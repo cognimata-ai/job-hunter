@@ -99,6 +99,34 @@ def test_migrate_dsn_uses_migrator(tmp_path: Path) -> None:
             WORKER_SECRETS,
             "langsmith_config",  # HIDE_OUTPUTS is missing
         ),
+        (
+            "worker",
+            {"LANGCHAIN_TRACING_V2": "true", "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com"},
+            WORKER_SECRETS,
+            "langsmith_config",  # no HIDE settings at all
+        ),
+        (
+            "worker",
+            {
+                "LANGCHAIN_TRACING": "TRUE",
+                "LANGSMITH_HIDE_INPUTS": "true",
+                "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
+            },
+            WORKER_SECRETS,
+            "langsmith_config",  # HIDE_OUTPUTS is missing
+        ),
+        (
+            "worker",
+            {
+                "LANGCHAIN_TRACING_V2": "true",
+                "LANGSMITH_HIDE_INPUTS": "true",
+                "LANGSMITH_HIDE_OUTPUTS": "true",
+                "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
+                "LANGCHAIN_ENDPOINT": "https://api.smith.langchain.com",  # the SDK falls back to it
+            },
+            WORKER_SECRETS,
+            "langsmith_config",
+        ),
         ("api", {}, {**API_SECRETS, "session_secret": b64(31, b"s")}, "session_secret_length"),
         ("api", {}, {**API_SECRETS, "data_key": b64(33, b"d")}, "data_key_length"),
         ("api", {}, {**API_SECRETS, "data_key_previous": b64(16)}, "data_key_previous_length"),
@@ -228,7 +256,9 @@ def test_an_empty_required_secret_counts_as_missing(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("tracing_var", ["LANGSMITH_TRACING", "LANGSMITH_TRACING_V2"])
+@pytest.mark.parametrize(
+    "tracing_var", ["LANGSMITH_TRACING", "LANGSMITH_TRACING_V2", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"]
+)
 @pytest.mark.parametrize("tracing_value", ["true", "TRUE"])
 def test_tracing_with_all_langsmith_requirements_met_passes(
     tmp_path: Path, tracing_var: str, tracing_value: str
@@ -241,6 +271,9 @@ def test_tracing_with_all_langsmith_requirements_met_passes(
         "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
     }
     run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)))
+    # a legacy endpoint alias that is the EU endpoint too is fine
+    env["LANGCHAIN_ENDPOINT"] = "https://eu.api.smith.langchain.com"
+    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "t", **WORKER_SECRETS)))
 
 
 def test_a_prod_worker_with_both_healthchecks_secrets_passes(tmp_path: Path) -> None:
@@ -256,9 +289,20 @@ def test_missing_secrets_dir_fails_secrets_present(tmp_path: Path) -> None:
 
 
 def test_environ_keeps_only_the_known_prefixes(tmp_path: Path) -> None:
-    env = {**BASE_ENV, "LANGSMITH_PROJECT": "p", "ANTHROPIC_BASE_URL": "u", "PATH": "/bin", "HOME": "/root"}
+    env = {
+        **BASE_ENV,
+        "LANGSMITH_PROJECT": "p",
+        "LANGCHAIN_TRACING_V2": "false",
+        "ANTHROPIC_BASE_URL": "u",
+        "PATH": "/bin",
+        "HOME": "/root",
+    }
     cfg = load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS))
-    assert set(cfg.environ) == set(BASE_ENV) | {"LANGSMITH_PROJECT", "ANTHROPIC_BASE_URL"}
+    assert set(cfg.environ) == set(BASE_ENV) | {
+        "LANGSMITH_PROJECT",
+        "LANGCHAIN_TRACING_V2",
+        "ANTHROPIC_BASE_URL",
+    }
 
 
 def test_config_fields(tmp_path: Path) -> None:

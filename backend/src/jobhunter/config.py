@@ -28,7 +28,14 @@ STARTUP_FAILED_EXIT_CODE: Final = 78
 DEFAULT_SECRETS_DIR: Final = Path("/run/secrets")
 LANGSMITH_EU_ENDPOINT: Final = "https://eu.api.smith.langchain.com"
 
-_ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "ANTHROPIC_")
+# LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
+_ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
+_TRACING_VARS: Final = (
+    "LANGSMITH_TRACING",
+    "LANGSMITH_TRACING_V2",
+    "LANGCHAIN_TRACING_V2",
+    "LANGCHAIN_TRACING",
+)
 _FAKE_MODE_VARS: Final = ("JOBHUNTER_FAKE_SOURCES", "JOBHUNTER_FAKE_LLM", "JOBHUNTER_FAULT")
 _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_API_KEY")
 _WORLD_READABLE: Final = 0o004
@@ -283,13 +290,16 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     if cfg.env == "prod" and (fake := [name for name in _FAKE_MODE_VARS if name in env]):
         raise StartupCheckFailed("fake_mode_in_prod", f"{', '.join(fake)} must not be set in prod")
 
-    # The langsmith SDK enables tracing from either variable, so both count here.
-    if any(env.get(name, "").lower() == "true" for name in ("LANGSMITH_TRACING", "LANGSMITH_TRACING_V2")):
+    # The langsmith SDK enables tracing from any of these variables, so each one counts here.
+    if any(env.get(name, "").lower() == "true" for name in _TRACING_VARS):
         wrong = [
             name for name in ("LANGSMITH_HIDE_INPUTS", "LANGSMITH_HIDE_OUTPUTS") if env.get(name) != "true"
         ]
         if env.get("LANGSMITH_ENDPOINT") != LANGSMITH_EU_ENDPOINT:
             wrong.append("LANGSMITH_ENDPOINT")
+        # The SDK falls back to the legacy endpoint variable, so a non-EU value must not be left behind.
+        if env.get("LANGCHAIN_ENDPOINT", "") not in ("", LANGSMITH_EU_ENDPOINT):
+            wrong.append("LANGCHAIN_ENDPOINT")
         if wrong:
             raise StartupCheckFailed("langsmith_config", f"tracing needs a correct {', '.join(wrong)}")
 
