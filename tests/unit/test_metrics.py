@@ -1,0 +1,31 @@
+# tests/unit/test_metrics.py
+from jobhunter.observability import metrics
+from prometheus_client import REGISTRY as GLOBAL_REGISTRY
+from prometheus_client import generate_latest
+
+
+def test_series_names() -> None:
+    metrics.RUNS.labels(status="succeeded").inc()
+    metrics.HTTP_REQUESTS.labels(route="/healthz", status="200").inc()
+    metrics.ALERTS_OPEN.labels(severity="warn").set(2)
+    text = generate_latest(metrics.REGISTRY).decode()
+    for name in (
+        "jobhunter_runs_total",
+        "jobhunter_run_duration_seconds",
+        "jobhunter_http_requests_total",
+        "jobhunter_table_bytes",
+        'jobhunter_alerts_open{severity="warn"} 2.0',
+    ):
+        assert name in text
+
+
+def test_metrics_live_on_a_dedicated_registry() -> None:
+    assert metrics.REGISTRY is not GLOBAL_REGISTRY
+    assert "jobhunter_" not in generate_latest(GLOBAL_REGISTRY).decode()
+
+
+def test_metrics_server_serves_the_dedicated_registry(monkeypatch) -> None:
+    calls: list[tuple[int, object]] = []
+    monkeypatch.setattr(metrics, "start_http_server", lambda port, registry: calls.append((port, registry)))
+    metrics.start_metrics_server(9100)
+    assert calls == [(9100, metrics.REGISTRY)]

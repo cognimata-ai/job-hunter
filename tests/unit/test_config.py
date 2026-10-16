@@ -1,5 +1,6 @@
 # tests/unit/test_config.py
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -172,6 +173,22 @@ def test_cli_exits_78_and_never_logs_the_value(tmp_path: Path) -> None:
     )
     assert r.returncode == 78 and "session_secret_length" in r.stdout
     assert secret.decode() not in r.stdout + r.stderr
+
+
+def test_cli_logs_the_failed_check_as_one_critical_json_event(tmp_path: Path) -> None:
+    d = write_secrets(tmp_path / "s", **{**API_SECRETS, "session_secret": b64(20, b"Z")})
+    env = {**os.environ, **BASE_ENV, "JOBHUNTER_SECRETS_DIR": str(d)}
+    r = subprocess.run(
+        [sys.executable, "-m", "jobhunter.cli", "startup-check", "--role", "api"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    (line,) = r.stdout.splitlines()
+    event = json.loads(line)
+    assert event["level"] == "critical" and event["event"] == "startup_check_failed"
+    assert event["check"] == "session_secret_length" and event["role"] == "api"
+    assert event["logger"] == "jobhunter.startup" and "ts" in event and "detail" in event
 
 
 # --- Additional coverage of behaviour the task brief specifies in prose -----------------------------------

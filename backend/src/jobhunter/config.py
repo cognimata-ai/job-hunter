@@ -10,7 +10,6 @@ check and exits with code 78.
 
 import base64
 import binascii
-import json
 import os
 import stat
 import sys
@@ -20,6 +19,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal, cast, get_args
 from urllib.parse import quote
+
+from jobhunter.observability.logging import configure_logging, get_logger
 
 Role = Literal["api", "worker", "migrate"]
 EnvName = Literal["prod", "dev", "test"]
@@ -315,16 +316,15 @@ def run_startup_assertions(cfg: AppConfig) -> None:
 
 
 def _log_startup_failure(role: Role, exc: StartupCheckFailed) -> None:
-    # Plain JSON on stdout until the structlog setup of Task 3 takes over.
-    record = {"level": "critical", "event": "startup_check_failed", "check": exc.check, "role": role}
+    fields = {"check": exc.check, "role": role}
     if exc.detail:
-        record["detail"] = exc.detail
-    sys.stdout.write(json.dumps(record) + "\n")
-    sys.stdout.flush()
+        fields["detail"] = exc.detail
+    get_logger("jobhunter.startup").critical("startup_check_failed", **fields)
 
 
 def startup_or_exit(role: Role) -> AppConfig:
     """Load the process configuration and run the startup assertions; on failure log the check and exit 78."""
+    configure_logging()
     try:
         cfg = load_config(role)
         run_startup_assertions(cfg)
