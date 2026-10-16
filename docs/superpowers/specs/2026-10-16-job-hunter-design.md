@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Design under final review — revision 3 (after two rounds of 4-eyes review by Codex GPT-6 Astra and Claude Fable 5.1, with the chair's decisions on three items, §2.4) |
+| Status | Design under final review — revision 3.1 (after three rounds of 4-eyes review by Codex GPT-6 Astra and Claude Fable 5.1, with the chair's decisions on three items, §2.4) |
 | Date | 2026-10-16 |
 | Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, the user's cost decision of revision 2 (§2.1 U14), and the chair's decisions of revision 3 (§2.4) |
 | Scope | One deployment for one user, German job market |
@@ -56,7 +56,7 @@ Job Hunter is a production-grade, single-user web application. On a configurable
 
 | # | Criterion | How it is measured |
 |---|---|---|
-| S1 | No silent drops | For every run, Σ raw-item dispositions equals the items received, with zero `pending` items at finalize. Every score target is in a glossary state (§1.6). Any violation sets the run to `failed_invariant` and raises an alert. |
+| S1 | No silent drops | For every run, Σ raw-item dispositions equals the items received, with zero `pending` items at finalize (an item deferred by a purge fence carries the recorded disposition `deferred('job_fenced')` and is resolved by a later run, §7.16.1). Every score target is in a glossary state (§1.6). Any violation sets the run to `failed_invariant` and raises an alert. |
 | S2 | Paid quota never exceeded | For every provider window, counted units (`reserved + dispatched + billed + ambiguous + adjustment`) ≤ the limit, with every reservation admitted under the provider's window lock and the owner's fencing lock (§6.2). Property tests cover this, and so does the `quota.limit_breach` invariant. |
 | S3 | LLM cap never exceeded | Every LLM reservation is admitted under the monthly budget lock only if `counted + reservation ≤ cap − overrun_buffer` (§6.9.1). Text reservations bound input tokens by the UTF-8 byte length of the request plus a doubled, measured overhead (§10.7). **Residual assumption: the cap holds provided the tokenizer emits ≤ 1 token per byte; spike V19 verifies this on the fixture corpus, umlauts included.** The `overrun_buffer` (default $2, never admitted for spending) absorbs any remaining overhead error. A settled cost above its reservation raises the critical alert `llm.reservation_bound_violated` and pauses scoring. |
 | S4 | Every score traceable | Every published result links to its job revision, profile version, rubric version, prompt/schema version, model policy, attempts, LLM calls (requested and served model, effort, usage), drafts, critic notes and evidence. A test walks this lineage for every fixture result. |
@@ -64,7 +64,7 @@ Job Hunter is a production-grade, single-user web application. On a configurable
 | S6 | Scheduler liveness visible off-box | The healthchecks.io dead-man switch alarms within `interval + grace` of a missing run. |
 | S7 | Crash safety | Every case in the crash-injection matrix (§18.3) passes. |
 | S8 | Score quality | Golden-set gates (§11.13), run on the production routing with each case's own profile and scope, pass before a rubric, prompt, model-policy or evaluation-policy change is activated, unless the user explicitly overrides. |
-| S9 | Recovery | A monthly restore test of a complete backup set succeeds, including deletion-manifest replay and a check that deleted ids are absent. Target RPO is 24 h and RTO is 4 h. No deletion acknowledged to the user can be reversed by a restore (§19.5). |
+| S9 | Recovery | A monthly restore test of a complete backup set succeeds, including deletion-manifest replay with its rebuilds and a check of every manifest operation's postcondition (rows deleted, fields redacted with their rows intact, files removed, fences released). Target RPO is 24 h and RTO is 4 h. No deletion acknowledged to the user can be reversed by a restore (§19.5). |
 
 ### 1.6 Glossary of states (single source of truth)
 
@@ -1248,7 +1248,7 @@ CREATE TABLE ranking_state (                       -- §14.3 pagination generati
 );
 ```
 
-**Ranking generation.** Every transaction that can change the order or the membership of the Jobs list runs `UPDATE ranking_state SET generation = generation + 1, updated_at = now() WHERE id = 1` as its **last statement before commit** (the row lock is held for microseconds and is last in the lock order). These transactions are: a publish (online or batch), a `det_results` current-instance change, a scope flip, a tuple activation, **any** target state change (published or not, since the scoring-state filter and the unscored section depend on it), a similarity update of a pending target, the insertion of a job, a change of any job field that a filter or sort reads, a duplicate-group change (join, leave, re-election, split, dissolve), a merge or unmerge, a job availability change, and any user action (`seen_at`, `saved_at`, `applied_at`, `hidden_at`, note). The generation is a committed, monotonic counter; it is never derived from row values. The list API reads the generation and the page rows **in one `REPEATABLE READ` snapshot** (§14.3), so a page can never be labelled with a generation newer than the data it shows.
+**Ranking generation.** Every transaction that can change the order or the membership of the Jobs list runs `UPDATE ranking_state SET generation = generation + 1, updated_at = now() WHERE id = 1` as its **last statement before commit** (the row lock is held for microseconds and is last in the lock order). These transactions are: a publish (online or batch), a `det_results` current-instance change, a scope flip, a tuple activation, **any** target state change (published or not, since the scoring-state filter and the unscored section depend on it), a similarity update of a pending target, the insertion of a job, a change of any job field that a filter or sort reads, a duplicate-group change (join, leave, re-election, split, dissolve), a merge or unmerge, a job availability change, and any user action (`saved_at`, `applied_at`, `hidden_at`, note, and an explicit Mark seen or Mark unseen). Setting `seen_at` implicitly by opening a job does **not** bump the generation: it would raise the "Ranking changed" banner after every view. A list filtered to unseen jobs may therefore keep showing a just-opened job until the next refresh; the UI marks it seen locally. The generation is a committed, monotonic counter; it is never derived from row values. The list API reads the generation and the page rows **in one `REPEATABLE READ` snapshot** (§14.3), so a page can never be labelled with a generation newer than the data it shows.
 
 ### 7.2 Identity, sessions, throttling
 
@@ -1794,20 +1794,22 @@ CREATE TABLE raw_items (                              -- retained 90 days (§20.
   item_ts         timestamptz,                          -- the source's own item timestamp (§5.1)
   item_sha256     bytea NOT NULL,
   disposition     text NOT NULL CHECK (disposition IN ('pending','linked','out_of_scope',
-                                                       'duplicate_in_page','rejected')),
+                                                       'duplicate_in_page','rejected','deferred')),
+                                                      -- deferred: 'job_fenced' only (§7.16.1)
   reason_code     text,
-  normalized      jsonb,                                -- the parsed NormalizedPosting while pending (§9.2)
+  normalized      jsonb,                                -- the parsed NormalizedPosting while pending or deferred (§9.2)
   observation_id  bigint UNIQUE,                        -- FK below (deferrable)
   created_at      timestamptz NOT NULL DEFAULT now(),
   disposed_at     timestamptz,
   UNIQUE (raw_response_id, item_index),
-  CHECK ((disposition IN ('out_of_scope','duplicate_in_page','rejected')) = (reason_code IS NOT NULL)),
+  CHECK ((disposition IN ('out_of_scope','duplicate_in_page','rejected','deferred')) = (reason_code IS NOT NULL)),
+  CHECK (disposition <> 'deferred' OR reason_code = 'job_fenced'),
   CHECK (observation_id IS NULL OR disposition = 'linked'),   -- a purge may detach a linked item's observation
   CHECK ((disposition = 'pending') = (disposed_at IS NULL)),
-  CHECK (disposition <> 'pending' OR normalized IS NOT NULL),
-  CHECK (disposition = 'pending' OR normalized IS NULL)        -- the intermediate is dropped on disposal
+  CHECK (disposition NOT IN ('pending','deferred') OR normalized IS NOT NULL),
+  CHECK (disposition IN ('pending','deferred') OR normalized IS NULL)   -- dropped on final disposal
 );
-CREATE INDEX raw_items_attention ON raw_items (disposition) WHERE disposition IN ('pending','rejected');
+CREATE INDEX raw_items_attention ON raw_items (disposition) WHERE disposition IN ('pending','rejected','deferred');
 CREATE INDEX raw_items_arbeitnow_ts ON raw_items (item_ts) WHERE item_ts IS NOT NULL;
 
 CREATE TABLE ats_snapshots (
@@ -2543,8 +2545,10 @@ CREATE TABLE batch_submissions (
   CHECK (released_at IS NULL OR state IN ('released','ended','reconciled'))
 );
 CREATE UNIQUE INDEX batch_one_in_flight ON batch_submissions ((true))
-  WHERE state IN ('preparing','submit_started','submitted','submit_ambiguous','ended');
--- 'released' is not in flight: after an explicit user release new batches may be submitted (§10.10).
+  WHERE state IN ('preparing','submit_started','submitted','submit_ambiguous','ended') AND released_at IS NULL;
+-- A released submission is never in flight again: after the user's release new batches may be submitted,
+-- and if its batch is found later it is reconciled (released → ended → reconciled, released_at kept)
+-- outside this singleton, alongside the current submission (Codex R3-2, §10.10).
 ALTER TABLE score_targets ADD FOREIGN KEY (batch_submission_id) REFERENCES batch_submissions(id);
 
 CREATE TABLE batch_items (
@@ -2607,13 +2611,16 @@ CREATE TABLE golden_cases (                          -- §11.13; its job inputs 
   expected_knockouts      text[] NOT NULL DEFAULT '{}',
   source                  text NOT NULL CHECK (source IN ('week1','feedback','adversarial')),
   labelled_from_result_id bigint REFERENCES llm_results(id) ON DELETE SET NULL,
-  det_inputs_snapshot     jsonb NOT NULL,          -- frozen job det-facts at labelling time (salary, locations, …)
+  det_inputs_snapshot     jsonb NOT NULL,          -- frozen job det-facts at labelling time, each with its source ids
+                                                   -- (the det_results.det_inputs format: salary, locations, …)
+  det_input_sources       text[] NOT NULL,         -- every source_id the snapshot draws on (source purge, §20.5)
   is_canary               boolean NOT NULL DEFAULT false,
   active                  boolean NOT NULL DEFAULT true,
   created_at              timestamptz NOT NULL DEFAULT now(),
   updated_at              timestamptz NOT NULL DEFAULT now(),
   UNIQUE (job_revision_id, profile_version_id)        -- a second label upserts (ON CONFLICT DO UPDATE)
 );
+CREATE INDEX golden_cases_sources ON golden_cases USING gin (det_input_sources);
 
 CREATE TABLE eval_runs (
   id                       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -2673,15 +2680,15 @@ CREATE TABLE deletion_manifests (                  -- ids and key hashes only, n
   manifest_uuid    uuid NOT NULL UNIQUE,           -- UUIDv7: the stream identity and file name (§19.5)
   kind             text NOT NULL CHECK (kind IN ('delete_everything','source_purge','profile_purge',
                                                  'retention_purge','job_tombstone','golden_case_delete')),
-  scope            jsonb NOT NULL,                 -- {table: [ids]}, key hashes, and max_ids {table: max id}
+  scope            jsonb NOT NULL DEFAULT '{}',    -- {operations: [typed operations, §19.5], max_ids: {table: max id}}
   status           text NOT NULL CHECK (status IN ('executing','completed','shipped')),
-  file_sha256      bytea NOT NULL,                 -- the fsync'd copy on the manifests volume
+  file_sha256      bytea,                          -- set once the fsync'd file exists; deletes start only after
   created_at       timestamptz NOT NULL DEFAULT now(),
   completed_at     timestamptz,
   shipped_at       timestamptz,
   shipment_id      bigint,                         -- FK below
   replay_log       jsonb NOT NULL DEFAULT '[]',
-  CHECK (status = 'executing' OR completed_at IS NOT NULL),
+  CHECK (status = 'executing' OR (completed_at IS NOT NULL AND file_sha256 IS NOT NULL)),
   CHECK ((status = 'shipped') = (shipped_at IS NOT NULL AND shipment_id IS NOT NULL))
 );
 
@@ -2795,7 +2802,7 @@ RETURNING id;
 | `score_targets` | `state` | `state_reason` | `state_changed_at` | `claim_id = :c AND attempt_no = :a` (in_progress); `batch_submission_id = :s AND attempt_no = :a` (in_batch) |
 | `runs` | `status` | `status_reason` | `finished_at` (terminal) / `started_at` | `attempt_no = :a` |
 | `fetch_requests` | `status` | `skip_reason` or `error_code` | `finished_at` | the run's predicate |
-| `raw_items` | `disposition` | `reason_code` | `disposed_at` | the run's predicate |
+| `raw_items` | `disposition` | `reason_code` | `disposed_at` | the run's predicate; for a `deferred` item, the predicate of the run that resolves it |
 | `postings` | `availability` | `availability_reason` | `availability_changed_at` | — |
 | `batch_submissions` | `state` | `reconcile_report` | the per-state timestamp | `state = :expected` |
 | `batch_items` | `result_type` | `decision` | `processed_at` | the submission's predicate |
@@ -2820,10 +2827,12 @@ RETURNING id;
 pending ──observation applied + posting linked─► linked          (normalized := NULL)
 pending ──source purge fence set───────────────► out_of_scope('source_purged')
 pending ──identity domain error────────────────► rejected('identity_error')
+pending ──a job of P or J is fenced (§8.6)─────► deferred('job_fenced')   (normalized kept)
+deferred ──a later run re-resolves it (§8.6)──► linked | out_of_scope | rejected | deferred('job_fenced')
 rejected ──explicit replay (payload ≤ 30 d)────► pending          (re-parsed from the stored body)
 ```
 
-At finalize, `count(pending) = 0` and the dispositions sum to `raw_responses.item_count` for every response of the run. A resumed attempt continues every `pending` item from its stored `normalized` intermediate and skips only terminal dispositions.
+At finalize, `count(pending) = 0` and the dispositions sum to `raw_responses.item_count` for every response of the run. `deferred('job_fenced')` is a **recorded disposition**, not a pending item: it counts in the sum, satisfies I1 and S1, and is listed in the run report. Node 6 of every later run re-resolves the deferred items of earlier runs whose jobs are no longer fenced (oldest first, at most 1,000 per run), each in one §8.6 transaction under that run's ownership predicate; an item still fenced stays `deferred`. A deferred item that reaches the 90-day raw-item retention is dropped with its raw item and counted in the retention report. A resumed attempt continues every `pending` item from its stored `normalized` intermediate and skips only terminal dispositions.
 
 #### 7.16.2 Availability (postings; jobs derive)
 
@@ -2883,7 +2892,7 @@ unknown ──mass disappearance confirmed or acknowledged (§8.11)────�
 | `in_batch` | item decision `followup` | `pending` | `lane := 'batch_followup'`, `resume_draft_id`; `batch_submission_id := NULL` |
 | `in_batch` | item decision `refused` | `refused(category)` | `batch_submission_id := NULL` |
 | `in_batch` | item decision `failed_request` or `failed_invalid_output` | that state | `batch_submission_id := NULL` |
-| `in_batch` | item decision `retry_online` (errored other, canceled, expired, missing, `max_tokens`, unparseable) | `pending` | `batch_submission_id := NULL`; `state_reason` names the cause |
+| `in_batch` | item decision `retry_online` (errored other, canceled without a tuple supersession, expired, missing, `max_tokens`, unparseable) | `pending` | `batch_submission_id := NULL`; `state_reason` names the cause (`batch_errored`, `batch_canceled`, `batch_expired`, `batch_missing`, `batch_max_tokens`, `batch_invalid_output`), and the target is never batched again (§10.10) |
 | `in_batch` | submission `submit_rejected` or `abandoned` | `pending` | `batch_submission_id := NULL` |
 | `in_batch` | user "release and re-score" on `submit_ambiguous` | `pending` | `batch_submission_id := NULL` |
 | `in_batch` | tuple superseded (after `messages.batches.cancel` is requested), revision superseded, job merged, or purge | `cancelled(reason)` | `batch_submission_id := NULL`; the item's later result is fenced: it settles spend from usage or from the provider's per-item evidence and publishes nothing (§10.10) |
@@ -2939,10 +2948,11 @@ preparing ──found at restart (never started), or delete-everything──► 
 submit_started ──create returned id──► submitted
 submit_started ──definitive 4xx response──► submit_rejected                (targets → pending, spend not_billed)
 submit_started ──timeout | connection lost | 5xx | crash──► submit_ambiguous
-submit_ambiguous | released ──candidate ended + custom_id set equals ours──► ended (adopt provider id)
+submit_ambiguous | released ──candidate ended + custom_id set equals ours──► ended (adopt provider id; a released one keeps released_at and stays outside the singleton)
 submit_ambiguous ──any reconciliation without a match, complete or not──► submit_ambiguous
                     (alert at 25 h; never by timeout and never from an empty listing — chair decision C3)
 submit_ambiguous ──explicit user release──► released     (in_batch targets → pending; spend stays ambiguous)
+released ──29 days after submit_started_at without a match──► released (reconciliation stops; terminal; items stay ambiguous)
 submit_started | submit_ambiguous ──delete-everything (§20.4)──► released     (spend → ambiguous; rows then deleted)
 submitted | ended ──delete-everything──► (same state; cancel_requested_at set, spend → ambiguous; rows then deleted)
 submitted ──processing_status = ended (also after a requested cancel)──► ended
@@ -3170,7 +3180,7 @@ The canonical primary link is stored in the normalised observation and used for 
    - collect the observation's keys `K` (§8.4) and look up `ad_keys` for `K`, following `merged_into_job_id` to the root;
    - together this gives the job set `J`.
 3. **Decide the job.**
-   - **Fenced jobs first.** The jobs of `P` and `J` are locked `FOR SHARE` in id order (`FOR UPDATE` where step 6 will merge them). If any of them is fenced (`is_fenced`, §20.2), the item waits: it stays `pending` and is retried by the next run after the fence is released, so a purge never races an attachment or a merge.
+   - **Fenced jobs first.** The jobs of `P` and `J` are locked `FOR SHARE` in id order (`FOR UPDATE` where step 6 will merge them). If any of them is fenced (`is_fenced`, §20.2), nothing is written except the disposition `deferred('job_fenced')` (§7.16.1), which keeps the `normalized` intermediate; a later run re-resolves the item once the fence is released. A purge therefore never races an attachment or a merge, and the current run still finalizes with no `pending` item (I1, S1).
    - **`J` empty**: allocate a new job. First search `tombstone_keys` for `sha256(key_ns ‖ key_value)` of every key in `K`; on a hit, the new job records `restored_from_tombstone_id` and its `user_job_actions` are initialised from the tombstone's timestamps, so a hidden ad that is re-posted stays hidden and an applied one stays marked applied. The job row is inserted with canonical fields computed from this observation alone (`current_revision_id` is a deferred FK and is set in step 7).
    - **`J` is one job**: that job.
    - **`J` has several jobs, with no exclusive conflict among them and no `dedup_decisions(different)` between any pair**: the lowest job id; the others are merged into it in step 6.
@@ -3370,7 +3380,7 @@ For each job, every canonical field is selected deterministically from its posti
   | latest quota ledger attempt of the request key | Resolved by the order in §6.2 rule 2 (replay, release, or ambiguous) |
   | `raw_responses.parsed_at` set | Parsing is done; the items exist |
   | `raw_items.disposition = 'pending'` | **Resume** from the stored `normalized` intermediate (§8.6) |
-  | `raw_items.disposition` terminal | Skip |
+  | `raw_items.disposition` terminal, or `deferred` | Skip (a deferred item is re-resolved by a later run's node 6, §7.16.1) |
   | `posting_observations.raw_item_id` exists | The observation was applied; link only |
   | `ats_snapshots.applied_at` set | The snapshot's availability effects were applied |
   | `score_targets` | `INSERT … ON CONFLICT` with the reactivation rule of §9.7 |
@@ -3411,7 +3421,7 @@ class CollectState(TypedDict):
 | 3 | `plan_fallback` | det | Runs after every primary JSearch spec is terminal. Collects the JSearch cells this run did not serve whose outcome is fallback-eligible by the table in §6.6, and creates SerpApi specs `phase='fallback'`. `paced` and `reserve_held` denials are never eligible. | 30 s | — |
 | 4 | `fetch_fallback` | det I/O | Same as node 2 for SerpApi specs, concurrency 1, with an `account.json` read before every search (§5.3.2). Skipped when there are none. | 15 min | as node 2 |
 | 5 | `parse_normalize` | det | For every `raw_response` of this run with `parsed_at IS NULL`: `adapter.parse` → one `raw_items` row per array element, either `pending` with its `normalized` intermediate or a terminal disposition; then `parsed_at`. One transaction per response. | 10 min, heartbeat | items `rejected(reason)` |
-| 6 | `resolve_identity` | det | Per `pending` raw item: §8.6 in one transaction holding `active_config` `FOR SHARE` (fence, idempotency, job decision, posting, observation, keys and provenance, tombstones, merge or conflict, canonical fields, revision reuse or creation, lineage, and the job's `hard_filter_results` and det instances for the active and pending scope). Then, per ATS snapshot of the run, the availability effects of §8.11 in one transaction, guarded by `applied_at`. Then duplicate grouping for changed revisions (§8.7), under `pg_advisory_xact_lock(hashtext(company_key))`. | 20 min, heartbeat | item `rejected('identity_error')` on a domain error |
+| 6 | `resolve_identity` | det | Per `pending` raw item of the run, then per `deferred('job_fenced')` item of earlier runs whose jobs are no longer fenced (§7.16.1): §8.6 in one transaction holding `active_config` `FOR SHARE` (fence, idempotency, job decision, posting, observation, keys and provenance, tombstones, merge or conflict, canonical fields, revision reuse or creation, lineage, and the job's `hard_filter_results` and det instances for the active and pending scope). Then, per ATS snapshot of the run, the availability effects of §8.11 in one transaction, guarded by `applied_at`. Then duplicate grouping for changed revisions (§8.7), under `pg_advisory_xact_lock(hashtext(company_key))`. | 20 min, heartbeat | item `rejected('identity_error')` on a domain error |
 | 7 | `embed` | det (embedder) | For revisions with `awaiting_embedding`, in batches of 16: `POST embedder/v1/embed` (passage, ≤ 1,024 tokens, truncation flagged), then upsert `embeddings` and mark `embedded`. | 20 min, heartbeat; 120 s per batch | **Embedder unavailable**: stop embedding, leave `awaiting_embedding`, count them, run → `partial`, alert `embedder.unavailable` (warn) |
 | 8 | `hard_filters` | det | Verification and backfill: for each job touched by the run whose `hard_filter_results` for the active (or pending) scope is missing, or whose `inputs_hash` or `det_algorithm_version` is stale, recompute it under `active_config` `FOR SHARE`. Normally there is nothing to do, because node 6 writes them atomically. | 5 min | bug → run `failed` |
 | 9 | `enqueue_targets` | det | If `llm_tuple_id` is set: for each current revision without an active-tuple target, take the job row `FOR SHARE`, skip it if a purge fence covers the job, and otherwise create one (§9.7 insert rule) with `similarity` = the max cosine against the profile vectors, or NULL if awaiting embedding. The state is `filtered_out`, `deferred_duplicate` or `pending` (§7.16.3). Targets of revisions that stopped being current → `cancelled('revision_superseded')` unless published. | 5 min | bug → run `failed` |
@@ -3589,6 +3599,7 @@ Invoked by the operations `extract_profile_text(draft_id)` and `extract_profile(
 
 ```python
 LANES = (("similarity", 0.70), ("oldest", 0.20), ("exploration", 0.10))
+SHARE = dict(LANES)
 TIE_ORDER = {"oldest": 0, "exploration": 1, "similarity": 2}    # safeguards win ties
 
 def admit(cycle) -> list[tuple[int, str]]:
@@ -3602,11 +3613,16 @@ def admit(cycle) -> list[tuple[int, str]]:
     for lane, share in LANES:                       # every lane accrues on S, in every cycle
         credits[lane] = min(credits[lane] + share * S, share * S + 1)
     slots = {lane: max(0, floor(credits[lane])) for lane, _ in LANES}
+    while sum(slots.values()) > S:                  # carried whole credits never buy more than S slots
+        lane = max((l for l in slots if slots[l] > 0),
+                   key=lambda l: (slots[l] - SHARE[l] * S, TIE_ORDER[l]))
+        slots[lane] -= 1                            # trim the largest excess (similarity first); its credit carries
     spare = S - sum(slots.values())
     for lane in sorted(slots, key=lambda l: (-(credits[l] - slots[l]), TIE_ORDER[l])):
-        if spare == 0:
+        if spare <= 0:
             break                                   # largest remainder gets the leftover slots
         slots[lane], spare = slots[lane] + 1, spare - 1
+    assert sum(slots.values()) == S                 # exactly S credit-backed slots, before any selection
     # Always-include shares the SIMILARITY slots only (at most half of S); it can never take a
     # safeguard (oldest/exploration) slot. Order, highest similarity first (NULL last): full-text twins
     # of partial scored members, watchlist companies, title trigram >= 0.6 against a confirmed target
@@ -3635,7 +3651,7 @@ def admit(cycle) -> list[tuple[int, str]]:
   - `similarity`: `similarity IS NOT NULL`, ordered by similarity descending. It **excludes** targets whose revision is `partial` and targets of non-representative duplicate-group members (U14); those reach the LLM through the oldest and exploration lanes, or through always-include;
   - `oldest`: ordered by `created_at` ascending, any similarity;
   - `exploration`: a reproducible random order seeded by the cycle id.
-- **Fair rotation for every `S`.** `admission_lane_credits` persists each lane's fractional credit across cycles. All three lanes accrue `share × S` per cycle (a lane carries at most `share × S + 1`), whole credits become slots, and leftover slots go to the largest remainders, ties to the safeguard lanes. Using a slot costs one credit, so a remainder slot may leave a lane at most one credit in debt. Over any 10 consecutive cycles with `S = 1`, the lanes get 7, 2 and 1 slots; the oldest and exploration lanes therefore never starve, even under a permanent always-include backlog (Codex #11).
+- **Fair rotation for every `S`.** `admission_lane_credits` persists each lane's fractional credit across cycles. All three lanes accrue `share × S` per cycle (a lane carries at most `share × S + 1`), whole credits become slots, and leftover slots go to the largest remainders, ties to the safeguard lanes. **The slots always sum to exactly `S`** before any candidate is selected: when carried whole credits exceed `S` (for example after cycles in which a lane had no candidates, or after `S` was lowered), slots are trimmed one at a time from the lane with the largest excess over `share × S`, similarity first on ties, and the trimmed credit simply carries. *Example (Codex R3-3).* `S = 10`; cycle 1 has no similarity candidates, so similarity keeps 7 credits; in cycle 2 the credits after accrual are 8 / 2 / 1, the trim gives 7 / 2 / 1, and 10 targets are admitted, not 14. Using a slot costs one credit, so a remainder slot may leave a lane at most one credit in debt. Over any 10 consecutive cycles with `S = 1`, the lanes get 7, 2 and 1 slots; the oldest and exploration lanes therefore never starve, even under a permanent always-include backlog (Codex #11).
 - **Always-include** draws only on the similarity slots and at most `ceil(0.5 × S)` per cycle. Candidates beyond that stay first in line for the next cycle.
 - **Spill** uses the counts actually taken, so a lane can never be asked for a negative number, and a lane without candidates passes its slots on. *Example (Codex #11).* `S = 10`, slots 7/2/1, zero similarity candidates and nine oldest candidates: the oldest lane takes 2 and the exploration lane 1 by slot; 7 slots are spare and spill to the oldest lane (7 more), so 10 targets are admitted, and only the 3 slot-backed takes cost credit.
 - Lane membership is recorded on the target (`lane`) and in the cycle report.
@@ -3916,13 +3932,13 @@ These run offline in CI with recorded request bodies and need no API calls. For 
 
 The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_retries=0, timeout=anthropic.Timeout(connect=10, read=120, write=60, pool=10))`), inside `llm/batches.py`. LangChain cannot do batches.
 
-**Eligibility.** Only targets of the **active bulk operation** (§6.9.3), with `batch_bulk_rescore = true` (settings, default true), no non-terminal submission and no `submit_ambiguous` submission. Immediately before preparing, the candidate set goes through **the same sweeps as online admission** (expiry, refilter, regroup, §9.6.2), and only targets still `pending` with `not_before` passed and no active purge fence are kept. A target is batched only if it still needs its **initial generator pass** (Codex N8): `resume_draft_id IS NULL`, `lane` is not `batch_followup` or `score_now`, `state_reason` is not an online-retry disposition (`batch_max_tokens`, `batch_invalid_output`, `batch_errored`, `batch_expired`, `batch_missing`), and `charged_attempts < max_score_attempts`. The preparation transaction re-checks these conditions in its CAS from `pending`. Only the **generator pass** runs in a batch; critic and revisions run online as `batch_followup`.
+**Eligibility.** Only targets of the **active bulk operation** (§6.9.3), with `batch_bulk_rescore = true` (settings, default true), no non-terminal submission and no `submit_ambiguous` submission. Immediately before preparing, the candidate set goes through **the same sweeps as online admission** (expiry, refilter, regroup, §9.6.2), and only targets still `pending` with `not_before` passed and no active purge fence are kept. A target is batched only if it still needs its **initial generator pass** (Codex N8): `resume_draft_id IS NULL`, `lane` is not `batch_followup` or `score_now`, `state_reason` is not an online-retry disposition (`batch_max_tokens`, `batch_invalid_output`, `batch_errored`, `batch_canceled`, `batch_expired`, `batch_missing`), the target has **no earlier batch attempt whose item received a provider result** (any `batch_items.result_type`; items of a rejected, abandoned or released submission have none), and `charged_attempts < max_score_attempts`. The second condition keeps the exclusion after the `state_reason` changes, so a target that once went through a batch is scored online from then on. The preparation transaction re-checks these conditions in its CAS from `pending`. Only the **generator pass** runs in a batch; critic and revisions run online as `batch_followup`.
 
 **Size, budget and order.**
 - Order: availability `active` first, then the previous tuple's `score_mid` descending, then similarity descending.
 - The batch is cut to at most `batch_max_items` (1,000, settings) and then to the largest `n` whose worst-case reservation **plus its expected follow-up allocation** fits the remaining batch allocation (§6.9.3). The allocation (40% by default) bounds the batch items and their expected follow-ups; it is not a limit on everything the re-score spends.
 - If fewer than `batch_min_targets` (200, settings) targets remain after pruning, no batch is submitted. The targets stay `pending` and are scored by online admission at the monthly pace.
-- **Follow-on submissions.** When a submission ends (`reconciled`, `released`, `submit_rejected` or `abandoned`), the worker inserts the next `batch_submit` operation for the active bulk operation. It is sized again from the remaining allocation, so repeated submissions never exceed it in total (§6.9.3).
+- **Follow-on submissions.** When a submission ends (`reconciled`, `released`, `submit_rejected` or `abandoned`), the worker inserts the next `batch_submit` operation for the active bulk operation. A released submission triggers its follow-on at the release, never again when it is later reconciled. It is sized again from the remaining allocation, so repeated submissions never exceed it in total (§6.9.3).
 
 **Lifecycle.**
 
@@ -3951,7 +3967,7 @@ The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_
 | `succeeded` | any other stop reason | `billed` | `failed_invalid_output('unexpected_stop_reason')` |
 | `errored` | `invalid_request` | `not_billed(batch_item_errored)` | `failed_request` → `failed_request('batch_invalid_request')` |
 | `errored` | other error types | `not_billed(batch_item_errored)` | `retry_online` → `pending('batch_errored')` |
-| `canceled` | — | `not_billed(batch_item_canceled)` | `cancelled` when the cancel was requested for a superseded tuple; otherwise `retry_online` → `pending` |
+| `canceled` | — | `not_billed(batch_item_canceled)` | `cancelled` when the cancel was requested for a superseded tuple; otherwise `retry_online` → `pending('batch_canceled')`, an excluded disposition (eligibility above) |
 | `expired` | — | `not_billed(batch_item_expired)` | `retry_online` → `pending('batch_expired')` |
 | *(no result after a complete stream)* | — | stays `ambiguous`; critical alert `batch.items_missing` | `retry_online` → `pending('batch_missing')` |
 
@@ -3975,6 +3991,8 @@ The job `batch_reconcile_ambiguous` runs every 15 min for every `submit_ambiguou
    - the original reservations stay counted as `ambiguous` spend.
 
    The submission moves to `released`, which no longer blocks new submissions. Reconciliation continues for 29 days (the result retention window). If a matching batch is later found, the submission moves to `ended` and its items settle from the provider's per-item outcome: `ambiguous → billed` from downloaded usage, or `ambiguous → not_billed(batch_item_errored | batch_item_canceled | batch_item_expired)` from the item's own result (Codex N9). The publish CAS rejects every late result, because the released targets are no longer `in_batch` for this submission. If no batch is ever found, the items stay `ambiguous` and counted.
+
+**Released-submission lifecycle** (Codex R3-2). A released submission is reconciled **outside the `batch_one_in_flight` singleton**: the index ignores rows with `released_at` set (§7.12), so a current submission B in `submitted` never blocks it and it never blocks B. Its path is `released → ended → reconciled` when its batch is found within 29 days (steps 5–7 run for it exactly as for any ended submission: the poll, per-item processing with every item `ignored_fenced` for the targets, and spend settlement per §7.16.7), or `released` for good when the 29-day window passes without a match, after which `batch_reconcile_ambiguous` stops listing for it and its items stay `ambiguous` and counted. It never moves a target and never starts a follow-on submission.
 
 While any submission is `submit_ambiguous`, no new batch is submitted; after an explicit release, new submissions may proceed (their `custom_id`s carry new attempt numbers, so they can never be confused with the released batch). Bulk re-scores continue through online admission meanwhile.
 
@@ -4162,8 +4180,8 @@ Two facts with the same fact id are a V4 issue; the first is kept.
 | Phrase (DE / EN) | Level emitted |
 |---|---|
 | Muttersprache, muttersprachlich / native | `native` |
-| verhandlungssicher, fließend / fluent, business fluent | `C1` |
-| sehr gute Kenntnisse / very good | `B2` |
+| verhandlungssicher / business fluent | `C1` |
+| fließend / fluent; sehr gute Kenntnisse / very good | `B2` |
 | gute Kenntnisse / good | `B1` |
 | Grundkenntnisse / basic | `A2` |
 
@@ -4585,7 +4603,7 @@ Semantic limits:
 
 ### 11.13 Calibration and the eval gate
 
-- **Golden set.** In week 1 the user labels about 40–50 published ads (`good / ok / poor` plus an optional comment) in the labelling UI (§15.6). Each case is stored in `golden_cases` **bound to** its job revision (the label revision), the profile version, the **scope version** the label assumed (the active ones at labelling time) and a **frozen snapshot of the job's det-facts** (`det_inputs_snapshot`: salary, locations, work modes, employment types, industry), because those can change without a new material revision; a second label of the same case updates it (upsert). Later "wrong score" feedback adds cases (`source='feedback'`). Adversarial synthetic cases are part of the test fixtures (`source='adversarial'`), each with its own profile and scope: injection, a partial snippet, language traps (an English ad requiring German, and the reverse), seniority traps (over- and under-qualification) and not-a-job-ad. The user can list and delete cases (§14.2).
+- **Golden set.** In week 1 the user labels about 40–50 published ads (`good / ok / poor` plus an optional comment) in the labelling UI (§15.6). Each case is stored in `golden_cases` **bound to** its job revision (the label revision), the profile version, the **scope version** the label assumed (the active ones at labelling time) and a **frozen snapshot of the job's det-facts** (`det_inputs_snapshot`: salary, locations, work modes, employment types, industry), because those can change without a new material revision. The snapshot keeps each fact's **source provenance** in the `det_results.det_inputs` format, and `det_input_sources` lists every source it draws on, so a source purge finds the case even when its material revision is untainted (§20.5); a second label of the same case updates it (upsert). Later "wrong score" feedback adds cases (`source='feedback'`). Adversarial synthetic cases are part of the test fixtures (`source='adversarial'`), each with its own profile and scope: injection, a partial snippet, language traps (an English ad requiring German, and the reverse), seniority traps (over- and under-qualification) and not-a-job-ad. The user can list and delete cases (§14.2).
 - **Candidate configuration.** An eval run (`eval_runs(kind='golden')`) evaluates a candidate `(rubric, prompt/schema, model policy, evaluation policy, execution config)`. For each active case it forms the case's own tuple (case profile × candidate rubric, prompt and model policy), runs the **case's hard filters under the case's scope**, and, if they pass, scores the revision **on the production route**: conditional critic per the candidate evaluation policy, revisions, contested null-out, and aggregation under the case's scope. Hard filters, knockouts and aggregation use the case's frozen `det_inputs_snapshot`, never the job's current facts, so reruns compare the same inputs against the same label. The T8 sample identity is `sha256(f"golden:{golden_case_id}:{tuple_identity}")`, where `tuple_identity` is the case tuple's hash, so a case is sampled reproducibly across runs of the same candidate. Runs happen outside the target table, their calls carry `golden_case_id`, and they draw on the non-scoring reserve.
 - **Diagnostics.** An optional second run with `route='forced_critic'` reviews every case. It is reported but never gates.
 - **Aggregation.** Metrics are computed pooled over all active cases, and per profile version for every profile with at least 10 cases. Test–retest runs 10 cases twice (`repetitions = 2`).
@@ -4634,7 +4652,7 @@ Semantic limits:
 
 ### 12.2 Text extraction
 
-- Extraction runs in the **`docparse`** container (§3.2), which has **no network** (`network_mode: none`) and no secrets. The worker places the decrypted file in a per-job directory on the `parse_jobs` volume, a **tmpfs** shared only by `worker` and `docparse` (mode 0770, §19.1), so the plaintext never reaches a disk; the directory is unlinked in a `finally` block after the result is read, and on worker start any leftover directory is removed. Inside `docparse`, each job runs in a subprocess with `RLIMIT_CPU` 30 s and `RLIMIT_AS` 768 MiB.
+- Extraction runs in the **`docparse`** container (§3.2), which has **no network** (`network_mode: none`) and no secrets. The worker places the decrypted file in a per-job directory on the `parse_jobs` volume, a **tmpfs** shared only by `worker` and `docparse` (root mode `2770`, group 10011, §19.1: the setgid bit gives every per-job directory the group 10011, so `docparse` can enter it; the worker creates the directory with mode 0770 and its files with mode 0660), so the plaintext never reaches a disk; the directory is unlinked in a `finally` block after the result is read, and on worker start any leftover directory is removed. Inside `docparse`, each job runs in a subprocess with `RLIMIT_CPU` 30 s and `RLIMIT_AS` 768 MiB.
 - **PDF**: `pypdf`. If it yields fewer than 300 characters, or more than 5% U+FFFD replacement characters, `pdfplumber` is used instead. **DOCX**: `python-docx` (paragraphs plus table cells, in document order).
 - **Low text** (fewer than 300 characters of extracted text) → `profile_drafts.status='failed', failure_code='low_text'`. The UI then offers the two repair paths in §12.7.
 - The extracted text (with contacts) is stored encrypted (`cv_files.raw_text_enc`). No OCR in v1.
@@ -4950,7 +4968,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | GET | `/api/jobs` | List / search | Query: filters (§15.3), `sort`, `cursor`, `limit` (≤ 100, default 50) → `{items: JobCard[], next_cursor, ranking_generation, ranking_changed, counts: {total_estimate, unscored}}` |
 | GET | `/api/jobs/{job_id}` | Detail | → `JobDetail`: canonical fields + provenance, sanitised description, postings, links, current score (criteria, evidence with spans, det criteria, knockouts, caps, interval, coverage, confidence, status, critic outcome, versions), contested data, group, user actions, history |
 | GET | `/api/jobs/{job_id}/history` | Score history | → results for previous tuples and scopes (keyset paged) |
-| PUT | `/api/jobs/{job_id}/actions` | User actions | `{seen?, saved?, applied?, hidden?: bool, note?: str, apply_to_group?: bool}` → `UserActions`. Sets or clears each timestamp independently. |
+| PUT | `/api/jobs/{job_id}/actions` | User actions | `{seen?, saved?, applied?, hidden?: bool, note?: str, apply_to_group?: bool, seen_on_open?: bool}` → `UserActions`. Sets or clears each timestamp independently. `seen_on_open=true` (sent by the drawer when it opens) sets `seen_at` without bumping the ranking generation (§7.1). |
 | POST | `/api/jobs/{job_id}/score-now` | Score now | `{force?: bool}` → 202 `{target_id, state}`. 409 `budget_exhausted`, 409 `filtered_requires_force`. |
 | POST | `/api/jobs/{job_id}/feedback` | Label or "wrong score" | `{kind: label \| wrong_score, label: good \| ok \| poor, comment?}` → 201. Creates `score_feedback` (with the score snapshot) and, when a profile is active, upserts the `golden_cases` row for (revision, profile) with the active scope. |
 | GET | `/api/golden-cases` | Golden set | keyset paged → `[{id, job_id, label, comment, profile_version, scope_version, source, active}]` |
@@ -5207,7 +5225,7 @@ The drawer slides in from the right at 50% width (full screen on small viewports
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Opening the drawer sets `seen_at`. The **Seen** toggle can clear it again.
+Opening the drawer sets `seen_at` (`seen_on_open`, which does not raise the "Ranking changed" banner, §7.1). The **Seen** toggle can clear or set it explicitly.
 
 ### 15.5 Duplicate-group card
 
@@ -5444,7 +5462,7 @@ Broad `except Exception` is allowed **only** at task boundaries, where it maps t
 
 | # | Invariant | On violation |
 |---|---|---|
-| I1 | For every `raw_response` of the run: `Σ raw_items by disposition = item_count`, and `count(pending) = 0` (every pending item was resumed from its stored intermediate). | `failed_invariant` |
+| I1 | For every `raw_response` of the run: `Σ raw_items by disposition = item_count`, and `count(pending) = 0` (every pending item was resumed from its stored intermediate). `deferred('job_fenced')` is a disposition and does not violate I1 (§7.16.1). | `failed_invariant` |
 | I2 | Every `fetch_request` of the run is terminal (`succeeded`, `failed`, `ambiguous` or `skipped`). | `failed_invariant` |
 | I3 | **Spend ≤ allowance**: for each quota provider, counted units in every window touched by the run ≤ `limit_units`, and the run's normal-class units ≤ the effective per-run cap (§6.4). | `failed_invariant` + `quota.limit_breach` (critical) |
 | I4 | Every `linked` raw item has an observation whose posting has a job. | `failed_invariant` |
@@ -5492,9 +5510,9 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `awaiting_embedding` | every 10 min, when the embedder is healthy | Revisions `awaiting_embedding` for more than 10 min | Embed; set similarity on their targets |
 | `stale_sweep` | tick (≤ 1,000 rows) + daily | Aggregator TTL | `active → stale` ("not re-confirmed"; targets are not expired by it) |
 | `manifest_shipping` | every 5 min | `completed` manifests named by a `manifest_shipment_items` row with an equal file hash; manifests `completed` for more than 1 h without one | Mark exactly those `shipped`; raise `privacy.manifest_unshipped` (critical) for the others |
-| `ats_mass_events` | after every ATS snapshot | An unconfirmed mass disappearance with two later complete snapshots ≥ 24 h apart | Confirm and close (§8.11) |
+| `ats_mass_events` | after every ATS snapshot | An unconfirmed mass disappearance with two later **structurally complete** snapshots (`complete` or `mass_disappearance`) ≥ 24 h apart | Confirm and close (§8.11) |
 | `batch_poll` | every 5 min | `submitted` or `ended` submissions | Poll and process (§10.10) |
-| `ambiguous_batches` | every 15 min | `submit_ambiguous`, and `released` younger than 29 days | The §10.10 reconciliation; alert at 25 h; never settles by timeout or from an empty listing (chair decision C3) |
+| `ambiguous_batches` | every 15 min | `submit_ambiguous`, and `released` younger than 29 days | The §10.10 reconciliation (a released submission is reconciled outside the `batch_one_in_flight` singleton); alert at 25 h; never settles by timeout or from an empty listing (chair decision C3) |
 | `purge_fences` | every 10 min | An active purge fence whose purge operation is `failed` or has not progressed for 1 h | Keep the fence (fenced work stays blocked); raise `privacy.purge_failed` (critical) |
 | `deadman_sync` | daily + on schedule changes | The healthchecks check's timeout/grace ≠ expected | Update via the Management API |
 | `retention_daily` | daily 03:17 UTC | §20.1 | Purges and tombstones |
@@ -5672,7 +5690,8 @@ LANGSMITH_HIDE_OUTPUTS=true
   - **Arbeitnow growth (P-AN1)**: a feed that grows faster than the per-run page cap produces chronologically ordered gaps (`lower < upper`), seeks that land within one page of the gap, and gaps that are abandoned and reported, never skipped silently.
   - **LLM spend**: `counted ≤ max(cap, counted_at_cap_change)` for every month under random reservation, settlement, cap-edit and month-boundary sequences, with the counters always equal to the ledger sums.
   - **USD bucket**: over any simulated month with an unbounded backlog and any tick pattern, scoring spend up to day `d` never exceeds `d/month × scoring share + B_max + one cycle's in-flight reservations`, and a 1,180-target backlog does not exhaust the month in its first days (Fable B1 scenario).
-  - **Admission**: for every `S ≥ 1` (including `S = 1`) and a permanent always-include backlog, every window of 10 consecutive cycles gives the similarity (with always-include), oldest and exploration lanes 7, 2 and 1 slots per unit of `S`; spill never requests a negative count; always-include never exceeds half of `S` and never takes a safeguard slot; credits stay ≥ −1.
+  - **Admission**: for every `S ≥ 1` (including `S = 1`) and a permanent always-include backlog, every window of 10 consecutive cycles gives the similarity (with always-include), oldest and exploration lanes 7, 2 and 1 slots per unit of `S`; spill never requests a negative count; always-include never exceeds half of `S` and never takes a safeguard slot; credits stay within `[−1, share × S + 1]`.
+  - **Admission size under changing conditions** (Codex R3-3, Fable round 3): over arbitrary sequences of cycles in which `S` changes (1 to 30) and each lane's candidate count varies independently (including cycles with no candidates at all), the credit-backed slots sum to exactly `S` before selection, and the targets admitted outside `score_now` never exceed `S`. After such a sequence, a permanent backlog in every lane returns to exact 7 / 2 / 1 shares.
   - **Call bounds**: the maximal routing path uses exactly 7 logical calls and at most 42 HTTP tries, within the CHECKs.
   - **State machines**: random event sequences never produce a disallowed transition, and every target ends in a glossary state.
   - **Outcome reducer**: commutative, and idempotent on equal outcomes.
@@ -5692,6 +5711,12 @@ LANGSMITH_HIDE_OUTPUTS=true
 - **Collection vs scope flip (Codex #7)**: a job inserted concurrently with an `apply_scope` final transaction either commits before the check (and carries its pending-scope projections) or after the flip (and computes them for the new active scope); the flip never commits with a job lacking them.
 - **Publication**: the publish transaction (§9.4.1) commits with the deferred `score_targets ↔ llm_results` keys; a concurrent scope save waits for it (`active_config` `FOR SHARE` vs `FOR UPDATE`), and the final flip never sees a published result without a current pending-scope `det_result`.
 - **Deletion graph**: on a database seeded with two-year-old rows of every table, the profile purge, the job tombstone (including a job with an inactive golden case), the Adzuna purge and delete-everything run to completion against the real DDL with no FK or CHECK violation, and leave the ledgers intact. Delete-everything with a `preparing`, a `submitted` and a `submit_ambiguous` submission applies exactly the mapping of §20.4: no ledger entry stays `reserved`, and batch entries end `ambiguous`.
+- **Migrate paths (Codex R3-1)**: `migrate` completes (a) on a first installation, an empty database straight after `deploy/postgres/init`, with and without manifests already on the volume; (b) on an upgrade from the preceding release's schema with data, including a release that adds one of the backup role's tables; (c) on a restored database whose manifest stream is newer than the dump. In every case the backup role's grants exist afterwards, and no identity value allocated by the run is at or below any manifest's `max_ids`.
+- **Typed replay (Codex R3-5, R3-6)**: a backup set taken before a profile purge, a source purge of a mixed-source job (text from JSearch, salary from Adzuna) and a golden-case deletion is restored and replayed. The purged profile version still exists with `profile_json` NULL and its tuples intact, and verification passes; the mixed job is rebuilt (no Adzuna salary in its canonical fields, `det_results` or golden snapshots) **before** `restore verify --phase replayed` succeeds, and its fence is released only in the transaction that completes the manifest. A replay with an injected rebuild failure leaves the fence active and `migrate` failed.
+- **Golden snapshot provenance (Codex R3-4)**: a golden case whose revision is untainted but whose frozen salary came from Adzuna is deleted by the source purge, together with its case results and eval calls.
+- **Released-batch recovery (Codex R3-2)**: submission A is released, submission B reaches `submitted`, then A's batch is found: A moves `released → ended → reconciled` while B stays `submitted`, with no unique-index violation, and A's items settle per §7.16.7 without moving any target.
+- **No re-batching (Codex N8)**: a provider-`canceled` item outside a tuple supersession leaves its target `pending('batch_canceled')`; the next batch preparation excludes it, and so does any later one after its `state_reason` has changed.
+- **Fenced raw items (Fable round 3)**: a run resolves an item whose keys point to a job under a `jobs` fence; the item becomes `deferred('job_fenced')`, the run finalizes with I1 satisfied (not `failed_invariant`), and the first run after the fence is released resolves it.
 - **Manifest shipment coverage (Codex #9)**: manifest A commits first but writes its file after a shipment that contains manifest B; that shipment's items name only B, and A becomes `shipped` only after a later shipment item names A with an equal hash.
 - **Default privileges**: a table created by a later migration (and the procrastinate and checkpoint tables) is usable by `jobhunter_app` without a manual grant; `jobhunter_restore` can create, restore and drop the scratch database and cannot read the production database.
 - **Postgres logs (L1)**: a slow insert of PII-shaped values and a constraint violation through psycopg leave neither value in the server log.
@@ -5742,7 +5767,7 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
 | C29 | Crash during a score cycle | The takeover sweep sets the cycle `failed('orphaned')`; its claims are reclaimed; the next tick starts a new cycle (the one-running index is free) |
 | C30 | Crash after the scope save commits, before its procrastinate job is deferred | The `operations` reconciler re-defers `apply_scope` within 2 min; the flip happens |
 | C31 | Crash after the deletion manifest file is fsync'd, before the deletes | Restart resumes the manifest to `completed`; the shipper ships it; the UI reports it done only at `shipped` |
-| C32 | VPS loss after a deletion completed and shipped, before the next nightly backup | Restore of the older backup set plus manifest replay leaves the deleted ids absent (verified) |
+| C32 | VPS loss after a deletion completed and shipped, before the next nightly backup | Restore of the older backup set plus manifest replay satisfies every operation's postcondition (verified) |
 | C33 | A released submission's batch is found later: one item succeeded, one errored, one expired | The succeeded item settles `ambiguous → billed` from usage; the errored and expired items settle `ambiguous → not_billed(batch_item_errored / batch_item_expired)`; every item is `ignored_fenced`; the re-claimed targets are untouched |
 | C34 | Crash inside the profile confirm transaction, then the client retries with the same `Idempotency-Key` | Either nothing changed and the retry activates once, or the retry returns the original response; never a second activation |
 | C35 | An operation (profile extraction) stalls after its reservation; the reconciler re-queues it and a second execution runs; then the first resumes | The first execution's dispatch marker updates 0 rows and it never sends; exactly one extraction call is billed |
@@ -5953,7 +5978,7 @@ networks:
 volumes:
   parse_jobs:                                    # RAM only: a decrypted CV never reaches a disk (§12.2)
     driver: local
-    driver_opts: {type: tmpfs, device: tmpfs, o: "size=256m,uid=0,gid=10011,mode=0770"}
+    driver_opts: {type: tmpfs, device: tmpfs, o: "size=256m,uid=0,gid=10011,mode=2770"}   # setgid: per-job dirs inherit 10011
   pgdata: {}
   cv_store: {}
   manifests: {}
@@ -6079,14 +6104,14 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
   - `ALTER DEFAULT PRIVILEGES FOR ROLE jobhunter_migrator GRANT USAGE, SELECT ON SEQUENCES TO jobhunter_app;`
   - `GRANT pg_read_all_data TO jobhunter_backup;` and `ALTER ROLE jobhunter_restore CREATEDB;`
 - **`jobhunter migrate`** runs as the `migrator` role, in this order:
-  1. re-apply the **explicit grants** idempotently: the backup role's `INSERT, UPDATE` on `backup_sets`, `backup_runs`, `manifest_shipments` and `manifest_shipment_items`. A restore uses `--no-acl` (§19.5), which drops them;
-  2. **advance identity sequences** past every id the manifest stream references (§19.5), before any write;
-  3. `alembic upgrade head`;
-  4. `procrastinate schema --apply` (or its migration scripts, for upgrades);
-  5. `PostgresSaver.setup()` on a dedicated `autocommit=True, prepare_threshold=0, row_factory=dict_row` connection (it uses `CREATE INDEX CONCURRENTLY`);
+  1. **advance identities of the existing tables** past every id the manifest stream references (§19.5). On a restored database this happens before any write. On an empty schema (a first installation) no application table exists yet, and the step does nothing;
+  2. `alembic upgrade head`. Migrations change the schema only and never insert rows into identity tables (seeding is step 6), so no id is allocated before the advancement;
+  3. **advance identities again**, now for every table, including those step 2 created. This is the empty-schema path: a first installation onto a `manifests` volume that already holds manifests gets the same guarantee;
+  4. **explicit grants**, idempotently and only now that every table exists: the backup role's `INSERT, UPDATE` on `backup_sets`, `backup_runs`, `manifest_shipments` and `manifest_shipment_items`. This creates them on a first installation and after an upgrade that adds one of these tables, and re-creates them after a restore, which uses `--no-acl` (§19.5);
+  5. `procrastinate schema --apply` (or its migration scripts, for upgrades), then `PostgresSaver.setup()` on a dedicated `autocommit=True, prepare_threshold=0, row_factory=dict_row` connection (it uses `CREATE INDEX CONCURRENTLY`);
   6. seeding the `sources` rows, rubric v1, the initial prompt-schema version, the default execution config and evaluation policy, and the `ranking_state` row, all idempotent;
-  7. replaying deletion manifests from the mounted `manifests` volume (§19.5).
-- Steps 1, 2 and 7 are idempotent and cheap, so every `migrate` runs them, not only the one after a restore.
+  7. replaying deletion manifests from the mounted `manifests` volume (§19.5), including the rebuilds they require.
+- Steps 1, 3, 4 and 7 are idempotent and cheap, so every `migrate` runs them, not only the one after a restore. The three paths (first installation, upgrade from the preceding release, restore) are integration-tested (§18.2) and exercised by spike V22.
 - **Expand/contract**: additive migrations ship first. Destructive steps follow at least one release later.
 - Every migration has an integration test, and long index builds use `CONCURRENTLY` in separate non-transactional migrations.
 - `/readyz` fails until the Alembic revision equals the code head.
@@ -6104,7 +6129,7 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `migrate` | §19.3 |
 | `worker` / `worker-health` | Start the worker / its health probe |
 | `migrate --database <db> --steps sequences,alembic,replay --manifest-dir <dir> --cv-dir <dir>` | The subset of `migrate` the restore test runs against its scratch database (§19.5) |
-| `manifests replay` | Migrate steps 2 and 7 alone: advance sequences, then replay the manifest stream by `manifest_uuid` |
+| `manifests replay` | Migrate steps 1, 3 and 7 alone: advance identities, then replay the manifest stream by `manifest_uuid` |
 | `restore verify --set <id> --phase restored\|replayed [--database <db>]` | Checks on a restored database (§19.5) |
 | `crypto rotate` | Resumable data-key rotation (§16.8) |
 | `schema-dry-run --live` | §10.11 |
@@ -6124,34 +6149,44 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 7. Set `backup_sets` to `succeeded` with the restic snapshot id and the inventory, and clear the staging directory. Any failure → `failed` with the error and `backup.failed` (critical).
 
 **Deletion manifests** (§7.14) make deletions durable across a disaster:
-1. **Identity.** A manifest's stream identity is its `manifest_uuid` (UUIDv7, generated by the app), never its `id`. Its file is `<manifest_uuid>.json`; it holds the uuid, kind, scope (ids and key hashes only) and `max_ids`: the highest id of every identity column of the application schema when the manifest was created.
-2. **Before** any row or file is deleted, the deleting task computes the manifest content and its sha256, commits the `deletion_manifests` row (`executing`) together with its purge fence (§20.2), and then writes the file: to `<manifest_uuid>.json.tmp`, `fsync`, rename, `fsync` of the directory. A crash between the commit and the rename leaves an `executing` row without a file; the purge operation's retry rewrites the identical file before it deletes anything.
-3. It performs the deletes, then sets `completed`.
-4. The **manifest shipper** (backup container, every 5 min) lists the `*.json` files of `/data/manifests` (never `*.tmp`), hashes each, runs `restic backup --files-from <that list> --tag manifests`, and records in one transaction a `manifest_shipments` row with one `manifest_shipment_items` row **per file the snapshot contains** (uuid and sha256). Coverage is therefore exact, never inferred from a highest id: a manifest that was still unwritten during a shipment simply has no item in it. Every run ships every file, so the latest `manifests` snapshot is always the complete stream.
-5. The `manifest_shipping` reconciler (§17.4) marks a `completed` manifest `shipped` when an item names its uuid with an equal sha256.
-6. The UI and the API report a deletion as done **only at `shipped`**. A manifest not shipped within 1 h raises `privacy.manifest_unshipped` (critical).
+1. **Identity.** A manifest's stream identity is its `manifest_uuid` (UUIDv7, generated by the app), never its `id`. Its file is `<manifest_uuid>.json`; it holds the uuid, the kind, `max_ids` (the highest id of every identity column of the application schema when the manifest's content was computed) and an ordered list of **typed operations**.
+2. **Typed operations** (Codex R3-5). A manifest never says only "these ids must be gone": each operation states what it does and the postcondition that replay and verification check. Operations hold ids, named selectors, column names and key hashes only, never content.
 
-**Replay rules** (migrate step 7, and the restore test). For each file of the restored stream, keyed by `manifest_uuid`:
+   | Operation | Payload | Replay action | Verified postcondition |
+   |---|---|---|---|
+   | `fence` | the fence kind and key (§20.2); for a source purge, the source whose jobs must be rebuilt | recreate the fence as an active `purge_fences` row for this manifest if the database has none; run every other operation of the manifest, then the **rebuild** of every job the fence matches (§20.5 step 5); release the fence in the manifest's final replay transaction, together with `completed` | no fence of the manifest is active, and every job the fence matched is deleted or rebuilt: no posting, revision lineage, current `det_results` instance or golden-case snapshot of it names the purged source |
+   | `row_delete` | a table and either ids or a named selector (`all`, `source:<id>`) bounded by the manifest's `max_ids` for that table | delete in the deletion-graph order of the manifest's kind (§20.2, §20.4, §20.5) | no named row exists; for a selector, no row with `id ≤ max_ids[table]` matches it, apart from the rows the kind keeps (§20.4) |
+   | `field_redact` | a table, ids, the redacted columns and, where the table has one, the marker (`purged_at`, `content_purged_at`, `status = 'purged'`) | set the columns to NULL and the marker | every named row that still exists has every redacted column NULL and its marker set. **The row stays valid**: a purged profile version keeps its id, tuples and references while its content is absent |
+   | `file_remove` | a volume and storage keys | unlink | no named file exists on the volume |
+
+   The `max_ids` bound makes selectors safe to replay: rows created after the manifest have larger ids (identity advancement, below), so a replay never touches them.
+3. **Before** any row or file is deleted, the purge commits the `deletion_manifests` row (`executing`, no file yet) together with its purge fence (§20.2). It then waits until no `jobhunter_app` transaction that began before that commit is still open (`pg_stat_activity`), so every consumer that checked the fence earlier has finished, and only then computes `max_ids` and the operations and writes the file: to `<manifest_uuid>.json.tmp`, `fsync`, rename, `fsync` of the directory, then `file_sha256` is recorded. Deletes start only after `file_sha256` is set. A crash before that leaves an `executing` row without a file; the purge operation's retry recomputes the content, which the fence keeps unchanged, and writes the file before it deletes anything.
+4. It performs the operations in order, then sets `completed`.
+5. The **manifest shipper** (backup container, every 5 min) lists the `*.json` files of `/data/manifests` (never `*.tmp`), hashes each, runs `restic backup --files-from <that list> --tag manifests`, and records in one transaction a `manifest_shipments` row with one `manifest_shipment_items` row **per file the snapshot contains** (uuid and sha256). Coverage is therefore exact, never inferred from a highest id: a manifest that was still unwritten during a shipment simply has no item in it. Every run ships every file, so the latest `manifests` snapshot is always the complete stream.
+6. The `manifest_shipping` reconciler (§17.4) marks a `completed` manifest `shipped` when an item names its uuid with an equal sha256.
+7. The UI and the API report a deletion as done **only at `shipped`**. A manifest not shipped within 1 h raises `privacy.manifest_unshipped` (critical).
+
+**Replay rules** (migrate step 7, and the restore test). Manifests replay in `manifest_uuid` order (UUIDv7 sorts by creation time). For each file of the restored stream:
 
 | Restored database has | Action |
 |---|---|
-| no row with that uuid (the manifest is newer than the dump) | insert the row from the file as `executing`, perform its deletes, set `completed` |
-| the row, `executing` | perform its deletes again (they are idempotent), set `completed` |
-| the row, `completed` or `shipped` | check that no named id is present; delete any that is |
+| no row with that uuid (the manifest is newer than the dump) | insert the row from the file as `executing`, run its operations in order (the `fence` operation first, its rebuild last), set `completed` in the transaction that releases the fence |
+| the row, `executing` | run its operations again (every one is idempotent), then the same final transaction |
+| the row, `completed` or `shipped` | check every operation's postcondition; re-run, in order, each operation whose postcondition fails, with the fence reconstructed for the duration if any rebuild is needed |
 
-Each manifest records the replay once in `replay_log` (restore id, time, deleted counts). Replay releases the manifest's purge fences, and the rebuild step of a source purge (§20.5 step 5) is re-queued as a `purge` operation. A file that does not parse, or whose name differs from the uuid inside it, stops `migrate` with an error for the operator; nothing is replayed until it is resolved.
+Each manifest records the replay once in `replay_log` (restore id, time, per-operation counts). Fences are never released before their rebuild has completed (Codex R3-6): a failed rebuild stops `migrate` with the fence still active, and `api` and `worker`, which depend on `migrate` completing, do not start. A file that does not parse, or whose name differs from the uuid inside it, also stops `migrate` with an error for the operator; nothing is replayed until it is resolved.
 
-**Identity advancement** (migrate step 2). Before any write, `migrate` sets every identity column of the application schema to restart above the greatest of its current maximum and the `max_ids` value of every manifest in the stream (`ALTER TABLE … ALTER COLUMN id RESTART WITH`, as the owner). A row created after a restore therefore never receives an id that a manifest names, so a later replay can never delete new data, and a profile version or job re-created after a purge never shares an id with the purged one.
+**Identity advancement** (migrate steps 1 and 3). Before any write, `migrate` sets every identity column of the application schema to restart above the greatest of its current maximum and the `max_ids` value of every manifest in the stream (`ALTER TABLE … ALTER COLUMN id RESTART WITH`, as the owner). A row created after a restore therefore never receives an id that a manifest names or that a selector's bound covers, so a later replay can never delete new data, and a profile version or job re-created after a purge never shares an id with the purged one.
 
 **Restore order** (`deploy/backup/restore.sh`, run with `docker compose --profile restore run --rm restore`; documented in the runbook; `api` and `worker` stay stopped):
 1. Restore the **latest manifest stream** (`restic restore latest --tag manifests`) into the `manifests` volume first.
 2. Choose a backup set (`--tag set:<id>`, latest by default), restore it into `/data/staging`, and verify `backup_set.json` against the dump's sha256.
 3. Start `postgres` on an empty data directory: `deploy/postgres/init` creates the roles, the extensions, the template database and the default privileges (§19.3).
 4. `pg_restore --no-owner --no-acl --exit-on-error -L <filtered list>` into the application database, as the migrator role. Every restored object is owned by the migrator, so the default privileges grant DML to the app role, and no ownership or ACL statement needs a superuser. The filtered list is `pg_restore --list` without the entries for the extensions, their comments and the `public` schema, which step 3 already created.
-5. `jobhunter restore verify --set <id> --phase restored`: the Alembic revision and the per-table row counts equal `backup_set.json`; `deletion_manifests` holds `manifest_count` rows; the checksum of 100 random raw responses matches. This runs before replay, because replay deletes rows.
+5. `jobhunter restore verify --set <id> --phase restored`: the Alembic revision and the per-table row counts equal `backup_set.json`; `deletion_manifests` holds `manifest_count` rows; the checksum of 100 random raw responses matches. This runs before replay, because replay deletes rows. It then closes the backup rows the dump captured mid-run: the set's own `backup_sets` row, dumped while `running`, becomes `succeeded` from `backup_set.json` and the restic snapshot id, and any other `running` `backup_sets` or `backup_runs` row becomes `failed` with error `restored_mid_backup`.
 6. Restore the CV files of the same set into `cv_store`.
-7. Run `migrate` (§19.3): grants, identity advancement, migrations, seeding and replay; it then deletes CV files that no restored row references.
-8. `jobhunter restore verify --set <id> --phase replayed`: every manifest of the stream has a `completed` or `shipped` row; **no id named by any manifest is present**; every identity column restarts above all `max_ids`.
+7. Run `migrate` (§19.3): identity advancement, migrations, grants, seeding and replay **with its rebuilds**; it then deletes CV files that no restored row references.
+8. `jobhunter restore verify --set <id> --phase replayed`: every manifest of the stream has a `completed` or `shipped` row; **every operation's postcondition holds** (rows deleted, fields redacted with their rows intact, files removed); no purge fence is active, and every rebuild has completed; every identity column restarts above all `max_ids`.
 9. Start `api` and `worker`.
 
 A deletion acknowledged to the user is shipped offsite before the acknowledgement, so no restore can bring it back (S9, crash case C32).
@@ -6277,10 +6312,12 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 ### 20.2 Deletion graph
 
 Every purge runs as a `purge` operation (§7.3; the payload names its manifest) and follows the same protocol:
-1. **Manifest and fence.** One transaction holding `active_config` `FOR UPDATE` commits the `deletion_manifests` row (`executing`) and the purge's `purge_fences` rows (§7.14). The manifest file is then written and fsync'd (§19.5).
+1. **Manifest and fence.** One transaction holding `active_config` `FOR UPDATE` commits the `deletion_manifests` row (`executing`, no file yet) and the purge's `purge_fences` rows (§7.14). Once every application transaction older than that commit has ended, the purge computes the manifest's typed operations and `max_ids`, then writes and fsyncs the file and records its hash (§19.5). Nothing is deleted before that.
 2. **Delete** in the order below, in bounded transactions that are idempotent on retry. A chunk that touches jobs first takes their rows `FOR UPDATE` in id order and only then selects the rows to delete, so it includes anything a consumer created before the fence committed.
 3. **Complete.** The final transaction sets the manifest `completed` and the fences' `released_at`. A failed purge keeps its fences, so fenced work stays blocked until a retry completes it (`purge_fences` reconciler, §17.4).
 4. **Report** the deletion as done only when the manifest is `shipped`.
+
+**Manifest operations.** The manifest records each purge's steps below as typed operations (§19.5): every deletion as `row_delete`; every content nulling (`profile_json`, query-proposal `items`, call `output_json`, CV texts, draft content, raw bodies, export paths) as `field_redact`, whose rows stay valid; CV and export files as `file_remove`; and the purge fence as `fence`. Replay after a restore checks each operation's own postcondition, so a purged profile version that still exists with its content absent satisfies its manifest.
 
 Ledgers (`quota_ledger`, `llm_spend_ledger`, `llm_budget`) are never touched; their `run_id` and `fetch_request_id` references become NULL by `ON DELETE SET NULL`.
 
@@ -6389,7 +6426,7 @@ The user types `DELETE EVERYTHING` and re-enters the password. A `purge` operati
    | other `dispatched` ledger entries (online calls in flight) | settle from their response, or become `ambiguous` after 15 minutes (§7.16.7) |
 
    Every reservation of a deleted batch therefore stays counted at its maximum until the month closes, so the cap holds even if a cancel fails.
-3. **Delete**, in this order (each step's referencing rows are gone before the referenced rows):
+3. **Delete**, in this order (each step's referencing rows are gone before the referenced rows). The manifest records each step as a `row_delete` with the `all` selector bounded by `max_ids` (§19.5), so a replay never removes rows created after the deletion:
    1. every score target, via target-set deletion;
    2. `eval_case_results`, `eval_runs` (their `llm_calls` cascade), `golden_cases` (their calls cascade), `score_feedback`;
    3. every remaining `llm_calls` row (extraction and query-proposal calls; `profile_drafts.llm_call_id` and `query_proposals.llm_call_id` become NULL);
@@ -6420,11 +6457,11 @@ The UI states that backup sets age out within about 3 months, that the manifest 
 3. **Purge derivatives**:
    - target-set deletion for every target of a tainted revision (results, drafts, critic notes, call outputs, evidence and det instances);
    - `det_results` of untainted revisions whose `det_inputs` name an Adzuna source (for example an Adzuna salary): deleted, and new current instances are computed from the remaining data;
-   - golden cases on tainted revisions, active or not (the agreement overrides the exemption; the UI lists the deleted cases). Their `eval_case_results` **and their eval calls** are deleted with them (`llm_calls.golden_case_id ON DELETE CASCADE`). Any other evaluation call whose `input_refs` names a tainted revision is deleted explicitly. Eval runs keep only aggregate metrics, which hold no ad content;
+   - golden cases on tainted revisions **and golden cases whose frozen det-inputs draw on Adzuna** (`'adzuna' = ANY(det_input_sources)`, for example an Adzuna salary on a revision whose text came from another source), active or not (the agreement overrides the exemption; the UI lists the deleted cases). Their `eval_case_results` **and their eval calls** are deleted with them (`llm_calls.golden_case_id ON DELETE CASCADE`), and the manifest lists them as `row_delete` operations. Any other evaluation call whose `input_refs` names a tainted revision is deleted explicitly. Eval runs keep only aggregate metrics, which hold no ad content;
    - every export.
-4. **Delete the source data**: every Adzuna posting (observations and key sources cascade), the `adzuna` keys, and the Adzuna fetch requests with their raw responses and items (the quota ledger keeps its rows, with `fetch_request_id := NULL`).
+4. **Delete the source data** (manifest operations: `row_delete` with the `source:adzuna` selector bounded by `max_ids`, §19.5): every Adzuna posting (observations and key sources cascade), the `adzuna` keys, and the Adzuna fetch requests with their raw responses and items (the quota ledger keeps its rows, with `fetch_request_id := NULL`).
 5. **Rebuild** each affected job from its remaining postings: recompute the canonical fields; reuse a revision only if its lineage names no Adzuna source; otherwise delete the job's tainted revisions first (`current_revision_id` is deferred) and insert a new revision, so a rebuilt revision with an identical `material_hash` is never the tainted one. Jobs that had only Adzuna postings are deleted with their dependents (tombstoning steps 4–7, without tombstones). No target is created here.
-6. **Final transaction**: release the fence and mark the manifest `completed`; it is reported done when `shipped`. The `missing_targets` reconciler then creates the targets of the rebuilt revisions (§17.4).
+6. **Final transaction**: release the fence and mark the manifest `completed`; it is reported done when `shipped`. The `missing_targets` reconciler then creates the targets of the rebuilt revisions (§17.4). A replay after a restore reconstructs the fence and repeats this rebuild before it releases the fence (§19.5), so a restored database never exposes an Adzuna-derived canonical field.
 
 Afterwards, no Adzuna-derived text, salary or score remains in the database, in exports or in any future restore. `sources.purge_fence_at` stays set as the record that the source was purged; the disabled source can only be re-enabled by a new settings version.
 
@@ -6611,7 +6648,7 @@ Each spike produces a short recorded result in `docs/spikes/` and, where relevan
 | V19 | The text input bound of §10.7 (chair decision C1): the tokenizer emits **at most one token per UTF-8 byte** for every rendered component, and the fixed per-request overhead per model | For 30 recorded generator, critic and profile requests per model, German and English, including umlauts, `ß`, typographic quotes and dashes: `messages.count_tokens` (free) for each component on its own and for the whole request, compared with the `usage` of the matching recorded responses (no new paid calls) | Every component has tokens ≤ bytes, and every recorded `usage` input + cache tokens ≤ the computed bound. `PROMPT_OVERHEAD_TOKENS[model]` = 2 × the largest framing overhead observed (whole-request tokens − Σ component tokens). For native PDF, `count_tokens` accepts the document block and recorded usage ≤ 1.25 × its count; otherwise the native-PDF path stays disabled. A violation of tokens ≤ bytes applies the §10.7 factor rule and restates S3 |
 | V20 | Client IP through Caddy | Compose test stack: requests from two client addresses, with and without a spoofed `X-Forwarded-For` | `login_attempts.ip` and `sessions.ip` record the real addresses; the spoofed header is ignored (test N2) |
 | V21 | The no-egress boundary | Compose test stack on the target VPS image with the `DOCKER-USER` rule installed | From `api` and `docparse`, DNS and TCP connections to an outside address fail; from `worker` they succeed (test N1) |
-| V22 | Secret delivery and the non-superuser restore (§19.2, §19.5) | Compose test stack with every secret file `root:10010`, mode 0440; a backup set, then a manifest created after it | Every app service passes `startup-check`. `pg_restore --no-owner --no-acl --exit-on-error` with the filtered list succeeds as the migrator and, into a database created from `jobhunter_template`, as `jobhunter_restore`. Both `restore verify` phases pass; the post-dump manifest's ids are absent after replay, and every identity restarts above its `max_ids` |
+| V22 | Secret delivery and the non-superuser restore (§19.2, §19.5) | Compose test stack with every secret file `root:10010`, mode 0440; a backup set, then a manifest created after it | Every app service passes `startup-check`. `pg_restore --no-owner --no-acl --exit-on-error` with the filtered list succeeds as the migrator and, into a database created from `jobhunter_template`, as `jobhunter_restore`. `migrate` also completes on a first installation and on an upgrade from the preceding release. Both `restore verify` phases pass: the post-dump manifest's operation postconditions hold after replay (including a profile purge whose version row stays with its content absent), its rebuild completes before the fence is released, and every identity restarts above its `max_ids` |
 
 ---
 
