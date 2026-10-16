@@ -1,0 +1,30 @@
+target-version = "py313"
+line-length = 110
+
+[format]
+# ruff 0.17 formats fenced code in Markdown; the plan and spec blocks are normative text, not code.
+exclude = ["docs/**"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "BLE", "UP", "S", "TID", "ASYNC", "RUF", "DTZ"]
+
+[lint.flake8-tidy-imports.banned-api]
+"anthropic.Anthropic".msg = "Only llm/gateway.py may reach Claude (§10.1)"
+"anthropic.AsyncAnthropic".msg = "Only llm/gateway.py may reach Claude (§10.1)"
+"langchain_anthropic.ChatAnthropic".msg = "Only llm/gateway.py may reach Claude (§10.1)"
+"psycopg.errors".msg = "Catch sqlalchemy.exc.DBAPIError subclasses and classify with db.sql.pg_error; raw psycopg code checks exc.sqlstate"
+
+[lint.per-file-ignores]
+"backend/src/jobhunter/llm/**" = ["TID251"]
+"backend/src/jobhunter/worker/tasks.py" = ["BLE001"]
+"backend/src/jobhunter/worker/reconcilers.py" = ["BLE001"]
+"backend/src/jobhunter/worker/main.py" = ["BLE001"]
+"backend/src/jobhunter/worker/watchdog.py" = ["BLE001"]
+"backend/src/jobhunter/worker/operations.py" = ["BLE001"]
+"backend/src/jobhunter/worker/runs.py" = ["BLE001"]
+"backend/src/jobhunter/worker/shutdown.py" = ["BLE001"]
+"backend/src/jobhunter/worker/heartbeat.py" = ["BLE001"]
+"backend/src/jobhunter/api/edge.py" = ["BLE001"]
+"backend/src/jobhunter/api/errors.py" = ["BLE001"]
+"tests/**" = ["S101", "S105", "S106", "S603", "S607"]
+"scripts/**" = ["S603", "S607"]
