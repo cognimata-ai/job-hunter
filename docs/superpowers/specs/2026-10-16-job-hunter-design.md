@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Status | Approved design; revised after 4-eyes review (Codex GPT-6 Astra, Claude Fable 5.1) — revision 2 |
+| Status | Design under final review — revision 3 (after two rounds of 4-eyes review by Codex GPT-6 Astra and Claude Fable 5.1, with the chair's decisions on three items, §2.4) |
 | Date | 2026-10-16 |
-| Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, and the user's cost decision of revision 2 (§2.1 U14) |
+| Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, the user's cost decision of revision 2 (§2.1 U14), and the chair's decisions of revision 3 (§2.4) |
 | Scope | One deployment for one user, German job market |
 
 Normative language: **MUST** / **MUST NOT** are invariants that tests have to check. **SHOULD** means the default behaviour, and any deviation needs a written reason. Every tunable value below gives its default and the place where it is configured: `settings` (UI-editable and versioned, §13), `env` (§19.2) or `const` (a code constant in the module named).
@@ -58,7 +58,7 @@ Job Hunter is a production-grade, single-user web application. On a configurable
 |---|---|---|
 | S1 | No silent drops | For every run, Σ raw-item dispositions equals the items received, with zero `pending` items at finalize. Every score target is in a glossary state (§1.6). Any violation sets the run to `failed_invariant` and raises an alert. |
 | S2 | Paid quota never exceeded | For every provider window, counted units (`reserved + dispatched + billed + ambiguous + adjustment`) ≤ the limit, with every reservation admitted under the provider's window lock and the owner's fencing lock (§6.2). Property tests cover this, and so does the `quota.limit_breach` invariant. |
-| S3 | LLM cap never exceeded | Every LLM reservation is admitted under the monthly budget lock only if `counted + reservation ≤ cap` (§6.9). Reservations are true upper bounds (§10.7), so settled cost never exceeds its reservation; a bound violation is a critical defect that pauses scoring (`llm.reservation_bound_violated`). |
+| S3 | LLM cap never exceeded | Every LLM reservation is admitted under the monthly budget lock only if `counted + reservation ≤ cap − overrun_buffer` (§6.9.1). Text reservations bound input tokens by the UTF-8 byte length of the request plus a doubled, measured overhead (§10.7). **Residual assumption: the cap holds provided the tokenizer emits ≤ 1 token per byte; spike V19 verifies this on the fixture corpus, umlauts included.** The `overrun_buffer` (default $2, never admitted for spending) absorbs any remaining overhead error. A settled cost above its reservation raises the critical alert `llm.reservation_bound_violated` and pauses scoring. |
 | S4 | Every score traceable | Every published result links to its job revision, profile version, rubric version, prompt/schema version, model policy, attempts, LLM calls (requested and served model, effort, usage), drafts, critic notes and evidence. A test walks this lineage for every fixture result. |
 | S5 | Stale data never shown as fresh | Each card shows posted date with its precision, plus first-seen and last-seen times. Stale or closed availability is shown, and stale/closed ads are hidden by default. The header strip turns red when the last successful run is older than 2× the interval. |
 | S6 | Scheduler liveness visible off-box | The healthchecks.io dead-man switch alarms within `interval + grace` of a missing run. |
@@ -75,26 +75,26 @@ All code, tables, API responses and UI labels MUST use these exact names.
 | **Run status** (`runs.status`) | `queued`, `running`, `succeeded`, `partial`, `failed`, `failed_invariant`, `cancelled`, `missed`, `skipped_overlap` |
 | **Run trigger** | `schedule`, `catch_up`, `manual` |
 | **Fetch request** (`fetch_requests.status`) | `planned`, `reserved`, `dispatched`, `succeeded`, `failed`, `ambiguous`, `skipped`. Skip reasons: `paced`, `reserve_held`, `exhausted`, `window_cap`, `breaker_open`, `awaiting_window_validation`, `shutdown`, `run_cancelled`, `superseded`, `not_needed` |
-| **Paid attempt / ledger entry** (`quota_ledger.state`, `llm_spend_ledger.state`) | `reserved`, `dispatched`, `billed`, `not_billed`, `ambiguous` (entry kind `request`); entries of kind `adjustment` have no state. `ambiguous` exits only through the two batch-evidence transitions of §7.16.7. |
+| **Paid attempt / ledger entry** (`quota_ledger.state`, `llm_spend_ledger.state`) | `reserved`, `dispatched`, `billed`, `not_billed`, `ambiguous` (entry kind `request`); entries of kind `adjustment` have no state. `ambiguous` exits only for items of a batch that was found: to `billed` from downloaded usage, or to `not_billed` with the provider's per-item evidence (§7.16.7). |
 | **Raw item disposition** | `pending`, `linked`, `out_of_scope`, `duplicate_in_page`, `rejected` |
 | **Availability** (posting and job) | `active`, `stale`, `closed`, `unknown` |
 | **Job revision embedding** | `awaiting_embedding`, `embedded` |
 | **Score target** | `pending`, `filtered_out`, `deferred_duplicate`, `budget_deferred`, `in_progress`, `in_batch`, `published_accepted`, `published_contested`, `refused`, `failed_max_tokens`, `failed_invalid_output`, `failed_request`, `failed_transient`, `failed_attempts_exhausted`, `expired_unscored`, `cancelled`. User override (`score_targets.override`): `none`, `score_now`, `score_anyway`, `individual` |
 | **Score attempt outcome** | `running`, `published_accepted`, `published_contested`, `refused`, `failed_max_tokens`, `failed_invalid_output`, `failed_request`, `transient_error`, `budget_exhausted`, `claim_lost`, `cancelled`, `batch_draft_ready`, `submit_rejected`, `released` |
 | **LLM result status** | `accepted`, `contested` |
-| **Batch submission** | `preparing`, `submit_started`, `submitted`, `submit_rejected`, `submit_ambiguous`, `ended`, `reconciled`, `not_submitted`, `abandoned` |
+| **Batch submission** | `preparing`, `submit_started`, `submitted`, `submit_rejected`, `submit_ambiguous`, `released`, `ended`, `reconciled`, `abandoned` |
 | **Batch item result** | `awaiting`, `succeeded`, `errored`, `canceled`, `expired`, `missing` |
 | **Profile draft** | `uploaded`, `extracting_text`, `text_review`, `extracting_profile`, `ready`, `failed`, `confirmed`, `discarded` |
 | **Source instance health** | `ok`, `degraded`, `breaker_open`, `auth_failed`, `contract_broken`, `not_found`, `disabled` |
 | **Quota window** | `validated`, `extrapolated_unvalidated`, `exhausted_until_reset` |
 | **Coverage interval** | kind `covered` or `gap`; gap status `open`, `closed`, `abandoned` |
 | **Duplicate group** | `active`, `dissolved`; an active group may carry `unscorable_reason` (`all_failed`, `all_filtered`, `no_active_member`) |
-| **ATS snapshot** | `complete`, `incomplete`, `mass_disappearance` |
+| **ATS snapshot** | `complete`, `incomplete`, `mass_disappearance`. `complete` and `mass_disappearance` are both *structurally complete*; `mass_disappearance` is a closure classification (§8.11) |
 | **Identity conflict** | `open`, `resolved_separate`, `resolved_merged` |
 | **Alert** | severity `info`, `warn`, `critical`; lifecycle `open` → `acknowledged` → `resolved` |
 | **Confidence** | `high`, `medium`, `low` |
 | **Score cycle** | `running`, `completed`, `failed` |
-| **Operation (durable intent)** | `pending`, `running`, `succeeded`, `failed` |
+| **Operation (durable intent)** | `pending`, `running`, `succeeded`, `failed`, `cancelled`; each execution holds a fresh claim token (§3.3.3) |
 | **Bulk operation** | `active`, `completed`, `cancelled` |
 | **Deletion manifest** | `executing`, `completed`, `shipped` |
 | **Backup set** | `running`, `succeeded`, `failed` |
@@ -104,7 +104,9 @@ Other key terms:
 - **Evaluation policy**: the immutable, versioned critic-routing policy (trigger thresholds, sample rate, per-trigger critic effort; §11.7). It is recorded on every result but is not part of the tuple (§11.11).
 - **Execution config**: the immutable, versioned per-node operational settings (`max_tokens`, deadlines). Every LLM call records it (§10.3).
 - **Score attempt**: one claim of one score target (`score_attempts`, `attempt_no`). **Run attempt**: one ownership epoch of one collection run (`run_attempts`).
-- **Logical call**: one node-level LLM step inside a score attempt (generate, regenerate, revise, critic); at most 7 per attempt. **HTTP try**: one physical request made by the gateway for a logical call (transport retries and the enlarged-`max_tokens` retry are separate tries); at most 6 per logical call (§10.4).
+- **Logical call**: one node-level LLM step inside a score attempt (generate, regenerate, revise, critic) that reached at least one dispatched HTTP try; it is counted in the dispatch-marker transaction of its first try, so a step denied before dispatch (budget, claim, deadline) is not a logical call. At most 7 per attempt. **HTTP try**: one physical request made by the gateway for a logical call (transport retries and the enlarged-`max_tokens` retry are separate tries); at most 6 per logical call (§10.4).
+- **Overrun buffer**: the part of the monthly cap that is never admitted for spending (`llm.overrun_buffer_usd`, default $2.00, §6.9.1).
+- **Purge fence**: a persisted marker on the inputs a running purge is deleting; target creation, admission, publication, evals and exports honour it (§20.2).
 - **Score instance**: one immutable `det_results` row. The *current* instance for a (result, scope) pair is the one flagged `is_current` (§11.11).
 - **USD bucket**: the persistent, time-based LLM pacing allowance (§6.9). **Hard headroom**: `cap − counted spend` of the month.
 - **Worker epoch**: the number that the singleton worker increments each time it acquires the advisory lock; every run attempt, claim and cycle records the epoch that owns it (§3.3.3).
@@ -149,7 +151,7 @@ Other key terms:
 | R6 | **Scoring is a detached lane** of score targets with its own claim lease. It is not a `runs` row. | Prevents scoring colliding with the one-active-collection index, and decouples long work. |
 | R7 | **`llm_result` is separate from `det_result`.** Scope changes recompute deterministic results without any LLM call (precompute, then flip). | Changing a radius must not cost an LLM re-score, and must not blank the ranking. |
 | R8 | **Exactly one retry layer per LLM call, owned by the gateway.** SDK `max_retries=0`; per-attempt spend reservation. | Every HTTP attempt has to be visible to the spend ledger. |
-| R9 | **A batch submission with an ambiguous submit is never resubmitted while ambiguous.** It is settled only with positive evidence and never on a timeout (consensus A7 v3.1). The price is that an API outage can keep that submission's reservation counted until reconciliation succeeds; the alert and the Budget page state the amount. | A lost submit response could otherwise bill twice and break the cap. |
+| R9 | **A batch submission with an ambiguous submit is never resubmitted while ambiguous.** It is never settled on a timeout and, by the chair's decision C3 (§2.4), never settled automatically from an empty listing either: only a matching batch that is found, or an explicit user release, ends the quarantine. The price is that the submission's reservation stays counted as `ambiguous` unless the batch is found; the alert and the Budget page state the amount. This is stricter than consensus A7 v3.1, which allowed a positive-evidence `not_submitted` settlement. | A lost submit response could otherwise bill twice and break the cap. |
 | R10 | Server-side refusal **fallbacks off**. | A silently different model would break score versioning. |
 | R11 | **SerpApi only when JSearch is provider-exhausted, circuit-open, auth-failed or contract-broken**, never because of local pacing. | SerpApi is a fallback, not extra volume on the same Google index. |
 | R12 | **Hard filters act on positive evidence only.** Unknown values pass. | A missing attribute must never become a rejection. |
@@ -172,6 +174,16 @@ Other key terms:
 - Batches: 50% price, results within ≤ 24 h, `custom_id` must match `^[a-zA-Z0-9_-]{1,64}$`. LangChain cannot do batches.
 - Dev-container gotcha: `ANTHROPIC_BASE_URL` points at a proxy, so the app MUST pass `base_url` and `api_key` explicitly.
 - GDPR: the CV is personal data, and ad texts contain recruiter PII. No PII may appear in logs or traces, and no raw fixture samples may be committed unscrubbed.
+
+### 2.4 Chair decisions (revision 3, binding)
+
+Three review findings cannot be fixed literally. The chair decided:
+
+| # | Item | Decision | Design consequence |
+|---|---|---|---|
+| C1 | Reservation upper bound (Codex #2) | The provider documents token counting as an estimate, so no provider-guaranteed bound exists. Text input is bounded by the **UTF-8 byte length** of every rendered component plus a fixed per-request overhead, measured by spike V19 and doubled; V19 must show tokens ≤ bytes on the fixture corpus, umlauts included. A global **overrun buffer** (default $2, at least `max concurrent calls × max per-call overhead error`) is never admitted for spending. Native PDF (opt-in only) reserves `count_tokens × 1.25` plus its buffer share, and the path is disabled when that cannot be computed. An overrun still raises a critical alert and pauses scoring. | §1.5 S3 (residual assumption), §6.9.1, §10.7, §22 V19 |
+| C2 | Shared SerpApi account (Codex #4) | The SerpApi account is assumed to be used **exclusively** by this app; the hourly guarantee depends on that. When other usage is detected, an alert is raised and admission switches to a conservative mode. Test Q-SH1 is downgraded accordingly. | §5.3.2, §6.5, §17.6, §18.1 |
+| C3 | Batch absence (Codex #37) | No automatic `not_submitted` proof. An empty listing keeps the submission `submit_ambiguous` until a matching batch is found or the user explicitly releases it; on release the spend stays counted as `ambiguous`. Provider-proven per-item unbilled transitions remain for items of a batch that **was** found (Codex N9). | §2.2 R9, §7.16.6–7.16.7, §10.10 |
 
 ---
 
@@ -230,7 +242,7 @@ Other key terms:
 | `embedder` | Stateless HTTP embedding service. The model is baked into the image at a pinned revision, and its sha256 is verified at start. | 1 | `internal` | none |
 | `postgres` | `pgvector/pgvector:0.8.7-pg17-bookworm` (pinned by digest). | 1 | `internal` | bootstrap superuser |
 | `migrate` | One-shot service: `alembic upgrade head`, default privileges, procrastinate schema migration, `PostgresSaver.setup()` on its own autocommit connection, then deletion-manifest replay (§19.5). `api` and `worker` depend on it with `service_completed_successfully`. | one-shot | `internal` | DB migrator role |
-| `backup` | busybox `crond` schedules: nightly backup sets, the deletion-manifest shipper, weekly prune, monthly restore test (§19.5). | 1 | `internal`, `egress` | DB backup and restore-test roles, restic, S3 |
+| `backup` | busybox `crond` schedules: nightly backup sets, the deletion-manifest shipper, weekly prune, monthly restore test (§19.5). Built from the app image, so the restore test runs the app's replay and verification code. A one-off `restore` service with the same image runs a disaster restore. | 1 | `internal`, `egress` | DB backup and restore-test roles, restic, S3 |
 
 - **No Redis.** Postgres holds the queue, intents, sessions, throttling counters, ledgers, checkpoints and domain data.
 - **Network boundary.** `proxy` and `internal` are Compose networks with `internal: true`, so they have no route to the internet. Only `edge` and `egress` are routable. A host firewall rule in the `DOCKER-USER` chain additionally drops new outbound connections from every container address except those on `egress` and Caddy's `edge` address, which ACME needs (§16.9). Integration test N1 (§18.2) proves that `api` and `docparse` cannot open an outbound connection.
@@ -249,7 +261,7 @@ Other key terms:
    2. Every `running` run whose current `run_attempts.worker_epoch` is older takes a new attempt (`attempt_no + 1`, new thread, `resume_count + 1`) owned by my epoch, and a locked `run_collect` task is deferred.
    3. Every `in_progress` score target whose `claim_epoch` is older is reclaimed (§9.4.3).
    4. Every `running` score cycle whose `worker_epoch` is older is set `failed('orphaned')`, and its report is closed.
-   5. Every `running` operation (§3.3.2) whose `worker_epoch` is older goes back to `pending`.
+   5. Every `running` operation (§3.3.2) whose `worker_epoch` is older goes back to `pending`, and its `claim_id` is cleared in the same statement.
 
    Old owners are therefore invalidated **atomically at takeover**, without waiting for their heartbeats to go stale.
 4. **Heartbeat and watchdog.** Every 10 s the worker runs the following statement on the lock session, with a 5 s statement timeout:
@@ -289,13 +301,15 @@ Other key terms:
   | Collection run attempt | `runs` | `attempt_no = :attempt AND status = 'running'` |
   | Score attempt | `score_targets` | `claim_id = :claim AND attempt_no = :attempt AND state = 'in_progress'` |
   | Batch submission | `batch_submissions` | `state = :expected` |
-  | Operation | `operations` | `worker_epoch = :epoch AND status = 'running'` |
+  | Operation | `operations` | `claim_id = :claim AND status = 'running'`. Every execution gets a fresh `claim_id` (UUID) when it moves `pending → running`; any reclaim clears it atomically, so an old execution can never become valid again within the same worker epoch |
 
   - Takeover, reclaim and cancellation lock the owner row `FOR UPDATE` and change the predicate (increment `attempt_no`, clear `claim_id`, change state).
   - Every **reservation** (quota or LLM), every **dispatch-marker commit** and every **domain write** of an owner runs in a transaction that first takes `SELECT … FROM <owner row> … FOR SHARE` and verifies the ownership predicate. `FOR SHARE` conflicts with `FOR UPDATE`, so reservation, dispatch admission and takeover are serialised.
   - A send happens only after the dispatch-marker transaction **committed with a verified predicate**. A takeover after that point cannot stop the send. The entry is already counted, and it settles `billed` or `ambiguous`.
   - An undispatched reservation of a superseded owner is released (`not_billed(never_dispatched)`) only by the reconciler or the new owner. The stale owner's later dispatch-marker transaction fails the predicate and returns 0 rows, and the stale owner MUST then abort without sending (`FencedOut`).
-  - **Global lock order** (deadlock avoidance), always acquired in this order: `active_config` → owner row → `llm_budget` month row → `quota_windows` row → ledger rows → domain rows.
+  - The ownership predicate is checked by **every** reservation, dispatch marker, heartbeat and domain write of the owner, including those of operations (profile extraction, query proposal, exports, purges, evals).
+  - **Purge fences** (§20.2) are persisted beside the predicate: every reservation and dispatch-marker transaction also refuses (`FencedOut`) while a `global` fence is active, except those of the purge operation itself, and work on a fenced job is refused as listed in §20.2.
+  - **Global lock order** (deadlock avoidance), always acquired in this order: `active_config` → job rows (purge chunks `FOR UPDATE`; target creation, revival and publication `FOR SHARE`, §20.2) → owner row → `llm_budget` month row → `quota_windows` row → ledger rows → other domain rows → `ranking_state`.
 - Before any resume within one process, the previous asyncio task for that run is cancelled and awaited.
 
 #### 3.3.4 Heartbeats
@@ -306,7 +320,7 @@ Other key terms:
 | `runs.heartbeat_at` | run task, plus long nodes internally | 30 s | 3 min | New attempt: `attempt_no+1`, new thread, `resume_count+1`. When `resume_count > 3`, the run becomes `failed` and an alert is raised. |
 | `score_targets.claim_heartbeat_at` | background asyncio task per held claim | 30 s, including during LLM calls | 3 min | Reclaim (§9.4.3). `in_batch` is exempt. |
 | `score_cycles.heartbeat_at` | the cycle task | 30 s | 3 min | The cycle is set `failed('orphaned')` and its claims are reclaimed (§17.4). |
-| `operations.heartbeat_at` | the operation task | 30 s | 3 min | The operation goes back to `pending` and is re-deferred. |
+| `operations.heartbeat_at` | the operation task, with its `claim_id` in the predicate | 30 s | 3 min | The operation goes back to `pending` with `claim_id := NULL` and is re-deferred. A heartbeat that updates 0 rows stops the execution. |
 
 #### 3.3.5 Graceful shutdown
 
@@ -440,7 +454,7 @@ job-hunter/
 ├── pyproject.toml, uv.lock, ruff.toml, mypy.ini
 ├── backend/src/jobhunter/
 │   ├── config.py                 # env loading + startup assertions (§16.8)
-│   ├── cli.py                    # `jobhunter` CLI: user, totp, migrate, worker, manifests, fixtures, schema-dry-run
+│   ├── cli.py                    # `jobhunter` CLI: user, totp, migrate, worker, manifests, restore, startup-check, fixtures, schema-dry-run
 │   ├── api/                      # FastAPI app
 │   │   ├── app.py, deps.py, errors.py (RFC 9457), pagination.py (signed keyset cursors)
 │   │   ├── security.py (sessions, CSRF, headers, throttling), static.py (SPA)
@@ -476,7 +490,8 @@ job-hunter/
 │   │       migrations/ (alembic env + versions)
 │   ├── observability/ logging.py redact.py metrics.py alerts.py ntfy.py deadman.py langsmith.py health.py
 │   ├── api_idempotency.py        # Idempotency-Key store (§14.1)
-│   └── privacy/ retention.py deletion_graph.py purge.py export.py manifests.py
+│   └── privacy/ retention.py deletion_graph.py purge.py fences.py export.py manifests.py replay.py
+│                restore_verify.py identities.py   # §19.5 replay, verification, identity advancement
 ├── embedder/ Dockerfile app.py model.lock
 ├── docparse/ Dockerfile worker.py        # network_mode: none; reads/writes the parse_jobs volume
 ├── frontend/ package.json vite.config.ts tsconfig.json
@@ -485,8 +500,8 @@ job-hunter/
 │       components/{HeaderStrip,FilterPanel,JobCard,ScoreBadge,DetailDrawer,DuplicateGroupCard,
 │                   CriteriaTable,EvidenceHighlighter,LabelBar,CvReview,SettingsForm,DryRunPanel,...}.tsx
 ├── deploy/ compose.yaml Caddyfile secrets.example (names only) postgres/{postgresql.conf, init/}
-│           firewall/docker-user.nft backup/{Dockerfile,crontab,backup_set.sh,manifest_shipper.sh,
-│           restore.sh,restore-test.sh}
+│           firewall/docker-user.nft backup/{Dockerfile (FROM the app image),crontab,backup_set.sh,
+│           manifest_shipper.sh,restore.sh,restore-test.sh}
 ├── tests/ unit/ property/ integration/ crash/ contract/{fixtures (scrubbed)}/ payload/ eval/ e2e/
 ├── docs/ PRIVACY.md RUNBOOK.md superpowers/specs/
 └── .github/workflows/ ci.yml eval-manual.yml schema-dry-run-manual.yml
@@ -612,7 +627,7 @@ class SourceAdapter(Protocol):
 |---|---|
 | Endpoint | `GET https://serpapi.com/search.json?engine=google_jobs`, with `api_key` from the worker's `serpapi_key` secret. |
 | Params | `q` = `"<query text> <city>"` (or `"<query text> Homeoffice Deutschland"` for `remote-de`). `gl=de`, `hl=en`, **pending spike V3**: if V3 shows `htidocid` differs between `hl=en` and `hl=de`/JSearch, the const `SERPAPI_HL` stays `de`. `next_page_token` is used for continuation. `location` and `uule` MUST NOT be sent. |
-| Account | `GET https://serpapi.com/account.json` (free, not counted). It is read **immediately before every SerpApi search request**, and once after the last one of a run. It provides `plan_renewal_date`, `searches_per_month`, `plan_searches_left`, `this_hour_searches` and `account_rate_limit_per_hour`, each stored with its `observed_at`. If it cannot be read, no SerpApi search is admitted (`window_cap`; fail closed). |
+| Account | `GET https://serpapi.com/account.json` (free, not counted). It is read **immediately before every SerpApi search request**, and once after the last one of a run. It provides `plan_renewal_date`, `searches_per_month`, `plan_searches_left`, `this_hour_searches` and `account_rate_limit_per_hour`, each stored with its `observed_at`. If it cannot be read, no SerpApi search is admitted (`window_cap`; fail closed). **Assumption (chair decision C2, §2.4): the SerpApi account is used exclusively by this app.** The hourly guarantee depends on it; detected foreign usage switches admission to a conservative mode (§6.5). |
 | Pagination | `serpapi_pagination.next_page_token` → `CURSOR`; absent → `END`. |
 | Identity | `job_id` is base64-decoded to JSON; `native_id = htidocid`, plus key `htidocid:<htidocid>`. The `fc` token is discarded. |
 | Primary link | The `apply_options[]` entry whose `title` equals `via` (case-insensitive, after removing a `via ` prefix); otherwise the first option. **No other apply option is stored or used for identity**: they are contaminated with unrelated jobs. |
@@ -847,15 +862,19 @@ The pacing model is a fractional token bucket per provider window. Percentages f
 
 ### 6.5 Hard caps beyond the monthly window
 
-- **SerpApi hourly.** `account.json` is read immediately before every SerpApi search (§5.3.2). With the latest account observation `obs`:
+- **SerpApi hourly.** `account.json` is read immediately before every SerpApi search (§5.3.2). With the latest account observation `obs` and `H = min(serpapi_hourly_cap, obs.hourly_cap)`:
 
   ```text
   hour_used = max( local counted SerpApi attempts reserved in the last 60 min,
                    obs.this_hour + local counted attempts reserved after obs.observed_at − 120 s )
-  admit iff hour_used + 1 ≤ min(serpapi_hourly_cap, obs.hourly_cap)
+  normal mode:        admit iff hour_used + 1 ≤ H
+  conservative mode:  admit iff hour_used + 1 ≤ H − 5
   ```
 
-  The 120 s term (`SERPAPI_USAGE_LAG`, const) covers provider lag; it can double-count, which is conservative. If no observation younger than 60 s exists and `account.json` cannot be read, the request is denied `window_cap` (fail closed). *Example.* The account reports 40 searches this hour, made by another SerpApi engine. Local usage is 0. The first local search sees `40 + 0 + 1 = 41 ≤ 45`; the account read before the second search reports 41 (or still 40 if it lags), plus 1 local attempt, so `42 ≤ 45`; the sixth search is denied, and the app never passes 45 (test Q-SH1, §18.1).
+  - **Exclusive-use assumption** (chair decision C2, §2.4). The hourly guarantee "the app never pushes the account above `H`" holds only if no one else uses the account: another user's searches made during the provider's reporting lag are invisible at admission time, so no local rule can bound them.
+  - **Detection.** At each account read, `foreign = obs.this_hour − (local counted attempts reserved in the 60 min before obs.observed_at)`. If `foreign > 1` (one search of tolerance for lag and hour-boundary rounding), the worker raises `quota.serpapi_foreign_usage` (warn) and admits in **conservative mode** until 24 h after the last detection. Monthly foreign usage also shows up as `quota.unaccounted_usage` adjustments (§6.3).
+  - The 120 s term (`SERPAPI_USAGE_LAG`, const) covers provider lag for the app's own searches; it can double-count, which is conservative. If no observation younger than 60 s exists and `account.json` cannot be read, the request is denied `window_cap` (fail closed).
+  - *Example.* Exclusive use: 12 local searches in the last hour, the account reports 12, so searches continue up to 45 per hour. Foreign use: the account reports 40 while local usage is 0, so `foreign = 40`: the alert fires, conservative mode starts, and `40 + 0 + 1 = 41 > 40` denies the search. Test Q-SH1 (§18.1) checks exactly these two behaviours; it does not claim that the account total stays below `H` when someone else uses the account.
 - **SerpApi monthly** uses the window of §6.3 with the tighten-only remaining rule; the account read before each search keeps it current.
 - **Adzuna**: each rolling window (60 s, 24 h, 7 d, 30 d) has `count + 1 ≤ cap`, counting `reserved`, `dispatched`, `billed` and `ambiguous` attempts. Adzuna also uses the §6.4 bucket with `N = 0.9 × cap_month` over its synthetic 30-day window.
 
@@ -905,62 +924,100 @@ def accrue(w: Window, now) -> None:
     w.tokens = min(w.capacity, w.tokens + Decimal(n * dt / length))
     w.tokens_at = now
 
-def current_window(provider, now, dry=False) -> Window:
-    w = Window.current(provider, for_update=not dry)   # SELECT … WHERE is_current FOR UPDATE
-    if w is None:
-        w = bootstrap(provider, now)                    # §6.3; SerpApi: None until account.json
-    while w is not None and now >= w.window_end:        # history is kept: close + insert
-        w = w.close_and_extrapolate(closed_reason="rolled_over")   # new row starts with tokens = C
+def current_window_locked(provider, now) -> Window | None:
+    """Authoritative path only: lock, then persist bootstrap and rollover."""
+    w = Window.current(provider, for_update=True)      # SELECT … WHERE is_current FOR UPDATE
+    w, changes = roll_forward(w, provider, now)
+    Window.apply(changes)                              # close old rows, insert new rows (history kept)
     return w
 
+def roll_forward(w: Window | None, provider, now) -> tuple[Window | None, list[WindowChange]]:
+    """Pure: bootstrap and extrapolate in memory, returning the window and the row changes."""
+    changes: list[WindowChange] = []
+    if w is None:
+        w = bootstrap_window(provider, now)            # §6.3; SerpApi: None until account.json
+        if w is not None:
+            changes.append(Insert(w))
+    while w is not None and now >= w.window_end:        # loops across long downtime
+        nxt = extrapolated_successor(w)                 # [end, end + period), tokens = C
+        changes += [Close(w, "rolled_over"), Insert(nxt)]
+        w = nxt
+    return w, changes
+
+def decide(w: Window, *, provider, request_class, units, used, run_normal_count,
+           hour_ok, adzuna_ok, now) -> Admit | Deny:
+    """Pure admission decision on an in-memory window. No I/O, no locks."""
+    if w.state == "exhausted_until_reset" or (
+            w.state == "extrapolated_unvalidated" and w.probe_failed):
+        if w.next_probe_at is None or now < w.next_probe_at:
+            return Deny("exhausted" if w.state == "exhausted_until_reset"
+                        else "awaiting_window_validation")
+        request_class = "probe"                         # periodic re-probe
+    elif w.state == "extrapolated_unvalidated":
+        if w.probe_used:
+            return Deny("awaiting_window_validation")   # a probe is in flight
+        request_class = "probe"
+    if used + units > w.limit_units:
+        return Deny("exhausted")
+    if request_class == "normal" and used + units > w.limit_units - effective_reserve(w, now):
+        return Deny("reserve_held")
+    if not hour_ok or not adzuna_ok:
+        return Deny("window_cap")                       # §6.5; SerpApi fails closed without fresh obs
+    if request_class == "normal":
+        if provider != "adzuna" and run_normal_count + units > per_run_cap(w):
+            return Deny("paced")                        # per_run_cap: max(10, ceil(2×fair_share))
+        if w.tokens < units:
+            return Deny("paced")
+    return Admit(request_class=request_class,
+                 tokens_used=units if request_class == "normal" else 0,
+                 starts_probe=(request_class == "probe"))
+
 def reserve(provider, *, owner: RunOwner, request_key, attempt_seq, request_class,
-            fetch_request_id, units=1, dry=False) -> Reservation | Denial:
-    with db.transaction(read_only=dry):
+            fetch_request_id, units=1) -> Reservation | Denial:
+    """Authoritative: the only path that locks or writes."""
+    with db.transaction():
         if not owner.lock_for_share():                  # runs row FOR SHARE + predicate (§3.3.3)
             raise FencedOut(owner)
         now = db.now()
-        w = current_window(provider, now, dry)
+        w = current_window_locked(provider, now)
         if w is None:
             return Denial("window_cap")                 # SerpApi without an account observation
         accrue(w, now)
-        if w.state == "exhausted_until_reset" or (
-                w.state == "extrapolated_unvalidated" and w.probe_failed):
-            if w.next_probe_at is None or now < w.next_probe_at:
-                return Denial("exhausted" if w.state == "exhausted_until_reset"
-                              else "awaiting_window_validation")
-            request_class = "probe"                     # periodic re-probe
-        elif w.state == "extrapolated_unvalidated":
-            if w.probe_used:
-                return Denial("awaiting_window_validation")   # a probe is in flight
-            request_class = "probe"
-        used = used_units(w)
-        if used + units > w.limit_units:
-            return Denial("exhausted")
-        if request_class == "normal" and used + units > w.limit_units - effective_reserve(w, now):
-            return Denial("reserve_held")
-        if provider == "serpapi" and not serpapi_hour_ok(w, now, units):
-            return Denial("window_cap")                 # §6.5, fails closed without fresh obs
-        if provider == "adzuna" and not adzuna_windows_ok(now, units):
-            return Denial("window_cap")                 # 60 s, 24 h, 7 d, 30 d
-        if request_class == "normal":
-            if provider != "adzuna" and \
-               Ledger.normal_count_for_run(owner.run_id) + units > per_run_cap(w):
-                return Denial("paced")                  # per_run_cap: max(10, ceil(2×fair_share))
-            if w.tokens < units:
-                return Denial("paced")
-            w.tokens -= units
-        if request_class == "probe":
+        d = decide(w, provider=provider, request_class=request_class, units=units,
+                   used=used_units(w), run_normal_count=Ledger.normal_count_for_run(owner.run_id),
+                   hour_ok=(provider != "serpapi" or serpapi_hour_ok(w, now, units)),
+                   adzuna_ok=(provider != "adzuna" or adzuna_windows_ok(now, units)), now=now)
+        if isinstance(d, Deny):
+            w.save()                                    # accrual is persisted, nothing else
+            return Denial(d.code)
+        w.tokens -= d.tokens_used
+        if d.starts_probe:
             w.probe_used, w.probe_failed = True, False
             w.next_probe_at = now + PROBE_RETRY         # 12 h; cleared when a probe validates
-        if dry:
-            return Reservation(None)                    # projection only, nothing written
         entry = Ledger.insert(provider=provider, window_start=w.window_start, kind="request",
-                              request_class=request_class, request_key=request_key,
+                              request_class=d.request_class, request_key=request_key,
                               attempt_seq=attempt_seq, run_id=owner.run_id,
                               run_attempt_no=owner.attempt_no, fetch_request_id=fetch_request_id,
                               units=units, state="reserved")
         w.save()
         return Reservation(entry.id)
+
+def project_allowance(provider, specs: list[PlannedSpec], now) -> list[Admit | Deny]:
+    """Planning and the settings dry-run: a pure simulation on a snapshot."""
+    snap = Window.current_snapshot(provider)            # plain SELECT: no FOR UPDATE, no FOR SHARE
+    w, _ = roll_forward(copy(snap), provider, now)      # simulated; the changes are discarded
+    if w is None:
+        return [Deny("window_cap")] * len(specs)
+    accrue(w, now)
+    used, run_normal, out = used_units_snapshot(provider, w), 0, []
+    for spec in specs:                                  # reservations are simulated in memory
+        d = decide(w, provider=provider, request_class=spec.request_class, units=1, used=used,
+                   run_normal_count=run_normal, hour_ok=True, adzuna_ok=True, now=now)
+        if isinstance(d, Admit):
+            used, w.tokens = used + 1, w.tokens - d.tokens_used
+            run_normal += d.tokens_used
+        out.append(d)
+    return out
 
 def mark_dispatched(entry_id, owner: RunOwner) -> None:      # committed BEFORE the send
     with db.transaction():
@@ -1019,7 +1076,7 @@ def apply_observation(provider, obs, entry_id=None) -> None:     # §6.3, ordere
     w.save()
 ```
 
-A probe that settles `ambiguous` or fails sets `probe_failed = true` in `settle`. Planning (`collect_graph.plan`) **projects** allowances with the same functions in read-only mode (`dry=True`), with no rows written. The authoritative decision is always the `reserve()` call made at fetch time.
+A probe that settles `ambiguous` or fails sets `probe_failed = true` in `settle`. Planning (`collect_graph.plan`) and the settings dry-run use `project_allowance`, which runs the same pure `roll_forward` and `decide` functions on an unlocked snapshot and writes nothing; bootstrap and rollover are simulated in memory. Only `reserve()` locks rows or writes, and it is always the authoritative decision at fetch time.
 
 ### 6.8 Settings dry-run
 
@@ -1029,7 +1086,7 @@ A probe that settles `ambiguous` or fails sets `probe_failed = true` in `settle`
 def dry_run(proposed: Settings, active: Settings, now) -> DryRunResult:
     errs, warns, proj = validate_fields(proposed), [], {}      # §13 field validation
     cells = paid_cells(proposed)                               # queries × (locations + remote-de)
-    jw = projected_window("jsearch", now)
+    jw, _ = roll_forward(Window.current_snapshot("jsearch"), "jsearch", now)   # pure, no writes
     n_per_day = (jw.limit_units - jw.reserve_units) / jw.length_days
     fair_share = n_per_day * proposed.interval_h / 24
     cap = per_run_cap(proposed, fair_share)                    # 'auto' → max(10, ceil(2×fair_share))
@@ -1082,7 +1139,7 @@ Paid LLM spend uses the same reserve-before-every-attempt discipline as the quot
 #### 6.9.1 Monthly budget row (the serialisation point)
 
 - **Window**: calendar month in UTC. A reservation belongs to the month in which it was made (`llm_spend_ledger.budget_month`), and its later settlement adjusts that month even after the month has ended.
-- **`llm_budget`** has one row per month (§7.11): `cap_usd`, `counted_usd`, `scoring_counted_usd`, `nonscoring_counted_usd`, `bucket_usd`, `bucket_at`, `cap_lowered_at`, `counted_at_cap_change_usd`. The row is created with `INSERT … ON CONFLICT DO NOTHING` (copying `cap_usd` from settings and starting the bucket full), then locked.
+- **`llm_budget`** has one row per month (§7.11): `cap_usd`, `overrun_buffer_usd`, `counted_usd`, `scoring_counted_usd`, `nonscoring_counted_usd`, `bucket_usd`, `bucket_at`, `cap_lowered_at`, `counted_at_cap_change_usd`. The row is created with `INSERT … ON CONFLICT DO NOTHING` (copying `cap_usd` and `overrun_buffer_usd` from settings and starting the bucket full), then locked.
 - **Every** LLM reservation (online, batch item, profile, queries, canary, eval, schema dry-run), every settlement, every cap edit and every bulk-budget change runs in a transaction that takes `SELECT … FROM llm_budget WHERE month = :m FOR UPDATE`, after the owner row and before any ledger row (lock order, §3.3.3). The check and the counter update happen **in the same transaction**, so concurrent reservations cannot both pass against the same balance.
 - **Counter maintenance**:
 
@@ -1092,42 +1149,47 @@ Paid LLM spend uses the same reserve-before-every-attempt discipline as the quot
   | settled `billed` at `s ≤ r` | `+ (s − r)` | `+ (r − s)` |
   | settled `not_billed` | `− r` | `+ r` |
   | settled `ambiguous` | unchanged | unchanged |
-  | `ambiguous → billed` at `s` (batch evidence) | `+ (s − r)` | `+ (r − s)` |
-  | `ambiguous → not_billed(batch_not_submitted_proven)` | `− r` | `+ r` |
+  | `ambiguous → billed` at `s` (an item of a batch that was found, usage downloaded) | `+ (s − r)` | `+ (r − s)` |
+  | `ambiguous → not_billed(batch_item_errored \| canceled \| expired)` (an item of a batch that was found, provider evidence) | `− r` | `+ r` |
 
   The heavy reconciler (§17.4) recomputes the counters from the ledger every 10 min. Any difference raises the critical alert `llm.budget_counter_drift` and the counters are corrected from the ledger under the lock.
-- **Admission against the hard cap.** With `reserve_frac = nonscoring_reserve_pct / 100` (default 0.05):
-  - a non-scoring reservation is admitted iff `counted_usd + r ≤ cap_usd`;
-  - a scoring reservation (including batches and follow-ups) is admitted iff `counted_usd + r ≤ cap_usd − max(0, cap_usd × reserve_frac − nonscoring_counted_usd)`. Scoring can never use the unspent part of the non-scoring reserve.
+- **Overrun buffer** (chair decision C1, §2.4). `overrun_buffer_usd` (settings `llm.overrun_buffer_usd`, default $2.00) is part of the cap that is **never admitted for spending**. It absorbs the residual estimation error of the input bound (§10.7). Settings validation requires `overrun_buffer_usd ≥ max_concurrent_llm_calls × PROMPT_OVERHEAD_TOKENS × the highest input price per token`, where `max_concurrent_llm_calls` is 3 score calls + 2 auxiliary calls + `batch_max_items` batch items (at batch prices). With 1,000 batch items and a measured overhead of 1,000 tokens that is about $1.28, so the $2.00 default holds; spike V19 sets the real overhead.
+- **Admission against the hard cap.** With `A = cap_usd − overrun_buffer_usd` (the admissible budget) and `reserve_frac = nonscoring_reserve_pct / 100` (default 0.05):
+  - a non-scoring reservation is admitted iff `counted_usd + r ≤ A`;
+  - a scoring reservation (including batches and follow-ups) is admitted iff `counted_usd + r ≤ A − max(0, A × reserve_frac − nonscoring_counted_usd)`. Scoring can never use the unspent part of the non-scoring reserve.
+  - With the defaults, `A = $98.00`, the non-scoring reserve is $4.90 and the scoring share is **$93.10**.
 
   A denied reservation raises `BudgetExhausted`. Every ledger row records `admitted_cap_usd` and `counted_before_usd`, so each admission can be audited.
-- **Cap edits.** A cap change takes the same lock. Raising the cap takes effect immediately. Lowering it below `counted_usd` is allowed: it records `cap_lowered_at` and `counted_at_cap_change_usd`, admits no new reservation for the rest of the month, and leaves in-flight attempts to settle. The cap invariant (§7.17 #6) is therefore `counted_usd ≤ max(cap_usd, counted_at_cap_change_usd)`, and no reservation may be admitted after `cap_lowered_at` while `counted_usd ≥ cap_usd`.
-- **Reservations are true upper bounds** (§10.7). Settled cost can exceed the reservation only through an estimator defect. That raises the critical alert `llm.reservation_bound_violated`, which pauses the score lane until the user acknowledges it; invariant 6 has no tolerance for overruns (Fable m14).
+- **Cap edits.** A cap change takes the same lock. Raising the cap takes effect immediately. Lowering it below `counted_usd` is allowed: it records `cap_lowered_at` and `counted_at_cap_change_usd`, admits no new reservation for the rest of the month, and leaves in-flight attempts to settle. The cap invariant (§7.17 #6) is therefore `counted_usd ≤ max(cap_usd, counted_at_cap_change_usd)`, and no reservation may be admitted after `cap_lowered_at` while `counted_usd ≥ cap_usd − overrun_buffer_usd`.
+- **Reservation bound and residual assumption** (§10.7). Text reservations bound input tokens by UTF-8 bytes plus a doubled, measured overhead; the cap holds provided the tokenizer emits ≤ 1 token per byte (§1.5 S3, verified by V19). A settled cost above its reservation is charged in full, consumes buffer, raises the critical alert `llm.reservation_bound_violated` and pauses the score lane until the user acknowledges it; invariant 6 has no tolerance beyond the buffer.
 
 #### 6.9.2 USD bucket (scoring pace)
 
 The bucket spreads scoring spend over the month. It gates the **size** of each admission and the **periodic cycle trigger**; it never interrupts a target that has already been admitted.
 
-- **Accrual rate**: `rate = cap_usd × (1 − reserve_frac) / month_length_s` (USD per second, the length of the current calendar month). With the defaults, `rate × 1 h ≈ $0.13`.
-- **Capacity**: `B_max = max(2 × rate × collection_interval_s, min_bucket_capacity_usd)`, with `min_bucket_capacity_usd = 1.00` (settings). At a 6-hour interval `B_max ≈ $1.58`; at 1 hour the floor of $1.00 applies.
+- **Accrual rate**: `rate = A × (1 − reserve_frac) / month_length_s`, the scoring share spread over the length of the current calendar month (USD per second). With the defaults, `rate × 1 h ≈ $0.127`.
+- **Capacity**: `B_max = max(2 × rate × collection_interval_s, min_bucket_capacity_usd)`, with `min_bucket_capacity_usd = 1.00` (settings). At a 6-hour interval `B_max ≈ $1.53`; at 1 hour the floor of $1.00 applies.
 - **Accrual** happens under the month-row lock at every reservation, settlement and tick: `bucket_usd := min(B_max, bucket_usd + rate × (now − bucket_at))`, `bucket_at := now`. A new month's row starts with `bucket_usd = B_max` (initial credit).
 - **Debit**: scoring reservations of targets that do not belong to a bulk operation debit the bucket by their reservation, and settlement credits back the difference (table above). The bucket therefore tracks **counted** scoring spend, not estimated admission counts. It may go negative while admitted work finishes; that is bounded by the in-flight targets of one cycle, and the next cycle waits until accrual has repaid it.
 - **Expected cost per target `ĉ`**: the trailing 7-day mean counted spend per completed attempt of the active tuple and evaluation policy, with at least 20 samples; otherwise the §21.2 central estimate for the active model policy and evaluation policy.
 - **Admission size**: a periodic cycle admits `S = min(max_targets_per_cycle, floor(bucket_usd / ĉ))` targets (`max_targets_per_cycle` default 60, settings).
 - **Cycle trigger** (§3.4): a periodic cycle starts only when `bucket_usd ≥ min(min_cycle_targets × ĉ, B_max)` (`min_cycle_targets` default 10, settings), pending targets exist and no cycle is running. The tick is the only trigger; a cycle that leaves pending targets does **not** re-defer itself. With the defaults and a 6-hour interval this yields a cycle about every 4 h.
 - **Score now** (§9.6.4) bypasses the bucket for admission but still debits it, and it remains subject to the hard cap.
-- **Non-scoring calls** never touch the bucket; they draw on the 5% reserve and the cap.
+- **Non-scoring calls** never touch the bucket; they draw on the 5% reserve and the admissible budget `A`.
 
 #### 6.9.3 Bulk-operation budgets
 
 A tuple change that creates targets for retained revisions (a new CV, a rubric or prompt change, a model-policy change) opens one **bulk operation** (`bulk_operations`, §7.11) in the same transaction as the target creation. Its targets carry `bulk_operation_id`.
 
-- **Budget**: `budget_usd = bulk_rescore_max_budget_share (0.4, settings) × scoring headroom at the start`, where scoring headroom is `cap × (1 − reserve_frac) − scoring_counted_usd`. The budget is fixed for the life of the operation.
-- **Cumulative accounting**: every reservation for a **batched** target of the operation — its batch generator item and its online follow-ups (critic, revise) — debits `bulk_operations.spent_usd` instead of the USD bucket, under the month-row lock. Settlement credits it back exactly like the bucket. Repeated submissions therefore can never spend more than the operation's budget in total.
+**What the 40% bounds.** `bulk_rescore_max_budget_share` defines a **batch allocation**, not a limit on all spending that a re-score causes: it bounds the batch generator items plus the **expected** follow-ups of the batched drafts. Follow-ups beyond that expectation, and all targets of the operation that are scored online, are paced by the USD bucket like any other scoring work. Every reservation, batched or not, is still admitted against the hard cap.
+
+- **Budget**: `budget_usd = bulk_rescore_max_budget_share (0.4, settings) × scoring headroom at the start`, where scoring headroom is `A × (1 − reserve_frac) − scoring_counted_usd`. The budget is fixed for the life of the operation.
+- **Cumulative accounting**: every reservation for a **batched** target of the operation — its batch generator item and its online follow-ups (critic, revise) — debits `bulk_operations.spent_usd` instead of the USD bucket, under the month-row lock, while it fits (next rule). Settlement credits it back exactly like the bucket. Repeated submissions therefore can never charge more than the allocation in total.
 - **Funded follow-ups**: a batch submission of `n` items is admitted only if
   `spent_usd + followup_held_usd + batch_worst_case(n) + n × p_followup × ĉ_followup ≤ budget_usd`,
-  where `p_followup` is the evaluation policy's `projected_critic_rate` (§11.7.4) and `ĉ_followup` the expected online critic-plus-revise cost of a triggered draft (§21.2). The last term is added to `followup_held_usd` (a planning hold, not a ledger reservation). Each item releases its share `p_followup × ĉ_followup` when it needs no follow-up, or when its follow-up attempt ends. The submission is shrunk to the largest `n` that fits; below `batch_min_targets` no batch is submitted (§10.10).
-- **Follow-up reservations** debit the bulk operation while `spent_usd + r ≤ budget_usd`; a follow-up that would exceed it is charged to the USD bucket like any other online work. `spent_usd` therefore never exceeds `budget_usd`.
+  where `p_followup` is the evaluation policy's `projected_critic_rate` (§11.7.4) and `ĉ_followup` the expected online critic-plus-revise cost of a triggered draft (§21.2). The last term is added to `followup_held_usd`. It is an **expected-value planning hold inside the allocation, not a ledger reservation**: it does not reserve hard-cap headroom, and an actual follow-up is admitted against the hard cap when it runs. Each item releases its share `p_followup × ĉ_followup` when it needs no follow-up, or when its follow-up attempt ends. The submission is shrunk to the largest `n` that fits; below `batch_min_targets` no batch is submitted (§10.10).
+- **Follow-up reservations** debit the allocation while `spent_usd + r ≤ budget_usd`; a follow-up that would exceed it is charged to the USD bucket like any other online work. `spent_usd` therefore never exceeds `budget_usd`.
+- **Eligibility** for a batch is limited to targets that still need their **initial generator** pass (§10.10): drafts awaiting follow-up and online-retry dispositions are never batched again.
 - **Online share**: targets of the operation that are not batched (batches disabled, too few, or not fitting) flow through normal admission and debit the USD bucket, so a bulk re-score never exceeds the monthly pace.
 - **End**: the operation becomes `completed` when none of its targets is `pending`, `in_progress` or `in_batch`, and `cancelled` when its tuple is superseded. Its unspent budget simply lapses.
 
@@ -1136,10 +1198,11 @@ A tuple change that creates targets for retained revisions (a new CV, a rubric o
 - A reservation that fails `BudgetExhausted` moves its target to `budget_deferred` (§7.16.3); unadmitted targets stay `pending`.
 - The critical alert `llm.cap_reached` is raised once per month and names the amount held by quarantined batch submissions, if any (R9).
 - "Score now" returns 409 `budget_exhausted`.
-- **Deferred targets return when headroom returns**, not only at month start: every tick, under the month-row lock, if the scoring headroom (`cap` minus `counted_usd`, minus the unspent non-scoring reserve) is at least `k × r_first`, the `k` oldest `budget_deferred` targets go back to `pending`, where `r_first` is the worst-case reservation of a first generator call. This happens after settlements release reservations, after a cap increase and at the month rollover.
-- The bucket does not promise that scoring never stops early. It makes a backlog drain at the accrual rate. Only "Score now", bulk operations (bounded by their own budget, §6.9.3) and non-scoring calls can spend faster, and the hard cap bounds all of them.
+- **Deferred targets return when headroom returns**, not only at month start: every tick, under the month-row lock, if the scoring headroom (`A` minus `counted_usd`, minus the unspent non-scoring reserve) is at least `k × r_first`, the `k` oldest `budget_deferred` targets go back to `pending`, where `r_first` is the worst-case reservation of a first generator call. This happens after settlements release reservations, after a cap increase and at the month rollover.
+- The bucket does not promise that scoring never stops early. It makes a backlog drain at the accrual rate. Only "Score now", the batch allocation of a bulk operation (§6.9.3) and non-scoring calls can spend faster, and the hard cap bounds all of them.
 
 ---
+
 ## 7. Data model
 
 ### 7.1 Conventions and extensions
@@ -1161,12 +1224,12 @@ A tuple change that creates targets for retained revisions (a new CV, a rubric o
   |---|---|---|
   | `jobhunter_migrator` | Owns the schema; DDL | `migrate` only |
   | `jobhunter_app` | DML on every table, via `ALTER DEFAULT PRIVILEGES FOR ROLE jobhunter_migrator GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO jobhunter_app` and `… GRANT USAGE, SELECT ON SEQUENCES …`, so tables created later by migrations (including `procrastinate_*` and `checkpoint*`) are covered | `api`, `worker` |
-  | `jobhunter_backup` | `pg_read_all_data`, plus `INSERT, UPDATE` on `backup_sets`, `backup_runs` and `manifest_shipments` | `backup` (dump, shipper) |
-  | `jobhunter_restore` | `CREATEDB` and `LOGIN` only; no rights on the production database. It creates, restores into and drops the scratch database `jobhunter_restore_test` | `backup` (monthly restore test) |
+  | `jobhunter_backup` | `pg_read_all_data`, plus `INSERT, UPDATE` on `backup_sets`, `backup_runs`, `manifest_shipments` and `manifest_shipment_items` (re-applied by every `migrate`, §19.3) | `backup` (dump, shipper) |
+  | `jobhunter_restore` | `CREATEDB` and `LOGIN` only; no rights on the production database. It creates the scratch database `jobhunter_restore_test` **from the template `jobhunter_template`** (which the bootstrap superuser created with the `vector`, `pg_trgm` and `unaccent` extensions and marked `IS_TEMPLATE`), restores into it with `pg_restore --no-owner --no-acl`, and drops it | `backup` (monthly restore test) |
 - The DDL below is grouped by domain for reading. Alembic migrations create the tables in dependency order and add the forward and cyclic foreign keys afterwards with `ALTER TABLE … ADD FOREIGN KEY`.
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector;            -- all three created by deploy/postgres/init (§19.3): no-ops here
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS unaccent;
 
@@ -1185,7 +1248,7 @@ CREATE TABLE ranking_state (                       -- §14.3 pagination generati
 );
 ```
 
-**Ranking generation.** Every transaction that can change the order or the membership of the Jobs list runs `UPDATE ranking_state SET generation = generation + 1, updated_at = now() WHERE id = 1` as its **last statement before commit** (the row lock is held for microseconds and is last in the lock order). These transactions are: a publish (online or batch), a `det_results` current-instance change, a scope flip, a tuple activation, a target state change into or out of a published state, a similarity update of a pending target, a duplicate-group change (join, leave, re-election, split, dissolve), a merge or unmerge, a job availability change and a user action that changes `hidden_at`. The generation is a committed, monotonic counter; it is never derived from row values.
+**Ranking generation.** Every transaction that can change the order or the membership of the Jobs list runs `UPDATE ranking_state SET generation = generation + 1, updated_at = now() WHERE id = 1` as its **last statement before commit** (the row lock is held for microseconds and is last in the lock order). These transactions are: a publish (online or batch), a `det_results` current-instance change, a scope flip, a tuple activation, **any** target state change (published or not, since the scoring-state filter and the unscored section depend on it), a similarity update of a pending target, the insertion of a job, a change of any job field that a filter or sort reads, a duplicate-group change (join, leave, re-election, split, dissolve), a merge or unmerge, a job availability change, and any user action (`seen_at`, `saved_at`, `applied_at`, `hidden_at`, note). The generation is a committed, monotonic counter; it is never derived from row values. The list API reads the generation and the page rows **in one `REPEATABLE READ` snapshot** (§14.3), so a page can never be labelled with a generation newer than the data it shows.
 
 ### 7.2 Identity, sessions, throttling
 
@@ -1312,7 +1375,7 @@ CREATE TABLE settings_versions (
   created_at            timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE llm_tuples (                            -- never deleted (ids only, §20.2)
+CREATE TABLE llm_tuples (                            -- ids only; deleted only by delete-everything (§20.4)
   id                       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   profile_version_id       bigint NOT NULL REFERENCES profile_versions(id),
   rubric_version_id        bigint NOT NULL REFERENCES rubric_versions(id),
@@ -1356,8 +1419,9 @@ CREATE TABLE operations (                            -- durable intents (§3.3.2
                     'purge','eval_run','watchlist_validate')),
   payload         jsonb NOT NULL,                    -- ids only, never content
   dedup_key       text NOT NULL,                     -- e.g. 'apply_scope:<scope_version_id>'
-  status          text NOT NULL CHECK (status IN ('pending','running','succeeded','failed')),
-  worker_epoch    bigint,                            -- owner while running
+  status          text NOT NULL CHECK (status IN ('pending','running','succeeded','failed','cancelled')),
+  claim_id        uuid,                              -- fresh per execution; the ownership token (§3.3.3)
+  worker_epoch    bigint,                            -- owner epoch while running
   attempts        smallint NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 10),
   not_before      timestamptz,
   heartbeat_at    timestamptz,
@@ -1366,8 +1430,8 @@ CREATE TABLE operations (                            -- durable intents (§3.3.2
   created_at      timestamptz NOT NULL DEFAULT now(),
   started_at      timestamptz,
   finished_at     timestamptz,
-  CHECK ((status = 'running') = (worker_epoch IS NOT NULL AND heartbeat_at IS NOT NULL)),
-  CHECK (status NOT IN ('succeeded','failed') OR finished_at IS NOT NULL),
+  CHECK ((status = 'running') = (claim_id IS NOT NULL AND worker_epoch IS NOT NULL AND heartbeat_at IS NOT NULL)),
+  CHECK (status NOT IN ('succeeded','failed','cancelled') OR finished_at IS NOT NULL),
   CHECK (status <> 'failed' OR last_error_code IS NOT NULL)
 );
 CREATE UNIQUE INDEX operations_live_dedup ON operations (kind, dedup_key) WHERE status IN ('pending','running');
@@ -1380,7 +1444,7 @@ Each active pointer changes only inside a transaction that holds `active_config`
 - `model_policy_id`, and with it `llm_tuple_id`, flips at settings activation with effect class `llm_tuple`; so do `rubric_version_id` and `prompt_schema_version_id` when the user activates a shipped version (§13.3);
 - `execution_config_id` and `evaluation_policy_id` flip at settings activation with effect classes `execution` and `evaluation_policy`. Neither creates a tuple or any target.
 
-An operation fails permanently (`failed`) after 10 attempts or on a non-retryable error, and raises `operation.failed` (warn). Every operation kind is idempotent on its payload.
+An operation fails permanently (`failed`) after 10 attempts or on a non-retryable error, and raises `operation.failed` (warn). Delete-everything and purges end superseded operations `cancelled` (§20.4). Every operation kind is idempotent on its payload. Each `pending → running` transition assigns a fresh `claim_id`; the heartbeat, every LLM reservation and dispatch marker made on the operation's behalf (owner row `FOR SHARE`), and every domain write of the operation check `claim_id = :claim AND status = 'running'`; reclaim sets `status = 'pending', claim_id = NULL` in one statement, so a stalled old execution can never satisfy the predicate again.
 
 ### 7.4 Profile and CV files
 
@@ -1438,7 +1502,7 @@ CREATE TABLE profile_versions (                      -- never deleted; content i
   draft_id     bigint NOT NULL UNIQUE,                       -- FK below (deferrable)
   cv_file_id   bigint REFERENCES cv_files(id) ON DELETE SET NULL,
   profile_json jsonb,                                        -- contact-stripped, immutable
-  profile_hash bytea NOT NULL UNIQUE,                        -- identical content reuses the version
+  profile_hash bytea NOT NULL,                               -- see the partial unique index below
   confirmed_at timestamptz NOT NULL DEFAULT now(),
   purged_at    timestamptz,
   CHECK ((purged_at IS NULL) = (profile_json IS NOT NULL))
@@ -1446,6 +1510,8 @@ CREATE TABLE profile_versions (                      -- never deleted; content i
 ALTER TABLE profile_drafts ADD FOREIGN KEY (confirmed_profile_version_id) REFERENCES profile_versions(id)
   DEFERRABLE INITIALLY DEFERRED;
 ALTER TABLE profile_versions ADD FOREIGN KEY (draft_id) REFERENCES profile_drafts(id) DEFERRABLE INITIALLY DEFERRED;
+-- Identical content reuses only a USABLE version; a purged row never blocks or absorbs re-introduced content.
+CREATE UNIQUE INDEX profile_versions_live_hash ON profile_versions (profile_hash) WHERE purged_at IS NULL;
 ```
 
 ### 7.5 Sources, watchlist, queries, coverage
@@ -1458,7 +1524,7 @@ CREATE TABLE sources (
   precedence_rank      smallint NOT NULL,          -- 1 = ATS, 2 = JSearch/SerpApi, 3 = Arbeitnow, 4 = Adzuna
   can_close            boolean NOT NULL,           -- true only for ATS
   default_completeness text NOT NULL CHECK (default_completeness IN ('full','partial')),
-  purge_fence_at       timestamptz                 -- set by a source purge (§20.5); ingestion refuses items
+  purge_fence_at       timestamptz                 -- record of the last source purge (§20.5); the fence is a purge_fences row
 );                                                 -- seeded by migration
 
 CREATE TABLE watchlist_companies (
@@ -1503,7 +1569,7 @@ CREATE TABLE source_instances (
 CREATE TABLE query_proposals (
   id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   profile_version_id bigint NOT NULL REFERENCES profile_versions(id),
-  status             text NOT NULL CHECK (status IN ('running','ready','failed')),
+  status             text NOT NULL CHECK (status IN ('running','ready','failed','purged')),   -- purged: items removed (§20.2)
   items              jsonb,                          -- §11.12 schema output
   llm_call_id        bigint,                         -- FK added after llm_calls (SET NULL)
   created_at         timestamptz NOT NULL DEFAULT now(),
@@ -1749,6 +1815,8 @@ CREATE TABLE ats_snapshots (
   source_instance_id      bigint NOT NULL REFERENCES source_instances(id) ON DELETE CASCADE,
   run_id                  bigint REFERENCES runs(id) ON DELETE SET NULL,
   status                  text NOT NULL CHECK (status IN ('complete','incomplete','mass_disappearance')),
+                          -- complete and mass_disappearance are both structurally complete (§8.11)
+  event_snapshot_id       bigint REFERENCES ats_snapshots(id) ON DELETE SET NULL,   -- first snapshot of the open event
   incomplete_reason       text,                         -- e.g. non_2xx, envelope, no_end, count_mismatch, missing_id
   member_count            integer NOT NULL CHECK (member_count >= 0),
   baseline_active_count   integer,                      -- source_instances.last_snapshot_active_count before it
@@ -1756,7 +1824,8 @@ CREATE TABLE ats_snapshots (
   taken_at                timestamptz NOT NULL,         -- fetched_at of its first page
   applied_at              timestamptz,                  -- availability effects applied (idempotency)
   acknowledged_at         timestamptz,                  -- user acknowledged a mass disappearance (§8.11)
-  CHECK ((status = 'incomplete') = (incomplete_reason IS NOT NULL))
+  CHECK ((status = 'incomplete') = (incomplete_reason IS NOT NULL)),
+  CHECK (event_snapshot_id IS NULL OR status = 'mass_disappearance')
 );
 CREATE INDEX ats_snapshots_instance ON ats_snapshots (source_instance_id, taken_at DESC);
 ALTER TABLE source_instances ADD FOREIGN KEY (last_complete_snapshot_id) REFERENCES ats_snapshots(id) ON DELETE SET NULL;
@@ -1794,6 +1863,7 @@ CREATE TABLE quota_windows (                         -- every window is kept (§
   observed_limit       integer,
   observed_this_hour   integer,                      -- SerpApi
   observed_hourly_cap  integer,                      -- SerpApi
+  conservative_until   timestamptz,                  -- SerpApi foreign-usage mode (§6.5)
   hour_observed_at     timestamptz,                  -- SerpApi
   PRIMARY KEY (provider, window_start),
   CHECK (window_end > window_start),
@@ -2189,7 +2259,7 @@ CREATE INDEX score_targets_bulk ON score_targets (bulk_operation_id, state) WHER
 CREATE TABLE admission_lane_credits (               -- persistent fair rotation (§9.6.2)
   llm_tuple_id bigint NOT NULL REFERENCES llm_tuples(id),
   lane         text NOT NULL CHECK (lane IN ('similarity','oldest','exploration')),
-  credit       numeric(10,4) NOT NULL DEFAULT 0 CHECK (credit >= 0),
+  credit       numeric(10,4) NOT NULL DEFAULT 0 CHECK (credit >= -1),   -- a largest-remainder slot may borrow one
   PRIMARY KEY (llm_tuple_id, lane)
 );
 
@@ -2208,7 +2278,8 @@ CREATE TABLE score_attempts (
                             'budget_exhausted','claim_lost','cancelled','batch_draft_ready','submit_rejected','released')),
   outcome_detail          text,
   resumed_from_attempt_id bigint REFERENCES score_attempts(id),
-  logical_calls           smallint NOT NULL DEFAULT 0 CHECK (logical_calls BETWEEN 0 AND 7),
+  logical_calls           smallint NOT NULL DEFAULT 0 CHECK (logical_calls BETWEEN 0 AND 7),   -- §10.2: counted
+                          -- with http_calls in the dispatch-marker transaction of a logical call's first try
   http_calls              smallint NOT NULL DEFAULT 0 CHECK (http_calls BETWEEN 0 AND 42),
   charged                 boolean NOT NULL DEFAULT false,      -- true once one LLM call was dispatched
   cost_usd                numeric(12,6) NOT NULL DEFAULT 0 CHECK (cost_usd >= 0),
@@ -2222,6 +2293,7 @@ CREATE TABLE score_attempts (
 CREATE TABLE llm_budget (                            -- the serialisation point (§6.9.1)
   month                     date PRIMARY KEY CHECK (extract(day FROM month) = 1),   -- UTC calendar month
   cap_usd                   numeric(10,2) NOT NULL CHECK (cap_usd >= 0),
+  overrun_buffer_usd        numeric(10,2) NOT NULL CHECK (overrun_buffer_usd >= 0),   -- never admitted (§6.9.1)
   counted_usd               numeric(12,6) NOT NULL DEFAULT 0,
   scoring_counted_usd       numeric(12,6) NOT NULL DEFAULT 0,
   nonscoring_counted_usd    numeric(12,6) NOT NULL DEFAULT 0,
@@ -2260,7 +2332,7 @@ CREATE TABLE llm_spend_ledger (                      -- retained indefinitely; h
   CHECK (state NOT IN ('billed','not_billed') OR settled_usd IS NOT NULL),
   CHECK (state <> 'not_billed' OR (settled_usd = 0 AND evidence IN ('error_response_no_content',
            'connect_failed_before_send','never_dispatched','batch_submit_rejected','batch_item_errored',
-           'batch_item_canceled','batch_item_expired','batch_not_submitted_proven'))),
+           'batch_item_canceled','batch_item_expired'))),
   CHECK (state <> 'billed' OR settled_usd <= reserved_usd OR evidence = 'reservation_bound_violated'),
   CHECK (purpose_class = 'scoring' OR bulk_operation_id IS NULL),
   CHECK (NOT eval_run OR purpose_class = 'nonscoring'),
@@ -2270,14 +2342,6 @@ CREATE INDEX llm_spend_month ON llm_spend_ledger (budget_month, state);
 CREATE INDEX llm_spend_unsettled ON llm_spend_ledger (state, created_at) WHERE state IN ('reserved','dispatched');
 -- counted(month) = Σ settled_usd (billed) + Σ reserved_usd (reserved, dispatched, ambiguous) + Σ adjustments;
 -- it must equal llm_budget.counted_usd (heavy reconciler, §6.9.1).
-
-CREATE TABLE token_counts (                          -- §10.7 input bound: counted prefixes
-  model          text NOT NULL,
-  content_sha256 bytea NOT NULL,                     -- prefix_sha256 of system[0] + system[1]
-  tokens         integer NOT NULL CHECK (tokens > 0),
-  counted_at     timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (model, content_sha256)
-);
 
 CREATE TABLE llm_calls (                             -- content-bearing; deleted with its owner (§20.2)
   id                          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -2291,6 +2355,7 @@ CREATE TABLE llm_calls (                             -- content-bearing; deleted
   transport_try               smallint NOT NULL DEFAULT 1 CHECK (transport_try BETWEEN 1 AND 3),
   profile_draft_id            bigint REFERENCES profile_drafts(id) ON DELETE SET NULL,
   eval_run_id                 bigint,                         -- FK below
+  golden_case_id              bigint,                         -- FK below; eval and canary calls (§20.2)
   execution_config_id         bigint NOT NULL REFERENCES execution_configs(id),
   model_requested             text NOT NULL CHECK (model_requested IN ('claude-opus-5-5','claude-sonnet-5-5',
                                                                        'claude-haiku-5-5','claude-fable-5-1')),
@@ -2442,7 +2507,7 @@ CREATE INDEX det_rank_low ON det_results (scope_version_id, score_low DESC NULLS
 CREATE INDEX det_results_job ON det_results (job_id, scope_version_id) WHERE is_current;
 ```
 
-- **Score instances.** A `det_results` row is never updated in place. A recompute (scope change, det-facts change, algorithm change) inserts a new row and, in the same transaction, sets the previous current row's `is_current = false, superseded_at = now()` when its `det_inputs_hash` or `det_algorithm_version` differs. An identical recompute is a no-op. Feedback and history reference the instance they were made against, so an old labelled score never changes. Superseded instances follow score-history retention (§20.1).
+- **Score instances.** A `det_results` row's scores are never updated; only its `is_current` flag is cleared when it is superseded. A recompute (scope change, det-facts change, algorithm change) runs in one transaction: it locks the `llm_results` row `FOR UPDATE` (serialising replacements of that result), **first** sets the previous current row's `is_current = false, superseded_at = now()`, and **then** inserts the new current row, so the immediate partial unique index `det_results_current` is never violated. A failure rolls back both statements and the previous instance stays current. A recompute whose `det_inputs_hash` and `det_algorithm_version` equal the current row's is a no-op. Feedback and history reference the instance they were made against, so an old labelled score never changes. Superseded instances follow score-history retention (§20.1).
 - **Budget counters.** `llm_budget` is changed only under its row lock, by the operations listed in §6.9.1.
 - `llm_calls.input_refs` holds ids only. Calls of a purged attempt are deleted with the attempt (§20.2); the spend ledger row, which holds no content, is kept.
 
@@ -2452,7 +2517,7 @@ CREATE INDEX det_results_job ON det_results (job_id, scope_version_id) WHERE is_
 CREATE TABLE batch_submissions (
   id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   state               text NOT NULL CHECK (state IN ('preparing','submit_started','submitted','submit_rejected',
-                                           'submit_ambiguous','ended','reconciled','not_submitted','abandoned')),
+                                           'submit_ambiguous','released','ended','reconciled','abandoned')),
   llm_tuple_id        bigint NOT NULL REFERENCES llm_tuples(id),
   bulk_operation_id   bigint NOT NULL REFERENCES bulk_operations(id),
   request_count       integer NOT NULL CHECK (request_count BETWEEN 1 AND 100000),
@@ -2474,10 +2539,12 @@ CREATE TABLE batch_submissions (
   CHECK (state NOT IN ('submitted','ended','reconciled') OR provider_batch_id IS NOT NULL),
   CHECK (state IN ('preparing','abandoned') OR submit_started_at IS NOT NULL),
   CHECK (state <> 'reconciled' OR results_complete_at IS NOT NULL),
-  CHECK (released_at IS NULL OR state IN ('submit_ambiguous','not_submitted','submitted','ended','reconciled'))
+  CHECK ((state = 'released') <= (released_at IS NOT NULL)),
+  CHECK (released_at IS NULL OR state IN ('released','ended','reconciled'))
 );
 CREATE UNIQUE INDEX batch_one_in_flight ON batch_submissions ((true))
   WHERE state IN ('preparing','submit_started','submitted','submit_ambiguous','ended');
+-- 'released' is not in flight: after an explicit user release new batches may be submitted (§10.10).
 ALTER TABLE score_targets ADD FOREIGN KEY (batch_submission_id) REFERENCES batch_submissions(id);
 
 CREATE TABLE batch_items (
@@ -2520,7 +2587,7 @@ CREATE TABLE score_feedback (                        -- snapshot survives score 
   id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   job_id             bigint REFERENCES jobs(id) ON DELETE SET NULL,
   job_revision_id    bigint REFERENCES job_revisions(id) ON DELETE SET NULL,
-  profile_version_id bigint REFERENCES profile_versions(id),     -- never deleted
+  profile_version_id bigint REFERENCES profile_versions(id),     -- keeps the profile content from purge (§20.2)
   llm_result_id      bigint REFERENCES llm_results(id) ON DELETE SET NULL,
   det_result_id      bigint REFERENCES det_results(id) ON DELETE SET NULL,   -- the immutable instance labelled
   score_snapshot     jsonb,                          -- {L, M, U, coverage, confidence, tuple ids, scope id}
@@ -2540,6 +2607,7 @@ CREATE TABLE golden_cases (                          -- §11.13; its job inputs 
   expected_knockouts      text[] NOT NULL DEFAULT '{}',
   source                  text NOT NULL CHECK (source IN ('week1','feedback','adversarial')),
   labelled_from_result_id bigint REFERENCES llm_results(id) ON DELETE SET NULL,
+  det_inputs_snapshot     jsonb NOT NULL,          -- frozen job det-facts at labelling time (salary, locations, …)
   is_canary               boolean NOT NULL DEFAULT false,
   active                  boolean NOT NULL DEFAULT true,
   created_at              timestamptz NOT NULL DEFAULT now(),
@@ -2565,6 +2633,7 @@ CREATE TABLE eval_runs (
   finished_at              timestamptz
 );
 ALTER TABLE llm_calls ADD FOREIGN KEY (eval_run_id) REFERENCES eval_runs(id) ON DELETE CASCADE;
+ALTER TABLE llm_calls ADD FOREIGN KEY (golden_case_id) REFERENCES golden_cases(id) ON DELETE CASCADE;
 
 CREATE TABLE eval_case_results (
   eval_run_id    bigint NOT NULL REFERENCES eval_runs(id) ON DELETE CASCADE,
@@ -2601,9 +2670,10 @@ CREATE UNIQUE INDEX alerts_open_dedup ON alerts (dedup_key) WHERE resolved_at IS
 
 CREATE TABLE deletion_manifests (                  -- ids and key hashes only, never content
   id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  manifest_uuid    uuid NOT NULL UNIQUE,           -- UUIDv7: the stream identity and file name (§19.5)
   kind             text NOT NULL CHECK (kind IN ('delete_everything','source_purge','profile_purge',
                                                  'retention_purge','job_tombstone','golden_case_delete')),
-  scope            jsonb NOT NULL,
+  scope            jsonb NOT NULL,                 -- {table: [ids]}, key hashes, and max_ids {table: max id}
   status           text NOT NULL CHECK (status IN ('executing','completed','shipped')),
   file_sha256      bytea NOT NULL,                 -- the fsync'd copy on the manifests volume
   created_at       timestamptz NOT NULL DEFAULT now(),
@@ -2618,10 +2688,49 @@ CREATE TABLE deletion_manifests (                  -- ids and key hashes only, n
 CREATE TABLE manifest_shipments (                  -- written by the backup container's shipper (§19.5)
   id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   restic_snapshot_id text NOT NULL,                -- tag 'manifests'
-  max_manifest_id    bigint NOT NULL,              -- every manifest file with id ≤ this is included
   shipped_at         timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE manifest_shipment_items (             -- the exact files a shipment contained
+  shipment_id   bigint NOT NULL REFERENCES manifest_shipments(id),
+  manifest_uuid uuid NOT NULL,
+  file_sha256   bytea NOT NULL,
+  PRIMARY KEY (shipment_id, manifest_uuid)
+);
 ALTER TABLE deletion_manifests ADD FOREIGN KEY (shipment_id) REFERENCES manifest_shipments(id);
+-- A manifest is shipped only when a shipment item names its manifest_uuid with an equal file_sha256.
+
+CREATE TABLE purge_fences (                        -- §20.2; persisted, survives restarts
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind        text NOT NULL CHECK (kind IN ('global','source','profile','jobs')),
+  source_id   text REFERENCES sources(id),
+  profile_version_id bigint,                       -- no FK: the row outlives the purge it fences
+  job_ids     bigint[] NOT NULL DEFAULT '{}',
+  manifest_id bigint NOT NULL REFERENCES deletion_manifests(id),
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  released_at timestamptz,                         -- set in the purge's final transaction
+  CHECK ((kind = 'source') = (source_id IS NOT NULL)),
+  CHECK ((kind = 'profile') = (profile_version_id IS NOT NULL)),
+  CHECK (kind <> 'jobs' OR cardinality(job_ids) >= 1)
+);
+CREATE INDEX purge_fences_active ON purge_fences (kind) WHERE released_at IS NULL;
+CREATE INDEX purge_fences_jobs ON purge_fences USING gin (job_ids) WHERE released_at IS NULL;
+
+CREATE FUNCTION is_fenced(p_job bigint, p_tuple bigint DEFAULT NULL) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM purge_fences f
+     WHERE f.released_at IS NULL
+       AND (f.kind = 'global'
+            OR (f.kind = 'jobs' AND p_job = ANY (f.job_ids))
+            OR (f.kind = 'source' AND (
+                  EXISTS (SELECT 1 FROM postings p JOIN source_instances si ON si.id = p.source_instance_id
+                           WHERE p.job_id = p_job AND si.source_id = f.source_id)
+               OR EXISTS (SELECT 1 FROM job_revisions r JOIN job_revision_sources s ON s.job_revision_id = r.id
+                           WHERE r.job_id = p_job AND s.source_id = f.source_id)))
+            OR (f.kind = 'profile' AND EXISTS (SELECT 1 FROM llm_tuples t
+                                                WHERE t.id = p_tuple
+                                                  AND t.profile_version_id = f.profile_version_id))));
+$$;                                                -- callers hold the job row FOR SHARE (§20.2)
 
 CREATE TABLE backup_sets (                         -- one consistent recovery set (§19.5)
   id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -2629,14 +2738,15 @@ CREATE TABLE backup_sets (                         -- one consistent recovery se
   restic_snapshot_id  text,                        -- tag 'set:<id>': dump + cv + manifests + backup_set.json
   dump_sha256         bytea,
   dump_bytes          bigint,
-  db_snapshot_at      timestamptz,                 -- start of the pg_dump transaction
-  manifest_high_water bigint,                      -- max deletion_manifests.id visible to the dump
+  db_snapshot_at      timestamptz,                 -- start of the exported snapshot the dump used
+  manifest_count      integer,                     -- deletion_manifests rows visible to the dump
+  row_counts          jsonb,                       -- {table: count} taken in the dump's own snapshot
   cv_file_count       integer,
   error               text,
   started_at          timestamptz NOT NULL DEFAULT now(),
   finished_at         timestamptz,
   CHECK (status <> 'succeeded' OR (restic_snapshot_id IS NOT NULL AND dump_sha256 IS NOT NULL
-                                   AND db_snapshot_at IS NOT NULL AND manifest_high_water IS NOT NULL))
+                                   AND db_snapshot_at IS NOT NULL AND row_counts IS NOT NULL))
 );
 
 CREATE TABLE backup_runs (
@@ -2690,7 +2800,7 @@ RETURNING id;
 | `batch_submissions` | `state` | `reconcile_report` | the per-state timestamp | `state = :expected` |
 | `batch_items` | `result_type` | `decision` | `processed_at` | the submission's predicate |
 | `profile_drafts` | `status` | `status_reason` | `status_changed_at` | — |
-| `operations` | `status` | `last_error_code` | `started_at` / `finished_at` | `worker_epoch = :e` |
+| `operations` | `status` | `last_error_code` | `started_at` / `finished_at` | `claim_id = :c` (fresh per execution) |
 | `score_cycles` | `status` | `status_reason` | `finished_at` | `worker_epoch = :e` |
 | `bulk_operations` | `state` | — | `finished_at` | — |
 | `quota_ledger`, `llm_spend_ledger` | `state` | `evidence` | `dispatched_at` / `settled_at` | the owner row (§3.3.3) |
@@ -2774,9 +2884,9 @@ unknown ──mass disappearance confirmed or acknowledged (§8.11)────�
 | `in_batch` | item decision `refused` | `refused(category)` | `batch_submission_id := NULL` |
 | `in_batch` | item decision `failed_request` or `failed_invalid_output` | that state | `batch_submission_id := NULL` |
 | `in_batch` | item decision `retry_online` (errored other, canceled, expired, missing, `max_tokens`, unparseable) | `pending` | `batch_submission_id := NULL`; `state_reason` names the cause |
-| `in_batch` | submission `submit_rejected`, `abandoned` or `not_submitted` | `pending` | `batch_submission_id := NULL` |
+| `in_batch` | submission `submit_rejected` or `abandoned` | `pending` | `batch_submission_id := NULL` |
 | `in_batch` | user "release and re-score" on `submit_ambiguous` | `pending` | `batch_submission_id := NULL` |
-| `in_batch` | tuple superseded (after `messages.batches.cancel` is requested) | `cancelled('tuple_superseded')` | `batch_submission_id := NULL` |
+| `in_batch` | tuple superseded (after `messages.batches.cancel` is requested), revision superseded, job merged, or purge | `cancelled(reason)` | `batch_submission_id := NULL`; the item's later result is fenced: it settles spend from usage or from the provider's per-item evidence and publishes nothing (§10.10) |
 | `pending`, `budget_deferred`, `deferred_duplicate`, `filtered_out`, `expired_unscored`, `refused`, `failed_*` | tuple superseded, revision superseded, job merged, purge | `cancelled(reason)` | group/filter columns := NULL |
 | `cancelled` (`tuple_superseded`, `revision_superseded`, `job_merged`) | its tuple is active again **and** its revision is the job's current revision of an unmerged job | `pending` | `override := 'none'` |
 
@@ -2825,14 +2935,16 @@ dispatched ──lost, timed out, or found by a new attempt without a response�
 
 ```
 preparing ──submit_started_at committed──► submit_started
-preparing ──found at restart (never started)──► abandoned                 (targets → pending, spend not_billed)
+preparing ──found at restart (never started), or delete-everything──► abandoned   (targets → pending, spend not_billed)
 submit_started ──create returned id──► submitted
 submit_started ──definitive 4xx response──► submit_rejected                (targets → pending, spend not_billed)
 submit_started ──timeout | connection lost | 5xx | crash──► submit_ambiguous
-submit_ambiguous ──candidate ended + custom_id set equals ours──► submitted (adopt provider id) → ended
-submit_ambiguous ──exhaustive reconciliation after the observation window closed, no match──► not_submitted
-                    (spend → not_billed(batch_not_submitted_proven); in_batch targets re-queued)
-submit_ambiguous ──incomplete reconciliation──► submit_ambiguous           (alert at 25 h; never by timeout)
+submit_ambiguous | released ──candidate ended + custom_id set equals ours──► ended (adopt provider id)
+submit_ambiguous ──any reconciliation without a match, complete or not──► submit_ambiguous
+                    (alert at 25 h; never by timeout and never from an empty listing — chair decision C3)
+submit_ambiguous ──explicit user release──► released     (in_batch targets → pending; spend stays ambiguous)
+submit_started | submit_ambiguous ──delete-everything (§20.4)──► released     (spend → ambiguous; rows then deleted)
+submitted | ended ──delete-everything──► (same state; cancel_requested_at set, spend → ambiguous; rows then deleted)
 submitted ──processing_status = ended (also after a requested cancel)──► ended
 ended ──result stream read to its end and validated; every item processed──► reconciled
 ```
@@ -2845,12 +2957,13 @@ reserved ──owner superseded, never dispatched──► not_billed(never_disp
 dispatched ──response classified billed (usage known / 2xx)──► billed (LLM: settled_usd = actual cost)
 dispatched ──positive evidence of no charge──► not_billed(evidence)
 dispatched ──lost | timed out | unclassifiable | > 15 min unsettled (online only)──► ambiguous (keeps max charge)
-ambiguous ──(LLM batch items only) results downloaded with usage──► billed
-ambiguous ──(LLM batch items only) exhaustive proof the batch was never created (§10.10)──► not_billed(batch_not_submitted_proven)
+dispatched ──(LLM batch item) its submission is released, or deleted by delete-everything (§20.4)──► ambiguous
+ambiguous ──(LLM batch item of a batch that was found) result downloaded with usage──► billed
+ambiguous ──(LLM batch item of a batch that was found) errored | canceled | expired──► not_billed(batch_item_errored | batch_item_canceled | batch_item_expired)
 ```
 
-- `billed` and `not_billed` are terminal. `ambiguous` is terminal for quota providers and for online LLM calls; batch items have exactly the two evidence transitions above, including items whose targets the user already released.
-- Batch item entries are exempt from the 15-minute rule; they settle when their item is processed or the submission is proven `not_submitted` (§10.10).
+- `billed` and `not_billed` are terminal. `ambiguous` is terminal for quota providers, for online LLM calls and for the items of a batch that is never found; batch items of a batch that **was** found have exactly the two provider-evidence transitions above, including items whose targets the user already released (Codex N9). There is no transition from an empty listing (chair decision C3).
+- Batch item entries are exempt from the 15-minute rule; they settle when their item is processed (§10.10). Items of a released submission that is never found stay `ambiguous` and counted.
 - Every transition of an LLM entry updates `llm_budget` in the same transaction (§6.9.1).
 - Adjustments are separate rows.
 
@@ -2871,8 +2984,8 @@ ambiguous ──(LLM batch items only) exhaustive proof the batch was never crea
   text_review | ready | failed ──discard (or a new upload / paste)──► discarded
   failed ──retry (same text, or native-PDF opt-in)──► extracting_profile
   ```
-- **Operation**: `pending → running → succeeded | failed`; `running → pending` (older epoch at takeover, heartbeat older than 3 min, or a retryable error with `not_before`).
-- **Score cycle**: `running → completed | failed(orphaned | bug)`.
+- **Operation**: `pending → running` (a fresh `claim_id`) `→ succeeded | failed`; `running → pending` with `claim_id := NULL` (older epoch at takeover, heartbeat older than 3 min, or a retryable error with `not_before`); `pending | running → cancelled` (delete-everything, a superseding purge, or a superseded scope, §20.4).
+- **Score cycle**: `running → completed | failed(orphaned | bug | cancelled)`; `cancelled` only by delete-everything (§20.4).
 - **Bulk operation**: `active → completed | cancelled`.
 - **Deletion manifest**: `executing → completed → shipped`.
 - **Backup set**: `running → succeeded | failed`.
@@ -2890,11 +3003,12 @@ These are checked by reconcilers (§17.4) and by integration tests:
 3. No target is `in_progress` with `claim_heartbeat_at < now() − 3 min`, or with a `claim_epoch` older than the current worker epoch after the takeover sweep. `in_batch` is exempt.
 4. Every `active` duplicate group either has a representative whose active-tuple target is `pending`, `budget_deferred`, `in_progress`, `in_batch` or published, or has `unscorable_reason` set and no eligible member (§8.7).
 5. For every published `llm_result` of the active tuple there is exactly one **current** `det_result` for the active scope, and for the pending scope while one exists, whose `det_inputs_hash` and `det_algorithm_version` are current.
-6. For every quota window, counted units ≤ `limit_units`. For every month, `llm_budget.counted_usd` equals the ledger sum, and `counted_usd ≤ max(cap_usd, counted_at_cap_change_usd)`. Every ledger row satisfies `counted_before_usd + reserved_usd ≤ admitted_cap_usd`. There is no tolerance for overruns: a billed row above its reservation is the critical defect `llm.reservation_bound_violated`.
+6. For every quota window, counted units ≤ `limit_units`. For every month, `llm_budget.counted_usd` equals the ledger sum, and `counted_usd ≤ max(cap_usd, counted_at_cap_change_usd)`. Every ledger row satisfies `counted_before_usd + reserved_usd ≤ admitted_cap_usd − overrun_buffer_usd`. The buffer is the only tolerance: a billed row above its reservation is the critical defect `llm.reservation_bound_violated`.
 7. For every bulk operation, `spent_usd ≤ budget_usd`, and every batch submission was admitted with `spent_usd + followup_held_usd + its worst case ≤ budget_usd` (§6.9.3).
 8. Every `submit_ambiguous` submission younger than 25 h is being reconciled; older ones have an open alert.
-9. Every deletion manifest is `shipped` within 1 h of completion, or `privacy.manifest_unshipped` is open.
-10. No running score cycle or operation has a `worker_epoch` older than the current one after the takeover sweep.
+9. Every deletion manifest is `shipped` within 1 h of completion — a shipment item names its `manifest_uuid` with an equal file hash — or `privacy.manifest_unshipped` is open.
+10. No running score cycle or operation has a `worker_epoch` older than the current one after the takeover sweep, and every running operation has a `claim_id`.
+11. While a purge fence is active, no target exists for a fenced job that was created or revived after the fence's `created_at`, and no result of a fenced job is published after it (§20.2).
 
 ### 7.18 Current-score view
 
@@ -2952,6 +3066,7 @@ SELECT cs.job_id,
 - **Cards** (§15.5): the group card shows the representative and its deferred members (`rendered_in_group_card`). A member with its own published score renders as **its own card**, ranked and filtered by its own score, with a "possible duplicate of <representative>" badge. Score filters and sorts on the group card use the representative's score.
 
 ---
+
 ## 8. Normalisation & deduplication
 
 All rules in this section are deterministic and pure functions, in `normalize/` and `dedup/`. Each has unit and property tests over the observed strings from research.
@@ -3045,26 +3160,28 @@ The canonical primary link is stored in the normalised observation and used for 
 
 ### 8.6 Identity resolution and merge rules
 
-`resolve_identity` handles one `pending` raw item per transaction, from its stored `normalized` intermediate.
+`resolve_identity` handles one `pending` raw item per transaction, from its stored `normalized` intermediate. The transaction first takes `active_config` `FOR SHARE` (lock order, §3.3.3), so a scope flip cannot commit between the item's writes and the projections they require (§13.4). Rows are written in dependency order: **decide the job first, then the posting, then the keys, then their provenance**.
 
 1. **Fence and idempotency.**
-   - If the item's source has `sources.purge_fence_at` set (§20.5), the item becomes `out_of_scope('source_purged')` and nothing else happens.
+   - If the item's source has an active `source` purge fence (§20.2, §20.5), the item becomes `out_of_scope('source_purged')` and nothing else happens.
    - If a `posting_observations` row with this `raw_item_id` already exists, the item is linked to it and nothing else happens. Replaying a receipt therefore never counts a sighting twice.
-2. **Posting.** `INSERT … ON CONFLICT (source_instance_id, native_id) DO NOTHING`, then `SELECT … FOR UPDATE`. The sighting time is `t = raw_responses.fetched_at` of the item's response, never the processing time.
-3. **Observation.** Insert the observation with `observed_at = t` and the provenance copy (`source_instance_id`, `raw_response_sha256`). Then, monotonically:
-   - `seen_count := seen_count + 1`;
-   - `last_seen_at := greatest(last_seen_at, t)`;
-   - `latest_observation_id := new` only if `t ≥` the current latest observation's `observed_at`;
-   - availability per §7.16.2: the sighting revives the posting only if `t > availability_changed_at`.
-4. **Keys.** Collect the observation's keys `K` (§8.4) and insert their `ad_key_sources` rows. Look up `ad_keys` for `K`, following `merged_into_job_id` to the root. Together with the posting's current job `P` (if any) this gives the job set `J`.
-5. **Tombstones.** If the posting is new and `J` is empty, `tombstone_keys` is searched for `sha256(key_ns ‖ key_value)` of every key in `K`. On a hit, the new job records `restored_from_tombstone_id`, and its `user_job_actions` are initialised from the tombstone's timestamps. A hidden ad that is re-posted stays hidden, and an applied one stays marked applied.
-6. **Decide.**
-   - **`J` empty**: the posting attaches to a new job, and the job takes ownership of `K` in `ad_keys`.
-   - **`J` is one job**: attach to it and insert any missing `ad_keys` rows.
-   - **`J` has several jobs, with no exclusive conflict among them and no `dedup_decisions(different)` between any pair**: merge them all into the lowest job id with the merge procedure (§8.6.1), one `merge_event(strong_key_merge)` per merged job.
-   - **Exclusive conflict** (two jobs, or the posting and a job, carry different values in the same exclusive namespace, for example two different `pub:stepstone.de` ids linked by one `htidocid`): **no merge**. The posting stays on `P`, or on a new job if it is new. Key ownership is unchanged. An `identity_conflicts(status='open', posting_job_id, candidate_job_ids)` row is written with the other job(s), at least one, and `dedup.identity_conflict` (info) is raised. The user resolves it in System → Needs attention.
-   - **A `different` decision** between jobs in `J` (from a split, an unmerge or a resolved conflict): no merge and no new conflict. The posting stays on its own job.
-7. **Canonical fields** of the affected job(s) are recomputed (§8.8). That may reuse or create a revision and move the job's current revision (§9.7).
+2. **Read before writing.** The sighting time is `t = raw_responses.fetched_at` of the item's response, never the processing time. Without writing anything yet:
+   - look up the posting on `(source_instance_id, native_id)` (a plain read; the posting is locked in step 4, after the job rows, per the lock order of §3.3.3); its job is `P`;
+   - collect the observation's keys `K` (§8.4) and look up `ad_keys` for `K`, following `merged_into_job_id` to the root;
+   - together this gives the job set `J`.
+3. **Decide the job.**
+   - **Fenced jobs first.** The jobs of `P` and `J` are locked `FOR SHARE` in id order (`FOR UPDATE` where step 6 will merge them). If any of them is fenced (`is_fenced`, §20.2), the item waits: it stays `pending` and is retried by the next run after the fence is released, so a purge never races an attachment or a merge.
+   - **`J` empty**: allocate a new job. First search `tombstone_keys` for `sha256(key_ns ‖ key_value)` of every key in `K`; on a hit, the new job records `restored_from_tombstone_id` and its `user_job_actions` are initialised from the tombstone's timestamps, so a hidden ad that is re-posted stays hidden and an applied one stays marked applied. The job row is inserted with canonical fields computed from this observation alone (`current_revision_id` is a deferred FK and is set in step 7).
+   - **`J` is one job**: that job.
+   - **`J` has several jobs, with no exclusive conflict among them and no `dedup_decisions(different)` between any pair**: the lowest job id; the others are merged into it in step 6.
+   - **Exclusive conflict** (two jobs, or the posting and a job, carry different values in the same exclusive namespace, for example two different `pub:stepstone.de` ids linked by one `htidocid`): **no merge**. The target job is `P`, or a new job if the posting is new. An `identity_conflicts(status='open', posting_job_id, candidate_job_ids)` row is written in step 6 with the other job(s), at least one, and `dedup.identity_conflict` (info) is raised. The user resolves it in System → Needs attention.
+   - **A `different` decision** between jobs in `J` (from a split, an unmerge or a resolved conflict): no merge and no new conflict. The target job is the posting's own job.
+4. **Posting and observation.**
+   - Insert the posting with the decided `job_id` (`INSERT … ON CONFLICT (source_instance_id, native_id) DO NOTHING`, then re-read it `FOR UPDATE`), or move an existing posting to the decided job.
+   - Insert the observation with `observed_at = t` and the provenance copy (`source_instance_id`, `raw_response_sha256`). Then, monotonically: `seen_count := seen_count + 1`; `last_seen_at := greatest(last_seen_at, t)`; `latest_observation_id := new` only if `t ≥` the current latest observation's `observed_at`; availability per §7.16.2 (the sighting revives the posting only if `t > availability_changed_at`).
+5. **Keys, then provenance.** Insert the missing `ad_keys` rows for `K`, owned by the decided job (`ON CONFLICT DO NOTHING`; key ownership is unchanged on an exclusive conflict), and only then the `ad_key_sources` rows that reference them.
+6. **Merges and conflicts.** Run the merge procedure (§8.6.1, one `merge_event(strong_key_merge)` per merged job) or write the identity conflict, as decided in step 3.
+7. **Canonical fields and projections** of the affected job(s) are recomputed (§8.8). That may reuse or create a revision and move the job's current revision (§9.7). **In the same transaction**, every affected job gets its `hard_filter_results` for the active scope and, if `pending_scope_version_id` is set, for the pending scope, and every published result of the job whose det-facts changed gets a new current `det_results` instance for both scopes (§8.8, §11.11). A scope flip therefore never finds a job without its required projections.
 
 #### 8.6.1 Merge procedure
 
@@ -3169,7 +3286,7 @@ For each job, every canonical field is selected deterministically from its posti
 
 - Each field records provenance in `jobs.field_provenance[field] = {source_instance_id, posting_id, observation_id, observed_at, rule}`.
 - **The material projection** (`job_revisions.llm_input`) is `{title, company_display, locations (labels), work_mode_possible + source, employment_types + source, ad_language, description_completeness, description_text}`. These are exactly the fields rendered into the generator prompt. `material_hash = sha256(canonical JSON)`.
-- **Revision reuse.** When `material_hash` changes, the job's revision with that hash is reused if one exists (`UNIQUE (job_id, material_hash)`); otherwise a new revision is inserted. Either way `jobs.current_revision_id` moves to it and a `job_revision_occurrences` row records the change. A job whose title flips A → B → A therefore points back to revision A, and A's existing target (published, or cancelled as `revision_superseded` and then revived, §7.16.3) is reused with no new LLM cost.
+- **Revision reuse.** When `material_hash` changes, the job's revision with that hash is reused if one exists (`UNIQUE (job_id, material_hash)`); otherwise a new revision is inserted. Either way `jobs.current_revision_id` moves to it and a `job_revision_occurrences` row records the change. A job whose title flips A → B → A therefore points back to revision A, and A's existing target (published, or cancelled as `revision_superseded` and then revived, §7.16.3) is reused with no new LLM cost. A revision with lineage from a source under an active purge fence is never reused; the purge deletes it (§20.5).
 - **Lineage.** A new revision writes `job_revision_sources` rows for every `llm_input` field, naming the source, posting and observation that supplied it. Lineage is immutable and survives the deletion of postings, so a source purge can find every revision derived from that source (§20.5).
 - Other canonical fields (salary, locations and their candidates, remote countries, industry, availability) live on `jobs` and feed `det_results` and hard filters through `det_facts_hash`. When they change, `det_results` (a new current instance) and `hard_filter_results` are recomputed for that job, with no LLM call.
 
@@ -3197,17 +3314,18 @@ For each job, every canonical field is selected deterministically from its posti
   - aggregator disappearance never closes an ad;
   - **`stale` never expires a score target.** A pending target of an aggregator-only job expires only on `too_old` or `closed` (§9.6.3), so it can still be scored for the whole `max_ad_age_days` window;
   - the dry-run warns `stale_ttl_short` when `stale_ttl_days < max_ad_age_days` (§6.8).
-- **ATS postings** (snapshots, §5.3.5):
-  - a **member** of any snapshot (complete or incomplete) → `active` if the sighting is newer than the last availability change, and `absent_snapshots := 0`, `first_absent_at := NULL`. Membership comes from `ats_snapshot_members`, so an item that failed normalisation still counts as present;
+- **ATS postings** (snapshots, §5.3.5). Two properties of a snapshot are kept apart: **structural completeness** (every page 2xx, envelope valid, `END` reached, counts match, every item has a native id) and the **closure classification** (`normal` or a mass disappearance). The `status` column combines them: `incomplete` is structurally incomplete; `complete` and `mass_disappearance` are both **structurally complete**, and `mass_disappearance` additionally carries the closure classification.
+  - a **member** of any snapshot (complete or not) → `active` if the sighting is newer than the last availability change, and `absent_snapshots := 0`, `first_absent_at := NULL`. Membership comes from `ats_snapshot_members`, so an item that failed normalisation still counts as present;
   - **absent from a `complete` snapshot** → `absent_snapshots := LEAST(absent_snapshots + 1, 2)` and `first_absent_at := COALESCE(first_absent_at, snapshot.taken_at)`, idempotently per snapshot (`last_absent_snapshot_id`);
   - `active | unknown → closed('ats_absent')` when `absent_snapshots ≥ 2` and `snapshot.taken_at − first_absent_at ≥ 24 h`. At a 6-hour interval this closes a posting at the fifth consecutive absent snapshot, 24 h after the first;
-  - absent from an **incomplete** snapshot (non-2xx page, envelope failure, no `END`, count mismatch, or any item without a native id) → `unknown`, and the absence is not counted.
-- **Mass disappearance.** The baseline is `source_instances.last_snapshot_active_count`: the number of active postings after the last complete, non-mass snapshot.
-  - A complete snapshot in which more than 50% of the baseline (and at least 5 postings) is absent is classified `mass_disappearance`. Its absent postings go to `unknown`, their absence is not counted, `mass_event_snapshot_id` records the first such snapshot, and `ats.mass_disappearance` (warn) is raised.
-  - **Confirmation.** The event is confirmed when two later complete snapshots, taken at least 24 h apart, still show the same postings absent. The postings absent from all three snapshots then go `unknown → closed('mass_disappearance_confirmed')`, the baseline is reset to the present count, and `mass_event_snapshot_id := NULL`.
+  - absent from an **incomplete** snapshot → `unknown`, and the absence is not counted;
+  - absent from a **`mass_disappearance`** snapshot → `unknown`, and the absence is **not** counted by the ordinary rule above. While an event is open, postings in its absent set can leave `unknown` only by reappearing, by confirmation or by acknowledgement (below), so ordinary counting can never close them behind the event's back.
+- **Mass disappearance.** The baseline is `source_instances.last_snapshot_active_count`: the number of active postings after the last structurally complete snapshot that was **not** part of a mass event. It is frozen while an event is open.
+  - **Opening.** A structurally complete snapshot in which more than 50% of the baseline (and at least 5 postings) is absent opens an event: it gets status `mass_disappearance`, `source_instances.mass_event_snapshot_id` records it, its absent postings form the event's **absent set**, and `ats.mass_disappearance` (warn) is raised.
+  - **Follow-up snapshots.** While the event is open, every structurally complete snapshot is compared with the frozen baseline. If more than 50% (and at least 5) is still absent, it also gets status `mass_disappearance`, with `event_snapshot_id` pointing at the opening snapshot. Otherwise it is `complete` and the event clears (baseline reset to the active count, `mass_event_snapshot_id := NULL`).
+  - **Confirmation** is evaluated over **structurally complete snapshots, i.e. status `complete` or `mass_disappearance`**: the event is confirmed when two snapshots taken after the opening one, at least 24 h apart, each show the absent-set postings still absent. The postings absent from the opening snapshot and from both confirming snapshots go `unknown → closed('mass_disappearance_confirmed')`, the baseline is reset to the present count, and `mass_event_snapshot_id := NULL`. *Example (Fable N1).* A board of 20 moves to another ATS, collected every 6 h: the 06:00 snapshot opens the event (20 of 20 absent); every later snapshot is a `mass_disappearance` follow-up with `event_snapshot_id` set; the 12:00 follow-up and the next day's 12:00 follow-up are 24 h apart, so the event is confirmed at the next day's 12:00 snapshot and the 20 postings close.
   - **Acknowledgement.** The user can confirm the event at once (`POST /api/ats-snapshots/{id}/acknowledge`, §14.2), which applies the same closure.
-  - Postings that reappear in any later snapshot become `active` as usual. The event clears when the absent share falls to 50% or below.
-  - After every other complete snapshot the baseline is updated to the active count.
+  - Postings that reappear in any later snapshot become `active` as usual.
 - **Failures never age anything.** A run where a source fails leaves its postings unchanged.
 - The **stale sweep** runs in the daily maintenance task and in the tick, in bounded batches of 1,000 postings.
 
@@ -3234,6 +3352,7 @@ For each job, every canonical field is selected deterministically from its posti
 - **Scope locations** are chosen through the gazetteer search API (§14.2): the user picks one candidate, so every scope location has a unique gazetteer id and coordinates.
 
 ---
+
 ## 9. Workflows (LangGraph)
 
 ### 9.1 Common rules
@@ -3260,7 +3379,8 @@ For each job, every canonical field is selected deterministically from its posti
 - **Non-LLM retry policy**: `RetryPolicy(max_attempts=3, initial_interval=0.5, backoff_factor=2, jitter=True, retry_on=is_retryable_db_error)`. That predicate matches only serialization failures (40001), deadlocks (40P01) and connection resets. Any 4xx and any validation or domain error is not retried.
 - **LLM nodes have no `RetryPolicy`**; the gateway owns retries (§10.4). Every LLM node has `timeout=TimeoutPolicy(run_timeout=<node deadline>)` and `trace_policy=TracePolicy(process_inputs=omit, process_outputs=omit)`.
 - **Error handlers**: every node has an `error_handler` that converts typed exceptions (§17.1) into a persisted outcome. Only `Bug`, `OutcomeConflict` and `FencedOut` propagate. `FencedOut` ends the attempt silently: the attempt record gets `end_reason='worker_takeover'` or `'heartbeat_stale'`, because a newer attempt owns the work.
-- **Lock order** in every transaction follows §3.3.3: `active_config` → owner row → `llm_budget` → `quota_windows` → ledger rows → domain rows → `ranking_state`.
+- **Lock order** in every transaction follows §3.3.3: `active_config` → job rows → owner row → `llm_budget` → `quota_windows` → ledger rows → other domain rows → `ranking_state`.
+- **Purge fences** (§20.2) are checked inside the same transaction as the work they guard: target creation and revival, the claim, the publish transaction, eval scoring and export generation each refuse fenced work.
 
 ### 9.2 `collect_graph` (deterministic, no LLM)
 
@@ -3291,10 +3411,10 @@ class CollectState(TypedDict):
 | 3 | `plan_fallback` | det | Runs after every primary JSearch spec is terminal. Collects the JSearch cells this run did not serve whose outcome is fallback-eligible by the table in §6.6, and creates SerpApi specs `phase='fallback'`. `paced` and `reserve_held` denials are never eligible. | 30 s | — |
 | 4 | `fetch_fallback` | det I/O | Same as node 2 for SerpApi specs, concurrency 1, with an `account.json` read before every search (§5.3.2). Skipped when there are none. | 15 min | as node 2 |
 | 5 | `parse_normalize` | det | For every `raw_response` of this run with `parsed_at IS NULL`: `adapter.parse` → one `raw_items` row per array element, either `pending` with its `normalized` intermediate or a terminal disposition; then `parsed_at`. One transaction per response. | 10 min, heartbeat | items `rejected(reason)` |
-| 6 | `resolve_identity` | det | Per `pending` raw item: §8.6 in one transaction (fence, idempotency, posting, observation, keys, tombstones, merge or conflict, canonical fields, revision reuse or creation, lineage). Then, per ATS snapshot of the run, the availability effects of §8.11 in one transaction, guarded by `applied_at`. Then duplicate grouping for changed revisions (§8.7), under `pg_advisory_xact_lock(hashtext(company_key))`. | 20 min, heartbeat | item `rejected('identity_error')` on a domain error |
+| 6 | `resolve_identity` | det | Per `pending` raw item: §8.6 in one transaction holding `active_config` `FOR SHARE` (fence, idempotency, job decision, posting, observation, keys and provenance, tombstones, merge or conflict, canonical fields, revision reuse or creation, lineage, and the job's `hard_filter_results` and det instances for the active and pending scope). Then, per ATS snapshot of the run, the availability effects of §8.11 in one transaction, guarded by `applied_at`. Then duplicate grouping for changed revisions (§8.7), under `pg_advisory_xact_lock(hashtext(company_key))`. | 20 min, heartbeat | item `rejected('identity_error')` on a domain error |
 | 7 | `embed` | det (embedder) | For revisions with `awaiting_embedding`, in batches of 16: `POST embedder/v1/embed` (passage, ≤ 1,024 tokens, truncation flagged), then upsert `embeddings` and mark `embedded`. | 20 min, heartbeat; 120 s per batch | **Embedder unavailable**: stop embedding, leave `awaiting_embedding`, count them, run → `partial`, alert `embedder.unavailable` (warn) |
-| 8 | `hard_filters` | det | For each job whose current revision is new or changed, or whose `det_facts_hash` changed: compute `hard_filter_results` for the active scope (and the pending scope, if any), with `inputs_hash` and `det_algorithm_version`. | 5 min | bug → run `failed` |
-| 9 | `enqueue_targets` | det | If `llm_tuple_id` is set: for each current revision without an active-tuple target, create one (§9.7 insert rule) with `similarity` = the max cosine against the profile vectors, or NULL if awaiting embedding. The state is `filtered_out`, `deferred_duplicate` or `pending` (§7.16.3). Targets of revisions that stopped being current → `cancelled('revision_superseded')` unless published. | 5 min | bug → run `failed` |
+| 8 | `hard_filters` | det | Verification and backfill: for each job touched by the run whose `hard_filter_results` for the active (or pending) scope is missing, or whose `inputs_hash` or `det_algorithm_version` is stale, recompute it under `active_config` `FOR SHARE`. Normally there is nothing to do, because node 6 writes them atomically. | 5 min | bug → run `failed` |
+| 9 | `enqueue_targets` | det | If `llm_tuple_id` is set: for each current revision without an active-tuple target, take the job row `FOR SHARE`, skip it if a purge fence covers the job, and otherwise create one (§9.7 insert rule) with `similarity` = the max cosine against the profile vectors, or NULL if awaiting embedding. The state is `filtered_out`, `deferred_duplicate` or `pending` (§7.16.3). Targets of revisions that stopped being current → `cancelled('revision_superseded')` unless published. | 5 min | bug → run `failed` |
 | 10 | `finalize` | det | Run invariants (§17.2); the run report; `coverage_cells` updates; alerts; run status `succeeded`/`partial`/`failed_invariant`; dead-man ping (§17.7). It does not start a score cycle: the tick does, gated by the USD bucket (§3.4, §6.9.2). | 60 s | invariant violation → `failed_invariant` + critical alert |
 
 **Edges**: `START → plan → fetch_primary (Send fan-out) → plan_fallback → [fetch_fallback | (no specs) skip] → parse_normalize → resolve_identity → embed → hard_filters → enqueue_targets → finalize → END`. `plan_fallback` has a conditional edge: when it produced specs it routes to `fetch_fallback`, otherwise straight to `parse_normalize`.
@@ -3349,6 +3469,7 @@ UPDATE score_targets t
    AND t.id IN (SELECT id FROM score_targets
                  WHERE id = ANY(:ids) AND state = 'pending'
                    AND (not_before IS NULL OR not_before <= now())
+                   AND NOT is_fenced(job_id, llm_tuple_id)   -- active purge fence (§7.14, §20.2)
                  FOR UPDATE SKIP LOCKED)
 RETURNING t.id, t.claim_id, t.attempt_no;
 ```
@@ -3395,6 +3516,7 @@ class TargetState(TypedDict):
 
 The **`publish` transaction** (online and batch use the same sequence):
 1. `SELECT … FROM active_config WHERE id = 1 FOR SHARE` — a scope save, tuple activation or scope flip cannot commit in between (§13.4).
+1a. `SELECT … FROM jobs WHERE id = :job FOR SHARE`, then check the purge fences. A fenced job publishes nothing: the attempt ends `cancelled` and the purge cancels the target (§20.2).
 2. `SELECT … FROM score_targets WHERE id = :t AND claim_id = :c AND attempt_no = :a AND state = 'in_progress' FOR UPDATE` (batch: `state = 'in_batch' AND batch_submission_id = :s AND attempt_no = :a`). Zero rows → `claim_lost`: the draft stays recorded, nothing is published, and the transaction ends.
 3. Build the final publication object (null-out for contested results, §11.10) and revalidate it with the strict publication model (§11.6). A failure here is a `Bug`.
 4. Insert `llm_results` (its `target_id` FK is deferred) and `result_evidence`.
@@ -3428,7 +3550,7 @@ revise ─(error)→ fail
 publish → END ; fail → END
 ```
 
-- **Bounds**: at most **7 logical calls** per attempt: 1 generate, ≤ 2 revise, ≤ 3 critic, plus at most 1 structural repair shared by all steps (`score_attempts.logical_calls ≤ 7`). Each logical call makes at most 6 HTTP tries (§10.4), so `http_calls ≤ 42`. A unit test walks the maximal path.
+- **Bounds**: at most **7 logical calls** per attempt: 1 generate, ≤ 2 revise, ≤ 3 critic, plus at most 1 structural repair shared by all steps. The routing enforces this with its own step counters. `score_attempts.logical_calls` is incremented, together with `http_calls`, in the dispatch-marker transaction of a logical call's **first** try, and `http_calls` in every dispatch-marker transaction; a step denied before dispatch (budget, claim, deadline) changes neither, so `logical_calls ≤ http_calls` always holds and a budget denial ends the attempt cleanly as `budget_exhausted` (target → `budget_deferred`). Each logical call makes at most 6 HTTP tries (§10.4), so `http_calls ≤ 42`. A unit test walks the maximal path, and another denies the budget before the first dispatch.
 - **Never accepted by numerical convergence.** Acceptance requires a critic round whose **derived** outcome is `accept` (§11.7.2) and zero unresolved deterministic failures, or no critic trigger at all. Once a critic has run, every later draft in that attempt goes back to the critic (trigger T0), even if the revised draft no longer meets any other trigger. A revision cannot escape review by moving its score.
 
 #### 9.4.3 Claim heartbeat, claim checks, reclaim
@@ -3467,6 +3589,7 @@ Invoked by the operations `extract_profile_text(draft_id)` and `extract_profile(
 
 ```python
 LANES = (("similarity", 0.70), ("oldest", 0.20), ("exploration", 0.10))
+TIE_ORDER = {"oldest": 0, "exploration": 1, "similarity": 2}    # safeguards win ties
 
 def admit(cycle) -> list[tuple[int, str]]:
     expire_sweep(cycle.llm_tuple_id)                # §9.6.3
@@ -3475,37 +3598,46 @@ def admit(cycle) -> list[tuple[int, str]]:
     # (no sweep touches a target with override ≠ 'none', §7.16.3)
     picked = take(pending_with_lane("score_now"), limit=None, lane="score_now")   # outside S
     S = cycle.admission_size
-    # 1. always-include, capped at half of S, in this order, highest similarity first (NULL last):
-    #    full-text twins of partial scored members, watchlist companies,
-    #    title trigram >= 0.6 against any confirmed target title, batch follow-ups
-    always = take(always_include_candidates(exclude=picked), limit=ceil(0.5 * S), lane="always_include")
-    R = S - len(always)
-    credits = LaneCredits.lock(cycle.llm_tuple_id)  # persistent fractional credits
-    quota = {}
-    for lane, share in LANES:
-        credits[lane] = min(credits[lane] + share * R, share * R + 1)   # carry ≤ one slot beyond the share
-        quota[lane] = floor(credits[lane])
-    excl, remaining = picked + always, R
+    credits = LaneCredits.lock(cycle.llm_tuple_id)  # persistent fractional credits, may be ≥ −1
+    for lane, share in LANES:                       # every lane accrues on S, in every cycle
+        credits[lane] = min(credits[lane] + share * S, share * S + 1)
+    slots = {lane: max(0, floor(credits[lane])) for lane, _ in LANES}
+    spare = S - sum(slots.values())
+    for lane in sorted(slots, key=lambda l: (-(credits[l] - slots[l]), TIE_ORDER[l])):
+        if spare == 0:
+            break                                   # largest remainder gets the leftover slots
+        slots[lane], spare = slots[lane] + 1, spare - 1
+    # Always-include shares the SIMILARITY slots only (at most half of S); it can never take a
+    # safeguard (oldest/exploration) slot. Order, highest similarity first (NULL last): full-text twins
+    # of partial scored members, watchlist companies, title trigram >= 0.6 against a confirmed target
+    # title, batch follow-ups.
+    always = take(always_include_candidates(exclude=picked),
+                  limit=min(slots["similarity"], ceil(0.5 * S)), lane="always_include")
+    sim = take(candidates("similarity", exclude=picked + always),
+               limit=slots["similarity"] - len(always), lane="similarity")
+    excl, taken = picked + always + sim, {"similarity": len(always) + len(sim)}
+    for lane in ("oldest", "exploration"):
+        got = take(candidates(lane, exclude=excl), limit=slots[lane], lane=lane)
+        excl, taken[lane] = excl + got, len(got)
     for lane, _ in LANES:
-        got = take(candidates(lane, exclude=excl), limit=min(quota[lane], remaining), lane=lane)
-        excl, remaining = excl + got, remaining - len(got)
-        credits[lane] -= len(got)                   # only quota-backed takes consume credit
+        credits[lane] -= taken[lane]                # credit pays only for slots actually used
+    remaining = S - sum(taken.values())
     for lane in ("oldest", "exploration", "similarity"):      # spill by ACTUAL remaining capacity
         if remaining <= 0:
             break
         extra = take(candidates(lane, exclude=excl), limit=remaining, lane=lane)
-        excl, remaining = excl + extra, remaining - len(extra)
+        excl, remaining = excl + extra, remaining - len(extra)   # spill takes cost no credit
     credits.save()
     return excl                                      # nothing is ever rejected; the rest stays pending
 ```
 
-- **Candidates per lane** (all are `pending` targets of the cycle's tuple, `not_before` passed):
+- **Candidates per lane** (all are `pending` targets of the cycle's tuple, `not_before` passed, not fenced):
   - `similarity`: `similarity IS NOT NULL`, ordered by similarity descending. It **excludes** targets whose revision is `partial` and targets of non-representative duplicate-group members (U14); those reach the LLM through the oldest and exploration lanes, or through always-include;
   - `oldest`: ordered by `created_at` ascending, any similarity;
   - `exploration`: a reproducible random order seeded by the cycle id.
-- **Fair rotation.** `admission_lane_credits` persists each lane's fractional credit across cycles. A lane carries at most `share × R + 1` of credit, so a lane that had no candidates for a while cannot later crowd out the others. With `R = 3`, the oldest lane gets a slot in 3 of every 5 cycles and the exploration lane in 3 of every 10, so no lane starves.
-- **Spill** uses the counts actually taken, so a lane can never be asked for a negative number. *Example (Codex #11).* `R = 10`, quotas 7/2/1, zero similarity candidates and nine oldest candidates: the oldest lane takes 2 and the exploration lane 1 by quota; 7 slots are spare and spill to oldest (7 more), so 10 targets are admitted.
-- **Always-include** is capped at `ceil(0.5 × S)`. Always-include candidates beyond the cap stay first in line for the next cycle.
+- **Fair rotation for every `S`.** `admission_lane_credits` persists each lane's fractional credit across cycles. All three lanes accrue `share × S` per cycle (a lane carries at most `share × S + 1`), whole credits become slots, and leftover slots go to the largest remainders, ties to the safeguard lanes. Using a slot costs one credit, so a remainder slot may leave a lane at most one credit in debt. Over any 10 consecutive cycles with `S = 1`, the lanes get 7, 2 and 1 slots; the oldest and exploration lanes therefore never starve, even under a permanent always-include backlog (Codex #11).
+- **Always-include** draws only on the similarity slots and at most `ceil(0.5 × S)` per cycle. Candidates beyond that stay first in line for the next cycle.
+- **Spill** uses the counts actually taken, so a lane can never be asked for a negative number, and a lane without candidates passes its slots on. *Example (Codex #11).* `S = 10`, slots 7/2/1, zero similarity candidates and nine oldest candidates: the oldest lane takes 2 and the exploration lane 1 by slot; 7 slots are spare and spill to the oldest lane (7 more), so 10 targets are admitted, and only the 3 slot-backed takes cost credit.
 - Lane membership is recorded on the target (`lane`) and in the cycle report.
 - Null-similarity targets (`awaiting_embedding`) are eligible for the oldest lane, the exploration lane and always-include.
 - Unadmitted targets stay `pending`. They are browsable with a clearly labelled **preliminary similarity**, and they have **Score now**.
@@ -3557,7 +3689,7 @@ The initial state is then corrected by the same rules as creation (filter, group
 | Rubric or prompt/schema version activation (§13.3) | Same as above. Activation is explicit in Settings, with a cost preview and the eval gate. |
 | Model policy change (Settings, effect class `llm_tuple`) | Same as above. |
 | Evaluation policy change (effect class `evaluation_policy`) | **No re-review.** New attempts use the new policy; published results keep the policy recorded on them (§11.11). |
-| Execution config change (effect class `execution`) | No re-score; the next LLM call reads the new config. |
+| Execution config change (effect class `execution`) | No re-score. The execution config is **pinned per attempt** (`score_attempts.execution_config_id`): attempts that are already running finish with their config, a resumed attempt keeps it, and the next new attempt uses the new one. |
 | New material job revision, or reuse of an earlier one | A target for the active tuple is created or revived. The previous revision's unpublished target is cancelled (`revision_superseded`). |
 | Merge reversal or group split | Targets for the affected revisions are created, revived or moved to `pending`. |
 | Scope change | **No LLM call.** `apply_scope` recomputes `hard_filter_results` and `det_results`, then flips the pointer (§13.4). |
@@ -3566,6 +3698,7 @@ The initial state is then corrected by the same rules as creation (filter, group
 A heavy reconciler (every 10 min) creates or revives any missing targets for the active tuple (invariant 2 in §7.17). Score-history retention never deletes a target of the active tuple (§20.1), so this reconciler can never cause a paid re-score of retained work.
 
 ---
+
 ## 10. LLM gateway
 
 ### 10.1 Contract
@@ -3587,7 +3720,7 @@ On **every** call the gateway MUST:
 | G6 | Never send a forced `tool_choice`, any tools, an assistant prefill, `temperature`, `top_p`, `top_k`, `thinking.budget_tokens` or betas. Effort set through `reasoning_effort` enables adaptive thinking on Opus and Sonnet as the library does by default. Thinking content is not stored. |
 | G7 | SDK `max_retries=0`. **The gateway is the single retry layer** (§10.4). |
 | G8 | Branch on `stop_reason` (§10.5) before reading content. |
-| G9 | Before every HTTP try, reserve a **true upper bound** of its cost under the monthly budget lock (§6.9.1, §10.7), commit the dispatch marker, and settle each try on its own. |
+| G9 | Before every HTTP try, reserve the §10.7 bound of its cost under the monthly budget lock, admitted against `cap − overrun_buffer_usd` (§6.9.1), commit the dispatch marker, and settle each try on its own. |
 | G10 | Record `model_requested`, `model_served` (from the response `model` field), usage including `cache_creation_input_tokens` and `cache_read_input_tokens`, `stop_reason`, `stop_details.category`, the provider `request-id` and the `execution_config_id`. |
 | G11 | Server-side refusal **fallbacks off**: no `fallbacks` parameter and no fallback beta. If `model_served ≠ model_requested`, the result is treated as `failed_request('model_mismatch')` and a critical alert is raised, because it would break score versioning. |
 | G12 | For score nodes, verify the owner predicate (`claim_id`, `attempt_no`, `state`) **inside** the reservation transaction and again inside the dispatch-marker transaction, both with `FOR SHARE` on the target row (§3.3.3). |
@@ -3612,7 +3745,6 @@ async def call(node: NodeConfig, messages: list[BaseMessage], ctx: CallContext) 
     """One LOGICAL call: ≤ 3 transport tries per max_tokens stage, ≤ 2 stages (≤ 6 HTTP tries)."""
     assert isinstance(messages[-1], HumanMessage)            # never a prefill
     deadline = ctx.deadline                                   # monotonic, from TimeoutPolicy
-    ctx.attempt.count_logical_call()                          # logical_calls ≤ 7 (§9.4.2)
     for stage, max_tokens in (("first", node.max_tokens), ("enlarged", node.max_tokens_retry)):
         for transport_try in (1, 2, 3):
             min_left = FIRST_TRY_MIN_REMAINING_S if (stage, transport_try) == ("first", 1) \
@@ -3620,8 +3752,10 @@ async def call(node: NodeConfig, messages: list[BaseMessage], ctx: CallContext) 
             if deadline - monotonic() < min_left:
                 raise DeadlineExhausted()
             res = await spend.reserve(node, messages, max_tokens, ctx)   # owner FOR SHARE + llm_budget
-            await spend.mark_dispatched(res, ctx)                         # owner FOR SHARE again
-            ctx.attempt.count_http_call()                                 # http_calls ≤ 42
+            first = (stage, transport_try) == ("first", 1)
+            await spend.mark_dispatched(res, ctx, counts=(1 if first else 0, 1))
+            # one transaction: owner FOR SHARE again, ledger → dispatched, and
+            # score_attempts.logical_calls += 1 (first try only), http_calls += 1 (§9.4.2)
             try:
                 out = await _chat(node, ctx.effort, max_tokens).ainvoke(messages)
             except (anthropic.RateLimitError, anthropic.InternalServerError,
@@ -3656,19 +3790,20 @@ async def call(node: NodeConfig, messages: list[BaseMessage], ctx: CallContext) 
 
 The configuration has two immutable, separately hashed parts:
 - the **model policy** (`model_policies`, part of the LLM tuple): model and effort per node, plus the critic's light effort;
-- the **execution config** (`execution_configs`, not part of the tuple): `max_tokens` per stage and the node deadline. Changing it never re-scores; every call records the `execution_config_id` it used.
+- the **execution config** (`execution_configs`, not part of the tuple): `max_tokens` per stage and the node deadline. Changing it never re-scores. It is **pinned per attempt**: a score attempt records the active `execution_config_id` when it is claimed (or prepared into a batch) and uses it for all its calls, including after a resume; every call records it. A new configuration takes effect at the next new attempt.
 
 | Node | Model (policy) | Effort (policy) | `max_tokens` first / enlarged (execution) | Node deadline (execution) | Cache breakpoint | Schema |
 |---|---|---|---|---|---|---|
-| `generate` | `claude-sonnet-5-5` | `medium` | 8,000 / 16,000 | 600 s | end of `system[1]` (profile block), 5-min TTL | generator (§11.5) |
-| `revise` | `claude-sonnet-5-5` | `medium` | 8,000 / 16,000 | 600 s | same prefix as `generate`, so it shares its cache entry | generator |
-| `critic` | `claude-opus-5-5` | `medium`; light effort `low` | 8,000 / 16,000 | 600 s | end of `system[1]`, one entry per (model, effort) | critic (§11.7.3) |
+| `generate` | `claude-sonnet-5-5` | `medium` | 6,000 / 12,000 | 600 s | end of `system[1]` (profile block), 5-min TTL | generator (§11.5) |
+| `revise` | `claude-sonnet-5-5` | `medium` | 6,000 / 12,000 | 600 s | same prefix as `generate`, so it shares its cache entry | generator |
+| `critic` | `claude-opus-5-5` | `medium`; light effort `low` | 6,000 / 12,000 | 600 s | end of `system[1]`, one entry per (model, effort) | critic (§11.7.3) |
 | `extract_profile` | `claude-opus-5-5` | `medium` | 16,000 / 32,000 | 900 s | none (single call) | profile (§12.4) |
 | `propose_queries` | `claude-opus-5-5` | `medium` | 8,000 / 16,000 | 300 s | none | queries (§11.12) |
 | `schema_dry_run` (tooling) | each configured model | `low` | 2,000 | 300 s | none | each schema |
 
 - **Allowed models**: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`.
 - **Allowed efforts**: `low | medium | high | xhigh | max`, constrained by each model's capabilities as listed in `llm/pricing.py`, where `claude-haiku-5-5` supports `low…max`.
+- The score nodes' first stage of 6,000 output tokens is about 1.5× the high-case output including thinking (§21.1) under the slim limits of U14; it keeps worst-case reservations and batch holds small. A `max_tokens` stop moves to the 12,000-token enlarged stage.
 - The generator's effort stays `medium` by default. `low` can be selected only after the golden-set gate shows parity (§11.13), and the UI says so.
 - The UI offers the presets **A** (all Opus medium), **B** (default) and **C** (Haiku generator and reviser, Sonnet critic), plus per-node overrides.
 
@@ -3739,12 +3874,12 @@ messages[0] (user):
 
   Batch requests cost 50% of these prices.
 
-- **Input bound** (`llm/bounds.py`). For every try the gateway computes an enforceable upper bound on billable input tokens:
-  - **text requests**: `input_tokens_bound = ceil(1.10 × counted_prefix_tokens) + utf8_bytes(every other part of the serialised request: system[2], the messages and the output_config schema) + PROMPT_OVERHEAD_TOKENS[model]`.
-    - `counted_prefix_tokens` is the token count of the exact cached prefix (`system[0]` + `system[1]`), obtained once per `(model, prefix_sha256)` from the token-counting endpoint and kept in `token_counts` (§7.11). The 10% margin covers the endpoint's documented small deviations. If no count is available, the prefix's UTF-8 byte count is used instead.
-    - A token always encodes at least one byte of text, so a byte count bounds the tokens of the remaining parts.
-    - `PROMPT_OVERHEAD_TOKENS` (const, per model) covers protocol and schema-rendering tokens; it is set to twice the largest overhead measured by spike V19;
-  - **native-PDF and other document inputs**: the gateway calls `messages.count_tokens` for the exact request first and uses `ceil(1.10 × count) + PROMPT_OVERHEAD_TOKENS[model]`. If counting fails, or the input exceeds the model's context window, the call is **rejected** (`failed('input_unbounded')`) and nothing is sent.
+- **Input bound** (`llm/bounds.py`, chair decision C1, §2.4). The provider documents token counting as an estimate, so the design does not rely on it for text:
+  - **text requests**: `input_tokens_bound = Σ utf8_bytes(every rendered component of the serialised request: system[0], system[1], system[2], each message, and the output_config schema) + PROMPT_OVERHEAD_TOKENS[model]`.
+    - The bound rests on one stated assumption: **the tokenizer emits at most one token per byte**, so the byte count of a component bounds its tokens. Spike V19 verifies `tokens ≤ bytes` for every fixture request (German text with umlauts, `ß` and typographic characters included) against recorded `usage`; if any fixture violates it, the byte count is multiplied by the smallest factor that restores the inequality with a 2× margin, and S3 (§1.5) is restated.
+    - `PROMPT_OVERHEAD_TOKENS[model]` (const) covers protocol, role and schema-rendering tokens. It is **twice** the largest framing overhead V19 measures (the whole request's tokens minus the sum of its components' tokens, each counted on its own), with a floor of 1,000 tokens until V19 has run.
+  - **native-PDF input** (opt-in only, §12.7): the gateway calls `messages.count_tokens` for the exact request and reserves for `ceil(1.25 × count) + PROMPT_OVERHEAD_TOKENS[model]` input tokens, **plus** `native_pdf_extra_usd = 0.25 × overrun_buffer_usd` ($0.50 by default) as its share of the buffer. If the count cannot be obtained, or the input exceeds the model's context window, the native-PDF path is **disabled** for that draft (`failed('input_unbounded')`, nothing is sent) and the UI offers pasted text instead.
+- **Overrun buffer.** Every reservation is admitted against `cap − overrun_buffer_usd` (§6.9.1); the buffer (default $2.00, at least `max concurrent calls × PROMPT_OVERHEAD_TOKENS × the highest input price`) is never admitted for spending and absorbs any residual error of the overhead constant.
 - **Worst-case reservation per try**: `input_tokens_bound × max(input, cache-write price) + max_tokens(stage) × output price`, using the price tier selected by `input_tokens_bound` (for Haiku, the > 100K tier whenever the bound exceeds 100K), at batch prices for batch items, rounded **up** to the next $0.000001. Output includes thinking tokens, which `max_tokens` bounds.
 - The reservation is admitted under the monthly budget lock (§6.9.1) and written in the same transaction as the `llm_calls` row (`status='reserved'`) and the ledger row. It **fails** with `BudgetExhausted` when the hard-cap check of §6.9.1 fails.
 - **Settlement** (per try, never aggregated across tries):
@@ -3752,7 +3887,7 @@ messages[0] (user):
   - an error response with no content (429/5xx/4xx) → `not_billed` (`error_response_no_content`);
   - a connect failure before send → `not_billed`;
   - a lost or timed-out stream, or a cancellation → `ambiguous` (keeps `reserved_usd`).
-- **A bound violation is a defect, not a warning.** If `settled_usd > reserved_usd`, the row records `evidence='reservation_bound_violated'`, the critical alert `llm.reservation_bound_violated` is raised, and the score lane pauses until the user acknowledges it. Because the bound is computed from the full request bytes, this can happen only through an estimator or pricing-table error, and invariant 6 (§7.17) has no tolerance for it.
+- **A bound violation is a defect, not a warning.** If `settled_usd > reserved_usd`, the full settled cost is charged (it consumes overrun buffer), the row records `evidence='reservation_bound_violated'`, the critical alert `llm.reservation_bound_violated` is raised, and the score lane pauses until the user acknowledges it. It can happen only if the one-token-per-byte assumption or the overhead constant is wrong, or the pricing table is; the buffer is the only tolerance in invariant 6 (§7.17).
 - `score_attempts.cost_usd` is the sum over the attempt's tries, where an ambiguous try counts at its reserved amount.
 
 ### 10.8 Cache monitoring
@@ -3781,13 +3916,13 @@ These run offline in CI with recorded request bodies and need no API calls. For 
 
 The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_retries=0, timeout=anthropic.Timeout(connect=10, read=120, write=60, pool=10))`), inside `llm/batches.py`. LangChain cannot do batches.
 
-**Eligibility.** Only targets of the **active bulk operation** (§6.9.3), with `batch_bulk_rescore = true` (settings, default true), no non-terminal submission and no `submit_ambiguous` submission. Immediately before preparing, the candidate set goes through **the same sweeps as online admission** (expiry, refilter, regroup, §9.6.2), and only targets still `pending` with `not_before` passed are kept. Only the **generator pass** runs in a batch; critic and revisions run online as `batch_followup`.
+**Eligibility.** Only targets of the **active bulk operation** (§6.9.3), with `batch_bulk_rescore = true` (settings, default true), no non-terminal submission and no `submit_ambiguous` submission. Immediately before preparing, the candidate set goes through **the same sweeps as online admission** (expiry, refilter, regroup, §9.6.2), and only targets still `pending` with `not_before` passed and no active purge fence are kept. A target is batched only if it still needs its **initial generator pass** (Codex N8): `resume_draft_id IS NULL`, `lane` is not `batch_followup` or `score_now`, `state_reason` is not an online-retry disposition (`batch_max_tokens`, `batch_invalid_output`, `batch_errored`, `batch_expired`, `batch_missing`), and `charged_attempts < max_score_attempts`. The preparation transaction re-checks these conditions in its CAS from `pending`. Only the **generator pass** runs in a batch; critic and revisions run online as `batch_followup`.
 
 **Size, budget and order.**
 - Order: availability `active` first, then the previous tuple's `score_mid` descending, then similarity descending.
-- The batch is cut to at most `batch_max_items` (1,000, settings) and then to the largest `n` whose worst-case reservation **plus its funded follow-up allocation** fits the bulk operation's remaining budget (§6.9.3).
+- The batch is cut to at most `batch_max_items` (1,000, settings) and then to the largest `n` whose worst-case reservation **plus its expected follow-up allocation** fits the remaining batch allocation (§6.9.3). The allocation (40% by default) bounds the batch items and their expected follow-ups; it is not a limit on everything the re-score spends.
 - If fewer than `batch_min_targets` (200, settings) targets remain after pruning, no batch is submitted. The targets stay `pending` and are scored by online admission at the monthly pace.
-- **Follow-on submissions.** When a submission ends (`reconciled`, `not_submitted`, `submit_rejected` or `abandoned`), the worker inserts the next `batch_submit` operation for the active bulk operation. It is sized again from the remaining bulk budget, so repeated submissions never exceed the operation's budget in total (§6.9.3).
+- **Follow-on submissions.** When a submission ends (`reconciled`, `released`, `submit_rejected` or `abandoned`), the worker inserts the next `batch_submit` operation for the active bulk operation. It is sized again from the remaining allocation, so repeated submissions never exceed it in total (§6.9.3).
 
 **Lifecycle.**
 
@@ -3820,34 +3955,28 @@ The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_
 | `expired` | — | `not_billed(batch_item_expired)` | `retry_online` → `pending('batch_expired')` |
 | *(no result after a complete stream)* | — | stays `ambiguous`; critical alert `batch.items_missing` | `retry_online` → `pending('batch_missing')` |
 
-- **Batched targets are `in_batch(submission_id)`.** That state is exempt from claim-reclaim, from online admission and from the stuck-target invariant until the batch ends, expires or resolves as `not_submitted`.
-- **Supersession.** If the tuple of a submitted batch is superseded, the worker requests `messages.batches.cancel`, sets `cancel_requested_at`, and moves the submission's `in_batch` targets to `cancelled('tuple_superseded')`. Items that later arrive are fenced: they settle spend from usage and publish nothing.
+- **Batched targets are `in_batch(submission_id)`.** That state is exempt from claim-reclaim, from online admission and from the stuck-target invariant until the batch ends or expires, the submission is rejected or abandoned, or the user releases it.
+- **Cancellation of batched targets.** If the tuple of a submitted batch is superseded, the worker requests `messages.batches.cancel`, sets `cancel_requested_at`, and moves the submission's `in_batch` targets to `cancelled('tuple_superseded')`. A revision supersession, job merge or purge cancels the affected `in_batch` targets individually (`cancelled(reason)`, §7.16.3) without cancelling the batch. Either way, an item that later arrives for a cancelled target is fenced: it settles spend from usage (`billed`) or from the provider's per-item evidence (`not_billed(batch_item_*)`) and publishes nothing (`decision='ignored_fenced'`).
 - Follow-ups of a bulk operation release their share of `followup_held_usd` as they complete.
 
 **Ambiguous-submit recovery (exact procedure).** The batch list/retrieve API exposes no caller metadata, so metadata matching is impossible. Only this single worker submits batches, one at a time; the `batch_one_in_flight` index guarantees this.
 
-The job `batch_reconcile_ambiguous` runs every 15 min:
+The job `batch_reconcile_ambiguous` runs every 15 min for every `submit_ambiguous` submission, and for every `released` one younger than 29 days:
 1. List **every** batch in the workspace (auto-paginating `messages.batches.list`) and select those with `created_at ∈ [submit_started_at − 1 min, submit_started_at + 10 min]` (the creation window; `create` has a 10-minute client deadline).
 2. **Candidates** are the selected batches whose total request count equals ours.
-3. A candidate is **confirmed** only after it has `ended`, its results are downloaded completely, and its `custom_id` set **equals** ours. Our ids are unique per target and attempt. Confirmation adopts `provider_batch_id`, moves the submission through `submitted → ended`, and processes results per step 6.
+3. A candidate is **confirmed** only after it has `ended`, its results are downloaded completely, and its `custom_id` set **equals** ours. Our ids are unique per target and attempt. Confirmation adopts `provider_batch_id`, moves the submission (from `submit_ambiguous` or `released`) to `ended`, and processes results per lifecycle step 6.
 4. A batch whose `custom_id` set partially intersects ours raises the critical alert `batch.custom_id_anomaly`. The submission stays quarantined and is never auto-settled.
-5. **Settlement requires positive evidence after the observation window has closed.** No absence proof is attempted before `submit_started_at + 10 min + BATCH_LIST_VISIBILITY_LAG` (const 5 min, validated by spike V12), so a batch created at the end of the creation window is visible to the listing. After that point the submission becomes `not_submitted` only after an **exhaustive, successful** reconciliation:
-   - every batch in the workspace created inside the window has been listed;
-   - every one of them has `ended`;
-   - every one's results were downloaded successfully;
-   - none contains any of our `custom_id`s.
-
-   Only then are the reservations released (`ambiguous → not_billed(batch_not_submitted_proven)`), the follow-up hold released, and the targets that are still `in_batch` re-queued (`pending`). The next claim gives them a new `attempt_no`.
-6. **Incomplete reconciliation** (an API outage, missing results, a batch still in progress) keeps the submission quarantined with spend reserved. At 25 h after `submit_started_at` it raises `batch.submit_ambiguous_unresolved` (critical). **It never transitions on timeout.** The alert text and the Budget page state the reserved amount that the quarantine holds against the month (R9).
+5. **No automatic absence proof** (chair decision C3, §2.4). A client timeout does not prove that the server stopped creating the batch, and no authoritative bound on creation or listing delay exists. An empty or non-matching listing therefore **never** settles the submission: it stays `submit_ambiguous`, with its reservations counted, until a matching batch is found (step 3) or the user releases it (step 7).
+6. **Unresolved quarantine.** At 25 h after `submit_started_at` the submission raises `batch.submit_ambiguous_unresolved` (critical). **It never transitions on timeout.** The alert text and the Budget page state the reserved amount that the quarantine holds against the month (R9), and offer the release.
 7. **User release.** The user may "release and re-score" the quarantined targets (System → Needs attention):
    - targets → `pending`;
    - attempts end `released`;
    - `released_at` is set;
    - the original reservations stay counted as `ambiguous` spend.
 
-   Reconciliation continues. If the batch is later confirmed, downloaded usage settles the items (`ambiguous → billed`). If its absence is later proven, the items settle `ambiguous → not_billed(batch_not_submitted_proven)` and the amount returns to the month. Either way the publish CAS rejects late results, because the targets are no longer `in_batch` for this submission.
+   The submission moves to `released`, which no longer blocks new submissions. Reconciliation continues for 29 days (the result retention window). If a matching batch is later found, the submission moves to `ended` and its items settle from the provider's per-item outcome: `ambiguous → billed` from downloaded usage, or `ambiguous → not_billed(batch_item_errored | batch_item_canceled | batch_item_expired)` from the item's own result (Codex N9). The publish CAS rejects every late result, because the released targets are no longer `in_batch` for this submission. If no batch is ever found, the items stay `ambiguous` and counted.
 
-While any submission is `submit_ambiguous`, no new batch is submitted. Bulk re-scores continue through online admission.
+While any submission is `submit_ambiguous`, no new batch is submitted; after an explicit release, new submissions may proceed (their `custom_id`s carry new attempt numbers, so they can never be confused with the released batch). Bulk re-scores continue through online admission meanwhile.
 
 ### 10.11 Schema dry-run test
 
@@ -3863,6 +3992,7 @@ While any submission is `submit_ambiguous`, no new batch is submitted. Bulk re-s
 - Results are stored as `eval_runs(kind='schema_dry_run')`. Activation of a new prompt/schema version requires a passing record. Total cost is below $0.10.
 
 ---
+
 ## 11. Scoring
 
 ### 11.1 Hard filters (deterministic, positive evidence only)
@@ -4017,6 +4147,7 @@ An `unconstrained` rating without a grounded quote is a deterministic failure (V
 | `certifications[]` | name, mandatory | `certification:<folded name>` |
 | `security_clearance` | required flag, level | `security_clearance:clearance` |
 | `work_permit` | required flag | `work_permit:work_permit` |
+| `not_a_job_ad` (top-level flag) | asserted flag; the critic's mandatory review supplies the grounded quote | `not_a_job_ad:ad` |
 
 Two facts with the same fact id are a V4 issue; the first is kept.
 
@@ -4024,14 +4155,24 @@ Two facts with the same fact id are a V4 issue; the first is kept.
 
 1. **Requirement**: the ad requires something (a fact asserted with a grounded quote, or a structured field).
 2. **Comparison** against the profile and scope, with exactly one result: `met`, `unmet` (provable incompatibility, every input known), or `uncomparable` (an input is unknown or cannot be compared).
-3. **Review need**: an `unmet` or `uncomparable` requirement that is not structured is **binding-capable** and triggers the critic (T5) for that fact id. A `met` requirement needs no review.
+3. **Review need**: an `unmet` or `uncomparable` requirement that is not structured is **binding-capable** and triggers the critic (T5) for that fact id. A `met` requirement needs no review, **except a scope-dependent one**: a text-asserted `onsite_required` requirement is always binding-capable, even when it is currently met, because a later scope (for example remote-only, or a smaller radius) can make it unmet and scope changes never call the LLM (consensus rule, Codex N5). The other knockout comparisons depend only on the profile, which is fixed for a tuple.
+
+**German proficiency phrases.** Ads rarely state CEFR levels, so the generator prompt carries this mapping, and the generator emits the level it gives rather than `unspecified` (each mapping is the *lowest* level the phrase commonly means, so a mapping can never create a false unmet comparison):
+
+| Phrase (DE / EN) | Level emitted |
+|---|---|
+| Muttersprache, muttersprachlich / native | `native` |
+| verhandlungssicher, fließend / fluent, business fluent | `C1` |
+| sehr gute Kenntnisse / very good | `B2` |
+| gute Kenntnisse / good | `B1` |
+| Grundkenntnisse / basic | `A2` |
 
 A **cap applies only when the comparison is `unmet` and the fact is structured or critic-confirmed** for that fact id. `uncomparable` never caps: it shows an "unverified requirement" badge, as uncertainty. (A conservative policy that caps uncomparable requirements is not offered in v1.)
 
 | Code | Requirement | `unmet` when (all inputs known) | `uncomparable` when | Default severity (`scope.knockout_severity`) |
 |---|---|---|---|---|
 | `onsite_required` | `onsite_only` asserted, or structured work mode `{onsite}` | `onsite ∉ scope.work_modes`, **or** every candidate of every job location is beyond 1.5 × each scope location's radius (on-site band 0, §11.8) | `onsite ∈ scope.work_modes` and some location is unresolved, ambiguous across bands, or there is no scope location | hard |
-| `mandatory_language` | a mandatory required language | the language is absent from the profile, or the required CEFR level is specified and the profile level is below it | the required level is `unspecified` and the profile has the language; or the language is `other` and its name does not match a profile `code_other` name (folded) | per-language policy (default hard, §13.6) |
+| `mandatory_language` | a mandatory required language | the language is absent from the profile, or the required CEFR level is specified and the profile level is below it | the required level is `unspecified` and the profile has the language **below B2**; or the language is `other` and its name does not match a profile `code_other` name (folded). With an `unspecified` level, a profile level of B2 or higher is `met`. | per-language policy (default hard, §13.6) |
 | `security_clearance` | required | the profile has no user-entered clearance | the ad's level is specified, the profile has a clearance, and the levels are not comparable strings (folded equality) | hard |
 | `work_permit` | required | `work_authorization_de = requires_sponsorship` | `work_authorization_de = unspecified` | hard |
 | `degree` | mandatory, with no "or equivalent" clause | the ad's level is specified and above the profile's highest degree (`none < vocational < bachelor < master < phd`) | the ad's level is `unspecified` | soft |
@@ -4174,6 +4315,10 @@ This is a conservative subset: `type`, `enum`, `anyOf`, `$ref`/`$defs`, `require
 | Each quote | 4–300 characters, with at least 3 letters or digits, and no ellipsis (§11.6 V3) |
 | `must_haves`, `nice_to_haves` | ≤ 25 each |
 | Requirement `text` | ≤ 200 characters |
+| Certification `name`, `industry.value`, `degree.field` | ≤ 120 characters each |
+| `language_other` | ≤ 40 characters |
+| `security_clearance.level` | ≤ 60 characters |
+| Profile reference `quote` | same rules as an ad quote |
 | `required_languages` | ≤ 6 |
 | `certifications` | ≤ 10 |
 | `remote_region.countries` | ≤ 30 ISO 3166-1 alpha-2 codes |
@@ -4193,31 +4338,35 @@ Validation has **two stages**, so that limits never turn a usable output into a 
 | **V1** Limits | The §11.5 limits (and §11.7.3 for the critic). | Issue → T1 |
 | **V2** Level/basis consistency | `unknown ⇔ level = null`. `unconstrained ⇒ level = 4` plus ≥ 1 ad quote. `observed ⇒ level ≠ null` plus an ad quote (plus a profile reference when level ≥ 1). Every asserted fact (`mandatory = true`, `asserted = true`, `required = true`, or a non-`unspecified` value) has ≥ 1 quote. | **Deterministic evidence failure** on that criterion or fact id |
 | **V3** Grounding | Every ad quote must be one **contiguous** substring of the rendered `<job_ad>` text, after `fold` normalisation and whitespace collapsing. A quote containing `…` or `...`, or one with fewer than 4 characters or fewer than 3 letters or digits, fails; quotes are never split into segments. The match records `source_kind` (`description` or `structured_field` with its field name) and, for the description, the span in `job_revisions.description_text`, mapped back through the offset map that `fold` produces. A quote may not include the truncation marker. Every profile quote must be a substring of the canonical serialisation of the named profile section. Critic quotes are checked the same way. | **Deterministic evidence failure** |
-| **V4** Consistency | These are listed in the next table. | Issue → T1 |
+| **V4** Consistency | Listed below. *Repairable* checks are corrected deterministically at validation; *consistency failures* cannot be computed and block acceptance like V2/V3 failures. | Repairable: corrected and recorded, no trigger. Consistency failure → T1, blocks acceptance, null-out at contested |
 | **V5** Injection | Deterministic detector over the ad text, case-insensitive DE/EN. It flags: `ignore (all\|previous\|above) instructions`, `ignoriere (alle\|vorherige)`, `system prompt`, `you are (a\|an) (ai\|language model\|assistant)`, `as an ai`, `score this (job\|ad)`, `rate (this\|me)`, `bewerte (diese\|dieses\|mich)`, `give (this\|me) (100\|10/10\|full marks)`, role tags (`<system>`, `assistant:`, `[INST]`), and runs of more than 5 zero-width characters. A hit, or `injection_observed = true`, sets `injection_suspected`. | Issue → critic (T6), badge |
-| **V6** Not a job ad | `not_a_job_ad = true`. | Critic (T7). If the critic's derived outcome is `accept`, the result is published with `not_a_job_ad = true`, every criterion `null`, and `score_* = NULL` ("Not a job ad (verified)"). It is excluded from default lists. |
+| **V6** Not a job ad | `not_a_job_ad = true`. | Critic (T7) with a **mandatory review** of fact id `not_a_job_ad:ad`. Only a `fact_confirmed` review with a grounded quote publishes the result with `not_a_job_ad = true`, every criterion `null`, and `score_* = NULL` ("Not a job ad (verified)"), excluded from default lists. A `fact_rejected` review sends the draft to revision as a real ad; an `uncertain` or missing review never yields the label (§11.10). |
 
-V4 consistency checks:
+V4 checks. **Repairable** (the value is computable, so it is corrected at validation, recorded in `validation` and in `llm_results.truncated_fields` as a correction, and shown with a "corrected" marker; it triggers no critic call):
+- `experience_seniority.level` differs from the deterministic two-sub-rating value (§11.3): the deterministic value replaces it (Fable round-2 minor);
+- the `work_mode` fact contradicts a structured work mode: the structured value replaces the fact;
+- `remote_region.value = other_country` while `countries` contains `DE`, or `germany`/`dach` while `countries` is non-empty and excludes `DE`: the value becomes `unspecified`;
+- two facts with the same fact id: the first is kept.
+
+**Consistency failures** (not computable; they trigger T1, block acceptance until a revision resolves them, and null the criterion at contested publication, §11.10):
 - `languages.level ≥ 3` while a mandatory language comparison is `unmet`;
 - `languages.level ≤ 1` while every mandatory language comparison is `met`;
-- `experience_seniority.level` differs from the deterministic two-sub-rating value (§11.3);
 - `skills.level = 4` while a must-have has no matching profile skill (folded token-set similarity < 0.5 against every profile skill);
-- the `work_mode` fact contradicts a structured work mode;
-- `remote_region.value = other_country` while `countries` contains `DE`, or `germany`/`dach` while `countries` is non-empty and excludes `DE`;
 - `languages.basis = unconstrained` while `required_languages` is non-empty;
-- `not_a_job_ad = true` while any criterion level is non-null;
-- two facts with the same fact id.
+- `not_a_job_ad = true` while any criterion level is non-null.
 
-**Repairs at publication.** A limit issue that is still present in the final draft is repaired explicitly, recorded in `llm_results.truncated_fields`, and shown with a "shortened" marker. Nothing is truncated silently.
+**Repairs at publication.** Every limited field has exactly one repair, so a limit issue that survives the revisions can never turn publication into a failure. Repairs are recorded in `llm_results.truncated_fields` and shown with a "shortened" marker; nothing is truncated silently. The rule is generic: **every length-limited string is cut at its limit with an explicit `[…]` marker; every count-limited list keeps its first N items; every out-of-range number becomes `null`; every invalid quote is dropped as evidence.**
 
 | Non-compliant field | Repair |
 |---|---|
-| A summary or rationale over its word or character limit | Cut at the limit, ending in an explicit `[…]` marker |
-| More quotes than allowed for one criterion or fact | Keep the first grounded quotes up to the limit |
-| A quote over 300 characters, or otherwise invalid | Dropped as evidence; it counts as a V3 failure of its criterion or fact (null-out if unresolved) |
-| A list over its count limit (`must_haves`, `nice_to_haves`, languages, certifications, countries) | Keep the first N items |
+| `summary_en`, `summary_de`, `rationale` over the word or character limit | Cut at the limit, ending in `[…]` |
+| Requirement `text`, certification `name`, `industry.value`, `degree.field`, `language_other`, `security_clearance.level` over the character limit | Cut at the limit, ending in `[…]` |
+| More quotes than allowed for one criterion, profile reference list or fact | Keep the first grounded quotes up to the limit |
+| A quote (ad or profile) over 300 characters, or otherwise invalid | Dropped as evidence; it counts as a V3 failure of its criterion or fact (null-out if unresolved) |
+| A list over its count limit (`must_haves`, `nice_to_haves`, `required_languages`, `certifications`, `countries`) | Keep the first N items |
+| An invalid ISO code in `countries` | Dropped |
 | `min_years_experience` outside 0–40 | Treated as `null` (unknown) |
-| Critic explanation or summary over its limit | Cut with `[…]` |
+| Critic `explanation` or `summary` over its limit | Cut with `[…]` |
 | Critic reviews over the count limit | Disputes beyond the limit are ignored; required fact reviews are never dropped |
 
 After null-out and repairs, the complete publication object is validated with the strict `PublishedResult` model, which enforces every limit. A failure there is a `Bug` (`failed_invalid_output('publication_invalid')` plus a critical alert), never a silent publish.
@@ -4231,25 +4380,25 @@ The provisional aggregation uses the active scope. Every threshold is a field of
 | Code | Trigger (U14 defaults) | Mandatory? |
 |---|---|---|
 | T0 | A previous critic round in this attempt (§9.4.2) | yes |
-| T1 | Any V1 limit issue, V2/V3 deterministic failure or V4 issue in the current draft | yes |
+| T1 | Any V1 limit issue, V2/V3 deterministic failure or V4 consistency failure in the current draft (repairable V4 issues are corrected first and do not trigger) | yes |
 | T2 | `\|M − τ\| ≤ t2_band` (5), **or** (`L < τ ≤ U` **and** coverage < `t2_straddle_max_coverage` (0.7)); τ = `relevance_threshold` (60) | no |
 | T3 | `M ≥ t3_min_mid` (80) | no |
 | T4 | Description `partial` and `M ≥ 60` | yes |
-| T5 | A binding-capable fact (§11.4: `unmet` or `uncomparable`, not structured) | yes |
+| T5 | A binding-capable fact (§11.4: `unmet` or `uncomparable` and not structured, or any text-asserted on-site requirement) | yes |
 | T6 | Injection suspicion (V5) | yes |
-| T7 | `not_a_job_ad = true` | yes |
+| T7 | `not_a_job_ad = true`; adds the required review `not_a_job_ad:ad` | yes |
 | T8 | A reproducible sample: `int(sha256(f"{target_id}:{llm_tuple_id}")[:8], 16) % 100 < t8_sample_pct` (5) | no |
 
 #### 11.7.2 Derived outcome
 
-The critic reviews **only** the criteria it disputes, plus **exactly one review per required fact id** (the binding-capable facts, listed in `<required_facts>`). Omitted criteria count as supported. The routing never trusts the top-level `verdict` alone; it computes `critic_notes.derived_outcome`:
+The critic reviews **only** the criteria it disputes, plus **exactly one review per required fact id** (the binding-capable facts and, when asserted, `not_a_job_ad:ad`, listed in `<required_facts>`). Omitted criteria count as supported. The routing never trusts the top-level `verdict` alone; it computes `critic_notes.derived_outcome`:
 
 - **`accept`** iff all of the following hold:
   1. the review is **complete**: every required fact id has exactly one review, no review targets an unknown criterion or fact id, and no target appears twice;
   2. every required fact is `fact_confirmed` or `fact_rejected`, **with at least one grounded ad quote** (V3);
   3. no grounded criterion dispute remains;
   4. `injection ≠ present_influenced`;
-  5. the draft has no unresolved deterministic failure.
+  5. the draft has no unresolved deterministic failure (V2/V3) and no unresolved V4 consistency failure.
 - **`incomplete`** if condition 1 fails. Missing fact reviews count as `uncertain`. It routes like `revise`.
 - **`revise`** otherwise.
 
@@ -4316,7 +4465,7 @@ Implemented in `scoring/aggregate.py` as pure functions.
 
 **Deterministic criteria.**
 
-*`location_work_mode`*: `P = jobs.work_mode_possible`. The scope gives accepted modes `A`, locations `i` each with radius `r_i`, and the remote toggle.
+*`location_work_mode`*: `P = jobs.work_mode_possible`. The scope gives accepted modes `A`, locations `i` each with radius `r_i ≥ 1 km` (Settings rejects smaller radii, so the division below is always defined, Codex N13), and the remote toggle.
 
 - **Distance bands** per job location `ℓ` and work mode, from the candidates `c` of `ℓ` (§8.12), with `x = min_i d(c, i) / r_i`:
   - on-site band: `x ≤ 1` → 4; `≤ 1.5` → 2; otherwise 0;
@@ -4379,9 +4528,10 @@ if injection_suspected and critic.injection != "none": base = low
 
 A contested result MUST be schema-valid and is built from the **last validated draft**:
 
-1. Every criterion with an **unresolved deterministic evidence failure** (V2/V3) is replaced with `level = null, basis = unknown` and listed in `nulled_criteria`.
+1. Every criterion with an **unresolved deterministic evidence failure** (V2/V3) or an unresolved V4 consistency failure is replaced with `level = null, basis = unknown` and listed in `nulled_criteria`.
 2. Every fact with failed grounding is treated as not asserted, so its knockout is dropped.
 3. A critic `fact_rejected` fact is dropped; `uncertain` and `unconfirmed` stay unconfirmed badges with no cap.
+3a. `not_a_job_ad` is kept only when `not_a_job_ad:ad` was confirmed with a grounded quote. Otherwise the result is published with `not_a_job_ad = false`, its criteria as validated (null where the generator gave none), and a "possibly not a job ad" badge; it stays in default lists.
 4. Purely semantic critic disputes keep the validated generator level. The critic's suggested level is displayed alongside it.
 5. The repairs of §11.6 are applied, and the publication object is revalidated.
 6. The interval is recomputed, and confidence is downgraded (§11.8).
@@ -4391,7 +4541,7 @@ A contested result MUST be schema-valid and is built from the **last validated d
 ### 11.11 Versioning keys and scope flip
 
 - **`llm_result`** is unique on `(job_revision_id, profile_version_id, rubric_version_id, prompt_schema_version_id, model_policy_id)`, and on `target_id` (≤ 1 published result per target). `score_attempt` is unique on `(target_id, attempt_no)`.
-- **The evaluation policy and the execution config are recorded, not identity.** A result records the evaluation policy it was routed under; a later policy never re-reviews it. This is deliberate: a routing change must not cost a re-score of every retained ad. A user who wants re-review re-scores explicitly (a new tuple).
+- **The evaluation policy and the execution config are recorded, not identity.** A result records the evaluation policy it was routed under; a later policy never re-reviews it. This is deliberate: a routing change must not cost a re-score of every retained ad. v1 offers no same-input re-review: a result stays as published until its tuple, rubric, prompt/schema or model policy changes.
 - **The generator receives profile + ad (+ rubric) only, never scope.**
 - **Deterministic algorithm version.** `DET_ALGORITHM_VERSION` (const, `scoring/versioning.py`) names the hard-filter, knockout and aggregation code. It is stored on every `det_results` and `hard_filter_results` row. A deployment that changes it makes the `det_completeness` reconciler recompute current instances, with no LLM call.
 - **`det_result` instances are immutable.** At most one is current per `(llm_result_id, scope_version_id)`. Each holds:
@@ -4435,8 +4585,8 @@ Semantic limits:
 
 ### 11.13 Calibration and the eval gate
 
-- **Golden set.** In week 1 the user labels about 40–50 published ads (`good / ok / poor` plus an optional comment) in the labelling UI (§15.6). Each case is stored in `golden_cases` **bound to** its job revision, the profile version and the **scope version** the label assumed (the active ones at labelling time); a second label of the same case updates it (upsert). Later "wrong score" feedback adds cases (`source='feedback'`). Adversarial synthetic cases are part of the test fixtures (`source='adversarial'`), each with its own profile and scope: injection, a partial snippet, language traps (an English ad requiring German, and the reverse), seniority traps (over- and under-qualification) and not-a-job-ad. The user can list and delete cases (§14.2).
-- **Candidate configuration.** An eval run (`eval_runs(kind='golden')`) evaluates a candidate `(rubric, prompt/schema, model policy, evaluation policy, execution config)`. For each active case it forms the case's own tuple (case profile × candidate rubric, prompt and model policy), runs the **case's hard filters under the case's scope**, and, if they pass, scores the revision **on the production route**: conditional critic per the candidate evaluation policy, revisions, contested null-out, and aggregation under the case's scope. Runs happen outside the target table and draw on the non-scoring reserve.
+- **Golden set.** In week 1 the user labels about 40–50 published ads (`good / ok / poor` plus an optional comment) in the labelling UI (§15.6). Each case is stored in `golden_cases` **bound to** its job revision (the label revision), the profile version, the **scope version** the label assumed (the active ones at labelling time) and a **frozen snapshot of the job's det-facts** (`det_inputs_snapshot`: salary, locations, work modes, employment types, industry), because those can change without a new material revision; a second label of the same case updates it (upsert). Later "wrong score" feedback adds cases (`source='feedback'`). Adversarial synthetic cases are part of the test fixtures (`source='adversarial'`), each with its own profile and scope: injection, a partial snippet, language traps (an English ad requiring German, and the reverse), seniority traps (over- and under-qualification) and not-a-job-ad. The user can list and delete cases (§14.2).
+- **Candidate configuration.** An eval run (`eval_runs(kind='golden')`) evaluates a candidate `(rubric, prompt/schema, model policy, evaluation policy, execution config)`. For each active case it forms the case's own tuple (case profile × candidate rubric, prompt and model policy), runs the **case's hard filters under the case's scope**, and, if they pass, scores the revision **on the production route**: conditional critic per the candidate evaluation policy, revisions, contested null-out, and aggregation under the case's scope. Hard filters, knockouts and aggregation use the case's frozen `det_inputs_snapshot`, never the job's current facts, so reruns compare the same inputs against the same label. The T8 sample identity is `sha256(f"golden:{golden_case_id}:{tuple_identity}")`, where `tuple_identity` is the case tuple's hash, so a case is sampled reproducibly across runs of the same candidate. Runs happen outside the target table, their calls carry `golden_case_id`, and they draw on the non-scoring reserve.
 - **Diagnostics.** An optional second run with `route='forced_critic'` reviews every case. It is reported but never gates.
 - **Aggregation.** Metrics are computed pooled over all active cases, and per profile version for every profile with at least 10 cases. Test–retest runs 10 cases twice (`repetitions = 2`).
 - **Metrics and gates** (judged with `ordinal(good)=2, ok=1, poor=0`, on the production route):
@@ -4464,6 +4614,7 @@ Semantic limits:
 - **Labels**: a quick good/ok/poor with an optional comment, available in the detail drawer and in labelling mode.
 
 ---
+
 ## 12. CV ingestion & profile schema
 
 ### 12.1 Upload checks
@@ -4483,7 +4634,7 @@ Semantic limits:
 
 ### 12.2 Text extraction
 
-- Extraction runs in the **`docparse`** container (§3.2), which has **no network** (`network_mode: none`) and no secrets. The worker places the decrypted file in a per-job directory on the `parse_jobs` volume and removes it after the result is read. Inside `docparse`, each job runs in a subprocess with `RLIMIT_CPU` 30 s and `RLIMIT_AS` 768 MiB.
+- Extraction runs in the **`docparse`** container (§3.2), which has **no network** (`network_mode: none`) and no secrets. The worker places the decrypted file in a per-job directory on the `parse_jobs` volume, a **tmpfs** shared only by `worker` and `docparse` (mode 0770, §19.1), so the plaintext never reaches a disk; the directory is unlinked in a `finally` block after the result is read, and on worker start any leftover directory is removed. Inside `docparse`, each job runs in a subprocess with `RLIMIT_CPU` 30 s and `RLIMIT_AS` 768 MiB.
 - **PDF**: `pypdf`. If it yields fewer than 300 characters, or more than 5% U+FFFD replacement characters, `pdfplumber` is used instead. **DOCX**: `python-docx` (paragraphs plus table cells, in document order).
 - **Low text** (fewer than 300 characters of extracted text) → `profile_drafts.status='failed', failure_code='low_text'`. The UI then offers the two repair paths in §12.7.
 - The extracted text (with contacts) is stored encrypted (`cv_files.raw_text_enc`). No OCR in v1.
@@ -4609,7 +4760,7 @@ Month-precision CV dates are stored as the first day of that month. Dates must b
 
 1. **Review.** The draft shows as a form (§15.7): every field is editable, there is a preview of the approved text, and validation issues appear inline. Saving the draft validates it again.
 2. **Confirm** (`POST /api/profile/drafts/{id}/confirm`, with an `Idempotency-Key` and `expected_rescore_ack=true` when retained ads exist). The response previews the re-score count, the estimated cost and the bulk budget (§6.9.3, §21). A repeated confirm of a draft that is already `confirmed` **returns its original outcome** (`confirmed_profile_version_id`) and never repeats the activation, even if a newer profile is active by then. Otherwise, in **one transaction**, holding `active_config` `FOR UPDATE`:
-   - (a) insert the immutable `profile_versions` row. If the `profile_hash` already exists, that version is reused.
+   - (a) insert the immutable `profile_versions` row. If a **usable** version with the same `profile_hash` exists (`purged_at IS NULL`), that version is reused; if that version is under an active `profile` purge fence, the confirm is refused with 409 `profile_purge_in_progress` and can be repeated when the purge has finished (§20.2). A purged version is never reused or revived: identical re-introduced content gets a new version with a new id (the partial unique index of §7.4 allows it), so a deletion manifest that names the old id can never purge the new one (Codex N12, Fable N3).
    - (b) insert or select the `llm_tuples` row `(profile, active rubric, active prompt/schema, active model policy)`.
    - (c) set `active_config.profile_version_id` and `llm_tuple_id`, and bump `ranking_state`.
    - (d) cancel the old tuple's unpublished targets: `pending`, `budget_deferred`, `deferred_duplicate`, `filtered_out`, `expired_unscored`, `refused` and `failed_*` → `cancelled('tuple_superseded')`; `in_progress` targets take the transition `in_progress → cancelled('tuple_superseded')`, which clears their claim, and their coroutines stop at the next claim check (their attempts end `cancelled`).
@@ -4631,6 +4782,7 @@ Month-precision CV dates are stored as the first day of that month. Dates must b
 - The repair actions use `POST /api/profile/drafts/{id}/retry` with `{mode: native_pdf | llm}` (§14.2). Paste text creates a new draft and discards the failed one.
 
 ---
+
 ## 13. Settings
 
 ### 13.1 Fields
@@ -4645,7 +4797,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `schedule.include_paid` | bool (applies to scheduled runs; "Run now" has its own checkbox) | `true` | collection |
 | Display | `display.timezone` | IANA zone, display only | `Europe/Berlin` | none |
 | | `display.ui_language` | `en \| de` | `en` | none |
-| Scope | `scope.locations[]` | 0–10 entries of `{label, gazetteer_id, lat, lon, radius_km}`, each chosen through the gazetteer search (§8.12, unique id). `radius_km` is an int, 0–200. | `[]` (onboarding requires ≥ 1 entry, or the remote toggle) | scope, collection |
+| Scope | `scope.locations[]` | 0–10 entries of `{label, gazetteer_id, lat, lon, radius_km}`, each chosen through the gazetteer search (§8.12, unique id). `radius_km` is an int, 1–200 (a city-only search uses a small radius such as 5; 0 is rejected because distance bands divide by it). | `[]` (onboarding requires ≥ 1 entry, or the remote toggle) | scope, collection |
 | | `scope.remote_within_germany` | bool | `true` | scope, collection |
 | | `scope.work_modes` | non-empty subset of `{remote, hybrid, onsite}` | all | scope |
 | | `scope.employment_types` | non-empty subset of the 8 types (§11.5) | all | scope |
@@ -4680,6 +4832,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `scoring.execution` | per node `{max_tokens, max_tokens_retry, deadline_s}`. `max_tokens` 1,024–32,000, with retry ≥ first and ≤ 64,000. `deadline_s` 120–1,800. | §10.3 table | execution |
 | Budget | `llm.cap_usd` | decimal, 1.00–10,000.00 | `100.00` | budget |
 | | `llm.nonscoring_reserve_pct` | int, 0–20 | `5` | budget |
+| | `llm.overrun_buffer_usd` | decimal, 0.50–50.00, and ≥ the bound of §6.9.1 for the configured concurrency and `batch_max_items` (else an error) | `2.00` | budget |
 | | `llm.min_bucket_capacity_usd` | decimal, 0.10–100.00 | `1.00` | budget |
 | | `scoring.max_targets_per_cycle` | int, 1–500 | `60` | budget |
 | | `scoring.min_cycle_targets` | int, 1–100 | `10` | budget |
@@ -4717,7 +4870,7 @@ Every class below is consistent with immutable, versioned storage: activation on
 | `collection` | Flip. `source_instances` and `coverage_cells` are upserted for the watchlist and queries (new cells start never-covered). Takes effect at the next run plan. |
 | `admission` | Flip. Takes effect at the next score cycle. Changes to `max_ad_age_days` trigger an immediate expiry sweep in both directions. |
 | `budget` | Flip. The new cap is written to the current `llm_budget` row under its lock (§6.9.1). A raised cap lets `budget_deferred` targets return through the headroom rule (§6.9.4). |
-| `execution` | Flip `execution_config_id`. The next LLM call reads the new config and records its id. No re-score, no eval gate. |
+| `execution` | Flip `execution_config_id`. The next **new** score attempt (and every non-score call) uses it; running and resumed attempts keep the config they pinned (§10.3). No re-score, no eval gate. |
 | `evaluation_policy` | New `evaluation_policies` row (with its `projected_critic_rate`), eval gate (§11.13), then flip `evaluation_policy_id`. New attempts use it; **published results are not re-reviewed**. |
 | `scope` | Flip of the settings pointer, and `active_config.pending_scope_version_id := new` plus an `apply_scope` operation in the same transaction. **Precompute, then flip** (§13.4). Deterministic recompute only, **no LLM call**. |
 | `llm_tuple` | A new `model_policies` row and a new or existing `llm_tuples` row. The eval gate is checked (§11.13): pass, or the override is acknowledged. Then, in one transaction, the active pointers flip, old-tuple work is cancelled, the bulk operation is opened and `create_targets_for_tuple` is recorded, all as in §12.6 (d)–(h). The UI requires confirmation of the re-score cost. |
@@ -4727,7 +4880,7 @@ Every class below is consistent with immutable, versioned storage: activation on
 
 ### 13.4 Scope apply: precompute, then flip
 
-All writers coordinate on `active_config`: a scope save, a tuple activation and the final flip take it `FOR UPDATE`; every publish takes it `FOR SHARE` at the start of its transaction (§9.4.1). A publish therefore sees either the old or the new `pending_scope_version_id`, never a half-applied state.
+All writers coordinate on `active_config`: a scope save, a tuple activation and the final flip take it `FOR UPDATE`; every publish takes it `FOR SHARE` at the start of its transaction (§9.4.1), and so does **every collection transaction that inserts a job or changes its det-facts or current revision** (`resolve_identity`, §8.6), which writes the job's `hard_filter_results` and det instances for the active and the pending scope in that same transaction (Codex #7). No input writer can therefore commit between the final completeness check and the flip. A publish therefore sees either the old or the new `pending_scope_version_id`, never a half-applied state.
 
 1. The save transaction sets `active_config.pending_scope_version_id := new` and inserts the `apply_scope(scope_version_id)` operation (dedup key `apply_scope:<id>`). The UI shows the banner "Applying settings… (n of N)".
 2. The `apply_scope` operation computes, in chunks of 500, outside any `active_config` lock:
@@ -4745,6 +4898,7 @@ All writers coordinate on `active_config`: a scope save, a tuple activation and 
    - move unpublished targets `filtered_out ⇄ pending` according to the new hard filters (never moving a target whose `override ≠ 'none'`, §7.16.3);
    - bump `ranking_state`.
 4. If the precompute crashes, the operation is retried (idempotent writes). The active pointer never flips onto an incomplete scope.
+5. If the operation **fails permanently** (`operations.status = 'failed'`, §7.3), one transaction clears `pending_scope_version_id` and leaves `active_config.scope_version_id` on the old scope, so the view and the filters stay consistent, and raises `scope.apply_failed` (critical). Publishes then stop writing the second set of `det_results`. The UI states that the active settings version's scope is not applied and offers **Retry apply** (a new `apply_scope` operation) or reverting the scope fields (a new settings version).
 
 ### 13.5 Budget and quota preview
 
@@ -4772,6 +4926,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 - **The language an ad is written in never implies its working-language requirements or the candidate's proficiency.** `accepted_ad_languages` is only a hard filter on the text language. It is applied only when the detection is confident (§8.9) or the language is structured.
 
 ---
+
 ## 14. HTTP API
 
 ### 14.1 Conventions
@@ -4827,6 +4982,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | GET | `/api/settings/versions/{id}` | A version and its diff vs the previous one | → `{payload, diff}` |
 | POST | `/api/settings/rubric-versions/{id}/activate` | Activate a shipped rubric version | `{expected_rescore_ack, eval_override_ack?}` → 201 `{version}` (an `llm_tuple` change, §13.3); 409 `eval_gate_failed` without the override |
 | POST | `/api/settings/prompt-schema-versions/{id}/activate` | Activate a shipped prompt/schema version | as above; also requires a passing schema dry-run (§10.11) |
+| POST | `/api/settings/scope/retry-apply` | Retry a failed scope application | → 202 `{operation_id}`: a new `apply_scope` operation for the active settings version's scope (§13.4 step 5); 409 if one is live |
 | GET | `/api/geo/places` | Gazetteer search for scope locations | `?q=<name or postal code>&limit=10` → `[{gazetteer_id, label, postal_codes, lat, lon, population}]`. Served from the bundled gazetteer; no network. |
 | POST | `/api/queries` | Add a query | `{text, lang}` → 201 |
 | PATCH | `/api/queries/{id}` | Edit a query (retire + create) | `{text?, lang?}` → 200 new query |
@@ -4841,11 +4997,12 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | GET | `/api/system/health` | Detailed health | → §17.5 |
 | GET | `/api/system/quota` | Quota windows and ledger summary | → per provider `{window, used, reserved, ambiguous, adjustments, tokens, state}` |
 | GET | `/api/system/spend` | LLM spend | → `{month, counted, billed, ambiguous, reserved, cap, headroom, bucket: {usd, capacity, rate_per_h}, c_hat, critic_rate_7d, projected_critic_rate, bulk_operation, quarantined_batch_usd, by_model_effort_role}` |
-| GET | `/api/system/needs-attention` | Items needing the user | → rejected raw items, identity conflicts, failed/refused targets, quarantined batches, broken sources |
+| GET | `/api/system/needs-attention` | Items needing the user | → rejected raw items, identity conflicts, failed/refused targets, quarantined batches, failed purges, broken sources |
+| POST | `/api/system/purges/{operation_id}/retry` | Retry a failed purge | → 202. A new attempt of the same `purge` operation and manifest; its purge fence stays active throughout (§20.2) |
 | POST | `/api/system/raw-items/replay` | Replay rejected items | `{raw_response_id \| raw_item_ids[]}` → 202 |
 | POST | `/api/identity-conflicts/{id}/resolve` | Resolve a conflict | `{decision: separate \| merge}` → 202 |
 | POST | `/api/ats-snapshots/{id}/acknowledge` | Confirm a mass disappearance | → 200; the absent postings close (§8.11) |
-| POST | `/api/batches/{id}/release` | Release and re-score quarantined targets | `{confirm: true}` → 202 |
+| POST | `/api/batches/{id}/release` | Release and re-score quarantined targets | `{confirm: true}` → 202. The submission becomes `released`; its reserved amount stays counted as `ambiguous` unless the batch is found later (§10.10). The response states that amount. |
 | POST | `/api/system/score-cycle` | Start a cycle manually | → 202 |
 | GET | `/api/alerts` | Alerts | `?status=open\|acknowledged\|resolved` keyset paged |
 | POST | `/api/alerts/{id}/ack` | Acknowledge | → 200 |
@@ -4879,6 +5036,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
   | `first_seen` | one section: `first_seen_at DESC, job_id DESC` | — |
 
   Rows of the scored section come first. The next page continues in the cursor's section with the keyset predicate `(sort_value, job_id) < (:last_value, :job_id)`, using `IS NULL` branches for `NULLS LAST`; when the scored section is exhausted, the unscored section starts from its beginning. The score is the `display_scores` value (§7.18), so a deferred member sorts with its representative's score.
+- **One snapshot per page.** The handler runs in a read-only `REPEATABLE READ` transaction that reads `ranking_state.generation` and the page rows from the same snapshot, so the generation returned with a page always describes exactly the data on it (Codex #46).
 - **Live semantics, disclosed**: pages are taken against live data. `gen` in the cursor is `ranking_state.generation` (§7.1) when the first page was served. When the current generation is larger, the response sets `ranking_changed: true`, and the UI shows the "Ranking changed — refresh" banner. Items may move across page boundaries in that case. This is disclosed, never silent. The generation is a committed counter bumped by every order- or membership-changing transaction, never derived from row values, so reverting a scope or tuple still increases it.
 
 ### 14.4 Error format (RFC 9457)
@@ -4892,7 +5050,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
   "detail": "The monthly LLM cap of $100.00 has been reached.",
   "instance": "/api/jobs/123/score-now",
   "request_id": "0192…",
-  "errors": [{"field": "payload.scope.locations[0].radius_km", "code": "out_of_range", "message": "0–200"}]
+  "errors": [{"field": "payload.scope.locations[0].radius_km", "code": "out_of_range", "message": "1–200"}]
 }
 ```
 
@@ -5092,10 +5250,10 @@ Status: Uploading → Extracting text → Removing contact details → Review te
 │ [Save draft] [Discard]                                   [Confirm profile →]                │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 Text review (before anything is sent): the stripped text with highlights, [mark span] [restore],
-"Automatic removal is best effort; please check." [Approve text & extract profile (~$0.12)]
-Confirm modal: "Creates profile v5 and re-scores 1,180 retained ads. Bulk budget $23.20 (40% of the
-remaining scoring budget): about 235 ads in one batch, incl. their critic follow-ups; the other ~945
-are scored online at the monthly pace (about 60 per day). This month $38.20 / $100.
+"Automatic removal is best effort; please check." [Approve text & extract profile (~$0.14)]
+Confirm modal: "Creates profile v5 and re-scores 1,180 retained ads. Batch allocation $22.44 (40% of
+the remaining scoring budget): about 211 ads in one batch, incl. their expected critic follow-ups;
+the other ~969 are scored online at the monthly pace (about 53 per day). This month $38.20 / $100.
 [Cancel] [Confirm & re-score]"
 ```
 
@@ -5221,7 +5379,7 @@ Cross-Origin-Resource-Policy: same-origin
 
 Every process runs these checks at start. A failure exits with code 78 and logs the failing check by name, never by value.
 
-1. Every secret file the role needs is present and no secret of another role is mounted (§19.2), and `JOBHUNTER_ENV ∈ {prod, dev, test}`.
+1. Every secret file the role needs is present and readable, none is world-readable (the files are `root:10010`, mode 0440, §19.2), no secret of another role is mounted, and `JOBHUNTER_ENV ∈ {prod, dev, test}`.
 2. `LANGSMITH_GATEWAY` is unset, and the `anthropic_key` secret does not start with `lsv2_`.
 3. In `prod`, `JOBHUNTER_FAKE_SOURCES` and `JOBHUNTER_FAKE_LLM` are unset.
 4. If `LANGSMITH_TRACING=true`: `LANGSMITH_HIDE_INPUTS=true`, `LANGSMITH_HIDE_OUTPUTS=true` and `LANGSMITH_ENDPOINT == "https://eu.api.smith.langchain.com"`.
@@ -5244,7 +5402,7 @@ Secrets are never written to the DB, logs, traces, fixtures or images. The struc
 - **Network boundary** (§3.2, §19.1):
   - only Caddy publishes ports (80, 443), on the `edge` network;
   - `proxy` (Caddy ↔ API) and `internal` (API, worker, Postgres, embedder) are Compose networks with `internal: true`, so they have **no route to the internet**; `api` is attached only to these two;
-  - only `worker` and `backup` are attached to `egress`;
+  - only `worker` and `backup` are attached to `egress` (and the one-off `restore` container while a restore runs, §19.5);
   - `docparse` runs with `network_mode: none`;
   - a host `DOCKER-USER` firewall rule (`deploy/firewall/docker-user.nft`) drops new outbound connections from any container address that is not on `egress` or Caddy's `edge` address, as defence in depth;
   - integration test N1 (§18.2) asserts that `api` and `docparse` cannot resolve or connect to an outside address, and that `worker` can.
@@ -5320,23 +5478,24 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `queued_runs` | tick | A `queued` run with no live procrastinate job for 2 min | Re-defer once; then `failed('orphaned_queue')` + `run.orphaned_queue` (warn) |
 | `stale_runs` | tick | `running` with `heartbeat_at` older than 3 min | New attempt (run row `FOR UPDATE`, `attempt_no+1`, new thread, locked task), or `failed('resume_exhausted')` + critical alert when `resume_count > 3` |
 | `orphaned_cycles` | tick | A `running` score cycle with `heartbeat_at` older than 3 min | `failed('orphaned')`, close its report, reclaim its claims; `score_cycle.orphaned` (warn) |
-| `operations` | tick | A `pending` operation without a live procrastinate job for 2 min; a `running` one with `heartbeat_at` older than 3 min | Re-defer; set the stale one back to `pending` (attempts + 1) |
+| `operations` | tick | A `pending` operation without a live procrastinate job for 2 min; a `running` one with `heartbeat_at` older than 3 min | Re-defer; set the stale one back to `pending` with `claim_id := NULL` in one statement (attempts + 1), which invalidates the old execution (§3.3.3) |
 | `stuck_targets` | tick | `in_progress` with `claim_heartbeat_at` older than 3 min (`in_batch` exempt) | Reclaim → `pending` / `failed_attempts_exhausted`; log; `scoring.stuck_target_repaired` aggregated hourly |
 | `ledger_unsettled` | tick | Quota or spend entries `reserved` older than 15 min whose owner predicate no longer holds (owner row locked `FOR UPDATE` first); `dispatched` online entries older than 15 min | `not_billed(never_dispatched)` / `ambiguous`, with the `llm_budget` counters updated in the same transaction |
 | `budget_release` | tick | Scoring headroom ≥ `k × r_first` (§6.9.4): after settlements, a raised cap or a new month | The `k` oldest `budget_deferred → pending` |
 | `budget_counters` | every 10 min | `llm_budget` counters differ from the ledger sums | Correct under the month-row lock; `llm.budget_counter_drift` (critical) |
 | `bulk_operations` | every 10 min | An active bulk operation with no `pending`, `in_progress` or `in_batch` target | `completed` |
-| `missing_targets` | every 10 min | A current revision of a retained job lacks an active-tuple target | Create (idempotent), log the count |
+| `missing_targets` | every 10 min | A current revision of a retained, unfenced job lacks an active-tuple target | Create (idempotent, job row `FOR SHARE` and fence check, §20.2), log the count |
 | `group_representatives` | every 10 min | §7.17 invariant 4 is violated | Re-elect; log; metric |
 | `det_completeness` | every 10 min | An active-tuple published result lacks a **current** det_result for the active (or pending) scope, or its `det_inputs_hash` or `det_algorithm_version` is stale | Insert a new current instance |
-| `hard_filter_completeness` | every 10 min | A job lacks an active-scope `hard_filter_results` row, or its `inputs_hash ≠ det_facts_hash` | Compute, then refilter targets |
+| `hard_filter_completeness` | every 10 min | A job lacks an active-scope (or pending-scope) `hard_filter_results` row, or its `inputs_hash ≠ det_facts_hash`, or its `det_algorithm_version` is not current | Compute under `active_config` `FOR SHARE`, then refilter the job's unpublished targets (honouring overrides) |
 | `expiry_sweep` | every 10 min + every cycle | §9.6.3 | Expire or revive |
 | `awaiting_embedding` | every 10 min, when the embedder is healthy | Revisions `awaiting_embedding` for more than 10 min | Embed; set similarity on their targets |
 | `stale_sweep` | tick (≤ 1,000 rows) + daily | Aggregator TTL | `active → stale` ("not re-confirmed"; targets are not expired by it) |
-| `manifest_shipping` | every 5 min | `completed` manifests covered by a `manifest_shipments` row; manifests `completed` for more than 1 h without one | Mark `shipped`; raise `privacy.manifest_unshipped` (critical) |
+| `manifest_shipping` | every 5 min | `completed` manifests named by a `manifest_shipment_items` row with an equal file hash; manifests `completed` for more than 1 h without one | Mark exactly those `shipped`; raise `privacy.manifest_unshipped` (critical) for the others |
 | `ats_mass_events` | after every ATS snapshot | An unconfirmed mass disappearance with two later complete snapshots ≥ 24 h apart | Confirm and close (§8.11) |
 | `batch_poll` | every 5 min | `submitted` or `ended` submissions | Poll and process (§10.10) |
-| `ambiguous_batches` | every 15 min | `submit_ambiguous` | The §10.10 reconciliation; alert at 25 h; never settles by timeout |
+| `ambiguous_batches` | every 15 min | `submit_ambiguous`, and `released` younger than 29 days | The §10.10 reconciliation; alert at 25 h; never settles by timeout or from an empty listing (chair decision C3) |
+| `purge_fences` | every 10 min | An active purge fence whose purge operation is `failed` or has not progressed for 1 h | Keep the fence (fenced work stays blocked); raise `privacy.purge_failed` (critical) |
 | `deadman_sync` | daily + on schedule changes | The healthchecks check's timeout/grace ≠ expected | Update via the Management API |
 | `retention_daily` | daily 03:17 UTC | §20.1 | Purges and tombstones |
 
@@ -5394,6 +5553,7 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `source.not_found` | warn | ATS board 404 | success / removal |
 | `ats.mass_disappearance` | warn | §8.11 | confirmed, acknowledged, or the absent share falls to 50% or below |
 | `quota.unaccounted_usage` | warn | Provider remaining below local (adjustment inserted) | manual |
+| `quota.serpapi_foreign_usage` | warn | SerpApi reports more searches this hour than the app made (§6.5); conservative mode for 24 h | 24 h without detection |
 | `quota.exhausted` | warn | JSearch is provider-exhausted (§6.6), not merely paced or holding its reserve | window renewal |
 | `quota.limit_increased` | info | A provider reports a higher limit than configured | manual |
 | `quota.fallback_active` | info | SerpApi served cells in a run | next run without fallback |
@@ -5419,7 +5579,8 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `admission.exploration_hits` | warn | §9.6.5 | below threshold |
 | `admission.high_sim_expired` | warn | §9.6.5 | 24 h without recurrence |
 | `admission.backlog_drain` | info | §9.6.5 | below threshold |
-| `batch.submit_ambiguous_unresolved` | critical | 25 h without resolution | resolution |
+| `batch.submit_ambiguous_unresolved` | critical | 25 h without a matching batch; the text states the reserved amount and offers the release | found or released |
+| `scope.apply_failed` | critical | An `apply_scope` operation failed permanently; the old scope stays active (§13.4) | a later successful apply |
 | `batch.custom_id_anomaly` | critical | Partial `custom_id` intersection | manual |
 | `batch.items_missing` | critical | A result is missing for an item | manual |
 | `dedup.identity_conflict` | info | New open identity conflict | resolved |
@@ -5507,11 +5668,11 @@ LANGSMITH_HIDE_OUTPUTS=true
 - **Validator V1–V6**, with crafted drafts.
 - **Property tests**:
   - **Quota**: for any sequence of ticks, schedules (1 h–7 d), manual runs, crashes, retries, 429s, late and out-of-order observations, limit decreases and provider resets observed early or late, `counted ≤ limit` in every window, and no observation ever loosens the ledger. With an hourly schedule and an available balance, normal requests are not starved for more than `1 / (N / window)` hours. The Adzuna rolling windows are never exceeded.
-  - **SerpApi hourly (Q-SH1)**: with another SerpApi engine consuming searches at random times (visible only through `account.json`, with a lag of up to 120 s), the app never pushes the account above `serpapi_hourly_cap`.
+  - **SerpApi hourly (Q-SH1, downgraded by chair decision C2)**: under exclusive use, for any admission sequence and provider lag up to 120 s, the app never pushes the account above `H`. With another SerpApi user injected at random times (visible only through `account.json`), the test asserts that foreign usage is detected, `quota.serpapi_foreign_usage` is raised, conservative mode starts, and the app's own admissions stop at `H − 5` above the latest observation. It does **not** assert that the account total stays below `H`, which no local rule can guarantee.
   - **Arbeitnow growth (P-AN1)**: a feed that grows faster than the per-run page cap produces chronologically ordered gaps (`lower < upper`), seeks that land within one page of the gap, and gaps that are abandoned and reported, never skipped silently.
   - **LLM spend**: `counted ≤ max(cap, counted_at_cap_change)` for every month under random reservation, settlement, cap-edit and month-boundary sequences, with the counters always equal to the ledger sums.
   - **USD bucket**: over any simulated month with an unbounded backlog and any tick pattern, scoring spend up to day `d` never exceeds `d/month × scoring share + B_max + one cycle's in-flight reservations`, and a 1,180-target backlog does not exhaust the month in its first days (Fable B1 scenario).
-  - **Admission**: lane credits never starve the oldest or exploration lanes for more than `ceil(1 / (share × R))` cycles; spill never requests a negative count; always-include never exceeds half of `S`.
+  - **Admission**: for every `S ≥ 1` (including `S = 1`) and a permanent always-include backlog, every window of 10 consecutive cycles gives the similarity (with always-include), oldest and exploration lanes 7, 2 and 1 slots per unit of `S`; spill never requests a negative count; always-include never exceeds half of `S` and never takes a safeguard slot; credits stay ≥ −1.
   - **Call bounds**: the maximal routing path uses exactly 7 logical calls and at most 42 HTTP tries, within the CHECKs.
   - **State machines**: random event sequences never produce a disallowed transition, and every target ends in a glossary state.
   - **Outcome reducer**: commutative, and idempotent on equal outcomes.
@@ -5523,9 +5684,15 @@ LANGSMITH_HIDE_OUTPUTS=true
 - The CAS `transition()` returns conflicts correctly.
 - `FOR UPDATE SKIP LOCKED` claims from two concurrent sessions never double-claim.
 - Concurrent `reserve()` calls from 8 threads never exceed the quota limit, and concurrent LLM reservations from 8 sessions (scoring, profile extraction, batch preparation and a cap edit mixed) never exceed the cap: they serialise on the `llm_budget` row.
-- **Fencing**: an owner that reserved, then lost ownership to a takeover, gets 0 rows from its dispatch-marker transaction and never sends; its reservation is released by the new owner.
+- **Fencing**: an owner that reserved, then lost ownership to a takeover, gets 0 rows from its dispatch-marker transaction and never sends; its reservation is released by the new owner. **Operation ABA (Codex N1)**: execution A of an operation stalls, the reconciler returns it to `pending`, execution B starts in the same worker epoch; A then resumes and every reservation, dispatch, heartbeat and write it attempts updates 0 rows.
+- **Score-instance replacement (Codex N2)**: recomputing an existing `(result, scope)` pair clears the old current row before inserting the new one and never violates `det_results_current`; a failure in between rolls back to the old instance.
+- **Dry-run projection (Codex N4)**: `project_allowance` on a provider with no window, and on an expired window, returns a projection inside a read-only transaction and writes no row.
+- **Purged profile re-upload (Codex N12)**: confirming content whose hash equals a purged version creates a new version with content; replaying the old profile-purge manifest leaves it intact.
+- **Purge fences (Codex N14)**: during a source purge, the `missing_targets` reconciler, `enqueue_targets`, the claim, the publish transaction, an eval run and an export each refuse work on a fenced job; after the purge commits, no target or result exists for a deleted revision.
+- **Collection vs scope flip (Codex #7)**: a job inserted concurrently with an `apply_scope` final transaction either commits before the check (and carries its pending-scope projections) or after the flip (and computes them for the new active scope); the flip never commits with a job lacking them.
 - **Publication**: the publish transaction (§9.4.1) commits with the deferred `score_targets ↔ llm_results` keys; a concurrent scope save waits for it (`active_config` `FOR SHARE` vs `FOR UPDATE`), and the final flip never sees a published result without a current pending-scope `det_result`.
-- **Deletion graph**: on a database seeded with two-year-old rows of every table, the profile purge, the job tombstone, the Adzuna purge and delete-everything run to completion against the real DDL with no FK or CHECK violation, and leave the ledgers intact.
+- **Deletion graph**: on a database seeded with two-year-old rows of every table, the profile purge, the job tombstone (including a job with an inactive golden case), the Adzuna purge and delete-everything run to completion against the real DDL with no FK or CHECK violation, and leave the ledgers intact. Delete-everything with a `preparing`, a `submitted` and a `submit_ambiguous` submission applies exactly the mapping of §20.4: no ledger entry stays `reserved`, and batch entries end `ambiguous`.
+- **Manifest shipment coverage (Codex #9)**: manifest A commits first but writes its file after a shipment that contains manifest B; that shipment's items name only B, and A becomes `shipped` only after a later shipment item names A with an equal hash.
 - **Default privileges**: a table created by a later migration (and the procrastinate and checkpoint tables) is usable by `jobhunter_app` without a manual grant; `jobhunter_restore` can create, restore and drop the scratch database and cannot read the production database.
 - **Postgres logs (L1)**: a slow insert of PII-shaped values and a constraint violation through psycopg leave neither value in the server log.
 - **The advisory-lock fence**:
@@ -5564,7 +5731,7 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
 | C18 | Lock session lost (network drop) | The watchdog calls `os._exit(70)` within 10 s; Compose restarts; the run resumes as a new attempt |
 | C19 | **Batch submit**: crash before `submit_started` | `abandoned`; targets → `pending`; spend `not_billed` |
 | C20 | **Batch submit-ambiguous**: crash after `submit_started`, with the batch actually created | `submit_ambiguous`; the reconciler confirms by `custom_id`-set equality after the batch ends; results publish |
-| C21 | Batch submit-ambiguous, with no batch created and listing complete | `not_submitted` only after exhaustive reconciliation; targets re-queued |
+| C21 | Batch submit-ambiguous, with no batch created and listing complete | Stays `submit_ambiguous` with spend counted (no automatic absence proof, chair decision C3); alert at 25 h; after the user's release the submission is `released`, the targets are re-queued, and the spend stays `ambiguous` |
 | C22 | Batch submit-ambiguous with the list API failing for 26 h (simulated clock) | Stays quarantined with spend reserved; critical alert at 25 h; no transition |
 | C23 | Crash during batch result processing | Idempotent item processing; no double publish |
 | C24 | Crash inside the profile-activation transaction | All-or-nothing: either the new tuple is active with tasks deferred, or nothing changed |
@@ -5576,8 +5743,11 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
 | C30 | Crash after the scope save commits, before its procrastinate job is deferred | The `operations` reconciler re-defers `apply_scope` within 2 min; the flip happens |
 | C31 | Crash after the deletion manifest file is fsync'd, before the deletes | Restart resumes the manifest to `completed`; the shipper ships it; the UI reports it done only at `shipped` |
 | C32 | VPS loss after a deletion completed and shipped, before the next nightly backup | Restore of the older backup set plus manifest replay leaves the deleted ids absent (verified) |
-| C33 | A batch result arrives after the user released the quarantined targets | Spend settles from usage; the item is `ignored_fenced`; the re-claimed target is untouched |
+| C33 | A released submission's batch is found later: one item succeeded, one errored, one expired | The succeeded item settles `ambiguous → billed` from usage; the errored and expired items settle `ambiguous → not_billed(batch_item_errored / batch_item_expired)`; every item is `ignored_fenced`; the re-claimed targets are untouched |
 | C34 | Crash inside the profile confirm transaction, then the client retries with the same `Idempotency-Key` | Either nothing changed and the retry activates once, or the retry returns the original response; never a second activation |
+| C35 | An operation (profile extraction) stalls after its reservation; the reconciler re-queues it and a second execution runs; then the first resumes | The first execution's dispatch marker updates 0 rows and it never sends; exactly one extraction call is billed |
+| C36 | Crash in the middle of a source purge chunk, then restart while the `missing_targets` reconciler runs | The fence stays active across the restart; no deleted target is recreated; the purge resumes and releases the fence in its final transaction |
+| C37 | Restore of an older backup set while the manifest stream holds a newer manifest; then new jobs, a profile version and a manifest are created, and `migrate` runs again | The newer manifest is replayed once; every new row's id lies above all `max_ids`; the second replay deletes nothing; the new manifest's file name (its uuid) collides with no old one |
 
 ### 18.4 Contract tests on scrubbed fixtures
 
@@ -5654,7 +5824,7 @@ E2E runs `@playwright/cli` against `docker compose -f deploy/compose.yaml -f dep
 |---|---|
 | `lint` | ruff (including the banned-API rules), mypy `--strict`, eslint, `tsc --noEmit`, gitleaks |
 | `unit` | pytest unit + property tests |
-| `integration` | pytest with a `pgvector/pgvector:0.8.7-pg17-bookworm` service: migrations, constraints, concurrency, deletion graph, Postgres-log test L1, crash matrix C1–C34 (C32 runs on the compose test stack in the `e2e` job) |
+| `integration` | pytest with a `pgvector/pgvector:0.8.7-pg17-bookworm` service: migrations, constraints, concurrency, deletion graph, Postgres-log test L1, crash matrix C1–C37 (C32 and C37 run on the compose test stack in the `e2e` job) |
 | `contract` | adapter contract tests + fixture PII scan |
 | `payload` | LLM payload contract tests (offline) |
 | `frontend` | vitest, build, OpenAPI drift check |
@@ -5680,6 +5850,7 @@ x-app: &app
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
   user: "10001:10001"
+  group_add: ["10010"]                           # jobhunter-secrets: reads the 0440 secret files (§19.2)
   logging: {driver: local, options: {max-size: 20m, max-file: "10"}}
   restart: unless-stopped
 
@@ -5719,7 +5890,7 @@ services:
     secrets: [data_key, db_app, anthropic_key, rapidapi_key, serpapi_key, adzuna_app_id, adzuna_app_key,
               langsmith_key, ntfy_token, healthchecks_ping_url, healthchecks_api_key]
     volumes: [cv_store:/data/cv, manifests:/data/manifests, exports:/data/exports, parse_jobs:/data/parse]
-    group_add: ["10010"]                        # parse_jobs exchange with docparse
+    group_add: ["10010", "10011"]                # secrets; jobhunter-parse (exchange with docparse)
     networks: [internal, egress]
     healthcheck: {test: ["CMD", "jobhunter", "worker-health"], interval: 30s}
     depends_on:
@@ -5734,8 +5905,8 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     user: "10002:10002"
-    volumes: [parse_jobs:/data/parse]               # shared with the worker via group 10010
-    group_add: ["10010"]
+    volumes: [parse_jobs:/data/parse]            # tmpfs, shared with the worker via group 10011
+    group_add: ["10011"]                         # never in the secrets group; mounts no secret
     mem_limit: 1g
     restart: unless-stopped
   embedder:
@@ -5748,7 +5919,9 @@ services:
     restart: unless-stopped
   postgres:
     image: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:<digest>
-    secrets: [pg_bootstrap]
+    user: "999:999"                              # the image's postgres user; no root step, so group_add applies
+    group_add: ["10010"]
+    secrets: [pg_bootstrap, db_app, db_migrator, db_backup, db_restore]   # role passwords: init only (§19.3)
     volumes: [pgdata:/var/lib/postgresql/data, ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro,
               ./postgres/init:/docker-entrypoint-initdb.d:ro]     # roles + default privileges (§19.3)
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
@@ -5758,20 +5931,37 @@ services:
     mem_limit: 5g
     restart: unless-stopped
   backup:
-    image: ghcr.io/<owner>/jobhunter-backup@sha256:<digest>     # postgres:17.11-alpine3.24 + restic 0.19.1 + crond
+    image: ghcr.io/<owner>/jobhunter-backup@sha256:<digest>     # app image + PostgreSQL 17.11 client + restic 0.19.1 + busybox crond
     secrets: [db_backup, db_restore, restic_password, s3_access_key_id, s3_secret_access_key]
     volumes: [cv_store:/data/cv:ro, manifests:/data/manifests:ro, backup_staging:/data/staging]
     networks: [internal, egress]
-    restart: unless-stopped
+    restart: unless-stopped                      # runs as root in its container (crond); reads secrets as their owner
+  restore:                                       # one-off: docker compose --profile restore run --rm restore (§19.5)
+    image: ghcr.io/<owner>/jobhunter-backup@sha256:<digest>
+    profiles: [restore]
+    command: ["/usr/local/bin/restore.sh"]
+    secrets: [db_migrator, restic_password, s3_access_key_id, s3_secret_access_key]
+    volumes: [cv_store:/data/cv, manifests:/data/manifests, backup_staging:/data/staging]
+    networks: [internal, egress]
+    restart: "no"
 
 networks:
   edge: {}                                       # internet-facing: caddy only
   proxy: {internal: true, ipam: {config: [{subnet: 172.30.0.0/24}]}}
   internal: {internal: true}
-  egress: {}                                     # worker and backup only
-volumes: {pgdata: {}, cv_store: {}, manifests: {}, exports: {}, parse_jobs: {}, backup_staging: {},
-          caddy_data: {}, caddy_config: {}}
-secrets:                                         # files under /etc/jobhunter/secrets/, mode 0400
+  egress: {}                                     # worker and backup only (plus the one-off restore)
+volumes:
+  parse_jobs:                                    # RAM only: a decrypted CV never reaches a disk (§12.2)
+    driver: local
+    driver_opts: {type: tmpfs, device: tmpfs, o: "size=256m,uid=0,gid=10011,mode=0770"}
+  pgdata: {}
+  cv_store: {}
+  manifests: {}
+  exports: {}
+  backup_staging: {}
+  caddy_data: {}
+  caddy_config: {}
+secrets:                                         # files under /etc/jobhunter/secrets/, root:10010, mode 0440
   session_secret: {file: /etc/jobhunter/secrets/session_secret}
   data_key: {file: /etc/jobhunter/secrets/data_key}
   # … one entry per secret named above (§19.2)
@@ -5821,16 +6011,21 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 
 ### 19.2 Secrets and environment (names only)
 
-**Secrets** are files under `/etc/jobhunter/secrets/` (root-owned, mode 0400), delivered by Compose `secrets` to the services listed, and read by the app from `/run/secrets/<name>`. A template listing the names only is `deploy/secrets.example`.
+**Secrets** are files under `/etc/jobhunter/secrets/`, delivered by Compose `secrets` to the services listed, and read by the app from `/run/secrets/<name>`. A template listing the names only is `deploy/secrets.example`.
+
+- **Ownership.** Compose bind-mounts a file-backed secret with the host file's owner and mode; it does not remap them. Every secret file is therefore `root:10010` (host group `jobhunter-secrets`) with mode **0440**, and the directory is `root:10010` with mode 0750. No host user is a member of the group.
+- **Readers.** Each service that receives a secret runs with supplementary group 10010: `api`, `worker` and `migrate` (`user: "10001:10001"`, `group_add: ["10010"]`) and `postgres` (`user: "999:999"`, `group_add: ["10010"]`). The `backup` and `restore` containers run as root inside the container (busybox `crond`) and read the files as their owner. `docparse`, `embedder` and `caddy` receive no secret and are not in the group.
+- **Isolation.** Group membership does not widen access: a container sees only the secrets mounted into it, so the per-service lists below remain the boundary.
+- **Check.** Startup assertion 1 (§16.8) reads every mounted secret and refuses to start when one is unreadable or world-readable, naming the file and never its content. The runbook (§19.8) provisions the files.
 
 | Secret | Services | Purpose |
 |---|---|---|
 | `session_secret` | api | ≥ 32 random bytes (base64). HKDF root for the session pepper and cursor signing |
 | `data_key` (and `data_key_previous` during a rotation) | api, worker | Exactly 32 random bytes (base64). AES-256-GCM for CV files, raw CV texts, the TOTP secret and exports |
-| `db_app` | api, worker | DML role credentials |
-| `db_migrator` | migrate | Schema owner credentials |
-| `db_backup` | backup | `pg_read_all_data` role |
-| `db_restore` | backup | `CREATEDB` restore-test role (§7.1) |
+| `db_app` | api, worker; postgres (init) | DML role credentials |
+| `db_migrator` | migrate, restore; postgres (init) | Schema owner credentials |
+| `db_backup` | backup; postgres (init) | `pg_read_all_data` role |
+| `db_restore` | backup; postgres (init) | `CREATEDB` restore-test role (§7.1) |
 | `pg_bootstrap` | postgres | Bootstrap superuser password (container init only) |
 | `anthropic_key` | worker | Claude API key (passed explicitly; G1) |
 | `rapidapi_key` | worker | JSearch via RapidAPI |
@@ -5839,7 +6034,7 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `langsmith_key` | worker | LangSmith (when tracing) |
 | `ntfy_token` | worker | ntfy access token (optional) |
 | `healthchecks_ping_url`, `healthchecks_api_key` | worker | Dead-man ping URL and Management API key (both required in prod, §17.7) |
-| `restic_password`, `s3_access_key_id`, `s3_secret_access_key` | backup | Offsite repository |
+| `restic_password`, `s3_access_key_id`, `s3_secret_access_key` | backup, restore | Offsite repository |
 
 **Non-secret environment** (`/etc/jobhunter/jobhunter.env`, passed to each service through its own `environment` section in Compose, so a service sees only its own names):
 
@@ -5875,17 +6070,23 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 
 ### 19.3 Migrations
 
-- **`deploy/postgres/init`** (first start only) creates the four roles of §7.1 and runs, as the bootstrap superuser:
+- **`deploy/postgres/init`** (first start on an empty data directory only) runs as the bootstrap superuser:
+  - creates the four roles of §7.1, each with the password from its secret file (`db_app`, `db_migrator`, `db_backup`, `db_restore`);
+  - `ALTER DATABASE <db> OWNER TO jobhunter_migrator`, so the migrator owns the `public` schema through `pg_database_owner`;
+  - `CREATE EXTENSION vector, pg_trgm, unaccent` in the application database, so neither the migrator nor the restore role ever needs the right to create an extension;
+  - creates the database `jobhunter_template` with the same three extensions and marks it `IS_TEMPLATE true` (the restore test's scratch database is created from it, §19.5);
   - `ALTER DEFAULT PRIVILEGES FOR ROLE jobhunter_migrator GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO jobhunter_app;`
   - `ALTER DEFAULT PRIVILEGES FOR ROLE jobhunter_migrator GRANT USAGE, SELECT ON SEQUENCES TO jobhunter_app;`
   - `GRANT pg_read_all_data TO jobhunter_backup;` and `ALTER ROLE jobhunter_restore CREATEDB;`
-  - the backup role's `INSERT, UPDATE` grants on `backup_sets`, `backup_runs` and `manifest_shipments` are applied by the migration that creates them.
 - **`jobhunter migrate`** runs as the `migrator` role, in this order:
-  1. `alembic upgrade head`;
-  2. `procrastinate schema --apply` (or its migration scripts, for upgrades);
-  3. `PostgresSaver.setup()` on a dedicated `autocommit=True, prepare_threshold=0, row_factory=dict_row` connection (it uses `CREATE INDEX CONCURRENTLY`);
-  4. seeding the `sources` rows, rubric v1, the initial prompt-schema version, the default execution config and evaluation policy, and the `ranking_state` row, all idempotent;
-  5. replaying deletion manifests from the mounted `manifests` volume (§19.5).
+  1. re-apply the **explicit grants** idempotently: the backup role's `INSERT, UPDATE` on `backup_sets`, `backup_runs`, `manifest_shipments` and `manifest_shipment_items`. A restore uses `--no-acl` (§19.5), which drops them;
+  2. **advance identity sequences** past every id the manifest stream references (§19.5), before any write;
+  3. `alembic upgrade head`;
+  4. `procrastinate schema --apply` (or its migration scripts, for upgrades);
+  5. `PostgresSaver.setup()` on a dedicated `autocommit=True, prepare_threshold=0, row_factory=dict_row` connection (it uses `CREATE INDEX CONCURRENTLY`);
+  6. seeding the `sources` rows, rubric v1, the initial prompt-schema version, the default execution config and evaluation policy, and the `ranking_state` row, all idempotent;
+  7. replaying deletion manifests from the mounted `manifests` volume (§19.5).
+- Steps 1, 2 and 7 are idempotent and cheap, so every `migrate` runs them, not only the one after a restore.
 - **Expand/contract**: additive migrations ship first. Destructive steps follow at least one release later.
 - Every migration has an integration test, and long index builds use `CONCURRENTLY` in separate non-transactional migrations.
 - `/readyz` fails until the Alembic revision equals the code head.
@@ -5902,45 +6103,66 @@ The `<owner>` and `<digest>` placeholders are filled by the release pipeline (§
 | `sessions revoke-all` / `sessions unlock` | Session recovery and lockout release |
 | `migrate` | §19.3 |
 | `worker` / `worker-health` | Start the worker / its health probe |
-| `manifests replay [--after-id <n>]` | Replay deletion manifests after a restore |
-| `restore verify --set <id>` | Checks on a restored database (§19.5) |
+| `migrate --database <db> --steps sequences,alembic,replay --manifest-dir <dir> --cv-dir <dir>` | The subset of `migrate` the restore test runs against its scratch database (§19.5) |
+| `manifests replay` | Migrate steps 2 and 7 alone: advance sequences, then replay the manifest stream by `manifest_uuid` |
+| `restore verify --set <id> --phase restored\|replayed [--database <db>]` | Checks on a restored database (§19.5) |
 | `crypto rotate` | Resumable data-key rotation (§16.8) |
 | `schema-dry-run --live` | §10.11 |
 | `fixtures scrub <in> <out>` | §18.4 |
 | `http-check <url>` | Compose healthcheck helper |
+| `startup-check` | Run the startup assertions of §16.8 for this service and exit |
 
 ### 19.5 Backups, deletion manifests and restore
 
 **Backup sets** (nightly, `JOBHUNTER_BACKUP_CRON`). `backup_set.sh` runs with `set -euo pipefail`, so any failing step fails the set:
 1. Insert `backup_sets(status='running')`.
-2. `pg_dump -Fc` as the backup role into `/data/staging/jobhunter.dump` (a file, not a pipe, so its exit status is checked). Record `db_snapshot_at` (the start of the dump's transaction) and `manifest_high_water` (the highest `deletion_manifests.id` visible to it).
-3. Verify the dump with `pg_restore --list` and record its sha256 and size.
-4. Write `backup_set.json`: the set id, dump sha256, `db_snapshot_at`, `manifest_high_water`, the CV file count and the app version.
-5. Take **one** restic snapshot of `/data/staging` (dump and `backup_set.json`), `/data/cv` and `/data/manifests`, tagged `set:<id>`. The CV files are already app-encrypted, and they are captured after the dump: every file the dump references existed when the dump began, and later files are orphans that the restore removes.
-6. Set `backup_sets` to `succeeded` with the restic snapshot id, and clear the staging directory. Any failure → `failed` with the error and `backup.failed` (critical).
+2. **One snapshot for the dump and the inventory.** A `psql` co-process, as the backup role, opens `BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY`, sets `idle_in_transaction_session_timeout = 0` for itself and runs `SELECT pg_export_snapshot()`. In that transaction it records `db_snapshot_at` (`now()`, the transaction start), `manifest_count` (`count(*)` of `deletion_manifests`) and `row_counts` (`count(*)` of every application table). It keeps the transaction open until step 3 has finished.
+3. `pg_dump -Fc --snapshot=<id>` as the backup role into `/data/staging/jobhunter.dump` (a file, not a pipe, so its exit status is checked). The dump therefore sees exactly the rows that were counted. The co-process then commits.
+4. Verify the dump with `pg_restore --list` and record its sha256 and size.
+5. Write `backup_set.json`: the set id, dump sha256, Alembic revision, `db_snapshot_at`, `manifest_count`, `row_counts`, the CV file count and the app version.
+6. Take **one** restic snapshot of `/data/staging` (dump and `backup_set.json`), `/data/cv` and `/data/manifests`, tagged `set:<id>`. The CV files are already app-encrypted, and they are captured after the dump: every file the dump references existed when the dump began, and later files are orphans that the restore removes.
+7. Set `backup_sets` to `succeeded` with the restic snapshot id and the inventory, and clear the staging directory. Any failure → `failed` with the error and `backup.failed` (critical).
 
 **Deletion manifests** (§7.14) make deletions durable across a disaster:
-1. **Before** any row or file is deleted, the deleting task inserts the `deletion_manifests` row (`executing`) and writes the manifest file (ids and key hashes only) to the `manifests` volume with `fsync` of the file and its directory, recording its sha256.
-2. It performs the deletes, then sets `completed`.
-3. The **manifest shipper** (backup container, every 5 min) runs `restic backup /data/manifests --tag manifests` and records a `manifest_shipments` row with the highest manifest id it contains. The `manifest_shipping` reconciler marks covered manifests `shipped`.
-4. The UI and the API report a deletion as done **only at `shipped`**. A manifest not shipped within 1 h raises `privacy.manifest_unshipped` (critical).
+1. **Identity.** A manifest's stream identity is its `manifest_uuid` (UUIDv7, generated by the app), never its `id`. Its file is `<manifest_uuid>.json`; it holds the uuid, kind, scope (ids and key hashes only) and `max_ids`: the highest id of every identity column of the application schema when the manifest was created.
+2. **Before** any row or file is deleted, the deleting task computes the manifest content and its sha256, commits the `deletion_manifests` row (`executing`) together with its purge fence (§20.2), and then writes the file: to `<manifest_uuid>.json.tmp`, `fsync`, rename, `fsync` of the directory. A crash between the commit and the rename leaves an `executing` row without a file; the purge operation's retry rewrites the identical file before it deletes anything.
+3. It performs the deletes, then sets `completed`.
+4. The **manifest shipper** (backup container, every 5 min) lists the `*.json` files of `/data/manifests` (never `*.tmp`), hashes each, runs `restic backup --files-from <that list> --tag manifests`, and records in one transaction a `manifest_shipments` row with one `manifest_shipment_items` row **per file the snapshot contains** (uuid and sha256). Coverage is therefore exact, never inferred from a highest id: a manifest that was still unwritten during a shipment simply has no item in it. Every run ships every file, so the latest `manifests` snapshot is always the complete stream.
+5. The `manifest_shipping` reconciler (§17.4) marks a `completed` manifest `shipped` when an item names its uuid with an equal sha256.
+6. The UI and the API report a deletion as done **only at `shipped`**. A manifest not shipped within 1 h raises `privacy.manifest_unshipped` (critical).
 
-**Restore order** (`deploy/backup/restore.sh`, documented in the runbook; services stay stopped):
+**Replay rules** (migrate step 7, and the restore test). For each file of the restored stream, keyed by `manifest_uuid`:
+
+| Restored database has | Action |
+|---|---|
+| no row with that uuid (the manifest is newer than the dump) | insert the row from the file as `executing`, perform its deletes, set `completed` |
+| the row, `executing` | perform its deletes again (they are idempotent), set `completed` |
+| the row, `completed` or `shipped` | check that no named id is present; delete any that is |
+
+Each manifest records the replay once in `replay_log` (restore id, time, deleted counts). Replay releases the manifest's purge fences, and the rebuild step of a source purge (§20.5 step 5) is re-queued as a `purge` operation. A file that does not parse, or whose name differs from the uuid inside it, stops `migrate` with an error for the operator; nothing is replayed until it is resolved.
+
+**Identity advancement** (migrate step 2). Before any write, `migrate` sets every identity column of the application schema to restart above the greatest of its current maximum and the `max_ids` value of every manifest in the stream (`ALTER TABLE … ALTER COLUMN id RESTART WITH`, as the owner). A row created after a restore therefore never receives an id that a manifest names, so a later replay can never delete new data, and a profile version or job re-created after a purge never shares an id with the purged one.
+
+**Restore order** (`deploy/backup/restore.sh`, run with `docker compose --profile restore run --rm restore`; documented in the runbook; `api` and `worker` stay stopped):
 1. Restore the **latest manifest stream** (`restic restore latest --tag manifests`) into the `manifests` volume first.
-2. Choose a backup set (`--tag set:<id>`, latest by default) and verify `backup_set.json` against the dump's sha256.
-3. Restore the dump into an empty database with `pg_restore`, as the migrator role.
-4. Restore the CV files of the same set (`restore.sh` runs in a one-off backup container with writable mounts); `migrate` later deletes CV files that no restored row references.
-5. Run `migrate`: it applies migrations, then **replays every manifest with an id above the set's `manifest_high_water`**, and re-applies any older manifest whose ids are still present.
-6. `jobhunter restore verify --set <id>`: the Alembic revision; row counts against `backup_set.json`; the checksum of 100 random raw responses; and **the absence of every id named by any manifest**.
-7. Start `api` and `worker`.
+2. Choose a backup set (`--tag set:<id>`, latest by default), restore it into `/data/staging`, and verify `backup_set.json` against the dump's sha256.
+3. Start `postgres` on an empty data directory: `deploy/postgres/init` creates the roles, the extensions, the template database and the default privileges (§19.3).
+4. `pg_restore --no-owner --no-acl --exit-on-error -L <filtered list>` into the application database, as the migrator role. Every restored object is owned by the migrator, so the default privileges grant DML to the app role, and no ownership or ACL statement needs a superuser. The filtered list is `pg_restore --list` without the entries for the extensions, their comments and the `public` schema, which step 3 already created.
+5. `jobhunter restore verify --set <id> --phase restored`: the Alembic revision and the per-table row counts equal `backup_set.json`; `deletion_manifests` holds `manifest_count` rows; the checksum of 100 random raw responses matches. This runs before replay, because replay deletes rows.
+6. Restore the CV files of the same set into `cv_store`.
+7. Run `migrate` (§19.3): grants, identity advancement, migrations, seeding and replay; it then deletes CV files that no restored row references.
+8. `jobhunter restore verify --set <id> --phase replayed`: every manifest of the stream has a `completed` or `shipped` row; **no id named by any manifest is present**; every identity column restarts above all `max_ids`.
+9. Start `api` and `worker`.
 
 A deletion acknowledged to the user is shipped offsite before the acknowledgement, so no restore can bring it back (S9, crash case C32).
 
-**Monthly restore test** (`JOBHUNTER_RESTORE_TEST_CRON`), run as `jobhunter_restore`:
-1. Create the scratch database `jobhunter_restore_test` (the role owns it).
-2. Run restore steps 1–6 for the latest backup set against the scratch database and a scratch directory.
-3. Drop the scratch database and directory.
-4. Record `backup_runs(kind='restore_test', backup_set_id)` with the verification report. A failure raises `backup.restore_test_failed`.
+**Monthly restore test** (`JOBHUNTER_RESTORE_TEST_CRON`). The backup image contains the app package, so the test runs the same code as a real restore:
+1. As `jobhunter_restore`: drop a leftover `jobhunter_restore_test`, then `CREATE DATABASE jobhunter_restore_test TEMPLATE jobhunter_template` (the role owns it; the extensions come from the template).
+2. Restore the latest backup set and the latest manifest stream into `/data/staging/restore_test/`.
+3. Run restore steps 4 and 5 against the scratch database, as `jobhunter_restore`, with `pg_restore --no-owner --no-acl`.
+4. Run, as `jobhunter_restore`, `jobhunter migrate --database jobhunter_restore_test --steps sequences,alembic,replay` with the scratch manifest and CV directories, then restore step 8 (`--phase replayed`) against the scratch database.
+5. Drop the scratch database and directory.
+6. Record, as the backup role, `backup_runs(kind='restore_test', backup_set_id)` with the verification report. A failure raises `backup.restore_test_failed`.
 
 **Retention**: `restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 3` for the `set:*` snapshots, with `prune` weekly. The `manifests` snapshots are never forgotten (they hold ids and hashes only).
 
@@ -5978,6 +6200,13 @@ A deletion acknowledged to the user is shipped offsite before the acknowledgemen
 
 ### 19.8 Runbook basics (`docs/RUNBOOK.md`)
 
+- **Host setup** (once, before the first `up`):
+  1. `groupadd --gid 10010 jobhunter-secrets` (no user is added to it).
+  2. `install -d -o root -g 10010 -m 0750 /etc/jobhunter/secrets`.
+  3. For each name of §19.2: `install -o root -g 10010 -m 0440 <file> /etc/jobhunter/secrets/<name>`, then delete the source file. Never `chmod 0400`: the app services run as uid 10001 and could not read it.
+  4. Check with `docker compose run --rm --no-deps api jobhunter startup-check`, and the same for `worker` and `migrate` (the assertions of §16.8 for that service, without starting it).
+  5. Run the host without swap, or with encrypted swap only, so the `parse_jobs` tmpfs never pages a decrypted CV to a plain disk.
+  6. Install `deploy/firewall/docker-user.nft` (§16.9).
 - **Start / stop**: `docker compose up -d` / `docker compose stop` (graceful). Never `--scale worker=…`.
 - **Health check**: `/readyz` from outside, then System → Health in the UI. `docker compose ps` and `logs worker --since 1h` (logs contain no PII).
 - **Alerts**:
@@ -5985,15 +6214,18 @@ A deletion acknowledged to the user is shipped offsite before the acknowledgemen
 | Alert | Action |
 |---|---|
 | `quota.unaccounted_usage` | Check whether the key is used elsewhere; rotate it if needed. |
-| `batch.submit_ambiguous_unresolved` | Inspect the Anthropic console; release if certain. |
+| `quota.serpapi_foreign_usage` | The SerpApi account must be used by this app only (§6.5). Stop the other user or rotate the key; the conservative mode ends by itself after 24 h without detection. |
+| `batch.submit_ambiguous_unresolved` | Inspect the Anthropic console. Release only when certain that no batch exists; the reserved spend stays counted as ambiguous either way (§10.10). |
+| `scope.apply_failed` | The old scope is still active. Read the operation's error, fix the cause, then use Retry apply in Settings. |
+| `privacy.purge_failed` | Fenced work stays blocked until the purge completes. Read the operation's error, fix the cause, and retry it from System → Needs attention (`POST /api/system/purges/{id}/retry`). |
 | `run.failed_invariant` | Read the run report invariant section; file a bug; the next run proceeds. |
 | `llm.reservation_bound_violated` | Scoring is paused. Check `llm/pricing.py` and the overhead constant against the call's usage; fix, deploy, then acknowledge. |
 | `privacy.manifest_unshipped` | Check the backup container and S3 credentials; run the shipper manually; the deletion is reported done only when shipped. |
 | `llm.budget_counter_drift` | The reconciler has corrected the counters from the ledger; file a bug with the alert context. |
 | `source.auth_failed` | Rotate or renew the key in its secret file (§19.2), then `docker compose up -d worker`. |
 
-- **Secret rotation**: replace the secret file, then restart the services that receive it (§19.2). Rotating the session secret logs the user out. Rotating the data key: mount the old key as `data_key_previous` and the new one as `data_key`, run `jobhunter crypto rotate` (resumable), and remove `data_key_previous` only after its verification pass reports no ciphertext with the old key id (§16.8).
-- **Restore**: follow the restore order of §19.5 exactly: manifest stream first, then the backup set, then `migrate` (replay), then `restore verify`, and only then start `api` and `worker`.
+- **Secret rotation**: replace the secret file with the same `install -o root -g 10010 -m 0440` command, then restart the services that receive it (§19.2). Rotating the session secret logs the user out. Rotating the data key: mount the old key as `data_key_previous` and the new one as `data_key`, run `jobhunter crypto rotate` (resumable), and remove `data_key_previous` only after its verification pass reports no ciphertext with the old key id (§16.8).
+- **Restore**: on a fresh host, do the host setup first, then follow the restore order of §19.5 exactly: manifest stream first, then the backup set, the empty database with its init, `pg_restore --no-owner --no-acl`, `restore verify --phase restored`, the CV files, `migrate` (identity advancement and replay), `restore verify --phase replayed`, and only then start `api` and `worker`.
 - **Disk pressure**: check `jobhunter_table_bytes`. Run `retention_daily` manually; vacuum.
 - **Password lost**: `jobhunter user set-password`.
 
@@ -6009,13 +6241,15 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 |---|---|---|---|
 | CV file (original) and raw CV text | `cv_store` (encrypted), `cv_files.raw_text_enc` | Files of the active and the previous profile version. Files of discarded or failed drafts and abandoned uploads: 30 days after the draft ended. | `retention_daily` / on confirm |
 | Contact-stripped text | `cv_files.stripped_text` | Same as the CV file | Same |
-| Draft content (`draft_json`, `reviewed_text`) | `profile_drafts` | 30 days after the draft is `confirmed`, `discarded` or `failed` (`content_purged_at`); the row's ids and states stay | `retention_daily` |
-| Contact-stripped profile JSON | `profile_versions.profile_json` | While retained scores or active golden cases reference it. The row itself is **never deleted**; purging nulls its content | Profile purge (§20.2) |
+| Draft content (`draft_json`, `reviewed_text`, and the `output_json` of the draft's `extract_profile` calls) | `profile_drafts`, `llm_calls` | 30 days after the draft is `confirmed`, `discarded` or `failed` (`content_purged_at`); the rows' ids, states and usage stay | `retention_daily` |
+| Contact-stripped profile JSON | `profile_versions.profile_json` | While retained scores, retained feedback (`score_feedback.profile_version_id`) or active golden cases reference it. The row itself is deleted only by delete-everything; purging nulls its content | Profile purge (§20.2) |
+| Query proposals (`items`, and the `output_json` of their `propose_queries` calls) | `query_proposals`, `llm_calls` | With the profile content; the proposal becomes `purged` | Profile purge |
 | Profile vectors | `profile_vectors` + `embeddings` | With the profile content | Profile purge |
 | Score history (targets, attempts, drafts, critic notes, llm_results, evidence, det instances, llm_calls) | DB | `retention.score_history_months` (default 12) after the target ended terminally, **except**: targets of the active tuple and everything they reference are never deleted by age (deleting one would make `missing_targets` re-create and re-score it); results referenced by an active golden case are kept | Target-set deletion (§20.2) |
 | Superseded `det_results` instances | DB | With score history; the current instance follows its result | Same |
 | Feedback | `score_feedback` | Until the user deletes it, or delete-everything. Its references are detached (`SET NULL`) when the result or job is removed; the score snapshot stays | User action |
-| Golden cases | `golden_cases`, `eval_case_results` | Until the user deletes them (§14.2). While a case is active, **its job revision, the job and its profile version are exempt** from tombstoning and purges | User action (manifest) |
+| Golden cases | `golden_cases`, `eval_case_results`, their eval calls | Until the user deletes them (§14.2). While a case is active, **its job revision, the job and its profile version are exempt** from tombstoning and purges (the Adzuna purge excepted, §20.5). Tombstoning and the profile purge delete **inactive** cases they would otherwise orphan (§20.2) | User action (manifest) |
+| Eval runs, their case results and calls (golden, canary, schema dry-run) | `eval_runs`, `eval_case_results`, `llm_calls` | 13 months after the run, except the latest completed run of each kind | `retention_daily` (calls cascade) |
 | Raw provider payload bodies | `raw_responses.body_zstd` | 30 days, extended while a newer row references the body (§7.7) | `retention_daily` (body nulled) |
 | `raw_items` | DB | 90 days; observations keep their provenance copy (`raw_item_id := NULL`) | `retention_daily` |
 | `raw_responses` rows (metadata, body already nulled) | DB | With their fetch request (13 months) | Cascade |
@@ -6030,7 +6264,6 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | LangGraph checkpoints | DB | 14 days after the run or cycle ends | `retention_daily` (deletes threads) |
 | procrastinate finished jobs | DB | 7 days | daily cleanup |
 | Idempotency records | `api_idempotency` | 7 days | daily |
-| Token counts | `token_counts` (hashes and counts only) | 90 days after the last use | daily |
 | Logs | Docker local driver | about 14 days (rotation) | Rotation |
 | Sessions | DB | Expiry + 1 day | daily |
 | Login attempts | DB | 30 days | daily |
@@ -6038,15 +6271,45 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Exports | `exports` volume | 7 days; deleted immediately by any purge (§20.2) | daily |
 | Backups | S3 (restic) | Backup sets: 7 daily, 4 weekly, 3 monthly. Manifest snapshots: indefinitely | `restic forget/prune` |
 | Backup sets, backup runs | DB | 13 months | daily |
-| Deletion manifests | DB + `manifests` volume + offsite | Indefinitely (ids and hashes only) | — |
+| Deletion manifests, shipments, purge fences | DB + `manifests` volume + offsite | Indefinitely (ids and hashes only) | — |
 | LangSmith traces | LangSmith EU | Per the LangSmith project retention setting (no I/O content) | LangSmith console |
 
 ### 20.2 Deletion graph
 
-Every purge follows the same protocol: **(1)** write the deletion manifest row and its fsync'd file (§19.5); **(2)** delete in the order below, in bounded transactions that are idempotent on retry; **(3)** mark the manifest `completed`; **(4)** report it done only when `shipped`. Ledgers (`quota_ledger`, `llm_spend_ledger`, `llm_budget`) are never touched; their `run_id` and `fetch_request_id` references become NULL by `ON DELETE SET NULL`.
+Every purge runs as a `purge` operation (§7.3; the payload names its manifest) and follows the same protocol:
+1. **Manifest and fence.** One transaction holding `active_config` `FOR UPDATE` commits the `deletion_manifests` row (`executing`) and the purge's `purge_fences` rows (§7.14). The manifest file is then written and fsync'd (§19.5).
+2. **Delete** in the order below, in bounded transactions that are idempotent on retry. A chunk that touches jobs first takes their rows `FOR UPDATE` in id order and only then selects the rows to delete, so it includes anything a consumer created before the fence committed.
+3. **Complete.** The final transaction sets the manifest `completed` and the fences' `released_at`. A failed purge keeps its fences, so fenced work stays blocked until a retry completes it (`purge_fences` reconciler, §17.4).
+4. **Report** the deletion as done only when the manifest is `shipped`.
+
+Ledgers (`quota_ledger`, `llm_spend_ledger`, `llm_budget`) are never touched; their `run_id` and `fetch_request_id` references become NULL by `ON DELETE SET NULL`.
+
+**Purge fences.** A fence is the persisted statement that a purge is in progress; it survives restarts and replaces every in-memory stop flag. `is_fenced(job_id, llm_tuple_id DEFAULT NULL)` is a `STABLE` SQL function that is true when an unreleased fence matches:
+
+| Fence kind | Created by | Matches |
+|---|---|---|
+| `global` | delete-everything (§20.4) | everything |
+| `source` | source purge (§20.5) | a job with a posting of that source, or with a revision whose lineage names it. Evaluated at call time, so a merge carries the fence to the surviving job |
+| `jobs` | job tombstoning (a `retention_daily` batch) | a job in `job_ids` |
+| `profile` | profile version purge | a tuple of that profile version |
+
+Every consumer checks the fences **inside the transaction that does the work**, after taking the job row `FOR SHARE` (lock order, §3.3.3). The purge's chunks take the same rows `FOR UPDATE`, so a consumer either commits before the chunk locks the job, and the chunk then deletes what it created, or it sees the fence:
+
+| Consumer | Behaviour while fenced |
+|---|---|
+| Target creation: `enqueue_targets` (§9.2 node 9), the `missing_targets` reconciler, `create_targets_for_tuple`, revival of a cancelled target (§7.16.3) | skips the job |
+| Identity resolution (§8.6) | a `source` fence makes the item `out_of_scope('source_purged')`; a fenced job in `P` or `J` leaves the item `pending` until release |
+| Admission: the claim (§9.4.2) and batch preparation (§10.10) | `NOT is_fenced(job_id, llm_tuple_id)` in the selecting statement |
+| Publication (§9.4.1 step 1a) | publishes nothing; the attempt ends `cancelled`, and the purge cancels the target |
+| Evaluation (§11.13) | the case is skipped and reported as `fenced`; no `eval_case_results` row is written |
+| Export (§20.3) | the final transaction takes `active_config` `FOR SHARE` and ends the export `purged` if any fence is active |
+| Profile activation (§12.6) | refuses a version under a `profile` fence with 409 `profile_purge_in_progress` |
+| Runs, cycles, operations, batch submits | a `global` fence is a persisted admission stop: none starts, and every dispatch check (§3.3.3) refuses. The purge operation itself is exempt |
+
+Retention deletion of expired score history needs no fence: it touches only terminal targets of inactive tuples, and each chunk re-checks under `active_config` `FOR SHARE` that their tuple is still inactive.
 
 **Target-set deletion** (used by every purge below) for a set T of score targets, in one transaction per chunk of 200 targets:
-1. Cancel the non-terminal targets in T (`cancelled('purged')`): `in_progress` targets lose their claims and their coroutines stop at the next claim check; `in_batch` targets are cancelled after a cancel request for their submission. Late results are fenced and publish nothing.
+1. Cancel the non-terminal targets in T (`cancelled('purged')`, §7.16.3): `in_progress` targets lose their claims and their coroutines stop at the next claim check; for `in_batch` targets the submission's cancel is requested first. Late results are fenced and publish nothing.
 2. `UPDATE score_targets SET resume_draft_id = NULL WHERE id = ANY(:T)`.
 3. Delete `result_evidence` and `det_results` of the results of T (`score_feedback` and `golden_cases.labelled_from_result_id` references become NULL).
 4. Delete `critic_notes` of the attempts of T.
@@ -6056,25 +6319,38 @@ Every purge follows the same protocol: **(1)** write the deletion manifest row a
 8. Delete `score_attempts` of T.
 9. Delete the targets T.
 
-**Profile version purge** runs when none of the version's tuples is active, its score history has expired, and no active golden case references it:
-1. Lock the profile version row.
+**Auxiliary and evaluation calls.** Calls without a target are owned as follows, so no call output outlives the content it was derived from:
+
+| Call purpose | Owner | Removal |
+|---|---|---|
+| `extract_profile` | its profile draft (`llm_calls.profile_draft_id`) | `output_json := NULL` when the draft content is purged (30 days, §20.1) or with the profile purge |
+| `propose_queries` | its query proposal (`query_proposals.llm_call_id`) | `output_json := NULL` with the profile purge, together with the proposal's items |
+| eval, canary and schema dry-run calls | their eval run and, per case, their golden case (`llm_calls.golden_case_id`) | deleted with the eval run (13 months, §20.1) or the golden case (`ON DELETE CASCADE`), whichever comes first |
+
+**Profile version purge** runs when none of the version's tuples is active, its score history has expired, no active golden case references it, and **no `score_feedback` row references it** (feedback keeps the profile it was given against for as long as the user keeps the feedback):
+1. Manifest and a `profile` fence (protocol step 1); lock the profile version row `FOR UPDATE`.
 2. Target-set deletion for every target of every tuple of this profile.
-3. Delete `profile_vectors`; delete the `query_proposals` items of the version (`items := NULL`).
-4. Set `profile_json = NULL`, `purged_at = now()`. The row, its tuples and their ids stay, so `runs`, `score_cycles`, `batch_submissions`, `bulk_operations` and the ledgers keep valid references.
-5. Delete the CV file and null `raw_text_enc` and `stripped_text` of its `cv_files` row if no retained version uses it; purge the draft content.
+3. Delete `profile_vectors`. Its query proposals become `status = 'purged'` with `items := NULL`, and their calls' `output_json := NULL`.
+4. Delete the inactive golden cases of the version (they cannot run without its content); their case results and calls cascade.
+5. Set `profile_json = NULL`, `purged_at = now()`. The row, its tuples and their ids stay, so `runs`, `score_cycles`, `batch_submissions`, `bulk_operations` and the ledgers keep valid references.
+6. Delete the CV file and null `raw_text_enc` and `stripped_text` of its `cv_files` row if no retained version uses it; purge the draft content, including its extraction call's `output_json`.
+7. Final transaction: release the fence, mark the manifest `completed`.
 
-Only non-content audit metadata remains: ids, timestamps, usage numbers.
+Only non-content audit metadata remains: ids, timestamps, usage numbers. Identical content uploaded later becomes a new version with a new id (§12.6), and after a restore every new id lies above the ids the manifest stream names (§19.5), so an old manifest can never purge it.
 
-**Job tombstoning** for a job J (and every job merged into it):
-1. Check the exemptions: not saved or applied, no active golden case on any of its revisions.
-2. Target-set deletion for every target of J.
-3. Delete `merge_events` naming J, `identity_conflicts` naming J (or remove J from their candidates), and J's duplicate-group membership (the group re-elects or dissolves).
-4. Set `jobs.current_revision_id = NULL` (deferred), then delete the revisions (lineage, occurrences and `hard_filter_results` cascade) and the postings (observations and their `ad_key_sources` cascade). A key of J that other jobs' postings also supply is re-assigned to the job of its earliest remaining provenance row; J's other `ad_keys` are deleted.
-5. Write `job_tombstones` (user-action timestamps only, never notes) and `tombstone_keys` (hashed keys), then delete `user_job_actions` and the job.
+**Job tombstoning** for a batch of jobs (each job J with every job merged into it):
+1. Check the exemptions: not saved or applied, no **active** golden case on any of its revisions.
+2. Manifest and a `jobs` fence naming the batch.
+3. Target-set deletion for every target of J.
+4. Delete the **inactive** golden cases on J's revisions, with their `eval_case_results` and calls (cascade). `golden_cases.job_revision_id` restricts revision deletion, so this step must precede step 6; a job with an active case was excluded in step 1.
+5. Delete `merge_events` naming J, `identity_conflicts` naming J (or remove J from their candidates), and J's duplicate-group membership (the group re-elects or dissolves).
+6. Set `jobs.current_revision_id = NULL` (deferred), then delete the revisions (lineage, occurrences and `hard_filter_results` cascade) and the postings (observations and their `ad_key_sources` cascade). A key of J that other jobs' postings also supply is re-assigned to the job of its earliest remaining provenance row; J's other `ad_keys` are deleted.
+7. Write `job_tombstones` (user-action timestamps only, never notes) and `tombstone_keys` (hashed keys), then delete `user_job_actions` and the job.
+8. Final transaction: release the fence, mark the manifest `completed`.
 
-`resolve_identity` consults `tombstone_keys` before creating a job (§8.6 step 5), so a re-posted ad keeps its hidden or applied state.
+`resolve_identity` consults `tombstone_keys` before creating a job (§8.6 step 3), so a re-posted ad keeps its hidden or applied state.
 
-**Golden-case deletion** (user): delete the case and its `eval_case_results`; its job and profile version lose the exemption and follow normal retention.
+**Golden-case deletion** (user): with a manifest (`kind='golden_case_delete'`), delete the case; its `eval_case_results` and its eval calls cascade. Its job and profile version lose the exemption and follow normal retention.
 
 ### 20.3 Export
 
@@ -6089,45 +6365,68 @@ Only non-content audit metadata remains: ids, timestamps, usage numbers.
   - `runs.json` (reports);
   - a `README.txt`.
 - The zip is encrypted at rest with the data key. It is available for 7 days, and its download is logged by id. Any purge deletes every existing export (`status='purged'`), because an export may contain the purged content.
+- The export's final transaction (`running → ready`) takes `active_config` `FOR SHARE` and ends the export `purged` instead if any purge fence is active. A fence commits under `active_config` `FOR UPDATE`, so an export either became `ready` before the fence, and the purge deletes it, or it sees the fence (§20.2).
 
 ### 20.4 Delete everything
 
-The user types `DELETE EVERYTHING` and re-enters the password. The manifest (`kind='delete_everything'`) is written and fsync'd first, and then:
-1. Active runs, cycles, operations and batches are cancelled (`messages.batches.cancel` for submitted batches); the worker's admission-stop flag is set for the duration.
-2. These are deleted, in this order:
-   - every score target, via target-set deletion; then `eval_case_results`, `eval_runs` (their `llm_calls` cascade), `golden_cases`, `score_feedback`;
-   - `bulk_operations`, `batch_items`, `batch_submissions`, `admission_lane_credits`;
-   - jobs and their graph as in tombstoning steps 3–5, but without writing tombstones, and then every existing tombstone;
-   - fetch requests (their raw responses and raw items cascade), ATS snapshots, coverage intervals and cells, queries, watchlist entries and source instances other than the defaults;
-   - score cycles, runs and their attempts;
-   - profile vectors and query proposals; then, because no run, cycle, target or feedback references them any more, `llm_tuples`, and `profile_versions` together with `profile_drafts` (a deferred pair); then CV files and texts, and embeddings;
-   - settings versions: a new default version is inserted and activated first, then the old ones and the scope versions only they used are deleted;
-   - alerts, exports, checkpoints, idempotency records, operations;
-   - every session except the current one, which is logged out at the end.
-3. These are **kept**:
+The user types `DELETE EVERYTHING` and re-enters the password. A `purge` operation then runs:
+
+1. **Manifest and global fence.** One transaction holding `active_config` `FOR UPDATE` commits the manifest (`kind='delete_everything'`) and a `global` purge fence; the manifest file is fsync'd. The fence is the **persisted admission stop**: it survives a restart, and nothing new starts until the final transaction releases it.
+2. **Cancel live work**, each with an explicit, legal terminal mapping (§7.16):
+
+   | Live row | Transition before deletion |
+   |---|---|
+   | `runs` `queued`, `running` | `cancelled('delete_everything')` (§7.16.4) |
+   | `score_cycles` `running` | `failed('cancelled')` (§7.16.8) |
+   | `operations` `pending`, `running`, except this purge | `cancelled`, `claim_id := NULL`; a running coroutine fails its next claim check |
+   | `score_targets`, non-terminal | `cancelled('purged')`, by target-set deletion step 1 |
+   | `batch_submissions` `preparing` | `abandoned`; its ledger entries `reserved → not_billed(never_dispatched)` |
+   | `batch_submissions` `submit_started`, `submit_ambiguous` | `released`; its ledger entries `dispatched → ambiguous` (counted at their reservation) |
+   | `batch_submissions` `submitted`, `ended` | `cancel_requested_at := now()`; `messages.batches.cancel` after commit (3 tries, then logged); its unsettled ledger entries `dispatched → ambiguous` |
+   | `batch_submissions` `submit_rejected`, `released`, `reconciled`, `abandoned` | already terminal |
+   | `bulk_operations` `active` | `cancelled` |
+   | other `reserved` ledger entries | `not_billed(never_dispatched)`: their owners were cancelled before dispatch |
+   | other `dispatched` ledger entries (online calls in flight) | settle from their response, or become `ambiguous` after 15 minutes (§7.16.7) |
+
+   Every reservation of a deleted batch therefore stays counted at its maximum until the month closes, so the cap holds even if a cancel fails.
+3. **Delete**, in this order (each step's referencing rows are gone before the referenced rows):
+   1. every score target, via target-set deletion;
+   2. `eval_case_results`, `eval_runs` (their `llm_calls` cascade), `golden_cases` (their calls cascade), `score_feedback`;
+   3. every remaining `llm_calls` row (extraction and query-proposal calls; `profile_drafts.llm_call_id` and `query_proposals.llm_call_id` become NULL);
+   4. remaining `batch_items`, then `batch_submissions`, then `admission_lane_credits`, then `bulk_operations` (the ledger's `bulk_operation_id` becomes NULL);
+   5. jobs and their graph as in tombstoning steps 5–7, but without writing tombstones, and then every existing tombstone;
+   6. fetch requests (their raw responses and raw items cascade), ATS snapshots, coverage intervals and cells, queries, watchlist entries and source instances other than the defaults;
+   7. score cycles, runs and their attempts;
+   8. **re-point `active_config`** in one transaction holding it `FOR UPDATE`: insert and activate a new default settings version and its scope version, set `profile_version_id := NULL`, `llm_tuple_id := NULL`, `pending_scope_version_id := NULL`, and bump `ranking_state`;
+   9. profile vectors and query proposals; then `llm_tuples`; then `profile_versions` together with `profile_drafts` (a deferred pair); then CV files and texts, and unreferenced embeddings;
+   10. the old settings versions and the scope versions only they used;
+   11. alerts, exports, checkpoints, idempotency records, and every operation except this purge;
+   12. every session except the current one, which is logged out at the end.
+4. **Final transaction**: release the global fence and mark the manifest `completed`.
+5. These are **kept**:
    - the user account;
    - the quota and LLM spend ledgers, `llm_budget` and `quota_windows`, which hold no content and are needed so a later restart cannot exceed the windows or the cap;
    - the policy and config tables of §20.1 that hold no personal content;
    - `backup_sets`, `backup_runs`;
-   - the deletion manifests.
+   - the deletion manifests, their shipments and the purge fences (ids only).
 
 The UI states that backup sets age out within about 3 months, that the manifest replay prevents the data from returning on restore, and that the deletion is complete when it shows "confirmed offsite".
 
 ### 20.5 Adzuna purge
 
-`POST /api/privacy/purge-source {source: 'adzuna'}` handles termination of the Adzuna agreement:
-1. **Fence.** In one transaction: disable the Adzuna source, set `sources.purge_fence_at`, and write the manifest. From then on, `resolve_identity` refuses Adzuna items (`out_of_scope('source_purged')`, §8.6), so a run already in flight cannot ingest new Adzuna content, and any target cancelled below fences its late batch results.
+`POST /api/privacy/purge-source {source: 'adzuna'}` handles termination of the Adzuna agreement as a `purge` operation:
+1. **Fence.** One transaction holding `active_config` `FOR UPDATE` disables the Adzuna source, sets `sources.purge_fence_at`, cancels active runs (§7.16.4), and commits the manifest and a `source` fence for `adzuna`. From then on, `resolve_identity` refuses Adzuna items (`out_of_scope('source_purged')`, §8.6), and every job with an Adzuna posting or a tainted revision is fenced: no target is created, claimed or published for it, and no eval or export reads it, until step 6.
 2. **Find the tainted revisions** through lineage: every revision with a `job_revision_sources` row for `adzuna`. This covers historical and mixed-source revisions, not only current fields.
 3. **Purge derivatives**:
    - target-set deletion for every target of a tainted revision (results, drafts, critic notes, call outputs, evidence and det instances);
    - `det_results` of untainted revisions whose `det_inputs` name an Adzuna source (for example an Adzuna salary): deleted, and new current instances are computed from the remaining data;
-   - golden cases and eval case results on tainted revisions;
+   - golden cases on tainted revisions, active or not (the agreement overrides the exemption; the UI lists the deleted cases). Their `eval_case_results` **and their eval calls** are deleted with them (`llm_calls.golden_case_id ON DELETE CASCADE`). Any other evaluation call whose `input_refs` names a tainted revision is deleted explicitly. Eval runs keep only aggregate metrics, which hold no ad content;
    - every export.
 4. **Delete the source data**: every Adzuna posting (observations and key sources cascade), the `adzuna` keys, and the Adzuna fetch requests with their raw responses and items (the quota ledger keeps its rows, with `fetch_request_id := NULL`).
-5. **Rebuild** each affected job from its remaining postings: recompute the canonical fields; reuse or create a revision and target; delete the tainted revisions themselves; delete jobs that had only Adzuna postings, with their dependents (tombstoning steps 3–5, without tombstones).
-6. Mark the manifest `completed`; it is reported done when `shipped`.
+5. **Rebuild** each affected job from its remaining postings: recompute the canonical fields; reuse a revision only if its lineage names no Adzuna source; otherwise delete the job's tainted revisions first (`current_revision_id` is deferred) and insert a new revision, so a rebuilt revision with an identical `material_hash` is never the tainted one. Jobs that had only Adzuna postings are deleted with their dependents (tombstoning steps 4–7, without tombstones). No target is created here.
+6. **Final transaction**: release the fence and mark the manifest `completed`; it is reported done when `shipped`. The `missing_targets` reconciler then creates the targets of the rebuilt revisions (§17.4).
 
-Afterwards, no Adzuna-derived text, salary or score remains in the database, in exports or in any future restore.
+Afterwards, no Adzuna-derived text, salary or score remains in the database, in exports or in any future restore. `sources.purge_fence_at` stays set as the record that the source was purged; the disabled source can only be re-enabled by a new settings version.
 
 ### 20.6 PRIVACY.md (contents)
 
@@ -6196,7 +6495,9 @@ German text runs at about 4 characters per token, and an average ad is about 1,6
 - **Revisions**: after a first critic round, 35% of drafts are revised (`q1`), and 30% of those are revised again (`q2`). Every revision is followed by a critic round.
 - That gives **0.655 critic calls and 0.205 revise calls per target** (central); 0.459 / 0.109 (low: rate 0.35, `q1 = q2 = 0.25`) to 0.932 / 0.352 (high: rate 0.58, `q1 = 0.45`, `q2 = 0.35`). Structural repairs are assumed at 1% of generator calls.
 
-**Cache writes** happen once per score cycle per (model, effort) prefix: Sonnet/medium ($0.0113), Opus/medium ($0.0225) and, in about 80% of cycles, Opus/low ($0.0225), so about $0.052 per cycle. The USD bucket starts a cycle when it holds `min_cycle_targets × ĉ` (§6.9.2), so with the defaults a month has about 180 cycles (central), and cache writes cost about **$9.40** per month.
+**Cache writes.** The per-call costs below already charge every prefix as a cache **read**. A cycle's first call per (model, effort) prefix writes the cache instead, so it adds only the **write-minus-read** difference: Sonnet/medium `4,500 × ($2.50 − $0.20)` = $0.01035, Opus/medium `4,500 × ($5.00 − $0.20)` = $0.0216, and, in about 80% of cycles, Opus/low another $0.0216. That is **$0.04923 per cycle**. The USD bucket starts a cycle when it holds `min_cycle_targets × ĉ` (§6.9.2), so the model below assumes ten-target cycles: a month that scores `N` targets has about `N / 10` cycles. Actual cache expirations inside long cycles are a measured assumption.
+
+- In §21.1 the triggers are as specified by U14 plus revision 3: the always-reviewed text-asserted on-site requirements (§11.4) add to T5, while the German phrase mapping and the deterministic seniority repair (§11.6) remove T5 and T1 triggers. The net effect is assumed to be zero and is measured in week 1 (`critic_rate_7d`).
 
 ### 21.2 Per-call and per-target cost (config B, default)
 
@@ -6215,39 +6516,41 @@ German text runs at about 4 characters per token, and an average ad is about 1,6
 | Low | $0.0173 | $0.0149 | $0.0022 | $0.0002 | **$0.0346** |
 | High | $0.0293 | $0.0442 | $0.0114 | $0.0003 | **$0.0852** |
 | Same routing, outputs **not** slimmed | $0.0303 | — | — | — | $0.0709 |
-| Revision-1 routing (55% critic rate), not slimmed, all critic rounds `medium` | — | — | — | — | $0.0826 |
+| Revision-1 routing (55% critic rate), not slimmed, all critic rounds `medium` | — | — | — | — | $0.0825 |
 
-Slimming saves **$0.0183 per target (26%)** under the same routing; the narrowed triggers save a further $0.0117 against the revision-1 routing.
+Slimming saves **$0.0183 per target (25.75%, about 26%)** under the same routing; the narrowed triggers save a further $0.0116 against the revision-1 routing.
 
-Other configurations under the same routing and limits (central): **A** (all Opus/medium): generator $0.0437, revise $0.0497 → **$0.0793** per target. **C** (Haiku generator and reviser with a 30% tokenizer uplift, Sonnet critic; critic rate assumed 0.55 with `q1 = 0.45`, `q2 = 0.35`, because the weaker generator triggers more reviews): generator $0.0015, critic $0.0207 (`medium`) / $0.0157 (`low`), revise $0.0016 → **$0.0195** per target.
+Other configurations under the same routing and limits (central):
+- **A** — Opus/medium for every node, with the evaluation policy's light critic effort for T2/T8-only rounds: generator $0.0437, revise $0.0497 → **$0.0793** per target. With every critic round at `medium` (literally "all Opus/medium") it is $0.0808.
+- **C** — Haiku generator and reviser with a 30% tokenizer uplift, Sonnet critic with the same 35% light share; critic rate assumed 0.55 with `q1 = 0.45`, `q2 = 0.35`, because the weaker generator triggers more reviews: generator $0.0015, critic $0.0207 (`medium`) / $0.0157 (`low`), revise $0.0016 → **$0.0194** per target.
 
-**Check of Fable's estimate.** Fable's ≈ $0.042 per target is reproduced with the slim outputs when the first-round critic rate is **0.30** ($0.0424). At $95 of scoring budget that gives 2,242 ≈ 2,250 targets with no cache overhead, or about 2,020 after $9.40 of cache writes. With the critic rate derived above (0.45) the central cost is $0.0526, so Fable's 2,250 is optimistic by about 28%.
+**Check of Fable's estimate.** Fable's ≈ $0.042 per target corresponds to a first-round critic rate of **0.30**: $0.0426 per target including the 1% repair allowance. With the revision-3 scoring share of $93.10 (§21.3) that gives about 2,185 targets with no cache overhead, or about 1,960 with it. Against the central capacity of about 1,620 at the derived critic rate of 0.45, Fable's 2,250 aspiration is about **39% higher**; equivalently, the central capacity is about **28% below** it. Fable withdrew $0.042 as the central figure in round 2.
 
 ### 21.3 Monthly estimate under the $100 cap
 
-The scoring share is the cap minus the 5% non-scoring reserve: **$95**. The month's cache writes come out of it.
+The admissible budget is the cap minus the overrun buffer, $100 − $2 = $98 (§6.9.1); the non-scoring reserve is 5% of it ($4.90), and the **scoring share is $93.10**. Cache writes come out of the scoring share. Capacity is `93.10 / (per-target cost + 0.04923 / 10)`.
 
-| Config B | Per target | Cache writes | Targets scored per month under the cap | Cost of 3,000 targets/month (uncapped) |
-|---|---|---|---|---|
-| **Central** | $0.0526 | ≈ $9.40 | **≈ 1,630** | ≈ $158 + $9 cache |
-| Low | $0.0346 | ≈ $14.40 (more, smaller cycles) | ≈ 2,330 | ≈ $104 + $14 |
-| High | $0.0852 | ≈ $5.80 | ≈ 1,050 | ≈ $256 + $6 |
+| Config B | Per target | Cycles per month | Cache writes | Targets scored per month under the cap | Cost of 3,000 targets/month (uncapped: 300 cycles) |
+|---|---|---|---|---|---|
+| **Central** | $0.0526 | ≈ 162 | ≈ $7.96 | **≈ 1,620** | ≈ $157.94 + $14.77 cache = $172.71 |
+| Low | $0.0346 | ≈ 236 | ≈ $11.61 | ≈ 2,360 | ≈ $103.69 + $14.77 = $118.45 |
+| High | $0.0852 | ≈ 103 | ≈ $5.08 | ≈ 1,030 | ≈ $255.65 + $14.77 = $270.42 |
 
-- Config A supports about 1,100 targets per month under the cap (central, after cache writes); config C about 4,350.
-- **The cap binds** for config B at the council's volume assumption of 3,000 targets per month. Realistic unique full-text targets for one profile are 1,500–2,000 per month (Fable), so the central capacity of about 1,630 covers most of them; the rest stay `pending` (browsable with Score now) or expire visibly at `max_ad_age_days`.
-- **Pace.** The USD bucket accrues `$95 / month ≈ $0.13 per hour ≈ $3.12 per day`, which is about 60 targets per day at the central cost. A backlog therefore drains at that rate instead of exhausting the month early (§6.9.2).
+- Config A supports about 1,120 targets per month under the cap (central; its generator, reviser and medium critic share one Opus/medium cache entry); config C about 4,370.
+- **The cap binds** for config B at the council's volume assumption of 3,000 targets per month. Realistic unique full-text targets for one profile are 1,500–2,000 per month (Fable), so the central capacity of about 1,620 covers most of them; the rest stay `pending` (browsable with Score now) or expire visibly at `max_ad_age_days`.
+- **Pace.** The USD bucket accrues `$93.10 / month ≈ $0.127 per hour ≈ $3.06 per day`, which is about 53 targets per day at the central cost including cache writes. A backlog therefore drains at that rate instead of exhausting the month early (§6.9.2).
 
-**Fixed monthly extras (non-scoring reserve, $5.00)**:
+**Fixed monthly extras (non-scoring reserve, $4.90)**:
 
 | Item | Cost |
 |---|---|
 | Canaries (2 per day, production route, with their cache writes) | ≈ $3.80 |
-| Profile extraction | ≈ $0.14 per CV |
-| Query proposal | ≈ $0.10 each |
+| Profile extraction | ≈ $0.14 per CV (5,000 input × $4 + 6,000 output × $20 per MTok) |
+| Query proposal | ≈ $0.09 each |
 | Schema dry-run | < $0.10 per activation |
 | Golden-set eval run (50 cases, production route) | ≈ $2.70; the optional forced-critic diagnostic adds ≈ $1.70 |
 
-In a month with an eval run, non-scoring spend (≈ $6.80) exceeds the 5% reserve by about $2. Non-scoring calls may use the whole cap (§6.9.1), so the excess reduces the scoring headroom by the same amount. One canary per day instead of two halves that line.
+In a month with an eval run, non-scoring spend (≈ $6.80) exceeds the reserve by about $1.90. Non-scoring calls may use the whole admissible budget (§6.9.1), so the excess reduces the scoring headroom by the same amount. One canary per day instead of two halves that line.
 
 **Corrections to revision 1** (Codex #49). The revision-1 central B figure was exactly $0.057591 per target ($172.773 for 3,000, before extras), and A $0.086343 ($259.029). Its B range was $0.038510–0.088902 ($115.530–266.706), A $0.059030–0.126996, and C with the 30% Haiku uplift $0.0213998 ($64.20). Its cold batch bulk path was $17.825 + $32.291 = $50.116 per 1,000 ads, not about $49. Under the 5% reserve, revision 1's B supported about 1,650 central targets before cache writes, or about 1,563 after $5 of them, not 1,700. The extra critic rounds after each revision explained only $26.16 per month of the gap to the council envelope; the rest came from larger output and funnel assumptions.
 
@@ -6255,18 +6558,18 @@ In a month with an eval run, non-scoring spend (≈ $6.80) exceeds the 5% reserv
 
 | Path | Per ad | Per 1,000 ads |
 |---|---|---|
-| All online | $0.0526 | ≈ $52.60 |
-| Generator in Batches (50%; no cache reads assumed in batch: `6,700 × $1 + 1,700 × $5`) plus online follow-ups | $0.0152 + $0.0301 = $0.0453 | ≈ $45.30 |
+| All online | $0.0526 | ≈ $52.65 |
+| Generator in Batches at 50% prices, **cold cache** (the batch params keep the prefix cache marker, so the prefix is written, not read: `2,200 × $1 + 4,500 × $1.25 + 1,700 × $5`), plus online follow-ups (critic $0.0249, revise $0.0052) | $0.0163 + $0.0301 = $0.0464; with the 1% repair allowance $0.0467 | ≈ $46.45; ≈ $46.67 with repairs |
 
-**Sizing under the hard cap.** A batch item's worst-case reservation is about $0.0684 (an input bound of about 22,750 tokens at the batch cache-write price, plus 8,000 output tokens at the batch output price, §10.7), and each item also holds its funded follow-up allocation (0.45 × $0.0669 = $0.0301, §6.9.3), so about $0.0986 per item is held until the batch settles. With the default 40% bulk share:
-- at the start of a month (bulk budget $38.00) a first batch of about 385 ads fits, then, after it settles, a second of about 208;
-- with $38.20 already counted, of which about $37 is scoring (bulk budget ≈ $23.20), one batch of about 235 ads fits, and the remaining budget (about $12.50) is below the 200-item minimum.
+**Sizing under the hard cap.** A batch item's worst-case reservation uses the byte bound of §10.7. The assumed component sizes are: rubric 9.0 KB, profile 9.5 KB, role 1.3 KB, ad block 8.0 KB (German, with umlauts counted as two bytes), output schema 8.0 KB, plus the 1,000-token overhead floor. That is an input bound of about 36,800 tokens. At the batch cache-write price ($1.25/MTok) plus 6,000 output tokens at the batch output price ($5/MTok), the reservation is **$0.0760**. Each item also holds its expected follow-up allocation (0.45 × $0.0669 = $0.0301, §6.9.3), so about **$0.1061** per item is held until the batch settles. With the default 40% batch allocation:
+- **At the start of a month** the allocation is 40% × $93.10 = $37.24, so a first batch of about 350 ads fits. Once it settles at about $0.0464 per ad, about $20.98 remains, which fits 197 items. That is below the 200-item minimum, so no second batch is submitted.
+- **With $38.20 already counted** (about $37.00 of it scoring), the allocation is 40% × ($93.10 − $37.00) ≈ $22.44, so one batch of about 211 ads fits. About $12.64 remains, below the minimum.
 
 The remaining ads of a bulk re-score are scored online at the monthly pace. The confirmation dialog states both numbers before anything is spent (§15.7).
 
 ### 21.5 Cap behaviour and levers
 
-- **Pacing**: the spend ledger enforces the cap per HTTP try under the monthly budget lock (§6.9.1), with true upper-bound reservations (§10.7). The USD bucket paces scoring across the month (§6.9.2); it does not promise that scoring never stops early, but a backlog drains at the accrual rate and the oldest and exploration lanes keep their share through persistent lane credits (§9.6.2).
+- **Pacing**: the spend ledger enforces the cap per HTTP try under the monthly budget lock (§6.9.1), with byte-bounded reservations admitted against `cap − overrun_buffer` (§10.7). The USD bucket paces scoring across the month (§6.9.2); it does not promise that scoring never stops early, but a backlog drains at the accrual rate and the oldest and exploration lanes keep their share through persistent lane credits (§9.6.2).
 - **When the cap is reached**: scoring pauses, admitted targets become `budget_deferred`, unadmitted ones stay `pending`, a critical alert is raised, and Score now is disabled. Deferred targets resume as soon as settled reservations, a raised cap or the new month restore headroom (§6.9.4).
 - **Levers the user can pull** in Settings, each with a dry-run projection. The cost levers of U14 are already the defaults. Further levers:
 
@@ -6275,11 +6578,12 @@ The remaining ads of a bulk re-score are scored online at the monthly pace. The 
   | Generator effort `low` (only after golden-set parity, §11.13) | about −$0.004 per target |
   | `critic_light_triggers` adds T3 | about −$0.0006 per target |
   | `t8_sample_pct` 5 → 0 | about −$0.0015 per target, at the cost of the unbiased quality sample |
-  | `min_cycle_targets` 10 → 20 | cache writes ≈ $9.40 → $4.70 (about +90 targets per month), at the cost of scoring latency (a cycle about every 8 h instead of 4 h) |
-  | Preset C | ≈ $0.0195 per target, subject to the eval gate |
+  | `min_cycle_targets` 10 → 20 | cache writes ≈ $7.96 → $4.16 (about +70 targets per month), at the cost of scoring latency (a cycle about every 8 h instead of 4 h) |
+  | Preset C | ≈ $0.0194 per target, subject to the eval gate |
   | A higher cap, fewer queries or a narrower scope | fewer or cheaper targets |
 
 ---
+
 ## 22. Verification spikes (before or early in implementation)
 
 Each spike produces a short recorded result in `docs/spikes/` and, where relevant, a test. Paid calls are limited to the stated budget.
@@ -6297,18 +6601,20 @@ Each spike produces a short recorded result in `docs/spikes/` and, where relevan
 | V9 | JSearch page and date semantics: 1 credit per page; `date_posted` buckets filter correctly; cursor reusability across hours; per-second limit | ≤ 6 paid calls | Recorded fixtures prove each point. `cursor_reuse_ttl` is set from the observation (0 if not reusable). |
 | V10 | `htidocid` stability across days | The same JSearch query on 2 days (2 units, combinable with V9) | The overlapping ads have identical `job_uid` |
 | V11 | LangGraph `TimeoutPolicy` cancels an in-flight streaming gateway call and the gateway settles `ambiguous` | Unit and integration test with a fake slow stream | Cancellation happens within 1 s of the deadline; the ledger is `ambiguous`; no leaked tasks |
-| V12 | Batches: `custom_id` pattern; result `usage` present; errored and expired items unbilled; list API fields (`created_at`, `request_counts`); cache behaviour in batches; **list visibility lag** | A 3-item Haiku batch (< $0.01); list the workspace every 15 s right after `create` returns | Results are processed by the real code path, the fields needed by the §10.10 reconciliation exist, and the new batch is listed within `BATCH_LIST_VISIBILITY_LAG` (5 min); otherwise the constant is raised to twice the observed lag |
+| V12 | Batches: `custom_id` pattern; result `usage` present; errored and expired items unbilled; the list API fields (`created_at`, `request_counts`) that the §10.10 matching rule uses; cache behaviour in batches | A 3-item Haiku batch (< $0.01), then a workspace listing | Results are processed by the real code path, and the fields needed by the §10.10 reconciliation exist. The listing is used only to **find** a batch; an empty listing is never treated as proof of absence (chair decision C3), so no visibility-lag constant is measured or used |
 | V13 | `with_structured_output(method="json_schema", include_raw=True)` with `streaming=True` exposes `stop_reason`, `stop_details`, the served `model` and the cache usage fields | 2 calls (Sonnet, Opus) with payload capture | The fields are present in `raw.response_metadata` / `usage_metadata`. The request carries `output_config.format` and `effort`, and no `tool_choice`. |
 | V14 | Prompt cache hits per (model, effort) with the §10.6 layout | 2 identical-prefix calls per model | The second call has `cache_read_input_tokens ≥ 4,000` |
 | V15 | healthchecks Management API timeout/grace update, and ntfy publish with a token | Calls against the user's accounts at deployment | The check shows the updated timeout and grace; an ntfy test notification arrives |
 | V16 | The TypeScript 7.0.2 toolchain (Vite 8 plugin, eslint, openapi-typescript) | Build the frontend | A clean build and lint. Otherwise stay on TypeScript 5.9.3. |
 | V17 | Gazetteer coverage of real location strings | Run the location parser over the scrubbed fixtures | ≥ 95% of German city strings resolve; no false "outside Germany" |
 | V18 | Adzuna `results_per_page=50` cap, `max_days_old`, `distance` semantics | ≤ 5 calls | Recorded fixtures confirm them |
-| V19 | The input bound of §10.7 is an upper bound: token-counting endpoint behaviour (no token charge, document blocks supported) and the protocol/schema overhead per model | `messages.count_tokens` on 30 recorded generator, critic and profile requests per model, compared with the `usage` of the matching recorded responses (no new paid calls) | For every request, `usage` input + cache tokens ≤ the computed bound; `PROMPT_OVERHEAD_TOKENS[model]` is set to twice the largest observed overhead; native-PDF counting works or the native-PDF path is disabled |
+| V19 | The text input bound of §10.7 (chair decision C1): the tokenizer emits **at most one token per UTF-8 byte** for every rendered component, and the fixed per-request overhead per model | For 30 recorded generator, critic and profile requests per model, German and English, including umlauts, `ß`, typographic quotes and dashes: `messages.count_tokens` (free) for each component on its own and for the whole request, compared with the `usage` of the matching recorded responses (no new paid calls) | Every component has tokens ≤ bytes, and every recorded `usage` input + cache tokens ≤ the computed bound. `PROMPT_OVERHEAD_TOKENS[model]` = 2 × the largest framing overhead observed (whole-request tokens − Σ component tokens). For native PDF, `count_tokens` accepts the document block and recorded usage ≤ 1.25 × its count; otherwise the native-PDF path stays disabled. A violation of tokens ≤ bytes applies the §10.7 factor rule and restates S3 |
 | V20 | Client IP through Caddy | Compose test stack: requests from two client addresses, with and without a spoofed `X-Forwarded-For` | `login_attempts.ip` and `sessions.ip` record the real addresses; the spoofed header is ignored (test N2) |
 | V21 | The no-egress boundary | Compose test stack on the target VPS image with the `DOCKER-USER` rule installed | From `api` and `docparse`, DNS and TCP connections to an outside address fail; from `worker` they succeed (test N1) |
+| V22 | Secret delivery and the non-superuser restore (§19.2, §19.5) | Compose test stack with every secret file `root:10010`, mode 0440; a backup set, then a manifest created after it | Every app service passes `startup-check`. `pg_restore --no-owner --no-acl --exit-on-error` with the filtered list succeeds as the migrator and, into a database created from `jobhunter_template`, as `jobhunter_restore`. Both `restore verify` phases pass; the post-dump manifest's ids are absent after replay, and every identity restarts above its `max_ids` |
 
 ---
+
 ## 23. Deferred / deployment-time items
 
 These are decided by the user at deployment. Each has a defined place in the configuration, and none blocks implementation.
