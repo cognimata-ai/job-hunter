@@ -5,7 +5,6 @@ from collections.abc import Sequence
 from typing import get_args
 
 from jobhunter.config import Role, startup_or_exit
-from jobhunter.db.migrate import run_migrate
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -26,6 +25,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         startup_or_exit(args.role)
         return 0
     if args.command == "migrate":
+        # Imported here: migrate pulls in procrastinate, langgraph and alembic, which `startup-check` (the
+        # healthcheck path of every container) must not load.
+        from jobhunter.db.migrate import run_migrate
+
         run_migrate(startup_or_exit("migrate"))
         return 0
     parser.error(f"unknown command {args.command!r}")

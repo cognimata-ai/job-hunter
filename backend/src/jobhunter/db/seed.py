@@ -15,7 +15,7 @@ from importlib import resources
 from typing import Final, Literal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import TextClause
+from sqlalchemy import RowMapping, TextClause
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
@@ -65,6 +65,11 @@ def local_anchor_to_utc(day: date, hhmm: str, tz: str) -> datetime:
     return local.astimezone(UTC)
 
 
+def anchor_utc_for(now: datetime, hhmm: str, tz: str) -> datetime:
+    """The anchor `hhmm` on the date it is at `now` in the zone `tz` (not the UTC date), as UTC."""
+    return local_anchor_to_utc(now.astimezone(ZoneInfo(tz)).date(), hhmm, tz)
+
+
 def latest_slot_at_or_before(anchor: datetime, interval_s: int, t: datetime) -> datetime:
     """The latest schedule slot (`anchor` plus any whole number of intervals) that is not after `t`."""
     if interval_s <= 0:
@@ -111,15 +116,15 @@ async def _ensure_hashed(
     return await _ensure_id(conn, select, insert, {"hash": digest}, {"hash": digest, "payload": payload})
 
 
-async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
-    """Write the default settings chain, `active_config`, `schedule_state` and `ranking_state`.
+_STORED_SETTINGS_V1 = q("SELECT id, payload FROM settings_versions WHERE version_no = 1")
 
-    Idempotent and never an overwrite: a derived row is found by its hash and a settings version by its
-    number, and the three single rows are inserted only when absent, so a second call with another `now`
-    changes nothing. The caller owns the transaction.
-    """
-    if now.tzinfo is None:
-        raise ValueError("now must be timezone-aware")
+
+async def _stored_settings_v1(conn: AsyncConnection) -> RowMapping | None:
+    return (await conn.execute(_STORED_SETTINGS_V1)).mappings().first()
+
+
+async def _insert_settings_v1(conn: AsyncConnection) -> None:
+    """Derive the rows of the packaged defaults and insert settings version 1 over them."""
     settings = load_settings_v1()
 
     scope_id = await _ensure_hashed(conn, "scope_versions", scope_payload(settings))
@@ -140,17 +145,14 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
         {"hash": evaluation_digest, "payload": evaluation, "rate": DEFAULT_PROJECTED_CRITIC_RATE},
     )
 
-    settings_id = await _ensure_id(
-        conn,
-        q("SELECT id FROM settings_versions WHERE version_no = 1"),
+    await conn.execute(
         q(
             "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, "
             "model_policy_id, execution_config_id, evaluation_policy_id, effect_classes) "
             "VALUES (1, :schema_version, :payload, :scope_id, :model_id, :execution_id, :evaluation_id, "
-            "'{none}') ON CONFLICT DO NOTHING RETURNING id",
+            "'{none}') ON CONFLICT DO NOTHING",
             jsonb=["payload"],
         ),
-        {},
         {
             "schema_version": SETTINGS_SCHEMA_VERSION,
             "payload": settings,
@@ -160,6 +162,30 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
             "evaluation_id": evaluation_id,
         },
     )
+
+
+async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
+    """Write the default settings chain, `active_config`, `schedule_state` and `ranking_state`.
+
+    Idempotent and never an overwrite. Settings version 1 is frozen once stored: the derived rows (scope,
+    model policy, execution config, evaluation policy) and the version are created from the packaged
+    defaults only when version 1 does not exist yet. Afterwards a release that edits `settings_v1.json`
+    changes nothing here, and the three single rows below are created, when absent, from the STORED version 1
+    and the pointers it holds (`settings_versions` carries all four: scope, model policy, execution config and
+    evaluation policy), never from the file. So a second call with another `now` changes nothing. The caller
+    owns the transaction.
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+
+    stored = await _stored_settings_v1(conn)
+    if stored is None:
+        await _insert_settings_v1(conn)
+        stored = await _stored_settings_v1(conn)
+        if stored is None:
+            raise LookupError("settings version 1 is missing right after its insert")
+    settings_id = int(stored["id"])
+    settings = get_object(stored["payload"], "")
 
     # The active pointers are those of the settings version they activate, so the two cannot disagree.
     # The profile, tuple, rubric and prompt-schema pointers stay NULL until M2.
@@ -173,10 +199,9 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
         {"settings_id": settings_id},
     )
 
-    timezone = get_str(settings, "display.timezone")
     interval_s = get_int(settings, "schedule.interval_hours") * _SECONDS_PER_HOUR
-    anchor_utc = local_anchor_to_utc(
-        now.astimezone(ZoneInfo(timezone)).date(), get_str(settings, "schedule.anchor_local"), timezone
+    anchor_utc = anchor_utc_for(
+        now, get_str(settings, "schedule.anchor_local"), get_str(settings, "display.timezone")
     )
     await conn.execute(
         q(

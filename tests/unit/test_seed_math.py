@@ -2,6 +2,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 from jobhunter.db.seed import (
+    anchor_utc_for,
     canonical_json,
     latest_slot_at_or_before,
     load_settings_v1,
@@ -118,3 +119,20 @@ def test_latest_slot_rejects_a_non_positive_interval() -> None:
     now = datetime(2026, 10, 16, 4, 0, tzinfo=UTC)
     with pytest.raises(ValueError, match="interval_s"):
         latest_slot_at_or_before(now, 0, now)
+
+
+def test_the_anchor_follows_the_local_date_of_now_not_the_utc_date() -> None:
+    # 23:30 UTC on the 16th is 01:30 on the 17th in Berlin (CEST): the anchor is 06:00 CEST of the 17th, and
+    # the latest slot at or before `now` is the previous one.
+    now = datetime(2026, 10, 16, 23, 30, tzinfo=UTC)
+    anchor = anchor_utc_for(now, "06:00", "Europe/Berlin")
+    assert anchor == datetime(2026, 10, 17, 4, 0, tzinfo=UTC)
+    assert latest_slot_at_or_before(anchor, 21600, now) == datetime(2026, 10, 16, 22, 0, tzinfo=UTC)
+    # The local midnight is the boundary: 00:00 CET on 2 December is 23:00 UTC on the 1st.
+    winter = "06:00", "Europe/Berlin"
+    assert anchor_utc_for(datetime(2026, 12, 1, 22, 59, tzinfo=UTC), *winter) == datetime(
+        2026, 12, 1, 5, 0, tzinfo=UTC
+    )
+    assert anchor_utc_for(datetime(2026, 12, 1, 23, 0, tzinfo=UTC), *winter) == datetime(
+        2026, 12, 2, 5, 0, tzinfo=UTC
+    )
