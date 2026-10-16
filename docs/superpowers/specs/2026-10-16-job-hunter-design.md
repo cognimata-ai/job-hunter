@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Council-approved — revision 3.3 (approved by Codex GPT-6 Astra and Claude Fable 5.1 after six rounds of 4-eyes review, with the chair's decisions on three items, §2.4); awaiting the user's final review |
+| Status | **Approved** — revision 3.3. Approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Audit trail: `docs/council/` |
 | Date | 2026-10-16 |
 | Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, the user's cost decision of revision 2 (§2.1 U14), and the chair's decisions of revision 3 (§2.4) |
 | Scope | One deployment for one user, German job market |
