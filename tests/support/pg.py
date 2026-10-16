@@ -22,6 +22,7 @@ from urllib.parse import quote
 import psycopg
 import pytest
 from jobhunter.config import ENV_PREFIXES, ROLE_SECRETS, AppConfig, Role, load_config
+from psycopg.rows import TupleRow
 
 PgRole = Literal["superuser", "migrator", "app", "backup", "restore"]
 
@@ -402,3 +403,55 @@ def pg_one(
     """The first row of `statement` run as `role`, or `None` for a statement without rows."""
     rows = pg_rows(server, role, statement, *params, db=db)
     return rows[0] if rows else None
+
+
+def _insert_id(conn: psycopg.Connection[TupleRow], statement: str, *params: object) -> int:
+    row = conn.execute(statement, params).fetchone()
+    if row is None:
+        raise LookupError(f"no id returned by: {statement}")
+    return int(row[0])
+
+
+def ensure_config_rows(conn: psycopg.Connection[TupleRow]) -> tuple[int, int]:
+    """Make sure a settings version exists; return `(settings_version_id, scope_version_id)` of the lowest.
+
+    When `settings_versions` is empty it inserts a minimal chain (a scope, model, execution and evaluation
+    version with random hashes and an empty payload, and a settings version over them). Nothing is committed:
+    the caller's transaction decides.
+    """
+    lowest = conn.execute("SELECT id, scope_version_id FROM settings_versions ORDER BY id LIMIT 1").fetchone()
+    if lowest is None:
+        scope_id = _insert_id(
+            conn,
+            "INSERT INTO scope_versions (scope_hash, payload) VALUES (%s, '{}') RETURNING id",
+            os.urandom(32),
+        )
+        model_id = _insert_id(
+            conn,
+            "INSERT INTO model_policies (policy_hash, payload) VALUES (%s, '{}') RETURNING id",
+            os.urandom(32),
+        )
+        execution_id = _insert_id(
+            conn,
+            "INSERT INTO execution_configs (config_hash, payload) VALUES (%s, '{}') RETURNING id",
+            os.urandom(32),
+        )
+        evaluation_id = _insert_id(
+            conn,
+            "INSERT INTO evaluation_policies (version_no, policy_hash, payload, projected_critic_rate) "
+            "VALUES ((SELECT coalesce(max(version_no), 0) + 1 FROM evaluation_policies), %s, '{}', 0) "
+            "RETURNING id",
+            os.urandom(32),
+        )
+        settings_id = _insert_id(
+            conn,
+            "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, "
+            "model_policy_id, execution_config_id, evaluation_policy_id, effect_classes) "
+            "VALUES (1, 1, '{}', %s, %s, %s, %s, ARRAY['none']) RETURNING id",
+            scope_id,
+            model_id,
+            execution_id,
+            evaluation_id,
+        )
+        return settings_id, scope_id
+    return int(lowest[0]), int(lowest[1])
