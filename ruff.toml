@@ -26,5 +26,6 @@ select = ["E", "F", "W", "I", "B", "BLE", "UP", "S", "TID", "ASYNC", "RUF", "DTZ
 "backend/src/jobhunter/worker/heartbeat.py" = ["BLE001"]
 "backend/src/jobhunter/api/edge.py" = ["BLE001"]
 "backend/src/jobhunter/api/errors.py" = ["BLE001"]
+"backend/src/jobhunter/observability/redact.py" = ["BLE001"]
 "tests/**" = ["S101", "S105", "S106", "S603", "S607"]
 "scripts/**" = ["S603", "S607"]

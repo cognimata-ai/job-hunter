@@ -246,13 +246,22 @@ def test_mask_text_is_bounded_on_adversarial_input() -> None:
         started = time.perf_counter()
         out = mask_text(text)
         assert time.perf_counter() - started < 1.0
-        assert out.endswith("…[TRUNCATED]") and len(out) < 20_000
+        assert "…[TRUNCATED]…" in out and len(out) < 20_000
 
 
 def test_strings_up_to_the_cap_are_not_truncated() -> None:
     at_cap = "ab " * 5461 + "a"  # 16384 characters, no secret-shaped run
     assert len(at_cap) == 16_384 and mask_text(at_cap) == at_cap
-    assert mask_text(at_cap + "b").endswith("…[TRUNCATED]")
+    assert "…[TRUNCATED]…" in mask_text(at_cap + "b")
+
+
+def test_long_strings_keep_their_head_and_their_tail() -> None:
+    head = "Traceback (most recent call last):\n"
+    tail = "ValueError: the final line, reply to max@example.org"
+    out = mask_text(head + "  File filler, in frame\n" * 5000 + tail)
+    assert out.startswith(head) and out.endswith("ValueError: the final line, reply to [EMAIL]")
+    assert out.count("…[TRUNCATED]…") == 1 and len(out) <= 16_384 + len("…[TRUNCATED]…")
+    assert out.index("…[TRUNCATED]…") == 8192
 
 
 def test_emails_with_long_or_uuid_local_parts_are_masked() -> None:
@@ -327,3 +336,82 @@ def test_registered_values_apply_to_rendered_log_lines() -> None:
     get_logger("t").info("calling", url=f"https://x/y/{ADZUNA_KEY}")
     logging.getLogger("lib").warning("oops %s", ADZUNA_KEY)
     assert ADZUNA_KEY not in buf.getvalue() and buf.getvalue().count("[SECRET]") == 2
+
+
+def test_encoded_forms_of_registered_values_are_masked_too() -> None:
+    value = "Zm9vYmFy+/Zm9vYmFy=="
+    redact.register_secret_values([value])
+    dsn = "postgresql://jobhunter_app:Zm9vYmFy%2B%2FZm9vYmFy%3D%3D@db.internal:5432/jobhunter"
+    assert mask_text(dsn) == "postgresql://jobhunter_app:[SECRET]@db.internal:5432/jobhunter"
+    assert mask_text(f"raw {value}") == "raw [SECRET]"
+
+
+def test_plus_and_percent_encoded_spaces_are_both_registered() -> None:
+    redact.register_secret_values(["pass word value"])
+    assert mask_text("a=pass+word+value&b=pass%20word%20value&c=pass word value") == (
+        "a=[SECRET]&b=[SECRET]&c=[SECRET]"
+    )
+
+
+class Unprintable:
+    def __str__(self) -> str:
+        raise RuntimeError("detail with max@example.org")
+
+
+def test_self_referencing_containers_log_without_raising_and_render_recursion() -> None:
+    buf = io.StringIO()
+    configure_logging("INFO", stream=buf)
+    items: list[object] = ["a"]
+    items.append(items)
+    mapping: dict[str, object] = {"k": 1}
+    mapping["me"] = mapping
+    get_logger("t").info("cycles", items=items, mapping=mapping)
+    line = json.loads(buf.getvalue())
+    assert line["items"] == ["a", "[RECURSION]"]
+    assert line["mapping"] == {"k": 1, "me": "[RECURSION]"}
+
+
+def test_containers_nested_deeper_than_32_levels_are_cut_off() -> None:
+    deep: object = "bottom"
+    for _ in range(40):
+        deep = [deep]
+    node = redact_event(None, "info", {"event": "x", "deep": deep})["deep"]
+    levels = 0
+    while isinstance(node, list):
+        node, levels = node[0], levels + 1
+    assert levels == 32 and node == "[RECURSION]"
+
+
+def test_a_container_that_appears_twice_without_a_cycle_is_rendered_both_times() -> None:
+    shared = ["max@example.org"]
+    ev = redact_event(None, "info", {"event": "x", "a": shared, "b": [shared, shared]})
+    assert ev["a"] == ["[EMAIL]"] and ev["b"] == [["[EMAIL]"], ["[EMAIL]"]]
+
+
+def test_a_redaction_failure_yields_a_fail_closed_event_without_other_fields() -> None:
+    ev = redact_event(
+        None,
+        "info",
+        {"event": "x", "ts": "T", "level": "info", "logger": "t", "bad": Unprintable(), "other": "kept?"},
+    )
+    assert ev == {
+        "ts": "T",
+        "level": "info",
+        "logger": "t",
+        "event": "redaction_failed",
+        "error_type": "RuntimeError",
+    }
+    assert redact_event(None, "info", {"event": "x", "bad": Unprintable()}) == {
+        "event": "redaction_failed",
+        "error_type": "RuntimeError",
+    }
+
+
+def test_a_redaction_failure_in_a_log_call_renders_only_the_fail_closed_event() -> None:
+    buf = io.StringIO()
+    configure_logging("INFO", stream=buf)
+    get_logger("t").info("hello", bad=Unprintable(), other="max@example.org")
+    line = json.loads(buf.getvalue())
+    assert line.keys() == {"ts", "level", "logger", "event", "error_type"}
+    assert line["event"] == "redaction_failed" and line["error_type"] == "RuntimeError"
+    assert line["logger"] == "t" and "detail" not in buf.getvalue() and "example.org" not in buf.getvalue()
