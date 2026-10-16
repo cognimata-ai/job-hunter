@@ -684,3 +684,9 @@ def test_bearer_and_basic_in_prose_stay_but_credentials_are_masked() -> None:
     # After an `Authorization` header name, any credential is masked, however it looks.
     assert mask_text("authorization=bearer abcdefgh") == "authorization=bearer [REDACTED]"
     assert mask_text("Authorization : Basic dXNlcjpwYXNz") == "Authorization : Basic [REDACTED]"
+
+
+def test_quoted_authorization_header_values_are_redacted_whole() -> None:
+    assert mask_text("{'Authorization': 'Basic dXNlcjpwYXNz'}") == "{'Authorization': '[REDACTED]'}"
+    assert mask_text('{"authorization": "Basic dXNlcjpwYXNz"}') == '{"authorization": "[REDACTED]"}'
+    assert mask_text('{\\"Authorization\\": \\"Bearer abcdefgh\\"}') == '{\\"Authorization\\": \\"[REDACTED]'

@@ -84,6 +84,8 @@ _SECRET_PARAMETERS: Final = (
     "secret",
     "client_secret",
     "password",
+    # The text form of a header mapping: `{'Authorization': 'Basic …'}`.
+    "authorization",
 )
 _PARAMETER_NAMES = "|".join(_SECRET_PARAMETERS)
 QUERY_SECRET = re.compile(rf"(?i)([?&](?:{_PARAMETER_NAMES})=)[^&\s'\"#]+")
