@@ -59,9 +59,8 @@ def reconciler(name: str, *cadences: Cadence) -> Callable[[ReconcilerFn], Reconc
     return register
 
 
-async def _persist_failure(ctx: ReconcileContext, name: str, exc: Exception) -> None:
+async def _persist_failure(ctx: ReconcileContext, name: str, error_class: str) -> None:
     """Raise (or count one more occurrence of) the alert for `name`, in a transaction of its own."""
-    error_class = type(exc).__name__
     async with ctx.engine.begin() as conn:
         await raise_alert(
             conn,
@@ -71,12 +70,30 @@ async def _persist_failure(ctx: ReconcileContext, name: str, exc: Exception) -> 
             message=f"reconciler {name} failed",
             context={"reconciler": name, "error_class": error_class},
         )
-    # Not the exception's message and not its traceback: either may carry content.
-    log.error("reconciler_failed", reconciler=name, error_class=error_class)
+
+
+async def _resolve_failure(ctx: ReconcileContext, name: str) -> None:
+    async with ctx.engine.begin() as conn:
+        await resolve_alert(conn, code=FAILED_ALERT_CODE, subject=name)
+
+
+async def _record_alert_outcome(name: str, write: Awaitable[None]) -> None:
+    """Await the alert `write` of reconciler `name`; a failure of it is logged and does not propagate."""
+    try:
+        await write
+    except Exception as exc:
+        log.error("reconciler_alert_write_failed", reconciler=name, error_class=type(exc).__name__)
 
 
 async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, int]:
-    """Run the reconcilers of `cadence`; the repaired count of each by name, `-1` for one that failed."""
+    """Run the reconcilers of `cadence`; the repaired count of each by name, `-1` for one that failed.
+
+    A reconciler that raises is logged as `reconciler_failed` first, then recorded as the alert. When the
+    alert write (or the resolution of an earlier alert) fails in turn, that is logged as
+    `reconciler_alert_write_failed`: the database that would hold the outcome is the one that failed, so the
+    log line is the outcome left. It does not stop the reconcilers that follow, and the `-1` is still
+    recorded. Neither log line carries an exception message.
+    """
     counts: dict[str, int] = {}
     for name, (cadences, fn) in list(REGISTRY.items()):
         if cadence not in cadences:
@@ -84,11 +101,13 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
         try:
             counts[name] = await fn(ctx)
         except Exception as exc:
-            await _persist_failure(ctx, name, exc)
             counts[name] = -1
-            continue
-        async with ctx.engine.begin() as conn:
-            await resolve_alert(conn, code=FAILED_ALERT_CODE, subject=name)
+            error_class = type(exc).__name__
+            # Not the exception's message and not its traceback: either may carry content.
+            log.error("reconciler_failed", reconciler=name, error_class=error_class)
+            await _record_alert_outcome(name, _persist_failure(ctx, name, error_class))
+        else:
+            await _record_alert_outcome(name, _resolve_failure(ctx, name))
     return counts
 
 

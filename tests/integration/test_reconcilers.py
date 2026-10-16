@@ -46,3 +46,59 @@ async def test_failure_is_persisted_isolated_and_resolved(engine, queue_app, mon
                 sa.text("SELECT count(*) FROM alerts WHERE code='reconciler.failed' AND resolved_at IS NULL")
             )
         ).scalar_one() == 0
+
+
+async def test_alert_write_failure_is_logged_and_does_not_stop_the_other_reconcilers(
+    engine, queue_app, monkeypatch, caplog
+) -> None:
+    async def flaky(ctx: r.ReconcileContext) -> int:
+        raise RuntimeError("detail that must not be stored")
+
+    async def ok(ctx: r.ReconcileContext) -> int:
+        return 3
+
+    async def broken_raise_alert(*args, **kwargs):
+        raise ConnectionError("alert write detail that must not be logged")
+
+    monkeypatch.setattr(r, "REGISTRY", {})
+    r.reconciler("flaky", "tick")(flaky)
+    r.reconciler("ok", "tick")(ok)
+    monkeypatch.setattr(r, "raise_alert", broken_raise_alert)
+    ctx = r.ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=1)
+    assert await r.run_reconcilers(ctx, "tick") == {"flaky": -1, "ok": 3}
+    events = [record.msg["event"] for record in caplog.records if isinstance(record.msg, dict)]
+    # The failure itself is logged first, then the failed attempt to persist it.
+    assert events.index("reconciler_failed") < events.index("reconciler_alert_write_failed")
+    logged = next(
+        rec.msg for rec in caplog.records if rec.msg.get("event") == "reconciler_alert_write_failed"
+    )
+    assert (logged["reconciler"], logged["error_class"]) == ("flaky", "ConnectionError")
+    assert "must not be" not in caplog.text
+    async with engine.connect() as c:
+        assert (await c.execute(sa.text("SELECT count(*) FROM alerts"))).scalar_one() == 0
+
+
+async def test_resolve_failure_is_logged_and_does_not_stop_the_other_reconcilers(
+    engine, queue_app, monkeypatch, caplog
+) -> None:
+    async def first(ctx: r.ReconcileContext) -> int:
+        return 1
+
+    async def second(ctx: r.ReconcileContext) -> int:
+        return 2
+
+    async def broken_resolve_alert(*args, **kwargs):
+        raise ConnectionError("resolve detail that must not be logged")
+
+    monkeypatch.setattr(r, "REGISTRY", {})
+    r.reconciler("first", "tick")(first)
+    r.reconciler("second", "tick")(second)
+    monkeypatch.setattr(r, "resolve_alert", broken_resolve_alert)
+    ctx = r.ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=1)
+    assert await r.run_reconcilers(ctx, "tick") == {"first": 1, "second": 2}  # both succeeded
+    failed = [rec.msg for rec in caplog.records if rec.msg.get("event") == "reconciler_alert_write_failed"]
+    assert [(m["reconciler"], m["error_class"]) for m in failed] == [
+        ("first", "ConnectionError"),
+        ("second", "ConnectionError"),
+    ]
+    assert "must not be" not in caplog.text

@@ -10,14 +10,20 @@ Task bodies are stubs here (they log `task_stub`); Tasks 10 to 13 fill them in. 
 and reads its inputs from the `WorkerRuntime` in `context.additional_context["runtime"]`.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
+
+A process has one task app, and the first call of `make_queue_app` wins: it fixes the app's DSN and its pool's
+`max_size`, and a later call with the same DSN returns that app whatever `max_size` it passes. (Adding the
+blueprint to an app namespaces its tasks, so it can be added once.) `_reset_task_app` undoes that for tests.
 """
 
 from collections.abc import Mapping
 from typing import Final, Literal, Protocol
 
 import procrastinate
-from procrastinate.exceptions import AlreadyEnqueued
+from procrastinate.exceptions import AlreadyEnqueued, ConnectorException, NoResult, UniqueViolation
 from procrastinate.job_context import JobContext
+from procrastinate.jobs import Job, Status
+from procrastinate.manager import QUEUEING_LOCK_CONSTRAINT, JobManager
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
@@ -101,6 +107,22 @@ def make_queue_app(dsn: str, *, max_size: int = 4) -> procrastinate.App:
     return _new_app(dsn, max_size)
 
 
+def _reset_task_app() -> None:
+    """Forget the task app and give the blueprint back its plain task names. Test-only: nothing uses it yet.
+
+    For an in-process test that needs a task app of its own (another DSN or pool size) after one was made.
+    The app that was returned earlier keeps working on its own connector, but its tasks are no longer
+    registered with the blueprint.
+    """
+    global _task_app, _task_dsn
+    prefix = f"{TASK_NAMESPACE}:"
+    for task in set(blueprint.tasks.values()):
+        task.name = task.name.removeprefix(prefix)
+        task.blueprint = blueprint
+    blueprint.tasks = {name.removeprefix(prefix): task for name, task in blueprint.tasks.items()}
+    _task_app = _task_dsn = None
+
+
 def task_app() -> procrastinate.App:
     """The task app that `make_queue_app` created in this process."""
     if _task_app is None:
@@ -167,18 +189,79 @@ async def live_job_exists(
     return bool(result.scalar_one())
 
 
+# The statuses that `procrastinate_retry_job_v2` accepts (it raises for any other) and that
+# `procrastinate_finish_job_v1` accepts.
+_RETRYABLE: Final = (Status.DOING, Status.FAILED)
+_FINISHABLE: Final = (Status.TODO, Status.DOING)
+
+type _Outcome = Literal["released", "superseded", "not_retryable"]
+
+_OUTCOME_EVENTS: Final[Mapping[_Outcome, str]] = {
+    "released": "stalled_job_released",
+    "superseded": "stalled_job_superseded",
+    "not_retryable": "stalled_job_not_retryable",
+}
+
+
+async def _has_left(manager: JobManager, job_id: int, statuses: tuple[Status, ...]) -> bool:
+    """Whether the job is gone or is in none of `statuses`, i.e. a failed state change was a lost race."""
+    try:
+        return await manager.get_job_status_async(job_id) not in statuses
+    except NoResult:
+        return True
+
+
+async def _release_one(manager: JobManager, job: Job) -> _Outcome:
+    """Retry `job`, or fail it when its queueing lock is taken, or leave it when it is no longer stalled.
+
+    Only these two failures of the retry are expected; any other error propagates. A retry raises
+    `UniqueViolation` (on the queueing-lock index) when a waiting job holds the job's queueing lock, and
+    `ConnectorException` (an SQL `RAISE`) when the job is not in `doing` or `failed` any more.
+    """
+    if job.id is None:
+        raise TypeError("a stalled job from the manager has no id")
+    try:
+        await manager.retry_job(job)
+    except UniqueViolation as exc:
+        if exc.constraint_name != QUEUEING_LOCK_CONSTRAINT:
+            raise
+    except ConnectorException:
+        if not await _has_left(manager, job.id, _RETRYABLE):
+            raise
+        return "not_retryable"
+    else:
+        return "released"
+    # The waiting job with the same queueing lock supersedes this one: it is what the lock exists to allow.
+    try:
+        await manager.finish_job(job, Status.FAILED, delete_job=False)
+    except ConnectorException:
+        if not await _has_left(manager, job.id, _FINISHABLE):
+            raise
+        return "not_retryable"
+    return "superseded"
+
+
 async def release_stalled_jobs(app: procrastinate.App, *, seconds_since_heartbeat: float = 60.0) -> int:
     """Retry every job in `doing` whose worker has had no heartbeat for `seconds_since_heartbeat`; the count.
 
-    Every M0 task is idempotent, so each stalled job is retried and none is failed (spike V2). `app` must
-    be open.
+    Every M0 task is idempotent, so a stalled job is retried, not failed (spike V2). Each job is handled on
+    its own, so one job cannot keep the others from being released:
+    - a job whose queueing lock a waiting job holds is superseded by it, so it is marked failed (logged
+      `stalled_job_superseded`) and not counted;
+    - a job that is no longer retryable, because it ended after it was listed, is skipped (logged
+      `stalled_job_not_retryable`) and not counted;
+    - any other error propagates, and the `stalled_jobs` reconciler records it as `reconciler.failed`.
+
+    `app` must be open.
     """
     manager = app.job_manager
     stalled = list(await manager.get_stalled_jobs(seconds_since_heartbeat=seconds_since_heartbeat))
+    released = 0
     for job in stalled:
-        await manager.retry_job(job)
-        log.warning("stalled_job_released", job_id=job.id, task=job.task_name)
-    return len(stalled)
+        outcome = await _release_one(manager, job)
+        log.warning(_OUTCOME_EVENTS[outcome], job_id=job.id, task_name=job.task_name)
+        released += outcome == "released"
+    return released
 
 
 async def delete_finished_jobs(app: procrastinate.App, *, older_than_hours: int = 168) -> None:
