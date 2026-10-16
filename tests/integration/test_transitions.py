@@ -11,6 +11,7 @@ from jobhunter.errors import TransitionConflict
 from tests.support.pg import MANUAL_RUN_SQL
 
 pytestmark = pytest.mark.integration
+INSUFFICIENT_PRIVILEGE = "42501"
 INS = sa.text(MANUAL_RUN_SQL)
 OP = sa.text(
     "INSERT INTO operations (kind,payload,dedup_key,status) VALUES ('export','{}','e','pending') RETURNING id"
@@ -181,6 +182,8 @@ async def test_the_database_matrix_is_the_registry_and_a_sync_replaces_stale_row
                 sa.text("DELETE FROM transition_matrix WHERE table_name='runs' AND to_state='failed'")
             )
             await c.execute(sa.text("INSERT INTO transition_matrix VALUES ('runs', 'succeeded', 'running')"))
+            # A row of a table that is no longer registered must not survive a sync either.
+            await c.execute(sa.text("INSERT INTO transition_matrix VALUES ('ghost', 'a', 'b')"))
             assert {tuple(row) for row in await c.execute(matrix)} != expected
             assert await sync_transition_matrix(c) == len(expected)
             assert {tuple(row) for row in await c.execute(matrix)} == expected
@@ -199,3 +202,32 @@ async def test_trigger_rejects_a_disallowed_direct_update_of_an_operation(engine
                 sa.text("UPDATE operations SET status='succeeded', finished_at=now() WHERE id=:i"), {"i": op}
             )
         assert pg_error(bad.value).sqlstate == CHECK_VIOLATION
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "INSERT INTO transition_matrix VALUES ('runs', 'succeeded', 'running')",
+        "UPDATE transition_matrix SET to_state = 'running'",
+        "DELETE FROM transition_matrix",
+        "TRUNCATE transition_matrix",
+    ],
+)
+async def test_the_app_role_cannot_edit_the_matrix_the_trigger_trusts(engine, statement) -> None:
+    async with engine.connect() as c:
+        with pytest.raises(sa.exc.ProgrammingError) as denied:
+            await c.execute(sa.text(statement))
+        assert pg_error(denied.value).sqlstate == INSUFFICIENT_PRIVILEGE
+        await c.rollback()
+
+
+async def test_the_app_role_reads_the_matrix_and_a_legal_transition_still_passes_the_trigger(engine) -> None:
+    async with engine.begin() as c:
+        edges = (await c.execute(sa.text("SELECT count(*) FROM transition_matrix"))).scalar_one()
+        assert edges == sum(len(spec.allowed) for spec in TRANSITIONS.values())
+        rid = (await c.execute(INS)).scalar_one()
+        await transition(
+            c, "runs", rid, ["queued"], "cancelled"
+        )  # an UPDATE of status: the trigger reads the matrix
+        status = (await c.execute(sa.text("SELECT status FROM runs WHERE id=:i"), {"i": rid})).scalar_one()
+        assert status == "cancelled"

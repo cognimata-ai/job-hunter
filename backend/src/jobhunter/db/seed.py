@@ -169,28 +169,27 @@ async def _insert_settings_v1(conn: AsyncConnection) -> None:
 
 
 async def sync_transition_matrix(conn: AsyncConnection) -> int:
-    """Replace the `transition_matrix` rows of every registered table with the edges of the code registry.
+    """Replace the whole `transition_matrix` with the edges of the code registry.
 
     The matrix is the database's copy of `TRANSITIONS`, which the `assert_transition` trigger checks. Code is
     the source, so unlike the frozen settings the rows are rewritten on every run (a release that adds or
-    removes an edge takes effect at the next `migrate`). Returns the number of edges written. The caller owns
-    the transaction, so a reader sees the old matrix or the new one, never a mix.
+    removes an edge takes effect at the next `migrate`), and a row of a table that is no longer registered
+    does not survive. Returns the number of edges written. The caller owns the transaction, so a reader sees
+    the old matrix or the new one, never a mix.
     """
-    delete = q("DELETE FROM transition_matrix WHERE table_name = :table_name")
     insert = q(
         "INSERT INTO transition_matrix (table_name, from_state, to_state) "
         "VALUES (:table_name, :from_state, :to_state)"
     )
-    written = 0
-    for name, spec in sorted(TRANSITIONS.items()):
-        await conn.execute(delete, {"table_name": name})
-        edges = [
-            {"table_name": name, "from_state": from_state, "to_state": to_state}
-            for from_state, to_state in sorted(spec.allowed)
-        ]
+    edges = [
+        {"table_name": name, "from_state": from_state, "to_state": to_state}
+        for name, spec in sorted(TRANSITIONS.items())
+        for from_state, to_state in sorted(spec.allowed)
+    ]
+    await conn.execute(q("DELETE FROM transition_matrix"))
+    if edges:  # an empty parameter list would run the INSERT once with no values
         await conn.execute(insert, edges)
-        written += len(edges)
-    return written
+    return len(edges)
 
 
 async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:

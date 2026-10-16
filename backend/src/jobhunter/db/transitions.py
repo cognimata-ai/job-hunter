@@ -208,6 +208,10 @@ async def transition(
     - The `set_` columns. A value that is a SQL expression is rendered as it is, a mapping or a list is bound
       as JSONB, anything else as an ordinary parameter.
 
+    A self-edge (for example `running -> running`) is exclusive only when `owner` is given: without an owner
+    predicate, two callers that both name `running` as the from-state both match, and the last one wins. A
+    caller that needs exclusivity (a takeover that must beat its rival) passes the owner.
+
     Raises `ValueError`, before touching the database, for a table or an edge the registry does not know, an
     owner key that is not an ownership column, and a `set_` key that is not settable or that the transition
     clears. Raises `TransitionConflict` when no row matched: it is absent, in another state, or owned by

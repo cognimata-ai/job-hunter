@@ -9,6 +9,17 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 def test_run_and_operation_edges() -> None:
     assert ("succeeded", "running") not in TRANSITIONS["runs"].allowed
     assert ("running", "running") in TRANSITIONS["runs"].allowed
+    assert TRANSITIONS["runs"].allowed == {
+        ("queued", "running"),
+        ("running", "running"),
+        ("running", "succeeded"),
+        ("running", "partial"),
+        ("running", "failed_invariant"),
+        ("running", "failed"),
+        ("queued", "failed"),
+        ("queued", "cancelled"),
+        ("running", "cancelled"),
+    }
     assert TRANSITIONS["operations"].allowed == {
         ("pending", "running"),
         ("running", "succeeded"),

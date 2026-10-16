@@ -104,6 +104,8 @@ def proc_env(request: pytest.FixtureRequest) -> ProcessEnvFactory:
     return make
 
 
+# How long `reset_database` waits for a lock before it fails. A healthy reset never waits.
+LOCK_TIMEOUT: Final = "10s"
 _SCHEDULE_RESET: Final = """\
 INSERT INTO schedule_state (id, anchor_utc, interval_s, enabled, last_evaluated_slot, settings_version_id)
 SELECT 1, %(anchor)s, %(interval_s)s, true, %(slot)s, id FROM settings_versions WHERE version_no = 1
@@ -113,16 +115,19 @@ ON CONFLICT (id) DO UPDATE SET
   updated_at = now()"""
 
 
-def reset_database(server: PgServer) -> None:
+def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> None:
     """Return the tables of `_TRUNCATE` to empty and `schedule_state` to its seeded row, in one transaction.
+
+    The TRUNCATE waits for the locks of any transaction a test leaked; after `lock_timeout` it fails with
+    SQLSTATE 55P03 instead of hanging the suite.
 
     The schedule keeps the interval and the anchor that `migrate` seeded: both come from the stored settings
     version 1 (the anchor on the day that version was created, as the seed computes it), not from constants
     here. Its `last_evaluated_slot` is the latest slot at or before the database's `now()`, and it is enabled.
     """
-    with psycopg.connect(
-        server.dsn("migrator")
-    ) as conn:  # commits when the block ends, closes the connection
+    # The block commits when it ends and closes the connection.
+    with psycopg.connect(server.dsn("migrator")) as conn:
+        conn.execute("SELECT set_config('lock_timeout', %s, true)", (lock_timeout,))
         conn.execute(_TRUNCATE)
         stored = conn.execute(
             "SELECT payload, created_at FROM settings_versions WHERE version_no = 1"
