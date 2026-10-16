@@ -62,6 +62,12 @@ _PORT_ATTEMPTS: Final = 3
 # run left behind.
 _OWNER_LABEL: Final = "jh-test-pg.pid"
 
+# The one copy of the statement that inserts a queued manual run over the active configuration.
+MANUAL_RUN_SQL: Final = (
+    "INSERT INTO runs (trigger,scheduled_slot,status,include_paid,settings_version_id,scope_version_id) "
+    "SELECT 'manual',NULL,'queued',false,settings_version_id,scope_version_id FROM active_config RETURNING id"
+)
+
 
 def pg_image() -> str:
     """The `pgvector` line of `deploy/images.lock`: `repo:tag@sha256:digest`."""

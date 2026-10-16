@@ -3,6 +3,9 @@
 `settings_v1.json` holds every §13.1 default; decimals are JSON strings. The derived rows (scope, model
 policy, execution config, evaluation policy) are immutable and deduplicated by the SHA-256 of the canonical
 JSON of the payload as stored (§13.2), so a second `seed_defaults` finds the rows of the first.
+
+The transition matrix is different: it is derived from code, so `sync_transition_matrix` replaces its rows on
+every run instead of freezing them.
 """
 
 import hashlib
@@ -19,6 +22,7 @@ from sqlalchemy import RowMapping, TextClause
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import TRANSITIONS
 from jobhunter.types import JSONValue, get_bool, get_int, get_object, get_str
 
 SETTINGS_SCHEMA_VERSION: Final = 1
@@ -164,6 +168,31 @@ async def _insert_settings_v1(conn: AsyncConnection) -> None:
     )
 
 
+async def sync_transition_matrix(conn: AsyncConnection) -> int:
+    """Replace the `transition_matrix` rows of every registered table with the edges of the code registry.
+
+    The matrix is the database's copy of `TRANSITIONS`, which the `assert_transition` trigger checks. Code is
+    the source, so unlike the frozen settings the rows are rewritten on every run (a release that adds or
+    removes an edge takes effect at the next `migrate`). Returns the number of edges written. The caller owns
+    the transaction, so a reader sees the old matrix or the new one, never a mix.
+    """
+    delete = q("DELETE FROM transition_matrix WHERE table_name = :table_name")
+    insert = q(
+        "INSERT INTO transition_matrix (table_name, from_state, to_state) "
+        "VALUES (:table_name, :from_state, :to_state)"
+    )
+    written = 0
+    for name, spec in sorted(TRANSITIONS.items()):
+        await conn.execute(delete, {"table_name": name})
+        edges = [
+            {"table_name": name, "from_state": from_state, "to_state": to_state}
+            for from_state, to_state in sorted(spec.allowed)
+        ]
+        await conn.execute(insert, edges)
+        written += len(edges)
+    return written
+
+
 async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     """Write the default settings chain, `active_config`, `schedule_state` and `ranking_state`.
 
@@ -172,8 +201,9 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     defaults only when version 1 does not exist yet. Afterwards a release that edits `settings_v1.json`
     changes nothing here, and the three single rows below are created, when absent, from the STORED version 1
     and the pointers it holds (`settings_versions` carries all four: scope, model policy, execution config and
-    evaluation policy), never from the file. So a second call with another `now` changes nothing. The caller
-    owns the transaction.
+    evaluation policy), never from the file. So a second call with another `now` changes nothing. The one
+    exception is the transition matrix, which is code-derived and replaced on every call
+    (`sync_transition_matrix`). The caller owns the transaction.
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -219,3 +249,5 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     )
 
     await conn.execute(q("INSERT INTO ranking_state (id, generation) VALUES (1, 0) ON CONFLICT DO NOTHING"))
+
+    await sync_transition_matrix(conn)

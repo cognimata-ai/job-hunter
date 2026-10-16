@@ -1,19 +1,32 @@
 """Shared pytest fixtures; later tasks add their fixtures here."""
 
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
+import psycopg
 import pytest
 import structlog
 from jobhunter.config import AppConfig, Role
 from jobhunter.db.migrate import run_migrate
+from jobhunter.db.seed import anchor_utc_for, latest_slot_at_or_before
+from jobhunter.db.session import make_engine
 from jobhunter.observability import redact
+from jobhunter.types import get_int, get_str
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.pg import PgServer, config_for, process_env, remove_pg_server, start_pg_server
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
+# Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
+# configuration chain, `active_config` and `ranking_state` are kept, `schedule_state` is reset (below), and so
+# is `checkpoint_migrations`: the checkpointer reads it to know its schema is set up.
+_TRUNCATE: Final = (
+    "TRUNCATE runs, run_attempts, operations, sessions, login_attempts, login_lockouts, api_idempotency, "
+    "alerts, purge_fences, worker_heartbeat, users, procrastinate_jobs, procrastinate_periodic_defers, "
+    "procrastinate_workers, checkpoints, checkpoint_writes, checkpoint_blobs CASCADE"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -89,3 +102,60 @@ def proc_env(request: pytest.FixtureRequest) -> ProcessEnvFactory:
         return process_env(server or request.getfixturevalue("pg_server"), role, **extra)
 
     return make
+
+
+_SCHEDULE_RESET: Final = """\
+INSERT INTO schedule_state (id, anchor_utc, interval_s, enabled, last_evaluated_slot, settings_version_id)
+SELECT 1, %(anchor)s, %(interval_s)s, true, %(slot)s, id FROM settings_versions WHERE version_no = 1
+ON CONFLICT (id) DO UPDATE SET
+  anchor_utc = EXCLUDED.anchor_utc, interval_s = EXCLUDED.interval_s, enabled = true,
+  last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
+  updated_at = now()"""
+
+
+def reset_database(server: PgServer) -> None:
+    """Return the tables of `_TRUNCATE` to empty and `schedule_state` to its seeded row, in one transaction.
+
+    The schedule keeps the interval and the anchor that `migrate` seeded: both come from the stored settings
+    version 1 (the anchor on the day that version was created, as the seed computes it), not from constants
+    here. Its `last_evaluated_slot` is the latest slot at or before the database's `now()`, and it is enabled.
+    """
+    with psycopg.connect(
+        server.dsn("migrator")
+    ) as conn:  # commits when the block ends, closes the connection
+        conn.execute(_TRUNCATE)
+        stored = conn.execute(
+            "SELECT payload, created_at FROM settings_versions WHERE version_no = 1"
+        ).fetchone()
+        db_now = conn.execute("SELECT now()").fetchone()
+        if stored is None or db_now is None:
+            raise LookupError("settings version 1 is missing: `migrated` seeds it")
+        payload, created_at = stored
+        interval_s = get_int(payload, "schedule.interval_hours") * 3600
+        anchor = anchor_utc_for(
+            created_at, get_str(payload, "schedule.anchor_local"), get_str(payload, "display.timezone")
+        )
+        slot = latest_slot_at_or_before(anchor, interval_s, db_now[0])
+        conn.execute(_SCHEDULE_RESET, {"anchor": anchor, "interval_s": interval_s, "slot": slot})
+
+
+@pytest.fixture
+def clean_db(migrated: PgServer) -> Iterator[None]:
+    """The shared database with no test data in it, before the test and again after it.
+
+    Sync, on a psycopg connection, so async tests and sync ones (the hypothesis property) share it. In
+    `tests/integration` and `tests/crash` it applies by itself to every test that uses `migrated`.
+    """
+    reset_database(migrated)
+    yield
+    reset_database(migrated)
+
+
+@pytest.fixture
+async def engine(migrated: PgServer, make_config: ConfigFactory) -> AsyncIterator[AsyncEngine]:
+    """A pooled engine as the application database role against the shared server; disposed after the test."""
+    app_engine = make_engine(make_config("api", migrated))
+    try:
+        yield app_engine
+    finally:
+        await app_engine.dispose()
