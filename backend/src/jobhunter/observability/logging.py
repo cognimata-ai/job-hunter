@@ -33,23 +33,27 @@ _FOREIGN_PRE_CHAIN: list[Processor] = [
 
 
 def _format_positional_args(logger: WrappedLogger, method: str, event_dict: EventDict) -> EventDict:
-    """Like structlog's `PositionalArgumentsFormatter`, but a malformed call does not raise.
+    """Like structlog's `PositionalArgumentsFormatter`, but it never raises.
 
-    If `event % args` fails, the event text stays as it is and the arguments stay in the event, where
-    redaction masks them as a list.
+    If formatting fails for any reason (a malformed call, an argument `%` cannot convert, an argument whose
+    `__str__` raises, a `positional_args` keyword that is no sequence), the event text and
+    `positional_args` stay as they are. Redaction then masks the arguments as a list, or, when one of them
+    cannot even be turned into a string, replaces the event with its fail-closed form.
     """
-    args = event_dict.get("positional_args")
-    if args is None:
-        return event_dict
-    if args:
-        # The stdlib accepts both positional arguments and a single mapping.
-        if len(args) == 1 and isinstance(args[0], Mapping) and args[0]:
-            args = args[0]
-        try:
-            event_dict["event"] %= args
-        except (TypeError, ValueError, KeyError):
+    try:
+        args = event_dict.get("positional_args")
+        if args is None:
             return event_dict
-    del event_dict["positional_args"]
+        if args:
+            # The stdlib accepts both positional arguments and a single mapping.
+            if len(args) == 1 and isinstance(args[0], Mapping) and args[0]:
+                args = args[0]
+            # Nothing in the event changes before this last step that can fail.
+            event_dict["event"] = event_dict["event"] % args
+        del event_dict["positional_args"]
+    except Exception:
+        # The outcome is the event as the caller made it, rendered by the rest of the chain.
+        return event_dict
     return event_dict
 
 

@@ -4,6 +4,7 @@ import json
 import logging
 import time
 
+import pytest
 import structlog
 from jobhunter.config import ALL_SECRETS
 from jobhunter.ids import uuid7
@@ -509,9 +510,9 @@ def test_handle_error_never_raises_even_when_the_stream_is_broken() -> None:
     logging.getLogger("lib").info("hello")  # must not raise out of the log call
 
 
-def test_before_configure_logging_stdlib_records_reach_last_resort_masked(capsys) -> None:
+def test_before_configure_logging_stdlib_records_reach_last_resort_masked(capsys, monkeypatch) -> None:
     lonely = logging.getLogger("lonely")  # no handler anywhere on its path
-    lonely.propagate = False
+    monkeypatch.setattr(lonely, "propagate", False)
     lonely.warning("contact max@example.org")
     err = capsys.readouterr().err
     line = json.loads(err)
@@ -536,7 +537,150 @@ def test_secrets_in_json_bodies_and_authorization_schemes_are_replaced() -> None
     assert mask_text("failed with Bearer eyJhbGciOi.abc-def_ghi= for x") == (
         "failed with Bearer [REDACTED] for x"
     )
-    assert mask_text("header basic dXNlcjpwYXNz") == "header basic [REDACTED]"
+    assert mask_text("header Authorization: Basic dXNlcjpwYXNz") == "header Authorization: Basic [REDACTED]"
     assert mask_text("GET /x?refresh_token=abc&client_secret=def") == (
         "GET /x?refresh_token=[REDACTED]&client_secret=[REDACTED]"
     )
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs", "expected"),
+    [
+        (
+            ("took %d ms for %s", float("inf"), "max@example.org"),
+            {},
+            {"event": "took %d ms for %s", "positional_args": ["Infinity", "[EMAIL]"]},
+        ),
+        (
+            ("char %c for %s", 0x110000, "max@example.org"),
+            {},
+            {"event": "char %c for %s", "positional_args": [0x110000, "[EMAIL]"]},
+        ),
+        (
+            ("to %s: %s", "max@example.org", Unprintable()),
+            {},
+            {"event": "redaction_failed", "error_type": "RuntimeError"},
+        ),
+        (
+            ("x",),
+            {"positional_args": 5, "to": "max@example.org"},
+            {"event": "x", "positional_args": 5, "to": "[EMAIL]"},
+        ),
+    ],
+    ids=["infinite-float-for-d", "out-of-range-c", "argument-str-raises", "positional-args-keyword"],
+)
+def test_positional_formatting_never_raises_into_the_caller(args, kwargs, expected) -> None:
+    buf = io.StringIO()
+    configure_logging("INFO", stream=buf)
+    get_logger("t").info(*args, **kwargs)
+    line = json.loads(buf.getvalue())
+    assert expected.items() <= line.items()
+    assert "example.org" not in buf.getvalue() and "detail" not in buf.getvalue()
+
+
+HALF = 524_288  # the first and the last HALF characters of an input over 1 MiB are masked
+EMAIL_NEEDLE = "max.mustermann@example.org"
+
+
+def _base64_run(length: int) -> str:
+    return ("QUJD" * (length // 4 + 1))[:length]
+
+
+def _fragments(needle: str, out: str) -> list[str]:
+    return [needle[i : i + 6] for i in range(0, len(needle) - 5, 3) if needle[i : i + 6] in out]
+
+
+@pytest.mark.parametrize("needle", [SECRET32, EMAIL_NEEDLE], ids=["secret", "email"])
+@pytest.mark.parametrize("offset", [0, -512, -700, 100], ids=["join", "join-512", "join-700", "join+100"])
+def test_a_secret_or_email_near_the_megabyte_head_join_leaves_no_fragment(needle, offset) -> None:
+    redact.register_secret_values([SECRET32])
+    # The needle straddles character HALF + offset. The base64-like run before it masks to `[KEY]`, which
+    # brings the inner end of the head into the first 8192 characters of the output.
+    start = HALF + offset - len(needle) // 2
+    text = _base64_run(start - 1) + " " + needle + " " + "ab " * 400_000
+    assert len(text) > 1_700_000 and text.index(needle) == start
+    out = mask_text(text)
+    assert "…[TRUNCATED]…" in out and _fragments(needle, out) == []
+
+
+@pytest.mark.parametrize("needle", [SECRET32, EMAIL_NEEDLE], ids=["secret", "email"])
+@pytest.mark.parametrize("offset", [0, -512, 512], ids=["join", "join-512", "join+512"])
+def test_a_secret_or_email_near_the_megabyte_tail_join_leaves_no_fragment(needle, offset) -> None:
+    redact.register_secret_values([SECRET32])
+    # The needle straddles character len(text) - (HALF + offset). The base64-like run after it masks to
+    # `[KEY]`, which brings the inner end of the tail into the last 8192 characters of the output.
+    after = HALF + offset - (len(needle) - len(needle) // 2)
+    body = needle + " " + _base64_run(after - 1)
+    text = "ab " * ((1_720_000 - len(body)) // 3) + " " + body
+    assert text.index(needle) == len(text) - (HALF + offset) - len(needle) // 2
+    out = mask_text(text)
+    assert "…[TRUNCATED]…" in out and _fragments(needle, out) == []
+
+
+def test_the_join_margin_grows_with_the_longest_registered_secret() -> None:
+    passphrase = " ".join(f"word{i:03d}" for i in range(120))  # 959 characters, no key-shaped run
+    redact.register_secret_values([passphrase])
+    start = HALF - 900  # 900 of its characters lie before the join, more than the minimum margin of 512
+    text = _base64_run(start - 1) + " " + passphrase + " " + "ab " * 400_000
+    assert _fragments(passphrase, mask_text(text)) == []
+
+
+def test_quoted_secrets_in_python_reprs_and_escaped_json_are_replaced() -> None:
+    assert mask_text("{'access_token': 'abc'}") == "{'access_token': '[REDACTED]'}"
+    # An escaped quote does not end the value, so the rest of an escaped JSON string is redacted too.
+    assert mask_text('{\\"token\\": \\"abc\\"}') == '{\\"token\\": \\"[REDACTED]'
+    assert mask_text('"password": "ab\\"cdefgh"') == '"password": "[REDACTED]"'
+    # A value ends only at the quote that opened it.
+    assert mask_text('{"password": "don\'t-tell-anyone"}') == '{"password": "[REDACTED]"}'
+    assert mask_text("{'password': \"it's-a-secret\"}") == "{'password': \"[REDACTED]\"}"
+
+
+def test_quoted_secret_and_authorization_patterns_stay_linear_on_megabyte_inputs() -> None:
+    for text in (
+        '{"token": "' + "\\a" * 1_500_000,
+        "'key':'" * 430_000,
+        '\\"key\\": \\"' * 280_000,
+        '"key"' + " " * 3_000_000,
+        "authorization: " * 200_000,
+        "bearer " + "a" * 3_000_000,
+        "Bearer " * 430_000,
+    ):
+        assert len(text) > 2_900_000
+        started = time.perf_counter()
+        out = mask_text(text)
+        assert time.perf_counter() - started < 2.0
+        assert len(out) <= 16_384 + len("…[TRUNCATED]…")
+
+
+def test_every_long_path_segment_of_a_registered_url_is_masked() -> None:
+    ping_key = "fH3kQ9zR2mX7vB1nL5wT8c"
+    redact.register_secret_values([f"https://hc-ping.com/{ping_key}/nightly-backup"])
+    assert mask_text(f"pinging {ping_key}/start") == "pinging [SECRET]/start"
+    assert mask_text(f"http://hc-ping.com/{ping_key}/other-job") == "http://hc-ping.com/[SECRET]/other-job"
+    assert mask_text("slug nightly-backup") == "slug [SECRET]"
+
+
+def _reject_constant(name: str) -> object:
+    raise ValueError(f"not strict JSON: {name}")
+
+
+def test_non_finite_floats_render_as_strings_so_every_line_is_strict_json() -> None:
+    nan, inf = float("nan"), float("inf")
+    ev = redact_event(None, "info", {"event": "x", "v": [nan, inf, -inf], "n": {"r": nan}, "ok": 1.5})
+    assert ev["v"] == ["NaN", "Infinity", "-Infinity"] and ev["n"] == {"r": "NaN"} and ev["ok"] == 1.5
+    buf = io.StringIO()
+    configure_logging("INFO", stream=buf)
+    get_logger("t").info("floats", values=[nan, inf, -inf], ratio=nan, nested={"x": -inf}, took=1.5)
+    line = json.loads(buf.getvalue(), parse_constant=_reject_constant)
+    assert line["values"] == ["NaN", "Infinity", "-Infinity"] and line["ratio"] == "NaN"
+    assert line["nested"] == {"x": "-Infinity"} and line["took"] == 1.5
+
+
+def test_bearer_and_basic_in_prose_stay_but_credentials_are_masked() -> None:
+    assert mask_text("basic setup done") == "basic setup done"
+    assert mask_text("Bearer of bad news") == "Bearer of bad news"
+    assert mask_text("sent Bearer ya29.a0AfH6SMBx3kQ to x") == "sent Bearer [REDACTED] to x"
+    assert mask_text("with Basic am9iaHVudGVyOnMzY3JldA==") == "with Basic [REDACTED]"
+    # After an `Authorization` header name, any credential is masked, however it looks.
+    assert mask_text("authorization=bearer abcdefgh") == "authorization=bearer [REDACTED]"
+    assert mask_text("Authorization : Basic dXNlcjpwYXNz") == "Authorization : Basic [REDACTED]"

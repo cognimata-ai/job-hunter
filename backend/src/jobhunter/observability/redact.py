@@ -2,20 +2,23 @@
 
 `redact_event` is the structlog processor that runs last before rendering. It redacts the values of
 sensitive keys, and masks e-mail addresses, phone numbers, key-like tokens, secrets in query strings and
-JSON bodies, authorization schemes and the loaded secret values in every string, in nested dicts, lists,
+in quoted key-value pairs (JSON bodies, escaped JSON, Python reprs), `Authorization` headers and
+`Bearer`/`Basic` credentials, and the loaded secret values in every string, in nested dicts, lists,
 tuples and sets, and in the string form of any other object. The keys of nested dicts are masked the same
 way, whether or not they are sensitive (the keys of the event itself are keyword names and stay as they
-are). It cannot know a secret that has neither a listed key, nor a recognisable shape, nor a registration
+are). Non-finite floats become the strings `NaN`, `Infinity` and `-Infinity`, so every line is strict
+JSON. It cannot know a secret that has neither a listed key, nor a recognisable shape, nor a registration
 with `register_secret_values`; callers must not log such values.
 
 `redact_event` never raises: a cyclic or over-deep container renders as `[RECURSION]`, and any other
 failure replaces the whole event with a fail-closed one that carries no logged data.
 """
 
+import math
 import re
 import threading
 from collections.abc import Iterable, MutableMapping
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 from urllib.parse import quote, quote_plus, urlsplit
 
 from jobhunter.secret_names import SECRET_NAMES
@@ -47,9 +50,12 @@ REDACTED: Final = "[REDACTED]"
 # survives. The cut comes after the masking, so no fragment of a secret is left at the cut.
 MAX_TEXT_LENGTH: Final = 16384
 TRUNCATION_MARKER: Final = "…[TRUNCATED]…"
-# A string longer than this is reduced to its head and tail before masking, which bounds the work. The
-# join lies in the middle, which the cut at `MAX_TEXT_LENGTH` discards.
+# Of a string longer than this only the first and the last half are masked, each on its own, which bounds
+# the work; the masked halves are joined with `TRUNCATION_MARKER`.
 _MAX_MASKED_INPUT: Final = 1_048_576
+# What is dropped from the inner end of each masked half: at least this, and at least the longest
+# registered secret form. It is longer than an e-mail address can be (320 characters).
+_MIN_JOIN_MARGIN: Final = 512
 # Containers nested deeper than this, and containers that contain themselves, render as `[RECURSION]`.
 MAX_DEPTH: Final = 32
 RECURSION: Final = "[RECURSION]"
@@ -81,16 +87,37 @@ _SECRET_PARAMETERS: Final = (
 )
 _PARAMETER_NAMES = "|".join(_SECRET_PARAMETERS)
 QUERY_SECRET = re.compile(rf"(?i)([?&](?:{_PARAMETER_NAMES})=)[^&\s'\"#]+")
-JSON_SECRET = re.compile(rf'(?i)("(?:{_PARAMETER_NAMES})"\s*:\s*")[^"]*')
-AUTHORIZATION = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
+# Double or single quotes, optionally escaped (JSON inside a JSON string). The value ends only at an
+# unescaped quote of the kind that opened it; an escaped-JSON value therefore runs on to the end of the
+# string, which is redacted with it.
+JSON_SECRET = re.compile(
+    rf"""(?i)(\\?["'](?:{_PARAMETER_NAMES})\\?["']\s*:\s*\\?(["']))(?:\\.|(?!\2)[^\\])*"""
+)
+# After an `Authorization` header name the credential is masked whatever it looks like.
+AUTHORIZATION_HEADER = re.compile(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic))\s+[A-Za-z0-9._~+/=-]+")
+# Elsewhere `Bearer`/`Basic` are also ordinary words: a credential has 8 or more characters, at least one
+# of them a digit or a symbol, so "basic setup" and "Bearer of bad news" stay.
+BEARER_OR_BASIC = re.compile(
+    r"\b((?i:bearer|basic))\s+(?=[A-Za-z0-9._~+/=-]*[0-9+/=._~-])[A-Za-z0-9._~+/=-]{8,}"
+)
 
 # A capturing group makes `split` keep the UUID spans, at the odd indices.
 _SPLIT_ON_UUID = re.compile(f"({UUID.pattern})")
 
 _MIN_SECRET_LENGTH: Final = 8
+
+
+class _SecretState(NamedTuple):
+    """The registered secrets as `mask_text` reads them: replaced as one value, so a call sees both
+    fields of the same registration."""
+
+    pattern: re.Pattern[str] | None
+    longest: int  # the length of the longest registered form
+
+
 _secret_lock = threading.Lock()
 _secret_values: set[str] = set()
-_secret_pattern: re.Pattern[str] | None = None
+_secret_state = _SecretState(None, 0)
 
 
 def _secret_forms(value: str) -> set[str]:
@@ -101,10 +128,9 @@ def _secret_forms(value: str) -> set[str]:
     except ValueError:
         url = None
     if url is not None and url.scheme in ("http", "https") and url.netloc:
-        # The last path segment can be the credential itself (a healthchecks ping UUID).
-        segments = [segment for segment in url.path.split("/") if segment]
-        if segments and len(segments[-1]) >= _MIN_SECRET_LENGTH:
-            forms.add(segments[-1])
+        # A path segment can be the credential itself: the ping UUID of a healthchecks URL, or the ping
+        # key of a `/<ping-key>/<slug>` one.
+        forms.update(segment for segment in url.path.split("/") if len(segment) >= _MIN_SECRET_LENGTH)
         forms.add(("http" if url.scheme == "https" else "https") + value[len(url.scheme) :])
     return forms
 
@@ -113,12 +139,12 @@ def register_secret_values(values: Iterable[str]) -> None:
     """Make `mask_text` replace every verbatim occurrence of these values with `[SECRET]`.
 
     Values are stripped; those shorter than 8 characters after stripping are ignored, as they would
-    mask ordinary words. For a value that is an `http(s)` URL, its last path segment (when it has 8
-    characters or more) and the URL with the other scheme are registered as well. The percent-encoded
+    mask ordinary words. For a value that is an `http(s)` URL, every path segment that has 8 characters
+    or more and the URL with the other scheme are registered as well. The percent-encoded
     forms (`quote`, `quote_plus`) of everything are registered too, as they appear in connection strings
     and URLs. Registrations accumulate over calls.
     """
-    global _secret_pattern
+    global _secret_state
     new: set[str] = set()
     for value in values:
         if len(stripped := value.strip()) >= _MIN_SECRET_LENGTH:
@@ -129,15 +155,16 @@ def register_secret_values(values: Iterable[str]) -> None:
         if _secret_values:
             # Longest first, so that a value that contains another one is replaced as a whole.
             ordered = sorted(_secret_values, key=lambda value: (-len(value), value))
-            _secret_pattern = re.compile("|".join(re.escape(value) for value in ordered))
+            pattern = re.compile("|".join(re.escape(value) for value in ordered))
+            _secret_state = _SecretState(pattern, len(ordered[0]))
 
 
 def _reset_secret_values() -> None:
     """Forget every registered value (for tests)."""
-    global _secret_pattern
+    global _secret_state
     with _secret_lock:
         _secret_values.clear()
-        _secret_pattern = None
+        _secret_state = _SecretState(None, 0)
 
 
 def _mask_key_like(match: re.Match[str]) -> str:
@@ -145,32 +172,49 @@ def _mask_key_like(match: re.Match[str]) -> str:
     return token if _SNAKE_CASE_WORDS.fullmatch(token) else "[KEY]"
 
 
-def _mask_all(value: str) -> str:
-    if (secrets := _secret_pattern) is not None:
+def _mask_all(value: str, secrets: re.Pattern[str] | None) -> str:
+    if secrets is not None:
         value = secrets.sub("[SECRET]", value)
     value = EMAIL.sub("[EMAIL]", value)
     value = QUERY_SECRET.sub(rf"\1{REDACTED}", value)
     value = JSON_SECRET.sub(rf"\1{REDACTED}", value)
-    value = AUTHORIZATION.sub(rf"\1 {REDACTED}", value)
+    value = AUTHORIZATION_HEADER.sub(rf"\1 {REDACTED}", value)
+    value = BEARER_OR_BASIC.sub(rf"\1 {REDACTED}", value)
     parts = _SPLIT_ON_UUID.split(value)
     for i in range(0, len(parts), 2):
         parts[i] = KEY.sub(_mask_key_like, PHONE.sub("[PHONE]", parts[i]))
     return "".join(parts)
 
 
+def _mask_halves(value: str, secrets: _SecretState) -> str:
+    """Mask the first and the last `_MAX_MASKED_INPUT // 2` characters, each on its own, and join them.
+
+    A registered secret or an e-mail address that crossed the inner end of a half was cut there, so the
+    masking could not recognise it; what is left of it lies within the margin at that end, and the margin
+    is dropped from the masked half. Dropping masked text exposes nothing.
+    """
+    half = _MAX_MASKED_INPUT // 2
+    margin = max(_MIN_JOIN_MARGIN, secrets.longest)
+    head = _mask_all(value[:half], secrets.pattern)
+    tail = _mask_all(value[-half:], secrets.pattern)
+    return head[: max(0, len(head) - margin)] + TRUNCATION_MARKER + tail[margin:]
+
+
 def mask_text(value: str) -> str:
     """Mask secrets and personal data in `value`; canonical UUIDs stay as they are.
 
     Order: registered secret values, e-mail addresses (on the whole string, so a UUID in the local part
-    is masked with it), secrets in query strings and JSON bodies, `Bearer`/`Basic` credentials, then
-    phone numbers and key-like tokens in the parts between UUIDs. Only then is a long result cut to its
-    head and tail (and an input over 1 MiB reduced to its head and tail before the masking).
+    is masked with it), secrets in query strings and quoted key-value pairs, `Authorization` headers and
+    `Bearer`/`Basic` credentials, then phone numbers and key-like tokens in the parts between UUIDs. Only
+    masked text is cut: a result longer than `MAX_TEXT_LENGTH` is cut to its head and tail, and of an input
+    over 1 MiB only the head and the tail are masked, on their own, before their inner ends are dropped.
     """
+    secrets = _secret_state
     original_length = len(value)
     if original_length > _MAX_MASKED_INPUT:
-        half = _MAX_MASKED_INPUT // 2
-        value = value[:half] + value[-half:]
-    masked = _mask_all(value)
+        masked = _mask_halves(value, secrets)
+    else:
+        masked = _mask_all(value, secrets.pattern)
     if original_length > MAX_TEXT_LENGTH and len(masked) > MAX_TEXT_LENGTH:
         half = MAX_TEXT_LENGTH // 2
         masked = masked[:half] + TRUNCATION_MARKER + masked[-half:]
@@ -204,13 +248,24 @@ def _redact_mapping(data: dict[Any, Any], *, top_level: bool, active: set[int]) 
     return out
 
 
+def _strict_json_float(value: float) -> float | str:
+    """`value`, or for NaN and the infinities the names JSON parsers know them by, as strings."""
+    if math.isfinite(value):
+        return value
+    if math.isnan(value):
+        return "NaN"
+    return "Infinity" if value > 0 else "-Infinity"
+
+
 def _redact_value(value: Any, active: set[int]) -> Any:
     """Return `value` with every string masked. Containers are rebuilt, never changed in place.
 
     `active` holds the ids of the containers on the path from the event to `value`.
     """
-    if value is None or isinstance(value, bool | int | float):
+    if value is None or isinstance(value, bool | int):
         return value
+    if isinstance(value, float):
+        return _strict_json_float(value)
     if isinstance(value, str):
         return mask_text(value)
     if not isinstance(value, dict | list | tuple | set | frozenset):
