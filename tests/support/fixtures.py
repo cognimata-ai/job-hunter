@@ -17,6 +17,7 @@ from jobhunter.types import get_int, get_str
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.pg import PgServer, config_for, process_env, remove_pg_server, start_pg_server
+from tests.support.procs import ProcessGroup
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
 # Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
@@ -164,3 +165,17 @@ async def engine(migrated: PgServer, make_config: ConfigFactory) -> AsyncIterato
         yield app_engine
     finally:
         await app_engine.dispose()
+
+
+@pytest.fixture
+def procs() -> Iterator[ProcessGroup]:
+    """Spawn tracked children with `procs.spawn(args, env)`.
+
+    After the test, also a failed one, every child still alive gets `SIGCONT` and then `SIGKILL` and is waited
+    for, and every pipe is closed: no child, stopped or not, outlives its test.
+    """
+    group = ProcessGroup()
+    try:
+        yield group
+    finally:
+        group.close()
