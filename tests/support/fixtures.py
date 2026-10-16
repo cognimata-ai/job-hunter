@@ -14,10 +14,11 @@ from jobhunter.db.seed import anchor_utc_for, latest_slot_at_or_before
 from jobhunter.db.session import make_engine
 from jobhunter.observability import redact
 from jobhunter.types import get_int, get_str
+from jobhunter.worker.lock import ADVISORY_LOCK_KEY, LockSession, acquire_lock
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.support.pg import PgServer, config_for, process_env, remove_pg_server, start_pg_server
-from tests.support.procs import ProcessGroup
+from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_pg_server, start_pg_server
+from tests.support.procs import ProcessGroup, wait_until
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
 # Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
@@ -179,3 +180,46 @@ def procs() -> Iterator[ProcessGroup]:
         yield group
     finally:
         group.close()
+
+
+_SINGLETON_LOCK_HELD: Final = (
+    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 7261001 AND granted)"
+)
+# How long `worker_lock` waits for the singleton lock to be free first. The server ends a closed session
+# asynchronously, so a lock session that an earlier test closed can hold the lock for a few milliseconds more.
+LOCK_RELEASE_WAIT_S: Final = 5.0
+
+
+def _refuse_standby(seconds: float) -> None:
+    raise RuntimeError(
+        f"worker_lock: advisory lock {ADVISORY_LOCK_KEY} is held by another session (the fixture never "
+        "stands by)"
+    )
+
+
+@pytest.fixture
+def worker_lock(migrated: PgServer, make_config: ConfigFactory) -> Iterator[LockSession]:
+    """A connected worker `LockSession` that holds the singleton lock (advisory key 7261001) during the test.
+
+    A lock-proving epoch claim (ruling T8-h) uses its pid: `WorkerIdentity(uuid4(), "h", n,
+    worker_lock.backend_pid, "v")`. It waits up to `LOCK_RELEASE_WAIT_S` for the lock to be free, then
+    acquires it with a `sleep` that raises: a lock that another session still holds fails the test at once
+    instead of standing by. Closed on teardown, also after a failure; closing it earlier is allowed.
+    """
+    session = LockSession(make_config("worker", migrated).dsn("psycopg"))
+    try:
+        try:
+            wait_until(
+                lambda: pg_one(migrated, "app", _SINGLETON_LOCK_HELD) == (False,), LOCK_RELEASE_WAIT_S, 0.02
+            )
+        except TimeoutError:
+            pytest.fail(
+                f"advisory lock {ADVISORY_LOCK_KEY} still held after {LOCK_RELEASE_WAIT_S} s: an earlier "
+                "test leaked a lock holder",
+                pytrace=False,
+            )
+        session.connect()
+        acquire_lock(session, sleep=_refuse_standby)
+        yield session
+    finally:
+        session.close()
