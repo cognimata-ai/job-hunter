@@ -47,8 +47,12 @@ MIGRATE_ORDER: Final[tuple[MigrateStep, ...]] = (
 # Tables of later milestones that the backup role writes (the backup role has no default privileges).
 BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments", "manifest_shipment_items")
 _MANIFEST_NOOP_REASON: Final = "manifest_stream_arrives_in_M5"
-# Session-level advisory lock that serialises `migrate` runs (7261001 is the worker singleton).
-MIGRATE_LOCK_KEY: Final = 7261002
+# Session-level advisory lock that serialises `migrate` runs. The project's advisory keys, which share one
+# lock space (session and transaction locks on the same key conflict), so each has its own:
+#   7261001  worker singleton
+#   7261002  login throttle (transaction lock)
+#   7261003  migrate
+MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5
 
 

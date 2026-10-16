@@ -168,8 +168,8 @@ async def test_a_rerun_recreates_missing_pointer_rows_over_the_existing_versions
     ) == (True, True, datetime(2026, 10, 17, 4, tzinfo=UTC), datetime(2026, 10, 17, 4, tzinfo=UTC))
 
 
-# The advisory locks on the migrate key (7261002) that exist on the server.
-ADVISORY_LOCKS = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7261002"
+# The advisory locks on the migrate key (7261003) that exist on the server.
+ADVISORY_LOCKS = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7261003"
 COUNTS = (
     "SELECT (SELECT count(*) FROM scope_versions), (SELECT count(*) FROM model_policies), "
     "(SELECT count(*) FROM execution_configs), (SELECT count(*) FROM evaluation_policies), "
@@ -262,7 +262,7 @@ async def test_migrate_waits_for_the_lock_and_says_so(fresh_pg_server, make_conf
     from jobhunter.db.migrate import MIGRATE_LOCK_KEY
     from structlog.testing import capture_logs
 
-    assert MIGRATE_LOCK_KEY == 7261002
+    assert MIGRATE_LOCK_KEY == 7261003
     cfg = make_config("migrate", fresh_pg_server)
     holder = await psycopg.AsyncConnection.connect(fresh_pg_server.dsn("migrator"), autocommit=True)
     try:
