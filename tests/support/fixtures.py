@@ -8,7 +8,7 @@ from typing import Protocol
 import pytest
 import structlog
 from jobhunter.config import AppConfig, Role
-from jobhunter.db.alembic_runner import upgrade_head
+from jobhunter.db.migrate import run_migrate
 from jobhunter.observability import redact
 
 from tests.support.pg import PgServer, config_for, process_env, remove_pg_server, start_pg_server
@@ -55,8 +55,8 @@ def pg_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgServer]:
 
 @pytest.fixture(scope="session")
 def migrated(pg_server: PgServer) -> PgServer:
-    """`pg_server` with the schema at the code head. (Task 6 replaces this with the `migrate` command.)"""
-    upgrade_head(pg_server.dsn("migrator", driver="sqlalchemy"))
+    """`pg_server` after `jobhunter migrate`: schema at the code head, queue and checkpoint tables, seeds."""
+    run_migrate(config_for(pg_server, "migrate"))
     return pg_server
 
 
