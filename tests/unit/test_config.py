@@ -78,6 +78,27 @@ def test_migrate_dsn_uses_migrator(tmp_path: Path) -> None:
             WORKER_SECRETS,
             "langsmith_config",
         ),
+        (
+            "worker",
+            {
+                "LANGSMITH_TRACING_V2": "true",
+                "LANGSMITH_HIDE_INPUTS": "true",
+                "LANGSMITH_HIDE_OUTPUTS": "true",
+                "LANGSMITH_ENDPOINT": "https://api.smith.langchain.com",
+            },
+            WORKER_SECRETS,
+            "langsmith_config",
+        ),
+        (
+            "worker",
+            {
+                "LANGSMITH_TRACING_V2": "True",  # compared case-insensitively
+                "LANGSMITH_HIDE_INPUTS": "true",
+                "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
+            },
+            WORKER_SECRETS,
+            "langsmith_config",  # HIDE_OUTPUTS is missing
+        ),
         ("api", {}, {**API_SECRETS, "session_secret": b64(31, b"s")}, "session_secret_length"),
         ("api", {}, {**API_SECRETS, "data_key": b64(33, b"d")}, "data_key_length"),
         ("api", {}, {**API_SECRETS, "data_key_previous": b64(16)}, "data_key_previous_length"),
@@ -205,6 +226,21 @@ def test_an_empty_required_secret_counts_as_missing(tmp_path: Path) -> None:
     assert check_of("api", BASE_ENV, write_secrets(tmp_path / "s", **{**API_SECRETS, "db_app": b"\n"})) == (
         "secrets_present"
     )
+
+
+@pytest.mark.parametrize("tracing_var", ["LANGSMITH_TRACING", "LANGSMITH_TRACING_V2"])
+@pytest.mark.parametrize("tracing_value", ["true", "TRUE"])
+def test_tracing_with_all_langsmith_requirements_met_passes(
+    tmp_path: Path, tracing_var: str, tracing_value: str
+) -> None:
+    env = {
+        **BASE_ENV,
+        tracing_var: tracing_value,
+        "LANGSMITH_HIDE_INPUTS": "true",
+        "LANGSMITH_HIDE_OUTPUTS": "true",
+        "LANGSMITH_ENDPOINT": "https://eu.api.smith.langchain.com",
+    }
+    run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)))
 
 
 def test_a_prod_worker_with_both_healthchecks_secrets_passes(tmp_path: Path) -> None:

@@ -283,7 +283,8 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     if cfg.env == "prod" and (fake := [name for name in _FAKE_MODE_VARS if name in env]):
         raise StartupCheckFailed("fake_mode_in_prod", f"{', '.join(fake)} must not be set in prod")
 
-    if env.get("LANGSMITH_TRACING") == "true":
+    # The langsmith SDK enables tracing from either variable, so both count here.
+    if any(env.get(name, "").lower() == "true" for name in ("LANGSMITH_TRACING", "LANGSMITH_TRACING_V2")):
         wrong = [
             name for name in ("LANGSMITH_HIDE_INPUTS", "LANGSMITH_HIDE_OUTPUTS") if env.get(name) != "true"
         ]
