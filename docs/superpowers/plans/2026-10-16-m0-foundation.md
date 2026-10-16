@@ -17,6 +17,8 @@
 - Container images are pinned **by digest** in `deploy/images.lock` and referenced as `name@sha256:…` everywhere (§4.1, §16.11).
 - `mypy --strict` passes on `backend/src`. `tests` are type-checked too, with untyped test functions allowed; helper parameters that feed `Literal` parameters are themselves `Literal`-typed. `ruff check` and `ruff format --check` pass.
 - Broad `except Exception` is allowed **only** at task boundaries (ruff `BLE001` with per-file allowlists), and every such catch persists an outcome (a state transition or a deduplicated alert) (§17.1).
+- Database errors that pass through SQLAlchemy are caught as the `sqlalchemy.exc.DBAPIError` subclasses `IntegrityError`, `ProgrammingError` and `OperationalError`, and classified with `db.sql.pg_error(exc)`, which reads the SQLSTATE and constraint name from `exc.orig` (for example `23505`, `42P01`, `55P03`). Code never names a `psycopg.errors` class: ruff bans that import (Task 1), and code that talks to psycopg directly checks `exc.sqlstate`. A statement that may fail while its transaction must go on runs in a savepoint (`conn.begin_nested()`), and the error is caught outside the savepoint block.
+- A transaction whose writes must persist never ends by raising. Code computes an outcome inside `async with engine.begin()`, lets the block commit, and only then raises the `Problem` or returns the error response. Login failures, lockouts, alert resolution and session slides follow this rule.
 - State, table and column names are exactly those of §1.6 and §7. Enumerations are `text` + `CHECK`. Every timestamp is `timestamptz`, and Python datetimes are timezone-aware (ruff `DTZ`).
 - Every state change goes through `transition()` (§7.16). A transition out of `running` clears that table's ownership columns in the same `UPDATE`. Sweeps loop over rows and call `transition()`.
 - Every JSON value bound into SQL uses a `JSONB`-typed bind parameter (`db.sql.q(..., jsonb=...)`, or automatically in `transition()`). Decimal settings values are JSON strings (for example `"100.00"`).
@@ -104,6 +106,7 @@ def test_sqlalchemy_async_extra_installed() -> None:
     ("from langchain_anthropic import ChatAnthropic\n", "TID251"),
     ("def f() -> None:\n    try:\n        pass\n    except Exception:\n        pass\n", "BLE001"),
     ("import datetime\ndatetime.datetime.now()\n", "DTZ005"),
+    ("from psycopg.errors import UniqueViolation\n", "TID251"),
 ])
 def test_ruff_rules_fire(tmp_path: Path, source: str, rule: str) -> None:
     target = tmp_path / "probe.py"
@@ -129,7 +132,7 @@ Expected: FAIL, either a uv error about the missing `pyproject.toml` or `ModuleN
 - `ruff.toml`:
   - `target-version = "py313"`, `line-length = 110`;
   - `select = ["E","F","W","I","B","BLE","UP","S","TID","ASYNC","RUF","DTZ"]`;
-  - `[lint.flake8-tidy-imports.banned-api]` for `anthropic.Anthropic`, `anthropic.AsyncAnthropic` and `langchain_anthropic.ChatAnthropic`, message `"Only llm/gateway.py may reach Claude (§10.1)"`;
+  - `[lint.flake8-tidy-imports.banned-api]` for `anthropic.Anthropic`, `anthropic.AsyncAnthropic` and `langchain_anthropic.ChatAnthropic`, message `"Only llm/gateway.py may reach Claude (§10.1)"`; and `psycopg.errors`, message `"Catch sqlalchemy.exc.DBAPIError subclasses and classify with db.sql.pg_error; raw psycopg code checks exc.sqlstate"`;
   - per-file-ignores: `backend/src/jobhunter/llm/**` = `TID251`; the task-boundary files `backend/src/jobhunter/worker/{tasks,reconcilers,main,watchdog,operations,runs,shutdown}.py` and `backend/src/jobhunter/api/{edge,errors}.py` = `BLE001`; `tests/**` = `S101,S603,S607`.
 - `mypy.ini`: `strict = True`, `files = backend/src, tests`, `plugins = pydantic.mypy`, `[mypy-pyotp.*] ignore_missing_imports = True`, `[mypy-tests.*] disallow_untyped_defs = False` and `disallow_incomplete_defs = False`.
 - `.python-version` = `3.13.16`.
@@ -140,7 +143,7 @@ Expected: FAIL, either a uv error about the missing `pyproject.toml` or `ModuleN
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv sync && uv run pytest tests/unit/test_toolchain.py -q && uv run mypy && uv run ruff check .`
-Expected: PASS (6 passed); mypy `Success: no issues found`; ruff `All checks passed!`
+Expected: PASS (7 passed); mypy `Success: no issues found`; ruff `All checks passed!`
 
 - [ ] **Step 5: Commit**
 
@@ -425,7 +428,7 @@ PHONE = re.compile(r"(?<![\w+\-])(?:\+\d{1,3}[ \d/()\-]{6,}\d|0\d{2,5}[ /\-]\d{3
 KEY   = re.compile(r"\b(?:sk-[A-Za-z0-9_\-]{20,}|lsv2_[A-Za-z0-9_]{20,}|[A-Za-z0-9+/_\-]{40,}={0,2})")
 ```
 
-- **`configure_logging` processor chain**: `merge_contextvars`, `add_log_level`, `add_logger_name`, `TimeStamper(fmt="iso", utc=True, key="ts")`, `format_exc_info`, `redact_event`, `JSONRenderer()`.
+- **`configure_logging` processor chain**: `merge_contextvars`, `add_log_level`, `add_logger_name`, `TimeStamper(fmt="iso", utc=True, key="ts")`, `format_exc_info`, `redact_event`, `JSONRenderer()`. It passes `cache_logger_on_first_use=False`, so a later call (the `log_events` fixture of Task 14) also reaches loggers that modules created at import time.
 - **`uuid7`** follows RFC 9562: 48-bit Unix milliseconds, version `0b0111`, a 12-bit counter, variant `0b10`, 62 random bits. Within one millisecond the counter increments, so ids stay strictly ordered; random bits are re-drawn when the counter overflows.
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -495,8 +498,9 @@ def test_default_privileges_cover_later_tables(pg_server: PgServer) -> None:
         q(pg_server, "app", "INSERT INTO probe_dp VALUES (1,'a')"); q(pg_server, "app", "UPDATE probe_dp SET v='b'")
         assert q(pg_server, "app", "SELECT v FROM probe_dp") == [("b",)]
         q(pg_server, "app", "DELETE FROM probe_dp")
-        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with pytest.raises(psycopg.Error) as denied:
             q(pg_server, "app", "CREATE TABLE app_ddl (x int)")
+        assert denied.value.sqlstate == "42501"                                # insufficient_privilege
     finally:
         q(pg_server, "migrator", "DROP TABLE probe_dp")
 
@@ -505,8 +509,9 @@ def test_restore_role_scratch_db_and_no_prod_read(pg_server: PgServer) -> None:
     q(pg_server, "restore", "DROP DATABASE jh_scratch", db="postgres")
     q(pg_server, "migrator", "CREATE TABLE probe_ro (x int)")
     try:
-        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with pytest.raises(psycopg.Error) as denied:
             q(pg_server, "restore", "SELECT * FROM probe_ro")
+        assert denied.value.sqlstate == "42501"
     finally:
         q(pg_server, "migrator", "DROP TABLE probe_ro")
 
@@ -525,8 +530,9 @@ def test_l1_postgres_logs_contain_no_values(pg_server: PgServer) -> None:
         with psycopg.connect(pg_server.dsn("app")) as c:
             c.execute("INSERT INTO l1_probe VALUES (%s, %s)", (email, phone)); c.commit()
             c.execute("SELECT pg_sleep(0.3), %s::text", (phone,)); c.commit()
-            with pytest.raises(psycopg.errors.UniqueViolation):
+            with pytest.raises(psycopg.Error) as dup:
                 c.execute("INSERT INTO l1_probe VALUES (%s, %s)", (email, phone))
+            assert dup.value.sqlstate == "23505"
         logs = pg_server.logs()
         assert "duplicate key" in logs and email not in logs and "170 1234567" not in logs
     finally:
@@ -666,8 +672,10 @@ def run_sql(status: str, trigger: str = "'schedule'", slot: str = "'2026-10-16T0
     ([run_sql("running", extra_cols=",attempt_no,started_at", extra_vals=",1,now()")], "23514"),
     (["INSERT INTO operations (kind,payload,dedup_key,status) VALUES ('export','{}','e','running')"], "23514"),
     (["INSERT INTO operations (kind,payload,dedup_key,status) VALUES ('export','{}','e','pending')"] * 2, "23505"),
-    (["INSERT INTO operations (kind,payload,dedup_key,status,claim_id,finished_at) "
-      "VALUES ('export','{}','e','succeeded',gen_random_uuid(),now())"], "23514"),    # stale ownership on exit
+    (["INSERT INTO operations (kind,payload,dedup_key,status,claim_id,worker_epoch,heartbeat_at,finished_at) "
+      "VALUES ('export','{}','e','succeeded',gen_random_uuid(),1,now(),now())"], "23514"),   # full ownership, finished row
+    (["INSERT INTO operations (kind,payload,dedup_key,status,claim_id,worker_epoch,heartbeat_at) "
+      "VALUES ('export','{}','e','pending',gen_random_uuid(),1,now())"], "23514"),           # full ownership, pending row
     (["INSERT INTO api_idempotency (route,idem_key,request_sha256,status,expires_at) VALUES ('r','short','\\x00','in_progress',now())"], "23514"),
     (["INSERT INTO users (id,username,password_hash,password_changed_at) VALUES (2,'abc','h',now())"], "23514"),
     (["INSERT INTO login_lockouts VALUES ('user:x', now(), 'r')"], "23514"),
@@ -708,6 +716,8 @@ Expected: FAIL with `fixture 'migrated' not found`
 - [ ] **Step 3: Implement the Alembic environment and `0001_m0_baseline`**
 
 - `env.py` uses `sqlalchemy.create_engine(url, poolclass=NullPool)` in online mode with `transaction_per_migration=True`.
+- `alembic_config` builds the `Config` in code, with `script_location` set to the package directory (`Path(__file__).parent / "migrations"`). There is no `alembic.ini` and no repository-relative path, so the installed non-editable wheel finds its migrations (Task 18 checks this in the final image).
+- The two ownership cases of `test_constraints_reject` set `claim_id`, `worker_epoch` and `heartbeat_at` together. The spec's CHECK compares `status = 'running'` with *all three* being set, so a non-running row with only some of them set passes it. Clearing every field on exit is `transition()`'s job, and Task 7 tests that. The DDL stays exactly as in the spec.
 - Revision id `0001_m0_baseline`. `downgrade()` raises `NotImplementedError("expand/contract: no downgrades")`.
 - The DDL is copied from the spec text; the file header names the source sections and lists every difference above.
 - The M0 `is_fenced` body:
@@ -738,14 +748,17 @@ git commit -m "feat(m0): alembic baseline with the M0 tables from §7, including
 
 **Files:**
 - Create: `backend/src/jobhunter/db/session.py`, `backend/src/jobhunter/db/sql.py`, `backend/src/jobhunter/db/migrate.py`, `backend/src/jobhunter/db/seed.py`, `backend/src/jobhunter/db/seed_data/settings_v1.json`, `backend/src/jobhunter/graphs/__init__.py`, `backend/src/jobhunter/graphs/checkpointer.py`
-- Modify: `backend/src/jobhunter/cli.py` (`migrate`), `tests/support/fixtures.py` (`migrated` calls `run_migrate`)
-- Test: `tests/unit/test_seed_math.py`, `tests/integration/test_migrate.py`
+- Modify: `backend/src/jobhunter/cli.py` (`migrate`), `backend/src/jobhunter/types.py` (typed JSON accessors), `tests/support/fixtures.py` (`migrated` calls `run_migrate`)
+- Test: `tests/unit/test_seed_math.py`, `tests/unit/test_json_access.py`, `tests/integration/test_migrate.py`, `tests/integration/test_sql_errors.py`
 
 **Interfaces:**
 - Consumes: `AppConfig`, `alembic_runner.upgrade_head`.
 - Produces:
   - `session.make_engine(cfg: AppConfig, *, pool_size: int = 10) -> AsyncEngine` (`create_async_engine(cfg.dsn("sqlalchemy"), pool_pre_ping=True, pool_size=pool_size, max_overflow=0)`); `session.make_null_engine(dsn: str) -> AsyncEngine` (`poolclass=NullPool`)
   - `sql.q(statement: str, *, jsonb: Iterable[str] = ()) -> TextClause` (binds the named parameters with `sqlalchemy.dialects.postgresql.JSONB`)
+  - `sql.UNIQUE_VIOLATION: Final = "23505"`, `sql.CHECK_VIOLATION: Final = "23514"`, `sql.UNDEFINED_TABLE: Final = "42P01"`, `sql.LOCK_NOT_AVAILABLE: Final = "55P03"`
+  - `@dataclass(frozen=True) class PgErrorInfo`: `sqlstate: str | None`, `constraint: str | None`; `sql.pg_error(exc: sqlalchemy.exc.DBAPIError) -> PgErrorInfo`; `sql.is_unique_violation(exc: sqlalchemy.exc.DBAPIError, constraint: str) -> bool`
+  - `types.json_get(doc: JSONValue, path: str) -> JSONValue` (a dotted path through objects), plus `types.get_object`, `get_list`, `get_str`, `get_bool` and `get_int` with the same parameters, returning `dict[str, JSONValue]`, `list[JSONValue]`, `str`, `bool` and `int` (`get_int` rejects `bool`). A missing key raises `KeyError(path)`. A value of another kind raises `TypeError(f"{path}: expected <kind>, got <type name>")`. With these, no code indexes into the `JSONValue` union, which `mypy --strict` rejects.
   - `MigrateStep = Literal["reconstruct_and_advance", "alembic", "advance_again", "grants", "queue_and_checkpointer", "seed", "replay"]`; `MIGRATE_ORDER: Final[tuple[MigrateStep, ...]]`
   - `async def run_migrate_async(cfg: AppConfig, *, now: datetime | None = None) -> list[MigrateStep]`; `run_migrate(cfg: AppConfig, *, now: datetime | None = None) -> list[MigrateStep]`, a sync wrapper (`asyncio.run`) that raises `RuntimeError` when called inside a running loop, used only by the CLI and by sync session fixtures
   - `BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments", "manifest_shipment_items")`; `async def apply_explicit_grants(conn: AsyncConnection) -> list[str]`
@@ -809,6 +822,7 @@ Every hash is `content_hash` of the payload as stored, and every payload is boun
 # tests/unit/test_seed_math.py
 from datetime import UTC, date, datetime
 from jobhunter.db.seed import canonical_json, latest_slot_at_or_before, load_settings_v1, local_anchor_to_utc, scope_payload
+from jobhunter.types import get_bool, get_str
 SPEC_FIELDS = ["schedule.enabled", "schedule.interval_hours", "schedule.anchor_local", "schedule.include_paid",
     "display.timezone", "display.ui_language", "scope.locations", "scope.remote_within_germany", "scope.work_modes",
     "scope.employment_types", "scope.seniority_range", "scope.industries_include", "scope.industries_exclude",
@@ -831,7 +845,7 @@ def test_settings_v1_has_every_spec_field() -> None:
         for part in path.split("."):
             assert isinstance(node, dict) and part in node, path
             node = node[part]
-    assert s["scope"]["remote_within_germany"] is True and s["llm"]["cap_usd"] == "100.00"
+    assert get_bool(s, "scope.remote_within_germany") is True and get_str(s, "llm.cap_usd") == "100.00"
     assert "max_ad_age_days" not in scope_payload(s) and scope_payload(s)["work_modes"] == ["remote", "hybrid", "onsite"]
 
 def test_anchor_summer_and_winter() -> None:
@@ -847,6 +861,26 @@ def test_latest_slot() -> None:
 
 def test_canonical_json() -> None:
     assert canonical_json({"b": 1, "a": "ü"}) == '{"a":"ü","b":1}'.encode()
+```
+
+```python
+# tests/unit/test_json_access.py
+from collections.abc import Callable
+import pytest
+from jobhunter.types import JSONValue, get_bool, get_int, get_list, get_object, get_str, json_get
+DOC: JSONValue = {"a": {"flag": True, "n": 3, "s": "x", "l": [1, "y"], "o": {}}}
+
+def test_accessors_narrow() -> None:
+    assert get_bool(DOC, "a.flag") is True and get_int(DOC, "a.n") == 3 and get_str(DOC, "a.s") == "x"
+    assert get_list(DOC, "a.l") == [1, "y"] and get_object(DOC, "a.o") == {} and json_get(DOC, "a.n") == 3
+
+@pytest.mark.parametrize(("call", "error", "text"), [
+    (lambda: get_int(DOC, "a.flag"), TypeError, "a.flag: expected int, got bool"),
+    (lambda: get_object(DOC, "a.s.x"), TypeError, "a.s: expected object, got str"),
+    (lambda: get_str(DOC, "a.missing"), KeyError, "a.missing"),
+])
+def test_accessors_reject(call: Callable[[], object], error: type[Exception], text: str) -> None:
+    with pytest.raises(error, match=text): call()
 ```
 
 ```python
@@ -912,9 +946,32 @@ async def test_checkpointer_setup_is_idempotent(migrated) -> None:
     await setup_checkpointer(migrated.dsn("migrator")); await setup_checkpointer(migrated.dsn("migrator"))
 ```
 
+```python
+# tests/integration/test_sql_errors.py
+import pytest, sqlalchemy as sa
+from jobhunter.db.session import make_null_engine
+from jobhunter.db.sql import UNDEFINED_TABLE, UNIQUE_VIOLATION, PgErrorInfo, is_unique_violation, pg_error
+pytestmark = pytest.mark.integration
+ALERT = sa.text("INSERT INTO alerts (code,severity,dedup_key,message) VALUES ('a','warn','sql-errors','m')")
+
+async def test_wrapped_errors_are_classified_and_savepoints_keep_the_transaction(migrated) -> None:
+    engine = make_null_engine(migrated.dsn("app", driver="sqlalchemy"))
+    async with engine.connect() as c:
+        with pytest.raises(sa.exc.ProgrammingError) as missing:
+            async with c.begin_nested(): await c.execute(sa.text("SELECT 1 FROM no_such_table"))
+        assert pg_error(missing.value).sqlstate == UNDEFINED_TABLE
+        await c.execute(ALERT)                                              # usable: only the savepoint rolled back
+        with pytest.raises(sa.exc.IntegrityError) as dup:
+            async with c.begin_nested(): await c.execute(ALERT)
+        assert pg_error(dup.value) == PgErrorInfo(UNIQUE_VIOLATION, "alerts_open_dedup")
+        assert is_unique_violation(dup.value, "alerts_open_dedup") and not is_unique_violation(dup.value, "runs_slot_uq")
+        await c.rollback()
+    await engine.dispose()
+```
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_seed_math.py tests/integration/test_migrate.py -q`
+Run: `uv run pytest tests/unit/test_seed_math.py tests/unit/test_json_access.py tests/integration/test_migrate.py tests/integration/test_sql_errors.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.db.migrate'`
 
 - [ ] **Step 3: Implement `run_migrate_async`, the seeds and the checkpointer setup**
@@ -928,10 +985,12 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.db.migrate'
   - `await app.schema_manager.apply_schema_async()` only when `to_regclass('procrastinate_jobs') IS NULL`. Upgrades of the procrastinate schema are owned by M5 (Deviation 5);
   - then `await setup_checkpointer(cfg.dsn("psycopg"))` on one `psycopg.AsyncConnection.connect(dsn, autocommit=True, prepare_threshold=0, row_factory=dict_row)`.
 - **`seed`**: `seed_defaults` inside one transaction. There are no nested event loops anywhere in the orchestration.
+- **The `types` accessors** walk `path.split(".")` with `isinstance` checks. `load_settings_v1` checks the root with `get_object`, and `scope_payload` and `seed_defaults` read the settings only through `get_object` / `get_bool` / `get_int` / `get_str`.
+- **`pg_error`**: `orig = exc.orig`. When `isinstance(orig, psycopg.Error)`, it returns `PgErrorInfo(orig.sqlstate, orig.diag.constraint_name)`; otherwise `PgErrorInfo(None, None)`. For a unique index, the constraint name is the index name. This is the only code that looks beneath a SQLAlchemy exception.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `uv run pytest tests/unit/test_seed_math.py tests/integration -q`
+Run: `uv run pytest tests/unit/test_seed_math.py tests/unit/test_json_access.py tests/integration -q`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -963,7 +1022,7 @@ git commit -m "feat(m0): async migrate in the §19.3 order with grants, queue an
   - `async def alerts.resolve_alert(conn: AsyncConnection, *, code: str, subject: str) -> bool`
   - `async def alerts.refresh_alert_gauge(conn: AsyncConnection) -> dict[Severity, int]` (sets `ALERTS_OPEN` for all three severities)
   - Fixtures:
-    - `clean_db`: autouse in `tests/integration` and `tests/crash` whenever `migrated` is in use. **Before and after** each test it runs, as migrator, `TRUNCATE runs, run_attempts, operations, sessions, login_attempts, login_lockouts, api_idempotency, alerts, purge_fences, worker_heartbeat, users, procrastinate_jobs, procrastinate_periodic_defers, procrastinate_workers, checkpoints, checkpoint_writes, checkpoint_blobs CASCADE`, then resets `schedule_state` to its seeded anchor and interval with `last_evaluated_slot = latest slot ≤ now()` and `enabled = true`.
+    - `clean_db`: autouse in `tests/integration` and `tests/crash` whenever `migrated` is in use (tests that need it regardless, such as the hypothesis property, request `migrated` and `clean_db` explicitly). It is a sync fixture on a psycopg connection, so sync tests (the hypothesis property) and async tests both use it. **Before and after** each test it runs, as migrator, `TRUNCATE runs, run_attempts, operations, sessions, login_attempts, login_lockouts, api_idempotency, alerts, purge_fences, worker_heartbeat, users, procrastinate_jobs, procrastinate_periodic_defers, procrastinate_workers, checkpoints, checkpoint_writes, checkpoint_blobs CASCADE`, then resets `schedule_state` to its seeded anchor and interval with `last_evaluated_slot = latest slot ≤ now()` and `enabled = true`.
     - `engine`: an async app-role `make_engine`, disposed after the test.
     - `migrator_engine`.
 
@@ -992,6 +1051,7 @@ def test_run_and_operation_edges() -> None:
 ```python
 # tests/integration/test_transitions.py
 import pytest, sqlalchemy as sa
+from jobhunter.db.sql import CHECK_VIOLATION, pg_error
 from jobhunter.db.transitions import transition
 from jobhunter.errors import TransitionConflict
 pytestmark = pytest.mark.integration
@@ -1031,8 +1091,9 @@ async def test_trigger_rejects_disallowed_direct_update(engine) -> None:
     async with engine.begin() as c:
         rid = (await c.execute(INS)).scalar_one()
         await c.execute(sa.text("UPDATE runs SET status='cancelled', finished_at=now() WHERE id=:i"), {"i": rid})
-        with pytest.raises(sa.exc.DBAPIError, match="disallowed transition runs: cancelled -> queued"):
+        with pytest.raises(sa.exc.IntegrityError, match="disallowed transition runs: cancelled -> queued") as bad:
             await c.execute(sa.text("UPDATE runs SET status='queued', finished_at=NULL WHERE id=:i"), {"i": rid})
+        assert pg_error(bad.value).sqlstate == CHECK_VIOLATION
 ```
 
 ```python
@@ -1049,11 +1110,11 @@ STEP = st.tuples(st.lists(st.sampled_from(STATES), min_size=1, max_size=3, uniqu
 
 @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
 @given(st.lists(STEP, min_size=1, max_size=12))
-def test_transition_calls_match_the_matrix(make_config, steps) -> None:
-    spec = TRANSITIONS["runs"]
+def test_transition_calls_match_the_matrix(migrated, clean_db, make_config, steps) -> None:
+    spec = TRANSITIONS["runs"]               # migrated: schema and active_config exist; clean_db: no rows leak in or out
     async def scenario() -> None:
-        engine = make_engine(make_config("api"))
-        async with engine.begin() as c:
+        engine = make_engine(make_config("api", migrated))
+        async with engine.connect() as c:    # autobegin; each example rolls back below
             rid = (await c.execute(sa.text("INSERT INTO runs (trigger,scheduled_slot,status,include_paid,settings_version_id,"
                 "scope_version_id) SELECT 'manual',NULL,'queued',false,settings_version_id,scope_version_id FROM active_config "
                 "RETURNING id"))).scalar_one()
@@ -1407,7 +1468,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.worker.task
 - **`defer_in_tx`**:
   - `raw = (await conn.get_raw_connection()).driver_connection`;
   - inside `async with conn.begin_nested():` it runs `await task_app().tasks[job_task_name(task)].configure(connection=raw, lock=lock, queueing_lock=queueing_lock).defer_async(**kwargs)`;
-  - a `procrastinate.exceptions.AlreadyEnqueued` rolls back that savepoint only and returns `None`.
+  - a `procrastinate.exceptions.AlreadyEnqueued` rolls back that savepoint only and returns `None`. It is procrastinate's own exception, raised by its connector on the raw driver connection, so it is not a SQLAlchemy-wrapped driver error. Any other exception leaves the savepoint and propagates.
 
   The external connection bypasses the connector pool, so this works against any database without opening the app (procrastinate 3.10 `ConfigureTaskOptions.connection`).
 - **`live_job_exists`**: `SELECT EXISTS (… procrastinate_jobs WHERE task_name = :t AND status IN ('todo','doing') AND args @> :m)`, with `m` JSONB-bound.
@@ -1624,7 +1685,7 @@ Every state change goes through `transition()`, which clears `claim_id`, `worker
    - another exception → `requeue_operation(error_code="bug", not_before=now + 1 min)`;
    - normal return → `finish(succeeded)`.
 
-   A `FencedOut` from finish or requeue also returns quietly.
+   Finish and requeue each run in their own `engine.begin()` block. A `FencedOut` from either is caught outside that block and returns quietly; the fenced transaction wrote nothing, because the `transition()` is its first write.
 4. In `finally`: cancel and await the heartbeat task.
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -1785,9 +1846,12 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.worker.tick
 2. When `enabled = false`: `last_evaluated_slot := max(cursor, latest slot ≤ now)`; return.
 3. `include_paid` comes from the active `settings_versions.payload->'schedule'->>'include_paid'`.
 4. Every slot but the latest is inserted in one statement, `INSERT … SELECT unnest(CAST(:slots AS timestamptz[]))`, as `runs(status='missed', trigger='schedule')` with `ON CONFLICT (kind, scheduled_slot) WHERE scheduled_slot IS NOT NULL DO NOTHING`.
-5. The latest slot `s` is inserted inside `async with conn.begin_nested()` as `status='queued'` with `trigger='schedule'` if `now − s ≤ 5 min`, else `'catch_up'`.
-   - A `UniqueViolation` with `diag.constraint_name == "runs_one_active_collect"` inserts `skipped_overlap` (same slot and trigger) in a new savepoint.
-   - One on `runs_slot_uq` is a no-op.
+5. The latest slot `s` is inserted inside `async with conn.begin_nested()` as `status='queued'` with `trigger='schedule'` if `now − s ≤ 5 min`, else `'catch_up'`. There is no pre-check; the unique indexes decide. The `sqlalchemy.exc.IntegrityError` is caught **outside** the savepoint block, where the savepoint has already rolled back and the transaction is still usable, and is classified with `is_unique_violation`:
+   - `runs_one_active_collect` → log `active_collect_conflict` with `path="tick"` and `sqlstate`, then insert `skipped_overlap` (same slot and trigger) in a new savepoint;
+   - `runs_slot_uq` → no-op;
+   - anything else re-raises.
+
+   `test_overlap_records_skipped_overlap` (sequential) and Task 17's `test_tick_blocked_behind_run_now_records_overlap` (blocked on the index) both take this branch.
 6. For a queued run: `defer(conn, "run_collect", lock="collect", queueing_lock=f"run:{id}:1", run_id=id, attempt_no=1)`.
 7. `last_evaluated_slot := max(cursor, s)`.
 
@@ -1815,7 +1879,8 @@ git commit -m "feat(m0): UTC slot tick under active_config with missed, skipped_
 **Interfaces:**
 - Consumes: `transition`, `raise_alert`, `resolve_alert`, `Deferrer`, `register_takeover_sweep`, `reconciler`, `heartbeat_loop`, `EXECUTIONS`, `open_saver`, `metrics.RUNS`, `metrics.RUN_DURATION`, `FencedOut`.
 - Produces:
-  - `graph.CollectState(TypedDict)`: `run_id: int`, `attempt_no: int`, `steps: Annotated[list[str], operator.add]`
+  - `graph.CollectState(TypedDict)`: the full graph state, `run_id: int`, `attempt_no: int`, `steps: Annotated[list[str], operator.add]`
+  - `graph.CollectUpdate(TypedDict, total=False)`: the partial update a node returns, with the same keys and types. Nodes are typed `async def node(state: CollectState) -> CollectUpdate`, following LangGraph's partial-update convention, so a node that returns only `steps` passes `mypy --strict`
   - `graph.build_noop_collect_graph(checkpointer: BaseCheckpointSaver[str]) -> CompiledStateGraph` (nodes `start` → `finalize`; `finalize` awaits `afault_point("collect.before_finalize")`)
   - `runs.thread_id(run_id: int, attempt_no: int) -> str` (`f"run-{run_id}-a{attempt_no}"`)
   - `@dataclass(frozen=True) class RunOwner`: `run_id: int`, `attempt_no: int`
@@ -1885,7 +1950,7 @@ from langgraph.graph import END, START, StateGraph
 from jobhunter.clock import utcnow
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.checkpointer import open_saver
-from jobhunter.graphs.collect.graph import CollectState, build_noop_collect_graph
+from jobhunter.graphs.collect.graph import CollectState, CollectUpdate, build_noop_collect_graph
 from jobhunter.worker import runs
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.executions import EXECUTIONS
@@ -1894,7 +1959,7 @@ from jobhunter.worker.tasks import defer_in_tx, live_job_exists
 pytestmark = pytest.mark.integration
 
 def gated_graph(gate: asyncio.Event, entered: asyncio.Event):
-    async def wait(s: CollectState) -> CollectState: entered.set(); await gate.wait(); return {"steps": ["wait"]}
+    async def wait(s: CollectState) -> CollectUpdate: entered.set(); await gate.wait(); return {"steps": ["wait"]}
     g = StateGraph(CollectState); g.add_node("wait", wait); g.add_edge(START, "wait"); g.add_edge("wait", END)
     return g.compile()
 
@@ -2023,12 +2088,14 @@ Expected: FAIL with `ImportError: cannot import name 'runs' from 'jobhunter.work
 - **`request_manual_run`**:
   - `active_config FOR SHARE` (settings and scope ids);
   - return the `queued` or `running` collection as `(row, False)` when one exists;
-  - else insert `runs(trigger='manual', scheduled_slot=NULL, status='queued', include_paid, settings_version_id, scope_version_id)` in a savepoint and defer the task;
-  - a `UniqueViolation` on `runs_one_active_collect` re-reads the active run and returns `(row, False)`.
+  - else insert `runs(trigger='manual', scheduled_slot=NULL, status='queued', include_paid, settings_version_id, scope_version_id)` inside `async with conn.begin_nested()` and defer the task;
+  - a `sqlalchemy.exc.IntegrityError` caught outside that block with `is_unique_violation(exc, "runs_one_active_collect")` logs `active_collect_conflict` with `path="manual"` and `sqlstate`, re-reads the active run and returns `(row, False)`; anything else re-raises. Task 17's `test_run_now_blocked_behind_tick_returns_tick_run` takes this branch, because the pre-check cannot see the tick's uncommitted run.
+- **The no-op graph**: nodes `start` and `finalize` are `async def …(state: CollectState) -> CollectUpdate` and return `{"steps": ["start"]}` and `{"steps": ["finalize"]}`.
 - **`execute_run`**: the admission protocol, then `ainvoke(…, {"configurable": {"thread_id": …}, "recursion_limit": 200}, durability="sync")`.
-  - On completion: `finalize_run(status="succeeded", reason=None, report={"noop": True})`.
+  - On completion: `finalize_run(status="succeeded", reason=None, report={"noop": True})` in its own `engine.begin()` block.
   - `CancelledError` or `FencedOut` → return quietly, with no owner writes.
-  - Any other exception → `finalize_run(status="failed", reason="bug", report={})` plus `raise_alert(code="run.failed", severity="critical", subject=f"run:{id}", message="run failed")`; a `FencedOut` there is ignored.
+  - Any other exception → in a **new** transaction, `finalize_run(status="failed", reason="bug", report={})` and then `raise_alert(code="run.failed", severity="critical", subject=f"run:{id}", message="run failed")`.
+  - A `FencedOut` from either finalize is caught **outside** its `async with` block. The fenced transaction wrote nothing (the `transition()` is its first write), and the run's new owner records the outcome.
   - The heartbeat task is always cancelled and awaited.
 - **`V6.md`** records `test_checkpointer_v6.py` and `test_checkpointer_setup_is_idempotent` (Task 6).
 
@@ -2213,7 +2280,7 @@ git commit -m "feat(m0): worker composition (task app before takeover), FIRST_CO
 - Test: `tests/integration/test_api_core.py`
 
 **Interfaces:**
-- Consumes: `make_engine`, `code_head`, `uuid7`, `HTTP_REQUESTS`, `AppConfig`.
+- Consumes: `make_engine`, `code_head`, `uuid7`, `HTTP_REQUESTS`, `AppConfig`, `pg_error`, `configure_logging`.
 - Produces:
   - `ProblemCode = Literal["unauthenticated", "csrf_failed", "throttled", "invalid_cursor", "stale_base_version", "validation_failed", "budget_exhausted", "filtered_requires_force", "run_active", "not_found", "conflict_state", "upload_rejected", "idempotency_key_required", "idempotency_key_reused", "idempotency_in_progress", "eval_gate_failed", "internal"]`
   - `class Problem(Exception)`: `__init__(self, status: int, code: ProblemCode, title: str, *, detail: str | None = None, errors: list[FieldError] | None = None, headers: Mapping[str, str] | None = None, extra: Mapping[str, JSONValue] | None = None)`; `@dataclass class FieldError: field: str; code: str; message: str`
@@ -2232,6 +2299,7 @@ git commit -m "feat(m0): worker composition (task app before takeover), FIRST_CO
   - `async def check_readiness(engine: AsyncEngine, *, code_head: str, now: datetime) -> ReadinessReport`
   - `openapi_export.main(argv: Sequence[str] | None = None) -> int`
   - Fixture `api_client`: `httpx.AsyncClient(transport=ASGITransport(app=create_app(cfg=make_config("api"), engine=engine), raise_app_exceptions=False, client=("198.51.100.10", 50000)), base_url="https://testserver", headers={"Origin": "https://testserver"})`
+  - Fixture `log_events` (function): runs `configure_logging("INFO", stream=buf)` on a `StringIO` and yields `Callable[[], list[dict[str, Any]]]`, which returns the JSON events logged so far; the finalizer restores the default stream
   - CLI `jobhunter http-check <url>`
 
 - [ ] **Step 1: Write the failing tests**
@@ -2267,12 +2335,16 @@ async def test_readyz(api_client, engine) -> None:
     r = await api_client.get("/readyz"); assert r.status_code == 503 and r.json() == {"failing": ["worker_heartbeat"]}
     await fresh_heartbeat(engine); assert (await api_client.get("/readyz")).status_code == 200
 
-async def test_readyz_reports_missing_schema(fresh_pg_server, make_config) -> None:
+async def test_readyz_reports_missing_schema(fresh_pg_server, make_config, log_events) -> None:
     from jobhunter.api.app import create_app
     from jobhunter.db.session import make_engine
     cfg = make_config("api", fresh_pg_server); engine = make_engine(cfg)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(cfg=cfg, engine=engine)), base_url="https://testserver") as c:
-        assert (await c.get("/readyz")).json() == {"failing": ["migrations", "worker_heartbeat"]}
+        r = await c.get("/readyz")
+    assert r.status_code == 503 and r.json() == {"failing": ["migrations", "worker_heartbeat"]}
+    # both probes saw 42P01 through SQLAlchemy; a poisoned transaction would give 25P02 for the second one
+    assert [(e["probe"], e["sqlstate"]) for e in log_events() if e["event"] == "readiness_probe_failed"] == [
+        ("migrations", "42P01"), ("worker_heartbeat", "42P01")]
     await engine.dispose()
 
 async def test_problems_for_404_422_and_500_carry_edge_headers(engine, make_config) -> None:
@@ -2331,10 +2403,13 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.api'`
 
   All take `request_id` from `request.state.request_id` and use `problem_body`.
 - **Edge middleware**: as specified in the Interfaces. It is the reason 500s and rejections still get headers: Starlette's `ServerErrorMiddleware` sits inside it.
-- **`check_readiness`**:
-  - `SELECT 1` under `asyncio.wait_for(…, 2.0)`; failure → only `db`.
-  - `SELECT version_num FROM alembic_version`: a missing table (`UndefinedTable`), an empty table or a different version → `migrations`.
-  - `SELECT now() - heartbeat_at FROM worker_heartbeat`: a missing table or row, or an age above 60 s → `worker_heartbeat`.
+- **`check_readiness`** uses one `engine.connect()`:
+  - `SELECT 1` under `asyncio.wait_for(…, 2.0)`. A `sqlalchemy.exc.DBAPIError`, `OSError` or `TimeoutError` → `failing = ["db"]`, and nothing else is probed.
+  - Each schema probe runs in its own savepoint (`async with conn.begin_nested():`). The `sqlalchemy.exc.DBAPIError` is caught outside that block, after the savepoint has rolled back, so a failed probe never aborts the transaction that the next probe uses:
+    - `migrations`: `SELECT version_num FROM alembic_version`. SQLSTATE `42P01` (`UNDEFINED_TABLE`, a `ProgrammingError`) or any other SQLSTATE, an empty table, or a different version → failing.
+    - `worker_heartbeat`: `SELECT now() - heartbeat_at FROM worker_heartbeat WHERE id = 1`. `42P01` or any other SQLSTATE, no row, or an age above 60 s → failing.
+    - A probe error with `exc.connection_invalidated` set means that the database went away mid-check → `failing = ["db"]`.
+  - Every failed probe logs `readiness_probe_failed` with `probe` and `sqlstate` (`null` when no error was raised), never the message.
   - `failing` is in the order `db`, `migrations`, `worker_heartbeat`.
 - **Routes**: `/healthz` → `{"status":"ok"}`; `/readyz` → 200 `{}` or 503 `{"failing":[…]}`.
 - **State**: with `cfg` and `engine` injected, `create_app` sets `api.state.cfg`, `.engine` and `.code_head` immediately (tests do not run the lifespan). Otherwise the lifespan loads `startup_or_exit("api")`, creates the engine (pool 10), computes `code_head()`, and outside the test env starts `start_metrics_server(8001)`.
@@ -2343,7 +2418,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.api'`
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/integration/test_api_core.py -q`
-Expected: PASS (7 passed)
+Expected: PASS (6 passed)
 
 - [ ] **Step 5: Commit**
 
@@ -2517,6 +2592,7 @@ git commit -m "feat(m0): single user with Argon2id, common-password policy, encr
   - `async def throttle.active_lockout(conn, ip: str, *, now: datetime) -> timedelta | None`; `async def throttle.record_attempt(conn, *, ip: str, username_hmac: bytes, success: bool, now: datetime) -> None` (requires `serialize` earlier in the same transaction); `async def throttle.unlock_all(conn) -> int`
   - `api.app.SessionRateLimiter(limit: int = 600, window_s: float = 60.0)` with `hit(key: bytes, now: float) -> bool`
   - `deps.require_session(request: Request) -> SessionInfo` (401 `unauthenticated` with the cookie cleared; 429 `throttled` past 600/min)
+  - `routes.auth.LoginOutcome = Locked | Rejected | Accepted`, frozen dataclasses `Locked(retry_after: timedelta)`, `Rejected()` and `Accepted(token: str)`; `async def routes.auth.decide_login(conn: AsyncConnection, *, ip: str, username_hmac: bytes, credentials_ok: bool, new_hash: str | None, pepper: bytes, user_agent: str | None, now: datetime) -> LoginOutcome` (writes, never raises a `Problem`)
   - Routes:
     - `POST /api/auth/login`: `LoginIn{username: str(1..256), password: str(1..1024), totp: str | None (^\d{6}$)}` → 204 with `Set-Cookie`;
     - `POST /api/auth/logout` → 204;
@@ -2564,6 +2640,10 @@ async def test_login_checks_origin_only_and_rejection_has_edge_headers(api_clien
 async def test_ip_lockout_after_five_failures(api_client, make_user, engine) -> None:
     await make_user()
     for _ in range(5): assert (await login(api_client, password="x" * 12)).status_code == 401
+    async with engine.connect() as c:                      # a separate connection sees committed rows only
+        assert tuple((await c.execute(sa.text(
+            "SELECT (SELECT count(*) FROM login_attempts WHERE host(ip) = '198.51.100.10' AND NOT success), "
+            "(SELECT count(*) FROM login_lockouts WHERE scope = 'ip:198.51.100.10' AND locked_until > now())"))).one()) == (5, 1)
     r = await login(api_client)
     assert r.status_code == 429 and r.json()["code"] == "throttled" and 880 <= r.json()["retry_after_s"] <= 900
     async with engine.connect() as c:
@@ -2576,7 +2656,10 @@ async def test_global_lockout_after_twenty_failures(engine, make_config, make_us
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=(ip, 1)), base_url="https://testserver",
                                  headers={"Origin": "https://testserver"})
     for i in range(20):
-        async with client(f"203.0.113.{i + 1}") as c: await login(c, password="y" * 12)
+        async with client(f"203.0.113.{i + 1}") as c: assert (await login(c, password="y" * 12)).status_code == 401
+    async with engine.connect() as c:
+        assert tuple((await c.execute(sa.text("SELECT (SELECT count(*) FROM login_attempts WHERE NOT success), "
+                                              "(SELECT count(*) FROM login_lockouts WHERE scope = 'global')"))).one()) == (20, 1)
     async with client("192.0.2.200") as c: assert (await login(c)).status_code == 429
     async with engine.connect() as c:
         assert (await c.execute(sa.text("SELECT severity FROM alerts WHERE code='auth.lockout' AND resolved_at IS NULL"))).scalar_one() == "critical"
@@ -2670,12 +2753,18 @@ Expected: FAIL with `fixture 'make_user' not found`
 
 **Login** (`routes/auth.py`, which imports `dummy_verify` by name):
 1. Credentials are verified **outside** any transaction: `find_user`, `verify_password` or `dummy_verify`, then TOTP when enabled.
-2. Then, in one transaction:
+2. Then `outcome = await decide_login(conn, …)` runs in one `async with engine.begin()` block, which **ends normally**, so everything it wrote commits:
    1. `throttle.serialize`;
-   2. `active_lockout(ip)`; when locked → 429 `throttled` with `extra={"retry_after_s": ceil(seconds)}`, even if the credentials were valid;
-   3. `record_attempt(success=…)`;
-   4. on failure → 401 `unauthenticated`, title `"Invalid credentials"`;
-   5. on success → `update_hash` when rehashed, then `create_session`, then `Set-Cookie: __Host-jh_session=<token>; Max-Age=2592000; Path=/; Secure; HttpOnly; SameSite=Strict`.
+   2. `active_lockout(ip)`, which may resolve an expired `auth.lockout` alert; when locked → `Locked(retry_after)`, even if the credentials were valid;
+   3. otherwise `record_attempt(success=…)`, which may write lockouts and the `auth.lockout` alert;
+   4. on failure → `Rejected()`;
+   5. on success → `update_hash` when rehashed, then `create_session` → `Accepted(token)`.
+3. Only after the block has committed does the route map the outcome:
+   - `Locked` → raise 429 `throttled` with `extra={"retry_after_s": ceil(seconds)}`;
+   - `Rejected` → raise 401 `unauthenticated`, title `"Invalid credentials"`;
+   - `Accepted` → 204 with `Set-Cookie: __Host-jh_session=<token>; Max-Age=2592000; Path=/; Secure; HttpOnly; SameSite=Strict`.
+
+   Raising the `Problem` inside the block would roll back the attempt, the lockout and the alert (Global Constraints). `test_ip_lockout_after_five_failures` and `test_global_lockout_after_twenty_failures` read the committed rows through a separate connection after the HTTP responses.
 
 The IP is `request.client.host`.
 
@@ -2694,7 +2783,7 @@ The IP is `request.client.host`.
 - `X-JH-Request: 1` is also required, except on `/api/auth/login`;
 - otherwise the edge itself sends a 403 `csrf_failed` problem (`problem_body`, edge headers, request id).
 
-**Rate limit**: `require_session` validates the cookie, then calls `SessionRateLimiter.hit(token_hmac, time.monotonic())` (an in-memory sliding 60 s window; the api runs one replica).
+**Rate limit**: `require_session` runs `validate_session` in its own `engine.begin()` block, which commits (including a slide) before anything is raised. It then raises 401 when there is no valid session, or calls `SessionRateLimiter.hit(token_hmac, time.monotonic())` (an in-memory sliding 60 s window; the api runs one replica) and raises 429 past the limit.
 
 **CLI**: `sessions revoke-all` calls `revoke_all`; `sessions unlock` calls `unlock_all` plus `resolve_alert(code="auth.lockout", subject="global")`.
 
@@ -2722,7 +2811,7 @@ git commit -m "feat(m0): login with serialised DB throttling, __Host- sessions, 
 - Test: `tests/unit/test_idempotency_fingerprint.py`, `tests/integration/test_runs_api.py`
 
 **Interfaces:**
-- Consumes: `request_manual_run`, `run_tick`, `defer_in_tx`, `make_queue_app`, `check_readiness`, `refresh_alert_gauge`, `require_session`, `Problem`, `q`.
+- Consumes: `request_manual_run`, `run_tick`, `defer_in_tx`, `make_queue_app`, `check_readiness`, `refresh_alert_gauge`, `require_session`, `Problem`, `q`, `pg_error`, the `log_events` fixture.
 - Produces:
   - `IDEMPOTENCY_TTL: Final = timedelta(days=7)`; `IDEM_KEY_RE: Final = re.compile(r"^[A-Za-z0-9_-]{16,128}$")`; `IN_PROGRESS_LOCK_TIMEOUT: Final = "5s"`
   - `request_fingerprint(body: JSONValue, path_params: Mapping[str, JSONValue]) -> bytes`
@@ -2805,7 +2894,7 @@ async def test_new_key_returns_active_run_and_expired_key_runs_again(logged_in_c
         await c.execute(sa.text("UPDATE runs SET status='cancelled', finished_at=now()"))
     assert (await post(logged_in_client)).json()["created"] is True
 
-async def test_run_now_blocked_behind_tick_returns_tick_run(logged_in_client, engine, queue_app) -> None:   # Review Focus 4
+async def test_run_now_blocked_behind_tick_returns_tick_run(logged_in_client, engine, queue_app, log_events) -> None:   # Review Focus 4
     now = await due_slot(engine)
     conn = await engine.connect(); tx = await conn.begin()
     rep = await run_tick(conn, now=now, defer=defer_in_tx)                   # tick's run inserted, not committed
@@ -2814,8 +2903,9 @@ async def test_run_now_blocked_behind_tick_returns_tick_run(logged_in_client, en
     await tx.commit(); await conn.close()
     r = await asyncio.wait_for(req, 5)
     assert r.status_code == 202 and r.json() == {"run": r.json()["run"], "created": False} and r.json()["run"]["id"] == rep.queued_run_id
+    assert [e["path"] for e in log_events() if e["event"] == "active_collect_conflict"] == ["manual"]   # the IntegrityError branch
 
-async def test_tick_blocked_behind_run_now_records_overlap(engine, queue_app) -> None:                   # Review Focus 4
+async def test_tick_blocked_behind_run_now_records_overlap(engine, queue_app, log_events) -> None:       # Review Focus 4
     now = await due_slot(engine)
     conn = await engine.connect(); tx = await conn.begin()
     manual, created = await runs.request_manual_run(conn, include_paid=False, defer=defer_in_tx)
@@ -2826,15 +2916,28 @@ async def test_tick_blocked_behind_run_now_records_overlap(engine, queue_app) ->
     await tx.commit(); await conn.close()
     rep = await asyncio.wait_for(t, 5)
     assert created and rep.skipped_overlap and rep.queued_run_id is None
+    assert [e["path"] for e in log_events() if e["event"] == "active_collect_conflict"] == ["tick"]
     async with engine.connect() as c:
         assert [r[0] for r in await c.execute(sa.text("SELECT id FROM runs WHERE status IN ('queued','running')"))] == [manual.id]
+
+async def test_same_key_in_flight_elsewhere_is_409(logged_in_client, engine, queue_app, monkeypatch) -> None:
+    import jobhunter.api_idempotency as idem
+    monkeypatch.setattr(idem, "IN_PROGRESS_LOCK_TIMEOUT", "200ms")
+    conn = await engine.connect(); tx = await conn.begin()                   # another request holds the key, uncommitted
+    await conn.execute(sa.text("INSERT INTO api_idempotency (route, idem_key, request_sha256, status, expires_at) VALUES "
+                               "('POST /api/runs', :k, decode(repeat('00', 32), 'hex'), 'in_progress', now() + interval '7 days')"), {"k": KEY})
+    r = await post(logged_in_client)                                          # waits on the key, then lock_timeout: SQLSTATE 55P03
+    assert r.status_code == 409 and r.json()["code"] == "idempotency_in_progress"
+    await tx.rollback(); await conn.close()
+    async with engine.connect() as c: assert (await c.execute(sa.text("SELECT count(*) FROM runs"))).scalar_one() == 0
 
 async def test_system_health_requires_session_and_reports(api_client, logged_in_client, engine, queue_app) -> None:
     assert (await api_client.get("/api/system/health")).status_code == 401
     await due_slot(engine)
     async with engine.begin() as c: await run_tick(c, now=utcnow() + timedelta(hours=2), defer=defer_in_tx)
     body = (await logged_in_client.get("/api/system/health")).json()
-    assert body["last_run"]["status"] == "queued" and body["last_run"]["trigger"] == "catch_up"   # newest by (queued_at, id)
+    # anchor and anchor+1h are missed; anchor+2h is about 1 min old at this tick, within CATCH_UP_AFTER, so 'schedule' (Task 11)
+    assert body["last_run"]["status"] == "queued" and body["last_run"]["trigger"] == "schedule"   # newest by (queued_at, id)
     assert body["alerts_open"] == {"info": 0, "warn": 0, "critical": 0} and body["run_age_state"] in ("grace", "none")
     assert body["queue_depths"]["collect"]["todo"] == 1 and body["versions"]["procrastinate"] == "3.10.0"
     assert "worker_heartbeat" in body["ready"]["failing"] and body["table_bytes"]["runs"] > 0
@@ -2850,8 +2953,8 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.api_idempot
 
 **`run_idempotent`** runs inside the caller's transaction:
 1. A missing key, or one that fails `IDEM_KEY_RE`, → 400 `idempotency_key_required`.
-2. `SET LOCAL lock_timeout = '5s'`, then `INSERT … (status='in_progress', expires_at = now + 7 d) ON CONFLICT (route, idem_key) DO NOTHING RETURNING 1`.
-   - `LockNotAvailable` (SQLSTATE 55P03) → 409 `idempotency_in_progress`.
+2. `SELECT set_config('lock_timeout', :t, true)` with `t = IN_PROGRESS_LOCK_TIMEOUT`, read at call time; then `INSERT … (status='in_progress', expires_at = now + 7 d) ON CONFLICT (route, idem_key) DO NOTHING RETURNING 1`; then `set_config('lock_timeout', '0', true)`, so the handler runs without the timeout (Task 4 sets no server-wide `lock_timeout`).
+   - A `sqlalchemy.exc.OperationalError` with `pg_error(exc).sqlstate == LOCK_NOT_AVAILABLE` (55P03) → 409 `idempotency_in_progress`. Nothing in this transaction has to persist, so raising here is correct. Any other error re-raises. `test_same_key_in_flight_elsewhere_is_409` takes this branch.
    - Inserted: `resp = await handler(conn)`, then `UPDATE … SET status='completed', response_status, response_body` (JSONB-bound), and return `resp`.
 3. Otherwise, select the row:
    - expired → delete it and retry the insert once;
@@ -2874,7 +2977,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.api_idempot
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/unit/test_idempotency_fingerprint.py tests/integration/test_runs_api.py -q`
-Expected: PASS (8 passed)
+Expected: PASS (9 passed)
 
 - [ ] **Step 5: Commit**
 
@@ -2900,7 +3003,8 @@ git commit -m "feat(m0): Idempotency-Key store, Run now endpoint, system health 
     - `caddy=caddy:2.11.7-alpine@sha256:…`;
     - `uv=ghcr.io/astral-sh/uv:0.13.1@sha256:…`;
     - `actionlint=rhysd/actionlint:1.7.7@sha256:…`.
-  - **Image `jobhunter-app:dev`**, built from `Dockerfile`, which takes `ARG` values for the digests: `uv sync --frozen --no-dev` into `/opt/venv`, `USER 10001:10001`.
+  - **Image `jobhunter-app:dev`**, built from the `Dockerfile` below with the build args `PYTHON_IMAGE` and `UV_IMAGE` from `deploy/images.lock`. It is a non-editable install (`uv sync --frozen --no-dev --no-editable`) into `/opt/venv`, so the runtime stage holds no source tree; `USER 10001:10001`.
+  - **Every `docker compose` call** passes `--env-file deploy/images.lock`. The lock file's `<name>=<image>` lines are valid compose variables, and the compose file references them as `${pgvector:?}`, `${python:?}`, `${uv:?}` and `${caddy:?}`, so a missing digest fails loudly.
   - **Compose project `jobhunter-dev`**: the `x-app` anchor of §19.1 (`read_only`, `tmpfs: [/tmp]`, `cap_drop: [ALL]`, `no-new-privileges`, `user: "10001:10001"`, `group_add: ["10010"]`, local logging). Services:
     - `postgres` (digest image, `user: "999:999"`, `group_add: ["10010"]`, secrets `pg_bootstrap, db_app, db_migrator, db_backup, db_restore`);
     - `migrate`;
@@ -2923,7 +3027,7 @@ from pathlib import Path
 import httpx, pytest
 pytestmark = pytest.mark.stack
 REPO = Path(__file__).resolve().parents[2]
-DC = ["docker", "compose", "-f", str(REPO / "deploy/compose.dev.yaml")]
+DC = ["docker", "compose", "--env-file", str(REPO / "deploy/images.lock"), "-f", str(REPO / "deploy/compose.dev.yaml")]
 PROBE_NAME = "jh-egress-probe"
 
 @pytest.fixture(scope="module")
@@ -2941,6 +3045,23 @@ def exec_(svc: str, code: str) -> int:
     return subprocess.run(DC + ["exec", "-T", svc, "python", "-c", code]).returncode
 
 PROBE = "import socket,sys\ntry:\n socket.create_connection(({host!r},{port}),timeout=3)\nexcept OSError:\n sys.exit(1)"
+
+IMAGE_CHECK = "\n".join([
+    "import importlib.resources as r, pathlib, jobhunter",
+    "from jobhunter.db.alembic_runner import code_head",
+    "site = pathlib.Path('/opt/venv/lib/python3.13/site-packages')",
+    "assert pathlib.Path(jobhunter.__file__).resolve().is_relative_to(site / 'jobhunter'), jobhunter.__file__",
+    "assert not list(site.glob('*jobhunter*.pth')), 'editable install'",
+    "assert r.files('jobhunter.db').joinpath('seed_data/settings_v1.json').is_file()",
+    "assert r.files('jobhunter.db').joinpath('migrations/versions/0002_m0_transition_matrix.py').is_file()",
+    "assert r.files('jobhunter.auth').joinpath('common_passwords.txt').is_file()",
+    "assert code_head() == '0002_m0_transition_matrix'",
+    "assert not pathlib.Path('/src').exists()",
+])
+
+def test_final_image_runs_the_installed_package_with_its_resources(stack) -> None:
+    r = subprocess.run(["docker", "run", "--rm", "jobhunter-app:dev", "python", "-I", "-c", IMAGE_CHECK], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
 
 def test_dev_stack_serves_through_devproxy(stack) -> None:
     r = httpx.get("http://localhost:8080/healthz", timeout=5)
@@ -2982,8 +3103,31 @@ Expected: FAIL with `No such file or directory: '…/scripts/dev-secrets.sh'`
 
 - [ ] **Step 3: Write the Dockerfile, the compose file, the Caddyfile and the secrets script, and record the digests**
 
-- `Dockerfile`: stage `build` `FROM ${PYTHON_IMAGE}` plus `COPY --from=${UV_IMAGE} /uv /usr/local/bin/uv`; stage `runtime` copies `/opt/venv`, sets `PATH`, `USER 10001:10001`.
-- `compose.dev.yaml` passes the digests from `deploy/images.lock` as build args and image references. Dependencies: `migrate` → postgres healthy; `api` and `worker` → `migrate: service_completed_successfully`. Healthchecks as in §19.1.
+- `Dockerfile`. BuildKit does not expand variables in `COPY --from`, so the uv image becomes a named stage:
+
+```dockerfile
+ARG PYTHON_IMAGE
+ARG UV_IMAGE
+FROM ${UV_IMAGE} AS uv
+
+FROM ${PYTHON_IMAGE} AS build
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+WORKDIR /src
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --frozen --no-dev --no-editable --no-install-project
+COPY backend ./backend
+RUN uv sync --frozen --no-dev --no-editable
+
+FROM ${PYTHON_IMAGE} AS runtime
+COPY --from=build /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1
+WORKDIR /
+USER 10001:10001
+```
+
+- `.dockerignore` excludes `.git`, `.venv`, `.secrets`, `frontend/node_modules`, `frontend/dist` and `__pycache__`.
+- `compose.dev.yaml` takes the digests from `deploy/images.lock` through `--env-file`: `build: {context: .., dockerfile: Dockerfile, args: {PYTHON_IMAGE: "${python:?}", UV_IMAGE: "${uv:?}"}}` with `image: jobhunter-app:dev` for the app services, `image: "${pgvector:?}"` for postgres and `image: "${caddy:?}"` for devproxy. Dependencies: `migrate` → postgres healthy; `api` and `worker` → `migrate: service_completed_successfully`. Healthchecks as in §19.1.
 - `Caddyfile.dev`:
 
 ```
@@ -3136,7 +3280,7 @@ git commit -m "ci(m0): lint, unit, integration (digest-pinned pgvector, crash ca
 
 - [ ] **Step 1: Write the smoke script**
 
-`scripts/smoke_m0.py` drives `deploy/compose.dev.yaml` with `subprocess` and `httpx`, using the canonical origin `http://localhost:8080`:
+`scripts/smoke_m0.py` drives `deploy/compose.dev.yaml` (always with `--env-file deploy/images.lock`) with `subprocess` and `httpx`, using the canonical origin `http://localhost:8080`:
 1. `docker compose … run --rm -T api jobhunter user create --username smoke --password-stdin` with stdin `Tannenbaum-Ölfass-7\n`; expect exit 0.
 2. `POST http://localhost:8080/api/auth/login` with `Origin: http://localhost:8080`; expect 204. Replay the token from `Set-Cookie` as an explicit `Cookie` header (httpx does not send `Secure` cookies over plain HTTP; this proves the backend session only).
 3. Poll `GET /api/system/health` for up to 60 s until `ready.ok is true`.
@@ -3153,7 +3297,7 @@ dockerd >/tmp/dockerd.log 2>&1 & sleep 3
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 uv run pytest -q && uv run pytest tests/stack -m stack -q && uv run pytest tests/perf -m perf -q
 (cd frontend && npm test && npm run build && npm run lint && npm run typecheck) && scripts/check-openapi-drift.sh
-docker compose -f deploy/compose.dev.yaml up -d --build --wait
+docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml up -d --build --wait
 uv run python scripts/smoke_m0.py
 ```
 
