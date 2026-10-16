@@ -2,9 +2,11 @@
 
 `redact_event` is the structlog processor that runs last before rendering. It redacts the values of
 sensitive keys, and masks e-mail addresses, phone numbers, key-like tokens, secrets in query strings and
-the loaded secret values in every string, in nested dicts, lists, tuples and sets, in nested dict keys, and
-in the string form of any other object. It cannot know a secret that has neither a listed key, nor a
-recognisable shape, nor a registration with `register_secret_values`; callers must not log such values.
+JSON bodies, authorization schemes and the loaded secret values in every string, in nested dicts, lists,
+tuples and sets, and in the string form of any other object. The keys of nested dicts are masked the same
+way, whether or not they are sensitive (the keys of the event itself are keyword names and stay as they
+are). It cannot know a secret that has neither a listed key, nor a recognisable shape, nor a registration
+with `register_secret_values`; callers must not log such values.
 
 `redact_event` never raises: a cyclic or over-deep container renders as `[RECURSION]`, and any other
 failure replaces the whole event with a fail-closed one that carries no logged data.
@@ -14,7 +16,7 @@ import re
 import threading
 from collections.abc import Iterable, MutableMapping
 from typing import Any, Final
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urlsplit
 
 from jobhunter.secret_names import SECRET_NAMES
 
@@ -41,10 +43,13 @@ REDACT_PREFIXES: Final[tuple[str, ...]] = ("description", "profile", "cv", "raw_
 REDACT_SUFFIXES: Final[tuple[str, ...]] = ("_api_key", "_app_key", "_secret", "_password", "_token")
 
 REDACTED: Final = "[REDACTED]"
-# Strings longer than this are cut before any pattern runs, which bounds the cost of every pattern. The
-# head and the tail stay, so that the last line of a traceback survives.
+# A masked string longer than this is cut to its head and its tail, so that the last line of a traceback
+# survives. The cut comes after the masking, so no fragment of a secret is left at the cut.
 MAX_TEXT_LENGTH: Final = 16384
 TRUNCATION_MARKER: Final = "…[TRUNCATED]…"
+# A string longer than this is reduced to its head and tail before masking, which bounds the work. The
+# join lies in the middle, which the cut at `MAX_TEXT_LENGTH` discards.
+_MAX_MASKED_INPUT: Final = 1_048_576
 # Containers nested deeper than this, and containers that contain themselves, render as `[RECURSION]`.
 MAX_DEPTH: Final = 32
 RECURSION: Final = "[RECURSION]"
@@ -60,9 +65,24 @@ PHONE = re.compile(r"(?<![\w+\-])(?:\+\d{1,3}[ \d/()\-]{6,}\d|0\d{2,5}[ /\-]\d{3
 KEY = re.compile(r"\b(?:sk-[A-Za-z0-9_\-]{20,}|lsv2_[A-Za-z0-9_]{20,}|[A-Za-z0-9+/_\-]{40,}={0,2})")
 # A long run of lower-case words joined by underscores is an identifier (an event name), not a key.
 _SNAKE_CASE_WORDS = re.compile(r"[a-z]+(?:_[a-z]+)+")
-QUERY_SECRET = re.compile(
-    r"(?i)([?&](?:app_id|app_key|api_key|apikey|key|token|access_token|secret|password)=)[^&\s'\"#]+"
+# Parameters that carry secrets: in query strings (`?api_key=...`) and in JSON bodies (`"token": "..."`).
+_SECRET_PARAMETERS: Final = (
+    "app_id",
+    "app_key",
+    "api_key",
+    "apikey",
+    "key",
+    "token",
+    "access_token",
+    "refresh_token",
+    "secret",
+    "client_secret",
+    "password",
 )
+_PARAMETER_NAMES = "|".join(_SECRET_PARAMETERS)
+QUERY_SECRET = re.compile(rf"(?i)([?&](?:{_PARAMETER_NAMES})=)[^&\s'\"#]+")
+JSON_SECRET = re.compile(rf'(?i)("(?:{_PARAMETER_NAMES})"\s*:\s*")[^"]*')
+AUTHORIZATION = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
 
 # A capturing group makes `split` keep the UUID spans, at the odd indices.
 _SPLIT_ON_UUID = re.compile(f"({UUID.pattern})")
@@ -73,18 +93,37 @@ _secret_values: set[str] = set()
 _secret_pattern: re.Pattern[str] | None = None
 
 
+def _secret_forms(value: str) -> set[str]:
+    """`value` and the other forms in which it can show up in a log line."""
+    forms = {value}
+    try:
+        url = urlsplit(value)
+    except ValueError:
+        url = None
+    if url is not None and url.scheme in ("http", "https") and url.netloc:
+        # The last path segment can be the credential itself (a healthchecks ping UUID).
+        segments = [segment for segment in url.path.split("/") if segment]
+        if segments and len(segments[-1]) >= _MIN_SECRET_LENGTH:
+            forms.add(segments[-1])
+        forms.add(("http" if url.scheme == "https" else "https") + value[len(url.scheme) :])
+    return forms
+
+
 def register_secret_values(values: Iterable[str]) -> None:
     """Make `mask_text` replace every verbatim occurrence of these values with `[SECRET]`.
 
     Values are stripped; those shorter than 8 characters after stripping are ignored, as they would
-    mask ordinary words. The percent-encoded forms (`quote`, `quote_plus`) are registered as well, as
-    they appear in connection strings and URLs. Registrations accumulate over calls.
+    mask ordinary words. For a value that is an `http(s)` URL, its last path segment (when it has 8
+    characters or more) and the URL with the other scheme are registered as well. The percent-encoded
+    forms (`quote`, `quote_plus`) of everything are registered too, as they appear in connection strings
+    and URLs. Registrations accumulate over calls.
     """
     global _secret_pattern
     new: set[str] = set()
     for value in values:
         if len(stripped := value.strip()) >= _MIN_SECRET_LENGTH:
-            new.update((stripped, quote(stripped, safe=""), quote_plus(stripped)))
+            for form in _secret_forms(stripped):
+                new.update((form, quote(form, safe=""), quote_plus(form)))
     with _secret_lock:
         _secret_values.update(new)
         if _secret_values:
@@ -106,24 +145,36 @@ def _mask_key_like(match: re.Match[str]) -> str:
     return token if _SNAKE_CASE_WORDS.fullmatch(token) else "[KEY]"
 
 
-def mask_text(value: str) -> str:
-    """Mask secrets and personal data in `value`; canonical UUIDs stay as they are.
-
-    Order: truncate (keeping head and tail), registered secret values, e-mail addresses (on the whole
-    string, so a UUID in the local part is masked with it), secrets in query strings, then phone numbers
-    and key-like tokens in the parts between UUIDs.
-    """
-    if len(value) > MAX_TEXT_LENGTH:
-        half = MAX_TEXT_LENGTH // 2
-        value = value[:half] + TRUNCATION_MARKER + value[-half:]
+def _mask_all(value: str) -> str:
     if (secrets := _secret_pattern) is not None:
         value = secrets.sub("[SECRET]", value)
     value = EMAIL.sub("[EMAIL]", value)
     value = QUERY_SECRET.sub(rf"\1{REDACTED}", value)
+    value = JSON_SECRET.sub(rf"\1{REDACTED}", value)
+    value = AUTHORIZATION.sub(rf"\1 {REDACTED}", value)
     parts = _SPLIT_ON_UUID.split(value)
     for i in range(0, len(parts), 2):
         parts[i] = KEY.sub(_mask_key_like, PHONE.sub("[PHONE]", parts[i]))
     return "".join(parts)
+
+
+def mask_text(value: str) -> str:
+    """Mask secrets and personal data in `value`; canonical UUIDs stay as they are.
+
+    Order: registered secret values, e-mail addresses (on the whole string, so a UUID in the local part
+    is masked with it), secrets in query strings and JSON bodies, `Bearer`/`Basic` credentials, then
+    phone numbers and key-like tokens in the parts between UUIDs. Only then is a long result cut to its
+    head and tail (and an input over 1 MiB reduced to its head and tail before the masking).
+    """
+    original_length = len(value)
+    if original_length > _MAX_MASKED_INPUT:
+        half = _MAX_MASKED_INPUT // 2
+        value = value[:half] + value[-half:]
+    masked = _mask_all(value)
+    if original_length > MAX_TEXT_LENGTH and len(masked) > MAX_TEXT_LENGTH:
+        half = MAX_TEXT_LENGTH // 2
+        masked = masked[:half] + TRUNCATION_MARKER + masked[-half:]
+    return masked
 
 
 def _is_sensitive_key(key: object) -> bool:
@@ -141,11 +192,12 @@ def _is_sensitive_key(key: object) -> bool:
 def _redact_mapping(data: dict[Any, Any], *, top_level: bool, active: set[int]) -> dict[Any, Any]:
     out: dict[Any, Any] = {}
     for key, value in data.items():
+        # Keys of the event itself are keyword names; keys of nested dicts are data and can be anything,
+        # so they are masked, as `str` (JSON needs that anyway), whether or not they are sensitive.
+        out_key = key if top_level else mask_text(key if isinstance(key, str) else str(key))
         if _is_sensitive_key(key):
-            out[key] = REDACTED
+            out[out_key] = REDACTED
             continue
-        # Keys of the event itself are keyword names; keys of nested dicts are data and can be anything.
-        out_key = key if top_level or not isinstance(key, str) else mask_text(key)
         out[out_key] = (
             value if top_level and key in _UNMASKED_TOP_LEVEL_KEYS else _redact_value(value, active)
         )

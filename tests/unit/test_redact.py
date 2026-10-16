@@ -242,11 +242,23 @@ def test_the_level_argument_filters_events() -> None:
 
 
 def test_mask_text_is_bounded_on_adversarial_input() -> None:
-    for text in ("a" * 200_000, "a." * 100_000):
+    for text in ("a" * 200_000, "a." * 100_000, "a@" * 100_000, "+1 " * 100_000):
         started = time.perf_counter()
         out = mask_text(text)
         assert time.perf_counter() - started < 1.0
-        assert "…[TRUNCATED]…" in out and len(out) < 20_000
+        assert len(out) < 20_000
+    assert mask_text("a." * 100_000).count("…[TRUNCATED]…") == 1
+    assert mask_text("a" * 200_000) == "[KEY]"  # masking left nothing long enough to cut
+
+
+def test_megabyte_inputs_are_masked_in_bounded_time() -> None:
+    redact.register_secret_values([f"registered-secret-value-{i:02d}-abcdef" for i in range(20)])
+    for text in ("word, " * 500_000, "a." * 1_500_000, "0123 456 " * 333_334, "x@y.de " * 430_000):
+        assert len(text) > 2_900_000
+        started = time.perf_counter()
+        out = mask_text(text)
+        assert time.perf_counter() - started < 2.0
+        assert len(out) <= 16_384 + len("…[TRUNCATED]…")
 
 
 def test_strings_up_to_the_cap_are_not_truncated() -> None:
@@ -415,3 +427,116 @@ def test_a_redaction_failure_in_a_log_call_renders_only_the_fail_closed_event() 
     assert line.keys() == {"ts", "level", "logger", "event", "error_type"}
     assert line["event"] == "redaction_failed" and line["error_type"] == "RuntimeError"
     assert line["logger"] == "t" and "detail" not in buf.getvalue() and "example.org" not in buf.getvalue()
+
+
+SECRET32 = "Q7xT2vLmB9wKd4RnE6yUa1ZcH8sJf3Pg"
+FILLER = "ab " * 4000
+
+
+def test_a_registered_secret_across_the_head_cut_leaves_no_fragment() -> None:
+    assert len(SECRET32) == 32
+    redact.register_secret_values([SECRET32])
+    out = mask_text(FILLER[: 8192 - 16] + SECRET32 + FILLER)
+    assert "…[TRUNCATED]…" in out
+    assert not any(SECRET32[i : i + 6] in out for i in range(0, 27, 3))
+
+
+def test_a_registered_secret_across_the_tail_cut_leaves_no_fragment() -> None:
+    redact.register_secret_values([SECRET32])
+    out = mask_text(FILLER + SECRET32 + FILLER[: 8192 - 16])
+    assert "…[TRUNCATED]…" in out
+    assert not any(SECRET32[i : i + 6] in out for i in range(0, 27, 3))
+
+
+def test_an_email_across_the_head_or_tail_cut_leaves_no_fragment() -> None:
+    address = "max.mustermann@example.org"
+    for text in (
+        FILLER[: 8192 - 14] + address + FILLER,
+        FILLER + address + FILLER[: 8192 - 12],
+    ):
+        out = mask_text(text)
+        assert "…[TRUNCATED]…" in out
+        assert not any(part in out for part in ("max.", "muster", "mann@", "@exam", "example"))
+
+
+def test_sensitive_nested_keys_are_masked_like_any_other_key() -> None:
+    ev = redact_event(
+        None,
+        "info",
+        {
+            "event": "x",
+            "recipients": {
+                "cv.mueller@example.org": "sent",
+                "profile max@example.org": 1,
+                "hr@acme.de_token": "t",
+            },
+        },
+    )
+    assert ev["recipients"] == {
+        "[EMAIL]": "[REDACTED]",
+        "profile [EMAIL]": "[REDACTED]",
+        "[EMAIL]_token": "[REDACTED]",
+    }
+    assert "example.org" not in json.dumps(ev) and "acme.de" not in json.dumps(ev)
+
+
+def test_non_string_nested_keys_are_emitted_as_masked_strings() -> None:
+    ev = redact_event(None, "info", {"event": "x", "m": {("max@example.org", 1): "x", 5: "y"}})
+    assert ev["m"] == {"('[EMAIL]', 1)": "x", "5": "y"}
+
+
+def test_a_malformed_positional_call_does_not_raise_and_still_masks() -> None:
+    buf = io.StringIO()
+    configure_logging("INFO", stream=buf)
+    log = get_logger("t")
+    log.info("done", "max@example.org")
+    log.info("x %d", "str")
+    log.info("to %(who)s", {"who": "max@example.org"})
+    first, second, third = (json.loads(line) for line in buf.getvalue().splitlines())
+    assert first["event"] == "done" and first["positional_args"] == ["[EMAIL]"]
+    assert second["event"] == "x %d" and second["positional_args"] == ["str"]
+    assert third["event"] == "to [EMAIL]" and "positional_args" not in third
+    assert "example.org" not in buf.getvalue()
+
+
+class BrokenStream(io.StringIO):
+    def write(self, s: str) -> int:
+        raise RuntimeError("disk gone")
+
+
+def test_handle_error_never_raises_even_when_the_stream_is_broken() -> None:
+    configure_logging("INFO", stream=BrokenStream())
+    logging.getLogger("lib").info("hello")  # must not raise out of the log call
+
+
+def test_before_configure_logging_stdlib_records_reach_last_resort_masked(capsys) -> None:
+    lonely = logging.getLogger("lonely")  # no handler anywhere on its path
+    lonely.propagate = False
+    lonely.warning("contact max@example.org")
+    err = capsys.readouterr().err
+    line = json.loads(err)
+    assert line["logger"] == "lonely" and line["level"] == "warning"
+    assert line["event"] == "contact [EMAIL]" and "example.org" not in err
+
+
+def test_the_path_segment_and_the_other_scheme_of_a_registered_url_are_masked() -> None:
+    uuid_text = "5f3e2a1b-0000-7000-8000-c4d3e2f1a0b9"
+    redact.register_secret_values([f"https://hc-ping.com/{uuid_text}"])
+    assert mask_text(f"ping {uuid_text} done") == "ping [SECRET] done"
+    assert mask_text(f"http://hc-ping.com/{uuid_text}/fail") == "[SECRET]/fail"
+    assert mask_text(f"https://hc-ping.com/{uuid_text}") == "[SECRET]"
+    redact.register_secret_values(["https://example.org/v1"])
+    assert mask_text("see v1 and https://example.org/v1") == "see v1 and [SECRET]"  # "v1" is too short
+
+
+def test_secrets_in_json_bodies_and_authorization_schemes_are_replaced() -> None:
+    body = '{"access_token": "abc123", "Client_Secret":"s3 cr3t", "name": "keep", "refresh_token" : "r"}'
+    expected = '{"access_token": "[REDACTED]", "Client_Secret":"[REDACTED]", "name": "keep", '
+    assert mask_text(body) == expected + '"refresh_token" : "[REDACTED]"}'
+    assert mask_text("failed with Bearer eyJhbGciOi.abc-def_ghi= for x") == (
+        "failed with Bearer [REDACTED] for x"
+    )
+    assert mask_text("header basic dXNlcjpwYXNz") == "header basic [REDACTED]"
+    assert mask_text("GET /x?refresh_token=abc&client_secret=def") == (
+        "GET /x?refresh_token=[REDACTED]&client_secret=[REDACTED]"
+    )
