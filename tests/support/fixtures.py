@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Final, Protocol
 
+import procrastinate
 import psycopg
 import pytest
 import structlog
@@ -15,6 +16,7 @@ from jobhunter.db.session import make_engine
 from jobhunter.observability import redact
 from jobhunter.types import get_int, get_str
 from jobhunter.worker.lock import ADVISORY_LOCK_KEY, LockSession, acquire_lock
+from jobhunter.worker.tasks import make_queue_app
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_pg_server, start_pg_server
@@ -223,3 +225,14 @@ def worker_lock(migrated: PgServer, make_config: ConfigFactory) -> Iterator[Lock
         yield session
     finally:
         session.close()
+
+
+@pytest.fixture
+async def queue_app(migrated: PgServer, make_config: ConfigFactory) -> AsyncIterator[procrastinate.App]:
+    """The task app of this process (`make_queue_app`) against the shared server, open for the test.
+
+    `defer_in_tx` and the stalled-job queries work on it; its pool is closed after the test.
+    """
+    app = make_queue_app(make_config("worker", migrated).dsn("psycopg"))
+    async with app.open_async():
+        yield app
