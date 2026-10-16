@@ -191,6 +191,33 @@ def test_cli_logs_the_failed_check_as_one_critical_json_event(tmp_path: Path) ->
     assert event["logger"] == "jobhunter.startup" and "ts" in event and "detail" in event
 
 
+def test_startup_or_exit_registers_the_loaded_secret_values_for_masking(tmp_path: Path, monkeypatch) -> None:
+    from jobhunter.config import startup_or_exit
+    from jobhunter.observability.redact import mask_text
+
+    adzuna_key = "0123456789abcdef0123456789abcdef"
+    ping_url = "https://hc-ping.com/5f3e2a1b-0000-7000-8000-c4d3e2f1a0b9"
+    d = write_secrets(
+        tmp_path / "s",
+        **WORKER_SECRETS,
+        adzuna_app_key=adzuna_key.encode(),
+        healthchecks_ping_url=ping_url.encode(),
+    )
+    for name, value in {**BASE_ENV, "JOBHUNTER_SECRETS_DIR": str(d)}.items():
+        monkeypatch.setenv(name, value)
+
+    startup_or_exit("worker")
+
+    assert mask_text(f"key {adzuna_key}") == "key [SECRET]"
+    assert mask_text(f"ping {ping_url}") == "ping [SECRET]"
+
+
+def test_all_secrets_is_the_import_free_secret_name_catalogue() -> None:
+    from jobhunter import secret_names
+
+    assert ALL_SECRETS is secret_names.SECRET_NAMES and len(ALL_SECRETS) == 20
+
+
 # --- Additional coverage of behaviour the task brief specifies in prose -----------------------------------
 
 

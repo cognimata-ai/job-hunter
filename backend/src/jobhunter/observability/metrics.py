@@ -5,7 +5,11 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, star
 REGISTRY = CollectorRegistry()
 
 RUNS = Counter("jobhunter_runs", "Runs that reached a terminal status.", ["status"], registry=REGISTRY)
-RUN_DURATION = Histogram("jobhunter_run_duration_seconds", "Duration of a run.", registry=REGISTRY)
+# A run takes seconds to an hour; `+Inf` is implicit.
+RUN_BUCKETS = (1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600)
+RUN_DURATION = Histogram(
+    "jobhunter_run_duration_seconds", "Duration of a run.", buckets=RUN_BUCKETS, registry=REGISTRY
+)
 HTTP_REQUESTS = Counter(
     "jobhunter_http_requests", "HTTP requests served.", ["route", "status"], registry=REGISTRY
 )

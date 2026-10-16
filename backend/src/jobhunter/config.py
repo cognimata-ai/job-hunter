@@ -21,6 +21,8 @@ from typing import Final, Literal, cast, get_args
 from urllib.parse import quote
 
 from jobhunter.observability.logging import configure_logging, get_logger
+from jobhunter.observability.redact import register_secret_values
+from jobhunter.secret_names import SECRET_NAMES
 
 Role = Literal["api", "worker", "migrate"]
 EnvName = Literal["prod", "dev", "test"]
@@ -41,31 +43,7 @@ _FAKE_MODE_VARS: Final = ("JOBHUNTER_FAKE_SOURCES", "JOBHUNTER_FAKE_LLM", "JOBHU
 _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_API_KEY")
 _WORLD_READABLE: Final = 0o004
 
-# Every secret file name that spec §19.2 lists, and nothing else.
-ALL_SECRETS: Final[frozenset[str]] = frozenset(
-    {
-        "session_secret",
-        "data_key",
-        "data_key_previous",
-        "db_app",
-        "db_migrator",
-        "db_backup",
-        "db_restore",
-        "pg_bootstrap",
-        "anthropic_key",
-        "rapidapi_key",
-        "serpapi_key",
-        "adzuna_app_id",
-        "adzuna_app_key",
-        "langsmith_key",
-        "ntfy_token",
-        "healthchecks_ping_url",
-        "healthchecks_api_key",
-        "restic_password",
-        "s3_access_key_id",
-        "s3_secret_access_key",
-    }
-)
+ALL_SECRETS: Final = SECRET_NAMES
 
 
 @dataclass(frozen=True)
@@ -327,6 +305,8 @@ def startup_or_exit(role: Role) -> AppConfig:
     configure_logging()
     try:
         cfg = load_config(role)
+        # From here on a secret value that reaches a log line is masked, whatever shape it has.
+        register_secret_values(value.decode("utf-8", errors="ignore") for value in cfg.secrets.values())
         run_startup_assertions(cfg)
     except StartupCheckFailed as exc:
         _log_startup_failure(role, exc)

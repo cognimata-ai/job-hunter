@@ -29,3 +29,12 @@ def test_metrics_server_serves_the_dedicated_registry(monkeypatch) -> None:
     monkeypatch.setattr(metrics, "start_http_server", lambda port, registry: calls.append((port, registry)))
     metrics.start_metrics_server(9100)
     assert calls == [(9100, metrics.REGISTRY)]
+
+
+def test_run_duration_buckets_cover_minutes_to_an_hour() -> None:
+    metrics.RUN_DURATION.observe(90)
+    text = generate_latest(metrics.REGISTRY).decode()
+    assert 'jobhunter_run_duration_seconds_bucket{le="1.0"} 0.0' in text
+    assert 'jobhunter_run_duration_seconds_bucket{le="120.0"}' in text
+    assert 'jobhunter_run_duration_seconds_bucket{le="3600.0"}' in text
+    assert 'jobhunter_run_duration_seconds_bucket{le="10.0"}' not in text
