@@ -21,7 +21,7 @@ from urllib.parse import quote
 
 import psycopg
 import pytest
-from jobhunter.config import _ENV_PREFIXES, ROLE_SECRETS, AppConfig, Role, load_config
+from jobhunter.config import ENV_PREFIXES, ROLE_SECRETS, AppConfig, Role, load_config
 
 PgRole = Literal["superuser", "migrator", "app", "backup", "restore"]
 
@@ -55,6 +55,11 @@ _READY_MESSAGE: Final = "database system is ready to accept connections"
 _START_TIMEOUT_S: Final = 60.0
 _POLL_INTERVAL_S: Final = 0.25
 _LOG_TAIL_LINES: Final = 50
+_PULL_TIMEOUT_S: Final = 600.0
+_PORT_ATTEMPTS: Final = 3
+# Every server carries the pid of the test process that started it, so a later run can remove what a killed
+# run left behind.
+_OWNER_LABEL: Final = "jh-test-pg.pid"
 
 
 def pg_image() -> str:
@@ -209,6 +214,90 @@ def _wait_ready(server: PgServer, *, ready_messages: int = 0) -> None:
         time.sleep(_POLL_INTERVAL_S)
 
 
+def _ensure_image() -> None:
+    """Make the pinned image present first, so the timeout of `docker run` never covers a pull."""
+    image = pg_image()
+    if _docker("image", "inspect", image).returncode == 0:
+        return
+    pulled = _docker("pull", image, timeout=_PULL_TIMEOUT_S)
+    if pulled.returncode != 0:
+        pytest.fail(f"docker pull {image} failed:\n{pulled.stderr.strip()}", pytrace=False)
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, it just belongs to someone else
+    return True
+
+
+def remove_stale_pg_servers() -> None:
+    """Remove (with their volumes) the servers whose starting test process no longer exists.
+
+    A hard kill (SIGKILL, an OOM kill) skips every fixture teardown, so the container outlives its run.
+    Never touches a server whose process is alive, such as a concurrent run's.
+    """
+    listing = _docker(
+        "ps",
+        "-a",
+        "--filter",
+        f"label={_OWNER_LABEL}",
+        "--format",
+        '{{.Names}} {{.Label "' + _OWNER_LABEL + '"}}',
+    )
+    for line in listing.stdout.splitlines():
+        name, _, pid_text = line.partition(" ")
+        if pid_text.strip().isdigit() and not _process_alive(int(pid_text)):
+            _remove_container(name)
+
+
+def _run_container(name: str, port: int, workdir: Path) -> subprocess.CompletedProcess[str]:
+    # fmt: off
+    return _docker(
+        "run",
+        "-d",
+        "--name", name,
+        "--label", f"{_OWNER_LABEL}={os.getpid()}",
+        "-p", f"127.0.0.1:{port}:5432",
+        "-e", "POSTGRES_USER=jobhunter_bootstrap",
+        "-e", f"POSTGRES_DB={_DB_NAME}",
+        "-e", "POSTGRES_PASSWORD_FILE=/run/secrets/pg_bootstrap",
+        "-v", f"{workdir / 'pgsecrets'}:/run/secrets:ro",
+        "-v", f"{_POSTGRES_DIR / 'init'}:/docker-entrypoint-initdb.d:ro",
+        "-v", f"{_POSTGRES_DIR / 'postgresql.conf'}:/etc/postgresql/postgresql.conf:ro",
+        pg_image(),
+        "postgres",
+        "-c", "config_file=/etc/postgresql/postgresql.conf",
+        "-c", "shared_buffers=128MB",
+        "-c", "effective_cache_size=512MB",
+        "-c", "max_connections=150",
+    )
+    # fmt: on
+
+
+def _start_container(name: str, workdir: Path) -> int:
+    """Run the container on a free host port and return the port.
+
+    The port is probed and then released, so another process can take it in between. Docker then refuses
+    to publish it and the start is tried again with a new port. (A Docker-assigned ephemeral port is no
+    option: Docker gives a container a new one at every `docker start`, and `PgServer.port` must survive
+    `pg_stop` / `pg_start` / `restart_pg_server`.)
+    """
+    for attempt in range(1, _PORT_ATTEMPTS + 1):
+        port = _free_port()
+        run = _run_container(name, port, workdir)
+        if run.returncode == 0:
+            return port
+        _remove_container(name)  # a refused publish leaves the container behind in state "created"
+        port_taken = "address already in use" in run.stderr or "port is already allocated" in run.stderr
+        if not port_taken or attempt == _PORT_ATTEMPTS:
+            pytest.fail(f"docker run failed:\n{run.stderr.strip()}", pytrace=False)
+    raise AssertionError("unreachable")
+
+
 def start_pg_server(workdir: Path) -> PgServer:
     """Start a fresh, initialised PostgreSQL container with its secrets under `workdir`.
 
@@ -216,51 +305,38 @@ def start_pg_server(workdir: Path) -> PgServer:
     carries the last 50 log lines.
     """
     _require_docker()
+    _ensure_image()
+    remove_stale_pg_servers()
     passwords = _write_secrets(workdir)
-    server = PgServer(
-        container=f"jh-test-pg-{secrets.token_hex(4)}",
-        host="127.0.0.1",
-        port=_free_port(),
-        passwords=MappingProxyType(passwords),
-        workdir=workdir,
-    )
+    name = f"jh-test-pg-{secrets.token_hex(4)}"
     started = False
     try:
-        # fmt: off
-        run = _docker(
-            "run",
-            "-d",
-            "--name", server.container,
-            "-p", f"127.0.0.1:{server.port}:5432",
-            "-e", "POSTGRES_USER=jobhunter_bootstrap",
-            "-e", f"POSTGRES_DB={_DB_NAME}",
-            "-e", "POSTGRES_PASSWORD_FILE=/run/secrets/pg_bootstrap",
-            "-v", f"{workdir / 'pgsecrets'}:/run/secrets:ro",
-            "-v", f"{_POSTGRES_DIR / 'init'}:/docker-entrypoint-initdb.d:ro",
-            "-v", f"{_POSTGRES_DIR / 'postgresql.conf'}:/etc/postgresql/postgresql.conf:ro",
-            pg_image(),
-            "postgres",
-            "-c", "config_file=/etc/postgresql/postgresql.conf",
-            "-c", "shared_buffers=128MB",
-            "-c", "effective_cache_size=512MB",
-            "-c", "max_connections=150",
+        port = _start_container(name, workdir)
+        server = PgServer(
+            container=name,
+            host="127.0.0.1",
+            port=port,
+            passwords=MappingProxyType(passwords),
+            workdir=workdir,
         )
-        # fmt: on
-        if run.returncode != 0:
-            pytest.fail(f"docker run failed:\n{run.stderr.strip()}", pytrace=False)
         _wait_ready(server, ready_messages=2)
         started = True
+        return server
     finally:
         if not started:
-            remove_pg_server(server)
-    return server
+            _remove_container(name)
+
+
+def _remove_container(name: str) -> None:
+    """`docker rm -f -v`: the image declares an anonymous data volume, which `-v` removes too."""
+    done = _docker("rm", "-f", "-v", name)
+    if done.returncode != 0 and "No such container" not in done.stderr:
+        raise RuntimeError(f"docker rm {name} failed: {done.stderr.strip()}")
 
 
 def remove_pg_server(server: PgServer) -> None:
     """Remove the container and its anonymous data volume; removing a container that is gone is fine."""
-    done = _docker("rm", "-f", "-v", server.container)
-    if done.returncode != 0 and "No such container" not in done.stderr:
-        raise RuntimeError(f"docker rm {server.container} failed: {done.stderr.strip()}")
+    _remove_container(server.container)
 
 
 def _docker_or_fail(*args: str) -> None:
@@ -307,7 +383,7 @@ def process_env(server: PgServer, role: Role, **extra: str) -> dict[str, str]:
     It is the test process's environment without the variables the application reads (`JOBHUNTER_*`,
     `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`), plus `server_env` and `extra`.
     """
-    inherited = {name: value for name, value in os.environ.items() if not name.startswith(_ENV_PREFIXES)}
+    inherited = {name: value for name, value in os.environ.items() if not name.startswith(ENV_PREFIXES)}
     return {**inherited, **server_env(server, role), **extra}
 
 

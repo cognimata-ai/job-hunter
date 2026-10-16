@@ -55,7 +55,7 @@ def pg_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgServer]:
 @pytest.fixture
 def fresh_pg_server(tmp_path: Path) -> Iterator[PgServer]:
     """A PostgreSQL container of its own, with a clean database, for one test."""
-    server = start_pg_server(tmp_path)
+    server = start_pg_server(tmp_path / "pg")
     try:
         yield server
     finally:

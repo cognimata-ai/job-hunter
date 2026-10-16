@@ -32,7 +32,7 @@ DEFAULT_SECRETS_DIR: Final = Path("/run/secrets")
 LANGSMITH_EU_ENDPOINT: Final = "https://eu.api.smith.langchain.com"
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
-_ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
+ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
 _TRACING_VARS: Final = (
     "LANGSMITH_TRACING",
     "LANGSMITH_TRACING_V2",
@@ -189,7 +189,7 @@ def load_config(
     validation applies to every directory.
     """
     source = os.environ if environ is None else environ
-    env = {k: v for k, v in source.items() if k.startswith(_ENV_PREFIXES)}
+    env = {k: v for k, v in source.items() if k.startswith(ENV_PREFIXES)}
 
     env_name = env.get("JOBHUNTER_ENV")
     if env_name not in get_args(EnvName):
