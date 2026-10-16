@@ -111,14 +111,21 @@ def test_watchdog_stop_never_exits(migrated, make_config) -> None:
             return super().heartbeat(instance_id, epoch)
 
     s = GatedSession(make_config("worker").dsn("psycopg"))
-    s.connect()
-    acquire_lock(s)
     exits: list[int] = []
     w = Watchdog(s, uuid.uuid4(), 1, period_s=0.1, exit=lambda code: exits.append(code))  # type: ignore[arg-type,return-value]
-    w.start()
-    assert s.entered.wait(5)  # readiness: a heartbeat is in flight
-    w.stop(timeout_s=0)  # stop() lands before the failing heartbeat returns
-    s.release.set()
-    w.join(5)
-    s.close()
-    assert not w.is_alive() and exits == [] and w.daemon
+    try:
+        s.connect()
+        acquire_lock(s)
+        w.start()
+        assert s.entered.wait(5)  # readiness: a heartbeat is in flight
+        w.stop(timeout_s=0)  # stop() lands before the failing heartbeat returns
+        s.release.set()
+        w.join(5)
+        assert not w.is_alive() and exits == [] and w.daemon
+    finally:
+        # Also after an early failure: stop first, so the released heartbeat can never lead to `exit`.
+        w.stop(timeout_s=0)
+        s.release.set()
+        if w.is_alive():
+            w.join(5)
+        s.close()

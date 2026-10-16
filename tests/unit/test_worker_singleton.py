@@ -10,7 +10,7 @@ from pathlib import Path
 import psycopg
 import pytest
 from jobhunter.config import ENV_PREFIXES
-from jobhunter.worker import lock
+from jobhunter.worker import epoch, lock
 from jobhunter.worker.lock import STANDBY_SLEEP_S, WATCHDOG_EXIT_CODE, LockSession, acquire_lock
 from jobhunter.worker.watchdog import Watchdog
 from structlog.testing import capture_logs
@@ -46,8 +46,34 @@ class ScriptedHeartbeat(LockSession):
 
 def test_the_lock_statements_use_the_lock_key() -> None:
     # The statements keep the spec's literal key (§3.3.1 is quoted verbatim); this ties them to the constant.
-    for statement in (lock._TRY_LOCK, lock._TERMINATE_STALE_HOLDER, lock._HEARTBEAT):
+    for statement in (lock._TRY_LOCK, lock._TERMINATE_STALE_HOLDER, lock._HEARTBEAT, epoch._HOLDS_LOCK):
         assert re.findall(r"\b\d{7}\b", statement) == [str(lock.ADVISORY_LOCK_KEY)]
+
+
+def test_the_lock_session_connects_with_keepalives_and_a_tcp_user_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class Connected(Exception):
+        pass
+
+    def connect(dsn: str, **kwargs: object) -> None:
+        seen.update(kwargs)
+        raise Connected  # the kwargs are all this test needs
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+    with pytest.raises(Connected):
+        LockSession("postgresql://never-connected").connect()
+    assert seen == {
+        "autocommit": True,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        "tcp_user_timeout": 20000,
+        "application_name": "jobhunter-worker-lock",
+    }
 
 
 def test_acquire_lock_retries_at_once_after_a_termination_and_sleeps_per_standby() -> None:

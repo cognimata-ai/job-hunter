@@ -3,8 +3,8 @@
 `ProcessGroup.spawn` starts a child in its own process group with both output streams on pipes. A daemon
 reader thread per stream collects every line; stdout lines that parse as a JSON object are the child's log
 events, which `Proc.wait_event` waits for. The `procs` fixture (`tests/support/fixtures.py`) closes the group
-after the test: every child still alive gets `SIGCONT` (a stopped child must not survive the test) and then
-`SIGKILL`, is waited for, and its pipes are closed.
+after the test: every child's process group gets `SIGCONT` (a stopped process must not survive the test) and
+then `SIGKILL`, the child is waited for, and its pipes are closed once their readers have seen end of file.
 """
 
 import asyncio
@@ -30,6 +30,9 @@ class Proc:
     def __init__(self, popen: subprocess.Popen[str]) -> None:
         self._popen = popen
         self.pid: int = popen.pid
+        # `spawn` starts the child with `start_new_session`, so it leads a process group with its own pid. Its
+        # descendants inherit the group, and with it the pipes.
+        self.pgid: int = popen.pid
         self._cond = threading.Condition()
         self._lines: list[str] = []  # both streams, in arrival order
         self._events: list[dict[str, Any]] = []  # the JSON objects among the stdout lines
@@ -54,8 +57,8 @@ class Proc:
                     if event is not None:
                         self._events.append(event)
                     self._cond.notify_all()
-        except (OSError, ValueError):
-            pass  # the pipe was closed under the reader by `close`: nothing more can arrive
+        except OSError:
+            pass  # a failed read ends the stream as end of file does
         finally:
             with self._cond:
                 self._open_streams -= 1
@@ -112,29 +115,37 @@ class Proc:
         return "".join(self._lines[-_TAIL_LINES:])
 
     def _kill(self) -> int | None:
-        """`SIGCONT`, then `SIGKILL`, to the child's process group if the child is not reaped yet; then wait.
+        """`SIGCONT`, then `SIGKILL`, to the child's whole process group; then wait for the child.
 
-        Returns the exit code, or `None` if the child did not end within `_KILL_WAIT_S`. A reaped child's
-        group is never signalled, so a reused pid can never be hit.
+        The group is signalled even when the child itself was already reaped: a descendant that survived it
+        would keep the pipes open, and their readers would never end. Linux gives no new process a pid that
+        is still a live group's id, so the saved id names this group for as long as any member is alive.
+        Returns the exit code, or `None` if the child did not end within `_KILL_WAIT_S`.
         """
-        if self._popen.poll() is None:
-            for sig in (signals.SIGCONT, signals.SIGKILL):
-                try:
-                    os.killpg(self.pid, sig)
-                except ProcessLookupError:
-                    break
+        for sig in (signals.SIGCONT, signals.SIGKILL):
+            try:
+                os.killpg(self.pgid, sig)
+            except ProcessLookupError:
+                break  # no member of the group is left
         try:
             return self._popen.wait(timeout=_KILL_WAIT_S)
         except subprocess.TimeoutExpired:
             return None
 
-    def _close(self) -> None:
-        """Let the readers drain what is left, then close the pipes."""
+    def _close(self) -> bool:
+        """Let the readers drain what is left, then close the pipes once every reader saw end of file.
+
+        Returns `False`, leaving the pipes open, when a reader is still blocked: closing a pipe under a
+        blocked reader waits for that read to return.
+        """
         for reader in self._readers:
             reader.join(_READER_JOIN_S)
+        if any(reader.is_alive() for reader in self._readers):
+            return False
         for stream in (self._popen.stdout, self._popen.stderr):
             if stream is not None:
                 stream.close()
+        return True
 
 
 def _json_object(line: str) -> dict[str, Any] | None:
@@ -174,15 +185,14 @@ class ProcessGroup:
         return proc
 
     def close(self) -> None:
-        """Kill (`SIGCONT`, then `SIGKILL`) and reap every child still alive, then close all pipes.
+        """Kill (`SIGCONT`, then `SIGKILL`) every child's process group, reap the children, close all pipes.
 
-        Raises `RuntimeError` after doing all of that if a child could not be reaped.
+        Raises `RuntimeError` after doing all of that if a child could not be reaped or a pipe stayed open.
         """
         survivors = [proc.pid for proc in self._procs if proc._kill() is None]
-        for proc in self._procs:
-            proc._close()
-        if survivors:
-            raise RuntimeError(f"children still alive after SIGKILL: {survivors}")
+        held_open = [proc.pid for proc in self._procs if not proc._close()]
+        if survivors or held_open:
+            raise RuntimeError(f"children alive after SIGKILL: {survivors}; pipes still open: {held_open}")
 
 
 def wait_until(pred: Callable[[], bool], timeout_s: float, step_s: float = 0.2) -> None:

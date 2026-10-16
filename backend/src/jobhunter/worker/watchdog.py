@@ -74,7 +74,12 @@ class Watchdog(threading.Thread):
             return  # reached only when an injected `exit` returns
 
     def stop(self, timeout_s: float = 15.0) -> None:
-        """Stop the watchdog and wait up to `timeout_s` for its thread; it never calls `exit` afterwards."""
+        """Stop the watchdog and wait up to `timeout_s` for its thread; it never calls `exit` afterwards.
+
+        It can wait longer than `timeout_s`: when the thread has already decided to exit, `stop()` blocks on
+        that decision until `exit` ends the process, because "no exit after `stop()` returns" wins over the
+        timeout.
+        """
         with self._decision:
             self._stop.set()
         if self.is_alive() and threading.current_thread() is not self:

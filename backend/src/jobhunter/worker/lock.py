@@ -28,6 +28,8 @@ STANDBY_SLEEP_S: Final = 10
 WATCHDOG_EXIT_CODE: Final = 70
 
 LOCK_APPLICATION_NAME: Final = "jobhunter-worker-lock"
+# libpq `tcp_user_timeout` of the lock session (ms): how long sent data may stay unacknowledged (ruling T8-g).
+TCP_USER_TIMEOUT_MS: Final = 20000
 # How long `terminate_stale_holder` waits for the terminated backend to exit (and so to release the lock).
 # Below the 5 s statement timeout, so the wait ends with `false` rather than with a cancelled statement.
 TERMINATE_WAIT_MS: Final = 3000
@@ -87,6 +89,9 @@ class LockSession:
             keepalives_idle=30,
             keepalives_interval=10,
             keepalives_count=3,
+            # Keepalives probe only an idle socket. Without this bound, an in-flight heartbeat on a silent TCP
+            # loss would block for the kernel's retransmission limit (~15 min), far past the 60 s takeover.
+            tcp_user_timeout=TCP_USER_TIMEOUT_MS,
             application_name=LOCK_APPLICATION_NAME,
         )
         try:

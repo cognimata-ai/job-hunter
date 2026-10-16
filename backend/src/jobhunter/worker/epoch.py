@@ -5,6 +5,9 @@ the same transaction, runs every registered takeover sweep. A sweep invalidates 
 (runs, score targets, score cycles, operations) and returns how many rows it took over; the modules that own
 that work register their sweeps with `register_takeover_sweep`. Old owners are thus fenced out atomically at
 takeover.
+
+The claim first proves, in the same transaction, that the claimant's lock session holds the singleton lock;
+a claimant that does not is `FencedOut` before anything is written or swept (ruling T8-h).
 """
 
 from collections.abc import Awaitable, Callable
@@ -15,9 +18,16 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
+from jobhunter.errors import FencedOut
 from jobhunter.observability.logging import get_logger
 
 TakeoverSweep = Callable[[AsyncConnection, int], Awaitable[int]]
+
+# Whether `lock_pid` holds the granted singleton lock (advisory key 7261001) in this database.
+_HOLDS_LOCK: Final = """\
+SELECT EXISTS (SELECT 1 FROM pg_locks
+                WHERE locktype = 'advisory' AND objid = 7261001 AND granted AND pid = :lock_pid
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))"""
 
 # The first worker creates the row with epoch 1; every later one increments it and records itself.
 _CLAIM_EPOCH: Final = """\
@@ -62,9 +72,15 @@ async def claim_epoch_and_sweep(engine: AsyncEngine, ident: WorkerIdentity) -> t
     """Claim the next worker epoch for `ident` and run every takeover sweep, all in one transaction.
 
     Returns the new epoch and the row count of each sweep by name. A failing sweep rolls the whole transaction
-    back, the epoch claim included.
+    back, the epoch claim included. When `ident.lock_backend_pid` does not hold the singleton lock, it raises
+    `FencedOut(owner="worker_lock")` having written nothing and run no sweep.
     """
     async with engine.begin() as conn:
+        holds_lock = (await conn.execute(q(_HOLDS_LOCK), {"lock_pid": ident.lock_backend_pid})).scalar_one()
+        if holds_lock is not True:
+            # Nothing has been written: ending the transaction by raising loses nothing.
+            log.warning("worker_epoch_claim_fenced", lock_backend_pid=ident.lock_backend_pid)
+            raise FencedOut(owner="worker_lock")
         claimed = (
             await conn.execute(
                 q(_CLAIM_EPOCH),
