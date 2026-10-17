@@ -14,6 +14,9 @@ of a threshold and neither lock out. Every login decision therefore holds the tr
 counts the committed attempts of the ones before it (READ COMMITTED: a statement after the lock wait sees
 what the lock holder committed). `jobhunter sessions unlock` (`unlock_all`) is the escape hatch.
 
+`peek_lockout` is the read-only pre-check a login runs before any Argon2 work, so a locked-out client costs
+no hashing; the decision under the lock (`active_lockout`) stays authoritative.
+
 All functions run on the caller's connection and leave the transaction to the caller.
 """
 
@@ -45,7 +48,10 @@ _SERIALIZE = q("SELECT pg_advisory_xact_lock(CAST(:key AS bigint))")
 _DELETE_EXPIRED = q(
     "DELETE FROM login_lockouts WHERE scope IN ('global', :ip_scope) AND locked_until <= :now RETURNING scope"
 )
-_LATEST_LOCK_END = q("SELECT max(locked_until) FROM login_lockouts WHERE scope IN ('global', :ip_scope)")
+_LATEST_LOCK_END = q(
+    "SELECT max(locked_until) FROM login_lockouts "
+    "WHERE scope IN ('global', :ip_scope) AND locked_until > :now"
+)
 _INSERT_ATTEMPT = q(
     "INSERT INTO login_attempts (at, ip, username_hmac, success) "
     "VALUES (:now, CAST(:ip AS inet), :username_hmac, :success)"
@@ -79,6 +85,15 @@ async def serialize(conn: AsyncConnection) -> None:
     await conn.execute(_SERIALIZE, {"key": THROTTLE_LOCK_KEY})
 
 
+async def peek_lockout(conn: AsyncConnection, ip: str, *, now: datetime) -> timedelta | None:
+    """How long `ip` is still locked out (the later of its own and the global lockout), or `None`.
+
+    Read-only and without the throttle lock: a pre-check. Only `active_lockout`, under `serialize`, decides.
+    """
+    locked_until = (await conn.execute(_LATEST_LOCK_END, {"ip_scope": ip_scope(ip), "now": now})).scalar_one()
+    return None if locked_until is None else locked_until - now
+
+
 async def active_lockout(conn: AsyncConnection, ip: str, *, now: datetime) -> timedelta | None:
     """How long `ip` is still locked out (the later of its own and the global lockout), or `None`.
 
@@ -88,8 +103,7 @@ async def active_lockout(conn: AsyncConnection, ip: str, *, now: datetime) -> ti
     expired = await conn.execute(_DELETE_EXPIRED, {"ip_scope": ip_scope(ip), "now": now})
     if GLOBAL_SCOPE in expired.scalars().all():
         await resolve_alert(conn, code=LOCKOUT_ALERT_CODE, subject=GLOBAL_SCOPE)
-    locked_until = (await conn.execute(_LATEST_LOCK_END, {"ip_scope": ip_scope(ip)})).scalar_one()
-    return None if locked_until is None else locked_until - now
+    return await peek_lockout(conn, ip, now=now)
 
 
 async def record_attempt(

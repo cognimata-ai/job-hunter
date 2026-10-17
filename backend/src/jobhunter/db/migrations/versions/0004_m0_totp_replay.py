@@ -7,7 +7,8 @@ A TOTP code stays valid for its 30 s step and, with the ±1 step window of §16.
 §5.2 says a verifier must not accept a code a second time once it validated. `users.totp_last_step` holds
 the step of the code the last successful login used; a login accepts only a code of a later step
 (`api.routes.auth.decide_login`). NULL means no TOTP login since TOTP was last turned on;
-`users.disable_totp` clears it. The spec has no such column; the plan records it as a deviation.
+`users.disable_totp` clears it. The spec has no such column: the deviation is recorded in the SDD ledger
+(ruling T16-a) and joins the plan's Deviations at Task 21.
 
 The column is nullable and has no default, so adding it rewrites no rows. Migrations are expand/contract:
 there is no downgrade.

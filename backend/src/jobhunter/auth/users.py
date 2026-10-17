@@ -42,6 +42,17 @@ _UPDATE_HASH = q("UPDATE users SET password_hash = :new_hash WHERE id = 1")
 _UPDATE_HASH_FROM = q(
     "UPDATE users SET password_hash = :new_hash WHERE id = 1 AND password_hash = :expected_hash"
 )
+# A login's success needs the row still as its verification saw it (ruling T16-a/T16-d). FOR UPDATE: a
+# concurrent `set_password` then waits for the login's commit, so its revocation covers the new session.
+_CONFIRM_UNCHANGED = q(
+    "SELECT id FROM users WHERE id = 1 AND password_hash = :expected_hash AND totp_enabled = :totp_enabled "
+    "FOR UPDATE"
+)
+# RFC 6238 §5.2 (migration 0004): a code's step is accepted once, and never one at or before the last used.
+_CLAIM_TOTP_STEP = q(
+    "UPDATE users SET totp_last_step = :step WHERE id = 1 AND totp_enabled "
+    "AND (totp_last_step IS NULL OR totp_last_step < :step) RETURNING id"
+)
 _ENABLE_TOTP = q("UPDATE users SET totp_secret_enc = :blob, totp_enabled = true WHERE id = 1 RETURNING id")
 _DISABLE_TOTP = q(
     "UPDATE users SET totp_secret_enc = NULL, totp_enabled = false, totp_last_step = NULL WHERE id = 1 "
@@ -145,6 +156,26 @@ async def update_hash(conn: AsyncConnection, new_hash: str, *, expected_hash: st
         await conn.execute(_UPDATE_HASH, {"new_hash": new_hash})
     else:
         await conn.execute(_UPDATE_HASH_FROM, {"new_hash": new_hash, "expected_hash": expected_hash})
+
+
+async def confirm_unchanged(conn: AsyncConnection, *, expected_hash: str, totp_enabled: bool) -> bool:
+    """Lock the user row and say whether it still has `expected_hash` and this TOTP state.
+
+    A login calls it in its decision transaction: `False` means the password changed, or TOTP was turned on
+    or off, since the credentials were verified. The row stays locked until that transaction ends.
+    """
+    row = await conn.execute(
+        _CONFIRM_UNCHANGED, {"expected_hash": expected_hash, "totp_enabled": totp_enabled}
+    )
+    return row.first() is not None
+
+
+async def claim_totp_step(conn: AsyncConnection, step: int) -> bool:
+    """Record `step` as the last TOTP step a login used; `False` when it is not later than the last one.
+
+    `False` also when TOTP is off. A code is thereby accepted once (RFC 6238 §5.2).
+    """
+    return (await conn.execute(_CLAIM_TOTP_STEP, {"step": step})).first() is not None
 
 
 async def enable_totp(conn: AsyncConnection, secret_b32: str, *, data_key: bytes) -> None:

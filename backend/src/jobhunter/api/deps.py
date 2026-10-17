@@ -1,6 +1,6 @@
 """FastAPI dependencies that read the app state and the request state the edge set."""
 
-import time
+from time import monotonic
 from typing import Protocol, runtime_checkable
 
 from fastapi import Request
@@ -72,6 +72,8 @@ async def require_session(request: Request) -> SessionInfo:
 
     The validation (and its slide) runs in a transaction of its own that commits before anything is raised.
     The limit is 600 requests per minute per session (§14.1), counted in memory: the api runs one replica.
+    Both clocks (`utcnow`, `monotonic`) are names of this module, so tests can inject them; patching
+    `time.monotonic` itself would also move the event loop's clock.
     """
     token = request.cookies.get(sessions.SESSION_COOKIE)
     if not token:
@@ -81,6 +83,6 @@ async def require_session(request: Request) -> SessionInfo:
         info = await sessions.validate_session(conn, token, pepper=pepper, now=utcnow())
     if info is None:
         raise _unauthenticated()
-    if not get_rate_limiter(request).hit(info.token_hmac, time.monotonic()):
+    if not get_rate_limiter(request).hit(info.token_hmac, monotonic()):
         raise Problem(429, "throttled", "Too many requests")
     return info

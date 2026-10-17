@@ -61,18 +61,29 @@ def hash_password(p: str) -> str:
     return ARGON2.hash(normalize_password(p))
 
 
+def check_password(stored: str, p: str) -> tuple[bool, bool]:
+    """Whether `p` matches `stored`, and whether `stored` was made with other parameters (`needs_rehash`).
+
+    Exactly one Argon2 verification, whatever the outcome: unlike `verify_password` it computes no new hash,
+    so a login can postpone the rehash until every factor matched (a right password then costs what a wrong
+    one does while the TOTP code is still unchecked). A wrong password and an unusable stored hash are both
+    `(False, False)`; any other failure is a bug and propagates.
+    """
+    try:
+        ARGON2.verify(stored, normalize_password(p))
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False, False
+    return True, ARGON2.check_needs_rehash(stored)
+
+
 def verify_password(stored: str, p: str) -> tuple[bool, str | None]:
     """Whether `p` matches `stored`, and a new hash when `stored` was made with other parameters.
 
     A wrong password and an unusable stored hash are both `(False, None)`; any other failure is a bug and
     propagates. The new hash is only ever returned together with `True`.
     """
-    normalized = normalize_password(p)
-    try:
-        ARGON2.verify(stored, normalized)
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
-        return False, None
-    return True, (ARGON2.hash(normalized) if ARGON2.check_needs_rehash(stored) else None)
+    ok, needs_rehash = check_password(stored, p)
+    return ok, (hash_password(p) if needs_rehash else None)
 
 
 def dummy_verify(p: str) -> None:

@@ -132,10 +132,14 @@ async def test_global_lockout_after_twenty_failures(engine, make_config, make_us
         ).scalar_one() == "critical"
 
 
-async def test_session_idle_absolute_and_slide(logged_in_client, engine) -> None:
+async def test_session_idle_absolute_and_slide(logged_in_client, engine, monkeypatch) -> None:
+    # One injected clock for `require_session` and every timestamp the test writes (no elapsed real time).
+    t = utcnow()
+    monkeypatch.setattr("jobhunter.api.deps.utcnow", lambda: t)
+    at = {"t": t}
     assert (await logged_in_client.get("/api/auth/session")).status_code == 200
     async with engine.begin() as c:
-        await c.execute(sa.text("UPDATE sessions SET last_seen_at = now() - interval '30 seconds'"))
+        await c.execute(sa.text("UPDATE sessions SET last_seen_at = :t - interval '30 seconds'"), at)
         before = (await c.execute(sa.text("SELECT idle_expires_at FROM sessions"))).scalar_one()
     await logged_in_client.get("/api/auth/session")
     async with engine.begin() as c:
@@ -144,21 +148,23 @@ async def test_session_idle_absolute_and_slide(logged_in_client, engine) -> None
         ).scalar_one() == before  # < 1 min: no slide
         await c.execute(
             sa.text(
-                "UPDATE sessions SET last_seen_at = now() - interval '2 minutes', "
-                "idle_expires_at = now() + interval '1 hour'"
-            )
+                "UPDATE sessions SET last_seen_at = :t - interval '2 minutes', "
+                "idle_expires_at = :t + interval '1 hour'"
+            ),
+            at,
         )
     await logged_in_client.get("/api/auth/session")
     async with engine.begin() as c:  # >= 1 min: the slide persisted now + 12 h
         assert (
-            await c.execute(sa.text("SELECT idle_expires_at > now() + interval '11 hours' FROM sessions"))
+            await c.execute(sa.text("SELECT idle_expires_at > :t + interval '11 hours' FROM sessions"), at)
         ).scalar_one() is True
         await c.execute(
             sa.text(
-                "UPDATE sessions SET last_seen_at = now() - interval '2 minutes', "
-                "idle_expires_at = now() + interval '30 minutes', "
-                "absolute_expires_at = now() + interval '1 hour'"
-            )
+                "UPDATE sessions SET last_seen_at = :t - interval '2 minutes', "
+                "idle_expires_at = :t + interval '30 minutes', "
+                "absolute_expires_at = :t + interval '1 hour'"
+            ),
+            at,
         )
     await logged_in_client.get("/api/auth/session")
     async with engine.begin() as c:  # absolute bound: the slide stops at absolute_expires_at
@@ -167,7 +173,7 @@ async def test_session_idle_absolute_and_slide(logged_in_client, engine) -> None
         assert (
             await c.execute(sa.text("SELECT idle_expires_at = absolute_expires_at FROM sessions"))
         ).scalar_one() is True
-        await c.execute(sa.text("UPDATE sessions SET idle_expires_at = now() - interval '1 second'"))
+        await c.execute(sa.text("UPDATE sessions SET idle_expires_at = :t - interval '1 second'"), at)
     r = await logged_in_client.get("/api/auth/session")
     assert (
         r.status_code == 401
@@ -198,9 +204,13 @@ async def test_totp_required_when_enabled(api_client, make_user, engine, make_co
     assert (await login(api_client, totp=pyotp.TOTP(secret).now())).status_code == 204
 
 
-async def test_rate_limit_600_per_minute(logged_in_client) -> None:
+async def test_rate_limit_600_per_minute(logged_in_client, monkeypatch) -> None:
+    clock = [1000.0]  # the injected monotonic clock of `require_session`: every request at the same instant
+    monkeypatch.setattr("jobhunter.api.deps.monotonic", lambda: clock[0])
     codes = [(await logged_in_client.get("/api/auth/session")).status_code for _ in range(601)]
     assert codes[:600].count(200) == 600 and codes[600] == 429
+    clock[0] += 60.0  # the window slid past every counted request
+    assert (await logged_in_client.get("/api/auth/session")).status_code == 200
 
 
 async def test_v20_dev_real_client_ip_through_trusted_proxy(engine, make_config, make_user) -> None:
@@ -288,7 +298,8 @@ async def test_a_totp_code_is_accepted_once(api_client, make_user, engine, make_
             sa.text("SELECT success, count(*) FROM login_attempts GROUP BY 1 ORDER BY 1")
         )
         assert [tuple(row) for row in counts] == [(False, 3), (True, 2)]
-        assert (await c.execute(sa.text("SELECT count(*) FROM sessions"))).scalar_one() == 2
+        # the second success came with the first one's cookie, so it replaced that session (rotation)
+        assert (await c.execute(sa.text("SELECT count(*) FROM sessions"))).scalar_one() == 1
 
 
 async def test_disabling_totp_forgets_the_last_step(engine, make_user) -> None:
@@ -309,14 +320,14 @@ async def test_a_login_with_a_password_changed_meanwhile_is_rejected(
     from jobhunter.auth import passwords, users
 
     await make_user()
-    verify = passwords.verify_password
+    check = passwords.check_password
 
-    def verify_then_change(stored: str, p: str) -> tuple[bool, str | None]:
-        result = verify(stored, p)  # the old password verifies; the operator changes it before the decision
+    def check_then_change(stored: str, p: str) -> tuple[bool, bool]:
+        result = check(stored, p)  # the old password verifies; the operator changes it before the decision
         asyncio.run(_set_password(engine.url, "Kastanienallee-Ölfass-9"))
         return result
 
-    monkeypatch.setattr(auth_routes, "verify_password", verify_then_change)
+    monkeypatch.setattr(auth_routes, "check_password", check_then_change)
     assert (await login(api_client)).status_code == 401
     async with engine.connect() as c:
         assert (await c.execute(sa.text("SELECT count(*) FROM sessions"))).scalar_one() == 0
@@ -396,6 +407,15 @@ async def test_auth_logs_carry_the_outcome_and_the_address_only(
         assert value not in dumped
 
 
+def test_session_rate_limiter_forgets_idle_sessions() -> None:
+    from jobhunter.api.app import SessionRateLimiter
+
+    limiter = SessionRateLimiter(limit=3, window_s=60.0)
+    assert limiter.hit(b"a", 0.0) and limiter.hit(b"b", 0.0)
+    assert limiter.hit(b"c", 30.0) and len(limiter) == 3  # no sweep before a window has passed
+    assert limiter.hit(b"c", 61.0) and len(limiter) == 1  # a and b had no request in the last window
+
+
 def test_session_rate_limiter_slides_per_key() -> None:
     from jobhunter.api.app import SessionRateLimiter
 
@@ -470,3 +490,198 @@ async def test_an_expired_global_lockout_resolves_its_alert(api_client, make_use
         assert (
             await c.execute(sa.text("SELECT resolved_at IS NOT NULL FROM alerts WHERE code = 'auth.lockout'"))
         ).scalar_one() is True
+
+
+# --- fix round 1: constant-cost phase 1, lockout pre-check, unreadable TOTP secret, rotation, branches ------
+
+
+class CountingHasher:
+    """Stands in for `passwords.ARGON2` and counts its expensive operations (`verify` and `hash`)."""
+
+    def __init__(self, real: Any) -> None:
+        self.real = real
+        self.ops: list[str] = []
+
+    def verify(self, stored: str, p: str) -> bool:
+        self.ops.append("verify")
+        return bool(self.real.verify(stored, p))
+
+    def hash(self, p: str) -> str:
+        self.ops.append("hash")
+        return str(self.real.hash(p))
+
+    def check_needs_rehash(self, stored: str) -> bool:
+        return bool(self.real.check_needs_rehash(stored))
+
+
+@pytest.fixture
+def argon2_ops(monkeypatch) -> list[str]:
+    """The Argon2 operations of the test so far, in order (`dummy_verify` included)."""
+    from jobhunter.auth import passwords
+
+    spy = CountingHasher(passwords.ARGON2)
+    monkeypatch.setattr(passwords, "ARGON2", spy)
+    return spy.ops
+
+
+def wrong_code(secret: str) -> str:
+    """A six-digit code that no step around now accepts."""
+    now = utcnow()
+    valid = {pyotp.TOTP(secret).at(now + timedelta(seconds=30 * offset)) for offset in range(-2, 3)}
+    return next(
+        code for code in ("000000", "111111", "222222", "333333", "444444", "555555") if code not in valid
+    )
+
+
+async def test_with_totp_on_a_right_password_costs_what_a_wrong_one_does(
+    api_client, make_user, engine, make_config, argon2_ops
+) -> None:
+    from argon2 import PasswordHasher
+    from jobhunter.auth import passwords, totp, users
+
+    await make_user()
+    secret = totp.new_secret()
+    weaker = PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1).hash(
+        passwords.normalize_password(PW)
+    )
+    async with engine.begin() as c:  # a stored hash with other parameters: a successful login rehashes it
+        await c.execute(sa.text("UPDATE users SET password_hash = :h"), {"h": weaker})
+        await users.enable_totp(c, secret, data_key=make_config("api").secret_b64("data_key"))
+    argon2_ops.clear()
+    assert (await login(api_client, totp=wrong_code(secret))).status_code == 401
+    right_password_ops = list(argon2_ops)
+    argon2_ops.clear()
+    assert (
+        await login(api_client, password="wrong-password-123", totp=wrong_code(secret))
+    ).status_code == 401
+    assert right_password_ops == argon2_ops == ["verify"]  # no rehash before the code matched
+    argon2_ops.clear()
+    assert (await login(api_client, totp=pyotp.TOTP(secret).now())).status_code == 204
+    assert argon2_ops == ["verify", "hash"]  # the rehash, once every factor matched
+    async with engine.connect() as c:
+        stored = (await c.execute(sa.text("SELECT password_hash FROM users"))).scalar_one()
+    assert stored != weaker and not passwords.ARGON2.check_needs_rehash(stored)
+
+
+async def test_a_locked_out_client_costs_no_argon2_work(api_client, make_user, engine, argon2_ops) -> None:
+    await make_user()
+    argon2_ops.clear()
+    async with engine.begin() as c:
+        await c.execute(
+            sa.text(
+                "INSERT INTO login_lockouts "
+                "VALUES ('ip:198.51.100.10', now() + interval '15 minutes', 'ip_failures')"
+            )
+        )
+    r = await login(api_client)
+    assert r.status_code == 429 and r.json()["code"] == "throttled" and 0 < r.json()["retry_after_s"] <= 900
+    assert argon2_ops == []
+    async with engine.connect() as c:
+        assert (await c.execute(sa.text("SELECT count(*) FROM login_attempts"))).scalar_one() == 0
+
+
+async def test_an_unreadable_totp_secret_fails_generically_and_raises_an_alert(
+    api_client, make_user, engine, log_events
+) -> None:
+    from jobhunter.auth import totp, users
+
+    await make_user()
+    secret = totp.new_secret()
+    async with engine.begin() as c:  # sealed with a key the api does not have
+        await users.enable_totp(c, secret, data_key=os.urandom(32))
+    right = await login(api_client, totp=pyotp.TOTP(secret).now())
+    wrong = await login(api_client, password="wrong-password-123", totp=pyotp.TOTP(secret).now())
+    # The right password is not confirmed: same answer, and the alert comes from both attempts alike.
+    assert right.status_code == wrong.status_code == 401 and right.json() == {
+        **wrong.json(),
+        "request_id": right.json()["request_id"],
+    }
+    async with engine.connect() as c:
+        assert (
+            await c.execute(sa.text("SELECT count(*) FROM login_attempts WHERE NOT success"))
+        ).scalar_one() == 2
+        alert = (
+            await c.execute(
+                sa.text(
+                    "SELECT severity, occurrences FROM alerts "
+                    "WHERE dedup_key = 'auth.totp_key_mismatch:totp' AND resolved_at IS NULL"
+                )
+            )
+        ).one()
+    assert tuple(alert) == ("critical", 2)
+    events = log_events()
+    unreadable = [e for e in events if e["event"] == "totp_secret_unreadable"]
+    assert [e["error_class"] for e in unreadable] == ["DecryptError", "DecryptError"]
+    for value in (secret, PW, "wrong-password-123"):
+        assert value not in json.dumps(events)
+
+
+async def test_confirm_unchanged_and_claim_totp_step(engine, make_user) -> None:
+    from jobhunter.auth import totp, users
+
+    await make_user()
+    async with engine.begin() as c:
+        row = await users.get_user(c)
+        assert row is not None
+        stored = row.password_hash
+        assert await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=False)
+        assert not await users.confirm_unchanged(c, expected_hash="$argon2id$other", totp_enabled=False)
+        assert not await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=True)
+        assert not await users.claim_totp_step(c, 7)  # TOTP is off: there is no step to claim
+        await users.enable_totp(c, totp.new_secret(), data_key=os.urandom(32))
+        assert await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=True)
+        assert not await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=False)
+        assert await users.claim_totp_step(c, 7)
+        assert not await users.claim_totp_step(c, 7) and not await users.claim_totp_step(c, 6)
+        assert await users.claim_totp_step(c, 8)
+
+
+def test_client_ip_is_canonical_or_the_shared_unknown_bucket() -> None:
+    from jobhunter.api.routes.auth import UNKNOWN_CLIENT_IP, client_ip
+    from starlette.requests import Request
+
+    def ip_of(client: tuple[str, int] | None) -> str:
+        return client_ip(Request({"type": "http", "client": client, "headers": []}))
+
+    assert UNKNOWN_CLIENT_IP == "0.0.0.0"  # noqa: S104 - an address recorded, not one bound to
+    assert ip_of(None) == ip_of(("testclient", 50000)) == ip_of(("", 0)) == UNKNOWN_CLIENT_IP
+    assert ip_of(("::ffff:198.51.100.5", 1)) == "198.51.100.5"  # IPv4-mapped IPv6: the IPv4 address
+    assert ip_of(("2001:db8::1", 1)) == "2001:db8::1" and ip_of(("198.51.100.10", 1)) == "198.51.100.10"
+
+
+async def test_a_client_without_an_address_is_counted_in_the_shared_bucket(
+    engine, make_config, make_user
+) -> None:
+    from jobhunter.api.app import create_app
+    from jobhunter.api.routes.auth import UNKNOWN_CLIENT_IP
+
+    await make_user()
+    app = create_app(cfg=make_config("api"), engine=engine)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=("testclient", 50000)),
+        base_url="https://testserver",
+        headers={"Origin": "https://testserver"},
+    ) as c:
+        assert (await login(c, password="w" * 12)).status_code == 401
+    async with engine.connect() as c:
+        assert (
+            await c.execute(sa.text("SELECT host(ip) FROM login_attempts"))
+        ).scalar_one() == UNKNOWN_CLIENT_IP
+
+
+async def test_a_login_rotates_the_session_it_was_sent_with(logged_in_client, api_client, engine) -> None:
+    old = logged_in_client.cookies["__Host-jh_session"]
+    async with engine.connect() as c:
+        old_hmac = (await c.execute(sa.text("SELECT token_hmac FROM sessions"))).scalar_one()
+    failed = await logged_in_client.post("/api/auth/login", json={"username": "ada", "password": "w" * 12})
+    assert failed.status_code == 401  # a failed login leaves the session alone
+    assert (await logged_in_client.get("/api/auth/session")).status_code == 200
+    r = await logged_in_client.post("/api/auth/login", json={"username": "ada", "password": PW})
+    assert r.status_code == 204
+    new = r.headers["set-cookie"].split(";")[0].split("=", 1)[1]
+    async with engine.connect() as c:
+        hmacs = [row[0] for row in await c.execute(sa.text("SELECT token_hmac FROM sessions"))]
+    assert new != old and len(hmacs) == 1 and hmacs[0] != old_hmac  # the old session is gone, not revoked
+    stale = await api_client.get("/api/auth/session", headers={"Cookie": f"__Host-jh_session={old}"})
+    assert stale.status_code == 401
+    assert (await logged_in_client.get("/api/auth/session")).status_code == 200

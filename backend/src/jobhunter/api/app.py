@@ -57,6 +57,10 @@ class SessionRateLimiter:
         hits.append(now)
         return True
 
+    def __len__(self) -> int:
+        """How many sessions it holds request times of (swept ones excluded)."""
+        return len(self._hits)
+
     def _sweep(self, now: float) -> None:
         if self._next_sweep is not None and now < self._next_sweep:
             return
