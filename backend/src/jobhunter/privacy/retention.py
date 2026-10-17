@@ -5,15 +5,23 @@ database's `now()` (ruling P14), with one exception: procrastinate's finished jo
 API (`tasks.delete_finished_jobs`), which compares their latest event with the database clock and returns no
 count, so the report holds `-1` for them.
 
-Each rule runs in a transaction of its own (ruling T13-e), so a rule that fails leaves the rules before it
-committed. The rules run in dependency order (§20.1: a row goes only after what references it): the checkpoint
-threads of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`).
-A live run (`queued` or `running`) is never deleted, however old.
+Each rule runs in a transaction of its own (ruling T13-e) and in an error boundary of its own (ruling T13-g):
+a rule that fails is reported as `-1`, logged `retention_rule_failed` and raised as the warn alert
+`retention.failed` (subject: the rule's name; context: the rule and the error class, never the message), and
+the rules after it still run. A rule that succeeds resolves its alert. Every rule is idempotent, so the next
+day's run repeats whatever failed.
 
-No exception is caught here: a failing rule propagates to the task boundary (procrastinate records the job as
-failed and logs it), the rules after it wait for the next day, and every rule is idempotent.
+The rules run in dependency order (§20.1: a row goes only after what references it): the checkpoint threads
+of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
+run (`queued` or `running`) is never deleted, however old.
+
+This module is a task boundary (ruff `BLE001` is allowed here). The catch around a rule persists its outcome
+as the alert, written in a transaction of its own. When that write fails too, `retention_alert_write_failed`
+is logged: the database that would hold the outcome is the one that failed, so the log line is what is left
+(as in `worker.reconcilers`). Neither log line carries an exception message.
 """
 
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final
@@ -24,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q
+from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.worker.tasks import delete_finished_jobs
 
@@ -81,6 +90,8 @@ _ENDED_THREADS: Final = q(
     "ORDER BY a.thread_id"
 )
 
+FAILED_ALERT_CODE: Final = "retention.failed"
+
 log = get_logger("jobhunter.privacy.retention")
 
 
@@ -106,21 +117,64 @@ async def _delete_finished_jobs(queue: procrastinate.App, window: timedelta) -> 
     return -1  # procrastinate returns no count
 
 
+async def _apply(
+    rule: RetentionRule,
+    engine: AsyncEngine,
+    queue: procrastinate.App,
+    saver: AsyncPostgresSaver,
+    now: datetime,
+) -> int:
+    cutoff = now - rule.window
+    if rule.name == "checkpoints":
+        return await _purge_threads(engine, saver, cutoff)
+    if rule.name == "procrastinate_jobs":
+        return await _delete_finished_jobs(queue, rule.window)
+    return await _delete_rows(engine, _DELETES[rule.name], cutoff)
+
+
+async def _raise_failure(engine: AsyncEngine, name: str, error_class: str) -> None:
+    async with engine.begin() as conn:
+        await raise_alert(
+            conn,
+            code=FAILED_ALERT_CODE,
+            severity="warn",
+            subject=name,
+            message=f"retention rule {name} failed",
+            context={"rule": name, "error_class": error_class},
+        )
+
+
+async def _resolve_failure(engine: AsyncEngine, name: str) -> None:
+    async with engine.begin() as conn:
+        await resolve_alert(conn, code=FAILED_ALERT_CODE, subject=name)
+
+
+async def _record_alert_outcome(name: str, write: Awaitable[None]) -> None:
+    """Await the alert `write` of rule `name`; a failure of it is logged and goes no further."""
+    try:
+        await write
+    except Exception as exc:
+        log.error("retention_alert_write_failed", rule=name, error_class=type(exc).__name__)
+
+
 async def run_retention_daily(
     engine: AsyncEngine, queue: procrastinate.App, saver: AsyncPostgresSaver, *, now: datetime
 ) -> dict[str, int]:
-    """Apply every rule of `RULES` at `now`, in order; the number deleted by rule name.
+    """Apply every rule of `RULES` at `now`, in order; the number deleted by rule name, `-1` when it failed.
 
     `checkpoints` counts threads; `procrastinate_jobs` is always `-1`. `queue` must be open.
     """
     report: dict[str, int] = {}
     for rule in RULES:
-        cutoff = now - rule.window
-        if rule.name == "checkpoints":
-            report[rule.name] = await _purge_threads(engine, saver, cutoff)
-        elif rule.name == "procrastinate_jobs":
-            report[rule.name] = await _delete_finished_jobs(queue, rule.window)
+        try:
+            report[rule.name] = await _apply(rule, engine, queue, saver, now)
+        except Exception as exc:
+            report[rule.name] = -1
+            error_class = type(exc).__name__
+            # Not the exception's message and not its traceback: either may carry content.
+            log.error("retention_rule_failed", rule=rule.name, error_class=error_class)
+            await _record_alert_outcome(rule.name, _raise_failure(engine, rule.name, error_class))
         else:
-            report[rule.name] = await _delete_rows(engine, _DELETES[rule.name], cutoff)
+            await _record_alert_outcome(rule.name, _resolve_failure(engine, rule.name))
     log.info("retention_done", **report)
     return report

@@ -52,6 +52,7 @@ from typing import Final, NoReturn, Protocol
 
 import procrastinate
 import sqlalchemy as sa
+from procrastinate.exceptions import ConnectorException
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter import __version__
@@ -80,6 +81,20 @@ _REGISTERING_MODULES: Final = ("jobhunter.worker.operations", "jobhunter.worker.
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
 log = get_logger("jobhunter.worker.main")
+
+
+def is_lock_timeout(exc: BaseException) -> bool:
+    """Whether `exc` is a lock wait that ran past `lock_timeout` (SQLSTATE 55P03), however it was raised.
+
+    A statement of the claim raises it as SQLAlchemy's `DBAPIError` (`db.sql.pg_error`). A takeover sweep's
+    defer goes through procrastinate's connector on the sweep's own connection, which raises its
+    `ConnectorException` from the driver's error: there the SQLSTATE is the cause's `sqlstate`.
+    """
+    if isinstance(exc, sa.exc.DBAPIError):
+        return pg_error(exc).sqlstate == LOCK_NOT_AVAILABLE
+    if isinstance(exc, ConnectorException):
+        return getattr(exc.__cause__, "sqlstate", None) == LOCK_NOT_AVAILABLE
+    return False
 
 
 class _Heartbeat(Protocol):
@@ -145,8 +160,8 @@ class _WorkerProcess:
         )
         try:
             epoch, _ = await claim_epoch_and_sweep(engine, ident)
-        except sa.exc.OperationalError as exc:
-            if pg_error(exc).sqlstate != LOCK_NOT_AVAILABLE:
+        except (sa.exc.DBAPIError, ConnectorException) as exc:
+            if not is_lock_timeout(exc):
                 raise
             # Nothing was committed. The teardown closes the lock session, which releases the lock, and the
             # exit lets the restart try again once the holder of the row lock is gone.

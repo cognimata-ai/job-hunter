@@ -17,7 +17,7 @@ A process has one task app, and the first call of `make_queue_app` wins: it fixe
 blueprint to an app namespaces its tasks, so it can be added once.) `_reset_task_app` undoes that for tests.
 """
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 import procrastinate
@@ -118,8 +118,15 @@ _task_app: procrastinate.App | None = None
 _task_dsn: str | None = None
 
 
-async def _autocommit(conn: psycopg.AsyncConnection[Any]) -> None:
-    await conn.set_autocommit(True)
+def _autocommit(conn: psycopg.Connection[Any] | psycopg.AsyncConnection[Any]) -> Awaitable[None] | None:
+    """The `configure` of the task app's pools: autocommit, for an async and for a sync connection alike.
+
+    The async pool and procrastinate's listener await what it returns (the coroutine of
+    `AsyncConnection.set_autocommit`). The sync connector that procrastinate derives from the same arguments,
+    for an app used synchronously before it is opened, calls it and ignores the result: a sync connection
+    sets autocommit at once and returns `None`.
+    """
+    return conn.set_autocommit(True)
 
 
 def _new_app(dsn: str, max_size: int) -> procrastinate.App:
@@ -129,8 +136,7 @@ def _new_app(dsn: str, max_size: int) -> procrastinate.App:
     # worker row locked until the server's idle-in-transaction timeout (60 s); the replacement worker's
     # stalled-job release and worker pruning would wait for it (C17). `configure` also runs on procrastinate's
     # own listener connection, which is autocommit already. (`autocommit=True` as a pool argument would clash
-    # with that connection's own.) The task app is only used asynchronously: the sync connector procrastinate
-    # derives from these arguments would not await `_autocommit`.
+    # with that connection's own.) `_autocommit` works for procrastinate's derived sync connector too.
     return procrastinate.App(
         connector=procrastinate.PsycopgConnector(
             conninfo=dsn, min_size=1, max_size=max_size, configure=_autocommit

@@ -228,3 +228,56 @@ async def test_finished_procrastinate_jobs_go_after_7_days_and_report_minus_one(
     async with engine.connect() as c:
         left = (await c.execute(sa.text("SELECT id FROM procrastinate_jobs"))).scalars().all()
     assert left == [recent]
+
+
+# --- Ruling T13-g (a): each rule has its own error boundary, with a deduplicated alert --------------------
+
+
+async def test_a_failing_rule_is_alerted_and_the_rules_after_it_still_run(
+    engine, queue_app, migrated, monkeypatch, caplog
+) -> None:
+    from jobhunter.db.sql import q
+    from jobhunter.privacy import retention
+
+    from tests.support.logs import logged
+
+    now = utcnow() + SHIFT
+    async with engine.begin() as c:
+        await c.execute(
+            sa.text(
+                "INSERT INTO login_attempts (at, ip, username_hmac, success) "
+                "VALUES (:t, '198.51.100.1', '\\x00', false)"
+            ),
+            {"t": now - timedelta(days=31)},
+        )
+        await c.execute(
+            sa.text(
+                "INSERT INTO alerts (code,severity,dedup_key,message,resolved_at) "
+                "VALUES ('a','info','k','m',:r)"
+            ),
+            {"r": now - timedelta(days=91)},
+        )
+    open_failure = sa.text(
+        "SELECT severity, message, context FROM alerts WHERE code = 'retention.failed' "
+        "AND dedup_key = 'retention.failed:login_attempts' AND resolved_at IS NULL"
+    )
+    # The third rule of the list fails on a missing table (no message of it may be stored or logged).
+    monkeypatch.setitem(
+        retention._DELETES, "login_attempts", q("DELETE FROM no_such_table WHERE at < :cutoff")
+    )
+    report = await retention_at(engine, queue_app, migrated, now)
+    assert report["login_attempts"] == -1
+    assert report["alerts"] == 1 and report["checkpoints"] == 0  # the rules after it ran
+    async with engine.connect() as c:
+        severity, message, context = (await c.execute(open_failure)).one()
+        assert (await c.execute(sa.text("SELECT count(*) FROM login_attempts"))).scalar_one() == 1
+    assert (severity, context) == ("warn", {"rule": "login_attempts", "error_class": "ProgrammingError"})
+    assert "no_such_table" not in message and "no_such_table" not in caplog.text
+    assert [(e["rule"], e["error_class"]) for e in logged(caplog, "retention_rule_failed")] == [
+        ("login_attempts", "ProgrammingError")
+    ]
+    monkeypatch.undo()
+    report = await retention_at(engine, queue_app, migrated, now)
+    assert report["login_attempts"] == 1  # the rule works again, and its alert is resolved
+    async with engine.connect() as c:
+        assert (await c.execute(open_failure)).first() is None

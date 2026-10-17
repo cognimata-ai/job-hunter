@@ -60,3 +60,25 @@ async def test_a_loop_that_ends_by_itself_stops_the_others_and_returns_1(caplog)
     (event,) = logged(caplog, "worker_loop_ended")
     assert (event["worker"], event["error_class"]) == ("jh-collect", "RuntimeError")
     assert "must not be logged" not in caplog.text
+
+
+async def test_loops_that_outlive_the_grace_are_logged_and_left_to_the_exit(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(shutdown, "GRACE_S", 0)
+    monkeypatch.setattr(shutdown, "_LOOP_END_MARGIN_S", 0.05)
+    state = ShutdownState()
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue  # ignores its cancellation until the test releases it
+
+    loops = [asyncio.create_task(stubborn(), name="jh-collect")]
+    state.requested.set()
+    assert await shutdown.coordinate(loops, state) == 0
+    (event,) = logged(caplog, "worker_loops_not_stopped")
+    assert event["workers"] == ["jh-collect"] and not loops[0].done()
+    release.set()
+    await loops[0]

@@ -25,7 +25,11 @@ async def setup_checkpointer(dsn: str) -> None:
 
 @asynccontextmanager
 async def open_saver(dsn: str) -> AsyncIterator[AsyncPostgresSaver]:
-    """A saver over a small pool (1 to 4 connections) that is closed when the block ends."""
+    """A saver over a small pool (1 to 4 connections) that is closed when the block ends.
+
+    The pool is also closed when opening it fails (for example a `PoolTimeout`), so its connection workers do
+    not outlive the error (ruling T13-g).
+    """
     pool: AsyncConnectionPool[AsyncConnection[DictRow]] = AsyncConnectionPool(
         conninfo=dsn,
         min_size=_POOL_MIN_SIZE,
@@ -33,8 +37,8 @@ async def open_saver(dsn: str) -> AsyncIterator[AsyncPostgresSaver]:
         kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
         open=False,
     )
-    await pool.open(wait=True)
     try:
+        await pool.open(wait=True)
         yield AsyncPostgresSaver(pool)
     finally:
         await pool.close()

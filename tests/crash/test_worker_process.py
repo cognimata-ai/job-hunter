@@ -4,7 +4,7 @@ import sys
 import psycopg
 import pytest
 
-from tests.support.pg import pg_one
+from tests.support.pg import pg_one, pg_rows
 from tests.support.procs import wait_until
 
 pytestmark = [pytest.mark.crash, pytest.mark.slow]
@@ -13,6 +13,18 @@ WORKER = [sys.executable, "-m", "jobhunter.cli", "worker"]
 
 def one(server, statement: str):
     return pg_one(server, "superuser", statement)  # shared helper (Task 4)
+
+
+def threads(server) -> dict[object, tuple[object, ...]]:
+    """The checkpoint rows and the pending writes stored for each thread."""
+    rows = pg_rows(
+        server,
+        "superuser",
+        "SELECT t.thread_id, (SELECT count(*) FROM checkpoints c WHERE c.thread_id = t.thread_id), "
+        "(SELECT count(*) FROM checkpoint_writes w WHERE w.thread_id = t.thread_id) FROM "
+        "(SELECT thread_id FROM checkpoints UNION SELECT thread_id FROM checkpoint_writes) t",
+    )
+    return {row[0]: row[1:] for row in rows}
 
 
 def due_slot_now(server) -> None:
@@ -29,7 +41,13 @@ def test_idle_sigterm_exits_zero_and_releases_lock(migrated, proc_env, procs) ->
     w.signal(signal.SIGTERM)
     assert w.exit_within(30) == 0
     w.wait_event("worker_shutdown_complete", 1)
-    assert one(migrated, "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=7261001") == (0,)
+    # The server ends a closed session asynchronously: the lock goes within moments of the exit, not at it.
+    wait_until(
+        lambda: (
+            one(migrated, "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=7261001") == (0,)
+        ),
+        5,
+    )
 
 
 def test_busy_sigterm_drains_inflight_run(migrated, proc_env, procs) -> None:
@@ -61,8 +79,16 @@ def test_c17_zombie_worker_writes_nothing(migrated, proc_env, procs) -> None:
         ),
         120,
     )
+    (run_id,) = one(migrated, "SELECT id FROM runs WHERE scheduled_slot IS NOT NULL")
+    old_thread, new_thread = f"run-{run_id}-a1", f"run-{run_id}-a2"
+    before = threads(migrated)
+    assert set(before) == {old_thread, new_thread}
     a.signal(signal.SIGCONT)
     assert a.exit_within(20) == 70
+    # §18.2 C17: the zombie's checkpoint writes are confined to its own, old thread. (It does write there: its
+    # graph finishes the paused step before the watchdog ends it.) The new attempt's thread is untouched.
+    after = threads(migrated)
+    assert set(after) == set(before) and after[new_thread] == before[new_thread]
     assert one(
         migrated,
         "SELECT h.pid, h.lock_backend_pid = l.pid FROM worker_heartbeat h JOIN pg_locks l "
@@ -116,8 +142,12 @@ def test_takeover_blocked_by_a_row_lock_exits_one_and_releases_the_lock(migrated
         w = procs.spawn(WORKER, proc_env("worker", migrated))
         w.wait_event("takeover_blocked", 60, error_class="OperationalError")
         assert w.exit_within(30) == 1
-        assert one(migrated, "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=7261001") == (
-            0,
+        wait_until(
+            lambda: (
+                one(migrated, "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=7261001")
+                == (0,)
+            ),
+            5,
         )
         assert one(migrated, "SELECT worker_epoch FROM worker_heartbeat") == (7,)  # the claim was rolled back
     output = w.output()

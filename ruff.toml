@@ -18,6 +18,7 @@ select = ["E", "F", "W", "I", "B", "BLE", "UP", "S", "TID", "ASYNC", "RUF", "DTZ
 "backend/src/jobhunter/llm/**" = ["TID251"]
 "backend/src/jobhunter/worker/tasks.py" = ["BLE001"]
 "backend/src/jobhunter/worker/reconcilers.py" = ["BLE001"]
+"backend/src/jobhunter/privacy/retention.py" = ["BLE001"]
 "backend/src/jobhunter/worker/main.py" = ["BLE001"]
 "backend/src/jobhunter/worker/watchdog.py" = ["BLE001"]
 "backend/src/jobhunter/worker/operations.py" = ["BLE001"]
