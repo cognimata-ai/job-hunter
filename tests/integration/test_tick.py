@@ -369,3 +369,22 @@ async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
         "queued",
         "skipped_overlap",
     ]
+
+
+# --- Final fix wave, item 8: one deferral of a run attempt (ruling P16) -------------------------------------
+
+
+async def test_the_tick_and_the_runs_defer_a_run_attempt_through_one_function(engine, queue_app) -> None:
+    from jobhunter.worker import runs as runs_module
+
+    # Neither module keeps a copy: both call the one in `tasks`.
+    assert vars(tick_module)["defer_run_attempt"] is tasks.defer_run_attempt
+    assert vars(runs_module)["defer_run_attempt"] is tasks.defer_run_attempt
+    await schedule(engine, interval=21600, cursor=A)
+    rep = await tick(engine, A + timedelta(hours=6))
+    async with engine.connect() as c:
+        job = (
+            await c.execute(sa.text("SELECT task_name, lock, queueing_lock, args FROM procrastinate_jobs"))
+        ).one()
+    run_id = rep.queued_run_id
+    assert tuple(job) == ("jh:run_collect", "collect", f"run:{run_id}:1", {"run_id": run_id, "attempt_no": 1})

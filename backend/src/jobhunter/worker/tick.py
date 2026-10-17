@@ -32,7 +32,7 @@ from jobhunter.db.sql import is_unique_violation, pg_error, q
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import RUNS
 from jobhunter.types import get_bool
-from jobhunter.worker.tasks import Deferrer
+from jobhunter.worker.tasks import Deferrer, defer_run_attempt
 
 CATCH_UP_AFTER: Final = timedelta(minutes=5)
 
@@ -257,14 +257,7 @@ async def run_tick(conn: AsyncConnection, *, now: datetime, defer: Deferrer) -> 
     skipped_overlap = False
     if isinstance(outcome, int):
         queued_run_id = outcome
-        await defer(
-            conn,
-            "run_collect",
-            lock="collect",
-            queueing_lock=f"run:{outcome}:1",
-            run_id=outcome,
-            attempt_no=1,
-        )
+        await defer_run_attempt(conn, defer, outcome, 1)
     elif outcome == "active_conflict":
         skipped_overlap = await _insert_skipped_overlap(
             conn, trigger=trigger, slot=latest, include_paid=include_paid, **versions

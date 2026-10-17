@@ -230,6 +230,26 @@ async def defer_in_tx(
         return None
 
 
+async def defer_run_attempt(
+    conn: AsyncConnection, defer: Deferrer, run_id: int, attempt_no: int
+) -> int | None:
+    """Defer `run_collect(run_id, attempt_no)` with `defer` on `conn`, in the caller's transaction.
+
+    Under the `collect` lock and the queueing lock `run:<run_id>:<attempt_no>`, so each attempt has at most
+    one waiting job. Returns the job id, or `None` when that attempt's job is already waiting. The one
+    deferral of a run attempt (ruling P16): the tick, the manual run, new attempts and the `queued_runs`
+    reconciler all use it.
+    """
+    return await defer(
+        conn,
+        "run_collect",
+        lock="collect",
+        queueing_lock=f"run:{run_id}:{attempt_no}",
+        run_id=run_id,
+        attempt_no=attempt_no,
+    )
+
+
 _LIVE_JOB = q(
     "SELECT EXISTS (SELECT 1 FROM procrastinate_jobs "
     "WHERE task_name = :t AND status IN ('todo', 'doing') AND args @> :m)",

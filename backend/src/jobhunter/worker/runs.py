@@ -62,7 +62,7 @@ from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import Swept, fence_epoch, register_takeover_sweep
 from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
-from jobhunter.worker.tasks import Deferrer, defer_in_tx, job_task_name
+from jobhunter.worker.tasks import Deferrer, defer_in_tx, defer_run_attempt, job_task_name
 from jobhunter.worker.tick import insert_active_collect
 
 if TYPE_CHECKING:
@@ -218,18 +218,6 @@ def _run_row(row: sa.Row[Any]) -> RunRow:
         started_at=row.started_at,
         finished_at=row.finished_at,
         status_reason=row.status_reason,
-    )
-
-
-async def _defer_attempt(conn: AsyncConnection, defer: Deferrer, run_id: int, attempt_no: int) -> int | None:
-    """Defer `run_collect(run_id, attempt_no)` on `conn`, under the `collect` lock and its queueing lock."""
-    return await defer(
-        conn,
-        "run_collect",
-        lock="collect",
-        queueing_lock=f"run:{run_id}:{attempt_no}",
-        run_id=run_id,
-        attempt_no=attempt_no,
     )
 
 
@@ -400,7 +388,7 @@ async def begin_new_attempt(
     )
     await conn.execute(_END_ATTEMPT, ended)
     await conn.execute(_INSERT_ATTEMPT, {"i": run_id, "a": following, "epoch": epoch, "thread": thread})
-    await _defer_attempt(conn, defer, run_id, following)
+    await defer_run_attempt(conn, defer, run_id, following)
     log.info(
         "run_new_attempt", run_id=run_id, attempt_no=following, end_reason=end_reason, resume_count=resumes
     )
@@ -442,7 +430,7 @@ async def request_manual_run(
             path="manual",
         )
         if isinstance(outcome, int):
-            await _defer_attempt(conn, defer, outcome, 1)
+            await defer_run_attempt(conn, defer, outcome, 1)
             log.info("manual_run_queued", run_id=outcome, include_paid=include_paid)
             return _run_row((await conn.execute(_RUN_BY_ID, {"i": outcome})).one()), True
         if outcome == "slot_conflict":
@@ -521,7 +509,7 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
         for row in (await conn.execute(_QUEUED_WITHOUT_JOB, params)).all():
             run_id, attempt_no = int(row.id), int(row.attempt_no)
             if row.status_reason is None:
-                if await _defer_attempt(conn, ctx.defer, run_id, attempt_no + 1) is None:
+                if await defer_run_attempt(conn, ctx.defer, run_id, attempt_no + 1) is None:
                     continue  # a waiting job holds the queueing lock: it starts the run
                 await annotate_run(conn, run_id, attempt_no=attempt_no, reason=REDEFERRED)
                 log.info("queued_run_redeferred", run_id=run_id)
