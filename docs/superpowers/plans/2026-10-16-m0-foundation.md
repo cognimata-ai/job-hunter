@@ -3431,6 +3431,9 @@ Each deviation either changes the order in which the spec arrives across milesto
 2. **M2 / M5:** `schedule.stale_data` (critical) is raised while the schedule is disabled (ruling T12-h). Exempt or downgrade the disabled case together with the alert catalogue (M5) or the user-facing toggle (M2).
 3. **M5 runbook:** with `replicas: 1`, a frozen worker (paused, or stalled in a swap storm) is never replaced automatically. Restart it by hand; the takeover protocol does the rest.
 4. **M3:** every epoch-stamping claim (score targets, cycles) uses the T21-c `fence_epoch` guard.
+5. **M1 (first task that touches `worker/main.py`):** worker teardown must not close the lock session while the watchdog thread is still inside a heartbeat. A heartbeat blocked by a silent TCP loss can outlast the teardown share of the stop deadline, and psycopg's `close()` would then run concurrently with libpq's in-flight call. Skip `close()` when the watchdog is still alive after its join; the process exit drops the socket and the lock. This is the final re-review's Minor 1.
+6. **M1:** a fenced admission (`foreign_epoch`, or a `None` operation claim) consumes its procrastinate job, so the work waits for the `queued_runs`/`operations` (2 min) or `stale_runs` (3 min) reconciler. Re-defer the same attempt or operation under its queueing lock instead. Correctness already holds; this is about latency and resume budget once collection does real work.
+7. **M4 (with the remaining api lifespan work):** shut down the `Argon2Gate` thread pool when the app's lifespan ends. Also note in the stack test's docstring that it rebuilds the shared `jobhunter-app:dev` image tag.
 
 ## Pre-flight corrections
 
