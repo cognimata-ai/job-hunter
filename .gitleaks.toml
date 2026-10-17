@@ -2,6 +2,8 @@
 #
 # The default ruleset stays on. Every entry below allows one known false positive and nothing else: a rule, a
 # file and the shape of the assignment must all match (condition = "AND"). A new finding anywhere else fails CI.
+# Each regex is anchored to the whole line (`^\s*NAME\s*=\s*"…"\s*$`), so a line that holds anything besides
+# that one assignment, another key included, is not allowed by it.
 title = "Job Hunter gitleaks configuration"
 
 [extend]
@@ -16,7 +18,7 @@ condition = "AND"
 targetRules = ["generic-api-key"]
 paths = ['''^tests/unit/test_redact\.py$''']
 regexTarget = "line"
-regexes = ['''\b(SECRET32|ADZUNA_KEY|random_key|ping_key)\s*=\s*"[A-Za-z0-9]+"''']
+regexes = ['''^\s*(SECRET32|ADZUNA_KEY|random_key|ping_key)\s*=\s*"[A-Za-z0-9]+"\s*$''']
 
 # tests/unit/test_config.py checks that `startup_or_exit` registers the loaded secret values with the redactor.
 # `adzuna_key` is the random-looking stand-in written to a temporary secrets directory by that one test.
@@ -26,4 +28,4 @@ condition = "AND"
 targetRules = ["generic-api-key"]
 paths = ['''^tests/unit/test_config\.py$''']
 regexTarget = "line"
-regexes = ['''\badzuna_key\s*=\s*"[A-Za-z0-9]+"''']
+regexes = ['''^\s*adzuna_key\s*=\s*"[A-Za-z0-9]+"\s*$''']

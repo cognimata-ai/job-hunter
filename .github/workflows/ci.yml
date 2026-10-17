@@ -28,6 +28,8 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: "0.13.1"
+      # `uv sync --frozen` installs uv.lock as it is; this fails when pyproject.toml and uv.lock disagree.
+      - run: uv lock --check
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -41,8 +43,10 @@ jobs:
       - run: npm run --prefix frontend lint
       - run: npm run --prefix frontend typecheck
       # The official container image, pinned by digest (gitleaks-action needs a paid licence for organisation
-      # repositories). It scans every commit; .gitleaks.toml holds the allowlist of known false positives.
+      # repositories). It scans every commit; .gitleaks.toml holds the allowlist of known false positives. It
+      # runs even when an earlier lint step failed, so a leak is reported on every run that is not cancelled.
       - name: gitleaks
+        if: ${{ !cancelled() }}
         run: >-
           docker run --rm -v "$PWD:/repo:ro" "$(grep ^gitleaks= deploy/images.lock | cut -d= -f2)"
           git --redact --no-banner --config /repo/.gitleaks.toml -v /repo
