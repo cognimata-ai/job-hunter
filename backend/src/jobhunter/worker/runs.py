@@ -29,12 +29,18 @@ The reconcilers `queued_runs` (a queued run without a live job: re-deferred once
 `failed('orphaned_queue')`) and `stale_data` (§17.5, §17.6) complete the set. Every time threshold uses the
 caller's clock (`ctx.now`), never the database's `now()`.
 
+Every run that reaches a terminal status is counted in `RUNS` (and, when it started, timed in `RUN_DURATION`)
+by the owner of the transaction that ended it, once that transaction has committed (ruling T12-e): the
+functions that end a run inside a caller's transaction report a `RunEnd`, and the owner passes it to
+`observe_run_ends` after its commit (`execute_run`, the reconcilers, and the takeover sweep through
+`epoch.Swept`).
+
 This module is a task boundary (ruff `BLE001` is allowed here). It needs no broad catch: `run_owned` reports
 an unexpected graph error as an outcome, which `execute_run` persists as `failed('bug')` plus the `run.failed`
 alert. LangGraph is imported for annotations only, so a process that only requests runs (the API) skips it.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -49,7 +55,7 @@ from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import RUN_DURATION, RUNS
 from jobhunter.types import JSONValue
-from jobhunter.worker.epoch import register_takeover_sweep
+from jobhunter.worker.epoch import Swept, register_takeover_sweep
 from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer, defer_in_tx, job_task_name
@@ -118,6 +124,22 @@ class RunRow:
     started_at: datetime | None
     finished_at: datetime | None
     status_reason: str | None
+
+
+@dataclass(frozen=True)
+class RunEnd:
+    """A run that a transaction ended: its terminal status and, when it had started, its duration."""
+
+    status: str
+    duration_s: float | None
+
+
+def observe_run_ends(ends: Iterable[RunEnd]) -> None:
+    """Count each ended run in `RUNS` and time it in `RUN_DURATION`; call only after the ending commit."""
+    for end in ends:
+        RUNS.labels(status=end.status).inc()
+        if end.duration_s is not None:
+            RUN_DURATION.observe(end.duration_s)
 
 
 # The run row and its current attempt, the run row locked: the DB step of the admission.
@@ -284,12 +306,23 @@ async def finalize_run(
     except TransitionConflict as exc:
         raise FencedOut("run") from exc
     await conn.execute(_END_ATTEMPT, {"i": owner.run_id, "a": owner.attempt_no, "reason": "completed"})
-    seconds = (await conn.execute(_DURATION, {"i": owner.run_id})).scalar_one()
+    return await _duration(conn, owner.run_id)
+
+
+async def _duration(conn: AsyncConnection, run_id: int) -> float | None:
+    """The run's duration in seconds, from its first `started_at` to its `finished_at` (`None` if unset)."""
+    seconds = (await conn.execute(_DURATION, {"i": run_id})).scalar_one()
     return None if seconds is None else float(seconds)
 
 
 async def begin_new_attempt(
-    conn: AsyncConnection, run_id: int, *, epoch: int, end_reason: EndReason, defer: Deferrer
+    conn: AsyncConnection,
+    run_id: int,
+    *,
+    epoch: int,
+    end_reason: EndReason,
+    defer: Deferrer,
+    ends: list[RunEnd] | None = None,
 ) -> int | None:
     """Take a `running` run from its current attempt and give it the next one, owned by `epoch`.
 
@@ -300,7 +333,8 @@ async def begin_new_attempt(
 
     Returns `None` when the run is not `running`, and when this would be resume `MAX_RESUMES + 1`: then the
     run ends `failed('resume_exhausted')` with that `resume_count` and the critical `run.resume_exhausted`
-    alert.
+    alert, its current attempt is closed with `end_reason`, and the end is appended to `ends` (when given) for
+    the transaction's owner to observe after its commit (`observe_run_ends`).
     """
     row = (await conn.execute(_LOCK_RUNNING, {"i": run_id})).first()
     if row is None or row.status != "running":
@@ -328,6 +362,8 @@ async def begin_new_attempt(
             subject=f"run:{run_id}",
             message="run resumes exhausted",
         )
+        if ends is not None:
+            ends.append(RunEnd(status="failed", duration_s=await _duration(conn, run_id)))
         log.warning("run_resume_exhausted", run_id=run_id, attempt_no=current, end_reason=end_reason)
         return None
     following = current + 1
@@ -400,12 +436,18 @@ async def request_manual_run(
 
 
 @register_takeover_sweep("runs")
-async def sweep_older_epoch_runs(conn: AsyncConnection, epoch: int) -> int:
-    """At takeover: give every `running` run whose current attempt belongs to an older epoch a new attempt."""
+async def sweep_older_epoch_runs(conn: AsyncConnection, epoch: int) -> Swept:
+    """At takeover: give every `running` run whose current attempt belongs to an older epoch a new attempt.
+
+    The runs it ends (`resume_exhausted`) are observed once the takeover transaction has committed.
+    """
     run_ids = [int(run_id) for run_id in (await conn.execute(_OLDER_EPOCH, {"epoch": epoch})).scalars()]
+    ends: list[RunEnd] = []
     for run_id in run_ids:
-        await begin_new_attempt(conn, run_id, epoch=epoch, end_reason="worker_takeover", defer=defer_in_tx)
-    return len(run_ids)
+        await begin_new_attempt(
+            conn, run_id, epoch=epoch, end_reason="worker_takeover", defer=defer_in_tx, ends=ends
+        )
+    return Swept(count=len(run_ids), after_commit=lambda: observe_run_ends(ends))
 
 
 @reconciler("stale_runs", "tick")
@@ -415,15 +457,18 @@ async def reconcile_stale_runs(ctx: ReconcileContext) -> int:
     After that commit, the local execution of a run is cancelled and awaited when, and only when, it runs for
     the attempt that was taken back (its registry token, ruling T12-d), so it releases the procrastinate
     `collect` lock before the replacement attempt's job can run. Rows locked by an in-flight heartbeat or
-    owner write are skipped this time. Returns the number of runs taken back.
+    owner write are skipped this time. The runs it ends (`resume_exhausted`) are observed after the commit.
+    Returns the number of runs taken back.
     """
+    ends: list[RunEnd] = []
     async with ctx.engine.begin() as conn:
         stale = (await conn.execute(_STALE, {"cutoff": ctx.now - RUN_STALE})).all()
         taken = [(int(row.id), int(row.attempt_no)) for row in stale]
         for run_id, _ in taken:
             await begin_new_attempt(
-                conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer
+                conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer, ends=ends
             )
+    observe_run_ends(ends)
     for run_id, superseded in taken:
         key: ExecKey = ("run", run_id)
         live = EXECUTIONS.get(key)
@@ -439,7 +484,8 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
 
     A run without a reason is re-deferred once and annotated `redeferred`. A `redeferred` run that still has
     no live job `QUEUED_ORPHANED_AFTER` after it was queued ends `failed('orphaned_queue')` with the warn
-    alert `run.orphaned_queue`. At most `QUEUED_BATCH` runs per tick.
+    alert `run.orphaned_queue`; it is counted in `RUNS` after the commit (never timed: it never started). At
+    most `QUEUED_BATCH` runs per tick.
     """
     params = {
         "cutoff": ctx.now - QUEUED_REDEFER_AFTER,
@@ -447,6 +493,7 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
         "limit": QUEUED_BATCH,
     }
     repaired = 0
+    ends: list[RunEnd] = []
     async with ctx.engine.begin() as conn:
         for row in (await conn.execute(_QUEUED_WITHOUT_JOB, params)).all():
             run_id, attempt_no = int(row.id), int(row.attempt_no)
@@ -473,8 +520,10 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
                     subject=f"run:{run_id}",
                     message="queued run orphaned",
                 )
+                ends.append(RunEnd(status="failed", duration_s=None))
                 log.warning("queued_run_orphaned", run_id=run_id)
                 repaired += 1
+    observe_run_ends(ends)
     return repaired
 
 
@@ -545,9 +594,7 @@ async def _finalize(
     except FencedOut:
         log.info("run_fenced", run_id=owner.run_id, attempt_no=owner.attempt_no, write="finalize")
         return
-    RUNS.labels(status=status).inc()
-    if duration is not None:
-        RUN_DURATION.observe(duration)
+    observe_run_ends([RunEnd(status=status, duration_s=duration)])
     log.info("run_finished", run_id=owner.run_id, attempt_no=owner.attempt_no, status=status, reason=reason)
 
 
@@ -570,9 +617,10 @@ async def execute_run(
        cancels it. By outcome: `lost` (a refused or failed heartbeat, the `stale_runs` reconciler's or the
        shutdown's cancel, or `FencedOut`) returns with no owner write; `raised` finalizes `failed('bug')` with
        the critical `run.failed` alert in a new transaction; `returned` finalizes `succeeded` with the report
-       `{"noop": true}`. A local execution that is still live when the work starts (`AlreadyExecuting`)
-       leaves the admitted attempt without an executor: no owner write is made, and `stale_runs` gives the
-       run a new attempt once its heartbeat is stale.
+       `{"noop": true}`. A local execution that is still live when the work starts (`AlreadyExecuting`, for
+       example an older one that ignored its cancel past the timeout) means nothing ran: `duplicate` is
+       returned and no further owner write is made; the admitted attempt is left without an executor, and
+       `stale_runs` gives the run a new attempt once its heartbeat is stale.
 
     The caller's own cancellation propagates (the graph is cancelled and awaited first) and nothing is
     written: the run's next owner (the stale-run reconciler or the takeover sweep) records the outcome.
@@ -602,8 +650,8 @@ async def execute_run(
             key, attempt_no, _invoke(graph, admitted), beat=beat, period_s=heartbeat_period_s
         )
     except AlreadyExecuting:
-        log.warning("run_already_executing", run_id=run_id, attempt_no=attempt_no)
-        return admission
+        log.warning("run_already_executing", run_id=run_id, attempt_no=attempt_no, admission=admission)
+        return "duplicate"
     match outcome.status:
         case "lost":
             pass

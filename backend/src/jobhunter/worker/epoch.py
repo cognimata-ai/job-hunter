@@ -8,6 +8,10 @@ takeover.
 
 The claim first proves, in the same transaction, that the claimant's lock session holds the singleton lock;
 a claimant that does not is `FencedOut` before anything is written or swept (ruling T8-h).
+
+A sweep returns its row count, or a `Swept` that adds an action to run once the takeover transaction has
+committed (for example observing the metrics of the runs it ended, Task 12): nothing the sweep did is real
+before that commit.
 """
 
 from collections.abc import Awaitable, Callable
@@ -21,7 +25,19 @@ from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.observability.logging import get_logger
 
-TakeoverSweep = Callable[[AsyncConnection, int], Awaitable[int]]
+
+@dataclass(frozen=True)
+class Swept:
+    """A sweep's result: `count` rows taken over, and `after_commit`, run once the takeover has committed.
+
+    `after_commit` must not raise (for example: observing metrics): the takeover it follows is already final.
+    """
+
+    count: int
+    after_commit: Callable[[], None] | None = None
+
+
+TakeoverSweep = Callable[[AsyncConnection, int], Awaitable[int | Swept]]
 
 # Whether `lock_pid` holds the granted singleton lock (advisory key 7261001) in this database.
 _HOLDS_LOCK: Final = """\
@@ -72,7 +88,8 @@ async def claim_epoch_and_sweep(engine: AsyncEngine, ident: WorkerIdentity) -> t
     """Claim the next worker epoch for `ident` and run every takeover sweep, all in one transaction.
 
     Returns the new epoch and the row count of each sweep by name. A failing sweep rolls the whole transaction
-    back, the epoch claim included. When `ident.lock_backend_pid` does not hold the singleton lock, it raises
+    back, the epoch claim included, and no sweep's `after_commit` runs; after the commit, each runs in sweep
+    order. When `ident.lock_backend_pid` does not hold the singleton lock, it raises
     `FencedOut(owner="worker_lock")` having written nothing and run no sweep.
     """
     async with engine.begin() as conn:
@@ -94,6 +111,14 @@ async def claim_epoch_and_sweep(engine: AsyncEngine, ident: WorkerIdentity) -> t
             )
         ).scalar_one()
         epoch = int(claimed)
-        counts = {name: await sweep(conn, epoch) for name, sweep in list(_SWEEPS.items())}
+        swept = {name: await sweep(conn, epoch) for name, sweep in list(_SWEEPS.items())}
+    counts: dict[str, int] = {}
+    for name, result in swept.items():
+        if isinstance(result, Swept):
+            counts[name] = result.count
+            if result.after_commit is not None:
+                result.after_commit()
+        else:
+            counts[name] = result
     log.info("worker_epoch_claimed", epoch=epoch, instance_id=str(ident.instance_id), swept=counts)
     return epoch, counts
