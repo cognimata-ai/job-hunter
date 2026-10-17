@@ -6,9 +6,9 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 (spike V1). Correctness never rests on it: every mutation that needs follow-up work also leaves a durable
 `operations` or `runs` row that the reconcilers re-defer from (§3.3.2).
 
-Task bodies not yet written are stubs (they log `task_stub`); Tasks 10 to 13 fill them in (`run_operation`:
-Task 10, `tick`: Task 11, `run_collect`: Task 12). Every body is `pass_context` and reads its inputs from the
-`WorkerRuntime` in `context.additional_context["runtime"]`.
+The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12), `reconcile_heavy` and
+`retention_daily` (Task 13). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
+`context.additional_context["runtime"]`.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 
@@ -18,9 +18,10 @@ blueprint to an app namespaces its tasks, so it can be added once.) `_reset_task
 """
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 import procrastinate
+import psycopg
 from procrastinate.exceptions import AlreadyEnqueued, ConnectorException, NoResult, UniqueViolation
 from procrastinate.job_context import JobContext
 from procrastinate.jobs import Job, Status
@@ -50,10 +51,6 @@ blueprint = procrastinate.Blueprint()
 def job_task_name(name: TaskName) -> str:
     """The name under which the task app registers `name` (and `procrastinate_jobs.task_name` stores it)."""
     return f"{TASK_NAMESPACE}:{name}"
-
-
-def _stub(name: TaskName, **fields: JSONValue) -> None:
-    log.info("task_stub", task=name, **fields)
 
 
 @blueprint.task(name="run_collect", queue="collect", lock="collect", pass_context=True)
@@ -96,13 +93,24 @@ async def tick(context: JobContext, timestamp: int) -> None:
 @blueprint.periodic(cron="*/10 * * * *")
 @blueprint.task(name="reconcile_heavy", queue="tick", pass_context=True)
 async def reconcile_heavy(context: JobContext, timestamp: int) -> None:
-    _stub("reconcile_heavy", timestamp=timestamp)
+    # Imported here: `reconcilers` imports this module (`Deferrer`, `release_stalled_jobs`).
+    from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    await run_reconcilers(
+        ReconcileContext(engine=rt.engine, queue=rt.queue, defer=defer_in_tx, now=utcnow(), epoch=rt.epoch),
+        "heavy",
+    )
 
 
 @blueprint.periodic(cron="17 3 * * *")
 @blueprint.task(name="retention_daily", queue="tick", pass_context=True)
 async def retention_daily(context: JobContext, timestamp: int) -> None:
-    _stub("retention_daily", timestamp=timestamp)
+    # Imported here: `privacy.retention` imports this module (`delete_finished_jobs`).
+    from jobhunter.privacy.retention import run_retention_daily
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow())
 
 
 # The blueprint can be added to one app only (adding it namespaces its tasks), so a process has one task app.
@@ -110,9 +118,23 @@ _task_app: procrastinate.App | None = None
 _task_dsn: str | None = None
 
 
+async def _autocommit(conn: psycopg.AsyncConnection[Any]) -> None:
+    await conn.set_autocommit(True)
+
+
 def _new_app(dsn: str, max_size: int) -> procrastinate.App:
+    # Every query procrastinate runs on its pool is one statement (one SQL function call), so its pool
+    # connections are autocommit: the server commits each statement as it ends. Otherwise the COMMIT is a
+    # round trip of its own, and a process frozen in between (SIGSTOP, a paused VM) would keep the job or
+    # worker row locked until the server's idle-in-transaction timeout (60 s); the replacement worker's
+    # stalled-job release and worker pruning would wait for it (C17). `configure` also runs on procrastinate's
+    # own listener connection, which is autocommit already. (`autocommit=True` as a pool argument would clash
+    # with that connection's own.) The task app is only used asynchronously: the sync connector procrastinate
+    # derives from these arguments would not await `_autocommit`.
     return procrastinate.App(
-        connector=procrastinate.PsycopgConnector(conninfo=dsn, min_size=1, max_size=max_size)
+        connector=procrastinate.PsycopgConnector(
+            conninfo=dsn, min_size=1, max_size=max_size, configure=_autocommit
+        )
     )
 
 

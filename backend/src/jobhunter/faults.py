@@ -9,6 +9,10 @@ refuses to start a prod process that has the variable set at all.
 * ``<point>:sleep=<s>``: ``afault_point`` awaits ``asyncio.sleep(s)``. The synchronous
   ``fault_point`` never sleeps, because that would block an event loop.
 
+Before it acts, ``afault_point`` logs ``fault_point_reached`` (warning) with ``point`` and ``action``: the
+crash tests' readiness acknowledgement that the process is at the point. The handler flushes every line, so
+the line is out before a pause or an exit.
+
 A malformed action on a matching point raises ``ValueError`` so a typo cannot pass as a no-op.
 """
 
@@ -18,11 +22,15 @@ import os
 import signal
 from typing import Final, Literal
 
+from jobhunter.observability.logging import get_logger
+
 FAULT_EXIT_CODE: Final = 86
 
 _ENV_VAR: Final = "JOBHUNTER_FAULT"
 
 type _Action = tuple[Literal["exit", "pause", "sleep"], float]
+
+log = get_logger("jobhunter.faults")
 
 
 def _armed_action(name: str) -> _Action | None:
@@ -69,6 +77,7 @@ async def afault_point(name: str) -> None:
     if action is None:
         return
     kind, seconds = action
+    log.warning("fault_point_reached", point=name, action=kind)
     if kind == "sleep":
         await asyncio.sleep(seconds)
     else:

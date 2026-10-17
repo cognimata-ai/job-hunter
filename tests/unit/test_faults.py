@@ -1,5 +1,6 @@
 # tests/unit/test_faults.py
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -96,3 +97,35 @@ def test_a_malformed_armed_fault_is_loud(monkeypatch: pytest.MonkeyPatch, fault:
     monkeypatch.setenv("JOBHUNTER_FAULT", fault)
     with pytest.raises(ValueError, match="JOBHUNTER_FAULT"):
         faults.fault_point("p.x")
+
+
+# --- The readiness acknowledgement of the crash tests (Task 13, ruling P11) --------------------------------
+
+
+async def test_async_fault_point_logs_the_point_before_it_acts(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    from tests.support.logs import logged
+
+    logged_before_sleep: list[list[object]] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        logged_before_sleep.append([event["point"] for event in logged(caplog, "fault_point_reached")])
+
+    monkeypatch.setenv("JOBHUNTER_ENV", "test")
+    monkeypatch.setenv("JOBHUNTER_FAULT", "p.x:sleep=2.5")
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await faults.afault_point("p.y")  # not armed here: nothing is logged
+    await faults.afault_point("p.x")
+    assert logged_before_sleep == [["p.x"]]
+    (event,) = logged(caplog, "fault_point_reached")
+    assert event["action"] == "sleep"
+
+
+def test_async_fault_point_logs_the_point_before_it_exits() -> None:
+    code = "import asyncio\nfrom jobhunter.faults import afault_point\nasyncio.run(afault_point('p.x'))"
+    env = {**os.environ, "JOBHUNTER_ENV": "test", "JOBHUNTER_FAULT": "p.x"}
+    done = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert done.returncode == 86
+    events = [json.loads(line) for line in (done.stdout + done.stderr).splitlines() if line.startswith("{")]
+    assert [(e["event"], e["point"], e["action"]) for e in events] == [("fault_point_reached", "p.x", "exit")]

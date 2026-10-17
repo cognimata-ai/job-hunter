@@ -9,7 +9,8 @@ the reconciler succeeds again, the alert is resolved.
 
 This module is a task boundary (ruff `BLE001` is allowed here), and the catch persists an outcome (§17.1).
 
-`stalled_jobs` is registered here; the tasks that own the other repairs register theirs.
+`stalled_jobs` and the heavy `metrics_refresh` are registered here; the tasks that own the other repairs
+register theirs.
 """
 
 from collections.abc import Awaitable, Callable
@@ -20,8 +21,9 @@ from typing import Literal
 import procrastinate
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from jobhunter.observability.alerts import raise_alert, resolve_alert
+from jobhunter.observability.alerts import raise_alert, refresh_alert_gauge, resolve_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.worker.tasks import Deferrer, release_stalled_jobs
 
 Cadence = Literal["start", "tick", "heavy", "daily"]
@@ -115,3 +117,15 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
 async def stalled_jobs(ctx: ReconcileContext) -> int:
     """Release the jobs of dead workers: the one stalled-job path (spike V2), at start and on every tick."""
     return await release_stalled_jobs(ctx.queue)
+
+
+@reconciler("metrics_refresh", "heavy")
+async def metrics_refresh(ctx: ReconcileContext) -> int:
+    """Refresh the gauges read from the database: open alerts by severity and the size of every table.
+
+    It repairs nothing, so it returns 0.
+    """
+    async with ctx.engine.connect() as conn:
+        await refresh_alert_gauge(conn)
+        await refresh_table_bytes(conn)
+    return 0

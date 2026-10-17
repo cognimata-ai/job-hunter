@@ -102,3 +102,20 @@ async def test_resolve_failure_is_logged_and_does_not_stop_the_other_reconcilers
         ("second", "ConnectionError"),
     ]
     assert "must not be" not in caplog.text
+
+
+async def test_heavy_metrics_refresh_sets_table_sizes_and_the_open_alert_gauge(engine, queue_app) -> None:
+    from jobhunter.observability.alerts import raise_alert
+    from jobhunter.observability.metrics import REGISTRY, refresh_table_bytes
+
+    async with engine.begin() as c:
+        await raise_alert(c, code="x.test", severity="critical", subject="s", message="m")
+    ctx = r.ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=1)
+    assert (await r.run_reconcilers(ctx, "heavy"))["metrics_refresh"] == 0  # a refresh repairs nothing
+    assert REGISTRY.get_sample_value("jobhunter_alerts_open", {"severity": "critical"}) == 1
+    async with engine.connect() as c:
+        sizes = await refresh_table_bytes(c)  # the one collector, which system health reuses (ruling T13-c)
+    for table in ("runs", "procrastinate_jobs", "checkpoints", "alerts"):
+        assert sizes[table] > 0  # every public table has at least its primary key's index
+        assert REGISTRY.get_sample_value("jobhunter_table_bytes", {"table": table}) == sizes[table]
+    assert "alembic_version" in sizes and not any(name.startswith("pg_") for name in sizes)

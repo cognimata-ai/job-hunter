@@ -17,6 +17,10 @@ def _build_parser() -> argparse.ArgumentParser:
     startup_check.add_argument("--role", required=True, choices=get_args(Role))
     commands.add_parser("migrate", help="bring the database to the code head and seed the defaults (§19.3)")
     commands.add_parser(
+        "worker",
+        help="run the worker: singleton lock, takeover, procrastinate queues (§3.3); SIGTERM drains it",
+    )
+    commands.add_parser(
         "worker-health",
         help="exit 0 when the worker heartbeat is at most 60 s old, else 1 (container HEALTHCHECK)",
     )
@@ -53,6 +57,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         run_migrate(startup_or_exit("migrate"))
         return 0
+    if args.command == "worker":
+        # Imported here, like `migrate`: the worker pulls in procrastinate and langgraph.
+        import asyncio
+
+        from jobhunter.worker.main import worker_main
+
+        raise SystemExit(asyncio.run(worker_main(startup_or_exit("worker"))))
     if args.command == "worker-health":
         return _worker_health()
     parser.error(f"unknown command {args.command!r}")

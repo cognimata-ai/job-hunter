@@ -42,6 +42,8 @@ _TRACING_VARS: Final = (
 _FAKE_MODE_VARS: Final = ("JOBHUNTER_FAKE_SOURCES", "JOBHUNTER_FAKE_LLM", "JOBHUNTER_FAULT")
 _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_API_KEY")
 _WORLD_READABLE: Final = 0o004
+# The levels `configure_logging` accepts (`JOBHUNTER_LOG_LEVEL`, compared upper-cased).
+LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 ALL_SECRETS: Final = SECRET_NAMES
 
@@ -291,6 +293,10 @@ def run_startup_assertions(cfg: AppConfig) -> None:
 
     if cfg.env == "prod" and (anthropic := [name for name in _ANTHROPIC_ENV_VARS if name in env]):
         raise StartupCheckFailed("anthropic_env_in_prod", f"{', '.join(anthropic)} must not be set in prod")
+
+    # After the §16.8 checks (ruling T13-a): the process applies this level when it configures its logging.
+    if cfg.log_level not in LOG_LEVELS:
+        raise StartupCheckFailed("log_level", f"JOBHUNTER_LOG_LEVEL must be one of {', '.join(LOG_LEVELS)}")
 
 
 def _log_startup_failure(role: Role, exc: StartupCheckFailed) -> None:

@@ -414,3 +414,37 @@ def test_cli_main_rejects_an_unknown_role() -> None:
     with pytest.raises(SystemExit) as exc:
         main(["startup-check", "--role", "embedder"])
     assert exc.value.code == 2
+
+
+# --- Ruling T13-a: the log level is a startup assertion ----------------------------------------------------
+
+
+@pytest.mark.parametrize("level", ["verbose", "TRACE", "20", "info "])
+def test_an_unknown_log_level_fails_startup(tmp_path: Path, level: str) -> None:
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", {**BASE_ENV, "JOBHUNTER_LOG_LEVEL": level}, d))
+    assert exc.value.check == "log_level"
+    assert exc.value.detail == "JOBHUNTER_LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL"
+
+
+@pytest.mark.parametrize("level", ["debug", "INFO", "Warning", "ERROR", "critical"])
+def test_every_known_log_level_passes_in_any_case(tmp_path: Path, level: str) -> None:
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    cfg = load_config("worker", {**BASE_ENV, "JOBHUNTER_LOG_LEVEL": level}, d)
+    run_startup_assertions(cfg)
+    assert cfg.log_level == level.upper()
+
+
+def test_cli_exits_78_for_an_unknown_log_level(tmp_path: Path) -> None:
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    env = {**os.environ, **BASE_ENV, "JOBHUNTER_SECRETS_DIR": str(d), "JOBHUNTER_LOG_LEVEL": "verbose"}
+    r = subprocess.run(
+        [sys.executable, "-m", "jobhunter.cli", "startup-check", "--role", "worker"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 78
+    (line,) = r.stdout.splitlines()
+    assert json.loads(line)["check"] == "log_level"

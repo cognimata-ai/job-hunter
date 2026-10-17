@@ -129,3 +129,15 @@ async def test_job_that_finished_after_the_listing_is_skipped(engine, queue_app,
     assert [(m["job_id"], m["task_name"]) for m in logged(caplog, "stalled_job_not_retryable")] == [
         (job_id, "jh:run_operation")
     ]
+
+
+async def test_task_app_statements_commit_as_they_end(queue_app) -> None:
+    """No COMMIT round trip after a statement, so a frozen process cannot hold job rows past it (C17)."""
+    from psycopg import pq
+
+    connector = queue_app.connector
+    assert isinstance(connector, procrastinate.PsycopgConnector)
+    async with connector.pool.connection() as conn:
+        await conn.execute("SELECT count(*) FROM procrastinate_jobs")
+        assert conn.autocommit and conn.info.transaction_status == pq.TransactionStatus.IDLE
+    assert await queue_app.job_manager.list_jobs_to_abort_async() == []  # the pool still serves procrastinate
