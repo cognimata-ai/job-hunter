@@ -54,8 +54,9 @@ def _http_check(url: str) -> int:
     """An api container HEALTHCHECK: one GET of `url`, with `HTTP_CHECK_TIMEOUT_S` for each socket operation.
 
     Quiet like `worker-health`: the standard library only (httpx is no runtime dependency), no logging setup,
-    and a failure prints one stderr line that names the error class only (a non-2xx answer is an `HTTPError`).
-    Proxy variables are ignored: the probe asks the server in its own container.
+    and a failure prints one stderr line that names the error class only. urllib raises `HTTPError` for every
+    final status outside 2xx (after following redirects), so an answer that does not raise is a 2xx. Proxy
+    variables are ignored: the probe asks the server in its own container.
     """
     try:
         # Imported here: the other commands do not need them.
@@ -65,13 +66,10 @@ def _http_check(url: str) -> int:
         if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
             raise ValueError("http-check probes http and https URLs only")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(url, timeout=HTTP_CHECK_TIMEOUT_S) as response:
-            status = response.status
+        with opener.open(url, timeout=HTTP_CHECK_TIMEOUT_S):
+            pass
     except Exception as exc:  # noqa: BLE001 - the probe's exit status is its outcome; Docker records it
         print(f"http-check: {type(exc).__name__}", file=sys.stderr)
-        return 1
-    if not 200 <= status < 300:
-        print(f"http-check: status {status}", file=sys.stderr)
         return 1
     return 0
 

@@ -78,6 +78,7 @@ async def test_readyz_reports_missing_schema(fresh_pg_server, make_config, log_e
 
 async def test_problems_for_404_422_and_500_carry_edge_headers(engine, make_config) -> None:
     from jobhunter.api.app import create_app
+    from jobhunter.observability.metrics import REGISTRY
 
     router = APIRouter()
 
@@ -93,6 +94,12 @@ async def test_problems_for_404_422_and_500_carry_edge_headers(engine, make_conf
         raise RuntimeError("secret detail")
 
     app = create_app(cfg=make_config("api"), engine=engine, extra_routers=[router])
+
+    def count(route: str, status: str) -> float:
+        value = REGISTRY.get_sample_value("jobhunter_http_requests_total", {"route": route, "status": status})
+        return 0.0 if value is None else value
+
+    boom_500s = count("/api/_boom", "500")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
         base_url="https://testserver",
@@ -113,6 +120,8 @@ async def test_problems_for_404_422_and_500_carry_edge_headers(engine, make_conf
             and r.json()["code"] == "validation_failed"
             and r.json()["errors"][0]["field"] == "body.n"
         )
+        assert r.headers["content-type"] == "application/problem+json"
+        assert r.json()["errors"][0]["code"] == "less_than_equal"
         r = await c.get("/api/_boom")
         assert_edge(r)
         assert (
@@ -121,6 +130,8 @@ async def test_problems_for_404_422_and_500_carry_edge_headers(engine, make_conf
             and "secret detail" not in r.text
             and "Traceback" not in r.text
         )
+        assert r.headers["content-type"] == "application/problem+json"
+    assert count("/api/_boom", "500") - boom_500s == 1.0  # counted under the route template
     async with engine.connect() as conn:  # the last-resort 500 persisted one deduplicated alert
         assert tuple(
             (
@@ -197,9 +208,18 @@ async def test_request_id_is_logged_and_unbound_after_the_response(engine, make_
     assert first.status_code == 500 and second.status_code == 200
     assert first.headers["x-request-id"] != second.headers["x-request-id"]
     assert first.json()["request_id"] == first.headers["x-request-id"]
-    unhandled = [e for e in log_events() if e["event"] == "unhandled_exception"]
-    assert [(e["request_id"], e["error_class"]) for e in unhandled] == [
-        (first.headers["x-request-id"], "RuntimeError")
+    # The inner handler logs first, then the edge sees ServerErrorMiddleware's re-raise after the 500 started:
+    # the edge wraps ServerErrorMiddleware. Mounted inside it, the edge would render the 500 itself and log it
+    # once as `jobhunter.api.edge`; the inner handler would never run.
+    rid = first.headers["x-request-id"]
+    sequence = [
+        (e["event"], e["logger"], e["request_id"], e["error_class"])
+        for e in log_events()
+        if e["event"] in ("unhandled_exception", "unhandled_exception_after_start")
+    ]
+    assert sequence == [
+        ("unhandled_exception", "jobhunter.api", rid, "RuntimeError"),
+        ("unhandled_exception_after_start", "jobhunter.api.edge", rid, "RuntimeError"),
     ]
     assert "secret detail" not in json.dumps(log_events()) and "Traceback" not in json.dumps(log_events())
 
@@ -471,3 +491,64 @@ async def test_the_lifespan_builds_the_state_from_the_environment(migrated, monk
         assert (await outbox.get())["type"] == "lifespan.shutdown.complete"
         await lifespan
     assert engine.pool.checkedin() == 0  # disposed at shutdown
+
+
+async def test_a_422_message_returns_to_the_sender_and_never_reaches_a_log_line(
+    engine, make_config, log_events
+) -> None:
+    from jobhunter.api.app import create_app
+    from pydantic import field_validator
+
+    router = APIRouter()
+
+    class Tagged(BaseModel):
+        tag: str
+
+        @field_validator("tag")
+        @classmethod
+        def known(cls, value: str) -> str:
+            raise ValueError(f"unknown tag {value!r}")  # pydantic puts this, with the input, into `msg`
+
+    @router.post("/api/_tagged")
+    async def tagged(body: Tagged) -> dict[str, str]:
+        return {"tag": body.tag}
+
+    app = create_app(cfg=make_config("api"), engine=engine, extra_routers=[router])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as c:
+        r = await c.post("/api/_tagged", json={"tag": "sender-input-7f3a"})
+    assert_edge(r)
+    assert r.status_code == 422 and r.headers["content-type"] == "application/problem+json"
+    # the sender gets its own input back (ruling T14-h) ...
+    assert r.json()["errors"] == [
+        {
+            "field": "body.tag",
+            "code": "value_error",
+            "message": "Value error, unknown tag 'sender-input-7f3a'",
+        }
+    ]
+    # ... and no log line carries it
+    assert "sender-input-7f3a" not in json.dumps(log_events())
+
+
+async def test_readiness_bounds_the_probe_sequence_client_side(engine, log_events, monkeypatch) -> None:
+    from jobhunter.clock import utcnow
+    from jobhunter.db.alembic_runner import code_head
+    from jobhunter.observability import health
+
+    assert health.PROBES_TIMEOUT_S == 2 * health.DB_TIMEOUT_S
+    await fresh_heartbeat(engine)
+    probe = health._rows
+    never = asyncio.Event()  # a database that stops answering after `SELECT 1`, its socket still open
+
+    async def stuck_heartbeat_probe(conn, name, statement):
+        if name == "worker_heartbeat":
+            await never.wait()
+        return await probe(conn, name, statement)
+
+    monkeypatch.setattr(health, "_rows", stuck_heartbeat_probe)
+    monkeypatch.setattr(health, "PROBES_TIMEOUT_S", 0.1)
+    async with asyncio.timeout(10):  # without the bound the check would wait for ever
+        report = await health.check_readiness(engine, code_head=code_head(), now=utcnow())
+    assert report == health.ReadinessReport(ok=False, failing=["db"])
+    failed = [(e["probe"], e["error_class"]) for e in log_events() if e["event"] == "readiness_probe_failed"]
+    assert failed == [("db", "TimeoutError")]  # the migrations probe passed; its result is not reported alone

@@ -12,7 +12,11 @@ from jobhunter.cli import main
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        self.send_response(204 if self.path == "/healthz" else 503)
+        if self.path.startswith("/moved"):  # /moved-to/healthz redirects to /healthz
+            self.send_response(302)
+            self.send_header("Location", self.path.removeprefix("/moved-to"))
+        else:
+            self.send_response(204 if self.path == "/healthz" else 503)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -37,6 +41,12 @@ def test_exit_status_follows_the_http_status(server_url, capsys) -> None:
     assert main(["http-check", f"{server_url}/healthz"]) == 0
     assert capsys.readouterr().err == ""
     assert main(["http-check", f"{server_url}/readyz"]) == 1
+    assert capsys.readouterr().err == "http-check: HTTPError\n"
+
+
+def test_redirects_are_followed_to_the_final_status(server_url, capsys) -> None:
+    assert main(["http-check", f"{server_url}/moved-to/healthz"]) == 0
+    assert main(["http-check", f"{server_url}/moved-to/readyz"]) == 1
     assert capsys.readouterr().err == "http-check: HTTPError\n"
 
 

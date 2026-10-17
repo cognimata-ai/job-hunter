@@ -10,7 +10,9 @@ the savepoint rolled back, so a failed probe (e.g. `42P01` on a database without
 transaction the next probe uses. A probe whose error invalidated the connection means the database went away
 mid-check: the answer is then `db`. After `SELECT 1`, the transaction sets a `statement_timeout`, so a probe
 that waits behind a lock (a migration holding `ACCESS EXCLUSIVE`) fails by itself instead of holding
-`/readyz` and a pool connection.
+`/readyz` and a pool connection. The server enforces that timeout; the client bounds the whole probe sequence
+too (`PROBES_TIMEOUT_S`), for a database that stops answering while its socket stays open: the answer is
+then `db`.
 
 Every failed probe logs `readiness_probe_failed` with `probe`, `sqlstate` and `error_class` (`None` when no
 error was raised; `reason` says what was wrong then). Never an exception message.
@@ -34,6 +36,8 @@ from jobhunter.worker.lock import HEARTBEAT_STALE_S
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat"]
 
 DB_TIMEOUT_S: Final = 2.0
+# The client-side bound of the schema probes together; each one also has the server-side statement timeout.
+PROBES_TIMEOUT_S: Final = 2 * DB_TIMEOUT_S
 PROBE_STATEMENT_TIMEOUT: Final = "2s"
 HEARTBEAT_STALE: Final = timedelta(seconds=HEARTBEAT_STALE_S)
 
@@ -119,9 +123,13 @@ async def _probe_all(engine: AsyncEngine, code_head: str) -> list[ReadinessCode]
             _log_failed("db", exc)
             return ["db"]
         try:
-            return await _schema_probes(conn, code_head)
+            async with asyncio.timeout(PROBES_TIMEOUT_S):
+                return await _schema_probes(conn, code_head)
         except _ConnectionLost as lost:
             _log_failed("db", lost.error)
+            return ["db"]
+        except TimeoutError as exc:
+            _log_failed("db", exc)
             return ["db"]
 
 

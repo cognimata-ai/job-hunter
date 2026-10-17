@@ -6,14 +6,18 @@ the one place that builds that document; the handlers here and the edge middlewa
 The handlers (installed through `exception_handlers()`):
 - `Problem`: its own document;
 - `RequestValidationError`: 422 `validation_failed`, one `FieldError` per pydantic error (`field` is the `loc`
-  joined with "."; `code` is the pydantic error type; never the input);
-- Starlette's `HTTPException`: 404 and 405 are `not_found` (a 405 keeps its `Allow` header);
+  joined with "."; `code` is the pydantic error type; `message` is pydantic's `msg`). The `msg` can echo the
+  sender's own input (a validator's `ValueError` text, a parse error's offending character): it goes back to
+  that sender only and is never logged (ruling T14-h). Pydantic's `input` member is never copied;
+- Starlette's `HTTPException`: mapped by `code_for_http_status` (404 and 405 are `not_found`; a 405 keeps its
+  `Allow` header);
 - any other `Exception`: the last-resort 500 `internal`. It logs `unhandled_exception` with the error class
   only and persists the deduplicated `api.unhandled_exception` alert (§17.1). Starlette runs it from
   `ServerErrorMiddleware`, which then re-raises to the edge.
 
 This module is a task boundary (ruff `BLE001` is allowed here). No exception message or traceback reaches a
-response body, a log line or an alert: they can carry SQL, input or secrets.
+log line or an alert, and none reaches a response body except the 422 validation messages above: they can
+carry SQL, input or secrets.
 """
 
 import asyncio
@@ -80,8 +84,9 @@ class FieldError:
 class Problem(Exception):
     """An error response the api means to send: raise it from a route or a dependency.
 
-    `str(problem)` is its `code`; `detail` and every `FieldError.message` go to the client, so they carry no
-    secret and no PII.
+    `str(problem)` is its `code`. `detail` and every `FieldError.message` go to the client: a `detail` carries
+    no secret and no PII; a validation message may echo the sender's own input (ruling T14-h), so no field
+    of a problem is ever logged.
     """
 
     def __init__(
@@ -206,18 +211,32 @@ def _http_status_title(status: int) -> str:
         return "Error"
 
 
-async def _on_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
-    # Routing raises 404 and 405; the rest come from Starlette or FastAPI themselves (a body that cannot be
-    # parsed is a 400). Their `detail` is not passed on: it is library text, not a client message.
-    status = exc.status_code if 400 <= exc.status_code <= 599 else 500
-    code: ProblemCode
+def code_for_http_status(status: int) -> ProblemCode:
+    """The problem code of an `HTTPException` that Starlette, FastAPI or a library raised (not a `Problem`).
+
+    - 404 and 405 (routing: no route, or no route for the method) → `not_found`;
+    - 401 (e.g. FastAPI's security helpers) → `unauthenticated`;
+    - 413 (a body over the size limit) → `upload_rejected`;
+    - any other 4xx (e.g. 400 for a body that cannot be parsed) → `validation_failed`;
+    - 5xx → `internal`.
+    """
     if status in (404, 405):
-        code = "not_found"
-    elif status >= 500:
-        code = "internal"
-    else:
-        code = "validation_failed"
-    return _respond(request, Problem(status, code, _http_status_title(status), headers=exc.headers))
+        return "not_found"
+    if status == 401:
+        return "unauthenticated"
+    if status == 413:
+        return "upload_rejected"
+    if status >= 500:
+        return "internal"
+    return "validation_failed"
+
+
+async def _on_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+    # Their `detail` is not passed on: it is library text, not a client message. Their headers (`Allow` of a
+    # 405, `WWW-Authenticate` of a 401) are.
+    status = exc.status_code if 400 <= exc.status_code <= 599 else 500
+    problem = Problem(status, code_for_http_status(status), _http_status_title(status), headers=exc.headers)
+    return _respond(request, problem)
 
 
 async def _on_unhandled(request: Request, exc: Exception) -> Response:
