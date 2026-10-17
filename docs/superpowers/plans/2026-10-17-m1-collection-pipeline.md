@@ -100,9 +100,9 @@ The paths follow §4.2 for the M1 subset. Modules that §4.2 does not list are m
 | `coverage_intervals` (`gap_status`) | `open→closed`, `open→abandoned` | both → `closed_at` | `reason` | `gap_cursor` |
 
   None of them has owner columns: the run's ownership predicate is checked by the caller's `runs … FOR SHARE` (§3.3.3), as the M0 `runs`/`operations` specs check theirs.
-  - `fixtures._TRUNCATE` also names `watchlist_companies, source_instances, queries, coverage_cells, coverage_intervals, fetch_requests, raw_responses, raw_items, ats_snapshots, ats_snapshot_members, ats_snapshot_absences, quota_windows, quota_ledger, postings, posting_observations, jobs, job_revisions, job_revision_occurrences, job_revision_sources, ad_keys, ad_key_sources, merge_events, identity_conflicts, duplicate_groups, duplicate_group_members, dedup_decisions, job_tombstones, tombstone_keys, embeddings, hard_filter_results`. `source_instances` is named on purpose: `TRUNCATE … CASCADE` truncates every table that references a named one whatever its `ON DELETE` action, so the default instances vanish with `watchlist_companies` and `ats_snapshots` in any case. `reset_database` therefore re-inserts them in the same transaction with `seed.DEFAULT_INSTANCES_SQL` (the seed's own `INSERT … ON CONFLICT DO NOTHING`), and also restores the configuration state that M1 tests mutate: `UPDATE active_config SET settings_version_id = <v1>, scope_version_id = <v1.scope>, pending_scope_version_id = NULL, llm_tuple_id = NULL`, `DELETE FROM settings_versions WHERE version_no > 1`, `DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)`, `UPDATE ranking_state SET generation = 0, updated_at = now()`. Instance ids change with every reset, so no test, helper or fixture assumes an id: they resolve instances by `(source_id, instance_key)` (`tests/support/collect.instance_id(conn, source_id, instance_key="default")`). The `sources` rows are seeds and stay.
+  - `fixtures._TRUNCATE` also names `watchlist_companies, source_instances, queries, coverage_cells, coverage_intervals, fetch_requests, raw_responses, raw_items, ats_snapshots, ats_snapshot_members, ats_snapshot_absences, quota_windows, quota_ledger, postings, posting_observations, jobs, job_revisions, job_revision_occurrences, job_revision_sources, ad_keys, ad_key_sources, merge_events, identity_conflicts, duplicate_groups, duplicate_group_members, dedup_decisions, job_tombstones, tombstone_keys, embeddings, hard_filter_results`. `source_instances` is named on purpose: `TRUNCATE … CASCADE` truncates every table that references a named one whatever its `ON DELETE` action, so the default instances vanish with `watchlist_companies` and `ats_snapshots` in any case. `reset_database` therefore re-inserts them in the same transaction with `seed.DEFAULT_INSTANCES_SQL` (the seed's own `INSERT … ON CONFLICT DO NOTHING`), and also restores the configuration state that M1 tests mutate, **in this order** (every row that references a newer settings version is re-pointed before that version is deleted; `schedule_state.settings_version_id` is an immediate FK): `UPDATE active_config SET settings_version_id = <v1>, scope_version_id = <v1.scope>, pending_scope_version_id = NULL, llm_tuple_id = NULL`; the M0 `_SCHEDULE_RESET` (which points `schedule_state` at version 1); `DELETE FROM settings_versions WHERE version_no > 1`; `DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)`; `UPDATE ranking_state SET generation = 0, updated_at = now()`. Instance ids change with every reset, so no test, helper or fixture assumes an id: they resolve instances by `(source_id, instance_key)` (`tests/support/collect.instance_id(conn, source_id, instance_key="default")`). The `sources` rows are seeds and stay.
 
-The migration's differences from the spec text, each with a SQL comment naming its owner (Deviations 1 and 2): `queries.proposal_id bigint` has no FK (M2 adds it with `query_proposals`); `profile_vectors` is not created (M2); `hard_filter_results` is created here; the `source_instances` CHECK reads `(health IN ('breaker_open','auth_failed','contract_broken','not_found')) = (breaker_opened_at IS NOT NULL AND half_open_after IS NOT NULL)`.
+The migration's differences from the spec text, each with a SQL comment naming its owner (Deviations 1 and 2): `queries.proposal_id bigint` has no FK (M2 adds it with `query_proposals`); `profile_vectors` is not created (M2); `hard_filter_results` is created here; the `source_instances` CHECK reads `(health IN ('breaker_open','auth_failed','contract_broken','not_found')) = (breaker_opened_at IS NOT NULL AND half_open_after IS NOT NULL)`; the CHECK constraints a test asserts by name carry an explicit `CONSTRAINT <name>` (the spec leaves them unnamed, and PostgreSQL's generated `<table>_check<n>` names depend on DDL order): `fetch_requests_skipped_reason_check`, `quota_windows_tokens_check`, `source_instances_breaker_check`, `coverage_intervals_covered_reason_check`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -120,7 +120,8 @@ def test_m1_machines() -> None:
 ```python
 # tests/integration/test_schema_m1.py
 import pytest, sqlalchemy as sa
-from jobhunter.db.sql import CHECK_VIOLATION, UNIQUE_VIOLATION, pg_error
+from jobhunter.db.sql import CHECK_VIOLATION, UNIQUE_VIOLATION, PgErrorInfo, pg_error
+from tests.support.fixtures import reset_database
 pytestmark = pytest.mark.integration
 M1_TABLES = {"sources", "watchlist_companies", "source_instances", "queries", "coverage_cells", "coverage_intervals", "fetch_requests",
     "raw_responses", "raw_items", "ats_snapshots", "ats_snapshot_members", "quota_windows", "quota_ledger", "postings", "posting_observations",
@@ -141,16 +142,16 @@ RUN = "INSERT INTO runs (trigger,scheduled_slot,status,include_paid,settings_ver
 CELL = "INSERT INTO coverage_cells (source_instance_id) SELECT id FROM source_instances WHERE source_id='arbeitnow' AND instance_key='default' RETURNING id"
 @pytest.mark.parametrize(("statement", "constraint"), [
     ("INSERT INTO fetch_requests (run_id, run_attempt_no, cell_id, source_instance_id, phase, operation, request_key, page_no, request_class, spec, status) "
-     "VALUES (:run,1,:cell,(SELECT source_instance_id FROM coverage_cells WHERE id=:cell),'primary','list','\\x00',1,'free','{}','skipped')", "fetch_requests_check"),   # skipped without skip_reason
-    ("INSERT INTO quota_windows (provider, window_start, window_end, is_current, limit_units, reserve_units, state, tokens, tokens_at, capacity) VALUES ('jsearch', now(), now() + interval '1 day', true, 200, 20, 'validated', 3, now(), 2)", "quota_windows_check"),   # tokens above capacity
-    ("INSERT INTO source_instances (source_id, instance_key, health) VALUES ('jsearch', 'x', 'breaker_open')", "source_instances_check"),   # open without timestamps
-    ("INSERT INTO coverage_intervals (cell_id, kind, span, reason) VALUES (:cell, 'covered', tstzrange(now() - interval '1 day', now()), 'page_cap')", "coverage_intervals_check1"),   # covered with a reason
+     "VALUES (:run,1,:cell,(SELECT source_instance_id FROM coverage_cells WHERE id=:cell),'primary','list','\\x00',1,'free','{}','skipped')", "fetch_requests_skipped_reason_check"),   # skipped without skip_reason
+    ("INSERT INTO quota_windows (provider, window_start, window_end, is_current, limit_units, reserve_units, state, tokens, tokens_at, capacity) VALUES ('jsearch', now(), now() + interval '1 day', true, 200, 20, 'validated', 3, now(), 2)", "quota_windows_tokens_check"),   # tokens above capacity
+    ("INSERT INTO source_instances (source_id, instance_key, health) VALUES ('jsearch', 'x', 'breaker_open')", "source_instances_breaker_check"),   # open without timestamps
+    ("INSERT INTO coverage_intervals (cell_id, kind, span, reason) VALUES (:cell, 'covered', tstzrange(now() - interval '1 day', now()), 'page_cap')", "coverage_intervals_covered_reason_check"),   # covered with a reason
 ])
 async def test_checks_reject_violations(engine, statement, constraint) -> None:
     async with engine.begin() as c:   # the dependencies are valid rows, so only the intended CHECK can fail
         run = (await c.execute(sa.text(RUN))).scalar_one(); cell = (await c.execute(sa.text(CELL))).scalar_one()
         with pytest.raises(sa.exc.IntegrityError) as bad: await c.execute(sa.text(statement), {"run": run, "cell": cell})
-    assert pg_error(bad.value).sqlstate == CHECK_VIOLATION and pg_error(bad.value).constraint.startswith(constraint.rsplit("_", 1)[0])
+    assert pg_error(bad.value) == PgErrorInfo(CHECK_VIOLATION, constraint)   # the exact named constraint, through M0's helper
 
 async def test_one_current_window_per_provider(engine) -> None:
     ins = sa.text("INSERT INTO quota_windows (provider, window_start, window_end, is_current, limit_units, reserve_units, state, tokens, tokens_at, capacity) VALUES ('adzuna', :s, :s + interval '30 days', true, 2250, 0, 'validated', 1, :s, 1)")
@@ -167,13 +168,20 @@ async def test_new_tables_have_transition_triggers(engine) -> None:
         with pytest.raises(sa.exc.IntegrityError, match="disallowed transition fetch_requests: planned -> succeeded"):
             await c.execute(sa.text("UPDATE fetch_requests SET status='succeeded' WHERE id=:i"), {"i": fr})
 
+V2 = ("INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, execution_config_id, evaluation_policy_id, effect_classes) "
+      "SELECT 2, schema_version, payload, scope_version_id, model_policy_id, execution_config_id, evaluation_policy_id, '{}' FROM settings_versions WHERE version_no = 1 RETURNING id")
 async def test_reset_reseeds_the_default_instances_and_the_configuration(engine, migrated) -> None:
     async with engine.begin() as c:
         await c.execute(sa.text("INSERT INTO watchlist_companies (display_name, ats_type, board_slug, validation_status) VALUES ('X','greenhouse','x','ok')"))
         await c.execute(sa.text("UPDATE ranking_state SET generation = 7"))
-    reset_database(migrated)
+        v2 = (await c.execute(sa.text(V2))).scalar_one()   # a newer version that the schedule and the active config point at, as the M1 tests do
+        await c.execute(sa.text("UPDATE active_config SET settings_version_id = :v"), {"v": v2}); await c.execute(sa.text("UPDATE schedule_state SET settings_version_id = :v"), {"v": v2})
+    reset_database(migrated)   # must not fail on schedule_state's FK: the schedule is re-pointed before version 2 is deleted
     async with engine.connect() as c:
+        v1 = (await c.execute(sa.text("SELECT id FROM settings_versions WHERE version_no = 1"))).scalar_one()
         assert sorted((await c.execute(sa.text("SELECT source_id FROM source_instances WHERE instance_key='default'"))).scalars()) == ["adzuna", "arbeitnow", "jsearch", "serpapi"]
+        assert (await c.execute(sa.text("SELECT max(version_no) FROM settings_versions"))).scalar_one() == 1
+        assert (await c.execute(sa.text("SELECT settings_version_id FROM schedule_state"))).scalar_one() == v1 == (await c.execute(sa.text("SELECT settings_version_id FROM active_config"))).scalar_one()
         assert (await c.execute(sa.text("SELECT generation FROM ranking_state"))).scalar_one() == 0 and (await c.execute(sa.text("SELECT count(*) FROM watchlist_companies"))).scalar_one() == 0
 ```
 
@@ -212,7 +220,7 @@ Expected: FAIL with `KeyError: 'fetch_requests'` and `UndefinedTable` errors (th
 - The migration docstring lists the spec sections it copies and the four deviations, like `0001_m0_baseline`. `op.execute` per statement; `-- ruff: noqa: E501`.
 - `seed_defaults` inserts `SOURCES` and `DEFAULT_INSTANCES` after `ranking_state` and before `sync_transition_matrix` (both `ON CONFLICT DO NOTHING`).
 - `transitions.py`: the seven specs as in the Interfaces table; `TransitionSpec` needs no change (`reason_col=None` for `fetch_requests` and `identity_conflicts`). `raw_items.disposed_at` is a changed-at column *and* a `clear_on_exit` column of `rejected`, never a settable one: `TransitionSpec.__post_init__` refuses `settable & managed`, and `_validate` already applies `clear_on_exit` on every exit to another state. `test_m1_machines` also asserts `TRANSITIONS["raw_items"].clear_on_exit == {"rejected": ("disposed_at",)}` and `"disposed_at" not in TRANSITIONS["raw_items"].settable`, and `tests/unit/test_transition_registry.py` gains `test_registry_imports_without_a_managed_settable_clash` (constructing a spec whose `settable` names a changed-at column raises `ValueError`, the guard this table relies on). The callers in Tasks 15 and 18 pass `reason=CLEAR_REASON` on `rejected→pending` and `deferred→linked`: `reason=None` keeps the old reason and the `raw_items` CHECK `(disposition IN (…)) = (reason_code IS NOT NULL)` refuses the row.
-- `reset_database`: the truncate, then `DEFAULT_INSTANCES_SQL`, the `active_config`/`settings_versions`/`scope_versions`/`ranking_state` restoration and the schedule reset, all in the one transaction.
+- `reset_database`, all in the one transaction and in this order: the truncate, `DEFAULT_INSTANCES_SQL`, the `active_config` restoration, the M0 schedule reset (`_SCHEDULE_RESET`, now **before** the deletes), then `DELETE FROM settings_versions WHERE version_no > 1`, the `scope_versions` delete and the `ranking_state` reset.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -859,7 +867,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.cli_fixture
 
 - [ ] **Step 3: Implement the scrubber, the recorder and the variant deriver**
 
-`scrub_document` runs `scrub_text` over every string value and key of the document after the source-specific rules; XML is scrubbed as text (Personio CDATA included). `scrub_tree` copies `.meta.json` files unchanged (they hold no PII). The recorder sends the keys as the §5.3 headers and parameters and writes nothing that contains them: the `.meta.json` URL is built from the path and the non-secret parameters only.
+`scrub_document` is one recursive walk that carries the JSON path and decides **per leaf** by the Interfaces contract: a string whose leaf key is in `IDENTIFIER_FIELDS[source]` gets that field's rule and **nothing else** — the rebuilt SerpApi `job_id` (base64 JSON, ≥ 40 characters, which M0's `redact.KEY` matches) and the rebuilt JSearch `job_id` are returned as rebuilt, never passed through `scrub_text`; every other string value goes through `scrub_text` (its generic `KEY` pass included); object keys are never touched; numbers, booleans and nulls pass through. There is no second, document-wide pass. `test_serpapi_and_jsearch_ids_keep_the_htidocid` and `test_identifier_fields_are_scrubbed_by_name_not_by_shape` pin exactly this. XML is scrubbed as text (Personio CDATA included). `scrub_tree` scrubs `.meta.json` files like any JSON document (the URL and the parameter values are free-text fields; a leaked key there would otherwise reach the repository) and `.headers.json` through the §5.2 allowlist; nothing is copied through unchanged. The recorder sends the keys as the §5.3 headers and parameters and writes nothing that contains them: the `.meta.json` URL is built from the path and the non-secret parameters only, and the PII scan's `SECRET_VARS` check is the second line of defence.
 
 - [ ] **Step 4: Run the spikes (live, with the user's keys; each with its exact request count and stop condition)**
 
@@ -1798,14 +1806,11 @@ def test_c2_after_marker_before_send_returns(migrated, proc_env, procs, fixture_
     # `quota.ambiguous_attempt` warn open, the window's probe_failed True with next_probe_at 12 h later; the Arbeitnow (free) page is re-dispatched by B with attempt_seq 2 and succeeds
 def test_c3_after_response_before_settle(migrated, proc_env, procs, fixture_log) -> None:
     ... # point collect.after_response → as C2 (no raw_responses row for attempt 1); the fixture log shows the one send of A and none of B for the paid key
-def test_c3b_after_coverage_commit_replays_without_double_stats(migrated, proc_env, procs, fixture_log) -> None:
-    ... # point collect.after_coverage_commit on the JSearch cell → after B: the page replayed (0 further sends for the key in the log), exactly one gap row for the cell,
-    # consecutive_incomplete == 1 and yield_ema == the single-application value (the stats are applied once, by finalize)
 def test_c4_after_settle_before_parse(migrated, proc_env, procs, fixture_log) -> None:
     ... # point collect.before_parse → B logs `page_replayed` for the key, exactly one raw_responses row, one billed entry, and parses it (raw_items exist, Task 15)
 ```
 
-(`fixture_log` is a `tests/support/sources.py` fixture: a fresh file whose path `proc_env` passes as `JOBHUNTER_FIXTURE_LOG` to both workers.)
+(`fixture_log` is a `tests/support/sources.py` fixture: a fresh file whose path `proc_env` passes as `JOBHUNTER_FIXTURE_LOG` to both workers. The crash case for `collect.after_coverage_commit`, C3b, asserts the finalized cell statistics and therefore lives in Task 23, where `finalize` stops being a pass-through; this task only adds the fault point.)
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -2413,12 +2418,15 @@ git commit -m "feat(m1): embedder service with pinned arctic-embed-l-v2.0 int8, 
 
 ```python
 # tests/integration/test_embed_node.py
-import math, pytest, sqlalchemy as sa
+import httpx, math, pytest, sqlalchemy as sa
 from jobhunter.embeddings import EMBEDDING_MODEL_ID, EmbedderClient, embed_awaiting
+from jobhunter.quota import ledger
+from tests.support.collect import queued_run
 pytestmark = pytest.mark.integration
 async def test_batches_dedup_and_truncation(engine, current_epoch, fake_embedder, revisions_awaiting) -> None:
     ids = await revisions_awaiting(engine, 20, duplicate_texts=2, long_texts=1)  # 20 awaiting revisions, two with identical text, one over 4,000 characters
-    async with httpx.AsyncClient() as http: report = await embed_awaiting(engine, EmbedderClient(fake_embedder.base_url, http))
+    owner = await queued_run(engine); guard = lambda c: ledger.lock_run_owner(c, owner)   # the node's guard; the reconciler tests pass fence_epoch
+    async with httpx.AsyncClient() as http: report = await embed_awaiting(engine, EmbedderClient(fake_embedder.base_url, http), guard=guard)
     assert (report.embedded, report.awaiting, report.truncated, report.unavailable) == (20, 0, 1, False) and fake_embedder.batches == [16, 4]
     async with engine.connect() as c:
         rows = (await c.execute(sa.text("SELECT embedding_status, embedding_id, embedding_truncated FROM job_revisions WHERE id = ANY(:ids)"), {"ids": ids})).all()
@@ -2474,10 +2482,10 @@ git commit -m "feat(m1): embedder client, embed node with batches of 16, embeddi
 **Files:**
 - Create: `backend/src/jobhunter/graphs/collect/nodes/finalize.py`, `graphs/collect/nodes/enqueue_targets.py`
 - Modify: `backend/src/jobhunter/worker/runs.py` (`_finalize` widened to `FinalStatus`; `execute_run`'s durable completion lookup and its `OutcomeConflict` branch; `_invoke` is unchanged and `run_owned`/`ExecutionOutcome` of `worker/executions.py` keep their M0 shape, `Coroutine[…, None]` and status-only), `backend/src/jobhunter/graphs/collect/graph.py` (the real `finalize` and `enqueue_targets` nodes, `collect.before_finalize` kept at the start of `finalize`)
-- Test: `tests/integration/test_finalize.py`
+- Test: `tests/integration/test_finalize.py`, `tests/crash/test_collect_crashes.py` (C3b)
 
 **Interfaces:**
-- Consumes: every earlier task; `finalize_run`, `observe_run_ends`, `RunEnd`, `raise_alert`, `resolve_alert`.
+- Consumes: every earlier task; `finalize_run`, `observe_run_ends`, `RunEnd` (M0's metrics record), `raise_alert`, `resolve_alert`.
 - Produces:
   - `finalize.InvariantCode = Literal["I1", "I2", "I3", "I4", "I5", "I6", "I7"]`; `@dataclass(frozen=True) class finalize.InvariantResult: code: InvariantCode; ok: bool; detail: dict[str, JSONValue]`; `async def finalize.check_invariants(conn, run_id: int, *, settings: RunSettings, outcome_conflicts: int) -> list[InvariantResult]` (§17.2 as SQL: I1 per `raw_responses` of the run Σ dispositions = `item_count` and `count(pending) = 0`; I2 every `fetch_requests` row of the run terminal; I3 for every window touched by the run's ledger entries counted ≤ `limit_units`, and the run's normal units ≤ `per_run_cap`; I4 every `linked` item's observation's posting has a job; I5 vacuous while `active_config.llm_tuple_id IS NULL` (Deviation 11); I6 every revision created in the run `embedded`, else `awaiting` counted (not a failure); I7 `outcome_conflicts == 0`)
   - `finalize.PartialCause = Literal["fetch_failed", "fetch_ambiguous", "source_breaker_open", "source_auth_failed", "source_contract_broken", "source_not_found", "awaiting_embedding", "raw_item_rejected"]`; `async def finalize.partial_conditions(conn, run_id: int) -> list[PartialCause]` (the §7.16.4 list)
@@ -2485,7 +2493,7 @@ git commit -m "feat(m1): embedder client, embed node with batches of 16, embeddi
   - `async def finalize.build_report(conn, run_id: int, *, invariants, partial, node_durations: Mapping[str, float], counters: Mapping[str, int], alerts_raised: Sequence[str]) -> dict[str, JSONValue]` with exactly these top-level keys: `sources` (per `"<source_id>/<instance_key>"`: `requests` by status, `units` `{billed, ambiguous, not_billed}`, `items` by disposition, `postings` `{new, updated}`, `availability` transitions by `<from>→<to>`, `gaps` `{opened, closed, abandoned}`, `health`), `identity` (`jobs_created`, `merges`, `conflicts`, `groups_formed`, `groups_changed`, `elections`), `revisions` (`created`, `embedded`, `awaiting`, `targets`: `{}` in M1), `quota` (per provider `{projected, used, window_start}`; `fallback: {used, reason, cells}`), `execution` (`nodes` durations, `invariants` `{code: {ok, detail}}`, `alerts`, `warnings`); no ad text anywhere
   - `async def finalize.finalize_from_graph(deps: CollectDeps, owner: RunOwner, state: CollectState) -> FinalStatus`: `afault_point("collect.before_finalize")`; one transaction, owner `FOR SHARE` first (`ledger.lock_run_owner`): `coverage.finalize_cells` (Task 14: the `coverage_cells` updates of §9.2 node 10, atomic with the run end), `check_invariants`, `partial_conditions`, `decide_status`, `build_report`, the alerts (`run.failed_invariant` critical subject `run:<id>`; `run.partial` warn per cause, subject `collect:<cause>`, and every other cause's alert resolved; `quota.limit_breach` critical when I3 fails; `run.failed` resolved on `succeeded`; `quota.fallback_active` resolved when no fallback spec was dispatched; `coverage.abandon_old_gaps`), then `finalize_run(conn, owner, status=…, reason=…, report=…)` (raises `FencedOut`, which propagates: the attempt is lost and nothing was written); after the commit `observe_run_ends([RunEnd(status, duration)])` with `finalize_run`'s duration (ruling T12-e) and the `run_finished` log line; the dead-man ping arrives in M5 (Deviation 12)
   - `nodes/finalize.make_finalize(deps)` returns `{"final_status": status, "steps": ["finalize"]}`; `nodes/enqueue_targets.make_enqueue_targets(deps)` returns `{"steps": ["enqueue_targets"]}` while `state["llm_tuple_id"] is None` (M3 fills the §9.2 node-9 behaviour)
-  - The typed result channel to `execute_run` is **durable, not in-memory**: `run_owned` discards the coroutine's value and `ExecutionOutcome` carries status only (M0 `executions.py`), so `execute_run` does not read graph state. `@dataclass(frozen=True) class runs.RunEnd: status: FinalStatus; reason: str | None; finished_at: datetime`; `async def runs.run_end(conn, run_id: int, attempt_no: int) -> RunEnd | None` (the run's terminal row of this attempt, `None` while `running`). `execute_run`'s `returned` branch: `run_end` not `None` → the graph finalized the run itself (its node observed the metrics and logged); only `run_admission`'s return remains; `None` → the M0 behaviour (`_finalize(status="succeeded", reason=None, report={"noop": True})`, which only the no-op graph of the M0 tests reaches). The `raised` branch gains one explicit case before the generic one: `isinstance(outcome.error, OutcomeConflict)` → `_finalize(status="failed_invariant", reason="I7", report={"execution": {"invariants": {"I7": {"ok": False, "detail": {"error_class": "OutcomeConflict"}}}}})`, which raises `run.failed_invariant` critical (the reducer conflicts outside any node, so `finalize` cannot see it; §17.2 I7 and §17.1 say `failed_invariant`, not `failed('bug')`). `_finalize`'s `status` becomes `FinalStatus` and it raises `run.failed` for `failed` and `run.failed_invariant` for `failed_invariant`. The cancellation semantics are unchanged: a caller cancelled during `finalize` writes nothing here, the run's next owner records the outcome
+  - The typed result channel to `execute_run` is **durable, not in-memory**: `run_owned` discards the coroutine's value and `ExecutionOutcome` carries status only (M0 `executions.py`), so `execute_run` does not read graph state. M0's `runs.RunEnd(status, duration_s)` is the metrics record and stays untouched (`observe_run_ends` reads `.duration_s`); the completion lookup has its own record: `@dataclass(frozen=True) class runs.RunCompletion: status: FinalStatus; reason: str | None; finished_at: datetime`; `async def runs.run_completion(conn, run_id: int, attempt_no: int) -> RunCompletion | None` (the run's terminal row of this attempt, `None` while `running`). `execute_run`'s `returned` branch: `run_completion` not `None` → the graph finalized the run itself (its node observed the metrics and logged); only `run_admission`'s return remains; `None` → the M0 behaviour (`_finalize(status="succeeded", reason=None, report={"noop": True})`, which only the no-op graph of the M0 tests reaches). The `raised` branch gains one explicit case before the generic one: `isinstance(outcome.error, OutcomeConflict)` → `_finalize(status="failed_invariant", reason="I7", report={"execution": {"invariants": {"I7": {"ok": False, "detail": {"error_class": "OutcomeConflict"}}}}})`, which raises `run.failed_invariant` critical (the reducer conflicts outside any node, so `finalize` cannot see it; §17.2 I7 and §17.1 say `failed_invariant`, not `failed('bug')`). `_finalize`'s `status` becomes `FinalStatus` and it raises `run.failed` for `failed` and `run.failed_invariant` for `failed_invariant`. The cancellation semantics are unchanged: a caller cancelled during `finalize` writes nothing here, the run's next owner records the outcome
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2515,7 +2523,7 @@ def test_decide_status_order() -> None:
     assert decide_status([ok("I1"), bad("I6")], []) == ("succeeded", None) and decide_status([ok("I1")], ["awaiting_embedding", "fetch_failed"]) == ("partial", "awaiting_embedding")
 async def test_execute_run_uses_the_graph_finalize_once(engine, current_epoch, fake_http, fake_embedder, collect_deps) -> None:
     ... # execute_run returns "started"; runs.report is the graph's report (not {"noop": true}); finished_at set once; RUNS counter incremented once;
-    # the M0 no-op graph still ends `succeeded` with {"noop": true} (run_end is None after it returns)
+    # the M0 no-op graph still ends `succeeded` with {"noop": true} (run_completion is None after it returns); observe_run_ends still receives RunEnd(status, duration_s)
 async def test_outcome_conflict_ends_failed_invariant_i7(engine, current_epoch, fake_http, fake_embedder, collect_deps) -> None:
     ... # conflicting_graph(saver, deps): a fetch_cell wrapper that returns two differing outcomes for one work_id → the reducer raises OutcomeConflict;
     # execute_run returns "started", the run is `failed_invariant` with status_reason "I7", report.execution.invariants.I7.ok is False, `run.failed_invariant`
@@ -2529,7 +2537,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.graphs.coll
 
 - [ ] **Step 3: Implement the node, the report and the `execute_run` change**
 
-`tests/support/collect.py` gains `collect_deps` (a `CollectDeps` over the fixture adapters, the fake embedder and `utcnow`), `run_to_the_end(engine, deps, *, include_paid=False) -> int` (a manual run inserted, admitted and executed through `execute_run` with `build_collect_graph`; returns the run id) and `conflicting_graph(saver, deps)` (the real graph with `fetch_cell` wrapped to emit two differing outcomes for the same `work_id`). `test_finalize.py` imports `json`.
+`tests/support/collect.py` gains `collect_deps` (a `CollectDeps` over the fixture adapters, the fake embedder and `utcnow`), `run_to_the_end(engine, deps, *, include_paid=False) -> int` (a manual run inserted, admitted and executed through `execute_run` with `build_collect_graph`; returns the run id) and `conflicting_graph(saver, deps)` (the real graph with `fetch_cell` wrapped to emit two differing outcomes for the same `work_id`). `test_finalize.py` imports `json`. `tests/crash/test_collect_crashes.py` gains `test_c3b_after_coverage_commit_replays_without_double_stats` (point `collect.after_coverage_commit` on the JSearch cell, Task 14 → after B: the page replayed (0 further sends for the key in the fixture log), exactly one gap row for the cell, `consecutive_incomplete == 1` and `yield_ema` equal to the single-application value: the statistics are applied once, by this task's `finalize`).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
