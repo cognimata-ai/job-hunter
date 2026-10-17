@@ -5,11 +5,15 @@ A login runs in phases, so that what it writes persists whatever the answer is (
 0. A read-only lockout pre-check (`throttle.peek_lockout`, its own short transaction): a locked-out client
    gets its 429 before any Argon2 work. Being locked out does not depend on the credentials, so the early
    answer reveals nothing about them.
-1. The credentials are verified outside any transaction, at one cost whatever is right or wrong until every
-   factor matched: `find_user` on a connection that is returned before the Argon2 work; the TOTP secret
-   decrypted (before the password, so an unreadable secret does not depend on it); exactly one Argon2
-   verification (`check_password`, or `dummy_verify` for an unknown username, §16.3); then the TOTP code;
-   and only when all of that matched, the rehash (`hash_password`) of a hash made with other parameters.
+   Then a slot of the process's Argon2 gate (`argon2_gate`, ruling T21-e): two logins verify at once and
+   eight wait; one more gets 429 `throttled` (`Retry-After: 1`) at once, before any Argon2 work. A login that
+   gets a slot repeats the pre-check first: a burst ahead of it in the queue may have locked it out by then.
+1. Holding the slot, the credentials are verified outside any transaction, at one cost whatever is right or
+   wrong until every factor matched: `find_user` on a connection that is returned before the Argon2 work; the
+   TOTP secret decrypted (before the password, so an unreadable secret does not depend on it); exactly one
+   Argon2 verification (`check_password`, or `dummy_verify` for an unknown username, §16.3); then the TOTP
+   code; and only when all of that matched, the rehash (`hash_password`) of a hash made with other parameters.
+   Every Argon2 computation runs on the gate's threads.
 2. `decide_login` runs in one `engine.begin()` block that ends normally and so commits the attempt, any
    lockout and alert it wrote, the rehash and the session; it re-checks the lockout under the throttle
    lock, which is what decides. Only after the commit does the route turn the outcome into a response or a
@@ -29,7 +33,6 @@ Logs carry the outcome and the client address only (ruling T16-b): never the use
 token, cookie or username HMAC.
 """
 
-import asyncio
 import ipaddress
 import math
 from dataclasses import dataclass, field
@@ -41,7 +44,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import Response
 
-from jobhunter.api.deps import get_config, get_engine, require_session
+from jobhunter.api.argon2_gate import Argon2Gate, GateFull
+from jobhunter.api.deps import get_argon2_gate, get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
 from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.auth import sessions, throttle, totp, users
@@ -57,6 +61,8 @@ from jobhunter.observability.logging import get_logger
 # escape the per-address throttle (uvicorn over TCP always has an address; a misconfiguration may not).
 UNKNOWN_CLIENT_IP: Final = "0.0.0.0"  # noqa: S104 - an address recorded, not one bound to
 INVALID_CREDENTIALS: Final = "Invalid credentials"
+# What a login refused by the full Argon2 gate is told to wait: a slot frees within one verification or two.
+BUSY_RETRY_AFTER_S: Final = 1
 TOTP_KEY_ALERT_CODE: Final = "auth.totp_key_mismatch"
 
 router = APIRouter(prefix="/api/auth")
@@ -176,17 +182,17 @@ class _Verified:
 
 
 async def _verify_credentials(
-    engine: AsyncEngine, cfg: AppConfig, body: LoginIn, *, at: datetime
+    engine: AsyncEngine, cfg: AppConfig, gate: Argon2Gate, body: LoginIn, *, at: datetime
 ) -> _Verified:
     """Phase 1: verify the credentials without holding a connection or a transaction during the hash.
 
     Until every factor matched it costs one Argon2 verification, whatever is right or wrong; the rehash
-    comes last.
+    comes last. The caller holds a slot of `gate`, whose threads run every Argon2 computation.
     """
     async with engine.connect() as conn:
         user = await users.find_user(conn, body.username)
     if user is None:
-        await asyncio.to_thread(dummy_verify, body.password)
+        await gate.run(dummy_verify, body.password)
         return _Verified(ok=False)
     secret, key_mismatch = None, False
     if user.totp_enabled:
@@ -195,7 +201,7 @@ async def _verify_credentials(
         except DecryptError as exc:
             log.error("totp_secret_unreadable", error_class=type(exc).__name__)
             key_mismatch = True
-    ok, needs_rehash = await asyncio.to_thread(check_password, user.password_hash, body.password)
+    ok, needs_rehash = await gate.run(check_password, user.password_hash, body.password)
     if not ok or key_mismatch:
         return _Verified(ok=False, totp_key_mismatch=key_mismatch)
     step = None
@@ -203,20 +209,32 @@ async def _verify_credentials(
         step = None if secret is None or body.totp is None else totp.matched_step(secret, body.totp, at=at)
         if step is None:
             return _Verified(ok=False)
-    new_hash = await asyncio.to_thread(hash_password, body.password) if needs_rehash else None
+    new_hash = await gate.run(hash_password, body.password) if needs_rehash else None
     return _Verified(ok=True, new_hash=new_hash, verified_hash=user.password_hash, totp_step=step)
 
 
-def _locked(ip: str, retry_after: timedelta) -> Problem:
-    log.warning("login", outcome="locked", ip=ip)
-    retry_after_s = max(1, math.ceil(retry_after.total_seconds()))
+def _throttled(ip: str, *, outcome: str, title: str, retry_after_s: int) -> Problem:
+    log.warning("login", outcome=outcome, ip=ip)
     return Problem(
         429,
         "throttled",
-        "Too many failed logins",
+        title,
         headers={"Retry-After": str(retry_after_s)},
         extra={"retry_after_s": retry_after_s},
     )
+
+
+def _locked(ip: str, retry_after: timedelta) -> Problem:
+    retry_after_s = max(1, math.ceil(retry_after.total_seconds()))
+    return _throttled(ip, outcome="locked", title="Too many failed logins", retry_after_s=retry_after_s)
+
+
+async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) -> None:
+    """The read-only lockout pre-check: raise the 429 of a lockout in force (nothing is recorded)."""
+    async with engine.connect() as conn:  # read-only, rolled back when the block ends
+        retry_after = await throttle.peek_lockout(conn, ip, now=now)
+    if retry_after is not None:
+        raise _locked(ip, retry_after)
 
 
 @router.post(
@@ -225,7 +243,7 @@ def _locked(ip: str, retry_after: timedelta) -> Problem:
     response_class=Response,
     responses={
         401: {"description": "Invalid credentials (`unauthenticated`)"},
-        429: {"description": "Too many failed logins (`throttled`, `retry_after_s`)"},
+        429: {"description": "Locked out, or too many logins at once (`throttled`, `retry_after_s`)"},
         **CSRF_RESPONSES,
     },
 )
@@ -234,16 +252,21 @@ async def login(
     request: Request,
     engine: Annotated[AsyncEngine, Depends(get_engine)],
     cfg: Annotated[AppConfig, Depends(get_config)],
+    gate: Annotated[Argon2Gate, Depends(get_argon2_gate)],
 ) -> Response:
-    """Log in: 204 with the session cookie, 401 for any failure, 429 while locked out (`retry_after_s`)."""
+    """Log in: 204 with the session cookie, 401 for any failure, 429 when locked out or busy."""
     now = utcnow()
     ip = client_ip(request)
-    async with engine.connect() as conn:  # phase 0: read-only, rolled back when the block ends
-        retry_after = await throttle.peek_lockout(conn, ip, now=now)
-    if retry_after is not None:
-        raise _locked(ip, retry_after)
+    await _refuse_if_locked_out(engine, ip, now=now)  # phase 0
     session_secret = cfg.secret_b64("session_secret")
-    verified = await _verify_credentials(engine, cfg, body, at=now)
+    try:
+        async with gate.slot():
+            await _refuse_if_locked_out(engine, ip, now=now)  # again: the queue may have taken a while
+            verified = await _verify_credentials(engine, cfg, gate, body, at=now)
+    except GateFull:
+        raise _throttled(
+            ip, outcome="busy", title="Too many logins at once", retry_after_s=BUSY_RETRY_AFTER_S
+        ) from None
     async with engine.begin() as conn:
         outcome = await decide_login(
             conn,

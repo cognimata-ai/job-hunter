@@ -15,7 +15,7 @@ export interface paths {
         put?: never;
         /**
          * Login
-         * @description Log in: 204 with the session cookie, 401 for any failure, 429 while locked out (`retry_after_s`).
+         * @description Log in: 204 with the session cookie, 401 for any failure, 429 when locked out or busy.
          */
         post: operations["login_api_auth_login_post"];
         delete?: never;
@@ -422,7 +422,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Too many failed logins (`throttled`, `retry_after_s`) */
+            /** @description Locked out, or too many logins at once (`throttled`, `retry_after_s`) */
             429: {
                 headers: {
                     [name: string]: unknown;

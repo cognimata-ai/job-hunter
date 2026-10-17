@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from jobhunter.api.argon2_gate import Argon2Gate
 from jobhunter.api.errors import Problem
 from jobhunter.auth import sessions
 from jobhunter.auth.sessions import SessionInfo
@@ -47,6 +48,14 @@ def get_rate_limiter(request: Request) -> RateLimiter:
     if not isinstance(limiter, RateLimiter):
         raise RuntimeError("the api state has no rate limiter: it was not built by create_app")
     return limiter
+
+
+def get_argon2_gate(request: Request) -> Argon2Gate:
+    """The process's one Argon2 admission gate (ruling T21-e)."""
+    gate = getattr(request.app.state, "argon2_gate", None)
+    if not isinstance(gate, Argon2Gate):
+        raise RuntimeError("the api state has no Argon2 gate: it was not built by create_app")
+    return gate
 
 
 def request_id(request: Request) -> str:

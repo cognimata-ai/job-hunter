@@ -1,7 +1,7 @@
 """The api app factory (spec §3, §14) and `app`, the object uvicorn serves.
 
-`create_app()` builds the FastAPI app, its routers, exception handlers and per-session rate limiter
-(`SessionRateLimiter`), and wraps it in `EdgeMiddleware`.
+`create_app()` builds the FastAPI app, its routers, exception handlers, per-session rate limiter
+(`SessionRateLimiter`) and Argon2 admission gate (`argon2_gate.Argon2Gate`), and wraps it in `EdgeMiddleware`.
 It touches no configuration, engine or queue: the lifespan builds all of that from the configuration it loads
 (`startup_or_exit("api")`, then the task app, the log level, the engine, the code head and, outside the test
 env, the metrics server on port 8001). With `cfg` and `engine` injected (tests), the state, the task app
@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.types import Receive, Scope, Send
 
 from jobhunter import __version__
+from jobhunter.api.argon2_gate import Argon2Gate
 from jobhunter.api.edge import EdgeMiddleware
 from jobhunter.api.errors import exception_handlers
 from jobhunter.api.openapi import JobHunterAPI
@@ -151,6 +152,7 @@ def create_app(
     for router in extra_routers:
         api.include_router(router)
     api.state.rate_limiter = SessionRateLimiter()
+    api.state.argon2_gate = Argon2Gate()  # every Argon2 computation of the process goes through it
     if cfg is not None and engine is not None:
         api.state.cfg = cfg
         api.state.engine = engine
