@@ -1,6 +1,7 @@
 """`POST /api/runs`: Run now (spec §3.4, §14.1, §14.2).
 
-One transaction: `active_config` `FOR SHARE` first (the first lock of the global order, before the
+A missing or malformed `Idempotency-Key` is refused (400) before any SQL. Then one transaction:
+`active_config` `FOR SHARE` first (the first lock of the global order, before the
 `api_idempotency` row), then `run_idempotent` around `request_manual_run`, which returns the active collection
 (`created=false`) or queues a `manual` one and defers its job in the same transaction. A repeated
 `Idempotency-Key` returns the stored response, even after that run finished, so a retried POST never starts a
@@ -15,7 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_engine, require_session
-from jobhunter.api_idempotency import IDEMPOTENCY_HEADER, StoredResponse, request_fingerprint, run_idempotent
+from jobhunter.api_idempotency import (
+    IDEMPOTENCY_HEADER,
+    StoredResponse,
+    check_idempotency_key,
+    request_fingerprint,
+    run_idempotent,
+)
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.observability.health import RunOut
@@ -56,6 +63,7 @@ async def run_now(
     idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
 ) -> Response:
     """202 with the active collection (`created=false`) or a new manual one (`created=true`)."""
+    key = check_idempotency_key(idempotency_key)  # a malformed key costs no database round trip
 
     async def handler(conn: AsyncConnection) -> StoredResponse:
         run, created = await request_manual_run(conn, include_paid=body.include_paid, defer=defer_in_tx)
@@ -66,7 +74,7 @@ async def run_now(
         stored = await run_idempotent(
             conn,
             route=RUN_NOW_ROUTE,
-            key=idempotency_key,
+            key=key,
             fingerprint=request_fingerprint(body.model_dump(mode="json"), {}),
             now=utcnow(),
             handler=handler,

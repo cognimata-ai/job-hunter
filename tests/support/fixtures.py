@@ -251,6 +251,8 @@ def api_app(engine: AsyncEngine, make_config: ConfigFactory) -> JobHunterApp:
 
     The app gets its config and engine injected, so no lifespan runs.
     """
+    # Its `make_queue_app` may be the process's first (first call wins: which DSN registers depends on test
+    # order), but deferring never uses the task app's DSN, only its registry.
     return create_app(cfg=make_config("api"), engine=engine)
 
 

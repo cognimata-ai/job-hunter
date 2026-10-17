@@ -1,14 +1,17 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
 import sqlalchemy as sa
+from jobhunter.api.app import JobHunterApp
+from jobhunter.api.deps import get_engine
+from jobhunter.api.errors import Problem
 from jobhunter.api_idempotency import StoredResponse, run_idempotent
 from jobhunter.clock import utcnow
-from jobhunter.observability.health import RunAgeState, run_age_state
 from jobhunter.worker import runs
+from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.tasks import defer_in_tx
 from jobhunter.worker.tick import TickReport, run_tick
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -38,19 +41,6 @@ async def waiting_on_lock(engine: AsyncEngine) -> bool:
         return bool(waiting.scalar_one() >= 1)
 
 
-async def lock_waited_longer_than(engine: AsyncEngine, seconds: float) -> bool:
-    """Whether a statement has been waiting for a lock for more than `seconds`, on the database clock."""
-    async with engine.connect() as c:
-        waiting = await c.execute(
-            sa.text(
-                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND clock_timestamp() - query_start > make_interval(secs => :s)"
-            ),
-            {"s": seconds},
-        )
-        return bool(waiting.scalar_one() >= 1)
-
-
 async def due_slot(engine: AsyncEngine) -> datetime:
     now = utcnow()
     async with engine.begin() as c:
@@ -71,6 +61,7 @@ async def test_same_key_returns_stored_response_and_one_run(logged_in_client, en
     a = await post(logged_in_client)
     b = await post(logged_in_client)
     assert a.status_code == b.status_code == 202 and a.json() == b.json() and a.json()["created"] is True
+    assert a.content == b.content  # the first response is rendered from the stored form, like every replay
     assert a.json()["run"]["trigger"] == "manual" and a.json()["run"]["scheduled_slot"] is None
     async with engine.begin() as c:
         await c.execute(sa.text("UPDATE runs SET status='cancelled', finished_at=now()"))
@@ -177,35 +168,57 @@ async def test_system_health_requires_session_and_reports(
     # anchor and anchor+1h are missed; anchor+2h is about 1 min old at this tick, within CATCH_UP_AFTER,
     # so 'schedule' (Task 11); the newest run by (queued_at, id)
     assert body["last_run"]["status"] == "queued" and body["last_run"]["trigger"] == "schedule"
-    assert body["alerts_open"] == {"info": 0, "warn": 0, "critical": 0} and body["run_age_state"] in (
-        "grace",
-        "none",
-    )
+    assert body["alerts_open"] == {"info": 0, "warn": 0, "critical": 0} and body["run_age_state"] == "grace"
     assert body["queue_depths"]["collect"]["todo"] == 1 and body["versions"]["procrastinate"] == "3.10.0"
     assert "worker_heartbeat" in body["ready"]["failing"] and body["table_bytes"]["runs"] > 0
     assert body["disk"]["total_bytes"] > body["disk"]["free_bytes"] > 0 and body["database_bytes"] > 0
 
 
-async def test_the_handler_waits_without_the_key_lock_timeout(
-    logged_in_client, engine, queue_app, monkeypatch
-) -> None:
-    import jobhunter.api_idempotency as idem
+async def test_the_handler_runs_without_the_key_lock_timeout(engine) -> None:
+    async def handler(conn: AsyncConnection) -> StoredResponse:
+        setting = (await conn.execute(sa.text("SELECT current_setting('lock_timeout')"))).scalar_one()
+        return StoredResponse(202, {"lock_timeout": setting})
 
-    monkeypatch.setattr(idem, "IN_PROGRESS_LOCK_TIMEOUT", "50ms")
-    now = await due_slot(engine)
-    async with engine.connect() as conn:
-        tx = await conn.begin()
-        rep = await run_tick(conn, now=now, defer=defer_in_tx)  # tick's run inserted, not committed
-        req = asyncio.create_task(post(logged_in_client))
-        try:
-            # the manual run's insert outwaits the key's lock timeout tenfold: that timeout is off again
-            await await_until(lambda: lock_waited_longer_than(engine, 0.5), 5)
-            assert not req.done()
-        finally:
-            await tx.commit()
-            await asyncio.wait([req], timeout=5)
-    r = await asyncio.wait_for(req, 5)
-    assert r.status_code == 202 and r.json()["run"]["id"] == rep.queued_run_id
+    async with engine.begin() as c:
+        response = await run_idempotent(
+            c, route="POST /api/test", key=KEY, fingerprint=bytes(32), now=utcnow(), handler=handler
+        )
+    assert response.body == {"lock_timeout": "0"}  # the claim's timeout is off again before the handler
+
+
+async def test_the_same_key_waits_for_the_first_request_then_replays_it(engine) -> None:
+    calls: list[str] = []
+    release = asyncio.Event()
+
+    def handler(name: str) -> Callable[[AsyncConnection], Awaitable[StoredResponse]]:
+        async def run(conn: AsyncConnection) -> StoredResponse:
+            calls.append(name)
+            await release.wait()
+            return StoredResponse(202, {"run": {"id": 7}, "created": True})
+
+        return run
+
+    async def call(name: str) -> StoredResponse:
+        async with engine.begin() as c:
+            return await run_idempotent(
+                c, route="POST /api/test", key=KEY, fingerprint=bytes(32), now=utcnow(), handler=handler(name)
+            )
+
+    async def a_in_its_handler() -> bool:
+        return calls == ["a"]
+
+    a = asyncio.create_task(call("a"))
+    b: asyncio.Task[StoredResponse] | None = None
+    try:
+        await await_until(a_in_its_handler, 5)  # A holds its claim of the key, uncommitted
+        b = asyncio.create_task(call("b"))
+        await await_until(lambda: waiting_on_lock(engine), 5)  # B's claim waits for A's
+    finally:
+        release.set()
+        await asyncio.wait([t for t in (a, b) if t is not None], timeout=5)
+    assert b is not None
+    assert a.result() == b.result() == StoredResponse(202, {"run": {"id": 7}, "created": True})
+    assert calls == ["a"]  # B replayed A's response; its handler never ran
 
 
 async def test_a_handler_error_stores_nothing_so_a_retry_runs_again(engine) -> None:  # ruling T17-e
@@ -256,33 +269,66 @@ async def test_run_now_takes_active_config_before_it_claims_the_key(
     assert r.status_code == 202 and r.json()["created"] is True
 
 
-_FIRST = datetime(2026, 10, 1, tzinfo=UTC)
-_HOUR = timedelta(hours=1)
+async def test_a_malformed_key_is_refused_before_any_sql(api_app: JobHunterApp, logged_in_client) -> None:
+    opened: list[str] = []
+
+    class NoDatabase:  # what the route gets as its engine; the session check keeps the real one
+        def begin(self) -> None:
+            opened.append("begin")
+            raise Problem(503, "internal", "the route reached the database")
+
+        def connect(self) -> None:
+            opened.append("connect")
+            raise Problem(503, "internal", "the route reached the database")
+
+    api_app.api.dependency_overrides[get_engine] = NoDatabase
+    try:
+        for key in (None, "short", "has space in it!!!"):
+            r = await post(logged_in_client, key)
+            assert r.status_code == 400 and r.json()["code"] == "idempotency_key_required"
+        assert opened == []
+        assert (await post(logged_in_client)).status_code == 503  # a valid key reaches it: the probe is live
+        assert opened == ["begin"]
+    finally:
+        api_app.api.dependency_overrides.clear()
 
 
-@pytest.mark.parametrize(
-    ("now_h", "success_h", "any_run", "state"),
-    [
-        (1.0, None, False, "none"),  # no run recorded yet
-        (5.0, None, False, "none"),
-        (1.0, None, True, "grace"),  # within 2 intervals of the first settings version
-        (2.0, 1.0, True, "grace"),  # the grace includes its end
-        (5.0, 4.0, True, "ok"),
-        (5.0, 3.5, True, "ok"),  # exactly 1.5 intervals: not yet warn
-        (5.0, 3.4, True, "warn"),
-        (5.0, 3.0, True, "warn"),  # exactly 2 intervals: not yet critical
-        (5.0, 2.9, True, "critical"),
-        (5.0, None, True, "critical"),  # nothing succeeded: aged from the first settings version
-    ],
-)
-def test_run_age_state(now_h: float, success_h: float | None, any_run: bool, state: RunAgeState) -> None:
-    assert (
-        run_age_state(
-            _FIRST + now_h * _HOUR,
-            any_run=any_run,
-            last_success_at=None if success_h is None else _FIRST + success_h * _HOUR,
-            first_settings_at=_FIRST,
-            interval_s=3600,
+async def test_system_health_holds_one_pool_connection_at_a_time(logged_in_client, engine) -> None:
+    held, most = 0, 0
+
+    def checkout(*_: object) -> None:
+        nonlocal held, most
+        held += 1
+        most = max(most, held)
+
+    def checkin(*_: object) -> None:
+        nonlocal held
+        held -= 1
+
+    sa.event.listen(engine.sync_engine, "checkout", checkout)
+    sa.event.listen(engine.sync_engine, "checkin", checkin)
+    try:
+        assert (await logged_in_client.get("/api/system/health")).status_code == 200
+    finally:
+        sa.event.remove(engine.sync_engine, "checkout", checkout)
+        sa.event.remove(engine.sync_engine, "checkin", checkin)
+    assert (most, held) == (1, 0)
+
+
+async def test_no_run_after_the_grace_is_critical_in_health_and_alerts(
+    logged_in_client, engine, queue_app, monkeypatch
+) -> None:  # ruling T17-g: one freshness rule
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE schedule_state SET interval_s = 3600"))
+        seeded = (await c.execute(sa.text("SELECT min(created_at) FROM settings_versions"))).scalar_one()
+    now = seeded + timedelta(hours=2, minutes=1)  # just past the 2 h grace; no run was ever recorded
+    monkeypatch.setattr("jobhunter.api.routes.system.utcnow", lambda: now)
+    body = (await logged_in_client.get("/api/system/health")).json()
+    assert body["last_run"] is None and body["run_age_state"] == "critical"
+    ctx = ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=now, epoch=1)
+    assert await runs.reconcile_stale_data(ctx) == 1
+    async with engine.connect() as c:
+        severity = await c.execute(
+            sa.text("SELECT severity FROM alerts WHERE code = 'schedule.stale_data' AND resolved_at IS NULL")
         )
-        == state
-    )
+        assert severity.scalar_one() == "critical"

@@ -21,6 +21,11 @@ error was raised; `reason` says what was wrong then). Never an exception message
 their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), disk and database
 sizes and the versions. Run ages are reported, never readiness gates. `RunOut` is the api's view of a run
 row, shared with `POST /api/runs`.
+
+**One freshness rule** (ruling T17-g): `read_run_freshness` is the one query of the run figures and
+`run_age_state` the one rule over them. System health reports that state, and the worker's `stale_data`
+reconciler raises `schedule.stale_data` exactly while it is `critical`, so the page and the alert never
+disagree.
 """
 
 import asyncio
@@ -178,8 +183,9 @@ _LAST_RUN: Final = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
     "finished_at FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1"
 )
-_RUN_FIGURES: Final = q(
-    "SELECT (SELECT max(finished_at) FROM runs WHERE status IN ('succeeded', 'partial')) AS last_success_at, "
+_RUN_FRESHNESS: Final = q(
+    "SELECT EXISTS (SELECT 1 FROM runs) AS any_run, "
+    "(SELECT max(finished_at) FROM runs WHERE status IN ('succeeded', 'partial')) AS last_success_at, "
     "(SELECT max(finished_at) FROM runs WHERE status = 'succeeded') AS last_full_success_at, "
     "(SELECT min(created_at) FROM settings_versions) AS first_settings_at, "
     "(SELECT interval_s FROM schedule_state WHERE id = 1) AS interval_s"
@@ -268,28 +274,50 @@ class SystemHealthOut(BaseModel):
     versions: Versions
 
 
-def run_age_state(
-    now: datetime,
-    *,
-    any_run: bool,
-    last_success_at: datetime | None,
-    first_settings_at: datetime | None,
-    interval_s: int | None,
-) -> RunAgeState:
-    """How stale the collection is at `now`, in this order:
+@dataclass(frozen=True)
+class RunFreshness:
+    """The run figures the freshness rule reads (`read_run_freshness`).
 
-    - `none`: no run has been recorded yet (or there is no schedule: nothing is seeded);
-    - `grace`: until `RUN_AGE_CRITICAL_INTERVALS` intervals after the first settings version's `created_at`;
-    - by the age of the last successful (`succeeded` or `partial`) run, or of the first settings version when
-      none succeeded yet (the rule of the `schedule.stale_data` alert): `critical` past 2 intervals, `warn`
-      past 1.5 intervals, else `ok`.
+    `last_success_at` is the latest `finished_at` of a `succeeded` or `partial` run, `last_full_success_at`
+    of a `succeeded` one; `first_settings_at` and `interval_s` are `None` when nothing is seeded.
     """
-    if not any_run or first_settings_at is None or interval_s is None:
+
+    any_run: bool
+    last_success_at: datetime | None
+    last_full_success_at: datetime | None
+    first_settings_at: datetime | None
+    interval_s: int | None
+
+
+async def read_run_freshness(conn: AsyncConnection) -> RunFreshness:
+    """The run figures of the freshness rule, in one statement on `conn`."""
+    row = (await conn.execute(_RUN_FRESHNESS)).one()
+    return RunFreshness(
+        any_run=bool(row.any_run),
+        last_success_at=row.last_success_at,
+        last_full_success_at=row.last_full_success_at,
+        first_settings_at=row.first_settings_at,
+        interval_s=None if row.interval_s is None else int(row.interval_s),
+    )
+
+
+def run_age_state(now: datetime, freshness: RunFreshness) -> RunAgeState:
+    """How stale the collection is at `now`: the one freshness rule (ruling T17-g), in this order.
+
+    - `none`: nothing is seeded (no schedule to be stale against);
+    - until `RUN_AGE_CRITICAL_INTERVALS` intervals after the first settings version's `created_at` (its end
+      included): `grace`, or `none` while no run has been recorded yet;
+    - after it, by the age of the last successful (`succeeded` or `partial`) run, or of the first settings
+      version when none succeeded yet: `critical` past 2 intervals, `warn` past 1.5 intervals, else `ok`. So
+      no run at all after the grace is `critical`, exactly while the `schedule.stale_data` alert is open.
+    """
+    first, interval_s = freshness.first_settings_at, freshness.interval_s
+    if first is None or interval_s is None:
         return "none"
     interval = timedelta(seconds=interval_s)
-    if now <= first_settings_at + RUN_AGE_CRITICAL_INTERVALS * interval:
-        return "grace"
-    age = now - (last_success_at or first_settings_at)
+    if now <= first + RUN_AGE_CRITICAL_INTERVALS * interval:
+        return "grace" if freshness.any_run else "none"
+    age = now - (freshness.last_success_at or first)
     if age > RUN_AGE_CRITICAL_INTERVALS * interval:
         return "critical"
     if age > RUN_AGE_WARN_INTERVALS * interval:
@@ -322,30 +350,25 @@ def _versions() -> Versions:
 
 
 async def system_health(
-    conn: AsyncConnection, *, engine: AsyncEngine, code_head: str, now: datetime
+    conn: AsyncConnection, *, readiness: ReadinessReport, now: datetime
 ) -> SystemHealthOut:
-    """The detailed health at `now` (the caller's clock), read on `conn`; readiness uses its own connection.
+    """The detailed health at `now` (the caller's clock), read on `conn`, with the caller's `readiness`.
 
-    Read-only, apart from the gauges it refreshes: `ALERTS_OPEN` and `TABLE_BYTES`.
+    The caller runs `check_readiness` before it opens `conn`, so it never holds two pool connections at once
+    (readiness probes on a connection of its own). Read-only, apart from the gauges it refreshes:
+    `ALERTS_OPEN` and `TABLE_BYTES`.
     """
-    readiness = await check_readiness(engine, code_head=code_head, now=now)
     last = (await conn.execute(_LAST_RUN)).first()
-    figures = (await conn.execute(_RUN_FIGURES)).one()
+    freshness = await read_run_freshness(conn)
     alerts = await refresh_alert_gauge(conn)
     disk = shutil.disk_usage(DISK_PATH)
     return SystemHealthOut(
         ready=ReadyState(ok=readiness.ok, failing=readiness.failing),
         last_run=None if last is None else RunOut.of(last),
         last_run_age_s=None if last is None else _age_s(now, last.queued_at),
-        last_successful_run_age_s=_age_s(now, figures.last_success_at),
-        last_fully_successful_run_age_s=_age_s(now, figures.last_full_success_at),
-        run_age_state=run_age_state(
-            now,
-            any_run=last is not None,
-            last_success_at=figures.last_success_at,
-            first_settings_at=figures.first_settings_at,
-            interval_s=figures.interval_s,
-        ),
+        last_successful_run_age_s=_age_s(now, freshness.last_success_at),
+        last_fully_successful_run_age_s=_age_s(now, freshness.last_full_success_at),
+        run_age_state=run_age_state(now, freshness),
         queue_depths=await _queue_depths(conn),
         alerts_open=AlertsOpen(info=alerts["info"], warn=alerts["warn"], critical=alerts["critical"]),
         disk=DiskUsage(path=DISK_PATH, total_bytes=disk.total, free_bytes=disk.free),

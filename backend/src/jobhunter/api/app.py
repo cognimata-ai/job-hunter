@@ -7,11 +7,13 @@ It touches no configuration, engine or queue: the lifespan builds all of that fr
 env, the metrics server on port 8001). With `cfg` and `engine` injected (tests), the state, the task app
 included, is set at once and the lifespan does nothing; the caller owns and disposes that engine.
 
-The task app (`make_queue_app(cfg.dsn("psycopg"))`, `api.state.queue`) is what `defer_in_tx` defers through:
-it needs the app's task registry, not its pool, since the job is inserted on the request's own connection.
-So neither `create_app` nor the lifespan opens it (which would hold a connection and make the api's start
-wait for the database); the lifespan closes it at shutdown, which closes a pool only if something opened one.
-An injected app's pool is closed by whoever opened it.
+The task app: `defer_in_tx` defers through the process-global `tasks.task_app()`, which the first
+`make_queue_app` call of the process creates and registers; building `make_queue_app(cfg.dsn("psycopg"))` here
+(kept as `api.state.queue`) is what registers it in the api. Deferring uses its task registry, not its pool or
+its DSN, since the job is inserted on the request's own connection. So neither `create_app` nor the lifespan
+opens it (which would hold a connection and make the api's start wait for the database); the lifespan closes
+it at shutdown, which closes a pool only if something opened one. An injected app's pool is closed by
+whoever opened it.
 """
 
 from collections import deque

@@ -8,12 +8,14 @@ handler returned, its response, for `IDEMPOTENCY_TTL`:
 - the same key with another request → 422 `idempotency_key_reused`;
 - a key whose first request is still running → 409 `idempotency_in_progress`. That request holds the row
   uncommitted, so the insert waits for it, for at most `IN_PROGRESS_LOCK_TIMEOUT`;
-- a missing or malformed key → 400 `idempotency_key_required`.
+- a missing or malformed key → 400 `idempotency_key_required` (`check_idempotency_key`, pure, so a route can
+  refuse it before it opens a transaction).
 
 The row is inserted (`in_progress`), the handler runs and the row is completed in one transaction, so a
 committed row is always `completed`. An exception from the handler rolls everything back, the row included:
 a retry with the same key runs again (ruling T17-e). Only the handler's returned status and JSON body are
-stored, and that body carries ids and states only, never a secret or PII.
+stored, and that body carries ids and states only, never a secret or PII. The first response is returned in
+its stored (JSONB-decoded) form too, so it renders byte for byte like every replay.
 """
 
 import hashlib
@@ -59,7 +61,7 @@ _DELETE_EXPIRED: Final = q(
 )
 _COMPLETE: Final = q(
     "UPDATE api_idempotency SET status = 'completed', response_status = :status, response_body = :body "
-    "WHERE route = :route AND idem_key = :key AND status = 'in_progress' RETURNING 1",
+    "WHERE route = :route AND idem_key = :key AND status = 'in_progress' RETURNING response_body",
     jsonb=["body"],
 )
 
@@ -77,13 +79,16 @@ class StoredResponse:
     body: dict[str, JSONValue]
 
 
-def _key_required() -> Problem:
-    return Problem(
-        400,
-        "idempotency_key_required",
-        "Idempotency-Key required",
-        detail="send an Idempotency-Key header of 16 to 128 characters from A-Z, a-z, 0-9, '_' and '-'",
-    )
+def check_idempotency_key(key: str | None) -> str:
+    """`key`, when it is a well-formed `Idempotency-Key`; else 400 `idempotency_key_required`. No I/O."""
+    if key is None or IDEM_KEY_RE.fullmatch(key) is None:
+        raise Problem(
+            400,
+            "idempotency_key_required",
+            "Idempotency-Key required",
+            detail="send an Idempotency-Key header of 16 to 128 characters from A-Z, a-z, 0-9, '_' and '-'",
+        )
+    return key
 
 
 def _in_progress() -> Problem:
@@ -127,26 +132,24 @@ async def run_idempotent(
 
     The caller has already taken any `active_config` lock its handler needs (global lock order). The key is
     claimed by inserting its `in_progress` row; then the handler runs and the row is completed with its
-    response, which is returned. When the key has a row already:
+    response, which is returned as it was stored. When the key has a row already:
     - expired at `now` → it is deleted and the key claimed again, once;
     - another `fingerprint` → 422 `idempotency_key_reused`;
     - `in_progress` → 409 `idempotency_in_progress`;
     - else the stored response is returned and `handler` does not run.
     A wait on another request's uncommitted claim longer than `IN_PROGRESS_LOCK_TIMEOUT` is a 409 too.
     """
-    if key is None or IDEM_KEY_RE.fullmatch(key) is None:
-        raise _key_required()
-    ids = {"route": route, "key": key}
+    ids = {"route": route, "key": check_idempotency_key(key)}
     claim = {**ids, "sha": fingerprint, "expires_at": now + IDEMPOTENCY_TTL}
     for _ in range(2):
         if await _under_lock_timeout(conn, _CLAIM, claim, route=route):
             response = await handler(conn)
-            completed = await conn.execute(
-                _COMPLETE, {**ids, "status": response.status, "body": response.body}
-            )
-            if completed.first() is None:
+            completed = (
+                await conn.execute(_COMPLETE, {**ids, "status": response.status, "body": response.body})
+            ).first()
+            if completed is None:
                 raise RuntimeError("api_idempotency: the claimed row vanished before it was completed")
-            return response
+            return StoredResponse(response.status, get_object(completed.response_body, ""))
         stored = (await conn.execute(_STORED, ids)).first()
         if stored is None:
             continue  # the row was deleted (expired) after the claim met it: claim again

@@ -52,6 +52,7 @@ from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.observability.alerts import raise_alert, resolve_alert
+from jobhunter.observability.health import read_run_freshness, run_age_state
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import RUN_DURATION, RUNS
 from jobhunter.types import JSONValue
@@ -192,11 +193,6 @@ _QUEUED_WITHOUT_JOB = q(
     "AND NOT EXISTS (SELECT 1 FROM procrastinate_jobs j WHERE j.task_name = :task "
     "AND j.status IN ('todo', 'doing') AND j.args @> jsonb_build_object('run_id', r.id)) "
     "ORDER BY r.id LIMIT :limit FOR UPDATE OF r SKIP LOCKED"
-)
-_FRESHNESS = q(
-    "SELECT (SELECT min(created_at) FROM settings_versions) AS first_settings_at, "
-    "(SELECT interval_s FROM schedule_state WHERE id = 1) AS interval_s, "
-    "(SELECT max(finished_at) FROM runs WHERE status IN ('succeeded', 'partial')) AS last_success_at"
 )
 
 
@@ -529,20 +525,15 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
 
 @reconciler("stale_data", "tick")
 async def reconcile_stale_data(ctx: ReconcileContext) -> int:
-    """Raise `schedule.stale_data` (critical) while no run succeeded within twice the interval; else resolve.
+    """Raise `schedule.stale_data` (critical) exactly while `run_age_state` is `critical`, else resolve it.
 
-    The age is `ctx.now` minus the last `succeeded` or `partial` run's `finished_at` (or the first settings
-    version's `created_at` when there is none). Nothing is raised before the grace, twice the interval after
-    the first settings version (§17.5). Returns 1 when it raised or resolved the alert, else 0.
+    That is the one freshness rule system health reports too (ruling T17-g): after the grace (twice the
+    interval after the first settings version, §17.5), no `succeeded` or `partial` run within twice the
+    interval, aged from the first settings version when none succeeded yet. Returns 1 when it raised or
+    resolved the alert, else 0.
     """
     async with ctx.engine.begin() as conn:
-        row = (await conn.execute(_FRESHNESS)).one()
-        first: datetime | None = row.first_settings_at
-        if first is None or row.interval_s is None:
-            return 0  # not seeded: there is no schedule to be stale against
-        window = 2 * timedelta(seconds=int(row.interval_s))
-        last_success: datetime = row.last_success_at or first
-        if ctx.now > first + window and ctx.now - last_success > window:
+        if run_age_state(ctx.now, await read_run_freshness(conn)) == "critical":
             await raise_alert(
                 conn,
                 code=STALE_DATA_ALERT,
