@@ -46,9 +46,11 @@ class SessionRateLimiter:
     """At most `limit` requests per session in any `window_s` seconds (§14.1: 600 per minute).
 
     A sliding window of the accepted requests' times per key (the session's token HMAC), in memory: the api
-    runs one replica, on one event loop, and `hit` never awaits, so no lock is needed. A refused request is
+    runs one replica, on one event loop, and neither method awaits, so no lock is needed. A refused request is
     not counted. Keys whose window is empty are dropped at most once per window, which bounds the memory to
-    the sessions active in the last window.
+    the sessions active in the last window. `limited` only looks, so `require_session` can refuse a request
+    before any SQL and still count only the requests of valid sessions (`hit`, after the validation): a
+    presented token that opens no session never becomes a key.
     """
 
     def __init__(self, limit: int = 600, window_s: float = 60.0) -> None:
@@ -57,12 +59,20 @@ class SessionRateLimiter:
         self._hits: dict[bytes, deque[float]] = {}
         self._next_sweep: float | None = None
 
+    def _current(self, hits: deque[float], now: float) -> deque[float]:
+        while hits and hits[0] <= now - self.window_s:
+            hits.popleft()
+        return hits
+
+    def limited(self, key: bytes, now: float) -> bool:
+        """Whether a request of `key` at `now` (monotonic seconds) would be refused; counts nothing."""
+        hits = self._hits.get(key)
+        return hits is not None and len(self._current(hits, now)) >= self.limit
+
     def hit(self, key: bytes, now: float) -> bool:
         """Count a request of `key` at `now` (monotonic seconds): `True`, or `False` past the limit."""
         self._sweep(now)
-        hits = self._hits.setdefault(key, deque())
-        while hits and hits[0] <= now - self.window_s:
-            hits.popleft()
+        hits = self._current(self._hits.setdefault(key, deque()), now)
         if len(hits) >= self.limit:
             return False
         hits.append(now)

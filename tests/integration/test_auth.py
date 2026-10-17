@@ -213,6 +213,27 @@ async def test_rate_limit_600_per_minute(logged_in_client, monkeypatch) -> None:
     assert (await logged_in_client.get("/api/auth/session")).status_code == 200
 
 
+async def test_a_request_past_the_rate_limit_costs_no_database_round_trip(
+    logged_in_client, engine, monkeypatch
+) -> None:
+    clock = [1000.0]  # the injected monotonic clock of `require_session`: every request at the same instant
+    monkeypatch.setattr("jobhunter.api.deps.monotonic", lambda: clock[0])
+    for _ in range(600):
+        assert (await logged_in_client.get("/api/auth/session")).status_code == 200
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *rest: Any) -> None:
+        statements.append(statement)
+
+    sa.event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        refused = await logged_in_client.get("/api/auth/session")
+    finally:
+        sa.event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert refused.status_code == 429 and refused.json()["code"] == "throttled"
+    assert statements == []  # refused on the token's HMAC, before the session is looked up
+
+
 async def test_v20_dev_real_client_ip_through_trusted_proxy(engine, make_config, make_user) -> None:
     from jobhunter.api.app import create_app
 
@@ -481,6 +502,17 @@ def test_session_rate_limiter_slides_per_key() -> None:
     assert limiter.hit(b"b", 3.0)  # another session has its own window
     assert not limiter.hit(b"a", 59.9)  # a refused request is not counted, but the window has not moved yet
     assert limiter.hit(b"a", 60.5) and not limiter.hit(b"a", 60.6)  # the hit at 0.0 slid out: one more
+
+
+def test_session_rate_limiter_looks_without_counting() -> None:
+    from jobhunter.api.app import SessionRateLimiter
+
+    limiter = SessionRateLimiter(limit=2, window_s=60.0)
+    assert not limiter.limited(b"a", 0.0) and len(limiter) == 0  # an unknown key: not limited, not stored
+    assert limiter.hit(b"a", 0.0) and not limiter.limited(b"a", 1.0)
+    assert limiter.hit(b"a", 1.0) and limiter.limited(b"a", 2.0) and limiter.limited(b"a", 2.0)
+    assert not limiter.limited(b"a", 60.5)  # the hit at 0.0 slid out; looking counted nothing
+    assert limiter.hit(b"a", 60.5) and not limiter.hit(b"a", 60.6)
 
 
 def _cli(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
