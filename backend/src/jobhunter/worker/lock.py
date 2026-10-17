@@ -19,11 +19,11 @@ from uuid import UUID
 import psycopg
 from psycopg.rows import TupleRow
 
+from jobhunter.heartbeats import HEARTBEAT_STALE_S
 from jobhunter.observability.logging import get_logger
 
 ADVISORY_LOCK_KEY: Final = 7261001
 HEARTBEAT_PERIOD_S: Final = 10
-HEARTBEAT_STALE_S: Final = 60
 STANDBY_SLEEP_S: Final = 10
 WATCHDOG_EXIT_CODE: Final = 70
 

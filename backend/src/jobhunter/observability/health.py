@@ -46,10 +46,10 @@ from sqlalchemy.sql.elements import TextClause
 
 from jobhunter import __version__
 from jobhunter.db.sql import pg_error, q
+from jobhunter.heartbeats import HEARTBEAT_STALE_S
 from jobhunter.observability.alerts import refresh_alert_gauge
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
-from jobhunter.worker.lock import HEARTBEAT_STALE_S
 from jobhunter.worker.tasks import QUEUES
 
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat"]
