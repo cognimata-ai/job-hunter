@@ -137,6 +137,177 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
                 {"claim_id", "worker_epoch", "heartbeat_at", "attempts", "not_before", "progress"}
             ),
         ),
+        # The M1 machines have no owner columns: the caller checks the run's ownership predicate with its
+        # `runs ... FOR SHARE` (§3.3.3), as the `runs` and `operations` specs check theirs.
+        #
+        # §7.16.5. Two reason columns, so neither is the registry's: `skip_reason` and `error_code` are
+        # settable, and the §7.7 CHECKs make each mandatory in its state (plan Deviation 13).
+        "fetch_requests": TransitionSpec(
+            table="fetch_requests",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType(
+                {
+                    "dispatched": "dispatched_at",
+                    **dict.fromkeys(("succeeded", "failed", "ambiguous", "skipped"), "finished_at"),
+                }
+            ),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("planned", "reserved"),
+                    ("planned", "dispatched"),
+                    ("planned", "skipped"),
+                    ("reserved", "dispatched"),
+                    ("reserved", "skipped"),
+                    ("dispatched", "succeeded"),
+                    ("dispatched", "failed"),
+                    ("dispatched", "ambiguous"),
+                }
+            ),
+            settable=frozenset(
+                {
+                    "skip_reason",
+                    "error_code",
+                    "http_status",
+                    "quota_ledger_id",
+                    "raw_response_id",
+                    "continuation",
+                    "next_cursor",
+                    "items",
+                    "new_native_ids",
+                    "new_postings",
+                }
+            ),
+        ),
+        # §7.16.1. `disposed_at` records leaving `pending` and is cleared on the replay `rejected -> pending`
+        # (the §7.7 CHECK `(disposition = 'pending') = (disposed_at IS NULL)`). The replay and
+        # `deferred -> linked` pass `reason=CLEAR_REASON`: the CHECK on `reason_code` refuses a kept reason.
+        "raw_items": TransitionSpec(
+            table="raw_items",
+            state_col="disposition",
+            reason_col="reason_code",
+            changed_at=MappingProxyType(
+                dict.fromkeys(("linked", "out_of_scope", "rejected", "deferred"), "disposed_at")
+            ),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({"rejected": ("disposed_at",)}),
+            allowed=frozenset(
+                {
+                    ("pending", "linked"),
+                    ("pending", "out_of_scope"),
+                    ("pending", "rejected"),
+                    ("pending", "deferred"),
+                    ("deferred", "linked"),
+                    ("deferred", "out_of_scope"),
+                    ("deferred", "rejected"),
+                    ("deferred", "deferred"),
+                    ("rejected", "pending"),
+                }
+            ),
+            settable=frozenset({"observation_id", "normalized"}),
+        ),
+        # §7.16.2. A new posting is inserted `active`; every change of availability is recorded.
+        "postings": TransitionSpec(
+            table="postings",
+            state_col="availability",
+            reason_col="availability_reason",
+            changed_at=MappingProxyType(
+                dict.fromkeys(("active", "stale", "unknown", "closed"), "availability_changed_at")
+            ),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("stale", "active"),
+                    ("unknown", "active"),
+                    ("closed", "active"),
+                    ("active", "stale"),
+                    ("active", "unknown"),
+                    ("active", "closed"),
+                    ("unknown", "closed"),
+                }
+            ),
+            settable=frozenset({"absent_snapshots", "first_absent_at", "last_absent_snapshot_id"}),
+        ),
+        # §7.16.7, quota providers: `billed`, `not_billed` and `ambiguous` are terminal.
+        "quota_ledger": TransitionSpec(
+            table="quota_ledger",
+            state_col="state",
+            reason_col="evidence",
+            changed_at=MappingProxyType(
+                {
+                    "dispatched": "dispatched_at",
+                    **dict.fromkeys(("billed", "not_billed", "ambiguous"), "settled_at"),
+                }
+            ),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("reserved", "dispatched"),
+                    ("reserved", "not_billed"),
+                    ("dispatched", "billed"),
+                    ("dispatched", "not_billed"),
+                    ("dispatched", "ambiguous"),
+                }
+            ),
+            settable=frozenset({"http_status", "provider_remaining", "window_start"}),
+        ),
+        # §7.16.8. Representative changes stay `active` and are not transitions (§8.7).
+        "duplicate_groups": TransitionSpec(
+            table="duplicate_groups",
+            state_col="status",
+            reason_col="election_reason",
+            changed_at=MappingProxyType({"dissolved": "updated_at"}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("active", "dissolved")}),
+            settable=frozenset({"representative_job_id", "unscorable_reason", "elected_at"}),
+        ),
+        # §7.16.8, a user action.
+        "identity_conflicts": TransitionSpec(
+            table="identity_conflicts",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType(
+                dict.fromkeys(("resolved_separate", "resolved_merged"), "resolved_at")
+            ),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("open", "resolved_separate"), ("open", "resolved_merged")}),
+        ),
+        # §7.16.8, gaps only (a `covered` row has no gap status).
+        "coverage_intervals": TransitionSpec(
+            table="coverage_intervals",
+            state_col="gap_status",
+            reason_col="reason",
+            changed_at=MappingProxyType(dict.fromkeys(("closed", "abandoned"), "closed_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("open", "closed"), ("open", "abandoned")}),
+            settable=frozenset({"gap_cursor"}),
+        ),
+        # §7.16.8. Keyed by `(provider, window_start)` and without an `id`, so `transition()` cannot update
+        # it: `windows.save_window` checks its edge against this entry, and the trigger checks it again. A
+        # closed window never changes state again.
+        "quota_windows": TransitionSpec(
+            table="quota_windows",
+            state_col="state",
+            reason_col=None,
+            changed_at=MappingProxyType({}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("extrapolated_unvalidated", "validated"),
+                    ("extrapolated_unvalidated", "exhausted_until_reset"),
+                    ("validated", "exhausted_until_reset"),
+                    ("exhausted_until_reset", "validated"),
+                }
+            ),
+        ),
     }
 )
 

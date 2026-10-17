@@ -104,3 +104,54 @@ async def test_a_reason_for_a_table_without_a_reason_column_is_refused(monkeypat
         await transition(NO_DATABASE, "t", 1, ["a"], "b", reason="why")
     with pytest.raises(ValueError, match="t has no reason column"):
         await transition(NO_DATABASE, "t", 1, ["a"], "b", reason=CLEAR_REASON)
+
+
+def test_m1_machines() -> None:
+    assert TRANSITIONS["fetch_requests"].allowed == {
+        ("planned", "reserved"),
+        ("planned", "dispatched"),
+        ("planned", "skipped"),
+        ("reserved", "dispatched"),
+        ("reserved", "skipped"),
+        ("dispatched", "succeeded"),
+        ("dispatched", "failed"),
+        ("dispatched", "ambiguous"),
+    }
+    assert TRANSITIONS["raw_items"].reason_col == "reason_code"
+    assert ("rejected", "pending") in TRANSITIONS["raw_items"].allowed
+    assert TRANSITIONS["raw_items"].clear_on_exit == {"rejected": ("disposed_at",)}
+    assert "disposed_at" not in TRANSITIONS["raw_items"].settable
+    assert ("active", "active") not in TRANSITIONS["postings"].allowed
+    assert ("unknown", "closed") in TRANSITIONS["postings"].allowed
+    assert TRANSITIONS["quota_ledger"].changed_at == {
+        "dispatched": "dispatched_at",
+        "billed": "settled_at",
+        "not_billed": "settled_at",
+        "ambiguous": "settled_at",
+    }
+    assert TRANSITIONS["coverage_intervals"].state_col == "gap_status"
+    assert TRANSITIONS["identity_conflicts"].reason_col is None
+    assert TRANSITIONS["quota_windows"].allowed == {  # §7.16.8
+        ("extrapolated_unvalidated", "validated"),
+        ("extrapolated_unvalidated", "exhausted_until_reset"),
+        ("validated", "exhausted_until_reset"),
+        ("exhausted_until_reset", "validated"),
+    }
+
+
+def test_registry_imports_without_a_managed_settable_clash() -> None:
+    # `raw_items.disposed_at` is a changed-at column (and cleared on leaving `rejected`), never a settable
+    # one: the registry imported, so no registered spec names a managed column as settable, because this
+    # guard refuses a changed-at column as surely as the reason column.
+    assert "disposed_at" in TRANSITIONS["raw_items"].changed_at.values()
+    with pytest.raises(ValueError, match=r"\['disposed_at'\] are managed by transition"):
+        TransitionSpec(
+            "raw_items",
+            "disposition",
+            "reason_code",
+            {"linked": "disposed_at"},
+            frozenset(),
+            {},
+            frozenset({("pending", "linked")}),
+            settable=frozenset({"disposed_at"}),
+        )

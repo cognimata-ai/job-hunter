@@ -164,10 +164,13 @@ async def test_registry_columns_and_triggers_exist_in_the_database(engine) -> No
         "SELECT count(*) FROM pg_trigger WHERE tgrelid = CAST(:t AS regclass) "
         "AND tgfoid = 'assert_transition'::regproc AND NOT tgisinternal"
     )
+    # Keyed by `(provider, window_start)`: `transition()` never updates it, so it has no `id` (M1 Task 1).
+    without_id = {"quota_windows"}
     async with engine.connect() as c:
         for name, spec in TRANSITIONS.items():
             have = {row[0] for row in await c.execute(columns, {"t": name})}
-            assert spec.columns <= have, name
+            assert spec.columns - ({"id"} if name in without_id else set()) <= have, name
+            assert ("id" in have) is (name not in without_id), name
             assert (await c.execute(triggers, {"t": name})).scalar_one() == 1, name
 
 
