@@ -56,7 +56,10 @@ _CLAIM_TOTP_STEP = q(
     "UPDATE users SET totp_last_step = :step WHERE id = 1 AND totp_enabled "
     "AND (totp_last_step IS NULL OR totp_last_step < :step) RETURNING id"
 )
-_ENABLE_TOTP = q("UPDATE users SET totp_secret_enc = :blob, totp_enabled = true WHERE id = 1 RETURNING id")
+_ENABLE_TOTP = q(
+    "UPDATE users SET totp_secret_enc = :blob, totp_enabled = true, totp_last_step = :step WHERE id = 1 "
+    "RETURNING id"
+)
 _DISABLE_TOTP = q(
     "UPDATE users SET totp_secret_enc = NULL, totp_enabled = false, totp_last_step = NULL WHERE id = 1 "
     "RETURNING id"
@@ -185,10 +188,16 @@ async def claim_totp_step(conn: AsyncConnection, step: int) -> bool:
     return (await conn.execute(_CLAIM_TOTP_STEP, {"step": step})).first() is not None
 
 
-async def enable_totp(conn: AsyncConnection, secret_b32: str, *, data_key: bytes) -> None:
-    """Store `secret_b32`, encrypted under `data_key`, and turn TOTP on. Raises `UserMissing`."""
+async def enable_totp(
+    conn: AsyncConnection, secret_b32: str, *, data_key: bytes, step: int | None = None
+) -> None:
+    """Store `secret_b32`, encrypted under `data_key`, and turn TOTP on. Raises `UserMissing`.
+
+    `step` is the step of the code that confirmed the enrolment (`totp.matched_step`): it is stored as the
+    last step used, so no login accepts that code again (RFC 6238 §5.2). `None` stores no step.
+    """
     blob = crypto.encrypt(data_key, secret_b32.encode(), aad=TOTP_AAD)
-    if (await conn.execute(_ENABLE_TOTP, {"blob": blob})).first() is None:
+    if (await conn.execute(_ENABLE_TOTP, {"blob": blob, "step": step})).first() is None:
         raise UserMissing
 
 

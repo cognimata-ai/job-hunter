@@ -302,6 +302,32 @@ async def test_a_totp_code_is_accepted_once(api_client, make_user, engine, make_
         assert (await c.execute(sa.text("SELECT count(*) FROM sessions"))).scalar_one() == 1
 
 
+async def test_the_enrolment_code_is_not_accepted_again_by_a_login(
+    api_client, make_user, engine, make_config, monkeypatch
+) -> None:
+    import jobhunter.api.routes.auth as auth_routes
+    from jobhunter import cli, cli_user
+    from jobhunter.auth import totp
+
+    await make_user()
+    cfg, secret = make_config("api"), totp.new_secret()
+    step = int(utcnow().timestamp()) // 30
+    start = datetime.fromtimestamp(step * 30, UTC)  # the start of the current step
+    clock = [start + timedelta(seconds=1)]
+    code = pyotp.TOTP(secret).at(start)
+    monkeypatch.setattr(cli_user, "startup_or_exit", lambda role: cfg)
+    monkeypatch.setattr(cli_user, "utcnow", lambda: clock[0])  # the clocks of the CLI and of the login route
+    monkeypatch.setattr(auth_routes, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(totp, "new_secret", lambda: secret)
+    monkeypatch.setattr("builtins.input", lambda prompt="": code)
+    assert await asyncio.to_thread(cli.main, ["user", "totp", "enable"]) == 0  # the operator types `code`
+    async with engine.connect() as c:
+        assert (await c.execute(sa.text("SELECT totp_last_step FROM users"))).scalar_one() == step
+    assert (await login(api_client, totp=code)).status_code == 401  # the code that enrolled, in its step
+    clock[0] = start + timedelta(seconds=31)
+    assert (await login(api_client, totp=pyotp.TOTP(secret).at(clock[0]))).status_code == 204  # a later step
+
+
 async def test_disabling_totp_forgets_the_last_step(engine, make_user) -> None:
     from jobhunter.auth import totp, users
 

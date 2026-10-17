@@ -425,3 +425,6 @@ def test_cli_totp_enable_with_a_fixed_clock_accepts_and_rejects(
     assert row is not None and row[0] is True and isinstance(row[1], bytes)
     assert decrypt([cfg.secret_b64("data_key")], row[1], aad=b"totp").decode() == FIXED_SECRET
     assert typed == []  # each run asked for exactly one code
+    # The step of the code that enrolled is used up: no login accepts that code again (RFC 6238 §5.2).
+    enrolled_step = int(FIXED_NOW.timestamp()) // 30 - 1
+    assert pg_rows(migrated, "app", "SELECT totp_last_step FROM users") == [(enrolled_step,)]

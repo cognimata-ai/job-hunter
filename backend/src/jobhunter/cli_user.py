@@ -178,11 +178,13 @@ def _totp_enable(cfg: AppConfig) -> int:
     except (EOFError, KeyboardInterrupt):
         _complain("aborted; nothing was stored")
         return 1
-    if not totp.verify(secret, code, at=utcnow()):
+    step = totp.matched_step(secret, code, at=utcnow())
+    if step is None:
         _complain("the code did not verify; nothing was stored")
         return 1
     data_key = cfg.secret_b64("data_key")
-    _in_transaction(cfg, lambda conn: users.enable_totp(conn, secret, data_key=data_key))
+    # The code's step is used up by the enrolment, so no login accepts that code again.
+    _in_transaction(cfg, lambda conn: users.enable_totp(conn, secret, data_key=data_key, step=step))
     print("TOTP is enabled")
     return 0
 
