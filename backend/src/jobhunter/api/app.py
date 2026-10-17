@@ -28,6 +28,7 @@ from starlette.types import Receive, Scope, Send
 from jobhunter import __version__
 from jobhunter.api.edge import EdgeMiddleware
 from jobhunter.api.errors import exception_handlers
+from jobhunter.api.openapi import JobHunterAPI
 from jobhunter.api.routes import auth, health, runs, system
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
@@ -130,7 +131,7 @@ def create_app(
     """The api; `cfg` and `engine` are injected together (tests) or not at all (the lifespan builds them)."""
     if (cfg is None) != (engine is None):
         raise ValueError("create_app takes cfg and engine together, or neither")
-    api = FastAPI(
+    api = JobHunterAPI(
         title="Job Hunter",
         version=__version__,
         lifespan=_lifespan if cfg is None else None,

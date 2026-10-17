@@ -43,6 +43,7 @@ from starlette.responses import Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
+from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.auth import sessions, throttle, totp, users
 from jobhunter.auth.passwords import check_password, dummy_verify, hash_password
 from jobhunter.auth.sessions import SessionInfo
@@ -222,7 +223,11 @@ def _locked(ip: str, retry_after: timedelta) -> Problem:
     "/login",
     status_code=204,
     response_class=Response,
-    responses={401: {"description": "Invalid credentials"}, 429: {"description": "Too many failed logins"}},
+    responses={
+        401: {"description": "Invalid credentials (`unauthenticated`)"},
+        429: {"description": "Too many failed logins (`throttled`, `retry_after_s`)"},
+        **CSRF_RESPONSES,
+    },
 )
 async def login(
     body: LoginIn,
@@ -275,7 +280,13 @@ async def login(
             return response
 
 
-@router.post("/logout", status_code=204, response_class=Response, dependencies=[Depends(require_session)])
+@router.post(
+    "/logout",
+    status_code=204,
+    response_class=Response,
+    dependencies=[Depends(require_session)],
+    responses={**SESSION_RESPONSES, **CSRF_RESPONSES},
+)
 async def logout(
     request: Request,
     engine: Annotated[AsyncEngine, Depends(get_engine)],
@@ -292,7 +303,7 @@ async def logout(
     return response
 
 
-@router.get("/session", response_model=SessionOut)
+@router.get("/session", response_model=SessionOut, responses=SESSION_RESPONSES)
 async def session(info: Annotated[SessionInfo, Depends(require_session)]) -> SessionOut:
     """The current session: who is logged in, whether TOTP is on, and when the session expires."""
     return SessionOut(

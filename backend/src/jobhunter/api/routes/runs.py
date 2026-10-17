@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_engine, require_session
+from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
     StoredResponse,
@@ -31,7 +32,7 @@ from jobhunter.worker.tasks import defer_in_tx
 
 RUN_NOW_ROUTE: Final = "POST /api/runs"
 
-router = APIRouter(prefix="/api/runs", dependencies=[Depends(require_session)])
+router = APIRouter(prefix="/api/runs", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
 _LOCK_ACTIVE_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE")
 
@@ -55,6 +56,7 @@ class RunNowOut(BaseModel):
         422: {
             "description": "Invalid body, or the key was used for another request (`idempotency_key_reused`)"
         },
+        **CSRF_RESPONSES,
     },
 )
 async def run_now(

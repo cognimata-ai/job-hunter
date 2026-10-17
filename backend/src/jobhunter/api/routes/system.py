@@ -10,10 +10,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.api.deps import get_code_head, get_engine, require_session
+from jobhunter.api.openapi import SESSION_RESPONSES
 from jobhunter.clock import utcnow
 from jobhunter.observability.health import SystemHealthOut, check_readiness, system_health
 
-router = APIRouter(prefix="/api/system", dependencies=[Depends(require_session)])
+router = APIRouter(prefix="/api/system", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
 
 @router.get("/health", response_model=SystemHealthOut)
