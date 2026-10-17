@@ -4,7 +4,8 @@
 # into /opt/venv. The runtime stage holds no source tree and runs as 10001:10001 (spec §19.1, §19.2).
 #
 # PYTHON_IMAGE and UV_IMAGE are the digest-pinned references of deploy/images.lock; the compose files pass them.
-# BuildKit does not expand variables in `COPY --from`, so the uv image becomes a named stage.
+# BuildKit does not expand variables in `COPY --from`, so the uv image becomes a named stage. `--locked` fails the
+# build when uv.lock no longer matches pyproject.toml (`--frozen` would install the stale lock silently).
 #
 # The optional build secret `build_ca` is a CA bundle for the build steps that reach the package index, for
 # hosts whose outbound HTTPS goes through a TLS-intercepting proxy. It is mounted for those RUN steps only and
@@ -20,11 +21,11 @@ WORKDIR /src
 COPY pyproject.toml uv.lock .python-version ./
 RUN --mount=type=secret,id=build_ca,required=false \
     if [ -s /run/secrets/build_ca ]; then export SSL_CERT_FILE=/run/secrets/build_ca; fi; \
-    uv sync --frozen --no-dev --no-editable --no-install-project
+    uv sync --locked --no-dev --no-editable --no-install-project
 COPY backend ./backend
 RUN --mount=type=secret,id=build_ca,required=false \
     if [ -s /run/secrets/build_ca ]; then export SSL_CERT_FILE=/run/secrets/build_ca; fi; \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --locked --no-dev --no-editable
 
 FROM ${PYTHON_IMAGE} AS runtime
 COPY --from=build /opt/venv /opt/venv

@@ -6,7 +6,8 @@
 # Each missing secret is a new random value: `openssl rand -base64 32` for session_secret and data_key,
 # `openssl rand -hex 24` for the database passwords. A file gets group 10010 (jobhunter-secrets) and mode 0440
 # before it appears under its name, so it is never readable by anyone else, and the directory gets group 10010
-# and mode 0750. An existing secret is never overwritten. The script prints names only, never a value.
+# and mode 0750. An existing secret is never overwritten. The script prints `created <name>`, or `kept <name>`
+# when another run created the file meanwhile; it never prints a value.
 #
 # Compose bind-mounts a secret with the host file's owner and mode, and the app runs as uid 10001 with the
 # supplementary group 10010, so setting the group needs root: run it with sudo.
@@ -41,13 +42,18 @@ create() {
     tmp=$(mktemp "$dir/.$name.XXXXXX")
     "$@" >"$tmp"
     { chgrp 10010 -- "$tmp" && chmod 0440 -- "$tmp"; } 2>/dev/null || cannot_set_group "$file"
-    if ! ln -- "$tmp" "$file" 2>/dev/null && [ ! -e "$file" ]; then
+    local outcome
+    if ln -- "$tmp" "$file" 2>/dev/null; then
+        outcome=created
+    elif [ -e "$file" ]; then
+        outcome=kept # another run created it meanwhile; its value stays
+    else
         echo "dev-secrets: cannot create $file" >&2
         exit 1
     fi
     rm -f -- "$tmp"
     tmp=""
-    echo "dev-secrets: created $name"
+    echo "dev-secrets: $outcome $name"
 }
 
 for name in session_secret data_key; do

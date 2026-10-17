@@ -10,7 +10,9 @@ check and exits with code 78.
 
 import base64
 import binascii
+import ipaddress
 import os
+import re
 import stat
 import sys
 from collections.abc import Mapping
@@ -46,6 +48,10 @@ _WORLD_READABLE: Final = 0o004
 LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 # The schemes a public origin may have, with the port a browser leaves out of `Origin` for each.
 _ORIGIN_DEFAULT_PORTS: Final = MappingProxyType({"http": 80, "https": 443})
+# A host name as a browser serialises it (lower-case ASCII, punycode for anything else), and the last label
+# that makes a browser read the whole host as an IPv4 address (decimal or hex).
+_ORIGIN_HOST_NAME: Final = re.compile(r"[a-z0-9.-]+")
+_IPV4_LAST_LABEL: Final = re.compile(r"[0-9]+|0x[0-9a-f]*")
 
 ALL_SECRETS: Final = SECRET_NAMES
 
@@ -259,13 +265,38 @@ def _check_key_material(cfg: AppConfig) -> None:
         raise StartupCheckFailed("keys_identical", "session_secret and data_key must differ")
 
 
+def _is_serialised_host(host: str) -> bool:
+    """`host` (without brackets) is a host in the form a browser serialises it (WHATWG URL host serialiser).
+
+    That is an IPv6 address in its compressed form and without a zone; a dotted-quad IPv4 address in canonical
+    form (a browser reads `127.1` or `0x7f.0.0.1` as `127.0.0.1`); or a name of `[a-z0-9.-]`. An IPv4-mapped
+    IPv6 address is refused: Python prints it dotted (`::ffff:1.2.3.4`), browsers in hex
+    (`::ffff:102:304`), and the plain IPv4 address serves the same purpose.
+    """
+    if ":" in host:
+        try:
+            address = ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+        return address.scope_id is None and address.ipv4_mapped is None and address.compressed == host
+    if not _ORIGIN_HOST_NAME.fullmatch(host):
+        return False
+    if _IPV4_LAST_LABEL.fullmatch(host.removesuffix(".").rpartition(".")[2]):
+        try:
+            return str(ipaddress.IPv4Address(host)) == host
+        except ValueError:
+            return False
+    return True
+
+
 def _is_serialised_origin(origin: str) -> bool:
     """`origin` is `scheme://host[:port]` exactly as a browser serialises it in `Origin` (RFC 6454 §6.2).
 
-    That is: scheme `http` or `https` and an ASCII host, both lower-case; a port only when it is not the
-    scheme's default, without leading zeros; no userinfo, path, query or fragment, not even an empty one or a
-    trailing slash. The edge compares `Origin` with the configured value byte for byte, so any other spelling
-    of the same origin would refuse every unsafe request.
+    That is: scheme `http` or `https`, lower-case; a host as `_is_serialised_host` describes it, IPv6 in
+    brackets; a port only when it is not the scheme's default, without leading zeros; no userinfo, path,
+    query or fragment, not even an empty one or a trailing slash. The edge compares `Origin` with the
+    configured value byte for byte, so any other spelling of the same origin would refuse every unsafe
+    request.
     """
     if not (origin.isascii() and origin.isprintable()) or " " in origin:
         return False
@@ -276,7 +307,7 @@ def _is_serialised_origin(origin: str) -> bool:
         return False
     host = parts.hostname
     default_port = _ORIGIN_DEFAULT_PORTS.get(parts.scheme)
-    if default_port is None or not host or port in (0, default_port):
+    if default_port is None or not host or port in (0, default_port) or not _is_serialised_host(host):
         return False
     netloc = f"[{host}]" if ":" in host else host
     if port is not None:
@@ -285,8 +316,11 @@ def _is_serialised_origin(origin: str) -> bool:
 
 
 def _check_public_origin(cfg: AppConfig) -> None:
-    """Ruling T18-c: a configured public origin has the exact form of `Origin`, and https in prod."""
+    """Rulings T18-c, T18-i: the api and the worker have a public origin (§19.2: the CSRF origin, the ntfy
+    click link); a configured one has the exact form of `Origin`, and https in prod."""
     if cfg.public_origin is None:
+        if cfg.role in ("api", "worker"):
+            raise StartupCheckFailed("public_origin", "JOBHUNTER_PUBLIC_ORIGIN is required")
         return
     if not _is_serialised_origin(cfg.public_origin):
         raise StartupCheckFailed(

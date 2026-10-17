@@ -472,6 +472,8 @@ def origin_failure(tmp_path: Path, env_name: str, origin: str) -> StartupCheckFa
         ("prod", "https://jobs.example.org:8443"),
         ("dev", "http://127.0.0.1:8080"),
         ("dev", "http://[::1]:8080"),
+        ("dev", "http://[2001:db8::1]:8080"),
+        ("dev", "http://dev-box.example.org.:8080"),  # a trailing dot stays in the serialised host
     ],
 )
 def test_a_public_origin_of_scheme_host_and_port_passes(tmp_path: Path, env_name: str, origin: str) -> None:
@@ -510,6 +512,28 @@ def test_a_public_origin_of_scheme_host_and_port_passes(tmp_path: Path, env_name
         " http://localhost:8080",
         "http://localhost:8080\n",
         "http://local host:8080",
+        # Fix round 1, item 4: the host is [a-z0-9.-]+ or a bracketed IPv6 address without a zone, both in
+        # the form a browser serialises.
+        "http://local_host:8080",  # no underscore in a host a browser sends
+        "http://%6cocalhost:8080",  # browsers decode percent-escapes in the host
+        "http://localhost\\:8080",  # a backslash is a path separator to a browser
+        "http://[fe80::1%25eth0]:8080",  # a zone id never appears in Origin
+        "http://[fe80::1%eth0]:8080",
+        "http://a!b:8080",
+        "http://exa$mple.org",
+        "http://*.example.org",
+        "http://a,b.example.org",
+        "http://a~b.example.org",
+        "http://[0:0::1]:8080",  # browsers send the compressed form, [::1]
+        "http://[::FFFF:1.2.3.4]:8080",
+        "http://[::ffff:1.2.3.4]:8080",  # IPv4-mapped: configure the IPv4 address instead
+        "http://[::ffff:102:304]:8080",
+        "http://[127.0.0.1]:8080",  # IPv4 in brackets
+        "http://127.1:8080",  # browsers send 127.0.0.1
+        "http://0x7f.0.0.1:8080",
+        "http://010.0.0.1:8080",  # octal to a browser: 8.0.0.1
+        "http://256.0.0.1:8080",  # not a valid IPv4 address
+        "http://1.2.3.4.5:8080",
     ],
 )
 def test_a_public_origin_that_is_not_exactly_scheme_host_and_port_fails(tmp_path: Path, origin: str) -> None:
@@ -524,6 +548,27 @@ def test_prod_requires_an_https_public_origin(tmp_path: Path, origin: str) -> No
         "public_origin",
         "JOBHUNTER_PUBLIC_ORIGIN must use https in prod",
     )
+
+
+# --- Fix round 1, item 0 (ruling T18-i): the api and the worker need a public origin ---------------------
+
+
+@pytest.mark.parametrize(("role", "secrets"), [("api", API_SECRETS), ("worker", WORKER_SECRETS)])
+@pytest.mark.parametrize("origin", [None, ""])  # an empty variable counts as missing
+def test_the_api_and_the_worker_need_a_public_origin(
+    tmp_path: Path, role: Role, secrets: dict[str, bytes], origin: str | None
+) -> None:
+    env = {name: value for name, value in BASE_ENV.items() if name != "JOBHUNTER_PUBLIC_ORIGIN"}
+    if origin is not None:
+        env["JOBHUNTER_PUBLIC_ORIGIN"] = origin
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config(role, env, write_secrets(tmp_path / "s", **secrets)))
+    assert (exc.value.check, exc.value.detail) == ("public_origin", "JOBHUNTER_PUBLIC_ORIGIN is required")
+
+
+def test_migrate_needs_no_public_origin(tmp_path: Path) -> None:
+    env = {name: value for name, value in BASE_ENV.items() if name != "JOBHUNTER_PUBLIC_ORIGIN"}
+    run_startup_assertions(load_config("migrate", env, write_secrets(tmp_path / "s", db_migrator=b"pw")))
 
 
 def test_the_cli_exits_78_for_a_public_origin_with_a_path(tmp_path: Path) -> None:

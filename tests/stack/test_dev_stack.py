@@ -1,4 +1,3 @@
-# tests/stack/test_dev_stack.py
 """The dev stack (Task 18): digest-pinned images, real UID/GID secret access, the dev part of V21.
 
 Run explicitly with `-m stack`. The fixture removes every container, network and volume of the compose project
@@ -6,6 +5,7 @@ Run explicitly with `-m stack`. The fixture removes every container, network and
 left behind) and after the module, also when the start fails.
 """
 
+import stat
 import subprocess
 import time
 from collections.abc import Iterator
@@ -27,10 +27,23 @@ DC = [
 ]
 PROBE_NAME = "jh-egress-probe"
 LOG_TAIL_LINES = 60
+# Every subprocess has a timeout (fix round 1, item 6): a hung docker call fails the test instead of the run.
+CALL_TIMEOUT_S = 120
+SECRET_NAMES = (
+    "session_secret",
+    "data_key",
+    "pg_bootstrap",
+    "db_app",
+    "db_migrator",
+    "db_backup",
+    "db_restore",
+)
 
 
 def _remove_stack() -> subprocess.CompletedProcess[str]:
-    subprocess.run(["docker", "rm", "-f", PROBE_NAME], capture_output=True, check=False, timeout=120)
+    subprocess.run(
+        ["docker", "rm", "-f", PROBE_NAME], capture_output=True, check=False, timeout=CALL_TIMEOUT_S
+    )
     return subprocess.run(
         [*DC, "down", "-v", "--remove-orphans"], capture_output=True, text=True, check=False, timeout=300
     )
@@ -42,7 +55,7 @@ def _logs_tail() -> str:
         capture_output=True,
         text=True,
         check=False,
-        timeout=120,
+        timeout=CALL_TIMEOUT_S,
     )
     return logs.stdout + logs.stderr
 
@@ -51,7 +64,7 @@ def _logs_tail() -> str:
 def stack() -> Iterator[None]:
     _remove_stack()
     try:
-        subprocess.run([str(REPO / "scripts/dev-secrets.sh")], check=True)
+        subprocess.run([str(REPO / "scripts/dev-secrets.sh")], check=True, timeout=CALL_TIMEOUT_S)
         up = subprocess.run([*DC, "up", "-d", "--build", "--wait"], check=False, timeout=900)
         if up.returncode != 0:
             pytest.fail(f"docker compose up failed ({up.returncode}); last log lines:\n{_logs_tail()}")
@@ -61,7 +74,9 @@ def stack() -> Iterator[None]:
             if line.startswith("python=")
         )
         probe = ["docker", "run", "-d", "--rm", "--name", PROBE_NAME, "--network", "jobhunter-dev_egress"]
-        subprocess.run([*probe, python, "python", "-m", "http.server", "8099"], check=True)
+        subprocess.run(
+            [*probe, python, "python", "-m", "http.server", "8099"], check=True, timeout=CALL_TIMEOUT_S
+        )
         yield
     finally:
         down = _remove_stack()
@@ -69,7 +84,7 @@ def stack() -> Iterator[None]:
 
 
 def exec_(svc: str, code: str) -> int:
-    return subprocess.run([*DC, "exec", "-T", svc, "python", "-c", code]).returncode
+    return subprocess.run([*DC, "exec", "-T", svc, "python", "-c", code], timeout=CALL_TIMEOUT_S).returncode
 
 
 PROBE = (
@@ -82,7 +97,7 @@ def image_check(head: str) -> str:
     """The check run inside the image; `head` is the code head of the test process (ruling T18-a)."""
     return "\n".join(
         [
-            "import importlib.resources as r, pathlib, jobhunter",
+            "import importlib.resources as r, os, pathlib, shutil, jobhunter",
             "from jobhunter.db.alembic_runner import code_head",
             "site = pathlib.Path('/opt/venv/lib/python3.13/site-packages')",
             "assert pathlib.Path(jobhunter.__file__).resolve().is_relative_to(site / 'jobhunter'), "
@@ -93,6 +108,8 @@ def image_check(head: str) -> str:
             "assert r.files('jobhunter.auth').joinpath('common_passwords.txt').is_file()",
             f"assert code_head() == {head!r}, code_head()",
             "assert not pathlib.Path('/src').exists()",
+            "assert os.getuid() == 10001, os.getuid()",
+            "assert shutil.which('uv') is None, shutil.which('uv')",
         ]
     )
 
@@ -105,6 +122,7 @@ def test_final_image_runs_the_installed_package_with_its_resources(stack) -> Non
         ["docker", "run", "--rm", "jobhunter-app:dev", "python", "-I", "-c", image_check(head)],
         capture_output=True,
         text=True,
+        timeout=CALL_TIMEOUT_S,
     )
     assert r.returncode == 0, r.stdout + r.stderr
 
@@ -118,22 +136,29 @@ def test_dev_stack_serves_through_devproxy(stack) -> None:
         time.sleep(2)
 
 
-@pytest.mark.parametrize("role", ["api", "worker", "migrate"])
-def test_startup_assertions_pass_under_real_uids(stack, role) -> None:
-    r = subprocess.run(
-        [*DC, "run", "--rm", "--no-deps", "-T", role, "jobhunter", "startup-check", "--role", role],
+def run_in(role: str, *command: str) -> subprocess.CompletedProcess[str]:
+    """`command` in a one-off container of the compose service `role`, without its dependencies."""
+    return subprocess.run(
+        [*DC, "run", "--rm", "--no-deps", "-T", role, *command],
         capture_output=True,
         text=True,
+        timeout=CALL_TIMEOUT_S,
     )
+
+
+@pytest.mark.parametrize("role", ["api", "worker", "migrate"])
+def test_startup_assertions_pass_under_real_uids(stack, role) -> None:
+    r = run_in(role, "jobhunter", "startup-check", "--role", role)
     assert r.returncode == 0, r.stdout + r.stderr
-    ids = subprocess.run(
-        [*DC, "run", "--rm", "--no-deps", "-T", role, "id", "-G"], capture_output=True, text=True
-    ).stdout.split()
+    assert run_in(role, "id", "-u").stdout.split() == ["10001"]
+    ids = run_in(role, "id", "-G").stdout.split()
     assert "10010" in ids
 
 
 def test_postgres_reads_secrets_as_999_with_group_10010(stack) -> None:
-    out = subprocess.run([*DC, "exec", "-T", "postgres", "id"], capture_output=True, text=True).stdout
+    out = subprocess.run(
+        [*DC, "exec", "-T", "postgres", "id"], capture_output=True, text=True, timeout=CALL_TIMEOUT_S
+    ).stdout
     assert "uid=999" in out and "10010" in out
 
 
@@ -148,9 +173,17 @@ def test_v21_dev_api_has_no_egress_but_worker_does(stack) -> None:
     assert exec_("api", PROBE.format(host=PROBE_NAME, port=8099)) == 1
 
 
+def mode_and_group(path: Path) -> tuple[str, int]:
+    st = path.stat()
+    return oct(stat.S_IMODE(st.st_mode)), st.st_gid
+
+
 def test_secrets_are_group_10010_0440_and_not_overwritten(stack) -> None:  # stack: .secrets/dev exists alone
     d = REPO / ".secrets/dev"
-    before = (d / "db_app").read_bytes()
-    subprocess.run([str(REPO / "scripts/dev-secrets.sh")], check=True)
-    st = (d / "db_app").stat()
-    assert (d / "db_app").read_bytes() == before and oct(st.st_mode & 0o777) == "0o440" and st.st_gid == 10010
+    before = {name: (d / name).read_bytes() for name in SECRET_NAMES}
+    subprocess.run([str(REPO / "scripts/dev-secrets.sh")], check=True, timeout=CALL_TIMEOUT_S)
+    assert {name: (d / name).read_bytes() for name in SECRET_NAMES} == before
+    assert {name: mode_and_group(d / name) for name in SECRET_NAMES} == dict.fromkeys(
+        SECRET_NAMES, ("0o440", 10010)
+    )
+    assert mode_and_group(d) == ("0o750", 10010)
