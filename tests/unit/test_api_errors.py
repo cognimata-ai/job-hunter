@@ -13,6 +13,7 @@ from jobhunter.api.errors import code_for_http_status
         (403, "validation_failed"),
         (404, "not_found"),
         (405, "not_found"),
+        (409, "conflict_state"),
         (413, "upload_rejected"),
         (415, "validation_failed"),
         (422, "validation_failed"),

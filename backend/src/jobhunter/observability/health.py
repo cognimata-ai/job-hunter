@@ -16,22 +16,36 @@ then `db`.
 
 Every failed probe logs `readiness_probe_failed` with `probe`, `sqlstate` and `error_class` (`None` when no
 error was raised; `reason` says what was wrong then). Never an exception message.
+
+`system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
+their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), disk and database
+sizes and the versions. Run ages are reported, never readiness gates. `RunOut` is the api's view of a run
+row, shared with `POST /api/runs`.
 """
 
 import asyncio
+import functools
+import platform
+import shutil
 from collections.abc import Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from importlib import metadata
 from typing import Any, Final, Literal
 
 import sqlalchemy as sa
+from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
+from jobhunter import __version__
 from jobhunter.db.sql import pg_error, q
+from jobhunter.observability.alerts import refresh_alert_gauge
 from jobhunter.observability.logging import get_logger
+from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.worker.lock import HEARTBEAT_STALE_S
+from jobhunter.worker.tasks import QUEUES
 
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat"]
 
@@ -146,3 +160,196 @@ async def check_readiness(engine: AsyncEngine, *, code_head: str, now: datetime)
         _log_failed("db", exc)
         failing = ["db"]
     return ReadinessReport(ok=not failing, failing=failing)
+
+
+RunAgeState = Literal["ok", "warn", "critical", "grace", "none"]
+
+# The last successful run's age, in schedule intervals, past which it is `warn` and `critical` (§17.5). The
+# grace lasts `RUN_AGE_CRITICAL_INTERVALS` intervals after the first settings version, as for the
+# `schedule.stale_data` alert (`worker.runs.reconcile_stale_data`).
+RUN_AGE_WARN_INTERVALS: Final = 1.5
+RUN_AGE_CRITICAL_INTERVALS: Final = 2
+DISK_PATH: Final = "/"
+# The job statuses every known queue reports, 0 included; any other status is reported when it has jobs.
+DEPTH_STATUSES: Final = ("todo", "doing")
+
+# `runs_recent` serves it.
+_LAST_RUN: Final = q(
+    "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
+    "finished_at FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1"
+)
+_RUN_FIGURES: Final = q(
+    "SELECT (SELECT max(finished_at) FROM runs WHERE status IN ('succeeded', 'partial')) AS last_success_at, "
+    "(SELECT max(finished_at) FROM runs WHERE status = 'succeeded') AS last_full_success_at, "
+    "(SELECT min(created_at) FROM settings_versions) AS first_settings_at, "
+    "(SELECT interval_s FROM schedule_state WHERE id = 1) AS interval_s"
+)
+_QUEUE_DEPTHS: Final = q(
+    "SELECT queue_name, status::text AS status, count(*) AS n FROM procrastinate_jobs "
+    "GROUP BY queue_name, status ORDER BY queue_name, status"
+)
+_DATABASE_BYTES: Final = q("SELECT pg_database_size(current_database())")
+
+
+class RunOut(BaseModel):
+    """A run as the api shows it (`runs` row, §7.6); its times in UTC."""
+
+    id: int
+    kind: str
+    trigger: str
+    status: str
+    scheduled_slot: datetime | None
+    include_paid: bool
+    attempt_no: int
+    queued_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+    @field_validator("scheduled_slot", "queued_at", "started_at", "finished_at")
+    @classmethod
+    def _in_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else value.astimezone(UTC)
+
+    @classmethod
+    def of(cls, run: object) -> "RunOut":
+        """The `RunOut` of anything with the run's columns as attributes (a `RunRow`, a result row)."""
+        return cls.model_validate(run, from_attributes=True)
+
+
+class ReadyState(BaseModel):
+    ok: bool
+    failing: list[ReadinessCode]
+
+
+class AlertsOpen(BaseModel):
+    info: int
+    warn: int
+    critical: int
+
+
+class DiskUsage(BaseModel):
+    path: str
+    total_bytes: int
+    free_bytes: int
+
+
+class Versions(BaseModel):
+    app: str
+    python: str
+    fastapi: str
+    sqlalchemy: str
+    psycopg: str
+    procrastinate: str
+    langgraph: str
+
+
+class SystemHealthOut(BaseModel):
+    """The detailed health (§17.5). Ages are seconds at the caller's `now`.
+
+    - `last_run`: the newest run by `(queued_at, id)`; `last_run_age_s` is measured from its `queued_at`.
+    - `last_successful_run_age_s`: since the latest `finished_at` of a `succeeded` or `partial` run;
+      `last_fully_successful_run_age_s`: of a `succeeded` one only.
+    - `run_age_state`: see `run_age_state`.
+    - `queue_depths`: procrastinate jobs by queue and status.
+    - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
+    """
+
+    ready: ReadyState
+    last_run: RunOut | None
+    last_run_age_s: float | None
+    last_successful_run_age_s: float | None
+    last_fully_successful_run_age_s: float | None
+    run_age_state: RunAgeState
+    queue_depths: dict[str, dict[str, int]]
+    alerts_open: AlertsOpen
+    disk: DiskUsage
+    database_bytes: int
+    table_bytes: dict[str, int]
+    versions: Versions
+
+
+def run_age_state(
+    now: datetime,
+    *,
+    any_run: bool,
+    last_success_at: datetime | None,
+    first_settings_at: datetime | None,
+    interval_s: int | None,
+) -> RunAgeState:
+    """How stale the collection is at `now`, in this order:
+
+    - `none`: no run has been recorded yet (or there is no schedule: nothing is seeded);
+    - `grace`: until `RUN_AGE_CRITICAL_INTERVALS` intervals after the first settings version's `created_at`;
+    - by the age of the last successful (`succeeded` or `partial`) run, or of the first settings version when
+      none succeeded yet (the rule of the `schedule.stale_data` alert): `critical` past 2 intervals, `warn`
+      past 1.5 intervals, else `ok`.
+    """
+    if not any_run or first_settings_at is None or interval_s is None:
+        return "none"
+    interval = timedelta(seconds=interval_s)
+    if now <= first_settings_at + RUN_AGE_CRITICAL_INTERVALS * interval:
+        return "grace"
+    age = now - (last_success_at or first_settings_at)
+    if age > RUN_AGE_CRITICAL_INTERVALS * interval:
+        return "critical"
+    if age > RUN_AGE_WARN_INTERVALS * interval:
+        return "warn"
+    return "ok"
+
+
+def _age_s(now: datetime, at: datetime | None) -> float | None:
+    return None if at is None else (now - at).total_seconds()
+
+
+async def _queue_depths(conn: AsyncConnection) -> dict[str, dict[str, int]]:
+    depths = {queue: dict.fromkeys(DEPTH_STATUSES, 0) for queue in QUEUES}
+    for row in await conn.execute(_QUEUE_DEPTHS):
+        depths.setdefault(str(row.queue_name), {})[str(row.status)] = int(row.n)
+    return depths
+
+
+@functools.cache  # fixed for the life of the process
+def _versions() -> Versions:
+    return Versions(
+        app=__version__,
+        python=platform.python_version(),
+        fastapi=metadata.version("fastapi"),
+        sqlalchemy=metadata.version("sqlalchemy"),
+        psycopg=metadata.version("psycopg"),
+        procrastinate=metadata.version("procrastinate"),
+        langgraph=metadata.version("langgraph"),
+    )
+
+
+async def system_health(
+    conn: AsyncConnection, *, engine: AsyncEngine, code_head: str, now: datetime
+) -> SystemHealthOut:
+    """The detailed health at `now` (the caller's clock), read on `conn`; readiness uses its own connection.
+
+    Read-only, apart from the gauges it refreshes: `ALERTS_OPEN` and `TABLE_BYTES`.
+    """
+    readiness = await check_readiness(engine, code_head=code_head, now=now)
+    last = (await conn.execute(_LAST_RUN)).first()
+    figures = (await conn.execute(_RUN_FIGURES)).one()
+    alerts = await refresh_alert_gauge(conn)
+    disk = shutil.disk_usage(DISK_PATH)
+    return SystemHealthOut(
+        ready=ReadyState(ok=readiness.ok, failing=readiness.failing),
+        last_run=None if last is None else RunOut.of(last),
+        last_run_age_s=None if last is None else _age_s(now, last.queued_at),
+        last_successful_run_age_s=_age_s(now, figures.last_success_at),
+        last_fully_successful_run_age_s=_age_s(now, figures.last_full_success_at),
+        run_age_state=run_age_state(
+            now,
+            any_run=last is not None,
+            last_success_at=figures.last_success_at,
+            first_settings_at=figures.first_settings_at,
+            interval_s=figures.interval_s,
+        ),
+        queue_depths=await _queue_depths(conn),
+        alerts_open=AlertsOpen(info=alerts["info"], warn=alerts["warn"], critical=alerts["critical"]),
+        disk=DiskUsage(path=DISK_PATH, total_bytes=disk.total, free_bytes=disk.free),
+        database_bytes=int((await conn.execute(_DATABASE_BYTES)).scalar_one()),
+        table_bytes=await refresh_table_bytes(conn),
+        versions=_versions(),
+    )

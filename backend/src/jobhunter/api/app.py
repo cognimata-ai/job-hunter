@@ -3,9 +3,15 @@
 `create_app()` builds the FastAPI app, its routers, exception handlers and per-session rate limiter
 (`SessionRateLimiter`), and wraps it in `EdgeMiddleware`.
 It touches no configuration, engine or queue: the lifespan builds all of that from the configuration it loads
-(`startup_or_exit("api")`, then the log level, the engine, the code head and, outside the test env, the
-metrics server on port 8001). With `cfg` and `engine` injected (tests), the state is set at once and the
-lifespan does nothing; the caller owns and disposes that engine.
+(`startup_or_exit("api")`, then the task app, the log level, the engine, the code head and, outside the test
+env, the metrics server on port 8001). With `cfg` and `engine` injected (tests), the state, the task app
+included, is set at once and the lifespan does nothing; the caller owns and disposes that engine.
+
+The task app (`make_queue_app(cfg.dsn("psycopg"))`, `api.state.queue`) is what `defer_in_tx` defers through:
+it needs the app's task registry, not its pool, since the job is inserted on the request's own connection.
+So neither `create_app` nor the lifespan opens it (which would hold a connection and make the api's start
+wait for the database); the lifespan closes it at shutdown, which closes a pool only if something opened one.
+An injected app's pool is closed by whoever opened it.
 """
 
 from collections import deque
@@ -20,12 +26,13 @@ from starlette.types import Receive, Scope, Send
 from jobhunter import __version__
 from jobhunter.api.edge import EdgeMiddleware
 from jobhunter.api.errors import exception_handlers
-from jobhunter.api.routes import auth, health
+from jobhunter.api.routes import auth, health, runs, system
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.session import make_engine
 from jobhunter.observability.logging import configure_logging
 from jobhunter.observability.metrics import start_metrics_server
+from jobhunter.worker.tasks import make_queue_app
 
 METRICS_PORT: Final = 8001
 ENGINE_POOL_SIZE: Final = 10
@@ -84,6 +91,7 @@ class JobHunterApp:
 @asynccontextmanager
 async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
     cfg = startup_or_exit("api")
+    queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: from the config the lifespan loads
     configure_logging(cfg.log_level)  # ruling T14-b
     engine = make_engine(cfg, pool_size=ENGINE_POOL_SIZE)
     try:
@@ -92,9 +100,13 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
             start_metrics_server(METRICS_PORT)
         api.state.cfg = cfg
         api.state.engine = engine
+        api.state.queue = queue
         yield
     finally:
-        await engine.dispose()
+        try:
+            await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
+        finally:
+            await engine.dispose()
 
 
 def _state_config(api: FastAPI) -> AppConfig | None:
@@ -131,6 +143,8 @@ def create_app(
     )
     api.include_router(health.router)
     api.include_router(auth.router)
+    api.include_router(runs.router)
+    api.include_router(system.router)
     for router in extra_routers:
         api.include_router(router)
     api.state.rate_limiter = SessionRateLimiter()
@@ -138,6 +152,7 @@ def create_app(
         api.state.cfg = cfg
         api.state.engine = engine
         api.state.code_head = code_head()
+        api.state.queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: built, not opened
     edge = EdgeMiddleware(api, config=lambda: _state_config(api), engine=lambda: _state_engine(api))
     return JobHunterApp(api, edge)
 
