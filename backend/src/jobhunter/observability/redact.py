@@ -26,6 +26,7 @@ from jobhunter.secret_names import SECRET_NAMES
 REDACT_KEYS: Final[frozenset[str]] = frozenset(
     {
         "authorization",
+        "proxy-authorization",
         "cookie",
         "set-cookie",
         "x-rapidapi-key",
@@ -86,17 +87,25 @@ _SECRET_PARAMETERS: Final = (
     "password",
     # The text form of a header mapping: `{'Authorization': 'Basic …'}`.
     "authorization",
+    "proxy-authorization",
 )
 _PARAMETER_NAMES = "|".join(_SECRET_PARAMETERS)
 QUERY_SECRET = re.compile(rf"(?i)([?&](?:{_PARAMETER_NAMES})=)[^&\s'\"#]+")
 # Double or single quotes, optionally escaped (JSON inside a JSON string). The value ends only at an
 # unescaped quote of the kind that opened it; an escaped-JSON value therefore runs on to the end of the
-# string, which is redacted with it.
+# string, which is redacted with it. A backslash escapes any character, a raw line break included.
 JSON_SECRET = re.compile(
-    rf"""(?i)(\\?["'](?:{_PARAMETER_NAMES})\\?["']\s*:\s*\\?(["']))(?:\\.|(?!\2)[^\\])*"""
+    rf"""(?i)(\\?["'](?:{_PARAMETER_NAMES})\\?["']\s*:\s*\\?(["']))(?:\\[\s\S]|(?!\2)[^\\])*"""
 )
-# After an `Authorization` header name the credential is masked whatever it looks like.
-AUTHORIZATION_HEADER = re.compile(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic))\s+[A-Za-z0-9._~+/=-]+")
+# After an `Authorization` (or `Proxy-Authorization`) header name the credential is masked whatever it looks
+# like: in a header line (`Authorization: Basic …`), a query (`authorization=Bearer …`) and the text forms of
+# header mappings and pairs, quoted or escaped, as `str` or `bytes` (`{b'authorization': b'Basic …'}`,
+# `[('authorization', 'Basic …')]`). The `,` of a pair counts only after a quoted name, so prose such as
+# "no authorization, basic setup" stays.
+AUTHORIZATION_HEADER = re.compile(
+    r"""(?i)\b((?:proxy-)?authorization(?:\\?["']\s*[:=,]|\s*[:=])\s*b?\\?["']?(?:bearer|basic))"""
+    r"""\s+[A-Za-z0-9._~+/=-]+"""
+)
 # Elsewhere `Bearer`/`Basic` are also ordinary words: a credential has 8 or more characters, at least one
 # of them a digit or a symbol, so "basic setup" and "Bearer of bad news" stay.
 BEARER_OR_BASIC = re.compile(
@@ -107,6 +116,7 @@ BEARER_OR_BASIC = re.compile(
 _SPLIT_ON_UUID = re.compile(f"({UUID.pattern})")
 
 _MIN_SECRET_LENGTH: Final = 8
+_DIGIT = re.compile(r"[0-9]")
 
 
 class _SecretState(NamedTuple):
@@ -131,8 +141,13 @@ def _secret_forms(value: str) -> set[str]:
         url = None
     if url is not None and url.scheme in ("http", "https") and url.netloc:
         # A path segment can be the credential itself: the ping UUID of a healthchecks URL, or the ping
-        # key of a `/<ping-key>/<slug>` one.
-        forms.update(segment for segment in url.path.split("/") if len(segment) >= _MIN_SECRET_LENGTH)
+        # key of a `/<ping-key>/<slug>` one. A segment without a digit is a word (a slug, `healthchecks`),
+        # and masking it everywhere would mask ordinary text; the whole URL is registered anyway.
+        forms.update(
+            segment
+            for segment in url.path.split("/")
+            if len(segment) >= _MIN_SECRET_LENGTH and _DIGIT.search(segment)
+        )
         forms.add(("http" if url.scheme == "https" else "https") + value[len(url.scheme) :])
     return forms
 
@@ -142,7 +157,7 @@ def register_secret_values(values: Iterable[str]) -> None:
 
     Values are stripped; those shorter than 8 characters after stripping are ignored, as they would
     mask ordinary words. For a value that is an `http(s)` URL, every path segment that has 8 characters
-    or more and the URL with the other scheme are registered as well. The percent-encoded
+    or more and a digit, and the URL with the other scheme, are registered as well. The percent-encoded
     forms (`quote`, `quote_plus`) of everything are registered too, as they appear in connection strings
     and URLs. Registrations accumulate over calls.
     """
@@ -178,9 +193,10 @@ def _mask_all(value: str, secrets: re.Pattern[str] | None) -> str:
     if secrets is not None:
         value = secrets.sub("[SECRET]", value)
     value = EMAIL.sub("[EMAIL]", value)
+    # Before the query pattern, which would take only the scheme of `?authorization=Bearer <token>`.
+    value = AUTHORIZATION_HEADER.sub(rf"\1 {REDACTED}", value)
     value = QUERY_SECRET.sub(rf"\1{REDACTED}", value)
     value = JSON_SECRET.sub(rf"\1{REDACTED}", value)
-    value = AUTHORIZATION_HEADER.sub(rf"\1 {REDACTED}", value)
     value = BEARER_OR_BASIC.sub(rf"\1 {REDACTED}", value)
     parts = _SPLIT_ON_UUID.split(value)
     for i in range(0, len(parts), 2):
@@ -206,7 +222,7 @@ def mask_text(value: str) -> str:
     """Mask secrets and personal data in `value`; canonical UUIDs stay as they are.
 
     Order: registered secret values, e-mail addresses (on the whole string, so a UUID in the local part
-    is masked with it), secrets in query strings and quoted key-value pairs, `Authorization` headers and
+    is masked with it), `Authorization` headers, secrets in query strings and quoted key-value pairs,
     `Bearer`/`Basic` credentials, then phone numbers and key-like tokens in the parts between UUIDs. Only
     masked text is cut: a result longer than `MAX_TEXT_LENGTH` is cut to its head and tail, and of an input
     over 1 MiB only the head and the tail are masked, on their own, before their inner ends are dropped.

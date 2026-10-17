@@ -652,12 +652,13 @@ def test_quoted_secret_and_authorization_patterns_stay_linear_on_megabyte_inputs
         assert len(out) <= 16_384 + len("…[TRUNCATED]…")
 
 
-def test_every_long_path_segment_of_a_registered_url_is_masked() -> None:
+def test_every_long_path_segment_with_a_digit_of_a_registered_url_is_masked() -> None:
     ping_key = "fH3kQ9zR2mX7vB1nL5wT8c"
     redact.register_secret_values([f"https://hc-ping.com/{ping_key}/nightly-backup"])
     assert mask_text(f"pinging {ping_key}/start") == "pinging [SECRET]/start"
     assert mask_text(f"http://hc-ping.com/{ping_key}/other-job") == "http://hc-ping.com/[SECRET]/other-job"
-    assert mask_text("slug nightly-backup") == "slug [SECRET]"
+    # A segment without a digit is a word, not a key (T3 PARKED-4): only the whole URL masks it.
+    assert mask_text("slug nightly-backup") == "slug nightly-backup"
 
 
 def _reject_constant(name: str) -> object:
@@ -690,3 +691,69 @@ def test_quoted_authorization_header_values_are_redacted_whole() -> None:
     assert mask_text("{'Authorization': 'Basic dXNlcjpwYXNz'}") == "{'Authorization': '[REDACTED]'}"
     assert mask_text('{"authorization": "Basic dXNlcjpwYXNz"}') == '{"authorization": "[REDACTED]"}'
     assert mask_text('{\\"Authorization\\": \\"Bearer abcdefgh\\"}') == '{\\"Authorization\\": \\"[REDACTED]'
+
+
+# --- Final fix wave B1-B4 (the parked T3 minors), each with the reviewer's probe ---------------------------
+
+
+def test_an_authorization_query_parameter_with_a_spaced_credential_is_masked() -> None:  # PARKED-1
+    # The header pattern runs before the query pattern, which would otherwise take only the scheme.
+    assert mask_text("GET /x?authorization=Bearer abcdefgh&y=1") == (
+        "GET /x?authorization=[REDACTED] [REDACTED]&y=1"
+    )
+
+
+def test_a_quoted_secret_value_runs_on_past_a_backslash_and_a_raw_newline() -> None:  # PARKED-2
+    assert mask_text('"password": "ab\\\ncdefgh"') == '"password": "[REDACTED]"'
+    assert mask_text('{"token": "a\\\nb", "name": "keep"}') == '{"token": "[REDACTED]", "name": "keep"}'
+
+
+@pytest.mark.parametrize(
+    ("text", "masked"),
+    [
+        ("{b'authorization': b'Basic abcdefghij'}", "{b'authorization': b'Basic [REDACTED]'}"),
+        ("[('authorization', 'Basic abcdefghij')]", "[('authorization', 'Basic [REDACTED]')]"),
+        ("{'Proxy-Authorization': 'Basic abcdefghij'}", "{'Proxy-Authorization': '[REDACTED]'}"),
+        ("Proxy-Authorization: Basic abcdefghij", "Proxy-Authorization: Basic [REDACTED]"),
+        (
+            "[(b'proxy-authorization', b'Bearer abcdefghij')]",
+            "[(b'proxy-authorization', b'Bearer [REDACTED]')]",
+        ),
+        ('{\\"Proxy-Authorization\\": \\"Basic abcdefghij\\"}', '{\\"Proxy-Authorization\\": \\"[REDACTED]'),
+    ],
+    ids=[
+        "bytes-repr",
+        "tuple-list-repr",
+        "proxy-repr",
+        "proxy-header",
+        "proxy-bytes-tuple",
+        "proxy-escaped-json",
+    ],
+)
+def test_header_context_forms_mask_a_letters_only_credential(text: str, masked: str) -> None:  # PARKED-3
+    assert mask_text(text) == masked
+
+
+def test_prose_after_the_word_authorization_is_not_taken_for_a_credential() -> None:
+    assert mask_text("no authorization, basic setup done") == "no authorization, basic setup done"
+    assert mask_text("authorization ok, bearer of news") == "authorization ok, bearer of news"
+
+
+def test_a_proxy_authorization_key_is_redacted_like_authorization() -> None:  # PARKED-3, structured form
+    ev = redact_event(None, "info", {"event": "x", "headers": {"Proxy-Authorization": "Basic abcdefghij"}})
+    assert ev["headers"] == {"Proxy-Authorization": "[REDACTED]"}
+
+
+def test_the_widened_header_and_quoted_value_patterns_stay_linear() -> None:  # B1-B3 keep the bound
+    for text in (
+        "{b'authorization': b'" * 150_000,
+        "[('proxy-authorization', '" * 120_000,
+        "authorization" + " " * 3_000_000 + ",",
+        "proxy-authorization:" * 150_000,
+        '{"token": "' + "\\\n" * 1_500_000,
+    ):
+        assert len(text) > 2_900_000
+        started = time.perf_counter()
+        out = mask_text(text)
+        assert time.perf_counter() - started < 2.0
+        assert len(out) <= 16_384 + len("…[TRUNCATED]…")
