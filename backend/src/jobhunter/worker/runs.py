@@ -35,7 +35,7 @@ Every run that reaches a terminal status is counted in `RUNS` (and, when it star
 by the owner of the transaction that ended it, once that transaction has committed (ruling T12-e): the
 functions that end a run inside a caller's transaction report a `RunEnd`, and the owner passes it to
 `observe_run_ends` after its commit (`execute_run`, the reconcilers, and the takeover sweep through
-`epoch.Swept`).
+`epoch.Swept`). The tick counts the `missed` and `skipped_overlap` runs it inserts (`tick.observe_tick`).
 
 This module is a task boundary (ruff `BLE001` is allowed here). It needs no broad catch: `run_owned` reports
 an unexpected graph error as an outcome, which `execute_run` persists as `failed('bug')` plus the `run.failed`

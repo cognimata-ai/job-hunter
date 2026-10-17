@@ -78,7 +78,7 @@ async def run_operation(context: JobContext, operation_id: int) -> None:
 async def tick(context: JobContext, timestamp: int) -> None:
     # Imported here: `reconcilers` and `tick` import this module (`Deferrer`, `release_stalled_jobs`).
     from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
-    from jobhunter.worker.tick import run_tick
+    from jobhunter.worker.tick import observe_tick, run_tick
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     # The `stalled_jobs` reconciler runs in this cadence, so the tick does not release stalled jobs itself.
@@ -87,7 +87,8 @@ async def tick(context: JobContext, timestamp: int) -> None:
         "tick",
     )
     async with rt.engine.begin() as conn:
-        await run_tick(conn, now=utcnow(), defer=defer_in_tx)
+        report = await run_tick(conn, now=utcnow(), defer=defer_in_tx)
+    observe_tick(report)  # after the commit: a rolled-back tick inserted nothing
 
 
 @blueprint.periodic(cron="*/10 * * * *")

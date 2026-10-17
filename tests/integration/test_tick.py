@@ -6,6 +6,7 @@ from typing import cast
 
 import pytest
 import sqlalchemy as sa
+from jobhunter.observability.metrics import REGISTRY
 from jobhunter.worker import reconcilers, tasks
 from jobhunter.worker import tick as tick_module
 from jobhunter.worker.tasks import defer_in_tx, live_job_exists
@@ -330,3 +331,41 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     assert ctx.defer is defer_in_tx and ctx.epoch == runtime.epoch
     assert ctx.engine is engine and ctx.queue is queue_app and ctx.now == now
     assert await runs(engine) == [(now, "queued", "schedule")]
+
+
+# --- Final fix wave, item 4: the terminal runs a tick inserts are counted in RUNS ---------------------------
+
+
+def runs_total(status: str) -> float:
+    """`jobhunter_runs_total{status}` in this process (0 before the first count)."""
+    return REGISTRY.get_sample_value("jobhunter_runs_total", {"status": status}) or 0.0
+
+
+async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
+    engine, queue_app, monkeypatch
+) -> None:
+    await schedule(engine, interval=3600, cursor=A)
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=1)  # the `WorkerRuntime` fields it reads
+    context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
+
+    async def tick_task_at(now: datetime) -> None:
+        monkeypatch.setattr(tasks, "utcnow", lambda: now)
+        await tasks.tick(context, timestamp=0)
+
+    def counts() -> tuple[float, float]:
+        return runs_total("missed"), runs_total("skipped_overlap")
+
+    missed, overlapping = counts()
+    await tick_task_at(A + timedelta(hours=3))  # slots +1 h and +2 h missed, +3 h queued
+    assert counts() == (missed + 2, overlapping)
+    await tick_task_at(A + timedelta(hours=4))  # the +3 h run is still active: +4 h overlaps it
+    assert counts() == (missed + 2, overlapping + 1)
+    await tick_task_at(A + timedelta(hours=4, minutes=1))  # no new slot, no new row: nothing more counted
+    assert counts() == (missed + 2, overlapping + 1)
+    assert [status for _, status, _ in await runs(engine)] == [
+        "missed",
+        "missed",
+        "queued",
+        "skipped_overlap",
+    ]

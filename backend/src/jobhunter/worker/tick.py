@@ -14,6 +14,10 @@ given, never from the database's clock:
 There is no check before an insert: the two unique indexes decide, and a violation is an outcome, never an
 error loop. `insert_active_collect` is the one place that inserts an active collection, shared with the
 manual run (`request_manual_run`).
+
+`missed` and `skipped_overlap` are terminal statuses: the tick task counts the rows a tick inserted with them
+in `RUNS` once its transaction has committed (`observe_tick`, ruling T12-e). They are never timed: such a run
+never started.
 """
 
 from dataclasses import dataclass
@@ -26,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db.seed import latest_slot_at_or_before
 from jobhunter.db.sql import is_unique_violation, pg_error, q
 from jobhunter.observability.logging import get_logger
+from jobhunter.observability.metrics import RUNS
 from jobhunter.types import get_bool
 from jobhunter.worker.tasks import Deferrer
 
@@ -73,6 +78,17 @@ class TickReport:
     queued_run_id: int | None
     skipped_overlap: bool
     cursor: datetime | None
+
+
+def observe_tick(report: TickReport) -> None:
+    """Count the terminal runs the tick of `report` inserted in `RUNS`; call it only after the tick's commit.
+
+    Only the rows this tick inserted: `missed` counts them, and `skipped_overlap` is true only for an insert.
+    """
+    if report.missed:
+        RUNS.labels(status="missed").inc(report.missed)
+    if report.skipped_overlap:
+        RUNS.labels(status="skipped_overlap").inc()
 
 
 def _utc(value: datetime, name: str) -> datetime:
