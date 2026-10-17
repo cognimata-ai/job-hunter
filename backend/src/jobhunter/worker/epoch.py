@@ -14,6 +14,17 @@ step for every other claimant: a claimant whose check passed keeps the row until
 and sweeps the first one's work. A claimant that lost its lock after its check can therefore never replace the
 holder that came after it. The row exists before it is locked, also on an empty table (`_ENSURE_ROW`).
 
+**The epoch fence** (ruling T21-c). A takeover sweeps only the work that older epochs own when it runs, so a
+superseded worker (a zombie, whose watchdog has not ended it yet) must not obtain fresh ownership afterwards.
+Every write that stamps a worker epoch as an owner (a run's admission and its new attempts, an operation's
+claim) therefore calls `fence_epoch` first in its transaction: it holds the `worker_heartbeat` row
+`FOR KEY SHARE`, which conflicts with the claim's `FOR UPDATE`, and refuses an epoch that is not the current
+one. Such a write either commits before a takeover locks the row (and that takeover's sweeps, whose
+statements all start after it got the row, see and sweep it) or runs after the takeover committed and is
+`FencedOut`. `FOR KEY SHARE` does not conflict with the lock session's heartbeat (a non-key `UPDATE`), so
+admissions never hold the watchdog back. Lock order: the `worker_heartbeat` row first, then run and
+operation rows (the takeover locks the row before it sweeps), so the two never deadlock.
+
 A sweep returns its row count, or a `Swept` that adds an action to run once the takeover transaction has
 committed (for example observing the metrics of the runs it ended, Task 12): nothing the sweep did is real
 before that commit. Each action runs on its own: one that raises is logged `takeover_after_commit_failed`
@@ -79,6 +90,9 @@ VALUES (1, :instance_id, 0, :hostname, :pid, :lock_backend_pid, :app_version, no
 ON CONFLICT (id) DO NOTHING"""
 # The claim's first row lock: a later claimant waits here until this claim has committed or rolled back.
 _LOCK_ROW: Final = "SELECT 1 FROM worker_heartbeat WHERE id = 1 FOR UPDATE"
+# The current epoch, its row held until the transaction ends (`fence_epoch`). `FOR KEY SHARE` conflicts with
+# the claim's `FOR UPDATE` above, not with the lock session's heartbeat (`FOR NO KEY UPDATE`).
+_CURRENT_EPOCH: Final = "SELECT worker_epoch FROM worker_heartbeat WHERE id = 1 FOR KEY SHARE"
 # Every claim increments the epoch (the first one from the placeholder's 0 to 1) and records its claimant.
 _CLAIM_EPOCH: Final = """\
 UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1, worker_instance_id = :instance_id,
@@ -158,6 +172,20 @@ async def claim_epoch_and_sweep(
             counts[name] = result
     log.info("worker_epoch_claimed", epoch=epoch, instance_id=str(ident.instance_id), swept=counts)
     return epoch, counts
+
+
+async def fence_epoch(conn: AsyncConnection, epoch: int) -> None:
+    """Prove that `epoch` is the current worker epoch, for the rest of `conn`'s transaction (ruling T21-c).
+
+    The first statement of every transaction that stamps `epoch` on an owner (before it locks any run or
+    operation row): it holds the `worker_heartbeat` row `FOR KEY SHARE` until that transaction ends, so no
+    takeover can commit a newer epoch in between. Raises `FencedOut(owner="worker_epoch")`, having written
+    nothing, when the row is missing or holds another epoch; logged `worker_epoch_fenced` with both epochs.
+    """
+    current = (await conn.execute(q(_CURRENT_EPOCH))).scalar_one_or_none()
+    if current is None or int(current) != epoch:
+        log.warning("worker_epoch_fenced", epoch=epoch, current_epoch=current)
+        raise FencedOut(owner="worker_epoch")
 
 
 def _after_commit(name: str, epoch: int, action: Callable[[], None]) -> None:

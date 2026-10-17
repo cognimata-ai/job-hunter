@@ -20,7 +20,12 @@ from jobhunter.worker.tasks import defer_in_tx, job_task_name, live_job_exists, 
 from langgraph.graph import END, START, StateGraph
 from procrastinate.job_context import JobContext
 
-pytestmark = pytest.mark.integration
+from tests.support.faults import PausePoint
+from tests.support.pg import blocked_or_done
+from tests.support.procs import await_until
+
+# Every test here admits or claims as `epoch=1` (or a later claimed epoch): epoch 1 must be the current one.
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_epoch")]
 
 
 def gated_graph(gate: asyncio.Event, entered: asyncio.Event):
@@ -446,3 +451,128 @@ async def test_live_execution_that_outlives_its_cancel_makes_the_delivery_a_dupl
     finally:
         release.set()
         await older
+
+
+# --- Final fix wave, item 2: admission is fenced by the current worker epoch (ruling T21-c) ----------------
+
+
+def claimant(worker_lock, n: int) -> WorkerIdentity:
+    return WorkerIdentity(uuid.uuid4(), "h", n, worker_lock.backend_pid, "v")
+
+
+def open_gate_graph(entered: asyncio.Event):
+    """A graph that returns at once, setting `entered` when it runs."""
+    gate = asyncio.Event()
+    gate.set()
+    return gated_graph(gate, entered)
+
+
+async def attempts(engine, rid: int) -> list[tuple[int, int, str | None]]:
+    """`(attempt_no, worker_epoch, end_reason)` of every attempt of `rid`, in order."""
+    async with engine.connect() as c:
+        rows = await c.execute(
+            sa.text(
+                "SELECT attempt_no, worker_epoch, end_reason FROM run_attempts WHERE run_id=:i "
+                "ORDER BY attempt_no"
+            ),
+            {"i": rid},
+        )
+        return [tuple(r) for r in rows]
+
+
+async def test_a_worker_paused_before_admission_is_fenced_once_another_epoch_took_over(
+    engine, queue_app, worker_lock, monkeypatch, log_events
+) -> None:
+    rid = await queued(engine)
+    e1, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 1))
+    pause = PausePoint("collect.before_admission")
+    monkeypatch.setattr(runs, "afault_point", pause)
+    entered = asyncio.Event()
+    zombie = asyncio.create_task(runs.execute_run(engine, open_gate_graph(entered), rid, 1, epoch=e1))
+    await asyncio.wait_for(pause.reached.wait(), 5)  # worker A (epoch e1) is about to admit the run ...
+    e2, counts = await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))  # ... when B takes over
+    assert counts["runs"] == 0  # the run is still queued: the sweep has nothing to take
+    pause.resume()
+    assert await asyncio.wait_for(zombie, 5) == "foreign_epoch"
+    assert not entered.is_set() and await attempts(engine, rid) == []  # A ran nothing and wrote nothing
+    fenced = [(e["epoch"], e["current_epoch"]) for e in log_events() if e["event"] == "worker_epoch_fenced"]
+    assert fenced == [(e1, e2)]
+    assert (await fetch(engine, rid))[:2] == ("queued", 0)
+    async with engine.begin() as c:  # B's admission of the same work succeeds
+        assert (await runs.start_attempt(c, rid, 1, epoch=e2))[0] == "started"
+    assert await attempts(engine, rid) == [(1, e2, None)]
+
+
+async def test_an_admission_in_flight_at_the_takeover_commits_first_and_is_swept(
+    engine, queue_app, worker_lock, migrated
+) -> None:
+    rid = await queued(engine)
+    a_ident = claimant(worker_lock, 1)
+    e1, _ = await claim_epoch_and_sweep(engine, a_ident)
+    async with engine.connect() as a:
+        tx = await a.begin()
+        admission, owner = await runs.start_attempt(a, rid, 1, epoch=e1)  # A's admission, not committed yet
+        # The admission's share lock on the worker_heartbeat row never holds back the watchdog's heartbeat.
+        assert worker_lock.heartbeat(a_ident.instance_id, e1) is True
+        takeover = asyncio.create_task(claim_epoch_and_sweep(engine, claimant(worker_lock, 2)))
+        try:
+            await await_until(lambda: blocked_or_done(migrated, takeover), 5)
+            waited = not takeover.done()  # the takeover waits for the admission ...
+        finally:
+            await tx.commit()
+    e2, counts = await asyncio.wait_for(takeover, 5)
+    # ... and then sweeps it: A's attempt ends, the run's new attempt belongs to B, A's owner is fenced.
+    assert (admission, waited, counts["runs"]) == ("started", True, 1)
+    assert await attempts(engine, rid) == [(1, e1, "worker_takeover"), (2, e2, None)]
+    async with engine.begin() as c:
+        assert owner is not None and await runs.heartbeat_run(c, owner) is False
+
+
+async def test_an_admission_during_a_takeover_waits_for_it_and_is_fenced(
+    engine, queue_app, worker_lock, migrated, monkeypatch
+) -> None:
+    rid = await queued(engine)
+    e1, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 1))
+    pause = PausePoint("takeover.before_epoch_write")
+    monkeypatch.setattr(epoch_module, "afault_point", pause)
+    takeover = asyncio.create_task(claim_epoch_and_sweep(engine, claimant(worker_lock, 2)))
+    # B holds the worker_heartbeat row; its epoch is not written yet.
+    await asyncio.wait_for(pause.reached.wait(), 5)
+    entered = asyncio.Event()
+    zombie = asyncio.create_task(runs.execute_run(engine, open_gate_graph(entered), rid, 1, epoch=e1))
+    try:
+        await await_until(lambda: blocked_or_done(migrated, zombie), 5)
+        waited = not zombie.done()  # A's admission waits for the takeover ...
+    finally:
+        pause.resume()
+    e2, _ = await asyncio.wait_for(takeover, 5)
+    # ... and then finds epoch e2: it is fenced and writes nothing.
+    assert (await asyncio.wait_for(zombie, 5), waited) == ("foreign_epoch", True)
+    assert not entered.is_set() and await attempts(engine, rid) == []
+    async with engine.begin() as c:
+        assert (await runs.start_attempt(c, rid, 1, epoch=e2))[0] == "started"
+
+
+async def test_a_superseded_epochs_stale_runs_reconciler_takes_nothing(
+    engine, queue_app, worker_lock
+) -> None:
+    rid = await queued(engine)
+    e1, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 1))
+    e2, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))
+    async with engine.begin() as c:
+        assert (await runs.start_attempt(c, rid, 1, epoch=e2))[0] == "started"
+    await age_heartbeat(engine, rid)
+
+    def ctx(epoch: int) -> ReconcileContext:
+        return ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=epoch)
+
+    # A zombie of epoch e1 neither stamps its epoch on a new attempt nor ends B's.
+    assert await runs.reconcile_stale_runs(ctx(e1)) == 0
+    assert await attempts(engine, rid) == [(1, e2, None)]
+    async with engine.begin() as c:
+        with pytest.raises(FencedOut):
+            await runs.begin_new_attempt(c, rid, epoch=e1, end_reason="heartbeat_stale", defer=defer_in_tx)
+    assert await attempts(engine, rid) == [(1, e2, None)]
+    # The current epoch's reconciler does take it.
+    assert await runs.reconcile_stale_runs(ctx(e2)) == 1
+    assert await attempts(engine, rid) == [(1, e2, "heartbeat_stale"), (2, e2, None)]

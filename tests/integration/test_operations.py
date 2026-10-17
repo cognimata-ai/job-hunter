@@ -8,6 +8,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
 from jobhunter.errors import FencedOut
+from jobhunter.worker import epoch as epoch_module
 from jobhunter.worker import operations as ops
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.executions import EXECUTIONS
@@ -15,11 +16,13 @@ from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
 from jobhunter.worker.tasks import defer_in_tx, live_job_exists
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from tests.support.faults import PausePoint
 from tests.support.logs import logged
 from tests.support.pg import blocked_or_done
 from tests.support.procs import await_until
 
-pytestmark = pytest.mark.integration
+# Every test here admits or claims as `epoch=1` (or a later claimed epoch): epoch 1 must be the current one.
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_epoch")]
 ROW = sa.text(
     "SELECT status, claim_id, worker_epoch, heartbeat_at, attempts, last_error_code "
     "FROM operations WHERE id=:i"
@@ -545,3 +548,86 @@ async def test_create_retries_when_the_conflicting_live_row_ended_before_it_was_
     assert [(await row(engine, i))[0] for i in (live, new)] == ["cancelled", "pending"]
     async with engine.connect() as c:
         assert await live_job_exists(c, "run_operation", args_match={"operation_id": new})
+
+
+# --- Final fix wave, item 2: a claim is fenced by the current worker epoch (ruling T21-c) ------------------
+
+
+def claimant(worker_lock, n: int) -> WorkerIdentity:
+    return WorkerIdentity(uuid.uuid4(), "h", n, worker_lock.backend_pid, "v")
+
+
+async def test_a_worker_paused_before_its_claim_is_fenced_once_another_epoch_took_over(
+    engine, queue_app, worker_lock, monkeypatch, log_events
+) -> None:
+    ran: list[int] = []
+
+    async def handler(ctx: ops.OperationContext) -> None:
+        ran.append(ctx.claim.operation_id)
+
+    monkeypatch.setitem(ops.HANDLERS, "export", handler)
+    op, _ = await new_op(engine)
+    e1, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 1))
+    pause = PausePoint("operation.before_claim")
+    monkeypatch.setattr(ops, "afault_point", pause)
+    zombie = asyncio.create_task(ops.execute_operation(engine, op, epoch=e1))
+    await asyncio.wait_for(pause.reached.wait(), 5)  # worker A (epoch e1) is about to claim the operation ...
+    e2, counts = await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))  # ... when B takes over
+    assert counts["operations"] == 0  # still pending: the sweep has nothing to take
+    pause.resume()
+    await asyncio.wait_for(zombie, 5)
+    assert ran == [] and (await row(engine, op))[:5] == ("pending", None, None, None, 0)  # no claim with e1
+    fenced = [(e["epoch"], e["current_epoch"]) for e in log_events() if e["event"] == "worker_epoch_fenced"]
+    assert fenced == [(e1, e2)]
+    async with engine.begin() as c:  # B's claim of the same operation succeeds
+        b = await ops.claim_operation(c, op, epoch=e2)
+    assert b is not None and (await row(engine, op))[:3] == ("running", b.claim_id, e2)
+
+
+async def test_a_claim_in_flight_at_the_takeover_commits_first_and_is_swept(
+    engine, queue_app, worker_lock, migrated
+) -> None:
+    op, _ = await new_op(engine)
+    e1, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 1))
+    async with engine.connect() as a:
+        tx = await a.begin()
+        old = await ops.claim_operation(a, op, epoch=e1)  # A's claim, not committed yet
+        takeover = asyncio.create_task(claim_epoch_and_sweep(engine, claimant(worker_lock, 2)))
+        try:
+            await await_until(lambda: blocked_or_done(migrated, takeover), 5)
+            waited = not takeover.done()  # the takeover waits for the claim ...
+        finally:
+            await tx.commit()
+    _, counts = await asyncio.wait_for(takeover, 5)
+    # ... and then sweeps it: the operation is pending again and A's claim is fenced.
+    assert (old is not None, waited, counts["operations"]) == (True, True, 1)
+    assert (await row(engine, op))[:5] == ("pending", None, None, None, 1)
+    async with engine.begin() as c:
+        assert old is not None and await ops.heartbeat_operation(c, old) is False
+
+
+async def test_a_claim_during_a_takeover_waits_for_it_and_is_fenced(
+    engine, queue_app, worker_lock, migrated, monkeypatch
+) -> None:
+    op, _ = await new_op(engine)
+    e1, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 1))
+    pause = PausePoint("takeover.before_epoch_write")
+    monkeypatch.setattr(epoch_module, "afault_point", pause)
+    takeover = asyncio.create_task(claim_epoch_and_sweep(engine, claimant(worker_lock, 2)))
+    # B holds the worker_heartbeat row; its epoch is not written yet.
+    await asyncio.wait_for(pause.reached.wait(), 5)
+
+    async def zombie_claim() -> ops.OperationClaim | None:
+        async with engine.begin() as c:
+            return await ops.claim_operation(c, op, epoch=e1)
+
+    zombie = asyncio.create_task(zombie_claim())
+    try:
+        await await_until(lambda: blocked_or_done(migrated, zombie), 5)
+        waited = not zombie.done()  # A's claim waits for the takeover ...
+    finally:
+        pause.resume()
+    _, counts = await asyncio.wait_for(takeover, 5)
+    # ... and then finds the new epoch: no claim, nothing written.
+    assert (await asyncio.wait_for(zombie, 5), waited, counts["operations"]) == (None, True, 0)
+    assert (await row(engine, op))[:5] == ("pending", None, None, None, 0)

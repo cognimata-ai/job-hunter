@@ -11,10 +11,11 @@ Every attempt has a checkpoint thread of its own, `run-<run_id>-a<attempt_no>` (
 1. Local check first (`EXECUTIONS`): a live task with token `n` makes the delivery a `duplicate`, which writes
    nothing; a live task with an older token is cancelled and awaited before step 2 (§3.3.3: before any resume
    within one process, the previous asyncio task for the run is cancelled and awaited).
-2. DB check under the run row `FOR UPDATE` (`start_attempt`): `started` (a `queued` run at attempt `n - 1`
-   moves to `running` and gets `run_attempts(n, epoch)`), `resumed` (attempt `n` is `running` and this epoch's
-   sweep or reconciler created it), `superseded`, `foreign_epoch` or `finished`. Only `started` and `resumed`
-   execute.
+2. DB check under the run row `FOR UPDATE` (`start_attempt`), once `epoch.fence_epoch` proved that `epoch`
+   is still the current worker epoch (else `foreign_epoch`): `started` (a `queued` run at attempt `n - 1`
+   moves to `running` and gets `run_attempts(n, epoch)`), `resumed` (attempt `n` is `running` and this
+   epoch's sweep or reconciler created it), `superseded`, `foreign_epoch` or `finished`. Only `started` and
+   `resumed` execute.
 3. The graph runs through `executions.run_owned(("run", id), n, …)`, next to a heartbeat whose loss cancels
    it.
 
@@ -22,8 +23,9 @@ Every attempt has a checkpoint thread of its own, `run-<run_id>-a<attempt_no>` (
 older worker epoch) and from the reconciler `stale_runs` (heartbeat older than `RUN_STALE`). Each moves the
 locked row `running → running` with `attempt_no + 1`, a new thread and `resume_count + 1`, and defers the new
 attempt's job; after `MAX_RESUMES` resumes the run ends `failed('resume_exhausted')` with a critical alert.
-`stale_runs` then cancels and awaits the superseded local execution, so it releases the procrastinate
-`collect` lock before the replacement can run.
+Both are fenced by the current worker epoch, like the admission (`epoch.fence_epoch`). `stale_runs` then
+cancels and awaits the superseded local execution, so it releases the procrastinate `collect` lock before the
+replacement can run.
 
 The reconcilers `queued_runs` (a queued run without a live job: re-deferred once, then
 `failed('orphaned_queue')`) and `stale_data` (§17.5, §17.6) complete the set. Every time threshold uses the
@@ -51,12 +53,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut, TransitionConflict
+from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.health import read_run_freshness, run_age_state
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import RUN_DURATION, RUNS
 from jobhunter.types import JSONValue
-from jobhunter.worker.epoch import Swept, register_takeover_sweep
+from jobhunter.worker.epoch import Swept, fence_epoch, register_takeover_sweep
 from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer, defer_in_tx, job_task_name
@@ -236,10 +239,16 @@ async def start_attempt(
       take back an attempt whose job waited in the queue.
     - `finished`: the run has a terminal status (or is gone), whatever attempt the delivery names.
     - `superseded`: the run is at another attempt.
-    - `foreign_epoch`: the run is `running` at `attempt_no`, owned by another epoch.
+    - `foreign_epoch`: the run is `running` at `attempt_no`, owned by another epoch; or `epoch` is no longer
+      the current worker epoch (`fence_epoch`, the first statement, before the run row is locked), so a
+      superseded worker admits nothing.
 
     Only `started` and `resumed` return the owner; the others write nothing.
     """
+    try:
+        await fence_epoch(conn, epoch)
+    except FencedOut:
+        return "foreign_epoch", None
     row = (await conn.execute(_ADMISSION, {"i": run_id})).first()
     if row is None:
         return "finished", None
@@ -331,7 +340,12 @@ async def begin_new_attempt(
     run ends `failed('resume_exhausted')` with that `resume_count` and the critical `run.resume_exhausted`
     alert, its current attempt is closed with `end_reason`, and the end is appended to `ends` (when given) for
     the transaction's owner to observe after its commit (`observe_run_ends`).
+
+    Raises `FencedOut`, having written nothing, when `epoch` is not the current worker epoch (`fence_epoch`,
+    its first statement). A caller that locks run rows before it calls this fences its transaction first, so
+    the `worker_heartbeat` row is always locked before a run row (the takeover sweep holds it already).
     """
+    await fence_epoch(conn, epoch)
     row = (await conn.execute(_LOCK_RUNNING, {"i": run_id})).first()
     if row is None or row.status != "running":
         return None
@@ -435,7 +449,8 @@ async def request_manual_run(
 async def sweep_older_epoch_runs(conn: AsyncConnection, epoch: int) -> Swept:
     """At takeover: give every `running` run whose current attempt belongs to an older epoch a new attempt.
 
-    The runs it ends (`resume_exhausted`) are observed once the takeover transaction has committed.
+    The runs it ends (`resume_exhausted`) are observed once the takeover transaction has committed. The
+    takeover holds the `worker_heartbeat` row with `epoch` written, so each new attempt's fence passes.
     """
     run_ids = [int(run_id) for run_id in (await conn.execute(_OLDER_EPOCH, {"epoch": epoch})).scalars()]
     ends: list[RunEnd] = []
@@ -454,16 +469,22 @@ async def reconcile_stale_runs(ctx: ReconcileContext) -> int:
     the attempt that was taken back (its registry token, ruling T12-d), so it releases the procrastinate
     `collect` lock before the replacement attempt's job can run. Rows locked by an in-flight heartbeat or
     owner write are skipped this time. The runs it ends (`resume_exhausted`) are observed after the commit.
-    Returns the number of runs taken back.
+    Returns the number of runs taken back: 0 when `ctx.epoch` is no longer the current worker epoch, because a
+    superseded worker gives no run a new attempt (the current worker's reconciler does).
     """
     ends: list[RunEnd] = []
-    async with ctx.engine.begin() as conn:
-        stale = (await conn.execute(_STALE, {"cutoff": ctx.now - RUN_STALE})).all()
-        taken = [(int(row.id), int(row.attempt_no)) for row in stale]
-        for run_id, _ in taken:
-            await begin_new_attempt(
-                conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer, ends=ends
-            )
+    try:
+        async with ctx.engine.begin() as conn:
+            # Before any run row is locked: the `worker_heartbeat` row comes first in the lock order.
+            await fence_epoch(conn, ctx.epoch)
+            stale = (await conn.execute(_STALE, {"cutoff": ctx.now - RUN_STALE})).all()
+            taken = [(int(row.id), int(row.attempt_no)) for row in stale]
+            for run_id, _ in taken:
+                await begin_new_attempt(
+                    conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer, ends=ends
+                )
+    except FencedOut:
+        return 0  # the fenced transaction wrote nothing (`fence_epoch` logged it)
     observe_run_ends(ends)
     for run_id, superseded in taken:
         key: ExecKey = ("run", run_id)
@@ -602,7 +623,8 @@ async def execute_run(
 
     1. Local check: a live local execution of the run with token `attempt_no` makes this a `duplicate`
        (nothing is written); one with an older token is cancelled and awaited first.
-    2. `start_attempt` in a transaction of its own; anything but `started` or `resumed` returns at once.
+    2. `start_attempt` in a transaction of its own (fenced by the current worker epoch); anything but
+       `started` or `resumed` returns at once.
     3. The graph runs through `run_owned(("run", id), attempt_no, …)`: the registry's task for the run, next
        to the heartbeat task `heartbeat:run:<id>` (`heartbeat_run` every `heartbeat_period_s`) whose loss
        cancels it. By outcome: `lost` (a refused or failed heartbeat, the `stale_runs` reconciler's or the
@@ -625,6 +647,7 @@ async def execute_run(
             return "duplicate"
         if isinstance(token, int) and token < attempt_no:
             await EXECUTIONS.cancel_and_await(key)
+    await afault_point("collect.before_admission")
     async with engine.begin() as conn:
         admission, owner = await start_attempt(conn, run_id, attempt_no, epoch=epoch)
     log.info("run_admission", run_id=run_id, attempt_no=attempt_no, admission=admission)

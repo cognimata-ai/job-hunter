@@ -39,10 +39,11 @@ from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut, TransitionConflict
+from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
-from jobhunter.worker.epoch import register_takeover_sweep
+from jobhunter.worker.epoch import fence_epoch, register_takeover_sweep
 from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer, job_task_name
@@ -192,8 +193,14 @@ async def create_operation(
 async def claim_operation(conn: AsyncConnection, operation_id: int, *, epoch: int) -> OperationClaim | None:
     """Claim a `pending` operation whose `not_before` has passed, with a fresh `claim_id`; `None` otherwise.
 
-    `pending → running` sets the claim, the worker `epoch` and the first heartbeat in one statement.
+    `pending → running` sets the claim, the worker `epoch` and the first heartbeat in one statement. `None`
+    too, having written nothing, when `epoch` is no longer the current worker epoch (`epoch.fence_epoch`, the
+    first statement, before the row is locked): a superseded worker claims nothing.
     """
+    try:
+        await fence_epoch(conn, epoch)
+    except FencedOut:
+        return None
     row = (await conn.execute(_CLAIMABLE, {"i": operation_id})).first()
     if row is None:
         return None
@@ -457,8 +464,9 @@ async def execute_operation(
 ) -> None:
     """Claim and run operation `operation_id` (the `run_operation` task body), one protocol for every end.
 
-    1. Claim it; return when it is not claimable. A kind without a handler ends `failed('no_handler')` with
-       the `operation.failed` alert (raised by `finish_operation`).
+    1. Claim it; return when it is not claimable (or `epoch` is no longer the current worker epoch). A kind
+       without a handler ends `failed('no_handler')` with the `operation.failed` alert (raised by
+       `finish_operation`).
     2. Run the handler through `run_owned(("operation", id), claim_id, …)`: the registry's task for the
        operation, next to the heartbeat task `heartbeat:operation:<id>` whose loss cancels it.
     3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, even one
@@ -472,6 +480,7 @@ async def execute_operation(
     cancellation propagates (the work is cancelled first) and nothing is written: the row's next owner
     (reclaim or takeover) records the outcome.
     """
+    await afault_point("operation.before_claim")
     async with engine.begin() as conn:
         claim = await claim_operation(conn, operation_id, epoch=epoch)
     if claim is None:

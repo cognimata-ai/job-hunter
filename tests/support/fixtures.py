@@ -234,6 +234,24 @@ def worker_lock(migrated: PgServer, make_config: ConfigFactory) -> Iterator[Lock
         session.close()
 
 
+_EPOCH_1_IS_CURRENT: Final = (
+    "INSERT INTO worker_heartbeat (id, worker_instance_id, worker_epoch, hostname, pid, lock_backend_pid, "
+    "app_version, started_at, heartbeat_at) "
+    "VALUES (1, gen_random_uuid(), 1, 'test', 1, 1, 'test', now(), now())"
+)
+
+
+@pytest.fixture
+def current_epoch(clean_db: None, migrated: PgServer) -> int:
+    """Worker epoch 1 recorded as the current one (a committed `worker_heartbeat` row); returns 1.
+
+    For tests that admit runs or claim operations as `epoch=1` without a takeover: every such write is fenced
+    by the current epoch (`epoch.fence_epoch`). A later epoch claim in the test increments it (to 2, 3, ...).
+    """
+    pg_one(migrated, "app", _EPOCH_1_IS_CURRENT)
+    return 1
+
+
 @pytest.fixture
 async def queue_app(migrated: PgServer, make_config: ConfigFactory) -> AsyncIterator[procrastinate.App]:
     """The task app of this process (`make_queue_app`) against the shared server, open for the test.
