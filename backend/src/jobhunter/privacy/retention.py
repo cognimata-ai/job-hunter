@@ -1,0 +1,201 @@
+"""Daily retention of the M0 data (spec §20.1): the body of the `retention_daily` task.
+
+Each rule removes what has passed its window. Every window is measured from the caller's `now`, never from the
+database's `now()` (ruling P14), with one exception: procrastinate's finished jobs are deleted through its own
+API (`tasks.delete_finished_jobs`), which compares their latest event with the database clock and returns no
+count, so the report holds `-1` for them.
+
+Each rule runs in a transaction of its own (ruling T13-e) and in an error boundary of its own (ruling T13-g):
+a rule that fails is reported as `-1`, logged `retention_rule_failed` and raised as the warn alert
+`retention.failed` (subject: the rule's name; context: the rule and the error class, never the message), and
+the rules after it still run. A rule that succeeds resolves its alert. Every rule is idempotent, so the next
+day's run repeats whatever failed.
+
+The rules run in dependency order (§20.1: a row goes only after what references it): the checkpoint threads
+of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
+run (`queued` or `running`) is never deleted, however old.
+
+Isolation has one exception, the dependent rules (ruling T21-f): a rule names in `depends_on` the rules whose
+work its own would make impossible to finish later. `runs` depends on `checkpoints`, because its cascade
+removes the `run_attempts` through which the checkpoint threads are found. A rule whose dependency failed (or
+was skipped itself) earlier in the same pass is skipped: it is reported as `-1` and logged
+`retention_rule_skipped` (with `blocked_by`), and it neither raises nor resolves an alert, so the failed
+dependency's alert stays open until a pass in which both succeed. Independent rules still run.
+
+This module is a task boundary (ruff `BLE001` is allowed here). The catch around a rule persists its outcome
+as the alert, written in a transaction of its own. When that write fails too, `retention_alert_write_failed`
+is logged: the database that would hold the outcome is the one that failed, so the log line is what is left
+(as in `worker.reconcilers`). Neither log line carries an exception message.
+"""
+
+from collections.abc import Awaitable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Final
+
+import procrastinate
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.sql.elements import TextClause
+
+from jobhunter.db.sql import q
+from jobhunter.observability.alerts import raise_alert, resolve_alert
+from jobhunter.observability.logging import get_logger
+from jobhunter.worker.tasks import delete_finished_jobs
+
+
+@dataclass(frozen=True)
+class RetentionRule:
+    """What `name` keeps: rows younger than `window` (measured from the caller's `now`).
+
+    `depends_on`: the earlier rules that must have succeeded in the same pass for this one to run.
+    """
+
+    name: str
+    window: timedelta
+    depends_on: tuple[str, ...] = ()
+
+
+# 13 calendar months last 393 to 397 days; the longest bound keeps every row for at least 13 months.
+THIRTEEN_MONTHS: Final = timedelta(days=397)
+
+# In the order they run, which is also the order of the report.
+RULES: Final[tuple[RetentionRule, ...]] = (
+    RetentionRule("api_idempotency", timedelta(0)),  # once expired (created + 7 days)
+    RetentionRule("sessions", timedelta(days=1)),  # expiry + 1 day
+    RetentionRule("login_attempts", timedelta(days=30)),
+    RetentionRule("alerts", timedelta(days=90)),  # after resolution
+    RetentionRule("operations", timedelta(days=30)),  # after they finished
+    RetentionRule("checkpoints", timedelta(days=14)),  # threads of the runs that ended that long ago
+    # Its cascade deletes the run_attempts that name the checkpoint threads, so never after a failed purge.
+    RetentionRule("runs", THIRTEEN_MONTHS, depends_on=("checkpoints",)),
+    RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
+)
+
+# One DELETE per row rule, each bound to its rule's `cutoff` (`now - window`).
+_DELETES: Final[dict[str, TextClause]] = {
+    "api_idempotency": q("DELETE FROM api_idempotency WHERE expires_at < :cutoff"),
+    "sessions": q("DELETE FROM sessions WHERE absolute_expires_at < :cutoff OR idle_expires_at < :cutoff"),
+    "login_attempts": q("DELETE FROM login_attempts WHERE at < :cutoff"),
+    "alerts": q("DELETE FROM alerts WHERE resolved_at < :cutoff"),
+    "operations": q(
+        "DELETE FROM operations "
+        "WHERE status IN ('succeeded', 'failed', 'cancelled') AND finished_at < :cutoff"
+    ),
+    # Terminal and finished, or never started (`missed`, `skipped_overlap`) and queued, before the cutoff.
+    "runs": q(
+        "DELETE FROM runs "
+        "WHERE (status IN ('succeeded', 'partial', 'failed', 'failed_invariant', 'cancelled') "
+        "AND finished_at < :cutoff) OR (status IN ('missed', 'skipped_overlap') AND queued_at < :cutoff)"
+    ),
+}
+
+# The checkpoint threads of the attempts of runs that ended before the cutoff and still have rows in any of
+# the saver's tables (so a thread is purged, and counted, once; a partly deleted one is finished next time).
+_ENDED_THREADS: Final = q(
+    "SELECT a.thread_id FROM run_attempts a JOIN runs r ON r.id = a.run_id "
+    "WHERE r.status IN ('succeeded', 'partial', 'failed', 'failed_invariant', 'cancelled') "
+    "AND r.finished_at < :cutoff "
+    "AND (EXISTS (SELECT 1 FROM checkpoints c WHERE c.thread_id = a.thread_id) "
+    "OR EXISTS (SELECT 1 FROM checkpoint_blobs b WHERE b.thread_id = a.thread_id) "
+    "OR EXISTS (SELECT 1 FROM checkpoint_writes w WHERE w.thread_id = a.thread_id)) "
+    "ORDER BY a.thread_id"
+)
+
+FAILED_ALERT_CODE: Final = "retention.failed"
+
+log = get_logger("jobhunter.privacy.retention")
+
+
+async def _delete_rows(engine: AsyncEngine, statement: TextClause, cutoff: datetime) -> int:
+    async with engine.begin() as conn:
+        return (await conn.execute(statement, {"cutoff": cutoff})).rowcount
+
+
+async def _purge_threads(engine: AsyncEngine, saver: AsyncPostgresSaver, cutoff: datetime) -> int:
+    """Delete the checkpoint threads of the runs that ended before `cutoff`; the number of threads."""
+    async with engine.connect() as conn:
+        threads = [
+            str(thread) for thread in (await conn.execute(_ENDED_THREADS, {"cutoff": cutoff})).scalars()
+        ]
+    for thread in threads:
+        # The saver's own deletion: checkpoints, blobs and writes of the thread, on its autocommit pool.
+        await saver.adelete_thread(thread)
+    return len(threads)
+
+
+async def _delete_finished_jobs(queue: procrastinate.App, window: timedelta) -> int:
+    await delete_finished_jobs(queue, older_than_hours=int(window / timedelta(hours=1)))
+    return -1  # procrastinate returns no count
+
+
+async def _apply(
+    rule: RetentionRule,
+    engine: AsyncEngine,
+    queue: procrastinate.App,
+    saver: AsyncPostgresSaver,
+    now: datetime,
+) -> int:
+    cutoff = now - rule.window
+    if rule.name == "checkpoints":
+        return await _purge_threads(engine, saver, cutoff)
+    if rule.name == "procrastinate_jobs":
+        return await _delete_finished_jobs(queue, rule.window)
+    return await _delete_rows(engine, _DELETES[rule.name], cutoff)
+
+
+async def _raise_failure(engine: AsyncEngine, name: str, error_class: str) -> None:
+    async with engine.begin() as conn:
+        await raise_alert(
+            conn,
+            code=FAILED_ALERT_CODE,
+            severity="warn",
+            subject=name,
+            message=f"retention rule {name} failed",
+            context={"rule": name, "error_class": error_class},
+        )
+
+
+async def _resolve_failure(engine: AsyncEngine, name: str) -> None:
+    async with engine.begin() as conn:
+        await resolve_alert(conn, code=FAILED_ALERT_CODE, subject=name)
+
+
+async def _record_alert_outcome(name: str, write: Awaitable[None]) -> None:
+    """Await the alert `write` of rule `name`; a failure of it is logged and goes no further."""
+    try:
+        await write
+    except Exception as exc:
+        log.error("retention_alert_write_failed", rule=name, error_class=type(exc).__name__)
+
+
+async def run_retention_daily(
+    engine: AsyncEngine, queue: procrastinate.App, saver: AsyncPostgresSaver, *, now: datetime
+) -> dict[str, int]:
+    """Apply every rule of `RULES` at `now`, in order; the number deleted by rule name, `-1` when it failed
+    or was skipped (a dependency of it failed in this pass).
+
+    `checkpoints` counts threads; `procrastinate_jobs` is always `-1`. `queue` must be open.
+    """
+    report: dict[str, int] = {}
+    not_done: set[str] = set()  # the rules that failed or were skipped in this pass
+    for rule in RULES:
+        blocked_by = [name for name in rule.depends_on if name in not_done]
+        if blocked_by:
+            report[rule.name] = -1
+            not_done.add(rule.name)
+            log.warning("retention_rule_skipped", rule=rule.name, blocked_by=blocked_by)
+            continue
+        try:
+            report[rule.name] = await _apply(rule, engine, queue, saver, now)
+        except Exception as exc:
+            report[rule.name] = -1
+            not_done.add(rule.name)
+            error_class = type(exc).__name__
+            # Not the exception's message and not its traceback: either may carry content.
+            log.error("retention_rule_failed", rule=rule.name, error_class=error_class)
+            await _record_alert_outcome(rule.name, _raise_failure(engine, rule.name, error_class))
+        else:
+            await _record_alert_outcome(rule.name, _resolve_failure(engine, rule.name))
+    log.info("retention_done", **report)
+    return report

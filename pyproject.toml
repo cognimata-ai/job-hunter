@@ -1,0 +1,58 @@
+[project]
+name = "jobhunter"
+version = "0.1.0"
+description = "Job Hunter: a job-matching agent platform"
+requires-python = "==3.13.*"
+dependencies = [
+    "fastapi==0.143.2",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.1",
+    "sqlalchemy[asyncio]==2.1.4",
+    "alembic==1.20.0",
+    "psycopg[binary]==3.3.6",
+    "psycopg-pool==3.3.3",
+    "procrastinate==3.10.0",
+    "langgraph==1.2.15",
+    "langgraph-checkpoint-postgres==3.2.0",
+    "langchain-core==1.6.11",
+    "argon2-cffi==25.1.0",
+    "pyotp==2.10.0",
+    "cryptography==50.0.2",
+    "structlog==26.1.0",
+    "prometheus-client==0.26.0",
+    "segno==1.6.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "hypothesis==6.170.0",
+    "ruff==0.17.1",
+    "mypy==2.4.0",
+    "httpx==0.28.1",
+    "pip-audit==2.10.1",
+]
+
+[project.scripts]
+jobhunter = "jobhunter.cli:main"
+
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/src/jobhunter"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+    "integration: needs the digest-pinned PostgreSQL container",
+    "crash: kills real processes and asserts recovery",
+    "stack: needs the full docker compose stack",
+    "slow: takes more than a few seconds",
+    "perf: performance measurement, never a correctness assertion",
+]
+addopts = "-m 'not stack and not perf'"

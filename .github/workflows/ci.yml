@@ -1,0 +1,120 @@
+# CI for Job Hunter (spec §18.8, the M0 subset): lint, unit, integration, frontend and audit.
+#
+# Supply chain: every action is pinned to a full commit SHA (the release tag is the trailing comment), uv and Node
+# to exact versions, the container images (PostgreSQL, gitleaks) to digests in deploy/images.lock. No job uses a
+# secret or a provider key: the token is read-only and the checkout does not keep it.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0 # gitleaks scans the whole history
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      # `uv sync --frozen` installs uv.lock as it is; this fails when pyproject.toml and uv.lock disagree.
+      - run: uv lock --check
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --prefix frontend
+      - run: npm run --prefix frontend lint
+      - run: npm run --prefix frontend typecheck
+      # The official container image, pinned by digest (gitleaks-action needs a paid licence for organisation
+      # repositories). It scans every commit; .gitleaks.toml holds the allowlist of known false positives. It
+      # runs even when an earlier lint step failed, so a leak is reported on every run that is not cancelled.
+      - name: gitleaks
+        if: ${{ !cancelled() }}
+        run: >-
+          docker run --rm -v "$PWD:/repo:ro" "$(grep ^gitleaks= deploy/images.lock | cut -d= -f2)"
+          git --redact --no-banner --config /repo/.gitleaks.toml -v /repo
+
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      - run: uv run pytest -W error tests/unit tests/property -q
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      # The harness (tests/support/pg.py) runs this image and is the only test code that needs Docker.
+      - run: docker pull "$(grep ^pgvector= deploy/images.lock | cut -d= -f2)"
+      - run: uv run pytest -W error tests/integration tests/crash -q
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --prefix frontend
+      - run: npm --prefix frontend test
+      - run: npm --prefix frontend run build
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      - run: scripts/check-openapi-drift.sh
+
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      # Without the project itself: it is installed editable and is not on PyPI, so `pip-audit --strict` cannot
+      # audit it and fails the run. `--no-sync` keeps `uv run` from installing it again.
+      - run: uv sync --frozen --no-install-project
+      - run: uv run --no-sync pip-audit --strict
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "22.22.3"
+      - run: npm audit --prefix frontend --omit=dev --audit-level=high

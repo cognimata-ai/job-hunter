@@ -58,7 +58,7 @@ Each spike records its result in `docs/spikes/V<n>.md`.
 
 | Milestone | Plan | Status |
 |---|---|---|
-| M0 | [`2026-10-16-m0-foundation.md`](2026-10-16-m0-foundation.md) | plan approved by Codex (3 review rounds); awaiting user review |
+| M0 | [`2026-10-16-m0-foundation.md`](2026-10-16-m0-foundation.md) | complete |
 | M1 | written after M0 lands | — |
 | M2 | written after M1 lands | — |
 | M3 | written after M2 lands | — |

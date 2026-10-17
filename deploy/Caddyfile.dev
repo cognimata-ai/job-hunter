@@ -1,0 +1,8 @@
+# The dev reverse proxy (Task 18): http://localhost:8080 -> api:8000 over the internal `proxy` network, from
+# devproxy's fixed address 172.30.0.2, the only forwarder the api trusts (§16.3, V20). The client address is
+# overwritten, so a client-supplied X-Forwarded-For never passes. Production's Caddyfile lands in M5.
+:8080 {
+  reverse_proxy api:8000 {
+    header_up X-Forwarded-For {remote_host}
+  }
+}
