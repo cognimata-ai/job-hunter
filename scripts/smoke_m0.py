@@ -22,7 +22,10 @@ exactly one JSON line, `{"check": <name>, "ok": <bool>}` with an optional `"deta
 It stops at the first failed check (exit 1); after six `ok` lines it exits 0. The password, the session cookie
 and every `Set-Cookie` value are never printed: the cookie travels as an explicit `Cookie` header, because
 httpx does not send a `Secure` cookie over plain HTTP (this proves the backend session only; the browser
-session is M4's), and everything printed passes through `Context.scrub`.
+session is M4's). The script prints nothing but those JSON lines: the output of the commands it runs is
+captured, and only a failure's `detail` can quote some of it (an exit status, a line of its output). That
+`detail` passes through `Context.scrub`, which replaces the exact password, cookie and token strings, and no
+other form of them; the rest of each line is fixed text.
 """
 
 import json
@@ -49,6 +52,9 @@ FRESH_HINT: Final = (
     "stack not fresh: run `docker compose --env-file deploy/images.lock "
     "-f deploy/compose.dev.yaml down -v` first"
 )
+# What `jobhunter user create` says when the single user exists (cli_user.py); other errors can also say
+# "already exists" (a docker network or container), and those are reported as they are.
+USER_EXISTS_MESSAGE: Final = "a user already exists"
 
 ORIGIN: Final = "http://localhost:8080"
 USERNAME: Final = "smoke"
@@ -116,6 +122,7 @@ def psql(sql: str) -> subprocess.CompletedProcess[str]:
         [*DC, "exec", "-T", "postgres", *PSQL, "-c", sql],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
         timeout=PSQL_TIMEOUT_S,
     )
@@ -166,7 +173,7 @@ def check_user_create(ctx: Context) -> str | None:
     )
     if process.returncode == 0:
         return None
-    if "already exists" in process.stderr:
+    if USER_EXISTS_MESSAGE in process.stderr:
         raise CheckFailed(FRESH_HINT)
     raise CheckFailed(f"exit {process.returncode}: {stderr_tail(process)}")
 
