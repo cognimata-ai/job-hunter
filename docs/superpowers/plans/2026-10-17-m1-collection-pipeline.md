@@ -34,6 +34,7 @@ Every Global Constraint of the M0 plan still applies (pins, `mypy --strict`, ruf
 - Spikes run with the user's real keys ONLY within these hard budgets for the whole milestone: JSearch ≤ 8 requests in total (V9 + V10), SerpApi 1 search (V3), Adzuna ≤ 5 requests (V18). Planned use: JSearch 7 (1 gateway-404 probe of the legacy route, which is not billed, plus 6 `search-v2` pages: V9 phases 1–2 and the day-2 phase shared by V10 and the 24-hour cursor check), SerpApi 1 search (plus free `account.json` reads), Adzuna 4, Arbeitnow ≤ 6 requests over 2 h (free, V8), ATS ≤ 12 free requests. Every spike step in Task 6 and Task 21 states its exact request count and its stop condition; the recorder counts every send *before* it happens, under a file lock, so a crash after the send or a transport failure can never spend more than the budget. The V10 day-2 phase may land in a later commit within M1; Task 25 (acceptance) stays blocked until its evidence is recorded in `docs/spikes/V10.md` and any identity instability it shows is resolved. In this dev container the keys are environment variables `RAPIDAPI_KEY` (JSearch via RapidAPI), `SERPAPI_API_KEY`, `ADZUNA_APP_ID` / `ADZUNA_APP_KEY`; the application itself reads provider keys as the spec's §19.2 secret files `rapidapi_key`, `serpapi_key`, `adzuna_app_id`, `adzuna_app_key` (the spike steps map the variables to the files); never print a key, never log one, never put one in a URL that is logged, never write one to a fixture.
 - No LLM in M1 (deterministic pipeline). No paid call in CI (`contract` job: fixtures and the PII scan only; the weekly `smoke-free-sources.yml` touches free sources only).
 - Commits use the scope `m1`, for example `feat(m1): …`.
+- Test bodies (Ruling P4): the Review Focus pins and the crash cases C1–C7 (C2b, C3b, C5b and C6b included) are given here as concrete code; every other test given as `...` or comments is written by its implementer from the step's prose and its named assertions, and a vacuous or tautological body is an Important review finding (as M0 P13).
 
 ## Review Focus
 
@@ -41,7 +42,7 @@ Every Global Constraint of the M0 plan still applies (pins, `mypy --strict`, ruf
 2. **A provider date later than the sighting** (JSearch's hour-truncated `job_posted_at_timestamp` can lie ahead of `fetched_at`). The ad must be kept with `posted_at_effective = first_seen_at`, never rejected by the `posted_at_effective ≤ first_seen_at` CHECK. Pinned by Task 17 (`test_future_provider_date_is_clamped_to_first_seen_at`).
 3. **An HTML error page or an oversized body in place of JSON** (a CDN or gateway outage). The fetch request becomes `failed('contract')` with the first 4 KiB stored and `item_count = 0`; its ledger entry settles by the billing rule alone (a JSearch 200 is `billed`: the provider charged, whatever the body), the instance is `contract_broken`, the run goes on and ends `partial`; nothing crashes, nothing is retried in the run, and a restart replays the failure from the receipt without a second send. Pinned by Task 5 (`test_html_body_and_oversized_body_are_contract_failures`), Task 12 (`test_contract_violation_fails_the_request_and_opens_the_breaker`, `test_contract_failure_is_replayed_after_restart`) and Task 14 (`test_contract_violation_is_visible_to_plan_fallback_in_the_same_run`).
 4. **A restart between a paid reservation and its dispatch** (a deploy during a run). The user must not be billed: the undispatched spec ends `skipped(shutdown)` with its ledger entry `not_billed(never_dispatched)`, nothing is sent, and the next attempt re-plans it. Pinned by Task 14 (`test_shutdown_after_reservation_before_dispatch_releases_and_sends_nothing`).
-5. **A watchlist company whose board disappears** (the company moved to another ATS: the board answers 404). Its postings are never aged by the failure, `source.not_found` is raised once, the instance is `not_found`, the next runs plan no request for it until the 6-hour half-open probe, and the probe's success resolves the alert. Pinned by Task 11 (`test_board_404_marks_not_found_and_skips_until_half_open`: health, alert and untouched postings) and Task 13 (`test_plan_skips_closed_instances_and_probes_half_open`: no request until the half-open probe).
+5. **A watchlist company whose board disappears** (the company moved to another ATS: the board answers 404). Its postings are never aged by the failure, `source.not_found` is raised once, the instance is `not_found`, the next runs plan no request for it until the 6-hour half-open probe, and the probe's success resolves the alert. Pinned by Task 11 (`test_board_404_marks_not_found_and_skips_until_half_open`: health, alert and its resolution), Task 13 (`test_plan_skips_closed_instances_and_probes_half_open`: no request until the half-open probe) and Task 19 (`test_board_404_ages_no_posting`: untouched postings).
 
 ---
 
@@ -52,7 +53,7 @@ The paths follow §4.2 for the M1 subset. Modules that §4.2 does not list are m
 | Path | Responsibility |
 |---|---|
 | `backend/src/jobhunter/db/migrations/versions/0005_m1_collection.py` | The M1 tables of §7.5, §7.7–7.10, `hard_filter_results` (§7.11), the `purge_fences.source_id` FK, `is_fenced` with the `source` branch, the transition triggers |
-| `backend/src/jobhunter/db/{seed,transitions}.py` | `sources` and default `source_instances` seeds; the seven M1 state machines |
+| `backend/src/jobhunter/db/{seed,transitions}.py` | `sources` and default `source_instances` seeds; the eight M1 state machines |
 | `backend/src/jobhunter/run_settings.py` *(new)* | Typed, read-only view of the collection, quota and scope settings of a settings version (M2 owns editing) |
 | `backend/src/jobhunter/normalize/{text,titles,companies,urls,keys,html,quality,language,fields}.py`, `normalize/data/{stopwords_de,stopwords_en}.txt` | §8.1–8.5, §8.8–8.10 pure functions |
 | `backend/src/jobhunter/sources/parsing/{dates,salary,employment,extensions,locations}.py` | German/English dates, salaries, employment types, SerpApi extensions, the location parser |
@@ -76,7 +77,7 @@ The paths follow §4.2 for the M1 subset. Modules that §4.2 does not list are m
 
 **Files:**
 - Create: `backend/src/jobhunter/db/migrations/versions/0005_m1_collection.py`
-- Modify: `backend/src/jobhunter/db/seed.py` (sources and default instances in `seed_defaults`; `DEFAULT_INSTANCES_SQL` shared with the test reset), `backend/src/jobhunter/db/transitions.py` (seven new `TransitionSpec`s), `tests/support/fixtures.py` (`_TRUNCATE`, `reset_database`), `tests/unit/test_transition_registry.py`, `backend/src/jobhunter/worker/main.py` (M0 carry-forward 5, Step 6)
+- Modify: `backend/src/jobhunter/db/seed.py` (sources and default instances in `seed_defaults`; `DEFAULT_INSTANCES_SQL` shared with the test reset), `backend/src/jobhunter/db/transitions.py` (eight new `TransitionSpec`s), `tests/support/fixtures.py` (`_TRUNCATE`, `reset_database`), `tests/unit/test_transition_registry.py`, `backend/src/jobhunter/worker/main.py` (M0 carry-forward 5, Step 6)
 - Test: `tests/integration/test_schema_m1.py`, `tests/integration/test_fences_m1.py`, `tests/unit/test_teardown.py`
 
 **Interfaces:**
@@ -85,7 +86,7 @@ The paths follow §4.2 for the M1 subset. Modules that §4.2 does not list are m
   - The tables of §7.5 (`sources`, `watchlist_companies`, `source_instances`, `queries`, `coverage_cells`, `coverage_intervals`), §7.7 (`fetch_requests`, `raw_responses`, `raw_items`, `ats_snapshots`, `ats_snapshot_members`), §7.8 (`quota_windows`, `quota_ledger`), §7.9 (`postings`, `posting_observations`, `jobs`, `job_revisions`, `job_revision_occurrences`, `job_revision_sources`, `ad_keys`, `ad_key_sources`, `merge_events`, `identity_conflicts`, `duplicate_groups`, `duplicate_group_members`, `dedup_decisions`, `job_tombstones`, `tombstone_keys`), §7.10 (`embeddings`) and §7.11 (`hard_filter_results`), plus `ats_snapshot_absences (snapshot_id bigint NOT NULL REFERENCES ats_snapshots(id) ON DELETE CASCADE, posting_id bigint NOT NULL REFERENCES postings(id) ON DELETE CASCADE, PRIMARY KEY (snapshot_id, posting_id))`, the frozen absent set of a mass-disappearance opening snapshot (Deviation 22), with their indexes, copied verbatim from the spec as static SQL in dependency order, the forward and cyclic FKs added afterwards with `ALTER TABLE … ADD FOREIGN KEY`.
   - `ALTER TABLE purge_fences ADD FOREIGN KEY (source_id) REFERENCES sources(id)` (M0 Deviation 1).
   - `CREATE OR REPLACE FUNCTION is_fenced(p_job bigint, p_tuple bigint DEFAULT NULL)` with the `global`, `jobs` and `source` branches of §7.14 (the `profile` branch is M2's; M0 Deviation 2).
-  - Triggers `<table>_assert_transition BEFORE UPDATE OF <state column> … EXECUTE FUNCTION assert_transition('<state column>')` on `fetch_requests(status)`, `raw_items(disposition)`, `postings(availability)`, `quota_ledger(state)`, `duplicate_groups(status)`, `identity_conflicts(status)`, `coverage_intervals(gap_status)`.
+  - Triggers `<table>_assert_transition BEFORE UPDATE OF <state column> … EXECUTE FUNCTION assert_transition('<state column>')` on `fetch_requests(status)`, `raw_items(disposition)`, `postings(availability)`, `quota_ledger(state)`, `duplicate_groups(status)`, `identity_conflicts(status)`, `coverage_intervals(gap_status)`, `quota_windows(state)`.
   - `seed.SOURCES: Final[tuple[SourceSeed, ...]]` with `@dataclass(frozen=True) class SourceSeed: id: str; kind: str; precedence_rank: int; can_close: bool; default_completeness: str`: `jsearch` (`paid_search`, 2, false, full), `serpapi` (`paid_search`, 2, false, full), `adzuna` (`quota_search`, 4, false, partial), `arbeitnow` (`firehose`, 3, false, full), `greenhouse`, `lever`, `ashby`, `personio`, `recruitee`, `smartrecruiters` (`ats`, 1, true, full); `seed.DEFAULT_INSTANCES: Final = ("jsearch", "serpapi", "adzuna", "arbeitnow")`, each with `instance_key = 'default'`. Both inserted `ON CONFLICT DO NOTHING` by `seed_defaults`.
   - `TRANSITIONS` entries (state column, reason column, changed-at, edges, settable):
 
@@ -98,9 +99,10 @@ The paths follow §4.2 for the M1 subset. Modules that §4.2 does not list are m
 | `duplicate_groups` (`status`) | `active→dissolved` | `dissolved → updated_at` | `election_reason` | `representative_job_id`, `unscorable_reason`, `elected_at` |
 | `identity_conflicts` (`status`) | `open→resolved_separate`, `open→resolved_merged` | both → `resolved_at` | none | — |
 | `coverage_intervals` (`gap_status`) | `open→closed`, `open→abandoned` | both → `closed_at` | `reason` | `gap_cursor` |
+| `quota_windows` (`state`, §7.16.8) | `extrapolated_unvalidated→validated`, `extrapolated_unvalidated→exhausted_until_reset`, `validated→exhausted_until_reset`, `exhausted_until_reset→validated` | none | none | — |
 
   None of them has owner columns: the run's ownership predicate is checked by the caller's `runs … FOR SHARE` (§3.3.3), as the M0 `runs`/`operations` specs check theirs.
-  - `fixtures._TRUNCATE` also names `watchlist_companies, source_instances, queries, coverage_cells, coverage_intervals, fetch_requests, raw_responses, raw_items, ats_snapshots, ats_snapshot_members, ats_snapshot_absences, quota_windows, quota_ledger, postings, posting_observations, jobs, job_revisions, job_revision_occurrences, job_revision_sources, ad_keys, ad_key_sources, merge_events, identity_conflicts, duplicate_groups, duplicate_group_members, dedup_decisions, job_tombstones, tombstone_keys, embeddings, hard_filter_results`. `source_instances` is named on purpose: `TRUNCATE … CASCADE` truncates every table that references a named one whatever its `ON DELETE` action, so the default instances vanish with `watchlist_companies` and `ats_snapshots` in any case. `reset_database` therefore re-inserts them in the same transaction with `seed.DEFAULT_INSTANCES_SQL` (the seed's own `INSERT … ON CONFLICT DO NOTHING`), and also restores the configuration state that M1 tests mutate, **in this order** (every row that references a newer settings version is re-pointed before that version is deleted; `schedule_state.settings_version_id` is an immediate FK): `UPDATE active_config SET settings_version_id = <v1>, scope_version_id = <v1.scope>, pending_scope_version_id = NULL, llm_tuple_id = NULL`; the M0 `_SCHEDULE_RESET` (which points `schedule_state` at version 1); `DELETE FROM settings_versions WHERE version_no > 1`; `DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)`; `UPDATE ranking_state SET generation = 0, updated_at = now()`. Instance ids change with every reset, so no test, helper or fixture assumes an id: they resolve instances by `(source_id, instance_key)` (`tests/support/collect.instance_id(conn, source_id, instance_key="default")`). The `sources` rows are seeds and stay.
+  - `fixtures._TRUNCATE` also names `watchlist_companies, source_instances, queries, coverage_cells, coverage_intervals, fetch_requests, raw_responses, raw_items, ats_snapshots, ats_snapshot_members, ats_snapshot_absences, quota_windows, quota_ledger, postings, posting_observations, jobs, job_revisions, job_revision_occurrences, job_revision_sources, ad_keys, ad_key_sources, merge_events, identity_conflicts, duplicate_groups, duplicate_group_members, dedup_decisions, job_tombstones, tombstone_keys, embeddings, hard_filter_results`. `source_instances` is named on purpose: `TRUNCATE … CASCADE` truncates every table that references a named one whatever its `ON DELETE` action, so the default instances vanish with `watchlist_companies` and `ats_snapshots` in any case. `reset_database` therefore re-inserts them in the same transaction with `seed.DEFAULT_INSTANCES_SQL` (the seed's own `INSERT … ON CONFLICT DO NOTHING`), and also restores the configuration state that M1 tests mutate, **in this order** (every row that references a newer settings version is re-pointed before that version is deleted; `schedule_state.settings_version_id` is an immediate FK): `UPDATE active_config SET settings_version_id = <v1>, scope_version_id = <v1.scope>, pending_scope_version_id = NULL, llm_tuple_id = NULL`; the M0 `_SCHEDULE_RESET` (which points `schedule_state` at version 1); `DELETE FROM settings_versions WHERE version_no > 1`; `DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)`; `UPDATE ranking_state SET generation = 0, updated_at = now()`. Instance ids change with every reset, so no test, helper or fixture assumes an id: they resolve instances by `(source_id, instance_key)` (`tests/support/collect.instance_id(conn, source_id, instance_key="default")`, Task 8). The `sources` rows are seeds and stay. `quota_windows` has the key `(provider, window_start)` and no `id`, so `transition()` does not apply to it: its state is written by `windows.save_window` (Task 7), checked against this registry entry before the statement and by its trigger.
 
 The migration's differences from the spec text, each with a SQL comment naming its owner (Deviations 1 and 2): `queries.proposal_id bigint` has no FK (M2 adds it with `query_proposals`); `profile_vectors` is not created (M2); `hard_filter_results` is created here; the `source_instances` CHECK reads `(health IN ('breaker_open','auth_failed','contract_broken','not_found')) = (breaker_opened_at IS NOT NULL AND half_open_after IS NOT NULL)`; the CHECK constraints a test asserts by name carry an explicit `CONSTRAINT <name>` (the spec leaves them unnamed, and PostgreSQL's generated `<table>_check<n>` names depend on DDL order): `fetch_requests_skipped_reason_check`, `quota_windows_tokens_check`, `source_instances_breaker_check`, `coverage_intervals_covered_reason_check`.
 
@@ -115,13 +117,17 @@ def test_m1_machines() -> None:
     assert ("active", "active") not in TRANSITIONS["postings"].allowed and ("unknown", "closed") in TRANSITIONS["postings"].allowed
     assert TRANSITIONS["quota_ledger"].changed_at == {"dispatched": "dispatched_at", "billed": "settled_at", "not_billed": "settled_at", "ambiguous": "settled_at"}
     assert TRANSITIONS["coverage_intervals"].state_col == "gap_status" and TRANSITIONS["identity_conflicts"].reason_col is None
+    assert TRANSITIONS["quota_windows"].allowed == {("extrapolated_unvalidated", "validated"), ("extrapolated_unvalidated", "exhausted_until_reset"),
+        ("validated", "exhausted_until_reset"), ("exhausted_until_reset", "validated")}   # §7.16.8
 ```
 
 ```python
 # tests/integration/test_schema_m1.py
 import pytest, sqlalchemy as sa
+from datetime import UTC, datetime
 from jobhunter.db.sql import CHECK_VIOLATION, UNIQUE_VIOLATION, PgErrorInfo, pg_error
 from tests.support.fixtures import reset_database
+from tests.support.pg import MANUAL_RUN_SQL
 pytestmark = pytest.mark.integration
 M1_TABLES = {"sources", "watchlist_companies", "source_instances", "queries", "coverage_cells", "coverage_intervals", "fetch_requests",
     "raw_responses", "raw_items", "ats_snapshots", "ats_snapshot_members", "quota_windows", "quota_ledger", "postings", "posting_observations",
@@ -138,7 +144,6 @@ async def test_tables_seeds_and_default_instances(engine) -> None:
         assert len(rows) == 10
         assert sorted((await c.execute(sa.text("SELECT source_id FROM source_instances WHERE instance_key='default'"))).scalars()) == ["adzuna", "arbeitnow", "jsearch", "serpapi"]
 
-RUN = "INSERT INTO runs (trigger,scheduled_slot,status,include_paid,settings_version_id,scope_version_id) SELECT 'manual',NULL,'queued',false,settings_version_id,scope_version_id FROM active_config RETURNING id"
 CELL = "INSERT INTO coverage_cells (source_instance_id) SELECT id FROM source_instances WHERE source_id='arbeitnow' AND instance_key='default' RETURNING id"
 @pytest.mark.parametrize(("statement", "constraint"), [
     ("INSERT INTO fetch_requests (run_id, run_attempt_no, cell_id, source_instance_id, phase, operation, request_key, page_no, request_class, spec, status) "
@@ -149,20 +154,21 @@ CELL = "INSERT INTO coverage_cells (source_instance_id) SELECT id FROM source_in
 ])
 async def test_checks_reject_violations(engine, statement, constraint) -> None:
     async with engine.begin() as c:   # the dependencies are valid rows, so only the intended CHECK can fail
-        run = (await c.execute(sa.text(RUN))).scalar_one(); cell = (await c.execute(sa.text(CELL))).scalar_one()
+        run = (await c.execute(sa.text(MANUAL_RUN_SQL))).scalar_one(); cell = (await c.execute(sa.text(CELL))).scalar_one()
         with pytest.raises(sa.exc.IntegrityError) as bad: await c.execute(sa.text(statement), {"run": run, "cell": cell})
     assert pg_error(bad.value) == PgErrorInfo(CHECK_VIOLATION, constraint)   # the exact named constraint, through M0's helper
 
 async def test_one_current_window_per_provider(engine) -> None:
-    ins = sa.text("INSERT INTO quota_windows (provider, window_start, window_end, is_current, limit_units, reserve_units, state, tokens, tokens_at, capacity) VALUES ('adzuna', :s, :s + interval '30 days', true, 2250, 0, 'validated', 1, :s, 1)")
+    ins = sa.text("INSERT INTO quota_windows (provider, window_start, window_end, is_current, limit_units, reserve_units, state, tokens, tokens_at, capacity) "
+                  "VALUES ('adzuna', CAST(:s AS timestamptz), CAST(:s AS timestamptz) + interval '30 days', true, 2250, 0, 'validated', 1, CAST(:s AS timestamptz), 1)")
     async with engine.begin() as c:
-        await c.execute(ins, {"s": "2026-10-01T00:00:00Z"})
-        with pytest.raises(sa.exc.IntegrityError) as bad: await c.execute(ins, {"s": "2026-10-02T00:00:00Z"})
+        await c.execute(ins, {"s": datetime(2026, 10, 1, tzinfo=UTC)})
+        with pytest.raises(sa.exc.IntegrityError) as bad: await c.execute(ins, {"s": datetime(2026, 10, 2, tzinfo=UTC)})
     assert (pg_error(bad.value).sqlstate, pg_error(bad.value).constraint) == (UNIQUE_VIOLATION, "quota_windows_current")
 
 async def test_new_tables_have_transition_triggers(engine) -> None:
     async with engine.begin() as c:
-        rid = (await c.execute(sa.text(RUN))).scalar_one(); cell = (await c.execute(sa.text(CELL))).scalar_one()
+        rid = (await c.execute(sa.text(MANUAL_RUN_SQL))).scalar_one(); cell = (await c.execute(sa.text(CELL))).scalar_one()
         fr = (await c.execute(sa.text("INSERT INTO fetch_requests (run_id, run_attempt_no, cell_id, source_instance_id, phase, operation, request_key, page_no, request_class, spec, status) "
             "VALUES (:r,1,:c,(SELECT source_instance_id FROM coverage_cells WHERE id=:c),'primary','list','\\x01',1,'free','{}','planned') RETURNING id"), {"r": rid, "c": cell})).scalar_one()
         with pytest.raises(sa.exc.IntegrityError, match="disallowed transition fetch_requests: planned -> succeeded"):
@@ -172,7 +178,7 @@ V2 = ("INSERT INTO settings_versions (version_no, schema_version, payload, scope
       "SELECT 2, schema_version, payload, scope_version_id, model_policy_id, execution_config_id, evaluation_policy_id, '{}' FROM settings_versions WHERE version_no = 1 RETURNING id")
 async def test_reset_reseeds_the_default_instances_and_the_configuration(engine, migrated) -> None:
     async with engine.begin() as c:
-        await c.execute(sa.text("INSERT INTO watchlist_companies (display_name, ats_type, board_slug, validation_status) VALUES ('X','greenhouse','x','ok')"))
+        await c.execute(sa.text("INSERT INTO watchlist_companies (display_name, company_key, ats_type, board_slug, detection, validation_status) VALUES ('X','x','greenhouse','x','manual','ok')"))
         await c.execute(sa.text("UPDATE ranking_state SET generation = 7"))
         v2 = (await c.execute(sa.text(V2))).scalar_one()   # a newer version that the schedule and the active config point at, as the M1 tests do
         await c.execute(sa.text("UPDATE active_config SET settings_version_id = :v"), {"v": v2}); await c.execute(sa.text("UPDATE schedule_state SET settings_version_id = :v"), {"v": v2})
@@ -219,7 +225,7 @@ Expected: FAIL with `KeyError: 'fetch_requests'` and `UndefinedTable` errors (th
 
 - The migration docstring lists the spec sections it copies and the four deviations, like `0001_m0_baseline`. `op.execute` per statement; `-- ruff: noqa: E501`.
 - `seed_defaults` inserts `SOURCES` and `DEFAULT_INSTANCES` after `ranking_state` and before `sync_transition_matrix` (both `ON CONFLICT DO NOTHING`).
-- `transitions.py`: the seven specs as in the Interfaces table; `TransitionSpec` needs no change (`reason_col=None` for `fetch_requests` and `identity_conflicts`). `raw_items.disposed_at` is a changed-at column *and* a `clear_on_exit` column of `rejected`, never a settable one: `TransitionSpec.__post_init__` refuses `settable & managed`, and `_validate` already applies `clear_on_exit` on every exit to another state. `test_m1_machines` also asserts `TRANSITIONS["raw_items"].clear_on_exit == {"rejected": ("disposed_at",)}` and `"disposed_at" not in TRANSITIONS["raw_items"].settable`, and `tests/unit/test_transition_registry.py` gains `test_registry_imports_without_a_managed_settable_clash` (constructing a spec whose `settable` names a changed-at column raises `ValueError`, the guard this table relies on). The callers in Tasks 15 and 18 pass `reason=CLEAR_REASON` on `rejected→pending` and `deferred→linked`: `reason=None` keeps the old reason and the `raw_items` CHECK `(disposition IN (…)) = (reason_code IS NOT NULL)` refuses the row.
+- `transitions.py`: the eight specs as in the Interfaces table; `TransitionSpec` needs no change (`reason_col=None` for `fetch_requests`, `identity_conflicts` and `quota_windows`). `raw_items.disposed_at` is a changed-at column *and* a `clear_on_exit` column of `rejected`, never a settable one: `TransitionSpec.__post_init__` refuses `settable & managed`, and `_validate` already applies `clear_on_exit` on every exit to another state. `test_m1_machines` also asserts `TRANSITIONS["raw_items"].clear_on_exit == {"rejected": ("disposed_at",)}` and `"disposed_at" not in TRANSITIONS["raw_items"].settable`, and `tests/unit/test_transition_registry.py` gains `test_registry_imports_without_a_managed_settable_clash` (constructing a spec whose `settable` names a changed-at column raises `ValueError`, the guard this table relies on). The callers in Tasks 15 and 18 pass `reason=CLEAR_REASON` on `rejected→pending` and `deferred→linked`: `reason=None` keeps the old reason and the `raw_items` CHECK `(disposition IN (…)) = (reason_code IS NOT NULL)` refuses the row.
 - `reset_database`, all in the one transaction and in this order: the truncate, `DEFAULT_INSTANCES_SQL`, the `active_config` restoration, the M0 schedule reset (`_SCHEDULE_RESET`, now **before** the deletes), then `DELETE FROM settings_versions WHERE version_no > 1`, the `scope_versions` delete and the `ranking_state` reset.
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -240,7 +246,7 @@ git commit -m "feat(m1): M1 schema (sources, receipts, quota, postings, jobs, gr
 
 ```bash
 git add backend/src/jobhunter/worker/main.py tests/unit/test_teardown.py
-git commit -m "fix(worker): keep the lock session open while the watchdog is in a heartbeat (M0 carry-forward 5)"
+git commit -m "fix(m1): keep the lock session open while the watchdog is in a heartbeat (M0 carry-forward 5)"
 ```
 
 ---
@@ -279,6 +285,8 @@ def test_normalized_title_and_tokens() -> None:
 ```
 
 (The first assertion's expected `title_norm` is `"senior software engineer (data & platform) berlin"`: step 4 trims the separators `-–—|,:` at both ends after collapsing runs; a separator in the middle collapses to one space, `&` stays.)
+
+`tests/unit/test_normalize_text.py` holds `test_norm_text_steps` (one assertion per §8.1 step: NFKC folds `ﬁ` to `fi`; U+00AD, U+200B–U+200D and U+FEFF are removed; NBSP and U+202F become a space; whitespace runs collapse; the result is trimmed) and `test_unaccent_map` (each pair of the `text.unaccent` map, and `fold("Straße") == "strasse"`).
 
 ```python
 # tests/unit/test_companies.py
@@ -339,7 +347,7 @@ async def test_python_fold_equals_db_unaccent_casefolded(engine, s) -> None:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_titles.py tests/unit/test_companies.py tests/unit/test_urls.py tests/unit/test_keys.py tests/integration/test_fold_matches_db.py -q`
+Run: `uv run pytest tests/unit/test_normalize_text.py tests/unit/test_titles.py tests/unit/test_companies.py tests/unit/test_urls.py tests/unit/test_keys.py tests/integration/test_fold_matches_db.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.normalize'`
 
 - [ ] **Step 3: Implement the five modules**
@@ -376,7 +384,7 @@ git commit -m "feat(m1): text primitives, title and company normalisation, URL c
 - Produces:
   - `html.ALLOWED_TAGS: Final = frozenset({"p", "br", "ul", "ol", "li", "strong", "em", "b", "i", "h3", "h4", "a"})`; `html.sanitize_html(raw: str) -> str` (nh3, `href` http/https only, `rel` and `target` forced, everything else stripped); `html.html_to_text(sanitized: str) -> str` (block tags become line breaks, entities unescaped, then `norm_text` per line); `html.unescape_html(s: str) -> str`
   - `quality.Quality = Literal["ok", "short", "garbage"]`; `quality.description_quality(text: str) -> Quality` (§8.9 thresholds 200 / 60 / 40% / 3 `null`-or-`undefined` lines)
-  - `language.AdLanguage = Literal["de", "en", "unknown"]`; `language.detect_language(text: str) -> AdLanguage` (the top-200 stop-word lists shipped as data files, ≥ 50 tokens, threshold 0.2)
+  - `language.AdLanguage = Literal["de", "en", "unknown"]`; `language.detect_language(text: str) -> AdLanguage` (the stop-word lists shipped as data files: PostgreSQL's `german.stop` (231 words, trimmed to 200) and `english.stop` (127 words, all); ≥ 50 tokens, threshold 0.2)
   - `dates.Precision = Literal["exact", "hour", "day", "relative_day", "ingest", "unknown"]`; `@dataclass(frozen=True) class ParsedDate: at: datetime; precision: Precision; raw: str | None`; `dates.BERLIN: Final = ZoneInfo("Europe/Berlin")`; `dates.parse_relative(text: str, *, reference: datetime) -> ParsedDate | None` (DE and EN forms of §5.3.2; `hour` for hours, `relative_day` for days/`Gestern`/`Heute`/`yesterday`/`today`/`just posted`, resolved in Europe/Berlin and returned in UTC); `dates.jsearch_precision(relative: str) -> Literal["hour", "day"]`; `dates.from_epoch(seconds: int | float, *, millis: bool = False, precision: Precision) -> ParsedDate`; `dates.parse_iso(text: str, *, precision: Precision) -> ParsedDate | None`; `dates.response_date(headers: Mapping[str, str], fallback: datetime) -> datetime` (the `Date` header, else `fallback`)
   - `salary.Salary` (Pydantic, §8.10 stored form: `min`, `max`, `currency`, `period`, `kind`, `raw`, `annual_eur_min`, `annual_eur_max`); `salary.parse_salary(text: str, *, kind: Literal["stated", "predicted"] = "stated") -> Salary | None`; `salary.annualise(amount: float, period: str) -> float`; `salary.from_bounds(min_: float | None, max_: float | None, *, currency: str, period: str, kind, raw: str | None) -> Salary | None`
   - `employment.EmploymentType = Literal["full_time", "part_time", "contract", "temporary", "internship", "working_student", "apprenticeship", "freelance"]`; `employment.JSEARCH_TYPES: Final[Mapping[str, EmploymentType]]` (`FULLTIME`, `PARTTIME`, `CONTRACTOR`, `INTERN`); `employment.parse_employment(text: str) -> list[EmploymentType]` (`Vollzeit`/`Full-time`, `Teilzeit`/`Part-time`, `Vertrag`/`Contractor`, `Praktikum`/`Internship`, plus `Werkstudent`, `Ausbildung`, `befristet`/`temporary`, `freelance`/`freiberuflich`); `employment.adzuna_employment(contract_time: str | None, contract_type: str | None) -> list[EmploymentType]`
@@ -466,7 +474,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.sources'`
 
 - `dates.parse_relative`: the reference is converted to `BERLIN`; a day form takes that local date minus `n` days at local midnight, converted back to UTC; an hour form subtracts `n` hours from the reference. `response_date` parses RFC 7231 `Date` with `email.utils.parsedate_to_datetime`.
 - `salary.parse_salary`: numbers accept `.` thousands and `,` decimals, `K`, `Tsd.`, NBSP; ranges joined by `bis`, `–`, `-`, `to`; periods `pro Jahr`/`jährlich`/`a year`/`per year`, `pro Monat`/`monatlich`/`a month`, `pro Stunde`/`an hour`, `pro Woche`; currency `€`/`EUR` only gives the annualised EUR values, any other currency leaves them `None`; no period → `year`.
-- `language.detect_language`: tokens are `fold`ed words; the data files hold one stop word per line (top 200 each, from the stop-word lists of PostgreSQL's `german.stop` and `english.stop`, trimmed to 200 by frequency).
+- `language.detect_language`: tokens are `fold`ed words; the data files hold one stop word per line: `stopwords_de.txt` the first 200 of the 231 words of PostgreSQL's `german.stop`, in file order, `stopwords_en.txt` all 127 of `english.stop` (the stop files carry no frequencies to trim by).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -497,7 +505,7 @@ git commit -m "feat(m1): HTML sanitisation, quality gate, language detection, bi
   - `gazetteer.distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float` (haversine)
   - `locations.LocationKind = Literal["city", "multi", "country_wide", "remote", "unknown"]`; `locations.Resolution = Literal["unique", "ambiguous", "unresolved"]`; `class locations.Candidate(BaseModel): gazetteer_id: str; country_code: str; lat: float; lon: float`; `class locations.Location(BaseModel): label: str; resolution: Resolution; candidates: list[Candidate]; postal_code: str | None; source: str`; `@dataclass(frozen=True) class locations.ParsedLocations: locations: list[Location]; kind: LocationKind; positively_non_de: bool`
   - `locations.parse_location_text(text: str, *, source: str) -> ParsedLocations` (§8.12 steps 1–4 and the §5.3.4 non-German rule); `locations.parse_jsearch_location(job_location: str | None, job_city: str | None, job_country: str | None) -> ParsedLocations` (§5.3.1: split on `•`, drop `über X`/`via X`, `Beliebiger Ort`/`Anywhere` → `country_wide`); `locations.location_from_coordinates(label: str, lat: float, lon: float, *, source: str) -> Location`; `locations.positively_outside_germany(locations: Sequence[Location]) -> bool` (every location resolved with every candidate outside `DE`, at least one location)
-  - `scripts/build_gazetteer.py`: downloads `https://download.geonames.org/export/dump/DE.zip`, `…/export/zip/DE.zip`, `…/export/dump/cities15000.zip` and `…/export/dump/countryInfo.txt` into a temporary directory, writes the three TSVs (DE: feature class `P`, population ≥ 1,000; a postal code maps to the places with the same folded name in the same admin1 code, else to the nearest DE place within 10 km; non-DE: European cities with population > 100,000 by `countryInfo.txt` continent `EU` excluding `DE`, plus every country name in EN from `countryInfo.txt` and in DE from the hand-maintained `country_names_de.tsv`), and prints the row counts. The TSV columns are the `Place` fields in order; `alt_folded` and `postal_codes` are `|`-joined.
+  - `scripts/build_gazetteer.py`: downloads `https://download.geonames.org/export/dump/DE.zip`, `…/export/zip/DE.zip`, `…/export/dump/cities15000.zip` and `…/export/dump/countryInfo.txt` into a temporary directory, writes the two generated TSVs, `de_places.tsv` and `non_de_places.tsv` (`country_names_de.tsv` is its hand-maintained input, Deviation 4) (DE: feature class `P`, population ≥ 1,000, `alt_folded` = the folded GeoNames `alternatenames` of the place plus the umlaut transliteration of its name (`ä→ae`, `ö→oe`, `ü→ue`, `ß→ss`), so `moenchengladbach` finds Mönchengladbach and `frankfurt` finds Frankfurt am Main and Frankfurt (Oder); a postal code maps to the places with the same folded name in the same admin1 code, else to the nearest DE place within 10 km; non-DE: European cities with population > 100,000 by `countryInfo.txt` continent `EU` excluding `DE`, plus every country name in EN from `countryInfo.txt` and in DE from the hand-maintained `country_names_de.tsv`), and prints the row counts. The TSV columns are the `Place` fields in order; `alt_folded` and `postal_codes` are `|`-joined.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -576,13 +584,13 @@ git commit -m "feat(m1): GeoNames gazetteer (DE places, European cities, country
   - Item outcomes: `@dataclass(frozen=True) class base.Parsed: item_index: int; native_id: str; item_ts: datetime | None; normalized: NormalizedPosting`; `OutOfScope(item_index, native_id, item_ts, reason: str)`; `DuplicateInPage(item_index, native_id, item_ts, first_index: int)`; `Rejected(item_index, native_id: str | None, item_ts, reason_code: str, detail: str)`; `base.ItemOutcome = Parsed | OutOfScope | DuplicateInPage | Rejected`
   - `@dataclass(frozen=True) class base.Observation: observed_at: datetime; status: int | None; reset_at: datetime | None = None; limit: int | None = None; remaining: int | None = None; this_hour: int | None = None; hourly_cap: int | None = None`
   - `base.Settlement = tuple[Literal["billed", "not_billed", "ambiguous"], str | None]` (state, evidence)
-  - `base.CoverageWindow = tuple[datetime, datetime]`; `@dataclass(frozen=True) class base.CellPlan: cell_id: int; source_id: str; instance_id: int; query_text: str | None; query_lang: str | None; location_key: str | None; location_label: str | None; radius_km: int | None; phase: Literal["primary", "fallback"]; request_class: Literal["normal", "retry", "probe", "free"]; bucket: Literal["today", "3days", "week", "month"] | None; window: CoverageWindow; max_days_old: int | None` (what an adapter needs to build its first page; the planner of Task 13 builds it from its DB-level `CellRow`); `class base.SourceAdapter(Protocol)`: the §5.1 methods (`capabilities`, `plan(cell: CellPlan) -> RequestSpec` for the first page of a traversal, with `cell.window` copied into `RequestSpec.window` so a resumed attempt reads the window from the planned row and never recomputes it; `fetch`, `check_envelope`, `peek_native_ids`, `parse`, `continuation`), plus `settle(outcome: HttpOutcome) -> Settlement` and `observation(page: RawPage) -> Observation | None` (both no-ops for free sources) and `next_page(spec: RequestSpec, cursor: str | None) -> RequestSpec | None`
+  - `base.CoverageWindow = tuple[datetime, datetime]`; `@dataclass(frozen=True) class base.CellPlan: cell_id: int; source_id: str; instance_id: int; query_text: str | None; query_lang: str | None; location_key: str | None; location_label: str | None; radius_km: int | None; phase: Literal["primary", "fallback"]; request_class: Literal["normal", "retry", "probe", "free"]; bucket: Literal["today", "3days", "week", "month"] | None; window: CoverageWindow; max_days_old: int | None` (what an adapter needs to build its first page; the planner of Task 13 builds it from its DB-level `CellRow`); `class base.SourceAdapter(Protocol)`: the §5.1 methods (`capabilities`, `plan(cell: CellPlan) -> RequestSpec` for the first page of a traversal (Deviation 25), with `cell.window` copied into `RequestSpec.window` so a resumed attempt reads the window from the planned row and never recomputes it; `async fetch(spec: RequestSpec) -> http.HttpOutcome` (one attempt through `http.send` with the adapter's injected clock: the transport outcome, page and error together, that `settle` classifies; Deviation 25), `check_envelope`, `peek_native_ids`, `parse`, `continuation`), plus `settle(outcome: HttpOutcome) -> Settlement` and `observation(page: RawPage) -> Observation | None` (both no-ops for free sources) and `next_page(spec: RequestSpec, cursor: str | None) -> RequestSpec | None`
   - `http.Timeouts` consts per §5.2; `http.MAX_BODY_BYTES: Final = 64 * 1024 * 1024`; `http.ERROR_BODY_BYTES: Final = 4096`; `http.STORED_HEADERS: Final` (the §5.2 allowlist); `http.configure(cfg: AppConfig) -> None` (process-wide: the UA, and the fixture transport when `cfg.fake_sources`); `http.make_client(source_id: str, *, max_body_bytes: int = MAX_BODY_BYTES) -> httpx.AsyncClient` (timeouts by source, redirects off, the Personio family handled in `send`); `@dataclass(frozen=True) class http.HttpOutcome: page: RawPage | None; error: SourceError | None`; `async def http.send(client, spec: RequestSpec, request: httpx.Request, *, now: Callable[[], datetime], deadline_s: float = 90.0) -> HttpOutcome` (one attempt; a `ConnectError` is `SourceError(transient, before_send=True)`, a timeout or a lost response `SourceError(ambiguous)`, a body over the cap `ContractViolation("body_too_large")` with the first 4 KiB kept, a 3xx a page unless the Personio exception applies; headers filtered to the allowlist, lower-cased)
-  - `class ratelimit.RateLimiter`: `__init__(limits: Iterable[RateLimit], *, clock: Callable[[], float], sleep: Callable[[float], Awaitable[None]])`; `async def acquire(key: str) -> AsyncContextManager[None]` (token bucket refilled continuously plus a semaphore of `concurrency`); `ratelimit.SOURCE_LIMITS: Final[Mapping[str, RateLimit]]` and `ratelimit.ATS_HOST_LIMIT: Final = RateLimit("ats-host", 5.0, 2)`, `ratelimit.SMARTRECRUITERS_DETAIL: Final = RateLimit("smartrecruiters-detail", 5.0, 4)`
+  - `class ratelimit.RateLimiter`: `__init__(limits: Iterable[RateLimit], *, clock: Callable[[], float], sleep: Callable[[float], Awaitable[None]])`; `def acquire(key: str) -> AbstractAsyncContextManager[None]` (an `asynccontextmanager`: `async with rl.acquire(key):` waits for a token of the bucket, refilled continuously, and a slot of the semaphore of `concurrency`); `ratelimit.SOURCE_LIMITS: Final[Mapping[str, RateLimit]]` and `ratelimit.ATS_HOST_LIMIT: Final = RateLimit("ats-host", 5.0, 2)`, `ratelimit.SMARTRECRUITERS_DETAIL: Final = RateLimit("smartrecruiters-detail", 5.0, 4)`
   - `breaker.Health = Literal[...]` (the seven §1.6 states); `breaker.FailureKind = Literal["transient", "rate_limited", "client", "auth", "contract", "not_found"]`; `breaker.PAID_THRESHOLD: Final = 2`, `FREE_THRESHOLD: Final = 5`, `HALF_OPEN_AFTER: Final = timedelta(hours=6)`; `async def breaker.record_failure(conn, instance_id: int, kind: FailureKind, *, billing: Billing, now: datetime) -> Health` (raises the §17.6 alerts `source.breaker_open` warn, `source.auth_failed` critical, `source.contract_broken` critical, `source.not_found` warn, subject `instance:<id>`); `async def breaker.record_success(conn, instance_id, *, now) -> Health` (`ok`, `consecutive_failures = 0`, `last_success_at`, resolves the four alerts); `breaker.available(instance: InstanceRow, now: datetime) -> Literal["available", "half_open", "blocked"]` (`blocked` is skipped at planning; `half_open` admits one probe)
   - `@dataclass(frozen=True) class instances.InstanceRow: id: int; source_id: str; instance_key: str; watchlist_company_id: int | None; health: Health; half_open_after: datetime | None; board_slug: str | None; lever_region: str | None; display_name: str | None`; `async def instances.list_instances(conn) -> list[InstanceRow]`; `async def instances.disable(conn, instance_id: int, *, code: str) -> None` (`health = 'disabled'`, `last_error_code = code`, `breaker_opened_at = NULL`, `half_open_after = NULL`, `consecutive_failures = 0`); `async def instances.sync_instances(conn, cfg: AppConfig) -> dict[str, Health]` (Deviation 6, a behaviour change: a paid or quota default instance whose secret file is absent is `disable`d with `code = 'missing_secret'`; an instance is restored to `ok` **only** from `disabled` with `last_error_code = 'missing_secret'` once its secret is present; every other state, an administrative `disabled` without that code and every breaker state included, is left untouched; in fake mode no secret is required and nothing is disabled); `async def instances.instance_for_company(conn, company_id: int) -> int` (`instance_key = board_slug`, or `f"{lever_region}:{board_slug}"` for Lever; `ON CONFLICT (source_id, instance_key)` returns the existing id)
   - `fixtures.fixture_transport(fixtures_dir: Path, *, log_path: Path | None = None) -> httpx.MockTransport` and `fixtures.ROUTES: Final[tuple[fixtures.Route, ...]]` (`Route(host: str, path: re.Pattern[str], query: Mapping[str, str | None], file: str)`, first match wins; the response body is `<file>.json`/`.xml`, status and headers from `<file>.headers.json`; no match → 404 `{"error": "no fixture"}`); with `log_path` (from `JOBHUNTER_FIXTURE_LOG`, test only) every served request appends one JSON line `{"pid", "method", "host", "path", "query", "case", "status"}` (`O_APPEND`, one `write` per line), the instrument the crash tests use to count real sends across worker processes
-  - `run_settings.ScopeLocation(label, gazetteer_id, lat, lon, radius_km, key)` where `key = slug(label)` (`fold`, non-alphanumerics to `-`, collapsed); `run_settings.SeniorityRange(mode, below, above, min, max)`; `run_settings.ScopeSettings` (`locations`, `remote_within_germany`, `work_modes`, `employment_types`, `seniority_range`, `industries_exclude`, `accepted_ad_languages`, `excluded_companies` as company keys, `excluded_keywords`, `exclude_keywords_in_description`, `max_ad_age_days`); `run_settings.SourcesEnabled(jsearch, serpapi, adzuna, arbeitnow, ats)`; `run_settings.QuotaSettings(jsearch_monthly_limit, serpapi_monthly_limit, reserve_pct, serpapi_hourly_cap, adzuna_cap_minute, adzuna_cap_day, adzuna_cap_week, adzuna_cap_month, paid_max_requests_per_run: int | Literal["auto"])`; `@dataclass(frozen=True) class run_settings.RunSettings: settings_version_id: int; scope_version_id: int; scope: ScopeSettings; sources: SourcesEnabled; quota: QuotaSettings; queries: Mapping[int, bool]; watchlist: Mapping[int, bool]; stale_ttl_days: int; interval_s: int; schedule_include_paid: bool`; `async def run_settings.load_run_settings(conn, settings_version_id: int) -> RunSettings` (`interval_s` from `schedule_state`; `stale_ttl_days` `null` → `max_ad_age_days`); `run_settings.scope_from_payload(payload: Mapping[str, JSONValue]) -> ScopeSettings`
+  - `run_settings.ScopeLocation(label, gazetteer_id, lat, lon, radius_km, key)` where `key = slug(label)` (`fold`, non-alphanumerics to `-`, collapsed); `run_settings.SeniorityRange(mode, below, above, min, max)`; `run_settings.ScopeSettings` (`locations`, `remote_within_germany`, `work_modes`, `employment_types`, `seniority_range`, `industries_exclude`, `accepted_ad_languages`, `excluded_companies` as company keys, `excluded_keywords`, `exclude_keywords_in_description`, `max_ad_age_days: int | None`, `None` when the scope is built from a `scope_versions.payload`, which M0 stores without it (`seed.scope_payload`)); `run_settings.SourcesEnabled(jsearch, serpapi, adzuna, arbeitnow, ats)`; `run_settings.QuotaSettings(jsearch_monthly_limit, serpapi_monthly_limit, reserve_pct, serpapi_hourly_cap, adzuna_cap_minute, adzuna_cap_day, adzuna_cap_week, adzuna_cap_month, paid_max_requests_per_run: int | Literal["auto"])`; `@dataclass(frozen=True) class run_settings.RunSettings: settings_version_id: int; scope_version_id: int; scope: ScopeSettings; sources: SourcesEnabled; quota: QuotaSettings; queries: Mapping[int, bool]; watchlist: Mapping[int, bool]; stale_ttl_days: int; interval_s: int; schedule_include_paid: bool`; `async def run_settings.load_run_settings(conn, settings_version_id: int) -> RunSettings` (`interval_s` from `schedule_state`; `stale_ttl_days` `null` → `max_ad_age_days`); `run_settings.scope_from_payload(payload: Mapping[str, JSONValue]) -> ScopeSettings`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -676,7 +684,7 @@ from datetime import timedelta
 import pytest, sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.sources.breaker import HALF_OPEN_AFTER, available, record_failure, record_success
-from jobhunter.sources.instances import list_instances
+from jobhunter.sources.instances import disable, list_instances
 pytestmark = pytest.mark.integration
 async def instance(engine, source_id: str):
     async with engine.connect() as c: return next(i for i in await list_instances(c) if i.source_id == source_id)
@@ -736,7 +744,6 @@ Expected: FAIL with `ImportError: cannot import name 'RequestSpec' from 'jobhunt
 
 - `http.send`: `client.send(request, stream=True)`; reads the body in chunks up to the cap; `response.headers` filtered to `STORED_HEADERS`; the Personio exception follows at most 3 redirects whose target host ends with `.jobs.personio.de`. The log line `source_request` carries `source_id`, the URL path and the query with the `api_key`, `app_id`, `app_key` parameters removed (the redaction processor masks the rest).
 - `breaker.record_failure`: `transient`, `rate_limited` and `client` count toward the threshold (`degraded` below it); `auth`, `contract` and `not_found` open at once as their own state; every open state sets `breaker_opened_at = now` and `half_open_after = now + HALF_OPEN_AFTER` (Deviation 2). `record_success` and `instances.disable` set both timestamps to NULL (the widened CHECK requires it, and the test above pins it). `available` is `half_open` when `now ≥ half_open_after`, `blocked` before, `available` for `ok`/`degraded`, and `blocked` for `disabled`.
-- `test_breaker.py` imports `disable` from `jobhunter.sources.instances`.
 - `fixtures.ROUTES` is filled by Task 6 as the fixtures are recorded; this task ships the mechanism and the two JSearch routes of the test.
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -757,17 +764,17 @@ git commit -m "feat(m1): adapter protocol and models, HTTP layer with outcome cl
 
 **Files:**
 - Create: `backend/src/jobhunter/cli_fixtures.py`, `scripts/spikes/record_sources.py`, `scripts/spikes/derive_variants.py`, `tests/contract/__init__.py`, `tests/contract/conftest.py`, `tests/contract/README.md`, `tests/contract/fixtures/**`, `tests/contract/test_fixture_pii.py`, `tests/contract/test_v17_gazetteer_coverage.py`, `tests/support/sources.py`, `tests/unit/test_fixture_scrub.py`, `docs/spikes/V3.md`, `V8.md`, `V9.md`, `V10.md`, `V17.md`, `V18.md`
-- Modify: `backend/src/jobhunter/cli.py` (`fixtures scrub`), `.gitignore` (`.fixtures-raw/`), `backend/src/jobhunter/sources/fixtures.py` (`ROUTES`), `pyproject.toml` (marker `contract`, `live`; `addopts = "-m 'not stack and not perf and not live'"`)
+- Modify: `backend/src/jobhunter/cli.py` (`fixtures scrub`), `.gitignore` (`.fixtures-raw/`), `backend/src/jobhunter/sources/fixtures.py` (`ROUTES`), `pyproject.toml` (marker `contract`, `live`; `addopts = "-m 'not stack and not perf and not live'"`), `tests/conftest.py` (`pytest_plugins` gains `tests.support.sources`, whose fixtures Tasks 11–15 add; Task 8 adds `tests.support.collect` and Task 22 `tests.support.embedder`, each with its module)
 
 **Interfaces:**
-- Consumes: `redact.EMAIL`, `redact.PHONE`, `redact.KEY`, `Gazetteer`, `parse_location_text`.
+- Consumes: `redact.EMAIL`, `redact.PHONE`, `redact.KEY`, `configure_logging`, `canonical_url`, `Gazetteer`, `parse_location_text`.
 - Produces:
-  - `class cli_fixtures.Pseudonyms`: deterministic per-category counters (`person`, `email`, `phone`, `user`, `token`, `key`), first appearance wins; `cli_fixtures.scrub_text(text: str, p: Pseudonyms) -> str`: e-mails → `[email:n]`, phones → `[phone:n]`, 2–3 capitalised words within 120 characters after `Ansprechpartner`, `Kontakt`, `Contact`, `Your contact` (case-insensitive) and the 2–3 capitalised words right before an e-mail → `[person:n]`, `linkedin.com/in/<x>` and `xing.com/profile/<x>` paths → `[user:n]`, every `utm_source=<x>` → `utm_source=scrubbed`, every `se=`/`v=`/`adref`/`fc`-style token and every `redact.KEY` match → `[token:n]`; `cli_fixtures.IDENTIFIER_FIELDS: Final[Mapping[str, Mapping[str, FieldRule]]]` per source, keyed by the leaf key of a JSON path, with a `FieldRule` of `keep` (`job_uid`, `htidocid`, `id`, `slug`, `requisition_id`, `internal_job_id`, numeric and UUID ids), `token` (`next_page_token`, `fc`, `se`, `v`, `adref`, `serpapi_pagination.*token*`, `search_metadata.id`, `request_id`: replaced by `[token:n]` whatever their shape), `serpapi_job_id` (base64 JSON: decode, `fc := "scrubbed"`, re-encode, `htidocid` kept) and `jsearch_job_id` (the `<job_uid>:<session blob>` form: the blob becomes `scrubbed`); `cli_fixtures.scrub_document(doc: JSONValue, source: str, p) -> JSONValue` walks the document **with its path** and is field-aware: a string under an identifier field gets its field rule and nothing else; every other string value (free text: titles, descriptions, company names, locations, links) goes through `scrub_text`, whose generic `redact.KEY` pass therefore never touches a rebuilt id; object keys are never rewritten (the wire structure stays); a URL value keeps its path and loses `utm_*`, `se`, `v`, `adref` values as `scrub_text` says; `cli_fixtures.scrub_tree(src: Path, dst: Path) -> ScrubReport` (every `.json`, `.xml` and `.headers.json`; headers keep only the §5.2 allowlist; `.meta.json` is scrubbed too); CLI `jobhunter fixtures scrub <in> <out>`
-  - `scripts/spikes/record_sources.py <spike> --phase N`: reads the keys from `RAPIDAPI_KEY`, `SERPAPI_API_KEY`, `ADZUNA_APP_ID`, `ADZUNA_APP_KEY` (never from a secret file, never printed); its accounting is crash-safe and conservative: the whole invocation holds an exclusive `fcntl.flock` on `.fixtures-raw/budget.lock` (a second invocation fails at once), and `.fixtures-raw/budget.json` (`{provider: {"sent": n, "requests": [{case, phase, state: "sending" | "done", status}]}}`) is rewritten by atomic rename **before** every send with the request counted as `sending`; after the response the entry becomes `done` with its status; a crash or a transport failure leaves it counted. It **refuses** a request when `sent + 1` would exceed `BUDGET = {"jsearch": 8, "serpapi": 1, "adzuna": 5, "arbeitnow": 6, "ats": 12}` and refuses a phase whose entries are already `done`; writes `.fixtures-raw/<source>/<case>.json` (body as received), `<case>.headers.json` (`{"status", "headers"}` allowlisted) and `<case>.meta.json` (URL without query secrets, non-secret params, `fetched_at`); logs every request as one line `source case status units_remaining`
-  - `scripts/spikes/derive_variants.py <scrubbed-dir>`: writes the hand-shaped variants listed in `tests/contract/README.md` from the scrubbed recordings (JSearch `search_v2_empty` (`data: []`, no cursor), `search_v2_429` (status 429, `x-ratelimit-requests-remaining: 0`), `search_v2_drift` (`status` key removed), `search_v2_html` (an HTML body); SerpApi `google_jobs_empty` (`jobs_results` removed, `error` added), `google_jobs_drift`; Adzuna `search_empty`, `search_401`; Arbeitnow `page1_remaining5` (`x-ratelimit-remaining: 5`), `page_truncated` (the body cut mid-array); ATS `*_404`, `lever_eu_<site>` from the global recording, `greenhouse_count_mismatch` (`meta.total + 1`), `personio_entity` (a DTD with an entity, must be refused by defusedxml), `smartrecruiters_list_paged` (the trimmed list with `totalFound = 150`: the pagination rule yields `offset = 100`) and `smartrecruiters_list_offset100` (`offset = 100`, `content: []`, `totalFound = 150`: the end)), trimming Arbeitnow to its first 30 items and Greenhouse/SmartRecruiters to 15/10 items with `meta.total`/`totalFound` adjusted so a trimmed base fixture is structurally complete (ruling (e): the count-mismatch and pagination cases keep their own variants, so trimming never erases those tests; a trim removes whole items and never alters an item, so every identity relationship of the kept items survives). The JSearch variants locate the item array and the cursor through the paths recorded by V9 (`--jsearch-items-path`, `--jsearch-cursor-path`, both written into the README). The Lever full-page rule (exactly 100 items → continue with `skip`) is tested on a synthetic list of 100 minimal objects built in the test, not on a padded fixture
+  - `class cli_fixtures.Pseudonyms`: deterministic per-category counters (`person`, `email`, `phone`, `user`, `token`, `key`), first appearance wins; `cli_fixtures.scrub_text(text: str, p: Pseudonyms) -> str`: e-mails → `[email:n]`, phones (`redact.PHONE` and the parenthesised area-code form `(030) 123456` that the PII scan checks with its own pattern) → `[phone:n]`, 2–3 capitalised words within 120 characters after `Ansprechpartner`, `Kontakt`, `Contact`, `Your contact` (case-insensitive) and the 2–3 capitalised words right before an e-mail → `[person:n]`; every http(s) URL in the text (`cli_fixtures.URL_IN_TEXT: Final[re.Pattern[str]]`) gets the `url` rule below; outside those URLs every `redact.KEY` match → `[token:n]` (the `KEY` pass runs only on non-URL free text, because `KEY` matches the job ids and slugs of real links); `cli_fixtures.IDENTIFIER_FIELDS: Final[Mapping[str, Mapping[str, FieldRule]]]` per source, keyed by the leaf key of a JSON path, with a `FieldRule` of `keep` (`job_uid`, `htidocid`, `id`, `slug`, `requisition_id`, `internal_job_id`, numeric and UUID ids), `url` (the link fields of each source, for example JSearch `job_apply_link`, SerpApi `link` and `share_link`, Adzuna `redirect_url`, Arbeitnow `url`, Greenhouse `absolute_url`, Lever `hostedUrl`: the path is kept, since its job ids and slugs are the §8.4 publisher keys; `linkedin.com/in/<x>` and `xing.com/profile/<x>` paths → `[user:n]`; query values of `utm_*` → `scrubbed`, of `se`, `v`, `adref`, `fc` → `[token:n]`, any other through `scrub_text`), `token` (`next_page_token`, `fc`, `se`, `v`, `adref`, `serpapi_pagination.*token*`, `search_metadata.id`, `request_id`: replaced by `[token:n]` whatever their shape), `serpapi_job_id` (base64 JSON: decode, `fc := "scrubbed"`, re-encode, `htidocid` kept) and `jsearch_job_id` (the `<job_uid>:<session blob>` form: the blob becomes `scrubbed`); `cli_fixtures.valid_url(value: str) -> bool` (an http(s) URL of `canonical_url` shape, without userinfo, whose query values match no `redact.KEY`, e-mail or phone pattern); `cli_fixtures.validate_identifier(source: str, key: str, value: str) -> bool` (the field's own shape check, used by the PII scan: `url` fields by `valid_url`, the others as the note under the scan says); `cli_fixtures.scrub_document(doc: JSONValue, source: str, p) -> JSONValue` walks the document **with its path** and is field-aware: a string under an identifier field gets its field rule and nothing else; every other string value (free text: titles, descriptions, company names, locations, links) goes through `scrub_text`, whose generic `redact.KEY` pass therefore never touches a rebuilt id; object keys are never rewritten (the wire structure stays); a URL value, in a `url` field or in free text, keeps its path and loses its `utm_*`, `se`, `v`, `adref` values by the `url` rule; `cli_fixtures.scrub_tree(src: Path, dst: Path) -> ScrubReport` (every `.json`, `.xml` and `.headers.json` except the recorder's `budget.json` and `budget.lock`, which are never copied; headers keep only the §5.2 allowlist; `.meta.json` is scrubbed too); CLI `jobhunter fixtures scrub <in> <out>`
+  - `scripts/spikes/record_sources.py <source> [--phase N]`: calls M0 `configure_logging` first (it quiets `httpx`/`httpcore`, whose INFO lines carry the query-string keys of Adzuna and SerpApi) and prints only an exception's class, never its text (an `httpx.HTTPStatusError` renders the URL); reads the keys from `RAPIDAPI_KEY`, `SERPAPI_API_KEY`, `ADZUNA_APP_ID`, `ADZUNA_APP_KEY` (never from a secret file, never printed); its accounting is crash-safe and conservative: the whole invocation holds an exclusive `fcntl.flock` on `.fixtures-raw/budget.lock` (a second invocation fails at once), and `.fixtures-raw/budget.json` (`{provider: {"sent": n, "requests": [{case, phase, state: "sending" | "done", status}]}}`) is rewritten by atomic rename **before** every send with the request counted as `sending`; after the response the entry becomes `done` with its status; a crash or a transport failure leaves it counted. It **refuses** a request when `sent + 1` would exceed `BUDGET = {"jsearch": 8, "serpapi": 1, "adzuna": 5, "arbeitnow": 6, "ats": 12}` and refuses a phase whose entries are already `done`; SerpApi `account.json` reads are exempt by name (free: recorded as entries with `"free": true`, never counted in `sent`), so the one SerpApi unit buys the search; writes `.fixtures-raw/<source>/<case>.json` (body as received), `<case>.headers.json` (`{"status", "headers"}` allowlisted) and `<case>.meta.json` (URL without query secrets, non-secret params, `fetched_at`); logs every request as one line `source case status units_remaining`
+  - `scripts/spikes/derive_variants.py <scrubbed-dir>`: writes the hand-shaped variants listed in `tests/contract/README.md` from the scrubbed recordings (JSearch `search_v2_empty` (`data: []`, no cursor), `search_v2_429` (status 429, `x-ratelimit-requests-remaining: 0`), `search_v2_drift` (`status` key removed), `search_v2_html` (an HTML body); SerpApi `google_jobs_empty` (`jobs_results` removed, `error` added), `google_jobs_drift`; Adzuna `search_empty`, `search_401`, `adzuna_reingest_pair` (`search_p1_rpp100` with its last result replaced by a copy of its first under a new `id`, with that id in its `adref` and `redirect_url`: one ad ingested twice, as Adzuna re-ingests do; Ruling P7); Arbeitnow `page1_remaining5` (`x-ratelimit-remaining: 5`), `page_truncated` (the body cut mid-array), `page_end` (`data: []`, no `links.next`: the end of the feed); ATS `*_404`, `lever_eu_<site>` from the global recording, `greenhouse_count_mismatch` (`meta.total + 1`), `personio_entity` (a DTD with an entity, must be refused by defusedxml), `smartrecruiters_list_paged` (the trimmed list with `totalFound = 150`: the pagination rule yields `offset = 100`) and `smartrecruiters_list_offset100` (`offset = 100`, `content: []`, `totalFound = 150`: the end)), trimming Arbeitnow to its first 30 items and Greenhouse/SmartRecruiters to 15/10 items with `meta.total`/`totalFound` adjusted so a trimmed base fixture is structurally complete (ruling (e): the count-mismatch and pagination cases keep their own variants, so trimming never erases those tests; a trim removes whole items and never alters an item, so every identity relationship of the kept items survives). The JSearch variants locate the item array and the cursor through the paths recorded by V9 (`--jsearch-items-path`, `--jsearch-cursor-path`, both written into the README). The Lever full-page rule (exactly 100 items → continue with `skip`) is tested on a synthetic list of 100 minimal objects built in the test, not on a padded fixture
   - `tests/support/sources.py`: `FIXTURES: Final = Path("tests/contract/fixtures")`; `load_fixture(source: str, case: str) -> tuple[int, dict[str, str], bytes]`; `fixture_page(source, case, spec: RequestSpec, *, fetched_at) -> RawPage`; `mock_fixture(respx_mock, method, url_pattern, source, case) -> respx.Route`; `served_requests(log_path: Path) -> list[dict[str, str]]` (the fixture transport's log lines, Task 5)
   - `tests/contract/fixtures/location_labels.tsv`: one row per distinct location string of the scrubbed fixtures (`source`, `string`, `country` (ISO 3166-1 alpha-2, or `-` for remote/country-wide/unknown), `kind` (`city`, `multi`, `country_wide`, `remote`, `unknown`)), labelled by hand while the fixtures are reviewed (step 8): the independent ground truth of V17
-  - `fixtures.ROUTES` for every recorded case the fake worker uses (JSearch page 1 / page 2 by `cursor` / today by `date_posted` / legacy 404; SerpApi `account.json` and `search.json`; Adzuna page 1 (`search_p1_rpp100`) and page ≥ 2 (`search_empty`); Arbeitnow `page=1`, `page=2`; the six ATS boards by host and slug, unknown slugs → `*_404`)
+  - `fixtures.ROUTES` for every recorded case the fake worker uses (JSearch page 1 / page 2 by `cursor` / today by `date_posted` / legacy 404; SerpApi `account.json` and `search.json`; Adzuna page 1 (`adzuna_reingest_pair`, so a fixture run sees one re-ingested ad) and page ≥ 2 (`search_empty`); Arbeitnow `page=1`, `page=2`, page ≥ 3 (`page_end`); the six ATS boards by host and slug, unknown slugs → `*_404`)
   - The spike records `docs/spikes/V<n>.md` in the `V1.md` form (Assumption, Method, Observed result, Decision)
 
 - [ ] **Step 1: Write the failing tests**
@@ -793,6 +800,9 @@ def test_identifier_fields_are_scrubbed_by_name_not_by_shape() -> None:
     out = scrub_document(doc, "serpapi", Pseudonyms())
     assert out["search_metadata"]["id"].startswith("[token:") and out["serpapi_pagination"]["next_page_token"].startswith("[token:")
     assert "[token:" in out["jobs_results"][0]["title"] and set(out) == set(doc)  # keys untouched, free text scrubbed
+    link = "https://www.stepstone.de/stellenangebote--senior-python-entwickler-berlin-acme-gmbh--14607704-inline.html?utm_source=x"
+    kept = scrub_document({"data": [{"job_apply_link": link}]}, "jsearch", Pseudonyms())["data"][0]["job_apply_link"]
+    assert KEY.search(link) and kept == link.replace("utm_source=x", "utm_source=scrubbed")  # a link keeps its key-shaped path: the publisher key survives
 def test_serpapi_and_jsearch_ids_keep_the_htidocid() -> None:
     job_id = base64.b64encode(json.dumps({"htidocid": "UMsYA14AEpQuse3eAAAAAA==", "fc": "SECRETSESSION"}).encode()).decode()
     doc = scrub_document({"jobs_results": [{"job_id": job_id}]}, "serpapi", Pseudonyms())
@@ -807,11 +817,14 @@ def test_serpapi_and_jsearch_ids_keep_the_htidocid() -> None:
 import json, os, re
 from pathlib import Path
 import pytest
-from jobhunter.cli_fixtures import IDENTIFIER_FIELDS, validate_identifier   # validate_identifier(source, key, value) -> bool: the field's own shape check
+from jobhunter.cli_fixtures import IDENTIFIER_FIELDS, URL_IN_TEXT, valid_url, validate_identifier   # validate_identifier(source, key, value) -> bool: the field's own shape check
 from jobhunter.observability.redact import EMAIL, KEY, PHONE
 ROOT = Path("tests/contract/fixtures")
 FILES = sorted(p for p in ROOT.rglob("*") if p.suffix in (".json", ".xml", ".tsv"))   # bodies, headers, meta and the label file
 UTM = re.compile(r"utm_source=([^&\"'\\s]+)")
+PHONE_DE = re.compile(r"\(0\d{2,5}\)\s?(?:\d{4,}|\d{2,}(?:[ /\-]\d{2,})+)(?:[ /\-]\d{2,})*(?!\w)")   # the scan's own pattern: "(030) 123456", which redact.PHONE misses
+def outside_links(text: str) -> str:   # a valid link keeps its key-shaped path (publisher keys): KEY is checked on everything else
+    return URL_IN_TEXT.sub(lambda m: "" if valid_url(m.group(0)) else m.group(0), text)
 SECRET_VARS = ("RAPIDAPI_KEY", "SERPAPI_API_KEY", "ADZUNA_APP_ID", "ADZUNA_APP_KEY")
 def strings(doc, path=()):   # every (path, string value) of a JSON document
     if isinstance(doc, str): yield path, doc
@@ -823,31 +836,31 @@ def strings(doc, path=()):   # every (path, string value) of a JSON document
 def test_fixture_has_no_pii_secret_or_key_shaped_value(path) -> None:
     text, source = path.read_text(encoding="utf-8"), path.relative_to(ROOT).parts[0]
     assert not EMAIL.search(text), "an e-mail address survived the scrub"
-    assert not PHONE.search(text), "a phone number survived the scrub"
+    assert not PHONE.search(text) and not PHONE_DE.search(text), "a phone number survived the scrub"
     assert {m.group(1) for m in UTM.finditer(text)} <= {"scrubbed"}
     for var in SECRET_VARS:   # the real keys of this machine, when present: never echoed in the message
         value = os.environ.get(var, "")
         assert len(value) < 8 or value not in text, f"the value of {var} is in the fixture"
     if path.suffix != ".json":
-        assert not KEY.search(text), "a key-shaped value in a non-JSON fixture"; return
+        assert not KEY.search(outside_links(text)), "a key-shaped value in a non-JSON fixture"; return
     doc = json.loads(text)
     if path.name.endswith(".headers.json"):
         assert set(doc) == {"status", "headers"} and not {k.lower() for k in doc["headers"]} & {"set-cookie", "authorization", "x-rapidapi-key", "cookie"}
-    strict = [(p, v) for p, v in strings(doc) if KEY.search(v)]   # a key-shaped value is allowed only as a validated identifier field
+    strict = [(p, v) for p, v in strings(doc) if KEY.search(outside_links(v))]   # a key-shaped value is allowed only in a valid link or a validated identifier field
     offending = [(p, v[:12] + "…") for p, v in strict if not (p and str(p[-1]) in IDENTIFIER_FIELDS.get(source, {}) and validate_identifier(source, str(p[-1]), v))]
     assert not offending, f"key-shaped values outside the identifier allowlist: {[p for p, _ in offending]}"
 def test_fixture_tree_is_not_empty() -> None:
     assert len(FILES) >= 30 and (ROOT / "jsearch/search_v2_page1.json").exists() and (ROOT / "location_labels.tsv").exists()
 ```
 
-(`validate_identifier` is strict per field: a SerpApi `job_id` must base64-decode to a JSON object whose `fc` is `scrubbed`; a JSearch `job_id` must decode to `<24-character htidocid>:scrubbed`; a `[token:n]` placeholder validates for the `token` fields; a `keep` field validates only when its value matches that field's shape (`htidocid`: 24 base64 characters, which the 40-character `KEY` floor never matches anyway). Everything else that `KEY` matches — a 48-character hexadecimal string in a description included — fails the scan.)
+(`validate_identifier` is strict per field: a SerpApi `job_id` must base64-decode to a JSON object whose `fc` is `scrubbed`; a JSearch `job_id` must decode to `<24-character htidocid>:scrubbed`; a `[token:n]` placeholder validates for the `token` fields; a `keep` field validates only when its value matches that field's shape (`htidocid`: 24 base64 characters, which the 40-character `KEY` floor never matches anyway); a `url` field and a URL inside free text validate by `valid_url`, so a key in a query value still fails. Everything else that `KEY` matches — a 48-character hexadecimal string in a description included — fails the scan.)
 
 ```python
 # tests/contract/test_v17_gazetteer_coverage.py
 import csv
 from pathlib import Path
-from jobhunter.sources.parsing.locations import parse_jsearch_location, parse_location_text
-def labelled() -> list[tuple[str, str, str, object]]: ...  # (source, string, country, kind) of location_labels.tsv, each parsed with the matching parser (JSearch strings through parse_jsearch_location)
+from jobhunter.sources.parsing.locations import ParsedLocations, parse_jsearch_location, parse_location_text
+def labelled() -> list[tuple[str, str, str, str, ParsedLocations]]: ...  # (source, string, country, kind, parsed) per row of location_labels.tsv, parsed with the matching parser (JSearch strings through parse_jsearch_location)
 def test_labels_cover_every_fixture_location_string() -> None:
     ...  # every distinct location string found in the scrubbed fixtures has a row in location_labels.tsv (the label file cannot go stale)
 def test_v17_coverage_thresholds_against_hand_labels() -> None:
@@ -856,7 +869,8 @@ def test_v17_coverage_thresholds_against_hand_labels() -> None:
     resolved = [s for s, p in german if p.kind in ("city", "multi") and all(l.resolution != "unresolved" for l in p.locations)]
     assert len(german) >= 40 and len(resolved) / len(german) >= 0.95
     assert not [s for _, s, country, _, p in rows if country == "DE" and p.positively_non_de]        # no German location is ever "positively outside"
-    assert not [s for _, s, country, _, p in rows if country not in ("DE", "-") and not p.positively_non_de and all(c.country_code == "DE" for l in p.locations for c in l.candidates) and p.locations]  # a foreign city resolved as only-German is a false German
+    assert not [s for _, s, country, _, p in rows if country not in ("DE", "-") and not p.positively_non_de and p.locations
+                and all(l.candidates for l in p.locations) and all(c.country_code == "DE" for l in p.locations for c in l.candidates)]  # a foreign city resolved as only-German is a false German; an unresolved one passes (§8.12)
     assert all(p.kind == kind for _, _, _, kind, p in rows if kind in ("remote", "country_wide"))
 ```
 
@@ -880,8 +894,8 @@ Each phase refuses to run twice; the budget file is the hard stop. Record the ob
 4. **SerpApi, V3 (1 search):** `record_sources.py serpapi`: `account.json` (free) → `account_before`; one `search.json?engine=google_jobs&q=software engineer Berlin&gl=de&hl=en` → `google_jobs_hl_en`; `account.json` → `account_after`. Stop at 1 search. Acceptance: `detected_extensions` present on the results and ≥ 3 `htidocid` identical with `search_v2_page1`; then `SERPAPI_HL = "en"`, otherwise `"de"` (and the fixture is still the contract fixture).
 5. **Adzuna, V18 (4 requests, 5 allowed):** `record_sources.py adzuna`: (1) `what=software engineer`, `where=Berlin`, `results_per_page=100`, `sort_by=date` → `search_p1_rpp100`; (2) `results_per_page=50`, `max_days_old=1` → `search_p1_days1`; (3) `distance=10` → `search_p1_distance10`; (4) `distance=50` → `search_p1_distance50`. Stop at 4; the 5th only repeats a request that failed in transport. Acceptance: (1) returns exactly 50 results; every `created` of (2) is within 2 days of `fetched_at`; `count` of (4) ≥ `count` of (3).
 6. **Arbeitnow, V8 (6 requests over 2 h):** `record_sources.py arbeitnow --phase k` for `k` = 1…6 at 0, 20, 40, 60, 90 and 120 min: phase 1 is `page=1` → `page1`; phase 2 is `page=2` → `page2`; phases 3–6 are `page=1` with headers only. Stop at 6. Acceptance: the sequence of `x-ratelimit-remaining` determines the window (a reset within the 2 h gives its length; none means ≥ 2 h); the page cap of §5.3.4 keeps a 7-day catch-up (`min(10, max(3, ceil(168 / 30) + 1)) = 7` pages) within the limit, otherwise the cap formula's upper bound is lowered and recorded in `V8.md`.
-7. **ATS boards (≤ 10 requests, free):** `record_sources.py ats`: Greenhouse `getyourguide` and a nonexistent slug (404); Lever `leverdemo` (global) and `api.eu.lever.co/v0/postings/leverdemo` (expected 404; a working EU site may be substituted when one is known); Ashby `n8n`; Personio `everphone`; Recruitee `bunq`; SmartRecruiters `DeliveryHero` list (`limit=100&offset=0`) plus the detail of its first two postings. Stop after the list.
-8. Scrub: `uv run jobhunter fixtures scrub .fixtures-raw tests/contract/fixtures`, then `uv run python scripts/spikes/derive_variants.py tests/contract/fixtures --jsearch-items-path <from V9> --jsearch-cursor-path <from V9>`, then fill `fixtures.ROUTES` and `tests/contract/README.md`: one row per file with its provenance (`recorded <spike> <date>` or `derived from <file>: <exact change>`), the trims (which items were dropped, which totals were adjusted) and the JSearch paths (ruling (e)). Review every scrubbed file by hand against the PR checklist (names near contact words, signatures, phone numbers in free text) before the commit; while reviewing, write `location_labels.tsv` by hand for every distinct location string; the raw directory is never added.
+7. **ATS boards (10 requests, free):** `record_sources.py ats`, one case file each: Greenhouse `getyourguide` → `greenhouse_getyourguide` and a nonexistent slug → `greenhouse_404`; Lever `leverdemo` (global) → `lever_leverdemo` and `api.eu.lever.co/v0/postings/leverdemo` → `lever_eu_404` (expected 404; a working EU site may be substituted when one is known, as `lever_eu_<site>`); Ashby `n8n` → `ashby_n8n`; Personio `everphone` → `personio_everphone`; Recruitee `bunq` → `recruitee_bunq`; SmartRecruiters `DeliveryHero` list (`limit=100&offset=0`) → `smartrecruiters_deliveryhero_list`, then the detail of its first two postings → `smartrecruiters_deliveryhero_detail_1`, `smartrecruiters_deliveryhero_detail_2`. Stop after the second detail call.
+8. Scrub: `uv run jobhunter fixtures scrub .fixtures-raw tests/contract/fixtures`, then `uv run python scripts/spikes/derive_variants.py tests/contract/fixtures --jsearch-items-path <from V9> --jsearch-cursor-path <from V9>`, then fill `fixtures.ROUTES` and `tests/contract/README.md`: one row per file with its provenance (`recorded <spike> <date>` or `derived from <file>: <exact change>`), its item count and the number of items its adapter rejects (`Rejected`, read by the Task 11 contract counts and the Task 25 end-to-end status), the trims (which items were dropped, which totals were adjusted) and the JSearch paths (ruling (e)). Review every scrubbed file by hand against the PR checklist (recruiter and contact names near contact words, signatures, phone numbers in free text) before the commit, and record the review in the task's report (every file reviewed, each name or number found and how the scrubber was fixed for it); while reviewing, write `location_labels.tsv` by hand for every distinct location string; the raw directory is never added.
 9. V17: run `tests/contract/test_v17_gazetteer_coverage.py` and record the ratios in `docs/spikes/V17.md` (resolved among hand-labelled German city strings, false-German and false-foreign counts); a ratio below 95% is fixed in the gazetteer build (missing variants) or the parser, never by relaxing the threshold or editing a label to fit the parser.
 
 - [ ] **Step 5: Run the tests to verify they pass**
@@ -913,7 +927,7 @@ git commit -m "feat(m1): fixture scrubber and PII scan, budgeted source recorder
   - `windows.WindowChange = Insert(window) | Close(window, reason)`; `windows.limit_for(provider, settings) -> int` (200 / 250 / `adzuna_cap_month`); `windows.reserve_for(provider, limit, settings) -> int` (`ceil(reserve_frac × limit)`; Adzuna `cap_month − int(0.9 × cap_month)`); `windows.bootstrap_window(provider, now, settings, *, account: AccountObservation | None) -> Window | None` (§6.3 bootstrap; `tokens = capacity` needs `interval_s`, so bootstrap takes `interval_s` too); `windows.roll_forward(w, provider, now, settings, *, interval_s, account=None) -> tuple[Window | None, list[WindowChange]]` (pure; closes `rolled_over` across long downtime)
   - `@dataclass(frozen=True) class pacing.PlannedSpec: request_class: Literal["normal", "retry", "probe"]` (what the planner and the dry-run hand to `project_allowance`); `pacing.fair_share(w: Window, interval_s: int) -> float`; `pacing.capacity(w, interval_s) -> Decimal`; `pacing.accrue(w, now, *, interval_s) -> None`; `pacing.effective_reserve(w, now) -> int`; `pacing.per_run_cap(settings, fair_share: float) -> int`; `pacing.DenyCode = Literal["paced", "reserve_held", "exhausted", "window_cap", "awaiting_window_validation"]`; `@dataclass(frozen=True) class pacing.Admit: request_class; tokens_used: int; starts_probe: bool`; `@dataclass(frozen=True) class pacing.Deny: code: DenyCode`; `pacing.decide(w, *, provider, request_class, units, used, run_normal_count, hour_ok, adzuna_ok, now, per_run_cap) -> Admit | Deny` (the §6.7 function verbatim in its order)
   - `@dataclass(frozen=True) class windows.ObservationEffects: adjustment_units: int; alerts: tuple[Literal["quota.limit_increased", "quota.unaccounted_usage"], ...]; reattribute: bool`; `windows.apply_observation_pure(w, obs: Observation, settings, *, provider, used_units: int) -> tuple[Window, list[WindowChange], ObservationEffects]` (§6.3 steps 0–4 in order; a 429 never validates)
-  - `async def windows.current_window_locked(conn, provider, now, settings, *, interval_s, account=None) -> Window | None` (`FOR UPDATE`, then `roll_forward` persisted: closes and inserts); `async def windows.current_snapshot(conn, provider) -> Window | None` (plain `SELECT`); `async def windows.save_window(conn, w) -> None`; `async def windows.apply_changes(conn, changes) -> None`
+  - `async def windows.current_window_locked(conn, provider, now, settings, *, interval_s, account=None) -> Window | None` (`FOR UPDATE`, then `roll_forward` persisted: closes and inserts); `async def windows.current_snapshot(conn, provider) -> Window | None` (plain `SELECT`); `async def windows.save_window(conn, w) -> None` (one `UPDATE … WHERE provider = :p AND window_start = :s`; a `state` change must be an edge of `TRANSITIONS["quota_windows"]` (Task 1, §7.16.8), checked before the statement (`ValueError`) and again by the `quota_windows_assert_transition` trigger, and a closed window's state never changes); `async def windows.apply_changes(conn, changes) -> None`
   - Metrics `metrics.QUOTA_USED_UNITS` and `metrics.QUOTA_REMAINING_UNITS` (gauges, label `provider`), set by Task 8's `settle` and `reserve`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1033,8 +1047,8 @@ git commit -m "feat(m1): quota windows, bootstrap and rollover, ordered observat
 ### Task 8: Quota ledger: reservation, dispatch marker, settlement, recovery, the hard caps, projections, fallback eligibility and dry-run projections
 
 **Files:**
-- Create: `backend/src/jobhunter/quota/ledger.py`, `quota/fallback.py`, `quota/dryrun.py`, `tests/support/quota.py` (extend)
-- Modify: `backend/src/jobhunter/observability/health.py` (`quota` field of `SystemHealthOut`), `backend/src/jobhunter/worker/main.py` (`jobhunter.quota.ledger` in `_REGISTERING_MODULES`)
+- Create: `backend/src/jobhunter/quota/ledger.py`, `quota/fallback.py`, `quota/dryrun.py`, `tests/support/collect.py`
+- Modify: `backend/src/jobhunter/quota/windows.py` (`note_probe_outcome`), `tests/support/quota.py`, `backend/src/jobhunter/observability/health.py` (`quota` field of `SystemHealthOut`), `backend/src/jobhunter/worker/main.py` (`jobhunter.quota.ledger` in `_REGISTERING_MODULES`), `tests/conftest.py` (`pytest_plugins` gains `tests.support.collect`), `frontend/src/api/schema.d.ts` (regenerated: the health response changed, Ruling P8)
 - Test: `tests/integration/test_quota_ledger.py`, `tests/integration/test_quota_concurrency.py`, `tests/property/test_quota_property.py`, `tests/unit/test_fallback.py`, `tests/unit/test_dryrun.py`, `tests/integration/test_system_health_quota.py`
 
 **Interfaces:**
@@ -1045,12 +1059,12 @@ git commit -m "feat(m1): quota windows, bootstrap and rollover, ordered observat
   - `async def ledger.lock_run_owner(conn, owner: RunOwner) -> None` (`SELECT 1 FROM runs WHERE id = :run AND attempt_no = :attempt AND status = 'running' FOR SHARE`, else `FencedOut("run")`; also refuses while a `global` purge fence is active)
   - `async def ledger.reserve(conn, provider, *, owner: RunOwner, request_key: bytes, attempt_seq: int, request_class, fetch_request_id: int, settings: QuotaSettings, interval_s: int, now: datetime, account: AccountObservation | None = None, units: int = 1) -> Reservation | Denial` (§6.7 `reserve` verbatim in its order: owner lock, window lock and roll-forward, accrual, `decide` with `serpapi_hour_ok` / `adzuna_windows_ok`, the `reserved` row, the window saved; a `Deny` persists the accrual only)
   - `async def ledger.mark_dispatched(conn, entry_id: int, owner: RunOwner) -> None` (owner lock, `transition(quota_ledger, reserved→dispatched)`; `TransitionConflict` → `FencedOut`)
-  - `async def ledger.settle(conn, entry_id: int, *, state: Literal["billed", "not_billed", "ambiguous"], evidence: str | None, http_status: int | None, provider_remaining: int | None, observation: Observation | None, settings, now) -> None` (`dispatched → state`; `apply_observation_pure` on the locked current window, changes applied, the entry re-attributed when `reattribute`, the effect alerts raised with subject `provider:<p>`; a `probe` entry's outcome goes through `windows.note_probe_outcome` below; a JSearch 429 raises `quota.exhausted` warn, resolved by a later validated observation with `remaining > 0`)
+  - `async def ledger.settle(conn, entry_id: int, *, state: Literal["billed", "not_billed", "ambiguous"], evidence: str | None, http_status: int | None, provider_remaining: int | None, observation: Observation | None, settings, now) -> None` (`dispatched → state`; `apply_observation_pure` on the locked current window, changes applied, the entry re-attributed when `reattribute`, the effect alerts raised with subject `provider:<p>`; a `probe` entry's outcome goes through `windows.note_probe_outcome` below; a JSearch 429 raises `quota.exhausted` warn, resolved by a later validated observation with `remaining > 0`; a settlement `ambiguous` raises `quota.ambiguous_attempt` warn, subject `provider:<p>`)
   - `windows.note_probe_outcome(w: Window, outcome: Literal["validated", "failed", "never_sent"], *, now) -> None` (pure, the one place that touches the probe columns after a reservation: `validated` → `probe_used = probe_failed = False, next_probe_at = None` (the observation's step 1 did it already when the reset was seen); `failed` (a probe settled `ambiguous` or with a non-2xx status, or recovered as ambiguous) → `probe_failed = True, next_probe_at = now + PROBE_RETRY`; `never_sent` (a probe reservation released as `never_dispatched`) → `probe_used = False, next_probe_at = None`, so the next request starts a fresh probe instead of waiting 12 h for one that never happened)
   - `@dataclass(frozen=True) class ledger.LedgerAttempt: entry_id: int; attempt_seq: int; state: str; fetch_request_id: int | None; run_id: int | None; run_attempt_no: int | None; dispatched: bool`; `async def ledger.latest_attempt(conn, provider, request_key: bytes) -> LedgerAttempt | None`
-  - The two recovery writes, **centralised and under the window lock** (every caller — the replay branch of `acquire_page`, the shutdown path and the reconciler — uses them, nothing else writes these transitions): `async def ledger.release_never_dispatched(conn, entry_id: int, *, now) -> bool` (locks the entry's window `FOR UPDATE` (the window of its `window_start`, current or closed), `reserved → not_billed('never_dispatched')`, and for a `probe` entry `note_probe_outcome(w, "never_sent")`, window saved) and `async def ledger.mark_ambiguous(conn, entry_id, *, now) -> bool` (the same lock, `dispatched → ambiguous`, for a `probe` entry `note_probe_outcome(w, "failed")`); `async def ledger.used_units(conn, provider, window_start) -> int`; `async def ledger.normal_count_for_run(conn, provider, run_id: int) -> int` (normal-class counted entries of the run, across its attempts)
-  - `async def ledger.serpapi_hour_ok(conn, w: Window, now, units, settings, *, local_recent: int) -> bool` and `async def ledger.detect_foreign_usage(conn, w, account: AccountObservation, now) -> int` (§6.5: `foreign = this_hour − local attempts reserved in the 60 min before observed_at`; `> 1` raises `quota.serpapi_foreign_usage` warn and sets `conservative_until = now + 24 h`); `async def ledger.adzuna_windows_ok(conn, now, units, settings) -> bool` (the four rolling counts of §6.5 over `created_at`, `COUNTED` states)
-  - `async def ledger.project_allowance(conn, provider, specs: Sequence[PlannedSpec], now, settings, *, interval_s, account=None) -> list[Admit | Deny]` (§6.7, pure on a snapshot; `PlannedSpec(request_class)` is in `quota/pacing.py`)
+  - The two recovery writes, **centralised and under the window lock** (every caller — the replay branch of `acquire_page`, the shutdown path and the reconciler — uses them, nothing else writes these transitions): `async def ledger.release_never_dispatched(conn, entry_id: int, *, now) -> bool` (locks the entry's window `FOR UPDATE` (the window of its `window_start`, current or closed), `reserved → not_billed('never_dispatched')`, and for a `probe` entry `note_probe_outcome(w, "never_sent")`, window saved) and `async def ledger.mark_ambiguous(conn, entry_id, *, now) -> bool` (the same lock, `dispatched → ambiguous`, for a `probe` entry `note_probe_outcome(w, "failed")`, and `quota.ambiguous_attempt` warn, subject `provider:<p>`, as `settle` raises it); `async def ledger.used_units(conn, provider, window_start) -> int`; `async def ledger.normal_count_for_run(conn, provider, run_id: int) -> int` (normal-class counted entries of the run, across its attempts)
+  - `ledger.serpapi_hour_admits(*, local_last_hour: int, this_hour: int, local_since_observation: int, hourly_cap: int, conservative: bool, units: int = 1) -> bool` (the §6.5 arithmetic, pure: `hour_used = max(local_last_hour, this_hour + local_since_observation)`, admitted iff `hour_used + units ≤ H`, or `≤ H − 5` in conservative mode); `async def ledger.serpapi_hour_ok(conn, w: Window, now, units, settings, *, local_recent: int) -> bool` (the two local counts read, then `serpapi_hour_admits`) and `async def ledger.detect_foreign_usage(conn, w, account: AccountObservation, now) -> int` (§6.5: `foreign = this_hour − local attempts reserved in the 60 min before observed_at`; `> 1` raises `quota.serpapi_foreign_usage` warn and sets `conservative_until = now + 24 h`); `async def ledger.adzuna_windows_ok(conn, now, units, settings) -> bool` (the four rolling counts of §6.5 over `created_at`, `COUNTED` states)
+  - `async def ledger.project_allowance(conn, provider, specs: Sequence[PlannedSpec], now, settings, *, interval_s, account=None) -> list[Admit | Deny]` (§6.7, pure on a snapshot; `PlannedSpec(request_class)` is in `quota/pacing.py`; the simulation carries `used`, `run_normal` and the tokens only and never sets `probe_used`, as §6.7 writes it: on an unvalidated window every normal spec projects `Admit(probe)`, and the reservation decides which one is the probe)
   - Reconciler `ledger_unsettled` (`async def ledger.reconcile_ledger_unsettled(ctx: ReconcileContext) -> int`, cadence `tick`), one transaction per entry, `fence_epoch(conn, ctx.epoch)` first: `reserved` older than 15 min whose owner predicate no longer holds (`runs` row locked `FOR UPDATE`, then the window) → `release_never_dispatched` and its fetch request `skipped('superseded')`; `dispatched` older than 15 min → `mark_ambiguous` and its fetch request `ambiguous`; returns the count. Recovery therefore never leaves a bootstrap probe "in flight": the window's probe columns are restored with the entry.
   - `fallback.CellOutcome = Literal["served", "paced", "reserve_held", "exhausted", "window_cap", "awaiting_after_failed_probe", "awaiting_probe_in_flight", "ambiguous", "transient", "breaker_open", "auth_failed", "contract_broken", "shutdown", "run_cancelled"]`; `fallback.eligible(outcome: CellOutcome) -> bool` (the §6.6 table)
   - `dryrun.quota_projections(settings: RunSettings, *, jsearch: Window | None, adzuna: Window | None, serpapi: Window | None, cells: int, now) -> tuple[list[Warning], dict[str, JSONValue]]` with `Warning(code, **detail)`: the `jsearch`, `adzuna`, `arbeitnow`, `serpapi_fallback` and `stale_ttl_short` parts of §6.8 (`paid_run_cap_binding`, `paid_refresh_slow`, `coverage_gap_guaranteed`, `adzuna_rotation`, `arbeitnow_coverage_risk`, `stale_ttl_short`); M2 composes `dry_run()` around it (Deviation 10)
@@ -1065,6 +1079,7 @@ import pytest, sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.errors import FencedOut
 from jobhunter.quota import ledger
+from jobhunter.quota.fallback import eligible
 from jobhunter.quota.pacing import PlannedSpec
 from jobhunter.quota.windows import AccountObservation
 from jobhunter.sources.base import Observation
@@ -1136,7 +1151,7 @@ async def test_adzuna_rolling_minute_cap(engine, current_epoch) -> None:
 async def test_project_allowance_writes_nothing(engine) -> None:
     async with engine.connect() as c:  # no window exists; an expired one is also tried
         out = await ledger.project_allowance(c, "jsearch", [PlannedSpec("normal")] * 3, utcnow(), SETTINGS, interval_s=21600)
-    assert [type(d).__name__ for d in out] == ["Admit", "Deny", "Deny"] and out[1].code == "awaiting_window_validation"
+    assert [type(d).__name__ for d in out] == ["Admit"] * 3 and all(d.request_class == "probe" for d in out)   # §6.7: the simulation never sets probe_used
     async with engine.connect() as c: assert (await c.execute(sa.text("SELECT count(*) FROM quota_windows"))).scalar_one() == 0
 ```
 
@@ -1154,6 +1169,11 @@ async def test_eight_concurrent_reservers_never_exceed_the_limit(engine, current
 # observation, a limit decrease, a provider reset observed early or late, a manual run, a crash (reserved never dispatched → never_dispatched after 15 min).
 # invariants after every rule: counted ≤ limit_units in every window; no observation ever lowered counted usage; the Adzuna 60 s / 24 h / 7 d / 30 d
 # counts never exceed their caps; with an hourly schedule and tokens ≥ 1 a normal request is admitted within 1 / (N / window) hours of the last denial.
+# Q-SH1 (§18.1, downgraded by chair decision C2): a second machine over `serpapi_hour_admits` and the §6.5 detection `foreign = this_hour − local
+# attempts in the 60 min before observed_at`, with an in-memory account whose `this_hour` lags the app's own searches by up to 120 s. Under
+# exclusive use, for any admission sequence, the account never exceeds H. With another user's searches injected at random times (seen only
+# through the account): foreign usage > 1 is detected, `quota.serpapi_foreign_usage` is raised, conservative mode starts, and the app's own
+# admissions stop at H − 5 above the latest observation; it never asserts that the account total stays below H.
 ```
 
 ```python
@@ -1168,9 +1188,9 @@ def test_fallback_table(outcome, expected) -> None: assert eligible(outcome) is 
 ```python
 # tests/unit/test_dryrun.py
 def test_projections_with_defaults_and_six_hour_interval() -> None:
-    warnings, proj = quota_projections(settings_6h, jsearch=js_window, adzuna=az_window, serpapi=None, cells=4, now=T0)
-    assert proj["jsearch"] == {"units_per_run": 1.453, "refresh_cadence_days": 0.688, "cells": 4} and proj["arbeitnow"] == {"page_cap": 3, "expected_pages": 1.162}
-    assert [w.code for w in warnings] == [] and quota_projections(settings_6h_40_cells_stale7, ...)[0] has codes {"paid_refresh_slow", "stale_ttl_short"}
+    ... # the seeded settings at a 6 h interval with bootstrapped jsearch and adzuna windows, serpapi None, 4 cells: proj["jsearch"] ==
+    # {"units_per_run": 1.453, "refresh_cadence_days": 0.688, "cells": 4}, proj["arbeitnow"] == {"page_cap": 3, "expected_pages": 1.162} and no warning;
+    # the same with 40 cells and stale_ttl_days 7: the warning codes are exactly {"paid_refresh_slow", "stale_ttl_short"}
 ```
 
 ```python
@@ -1188,18 +1208,18 @@ Expected: FAIL with `ImportError: cannot import name 'ledger' from 'jobhunter.qu
 
 - `reserve` takes `fence_epoch`? No: the run row `FOR SHARE` is the owner predicate (§3.3.3); the epoch fence belongs to epoch-stamping writes only.
 - `settle` raises `quota.limit_increased` (info) and `quota.unaccounted_usage` (warn) from the effects, and inserts the `adjustment` row (`evidence = f"provider_remaining={obs.remaining}"`). It also sets `QUOTA_USED_UNITS` / `QUOTA_REMAINING_UNITS`.
-- `reconcile_ledger_unsettled` fences the epoch, then locks each entry's run row `FOR UPDATE` before deciding, so a stale owner's dispatch marker afterwards finds 0 rows; the window lock comes after the run row (owner → `quota_windows` → ledger rows, §3.3.3). `test_quota_ledger.py` imports `eligible` from `jobhunter.quota.fallback` and `PROBE_RETRY` is re-exported by `ledger`.
-- `tests/support/collect.py` (new in this task; grows later): `async def queued_run(engine, *, include_paid=True) -> RunOwner` (a manual run inserted with `MANUAL_RUN_SQL`, admitted with `runs.start_attempt(…, epoch=1)`); `async def planned_request(engine, owner, *, provider, key, attempt_seq, cell_id=None) -> int` (a `coverage_cells` row for the provider's default instance and a `planned` `fetch_requests` row); `ctx(engine, queue_app, now=None, epoch=1) -> ReconcileContext`.
+- `reconcile_ledger_unsettled` fences the epoch, then locks each entry's run row `FOR UPDATE` before deciding, so a stale owner's dispatch marker afterwards finds 0 rows; the window lock comes after the run row (owner → `quota_windows` → ledger rows, §3.3.3). `PROBE_RETRY` is re-exported by `ledger`.
+- `tests/support/collect.py` (new in this task; grows later; registered in `pytest_plugins`): `async def queued_run(engine, *, include_paid=True) -> RunOwner` (a manual run inserted over `active_config` by an `INSERT` of its own that binds `include_paid`, not `MANUAL_RUN_SQL`, whose literal is `false`; admitted with `runs.start_attempt(…, epoch=1)`); `async def instance_id(conn, source_id: str, instance_key: str = "default") -> int` (instance ids change with every reset, Task 1); `async def planned_request(engine, owner, *, provider, key, attempt_seq, cell_id=None) -> int` (a `coverage_cells` row for the provider's default instance and a `planned` `fetch_requests` row); `ctx(engine, queue_app, now=None, epoch=1) -> ReconcileContext`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `uv run pytest tests/unit tests/property tests/integration -q`
-Expected: PASS
+Run: `uv run pytest tests/unit tests/property tests/integration -q`, then `npm ci --prefix frontend && scripts/check-openapi-drift.sh` (it regenerates `frontend/src/api/schema.d.ts` for the `quota` field and fails on the difference), `git add frontend/src/api/schema.d.ts` and `scripts/check-openapi-drift.sh` again
+Expected: PASS, and the second drift check passes, so CI's drift job stays green from this task on (Ruling P8)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/src/jobhunter tests
+git add backend/src/jobhunter tests frontend/src/api/schema.d.ts
 git commit -m "feat(m1): quota ledger with reservation, dispatch marker, settlement and recovery; SerpApi hourly and Adzuna rolling caps; projections, fallback table, dry-run quota projections, quota health"
 ```
 
@@ -1214,8 +1234,8 @@ git commit -m "feat(m1): quota ledger with reservation, dispatch marker, settlem
 **Interfaces:**
 - Consumes: Tasks 2–6; `fixture_page`, `mock_fixture`.
 - Produces:
-  - `class jsearch.JSearchAdapter`: `__init__(client: httpx.AsyncClient, *, api_key: bytes, instance_id: int)`; `capabilities()` → `Capabilities("jsearch", "paid", 1, "cursor", 10, "day", "full", False, 1, [RateLimit("jsearch", 1.0, 1)])`; `plan(cell)` → one `RequestSpec` page 1 with `params = {"query": f"{q} in {city}, Germany"}` (or `f"{q} remote Germany"` for `remote-de`), `country=de`, `num_pages=1`, `date_posted=<bucket>` (`cell.bucket`), `request_class` from the cell; `fetch` (headers `x-rapidapi-key`, `x-rapidapi-host: jsearch.p.rapidapi.com`, GET `https://jsearch.p.rapidapi.com/search-v2`; the legacy `/search` route is never used); `jsearch.ITEMS_PATH: Final[tuple[str, ...]]` and `jsearch.CURSOR_PATH: Final[tuple[str, ...]]` (the item-array path and the cursor path of the `search-v2` envelope as recorded by V9 and written in `V9.md` and the fixtures README; `jsearch.items_of(doc) -> list[JSONValue]`, `jsearch.cursor_of(doc) -> str | None`); `check_envelope` (a JSON object with `status == "OK"`, a list at `ITEMS_PATH` and, when the cursor key exists, a non-empty string at `CURSOR_PATH`, asserted together; anything else `ContractViolation`); `peek_native_ids` (`job_uid` per item, `None` when missing); `parse` (§5.3.1: `native_id = job_uid`, keys `htidocid:<job_uid>` plus `keys_from_link(job_apply_link)`, `posted_at` from `job_posted_at_timestamp` with `jsearch_precision(job_posted_at)`, `item_ts = posted_at`, full description through the quality gate, `job_is_remote` → `{remote}` structured else all three with source `none`, `job_employment_types` mapped, location from `parse_jsearch_location`, `publisher = job_publisher`, `primary_link = canonical_url(job_apply_link)`); `continuation` (`cursor_of(doc)` present → `(CURSOR, cursor)` whatever the page length, else `(END, None)`); `next_page(spec, cursor)` (page 2 with `cursor`, `page_no + 1`, class `normal`); `settle(outcome)` (2xx `billed`; 404 with `x-rapidapi-proxy-response: true` `("not_billed", "rapidapi_gateway_404")`; a connect error before any byte `("not_billed", "connect_failed_before_send")`; everything else `ambiguous`); `observation(page)` from `x-ratelimit-requests-limit/-remaining/-reset` (`reset_at = fetched_at + reset seconds`); `jsearch.CURSOR_REUSE_TTL: Final[timedelta]` (24 h, 2 h or 0: the longest reuse interval V9 observed); `jsearch.PAGE2_MIN_NEW: Final = 7`
-  - `class serpapi.SerpApiAdapter`: `__init__(client, *, api_key: bytes, instance_id)`; capabilities `("serpapi", "paid", 1, "cursor", 10, "relative", "full", False, 1, [RateLimit("serpapi", 1.0, 1)])`; `plan` → `q = f"{q} {city}"` (`f"{q} Homeoffice Deutschland"` for `remote-de`), `gl=de`, `hl=SERPAPI_HL`, `engine=google_jobs`, never `location` or `uule`; `async account() -> AccountObservation` (`GET https://serpapi.com/account.json`, free, not a ledger entry); `fetch` (`api_key` added at send time only); `check_envelope` (a JSON object with `search_metadata`; `jobs_results` may be absent when `error` says no results, which is an empty page, not a violation); `peek_native_ids` (decoded `htidocid`); `parse` (§5.3.2: primary link = the `apply_options[]` entry whose `title` equals `via` after removing a `via ` prefix, case-insensitively, else the first; no other option is stored; `extensions` and `detected_extensions` through `parse_extensions` with `reference = response_date(headers, fetched_at)`; precision `hour` or `relative_day`; quality gate); `continuation` (`serpapi_pagination.next_page_token`); `settle` (2xx `billed`, connect-before-send `not_billed`, else `ambiguous`); `observation(page)` is `None` (the account read supplies it); `serpapi.SERPAPI_HL: Final[Literal["de", "en"]]` from V3
+  - `class jsearch.JSearchAdapter`: `__init__(client: httpx.AsyncClient, *, api_key: bytes, instance_id: int, clock: Callable[[], datetime])` (the clock is `http.send`'s `now`; every adapter of Tasks 9–11 takes one); `capabilities()` → `Capabilities("jsearch", "paid", 1, "cursor", 10, "day", "full", False, 1, [RateLimit("jsearch", 1.0, 1)])`; `plan(cell)` → one `RequestSpec` page 1 with `params = {"query": f"{q} in {city}, Germany"}` (or `f"{q} remote Germany"` for `remote-de`), `country=de`, `num_pages=1`, `date_posted=<bucket>` (`cell.bucket`), `request_class` from the cell; `fetch` (headers `x-rapidapi-key`, `x-rapidapi-host: jsearch.p.rapidapi.com`, GET `https://jsearch.p.rapidapi.com/search-v2`; the legacy `/search` route is never used); `jsearch.ITEMS_PATH: Final[tuple[str, ...]]` and `jsearch.CURSOR_PATH: Final[tuple[str, ...]]` (the item-array path and the cursor path of the `search-v2` envelope as recorded by V9 and written in `V9.md` and the fixtures README; `jsearch.items_of(doc) -> list[JSONValue]`, `jsearch.cursor_of(doc) -> str | None`); `check_envelope` (a JSON object with `status == "OK"`, a list at `ITEMS_PATH` and, when the cursor key exists, a non-empty string at `CURSOR_PATH`, asserted together; anything else `ContractViolation`); `peek_native_ids` (`job_uid` per item, `None` when missing); `parse` (§5.3.1: `native_id = job_uid`, keys `htidocid:<job_uid>` plus `keys_from_link(job_apply_link)`, `posted_at` from `job_posted_at_timestamp` with `jsearch_precision(job_posted_at)`, `item_ts = posted_at`, full description through the quality gate, `job_is_remote` → `{remote}` structured else all three with source `none`, `job_employment_types` mapped, location from `parse_jsearch_location`, `publisher = job_publisher`, `primary_link = canonical_url(job_apply_link)`); `continuation` (`cursor_of(doc)` present → `(CURSOR, cursor)` whatever the page length, else `(END, None)`); `next_page(spec, cursor)` (page 2 with `cursor`, `page_no + 1`, class `normal`); `settle(outcome)` (2xx `billed`; 404 with `x-rapidapi-proxy-response: true` `("not_billed", "rapidapi_gateway_404")`; a connect error before any byte `("not_billed", "connect_failed_before_send")`; everything else `ambiguous`); `observation(page)` from `x-ratelimit-requests-limit/-remaining/-reset` (`reset_at = fetched_at + reset seconds`); `jsearch.CURSOR_REUSE_TTL: Final[timedelta]` (24 h, 2 h or 0: the longest reuse interval V9 observed; read by the planner's cursor reuse, Task 13); `jsearch.PAGE2_MIN_NEW: Final = 7`
+  - `class serpapi.SerpApiAdapter`: `__init__(client, *, api_key: bytes, instance_id, clock)`; capabilities `("serpapi", "paid", 1, "cursor", 10, "relative", "full", False, 1, [RateLimit("serpapi", 1.0, 1)])`; `plan` → `q = f"{q} {city}"` (`f"{q} Homeoffice Deutschland"` for `remote-de`), `gl=de`, `hl=SERPAPI_HL`, `engine=google_jobs`, never `location` or `uule`; `async account() -> AccountObservation` (`GET https://serpapi.com/account.json`, free, not a ledger entry); `fetch` (`api_key` added at send time only); `check_envelope` (a JSON object with `search_metadata`; `jobs_results` may be absent when `error` says no results, which is an empty page, not a violation); `peek_native_ids` (decoded `htidocid`); `parse` (§5.3.2: primary link = the `apply_options[]` entry whose `title` equals `via` after removing a `via ` prefix, case-insensitively, else the first; no other option is stored; `extensions` and `detected_extensions` through `parse_extensions` with `reference = response_date(headers, fetched_at)`; precision `hour` or `relative_day`; quality gate); `continuation` (`serpapi_pagination.next_page_token`); `settle` (2xx `billed`, connect-before-send `not_billed`, else `ambiguous`); `observation(page)` is `None` (the account read supplies it); `serpapi.SERPAPI_HL: Final[Literal["de", "en"]]` from V3
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1224,11 +1244,13 @@ git commit -m "feat(m1): quota ledger with reservation, dispatch marker, settlem
 import httpx, pytest, respx
 from datetime import UTC, datetime
 from jobhunter.sources.base import ContractViolation, Continuation, Parsed, SourceError
-from jobhunter.sources.jsearch import JSearchAdapter
+from jobhunter.sources.http import HttpOutcome
+from jobhunter.sources.jsearch import JSearchAdapter, cursor_of, items_of
 from tests.support.sources import fixture_page, mock_fixture
+from tests.unit.test_sources_base import SPEC
 pytestmark = pytest.mark.contract
 T = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
-def adapter() -> JSearchAdapter: return JSearchAdapter(httpx.AsyncClient(), api_key=b"k", instance_id=1)
+def adapter() -> JSearchAdapter: return JSearchAdapter(httpx.AsyncClient(), api_key=b"k", instance_id=1, clock=lambda: T)
 def test_page_one_contract() -> None:
     a, page = adapter(), fixture_page("jsearch", "search_v2_page1", SPEC, fetched_at=T)
     a.check_envelope(page); ids = a.peek_native_ids(page); outcomes = a.parse(page)
@@ -1256,15 +1278,26 @@ def test_settlement_rules() -> None:
 async def test_fetch_sends_the_key_as_a_header_only_and_logs_no_key(log_events) -> None:
     route = mock_fixture(respx.mock, "GET", "https://jsearch.p.rapidapi.com/search-v2", "jsearch", "search_v2_page1")
     async with httpx.AsyncClient() as client:
-        a = JSearchAdapter(client, api_key=b"TOPSECRETKEY-abcdefghijklmnopqrstuvwxyz0123456789", instance_id=1)
-        page = await a.fetch(SPEC)
+        a = JSearchAdapter(client, api_key=b"TOPSECRETKEY-abcdefghijklmnopqrstuvwxyz0123456789", instance_id=1, clock=lambda: T)
+        out = await a.fetch(SPEC)
     sent = route.calls.last.request
-    assert sent.headers["x-rapidapi-key"].startswith("TOPSECRET") and "TOPSECRET" not in str(sent.url) and page.status == 200
+    assert sent.headers["x-rapidapi-key"].startswith("TOPSECRET") and "TOPSECRET" not in str(sent.url) and out.page is not None and out.page.status == 200
     assert "TOPSECRET" not in "".join(str(e) for e in log_events()) and "cursor" not in SPEC.to_json()["params"]
 ```
 
 ```python
 # tests/contract/test_serpapi.py
+import httpx, pytest
+from datetime import UTC, datetime
+from jobhunter.normalize.keys import AdKey
+from jobhunter.sources.base import Continuation, Parsed
+from jobhunter.sources.jsearch import JSearchAdapter
+from jobhunter.sources.serpapi import SERPAPI_HL, SerpApiAdapter
+from tests.support.sources import fixture_page
+from tests.unit.test_sources_base import SPEC
+pytestmark = pytest.mark.contract
+T = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
+def adapter() -> SerpApiAdapter: return SerpApiAdapter(httpx.AsyncClient(), api_key=b"k", instance_id=1, clock=lambda: T)
 def test_hl_en_page_contract_and_v3_overlap() -> None:
     a, page = adapter(), fixture_page("serpapi", "google_jobs_hl_en", SPEC, fetched_at=T)
     a.check_envelope(page); outcomes = a.parse(page); ids = a.peek_native_ids(page)
@@ -1272,8 +1305,9 @@ def test_hl_en_page_contract_and_v3_overlap() -> None:
     parsed = [o.normalized for o in outcomes if isinstance(o, Parsed)]
     assert all(p.native_id == uid for p, uid in zip(parsed, ids, strict=False)) and all(p.raw_keys[0] == AdKey("htidocid", p.native_id) for p in parsed)
     via_links = [p.primary_link for p in parsed]; assert all(l is None or "utm_" not in l for l in via_links)
-    jsearch_ids = set(JSearchAdapter(...).peek_native_ids(fixture_page("jsearch", "search_v2_page1", SPEC, fetched_at=T)))
-    assert len(set(ids) & jsearch_ids) >= 3 or SERPAPI_HL == "de"
+    js = JSearchAdapter(httpx.AsyncClient(), api_key=b"k", instance_id=1, clock=lambda: T)
+    jsearch_ids = set(js.peek_native_ids(fixture_page("jsearch", "search_v2_page1", SPEC, fetched_at=T)))
+    assert SERPAPI_HL == ("en" if len(set(ids) & jsearch_ids) >= 3 else "de")   # the V3 decision record (docs/spikes/V3.md): one outcome per recording
 def test_primary_link_is_the_via_option_only() -> None:
     ... # an item whose apply_options list the `via` publisher third: primary_link is that option; no other option appears in raw_keys
 def test_empty_results_are_a_page_not_a_violation_and_account_is_free() -> None:
@@ -1289,7 +1323,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.sources.jse
 
 - [ ] **Step 3: Implement both adapters**
 
-`tests/unit/test_jsearch_plan.py` pins the query strings (`"python developer in Berlin, Germany"`, `"python developer remote Germany"`) and the `date_posted` parameter from the cell's bucket. Item-level failures (a missing `job_uid`, a non-string title) become `Rejected(reason_code="item_contract")`, never a page failure. `ITEMS_PATH`/`CURSOR_PATH` are copied from `V9.md`; `test_empty_page_ends_and_variants_are_contract_failures` passing on `search_v2_empty` proves the variant deriver used the same paths. `test_jsearch.py` imports `cursor_of`, `items_of` from `jobhunter.sources.jsearch`.
+`tests/unit/test_jsearch_plan.py` pins the query strings (`"python developer in Berlin, Germany"`, `"python developer remote Germany"`) and the `date_posted` parameter from the cell's bucket. Item-level failures (a missing `job_uid`, a non-string title) become `Rejected(reason_code="item_contract")`, never a page failure. `ITEMS_PATH`/`CURSOR_PATH` are copied from `V9.md`; `test_empty_page_ends_and_variants_are_contract_failures` passing on `search_v2_empty` proves the variant deriver used the same paths.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1313,14 +1347,25 @@ git commit -m "feat(m1): JSearch and SerpApi adapters on scrubbed fixtures: enve
 **Interfaces:**
 - Consumes: Tasks 2–6.
 - Produces:
-  - `class adzuna.AdzunaAdapter`: `__init__(client, *, app_id: bytes, app_key: bytes, instance_id)`; capabilities `("adzuna", "quota", 1, "page", 50, "ingest", "partial", False, 1, [RateLimit("adzuna", 1.0, 1)])`; `plan(cell)` → page 1 with `results_per_page=50`, `what=<q>`, `where=<city>`, `distance=<radius_km>`, `max_days_old=<cell.max_days_old>`, `sort_by=date` (`remote-de`: `what=<q> remote`, no `where`); `fetch` (`GET https://api.adzuna.com/v1/api/jobs/de/search/{page_no}`, `app_id`/`app_key` added at send time); `check_envelope` (an object with a `results` list and an integer `count`); `peek_native_ids` (`str(id)`); `parse` (§5.3.3: `native_id = id`, key `adzuna:<id>`, `posted_at = created` precision `ingest`, `item_ts = created`, description `partial` through the quality gate, `outbound_url_private = redirect_url`, `primary_link = None`, `raw_keys` never from `redirect_url`, salary from `salary_min`/`salary_max` with `kind = "predicted"` when `salary_is_predicted` is `"1"` else `stated`, currency `EUR` period `year`, coordinates → one `unique` candidate, `contract_time`/`contract_type` → employment, `category.tag` → `source_structured["industry"]` unless `unknown`, `company.display_name`); `continuation` (`END` when the page holds fewer than 50 or `page_no × 50 ≥ count`, else `(CURSOR, str(page_no + 1))`); `next_page(spec, cursor)`; `settle` (every dispatched request `billed` whatever its status; connect-before-send `not_billed`); `observation` is `None`; `adzuna.PAGE_CAP: Final = 3`
-  - `class arbeitnow.ArbeitnowAdapter`: `__init__(client, *, instance_id)`; capabilities `("arbeitnow", "free", 0, "page", 300, "exact", "full", False, 1, [RateLimit("arbeitnow", 0.5, 1)])`; `plan(cell)` → page 1, always (§5.3.4: each run reads page 1 first; the seek legs are planned by the traversal, below); `fetch` (`GET https://www.arbeitnow.com/api/job-board-api?page=N`); `check_envelope` (an object with `data` list, `meta` and `links`); `peek_native_ids` (`slug`); `parse` (§5.3.4: `native_id = slug`, key `arbeitnow:<numeric suffix>`, `created_at` seconds → `exact` and `item_ts`, `remote=true` → `{remote}` structured, description HTML sanitised, `job_types` → employment (`text`), location through `parse_location_text` with `OutOfScope("not_germany")` on positive evidence only); `continuation` (`links.next` present → `(CURSOR, str(page_no + 1))`, else `END`); `remaining_low(page) -> bool` (`x-ratelimit-remaining ≤ 5`); `arbeitnow.PAGE_SIZE: Final = 300`; `arbeitnow.OVERLAP: Final = timedelta(hours=2)`; `arbeitnow.LOW_REMAINING: Final = 5`; `arbeitnow.page_cap(interval_s: int) -> int`; `arbeitnow.seek_page(n_newer: int) -> int`
-  - The pure firehose coverage model, **fresh head first**: `@dataclass(frozen=True) class arbeitnow.Gap: lower: datetime; upper: datetime; status: Literal["open", "closed", "abandoned"]`; `@dataclass(frozen=True) class arbeitnow.FirehoseState: newest_covered_upper: datetime | None; gaps: tuple[Gap, ...]` (derived from the cell's `last_covered_at` and its `coverage_intervals`, never stored separately); `@dataclass(frozen=True) class arbeitnow.Leg: kind: Literal["fresh", "seek"]; gap: Gap | None; start_page: int`; `arbeitnow.plan_legs(state, *, n_newer: Callable[[Gap], int], now, max_ad_age_days) -> list[Leg]` (always `Leg("fresh", None, 1)` first; then one `seek` leg per open gap whose upper bound is newer than `now − max_ad_age_days`, newest first, at `seek_page(n_newer(gap))`); `arbeitnow.step(page_items: Sequence[datetime], leg, state, *, first_item_older_than_target: bool, last_item_newer_than_target: bool) -> Literal["continue", "step_back", "step_forward", "stop"]` (the fresh leg stops once it has passed `newest_covered_upper − OVERLAP`; a seek leg once it has passed `gap.lower`); `arbeitnow.conclude(state, legs: Sequence[tuple[Leg, Sequence[datetime]]], *, pages: int, cap: int, stopped_by: Literal["overlap", "cap", "remaining", "end"], now, max_ad_age_days) -> tuple[FirehoseState, list[Gap]]` (the §5.3.4 rules: a fresh leg that reached the overlap advances `newest_covered_upper` to its newest item; a fresh leg stopped by the cap or the remaining-low rule before the overlap records `[newest_covered_upper, oldest_read)` open; a seek leg that read past `gap.lower` closes the gap; a seek leg cut short closes the gap and opens the remainder `[gap.lower, oldest_read_of_the_leg)` (narrowing is recorded, never silent); a gap whose upper bound is older than `now − max_ad_age_days` is abandoned; every interval `[older, newer)`). Every page of every leg counts against the cap; a seek leg starts only while pages remain, so with a backlog the fresh head is still read every run and the oldest gaps wait or are abandoned and reported (P-AN1)
+  - `class adzuna.AdzunaAdapter`: `__init__(client, *, app_id: bytes, app_key: bytes, instance_id, clock)`; capabilities `("adzuna", "quota", 1, "page", 50, "ingest", "partial", False, 1, [RateLimit("adzuna", 1.0, 1)])`; `plan(cell)` → page 1 with `results_per_page=50`, `what=<q>`, `where=<city>`, `distance=<radius_km>`, `max_days_old=<cell.max_days_old>`, `sort_by=date` (`remote-de`: `what=<q> remote`, no `where`); `fetch` (`GET https://api.adzuna.com/v1/api/jobs/de/search/{page_no}`, `app_id`/`app_key` added at send time); `check_envelope` (an object with a `results` list and an integer `count`); `peek_native_ids` (`str(id)`); `parse` (§5.3.3: `native_id = id`, key `adzuna:<id>`, `posted_at = created` precision `ingest`, `item_ts = created`, description `partial` through the quality gate, `outbound_url_private = redirect_url`, `primary_link = None`, `raw_keys` never from `redirect_url`, salary from `salary_min`/`salary_max` with `kind = "predicted"` when `salary_is_predicted` is `"1"` else `stated`, currency `EUR` period `year`, coordinates → one `unique` candidate, `contract_time`/`contract_type` → employment, `category.tag` → `source_structured["industry"]` unless `unknown`, `company.display_name`); `continuation` (`END` when the page holds fewer than 50 or `page_no × 50 ≥ count`, else `(CURSOR, str(page_no + 1))`); `next_page(spec, cursor)`; `settle` (every dispatched request `billed` whatever its status; connect-before-send `not_billed`); `observation` is `None`; `adzuna.PAGE_CAP: Final = 3`
+  - `class arbeitnow.ArbeitnowAdapter`: `__init__(client, *, instance_id, clock)`; capabilities `("arbeitnow", "free", 0, "page", 300, "exact", "full", False, 1, [RateLimit("arbeitnow", 0.5, 1)])`; `plan(cell)` → page 1, always (§5.3.4: each run reads page 1 first; the seek legs are planned by the traversal, below); `fetch` (`GET https://www.arbeitnow.com/api/job-board-api?page=N`); `check_envelope` (an object with `data` list, `meta` and `links`); `peek_native_ids` (`slug`); `parse` (§5.3.4: `native_id = slug`, key `arbeitnow:<numeric suffix>`, `created_at` seconds → `exact` and `item_ts`, `remote=true` → `{remote}` structured, description HTML sanitised, `job_types` → employment (`text`), location through `parse_location_text` with `OutOfScope("not_germany")` on positive evidence only); `continuation` (`links.next` present → `(CURSOR, str(page_no + 1))`, else `END`); `remaining_low(page) -> bool` (`x-ratelimit-remaining ≤ 5`); `arbeitnow.PAGE_SIZE: Final = 300`; `arbeitnow.OVERLAP: Final = timedelta(hours=2)`; `arbeitnow.LOW_REMAINING: Final = 5`; `arbeitnow.page_cap(interval_s: int) -> int`; `arbeitnow.seek_page(n_newer: int) -> int`
+  - The pure firehose coverage model, **fresh head first**: `@dataclass(frozen=True) class arbeitnow.Gap: lower: datetime; upper: datetime; status: Literal["open", "closed", "abandoned"]`; `@dataclass(frozen=True) class arbeitnow.FirehoseState: newest_covered_upper: datetime | None; gaps: tuple[Gap, ...]` (derived from the cell's `last_covered_at` and its `coverage_intervals`, never stored separately); `@dataclass(frozen=True) class arbeitnow.Leg: kind: Literal["fresh", "seek"]; gap: Gap | None; start_page: int`; `arbeitnow.plan_legs(state, *, n_newer: Mapping[Gap, int], now, max_ad_age_days) -> list[Leg]` (`n_newer` prefetched per open gap by the caller, Task 14; always `Leg("fresh", None, 1)` first; then one `seek` leg per open gap whose upper bound is newer than `now − max_ad_age_days`, newest first, at `seek_page(n_newer[gap])`); `arbeitnow.step(page_items: Sequence[datetime], leg, state, *, first_item_older_than_target: bool, last_item_newer_than_target: bool) -> Literal["continue", "step_back", "step_forward", "stop"]` (the fresh leg stops once it has passed `newest_covered_upper − OVERLAP`, and after page 1 when `newest_covered_upper` is `None`: a never-covered cell claims nothing older, so its first run reads page 1 only and `conclude` sets `newest_covered_upper` to the newest item read, with no gap; a seek leg stops once it has passed `gap.lower`); `arbeitnow.conclude(state, legs: Sequence[tuple[Leg, Sequence[datetime]]], *, pages: int, cap: int, stopped_by: Literal["overlap", "cap", "remaining", "end"], now, max_ad_age_days) -> tuple[FirehoseState, list[Gap]]` (the §5.3.4 rules: a fresh leg that reached the overlap advances `newest_covered_upper` to its newest item; a fresh leg stopped by the cap or the remaining-low rule before the overlap records `[newest_covered_upper, oldest_read)` open; a seek leg that read past `gap.lower` closes the gap; a seek leg cut short closes the gap and opens the remainder `[gap.lower, oldest_read_of_the_leg)` (narrowing is recorded, never silent); a gap whose upper bound is older than `now − max_ad_age_days` is abandoned; every interval `[older, newer)`). Every page of every leg counts against the cap; a seek leg starts only while pages remain, so with a backlog the fresh head is still read every run and the oldest gaps wait or are abandoned and reported (P-AN1)
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/contract/test_adzuna.py
+import httpx, pytest
+from datetime import UTC, datetime
+from jobhunter.normalize.keys import AdKey
+from jobhunter.sources.adzuna import AdzunaAdapter
+from jobhunter.sources.base import Continuation, DuplicateInPage, Parsed, SourceError
+from jobhunter.sources.http import HttpOutcome
+from tests.support.sources import fixture_page
+from tests.unit.test_sources_base import SPEC
+pytestmark = pytest.mark.contract
+T = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
+def adapter() -> AdzunaAdapter: return AdzunaAdapter(httpx.AsyncClient(), app_id=b"i", app_key=b"k", instance_id=1, clock=lambda: T)
 def test_rpp100_is_capped_at_50_and_everything_is_partial() -> None:
     a, page = adapter(), fixture_page("adzuna", "search_p1_rpp100", SPEC, fetched_at=T)
     a.check_envelope(page); out = a.parse(page); parsed = [o.normalized for o in out if isinstance(o, Parsed)]
@@ -1329,7 +1374,7 @@ def test_rpp100_is_capped_at_50_and_everything_is_partial() -> None:
     assert all(p.primary_link is None and p.outbound_url_private is not None and p.raw_keys == (AdKey("adzuna", p.native_id),) for p in parsed)
     assert any(p.salary is not None and p.salary.kind == "predicted" for p in parsed) and all(c.resolution == "unique" for p in parsed for c in p.locations if p.locations)
     assert sum(isinstance(o, DuplicateInPage) for o in out) == 0  # re-ingests have different ids: distinct postings, grouped later (§8.7)
-    assert a.continuation(page) == (Continuation.CURSOR, "2") or a.continuation(page) == (Continuation.END, None)
+    assert page.json()["count"] > 50 and a.continuation(page) == (Continuation.CURSOR, "2")   # the recording holds more than one page (V18)
 def test_settlement_bills_every_status() -> None:
     a = adapter()
     assert a.settle(HttpOutcome(fixture_page("adzuna", "search_401", SPEC, fetched_at=T), None)) == ("billed", None)
@@ -1340,6 +1385,16 @@ def test_plan_params_and_remote_cell() -> None:
 
 ```python
 # tests/contract/test_arbeitnow.py
+import httpx, pytest
+from datetime import UTC, datetime
+from jobhunter.normalize.keys import AdKey
+from jobhunter.sources.arbeitnow import ArbeitnowAdapter
+from jobhunter.sources.base import ContractViolation, Continuation, OutOfScope, Parsed
+from tests.support.sources import fixture_page
+from tests.unit.test_sources_base import SPEC
+pytestmark = pytest.mark.contract
+T = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
+def adapter() -> ArbeitnowAdapter: return ArbeitnowAdapter(httpx.AsyncClient(), instance_id=1, clock=lambda: T)
 def test_page_contract_scope_rule_and_sanitised_html() -> None:
     a, page = adapter(), fixture_page("arbeitnow", "page1", SPEC, fetched_at=T)
     a.check_envelope(page); out = a.parse(page)
@@ -1361,26 +1416,29 @@ def test_caps_and_seek() -> None:
     assert (page_cap(3600), page_cap(21600), page_cap(604800)) == (3, 3, 7) and (seek_page(0), seek_page(299), seek_page(650)) == (1, 1, 2)
 def test_fresh_head_is_always_the_first_leg() -> None:
     state = FirehoseState(newest_covered_upper=T - 2 * H, gaps=(Gap(T - 40 * H, T - 29 * H, "open"),))
-    legs = plan_legs(state, n_newer=lambda g: 900, now=T, max_ad_age_days=30)
+    legs = plan_legs(state, n_newer={state.gaps[0]: 900}, now=T, max_ad_age_days=30)
     assert legs[0] == Leg("fresh", None, 1) and legs[1] == Leg("seek", state.gaps[0], 3)
+def test_never_covered_cell_reads_page_one_only() -> None:
+    ... # newest_covered_upper None: plan_legs gives the fresh leg only; step after its page 1 is "stop"; conclude sets newest_covered_upper
+    # to the newest item read and records no gap (the stop rule a first fixture run relies on: no page 3 request, Tasks 23 and 25)
 def test_stop_at_cap_records_the_gap_and_a_later_seek_closes_it() -> None:
     state = FirehoseState(newest_covered_upper=T - 40 * H, gaps=())
     fresh = Leg("fresh", None, 1); read = [T - n * H for n in range(0, 30)]  # 30 h of items, newest first; the overlap at T-42h was not reached
     state2, gaps = conclude(state, [(fresh, read)], pages=3, cap=3, stopped_by="cap", now=T, max_ad_age_days=30)
     assert gaps == [Gap(lower=T - 40 * H, upper=T - 29 * H, status="open")] and state2.newest_covered_upper == T
-    legs = plan_legs(state2, n_newer=lambda g: 30, now=T + H, max_ad_age_days=30); assert [l.kind for l in legs] == ["fresh", "seek"]
+    legs = plan_legs(state2, n_newer={g: 30 for g in state2.gaps}, now=T + H, max_ad_age_days=30); assert [l.kind for l in legs] == ["fresh", "seek"]
     head = [T + H, T + H / 2]  # the fresh leg reaches the overlap at once
     seek = [T - 29 * H + 5 * H - n * H for n in range(0, 20)]  # reads down past the gap's lower bound
     state3, gaps3 = conclude(state2, [(legs[0], head), (legs[1], seek)], pages=2, cap=3, stopped_by="overlap", now=T + H, max_ad_age_days=30)
     assert [g.status for g in state3.gaps] == ["closed"] and state3.newest_covered_upper == T + H
 def test_seek_cut_short_narrows_the_gap_and_never_drops_it() -> None:
     gap = Gap(T - 40 * H, T - 29 * H, "open"); state = FirehoseState(newest_covered_upper=T, gaps=(gap,))
-    legs = plan_legs(state, n_newer=lambda g: 300, now=T, max_ad_age_days=30)
+    legs = plan_legs(state, n_newer={gap: 300}, now=T, max_ad_age_days=30)
     state2, gaps = conclude(state, [(legs[0], [T]), (legs[1], [T - 29 * H - n * H for n in range(0, 5)])], pages=3, cap=3, stopped_by="cap", now=T, max_ad_age_days=30)
     assert [(g.lower, g.upper, g.status) for g in gaps] == [(gap.lower, gap.upper, "closed"), (gap.lower, T - 33 * H, "open")]
 def test_old_gap_is_abandoned_not_skipped() -> None:
     state = FirehoseState(newest_covered_upper=T, gaps=(Gap(T - 40 * 24 * H, T - 31 * 24 * H, "open"),))
-    legs = plan_legs(state, n_newer=lambda g: 0, now=T, max_ad_age_days=30); assert [l.kind for l in legs] == ["fresh"]
+    legs = plan_legs(state, n_newer={g: 0 for g in state.gaps}, now=T, max_ad_age_days=30); assert [l.kind for l in legs] == ["fresh"]
     _, gaps = conclude(state, [(legs[0], [T])], pages=1, cap=3, stopped_by="overlap", now=T, max_ad_age_days=30)
     assert gaps[0].status == "abandoned"
 ```
@@ -1421,7 +1479,7 @@ git commit -m "feat(m1): Adzuna and Arbeitnow adapters; the firehose coverage mo
 
 **Files:**
 - Create: `backend/src/jobhunter/sources/watchlist_patterns.py`, `sources/watchlist_validate.py`, `sources/ats/__init__.py`, `sources/ats/common.py`, `sources/ats/greenhouse.py`, `sources/ats/lever.py`, `sources/ats/ashby.py`, `sources/ats/personio.py`, `sources/ats/recruitee.py`, `sources/ats/smartrecruiters.py`
-- Modify: `pyproject.toml` (`defusedxml==0.7.1`), `backend/src/jobhunter/worker/main.py` (`jobhunter.sources.watchlist_validate` in `_REGISTERING_MODULES`)
+- Modify: `pyproject.toml` (`defusedxml==0.7.1`), `backend/src/jobhunter/worker/main.py` (`jobhunter.sources.watchlist_validate` in `_REGISTERING_MODULES`), `tests/support/sources.py` (`fake_http`, `adapter_for_fixture`, `parsed_of`)
 - Test: `tests/unit/test_watchlist_patterns.py`, `tests/contract/test_ats.py`, `tests/integration/test_watchlist_validate.py`, `tests/integration/test_board_not_found.py`
 
 **Interfaces:**
@@ -1429,9 +1487,10 @@ git commit -m "feat(m1): Adzuna and Arbeitnow adapters; the firehose coverage mo
 - Produces:
   - `watchlist_patterns.AtsType = Literal["greenhouse", "lever", "ashby", "personio", "recruitee", "smartrecruiters"]`; `watchlist_patterns.SLUG: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")`; `@dataclass(frozen=True) class Detected: ats: AtsType; slug: str; lever_region: Literal["global", "eu"] | None`; `@dataclass(frozen=True) class Unsupported: reason: Literal["workable", "unsupported_pattern", "bad_slug", "not_a_url"]`; `watchlist_patterns.detect(url: str) -> Detected | Unsupported` (the §5.4 table; a trailing slash, a path tail and a query are ignored; the URL is never fetched)
   - `watchlist_patterns.API_HOSTS: Final[Mapping[AtsType, tuple[str, ...]]]` (the fixed hosts of §5.3.5; Personio `{slug}.jobs.personio.de`; Lever `api.lever.co` / `api.eu.lever.co`): the compile-time allowlist of §5.4
-  - `ats/common.py`: `@dataclass(frozen=True) class SnapshotDraft: members: frozenset[str]; member_count: int; complete: bool; incomplete_reason: str | None` (reasons `non_2xx`, `envelope`, `no_end`, `count_mismatch`, `missing_id`); `common.membership(pages: Sequence[RawPage], adapter, *, reached_end: bool) -> SnapshotDraft` (rules 1–5 of §5.3.5); `class common.AtsAdapter` (shared: `board`, `instance_id`, the host from `API_HOSTS`, `capabilities()` with `billing="free"`, `can_close=True`, `max_concurrency=2`, `rate_limits=[ATS_HOST_LIMIT]`, `settle`/`observation` no-ops, `key(posting_id) -> AdKey` via `ats_key`)
-  - One adapter class per ATS with the §5.3.5 request, pagination, identity, posted date, work mode and description rules: `GreenhouseAdapter` (single page; `meta.total` must equal `len(jobs)` else `incomplete(count_mismatch)`; `content` unescaped then sanitised; `requisition_id` and `language` in `source_structured`), `LeverAdapter(region)` (`skip`/`limit=100`, fewer than 100 → `END`; `workplaceType` structured; `country` → `remote_countries` for remote postings; `descriptionPlain + lists + additional`), `AshbyAdapter` (`includeCompensation=true`; `workplaceType`/`isRemote`), `PersonioAdapter` (`defusedxml` over the `workzag-jobs` XML; a DTD or entity → `ContractViolation("xml_entity")`; `seniority`, `employmentType`, `yearsOfExperience`, `occupationCategory` kept in `source_structured`), `RecruiteeAdapter` (`remote`/`hybrid`/`on_site`, `country_code`), `SmartRecruitersAdapter` (`limit=100&offset=`, `END` when `offset + len ≥ totalFound`; `detail_specs(page, known: Mapping[str, tuple[bytes, datetime | None]], *, now) -> list[RequestSpec]` for postings that are new, whose list-item sha256 changed, or whose detail is older than 7 days; a list item positively outside Germany and not remote → `OutOfScope("not_germany")` with no detail; `parse_detail(page) -> ItemOutcome`; detail `RateLimit` `SMARTRECRUITERS_DETAIL`)
-  - `ats.adapter_for(instance: InstanceRow, client) -> AtsAdapter`
+  - `ats/common.py`: `@dataclass(frozen=True) class SnapshotDraft: members: frozenset[str]; member_count: int; complete: bool; incomplete_reason: str | None` (reasons `non_2xx`, `envelope`, `no_end`, `count_mismatch`, `missing_id`); `common.membership(pages: Sequence[RawPage], adapter, *, reached_end: bool) -> SnapshotDraft` (rules 1–5 of §5.3.5); `class common.AtsAdapter` (shared: `board`, `instance_id`, the injected `clock`, the host from `API_HOSTS`, `capabilities()` with `billing="free"`, `can_close=True`, `max_concurrency=2`, `rate_limits=[ATS_HOST_LIMIT]`, `settle`/`observation` no-ops, `key(posting_id) -> AdKey` via `ats_key`)
+  - One adapter class per ATS with the §5.3.5 request, pagination, identity, posted date, work mode and description rules: `GreenhouseAdapter` (single page; `meta.total` must equal `len(jobs)` else `incomplete(count_mismatch)`; `content` unescaped then sanitised; `requisition_id` and `language` in `source_structured`), `LeverAdapter(region)` (`skip`/`limit=100`, fewer than 100 → `END`; `workplaceType` structured; `country` → `remote_countries` for remote postings; `descriptionPlain + lists + additional`), `AshbyAdapter` (`includeCompensation=true`; `workplaceType`/`isRemote`), `PersonioAdapter` (`defusedxml` over the `workzag-jobs` XML; a DTD or entity → `ContractViolation("xml_entity")`; `seniority`, `employmentType`, `yearsOfExperience`, `occupationCategory` kept in `source_structured`), `RecruiteeAdapter` (`remote`/`hybrid`/`on_site`, `country_code`), `SmartRecruitersAdapter` (`limit=100&offset=`, `END` when `offset + len ≥ totalFound`; `list_item_sha256(page: RawPage, index: int) -> bytes` (sha256 of the canonical JSON of list item `index`, the `known` change marker); `detail_specs(page, known: Mapping[str, tuple[bytes, datetime | None]], *, now) -> list[RequestSpec]` for postings that are new, whose list-item sha256 changed, or whose detail is older than 7 days; a list item positively outside Germany and not remote → `OutOfScope("not_germany")` with no detail; `parse_detail(page) -> ItemOutcome`; detail `RateLimit` `SMARTRECRUITERS_DETAIL`)
+  - `ats.adapter_for(instance: InstanceRow, client, *, clock: Callable[[], datetime]) -> AtsAdapter`
+  - `tests/support/sources.py` gains `adapter_for_fixture(ats: AtsType, case: str) -> AtsAdapter` (the adapter of the board the case was recorded from, its slug and Lever region read from the case name, on a client it never uses, clock `utcnow`) and `parsed_of(ats, case) -> list[NormalizedPosting]` (the `Parsed` items of the case's page)
   - `watchlist_validate.validate_company(conn, company_id: int, *, client: httpx.AsyncClient, now) -> Literal["ok", "not_found", "error"]` (one GET of the board's list URL with redirects disabled; `ok` creates the source instance through `instance_for_company`; writes `validation_status` and `validated_at`); the handler `@register_operation_handler("watchlist_validate")` (payload `{"watchlist_company_id": id}`, dedup key `watchlist_validate:<id>`)
 
 - [ ] **Step 1: Write the failing tests**
@@ -1453,8 +1512,17 @@ def test_detection_table(url, expected) -> None: assert detect(url) == expected
 
 ```python
 # tests/contract/test_ats.py
+import pytest
+from datetime import UTC, datetime, timedelta
+from jobhunter.normalize.keys import AdKey
+from jobhunter.sources.ats.common import membership
+from jobhunter.sources.base import ContractViolation, Continuation, Parsed
+from tests.support.sources import adapter_for_fixture, fixture_page, parsed_of
+from tests.unit.test_sources_base import SPEC
+pytestmark = pytest.mark.contract
+T = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
 @pytest.mark.parametrize(("ats", "case", "n", "key_ns"), [("greenhouse", "greenhouse_getyourguide", 15, "ats:greenhouse:getyourguide"), ("lever", "lever_leverdemo", None, "ats:lever:global:leverdemo"),
-    ("ashby", "ashby_n8n", None, "ats:ashby:n8n"), ("personio", "personio_everphone", 8, "ats:personio:everphone"), ("recruitee", "recruitee_bunq", None, "ats:recruitee:bunq")])
+    ("ashby", "ashby_n8n", None, "ats:ashby:n8n"), ("personio", "personio_everphone", None, "ats:personio:everphone"), ("recruitee", "recruitee_bunq", None, "ats:recruitee:bunq")])
 def test_board_contract(ats, case, n, key_ns) -> None:
     a, page = adapter_for_fixture(ats, case), fixture_page("ats", case, SPEC, fetched_at=T)
     a.check_envelope(page); ids = a.peek_native_ids(page); out = a.parse(page)
@@ -1480,15 +1548,48 @@ def test_smartrecruiters_list_and_details() -> None:
     specs = a.detail_specs(page, known, now=T); assert len(specs) == 9 and all(s.operation == "detail" and s.detail_native_id for s in specs)
     stale = {a.peek_native_ids(page)[0]: (a.list_item_sha256(page, 0), T - timedelta(days=8))}; assert len(a.detail_specs(page, stale, now=T)) == 10
     detail = a.parse_detail(fixture_page("ats", "smartrecruiters_deliveryhero_detail_1", SPEC, fetched_at=T)); assert isinstance(detail, Parsed) and len(detail.normalized.description_text) >= 200
+def test_smartrecruiters_pagination_variants() -> None:
+    ... # `smartrecruiters_list_paged` (totalFound 150) → (CURSOR, "100"); `smartrecruiters_list_offset100` (content [], totalFound 150) → END;
+    # membership over both pages with reached_end=True is complete with exactly the paged list's members
+def test_lever_eu_site_and_the_full_page_rule() -> None:
+    ... # `lever_eu_<site>` parses with the key namespace `ats:lever:eu:<site>`; a synthetic list of exactly 100 minimal postings built in the test
+    # → (CURSOR, "100") (continue with `skip=100`); 99 postings → END
 ```
+
+(Each `None` in the `n` column becomes the item count `tests/contract/README.md` records for that case once Task 6 has recorded it, never a guess made before; 15 is the Greenhouse trim.)
 
 ```python
 # tests/integration/test_board_not_found.py
-async def test_board_404_marks_not_found_and_skips_until_half_open(engine, current_epoch) -> None:  # Review Focus 5 (the planning half is Task 13)
-    ... # a watchlist company with an unknown slug and an ATS instance with one active posting; the fixture transport answers 404;
-    # fetching the board through `acquire_page`-less direct `send` + `record_failure("not_found")`: health not_found, `source.not_found` warn open,
-    # available(now) == "blocked", available(now + 6 h) == "half_open"; the posting is still `active` with its availability_changed_at unchanged;
-    # `record_success` later → ok and the alert resolved
+from datetime import timedelta
+import pytest, sqlalchemy as sa
+from jobhunter.clock import utcnow
+from jobhunter.sources import ats, http
+from jobhunter.sources.base import CellPlan
+from jobhunter.sources.breaker import HALF_OPEN_AFTER, available, record_failure, record_success
+from jobhunter.sources.instances import instance_for_company, list_instances
+pytestmark = pytest.mark.integration
+GONE = ("INSERT INTO watchlist_companies (display_name, company_key, ats_type, board_slug, detection, validation_status) "
+        "VALUES ('Gone', 'gone', 'greenhouse', 'gone-to-workday', 'manual', 'ok') RETURNING id")   # a slug the fixture routes answer with greenhouse_404
+OPEN = sa.text("SELECT count(*) FROM alerts WHERE dedup_key = :k AND severity = 'warn' AND resolved_at IS NULL")
+async def instance(engine, iid: int):
+    async with engine.connect() as c: return next(i for i in await list_instances(c) if i.id == iid)
+async def test_board_404_marks_not_found_and_skips_until_half_open(engine, current_epoch, fake_http) -> None:  # Review Focus 5 (planning: Task 13; postings: Task 19)
+    now = utcnow()
+    async with engine.begin() as c: iid = await instance_for_company(c, (await c.execute(sa.text(GONE))).scalar_one())
+    plan = CellPlan(cell_id=0, source_id="greenhouse", instance_id=iid, query_text=None, query_lang=None, location_key=None, location_label=None,
+                    radius_km=None, phase="primary", request_class="free", bucket=None, window=(now, now), max_days_old=None)
+    async with http.make_client("greenhouse") as client:
+        adapter = ats.adapter_for(await instance(engine, iid), client, clock=utcnow)
+        outcome = await adapter.fetch(adapter.plan(plan))   # one GET of the board's list URL, outside acquire_page
+    assert outcome.page is not None and outcome.page.status == 404
+    async with engine.begin() as c: assert await record_failure(c, iid, "not_found", billing="free", now=now) == "not_found"
+    gone, key = await instance(engine, iid), {"k": f"source.not_found:instance:{iid}"}
+    assert available(gone, now) == "blocked" and available(gone, now + HALF_OPEN_AFTER - timedelta(seconds=1)) == "blocked"
+    assert available(gone, now + HALF_OPEN_AFTER) == "half_open"   # one probe after 6 h (its planning: Task 13)
+    async with engine.connect() as c: assert (await c.execute(OPEN, key)).scalar_one() == 1   # `source.not_found` (warn), raised once
+    async with engine.begin() as c: assert await record_success(c, iid, now=now + HALF_OPEN_AFTER) == "ok"   # the half-open probe answered
+    async with engine.connect() as c: assert (await c.execute(OPEN, key)).scalar_one() == 0
+    assert (await instance(engine, iid)).health == "ok"
 ```
 
 ```python
@@ -1498,7 +1599,7 @@ async def test_operation_validates_and_creates_the_instance(engine, current_epoc
     # → validation_status 'ok', validated_at set, a source_instances row (greenhouse, 'getyourguide'); an unknown slug → 'not_found' and no instance; the operation `succeeded` both times
 ```
 
-(`fake_http` is a fixture of `tests/support/sources.py` that calls `http.configure` with a config whose `fake_sources` is true.)
+(`fake_http` is a fixture of `tests/support/sources.py` that calls `http.configure` with a config whose `fake_sources` is true, and on teardown restores the process-wide state it found, so a later `make_client` test is not served by the fixture transport.)
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1527,23 +1628,25 @@ git commit -m "feat(m1): six ATS adapters with snapshot membership, watchlist de
 
 **Files:**
 - Create: `backend/src/jobhunter/sources/receipts.py`, `sources/acquire.py`
-- Modify: `pyproject.toml` (`zstandard==0.25.0`), `tests/support/collect.py`
+- Modify: `pyproject.toml` (`zstandard==0.25.0`), `backend/src/jobhunter/quota/ledger.py` (`record_account`), `backend/src/jobhunter/quota/windows.py` (`apply_account`), `tests/support/collect.py`, `tests/support/sources.py` (`fixture_log` and the adapter fixtures)
 - Test: `tests/integration/test_receipts.py`, `tests/integration/test_acquire.py`
 
 **Interfaces:**
 - Consumes: Tasks 5–11; `RunOwner`, `transition`, `ledger`, `breaker`, `afault_point`, `PausePoint`.
 - Produces:
-  - `receipts.RAW_BODY_TTL: Final = timedelta(days=30)`; `receipts.ERROR_BODY_BYTES: Final = 4096`
+  - `receipts.RAW_BODY_TTL: Final = timedelta(days=30)`; the error-body cap is `http.ERROR_BODY_BYTES` (Task 5), imported, not redefined
   - `async def receipts.insert_fetch_request(conn, *, owner: RunOwner, cell_id: int, source_instance_id: int, phase: Literal["primary", "fallback"], spec: RequestSpec, request_key: bytes, attempt_seq: int, status: Literal["planned", "skipped"], skip_reason: str | None = None) -> int`
   - `@dataclass(frozen=True) class receipts.FetchAttempt: id: int; attempt_seq: int; status: str; raw_response_id: int | None; quota_ledger_id: int | None; run_id: int; run_attempt_no: int; http_status: int | None`; `async def receipts.latest_fetch_attempt(conn, request_key: bytes) -> FetchAttempt | None`
   - `async def receipts.store_response(conn, fetch_request_id: int, page: RawPage, *, source_instance_id: int, ledger_entry_id: int | None, succeeded: bool, items: int | None) -> int` (zstd level 3; the full body for a `succeeded` request, the first `ERROR_BODY_BYTES` for every other outcome whatever the HTTP status, an HTML 200 included; a request that did not succeed stores `item_count = 0` and `parsed_at = fetched_at`, so I1 holds for an unparseable envelope and `parse_normalize` never selects it (Deviation 23); `body_sha256`; a stored unexpired body with the same hash is referenced through `body_ref_id` and its `expires_at` raised to `greatest(expires_at, new.expires_at)`; `expires_at = fetched_at + RAW_BODY_TTL`; returns the row id and sets `fetch_requests.raw_response_id`)
   - `async def receipts.load_response(conn, raw_response_id: int, spec: RequestSpec) -> RawPage` (follows `body_ref_id`; raises `LookupError` for a purged body)
   - `@dataclass class acquire.AcquireContext: engine: AsyncEngine; owner: RunOwner; adapter: SourceAdapter; billing: Billing; provider: Provider | None; settings: RunSettings; clock: Callable[[], datetime]; sleep: Callable[[float], Awaitable[None]]; admission_stopped: Callable[[], bool]` (no cached account: SerpApi's account is read inside the protocol, below)
-  - `async def ledger.record_account(conn, obs: AccountObservation, *, settings, now) -> None` (added to Task 8's module here: the window lock, `windows.apply_account` (bootstrap or refresh of the SerpApi window from the observation), `detect_foreign_usage`; the same code `reserve` runs when it is given `account=`)
+  - `@runtime_checkable class acquire.AccountAdapter(Protocol)`: `async def account(self) -> AccountObservation` (the SerpApi adapter's free read; `acquire_page` and `traverse_cell` narrow `ctx.adapter` with `isinstance(ctx.adapter, AccountAdapter)` before calling it, so `SourceAdapter` stays the §5.1 protocol)
+  - `windows.apply_account(w: Window | None, obs: AccountObservation, settings, *, now) -> tuple[Window | None, list[WindowChange]]` (added to Task 7's module here, pure: bootstraps the SerpApi window from the observation when none is current, otherwise refreshes its observed fields under the step-0 monotonic rule)
+  - `async def ledger.record_account(conn, obs: AccountObservation, *, settings, now) -> None` (added to Task 8's module here: the window lock, `windows.apply_account`, `detect_foreign_usage`; the same code `reserve` runs when it is given `account=`)
   - Results: `@dataclass(frozen=True) class acquire.Served: fetch_request_id: int; page: RawPage; replayed: bool; new_native_ids: int | None`; `Denied(fetch_request_id, skip_reason)`; `Failed(fetch_request_id, error_code: str, http_status: int | None, replayed: bool)`; `Ambiguous(fetch_request_id)`; `acquire.PageResult = Served | Denied | Failed | Ambiguous`
-  - `async def acquire.acquire_page(ctx, spec: RequestSpec, *, cell_id: int, phase: Literal["primary", "fallback"], planned_id: int | None, known_native_ids: Callable[[Sequence[str | None]], Awaitable[int]] | None = None) -> PageResult`: the §6.2 rule-2 order on `latest_fetch_attempt`/`ledger.latest_attempt`: a `succeeded` row is **replayed** from its stored response without HTTP (`Served(replayed=True)`); a settled `failed` row keeps its receipt and applies the §5.2 retry rule — `rate_limited` or a 5xx `transient` *response* earns one `retry`-class attempt (`attempt_seq + 1`) for a paid source and up to three attempts for a free one, any other error code (`contract`, `not_found`, `auth`, `client`) is returned as `Failed(replayed=True)` with no send, no new ledger entry and no second breaker write; a `reserved` row of a superseded owner is released through `ledger.release_never_dispatched` and its request `skipped('superseded')` before `attempt_seq + 1`; a paid `dispatched`/`ambiguous` row becomes `Ambiguous` (`ledger.mark_ambiguous`) and is not re-dispatched; a free or Adzuna one is re-dispatched with `attempt_seq + 1`. Then per attempt: `admission_stopped()` → `skipped('shutdown')`; **SerpApi only**: `account = await adapter.account()` (free HTTP, outside any transaction; a failure or a non-2xx → `Denied("window_cap")`, the request `skipped(window_cap)`, nothing sent: §5.3.2 fails closed); quota providers: `ledger.reserve(…, account=account)` (the observation and its foreign-usage effects are persisted under the window lock *before* `decide`; a `Denial` → `skipped(<code>)`), `fetch_requests planned→reserved`; `afault_point("collect.after_reserve")`; `admission_stopped()` again → `skipped('shutdown')` and `release_never_dispatched`; `ledger.mark_dispatched` and `reserved→dispatched` in one transaction; `afault_point("collect.after_dispatch_marker")`; the rate limiter; `adapter.fetch`; `afault_point("collect.after_response")`; `check_envelope`; `new_native_ids` through `known_native_ids(adapter.peek_native_ids(page))` when given; one settlement transaction: `store_response(succeeded=…)`, `fetch_requests → succeeded | failed(error_code) | ambiguous` with `http_status`, `continuation`, `next_cursor`, `items`, `new_native_ids`, `ledger.settle` with `adapter.settle(outcome)` (billing is classified by the transport outcome and the status alone, never by the envelope: a JSearch HTML 200 is `billed` and `failed('contract')` at once) and `adapter.observation(page)`, `breaker.record_success`/`record_failure`; `afault_point("collect.after_settle")`. Free-source retries sleep through `ctx.sleep` (1 s, 4 s, jitter ±25%, `Retry-After` ≤ 60 s). Every transaction that writes a receipt first holds the run row `FOR SHARE` (`ledger.lock_run_owner`), so a superseded owner is `FencedOut` before any write; the lock order inside is owner → `quota_windows` → ledger row → `fetch_requests`/`raw_responses` → `source_instances`.
-  - `acquire.error_code(err: SourceError) -> str` (`transient`, `rate_limited`, `auth`, `contract`, `not_found`, `client`, `ambiguous`)
-  - `tests/support/collect.py` gains `acquire_ctx(engine, owner, adapter, *, billing, provider, clock=None, sleep=None, stopped=lambda: False) -> AcquireContext`
+  - `async def acquire.acquire_page(ctx, spec: RequestSpec, *, cell_id: int, phase: Literal["primary", "fallback"], planned_id: int | None, known_native_ids: Callable[[Sequence[str | None]], Awaitable[int]] | None = None) -> PageResult`: the §6.2 rule-2 order on `latest_fetch_attempt`/`ledger.latest_attempt`: a `succeeded` row is **replayed** from its stored response without HTTP (`Served(replayed=True)`, logged `page_replayed` with `fetch_request_id`); a settled `failed` row keeps its receipt and applies the §5.2 retry rule — `rate_limited` or a 5xx `transient` *response* earns one `retry`-class attempt (`attempt_seq + 1`) for a paid source and up to three attempts for a free one, any other error code (`contract`, `not_found`, `auth`, `client`) is returned as `Failed(replayed=True)` with no send, no new ledger entry and no second breaker write; a `reserved` row of a superseded owner is released through `ledger.release_never_dispatched` and its request `skipped('superseded')` before `attempt_seq + 1`; a paid `dispatched`/`ambiguous` row becomes `Ambiguous` (`ledger.mark_ambiguous`) and is not re-dispatched; a free or Adzuna one is closed `ambiguous` (its outcome is unknown) and re-dispatched with `attempt_seq + 1`. Then per attempt: `admission_stopped()` → `skipped('shutdown')`; **SerpApi only** (`isinstance(adapter, AccountAdapter)`): `account = await adapter.account()` (free HTTP, outside any transaction; a failure or a non-2xx → `Denied("window_cap")`, the request `skipped(window_cap)`, nothing sent: §5.3.2 fails closed); quota providers: `ledger.reserve(…, account=account)` (the observation and its foreign-usage effects are persisted under the window lock *before* `decide`; a `Denial` → `skipped(<code>)`), `fetch_requests planned→reserved`; `afault_point("collect.after_reserve")`; `admission_stopped()` again → `skipped('shutdown')` and `release_never_dispatched`; `ledger.mark_dispatched` and `reserved→dispatched` in one transaction; `afault_point("collect.after_dispatch_marker")`; the rate limiter; `adapter.fetch`; `afault_point("collect.after_response")`; `check_envelope`; `new_native_ids` through `known_native_ids(adapter.peek_native_ids(page))` when given; one settlement transaction: `store_response(succeeded=…)`, `fetch_requests → succeeded | failed(error_code) | ambiguous` with `http_status`, `continuation`, `next_cursor`, `items`, `new_native_ids`, `ledger.settle` with `adapter.settle(outcome)` (billing is classified by the transport outcome and the status alone, never by the envelope: a JSearch HTML 200 is `billed` and `failed('contract')` at once) and `adapter.observation(page)`, `breaker.record_success`/`record_failure(failure_kind(err))` (no breaker write when `failure_kind` is `None`); `afault_point("collect.after_settle")`. Free-source retries sleep through `ctx.sleep` (1 s, 4 s, jitter ±25%, `Retry-After` ≤ 60 s). Every transaction that writes a receipt first holds the run row `FOR SHARE` (`ledger.lock_run_owner`), so a superseded owner is `FencedOut` before any write; the lock order inside is owner → `quota_windows` → ledger row → `fetch_requests`/`raw_responses` → `source_instances`.
+  - `acquire.error_code(err: SourceError) -> str` (`transient`, `rate_limited`, `auth`, `contract`, `not_found`, `client`, `ambiguous`); `acquire.failure_kind(err: SourceError) -> FailureKind | None` (the breaker kind of an error: the six `FailureKind`s map to themselves; `ambiguous` and `quota_exhausted` → `None`, no breaker write)
+  - `tests/support/collect.py` gains `acquire_ctx(engine, owner, adapter, *, billing, provider, clock=None, sleep=None, stopped=lambda: False) -> AcquireContext`, `jsearch_cell(engine) -> int` (the JSearch default instance's `remote-de` cell for a test query) and `async def page1_spec(engine, cell_id: int) -> RequestSpec` (the cell's JSearch page-1 spec, its instance id read from the cell row)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1560,28 +1663,34 @@ async def test_latest_fetch_attempt_picks_the_highest_attempt_seq(engine, curren
 import httpx, pytest, respx, sqlalchemy as sa
 from jobhunter.errors import FencedOut
 from jobhunter.sources.acquire import Ambiguous, Denied, Failed, Served, acquire_page
+from jobhunter.sources.receipts import load_response
+from jobhunter.worker import runs
+from jobhunter.worker.tasks import defer_in_tx
+from tests.support.collect import acquire_ctx, jsearch_cell, page1_spec, queued_run
 from tests.support.faults import PausePoint
+from tests.support.sources import served_requests
 pytestmark = pytest.mark.integration
+JSEARCH = sa.text("SELECT id, health, consecutive_failures FROM source_instances WHERE source_id = 'jsearch' AND instance_key = 'default'")
 
 async def test_paid_page_reserve_marker_send_settle(engine, current_epoch, jsearch_fixture_adapter) -> None:
     owner, cell = await queued_run(engine), await jsearch_cell(engine)
     ctx = acquire_ctx(engine, owner, jsearch_fixture_adapter, billing="paid", provider="jsearch")
-    r = await acquire_page(ctx, page1_spec(cell), cell_id=cell, phase="primary", planned_id=None)
+    r = await acquire_page(ctx, await page1_spec(engine, cell), cell_id=cell, phase="primary", planned_id=None)
     assert isinstance(r, Served) and not r.replayed and r.page.status == 200
     async with engine.connect() as c:
-        fr = (await c.execute(sa.text("SELECT status, request_class, items, continuation, http_status, raw_response_id, quota_ledger_id FROM fetch_requests WHERE id=:i"), {"i": r.fetch_request_id})).one()
+        fr = (await c.execute(sa.text("SELECT status, items, continuation, http_status, raw_response_id, quota_ledger_id FROM fetch_requests WHERE id=:i"), {"i": r.fetch_request_id})).one()
         led = (await c.execute(sa.text("SELECT state, request_class, http_status FROM quota_ledger WHERE id=:i"), {"i": fr.quota_ledger_id})).one()
         rr = (await c.execute(sa.text("SELECT ledger_entry_id, item_count, http_status FROM raw_responses WHERE id=:i"), {"i": fr.raw_response_id})).one()
-    assert (fr.status, fr.request_class, fr.items, fr.continuation, fr.http_status) == ("succeeded", "probe", 10, "cursor", 200)
+    assert (fr.status, fr.items, fr.continuation, fr.http_status) == ("succeeded", 10, "cursor", 200)   # the reserved class is the ledger row's
     assert tuple(led) == ("billed", "probe", 200) and tuple(rr) == (fr.quota_ledger_id, 10, 200)
 
 async def test_intermediate_states_at_each_fault_point(engine, current_epoch, jsearch_fixture_adapter, monkeypatch) -> None:
     ... # PausePoint at collect.after_reserve: fetch_requests reserved + ledger reserved, no dispatched_at; at collect.after_dispatch_marker: both dispatched;
     # at collect.after_response: no raw_responses row yet; after resume: succeeded/billed. One PausePoint per acquisition, four acquisitions on four keys.
 
-async def test_replay_order_of_rule_two(engine, current_epoch, jsearch_fixture_adapter, respx_mock) -> None:
-    ... # (a) a settled 2xx row for the key → Served(replayed=True) and the respx route has 0 calls;
-    # (b) a `dispatched` paid row of attempt 1 after `begin_new_attempt` → Ambiguous, ledger ambiguous, fetch_requests ambiguous, 0 calls;
+async def test_replay_order_of_rule_two(engine, current_epoch, jsearch_fixture_adapter, fixture_log) -> None:
+    ... # (a) a settled 2xx row for the key → Served(replayed=True) and no new line in served_requests(fixture_log);
+    # (b) a `dispatched` paid row of attempt 1 after `begin_new_attempt` → Ambiguous, ledger ambiguous, fetch_requests ambiguous, no send;
     # (c) a `reserved` row of a superseded owner → released not_billed(never_dispatched), old request skipped(superseded), new row attempt_seq 2 served;
     # (d) a settled 429 row → one `retry`-class attempt_seq 2; a second 429 → Failed(error_code="rate_limited") and no third attempt (paid: ≤ 1 retry)
 
@@ -1589,20 +1698,43 @@ async def test_free_source_retries_and_backoff(engine, current_epoch, arbeitnow_
     ... # 503, 503, 200: three fetch_requests rows (attempt_seq 1..3, class free), sleeps ≈ [1.0, 4.0] (±25%), the third `succeeded`;
     # 429 with Retry-After: 30 → a 30 s sleep; Retry-After: 120 → 60 s; a 404 board → Failed(error_code="not_found") and no retry
 
-async def test_denial_and_shutdown_send_nothing(engine, current_epoch, jsearch_fixture_adapter, respx_mock) -> None:
-    ... # an exhausted window → Denied("exhausted"), 0 calls; admission_stopped() true before the reserve → Denied("shutdown"), no ledger row
+async def test_denial_and_shutdown_send_nothing(engine, current_epoch, jsearch_fixture_adapter, fixture_log) -> None:
+    ... # an exhausted window → Denied("exhausted"), served_requests(fixture_log) empty; admission_stopped() true before the reserve → Denied("shutdown"), no ledger row
 
-async def test_stale_owner_dispatch_marker_is_fenced(engine, current_epoch, queue_app, jsearch_fixture_adapter, monkeypatch, respx_mock) -> None:  # C28, in process
-    ... # PausePoint at collect.after_reserve; while paused, `begin_new_attempt` supersedes the owner; resume → FencedOut, the respx route has 0 calls,
+async def test_stale_owner_dispatch_marker_is_fenced(engine, current_epoch, queue_app, jsearch_fixture_adapter, monkeypatch, fixture_log) -> None:  # C28, in process
+    ... # PausePoint at collect.after_reserve; while paused, `begin_new_attempt` supersedes the owner; resume → FencedOut, served_requests(fixture_log) empty,
     # and the new owner's `acquire_page` for the same key takes branch (c) above
 
-async def test_contract_violation_fails_the_request_and_opens_the_breaker(engine, current_epoch, jsearch_html_adapter) -> None:
-    ... # Failed(error_code="contract", replayed=False), the instance contract_broken, `source.contract_broken` critical open; raw_responses row with
-    # body ≤ 4096 bytes, item_count 0 and parsed_at set; the ledger entry `billed` (a 200 is billed whatever the body: billing ≠ envelope validity)
+async def test_contract_violation_fails_the_request_and_opens_the_breaker(engine, current_epoch, jsearch_html_adapter) -> None:  # Review Focus 3
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    r = await acquire_page(acquire_ctx(engine, owner, jsearch_html_adapter, billing="paid", provider="jsearch"), spec, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(r, Failed) and (r.error_code, r.http_status, r.replayed) == ("contract", 200, False)   # returned, never raised
+    async with engine.connect() as c:
+        fr = (await c.execute(sa.text("SELECT status, error_code, raw_response_id, quota_ledger_id FROM fetch_requests WHERE id=:i"), {"i": r.fetch_request_id})).one()
+        rr = (await c.execute(sa.text("SELECT item_count, parsed_at IS NOT NULL FROM raw_responses WHERE id=:i"), {"i": fr.raw_response_id})).one()
+        body = (await load_response(c, fr.raw_response_id, spec)).body
+        led = (await c.execute(sa.text("SELECT state, http_status FROM quota_ledger WHERE id=:i"), {"i": fr.quota_ledger_id})).one()
+        js = (await c.execute(JSEARCH)).one()
+        alert = (await c.execute(sa.text("SELECT severity FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL"), {"k": f"source.contract_broken:instance:{js.id}"})).scalar_one()
+    assert (fr.status, fr.error_code) == ("failed", "contract") and tuple(rr) == (0, True) and 0 < len(body) <= 4096   # the first 4 KiB, never parsed
+    assert tuple(led) == ("billed", 200) and (js.health, alert) == ("contract_broken", "critical")   # a 200 is billed whatever the body: billing ≠ envelope validity
 
-async def test_contract_failure_is_replayed_after_restart(engine, current_epoch, queue_app, jsearch_html_adapter, respx_mock) -> None:  # Review Focus 3
-    ... # after the test above, `begin_new_attempt` supersedes the owner; the new owner's acquire_page for the same key → Failed(error_code="contract", replayed=True),
-    # the respx route has 0 calls, no second fetch_requests row, no second ledger entry, the instance's consecutive_failures unchanged
+async def test_contract_failure_is_replayed_after_restart(engine, current_epoch, queue_app, jsearch_html_adapter, fixture_log) -> None:  # Review Focus 3
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    first = await acquire_page(acquire_ctx(engine, owner, jsearch_html_adapter, billing="paid", provider="jsearch"), spec, cell_id=cell, phase="primary", planned_id=None)
+    sent = served_requests(fixture_log)
+    async with engine.connect() as c: failures = (await c.execute(JSEARCH)).one().consecutive_failures
+    async with engine.begin() as c: attempt = await runs.begin_new_attempt(c, owner.run_id, epoch=1, end_reason="worker_takeover", defer=defer_in_tx)   # a deploy restarts the run
+    assert attempt == 2
+    again = await acquire_page(acquire_ctx(engine, runs.RunOwner(owner.run_id, attempt), jsearch_html_adapter, billing="paid", provider="jsearch"),
+                               spec, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(again, Failed) and (again.fetch_request_id, again.error_code, again.replayed) == (first.fetch_request_id, "contract", True)
+    async with engine.connect() as c:
+        rows = (await c.execute(sa.text("SELECT (SELECT count(*) FROM fetch_requests), (SELECT count(*) FROM quota_ledger)"))).one()
+        after = (await c.execute(JSEARCH)).one().consecutive_failures
+    assert len(sent) == 1 and served_requests(fixture_log) == sent and tuple(rows) == (1, 1) and after == failures   # no second send, receipt, entry or breaker write
 
 async def test_serpapi_account_is_read_before_each_search_and_after_the_last(engine, current_epoch, serpapi_fixture_adapter, respx_mock) -> None:
     ... # two searches (page 1 with a cursor, page 2): the account route is called before each search (2 calls) and once more by traverse_cell after
@@ -1618,7 +1750,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.sources.rec
 
 - [ ] **Step 3: Implement `receipts.py` and `acquire.py`**
 
-- The adapter fixtures of `tests/support/sources.py`: `jsearch_fixture_adapter` (a `JSearchAdapter` on a client with the fixture transport), `jsearch_html_adapter` (routes to `search_v2_html`), `serpapi_fixture_adapter` (`account.json` and `search.json` on respx, so the account calls can be counted), `arbeitnow_adapter` (respx-mocked). `tests/support/collect.py` gains `jsearch_cell(engine) -> int` (the JSearch default instance's `remote-de` cell for a test query) and `page1_spec(cell_id: int) -> RequestSpec`.
+- The fixtures of `tests/support/sources.py`: `fixture_log` (a fresh file under `tmp_path`: the fixture transport of the adapter fixtures logs every served request to it, and the crash tests of Task 14 pass it to their workers as `JOBHUNTER_FIXTURE_LOG`; `served_requests(fixture_log)` counts the real sends, which respx cannot see on a `MockTransport`), `jsearch_fixture_adapter` (a `JSearchAdapter` of the default JSearch instance, resolved by `instance_id`, on a client with `fixture_transport(FIXTURES, log_path=fixture_log)`, clock `utcnow`), `jsearch_html_adapter` (the same over a temporary copy of the fixtures in which `jsearch/search_v2_page1` is `search_v2_html`), `serpapi_fixture_adapter` (`account.json` and `search.json` on respx, so the account calls can be counted), `arbeitnow_adapter` (respx-mocked).
 - `acquire_page` never raises `SourceError`; it raises `FencedOut` (the owner lost the run) and lets `Bug`-class errors propagate.
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -1629,7 +1761,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pyproject.toml uv.lock backend/src/jobhunter/sources tests
+git add pyproject.toml uv.lock backend/src/jobhunter/sources backend/src/jobhunter/quota tests
 git commit -m "feat(m1): acquisition receipts with zstd bodies and dedup; the one-page protocol with reservation, dispatch marker, settlement, replay order and retries"
 ```
 
@@ -1639,25 +1771,25 @@ git commit -m "feat(m1): acquisition receipts with zstd bodies and dedup; the on
 
 **Files:**
 - Create: `backend/src/jobhunter/graphs/outcomes.py`, `graphs/collect/state.py`, `graphs/collect/deps.py`, `graphs/collect/nodes/__init__.py`, `graphs/collect/nodes/plan.py`, `graphs/collect/nodes/plan_fallback.py`, `backend/src/jobhunter/quota/planner.py`, `backend/src/jobhunter/sources/coverage.py` (the `freshness_bucket` and `adzuna_max_days_old` functions; the rest in Task 14)
-- Modify: `backend/src/jobhunter/graphs/collect/graph.py` (`build_collect_graph`; `build_noop_collect_graph` stays for the M0 tests), `backend/src/jobhunter/worker/runs.py` (`_invoke` builds the full initial `CollectState`)
+- Modify: `backend/src/jobhunter/graphs/collect/graph.py` (`build_collect_graph` and its pass-through nodes; `build_noop_collect_graph` stays for the M0 tests; `CollectState`/`CollectUpdate` imported from `state.py`), `backend/src/jobhunter/worker/runs.py` (`_invoke` builds the full initial `CollectState`), `backend/src/jobhunter/quota/fallback.py` (`cell_outcome`), `tests/support/collect.py` (`DEFAULT_CELL`, `seed_inputs`)
 - Test: `tests/unit/test_outcomes.py`, `tests/unit/test_planner.py`, `tests/unit/test_freshness.py`, `tests/integration/test_plan_node.py`
 
 **Interfaces:**
 - Consumes: Tasks 5–12.
 - Produces:
   - `class outcomes.OutcomeConflict(DomainError)`; `outcomes.merge_outcomes(a: dict[str, FetchOutcome], b: dict[str, FetchOutcome]) -> dict[str, FetchOutcome]` (idempotent on equal values, raises on a differing value for one `work_id`); `outcomes.sum_counters(a: dict[str, int], b: dict[str, int]) -> dict[str, int]`
-  - `class state.FetchOutcome(TypedDict)` and `class state.CollectState(TypedDict)` exactly as §9.2, plus `steps: Annotated[list[str], operator.add]`, `node_durations: Annotated[dict[str, float], sum_counters]` and `final_status: str | None`; `class state.CollectUpdate(TypedDict, total=False)` with the same keys; `state.initial_state(run_id, attempt_no) -> CollectState`
-  - `@dataclass class deps.CollectDeps: engine: AsyncEngine; adapters: Callable[[InstanceRow], SourceAdapter]; embedder: EmbedderClient | None; clock: Callable[[], datetime]; sleep: Callable[[float], Awaitable[None]]; admission_stopped: Callable[[], bool]` (`EmbedderClient` is Task 22's; `None` until then)
-  - `graph.build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDeps) -> CollectGraph`: the §9.2 edges `START → plan → fetch_primary (Send fan-out to fetch_cell) → plan_fallback → [fetch_fallback | parse_normalize] → resolve_identity → embed → hard_filters → enqueue_targets → finalize → END`, each node with its §9.2 timeout, `RetryPolicy(max_attempts=3, initial_interval=0.5, backoff_factor=2, jitter=True, retry_on=graph.is_retryable_db_error)` on the non-I/O nodes, and an `error_handler` that persists typed `SourceError`/`EmbedderError` outcomes and lets `Bug`, `OutcomeConflict` and `FencedOut` propagate. In this task the nodes after `plan_fallback` are the pass-through functions of their modules (`return {"steps": [name]}`); Tasks 14–23 replace them.
+  - `class state.FetchOutcome(TypedDict)` and `class state.CollectState(TypedDict)` exactly as §9.2, plus `steps: Annotated[list[str], operator.add]`, `node_durations: Annotated[dict[str, float], sum_counters]` and `final_status: str | None`; `class state.CollectUpdate(TypedDict, total=False)` with the same keys; `state.initial_state(run_id, attempt_no) -> CollectState`. These are the one definition: M0's `graph.CollectState`/`CollectUpdate` move here, widened, and `graph.py` imports them back, so `graph.CollectState` (the import of `tests/integration/test_runs.py`) and the `CollectGraph` alias name the same classes
+  - `@dataclass class deps.FetchContext` (the §9.2 per-source semaphores: JSearch 1, SerpApi 1, Adzuna 1, Arbeitnow 1; Task 14 adds the ATS host semaphores) and `@dataclass class deps.CollectDeps: engine: AsyncEngine; adapters: Callable[[InstanceRow], SourceAdapter]; embedder: object | None; clock: Callable[[], datetime]; sleep: Callable[[float], Awaitable[None]]; admission_stopped: Callable[[], bool]; limiter: RateLimiter; fetch_ctx: FetchContext` (one `RateLimiter` for the process; `embedder` is `None` until Task 22 narrows the field to `EmbedderClient | None`)
+  - `graph.build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDeps) -> CollectGraph`: the §9.2 edges `START → plan → fetch_primary (Send fan-out to fetch_cell) → plan_fallback → [fetch_fallback | parse_normalize] → resolve_identity → embed → hard_filters → enqueue_targets → finalize → END`, each node with its §9.2 timeout, `RetryPolicy(max_attempts=3, initial_interval=0.5, backoff_factor=2, jitter=True, retry_on=graph.is_retryable_db_error)` on the non-I/O nodes, and an `error_handler` that persists typed `SourceError` outcomes (Task 22 adds `EmbedderError`) and lets `Bug`, `OutcomeConflict` and `FencedOut` propagate. In this task the nodes after `plan_fallback` are pass-through functions defined in `graph.py` itself (`return {"steps": [name]}`); Tasks 14–23 create the node modules and wire each one in place of its pass-through.
   - `graph.is_retryable_db_error(exc: BaseException) -> bool` (SQLSTATE `40001`, `40P01`, or a `DBAPIError` with `connection_invalidated`)
   - `@dataclass(frozen=True) class planner.CellRow` (every `coverage_cells` column plus `source_id`, `instance_key`, `query_text`, `query_lang`, `exploration`, `location_label`, `radius_km`); `planner.cell_plan(cell: CellRow, instance: InstanceRow, *, phase, request_class, bucket, window, max_days_old) -> base.CellPlan` (the adapter-facing plan of Task 5; `CoverageWindow` is `base.CoverageWindow`)
   - `planner.location_keys(scope: ScopeSettings) -> list[tuple[str, str | None]]` (`(slug, label)` per scope location, de-duplicated on the slug, plus `("remote-de", None)` when the toggle is on); `async def planner.ensure_cells(conn, settings: RunSettings, instances: Sequence[InstanceRow]) -> list[CellRow]` (paid and quota: `(instance, query, location_key)` for every enabled query and key; Arbeitnow one cell; one cell per enabled ATS instance; `ON CONFLICT DO NOTHING`, then read back)
   - `planner.priority(cell: CellRow, now: datetime) -> float`; `planner.order_paid(cells: Sequence[CellRow], *, now, units_since_exploration: int) -> list[CellRow]` (priority order; an exploration cell first when `units_since_exploration ≥ 10`)
   - `coverage.BUCKETS: Final = {"today": timedelta(hours=24), "3days": timedelta(hours=72), "week": timedelta(hours=168), "month": timedelta(hours=720)}`; `coverage.freshness_bucket(now, last_covered_at: datetime | None) -> tuple[str, CoverageWindow, CoverageWindow | None]` (the bucket, the window `[now − span, now]`, and the unreachable part `[last_covered_at, now − 720 h]` to abandon when the span exceeds 720 h); `coverage.adzuna_max_days_old(now, last_covered_at, max_ad_age_days) -> int`
-  - `@dataclass(frozen=True) class planner.PlanReport: primary_fetch_request_ids: list[int]; skipped: dict[str, int]; cells: int; replanned: int`; `async def planner.plan_run(conn, *, owner: RunOwner, include_paid: bool, settings: RunSettings, instances: Sequence[InstanceRow], now, account: AccountObservation | None) -> PlanReport` (the §9.2 node-1 behaviour: the receipt (existing `fetch_requests` of the run are reused, `skipped(shutdown|superseded)` re-planned as `planned` rows with `attempt_seq + 1`, up to 8); otherwise the free cells of enabled, `available`/`half_open` instances every run, Adzuna by `project_allowance` with rotation by staleness, JSearch by priority and `project_allowance` (`paced`, `reserve_held`, `exhausted`, `window_cap`, `awaiting_window_validation` as `skipped` rows); an instance that is `blocked` gives `skipped(breaker_open)` rows; a `half_open` instance gets exactly one spec; a disabled source (settings or health `disabled`) gives no rows; the unreachable part of a window is abandoned at once (`coverage.abandon_span`, Task 14 — here through a `coverage_intervals` insert with reason `beyond_provider_window`); SerpApi cells get no primary spec)
+  - `@dataclass(frozen=True) class planner.PlanReport: primary_fetch_request_ids: list[int]; skipped: dict[str, int]; cells: int; replanned: int`; `async def planner.plan_run(conn, *, owner: RunOwner, include_paid: bool, settings: RunSettings, instances: Sequence[InstanceRow], now, account: AccountObservation | None) -> PlanReport` (the §9.2 node-1 behaviour: the receipt (existing `fetch_requests` of the run are reused, `skipped(shutdown|superseded)` re-planned as `planned` rows with `attempt_seq + 1`, up to 8); otherwise the free cells of enabled, `available`/`half_open` instances every run, Adzuna by `project_allowance` with rotation by staleness, JSearch by priority and `project_allowance` (`paced`, `reserve_held`, `exhausted`, `window_cap`, `awaiting_window_validation` as `skipped` rows); an instance that is `blocked` gives `skipped(breaker_open)` rows; a `half_open` instance gets exactly one spec; a disabled source (settings or health `disabled`) gives no rows; the unreachable part of a window is abandoned at once by an inline `coverage_intervals` insert (a `gap` row `abandoned`, reason `beyond_provider_window`); SerpApi cells get no primary spec; **cursor reuse** (§5.3.1, Ruling P3): a JSearch cell whose `coverage_cells.continuation` holds a cursor with `obtained_at + jsearch.CURSOR_REUSE_TTL > now` is planned from it, `adapter.next_page(adapter.plan(cell_plan), cursor)` with the continuation's stored window (the traversal it continues, whose open gap that traversal's `END` closes), and otherwise from page 1 with a fresh window, the open gap kept)
   - `async def fallback.cell_outcome(conn, run_id: int, cell_id: int) -> CellOutcome` (in `quota/fallback.py`: from the cell's last fetch request of the run — `succeeded` → `served`; `skipped(<code>)` → that code, except `awaiting_window_validation`, which is `awaiting_after_failed_probe` when the JSearch window has `probe_failed` and `awaiting_probe_in_flight` otherwise; `failed(<error_code>)` → `transient`, or the instance's health for `breaker_open`/`auth_failed`/`contract_broken`; `ambiguous` → `ambiguous`; `skipped(shutdown|run_cancelled)` by name)
   - `async def planner.plan_fallback(conn, *, owner: RunOwner, settings, instances, now, account) -> list[int]` (§6.6: for every JSearch cell of the run whose `cell_outcome` is eligible, one SerpApi spec `phase='fallback'` on the SerpApi cell with the same `(query_id, location_key)`, subject to `project_allowance` on `serpapi` with the account observation (a free read made by the node for the projection only; the acquisition protocol reads the account again immediately before every search, Task 12); records `quota.fallback_active` info when any is planned)
-  - `nodes/plan.make_plan(deps) -> node` (loads the run and `load_run_settings`, `list_instances`, the SerpApi account when SerpApi is enabled (projection only), calls `plan_run`, returns `settings_version_id`, `scope_version_id`, `llm_tuple_id`, `plan_done`, `primary_fetch_request_ids`); `nodes/plan_fallback.make_plan_fallback(deps) -> node` and `nodes/plan_fallback.route(state) -> Literal["fetch_fallback", "parse_normalize"]`
+  - `nodes/plan.make_plan(deps) -> node` (loads the run and `load_run_settings`, `list_instances`, the SerpApi account when SerpApi is enabled (projection only), calls `plan_run`, returns `settings_version_id`, `scope_version_id`, `llm_tuple_id`, `plan_done`, `primary_fetch_request_ids`); `nodes/plan_fallback.make_plan_fallback(deps) -> node` (returns `fallback_fetch_request_ids`) and `nodes/plan_fallback.route(state) -> Literal["fetch_fallback", "parse_normalize"]`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1676,7 +1808,8 @@ def test_reducer_is_idempotent_commutative_and_conflicting() -> None:
 ```python
 # tests/unit/test_planner.py
 from datetime import UTC, datetime, timedelta
-from jobhunter.quota.planner import order_paid, priority
+from jobhunter.quota.planner import CellRow, order_paid, priority
+from tests.support.collect import DEFAULT_CELL   # the CellRow fields of a never-attempted JSearch cell, as a dict
 T = datetime(2026, 10, 16, tzinfo=UTC)
 def cell(**k): return CellRow(**{**DEFAULT_CELL, **k})
 def test_priority_formula() -> None:
@@ -1705,14 +1838,44 @@ def test_bucket_selection_and_abandoned_span() -> None:
 
 ```python
 # tests/integration/test_plan_node.py
+from datetime import timedelta
+import pytest, sqlalchemy as sa
+from jobhunter.clock import utcnow
+from jobhunter.quota.planner import plan_run
+from jobhunter.run_settings import load_run_settings
+from jobhunter.sources.breaker import HALF_OPEN_AFTER, record_failure
+from jobhunter.sources.instances import list_instances
+from jobhunter.worker.runs import finalize_run
+from tests.support.collect import instance_id, queued_run, seed_inputs
+pytestmark = pytest.mark.integration
+ROWS = sa.text("SELECT status, skip_reason FROM fetch_requests WHERE run_id = :r AND source_instance_id = :i ORDER BY id")
+async def plan_once(engine, owner, now) -> None:   # one plan_run of the owner's run, as the plan node calls it
+    async with engine.begin() as c:
+        version = (await c.execute(sa.text("SELECT settings_version_id FROM runs WHERE id = :r"), {"r": owner.run_id})).scalar_one()
+        await plan_run(c, owner=owner, include_paid=False, settings=await load_run_settings(c, version), instances=await list_instances(c), now=now, account=None)
+
 async def test_plan_creates_cells_and_specs_for_every_enabled_source(engine, current_epoch, fake_http) -> None:
     ... # a query ("python developer", remote-de only) + a greenhouse company `getyourguide`; an include_paid run → cells: jsearch×1, serpapi×1, adzuna×1, arbeitnow×1, ats×1;
     # fetch_requests: jsearch 1 planned (class probe, params date_posted=month), adzuna 1 planned (max_days_old=30), arbeitnow 1, greenhouse 1; serpapi 0; report.skipped == {}
     # with include_paid=False: no jsearch row, adzuna still planned
 async def test_plan_is_a_receipt_and_replans_shutdown_skips(engine, current_epoch, fake_http) -> None:
     ... # a second plan_run returns the same ids and inserts nothing; a row set skipped(shutdown) → a new planned row attempt_seq 2 for the same request_key; replanned == 1
-async def test_plan_skips_closed_instances_and_probes_half_open(engine, current_epoch, fake_http) -> None:  # Review Focus 5, the planning half
-    ... # the greenhouse instance `not_found` with half_open_after in the future → its spec is skipped(breaker_open); with half_open_after in the past → exactly one planned spec
+async def test_plan_reuses_a_fresh_jsearch_cursor(engine, current_epoch, fake_http) -> None:
+    ... # a JSearch cell whose continuation holds a cursor obtained 1 h ago → the planned spec carries that cursor, page_no 2 and the continuation's window;
+    # obtained longer than CURSOR_REUSE_TTL ago → page 1 with a fresh window, and the cell's open gap is still open (§5.3.1)
+async def test_plan_skips_closed_instances_and_probes_half_open(engine, current_epoch) -> None:  # Review Focus 5, the planning half
+    await seed_inputs(engine, companies=(("greenhouse", "getyourguide"),), enabled=("ats",))
+    now = utcnow()
+    async with engine.begin() as c:
+        gh = await instance_id(c, "greenhouse", "getyourguide")
+        assert await record_failure(c, gh, "not_found", billing="free", now=now) == "not_found"   # the board answered 404 (Task 11)
+    first = await queued_run(engine, include_paid=False); await plan_once(engine, first, now + timedelta(hours=1))
+    async with engine.begin() as c:
+        assert [tuple(r) for r in (await c.execute(ROWS, {"r": first.run_id, "i": gh})).all()] == [("skipped", "breaker_open")]   # no request before half-open
+        await finalize_run(c, first, status="succeeded", reason=None, report={})
+    second = await queued_run(engine, include_paid=False); await plan_once(engine, second, now + HALF_OPEN_AFTER + timedelta(minutes=1))
+    async with engine.connect() as c:
+        assert [tuple(r) for r in (await c.execute(ROWS, {"r": second.run_id, "i": gh})).all()] == [("planned", None)]   # exactly one probe spec
 async def test_plan_fallback_follows_the_eligibility_table(engine, current_epoch, fake_http) -> None:
     ... # JSearch cell outcomes `exhausted` and `contract_broken` → one SerpApi fallback spec each on the matching serpapi cell; `paced` and `ambiguous` → none; `quota.fallback_active` info open
 async def test_graph_runs_plan_and_pass_through_nodes_on_the_real_worker_protocol(engine, current_epoch, migrated, fake_http) -> None:
@@ -1727,7 +1890,8 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.graphs.outc
 - [ ] **Step 3: Implement the reducer, the state, the planner, the two nodes and the graph**
 
 - `plan_run` builds every spec through `adapter.plan(cell_plan)` and `insert_fetch_request`; the coverage window is computed once here and travels in `RequestSpec.window` (persisted in `fetch_requests.spec`), so a resumed attempt reuses it (§5.5.3 re-planning, Task 14). `project_allowance` is called once per provider with the ordered specs. The JSearch `units_since_exploration` is the count of normal-class JSearch ledger entries since `max(coverage_cells.last_exploration_at)` of the JSearch cells.
-- `runs._invoke` builds `state.initial_state(run_id, attempt_no)`; the M0 shape (`run_id`, `attempt_no`, `steps`) is a subset, so the M0 tests of `build_noop_collect_graph` still pass.
+- `runs._invoke` builds `state.initial_state(run_id, attempt_no)` and adds `"max_concurrency": 4` to its config (Global Constraints, Graph); the M0 shape (`run_id`, `attempt_no`, `steps`) is a subset, so the M0 tests of `build_noop_collect_graph` still pass.
+- `tests/support/collect.py` gains `DEFAULT_CELL: Final[Mapping[str, object]]` (every `CellRow` field of a never-attempted JSearch `remote-de` cell) and `async def seed_inputs(engine, *, queries: Sequence[str] = (), companies: Sequence[tuple[str, str]] = (), enabled: Sequence[str] | None = None) -> None` (Deviation 3: the `queries` rows (`lang='en'`, `origin='user'`), the watchlist companies `(ats_type, slug)` (`detection='manual'`, `validation_status='ok'`) with their instances through `instance_for_company`, and a new settings version copied from the active one whose `queries[]` and `watchlist[]` entries enable them and, when `enabled` is given, whose `sources.enabled` is true for exactly those sources; `active_config` re-pointed at it, so a run queued afterwards uses it).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1747,18 +1911,18 @@ git commit -m "feat(m1): collect_graph skeleton with the outcome reducer, the ru
 
 **Files:**
 - Create: `backend/src/jobhunter/sources/traverse.py`, `graphs/collect/nodes/fetch.py`, `tests/crash/test_collect_crashes.py`
-- Modify: `backend/src/jobhunter/sources/coverage.py` (the persisted rules), `backend/src/jobhunter/graphs/collect/graph.py` (the `Send` fan-out), `backend/src/jobhunter/worker/main.py` (`CollectDeps` with the fake transport in test env; the full wiring is Task 24, this task adds what the crash tests need), `backend/src/jobhunter/observability/metrics.py` (`FETCH_REQUESTS` counter, labels `source`, `status`)
+- Modify: `backend/src/jobhunter/sources/coverage.py` (the persisted rules), `backend/src/jobhunter/graphs/collect/graph.py` (the `Send` fan-out), `backend/src/jobhunter/graphs/collect/deps.py` (`FetchContext.host(host) -> asyncio.Semaphore`: the ATS host semaphores, 2 per host, created on first use), `backend/src/jobhunter/worker/main.py` (`CollectDeps` with the fake transport in test env; the full wiring is Task 24, this task adds what the crash tests need), `backend/src/jobhunter/observability/metrics.py` (`FETCH_REQUESTS` counter, labels `source`, `status`), `tests/support/collect.py` (`make_deps`, `job_factory`, `seed_inputs_sync`, `manual_paid_run`), `tests/support/sources.py` (`adapters`)
 - Test: `tests/integration/test_traverse.py`, `tests/integration/test_coverage.py`, `tests/crash/test_collect_crashes.py`
 
 **Interfaces:**
 - Consumes: Tasks 10–13; `EXECUTIONS`, `afault_point`.
 - Produces:
-  - `@dataclass(frozen=True) class traverse.TraversalResult: outcomes: list[FetchOutcome]; end: Literal["end", "cursor", "unknown", "ambiguous", "failed", "skipped"]; reason: str | None; pages: int; items: int; cursor_out: str | None; snapshot: SnapshotDraft | None; firehose: tuple[FirehoseState, list[Gap]] | None` (no posting counts: postings exist only after node 6, so the yield is finalized from the tables, below)
-  - `async def traverse.traverse_cell(ctx: AcquireContext, plan: CellPlan, first_fetch_request_id: int, *, limiter: RateLimiter) -> TraversalResult`: the window is `plan.window`, read from the planned row's spec (never recomputed on a resumed attempt); pages in a loop, each through `acquire_page` with its own receipt; JSearch page 2 only when `new_native_ids ≥ PAGE2_MIN_NEW` (the count persisted by `acquire_page`) and the reservation is admitted; Adzuna up to `PAGE_CAP` pages, a full page at the cap → `end="unknown"`; Arbeitnow through `plan_legs` (fresh head first, then the seek legs; `n_newer(gap)` counts distinct native ids with `raw_items.item_ts ≥ gap.upper`), `step`, `remaining_low` and the cap; ATS until `END` (Lever/SmartRecruiters offsets), SmartRecruiters detail specs at `SMARTRECRUITERS_DETAIL` concurrency, and membership from the list pages; SerpApi: after the last search of the traversal one more `adapter.account()` read, persisted with `ledger.record_account` (§5.3.2); `admission_stopped()` between pages ends the traversal `skipped('shutdown')`; a `Failed`/`Ambiguous`/`Denied` page ends it with that `end`; every page yields one `FetchOutcome(work_id=f"fr:{id}", new_postings=0)` (the state's outcome is a receipt of the page, the posting count lives in `fetch_requests.new_postings`, written by finalize)
+  - `@dataclass(frozen=True) class traverse.TraversalResult: outcomes: list[FetchOutcome]; end: Literal["end", "cursor", "unknown", "ambiguous", "failed", "skipped"]; reason: str | None; pages: int; items: int; cursor_out: str | None; snapshot: SnapshotDraft | None; firehose: tuple[FirehoseState, list[Gap]] | None` (no posting counts: postings exist only after node 6, so the yield is finalized from the tables, below; `snapshot` is `None` when no list page was served, so a board whose first page failed (a 404) writes no snapshot and ages nothing, §8.11 and Review Focus 5)
+  - `async def traverse.traverse_cell(ctx: AcquireContext, plan: CellPlan, first_fetch_request_id: int, *, limiter: RateLimiter) -> TraversalResult`: the window is `plan.window`, read from the planned row's spec (never recomputed on a resumed attempt); pages in a loop, each through `acquire_page` with its own receipt; JSearch page 2 only when `new_native_ids ≥ PAGE2_MIN_NEW` (the count persisted by `acquire_page`) and the reservation is admitted; Adzuna up to `PAGE_CAP` pages, a full page at the cap → `end="unknown"`; Arbeitnow through `plan_legs` (fresh head first, then the seek legs; `n_newer` is prefetched before `plan_legs` into a dict, one count per open gap of distinct native ids with `raw_items.item_ts ≥ gap.upper`), `step`, `remaining_low` and the cap; ATS until `END` (Lever/SmartRecruiters offsets), SmartRecruiters detail specs at `SMARTRECRUITERS_DETAIL` concurrency, and membership from the list pages; SerpApi: after the last search of the traversal one more `account()` read (through `acquire.AccountAdapter`), persisted with `ledger.record_account` (§5.3.2); `admission_stopped()` between pages ends the traversal `skipped('shutdown')`; a `Failed`/`Ambiguous`/`Denied` page ends it with that `end`; every page yields one `FetchOutcome(work_id=f"fr:{id}", new_postings=0)` (the state's outcome is a receipt of the page, the posting count lives in `fetch_requests.new_postings`, written by finalize)
   - `async def coverage.record_search_traversal(conn, cell_id: int, *, window: CoverageWindow, result: TraversalResult, run_id: int) -> CoverageEffect` with `@dataclass(frozen=True) class CoverageEffect: opened: int; closed: int; covered: int` — **intervals only**, replay-safe by the unique span: `END` inserts the `covered` row `W` and closes the open gaps `W` covers; otherwise it inserts the `open` gap `[max(W.lower, coalesce(last_covered_at, W.lower)), W.upper]` with `gap_cursor` and `reason` (`page_cap`, `allowance`, `ambiguous_attempt`, `unknown_continuation`, `source_failed`, `shutdown`); every row `ON CONFLICT (cell_id, kind, span) DO NOTHING` with `run_id`; nothing on `coverage_cells` is written here
   - `async def coverage.record_firehose_traversal(conn, cell_id, state: FirehoseState, gaps: Sequence[Gap], *, run_id) -> CoverageEffect` (the gap and covered rows on the `created_at` axis, the same idempotency); `async def coverage.record_ats_snapshot(conn, cell_id, instance_id, draft: SnapshotDraft, *, run_id, taken_at) -> int` (the `ats_snapshots` row with `status` `complete` or `incomplete` (the mass classification is Task 19's `apply_snapshot`), its members, and a gap `incomplete_snapshot` otherwise; written once per `(source_instance_id, run_id)`: an existing row is returned, nothing inserted); `async def coverage.abandon_old_gaps(conn, *, now, max_ad_age_days) -> int` (raises `coverage.gap_abandoned` warn per cell)
-  - `async def coverage.finalize_cells(conn, run_id: int, *, now) -> dict[int, CellStats]` with `@dataclass(frozen=True) class CellStats: requests: int; new_postings: int; reached_end: bool; covered: bool` — the `coverage_cells` updates of §9.2 node 10, computed from durable rows only and applied **once, in the `finalize` transaction** (Task 23; atomic with `finalize_run`, so a crash keeps or loses both and no later attempt applies them twice): for every cell with a fetch request of the run: `last_attempted_at = min(created_at)` of those requests; `last_success_at` when any succeeded; `requests` = dispatched requests; `new_postings` = postings whose earliest observation belongs to the run's raw items of the cell, written also into each `fetch_requests.new_postings`; `yield_ema` EMA α 0.3 of `new_postings / requests` (unchanged when `requests = 0`), `zero_yield_streak`; `last_covered_at` advanced to `W.upper` of the run's `covered` row under the three §5.6 conditions (`NULL` before; `W.lower ≤ last_covered_at`; every gap between them `closed`/`abandoned`), `last_complete_snapshot_id` for a complete ATS snapshot; `consecutive_incomplete` reset to 0 by a covered run and `+ 1` by a run that opened a gap; `last_exploration_at` for exploration cells; `continuation` = the JSearch cursor of the last succeeded page with a cursor plus `obtained_at`; `coverage.too_broad` info at `consecutive_incomplete ≥ 3` for a paid cell, resolved when covered
-  - `nodes/fetch.make_fetch_primary(deps)`, `make_fetch_fallback(deps)` (the `Send("fetch_cell", {"fetch_request_id": id})` fan-out over the planned ids of the phase, `max_concurrency=4`), `make_fetch_cell(deps)` (loads the planned row and its cell, builds the `CellPlan` from the stored spec and the adapter, holds the per-source semaphore (`deps`-level `FetchContext` with the §9.2 limits), runs `traverse_cell`, then in one transaction (owner `FOR SHARE` first) the `record_*` writes, then `afault_point("collect.after_coverage_commit")`, and returns `outcomes` and `counters`); `fetch.route_after_primary(state) -> "plan_fallback"`
+  - `async def coverage.finalize_cells(conn, run_id: int, *, now) -> dict[int, CellStats]` with `@dataclass(frozen=True) class CellStats: requests: int; new_postings: int; reached_end: bool; covered: bool` — the `coverage_cells` updates of §9.2 node 10, computed from durable rows only and applied **once, in the `finalize` transaction** (Task 23; atomic with `finalize_run`, so a crash keeps or loses both and no later attempt applies them twice): for every cell with a fetch request of the run: `last_attempted_at = min(created_at)` of those requests; `last_success_at` when any succeeded; `requests` = dispatched requests; `new_postings` = postings whose earliest observation belongs to the run's raw items of the cell, written also into each `fetch_requests.new_postings`; `yield_ema` EMA α 0.3 of `new_postings / requests` (unchanged when `requests = 0`), `zero_yield_streak`; `last_covered_at` advanced to `W.upper` of the run's `covered` row under the three §5.6 conditions (`NULL` before; `W.lower ≤ last_covered_at`; every gap between them `closed`/`abandoned`), `last_complete_snapshot_id` for a complete ATS snapshot; `consecutive_incomplete` reset to 0 by a covered run and `+ 1` by a run that opened a gap; `last_exploration_at` for exploration cells; `continuation` = the JSearch cursor of the last succeeded page with a cursor, its `obtained_at` and the traversal's window (what the planner's cursor reuse reads, Task 13); `coverage.too_broad` info at `consecutive_incomplete ≥ 3` for a paid cell, resolved when covered
+  - `nodes/fetch.make_fetch_primary(deps)`, `make_fetch_fallback(deps)` (the `Send("fetch_cell", {"fetch_request_id": id})` fan-out over the planned ids of the phase, `max_concurrency=4`), `make_fetch_cell(deps)` (loads the planned row and its cell, builds the `CellPlan` from the stored spec and the adapter, holds the per-source semaphore (`deps.fetch_ctx`, Task 13; an ATS cell its host's), runs `traverse_cell(…, limiter=deps.limiter)`, then in one transaction (owner `FOR SHARE` first) the `record_*` writes, then `afault_point("collect.after_coverage_commit")`, and returns `outcomes` and `counters`); `fetch.route_after_primary(state) -> "plan_fallback"`
   - Fault points: `collect.after_reserve`, `collect.after_dispatch_marker`, `collect.after_response`, `collect.after_settle` (Task 12), `collect.after_coverage_commit` (here) and `collect.before_parse` (the start of node 5, Task 15; the C4 test waits for it)
 
 - [ ] **Step 1: Write the failing tests**
@@ -1773,44 +1937,157 @@ async def test_search_coverage_rules(engine, current_epoch) -> None:
     # (e) `beyond_provider_window` abandoned at planning (Task 13) lets contiguity advance past it
 async def test_cell_stats_are_finalized_from_durable_rows_once(engine, current_epoch, job_factory) -> None:
     ... # a run with one dispatched request for the cell and 3 postings whose earliest observations come from its raw items, plus 1 older posting re-sighted:
-    # finalize_cells → new_postings 3 (the re-sighting is not new), fetch_requests.new_postings == 3, yield_ema from 0.5 == 0.3*3 + 0.7*0.5 == 1.4;
+    # finalize_cells → new_postings 3 (the re-sighting is not new), fetch_requests.new_postings == 3, yield_ema from 0.5 == 0.3*3 + 0.7*0.5 == 1.25;
     # calling finalize_cells again in a new transaction for the same run is refused by the caller contract (the run is terminal) — asserted through the crash case below;
     # three runs that opened a gap → consecutive_incomplete 3 and `coverage.too_broad` info; a covered run resolves it and resets the streak
 ```
 
 ```python
 # tests/integration/test_traverse.py
+import asyncio
+import pytest, sqlalchemy as sa
+from jobhunter.graphs.collect.nodes.fetch import make_fetch_cell
+from jobhunter.graphs.collect.nodes.plan import make_plan
+from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback
+from jobhunter.graphs.collect.state import initial_state
+from jobhunter.sources import acquire
+from jobhunter.worker import runs
+from jobhunter.worker.tasks import defer_in_tx
+from tests.support.collect import make_deps, queued_run, seed_inputs
+from tests.support.faults import PausePoint
+from tests.support.sources import served_requests
+pytestmark = pytest.mark.integration
+GAPS = sa.text("SELECT i.kind, i.gap_status, i.reason FROM coverage_intervals i JOIN fetch_requests f ON f.cell_id = i.cell_id WHERE f.id = :i")
+
 async def test_jsearch_page_two_rule(engine, current_epoch, fake_http) -> None:
     ... # page 1 with 10 new ids → page 2 requested (2 outcomes, 2 ledger entries); with 4 of the ids already in postings → no page 2, end="cursor", reason "page_cap", one open gap
-async def test_adzuna_page_cap_and_arbeitnow_overlap(engine, current_epoch, fake_http) -> None:
-    ... # Adzuna: 3 full pages at the cap → end="unknown" and a gap with reason `unknown_continuation`; Arbeitnow: page 1 reaches the overlap → end="end", newest_covered_upper advanced, no gap
+async def test_adzuna_page_cap_and_arbeitnow_overlap(engine, current_epoch, fake_http, respx_mock) -> None:
+    ... # Adzuna, on an adapter whose client is respx-mocked to serve `search_p1_rpp100` with `count` set to 1000 for pages 1–3 (the fixture routes
+    # answer page ≥ 2 with `search_empty`): 3 full pages at the cap → end="unknown" and a gap with reason `unknown_continuation`;
+    # Arbeitnow (fixture routes): a covered cell's page 1 reaches the overlap → end="end", newest_covered_upper advanced, no gap
 async def test_ats_snapshot_written_once_and_complete(engine, current_epoch, fake_http) -> None:
     ... # greenhouse getyourguide: one ats_snapshots row (complete, member_count 15), 15 members; a resumed traversal (the page replayed) inserts no second snapshot
-async def test_shutdown_after_reservation_before_dispatch_releases_and_sends_nothing(engine, current_epoch, fake_http, monkeypatch) -> None:  # Review Focus 4
-    ... # admission_stopped flips to True while paused at collect.after_reserve: the request ends skipped(shutdown), the ledger entry not_billed(never_dispatched), the respx route has 0 calls,
-    # the traversal end is "skipped" with reason "shutdown", and a new plan_run re-plans the key as attempt_seq 2
-async def test_contract_violation_is_visible_to_plan_fallback_in_the_same_run(engine, current_epoch, fake_http) -> None:  # Review Focus 3
-    ... # the JSearch cell is served the html fixture: fetch_requests failed('contract'), instance contract_broken; plan_fallback then plans a SerpApi spec for that cell
+async def test_shutdown_after_reservation_before_dispatch_releases_and_sends_nothing(engine, current_epoch, queue_app, jsearch_fixture_adapter, fixture_log, monkeypatch) -> None:  # Review Focus 4
+    await seed_inputs(engine, queries=("python developer",), enabled=("jsearch",))
+    owner, stopped, pause = await queued_run(engine), [False], PausePoint("collect.after_reserve")
+    monkeypatch.setattr(acquire, "afault_point", pause)
+    deps = make_deps(engine, lambda instance: jsearch_fixture_adapter, admission_stopped=lambda: stopped[0])
+    (fid,) = (await make_plan(deps)(initial_state(owner.run_id, owner.attempt_no)))["primary_fetch_request_ids"]
+    task = asyncio.create_task(make_fetch_cell(deps)({"fetch_request_id": fid}))
+    await asyncio.wait_for(pause.reached.wait(), 10)
+    stopped[0] = True; pause.resume(); await task   # the deploy's SIGTERM lands between the reservation and the dispatch marker
+    async with engine.connect() as c:
+        row = (await c.execute(sa.text("SELECT f.status, f.skip_reason, f.request_key, l.state, l.evidence FROM fetch_requests f JOIN quota_ledger l ON l.id = f.quota_ledger_id WHERE f.id = :i"), {"i": fid})).one()
+        gap = (await c.execute(GAPS, {"i": fid})).one()
+    assert (row.status, row.skip_reason, row.state, row.evidence) == ("skipped", "shutdown", "not_billed", "never_dispatched")   # the user is not billed
+    assert served_requests(fixture_log) == [] and tuple(gap) == ("gap", "open", "shutdown")   # nothing sent; the traversal ended skipped('shutdown')
+    async with engine.begin() as c: attempt = await runs.begin_new_attempt(c, owner.run_id, epoch=1, end_reason="worker_takeover", defer=defer_in_tx)
+    replanned = (await make_plan(deps)(initial_state(owner.run_id, attempt)))["primary_fetch_request_ids"]
+    async with engine.connect() as c:
+        rows = (await c.execute(sa.text("SELECT id, attempt_seq, status FROM fetch_requests WHERE request_key = :k ORDER BY attempt_seq"), {"k": row.request_key})).all()
+    assert [(r.attempt_seq, r.status) for r in rows] == [(1, "skipped"), (2, "planned")] and rows[1].id in replanned   # the next attempt re-plans the key
+async def test_contract_violation_is_visible_to_plan_fallback_in_the_same_run(engine, current_epoch, jsearch_html_adapter, adapters) -> None:  # Review Focus 3
+    await seed_inputs(engine, queries=("python developer",), enabled=("jsearch", "serpapi"))
+    owner = await queued_run(engine)
+    deps = make_deps(engine, lambda instance: jsearch_html_adapter if instance.source_id == "jsearch" else adapters(instance))
+    state = initial_state(owner.run_id, owner.attempt_no)
+    (primary,) = (await make_plan(deps)(state))["primary_fetch_request_ids"]   # the JSearch spec: SerpApi cells get no primary spec
+    await make_fetch_cell(deps)({"fetch_request_id": primary})   # served the HTML error page
+    fallback = (await make_plan_fallback(deps)(state))["fallback_fetch_request_ids"]
+    async with engine.connect() as c:
+        failed = (await c.execute(sa.text("SELECT f.status, f.error_code, s.health, c.query_id, c.location_key FROM fetch_requests f JOIN source_instances s ON s.id = f.source_instance_id "
+                                          "JOIN coverage_cells c ON c.id = f.cell_id WHERE f.id = :i"), {"i": primary})).one()
+        planned = (await c.execute(sa.text("SELECT f.phase, s.source_id, c.query_id, c.location_key FROM fetch_requests f JOIN source_instances s ON s.id = f.source_instance_id "
+                                           "JOIN coverage_cells c ON c.id = f.cell_id WHERE f.id = ANY(:ids)"), {"ids": fallback})).all()
+    assert (failed.status, failed.error_code, failed.health) == ("failed", "contract", "contract_broken")
+    assert [tuple(p) for p in planned] == [("fallback", "serpapi", failed.query_id, failed.location_key)]   # the same run falls back to SerpApi for that cell
 ```
 
 ```python
 # tests/crash/test_collect_crashes.py
-# Each case: a query + settings entry and an include_paid manual run inserted by SQL (tests/support/collect.manual_paid_run), worker A spawned with
-# JOBHUNTER_FAKE_SOURCES=1 and JOBHUNTER_FAULT=<point>, exit 86 awaited, worker B spawned, the run awaited to `succeeded` or `partial` at attempt 2.
+import sys
+import pytest
+from tests.support.collect import manual_paid_run
+from tests.support.pg import pg_one, pg_rows
+from tests.support.procs import Proc, wait_until
+from tests.support.sources import served_requests
+pytestmark = [pytest.mark.crash, pytest.mark.slow]
+WORKER = [sys.executable, "-m", "jobhunter.cli", "worker"]
+# Page 1 of the run's only cell, every attempt of it, with its ledger entry (none for a free source).
+PAGE1 = ("SELECT f.attempt_seq, f.status, l.state, l.request_class FROM fetch_requests f LEFT JOIN quota_ledger l ON l.id = f.quota_ledger_id "
+         "WHERE f.run_id = %s AND f.page_no = 1 ORDER BY f.attempt_seq")
+
+def one(server, statement: str, *params: object) -> tuple[object, ...] | None:
+    return pg_one(server, "superuser", statement, *params)
+
+def die_at(server, proc_env, procs, fixture_log, point: str) -> Proc:
+    """Worker A runs the queued run up to `point` and dies there (exit 86, no cleanup at all)."""
+    a = procs.spawn(WORKER, proc_env("worker", server, JOBHUNTER_FAULT=point, JOBHUNTER_FIXTURE_LOG=str(fixture_log)))
+    a.wait_event("fault_point_reached", 180, point=point)
+    assert a.exit_within(30) == 86
+    one(server, "UPDATE procrastinate_workers SET last_heartbeat = now() - interval '5 minutes'")   # A's job is stalled, as in M0's C27
+    return a
+
+def resume(server, proc_env, procs, fixture_log, run_id: int) -> Proc:
+    """Worker B takes the run over and returns once it ended at attempt 2, `succeeded` or `partial`."""
+    b = procs.spawn(WORKER, proc_env("worker", server, JOBHUNTER_FIXTURE_LOG=str(fixture_log)))
+    wait_until(lambda: one(server, "SELECT status IN ('succeeded', 'partial'), attempt_no FROM runs WHERE id = %s", run_id) == (True, 2), 180)
+    return b
+
 def test_c1_after_reservation_before_marker(migrated, proc_env, procs, fixture_log) -> None:
-    ... # point collect.after_reserve → A exits 86; after B: the attempt-1 ledger row is not_billed/never_dispatched, its fetch request skipped(superseded),
-    # an attempt_seq-2 row succeeded with a billed entry; the JSearch window's probe_used is False between A and B and the attempt-2 entry is the probe;
-    # exactly one served request for the JSearch page-1 route in `served_requests(fixture_log)` across both processes (the instrument, not a row count), and one raw_responses row
+    run_id = manual_paid_run(migrated, only="jsearch")   # only the source under test is enabled (Ruling P5): the first arrival is its page 1
+    die_at(migrated, proc_env, procs, fixture_log, "collect.after_reserve")
+    assert pg_rows(migrated, "superuser", PAGE1, run_id) == [(1, "reserved", "reserved", "probe")]   # reserved, no dispatch marker
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    assert pg_rows(migrated, "superuser", PAGE1, run_id) == [(1, "skipped", "not_billed", "probe"), (2, "succeeded", "billed", "probe")]
+    assert one(migrated, "SELECT f.skip_reason, l.evidence FROM fetch_requests f JOIN quota_ledger l ON l.id = f.quota_ledger_id "
+               "WHERE f.run_id = %s AND f.page_no = 1 AND f.attempt_seq = 1", run_id) == ("superseded", "never_dispatched")
+    # B's entry is the probe again: the release restored probe_used, or B's reserve would have been denied awaiting_window_validation
+    assert [r["case"] for r in served_requests(fixture_log) if r["case"] == "search_v2_page1"] == ["search_v2_page1"]   # one send across both processes
+    assert one(migrated, "SELECT count(*) FROM raw_responses r JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = %s AND f.page_no = 1", run_id) == (1,)
+
 def test_c2_after_marker_before_send_returns(migrated, proc_env, procs, fixture_log) -> None:
-    ... # point collect.after_dispatch_marker → the entry ends ambiguous, the request ambiguous, a coverage gap ambiguous_attempt, no attempt_seq 2 for the paid key,
-    # `quota.ambiguous_attempt` warn open, the window's probe_failed True with next_probe_at 12 h later; the Arbeitnow (free) page is re-dispatched by B with attempt_seq 2 and succeeds
+    run_id = manual_paid_run(migrated, only="jsearch")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.after_dispatch_marker")
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    assert pg_rows(migrated, "superuser", PAGE1, run_id) == [(1, "ambiguous", "ambiguous", "probe")]   # counted, and the paid spec is never re-dispatched
+    assert one(migrated, "SELECT i.kind, i.gap_status, i.reason FROM coverage_intervals i JOIN fetch_requests f ON f.cell_id = i.cell_id "
+               "WHERE f.run_id = %s AND f.page_no = 1", run_id) == ("gap", "open", "ambiguous_attempt")
+    assert one(migrated, "SELECT severity FROM alerts WHERE dedup_key = 'quota.ambiguous_attempt:provider:jsearch' AND resolved_at IS NULL") == ("warn",)
+    assert one(migrated, "SELECT probe_failed, next_probe_at BETWEEN now() + interval '11 hours' AND now() + interval '12 hours' "
+               "FROM quota_windows WHERE provider = 'jsearch' AND is_current") == (True, True)   # the probe failed: the next one in 12 h
+    assert not [r for r in served_requests(fixture_log) if r["case"] == "search_v2_page1"]   # A died before its send, B never sent
+
+def test_c2b_free_page_after_marker_is_redispatched(migrated, proc_env, procs, fixture_log) -> None:   # C2's free half, a case of its own (Ruling P5)
+    run_id = manual_paid_run(migrated, only="arbeitnow")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.after_dispatch_marker")
+    assert served_requests(fixture_log) == []
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    assert pg_rows(migrated, "superuser", PAGE1, run_id) == [(1, "ambiguous", None, None), (2, "succeeded", None, None)]   # no ledger entry: a free page
+    assert [r["case"] for r in served_requests(fixture_log)] == ["page1"]   # re-dispatched once, by B (a never-covered cell reads page 1 only)
+
 def test_c3_after_response_before_settle(migrated, proc_env, procs, fixture_log) -> None:
-    ... # point collect.after_response → as C2 (no raw_responses row for attempt 1); the fixture log shows the one send of A and none of B for the paid key
+    run_id = manual_paid_run(migrated, only="jsearch")
+    a = die_at(migrated, proc_env, procs, fixture_log, "collect.after_response")
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    assert pg_rows(migrated, "superuser", PAGE1, run_id) == [(1, "ambiguous", "ambiguous", "probe")]   # the response is lost, the attempt charged
+    assert one(migrated, "SELECT count(*) FROM raw_responses r JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = %s", run_id) == (0,)
+    assert [int(r["pid"]) for r in served_requests(fixture_log) if r["case"] == "search_v2_page1"] == [a.pid]   # A's one send, none by B
+
 def test_c4_after_settle_before_parse(migrated, proc_env, procs, fixture_log) -> None:
-    ... # point collect.before_parse → B logs `page_replayed` for the key, exactly one raw_responses row, one billed entry, and parses it (raw_items exist, Task 15)
+    run_id = manual_paid_run(migrated, only="jsearch")
+    a = die_at(migrated, proc_env, procs, fixture_log, "collect.before_parse")
+    sent = served_requests(fixture_log)
+    b = resume(migrated, proc_env, procs, fixture_log, run_id)
+    b.wait_event("page_replayed", 5)
+    assert sent and {int(r["pid"]) for r in sent} == {a.pid} and served_requests(fixture_log) == sent   # B replays the receipts: no new HTTP call
+    assert pg_rows(migrated, "superuser", "SELECT f.page_no, l.state, count(DISTINCT r.id) FROM fetch_requests f JOIN quota_ledger l ON l.id = f.quota_ledger_id "
+                   "JOIN raw_responses r ON r.fetch_request_id = f.id WHERE f.run_id = %s GROUP BY 1, 2 ORDER BY 1", run_id) == [(1, "billed", 1), (2, "billed", 1)]
+    assert one(migrated, "SELECT count(*) > 0 FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
+               "JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = %s", run_id) == (True,)   # and parses them (Task 15)
 ```
 
-(`fixture_log` is a `tests/support/sources.py` fixture: a fresh file whose path `proc_env` passes as `JOBHUNTER_FIXTURE_LOG` to both workers. The crash case for `collect.after_coverage_commit`, C3b, asserts the finalized cell statistics and therefore lives in Task 23, where `finalize` stops being a pass-through; this task only adds the fault point.)
+(`fixture_log` is Task 12's; `die_at` and `resume` pass it to both workers as `JOBHUNTER_FIXTURE_LOG`. The crash case for `collect.after_coverage_commit`, C3b, asserts the finalized cell statistics and therefore lives in Task 23, where `finalize` stops being a pass-through; this task only adds the fault point.)
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1819,14 +2096,15 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.sources.tra
 
 - [ ] **Step 3: Implement the traversal, the coverage rules, the fetch nodes and the fan-out**
 
-- `traverse_cell` holds one `RateLimiter` for the process (in `CollectDeps`) and the per-source asyncio semaphores of `FetchContext`; the ATS host semaphore is keyed by host.
+- `traverse_cell` uses the process's one `RateLimiter` (`deps.limiter`) and the per-source asyncio semaphores of `deps.fetch_ctx`; the ATS host semaphore is keyed by host (`FetchContext.host`).
+- Test helpers. `tests/support/sources.py` gains the fixture `adapters` (the fixture-backed adapter factory, `Callable[[InstanceRow], SourceAdapter]`: every adapter on `fake_http`'s fixture transport, clock `utcnow`, keys `b"fake"`). `tests/support/collect.py` gains `make_deps(engine, adapters, *, admission_stopped=lambda: False) -> CollectDeps` (the real `RateLimiter` over `SOURCE_LIMITS` with `time.monotonic` and `asyncio.sleep`, a fresh `FetchContext`, `utcnow`, `embedder=None`); the fixture `job_factory` (inserts jobs, postings and observations directly with the given facts; used here and by Tasks 16, 19 and 20); `seed_inputs_sync(server, **inputs)` (`seed_inputs` through `asyncio.run` on an engine of its own, for the sync crash tests); and `manual_paid_run(server, *, only: str) -> int` (sync: `seed_inputs_sync(server, queries=("python developer",), enabled=(only,))`, so the crash run enables only the source under test (Ruling P5), then an `include_paid` manual run requested through `runs.request_manual_run(…, defer=defer_in_tx)` on a queue app of its own, so its `run_collect(id, 1)` job waits for the worker; returns the run id).
 - `fetch_cell` is one `Send` per planned primary spec; `fetch_primary` returns the `Send` list from a conditional edge, and `fetch_fallback` the same for the fallback ids. The fan-out nodes carry the 15-minute `TimeoutPolicy`.
 - `worker/main.py` builds `CollectDeps` (adapters from `instances` + the configured HTTP layer; `embedder=None` until Task 22) and `build_collect_graph` instead of the no-op graph.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/integration/test_coverage.py tests/integration/test_traverse.py -q && uv run pytest tests/crash/test_collect_crashes.py -k "c1 or c2 or c3" -q`
-Expected: PASS for both commands (the `-k` filter applies to the crash file only; C4 passes in Task 15)
+Expected: PASS for both commands (the `-k` filter applies to the crash file only and selects C1, C2, C2b and C3; C4 passes in Task 15)
 
 - [ ] **Step 5: Commit**
 
@@ -1840,7 +2118,7 @@ git commit -m "feat(m1): cell traversal with page rules, coverage accounting and
 
 **Files:**
 - Create: `backend/src/jobhunter/graphs/collect/nodes/parse_normalize.py`, `backend/src/jobhunter/sources/items.py`
-- Modify: `backend/src/jobhunter/observability/metrics.py` (`RAW_ITEMS` counter, labels `source`, `disposition`), `tests/crash/test_collect_crashes.py` (C4 enabled, C5 added)
+- Modify: `backend/src/jobhunter/graphs/collect/graph.py` (`parse_normalize` wired in place of its pass-through), `backend/src/jobhunter/observability/metrics.py` (`RAW_ITEMS` counter, labels `source`, `disposition`), `tests/support/sources.py` (`stored_arbeitnow_page`, `crafted_page`), `tests/crash/test_collect_crashes.py` (C4 enabled, C5 added)
 - Test: `tests/integration/test_parse_node.py`
 
 **Interfaces:**
@@ -1887,7 +2165,20 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.sources.ite
 
 - [ ] **Step 3: Implement `items.py`, the node and the two crash cases**
 
-The fixtures `stored_arbeitnow_page` (an admitted run with one served Arbeitnow page-1 receipt, as `(RunOwner, raw_response_id)`), `crafted_page` (a JSearch page whose element 3 repeats element 1's `job_uid` and whose element 5 has none, stored the same way) and `adapters` (the fixture-backed adapter factory) go into `tests/support/sources.py`. `tests/crash/test_collect_crashes.py` gains `test_c5_between_responses_resumes_without_duplicates` (point `collect.parse.between_responses` → after B: every 2xx response of the run has `parsed_at`, every `(raw_response_id, item_index)` once, Σ dispositions = `item_count` per response) and runs `test_c4_after_settle_before_parse` (Task 14).
+The fixtures `stored_arbeitnow_page` (an admitted run with one served Arbeitnow page-1 receipt, as `(RunOwner, raw_response_id)`) and `crafted_page` (a JSearch page whose element 3 repeats element 1's `job_uid` and whose element 5 has none, stored the same way) go into `tests/support/sources.py`; `adapters` is Task 14's. `tests/crash/test_collect_crashes.py` gains C5 and runs `test_c4_after_settle_before_parse` (Task 14):
+
+```python
+def test_c5_between_responses_resumes_without_duplicates(migrated, proc_env, procs, fixture_log) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")   # two pages: A dies after parsing the first
+    die_at(migrated, proc_env, procs, fixture_log, "collect.parse.between_responses")
+    assert one(migrated, "SELECT count(*) FILTER (WHERE r.parsed_at IS NULL) FROM raw_responses r JOIN fetch_requests f ON f.id = r.fetch_request_id "
+               "WHERE f.run_id = %s AND f.status = 'succeeded'", run_id) == (1,)   # one response left unparsed
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    rows = pg_rows(migrated, "superuser", "SELECT r.parsed_at IS NOT NULL, r.item_count, count(i.id), count(DISTINCT i.item_index) FROM raw_responses r "
+                   "JOIN fetch_requests f ON f.id = r.fetch_request_id LEFT JOIN raw_items i ON i.raw_response_id = r.id "
+                   "WHERE f.run_id = %s AND f.status = 'succeeded' GROUP BY r.id", run_id)
+    assert len(rows) == 2 and all(parsed and n == items == distinct for parsed, n, items, distinct in rows)   # parsed once, no duplicate row, dispositions conserve
+```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1907,7 +2198,7 @@ git commit -m "feat(m1): parse_normalize node with one raw item per element, dis
 
 **Files:**
 - Create: `backend/src/jobhunter/scoring/__init__.py`, `scoring/versioning.py`, `scoring/filters.py`, `graphs/collect/nodes/hard_filters.py`, `tests/support/facts.py`
-- Modify: `backend/src/jobhunter/worker/main.py` (`jobhunter.scoring.filters` in `_REGISTERING_MODULES`)
+- Modify: `backend/src/jobhunter/worker/main.py` (`jobhunter.scoring.filters` in `_REGISTERING_MODULES`), `backend/src/jobhunter/graphs/collect/graph.py` (`hard_filters` wired in place of its pass-through), `tests/support/collect.py` (`posting_factory`, `board`, `board20`)
 - Test: `tests/unit/test_hard_filters.py`, `tests/integration/test_hard_filter_results.py`
 
 **Interfaces:**
@@ -1926,8 +2217,9 @@ git commit -m "feat(m1): parse_normalize node with one raw item per element, dis
 ```python
 # tests/unit/test_hard_filters.py
 import pytest
+from jobhunter.run_settings import ScopeLocation, SeniorityRange
 from jobhunter.scoring.filters import evaluate
-from tests.support.facts import BERLIN, HAMBURG, LONDON, facts, scope   # Location fixtures with gazetteer ids; `facts(**overrides)` and `scope(**overrides)` builders over the seeded defaults
+from tests.support.facts import AMBIGUOUS_WITH_ONE_DE_CANDIDATE, BERLIN, HAMBURG, LONDON, POTSDAM_40KM, facts, scope   # Location fixtures with gazetteer ids; `facts(**overrides)` and `scope(**overrides)` builders over the seeded defaults
 def test_unknown_passes_and_positive_evidence_fails() -> None:
     assert evaluate(facts(), "", scope()).passed and evaluate(facts(locations=()), "", scope()).passed
     assert evaluate(facts(locations=(LONDON,)), "", scope(remote_within_germany=False)).reasons == ("outside_germany",)
@@ -1973,7 +2265,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.scoring'`
 
 - [ ] **Step 3: Implement the filters, the writes, the reconciler and the node**
 
-`job_factory` (`tests/support/collect.py`, also used by Tasks 19 and 20 with `posting_factory`, `board` and `board20`) inserts jobs, postings and observations directly with the given facts. `outside_germany` is positive only when every location is resolved and every candidate is outside `DE`; a remote-capable job (`remote ∈ work_mode_possible`) with the toggle on passes unless structured `remote_countries` is non-empty and excludes `DE`. `beyond_radius` applies only when `work_mode_possible ⊆ {onsite, hybrid}` and the scope has locations; a location whose candidates fall into different bands is unknown.
+`tests/support/facts.py` exports the Location fixtures `BERLIN`, `HAMBURG`, `LONDON`, `POTSDAM_40KM` and `AMBIGUOUS_WITH_ONE_DE_CANDIDATE` (one DE and one foreign candidate) with the two builders. The integration test uses Task 14's `job_factory`; this task adds to `tests/support/collect.py` the fixtures Tasks 19 and 20 use: `posting_factory` (`(engine, *, source_id, native_id, availability, last_seen_at, availability_changed_at) -> int`: a posting with its job and one observation) and `board`/`board20` (a `Board(instance_id, postings: Mapping[str, int])`: a greenhouse watchlist company `acme-board`, a slug the fixture routes answer with `greenhouse_404`, enabled through `seed_inputs(…, enabled=("ats",))`, its instance with `last_snapshot_active_count` = the posting count, and 3 or 20 `active` postings with their jobs). `outside_germany` is positive only when every location is resolved and every candidate is outside `DE`; a remote-capable job (`remote ∈ work_mode_possible`) with the toggle on passes unless structured `remote_countries` is non-empty and excludes `DE`. `beyond_radius` applies only when `work_mode_possible ⊆ {onsite, hybrid}` and the scope has locations; a location whose candidates fall into different bands is unknown.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1993,13 +2285,14 @@ git commit -m "feat(m1): hard filters on positive evidence, hard_filter_results 
 
 **Files:**
 - Create: `backend/src/jobhunter/normalize/fields.py`, `backend/src/jobhunter/dedup/__init__.py`, `dedup/revisions.py`, `backend/src/jobhunter/db/ranking.py`, `tests/support/observations.py`
+- Modify: `tests/support/collect.py` (`job_with_postings`)
 - Test: `tests/unit/test_canonical_fields.py`, `tests/integration/test_revisions.py`
 
 **Interfaces:**
-- Consumes: `NormalizedPosting`, `DetFacts`, `det_facts_hash`, `canonical_json`, `content_hash`, `normalize_title`, `company_key`, `detect_language`.
+- Consumes: `NormalizedPosting`, `DetFacts`, `det_facts_hash`, `canonical_json`, `content_hash`, `normalize_title`, `company_key`, `detect_language`, `seed.SOURCES`.
 - Produces:
   - `@dataclass(frozen=True) class fields.ObservationView: posting_id: int; observation_id: int; source_instance_id: int; source_id: str; observed_at: datetime; normalized: NormalizedPosting; completeness: str; quality: str`
-  - `fields.SOURCE_RANK: Final[Mapping[str, int]]` (`greenhouse`…`smartrecruiters`: 1; `jsearch`, `serpapi`: 2; `arbeitnow`: 3; `adzuna`: 4)
+  - `fields.SOURCE_RANK: Final[Mapping[str, int]] = MappingProxyType({s.id: s.precedence_rank for s in seed.SOURCES})` (derived from the one table of Task 1: the ATS boards 1, `jsearch` and `serpapi` 2, `arbeitnow` 3, `adzuna` 4)
   - `@dataclass(frozen=True) class fields.CanonicalFields`: every `jobs` column the §8.8 table selects (`company_key`, `company_display`, `title`, `title_norm`, `seniority_tokens`, `locations`, `location_kind`, `work_mode_possible`, `work_mode_source`, `remote_countries`, `employment_types`, `employment_source`, `salary`, `industry_structured`, `ad_language`, `completeness`, `posted_at_effective`, `posted_precision`, `source_ids`), the description (`description_text`, `description_completeness`, `description_quality`), `field_provenance: dict[str, Provenance]` (`Provenance(source_instance_id, posting_id, observation_id, observed_at, rule)`), `det_facts: DetFacts`, `det_facts_hash: bytes`, `llm_input: dict[str, JSONValue]` (exactly `title`, `company_display`, `locations` (labels), `work_mode_possible` + `work_mode_source`, `employment_types` + `employment_source`, `ad_language`, `description_completeness`, `description_text`), `material_hash: bytes`, `lineage: dict[str, Provenance]` (per `llm_input` field), `conflicts: tuple[str, ...]` (fields whose structured values disagreed)
   - `fields.select_canonical(observations: Sequence[ObservationView], *, first_seen_at: datetime, watchlist_display: str | None) -> CanonicalFields` (the §8.8 precedence table; ties by most recent `observed_at`, then lowest posting id; `posted_at_effective = min(best-precision provider date, first_seen_at)`, `unknown` when none; `ad_language` structured > `detect_language(description_text)` > `unknown`; `location_kind = multi` for ≥ 2 locations; `source_ids` sorted)
   - `@dataclass(frozen=True) class revisions.RecomputeResult: job_id: int; revision_id: int; revision_created: bool; current_changed: bool; det_facts_changed: bool; tainted_reuse_refused: bool; conflicts: tuple[str, ...]`; `async def revisions.recompute_job(conn, job_id: int, *, now: datetime, fenced_source_ids: frozenset[str] = frozenset()) -> RecomputeResult` (the caller holds the job row `FOR UPDATE`; loads the latest observation of every posting of the job (and of the jobs merged into it), excluding the observations of a fenced source, `select_canonical`, writes the `jobs` columns, `field_provenance`, `det_facts_hash`, `updated_at`; reuses the revision with `(job_id, material_hash)`; when that revision's lineage names a fenced source the reuse is refused **and nothing is created either**, because `UNIQUE (job_id, material_hash)` forbids a second row while it exists: the job keeps its current revision and the result says `tainted_reuse_refused` (M5's purge deletes the tainted revision, after which the same recompute creates it anew; Deviation 24); otherwise inserts `job_revisions(revision_no = max + 1, embedding_status = 'awaiting_embedding')` with its `job_revision_sources` rows; moves `current_revision_id` and inserts a `job_revision_occurrences` row when it changed; raises `dedup.field_conflict` info per conflict)
@@ -2011,7 +2304,7 @@ git commit -m "feat(m1): hard filters on positive evidence, hard_filter_results 
 # tests/unit/test_canonical_fields.py
 from datetime import UTC, datetime, timedelta
 from jobhunter.normalize.fields import select_canonical
-from tests.support.observations import obs   # obs(source_id, posting_id, observed_at, **normalized overrides) → ObservationView with sane defaults
+from tests.support.observations import obs, predicted, stated   # obs(source_id, posting_id, observed_at, **normalized overrides) → ObservationView with sane defaults; stated/predicted(min, max) → an EUR-per-year Salary of that kind
 T = datetime(2026, 10, 16, 9, tzinfo=UTC)
 def test_description_and_title_precedence() -> None:
     adz = obs("adzuna", 1, T, description_text="x" * 500 + "…", description_completeness="partial", title_raw="Senior Engineer (m/w/d)")
@@ -2081,7 +2374,7 @@ git commit -m "feat(m1): canonical field selection with provenance, material pro
 
 **Files:**
 - Create: `backend/src/jobhunter/dedup/identity.py`, `dedup/merge.py`, `graphs/collect/nodes/resolve_identity.py`
-- Modify: `tests/crash/test_collect_crashes.py` (C5b, C6)
+- Modify: `backend/src/jobhunter/graphs/collect/graph.py` (`resolve_identity` wired in place of its pass-through), `tests/support/collect.py` (`pending_item`), `tests/crash/test_collect_crashes.py` (C5b, C6)
 - Test: `tests/integration/test_identity.py`, `tests/integration/test_merge_unmerge.py`, `tests/integration/test_fenced_items.py`
 
 **Interfaces:**
@@ -2098,9 +2391,10 @@ git commit -m "feat(m1): canonical field selection with provenance, material pro
 ```python
 # tests/integration/test_identity.py
 import pytest, sqlalchemy as sa
+from jobhunter.clock import utcnow
 from jobhunter.dedup.identity import resolve_item
 from jobhunter.errors import FencedOut
-from tests.support.collect import pending_item   # pending_item(engine, owner, source_id, normalized_overrides, *, fetched_at) → raw_item_id, via a stored page and parse_response
+from tests.support.collect import pending_item, queued_run   # pending_item(engine, owner, source_id, normalized_overrides, *, fetched_at=None) → raw_item_id, via a stored page and parse_response; fetched_at None is utcnow()
 pytestmark = pytest.mark.integration
 
 async def test_new_job_posting_observation_keys_revision_and_filters(engine, current_epoch) -> None:
@@ -2155,7 +2449,31 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.dedup.ident
 - [ ] **Step 3: Implement identity, merge and the node; add the crash cases**
 
 - The `tombstone_keys` hash is `sha256(ns.encode() + b"\x00" + value.encode())`; `tombstone_keys` rows are written by M5's tombstoning, this task only reads them.
-- `tests/crash/test_collect_crashes.py` gains `test_c5b_pending_items_are_all_resumed` (point `collect.before_resolve_identity`: after B, `count(linked) + count(out_of_scope) + count(rejected) + count(deferred)` of the run equals the pending count A left, and `count(pending) == 0`) and `test_c6_item_transaction_rolls_back_without_a_partial_posting` (point `collect.identity.in_item_tx` → after A dies the item is still `pending` and `postings` has no row for it; after B it is `linked` and `count(postings) == count(linked items of distinct native ids)`).
+- `tests/support/collect.py` gains `pending_item` (as the test's import says). `tests/crash/test_collect_crashes.py` gains C5b and C6:
+
+```python
+ITEMS = ("SELECT i.disposition, count(*) FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
+         "JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = %s GROUP BY 1")
+
+def test_c5b_pending_items_are_all_resumed(migrated, proc_env, procs, fixture_log) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.before_resolve_identity")
+    left, sent = dict(pg_rows(migrated, "superuser", ITEMS, run_id)), served_requests(fixture_log)
+    assert left.get("pending", 0) > 0 and "linked" not in left   # A parsed every page and resolved nothing
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    after = dict(pg_rows(migrated, "superuser", ITEMS, run_id))
+    assert "pending" not in after and sum(after.values()) == sum(left.values()) and served_requests(fixture_log) == sent   # resumed from `normalized`: no re-fetch, no re-parse
+    assert sum(after.get(d, 0) - left.get(d, 0) for d in ("linked", "out_of_scope", "rejected", "deferred")) == left["pending"]   # none skipped
+
+def test_c6_item_transaction_rolls_back_without_a_partial_posting(migrated, proc_env, procs, fixture_log) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.identity.in_item_tx")
+    assert one(migrated, "SELECT count(*) FROM postings") == (0,) and "linked" not in dict(pg_rows(migrated, "superuser", ITEMS, run_id))   # the item's transaction rolled back
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    assert "pending" not in dict(pg_rows(migrated, "superuser", ITEMS, run_id))
+    assert one(migrated, "SELECT (SELECT count(*) FROM postings) = (SELECT count(DISTINCT native_id) FROM raw_items WHERE disposition = 'linked'), "
+               "(SELECT count(*) FROM postings) > 0") == (True, True)   # every item linked once, no partial or second posting
+```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -2176,10 +2494,10 @@ git commit -m "feat(m1): identity resolution with strong-key merges, exclusive c
 **Files:**
 - Create: `backend/src/jobhunter/availability/__init__.py`, `availability/rules.py`, `availability/snapshots.py`
 - Modify: `backend/src/jobhunter/dedup/identity.py` (step 4 calls `apply_sighting`), `graphs/collect/nodes/resolve_identity.py` (the snapshot pass), `backend/src/jobhunter/worker/main.py` (`jobhunter.availability.rules`, `jobhunter.availability.snapshots` in `_REGISTERING_MODULES`)
-- Test: `tests/integration/test_availability.py`, `tests/integration/test_snapshots.py`
+- Test: `tests/integration/test_availability.py`, `tests/integration/test_snapshots.py`, `tests/integration/test_board_not_found.py` (extended: Review Focus 5, the postings half)
 
 **Interfaces:**
-- Consumes: Task 18; `transition`, `raise_alert`, `resolve_alert`, `ranking.bump`, `reconciler`.
+- Consumes: Task 18; `transition`, `raise_alert`, `resolve_alert`, `ranking.bump`, `reconciler`; the fixtures `posting_factory`, `board` and `board20` (Task 16), `adapters` and `make_deps` (Task 14).
 - Produces:
   - `rules.JOB_ORDER: Final = ("active", "unknown", "stale", "closed")`; `@dataclass(frozen=True) class rules.SightingEffect: revived: bool; latest_moved: bool`; `async def rules.apply_sighting(conn, posting_id: int, *, observed_at: datetime, observation_id: int) -> SightingEffect` — **observation accounting, called by identity only** (`seen_count + 1`; `last_seen_at = greatest`; `latest_observation_id` when `observed_at ≥` the latest's; `stale | unknown | closed → active` only when `observed_at > availability_changed_at`, a `closed → active` logged `posting_reopened`; `absent_snapshots = 0, first_absent_at = NULL`); `async def rules.apply_membership(conn, posting_id: int, *, taken_at: datetime) -> bool` — **membership effects, called by snapshots only**: the revival rule and the absence reset of a member (§8.11: "a member of any snapshot"), never `seen_count`, `last_seen_at` or `latest_observation_id` (those belong to the observation the item produced, or to no observation when the item failed normalisation); `async def rules.recompute_job_availability(conn, job_id: int) -> bool` (the best of its postings by `JOB_ORDER`; sets `availability_changed_at` and bumps the ranking when it changed); `async def rules.stale_sweep(conn, *, now, stale_ttl_days: int, limit: int = 1000) -> int` (lock order: the jobs of the batch `FOR UPDATE` in id order **first**, then their postings `active → stale` for non-ATS instances with `now − last_seen_at > stale_ttl_days`, then the jobs recomputed, `ranking_state` last; the batch is chosen by a plain read and re-checked after the lock); reconciler `stale_sweep` (cadences `tick`, `daily`; `fence_epoch(conn, ctx.epoch)` opens each batch transaction; `stale_ttl_days` from the active settings)
   - `@dataclass(frozen=True) class snapshots.SnapshotEffect: revived: int; absent_marked: int; closed: int; unknown: int; mass_opened: bool; mass_followup: bool; mass_cleared: bool; mass_confirmed: bool`; `async def snapshots.apply_snapshot(conn, snapshot_id: int, *, now, guard: Callable[[AsyncConnection], Awaitable[None]]) -> SnapshotEffect` (guarded by `applied_at`; lock order: the jobs of the instance's `active`/`unknown` postings and of the members `FOR UPDATE` in id order, then `guard(conn)` (the node passes `lambda c: ledger.lock_run_owner(c, owner)`, the reconciler `lambda c: fence_epoch(c, ctx.epoch)`), then the posting, snapshot and instance rows; members → `apply_membership(taken_at)` (a member without a posting, for example an item that was rejected, is ignored); the snapshot's **absent set** = the instance's `active`/`unknown` postings that are not members; from a structurally complete snapshot `absent_snapshots = LEAST(absent_snapshots + 1, 2)`, `first_absent_at = COALESCE(first_absent_at, taken_at)`, `last_absent_snapshot_id` idempotency, then `active | unknown → closed('ats_absent')` when `absent_snapshots ≥ 2` and `taken_at − first_absent_at ≥ 24 h`; from an incomplete or a mass-disappearance snapshot `active → unknown` without counting; the mass classification against the frozen baseline `last_snapshot_active_count` (> 50% and ≥ 5 absent opens an event: status `mass_disappearance`, `mass_event_snapshot_id`, the absent set written to `ats_snapshot_absences` for the opening snapshot — the event's frozen absent set, never re-derived from mutable posting columns (Deviation 22) — and `ats.mass_disappearance` warn; a follow-up keeps `event_snapshot_id`; otherwise `complete` clears the event and resets the baseline); the confirmation rule of §8.11 over structurally complete snapshots (two later ones ≥ 24 h apart whose members exclude every posting of the frozen set) → `unknown → closed('mass_disappearance_confirmed')` for the frozen set, baseline reset, alert resolved; `applied_at = now`; every touched job recomputed; ranking bumped once)
@@ -2202,7 +2520,7 @@ from datetime import timedelta
 H = timedelta(hours=1)
 async def test_absence_counting_closes_at_two_absences_a_day_apart(engine, current_epoch, board) -> None:
     ... # board with postings {a, b, c} active, baseline 3; snapshots every 6 h without `a`: t0 (absent 1, first_absent t0), +6 h (2), +12 h (2, no close), +18 h (2), +24 h → a closed('ats_absent');
-    # applying the +6 h snapshot twice counts once; an incomplete snapshot at +30 h → b and c unknown, absence not counted; a complete one at +36 h with b → b active, c closed? no: c stays unknown until its own two absences a day apart
+    # applying the +6 h snapshot twice counts once; an incomplete snapshot at +30 h → b and c unknown, absence not counted; a complete one at +36 h with b → b active, c stays unknown until its own two absences a day apart
 async def test_mass_disappearance_open_followup_confirm_and_acknowledge(engine, current_epoch, board20) -> None:
     ... # §8.11 example: 20 active, baseline 20; 06:00 d1 snapshot with 0 members → mass_disappearance, every posting unknown, `ats.mass_disappearance` open, baseline still 20;
     # 12:00 d1, 18:00 d1, 00:00 d2 follow-ups (event_snapshot_id set, nothing closed); 12:00 d2 → confirmed: 20 closed('mass_disappearance_confirmed'), baseline 0, mass_event_snapshot_id NULL, alert resolved;
@@ -2211,6 +2529,25 @@ async def test_mass_disappearance_open_followup_confirm_and_acknowledge(engine, 
 async def test_snapshot_membership_never_counts_a_sighting(engine, current_epoch, board) -> None:
     ... # posting a was linked by an item of the run (seen_count 2) and is a member of the run's complete snapshot: after apply_snapshot seen_count is still 2 and
     # last_seen_at unchanged; a stale member not sighted by an item is revived with seen_count unchanged; a member native id without a posting (its item was rejected) is ignored
+```
+
+```python
+# tests/integration/test_board_not_found.py (appended; the file's imports gain stale_sweep, make_fetch_cell, make_plan, make_resolve_identity,
+# initial_state, make_deps and queued_run from their modules)
+POSTINGS = sa.text("SELECT id, availability, availability_changed_at, absent_snapshots, first_absent_at FROM postings WHERE source_instance_id = :i ORDER BY id")
+async def test_board_404_ages_no_posting(engine, current_epoch, adapters, board) -> None:  # Review Focus 5, the postings half (moved here from Task 11)
+    async with engine.connect() as c: before = (await c.execute(POSTINGS, {"i": board.instance_id})).all()
+    owner, deps = await queued_run(engine, include_paid=False), make_deps(engine, adapters)
+    state = initial_state(owner.run_id, owner.attempt_no)
+    for fid in (await make_plan(deps)(state))["primary_fetch_request_ids"]:
+        await make_fetch_cell(deps)({"fetch_request_id": fid})   # the board answers 404 (greenhouse_404)
+    await make_resolve_identity(deps)(state)   # the run's snapshot pass
+    async with engine.begin() as c: await stale_sweep(c, now=utcnow() + timedelta(days=100), stale_ttl_days=30)
+    async with engine.connect() as c:
+        after = (await c.execute(POSTINGS, {"i": board.instance_id})).all()
+        health, snapshots = (await c.execute(sa.text("SELECT health, (SELECT count(*) FROM ats_snapshots WHERE source_instance_id = :i) FROM source_instances WHERE id = :i"),
+                                             {"i": board.instance_id})).one()
+    assert len(before) == 3 and after == before and (health, snapshots) == ("not_found", 0)   # the failure aged nothing: no snapshot, no unknown, no stale, no close
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2224,7 +2561,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.availabilit
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `uv run pytest tests/integration/test_availability.py tests/integration/test_snapshots.py tests/integration/test_identity.py -q`
+Run: `uv run pytest tests/integration/test_availability.py tests/integration/test_snapshots.py tests/integration/test_board_not_found.py tests/integration/test_identity.py -q`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -2272,7 +2609,7 @@ def test_scores_and_g5_thresholds() -> None:
 ```python
 # tests/unit/test_group_rules.py
 from jobhunter.dedup.groups import pair_evidence
-from tests.support.groups import job   # job(**overrides) → JobView with Berlin, {senior}, full text, company "acme"
+from tests.support.groups import LEIPZIG, POTSDAM_24KM, UNRESOLVED, ZURICH, job   # job(**overrides) → JobView with Berlin, {senior}, full text, company "acme"; the Location fixtures
 def test_decision_table() -> None:
     assert pair_evidence(job(id=1), job(id=2, title_norm="senior software engineer"), 1.0) is not None  # "Sr." normalised earlier: identical title_norm
     assert pair_evidence(job(id=1, ats_boards=frozenset({"greenhouse:acme"})), job(id=2, ats_boards=frozenset({"greenhouse:acme"})), 1.0) is None  # G1
@@ -2303,12 +2640,26 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.dedup.shing
 
 - [ ] **Step 3: Implement the modules, the node pass and the reconciler**
 
-`title_similarity` is `SELECT similarity(:a, :b)` (pg_trgm) per candidate pair; candidates are read with one query over `jobs_company`. `tests/crash/test_collect_crashes.py` gains `test_c6b_grouping_resumes_from_occurrences` (point `collect.identity.before_grouping`, with two Adzuna re-ingests of one ad in the fixtures: A dies after its items are linked and before any grouping; after B the two jobs form one active group, so a linked-but-ungrouped revision is never lost).
+`title_similarity` is `SELECT similarity(:a, :b)` (pg_trgm) per candidate pair; candidates are read with one query over `jobs_company`. `tests/support/groups.py` exports `job(**overrides)` and the Location fixtures `ZURICH`, `UNRESOLVED`, `POTSDAM_24KM` and `LEIPZIG` (about 150 km from Berlin). `tests/crash/test_collect_crashes.py` gains C6b over the fixture pair `adzuna_reingest_pair` (Task 6, Ruling P7), which the Adzuna page-1 route serves; the file's imports gain `json` and `tests.support.sources.load_fixture`:
+
+```python
+def test_c6b_grouping_resumes_from_occurrences(migrated, proc_env, procs, fixture_log) -> None:
+    results = json.loads(load_fixture("adzuna", "adzuna_reingest_pair")[2])["results"]
+    pair = (str(results[0]["id"]), str(results[-1]["id"]))   # one ad under two Adzuna ids
+    run_id = manual_paid_run(migrated, only="adzuna")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.identity.before_grouping")
+    assert one(migrated, "SELECT count(*) FROM duplicate_groups") == (0,)   # A linked its items and grouped nothing
+    assert one(migrated, "SELECT count(DISTINCT job_id) FROM postings WHERE native_id IN (%s, %s)", *pair) == (2,)
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    groups = pg_rows(migrated, "superuser", "SELECT m.group_id FROM postings p JOIN duplicate_group_members m ON m.job_id = p.job_id "
+                     "JOIN duplicate_groups g ON g.id = m.group_id WHERE g.status = 'active' AND p.native_id IN (%s, %s)", *pair)
+    assert len(groups) == 2 and len(set(groups)) == 1   # B grouped them from the occurrences: a linked-but-ungrouped revision is never lost
+```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `uv run pytest tests/unit tests/integration/test_groups.py tests/integration/test_identity.py -q`
-Expected: PASS
+Run: `uv run pytest tests/unit tests/integration/test_groups.py tests/integration/test_identity.py -q && uv run pytest tests/crash/test_collect_crashes.py -k c6b -q`
+Expected: PASS for both commands
 
 - [ ] **Step 5: Commit**
 
@@ -2321,8 +2672,8 @@ git commit -m "feat(m1): probable-duplicate groups (G1-G5), shingle confirmation
 ### Task 21: The embedder service (image, checksum, `/v1/embed`, `/health`) and spike V7
 
 **Files:**
-- Create: `embedder/Dockerfile`, `embedder/app.py`, `embedder/health.py`, `embedder/model.lock`, `embedder/download_model.sh`, `scripts/spikes/v7_embedder.py`, `docs/spikes/V7.md`, `tests/embedder/__init__.py`, `tests/embedder/test_app.py`
-- Modify: `pyproject.toml` (the `embedder` dependency group; marker `embedder_model`, deselected by default), `.gitignore` (`.model-cache/`)
+- Create: `embedder/__init__.py` (so `embedder.app` is an importable package for the tests and mypy), `embedder/Dockerfile`, `embedder/app.py`, `embedder/health.py`, `embedder/model.lock`, `embedder/download_model.sh`, `scripts/spikes/v7_embedder.py`, `docs/spikes/V7.md`, `tests/embedder/__init__.py`, `tests/embedder/test_app.py`
+- Modify: `pyproject.toml` (the `embedder` dependency group; marker `embedder_model`, deselected by default), `.gitignore` (`.model-cache/`), `mypy.ini` (`embedder/` in `files`)
 
 **Interfaces:**
 - Consumes: nothing from the `jobhunter` package (the embedder image does not contain it).
@@ -2331,7 +2682,7 @@ git commit -m "feat(m1): probable-duplicate groups (G1-G5), shingle confirmation
   - `embedder/download_model.sh <model-dir>`: `curl` of `https://huggingface.co/<repo>/resolve/<revision>/<file>` for each locked file, `sha256sum --check` against the lock; non-zero exit on a mismatch
   - `embedder/app.py`: `MAX_TOKENS: Final = 1024`, `MAX_BATCH: Final = 16`, `MAX_TEXT_BYTES: Final = 65_536`, `DIM: Final = 1024`, `QUERY_PREFIX: Final = "query: "`; `class ChecksumMismatch(Exception)`; `verify_checksums(model_dir: Path, lock: Path) -> str` (returns `model_id`; raises `ChecksumMismatch` naming the file); `class Model(Protocol): def embed(self, texts: Sequence[str], input_kind: Literal["query", "passage"]) -> tuple[list[list[float]], list[bool], list[int]]` (vectors, truncated flags, token counts); `class OnnxModel(Model)` (`tokenizers.Tokenizer.from_file`, truncation at 1024 and padding per batch, `onnxruntime.InferenceSession` with `intra_op_num_threads` from `EMBEDDER_THREADS` (default 3), the `query: ` prefix for queries only, the pooled output (`sentence_embedding`, or mean pooling over `last_hidden_state` when that is the export's output: V7 records which) L2-normalised as float32); `create_app(model: Model, *, model_id: str, checksum_ok: bool) -> FastAPI` with `GET /health` → `200 {"status": "ok", "model_id", "checksum_ok": true, "dim": 1024}` (503 when `checksum_ok` is false) and `POST /v1/embed` (`{"input_kind": "query" | "passage", "texts": [...]}` → `{"model_id", "vectors": [[1024 floats]], "truncated": [bool], "tokens": [int]}`; 413 for more than 16 texts or a text over 64 KiB; 422 for anything else); `main()` reads `EMBEDDER_MODEL_DIR` (default `/opt/model`), verifies the checksums (exit 78 on a mismatch, logged by file name) and serves on `0.0.0.0:8080`
   - `embedder/health.py` (installed as `/usr/local/bin/embedder-health`): `GET http://127.0.0.1:8080/health` within 3 s, exit 0 iff 200 and `checksum_ok`
-  - `embedder/Dockerfile`: `ARG PYTHON_IMAGE`, `ARG UV_IMAGE` like the app image; `uv sync --locked --no-dev --no-install-project --only-group embedder` into `/opt/venv`; `download_model.sh /opt/model` at build; `COPY embedder/app.py embedder/health.py /app/`; `USER 10004:10004`; `EXPOSE 8080`; `CMD ["python", "/app/app.py"]`; runs read-only (nothing is written at run time)
+  - `embedder/Dockerfile`: `ARG PYTHON_IMAGE`, `ARG UV_IMAGE` like the app image; `uv sync --locked --no-dev --no-install-project --only-group embedder` into `/opt/venv`; `download_model.sh /opt/model` at build; `COPY embedder/app.py embedder/health.py embedder/model.lock /app/` (`main()` verifies the model against the lock at start); `USER 10004:10004`; `EXPOSE 8080`; `CMD ["python", "/app/app.py"]`; runs read-only (nothing is written at run time)
   - `scripts/spikes/v7_embedder.py`: loads `OnnxModel` from a local model directory (downloaded with `download_model.sh` into the gitignored `.model-cache/`), embeds the descriptions of 50 fixture ads at 1,024 tokens, prints docs/s, peak RSS (`resource.getrusage`), the cosine parity against the fp32 export (`onnx/model.onnx` + `model.onnx_data`, 2.27 GB, downloaded into `.model-cache/` only for the spike) and the query-prefix check (a `query: python developer` vector is closer to a Python ad than to a nursing ad, and differs from the same text embedded as a passage)
 
 - [ ] **Step 1: Write the failing tests**
@@ -2378,7 +2729,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'embedder'`
 
 - `pyproject.toml`: the `embedder` group; `tests/embedder` is type-checked like the other tests (`embedder/` is added to `mypy.ini`'s `files`). `app.py` imports `onnxruntime` and `tokenizers` inside `OnnxModel.__init__` only, so `create_app`, `verify_checksums` and `tests/embedder/test_app.py` run in the base environment (fastapi is a runtime dependency of the api already); CI's `unit` job runs `tests/embedder` (Task 24).
 - V7 (free, local): `embedder/download_model.sh .model-cache/arctic` (590 MB), then `uv run --group embedder python scripts/spikes/v7_embedder.py .model-cache/arctic --fp32 .model-cache/arctic-fp32`. Record in `docs/spikes/V7.md`: docs/s at 1,024 tokens, RSS, parity, the output name of the int8 export and the prefix check. Acceptance in this container: ≥ 1.5 docs/s, RSS ≤ 3 GB, parity ≥ 0.99. The VPS run of §22 V7 is repeated at deployment (§23: the VPS is chosen then); a parity below 0.99 switches `model.lock` to `onnx/model_fp16.onnx` (sha256 `0b6846bcf4c0d9e53fdfc70d6dc1bbe3bb40fd205ebb7f0365da5b07064ddccc`).
-- `docker build -f embedder/Dockerfile --build-arg PYTHON_IMAGE=… --build-arg UV_IMAGE=… -t jobhunter-embedder:dev .` must succeed and `docker run --rm jobhunter-embedder:dev python -c "..."` must show `/opt/model` verified.
+- `docker build -f embedder/Dockerfile --build-arg PYTHON_IMAGE=… --build-arg UV_IMAGE=… -t jobhunter-embedder:dev .` must succeed and `docker run --rm --workdir /app jobhunter-embedder:dev python -c "from pathlib import Path; from app import verify_checksums; print(verify_checksums(Path('/opt/model'), Path('model.lock')))"` must print the lock's `model_id` (exit 0: `/opt/model` verified).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -2398,20 +2749,20 @@ git commit -m "feat(m1): embedder service with pinned arctic-embed-l-v2.0 int8, 
 
 **Files:**
 - Create: `backend/src/jobhunter/embeddings.py`, `graphs/collect/nodes/embed.py`, `tests/support/embedder.py`
-- Modify: `backend/src/jobhunter/observability/health.py` (`ReadinessCode` gains `"embedder"`, `check_readiness(…, embedder=…)`, `SystemHealthOut.embedder`), `backend/src/jobhunter/api/{app.py,deps.py,routes/health.py,routes/system.py}` (an `EmbedderClient` in the app state), `backend/src/jobhunter/observability/metrics.py` (`EMBED_SECONDS` histogram), `backend/src/jobhunter/worker/main.py` (`jobhunter.graphs.collect.nodes.embed` in `_REGISTERING_MODULES`, the client in `CollectDeps`), `deploy/compose.dev.yaml` (the `embedder` service, `JOBHUNTER_EMBEDDER_URL`, the worker's `depends_on`), `tests/support/{fixtures,pg}.py` (the fake embedder's URL in `make_config` and `process_env`), `tests/crash/test_collect_crashes.py` (C7)
+- Modify: `backend/src/jobhunter/observability/health.py` (`ReadinessCode` gains `"embedder"`, `check_readiness(…, embedder=…)`, `SystemHealthOut.embedder`), `backend/src/jobhunter/api/{app.py,deps.py,routes/health.py,routes/system.py}` (an `EmbedderClient` in the app state), `backend/src/jobhunter/observability/metrics.py` (`EMBED_SECONDS` histogram), `backend/src/jobhunter/worker/main.py` (`jobhunter.graphs.collect.nodes.embed` in `_REGISTERING_MODULES`, the client in `CollectDeps`), `backend/src/jobhunter/graphs/collect/deps.py` (`CollectDeps.embedder` narrowed to `EmbedderClient | None`), `backend/src/jobhunter/graphs/collect/graph.py` (`embed` wired in place of its pass-through; the `error_handler` gains `EmbedderError`), `deploy/compose.dev.yaml` (the `embedder` service, `JOBHUNTER_EMBEDDER_URL`, the worker's `depends_on`), `tests/support/{fixtures,pg}.py` (the fake embedder's URL in `make_config` and `process_env`), `tests/support/collect.py` (`revisions_awaiting`), `tests/conftest.py` (`pytest_plugins` gains `tests.support.embedder`), `tests/crash/test_collect_crashes.py` (C7), `frontend/src/api/schema.d.ts` (regenerated: readiness and health changed, Ruling P8)
 - Test: `tests/integration/test_embed_node.py`, `tests/integration/test_readiness_embedder.py`
 
 **Interfaces:**
 - Consumes: Task 21's HTTP contract; Tasks 17–18; `reconciler`, `raise_alert`, `resolve_alert`.
 - Produces:
-  - `embeddings.EMBEDDING_MODEL_ID: Final = "snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/int8"`; `embeddings.BATCH: Final = 16`; `embeddings.BATCH_TIMEOUT_S: Final = 120.0`; `embeddings.HEALTH_TIMEOUT_S: Final = 2.0`
+  - `embeddings.EMBEDDING_MODEL_ID: Final = "snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/int8"`; `embeddings.BATCH: Final = 16`; `embeddings.BATCH_TIMEOUT_S: Final = 120.0`; `embeddings.HEALTH_TIMEOUT_S: Final = 2.0`; `embeddings.MAX_TEXT_BYTES: Final = 65_536` (the service's limit, Task 21)
   - `class embeddings.EmbedderError(DomainError)`: `kind: Literal["unavailable", "bad_response", "checksum"]`; `@dataclass(frozen=True) class embeddings.Embedded: vector: tuple[float, ...]; truncated: bool; tokens: int`; `@dataclass(frozen=True) class embeddings.EmbedderHealth: ok: bool; model_id: str | None; checksum_ok: bool | None`
   - `class embeddings.EmbedderClient`: `__init__(base_url: str, client: httpx.AsyncClient)`; `async embed(texts: Sequence[str], *, input_kind: Literal["query", "passage"], timeout_s: float = BATCH_TIMEOUT_S) -> list[Embedded]` (`unavailable` on a connect error, a timeout or a 5xx; `bad_response` on a non-JSON body, a wrong count, a wrong dimension, a non-finite value or a `model_id` other than `EMBEDDING_MODEL_ID`; `checksum` on a 503 health); `async health(timeout_s: float = HEALTH_TIMEOUT_S) -> EmbedderHealth` (never raises)
-  - `embeddings.embedding_text(llm_input: Mapping[str, JSONValue]) -> str` (`title`, `company_display` and `description_text` joined by newlines); `embeddings.text_sha256(text: str) -> bytes`; `async def embeddings.upsert_embedding(conn, *, model_id: str, text_sha256: bytes, input_kind: str, vector: Sequence[float]) -> int` (`INSERT … ON CONFLICT (embedding_model_id, text_sha256, input_kind) DO NOTHING`, then the id; the vector bound as the `halfvec` literal `[v1,…]`); `async def embeddings.mark_embedded(conn, revision_id: int, *, embedding_id: int, truncated: bool) -> None`
+  - `embeddings.embedding_text(llm_input: Mapping[str, JSONValue]) -> str` (`title`, `company_display` and `description_text` joined by newlines, cut to `MAX_TEXT_BYTES` UTF-8 bytes on a character boundary, so the service never answers 413 and no revision stays awaiting for its length; the 1,024-token truncation flag still comes from the service); `embeddings.text_sha256(text: str) -> bytes`; `async def embeddings.upsert_embedding(conn, *, model_id: str, text_sha256: bytes, input_kind: str, vector: Sequence[float]) -> int` (`INSERT … ON CONFLICT (embedding_model_id, text_sha256, input_kind) DO NOTHING`, then the id; the vector bound as the `halfvec` literal `[v1,…]`); `async def embeddings.mark_embedded(conn, revision_id: int, *, embedding_id: int, truncated: bool) -> None`
   - `@dataclass(frozen=True) class embeddings.EmbedReport: embedded: int; awaiting: int; truncated: int; unavailable: bool`; `async def embeddings.embed_awaiting(engine, client: EmbedderClient, *, guard: Callable[[AsyncConnection], Awaitable[None]], limit: int | None = None, batch: int = BATCH, fault: str | None = None) -> EmbedReport` (revisions `awaiting_embedding` oldest first, batches of 16; per batch one `embed` HTTP call, `afault_point("collect.embed.after_http")`, then one transaction that **first** runs `guard(conn)` — the post-I/O ownership check: the node passes `lambda c: ledger.lock_run_owner(c, owner)`, the reconciler `lambda c: fence_epoch(c, ctx.epoch)`; `FencedOut` propagates and the attempt is lost, no vector of a superseded owner is committed — then the `embeddings` upserts and `UPDATE job_revisions … WHERE id = ANY(:ids) AND embedding_status = 'awaiting_embedding'` (a revision embedded meanwhile is left alone); `EmbedderError(unavailable)` stops the loop and counts the rest as `awaiting`; `EMBED_SECONDS` observed per batch; `afault_point(fault)` after each batch when given)
   - Two entry points over that loop: `nodes/embed.make_embed(deps)` (`embed_awaiting(…, guard=<owner lock>, fault="collect.embed.between_batches")`; on `unavailable` raises `embedder.unavailable` warn (subject `embedder`) and returns `counters["revisions_awaiting"]`, which makes the run `partial` (Task 23)) and the reconciler `awaiting_embedding` (`embeddings.reconcile_awaiting_embedding(ctx)`, cadence `heavy`: when `client.health().ok`, `embed_awaiting(…, guard=<epoch fence>)` over revisions awaiting for more than 10 min, resolving the alert when none is left)
   - Readiness: `health.ReadinessCode = Literal["db", "migrations", "worker_heartbeat", "embedder"]`; `async def health.check_readiness(engine, *, code_head: str, now: datetime, embedder: EmbedderClient | None) -> ReadinessReport` (the probe `embedder` fails when `health()` is not `ok` with `checksum_ok`); `SystemHealthOut.embedder: EmbedderOut(ok: bool, model_id: str | None, checksum_ok: bool | None)`; `deps.get_embedder(request) -> EmbedderClient`; `create_app` builds the client from `cfg.embedder_url` on an `httpx.AsyncClient` closed by the lifespan
-  - `tests/support/embedder.py`: `class FakeEmbedder` (a `ThreadingHTTPServer` on `127.0.0.1:0` answering `/health` and `/v1/embed` with deterministic unit vectors seeded from the text's sha256, `truncated` for texts over 4,000 characters; `down: bool` makes it refuse connections, `checksum_ok`, `dim` and `model_id` configurable; `batches: list[int]` records the size of every embed request; `base_url`); the session fixture `fake_embedder` and `make_config`/`process_env` pass its URL as `JOBHUNTER_EMBEDDER_URL`
+  - `tests/support/embedder.py`: `class FakeEmbedder` (a `ThreadingHTTPServer` on `127.0.0.1:0` answering `/health` and `/v1/embed` with deterministic unit vectors seeded from the text's sha256, `truncated` for texts over 4,000 characters; `down: bool` makes it refuse connections, `checksum_ok`, `dim` and `model_id` configurable; `batches: list[int]` records the size of every embed request; `base_url`); one server per session, whose URL `make_config`/`process_env` pass as `JOBHUNTER_EMBEDDER_URL`, and the function fixture `fake_embedder`, which hands it to the test after resetting `down`, `checksum_ok`, `dim`, `model_id` and `batches`, so no switch leaks from one test into the next
   - `deploy/compose.dev.yaml`: service `embedder` (build `embedder/Dockerfile` with the lock's `python`/`uv` args, image `jobhunter-embedder:dev`, `read_only: true`, `user: "10004:10004"`, `cap_drop: [ALL]`, `security_opt`, `networks: [internal]`, `healthcheck: {test: ["CMD", "embedder-health"], interval: 30s, start_period: 120s, start_interval: 2s}`, `mem_limit: 3500m`, `cpus: 3`, `restart: unless-stopped`); `JOBHUNTER_EMBEDDER_URL: http://embedder:8080` for `api` and `worker`; the worker's `depends_on` gains `embedder: {condition: service_healthy}`
 
 - [ ] **Step 1: Write the failing tests**
@@ -2445,6 +2796,9 @@ async def test_superseded_owner_batch_is_fenced_after_the_http_call(engine, curr
 
 ```python
 # tests/integration/test_readiness_embedder.py
+import pytest
+from jobhunter.embeddings import EMBEDDING_MODEL_ID
+pytestmark = pytest.mark.integration
 async def test_readyz_and_health_report_the_embedder(api_client, logged_in_client, fake_embedder, worker_lock_heartbeat) -> None:
     assert (await api_client.get("/readyz")).status_code == 200
     body = (await logged_in_client.get("/api/system/health")).json(); assert body["embedder"] == {"ok": True, "model_id": EMBEDDING_MODEL_ID, "checksum_ok": True}
@@ -2460,18 +2814,29 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.embeddings'
 
 - [ ] **Step 3: Implement the client, the node, the readiness probe, the compose service and C7**
 
-- `tests/crash/test_collect_crashes.py` gains `test_c7_crash_during_embed_leaves_awaiting_then_embedded` (point `collect.embed.between_batches` with ≥ 17 awaiting revisions → after A dies at least 16 are `embedded` and the rest `awaiting_embedding`; after B every revision is `embedded` and `count(embeddings) == count(distinct text_sha256)`).
-- `tests/support/collect.py` gains `revisions_awaiting(engine, n, *, duplicate_texts=0, long_texts=0) -> list[int]` (jobs with revisions in `awaiting_embedding`); `tests/support/fixtures.py` gains `worker_lock_heartbeat` (a fresh `worker_heartbeat` row, so the `worker_heartbeat` probe passes). The M0 readiness tests use `api_app`, whose config carries the fake embedder's URL through the session fixture, so `/readyz` keeps answering 200 there.
+- `tests/crash/test_collect_crashes.py` gains C7 (the Adzuna page gives about 50 revisions, more than one batch):
+
+```python
+def test_c7_crash_during_embed_leaves_awaiting_then_embedded(migrated, proc_env, procs, fixture_log, fake_embedder) -> None:
+    run_id = manual_paid_run(migrated, only="adzuna")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.embed.between_batches")
+    assert one(migrated, "SELECT count(*) FILTER (WHERE embedding_status = 'embedded'), "
+               "count(*) FILTER (WHERE embedding_status = 'awaiting_embedding') > 0 FROM job_revisions") == (16, True)   # A died after its first batch
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    assert one(migrated, "SELECT count(*) FILTER (WHERE embedding_status <> 'embedded'), "
+               "(SELECT count(*) FROM embeddings) = count(DISTINCT embedding_id) FROM job_revisions") == (0, True)   # every revision embedded, no orphaned vector
+```
+- `tests/support/collect.py` gains the fixture `revisions_awaiting`, which returns the coroutine function `(engine, n, *, duplicate_texts=0, long_texts=0) -> list[int]` (jobs with revisions in `awaiting_embedding`); `tests/support/fixtures.py` gains `worker_lock_heartbeat` (a fresh `worker_heartbeat` row, so the `worker_heartbeat` probe passes). The M0 readiness tests use `api_app`, whose config carries the fake embedder's URL through the session fixture, so `/readyz` keeps answering 200 there.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `uv run pytest tests/integration -q && uv run pytest tests/crash/test_collect_crashes.py -k c7 -q`
-Expected: PASS
+Run: `uv run pytest tests/integration -q && uv run pytest tests/crash/test_collect_crashes.py -k c7 -q`, then `scripts/check-openapi-drift.sh` (it regenerates `frontend/src/api/schema.d.ts` for the `embedder` readiness code and health field and fails on the difference), `git add frontend/src/api/schema.d.ts` and the check again
+Expected: PASS, and the second drift check passes (Ruling P8)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/src/jobhunter deploy/compose.dev.yaml tests
+git add backend/src/jobhunter deploy/compose.dev.yaml tests frontend/src/api/schema.d.ts
 git commit -m "feat(m1): embedder client, embed node with batches of 16, embeddings upsert, readiness and health embedder probes, awaiting_embedding reconciler, dev embedder service; crash case C7"
 ```
 
@@ -2481,7 +2846,7 @@ git commit -m "feat(m1): embedder client, embed node with batches of 16, embeddi
 
 **Files:**
 - Create: `backend/src/jobhunter/graphs/collect/nodes/finalize.py`, `graphs/collect/nodes/enqueue_targets.py`
-- Modify: `backend/src/jobhunter/worker/runs.py` (`_finalize` widened to `FinalStatus`; `execute_run`'s durable completion lookup and its `OutcomeConflict` branch; `_invoke` is unchanged and `run_owned`/`ExecutionOutcome` of `worker/executions.py` keep their M0 shape, `Coroutine[…, None]` and status-only), `backend/src/jobhunter/graphs/collect/graph.py` (the real `finalize` and `enqueue_targets` nodes, `collect.before_finalize` kept at the start of `finalize`)
+- Modify: `backend/src/jobhunter/worker/runs.py` (`_finalize` widened to `FinalStatus`; `execute_run`'s durable completion lookup and its `OutcomeConflict` branch; `_invoke` is unchanged and `run_owned`/`ExecutionOutcome` of `worker/executions.py` keep their M0 shape, `Coroutine[…, None]` and status-only), `backend/src/jobhunter/graphs/collect/graph.py` (the real `finalize` and `enqueue_targets` nodes, `collect.before_finalize` kept at the start of `finalize`), `tests/support/collect.py` (`collect_deps`, `run_to_the_end`, `conflicting_graph`)
 - Test: `tests/integration/test_finalize.py`, `tests/crash/test_collect_crashes.py` (C3b)
 
 **Interfaces:**
@@ -2499,8 +2864,10 @@ git commit -m "feat(m1): embedder client, embed node with batches of 16, embeddi
 
 ```python
 # tests/integration/test_finalize.py
+import json
 import pytest, sqlalchemy as sa
-from jobhunter.graphs.collect.nodes.finalize import check_invariants, decide_status, partial_conditions
+from jobhunter.graphs.collect.nodes.finalize import InvariantResult, check_invariants, decide_status, partial_conditions
+from tests.support.collect import run_to_the_end
 pytestmark = pytest.mark.integration
 async def test_happy_run_succeeds_with_a_full_report(engine, current_epoch, fake_http, fake_embedder, collect_deps) -> None:
     rid = await run_to_the_end(engine, collect_deps)   # a watchlist company + Arbeitnow, the real graph through execute_run
@@ -2537,7 +2904,21 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'jobhunter.graphs.coll
 
 - [ ] **Step 3: Implement the node, the report and the `execute_run` change**
 
-`tests/support/collect.py` gains `collect_deps` (a `CollectDeps` over the fixture adapters, the fake embedder and `utcnow`), `run_to_the_end(engine, deps, *, include_paid=False) -> int` (a manual run inserted, admitted and executed through `execute_run` with `build_collect_graph`; returns the run id) and `conflicting_graph(saver, deps)` (the real graph with `fetch_cell` wrapped to emit two differing outcomes for the same `work_id`). `test_finalize.py` imports `json`. `tests/crash/test_collect_crashes.py` gains `test_c3b_after_coverage_commit_replays_without_double_stats` (point `collect.after_coverage_commit` on the JSearch cell, Task 14 → after B: the page replayed (0 further sends for the key in the fixture log), exactly one gap row for the cell, `consecutive_incomplete == 1` and `yield_ema` equal to the single-application value: the statistics are applied once, by this task's `finalize`).
+`tests/support/collect.py` gains the fixture `collect_deps` (`make_deps(engine, adapters)` of Task 14 with `embedder` set to an `EmbedderClient` on the fake embedder), `run_to_the_end(engine, deps, *, include_paid=False) -> int` (a manual run inserted, admitted and executed through `execute_run` with `build_collect_graph`; returns the run id) and `conflicting_graph(saver, deps)` (the real graph with `fetch_cell` wrapped to emit two differing outcomes for the same `work_id`). `tests/crash/test_collect_crashes.py` gains C3b (the fault point is Task 14's):
+
+```python
+def test_c3b_after_coverage_commit_replays_without_double_stats(migrated, proc_env, procs, fixture_log) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.after_coverage_commit")
+    sent = served_requests(fixture_log)
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    (cell,) = one(migrated, "SELECT cell_id FROM fetch_requests WHERE run_id = %s AND page_no = 1", run_id)
+    assert served_requests(fixture_log) == sent   # the pages are replayed: no further send
+    assert pg_rows(migrated, "superuser", "SELECT kind, gap_status, reason FROM coverage_intervals WHERE cell_id = %s", cell) == [("gap", "open", "page_cap")]   # recorded once
+    ema, streak = one(migrated, "SELECT yield_ema, consecutive_incomplete FROM coverage_cells WHERE id = %s", cell)
+    new, requests = one(migrated, "SELECT sum(new_postings), count(*) FILTER (WHERE dispatched_at IS NOT NULL) FROM fetch_requests WHERE run_id = %s AND cell_id = %s", run_id, cell)
+    assert streak == 1 and abs(ema - (0.3 * new / requests + 0.7 * 0.5)) < 1e-6   # applied once, by finalize (the column default 0.5 before)
+```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -2557,13 +2938,13 @@ git commit -m "feat(m1): finalize with run invariants I1-I7, the run report, par
 
 **Files:**
 - Create: `backend/src/jobhunter/sources/registry.py`, `deploy/compose.fixtures.yaml`, `.github/workflows/smoke-free-sources.yml`, `tests/live/__init__.py`, `tests/live/test_free_sources_live.py`
-- Modify: `backend/src/jobhunter/worker/main.py` (wiring; carry-forward 5 landed in Task 1), `backend/src/jobhunter/worker/runs.py` (carry-forward 6), `backend/src/jobhunter/worker/operations.py` (carry-forward 6; `claim_operation` raises `FencedOut` for a stale epoch), `backend/src/jobhunter/privacy/retention.py`, `.github/workflows/ci.yml` (`contract` job; `tests/embedder` in the `unit` job), `pyproject.toml` (marker `live`), `tests/integration/test_operations.py` (the fenced-claim assertion)
+- Modify: `backend/src/jobhunter/worker/main.py` (wiring; carry-forward 5 landed in Task 1), `backend/src/jobhunter/worker/runs.py` (carry-forward 6), `backend/src/jobhunter/worker/operations.py` (carry-forward 6; `claim_operation` raises `FencedOut` for a stale epoch), `backend/src/jobhunter/privacy/retention.py`, `.github/workflows/ci.yml` (`contract` job; `tests/embedder` in the `unit` job), `tests/integration/test_operations.py` (the fenced-claim assertion), `tests/support/collect.py` (`m1_rows`)
 - Test: `tests/integration/test_worker_wiring.py`, `tests/integration/test_retention_m1.py`, `tests/integration/test_fenced_admission_redefers.py`
 
 **Interfaces:**
 - Consumes: everything.
 - Produces:
-  - `registry.build_adapter(instance: InstanceRow, cfg: AppConfig, clients: Mapping[str, httpx.AsyncClient]) -> SourceAdapter` (by `source_id`: `JSearchAdapter` with `cfg.secret("rapidapi_key")`, `SerpApiAdapter` with `serpapi_key`, `AdzunaAdapter` with the two Adzuna secrets, `ArbeitnowAdapter`, the ATS adapters through `ats.adapter_for`; in fake mode the keys are `b"fake"`); `registry.make_clients(cfg) -> dict[str, httpx.AsyncClient]` (one client per source family through `http.make_client`, closed by the worker teardown)
+  - `registry.build_adapter(instance: InstanceRow, cfg: AppConfig, clients: Mapping[str, httpx.AsyncClient], *, clock: Callable[[], datetime] = utcnow) -> SourceAdapter` (every adapter gets the clock; by `source_id`: `JSearchAdapter` with `cfg.secret("rapidapi_key")`, `SerpApiAdapter` with `serpapi_key`, `AdzunaAdapter` with the two Adzuna secrets, `ArbeitnowAdapter`, the ATS adapters through `ats.adapter_for`; in fake mode the keys are `b"fake"`); `registry.make_clients(cfg) -> dict[str, httpx.AsyncClient]` (one client per source family through `http.make_client`, closed by the worker teardown)
   - `worker_main` step 7 builds `http.configure(cfg)`, the clients, `EmbedderClient(cfg.embedder_url, …)`, `CollectDeps(…, admission_stopped=lambda: self.shutdown.admission_stopped)` and `build_collect_graph(saver, deps)`; step 8 runs `sync_instances(conn, cfg)` before the start reconcilers; `_REGISTERING_MODULES = ("jobhunter.worker.operations", "jobhunter.worker.runs", "jobhunter.quota.ledger", "jobhunter.availability.rules", "jobhunter.availability.snapshots", "jobhunter.dedup.groups", "jobhunter.scoring.filters", "jobhunter.graphs.collect.nodes.embed", "jobhunter.sources.watchlist_validate")`
   - Carry-forward 6 (Deviation 18, ruling (d)): `execute_run` on `foreign_epoch` re-defers `run_collect(run_id, attempt_no)` with `defer_run_attempt` in a transaction of its own (`None` when a job with that queueing lock already waits); `claim_operation` raises `FencedOut` **only** for a stale epoch and keeps returning `None` for an ordinary unclaimable operation (absent, not `queued`, already claimed); `execute_operation` catches `FencedOut` and re-defers `run_operation(operation_id)` under the queueing lock `op:<id>`, so a second re-defer of the same operation is deduplicated by the lock
   - Retention rules appended to `RULES`, in this order after `operations`: `raw_items` (90 d, `created_at`), `raw_bodies` (window `timedelta(0)`, so `cutoff = now`: `body_zstd := NULL, purged_at := :cutoff` where `expires_at < :cutoff AND purged_at IS NULL`; `expires_at` already holds `fetched_at + 30 d` and the deduplication extension, so a 30-day window compared with it would keep bodies for about 60 days), `ats_snapshots` (30 d by `taken_at`, except each instance's `last_complete_snapshot_id`, its `mass_event_snapshot_id` and every `mass_disappearance` snapshot with `acknowledged_at IS NULL` whose event is open), `embeddings` (0 d: rows referenced by no `job_revisions.embedding_id`; `profile_vectors` joins in M2), `coverage_intervals` (397 d by `coalesce(closed_at, created_at)`), `fetch_requests` (397 d by `created_at`, terminal rows; `depends_on=("raw_items",)`)
@@ -2596,6 +2977,8 @@ async def test_m1_windows(engine, queue_app, migrated, m1_rows) -> None:
     # ats_snapshots 31 d old deleted except the instance's last complete one and an unacknowledged mass one; an embedding referenced by no revision deleted; `fetch_requests` skipped when `raw_items` failed
 ```
 
+(`m1_rows` is a fixture of `tests/support/collect.py`: it inserts the aged rows this test names, on either side of each window, and returns their ids by name.)
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/integration/test_worker_wiring.py tests/integration/test_fenced_admission_redefers.py tests/integration/test_retention_m1.py -q`
@@ -2614,7 +2997,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/src/jobhunter deploy .github pyproject.toml tests
+git add backend/src/jobhunter deploy .github tests
 git commit -m "feat(m1): worker runs the real collect_graph with live or fixture adapters; fenced admissions re-defer; M1 retention; contract CI job; free-source smoke workflow"
 ```
 
@@ -2634,11 +3017,18 @@ git commit -m "feat(m1): worker runs the real collect_graph with live or fixture
 
 ```python
 # tests/integration/test_collect_end_to_end.py
+import pytest, sqlalchemy as sa
+from tests.support.collect import run_to_the_end, seed_inputs
+pytestmark = pytest.mark.integration
+FIXTURE_REJECTED = 0   # the Rejected items of the fixtures this run is served, as tests/contract/README.md records them (Task 6 step 8; Ruling P7)
 async def test_two_runs_on_fixtures_through_the_real_graph(engine, current_epoch, fake_http, fake_embedder, collect_deps, migrated) -> None:
     # inputs: the query "software engineer" (remote-de), watchlist companies getyourguide (greenhouse) and bunq (recruitee), an include_paid manual run
+    await seed_inputs(engine, queries=("software engineer",), companies=(("greenhouse", "getyourguide"), ("recruitee", "bunq")))
     rid = await run_to_the_end(engine, collect_deps, include_paid=True)
     async with engine.connect() as c:
-        status, report = (await c.execute(sa.text("SELECT status, report FROM runs WHERE id=:i"), {"i": rid})).one()
+        status, reason, report = (await c.execute(sa.text("SELECT status, status_reason, report FROM runs WHERE id=:i"), {"i": rid})).one()
+        rejected = (await c.execute(sa.text("SELECT count(*) FROM raw_items WHERE disposition='rejected'"))).scalar_one()
+        revisions = (await c.execute(sa.text("SELECT count(*) FROM job_revisions"))).scalar_one()
         pending = (await c.execute(sa.text("SELECT count(*) FROM raw_items WHERE disposition='pending'"))).scalar_one()
         conserved = (await c.execute(sa.text("SELECT bool_and(r.item_count = (SELECT count(*) FROM raw_items i WHERE i.raw_response_id = r.id)) FROM raw_responses r"))).scalar_one()
         jobs, postings, linked = [(await c.execute(sa.text(q))).scalar_one() for q in ("SELECT count(*) FROM jobs", "SELECT count(*) FROM postings", "SELECT count(*) FROM raw_items WHERE disposition='linked'")]
@@ -2647,10 +3037,11 @@ async def test_two_runs_on_fixtures_through_the_real_graph(engine, current_epoch
         embedded = (await c.execute(sa.text("SELECT count(*) FROM job_revisions WHERE embedding_status='embedded'"))).scalar_one()
         groups = (await c.execute(sa.text("SELECT count(*) FROM duplicate_groups WHERE status='active'"))).scalar_one()
         hf = (await c.execute(sa.text("SELECT count(*) FROM jobs j WHERE NOT EXISTS (SELECT 1 FROM hard_filter_results h WHERE h.job_id = j.id)"))).scalar_one()
-    assert status == "succeeded" and pending == 0 and conserved and jobs > 0 and postings == linked and hf == 0
+    assert rejected == FIXTURE_REJECTED and (status, reason) == (("succeeded", None) if FIXTURE_REJECTED == 0 else ("partial", "raw_item_rejected"))
+    assert pending == 0 and conserved and jobs > 0 and postings == linked and hf == 0
     # JSearch: page 1 (probe) plus page 2 (10 new ids ≥ 7); Adzuna: 50 of 113 then the empty page 2
     assert ledger == {"jsearch:billed": 2, "adzuna:billed": 2} and [s.status for s in snapshots] == ["complete", "complete"] and all(s.member_count > 0 for s in snapshots)
-    assert embedded == (await count(engine, "SELECT count(*) FROM job_revisions")) and groups >= 1  # the Adzuna re-ingests of one ad form a group
+    assert embedded == revisions and groups >= 1  # the Adzuna re-ingest pair of the fixtures forms a group (adzuna_reingest_pair, Task 6)
     assert all(v["ok"] for v in report["execution"]["invariants"].values()) and report["quota"]["jsearch"]["used"] == 2
     second = await run_to_the_end(engine, collect_deps, include_paid=False)
     async with engine.connect() as c:
@@ -2662,7 +3053,7 @@ async def test_two_runs_on_fixtures_through_the_real_graph(engine, current_epoch
 ```python
 # tests/crash/test_collect_worker_end_to_end.py
 def test_scheduled_run_on_fixtures_through_the_worker_process(migrated, proc_env, procs, fake_embedder) -> None:
-    ... # the inputs inserted by SQL (tests/support/collect.seed_inputs_sql), a due slot, the worker spawned with the fake sources; wait for `succeeded` or `partial` within 180 s;
+    ... # the inputs inserted with tests/support/collect.seed_inputs_sync (Task 14), a due slot, the worker spawned with the fake sources; wait for `succeeded` or `partial` within 180 s;
     # runs.report has the five sections; `worker_shutdown_complete` with exit 0 after SIGTERM; no `error` log line without an `error_class`, and no log line containing an e-mail or a key shape
 ```
 
@@ -2672,7 +3063,7 @@ def test_scheduled_run_on_fixtures_through_the_worker_process(migrated, proc_env
 1. `user_create`, 2. `login`, 3. `health_ready` as in M0 (the body must also show `embedder.ok` true and a `quota` object);
 4. `seed_inputs`: `psql` inserts a `queries` row (`software engineer`, `en`, `user`), appends `{"query_id": <id>, "enabled": true}` to the active settings version's `queries[]`, inserts the watchlist company `getyourguide` (greenhouse) with its entry in `watchlist[]` and its source instance;
 5. `run_now_paid`: `POST /api/runs` with `{"include_paid": true}` (an `Idempotency-Key`, `Origin`, `X-JH-Request`) → 202;
-6. `collect_succeeded`: poll until `last_run.status` is `succeeded` (150 s); then `psql`: `count(*) FROM jobs > 0`, `count(*) FROM raw_items WHERE disposition='pending' = 0`, `count(*) FROM embeddings > 0`, `count(*) FROM quota_ledger WHERE state='billed' = 4` (two JSearch pages, two Adzuna pages), and `report->'execution'->'invariants'` all `ok`;
+6. `collect_succeeded`: poll until `last_run.status` is `succeeded` (150 s; `partial` with reason `raw_item_rejected` instead when the fixtures' Rejected count in `tests/contract/README.md` is not 0, as the end-to-end test asserts, Ruling P7); then `psql`: `count(*) FROM jobs > 0`, `count(*) FROM raw_items WHERE disposition='pending' = 0`, `count(*) FROM embeddings > 0`, `count(*) FROM quota_ledger WHERE state='billed' = 4` (two JSearch pages, two Adzuna pages), and `report->'execution'->'invariants'` all `ok`;
 7. `second_run_idempotent`: a second `POST /api/runs` with `include_paid: false` → after it succeeds, `count(*) FROM jobs` unchanged and `min(seen_count) FROM postings WHERE source_instance_id IN (<arbeitnow, greenhouse>)` is 2.
 
 - [ ] **Step 3: Bring up the stack and run everything**
@@ -2680,7 +3071,8 @@ def test_scheduled_run_on_fixtures_through_the_worker_process(migrated, proc_env
 Run:
 
 ```bash
-dockerd >/tmp/dockerd.log 2>&1 & sleep 3
+dockerd >/tmp/dockerd.log 2>&1 &
+timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 uv run pytest -q && uv run pytest tests/contract -q && uv run pytest tests/stack -m stack -q && uv run pytest tests/perf -m perf -q
 (cd frontend && npm test && npm run build && npm run lint && npm run typecheck) && scripts/check-openapi-drift.sh
@@ -2689,7 +3081,7 @@ docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deplo
 uv run python scripts/smoke_m1.py
 ```
 
-Expected: every command exits 0, and the smoke script prints seven `{"check": …, "ok": true}` lines. The OpenAPI drift check sees the new `/readyz` failing code and the `embedder`/`quota` health fields (regenerate `frontend/openapi.json` and the types in this task).
+Expected: every command exits 0, and the smoke script prints seven `{"check": …, "ok": true}` lines. The OpenAPI drift check passes as it has since Task 8: Tasks 8 and 22 committed the regenerated `frontend/src/api/schema.d.ts` with their API changes (Ruling P8); `frontend/openapi.json` is the script's git-ignored scratch file and is never committed.
 
 - [ ] **Step 4: Close the spikes and the roadmap**
 
@@ -2698,7 +3090,7 @@ This step is a gate (ruling (f)): `docs/spikes/V10.md` must hold the day-2 resul
 - [ ] **Step 5: Commit, then the final 4-eyes review**
 
 ```bash
-git add scripts/smoke_m1.py tests docs/spikes docs/superpowers/plans/2026-10-16-job-hunter-roadmap.md frontend/openapi.json frontend/src/api/schema.d.ts
+git add scripts/smoke_m1.py tests docs/spikes docs/superpowers/plans/2026-10-16-job-hunter-roadmap.md
 git commit -m "test(m1): end-to-end collection on fixtures through the graph and the worker; acceptance smoke; mark M1 complete"
 ```
 
@@ -2713,7 +3105,7 @@ Each deviation stages a spec item across milestones or settles something the spe
 1. **Tables and FKs staged across milestones** (continuing M0 Deviation 1). In M1: every table of §7.5, §7.7–7.10 except `profile_vectors` (M2, with `profile_versions`) and `query_proposals` (M2); `queries.proposal_id` keeps its type without an FK until then. `hard_filter_results` (§7.11) is created in M1 because `resolve_identity` and node 8 write it; the rest of §7.11 is M3's. The FK `purge_fences.source_id → sources` and the `source` branch of `is_fenced()` arrive here, as M0 Deviations 1 and 2 said.
 2. **`source_instances` CHECK widened** (approved, ruling (b)). §5.2 says `auth_failed`, `contract_broken` and `not_found` *open* the breaker and that a half-open probe follows after 6 h, but the §7.5 CHECK allows `breaker_opened_at`/`half_open_after` only for `breaker_open`. M1 allows them for all four open states so the 6-hour half-open rule applies to each; `record_success` and `instances.disable` clear both timestamps on the way back to `ok` or `disabled` (`test_breaker_timestamps_clear_on_ok_and_disabled`, Task 5). No user-visible change.
 3. **Settings lists written directly in M1.** §13.1's `queries[]` and `watchlist[]` entries are authored by M2's settings editing and M4's watchlist API. M1 reads them as the spec says (a query or company counts as enabled only with an entry `enabled: true`); the tests, the crash tests and `smoke_m1.py` write the entries with SQL. No behaviour change.
-4. **Layout differences from §4.2.** New: `run_settings.py`, `embeddings.py`, `cli_fixtures.py`, `db/ranking.py`, `sources/{instances,fixtures,receipts,acquire,traverse,coverage,watchlist_validate,registry,items}.py`, `dedup/revisions.py`, `graphs/collect/{state,deps}.py`, `embedder/{health.py,download_model.sh}`, `scripts/spikes/`, `tests/{contract,embedder,live}/`. `geo/data/country_names_de.tsv` is a hand-maintained source of the build.
+4. **Layout differences from §4.2.** New: `run_settings.py`, `embeddings.py`, `cli_fixtures.py`, `db/ranking.py`, `sources/{instances,fixtures,receipts,acquire,traverse,coverage,watchlist_validate,registry,items}.py`, `dedup/revisions.py`, `graphs/collect/{state,deps}.py`, `embedder/{__init__.py,health.py,download_model.sh}`, `scripts/spikes/`, `tests/{contract,embedder,live}/`. `geo/data/country_names_de.tsv` is a hand-maintained source of the build.
 5. **Environment.** `JOBHUNTER_FIXTURES_DIR` (test and dev only, with `JOBHUNTER_FAKE_SOURCES`) is not in §19.2; `JOBHUNTER_EMBEDDER_URL` is read by the api as well as the worker, because `/readyz` probes the embedder (§17.5). In fake mode `sync_instances` requires no provider secret.
 6. **A missing provider secret disables the instance** — a **behaviour change**, approved by the controller (ruling (c)) and by the user on 2026-10-17. §16.8 lists the provider secrets as optional for the worker and says nothing about a missing one at planning time; without this rule every run would fail the source with `auth_failed`. `sync_instances` sets `health = 'disabled'`, `last_error_code = 'missing_secret'` (breaker timestamps cleared) and restores `ok` **only** from that exact state once the secret is present; an administrative `disabled` without that code and every breaker state are left untouched. The source is skipped and visibly reported as `disabled` in the run report and in `/api/system/health`.
 7. **Merge and unmerge steps that need later tables.** §8.6.1 step 3 (user actions) and §8.6.2 step 4 arrive with `user_job_actions` (M4); §8.6.1 step 4 (targets `cancelled('job_merged')`) with `score_targets` (M3). The merge snapshot records what exists.
@@ -2734,6 +3126,7 @@ Each deviation stages a spec item across milestones or settles something the spe
 22. **`ats_snapshot_absences`.** §8.11 confirms a mass disappearance against the opening snapshot's "absent set" but gives it no durable home; deriving it from `postings.last_absent_snapshot_id` would need an update rule the spec does not define. M1 adds the table (written once when an event opens, cascade-deleted with the snapshot) and reads the frozen set from it. No user-visible change.
 23. **Billing is separate from envelope validity; a failed request stores no items.** §5.3 classifies billing by the transport outcome and the HTTP status (a JSearch 2xx is `billed`), and §5.2 keeps the full body of a 2xx; a 200 whose body is not the contract (an HTML error page) is both `billed` and `failed('contract')`. M1 keeps the full body only for a `succeeded` request, stores the first 4 KiB otherwise, and sets `item_count = 0` with `parsed_at` on a request that did not succeed, so I1 holds for an unparseable envelope and `parse_normalize` selects by `fetch_requests.status = 'succeeded'`. A replayed failure keeps its receipt and is never re-sent unless the §5.2 retry rule says so. No user-visible change beyond the report's `requests` counts.
 24. **A tainted revision blocks reuse without creating a twin.** `UNIQUE (job_id, material_hash)` forbids a second revision with the same hash, so when the reusable revision's lineage names a fenced source the recompute refuses the reuse and leaves the job on its current revision (`tainted_reuse_refused`) until M5's purge deletes that revision; a recompute whose material differs (the fenced source's observations are excluded from the inputs) creates a new revision as usual. No behaviour visible before M5.
+25. **The adapter's `plan` and `fetch` signatures** (Ruling P2). §5.1 declares `plan(self, cell: CoverageCell, window: Window) -> list[RequestSpec]` and `fetch(spec) -> RawPage`. M1's adapters take one `CellPlan` (Task 5: the cell's query and location, the phase, the request class, the bucket, the coverage window and `max_days_old`, built by the planner from its `CellRow`) and return the `RequestSpec` of the traversal's first page; every later page comes from `next_page(spec, cursor)` and the Arbeitnow seek legs from the traversal (Task 14), because page 2 and beyond depend on the previous response (the cursor, `new_native_ids`, the seek rule) and cannot be planned before it. `fetch` returns `http.HttpOutcome`, the page and the transport error together, because settlement classifies the transport outcome (`settle(outcome)`) and an oversized body carries both. The window still travels in `RequestSpec.window`. No behaviour change.
 
 ## Carry-forward to later milestones
 
@@ -2743,6 +3136,20 @@ Each deviation stages a spec item across milestones or settles something the spe
 4. **M5:** job tombstoning (the writer of `tombstone_keys`) and the source purge (which relies on `recompute_job(fenced_source_ids=…)` never reusing a tainted revision); the dead-man ping in `finalize`; the alert catalogue dispatch for the new codes; the `images` CI job with the embedder checksum; V7 on the VPS; PRIVACY.md's GeoNames attribution.
 5. **Steady-state consequence of §5.3.1 with §5.6 (ruling (a): implemented as written; the user confirmed on 2026-10-17 to keep it as written for M1).** A steady-state JSearch cell whose page 1 carries a cursor and fewer than 7 new `job_uid`s never reaches `END`: §5.6 records an open gap on every run (`reason = page_cap`) and marks the query "too broad" after three such runs. M1 implements exactly that, and Task 25's end-to-end test pins the gap. Fewer than 7 new ids does not prove chronological overlap with the previous coverage, so treating it as the overlap would be a separate behaviour change; whether to adopt such a rule is a product decision for the user, recorded here for the spec revision that would carry it.
 6. **M4/M5 runbook:** the embedder's first build downloads 590 MB from the HF Hub; a host without that route needs the model files staged by hand (`embedder/download_model.sh` accepts a local mirror URL through `HF_MIRROR`).
+
+## Pre-flight corrections
+
+The binding pre-flight rulings P1–P9 (`.superpowers/sdd/2026-10-17-m1-collection-pipeline/progress.md`, on the findings of `preflight.md` §4) are applied in the task text above. Each line names where.
+
+- **P1** (every §4 suggestion accepted as written): Task 1 Step 1 (S1: the watchlist insert, the `CAST` binds, `MANUAL_RUN_SQL`) and Step 6 (`fix(m1)`); Task 2 `test_normalize_text.py` (S2); Task 3 stop words (S3); Task 4 build (S4); Task 5 `SourceAdapter.fetch`, `RateLimiter.acquire`, `ScopeSettings.max_ad_age_days`, the `disable` import (X39, X43, X46, S5); Task 6 Files, `scrub_tree`, `validate_identifier`, `labelled`, the false-German check, step 4 item 7, `page_end` and its route (S6, M12, X55, X56, X58: each support module is registered by the task that creates it, Tasks 6, 8 and 22, because `pytest_plugins` cannot name a module that does not exist yet); Task 8 Files, `instance_id`, `queued_run`, `quota.ambiguous_attempt`, the `eligible` import, `test_dryrun` (X16, X64, X65, X72, X74, S8); Task 9 clocks, imports, `HttpOutcome` (X41, X39, S9); Task 10 clocks, imports, `(CURSOR, "2")`, `plan_legs(n_newer: Mapping)`, the never-covered stop rule (X41, S10, M4, X80, X82); Task 11 Files, `adapter_for(…, clock)`, `list_item_sha256`, `adapter_for_fixture`, `parsed_of`, the recorded `n`, the two pagination tests, `fake_http` teardown (X41, S11, X54, X55, X48); Task 12 Files and `git add`, `http.ERROR_BODY_BYTES`, `AccountAdapter`, `apply_account`, `failure_kind`, the ledger-owned request class, `served_requests` in place of respx counts (X70, X51, X50, X66, X42, X5, M2, S12); Task 13 Files, one `CollectState`, `FetchContext` and `CollectDeps`, pass-throughs in `graph.py`, the inline `beyond_provider_window` insert, `max_concurrency`, `DEFAULT_CELL`, the `test_planner` imports (X71, X93, X89, X92, X91, X90, X94, S13); Task 14 Files, `FetchContext.host`, `n_newer` prefetch, `job_factory`, `manual_paid_run`, `adapters`, the EMA value 1.25, the Adzuna cap test (X89, X80, X98, X99, M9, M11, S14); Tasks 15, 16, 18 and 22 node wiring in `graph.py` (X91); Task 15 Files (S15); Task 16 Files, `facts.py` exports, `posting_factory`/`board`/`board20` (S16, X105); Task 17 `SOURCE_RANK` from `seed.SOURCES`, `stated`/`predicted`, Files (X17, S17); Task 18 Files, `pending_item`, imports (S18); Task 19 producers named, the self-correction removed (S19); Task 20 imports, Step 4 (S20); Task 21 `embedder/__init__.py`, `mypy.ini`, the `docker run` check (S21; Deviation 4); Task 22 Files, `MAX_TEXT_BYTES`, the per-test `fake_embedder` reset, the `revisions_awaiting` fixture, the readiness imports (X92, X116, S22, M16); Task 23 Files, imports, `collect_deps` (S23); Task 24 Files, `m1_rows`, `git add`, `build_adapter(…, clock)` (X62, S24, X41); Task 25 imports, `seed_inputs`, the inline revision count, `seed_inputs_sync`, the `docker info` poll (S25). Where §4 offered an either/or that no P ruling decides: X5 drops the assertion, X90 keeps the inline insert, X98 moves `job_factory` to Task 14, S2 keeps the test file, S14 drops "between A and B", S21 adds `embedder/__init__.py`, S22 resets per test, M2 counts with `served_requests(fixture_log)`.
+- **P2** (spec first: the window machine, the §6.7 simulation, the `plan` Deviation, Q-SH1): File Structure; Task 1 Files, the triggers, the `TRANSITIONS` table, the reset note, `test_m1_machines` and Step 3; Task 7 `save_window`; Task 8 `project_allowance`, `serpapi_hour_admits`, `test_project_allowance_writes_nothing` and the Q-SH1 machine of `test_quota_property.py`; Task 5 `SourceAdapter`; Deviation 25 (with X39's `fetch`).
+- **P3** (JSearch cursor reuse): Task 13 `plan_run` and `test_plan_reuses_a_fresh_jsearch_cursor`; Task 14 `finalize_cells` (the continuation keeps its window); Task 9 `CURSOR_REUSE_TTL`.
+- **P4** (concrete pins): Global Constraints; Review Focus 5; Task 11 `test_board_404_marks_not_found_and_skips_until_half_open`; Task 12 the two Review Focus 3 tests; Task 13 `test_plan_skips_closed_instances_and_probes_half_open`; Task 14 the Review Focus 3 and 4 tests, `die_at`/`resume` and C1, C2, C2b, C3, C4 (with `page_replayed` and the closed free row in Task 12, and `fallback_fetch_request_ids` in Task 13, as their producers); Task 15 C5; Task 18 C5b, C6; Task 19 `test_board_404_ages_no_posting` (X84, M3; Task 14 `snapshot` is `None` without a list page); Task 20 C6b; Task 22 C7; Task 23 C3b.
+- **P5** (only the source under test; C2b on its own): Task 13 `seed_inputs(enabled=…)`; Task 14 `seed_inputs_sync`, `manual_paid_run(only=…)` and `test_c2b_free_page_after_marker_is_redispatched`; Task 12 the free row closed `ambiguous` before its re-dispatch.
+- **P6** (links, recorder, phone pattern, name review): Task 6 `scrub_text`, `IDENTIFIER_FIELDS` (`url`), `URL_IN_TEXT`, `valid_url`, `validate_identifier`, `record_sources.py` (`configure_logging`, exception classes, `account.json` exempt), `test_fixture_scrub.py` (the kept link), `test_fixture_pii.py` (`PHONE_DE`, `outside_links`), step 4 item 8 (the review recorded in the task's report).
+- **P7** (`adzuna_reingest_pair`; the status by the Rejected count): Task 6 `derive_variants.py`, `ROUTES` and the README counts; Task 20 C6b; Task 25 `test_two_runs_on_fixtures_through_the_real_graph` (`FIXTURE_REJECTED`) and smoke check 6.
+- **P8** (`schema.d.ts` with each OpenAPI change): Tasks 8 and 22 Files, Step 4 and `git add`; Task 25 Step 3 and its `git add` (no `frontend/openapi.json`).
+- **P9** (this list): the edits above; nothing else in the plan changed.
 
 ## Closing note: spec coverage of the M1 sections
 
