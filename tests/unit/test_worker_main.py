@@ -134,6 +134,9 @@ class World:
                 world.timeouts["watchdog"] = timeout_s
                 world.on_watchdog_stopped()
 
+            def is_alive(self) -> bool:
+                return False  # its thread ended within the stop (`test_teardown.py` covers the other case)
+
         class FakeExecutions:
             async def cancel_all(self, *, timeout_s: float = 30.0) -> int:
                 world.timeouts["executions"] = timeout_s

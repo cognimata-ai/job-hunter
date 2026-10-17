@@ -26,6 +26,9 @@ Until step 9 a SIGTERM ends the process at once (the default action): nothing ru
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
 Each of its steps runs even when an earlier one failed (logged `worker_teardown_failed`; the exit code is then
 1). The watchdog is always stopped before the lock session closes, so closing it never reads as a lost lock.
+When the watchdog thread is still alive after that stop (its join timed out inside a heartbeat on the lock
+session), the session is not closed under it: `lock_session_left_open` is logged and the process exit drops
+the socket, and with it the lock.
 
 Exit codes: 0 after a requested shutdown; 1 when a worker loop ended by itself, when the takeover was blocked
 (`takeover_blocked`: a row lock outlived the claim's lock timeout, ruling T13-b) and when the start failed
@@ -234,6 +237,12 @@ class _WorkerProcess:
             await self.engine.dispose()
 
     async def _close_lock_session(self) -> None:
+        if self.watchdog is not None and self.watchdog.is_alive():
+            # Its stop timed out joining the thread, which is still in a heartbeat on this very session:
+            # closing the connection under that statement is not safe (M0 carry-forward 5). The process exit
+            # drops the socket, and the server then ends the session and releases the lock.
+            log.warning("lock_session_left_open")
+            return
         self.lock_session.close()
 
     async def teardown(self) -> bool:
@@ -241,8 +250,9 @@ class _WorkerProcess:
 
         Every wait takes at most what is left of the stop's one deadline: the coordinator's, or one that
         starts now when the start failed before it. A step that would wait past it is cut off (`TimeoutError`,
-        logged like any failed step); one that needs no wait still runs. The lock session is closed last,
-        always.
+        logged like any failed step); one that needs no wait still runs. The lock session is the last step,
+        always: it is closed unless the watchdog thread is still alive (`lock_session_left_open`, which is not
+        a failed step).
         """
         deadline = self.shutdown.stop_deadline or StopDeadline.start()
         steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
