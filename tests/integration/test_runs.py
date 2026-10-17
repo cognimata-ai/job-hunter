@@ -576,3 +576,39 @@ async def test_a_superseded_epochs_stale_runs_reconciler_takes_nothing(
     # The current epoch's reconciler does take it.
     assert await runs.reconcile_stale_runs(ctx(e2)) == 1
     assert await attempts(engine, rid) == [(1, e2, "heartbeat_stale"), (2, e2, None)]
+
+
+# --- Final fix wave, item 5: C17's zombie write is refused (in one process, so the write surely happens) ---
+
+RUN_END = sa.text("SELECT status, attempt_no, finished_at, report, status_reason FROM runs WHERE id=:i")
+
+
+async def run_end(engine, rid: int) -> tuple[object, ...]:
+    async with engine.connect() as c:
+        return tuple((await c.execute(RUN_END, {"i": rid})).one())
+
+
+async def test_a_zombie_execution_that_ends_after_a_takeover_is_fenced_at_its_finalize(
+    engine, queue_app, worker_lock, log_events
+) -> None:
+    rid, gate, entered = await queued(engine), asyncio.Event(), asyncio.Event()
+    e1, _ = await claim_epoch_and_sweep(engine, claimant(worker_lock, 1))
+    zombie = asyncio.create_task(
+        runs.execute_run(engine, gated_graph(gate, entered), rid, 1, epoch=e1, heartbeat_period_s=3600)
+    )
+    await asyncio.wait_for(entered.wait(), 5)  # the zombie's graph is mid-run, as C17's paused worker is
+    e2, counts = await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))
+    assert counts["runs"] == 1
+    # The replacement runs attempt 2 to its end. Its DB writes, not `execute_run`: in one process that would
+    # first cancel the zombie's local execution, which a replacement worker cannot do.
+    async with engine.begin() as c:
+        admission, owner = await runs.start_attempt(c, rid, 2, epoch=e2)
+        assert admission == "resumed" and owner is not None
+        await runs.finalize_run(c, owner, status="succeeded", reason=None, report={"by": "replacement"})
+    replaced = await run_end(engine, rid)
+    gate.set()  # the zombie's graph returns, and the zombie tries to finalize attempt 1
+    assert await asyncio.wait_for(zombie, 5) == "started"
+    fenced = [(e["run_id"], e["attempt_no"], e["write"]) for e in log_events() if e["event"] == "run_fenced"]
+    assert fenced == [(rid, 1, "finalize")]  # the zombie's write was attempted and refused ...
+    assert await run_end(engine, rid) == replaced  # ... so the run keeps the replacement's end and report
+    assert await attempts(engine, rid) == [(1, e1, "worker_takeover"), (2, e2, "completed")]

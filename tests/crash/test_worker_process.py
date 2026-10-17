@@ -27,6 +27,23 @@ def threads(server) -> dict[object, tuple[object, ...]]:
     return {row[0]: row[1:] for row in rows}
 
 
+def run_end(server) -> tuple[object, ...]:
+    """The scheduled run's end (status, attempt, `finished_at`, report, reason) and every attempt of it."""
+    attempts = pg_rows(
+        server,
+        "superuser",
+        "SELECT attempt_no, worker_epoch, ended_at, end_reason FROM run_attempts ORDER BY attempt_no",
+    )
+    return (
+        one(
+            server,
+            "SELECT status, attempt_no, finished_at, report, status_reason FROM runs "
+            "WHERE scheduled_slot IS NOT NULL",
+        ),
+        tuple(attempts),
+    )
+
+
 def due_slot_now(server) -> None:
     one(
         server,
@@ -83,8 +100,13 @@ def test_c17_zombie_worker_writes_nothing(migrated, proc_env, procs) -> None:
     old_thread, new_thread = f"run-{run_id}-a1", f"run-{run_id}-a2"
     before = threads(migrated)
     assert set(before) == {old_thread, new_thread}
+    replaced = run_end(migrated)  # the replacement's end of the run, its report and both attempts
     a.signal(signal.SIGCONT)
     assert a.exit_within(20) == 70
+    # The zombie changed none of it. Whether it reached its own finalize before its watchdog ended it depends
+    # on how much of its watchdog period was left at SIGCONT; the refusal of that write itself is proven
+    # deterministically in one process (`test_a_zombie_execution_that_ends_after_a_takeover_is_fenced_...`).
+    assert run_end(migrated) == replaced
     # §18.2 C17: the zombie's checkpoint writes are confined to its own, old thread. (It does write there: its
     # graph finishes the paused step before the watchdog ends it.) The new attempt's thread is untouched.
     after = threads(migrated)
