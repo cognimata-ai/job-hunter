@@ -612,3 +612,24 @@ async def test_a_zombie_execution_that_ends_after_a_takeover_is_fenced_at_its_fi
     assert fenced == [(rid, 1, "finalize")]  # the zombie's write was attempted and refused ...
     assert await run_end(engine, rid) == replaced  # ... so the run keeps the replacement's end and report
     assert await attempts(engine, rid) == [(1, e1, "worker_takeover"), (2, e2, "completed")]
+
+
+# --- Final fix wave, item 9: a reason from the queue does not survive into running and succeeded ----------
+
+
+async def test_a_redeferred_run_that_then_runs_keeps_no_stale_reason(engine, queue_app, migrated) -> None:
+    rid = await queued(engine)
+    async with engine.begin() as c:
+        await c.execute(sa.text("DELETE FROM procrastinate_jobs"))  # its job was lost
+    ctx = ReconcileContext(
+        engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow() + timedelta(minutes=2.1), epoch=1
+    )
+    await run_reconcilers(ctx, "tick")
+    assert (await fetch(engine, rid))[0::5] == ("queued", runs.REDEFERRED)
+    async with engine.begin() as c:
+        admission, owner = await runs.start_attempt(c, rid, 1, epoch=1)
+    assert admission == "started" and owner is not None
+    assert (await fetch(engine, rid))[0::5] == ("running", None)  # cleared by queued -> running
+    async with open_saver(migrated.dsn("app")) as saver:
+        assert await runs.execute_run(engine, build_noop_collect_graph(saver), rid, 1, epoch=1) == "resumed"
+    assert (await fetch(engine, rid))[0::5] == ("succeeded", None)

@@ -51,7 +51,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import transition
+from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert, resolve_alert
@@ -227,7 +227,8 @@ async def start_attempt(
     """The DB step of the admission of `run_collect(run_id, attempt_no)` by worker `epoch`, row `FOR UPDATE`.
 
     - `started`: the run is `queued` at attempt `attempt_no - 1`. It moves to `running` at `attempt_no` with a
-      first heartbeat and its thread, and `run_attempts(attempt_no, epoch)` is inserted.
+      first heartbeat and its thread, and `run_attempts(attempt_no, epoch)` is inserted. The move clears the
+      queued run's `status_reason` (`redeferred`), which says nothing about a running run.
     - `resumed`: the run is `running` at `attempt_no`, whose open `run_attempts` row belongs to `epoch` (this
       epoch's sweep or reconciler created it). Its heartbeat is refreshed (fenced), so the reconciler does not
       take back an attempt whose job waited in the queue.
@@ -257,6 +258,7 @@ async def start_attempt(
             run_id,
             ["queued"],
             "running",
+            reason=CLEAR_REASON,
             owner={"attempt_no": row.attempt_no},
             set_={"attempt_no": attempt_no, "heartbeat_at": sa.func.now(), "current_thread_id": thread},
         )

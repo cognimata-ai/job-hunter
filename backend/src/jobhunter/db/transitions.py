@@ -13,6 +13,7 @@ The database holds the same edges in `transition_matrix` (written by `seed.sync_
 registry), where the `assert_transition` trigger checks them as defence in depth.
 """
 
+import enum
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
@@ -66,6 +67,15 @@ class TransitionSpec:
             named.update(cleared)
         return frozenset(named)
 
+
+class _Clear(enum.Enum):
+    """The type of `CLEAR_REASON`, a sentinel of one value."""
+
+    CLEAR_REASON = "clear_reason"
+
+
+# `transition(reason=CLEAR_REASON)` sets the reason column to NULL; `reason=None` leaves it as it is.
+CLEAR_REASON: Final = _Clear.CLEAR_REASON
 
 _RUN_TERMINAL: Final = ("succeeded", "partial", "failed_invariant", "failed", "cancelled")
 
@@ -157,7 +167,7 @@ def _validate(
     spec: TransitionSpec,
     from_states: Sequence[str],
     to_state: str,
-    reason: str | None,
+    reason: str | _Clear | None,
     owner: Mapping[str, object],
     set_: Mapping[str, object],
 ) -> frozenset[str]:
@@ -192,7 +202,7 @@ async def transition(
     from_states: Sequence[str],
     to_state: str,
     *,
-    reason: str | None = None,
+    reason: str | _Clear | None = None,
     owner: Mapping[str, object] | None = None,
     set_: Mapping[str, object] | None = None,
 ) -> None:
@@ -200,7 +210,8 @@ async def transition(
 
     One `UPDATE ... WHERE id = :id AND <state> = ANY(:from) [AND <owner col> = :owner ...] RETURNING id`:
 
-    - The new state, and the reason when `reason` is given.
+    - The new state, and the reason when `reason` is given: a text, or `CLEAR_REASON` for `NULL`. Without one
+      (`None`) the reason column keeps whatever it held.
     - The changed-at column of `to_state`, unless the row is already in `to_state` (a self-edge keeps the
       time of the first entry).
     - `NULL` for the ownership columns that `clear_on_exit` lists for every state of `from_states` other
@@ -228,7 +239,7 @@ async def transition(
     state = target.c[spec.state_col]
     assignments: dict[str, object] = {spec.state_col: to_state}
     if reason is not None and spec.reason_col is not None:
-        assignments[spec.reason_col] = reason
+        assignments[spec.reason_col] = sa.null() if reason is CLEAR_REASON else reason
     changed_at = spec.changed_at.get(to_state)
     if changed_at is not None:
         assignments[changed_at] = (

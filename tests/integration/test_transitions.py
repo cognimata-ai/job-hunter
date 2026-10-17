@@ -5,7 +5,7 @@ import sqlalchemy as sa
 from jobhunter.db.seed import sync_transition_matrix
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import CHECK_VIOLATION, pg_error
-from jobhunter.db.transitions import TRANSITIONS, transition
+from jobhunter.db.transitions import CLEAR_REASON, TRANSITIONS, transition
 from jobhunter.errors import TransitionConflict
 
 from tests.support.pg import MANUAL_RUN_SQL
@@ -231,3 +231,15 @@ async def test_the_app_role_reads_the_matrix_and_a_legal_transition_still_passes
         )  # an UPDATE of status: the trigger reads the matrix
         status = (await c.execute(sa.text("SELECT status FROM runs WHERE id=:i"), {"i": rid})).scalar_one()
         assert status == "cancelled"
+
+
+async def test_clear_reason_empties_the_reason_column_and_no_reason_leaves_it(engine) -> None:
+    reason = sa.text("SELECT status, status_reason FROM runs WHERE id=:i")
+    async with engine.begin() as c:
+        rid = (await c.execute(INS)).scalar_one()
+        await c.execute(sa.text("UPDATE runs SET status_reason = 'redeferred' WHERE id=:i"), {"i": rid})
+        await transition(c, "runs", rid, ["queued"], "running", reason=CLEAR_REASON, set_=start(rid, 1))
+        assert tuple((await c.execute(reason, {"i": rid})).one()) == ("running", None)
+        await c.execute(sa.text("UPDATE runs SET status_reason = 'kept' WHERE id=:i"), {"i": rid})
+        await transition(c, "runs", rid, ["running"], "succeeded", owner={"attempt_no": 1})
+        assert tuple((await c.execute(reason, {"i": rid})).one()) == ("succeeded", "kept")

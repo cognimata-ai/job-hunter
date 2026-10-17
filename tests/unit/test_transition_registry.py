@@ -2,7 +2,7 @@ from typing import NoReturn, cast
 
 import pytest
 from jobhunter.db import transitions
-from jobhunter.db.transitions import TRANSITIONS, TransitionSpec, transition
+from jobhunter.db.transitions import CLEAR_REASON, TRANSITIONS, TransitionSpec, transition
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 
@@ -102,3 +102,5 @@ async def test_a_reason_for_a_table_without_a_reason_column_is_refused(monkeypat
     monkeypatch.setattr(transitions, "TRANSITIONS", {"t": spec})
     with pytest.raises(ValueError, match="t has no reason column"):
         await transition(NO_DATABASE, "t", 1, ["a"], "b", reason="why")
+    with pytest.raises(ValueError, match="t has no reason column"):
+        await transition(NO_DATABASE, "t", 1, ["a"], "b", reason=CLEAR_REASON)
