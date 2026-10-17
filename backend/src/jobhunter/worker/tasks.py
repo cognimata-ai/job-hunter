@@ -6,8 +6,9 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 (spike V1). Correctness never rests on it: every mutation that needs follow-up work also leaves a durable
 `operations` or `runs` row that the reconcilers re-defer from (§3.3.2).
 
-Task bodies are stubs here (they log `task_stub`); Tasks 10 to 13 fill them in. Every body is `pass_context`
-and reads its inputs from the `WorkerRuntime` in `context.additional_context["runtime"]`.
+Task bodies not yet written are stubs (they log `task_stub`); Tasks 10 to 13 fill them in (`run_operation`:
+Task 10). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
+`context.additional_context["runtime"]`.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 
@@ -17,7 +18,7 @@ blueprint to an app namespaces its tasks, so it can be added once.) `_reset_task
 """
 
 from collections.abc import Mapping
-from typing import Final, Literal, Protocol
+from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 import procrastinate
 from procrastinate.exceptions import AlreadyEnqueued, ConnectorException, NoResult, UniqueViolation
@@ -29,6 +30,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
+
+if TYPE_CHECKING:
+    # Only for annotations: the runtime pulls in langgraph, which a process that only defers (the API) skips.
+    from jobhunter.worker.runtime import WorkerRuntime
 
 TASK_NAMESPACE: Final = "jh"
 TaskName = Literal["run_collect", "run_operation", "tick", "reconcile_heavy", "retention_daily"]
@@ -57,7 +62,12 @@ async def run_collect(context: JobContext, run_id: int, attempt_no: int) -> None
 
 @blueprint.task(name="run_operation", queue="aux", pass_context=True)
 async def run_operation(context: JobContext, operation_id: int) -> None:
-    _stub("run_operation", operation_id=operation_id)
+    # Imported here: `operations` imports this module (`Deferrer`, `live_job_exists`). The worker imports
+    # `operations` itself before takeover, so its sweep, reconciler and handlers are registered (Task 13).
+    from jobhunter.worker.operations import execute_operation
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    await execute_operation(rt.engine, operation_id, epoch=rt.epoch)
 
 
 @blueprint.periodic(cron="* * * * *")
