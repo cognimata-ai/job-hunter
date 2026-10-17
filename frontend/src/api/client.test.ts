@@ -14,8 +14,14 @@ function problem(status: number, body: unknown, headers: Record<string, string> 
   return new Response(JSON.stringify(body), { status, headers: { ...PROBLEM_JSON, ...headers } });
 }
 
+// The init of fetch call `call`. Each test asserts the number of calls first, so a missing call fails there
+// instead of reading as an empty init.
 function sentInit(f: ReturnType<typeof mockFetch>, call = 0): RequestInit {
-  return f.mock.calls[call]?.[1] ?? {};
+  const init = f.mock.calls[call]?.[1];
+  if (init === undefined) {
+    throw new Error(`fetch call ${String(call)} was made without an init`);
+  }
+  return init;
 }
 
 describe("apiFetch", () => {
@@ -40,18 +46,21 @@ describe("apiFetch", () => {
     it.each(["POST", "PUT", "PATCH", "DELETE", "post", "patch"])("marks %s as state-changing", async (method) => {
       const f = mockFetch(() => new Response("{}"));
       await apiFetch("/api/x", { method });
+      expect(f).toHaveBeenCalledTimes(1);
       expect(new Headers(sentInit(f).headers).get("X-JH-Request")).toBe("1");
     });
 
     it.each([undefined, "GET", "HEAD", "get"])("does not mark %s", async (method) => {
       const f = mockFetch(() => new Response("{}"));
       await apiFetch("/api/x", method === undefined ? {} : { method });
+      expect(f).toHaveBeenCalledTimes(1);
       expect(new Headers(sentInit(f).headers).has("X-JH-Request")).toBe(false);
     });
 
     it("keeps same-origin credentials whatever the caller passes", async () => {
       const f = mockFetch(() => new Response("{}"));
       await apiFetch("/api/x", { credentials: "include" });
+      expect(f).toHaveBeenCalledTimes(1);
       expect(sentInit(f).credentials).toBe("same-origin");
     });
 
@@ -63,6 +72,7 @@ describe("apiFetch", () => {
         body: "{}",
         cache: "no-store",
       });
+      expect(f).toHaveBeenCalledTimes(1);
       const init = sentInit(f);
       expect(new Headers(init.headers).get("Idempotency-Key")).toBe("k-1");
       expect(new Headers(init.headers).get("X-JH-Request")).toBe("1");
@@ -75,6 +85,7 @@ describe("apiFetch", () => {
       await apiFetch("/api/x", { method: "POST", body: "{}" });
       await apiFetch("/api/x", { method: "POST", body: "a", headers: { "Content-Type": "text/plain" } });
       await apiFetch("/api/x");
+      expect(f).toHaveBeenCalledTimes(3);
       expect(new Headers(sentInit(f, 0).headers).get("content-type")).toBe("application/json");
       expect(new Headers(sentInit(f, 1).headers).get("content-type")).toBe("text/plain");
       expect(new Headers(sentInit(f, 2).headers).has("content-type")).toBe(false);
@@ -90,6 +101,19 @@ describe("apiFetch", () => {
     it("returns undefined for a 204", async () => {
       mockFetch(() => new Response(null, { status: 204 }));
       await expect(apiFetch<undefined>("/api/auth/logout", { method: "POST" })).resolves.toBeUndefined();
+    });
+
+    it.each([200, 201, 202])("returns undefined for a %i with an empty body", async (status) => {
+      mockFetch(() => new Response(null, { status, headers: { "content-type": "application/json" } }));
+      await expect(apiFetch<undefined>("/api/x", { method: "POST" })).resolves.toBeUndefined();
+    });
+
+    it("answers a 2xx whose body is not JSON with code internal and the header's request id", async () => {
+      mockFetch(() => new Response("<html>ok</html>",
+        { status: 200, headers: { "content-type": "text/html", "x-request-id": "r-6" } }));
+      const error = await apiFetch("/api/x").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ProblemError);
+      expect(error).toMatchObject({ status: 200, code: "internal", requestId: "r-6", errors: [] });
     });
   });
 

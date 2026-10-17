@@ -404,7 +404,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            /** @description Origin check failed (`csrf_failed`) */
             403: {
                 headers: {
                     [name: string]: unknown;

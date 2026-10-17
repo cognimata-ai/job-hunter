@@ -80,11 +80,13 @@ async function problemFrom(response: Response): Promise<ProblemError> {
 }
 
 /**
- * Calls the api at `path` and returns its JSON body (`undefined` for a 204; use `apiFetch<undefined>`).
+ * Calls the api at `path` and returns its JSON body (`undefined` for a 204 or any other empty 2xx body; use
+ * `apiFetch<undefined>`).
  *
  * Cookies go with same-origin requests only. State-changing methods carry `X-JH-Request: 1`, which the edge
- * requires (§16.5); a string body is sent as JSON unless the caller set a content type. Any non-2xx response
- * throws a `ProblemError`; a network failure rejects with `fetch`'s own error.
+ * requires (§16.5); a string body is sent as JSON unless the caller set a content type. Any non-2xx response,
+ * and a 2xx whose body is not JSON (code `"internal"`), throws a `ProblemError`; a network failure rejects with
+ * `fetch`'s own error.
  */
 export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -101,5 +103,19 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   if (response.status === 204) {
     return undefined as T;
   }
-  return (await response.json()) as T;
+  const text = await response.text();
+  if (text === "") {
+    return undefined as T;
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ProblemError({
+      status: response.status,
+      code: "internal",
+      title: "The response body is not JSON",
+      requestId: response.headers.get(REQUEST_ID_HEADER),
+      errors: [],
+    });
+  }
 }

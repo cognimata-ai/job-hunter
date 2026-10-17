@@ -47,7 +47,7 @@ from starlette.responses import Response
 from jobhunter.api.argon2_gate import Argon2Gate, GateFull
 from jobhunter.api.deps import get_argon2_gate, get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import CSRF_RESPONSES, LOGIN_CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.auth import sessions, throttle, totp, users
 from jobhunter.auth.passwords import check_password, dummy_verify, hash_password
 from jobhunter.auth.sessions import SessionInfo
@@ -257,7 +257,7 @@ async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) 
     responses={
         401: {"description": "Invalid credentials (`unauthenticated`)"},
         429: {"description": "Locked out, or too many logins at once (`throttled`, `retry_after_s`)"},
-        **CSRF_RESPONSES,
+        **LOGIN_CSRF_RESPONSES,
     },
 )
 async def login(

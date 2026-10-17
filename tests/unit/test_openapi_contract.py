@@ -121,3 +121,12 @@ def test_edge_and_session_errors_are_documented_on_every_api_route(document) -> 
         assert ("403" in statuses) == (method.upper() in STATE_CHANGING_METHODS), (method, path)
         if path != LOGIN_PATH:
             assert {"401", "429"} <= statuses, (method, path)
+
+
+def test_only_the_403_of_routes_that_need_x_jh_request_names_it(document) -> None:
+    """The login is checked for `Origin` only (§16.5, `edge.LOGIN_PATH`): its 403 does not name the header."""
+    forbidden = {key[:2]: response for key, response in error_responses(document).items() if key[2] == "403"}
+    assert ("post", LOGIN_PATH) in forbidden and len(forbidden) > 1
+    for (method, path), response in forbidden.items():
+        assert ("X-JH-Request" in response["description"]) == (path != LOGIN_PATH), (method, path)
+        assert "Origin" in response["description"], (method, path)

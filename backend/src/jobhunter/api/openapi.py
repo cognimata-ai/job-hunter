@@ -13,7 +13,8 @@ generated document says so:
 
 What a route does not raise itself but its guards do is declared by the route's `responses=`:
 `SESSION_RESPONSES` for what `deps.require_session` raises, `CSRF_RESPONSES` for the edge's CSRF check on a
-state-changing method (`edge.csrf_failure`). A unit test checks that every `/api` route documents them.
+state-changing method (`edge.csrf_failure`), and `LOGIN_CSRF_RESPONSES` for the login's, which checks `Origin`
+only. A unit test checks that every `/api` route documents them.
 """
 
 from typing import Any, Final
@@ -36,6 +37,10 @@ SESSION_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 }
 CSRF_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     403: {"description": "Origin or `X-JH-Request` check failed (`csrf_failed`)"},
+}
+# The login has no session yet and is checked for `Origin` only (§16.5, `edge.LOGIN_PATH`).
+LOGIN_CSRF_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    403: {"description": "Origin check failed (`csrf_failed`)"},
 }
 
 
