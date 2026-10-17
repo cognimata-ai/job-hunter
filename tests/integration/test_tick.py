@@ -1,0 +1,277 @@
+import asyncio
+import logging
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
+import sqlalchemy as sa
+from jobhunter.worker import reconcilers, tasks
+from jobhunter.worker import tick as tick_module
+from jobhunter.worker.tasks import defer_in_tx, live_job_exists
+from jobhunter.worker.tick import insert_active_collect, run_tick
+from procrastinate.job_context import JobContext
+from sqlalchemy.exc import IntegrityError
+
+from tests.support.logs import logged
+
+pytestmark = pytest.mark.integration
+A = datetime(2026, 10, 16, 4, tzinfo=UTC)
+
+
+async def schedule(engine, *, interval: int, cursor: datetime, enabled: bool = True) -> None:
+    async with engine.begin() as c:
+        await c.execute(
+            sa.text(
+                "UPDATE schedule_state SET anchor_utc=:a, interval_s=:i, last_evaluated_slot=:c, enabled=:e"
+            ),
+            {"a": A, "i": interval, "c": cursor, "e": enabled},
+        )
+
+
+async def runs(engine) -> list[tuple[datetime, str, str]]:
+    async with engine.connect() as c:
+        return [
+            tuple(r)
+            for r in await c.execute(
+                sa.text("SELECT scheduled_slot, status, trigger FROM runs ORDER BY scheduled_slot, id")
+            )
+        ]
+
+
+async def tick(engine, now: datetime):
+    async with engine.begin() as c:
+        return await run_tick(c, now=now, defer=defer_in_tx)
+
+
+async def test_due_slot_queues_one_scheduled_run(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    rep = await tick(engine, A + timedelta(hours=6, minutes=1))
+    assert rep.missed == 0 and await runs(engine) == [(A + timedelta(hours=6), "queued", "schedule")]
+    async with engine.connect() as c:
+        assert await live_job_exists(
+            c, "run_collect", args_match={"run_id": rep.queued_run_id, "attempt_no": 1}
+        )
+        assert (
+            await c.execute(
+                sa.text(
+                    "SELECT r.settings_version_id = a.settings_version_id "
+                    "AND r.scope_version_id = a.scope_version_id FROM runs r, active_config a"
+                )
+            )
+        ).scalar_one() is True
+    assert (await tick(engine, A + timedelta(hours=6, minutes=2))).queued_run_id is None
+    assert len(await runs(engine)) == 1
+
+
+async def test_overlap_records_skipped_overlap(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    await tick(engine, A + timedelta(hours=6))
+    rep = await tick(engine, A + timedelta(hours=12))
+    assert rep.skipped_overlap and await runs(engine) == [
+        (A + timedelta(hours=6), "queued", "schedule"),
+        (A + timedelta(hours=12), "skipped_overlap", "schedule"),
+    ]
+
+
+async def test_downtime_records_missed_and_catch_up(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    assert (await tick(engine, A + timedelta(hours=18, minutes=30))).missed == 2
+    assert await runs(engine) == [
+        (A + timedelta(hours=6), "missed", "schedule"),
+        (A + timedelta(hours=12), "missed", "schedule"),
+        (A + timedelta(hours=18), "queued", "catch_up"),
+    ]
+
+
+async def test_long_downtime_records_every_slot_once(engine, queue_app) -> None:  # Review Focus 2
+    await schedule(engine, interval=3600, cursor=A)
+    rep = await tick(engine, A + timedelta(days=9, minutes=30))
+    expected = [(A + timedelta(hours=h), "missed", "schedule") for h in range(1, 216)] + [
+        (A + timedelta(hours=216), "queued", "catch_up")
+    ]
+    assert rep.missed == 215 and await runs(engine) == expected
+    assert (await tick(engine, A + timedelta(days=9, minutes=31))).missed == 0
+    assert await runs(engine) == expected
+
+
+async def test_tick_with_clock_behind_cursor_is_noop(engine, queue_app) -> None:  # Review Focus 5
+    await schedule(engine, interval=21600, cursor=A + timedelta(hours=12))
+    rep = await tick(engine, A + timedelta(hours=1))
+    assert rep.cursor == A + timedelta(hours=12) and await runs(engine) == []
+    assert (await tick(engine, A + timedelta(hours=18))).queued_run_id is not None
+
+
+async def test_disabled_schedule_moves_cursor_without_rows(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=A, enabled=False)
+    rep = await tick(engine, A + timedelta(days=2))
+    assert await runs(engine) == [] and rep.cursor == A + timedelta(days=2)
+
+
+async def wait_until_a_session_waits_for_a_lock(engine) -> None:
+    """Return once another session is blocked on a lock, observed in `pg_stat_activity`.
+
+    Each poll is a transaction of its own: a transaction keeps the first `pg_stat_activity` snapshot it reads.
+    The timeout only turns a wait that never ends into a failure.
+    """
+    async with asyncio.timeout(30):
+        while True:
+            async with engine.connect() as c:
+                waiting = await c.execute(
+                    sa.text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND wait_event_type = 'Lock')"
+                    )
+                )
+                if waiting.scalar_one():
+                    return
+            await asyncio.sleep(0.02)
+
+
+async def test_concurrent_ticks_queue_the_slot_once(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    now = A + timedelta(hours=6)
+    async with engine.connect() as first:
+        tx = await first.begin()
+        rep1 = await run_tick(first, now=now, defer=defer_in_tx)
+        second = asyncio.create_task(tick(engine, now))
+        try:
+            await wait_until_a_session_waits_for_a_lock(engine)
+            assert not second.done()  # it waits for the cursor row that the first tick holds
+        finally:  # also when the assertion fails: the second tick must not wait for ever
+            await tx.commit()
+            await asyncio.wait([second])
+    rep2 = second.result()
+    assert rep1.queued_run_id is not None and rep2.queued_run_id is None and rep2.missed == 0
+    assert await runs(engine) == [(now, "queued", "schedule")]
+
+
+async def test_tick_locks_active_config_before_schedule_state(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    async with engine.connect() as holder:
+        tx = await holder.begin()
+        await holder.execute(sa.text("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE"))
+        blocked = asyncio.create_task(tick(engine, A + timedelta(hours=6)))
+        try:
+            await wait_until_a_session_waits_for_a_lock(engine)
+            async with engine.begin() as probe:  # fails with 55P03 if the waiting tick holds the cursor row
+                await probe.execute(sa.text("SELECT 1 FROM schedule_state WHERE id = 1 FOR UPDATE NOWAIT"))
+        finally:
+            await tx.commit()
+            await asyncio.wait([blocked])
+    assert blocked.result().queued_run_id is not None
+
+
+async def test_insert_active_collect_classifies_each_conflict(engine, queue_app, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    async with engine.begin() as c:
+        settings_id, scope_id = (
+            await c.execute(sa.text("SELECT settings_version_id, scope_version_id FROM active_config"))
+        ).one()
+        ids = {"include_paid": True, "settings_version_id": settings_id, "scope_version_id": scope_id}
+        await c.execute(
+            sa.text(
+                "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, "
+                "scope_version_id) VALUES ('schedule', :slot, 'missed', true, :s, :c)"
+            ),
+            {"slot": A, "s": settings_id, "c": scope_id},
+        )
+        assert await insert_active_collect(c, trigger="catch_up", scheduled_slot=A, path="tick", **ids) == (
+            "slot_conflict"
+        )
+        manual = await insert_active_collect(c, trigger="manual", scheduled_slot=None, path="manual", **ids)
+        assert isinstance(manual, int)
+        assert logged(caplog, "active_collect_conflict") == []
+        other = A + timedelta(hours=6)
+        assert await insert_active_collect(
+            c, trigger="schedule", scheduled_slot=other, path="tick", **ids
+        ) == ("active_conflict")
+        [event] = logged(caplog, "active_collect_conflict")
+        assert event["path"] == "tick" and event["sqlstate"] == "23505"
+        with pytest.raises(
+            IntegrityError
+        ):  # a manual run has no slot (CHECK): neither index, so it re-raises
+            await insert_active_collect(c, trigger="manual", scheduled_slot=other, path="manual", **ids)
+        # every conflict rolled back its savepoint only
+        assert (await c.execute(sa.text("SELECT count(*) FROM runs"))).scalar_one() == 2
+
+
+async def test_skipped_overlap_for_a_slot_that_was_taken_meanwhile_is_a_noop(
+    engine, queue_app, monkeypatch
+) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    slot = A + timedelta(hours=6)
+
+    async def lose_both_races(conn, **kwargs):
+        # Another writer recorded the slot between our attempt and our skipped_overlap insert.
+        await conn.execute(
+            sa.text(
+                "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, "
+                "scope_version_id) SELECT 'schedule', :slot, 'skipped_overlap', true, settings_version_id, "
+                "scope_version_id FROM active_config"
+            ),
+            {"slot": slot},
+        )
+        return "active_conflict"
+
+    monkeypatch.setattr(tick_module, "insert_active_collect", lose_both_races)
+    rep = await tick(engine, slot)
+    assert not rep.skipped_overlap and rep.queued_run_id is None and rep.cursor == slot
+    assert await runs(engine) == [(slot, "skipped_overlap", "schedule")]
+
+
+async def test_scheduled_run_takes_include_paid_from_the_active_settings(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    set_flag = sa.text(
+        "UPDATE settings_versions "
+        "SET payload = jsonb_set(payload, '{schedule,include_paid}', CAST(:v AS jsonb)) "
+        "WHERE id = (SELECT settings_version_id FROM active_config)"
+    )
+    async with engine.begin() as c:  # the settings row is shared by the whole session: put the flag back
+        original = (
+            await c.execute(
+                sa.text(
+                    "SELECT payload #>> '{schedule,include_paid}' FROM settings_versions "
+                    "WHERE id = (SELECT settings_version_id FROM active_config)"
+                )
+            )
+        ).scalar_one()
+        await c.execute(set_flag, {"v": "false"})
+    try:
+        await tick(engine, A + timedelta(hours=12))
+    finally:
+        async with engine.begin() as c:
+            await c.execute(set_flag, {"v": original})
+    async with engine.connect() as c:
+        paid = (
+            (await c.execute(sa.text("SELECT include_paid FROM runs ORDER BY scheduled_slot")))
+            .scalars()
+            .all()
+        )
+    assert paid == [False, False]
+
+
+async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
+    engine, queue_app, monkeypatch
+) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    now = A + timedelta(hours=6)
+    released_by: list[str] = []
+
+    async def release_in_reconciler(app, **kwargs) -> int:
+        released_by.append("reconciler")
+        assert app is queue_app
+        return 0
+
+    async def release_in_task(app, **kwargs) -> int:
+        released_by.append("task")
+        return 0
+
+    monkeypatch.setattr(reconcilers, "release_stalled_jobs", release_in_reconciler)
+    monkeypatch.setattr(tasks, "release_stalled_jobs", release_in_task)
+    monkeypatch.setattr(tasks, "utcnow", lambda: now)
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=3)  # the `WorkerRuntime` fields it reads
+    context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
+    await tasks.tick(context, timestamp=0)
+    assert released_by == ["reconciler"]  # the `stalled_jobs` reconciler releases; the body does not
+    assert await runs(engine) == [(now, "queued", "schedule")]

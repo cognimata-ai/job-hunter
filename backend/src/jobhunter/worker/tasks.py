@@ -7,7 +7,7 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 `operations` or `runs` row that the reconcilers re-defer from (§3.3.2).
 
 Task bodies not yet written are stubs (they log `task_stub`); Tasks 10 to 13 fill them in (`run_operation`:
-Task 10). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
+Task 10, `tick`: Task 11). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
 `context.additional_context["runtime"]`.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
@@ -27,6 +27,7 @@ from procrastinate.jobs import Job, Status
 from procrastinate.manager import QUEUEING_LOCK_CONSTRAINT, JobManager
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
@@ -73,7 +74,18 @@ async def run_operation(context: JobContext, operation_id: int) -> None:
 @blueprint.periodic(cron="* * * * *")
 @blueprint.task(name="tick", queue="tick", queueing_lock="tick", pass_context=True)
 async def tick(context: JobContext, timestamp: int) -> None:
-    _stub("tick", timestamp=timestamp)
+    # Imported here: `reconcilers` and `tick` import this module (`Deferrer`, `release_stalled_jobs`).
+    from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
+    from jobhunter.worker.tick import run_tick
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    # The `stalled_jobs` reconciler runs in this cadence, so the tick does not release stalled jobs itself.
+    await run_reconcilers(
+        ReconcileContext(engine=rt.engine, queue=rt.queue, defer=defer_in_tx, now=utcnow(), epoch=rt.epoch),
+        "tick",
+    )
+    async with rt.engine.begin() as conn:
+        await run_tick(conn, now=utcnow(), defer=defer_in_tx)
 
 
 @blueprint.periodic(cron="*/10 * * * *")
