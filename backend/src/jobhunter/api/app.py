@@ -1,12 +1,14 @@
 """The api app factory (spec §3, §14) and `app`, the object uvicorn serves.
 
-`create_app()` builds the FastAPI app, its routers and exception handlers, and wraps it in `EdgeMiddleware`.
+`create_app()` builds the FastAPI app, its routers, exception handlers and per-session rate limiter
+(`SessionRateLimiter`), and wraps it in `EdgeMiddleware`.
 It touches no configuration, engine or queue: the lifespan builds all of that from the configuration it loads
 (`startup_or_exit("api")`, then the log level, the engine, the code head and, outside the test env, the
 metrics server on port 8001). With `cfg` and `engine` injected (tests), the state is set at once and the
 lifespan does nothing; the caller owns and disposes that engine.
 """
 
+from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Final
@@ -18,7 +20,7 @@ from starlette.types import Receive, Scope, Send
 from jobhunter import __version__
 from jobhunter.api.edge import EdgeMiddleware
 from jobhunter.api.errors import exception_handlers
-from jobhunter.api.routes import health
+from jobhunter.api.routes import auth, health
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.session import make_engine
@@ -27,6 +29,41 @@ from jobhunter.observability.metrics import start_metrics_server
 
 METRICS_PORT: Final = 8001
 ENGINE_POOL_SIZE: Final = 10
+
+
+class SessionRateLimiter:
+    """At most `limit` requests per session in any `window_s` seconds (§14.1: 600 per minute).
+
+    A sliding window of the accepted requests' times per key (the session's token HMAC), in memory: the api
+    runs one replica, on one event loop, and `hit` never awaits, so no lock is needed. A refused request is
+    not counted. Keys whose window is empty are dropped at most once per window, which bounds the memory to
+    the sessions active in the last window.
+    """
+
+    def __init__(self, limit: int = 600, window_s: float = 60.0) -> None:
+        self.limit = limit
+        self.window_s = window_s
+        self._hits: dict[bytes, deque[float]] = {}
+        self._next_sweep: float | None = None
+
+    def hit(self, key: bytes, now: float) -> bool:
+        """Count a request of `key` at `now` (monotonic seconds): `True`, or `False` past the limit."""
+        self._sweep(now)
+        hits = self._hits.setdefault(key, deque())
+        while hits and hits[0] <= now - self.window_s:
+            hits.popleft()
+        if len(hits) >= self.limit:
+            return False
+        hits.append(now)
+        return True
+
+    def _sweep(self, now: float) -> None:
+        if self._next_sweep is not None and now < self._next_sweep:
+            return
+        self._next_sweep = now + self.window_s
+        stale = [key for key, hits in self._hits.items() if not hits or hits[-1] <= now - self.window_s]
+        for key in stale:
+            del self._hits[key]
 
 
 class JobHunterApp:
@@ -89,8 +126,10 @@ def create_app(
         telemetry={"tracing": False, "metrics": False, "logs": False, "auto_configure": False},
     )
     api.include_router(health.router)
+    api.include_router(auth.router)
     for router in extra_routers:
         api.include_router(router)
+    api.state.rate_limiter = SessionRateLimiter()
     if cfg is not None and engine is not None:
         api.state.cfg = cfg
         api.state.engine = engine

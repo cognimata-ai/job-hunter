@@ -43,7 +43,10 @@ _UPDATE_HASH_FROM = q(
     "UPDATE users SET password_hash = :new_hash WHERE id = 1 AND password_hash = :expected_hash"
 )
 _ENABLE_TOTP = q("UPDATE users SET totp_secret_enc = :blob, totp_enabled = true WHERE id = 1 RETURNING id")
-_DISABLE_TOTP = q("UPDATE users SET totp_secret_enc = NULL, totp_enabled = false WHERE id = 1 RETURNING id")
+_DISABLE_TOTP = q(
+    "UPDATE users SET totp_secret_enc = NULL, totp_enabled = false, totp_last_step = NULL WHERE id = 1 "
+    "RETURNING id"
+)
 
 
 class UserExists(Exception):
@@ -152,7 +155,7 @@ async def enable_totp(conn: AsyncConnection, secret_b32: str, *, data_key: bytes
 
 
 async def disable_totp(conn: AsyncConnection) -> None:
-    """Turn TOTP off and delete the secret. Raises `UserMissing`."""
+    """Turn TOTP off, delete the secret and forget the last step a login used. Raises `UserMissing`."""
     if (await conn.execute(_DISABLE_TOTP)).first() is None:
         raise UserMissing
 

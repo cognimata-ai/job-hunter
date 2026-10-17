@@ -514,7 +514,11 @@ async def test_a_422_message_returns_to_the_sender_and_never_reaches_a_log_line(
         return {"tag": body.tag}
 
     app = create_app(cfg=make_config("api"), engine=engine, extra_routers=[router])
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as c:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://testserver",
+        headers={"Origin": "https://testserver", "X-JH-Request": "1"},  # past the edge's CSRF check
+    ) as c:
         r = await c.post("/api/_tagged", json={"tag": "sender-input-7f3a"})
     assert_edge(r)
     assert r.status_code == 422 and r.headers["content-type"] == "application/problem+json"

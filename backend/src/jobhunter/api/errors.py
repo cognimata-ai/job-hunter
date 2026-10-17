@@ -217,6 +217,7 @@ def code_for_http_status(status: int) -> ProblemCode:
     - 404 and 405 (routing: no route, or no route for the method) → `not_found`;
     - 401 (e.g. FastAPI's security helpers) → `unauthenticated`;
     - 413 (a body over the size limit) → `upload_rejected`;
+    - 429 (a rate limit) → `throttled`;
     - any other 4xx (e.g. 400 for a body that cannot be parsed) → `validation_failed`;
     - 5xx → `internal`.
     """
@@ -226,6 +227,8 @@ def code_for_http_status(status: int) -> ProblemCode:
         return "unauthenticated"
     if status == 413:
         return "upload_rejected"
+    if status == 429:
+        return "throttled"
     if status >= 500:
         return "internal"
     return "validation_failed"

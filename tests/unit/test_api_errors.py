@@ -16,6 +16,7 @@ from jobhunter.api.errors import code_for_http_status
         (413, "upload_rejected"),
         (415, "validation_failed"),
         (422, "validation_failed"),
+        (429, "throttled"),
         (500, "internal"),
         (503, "internal"),
     ],

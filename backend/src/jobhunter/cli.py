@@ -31,6 +31,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     http_check.add_argument("url", help="the http or https URL to probe, e.g. http://127.0.0.1:8000/healthz")
     _add_user_commands(commands)
+    _add_sessions_commands(commands)
     return parser
 
 
@@ -51,6 +52,15 @@ def _add_user_commands(commands: "argparse._SubParsersAction[argparse.ArgumentPa
         "enable", help="show the otpauth URI and a QR code, store the secret once a code verifies"
     )
     totp_commands.add_parser("disable", help="turn TOTP off and delete the secret")
+
+
+def _add_sessions_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    sessions = commands.add_parser("sessions", help="session and lockout recovery (§16.3, §16.4)")
+    sessions_commands = sessions.add_subparsers(dest="sessions_command", required=True)
+    sessions_commands.add_parser("revoke-all", help="revoke every session: everyone logs in again")
+    sessions_commands.add_parser(
+        "unlock", help="lift every login lockout and resolve the global auth.lockout alert"
+    )
 
 
 def _worker_health() -> int:
@@ -123,6 +133,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.cli_user import run_user_command
 
         return run_user_command(parser, args)
+    if args.command == "sessions":
+        # Imported here, like `user`: the sessions commands need the database layer.
+        from jobhunter.cli_sessions import run_sessions_command
+
+        return run_sessions_command(args)
     parser.error(f"unknown command {args.command!r}")
 
 

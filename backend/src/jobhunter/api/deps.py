@@ -1,9 +1,23 @@
 """FastAPI dependencies that read the app state and the request state the edge set."""
 
+import time
+from typing import Protocol, runtime_checkable
+
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from jobhunter.api.errors import Problem
+from jobhunter.auth import sessions
+from jobhunter.auth.sessions import SessionInfo
+from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+
+
+@runtime_checkable
+class RateLimiter(Protocol):
+    """What `require_session` needs of the app's `rate_limiter` (`app.SessionRateLimiter`)."""
+
+    def hit(self, key: bytes, now: float) -> bool: ...
 
 
 def get_engine(request: Request) -> AsyncEngine:
@@ -28,9 +42,45 @@ def get_code_head(request: Request) -> str:
     return head
 
 
+def get_rate_limiter(request: Request) -> RateLimiter:
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if not isinstance(limiter, RateLimiter):
+        raise RuntimeError("the api state has no rate limiter: it was not built by create_app")
+    return limiter
+
+
 def request_id(request: Request) -> str:
     """The id `EdgeMiddleware` gave this request (the `X-Request-Id` of its response)."""
     value = getattr(request.state, "request_id", None)
     if not isinstance(value, str):
         raise RuntimeError("the request has no request id: it did not pass the edge")
     return value
+
+
+def _unauthenticated() -> Problem:
+    # The cookie is cleared with the attributes it was set with, so the browser drops it (ruling T16-e).
+    return Problem(
+        401,
+        "unauthenticated",
+        "Authentication required",
+        headers={"Set-Cookie": sessions.CLEARED_SESSION_COOKIE},
+    )
+
+
+async def require_session(request: Request) -> SessionInfo:
+    """The valid session of the request's cookie; 401 `unauthenticated` without one, 429 past the rate limit.
+
+    The validation (and its slide) runs in a transaction of its own that commits before anything is raised.
+    The limit is 600 requests per minute per session (§14.1), counted in memory: the api runs one replica.
+    """
+    token = request.cookies.get(sessions.SESSION_COOKIE)
+    if not token:
+        raise _unauthenticated()
+    pepper = sessions.session_pepper(get_config(request).secret_b64("session_secret"))
+    async with get_engine(request).begin() as conn:
+        info = await sessions.validate_session(conn, token, pepper=pepper, now=utcnow())
+    if info is None:
+        raise _unauthenticated()
+    if not get_rate_limiter(request).hit(info.token_hmac, time.monotonic()):
+        raise Problem(429, "throttled", "Too many requests")
+    return info

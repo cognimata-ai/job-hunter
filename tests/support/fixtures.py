@@ -3,7 +3,7 @@
 import io
 import json
 import logging
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -12,7 +12,9 @@ import procrastinate
 import psycopg
 import pytest
 import structlog
-from jobhunter.api.app import create_app
+from jobhunter.api.app import JobHunterApp, create_app
+from jobhunter.auth import users
+from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, Role
 from jobhunter.db.migrate import run_migrate
 from jobhunter.db.seed import anchor_utc_for, latest_slot_at_or_before
@@ -244,20 +246,62 @@ async def queue_app(migrated: PgServer, make_config: ConfigFactory) -> AsyncIter
 
 
 @pytest.fixture
-async def api_client(engine: AsyncEngine, make_config: ConfigFactory) -> AsyncIterator[httpx.AsyncClient]:
-    """A client of the whole api (edge included) on the shared database, as client `198.51.100.10:50000`.
+def api_app(engine: AsyncEngine, make_config: ConfigFactory) -> JobHunterApp:
+    """The whole api (edge included) on the shared database; `api_client` and `logged_in_client` share it.
 
-    The app gets its config and engine injected, so no lifespan runs. An exception the app lets through comes
-    back as a 500 instead of being raised in the test (`raise_app_exceptions=False`).
+    The app gets its config and engine injected, so no lifespan runs.
     """
-    transport = httpx.ASGITransport(
-        app=create_app(cfg=make_config("api"), engine=engine),
-        raise_app_exceptions=False,
-        client=("198.51.100.10", 50000),
-    )
-    async with httpx.AsyncClient(
-        transport=transport, base_url="https://testserver", headers={"Origin": "https://testserver"}
-    ) as client:
+    return create_app(cfg=make_config("api"), engine=engine)
+
+
+def _app_client(app: JobHunterApp, client: tuple[str, int], headers: dict[str, str]) -> httpx.AsyncClient:
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False, client=client)
+    return httpx.AsyncClient(transport=transport, base_url="https://testserver", headers=headers)
+
+
+@pytest.fixture
+async def api_client(api_app: JobHunterApp) -> AsyncIterator[httpx.AsyncClient]:
+    """A client of `api_app` as client `198.51.100.10:50000`, sending `Origin: https://testserver`.
+
+    An exception the app lets through comes back as a 500 instead of being raised in the test
+    (`raise_app_exceptions=False`).
+    """
+    async with _app_client(api_app, ("198.51.100.10", 50000), {"Origin": "https://testserver"}) as client:
+        yield client
+
+
+TEST_USERNAME: Final = "ada"
+TEST_PASSWORD: Final = "Tannenbaum-Ölfass-7"
+
+
+class UserFactory(Protocol):
+    def __call__(self, username: str = TEST_USERNAME, password: str = TEST_PASSWORD) -> Awaitable[None]: ...
+
+
+@pytest.fixture
+def make_user(engine: AsyncEngine) -> UserFactory:
+    """`await make_user(username="ada", password=TEST_PASSWORD)`: create the single user (committed)."""
+
+    async def make(username: str = TEST_USERNAME, password: str = TEST_PASSWORD) -> None:
+        async with engine.begin() as conn:
+            await users.create_user(conn, username, password, now=utcnow())
+
+    return make
+
+
+@pytest.fixture
+async def logged_in_client(api_app: JobHunterApp, make_user: UserFactory) -> AsyncIterator[httpx.AsyncClient]:
+    """A second client of `api_app` (client `198.51.100.20:50000`), logged in as the user `make_user` made.
+
+    It sends `Origin: https://testserver` and `X-JH-Request: 1` with every request, and the session cookie
+    it got from the login.
+    """
+    await make_user()
+    headers = {"Origin": "https://testserver", "X-JH-Request": "1"}
+    async with _app_client(api_app, ("198.51.100.20", 50000), headers) as client:
+        r = await client.post("/api/auth/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD})
+        if r.status_code != 204:
+            raise RuntimeError(f"logged_in_client: the login answered {r.status_code}")
         yield client
 
 

@@ -8,8 +8,10 @@ itself. For each HTTP request it:
    bound to the structlog contextvars for the request only (unbound again when the request ends, ruling
    T14-d);
 2. sets `X-Request-Id` and `SECURITY_HEADERS` on every `http.response.start`;
-3. counts `HTTP_REQUESTS` by route template (or `"unmatched"`, never the raw path; ruling T14-c) and status;
-4. renders a 500 `internal` problem when the inner app raises before a response started, then persists the
+3. refuses a state-changing `/api` request that fails the CSRF check (§14.1, §16.5) with its own 403
+   `csrf_failed` problem, before the app sees it (`csrf_failure`);
+4. counts `HTTP_REQUESTS` by route template (or `"unmatched"`, never the raw path; ruling T14-c) and status;
+5. renders a 500 `internal` problem when the inner app raises before a response started, then persists the
    `api.unhandled_exception` alert. When a response has already started, the inner handler rendered it and
    persisted the alert (or a body failed mid-stream), so the edge only logs.
 
@@ -19,14 +21,20 @@ must never reach a log line. This module is a task boundary (ruff `BLE001` is al
 
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Literal
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from jobhunter.api.errors import internal_problem, persist_unhandled_alert, problem_response, request_instance
+from jobhunter.api.errors import (
+    Problem,
+    internal_problem,
+    persist_unhandled_alert,
+    problem_response,
+    request_instance,
+)
 from jobhunter.config import AppConfig
 from jobhunter.ids import uuid7
 from jobhunter.observability.logging import get_logger
@@ -51,6 +59,12 @@ SECURITY_HEADERS: Final[Mapping[str, str]] = MappingProxyType(
 REQUEST_ID_HEADER: Final = "X-Request-Id"
 # The `route` label of a request that matched no route (a 404) or matched a path but not its method (a 405).
 UNMATCHED_ROUTE: Final = "unmatched"
+# §16.5: the methods that may change state, and the custom header a cross-origin page cannot send without a
+# CORS preflight (and the api answers no preflight). The login has no session yet: Origin only.
+STATE_CHANGING_METHODS: Final = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+CSRF_HEADER: Final = "X-JH-Request"
+LOGIN_PATH: Final = "/api/auth/login"
+CsrfFailure = Literal["origin_missing", "origin_mismatch", "header_missing"]
 
 log = get_logger("jobhunter.api.edge")
 
@@ -67,6 +81,36 @@ def route_label(scope: Scope) -> str:
     if not isinstance(path, str) or (methods is not None and scope.get("method") not in methods):
         return UNMATCHED_ROUTE
     return path
+
+
+def _header_values(scope: Scope, name: bytes) -> list[str]:
+    return [value.decode("latin-1") for key, value in scope.get("headers", []) if key == name]
+
+
+def csrf_failure(scope: Scope, public_origin: str | None) -> CsrfFailure | None:
+    """Why the request of `scope` fails the CSRF check, or `None` when it passes or is not subject to it.
+
+    It applies to POST, PUT, PATCH and DELETE under `/api`. `Origin` must be sent once and equal
+    `public_origin` exactly (scheme, host and port, as browsers send it); without a configured origin every
+    such request fails. `X-JH-Request: 1` is also required, except on the login.
+    """
+    if scope.get("method") not in STATE_CHANGING_METHODS:
+        return None
+    path = str(scope.get("path", ""))
+    if path != "/api" and not path.startswith("/api/"):
+        return None
+    origins = _header_values(scope, b"origin")
+    if not origins:
+        return "origin_missing"
+    if public_origin is None or origins != [public_origin]:
+        return "origin_mismatch"
+    if path != LOGIN_PATH and _header_values(scope, CSRF_HEADER.lower().encode("ascii")) != ["1"]:
+        return "header_missing"
+    return None
+
+
+def _csrf_problem() -> Problem:
+    return Problem(403, "csrf_failed", "Cross-site request refused")
 
 
 class EdgeMiddleware:
@@ -106,7 +150,16 @@ class EdgeMiddleware:
 
         with structlog.contextvars.bound_contextvars(request_id=request_id):
             try:
-                await self.app(scope, receive, send_with_edge_headers)
+                cfg = self._config()
+                failure = csrf_failure(scope, None if cfg is None else cfg.public_origin)
+                if failure is None:
+                    await self.app(scope, receive, send_with_edge_headers)
+                else:
+                    log.warning("csrf_rejected", reason=failure)
+                    response = problem_response(
+                        _csrf_problem(), instance=request_instance(scope), request_id=request_id
+                    )
+                    await response(scope, receive, send_with_edge_headers)
             except Exception as exc:
                 await self._last_resort(
                     scope,
