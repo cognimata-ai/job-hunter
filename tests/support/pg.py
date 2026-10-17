@@ -6,6 +6,7 @@ privileges under test are the ones production gets. Role passwords are random pe
 container only as files in a read-only mount; they appear on no command line and in no log.
 """
 
+import asyncio
 import base64
 import os
 import secrets
@@ -16,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Any, Final, Literal
 from urllib.parse import quote
 
 import psycopg
@@ -409,6 +410,21 @@ def pg_one(
     """The first row of `statement` run as `role`, or `None` for a statement without rows."""
     rows = pg_rows(server, role, statement, *params, db=db)
     return rows[0] if rows else None
+
+
+def lock_waits(server: PgServer) -> int:
+    """How many lock requests wait right now (`pg_locks` rows not granted), across the whole server.
+
+    A barrier's readiness acknowledgement: a statement that another transaction's lock holds back shows up
+    here.
+    """
+    row = pg_one(server, "superuser", "SELECT count(*) FROM pg_locks WHERE NOT granted")
+    return 0 if row is None else int(str(row[0]))
+
+
+async def blocked_or_done(server: PgServer, task: asyncio.Task[Any]) -> bool:
+    """Whether `task` has ended or some statement waits for a lock: what `await_until` polls at a barrier."""
+    return task.done() or lock_waits(server) > 0
 
 
 def _insert_id(conn: psycopg.Connection[TupleRow], statement: str, *params: object) -> int:

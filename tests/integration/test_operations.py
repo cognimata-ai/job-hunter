@@ -16,6 +16,7 @@ from jobhunter.worker.tasks import defer_in_tx, live_job_exists
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from tests.support.logs import logged
+from tests.support.pg import blocked_or_done
 from tests.support.procs import await_until
 
 pytestmark = pytest.mark.integration
@@ -138,6 +139,80 @@ async def test_takeover_sweep_returns_older_epoch_operations(engine, queue_app, 
         and counts["operations"] == 1
         and (await row(engine, op))[:4] == ("pending", None, None, None)
     )
+
+
+# --- Final fix wave, item 1: the takeover waits for an old owner's row lock, it never skips the row ---------
+
+
+async def _owner_holds_the_row(conn: AsyncConnection, claim_: ops.OperationClaim, how: str) -> None:
+    """What an old owner's in-flight transaction holds on its row: `FOR SHARE` or a heartbeat's update."""
+    if how == "owner_lock":
+        await ops.lock_operation_owner(conn, claim_)
+    else:
+        assert await ops.heartbeat_operation(conn, claim_)
+
+
+@pytest.mark.parametrize("how", ["owner_lock", "heartbeat"])
+async def test_the_takeover_waits_for_an_older_owners_row_lock_and_then_fences_it(
+    engine, queue_app, worker_lock, migrated, how
+) -> None:
+    op, _ = await new_op(engine)
+    e1, _ = await claim_epoch_and_sweep(
+        engine, WorkerIdentity(uuid.uuid4(), "h", 1, worker_lock.backend_pid, "v")
+    )
+    async with engine.begin() as c:
+        old = await ops.claim_operation(c, op, epoch=e1)
+    assert old is not None
+    async with engine.connect() as holder:
+        tx = await holder.begin()
+        await _owner_holds_the_row(holder, old, how)  # the old owner is mid-transaction on its row
+        takeover = asyncio.create_task(
+            claim_epoch_and_sweep(engine, WorkerIdentity(uuid.uuid4(), "h", 2, worker_lock.backend_pid, "v"))
+        )
+        try:
+            await await_until(lambda: blocked_or_done(migrated, takeover), 5)
+            waited = not takeover.done()  # it waits for the row instead of committing without it
+        finally:
+            await tx.commit()
+    e2, counts = await asyncio.wait_for(takeover, 5)
+    assert (waited, e2, counts["operations"]) == (True, e1 + 1, 1)
+    assert (await row(engine, op))[:5] == ("pending", None, None, None, 1)
+    async with engine.begin() as c:  # the old claim is fenced: its heartbeat and finalization write nothing
+        assert await ops.heartbeat_operation(c, old) is False
+    async with engine.begin() as c:
+        with pytest.raises(FencedOut):
+            await ops.finish_operation(c, old, status="succeeded")
+    assert (await row(engine, op))[:5] == ("pending", None, None, None, 1)
+
+
+async def test_an_older_owners_row_lock_held_past_the_lock_timeout_fails_the_takeover_with_55p03(
+    engine, queue_app, worker_lock
+) -> None:
+    op, _ = await new_op(engine)
+    e1, _ = await claim_epoch_and_sweep(
+        engine, WorkerIdentity(uuid.uuid4(), "h", 1, worker_lock.backend_pid, "v")
+    )
+    async with engine.begin() as c:
+        old = await ops.claim_operation(c, op, epoch=e1)
+    assert old is not None
+    before = await row(engine, op)
+    async with engine.connect() as holder:
+        tx = await holder.begin()
+        await ops.lock_operation_owner(holder, old)  # held until the claim gave up
+        try:
+            with pytest.raises(sa.exc.OperationalError) as blocked:
+                await claim_epoch_and_sweep(
+                    engine,
+                    WorkerIdentity(uuid.uuid4(), "h", 2, worker_lock.backend_pid, "v"),
+                    lock_timeout_ms=200,
+                )
+        finally:
+            await tx.rollback()
+    assert pg_error(blocked.value).sqlstate == LOCK_NOT_AVAILABLE
+    # Nothing was committed: the epoch is still e1 and the operation still belongs to the old claim.
+    async with engine.connect() as c:
+        assert (await c.execute(sa.text("SELECT worker_epoch FROM worker_heartbeat"))).scalar_one() == e1
+    assert await row(engine, op) == before and before[:3] == ("running", old.claim_id, e1)
 
 
 async def test_c30_reconciler_redefers_lost_job_after_two_minutes(engine, queue_app) -> None:

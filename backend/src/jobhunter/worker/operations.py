@@ -139,9 +139,12 @@ _STALE = q(
     "SELECT id, claim_id, attempts FROM operations WHERE status = 'running' AND heartbeat_at < :cutoff "
     "ORDER BY id FOR UPDATE SKIP LOCKED"
 )
+# Not SKIP LOCKED, unlike `_STALE`: the takeover must take back every operation of an older epoch (§3.3.1
+# step 5), so it waits for an old owner's row lock (a heartbeat, `lock_operation_owner`) instead of leaving
+# that claim valid. The takeover's `lock_timeout` bounds the wait, as for the `runs` sweep.
 _OLDER_EPOCH = q(
     "SELECT id, claim_id, attempts FROM operations WHERE status = 'running' AND worker_epoch < :epoch "
-    "ORDER BY id FOR UPDATE SKIP LOCKED"
+    "ORDER BY id FOR UPDATE"
 )
 # Due `pending` operations without a live job (the predicate of `tasks.live_job_exists`, inline so that
 # only real candidates are locked and the batch is never filled by rows that still have their job).
@@ -366,7 +369,11 @@ async def _reclaim_stale(conn: AsyncConnection, *, now: datetime) -> list[tuple[
 
 @register_takeover_sweep("operations")
 async def sweep_older_epoch_operations(conn: AsyncConnection, epoch: int) -> int:
-    """At takeover: take back every `running` operation of an older worker epoch; the count."""
+    """At takeover: take back every `running` operation of an older worker epoch; the count.
+
+    It waits for the row locks of those owners (none is skipped), so once the takeover commits no older claim
+    is valid any more.
+    """
     rows = (await conn.execute(_OLDER_EPOCH, {"epoch": epoch})).all()
     for row in rows:
         await _release(conn, row.id, row.claim_id, int(row.attempts), reason=None, not_before=None)
