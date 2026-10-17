@@ -1,19 +1,24 @@
 """Shared pytest fixtures; later tasks add their fixtures here."""
 
+import io
+import json
 import logging
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
+import httpx
 import procrastinate
 import psycopg
 import pytest
 import structlog
+from jobhunter.api.app import create_app
 from jobhunter.config import AppConfig, Role
 from jobhunter.db.migrate import run_migrate
 from jobhunter.db.seed import anchor_utc_for, latest_slot_at_or_before
 from jobhunter.db.session import make_engine
 from jobhunter.observability import redact
+from jobhunter.observability.logging import configure_logging
 from jobhunter.types import get_int, get_str
 from jobhunter.worker.lock import ADVISORY_LOCK_KEY, LockSession, acquire_lock
 from jobhunter.worker.tasks import make_queue_app
@@ -236,3 +241,40 @@ async def queue_app(migrated: PgServer, make_config: ConfigFactory) -> AsyncIter
     app = make_queue_app(make_config("worker", migrated).dsn("psycopg"))
     async with app.open_async():
         yield app
+
+
+@pytest.fixture
+async def api_client(engine: AsyncEngine, make_config: ConfigFactory) -> AsyncIterator[httpx.AsyncClient]:
+    """A client of the whole api (edge included) on the shared database, as client `198.51.100.10:50000`.
+
+    The app gets its config and engine injected, so no lifespan runs. An exception the app lets through comes
+    back as a 500 instead of being raised in the test (`raise_app_exceptions=False`).
+    """
+    transport = httpx.ASGITransport(
+        app=create_app(cfg=make_config("api"), engine=engine),
+        raise_app_exceptions=False,
+        client=("198.51.100.10", 50000),
+    )
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://testserver", headers={"Origin": "https://testserver"}
+    ) as client:
+        yield client
+
+
+@pytest.fixture
+def log_events() -> Iterator[Callable[[], list[dict[str, Any]]]]:
+    """`log_events()`: the JSON events logged so far in this test, as rendered (redaction included), in order.
+
+    The logging of the process goes to an in-memory stream at level INFO during the test; afterwards the
+    default stream is back.
+    """
+    buffer = io.StringIO()
+    configure_logging("INFO", stream=buffer)
+
+    def events() -> list[dict[str, Any]]:
+        return [json.loads(line) for line in buffer.getvalue().splitlines() if line]
+
+    try:
+        yield events
+    finally:
+        configure_logging("INFO")

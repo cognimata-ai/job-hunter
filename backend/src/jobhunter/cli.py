@@ -3,9 +3,11 @@
 import argparse
 import sys
 from collections.abc import Sequence
-from typing import get_args
+from typing import Final, get_args
 
 from jobhunter.config import Role, load_config, startup_or_exit
+
+HTTP_CHECK_TIMEOUT_S: Final = 3
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -24,6 +26,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "worker-health",
         help="exit 0 when the worker heartbeat is at most 60 s old, else 1 (container HEALTHCHECK)",
     )
+    http_check = commands.add_parser(
+        "http-check", help="exit 0 when a GET of URL answers 2xx within 3 s, else 1 (container HEALTHCHECK)"
+    )
+    http_check.add_argument("url", help="the http or https URL to probe, e.g. http://127.0.0.1:8000/healthz")
     return parser
 
 
@@ -42,6 +48,32 @@ def _worker_health() -> int:
         print(f"worker-health: {type(exc).__name__}", file=sys.stderr)
         return 1
     return 0 if fresh else 1
+
+
+def _http_check(url: str) -> int:
+    """An api container HEALTHCHECK: one GET of `url`, with `HTTP_CHECK_TIMEOUT_S` for each socket operation.
+
+    Quiet like `worker-health`: the standard library only (httpx is no runtime dependency), no logging setup,
+    and a failure prints one stderr line that names the error class only (a non-2xx answer is an `HTTPError`).
+    Proxy variables are ignored: the probe asks the server in its own container.
+    """
+    try:
+        # Imported here: the other commands do not need them.
+        import urllib.parse
+        import urllib.request
+
+        if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+            raise ValueError("http-check probes http and https URLs only")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=HTTP_CHECK_TIMEOUT_S) as response:
+            status = response.status
+    except Exception as exc:  # noqa: BLE001 - the probe's exit status is its outcome; Docker records it
+        print(f"http-check: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    if not 200 <= status < 300:
+        print(f"http-check: status {status}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -66,6 +98,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(asyncio.run(worker_main(startup_or_exit("worker"))))
     if args.command == "worker-health":
         return _worker_health()
+    if args.command == "http-check":
+        return _http_check(args.url)
     parser.error(f"unknown command {args.command!r}")
 
 
