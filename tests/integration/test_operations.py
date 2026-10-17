@@ -1,18 +1,21 @@
 import asyncio
 import uuid
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
 from jobhunter.errors import FencedOut
 from jobhunter.worker import operations as ops
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
 from jobhunter.worker.tasks import defer_in_tx, live_job_exists
+from sqlalchemy.ext.asyncio import AsyncConnection
 
+from tests.support.logs import logged
 from tests.support.procs import await_until
 
 pytestmark = pytest.mark.integration
@@ -47,8 +50,16 @@ async def row(engine, op: int):
         return tuple((await c.execute(ROW, {"i": op})).one())
 
 
-def _logged(caplog, event: str) -> list[dict[str, Any]]:
-    return [rec.msg for rec in caplog.records if isinstance(rec.msg, dict) and rec.msg.get("event") == event]
+async def failed_alerts(engine) -> list[tuple[str, str, int]]:
+    """`(dedup_key, severity, occurrences)` of every `operation.failed` alert, oldest first."""
+    async with engine.connect() as c:
+        rows = await c.execute(
+            sa.text(
+                "SELECT dedup_key, severity, occurrences FROM alerts "
+                "WHERE code='operation.failed' ORDER BY id"
+            )
+        )
+        return [(r.dedup_key, r.severity, r.occurrences) for r in rows]
 
 
 async def test_create_dedups_and_defers_only_new_rows(engine, queue_app) -> None:
@@ -79,10 +90,11 @@ async def test_completion_failure_and_exhaustion_clear_ownership(engine, queue_a
     async with engine.begin() as c:
         assert await ops.requeue_operation(c, c3, error_code="transient", not_before=utcnow()) == "failed"
     assert await row(engine, op3) == ("failed", None, None, None, 10, "attempts_exhausted")
-    async with engine.connect() as c:
-        assert (
-            await c.execute(sa.text("SELECT severity FROM alerts WHERE code='operation.failed'"))
-        ).scalar_one() == "warn"
+    # Ruling T10-g: the direct `failed` finish alerts too, so each permanent failure has exactly one alert.
+    assert await failed_alerts(engine) == [
+        (f"operation.failed:operation:{op2}", "warn", 1),
+        (f"operation.failed:operation:{op3}", "warn", 1),
+    ]
 
 
 async def test_operation_aba_old_execution_is_fenced(engine, queue_app) -> None:
@@ -184,6 +196,7 @@ async def test_unknown_kind_fails_with_no_handler_and_alert(engine, queue_app, m
                 {"k": f"operation.failed:operation:{op}"},
             )
         ).scalar_one() == "warn"
+    assert await failed_alerts(engine) == [(f"operation.failed:operation:{op}", "warn", 1)]  # raised once
 
 
 # Beyond the brief: the other execute_operation outcomes, the reconciler's local cancel, and cancellation.
@@ -224,8 +237,8 @@ async def test_unexpected_handler_error_requeues_as_bug_with_a_delay(
         ).scalar_one()
     assert not_before >= before + timedelta(minutes=1)
     assert await claim(engine, op) is None  # not claimable before its not_before
-    [logged] = _logged(caplog, "operation_handler_failed")
-    assert (logged["operation_id"], logged["error_class"]) == (op, "RuntimeError")
+    [event] = logged(caplog, "operation_handler_failed")
+    assert (event["operation_id"], event["error_class"]) == (op, "RuntimeError")
     assert "must not be logged" not in caplog.text
 
 
@@ -297,3 +310,163 @@ async def test_cancel_operation_fences_the_running_claim(engine, queue_app) -> N
         assert await ops.cancel_operation(c, op2, reason="delete_everything") is True  # pending -> cancelled
     assert (await row(engine, op2))[0::5] == ("cancelled", "delete_everything")
     assert (await new_op(engine, kind="purge"))[1] is True  # a cancelled row no longer holds the dedup key
+
+
+# Fix round 1.
+
+
+async def _swallowing_handler(
+    claims: list[ops.OperationClaim], started: asyncio.Event, cancelled: asyncio.Event
+):
+    async def handler(ctx: ops.OperationContext) -> None:
+        claims.append(ctx.claim)
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()  # swallowed: the handler returns as if it had finished
+
+    return handler
+
+
+async def assert_still_owned_by(engine, op: int, claim_: ops.OperationClaim) -> None:
+    status, claim_id, epoch, heartbeat_at, attempts, error = await row(engine, op)
+    assert (status, claim_id, epoch, attempts, error) == ("running", claim_.claim_id, 1, 0, None)
+    assert heartbeat_at is not None
+
+
+async def test_swallowed_cancel_after_a_failing_beat_writes_nothing(
+    engine, queue_app, monkeypatch, caplog
+) -> None:
+    claims: list[ops.OperationClaim] = []
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    monkeypatch.setitem(ops.HANDLERS, "export", await _swallowing_handler(claims, started, cancelled))
+
+    async def failing_beat(conn, claim_: ops.OperationClaim) -> bool:
+        await started.wait()
+        raise ConnectionError("server closed the connection")
+
+    monkeypatch.setattr(ops, "heartbeat_operation", failing_beat)
+    op, _ = await new_op(engine)
+    await asyncio.wait_for(ops.execute_operation(engine, op, epoch=1, heartbeat_period_s=0), 5)
+    assert cancelled.is_set() and [m["error_class"] for m in logged(caplog, "heartbeat_failed")] == [
+        "ConnectionError"
+    ]
+    # Lost, so no owner write: not `succeeded`. The stale reclaim takes it back later (attempts + 1).
+    await assert_still_owned_by(engine, op, claims[0])
+    assert EXECUTIONS.get(("operation", op)) is None
+
+
+async def test_swallowed_cancel_from_cancel_all_writes_nothing(engine, queue_app, monkeypatch) -> None:
+    claims: list[ops.OperationClaim] = []
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    monkeypatch.setitem(ops.HANDLERS, "export", await _swallowing_handler(claims, started, cancelled))
+    op, _ = await new_op(engine)
+    run = asyncio.create_task(ops.execute_operation(engine, op, epoch=1, heartbeat_period_s=3600))
+    await started.wait()
+    assert await EXECUTIONS.cancel_all() == 1  # the shutdown's teardown
+    await asyncio.wait_for(run, 5)
+    assert cancelled.is_set()
+    await assert_still_owned_by(engine, op, claims[0])  # no state is rewritten on shutdown (§3.3.5)
+
+
+async def test_reconciler_leaves_a_local_execution_of_another_claim_alone(engine, queue_app) -> None:
+    op, _ = await new_op(engine)
+    assert await claim(engine, op) is not None
+    await age(engine, op, 4)
+    gate = asyncio.Event()
+
+    async def other_claims_execution() -> None:
+        await gate.wait()
+
+    other = EXECUTIONS.start(("operation", op), "a-different-claim", other_claims_execution())
+    try:
+        ctx = ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=1)
+        assert (await run_reconcilers(ctx, "tick"))["operations"] == 1  # the stale claim was taken back
+        assert EXECUTIONS.get(("operation", op)) == ("a-different-claim", other)  # but not this task
+        assert not other.done()
+    finally:
+        gate.set()
+        await other
+    assert (await row(engine, op))[0::4] == ("pending", 1)
+
+
+JOBS_FOR = sa.text(
+    "SELECT count(*) FROM procrastinate_jobs WHERE args @> jsonb_build_object('operation_id', :i)"
+)
+LOCK_NOWAIT = sa.text("SELECT id FROM operations WHERE id=:i FOR UPDATE NOWAIT")
+
+
+async def test_redefer_neither_locks_nor_redefers_a_row_with_a_live_job(engine, queue_app) -> None:
+    with_job, _ = await new_op(engine)  # deferred at creation: its job is live
+    lost, _ = await new_op(engine, defer=None, kind="purge")
+    due = utcnow() + timedelta(minutes=2, seconds=1)
+    async with engine.connect() as c1:
+        tx = await c1.begin()
+        assert await ops._redefer_lost_jobs(c1, now=due, defer=defer_in_tx) == 1
+        async with engine.connect() as c2:  # while the re-defer transaction is still open
+            async with c2.begin():
+                await c2.execute(LOCK_NOWAIT, {"i": with_job})  # never a candidate, so never locked
+            with pytest.raises(sa.exc.OperationalError) as locked:
+                async with c2.begin():
+                    await c2.execute(LOCK_NOWAIT, {"i": lost})
+            assert pg_error(locked.value).sqlstate == LOCK_NOT_AVAILABLE
+        await tx.commit()
+    async with engine.connect() as c:
+        assert [(await c.execute(JOBS_FOR, {"i": i})).scalar_one() for i in (with_job, lost)] == [1, 1]
+
+
+async def test_redefer_is_bounded_per_tick(engine, queue_app) -> None:
+    async with engine.begin() as c:
+        await c.execute(
+            sa.text(
+                "INSERT INTO operations (kind, payload, dedup_key, status) "
+                "SELECT 'export', '{}'::jsonb, 'bulk:' || g, 'pending' FROM generate_series(1, :n) g"
+            ),
+            {"n": ops.REDEFER_BATCH + 1},
+        )
+    due = utcnow() + timedelta(minutes=2, seconds=1)
+    async with engine.begin() as c:
+        assert await ops._redefer_lost_jobs(c, now=due, defer=defer_in_tx) == ops.REDEFER_BATCH
+    async with engine.begin() as c:  # the next tick takes the rest
+        assert await ops._redefer_lost_jobs(c, now=due, defer=defer_in_tx) == 1
+    async with engine.connect() as c:
+        assert (await c.execute(sa.text("SELECT count(*) FROM procrastinate_jobs"))).scalar_one() == 101
+
+
+class _EndsTheLiveRowBeforeItIsRead:
+    """A connection whose live row ends between the conflicting insert and the read of its id.
+
+    That is what a concurrent finish does in READ COMMITTED; here it happens deterministically, once.
+    """
+
+    def __init__(self, conn: AsyncConnection, live_id: int) -> None:
+        self.conn, self.live_id, self.ended = conn, live_id, False
+
+    async def execute(self, statement, *args, **kwargs):
+        if statement is ops._LIVE_ID and not self.ended:
+            self.ended = True
+            assert await ops.cancel_operation(self.conn, self.live_id, reason="superseded")
+        return await self.conn.execute(statement, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.conn, name)
+
+
+async def test_create_retries_when_the_conflicting_live_row_ended_before_it_was_read(
+    engine, queue_app
+) -> None:
+    live, _ = await new_op(engine, defer=None)
+    async with engine.begin() as c:
+        proxy = _EndsTheLiveRowBeforeItIsRead(c, live)
+        new, created = await ops.create_operation(
+            cast(AsyncConnection, proxy),
+            kind="export",
+            payload={"export_id": 1},
+            dedup_key="export:1",
+            defer=defer_in_tx,
+        )
+    assert proxy.ended and created and new != live
+    assert [(await row(engine, i))[0] for i in (live, new)] == ["cancelled", "pending"]
+    async with engine.connect() as c:
+        assert await live_job_exists(c, "run_operation", args_match={"operation_id": new})

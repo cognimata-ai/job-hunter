@@ -1,5 +1,3 @@
-from typing import Any
-
 import procrastinate
 import pytest
 import sqlalchemy as sa
@@ -11,6 +9,8 @@ from jobhunter.worker.tasks import (
     make_queue_app,
     release_stalled_jobs,
 )
+
+from tests.support.logs import logged
 
 pytestmark = pytest.mark.integration
 COUNT = sa.text("SELECT count(*) FROM procrastinate_jobs WHERE task_name = :t")
@@ -73,10 +73,6 @@ async def test_defer_in_tx_needs_no_open_app(engine, make_config) -> None:
         await app.job_manager.check_connection_async()
 
 
-def _logged(caplog, event: str) -> list[dict[str, Any]]:
-    return [rec.msg for rec in caplog.records if isinstance(rec.msg, dict) and rec.msg["event"] == event]
-
-
 async def _statuses(engine) -> dict[int, str]:
     async with engine.connect() as c:
         rows = await c.execute(sa.text("SELECT id, status FROM procrastinate_jobs"))
@@ -107,10 +103,10 @@ async def test_stalled_job_with_a_taken_queueing_lock_is_failed_and_the_rest_are
     monkeypatch.setattr(queue_app.job_manager, "get_stalled_jobs", listing_in_order)
     assert await release_stalled_jobs(queue_app) == 1
     assert await _statuses(engine) == {superseded: "failed", waiting: "todo", operation: "todo"}
-    assert [(m["job_id"], m["task_name"]) for m in _logged(caplog, "stalled_job_superseded")] == [
+    assert [(m["job_id"], m["task_name"]) for m in logged(caplog, "stalled_job_superseded")] == [
         (superseded, "jh:tick")
     ]
-    assert [(m["job_id"], m["task_name"]) for m in _logged(caplog, "stalled_job_released")] == [
+    assert [(m["job_id"], m["task_name"]) for m in logged(caplog, "stalled_job_released")] == [
         (operation, "jh:run_operation")
     ]
 
@@ -130,6 +126,6 @@ async def test_job_that_finished_after_the_listing_is_skipped(engine, queue_app,
     monkeypatch.setattr(queue_app.job_manager, "get_stalled_jobs", listing_then_finish)
     assert await release_stalled_jobs(queue_app) == 0  # no error: nothing left to release
     assert await _statuses(engine) == {job_id: "succeeded"}
-    assert [(m["job_id"], m["task_name"]) for m in _logged(caplog, "stalled_job_not_retryable")] == [
+    assert [(m["job_id"], m["task_name"]) for m in logged(caplog, "stalled_job_not_retryable")] == [
         (job_id, "jh:run_operation")
     ]

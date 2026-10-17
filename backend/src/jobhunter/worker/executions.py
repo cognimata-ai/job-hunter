@@ -9,9 +9,10 @@ execution whose row they took away (`cancel_and_await`), and the shutdown uses `
 `execute_run`): the work runs as the registry's task for the key, next to a heartbeat task whose loss cancels
 it, and the outcome tells the owner what is left to write:
 - `returned`: the work ended normally; the owner records its completion (fenced by its token);
-- `lost`: the work was cancelled by someone other than the caller (a refused or failed heartbeat, a
-  reconciler's `cancel_and_await`, the shutdown's `cancel_all`) or raised `FencedOut`. Ownership is gone or
-  being taken away, so the owner makes **no** further owner write;
+- `lost`: someone other than the caller requested the work's cancellation (a refused or failed heartbeat, a
+  reconciler's `cancel_and_await`, the shutdown's `cancel_all`), however the work then ended (ruling T10-f:
+  work that swallows the `CancelledError` and returns is `lost` too), or the work raised `FencedOut`.
+  Ownership is gone or being taken away, so the owner makes **no** further owner write;
 - `raised`: the work raised another exception, which the owner maps to its retry or failure path.
 
 Cancellation never hides the caller's own: when the task that awaits (`cancel_and_await`, `cancel_all`,
@@ -131,16 +132,22 @@ class ExecutionOutcome:
     error: Exception | None = None
 
 
-def _outcome(task: asyncio.Task[None]) -> ExecutionOutcome:
+def _outcome(task: asyncio.Task[None], key: ExecKey) -> ExecutionOutcome:
+    """The outcome of the ended work `task`, whose cancellation the caller did not request itself."""
     if task.cancelled():
         return ExecutionOutcome("lost")
     error = task.exception()
+    if error is not None and not isinstance(error, Exception):
+        raise error  # KeyboardInterrupt, SystemExit: not an outcome of the work
+    if task.cancelling() > 0:
+        # A cancel was requested (heartbeat loss, a reconciler, the shutdown) and the work swallowed it: its
+        # normal end or its error says nothing about the ownership it was told it lost (ruling T10-f).
+        _retrieve(task, key)
+        return ExecutionOutcome("lost")
     if error is None:
         return ExecutionOutcome("returned")
     if isinstance(error, FencedOut):
         return ExecutionOutcome("lost")
-    if not isinstance(error, Exception):
-        raise error  # KeyboardInterrupt, SystemExit: not an outcome of the work
     return ExecutionOutcome("raised", error)
 
 
@@ -159,12 +166,16 @@ async def run_owned(
     1. `registry.start(key, token, work)` (raises `AlreadyExecuting`, with `work` closed, before anything
        else starts), plus a heartbeat task named `heartbeat:<kind>:<id>` that runs `heartbeat_loop(beat,
        period_s=period_s)` and cancels the work when a beat is refused or fails.
-    2. Wait for the work. Its cancellation by anyone but the caller, or a `FencedOut` from it, is `lost`;
-       another exception is `raised` (never logged here with its message); a normal end is `returned`.
-       When the caller itself is cancelled, the work is cancelled and awaited (up to `cancel_timeout_s`)
-       and the `CancelledError` propagates.
-    3. Always: the heartbeat task is cancelled and awaited (up to `cancel_timeout_s`) before this returns,
-       so no beat of this owner runs once the caller makes its completion write.
+    2. Wait for the work. It is `lost` when anyone but the caller requested its cancellation (whether the
+       work then ended cancelled, returned or raised: `task.cancelling() > 0`, ruling T10-f) or when it
+       raised `FencedOut`; another exception is `raised` (never logged here with its message); a normal
+       end is `returned`. When the caller itself is cancelled, the work is cancelled and awaited (up to
+       `cancel_timeout_s`) and the `CancelledError` propagates.
+    3. Always: the heartbeat task is cancelled and awaited (up to `cancel_timeout_s`) before this returns.
+       Normally no beat of this owner is then in flight when the caller makes its completion write. A beat
+       that ignores the cancellation past `cancel_timeout_s` (logged `heartbeat_cancel_timeout`) may still
+       run later, but it is fenced like every beat (`claim_id` / `attempt_no` in its predicate), so once
+       the row has another owner or has ended it updates nothing.
     """
     task = registry.start(key, token, work)
 
@@ -185,13 +196,13 @@ async def run_owned(
     finally:
         heartbeat.cancel()
         await _settle(heartbeat, _label(key), cancel_timeout_s, event="heartbeat_cancel_timeout")
-    outcome = _outcome(task)
+    outcome = _outcome(task, key)
     if outcome.status == "lost":
         log.info("execution_lost", key=_label(key))
     return outcome
 
 
 def _retrieve(task: asyncio.Task[None], key: ExecKey) -> None:
-    """Mark the ended `task`'s exception as retrieved, logging its class: the caller's cancellation wins."""
+    """Mark the ended `task`'s exception as retrieved, logging its class: a cancellation outranks it."""
     if not task.cancelled() and (error := task.exception()) is not None:
         log.warning("execution_failed_while_cancelled", key=_label(key), error_class=type(error).__name__)

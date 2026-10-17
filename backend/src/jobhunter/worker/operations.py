@@ -14,8 +14,9 @@ The ways out of `running`:
   takeover sweep (an older worker epoch): back to `pending` with `attempts + 1`, no reason;
 - `cancel_operation`: `cancelled` (delete-everything, a superseding purge or scope).
 
-A requeue or reclaim that reaches `MAX_OPERATION_ATTEMPTS` ends the row `failed('attempts_exhausted')` instead
-and raises the `operation.failed` alert (warn).
+A requeue or reclaim that reaches `MAX_OPERATION_ATTEMPTS` ends the row `failed('attempts_exhausted')`
+instead. Every permanent failure (a `failed` finish, or exhaustion) raises the `operation.failed` alert (warn,
+subject `operation:<id>`) exactly once, in the transaction that ends the row (§7.3; ruling T10-g).
 
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
 the one ownership-loss protocol shared with runs. Every time comparison of the sweeps and reconcilers uses the
@@ -42,9 +43,9 @@ from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import register_takeover_sweep
-from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, run_owned
+from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
-from jobhunter.worker.tasks import Deferrer, live_job_exists
+from jobhunter.worker.tasks import Deferrer, job_task_name
 
 OperationKind = Literal[
     "extract_profile_text",
@@ -63,6 +64,8 @@ OperationKind = Literal[
 MAX_OPERATION_ATTEMPTS: Final = 10
 OPERATION_STALE: Final = timedelta(minutes=3)
 REDEFER_AFTER: Final = timedelta(minutes=2)
+# At most this many lost jobs are re-deferred per tick; the next tick takes the rest.
+REDEFER_BATCH: Final = 100
 # How long a requeued operation waits before it can be claimed again: after an unexpected handler error
 # (`bug`) or a refused local start (`already_executing`).
 RETRY_DELAY: Final = timedelta(minutes=1)
@@ -140,11 +143,15 @@ _OLDER_EPOCH = q(
     "SELECT id, claim_id, attempts FROM operations WHERE status = 'running' AND worker_epoch < :epoch "
     "ORDER BY id FOR UPDATE SKIP LOCKED"
 )
+# Due `pending` operations without a live job (the predicate of `tasks.live_job_exists`, inline so that
+# only real candidates are locked and the batch is never filled by rows that still have their job).
 # `operations_pending` serves the `status = 'pending'` scan.
 _REDEFER_DUE = q(
-    "SELECT id FROM operations WHERE status = 'pending' "
-    "AND greatest(created_at, coalesce(not_before, created_at)) <= :cutoff "
-    "ORDER BY id FOR UPDATE SKIP LOCKED"
+    "SELECT o.id FROM operations o WHERE o.status = 'pending' "
+    "AND greatest(o.created_at, coalesce(o.not_before, o.created_at)) <= :cutoff "
+    "AND NOT EXISTS (SELECT 1 FROM procrastinate_jobs j WHERE j.task_name = :task "
+    "AND j.status IN ('todo', 'doing') AND j.args @> jsonb_build_object('operation_id', o.id)) "
+    "ORDER BY o.id LIMIT :limit FOR UPDATE OF o SKIP LOCKED"
 )
 
 
@@ -229,8 +236,8 @@ async def finish_operation(
 ) -> None:
     """End the claimed operation `succeeded` or `failed(error_code)`; `FencedOut` when `claim` lost the row.
 
-    A `failed` end needs an `error_code`. It raises no alert: the caller does when the failure is permanent
-    for a reason it knows.
+    A `failed` end needs an `error_code`, and raises the `operation.failed` alert in the same transaction
+    (ruling T10-g), so no caller can forget it; a fenced finish raises neither.
     """
     if status == "failed" and error_code is None:
         raise ValueError("a failed operation needs an error code")
@@ -246,6 +253,8 @@ async def finish_operation(
         )
     except TransitionConflict as exc:
         raise FencedOut("operation") from exc
+    if status == "failed":
+        await _raise_failed_alert(conn, claim.operation_id)
 
 
 async def _raise_failed_alert(conn: AsyncConnection, operation_id: int) -> None:
@@ -344,10 +353,15 @@ async def reclaim_stale_operations(conn: AsyncConnection, *, now: datetime) -> l
     Each goes back to `pending` (or ends `failed` on its last attempt); rows locked by an in-flight
     heartbeat or owner write are skipped this time. Returns the ids taken back, in id order.
     """
+    return [operation_id for operation_id, _ in await _reclaim_stale(conn, now=now)]
+
+
+async def _reclaim_stale(conn: AsyncConnection, *, now: datetime) -> list[tuple[int, UUID]]:
+    """`reclaim_stale_operations`, returning each id with the claim it was taken from."""
     rows = (await conn.execute(_STALE, {"cutoff": now - OPERATION_STALE})).all()
     for row in rows:
         await _release(conn, row.id, row.claim_id, int(row.attempts), reason=None, not_before=None)
-    return [int(row.id) for row in rows]
+    return [(int(row.id), row.claim_id) for row in rows]
 
 
 @register_takeover_sweep("operations")
@@ -360,12 +374,13 @@ async def sweep_older_epoch_operations(conn: AsyncConnection, epoch: int) -> int
 
 
 async def _redefer_lost_jobs(conn: AsyncConnection, *, now: datetime, defer: Deferrer) -> int:
-    """Defer `run_operation` again for every due `pending` operation without a live job; the count."""
+    """Defer `run_operation` again for up to `REDEFER_BATCH` due `pending` operations without a live job.
+
+    Only those candidates are locked (`FOR UPDATE SKIP LOCKED`). Returns how many jobs were deferred.
+    """
+    params = {"cutoff": now - REDEFER_AFTER, "task": job_task_name("run_operation"), "limit": REDEFER_BATCH}
     redeferred = 0
-    due = (await conn.execute(_REDEFER_DUE, {"cutoff": now - REDEFER_AFTER})).scalars().all()
-    for operation_id in due:
-        if await live_job_exists(conn, "run_operation", args_match={"operation_id": operation_id}):
-            continue
+    for operation_id in (await conn.execute(_REDEFER_DUE, params)).scalars().all():
         job_id = await defer(
             conn, "run_operation", queueing_lock=f"op:{operation_id}", operation_id=operation_id
         )
@@ -378,15 +393,20 @@ async def reconcile_operations(ctx: ReconcileContext) -> int:
     """Re-defer lost jobs, then reclaim stale executions and stop their local tasks; rows repaired.
 
     A `pending` operation without a live job is re-deferred once `ctx.now` is `REDEFER_AFTER` past its
-    creation and its `not_before`. A `running` one whose heartbeat is older than `OPERATION_STALE` is taken
-    back, and after that commit its local execution, if any, is cancelled and awaited.
+    creation and its `not_before` (at most `REDEFER_BATCH` per tick). A `running` one whose heartbeat is
+    older than `OPERATION_STALE` is taken back; after that commit, its local execution is cancelled and
+    awaited when, and only when, it runs for the claim that was taken back (its registry token).
     """
     async with ctx.engine.begin() as conn:
         redeferred = await _redefer_lost_jobs(conn, now=ctx.now, defer=ctx.defer)
     async with ctx.engine.begin() as conn:
-        reclaimed = await reclaim_stale_operations(conn, now=ctx.now)
-    for operation_id in reclaimed:
-        await EXECUTIONS.cancel_and_await(("operation", operation_id))
+        reclaimed = await _reclaim_stale(conn, now=ctx.now)
+    for operation_id, claim_id in reclaimed:
+        key: ExecKey = ("operation", operation_id)
+        live = EXECUTIONS.get(key)
+        # No await between the check and the cancel: the entry cannot change in between.
+        if live is not None and live[0] == claim_id:
+            await EXECUTIONS.cancel_and_await(key)
     return redeferred + len(reclaimed)
 
 
@@ -410,12 +430,10 @@ async def _finish(
     status: Literal["succeeded", "failed"],
     error_code: str | None = None,
 ) -> None:
-    """Finish `claim` in a transaction of its own (a permanent failure raises `operation.failed` in it)."""
+    """Finish `claim` in a transaction of its own (a `failed` finish raises `operation.failed` in it)."""
     try:
         async with engine.begin() as conn:
             await finish_operation(conn, claim, status=status, error_code=error_code)
-            if status == "failed":
-                await _raise_failed_alert(conn, claim.operation_id)
     except FencedOut:
         log.info("operation_fenced", operation_id=claim.operation_id, write="finish")
         return
@@ -433,13 +451,14 @@ async def execute_operation(
     """Claim and run operation `operation_id` (the `run_operation` task body), one protocol for every end.
 
     1. Claim it; return when it is not claimable. A kind without a handler ends `failed('no_handler')` with
-       the `operation.failed` alert.
+       the `operation.failed` alert (raised by `finish_operation`).
     2. Run the handler through `run_owned(("operation", id), claim_id, …)`: the registry's task for the
        operation, next to the heartbeat task `heartbeat:operation:<id>` whose loss cancels it.
-    3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, or
-       `FencedOut`) returns with no further owner write; `raised` requeues with `error_code='bug'` and
-       `not_before = now + RETRY_DELAY`; `returned` finishes `succeeded`. A local execution that is still
-       live for the operation (`AlreadyExecuting`) requeues the new claim as `already_executing`.
+    3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, even one
+       the handler swallowed, or `FencedOut`) returns with no further owner write; `raised` requeues with
+       `error_code='bug'` and `not_before = now + RETRY_DELAY`; `returned` finishes `succeeded`. A local
+       execution that is still live for the operation (`AlreadyExecuting`) requeues the new claim as
+       `already_executing`.
 
     Finish and requeue each run in a transaction of their own; their `FencedOut` is caught outside it, and the
     fenced transaction wrote nothing, because its `transition()` is its first write. The caller's own

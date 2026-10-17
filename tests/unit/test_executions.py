@@ -7,9 +7,7 @@ from jobhunter.errors import FencedOut
 from jobhunter.worker.executions import AlreadyExecuting, ExecutionRegistry, run_owned
 from jobhunter.worker.heartbeat import heartbeat_loop
 
-
-def _logged(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, Any]]:
-    return [rec.msg for rec in caplog.records if isinstance(rec.msg, dict) and rec.msg.get("event") == event]
+from tests.support.logs import logged
 
 
 def _live_tasks_named(name: str) -> list[asyncio.Task[Any]]:
@@ -83,9 +81,9 @@ async def test_cancel_and_await_gives_up_on_a_task_that_ignores_cancellation(cap
     # The task cannot end before `release` is set, so the short timeout decides nothing by itself.
     assert await reg.cancel_and_await(("operation", 7), timeout_s=0.05) is False
     assert cancelled.is_set() and reg.get(("operation", 7)) == ("claim", task)
-    [logged] = _logged(caplog, "execution_cancel_timeout")
-    assert logged["key"] == "operation:7"
-    assert set(logged) <= {"event", "key", "level", "logger", "ts"}  # the key only
+    [event] = logged(caplog, "execution_cancel_timeout")
+    assert event["key"] == "operation:7"
+    assert set(event) <= {"event", "key", "level", "logger", "ts"}  # the key only
     release.set()
     await task
     assert reg.get(("operation", 7)) is None
@@ -106,6 +104,29 @@ async def test_cancel_and_await_never_swallows_the_callers_cancellation() -> Non
     await started.wait()
     caller = asyncio.create_task(reg.cancel_and_await(("run", 3)))
     await cancelled.wait()  # the registry has cancelled the execution and now waits for it
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert caller.cancelled()
+    release.set()
+    await task
+
+
+async def test_cancel_all_never_swallows_the_callers_cancellation() -> None:
+    reg, started, cancelled, release = ExecutionRegistry(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def stubborn() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    task = reg.start(("operation", 12), 1, stubborn())
+    await started.wait()
+    caller = asyncio.create_task(reg.cancel_all())
+    await cancelled.wait()  # cancel_all has cancelled the execution and now waits for it
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await caller
@@ -136,7 +157,7 @@ async def test_cancel_all_counts_the_executions_that_stopped(caplog) -> None:
     assert await reg.cancel_all(timeout_s=0.05) == 2
     assert all(task.cancelled() for task in tasks)
     assert reg.get(("run", 10)) is None and reg.get(("operation", 10)) is None
-    assert [m["key"] for m in _logged(caplog, "execution_cancel_timeout")] == ["operation:11"]
+    assert [m["key"] for m in logged(caplog, "execution_cancel_timeout")] == ["operation:11"]
     release.set()
     await held
     assert await reg.cancel_all() == 0
@@ -160,8 +181,8 @@ async def test_heartbeat_loop_logs_the_failure_class_only_and_reports_loss(caplo
 
     await asyncio.wait_for(heartbeat_loop(beat, period_s=0, on_lost=lambda: lost.append(1)), 5)
     assert lost == [1]
-    [logged] = _logged(caplog, "heartbeat_failed")
-    assert logged["error_class"] == "ConnectionError"
+    [event] = logged(caplog, "heartbeat_failed")
+    assert event["error_class"] == "ConnectionError"
     assert "hunter2" not in caplog.text and "detail" not in caplog.text
 
 
@@ -224,3 +245,26 @@ async def test_run_owned_lets_the_callers_cancellation_through_and_stops_the_wor
         await runner
     assert runner.cancelled() and cancelled.is_set()
     assert reg.get(("run", 4)) is None and not _live_tasks_named("heartbeat:run:4")
+
+
+async def test_run_owned_counts_work_that_swallowed_its_cancellation_as_lost() -> None:
+    # Ruling T10-f: a cancel requested by the heartbeat (or a reconciler, or cancel_all) means ownership is
+    # gone or going, even when the work catches the CancelledError and returns normally.
+    reg, started, cancelled = ExecutionRegistry(), asyncio.Event(), asyncio.Event()
+
+    async def swallowing() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()  # and returns as if it had finished
+
+    async def beat() -> bool:
+        await started.wait()
+        return False
+
+    outcome = await asyncio.wait_for(
+        run_owned(("operation", 9), "c", swallowing(), beat=beat, period_s=0, registry=reg), 5
+    )
+    assert cancelled.is_set() and (outcome.status, outcome.error) == ("lost", None)
+    assert reg.get(("operation", 9)) is None and not _live_tasks_named("heartbeat:operation:9")
