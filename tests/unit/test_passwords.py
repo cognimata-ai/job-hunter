@@ -1,3 +1,4 @@
+import hashlib
 import re
 import unicodedata
 from importlib.resources import files
@@ -13,6 +14,9 @@ from jobhunter.auth.passwords import (
     hash_password,
     verify_password,
 )
+
+# sha256 of the upstream 10k-most-common.txt at the commit named in the header of the list
+UPSTREAM_SHA256 = "68782d6a4a19a4768d5f15dd66bd534e7a33055cc755411e33f16d18c50fdcce"
 
 
 def test_argon2id_parameters() -> None:
@@ -43,6 +47,14 @@ def test_common_password_file_is_pinned_and_complete() -> None:
     entries = [line for line in lines if not line.startswith("#")]
     assert len(entries) >= 9_000 and all(entry and entry == entry.strip() for entry in entries)
     assert {"password", "123456", "qwerty"} <= set(entries)
+
+
+def test_the_list_body_is_the_pinned_upstream_file() -> None:
+    """Every line after the header is the upstream SecLists file, byte for byte."""
+    data = files("jobhunter.auth").joinpath("common_passwords.txt").read_bytes()
+    header, newline, body = data.partition(b"\n")
+    assert newline and header.startswith(b"#")
+    assert hashlib.sha256(body).hexdigest() == UPSTREAM_SHA256
 
 
 def test_policy_counts_characters_after_nfc_and_ignores_case_of_common_passwords() -> None:

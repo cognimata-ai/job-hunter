@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 import pyotp
 import pytest
 import sqlalchemy as sa
+from jobhunter import cli, cli_user
 from jobhunter.auth import totp, users
 from jobhunter.auth.passwords import WeakPassword, verify_password
 from jobhunter.clock import utcnow
@@ -66,8 +67,9 @@ async def test_username_match_is_canonical_caseless_matching(engine) -> None:
 async def test_username_length_is_three_to_sixty_four_characters_after_normalising(engine) -> None:
     for bad in ("ab", "  ab  ", "", "x" * 65, " " + "x" * 65):
         async with engine.begin() as c:
-            with pytest.raises(ValueError, match=r"^username_length$"):
+            with pytest.raises(ValueError, match=r"^username_length$") as caught:
                 await users.create_user(c, bad, PW, now=utcnow())
+            assert isinstance(caught.value, users.InvalidUsername)
     async with engine.connect() as c:
         assert (await c.execute(sa.text("SELECT count(*) FROM users"))).scalar_one() == 0
     async with engine.begin() as c:
@@ -381,3 +383,45 @@ def test_cli_totp_enable_stores_the_secret_only_when_the_code_verifies(
     assert pg_rows(migrated, "app", "SELECT totp_enabled, totp_secret_enc IS NULL FROM users") == [
         (False, True)
     ]
+
+
+FIXED_NOW = datetime(2026, 10, 16, 10, tzinfo=UTC)  # on a 30 s step boundary
+FIXED_SECRET = "JBSWY3DPEHPK3PXP"
+
+
+def test_cli_totp_enable_with_a_fixed_clock_accepts_and_rejects(
+    migrated, make_config, monkeypatch, capsys
+) -> None:
+    """The same command as the end-to-end test, with the time, the secret and the typed code pinned.
+
+    No wall clock is involved: the clock the CLI reads returns `FIXED_NOW`, so the accepted code is one step
+    old (inside the window) and the rejected one is three steps old (outside it).
+    """
+    cfg = make_config("api", migrated)
+    pg_rows(
+        migrated,
+        "app",
+        "INSERT INTO users (id, username, password_hash, password_changed_at) VALUES (1, 'ada', 'h', now())",
+    )
+    typed: list[str] = []
+    monkeypatch.setattr(cli_user, "startup_or_exit", lambda role: cfg)
+    monkeypatch.setattr(cli_user, "utcnow", lambda: FIXED_NOW)
+    monkeypatch.setattr(totp, "new_secret", lambda: FIXED_SECRET)
+    monkeypatch.setattr("builtins.input", lambda prompt="": typed.pop(0))
+    state = "SELECT totp_enabled, totp_secret_enc IS NULL FROM users"
+
+    typed.append(pyotp.TOTP(FIXED_SECRET).at(FIXED_NOW - timedelta(seconds=90)))
+    assert cli.main(["user", "totp", "enable"]) == 1
+    shown = capsys.readouterr()
+    assert "nothing was stored" in shown.err and FIXED_SECRET not in shown.err
+    assert FIXED_SECRET in shown.out  # the operator's terminal sees the URI, once
+    assert pg_rows(migrated, "app", state) == [(False, True)]
+
+    typed.append(pyotp.TOTP(FIXED_SECRET).at(FIXED_NOW - timedelta(seconds=30)))
+    assert cli.main(["user", "totp", "enable"]) == 0
+    shown = capsys.readouterr()
+    assert "TOTP is enabled" in shown.out and shown.err == ""
+    row = pg_one(migrated, "app", "SELECT totp_enabled, totp_secret_enc FROM users")
+    assert row is not None and row[0] is True and isinstance(row[1], bytes)
+    assert decrypt([cfg.secret_b64("data_key")], row[1], aad=b"totp").decode() == FIXED_SECRET
+    assert typed == []  # each run asked for exactly one code

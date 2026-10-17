@@ -50,6 +50,10 @@ class UserExists(Exception):
     """`create_user` found the single user already there."""
 
 
+class InvalidUsername(ValueError):
+    """The username is not 3-64 characters long after normalisation; the message is the fixed code."""
+
+
 class UserMissing(LookupError):
     """A change was asked of the single user, and there is none."""
 
@@ -78,12 +82,12 @@ def _caseless_key(u: str) -> str:
 async def create_user(conn: AsyncConnection, username: str, password: str, *, now: datetime) -> None:
     """Create the single user, or raise `UserExists` (the transaction stays usable).
 
-    Raises `ValueError("username_length")` for a username outside 3-64 characters after normalisation, and
-    `WeakPassword` for a password that breaks the policy; nothing is written then.
+    Raises `InvalidUsername("username_length")` (a `ValueError`) for a username outside 3-64 characters after
+    normalisation, and `WeakPassword` for a password that breaks the policy; nothing is written then.
     """
     name = normalize_username(username)
     if not USERNAME_MIN_LENGTH <= len(name) <= USERNAME_MAX_LENGTH:
-        raise ValueError("username_length")
+        raise InvalidUsername("username_length")
     check_password_policy(password)
     password_hash = await asyncio.to_thread(hash_password, password)
     inserted = await conn.execute(
