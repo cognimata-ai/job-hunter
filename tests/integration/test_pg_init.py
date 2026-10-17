@@ -111,20 +111,25 @@ def test_server_settings(pg_server: PgServer, name: str, value: str) -> None:
     assert q(pg_server, "superuser", f"SHOW {name}") == [(value,)]
 
 
-def _logs_with(server: PgServer, needle: str, timeout_s: float = 5.0) -> str:
-    """The container log once `needle` is in it: `docker logs` can lag the server by a moment."""
+def _logs_with(server: PgServer, needle: str, *, more_than: int, timeout_s: float = 5.0) -> str:
+    """The container log once `needle` is in it more than `more_than` times: `docker logs` can lag the server
+    by a moment."""
     deadline = time.monotonic() + timeout_s
     while True:
         logs = server.logs()
-        if needle in logs or time.monotonic() >= deadline:
+        if logs.count(needle) > more_than or time.monotonic() >= deadline:
             return logs
         time.sleep(0.1)
 
 
 def test_l1_postgres_logs_contain_no_values(pg_server: PgServer) -> None:
     email, phone = "max.mustermann@example.org", "+49 170 1234567"
+    # The error line of this test's own duplicate: other tests log `duplicate key` lines on the shared
+    # server too, so the generic text could match a line that is already there. Counted before and after.
+    needle = 'duplicate key value violates unique constraint "l1_probe_email_key"'
     q(pg_server, "migrator", "CREATE TABLE l1_probe (email text UNIQUE, phone text)")
     try:
+        before = pg_server.logs().count(needle)
         with psycopg.connect(pg_server.dsn("app")) as c:
             c.execute("INSERT INTO l1_probe VALUES (%s, %s)", (email, phone))
             c.commit()
@@ -133,7 +138,8 @@ def test_l1_postgres_logs_contain_no_values(pg_server: PgServer) -> None:
             with pytest.raises(psycopg.Error) as dup:
                 c.execute("INSERT INTO l1_probe VALUES (%s, %s)", (email, phone))
             assert dup.value.sqlstate == "23505"
-        logs = _logs_with(pg_server, "duplicate key")
-        assert "duplicate key" in logs and email not in logs and "170 1234567" not in logs
+        logs = _logs_with(pg_server, needle, more_than=before)
+        assert logs.count(needle) == before + 1  # its own line is there: the checks below are not vacuous
+        assert email not in logs and "170 1234567" not in logs
     finally:
         q(pg_server, "migrator", "DROP TABLE l1_probe")
