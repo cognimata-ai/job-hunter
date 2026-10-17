@@ -448,3 +448,98 @@ def test_cli_exits_78_for_an_unknown_log_level(tmp_path: Path) -> None:
     assert r.returncode == 78
     (line,) = r.stdout.splitlines()
     assert json.loads(line)["check"] == "log_level"
+
+
+# --- Ruling T18-c: the public origin is exactly scheme://host[:port] --------------------------------------
+
+ORIGIN_SHAPE = "JOBHUNTER_PUBLIC_ORIGIN must be exactly scheme://host[:port], as a browser sends it in Origin"
+
+
+def origin_failure(tmp_path: Path, env_name: str, origin: str) -> StartupCheckFailed:
+    d = write_secrets(tmp_path / "s", **API_SECRETS)
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "JOBHUNTER_PUBLIC_ORIGIN": origin}
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("api", env, d))
+    return exc.value
+
+
+@pytest.mark.parametrize(
+    ("env_name", "origin"),
+    [
+        ("dev", "http://localhost:8080"),  # the one canonical dev origin
+        ("test", "https://testserver"),
+        ("prod", "https://jobs.example.org"),
+        ("prod", "https://jobs.example.org:8443"),
+        ("dev", "http://127.0.0.1:8080"),
+        ("dev", "http://[::1]:8080"),
+    ],
+)
+def test_a_public_origin_of_scheme_host_and_port_passes(tmp_path: Path, env_name: str, origin: str) -> None:
+    d = write_secrets(tmp_path / "s", **API_SECRETS)
+    cfg = load_config("api", {**BASE_ENV, "JOBHUNTER_ENV": env_name, "JOBHUNTER_PUBLIC_ORIGIN": origin}, d)
+    run_startup_assertions(cfg)
+    assert cfg.public_origin == origin
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:8080/",  # trailing slash
+        "http://localhost:8080/app",  # path
+        "http://localhost:8080?next=1",  # query
+        "http://localhost:8080?",  # empty query
+        "http://localhost:8080#top",  # fragment
+        "http://localhost:8080#",  # empty fragment
+        "http://user@localhost:8080",  # userinfo
+        "http://user:pw@localhost:8080",
+        "ftp://localhost:8080",  # neither http nor https
+        "localhost:8080",  # no scheme
+        "//localhost:8080",
+        "http://",  # no host
+        "http://:8080",
+        "http://localhost:",  # empty port
+        "http://localhost:0",
+        "http://localhost:65536",
+        "http://localhost:80a",
+        "http://localhost:08080",
+        "HTTP://localhost:8080",  # browsers send scheme and host lower-cased
+        "http://LocalHost:8080",
+        "http://localhost:80",  # browsers leave out the default port
+        "https://jobs.example.org:443",
+        "https://bücher.example",  # browsers send the punycode form
+        " http://localhost:8080",
+        "http://localhost:8080\n",
+        "http://local host:8080",
+    ],
+)
+def test_a_public_origin_that_is_not_exactly_scheme_host_and_port_fails(tmp_path: Path, origin: str) -> None:
+    failure = origin_failure(tmp_path, "dev", origin)
+    assert (failure.check, failure.detail) == ("public_origin", ORIGIN_SHAPE)
+
+
+@pytest.mark.parametrize("origin", ["http://jobs.example.org", "http://localhost:8080"])
+def test_prod_requires_an_https_public_origin(tmp_path: Path, origin: str) -> None:
+    failure = origin_failure(tmp_path, "prod", origin)
+    assert (failure.check, failure.detail) == (
+        "public_origin",
+        "JOBHUNTER_PUBLIC_ORIGIN must use https in prod",
+    )
+
+
+def test_the_cli_exits_78_for_a_public_origin_with_a_path(tmp_path: Path) -> None:
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    env = {
+        **os.environ,
+        **BASE_ENV,
+        "JOBHUNTER_SECRETS_DIR": str(d),
+        "JOBHUNTER_PUBLIC_ORIGIN": "https://testserver/",
+    }
+    r = subprocess.run(
+        [sys.executable, "-m", "jobhunter.cli", "startup-check", "--role", "worker"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 78
+    (line,) = r.stdout.splitlines()
+    assert json.loads(line)["check"] == "public_origin"

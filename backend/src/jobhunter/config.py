@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal, cast, get_args
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.redact import register_secret_values
@@ -44,6 +44,8 @@ _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHRO
 _WORLD_READABLE: Final = 0o004
 # The levels `configure_logging` accepts (`JOBHUNTER_LOG_LEVEL`, compared upper-cased).
 LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+# The schemes a public origin may have, with the port a browser leaves out of `Origin` for each.
+_ORIGIN_DEFAULT_PORTS: Final = MappingProxyType({"http": 80, "https": 443})
 
 ALL_SECRETS: Final = SECRET_NAMES
 
@@ -257,6 +259,44 @@ def _check_key_material(cfg: AppConfig) -> None:
         raise StartupCheckFailed("keys_identical", "session_secret and data_key must differ")
 
 
+def _is_serialised_origin(origin: str) -> bool:
+    """`origin` is `scheme://host[:port]` exactly as a browser serialises it in `Origin` (RFC 6454 §6.2).
+
+    That is: scheme `http` or `https` and an ASCII host, both lower-case; a port only when it is not the
+    scheme's default, without leading zeros; no userinfo, path, query or fragment, not even an empty one or a
+    trailing slash. The edge compares `Origin` with the configured value byte for byte, so any other spelling
+    of the same origin would refuse every unsafe request.
+    """
+    if not (origin.isascii() and origin.isprintable()) or " " in origin:
+        return False
+    try:
+        parts = urlsplit(origin)
+        port = parts.port
+    except ValueError:  # a port that is no number in 0..65535, or a malformed IPv6 literal
+        return False
+    host = parts.hostname
+    default_port = _ORIGIN_DEFAULT_PORTS.get(parts.scheme)
+    if default_port is None or not host or port in (0, default_port):
+        return False
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return origin == f"{parts.scheme}://{netloc}"
+
+
+def _check_public_origin(cfg: AppConfig) -> None:
+    """Ruling T18-c: a configured public origin has the exact form of `Origin`, and https in prod."""
+    if cfg.public_origin is None:
+        return
+    if not _is_serialised_origin(cfg.public_origin):
+        raise StartupCheckFailed(
+            "public_origin",
+            "JOBHUNTER_PUBLIC_ORIGIN must be exactly scheme://host[:port], as a browser sends it in Origin",
+        )
+    if cfg.env == "prod" and not cfg.public_origin.startswith("https://"):
+        raise StartupCheckFailed("public_origin", "JOBHUNTER_PUBLIC_ORIGIN must use https in prod")
+
+
 def run_startup_assertions(cfg: AppConfig) -> None:
     """Run the startup assertions of §16.8 in order; the first failure raises `StartupCheckFailed`."""
     env = cfg.environ
@@ -297,6 +337,9 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     # After the §16.8 checks (ruling T13-a): the process applies this level when it configures its logging.
     if cfg.log_level not in LOG_LEVELS:
         raise StartupCheckFailed("log_level", f"JOBHUNTER_LOG_LEVEL must be one of {', '.join(LOG_LEVELS)}")
+
+    # Also after the §16.8 checks (ruling T18-c): the edge's CSRF check compares `Origin` with this value.
+    _check_public_origin(cfg)
 
 
 def _log_startup_failure(role: Role, exc: StartupCheckFailed) -> None:

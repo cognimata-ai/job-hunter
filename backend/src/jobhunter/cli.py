@@ -18,6 +18,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     startup_check.add_argument("--role", required=True, choices=get_args(Role))
     commands.add_parser("migrate", help="bring the database to the code head and seed the defaults (§19.3)")
+    _add_api_command(commands)
     commands.add_parser(
         "worker",
         help="run the worker: singleton lock, takeover, procrastinate queues (§3.3); SIGTERM drains it",
@@ -33,6 +34,25 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_user_commands(commands)
     _add_sessions_commands(commands)
     return parser
+
+
+def _add_api_command(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    api = commands.add_parser(
+        "api",
+        help="run the startup assertions of the api (exit 78 when one fails), then serve it with uvicorn",
+    )
+    api.add_argument("--host", default="127.0.0.1", help="the address to listen on (default 127.0.0.1)")
+    api.add_argument("--port", type=int, default=8000, help="the port to listen on (default 8000)")
+    api.add_argument(
+        "--proxy-headers",
+        action="store_true",
+        help="take the client address from X-Forwarded-For when a trusted forwarder sends it (default off)",
+    )
+    api.add_argument(
+        "--forwarded-allow-ips",
+        metavar="IPS",
+        help="comma-separated addresses of the trusted forwarders, e.g. 172.30.0.2 (the dev and prod proxy)",
+    )
 
 
 def _add_user_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
@@ -117,6 +137,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         run_migrate(startup_or_exit("migrate"))
         return 0
+    if args.command == "api":
+        # Imported here: the api command needs uvicorn, and the app it serves FastAPI and the database layer.
+        from jobhunter.cli_api import run_api
+
+        return run_api(args)
     if args.command == "worker":
         # Imported here, like `migrate`: the worker pulls in procrastinate and langgraph.
         import asyncio

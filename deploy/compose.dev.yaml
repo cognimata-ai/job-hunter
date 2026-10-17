@@ -1,0 +1,165 @@
+# The dev stack (spec §19.1, §19.2; Task 18). Every call passes the digest lock as its env file:
+#
+#   scripts/dev-secrets.sh            # once; as root (sudo), it sets group 10010 on the secret files
+#   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml up -d --build --wait
+#
+# Images come from deploy/images.lock only: `${name:?}` fails loudly when a digest line is missing. The one dev
+# origin is http://localhost:8080, served by devproxy on the host's loopback only. The api has no route out
+# (its networks `proxy` and `internal` are both internal); only the worker reaches `egress`.
+name: jobhunter-dev
+
+x-app-build: &app-build
+  context: ..
+  dockerfile: Dockerfile
+  args:
+    PYTHON_IMAGE: "${python:?}"
+    UV_IMAGE: "${uv:?}"
+  # Optional: a CA bundle for the package downloads of the build, for hosts behind a TLS-intercepting proxy
+  # (SSL_CERT_FILE of the calling shell; empty when unset). Mounted for the RUN steps only, never in a layer.
+  secrets: [build_ca]
+
+x-app: &app
+  image: jobhunter-app:dev
+  build: *app-build
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "10001:10001"
+  group_add: ["10010"] # jobhunter-secrets: reads the 0440 secret files (§19.2)
+  logging: { driver: local, options: { max-size: 20m, max-file: "10" } }
+  restart: unless-stopped
+  # Docker's init as PID 1 forwards signals: as PID 1 itself, a process ignores a SIGTERM it has no handler for
+  # (a standby or starting worker, migrate), so a stop would wait out the grace period and then kill it.
+  init: true
+
+# The non-secret environment of the app services (§19.2). Never set JOBHUNTER_FAULT or JOBHUNTER_FAKE_* here:
+# a variable that is set counts as present, even when empty.
+x-app-env: &app-env
+  JOBHUNTER_ENV: dev
+  JOBHUNTER_DB_HOST: postgres
+  JOBHUNTER_DB_PORT: "5432"
+  JOBHUNTER_DB_NAME: jobhunter
+  JOBHUNTER_LOG_LEVEL: INFO
+
+services:
+  postgres:
+    image: "${pgvector:?}"
+    user: "999:999" # the image's postgres user; no root step, so group_add applies
+    group_add: ["10010"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: jobhunter
+      POSTGRES_USER: jobhunter_bootstrap
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_bootstrap
+    secrets: [pg_bootstrap, db_app, db_migrator, db_backup, db_restore] # role passwords: init only (§19.3)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    networks: [internal]
+    shm_size: 1g
+    # Over TCP: the image's init phase runs a temporary server that listens on the Unix socket only, so a socket
+    # probe would report ready before the init scripts have finished and the final server has started.
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      start_period: 120s
+      start_interval: 1s
+    mem_limit: 5g
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["jobhunter", "migrate"] # §19.3
+    restart: "no"
+    environment: *app-env
+    secrets: [db_migrator]
+    networks: [internal]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  api:
+    <<: *app
+    # `jobhunter api` runs the startup assertions first (exit 78), then uvicorn (ruling T18-b).
+    command:
+      [
+        "jobhunter", "api", "--host", "0.0.0.0", "--port", "8000",
+        "--proxy-headers", "--forwarded-allow-ips", "172.30.0.2",
+      ]
+    environment:
+      <<: *app-env
+      JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
+    secrets: [session_secret, data_key, db_app]
+    networks: [proxy, internal] # both internal: no route to the internet
+    healthcheck:
+      test: ["CMD", "jobhunter", "http-check", "http://localhost:8000/healthz"]
+      interval: 15s
+      start_period: 60s
+      start_interval: 1s
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    mem_limit: 1g
+
+  worker:
+    <<: *app
+    command: ["jobhunter", "worker"]
+    deploy: { replicas: 1 } # MUST stay 1 (§3.3)
+    stop_grace_period: 120s
+    environment:
+      <<: *app-env
+      JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
+    secrets: [data_key, db_app]
+    networks: [internal, egress]
+    healthcheck:
+      test: ["CMD", "jobhunter", "worker-health"]
+      interval: 30s
+      start_period: 120s
+      start_interval: 2s
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    mem_limit: 2g
+
+  devproxy:
+    image: "${caddy:?}"
+    # Not in the secrets group and given no secret (§19.2). The image's caddy binary carries the file capability
+    # cap_net_bind_service, which execve refuses unless it is in the bounding set; port 8080 does not use it.
+    user: "10003:10003"
+    read_only: true
+    tmpfs: [/data, /config]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    ports: ["127.0.0.1:8080:8080"]
+    volumes: [./Caddyfile.dev:/etc/caddy/Caddyfile:ro]
+    networks:
+      devedge: {}
+      proxy: { ipv4_address: 172.30.0.2 } # fixed: the only trusted forwarder (§16.3)
+    depends_on: { api: { condition: service_healthy } }
+    logging: { driver: local, options: { max-size: 20m, max-file: "10" } }
+    restart: unless-stopped
+
+networks:
+  devedge: {} # the host's way in: devproxy only, published on 127.0.0.1
+  proxy:
+    internal: true
+    ipam:
+      config:
+        # Dynamic addresses come from the upper half only, so the api (started before devproxy) can never take
+        # devproxy's fixed 172.30.0.2.
+        - { subnet: 172.30.0.0/24, ip_range: 172.30.0.128/25, gateway: 172.30.0.1 }
+  internal: { internal: true }
+  egress: {} # the worker only
+
+volumes:
+  pgdata: {}
+
+# The files of scripts/dev-secrets.sh: group 10010, mode 0440, in a 0750 directory (§19.2).
+secrets:
+  session_secret: { file: ../.secrets/dev/session_secret }
+  data_key: { file: ../.secrets/dev/data_key }
+  db_app: { file: ../.secrets/dev/db_app }
+  db_migrator: { file: ../.secrets/dev/db_migrator }
+  db_backup: { file: ../.secrets/dev/db_backup }
+  db_restore: { file: ../.secrets/dev/db_restore }
+  pg_bootstrap: { file: ../.secrets/dev/pg_bootstrap }
+  build_ca: { file: "${SSL_CERT_FILE:-/dev/null}" }

@@ -1,0 +1,12 @@
+# The build context is the repository root; the Dockerfile copies only pyproject.toml, uv.lock,
+# .python-version and backend/. Secrets, the local virtualenv, git metadata and caches never enter it.
+.git
+.venv
+.secrets
+frontend/node_modules
+frontend/dist
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.hypothesis
