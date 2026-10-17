@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
-from jobhunter.worker.tick import compute_due_slots
+from jobhunter.worker.tick import CATCH_UP_AFTER, compute_due_slots, trigger_for
 
 A = datetime(2026, 10, 16, 4, tzinfo=UTC)
 H6 = 21600
@@ -51,3 +51,23 @@ def test_naive_datetimes_and_bad_intervals_are_rejected() -> None:
         compute_due_slots(A, H6, None, datetime(2026, 10, 17))  # noqa: DTZ001
     with pytest.raises(ValueError, match="positive"):
         compute_due_slots(A, 0, None, A)
+
+
+def test_trigger_is_schedule_up_to_exactly_five_minutes_and_catch_up_after() -> None:
+    assert CATCH_UP_AFTER == timedelta(minutes=5)
+    assert trigger_for(A, A) == "schedule"
+    assert trigger_for(A + timedelta(minutes=5), A) == "schedule"
+    assert trigger_for(A + timedelta(minutes=5, microseconds=1), A) == "catch_up"
+    assert trigger_for(A + timedelta(minutes=5, seconds=1), A) == "catch_up"
+
+
+def test_trigger_compares_instants_whatever_the_zone_of_the_inputs() -> None:
+    berlin = ZoneInfo("Europe/Berlin")
+    slot = datetime(2026, 10, 25, 0, 30, tzinfo=UTC).astimezone(berlin)  # 02:30 CEST, an hour before DST ends
+    five_minutes_later = datetime(2026, 10, 25, 0, 35, tzinfo=UTC).astimezone(berlin)
+    just_after = datetime(2026, 10, 25, 0, 36, tzinfo=UTC).astimezone(berlin)
+    assert trigger_for(five_minutes_later, slot) == "schedule"
+    assert trigger_for(just_after, slot) == "catch_up"
+    # Same zone object on both sides: wall-clock subtraction would see 02:30 -> 02:35 as five minutes.
+    after_the_change = datetime(2026, 10, 25, 1, 35, tzinfo=UTC).astimezone(berlin)  # 02:35 CET, 65 min on
+    assert trigger_for(after_the_change, slot) == "catch_up"

@@ -107,6 +107,12 @@ def compute_due_slots(
     return [anchor + k * step for k in range(k_last + 1, k_now + 1)]
 
 
+def trigger_for(now: datetime, slot: datetime) -> Literal["schedule", "catch_up"]:
+    """The trigger of the run for `slot` evaluated at `now`: `'schedule'` up to and including
+    `CATCH_UP_AFTER` after the slot, `'catch_up'` after that (§3.4)."""
+    return "schedule" if _utc(now, "now") - _utc(slot, "slot") <= CATCH_UP_AFTER else "catch_up"
+
+
 async def insert_active_collect(
     conn: AsyncConnection,
     *,
@@ -221,8 +227,13 @@ async def run_tick(conn: AsyncConnection, *, now: datetime, defer: Deferrer) -> 
         missed = (
             await conn.execute(_INSERT_MISSED, {"slots": earlier, "include_paid": include_paid, **versions})
         ).rowcount
+    if missed > 0:
+        # Slots that passed without a run mean the worker (or the schedule) was down: worth an operator's eye.
+        log.warning(
+            "slots_missed", count=missed, first_slot=earlier[0].isoformat(), last_slot=earlier[-1].isoformat()
+        )
 
-    trigger: Literal["schedule", "catch_up"] = "schedule" if now - latest <= CATCH_UP_AFTER else "catch_up"
+    trigger = trigger_for(now, latest)
     outcome = await insert_active_collect(
         conn, trigger=trigger, scheduled_slot=latest, include_paid=include_paid, path="tick", **versions
     )

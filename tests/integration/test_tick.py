@@ -19,7 +19,7 @@ pytestmark = pytest.mark.integration
 A = datetime(2026, 10, 16, 4, tzinfo=UTC)
 
 
-async def schedule(engine, *, interval: int, cursor: datetime, enabled: bool = True) -> None:
+async def schedule(engine, *, interval: int, cursor: datetime | None, enabled: bool = True) -> None:
     async with engine.begin() as c:
         await c.execute(
             sa.text(
@@ -27,6 +27,14 @@ async def schedule(engine, *, interval: int, cursor: datetime, enabled: bool = T
             ),
             {"a": A, "i": interval, "c": cursor, "e": enabled},
         )
+
+
+async def stored_cursor(engine) -> datetime | None:
+    async with engine.connect() as c:
+        cursor: datetime | None = (
+            await c.execute(sa.text("SELECT last_evaluated_slot FROM schedule_state"))
+        ).scalar_one()
+        return cursor
 
 
 async def runs(engine) -> list[tuple[datetime, str, str]]:
@@ -108,6 +116,42 @@ async def test_disabled_schedule_moves_cursor_without_rows(engine, queue_app) ->
     assert await runs(engine) == [] and rep.cursor == A + timedelta(days=2)
 
 
+async def test_null_cursor_queues_only_the_latest_slot_and_records_no_missed(engine, queue_app) -> None:
+    await schedule(engine, interval=21600, cursor=None)
+    now = A + timedelta(hours=18, minutes=1)  # three slots after the anchor, none of them evaluated before
+    rep = await tick(engine, now)
+    latest = A + timedelta(hours=18)
+    assert rep.missed == 0 and rep.cursor == latest and rep.queued_run_id is not None
+    assert await runs(engine) == [(latest, "queued", "schedule")]
+    assert await stored_cursor(engine) == latest
+    assert (await tick(engine, now + timedelta(minutes=1))).queued_run_id is None
+
+
+async def test_null_cursor_with_disabled_schedule_moves_the_cursor_to_the_latest_slot(
+    engine, queue_app
+) -> None:
+    await schedule(engine, interval=21600, cursor=None, enabled=False)
+    rep = await tick(engine, A + timedelta(days=2, hours=1))
+    latest = A + timedelta(days=2)
+    assert await runs(engine) == [] and rep.cursor == latest
+    assert await stored_cursor(engine) == latest
+
+
+async def test_missed_slots_are_logged_as_a_warning_with_their_count_and_range(
+    engine, queue_app, caplog
+) -> None:
+    await schedule(engine, interval=21600, cursor=A)
+    await tick(engine, A + timedelta(hours=6, minutes=1))
+    assert logged(caplog, "slots_missed") == []  # a tick on time misses nothing
+    await tick(engine, A + timedelta(hours=36, minutes=1))  # 12h..30h are missed; 36h overlaps the 6h run
+    [event] = logged(caplog, "slots_missed")
+    assert event["count"] == 4
+    assert event["first_slot"] == (A + timedelta(hours=12)).isoformat()
+    assert event["last_slot"] == (A + timedelta(hours=30)).isoformat()
+    [record] = [r for r in caplog.records if isinstance(r.msg, dict) and r.msg.get("event") == "slots_missed"]
+    assert record.levelno == logging.WARNING
+
+
 async def wait_until_a_session_waits_for_a_lock(engine) -> None:
     """Return once another session is blocked on a lock, observed in `pg_stat_activity`.
 
@@ -176,21 +220,20 @@ async def test_insert_active_collect_classifies_each_conflict(engine, queue_app,
             ),
             {"slot": A, "s": settings_id, "c": scope_id},
         )
-        assert await insert_active_collect(c, trigger="catch_up", scheduled_slot=A, path="tick", **ids) == (
-            "slot_conflict"
-        )
+        taken = await insert_active_collect(c, trigger="catch_up", scheduled_slot=A, path="tick", **ids)
+        assert taken == "slot_conflict"
         manual = await insert_active_collect(c, trigger="manual", scheduled_slot=None, path="manual", **ids)
         assert isinstance(manual, int)
         assert logged(caplog, "active_collect_conflict") == []
         other = A + timedelta(hours=6)
-        assert await insert_active_collect(
+        overlapping = await insert_active_collect(
             c, trigger="schedule", scheduled_slot=other, path="tick", **ids
-        ) == ("active_conflict")
+        )
+        assert overlapping == "active_conflict"
         [event] = logged(caplog, "active_collect_conflict")
         assert event["path"] == "tick" and event["sqlstate"] == "23505"
-        with pytest.raises(
-            IntegrityError
-        ):  # a manual run has no slot (CHECK): neither index, so it re-raises
+        # A manual run has no slot (CHECK): neither unique index is involved, so the error re-raises.
+        with pytest.raises(IntegrityError):
             await insert_active_collect(c, trigger="manual", scheduled_slot=other, path="manual", **ids)
         # every conflict rolled back its savepoint only
         assert (await c.execute(sa.text("SELECT count(*) FROM runs"))).scalar_one() == 2
@@ -257,6 +300,7 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     await schedule(engine, interval=21600, cursor=A)
     now = A + timedelta(hours=6)
     released_by: list[str] = []
+    seen: list[tuple[reconcilers.ReconcileContext, list[tuple[datetime, str, str]]]] = []
 
     async def release_in_reconciler(app, **kwargs) -> int:
         released_by.append("reconciler")
@@ -267,6 +311,13 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
         released_by.append("task")
         return 0
 
+    async def probe(ctx: reconcilers.ReconcileContext) -> int:
+        # An assertion here would be swallowed by `run_reconcilers`, so the test records and asserts after.
+        seen.append((ctx, await runs(engine)))
+        return 0
+
+    monkeypatch.setattr(reconcilers, "REGISTRY", dict(reconcilers.REGISTRY))
+    reconcilers.reconciler("probe", "tick")(probe)
     monkeypatch.setattr(reconcilers, "release_stalled_jobs", release_in_reconciler)
     monkeypatch.setattr(tasks, "release_stalled_jobs", release_in_task)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
@@ -274,4 +325,8 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.tick(context, timestamp=0)
     assert released_by == ["reconciler"]  # the `stalled_jobs` reconciler releases; the body does not
+    [(ctx, runs_during_reconcile)] = seen
+    assert runs_during_reconcile == []  # the reconcilers ran before the tick recorded anything
+    assert ctx.defer is defer_in_tx and ctx.epoch == runtime.epoch
+    assert ctx.engine is engine and ctx.queue is queue_app and ctx.now == now
     assert await runs(engine) == [(now, "queued", "schedule")]
