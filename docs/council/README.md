@@ -16,5 +16,7 @@ Three models took part, Claude Opus 5.5, Claude Fable 5.1 and Codex GPT‑6 Astr
 6. **Specification 4-eyes review** ([`spec-reviews/`](spec-reviews/)): six rounds of review of the written spec by Codex and Fable, until both approved revision 3.3.
 7. **M0 final 4-eyes review** ([`m0-final-review/`](m0-final-review/)): a whole-branch review of the M0 implementation by Codex and Fable. Codex rejected it and Fable approved with changes. One fix wave followed, recorded as Deviations 17–28 and the carry-forward list in the M0 plan, and both approved the re-review. The reviews refer to the controller ledger (`.superpowers/sdd/…/progress.md`), which was a git-ignored working file and was deleted once M0 was complete.
 
+8. **M1 plan 4-eyes review** ([`plan-reviews/`](plan-reviews/)): three Codex rounds on the M1 collection-pipeline plan. Round 1 rejected it (2 blockers, 15 major findings), round 2 rejected it on a narrower list, and round 3 approved.
+
 ## Standing rules
 See [`notes.md`](notes.md): Codex GPT‑6 Astra is used only at `high` effort in council and review rounds.
