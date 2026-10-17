@@ -1,8 +1,12 @@
 """The dev stack (Task 18): digest-pinned images, real UID/GID secret access, the dev part of V21.
 
-Run explicitly with `-m stack`. The fixture removes every container, network and volume of the compose project
-`jobhunter-dev`, and the egress probe container, on every path: before the start (what a killed earlier run
-left behind) and after the module, also when the start fails.
+Run explicitly with `-m stack`. The stack runs as a compose project of its own, `jobhunter-stacktest` (every
+compose call passes `-p jobhunter-stacktest`; ruling T21-g), never as the normal dev stack `jobhunter-dev`,
+whose database it must not touch. The fixture removes every container, network and volume of
+`jobhunter-stacktest`, and its egress probe container, on every path: before the start (what a killed earlier
+run left behind) and after the module, also when the start fails. It never stops or removes anything of
+`jobhunter-dev`: when that project has a running container or a network (its fixed subnet `172.30.0.0/24`
+and port `127.0.0.1:8080` would collide), the module is skipped with a message saying so.
 """
 
 import stat
@@ -17,15 +21,19 @@ from jobhunter.db.alembic_runner import code_head
 
 pytestmark = pytest.mark.stack
 REPO = Path(__file__).resolve().parents[2]
+PROJECT = "jobhunter-stacktest"
+DEV_PROJECT = "jobhunter-dev"  # the normal dev stack (`name:` of compose.dev.yaml): only ever looked at
 DC = [
     "docker",
     "compose",
+    "-p",
+    PROJECT,
     "--env-file",
     str(REPO / "deploy/images.lock"),
     "-f",
     str(REPO / "deploy/compose.dev.yaml"),
 ]
-PROBE_NAME = "jh-egress-probe"
+PROBE_NAME = f"{PROJECT}-egress-probe"
 LOG_TAIL_LINES = 60
 # Every subprocess has a timeout (fix round 1, item 6): a hung docker call fails the test instead of the run.
 CALL_TIMEOUT_S = 120
@@ -38,6 +46,25 @@ SECRET_NAMES = (
     "db_backup",
     "db_restore",
 )
+
+
+def _dev_stack_in_use() -> str | None:
+    """What of `jobhunter-dev` exists (running containers, networks), or `None`; it changes nothing."""
+    found = []
+    for kind, command in (
+        ("running containers", ["docker", "ps", "--quiet"]),
+        ("networks", ["docker", "network", "ls", "--quiet"]),
+    ):
+        listed = subprocess.run(
+            [*command, "--filter", f"label=com.docker.compose.project={DEV_PROJECT}"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=CALL_TIMEOUT_S,
+        )
+        if listed.stdout.split():
+            found.append(f"{kind} ({len(listed.stdout.split())})")
+    return ", ".join(found) or None
 
 
 def _remove_stack() -> subprocess.CompletedProcess[str]:
@@ -62,6 +89,14 @@ def _logs_tail() -> str:
 
 @pytest.fixture(scope="module")
 def stack() -> Iterator[None]:
+    in_use = _dev_stack_in_use()
+    if in_use is not None:
+        pytest.skip(
+            f"the dev stack (compose project {DEV_PROJECT}) has {in_use}: its fixed subnet and port 8080 "
+            f"would collide with {PROJECT}. This test never stops or removes it; stop it yourself "
+            "(`docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml down`, keeping its "
+            "volumes) to run the stack tests."
+        )
     _remove_stack()
     try:
         subprocess.run([str(REPO / "scripts/dev-secrets.sh")], check=True, timeout=CALL_TIMEOUT_S)
@@ -73,7 +108,7 @@ def stack() -> Iterator[None]:
             for line in (REPO / "deploy/images.lock").read_text().splitlines()
             if line.startswith("python=")
         )
-        probe = ["docker", "run", "-d", "--rm", "--name", PROBE_NAME, "--network", "jobhunter-dev_egress"]
+        probe = ["docker", "run", "-d", "--rm", "--name", PROBE_NAME, "--network", f"{PROJECT}_egress"]
         subprocess.run(
             [*probe, python, "python", "-m", "http.server", "8099"], check=True, timeout=CALL_TIMEOUT_S
         )
