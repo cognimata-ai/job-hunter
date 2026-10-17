@@ -100,6 +100,10 @@ def test_rules_name_every_report_key_with_its_window() -> None:
     }
     names = [rule.name for rule in RULES]
     assert names.index("checkpoints") < names.index("runs")  # threads go while their attempts still name them
+    # A dependency is named explicitly (ruling T21-f), and only ever on a rule that runs before it.
+    assert {rule.name: rule.depends_on for rule in RULES if rule.depends_on} == {"runs": ("checkpoints",)}
+    for rule in RULES:
+        assert all(names.index(name) < names.index(rule.name) for name in rule.depends_on), rule.name
 
 
 async def test_sessions_and_operations_go_one_day_after_expiry_and_30_days_after_they_finish(
@@ -281,3 +285,67 @@ async def test_a_failing_rule_is_alerted_and_the_rules_after_it_still_run(
     assert report["login_attempts"] == 1  # the rule works again, and its alert is resolved
     async with engine.connect() as c:
         assert (await c.execute(open_failure)).first() is None
+
+
+# --- Ruling T21-f: a rule that depends on another is skipped in a pass where that one failed -------------
+
+
+async def test_a_failed_checkpoint_rule_keeps_the_runs_that_name_its_threads(
+    engine, queue_app, migrated, monkeypatch, caplog
+) -> None:
+    from tests.support.logs import logged
+
+    now = utcnow() + SHIFT
+    old = now - timedelta(days=398)  # past both windows: its threads (14 days) and the run itself (13 months)
+    async with engine.begin() as c:
+        run_id = await insert_run(c, "succeeded", queued=old, finished=old, attempts=1)
+        await c.execute(
+            sa.text(
+                "INSERT INTO login_attempts (at, ip, username_hmac, success) "
+                "VALUES (:t, '198.51.100.1', '\\x00', false)"
+            ),
+            {"t": now - timedelta(days=31)},
+        )
+    thread = f"run-{run_id}-a1"
+    open_failure = sa.text(
+        "SELECT context FROM alerts WHERE dedup_key = 'retention.failed:checkpoints' AND resolved_at IS NULL"
+    )
+
+    async def left() -> tuple[int, int, int]:
+        async with engine.connect() as c:
+            runs = (await c.execute(sa.text("SELECT count(*) FROM runs"))).scalar_one()
+            attempts = (await c.execute(sa.text("SELECT count(*) FROM run_attempts"))).scalar_one()
+            checkpoints = await c.execute(
+                sa.text("SELECT count(*) FROM checkpoints WHERE thread_id = :t"), {"t": thread}
+            )
+            return runs, attempts, checkpoints.scalar_one()
+
+    async with open_saver(migrated.dsn("app")) as saver:
+        await build_noop_collect_graph(saver).ainvoke(
+            {"run_id": run_id, "attempt_no": 1, "steps": []},
+            {"configurable": {"thread_id": thread}},
+            durability="sync",
+        )
+
+        async def unavailable(thread_id: str) -> None:
+            raise RuntimeError("checkpoint store unavailable")
+
+        monkeypatch.setattr(saver, "adelete_thread", unavailable)
+        first = await run_retention_daily(engine, queue_app, saver, now=now)
+        runs, attempts, checkpoints = await left()
+        assert (first["checkpoints"], first["runs"], first["login_attempts"]) == (-1, -1, 1)
+        assert (runs, attempts) == (1, 1) and checkpoints > 0  # the run and the attempt that names the thread
+        async with engine.connect() as c:
+            assert (await c.execute(open_failure)).scalar_one() == {
+                "rule": "checkpoints",
+                "error_class": "RuntimeError",
+            }
+        assert [(e["rule"], e["blocked_by"]) for e in logged(caplog, "retention_rule_skipped")] == [
+            ("runs", ["checkpoints"])
+        ]
+        monkeypatch.undo()
+        second = await run_retention_daily(engine, queue_app, saver, now=now)
+    assert (second["checkpoints"], second["runs"]) == (1, 1)
+    assert await left() == (0, 0, 0)
+    async with engine.connect() as c:
+        assert (await c.execute(open_failure)).first() is None  # resolved by the successful pass

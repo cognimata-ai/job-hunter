@@ -15,6 +15,13 @@ The rules run in dependency order (§20.1: a row goes only after what references
 of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
 run (`queued` or `running`) is never deleted, however old.
 
+Isolation has one exception, the dependent rules (ruling T21-f): a rule names in `depends_on` the rules whose
+work its own would make impossible to finish later. `runs` depends on `checkpoints`, because its cascade
+removes the `run_attempts` through which the checkpoint threads are found. A rule whose dependency failed (or
+was skipped itself) earlier in the same pass is skipped: it is reported as `-1` and logged
+`retention_rule_skipped` (with `blocked_by`), and it neither raises nor resolves an alert, so the failed
+dependency's alert stays open until a pass in which both succeed. Independent rules still run.
+
 This module is a task boundary (ruff `BLE001` is allowed here). The catch around a rule persists its outcome
 as the alert, written in a transaction of its own. When that write fails too, `retention_alert_write_failed`
 is logged: the database that would hold the outcome is the one that failed, so the log line is what is left
@@ -39,10 +46,14 @@ from jobhunter.worker.tasks import delete_finished_jobs
 
 @dataclass(frozen=True)
 class RetentionRule:
-    """What `name` keeps: rows younger than `window` (measured from the caller's `now`)."""
+    """What `name` keeps: rows younger than `window` (measured from the caller's `now`).
+
+    `depends_on`: the earlier rules that must have succeeded in the same pass for this one to run.
+    """
 
     name: str
     window: timedelta
+    depends_on: tuple[str, ...] = ()
 
 
 # 13 calendar months last 393 to 397 days; the longest bound keeps every row for at least 13 months.
@@ -56,7 +67,8 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("alerts", timedelta(days=90)),  # after resolution
     RetentionRule("operations", timedelta(days=30)),  # after they finished
     RetentionRule("checkpoints", timedelta(days=14)),  # threads of the runs that ended that long ago
-    RetentionRule("runs", THIRTEEN_MONTHS),
+    # Its cascade deletes the run_attempts that name the checkpoint threads, so never after a failed purge.
+    RetentionRule("runs", THIRTEEN_MONTHS, depends_on=("checkpoints",)),
     RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
 )
 
@@ -160,16 +172,25 @@ async def _record_alert_outcome(name: str, write: Awaitable[None]) -> None:
 async def run_retention_daily(
     engine: AsyncEngine, queue: procrastinate.App, saver: AsyncPostgresSaver, *, now: datetime
 ) -> dict[str, int]:
-    """Apply every rule of `RULES` at `now`, in order; the number deleted by rule name, `-1` when it failed.
+    """Apply every rule of `RULES` at `now`, in order; the number deleted by rule name, `-1` when it failed
+    or was skipped (a dependency of it failed in this pass).
 
     `checkpoints` counts threads; `procrastinate_jobs` is always `-1`. `queue` must be open.
     """
     report: dict[str, int] = {}
+    not_done: set[str] = set()  # the rules that failed or were skipped in this pass
     for rule in RULES:
+        blocked_by = [name for name in rule.depends_on if name in not_done]
+        if blocked_by:
+            report[rule.name] = -1
+            not_done.add(rule.name)
+            log.warning("retention_rule_skipped", rule=rule.name, blocked_by=blocked_by)
+            continue
         try:
             report[rule.name] = await _apply(rule, engine, queue, saver, now)
         except Exception as exc:
             report[rule.name] = -1
+            not_done.add(rule.name)
             error_class = type(exc).__name__
             # Not the exception's message and not its traceback: either may carry content.
             log.error("retention_rule_failed", rule=rule.name, error_class=error_class)
