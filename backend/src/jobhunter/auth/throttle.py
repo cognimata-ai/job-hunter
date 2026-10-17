@@ -22,12 +22,12 @@ All functions run on the caller's connection and leave the transaction to the ca
 
 import hashlib
 import hmac
-import unicodedata
 from datetime import datetime, timedelta
 from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.auth.users import normalize_username
 from jobhunter.crypto import hkdf_sha256
 from jobhunter.db.sql import q
 from jobhunter.observability.alerts import raise_alert, resolve_alert
@@ -74,9 +74,13 @@ def ip_scope(ip: str) -> str:
 
 
 def username_hmac(username: str, session_secret: bytes) -> bytes:
-    """HMAC-SHA256 of the casefolded NFC `username` under `HKDF(session_secret, "login-username")`."""
+    """HMAC-SHA256 of the casefolded, normalised `username` under `HKDF(session_secret, "login-username")`.
+
+    The name is normalised as the user lookup normalises it (`users.normalize_username`: NFC, without outer
+    whitespace), so `" ada"` and `"ada"` are one name in `login_attempts`, as they are at the login.
+    """
     key = hkdf_sha256(session_secret, b"login-username")
-    folded = unicodedata.normalize("NFC", username).casefold()
+    folded = normalize_username(username).casefold()
     return hmac.new(key, folded.encode("utf-8"), hashlib.sha256).digest()
 
 

@@ -485,6 +485,28 @@ async def test_auth_logs_carry_the_outcome_and_the_address_only(
         assert value not in dumped
 
 
+def test_the_username_hmac_normalises_the_name_like_the_user_lookup() -> None:
+    from jobhunter.auth import throttle
+
+    key = b"k" * 32
+    expected = throttle.username_hmac("ada", key)
+    for typed in (" ada", "ada\t", " ADA \n", "Ada"):
+        assert throttle.username_hmac(typed, key) == expected, repr(typed)
+    assert throttle.username_hmac("a da", key) != expected  # inner whitespace is part of the name
+
+
+async def test_logins_with_and_without_outer_spaces_record_one_username_hmac(
+    api_client, make_user, engine
+) -> None:
+    await make_user()
+    for username in ("ada", " ada", "ADA "):
+        r = await api_client.post("/api/auth/login", json={"username": username, "password": "w" * 12})
+        assert r.status_code == 401
+    async with engine.connect() as c:
+        hmacs = (await c.execute(sa.text("SELECT DISTINCT username_hmac FROM login_attempts"))).all()
+    assert len(hmacs) == 1
+
+
 def test_session_rate_limiter_forgets_idle_sessions() -> None:
     from jobhunter.api.app import SessionRateLimiter
 
