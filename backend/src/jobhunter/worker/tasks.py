@@ -7,8 +7,8 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 `operations` or `runs` row that the reconcilers re-defer from (§3.3.2).
 
 Task bodies not yet written are stubs (they log `task_stub`); Tasks 10 to 13 fill them in (`run_operation`:
-Task 10, `tick`: Task 11). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
-`context.additional_context["runtime"]`.
+Task 10, `tick`: Task 11, `run_collect`: Task 12). Every body is `pass_context` and reads its inputs from the
+`WorkerRuntime` in `context.additional_context["runtime"]`.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 
@@ -58,7 +58,12 @@ def _stub(name: TaskName, **fields: JSONValue) -> None:
 
 @blueprint.task(name="run_collect", queue="collect", lock="collect", pass_context=True)
 async def run_collect(context: JobContext, run_id: int, attempt_no: int) -> None:
-    _stub("run_collect", run_id=run_id, attempt_no=attempt_no)
+    # Imported here: `runs` imports this module (`Deferrer`, `defer_in_tx`, `job_task_name`). The worker
+    # imports `runs` itself before takeover, so its sweep and reconcilers are registered (Task 13).
+    from jobhunter.worker.runs import execute_run
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    await execute_run(rt.engine, rt.collect_graph, run_id, attempt_no, epoch=rt.epoch)
 
 
 @blueprint.task(name="run_operation", queue="aux", pass_context=True)
