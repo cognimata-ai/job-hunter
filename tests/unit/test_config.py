@@ -515,6 +515,9 @@ def test_a_public_origin_of_scheme_host_and_port_passes(tmp_path: Path, env_name
         # Fix round 1, item 4: the host is [a-z0-9.-]+ or a bracketed IPv6 address without a zone, both in
         # the form a browser serialises.
         "http://local_host:8080",  # no underscore in a host a browser sends
+        "http://a_b:8080",
+        "http://local\\host:8080",  # a backslash inside the host
+        "http://localhost%2f:8080",  # a percent-escape (here of "/") inside the host
         "http://%6cocalhost:8080",  # browsers decode percent-escapes in the host
         "http://localhost\\:8080",  # a backslash is a path separator to a browser
         "http://[fe80::1%25eth0]:8080",  # a zone id never appears in Origin
