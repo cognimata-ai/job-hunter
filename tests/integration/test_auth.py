@@ -335,6 +335,37 @@ async def test_a_login_with_a_password_changed_meanwhile_is_rejected(
     assert row is not None and passwords.verify_password(row.password_hash, "Kastanienallee-Ölfass-9")[0]
 
 
+async def test_a_login_verified_with_a_totp_secret_replaced_meanwhile_is_rejected(
+    api_client, make_user, engine, make_config, monkeypatch
+) -> None:
+    import jobhunter.api.routes.auth as auth_routes
+    from jobhunter.auth import totp, users
+
+    await make_user()
+    data_key = make_config("api").secret_b64("data_key")
+    secret_a, secret_b = totp.new_secret(), totp.new_secret()
+    async with engine.begin() as c:
+        await users.enable_totp(c, secret_a, data_key=data_key)
+    decide = auth_routes.decide_login
+
+    async def replace_secret_then_decide(conn: Any, **arguments: Any) -> Any:
+        # The login has verified the password and secret A's code. Before its decision (no statement of it
+        # has run yet) the operator turns TOTP off and on again with secret B; the password is unchanged.
+        async with engine.begin() as operator:
+            await users.disable_totp(operator)
+            await users.enable_totp(operator, secret_b, data_key=data_key)
+        return await decide(conn, **arguments)
+
+    monkeypatch.setattr(auth_routes, "decide_login", replace_secret_then_decide)
+    assert (await login(api_client, totp=pyotp.TOTP(secret_a).now())).status_code == 401
+    async with engine.connect() as c:
+        assert (await c.execute(sa.text("SELECT count(*) FROM sessions"))).scalar_one() == 0
+        attempts = await c.execute(sa.text("SELECT success FROM login_attempts"))
+        assert attempts.scalars().all() == [False]  # it counts as a failure
+        row = await users.get_user(c)
+    assert row is not None and users.totp_secret(row, keys=[data_key]) == secret_b
+
+
 async def _set_password(url: sa.URL, password: str) -> None:
     from jobhunter.auth import users
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -624,13 +655,27 @@ async def test_confirm_unchanged_and_claim_totp_step(engine, make_user) -> None:
         row = await users.get_user(c)
         assert row is not None
         stored = row.password_hash
-        assert await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=False)
-        assert not await users.confirm_unchanged(c, expected_hash="$argon2id$other", totp_enabled=False)
-        assert not await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=True)
+
+        async def unchanged(expected_hash: str, totp_enabled: bool, sealed: bytes | None) -> bool:
+            return await users.confirm_unchanged(
+                c, expected_hash=expected_hash, totp_enabled=totp_enabled, totp_secret_enc=sealed
+            )
+
+        assert await unchanged(stored, False, None)
+        assert not await unchanged("$argon2id$other", False, None)
+        assert not await unchanged(stored, True, None)
         assert not await users.claim_totp_step(c, 7)  # TOTP is off: there is no step to claim
-        await users.enable_totp(c, totp.new_secret(), data_key=os.urandom(32))
-        assert await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=True)
-        assert not await users.confirm_unchanged(c, expected_hash=stored, totp_enabled=False)
+        secret, key = totp.new_secret(), os.urandom(32)
+        await users.enable_totp(c, secret, data_key=key)
+        enabled = await users.get_user(c)
+        assert enabled is not None and enabled.totp_secret_enc is not None
+        sealed = enabled.totp_secret_enc
+        assert await unchanged(stored, True, sealed)
+        assert not await unchanged(stored, False, sealed)
+        assert not await unchanged(stored, True, None)
+        await users.disable_totp(c)
+        await users.enable_totp(c, secret, data_key=key)  # the same secret, sealed again: another value
+        assert not await unchanged(stored, True, sealed)
         assert await users.claim_totp_step(c, 7)
         assert not await users.claim_totp_step(c, 7) and not await users.claim_totp_step(c, 6)
         assert await users.claim_totp_step(c, 8)

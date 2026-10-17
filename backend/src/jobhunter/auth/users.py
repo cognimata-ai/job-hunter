@@ -42,11 +42,14 @@ _UPDATE_HASH = q("UPDATE users SET password_hash = :new_hash WHERE id = 1")
 _UPDATE_HASH_FROM = q(
     "UPDATE users SET password_hash = :new_hash WHERE id = 1 AND password_hash = :expected_hash"
 )
-# A login's success needs the row still as its verification saw it (ruling T16-a/T16-d). FOR UPDATE: a
+# A login's success needs the row still as its verification saw it (ruling T16-a/T16-d): the password hash,
+# the TOTP state and the sealed TOTP secret itself, so a secret replaced in the meantime (disabled and enabled
+# again, with the password unchanged) is not taken for the one whose code was verified. Every `enable_totp`
+# seals with a fresh nonce, so even the same secret enabled again is a different value. FOR UPDATE: a
 # concurrent `set_password` then waits for the login's commit, so its revocation covers the new session.
 _CONFIRM_UNCHANGED = q(
     "SELECT id FROM users WHERE id = 1 AND password_hash = :expected_hash AND totp_enabled = :totp_enabled "
-    "FOR UPDATE"
+    "AND totp_secret_enc IS NOT DISTINCT FROM CAST(:totp_secret_enc AS bytea) FOR UPDATE"
 )
 # RFC 6238 §5.2 (migration 0004): a code's step is accepted once, and never one at or before the last used.
 _CLAIM_TOTP_STEP = q(
@@ -158,14 +161,18 @@ async def update_hash(conn: AsyncConnection, new_hash: str, *, expected_hash: st
         await conn.execute(_UPDATE_HASH_FROM, {"new_hash": new_hash, "expected_hash": expected_hash})
 
 
-async def confirm_unchanged(conn: AsyncConnection, *, expected_hash: str, totp_enabled: bool) -> bool:
-    """Lock the user row and say whether it still has `expected_hash` and this TOTP state.
+async def confirm_unchanged(
+    conn: AsyncConnection, *, expected_hash: str, totp_enabled: bool, totp_secret_enc: bytes | None
+) -> bool:
+    """Lock the user row and say whether it still has `expected_hash`, this TOTP state and this sealed secret.
 
-    A login calls it in its decision transaction: `False` means the password changed, or TOTP was turned on
-    or off, since the credentials were verified. The row stays locked until that transaction ends.
+    A login calls it in its decision transaction with what its verification read (`UserRow`): `False` means
+    the password changed, TOTP was turned on or off, or its secret was replaced since the credentials were
+    verified. The row stays locked until that transaction ends.
     """
     row = await conn.execute(
-        _CONFIRM_UNCHANGED, {"expected_hash": expected_hash, "totp_enabled": totp_enabled}
+        _CONFIRM_UNCHANGED,
+        {"expected_hash": expected_hash, "totp_enabled": totp_enabled, "totp_secret_enc": totp_secret_enc},
     )
     return row.first() is not None
 

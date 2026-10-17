@@ -85,6 +85,7 @@ async def decide(conn, **overrides: Any) -> Any:
         "now": utcnow(),
         "verified_hash": None,
         "totp_step": None,
+        "verified_totp_secret_enc": None,
         "previous_token": None,
     }
     return await decide_login(conn, **{**arguments, **overrides})

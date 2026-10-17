@@ -112,19 +112,22 @@ async def decide_login(
     now: datetime,
     verified_hash: str | None,
     totp_step: int | None,
+    verified_totp_secret_enc: bytes | None,
     previous_token: str | None,
 ) -> LoginOutcome:
     """Decide a login whose credentials were verified already, and write what it decided.
 
     `credentials_ok` is the verification's result: the password, and the TOTP code when TOTP is on.
-    `verified_hash` is the stored hash the password was verified against, and `totp_step` the step of the
-    accepted code (`totp.matched_step`), `None` when TOTP is off. `previous_token` is the session cookie the
-    request carried, if any. It never raises a `Problem`: the caller commits, then answers.
+    `verified_hash` is the stored hash the password was verified against, `totp_step` the step of the
+    accepted code (`totp.matched_step`), `None` when TOTP is off, and `verified_totp_secret_enc` the sealed
+    TOTP secret the code was verified with (as stored; `None` without TOTP). `previous_token` is the session
+    cookie the request carried, if any. It never raises a `Problem`: the caller commits, then answers.
 
     1. `throttle.serialize`, the first statement (ruling T16-c);
     2. a lockout in force → `Locked`, whatever the credentials (nothing is recorded);
-    3. a success also needs the user row unchanged (`users.confirm_unchanged`) and, with TOTP, a step later
-       than the last one used (`users.claim_totp_step`, ruling T16-a): otherwise it counts as a failure;
+    3. a success also needs the user row unchanged (`users.confirm_unchanged`: the hash, the TOTP state and
+       the sealed secret) and, with TOTP, a step later than the last one used (`users.claim_totp_step`,
+       ruling T16-a): otherwise it counts as a failure;
     4. `record_attempt`, which may lock out and raise `auth.lockout`; a failure → `Rejected`;
     5. a success stores the rehash (only over the verified hash), deletes the session of `previous_token`
        (rotation) and creates a new one → `Accepted`.
@@ -137,7 +140,10 @@ async def decide_login(
         credentials_ok
         and verified_hash is not None
         and await users.confirm_unchanged(
-            conn, expected_hash=verified_hash, totp_enabled=totp_step is not None
+            conn,
+            expected_hash=verified_hash,
+            totp_enabled=totp_step is not None,
+            totp_secret_enc=verified_totp_secret_enc,
         )
         and (totp_step is None or await users.claim_totp_step(conn, totp_step))
     )
@@ -178,6 +184,7 @@ class _Verified:
     new_hash: str | None = field(default=None, repr=False)
     verified_hash: str | None = field(default=None, repr=False)
     totp_step: int | None = None
+    totp_secret_enc: bytes | None = field(default=None, repr=False)
     totp_key_mismatch: bool = False
 
 
@@ -210,7 +217,13 @@ async def _verify_credentials(
         if step is None:
             return _Verified(ok=False)
     new_hash = await gate.run(hash_password, body.password) if needs_rehash else None
-    return _Verified(ok=True, new_hash=new_hash, verified_hash=user.password_hash, totp_step=step)
+    return _Verified(
+        ok=True,
+        new_hash=new_hash,
+        verified_hash=user.password_hash,
+        totp_step=step,
+        totp_secret_enc=user.totp_secret_enc,
+    )
 
 
 def _throttled(ip: str, *, outcome: str, title: str, retry_after_s: int) -> Problem:
@@ -279,6 +292,7 @@ async def login(
             now=now,
             verified_hash=verified.verified_hash,
             totp_step=verified.totp_step,
+            verified_totp_secret_enc=verified.totp_secret_enc,
             previous_token=request.cookies.get(sessions.SESSION_COOKIE),
         )
         if verified.totp_key_mismatch:  # after the throttle lock, the first statement (ruling T16-c)
