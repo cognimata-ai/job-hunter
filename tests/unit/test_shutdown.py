@@ -1,9 +1,14 @@
 import asyncio
+import re
+from pathlib import Path
 
 from jobhunter.worker import shutdown
 from jobhunter.worker.runtime import ShutdownState
 
+from tests.support.clock import FakeClock
 from tests.support.logs import logged
+
+COMPOSE = Path(__file__).resolve().parents[2] / "deploy" / "compose.dev.yaml"
 
 
 def forever() -> asyncio.Future[None]:
@@ -62,9 +67,14 @@ async def test_a_loop_that_ends_by_itself_stops_the_others_and_returns_1(caplog)
     assert "must not be logged" not in caplog.text
 
 
-async def test_loops_that_outlive_the_grace_are_logged_and_left_to_the_exit(monkeypatch, caplog) -> None:
-    monkeypatch.setattr(shutdown, "GRACE_S", 0)
-    monkeypatch.setattr(shutdown, "_LOOP_END_MARGIN_S", 0.05)
+async def test_loops_that_outlive_the_grace_are_logged_and_left_to_the_exit(caplog) -> None:
+    # The stop begins at 0, and every later reading of the clock is `GRACE_S` later: the grace is used up when
+    # the coordinator would wait for the loops, so it does not wait at all.
+    readings = iter([0.0])
+
+    def clock() -> float:
+        return next(readings, float(shutdown.GRACE_S))
+
     state = ShutdownState()
     release = asyncio.Event()
 
@@ -77,8 +87,40 @@ async def test_loops_that_outlive_the_grace_are_logged_and_left_to_the_exit(monk
 
     loops = [asyncio.create_task(stubborn(), name="jh-collect")]
     state.requested.set()
-    assert await shutdown.coordinate(loops, state) == 0
-    (event,) = logged(caplog, "worker_loops_not_stopped")
-    assert event["workers"] == ["jh-collect"] and not loops[0].done()
-    release.set()
-    await loops[0]
+    try:
+        assert await shutdown.coordinate(loops, state, clock=clock) == 0
+        (event,) = logged(caplog, "worker_loops_not_stopped")
+        assert event["workers"] == ["jh-collect"] and not loops[0].done()
+    finally:  # also when an assertion failed: the stubborn loop would outlive the test's event loop
+        release.set()
+        await loops[0]
+
+
+# --- Final fix wave, item 6: one deadline for the whole stop, within Compose's stop grace ------------------
+
+
+def test_the_whole_stop_fits_in_the_compose_stop_grace_with_room_for_the_exit() -> None:
+    (grace,) = re.findall(r"stop_grace_period: (\d+)s", COMPOSE.read_text(encoding="utf-8"))
+    assert shutdown.GRACE_S + shutdown.TEARDOWN_S == shutdown.STOP_BUDGET_S < int(grace)
+
+
+async def test_the_stop_starts_one_deadline_and_the_teardown_gets_what_the_loops_left() -> None:
+    clock = FakeClock(500.0)
+    state = ShutdownState()
+
+    async def drains() -> None:
+        try:
+            await forever()
+        except asyncio.CancelledError:
+            clock.now += 30  # its running jobs took 30 s to finish
+            raise
+
+    loops = [asyncio.create_task(drains(), name="jh-collect")]
+    state.requested.set()
+    assert await shutdown.coordinate(loops, state, clock=clock) == 0
+    deadline = state.stop_deadline
+    assert deadline is not None and deadline.at == 500.0 + shutdown.STOP_BUDGET_S
+    assert deadline.remaining() == shutdown.STOP_BUDGET_S - 30  # the rest of the one budget ...
+    assert deadline.remaining(15.0) == 15.0  # ... capped by a step's own bound
+    clock.now = deadline.at + 1
+    assert deadline.remaining() == 0.0  # never negative

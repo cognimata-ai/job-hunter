@@ -18,7 +18,9 @@
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
 12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app and the engine
-    closed, and the lock session closed last, which releases the lock; then `worker_shutdown_complete`.
+    closed, and the lock session closed last, which releases the lock; then `worker_shutdown_complete`. Each
+    of its waits takes at most what is left of the stop's one deadline (`shutdown.StopDeadline`), so the
+    whole stop fits in `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -69,13 +71,16 @@ from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.lock import WATCHDOG_EXIT_CODE, LockSession, acquire_lock
 from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
 from jobhunter.worker.runtime import ShutdownState, WorkerRuntime
-from jobhunter.worker.shutdown import GRACE_S, coordinate
+from jobhunter.worker.shutdown import GRACE_S, StopDeadline, coordinate
 from jobhunter.worker.tasks import QUEUES, defer_in_tx, make_queue_app
 from jobhunter.worker.watchdog import Watchdog
 
 METRICS_PORT: Final = 9100
 ENGINE_POOL_SIZE: Final = 10
 QUEUE_POOL_MAX_SIZE: Final = 4
+# The bounds of two teardown waits; each also takes at most what is left of the stop's deadline.
+EXECUTIONS_CANCEL_S: Final = 30.0
+WATCHDOG_STOP_S: Final = 15.0
 # Imported before the takeover (step 4): importing them registers their sweeps, reconcilers and handlers.
 _REGISTERING_MODULES: Final = ("jobhunter.worker.operations", "jobhunter.worker.runs")
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
@@ -137,6 +142,7 @@ class _WorkerProcess:
         self.queue: procrastinate.App | None = None  # its `close_async` is a no-op until it is open
         self.watchdog: Watchdog | None = None
         self.saver_scope = AsyncExitStack()
+        self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
         cfg = self.cfg
@@ -181,7 +187,7 @@ class _WorkerProcess:
             saver=saver,
             collect_graph=build_noop_collect_graph(saver),
             epoch=epoch,
-            shutdown=ShutdownState(),
+            shutdown=self.shutdown,
         )
         # 8. The start reconcilers, and the metrics server outside the test env.
         start = ReconcileContext(engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch)
@@ -214,10 +220,10 @@ class _WorkerProcess:
             await asyncio.to_thread(exit_unless_lock_held, self.lock_session, ident.instance_id, epoch)
         return code
 
-    async def _stop_watchdog(self) -> None:
+    async def _stop_watchdog(self, timeout_s: float) -> None:
         if self.watchdog is not None:
             # `stop()` joins the thread, which can be in a heartbeat (5 s statement timeout): off the loop.
-            await asyncio.to_thread(self.watchdog.stop)
+            await asyncio.to_thread(self.watchdog.stop, timeout_s)
 
     async def _close_queue(self) -> None:
         if self.queue is not None:
@@ -231,13 +237,20 @@ class _WorkerProcess:
         self.lock_session.close()
 
     async def teardown(self) -> bool:
-        """Step 12, in order, for what the start built; `False` when a step failed (the rest still ran)."""
+        """Step 12, in order, for what the start built; `False` when a step failed (the rest still ran).
+
+        Every wait takes at most what is left of the stop's one deadline: the coordinator's, or one that
+        starts now when the start failed before it. A step that would wait past it is cut off (`TimeoutError`,
+        logged like any failed step); one that needs no wait still runs. The lock session is closed last,
+        always.
+        """
+        deadline = self.shutdown.stop_deadline or StopDeadline.start()
         steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
-            ("executions", EXECUTIONS.cancel_all),
-            ("watchdog", self._stop_watchdog),
-            ("saver", self.saver_scope.aclose),
-            ("queue", self._close_queue),
-            ("engine", self._dispose_engine),
+            ("executions", lambda: EXECUTIONS.cancel_all(timeout_s=deadline.remaining(EXECUTIONS_CANCEL_S))),
+            ("watchdog", lambda: self._stop_watchdog(deadline.remaining(WATCHDOG_STOP_S))),
+            ("saver", lambda: _within(deadline, self.saver_scope.aclose())),
+            ("queue", lambda: _within(deadline, self._close_queue())),
+            ("engine", lambda: _within(deadline, self._dispose_engine())),
             ("lock_session", self._close_lock_session),  # last: closing it releases the lock
         )
         clean = True
@@ -249,6 +262,16 @@ class _WorkerProcess:
                 clean = False
                 log.error("worker_teardown_failed", step=name, error_class=type(exc).__name__)
         return clean
+
+
+async def _within(deadline: StopDeadline, step: Awaitable[object]) -> None:
+    """Await `step` until the stop's `deadline`, then cut it off with `TimeoutError`.
+
+    `asyncio.timeout` fires only once `step` waits, so a step that needs no wait completes even when nothing
+    is left of the budget.
+    """
+    async with asyncio.timeout(deadline.remaining()):
+        await step
 
 
 async def worker_main(cfg: AppConfig) -> int:

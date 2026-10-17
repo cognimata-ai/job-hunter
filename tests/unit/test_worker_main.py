@@ -1,10 +1,13 @@
 import asyncio
+import functools
 import uuid
+from collections.abc import Callable
 from typing import NoReturn
 
 import pytest
 from jobhunter.worker.main import exit_unless_lock_held
 
+from tests.support.clock import FakeClock
 from tests.support.logs import logged
 
 
@@ -97,6 +100,12 @@ class World:
         self.events = events
         self.open_fails = False
         self.dispose_fails = False
+        # For the stop budget: what each bounded teardown wait was given, and hooks that spend fake time.
+        self.timeouts: dict[str, float] = {}
+        self.on_loop_cancelled: Callable[[], None] = lambda: None
+        self.on_executions_cancelled: Callable[[], None] = lambda: None
+        self.on_watchdog_stopped: Callable[[], None] = lambda: None
+        self.saver_close_hangs = False
         world = self
 
         class FakeLockSession:
@@ -122,6 +131,14 @@ class World:
 
             def stop(self, timeout_s: float = 15.0) -> None:
                 events.append("watchdog_stop")
+                world.timeouts["watchdog"] = timeout_s
+                world.on_watchdog_stopped()
+
+        class FakeExecutions:
+            async def cancel_all(self, *, timeout_s: float = 30.0) -> int:
+                world.timeouts["executions"] = timeout_s
+                world.on_executions_cancelled()
+                return 0
 
         class FakeEngine:
             async def dispose(self) -> None:
@@ -141,7 +158,11 @@ class World:
             async def run_worker_async(self, **options: object) -> None:
                 if options["name"] == "jh-tick":  # this loop asks for the shutdown, as a SIGTERM would
                     options["additional_context"]["runtime"].shutdown.requested.set()  # type: ignore[index]
-                await asyncio.get_running_loop().create_future()  # runs until it is cancelled
+                try:
+                    await asyncio.get_running_loop().create_future()  # runs until it is cancelled
+                except asyncio.CancelledError:
+                    world.on_loop_cancelled()
+                    raise
 
         @asynccontextmanager
         async def fake_open_saver(dsn: str):
@@ -150,6 +171,8 @@ class World:
                 yield object()
             finally:
                 events.append("saver_close")
+                if world.saver_close_hangs:
+                    await asyncio.get_running_loop().create_future()  # a close that never ends
 
         async def fake_claim(engine: object, ident: object) -> tuple[int, dict[str, int]]:
             events.append("claim")
@@ -169,6 +192,7 @@ class World:
             "open_saver": fake_open_saver,
             "build_noop_collect_graph": lambda saver: object(),
             "run_reconcilers": fake_reconcilers,
+            "EXECUTIONS": FakeExecutions(),
         }.items():
             monkeypatch.setattr(main, name, fake)
         secrets = tmp_path / "secrets"
@@ -234,3 +258,33 @@ async def test_a_failing_teardown_step_does_not_stop_the_others_and_exits_1(
     assert (event["step"], event["error_class"]) == ("engine", "OSError")
     assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [1]
     assert "must not be logged" not in caplog.text
+
+
+# --- Final fix wave, item 6: every wait of the stop takes what is left of one deadline ---------------------
+
+
+async def test_the_teardown_shares_what_is_left_of_the_one_stop_deadline(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from jobhunter.worker import main, shutdown
+
+    world = World(monkeypatch, tmp_path)
+    clock = FakeClock(1000.0)
+    monkeypatch.setattr(main, "coordinate", functools.partial(shutdown.coordinate, clock=clock))
+
+    def spend(seconds: float) -> Callable[[], None]:
+        return lambda: setattr(clock, "now", clock.now + seconds)
+
+    # The running jobs drain for the whole grace, cancelling the executions takes 4 s and stopping the
+    # watchdog the 6 s left; the saver's close would then never end.
+    world.on_loop_cancelled = lambda: setattr(clock, "now", max(clock.now, 1000.0 + shutdown.GRACE_S))
+    world.on_executions_cancelled = spend(4.0)
+    world.on_watchdog_stopped = spend(6.0)
+    world.saver_close_hangs = True
+    # Bounded: a teardown that waits past its budget fails the test, never hangs it.
+    assert await asyncio.wait_for(main.worker_main(world.cfg), 5) == 1  # a teardown step was cut off
+    assert world.timeouts == {"executions": shutdown.TEARDOWN_S, "watchdog": shutdown.TEARDOWN_S - 4.0}
+    (event,) = logged(caplog, "worker_teardown_failed")
+    assert (event["step"], event["error_class"]) == ("saver", "TimeoutError")
+    assert world.events[-len(TEARDOWN) :] == TEARDOWN  # every step still ran, the lock session last
+    assert clock.now == 1000.0 + shutdown.STOP_BUDGET_S  # the whole stop took exactly its budget
