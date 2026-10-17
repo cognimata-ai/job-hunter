@@ -72,6 +72,12 @@ if TYPE_CHECKING:
 
     from jobhunter.graphs.collect.graph import CollectState
 
+# These thresholds compare times the database wrote (`heartbeat_at`, `queued_at`: its `now()`) with the
+# caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
+# one VPS and read its one kernel clock, so the two never drift apart (ruling T21-d). If the database moves to
+# another host, their skew shifts every threshold: a worker clock ahead of the database's gives live attempts
+# a new attempt early (spending resumes and fencing a healthy execution), one behind recovers dead ones late;
+# the cutoffs then have to be computed in SQL from the database's `now()`.
 RUN_STALE: Final = timedelta(minutes=3)
 QUEUED_REDEFER_AFTER: Final = timedelta(minutes=2)
 # A queued run that was re-deferred once and still has no live job this long after it was queued is orphaned.

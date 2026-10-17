@@ -63,6 +63,12 @@ OperationKind = Literal[
 ]
 
 MAX_OPERATION_ATTEMPTS: Final = 10
+# These thresholds compare times the database wrote (`heartbeat_at`, `created_at`: its `now()`) with the
+# caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
+# one VPS and read its one kernel clock, so the two never drift apart (ruling T21-d). If the database moves to
+# another host, their skew shifts every threshold: a worker clock ahead of the database's reclaims live claims
+# early (their owners are then fenced in mid-work), one behind reclaims dead ones late; the cutoffs then have
+# to be computed in SQL from the database's `now()`.
 OPERATION_STALE: Final = timedelta(minutes=3)
 REDEFER_AFTER: Final = timedelta(minutes=2)
 # At most this many lost jobs are re-deferred per tick; the next tick takes the rest.
