@@ -308,6 +308,17 @@ async def release_stalled_jobs(app: procrastinate.App, *, seconds_since_heartbea
       `stalled_job_not_retryable`) and not counted;
     - any other error propagates, and the `stalled_jobs` reconciler records it as `reconciler.failed`.
 
+    Which tasks can be superseded (ruling T9-d): only one whose queueing lock a new job can take while the
+    stalled job is still `doing`. In M0 that is `tick` alone: the periodic deferrer queues the next minute's
+    `tick` (queueing lock `tick`) while a dead worker's `tick` is stalled, and the new one does the same work.
+    `run_collect` cannot be: its queueing lock names the attempt (`run:<id>:<n>`), and nothing defers that
+    attempt again while its job is live (`todo` or `doing`; a new attempt has a lock of its own). Neither can
+    `run_operation` (`op:<id>`, re-deferred only for an operation without a live job), nor `reconcile_heavy`
+    and `retention_daily` (no queueing lock). A task that a later milestone gives a queueing lock inherits
+    this: if anything can defer a job with that lock while the stalled one is `doing`, the stalled job ends
+    `failed` here and never runs again, so either its successor must do the same work (as `tick`'s does) or
+    its re-deferral must skip work that has a live job, as `run_collect`'s and `run_operation`'s do.
+
     `app` must be open.
     """
     manager = app.job_manager
