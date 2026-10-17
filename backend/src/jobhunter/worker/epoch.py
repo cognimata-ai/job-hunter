@@ -6,8 +6,13 @@ the same transaction, runs every registered takeover sweep. A sweep invalidates 
 that work register their sweeps with `register_takeover_sweep`. Old owners are thus fenced out atomically at
 takeover.
 
-The claim first proves, in the same transaction, that the claimant's lock session holds the singleton lock;
-a claimant that does not is `FencedOut` before anything is written or swept (ruling T8-h).
+The claim first locks the `worker_heartbeat` row `FOR UPDATE` and then proves, in the same transaction, that
+the claimant's lock session holds the singleton lock; a claimant that does not is `FencedOut` having committed
+nothing and run no sweep (ruling T8-h). The row lock comes first so that the check and the epoch write are one
+step for every other claimant: a claimant whose check passed keeps the row until it commits, and the next one
+(which can hold the lock only after the first one's lock session died) waits for it, then claims a newer epoch
+and sweeps the first one's work. A claimant that lost its lock after its check can therefore never replace the
+holder that came after it. The row exists before it is locked, also on an empty table (`_ENSURE_ROW`).
 
 A sweep returns its row count, or a `Swept` that adds an action to run once the takeover transaction has
 committed (for example observing the metrics of the runs it ended, Task 12): nothing the sweep did is real
@@ -31,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
+from jobhunter.faults import afault_point
 from jobhunter.observability.logging import get_logger
 
 
@@ -61,15 +67,24 @@ SELECT EXISTS (SELECT 1 FROM pg_locks
                 WHERE locktype = 'advisory' AND objid = 7261001 AND granted AND pid = :lock_pid
                   AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))"""
 
-# The first worker creates the row with epoch 1; every later one increments it and records itself.
-_CLAIM_EPOCH: Final = """\
+# The row exists before the claim locks it, the first claim included: an empty table has no row to lock. On an
+# empty table this inserts a placeholder of epoch 0, which the claim's epoch write replaces in the same
+# transaction (it is never committed as it is); a second first claimant's insert waits for that uncommitted
+# row and then does nothing, so two first claimants serialise like any two others. An existing row is left
+# untouched and unlocked.
+_ENSURE_ROW: Final = """\
 INSERT INTO worker_heartbeat (id, worker_instance_id, worker_epoch, hostname, pid, lock_backend_pid,
                               app_version, started_at, heartbeat_at)
-VALUES (1, :instance_id, 1, :hostname, :pid, :lock_backend_pid, :app_version, now(), now())
-ON CONFLICT (id) DO UPDATE SET worker_epoch = worker_heartbeat.worker_epoch + 1,
-  worker_instance_id = EXCLUDED.worker_instance_id, hostname = EXCLUDED.hostname, pid = EXCLUDED.pid,
-  lock_backend_pid = EXCLUDED.lock_backend_pid, app_version = EXCLUDED.app_version,
+VALUES (1, :instance_id, 0, :hostname, :pid, :lock_backend_pid, :app_version, now(), now())
+ON CONFLICT (id) DO NOTHING"""
+# The claim's first row lock: a later claimant waits here until this claim has committed or rolled back.
+_LOCK_ROW: Final = "SELECT 1 FROM worker_heartbeat WHERE id = 1 FOR UPDATE"
+# Every claim increments the epoch (the first one from the placeholder's 0 to 1) and records its claimant.
+_CLAIM_EPOCH: Final = """\
+UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1, worker_instance_id = :instance_id,
+  hostname = :hostname, pid = :pid, lock_backend_pid = :lock_backend_pid, app_version = :app_version,
   started_at = now(), heartbeat_at = now()
+ WHERE id = 1
 RETURNING worker_epoch"""
 
 # Insertion ordered: the sweeps run in registration order.
@@ -108,29 +123,29 @@ async def claim_epoch_and_sweep(
     Returns the new epoch and the row count of each sweep by name. A failing sweep rolls the whole transaction
     back, the epoch claim included, and no sweep's `after_commit` runs; after the commit, each runs in sweep
     order, and one that raises is logged without stopping the others. When `ident.lock_backend_pid` does not
-    hold the singleton lock, it raises `FencedOut(owner="worker_lock")` having written nothing and run no
-    sweep. A lock wait longer than `lock_timeout_ms` (tests pass a shorter one) raises the `OperationalError`
-    of SQLSTATE 55P03 (`db.sql.LOCK_NOT_AVAILABLE`), and nothing is committed.
+    hold the singleton lock, it raises `FencedOut(owner="worker_lock")` having committed nothing and run no
+    sweep. The check runs under the `worker_heartbeat` row lock, which the claim holds until it commits. A
+    lock wait longer than `lock_timeout_ms` (tests pass a shorter one) raises the `OperationalError` of
+    SQLSTATE 55P03 (`db.sql.LOCK_NOT_AVAILABLE`), and nothing is committed.
     """
+    claimant = {
+        "instance_id": ident.instance_id,
+        "hostname": ident.hostname,
+        "pid": ident.pid,
+        "lock_backend_pid": ident.lock_backend_pid,
+        "app_version": ident.app_version,
+    }
     async with engine.begin() as conn:
         await conn.execute(q(_SET_LOCK_TIMEOUT), {"timeout": f"{lock_timeout_ms}ms"})
+        await conn.execute(q(_ENSURE_ROW), claimant)
+        await conn.execute(q(_LOCK_ROW))
         holds_lock = (await conn.execute(q(_HOLDS_LOCK), {"lock_pid": ident.lock_backend_pid})).scalar_one()
         if holds_lock is not True:
-            # Nothing has been written: ending the transaction by raising loses nothing.
+            # At most the uncommitted placeholder row was written: ending the transaction by raising loses it.
             log.warning("worker_epoch_claim_fenced", lock_backend_pid=ident.lock_backend_pid)
             raise FencedOut(owner="worker_lock")
-        claimed = (
-            await conn.execute(
-                q(_CLAIM_EPOCH),
-                {
-                    "instance_id": ident.instance_id,
-                    "hostname": ident.hostname,
-                    "pid": ident.pid,
-                    "lock_backend_pid": ident.lock_backend_pid,
-                    "app_version": ident.app_version,
-                },
-            )
-        ).scalar_one()
+        await afault_point("takeover.before_epoch_write")
+        claimed = (await conn.execute(q(_CLAIM_EPOCH), claimant)).scalar_one()
         epoch = int(claimed)
         swept = {name: await sweep(conn, epoch) for name, sweep in list(_SWEEPS.items())}
     counts: dict[str, int] = {}

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import psycopg
@@ -9,9 +10,10 @@ from jobhunter.worker import epoch as epoch_module
 from jobhunter.worker.epoch import Swept, WorkerIdentity, claim_epoch_and_sweep, register_takeover_sweep
 from jobhunter.worker.lock import LockSession
 
+from tests.support.faults import PausePoint
 from tests.support.logs import logged
-from tests.support.pg import pg_one
-from tests.support.procs import wait_until
+from tests.support.pg import blocked_or_done, pg_one
+from tests.support.procs import await_until, wait_until
 
 pytestmark = pytest.mark.integration
 
@@ -167,3 +169,51 @@ async def test_a_failing_after_commit_action_neither_masks_the_takeover_nor_skip
     (event,) = logged(caplog, "takeover_after_commit_failed")
     assert (event["sweep"], event["error_class"], event["epoch"]) == ("first", "RuntimeError", epoch)
     assert "must not be logged" not in caplog.text
+
+
+# --- Final fix wave, item 3: a claim that passed the lock check is serialised before the next holder's -----
+
+# What an earlier worker left behind: the row exists, its epoch is 7.
+_EARLIER_WORKERS_ROW = (
+    "INSERT INTO worker_heartbeat (id, worker_instance_id, worker_epoch, hostname, pid, lock_backend_pid, "
+    "app_version, started_at, heartbeat_at) VALUES (1, gen_random_uuid(), 7, 'h', 1, 1, 'v', now(), now())"
+)
+_RECORDED_HOLDER = "SELECT worker_epoch, worker_instance_id, lock_backend_pid FROM worker_heartbeat"
+
+
+@pytest.mark.parametrize("table", ["earlier_row", "empty"])
+async def test_a_claimant_that_lost_its_lock_after_the_check_cannot_evict_the_next_holder(
+    engine, worker_lock, make_config, migrated, monkeypatch, table
+) -> None:
+    if table == "earlier_row":
+        pg_one(migrated, "app", _EARLIER_WORKERS_ROW)
+    pause = PausePoint("takeover.before_epoch_write")
+    monkeypatch.setattr(epoch_module, "afault_point", pause)
+    a = WorkerIdentity(uuid.uuid4(), "a", 1, worker_lock.backend_pid, "v")
+    a_claim = asyncio.create_task(claim_epoch_and_sweep(engine, a))
+    # A proved it holds the lock (under the row lock) and waits before its epoch write ...
+    await asyncio.wait_for(pause.reached.wait(), 5)
+    # ... while its lock session dies, so B can take the lock and claim.
+    pg_one(migrated, "superuser", "SELECT pg_terminate_backend(%s, 5000)", worker_lock.backend_pid)
+    b_session = LockSession(make_config("worker", migrated).dsn("psycopg"))
+    try:
+        b_session.connect()
+        wait_until(b_session.try_lock, 5)
+        b = WorkerIdentity(uuid.uuid4(), "b", 2, b_session.backend_pid or 0, "v")
+        b_claim = asyncio.create_task(claim_epoch_and_sweep(engine, b))
+        try:
+            await await_until(lambda: blocked_or_done(migrated, b_claim), 5)
+            b_waited = not b_claim.done()  # B's claim waits for A's, instead of committing before it
+        finally:
+            pause.resume()
+        a_epoch, _ = await asyncio.wait_for(a_claim, 5)
+        b_epoch, _ = await asyncio.wait_for(b_claim, 5)
+        # B claimed last: its epoch is the newest and the row records B, so B's heartbeat still holds.
+        assert (b_epoch > a_epoch, pg_one(migrated, "app", _RECORDED_HOLDER)) == (
+            True,
+            (b_epoch, b.instance_id, b.lock_backend_pid),
+        )
+        assert b_session.heartbeat(b.instance_id, b_epoch) is True
+        assert b_waited
+    finally:
+        b_session.close()
