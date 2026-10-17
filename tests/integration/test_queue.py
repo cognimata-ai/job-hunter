@@ -143,14 +143,14 @@ async def test_task_app_statements_commit_as_they_end(queue_app) -> None:
     assert await queue_app.job_manager.list_jobs_to_abort_async() == []  # the pool still serves procrastinate
 
 
-def test_the_sync_connector_derived_from_the_task_app_is_autocommit_too(make_config) -> None:
+def test_the_sync_connector_derived_from_the_task_app_is_autocommit_too(make_config, migrated) -> None:
     """procrastinate derives a sync connector from the same pool arguments (an unopened app used
     synchronously): `configure` must work there too, not leave a coroutine unawaited (fix round 1, item 5)."""
     from jobhunter.worker.tasks import _new_app
     from procrastinate.sync_psycopg_connector import SyncPsycopgConnector
     from psycopg import pq
 
-    sync = _new_app(make_config("worker").dsn("psycopg"), 1).connector.get_sync_connector()
+    sync = _new_app(make_config("worker", migrated).dsn("psycopg"), 1).connector.get_sync_connector()
     assert isinstance(sync, SyncPsycopgConnector)
     sync.open()
     try:
