@@ -9,9 +9,11 @@
    match is `unique`; several are `ambiguous` and keep every candidate (the most populous is never picked);
    none is `unresolved` and kept as a label. A trailing parenthetical (`Berlin (Stepstone)`,
    `Remote (Germany)`) is dropped unless the part is a place name with it (`Frankfurt (Oder)`); a trailing
-   `, <country>` (`Berlin, Germany`, `Zürich, Schweiz`) selects the candidates in that country. Other comma
-   parts stay unresolved: a comma separates a list as often as it qualifies a name, and guessing would lose
-   locations;
+   `, <country>` (`Berlin, Germany`, `Zürich, Schweiz`) selects the candidates in that country, but only after
+   a single place name: a list, a country, a state or a marker in front of it (`Deutschland, Österreich`,
+   `Remote, Austria`) stays unresolved. Other comma parts stay unresolved too: a comma separates a list as
+   often as it qualifies a name, and guessing would lose locations. A federal state (`Sachsen`, `NRW`; not the
+   city-states) is a region, never the town of that name: it is unresolved and never foreign;
 4. `Remote`, `Homeoffice`, `Deutschlandweit` and `Beliebiger Ort` are markers, not places: they set `kind`.
 
 `ParsedLocations.positively_non_de` is the §5.3.4 evidence for `OutOfScope('not_germany')`: every part names
@@ -50,6 +52,45 @@ _HAS_CONTENT: Final = re.compile(r"\w")
 _REMOTE: Final = frozenset({"remote", "homeoffice", "home office", "home-office"})
 _COUNTRY_WIDE: Final = frozenset({"deutschlandweit", "bundesweit", "beliebiger ort", "anywhere"})
 _GERMANY_NAMES: Final = frozenset({"deutschland", "germany", "bundesrepublik deutschland"})
+# The federal states, folded, in German and English. A state is a region, not a place: `Sachsen` must not
+# become the village Sachsen bei Ansbach, nor `Brandenburg` the town Brandenburg an der Havel. The city-states
+# Berlin, Hamburg and Bremen are left out; they are places.
+_LAND_NAMES: Final = frozenset(
+    {
+        "baden-wurttemberg",
+        "baden-wuerttemberg",
+        "baden wurttemberg",
+        "bayern",
+        "freistaat bayern",
+        "bavaria",
+        "brandenburg",
+        "hessen",
+        "hesse",
+        "mecklenburg-vorpommern",
+        "mecklenburg vorpommern",
+        "mecklenburg-western pomerania",
+        "niedersachsen",
+        "lower saxony",
+        "nordrhein-westfalen",
+        "nordrhein westfalen",
+        "north rhine-westphalia",
+        "nrw",
+        "rheinland-pfalz",
+        "rheinland pfalz",
+        "rhineland-palatinate",
+        "saarland",
+        "sachsen",
+        "freistaat sachsen",
+        "saxony",
+        "sachsen-anhalt",
+        "saxony-anhalt",
+        "schleswig-holstein",
+        "thuringen",
+        "thueringen",
+        "freistaat thuringen",
+        "thuringia",
+    }
+)
 
 
 class Candidate(BaseModel):
@@ -195,18 +236,35 @@ def _resolve_postal_code(gaz: Gazetteer, code: str) -> list[Candidate] | None:
 def _resolve_name(gaz: Gazetteer, text: str, country_hint: str | None) -> tuple[list[Candidate], bool]:
     """The candidates of a place name and whether the text positively names somewhere outside Germany."""
     folded = fold(text)
+    if folded in _LAND_NAMES:
+        return [], False
     candidates = _by_name(gaz, folded)
     country = _country_of(gaz, folded)
     if not candidates and country is None:
         head, comma, tail = text.rpartition(",")
         qualifier = _country_of(gaz, fold(tail)) if comma else None
         if qualifier is not None:
-            candidates = _by_name(gaz, fold(head))
+            # `<place>, <country>` only. A head that is a list, a country, a state or a marker (`Deutschland,
+            # Österreich`, `Berlin, Hamburg, Austria`, `Remote, Austria`) says nothing about one place.
+            head_folded = fold(head)
+            if not head_folded or "," in head or _is_not_a_place(gaz, head_folded):
+                return [], False
+            candidates = _by_name(gaz, head_folded)
             country = qualifier
     candidates = _in_country(_in_country(candidates, country), country_hint)
     if candidates:
         return candidates, all(c.country_code != GERMANY for c in candidates)
     return [], country is not None and country != GERMANY
+
+
+def _is_not_a_place(gaz: Gazetteer, folded: str) -> bool:
+    """A country, a federal state or a marker."""
+    return (
+        _country_of(gaz, folded) is not None
+        or folded in _LAND_NAMES
+        or folded in _REMOTE
+        or folded in _COUNTRY_WIDE
+    )
 
 
 def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | None) -> _Part:
@@ -218,6 +276,12 @@ def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | No
     if folded in _COUNTRY_WIDE:
         return _Part(None, "country_wide", False)
 
+    if (
+        pair := _COORDINATES.fullmatch(part)
+    ) is not None:  # before the postal code: `47.80331` holds a 5-digit run
+        point = location_from_coordinates(part, float(pair[1]), float(pair[2]), source=source)
+        return _Part(point, None, bool(point.candidates) and point.candidates[0].country_code != GERMANY)
+
     postal_code: str | None = None
     candidates: list[Candidate] | None = None
     name = part
@@ -225,9 +289,6 @@ def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | No
         postal_code = found.group()
         candidates = _resolve_postal_code(gaz, postal_code)
         name = norm_text(_POSTAL_CODE.sub(" ", part)).strip(" ,-")
-    if candidates is None and (pair := _COORDINATES.fullmatch(part)) is not None:
-        point = location_from_coordinates(part, float(pair[1]), float(pair[2]), source=source)
-        return _Part(point, None, bool(point.candidates) and point.candidates[0].country_code != GERMANY)
     non_de = False
     if candidates is None:
         candidates, non_de = _resolve_name(gaz, name, country_hint) if name else ([], False)

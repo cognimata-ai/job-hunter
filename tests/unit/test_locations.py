@@ -301,6 +301,95 @@ def test_a_country_qualifier_chooses_between_homonyms_across_borders() -> None:
     assert bergen_no.locations[0].resolution == "unique" and bergen_no.positively_non_de
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Deutschland, Österreich",
+        "Germany, Austria",
+        "Germany, Switzerland",
+        "Deutschland, Schweiz",
+        "Deutschland, Österreich, Schweiz",
+        "Berlin, Hamburg, Austria",
+        "Remote, Austria",
+        "Anywhere, Schweiz",
+        "Sachsen, Österreich",
+    ],
+)
+def test_a_comma_list_that_names_germany_or_a_place_or_a_marker_is_never_positively_foreign(
+    text: str,
+) -> None:
+    p = parse(text)
+    assert not p.positively_non_de, text
+    assert all(loc.resolution == "unresolved" for loc in p.locations), (
+        text
+    )  # nothing is guessed from the tail
+    assert positively_outside_germany(p.locations) is False
+
+
+def test_the_same_countries_in_a_list_with_und_or_slash_are_not_foreign_either() -> None:
+    for text in ("Deutschland und Österreich", "Deutschland / Schweiz", "Berlin; Hamburg; Austria"):
+        assert not parse(text).positively_non_de, text
+    m = parse("Deutschland, Österreich und Schweiz")  # the comma part is unresolved, the last part is foreign
+    assert m.kind == "multi" and not m.positively_non_de
+    assert [loc.resolution for loc in m.locations] == ["unresolved", "unresolved"]
+
+
+def test_a_country_qualifier_still_needs_only_a_single_head() -> None:
+    assert parse("Hintertux, Austria").positively_non_de and parse("Wien, Österreich").positively_non_de
+    assert not parse("Hintertux, Deutschland").positively_non_de
+    assert parse("Zürich, Schweiz; Wien, Österreich").positively_non_de
+
+
+STATES = [
+    "Sachsen",
+    "Brandenburg",
+    "Bayern",
+    "NRW",
+    "Thüringen",
+    "Hessen",
+    "Saarland",
+    "Niedersachsen",
+    "Freistaat Sachsen",
+    "Sachsen-Anhalt",
+    "Baden-Württemberg",
+    "Saxony",
+    "Bavaria",
+    "Lower Saxony",
+    "North Rhine-Westphalia",
+]
+
+
+@pytest.mark.parametrize("text", STATES)
+def test_a_federal_state_is_a_region_not_a_place(text: str) -> None:
+    p = parse(text)
+    (loc,) = p.locations
+    assert loc.resolution == "unresolved" and loc.candidates == [] and loc.label == text
+    assert not p.positively_non_de
+    assert parse(f"{text}, Deutschland").locations[0].candidates == []
+    assert parse(f"{text}, Germany").locations[0].resolution == "unresolved"
+
+
+def test_a_federal_state_next_to_a_city_leaves_only_the_city_resolved() -> None:
+    p = parse("Berlin/Brandenburg")
+    assert [(loc.label, loc.resolution) for loc in p.locations] == [
+        ("Berlin", "unique"),
+        ("Brandenburg", "unresolved"),
+    ]
+    assert [(loc.label, loc.resolution) for loc in parse("Dresden; Sachsen").locations] == [
+        ("Dresden", "unique"),
+        ("Sachsen", "unresolved"),
+    ]
+    assert not parse("Zürich / Sachsen").positively_non_de
+
+
+def test_the_city_states_and_towns_named_like_a_state_remain_places() -> None:
+    for text in ("Berlin", "Hamburg", "Bremen", "Brandenburg an der Havel", "Sachsen bei Ansbach"):
+        (loc,) = parse(text).locations
+        assert loc.resolution in ("unique", "ambiguous") and loc.candidates, text
+    assert parse("Sachsen (Dresden)").locations[0].resolution == "unresolved"
+    assert parse_jsearch_location(None, "Sachsen", "DE").locations[0].resolution == "unresolved"
+
+
 # --- coordinates ------------------------------------------------------------------------------
 
 
@@ -310,6 +399,18 @@ def test_coordinates_in_text_are_a_unique_location() -> None:
     assert loc.resolution == "unique" and loc.candidates[0].country_code == "DE" and not p.positively_non_de
     assert (loc.candidates[0].lat, loc.candidates[0].lon) == (52.52, 13.405)
     assert parse("47.3769, 8.5417").positively_non_de  # Zürich
+
+
+def test_coordinates_whose_fraction_looks_like_a_postal_code_are_still_coordinates() -> None:
+    munich_code = parse("47.80331, 8.54170")  # "80331" is the postal code of München
+    (loc,) = munich_code.locations
+    assert loc.postal_code is None and loc.label == "47.80331, 8.54170" and loc.resolution == "unique"
+    assert (loc.candidates[0].lat, loc.candidates[0].lon) == (47.80331, 8.5417)
+    berlin_code = parse("48.10115, 11.57549")  # "10115" is the postal code of Berlin; the point is in Munich
+    (loc,) = berlin_code.locations
+    assert loc.postal_code is None and loc.candidates[0].gazetteer_id != "geonames:2950159"
+    assert (loc.candidates[0].lat, loc.candidates[0].lon) == (48.10115, 11.57549)
+    assert not berlin_code.positively_non_de and loc.candidates[0].country_code == "DE"
 
 
 def test_coordinates_take_the_id_and_country_of_the_closest_known_place() -> None:
