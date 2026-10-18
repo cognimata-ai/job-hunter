@@ -591,3 +591,50 @@ def test_the_cli_exits_78_for_a_public_origin_with_a_path(tmp_path: Path) -> Non
     assert r.returncode == 78
     (line,) = r.stdout.splitlines()
     assert json.loads(line)["check"] == "public_origin"
+
+
+# --- M1 Task 5: fake sources, the fixtures directory, the embedder URL and the User-Agent ------------------
+
+
+@pytest.mark.parametrize("value", ["1", "yes", ""])  # set to anything, the empty string included
+def test_fake_sources_is_set_by_the_variable_being_present(tmp_path: Path, value: str) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_FAKE_SOURCES": value}
+    assert load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)).fake_sources is True
+
+
+def test_m1_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg = load_config("worker", BASE_ENV, write_secrets(tmp_path / "s", **WORKER_SECRETS))
+    assert cfg.fake_sources is False
+    assert (
+        cfg.fixtures_dir == (tmp_path / "tests/contract/fixtures").resolve()
+        and cfg.fixtures_dir.is_absolute()
+    )
+    assert cfg.embedder_url == "http://embedder:8080"
+    assert cfg.http_user_agent == "JobHunter/1.0 (personal job search)"
+
+
+def test_m1_settings_from_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    env = {
+        **BASE_ENV,
+        "JOBHUNTER_FIXTURES_DIR": "fx",
+        "JOBHUNTER_EMBEDDER_URL": "http://127.0.0.1:9000",
+        "JOBHUNTER_HTTP_USER_AGENT": "JobHunter/test",
+    }
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS))
+    assert (cfg.fixtures_dir, cfg.embedder_url, cfg.http_user_agent) == (
+        (tmp_path / "fx").resolve(),
+        "http://127.0.0.1:9000",
+        "JobHunter/test",
+    )
+
+
+def test_fake_sources_are_still_refused_in_prod(tmp_path: Path) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "JOBHUNTER_FAKE_SOURCES": "1"}
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)))
+    assert (exc.value.check, exc.value.detail) == (
+        "fake_mode_in_prod",
+        "JOBHUNTER_FAKE_SOURCES must not be set in prod",
+    )

@@ -32,6 +32,10 @@ EnvName = Literal["prod", "dev", "test"]
 STARTUP_FAILED_EXIT_CODE: Final = 78
 DEFAULT_SECRETS_DIR: Final = Path("/run/secrets")
 LANGSMITH_EU_ENDPOINT: Final = "https://eu.api.smith.langchain.com"
+# M1 (spec §5.2, §19.2; plan Deviation 5): the fixtures served in fake mode, the embedder and the User-Agent.
+DEFAULT_FIXTURES_DIR: Final = Path("tests/contract/fixtures")
+DEFAULT_EMBEDDER_URL: Final = "http://embedder:8080"
+DEFAULT_HTTP_USER_AGENT: Final = "JobHunter/1.0 (personal job search)"
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
@@ -117,6 +121,12 @@ class AppConfig:
     public_origin: str | None
     log_level: str
     fault: str | None
+    # `JOBHUNTER_FAKE_SOURCES` set to anything (the empty string included): every adapter is served from
+    # `fixtures_dir` (dev and test only; `fake_mode_in_prod` refuses it in prod).
+    fake_sources: bool
+    fixtures_dir: Path
+    embedder_url: str
+    http_user_agent: str
     # Neither mapping appears in repr(): a config that is logged or shown in a traceback must not leak.
     secrets: Mapping[str, bytes] = field(repr=False)
     environ: Mapping[str, str] = field(repr=False)
@@ -217,6 +227,11 @@ def load_config(
         public_origin=env.get("JOBHUNTER_PUBLIC_ORIGIN") or None,
         log_level=(env.get("JOBHUNTER_LOG_LEVEL") or "INFO").upper(),
         fault=env.get("JOBHUNTER_FAULT") or None,
+        fake_sources="JOBHUNTER_FAKE_SOURCES" in env,
+        # A relative directory (the default included) is resolved from the current directory.
+        fixtures_dir=Path(env.get("JOBHUNTER_FIXTURES_DIR") or DEFAULT_FIXTURES_DIR).resolve(),
+        embedder_url=env.get("JOBHUNTER_EMBEDDER_URL") or DEFAULT_EMBEDDER_URL,
+        http_user_agent=env.get("JOBHUNTER_HTTP_USER_AGENT") or DEFAULT_HTTP_USER_AGENT,
         secrets=MappingProxyType(contents),
         environ=MappingProxyType(env),
         secrets_dir=secrets_dir,

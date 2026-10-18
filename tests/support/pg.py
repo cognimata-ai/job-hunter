@@ -30,6 +30,8 @@ PgRole = Literal["superuser", "migrator", "app", "backup", "restore"]
 _REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 _IMAGES_LOCK: Final = _REPO_ROOT / "deploy" / "images.lock"
 _POSTGRES_DIR: Final = _REPO_ROOT / "deploy" / "postgres"
+# The scrubbed fixtures a test worker is served from (M1: `JOBHUNTER_FAKE_SOURCES`, no provider key needed).
+FIXTURES_DIR: Final = _REPO_ROOT / "tests" / "contract" / "fixtures"
 
 # Database user and secret file (in the container's /run/secrets) of every PgRole.
 _DB_USER: Final[Mapping[PgRole, str]] = MappingProxyType(
@@ -368,7 +370,15 @@ def restart_pg_server(server: PgServer) -> None:
 
 
 def server_env(server: PgServer, role: Role, **env: str) -> dict[str, str]:
-    """The `JOBHUNTER_*` environment of `role` against `server`; `env` adds to it or overrides it."""
+    """The `JOBHUNTER_*` environment of `role` against `server`; `env` adds to it or overrides it.
+
+    The worker is in fake mode: its sources are served from `FIXTURES_DIR` (it has no provider secret).
+    """
+    fake_sources = (
+        {"JOBHUNTER_FAKE_SOURCES": "1", "JOBHUNTER_FIXTURES_DIR": str(FIXTURES_DIR)}
+        if role == "worker"
+        else {}
+    )
     return {
         "JOBHUNTER_ENV": "test",
         "JOBHUNTER_DB_HOST": server.host,
@@ -376,6 +386,7 @@ def server_env(server: PgServer, role: Role, **env: str) -> dict[str, str]:
         "JOBHUNTER_DB_NAME": _DB_NAME,
         "JOBHUNTER_PUBLIC_ORIGIN": "https://testserver",
         "JOBHUNTER_SECRETS_DIR": str(server.secrets_dir(role)),
+        **fake_sources,
         **env,
     }
 
