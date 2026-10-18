@@ -141,6 +141,8 @@ def image_check(head: str) -> str:
             "assert r.files('jobhunter.db').joinpath('seed_data/settings_v1.json').is_file()",
             f"assert r.files('jobhunter.db').joinpath('migrations/versions/{head}.py').is_file()",
             "assert r.files('jobhunter.auth').joinpath('common_passwords.txt').is_file()",
+            "assert r.files('jobhunter.geo').joinpath('data/de_places.tsv').is_file()",
+            "assert r.files('jobhunter.geo').joinpath('data/non_de_places.tsv').is_file()",
             f"assert code_head() == {head!r}, code_head()",
             "assert not pathlib.Path('/src').exists()",
             "assert os.getuid() == 10001, os.getuid()",
