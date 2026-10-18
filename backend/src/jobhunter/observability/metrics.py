@@ -26,6 +26,19 @@ TABLE_BYTES = Gauge(
     "jobhunter_table_bytes", "Size of a database table in bytes.", ["table"], registry=REGISTRY
 )
 ALERTS_OPEN = Gauge("jobhunter_alerts_open", "Open alerts by severity.", ["severity"], registry=REGISTRY)
+# The provider's current quota window (§6.3); the ledger's reservation and settlement set them (M1 Task 8).
+QUOTA_USED_UNITS = Gauge(
+    "jobhunter_quota_used_units",
+    "Counted units of the provider's current quota window.",
+    ["provider"],
+    registry=REGISTRY,
+)
+QUOTA_REMAINING_UNITS = Gauge(
+    "jobhunter_quota_remaining_units",
+    "Units left in the provider's current quota window (limit minus counted units).",
+    ["provider"],
+    registry=REGISTRY,
+)
 
 
 def start_metrics_server(port: int) -> None:

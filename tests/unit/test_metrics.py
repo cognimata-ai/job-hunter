@@ -19,6 +19,14 @@ def test_series_names() -> None:
         assert name in text
 
 
+def test_quota_gauges_are_labelled_by_provider() -> None:
+    metrics.QUOTA_USED_UNITS.labels(provider="jsearch").set(12)
+    metrics.QUOTA_REMAINING_UNITS.labels(provider="jsearch").set(188)
+    text = generate_latest(metrics.REGISTRY).decode()
+    assert 'jobhunter_quota_used_units{provider="jsearch"} 12.0' in text
+    assert 'jobhunter_quota_remaining_units{provider="jsearch"} 188.0' in text
+
+
 def test_metrics_live_on_a_dedicated_registry() -> None:
     assert metrics.REGISTRY is not GLOBAL_REGISTRY
     assert "jobhunter_" not in generate_latest(GLOBAL_REGISTRY).decode()

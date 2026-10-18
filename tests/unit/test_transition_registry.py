@@ -75,6 +75,8 @@ NO_DATABASE = cast("AsyncConnection", NoDatabase())
         ("runs", ["running"], "succeeded", {"set_": {"status_reason": "x"}}, "cannot be set"),
         ("runs", ["running"], "succeeded", {"set_": {"id": 2}}, "cannot be set"),
         ("runs", ["running"], "succeeded", {"set_": {"report = '{}', status": "queued"}}, "cannot be set"),
+        # Keyed by (provider, window_start), without an id: refused here, not by the database (Ruling P11).
+        ("quota_windows", ["validated"], "exhausted_until_reset", {}, r"quota\.windows\.save_window"),
     ],
 )
 async def test_calls_the_registry_refuses_never_reach_the_database(table, froms, to, kwargs, message) -> None:

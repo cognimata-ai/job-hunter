@@ -312,6 +312,12 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
 )
 
 
+# Registered machines whose rows `transition()` cannot address (no `id`), with the function that writes them.
+_WRITTEN_ELSEWHERE: Final[Mapping[str, str]] = MappingProxyType(
+    {"quota_windows": "jobhunter.quota.windows.save_window"}
+)
+
+
 @cache
 def _table(name: str) -> sa.TableClause:
     """A lightweight table object over the registry columns of `name` (only registered names get here)."""
@@ -394,14 +400,19 @@ async def transition(
     predicate, two callers that both name `running` as the from-state both match, and the last one wins. A
     caller that needs exclusivity (a takeover that must beat its rival) passes the owner.
 
-    Raises `ValueError`, before touching the database, for a table or an edge the registry does not know, an
-    owner key that is not an ownership column, and a `set_` key that is not settable or that the transition
-    clears. Raises `TransitionConflict` when no row matched: it is absent, in another state, or owned by
-    another attempt or claim. The caller decides what that means.
+    Raises `ValueError`, before touching the database, for a table or an edge the registry does not know, a
+    table whose rows have no `id` (`quota_windows`: `windows.save_window` writes its state), an owner key that
+    is not an ownership column, and a `set_` key that is not settable or that the transition clears. Raises
+    `TransitionConflict` when no row matched: it is absent, in another state, or owned by another attempt or
+    claim. The caller decides what that means.
     """
     spec = TRANSITIONS.get(table)
     if spec is None:
         raise ValueError(f"unknown table {table!r}: it has no state machine")
+    if (writer := _WRITTEN_ELSEWHERE.get(table)) is not None:
+        raise ValueError(
+            f"{table} has no id, so transition() cannot update it: its state is written by {writer}"
+        )
     owner = owner or {}
     set_ = set_ or {}
     cleared = _validate(spec, from_states, to_state, reason, owner, set_)
