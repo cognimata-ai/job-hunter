@@ -1,3 +1,4 @@
+import asyncio
 from datetime import timedelta
 from typing import Any
 
@@ -5,6 +6,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
+from jobhunter.dedup import identity, merge
 from jobhunter.dedup.merge import merge_jobs, resolve_conflict, unmerge
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.normalize.keys import AdKey
@@ -13,11 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.collect import (
     STEPSTONE_1,
     STEPSTONE_2,
+    job_lockable,
     key_pair,
     pending_item,
     queued_run,
     resolved,
 )
+from tests.support.faults import PausePoint
 
 pytestmark = pytest.mark.integration
 
@@ -86,7 +90,7 @@ async def test_unmerge_restores_postings_keys_and_blocks_a_remerge(engine, curre
     gen = await generation(engine)
 
     async with engine.begin() as c:
-        reversal = await unmerge(c, event.id, now=utcnow())
+        reversal = await unmerge(c, event.id)
     assert await scalar(engine, "SELECT merged_into_job_id FROM jobs WHERE id = :b", b=pair.b) is None
     assert await scalar(engine, "SELECT job_id FROM postings WHERE id = :p", p=pair.posting_b) == pair.b
     assert await scalar(engine, "SELECT job_id FROM postings WHERE id = :p", p=pair.posting_a) == pair.a
@@ -143,10 +147,10 @@ async def test_unmerge_restores_postings_keys_and_blocks_a_remerge(engine, curre
     # an event is reversed once, and an unmerge event is not a merge
     with pytest.raises(InvariantViolation):
         async with engine.begin() as c:
-            await unmerge(c, event.id, now=utcnow())
+            await unmerge(c, event.id)
     with pytest.raises(InvariantViolation):
         async with engine.begin() as c:
-            await unmerge(c, reversal, now=utcnow())
+            await unmerge(c, reversal)
 
 
 async def test_resolve_conflict_separate_and_merge(engine, current_epoch) -> None:
@@ -166,7 +170,7 @@ async def test_resolve_conflict_separate_and_merge(engine, current_epoch) -> Non
     gen = await generation(engine)
 
     async with engine.begin() as c:
-        await resolve_conflict(c, first.id, "separate", now=utcnow())
+        await resolve_conflict(c, first.id, "separate")
     [separated] = await fetch(engine, CONFLICTS)
     assert (separated.status, separated.resolved_at is not None) == ("resolved_separate", True)
     assert await fetch(engine, sa.text("SELECT job_a, job_b, decision, source FROM dedup_decisions")) == [
@@ -200,7 +204,7 @@ async def test_resolve_conflict_separate_and_merge(engine, current_epoch) -> Non
     assert (second.status, second.posting_job_id, second.candidate_job_ids) == ("open", y, [pair.a])
     gen = await generation(engine)
     async with engine.begin() as c:
-        await resolve_conflict(c, second.id, "merge", now=utcnow())
+        await resolve_conflict(c, second.id, "merge")
     merged = (await fetch(engine, CONFLICTS))[1]
     assert merged.status == "resolved_merged" and merged.resolved_at is not None
     assert (await fetch(engine, CONFLICTS))[0].status == "resolved_separate"  # history is not rewritten
@@ -217,7 +221,7 @@ async def test_resolve_conflict_separate_and_merge(engine, current_epoch) -> Non
     assert resolved_at is not None and await generation(engine) == gen + 1
     with pytest.raises(InvariantViolation):  # a resolved conflict stays resolved
         async with engine.begin() as c:
-            await resolve_conflict(c, second.id, "separate", now=utcnow())
+            await resolve_conflict(c, second.id, "separate")
 
 
 async def test_the_merged_jobs_field_conflict_alert_is_resolved_and_reopens_on_unmerge(
@@ -259,7 +263,7 @@ async def test_the_merged_jobs_field_conflict_alert_is_resolved_and_reopens_on_u
     assert await fetch(engine, ALERT, k=key_a) == [("info", None)]  # A carries the conflict now
 
     async with engine.begin() as c:
-        await unmerge(c, event.id, now=utcnow())
+        await unmerge(c, event.id)
     reopened = await fetch(engine, ALERT, k=key_b)
     assert len(reopened) == 2 and reopened[1] == ("info", None)  # B conflicts again on its own
     [(_, a_resolved)] = await fetch(engine, ALERT, k=key_a)
@@ -294,7 +298,6 @@ async def test_merge_takes_the_from_job_out_of_its_group_and_refuses_fenced_jobs
             into_job_id=jobs["A"],
             kind="user_confirmed_merge",
             evidence={},
-            now=utcnow(),
         )
         await merge_jobs(
             c,
@@ -302,7 +305,6 @@ async def test_merge_takes_the_from_job_out_of_its_group_and_refuses_fenced_jobs
             into_job_id=jobs["A"],
             kind="user_confirmed_merge",
             evidence={},
-            now=utcnow(),
         )
         await ranking.bump(c)
     [snapshot] = await fetch(engine, sa.text("SELECT evidence FROM merge_events WHERE id = :e"), e=event)
@@ -364,7 +366,6 @@ async def test_merge_takes_the_from_job_out_of_its_group_and_refuses_fenced_jobs
                 into_job_id=jobs["A"],
                 kind="user_confirmed_merge",
                 evidence={},
-                now=utcnow(),
             )
     with pytest.raises(InvariantViolation):  # a merged job is never merged again
         async with engine.begin() as c:
@@ -374,5 +375,163 @@ async def test_merge_takes_the_from_job_out_of_its_group_and_refuses_fenced_jobs
                 into_job_id=jobs["C"],
                 kind="user_confirmed_merge",
                 evidence={},
-                now=utcnow(),
             )
+
+
+async def jsearch_jobs(
+    engine: AsyncEngine, owner: Any, at: Any, *native_ids: str, **overrides: Any
+) -> list[int]:
+    """One JSearch job per native id, resolved in that order (so their ids ascend), an hour apart."""
+    jobs: list[int] = []
+    for hours, native_id in enumerate(native_ids):
+        item = await pending_item(
+            engine,
+            owner,
+            "jsearch",
+            {"native_id": native_id, **overrides},
+            fetched_at=at + timedelta(hours=hours),
+        )
+        assert await resolved(engine, owner, item) == "linked"
+        jobs.append((await job_of(engine, item))[1])
+    return jobs
+
+
+async def group_of(engine: AsyncEngine, representative: int, members: tuple[int, ...]) -> int:
+    async with engine.begin() as c:
+        group = int((await c.execute(GROUP, {"rep": representative})).scalar_one())
+        for job in members:
+            await c.execute(MEMBER, {"g": group, "j": job})
+            await c.execute(IN_GROUP, {"g": group, "j": job})
+    return group
+
+
+async def test_step_5_locks_a_lower_id_member_in_the_one_ordered_statement(
+    engine, current_epoch, monkeypatch
+) -> None:
+    """Ruling T18-c: the member a dissolving group leaves behind has a lower id than both merge jobs; its row
+    is locked by the ordered statement, before the owner row, and never lazily."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=8)
+    member, a, b, unrelated = await jsearch_jobs(engine, owner, at, "GM", "HA", "HB", "GU")
+    assert member < a < b
+    group = await group_of(engine, b, (b, member))
+    calls: list[tuple[list[int], list[int], list[int]]] = []
+    real_lock = merge.lock_jobs
+
+    async def recording(conn, job_ids, *, with_groups_of=()):
+        locked = await real_lock(conn, job_ids, with_groups_of=with_groups_of)
+        calls.append((sorted(job_ids), sorted(with_groups_of), sorted(locked)))
+        return locked
+
+    monkeypatch.setattr(merge, "lock_jobs", recording)
+    pause = PausePoint(identity.IN_ITEM_TX)
+    monkeypatch.setattr(identity, "afault_point", pause)
+    linking = await pending_item(
+        engine,
+        owner,
+        "arbeitnow",
+        {"raw_keys": (AdKey("htidocid", "HA"), AdKey("htidocid", "HB"))},
+        fetched_at=at + timedelta(hours=5),
+    )
+    resolving = asyncio.create_task(resolved(engine, owner, linking))
+    await asyncio.wait_for(pause.reached.wait(), 10)
+    # the identity transaction holds the member's row, and only the rows it needs
+    assert [await job_lockable(engine, job) for job in (member, a, b, unrelated)] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+    pause.resume()
+    assert await asyncio.wait_for(resolving, 10) == "linked"
+    assert calls == [([a, b], [b], [member, a, b])]  # one statement, ascending: the member first
+    assert await scalar(engine, "SELECT status FROM duplicate_groups WHERE id = :g", g=group) == "dissolved"
+    assert await scalar(engine, "SELECT count(*) FROM duplicate_group_members") == 0
+    assert await scalar(engine, "SELECT duplicate_group_id FROM jobs WHERE id = :m", m=member) is None
+
+    # the assertion path: a caller that did not lock a member gets InvariantViolation, and nothing is written
+    y, x = await jsearch_jobs(engine, owner, at + timedelta(hours=6), "GY", "GX")
+    other = await group_of(engine, x, (x, y))
+    with pytest.raises(InvariantViolation, match="not locked"):
+        async with engine.begin() as c:
+            await merge.lock_jobs(c, (x, a))
+            await merge_jobs(
+                c, from_job_id=x, into_job_id=a, kind="user_confirmed_merge", evidence={}, locked=(x, a)
+            )
+    assert await scalar(engine, "SELECT status FROM duplicate_groups WHERE id = :g", g=other) == "active"
+    assert await scalar(engine, "SELECT merged_into_job_id FROM jobs WHERE id = :x", x=x) is None
+    assert (
+        await scalar(engine, "SELECT count(*) FROM duplicate_group_members WHERE group_id = :g", g=other) == 2
+    )
+
+
+async def test_resolve_conflict_judges_the_posting_jobs_pairs_and_merges_every_candidate(
+    engine, current_epoch
+) -> None:
+    """Ruling T18-e and Minor 8: a conflict with two candidates."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=8)
+    a = (await jsearch_jobs(engine, owner, at, "H1", primary_link=STEPSTONE_1))[0]
+    b = (await jsearch_jobs(engine, owner, at + timedelta(hours=1), "H2", primary_link=STEPSTONE_2))[0]
+    both = {"raw_keys": (AdKey("htidocid", "H1"), AdKey("htidocid", "H2"))}
+    first = await pending_item(engine, owner, "arbeitnow", both, fetched_at=at + timedelta(hours=2))
+    assert await resolved(engine, owner, first) == "linked"
+    _, x = await job_of(engine, first)
+    [conflict] = await fetch(engine, CONFLICTS)
+    assert (conflict.posting_job_id, conflict.candidate_job_ids) == (x, [a, b])
+    async with engine.begin() as c:
+        await resolve_conflict(c, conflict.id, "separate")
+    # the user judged the posting's job against each candidate, not the candidates against each other
+    assert await fetch(engine, sa.text("SELECT job_a, job_b FROM dedup_decisions ORDER BY job_a, job_b")) == [
+        (a, x),
+        (b, x),
+    ]
+
+    second = await pending_item(engine, owner, "arbeitnow", both, fetched_at=at + timedelta(hours=3))
+    assert await resolved(engine, owner, second) == "linked"  # A and B are not judged apart: a new conflict
+    _, y = await job_of(engine, second)
+    later = (await fetch(engine, CONFLICTS))[1]
+    assert (later.status, later.posting_job_id, later.candidate_job_ids) == ("open", y, [a, b])
+    async with engine.begin() as c:
+        await resolve_conflict(c, later.id, "merge")
+    events = await fetch(engine, EVENTS)
+    assert [(e.kind, e.from_job_id, e.into_job_id) for e in events] == [
+        ("user_confirmed_merge", a, y),
+        ("user_confirmed_merge", b, y),
+    ]
+    assert (await fetch(engine, CONFLICTS))[1].status == "resolved_merged"
+    assert (await fetch(engine, CONFLICTS))[0].status == "resolved_separate"
+    merged = await fetch(
+        engine, sa.text("SELECT id, merged_into_job_id FROM jobs WHERE id = ANY(:ids)"), ids=[a, b]
+    )
+    assert {r.id: r.merged_into_job_id for r in merged} == {a: y, b: y}
+    # every key moved to Y: X's posting supplied only keys A and B owned
+    assert set((await owners(engine)).values()) == {y}
+
+
+async def test_no_eligible_member_left_records_no_active_member(engine, current_epoch) -> None:
+    """Minor 8: the representative leaves and every other member is closed."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=8)
+    a, rep, closed_one, closed_two = await jsearch_jobs(engine, owner, at, "NA", "NR", "N1", "N2")
+    group = await group_of(engine, rep, (rep, closed_one, closed_two))
+    async with engine.begin() as c:
+        await c.execute(
+            sa.text("UPDATE jobs SET availability = 'closed' WHERE id = ANY(:ids)"),
+            {"ids": [closed_one, closed_two]},
+        )
+        await merge_jobs(c, from_job_id=rep, into_job_id=a, kind="user_confirmed_merge", evidence={})
+        await ranking.bump(c)
+    row = (
+        await fetch(
+            engine,
+            sa.text(
+                "SELECT status, representative_job_id, unscorable_reason, election_reason "
+                "FROM duplicate_groups"
+            ),
+        )
+    )[0]
+    assert tuple(row) == ("active", None, "no_active_member", "member_left")
+    assert (
+        await scalar(engine, "SELECT count(*) FROM duplicate_group_members WHERE group_id = :g", g=group) == 2
+    )

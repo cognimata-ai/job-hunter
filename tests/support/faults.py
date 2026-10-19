@@ -29,3 +29,19 @@ class PausePoint:
 
     def resume(self) -> None:
         self._resumed.set()
+
+
+class PausePoints:
+    """An `afault_point` replacement holding the first arrival at each of several points (`PausePoint`s):
+    `pauses[point].reached` and `pauses[point].resume()`."""
+
+    def __init__(self, *points: str) -> None:
+        self._points = {point: PausePoint(point) for point in points}
+
+    def __getitem__(self, point: str) -> PausePoint:
+        return self._points[point]
+
+    async def __call__(self, name: str) -> None:
+        pause = self._points.get(name)
+        if pause is not None:
+            await pause(name)

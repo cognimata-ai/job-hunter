@@ -7,10 +7,12 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.dedup.identity import resolve_deferred_items, resolve_run_items
+from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
+from jobhunter.graphs.collect.state import initial_state
 from jobhunter.worker.runs import finalize_run
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.support.collect import STEPSTONE_1, pending_item, queued_run, resolved
+from tests.support.collect import STEPSTONE_1, make_deps, pending_item, queued_run, resolved
 
 pytestmark = pytest.mark.integration
 
@@ -23,6 +25,16 @@ FENCE = sa.text(
     "VALUES (:kind, :source, CAST(:jobs AS bigint[]), 1) RETURNING id"
 )
 RELEASE = sa.text("UPDATE purge_fences SET released_at = now() WHERE id = :f")
+
+
+async def row_version(engine: AsyncEngine, raw_item_id: int) -> str:
+    """The raw item row's `xmin`: it changes with every update of the row."""
+    async with engine.connect() as c:
+        return str(
+            (
+                await c.execute(sa.text("SELECT xmin::text FROM raw_items WHERE id = :i"), {"i": raw_item_id})
+            ).scalar_one()
+        )
 
 
 async def item_row(engine: AsyncEngine, raw_item_id: int) -> tuple[Any, ...]:
@@ -91,7 +103,7 @@ async def test_source_fence_and_job_fence_dispositions(
     )
     async with engine.begin() as c:
         assert (await c.execute(sa.text("SELECT generation FROM ranking_state"))).scalar_one() == 2
-    counts = await resolve_run_items(engine, owner, now=utcnow(), clock=utcnow)
+    counts = await resolve_run_items(engine, owner, clock=utcnow)
     assert counts == {"deferred": 2}
     for item in (held, still):
         assert await item_row(engine, item) == ("deferred", "job_fenced", True, None)
@@ -104,10 +116,12 @@ async def test_source_fence_and_job_fence_dispositions(
     async with engine.begin() as c:
         await finalize_run(c, owner, status="succeeded", reason=None, report={})
     later = await queued_run(engine)
-    assert await resolve_deferred_items(engine, later, now=utcnow()) == {"deferred": 2}  # both still fenced
+    untouched = {item: await row_version(engine, item) for item in (held, still)}
+    assert await resolve_deferred_items(engine, later) == {}  # both still fenced: not selected
+    assert {item: await row_version(engine, item) for item in (held, still)} == untouched
     async with engine.begin() as c:
         await c.execute(RELEASE, {"f": h_fence})
-    assert await resolve_deferred_items(engine, later, now=utcnow()) == {"linked": 1, "deferred": 1}
+    assert await resolve_deferred_items(engine, later) == {"linked": 1}
     linked = await item_row(engine, held)
     assert (linked[0], linked[1], linked[2], linked[3] is not None) == ("linked", None, False, True)
     # the SerpApi posting is on the JSearch posting's job
@@ -118,10 +132,67 @@ async def test_source_fence_and_job_fence_dispositions(
         ).scalar_one()
     assert sources == ["jsearch", "serpapi"]
     assert await item_row(engine, still) == ("deferred", "job_fenced", True, None)  # stays deferred
+    assert await row_version(engine, still) == untouched[still]  # and is never touched
     assert await item_row(engine, adzuna) == ("out_of_scope", "source_purged", False, None)  # never deferred
     # the limit bounds a pass; items of the run itself are not "earlier"
-    assert await resolve_deferred_items(engine, later, now=utcnow(), limit=0) == {}
+    assert await resolve_deferred_items(engine, later, limit=0) == {}
     async with engine.begin() as c:
         await c.execute(RELEASE, {"f": k_fence})
         await c.execute(RELEASE, {"f": source_fence})
-    assert await resolve_deferred_items(engine, later, now=utcnow()) == {"linked": 1}
+    # node 6 of the later run counts the deferred pass apart from the run's own items (Minor 5)
+    node = make_resolve_identity(make_deps(engine, lambda instance: pytest.fail("no adapter is used")))
+    update = await node(initial_state(later.run_id, later.attempt_no))
+    counters = update["counters"]
+    assert (counters["deferred_relinked"], counters["deferred_still_fenced"], counters["jobs_created"]) == (
+        1,
+        0,
+        0,
+    )
+    assert [counters[f"raw_items_{d}"] for d in ("linked", "out_of_scope", "rejected", "deferred")] == [
+        0,
+        0,
+        0,
+        0,
+    ]
+    relinked = await item_row(engine, still)
+    assert relinked[:3] == ("linked", None, False) and relinked[3] is not None
+
+
+async def test_a_fenced_backlog_larger_than_the_limit_never_starves_a_released_item(
+    engine, current_epoch
+) -> None:
+    """Minor 1: the selection leaves the still-fenced items out before its `LIMIT`."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=6)
+    for native_id, hours in (("F", 0), ("R", 1)):  # F's job stays fenced, R's is released
+        item = await pending_item(
+            engine, owner, "jsearch", {"native_id": native_id}, fetched_at=at + timedelta(hours=hours)
+        )
+        assert await resolved(engine, owner, item) == "linked"
+    job_f, job_r = (
+        (await jobs_of_native(engine, "F"))["jsearch"],
+        (await jobs_of_native(engine, "R"))["jsearch"],
+    )
+    await fence(engine, "jobs", jobs=(job_f,))
+    r_fence = await fence(engine, "jobs", jobs=(job_r,))
+    backlog = [  # three fenced items, older than the released one, more than the pass's limit of 2
+        await pending_item(
+            engine, owner, "serpapi", {"native_id": "F"}, fetched_at=at + timedelta(hours=2 + n)
+        )
+        for n in range(3)
+    ]
+    released = await pending_item(
+        engine, owner, "serpapi", {"native_id": "R"}, fetched_at=at + timedelta(hours=5)
+    )
+    assert await resolve_run_items(engine, owner, clock=utcnow) == {"deferred": 4}
+    async with engine.begin() as c:
+        await finalize_run(c, owner, status="succeeded", reason=None, report={})
+        await c.execute(RELEASE, {"f": r_fence})
+    later = await queued_run(engine)
+    versions = {item: await row_version(engine, item) for item in backlog}
+    assert await resolve_deferred_items(engine, later, limit=2) == {"linked": 1}
+    assert (await item_row(engine, released))[0] == "linked"
+    assert await jobs_of_native(engine, "R") == {"jsearch": job_r, "serpapi": job_r}
+    for item in backlog:
+        assert await item_row(engine, item) == ("deferred", "job_fenced", True, None)
+    assert {item: await row_version(engine, item) for item in backlog} == versions

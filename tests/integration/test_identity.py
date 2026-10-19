@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from datetime import timedelta
 from typing import Any
@@ -6,7 +7,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.transitions import transition
-from jobhunter.dedup import revisions
+from jobhunter.dedup import identity, merge, revisions
 from jobhunter.dedup.identity import collect_keys, resolve_item, tombstone_key_hash
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.collect import (
     STEPSTONE_1,
     STEPSTONE_2,
+    job_lockable,
     key_pair,
     make_deps,
     pending_item,
@@ -24,6 +26,7 @@ from tests.support.collect import (
     resolved,
     supersede,
 )
+from tests.support.faults import PausePoints
 from tests.support.observations import normalized
 
 pytestmark = pytest.mark.integration
@@ -89,7 +92,7 @@ async def test_new_job_posting_observation_keys_revision_and_filters(engine, cur
         {"native_id": "UID1", "primary_link": "https://stepstone.de/x--14607704-inline.html"},
     )
     async with engine.begin() as c:
-        assert await resolve_item(c, owner=owner, raw_item_id=item, now=utcnow()) == "linked"
+        assert await resolve_item(c, owner=owner, raw_item_id=item) == "linked"
     async with engine.connect() as c:
         job = (
             await c.execute(
@@ -434,11 +437,16 @@ async def test_late_sighting_never_revives(engine, current_epoch) -> None:
     )
     # the job's availability derives from its postings
     assert await scalar(engine, "SELECT availability FROM jobs WHERE id = :j", j=posting.job_id) == "closed"
-    # a sighting after the change revives it
-    fresh = await pending_item(engine, owner, "jsearch", {"native_id": "UID3"})
+    # a sighting after the change revives it, changed at the sighting's own time (Ruling T18-d)
+    sighted = utcnow() - timedelta(minutes=5)
+    fresh = await pending_item(engine, owner, "jsearch", {"native_id": "UID3"}, fetched_at=sighted)
     assert await resolved(engine, owner, fresh) == "linked"
     [revived] = await fetch(engine, POSTING, p=posting_id)
-    assert (revived.availability, revived.seen_count) == ("active", 3)
+    assert (revived.availability, revived.seen_count, revived.availability_changed_at) == (
+        "active",
+        3,
+        sighted,
+    )
     assert (
         await scalar(engine, "SELECT availability_reason FROM postings WHERE id = :p", p=posting_id) is None
     )
@@ -451,7 +459,7 @@ async def test_superseded_owner_is_fenced(engine, current_epoch, queue_app) -> N
     await supersede(engine, owner)
     with pytest.raises(FencedOut):
         async with engine.begin() as c:
-            await resolve_item(c, owner=owner, raw_item_id=item, now=utcnow())
+            await resolve_item(c, owner=owner, raw_item_id=item)
     assert await scalar(engine, "SELECT count(*) FROM jobs") == 0
     assert tuple((await fetch(engine, ITEM, i=item))[0]) == ("pending", None, None, False)
 
@@ -502,6 +510,10 @@ async def test_the_node_resolves_the_run_items_and_counts(engine, current_epoch)
         "raw_items_out_of_scope": 0,
         "raw_items_rejected": 0,
         "raw_items_deferred": 0,
+        "deferred_relinked": 0,  # no deferred item of an earlier run
+        "deferred_out_of_scope": 0,
+        "deferred_rejected": 0,
+        "deferred_still_fenced": 0,
         "jobs_created": 3,  # A, B, and the conflict's own job
         "merges": 1,
         "conflicts": 1,
@@ -510,3 +522,105 @@ async def test_the_node_resolves_the_run_items_and_counts(engine, current_epoch)
     assert await scalar(engine, "SELECT count(*) FROM raw_items WHERE disposition = 'pending'") == 0
     again = await node(initial_state(owner.run_id, owner.attempt_no))  # nothing is left pending
     assert again["counters"]["raw_items_linked"] == 0 and again["counters"]["jobs_created"] == 0
+
+
+JSEARCH_JOB = sa.text(
+    "SELECT p.job_id FROM postings p JOIN source_instances i ON i.id = p.source_instance_id "
+    "WHERE i.source_id = 'jsearch' AND p.native_id = :n"
+)
+
+
+async def jobs_of(engine: AsyncEngine, *native_ids: str) -> list[int]:
+    """The job of the JSearch posting of each native id."""
+    async with engine.connect() as c:
+        return [(await c.execute(JSEARCH_JOB, {"n": native_id})).scalar_one() for native_id in native_ids]
+
+
+async def test_an_exclusive_conflict_between_two_jobs_of_j(engine, current_epoch) -> None:
+    """Minor 8: the observation carries no exclusive key; two jobs of `J` hold disjoint stepstone ids."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=5)
+    for hours, (native_id, link) in enumerate((("H1", STEPSTONE_1), ("H2", STEPSTONE_2))):
+        item = await pending_item(
+            engine,
+            owner,
+            "jsearch",
+            {"native_id": native_id, "primary_link": link},
+            fetched_at=at + timedelta(hours=hours),
+        )
+        assert await resolved(engine, owner, item) == "linked"
+    a, b = await jobs_of(engine, "H1", "H2")
+    linking = await pending_item(
+        engine,
+        owner,
+        "arbeitnow",
+        {"raw_keys": (AdKey("htidocid", "H1"), AdKey("htidocid", "H2"))},
+        fetched_at=at + timedelta(hours=2),
+    )
+    assert await resolved(engine, owner, linking) == "linked"
+    [(_, posting, _)] = await fetch(engine, OBSERVATION_OF, i=linking)
+    x = await scalar(engine, "SELECT job_id FROM postings WHERE id = :p", p=posting)
+    assert x not in (a, b) and await scalar(engine, "SELECT count(*) FROM merge_events") == 0
+    [conflict] = await fetch(
+        engine, sa.text("SELECT posting_job_id, candidate_job_ids, evidence FROM identity_conflicts")
+    )
+    assert (conflict.posting_job_id, conflict.candidate_job_ids) == (x, [a, b])
+    assert conflict.evidence["conflicting_keys"] == [
+        {
+            "key_ns": "pub:stepstone.de",
+            "observation": [],
+            "jobs": [{"job_id": a, "values": ["1"]}, {"job_id": b, "values": ["2"]}],
+        }
+    ]
+    owners = {(r.key_ns, r.key_value): r.job_id for r in await fetch(engine, KEYS)}
+    assert (owners[("htidocid", "H1")], owners[("htidocid", "H2")]) == (a, b)  # ownership unchanged
+
+
+async def test_a_job_merged_before_the_lock_sends_a_fresh_ordered_round(
+    engine, current_epoch, monkeypatch
+) -> None:
+    """Minor 2: a round whose set changed is rolled back to its savepoint (its row locks released), and the
+    next round locks the whole new set in one ordered statement."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=5)
+    for hours, native_id in enumerate(("HA", "HB", "HC")):
+        item = await pending_item(
+            engine, owner, "jsearch", {"native_id": native_id}, fetched_at=at + timedelta(hours=hours)
+        )
+        assert await resolved(engine, owner, item) == "linked"
+    a, b, c = await jobs_of(engine, "HA", "HB", "HC")
+    linking = await pending_item(
+        engine,
+        owner,
+        "arbeitnow",
+        {"raw_keys": (AdKey("htidocid", "HA"), AdKey("htidocid", "HB"))},
+        fetched_at=at + timedelta(hours=3),
+    )
+    calls: list[tuple[list[int], list[int]]] = []
+    real_lock = merge.lock_jobs
+
+    async def recording(conn, job_ids, *, with_groups_of=()):
+        calls.append((sorted(job_ids), sorted(with_groups_of)))
+        return await real_lock(conn, job_ids, with_groups_of=with_groups_of)
+
+    monkeypatch.setattr(merge, "lock_jobs", recording)
+    pauses = PausePoints(identity.BEFORE_JOB_LOCK, identity.IN_ITEM_TX)
+    monkeypatch.setattr(identity, "afault_point", pauses)
+    resolving = asyncio.create_task(resolved(engine, owner, linking))
+    await asyncio.wait_for(pauses[identity.BEFORE_JOB_LOCK].reached.wait(), 10)
+    # between the read (J = {A, B}) and the lock, B is merged into C and commits
+    async with engine.begin() as conn:
+        await merge.merge_jobs(conn, from_job_id=b, into_job_id=c, kind="user_confirmed_merge", evidence={})
+    pauses[identity.BEFORE_JOB_LOCK].resume()
+    await asyncio.wait_for(pauses[identity.IN_ITEM_TX].reached.wait(), 10)
+    # the first round's lock on B went with its savepoint; the second round holds A and C
+    assert [await job_lockable(engine, job) for job in (a, b, c)] == [False, True, False]
+    pauses[identity.IN_ITEM_TX].resume()
+    assert await asyncio.wait_for(resolving, 10) == "linked"
+    assert calls[-2:] == [([a, b], [b]), ([a, c], [c])]  # each round: one ordered statement
+    events = await fetch(
+        engine, sa.text("SELECT kind, from_job_id, into_job_id FROM merge_events ORDER BY id")
+    )
+    assert [tuple(e) for e in events] == [("user_confirmed_merge", b, c), ("strong_key_merge", c, a)]
+    [(_, posting, _)] = await fetch(engine, OBSERVATION_OF, i=linking)
+    assert await scalar(engine, "SELECT job_id FROM postings WHERE id = :p", p=posting) == a

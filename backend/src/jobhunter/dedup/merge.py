@@ -1,9 +1,17 @@
 """Merges, unmerges and identity conflicts (spec §8.6.1, §8.6.2, §8.6 steps 3 and 6, §20.2).
 
-**`merge_jobs`** runs the merge procedure of §8.6.1 in the caller's transaction, with both job rows `FOR
-UPDATE` in ascending id (`lock_jobs`; a no-op when the caller holds them, as identity resolution does). A
-fenced job (`is_fenced`, §20.2) is never merged (`FencedOut("purge_fence")`), and a job already merged is
-never merged again (`InvariantViolation`).
+**Locks (Ruling T18-c).** Every job row a transaction writes or references is locked by ONE ordered
+statement, `lock_jobs`: `… WHERE id = ANY(:ids) OR id IN (<the duplicate-group co-members of with_groups_of>)
+ORDER BY id FOR UPDATE`, before the owner row when there is one (§3.3.3). A job that may be merged away
+brings its co-members, because step 5 writes their rows (the last member of a dissolved group) or names
+them (an elected representative). Nothing is ever locked lazily: `_leave_group` raises `InvariantViolation`
+for a member the transaction does not hold.
+
+**`merge_jobs`** runs the merge procedure of §8.6.1 in the caller's transaction. Standalone, it locks the
+pair and the members of both jobs' groups in that one statement; a caller that already holds its jobs
+(identity resolution, `resolve_conflict`) passes them as `locked`, and the pair must be among them. A fenced
+job (`is_fenced`, §20.2) is never merged (`FencedOut("purge_fence")`), and a job already merged is never
+merged again (`InvariantViolation`).
 
 1. **Snapshot** into `merge_events.evidence["snapshot"]`, beside the caller's evidence: the `ad_keys` rows
    the from-job owns and the group memberships of both jobs. The `user_job_actions` rows (step 3) and the
@@ -14,7 +22,8 @@ never merged again (`InvariantViolation`).
    (`member_left`) and that member leaves it too; a group whose representative left elects the eligible
    member that sorts first by §8.7 (availability, completeness, source rank, description length, first
    seen, id; eligible: unmerged and not `closed`, the targets of M3 aside), or records `no_active_member`.
-   The revalidation of the members against a new representative is Task 20's (`groups.leave_group`).
+   Every member must be held by the transaction (`InvariantViolation` otherwise). The revalidation of the
+   members against a new representative is Task 20's (`groups.leave_group`).
 6. **Conflicts**: every open conflict naming the from-job names the into-job instead. One left without a
    candidate other than its posting's job is `resolved_merged`, its ids unchanged, and its
    `dedup.identity_conflict` alert is resolved.
@@ -24,22 +33,25 @@ never merged again (`InvariantViolation`).
    Identity resolution passes `recompute=False` and recomputes once, after its last merge. The caller
    writes the hard-filter results (it holds `active_config` first, §3.3.3) and bumps the ranking.
 
-**`unmerge`** reverses one merge event (§8.6.2), in the order `active_config` `FOR SHARE` → both job rows
-`FOR UPDATE` in id order → the event row → the other rows → `ranking_state`: the event's postings that are on
-the into-job move back and `from.merged_into_job_id := NULL` (step 1); every key either job owns is owned
-by the job of its earliest `ad_key_sources` row (by `first_seen_at`, then posting id) among the two jobs'
-postings (step 2); `dedup_decisions(different, 'unmerge')` (step 3); both jobs' availability, seen bounds
-and canonical fields are recomputed, with their hard-filter results (step 5; the from-job's stored
+**`unmerge`** reverses one merge event (§8.6.2), in the order `active_config` `FOR SHARE` → both job rows and
+their groups' members `FOR UPDATE` in one ordered statement → the event row → the other rows →
+`ranking_state`: the event's postings that are on the into-job move back and `from.merged_into_job_id :=
+NULL` (step 1); every key either job owns is owned by the job of its earliest `ad_key_sources` row (by
+`first_seen_at`, then posting id) among the two jobs' postings, and only the keys the two jobs own (step 2;
+a plan deviation, Ruling T18-f: a key a third job owns after a conflict keeps its owner);
+`dedup_decisions(different, 'unmerge')` (step 3); both jobs' availability, seen bounds and canonical fields
+are recomputed, with their hard-filter results (step 5; the from-job's stored
 field-conflict markers are dropped first, because the merge resolved their alerts, so a conflict that still
 holds is raised again); a `merge_event(unmerge)` and the original's `reversed_by_event_id` (step 6). Step 4
 (user actions) arrives with M4. Only the latest state is reversed: the from-job must still be merged into
 the into-job, and the into-job unmerged.
 
-**`resolve_conflict`** settles an open conflict in the same lock order: `separate` writes
-`dedup_decisions(different, 'conflict_resolution')` for every pair of the conflict's jobs and moves it to
-`resolved_separate` (the list does not change, so no bump); `merge` merges every candidate into the
-posting's job (`user_confirmed_merge`; the last merge's step 6 resolves it), then recomputes that job,
-writes its hard-filter results and bumps the ranking.
+**`resolve_conflict`** settles an open conflict in the same lock order (for `merge`, the candidates' groups'
+members are locked with the jobs): `separate` writes `dedup_decisions(different, 'conflict_resolution')` for
+each (posting job, candidate) pair, the pairs the user judged, never between two candidates (Ruling T18-e),
+and moves it to `resolved_separate` (the list does not change, so no bump); `merge` merges every candidate
+into the posting's job (`user_confirmed_merge`; the last merge's step 6 resolves it), then recomputes that
+job, writes its hard-filter results and bumps the ranking.
 
 `derive_from_postings` gives a job the best availability of its postings (`active > unknown > stale >
 closed`, §7.16.2; `availability_changed_at := now()` when it changes) and its postings' first and last
@@ -48,13 +60,12 @@ and the recompute that follows selects it again. Task 19 moves the availability 
 `rules.recompute_job_availability`.
 
 Every timestamp written is the database's `now()`, the clock domain of `runs.started_at` (carry 3; Task 17
-ruling T17-a). The `now` parameters are the plan's interface and write nothing.
+ruling T17-a; Ruling T18-b: no function here takes a caller clock).
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import combinations
 from typing import Any, Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -77,8 +88,18 @@ IDENTITY_CONFLICT_ALERT: Final = "dedup.identity_conflict"
 AVAILABILITY_ORDER: Final = ("active", "unknown", "stale", "closed")
 _MEMBER_LEFT: Final = "member_left"
 
+# The co-members (and the jobs themselves) of the groups of :grouped.
+_CO_MEMBERS_OF: Final = (
+    "SELECT co.job_id FROM duplicate_group_members m JOIN duplicate_group_members co "
+    "ON co.group_id = m.group_id WHERE m.job_id = ANY(CAST(:grouped AS bigint[]))"
+)
 _LOCK_JOBS: Final = q(
-    "SELECT id, merged_into_job_id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR UPDATE"
+    f"SELECT id, merged_into_job_id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) "  # noqa: S608
+    f"OR id IN ({_CO_MEMBERS_OF}) ORDER BY id FOR UPDATE"
+)
+_CO_MEMBERS: Final = q(_CO_MEMBERS_OF)
+_PAIR_STATE: Final = q(
+    "SELECT id, merged_into_job_id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id"
 )
 _FENCED: Final = q(
     "SELECT j.id FROM unnest(CAST(:ids AS bigint[])) AS j(id) WHERE is_fenced(j.id) ORDER BY j.id"
@@ -206,14 +227,26 @@ class Derived:
         return self.availability_changed or self.first_seen_changed
 
 
-async def lock_jobs(conn: AsyncConnection, job_ids: Iterable[int]) -> dict[int, int | None]:
-    """The job rows of `job_ids` `FOR UPDATE` in ascending id, in one statement (§3.3.3); their
-    `merged_into_job_id` by id. A job that does not exist is absent from the result."""
-    ids = sorted(set(job_ids))
-    if not ids:
+async def lock_jobs(
+    conn: AsyncConnection, job_ids: Iterable[int], *, with_groups_of: Iterable[int] = ()
+) -> dict[int, int | None]:
+    """The job rows of `job_ids` and of every duplicate-group co-member of `with_groups_of` `FOR UPDATE` in
+    ascending id, in one statement (§3.3.3, Ruling T18-c); their `merged_into_job_id` by id. A job that does
+    not exist is absent from the result. The co-members are those the statement's snapshot sees: a caller
+    that depends on them checks `co_members` afterwards."""
+    ids, grouped = sorted(set(job_ids)), sorted(set(with_groups_of))
+    if not ids and not grouped:
         return {}
-    rows = await conn.execute(_LOCK_JOBS, {"ids": ids})
+    rows = await conn.execute(_LOCK_JOBS, {"ids": ids, "grouped": grouped})
     return {int(r.id): None if r.merged_into_job_id is None else int(r.merged_into_job_id) for r in rows}
+
+
+async def co_members(conn: AsyncConnection, job_ids: Iterable[int]) -> frozenset[int]:
+    """Every member of the duplicate groups of `job_ids`, the grouped jobs themselves included."""
+    grouped = sorted(set(job_ids))
+    if not grouped:
+        return frozenset()
+    return frozenset(int(job) for job in (await conn.execute(_CO_MEMBERS, {"grouped": grouped})).scalars())
 
 
 async def fenced_jobs(conn: AsyncConnection, job_ids: Iterable[int]) -> list[int]:
@@ -266,17 +299,22 @@ async def _snapshot(conn: AsyncConnection, from_job_id: int, into_job_id: int) -
     return {"ad_keys": keys, "group_memberships": memberships}
 
 
-async def _leave_group(conn: AsyncConnection, job_id: int) -> None:
-    """Step 5: the job leaves its duplicate group, which dissolves or re-elects (module docstring)."""
+async def _leave_group(conn: AsyncConnection, job_id: int, held: Collection[int]) -> None:
+    """Step 5: the job leaves its duplicate group, which dissolves or re-elects (module docstring). Every
+    member's row must be among `held`, the rows this transaction locked: `InvariantViolation` otherwise,
+    before it writes anything (Ruling T18-c; `_hold_pair` checks the same before the merge writes)."""
     group = (await conn.execute(_GROUP_OF, {"job": job_id})).first()
     if group is None:
         return
     group_id = int(group.id)
+    members = [int(member) for member in (await conn.execute(_MEMBERS, {"group": group_id})).scalars()]
+    if unheld := sorted(set(members) - set(held)):
+        raise InvariantViolation(f"group {group_id}: the rows of jobs {unheld} are not locked")
     await conn.execute(_LEAVE, {"group": group_id, "jobs": [job_id]})
     await conn.execute(_UNGROUP, {"group": group_id, "jobs": [job_id]})
     if group.status != "active":
         return
-    remaining = [int(member) for member in (await conn.execute(_MEMBERS, {"group": group_id})).scalars()]
+    remaining = [member for member in members if member != job_id]
     if len(remaining) < 2:
         await conn.execute(_LEAVE, {"group": group_id, "jobs": remaining})
         await conn.execute(_UNGROUP, {"group": group_id, "jobs": remaining})
@@ -317,18 +355,34 @@ async def _rewrite_conflicts(conn: AsyncConnection, from_job_id: int, into_job_i
             log.info("identity_conflict_resolved", conflict_id=int(row.id), status="resolved_merged")
 
 
-async def _locked_unmerged_pair(conn: AsyncConnection, from_job_id: int, into_job_id: int) -> None:
+async def _hold_pair(
+    conn: AsyncConnection, from_job_id: int, into_job_id: int, locked: Collection[int] | None
+) -> frozenset[int]:
+    """The rows the merge may touch, held: the pair and, standalone, its groups' members, locked in one
+    statement; or the caller's `locked`, which must hold the pair. The pair's state is checked."""
     if from_job_id == into_job_id:
         raise InvariantViolation(f"job {from_job_id} cannot be merged into itself")
-    locked = await lock_jobs(conn, (from_job_id, into_job_id))
-    for job_id in (from_job_id, into_job_id):
-        if job_id not in locked:
+    pair = (from_job_id, into_job_id)
+    if locked is None:
+        state = await lock_jobs(conn, pair, with_groups_of=pair)
+        held = frozenset(state)
+    else:
+        held = frozenset(locked)
+        if missing := sorted(set(pair) - held):
+            raise InvariantViolation(f"jobs {missing} are not among the rows the caller locked")
+        rows = await conn.execute(_PAIR_STATE, {"ids": list(pair)})
+        state = {int(r.id): None if r.merged_into_job_id is None else int(r.merged_into_job_id) for r in rows}
+    for job_id in pair:
+        if job_id not in state:
             raise LookupError(f"job {job_id} does not exist")
-        if locked[job_id] is not None:
-            raise InvariantViolation(f"job {job_id} is merged into job {locked[job_id]}")
-    if fenced := await fenced_jobs(conn, (from_job_id, into_job_id)):
+        if state[job_id] is not None:
+            raise InvariantViolation(f"job {job_id} is merged into job {state[job_id]}")
+    if fenced := await fenced_jobs(conn, pair):
         log.warning("merge_refused_fenced", job_ids=fenced)
         raise FencedOut("purge_fence")
+    if unheld := sorted(await co_members(conn, (from_job_id,)) - held):  # before the merge writes anything
+        raise InvariantViolation(f"the rows of jobs {unheld} of job {from_job_id}'s group are not locked")
+    return held
 
 
 async def recompute_rollups(conn: AsyncConnection, job_id: int) -> tuple[Derived, RecomputeResult]:
@@ -344,20 +398,22 @@ async def merge_jobs(
     into_job_id: int,
     kind: MergeKind,
     evidence: Mapping[str, JSONValue],
-    now: datetime,
     recompute: bool = True,
+    locked: Collection[int] | None = None,
 ) -> int:
     """Merge `from_job_id` into `into_job_id` (§8.6.1 steps 1, 2, 5, 6 and 7; module docstring) in the
-    caller's transaction; returns the `merge_events` id. The caller writes the hard-filter results and bumps
-    the ranking. Raises `FencedOut` for a fenced job, `InvariantViolation` for a job already merged (or a
-    job merged into itself) and `LookupError` for a job that does not exist, having written nothing."""
-    await _locked_unmerged_pair(conn, from_job_id, into_job_id)
+    caller's transaction; returns the `merge_events` id. `locked` is the job rows the caller holds (the pair
+    and the from-job's group members among them); without it the merge locks them itself. The caller writes
+    the hard-filter results and bumps the ranking. Raises `FencedOut` for a fenced job, `InvariantViolation`
+    for a job already merged, a job merged into itself or a row the transaction does not hold, and
+    `LookupError` for a job that does not exist, having written nothing."""
+    held = await _hold_pair(conn, from_job_id, into_job_id, locked)
     snapshot = await _snapshot(conn, from_job_id, into_job_id)
     moved = sorted(
         int(p) for p in (await conn.execute(_MOVE_POSTINGS, _pair(from_job_id, into_job_id))).scalars()
     )
     await conn.execute(_MOVE_KEYS, _pair(from_job_id, into_job_id))
-    await _leave_group(conn, from_job_id)
+    await _leave_group(conn, from_job_id, held)
     await _rewrite_conflicts(conn, from_job_id, into_job_id)
     await conn.execute(_MERGED, _pair(from_job_id, into_job_id))
     for field in CONFLICT_FIELDS:  # carry 7: the from-job's selection no longer stands
@@ -428,7 +484,7 @@ async def open_conflict(
 
 
 async def resolve_conflict(
-    conn: AsyncConnection, conflict_id: int, decision: Literal["separate", "merge"], *, now: datetime
+    conn: AsyncConnection, conflict_id: int, decision: Literal["separate", "merge"]
 ) -> None:
     """Settle the open conflict as `separate` or `merge` (module docstring) in the caller's transaction.
 
@@ -442,7 +498,8 @@ async def resolve_conflict(
     posting_job = int(row.posting_job_id)
     candidates = sorted(int(job) for job in row.candidate_job_ids)
     jobs = sorted({posting_job, *candidates})
-    locked = await lock_jobs(conn, jobs)
+    # the candidates merge away under `merge`: their groups' members are locked with the jobs (T18-c)
+    locked = await lock_jobs(conn, jobs, with_groups_of=candidates if decision == "merge" else ())
     if fenced := await fenced_jobs(conn, jobs):
         log.warning("conflict_resolution_refused_fenced", conflict_id=conflict_id, job_ids=fenced)
         raise FencedOut("purge_fence")
@@ -457,8 +514,8 @@ async def resolve_conflict(
     if any(locked.get(job, -1) is not None for job in jobs):
         raise InvariantViolation(f"identity conflict {conflict_id} names a merged or missing job")
     if decision == "separate":
-        for job_x, job_y in combinations(jobs, 2):
-            await decide_different(conn, job_x, job_y, source="conflict_resolution")
+        for candidate in candidates:  # the pairs the user judged (Ruling T18-e)
+            await decide_different(conn, posting_job, candidate, source="conflict_resolution")
         await transition(conn, "identity_conflicts", conflict_id, ["open"], "resolved_separate")
         await resolve_alert(conn, code=IDENTITY_CONFLICT_ALERT, subject=f"conflict:{conflict_id}")
         log.info("identity_conflict_resolved", conflict_id=conflict_id, status="resolved_separate")
@@ -471,8 +528,8 @@ async def resolve_conflict(
             into_job_id=posting_job,
             kind="user_confirmed_merge",
             evidence=evidence,
-            now=now,
             recompute=False,
+            locked=locked,
         )
     status = (await conn.execute(_LOCK_CONFLICT, {"id": conflict_id})).one().status
     if status == "open":  # the merges' step 6 resolves it; this is the guard
@@ -482,7 +539,7 @@ async def resolve_conflict(
     await ranking.bump(conn)
 
 
-async def unmerge(conn: AsyncConnection, merge_event_id: int, *, now: datetime) -> int:
+async def unmerge(conn: AsyncConnection, merge_event_id: int) -> int:
     """Reverse the merge event (§8.6.2 steps 1, 2, 3, 5 and 6; module docstring) in the caller's
     transaction; returns the `merge_events(unmerge)` id. Its last statement bumps the ranking.
 
@@ -497,7 +554,7 @@ async def unmerge(conn: AsyncConnection, merge_event_id: int, *, now: datetime) 
     if event.kind == "unmerge":
         raise InvariantViolation(f"merge event {merge_event_id} is an unmerge")
     from_job, into_job = int(event.from_job_id), int(event.into_job_id)
-    locked = await lock_jobs(conn, (from_job, into_job))
+    locked = await lock_jobs(conn, (from_job, into_job), with_groups_of=(from_job, into_job))
     if fenced := await fenced_jobs(conn, (from_job, into_job)):
         log.warning("unmerge_refused_fenced", event_id=merge_event_id, job_ids=fenced)
         raise FencedOut("purge_fence")

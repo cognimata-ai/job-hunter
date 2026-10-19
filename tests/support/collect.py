@@ -44,6 +44,8 @@ takes. Unless the overrides give `raw_keys`, the item's keys are the ones its so
 the source's own id key (`htidocid` for JSearch and SerpApi, `adzuna` for Adzuna) and the keys of its
 primary link (`keys_from_link`), which is stored canonical. `key_pair` resolves job A (a JSearch posting
 with `htidocid` `H` and `pub:stepstone.de` 1) and job B (an Adzuna posting with id 9) for a run, A first.
+`job_lockable` probes from a connection of its own whether a job row can be locked at once (`FOR UPDATE
+NOWAIT`): `False` while another transaction holds it.
 """
 
 import asyncio
@@ -62,7 +64,7 @@ import procrastinate
 import pytest
 from jobhunter.clock import utcnow
 from jobhunter.db.session import make_null_engine
-from jobhunter.db.sql import q
+from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error, q
 from jobhunter.db.transitions import transition
 from jobhunter.dedup.identity import resolve_item
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
@@ -93,6 +95,7 @@ from jobhunter.worker import runs
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.runs import RunOwner
 from jobhunter.worker.tasks import defer_in_tx, make_queue_app
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.observations import normalized
@@ -989,7 +992,7 @@ async def pending_item(
 async def resolved(engine: AsyncEngine, owner: RunOwner, raw_item_id: int) -> str:
     """`identity.resolve_item` of the raw item in a transaction of its own; its resolution."""
     async with engine.begin() as conn:
-        return await resolve_item(conn, owner=owner, raw_item_id=raw_item_id, now=utcnow())
+        return await resolve_item(conn, owner=owner, raw_item_id=raw_item_id)
 
 
 _JOB_OF_POSTING: Final = q(
@@ -1023,3 +1026,18 @@ async def key_pair(engine: AsyncEngine, owner: RunOwner, *, at: datetime) -> Key
         a = (await conn.execute(_JOB_OF_POSTING, {"s": "jsearch", "n": "H"})).one()
         b = (await conn.execute(_JOB_OF_POSTING, {"s": "adzuna", "n": "9"})).one()
     return KeyPair(int(a.job_id), int(b.job_id), int(a.id), int(b.id))
+
+
+_TRY_LOCK_JOB: Final = q("SELECT id FROM jobs WHERE id = :job FOR UPDATE NOWAIT")
+
+
+async def job_lockable(engine: AsyncEngine, job_id: int) -> bool:
+    """Whether the job row can be locked at once from a new transaction (released straight away)."""
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(_TRY_LOCK_JOB, {"job": job_id})
+    except DBAPIError as err:
+        if pg_error(err).sqlstate == LOCK_NOT_AVAILABLE:
+            return False
+        raise
+    return True

@@ -808,6 +808,10 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
         # node 6 (Task 18) ran: no item was pending
         "raw_items_linked": 0,
         "raw_items_deferred": 0,
+        "deferred_relinked": 0,
+        "deferred_out_of_scope": 0,
+        "deferred_rejected": 0,
+        "deferred_still_fenced": 0,
         "jobs_created": 0,
         "merges": 0,
         "conflicts": 0,
