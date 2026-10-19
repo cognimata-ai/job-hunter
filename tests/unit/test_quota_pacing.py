@@ -194,3 +194,15 @@ def test_adzuna_has_no_per_run_cap_but_its_bucket() -> None:
         per_run_cap=10,
     )
     assert code(capped) == "window_cap"
+
+
+def test_capacity_is_bounded_by_the_window_limit() -> None:
+    # Ruling T8-a: a window refined to 1.5 s by a reset header would hold 2N x interval / 1.5 s = 5,184,000
+    # tokens, past the numeric(10,4) column; no bucket holds more than the window's limit, and never below 1.
+    w = boot(interval_s=21600)
+    short = replace(w, window_end=w.window_start + timedelta(milliseconds=1500))
+    assert capacity(short, 21600) == Decimal(200)
+    accrue(short, short.window_start + timedelta(seconds=1), interval_s=21600)
+    assert short.capacity == 200 and short.tokens <= 200
+    assert capacity(replace(w, limit_units=0, reserve_units=0), 21600) == Decimal(1)
+    assert capacity(w, 21600) == Decimal("2.9067")  # an ordinary window is unchanged

@@ -2,6 +2,9 @@
 
 `N = limit - reserve` units are spread over the window: `fair_share = N * interval_s / window_length_s` per
 scheduled run, the bucket holds at most `C = max(1, 2 * fair_share)` and accrues `N * Δt / window_length_s`.
+`C` never exceeds the window's limit (Ruling T8-a): a window that a reset header refines to a few seconds
+would otherwise hold millions of tokens, past its `numeric(10,4)` column, and no window spends more than its
+limit anyway.
 Tokens and capacity are kept at the scale of their `numeric(10,4)` columns, so a window read back equals the
 one saved: the capacity rounds to the nearest 4th decimal, the tokens round down (never a token too many).
 
@@ -59,9 +62,10 @@ def fair_share(w: Window, interval_s: int) -> float:
 
 
 def capacity(w: Window, interval_s: int) -> Decimal:
-    """`C = max(1, 2 * fair_share)`, exact, then rounded to the column scale."""
+    """`C = max(1, 2 * fair_share)`, exact, at most the window's `limit_units` (never below 1, Ruling T8-a),
+    then rounded to the column scale."""
     twice = Decimal(2 * _units(w) * interval_s * 1_000_000) / Decimal(_length_us(w))
-    return max(Decimal(1), twice).quantize(_SCALE, rounding=ROUND_HALF_UP)
+    return max(Decimal(1), min(twice, Decimal(w.limit_units))).quantize(_SCALE, rounding=ROUND_HALF_UP)
 
 
 def accrue(w: Window, now: datetime, *, interval_s: int) -> None:

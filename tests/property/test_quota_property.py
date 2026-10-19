@@ -25,6 +25,7 @@ from jobhunter.quota import ledger
 from jobhunter.quota.pacing import Admit, QuotaClass, effective_reserve, fair_share, per_run_cap
 from jobhunter.quota.windows import (
     NOMINAL_PERIOD,
+    PROBE_RETRY,
     Close,
     Insert,
     ObservationEffects,
@@ -41,7 +42,24 @@ from tests.support.quota import SETTINGS
 START = datetime(2026, 1, 1, tzinfo=UTC)
 RECOVERY = ledger.RECOVERY_AFTER
 SPANS = ledger.ADZUNA_SPANS
-Settlement = Literal["ok", "gateway_404", "connect", "lost", "rate_limited", "server_error"]
+Settlement = Literal[
+    "ok", "ok_bare", "gateway_404", "connect", "lost", "rate_limited", "rate_limited_bare", "server_error"
+]
+# Drawn outcomes of a sent request; a served 2xx with headers is the most common one.
+OUTCOMES: list[Settlement] = [
+    "ok",
+    "ok",
+    "ok",
+    "ok_bare",
+    "gateway_404",
+    "connect",
+    "lost",
+    "rate_limited",
+    "rate_limited_bare",
+    "server_error",
+]
+# The outcomes that decide a probe's fate: validated, failed (with or without headers), lost, never sent.
+PROBE_OUTCOMES: list[Settlement] = ["ok", "ok_bare", "rate_limited", "rate_limited_bare", "lost", "connect"]
 Settled = Literal["billed", "not_billed", "ambiguous"]
 
 
@@ -96,6 +114,8 @@ class QuotaMachine(RuleBasedStateMachine):
         self.p_limit = limit
         self.p_used = 0
         self.last_observed: datetime | None = None
+        # When a window's next probe is due, per window: a probe that did not validate it is retried.
+        self.reprobe_due: dict[datetime, datetime] = {}
 
     # -- helpers -------------------------------------------------------------------------------------------
     def counted(self, ws: datetime) -> int:
@@ -165,19 +185,25 @@ class QuotaMachine(RuleBasedStateMachine):
                 assert used + 1 <= w.limit_units - effective_reserve(w, self.now)
             entry = Entry(w.window_start, d.request_class, "reserved", self.now, self.run)
             self.entries.append(entry)
+            if d.request_class == "probe":
+                self.reprobe_due.pop(w.window_start, None)
             if d.tokens_used:
                 self.last_take = self.now
             return entry
+        in_flight = any(
+            e.window_start == w.window_start
+            and e.request_class == "probe"
+            and e.state in ("reserved", "dispatched")
+            for e in self.entries
+        )
         if d.code == "awaiting_window_validation":  # never a lockout: a probe is in flight, or due later
-            in_flight = any(
-                e.window_start == w.window_start
-                and e.request_class == "probe"
-                and e.state in ("reserved", "dispatched")
-                for e in self.entries
-            )
             assert in_flight or (
                 w.probe_failed and w.next_probe_at is not None and self.now < w.next_probe_at
             )
+        due = self.reprobe_due.get(w.window_start)
+        if d.code in ("exhausted", "awaiting_window_validation") and due is not None and self.now >= due:
+            # a probe that failed (or was never sent) is retried when due, not only when the window ends
+            assert in_flight or used + 1 > w.limit_units, "the window's next probe is not admitted"
         cap = per_run_cap(self.settings, fair_share(w, self.interval_s))
         bucket = d.code == "paced" and (self.provider == "adzuna" or run_normal + 1 <= cap)
         if bucket and self.last_take is not None:
@@ -197,6 +223,7 @@ class QuotaMachine(RuleBasedStateMachine):
         used = self.counted(cur.window_start)  # after the entry's own state change
         entry_units = e.units if state in ledger.COUNTED else 0
         before = {ws: self.counted(ws) for ws in self.windows}
+        probe = e.request_class == "probe" and e.window_start == cur.window_start
         w, changes, fx = ledger.settle_window(
             cur,
             obs,
@@ -204,7 +231,7 @@ class QuotaMachine(RuleBasedStateMachine):
             provider=self.provider,
             state=state,
             http_status=status,
-            probe=e.request_class == "probe" and e.window_start == cur.window_start,
+            probe=probe,
             used_units=used,
             entry_units=entry_units,
             interval_s=self.interval_s,
@@ -218,6 +245,13 @@ class QuotaMachine(RuleBasedStateMachine):
         ):
             self.last_take = None  # the bucket's shape changed: the starvation clock restarts
         self.current = self.windows[w.window_start] = w
+        if w.state == "validated":
+            self.reprobe_due.pop(w.window_start, None)
+        elif (
+            probe
+        ):  # §6.3: a probe that ended without validating is failed (next one 12 h later), or never sent
+            never_sent = state == "not_billed" and status is None
+            self.reprobe_due[w.window_start] = self.now if never_sent else self.now + PROBE_RETRY
         source = e.window_start
         if fx.reattribute:
             e.window_start = w.window_start
@@ -257,6 +291,9 @@ class QuotaMachine(RuleBasedStateMachine):
         if outcome == "ok":
             self.p_used += 1
             return "billed", 200, self._observation(at, 200)
+        if outcome == "ok_bare":  # a 2xx without the quota headers: it validates nothing
+            self.p_used += 1
+            return "billed", 200, Observation(observed_at=at, status=200)
         if outcome == "gateway_404":
             return "not_billed", 404, None
         if outcome == "connect":
@@ -264,23 +301,40 @@ class QuotaMachine(RuleBasedStateMachine):
         if outcome == "lost":
             self.p_used += charged
             return "ambiguous", None, None
+        if (
+            outcome == "rate_limited_bare"
+        ):  # a 429 without the quota headers: `remaining` absent (§6.3 step 4)
+            return "ambiguous", 429, Observation(observed_at=at, status=429)
         if outcome == "rate_limited":
             return "ambiguous", 429, self._observation(at, 429)
         self.p_used += charged
         return "ambiguous", 503, self._observation(at, 503) if charged else None
 
     # -- rules ---------------------------------------------------------------------------------------------
-    @rule(manual=st.booleans(), complete=st.booleans())
-    def tick(self, manual: bool, complete: bool) -> None:
+    @rule(
+        manual=st.booleans(), complete=st.booleans(), outcome=st.sampled_from(OUTCOMES), charged=st.booleans()
+    )
+    def tick(self, manual: bool, complete: bool, outcome: Settlement, charged: bool) -> None:
         """A scheduled run (one interval later) or a manual run (now) plans one normal request; `complete`
-        sends it and settles its 2xx at once, otherwise it is left reserved."""
+        sends it and settles its outcome at once, otherwise it is left reserved."""
         if not manual:
             self._advance(timedelta(seconds=self.interval_s))
         self.run += 1
         entry = self._reserve("normal")
         if entry is not None and complete:
             entry.state, entry.dispatched_at = "dispatched", self.now
-            self._settle(entry, "ok", late=False, charged=True)
+            self._settle(entry, outcome, late=False, charged=charged)
+
+    @rule(outcome=st.sampled_from(PROBE_OUTCOMES), charged=st.booleans())
+    def when_the_probe_is_due(self, outcome: Settlement, charged: bool) -> None:
+        """A run waits until the window's next probe is due (an exhausted or failed-probe window): by §6.3, or
+        by the window's `next_probe_at`, whichever comes first. It plans one normal request (the re-probe) and
+        sends it."""
+        w = self._roll()
+        due = [t for t in (w.next_probe_at, self.reprobe_due.get(w.window_start)) if t is not None]
+        if due and min(due) > self.now:
+            self._advance(min(due) - self.now)
+        self.tick(manual=True, complete=True, outcome=outcome, charged=charged)
 
     @rule(
         minutes=st.integers(0, 120),
@@ -295,9 +349,7 @@ class QuotaMachine(RuleBasedStateMachine):
 
     @rule(
         data=st.data(),
-        outcome=st.sampled_from(
-            ["ok", "ok", "gateway_404", "connect", "lost", "rate_limited", "server_error"]
-        ),
+        outcome=st.sampled_from(OUTCOMES),
         charged=st.booleans(),
     )
     def send(self, data: st.DataObject, outcome: Settlement, charged: bool) -> None:
@@ -315,7 +367,7 @@ class QuotaMachine(RuleBasedStateMachine):
 
     @rule(
         data=st.data(),
-        outcome=st.sampled_from(["ok", "gateway_404", "connect", "lost", "rate_limited", "server_error"]),
+        outcome=st.sampled_from(OUTCOMES),
         late=st.booleans(),
         charged=st.booleans(),
     )
@@ -352,6 +404,8 @@ class QuotaMachine(RuleBasedStateMachine):
                 e.state = "not_billed"
                 if e.request_class == "probe":
                     note_probe_outcome(w, "never_sent", now=self.now)
+                    if w.state != "validated":  # a validated window awaits no probe
+                        self.reprobe_due[e.window_start] = self.now
             elif (
                 e.state == "dispatched"
                 and e.dispatched_at is not None
@@ -360,6 +414,8 @@ class QuotaMachine(RuleBasedStateMachine):
                 e.state = "ambiguous"
                 if e.request_class == "probe":
                     note_probe_outcome(w, "failed", now=self.now)
+                    if w.state != "validated":
+                        self.reprobe_due[e.window_start] = self.now + PROBE_RETRY
 
     # -- invariants ----------------------------------------------------------------------------------------
     @invariant()
@@ -378,7 +434,7 @@ class QuotaMachine(RuleBasedStateMachine):
 
 
 TestQuotaMachine = QuotaMachine.TestCase
-TestQuotaMachine.settings = settings(max_examples=200, stateful_step_count=80, deadline=None)
+TestQuotaMachine.settings = settings(max_examples=300, stateful_step_count=80, deadline=None)
 
 
 # -- Q-SH1 ---------------------------------------------------------------------------------------------------

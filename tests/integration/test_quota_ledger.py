@@ -634,6 +634,64 @@ async def test_a_jsearch_429_exhausts_until_a_validated_observation(engine, curr
     assert "quota.exhausted:provider:jsearch" not in await open_alerts(engine)
 
 
+async def test_a_probe_that_refines_its_window_to_seconds_still_admits(engine, current_epoch) -> None:
+    # Ruling T8-a: the probe's reset header ends the bootstrapped window 1.5 s after its start; the bucket's
+    # capacity of such a window must fit its column (numeric(10,4)), so the next reservation is admitted.
+    owner, now = await queued_run(engine), utcnow()
+    fr = await planned_request(engine, owner, provider="jsearch", key=K, attempt_seq=1)
+    async with engine.begin() as c:
+        r = reservation(
+            await ledger.reserve(
+                c,
+                "jsearch",
+                owner=owner,
+                request_key=K,
+                attempt_seq=1,
+                request_class="normal",
+                fetch_request_id=fr,
+                settings=SETTINGS,
+                interval_s=SIX_H,
+                now=now,
+            )
+        )
+        assert r.request_class == "probe"
+        await ledger.mark_dispatched(c, r.entry_id, owner)
+    observed = now + timedelta(milliseconds=500)
+    async with engine.begin() as c:
+        await ledger.settle(
+            c,
+            r.entry_id,
+            state="billed",
+            evidence=None,
+            http_status=200,
+            provider_remaining=199,
+            observation=Observation(
+                observed, 200, reset_at=now + timedelta(milliseconds=1500), limit=200, remaining=199
+            ),
+            settings=SETTINGS,
+            interval_s=SIX_H,
+            now=observed,
+        )
+    fr2 = await planned_request(engine, owner, provider="jsearch", key=key(1), attempt_seq=1)
+    async with engine.begin() as c:
+        again = await ledger.reserve(
+            c,
+            "jsearch",
+            owner=owner,
+            request_key=key(1),
+            attempt_seq=1,
+            request_class="normal",
+            fetch_request_id=fr2,
+            settings=SETTINGS,
+            interval_s=SIX_H,
+            now=now + timedelta(seconds=1),
+        )
+    assert isinstance(again, ledger.Reservation) and again.request_class == "normal"
+    w = await one(engine, f"SELECT state, window_end, capacity, limit_units {JSEARCH_WINDOW}")
+    assert w[:2] == ("validated", now + timedelta(milliseconds=1500))
+    assert isinstance(w[2], Decimal) and isinstance(w[3], int) and 1 <= w[2] <= w[3]
+
+
 async def test_a_probe_that_fails_or_is_never_sent(engine, current_epoch) -> None:
     owner, now = await queued_run(engine), utcnow()
     fr = await planned_request(engine, owner, provider="jsearch", key=K, attempt_seq=1)

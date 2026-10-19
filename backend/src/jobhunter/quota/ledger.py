@@ -428,12 +428,13 @@ def probe_outcome(state: SettleState, http_status: int | None, w: Window) -> Pro
     """How a settled probe ended, given the window after its observation.
 
     `never_sent`: a connect error before any byte (`not_billed` without a status); `validated`: a billed 2xx
-    whose observation validated the window; anything else (`ambiguous`, a non-2xx status, a 2xx whose headers
-    validated nothing) `failed`, which retries 12 h later instead of waiting for a probe that already ended.
+    after which the window is `validated`; anything else (`ambiguous`, a non-2xx status, a 2xx whose headers
+    validated nothing and so leaves an unvalidated window unvalidated, an exhausted one exhausted) `failed`,
+    so the next probe follows 12 h later (§6.7) instead of never, or only when the window ends.
     """
     if state == "not_billed" and http_status is None:
         return "never_sent"
-    if state == "billed" and http_status in _HTTP_OK and w.state != "extrapolated_unvalidated":
+    if state == "billed" and http_status in _HTTP_OK and w.state == "validated":
         return "validated"
     return "failed"
 
