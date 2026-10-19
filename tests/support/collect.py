@@ -5,21 +5,34 @@ planned fetch requests and a reconcile context.
 `pg.MANUAL_RUN_SQL` fixes to `false`) and admits it as attempt 1 of worker epoch 1 (`runs.start_attempt`): the
 test needs the `current_epoch` fixture. Instance ids change with every database reset (Task 1), so they are
 always looked up by `(source_id, instance_key)`.
+
+Task 12: `acquire_ctx` is the acquisition context of a test (the seeded run settings, `utcnow` and a sleep
+that does not wait unless given); `source_cell` the coverage cell of a source's default instance for the test
+query (`TEST_QUERY`) and a location key, created when absent, and `jsearch_cell` its JSearch `remote-de`
+cell; `page1_spec` the JSearch page-1 spec of a cell (bucket `week`), its instance read from the cell row;
+`supersede` gives a run its next attempt, as a takeover does.
 """
 
-from datetime import datetime
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from typing import Final
 
+import httpx
 import procrastinate
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
-from jobhunter.sources.base import RequestSpec
+from jobhunter.quota.windows import Provider
+from jobhunter.sources.acquire import AcquireContext
+from jobhunter.sources.base import REMOTE_DE, Billing, CellPlan, RequestSpec, SourceAdapter
+from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.worker import runs
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.runs import RunOwner
 from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
+from tests.support.quota import seeded_run_settings
 
 _QUEUED_RUN: Final = q(
     "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id) "
@@ -41,6 +54,21 @@ _PLANNED: Final = q(
     jsonb=["spec"],
 )
 CELL_LOCATION: Final = "berlin"
+TEST_QUERY: Final = "python developer"
+_QUERY: Final = q("INSERT INTO queries (text, lang, origin) VALUES (:t, 'en', 'user') ON CONFLICT DO NOTHING")
+_QUERY_ID: Final = q("SELECT id FROM queries WHERE lower(text) = lower(:t) AND retired_at IS NULL")
+_SOURCE_CELL: Final = q(
+    "INSERT INTO coverage_cells (source_instance_id, query_id, location_key) VALUES (:i, :query, :loc) "
+    "ON CONFLICT DO NOTHING"
+)
+_SOURCE_CELL_ID: Final = q(
+    "SELECT id FROM coverage_cells WHERE source_instance_id = :i AND query_id IS NOT DISTINCT FROM :query "
+    "AND location_key IS NOT DISTINCT FROM :loc"
+)
+_CELL_ROW: Final = q(
+    "SELECT c.source_instance_id, c.location_key, qr.text FROM coverage_cells c "
+    "LEFT JOIN queries qr ON qr.id = c.query_id WHERE c.id = :id"
+)
 
 
 async def queued_run(engine: AsyncEngine, *, include_paid: bool = True) -> RunOwner:
@@ -117,6 +145,97 @@ async def request_sent(conn: AsyncConnection, fetch_request_id: int, entry_id: i
         set_={"quota_ledger_id": entry_id},
     )
     await transition(conn, "fetch_requests", fetch_request_id, ["reserved"], "dispatched")
+
+
+async def _no_wait(seconds: float) -> None:
+    return None
+
+
+def acquire_ctx(
+    engine: AsyncEngine,
+    owner: RunOwner,
+    adapter: SourceAdapter,
+    *,
+    billing: Billing,
+    provider: Provider | None,
+    clock: Callable[[], datetime] | None = None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    stopped: Callable[[], bool] = lambda: False,
+) -> AcquireContext:
+    """The acquisition context of `owner` for `adapter`: the seeded run settings (6 h interval), `utcnow`
+    unless `clock` is given, and a sleep that returns at once unless `sleep` is given."""
+    return AcquireContext(
+        engine=engine,
+        owner=owner,
+        adapter=adapter,
+        billing=billing,
+        provider=provider,
+        settings=seeded_run_settings(),
+        clock=utcnow if clock is None else clock,
+        sleep=_no_wait if sleep is None else sleep,
+        admission_stopped=stopped,
+    )
+
+
+async def source_cell(
+    engine: AsyncEngine,
+    source_id: str,
+    *,
+    query: str | None = TEST_QUERY,
+    location_key: str | None = REMOTE_DE,
+) -> int:
+    """The coverage cell of the source's default instance for `query` (a `queries` row, created when absent;
+    `None` for a cell without a query, as Arbeitnow's) and `location_key`, created when absent."""
+    async with engine.begin() as conn:
+        instance = await instance_id(conn, source_id)
+        query_id = None
+        if query is not None:
+            await conn.execute(_QUERY, {"t": query})
+            query_id = int((await conn.execute(_QUERY_ID, {"t": query})).scalar_one())
+        cell = {"i": instance, "query": query_id, "loc": location_key}
+        await conn.execute(_SOURCE_CELL, cell)
+        return int((await conn.execute(_SOURCE_CELL_ID, cell)).scalar_one())
+
+
+async def jsearch_cell(engine: AsyncEngine) -> int:
+    """The JSearch default instance's `remote-de` cell for `TEST_QUERY`."""
+    return await source_cell(engine, "jsearch")
+
+
+async def page1_spec(engine: AsyncEngine, cell_id: int) -> RequestSpec:
+    """The JSearch page-1 spec of the cell (bucket `week`), its instance read from the cell row."""
+    async with engine.connect() as conn:
+        row = (await conn.execute(_CELL_ROW, {"id": cell_id})).one()
+    now = utcnow()
+    plan = CellPlan(
+        cell_id=cell_id,
+        source_id="jsearch",
+        instance_id=int(row.source_instance_id),
+        query_text=row.text,
+        query_lang="en",
+        location_key=row.location_key,
+        location_label=None,
+        radius_km=None,
+        phase="primary",
+        request_class="normal",
+        bucket="week",
+        window=(now - timedelta(days=7), now),
+        max_days_old=None,
+    )
+    async with httpx.AsyncClient() as client:  # `plan` sends nothing
+        adapter = JSearchAdapter(client, api_key=b"fake", instance_id=plan.instance_id, clock=utcnow)
+        return adapter.plan(plan)
+
+
+async def supersede(engine: AsyncEngine, owner: RunOwner) -> RunOwner:
+    """The run's next attempt, by worker epoch 1 (a takeover): `owner` loses the run. Needs `queue_app`."""
+    async with engine.begin() as conn:
+        attempt = await runs.begin_new_attempt(
+            conn, owner.run_id, epoch=1, end_reason="worker_takeover", defer=defer_in_tx
+        )
+    if attempt is None:
+        raise RuntimeError(f"supersede: run {owner.run_id} got no new attempt")
+    return RunOwner(owner.run_id, attempt)
 
 
 def ctx(

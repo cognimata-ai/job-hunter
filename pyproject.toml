@@ -24,6 +24,7 @@ dependencies = [
     "nh3==0.3.7",
     "httpx==0.28.1",
     "defusedxml==0.7.1",
+    "zstandard==0.25.0",
 ]
 
 [dependency-groups]

@@ -7,6 +7,8 @@ before the attempt and counted until positive evidence says it was not charged.
 (`observe_account`), the bucket accrued, `decide` with the hard caps of §6.5 (`serpapi_hour_ok`,
 `adzuna_windows_ok`), and then either the `reserved` row and the saved window, or (a denial) the saved accrual
 and nothing else. Global lock order: owner row -> `quota_windows` row -> ledger rows -> other domain rows.
+`record_account` applies a SerpApi account read made outside a reservation (the read after a traversal's
+last search) with the same code under the same lock.
 
 **The dispatch marker** (`mark_dispatched`) commits `reserved -> dispatched` immediately before the send,
 under the owner's `FOR SHARE` again; a lost predicate or a row that is no longer `reserved` is `FencedOut`,
@@ -79,7 +81,7 @@ from jobhunter.quota.windows import (
     save_window,
     window_locked,
 )
-from jobhunter.run_settings import QuotaSettings
+from jobhunter.run_settings import QuotaSettings, RunSettings
 from jobhunter.sources.base import Observation
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
@@ -567,8 +569,11 @@ async def observe_account(
 
     The read is an observation (§6.3, the stale-renewal rule of T7-a included): its adjustment and alerts,
     then the foreign-usage detection (§6.5) and the renewal check (T7-b). A read that shows a provider reset
-    opens the new window with a full bucket.
+    opens the new window with a full bucket. A read older than the window's `hour_observed_at` (a late one,
+    step 0) changes nothing at all: neither the window nor the foreign-usage mode and its alert.
     """
+    if w.hour_observed_at is not None and account.observed_at < w.hour_observed_at:
+        return w
     obs = account_observation(account)
     used = await used_units(conn, "serpapi", w.window_start)
     cur, changes, fx = apply_observation_pure(w, obs, settings, provider="serpapi", used_units=used)
@@ -579,6 +584,31 @@ async def observe_account(
     await check_serpapi_renewal(conn, cur)
     await save_window(conn, cur)
     return cur
+
+
+async def _account_window(
+    conn: AsyncConnection,
+    account: AccountObservation,
+    *,
+    settings: QuotaSettings,
+    interval_s: int,
+    now: datetime,
+) -> Window | None:
+    """The SerpApi window under its lock, rolled forward (or bootstrapped from `account`), with the read
+    applied (`observe_account`): what `reserve` and `record_account` both run for an account read."""
+    w = await current_window_locked(conn, "serpapi", now, settings, interval_s=interval_s, account=account)
+    if w is None:
+        return None
+    return await observe_account(conn, w, account, settings=settings, interval_s=interval_s, now=now)
+
+
+async def record_account(
+    conn: AsyncConnection, obs: AccountObservation, *, settings: RunSettings, now: datetime
+) -> None:
+    """Persist a SerpApi account read made outside a reservation (the read after the last search of a
+    traversal, §5.3.2) in the caller's transaction: the window lock, the observation and the foreign-usage
+    detection, exactly as `reserve` applies the read it is given."""
+    await _account_window(conn, obs, settings=settings.quota, interval_s=settings.interval_s, now=now)
 
 
 async def reserve(
@@ -606,11 +636,12 @@ async def reserve(
     if not 1 <= attempt_seq <= MAX_ATTEMPT_SEQ:
         raise ValueError(f"attempt_seq must be 1 to {MAX_ATTEMPT_SEQ}, got {attempt_seq}")
     await lock_run_owner(conn, owner)
-    w = await current_window_locked(conn, provider, now, settings, interval_s=interval_s, account=account)
+    if account is not None and provider == "serpapi":
+        w = await _account_window(conn, account, settings=settings, interval_s=interval_s, now=now)
+    else:
+        w = await current_window_locked(conn, provider, now, settings, interval_s=interval_s)
     if w is None:
         return Denial("window_cap")  # SerpApi without an account observation (§6.3)
-    if account is not None and provider == "serpapi":
-        w = await observe_account(conn, w, account, settings=settings, interval_s=interval_s, now=now)
     used = await used_units(conn, provider, w.window_start)
     d = admission(
         w,
