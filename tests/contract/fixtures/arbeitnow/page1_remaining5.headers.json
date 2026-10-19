@@ -1,0 +1,12 @@
+{
+  "status": 200,
+  "headers": {
+    "age": "1440",
+    "cache-control": "private, max-age=432000",
+    "cf-cache-status": "HIT",
+    "content-type": "application/json",
+    "date": "Sun, 18 Oct 2026 20:53:22 GMT",
+    "x-ratelimit-limit": "50",
+    "x-ratelimit-remaining": "5"
+  }
+}

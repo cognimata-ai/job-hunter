@@ -25,6 +25,7 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final, Literal
 
 from pydantic import BaseModel
@@ -48,49 +49,47 @@ _SEMICOLON: Final = re.compile(r"\s*;\s*")
 _CONJUNCTION: Final = re.compile(r"\s+(?:und|oder|or|and)\s+", re.IGNORECASE)
 _SLASH: Final = re.compile(r"(?<=\w\w)\s*/\s*(?=\w\w)")  # not `n/a`
 _HAS_CONTENT: Final = re.compile(r"\w")
+# A site word after a place name (Ashby: "Berlin Office"); it is dropped when what is left is a place.
+_SITE_SUFFIX: Final = re.compile(
+    r"\s+(?:office|offices|büro|buero|hq|headquarters|campus|hub|site)$", re.IGNORECASE
+)
+DISTRICT_KM: Final = 30.0  # `<district>, <city>`: the district lies this close to the city it names
 
-_REMOTE: Final = frozenset({"remote", "homeoffice", "home office", "home-office"})
+_REMOTE: Final = frozenset(
+    {"remote", "homeoffice", "home office", "home-office", "remote job", "remote jobs"}
+)
 _COUNTRY_WIDE: Final = frozenset({"deutschlandweit", "bundesweit", "beliebiger ort", "anywhere"})
-_GERMANY_NAMES: Final = frozenset({"deutschland", "germany", "bundesrepublik deutschland"})
-# The federal states, folded, in German and English. A state is a region, not a place: `Sachsen` must not
-# become the village Sachsen bei Ansbach, nor `Brandenburg` the town Brandenburg an der Havel. The city-states
-# Berlin, Hamburg and Bremen are left out; they are places.
-_LAND_NAMES: Final = frozenset(
+# Germany in German and English, and in the languages postings of German boards also use (V17: Arbeitnow
+# writes "Hamburg, Hamburg, Duitsland").
+_GERMANY_NAMES: Final = frozenset(
+    {"deutschland", "germany", "bundesrepublik deutschland"}
+    | {"duitsland", "allemagne", "alemania", "germania", "niemcy", "nemecko", "tyskland", "almanya"}
+)
+# The federal states, folded, in German and English, with their GeoNames admin1 codes. A state is a region,
+# not a place: `Sachsen` must not become the village Sachsen bei Ansbach, nor `Brandenburg` the town
+# Brandenburg an der Havel. The city-states Berlin, Hamburg and Bremen are left out; they are places.
+_LAND_ADMIN1: Final = MappingProxyType(
     {
-        "baden-wurttemberg",
-        "baden-wuerttemberg",
-        "baden wurttemberg",
-        "bayern",
-        "freistaat bayern",
-        "bavaria",
-        "brandenburg",
-        "hessen",
-        "hesse",
-        "mecklenburg-vorpommern",
-        "mecklenburg vorpommern",
-        "mecklenburg-western pomerania",
-        "niedersachsen",
-        "lower saxony",
-        "nordrhein-westfalen",
-        "nordrhein westfalen",
-        "north rhine-westphalia",
-        "nrw",
-        "rheinland-pfalz",
-        "rheinland pfalz",
-        "rhineland-palatinate",
-        "saarland",
-        "sachsen",
-        "freistaat sachsen",
-        "saxony",
-        "sachsen-anhalt",
-        "saxony-anhalt",
-        "schleswig-holstein",
-        "thuringen",
-        "thueringen",
-        "freistaat thuringen",
-        "thuringia",
+        **dict.fromkeys(("baden-wurttemberg", "baden-wuerttemberg", "baden wurttemberg"), "01"),
+        **dict.fromkeys(("bayern", "freistaat bayern", "bavaria"), "02"),
+        **dict.fromkeys(("hessen", "hesse"), "05"),
+        **dict.fromkeys(("niedersachsen", "lower saxony"), "06"),
+        **dict.fromkeys(
+            ("nordrhein-westfalen", "nordrhein westfalen", "north rhine-westphalia", "nrw"), "07"
+        ),
+        **dict.fromkeys(("rheinland-pfalz", "rheinland pfalz", "rhineland-palatinate"), "08"),
+        "saarland": "09",
+        "schleswig-holstein": "10",
+        "brandenburg": "11",
+        **dict.fromkeys(
+            ("mecklenburg-vorpommern", "mecklenburg vorpommern", "mecklenburg-western pomerania"), "12"
+        ),
+        **dict.fromkeys(("sachsen", "freistaat sachsen", "saxony"), "13"),
+        **dict.fromkeys(("sachsen-anhalt", "saxony-anhalt"), "14"),
+        **dict.fromkeys(("thuringen", "thueringen", "freistaat thuringen", "thuringia"), "15"),
     }
 )
+_LAND_NAMES: Final = frozenset(_LAND_ADMIN1)
 
 
 class Candidate(BaseModel):
@@ -122,6 +121,7 @@ class _Part:
     location: Location | None
     marker: Literal["remote", "country_wide"] | None
     non_de: bool
+    country_only: bool = False  # the part is a country's name and nothing else (`Germany`, `Norway`)
 
 
 def _candidate(place: Place | NonDePlace) -> Candidate | None:
@@ -240,21 +240,82 @@ def _resolve_name(gaz: Gazetteer, text: str, country_hint: str | None) -> tuple[
         return [], False
     candidates = _by_name(gaz, folded)
     country = _country_of(gaz, folded)
-    if not candidates and country is None:
-        head, comma, tail = text.rpartition(",")
-        qualifier = _country_of(gaz, fold(tail)) if comma else None
-        if qualifier is not None:
-            # `<place>, <country>` only. A head that is a list, a country, a state or a marker (`Deutschland,
-            # Österreich`, `Berlin, Hamburg, Austria`, `Remote, Austria`) says nothing about one place.
-            head_folded = fold(head)
-            if not head_folded or "," in head or _is_not_a_place(gaz, head_folded):
-                return [], False
-            candidates = _by_name(gaz, head_folded)
-            country = qualifier
+    if not candidates and country is None and "," in text:
+        return _resolve_qualified(gaz, text, country_hint)
+    return _in_country_result(candidates, country, country_hint)
+
+
+def _in_country_result(
+    candidates: list[Candidate], country: str | None, country_hint: str | None
+) -> tuple[list[Candidate], bool]:
+    """The candidates in `country`. When none lies there, only the German ones are kept: a qualifier that
+    contradicts the name never turns a German place foreign (`Berlin, Austria`), nor moves a city to a third
+    country (`Santa Cruz, Bolivia` is no Spanish Santa Cruz)."""
+    if country is not None and not any(c.country_code == country for c in candidates):
+        candidates = [c for c in candidates if c.country_code == GERMANY]
     candidates = _in_country(_in_country(candidates, country), country_hint)
     if candidates:
         return candidates, all(c.country_code != GERMANY for c in candidates)
     return [], country is not None and country != GERMANY
+
+
+def _german(gaz: Gazetteer, folded: str, *, admin1: str | None) -> list[Candidate]:
+    """The German places named `folded`, those in the federal state `admin1` when there are any."""
+    places = gaz.by_name(folded)
+    inside = [p for p in places if p.admin1 == admin1] if admin1 is not None else []
+    return [c for p in inside or places if (c := _candidate(p)) is not None]
+
+
+def _german_near(gaz: Gazetteer, district: str, city: str) -> list[Candidate]:
+    """`<district>, <city>`: the German places named `district` within `DISTRICT_KM` of a `city` place and
+    smaller than it. Two cities near each other (`Köln, Bonn`, `Berlin, Potsdam`) are a list, not a district
+    and its city, and stay unresolved (§8.12: positive evidence only)."""
+    cities = gaz.by_name(city)
+    near = [
+        d
+        for d in gaz.by_name(district)
+        if any(
+            d.population < c.population and distance_km(d.lat, d.lon, c.lat, c.lon) <= DISTRICT_KM
+            for c in cities
+        )
+    ]
+    return [c for p in near if (c := _candidate(p)) is not None]
+
+
+def _resolve_qualified(gaz: Gazetteer, text: str, country_hint: str | None) -> tuple[list[Candidate], bool]:
+    """A place qualified by commas, resolved only where the gazetteer confirms the qualifier (V17):
+
+    - `<place>, <country>` (`Zürich, Schweiz`): the candidates in that country;
+    - `<city>, <federal state>` (`Munich, Bavaria`): the German candidates in that state;
+    - `<district>, <city>` (`Kreuzberg, Berlin`): the German candidates near that city and smaller than it;
+    - `<city>, <state>, <country>` (`Detmold, Nordrhein-Westfalen, Deutschland`; `Berlin, Berlin, Germany`, a
+      city-state under its own name; `Amsterdam, Noord-Holland, Netherlands`): the city in that state or
+      country. Abroad the middle must be no German place, state, country or marker.
+
+    Empty parts (`Barcelona, , Spain`) are dropped. Anything else is a list or a guess and stays unresolved:
+    `Berlin, Hamburg`, `Berlin, Hamburg, Austria`, and a head that is a country, a state or a marker
+    (`Deutschland, Österreich`, `Remote, Austria`), which says nothing about one place.
+    """
+    parts = [part for part in (norm_text(piece).strip() for piece in text.split(",")) if part]
+    folded = [fold(part) for part in parts]
+    if not 2 <= len(parts) <= 3 or _is_not_a_place(gaz, folded[0]):
+        return [], False
+    head, tail = folded[0], folded[-1]
+    country = _country_of(gaz, tail)
+    if len(parts) == 2:
+        if country is not None:
+            return _in_country_result(_by_name(gaz, head), country, country_hint)
+        if (admin1 := _LAND_ADMIN1.get(tail)) is not None:
+            return _german(gaz, head, admin1=admin1), False
+        return _german_near(gaz, head, tail), False
+    middle = folded[1]
+    if country == GERMANY:
+        if (admin1 := _LAND_ADMIN1.get(middle)) is not None:
+            return _german(gaz, head, admin1=admin1), False
+        return (_german(gaz, head, admin1=None), False) if middle == head else ([], False)
+    if country is None or gaz.is_german_place_name(middle) or _is_not_a_place(gaz, middle):
+        return [], False
+    return _in_country_result(_by_name(gaz, head), country, country_hint)
 
 
 def _is_not_a_place(gaz: Gazetteer, folded: str) -> bool:
@@ -270,6 +331,8 @@ def _is_not_a_place(gaz: Gazetteer, folded: str) -> bool:
 def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | None) -> _Part:
     if not _is_known(gaz, fold(part)):
         part = _TRAILING_PARENTHETICAL.sub("", part).strip(" ,") or part
+    if not _is_known(gaz, fold(part)) and _is_known(gaz, fold(site := _SITE_SUFFIX.sub("", part))):
+        part = site
     folded = fold(part)
     if folded in _REMOTE:
         return _Part(None, "remote", False)
@@ -299,7 +362,8 @@ def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | No
         postal_code=postal_code,
         source=source,
     )
-    return _Part(location, None, non_de)
+    country_only = not candidates and postal_code is None and _country_of(gaz, fold(name)) is not None
+    return _Part(location, None, non_de, country_only)
 
 
 def _parse(text: str, *, source: str, country_hint: str | None) -> ParsedLocations:
@@ -320,6 +384,8 @@ def _parse(text: str, *, source: str, country_hint: str | None) -> ParsedLocatio
     kind: LocationKind
     if not locations:
         kind = "country_wide" if "country_wide" in markers else "remote"
+    elif all(p.country_only for p in parts if p.location is not None):
+        kind = "country_wide"  # a whole country (V17: Ashby's `Germany`); it stays an unresolved location
     else:
         kind = "multi" if len(locations) > 1 else "city"
     return ParsedLocations(locations, kind, all(p.non_de for p in parts))

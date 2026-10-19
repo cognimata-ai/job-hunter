@@ -1,0 +1,19 @@
+{
+  "source": "ats",
+  "case": "lever_leverdemo",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://api.lever.co/v0/postings/leverdemo",
+  "params": {
+    "mode": "json",
+    "skip": "0",
+    "limit": "100"
+  },
+  "fetched_at": "2026-10-18T20:49:42.410699+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 815,
+  "free": false,
+  "body_bytes": 83523,
+  "body_sha256": "[token:6]"
+}

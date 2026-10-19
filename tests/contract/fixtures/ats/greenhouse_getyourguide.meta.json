@@ -1,0 +1,17 @@
+{
+  "source": "ats",
+  "case": "greenhouse_getyourguide",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://boards-api.greenhouse.io/v1/boards/getyourguide/jobs",
+  "params": {
+    "content": "true"
+  },
+  "fetched_at": "2026-10-18T20:49:40.018065+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 701,
+  "free": false,
+  "body_bytes": 658225,
+  "body_sha256": "[token:3]"
+}

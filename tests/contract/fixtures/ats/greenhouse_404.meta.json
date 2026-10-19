@@ -1,0 +1,17 @@
+{
+  "source": "ats",
+  "case": "greenhouse_404",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://boards-api.greenhouse.io/v1/boards/jobhunter-nonexistent-board/jobs",
+  "params": {
+    "content": "true"
+  },
+  "fetched_at": "2026-10-18T20:49:41.097206+00:00",
+  "status": 404,
+  "error": null,
+  "duration_ms": 408,
+  "free": false,
+  "body_bytes": 38,
+  "body_sha256": "[token:2]"
+}

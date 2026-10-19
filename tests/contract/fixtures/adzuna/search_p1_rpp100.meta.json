@@ -1,0 +1,20 @@
+{
+  "source": "adzuna",
+  "case": "search_p1_rpp100",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://api.adzuna.com/v1/api/jobs/de/search/1",
+  "params": {
+    "what": "software engineer",
+    "where": "Berlin",
+    "sort_by": "date",
+    "results_per_page": "100"
+  },
+  "fetched_at": "2026-10-18T20:53:08.390549+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 1508,
+  "free": false,
+  "body_bytes": 66630,
+  "body_sha256": "[token:169]"
+}

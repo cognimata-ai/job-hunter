@@ -1,0 +1,17 @@
+{
+  "source": "arbeitnow",
+  "case": "page1",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://www.arbeitnow.com/api/job-board-api",
+  "params": {
+    "page": "1"
+  },
+  "fetched_at": "2026-10-18T20:53:22.645912+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 548,
+  "free": false,
+  "body_bytes": 2045166,
+  "body_sha256": "[token:14]"
+}

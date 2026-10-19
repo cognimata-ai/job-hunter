@@ -1,0 +1,1081 @@
+{
+  "offset": 0,
+  "limit": 100,
+  "totalFound": 150,
+  "content": [
+    {
+      "id": "744000156183719",
+      "name": "Analytics Engineer II",
+      "uuid": "567d87fc-2097-4f79-ac35-81c80b69b1c2",
+      "jobAdId": "bff1fe9b-88c1-48ad-b6c3-87adac491278",
+      "defaultJobAd": true,
+      "refNumber": "REF19355C",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-18T11:21:35.758Z",
+      "location": {
+        "city": "Dubai",
+        "region": "Dubai",
+        "country": "ae",
+        "remote": false,
+        "hybrid": false,
+        "latitude": "25.2048493",
+        "longitude": "55.2707828",
+        "fullLocation": "Dubai, Dubai, United Arab Emirates"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "information_technology",
+        "label": "Information Technology"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "talabat",
+          "valueLabel": "talabat"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "b475b918a299012772704e344e013005",
+          "valueLabel": "Data Analyst/BI"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "ef2e8d3982de010dd4be36e9d1161500",
+          "valueLabel": "Data"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "1546ec10dc661001a29082bd1f080000",
+          "valueLabel": "IT - Data Science & Engineering - 01 - 1 - HIE11780"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "ae",
+          "valueLabel": "United Arab Emirates"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de01df9ed10f45d2163700",
+          "valueLabel": "IC2"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "e8ceac9423040136e46bf15a105dbb78",
+          "valueLabel": "Dubai - City Walk (Talabat HQ)"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "a2e7316c822c100094643577d9a50000",
+          "valueLabel": "Data Analytics - IC2"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156183719",
+      "creator": {
+        "name": "[person:8]"
+      },
+      "language": {
+        "code": "en",
+        "label": "English",
+        "labelNative": "English (US)"
+      }
+    },
+    {
+      "id": "744000156094379",
+      "name": "Advertising Sr Manager",
+      "uuid": "f4f9c9e0-81f5-4b68-8c28-9431ad6d41f0",
+      "jobAdId": "5939ba0b-7f38-4e32-b5e1-38afecb73435",
+      "defaultJobAd": true,
+      "refNumber": "JR0087910",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T23:42:10.409Z",
+      "location": {
+        "city": "Buenos Aires",
+        "country": "ar",
+        "remote": false,
+        "hybrid": true,
+        "fullLocation": "Buenos Aires, , Argentina"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "sales",
+        "label": "Sales"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "PedidosYa",
+          "valueLabel": "PedidosYa"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "75439315e9751000915150c1ccdc0000",
+          "valueLabel": "Sales Account Management"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "75439315e97510004b9c1be43b920000",
+          "valueLabel": "Sales"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "6c2cb05586e90169e1f84017f90028a3",
+          "valueLabel": "Commercial - Sales - ARG - Team Y - HIE01093"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "ar",
+          "valueLabel": "Argentina"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de01107cabc544d2162b00",
+          "valueLabel": "M2"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "faf13b71c1170168d6b5d3e83f01f407",
+          "valueLabel": "Buenos Aires - Centro Empresarial Libertador"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "0b9bd6d5dac71000949fb1dce7e50000",
+          "valueLabel": "Mid-Size Account Management - M2"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156094379",
+      "language": {
+        "code": "es-MX",
+        "label": "Spanish (LATAM)",
+        "labelNative": "español (LATAM)"
+      }
+    },
+    {
+      "id": "744000156066650",
+      "name": "Growth Commercial Manager",
+      "uuid": "3fc8f87c-e6e3-4c19-8aee-8f58ecfe1d10",
+      "jobAdId": "daad7ba9-c795-4be5-a9ae-0fc90af6d7d6",
+      "defaultJobAd": true,
+      "refNumber": "JR0087858",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T19:17:26.321Z",
+      "location": {
+        "city": "San Salvador",
+        "country": "sv",
+        "remote": false,
+        "hybrid": true,
+        "fullLocation": "San Salvador, , El Salvador"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "sales",
+        "label": "Sales"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "PedidosYa",
+          "valueLabel": "PedidosYa"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "75439315e9751000914c03e872460000",
+          "valueLabel": "Sales & Business Development"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "75439315e97510004b9c1be43b920000",
+          "valueLabel": "Sales"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "a72573cfa0730100fb41c093929e0000",
+          "valueLabel": "Local - Business Development - SV - HIE05464"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "sv",
+          "valueLabel": "El Salvador"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de012e0493d244d2162d00",
+          "valueLabel": "M1"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "41de4932dc8b01172040f9c3dc01fe85",
+          "valueLabel": "San Salvador - Plaza Futura"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "0b9bd6d5dac71000949d7be1bdfd0000",
+          "valueLabel": "Sales Acquisition - M1"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156066650",
+      "language": {
+        "code": "es-MX",
+        "label": "Spanish (LATAM)",
+        "labelNative": "español (LATAM)"
+      }
+    },
+    {
+      "id": "744000156067009",
+      "name": "Logistics Analyst",
+      "uuid": "e1358e5a-056e-42ba-acd9-bffef6df342f",
+      "jobAdId": "69037acc-edc7-4570-905d-d2df8b751d48",
+      "defaultJobAd": true,
+      "refNumber": "JR0087932",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T19:07:41.444Z",
+      "location": {
+        "city": "Montevideo",
+        "country": "uy",
+        "remote": false,
+        "hybrid": true,
+        "fullLocation": "Montevideo, , Uruguay"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "general_business",
+        "label": "General Business"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "associate",
+        "label": "Associate"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "PedidosYa",
+          "valueLabel": "PedidosYa"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "b475b918a2990102bdb14a344e011805",
+          "valueLabel": "Logistics Operations"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "75439315e97510004b7105c2e3100000",
+          "valueLabel": "Logistics"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "75439315e9751000c73754c2974d0000",
+          "valueLabel": "Local- Logistics Operations - Rider Ops - Team JI - HIE10519"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "uy",
+          "valueLabel": "Uruguay"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de01acdf1d1c45d2163900",
+          "valueLabel": "IC1"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "faf13b71c117018402e3c8e83f01c207",
+          "valueLabel": "Montevideo - Plaza Alemania"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "0b9bd6d5dac7100094778e2552a70000",
+          "valueLabel": "Country Logistics - IC1"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156067009",
+      "language": {
+        "code": "es-MX",
+        "label": "Spanish (LATAM)",
+        "labelNative": "español (LATAM)"
+      }
+    },
+    {
+      "id": "744000156064709",
+      "name": "Site Reliability Engineering Manager",
+      "uuid": "dc853e15-4413-4db0-957c-009de04be5b0",
+      "jobAdId": "22202a7c-ff22-4b9d-9589-df830c034ca0",
+      "defaultJobAd": true,
+      "refNumber": "JR0087362",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T18:49:10.766Z",
+      "location": {
+        "city": "Montevideo",
+        "country": "uy",
+        "remote": false,
+        "hybrid": true,
+        "fullLocation": "Montevideo, , Uruguay"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "information_technology",
+        "label": "Information Technology"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "PedidosYa",
+          "valueLabel": "PedidosYa"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "b475b918a29901e7cf4c4b344e011c05",
+          "valueLabel": "Software Engineering"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "ef2e8d3982de01cea74d59c3d1160900",
+          "valueLabel": "Tech"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "3014a2f935e7017bfcb0061438011e4a",
+          "valueLabel": "Business Intelligence - BI - URY - Team D - HIE01219"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "uy",
+          "valueLabel": "Uruguay"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de012e0493d244d2162d00",
+          "valueLabel": "M1"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "faf13b71c117018402e3c8e83f01c207",
+          "valueLabel": "Montevideo - Plaza Alemania"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "fab1bc7302a210009da554d583eb0000",
+          "valueLabel": "Back-End Software Engineer - M1"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156064709",
+      "language": {
+        "code": "es-MX",
+        "label": "Spanish (LATAM)",
+        "labelNative": "español (LATAM)"
+      }
+    },
+    {
+      "id": "744000156063229",
+      "name": "Sr Site Reliability Engineer",
+      "uuid": "cf166564-e88c-45dd-9ac6-75cb52112cb9",
+      "jobAdId": "16f5a0bb-ae34-4818-b9b4-2b4aacf009d4",
+      "defaultJobAd": true,
+      "refNumber": "JR0087368",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T18:42:39.187Z",
+      "location": {
+        "city": "Montevideo",
+        "region": "Montevideo Department",
+        "country": "uy",
+        "remote": false,
+        "hybrid": true,
+        "latitude": "-34.9055016",
+        "longitude": "-56.1851147",
+        "fullLocation": "Montevideo, Montevideo Department, Uruguay"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "information_technology",
+        "label": "Information Technology"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "PedidosYa",
+          "valueLabel": "PedidosYa"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "b475b918a29901000c3550344e013a05",
+          "valueLabel": "Infrastructure Engineering"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "ef2e8d3982de01cea74d59c3d1160900",
+          "valueLabel": "Tech"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "a405195630751001f224102c69450000",
+          "valueLabel": "Technology - Engineering - URY - Team EL - HIE08426"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "uy",
+          "valueLabel": "Uruguay"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de0186768e0345d2163500",
+          "valueLabel": "IC3"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "26beb18030061001ef7f00d22c000000",
+          "valueLabel": "Buenos Aires - Casa Peya"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "a2e7316c822c100094a487c88fc30000",
+          "valueLabel": "Infrastructure Engineer - IC3"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156063229",
+      "language": {
+        "code": "es-MX",
+        "label": "Spanish (LATAM)",
+        "labelNative": "español (LATAM)"
+      }
+    },
+    {
+      "id": "744000156053160",
+      "name": "Facilities Sr Analyst",
+      "uuid": "cabe8c83-ef7f-4347-90b6-540c1e079654",
+      "jobAdId": "af6fac92-81ab-49a1-9aae-5a11cc14bee0",
+      "defaultJobAd": true,
+      "refNumber": "JR0087958",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T17:32:21.923Z",
+      "location": {
+        "city": "Santa Cruz",
+        "country": "bo",
+        "remote": false,
+        "hybrid": false,
+        "fullLocation": "Santa Cruz, , Bolivia"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "management",
+        "label": "Management"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "PedidosYa",
+          "valueLabel": "PedidosYa"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "b475b918a29901ab99254e344e012e05",
+          "valueLabel": "Management Support"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "ef2e8d3982de0160fb4ea0fdd1161700",
+          "valueLabel": "Management"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "50b64d01981c0130cfa1427a98010324",
+          "valueLabel": "International - Dark Store - CHL - Team G - HIE01929"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "bo",
+          "valueLabel": "Bolivia"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de01df9ed10f45d2163700",
+          "valueLabel": "IC2"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "faf13b71c117011521ebd0e83f01ea07",
+          "valueLabel": "Santa Cruz - Manzana 40"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "0b9bd6d5dac71000947c58e9421d0000",
+          "valueLabel": "Facilities Management - IC2"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156053160",
+      "language": {
+        "code": "es-MX",
+        "label": "Spanish (LATAM)",
+        "labelNative": "español (LATAM)"
+      }
+    },
+    {
+      "id": "744000156044175",
+      "name": "Evergreen Sales Executive SMB Italy",
+      "uuid": "99a51b6b-5d5c-488b-a8e4-a8e041136db9",
+      "jobAdId": "01bed744-690c-4045-bf0f-5b48660f38c0",
+      "defaultJobAd": true,
+      "refNumber": "JR0075764",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T16:34:25.987Z",
+      "location": {
+        "city": "Milan",
+        "region": "Lombardy",
+        "country": "it",
+        "remote": false,
+        "hybrid": true,
+        "latitude": "45.468503",
+        "longitude": "9.182402699999999",
+        "fullLocation": "Milan, Lombardy, Italy"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "sales",
+        "label": "Sales"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "associate",
+        "label": "Associate"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "Glovo",
+          "valueLabel": "Glovo"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "75439315e9751000914c03e872460000",
+          "valueLabel": "Sales & Business Development"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "75439315e97510004b9c1be43b920000",
+          "valueLabel": "Sales"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "2446ff07ae4e1001e0410962448a0000",
+          "valueLabel": "Partners & Brands - SMB Sales & AM & Content - Italy - HIE97120"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "it",
+          "valueLabel": "Italy"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de01acdf1d1c45d2163900",
+          "valueLabel": "IC1"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "121954fc96081001b7d1728dde400000",
+          "valueLabel": "Milan - Giovanni Battista Pirelli"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "a2e7316c822c1000949d3f0414210000",
+          "valueLabel": "Sales Acquisition - IC1"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156044175",
+      "language": {
+        "code": "en",
+        "label": "English",
+        "labelNative": "English (US)"
+      }
+    },
+    {
+      "id": "744000156041559",
+      "name": "Strategic Account Manager - Global Partnerships",
+      "uuid": "2784a862-998e-401c-8644-9bba030f903c",
+      "jobAdId": "cbb55210-e61a-4276-994b-6649260ec050",
+      "defaultJobAd": true,
+      "refNumber": "JR0084293",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T16:15:23.732Z",
+      "location": {
+        "city": "Barcelona",
+        "country": "es",
+        "remote": false,
+        "hybrid": true,
+        "hybridDescription": "3 days on site / 2 days WFH",
+        "fullLocation": "Barcelona, , Spain"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "general_business",
+        "label": "General Business"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "Glovo",
+          "valueLabel": "Glovo"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "b475b918a29901bba09158344e016205",
+          "valueLabel": "General Operations"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "ef2e8d3982de01af01204cd9d1161100",
+          "valueLabel": "Operations"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "6b8a0a449bb1100147088c0b8e770000",
+          "valueLabel": "Q Commerce - Retail Sales - HIE14708"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "es",
+          "valueLabel": "Spain"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de01df9ed10f45d2163700",
+          "valueLabel": "IC2"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "5abc96616cc11000ae713ac737c70000",
+          "valueLabel": "Barcelona - Yellow Park"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "a2e7316c822c10009487d54e65c60000",
+          "valueLabel": "Content Support - IC2"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156041559",
+      "language": {
+        "code": "en",
+        "label": "English",
+        "labelNative": "English (US)"
+      }
+    },
+    {
+      "id": "744000156040669",
+      "name": "Lead Indirect Procurement",
+      "uuid": "e3af0065-314a-4d55-a50a-83d11af20864",
+      "jobAdId": "d3539e1b-10fe-42d9-9160-713ba7042f15",
+      "defaultJobAd": true,
+      "refNumber": "JR0086973",
+      "company": {
+        "identifier": "DeliveryHero",
+        "name": "Delivery Hero"
+      },
+      "releasedDate": "2026-10-16T16:10:10.153Z",
+      "location": {
+        "city": "Barcelona",
+        "country": "es",
+        "remote": false,
+        "hybrid": true,
+        "hybridDescription": "3 days on site / 2 days WFH",
+        "fullLocation": "Barcelona, , Spain"
+      },
+      "industry": {
+        "id": "internet",
+        "label": "Internet"
+      },
+      "department": {},
+      "function": {
+        "id": "finance",
+        "label": "Finance"
+      },
+      "typeOfEmployment": {
+        "id": "permanent",
+        "label": "Full-time"
+      },
+      "experienceLevel": {
+        "id": "mid_senior_level",
+        "label": "Mid-Senior Level"
+      },
+      "customField": [
+        {
+          "fieldId": "6564ae9ddd552072c3a97453",
+          "fieldLabel": "Time Type",
+          "valueId": "421938a4e1d40118e396324490147300",
+          "valueLabel": "Full time"
+        },
+        {
+          "fieldId": "655ce69d695b8c5663cf1f55",
+          "fieldLabel": "Brands",
+          "valueId": "Glovo",
+          "valueLabel": "Glovo"
+        },
+        {
+          "fieldId": "6564ad6b1cf48c421e22419d",
+          "fieldLabel": "Job Family",
+          "valueId": "fc0b7663136b10009cc2a415674c0000",
+          "valueLabel": "Procurement"
+        },
+        {
+          "fieldId": "6564ad3fee5f2f5b84045448",
+          "fieldLabel": "Job Family Group",
+          "valueId": "ef2e8d3982de0154ceac3dccd1160d00",
+          "valueLabel": "Finance"
+        },
+        {
+          "fieldId": "6564aa853d74d30a33089d2a",
+          "fieldLabel": "Supervisory Organization",
+          "valueId": "1924780951e41001df8cb2589ffa0000",
+          "valueLabel": "Operations - Procurement - HIE95002"
+        },
+        {
+          "fieldId": "COUNTRY",
+          "fieldLabel": "Country/Region",
+          "valueId": "es",
+          "valueLabel": "Spain"
+        },
+        {
+          "fieldId": "6564ad09560ccd2ba9e90d24",
+          "fieldLabel": "Management Level",
+          "valueId": "ef2e8d3982de0186768e0345d2163500",
+          "valueLabel": "IC3"
+        },
+        {
+          "fieldId": "6564ae71dd552072c3a97452",
+          "fieldLabel": "Worker Sub-Type",
+          "valueId": "ef2e8d3982de0123e1696445d2164400",
+          "valueLabel": "Permanent"
+        },
+        {
+          "fieldId": "6564abc0d641ff6fc90ebd6d",
+          "fieldLabel": "Primary Location",
+          "valueId": "5abc96616cc11000ae713ac737c70000",
+          "valueLabel": "Barcelona - Yellow Park"
+        },
+        {
+          "fieldId": "6564ada8e5ee8c3d9bec3405",
+          "fieldLabel": "Job Profile",
+          "valueId": "0b9bd6d5dac710009470d2d89e6c0000",
+          "valueLabel": "Procurement Strategy - IC3"
+        }
+      ],
+      "visibility": "PUBLIC",
+      "ref": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156040669",
+      "language": {
+        "code": "en",
+        "label": "English",
+        "labelNative": "English (US)"
+      }
+    }
+  ]
+}

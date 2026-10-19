@@ -1,0 +1,20 @@
+{
+  "source": "serpapi",
+  "case": "google_jobs_hl_en",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://serpapi.com/search.json",
+  "params": {
+    "engine": "google_jobs",
+    "q": "software engineer Berlin",
+    "gl": "de",
+    "hl": "en"
+  },
+  "fetched_at": "2026-10-18T20:50:47.975430+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 13580,
+  "free": false,
+  "body_bytes": 114392,
+  "body_sha256": "[token:52]"
+}

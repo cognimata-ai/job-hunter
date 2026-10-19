@@ -286,7 +286,9 @@ def test_no_german_place_name_is_ever_positively_foreign() -> None:
         ("Kleinkleckersdorf, Deutschland", [[]], False),
         ("Berlin, Austria", [["DE"]], False),  # a country that contradicts the name does not turn it foreign
         ("Berlin, Hamburg", [[]], False),  # a list or a qualifier? Not guessed.
-        ("Berlin, Berlin, Germany", [[]], False),
+        # V17 (Task 6): a city-state named twice, then its country, is the city (Arbeitnow's `<city>, <state>,
+        # <country>`); a list of two different places (above; `Berlin, Hamburg, Austria`) is still not guessed
+        ("Berlin, Berlin, Germany", [["DE"]], False),
     ],
 )
 def test_a_trailing_country_selects_candidates(text: str, countries_: list[list[str]], foreign: bool) -> None:
@@ -521,3 +523,111 @@ def test_locations_round_trip_through_json() -> None:
     assert set(dumped[0]) == {"label", "resolution", "candidates", "postal_code", "source"}
     assert set(dumped[0]["candidates"][0]) == {"gazetteer_id", "country_code", "lat", "lon"}
     assert [Location.model_validate(d) for d in dumped] == parsed.locations
+
+
+# V17 (Task 6): the forms of the recorded fixtures that the parser left unresolved. A comma qualifies a name
+# only when the gazetteer says so (a district near its city, a city in its federal state, a city under its own
+# name as state); a list of places stays unresolved, and nothing becomes foreign that names Germany.
+@pytest.mark.parametrize(
+    ("text", "admin1"),
+    [
+        ("Kreuzberg, Berlin", "16"),  # Adzuna: <district>, <city>
+        ("Mariendorf, Berlin", "16"),
+        ("Potsdam, Brandenburg", "11"),  # <city>, <federal state>, in German or English
+        ("Munich, Bavaria", "02"),
+        ("Eschborn, Hesse", "05"),
+        ("Düsseldorf, North Rhine-Westphalia", "07"),
+        ("Detmold, Nordrhein-Westfalen, Deutschland", "07"),  # Arbeitnow: <city>, <state>, <country>
+        ("München, Bayern, Deutschland", "02"),
+        ("Munich, Bayern, Germany", "02"),
+        ("Berlin, Berlin, Deutschland", "16"),  # a city-state under its own name
+        ("Hamburg, Hamburg, Duitsland", "04"),  # Germany in Dutch
+    ],
+)
+def test_a_qualified_german_place_resolves_in_its_area(text: str, admin1: str) -> None:
+    p = parse(text)
+    (loc,) = p.locations
+    assert loc.resolution == "unique" and not p.positively_non_de, text
+    (candidate,) = loc.candidates
+    place = next(
+        pl
+        for pl in Gazetteer.load().by_name(candidate_name(text))
+        if pl.gazetteer_id == candidate.gazetteer_id
+    )
+    assert place.admin1 == admin1, text
+
+
+def candidate_name(text: str) -> str:
+    from jobhunter.normalize.text import fold
+
+    head = text.split(",")[0].strip()
+    return fold({"munich": "münchen"}.get(fold(head), head))
+
+
+@pytest.mark.parametrize(
+    ("text", "code"),
+    [
+        ("Amsterdam, Noord-Holland, Netherlands", "NL"),
+        ("Barcelona, , Spain", "ES"),
+        ("Milan, Lombardy, Italy", "IT"),
+        ("Sofia, Sofia (stolitsa), Bulgaria", "BG"),
+    ],
+)
+def test_a_qualified_foreign_city_resolves_in_its_country(text: str, code: str) -> None:
+    p = parse(text)
+    (loc,) = p.locations
+    assert [c.country_code for c in loc.candidates] == [code] and p.positively_non_de, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Berlin, Hamburg",
+        "Berlin, Hamburg, Germany",
+        "Berlin, Hamburg, Austria",
+        "Deutschland, Österreich, Schweiz",
+    ],
+)
+def test_a_comma_list_of_places_stays_unresolved(text: str) -> None:
+    p = parse(text)
+    assert all(loc.resolution == "unresolved" for loc in p.locations) and not p.positively_non_de, text
+
+
+def test_an_office_suffix_and_a_remote_job_marker() -> None:
+    assert countries("Berlin Office") == [["DE"]] and countries("London Office") == [["GB"]]
+    assert parse("Remote job").kind == "remote" and parse("Remote jobs").locations == []
+
+
+@pytest.mark.parametrize(
+    ("text", "foreign"),
+    [
+        ("Germany", False),
+        ("Deutschland", False),
+        ("Norway", True),
+        ("Bosnia", True),
+        ("Czech Republic", True),
+    ],
+)
+def test_a_bare_country_name_is_country_wide(text: str, foreign: bool) -> None:
+    p = parse(text)
+    assert p.kind == "country_wide" and p.positively_non_de is foreign, text
+    (loc,) = p.locations  # the country stays a (unresolved) location, as before
+    assert loc.resolution == "unresolved"
+
+
+def test_a_foreign_qualifier_never_moves_a_city_to_another_foreign_country() -> None:
+    # V17: SmartRecruiters' `Santa Cruz, , Bolivia` is no Spanish Santa Cruz; a German name stays German
+    p = parse("Santa Cruz, , Bolivia")
+    assert [loc.resolution for loc in p.locations] == ["unresolved"] and p.positively_non_de
+    assert countries("Santa Cruz, Bolivia") == [[]] and countries("Berlin, Austria") == [["DE"]]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Köln, Bonn", "Berlin, Potsdam", "Nürnberg, Fürth", "Mannheim, Heidelberg", "Düsseldorf, Neuss"],
+)
+def test_a_list_of_neighbouring_cities_stays_unresolved(text: str) -> None:
+    # 6a review, finding 5: `<district>, <city>` needs the head to be smaller than the city it names (§8.12:
+    # positive evidence only); two cities near each other are a list, not a district and its city
+    p = parse(text)
+    assert [loc.resolution for loc in p.locations] == ["unresolved"] and not p.positively_non_de, text

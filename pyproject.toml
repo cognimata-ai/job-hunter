@@ -56,5 +56,7 @@ markers = [
     "stack: needs the full docker compose stack",
     "slow: takes more than a few seconds",
     "perf: performance measurement, never a correctness assertion",
+    "contract: runs an adapter or the fixture scan on the scrubbed fixtures (tests/contract, spec §18.4)",
+    "live: calls a real provider; never run in CI and deselected by default",
 ]
-addopts = "-m 'not stack and not perf'"
+addopts = "-m 'not stack and not perf and not live'"

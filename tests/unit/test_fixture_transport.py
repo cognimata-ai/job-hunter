@@ -34,11 +34,78 @@ async def test_routes_by_host_path_and_query(tmp_path: Path) -> None:
         assert nowhere.status_code == 404 and nowhere.json() == {"error": "no fixture"}
 
 
-def test_the_shipped_routes_are_the_two_jsearch_routes() -> None:
-    assert [(r.host, r.path.pattern, dict(r.query), r.file) for r in ROUTES] == [
-        ("jsearch.p.rapidapi.com", "/search-v2", {}, "jsearch/search_v2_page1"),
-        ("jsearch.p.rapidapi.com", "/search", {}, "jsearch/search_legacy_404"),
-    ]
+SHIPPED = Path(__file__).resolve().parents[2] / "tests/contract/fixtures"
+# What the fake worker sends and the case each request is served (Task 6: a route per recorded case it uses).
+SHIPPED_REQUESTS = [
+    (
+        "https://jsearch.p.rapidapi.com/search-v2?query=x&country=de&date_posted=week",
+        "jsearch/search_v2_page1",
+    ),
+    ("https://jsearch.p.rapidapi.com/search-v2?query=x&date_posted=week&cursor=c", "jsearch/search_v2_page2"),
+    ("https://jsearch.p.rapidapi.com/search-v2?query=x&date_posted=today", "jsearch/search_v2_today"),
+    ("https://jsearch.p.rapidapi.com/search?query=x", "jsearch/search_legacy_404"),
+    ("https://serpapi.com/account.json?api_key=k", "serpapi/account_before"),
+    ("https://serpapi.com/search.json?engine=google_jobs&q=x&api_key=k", "serpapi/google_jobs_hl_en"),
+    ("https://api.adzuna.com/v1/api/jobs/de/search/1?what=x", "adzuna/adzuna_reingest_pair"),
+    ("https://api.adzuna.com/v1/api/jobs/de/search/2?what=x", "adzuna/search_empty"),
+    ("https://www.arbeitnow.com/api/job-board-api?page=1", "arbeitnow/page1"),
+    ("https://www.arbeitnow.com/api/job-board-api?page=2", "arbeitnow/page2"),
+    ("https://www.arbeitnow.com/api/job-board-api?page=3", "arbeitnow/page_end"),
+    (
+        "https://boards-api.greenhouse.io/v1/boards/getyourguide/jobs?content=true",
+        "ats/greenhouse_getyourguide",
+    ),
+    ("https://boards-api.greenhouse.io/v1/boards/nobody/jobs?content=true", "ats/greenhouse_404"),
+    ("https://api.lever.co/v0/postings/leverdemo?mode=json&skip=0&limit=100", "ats/lever_leverdemo"),
+    ("https://api.eu.lever.co/v0/postings/leverdemo?mode=json&skip=0&limit=100", "ats/lever_eu_leverdemo"),
+    ("https://api.eu.lever.co/v0/postings/leverdemo?mode=json&skip=100&limit=100", "ats/lever_eu_end"),
+    ("https://api.lever.co/v0/postings/nobody?mode=json&skip=0&limit=100", "ats/lever_404"),
+    ("https://api.ashbyhq.com/posting-api/job-board/n8n?includeCompensation=true", "ats/ashby_n8n"),
+    ("https://api.ashbyhq.com/posting-api/job-board/nobody?includeCompensation=true", "ats/ashby_404"),
+    ("https://everphone.jobs.personio.de/xml", "ats/personio_everphone"),
+    ("https://nobody.jobs.personio.de/xml", "ats/personio_404"),
+    ("https://bunq.recruitee.com/api/offers/", "ats/recruitee_bunq"),
+    ("https://nobody.recruitee.com/api/offers/", "ats/recruitee_404"),
+    (
+        "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings?limit=100&offset=0",
+        "ats/smartrecruiters_deliveryhero_list",
+    ),
+    (
+        "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156183719",
+        "ats/smartrecruiters_deliveryhero_detail_1",
+    ),
+    (
+        "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156094379",
+        "ats/smartrecruiters_deliveryhero_detail_2",
+    ),
+    ("https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/1", "ats/smartrecruiters_404"),
+    (
+        "https://api.smartrecruiters.com/v1/companies/nobody/postings?limit=100&offset=0",
+        "ats/smartrecruiters_404",
+    ),
+]
+
+
+def test_every_shipped_route_serves_a_shipped_fixture() -> None:
+    for route in ROUTES:
+        status, _headers, body = fixtures.load_case(SHIPPED, route.file)  # raises when the case is missing
+        assert body and 200 <= status < 600, route.file
+
+
+@pytest.mark.parametrize(("url", "case"), SHIPPED_REQUESTS)
+def test_the_shipped_routes_serve_the_fake_worker(url: str, case: str) -> None:
+    request = httpx.Request("GET", url)
+    assert next(route.file for route in ROUTES if route.matches(request)) == case
+    if "_detail_" in case:  # a detail is the posting the path names (6a review, finding 1)
+        _status, _headers, body = fixtures.load_case(SHIPPED, case)
+        assert json.loads(body)["id"] == request.url.path.rsplit("/", 1)[1]
+
+
+def test_a_wildcard_host_matches_every_subdomain_and_only_those() -> None:
+    route = Route("*.jobs.personio.de", re.compile(r"/xml"), {}, "x")
+    assert route.matches(httpx.Request("GET", "https://acme.jobs.personio.de/xml"))
+    assert not route.matches(httpx.Request("GET", "https://jobs.personio.de.evil.example/xml"))
+    assert not route.matches(httpx.Request("GET", "https://acmejobs.personio.de/xml"))
 
 
 async def test_query_constraints_first_match_and_the_served_request_log(
@@ -98,3 +165,25 @@ async def test_a_route_without_its_fixture_file_fails_loudly(tmp_path: Path) -> 
     async with httpx.AsyncClient(transport=fixture_transport(tmp_path)) as c:
         with pytest.raises(FileNotFoundError, match="search_v2_page1"):
             await c.get("https://jsearch.p.rapidapi.com/search-v2")
+
+
+async def test_non_json_bodies_and_load_case(tmp_path: Path) -> None:
+    (tmp_path / "jsearch").mkdir()
+    html = "<!DOCTYPE html><html><body>Bad gateway</body></html>"
+    (tmp_path / "jsearch/search_v2_html.html").write_text(html)
+    (tmp_path / "jsearch/search_v2_html.headers.json").write_text(
+        json.dumps({"status": 200, "headers": {"Content-Type": "text/html; charset=utf-8"}})
+    )
+    (tmp_path / "jsearch/page_truncated.txt").write_text('{"data": [{"slug": "a"}, {"sl')
+    assert fixtures.load_case(tmp_path, "jsearch/search_v2_html") == (
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        html.encode(),
+    )
+    assert fixtures.load_case(tmp_path, "jsearch/page_truncated") == (
+        200,
+        {"content-type": "text/plain"},
+        b'{"data": [{"slug": "a"}, {"sl',
+    )
+    with pytest.raises(FileNotFoundError):
+        fixtures.load_case(tmp_path, "jsearch/missing")

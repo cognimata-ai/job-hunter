@@ -10,3 +10,5 @@ frontend/dist
 .pytest_cache
 .ruff_cache
 .hypothesis
+# Raw source recordings hold recruiter personal data (Task 6): never part of a build context.
+.fixtures-raw
