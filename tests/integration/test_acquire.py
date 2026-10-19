@@ -2,21 +2,23 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut
 from jobhunter.quota import ledger
-from jobhunter.sources import acquire
+from jobhunter.sources import acquire, ats, http
 from jobhunter.sources.acquire import AcquireContext, Ambiguous, Denied, Failed, Served, acquire_page
 from jobhunter.sources.arbeitnow import FEED_URL
 from jobhunter.sources.base import CellPlan, RequestSpec, SourceError, request_key
+from jobhunter.sources.instances import instance_for_company, list_instances
 from jobhunter.sources.jsearch import SEARCH_URL as JSEARCH_URL
 from jobhunter.sources.jsearch import JSearchAdapter
-from jobhunter.sources.receipts import load_response
+from jobhunter.sources.receipts import fetch_attempts, insert_fetch_request, load_response, store_response
 from jobhunter.sources.serpapi import SerpApiAdapter
 from jobhunter.worker import runs
 from jobhunter.worker.runs import RunOwner
@@ -847,3 +849,322 @@ async def test_acquire_never_raises_a_source_error_for_an_account_read(
         pytest.fail(f"acquire_page raised {exc!r}")
     assert isinstance(r, Denied) and r.skip_reason == "window_cap"
     assert respx_mock.routes["serpapi_search"].call_count == 0
+
+
+class Ticking:
+    """A clock that moves one second at every reading, from `now`; the test may set `now` to jump it."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        self.now += timedelta(seconds=1)
+        return self.now
+
+
+OUT_OF_SEARCHES = {"search_metadata": {"status": "Error"}, "error": "Your account has run out of searches."}
+
+
+async def test_serpapi_out_of_searches_exhausts_the_window_until_its_reset(
+    engine, current_epoch, serpapi_fixture_adapter, respx_mock
+) -> None:  # fix round 1, I1
+    clock = Ticking(utcnow())
+    renewal = (clock.now + timedelta(days=5)).date()
+    account, search = respx_mock.routes["serpapi_account"], respx_mock.routes["serpapi_search"]
+
+    def read(left: int, renews: date) -> httpx.Response:
+        return serpapi_account_response(plan_renewal_date=renews.isoformat(), plan_searches_left=left)
+
+    owner, cell = await queued_run(engine), await source_cell(engine, "serpapi")
+    async with engine.connect() as c:
+        instance = await instance_id(c, "serpapi")
+    async with httpx.AsyncClient() as client:
+        adapter = SerpApiAdapter(client, api_key=b"fake", instance_id=instance, clock=clock)
+        spec = await serpapi_spec(engine, adapter, cell)
+        ctx = acquire_ctx(engine, owner, adapter, billing="paid", provider="serpapi", clock=clock)
+
+        async def search_page(page_no: int) -> object:
+            page = replace(spec, page_no=page_no)
+            return await acquire_page(ctx, page, cell_id=cell, phase="fallback", planned_id=None)
+
+        account.side_effect = [read(240, renewal), read(200, renewal)]
+        search.side_effect = [httpx.Response(200, json=OUT_OF_SEARCHES)]
+        first = await search_page(1)
+        assert isinstance(first, Failed) and first.error_code == "quota_exhausted"
+        assert (await window(engine, "serpapi")).state == "exhausted_until_reset"
+        # (a) the next search of the run is denied, even when a lagging account read still shows searches left
+        lagging = await search_page(2)
+        assert isinstance(lagging, Denied) and lagging.skip_reason == "exhausted"
+        assert search.call_count == 1 and (await window(engine, "serpapi")).state == "exhausted_until_reset"
+        # (b) no permanent lockout: past the renewal, the next month's read admits a search again
+        clock.now = datetime.combine(renewal, time(1), tzinfo=UTC)
+        account.side_effect = [read(250, renewal + timedelta(days=31))]
+        status, headers, body = load_fixture("serpapi", "google_jobs_hl_en")
+        search.side_effect = [httpx.Response(status, headers=headers, content=body)]
+        renewed = await search_page(3)
+        assert isinstance(renewed, Served) and search.call_count == 2
+    async with engine.connect() as c:
+        current = (
+            await c.execute(
+                sa.text(
+                    "SELECT state, window_start FROM quota_windows WHERE provider = 'serpapi' AND is_current"
+                )
+            )
+        ).one()
+    assert tuple(current) == ("validated", datetime.combine(renewal, time(0), tzinfo=UTC))
+
+
+SMARTRECRUITERS = sa.text(
+    "INSERT INTO watchlist_companies "
+    "(display_name, company_key, ats_type, board_slug, detection, validation_status) "
+    "VALUES ('Delivery Hero', 'delivery hero', 'smartrecruiters', 'DeliveryHero', 'manual', 'ok') "
+    "RETURNING id"
+)
+INSTANCE_CELL = sa.text("INSERT INTO coverage_cells (source_instance_id) VALUES (:i) RETURNING id")
+
+
+async def test_a_free_detail_404_is_a_client_failure_not_a_missing_board(
+    engine, current_epoch, fake_http
+) -> None:  # fix round 1, I2: `not_found` is a board (list) 404 only
+    owner = await queued_run(engine)
+    async with engine.begin() as c:
+        iid = await instance_for_company(c, (await c.execute(SMARTRECRUITERS)).scalar_one())
+        cell = int((await c.execute(INSTANCE_CELL, {"i": iid})).scalar_one())
+        row = next(i for i in await list_instances(c) if i.id == iid)
+    now = utcnow()
+    plan = CellPlan(
+        cell_id=cell,
+        source_id="smartrecruiters",
+        instance_id=iid,
+        query_text=None,
+        query_lang=None,
+        location_key=None,
+        location_label=None,
+        radius_km=None,
+        phase="primary",
+        request_class="free",
+        bucket=None,
+        window=(now, now),
+        max_days_old=None,
+    )
+    async with http.make_client("smartrecruiters") as client:
+        adapter = ats.adapter_for(row, client, clock=utcnow)
+        listing = adapter.plan(plan)
+        async with engine.begin() as c:
+            parent = await insert_fetch_request(
+                c,
+                owner=owner,
+                cell_id=cell,
+                source_instance_id=iid,
+                phase="primary",
+                spec=listing,
+                request_key=request_key(listing, owner.run_id),
+                attempt_seq=1,
+                status="planned",
+            )
+        detail = replace(
+            listing,
+            operation="detail",
+            params={},
+            cursor_in=None,
+            detail_native_id="744000000000001",  # a withdrawn posting: the fixture routes answer 404
+            parent_fetch_request_id=parent,
+        )
+        ctx = acquire_ctx(engine, owner, adapter, billing="free", provider=None)
+        r = await acquire_page(ctx, detail, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(r, Failed) and (r.error_code, r.http_status, r.replayed) == ("client", 404, False)
+    async with engine.connect() as c:
+        breaker_row = sa.text("SELECT health, consecutive_failures FROM source_instances WHERE id = :i")
+        assert tuple((await c.execute(breaker_row, {"i": iid})).one()) == (
+            "degraded",
+            1,
+        )  # the board is there
+
+
+async def jsearch_on_respx(engine: AsyncEngine, client: httpx.AsyncClient, owner: RunOwner) -> AcquireContext:
+    """A roomy JSearch context on `client` (respx-mocked), over a validated window."""
+    await insert_window(engine, jsearch_window(utcnow(), limit=200, reserve=20, tokens=10, interval_s=SIX_H))
+    async with engine.connect() as c:
+        instance = await instance_id(c, "jsearch")
+    return jsearch_ctx(
+        engine, owner, JSearchAdapter(client, api_key=b"fake", instance_id=instance, clock=utcnow)
+    )
+
+
+async def test_a_paid_gateway_404_is_transient_not_billed_and_not_retried(
+    engine, current_epoch, respx_mock
+) -> None:  # fix round 1, M6
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    route = respx_mock.get(JSEARCH_URL)
+    gateway = {"x-rapidapi-proxy-response": "true", "content-type": "application/json"}
+    route.side_effect = [httpx.Response(404, headers=gateway, json={"message": "Endpoint does not exist"})]
+    async with httpx.AsyncClient() as client:
+        ctx = await jsearch_on_respx(engine, client, owner)
+        r = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(r, Failed) and (r.error_code, r.http_status, r.replayed) == ("transient", 404, False)
+    assert await attempts(engine, spec, owner) == [
+        (1, "normal", "failed", None, "transient", 404, "not_billed", "rapidapi_gateway_404", "normal")
+    ]
+    assert route.call_count == 1  # §5.2: a paid retry follows a 429 or a 5xx only
+    async with engine.connect() as c:
+        assert tuple((await c.execute(JSEARCH)).one())[1:] == ("degraded", 1)  # a transient failure
+
+
+async def test_a_paid_5xx_earns_exactly_one_retry(
+    engine, current_epoch, respx_mock
+) -> None:  # fix round 1, M7
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    route = respx_mock.get(JSEARCH_URL)
+    status, headers, body = load_fixture("jsearch", "search_v2_page1")
+    async with httpx.AsyncClient() as client:
+        ctx = await jsearch_on_respx(engine, client, owner)
+        route.side_effect = [httpx.Response(503), httpx.Response(503)]
+        failed = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+        assert isinstance(failed, Failed) and (failed.error_code, failed.http_status) == ("transient", 503)
+        assert await attempts(engine, spec, owner) == [
+            (1, "normal", "failed", None, "transient", 503, "ambiguous", None, "normal"),
+            (2, "retry", "failed", None, "transient", 503, "ambiguous", None, "retry"),
+        ]
+        assert route.call_count == 2  # one retry, never a third attempt
+        recovered = replace(spec, page_no=2)
+        route.side_effect = [httpx.Response(502), httpx.Response(status, headers=headers, content=body)]
+        served = await acquire_page(ctx, recovered, cell_id=cell, phase="primary", planned_id=None)
+        assert isinstance(served, Served) and route.call_count == 4
+        assert await attempts(engine, recovered, owner) == [
+            (1, "normal", "failed", None, "transient", 502, "ambiguous", None, "normal"),
+            (2, "retry", "succeeded", None, None, 200, "billed", None, "retry"),
+        ]
+
+
+async def test_a_paid_connect_error_before_send_is_not_billed_and_not_retried(
+    engine, current_epoch, respx_mock
+) -> None:  # fix round 1, M7
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    route = respx_mock.get(JSEARCH_URL)
+    route.side_effect = httpx.ConnectError("connection refused")
+    async with httpx.AsyncClient() as client:
+        ctx = await jsearch_on_respx(engine, client, owner)
+        r = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(r, Failed) and (r.error_code, r.http_status) == ("transient", None)
+    assert await attempts(engine, spec, owner) == [
+        (1, "normal", "failed", None, "transient", None, "not_billed", "connect_failed_before_send", "normal")
+    ]
+    assert route.call_count == 1
+
+
+async def test_an_exception_between_send_and_settlement_leaves_the_row_dispatched(
+    engine, current_epoch, jsearch_fixture_adapter, fixture_log
+) -> None:  # fix round 1, M7: an error in process (no process death) after the send
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    ctx = acquire_ctx(engine, owner, jsearch_fixture_adapter, billing="paid", provider="jsearch")
+
+    async def broken(ids: Sequence[str | None]) -> int:
+        raise RuntimeError("a bug after the send")
+
+    with pytest.raises(RuntimeError, match="a bug after the send"):
+        await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None, known_native_ids=broken)
+    assert await attempts(engine, spec, owner) == [
+        (1, "normal", "dispatched", None, None, None, "dispatched", None, "probe")
+    ]
+    assert len(served_requests(fixture_log)) == 1
+    again = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(again, Ambiguous)
+    assert await attempts(engine, spec, owner) == [
+        (1, "normal", "ambiguous", None, "unsettled", None, "ambiguous", None, "probe")
+    ]
+    assert len(served_requests(fixture_log)) == 1  # the paid page is never sent twice
+
+
+RAISE = "DO $$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE = '{}'; END $$"
+
+
+async def test_a_serialization_failure_in_the_settlement_is_retried_with_the_response_in_hand(
+    engine, current_epoch, jsearch_fixture_adapter, fixture_log, monkeypatch
+) -> None:  # fix round 1, M1
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    ctx = jsearch_ctx(engine, owner, jsearch_fixture_adapter)
+    real = store_response  # what `acquire` calls
+    injected: list[str] = ["40P01"]  # the SQLSTATEs the next settlement transactions fail with, in order
+
+    async def flaky(conn, *args, **kwargs):
+        if injected:
+            await conn.execute(sa.text(RAISE.format(injected.pop(0))))
+        return await real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(acquire, "store_response", flaky)
+    r = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(r, Served) and not r.replayed  # settled by the second transaction
+    assert await attempts(engine, spec, owner) == [
+        (1, "normal", "succeeded", None, None, 200, "billed", None, "probe")
+    ]
+    assert len(served_requests(fixture_log)) == 1
+    assert await scalar(engine, "SELECT count(*) FROM quota_ledger WHERE kind = 'request'") == 1
+
+    # at most three transactions: the third failure is raised, the row stays dispatched (then ambiguous)
+    second = replace(spec, page_no=2)
+    injected[:] = ["40001", "40P01", "40001"]
+    with pytest.raises(sa.exc.DBAPIError):
+        await acquire_page(ctx, second, cell_id=cell, phase="primary", planned_id=None)
+    assert injected == [] and [a[2] for a in await attempts(engine, second, owner)] == ["dispatched"]
+
+    # anything else, a connection failure first of all, is never retried (its commit outcome is unknown)
+    third = replace(spec, page_no=3)
+    injected[:] = ["08006", "40P01"]
+    with pytest.raises(sa.exc.DBAPIError):
+        await acquire_page(ctx, third, cell_id=cell, phase="primary", planned_id=None)
+    assert injected == ["40P01"] and [a[2] for a in await attempts(engine, third, owner)] == ["dispatched"]
+    assert len(served_requests(fixture_log)) == 3  # one send each
+
+
+async def test_a_receipt_moved_under_the_resolution_is_resolved_again(
+    engine, current_epoch, queue_app, arbeitnow_adapter, respx_mock, monkeypatch
+) -> None:  # fix round 1, M5
+    owner = await queued_run(engine)
+    cell = await source_cell(engine, "arbeitnow", query=None, location_key=None)
+    async with engine.connect() as c:
+        spec = arbeitnow_adapter.plan(arbeitnow_plan(cell, await instance_id(c, "arbeitnow")))
+    status, headers, body = load_fixture("arbeitnow", "page1")
+    feed = respx_mock.get(FEED_URL).mock(return_value=httpx.Response(status, headers=headers, content=body))
+    await stop_at(
+        "collect.after_dispatch_marker",
+        monkeypatch,
+        acquire_ctx(engine, owner, arbeitnow_adapter, billing="free", provider=None),
+        spec,
+    )
+    restarted = await supersede(engine, owner)
+    real = fetch_attempts  # what `acquire` calls
+    moved: list[int] = []
+
+    async def racing(conn, key):
+        history = await real(conn, key)
+        if not moved:  # another actor closes the dispatched row right after this read
+            moved.append(history[-1].id)
+            async with engine.begin() as other:
+                await transition(
+                    other,
+                    "fetch_requests",
+                    moved[0],
+                    ["dispatched"],
+                    "ambiguous",
+                    set_={"error_code": "unsettled"},
+                )
+        return history
+
+    monkeypatch.setattr(acquire, "fetch_attempts", racing)
+    r = await acquire_page(
+        acquire_ctx(engine, restarted, arbeitnow_adapter, billing="free", provider=None),
+        spec,
+        cell_id=cell,
+        phase="primary",
+        planned_id=None,
+    )
+    assert isinstance(r, Served) and not r.replayed and feed.call_count == 1  # not FencedOut: resolved again
+    assert await attempts(engine, spec, owner) == [
+        (1, "free", "ambiguous", None, "unsettled", None, None, None, None),
+        (2, "free", "succeeded", None, None, 200, None, None, None),
+    ]

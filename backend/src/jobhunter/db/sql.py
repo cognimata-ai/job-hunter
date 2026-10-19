@@ -17,6 +17,8 @@ UNIQUE_VIOLATION: Final = "23505"
 CHECK_VIOLATION: Final = "23514"
 UNDEFINED_TABLE: Final = "42P01"
 LOCK_NOT_AVAILABLE: Final = "55P03"
+SERIALIZATION_FAILURE: Final = "40001"
+DEADLOCK_DETECTED: Final = "40P01"
 
 
 def q(statement: str, *, jsonb: Iterable[str] = ()) -> TextClause:
@@ -43,6 +45,14 @@ def pg_error(exc: sa.exc.DBAPIError) -> PgErrorInfo:
     if isinstance(orig, psycopg.Error):
         return PgErrorInfo(orig.sqlstate, orig.diag.constraint_name)
     return PgErrorInfo(None, None)
+
+
+def is_serialization_failure(exc: BaseException) -> bool:
+    """A serialization failure (40001) or a deadlock (40P01): the server rolled the transaction back, so it
+    may be run again. Never a connection loss (`connection_invalidated`), whose commit outcome is unknown."""
+    if not isinstance(exc, sa.exc.DBAPIError) or exc.connection_invalidated:
+        return False
+    return pg_error(exc).sqlstate in (SERIALIZATION_FAILURE, DEADLOCK_DETECTED)
 
 
 def is_unique_violation(exc: sa.exc.DBAPIError, constraint: str) -> bool:

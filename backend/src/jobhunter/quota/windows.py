@@ -303,11 +303,15 @@ def apply_observation_pure(
     1. A reset time (never from a 429) at least half a period past `w`'s end means the provider has reset:
        `w` is closed `provider_reset_observed` and `[observed_at, reset_at)` opens `validated`, with `w`'s
        limit (tighten-only) and its capacity as the full bucket (the next accrual recomputes it). Otherwise it
-       refines `w`: `window_end := reset_at`, `validated`, the probe settled. A reset time that is not ahead
-       of the observation identifies no window and is ignored.
+       refines `w`: `window_end := reset_at`, `validated`, the probe settled; an exhausted SerpApi window
+       stays exhausted (SerpApi is never probed: only its reset or rollover ends the exhaustion, so a lagging
+       account read cannot re-open the month). A reset time that is not ahead of the observation identifies no
+       window and is ignored.
     2. A lower limit lowers `limit_units` and the reserve with it; a higher one only alerts.
     3. `limit_units - remaining` above the local usage is an adjustment of the difference (tighten-only).
-    4. A JSearch 429 with `remaining` 0 or absent exhausts the window until its reset.
+    4. A JSearch 429 with `remaining` 0 or absent exhausts the window until its reset, and so does a SerpApi
+       observation with `remaining` 0 (an account read with no searches left, or a search answered "out of
+       searches", which the acquisition reports as `remaining = 0`).
     """
     if w.last_observed_at is not None and obs.observed_at <= w.last_observed_at:
         return w, [], ObservationEffects(0, (), False)
@@ -340,6 +344,8 @@ def apply_observation_pure(
                 observed_limit=None,
             )
             used, reattribute = entry_units, True
+        elif provider == "serpapi" and cur.state == "exhausted_until_reset":
+            cur.window_end = reset_at  # out of searches until the renewal: no read re-opens the month
         else:
             cur.window_end, cur.state = reset_at, "validated"
             cur.probe_used, cur.probe_failed, cur.next_probe_at = False, False, None
@@ -358,6 +364,8 @@ def apply_observation_pure(
             adjustment = provider_used - used
             alerts.append("quota.unaccounted_usage")
     if obs.status == 429 and provider == "jsearch" and obs.remaining in (None, 0):
+        cur.state = "exhausted_until_reset"
+    elif provider == "serpapi" and obs.remaining == 0:
         cur.state = "exhausted_until_reset"
     _record_hour(cur, obs)
     if reattribute:

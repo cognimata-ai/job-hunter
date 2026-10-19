@@ -27,15 +27,18 @@ crash, restart or takeover ever sends a paid request twice or loses a paid respo
    they raise is an outcome, never an exception), then the stored response (`receipts.store_response`), the
    request `succeeded | failed(error_code) | ambiguous`, the ledger settled by the transport outcome and the
    status alone (`adapter.settle`: a JSearch HTML 200 is `billed` and `failed('contract')` at once, Deviation
-   23) with the response's observation, and the breaker (`failure_kind`; a timeout counts as `transient` for
-   the breaker while its ledger entry stays `ambiguous`).
+   23) with the response's observation (a provider's "out of quota" report, `quota_exhausted`, observed as
+   nothing left: the window is exhausted until its reset), and the breaker (`failure_kind`, the one mapping:
+   a timeout counts as `transient` for the breaker while its ledger entry stays `ambiguous`). A settlement
+   transaction the server rolled back (40001, 40P01) is run again with the response in hand, three in all.
 
 Fault points `collect.after_reserve`, `collect.after_dispatch_marker`, `collect.after_response` and
 `collect.after_settle` mark the crash windows (§18.3 C1-C4). Every transaction that writes a receipt first
 holds the run row `FOR SHARE` (`ledger.lock_run_owner`), so a superseded owner is `FencedOut` before it writes
 or sends; the lock order inside is owner -> `quota_windows` -> ledger row -> `fetch_requests`/`raw_responses`
 -> `source_instances`. `acquire_page` never raises `SourceError`: it raises `FencedOut` (the owner lost the
-run, or its receipt was recovered by another) and lets bugs propagate.
+run, or its own receipt was moved by another) and lets bugs propagate; a receipt that a recovery moved under
+the resolution is resolved again.
 
 **Retries (§5.2).** Keyed on the response status, never on the error kind: a 2xx is never retried (a 200
 carrying the provider's own error is billed). A paid or quota source earns at most one `retry`-class attempt
@@ -54,8 +57,10 @@ from email.utils import parsedate_to_datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast, get_args, runtime_checkable
 
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from jobhunter.db.sql import is_serialization_failure, pg_error
 from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut, InvariantViolation, TransitionConflict
 from jobhunter.faults import afault_point
@@ -68,6 +73,8 @@ from jobhunter.sources import breaker
 from jobhunter.sources.base import (
     Billing,
     Continuation,
+    Observation,
+    Operation,
     RawPage,
     RequestClass,
     RequestSpec,
@@ -98,6 +105,9 @@ RETRY_AFTER_MAX_S: Final = 60.0
 UNSETTLED: Final = "unsettled"
 # The skips after which the request is attempted again (§7.16.5); every other skip is the request's denial.
 _REATTEMPTED: Final = frozenset({"shutdown", "superseded"})
+GATEWAY_404: Final = "rapidapi_gateway_404"  # the settlement evidence of a 404 the RapidAPI gateway answered
+# Transactions a settlement may take when the server rolls one back as a serialization failure or a deadlock.
+SETTLE_TRANSACTIONS: Final = 3
 _SENT: Final = frozenset({"dispatched", "succeeded", "failed", "ambiguous"})
 _FAILURE_KINDS: Final[Mapping[str, FailureKind]] = MappingProxyType({k: k for k in get_args(FailureKind)})
 _RANDOM: Final = random.SystemRandom()
@@ -169,22 +179,20 @@ def error_code(err: SourceError) -> str:
 
 
 def failure_kind(err: SourceError) -> FailureKind | None:
-    """The breaker kind of an error: the six `FailureKind`s are themselves; `ambiguous` and
-    `quota_exhausted` are `None`, no breaker write (the protocol still counts an ambiguous attempt as
-    `transient`, `_breaker_kind`)."""
+    """The breaker kind of an error, the one mapping the protocol uses: the six `FailureKind`s are themselves;
+    `ambiguous` (a timeout, a lost response) is `transient` (§17.1), so a host that always times out opens its
+    breaker while the ledger keeps the attempt `ambiguous`; `quota_exhausted` is `None`, no breaker write."""
+    if err.kind == "ambiguous":
+        return "transient"
     return _FAILURE_KINDS.get(err.kind)
 
 
-def _breaker_kind(err: SourceError) -> FailureKind | None:
-    """What the breaker records for a failed attempt: a lost or timed-out one is `transient` (§17.1), so a
-    host that always times out opens its breaker; the ledger keeps it `ambiguous`."""
-    return "transient" if err.kind == "ambiguous" else failure_kind(err)
-
-
-def status_error(status: int, billing: Billing) -> SourceError:
+def status_error(status: int, billing: Billing, *, operation: Operation, evidence: str | None) -> SourceError:
     """The error of a non-2xx response, by its status alone (§17.1): 429 `rate_limited`, 401/403 `auth`,
-    5xx `transient`, a 404 `not_found` for a free source (a board or feed that is gone) and `client`
-    otherwise, any other status `client`."""
+    5xx `transient`; a 404 is `transient` when the RapidAPI gateway answered it itself (`evidence` is the
+    settlement's `rapidapi_gateway_404`, §6.6), `not_found` for a free source's list or feed (a board that
+    is gone) and `client` otherwise (a withdrawn posting's detail call, a paid 404); any other status
+    `client`."""
     kind: SourceErrorKind
     if status == 429:
         kind = "rate_limited"
@@ -192,7 +200,9 @@ def status_error(status: int, billing: Billing) -> SourceError:
         kind = "auth"
     elif status >= 500:
         kind = "transient"
-    elif status == 404 and billing == "free":
+    elif status == 404 and evidence == GATEWAY_404:
+        kind = "transient"
+    elif status == 404 and billing == "free" and operation == "list":
         kind = "not_found"
     else:
         kind = "client"
@@ -215,7 +225,8 @@ def _classify(adapter: SourceAdapter, outcome: HttpOutcome, billing: Billing) ->
     if page is None:
         return outcome.error or SourceError("ambiguous", code="no_response")
     if not 200 <= page.status < 300:
-        return status_error(page.status, billing)
+        evidence = None if billing == "free" else adapter.settle(outcome)[1]
+        return status_error(page.status, billing, operation=page.spec.operation, evidence=evidence)
     if outcome.error is not None:  # a 2xx body over the cap, or undecodable: not the contract
         return outcome.error
     try:
@@ -225,6 +236,18 @@ def _classify(adapter: SourceAdapter, outcome: HttpOutcome, billing: Billing) ->
     except SourceError as err:  # a broken envelope, or the provider's own error report delivered with a 2xx
         return err
     return _Envelope(page, ids, continuation, cursor)
+
+
+def _observation(
+    adapter: SourceAdapter, page: RawPage | None, verdict: _Envelope | SourceError
+) -> Observation | None:
+    """The response's quota observation (§6.3). A provider's own "out of quota" report (`quota_exhausted`, a
+    SerpApi search answered "out of searches") is an observation of nothing left, which exhausts the window
+    until its reset through the observation's step 4."""
+    observation = None if page is None else adapter.observation(page)
+    if page is not None and isinstance(verdict, SourceError) and verdict.kind == "quota_exhausted":
+        observation = replace(observation or Observation(page.fetched_at, page.status), remaining=0)
+    return observation
 
 
 def _retry_after(page: RawPage | None) -> float:
@@ -286,6 +309,25 @@ async def _move(
         await transition(conn, "fetch_requests", fetch_request_id, from_states, to_state, set_=set_)
     except TransitionConflict as exc:
         raise FencedOut("fetch_requests") from exc
+
+
+class _Moved(Exception):
+    """A receipt that a recovery moved under the resolution: the transaction rolls back, resolve again."""
+
+
+async def _recover(
+    conn: AsyncConnection,
+    fetch_request_id: int,
+    from_states: list[str],
+    to_state: str,
+    set_: Mapping[str, object],
+) -> None:
+    """A recovery transition of a receipt found by the resolution; one that another actor moved meanwhile is
+    `_Moved` (re-resolve), not `FencedOut`: the owner still holds its run."""
+    try:
+        await transition(conn, "fetch_requests", fetch_request_id, from_states, to_state, set_=set_)
+    except TransitionConflict as exc:
+        raise _Moved from exc
 
 
 class _Acquisition:
@@ -394,26 +436,33 @@ class _Acquisition:
                 row_id=last.id,
                 entry_id=entry.entry_id,
             )
-        async with ctx.engine.begin() as conn:
-            await ledger.lock_run_owner(conn, ctx.owner)  # the stale owner's marker now finds no predicate
-            released = await ledger.release_never_dispatched(conn, entry.entry_id, now=ctx.clock())
-            if released:
-                await _move(conn, last.id, ["reserved"], "skipped", {"skip_reason": "superseded"})
-        if not released:
+        try:
+            async with ctx.engine.begin() as conn:
+                await ledger.lock_run_owner(
+                    conn, ctx.owner
+                )  # the stale owner's marker now finds no predicate
+                if not await ledger.release_never_dispatched(conn, entry.entry_id, now=ctx.clock()):
+                    raise _Moved
+                await _recover(conn, last.id, ["reserved"], "skipped", {"skip_reason": "superseded"})
+        except _Moved:
             return _AGAIN  # recovered meanwhile (the reconciler moves both together)
         log.info("reservation_released", fetch_request_id=last.id, attempt_seq=last.attempt_seq)
         return _following(last, cast(RequestClass, last.request_class)) or Denied(last.id, "superseded")
 
     async def _close_ambiguous(self, last: FetchAttempt) -> bool:
-        """`dispatched -> ambiguous` for the request and its ledger entry (which stays charged); `False` when
-        the entry was recovered meanwhile."""
+        """`dispatched -> ambiguous` for the request and its ledger entry (which stays charged); `False`, with
+        nothing written, when another actor (the reconciler, a recovery) moved either meanwhile. Only a lost
+        owner predicate is `FencedOut`."""
         ctx = self.ctx
-        async with ctx.engine.begin() as conn:
-            await ledger.lock_run_owner(conn, ctx.owner)
-            if last.quota_ledger_id is not None:
-                if not await ledger.mark_ambiguous(conn, last.quota_ledger_id, now=ctx.clock()):
-                    return False
-            await _move(conn, last.id, ["dispatched"], "ambiguous", {"error_code": UNSETTLED})
+        try:
+            async with ctx.engine.begin() as conn:
+                await ledger.lock_run_owner(conn, ctx.owner)
+                if last.quota_ledger_id is not None:
+                    if not await ledger.mark_ambiguous(conn, last.quota_ledger_id, now=ctx.clock()):
+                        raise _Moved
+                await _recover(conn, last.id, ["dispatched"], "ambiguous", {"error_code": UNSETTLED})
+        except _Moved:
+            return False
         return True
 
     # -- steps 2 to 5: one attempt
@@ -556,63 +605,90 @@ class _Acquisition:
         verdict: _Envelope | SourceError,
         new_ids: int | None,
     ) -> PageResult | int:
-        """Step 5: the response, the request, the ledger and the breaker in one transaction."""
-        ctx, page = self.ctx, outcome.page
-        now = ctx.clock()
-        status = None if page is None else page.status
-        envelope = verdict if isinstance(verdict, _Envelope) else None
-        async with ctx.engine.begin() as conn:
-            await ledger.lock_run_owner(conn, ctx.owner)
-            if entry is not None:  # billed by the transport outcome and the status alone, never by the body
-                state, evidence = ctx.adapter.settle(outcome)
-                observation = None if page is None else ctx.adapter.observation(page)
-                await ledger.settle(
-                    conn,
-                    entry,
-                    state=state,
-                    evidence=evidence,
-                    http_status=status,
-                    provider_remaining=None if observation is None else observation.remaining,
-                    observation=observation,
-                    settings=ctx.settings.quota,
-                    interval_s=ctx.settings.interval_s,
-                    now=now,
+        """Step 5: the response, the request, the ledger and the breaker in one transaction. A transaction the
+        server rolled back as a serialization failure or a deadlock is run again with the response in hand,
+        `SETTLE_TRANSACTIONS` in all; any other error (a lost connection: its commit is unknown) propagates
+        and leaves the request `dispatched`, which the next resolution closes `ambiguous`."""
+        now = self.ctx.clock()
+        for transaction in range(1, SETTLE_TRANSACTIONS + 1):
+            try:
+                async with self.ctx.engine.begin() as conn:
+                    await self._settle_in(conn, row, entry, spec, outcome, verdict, new_ids, now)
+                break
+            except DBAPIError as exc:
+                if transaction == SETTLE_TRANSACTIONS or not is_serialization_failure(exc):
+                    raise
+                log.warning(
+                    "settlement_retried",
+                    fetch_request_id=row,
+                    transaction=transaction,
+                    sqlstate=pg_error(exc).sqlstate,
                 )
-            if page is not None:
-                await store_response(
-                    conn,
-                    row,
-                    page,
-                    source_instance_id=spec.source_instance_id,
-                    ledger_entry_id=entry,
-                    succeeded=envelope is not None,
-                    items=None if envelope is None else len(envelope.ids),
-                )
-            if envelope is not None:
-                done = {
-                    "http_status": status,
-                    "items": len(envelope.ids),
-                    "continuation": envelope.continuation.value,
-                    "next_cursor": None if envelope.cursor is None else {"cursor": envelope.cursor},
-                    "new_native_ids": new_ids,
-                }
-                await _move(conn, row, ["dispatched"], "succeeded", done)
-                await breaker.record_success(conn, spec.source_instance_id, now=now)
-            else:
-                err = cast(SourceError, verdict)
-                to_state = "ambiguous" if err.kind == "ambiguous" else "failed"
-                failed = {"http_status": status, "error_code": error_code(err)}
-                await _move(conn, row, ["dispatched"], to_state, failed)
-                if (kind := _breaker_kind(err)) is not None:
-                    await breaker.record_failure(
-                        conn, spec.source_instance_id, kind, billing=ctx.billing, now=now
-                    )
-        if envelope is not None:
-            return Served(row, envelope.page, replayed=False, new_native_ids=new_ids)
-        if isinstance(verdict, SourceError) and verdict.kind == "ambiguous":
+        if isinstance(verdict, _Envelope):
+            return Served(row, verdict.page, replayed=False, new_native_ids=new_ids)
+        if verdict.kind == "ambiguous":
             log.warning("page_ambiguous", fetch_request_id=row, error_code=verdict.code)
             return Ambiguous(row)
         return row
+
+    async def _settle_in(
+        self,
+        conn: AsyncConnection,
+        row: int,
+        entry: int | None,
+        spec: RequestSpec,
+        outcome: HttpOutcome,
+        verdict: _Envelope | SourceError,
+        new_ids: int | None,
+        now: datetime,
+    ) -> None:
+        ctx, page = self.ctx, outcome.page
+        status = None if page is None else page.status
+        envelope = verdict if isinstance(verdict, _Envelope) else None
+        await ledger.lock_run_owner(conn, ctx.owner)
+        if entry is not None:  # billed by the transport outcome and the status alone, never by the body
+            state, evidence = ctx.adapter.settle(outcome)
+            observation = _observation(ctx.adapter, page, verdict)
+            await ledger.settle(
+                conn,
+                entry,
+                state=state,
+                evidence=evidence,
+                http_status=status,
+                provider_remaining=None if observation is None else observation.remaining,
+                observation=observation,
+                settings=ctx.settings.quota,
+                interval_s=ctx.settings.interval_s,
+                now=now,
+            )
+        if page is not None:
+            await store_response(
+                conn,
+                row,
+                page,
+                source_instance_id=spec.source_instance_id,
+                ledger_entry_id=entry,
+                succeeded=envelope is not None,
+                items=None if envelope is None else len(envelope.ids),
+            )
+        if envelope is not None:
+            done = {
+                "http_status": status,
+                "items": len(envelope.ids),
+                "continuation": envelope.continuation.value,
+                "next_cursor": None if envelope.cursor is None else {"cursor": envelope.cursor},
+                "new_native_ids": new_ids,
+            }
+            await _move(conn, row, ["dispatched"], "succeeded", done)
+            await breaker.record_success(conn, spec.source_instance_id, now=now)
+            return
+        err = cast(SourceError, verdict)
+        to_state = "ambiguous" if err.kind == "ambiguous" else "failed"
+        await _move(
+            conn, row, ["dispatched"], to_state, {"http_status": status, "error_code": error_code(err)}
+        )
+        if (kind := failure_kind(err)) is not None:
+            await breaker.record_failure(conn, spec.source_instance_id, kind, billing=ctx.billing, now=now)
 
 
 async def acquire_page(
