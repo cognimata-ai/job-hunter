@@ -316,6 +316,8 @@ def test_every_scrubbed_page_parses_without_rejections() -> None:
         "search_v2_page1",
         "search_v2_page2",
         "search_v2_page2_reused",
+        "search_v2_page1_day2",
+        "search_v2_page2_day2",
         "search_v2_today",
         "search_v2_empty",
     ):
