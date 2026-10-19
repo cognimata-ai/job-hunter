@@ -102,7 +102,16 @@ def decide(
     now: datetime,
     per_run_cap: int,
 ) -> Admit | Deny:
-    """The pure admission decision of §6.7, in its order. No I/O, no locks, and `w` is not modified."""
+    """The pure admission decision of §6.7, in its order. No I/O, no locks, and `w` is not modified.
+
+    SerpApi first fails closed in the renewal gap (Ruling T7-a): from the local rollover until an account read
+    reports a renewal date after `w.window_start`. Its windows are never probed (§6.3), and only such a read
+    validates one (step 1; bootstrap validates only from a renewal that is the window's end, and no edge leads
+    back to `extrapolated_unvalidated`), so the persisted state is the test: a SerpApi window in
+    `extrapolated_unvalidated` has seen no read of its own renewal yet.
+    """
+    if provider == "serpapi" and w.state == "extrapolated_unvalidated":
+        return Deny("window_cap")
     if w.state == "exhausted_until_reset" or (w.state == "extrapolated_unvalidated" and w.probe_failed):
         if w.next_probe_at is None or now < w.next_probe_at:
             return Deny("exhausted" if w.state == "exhausted_until_reset" else "awaiting_window_validation")

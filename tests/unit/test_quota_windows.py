@@ -3,11 +3,13 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from jobhunter.quota.pacing import Admit, Deny, QuotaClass, decide
 from jobhunter.quota.windows import (
     NOMINAL_PERIOD,
     AccountObservation,
     Close,
     Insert,
+    ObservationEffects,
     Window,
     WindowChange,
     apply_observation_pure,
@@ -319,3 +321,159 @@ def test_hourly_fields_are_recorded() -> None:
         used_units=0,
     )
     assert (w.observed_this_hour, w.observed_hourly_cap, w.hour_observed_at) == (12, 250, later)
+
+
+# The renewal gap (Ruling T7-a). SerpApi's `plan_renewal_date` is a date (the recording's is "2026-11-08"), so
+# the local window rolls over at 00:00 UTC while SerpApi renews the plan hours later: until then every account
+# read still reports the old renewal date and the old month's `plan_searches_left`.
+RENEWAL = datetime(2026, 11, 8, tzinfo=UTC)
+NEXT_RENEWAL = datetime(2026, 12, 8, tzinfo=UTC)
+IN_THE_GAP = RENEWAL + timedelta(hours=3)
+OCTOBER = datetime(2026, 10, 20, tzinfo=UTC)
+
+
+def account_read(account: AccountObservation) -> Observation:
+    """An account read (§5.3.2) as the observation it is reconciled as (§6.3)."""
+    return Observation(
+        observed_at=account.observed_at,
+        status=200,
+        reset_at=account.plan_renewal_date,
+        limit=account.searches_per_month,
+        remaining=account.plan_searches_left,
+        this_hour=account.this_hour_searches,
+        hourly_cap=account.account_rate_limit_per_hour,
+    )
+
+
+def lagging(at: datetime, **override: int) -> AccountObservation:
+    """A read before SerpApi has renewed: the old renewal date, October's 100 searches still counted."""
+    return recorded_account(at, **{"plan_searches_left": 150, **override})
+
+
+def renewed(at: datetime) -> AccountObservation:
+    """A read after SerpApi has renewed: the next renewal date and the new month's full allowance."""
+    return replace(recorded_account(at, plan_searches_left=250), plan_renewal_date=NEXT_RENEWAL)
+
+
+def serpapi_decision(w: Window, now: datetime, *, used: int, cls: QuotaClass = "normal") -> Admit | Deny:
+    return decide(
+        w,
+        provider="serpapi",
+        request_class=cls,
+        units=1,
+        used=used,
+        run_normal_count=0,
+        hour_ok=True,
+        adzuna_ok=True,
+        now=now,
+        per_run_cap=10,
+    )
+
+
+def rolled_into_the_gap() -> Window:
+    """SerpApi bootstrapped in October from a read with 150 of 250 left, then rolled over locally on Nov 8."""
+    october = boot("serpapi", OCTOBER, account=lagging(OCTOBER))
+    cur, _ = roll_forward(october, "serpapi", IN_THE_GAP, SETTINGS, interval_s=SIX_H)
+    assert cur is not None
+    assert (cur.window_start, cur.window_end, cur.state) == (
+        RENEWAL,
+        NEXT_RENEWAL,
+        "extrapolated_unvalidated",
+    )
+    return cur
+
+
+def test_a_lagging_account_read_in_the_renewal_gap_describes_the_previous_window() -> None:
+    cur = rolled_into_the_gap()
+    w, changes, fx = apply_observation_pure(
+        cur,
+        account_read(lagging(IN_THE_GAP, this_hour_searches=2)),
+        SETTINGS,
+        provider="serpapi",
+        used_units=0,
+    )
+    # its renewal is not after the window's start: nothing is charged to the new month and nothing alerts
+    assert (fx, changes) == (ObservationEffects(0, (), False), [])
+    assert (w.state, w.window_end, w.limit_units, w.observed_remaining, w.observed_limit) == (
+        "extrapolated_unvalidated",
+        NEXT_RENEWAL,
+        250,
+        None,
+        None,
+    )
+    # only the observation clock and the hour figures are recorded
+    assert (w.last_observed_at, w.observed_this_hour, w.observed_hourly_cap, w.hour_observed_at) == (
+        IN_THE_GAP,
+        2,
+        250,
+        IN_THE_GAP,
+    )
+    # SerpApi fails closed in the gap: no probe that would bypass the bucket and the reserve, no retry either
+    assert serpapi_decision(w, IN_THE_GAP, used=0) == Deny("window_cap")
+    assert serpapi_decision(w, IN_THE_GAP, used=0, cls="retry") == Deny("window_cap")
+    later = IN_THE_GAP + timedelta(hours=1)
+    w2, _, fx2 = apply_observation_pure(
+        w, account_read(lagging(later)), SETTINGS, provider="serpapi", used_units=0
+    )
+    assert fx2 == ObservationEffects(0, (), False)
+    assert serpapi_decision(w2, later, used=0) == Deny("window_cap")
+    # until a read shows the new renewal date
+    at = later + timedelta(hours=3)
+    w3, _, _ = apply_observation_pure(
+        w2, account_read(renewed(at)), SETTINGS, provider="serpapi", used_units=0
+    )
+    assert serpapi_decision(w3, at, used=0) == Admit("normal", tokens_used=1, starts_probe=False)
+
+
+def test_after_the_real_renewal_the_window_is_validated_with_the_new_months_remaining() -> None:
+    w = rolled_into_the_gap()
+    # the new window's counted usage, as the ledger would hold it: adjustments plus admitted requests
+    used = 0
+    w, _, fx = apply_observation_pure(
+        w, account_read(lagging(IN_THE_GAP)), SETTINGS, provider="serpapi", used_units=used
+    )
+    used += fx.adjustment_units
+    if isinstance(serpapi_decision(w, IN_THE_GAP, used=used), Admit):
+        used += 1
+    at = IN_THE_GAP + timedelta(hours=4)
+    w, changes, fx = apply_observation_pure(
+        w, account_read(renewed(at)), SETTINGS, provider="serpapi", used_units=used
+    )
+    assert (w.state, w.window_start, w.window_end, w.limit_units, w.observed_remaining) == (
+        "validated",
+        RENEWAL,
+        NEXT_RENEWAL,
+        250,
+        250,
+    )
+    assert (fx, changes) == (ObservationEffects(0, (), False), [])
+    # the new month keeps its whole allowance: nothing of October's usage was carried into it
+    assert (used, w.limit_units - used) == (0, 250)
+
+
+def test_a_bootstrap_from_a_lagging_account_read_validates_only_the_month_it_describes() -> None:
+    read = lagging(IN_THE_GAP)
+    cur, changes = roll_forward(None, "serpapi", IN_THE_GAP, SETTINGS, interval_s=SIX_H, account=read)
+    assert [type(c).__name__ for c in changes] == ["Insert", "Close", "Insert"]
+    previous = closes(changes)[0].window
+    # the read identifies the month that has just ended locally, and that window keeps its figures
+    assert (previous.window_start, previous.window_end, previous.state, previous.observed_remaining) == (
+        datetime(2026, 10, 8, tzinfo=UTC),
+        RENEWAL,
+        "validated",
+        150,
+    )
+    # the current window records only the observation clock and the hour figures
+    assert cur is not None and (cur.window_start, cur.state, cur.limit_units, cur.observed_remaining) == (
+        RENEWAL,
+        "extrapolated_unvalidated",
+        250,
+        None,
+    )
+    assert (cur.last_observed_at, cur.observed_this_hour, cur.hour_observed_at) == (IN_THE_GAP, 0, IN_THE_GAP)
+    # the caller's reconciliation of the same read charges nothing to the new month
+    w, rc_changes, fx = apply_observation_pure(
+        cur, account_read(read), SETTINGS, provider="serpapi", used_units=0
+    )
+    assert (fx, rc_changes) == (ObservationEffects(0, (), False), [])
+    assert serpapi_decision(w, IN_THE_GAP, used=0) == Deny("window_cap")

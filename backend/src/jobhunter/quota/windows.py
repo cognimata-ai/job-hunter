@@ -206,6 +206,11 @@ def bootstrap_window(
     `validated`, with the limit tightened by `searches_per_month` and the account's figures recorded.
     `last_observed_at` stays unset: the same read is still reconciled as an observation (step 0 onwards) by
     its caller.
+
+    A read whose renewal is not after `now` describes a month that has already ended locally (the renewal gap,
+    Ruling T7-a): that window keeps its figures and `roll_forward` closes it at once. The read is recorded as
+    seen (`last_observed_at`, which the successor carries with the hour figures), so its reconciliation skips
+    it and none of its renewal, limit or remaining reaches the current window.
     """
     if provider == "serpapi":
         if account is None:
@@ -219,6 +224,8 @@ def bootstrap_window(
             account.account_rate_limit_per_hour,
         )
         w.hour_observed_at = account.observed_at
+        if now >= end:
+            w.last_observed_at = account.observed_at
         return w
     state: WindowState = "extrapolated_unvalidated" if provider == "jsearch" else "validated"
     end = now + NOMINAL_PERIOD[provider]
@@ -288,11 +295,16 @@ def apply_observation_pure(
     concurrency 1), so step 3 measures the new window against it.
 
     0. A response observed no later than `w.last_observed_at` is late: nothing changes.
+       A reset time no later than `w.window_start` describes the previous window (Ruling T7-a): SerpApi's
+       renewal date is a date, so the local window rolls over at 00:00 UTC hours before SerpApi renews, and
+       until then its reads report the old renewal and the old month's remaining. Only `last_observed_at` and
+       the hour figures are recorded; steps 1 to 4 are skipped, so the window stays as it is (a SerpApi
+       window stays `extrapolated_unvalidated`, which `pacing.decide` denies as `window_cap`).
     1. A reset time (never from a 429) at least half a period past `w`'s end means the provider has reset:
        `w` is closed `provider_reset_observed` and `[observed_at, reset_at)` opens `validated`, with `w`'s
        limit (tighten-only) and its capacity as the full bucket (the next accrual recomputes it). Otherwise it
        refines `w`: `window_end := reset_at`, `validated`, the probe settled. A reset time that is not ahead
-       of both the observation and `w`'s start identifies no window and is ignored.
+       of the observation identifies no window and is ignored.
     2. A lower limit lowers `limit_units` and the reserve with it; a higher one only alerts.
     3. `limit_units - remaining` above the local usage is an adjustment of the difference (tighten-only).
     4. A JSearch 429 with `remaining` 0 or absent exhausts the window until its reset.
@@ -300,11 +312,15 @@ def apply_observation_pure(
     if w.last_observed_at is not None and obs.observed_at <= w.last_observed_at:
         return w, [], ObservationEffects(0, (), False)
     cur = replace(w, last_observed_at=obs.observed_at)
+    if obs.reset_at is not None and obs.reset_at <= cur.window_start:
+        # The previous window's figures (Ruling T7-a), e.g. a SerpApi read before the plan has renewed.
+        _record_hour(cur, obs)
+        return cur, [], ObservationEffects(0, (), False)
     changes: list[WindowChange] = []
     used = used_units
     reattribute = False
     reset_at = obs.reset_at
-    if reset_at is not None and obs.status != 429 and reset_at > max(obs.observed_at, cur.window_start):
+    if reset_at is not None and obs.status != 429 and reset_at > obs.observed_at:
         if reset_at >= cur.window_end + _period(provider, cur) / 2:
             changes.append(_closed(cur, "provider_reset_observed"))
             limit = min(cur.limit_units, limit_for(provider, settings))
@@ -343,12 +359,17 @@ def apply_observation_pure(
             alerts.append("quota.unaccounted_usage")
     if obs.status == 429 and provider == "jsearch" and obs.remaining in (None, 0):
         cur.state = "exhausted_until_reset"
-    if obs.this_hour is not None:
-        cur.observed_this_hour, cur.observed_hourly_cap = obs.this_hour, obs.hourly_cap
-        cur.hour_observed_at = obs.observed_at
+    _record_hour(cur, obs)
     if reattribute:
         changes.append(Insert(replace(cur)))
     return cur, changes, ObservationEffects(adjustment, tuple(alerts), reattribute)
+
+
+def _record_hour(w: Window, obs: Observation) -> None:
+    """The provider's own hourly figures (SerpApi `this_hour_searches`), which belong to no monthly window."""
+    if obs.this_hour is not None:
+        w.observed_this_hour, w.observed_hourly_cap = obs.this_hour, obs.hourly_cap
+        w.hour_observed_at = obs.observed_at
 
 
 # Persistence. Every statement names the columns of §7.8 explicitly; `_COLUMNS` is the dataclass order.
