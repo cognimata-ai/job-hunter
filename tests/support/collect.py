@@ -28,11 +28,20 @@ Task 16: `posting_factory` inserts a posting with its job and one observation (t
 sighting as given; a missing source instance is created); `board` and `board20` are the Greenhouse watchlist
 board `BOARD_SLUG` (enabled through `seed_inputs`; its fixture route answers `greenhouse_404`) with 3 or 20
 `active` postings and their jobs, its instance's `last_snapshot_active_count` their number (`Board`).
+
+Task 17: the fixture `job_with_postings` inserts a job with one posting and one observation per source,
+straight into the tables (the resolution path arrives in Task 18); each observation's `normalized` is
+`observations.normalized` with that source's overrides. The job row is a placeholder, not a canonical
+selection: its title, `title_norm` and `seniority_tokens` come from `normalize_title` of the first posting's
+title, its other fields say nothing, and its `det_facts_hash` is no hash of its facts, so the first
+`recompute_job` changes the det facts. `add_posting` adds such a posting to a job and `add_observation` a
+newer observation to a posting (it becomes the posting's latest), both on the caller's connection.
 """
 
 import asyncio
 import hashlib
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -43,10 +52,13 @@ import httpx
 import procrastinate
 import pytest
 from jobhunter.clock import utcnow
+from jobhunter.db.seed import SOURCES
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
+from jobhunter.normalize.companies import company_key
+from jobhunter.normalize.titles import normalize_title
 from jobhunter.quota.windows import Provider
 from jobhunter.sources.acquire import AcquireContext
 from jobhunter.sources.base import REMOTE_DE, Billing, CellPlan, RequestSpec, SourceAdapter
@@ -60,6 +72,7 @@ from jobhunter.worker.runs import RunOwner
 from jobhunter.worker.tasks import defer_in_tx, make_queue_app
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.observations import normalized
 from tests.support.pg import PgServer, config_for
 from tests.support.quota import seeded_run_settings
 
@@ -687,3 +700,163 @@ def manual_paid_run(server: PgServer, *, only: str) -> int:
         return row.id
 
     return asyncio.run(request())
+
+
+# ---- Task 17 ----------------------------------------------------------------------------------------------
+
+_ATS: Final = frozenset(source.id for source in SOURCES if source.kind == "ats")
+_PLACEHOLDER_JOB: Final = q(
+    "INSERT INTO jobs (company_key, company_display, title, title_norm, seniority_tokens, location_kind, "
+    "work_mode_possible, work_mode_source, employment_source, ad_language, completeness, posted_precision, "
+    "first_seen_at, last_seen_at, availability, availability_changed_at, source_ids, field_provenance, "
+    "det_facts_hash) VALUES (:company_key, :company, :title, :title_norm, CAST(:tokens AS text[]), "
+    "'unknown', ARRAY['remote','hybrid','onsite'], 'none', 'none', 'unknown', 'full', 'unknown', :at, :at, "
+    "'active', :at, CAST(:sources AS text[]), '{}', :facts) RETURNING id"
+)
+_SOURCE_POSTING: Final = q(
+    "INSERT INTO postings (source_instance_id, native_id, job_id, first_seen_at, last_seen_at, availability, "
+    "availability_changed_at) VALUES (:instance, :native_id, :job, :at, :at, 'active', :at) RETURNING id"
+)
+_NORMALIZED_OBSERVATION: Final = q(
+    "INSERT INTO posting_observations (posting_id, source_instance_id, raw_response_sha256, observed_at, "
+    "normalized, content_hash, completeness, quality) VALUES (:posting, :instance, :sha, :at, :normalized, "
+    ":sha, :completeness, :quality) RETURNING id",
+    jsonb=["normalized"],
+)
+_POSTING_ROW: Final = q("SELECT source_instance_id, native_id FROM postings WHERE id = :p")
+_WATCHLIST_COMPANY: Final = q(
+    "INSERT INTO watchlist_companies (display_name, company_key, ats_type, board_slug, lever_region, "
+    "detection, validation_status) VALUES (:display, :key, :ats, :slug, :region, 'manual', 'ok') RETURNING id"
+)
+
+
+@dataclass(frozen=True)
+class JobPostings:
+    """A job of `job_with_postings`: its postings and their observations, by source id."""
+
+    job_id: int
+    postings: Mapping[str, int]
+    observations: Mapping[str, int]
+
+
+async def _posting_instance(conn: AsyncConnection, source_id: str, watchlist_display: str | None) -> int:
+    """The `default` instance of `source_id` (created when absent), or, for an ATS source with a
+    `watchlist_display`, the board instance of a new watchlist company of that display name."""
+    if watchlist_display is None or source_id not in _ATS:
+        await conn.execute(_ENSURE_INSTANCE, {"s": source_id, "k": "default"})
+        return await instance_id(conn, source_id)
+    company = {
+        "display": watchlist_display,
+        "key": company_key(watchlist_display),
+        "ats": source_id,
+        "slug": f"board-{uuid.uuid4().hex[:12]}",
+        "region": "global" if source_id == "lever" else None,
+    }
+    company_id = int((await conn.execute(_WATCHLIST_COMPANY, company)).scalar_one())
+    return await instance_for_company(conn, company_id)
+
+
+async def _observe(
+    conn: AsyncConnection,
+    posting_id: int,
+    instance: int,
+    native_id: str,
+    at: datetime,
+    overrides: Mapping[str, Any],
+) -> int:
+    """A new observation of the posting at `at` (`observations.normalized` with `overrides`), its latest."""
+    posting = normalized(native_id, **overrides)
+    params = {
+        "posting": posting_id,
+        "instance": instance,
+        "sha": hashlib.sha256(f"{native_id}@{at.isoformat()}@{uuid.uuid4()}".encode()).digest(),
+        "at": at,
+        "normalized": posting.model_dump(mode="json"),
+        "completeness": posting.description_completeness,
+        "quality": posting.description_quality,
+    }
+    observation = int((await conn.execute(_NORMALIZED_OBSERVATION, params)).scalar_one())
+    await conn.execute(_LATEST, {"o": observation, "p": posting_id})
+    return observation
+
+
+async def add_posting(
+    conn: AsyncConnection,
+    job_id: int,
+    source_id: str,
+    *,
+    observed_at: datetime,
+    watchlist_display: str | None = None,
+    **overrides: Any,
+) -> tuple[int, int]:
+    """A posting of `source_id` on the job with one observation at `observed_at` (`observations.normalized`
+    with `overrides`); an ATS posting is on a new watchlist board when `watchlist_display` is given. Returns
+    the posting id and the observation id."""
+    instance = await _posting_instance(conn, source_id, watchlist_display)
+    native_id = f"{source_id}-{uuid.uuid4().hex[:12]}"
+    posting_params = {"instance": instance, "native_id": native_id, "job": job_id, "at": observed_at}
+    posting = int((await conn.execute(_SOURCE_POSTING, posting_params)).scalar_one())
+    return posting, await _observe(conn, posting, instance, native_id, observed_at, overrides)
+
+
+async def add_observation(
+    conn: AsyncConnection, posting_id: int, *, observed_at: datetime, **overrides: Any
+) -> int:
+    """A newer observation of the posting (`observations.normalized` with `overrides`), now its latest one;
+    returns its id."""
+    row = (await conn.execute(_POSTING_ROW, {"p": posting_id})).one()
+    return await _observe(
+        conn, posting_id, int(row.source_instance_id), row.native_id, observed_at, overrides
+    )
+
+
+class JobWithPostings(Protocol):
+    def __call__(
+        self,
+        postings: Mapping[str, Mapping[str, Any]],
+        *,
+        observed_at: datetime | None = None,
+        watchlist_display: str | None = None,
+    ) -> Awaitable[JobPostings]: ...
+
+
+@pytest.fixture
+def job_with_postings(engine: AsyncEngine) -> JobWithPostings:
+    """`await job_with_postings({source_id: {normalized overrides}, ...})`: a job with one posting and one
+    observation per source, in the mapping's order, all observed at `observed_at` (an hour ago by default) and
+    first seen then; the ATS postings are on new watchlist boards named `watchlist_display` when it is given.
+    The job row is a placeholder (see the module docstring)."""
+
+    async def make(
+        postings: Mapping[str, Mapping[str, Any]],
+        *,
+        observed_at: datetime | None = None,
+        watchlist_display: str | None = None,
+    ) -> JobPostings:
+        if not postings:
+            raise ValueError("job_with_postings needs at least one posting")
+        at = utcnow() - timedelta(hours=1) if observed_at is None else observed_at
+        first = normalized(**dict(next(iter(postings.values()))))
+        title = normalize_title(first.title_raw).title
+        normalized_title = normalize_title(title)
+        job_params = {
+            "company_key": company_key(first.company_raw),
+            "company": first.company_raw,
+            "title": title,
+            "title_norm": normalized_title.title_norm,
+            "tokens": sorted(normalized_title.seniority_tokens),
+            "at": at,
+            "sources": sorted(postings),
+            "facts": hashlib.sha256(b"a placeholder, not the hash of the job's facts").digest(),
+        }
+        made_postings: dict[str, int] = {}
+        made_observations: dict[str, int] = {}
+        async with engine.begin() as conn:
+            job = int((await conn.execute(_PLACEHOLDER_JOB, job_params)).scalar_one())
+            for source_id, overrides in postings.items():
+                made_postings[source_id], made_observations[source_id] = await add_posting(
+                    conn, job, source_id, observed_at=at, watchlist_display=watchlist_display, **overrides
+                )
+        return JobPostings(job, MappingProxyType(made_postings), MappingProxyType(made_observations))
+
+    return make
