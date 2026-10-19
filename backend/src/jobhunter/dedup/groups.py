@@ -21,10 +21,11 @@ It returns the `GroupEvidence` (with a requisition id match as extra evidence, n
 **Formation** (`choose_group`, `choose_partner`, pure): a job joins an active group whose representative it
 confirms (G2-G5), against whose every member it passes G1 and has no `different` decision, and that has fewer
 than `MAX_MEMBERS` members; a group without a representative cannot be validated and is not joined. Of
-several, the one with the best text score, then the lowest id (`dedup.ambiguous_grouping`, info, logged and
-kept in the member's evidence). Otherwise the ungrouped candidate with the best pair evidence (text score,
-then lowest id) forms a new group with it, its representative elected by §8.7's order (`initial`). Groups
-are never merged together.
+several, the one with the best text score, then the lowest id: `dedup.ambiguous_grouping` is raised as an info
+alert (subject `job:<id>`, Ruling T20-b) when the job joins, logged, and kept in the member's evidence; a
+regroup that only confirms the job raises nothing. Otherwise the ungrouped candidate with the best pair
+evidence (text score, then lowest id) forms a new group with it, its representative elected by §8.7's order
+(`initial`). Groups are never merged together.
 
 **`regroup_job`** (the grouping of one job, in the caller's transaction): the candidates are the jobs of the
 same `company_key`, first seen at most `CANDIDATE_DAYS` apart, unmerged, with no `different` decision against
@@ -37,12 +38,14 @@ it is eligible. After every representative change the members are revalidated ag
 and those that fail leave (`member_left`); a group left with fewer than two members is dissolved. The ranking
 generation is bumped, as the last statement, when anything was written.
 
-**Locks (Ruling T20-a, §3.3.3).** `regroup_job` takes `pg_advisory_xact_lock(hashtext(company_key))` FIRST,
-before any row: regroups of one company are serialised. Then the job, its candidates and the current members
-of every group it may join or leave (the groups of the job and of its candidates) in ONE ordered `FOR UPDATE`
-statement (`merge.lock_jobs`), so a job is never added to a group whose members another transaction holds
-(carry 4). Then `guard(conn)` (the run's owner row, or the reconciler's epoch fence: Ruling T19-a puts it
-after the job rows). Then the group rows `FOR UPDATE` in id order, the other domain rows, and
+**Locks (Ruling T20-a, §3.3.3).** `regroup_job` takes the company lock, `pg_advisory_xact_lock(
+COMPANY_LOCK_NAMESPACE, hashtext(company_key))` (the two-key form: a key space of its own), FIRST, before any
+row, and it must be the caller transaction's first lock: regroups of one company are serialised, and no
+transaction waits for a company lock while it holds a row. Then the job, its candidates and the current
+members of every group it may join or leave (the groups of the job and of its candidates) in ONE ordered
+`FOR UPDATE` statement (`merge.lock_jobs`), so a job is never added to a group whose members another
+transaction holds (carry 4). Then `guard(conn)` (the run's owner row, or the reconciler's epoch fence: Ruling
+T19-a puts it after the job rows). Then the group rows `FOR UPDATE` in id order, the other domain rows, and
 `ranking_state` last. Each read-and-lock round runs in a savepoint: when the job's company or first sighting
 changed between the read and the lock, or its groups gained a member the round does not hold, the savepoint
 is rolled back, which releases the round's row locks and its advisory lock, and the round runs again (at
@@ -94,6 +97,7 @@ from jobhunter.dedup.representative import ELIGIBLE_SQL, MemberView, eligible
 from jobhunter.dedup.shingles import TextSide, text_confirms
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.geo.gazetteer import distance_km
+from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import DEDUP_GROUP_REPAIRS
 from jobhunter.quota import ledger
@@ -109,7 +113,7 @@ CANDIDATE_DAYS: Final = 45
 MAX_MEMBERS: Final = 10
 G2_KM: Final = 25.0
 GROUPING_COUNTERS: Final = ("groups_formed", "groups_changed", "elections")
-AMBIGUOUS_GROUPING: Final = "dedup.ambiguous_grouping"
+AMBIGUOUS_GROUPING: Final = "dedup.ambiguous_grouping"  # an info alert, subject `job:<id>` (Ruling T20-b)
 # election reasons (§7.9 `duplicate_groups.election_reason`)
 INITIAL: Final = "initial"
 FULLER_MEMBER_JOINED: Final = "fuller_member_joined"
@@ -122,7 +126,11 @@ _LOCK_ROUNDS: Final = 3  # read-then-lock rounds before a set that keeps changin
 _DIGITS: Final = 4  # the precision of a score in a member's evidence
 
 _JOB: Final = q("SELECT company_key, first_seen_at FROM jobs WHERE id = :job AND merged_into_job_id IS NULL")
-_COMPANY_LOCK: Final = q("SELECT pg_advisory_xact_lock(hashtext(:company))")
+# The company lock's key space: the two-key form `(COMPANY_LOCK_NAMESPACE, hashtext(company_key))` keeps it
+# apart from the project's single-key locks (7261001 worker singleton, 7261002 login throttle, 7261003
+# migrate).
+COMPANY_LOCK_NAMESPACE: Final = 7261004
+_COMPANY_LOCK: Final = q("SELECT pg_advisory_xact_lock(CAST(:namespace AS integer), hashtext(:company))")
 _CANDIDATES: Final = q(
     "SELECT c.id FROM jobs c WHERE c.company_key = :company AND c.id <> :job "
     "AND c.merged_into_job_id IS NULL "
@@ -464,7 +472,11 @@ async def _revalidate(conn: AsyncConnection, group_id: int, representative_id: i
 
 
 async def _elect(conn: AsyncConnection, group_id: int, *, reason: str) -> tuple[int, ...]:
-    """An election for `reason`, then the revalidation against the new representative; the jobs that left."""
+    """An election for `reason`, then the revalidation against the new representative; the jobs that left,
+    those of a group of fewer than two members that is dissolved instead (as `reelect` would) among them."""
+    group = (await conn.execute(_GROUP, {"group": group_id})).one()
+    if group.status == "active" and len(await _members(conn, group_id)) < 2:
+        return await representative.dissolve(conn, group_id, reason=reason)
     elected = await representative.reelect(conn, group_id, reason=reason)
     return () if elected is None else await _revalidate(conn, group_id, elected)
 
@@ -507,7 +519,7 @@ async def _lock_round(conn: AsyncConnection, job_id: int) -> _Locked | None:
     row = (await conn.execute(_JOB, {"job": job_id})).first()
     if row is None:
         return _Locked(found=False)
-    await conn.execute(_COMPANY_LOCK, {"company": row.company_key})
+    await conn.execute(_COMPANY_LOCK, {"namespace": COMPANY_LOCK_NAMESPACE, "company": row.company_key})
     params = {"company": row.company_key, "job": job_id, "first": row.first_seen_at, "days": CANDIDATE_DAYS}
     candidates = tuple(int(c) for c in (await conn.execute(_CANDIDATES, params)).scalars())
     jobs = (job_id, *candidates)
@@ -677,7 +689,19 @@ class _Regroup:
         await self.conn.execute(_IN_GROUP, {"group": choice.group_id, "jobs": [a.id]})
         self.wrote = True
         log.info("duplicate_group_joined", group_id=choice.group_id, job_id=a.id)
-        if ambiguous:
+        if ambiguous:  # recorded once, when the job joins; a regroup that confirms it raises nothing
+            await raise_alert(
+                self.conn,
+                code=AMBIGUOUS_GROUPING,
+                severity="info",
+                subject=f"job:{a.id}",
+                message="a job qualified for several duplicate groups and joined the best-scoring one",
+                context={
+                    "job_id": a.id,
+                    "group_id": choice.group_id,
+                    "group_ids": list[JSONValue](choice.qualifying),
+                },
+            )
             log.info(AMBIGUOUS_GROUPING, job_id=a.id, group_ids=list(choice.qualifying))
         if (
             a.completeness == "full"
@@ -714,7 +738,9 @@ class _Regroup:
 
 async def regroup_job(conn: AsyncConnection, job_id: int, *, guard: Guard) -> GroupEffect:
     """Group one job (§8.7; module docstring) in the caller's transaction, under the company lock and in the
-    lock order of Ruling T20-a; what it did. A job that is merged or gone is left alone. `guard` runs after
+    lock order of Ruling T20-a; what it did. The company lock must be the caller transaction's FIRST lock:
+    deadlock freedom depends on no transaction ever waiting for it while holding a row (a caller that already
+    holds rows must commit them first). A job that is merged or gone is left alone. `guard` runs after
     the job rows and before any write; it raises `FencedOut` to stop. Idempotent: a job already in the right
     group is confirmed and nothing is written."""
     locked = await _lock(conn, job_id)

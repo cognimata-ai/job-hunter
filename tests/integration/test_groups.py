@@ -8,7 +8,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
-from jobhunter.dedup import groups, merge
+from jobhunter.dedup import groups, merge, revisions
 from jobhunter.dedup.groups import GroupEffect
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
@@ -19,7 +19,15 @@ from jobhunter.worker import reconcilers as r
 from jobhunter.worker.epoch import fence_epoch
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from tests.support.collect import ctx, job_lockable, make_deps, pending_item, queued_run, supersede
+from tests.support.collect import (
+    add_observation,
+    ctx,
+    job_lockable,
+    make_deps,
+    pending_item,
+    queued_run,
+    supersede,
+)
 from tests.support.groups import BERLIN, FULL_TEXT, canonical_job, varied
 from tests.support.logs import logged
 from tests.support.pg import PgServer, lock_waits, pg_one
@@ -105,8 +113,18 @@ def repairs_total() -> float:
 
 
 def advisory_held(server: PgServer) -> int:
-    row = pg_one(server, "superuser", "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted")
+    """Granted company locks: two-key advisory locks (`objsubid = 2`) of `groups.COMPANY_LOCK_NAMESPACE`."""
+    row = pg_one(
+        server,
+        "superuser",
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 2 "
+        "AND classid::bigint = %s",
+        groups.COMPANY_LOCK_NAMESPACE,
+    )
     return 0 if row is None else int(str(row[0]))
+
+
+ALERT = sa.text("SELECT severity, occurrences, context, resolved_at FROM alerts WHERE dedup_key = :k")
 
 
 async def test_group_formation_election_twin_and_member_left(
@@ -180,9 +198,18 @@ async def test_an_ambiguous_job_joins_the_better_group(
     assert effect == GroupEffect(one, True, False, (), True, True)  # the better score; a full twin, elected
     [event] = logged(caplog, "dedup.ambiguous_grouping")
     assert (event["job_id"], event["group_ids"]) == (a, [one, two])
+    # Ruling T20-b: recorded as an info alert
+    [alert] = await fetch(engine, ALERT, k=f"dedup.ambiguous_grouping:job:{a}")
+    assert (alert.severity, alert.occurrences, alert.resolved_at) == ("info", 1, None)
+    assert alert.context == {"job_id": a, "group_id": one, "group_ids": [one, two]}
     evidence = await scalar(engine, "SELECT evidence FROM duplicate_group_members WHERE job_id = :j", j=a)
     assert evidence["ambiguous_group_ids"] == [one, two] and evidence["against_job_id"] == first[0]
     assert await members(engine, two) == sorted(second)  # groups are never merged together
+    # an unchanged regroup raises it no more
+    assert (await regroup(engine, a)) == GroupEffect(one, False, False, (), False, False)
+    assert [row.occurrences for row in await fetch(engine, ALERT, k=f"dedup.ambiguous_grouping:job:{a}")] == [
+        1
+    ]
 
 
 async def test_split_confirm_dissolve_and_reconciler(
@@ -411,18 +438,25 @@ async def test_the_node_groups_the_jobs_changed_in_the_run(
     assert len(grouped) == 3 and grouped[0] == old
     assert [await group_of_job(engine, job) for job in stale] == [None, None]
     start = await generation(engine)
-    again = await node(
-        initial_state(owner.run_id, owner.attempt_no)
-    )  # a resumed attempt re-runs it harmlessly
+    # a resumed attempt re-runs it harmlessly
+    again = await node(initial_state(owner.run_id, owner.attempt_no))
     assert {k: again["counters"][k] for k in groups.GROUPING_COUNTERS} == dict.fromkeys(
         groups.GROUPING_COUNTERS, 0
     )
     assert await generation(engine) == start and await members(engine, group) == grouped
 
-    await supersede(engine, owner)  # the old attempt is fenced out after the job rows, having written nothing
+    # a pair changed in the run and not grouped yet: a pass of the old attempt would group it, but it is
+    # fenced out after the job rows, having written nothing
+    fresh = [await make("greenhouse", company_raw="Fresh", description_text=FULL_TEXT) for _ in "xy"]
+    successor = await supersede(engine, owner)
     with pytest.raises(FencedOut):
         await groups.regroup_run_jobs(engine, owner)
-    assert await generation(engine) == start
+    assert [await group_of_job(engine, job) for job in fresh] == [None, None]
+    assert await generation(engine) == start and len(await fetch(engine, GROUPS)) == 1
+    # the run's owner groups it
+    assert (await groups.regroup_run_jobs(engine, successor))["groups_formed"] == 1
+    paired = await group_of_job(engine, fresh[0])
+    assert paired is not None and await members(engine, paired) == fresh
 
 
 async def test_regroup_locks_the_job_and_every_member_in_one_statement_before_the_guard(
@@ -518,3 +552,131 @@ async def test_the_reconciler_locks_the_members_before_its_fence(
     assert await r.REGISTRY["group_representatives"][1](ctx(engine, queue_app)) == 1
     assert order == ["job rows", "fence_epoch"]
     assert group is not None and await group_row(engine, group) == ("active", v, None, "reconciler_repair")
+
+
+async def test_candidates_are_first_seen_at_most_45_days_apart(
+    engine, current_epoch, job_with_postings
+) -> None:
+    base = utcnow() - timedelta(days=60)
+
+    async def make(company: str, days: int) -> int:
+        at = base + timedelta(days=days)
+        return await canonical_job(
+            engine,
+            job_with_postings,
+            "jsearch",
+            observed_at=at,
+            company_raw=company,
+            description_text=FULL_TEXT,
+        )
+
+    near = [await make("Near", 0), await make("Near", 44)]
+    far = [await make("Far", 0), await make("Far", 46)]
+    joined = await regroup(engine, near[1])
+    assert joined.created and joined.group_id is not None and await members(engine, joined.group_id) == near
+    assert await regroup(engine, far[1]) == NOTHING and await regroup(engine, far[0]) == NOTHING
+
+
+async def test_two_postings_of_one_ats_board_are_never_grouped(
+    engine, current_epoch, job_with_postings
+) -> None:
+    """G1 through the database: the jobs' `ats:` keys name one board. A requisition id match is evidence."""
+    make = jobs_maker(engine, job_with_postings)
+    a, b = [await make("greenhouse", description_text=FULL_TEXT, requisition_id="R1") for _ in "ab"]
+    c = await make("greenhouse", description_text=FULL_TEXT, requisition_id="R1")
+    keys = sa.text("INSERT INTO ad_keys (key_ns, key_value, exclusive, job_id) VALUES (:ns, :v, true, :j)")
+    async with engine.begin() as conn:
+        for job, board, value in ((a, "acme", "1"), (b, "acme", "2"), (c, "acme-eu", "3")):
+            await conn.execute(keys, {"ns": f"ats:greenhouse:{board}", "v": value, "j": job})
+    views = await _views(engine, a, b, c)
+    assert (views[a].ats_boards, views[a].requisition_ids) == (
+        frozenset({"greenhouse:acme"}),
+        frozenset({"R1"}),
+    )
+    paired = await regroup(engine, a)  # B is on A's board; C is not
+    assert paired.created and paired.group_id is not None and await members(engine, paired.group_id) == [a, c]
+    evidence = await scalar(engine, "SELECT evidence FROM duplicate_group_members WHERE job_id = :j", j=c)
+    assert evidence["requisition_match"] is True
+    assert await regroup(engine, b) == NOTHING  # G1 against a member rules the group out
+
+
+async def _views(engine: AsyncEngine, *job_ids: int) -> dict[int, groups.JobView]:
+    async with engine.connect() as conn:
+        return await groups.load_views(conn, job_ids)
+
+
+async def test_a_representative_that_closed_re_elects_on_its_own_regroup(
+    engine, current_epoch, job_with_postings
+) -> None:
+    make = jobs_maker(engine, job_with_postings)
+    u, v, w = [await make("jsearch", description_text=FULL_TEXT) for _ in "uvw"]
+    group = (await regroup(engine, u)).group_id
+    assert group is not None and (await regroup(engine, w)).joined
+    close = sa.text("UPDATE jobs SET availability = 'closed' WHERE id = :j")
+    async with engine.begin() as conn:
+        await conn.execute(close, {"j": u})
+    start = await generation(engine)
+    assert await regroup(engine, u) == GroupEffect(group, False, False, (), True, False)
+    assert await group_row(engine, group) == ("active", v, None, "rep_inactive")
+    assert await members(engine, group) == [u, v, w] and await generation(engine) == start + 1
+    assert await regroup(engine, u) == GroupEffect(group, False, False, (), False, False)  # confirmed now
+
+    # Minor 2: a group that `reelect` dissolves reports its members as left (a group of one, as a stand-in
+    # or a hand edit may leave it)
+    x = await make("jsearch", company_raw="Lonely", description_text=FULL_TEXT)
+    async with engine.begin() as conn:
+        lonely = (
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO duplicate_groups (representative_job_id, status, election_reason) "
+                    "VALUES (:x, 'active', 'initial') RETURNING id"
+                ),
+                {"x": x},
+            )
+        ).scalar_one()
+        await conn.execute(
+            sa.text("INSERT INTO duplicate_group_members (group_id, job_id, evidence) VALUES (:g, :x, '{}')"),
+            {"g": lonely, "x": x},
+        )
+        await conn.execute(
+            sa.text("UPDATE jobs SET duplicate_group_id = :g WHERE id = :x"), {"g": lonely, "x": x}
+        )
+        await conn.execute(close, {"j": x})
+    assert await regroup(engine, x) == GroupEffect(None, False, False, (x,), True, False)
+    assert await group_row(engine, lonely) == ("dissolved", None, None, "rep_inactive")
+
+
+async def test_a_member_that_no_longer_confirms_leaves_and_is_grouped_anew(
+    engine, current_epoch, job_with_postings
+) -> None:
+    make = jobs_maker(engine, job_with_postings)
+    a, b, m = [await make("jsearch", description_text=FULL_TEXT) for _ in "abm"]
+    other = varied(60, 200)
+    n = await make("jsearch", description_text=other)  # confirms against none of them
+    group = (await regroup(engine, a)).group_id
+    assert group is not None and (await regroup(engine, m)).joined and await regroup(engine, n) == NOTHING
+    # M's ad changes to N's text: a new current revision
+    async with engine.begin() as conn:
+        posting = (
+            await conn.execute(sa.text("SELECT id FROM postings WHERE job_id = :m"), {"m": m})
+        ).scalar_one()
+        await add_observation(
+            conn,
+            posting,
+            observed_at=utcnow(),
+            title_raw="Senior Software Engineer",
+            locations=[BERLIN],
+            location_kind="city",
+            description_text=other,
+        )
+        await revisions.recompute_job(conn, m)
+    effect = await regroup(engine, m)
+    assert effect.created and effect.left == (m,) and effect.group_id not in (None, group)
+    assert effect.group_id is not None and await members(engine, effect.group_id) == [m, n]
+    assert await members(engine, group) == [a, b] and await group_row(engine, group) == (
+        "active",
+        a,
+        None,
+        "initial",
+    )
+    assert await regroup(engine, m) == GroupEffect(effect.group_id, False, False, (), False, False)
