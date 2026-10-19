@@ -8,7 +8,8 @@ one Arbeitnow cell; one cell per enabled watchlist board. Inserted `ON CONFLICT 
 
 **The primary plan** (`plan_run`, node 1): a run that has fetch requests already reuses them (the receipt,
 `_reuse`): the latest attempt of every planned request is the work list, a `skipped(shutdown | superseded)`
-one is re-planned as a new `planned` row with `attempt_seq + 1` (at most `ledger.MAX_ATTEMPT_SEQ`), every
+one is re-planned as a new `planned` row with `attempt_seq + 1` (at most `ledger.MAX_ATTEMPT_SEQ`; one out of
+attempts stays skipped and a search cell's window is recorded as the open gap `shutdown`, §7.16.5), every
 other skip is a denial that stays. Otherwise every enabled instance whose health is not `disabled` is
 planned, a paid one (JSearch) only in a run that includes paid sources and SerpApi never (its specs come from
 the fallback, §6.6):
@@ -24,7 +25,8 @@ the fallback, §6.6):
 Every spec is the adapter's `plan(cell_plan)`, with the coverage window computed here once and carried in
 `RequestSpec.window` (a resumed attempt reads it back from the row): JSearch and SerpApi the freshness bucket
 (`coverage.freshness_bucket`), whose unreachable part is abandoned at once by an inline `coverage_intervals`
-row (`gap`, `abandoned`, `beyond_provider_window`) when the spec is planned; Adzuna `max_days_old` days; the
+row (`gap`, `abandoned`, `beyond_provider_window`) when the spec is planned, from the cell's latest such bound
+on, so that the rows of successive runs never overlap; Adzuna `max_days_old` days; the
 free sources the scope's ad age. **Cursor reuse** (§5.3.1, Ruling P3): a JSearch cell whose continuation holds
 a cursor obtained less than `jsearch.CURSOR_REUSE_TTL` ago is planned from it, `next_page(plan(cell_plan),
 cursor)` over the continuation's window and on its page, so that traversal's `END` closes its open gap;
@@ -81,6 +83,7 @@ from jobhunter.sources.coverage import (
     JSearchContinuation,
     adzuna_max_days_old,
     freshness_bucket,
+    record_search_gap,
 )
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.sources.jsearch import CURSOR_REUSE_TTL, JSearchAdapter
@@ -161,18 +164,24 @@ _RECEIPTS = q(
     "WITH firsts AS (SELECT DISTINCT ON (cell_id) request_key, id AS first_id FROM fetch_requests "
     "WHERE run_id = :run AND phase = :phase ORDER BY cell_id, id) "
     "SELECT DISTINCT ON (f.request_key) f.id, f.cell_id, f.source_instance_id, f.attempt_seq, f.status, "
-    "f.skip_reason, f.request_key, f.spec, firsts.first_id FROM fetch_requests f "
-    "JOIN firsts ON firsts.request_key = f.request_key WHERE f.run_id = :run "
-    "ORDER BY f.request_key, f.attempt_seq DESC"
+    "f.skip_reason, f.request_key, f.spec, firsts.first_id, i.source_id FROM fetch_requests f "
+    "JOIN firsts ON firsts.request_key = f.request_key "
+    "JOIN source_instances i ON i.id = f.source_instance_id "
+    "WHERE f.run_id = :run ORDER BY f.request_key, f.attempt_seq DESC"
 )
 _RUN_JSEARCH_CELLS = q(
     "SELECT DISTINCT f.cell_id FROM fetch_requests f JOIN source_instances i ON i.id = f.source_instance_id "
     "WHERE f.run_id = :run AND f.phase = 'primary' AND i.source_id = 'jsearch' ORDER BY f.cell_id"
 )
+# The unreachable part of a window, from the latest `beyond_provider_window` bound of the cell on: while
+# `last_covered_at` stays put, every run's part would otherwise overlap the parts abandoned before it.
 _ABANDON = q(
     "INSERT INTO coverage_intervals (cell_id, kind, span, gap_status, reason, run_id, closed_at) "
-    "VALUES (:cell, 'gap', tstzrange(:lower, :upper, '[)'), 'abandoned', 'beyond_provider_window', :run, "
-    ":now) ON CONFLICT (cell_id, kind, span) DO NOTHING"
+    "SELECT :cell, 'gap', tstzrange(b.lower, :upper, '[)'), 'abandoned', 'beyond_provider_window', :run, "
+    ":now FROM (SELECT greatest(CAST(:lower AS timestamptz), max(upper(span))) AS lower "
+    "FROM coverage_intervals WHERE cell_id = :cell AND kind = 'gap' "
+    "AND reason = 'beyond_provider_window') AS b "
+    "WHERE b.lower < CAST(:upper AS timestamptz) ON CONFLICT (cell_id, kind, span) DO NOTHING"
 )
 
 
@@ -573,7 +582,15 @@ async def _reuse(conn: AsyncConnection, owner: "RunOwner", phase: Phase) -> Plan
     skipped: Counter[str] = Counter()
     replanned = 0
     for row in sorted(found, key=lambda row: int(row.first_id)):
-        if row.status == "skipped" and row.skip_reason in REPLANNED and row.attempt_seq < MAX_ATTEMPT_SEQ:
+        if row.status == "skipped" and row.skip_reason in REPLANNED and row.attempt_seq >= MAX_ATTEMPT_SEQ:
+            # out of attempts (§7.16.5): the spec is recorded as a gap, a search cell's window by §5.6
+            window = RequestSpec.from_json(row.spec).window
+            if row.source_id in SEARCH_SOURCES and window is not None:
+                await record_search_gap(
+                    conn, int(row.cell_id), window=window, reason="shutdown", run_id=owner.run_id
+                )
+            skipped[str(row.skip_reason)] += 1
+        elif row.status == "skipped" and row.skip_reason in REPLANNED:
             fetch_request_id = await insert_fetch_request(
                 conn,
                 owner=owner,

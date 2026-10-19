@@ -532,6 +532,7 @@ GRAPH_NODES = [
     "fetch_cell",
     "plan_fallback",
     "fetch_fallback",
+    "fetch_cell",
     "parse_normalize",
     "resolve_identity",
     "embed",
@@ -700,8 +701,8 @@ async def run_row(engine, rid: int):
         )
 
 
-async def test_graph_runs_plan_and_pass_through_nodes_on_the_real_worker_protocol(
-    engine, current_epoch, migrated, fake_http, respx_mock, serpapi_fixture_adapter: SerpApiAdapter
+async def test_graph_runs_plan_fetch_and_pass_through_nodes_on_the_real_worker_protocol(
+    engine, current_epoch, migrated, adapters, respx_mock, serpapi_fixture_adapter: SerpApiAdapter
 ) -> None:
     await seed_inputs(engine, queries=(TEST_QUERY,), companies=(("greenhouse", "getyourguide"),))
     async with (
@@ -711,30 +712,40 @@ async def test_graph_runs_plan_and_pass_through_nodes_on_the_real_worker_protoco
         assert await record_failure(c, jsearch, "auth", billing="paid", now=utcnow()) == "auth_failed"
     rid = await queued_run_id(engine, include_paid=True)
 
-    def adapters(instance: InstanceRow) -> SourceAdapter:
-        assert instance.source_id == "serpapi", "only plan_fallback reads an account, the SerpApi one"
-        return serpapi_fixture_adapter
+    def fixture_adapters(instance: InstanceRow) -> SourceAdapter:
+        return serpapi_fixture_adapter if instance.source_id == "serpapi" else adapters(instance)
 
-    admission, state = await run_graph(engine, migrated, collect_deps(engine, adapters), rid)
+    admission, state = await run_graph(engine, migrated, collect_deps(engine, fixture_adapters), rid)
     assert admission == "started"
     rows = await requests(engine, rid)
     # the pass-through finalize leaves the end to execute_run
     assert await run_row(engine, rid) == ("succeeded", {"noop": True})
-    assert sorted((r.phase, r.source_id, r.status, r.skip_reason) for r in rows) == [
-        ("fallback", "serpapi", "planned", None),
-        ("primary", "adzuna", "planned", None),
-        ("primary", "arbeitnow", "planned", None),
-        ("primary", "greenhouse", "planned", None),
-        ("primary", "jsearch", "skipped", "breaker_open"),
+    assert sorted((r.phase, r.source_id, r.page_no, r.status, r.skip_reason) for r in rows) == [
+        ("fallback", "serpapi", 1, "succeeded", None),
+        ("fallback", "serpapi", 2, "succeeded", None),  # page 1's ids are new: page 2 (§5.3.1)
+        ("primary", "adzuna", 1, "succeeded", None),
+        ("primary", "adzuna", 2, "succeeded", None),  # the fixture routes' empty page 2: the end
+        ("primary", "arbeitnow", 1, "succeeded", None),
+        ("primary", "arbeitnow", 2, "succeeded", None),
+        ("primary", "arbeitnow", 3, "succeeded", None),  # page 3 is the end of the fixture feed
+        ("primary", "greenhouse", 1, "succeeded", None),
+        ("primary", "jsearch", 1, "skipped", "breaker_open"),
     ]
-    planned = {phase: [r.id for r in rows if r.phase == phase and r.status == "planned"] for phase in PHASES}
-    assert state["steps"] == GRAPH_NODES  # every node, one fetch_cell per planned primary spec
+    planned = {  # the planner's rows: every phase's first pages, but the skipped JSearch spec
+        phase: [r.id for r in rows if r.phase == phase and r.page_no == 1 and r.status != "skipped"]
+        for phase in PHASES
+    }
+    assert state["steps"] == GRAPH_NODES  # every node, one fetch_cell per planned spec of each phase
     assert state["primary_fetch_request_ids"] == planned["primary"]
     assert state["fallback_fetch_request_ids"] == planned["fallback"] and state["plan_done"] is True
-    assert (state["outcomes"], state["counters"], state["final_status"]) == ({}, {}, None)
+    fetched = [r for r in rows if r.status == "succeeded"]
+    assert sorted(state["outcomes"]) == sorted(f"fr:{r.id}" for r in fetched)  # one outcome per page
+    assert {o["status"] for o in state["outcomes"].values()} == {"succeeded"}
+    assert state["counters"]["fetch_pages"] == len(fetched) and state["final_status"] is None
     async with engine.connect() as c:
         assert state["settings_version_id"] == (await c.execute(ACTIVE_VERSION)).scalar_one()
-    assert respx_mock["serpapi_account"].call_count == 1  # plan_fallback's; `plan` reads none (Ruling T13-c)
+    # plan_fallback's read (`plan` reads none, Ruling T13-c), one before each search and one after the last
+    assert respx_mock["serpapi_account"].call_count == 1 + 2 + 1
 
 
 async def test_plan_fallback_reads_its_inputs_from_the_run_row(engine, current_epoch) -> None:
@@ -777,7 +788,9 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
     await seed_free_inputs(engine)
     rid = await queued_run_id(engine, include_paid=False)
     error = SourceError("transient", code="http_503", status=503)
-    monkeypatch.setattr(collect_graph, "fetch_cell", failing_fetch_cell(engine, "arbeitnow", error))
+    monkeypatch.setattr(
+        collect_graph, "make_fetch_cell", lambda deps: failing_fetch_cell(engine, "arbeitnow", error)
+    )
     admission, state = await run_graph(engine, migrated, collect_deps(engine), rid)
     (failed,) = [r.id for r in await requests(engine, rid) if r.source_id == "arbeitnow"]
     assert admission == "started" and await run_row(engine, rid) == ("succeeded", {"noop": True})
@@ -794,7 +807,9 @@ async def test_fenced_out_in_one_fetch_cell_send_ends_the_attempt(
     await seed_free_inputs(engine)
     rid = await queued_run_id(engine, include_paid=False)
     monkeypatch.setattr(
-        collect_graph, "fetch_cell", failing_fetch_cell(engine, "arbeitnow", FencedOut("run"))
+        collect_graph,
+        "make_fetch_cell",
+        lambda deps: failing_fetch_cell(engine, "arbeitnow", FencedOut("run")),
     )
     admission, state = await run_graph(engine, migrated, collect_deps(engine), rid)
     assert admission == "started" and "finalize" not in state.get("steps", [])

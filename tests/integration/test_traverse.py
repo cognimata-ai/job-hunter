@@ -1,0 +1,434 @@
+import asyncio
+import json
+import re
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+
+import httpx
+import pytest
+import respx
+import sqlalchemy as sa
+from jobhunter.clock import utcnow
+from jobhunter.graphs.collect.deps import CollectDeps
+from jobhunter.graphs.collect.nodes.fetch import make_fetch_cell, traverse_and_record
+from jobhunter.graphs.collect.nodes.plan import make_plan
+from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback
+from jobhunter.graphs.collect.state import initial_state
+from jobhunter.observability.metrics import REGISTRY
+from jobhunter.sources import acquire
+from jobhunter.sources.adzuna import SEARCH_URL as ADZUNA_URL
+from jobhunter.sources.adzuna import AdzunaAdapter
+from jobhunter.sources.arbeitnow import FEED_URL, ArbeitnowAdapter
+from jobhunter.sources.ats import adapter_for
+from jobhunter.sources.ats.smartrecruiters import SmartRecruitersAdapter
+from jobhunter.sources.breaker import record_failure
+from jobhunter.sources.instances import InstanceRow, list_instances
+from jobhunter.sources.serpapi import SerpApiAdapter
+from jobhunter.worker import runs
+from jobhunter.worker.runs import RunOwner, finalize_run
+from jobhunter.worker.tasks import defer_in_tx
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from tests.support.collect import (
+    TEST_QUERY,
+    JobFactory,
+    instance_id,
+    make_deps,
+    queued_run,
+    seed_inputs,
+    supersede,
+)
+from tests.support.faults import PausePoint
+from tests.support.sources import Adapters, load_fixture, served_requests
+
+pytestmark = pytest.mark.integration
+GAPS = sa.text(
+    "SELECT i.kind, i.gap_status, i.reason FROM coverage_intervals i "
+    "JOIN fetch_requests f ON f.cell_id = i.cell_id WHERE f.id = :i"
+)
+RUN_INTERVALS = sa.text(
+    "SELECT kind, gap_status, reason, lower(span), upper(span), gap_cursor FROM coverage_intervals "
+    "WHERE run_id = :r ORDER BY id"
+)
+PAGES = sa.text(
+    "SELECT f.page_no, f.status, f.request_class, f.new_native_ids, l.request_class AS ledger_class "
+    "FROM fetch_requests f LEFT JOIN quota_ledger l ON l.id = f.quota_ledger_id WHERE f.run_id = :r "
+    "AND f.cell_id = :c ORDER BY f.id"
+)
+CELL_OF = sa.text("SELECT cell_id FROM fetch_requests WHERE id = :i")
+SOURCES_OF = sa.text(
+    "SELECT s.source_id, f.id, f.cell_id FROM fetch_requests f JOIN source_instances s "
+    "ON s.id = f.source_instance_id WHERE f.id = ANY(:ids)"
+)
+H = timedelta(hours=1)
+
+
+async def plan_ids(deps: CollectDeps, owner: RunOwner) -> list[int]:
+    return (await make_plan(deps)(initial_state(owner.run_id, owner.attempt_no)))["primary_fetch_request_ids"]
+
+
+async def rows(engine: AsyncEngine, statement: sa.TextClause, **params: object) -> list[tuple[object, ...]]:
+    async with engine.connect() as c:
+        return [tuple(r) for r in await c.execute(statement, params)]
+
+
+async def cell_of(engine: AsyncEngine, fetch_request_id: int) -> int:
+    async with engine.connect() as c:
+        return int((await c.execute(CELL_OF, {"i": fetch_request_id})).scalar_one())
+
+
+async def by_source(engine: AsyncEngine, ids: list[int]) -> dict[str, tuple[int, int]]:
+    """The planned requests `ids` by source: `(fetch request id, cell id)`."""
+    async with engine.connect() as c:
+        return {r.source_id: (int(r.id), int(r.cell_id)) for r in await c.execute(SOURCES_OF, {"ids": ids})}
+
+
+async def finish(engine: AsyncEngine, owner: RunOwner) -> None:
+    async with engine.begin() as c:
+        await finalize_run(c, owner, status="succeeded", reason=None, report={})
+
+
+def fetched(source: str, status: str) -> float:
+    labels = {"source": source, "status": status}
+    return REGISTRY.get_sample_value("jobhunter_fetch_requests_total", labels) or 0.0
+
+
+def page1_ids() -> list[str]:
+    doc = json.loads(load_fixture("jsearch", "search_v2_page1")[2])
+    return [job["job_uid"] for job in doc["data"]["jobs"]]
+
+
+async def test_jsearch_page_two_rule(
+    engine, current_epoch, adapters: Adapters, job_factory: JobFactory
+) -> None:
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    deps = make_deps(engine, adapters)
+    first = await queued_run(engine)
+    (fid,) = await plan_ids(deps, first)
+    cell = await cell_of(engine, fid)
+    before = fetched("jsearch", "succeeded")
+    result = await traverse_and_record(deps, fid)
+    assert fetched("jsearch", "succeeded") == before + 2  # FETCH_REQUESTS: one per page
+    # page 1's 10 job_uids are all new: page 2 is requested (a normal reservation), and its cursor is left
+    assert (result.end, result.reason, result.pages, result.items, len(result.outcomes)) == (
+        "cursor",
+        "page_cap",
+        2,
+        19,
+        2,
+    )
+    assert await rows(engine, PAGES, r=first.run_id, c=cell) == [
+        (1, "succeeded", "probe", 10, "probe"),
+        (2, "succeeded", "normal", 9, "normal"),
+    ]
+    await finish(engine, first)
+    for uid in page1_ids()[:4]:  # 4 of page 1's ids are postings already: 6 new, below PAGE2_MIN_NEW
+        await job_factory(native_id=uid)
+    second = await queued_run(engine)
+    (fid,) = await plan_ids(deps, second)
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason, result.pages, len(result.outcomes)) == ("cursor", "page_cap", 1, 1)
+    assert [r[:4] for r in await rows(engine, PAGES, r=second.run_id, c=cell)] == [
+        (1, "succeeded", "normal", 6)
+    ]
+    cursor = json.loads(load_fixture("jsearch", "search_v2_page1")[2])["data"]["cursor"]
+    (gap,) = await rows(engine, RUN_INTERVALS, r=second.run_id)
+    assert (gap[:3], gap[5]) == (("gap", "open", "page_cap"), {"cursor": cursor})  # one open gap, page 2 left
+
+
+def adzuna_full_page(count: int) -> httpx.Response:
+    status, headers, body = load_fixture("adzuna", "search_p1_rpp100")
+    return httpx.Response(status, headers=headers, json={**json.loads(body), "count": count})
+
+
+def arbeitnow_page(case: str, **first_item: object) -> httpx.Response:
+    status, headers, body = load_fixture("arbeitnow", case)
+    doc = json.loads(body)
+    doc["data"][0] = {**doc["data"][0], **first_item}
+    return httpx.Response(status, headers=headers, json=doc)
+
+
+def feed_times() -> tuple[datetime, datetime]:
+    """The oldest and the newest `created_at` of the fixture feed's pages 1 and 2."""
+    times = [
+        datetime.fromtimestamp(job["created_at"], UTC)
+        for case in ("page1", "page2")
+        for job in json.loads(load_fixture("arbeitnow", case)[2])["data"]
+    ]
+    return min(times), max(times)
+
+
+COVERED_ROW = sa.text(
+    "INSERT INTO coverage_intervals (cell_id, kind, span) VALUES (:c, 'covered', tstzrange(:l, :u, '[)'))"
+)
+
+
+async def test_adzuna_page_cap_and_arbeitnow_overlap(
+    engine, current_epoch, fake_http, respx_mock: respx.MockRouter, adapters: Adapters
+) -> None:
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("adzuna", "arbeitnow"))
+    oldest, newest = feed_times()
+    # the Arbeitnow traversals' clock: the feed's items are fresh then (the ad age decides what is abandoned)
+    feed_now = newest + H
+    respx_mock.get(url__regex=rf"^{re.escape(ADZUNA_URL)}/[123]\?").mock(return_value=adzuna_full_page(1000))
+    async with engine.connect() as c:
+        adzuna, arbeitnow = await instance_id(c, "adzuna"), await instance_id(c, "arbeitnow")
+    async with httpx.AsyncClient() as client:  # respx serves it
+        adzuna_adapter = AdzunaAdapter(
+            client, app_id=b"fake", app_key=b"fake", instance_id=adzuna, clock=utcnow
+        )
+        respx_feed = ArbeitnowAdapter(client, instance_id=arbeitnow, clock=utcnow)
+
+        def first_adapters(instance: InstanceRow):
+            return adzuna_adapter if instance.source_id == "adzuna" else adapters(instance)
+
+        deps = make_deps(engine, first_adapters)
+        feed_deps = replace(deps, clock=lambda: feed_now)
+        owner = await queued_run(engine, include_paid=False)
+        planned = await by_source(engine, await plan_ids(deps, owner))
+        assert set(planned) == {"adzuna", "arbeitnow"}
+        # Adzuna: 3 full pages, page 3 is the cap → unknown, with a gap
+        result = await traverse_and_record(deps, planned["adzuna"][0])
+        assert (result.end, result.reason, result.pages, result.items) == (
+            "unknown",
+            "unknown_continuation",
+            3,
+            150,
+        )
+        assert [r[:3] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
+            ("gap", "open", "unknown_continuation")
+        ]
+        # Arbeitnow, a covered cell (its coverage reaches into page 1): read to the end of the feed (page 3)
+        feed_fid, feed_cell = planned["arbeitnow"]
+        async with engine.begin() as c:
+            await c.execute(COVERED_ROW, {"c": feed_cell, "l": oldest - 72 * H, "u": oldest + H})
+        result = await traverse_and_record(feed_deps, feed_fid)
+        assert (result.end, result.reason, result.pages, result.covered) == ("end", None, 3, (oldest, newest))
+        assert (
+            result.firehose is not None and result.firehose[1] == []
+        )  # no gap: the reads reach the coverage
+        assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)][1:] == [
+            ("covered", None, None, oldest, newest)
+        ]
+        await finish(engine, owner)
+        # a read stopped by the cap (page 3 still has a next page) proves nothing: an open gap, no covered row
+        later = newest + 30 * timedelta(minutes=1)
+        respx_mock.get(FEED_URL, params={"page": "1"}).mock(
+            return_value=arbeitnow_page("page1", created_at=int(later.timestamp()))
+        )
+        respx_mock.get(FEED_URL, params={"page": "2"}).mock(return_value=arbeitnow_page("page2"))
+        respx_mock.get(FEED_URL, params={"page": "3"}).mock(return_value=arbeitnow_page("page2"))
+        deps = make_deps(engine, lambda instance: respx_feed)
+        feed_deps = replace(deps, clock=lambda: feed_now)
+        second = await queued_run(engine, include_paid=False)
+        planned = await by_source(engine, await plan_ids(deps, second))
+        result = await traverse_and_record(feed_deps, planned["arbeitnow"][0])
+        assert (result.end, result.reason, result.pages, result.covered) == ("cursor", "page_cap", 3, None)
+        assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=second.run_id)] == [
+            ("gap", "open", "page_cap", newest, later)  # from the coverage's frontier to the newest item read
+        ]
+
+
+SNAPSHOTS = sa.text(
+    "SELECT s.status, s.member_count, s.incomplete_reason, (SELECT count(*) FROM ats_snapshot_members m "
+    "WHERE m.snapshot_id = s.id) FROM ats_snapshots s ORDER BY s.id"
+)
+
+
+async def test_ats_snapshot_written_once_and_complete(
+    engine, current_epoch, queue_app, adapters: Adapters, fixture_log
+) -> None:
+    await seed_inputs(engine, companies=(("greenhouse", "getyourguide"),), enabled=("ats",))
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    result = await traverse_and_record(deps, fid)
+    assert result.snapshot is not None and (result.end, result.snapshot.complete) == ("end", True)
+    assert await rows(engine, SNAPSHOTS) == [("complete", 15, None, 15)]
+    sent = served_requests(fixture_log)
+    assert [r["case"] for r in sent] == ["greenhouse_getyourguide"]
+    resumed = await supersede(engine, owner)  # a takeover: the next attempt traverses the cell again
+    assert await plan_ids(deps, resumed) == [fid]
+    again = await traverse_and_record(deps, fid, attempt_no=resumed.attempt_no)
+    assert again.snapshot == result.snapshot and again.outcomes == result.outcomes  # the page replayed
+    assert (
+        await rows(engine, SNAPSHOTS) == [("complete", 15, None, 15)] and served_requests(fixture_log) == sent
+    )
+
+
+DETAILS = sa.text(
+    "SELECT operation, detail_native_id, parent_fetch_request_id, status FROM fetch_requests "
+    "WHERE run_id = :r ORDER BY id"
+)
+
+
+async def test_smartrecruiters_detail_calls_hang_off_their_list_page(
+    engine, current_epoch, respx_mock: respx.MockRouter
+) -> None:
+    """A list item in Germany gets its detail call, with the list page as its parent; the others (outside
+    Germany) none, and membership comes from the list page alone."""
+    await seed_inputs(engine, companies=(("smartrecruiters", "DeliveryHero"),), enabled=("ats",))
+    status, headers, body = load_fixture("ats", "smartrecruiters_deliveryhero_list")
+    listing = json.loads(body)
+    berlin = {"city": "Berlin", "country": "de", "remote": False, "fullLocation": "Berlin, Germany"}
+    listing["content"][0]["location"] = berlin
+    respx_mock.get("https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings").mock(
+        return_value=httpx.Response(status, headers=headers, json=listing)
+    )
+    first_id = listing["content"][0]["id"]
+    status, headers, body = load_fixture("ats", "smartrecruiters_deliveryhero_detail_1")
+    respx_mock.get(f"https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/{first_id}").mock(
+        return_value=httpx.Response(status, headers=headers, content=body)
+    )
+    async with engine.connect() as c:
+        board = next(i for i in await list_instances(c) if i.source_id == "smartrecruiters")
+    async with httpx.AsyncClient() as client:
+        adapter = adapter_for(board, client, clock=utcnow)
+        assert isinstance(adapter, SmartRecruitersAdapter)
+        deps = make_deps(engine, lambda instance: adapter)
+        owner = await queued_run(engine, include_paid=False)
+        (fid,) = await plan_ids(deps, owner)
+        result = await traverse_and_record(deps, fid)
+    assert result.snapshot is not None and (result.snapshot.complete, result.snapshot.member_count) == (
+        True,
+        10,
+    )
+    assert (result.pages, len(result.outcomes)) == (1, 2)
+    assert await rows(engine, DETAILS, r=owner.run_id) == [
+        ("list", None, None, "succeeded"),
+        ("detail", first_id, fid, "succeeded"),
+    ]
+
+
+async def test_a_half_open_instance_probes_with_one_page(engine, current_epoch, adapters: Adapters) -> None:
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("arbeitnow",))
+    async with engine.begin() as c:
+        feed = await instance_id(c, "arbeitnow")
+        for _ in range(5):  # the free threshold: the breaker opens
+            await record_failure(c, feed, "transient", billing="free", now=utcnow() - 7 * H)
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)  # half open six hours later: one spec, its probe
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason, result.pages, len(result.outcomes)) == ("cursor", "page_cap", 1, 1)
+    assert result.covered is None and result.firehose is not None  # a probe's page proves nothing
+
+
+async def test_serpapi_traversal_reads_the_account_after_its_last_search(
+    engine, current_epoch, respx_mock: respx.MockRouter, serpapi_fixture_adapter: SerpApiAdapter
+) -> None:
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "serpapi"))
+    async with (
+        engine.begin() as c
+    ):  # JSearch is closed: its cell's skipped(breaker_open) is fallback-eligible
+        await record_failure(c, await instance_id(c, "jsearch"), "auth", billing="paid", now=utcnow())
+    owner = await queued_run(engine)
+    deps = make_deps(engine, lambda instance: serpapi_fixture_adapter)
+    state = initial_state(owner.run_id, owner.attempt_no)
+    assert (await make_plan(deps)(state))["primary_fetch_request_ids"] == []
+    (fallback,) = (await make_plan_fallback(deps)(state))["fallback_fetch_request_ids"]
+    reads = respx_mock["serpapi_account"].call_count  # plan_fallback's own read
+    result = await traverse_and_record(deps, fallback)
+    # page 1's ids are all new: page 2 by JSearch's rule, and no page 3
+    assert (result.end, result.reason, result.pages) == ("cursor", "page_cap", 2)
+    assert respx_mock["serpapi_search"].call_count == 2
+    assert respx_mock["serpapi_account"].call_count == reads + 2 + 1  # before each search, and after the last
+
+
+async def test_shutdown_after_reservation_before_dispatch_releases_and_sends_nothing(
+    engine, current_epoch, queue_app, jsearch_fixture_adapter, fixture_log, monkeypatch
+) -> None:  # Review Focus 4
+    await seed_inputs(engine, queries=("python developer",), enabled=("jsearch",))
+    owner, stopped, pause = await queued_run(engine), [False], PausePoint("collect.after_reserve")
+    monkeypatch.setattr(acquire, "afault_point", pause)
+    deps = make_deps(engine, lambda instance: jsearch_fixture_adapter, admission_stopped=lambda: stopped[0])
+    (fid,) = (await make_plan(deps)(initial_state(owner.run_id, owner.attempt_no)))[
+        "primary_fetch_request_ids"
+    ]
+    task = asyncio.create_task(make_fetch_cell(deps)({"fetch_request_id": fid}))
+    await asyncio.wait_for(pause.reached.wait(), 10)
+    stopped[0] = True
+    pause.resume()
+    await task  # the deploy's SIGTERM lands between the reservation and the dispatch marker
+    async with engine.connect() as c:
+        row = (
+            await c.execute(
+                sa.text(
+                    "SELECT f.status, f.skip_reason, f.request_key, l.state, l.evidence "
+                    "FROM fetch_requests f JOIN quota_ledger l ON l.id = f.quota_ledger_id WHERE f.id = :i"
+                ),
+                {"i": fid},
+            )
+        ).one()
+        gap = (await c.execute(GAPS, {"i": fid})).one()
+    assert (row.status, row.skip_reason, row.state, row.evidence) == (
+        "skipped",
+        "shutdown",
+        "not_billed",
+        "never_dispatched",
+    )  # the user is not billed
+    assert served_requests(fixture_log) == [] and tuple(gap) == (
+        "gap",
+        "open",
+        "shutdown",
+    )  # nothing sent; the traversal ended skipped('shutdown')
+    async with engine.begin() as c:
+        attempt = await runs.begin_new_attempt(
+            c, owner.run_id, epoch=1, end_reason="worker_takeover", defer=defer_in_tx
+        )
+    assert attempt is not None
+    replanned = (await make_plan(deps)(initial_state(owner.run_id, attempt)))["primary_fetch_request_ids"]
+    async with engine.connect() as c:
+        found = (
+            await c.execute(
+                sa.text(
+                    "SELECT id, attempt_seq, status FROM fetch_requests WHERE request_key = :k "
+                    "ORDER BY attempt_seq"
+                ),
+                {"k": row.request_key},
+            )
+        ).all()
+    assert [(r.attempt_seq, r.status) for r in found] == [(1, "skipped"), (2, "planned")]
+    assert found[1].id in replanned  # the next attempt re-plans the key
+
+
+async def test_contract_violation_is_visible_to_plan_fallback_in_the_same_run(
+    engine, current_epoch, jsearch_html_adapter, adapters
+) -> None:  # Review Focus 3
+    await seed_inputs(engine, queries=("python developer",), enabled=("jsearch", "serpapi"))
+    owner = await queued_run(engine)
+    deps = make_deps(
+        engine,
+        lambda instance: jsearch_html_adapter if instance.source_id == "jsearch" else adapters(instance),
+    )
+    state = initial_state(owner.run_id, owner.attempt_no)
+    (primary,) = (await make_plan(deps)(state))[
+        "primary_fetch_request_ids"
+    ]  # the JSearch spec: no SerpApi one
+    await make_fetch_cell(deps)({"fetch_request_id": primary})  # served the HTML error page
+    fallback = (await make_plan_fallback(deps)(state))["fallback_fetch_request_ids"]
+    async with engine.connect() as c:
+        failed = (
+            await c.execute(
+                sa.text(
+                    "SELECT f.status, f.error_code, s.health, c.query_id, c.location_key "
+                    "FROM fetch_requests f JOIN source_instances s ON s.id = f.source_instance_id "
+                    "JOIN coverage_cells c ON c.id = f.cell_id WHERE f.id = :i"
+                ),
+                {"i": primary},
+            )
+        ).one()
+        planned = (
+            await c.execute(
+                sa.text(
+                    "SELECT f.phase, s.source_id, c.query_id, c.location_key FROM fetch_requests f "
+                    "JOIN source_instances s ON s.id = f.source_instance_id "
+                    "JOIN coverage_cells c ON c.id = f.cell_id WHERE f.id = ANY(:ids)"
+                ),
+                {"ids": fallback},
+            )
+        ).all()
+    assert (failed.status, failed.error_code, failed.health) == ("failed", "contract", "contract_broken")
+    assert [tuple(p) for p in planned] == [
+        ("fallback", "serpapi", failed.query_id, failed.location_key)
+    ]  # the same run falls back to SerpApi for that cell

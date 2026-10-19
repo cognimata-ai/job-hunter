@@ -193,7 +193,7 @@ class World:
             "claim_epoch_and_sweep": fake_claim,
             "Watchdog": FakeWatchdog,
             "open_saver": fake_open_saver,
-            "build_noop_collect_graph": lambda saver: object(),
+            "build_collect_graph": lambda saver, deps: object(),
             "run_reconcilers": fake_reconcilers,
             "EXECUTIONS": FakeExecutions(),
         }.items():

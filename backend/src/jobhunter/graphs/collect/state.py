@@ -8,11 +8,13 @@ the annotated keys (`merge_outcomes`, `sum_counters`, `operator.add`).
 
 Every attempt starts from `initial_state` on a thread of its own (`worker.runs.thread_id`), so no attempt
 reads another's progress; the ids of the run's settings are `0` until `plan` sets them from the run row.
-`FetchCellInput` is what the fan-out `Send`s to `fetch_cell`: one planned fetch request.
+`FetchCellInput` is what the fan-out `Send`s to `fetch_cell`: one planned fetch request, and the attempt the
+Send belongs to (the owner its traversal acts as, so a superseded attempt's Send is fenced out; a direct call
+without it acts for the run's current attempt).
 """
 
 import operator
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal, NotRequired, TypedDict
 
 from jobhunter.graphs.outcomes import merge_outcomes, sum_counters
 
@@ -58,6 +60,7 @@ class CollectUpdate(TypedDict, total=False):
 
 class FetchCellInput(TypedDict):
     fetch_request_id: int
+    attempt_no: NotRequired[int]
 
 
 def initial_state(run_id: int, attempt_no: int) -> CollectState:

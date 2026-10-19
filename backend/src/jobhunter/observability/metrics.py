@@ -26,6 +26,13 @@ TABLE_BYTES = Gauge(
     "jobhunter_table_bytes", "Size of a database table in bytes.", ["table"], registry=REGISTRY
 )
 ALERTS_OPEN = Gauge("jobhunter_alerts_open", "Open alerts by severity.", ["severity"], registry=REGISTRY)
+# The pages the fetch nodes acquired (one per receipt they ended on), by source and receipt status.
+FETCH_REQUESTS = Counter(
+    "jobhunter_fetch_requests",
+    "Fetch request pages acquired by the fetch nodes.",
+    ["source", "status"],
+    registry=REGISTRY,
+)
 # The provider's current quota window (§6.3); the ledger's reservation and settlement set them (M1 Task 8).
 QUOTA_USED_UNITS = Gauge(
     "jobhunter_quota_used_units",

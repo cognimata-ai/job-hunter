@@ -21,6 +21,10 @@ others (with headers changed). The adapter fixtures are the adapters of the defa
 `serpapi_account` and `serpapi_search`, so the account reads can be counted; the recorded account's renewal is
 moved 20 days ahead of today by `serpapi_account_response`, so its window is current whatever the date) and
 `arbeitnow_adapter` on a client that respx mocks (the test adds the routes).
+
+Task 14: `fake_http` also logs every request its fixture transport serves to `fixture_log`; `adapters` is the
+fixture-backed adapter factory of the fetch nodes (`Callable[[InstanceRow], SourceAdapter]`): every adapter on
+`fake_http`'s fixture transport (one `http.make_client` per source), clock `utcnow`, keys `b"fake"`.
 """
 
 import json
@@ -40,9 +44,10 @@ from jobhunter.config import load_config
 from jobhunter.db.sql import q
 from jobhunter.sources import ats as ats_adapters
 from jobhunter.sources import http
+from jobhunter.sources.adzuna import AdzunaAdapter
 from jobhunter.sources.arbeitnow import ArbeitnowAdapter
 from jobhunter.sources.ats.common import AtsAdapter
-from jobhunter.sources.base import CellPlan, NormalizedPosting, Parsed, RawPage, RequestSpec
+from jobhunter.sources.base import CellPlan, NormalizedPosting, Parsed, RawPage, RequestSpec, SourceAdapter
 from jobhunter.sources.fixtures import fixture_transport, load_case
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.sources.jsearch import JSearchAdapter
@@ -163,24 +168,60 @@ def parsed_of(ats: AtsType, case: str) -> list[NormalizedPosting]:
 
 
 @pytest.fixture
-def fake_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """`http.configure` in fake mode over `FIXTURES` (every new client is served by the fixture transport);
-    the process-wide configuration it found is restored after the test."""
+def fixture_log(tmp_path: Path) -> Path:
+    """A request log of the fixture transport that no request has been written to yet."""
+    return tmp_path / "fixture-requests.jsonl"
+
+
+@pytest.fixture
+def fake_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_log: Path) -> Iterator[None]:
+    """`http.configure` in fake mode over `FIXTURES` (every new client is served by the fixture transport,
+    which logs to `fixture_log`); the process-wide configuration it found is restored after the test."""
     env = {
         "JOBHUNTER_ENV": "test",
         "JOBHUNTER_DB_NAME": "jobhunter",
         "JOBHUNTER_FAKE_SOURCES": "1",
         "JOBHUNTER_FIXTURES_DIR": str(FIXTURES.resolve()),
+        "JOBHUNTER_FIXTURE_LOG": str(fixture_log),
     }
     monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
     http.configure(load_config("worker", env, tmp_path / "no-secrets"))
     yield
 
 
+Adapters = Callable[[InstanceRow], SourceAdapter]
+
+
 @pytest.fixture
-def fixture_log(tmp_path: Path) -> Path:
-    """A request log of the fixture transport that no request has been written to yet."""
-    return tmp_path / "fixture-requests.jsonl"
+async def adapters(fake_http: None) -> AsyncIterator[Adapters]:
+    """The adapter of an instance on `fake_http`'s fixture transport, clock `utcnow`, keys `b"fake"`."""
+    clients: dict[str, httpx.AsyncClient] = {}
+
+    def client(source_id: str) -> httpx.AsyncClient:
+        if source_id not in clients:
+            clients[source_id] = http.make_client(source_id)
+        return clients[source_id]
+
+    def adapter_of(instance: InstanceRow) -> SourceAdapter:
+        on = client(instance.source_id)
+        match instance.source_id:
+            case "jsearch":
+                return JSearchAdapter(on, api_key=b"fake", instance_id=instance.id, clock=utcnow)
+            case "serpapi":
+                return SerpApiAdapter(on, api_key=b"fake", instance_id=instance.id, clock=utcnow)
+            case "adzuna":
+                return AdzunaAdapter(
+                    on, app_id=b"fake", app_key=b"fake", instance_id=instance.id, clock=utcnow
+                )
+            case "arbeitnow":
+                return ArbeitnowAdapter(on, instance_id=instance.id, clock=utcnow)
+        return ats_adapters.adapter_for(instance, on, clock=utcnow)
+
+    try:
+        yield adapter_of
+    finally:
+        for made in clients.values():
+            await made.aclose()
 
 
 # A case served as another one: the other case's name, or the name with headers replaced.

@@ -4,12 +4,14 @@
 `CollectGraph` alias name the one definition. A node's parameter is named `state`: LangGraph's node protocols
 name it so, and `mypy --strict` matches the name.
 
-`build_collect_graph` wires the §9.2 edges: `START → plan → fetch_primary`, a `Send("fetch_cell",
-{"fetch_request_id": id})` per planned primary spec (or straight on when there is none), `→ plan_fallback →
-[fetch_fallback | parse_normalize] → resolve_identity → embed → hard_filters → enqueue_targets → finalize →
-END`. Every node has its §9.2 timeout; the nodes that make no source or embedder call retry a serialization
+`build_collect_graph` wires the §9.2 edges: `START → plan → fetch_primary`, a `Send("fetch_cell", …)` per
+planned primary spec (`nodes.fetch.route_after_primary`, or straight on when there is none), `→ plan_fallback
+→ [fetch_fallback → a fetch_cell Send per fallback spec | parse_normalize]`, then `parse_normalize →
+resolve_identity → embed → hard_filters → enqueue_targets → finalize → END`; after a `fetch_cell`,
+`route_after_cell` goes to `plan_fallback` in the primary phase and to `parse_normalize` in the fallback one.
+Every node has its §9.2 timeout; the nodes that make no source or embedder call retry a serialization
 failure, a deadlock or a lost connection (`DB_RETRY`, `is_retryable_db_error`), and nothing else. The nodes
-after `plan`, other than `plan_fallback`, are pass-through functions here until Tasks 14 to 23 wire theirs
+from `parse_normalize` to `finalize` are pass-through functions here until Tasks 15 to 23 wire theirs
 (`finalize` keeps the fault point `collect.before_finalize`).
 
 **Error handling (§9.1).** Every node runs inside `error_handled`, which turns a typed `SourceError` that
@@ -27,18 +29,26 @@ heartbeat, fenced finalize) and gives the crash tests the fault point `collect.b
 from collections.abc import Mapping
 from datetime import timedelta
 from types import MappingProxyType
-from typing import Final, Literal, Protocol
+from typing import Final, Protocol
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import RetryPolicy, Send, TimeoutPolicy
+from langgraph.types import RetryPolicy, TimeoutPolicy
 from sqlalchemy.exc import DBAPIError
 
 from jobhunter.db.sql import is_serialization_failure
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
+from jobhunter.graphs.collect.nodes.fetch import (
+    make_fetch_cell,
+    make_fetch_fallback,
+    make_fetch_primary,
+    route_after_cell,
+    route_after_fallback,
+    route_after_primary,
+)
 from jobhunter.graphs.collect.nodes.plan import make_plan
 from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback, route
 from jobhunter.graphs.collect.state import CollectState as CollectState
@@ -126,27 +136,14 @@ def _pass_through(name: str) -> Node:
     return node
 
 
-async def fetch_cell(state: FetchCellInput) -> CollectUpdate:
-    """One cell traversal of a planned request (a pass-through until Task 14)."""
-    return {"steps": ["fetch_cell"]}
-
-
-def fan_out_primary(state: CollectState) -> list[Send] | Literal["plan_fallback"]:
-    """One `Send` to `fetch_cell` per planned primary spec; `plan_fallback` when there is none."""
-    ids = state["primary_fetch_request_ids"]
-    if not ids:
-        return "plan_fallback"
-    return [Send("fetch_cell", FetchCellInput(fetch_request_id=fetch_request_id)) for fetch_request_id in ids]
-
-
 def build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDeps) -> CollectGraph:
     """The §9.2 collection graph over `deps`, compiled with `checkpointer` (see the module docstring)."""
     graph = StateGraph(CollectState)
     nodes: dict[str, Node] = {
         "plan": make_plan(deps),
-        "fetch_primary": _pass_through("fetch_primary"),
+        "fetch_primary": make_fetch_primary(deps),
         "plan_fallback": make_plan_fallback(deps),
-        "fetch_fallback": _pass_through("fetch_fallback"),
+        "fetch_fallback": make_fetch_fallback(deps),
         "parse_normalize": _pass_through("parse_normalize"),
         "resolve_identity": _pass_through("resolve_identity"),
         "embed": _pass_through("embed"),
@@ -163,16 +160,16 @@ def build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDep
         )
     graph.add_node(
         "fetch_cell",
-        error_handled("fetch_cell", fetch_cell),
+        error_handled("fetch_cell", make_fetch_cell(deps)),
         input_schema=FetchCellInput,
         timeout=TimeoutPolicy(run_timeout=TIMEOUTS["fetch_cell"]),
     )
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "fetch_primary")
-    graph.add_conditional_edges("fetch_primary", fan_out_primary, ["fetch_cell", "plan_fallback"])
-    graph.add_edge("fetch_cell", "plan_fallback")
+    graph.add_conditional_edges("fetch_primary", route_after_primary, ["fetch_cell", "plan_fallback"])
+    graph.add_conditional_edges("fetch_cell", route_after_cell, ["plan_fallback", "parse_normalize"])
     graph.add_conditional_edges("plan_fallback", route, ["fetch_fallback", "parse_normalize"])
-    graph.add_edge("fetch_fallback", "parse_normalize")
+    graph.add_conditional_edges("fetch_fallback", route_after_fallback, ["fetch_cell", "parse_normalize"])
     for before, after in (
         ("parse_normalize", "resolve_identity"),
         ("resolve_identity", "embed"),

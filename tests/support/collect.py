@@ -16,30 +16,46 @@ Task 13: `DEFAULT_CELL` is every `planner.CellRow` field of a never-attempted JS
 dict; `seed_inputs` writes the queries and the watchlist companies (with their board instances) of a test and
 a new settings version that enables them (and, with `enabled`, exactly those sources), pointed at by
 `active_config`, so a run queued afterwards plans them (plan Deviation 3).
+
+Task 14: `make_deps` is the `CollectDeps` of a test (the real `RateLimiter` over `SOURCE_LIMITS`, a fresh
+`FetchContext`, `utcnow`, no embedder); the fixture `job_factory` inserts a job with one posting and its
+observations directly, with the facts given (`MadeJob`); `seed_inputs_sync` is `seed_inputs` for the sync
+crash tests, on an engine of its own; `manual_paid_run` seeds the test query with only the source under test
+enabled (Ruling P5) and requests a manual run that includes paid sources, whose `run_collect(id, 1)` job waits
+for the worker.
 """
 
+import asyncio
+import hashlib
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Final
+from typing import Any, Final, Protocol
 
 import httpx
 import procrastinate
+import pytest
 from jobhunter.clock import utcnow
+from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
+from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.quota.windows import Provider
 from jobhunter.sources.acquire import AcquireContext
 from jobhunter.sources.base import REMOTE_DE, Billing, CellPlan, RequestSpec, SourceAdapter
-from jobhunter.sources.instances import instance_for_company
+from jobhunter.sources.instances import InstanceRow, instance_for_company
 from jobhunter.sources.jsearch import JSearchAdapter
+from jobhunter.sources.ratelimit import SOURCE_LIMITS, RateLimiter
 from jobhunter.types import JSONValue, get_list, get_object
 from jobhunter.worker import runs
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.runs import RunOwner
-from jobhunter.worker.tasks import defer_in_tx
+from jobhunter.worker.tasks import defer_in_tx, make_queue_app
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.pg import PgServer, config_for
 from tests.support.quota import seeded_run_settings
 
 _QUEUED_RUN: Final = q(
@@ -361,3 +377,163 @@ async def seed_inputs(
             payload["sources"] = {**get_object(payload, "sources"), "enabled": switches}
         version = int((await conn.execute(_NEXT_VERSION, {"payload": payload})).scalar_one())
         await conn.execute(_ACTIVATE, {"v": version})
+
+
+# ---- Task 14 ----------------------------------------------------------------------------------------------
+
+
+def make_deps(
+    engine: AsyncEngine,
+    adapters: Callable[[InstanceRow], SourceAdapter],
+    *,
+    admission_stopped: Callable[[], bool] = lambda: False,
+) -> CollectDeps:
+    """The `CollectDeps` of a test: the real `RateLimiter` over `SOURCE_LIMITS` on `time.monotonic` and
+    `asyncio.sleep`, a fresh `FetchContext`, `utcnow` and no embedder."""
+    return CollectDeps(
+        engine=engine,
+        adapters=adapters,
+        embedder=None,
+        clock=utcnow,
+        sleep=asyncio.sleep,
+        admission_stopped=admission_stopped,
+        limiter=RateLimiter(SOURCE_LIMITS.values(), clock=time.monotonic, sleep=asyncio.sleep),
+        fetch_ctx=FetchContext(),
+    )
+
+
+@dataclass(frozen=True)
+class MadeJob:
+    job_id: int
+    posting_id: int
+    observation_ids: tuple[int, ...]
+
+
+class JobFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        native_id: str,
+        source_id: str = "jsearch",
+        instance_key: str = "default",
+        observations: Sequence[tuple[datetime, int | None]] = (),
+        title: str = "Python Developer",
+        company: str = "Acme",
+        availability: str = "active",
+    ) -> Awaitable[MadeJob]: ...
+
+
+_JOB: Final = q(
+    "INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, work_mode_possible, "
+    "work_mode_source, employment_source, ad_language, completeness, posted_precision, first_seen_at, "
+    "last_seen_at, availability, availability_changed_at, source_ids, field_provenance, det_facts_hash) "
+    "VALUES (lower(:company), :company, :title, lower(:title), 'unknown', ARRAY['remote','hybrid','onsite'], "
+    "'none', 'none', 'unknown', 'full', 'unknown', :first, :last, :availability, :last, ARRAY[:source], "
+    "'{}', :facts) RETURNING id"
+)
+_POSTING: Final = q(
+    "INSERT INTO postings (source_instance_id, native_id, job_id, first_seen_at, last_seen_at, seen_count, "
+    "availability, availability_changed_at) VALUES (:instance, :native_id, :job, :first, :last, :seen, "
+    ":availability, :last) RETURNING id"
+)
+_OBSERVATION: Final = q(
+    "INSERT INTO posting_observations (posting_id, raw_item_id, source_instance_id, raw_response_sha256, "
+    "observed_at, normalized, content_hash, completeness, quality) VALUES (:posting, :raw_item, :instance, "
+    ":sha, :at, '{}', :sha, 'full', 'ok') RETURNING id"
+)
+_LINK_ITEM: Final = q("UPDATE raw_items SET observation_id = :o WHERE id = :i")
+_LATEST: Final = q("UPDATE postings SET latest_observation_id = :o WHERE id = :p")
+
+
+@pytest.fixture
+def job_factory(engine: AsyncEngine) -> JobFactory:
+    """`await job_factory(native_id=…, observations=[(observed_at, raw_item_id), …])`: a job with one posting
+    of `(source_id, instance_key)` and one observation per entry (a `raw_item_id`, when given, is a `linked`
+    raw item that the observation came from), inserted directly; one observation now without any."""
+
+    async def make(
+        *,
+        native_id: str,
+        source_id: str = "jsearch",
+        instance_key: str = "default",
+        observations: Sequence[tuple[datetime, int | None]] = (),
+        title: str = "Python Developer",
+        company: str = "Acme",
+        availability: str = "active",
+    ) -> MadeJob:
+        seen = list(observations) or [(utcnow(), None)]
+        first, last = min(at for at, _ in seen), max(at for at, _ in seen)
+        async with engine.begin() as conn:
+            instance = await instance_id(conn, source_id, instance_key)
+            job_params: dict[str, Any] = {
+                "company": company,
+                "title": title,
+                "first": first,
+                "last": last,
+                "availability": availability,
+                "source": source_id,
+                "facts": hashlib.sha256(f"{source_id}:{native_id}".encode()).digest(),
+            }
+            job = int((await conn.execute(_JOB, job_params)).scalar_one())
+            posting_params = {
+                "instance": instance,
+                "native_id": native_id,
+                "job": job,
+                "first": first,
+                "last": last,
+                "seen": len(seen),
+                "availability": availability,
+            }
+            posting = int((await conn.execute(_POSTING, posting_params)).scalar_one())
+            made: list[int] = []
+            for at, raw_item in sorted(seen, key=lambda entry: entry[0]):
+                sha = hashlib.sha256(f"{native_id}@{at.isoformat()}".encode()).digest()
+                params = {
+                    "posting": posting,
+                    "raw_item": raw_item,
+                    "instance": instance,
+                    "sha": sha,
+                    "at": at,
+                }
+                observation = int((await conn.execute(_OBSERVATION, params)).scalar_one())
+                if raw_item is not None:
+                    await conn.execute(_LINK_ITEM, {"o": observation, "i": raw_item})
+                made.append(observation)
+            await conn.execute(_LATEST, {"o": made[-1], "p": posting})
+        return MadeJob(job, posting, tuple(made))
+
+    return make
+
+
+def seed_inputs_sync(server: PgServer, **inputs: Any) -> None:
+    """`seed_inputs(**inputs)` for a sync test, on an engine of its own against `server`."""
+
+    async def seed() -> None:
+        engine = make_null_engine(server.dsn("app", driver="sqlalchemy"))
+        try:
+            await seed_inputs(engine, **inputs)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+
+
+def manual_paid_run(server: PgServer, *, only: str) -> int:
+    """A queued manual run that includes paid sources, over the test query with only the source switch
+    `only` enabled (Ruling P5); its `run_collect(id, 1)` job, deferred on the task app, waits for a worker.
+    Returns the run id."""
+    seed_inputs_sync(server, queries=(TEST_QUERY,), enabled=(only,))
+
+    async def request() -> int:
+        make_queue_app(config_for(server, "worker").dsn("psycopg"))  # the task app `defer_in_tx` defers on
+        engine = make_null_engine(server.dsn("app", driver="sqlalchemy"))
+        try:
+            async with engine.begin() as conn:
+                row, created = await runs.request_manual_run(conn, include_paid=True, defer=defer_in_tx)
+        finally:
+            await engine.dispose()
+        if not created:
+            raise RuntimeError(f"manual_paid_run: collection {row.id} was already active")
+        return row.id
+
+    return asyncio.run(request())

@@ -10,17 +10,19 @@
 5. the epoch claim and the takeover sweep (`claim_epoch_and_sweep`; its sweeps defer through the sweep
    transaction's own connection), then `startup_check_passed` with `check="advisory_lock_acquired"`;
 6. the watchdog;
-7. the task app opened, the checkpointer, the collection graph and the `WorkerRuntime` with a fresh
-   `ShutdownState`;
+7. the task app opened, the checkpointer, the collection graph on its `CollectDeps` (the HTTP layer
+   configured by `http.configure`: in fake mode every source is served from the fixtures, with the keys
+   `b"fake"`; one client per source, made on first use; the process's one `RateLimiter`; admission stopped
+   with the shutdown; Task 24 completes this wiring) and the `WorkerRuntime` with a fresh `ShutdownState`;
 8. the start reconcilers (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the
    metrics server;
 9. SIGTERM and SIGINT handlers that request the shutdown;
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
-12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app and the engine
-    closed, and the lock session closed last, which releases the lock; then `worker_shutdown_complete`. Each
-    of its waits takes at most what is left of the stop's one deadline (`shutdown.StopDeadline`), so the
-    whole stop fits in `shutdown.STOP_BUDGET_S`.
+12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app, the source
+    clients and the engine closed, and the lock session closed last, which releases the lock; then
+    `worker_shutdown_complete`. Each of its waits takes at most what is left of the stop's one deadline
+    (`shutdown.StopDeadline`), so the whole stop fits in `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -50,11 +52,13 @@ import importlib
 import os
 import signal
 import socket
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from typing import Final, NoReturn, Protocol
 
+import httpx
 import procrastinate
 import sqlalchemy as sa
 from procrastinate.exceptions import ConnectorException
@@ -66,9 +70,18 @@ from jobhunter.config import AppConfig
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
 from jobhunter.graphs.checkpointer import open_saver
-from jobhunter.graphs.collect.graph import build_noop_collect_graph
+from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
+from jobhunter.graphs.collect.graph import build_collect_graph
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
+from jobhunter.sources import ats, http
+from jobhunter.sources.adzuna import AdzunaAdapter
+from jobhunter.sources.arbeitnow import ArbeitnowAdapter
+from jobhunter.sources.base import SourceAdapter
+from jobhunter.sources.instances import InstanceRow
+from jobhunter.sources.jsearch import JSearchAdapter
+from jobhunter.sources.ratelimit import SOURCE_LIMITS, RateLimiter
+from jobhunter.sources.serpapi import SerpApiAdapter
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.lock import WATCHDOG_EXIT_CODE, LockSession, acquire_lock
@@ -134,6 +147,57 @@ def exit_unless_lock_held(
         exit(WATCHDOG_EXIT_CODE)
 
 
+class SourceClients:
+    """The HTTP client of each source (`http.make_client`), made on first use; `aclose` closes them all."""
+
+    def __init__(self) -> None:
+        self._clients: dict[str, httpx.AsyncClient] = {}
+
+    def get(self, source_id: str) -> httpx.AsyncClient:
+        client = self._clients.get(source_id)
+        if client is None:
+            client = self._clients[source_id] = http.make_client(source_id)
+        return client
+
+    async def aclose(self) -> None:
+        clients, self._clients = list(self._clients.values()), {}
+        for client in clients:
+            await client.aclose()
+
+
+def source_adapters(cfg: AppConfig, clients: SourceClients) -> Callable[[InstanceRow], SourceAdapter]:
+    """The adapter of a source instance on its source's client: in fake mode with the keys `b"fake"` (the
+    fixture transport serves every request), otherwise with the provider secrets of `cfg`."""
+
+    def secret(name: str) -> bytes:
+        return b"fake" if cfg.fake_sources else cfg.secret(name)
+
+    def adapter_of(instance: InstanceRow) -> SourceAdapter:
+        client = clients.get(instance.source_id)
+        match instance.source_id:
+            case "jsearch":
+                return JSearchAdapter(
+                    client, api_key=secret("rapidapi_key"), instance_id=instance.id, clock=utcnow
+                )
+            case "serpapi":
+                return SerpApiAdapter(
+                    client, api_key=secret("serpapi_key"), instance_id=instance.id, clock=utcnow
+                )
+            case "adzuna":
+                return AdzunaAdapter(
+                    client,
+                    app_id=secret("adzuna_app_id"),
+                    app_key=secret("adzuna_app_key"),
+                    instance_id=instance.id,
+                    clock=utcnow,
+                )
+            case "arbeitnow":
+                return ArbeitnowAdapter(client, instance_id=instance.id, clock=utcnow)
+        return ats.adapter_for(instance, client, clock=utcnow)
+
+    return adapter_of
+
+
 def _request_shutdown(state: ShutdownState, sig: signal.Signals) -> None:
     if not state.requested.is_set():
         log.info("shutdown_requested", signal=sig.name)
@@ -150,6 +214,7 @@ class _WorkerProcess:
         self.queue: procrastinate.App | None = None  # its `close_async` is a no-op until it is open
         self.watchdog: Watchdog | None = None
         self.saver_scope = AsyncExitStack()
+        self.clients = SourceClients()
         self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
@@ -188,14 +253,26 @@ class _WorkerProcess:
         # 7. The task app opened, the checkpointer, the collection graph and the runtime.
         await queue.open_async()
         saver = await self.saver_scope.enter_async_context(open_saver(dsn))
+        http.configure(cfg)
+        shutdown = self.shutdown
+        deps = CollectDeps(
+            engine=engine,
+            adapters=source_adapters(cfg, self.clients),
+            embedder=None,
+            clock=utcnow,
+            sleep=asyncio.sleep,
+            admission_stopped=lambda: shutdown.admission_stopped,
+            limiter=RateLimiter(SOURCE_LIMITS.values(), clock=time.monotonic, sleep=asyncio.sleep),
+            fetch_ctx=FetchContext(),
+        )
         runtime = WorkerRuntime(
             cfg=cfg,
             engine=engine,
             queue=queue,
             saver=saver,
-            collect_graph=build_noop_collect_graph(saver),
+            collect_graph=build_collect_graph(saver, deps),
             epoch=epoch,
-            shutdown=self.shutdown,
+            shutdown=shutdown,
         )
         # 8. The start reconcilers, and the metrics server outside the test env.
         start = ReconcileContext(engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch)
@@ -265,6 +342,7 @@ class _WorkerProcess:
             ("watchdog", lambda: self._stop_watchdog(deadline.remaining(WATCHDOG_STOP_S))),
             ("saver", lambda: _within(deadline, self.saver_scope.aclose())),
             ("queue", lambda: _within(deadline, self._close_queue())),
+            ("clients", lambda: _within(deadline, self.clients.aclose())),
             ("engine", lambda: _within(deadline, self._dispose_engine())),
             ("lock_session", self._close_lock_session),  # last: closing it releases the lock
         )
