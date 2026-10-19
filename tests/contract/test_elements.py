@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from xml.etree.ElementTree import canonicalize, tostring
@@ -24,13 +25,19 @@ from tests.support.sources import adapter_for_fixture, fixture_page, load_fixtur
 from tests.unit.test_sources_base import SPEC
 
 T = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
-CLIENT = httpx.AsyncClient()  # never used: nothing is sent
-AGGREGATORS: dict[str, SourceAdapter] = {
-    "jsearch": JSearchAdapter(CLIENT, api_key=b"fake", instance_id=1, clock=utcnow),
-    "serpapi": SerpApiAdapter(CLIENT, api_key=b"fake", instance_id=1, clock=utcnow),
-    "adzuna": AdzunaAdapter(CLIENT, app_id=b"fake", app_key=b"fake", instance_id=1, clock=utcnow),
-    "arbeitnow": ArbeitnowAdapter(CLIENT, instance_id=1, clock=utcnow),
-}
+Aggregators = dict[str, SourceAdapter]
+
+
+@pytest.fixture
+async def aggregators() -> AsyncIterator[Aggregators]:
+    """The four aggregator adapters, instance 1, on a client that sends nothing and is closed afterwards."""
+    async with httpx.AsyncClient() as client:
+        yield {
+            "jsearch": JSearchAdapter(client, api_key=b"fake", instance_id=1, clock=utcnow),
+            "serpapi": SerpApiAdapter(client, api_key=b"fake", instance_id=1, clock=utcnow),
+            "adzuna": AdzunaAdapter(client, app_id=b"fake", app_key=b"fake", instance_id=1, clock=utcnow),
+            "arbeitnow": ArbeitnowAdapter(client, instance_id=1, clock=utcnow),
+        }
 
 
 def json_items(doc: JSONValue, *path: str) -> list[JSONValue]:
@@ -52,9 +59,9 @@ def json_items(doc: JSONValue, *path: str) -> list[JSONValue]:
     ],
 )
 def test_a_json_element_is_its_canonical_json(
-    source: str, case: str, path: tuple[str, ...], n: int | None
+    aggregators: Aggregators, source: str, case: str, path: tuple[str, ...], n: int | None
 ) -> None:
-    adapter, page = AGGREGATORS[source], fixture_page(source, case, SPEC, fetched_at=T)
+    adapter, page = aggregators[source], fixture_page(source, case, SPEC, fetched_at=T)
     expected = [canonical_json(item) for item in json_items(json.loads(page.body), *path)]
     elements = adapter.elements(page)
     assert elements == expected and (n is None or len(elements) == n)
@@ -88,13 +95,13 @@ def test_a_json_board_element_is_its_canonical_json(ats: AtsType, case: str, pat
         ("arbeitnow", "page_end"),
     ],
 )
-def test_a_page_without_results_has_no_elements(source: str, case: str) -> None:
-    adapter, page = AGGREGATORS[source], fixture_page(source, case, SPEC, fetched_at=T)
+def test_a_page_without_results_has_no_elements(aggregators: Aggregators, source: str, case: str) -> None:
+    adapter, page = aggregators[source], fixture_page(source, case, SPEC, fetched_at=T)
     assert adapter.elements(page) == [] == adapter.parse(page)
 
 
-def test_elements_do_not_depend_on_key_order_or_whitespace() -> None:
-    adapter, page = AGGREGATORS["arbeitnow"], fixture_page("arbeitnow", "page1", SPEC, fetched_at=T)
+def test_elements_do_not_depend_on_key_order_or_whitespace(aggregators: Aggregators) -> None:
+    adapter, page = aggregators["arbeitnow"], fixture_page("arbeitnow", "page1", SPEC, fetched_at=T)
     doc = json.loads(page.body)
     doc["data"] = [dict(reversed(list(job.items()))) for job in doc["data"]]
     rewritten = replace(page, body=json.dumps(doc, indent=3).encode("utf-8"))
@@ -143,8 +150,10 @@ def test_a_personio_element_is_the_c14n_of_its_position() -> None:
     ("source", "case"),
     [("jsearch", "search_v2_drift"), ("jsearch", "search_v2_html"), ("arbeitnow", "page_truncated")],
 )
-def test_elements_read_the_envelope_as_check_envelope_does(source: str, case: str) -> None:
-    adapter, page = AGGREGATORS[source], fixture_page(source, case, SPEC, fetched_at=T)
+def test_elements_read_the_envelope_as_check_envelope_does(
+    aggregators: Aggregators, source: str, case: str
+) -> None:
+    adapter, page = aggregators[source], fixture_page(source, case, SPEC, fetched_at=T)
     with pytest.raises(SourceError) as checked:
         adapter.check_envelope(page)
     with pytest.raises(type(checked.value)) as read:

@@ -11,6 +11,7 @@ from jobhunter.clock import utcnow
 from jobhunter.db.seed import canonical_json
 from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut, InvariantViolation
+from jobhunter.graphs.collect.graph import error_handled
 from jobhunter.graphs.collect.nodes import parse_normalize as parse_node
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.metrics import REGISTRY
@@ -26,6 +27,7 @@ from jobhunter.sources.base import (
 from jobhunter.sources.instances import InstanceRow, list_instances
 from jobhunter.sources.items import ParseCounts, parse_response, pending_items_of_run, replay_rejected
 from jobhunter.sources.jsearch import JSearchAdapter
+from jobhunter.sources.receipts import RAW_BODY_TTL
 from jobhunter.types import JSONValue, get_str
 from jobhunter.worker.runs import finalize_run
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -54,7 +56,8 @@ RUN_ITEMS = sa.text(
     "JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = :run"
 )
 ITEM = sa.text(
-    "SELECT disposition, reason_code, native_id, normalized, disposed_at FROM raw_items WHERE id = :i"
+    "SELECT disposition, reason_code, native_id, item_ts, normalized, disposed_at FROM raw_items "
+    "WHERE id = :i"
 )
 
 
@@ -106,6 +109,19 @@ class Reordered(ArbeitnowAdapter):
 
     def parse(self, page: RawPage) -> list[ItemOutcome]:
         return super().parse(page)[::-1]
+
+
+class BrokenElements(ArbeitnowAdapter):
+    """Arbeitnow whose `elements` no longer reads a stored body that passed `check_envelope`."""
+
+    def elements(self, page: RawPage) -> list[bytes]:
+        raise ContractViolation("not_object", status=page.status)
+
+
+def recorded(case: str) -> httpx.Response:
+    """The recorded Arbeitnow `case` as a response."""
+    status, headers, body = load_fixture("arbeitnow", case)
+    return httpx.Response(status, headers=headers, content=body)
 
 
 class TolerantJSearch(JSearchAdapter):
@@ -233,7 +249,10 @@ async def test_replay_rejected_reparses_from_the_stored_body(
     rows = await items_of(engine, rr)
     rejected = rows[4].id
     pending = [r.id for r in rows if r.disposition == "pending"]
-    fetched_at = utcnow()
+    async with engine.connect() as c:
+        fetched_at = (
+            await c.execute(sa.text("SELECT fetched_at FROM raw_responses WHERE id = :r"), {"r": rr})
+        ).scalar_one()
     async with httpx.AsyncClient() as client:
         tolerant = TolerantJSearch(client, api_key=b"fake", instance_id=instance.id, clock=utcnow)
 
@@ -246,10 +265,14 @@ async def test_replay_rejected_reparses_from_the_stored_body(
         # the adapter of today still rejects it: nothing moves; a pending item is no replay at all
         assert await replay([rejected, *pending], adapter=adapters(instance)) == 0
         assert (await item(engine, rejected)).disposition == "rejected"
-        # a body older than 30 days is no longer replayed
-        assert await replay([rejected], adapter=tolerant, now=fetched_at + timedelta(days=31)) == 0
-        # the adapter now tolerates the missing id: rejected -> pending, normalized rebuilt from the body
-        assert await replay([rejected], adapter=tolerant) == 1
+        # the payload age bound is inclusive (§7.16.1, payload <= 30 d): 30 d + 1 s is no longer replayed...
+        too_old = fetched_at + RAW_BODY_TTL + timedelta(seconds=1)
+        assert RAW_BODY_TTL == timedelta(days=30)
+        assert await replay([rejected], adapter=tolerant, now=too_old) == 0
+        assert (await item(engine, rejected)).disposition == "rejected"
+        # ...exactly 30 d still is, and the adapter now tolerates the missing id: rejected -> pending, with
+        # normalized, native_id and item_ts rebuilt from the stored body
+        assert await replay([rejected], adapter=tolerant, now=fetched_at + RAW_BODY_TTL) == 1
         moved = await item(engine, rejected)
         expected = f"tolerated-{get_str(crafted_jsearch_jobs()[4], 'job_id')}"
         assert (moved.disposition, moved.reason_code, moved.native_id, moved.disposed_at) == (
@@ -258,7 +281,10 @@ async def test_replay_rejected_reparses_from_the_stored_body(
             expected,
             None,
         )
-        assert NormalizedPosting.model_validate(moved.normalized).native_id == expected
+        posting = NormalizedPosting.model_validate(moved.normalized)
+        assert (
+            posting.native_id == expected and moved.item_ts == posting.item_ts and moved.item_ts is not None
+        )
         assert await replay([rejected], adapter=tolerant) == 0  # pending now: nothing to replay
 
         # a purged body: nothing moves
@@ -413,3 +439,41 @@ async def test_the_node_parses_every_unparsed_response_of_the_run(
     )
     async with engine.connect() as c:
         assert (await c.execute(RUN_ITEMS, {"run": owner.run_id})).scalar_one() == 60
+
+
+async def test_an_elements_error_is_a_bug_that_stops_the_node(
+    engine, current_epoch, arbeitnow_adapter, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    """T15-b: a stored body whose envelope passed `check_envelope` must read again. A `SourceError` from
+    `elements` is a bug: never a source error of the node's error handler, and no later response is parsed."""
+    owner = await queued_run(engine)
+    respx_mock.get(FEED_URL).side_effect = [recorded("page1"), recorded("page2")]
+    stored = [
+        await served_response(
+            engine,
+            owner,
+            arbeitnow_adapter,
+            await arbeitnow_spec(engine, arbeitnow_adapter, n),
+            billing="free",
+            provider=None,
+        )
+        for n in (1, 2)
+    ]
+    points: list[str] = []
+
+    async def reached(name: str) -> None:
+        points.append(name)
+
+    monkeypatch.setattr(parse_node, "afault_point", reached)
+    async with httpx.AsyncClient() as client:
+        broken = BrokenElements(client, instance_id=1, clock=utcnow)
+        node = parse_node.make_parse_normalize(make_deps(engine, lambda instance: broken))
+        with pytest.raises(InvariantViolation, match="no longer reads") as raised:
+            await error_handled(parse_node.PARSE_NORMALIZE, node)(
+                initial_state(owner.run_id, owner.attempt_no)
+            )
+    assert isinstance(raised.value.__cause__, ContractViolation)
+    assert points == ["collect.before_parse"]  # it stopped at the first response
+    for raw_response_id in stored:
+        assert await items_of(engine, raw_response_id) == []
+        assert await response_of(engine, raw_response_id) == (30, None)

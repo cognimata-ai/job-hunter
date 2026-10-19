@@ -184,7 +184,6 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
         # §7.16.1. `disposed_at` records leaving `pending` and is cleared on the replay `rejected -> pending`
         # (the §7.7 CHECK `(disposition = 'pending') = (disposed_at IS NULL)`). The replay and
         # `deferred -> linked` pass `reason=CLEAR_REASON`: the CHECK on `reason_code` refuses a kept reason.
-        # The replay re-parses the item, so it also sets the `native_id` and `item_ts` of the new parse.
         "raw_items": TransitionSpec(
             table="raw_items",
             state_col="disposition",
@@ -207,7 +206,7 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
                     ("rejected", "pending"),
                 }
             ),
-            settable=frozenset({"observation_id", "normalized", "native_id", "item_ts"}),
+            settable=frozenset({"observation_id", "normalized"}),
         ),
         # §7.16.2. A new posting is inserted `active`; every change of availability is recorded.
         "postings": TransitionSpec(

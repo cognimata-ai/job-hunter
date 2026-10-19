@@ -17,7 +17,8 @@ becomes one row:
 Every row has the outcome's `native_id` and `item_ts` and `item_sha256 = element_sha256(element)`; a disposed
 one has its `disposed_at`. A `SourceError` from `parse` (the whole array unreadable) rejects every element
 `item_contract`; one from `elements`, on a body whose envelope passed `check_envelope` when it was stored, is
-a bug and propagates (ruling T15-b). The rows are inserted `ON CONFLICT (raw_response_id, item_index) DO
+a bug (ruling T15-b): it is raised as an `InvariantViolation`, so the node's error handler never takes it for
+a source error and the node stops there. The rows are inserted `ON CONFLICT (raw_response_id, item_index) DO
 NOTHING`, then the response gets `parsed_at = now()` and `item_count = len(elements)`, which must be the count
 it was stored with (the envelope's, `peek_native_ids`): the I1 sum of §17.2 is taken over that count.
 
@@ -29,8 +30,10 @@ pending.
 `replay_rejected` is the explicit replay `rejected -> pending` of §7.16.1 (M4 exposes it): every item whose
 stored body is not purged and was fetched at most `RAW_BODY_TTL` (30 days) ago is re-parsed from that body
 by the adapter of its source instance. An item the new parse gives as `Parsed` moves to `pending` with its
-`normalized`, `native_id` and `item_ts`; every other item stays `rejected`. It returns the number of items
-moved.
+`normalized` (the transition: a `pending` row without it breaks a §7.7 CHECK), then gets the new parse's
+`native_id` and `item_ts` by a guarded update of the `pending` row in the same transaction; every other item
+stays `rejected`. It returns the number of items moved. Its caller checks the global purge fence, and resolves
+the moved items, whose run is over (see its docstring).
 """
 
 from collections.abc import Callable, Sequence
@@ -103,6 +106,11 @@ _PENDING_OF_RUN: Final = q(
     "JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = :run AND i.disposition = 'pending' "
     "ORDER BY i.id"
 )
+# The new parse's id and time of a replayed item, guarded by the state the replay just gave it.
+_REPLAYED: Final = q(
+    "UPDATE raw_items SET native_id = :native_id, item_ts = :item_ts "
+    "WHERE id = :id AND disposition = 'pending' RETURNING id"
+)
 _REJECTED: Final = q(
     "SELECT i.id, i.raw_response_id, i.item_index, r.fetched_at, r.purged_at, f.spec, f.source_instance_id "
     "FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
@@ -136,6 +144,17 @@ def _one_per_element(outcomes: Sequence[ItemOutcome], elements: int, raw_respons
             f"raw response {raw_response_id}: the parse is not one outcome per element in item_index order "
             f"({len(outcomes)} outcomes for {elements} elements)"
         )
+
+
+def _elements(adapter: SourceAdapter, page: RawPage, raw_response_id: int) -> list[bytes]:
+    """The elements of a stored page. Its envelope passed `check_envelope` when it was stored, so a
+    `SourceError` here is a bug (ruling T15-b), raised as an `InvariantViolation`, never as a source error."""
+    try:
+        return adapter.elements(page)
+    except SourceError as err:  # the kind and the code only: a message may carry content
+        raise InvariantViolation(
+            f"raw response {raw_response_id}: its stored envelope no longer reads ({err.kind}: {err.code})"
+        ) from err
 
 
 def _outcomes(
@@ -197,7 +216,7 @@ async def parse_response(
     if response.parsed_at is not None:
         return await _stored_counts(conn, raw_response_id)
     page = await load_response(conn, raw_response_id, RequestSpec.from_json(response.spec))
-    elements = adapter.elements(page)
+    elements = _elements(adapter, page, raw_response_id)
     if response.item_count is not None and response.item_count != len(elements):
         raise InvariantViolation(
             f"raw response {raw_response_id} was stored with {response.item_count} items, "
@@ -237,7 +256,12 @@ async def replay_rejected(
 ) -> int:
     """The replay `rejected -> pending` of the `rejected` items among `raw_item_ids` (see the module
     docstring), in the caller's transaction, each item locked `FOR UPDATE`; the number of items moved. An id
-    that is not a `rejected` item is skipped."""
+    that is not a `rejected` item is skipped.
+
+    It has no run owner, so it checks no fence of its own. Its caller (the M4 operation) must check the global
+    purge fence in the same transaction, before calling it. The items it moves belong to a past run, whose
+    `resolve_identity` has finished, so no node resolves them: the caller also needs a resolver for items
+    moved under a past run, or they stay `pending`."""
     rows = (await conn.execute(_REJECTED, {"ids": list(raw_item_ids)})).all()
     if not rows:
         return 0
@@ -259,19 +283,18 @@ async def replay_rejected(
             outcomes = adapter.parse(page)
         except SourceError:  # the item array is still unreadable: its items stay rejected
             continue
-        _one_per_element(outcomes, len(adapter.elements(page)), raw_response_id)
+        _one_per_element(outcomes, len(_elements(adapter, page, raw_response_id)), raw_response_id)
         for item in items:
             outcome = outcomes[int(item.item_index)]
             if not isinstance(outcome, Parsed):
                 continue
-            fields = {
-                "normalized": outcome.normalized.model_dump(mode="json"),
-                "native_id": outcome.native_id,
-                "item_ts": outcome.item_ts,
-            }
+            normalized = {"normalized": outcome.normalized.model_dump(mode="json")}
             await transition(
-                conn, "raw_items", int(item.id), ["rejected"], "pending", reason=CLEAR_REASON, set_=fields
+                conn, "raw_items", int(item.id), ["rejected"], "pending", reason=CLEAR_REASON, set_=normalized
             )
+            params = {"id": int(item.id), "native_id": outcome.native_id, "item_ts": outcome.item_ts}
+            if (await conn.execute(_REPLAYED, params)).first() is None:
+                raise InvariantViolation(f"raw item {item.id} is not pending after its replay")
             moved += 1
     log.info("rejected_items_replayed", asked=len(raw_item_ids), rejected=len(rows), moved=moved)
     return moved
