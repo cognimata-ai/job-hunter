@@ -805,6 +805,13 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
         "raw_items_out_of_scope": 0,
         "raw_items_duplicate_in_page": 0,
         "raw_items_rejected": 0,
+        # node 6 (Task 18) ran: no item was pending
+        "raw_items_linked": 0,
+        "raw_items_deferred": 0,
+        "jobs_created": 0,
+        "merges": 0,
+        "conflicts": 0,
+        "revisions_new": 0,
         "hard_filter_backfilled": 0,  # node 8 (Task 16) ran: no job was touched
     }
     assert state["steps"].count("fetch_cell") == 3 and state["steps"][-1] == "finalize"

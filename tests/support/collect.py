@@ -36,17 +36,26 @@ selection: its title, `title_norm` and `seniority_tokens` come from `normalize_t
 title, its other fields say nothing, and its `det_facts_hash` is no hash of its facts, so the first
 `recompute_job` changes the det facts. `add_posting` adds such a posting to a job and `add_observation` a
 newer observation to a posting (it becomes the posting's latest), both on the caller's connection.
+
+Task 18: `pending_item` stores a one-element page for a run (a `free` list request of the source's default
+instance, `succeeded`, its response fetched at `fetched_at`) and parses it with `items.parse_response` and an
+adapter whose one item is `observations.normalized` with the overrides: the `pending` raw item a resolver
+takes. Unless the overrides give `raw_keys`, the item's keys are the ones its source's adapter reads (§8.4):
+the source's own id key (`htidocid` for JSearch and SerpApi, `adzuna` for Adzuna) and the keys of its
+primary link (`keys_from_link`), which is stored canonical. `key_pair` resolves job A (a JSearch posting
+with `htidocid` `H` and `pub:stepstone.de` 1) and job B (an Adzuna posting with id 9) for a run, A first.
 """
 
 import asyncio
 import hashlib
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, cast
 
 import httpx
 import procrastinate
@@ -55,13 +64,27 @@ from jobhunter.clock import utcnow
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
+from jobhunter.dedup.identity import resolve_item
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.normalize.companies import company_key
 from jobhunter.normalize.fields import ATS_SOURCES
+from jobhunter.normalize.keys import AdKey, keys_from_link
 from jobhunter.normalize.titles import normalize_title
+from jobhunter.normalize.urls import canonical_url
 from jobhunter.quota.windows import Provider
+from jobhunter.sources import items, receipts
 from jobhunter.sources.acquire import AcquireContext
-from jobhunter.sources.base import REMOTE_DE, Billing, CellPlan, RequestSpec, SourceAdapter
+from jobhunter.sources.base import (
+    REMOTE_DE,
+    Billing,
+    CellPlan,
+    ItemOutcome,
+    NormalizedPosting,
+    Parsed,
+    RawPage,
+    RequestSpec,
+    SourceAdapter,
+)
 from jobhunter.sources.instances import InstanceRow, instance_for_company
 from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.sources.ratelimit import SOURCE_LIMITS, RateLimiter
@@ -859,3 +882,144 @@ def job_with_postings(engine: AsyncEngine) -> JobWithPostings:
         return JobPostings(job, MappingProxyType(made_postings), MappingProxyType(made_observations))
 
     return make
+
+
+# ---- Task 18 ----------------------------------------------------------------------------------------------
+
+_ITEM_OF: Final = q("SELECT id FROM raw_items WHERE raw_response_id = :rr")
+# The key a source's own id is (§8.4), as its adapter puts it first in `raw_keys`.
+_NATIVE_KEY_NS: Final = {"jsearch": "htidocid", "serpapi": "htidocid", "adzuna": "adzuna"}
+STEPSTONE_1: Final = "https://stepstone.de/x--1-inline.html"
+STEPSTONE_2: Final = "https://stepstone.de/x--2-inline.html"
+
+
+class _OneItem:
+    """The adapter of a stored one-element page whose one item parses as `posting` (`parse_response` calls
+    nothing else)."""
+
+    def __init__(self, posting: NormalizedPosting) -> None:
+        self._posting = posting
+
+    def elements(self, page: RawPage) -> list[bytes]:
+        return [page.body]
+
+    def parse(self, page: RawPage) -> list[ItemOutcome]:
+        return [Parsed(0, self._posting.native_id, self._posting.item_ts, self._posting)]
+
+
+def _item_posting(source_id: str, overrides: Mapping[str, Any]) -> NormalizedPosting:
+    """`observations.normalized` with the overrides, a fresh native id unless one is given, the primary link
+    canonical, and the keys of the source's adapter unless `raw_keys` is given (module docstring)."""
+    fields = dict(overrides)
+    native_id = str(fields.pop("native_id", f"{source_id}-{uuid.uuid4().hex[:12]}"))
+    link = fields.get("primary_link")
+    if link is not None:
+        fields["primary_link"] = link = canonical_url(link)
+    if "raw_keys" not in fields:
+        ns = _NATIVE_KEY_NS.get(source_id)
+        native = [AdKey(ns, native_id)] if ns is not None else []
+        fields["raw_keys"] = (*native, *(keys_from_link(link) if link is not None else []))
+    return normalized(native_id, **fields)
+
+
+async def pending_item(
+    engine: AsyncEngine,
+    owner: RunOwner,
+    source_id: str,
+    normalized_overrides: Mapping[str, Any],
+    *,
+    fetched_at: datetime | None = None,
+) -> int:
+    """The id of a `pending` raw item of `owner`'s run from the source's default instance, its page fetched at
+    `fetched_at` (now when `None`), parsed by `items.parse_response` (module docstring)."""
+    at = utcnow() if fetched_at is None else fetched_at
+    posting = _item_posting(source_id, normalized_overrides)
+    cell = await source_cell(engine, source_id)
+    async with engine.begin() as conn:
+        instance = await instance_id(conn, source_id)
+        spec = RequestSpec(
+            source_instance_id=instance,
+            operation="list",
+            cell_id=cell,
+            page_no=1,
+            params={"item": uuid.uuid4().hex},
+            cursor_in=None,
+            detail_native_id=None,
+            parent_fetch_request_id=None,
+            window=None,
+            request_class="free",
+        )
+        fetch_request = await receipts.insert_fetch_request(
+            conn,
+            owner=owner,
+            cell_id=cell,
+            source_instance_id=instance,
+            phase="primary",
+            spec=spec,
+            request_key=uuid.uuid4().bytes,
+            attempt_seq=1,
+            status="planned",
+        )
+        await transition(conn, "fetch_requests", fetch_request, ["planned"], "dispatched")
+        body = json.dumps({"native_id": posting.native_id, "nonce": uuid.uuid4().hex}).encode()
+        page = RawPage(spec, 200, {"content-type": "application/json"}, body, at)
+        raw_response = await receipts.store_response(
+            conn,
+            fetch_request,
+            page,
+            source_instance_id=instance,
+            ledger_entry_id=None,
+            succeeded=True,
+            items=1,
+        )
+        await transition(
+            conn,
+            "fetch_requests",
+            fetch_request,
+            ["dispatched"],
+            "succeeded",
+            set_={"http_status": 200, "items": 1},
+        )
+    async with engine.begin() as conn:
+        adapter = cast(SourceAdapter, _OneItem(posting))
+        await items.parse_response(conn, raw_response, adapter=adapter, owner=owner)
+        return int((await conn.execute(_ITEM_OF, {"rr": raw_response})).scalar_one())
+
+
+async def resolved(engine: AsyncEngine, owner: RunOwner, raw_item_id: int) -> str:
+    """`identity.resolve_item` of the raw item in a transaction of its own; its resolution."""
+    async with engine.begin() as conn:
+        return await resolve_item(conn, owner=owner, raw_item_id=raw_item_id, now=utcnow())
+
+
+_JOB_OF_POSTING: Final = q(
+    "SELECT p.id, p.job_id FROM postings p JOIN source_instances i ON i.id = p.source_instance_id "
+    "WHERE i.source_id = :s AND i.instance_key = 'default' AND p.native_id = :n"
+)
+
+
+@dataclass(frozen=True)
+class KeyPair:
+    """Job A (a JSearch posting: `htidocid` `H`, `pub:stepstone.de` 1) and job B (an Adzuna posting, id 9)."""
+
+    a: int
+    b: int
+    posting_a: int
+    posting_b: int
+
+
+async def key_pair(engine: AsyncEngine, owner: RunOwner, *, at: datetime) -> KeyPair:
+    """A and B (`KeyPair`), resolved for `owner`'s run from items fetched at `at` and an hour later."""
+    first = await pending_item(
+        engine, owner, "jsearch", {"native_id": "H", "primary_link": STEPSTONE_1}, fetched_at=at
+    )
+    second = await pending_item(
+        engine, owner, "adzuna", {"native_id": "9"}, fetched_at=at + timedelta(hours=1)
+    )
+    for raw_item_id in (first, second):
+        if await resolved(engine, owner, raw_item_id) != "linked":
+            raise RuntimeError(f"key_pair: raw item {raw_item_id} was not linked")
+    async with engine.connect() as conn:
+        a = (await conn.execute(_JOB_OF_POSTING, {"s": "jsearch", "n": "H"})).one()
+        b = (await conn.execute(_JOB_OF_POSTING, {"s": "adzuna", "n": "9"})).one()
+    return KeyPair(int(a.job_id), int(b.job_id), int(a.id), int(b.id))

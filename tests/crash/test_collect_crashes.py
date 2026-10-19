@@ -1,4 +1,5 @@
 import sys
+from typing import cast
 
 import pytest
 
@@ -186,3 +187,54 @@ def test_c5_between_responses_resumes_without_duplicates(migrated, proc_env, pro
     )
     # parsed once, no duplicate row, dispositions conserve
     assert len(rows) == 2 and all(parsed and n == items == distinct for parsed, n, items, distinct in rows)
+
+
+# The dispositions of the run's raw items, by disposition.
+ITEMS = (
+    "SELECT i.disposition, count(*) FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
+    "JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = %s GROUP BY 1"
+)
+
+
+def dispositions(server: PgServer, run_id: int) -> dict[str, int]:
+    """`ITEMS` of the run as `{disposition: count}`."""
+    return {str(disposition): cast(int, n) for disposition, n in pg_rows(server, "superuser", ITEMS, run_id)}
+
+
+def test_c5b_pending_items_are_all_resumed(migrated, proc_env, procs, fixture_log) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.before_resolve_identity")
+    left, sent = dispositions(migrated, run_id), served_requests(fixture_log)
+    assert left.get("pending", 0) > 0 and "linked" not in left  # A parsed every page and resolved nothing
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    after = dispositions(migrated, run_id)
+    # resumed from `normalized`: no re-fetch, no re-parse
+    assert (
+        "pending" not in after
+        and sum(after.values()) == sum(left.values())
+        and served_requests(fixture_log) == sent
+    )
+    # none skipped
+    assert (
+        sum(after.get(d, 0) - left.get(d, 0) for d in ("linked", "out_of_scope", "rejected", "deferred"))
+        == left["pending"]
+    )
+
+
+def test_c6_item_transaction_rolls_back_without_a_partial_posting(
+    migrated, proc_env, procs, fixture_log
+) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.identity.in_item_tx")
+    # the item's transaction rolled back
+    assert one(migrated, "SELECT count(*) FROM postings") == (0,) and "linked" not in dispositions(
+        migrated, run_id
+    )
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    assert "pending" not in dispositions(migrated, run_id)
+    # every item linked once, no partial or second posting
+    assert one(
+        migrated,
+        "SELECT (SELECT count(*) FROM postings) = (SELECT count(DISTINCT native_id) FROM raw_items "
+        "WHERE disposition = 'linked'), (SELECT count(*) FROM postings) > 0",
+    ) == (True, True)
