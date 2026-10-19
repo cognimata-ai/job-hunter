@@ -54,6 +54,14 @@ QUOTA_REMAINING_UNITS = Gauge(
     registry=REGISTRY,
 )
 
+# The duplicate groups the `group_representatives` reconciler repaired (§8.7, §17.4: one election per group
+# per pass), counted once the repair committed.
+DEDUP_GROUP_REPAIRS = Counter(
+    "jobhunter_dedup_group_repairs",
+    "Duplicate groups repaired by the group_representatives reconciler.",
+    registry=REGISTRY,
+)
+
 
 def start_metrics_server(port: int) -> None:
     """Serve `REGISTRY` over HTTP on `port` from a daemon thread."""

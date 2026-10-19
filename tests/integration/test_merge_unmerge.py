@@ -22,6 +22,7 @@ from tests.support.collect import (
     resolved,
 )
 from tests.support.faults import PausePoint
+from tests.support.groups import BERLIN
 
 pytestmark = pytest.mark.integration
 
@@ -277,9 +278,15 @@ async def test_merge_takes_the_from_job_out_of_its_group_and_refuses_fenced_jobs
     at = utcnow() - timedelta(days=3)
     names = ("A", "B", "C", "D", "E", "F")
     jobs: dict[str, int] = {}
+    # one place for all (G2), so the members confirm against each new representative (Task 20)
+    berlin = {"locations": [BERLIN], "location_kind": "city"}
     for hours, name in enumerate(names):
         item = await pending_item(
-            engine, owner, "jsearch", {"native_id": f"G{name}"}, fetched_at=at + timedelta(hours=hours)
+            engine,
+            owner,
+            "jsearch",
+            {"native_id": f"G{name}", **berlin},
+            fetched_at=at + timedelta(hours=hours),
         )
         assert await resolved(engine, owner, item) == "linked"
         jobs[name] = (await job_of(engine, item))[1]

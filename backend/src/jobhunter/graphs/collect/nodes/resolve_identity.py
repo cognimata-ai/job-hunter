@@ -5,7 +5,11 @@ resolves the run's `pending` items, oldest first, one transaction each (crash ca
 `identity.resolve_deferred_items` the `deferred` items of earlier runs whose jobs are no longer fenced (at
 most `identity.DEFERRED_LIMIT`), and `snapshots.apply_run_snapshots` applies the run's ATS snapshots that are
 not applied yet (§8.11), one transaction each under the run's owner row, after the items, so a member's
-sighting is counted by its item alone. Task 20 adds the grouping.
+sighting is counted by its item alone. Then the grouping pass (§8.7, crash case C6b dies before it): it passes
+`collect.identity.before_grouping` and `groups.regroup_run_jobs` regroups every unmerged job with a
+`job_revision_occurrences` row since the run's `started_at` (the durable trace of "created or changed in this
+run", never an in-memory result), one transaction each, under the company lock, then the job rows, then the
+run's owner row.
 
 A resumed attempt continues every `pending` item from its stored `normalized` intermediate; the terminal
 dispositions are never touched again. The update's `counters` are what this call did:
@@ -17,9 +21,11 @@ dispositions are never touched again. The update's `counters` are what this call
   `deferred_rejected`, and `deferred_still_fenced` for an item fenced again before its transaction;
 - of both passes: `jobs_created`, `merges`, `conflicts` and `revisions_new`;
 - of the snapshot pass (`snapshots.SNAPSHOT_COUNTERS`): `availability_closed`, `availability_unknown`,
-  `availability_revived` and `mass_events_opened`.
+  `availability_revived` and `mass_events_opened`;
+- of the grouping pass (`groups.GROUPING_COUNTERS`): `groups_formed`, `groups_changed` and `elections`.
 
-The run's own totals are its rows (I1, §17.2), whichever attempt wrote them.
+The run's own totals are its rows (I1, §17.2), whichever attempt wrote them. A resumed attempt runs the
+grouping pass again: a job already grouped is confirmed and counts nothing.
 """
 
 from collections.abc import Mapping
@@ -27,7 +33,7 @@ from types import MappingProxyType
 from typing import Final
 
 from jobhunter.availability import snapshots
-from jobhunter.dedup import identity
+from jobhunter.dedup import groups, identity
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
@@ -35,6 +41,7 @@ from jobhunter.graphs.collect.state import CollectState, CollectUpdate
 from jobhunter.worker.runs import RunOwner
 
 RESOLVE_IDENTITY: Final = "resolve_identity"
+BEFORE_GROUPING: Final = "collect.identity.before_grouping"
 # The counter of each resolution of the deferred pass (items of earlier runs).
 DEFERRED_COUNTERS: Final[Mapping[identity.Resolution, str]] = MappingProxyType(
     {
@@ -62,6 +69,8 @@ def make_resolve_identity(deps: CollectDeps) -> Node:
             "revisions_new": tally.revisions_new,
         }
         counters |= await snapshots.apply_run_snapshots(deps.engine, owner, clock=deps.clock)
+        await afault_point(BEFORE_GROUPING)
+        counters |= await groups.regroup_run_jobs(deps.engine, owner)
         return {"counters": counters, "steps": [RESOLVE_IDENTITY]}
 
     return resolve_identity

@@ -3,9 +3,11 @@
 **Locks (Ruling T18-c).** Every job row a transaction writes or references is locked by ONE ordered
 statement, `lock_jobs`: `… WHERE id = ANY(:ids) OR id IN (<the duplicate-group co-members of with_groups_of>)
 ORDER BY id FOR UPDATE`, before the owner row when there is one (§3.3.3). A job that may be merged away
-brings its co-members, because step 5 writes their rows (the last member of a dissolved group) or names
-them (an elected representative). Nothing is ever locked lazily: `_leave_group` raises `InvariantViolation`
-for a member the transaction does not hold.
+brings its co-members, because step 5 writes their rows (the last member of a dissolved group, a member that
+no longer confirms) or names them (an elected representative). Nothing is ever locked lazily:
+`groups.leave_group` raises `InvariantViolation` for a member the transaction does not hold. No function here
+takes a company advisory lock (Ruling T20-a): only `groups.regroup_job` does, before any job row, so a merge
+never waits for one while it holds job rows.
 
 **`merge_jobs`** runs the merge procedure of §8.6.1 in the caller's transaction. Standalone, it locks the
 pair and the members of both jobs' groups in that one statement; a caller that already holds its jobs
@@ -18,12 +20,12 @@ merged again (`InvariantViolation`).
    from-job's non-terminal targets (step 4) arrive with their tables in M4 and M3 (plan Deviation 7).
 2. **Move** every posting of the from-job (its ids are the event's `posting_ids`) and every key it owns to
    the into-job. `ad_key_sources` is untouched.
-5. **Groups**: the from-job leaves its duplicate group. A group left with one member is `dissolved`
-   (`member_left`) and that member leaves it too; a group whose representative left elects the eligible
-   member that sorts first by §8.7 (availability, completeness, source rank, description length, first
-   seen, id; eligible: unmerged and not `closed`, the targets of M3 aside), or records `no_active_member`.
-   Every member must be held by the transaction (`InvariantViolation` otherwise). The revalidation of the
-   members against a new representative is Task 20's (`groups.leave_group`).
+5. **Groups**: the from-job leaves its duplicate group (`groups.leave_group(reason='member_left')`). A group
+   left with one member is `dissolved` (`member_left`) and that member leaves it too; a group whose
+   representative left elects the eligible member that sorts first by §8.7 (`representative.reelect`), or
+   records `no_active_member`, and the members are revalidated against the new representative: one that no
+   longer confirms leaves (§8.7). Every member must be held by the transaction (`InvariantViolation`
+   otherwise).
 6. **Conflicts**: every open conflict naming the from-job names the into-job instead. One left without a
    candidate other than its posting's job is `resolved_merged`, its ids unchanged, and its
    `dedup.identity_conflict` alert is resolved.
@@ -73,7 +75,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
-from jobhunter.dedup import revisions
+from jobhunter.dedup import groups, revisions
 from jobhunter.dedup.revisions import FIELD_CONFLICT_ALERT, RecomputeResult
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.normalize.fields import CONFLICT_FIELDS, CONFLICT_RULE
@@ -86,7 +88,6 @@ MergeKind = Literal["strong_key_merge", "user_confirmed_merge"]
 IDENTITY_CONFLICT_ALERT: Final = "dedup.identity_conflict"
 # The order of a job's availability (§7.16.2): the first state its postings hold.
 AVAILABILITY_ORDER: Final = ("active", "unknown", "stale", "closed")
-_MEMBER_LEFT: Final = "member_left"
 
 # The co-members (and the jobs themselves) of the groups of :grouped.
 _CO_MEMBERS_OF: Final = (
@@ -134,31 +135,6 @@ _INSERT_EVENT: Final = q(
     "INSERT INTO merge_events (kind, from_job_id, into_job_id, posting_ids, evidence) "
     "VALUES (:kind, :from_job, :into_job, CAST(:postings AS bigint[]), :evidence) RETURNING id",
     jsonb=["evidence"],
-)
-# -- groups (step 5)
-_GROUP_OF: Final = q(
-    "SELECT g.id, g.status, g.representative_job_id FROM duplicate_group_members m "
-    "JOIN duplicate_groups g ON g.id = m.group_id WHERE m.job_id = :job FOR UPDATE OF g"
-)
-_LEAVE: Final = q(
-    "DELETE FROM duplicate_group_members WHERE group_id = :group AND job_id = ANY(CAST(:jobs AS bigint[]))"
-)
-_UNGROUP: Final = q(
-    "UPDATE jobs SET duplicate_group_id = NULL WHERE id = ANY(CAST(:jobs AS bigint[])) "
-    "AND duplicate_group_id = :group"
-)
-_MEMBERS: Final = q("SELECT job_id FROM duplicate_group_members WHERE group_id = :group ORDER BY job_id")
-_CANDIDATE_REPRESENTATIVE: Final = q(
-    "SELECT j.id FROM duplicate_group_members m JOIN jobs j ON j.id = m.job_id "
-    "LEFT JOIN job_revisions r ON r.id = j.current_revision_id "
-    "WHERE m.group_id = :group AND j.merged_into_job_id IS NULL AND j.availability <> 'closed' "
-    "ORDER BY array_position(CAST(:order AS text[]), j.availability), (j.completeness = 'full') DESC, "
-    "(SELECT min(s.precedence_rank) FROM sources s WHERE s.id = ANY(j.source_ids)), "
-    "length(coalesce(r.description_text, '')) DESC, j.first_seen_at, j.id LIMIT 1"
-)
-_ELECT: Final = q(
-    "UPDATE duplicate_groups SET representative_job_id = :rep, unscorable_reason = :reason, "
-    "elected_at = now(), election_reason = :election, updated_at = now() WHERE id = :group"
 )
 # -- conflicts (step 6, §8.6 step 3)
 _CONFLICTS_NAMING: Final = q(
@@ -299,44 +275,6 @@ async def _snapshot(conn: AsyncConnection, from_job_id: int, into_job_id: int) -
     return {"ad_keys": keys, "group_memberships": memberships}
 
 
-async def _leave_group(conn: AsyncConnection, job_id: int, held: Collection[int]) -> None:
-    """Step 5: the job leaves its duplicate group, which dissolves or re-elects (module docstring). Every
-    member's row must be among `held`, the rows this transaction locked: `InvariantViolation` otherwise,
-    before it writes anything (Ruling T18-c; `_hold_pair` checks the same before the merge writes)."""
-    group = (await conn.execute(_GROUP_OF, {"job": job_id})).first()
-    if group is None:
-        return
-    group_id = int(group.id)
-    members = [int(member) for member in (await conn.execute(_MEMBERS, {"group": group_id})).scalars()]
-    if unheld := sorted(set(members) - set(held)):
-        raise InvariantViolation(f"group {group_id}: the rows of jobs {unheld} are not locked")
-    await conn.execute(_LEAVE, {"group": group_id, "jobs": [job_id]})
-    await conn.execute(_UNGROUP, {"group": group_id, "jobs": [job_id]})
-    if group.status != "active":
-        return
-    remaining = [member for member in members if member != job_id]
-    if len(remaining) < 2:
-        await conn.execute(_LEAVE, {"group": group_id, "jobs": remaining})
-        await conn.execute(_UNGROUP, {"group": group_id, "jobs": remaining})
-        await transition(conn, "duplicate_groups", group_id, ["active"], "dissolved", reason=_MEMBER_LEFT)
-        log.info("duplicate_group_dissolved", group_id=group_id, job_id=job_id)
-        return
-    if group.representative_job_id != job_id:
-        return
-    order = {"group": group_id, "order": list(AVAILABILITY_ORDER)}
-    representative = (await conn.execute(_CANDIDATE_REPRESENTATIVE, order)).scalar()
-    await conn.execute(
-        _ELECT,
-        {
-            "group": group_id,
-            "rep": representative,
-            "reason": None if representative is not None else "no_active_member",
-            "election": _MEMBER_LEFT,
-        },
-    )
-    log.info("duplicate_group_reelected", group_id=group_id, representative_job_id=representative)
-
-
 async def _rewrite_conflicts(conn: AsyncConnection, from_job_id: int, into_job_id: int) -> None:
     """Step 6: the open conflicts naming the from-job name the into-job; one left without a candidate is
     `resolved_merged`, its ids as they were (the CHECKs keep the posting's job out of its candidates)."""
@@ -413,7 +351,7 @@ async def merge_jobs(
         int(p) for p in (await conn.execute(_MOVE_POSTINGS, _pair(from_job_id, into_job_id))).scalars()
     )
     await conn.execute(_MOVE_KEYS, _pair(from_job_id, into_job_id))
-    await _leave_group(conn, from_job_id, held)
+    await groups.leave_group(conn, from_job_id, reason=groups.MEMBER_LEFT, held=held)
     await _rewrite_conflicts(conn, from_job_id, into_job_id)
     await conn.execute(_MERGED, _pair(from_job_id, into_job_id))
     for field in CONFLICT_FIELDS:  # carry 7: the from-job's selection no longer stands

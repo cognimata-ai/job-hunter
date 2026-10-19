@@ -522,6 +522,9 @@ async def test_the_node_resolves_the_run_items_and_counts(engine, current_epoch)
         "availability_unknown": 0,
         "availability_revived": 0,
         "mass_events_opened": 0,
+        "groups_formed": 0,  # the grouping pass (Task 20): no location, so no G2 match
+        "groups_changed": 0,
+        "elections": 0,
     }
     assert await scalar(engine, "SELECT count(*) FROM raw_items WHERE disposition = 'pending'") == 0
     again = await node(initial_state(owner.run_id, owner.attempt_no))  # nothing is left pending

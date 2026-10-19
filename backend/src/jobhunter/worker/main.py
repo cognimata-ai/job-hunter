@@ -106,6 +106,7 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.scoring.filters",
     "jobhunter.availability.rules",
     "jobhunter.availability.snapshots",
+    "jobhunter.dedup.groups",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

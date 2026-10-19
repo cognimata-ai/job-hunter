@@ -1,3 +1,4 @@
+import json
 import sys
 from typing import cast
 
@@ -6,7 +7,7 @@ import pytest
 from tests.support.collect import manual_paid_run
 from tests.support.pg import PgServer, pg_one, pg_rows
 from tests.support.procs import Proc, ProcessGroup, wait_until
-from tests.support.sources import served_requests
+from tests.support.sources import load_fixture, served_requests
 
 pytestmark = [pytest.mark.crash, pytest.mark.slow]
 WORKER = [sys.executable, "-m", "jobhunter.cli", "worker"]
@@ -238,3 +239,24 @@ def test_c6_item_transaction_rolls_back_without_a_partial_posting(
         "SELECT (SELECT count(*) FROM postings) = (SELECT count(DISTINCT native_id) FROM raw_items "
         "WHERE disposition = 'linked'), (SELECT count(*) FROM postings) > 0",
     ) == (True, True)
+
+
+def test_c6b_grouping_resumes_from_occurrences(migrated, proc_env, procs, fixture_log) -> None:
+    results = json.loads(load_fixture("adzuna", "adzuna_reingest_pair")[2])["results"]
+    pair = (str(results[0]["id"]), str(results[-1]["id"]))  # one ad under two Adzuna ids
+    run_id = manual_paid_run(migrated, only="adzuna")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.identity.before_grouping")
+    # A linked its items and grouped nothing
+    assert one(migrated, "SELECT count(*) FROM duplicate_groups") == (0,)
+    distinct_jobs = "SELECT count(DISTINCT job_id) FROM postings WHERE native_id IN (%s, %s)"
+    assert one(migrated, distinct_jobs, *pair) == (2,)
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    groups = pg_rows(
+        migrated,
+        "superuser",
+        "SELECT m.group_id FROM postings p JOIN duplicate_group_members m ON m.job_id = p.job_id "
+        "JOIN duplicate_groups g ON g.id = m.group_id WHERE g.status = 'active' AND p.native_id IN (%s, %s)",
+        *pair,
+    )
+    # B grouped them from the occurrences: a linked-but-ungrouped revision is never lost
+    assert len(groups) == 2 and len(set(groups)) == 1
