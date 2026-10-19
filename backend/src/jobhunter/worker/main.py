@@ -89,6 +89,7 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.worker.operations",
     "jobhunter.worker.runs",
     "jobhunter.quota.ledger",
+    "jobhunter.sources.watchlist_validate",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

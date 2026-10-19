@@ -5,19 +5,33 @@ turns it into the `RawPage` an adapter parses; `mock_fixture` serves it on a res
 reads the fixture transport's request log (Task 5), each `case` reduced to its name (`search_v2_page1`);
 `make_cell_plan` builds the `CellPlan` an adapter's `plan` takes (Task 9: a JSearch cell for Berlin, the
 `week` bucket), with any field changed.
+
+Task 11: `adapter_for_fixture` is the ATS adapter of the board an `ats/` case was recorded from (its slug, and
+for Lever its region, read from the case name), instance 1, on a client it never uses; `parsed_of` is the
+postings that adapter parses from the case. The `fake_http` fixture configures the HTTP layer for fake mode
+(`http.configure`, the fixture transport over `FIXTURES`) and restores the process-wide state it found.
 """
 
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
 import httpx
+import pytest
 import respx
-from jobhunter.sources.base import CellPlan, RawPage, RequestSpec
+from jobhunter.clock import utcnow
+from jobhunter.config import load_config
+from jobhunter.sources import ats as ats_adapters
+from jobhunter.sources import http
+from jobhunter.sources.ats.common import AtsAdapter
+from jobhunter.sources.base import CellPlan, NormalizedPosting, Parsed, RawPage, RequestSpec
 from jobhunter.sources.fixtures import load_case
+from jobhunter.sources.instances import InstanceRow
+from jobhunter.sources.watchlist_patterns import AtsType
 
 FIXTURES: Final = Path("tests/contract/fixtures")
 _NOW: Final = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
@@ -80,3 +94,67 @@ def make_cell_plan(**changes: Any) -> CellPlan:
         max_days_old=None,
     )
     return replace(base, **changes)
+
+
+# The boards the `ats/` cases were recorded from, by the first word of the case name after the ATS, where the
+# board's slug is not that word as it stands (SmartRecruiters slugs keep their case).
+_RECORDED_SLUGS: Final = {"deliveryhero": "DeliveryHero"}
+_FIXTURE_SPEC: Final = RequestSpec(
+    source_instance_id=1,
+    operation="list",
+    cell_id=7,
+    page_no=1,
+    params={},
+    cursor_in=None,
+    detail_native_id=None,
+    parent_fetch_request_id=None,
+    window=None,
+    request_class="free",
+)
+
+
+def adapter_for_fixture(ats: AtsType, case: str) -> AtsAdapter:
+    """The adapter of the board `ats/<case>` was recorded from: `<ats>_<slug>_…` (`lever_eu_<site>_…` for
+    a Lever EU board), instance 1, clock `utcnow`, on a client it never uses."""
+    prefix = f"{ats}_"
+    if not case.startswith(prefix):
+        raise ValueError(f"case {case!r} is not a {ats} case")
+    rest = case.removeprefix(prefix)
+    region = "global"
+    if ats == "lever" and rest.startswith("eu_"):
+        region, rest = "eu", rest.removeprefix("eu_")
+    word = rest.split("_", 1)[0]
+    slug = _RECORDED_SLUGS.get(word, word)
+    instance = InstanceRow(
+        id=1,
+        source_id=ats,
+        instance_key=f"{region}:{slug}" if ats == "lever" else slug,
+        watchlist_company_id=None,
+        health="ok",
+        half_open_after=None,
+        board_slug=slug,
+        lever_region=region if ats == "lever" else None,
+        display_name=None,
+    )
+    return ats_adapters.adapter_for(instance, httpx.AsyncClient(), clock=utcnow)
+
+
+def parsed_of(ats: AtsType, case: str) -> list[NormalizedPosting]:
+    """The postings the adapter of `ats/<case>` parses from that case (its `Parsed` items, in order)."""
+    page = fixture_page("ats", case, _FIXTURE_SPEC, fetched_at=_NOW)
+    return [o.normalized for o in adapter_for_fixture(ats, case).parse(page) if isinstance(o, Parsed)]
+
+
+@pytest.fixture
+def fake_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """`http.configure` in fake mode over `FIXTURES` (every new client is served by the fixture transport);
+    the process-wide configuration it found is restored after the test."""
+    env = {
+        "JOBHUNTER_ENV": "test",
+        "JOBHUNTER_DB_NAME": "jobhunter",
+        "JOBHUNTER_FAKE_SOURCES": "1",
+        "JOBHUNTER_FIXTURES_DIR": str(FIXTURES.resolve()),
+    }
+    monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
+    http.configure(load_config("worker", env, tmp_path / "no-secrets"))
+    yield
