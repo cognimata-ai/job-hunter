@@ -91,9 +91,7 @@ def test_capabilities_and_constants_are_the_contract() -> None:
     )
     assert (ITEMS_PATH, CURSOR_PATH) == (("data", "jobs"), ("data", "cursor"))  # V9
     assert PAGE2_MIN_NEW == 7
-    assert CURSOR_REUSE_TTL == timedelta(
-        hours=2
-    )  # the longest reuse V9 observed so far; V10 phase 3 may raise it
+    assert CURSOR_REUSE_TTL == timedelta(hours=24)  # the longest reuse observed (V10 phase 3)
 
 
 def test_the_adapter_satisfies_the_source_adapter_protocol() -> None:

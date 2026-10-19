@@ -23,6 +23,19 @@ Pseudonyms are numbered per source directory (`[person:n]`, `[email:n]`, `[phone
 so one value has one placeholder in every file of its source: the cursor of `jsearch/search_v2_page1`
 (`data.cursor`) is the `cursor` that `search_v2_page2` echoes in `parameters.cursor`.
 
+The two V10 day-2 recordings (`jsearch/search_v2_page1_day2` and `search_v2_page2_day2`) were scrubbed after
+the rest of `jsearch/`, and in the following way:
+1. a scratch copy of `.fixtures-raw/jsearch/` was made, with the day-2 files renamed to sort last (a `zz_`
+   prefix);
+2. that copy was scrubbed with the command above;
+3. only the two day-2 cases were copied here, under their own names.
+
+Their placeholders therefore continue the numbering of the committed files: the page-1 cursor is `[token:8]` in
+`search_v2_page2_day2` too. That run also reproduced every other committed JSearch file byte for byte. A plain
+re-scrub of `.fixtures-raw` would differ: it sorts the day-2 files between `search_v2_page1` and
+`search_v2_page2`, so it renumbers the `[token:n]` of `search_v2_page2`, `search_v2_page2_reused`,
+`search_v2_today` and the day-2 files.
+
 Each case is `<case>.json` (or `.xml`, `.html`, `.txt` for a body that is not JSON) with `<case>.headers.json`
 (`{"status", "headers"}`, the §5.2 header allowlist only) and, for a recording, `<case>.meta.json` (the URL
 without its query, the non-secret parameters, `fetched_at`, the duration and the body's size and hash).
@@ -65,6 +78,8 @@ of Tasks 9–11 (a missing native id, or a title that is not a string): **0 in e
 | `jsearch/search_v2_today` | 200 | 0 | 0 | recorded V9 phase 1, 2026-10-18 (`date_posted=today`; `data.cursor: null`) |
 | `jsearch/search_v2_page2` | 200 | 9 | 0 | recorded V9 phase 1, 2026-10-18 (the page-1 cursor; 0 of 9 `job_uid` on page 1) |
 | `jsearch/search_v2_page2_reused` | 200 | 9 | 0 | recorded V9 phase 2, 2026-10-18 (the page-1 cursor again, 2.01 h later; 7 of 9 `job_uid` of `search_v2_page2`; not routed) |
+| `jsearch/search_v2_page1_day2` | 200 | 10 | 0 | recorded V10 2026-10-19 (phase 3: the parameters of `search_v2_page1` again, 24.03 h later; 7 of 10 `job_uid` of `search_v2_page1`; cursor set; untrimmed; not routed) |
+| `jsearch/search_v2_page2_day2` | 200 | 8 | 0 | recorded V10 2026-10-19 (phase 3: the page-1 cursor of `search_v2_page1` once more, 24.04 h later; 6 of 8 `job_uid` of `search_v2_page2`, 0 of either page 1; cursor set; untrimmed; not routed) |
 | `jsearch/search_v2_empty` | 200 | 0 | 0 | derived from `search_v2_page1`: `data.jobs` → `[]`, `data.cursor` → `null` (the recorded end form) |
 | `jsearch/search_v2_429` | 429 | - | - | derived from `search_v2_page1`: body → `{"message": "Too many requests"}`, status 429, `x-ratelimit-requests-remaining: 0` |
 | `jsearch/search_v2_drift` | 200 | 10 | 0 | derived from `search_v2_page1`: the `status` key removed |
@@ -107,7 +122,7 @@ of Tasks 9–11 (a missing native id, or a title that is not a string): **0 in e
 | `ats/smartrecruiters_list_paged` | 200 | 5 | 0 | derived from `smartrecruiters_deliveryhero_list`: `content` → its first 5 postings, `totalFound` 10 kept (`0 + 5 < 10`: the pagination rule continues with `offset=100`; ruling T11-c) |
 | `ats/smartrecruiters_list_offset100` | 200 | 5 | 0 | derived from `smartrecruiters_deliveryhero_list`: `offset` → 100, `content` → its last 5 postings, `totalFound` 10 kept (the end); with `smartrecruiters_list_paged`, one board of 10 in two pages: a complete snapshot |
 | `ats/smartrecruiters_404` | 404 | - | - | derived: hand-written `{"message": "Company not found"}` |
-| `location_labels.tsv` | - | 172 rows | - | hand-labelled while reviewing (V17, below) |
+| `location_labels.tsv` | - | 173 rows | - | hand-labelled while reviewing (V17, below; V10 added `Berlin • über Arbeitnow`) |
 
 **Rejected in the fixture set the end-to-end test is served** (JSearch `search_v2_page1` and `search_v2_page2`,
 Adzuna `adzuna_reingest_pair` and `search_empty`, Arbeitnow `page1`, `page2` and `page_end`, Greenhouse

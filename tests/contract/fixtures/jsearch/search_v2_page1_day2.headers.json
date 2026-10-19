@@ -1,0 +1,13 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json",
+    "date": "Mon, 19 Oct 2026 20:52:20 GMT",
+    "x-ratelimit-rapid-free-plans-hard-limit-limit": "500000",
+    "x-ratelimit-rapid-free-plans-hard-limit-remaining": "499994",
+    "x-ratelimit-rapid-free-plans-hard-limit-reset": "2376124",
+    "x-ratelimit-requests-limit": "200",
+    "x-ratelimit-requests-remaining": "194",
+    "x-ratelimit-requests-reset": "2376124"
+  }
+}
