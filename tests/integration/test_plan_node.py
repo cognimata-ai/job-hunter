@@ -742,6 +742,7 @@ async def test_graph_runs_plan_fetch_and_pass_through_nodes_on_the_real_worker_p
     assert sorted(state["outcomes"]) == sorted(f"fr:{r.id}" for r in fetched)  # one outcome per page
     assert {o["status"] for o in state["outcomes"].values()} == {"succeeded"}
     assert state["counters"]["fetch_pages"] == len(fetched) and state["final_status"] is None
+    assert state["counters"]["hard_filter_backfilled"] == 0  # node 8 ran for real: no job was touched
     async with engine.connect() as c:
         assert state["settings_version_id"] == (await c.execute(ACTIVE_VERSION)).scalar_one()
     # plan_fallback's read (`plan` reads none, Ruling T13-c), one before each search and one after the last
@@ -804,6 +805,7 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
         "raw_items_out_of_scope": 0,
         "raw_items_duplicate_in_page": 0,
         "raw_items_rejected": 0,
+        "hard_filter_backfilled": 0,  # node 8 (Task 16) ran: no job was touched
     }
     assert state["steps"].count("fetch_cell") == 3 and state["steps"][-1] == "finalize"
 

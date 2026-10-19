@@ -23,6 +23,11 @@ observations directly, with the facts given (`MadeJob`); `seed_inputs_sync` is `
 crash tests, on an engine of its own; `manual_paid_run` seeds the test query with only the source under test
 enabled (Ruling P5) and requests a manual run that includes paid sources, whose `run_collect(id, 1)` job waits
 for the worker.
+
+Task 16: `posting_factory` inserts a posting with its job and one observation (the availability and the last
+sighting as given; a missing source instance is created); `board` and `board20` are the Greenhouse watchlist
+board `BOARD_SLUG` (enabled through `seed_inputs`; its fixture route answers `greenhouse_404`) with 3 or 20
+`active` postings and their jobs, its instance's `last_snapshot_active_count` their number (`Board`).
 """
 
 import asyncio
@@ -429,21 +434,82 @@ _JOB: Final = q(
     "work_mode_source, employment_source, ad_language, completeness, posted_precision, first_seen_at, "
     "last_seen_at, availability, availability_changed_at, source_ids, field_provenance, det_facts_hash) "
     "VALUES (lower(:company), :company, :title, lower(:title), 'unknown', ARRAY['remote','hybrid','onsite'], "
-    "'none', 'none', 'unknown', 'full', 'unknown', :first, :last, :availability, :last, ARRAY[:source], "
+    "'none', 'none', 'unknown', 'full', 'unknown', :first, :last, :availability, :changed, ARRAY[:source], "
     "'{}', :facts) RETURNING id"
 )
 _POSTING: Final = q(
     "INSERT INTO postings (source_instance_id, native_id, job_id, first_seen_at, last_seen_at, seen_count, "
     "availability, availability_changed_at) VALUES (:instance, :native_id, :job, :first, :last, :seen, "
-    ":availability, :last) RETURNING id"
+    ":availability, :changed) RETURNING id"
 )
 _OBSERVATION: Final = q(
     "INSERT INTO posting_observations (posting_id, raw_item_id, source_instance_id, raw_response_sha256, "
     "observed_at, normalized, content_hash, completeness, quality) VALUES (:posting, :raw_item, :instance, "
     ":sha, :at, '{}', :sha, 'full', 'ok') RETURNING id"
 )
+_ENSURE_INSTANCE: Final = q(
+    "INSERT INTO source_instances (source_id, instance_key) VALUES (:s, :k) ON CONFLICT DO NOTHING"
+)
 _LINK_ITEM: Final = q("UPDATE raw_items SET observation_id = :o WHERE id = :i")
 _LATEST: Final = q("UPDATE postings SET latest_observation_id = :o WHERE id = :p")
+
+
+async def insert_job(
+    engine: AsyncEngine,
+    *,
+    native_id: str,
+    source_id: str = "jsearch",
+    instance_key: str = "default",
+    observations: Sequence[tuple[datetime, int | None]] = (),
+    title: str = "Python Developer",
+    company: str = "Acme",
+    availability: str = "active",
+    availability_changed_at: datetime | None = None,
+    create_instance: bool = False,
+) -> MadeJob:
+    """A job with one posting of `(source_id, instance_key)` and one observation per entry of `observations`
+    (one now without any), inserted directly; the availability of the job and the posting was last changed at
+    `availability_changed_at` (the last sighting by default). With `create_instance` a missing source instance
+    is created (a board that `seed_inputs` did not make)."""
+    seen = list(observations) or [(utcnow(), None)]
+    first, last = min(at for at, _ in seen), max(at for at, _ in seen)
+    changed = last if availability_changed_at is None else availability_changed_at
+    async with engine.begin() as conn:
+        if create_instance:
+            await conn.execute(_ENSURE_INSTANCE, {"s": source_id, "k": instance_key})
+        instance = await instance_id(conn, source_id, instance_key)
+        job_params: dict[str, Any] = {
+            "company": company,
+            "title": title,
+            "first": first,
+            "last": last,
+            "changed": changed,
+            "availability": availability,
+            "source": source_id,
+            "facts": hashlib.sha256(f"{source_id}:{native_id}".encode()).digest(),
+        }
+        job = int((await conn.execute(_JOB, job_params)).scalar_one())
+        posting_params = {
+            "instance": instance,
+            "native_id": native_id,
+            "job": job,
+            "first": first,
+            "last": last,
+            "seen": len(seen),
+            "changed": changed,
+            "availability": availability,
+        }
+        posting = int((await conn.execute(_POSTING, posting_params)).scalar_one())
+        made: list[int] = []
+        for at, raw_item in sorted(seen, key=lambda entry: entry[0]):
+            sha = hashlib.sha256(f"{native_id}@{at.isoformat()}".encode()).digest()
+            params = {"posting": posting, "raw_item": raw_item, "instance": instance, "sha": sha, "at": at}
+            observation = int((await conn.execute(_OBSERVATION, params)).scalar_one())
+            if raw_item is not None:
+                await conn.execute(_LINK_ITEM, {"o": observation, "i": raw_item})
+            made.append(observation)
+        await conn.execute(_LATEST, {"o": made[-1], "p": posting})
+    return MadeJob(job, posting, tuple(made))
 
 
 @pytest.fixture
@@ -462,48 +528,116 @@ def job_factory(engine: AsyncEngine) -> JobFactory:
         company: str = "Acme",
         availability: str = "active",
     ) -> MadeJob:
-        seen = list(observations) or [(utcnow(), None)]
-        first, last = min(at for at, _ in seen), max(at for at, _ in seen)
-        async with engine.begin() as conn:
-            instance = await instance_id(conn, source_id, instance_key)
-            job_params: dict[str, Any] = {
-                "company": company,
-                "title": title,
-                "first": first,
-                "last": last,
-                "availability": availability,
-                "source": source_id,
-                "facts": hashlib.sha256(f"{source_id}:{native_id}".encode()).digest(),
-            }
-            job = int((await conn.execute(_JOB, job_params)).scalar_one())
-            posting_params = {
-                "instance": instance,
-                "native_id": native_id,
-                "job": job,
-                "first": first,
-                "last": last,
-                "seen": len(seen),
-                "availability": availability,
-            }
-            posting = int((await conn.execute(_POSTING, posting_params)).scalar_one())
-            made: list[int] = []
-            for at, raw_item in sorted(seen, key=lambda entry: entry[0]):
-                sha = hashlib.sha256(f"{native_id}@{at.isoformat()}".encode()).digest()
-                params = {
-                    "posting": posting,
-                    "raw_item": raw_item,
-                    "instance": instance,
-                    "sha": sha,
-                    "at": at,
-                }
-                observation = int((await conn.execute(_OBSERVATION, params)).scalar_one())
-                if raw_item is not None:
-                    await conn.execute(_LINK_ITEM, {"o": observation, "i": raw_item})
-                made.append(observation)
-            await conn.execute(_LATEST, {"o": made[-1], "p": posting})
-        return MadeJob(job, posting, tuple(made))
+        return await insert_job(
+            engine,
+            native_id=native_id,
+            source_id=source_id,
+            instance_key=instance_key,
+            observations=observations,
+            title=title,
+            company=company,
+            availability=availability,
+        )
 
     return make
+
+
+# ---- Task 16 ----------------------------------------------------------------------------------------------
+
+
+class PostingFactory(Protocol):
+    def __call__(
+        self,
+        engine: AsyncEngine,
+        *,
+        source_id: str,
+        native_id: str,
+        availability: str,
+        last_seen_at: datetime,
+        availability_changed_at: datetime,
+        instance_key: str = "default",
+    ) -> Awaitable[int]: ...
+
+
+async def make_posting(
+    engine: AsyncEngine,
+    *,
+    source_id: str,
+    native_id: str,
+    availability: str,
+    last_seen_at: datetime,
+    availability_changed_at: datetime,
+    instance_key: str = "default",
+) -> int:
+    """The id of a posting of `(source_id, instance_key)` (the instance is created when absent) with its job
+    (the same availability) and one observation at `last_seen_at`; `availability_changed_at` is when the
+    availability last changed."""
+    made = await insert_job(
+        engine,
+        native_id=native_id,
+        source_id=source_id,
+        instance_key=instance_key,
+        observations=[(last_seen_at, None)],
+        availability=availability,
+        availability_changed_at=availability_changed_at,
+        create_instance=True,
+    )
+    return made.posting_id
+
+
+@pytest.fixture
+def posting_factory() -> PostingFactory:
+    """`await posting_factory(engine, source_id=…, native_id=…, availability=…, last_seen_at=…,
+    availability_changed_at=…)`: a posting with its job and one observation; returns the posting id."""
+    return make_posting
+
+
+BOARD_SLUG: Final = "acme-board"
+_BOARD_COUNT: Final = q("UPDATE source_instances SET last_snapshot_active_count = :n WHERE id = :i")
+
+
+@dataclass(frozen=True)
+class Board:
+    """A watchlist board of the fixtures: its source instance and its postings by native id."""
+
+    instance_id: int
+    postings: Mapping[str, int]
+
+
+async def make_board(engine: AsyncEngine, native_ids: Sequence[str]) -> Board:
+    """The Greenhouse board `BOARD_SLUG` (its fixture route answers `greenhouse_404`; enabled by
+    `seed_inputs(…, enabled=("ats",))`), with one `active` posting and job per native id, sighted a day ago,
+    and `last_snapshot_active_count` = the number of postings."""
+    await seed_inputs(engine, companies=(("greenhouse", BOARD_SLUG),), enabled=("ats",))
+    sighted = utcnow() - timedelta(days=1)
+    postings = {
+        native_id: await make_posting(
+            engine,
+            source_id="greenhouse",
+            instance_key=BOARD_SLUG,
+            native_id=native_id,
+            availability="active",
+            last_seen_at=sighted,
+            availability_changed_at=sighted,
+        )
+        for native_id in native_ids
+    }
+    async with engine.begin() as conn:
+        instance = await instance_id(conn, "greenhouse", BOARD_SLUG)
+        await conn.execute(_BOARD_COUNT, {"n": len(postings), "i": instance})
+    return Board(instance, MappingProxyType(postings))
+
+
+@pytest.fixture
+async def board(engine: AsyncEngine, current_epoch: int) -> Board:
+    """`BOARD_SLUG` with the 3 active postings `a`, `b` and `c`."""
+    return await make_board(engine, ("a", "b", "c"))
+
+
+@pytest.fixture
+async def board20(engine: AsyncEngine, current_epoch: int) -> Board:
+    """`BOARD_SLUG` with the 20 active postings `p01` to `p20`."""
+    return await make_board(engine, tuple(f"p{n:02d}" for n in range(1, 21)))
 
 
 def seed_inputs_sync(server: PgServer, **inputs: Any) -> None:
