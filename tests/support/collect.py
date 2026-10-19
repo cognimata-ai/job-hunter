@@ -52,12 +52,12 @@ import httpx
 import procrastinate
 import pytest
 from jobhunter.clock import utcnow
-from jobhunter.db.seed import SOURCES
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.normalize.companies import company_key
+from jobhunter.normalize.fields import ATS_SOURCES
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.quota.windows import Provider
 from jobhunter.sources.acquire import AcquireContext
@@ -704,7 +704,6 @@ def manual_paid_run(server: PgServer, *, only: str) -> int:
 
 # ---- Task 17 ----------------------------------------------------------------------------------------------
 
-_ATS: Final = frozenset(source.id for source in SOURCES if source.kind == "ats")
 _PLACEHOLDER_JOB: Final = q(
     "INSERT INTO jobs (company_key, company_display, title, title_norm, seniority_tokens, location_kind, "
     "work_mode_possible, work_mode_source, employment_source, ad_language, completeness, posted_precision, "
@@ -742,7 +741,7 @@ class JobPostings:
 async def _posting_instance(conn: AsyncConnection, source_id: str, watchlist_display: str | None) -> int:
     """The `default` instance of `source_id` (created when absent), or, for an ATS source with a
     `watchlist_display`, the board instance of a new watchlist company of that display name."""
-    if watchlist_display is None or source_id not in _ATS:
+    if watchlist_display is None or source_id not in ATS_SOURCES:
         await conn.execute(_ENSURE_INSTANCE, {"s": source_id, "k": "default"})
         return await instance_id(conn, source_id)
     company = {

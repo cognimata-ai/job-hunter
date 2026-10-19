@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -33,9 +33,9 @@ OCCURRENCES = sa.text(
     "ORDER BY became_current_at"
 )
 GENERATION = sa.text("SELECT generation FROM ranking_state WHERE id = 1")
-ALERT = sa.text(
+ALERTS = sa.text(
     "SELECT severity, occurrences, resolved_at FROM alerts WHERE code = 'dedup.field_conflict' "
-    "AND dedup_key = :key"
+    "AND dedup_key = :key ORDER BY id"
 )
 LLM_INPUT_FIELDS = (
     "ad_language",
@@ -49,18 +49,16 @@ LLM_INPUT_FIELDS = (
     "work_mode_possible",
     "work_mode_source",
 )
-# A caller clock far from the database's: nothing `recompute_job` writes may come from it (carry 3).
-CALLER_NOW = datetime(2001, 1, 1, tzinfo=UTC)
 
 
 async def recompute_in(
     conn: AsyncConnection, job_id: int, *, fenced: frozenset[str] = frozenset()
 ) -> RecomputeResult:
-    """`recompute_job` as its callers run it: the job row `FOR UPDATE` first, the ranking bumped last when the
-    job changed (§7.1)."""
+    """`recompute_job` as its callers run it: the job row `FOR UPDATE` first, the ranking bumped last when a
+    column the list reads changed (§7.1)."""
     await conn.execute(LOCK_JOB, {"job": job_id})
-    result = await revisions.recompute_job(conn, job_id, now=CALLER_NOW, fenced_source_ids=fenced)
-    if result.current_changed or result.det_facts_changed:
+    result = await revisions.recompute_job(conn, job_id, fenced_source_ids=fenced)
+    if result.list_changed:
         await ranking.bump(conn)
     return result
 
@@ -298,24 +296,106 @@ async def test_the_det_facts_round_trip_through_the_jobs_columns(  # carry 2
     assert bytes((await job_row(engine, made.job_id)).det_facts_hash) == bytes(row.det_facts_hash)
 
 
-async def test_a_work_mode_conflict_raises_an_info_alert(
+async def test_the_work_mode_conflict_alert_follows_the_conflict(
     engine: AsyncEngine, current_epoch: int, job_with_postings: JobWithPostings
 ) -> None:
-    made = await job_with_postings(
-        {
-            "lever": {"work_mode_possible": frozenset({"remote"}), "work_mode_source": "structured"},
-            "ashby": {"work_mode_possible": frozenset({"onsite"}), "work_mode_source": "structured"},
-        }
-    )
+    def structured(*modes: str) -> dict[str, Any]:
+        return {"work_mode_possible": frozenset(modes), "work_mode_source": "structured"}
+
+    made = await job_with_postings({"lever": structured("remote"), "ashby": structured("onsite")})
     result = await recompute(engine, made.job_id)
     assert result.conflicts == ("work_mode_possible",)
     assert (await job_row(engine, made.job_id)).work_mode_possible == ["remote"]  # the lowest posting id
     key = f"dedup.field_conflict:job:{made.job_id}:work_mode_possible"
-    [alert] = await fetch(engine, ALERT, key=key)
+    [alert] = await fetch(engine, ALERTS, key=key)
     assert (alert.severity, alert.occurrences, alert.resolved_at) == ("info", 1, None)
-    await recompute(engine, made.job_id)
-    [alert] = await fetch(engine, ALERT, key=key)
-    assert alert.occurrences == 2
+    # the same conflict again adds no occurrence
+    assert (await recompute(engine, made.job_id)).conflicts == ("work_mode_possible",)
+    [alert] = await fetch(engine, ALERTS, key=key)
+    assert (alert.occurrences, alert.resolved_at) == (1, None)
+    # the conflict disappears: the alert is resolved
+    async with engine.begin() as conn:
+        await add_observation(
+            conn, made.postings["ashby"], observed_at=utcnow(), **structured("remote", "onsite")
+        )
+    assert (await recompute(engine, made.job_id)).conflicts == ()
+    [alert] = await fetch(engine, ALERTS, key=key)
+    assert alert.resolved_at is not None
+    # it comes back: a new alert
+    async with engine.begin() as conn:
+        await add_observation(conn, made.postings["ashby"], observed_at=utcnow(), **structured("onsite"))
+    assert (await recompute(engine, made.job_id)).conflicts == ("work_mode_possible",)
+    resolved, reopened = await fetch(engine, ALERTS, key=key)
+    assert resolved.resolved_at is not None and (reopened.occurrences, reopened.resolved_at) == (1, None)
+
+
+async def test_a_recompute_after_only_observed_at_moved_creates_nothing(
+    engine: AsyncEngine, current_epoch: int, job_with_postings: JobWithPostings
+) -> None:
+    hamburg = {"locations": [HAMBURG], "location_kind": "city"}
+    berlin = {"locations": [BERLIN], "location_kind": "city"}
+    made = await job_with_postings({"greenhouse": hamburg, "lever": berlin})
+    first = await recompute(engine, made.job_id)
+    for source, content in (("lever", berlin), ("greenhouse", hamburg)):  # the same content, seen again later
+        async with engine.begin() as conn:
+            await add_observation(conn, made.postings[source], observed_at=utcnow(), **content)
+        moved = await recompute(engine, made.job_id)
+        assert (moved.revision_created, moved.current_changed, moved.revision_id) == (
+            False,
+            False,
+            first.revision_id,
+        )
+        assert (moved.det_facts_changed, moved.list_changed) == (False, False)
+    assert len(await fetch(engine, REVISIONS, job=made.job_id)) == 1
+    assert len(await fetch(engine, OCCURRENCES, job=made.job_id)) == 1
+    assert [location["label"] for location in (await job_row(engine, made.job_id)).locations] == [
+        "Berlin",
+        "Hamburg",
+    ]
+
+
+async def test_list_changed_names_a_change_of_a_column_the_list_reads(
+    engine: AsyncEngine, current_epoch: int, job_with_postings: JobWithPostings
+) -> None:
+    made = await job_with_postings({"jsearch": {}})
+    assert (await recompute(engine, made.job_id)).list_changed
+    assert not (await recompute(engine, made.job_id)).list_changed  # nothing changed
+    # the same ad on Arbeitnow (ranked below JSearch): only `source_ids` changes
+    async with engine.begin() as conn:
+        await add_posting(conn, made.job_id, "arbeitnow", observed_at=utcnow())
+    only_sources = await recompute(engine, made.job_id)
+    assert (only_sources.list_changed, only_sources.current_changed, only_sources.det_facts_changed) == (
+        True,
+        False,
+        False,
+    )
+    assert (await job_row(engine, made.job_id)).source_ids == ["arbeitnow", "jsearch"]
+
+
+async def test_the_watchlist_name_is_credited_to_its_board(
+    engine: AsyncEngine, current_epoch: int, job_with_postings: JobWithPostings
+) -> None:
+    made = await job_with_postings({"greenhouse": {"company_raw": "Acme Group"}})  # on no watchlist board
+    async with engine.begin() as conn:
+        board_posting, board_observation = await add_posting(
+            conn,
+            made.job_id,
+            "lever",
+            observed_at=utcnow() - timedelta(hours=2),
+            watchlist_display="Acme Software GmbH",
+        )
+    result = await recompute(engine, made.job_id)
+    company = (await job_row(engine, made.job_id)).field_provenance["company_display"]
+    assert (company["posting_id"], company["observation_id"], company["rule"]) == (
+        board_posting,
+        board_observation,
+        "watchlist_display_name",
+    )
+    assert (await job_row(engine, made.job_id)).company_display == "Acme Software GmbH"
+    lineage = await fetch(engine, LINEAGE, revision=result.revision_id)
+    assert [(r.source_id, r.posting_id) for r in lineage if r.field == "company_display"] == [
+        ("lever", board_posting)
+    ]
 
 
 async def test_the_postings_of_a_job_merged_into_it_count(
@@ -343,7 +423,7 @@ async def test_the_timestamps_are_the_database_clock(  # carry 3
         await recompute_in(conn, made.job_id)
     assert (await job_row(engine, made.job_id)).updated_at == db_now
     [occurrence] = await fetch(engine, OCCURRENCES, job=made.job_id)
-    assert occurrence.became_current_at == db_now != CALLER_NOW
+    assert occurrence.became_current_at == db_now
 
 
 async def test_two_current_changes_in_one_transaction_record_the_last(
@@ -370,7 +450,7 @@ async def test_recompute_refuses_a_job_without_an_observation(
             await recompute_in(conn, made.job_id, fenced=frozenset({"adzuna"}))
     async with engine.connect() as conn:
         with pytest.raises(LookupError, match="does not exist"):
-            await revisions.recompute_job(conn, made.job_id + 1000, now=CALLER_NOW)
+            await revisions.recompute_job(conn, made.job_id + 1000)
 
 
 async def test_the_ranking_bump_counts_once_and_needs_its_row(engine: AsyncEngine) -> None:

@@ -4,8 +4,8 @@
 transaction of §8.6, a merge, the M5 purge); it takes the lock again, a no-op then. It reads the latest
 observation of every posting of the job and of the jobs merged into it (`merged_into_job_id`, transitively),
 leaving out the observations of `fenced_source_ids`, and makes the §8.8 selection (`fields.select_canonical`,
-with the job's `first_seen_at` and the watchlist display name of the best-ranked board instance among them).
-Then:
+with the job's `first_seen_at` and, when a posting came from a watchlist board, that company's display name
+with the best-ranked such observation). Then:
 
 1. **The revision.** The job's revision with the selection's `material_hash` is reused (`UNIQUE (job_id,
    material_hash)`), unless its lineage (`job_revision_sources`) names a fenced source. Such a tainted
@@ -16,20 +16,25 @@ Then:
    job's revisions, `embedding_status = 'awaiting_embedding'`) with its lineage: one row per `llm_input`
    field and source (`fields.CanonicalFields.contributors`), naming the posting and the observation.
 2. **The job row**, in one statement: every selected column (with `structured_seniority`, Task 16 ruling
-   T16-a), `field_provenance`, `det_facts_hash`, `current_revision_id`, and `updated_at = now()`.
+   T16-a), `field_provenance`, `det_facts_hash`, `current_revision_id`, and `updated_at = now()`. The same
+   statement compares the `LIST_COLUMNS` before and after (`list_changed`).
 3. **An occurrence** when the current revision changed: a `job_revision_occurrences` row at `now()`. Two
    changes of one job in one transaction share that time, and the row records the last.
-4. **A `dedup.field_conflict` alert** (info) per conflicting field, subject `job:<id>:<field>`.
+4. **`dedup.field_conflict`** (info, subject `job:<id>:<field>`) follows the conflict: it is raised when a
+   field conflicts and did not in the job's previous selection, and resolved when the conflict is gone. The
+   previous selection's conflicts are read from the stored `field_provenance` (rule `fields.CONFLICT_RULE`):
+   `raise_alert` counts an occurrence on every call, so an unchanged conflict must not call it, and the job
+   row already says whether the conflict is new, with no query of `alerts`. An alert resolved by hand while
+   the conflict persists is raised again only after the conflict has gone and come back.
 
 Every timestamp written is the database's `now()`, the clock of `runs.started_at` that node 8 and the
-grouping pass compare with (carry 3); the `now` parameter is accepted for the interface and not read. The
-ranking generation is the caller's to bump: `ranking.bump` is the last statement of its transaction (§7.1),
+grouping pass compare with (carry 3; Task 17 ruling T17-a dropped the caller clock). The ranking generation is
+the caller's to bump, when `list_changed`: `ranking.bump` is the last statement of its transaction (§7.1),
 after the hard filters it writes for the job.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Final
 
 from sqlalchemy.engine import Row
@@ -37,15 +42,53 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.errors import InvariantViolation
-from jobhunter.normalize.fields import CanonicalFields, ObservationView, precedence_key, select_canonical
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.normalize.fields import (
+    CONFLICT_FIELDS,
+    CONFLICT_RULE,
+    CanonicalFields,
+    ObservationView,
+    WatchlistDisplay,
+    precedence_key,
+    select_canonical,
+)
+from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.sources.base import NormalizedPosting
+from jobhunter.types import JSONValue
 
 FIELD_CONFLICT_ALERT: Final = "dedup.field_conflict"
+# The `jobs` columns this recompute writes that the Jobs list filters, sorts, searches or shows (§7.1: "a
+# change of any job field that a filter or sort reads"): every canonical column, `source_ids`,
+# `posted_at_effective` and `current_revision_id` (the list searches and scores the current revision). Not
+# `field_provenance` (shown only in the drawer's provenance tab), `det_facts_hash` (a hash of columns listed
+# here) or `updated_at`.
+LIST_COLUMNS: Final = (
+    "company_key",
+    "company_display",
+    "title",
+    "title_norm",
+    "seniority_tokens",
+    "structured_seniority",
+    "locations",
+    "location_kind",
+    "work_mode_possible",
+    "work_mode_source",
+    "remote_countries",
+    "employment_types",
+    "employment_source",
+    "salary",
+    "industry_structured",
+    "ad_language",
+    "completeness",
+    "posted_at_effective",
+    "posted_precision",
+    "source_ids",
+    "current_revision_id",
+)
 
 _JOB: Final = q(
-    "SELECT first_seen_at, current_revision_id, det_facts_hash FROM jobs WHERE id = :job FOR UPDATE"
+    "SELECT first_seen_at, current_revision_id, det_facts_hash, field_provenance FROM jobs "
+    "WHERE id = :job FOR UPDATE"
 )
 # The latest observation of each posting of the job and of every job merged into it, by posting id; a fenced
 # source's are left out.
@@ -78,8 +121,11 @@ _INSERT_LINEAGE: Final = q(
     "FROM unnest(CAST(:fields AS text[]), CAST(:sources AS text[]), CAST(:postings AS bigint[]), "
     "CAST(:observations AS bigint[])) AS l(field, source_id, posting_id, observation_id)"
 )
+# `old` is the row before the update (the statement's snapshot), `j` the row after it: the RETURNING compares
+# the list columns of both. The column lists are constants of this module, never input.
 _UPDATE_JOB: Final = q(
-    "UPDATE jobs SET company_key = :company_key, company_display = :company_display, title = :title, "
+    f"WITH old AS (SELECT {', '.join(LIST_COLUMNS)} FROM jobs WHERE id = :job) "  # noqa: S608
+    "UPDATE jobs AS j SET company_key = :company_key, company_display = :company_display, title = :title, "
     "title_norm = :title_norm, seniority_tokens = CAST(:seniority_tokens AS text[]), "
     "structured_seniority = :structured_seniority, locations = :locations, location_kind = :location_kind, "
     "work_mode_possible = CAST(:work_mode_possible AS text[]), work_mode_source = :work_mode_source, "
@@ -90,7 +136,9 @@ _UPDATE_JOB: Final = q(
     "posted_at_effective = :posted_at_effective, posted_precision = :posted_precision, "
     "source_ids = CAST(:source_ids AS text[]), field_provenance = :field_provenance, "
     "det_facts_hash = :det_facts_hash, current_revision_id = :current_revision_id, updated_at = now() "
-    "WHERE id = :job",
+    "FROM old WHERE j.id = :job "
+    f"RETURNING ROW({', '.join(f'old.{column}' for column in LIST_COLUMNS)}) IS DISTINCT FROM "
+    f"ROW({', '.join(f'j.{column}' for column in LIST_COLUMNS)}) AS list_changed",
     jsonb=["locations", "salary", "field_provenance"],
 )
 _OCCURRENCE: Final = q(
@@ -109,6 +157,7 @@ class RecomputeResult:
     revision_created: bool
     current_changed: bool
     det_facts_changed: bool
+    list_changed: bool  # a `LIST_COLUMNS` value changed: the caller bumps the ranking generation
     tainted_reuse_refused: bool
     conflicts: tuple[str, ...]
 
@@ -126,10 +175,25 @@ def _view(row: Row[tuple[object, ...]]) -> ObservationView:
     )
 
 
-def _watchlist_display(views: Sequence[ObservationView], names: dict[int, str]) -> str | None:
-    """The watchlist display name of the best-ranked observation from a watchlist board, by posting id."""
+def _watchlist_display(views: Sequence[ObservationView], names: Mapping[int, str]) -> WatchlistDisplay | None:
+    """The watchlist display name, by posting id, of the best-ranked observation from a watchlist board, with
+    that observation."""
     boards = [view for view in views if view.posting_id in names]
-    return names[min(boards, key=precedence_key).posting_id] if boards else None
+    if not boards:
+        return None
+    board = min(boards, key=precedence_key)
+    return WatchlistDisplay(names[board.posting_id], board)
+
+
+def _previous_conflicts(provenance: JSONValue) -> frozenset[str]:
+    """The fields that conflicted in the selection the stored `field_provenance` records."""
+    if not isinstance(provenance, dict):
+        return frozenset()
+    return frozenset(
+        field
+        for field in CONFLICT_FIELDS
+        if isinstance(entry := provenance.get(field), dict) and entry.get("rule") == CONFLICT_RULE
+    )
 
 
 def _lineage(fields: CanonicalFields, source_of: dict[int, str]) -> dict[str, list[object]]:
@@ -194,8 +258,27 @@ def _job_params(job_id: int, fields: CanonicalFields, current_revision_id: int) 
     }
 
 
+async def _follow_conflicts(
+    conn: AsyncConnection, job_id: int, previous: frozenset[str], current: tuple[str, ...]
+) -> None:
+    """Raise `dedup.field_conflict` for each new conflict and resolve it for each conflict that is gone."""
+    for field in sorted(set(current) - previous):
+        log.info(FIELD_CONFLICT_ALERT, job_id=job_id, field=field)
+        await raise_alert(
+            conn,
+            code=FIELD_CONFLICT_ALERT,
+            severity="info",
+            subject=f"job:{job_id}:{field}",
+            message="the structured values of the job's postings disagree",
+            context={"job_id": job_id, "field": field},
+        )
+    for field in sorted(previous - set(current)):
+        log.info("field_conflict_resolved", job_id=job_id, field=field)
+        await resolve_alert(conn, code=FIELD_CONFLICT_ALERT, subject=f"job:{job_id}:{field}")
+
+
 async def recompute_job(
-    conn: AsyncConnection, job_id: int, *, now: datetime, fenced_source_ids: frozenset[str] = frozenset()
+    conn: AsyncConnection, job_id: int, *, fenced_source_ids: frozenset[str] = frozenset()
 ) -> RecomputeResult:
     """Recompute the job's canonical fields and reuse or create its current revision (module docstring).
 
@@ -235,26 +318,19 @@ async def recompute_job(
         current, refused = previous, True
         log.warning("tainted_revision_reuse_refused", job_id=job_id, revision_id=int(match.id), fenced=fenced)
 
-    await conn.execute(_UPDATE_JOB, _job_params(job_id, fields, current))
+    updated = await conn.execute(_UPDATE_JOB, _job_params(job_id, fields, current))
+    list_changed = bool(updated.scalar_one())
     changed = current != previous
     if changed:
         await conn.execute(_OCCURRENCE, {"job": job_id, "revision": current})
-    for field in fields.conflicts:
-        log.info(FIELD_CONFLICT_ALERT, job_id=job_id, field=field)
-        await raise_alert(
-            conn,
-            code=FIELD_CONFLICT_ALERT,
-            severity="info",
-            subject=f"job:{job_id}:{field}",
-            message="the structured values of the job's postings disagree",
-            context={"job_id": job_id, "field": field},
-        )
+    await _follow_conflicts(conn, job_id, _previous_conflicts(job.field_provenance), fields.conflicts)
     return RecomputeResult(
         job_id=job_id,
         revision_id=current,
         revision_created=created,
         current_changed=changed,
         det_facts_changed=bytes(job.det_facts_hash) != fields.det_facts_hash,
+        list_changed=list_changed,
         tainted_reuse_refused=refused,
         conflicts=fields.conflicts,
     )

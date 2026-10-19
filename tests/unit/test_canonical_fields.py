@@ -2,7 +2,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from jobhunter.db.seed import content_hash
-from jobhunter.normalize.fields import SOURCE_RANK, ObservationView, select_canonical
+from jobhunter.normalize.fields import (
+    SOURCE_RANK,
+    CanonicalFields,
+    ObservationView,
+    WatchlistDisplay,
+    select_canonical,
+)
 from jobhunter.scoring.filters import det_facts_hash
 
 from tests.support.facts import AMBIGUOUS_WITH_ONE_DE_CANDIDATE, BERLIN, HAMBURG, LONDON
@@ -43,7 +49,7 @@ def test_description_and_title_precedence() -> None:
         description_text="ats text " * 100,
         title_raw="Senior Engineer - Berlin",
     )
-    f = select_canonical([adz, js, gh], first_seen_at=T, watchlist_display="Acme GmbH")
+    f = select_canonical([adz, js, gh], first_seen_at=T, watchlist_display=WatchlistDisplay("Acme GmbH", gh))
     assert (
         f.description_text.startswith("ats text")
         and f.description_completeness == "full"
@@ -223,12 +229,26 @@ def test_company_display_watchlist_then_ats_then_the_most_frequent_raw_form() ->
     gh = obs("greenhouse", 4, T - timedelta(days=1), company_raw="Acme Group")
     g = select_canonical([js, sp, an, gh], first_seen_at=T, watchlist_display=None)
     assert (g.company_display, g.company_key) == ("Acme Group", "acme group")
-    w = select_canonical([js, gh], first_seen_at=T, watchlist_display="Acme Software GmbH")
+    w = select_canonical(
+        [js, gh], first_seen_at=T, watchlist_display=WatchlistDisplay("Acme Software GmbH", gh)
+    )
     assert (w.company_display, w.company_key) == ("Acme Software GmbH", "acme software")
     assert (w.field_provenance["company_display"].posting_id, w.field_provenance["company_display"].rule) == (
         4,
         "watchlist_display_name",
     )
+
+
+def test_the_watchlist_name_is_credited_to_the_observation_that_supplied_it() -> None:
+    newer = obs("greenhouse", 1, T, company_raw="Acme Group")  # the best-ranked one, on no watchlist board
+    board = obs("lever", 2, T - timedelta(days=1), company_raw="Acme")
+    f = select_canonical(
+        [newer, board], first_seen_at=T, watchlist_display=WatchlistDisplay("Acme Software GmbH", board)
+    )
+    assert f.company_display == "Acme Software GmbH"
+    assert f.field_provenance["company_display"].posting_id == 2 == f.lineage["company_display"].posting_id
+    with pytest.raises(ValueError, match="not one of the observations"):
+        select_canonical([newer], first_seen_at=T, watchlist_display=WatchlistDisplay("Acme", board))
 
 
 def test_locations_are_the_ats_union_or_the_best_ranked_parsed_ones() -> None:
@@ -258,6 +278,21 @@ def test_locations_are_the_ats_union_or_the_best_ranked_parsed_ones() -> None:
         "unknown",
         "none",
     )
+
+
+def test_the_location_union_does_not_depend_on_recency() -> None:
+    lever_berlin = BERLIN.model_copy(update={"source": "lever"})  # the same place as another board states it
+
+    def union(gh_at: datetime, lv_at: datetime) -> CanonicalFields:
+        gh = obs("greenhouse", 1, gh_at, locations=[HAMBURG, BERLIN], location_kind="multi")
+        lv = obs("lever", 2, lv_at, locations=[lever_berlin], location_kind="city")
+        return select_canonical([gh, lv], first_seen_at=T, watchlist_display=None)
+
+    before, after = union(T, T - timedelta(hours=1)), union(T - timedelta(hours=1), T)
+    for f in (before, after):
+        assert f.locations == (BERLIN, HAMBURG)  # by folded label; a repeated place from the lowest posting
+        assert f.llm_input["locations"] == ["Berlin", "Hamburg"]
+    assert before.material_hash == after.material_hash and before.det_facts_hash == after.det_facts_hash
 
 
 def test_work_mode_text_derived_without_a_structured_source() -> None:

@@ -5,8 +5,9 @@
 their hash, and the material projection (`llm_input`) with its hash and lineage. "First wins" orders the
 candidates of a field by the row's criteria, then by **source rank** (`SOURCE_RANK`, the seeded
 `sources.precedence_rank`: the ATS boards 1, JSearch and SerpApi 2, Arbeitnow 3, Adzuna 4) where the row names
-it, and ties go to the most recent `observed_at`, then the lowest posting id (`precedence_key`). The rows, as
-read here:
+it, and ties go to the most recent `observed_at`, then the lowest posting id (`precedence_key`). Recency only
+breaks the ties of a single-valued choice: a union or an intersection depends on content alone, so a posting
+seen again with the same content changes no value and no hash. The rows, as read here:
 
 - `description_text`: a `garbage` description only when nothing else exists (§8.9), then `full` before
   `partial` (a partial never overwrites a full), `ok` before `short`, then source rank. A garbage-only job is
@@ -14,18 +15,19 @@ read here:
   `description_quality` says `garbage`.
 - `title`: source rank; its `title` is the display form of `normalize_title`, which also gives `title_norm`
   and `seniority_tokens`.
-- `company_display`: the watchlist `display_name` (credited to the best-ranked observation, an ATS one
-  whenever the job has one), else the best ATS observation's company, else the most frequent raw form (by
+- `company_display`: the watchlist `display_name` (`WatchlistDisplay`, credited to the observation from the
+  board that supplied it), else the best ATS observation's company, else the most frequent raw form (by
   `norm_text`; equally frequent forms by their most recent observation, then the lowest posting id).
   `company_key` is `company_key(company_display)`.
-- `locations`: the union of the ATS observations' locations (in precedence order; a location repeated by
-  another board, same folded label and candidates, counts once); without any, the best-ranked observation's
-  parsed locations as they are, every candidate kept. `location_kind` is `multi` for two locations or more,
-  `country_wide` or `city` for one (as its observation says), and for none the best-ranked `remote` or
-  `country_wide` marker, else `unknown`.
+- `locations`: the union of the ATS observations' locations, ordered by content (folded label, then the
+  candidates' gazetteer ids); a place that several boards state (same folded label and candidates) is taken
+  from the board first by source rank and lowest posting id, never by recency. Without an ATS location, the
+  best-ranked observation's parsed locations as they are, every candidate kept. `location_kind` is `multi`
+  for two locations or more, `country_wide` or `city` for one (as its observation says), and for none the
+  best-ranked `remote` or `country_wide` marker, else `unknown`.
 - `work_mode_possible`: the intersection of the structured observations' values; an empty intersection is a
-  conflict (`conflicts`) that keeps the best-ranked one. Without a structured value, the best-ranked
-  text-derived one; otherwise all three modes, source `none`.
+  conflict (`conflicts`, provenance rule `CONFLICT_RULE`) that keeps the best-ranked one. Without a
+  structured value, the best-ranked text-derived one; otherwise all three modes, source `none`.
 - `remote_countries`: the union of all values (only structured ISO codes are ever parsed).
 - `employment_types`: the best observation by employment source (`structured` before `text`), then source
   rank: an ATS or JSearch structured value before Adzuna's `contract_time`/`contract_type` (structured, rank
@@ -71,8 +73,12 @@ from jobhunter.sources.parsing.salary import Salary
 from jobhunter.types import JSONValue
 
 SOURCE_RANK: Final[Mapping[str, int]] = MappingProxyType({s.id: s.precedence_rank for s in seed.SOURCES})
-_ATS: Final = frozenset(s.id for s in seed.SOURCES if s.kind == "ats")
-ALL_WORK_MODES: Final = frozenset({"remote", "hybrid", "onsite"})
+ATS_SOURCES: Final = frozenset(s.id for s in seed.SOURCES if s.kind == "ats")
+# The rule of a structured work-mode conflict in `field_provenance`: a job's stored provenance tells whether
+# its last selection had the conflict (`revisions` raises and resolves `dedup.field_conflict` by it).
+CONFLICT_RULE: Final = "structured_conflict"
+CONFLICT_FIELDS: Final = ("work_mode_possible",)  # the fields whose structured values can conflict
+_ALL_WORK_MODES: Final = frozenset({"remote", "hybrid", "onsite"})
 
 _QUALITY_ORDER: Final = {"ok": 0, "short": 1, "garbage": 2}
 _EMPLOYMENT_ORDER: Final = {"structured": 0, "text": 1}
@@ -98,6 +104,14 @@ class ObservationView:
     normalized: NormalizedPosting
     completeness: str  # posting_observations.completeness
     quality: str  # posting_observations.quality
+
+
+@dataclass(frozen=True)
+class WatchlistDisplay:
+    """The `display_name` of the watchlist company whose board supplied `observation`, one of the job's."""
+
+    display_name: str
+    observation: ObservationView
 
 
 @dataclass(frozen=True)
@@ -174,12 +188,13 @@ def _description_key(view: ObservationView) -> tuple[object, ...]:
 
 
 def _company(
-    views: Sequence[ObservationView], best: ObservationView, watchlist_display: str | None
+    views: Sequence[ObservationView], best: ObservationView, watchlist_display: WatchlistDisplay | None
 ) -> tuple[str, Provenance]:
-    if watchlist_display is not None:  # credited to `best`: an ATS observation whenever the job has one
-        return watchlist_display, _provenance(best, "watchlist_display_name")
+    if watchlist_display is not None:
+        supplier = watchlist_display.observation
+        return watchlist_display.display_name, _provenance(supplier, "watchlist_display_name")
     named = [view for view in views if norm_text(view.normalized.company_raw)]
-    if ats_named := [view for view in named if view.source_id in _ATS]:
+    if ats_named := [view for view in named if view.source_id in ATS_SOURCES]:
         supplier = min(ats_named, key=precedence_key)
         return norm_text(supplier.normalized.company_raw), _provenance(supplier, "ats")
     if not named:
@@ -199,17 +214,26 @@ def _one_location_kind(supplier: ObservationView) -> str:
     return "country_wide" if supplier.normalized.location_kind == "country_wide" else "city"
 
 
+def _union_key(view: ObservationView) -> tuple[int, int, int]:
+    """Source rank, then the lowest posting id: the order of the boards of a union. Never recency: a union is
+    no single-valued choice, and a board seen again with the same content must not change it."""
+    return SOURCE_RANK[view.source_id], view.posting_id, view.observation_id
+
+
 def _locations(
     views: Sequence[ObservationView], best: ObservationView
 ) -> tuple[tuple[Location, ...], str, tuple[Provenance, ...]]:
-    boards = sorted((v for v in views if v.source_id in _ATS and v.normalized.locations), key=precedence_key)
+    boards = sorted(
+        (v for v in views if v.source_id in ATS_SOURCES and v.normalized.locations), key=_union_key
+    )
     if boards:
-        union: dict[tuple[str, tuple[str, ...]], Location] = {}
-        for view in boards:
+        union: dict[tuple[str, tuple[str, ...]], tuple[Location, ObservationView]] = {}
+        for view in boards:  # a place several boards state comes from the first board by `_union_key`
             for location in view.normalized.locations:
-                union.setdefault(_location_identity(location), location)
-        locations = tuple(union.values())
-        kind = "multi" if len(locations) >= 2 else _one_location_kind(boards[0])
+                union.setdefault(_location_identity(location), (location, view))
+        ordered = [union[identity] for identity in sorted(union)]  # by content: folded label, candidates
+        locations = tuple(location for location, _ in ordered)
+        kind = "multi" if len(locations) >= 2 else _one_location_kind(ordered[0][1])
         return locations, kind, tuple(_provenance(view, "ats_union") for view in boards)
     if parsed := [view for view in views if view.normalized.locations]:
         supplier = min(parsed, key=precedence_key)
@@ -242,13 +266,13 @@ def _work_modes(
         return (
             kept.normalized.work_mode_possible,
             "structured",
-            (_provenance(kept, "structured_conflict"),),
+            (_provenance(kept, CONFLICT_RULE),),
             True,
         )
     if text := [view for view in views if view.normalized.work_mode_source == "text"]:
         supplier = min(text, key=precedence_key)
         return supplier.normalized.work_mode_possible, "text", (_provenance(supplier, "text"),), False
-    return ALL_WORK_MODES, "none", (_provenance(best, "none"),), False
+    return _ALL_WORK_MODES, "none", (_provenance(best, "none"),), False
 
 
 def _employment(
@@ -333,7 +357,7 @@ def _industry_of(view: ObservationView) -> tuple[int, str] | None:
     any other source 2) and the value; `None` when it has none."""
     structured = view.normalized.source_structured
     if (industry := _text(structured, "industry")) is not None and fold(industry) != "unknown":
-        return (0 if view.source_id in _ATS else 2), industry
+        return (0 if view.source_id in ATS_SOURCES else 2), industry
     if view.source_id == "personio" and (occupation := _text(structured, "occupationCategory")) is not None:
         return 1, occupation
     return None
@@ -360,16 +384,26 @@ def _seniority(views: Sequence[ObservationView], best: ObservationView) -> tuple
 
 
 def select_canonical(
-    observations: Sequence[ObservationView], *, first_seen_at: datetime, watchlist_display: str | None
+    observations: Sequence[ObservationView],
+    *,
+    first_seen_at: datetime,
+    watchlist_display: WatchlistDisplay | None,
 ) -> CanonicalFields:
     """The §8.8 selection over the latest observation of each posting (see the module docstring).
 
     `first_seen_at` is the job's, the bound of `posted_at_effective`; `watchlist_display` is the display name
-    of the watchlist company whose board a posting came from, if any. Raises `ValueError` for no observation.
+    of the watchlist company whose board supplied one of the observations, with that observation, if any.
+    Raises `ValueError` for no observation, or for a `watchlist_display` whose observation is not one of them.
     """
     if not observations:
         raise ValueError("select_canonical needs at least one observation")
     views = tuple(observations)
+    if watchlist_display is not None and not any(
+        (view.posting_id, view.observation_id)
+        == (watchlist_display.observation.posting_id, watchlist_display.observation.observation_id)
+        for view in views
+    ):
+        raise ValueError("the watchlist display's observation is not one of the observations")
     best = min(views, key=precedence_key)
 
     described = min(views, key=_description_key)
@@ -495,5 +529,5 @@ def select_canonical(
         material_hash=content_hash(llm_input),
         lineage={field: suppliers[0] for field, suppliers in contributors.items()},
         contributors=contributors,
-        conflicts=("work_mode_possible",) if work_mode_conflict else (),
+        conflicts=CONFLICT_FIELDS if work_mode_conflict else (),
     )
