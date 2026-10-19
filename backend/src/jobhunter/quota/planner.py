@@ -33,9 +33,10 @@ that refuses every request (`_spec_adapters`): `plan` and `next_page` never send
 
 **The fallback plan** (`plan_fallback`, node 3, §6.6): for every JSearch cell of the run whose
 `fallback.cell_outcome` is eligible, one SerpApi spec `phase='fallback'` on the SerpApi cell with the same
-`(query_id, location_key)`, through `project_allowance("serpapi", …, account=…)` with the node's free account
-read (the acquisition reads the account again before every search); `quota.fallback_active` (info) when any is
-planned. It is a receipt too.
+`(query_id, location_key)`, through `project_allowance("serpapi", …, account=…)` with the `plan_fallback`
+node's free account read (the acquisition reads the account again before every search);
+`quota.fallback_active` (info) when any is planned. It is a receipt too. Only the SerpApi projection ever gets
+the account (Ruling T13-c).
 
 Every function runs in the caller's transaction, which this module opens with the owner row `FOR SHARE`
 (`ledger.lock_run_owner`); `project_allowance` reads the quota windows without a lock.
@@ -509,7 +510,8 @@ async def _plan_instance(
     settings: RunSettings,
     account: AccountObservation | None,
 ) -> None:
-    """One request per cell of the instance, in the order given (see the module docstring)."""
+    """One request per cell of the instance, in the order given (see the module docstring). `account` reaches
+    the SerpApi projection only (Ruling T13-c)."""
     provider = PROVIDERS.get(instance.source_id)
     base: RequestClass = "normal" if provider is not None else "free"
     match available(instance, rows.now):
@@ -532,7 +534,7 @@ async def _plan_instance(
             rows.now,
             settings.quota,
             interval_s=settings.interval_s,
-            account=account,
+            account=account if provider == "serpapi" else None,
         )
         for cell, verdict in zip(admitted, verdicts, strict=True):
             decisions[cell.id] = (
@@ -604,8 +606,8 @@ async def plan_run(
 ) -> PlanReport:
     """The primary plan of `owner`'s run (§9.2 node 1; see the module docstring), in the caller's transaction.
 
-    `account` is the node's SerpApi account read, which the projection applies to a SerpApi window only: the
-    primary plan has no SerpApi spec, so it changes no decision here.
+    `account` goes to a SerpApi projection only, never to JSearch's or Adzuna's (Ruling T13-c); the primary
+    plan has no SerpApi spec, so the `plan` node passes `None`.
     """
     await lock_run_owner(conn, owner)
     reused = await _reuse(conn, owner, "primary")

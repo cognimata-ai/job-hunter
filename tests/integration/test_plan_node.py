@@ -9,15 +9,18 @@ from jobhunter.clock import utcnow
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
-from jobhunter.errors import InvariantViolation
+from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.graphs.checkpointer import open_saver
+from jobhunter.graphs.collect import graph as collect_graph
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.graphs.collect.graph import build_collect_graph, is_retryable_db_error
+from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback
+from jobhunter.graphs.collect.state import CollectUpdate, FetchCellInput, initial_state
 from jobhunter.quota import ledger
 from jobhunter.quota.fallback import cell_outcome
 from jobhunter.quota.planner import PlanReport, ensure_cells, plan_fallback, plan_run
 from jobhunter.run_settings import load_run_settings
-from jobhunter.sources.base import RawPage, RequestSpec, SourceAdapter, request_key
+from jobhunter.sources.base import RawPage, RequestSpec, SourceAdapter, SourceError, request_key
 from jobhunter.sources.breaker import HALF_OPEN_AFTER, record_failure
 from jobhunter.sources.coverage import JSearchContinuation
 from jobhunter.sources.instances import InstanceRow, list_instances
@@ -538,32 +541,138 @@ GRAPH_NODES = [
 ]
 
 
-async def test_graph_runs_plan_and_pass_through_nodes_on_the_real_worker_protocol(
-    engine, current_epoch, migrated, fake_http, serpapi_fixture_adapter: SerpApiAdapter
-) -> None:
-    await seed_inputs(engine, queries=(TEST_QUERY,), companies=(("greenhouse", "getyourguide"),))
-    async with (
-        engine.begin() as c
-    ):  # JSearch is closed: its cell's skipped(breaker_open) is fallback-eligible
+BY_QUERY = sa.text(
+    "SELECT s.source_id, q.text, f.status, f.skip_reason, f.request_class FROM fetch_requests f "
+    "JOIN source_instances s ON s.id = f.source_instance_id JOIN coverage_cells c ON c.id = f.cell_id "
+    "JOIN queries q ON q.id = c.query_id WHERE f.run_id = :r ORDER BY f.id"
+)
+
+
+async def by_query(engine, run_id: int, source_id: str) -> list[tuple[str, str, str | None, str]]:
+    """The run's requests of `source_id` in insertion order: (query, status, skip reason, class)."""
+    async with engine.connect() as c:
+        rows = (await c.execute(BY_QUERY, {"r": run_id})).all()
+    return [(r.text, r.status, r.skip_reason, r.request_class) for r in rows if r.source_id == source_id]
+
+
+async def test_a_denied_projection_is_a_skip_with_its_code(engine, current_epoch) -> None:
+    """Minor 2 (a): with one token in the bucket the second spec is `paced`; a used-up window `exhausted`."""
+    await seed_inputs(engine, queries=("first query", "second query"), enabled=("jsearch",))
+    now = utcnow()
+    await insert_window(engine, jsearch_window(now, limit=200, reserve=20, tokens=1, interval_s=SIX_H))
+    owner = await queued_run(engine)
+    report = await plan_once(engine, owner, now, include_paid=True)
+    # both never attempted: the same priority, so the order is the cells' (the queries')
+    assert await by_query(engine, owner.run_id, "jsearch") == [
+        ("first query", "planned", None, "normal"),
+        ("second query", "skipped", "paced", "normal"),
+    ]
+    assert report.skipped == {"paced": 1} and len(report.primary_fetch_request_ids) == 1
+    await finish(engine, owner)
+    async with engine.begin() as c:  # a limit of 0: used + 1 > limit
+        await c.execute(
+            sa.text("UPDATE quota_windows SET limit_units = 0, reserve_units = 0 WHERE provider = 'jsearch'")
+        )
+    second = await queued_run(engine)
+    assert (await plan_once(engine, second, now, include_paid=True)).skipped == {"exhausted": 2}
+    assert {status for _, status, _, _ in await by_query(engine, second.run_id, "jsearch")} == {"skipped"}
+
+
+async def test_a_half_open_paid_instance_gets_exactly_one_spec(engine, current_epoch) -> None:
+    """Minor 2 (b): before half-open every cell is `skipped(breaker_open)`; then only the first is planned."""
+    queries = ("first query", "second query", "third query")
+    await seed_inputs(engine, queries=queries, enabled=("jsearch",))
+    now = utcnow()
+    async with engine.begin() as c:
         assert (
-            await record_failure(c, await instance_id(c, "jsearch"), "auth", billing="paid", now=utcnow())
+            await record_failure(c, await instance_id(c, "jsearch"), "auth", billing="paid", now=now)
             == "auth_failed"
         )
-        rid = (
-            await c.execute(
-                sa.text(
-                    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, "
-                    "scope_version_id) SELECT 'manual', NULL, 'queued', true, settings_version_id, "
-                    "scope_version_id FROM active_config RETURNING id"
-                )
-            )
-        ).scalar_one()
+    blocked = await queued_run(engine)
+    await plan_once(engine, blocked, now + H, include_paid=True)
+    assert [
+        (text, status, skip) for text, status, skip, _ in await by_query(engine, blocked.run_id, "jsearch")
+    ] == [(text, "skipped", "breaker_open") for text in queries]
+    await finish(engine, blocked)
+    probe = await queued_run(engine)
+    report = await plan_once(engine, probe, now + HALF_OPEN_AFTER + timedelta(minutes=1), include_paid=True)
+    assert [
+        (text, status, skip) for text, status, skip, _ in await by_query(engine, probe.run_id, "jsearch")
+    ] == [
+        ("first query", "planned", None),
+        ("second query", "skipped", "breaker_open"),
+        ("third query", "skipped", "breaker_open"),
+    ]
+    assert report.skipped == {"breaker_open": 2} and len(report.primary_fetch_request_ids) == 1
 
-    def adapters(instance: InstanceRow) -> SourceAdapter:
-        assert instance.source_id == "serpapi", "planning reads the SerpApi account only"
-        return serpapi_fixture_adapter
 
-    deps = CollectDeps(
+LEDGER_ENTRY = sa.text(
+    "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, units, "
+    "state, created_at, dispatched_at, settled_at) VALUES ('jsearch', :ws, 'request', 'normal', :key, 1, 1, "
+    "'billed', :at, :at, :at)"
+)
+ATTEMPTED = sa.text("UPDATE coverage_cells SET last_attempted_at = :at WHERE id = :c")
+
+
+async def test_plan_run_orders_paid_cells_by_priority_and_adzuna_stalest_first(engine, current_epoch) -> None:
+    """Minor 2 (c): the planned rows' insertion order is `order_paid`'s (with the exploration rule) and the
+    Adzuna rotation's."""
+    await seed_inputs(engine, queries=("qa", "qb", "qc", "qd"), enabled=("jsearch", "adzuna"))
+    now = utcnow()
+    window = jsearch_window(now - timedelta(days=1), limit=200, reserve=20, tokens=2, interval_s=SIX_H)
+    await insert_window(engine, window)
+    jsearch_seen = {"qa": now - 2 * H, "qc": now - 10 * H, "qd": now - H}  # qb never: priority qb, qc, qa, qd
+    adzuna_seen = {"qb": now - 10 * H, "qc": now - 2 * H, "qd": now - 30 * H}  # qa never: qa, qd, qb, qc
+    async with engine.begin() as c:
+        settings = await load_run_settings(c, (await c.execute(ACTIVE_VERSION)).scalar_one())
+        cells = {
+            (cell.source_id, cell.query_text): cell
+            for cell in await ensure_cells(c, settings, await list_instances(c))
+        }
+        for source, seen in (("jsearch", jsearch_seen), ("adzuna", adzuna_seen)):
+            for text, at in seen.items():
+                await c.execute(ATTEMPTED, {"at": at, "c": cells[(source, text)].id})
+        await c.execute(sa.text("UPDATE queries SET exploration = true WHERE text = 'qd'"))
+        for n in range(10):  # ten normal JSearch units and no exploration request yet
+            await c.execute(LEDGER_ENTRY, {"ws": window.window_start, "key": bytes([n]) * 32, "at": now - H})
+    first = await queued_run(engine)
+    await plan_once(engine, first, now, include_paid=True)
+    assert [text for text, *_ in await by_query(engine, first.run_id, "jsearch")] == ["qd", "qb", "qc", "qa"]
+    assert [text for text, *_ in await by_query(engine, first.run_id, "adzuna")] == ["qa", "qd", "qb", "qc"]
+    await finish(engine, first)
+    async with engine.begin() as c:  # an exploration request after those units: back to priority order
+        await c.execute(
+            sa.text("UPDATE coverage_cells SET last_exploration_at = :at WHERE id = :c"),
+            {"at": now - timedelta(minutes=30), "c": cells[("jsearch", "qd")].id},
+        )
+    second = await queued_run(engine)
+    await plan_once(engine, second, now, include_paid=True)
+    assert [text for text, *_ in await by_query(engine, second.run_id, "jsearch")] == ["qb", "qc", "qa", "qd"]
+
+
+QUEUED_RUN = sa.text(
+    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id) "
+    "SELECT 'manual', NULL, 'queued', :paid, settings_version_id, scope_version_id FROM active_config "
+    "RETURNING id"
+)
+SOURCE_OF = sa.text(
+    "SELECT s.source_id FROM fetch_requests f JOIN source_instances s ON s.id = f.source_instance_id "
+    "WHERE f.id = :i"
+)
+
+
+async def queued_run_id(engine, *, include_paid: bool) -> int:
+    """A queued manual run over the active configuration, not admitted (`execute_run` starts it)."""
+    async with engine.begin() as c:
+        return int((await c.execute(QUEUED_RUN, {"paid": include_paid})).scalar_one())
+
+
+def no_adapter(instance: InstanceRow) -> SourceAdapter:
+    raise AssertionError(f"no adapter is needed here, asked for {instance.source_id}")
+
+
+def collect_deps(engine, adapters=no_adapter) -> CollectDeps:
+    return CollectDeps(
         engine=engine,
         adapters=adapters,
         embedder=None,
@@ -573,17 +682,44 @@ async def test_graph_runs_plan_and_pass_through_nodes_on_the_real_worker_protoco
         limiter=RateLimiter(SOURCE_LIMITS.values(), clock=time.monotonic, sleep=asyncio.sleep),
         fetch_ctx=FetchContext(),
     )
+
+
+async def run_graph(engine, migrated, deps: CollectDeps, rid: int):
+    """`execute_run` of attempt 1 on the collection graph; the admission and the attempt's final state."""
     async with open_saver(migrated.dsn("app")) as saver:
         graph = build_collect_graph(saver, deps)
-        assert await runs.execute_run(engine, graph, rid, 1, epoch=1) == "started"
+        admission = await runs.execute_run(engine, graph, rid, 1, epoch=1)
         state = (await graph.aget_state({"configurable": {"thread_id": f"run-{rid}-a1"}})).values
-    rows = await requests(engine, rid)
+    return admission, state
+
+
+async def run_row(engine, rid: int):
     async with engine.connect() as c:
-        run = (await c.execute(sa.text("SELECT status, report FROM runs WHERE id = :r"), {"r": rid})).one()
-    assert tuple(run) == (
-        "succeeded",
-        {"noop": True},
-    )  # the pass-through finalize leaves the end to execute_run
+        return tuple(
+            (await c.execute(sa.text("SELECT status, report FROM runs WHERE id = :r"), {"r": rid})).one()
+        )
+
+
+async def test_graph_runs_plan_and_pass_through_nodes_on_the_real_worker_protocol(
+    engine, current_epoch, migrated, fake_http, respx_mock, serpapi_fixture_adapter: SerpApiAdapter
+) -> None:
+    await seed_inputs(engine, queries=(TEST_QUERY,), companies=(("greenhouse", "getyourguide"),))
+    async with (
+        engine.begin() as c
+    ):  # JSearch is closed: its cell's skipped(breaker_open) is fallback-eligible
+        jsearch = await instance_id(c, "jsearch")
+        assert await record_failure(c, jsearch, "auth", billing="paid", now=utcnow()) == "auth_failed"
+    rid = await queued_run_id(engine, include_paid=True)
+
+    def adapters(instance: InstanceRow) -> SourceAdapter:
+        assert instance.source_id == "serpapi", "only plan_fallback reads an account, the SerpApi one"
+        return serpapi_fixture_adapter
+
+    admission, state = await run_graph(engine, migrated, collect_deps(engine, adapters), rid)
+    assert admission == "started"
+    rows = await requests(engine, rid)
+    # the pass-through finalize leaves the end to execute_run
+    assert await run_row(engine, rid) == ("succeeded", {"noop": True})
     assert sorted((r.phase, r.source_id, r.status, r.skip_reason) for r in rows) == [
         ("fallback", "serpapi", "planned", None),
         ("primary", "adzuna", "planned", None),
@@ -598,3 +734,68 @@ async def test_graph_runs_plan_and_pass_through_nodes_on_the_real_worker_protoco
     assert (state["outcomes"], state["counters"], state["final_status"]) == ({}, {}, None)
     async with engine.connect() as c:
         assert state["settings_version_id"] == (await c.execute(ACTIVE_VERSION)).scalar_one()
+    assert respx_mock["serpapi_account"].call_count == 1  # plan_fallback's; `plan` reads none (Ruling T13-c)
+
+
+async def test_plan_fallback_reads_its_inputs_from_the_run_row(engine, current_epoch) -> None:
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "serpapi"))
+    owner = await queued_run(engine, include_paid=False)
+    # the state's settings id is still 0: the node reads the run's own version and include_paid
+    update = await make_plan_fallback(collect_deps(engine))(initial_state(owner.run_id, owner.attempt_no))
+    assert update == {
+        "fallback_fetch_request_ids": [],
+        "steps": ["plan_fallback"],
+    }  # a free run reads no account
+
+
+def failing_fetch_cell(engine, source_id: str, error: Exception):
+    """A `fetch_cell` that raises `error` for the request of `source_id` and passes through the others."""
+
+    async def fetch_cell(state: FetchCellInput) -> CollectUpdate:
+        async with engine.connect() as c:
+            if (await c.execute(SOURCE_OF, {"i": state["fetch_request_id"]})).scalar_one() == source_id:
+                raise error
+        return {"steps": ["fetch_cell"]}
+
+    return fetch_cell
+
+
+async def seed_free_inputs(engine) -> None:
+    """Three free-run cells (Adzuna, Arbeitnow, a Greenhouse board): three concurrent `fetch_cell` Sends."""
+    await seed_inputs(
+        engine,
+        queries=(TEST_QUERY,),
+        companies=(("greenhouse", "getyourguide"),),
+        enabled=("adzuna", "arbeitnow", "ats"),
+    )
+
+
+async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_goes_on(
+    engine, current_epoch, migrated, monkeypatch
+) -> None:
+    """Minor 4: the wrapper, not LangGraph's `error_handler=`, survives a failure next to other Sends."""
+    await seed_free_inputs(engine)
+    rid = await queued_run_id(engine, include_paid=False)
+    error = SourceError("transient", code="http_503", status=503)
+    monkeypatch.setattr(collect_graph, "fetch_cell", failing_fetch_cell(engine, "arbeitnow", error))
+    admission, state = await run_graph(engine, migrated, collect_deps(engine), rid)
+    (failed,) = [r.id for r in await requests(engine, rid) if r.source_id == "arbeitnow"]
+    assert admission == "started" and await run_row(engine, rid) == ("succeeded", {"noop": True})
+    assert state["outcomes"] == {
+        f"fr:{failed}": {"work_id": f"fr:{failed}", "status": "failed", "items": 0, "new_postings": 0}
+    }
+    assert state["counters"] == {"source_errors": 1}
+    assert state["steps"].count("fetch_cell") == 3 and state["steps"][-1] == "finalize"
+
+
+async def test_fenced_out_in_one_fetch_cell_send_ends_the_attempt(
+    engine, current_epoch, migrated, monkeypatch
+) -> None:
+    await seed_free_inputs(engine)
+    rid = await queued_run_id(engine, include_paid=False)
+    monkeypatch.setattr(
+        collect_graph, "fetch_cell", failing_fetch_cell(engine, "arbeitnow", FencedOut("run"))
+    )
+    admission, state = await run_graph(engine, migrated, collect_deps(engine), rid)
+    assert admission == "started" and "finalize" not in state.get("steps", [])
+    assert await run_row(engine, rid) == ("running", None)  # lost: no owner write, the next owner ends it
