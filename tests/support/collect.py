@@ -11,10 +11,16 @@ that does not wait unless given); `source_cell` the coverage cell of a source's 
 query (`TEST_QUERY`) and a location key, created when absent, and `jsearch_cell` its JSearch `remote-de`
 cell; `page1_spec` the JSearch page-1 spec of a cell (bucket `week`), its instance read from the cell row;
 `supersede` gives a run its next attempt, as a takeover does.
+
+Task 13: `DEFAULT_CELL` is every `planner.CellRow` field of a never-attempted JSearch `remote-de` cell, as a
+dict; `seed_inputs` writes the queries and the watchlist companies (with their board instances) of a test and
+a new settings version that enables them (and, with `enabled`, exactly those sources), pointed at by
+`active_config`, so a run queued afterwards plans them (plan Deviation 3).
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import Final
 
 import httpx
@@ -25,7 +31,9 @@ from jobhunter.db.transitions import transition
 from jobhunter.quota.windows import Provider
 from jobhunter.sources.acquire import AcquireContext
 from jobhunter.sources.base import REMOTE_DE, Billing, CellPlan, RequestSpec, SourceAdapter
+from jobhunter.sources.instances import instance_for_company
 from jobhunter.sources.jsearch import JSearchAdapter
+from jobhunter.types import JSONValue, get_list, get_object
 from jobhunter.worker import runs
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.runs import RunOwner
@@ -245,3 +253,111 @@ def ctx(
     return ReconcileContext(
         engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow() if now is None else now, epoch=epoch
     )
+
+
+# Every `planner.CellRow` field of a never-attempted JSearch `remote-de` cell, with the column defaults of
+# `coverage_cells` (`yield_ema` 0.5, no streaks).
+DEFAULT_CELL: Final[Mapping[str, object]] = MappingProxyType(
+    {
+        "id": 1,
+        "source_instance_id": 1,
+        "query_id": 1,
+        "location_key": REMOTE_DE,
+        "enabled": True,
+        "last_attempted_at": None,
+        "last_covered_at": None,
+        "last_success_at": None,
+        "continuation": None,
+        "yield_ema": 0.5,
+        "zero_yield_streak": 0,
+        "consecutive_incomplete": 0,
+        "last_exploration_at": None,
+        "source_id": "jsearch",
+        "instance_key": "default",
+        "query_text": TEST_QUERY,
+        "query_lang": "en",
+        "exploration": False,
+        "location_label": None,
+        "radius_km": None,
+    }
+)
+
+# The source switches of `sources.enabled` (§13.1).
+SOURCE_SWITCHES: Final = ("jsearch", "serpapi", "adzuna", "arbeitnow", "ats")
+_COMPANY: Final = q(
+    "INSERT INTO watchlist_companies (display_name, company_key, ats_type, board_slug, lever_region, "
+    "detection, validation_status, validated_at) VALUES (:slug, lower(:slug), :ats, :slug, :region, "
+    "'manual', 'ok', now()) ON CONFLICT DO NOTHING"
+)
+_COMPANY_ID: Final = q(
+    "SELECT id FROM watchlist_companies WHERE ats_type = :ats AND board_slug = :slug "
+    "AND lever_region IS NOT DISTINCT FROM :region"
+)
+_ACTIVE_PAYLOAD: Final = q(
+    "SELECT v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
+    "WHERE a.id = 1 FOR UPDATE OF a"
+)
+_NEXT_VERSION: Final = q(
+    "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, "
+    "execution_config_id, evaluation_policy_id, effect_classes) "
+    "SELECT (SELECT max(version_no) + 1 FROM settings_versions), v.schema_version, :payload, "
+    "v.scope_version_id, v.model_policy_id, v.execution_config_id, v.evaluation_policy_id, '{collection}' "
+    "FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id WHERE a.id = 1 "
+    "RETURNING id",
+    jsonb=["payload"],
+)
+_ACTIVATE: Final = q("UPDATE active_config SET settings_version_id = :v WHERE id = 1")
+
+
+def _enabling(entries: JSONValue, key: str, ids: Sequence[int]) -> list[JSONValue]:
+    """The settings entries `[{key: id, "enabled": …}]` with every id of `ids` enabled (kept in place)."""
+    merged: dict[int, dict[str, JSONValue]] = {}
+    for entry in get_list(entries, ""):
+        entry_id = get_object(entry, "")[key]
+        if not isinstance(entry_id, int):
+            raise TypeError(f"{key} must be an integer, got {entry_id!r}")
+        merged[entry_id] = dict(get_object(entry, ""))
+    for entry_id in ids:
+        merged[entry_id] = {key: entry_id, "enabled": True}
+    return list(merged.values())
+
+
+async def seed_inputs(
+    engine: AsyncEngine,
+    *,
+    queries: Sequence[str] = (),
+    companies: Sequence[tuple[str, str]] = (),
+    enabled: Sequence[str] | None = None,
+) -> None:
+    """The test's collection inputs (plan Deviation 3), committed:
+
+    - a `queries` row per text (`lang='en'`, `origin='user'`);
+    - a watchlist company per `(ats_type, slug)` (`detection='manual'`, `validation_status='ok'`; a Lever
+      board in the `global` region) and its board instance (`instances.instance_for_company`);
+    - a new settings version copied from the active one whose `queries[]` and `watchlist[]` entries enable
+      them and, when `enabled` is given, whose `sources.enabled` is true for exactly those switches
+      (`SOURCE_SWITCHES`); `active_config` points at it, so a run queued afterwards uses it.
+    """
+    if enabled is not None and (unknown := set(enabled) - set(SOURCE_SWITCHES)):
+        raise ValueError(f"unknown source switches: {sorted(unknown)}")
+    async with engine.begin() as conn:
+        # `active_config` first, as the lock order has it (§3.3.3)
+        payload = dict(get_object((await conn.execute(_ACTIVE_PAYLOAD)).scalar_one(), ""))
+        query_ids: list[int] = []
+        for text in queries:
+            await conn.execute(_QUERY, {"t": text})
+            query_ids.append(int((await conn.execute(_QUERY_ID, {"t": text})).scalar_one()))
+        company_ids: list[int] = []
+        for ats, slug in companies:
+            board = {"ats": ats, "slug": slug, "region": "global" if ats == "lever" else None}
+            await conn.execute(_COMPANY, board)
+            company_id = int((await conn.execute(_COMPANY_ID, board)).scalar_one())
+            await instance_for_company(conn, company_id)
+            company_ids.append(company_id)
+        payload["queries"] = _enabling(payload["queries"], "query_id", query_ids)
+        payload["watchlist"] = _enabling(payload["watchlist"], "watchlist_company_id", company_ids)
+        if enabled is not None:
+            switches: dict[str, JSONValue] = {switch: switch in enabled for switch in SOURCE_SWITCHES}
+            payload["sources"] = {**get_object(payload, "sources"), "enabled": switches}
+        version = int((await conn.execute(_NEXT_VERSION, {"payload": payload})).scalar_one())
+        await conn.execute(_ACTIVATE, {"v": version})

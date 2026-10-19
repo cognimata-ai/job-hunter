@@ -54,6 +54,7 @@ from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.faults import afault_point
+from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.health import read_run_freshness, run_age_state
 from jobhunter.observability.logging import get_logger
@@ -70,8 +71,6 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
     from langgraph.types import Durability
 
-    from jobhunter.graphs.collect.graph import CollectState
-
 # These thresholds compare times the database wrote (`heartbeat_at`, `queued_at`: its `now()`) with the
 # caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
 # one VPS and read its one kernel clock, so the two never drift apart (ruling T21-d). If the database moves to
@@ -86,6 +85,7 @@ MAX_RESUMES: Final = 3
 # At most this many queued runs without a live job are repaired per tick; the next tick takes the rest.
 QUEUED_BATCH: Final = 100
 RECURSION_LIMIT: Final = 200
+MAX_CONCURRENCY: Final = 4  # the graph's parallel tasks: the fetch fan-out (§9.2)
 
 REDEFERRED: Final = "redeferred"
 RESUME_EXHAUSTED_ALERT: Final = "run.resume_exhausted"
@@ -567,12 +567,12 @@ async def _invoke(graph: RunGraph, owner: RunOwner) -> None:
     config: RunnableConfig = {
         "configurable": {"thread_id": thread_id(owner.run_id, owner.attempt_no)},
         "recursion_limit": RECURSION_LIMIT,
+        "max_concurrency": MAX_CONCURRENCY,
     }
-    state: CollectState = {"run_id": owner.run_id, "attempt_no": owner.attempt_no, "steps": []}
     # `durability` acts on the graph's own saver; LangGraph warns when it is given to a graph without one.
     saver = graph.checkpointer
     durability: Durability | None = "sync" if saver is not None and not isinstance(saver, bool) else None
-    await graph.ainvoke(state, config, durability=durability)
+    await graph.ainvoke(initial_state(owner.run_id, owner.attempt_no), config, durability=durability)
 
 
 async def _finalize(

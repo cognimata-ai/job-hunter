@@ -5,6 +5,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.graph import build_noop_collect_graph
+from jobhunter.graphs.collect.state import initial_state
 from jobhunter.privacy.retention import RULES, run_retention_daily
 from jobhunter.worker.tasks import defer_in_tx
 from procrastinate.jobs import Status
@@ -186,7 +187,7 @@ async def test_checkpoint_threads_of_runs_finished_over_14_days_ago_are_deleted(
         graph = build_noop_collect_graph(saver)
         for run_id, thread in threads.items():  # real checkpoint threads, written by the collection graph
             await graph.ainvoke(
-                {"run_id": run_id, "attempt_no": 1, "steps": []},
+                initial_state(run_id, 1),
                 {"configurable": {"thread_id": thread}},
                 durability="sync",
             )
@@ -322,7 +323,7 @@ async def test_a_failed_checkpoint_rule_keeps_the_runs_that_name_its_threads(
 
     async with open_saver(migrated.dsn("app")) as saver:
         await build_noop_collect_graph(saver).ainvoke(
-            {"run_id": run_id, "attempt_no": 1, "steps": []},
+            initial_state(run_id, 1),
             {"configurable": {"thread_id": thread}},
             durability="sync",
         )

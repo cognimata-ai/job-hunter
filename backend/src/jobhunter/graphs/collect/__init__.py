@@ -1,1 +1,1 @@
-"""The collection graph (spec §3.3.3, §9); M0 has its no-op form, which `worker.runs.execute_run` runs."""
+"""The collection graph (spec §3.3.3, §9.2): its state, its dependencies, its nodes and the graph itself."""
