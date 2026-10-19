@@ -29,6 +29,7 @@ from typing import Final
 
 import httpx
 
+from jobhunter.clock import utcnow
 from jobhunter.config import DEFAULT_HTTP_USER_AGENT, AppConfig
 from jobhunter.db.seed import SOURCES
 from jobhunter.observability.logging import get_logger
@@ -91,12 +92,13 @@ _configuration = _Configuration()
 
 
 def configure(cfg: AppConfig) -> None:
-    """Process-wide: the User-Agent of `cfg`, and in fake mode the fixture transport for every new client."""
+    """Process-wide: the User-Agent of `cfg`, and in fake mode the fixture transport for every new client (on
+    the wall clock, so the recorded SerpApi account stays current)."""
     global _configuration
     transport = None
     if cfg.fake_sources:
         log = cfg.environ.get("JOBHUNTER_FIXTURE_LOG")
-        transport = fixture_transport(cfg.fixtures_dir, log_path=Path(log) if log else None)
+        transport = fixture_transport(cfg.fixtures_dir, log_path=Path(log) if log else None, clock=utcnow)
     _configuration = _Configuration(cfg.http_user_agent, transport)
 
 

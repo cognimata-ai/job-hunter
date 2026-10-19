@@ -12,13 +12,18 @@ With `log_path` (from `JOBHUNTER_FIXTURE_LOG`, tests only) every served request 
 `{"pid", "method", "host", "path", "query", "case", "status"}`: the instrument the crash tests use to count
 the real sends across worker processes. Each line is one `write` on an `O_APPEND` descriptor, so the lines of
 concurrent processes never interleave. The logged query has no credential parameter (`SECRET_PARAMS`).
+
+With `clock` (the fake mode of `http.configure` passes `utcnow`), the SerpApi account read (`ACCOUNT_CASE`)
+is served with its plan renewing `ACCOUNT_RENEWAL_AHEAD` after `clock()`'s date (`renewed_account`), so the
+recorded account describes a current window whatever the date; without one every case is served as recorded.
 """
 
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
@@ -63,6 +68,8 @@ def _r(host: str, path: str, file: str, **query: str | None) -> Route:
     return Route(host, re.compile(path), query, file)
 
 
+ACCOUNT_CASE: Final = "serpapi/account_before"
+ACCOUNT_RENEWAL_AHEAD: Final = timedelta(days=20)
 _SR: Final = "api.smartrecruiters.com"
 _SR_DH: Final = "/v1/companies/DeliveryHero/postings"
 # First match wins. One route per recorded case the fake worker uses (Task 6; tests/contract/README.md):
@@ -75,7 +82,7 @@ ROUTES: Final[tuple[Route, ...]] = (
     _r("jsearch.p.rapidapi.com", r"/search-v2", "jsearch/search_v2_today", date_posted="today"),
     _r("jsearch.p.rapidapi.com", r"/search-v2", "jsearch/search_v2_page1"),
     _r("jsearch.p.rapidapi.com", r"/search", "jsearch/search_legacy_404"),
-    _r("serpapi.com", r"/account\.json", "serpapi/account_before"),
+    _r("serpapi.com", r"/account\.json", ACCOUNT_CASE),
     _r("serpapi.com", r"/search\.json", "serpapi/google_jobs_hl_en"),
     _r("api.adzuna.com", r"/v1/api/jobs/de/search/1", "adzuna/adzuna_reingest_pair"),
     _r("api.adzuna.com", r"/v1/api/jobs/de/search/\d+", "adzuna/search_empty"),
@@ -126,8 +133,20 @@ def load_case(fixtures_dir: Path, case: str) -> tuple[int, dict[str, str], bytes
     return status, headers, body_path.read_bytes()
 
 
-def _serve(fixtures_dir: Path, case: str) -> httpx.Response:
+def renewed_account(body: bytes, today: date, **changes: JSONValue) -> bytes:
+    """A recorded SerpApi `account.json` body whose plan renews `ACCOUNT_RENEWAL_AHEAD` after `today`, with
+    its other fields changed by `changes`."""
+    doc = json.loads(body)
+    if not isinstance(doc, dict):
+        raise ValueError("a SerpApi account document is an object")
+    doc.update({"plan_renewal_date": (today + ACCOUNT_RENEWAL_AHEAD).isoformat(), **changes})
+    return json.dumps(doc).encode("utf-8")
+
+
+def _serve(fixtures_dir: Path, case: str, clock: Callable[[], datetime] | None) -> httpx.Response:
     status, headers, body = load_case(fixtures_dir, case)
+    if clock is not None and case == ACCOUNT_CASE:
+        body = renewed_account(body, clock().date())
     return httpx.Response(status, headers=headers, content=body)
 
 
@@ -149,15 +168,18 @@ def _log_served(log_path: Path, request: httpx.Request, case: str | None, status
         os.close(fd)
 
 
-def fixture_transport(fixtures_dir: Path, *, log_path: Path | None = None) -> httpx.MockTransport:
-    """A transport that answers from `fixtures_dir` by `ROUTES` (read at each request)."""
+def fixture_transport(
+    fixtures_dir: Path, *, log_path: Path | None = None, clock: Callable[[], datetime] | None = None
+) -> httpx.MockTransport:
+    """A transport that answers from `fixtures_dir` by `ROUTES` (read at each request); with `clock`, the
+    SerpApi account renews after `clock()` (see the module docstring)."""
 
     def handle(request: httpx.Request) -> httpx.Response:
         route = next((route for route in ROUTES if route.matches(request)), None)
         if route is None:
             response = httpx.Response(404, json=_NO_FIXTURE)
         else:
-            response = _serve(fixtures_dir, route.file)
+            response = _serve(fixtures_dir, route.file, clock)
         if log_path is not None:
             _log_served(log_path, request, None if route is None else route.file, response.status_code)
         return response

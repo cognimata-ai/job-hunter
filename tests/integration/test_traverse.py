@@ -3,19 +3,27 @@ import json
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any, Final
 
 import httpx
 import pytest
 import respx
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.deps import CollectDeps
-from jobhunter.graphs.collect.nodes.fetch import make_fetch_cell, traverse_and_record
+from jobhunter.graphs.collect.nodes.fetch import (
+    acquire_context,
+    load_planned,
+    make_fetch_cell,
+    traverse_and_record,
+)
 from jobhunter.graphs.collect.nodes.plan import make_plan
 from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.metrics import REGISTRY
-from jobhunter.sources import acquire
+from jobhunter.sources import acquire, traverse
+from jobhunter.sources.acquire import Denied, acquire_page
 from jobhunter.sources.adzuna import SEARCH_URL as ADZUNA_URL
 from jobhunter.sources.adzuna import AdzunaAdapter
 from jobhunter.sources.arbeitnow import FEED_URL, ArbeitnowAdapter
@@ -39,6 +47,7 @@ from tests.support.collect import (
     supersede,
 )
 from tests.support.faults import PausePoint
+from tests.support.quota import SIX_H, insert_window, jsearch_window
 from tests.support.sources import Adapters, load_fixture, served_requests
 
 pytestmark = pytest.mark.integration
@@ -432,3 +441,266 @@ async def test_contract_violation_is_visible_to_plan_fallback_in_the_same_run(
     assert [tuple(p) for p in planned] == [
         ("fallback", "serpapi", failed.query_id, failed.location_key)
     ]  # the same run falls back to SerpApi for that cell
+
+
+# ---- fix round 1 ------------------------------------------------------------------------------------------
+
+PRIMARY = sa.text(
+    "SELECT id, cell_id, status, skip_reason, error_code, quota_ledger_id FROM fetch_requests "
+    "WHERE run_id = :r AND phase = 'primary' ORDER BY id"
+)
+CELL_PLACES = sa.text("SELECT query_id, location_key FROM coverage_cells WHERE id = ANY(:ids) ORDER BY 1, 2")
+FALLBACK_CELLS = sa.text("SELECT cell_id FROM fetch_requests WHERE id = ANY(:ids)")
+CELL_INTERVALS = sa.text(
+    "SELECT kind, gap_status, reason FROM coverage_intervals WHERE cell_id = :c ORDER BY id"
+)
+
+
+async def test_an_open_breaker_denies_the_next_cell_and_both_cells_fall_back(
+    engine, current_epoch, jsearch_html_adapter, adapters: Adapters, fixture_log
+) -> None:
+    """C1, Ruling T14-b: the first cell's HTML page opens the JSearch breaker at once (`contract_broken`); the
+    second cell's planned request is skipped `breaker_open` with nothing reserved or sent, and both cells fall
+    back to SerpApi in the same run."""
+    await seed_inputs(engine, queries=(TEST_QUERY, "data engineer"), enabled=("jsearch", "serpapi"))
+    await insert_window(engine, jsearch_window(utcnow(), limit=200, reserve=20, tokens=10, interval_s=SIX_H))
+    owner = await queued_run(engine)
+    deps = make_deps(
+        engine,
+        lambda instance: jsearch_html_adapter if instance.source_id == "jsearch" else adapters(instance),
+    )
+    state = initial_state(owner.run_id, owner.attempt_no)
+    first, second = (await make_plan(deps)(state))["primary_fetch_request_ids"]
+    for fid in (first, second):
+        await make_fetch_cell(deps)({"fetch_request_id": fid})
+    rows_ = await rows(engine, PRIMARY, r=owner.run_id)
+    assert [r[2:] for r in rows_] == [
+        ("failed", None, "contract", rows_[0][5]),
+        ("skipped", "breaker_open", None, None),  # no ledger entry: nothing was reserved
+    ]
+    assert await rows(engine, CELL_INTERVALS, c=rows_[1][1]) == [("gap", "open", "source_failed")]
+    searches = [r for r in served_requests(fixture_log) if r["host"] == "jsearch.p.rapidapi.com"]
+    assert len(searches) == 1  # exactly one search: the first cell's page 1
+    fallback = (await make_plan_fallback(deps)(state))["fallback_fetch_request_ids"]
+    async with engine.connect() as c:
+        jsearch_places = (await c.execute(CELL_PLACES, {"ids": [r[1] for r in rows_]})).all()
+        cells = list((await c.execute(FALLBACK_CELLS, {"ids": fallback})).scalars())
+        serpapi_places = (await c.execute(CELL_PLACES, {"ids": cells})).all()
+    assert len(fallback) == 2 and serpapi_places == jsearch_places  # both cells fall back
+
+
+SNAPSHOT_COUNT = sa.text("SELECT count(*) FROM ats_snapshots")
+
+
+async def test_a_board_404_writes_no_snapshot_and_its_open_breaker_sends_nothing_more(
+    engine, current_epoch, adapters: Adapters, fixture_log
+) -> None:
+    """C1 (a free source) and M7: the board's list 404 (`not_found`, open at once) writes no snapshot and ages
+    nothing; any later new attempt for the instance in the run (a later page, a retry) is skipped
+    `breaker_open` without a request."""
+    await seed_inputs(engine, companies=(("greenhouse", "acme-board"),), enabled=("ats",))
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason, result.pages, result.snapshot) == ("failed", "not_found", 0, None)
+    async with engine.connect() as c:
+        assert (await c.execute(SNAPSHOT_COUNT)).scalar_one() == 0
+    planned = await load_planned(engine, fid, attempt_no=None)
+    assert planned.instance.health == "not_found"
+    adapter = adapters(planned.instance)
+    later = replace(adapter.plan(planned.plan), page_no=2)
+    denied = await acquire_page(
+        acquire_context(deps, planned, adapter),
+        later,
+        cell_id=planned.plan.cell_id,
+        phase="primary",
+        planned_id=None,
+    )
+    assert isinstance(denied, Denied) and denied.skip_reason == "breaker_open"
+    boards = [r["case"] for r in served_requests(fixture_log) if r["host"] == "boards-api.greenhouse.io"]
+    assert boards == ["greenhouse_404"]  # the one request of the run to the board
+
+
+async def test_an_interrupted_board_traversal_writes_no_snapshot_until_the_resumed_read(
+    engine, current_epoch, queue_app, adapters: Adapters, monkeypatch
+) -> None:
+    """M1: a shutdown between a board's pages writes no snapshot (an incomplete one would be the run's,
+    written once); the resumed attempt's read to the end is recorded, complete."""
+    await seed_inputs(engine, companies=(("lever", "leverdemo"),), enabled=("ats",), lever_region="eu")
+    stopped, pause = [False], PausePoint("collect.after_settle")
+    monkeypatch.setattr(acquire, "afault_point", pause)
+    deps = make_deps(engine, adapters, admission_stopped=lambda: stopped[0])
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    task = asyncio.create_task(traverse_and_record(deps, fid))
+    await asyncio.wait_for(pause.reached.wait(), 10)  # page 1 (100 postings) is settled
+    stopped[0] = True
+    pause.resume()
+    result = await task
+    assert (result.end, result.reason, result.pages) == ("skipped", "shutdown", 1)
+    assert result.snapshot is not None and not result.snapshot.complete
+    assert await rows(engine, SNAPSHOTS) == []
+    stopped[0] = False
+    resumed = await supersede(engine, owner)
+    assert await plan_ids(deps, resumed) == [fid]
+    result = await traverse_and_record(deps, fid, attempt_no=resumed.attempt_no)
+    assert (result.end, result.pages) == ("end", 2)
+    assert await rows(engine, SNAPSHOTS) == [("complete", 100, None, 100)]
+
+
+def listing_in_germany() -> dict[str, Any]:
+    """The recorded DeliveryHero list, its first posting in Berlin (the others are outside Germany)."""
+    listing: dict[str, Any] = json.loads(load_fixture("ats", "smartrecruiters_deliveryhero_list")[2])
+    listing["content"][0]["location"] = {"city": "Berlin", "country": "de", "fullLocation": "Berlin, Germany"}
+    return listing
+
+
+async def test_a_lost_owner_in_a_detail_call_is_raised_unwrapped(
+    engine, current_epoch, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    """M2: a `FencedOut` of one detail call leaves the traversal as itself, not inside an `ExceptionGroup`."""
+    await seed_inputs(engine, companies=(("smartrecruiters", "DeliveryHero"),), enabled=("ats",))
+    respx_mock.get("https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings").mock(
+        return_value=httpx.Response(200, json=listing_in_germany())
+    )
+    real = acquire_page
+
+    async def fenced_details(ctx, spec, **arguments):
+        if spec.operation == "detail":
+            raise FencedOut("run")
+        return await real(ctx, spec, **arguments)
+
+    monkeypatch.setattr(traverse, "acquire_page", fenced_details)
+    async with engine.connect() as c:
+        board = next(i for i in await list_instances(c) if i.source_id == "smartrecruiters")
+    async with httpx.AsyncClient() as client:
+        adapter = adapter_for(board, client, clock=utcnow)
+        deps = make_deps(engine, lambda instance: adapter)
+        owner = await queued_run(engine, include_paid=False)
+        (fid,) = await plan_ids(deps, owner)
+        with pytest.raises(FencedOut):
+            await traverse_and_record(deps, fid)
+
+
+async def test_a_failed_page_two_leaves_page_one_cursor_in_the_gap(
+    engine, current_epoch, jsearch_variant
+) -> None:
+    """M4: the gap after a served page 1 whose page 2 failed keeps page 1's continuation cursor (§5.6)."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    adapter = jsearch_variant({"search_v2_page2": "search_v2_html"})
+    deps = make_deps(engine, lambda instance: adapter)
+    owner = await queued_run(engine)
+    (fid,) = await plan_ids(deps, owner)
+    result = await traverse_and_record(deps, fid)
+    cursor = json.loads(load_fixture("jsearch", "search_v2_page1")[2])["data"]["cursor"]
+    assert (result.end, result.reason, result.pages, result.cursor_out) == ("failed", "contract", 1, cursor)
+    (gap,) = await rows(engine, RUN_INTERVALS, r=owner.run_id)
+    assert (gap[:3], gap[5]) == (("gap", "open", "source_failed"), {"cursor": cursor})
+
+
+async def test_a_shutdown_between_two_search_pages_leaves_a_shutdown_gap(
+    engine, current_epoch, adapters: Adapters, monkeypatch
+) -> None:
+    """M7: admission stops after page 1 settled; page 2 is never requested, the gap is `shutdown`."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    stopped, pause = [False], PausePoint("collect.after_settle")
+    monkeypatch.setattr(acquire, "afault_point", pause)
+    deps = make_deps(engine, adapters, admission_stopped=lambda: stopped[0])
+    owner = await queued_run(engine)
+    (fid,) = await plan_ids(deps, owner)
+    task = asyncio.create_task(traverse_and_record(deps, fid))
+    await asyncio.wait_for(pause.reached.wait(), 10)
+    stopped[0] = True
+    pause.resume()
+    result = await task
+    assert (result.end, result.reason, result.pages, len(result.outcomes)) == ("skipped", "shutdown", 1, 1)
+    cursor = json.loads(load_fixture("jsearch", "search_v2_page1")[2])["data"]["cursor"]
+    (gap,) = await rows(engine, RUN_INTERVALS, r=owner.run_id)
+    assert (gap[:3], gap[5]) == (("gap", "open", "shutdown"), {"cursor": cursor})
+
+
+async def test_a_half_open_jsearch_probe_reads_one_page(engine, current_epoch, adapters: Adapters) -> None:
+    """M7: page 1's ids are all new, yet a half-open instance's probe reads that page only."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    async with engine.begin() as c:  # an auth failure opens at once; it is half open 6 h later
+        await record_failure(c, await instance_id(c, "jsearch"), "auth", billing="paid", now=utcnow() - 7 * H)
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine)
+    (fid,) = await plan_ids(deps, owner)
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason, result.pages, len(result.outcomes)) == ("cursor", "page_cap", 1, 1)
+    assert await rows(engine, PAGES, r=owner.run_id, c=await cell_of(engine, fid)) == [
+        (1, "succeeded", "probe", 10, "probe")
+    ]
+
+
+async def no_wait(seconds: float) -> None:
+    return None
+
+
+LEVER_EU: Final = "https://api.eu.lever.co/v0/postings/leverdemo"
+ATTEMPTS_BY_PAGE = sa.text(
+    "SELECT page_no, attempt_seq, status, http_status FROM fetch_requests WHERE run_id = :r "
+    "ORDER BY page_no, attempt_seq"
+)
+
+
+async def test_lever_membership_spans_its_pages_with_one_final_attempt_each(
+    engine, current_epoch, respx_mock: respx.MockRouter
+) -> None:
+    """M7 (carry 4): a Lever EU board of two pages, page 2 served on its second attempt: the snapshot's
+    membership has both pages, numbered from 1, each by its final attempt, and is complete."""
+    await seed_inputs(engine, companies=(("lever", "leverdemo"),), enabled=("ats",), lever_region="eu")
+    status, headers, body = load_fixture("ats", "lever_eu_leverdemo")
+    respx_mock.get(LEVER_EU, params={"skip": "0"}).mock(
+        return_value=httpx.Response(status, headers=headers, content=body)
+    )
+    status, headers, body = load_fixture("ats", "lever_eu_end")
+    respx_mock.get(LEVER_EU, params={"skip": "100"}).mock(
+        side_effect=[httpx.Response(503), httpx.Response(status, headers=headers, content=body)]
+    )
+    async with engine.connect() as c:
+        board = next(i for i in await list_instances(c) if i.source_id == "lever")
+    async with httpx.AsyncClient() as client:
+        adapter = adapter_for(board, client, clock=utcnow)
+        deps = replace(make_deps(engine, lambda instance: adapter), sleep=no_wait)  # the free retry's backoff
+        owner = await queued_run(engine, include_paid=False)
+        (fid,) = await plan_ids(deps, owner)
+        result = await traverse_and_record(deps, fid)
+    assert (result.end, result.pages) == ("end", 2)
+    assert result.snapshot is not None and (result.snapshot.complete, result.snapshot.member_count) == (
+        True,
+        100,
+    )
+    assert await rows(engine, ATTEMPTS_BY_PAGE, r=owner.run_id) == [
+        (1, 1, "succeeded", 200),
+        (2, 1, "failed", 503),
+        (2, 2, "succeeded", 200),
+    ]
+    assert await rows(engine, SNAPSHOTS) == [("complete", 100, None, 100)]
+
+
+async def test_an_arbeitnow_failure_partway_proves_nothing_and_leaves_an_open_gap(
+    engine, current_epoch, respx_mock: respx.MockRouter, arbeitnow_adapter: ArbeitnowAdapter
+) -> None:
+    """M7: page 2 of the feed fails (404, `not_found`): the reads are concluded as stopped short (`remaining`,
+    never `end`), so no covered row is written and what page 1 read is an open gap."""
+    await seed_inputs(engine, enabled=("arbeitnow",))
+    status, headers, body = load_fixture("arbeitnow", "page1")
+    respx_mock.get(FEED_URL, params={"page": "1"}).mock(
+        return_value=httpx.Response(status, headers=headers, content=body)
+    )
+    respx_mock.get(FEED_URL, params={"page": "2"}).mock(
+        return_value=httpx.Response(404, json={"error": "gone"})
+    )
+    times = [datetime.fromtimestamp(job["created_at"], UTC) for job in json.loads(body)["data"]]
+    deps = make_deps(engine, lambda instance: arbeitnow_adapter)
+    feed_deps = replace(deps, clock=lambda: max(times) + H)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    result = await traverse_and_record(feed_deps, fid)
+    assert (result.end, result.reason, result.pages, result.covered) == ("failed", "not_found", 1, None)
+    assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
+        ("gap", "open", "source_failed", min(times), max(times))
+    ]

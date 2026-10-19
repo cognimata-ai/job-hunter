@@ -26,7 +26,9 @@ Every spec is the adapter's `plan(cell_plan)`, with the coverage window computed
 `RequestSpec.window` (a resumed attempt reads it back from the row): JSearch and SerpApi the freshness bucket
 (`coverage.freshness_bucket`), whose unreachable part is abandoned at once by an inline `coverage_intervals`
 row (`gap`, `abandoned`, `beyond_provider_window`) when the spec is planned, from the cell's latest such bound
-on, so that the rows of successive runs never overlap; Adzuna `max_days_old` days; the
+on, so that the rows of successive runs never overlap, and the cell's open gaps that reach back beyond the
+window are abandoned with it (`coverage.abandon_beyond_provider_window`: one that straddles the window's lower
+bound keeps its newer part open, so contiguity can advance past it); Adzuna `max_days_old` days; the
 free sources the scope's ad age. **Cursor reuse** (§5.3.1, Ruling P3): a JSearch cell whose continuation holds
 a cursor obtained less than `jsearch.CURSOR_REUSE_TTL` ago is planned from it, `next_page(plan(cell_plan),
 cursor)` over the continuation's window and on its page, so that traversal's `END` closes its open gap;
@@ -79,8 +81,10 @@ from jobhunter.sources.base import (
 from jobhunter.sources.breaker import available
 from jobhunter.sources.coverage import (
     BUCKETS,
+    SEARCH_SOURCES,
     Bucket,
     JSearchContinuation,
+    abandon_beyond_provider_window,
     adzuna_max_days_old,
     freshness_bucket,
     record_search_gap,
@@ -98,8 +102,8 @@ if TYPE_CHECKING:
 
 Phase = Literal["primary", "fallback"]
 
-# The sources with one cell per (instance, query, location key) (§5.5.2), and their quota providers.
-SEARCH_SOURCES: Final = frozenset({"jsearch", "serpapi", "adzuna"})
+# The sources with one cell per (instance, query, location key) (`coverage.SEARCH_SOURCES`, §5.5.2), and
+# their quota providers.
 PROVIDERS: Final[Mapping[str, Provider]] = MappingProxyType(
     {"jsearch": "jsearch", "serpapi": "serpapi", "adzuna": "adzuna"}
 )
@@ -505,6 +509,8 @@ class _Rows:
                     "now": self.now,
                 },
             )
+            # the open gaps reaching back beyond the window: abandoned, a straddling one split (§5.6)
+            await abandon_beyond_provider_window(self.conn, spec.cell_id, upper)
 
     def report(self, *, replanned: int = 0) -> PlanReport:
         return PlanReport(list(self.planned), dict(self.skipped), self.cells, replanned)

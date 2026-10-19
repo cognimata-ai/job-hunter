@@ -344,12 +344,13 @@ async def seed_inputs(
     queries: Sequence[str] = (),
     companies: Sequence[tuple[str, str]] = (),
     enabled: Sequence[str] | None = None,
+    lever_region: str = "global",
 ) -> None:
     """The test's collection inputs (plan Deviation 3), committed:
 
     - a `queries` row per text (`lang='en'`, `origin='user'`);
     - a watchlist company per `(ats_type, slug)` (`detection='manual'`, `validation_status='ok'`; a Lever
-      board in the `global` region) and its board instance (`instances.instance_for_company`);
+      board in `lever_region`, `global` by default) and its board instance (`instances.instance_for_company`);
     - a new settings version copied from the active one whose `queries[]` and `watchlist[]` entries enable
       them and, when `enabled` is given, whose `sources.enabled` is true for exactly those switches
       (`SOURCE_SWITCHES`); `active_config` points at it, so a run queued afterwards uses it.
@@ -365,7 +366,7 @@ async def seed_inputs(
             query_ids.append(int((await conn.execute(_QUERY_ID, {"t": text})).scalar_one()))
         company_ids: list[int] = []
         for ats, slug in companies:
-            board = {"ats": ats, "slug": slug, "region": "global" if ats == "lever" else None}
+            board = {"ats": ats, "slug": slug, "region": lever_region if ats == "lever" else None}
             await conn.execute(_COMPANY, board)
             company_id = int((await conn.execute(_COMPANY_ID, board)).scalar_one())
             await instance_for_company(conn, company_id)

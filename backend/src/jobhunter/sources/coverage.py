@@ -26,7 +26,8 @@ records the same traversal again changes nothing; a gap's status moves only thro
   the end of the feed, and nothing else).
 - A board (`record_ats_snapshot`): one `ats_snapshots` row per instance and run, with its members. A
   structurally complete snapshot closes the board's open `incomplete_snapshot` gaps; an incomplete one records
-  that gap from the board's last complete snapshot (or from itself) to its own `taken_at`, both included. The
+  that gap `[start, taken_at)`, starting at the latest of the board's last complete snapshot and its previous
+  `incomplete_snapshot` gap (so successive ones never overlap; the run's start for a board's first). The
   planning window of a free cell is never ATS coverage.
 - `abandon_old_gaps`: an open gap whose upper bound is at or before `now - max_ad_age_days` is abandoned, and
   `coverage.gap_abandoned` (warn) is raised for its cell.
@@ -53,6 +54,7 @@ from jobhunter.observability.logging import get_logger
 from jobhunter.sources.arbeitnow import FirehoseState, Gap
 from jobhunter.sources.ats.common import SnapshotDraft
 from jobhunter.sources.base import CoverageWindow
+from jobhunter.sources.watchlist_patterns import ATS_TYPES
 from jobhunter.types import JSONValue
 
 if TYPE_CHECKING:
@@ -159,13 +161,16 @@ GapReason = Literal[
     "source_failed",
     "shutdown",
 ]
-# The skips that end a traversal because the run was ending (§7.16.5); every other skip is a denial of the
-# allowance (`paced`, `reserve_held`, `exhausted`, `window_cap`, `awaiting_window_validation`, ...).
+# The skips that end a traversal because the run was ending (§7.16.5); `breaker_open` is the source's failure
+# (Ruling T14-b), and every other skip a denial of the allowance (`paced`, `reserve_held`, `exhausted`,
+# `window_cap`, `awaiting_window_validation`).
 _ENDING_SKIPS: Final = frozenset({"shutdown", "superseded", "run_cancelled"})
 GAP_ABANDONED_ALERT: Final = "coverage.gap_abandoned"
 TOO_BROAD_ALERT: Final = "coverage.too_broad"
 TOO_BROAD_AFTER: Final = 3  # consecutive incomplete runs of a paid cell (§5.6)
 PAID_SOURCES: Final = frozenset({"jsearch", "serpapi"})
+# The search cells (one per instance, query and place, §5.5.2), whose coverage is their planned window.
+SEARCH_SOURCES: Final = frozenset({"jsearch", "serpapi", "adzuna"})
 YIELD_ALPHA: Final = 0.3  # the EMA of new postings per request (§5.5.3)
 
 log = get_logger("jobhunter.sources.coverage")
@@ -193,8 +198,12 @@ def gap_reason(result: "TraversalResult") -> GapReason | None:
             return "ambiguous_attempt"
         case "failed":
             return "source_failed"
+        case "skipped" if result.reason in _ENDING_SKIPS:
+            return "shutdown"
+        case "skipped" if result.reason == "breaker_open":
+            return "source_failed"  # the source failed before: its breaker blocks the attempt
         case "skipped":
-            return "shutdown" if result.reason in _ENDING_SKIPS else "allowance"
+            return "allowance"
 
 
 _LAST_COVERED = q("SELECT last_covered_at FROM coverage_cells WHERE id = :c")
@@ -205,7 +214,7 @@ _INSERT_COVERED = q(
 )
 _INSERT_GAP = q(
     "INSERT INTO coverage_intervals (cell_id, kind, span, gap_status, gap_cursor, reason, run_id, closed_at) "
-    "VALUES (:c, 'gap', tstzrange(:lower, :upper, :bounds), :status, :cursor, :reason, :run, "
+    "VALUES (:c, 'gap', tstzrange(:lower, :upper, '[)'), :status, :cursor, :reason, :run, "
     "CASE WHEN :status = 'open' THEN NULL ELSE now() END) "
     "ON CONFLICT (cell_id, kind, span) DO NOTHING RETURNING id",
     jsonb=["cursor"],
@@ -241,14 +250,12 @@ async def _insert_gap(
     reason: GapReason,
     run_id: int,
     cursor: str | None = None,
-    bounds: Literal["[)", "[]"] = "[)",
 ) -> bool:
     """Insert a gap row (an abandoned one closed at once); whether it was new."""
     params = {
         "c": cell_id,
         "lower": span[0],
         "upper": span[1],
-        "bounds": bounds,
         "status": status,
         "cursor": None if cursor is None else {"cursor": cursor},
         "reason": reason,
@@ -346,6 +353,41 @@ async def record_firehose_traversal(
     return CoverageEffect(opened=opened, closed=closed, covered=int(inserted_covered))
 
 
+_OPEN_REACHING_BACK = q(
+    "SELECT id, upper(span) AS upper, gap_cursor, reason, run_id FROM coverage_intervals WHERE cell_id = :c "
+    "AND kind = 'gap' AND gap_status = 'open' AND lower(span) < :boundary ORDER BY id"
+)
+_INSERT_REMAINDER = q(
+    "INSERT INTO coverage_intervals (cell_id, kind, span, gap_status, gap_cursor, reason, run_id) "
+    "VALUES (:c, 'gap', tstzrange(:lower, :upper, '[)'), 'open', :cursor, :reason, :run) "
+    "ON CONFLICT (cell_id, kind, span) DO NOTHING",
+    jsonb=["cursor"],
+)
+
+
+async def abandon_beyond_provider_window(conn: AsyncConnection, cell_id: int, boundary: datetime) -> int:
+    """The open gaps of a search cell that reach back before `boundary` (`t - 720 h`, the oldest instant the
+    cell's window can reach, §5.6), when the planner abandons the part beyond it: each is abandoned (its
+    reason kept), and one that straddles the boundary leaves its newer part `[boundary, upper)` open as a new
+    row with the same reason, cursor and run, which the run's `END` can close. The number abandoned."""
+    abandoned = 0
+    for row in (await conn.execute(_OPEN_REACHING_BACK, {"c": cell_id, "boundary": boundary})).all():
+        if not await _end_gaps(conn, [int(row.id)], "abandoned"):
+            continue
+        abandoned += 1
+        if row.upper > boundary:
+            params = {
+                "c": cell_id,
+                "lower": boundary,
+                "upper": row.upper,
+                "cursor": row.gap_cursor,
+                "reason": row.reason,
+                "run": row.run_id,
+            }
+            await conn.execute(_INSERT_REMAINDER, params)
+    return abandoned
+
+
 _SNAPSHOT_OF_RUN = q(
     "SELECT id FROM ats_snapshots WHERE source_instance_id = :i AND run_id = :r ORDER BY id LIMIT 1"
 )
@@ -357,9 +399,14 @@ _INSERT_MEMBERS = q(
     "INSERT INTO ats_snapshot_members (snapshot_id, native_id) "
     "SELECT :s, m FROM unnest(CAST(:members AS text[])) AS m ON CONFLICT DO NOTHING"
 )
-_LAST_COMPLETE_TAKEN = q(
-    "SELECT s.taken_at FROM source_instances i JOIN ats_snapshots s ON s.id = i.last_complete_snapshot_id "
-    "WHERE i.id = :i"
+# Where a board's new `incomplete_snapshot` gap starts: after its last complete snapshot and after its
+# previous such gap (so successive incomplete snapshots never open overlapping gaps); for a board's first,
+# the run's start.
+_SNAPSHOT_GAP_START = q(
+    "SELECT coalesce(greatest((SELECT s.taken_at FROM source_instances i "
+    "JOIN ats_snapshots s ON s.id = i.last_complete_snapshot_id WHERE i.id = :i), "
+    "(SELECT max(upper(span)) FROM coverage_intervals WHERE cell_id = :c AND kind = 'gap' "
+    "AND reason = 'incomplete_snapshot')), (SELECT coalesce(started_at, queued_at) FROM runs WHERE id = :r))"
 )
 _OPEN_SNAPSHOT_GAPS = q(
     "SELECT id FROM coverage_intervals WHERE cell_id = :c AND kind = 'gap' AND gap_status = 'open' "
@@ -399,17 +446,12 @@ async def record_ats_snapshot(
         ids = (await conn.execute(_OPEN_SNAPSHOT_GAPS, {"c": cell_id, "taken_at": taken_at})).scalars()
         await _end_gaps(conn, [int(gap_id) for gap_id in ids], "closed")
     else:
-        last = (await conn.execute(_LAST_COMPLETE_TAKEN, {"i": instance_id})).scalar()
-        lower = last if last is not None and last < taken_at else taken_at
-        await _insert_gap(
-            conn,
-            cell_id,
-            (lower, taken_at),
-            status="open",
-            reason="incomplete_snapshot",
-            run_id=run_id,
-            bounds="[]",
-        )
+        start = {"i": instance_id, "c": cell_id, "r": run_id}
+        lower = (await conn.execute(_SNAPSHOT_GAP_START, start)).scalar_one()
+        if lower < taken_at:
+            await _insert_gap(
+                conn, cell_id, (lower, taken_at), status="open", reason="incomplete_snapshot", run_id=run_id
+            )
     return snapshot_id
 
 
@@ -470,7 +512,9 @@ _RUN_CELLS = q(
     "min(f.created_at) FILTER (WHERE f.status IN ('dispatched','succeeded','failed','ambiguous')) "
     "AS attempted_at, max(f.finished_at) FILTER (WHERE f.status = 'succeeded') AS succeeded_at, "
     "coalesce(bool_or(f.status = 'succeeded' AND f.operation = 'list' AND f.continuation = 'end'), false) "
-    "AS reached_end FROM fetch_requests f JOIN coverage_cells c ON c.id = f.cell_id "
+    "AS reached_end, coalesce(bool_or(f.operation = 'list' "
+    "AND f.status IN ('dispatched','succeeded','failed','ambiguous')), false) AS traversed "
+    "FROM fetch_requests f JOIN coverage_cells c ON c.id = f.cell_id "
     "JOIN source_instances i ON i.id = c.source_instance_id LEFT JOIN queries qr ON qr.id = c.query_id "
     "WHERE f.run_id = :run GROUP BY f.cell_id, i.source_id, c.source_instance_id, c.last_covered_at, "
     "c.yield_ema, c.zero_yield_streak, c.consecutive_incomplete ORDER BY f.cell_id"
@@ -500,6 +544,11 @@ _OPENED_GAPS = q(
 )
 _RUN_SNAPSHOTS = q(
     "SELECT source_instance_id, id, status, taken_at FROM ats_snapshots WHERE run_id = :run ORDER BY id"
+)
+# The window of the run's last list page of each cell that ended its traversal (`END`).
+_END_PAGES = q(
+    "SELECT DISTINCT ON (cell_id) cell_id, spec FROM fetch_requests WHERE run_id = :run "
+    "AND status = 'succeeded' AND operation = 'list' AND continuation = 'end' ORDER BY cell_id, id DESC"
 )
 _OPEN_BETWEEN = q(
     "SELECT EXISTS (SELECT 1 FROM coverage_intervals WHERE cell_id = :c AND kind = 'gap' "
@@ -556,22 +605,33 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
     `created_at` (a cell whose requests were all skipped was not attempted, and keeps its staleness);
     `last_success_at` when one succeeded; `new_postings` per request (`fetch_requests.new_postings`) and
     per cell; `yield_ema` (alpha 0.3 of new postings per dispatched request) and `zero_yield_streak`,
-    unchanged without a dispatched request; `last_covered_at` advanced to the upper bound of the run's
-    `covered` row when it is `NULL`, when the row starts at or before it, or when no open gap lies between
-    them (§5.6), and to a structurally complete snapshot's `taken_at` for a board, whose `complete`
-    snapshot also becomes the instance's `last_complete_snapshot_id`; `consecutive_incomplete` reset by a
-    covered run and incremented by one that opened a gap; `last_exploration_at` for an attempted
-    exploration cell; a JSearch cell's `continuation` from its last succeeded page (`JSearchContinuation`;
-    cleared when that page ended the traversal). `coverage.too_broad` (info) is raised for a paid cell at
-    `consecutive_incomplete >= 3` and resolved when the cell is covered. `now` is the finalize time, for
-    the log.
+    unchanged without a dispatched request. A search or firehose cell is covered when a list page of the
+    run ended its traversal (`END`) or the run recorded a `covered` row, a board when its snapshot of the
+    run is structurally complete. `last_covered_at` advances to the upper bound of the covered window (the
+    run's `covered` row, else a search cell's `END` page's window) when it is `NULL`, when the window
+    starts at or before it, or when no open gap lies between them (§5.6), and to a structurally complete
+    snapshot's `taken_at` for a board, whose `complete` snapshot also becomes the instance's
+    `last_complete_snapshot_id`. `consecutive_incomplete` is reset by a covered run and incremented by a
+    run that traversed the cell (a dispatched list request) without covering it, whether or not it wrote a
+    new gap row, or that recorded a new gap of it; `last_exploration_at` is set for an attempted
+    exploration cell; a JSearch cell's `continuation` comes from its last succeeded page
+    (`JSearchContinuation`; cleared when that page ended the traversal). `coverage.too_broad` (info) is
+    raised for a paid cell at `consecutive_incomplete >= 3` and resolved when the cell is covered. `now`
+    is the finalize time, for the log.
     """
     await conn.execute(_LOCK_CELLS, {"run": run_id})
     cells = (await conn.execute(_RUN_CELLS, {"run": run_id})).all()
     new_postings: defaultdict[int, int] = defaultdict(int)
     for row in await conn.execute(_NEW_POSTINGS, {"run": run_id}):
         new_postings[int(row.cell_id)] += int(row.new_postings)
-    covered_rows = {int(row.cell_id): row for row in await conn.execute(_COVERED_ROWS, {"run": run_id})}
+    covered_rows: dict[int, CoverageWindow] = {
+        int(row.cell_id): (row.lower, row.upper) for row in await conn.execute(_COVERED_ROWS, {"run": run_id})
+    }
+    end_windows = {
+        int(row.cell_id): window
+        for row in await conn.execute(_END_PAGES, {"run": run_id})
+        if (window := _window_of(row.spec)) is not None
+    }
     opened = {int(cell_id) for cell_id in (await conn.execute(_OPENED_GAPS, {"run": run_id})).scalars()}
     snapshots = {
         int(row.source_instance_id): row for row in await conn.execute(_RUN_SNAPSHOTS, {"run": run_id})
@@ -581,15 +641,19 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
     for cell in cells:
         cell_id, requests = int(cell.cell_id), int(cell.requests)
         last_covered: datetime | None = cell.last_covered_at
-        covered = False
-        if (span := covered_rows.get(cell_id)) is not None:
-            covered = True
-            contiguous = last_covered is None or span.lower <= last_covered
+        board = cell.source_id in ATS_TYPES
+        # a search or firehose cell is covered by its END (its window, or the run's covered row: a span an
+        # earlier run recorded already is no row of this run), a board by a structurally complete snapshot
+        covered = (not board and bool(cell.reached_end)) or cell_id in covered_rows
+        windowed = covered and cell.source_id in SEARCH_SOURCES  # a firehose spec's window is no coverage
+        span = covered_rows.get(cell_id) or (end_windows.get(cell_id) if windowed else None)
+        if span is not None:
+            contiguous = last_covered is None or span[0] <= last_covered
             if not contiguous:
-                between = {"c": cell_id, "lower": last_covered, "upper": span.lower}
+                between = {"c": cell_id, "lower": last_covered, "upper": span[0]}
                 contiguous = not (await conn.execute(_OPEN_BETWEEN, between)).scalar_one()
             if contiguous:
-                last_covered = span.upper if last_covered is None else max(last_covered, span.upper)
+                last_covered = span[1] if last_covered is None else max(last_covered, span[1])
         snapshot = snapshots.get(int(cell.source_instance_id))
         if snapshot is not None and snapshot.status in ("complete", "mass_disappearance"):
             covered = True
@@ -600,7 +664,7 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
         incomplete = int(cell.consecutive_incomplete)
         if covered:
             incomplete = 0
-        elif cell_id in opened:
+        elif cell.traversed or cell_id in opened:  # its traversal of the cell did not reach END
             incomplete += 1
         ema, streak = float(cell.yield_ema), int(cell.zero_yield_streak)
         new = new_postings.get(cell_id, 0)

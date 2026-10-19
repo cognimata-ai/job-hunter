@@ -15,6 +15,7 @@ from jobhunter.sources import acquire, ats, http
 from jobhunter.sources.acquire import AcquireContext, Ambiguous, Denied, Failed, Served, acquire_page
 from jobhunter.sources.arbeitnow import FEED_URL
 from jobhunter.sources.base import CellPlan, RequestSpec, SourceError, request_key
+from jobhunter.sources.breaker import record_success
 from jobhunter.sources.instances import instance_for_company, list_instances
 from jobhunter.sources.jsearch import SEARCH_URL as JSEARCH_URL
 from jobhunter.sources.jsearch import JSearchAdapter
@@ -71,6 +72,13 @@ async def attempts(engine: AsyncEngine, spec: RequestSpec, owner: RunOwner) -> l
     async with engine.connect() as c:
         rows = await c.execute(ATTEMPTS, {"k": request_key(spec, owner.run_id)})
         return [tuple(r) for r in rows]
+
+
+async def close_breaker(engine: AsyncEngine, instance: int) -> None:
+    """A success of the instance: its breaker closed again, so the next scenario starts from `ok` (the
+    runtime gate of Ruling T14-b blocks every new attempt while the breaker is open)."""
+    async with engine.begin() as c:
+        await record_success(c, instance, now=utcnow())
 
 
 async def scalar(engine: AsyncEngine, statement: str, **params: object) -> object:
@@ -320,7 +328,9 @@ async def test_replay_order_of_rule_two(
     )
     assert final == replace(retried, replayed=True) and await attempts(engine, spec, owner) == retry_rows
     await finish(engine, restarted)
-    # the same within one call: the 429, its one retry, and the Failed of the second 429
+    # the same within one call: the 429, its one retry, and the Failed of the second 429 (the two 429s above
+    # opened the breaker, which would deny this run's attempt: it starts closed)
+    await close_breaker(engine, spec.source_instance_id)
     owner = await queued_run(engine)
     in_call = await acquire_page(
         jsearch_ctx(engine, owner, throttled), spec, cell_id=cell, phase="primary", planned_id=None
@@ -705,6 +715,7 @@ async def test_timeouts_count_for_the_breaker_and_a_billed_provider_error_is_nev
         ]
         # timeouts: the ledger keeps them ambiguous, the breaker counts them transient, open at 2 (T5 carry)
         route.side_effect = httpx.ReadTimeout("read timed out")
+        await close_breaker(engine, spec.source_instance_id)  # the 200 error counted one failure already
         for page_no in (2, 3):
             timed_out = await acquire_page(
                 ctx, replace(spec, page_no=page_no), cell_id=cell, phase="primary", planned_id=None
@@ -713,9 +724,17 @@ async def test_timeouts_count_for_the_breaker_and_a_billed_provider_error_is_nev
             assert [a[2:7] for a in await attempts(engine, replace(spec, page_no=page_no), owner)] == [
                 ("ambiguous", None, "ambiguous", None, "ambiguous")
             ]
-    assert route.call_count == 3  # no retry of a 200, none of a timeout
+        # open: the next new attempt is skipped, nothing reserved or sent (Ruling T14-b)
+        blocked = await acquire_page(
+            ctx, replace(spec, page_no=4), cell_id=cell, phase="primary", planned_id=None
+        )
+        assert isinstance(blocked, Denied) and blocked.skip_reason == "breaker_open"
+        assert [a[2:7] for a in await attempts(engine, replace(spec, page_no=4), owner)] == [
+            ("skipped", "breaker_open", None, None, None)
+        ]
+    assert route.call_count == 3  # no retry of a 200, none of a timeout, nothing while open
     async with engine.connect() as c:
-        assert tuple((await c.execute(JSEARCH)).one())[1:] == ("breaker_open", 3)
+        assert tuple((await c.execute(JSEARCH)).one())[1:] == ("breaker_open", 2)
 
 
 async def test_serpapi_quota_exhausted_writes_no_breaker_row(
@@ -1028,6 +1047,7 @@ async def test_a_paid_5xx_earns_exactly_one_retry(
             (2, "retry", "failed", None, "transient", 503, "ambiguous", None, "retry"),
         ]
         assert route.call_count == 2  # one retry, never a third attempt
+        await close_breaker(engine, spec.source_instance_id)  # the two 503s opened it (paid threshold 2)
         recovered = replace(spec, page_no=2)
         route.side_effect = [httpx.Response(502), httpx.Response(status, headers=headers, content=body)]
         served = await acquire_page(ctx, recovered, cell_id=cell, phase="primary", planned_id=None)

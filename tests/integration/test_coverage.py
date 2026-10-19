@@ -9,6 +9,7 @@ from jobhunter.db.transitions import transition
 from jobhunter.quota.planner import plan_run
 from jobhunter.run_settings import load_run_settings
 from jobhunter.sources.acquire import Served, acquire_page
+from jobhunter.sources.ats.common import SnapshotDraft
 from jobhunter.sources.base import CoverageWindow, RequestSpec
 from jobhunter.sources.coverage import (
     CellStats,
@@ -16,6 +17,7 @@ from jobhunter.sources.coverage import (
     JSearchContinuation,
     abandon_old_gaps,
     finalize_cells,
+    record_ats_snapshot,
     record_search_traversal,
 )
 from jobhunter.sources.instances import list_instances
@@ -269,7 +271,8 @@ async def test_cell_stats_are_finalized_from_durable_rows_once(
     async with engine.connect() as c:
         assert (await c.execute(REQUEST, {"i": served.fetch_request_id})).one().new_postings == 3
     assert row.yield_ema == pytest.approx(0.3 * 3 + 0.7 * 0.5) and row.yield_ema == pytest.approx(1.25)
-    assert (row.zero_yield_streak, row.consecutive_incomplete) == (0, 0)
+    # the run read page 1 only, whose cursor was left: its traversal did not reach END (fix round 1, M3)
+    assert (row.zero_yield_streak, row.consecutive_incomplete) == (0, 1)
     assert row.last_attempted_at == request.created_at and row.last_success_at is not None
     assert row.last_exploration_at == request.created_at
     cursor = json.loads(load_fixture("jsearch", "search_v2_page1")[2])["data"]["cursor"]
@@ -277,7 +280,8 @@ async def test_cell_stats_are_finalized_from_durable_rows_once(
     assert (
         row.continuation == JSearchContinuation(cursor, fetched_at, spec.window, 2).dump()
     )  # page 2's cursor
-    # three runs that leave the paid cell incomplete: `coverage.too_broad`; a covered run resolves it
+    # the third run in a row that leaves the paid cell incomplete raises `coverage.too_broad`; a covered run
+    # resolves it
     await finish(engine, owner)
     window_end = utcnow()
     for run in range(1, 5):
@@ -292,9 +296,9 @@ async def test_cell_stats_are_finalized_from_durable_rows_once(
         async with engine.connect() as c:
             alert = (await c.execute(ALERT, {"k": f"coverage.too_broad:cell:{cell}"})).one_or_none()
         assert (incomplete, None if alert is None else alert.severity) == {
-            1: (1, None),
-            2: (2, None),
-            3: (3, "info"),
+            1: (2, None),
+            2: (3, "info"),
+            3: (4, "info"),
             4: (0, None),
         }[run]
     assert (await cell_row(engine, cell)).yield_ema == pytest.approx(1.25)  # no dispatched request since
@@ -353,3 +357,109 @@ async def test_a_shutdown_skip_out_of_attempts_is_recorded_as_a_gap(engine, curr
             0,
         )
     assert await intervals(engine, cell) == [("gap", "open", "shutdown", *spec.window, None, False)]
+
+
+# ---- fix round 1 ------------------------------------------------------------------------------------------
+
+GAP_ROWS = sa.text(
+    "SELECT gap_status, reason, lower(span), upper(span), gap_cursor, run_id FROM coverage_intervals "
+    "WHERE cell_id = :c AND kind = 'gap' AND reason <> 'beyond_provider_window' ORDER BY id"
+)
+
+
+async def test_an_open_gap_straddling_the_provider_window_does_not_block_contiguity(
+    engine, current_epoch
+) -> None:
+    """I2 (§5.6): when the planner abandons the part beyond 720 h, an open gap that straddles that bound is
+    abandoned and its newer part stays open, so the run's END closes it and `last_covered_at` advances."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    cell = await jsearch_cell(engine)
+    now, covered = utcnow(), utcnow() - 40 * DAY
+    async with engine.begin() as c:
+        await c.execute(COVERED, {"at": covered, "c": cell})
+    first = await queued_run(engine)
+    earlier = await plan_at(engine, first, now - 6 * H)
+    assert earlier.window is not None
+    await record(engine, cell, earlier.window, traversal("cursor", "page_cap", "c1"), first.run_id)
+    await finalize(engine, first.run_id, now - 6 * H)
+    await finish(engine, first)
+    boundary = now - 720 * H  # where the second run's window starts
+    second = await queued_run(engine)
+    spec = await plan_at(engine, second, now)
+    assert spec.window == (boundary, now)
+    async with engine.connect() as c:
+        gaps = [tuple(r) for r in await c.execute(GAP_ROWS, {"c": cell})]
+    assert gaps == [
+        ("abandoned", "page_cap", now - 6 * H - 720 * H, now - 6 * H, {"cursor": "c1"}, first.run_id),
+        ("open", "page_cap", boundary, now - 6 * H, {"cursor": "c1"}, first.run_id),  # its newer part
+    ]
+    assert await record(engine, cell, spec.window, traversal("end"), second.run_id) == CoverageEffect(0, 1, 1)
+    await finalize(engine, second.run_id, now)
+    assert (await cell_row(engine, cell)).last_covered_at == now
+
+
+async def test_a_traversal_short_of_end_counts_as_incomplete_on_a_repeated_gap(
+    engine, current_epoch, jsearch_fixture_adapter: JSearchAdapter
+) -> None:
+    """M3: a run whose traversal of the cell did not reach END counts, also when its gap repeats a span an
+    earlier run recorded (no new row)."""
+    cell = await jsearch_cell(engine)
+    window = (DAY0, DAY0 + 3 * DAY)  # the same window twice (a reused cursor's traversal)
+    for run in (1, 2):
+        owner = await queued_run(engine)
+        spec = await page1_spec(engine, cell)
+        ctx = acquire_ctx(engine, owner, jsearch_fixture_adapter, billing="paid", provider="jsearch")
+        assert isinstance(
+            await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None), Served
+        )
+        effect = await record(engine, cell, window, traversal("cursor", "page_cap", "c"), owner.run_id)
+        assert effect.opened == (1 if run == 1 else 0)
+        await finalize(engine, owner.run_id, utcnow())
+        await finish(engine, owner)
+        assert (await cell_row(engine, cell)).consecutive_incomplete == run
+
+
+BOARD_CELL = sa.text("INSERT INTO coverage_cells (source_instance_id) VALUES (:i) RETURNING id")
+SNAPSHOT_GAPS = sa.text(
+    "SELECT gap_status, lower(span), upper(span), lower_inc(span), upper_inc(span) FROM coverage_intervals "
+    "WHERE cell_id = :c ORDER BY id"
+)
+STARTED = sa.text("SELECT started_at FROM runs WHERE id = :r")
+
+
+async def test_successive_incomplete_snapshots_open_gaps_that_follow_one_another(
+    engine, current_epoch
+) -> None:
+    """M5: an incomplete snapshot's gap is `[start, taken_at)`, starting where the board's previous one ended
+    (the run's start for the first); a complete snapshot closes them, and a replay writes nothing more."""
+    await seed_inputs(engine, companies=(("greenhouse", "getyourguide"),), enabled=("ats",))
+    async with engine.begin() as c:
+        board = next(i for i in await list_instances(c) if i.source_id == "greenhouse")
+        cell = int((await c.execute(BOARD_CELL, {"i": board.id})).scalar_one())
+    incomplete = SnapshotDraft(frozenset({"a"}), 1, False, "no_end")
+    complete = SnapshotDraft(frozenset({"a", "b"}), 2, True, None)
+    taken: list[datetime] = []
+    for draft in (incomplete, incomplete, complete):
+        owner = await queued_run(engine, include_paid=False)
+        taken.append(utcnow())
+        async with engine.begin() as c:
+            started = (await c.execute(STARTED, {"r": owner.run_id})).scalar_one()
+            first = await record_ats_snapshot(
+                c, cell, board.id, draft, run_id=owner.run_id, taken_at=taken[-1]
+            )
+            again = await record_ats_snapshot(
+                c, cell, board.id, draft, run_id=owner.run_id, taken_at=taken[-1]
+            )
+        assert again == first  # once per board and run
+        if len(taken) == 1:
+            first_start = started
+        await finish(engine, owner)
+    assert await rows(engine, SNAPSHOT_GAPS, cell) == [
+        ("closed", first_start, taken[0], True, False),
+        ("closed", taken[0], taken[1], True, False),  # from the previous gap's end: no overlap
+    ]
+
+
+async def rows(engine: AsyncEngine, statement: sa.TextClause, cell: int) -> list[tuple[object, ...]]:
+    async with engine.connect() as c:
+        return [tuple(r) for r in await c.execute(statement, {"c": cell})]

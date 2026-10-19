@@ -49,7 +49,7 @@ from typing import Final, Literal
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.db.sql import q
-from jobhunter.errors import InvariantViolation
+from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.graphs.collect.state import FetchOutcome
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
@@ -284,10 +284,11 @@ def _rules_allow_next(plan: CellPlan, spec: RequestSpec, served: Served) -> bool
 async def _search(t: _Traversal, first: RequestSpec, first_id: int | None) -> TraversalResult:
     adapter, plan = t.ctx.adapter, t.plan
     spec, planned_id = first, first_id
+    cursor: str | None = None  # the continuation of the last served page (§5.6: the gap keeps it)
     while True:
         result = await t.acquire(spec, planned_id, key=plan.source_id)
         if not isinstance(result, Served):
-            return t.result(*_stopped(result))
+            return t.result(*_stopped(result), cursor_out=cursor)
         kind, cursor = adapter.continuation(result.page)
         if kind is Continuation.END:
             return t.result("end", None)
@@ -390,8 +391,10 @@ async def _firehose(
 
 
 async def _details(t: _Traversal, adapter: SmartRecruitersAdapter, listing: Served) -> None:
-    """The detail calls of a SmartRecruiters list page (§5.3.5), at most `SMARTRECRUITERS_DETAIL.concurrency`
-    at once; their outcomes are the traversal's, and none of them ends it."""
+    """The detail calls of a SmartRecruiters list page (§5.3.5), sent at most
+    `SMARTRECRUITERS_DETAIL.concurrency` at a time (the limiter's key bounds them); their outcomes are the
+    traversal's, and none of them ends it. An error of a call (a lost owner, a bug) is raised as it is, never
+    wrapped in the `ExceptionGroup` of the task group: a `FencedOut` must still end the attempt quietly."""
     ids = sorted({native_id for native_id in adapter.peek_native_ids(listing.page) if native_id is not None})
     known: dict[str, tuple[bytes, datetime | None]] = {}
     if ids:
@@ -401,15 +404,26 @@ async def _details(t: _Traversal, adapter: SmartRecruitersAdapter, listing: Serv
     specs = adapter.detail_specs(
         listing.page, known, now=t.ctx.clock(), parent_fetch_request_id=listing.fetch_request_id
     )
-    gate = asyncio.Semaphore(SMARTRECRUITERS_DETAIL.concurrency)
+    try:
+        async with asyncio.TaskGroup() as group:
+            for spec in specs:
+                group.create_task(t.acquire(spec, None, key=SMARTRECRUITERS_DETAIL.key, listing=False))
+    except ExceptionGroup as failed:
+        raise _first(failed) from None
 
-    async def detail(spec: RequestSpec) -> None:
-        async with gate:
-            await t.acquire(spec, None, key=SMARTRECRUITERS_DETAIL.key, listing=False)
 
-    async with asyncio.TaskGroup() as group:
-        for spec in specs:
-            group.create_task(detail(spec))
+def _first(group: BaseExceptionGroup[Exception]) -> Exception:
+    """The error a detail task group failed with: its first `FencedOut` (the attempt is lost), else its first
+    error, unwrapped from every nesting."""
+    leaves: list[Exception] = []
+    pending: list[BaseException] = [group]
+    while pending:
+        error = pending.pop(0)
+        if isinstance(error, BaseExceptionGroup):
+            pending[:0] = list(error.exceptions)
+        elif isinstance(error, Exception):
+            leaves.append(error)
+    return next((error for error in leaves if isinstance(error, FencedOut)), leaves[0])
 
 
 async def _board(

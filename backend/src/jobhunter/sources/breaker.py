@@ -126,11 +126,29 @@ async def record_success(conn: AsyncConnection, instance_id: int, *, now: dateti
     return "ok"
 
 
-def available(instance: "InstanceRow", now: datetime) -> Literal["available", "half_open", "blocked"]:
-    """`available` for `ok`/`degraded`; for an open state `half_open` (one probe) from `half_open_after`
-    on and `blocked` before; `blocked` for `disabled`. The planner skips `blocked`."""
-    if instance.health in ("ok", "degraded"):
+Availability = Literal["available", "half_open", "blocked"]
+_AVAILABILITY = q("SELECT health, half_open_after FROM source_instances WHERE id = :id")
+
+
+def _availability(health: str, half_open_after: datetime | None, now: datetime) -> Availability:
+    if health in ("ok", "degraded"):
         return "available"
-    if instance.health == "disabled" or instance.half_open_after is None or now < instance.half_open_after:
+    if health == "disabled" or half_open_after is None or now < half_open_after:
         return "blocked"
     return "half_open"
+
+
+def available(instance: "InstanceRow", now: datetime) -> Availability:
+    """`available` for `ok`/`degraded`; for an open state `half_open` (one probe) from `half_open_after`
+    on and `blocked` before; `blocked` for `disabled`. The planner skips `blocked`."""
+    return _availability(instance.health, instance.half_open_after, now)
+
+
+async def instance_availability(conn: AsyncConnection, instance_id: int, *, now: datetime) -> Availability:
+    """`available` for the instance's row as it is now, read without a lock (the acquisition's runtime
+    gate, Ruling T14-b: it reads the row inside the transaction that reserves or marks an attempt, whose
+    later instance writes keep `source_instances` last in the lock order)."""
+    row = (await conn.execute(_AVAILABILITY, {"id": instance_id})).first()
+    if row is None:
+        raise LookupError(f"source instance {instance_id} does not exist")
+    return _availability(row.health, row.half_open_after, now)

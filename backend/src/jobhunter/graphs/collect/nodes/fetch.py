@@ -11,9 +11,10 @@ fallback phase to `parse_normalize` (only the fallback phase has fallback ids).
 instance, holds the source's semaphore (`deps.fetch_ctx`: a board holds its host's), runs
 `traverse.traverse_cell(…, limiter=deps.limiter)`, then records the coverage in one transaction that first
 holds the owner row `FOR SHARE` (`coverage.record_search_traversal`, `record_firehose_traversal` or
-`record_ats_snapshot`), then passes `afault_point("collect.after_coverage_commit")`. It returns the
-traversal's page outcomes and counters. It settles its own `fetch_requests` rows and never raises
-`SourceError`; a lost owner (`FencedOut`) and bugs propagate.
+`record_ats_snapshot`; a board whose traversal a shutdown or a takeover cut short writes no snapshot), then
+passes `afault_point("collect.after_coverage_commit")`. It returns the traversal's page outcomes and
+counters. It settles its own `fetch_requests` rows and never raises `SourceError`; a lost owner
+(`FencedOut`) and bugs propagate.
 """
 
 import asyncio
@@ -31,18 +32,20 @@ from jobhunter.graphs.collect.nodes import Node
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate, FetchCellInput
 from jobhunter.observability.metrics import FETCH_REQUESTS
 from jobhunter.quota import ledger
-from jobhunter.quota.planner import PROVIDERS, SEARCH_SOURCES
+from jobhunter.quota.planner import PROVIDERS
 from jobhunter.run_settings import RunSettings, load_run_settings
 from jobhunter.sources import coverage
 from jobhunter.sources.acquire import AcquireContext
 from jobhunter.sources.ats.common import AtsAdapter
 from jobhunter.sources.base import CellPlan, RequestSpec, SourceAdapter
-from jobhunter.sources.coverage import BUCKETS, Bucket
+from jobhunter.sources.coverage import BUCKETS, SEARCH_SOURCES, Bucket
 from jobhunter.sources.instances import InstanceRow, list_instances
 from jobhunter.sources.traverse import TraversalResult, traverse_cell
 from jobhunter.worker.runs import RunOwner
 
 FETCH_CELL: Final = "fetch_cell"
+# The ends of a traversal that a shutdown or a takeover cut short: no snapshot is written for them.
+INTERRUPTED: Final = frozenset({"shutdown", "superseded"})
 
 _ROW = q(
     "SELECT f.run_id, f.cell_id, f.source_instance_id, f.phase, f.spec, c.location_key, "
@@ -131,6 +134,12 @@ def _semaphore(deps: CollectDeps, source_id: str, adapter: SourceAdapter) -> asy
     return deps.fetch_ctx.sources[source_id]
 
 
+def _interrupted(result: TraversalResult) -> bool:
+    """A traversal the run's end cut short (a shutdown or a takeover): a board then writes no snapshot, so
+    the resumed attempt's own read is the run's snapshot (a snapshot is written once per run)."""
+    return result.end == "skipped" and result.reason in INTERRUPTED
+
+
 async def _record(conn: AsyncConnection, planned: PlannedCell, result: TraversalResult) -> None:
     cell_id, run_id = planned.plan.cell_id, planned.owner.run_id
     if planned.instance.source_id in SEARCH_SOURCES:
@@ -148,7 +157,7 @@ async def _record(conn: AsyncConnection, planned: PlannedCell, result: Traversal
             reason=coverage.gap_reason(result) or "page_cap",  # an END read's gap: earlier reads were capped
             run_id=run_id,
         )
-    elif result.snapshot is not None and result.taken_at is not None:
+    elif result.snapshot is not None and result.taken_at is not None and not _interrupted(result):
         await coverage.record_ats_snapshot(
             conn, cell_id, planned.instance.id, result.snapshot, run_id=run_id, taken_at=result.taken_at
         )

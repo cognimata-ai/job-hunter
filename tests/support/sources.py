@@ -32,7 +32,7 @@ import re
 import shutil
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
@@ -48,11 +48,12 @@ from jobhunter.sources.adzuna import AdzunaAdapter
 from jobhunter.sources.arbeitnow import ArbeitnowAdapter
 from jobhunter.sources.ats.common import AtsAdapter
 from jobhunter.sources.base import CellPlan, NormalizedPosting, Parsed, RawPage, RequestSpec, SourceAdapter
-from jobhunter.sources.fixtures import fixture_transport, load_case
+from jobhunter.sources.fixtures import fixture_transport, load_case, renewed_account
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.sources.serpapi import ACCOUNT_URL, SEARCH_URL, SerpApiAdapter
 from jobhunter.sources.watchlist_patterns import AtsType
+from jobhunter.types import JSONValue
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 FIXTURES: Final = Path("tests/contract/fixtures")
@@ -305,14 +306,12 @@ def jsearch_html_adapter(jsearch_variant: JSearchVariant) -> JSearchAdapter:
     return jsearch_variant({"search_v2_page1": ("search_v2_html", {"x-ratelimit-requests-remaining": "199"})})
 
 
-def serpapi_account_response(case: str = "account_before", **changes: object) -> httpx.Response:
-    """The recorded SerpApi account read `case` as a response, its renewal 20 days after today (UTC) and its
-    other fields changed by `changes`."""
+def serpapi_account_response(case: str = "account_before", **changes: JSONValue) -> httpx.Response:
+    """The recorded SerpApi account read `case` as a response, its renewal
+    `fixtures.ACCOUNT_RENEWAL_AHEAD` after today (UTC, `fixtures.renewed_account`, as the fake mode's
+    transport serves it) and its other fields changed by `changes`."""
     status, headers, body = load_fixture("serpapi", case)
-    doc = json.loads(body)
-    renewal = utcnow().date() + timedelta(days=20)
-    doc.update({"plan_renewal_date": renewal.isoformat(), **changes})
-    return httpx.Response(status, headers=headers, content=json.dumps(doc).encode("utf-8"))
+    return httpx.Response(status, headers=headers, content=renewed_account(body, utcnow().date(), **changes))
 
 
 @pytest.fixture

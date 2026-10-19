@@ -32,6 +32,13 @@ crash, restart or takeover ever sends a paid request twice or loses a paid respo
    a timeout counts as `transient` for the breaker while its ledger entry stays `ambiguous`). A settlement
    transaction the server rolled back (40001, 40P01) is run again with the response in hand, three in all.
 
+**The breaker gate** (§5.2, §7.16.5; Ruling T14-b). A new attempt (a page, a retry, a re-dispatch, a detail
+call; never the replay of a receipt) is made only while the instance's breaker admits it
+(`breaker.instance_availability`: `available`, or `half_open` for the probe): the reserving transaction of a
+quota source and the marking transaction of a free one read it right after the owner row, and a `blocked`
+instance skips the request `planned -> skipped('breaker_open')` (`Denied('breaker_open')`) with nothing
+reserved or sent; SerpApi also checks it before its account read.
+
 Fault points `collect.after_reserve`, `collect.after_dispatch_marker`, `collect.after_response` and
 `collect.after_settle` mark the crash windows (§18.3 C1-C4). Every transaction that writes a receipt first
 holds the run row `FOR SHARE` (`ledger.lock_run_owner`), so a superseded owner is `FencedOut` before it writes
@@ -105,6 +112,7 @@ RETRY_AFTER_MAX_S: Final = 60.0
 UNSETTLED: Final = "unsettled"
 # The skips after which the request is attempted again (§7.16.5); every other skip is the request's denial.
 _REATTEMPTED: Final = frozenset({"shutdown", "superseded"})
+BREAKER_OPEN: Final = "breaker_open"  # the skip of a new attempt that an open breaker blocks (Ruling T14-b)
 GATEWAY_404: Final = "rapidapi_gateway_404"  # the settlement evidence of a 404 the RapidAPI gateway answered
 # Transactions a settlement may take when the server rolls one back as a serialization failure or a deadlock.
 SETTLE_TRANSACTIONS: Final = 3
@@ -478,6 +486,8 @@ class _Acquisition:
                 return await self._skip(row, spec, nxt, cell_id, "shutdown")
             account = None
             if isinstance(ctx.adapter, AccountAdapter):
+                if await self._blocked():  # the account read is a send to the provider too
+                    return await self._skip(row, spec, nxt, cell_id, BREAKER_OPEN)
                 try:
                     account = await ctx.adapter.account()
                 except SourceError as err:  # §5.3.2: no fresh account read, no search
@@ -514,6 +524,9 @@ class _Acquisition:
                 await _move(conn, row, ["reserved"], "dispatched")
             else:
                 await ledger.lock_run_owner(conn, owner)
+                if await self._gate(conn):  # a free attempt: the breaker is read where it is marked
+                    await _move(conn, row, ["planned"], "skipped", {"skip_reason": BREAKER_OPEN})
+                    return Denied(row, BREAKER_OPEN)
                 await _move(conn, row, ["planned"], "dispatched")
         await afault_point("collect.after_dispatch_marker")
         async with self.throttle() if self.throttle is not None else nullcontext():
@@ -529,6 +542,16 @@ class _Acquisition:
         self.settled_here.add(row)
         self.last_page = outcome.page
         return result
+
+    async def _gate(self, conn: AsyncConnection) -> bool:
+        """Whether the instance's breaker blocks a new attempt now (`half_open` admits it: the traversal
+        limits a probe to one page)."""
+        now = self.ctx.clock()
+        return await breaker.instance_availability(conn, self.spec.source_instance_id, now=now) == "blocked"
+
+    async def _blocked(self) -> bool:
+        async with self.ctx.engine.connect() as conn:
+            return await self._gate(conn)
 
     async def _insert(
         self,
@@ -577,6 +600,10 @@ class _Acquisition:
         if spec.request_class not in get_args(QuotaClass):
             raise ValueError(f"a {provider} request has a quota class, not {spec.request_class!r}")
         async with ctx.engine.begin() as conn:
+            await ledger.lock_run_owner(conn, ctx.owner)
+            if await self._gate(conn):  # no reservation while the breaker blocks (Ruling T14-b)
+                await _move(conn, row, ["planned"], "skipped", {"skip_reason": BREAKER_OPEN})
+                return Denied(row, BREAKER_OPEN)
             decision = await ledger.reserve(
                 conn,
                 provider,

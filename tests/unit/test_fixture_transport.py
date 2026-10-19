@@ -2,6 +2,7 @@
 import json
 import os
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -187,3 +188,18 @@ async def test_non_json_bodies_and_load_case(tmp_path: Path) -> None:
     )
     with pytest.raises(FileNotFoundError):
         fixtures.load_case(tmp_path, "jsearch/missing")
+
+
+async def test_a_clock_renews_the_recorded_serpapi_account_and_changes_nothing_else() -> None:
+    """Ruling I1 (Task 14 fix round 1): with a clock the recorded account renews 20 days after its date, so
+    a fake-mode run's SerpApi window is current on any date; without one the recording is served as it is."""
+    today = datetime(2027, 3, 1, 23, 59, tzinfo=UTC)
+    account = "https://serpapi.com/account.json?api_key=k"
+    search = "https://serpapi.com/search.json?engine=google_jobs&q=x&api_key=k"
+    async with httpx.AsyncClient(transport=fixture_transport(SHIPPED, clock=lambda: today)) as c:
+        renewed, served_search = (await c.get(account)).json(), (await c.get(search)).content
+    async with httpx.AsyncClient(transport=fixture_transport(SHIPPED)) as c:
+        recorded = (await c.get(account)).json()
+    assert (renewed["plan_renewal_date"], recorded["plan_renewal_date"]) == ("2027-03-21", "2026-11-08")
+    assert {**renewed, "plan_renewal_date": None} == {**recorded, "plan_renewal_date": None}
+    assert served_search == fixtures.load_case(SHIPPED, "serpapi/google_jobs_hl_en")[2]  # only the account
