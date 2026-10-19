@@ -372,15 +372,55 @@ def _record_hour(w: Window, obs: Observation) -> None:
         w.hour_observed_at = obs.observed_at
 
 
+def account_observation(account: AccountObservation) -> Observation:
+    """A SerpApi account read as the observation it is reconciled as (§6.3): the renewal is the reset."""
+    return Observation(
+        observed_at=account.observed_at,
+        status=200,
+        reset_at=account.plan_renewal_date,
+        limit=account.searches_per_month,
+        remaining=account.plan_searches_left,
+        this_hour=account.this_hour_searches,
+        hourly_cap=account.account_rate_limit_per_hour,
+    )
+
+
+ProbeOutcome = Literal["validated", "failed", "never_sent"]
+
+
+def note_probe_outcome(w: Window, outcome: ProbeOutcome, *, now: datetime) -> None:
+    """Record how the window's probe ended, in place: the one writer of the probe columns after a reservation.
+
+    - `validated`: the probe is settled (`probe_used = probe_failed = False`, `next_probe_at = None`); step 1
+      of the observation has done this already when it saw the reset.
+    - `failed` (settled `ambiguous` or with a non-2xx status, a 2xx that validated nothing, or recovered as
+      `ambiguous`): `probe_failed = True` and the next probe `PROBE_RETRY` later (§6.3); until then JSearch
+      counts as exhausted for the fallback (§6.6).
+    - `never_sent` (released `never_dispatched`, or a connect error before any byte): no probe happened, so
+      the next request starts a fresh one at once instead of waiting 12 h: `probe_used = False` and no wait.
+      An `exhausted_until_reset` window re-probes only from `next_probe_at`, so there the wait ends `now`
+      (`None` would deny it until the window ends); elsewhere `next_probe_at = None`.
+    """
+    if outcome == "validated":
+        w.probe_used, w.probe_failed, w.next_probe_at = False, False, None
+    elif outcome == "failed":
+        w.probe_failed, w.next_probe_at = True, now + PROBE_RETRY
+    else:
+        w.probe_used = False
+        w.next_probe_at = now if w.state == "exhausted_until_reset" else None
+
+
 # Persistence. Every statement names the columns of §7.8 explicitly; `_COLUMNS` is the dataclass order.
 _COLUMNS: Final = tuple(f.name for f in fields(Window))
-_SELECT_CURRENT = q(
+_SELECT_WINDOWS: Final = (
     "SELECT provider, window_start, window_end, is_current, closed_reason, limit_units, reserve_units, "
     "state, tokens, tokens_at, capacity, probe_used, probe_failed, next_probe_at, last_observed_at, "
     "observed_remaining, observed_limit, observed_this_hour, observed_hourly_cap, conservative_until, "
-    "hour_observed_at FROM quota_windows WHERE provider = :provider AND is_current"
+    "hour_observed_at FROM quota_windows"
 )
+_SELECT_CURRENT = q(f"{_SELECT_WINDOWS} WHERE provider = :provider AND is_current")
 _LOCK_CURRENT = q(f"{_SELECT_CURRENT.text} FOR UPDATE")
+_LOCK_BY_KEY = q(f"{_SELECT_WINDOWS} WHERE provider = :provider AND window_start = :window_start FOR UPDATE")
 _INSERT_SQL: Final = (
     "INSERT INTO quota_windows (provider, window_start, window_end, is_current, closed_reason, limit_units, "
     "reserve_units, state, tokens, tokens_at, capacity, probe_used, probe_failed, next_probe_at, "
@@ -427,6 +467,15 @@ async def _current(conn: AsyncConnection, provider: Provider, *, lock: bool) -> 
 async def current_snapshot(conn: AsyncConnection, provider: Provider) -> Window | None:
     """The current window as it is (plain `SELECT`, no lock): planning and the dry-run simulate on it."""
     return await _current(conn, provider, lock=False)
+
+
+async def window_locked(conn: AsyncConnection, provider: Provider, window_start: datetime) -> Window:
+    """The window `(provider, window_start)`, current or closed, under `FOR UPDATE` (the ledger's recovery
+    writes lock an entry's own window). Raises `LookupError` when it does not exist."""
+    row = (await conn.execute(_LOCK_BY_KEY, {"provider": provider, "window_start": window_start})).first()
+    if row is None:
+        raise LookupError(f"no {provider} window starts at {window_start}")
+    return Window(**{name: getattr(row, name) for name in _COLUMNS})
 
 
 async def apply_changes(conn: AsyncConnection, changes: Sequence[WindowChange]) -> None:

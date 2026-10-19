@@ -18,9 +18,9 @@ Every failed probe logs `readiness_probe_failed` with `probe`, `sqlstate` and `e
 error was raised; `reason` says what was wrong then). Never an exception message.
 
 `system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
-their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), disk and database
-sizes and the versions. Run ages are reported, never readiness gates. `RunOut` is the api's view of a run
-row, shared with `POST /api/runs`.
+their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), the current quota
+window of each provider, disk and database sizes and the versions. Run ages are reported, never readiness
+gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs`.
 
 **One freshness rule** (ruling T17-g): `read_run_freshness` is the one query of the run figures and
 `run_age_state` the one rule over them. System health reports that state, and the worker's `stale_data`
@@ -50,6 +50,8 @@ from jobhunter.heartbeats import HEARTBEAT_STALE_S
 from jobhunter.observability.alerts import refresh_alert_gauge
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
+from jobhunter.quota.ledger import used_units
+from jobhunter.quota.windows import Provider, WindowState, current_snapshot
 from jobhunter.worker.tasks import QUEUES
 
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat"]
@@ -249,6 +251,47 @@ class Versions(BaseModel):
     langgraph: str
 
 
+class QuotaOut(BaseModel):
+    """A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket."""
+
+    window_start: datetime
+    window_end: datetime
+    state: WindowState
+    limit_units: int
+    used_units: int
+    remaining_units: int
+    tokens: float
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _in_utc(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+
+QUOTA_PROVIDERS: Final[tuple[Provider, ...]] = ("jsearch", "serpapi", "adzuna")
+
+
+async def quota_health(conn: AsyncConnection) -> dict[Provider, QuotaOut | None]:
+    """Each quota provider's current window with its counted usage, `None` when it has none yet."""
+    out: dict[Provider, QuotaOut | None] = {}
+    for provider in QUOTA_PROVIDERS:
+        w = await current_snapshot(conn, provider)
+        if w is None:
+            out[provider] = None
+            continue
+        used = await used_units(conn, provider, w.window_start)
+        out[provider] = QuotaOut(
+            window_start=w.window_start,
+            window_end=w.window_end,
+            state=w.state,
+            limit_units=w.limit_units,
+            used_units=used,
+            remaining_units=max(0, w.limit_units - used),
+            tokens=float(w.tokens),
+        )
+    return out
+
+
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -257,6 +300,7 @@ class SystemHealthOut(BaseModel):
       `last_fully_successful_run_age_s`: of a `succeeded` one only.
     - `run_age_state`: see `run_age_state`.
     - `queue_depths`: procrastinate jobs by queue and status.
+    - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
     """
 
@@ -267,6 +311,7 @@ class SystemHealthOut(BaseModel):
     last_fully_successful_run_age_s: float | None
     run_age_state: RunAgeState
     queue_depths: dict[str, dict[str, int]]
+    quota: dict[Provider, QuotaOut | None]
     alerts_open: AlertsOpen
     disk: DiskUsage
     database_bytes: int
@@ -370,6 +415,7 @@ async def system_health(
         last_fully_successful_run_age_s=_age_s(now, freshness.last_full_success_at),
         run_age_state=run_age_state(now, freshness),
         queue_depths=await _queue_depths(conn),
+        quota=await quota_health(conn),
         alerts_open=AlertsOpen(info=alerts["info"], warn=alerts["warn"], critical=alerts["critical"]),
         disk=DiskUsage(path=DISK_PATH, total_bytes=disk.total, free_bytes=disk.free),
         database_bytes=int((await conn.execute(_DATABASE_BYTES)).scalar_one()),

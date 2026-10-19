@@ -240,6 +240,35 @@ export interface components {
             [key: string]: unknown;
         };
         /**
+         * QuotaOut
+         * @description A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket.
+         */
+        QuotaOut: {
+            /** Limit Units */
+            limit_units: number;
+            /** Remaining Units */
+            remaining_units: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Tokens */
+            tokens: number;
+            /** Used Units */
+            used_units: number;
+            /**
+             * Window End
+             * Format: date-time
+             */
+            window_end: string;
+            /**
+             * Window Start
+             * Format: date-time
+             */
+            window_start: string;
+        };
+        /**
          * ReadyOut
          * @description Every serving prerequisite holds; the body is `{}`.
          */
@@ -317,6 +346,7 @@ export interface components {
          *       `last_fully_successful_run_age_s`: of a `succeeded` one only.
          *     - `run_age_state`: see `run_age_state`.
          *     - `queue_depths`: procrastinate jobs by queue and status.
+         *     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
          *     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
          */
         SystemHealthOut: {
@@ -336,6 +366,10 @@ export interface components {
                 [key: string]: {
                     [key: string]: number;
                 };
+            };
+            /** Quota */
+            quota: {
+                [key: string]: components["schemas"]["QuotaOut"] | null;
             };
             ready: components["schemas"]["ReadyState"];
             /**

@@ -85,7 +85,11 @@ QUEUE_POOL_MAX_SIZE: Final = 4
 EXECUTIONS_CANCEL_S: Final = 30.0
 WATCHDOG_STOP_S: Final = 15.0
 # Imported before the takeover (step 4): importing them registers their sweeps, reconcilers and handlers.
-_REGISTERING_MODULES: Final = ("jobhunter.worker.operations", "jobhunter.worker.runs")
+_REGISTERING_MODULES: Final = (
+    "jobhunter.worker.operations",
+    "jobhunter.worker.runs",
+    "jobhunter.quota.ledger",
+)
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
 log = get_logger("jobhunter.worker.main")
