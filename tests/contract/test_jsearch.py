@@ -336,8 +336,11 @@ def test_every_scrubbed_page_parses_without_rejections() -> None:
     [
         ([], "not_object"),
         ("OK", "not_object"),
-        ({"data": {"jobs": [], "cursor": None}}, "status_not_ok"),
-        ({"status": "ERROR", "data": {"jobs": [], "cursor": None}}, "status_not_ok"),
+        ({"data": {"jobs": [], "cursor": None}}, "status_invalid"),
+        ({"status": None, "data": {"jobs": [], "cursor": None}}, "status_invalid"),
+        ({"status": 200, "data": {"jobs": [], "cursor": None}}, "status_invalid"),
+        ({"status": True, "data": {"jobs": [], "cursor": None}}, "status_invalid"),
+        ({"status": ["OK"], "data": {"jobs": [], "cursor": None}}, "status_invalid"),
         ({"status": "OK"}, "items_missing"),
         ({"status": "OK", "data": {"cursor": "c"}}, "items_missing"),
         ({"status": "OK", "data": []}, "items_missing"),
@@ -353,6 +356,33 @@ def test_an_envelope_that_breaks_the_contract_is_a_violation(doc: Any, code: str
     with pytest.raises(ContractViolation) as exc:
         adapter().check_envelope(doc_page(doc))
     assert (exc.value.kind, exc.value.code, exc.value.status) == ("contract", code, 200)
+
+
+@pytest.mark.parametrize("status", [200, 201])
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"status": "ERROR", "request_id": "r", "error": {"message": "Upstream failed", "code": 500}},
+        {"status": "ERROR", "data": {"jobs": [], "cursor": None}},  # even with a well-formed data object
+        {"status": "FAILED"},
+        {"status": "error"},
+        {"status": ""},
+    ],
+)
+def test_a_provider_error_delivered_with_a_2xx_is_a_transient_failure_not_a_contract_violation(
+    doc: dict[str, Any], status: int
+) -> None:
+    a, page = adapter(), doc_page(doc, status=status)
+    with pytest.raises(SourceError) as exc:
+        a.check_envelope(page)
+    assert not isinstance(exc.value, ContractViolation)
+    assert (exc.value.kind, exc.value.code, exc.value.status) == ("transient", "provider_error", status)
+    assert "Upstream" not in str(exc.value)  # the provider's text is never copied into the error
+    for read in (a.parse, a.peek_native_ids, a.continuation):  # nothing reads its items or cursor either
+        with pytest.raises(SourceError) as again:
+            read(page)
+        assert (again.value.kind, again.value.code) == ("transient", "provider_error")
+    assert a.settle(HttpOutcome(page, None)) == ("billed", None)  # billing is unchanged: a 2xx is billed
 
 
 @pytest.mark.parametrize(

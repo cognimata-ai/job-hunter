@@ -9,7 +9,10 @@ Envelope (spike V9, `docs/spikes/V9.md`): the items are at `ITEMS_PATH` and the 
 `CURSOR_PATH`. The end of the results is the cursor key present with `null` (or missing), never an empty page:
 `continuation` follows the cursor whatever the page length. `check_envelope` asserts the status, the item
 array and the cursor together, so a drift of any of them breaks the contract instead of reading as an empty
-page.
+page. A `status` that is a string other than `OK` is the provider's own error report, delivered with a 2xx
+(T9-a): `SourceError("transient", code="provider_error")`, a failed attempt that counts toward the breaker
+threshold, not a broken contract. A missing or non-string `status` is a contract violation. `parse`,
+`peek_native_ids` and `continuation` apply the same check, so no path reads an error body as a page.
 
 Identity: `native_id` is `job_uid`, the Google `htidocid`. `job_id` embeds a session blob that changes from
 request to request and is never read.
@@ -45,6 +48,7 @@ from jobhunter.sources.base import (
     Rejected,
     RequestSpec,
     Settlement,
+    SourceError,
 )
 from jobhunter.sources.http import HttpOutcome, send
 from jobhunter.sources.parsing.dates import Precision, from_epoch, jsearch_precision
@@ -80,6 +84,20 @@ def _lookup(doc: JSONValue, path: Sequence[str]) -> tuple[bool, JSONValue]:
             return False, None
         node = node[key]
     return True, node
+
+
+def _document(page: RawPage) -> dict[str, JSONValue]:
+    """The body as an object whose `status` is `OK`; anything else raises (see the module docstring)."""
+    doc = page.json()
+    if not isinstance(doc, dict):
+        raise ContractViolation("not_object", status=page.status)
+    status = doc.get("status")
+    if not isinstance(status, str):
+        raise ContractViolation("status_invalid", status=page.status)
+    if status != "OK":
+        # The provider's text is not copied into the error: it is neither logged nor stored.
+        raise SourceError("transient", code="provider_error", status=page.status)
+    return doc
 
 
 def _items(doc: JSONValue, status: int | None) -> list[JSONValue]:
@@ -275,21 +293,17 @@ class JSearchAdapter:
         return await send(self._client, spec, request, now=self._clock)
 
     def check_envelope(self, page: RawPage) -> None:
-        doc = page.json()
-        if not isinstance(doc, dict):
-            raise ContractViolation("not_object", status=page.status)
-        if doc.get("status") != "OK":
-            raise ContractViolation("status_not_ok", status=page.status)
+        doc = _document(page)
         _items(doc, page.status)
         _cursor(doc, page.status)
 
     def peek_native_ids(self, page: RawPage) -> list[str | None]:
-        return [_uid(job) for job in items_of(page.json())]
+        return [_uid(job) for job in _items(_document(page), page.status)]
 
     def parse(self, page: RawPage) -> list[ItemOutcome]:
         outcomes: list[ItemOutcome] = []
         first_seen: dict[str, int] = {}
-        for index, job in enumerate(items_of(page.json())):
+        for index, job in enumerate(_items(_document(page), page.status)):
             outcome: ItemOutcome = _parse_item(index, job)
             if isinstance(outcome, Parsed):
                 first = first_seen.setdefault(outcome.native_id, index)
@@ -299,7 +313,7 @@ class JSearchAdapter:
         return outcomes
 
     def continuation(self, page: RawPage) -> tuple[Continuation, str | None]:
-        cursor = cursor_of(page.json())
+        cursor = _cursor(_document(page), page.status)
         return (Continuation.END, None) if cursor is None else (Continuation.CURSOR, cursor)
 
     def next_page(self, spec: RequestSpec, cursor: str | None) -> RequestSpec | None:

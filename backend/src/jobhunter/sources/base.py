@@ -374,7 +374,8 @@ class SourceAdapter(Protocol):
         ...
 
     def check_envelope(self, page: RawPage) -> None:
-        """Raise `ContractViolation` for a response whose envelope breaks the contract."""
+        """Raise `ContractViolation` for a response whose envelope breaks the contract; a paid source also
+        raises the `SourceError` of the provider's own error report when it delivers one with a 2xx (T9-a)."""
         ...
 
     def peek_native_ids(self, page: RawPage) -> list[str | None]:

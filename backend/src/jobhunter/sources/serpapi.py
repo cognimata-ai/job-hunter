@@ -17,8 +17,16 @@ option is stored or used for a key: they link to unrelated postings.
 Dates, work mode, schedule and salary come from the `extensions[]` chips and, when present, from
 `detected_extensions`, which wins (`parse_extensions`). The `hl=en` recording has no `detected_extensions`
 (ruling T6-a), so the chips are the usual source. Relative dates resolve against the response `Date` header
-(`fetched_at` without one). A work mode, schedule or salary read from chips is `text` evidence; from
-`detected_extensions` it is `structured`.
+(`fetched_at` without one). The work mode is always `text` evidence, `work_from_home` included: it says remote
+work is possible, not that the job cannot be on site (T9-b). The employment types are `structured` only when
+every one of them came from `detected_extensions.schedule_type`; once a chip adds one they are `text`.
+
+A search with no jobs is an empty page, not a violation, when Google says so: `error` reads "hasn't returned
+any results" or `search_information.jobs_results_state` is `Fully empty` (T9-c). A body with
+`search_metadata.status == "Error"` and an `error` string is the provider's own error report, delivered with a
+2xx (T9-a): `SourceError("transient", code="provider_error")`, a failed attempt that counts toward the breaker
+threshold, or the `quota_exhausted` kind when the account has run out of searches. A missing `search_metadata`
+or any other body without `jobs_results` is a contract violation.
 
 Settlement (§5.3.2): a 2xx is `billed`, an empty result too; a connect error before any byte was sent is
 `not_billed`; everything else is `ambiguous`.
@@ -72,6 +80,9 @@ SERPAPI_HL: Final[Literal["de", "en"]] = "en"
 _ALL_WORK_MODES: Final = frozenset({"remote", "hybrid", "onsite"})
 # The `error` of a search Google answered with no jobs (SerpApi words it in English whatever `hl` is).
 _NO_RESULTS: Final = re.compile(r"hasn.t returned any results", re.IGNORECASE)
+# The structured form of the same fact, which does not depend on the wording of the message (T9-c).
+_FULLY_EMPTY: Final = "fully empty"
+_OUT_OF_SEARCHES: Final = re.compile(r"run out of searches", re.IGNORECASE)
 _VIA_PREFIX: Final = re.compile(r"^via\s+", re.IGNORECASE)
 
 
@@ -82,16 +93,31 @@ def _document(page: RawPage) -> dict[str, JSONValue]:
     return doc
 
 
+def _says_no_results(doc: dict[str, JSONValue]) -> bool:
+    """Google found nothing: `search_information.jobs_results_state` or the `error` message says so."""
+    information = doc.get("search_information")
+    state = information.get("jobs_results_state") if isinstance(information, dict) else None
+    if isinstance(state, str) and state.strip().casefold() == _FULLY_EMPTY:
+        return True
+    error = doc.get("error")
+    return isinstance(error, str) and _NO_RESULTS.search(error) is not None
+
+
 def _jobs(doc: dict[str, JSONValue], status: int) -> list[JSONValue]:
-    """`jobs_results`; absent is an empty page only when `error` says Google found nothing."""
+    """`jobs_results`. Absent, the body is an empty page when Google says it found nothing, SerpApi's own
+    error report (`SourceError`) when its status is `Error` with an `error` string, else a violation."""
     if "jobs_results" in doc:
         jobs = doc["jobs_results"]
         if not isinstance(jobs, list):
             raise ContractViolation("jobs_results_not_list", status=status)
         return jobs
-    error = doc.get("error")
-    if isinstance(error, str) and _NO_RESULTS.search(error):
+    if _says_no_results(doc):
         return []
+    metadata, error = doc.get("search_metadata"), doc.get("error")
+    if isinstance(metadata, dict) and metadata.get("status") == "Error" and isinstance(error, str):
+        # The provider's text is not copied into the error: it is neither logged nor stored.
+        kind: SourceErrorKind = "quota_exhausted" if _OUT_OF_SEARCHES.search(error) else "transient"
+        raise SourceError(kind, code="provider_error", status=status)
     raise ContractViolation("jobs_results_missing", status=status)
 
 
@@ -166,20 +192,16 @@ def _parse_item(index: int, job: JSONValue, reference: datetime) -> Parsed | Rej
         reference=reference,
     )
     schedule = structured.get("schedule_type") if structured else None
+    scheduled = parse_employment(schedule) if isinstance(schedule, str) else []
     employment_source: Literal["structured", "text", "none"] = (
-        "structured"
-        if isinstance(schedule, str) and parse_employment(schedule)
+        "none"
+        if not found.employment
+        else "structured"
+        if all(kind in scheduled for kind in found.employment)  # no chip added a type
         else "text"
-        if found.employment
-        else "none"
     )
-    work_mode_source: Literal["structured", "text", "none"] = (
-        "structured"
-        if structured is not None and structured.get("work_from_home") is True
-        else "text"
-        if found.work_modes is not None
-        else "none"
-    )
+    # `work_from_home` says remote work is possible, which a chip says too: text evidence, never an exclusion.
+    work_mode_source: Literal["text", "none"] = "none" if found.work_modes is None else "text"
     location = _text(job, "location")
     places = (
         parse_location_text(location, source=SOURCE_ID) if location else ParsedLocations([], "unknown", False)
@@ -358,7 +380,10 @@ class SerpApiAdapter:
         return outcomes
 
     def continuation(self, page: RawPage) -> tuple[Continuation, str | None]:
-        token = _next_token(_document(page), page.status)
+        doc = _document(page)
+        # An error report has no pagination: it must not read as the end of the results.
+        _jobs(doc, page.status)
+        token = _next_token(doc, page.status)
         return (Continuation.END, None) if token is None else (Continuation.CURSOR, token)
 
     def next_page(self, spec: RequestSpec, cursor: str | None) -> RequestSpec | None:

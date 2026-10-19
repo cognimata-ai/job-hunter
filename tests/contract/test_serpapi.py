@@ -286,9 +286,51 @@ def test_detected_extensions_win_over_the_chips_when_present() -> None:
         },
     )
     assert posting.posted_raw == "1 day ago" and posting.posted_at == datetime(2026, 10, 16, 22, tzinfo=UTC)
-    assert posting.employment_types[0] == "part_time" and posting.employment_source == "structured"
-    assert posting.work_mode_possible == {"remote", "hybrid"} and posting.work_mode_source == "structured"
+    # the merged employment types are not all from the structured field (the chip adds `full_time`)
+    assert posting.employment_types == ("part_time", "full_time") and posting.employment_source == "text"
+    assert posting.work_mode_possible == {"remote", "hybrid"} and posting.work_mode_source == "text"
     assert posting.salary is not None and (posting.salary.min, posting.salary.max) == (70000.0, 80000.0)
+
+
+def test_the_work_from_home_flag_is_text_evidence_like_the_chips() -> None:
+    flag = parsed_one(extensions=[], detected_extensions={"work_from_home": True})
+    assert flag.work_mode_possible == {"remote", "hybrid"} and flag.work_mode_source == "text"
+    chip = parsed_one(extensions=["Work from home"])
+    assert chip.work_mode_possible == {"remote", "hybrid"} and chip.work_mode_source == "text"
+    for off in ({"work_from_home": False}, {"work_from_home": "true"}, {}):
+        other = parsed_one(extensions=[], detected_extensions=off)
+        assert other.work_mode_possible == {"remote", "hybrid", "onsite"} and other.work_mode_source == "none"
+
+
+@pytest.mark.parametrize(
+    "chips, schedule, types, source",
+    [
+        (
+            ["Full-time"],
+            "Part-time",
+            ("part_time", "full_time"),
+            "text",
+        ),  # a chip adds a type: not all structured
+        ([], "Part-time", ("part_time",), "structured"),
+        (
+            ["Teilzeit"],
+            "Part-time",
+            ("part_time",),
+            "structured",
+        ),  # the chip only repeats the structured type
+        (["Part-time", "Internship"], "Part-time", ("part_time", "internship"), "text"),
+        (["Full-time"], None, ("full_time",), "text"),
+        (["Full-time"], "Weekends", ("full_time",), "text"),  # a schedule that names no type adds nothing
+        ([], "Weekends", (), "none"),
+        ([], None, (), "none"),
+    ],
+)
+def test_employment_is_structured_only_when_every_type_came_from_the_structured_field(
+    chips: list[str], schedule: str | None, types: tuple[str, ...], source: str
+) -> None:
+    detected = None if schedule is None else {"schedule_type": schedule}
+    posting = parsed_one(extensions=chips, detected_extensions=detected)
+    assert (posting.employment_types, posting.employment_source) == (types, source)
 
 
 def test_detected_extensions_alone_are_enough() -> None:
@@ -375,11 +417,33 @@ NO_RESULTS = "Google hasn't returned any results for this query."
         (lambda d: d.pop("search_metadata"), "search_metadata_missing"),
         (lambda d: d.update(search_metadata="Success"), "search_metadata_missing"),
         (lambda d: d.pop("jobs_results"), "jobs_results_missing"),
-        (
-            lambda d: (d.pop("jobs_results"), d.update(error="Your account has run out of searches.")),
-            "jobs_results_missing",
-        ),
         (lambda d: (d.pop("jobs_results"), d.update(error=None)), "jobs_results_missing"),
+        # an error text without `search_metadata.status == "Error"` is not a provider error report
+        (lambda d: (d.pop("jobs_results"), d.update(error="Something went wrong.")), "jobs_results_missing"),
+        (
+            lambda d: (d.pop("jobs_results"), d["search_metadata"].update(status="Error")),
+            "jobs_results_missing",  # status Error without an `error` string
+        ),
+        (
+            lambda d: (
+                d.pop("jobs_results"),
+                d["search_metadata"].update(status="Error"),
+                d.update(error=["Your account has run out of searches."]),
+            ),
+            "jobs_results_missing",  # an `error` that is not a string
+        ),
+        (
+            lambda d: (
+                d.pop("jobs_results"),
+                d["search_metadata"].update(status=500),
+                d.update(error="Your account has run out of searches."),
+            ),
+            "jobs_results_missing",  # a status that is not the string "Error"
+        ),
+        (
+            lambda d: (d.pop("search_metadata"), d.pop("jobs_results"), d.update(error="Boom")),
+            "search_metadata_missing",
+        ),
         (lambda d: d.update(jobs_results={"0": {}}), "jobs_results_not_list"),
         (lambda d: d.update(jobs_results=None), "jobs_results_not_list"),
         (lambda d: d.update(serpapi_pagination="next"), "pagination_invalid"),
@@ -405,6 +469,81 @@ def test_drift_lists_and_non_json_bodies_are_violations() -> None:
         a.check_envelope(page_of([]))
     with pytest.raises(ContractViolation, match="not_json"):
         a.check_envelope(RawPage(SPEC, 200, {}, b"<html>502 Bad Gateway</html>", T))
+
+
+def error_page(message: Any, *, status: int = 200, state: str = "Error") -> RawPage:
+    return page_of({"search_metadata": {"status": state}, "error": message}, status=status)
+
+
+@pytest.mark.parametrize("status", [200, 201])
+@pytest.mark.parametrize(
+    "message", ["Something went wrong.", "Invalid API key. Your API key should be here."]
+)
+def test_a_provider_error_delivered_with_a_2xx_is_a_transient_failure_not_a_contract_violation(
+    message: str, status: int
+) -> None:
+    a, page = adapter(), error_page(message, status=status)
+    with pytest.raises(SourceError) as exc:
+        a.check_envelope(page)
+    assert not isinstance(exc.value, ContractViolation)
+    assert (exc.value.kind, exc.value.code, exc.value.status) == ("transient", "provider_error", status)
+    assert message not in str(exc.value)  # the provider's text is never copied into the error
+    for read in (a.parse, a.peek_native_ids, a.continuation):  # nothing reads it as an empty page either
+        with pytest.raises(SourceError) as again:
+            read(page)
+        assert (again.value.kind, again.value.code) == ("transient", "provider_error")
+    assert a.settle(HttpOutcome(page, None)) == ("billed", None)  # billing is unchanged: a 2xx is billed
+
+
+def test_running_out_of_searches_at_200_is_the_quota_exhausted_kind() -> None:
+    for message in ("Your account has run out of searches.", "YOUR ACCOUNT HAS RUN OUT OF SEARCHES."):
+        page = error_page(message)
+        with pytest.raises(SourceError) as exc:
+            adapter().check_envelope(page)
+        assert not isinstance(exc.value, ContractViolation)
+        assert (exc.value.kind, exc.value.code, exc.value.status) == (
+            "quota_exhausted",
+            "provider_error",
+            200,
+        )
+        assert "searches" not in str(exc.value)
+
+
+def test_a_no_results_error_wins_over_the_error_status() -> None:
+    page = error_page(NO_RESULTS)
+    adapter().check_envelope(page)
+    assert adapter().parse(page) == [] and adapter().continuation(page) == (Continuation.END, None)
+
+
+@pytest.mark.parametrize("message", ["Aucun résultat pour cette recherche.", "No jobs here, sorry.", None])
+def test_google_jobs_fully_empty_is_a_no_results_signal_whatever_the_message_says(
+    message: str | None,
+) -> None:
+    a = adapter()
+    doc: dict[str, Any] = {
+        "search_metadata": {"status": "Success"},
+        "search_information": {"jobs_results_state": "Fully empty"},
+    }
+    if message is not None:
+        doc["error"] = message
+    page = page_of(doc)
+    a.check_envelope(page)
+    assert a.parse(page) == [] and a.peek_native_ids(page) == []
+    assert a.continuation(page) == (Continuation.END, None)
+    # the structured signal also outranks a status of Error, as the message does
+    doc["search_metadata"] = {"status": "Error"}
+    doc["error"] = message or "x"
+    a.check_envelope(page_of(doc))
+
+
+@pytest.mark.parametrize(
+    "information",
+    [{"jobs_results_state": "Results for exact spelling"}, {"jobs_results_state": None}, {}, "Fully empty"],
+)
+def test_any_other_search_information_is_no_signal(information: Any) -> None:
+    page = page_of({"search_metadata": {"status": "Success"}, "search_information": information})
+    with pytest.raises(ContractViolation, match="jobs_results_missing"):
+        adapter().check_envelope(page)
 
 
 def test_a_page_without_results_is_valid_only_when_google_says_so() -> None:
