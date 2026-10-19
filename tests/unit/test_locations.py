@@ -435,6 +435,34 @@ def test_coordinates_take_the_id_and_country_of_the_closest_known_place() -> Non
     assert [c.country_code for c in warsaw.candidates] == ["PL"]
 
 
+@pytest.mark.parametrize(
+    "text", ["95.10115, 11.5", "99.5, 200.1", "-91.5, 10.0", "50.0, -180.5", "12.5, 999.9"]
+)
+def test_coordinate_shaped_text_out_of_range_is_an_unresolved_location_not_an_error(text: str) -> None:
+    p = parse(text)
+    (loc,) = p.locations
+    # "95.10115" holds the 5-digit run 10115 (Berlin's postal code): it must not become a postal code either
+    assert (loc.label, loc.resolution, loc.candidates, loc.postal_code) == (text, "unresolved", [], None)
+    assert p.kind == "city" and not p.positively_non_de
+
+
+def test_an_out_of_range_coordinate_pair_leaves_the_other_parts_of_the_string_alone() -> None:
+    p = parse("Berlin; 99.5, 200.1")
+    assert [(loc.label, loc.resolution) for loc in p.locations] == [
+        ("Berlin", "unique"),
+        ("99.5, 200.1", "unresolved"),
+    ]
+    assert p.kind == "multi" and not p.positively_non_de
+    assert parse_jsearch_location(None, "95.10115, 11.5", "DE").locations[0].resolution == "unresolved"
+    assert parse_jsearch_location("99.5, 200.1 • über X", None, None).locations[0].resolution == "unresolved"
+
+
+@pytest.mark.parametrize("text", ["90.0, 180.0", "-90.0, -180.0", "0.0, 0.0"])
+def test_coordinates_at_the_edge_of_the_range_are_still_coordinates(text: str) -> None:
+    (loc,) = parse(text).locations
+    assert loc.label == text and loc.postal_code is None
+
+
 def test_coordinates_far_from_every_known_place_have_no_known_country() -> None:
     atlantic = location_from_coordinates("Atlantik", 30.0, -40.0, source="x")
     assert atlantic.resolution == "unresolved" and atlantic.candidates == []

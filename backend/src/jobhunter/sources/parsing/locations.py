@@ -13,7 +13,8 @@
    a single place name: a list, a country, a state or a marker in front of it (`Deutschland, Österreich`,
    `Remote, Austria`) stays unresolved. Other comma parts stay unresolved too: a comma separates a list as
    often as it qualifies a name, and guessing would lose locations. A federal state (`Sachsen`, `NRW`; not the
-   city-states) is a region, never the town of that name: it is unresolved and never foreign;
+   city-states) is a region, never the town of that name: it is unresolved and never foreign. Text shaped like
+   coordinates that lie outside latitude ±90 / longitude ±180 (`95.10115, 11.5`) is one unresolved label;
 4. `Remote`, `Homeoffice`, `Deutschlandweit` and `Beliebiger Ort` are markers, not places: they set `kind`.
 
 `ParsedLocations.positively_non_de` is the §5.3.4 evidence for `OutOfScope('not_germany')`: every part names
@@ -342,7 +343,15 @@ def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | No
     if (
         pair := _COORDINATES.fullmatch(part)
     ) is not None:  # before the postal code: `47.80331` holds a 5-digit run
-        point = location_from_coordinates(part, float(pair[1]), float(pair[2]), source=source)
+        lat, lon = float(pair[1]), float(pair[2])
+        if not _is_coordinate_pair(lat, lon):
+            # Text shaped like coordinates that no point on Earth has (`95.10115, 11.5`) is one unresolved
+            # label: not an error (one bad string must not fail a job), nor a postal code from its digits.
+            nowhere = Location(
+                label=part, resolution="unresolved", candidates=[], postal_code=None, source=source
+            )
+            return _Part(nowhere, None, False)
+        point = location_from_coordinates(part, lat, lon, source=source)
         return _Part(point, None, bool(point.candidates) and point.candidates[0].country_code != GERMANY)
 
     postal_code: str | None = None
@@ -413,6 +422,10 @@ def parse_jsearch_location(
     return _parse("; ".join(kept), source="jsearch", country_hint=hint)
 
 
+def _is_coordinate_pair(lat: float, lon: float) -> bool:
+    return math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180
+
+
 def location_from_coordinates(label: str, lat: float, lon: float, *, source: str) -> Location:
     """A `unique` location at explicit coordinates (spec §8.12).
 
@@ -420,7 +433,7 @@ def location_from_coordinates(label: str, lat: float, lon: float, *, source: str
     (German place or European city) within 50 km; farther from any, the country is unknown and the location is
     `unresolved`. Where two countries are close, the nearer place wins, and German places are far denser.
     """
-    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+    if not _is_coordinate_pair(lat, lon):
         raise ValueError(f"not a coordinate pair: {lat}, {lon}")
     place = Gazetteer.load().nearest(lat, lon, COORDINATE_MATCH_KM)
     candidate = None

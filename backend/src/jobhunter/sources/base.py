@@ -44,6 +44,8 @@ CoverageWindow = tuple[datetime, datetime]
 # The query parameters that carry provider credentials (SerpApi `api_key`, Adzuna `app_id`/`app_key`). They
 # are added at send time only, so a spec refuses them and the request log removes them.
 SECRET_PARAMS: Final = frozenset({"api_key", "app_id", "app_key"})
+# The `location_key` of the cell that asks for remote work within Germany instead of a city (§5.5).
+REMOTE_DE: Final = "remote-de"
 
 
 def public_query(url: httpx.URL) -> str:

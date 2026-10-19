@@ -2,21 +2,25 @@
 
 `load_fixture` reads a case the way the fixture transport serves it (`fixtures.load_case`); `fixture_page`
 turns it into the `RawPage` an adapter parses; `mock_fixture` serves it on a respx route; `served_requests`
-reads the fixture transport's request log (Task 5), each `case` reduced to its name (`search_v2_page1`).
+reads the fixture transport's request log (Task 5), each `case` reduced to its name (`search_v2_page1`);
+`make_cell_plan` builds the `CellPlan` an adapter's `plan` takes (Task 9: a JSearch cell for Berlin, the
+`week` bucket), with any field changed.
 """
 
 import json
 import re
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import httpx
 import respx
-from jobhunter.sources.base import RawPage, RequestSpec
+from jobhunter.sources.base import CellPlan, RawPage, RequestSpec
 from jobhunter.sources.fixtures import load_case
 
 FIXTURES: Final = Path("tests/contract/fixtures")
+_NOW: Final = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
 
 
 def load_fixture(source: str, case: str) -> tuple[int, dict[str, str], bytes]:
@@ -56,3 +60,23 @@ def served_requests(log_path: Path) -> list[dict[str, str]]:
             }
         )
     return served
+
+
+def make_cell_plan(**changes: Any) -> CellPlan:
+    """A JSearch cell for `python developer` in Berlin, bucket `week`, with `changes` applied."""
+    base = CellPlan(
+        cell_id=7,
+        source_id="jsearch",
+        instance_id=1,
+        query_text="python developer",
+        query_lang="en",
+        location_key="berlin",
+        location_label="Berlin",
+        radius_km=25,
+        phase="primary",
+        request_class="normal",
+        bucket="week",
+        window=(datetime(2026, 10, 9, 9, 47, tzinfo=UTC), _NOW),
+        max_days_old=None,
+    )
+    return replace(base, **changes)
