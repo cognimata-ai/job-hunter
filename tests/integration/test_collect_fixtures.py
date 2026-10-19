@@ -15,7 +15,7 @@ pytestmark = pytest.mark.integration
 POSTING = sa.text(
     "SELECT p.id, p.job_id, p.availability, p.availability_changed_at, p.last_seen_at, p.first_seen_at, "
     "p.seen_count, p.latest_observation_id, i.source_id, i.instance_key, j.availability AS job_availability, "
-    "j.availability_changed_at AS job_changed_at, "
+    "j.availability_changed_at AS job_changed_at, j.structured_seniority, "
     "(SELECT count(*) FROM posting_observations o WHERE o.posting_id = p.id) AS observations, "
     "(SELECT o.observed_at FROM posting_observations o WHERE o.id = p.latest_observation_id) AS observed_at "
     "FROM postings p JOIN source_instances i ON i.id = p.source_instance_id JOIN jobs j ON j.id = p.job_id "
@@ -47,6 +47,7 @@ async def test_posting_factory_makes_a_posting_with_its_job_and_one_observation(
         availability="stale",
         last_seen_at=sighted,
         availability_changed_at=changed,
+        structured_seniority="associate",
     )
     async with engine.connect() as conn:
         row = (await conn.execute(POSTING, {"id": posting})).one()
@@ -59,6 +60,7 @@ async def test_posting_factory_makes_a_posting_with_its_job_and_one_observation(
     assert (row.last_seen_at, row.first_seen_at, row.observed_at) == (sighted, sighted, sighted)
     assert (row.availability_changed_at, row.job_changed_at) == (changed, changed)
     assert (row.observations, row.seen_count) == (1, 1) and row.latest_observation_id is not None
+    assert row.structured_seniority == "associate"
 
 
 async def test_posting_factory_creates_the_instance_of_an_ats_source_and_reuses_it(

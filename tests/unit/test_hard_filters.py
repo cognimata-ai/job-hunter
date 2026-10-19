@@ -4,9 +4,9 @@ from typing import Any
 
 import pytest
 from jobhunter.geo.gazetteer import distance_km
-from jobhunter.normalize.titles import normalize_title
+from jobhunter.normalize.titles import SENIORITY_LADDER, normalize_title
 from jobhunter.run_settings import ScopeLocation, SeniorityRange
-from jobhunter.scoring.filters import DetFacts, det_facts_hash, evaluate
+from jobhunter.scoring.filters import STRUCTURED_LEVELS, DetFacts, det_facts_hash, evaluate
 from jobhunter.sources.parsing.locations import Candidate, Location
 from jobhunter.sources.parsing.salary import Salary
 
@@ -297,6 +297,67 @@ def test_an_unknown_bound_is_open() -> None:
     assert evaluate(facts(seniority_tokens=frozenset({"senior"})), "", odd).reasons == (
         "seniority_out_of_range",
     )
+
+
+def test_an_inverted_explicit_range_is_open() -> None:
+    """`min` above `max` says nothing about what the user wants: no job is filtered on its seniority."""
+    inverted = scope(seniority_range=SeniorityRange("explicit", 0, 0, "senior", "junior"))
+    for tokens in ({"intern"}, {"junior"}, {"mid"}, {"senior"}, {"head"}):
+        assert evaluate(facts(seniority_tokens=frozenset(tokens)), "", inverted).passed
+    assert evaluate(facts(structured_seniority="director"), "", inverted).passed
+    equal = scope(
+        seniority_range=SeniorityRange("explicit", 0, 0, "senior", "senior")
+    )  # a range of one level
+    assert evaluate(facts(seniority_tokens=frozenset({"head"})), "", equal).reasons == (
+        "seniority_out_of_range",
+    )
+
+
+# Each provider level and the ladder levels it may stand for (Task 16 ruling T16-b): broad levels map broad,
+# so that an ad is never filtered out for a level that its tag may describe.
+LEVELS_OF = {
+    "internship": {"intern", "working_student"},
+    "student": {"intern", "working_student", "apprentice"},
+    "entry_level": {"intern", "working_student", "apprentice", "junior"},
+    "associate": {"junior", "mid", "senior"},
+    "experienced": {"junior", "mid", "senior", "lead", "principal"},
+    "mid_senior_level": {"mid", "senior", "lead", "principal"},
+    "director": {"lead", "principal", "head"},
+    "executive": {"principal", "head"},
+}
+
+
+@pytest.mark.parametrize("provider_level", sorted(LEVELS_OF))
+def test_a_structured_level_fails_only_outside_every_level_it_may_describe(provider_level: str) -> None:
+    for level in SENIORITY_LADDER:
+        one_level = scope(seniority_range=SeniorityRange("explicit", 0, 0, level, level))
+        result = evaluate(facts(structured_seniority=provider_level), "", one_level)
+        assert result.passed == (level in LEVELS_OF[provider_level]), (provider_level, level)
+
+
+def test_the_provider_levels_of_the_fixtures_are_all_mapped() -> None:
+    assert set(STRUCTURED_LEVELS) == set(LEVELS_OF)
+    assert all(level in SENIORITY_LADDER for levels in STRUCTURED_LEVELS.values() for level in levels)
+
+
+@pytest.mark.parametrize(
+    ("provider_level", "range_", "passes"),
+    [
+        ("mid_senior_level", ("principal", "principal"), True),  # a mid-senior ad may be a principal role
+        ("mid_senior_level", ("head", "head"), False),
+        ("experienced", ("junior", "junior"), True),  # junior ads tagged `experienced` are not filtered out
+        ("experienced", ("intern", "apprentice"), False),
+        ("entry_level", ("apprentice", "apprentice"), True),
+        ("associate", ("senior", "senior"), True),
+        ("director", ("lead", "lead"), True),
+        ("executive", ("principal", "principal"), True),
+        ("internship", ("working_student", "working_student"), True),
+        ("student", ("apprentice", "apprentice"), True),
+    ],
+)
+def test_the_widened_structured_levels(provider_level: str, range_: tuple[str, str], passes: bool) -> None:
+    wanted = scope(seniority_range=SeniorityRange("explicit", 0, 0, *range_))
+    assert evaluate(facts(structured_seniority=provider_level), "", wanted).passed is passes
 
 
 def test_every_failed_filter_is_a_reason_in_the_order_of_the_table() -> None:

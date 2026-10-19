@@ -2,9 +2,10 @@
 
 **Positive evidence only.** `evaluate` fails a job under a filter only when the job's own data proves it;
 whatever is unknown passes. It reads `DetFacts`, the job's deterministic facts (§8.8): the columns of `jobs`
-that feed the filters and `det_results` (so that `det_facts_hash` is what `jobs.det_facts_hash` records), plus
-`structured_seniority`, which `jobs` has no column for and `load_facts` reads from the postings' latest
-observations. `too_old` is not a stored filter (§11.1: it is evaluated at admission as expiry).
+that feed the filters and `det_results`, so `det_facts_hash` is what `jobs.det_facts_hash` records;
+`structured_seniority` is the column `jobs.structured_seniority` (Task 16 ruling T16-a; written by the
+canonical selection of Task 17). `too_old` is not a stored filter (§11.1: it is evaluated at admission as
+expiry).
 
 - `outside_germany`: at least one location, all of them resolved with every candidate outside Germany
   (`positively_outside_germany`), and the job is not remote-capable (`remote` in `work_mode_possible`) under
@@ -17,10 +18,10 @@ observations. `too_old` is not a stored filter (§11.1: it is evaluated at admis
 - `seniority_out_of_range`: only for `seniority_range.mode == "explicit"` (a `profile_relative` range is
   unknown in M1, plan Deviation 8). The title's tokens and the structured level map onto `SENIORITY_LADDER`;
   the job fails when it has such evidence and every level of it lies outside `[min, max]`. A bound that is
-  `None`, or not a ladder level, is open. A structured level is the value a provider wrote
-  (`STRUCTURED_LEVELS`: SmartRecruiters' `experienceLevel.id`, Personio's `seniority`) or a ladder level; it
-  may stand for several levels (`mid_senior_level` stands for mid, senior and lead), and a value that is not
-  known says nothing.
+  `None`, or not a ladder level, is open, and so is a range whose `min` lies above its `max`. A structured
+  level is the value a provider wrote (`STRUCTURED_LEVELS`: SmartRecruiters' `experienceLevel.id`, Personio's
+  `seniority`) or a ladder level; it stands for every level it may cover (`mid_senior_level` for mid to
+  principal), and a value that is not known says nothing.
 - `excluded_company`: the company key is one of the scope's.
 - `excluded_keyword`: a whole-word match in the title (and in the description when the scope says so). Text
   and keywords go through the normalisation of `title_norm` (`normalize_title`: separators, `Sr.`, accents,
@@ -30,30 +31,32 @@ observations. `too_old` is not a stored filter (§11.1: it is evaluated at admis
 `write_result` upserts the row of a (job, scope) with `inputs_hash`, the `jobs.det_facts_hash` the result was
 computed from, and `det_algorithm_version`. `refilter_job` computes and writes a job's rows for the scopes it
 is given under the job row `FOR SHARE`: it waits for an identity transaction that holds the row `FOR UPDATE`
-and reads the facts that transaction committed. Locks are taken in the order of §3.3.3: `active_config`
-(`active_scopes`), then the jobs in ascending id.
+and reads the facts that transaction committed.
 
 **Completeness.** `recompute_stale` finds the unmerged jobs that lack a row for a scope of `active_scopes`, or
 whose row has an `inputs_hash` other than `jobs.det_facts_hash` or another `det_algorithm_version`, and
-refilters up to `BATCH` of them. The heavy reconciler `hard_filter_completeness` runs it over every job;
-node 8 (`graphs.collect.nodes.hard_filters`) over the jobs the run touched. Nothing is fenced by the worker
-epoch: the rows are an idempotent projection of the job, not an owner's write. The unpublished targets of a
-job whose result changed are refiltered once `score_targets` exists (M3).
+refilters up to `BATCH` of them. The heavy reconciler `hard_filter_completeness` runs it over every job
+(fenced by the worker epoch); node 8 (`graphs.collect.nodes.hard_filters`) over the jobs the run touched
+(fenced by the run's owner row). Each batch is one transaction in the lock order of §3.3.3: `active_config`
+(`active_scopes`), then the batch's job rows `FOR SHARE` in ascending id and in one statement (a job merged or
+deleted meanwhile is skipped), then the caller's `guard` (the owner or epoch fence), then the writes. The
+unpublished targets of a job whose result changed are refiltered once `score_targets` exists (M3).
 """
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.seed import canonical_json, content_hash
 from jobhunter.db.sql import q
+from jobhunter.errors import FencedOut
 from jobhunter.geo.gazetteer import distance_km
 from jobhunter.normalize.text import fold
 from jobhunter.normalize.titles import SENIORITY_LADDER, normalize_title
@@ -61,7 +64,8 @@ from jobhunter.run_settings import ScopeLocation, ScopeSettings, scope_from_payl
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
 from jobhunter.sources.parsing.locations import GERMANY, Location, positively_outside_germany
 from jobhunter.sources.parsing.salary import Salary
-from jobhunter.types import JSONValue, get_object
+from jobhunter.types import get_object
+from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
 FilterCode = Literal[
@@ -81,20 +85,23 @@ BATCH: Final = 500  # jobs recomputed per pass of the reconciler (and per transa
 _ON_SITE: Final = frozenset({"onsite", "hybrid"})
 _LEVEL: Final = {name: level for level, name in enumerate(SENIORITY_LADDER)}
 _TOP_LEVEL: Final = len(SENIORITY_LADDER) - 1
-# The levels a provider's own seniority value stands for, by `_level_key` of the value. The wider the set the
-# fewer jobs it fails (a job fails only when every level lies outside the range): `entry_level` is the junior
-# token of §8.2, `associate` sits between junior and mid, `experienced` and `mid_senior_level` span the
-# middle of the ladder, `director` and `executive` are the head of §8.2, and `not_applicable` says nothing.
+# The levels a provider's own seniority value stands for, by `_level_key` of the value. A job fails only when
+# every level of its evidence lies outside the range, so a broad provider level maps broad: it must never
+# filter out an ad that the level may describe (Task 16 ruling T16-b). `entry_level` covers the entry-level
+# rungs (the junior token of §8.2 and the trainee ones), `associate` and `experienced` span the ladder from
+# junior (SmartRecruiters and Personio tag junior ads so) upwards, `mid_senior_level` covers mid to principal,
+# `director` and `executive` the management end, `internship` and `student` the intern rungs, and
+# `not_applicable` says nothing.
 STRUCTURED_LEVELS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     {
-        "internship": ("intern",),
-        "student": ("working_student", "intern"),
-        "entry_level": ("junior",),
-        "associate": ("junior", "mid"),
-        "experienced": ("mid", "senior", "lead", "principal"),
-        "mid_senior_level": ("mid", "senior", "lead"),
-        "director": ("head",),
-        "executive": ("head",),
+        "internship": ("intern", "working_student"),
+        "student": ("intern", "working_student", "apprentice"),
+        "entry_level": ("intern", "working_student", "apprentice", "junior"),
+        "associate": ("junior", "mid", "senior"),
+        "experienced": ("junior", "mid", "senior", "lead", "principal"),
+        "mid_senior_level": ("mid", "senior", "lead", "principal"),
+        "director": ("lead", "principal", "head"),
+        "executive": ("principal", "head"),
     }
 )
 _LEVEL_SEPARATORS: Final = re.compile(r"[\s\-]+")
@@ -127,27 +134,21 @@ class HardFilterResult:
     reasons: tuple[FilterCode, ...]
 
 
-def _sorted(values: Iterable[str]) -> list[JSONValue]:
-    return [*sorted(values)]
-
-
 def det_facts_hash(facts: DetFacts) -> bytes:
     """The SHA-256 of the canonical JSON of `facts`: sets and the unordered lists (locations, remote
     countries) are sorted, so that only a change of content changes the hash."""
-    locations: list[JSONValue] = sorted(
-        (location.model_dump(mode="json") for location in facts.locations), key=canonical_json
-    )
-    document: dict[str, JSONValue] = {
+    locations = sorted((location.model_dump(mode="json") for location in facts.locations), key=canonical_json)
+    document: dict[str, Any] = {
         "company_key": facts.company_key,
         "title_norm": facts.title_norm,
-        "seniority_tokens": _sorted(facts.seniority_tokens),
+        "seniority_tokens": sorted(facts.seniority_tokens),
         "structured_seniority": facts.structured_seniority,
         "locations": locations,
         "location_kind": facts.location_kind,
-        "work_mode_possible": _sorted(facts.work_mode_possible),
+        "work_mode_possible": sorted(facts.work_mode_possible),
         "work_mode_source": facts.work_mode_source,
-        "remote_countries": _sorted(facts.remote_countries),
-        "employment_types": _sorted(facts.employment_types),
+        "remote_countries": sorted(facts.remote_countries),
+        "employment_types": sorted(facts.employment_types),
         "employment_source": facts.employment_source,
         "salary": None if facts.salary is None else facts.salary.model_dump(mode="json"),
         "industry_structured": facts.industry_structured,
@@ -235,6 +236,8 @@ def _seniority_out_of_range(facts: DetFacts, scope: ScopeSettings) -> bool:
     if facts.structured_seniority is not None:
         levels |= _structured_levels(facts.structured_seniority)
     low, high = _bound(wanted.min, 0), _bound(wanted.max, _TOP_LEVEL)
+    if low > high:  # an inverted range says nothing: it is open
+        return False
     return bool(levels) and not any(low <= level <= high for level in levels)
 
 
@@ -253,20 +256,32 @@ def _keyword_pattern(keywords: tuple[str, ...]) -> re.Pattern[str] | None:
     return re.compile(r"(?<!\w)(?:" + "|".join(map(re.escape, forms)) + r")(?!\w)")
 
 
-def _excluded_keyword(facts: DetFacts, description_text: str, scope: ScopeSettings) -> bool:
+class _Description:
+    """A job's description for the keyword match: normalised on first use, once for every scope."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    @cached_property
+    def comparison_form(self) -> str:
+        return _comparison_form(self._text)
+
+
+def _excluded_keyword(facts: DetFacts, description: _Description, scope: ScopeSettings) -> bool:
     pattern = _keyword_pattern(scope.excluded_keywords)
     if pattern is None:
         return False
     if pattern.search(facts.title_norm) is not None:
         return True
-    return (
-        scope.exclude_keywords_in_description
-        and pattern.search(_comparison_form(description_text)) is not None
-    )
+    return scope.exclude_keywords_in_description and pattern.search(description.comparison_form) is not None
 
 
 def evaluate(facts: DetFacts, description_text: str, scope: ScopeSettings) -> HardFilterResult:
     """The hard filters of §11.1 over one job and one scope: the failed ones, in the order of the table."""
+    return _evaluate(facts, _Description(description_text), scope)
+
+
+def _evaluate(facts: DetFacts, description: _Description, scope: ScopeSettings) -> HardFilterResult:
     reasons: list[FilterCode] = []
     if _outside_germany(facts, scope):
         reasons.append("outside_germany")
@@ -280,7 +295,7 @@ def evaluate(facts: DetFacts, description_text: str, scope: ScopeSettings) -> Ha
         reasons.append("seniority_out_of_range")
     if facts.company_key in scope.excluded_companies:
         reasons.append("excluded_company")
-    if _excluded_keyword(facts, description_text, scope):
+    if _excluded_keyword(facts, description, scope):
         reasons.append("excluded_keyword")
     if facts.ad_language != "unknown" and facts.ad_language not in scope.accepted_ad_languages:
         reasons.append("ad_language_excluded")
@@ -294,38 +309,28 @@ def evaluate(facts: DetFacts, description_text: str, scope: ScopeSettings) -> Ha
 _JOB: Final = (
     "SELECT j.company_key, j.title_norm, j.seniority_tokens, j.locations, j.location_kind, "
     "j.work_mode_possible, j.work_mode_source, j.remote_countries, j.employment_types, j.employment_source, "
-    "j.salary, j.industry_structured, j.ad_language, j.posted_at_effective, j.det_facts_hash, "
-    "coalesce(r.description_text, '') AS description_text "
+    "j.salary, j.industry_structured, j.structured_seniority, j.ad_language, j.posted_at_effective, "
+    "j.det_facts_hash, coalesce(r.description_text, '') AS description_text "
     "FROM jobs j LEFT JOIN job_revisions r ON r.id = j.current_revision_id WHERE j.id = :job"
 )
 _READ_JOB: Final = q(_JOB)
 _LOCK_JOB: Final = q(_JOB + " FOR SHARE OF j")
-# The structured seniority of the job: the §8.8 precedence over its postings' latest observations (the best
-# source rank, then the most recent `observed_at`, then the lowest posting id).
-_STRUCTURED_SENIORITY: Final = q(
-    "SELECT o.normalized #>> '{source_structured,seniority}' FROM postings p "
-    "JOIN posting_observations o ON o.id = p.latest_observation_id "
-    "JOIN source_instances i ON i.id = p.source_instance_id JOIN sources s ON s.id = i.source_id "
-    "WHERE p.job_id = :job AND o.normalized #>> '{source_structured,seniority}' IS NOT NULL "
-    "ORDER BY s.precedence_rank, o.observed_at DESC, p.id LIMIT 1"
-)
 
 
 @dataclass(frozen=True)
 class _Loaded:
     facts: DetFacts
     description_text: str
-    det_facts_hash: (
-        bytes  # what `jobs.det_facts_hash` records: the `inputs_hash` of the results computed from it
-    )
+    # The job's stored `det_facts_hash`: the `inputs_hash` of every result written from these facts.
+    det_facts_hash: bytes
 
 
-def _facts(row: Row[tuple[object, ...]], structured_seniority: str | None) -> DetFacts:
+def _facts(row: Row[tuple[object, ...]]) -> DetFacts:
     return DetFacts(
         company_key=row.company_key,
         title_norm=row.title_norm,
         seniority_tokens=frozenset(row.seniority_tokens),
-        structured_seniority=structured_seniority,
+        structured_seniority=row.structured_seniority,
         locations=tuple(Location.model_validate(item) for item in row.locations),
         location_kind=row.location_kind,
         work_mode_possible=frozenset(row.work_mode_possible),
@@ -344,8 +349,7 @@ async def _load(conn: AsyncConnection, job_id: int, *, lock: bool) -> _Loaded:
     row = (await conn.execute(_LOCK_JOB if lock else _READ_JOB, {"job": job_id})).first()
     if row is None:
         raise LookupError(f"job {job_id} does not exist")
-    structured = (await conn.execute(_STRUCTURED_SENIORITY, {"job": job_id})).scalar_one_or_none()
-    return _Loaded(_facts(row, structured), row.description_text, bytes(row.det_facts_hash))
+    return _Loaded(_facts(row), row.description_text, bytes(row.det_facts_hash))
 
 
 async def load_facts(conn: AsyncConnection, job_id: int) -> tuple[DetFacts, str]:
@@ -421,9 +425,10 @@ async def refilter_job(
     not exist.
     """
     loaded = await _load(conn, job_id, lock=True)
+    description = _Description(loaded.description_text)  # normalised at most once, whatever the scopes
     results: dict[int, HardFilterResult] = {}
     for scope_version_id, scope in scopes.items():
-        result = evaluate(loaded.facts, loaded.description_text, scope)
+        result = _evaluate(loaded.facts, description, scope)
         await write_result(conn, job_id, scope_version_id, result, inputs_hash=loaded.det_facts_hash)
         results[scope_version_id] = result
     return results
@@ -431,24 +436,37 @@ async def refilter_job(
 
 # -- completeness --------------------------------------------------------------------------------------------
 
-# The unmerged jobs (touched since `since`, when given) that lack a row for a scope, or whose row is stale.
+# The unmerged jobs (touched since `since`, when given) that lack a row for a scope, or whose row is stale,
+# in id order, locked `FOR SHARE` as they are returned: a job merged or deleted since the scan is skipped.
 _STALE: Final = q(
     "SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL "
     "AND (CAST(:since AS timestamptz) IS NULL OR j.updated_at >= :since) "
     "AND EXISTS (SELECT 1 FROM unnest(CAST(:scopes AS bigint[])) AS s(id) "
     "LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = s.id "
     "WHERE h.job_id IS NULL OR h.inputs_hash <> j.det_facts_hash OR h.det_algorithm_version <> :version) "
-    "ORDER BY j.id LIMIT :limit"
+    "ORDER BY j.id LIMIT :limit FOR SHARE OF j"
 )
+
+type Guard = Callable[[AsyncConnection], Awaitable[None]]
 
 
 async def recompute_stale(
-    conn: AsyncConnection, scopes: Mapping[int, ScopeSettings], *, since: datetime | None = None
+    conn: AsyncConnection,
+    scopes: Mapping[int, ScopeSettings],
+    *,
+    guard: Guard,
+    since: datetime | None = None,
 ) -> int:
     """Refilter up to `BATCH` unmerged jobs, in id order, that lack a result for a scope of `scopes`, or whose
     result has an `inputs_hash` other than the job's `det_facts_hash` or another algorithm version; only the
     jobs updated at or after `since` when it is given. Returns how many jobs it recomputed (a pass that
-    returns `BATCH` may have left more)."""
+    returns `BATCH` may have left more).
+
+    In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `active_scopes`): the batch's
+    job rows `FOR SHARE` in one statement, then `await guard(conn)`, which proves the caller still owns the
+    work (the owner row of the run, or the worker epoch) and raises `FencedOut`, having written nothing, when
+    it does not; then the results are written.
+    """
     if not scopes:
         return 0
     found = await conn.execute(
@@ -456,6 +474,7 @@ async def recompute_stale(
         {"since": since, "scopes": list(scopes), "version": DET_ALGORITHM_VERSION, "limit": BATCH},
     )
     job_ids = [int(job_id) for job_id in found.scalars()]
+    await guard(conn)
     for job_id in job_ids:
         await refilter_job(conn, job_id, scopes)
     return len(job_ids)
@@ -465,6 +484,14 @@ async def recompute_stale(
 async def hard_filter_completeness(ctx: ReconcileContext) -> int:
     """§17.4 `hard_filter_completeness`: the unmerged jobs without a current result for the active (or
     pending) scope are recomputed, under `active_config` `FOR SHARE`, `BATCH` jobs per pass. Returns the
-    count of jobs recomputed."""
-    async with ctx.engine.begin() as conn:
-        return await recompute_stale(conn, await active_scopes(conn))
+    count of jobs recomputed: 0 when `ctx.epoch` is no longer the current worker epoch (`fence_epoch`),
+    because a superseded worker writes nothing."""
+
+    async def fenced(conn: AsyncConnection) -> None:
+        await fence_epoch(conn, ctx.epoch)
+
+    try:
+        async with ctx.engine.begin() as conn:
+            return await recompute_stale(conn, await active_scopes(conn), guard=fenced)
+    except FencedOut:
+        return 0  # the fenced transaction wrote nothing (`fence_epoch` logged it)

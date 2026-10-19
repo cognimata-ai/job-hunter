@@ -34,7 +34,7 @@ right after `fetch_requests`):
          transition_matrix from the code registry
 
 These are the ONLY differences from the spec text. Each one carries a SQL comment naming its owner (plan
-Deviations 1, 2 and 22, M0 Deviations 1 and 2, and plan Task 1 for the constraint names):
+Deviations 1, 2 and 22, Task 16 ruling T16-a, M0 Deviations 1 and 2, and plan Task 1 for the constraint names):
 
   1. queries.proposal_id has no foreign key: M2 adds REFERENCES query_proposals(id) ON DELETE SET NULL with
      query_proposals. query_proposals and profile_vectors are not created (M2, with profile_versions).
@@ -52,6 +52,9 @@ Deviations 1, 2 and 22, M0 Deviations 1 and 2, and plan Task 1 for the constrain
      be quota_windows_tokens_check, which PostgreSQL then refuses for the table CHECK.
   6. is_fenced has the 'global', 'jobs' and 'source' branches; M2 adds the 'profile' branch with
      llm_tuples, ending at the §7.14 body. purge_fences.manifest_id -> deletion_manifests stays M5's.
+  7. jobs.structured_seniority text (nullable) is not in the spec's §7.9: the hard filter
+     seniority_out_of_range reads the structured level (§11.1) as one of the det-facts that det_facts_hash
+     covers, and no other column holds it (Task 16 ruling T16-a; written by Task 17's canonical selection).
 
 Migrations are expand/contract: there is no downgrade.
 """
@@ -443,6 +446,9 @@ CREATE TABLE jobs (
   employment_source       text NOT NULL CHECK (employment_source IN ('structured','text','none')),
   salary                  jsonb,                             -- §8.10
   industry_structured     text,
+  structured_seniority    text,                              -- Task 16 ruling T16-a: the provider's own level as stored in
+                                                             -- source_structured.seniority (Personio, SmartRecruiters), the first non-null of the
+                                                             -- postings' latest observations by precedence_rank, observed_at DESC, posting id
   ad_language             text NOT NULL CHECK (ad_language IN ('de','en','other','unknown')),
   completeness            text NOT NULL CHECK (completeness IN ('full','partial')),
   posted_at_effective     timestamptz,

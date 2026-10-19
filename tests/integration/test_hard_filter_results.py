@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 from datetime import timedelta
+from functools import partial
 from typing import Any
 
 import pytest
@@ -8,6 +9,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import content_hash, scope_payload
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error, q
+from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.nodes.hard_filters import make_hard_filters
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.run_settings import ScopeSettings, SeniorityRange
@@ -18,9 +20,9 @@ from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.worker import main as worker_main
 from jobhunter.worker import reconcilers as r
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from tests.support.collect import ctx, make_deps, queued_run, seed_inputs
+from tests.support.collect import ctx, make_deps, queued_run, supersede
 from tests.support.facts import BERLIN, HAMBURG, facts, scope
 from tests.support.procs import await_until
 from tests.support.quota import seeded_payload
@@ -47,6 +49,16 @@ WAITING = sa.text(
 H2 = hashlib.sha256(b"det facts changed").digest()
 
 
+async def waiting_for_a_lock(engine: AsyncEngine) -> bool:
+    """Some session of the database waits for a lock."""
+    async with engine.connect() as conn:
+        return bool((await conn.execute(WAITING)).scalar_one())
+
+
+async def allow(conn: AsyncConnection) -> None:
+    """A guard that always lets the work through."""
+
+
 async def active_scope_id(engine: AsyncEngine) -> int:
     async with engine.connect() as conn:
         return int((await conn.execute(ACTIVE_SCOPE)).scalar_one())
@@ -62,11 +74,11 @@ async def job_hash(engine: AsyncEngine, job: int) -> bytes:
         return bytes((await conn.execute(JOB_HASH, {"job": job})).scalar_one())
 
 
-async def add_pending_scope(engine: AsyncEngine, **changes: Any) -> int:
-    """A scope version (the seeded scope with `changes`) as the active configuration's pending scope."""
+async def add_scope_version(engine: AsyncEngine, **changes: Any) -> int:
+    """A scope version: the seeded scope with `changes`, not active."""
     payload = {**scope_payload(seeded_payload()), **changes}
     async with engine.begin() as conn:
-        pending = int(
+        return int(
             (
                 await conn.execute(
                     q(
@@ -78,6 +90,12 @@ async def add_pending_scope(engine: AsyncEngine, **changes: Any) -> int:
                 )
             ).scalar_one()
         )
+
+
+async def add_pending_scope(engine: AsyncEngine, **changes: Any) -> int:
+    """A scope version (the seeded scope with `changes`) as the active configuration's pending scope."""
+    pending = await add_scope_version(engine, **changes)
+    async with engine.begin() as conn:
         await conn.execute(sa.text("UPDATE active_config SET pending_scope_version_id = :p"), {"p": pending})
     return pending
 
@@ -185,7 +203,26 @@ async def test_active_scopes_reads_the_active_and_the_pending_scope_under_share(
             )  # a reader can
 
 
-async def test_load_facts_reads_the_job_its_current_revision_and_the_structured_seniority(
+async def set_description(engine: AsyncEngine, job: int, text: str) -> None:
+    """The job's current revision, with `text` as its `description_text`."""
+    async with engine.begin() as conn:
+        revision = (
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, "
+                    "description_text, description_completeness, ad_language, embedding_status) "
+                    "VALUES (:job, 1, :hash, '{}', :text, 'full', 'de', 'awaiting_embedding') RETURNING id"
+                ),
+                {"job": job, "hash": H2, "text": text},
+            )
+        ).scalar_one()
+        await conn.execute(
+            sa.text("UPDATE jobs SET current_revision_id = :rev WHERE id = :job"),
+            {"rev": revision, "job": job},
+        )
+
+
+async def test_load_facts_reads_every_det_fact_from_a_jobs_column_and_the_current_revision(
     engine, current_epoch, job_factory
 ) -> None:
     made = await job_factory(native_id="a")
@@ -203,11 +240,12 @@ async def test_load_facts_reads_the_job_its_current_revision_and_the_structured_
     async with engine.begin() as conn:
         await conn.execute(
             q(
-                "UPDATE jobs SET company_key = 'acme', title_norm = 'senior python developer', "
+                "UPDATE jobs SET company_key = 'initech', title_norm = 'senior python developer', "
                 "seniority_tokens = ARRAY['senior'], locations = :locations, location_kind = 'multi', "
                 "work_mode_possible = ARRAY['hybrid','onsite'], work_mode_source = 'text', "
                 "remote_countries = ARRAY['DE'], employment_types = ARRAY['full_time'], "
                 "employment_source = 'structured', salary = :salary, industry_structured = 'software', "
+                "structured_seniority = 'mid_senior_level', "
                 "ad_language = 'de', posted_precision = 'exact', posted_at_effective = :posted "
                 "WHERE id = :job",
                 jsonb=["locations", "salary"],
@@ -219,15 +257,11 @@ async def test_load_facts_reads_the_job_its_current_revision_and_the_structured_
                 "job": made.job_id,
             },
         )
-        await conn.execute(
-            q("UPDATE posting_observations SET normalized = :n WHERE id = :o", jsonb=["n"]),
-            {"n": {"source_structured": {"seniority": "mid_senior_level"}}, "o": made.observation_ids[0]},
-        )
     async with engine.connect() as conn:
         loaded, description = await filters.load_facts(conn, made.job_id)
     assert description == ""  # no current revision
     assert loaded == DetFacts(
-        company_key="acme",
+        company_key="initech",
         title_norm="senior python developer",
         seniority_tokens=frozenset({"senior"}),
         structured_seniority="mid_senior_level",
@@ -244,23 +278,13 @@ async def test_load_facts_reads_the_job_its_current_revision_and_the_structured_
         posted_at_effective=posted,
     )
     assert loaded.salary is not None and loaded.salary.model_dump(mode="json") == salary
+    # No fact is left at its unknown default: every one of them came from a column of the job.
+    unknown = facts()
+    assert [
+        name for name in DetFacts.__dataclass_fields__ if getattr(loaded, name) == getattr(unknown, name)
+    ] == []
 
-    async with engine.begin() as conn:
-        revision = (
-            await conn.execute(
-                sa.text(
-                    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, "
-                    "description_text, description_completeness, ad_language, embedding_status) "
-                    "VALUES (:job, 1, :hash, '{}', "
-                    "'Wir nutzen SAP.', 'full', 'de', 'awaiting_embedding') RETURNING id"
-                ),
-                {"job": made.job_id, "hash": H2},
-            )
-        ).scalar_one()
-        await conn.execute(
-            sa.text("UPDATE jobs SET current_revision_id = :rev WHERE id = :job"),
-            {"rev": revision, "job": made.job_id},
-        )
+    await set_description(engine, made.job_id, "Wir nutzen SAP.")
     async with engine.connect() as conn:
         assert (await filters.load_facts(conn, made.job_id))[1] == "Wir nutzen SAP."
     with pytest.raises(LookupError):
@@ -268,63 +292,12 @@ async def test_load_facts_reads_the_job_its_current_revision_and_the_structured_
             await filters.load_facts(conn, made.job_id + 1000)
 
 
-async def test_the_structured_seniority_is_the_best_ranked_latest_observation(
-    engine, current_epoch, job_factory
-) -> None:
-    """§8.8 precedence: the best source rank (an ATS before JSearch), then the most recent `observed_at`."""
-    await seed_inputs(
-        engine, companies=(("greenhouse", "acme-gh"), ("smartrecruiters", "acme-sr")), enabled=("ats",)
-    )
-    now = utcnow()
-    first = await job_factory(
-        native_id="a",
-        source_id="greenhouse",
-        instance_key="acme-gh",
-        observations=[(now - timedelta(hours=2), None)],
-    )
-    second = await job_factory(
-        native_id="b",
-        source_id="smartrecruiters",
-        instance_key="acme-sr",
-        observations=[(now - timedelta(hours=1), None)],
-    )
-    third = await job_factory(native_id="c", source_id="jsearch", observations=[(now, None)])
-    levels = {first.observation_ids[0]: "entry-level", second.observation_ids[0]: "director"}
-    levels[third.observation_ids[0]] = "senior"
-    async with engine.begin() as conn:
-        for other in (second, third):  # one job with the three postings
-            await conn.execute(
-                sa.text("UPDATE postings SET job_id = :job WHERE id = :posting"),
-                {"job": first.job_id, "posting": other.posting_id},
-            )
-        for observation, level in levels.items():
-            await conn.execute(
-                q("UPDATE posting_observations SET normalized = :n WHERE id = :o", jsonb=["n"]),
-                {"n": {"source_structured": {"seniority": level}}, "o": observation},
-            )
-
-    async def structured() -> str | None:
-        async with engine.connect() as conn:
-            return (await filters.load_facts(conn, first.job_id))[0].structured_seniority
-
-    assert await structured() == "director"  # both ATS (rank 1): the later observation; JSearch is rank 2
-    for observation, expected in (
-        (second.observation_ids[0], "entry-level"),
-        (first.observation_ids[0], "senior"),
-    ):
-        async with engine.begin() as conn:
-            await conn.execute(
-                sa.text("UPDATE posting_observations SET normalized = '{}' WHERE id = :o"), {"o": observation}
-            )
-        assert await structured() == expected
-    async with engine.begin() as conn:
-        await conn.execute(
-            sa.text(
-                "UPDATE posting_observations SET normalized = '{\"source_structured\": {}}' WHERE id = :o"
-            ),
-            {"o": third.observation_ids[0]},
-        )
-    assert await structured() is None
+async def test_a_job_without_a_structured_seniority_loads_none(engine, current_epoch, job_factory) -> None:
+    plain = await job_factory(native_id="a")
+    tagged = await job_factory(native_id="b", structured_seniority="entry-level")
+    async with engine.connect() as conn:
+        assert (await filters.load_facts(conn, plain.job_id))[0].structured_seniority is None
+        assert (await filters.load_facts(conn, tagged.job_id))[0].structured_seniority == "entry-level"
 
 
 async def test_refilter_job_writes_a_row_per_scope_with_the_stored_hash(
@@ -362,14 +335,10 @@ async def test_refilter_job_computes_from_the_facts_an_overlapping_transaction_c
         async with engine.begin() as conn:
             return await filters.refilter_job(conn, job, {active: scope()})
 
-    async def waiting_for_a_lock() -> bool:
-        async with engine.connect() as conn:
-            return bool((await conn.execute(WAITING)).scalar_one())
-
     async with engine.connect() as identity:
         await identity.execute(SET_JOB, {"language": "other", "hash": H2, "job": job})  # uncommitted
         task = asyncio.create_task(refilter())
-        await await_until(waiting_for_a_lock, 10)
+        await await_until(partial(waiting_for_a_lock, engine), 10)
         await identity.commit()
     assert await task == {active: HardFilterResult(False, ("ad_language_excluded",))}
     stored = await row(engine, job, active)
@@ -377,12 +346,7 @@ async def test_refilter_job_computes_from_the_facts_an_overlapping_transaction_c
 
 
 async def test_refilter_job_uses_the_scopes_it_is_given(engine, current_epoch, job_factory) -> None:
-    made = await job_factory(native_id="a")
-    async with engine.begin() as conn:
-        await conn.execute(
-            q("UPDATE posting_observations SET normalized = :n WHERE id = :o", jsonb=["n"]),
-            {"n": {"source_structured": {"seniority": "entry_level"}}, "o": made.observation_ids[0]},
-        )
+    made = await job_factory(native_id="a", structured_seniority="entry_level")
     active = await active_scope_id(engine)
     explicit = scope(seniority_range=SeniorityRange("explicit", 0, 0, "senior", "senior"))
     async with engine.begin() as conn:
@@ -392,6 +356,43 @@ async def test_refilter_job_uses_the_scopes_it_is_given(engine, current_epoch, j
     with pytest.raises(LookupError):
         async with engine.begin() as conn:
             await filters.refilter_job(conn, made.job_id + 1000, {active: explicit})
+
+
+async def test_the_description_is_normalised_once_for_all_scopes(
+    engine, current_epoch, job_factory, monkeypatch
+) -> None:
+    job = (await job_factory(native_id="a")).job_id
+    text = "Wir suchen Front-End Entwickler mit SAP-Erfahrung."
+    await set_description(engine, job, text)
+    active = await active_scope_id(engine)
+    sap = await add_scope_version(engine, excluded_keywords=["sap"])
+    php = await add_scope_version(engine, excluded_keywords=["php"])
+    calls: list[str] = []
+    real = filters._comparison_form
+
+    def counting(value: str) -> str:
+        calls.append(value)
+        return real(value)
+
+    monkeypatch.setattr(filters, "_comparison_form", counting)
+
+    def reading(*keywords: str) -> ScopeSettings:
+        return scope(excluded_keywords=keywords, exclude_keywords_in_description=True)
+
+    async with engine.begin() as conn:
+        results = await filters.refilter_job(
+            conn, job, {active: reading("front-end"), sap: reading("sap"), php: reading("php")}
+        )
+    assert {scope_id: result.reasons for scope_id, result in results.items()} == {
+        active: ("excluded_keyword",),
+        sap: ("excluded_keyword",),
+        php: (),
+    }
+    assert calls.count(text) == 1  # three scopes read the description, one normalisation of it
+    calls.clear()
+    async with engine.begin() as conn:
+        await filters.refilter_job(conn, job, {active: scope(excluded_keywords=("sap",)), php: scope()})
+    assert text not in calls  # no scope reads the description: it is never normalised
 
 
 async def test_reconciler_works_through_stale_jobs_in_batches_of_a_pass(
@@ -491,3 +492,89 @@ async def test_the_facts_of_a_job_that_knows_nothing_pass_every_filter(
         loaded, description = await filters.load_facts(conn, job)
     assert loaded == facts() and description == ""
     assert filters.evaluate(loaded, description, scope()).passed
+
+
+async def test_the_batch_is_locked_before_the_guard_and_a_refused_guard_writes_nothing(
+    engine, current_epoch, job_factory
+) -> None:
+    job = (await job_factory(native_id="a")).job_id
+    active = await active_scope_id(engine)
+    held: list[str | None] = []
+
+    async def probe(conn: AsyncConnection) -> None:
+        async with engine.connect() as other:  # the batch's job rows are already held `FOR SHARE`
+            with pytest.raises(sa.exc.DBAPIError) as refused:
+                await other.execute(
+                    sa.text("SELECT 1 FROM jobs WHERE id = :job FOR UPDATE NOWAIT"), {"job": job}
+                )
+            held.append(pg_error(refused.value).sqlstate)
+
+    async def refuse(conn: AsyncConnection) -> None:
+        raise FencedOut("run")
+
+    async with engine.begin() as conn:
+        assert await filters.recompute_stale(conn, await filters.active_scopes(conn), guard=probe) == 1
+    assert held == [LOCK_NOT_AVAILABLE]
+    async with engine.begin() as conn:
+        await conn.execute(sa.text("DELETE FROM hard_filter_results"))
+    with pytest.raises(FencedOut):
+        async with engine.begin() as conn:
+            await filters.recompute_stale(conn, await filters.active_scopes(conn), guard=refuse)
+    assert await row(engine, job, active) is None
+
+
+@pytest.mark.parametrize("change", ["deleted", "merged"])
+async def test_a_job_deleted_or_merged_between_the_scan_and_the_lock_is_skipped(
+    engine, current_epoch, job_factory, change
+) -> None:
+    gone = await job_factory(native_id="gone")  # the lower id: the batch waits for it first
+    kept = await job_factory(native_id="kept")
+    active = await active_scope_id(engine)
+
+    async def recompute() -> int:
+        async with engine.begin() as conn:
+            return await filters.recompute_stale(conn, await filters.active_scopes(conn), guard=allow)
+
+    async with engine.connect() as other:
+        if change == "deleted":
+            await other.execute(sa.text("DELETE FROM postings WHERE job_id = :job"), {"job": gone.job_id})
+            await other.execute(sa.text("DELETE FROM jobs WHERE id = :job"), {"job": gone.job_id})
+        else:
+            await other.execute(
+                sa.text("UPDATE jobs SET merged_into_job_id = :into WHERE id = :job"),
+                {"into": kept.job_id, "job": gone.job_id},
+            )
+        task = asyncio.create_task(recompute())
+        await await_until(partial(waiting_for_a_lock, engine), 10)  # the batch waits for the row
+        await other.commit()
+    assert await task == 1  # the other job; the gone one is skipped, not raised
+    assert (await row(engine, kept.job_id, active)).passed is True
+    assert await row(engine, gone.job_id, active) is None
+
+
+async def test_the_reconciler_of_a_superseded_worker_epoch_writes_nothing(
+    engine, current_epoch, queue_app, job_factory
+) -> None:
+    job = (await job_factory(native_id="a")).job_id
+    active = await active_scope_id(engine)
+    reconcile = r.REGISTRY["hard_filter_completeness"][1]
+    assert await reconcile(ctx(engine, queue_app, epoch=current_epoch + 1)) == 0
+    assert await row(engine, job, active) is None
+    assert await reconcile(ctx(engine, queue_app, epoch=current_epoch)) == 1
+    assert (await row(engine, job, active)).passed is True
+
+
+async def test_node_8_of_a_superseded_attempt_is_fenced_out_and_writes_nothing(
+    engine, current_epoch, queue_app, job_factory
+) -> None:
+    owner = await queued_run(engine, include_paid=False)
+    job = (await job_factory(native_id="a")).job_id  # touched after the run started
+    newer = await supersede(engine, owner)
+    node = make_hard_filters(make_deps(engine, no_adapter))
+    active = await active_scope_id(engine)
+    with pytest.raises(FencedOut):
+        await node(initial_state(owner.run_id, owner.attempt_no))
+    assert await row(engine, job, active) is None
+    update = await node(initial_state(newer.run_id, newer.attempt_no))  # the attempt that owns the run
+    assert update["counters"] == {"hard_filter_backfilled": 1}
+    assert (await row(engine, job, active)).passed is True

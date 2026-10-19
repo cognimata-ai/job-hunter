@@ -426,16 +426,18 @@ class JobFactory(Protocol):
         title: str = "Python Developer",
         company: str = "Acme",
         availability: str = "active",
+        structured_seniority: str | None = None,
     ) -> Awaitable[MadeJob]: ...
 
 
 _JOB: Final = q(
     "INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, work_mode_possible, "
     "work_mode_source, employment_source, ad_language, completeness, posted_precision, first_seen_at, "
-    "last_seen_at, availability, availability_changed_at, source_ids, field_provenance, det_facts_hash) "
+    "last_seen_at, availability, availability_changed_at, source_ids, field_provenance, det_facts_hash, "
+    "structured_seniority) "
     "VALUES (lower(:company), :company, :title, lower(:title), 'unknown', ARRAY['remote','hybrid','onsite'], "
     "'none', 'none', 'unknown', 'full', 'unknown', :first, :last, :availability, :changed, ARRAY[:source], "
-    "'{}', :facts) RETURNING id"
+    "'{}', :facts, :seniority) RETURNING id"
 )
 _POSTING: Final = q(
     "INSERT INTO postings (source_instance_id, native_id, job_id, first_seen_at, last_seen_at, seen_count, "
@@ -466,11 +468,13 @@ async def insert_job(
     availability: str = "active",
     availability_changed_at: datetime | None = None,
     create_instance: bool = False,
+    structured_seniority: str | None = None,
 ) -> MadeJob:
     """A job with one posting of `(source_id, instance_key)` and one observation per entry of `observations`
     (one now without any), inserted directly; the availability of the job and the posting was last changed at
     `availability_changed_at` (the last sighting by default). With `create_instance` a missing source instance
-    is created (a board that `seed_inputs` did not make)."""
+    is created (a board that `seed_inputs` did not make). `structured_seniority` is the job's column of that
+    name (the provider's own level, `source_structured.seniority`)."""
     seen = list(observations) or [(utcnow(), None)]
     first, last = min(at for at, _ in seen), max(at for at, _ in seen)
     changed = last if availability_changed_at is None else availability_changed_at
@@ -487,6 +491,7 @@ async def insert_job(
             "availability": availability,
             "source": source_id,
             "facts": hashlib.sha256(f"{source_id}:{native_id}".encode()).digest(),
+            "seniority": structured_seniority,
         }
         job = int((await conn.execute(_JOB, job_params)).scalar_one())
         posting_params = {
@@ -527,6 +532,7 @@ def job_factory(engine: AsyncEngine) -> JobFactory:
         title: str = "Python Developer",
         company: str = "Acme",
         availability: str = "active",
+        structured_seniority: str | None = None,
     ) -> MadeJob:
         return await insert_job(
             engine,
@@ -537,6 +543,7 @@ def job_factory(engine: AsyncEngine) -> JobFactory:
             title=title,
             company=company,
             availability=availability,
+            structured_seniority=structured_seniority,
         )
 
     return make
@@ -556,6 +563,7 @@ class PostingFactory(Protocol):
         last_seen_at: datetime,
         availability_changed_at: datetime,
         instance_key: str = "default",
+        structured_seniority: str | None = None,
     ) -> Awaitable[int]: ...
 
 
@@ -568,10 +576,16 @@ async def make_posting(
     last_seen_at: datetime,
     availability_changed_at: datetime,
     instance_key: str = "default",
+    structured_seniority: str | None = None,
 ) -> int:
     """The id of a posting of `(source_id, instance_key)` (the instance is created when absent) with its job
     (the same availability) and one observation at `last_seen_at`; `availability_changed_at` is when the
-    availability last changed."""
+    availability last changed.
+
+    A missing instance is created without a watchlist company: `greenhouse` / `default` is such an instance, a
+    board that no watchlist entry owns, so a test that plans a run over the watchlist (Tasks 19 and 20) must
+    not expect it to be planned or served; the watchlist boards come from `seed_inputs` (`board`, `board20`).
+    """
     made = await insert_job(
         engine,
         native_id=native_id,
@@ -581,6 +595,7 @@ async def make_posting(
         availability=availability,
         availability_changed_at=availability_changed_at,
         create_instance=True,
+        structured_seniority=structured_seniority,
     )
     return made.posting_id
 
