@@ -33,6 +33,13 @@ FETCH_REQUESTS = Counter(
     ["source", "status"],
     registry=REGISTRY,
 )
+# The raw items `parse_normalize` wrote (one per element of a response it parsed), by source and disposition.
+RAW_ITEMS = Counter(
+    "jobhunter_raw_items",
+    "Raw items written by parse_normalize.",
+    ["source", "disposition"],
+    registry=REGISTRY,
+)
 # The provider's current quota window (§6.3); the ledger's reservation and settlement set them (M1 Task 8).
 QUOTA_USED_UNITS = Gauge(
     "jobhunter_quota_used_units",

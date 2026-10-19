@@ -25,6 +25,13 @@ moved 20 days ahead of today by `serpapi_account_response`, so its window is cur
 Task 14: `fake_http` also logs every request its fixture transport serves to `fixture_log`; `adapters` is the
 fixture-backed adapter factory of the fetch nodes (`Callable[[InstanceRow], SourceAdapter]`): every adapter on
 `fake_http`'s fixture transport (one `http.make_client` per source), clock `utcnow`, keys `b"fake"`.
+
+Task 15: `served_response` acquires one page for a run through the one-page protocol (`acquire_page`) and
+returns its stored response; `arbeitnow_spec` is a page spec of the Arbeitnow default instance's cell. Two
+fixtures give an admitted run (`queued_run`) with one stored response, as `(RunOwner, raw_response_id)`:
+`stored_arbeitnow_page`, the recorded Arbeitnow `page1` (30 elements) served on respx, and `crafted_page`, a
+JSearch page derived from the recorded `search_v2_page1` (`crafted_jsearch_jobs`: five jobs, element 3 repeats
+element 1's `job_uid`, element 4, the fifth, has none), served on respx as page 1 of the `remote-de` cell.
 """
 
 import json
@@ -32,7 +39,7 @@ import re
 import shutil
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 
@@ -42,19 +49,33 @@ import respx
 from jobhunter.clock import utcnow
 from jobhunter.config import load_config
 from jobhunter.db.sql import q
+from jobhunter.quota.windows import Provider
 from jobhunter.sources import ats as ats_adapters
 from jobhunter.sources import http
+from jobhunter.sources.acquire import acquire_page
 from jobhunter.sources.adzuna import AdzunaAdapter
-from jobhunter.sources.arbeitnow import ArbeitnowAdapter
+from jobhunter.sources.arbeitnow import FEED_URL, ArbeitnowAdapter
 from jobhunter.sources.ats.common import AtsAdapter
-from jobhunter.sources.base import CellPlan, NormalizedPosting, Parsed, RawPage, RequestSpec, SourceAdapter
+from jobhunter.sources.base import (
+    Billing,
+    CellPlan,
+    NormalizedPosting,
+    Parsed,
+    RawPage,
+    RequestSpec,
+    SourceAdapter,
+)
 from jobhunter.sources.fixtures import fixture_transport, load_case, renewed_account
 from jobhunter.sources.instances import InstanceRow
+from jobhunter.sources.jsearch import SEARCH_URL as JSEARCH_URL
 from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.sources.serpapi import ACCOUNT_URL, SEARCH_URL, SerpApiAdapter
 from jobhunter.sources.watchlist_patterns import AtsType
-from jobhunter.types import JSONValue
+from jobhunter.types import JSONValue, get_list, get_object
+from jobhunter.worker.runs import RunOwner
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from tests.support.collect import acquire_ctx, instance_id, jsearch_cell, page1_spec, queued_run, source_cell
 
 FIXTURES: Final = Path("tests/contract/fixtures")
 _NOW: Final = datetime(2026, 10, 16, 9, 47, tzinfo=UTC)
@@ -337,3 +358,94 @@ async def arbeitnow_adapter(
     instance = await _default_instance(engine, "arbeitnow")
     async with httpx.AsyncClient() as client:
         yield ArbeitnowAdapter(client, instance_id=instance, clock=utcnow)
+
+
+# ---- Task 15 ----------------------------------------------------------------------------------------------
+
+StoredPage = tuple[RunOwner, int]
+_RAW_RESPONSE_OF: Final = q("SELECT raw_response_id FROM fetch_requests WHERE id = :i")
+
+
+async def served_response(
+    engine: AsyncEngine,
+    owner: RunOwner,
+    adapter: SourceAdapter,
+    spec: RequestSpec,
+    *,
+    billing: Billing,
+    provider: Provider | None,
+) -> int:
+    """The `raw_responses` id of `spec`'s page, acquired for `owner` through `acquire_page` (`acquire_ctx`);
+    a page that failed with a response (a `failed('contract')` 200) has its stored response too."""
+    ctx = acquire_ctx(engine, owner, adapter, billing=billing, provider=provider)
+    result = await acquire_page(ctx, spec, cell_id=spec.cell_id, phase="primary", planned_id=None)
+    async with engine.connect() as conn:
+        raw_response_id = (await conn.execute(_RAW_RESPONSE_OF, {"i": result.fetch_request_id})).scalar()
+    if raw_response_id is None:
+        raise RuntimeError(f"served_response: the page of request {result.fetch_request_id} stored nothing")
+    return int(raw_response_id)
+
+
+async def arbeitnow_spec(engine: AsyncEngine, adapter: ArbeitnowAdapter, page_no: int = 1) -> RequestSpec:
+    """Page `page_no` of the Arbeitnow default instance's cell (created when absent), a free request."""
+    cell = await source_cell(engine, "arbeitnow", query=None, location_key=None)
+    async with engine.connect() as conn:
+        instance = await instance_id(conn, "arbeitnow")
+    now = utcnow()
+    plan = make_cell_plan(
+        cell_id=cell,
+        source_id="arbeitnow",
+        instance_id=instance,
+        query_text=None,
+        query_lang=None,
+        location_key=None,
+        location_label=None,
+        radius_km=None,
+        request_class="free",
+        bucket=None,
+        window=(now - timedelta(days=1), now),
+    )
+    first = adapter.plan(plan)
+    return first if page_no == 1 else replace(first, page_no=page_no)
+
+
+@pytest.fixture
+async def stored_arbeitnow_page(
+    engine: AsyncEngine, current_epoch: int, arbeitnow_adapter: ArbeitnowAdapter, respx_mock: respx.MockRouter
+) -> StoredPage:
+    """An admitted run with one served Arbeitnow page-1 receipt (the recorded `page1`, 30 elements)."""
+    mock_fixture(respx_mock, "GET", FEED_URL, "arbeitnow", "page1")
+    owner = await queued_run(engine)
+    spec = await arbeitnow_spec(engine, arbeitnow_adapter)
+    return owner, await served_response(engine, owner, arbeitnow_adapter, spec, billing="free", provider=None)
+
+
+def crafted_jsearch_jobs() -> list[JSONValue]:
+    """Five jobs of the recorded `search_v2_page1`: element 3 is the recorded fourth job with element 1's
+    `job_uid`, element 4 the recorded fifth job without its `job_uid`."""
+    jobs = get_list(get_object(json.loads(load_fixture("jsearch", "search_v2_page1")[2]), "data"), "jobs")
+    first, second, third, fourth, fifth = (dict(get_object(job, "")) for job in jobs[:5])
+    del fifth["job_uid"]
+    return [first, second, third, {**fourth, "job_uid": second["job_uid"]}, fifth]
+
+
+@pytest.fixture
+async def crafted_page(engine: AsyncEngine, current_epoch: int, respx_mock: respx.MockRouter) -> StoredPage:
+    """An admitted run with one served JSearch page-1 receipt whose body is the recorded `search_v2_page1`
+    with `crafted_jsearch_jobs` as its jobs. Its `x-ratelimit-requests-remaining` is 199 (the fresh ledger's
+    count), so the observation adjusts nothing."""
+    status, headers, body = load_fixture("jsearch", "search_v2_page1")
+    doc = json.loads(body)
+    doc["data"]["jobs"] = crafted_jsearch_jobs()
+    respx_mock.get(JSEARCH_URL).mock(
+        return_value=httpx.Response(
+            status,
+            headers={**headers, "x-ratelimit-requests-remaining": "199"},
+            content=json.dumps(doc).encode("utf-8"),
+        )
+    )
+    owner = await queued_run(engine)
+    spec = await page1_spec(engine, await jsearch_cell(engine))
+    async with httpx.AsyncClient() as client:
+        adapter = JSearchAdapter(client, api_key=b"fake", instance_id=spec.source_instance_id, clock=utcnow)
+        return owner, await served_response(engine, owner, adapter, spec, billing="paid", provider="jsearch")

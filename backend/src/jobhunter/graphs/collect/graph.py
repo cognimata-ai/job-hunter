@@ -10,9 +10,10 @@ planned primary spec (`nodes.fetch.route_after_primary`, or straight on when the
 resolve_identity → embed → hard_filters → enqueue_targets → finalize → END`; after a `fetch_cell`,
 `route_after_cell` goes to `plan_fallback` in the primary phase and to `parse_normalize` in the fallback one.
 Every node has its §9.2 timeout; the nodes that make no source or embedder call retry a serialization
-failure, a deadlock or a lost connection (`DB_RETRY`, `is_retryable_db_error`), and nothing else. The nodes
-from `parse_normalize` to `finalize` are pass-through functions here until Tasks 15 to 23 wire theirs
-(`finalize` keeps the fault point `collect.before_finalize`).
+failure, a deadlock or a lost connection (`DB_RETRY`, `is_retryable_db_error`), and nothing else.
+`parse_normalize` is `nodes.parse_normalize` (Task 15); the nodes from `resolve_identity` to `finalize` are
+pass-through functions here until Tasks 16 to 23 wire theirs (`finalize` keeps the fault point
+`collect.before_finalize`).
 
 **Error handling (§9.1).** Every node runs inside `error_handled`, which turns a typed `SourceError` that
 reached it into a persisted outcome (the checkpointed update: a `failed` `FetchOutcome` for the fetch request
@@ -49,6 +50,7 @@ from jobhunter.graphs.collect.nodes.fetch import (
     route_after_fallback,
     route_after_primary,
 )
+from jobhunter.graphs.collect.nodes.parse_normalize import make_parse_normalize
 from jobhunter.graphs.collect.nodes.plan import make_plan
 from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback, route
 from jobhunter.graphs.collect.state import CollectState as CollectState
@@ -144,7 +146,7 @@ def build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDep
         "fetch_primary": make_fetch_primary(deps),
         "plan_fallback": make_plan_fallback(deps),
         "fetch_fallback": make_fetch_fallback(deps),
-        "parse_normalize": _pass_through("parse_normalize"),
+        "parse_normalize": make_parse_normalize(deps),
         "resolve_identity": _pass_through("resolve_identity"),
         "embed": _pass_through("embed"),
         "hard_filters": _pass_through("hard_filters"),

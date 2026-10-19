@@ -141,7 +141,6 @@ def test_c3_after_response_before_settle(migrated, proc_env, procs, fixture_log)
     assert [int(r["pid"]) for r in served_requests(fixture_log) if r["case"] == "search_v2_page1"] == [a.pid]
 
 
-@pytest.mark.skip(reason="`collect.before_parse` and the parsing it asserts arrive with Task 15")
 def test_c4_after_settle_before_parse(migrated, proc_env, procs, fixture_log) -> None:
     run_id = manual_paid_run(migrated, only="jsearch")
     a = die_at(migrated, proc_env, procs, fixture_log, "collect.before_parse")
@@ -164,3 +163,26 @@ def test_c4_after_settle_before_parse(migrated, proc_env, procs, fixture_log) ->
         "JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = %s",
         run_id,
     ) == (True,)  # and parses them (Task 15)
+
+
+def test_c5_between_responses_resumes_without_duplicates(migrated, proc_env, procs, fixture_log) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")  # two pages: A dies after parsing the first
+    die_at(migrated, proc_env, procs, fixture_log, "collect.parse.between_responses")
+    assert one(
+        migrated,
+        "SELECT count(*) FILTER (WHERE r.parsed_at IS NULL) FROM raw_responses r "
+        "JOIN fetch_requests f ON f.id = r.fetch_request_id WHERE f.run_id = %s AND f.status = 'succeeded'",
+        run_id,
+    ) == (1,)  # one response left unparsed
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    rows = pg_rows(
+        migrated,
+        "superuser",
+        "SELECT r.parsed_at IS NOT NULL, r.item_count, count(i.id), count(DISTINCT i.item_index) "
+        "FROM raw_responses r JOIN fetch_requests f ON f.id = r.fetch_request_id "
+        "LEFT JOIN raw_items i ON i.raw_response_id = r.id WHERE f.run_id = %s AND f.status = 'succeeded' "
+        "GROUP BY r.id",
+        run_id,
+    )
+    # parsed once, no duplicate row, dispositions conserve
+    assert len(rows) == 2 and all(parsed and n == items == distinct for parsed, n, items, distinct in rows)

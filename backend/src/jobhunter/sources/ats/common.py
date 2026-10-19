@@ -7,12 +7,16 @@ concurrent requests, 5 per second; `host` names the bucket). The request goes th
 redirects are refused except within the Personio host family (§5.2).
 
 The envelope gate: an adapter's `_items` is the only reader of a body, and every read path (`check_envelope`,
-`peek_native_ids`, `parse`, `continuation`, the reported total) goes through it, so no error body is ever read
-as a page or as the end of a board. A body of the wrong shape is a `ContractViolation`; the provider's own
-error report delivered with a 2xx (a Greenhouse `{"status", "error"}`, a Lever `{"ok": false, "error"}`, ...)
-is `SourceError("transient", code="provider_error")` (ruling T9-a): a failed attempt that counts toward the
-free threshold, not a broken contract. An error report beside the items, even beside an empty item list, is
-that error too, never an (empty) board (ruling T11-c).
+`peek_native_ids`, `elements`, `parse`, `continuation`, the reported total) goes through it, so no error body
+is ever read as a page or as the end of a board. A body of the wrong shape is a `ContractViolation`; the
+provider's own error report delivered with a 2xx (a Greenhouse `{"status", "error"}`, a Lever
+`{"ok": false, "error"}`, ...) is `SourceError("transient", code="provider_error")` (ruling T9-a): a failed
+attempt that counts toward the free threshold, not a broken contract. An error report beside the items, even
+beside an empty item list, is that error too, never an (empty) board (ruling T11-c).
+
+The elements of a page (`elements`, ruling T15-a) are the `_canonical` bytes of its items, in their order: the
+canonical JSON of a JSON item (a SmartRecruiters detail page is one element, its posting), the C14N 2.0 form
+of a Personio `<position>`.
 
 The item contract: an item that is not an object, has no native id or has no string title is
 `Rejected("item_contract")`; a native id seen earlier on the page is `DuplicateInPage`. ATS postings are not
@@ -30,16 +34,18 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
-from typing import ClassVar, Final, Literal
+from typing import ClassVar, Final, Literal, cast
 
 import httpx
 
+from jobhunter.db.seed import canonical_json
 from jobhunter.normalize.html import html_to_text, sanitize_html
 from jobhunter.normalize.keys import AdKey, ats_key
 from jobhunter.normalize.quality import Quality, description_quality
 from jobhunter.normalize.text import norm_text
 from jobhunter.normalize.urls import canonical_url
 from jobhunter.sources.base import (
+    ITEM_CONTRACT,
     Capabilities,
     CellPlan,
     Continuation,
@@ -73,7 +79,6 @@ ALL_WORK_MODES: Final = frozenset({"remote", "hybrid", "onsite"})
 IncompleteReason = Literal["non_2xx", "envelope", "no_end", "count_mismatch", "missing_id"]
 # The §5.3.5 rules in their order: an incomplete snapshot names the first rule that failed.
 RULES: Final[tuple[IncompleteReason, ...]] = ("non_2xx", "envelope", "no_end", "count_mismatch", "missing_id")
-ITEM_CONTRACT: Final = "item_contract"
 
 
 @dataclass(frozen=True)
@@ -319,6 +324,13 @@ class AtsAdapter(ABC):
 
     def peek_native_ids(self, page: RawPage) -> list[str | None]:
         return [self._native_id(item) for item in self._items(page)]
+
+    def _canonical(self, item: object) -> bytes:
+        """The canonical bytes of one item of `_items`: its canonical JSON (a JSON board's items are JSON)."""
+        return canonical_json(cast(JSONValue, item))
+
+    def elements(self, page: RawPage) -> list[bytes]:
+        return [self._canonical(item) for item in self._items(page)]
 
     def reported_total(self, page: RawPage) -> int | None:
         """The number of items this page must hold, where the board says so (§5.3.5 rule 4, per page)."""

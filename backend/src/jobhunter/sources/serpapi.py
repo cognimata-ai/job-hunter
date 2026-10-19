@@ -40,6 +40,7 @@ from typing import Final, Literal
 
 import httpx
 
+from jobhunter.db.seed import canonical_json
 from jobhunter.normalize.keys import AdKey, decode_serpapi_job_id, keys_from_link
 from jobhunter.normalize.text import norm_text
 from jobhunter.normalize.urls import canonical_url
@@ -365,6 +366,9 @@ class SerpApiAdapter:
 
     def peek_native_ids(self, page: RawPage) -> list[str | None]:
         return [_htidocid(job) for job in _jobs(_document(page), page.status)]
+
+    def elements(self, page: RawPage) -> list[bytes]:
+        return [canonical_json(job) for job in _jobs(_document(page), page.status)]
 
     def parse(self, page: RawPage) -> list[ItemOutcome]:
         reference = response_date(page.headers, page.fetched_at)

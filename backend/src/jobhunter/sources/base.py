@@ -7,7 +7,9 @@ error page, a truncated body) into `ContractViolation("not_json")`, never into a
 
 `SourceAdapter` is the §5.1 protocol with the M1 signatures of Deviation 25: `plan(cell)` returns the first
 page of a traversal, every later page comes from `next_page`, and `fetch` returns the transport outcome
-(`http.HttpOutcome`: the page and the error together) that `settle` classifies.
+(`http.HttpOutcome`: the page and the error together) that `settle` classifies. Ruling T15-a adds `elements`:
+the canonical bytes of each element of a page's item array, whose `element_sha256` is `raw_items.item_sha256`
+and whose number is `raw_responses.item_count`; `parse` returns exactly one outcome per element.
 """
 
 import codecs
@@ -287,6 +289,16 @@ class NormalizedPosting(BaseModel):
     source_structured: dict[str, JSONValue]
 
 
+# The reason code of an item that breaks its contract (§5.1, §7.16.1): `Rejected(ITEM_CONTRACT)`.
+ITEM_CONTRACT: Final = "item_contract"
+
+
+def element_sha256(element: bytes) -> bytes:
+    """The SHA-256 digest of one element's canonical bytes (`SourceAdapter.elements`): the
+    `raw_items.item_sha256` of the element, and SmartRecruiters' list-item change marker."""
+    return hashlib.sha256(element).digest()
+
+
 # Item outcomes (§5.1): `parse` returns exactly one per array element, with `item_index` preserved.
 @dataclass(frozen=True)
 class Parsed:
@@ -382,7 +394,15 @@ class SourceAdapter(Protocol):
         """The native ids of the envelope's items, without normalisation."""
         ...
 
-    def parse(self, page: RawPage) -> list[ItemOutcome]: ...
+    def elements(self, page: RawPage) -> list[bytes]:
+        """The canonical bytes of each element of the envelope's item array, in `item_index` order (ruling
+        T15-a): `canonical_json` of a JSON element, the C14N 2.0 form of an XML one. It reads the envelope as
+        `check_envelope` does, and raises what that raises."""
+        ...
+
+    def parse(self, page: RawPage) -> list[ItemOutcome]:
+        """Exactly one outcome per element of `elements(page)`, the outcome of element `i` at index `i`."""
+        ...
 
     def continuation(self, page: RawPage) -> tuple[Continuation, str | None]: ...
 

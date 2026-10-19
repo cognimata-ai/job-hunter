@@ -16,11 +16,13 @@ structured employment types; `seniority`, `employmentType`, `yearsOfExperience` 
 kept in `source_structured` as Personio writes them. The locations are `<office>` and every
 `<additionalOffices>/<office>`; the company is `<subcompany>`. The posting's page is
 `https://{slug}.jobs.personio.de/job/{id}`, the link form whose key (§8.4) is the same as the board's.
+An element of the page (`elements`, ruling T15-a) is the C14N 2.0 form of its `<position>`.
 """
 
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast
+from xml.etree.ElementTree import canonicalize, tostring
 
 from defusedxml import DefusedXmlException, DTDForbidden
 from defusedxml.ElementTree import ParseError, fromstring
@@ -100,6 +102,11 @@ class PersonioAdapter(AtsAdapter):
 
     def _native_id(self, item: object) -> str | None:
         return _text(cast("Element", item), "id")
+
+    def _canonical(self, item: object) -> bytes:
+        """The C14N 2.0 form of a `<position>` (ruling T15-a), UTF-8: the element alone, without the text that
+        follows it."""
+        return canonicalize(tostring(cast("Element", item), encoding="unicode")).encode("utf-8")
 
     def _parse_item(self, index: int, item: object) -> Parsed | OutOfScope | Rejected:
         position = cast("Element", item)

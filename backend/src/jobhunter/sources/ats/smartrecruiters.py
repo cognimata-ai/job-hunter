@@ -13,12 +13,13 @@ is `{"message": "..."}`.
 Detail: `GET .../postings/{id}` (operation `detail`, `detail_native_id = id`, `parent_fetch_request_id` the
 list page's fetch request), an object whose `id` must be the posting asked for. The posting is normalised from
 its detail alone (the full description is in `jobAd.sections`). `detail_specs` plans a detail call for each
-list item whose posting is new, whose list item changed (`list_item_sha256`, sha256 of the item's canonical
-JSON, the `postings.list_item_sha256` marker) or whose last detail call is older than `DETAIL_MAX_AGE`, at
-the `SMARTRECRUITERS_DETAIL` limit (concurrency 4, 5 per second). A list item positively outside Germany and
-not remote is `OutOfScope("not_germany")` and gets no detail call: its structured `location.country` is
-another country's code (without one, every place `location.fullLocation` names lies outside Germany,
-§8.12). Every other list item is `OutOfScope("detail_call")`: the list page is not where it is normalised.
+list item whose posting is new, whose list item changed (`list_item_sha256`, `element_sha256` of the
+item's element, the sha256 of its canonical JSON: the `postings.list_item_sha256` marker) or whose last
+detail call is older than `DETAIL_MAX_AGE`, at the `SMARTRECRUITERS_DETAIL` limit (concurrency 4, 5 per
+second). A list item positively outside Germany and not remote is `OutOfScope("not_germany")` and gets no
+detail call: its structured `location.country` is another country's code (without one, every place
+`location.fullLocation` names lies outside Germany, §8.12). Every other list item is
+`OutOfScope("detail_call")`: the list page is not where it is normalised.
 
 Items: `native_id` is the posting `id`, the key `ats:smartrecruiters:{slug}:{id}`; `releasedDate` is the
 posted date (exact). The work mode is structured: `location.remote`, `location.hybrid`, on site otherwise.
@@ -32,7 +33,6 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Final
 
-from jobhunter.db.seed import content_hash
 from jobhunter.sources.ats.common import (
     AtsAdapter,
     country_code,
@@ -60,6 +60,7 @@ from jobhunter.sources.base import (
     RawPage,
     Rejected,
     RequestSpec,
+    element_sha256,
 )
 from jobhunter.sources.parsing.employment import parse_employment
 from jobhunter.sources.parsing.locations import GERMANY, ParsedLocations, location_from_coordinates
@@ -224,8 +225,9 @@ class SmartRecruitersAdapter(AtsAdapter):
     # -- detail calls
 
     def list_item_sha256(self, page: RawPage, index: int) -> bytes:
-        """sha256 of the canonical JSON of list item `index`: the change marker of its posting."""
-        return content_hash(self._listing(page)[0][index])
+        """The change marker of list item `index`'s posting: `element_sha256` of its element, equal to
+        `element_sha256(elements(page)[index])` (one helper, `_canonical`, makes both)."""
+        return element_sha256(self._canonical(self._listing(page)[0][index]))
 
     def detail_specs(
         self,
@@ -252,7 +254,7 @@ class SmartRecruitersAdapter(AtsAdapter):
             if stored is not None:
                 sha256, detailed_at = stored
                 fresh = detailed_at is not None and now - detailed_at <= DETAIL_MAX_AGE
-                if sha256 == content_hash(item) and fresh:
+                if sha256 == element_sha256(self._canonical(item)) and fresh:
                     continue
             specs.append(
                 replace(

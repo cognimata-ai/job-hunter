@@ -797,7 +797,14 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
     assert state["outcomes"] == {
         f"fr:{failed}": {"work_id": f"fr:{failed}", "status": "failed", "items": 0, "new_postings": 0}
     }
-    assert state["counters"] == {"source_errors": 1}
+    # the fake fetch_cell stores no response, so parse_normalize (Task 15) parses nothing
+    assert state["counters"] == {
+        "source_errors": 1,
+        "raw_items_pending": 0,
+        "raw_items_out_of_scope": 0,
+        "raw_items_duplicate_in_page": 0,
+        "raw_items_rejected": 0,
+    }
     assert state["steps"].count("fetch_cell") == 3 and state["steps"][-1] == "finalize"
 
 

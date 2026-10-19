@@ -30,6 +30,7 @@ from typing import Final
 
 import httpx
 
+from jobhunter.db.seed import canonical_json
 from jobhunter.normalize.keys import AdKey, jsearch_uid_key, keys_from_link
 from jobhunter.normalize.urls import canonical_url
 from jobhunter.sources.base import (
@@ -299,6 +300,9 @@ class JSearchAdapter:
 
     def peek_native_ids(self, page: RawPage) -> list[str | None]:
         return [_uid(job) for job in _items(_document(page), page.status)]
+
+    def elements(self, page: RawPage) -> list[bytes]:
+        return [canonical_json(job) for job in _items(_document(page), page.status)]
 
     def parse(self, page: RawPage) -> list[ItemOutcome]:
         outcomes: list[ItemOutcome] = []

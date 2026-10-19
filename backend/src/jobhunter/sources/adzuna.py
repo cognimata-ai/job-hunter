@@ -42,6 +42,7 @@ from typing import Final
 
 import httpx
 
+from jobhunter.db.seed import canonical_json
 from jobhunter.normalize.keys import AdKey
 from jobhunter.sources.base import (
     REMOTE_DE,
@@ -303,6 +304,9 @@ class AdzunaAdapter:
 
     def peek_native_ids(self, page: RawPage) -> list[str | None]:
         return [_native_id(job) for job in _results(page)[0]]
+
+    def elements(self, page: RawPage) -> list[bytes]:
+        return [canonical_json(job) for job in _results(page)[0]]
 
     def parse(self, page: RawPage) -> list[ItemOutcome]:
         outcomes: list[ItemOutcome] = []

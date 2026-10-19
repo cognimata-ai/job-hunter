@@ -67,6 +67,7 @@ from typing import Final, Literal
 
 import httpx
 
+from jobhunter.db.seed import canonical_json
 from jobhunter.normalize.html import html_to_text, sanitize_html, unescape_html
 from jobhunter.normalize.keys import AdKey
 from jobhunter.normalize.quality import Quality, description_quality
@@ -489,6 +490,9 @@ class ArbeitnowAdapter:
 
     def peek_native_ids(self, page: RawPage) -> list[str | None]:
         return [_slug(job) for job in _envelope(page)[0]]
+
+    def elements(self, page: RawPage) -> list[bytes]:
+        return [canonical_json(job) for job in _envelope(page)[0]]
 
     def parse(self, page: RawPage) -> list[ItemOutcome]:
         outcomes: list[ItemOutcome] = []
