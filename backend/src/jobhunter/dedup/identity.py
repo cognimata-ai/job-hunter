@@ -35,13 +35,12 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    and `t` as its first and last sighting and availability change; an existing one is locked `FOR UPDATE`
    (it stays on its job, which is the decided job or merged into it). The observation has `observed_at = t`,
    the response's `body_sha256` and the item's own `material_hash` as `content_hash`. The sighting of an
-   existing posting (§7.16.2), the only place one is counted: `seen_count + 1`; `last_seen_at :=
-   greatest`; `latest_observation_id` only when `t ≥` the latest's `observed_at`; when `t >
-   availability_changed_at`, the absence reset (also only after `first_absent_at`) and the revival of a
-   `stale`, `unknown` or `closed` posting through `transition()` (a `closed` one logs `posting_reopened`),
-   with `availability_changed_at := t` (Ruling T18-d, a plan deviation: the sighting's own time, so later
-   receipts compare `t > availability_changed_at` in one time domain). Task 19 moves these statements into
-   `rules.apply_sighting` unchanged.
+   existing posting (§7.16.2), the only place one is counted, is `availability.rules.apply_sighting`:
+   `seen_count + 1`; `last_seen_at := greatest`; `latest_observation_id` only when `t ≥` the latest's
+   `observed_at`; when `t > availability_changed_at`, the absence reset (also only after `first_absent_at`)
+   and the revival of a `stale`, `unknown` or `closed` posting through `transition()` (a `closed` one logs
+   `posting_reopened`), with `availability_changed_at := t` (Ruling T18-d, a plan deviation: the sighting's
+   own time, so later receipts compare `t > availability_changed_at` in one time domain).
 5. **Keys, then provenance**: the missing `ad_keys` rows owned by the decided job (`ON CONFLICT DO NOTHING`:
    ownership never changes here), then the `ad_key_sources` rows of the posting.
 6. **Merges or the conflict**: `merge.merge_jobs(strong_key_merge, recompute=False, locked=<the rows of
@@ -78,6 +77,7 @@ from typing import Final, Literal, get_args
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from jobhunter.availability import rules
 from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
@@ -171,27 +171,6 @@ _INSERT_OBSERVATION: Final = q(
     jsonb=["normalized"],
 )
 _FIRST_LATEST: Final = q("UPDATE postings SET latest_observation_id = :observation WHERE id = :posting")
-# A revival's change time is the sighting's (Ruling T18-d); `transition()` wrote the database's `now()`.
-_REVIVED_AT: Final = q(
-    "UPDATE postings SET availability_changed_at = :t WHERE id = :posting AND availability = 'active' "
-    "RETURNING id"
-)
-# The sighting of an existing posting (§7.16.2): Task 19's `rules.apply_sighting`. `:t` is the sighting time;
-# the conditions are constants of this module, never input.
-_NOT_LATE: Final = (
-    "CAST(:t AS timestamptz) > p.availability_changed_at "
-    "AND (p.first_absent_at IS NULL OR CAST(:t AS timestamptz) > p.first_absent_at)"
-)
-_SIGHTING: Final = q(
-    "UPDATE postings AS p SET seen_count = p.seen_count + 1, "  # noqa: S608
-    "last_seen_at = greatest(p.last_seen_at, CAST(:t AS timestamptz)), "
-    "latest_observation_id = CASE WHEN p.latest_observation_id IS NULL OR CAST(:t AS timestamptz) >= "
-    "(SELECT o.observed_at FROM posting_observations o WHERE o.id = p.latest_observation_id) "
-    "THEN CAST(:observation AS bigint) ELSE p.latest_observation_id END, "
-    f"absent_snapshots = CASE WHEN {_NOT_LATE} THEN 0 ELSE p.absent_snapshots END, "
-    f"first_absent_at = CASE WHEN {_NOT_LATE} THEN NULL ELSE p.first_absent_at END "
-    "WHERE p.id = :posting RETURNING p.availability, p.availability_changed_at"
-)
 _INSERT_KEY: Final = q(
     "INSERT INTO ad_keys (key_ns, key_value, exclusive, job_id) VALUES (:ns, :value, :exclusive, :job) "
     "ON CONFLICT (key_ns, key_value) DO NOTHING"
@@ -504,23 +483,6 @@ async def _posting_for(
     return int(posting.id), False
 
 
-async def _apply_sighting(
-    conn: AsyncConnection, posting_id: int, *, observed_at: datetime, observation_id: int
-) -> None:
-    """The sighting of an existing posting (step 4, §7.16.2)."""
-    row = (
-        await conn.execute(
-            _SIGHTING, {"posting": posting_id, "t": observed_at, "observation": observation_id}
-        )
-    ).one()
-    if row.availability != "active" and observed_at > row.availability_changed_at:
-        await transition(conn, "postings", posting_id, [row.availability], "active", reason=CLEAR_REASON)
-        if (await conn.execute(_REVIVED_AT, {"posting": posting_id, "t": observed_at})).first() is None:
-            raise InvariantViolation(f"posting {posting_id} is not active after its revival")
-        if row.availability == "closed":
-            log.info("posting_reopened", posting_id=posting_id, observation_id=observation_id)
-
-
 async def _link(
     conn: AsyncConnection, owner: RunOwner, item: _Item, scopes: Mapping[int, ScopeSettings]
 ) -> ResolveOutcome:
@@ -560,7 +522,7 @@ async def _link(
     if inserted:
         await conn.execute(_FIRST_LATEST, {"posting": posting_id, "observation": observation_id})
     else:
-        await _apply_sighting(conn, posting_id, observed_at=item.t, observation_id=observation_id)
+        await rules.apply_sighting(conn, posting_id, observed_at=item.t, observation_id=observation_id)
 
     if keys:
         await conn.execute(

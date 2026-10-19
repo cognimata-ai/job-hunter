@@ -816,6 +816,10 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
         "merges": 0,
         "conflicts": 0,
         "revisions_new": 0,
+        "availability_closed": 0,  # its snapshot pass (Task 19): the fake fetch_cell records no snapshot
+        "availability_unknown": 0,
+        "availability_revived": 0,
+        "mass_events_opened": 0,
         "hard_filter_backfilled": 0,  # node 8 (Task 16) ran: no job was touched
     }
     assert state["steps"].count("fetch_cell") == 3 and state["steps"][-1] == "finalize"

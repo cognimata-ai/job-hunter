@@ -165,7 +165,7 @@ async def test_second_sighting_and_replay_are_idempotent(engine, current_epoch) 
     first = await pending_item(engine, owner, "jsearch", {"native_id": "UID2"}, fetched_at=day0)
     assert await resolved(engine, owner, first) == "linked"
     assert await generation(engine) == 1  # a new job changes the list
-    [(posting_id, _, _)] = await fetch(engine, OBSERVATION_OF, i=first)
+    [(_, posting_id, _)] = await fetch(engine, OBSERVATION_OF, i=first)  # (id, posting_id, observed_at)
 
     second = await pending_item(
         engine, owner, "jsearch", {"native_id": "UID2"}, fetched_at=day0 + timedelta(days=1)
@@ -518,6 +518,10 @@ async def test_the_node_resolves_the_run_items_and_counts(engine, current_epoch)
         "merges": 1,
         "conflicts": 1,
         "revisions_new": await scalar(engine, "SELECT count(*) FROM job_revisions"),
+        "availability_closed": 0,  # the snapshot pass (Task 19): the run has no snapshot
+        "availability_unknown": 0,
+        "availability_revived": 0,
+        "mass_events_opened": 0,
     }
     assert await scalar(engine, "SELECT count(*) FROM raw_items WHERE disposition = 'pending'") == 0
     again = await node(initial_state(owner.run_id, owner.attempt_no))  # nothing is left pending

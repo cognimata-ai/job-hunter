@@ -56,8 +56,8 @@ job, writes its hard-filter results and bumps the ranking.
 `derive_from_postings` gives a job the best availability of its postings (`active > unknown > stale >
 closed`, §7.16.2; `availability_changed_at := now()` when it changes) and its postings' first and last
 sighting; a `posted_at_effective` beyond a lowered `first_seen_at` is capped to it (the CHECK of §7.9),
-and the recompute that follows selects it again. Task 19 moves the availability part into
-`rules.recompute_job_availability`.
+and the recompute that follows selects it again. It is the one place a job's availability is derived:
+`availability.rules.recompute_job_availability` (the snapshot effects and the stale sweep) reuses it.
 
 Every timestamp written is the database's `now()`, the clock domain of `runs.started_at` (carry 3; Task 17
 ruling T17-a; Ruling T18-b: no function here takes a caller clock).
