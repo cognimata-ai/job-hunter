@@ -104,8 +104,8 @@ of Tasks 9–11 (a missing native id, or a title that is not a string): **0 in e
 | `ats/smartrecruiters_deliveryhero_list` | 200 | 10 | 0 | recorded ATS, 2026-10-18 (`limit=100&offset=0`), trimmed (above) |
 | `ats/smartrecruiters_deliveryhero_detail_1` | 200 | 1 | 0 | recorded ATS, 2026-10-18 (the first posting of the list, `744000156183719`) |
 | `ats/smartrecruiters_deliveryhero_detail_2` | 200 | 1 | 0 | recorded ATS, 2026-10-18 (the second posting, `744000156094379`) |
-| `ats/smartrecruiters_list_paged` | 200 | 10 | 0 | derived from `smartrecruiters_deliveryhero_list`: `totalFound` 10 → 150 (the pagination rule continues with `offset=100`) |
-| `ats/smartrecruiters_list_offset100` | 200 | 0 | 0 | derived from `smartrecruiters_deliveryhero_list`: `offset` → 100, `content` → `[]`, `totalFound` → 150 (the end) |
+| `ats/smartrecruiters_list_paged` | 200 | 5 | 0 | derived from `smartrecruiters_deliveryhero_list`: `content` → its first 5 postings, `totalFound` 10 kept (`0 + 5 < 10`: the pagination rule continues with `offset=100`; ruling T11-c) |
+| `ats/smartrecruiters_list_offset100` | 200 | 5 | 0 | derived from `smartrecruiters_deliveryhero_list`: `offset` → 100, `content` → its last 5 postings, `totalFound` 10 kept (the end); with `smartrecruiters_list_paged`, one board of 10 in two pages: a complete snapshot |
 | `ats/smartrecruiters_404` | 404 | - | - | derived: hand-written `{"message": "Company not found"}` |
 | `location_labels.tsv` | - | 172 rows | - | hand-labelled while reviewing (V17, below) |
 

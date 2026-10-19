@@ -154,10 +154,13 @@ def test_smartrecruiters_pagination_variants() -> None:
     assert following is not None and following.params["offset"] == "100" and following.page_no == 2
     second = fixture_page("ats", "smartrecruiters_list_offset100", following, fetched_at=T)
     assert a.continuation(second) == (Continuation.END, None)
+    # the two variants split the ten trimmed postings: 5 at offset 0 and 5 at offset 100, `totalFound` 10
+    recorded = fixture_page("ats", "smartrecruiters_deliveryhero_list", SPEC, fetched_at=T)
+    union = frozenset(a.peek_native_ids(first)) | frozenset(a.peek_native_ids(second))
+    assert len(a.peek_native_ids(first)) == len(a.peek_native_ids(second)) == 5
+    assert union == frozenset(a.peek_native_ids(recorded))
     draft = membership([first, second], a, reached_end=True)
-    assert (
-        draft.complete and draft.members == frozenset(a.peek_native_ids(first)) and draft.member_count == 10
-    )
+    assert draft.complete and draft.members == union and draft.member_count == 10
 
 
 def _lever_page(count: int) -> RawPage:
@@ -411,18 +414,119 @@ def test_a_provider_error_delivered_with_a_2xx_is_transient_never_a_page(source_
     assert membership([page], a, reached_end=True).incomplete_reason == "envelope"
 
 
-@pytest.mark.parametrize(
-    "body", ['{"jobs": [], "meta": {"total": 0}}', '{"jobs": [], "meta": {"total": 0}, "error": "x"}']
-)
-def test_an_empty_board_is_a_complete_empty_snapshot(body) -> None:
+def test_an_empty_board_is_a_complete_empty_snapshot() -> None:
     a = adapter_for_fixture("greenhouse", "greenhouse_acme")
-    draft = membership([_page(body)], a, reached_end=True)
+    draft = membership([_page('{"jobs": [], "meta": {"total": 0}}')], a, reached_end=True)
     assert (draft.complete, draft.members, draft.member_count, draft.incomplete_reason) == (
         True,
         frozenset(),
         0,
         None,
     )
+
+
+BESIDE_ITEMS = [
+    ("greenhouse", '{"jobs": [], "meta": {"total": 0}, "error": "Job board is unavailable"}'),
+    ("greenhouse", '{"jobs": [{"id": 1, "title": "Engineer"}], "meta": {"total": 1}, "error": "partial"}'),
+    ("ashby", '{"jobs": [], "error": "Job board not found"}'),
+    ("recruitee", '{"offers": [], "error": "Not found"}'),
+    ("smartrecruiters", '{"offset": 0, "limit": 100, "totalFound": 0, "content": [], "message": "x"}'),
+]
+
+
+@pytest.mark.parametrize(("source_id", "body"), BESIDE_ITEMS)
+def test_an_error_report_beside_the_items_is_the_provider_error_never_a_board(source_id, body) -> None:
+    # T11-c: an error beside an (empty) item list is no proof that the board is empty
+    a = adapter_for_fixture(source_id, f"{source_id}_acme")
+    page = _page(body)
+    for read in (a.check_envelope, a.peek_native_ids, a.parse, a.continuation):
+        with pytest.raises(SourceError) as raised:
+            read(page)
+        assert (raised.value.kind, raised.value.code) == ("transient", "provider_error")
+    draft = membership([page], a, reached_end=True)
+    assert (draft.complete, draft.incomplete_reason) == (False, "envelope")
+
+
+def _sr_items(count: int, start: int = 0) -> list[dict[str, Any]]:
+    return [
+        _sr_item(str(744000000000000 + i), city="Berlin", country="de") for i in range(start, start + count)
+    ]
+
+
+def _sr_listing(a: AtsAdapter, items: list[dict[str, Any]], *, offset: int, total: int) -> RawPage:
+    """A SmartRecruiters list page of `a` at `offset` (the spec asks for it) with `totalFound = total`."""
+    spec = a.plan(ats_cell("smartrecruiters"))
+    if offset:
+        following = a.next_page(spec, str(offset))
+        assert following is not None
+        spec = following
+    doc = {"offset": offset, "limit": 100, "totalFound": total, "content": items}
+    return _page(json.dumps(doc), spec=spec)
+
+
+def test_a_short_page_mid_listing_is_a_count_mismatch_with_its_members_kept() -> None:
+    # T11-c (the review's probe): 60 of 100 at offset 0, then 50 at offset 100, of `totalFound` 150
+    a = adapter_for_fixture("smartrecruiters", "smartrecruiters_acme")
+    first = _sr_listing(a, _sr_items(60), offset=0, total=150)
+    assert a.continuation(first) == (Continuation.CURSOR, "100")
+    second = _sr_listing(a, _sr_items(50, start=100), offset=100, total=150)
+    assert a.continuation(second) == (Continuation.END, None)
+    draft = membership([first, second], a, reached_end=True)
+    assert (draft.complete, draft.incomplete_reason, draft.member_count) == (False, "count_mismatch", 110)
+    assert draft.members == frozenset(a.peek_native_ids(first)) | frozenset(a.peek_native_ids(second))
+
+
+def test_an_empty_page_below_the_total_ends_the_board_as_a_count_mismatch() -> None:
+    a = adapter_for_fixture("smartrecruiters", "smartrecruiters_acme")
+    first = _sr_listing(a, _sr_items(100), offset=0, total=150)
+    empty = _sr_listing(a, [], offset=100, total=150)
+    assert a.continuation(empty) == (Continuation.END, None)  # the board has nothing more to give
+    draft = membership([first, empty], a, reached_end=True)
+    assert (draft.complete, draft.incomplete_reason, draft.member_count) == (False, "count_mismatch", 100)
+
+
+def test_a_total_that_changes_between_pages_is_a_count_mismatch() -> None:
+    a = adapter_for_fixture("smartrecruiters", "smartrecruiters_acme")
+    first = _sr_listing(a, _sr_items(100), offset=0, total=150)
+    second = _sr_listing(a, _sr_items(50, start=100), offset=100, total=140)  # 150 members, 150 then 140
+    assert a.continuation(second) == (Continuation.END, None)
+    draft = membership([first, second], a, reached_end=True)
+    assert (draft.complete, draft.incomplete_reason, draft.member_count) == (False, "count_mismatch", 150)
+    whole = _sr_listing(a, _sr_items(50, start=100), offset=100, total=150)
+    assert membership([first, whole], a, reached_end=True).complete  # the same board, the totals agreeing
+
+
+def test_an_offset_the_board_did_not_ask_for_breaks_the_contract() -> None:
+    a = adapter_for_fixture("smartrecruiters", "smartrecruiters_acme")
+    assert isinstance(a, SmartRecruitersAdapter)
+    asked = _sr_listing(a, _sr_items(50, start=100), offset=100, total=150)
+    page = replace(asked, body=asked.body.replace(b'"offset": 100', b'"offset": 0'))
+    reads = (a.check_envelope, a.peek_native_ids, a.parse, a.continuation, lambda p: a.list_item_sha256(p, 0))
+    for read in (*reads, lambda p: a.detail_specs(p, {}, now=T)):
+        with pytest.raises(ContractViolation, match="offset_mismatch"):
+            read(page)
+    first = _sr_listing(a, _sr_items(100), offset=0, total=150)
+    assert membership([first, page], a, reached_end=True).incomplete_reason == "envelope"
+
+
+def test_membership_needs_the_end_proven_by_the_last_of_contiguous_pages() -> None:
+    sr = adapter_for_fixture("smartrecruiters", "smartrecruiters_acme")
+    first = _sr_listing(sr, _sr_items(100), offset=0, total=150)
+    second = _sr_listing(sr, _sr_items(50, start=100), offset=100, total=150)
+    assert membership([first, second], sr, reached_end=True).complete
+    # the caller's flag alone proves nothing: the last page must say END
+    assert membership([first], sr, reached_end=True).incomplete_reason == "no_end"
+    lever = adapter_for_fixture("lever", "lever_acme")
+    assert membership([_lever_page(100)], lever, reached_end=True).incomplete_reason == "no_end"
+    assert membership([_lever_page(99)], lever, reached_end=True).complete
+    # one page per page number, from 1 without a gap
+    third = replace(second, spec=replace(second.spec, page_no=3))
+    assert membership([first, third], sr, reached_end=True).incomplete_reason == "no_end"
+    assert membership([first, first, second], sr, reached_end=True).incomplete_reason == "no_end"
+    gh = adapter_for_fixture("greenhouse", "greenhouse_acme")
+    later = _page('{"jobs": [], "meta": {"total": 0}}', spec=replace(SPEC, page_no=2))
+    assert membership([later], gh, reached_end=True).incomplete_reason == "no_end"
+    assert membership([second, first], sr, reached_end=True).complete  # the order of the list is not proof
 
 
 def test_xml_entities_and_dtds_are_refused_on_every_read_path() -> None:

@@ -1,11 +1,14 @@
 """The SmartRecruiters board adapter: list pages and detail calls (spec §5.3.5).
 
 List: `GET https://api.smartrecruiters.com/v1/companies/{slug}/postings?limit=100&offset=N` (operation
-`list`), an object with a `content` array and the integers `totalFound`, `offset` and `limit`. Pagination by
-offset: `END` when the page is empty or `offset + len(content) >= totalFound`, otherwise the cursor
-`offset + limit`. `totalFound` is the pagination bound, not a rule-4 total: the snapshot's membership is the
-union of the list pages' ids (§5.3.5 "Membership comes from the list pages"). SmartRecruiters' own error
-report is `{"message": "..."}`.
+`list`), an object with a `content` array and the integers `totalFound`, `offset` and `limit`; the `offset`
+it echoes must be the offset asked for (`offset_mismatch` otherwise). Pagination by offset: `END` when the
+page is empty or `offset + len(content) >= totalFound`, otherwise the cursor `offset + limit`. `totalFound`
+is the board's reported total of §5.3.5 rule 4 (`board_total`, ruling T11-c): every list page of a snapshot
+must report the same one and the snapshot must have exactly that many members, so a short page mid-listing,
+an empty page below the total or a total that moves makes the snapshot `incomplete(count_mismatch)` (with its
+members kept), never a complete snapshot that counts live postings absent. SmartRecruiters' own error report
+is `{"message": "..."}`.
 
 Detail: `GET .../postings/{id}` (operation `detail`, `detail_native_id = id`, `parent_fetch_request_id` the
 list page's fetch request), an object whose `id` must be the posting asked for. The posting is normalised from
@@ -163,6 +166,9 @@ class SmartRecruitersAdapter(AtsAdapter):
         total, offset, limit = (envelope_int(doc, key, page) for key in ("totalFound", "offset", "limit"))
         if limit < 1:
             raise ContractViolation("limit_invalid", status=page.status)
+        # The API's default offset is 0, the offset of a spec that names none.
+        if offset != _offset(page.spec.params.get("offset", "0")):
+            raise ContractViolation("offset_mismatch", status=page.status)
         return content, total, offset, limit
 
     def _detail(self, page: RawPage) -> tuple[dict[str, JSONValue], str]:
@@ -190,9 +196,17 @@ class SmartRecruitersAdapter(AtsAdapter):
 
     # -- pagination
 
+    def board_total(self, page: RawPage) -> int | None:
+        """`totalFound`: the number of postings the board holds, as this list page reports it."""
+        if page.spec.operation == "detail":
+            self._detail(page)
+            return None
+        return self._listing(page)[1]
+
     def continuation(self, page: RawPage) -> tuple[Continuation, str | None]:
         """`END` for an empty page or `offset + len >= totalFound`, otherwise the next offset; a detail page
-        is not part of the pagination and ends there."""
+        is not part of the pagination and ends there. An empty page below `totalFound` ends the board too: it
+        has no more to give, and `membership` finds its snapshot short of the total."""
         if page.spec.operation == "detail":
             self._detail(page)
             return Continuation.END, None

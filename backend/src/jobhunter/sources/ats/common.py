@@ -11,7 +11,8 @@ The envelope gate: an adapter's `_items` is the only reader of a body, and every
 as a page or as the end of a board. A body of the wrong shape is a `ContractViolation`; the provider's own
 error report delivered with a 2xx (a Greenhouse `{"status", "error"}`, a Lever `{"ok": false, "error"}`, ...)
 is `SourceError("transient", code="provider_error")` (ruling T9-a): a failed attempt that counts toward the
-free threshold, not a broken contract.
+free threshold, not a broken contract. An error report beside the items, even beside an empty item list, is
+that error too, never an (empty) board (ruling T11-c).
 
 The item contract: an item that is not an object, has no native id or has no string title is
 `Rejected("item_contract")`; a native id seen earlier on the page is `DuplicateInPage`. ATS postings are not
@@ -20,6 +21,8 @@ Only SmartRecruiters drops a list item positively outside Germany, to spare its 
 
 Snapshot membership (`membership`, §5.3.5 rules 1-5) is decided from the list pages alone, independently of
 normalisation: every native id that `peek_native_ids` finds is a member, even when `parse` rejects its item.
+These boards are the only source that closes postings, so any doubt makes a snapshot incomplete (ruling
+T11-c): the end must be proven by the last page itself, and every total a board reports must hold.
 """
 
 from abc import ABC, abstractmethod
@@ -94,13 +97,14 @@ def provider_error(page: RawPage) -> SourceError:
 def object_envelope(page: RawPage, item_key: str, *, error_key: str = "error") -> dict[str, JSONValue]:
     """The envelope object of `page`, which holds its items at `item_key`.
 
-    An object without `item_key` whose `error_key` is a non-empty string is the provider's error report
-    (`provider_error`); any other body that is not an object breaks the contract.
+    An object whose `error_key` is a non-empty string is the provider's error report (`provider_error`),
+    with or without items beside it (T11-c: an error next to an empty list is no empty board); any other body
+    that is not an object breaks the contract.
     """
     doc = page.json()
     if not isinstance(doc, dict):
         raise ContractViolation("not_object", status=page.status)
-    if item_key not in doc and isinstance(message := doc.get(error_key), str) and message.strip():
+    if isinstance(message := doc.get(error_key), str) and message.strip():
         raise provider_error(page)
     return doc
 
@@ -317,7 +321,13 @@ class AtsAdapter(ABC):
         return [self._native_id(item) for item in self._items(page)]
 
     def reported_total(self, page: RawPage) -> int | None:
-        """The number of postings the board says it holds, where it says one (§5.3.5 rule 4)."""
+        """The number of items this page must hold, where the board says so (§5.3.5 rule 4, per page)."""
+        self._items(page)
+        return None
+
+    def board_total(self, page: RawPage) -> int | None:
+        """The number of postings the whole board holds, as this page reports it (§5.3.5 rule 4, per board):
+        every list page must report the same, and the snapshot must have that many members."""
         self._items(page)
         return None
 
@@ -401,23 +411,42 @@ class AtsAdapter(ABC):
         )
 
 
+def _ends(adapter: AtsAdapter, page: RawPage) -> bool:
+    """Whether `page` itself says the board ends with it (a 2xx whose continuation is `END`)."""
+    if not 200 <= page.status < 300:
+        return False
+    try:
+        return adapter.continuation(page)[0] is Continuation.END
+    except SourceError:
+        return False
+
+
 def membership(pages: Sequence[RawPage], adapter: AtsAdapter, *, reached_end: bool) -> SnapshotDraft:
     """The snapshot of a board traversal from its list pages (§5.3.5): every native id that
     `peek_native_ids` finds is a member, and the snapshot is complete only when
 
     1. every list page returned 2xx;
     2. its envelope passed the contract;
-    3. the pagination reached `END` (`reached_end`; a traversal without a list page reached nothing);
-    4. the item count of a page equals the total the board reports, where it reports one;
+    3. the pagination reached `END`: the caller says so (`reached_end`), the pages are numbered 1 to n without
+       a gap or a repeat, and the last of them itself says `END` (a traversal without a list page reached
+       nothing);
+    4. the counts hold: a page holds the items it must (`reported_total`, Greenhouse's `meta.total`), and
+       every page reports the same board total (`board_total`, SmartRecruiters' `totalFound`), which equals
+       the number of members;
     5. every item had a native id.
 
-    Detail pages (SmartRecruiters) are not part of membership and are ignored. An incomplete snapshot keeps
-    every member found and names the first rule that failed.
+    The caller passes one page per logical page: the final attempt of each list request. Detail pages
+    (SmartRecruiters) are not part of membership and are ignored. An incomplete snapshot keeps every member
+    found and names the first rule that failed.
     """
     failed: set[IncompleteReason] = set()
     members: set[str] = set()
-    listed = [page for page in pages if page.spec.operation == "list"]
-    if not reached_end or not listed:
+    board_totals: list[int] = []
+    listed = sorted(
+        (page for page in pages if page.spec.operation == "list"), key=lambda page: page.spec.page_no
+    )
+    numbered = [page.spec.page_no for page in listed] == list(range(1, len(listed) + 1))
+    if not reached_end or not listed or not numbered or not _ends(adapter, listed[-1]):
         failed.add("no_end")
     for page in listed:
         if not 200 <= page.status < 300:
@@ -427,6 +456,7 @@ def membership(pages: Sequence[RawPage], adapter: AtsAdapter, *, reached_end: bo
             adapter.check_envelope(page)
             ids = adapter.peek_native_ids(page)
             total = adapter.reported_total(page)
+            board = adapter.board_total(page)
         except SourceError:
             failed.add("envelope")
             continue
@@ -435,5 +465,9 @@ def membership(pages: Sequence[RawPage], adapter: AtsAdapter, *, reached_end: bo
             failed.add("missing_id")
         if total is not None and total != len(ids):
             failed.add("count_mismatch")
+        if board is not None:
+            board_totals.append(board)
+    if board_totals and (len(set(board_totals)) != 1 or board_totals[0] != len(members)):
+        failed.add("count_mismatch")
     reason = next((rule for rule in RULES if rule in failed), None)
     return SnapshotDraft(frozenset(members), len(members), reason is None, reason)

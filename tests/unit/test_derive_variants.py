@@ -186,13 +186,16 @@ def test_every_variant_and_trim(derive: ModuleType, tmp_path: Path) -> None:
     assert read(tmp_path, "ats/greenhouse_count_mismatch.json")["meta"]["total"] == 16
     sr = read(tmp_path, "ats/smartrecruiters_deliveryhero_list.json")
     assert len(sr["content"]) == 10 and sr["totalFound"] == 10
-    assert read(tmp_path, "ats/smartrecruiters_list_paged.json")["totalFound"] == 150
-    assert read(tmp_path, "ats/smartrecruiters_list_offset100.json") | {} == {
+    # T11-c: the two pages split the trimmed postings, whole items, and report the board's one total
+    paged = read(tmp_path, "ats/smartrecruiters_list_paged.json")
+    offset100 = read(tmp_path, "ats/smartrecruiters_list_offset100.json")
+    assert {k: v for k, v in paged.items() if k != "content"} == {"offset": 0, "limit": 100, "totalFound": 10}
+    assert {k: v for k, v in offset100.items() if k != "content"} == {
         "offset": 100,
         "limit": 100,
-        "totalFound": 150,
-        "content": [],
+        "totalFound": 10,
     }
+    assert paged["content"] == sr["content"][:5] and offset100["content"] == sr["content"][5:]
     assert "<!ENTITY" in (tmp_path / "ats/personio_entity.xml").read_text()
     assert (
         read(tmp_path, "ats/lever_eu_end.json") == []

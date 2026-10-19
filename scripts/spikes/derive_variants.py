@@ -204,10 +204,18 @@ def ats(tree: Tree) -> None:
         sr["content"] = sr["content"][:SMARTRECRUITERS_TRIM]
         sr["totalFound"] = len(sr["content"])
         tree.write("ats/smartrecruiters_deliveryhero_list", sr, sr_headers)
-    tree.write("ats/smartrecruiters_list_paged", {**copy.deepcopy(sr), "totalFound": 150}, sr_headers)
+    # Two list pages of one board (ruling T11-c): the trimmed postings split in two, each page reporting the
+    # board's one `totalFound` (10). The first page continues with `offset=100`, the second ends the board,
+    # and their union is the whole board: a structurally complete snapshot.
+    half = len(sr["content"]) // 2
+    tree.write(
+        "ats/smartrecruiters_list_paged",
+        {**copy.deepcopy(sr), "content": copy.deepcopy(sr["content"][:half])},
+        sr_headers,
+    )
     tree.write(
         "ats/smartrecruiters_list_offset100",
-        {**{k: v for k, v in sr.items() if k != "content"}, "offset": 100, "totalFound": 150, "content": []},
+        {**copy.deepcopy(sr), "offset": 100, "content": copy.deepcopy(sr["content"][half:])},
         sr_headers,
     )
 
