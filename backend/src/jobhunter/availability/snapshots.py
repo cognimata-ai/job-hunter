@@ -12,11 +12,17 @@ posting rows, the snapshot row and the instance row `FOR UPDATE`; then the write
   `rules.apply_membership(taken_at)`: the absence reset, and `stale | unknown | closed → active` when
   `taken_at > availability_changed_at`, changed at `taken_at` (carry 3). A member without a posting (an item
   that was rejected) is ignored, and no sighting is counted (carry 4).
-- The snapshot's **absent set** `A` is the instance's `active`/`unknown` postings that are not members.
+- The snapshot's **absent set** `A` is the instance's `active`/`unknown` postings that are not members: the
+  set that is counted, closed and frozen.
 - **Structurally incomplete** (`incomplete`): `active → unknown` for `A`, nothing counted.
-- **Mass classification** of a structurally complete snapshot against the frozen baseline
-  `source_instances.last_snapshot_active_count` (`B`): `|A| ≥ 5` and `|A| > B / 2` (no classification
-  without a baseline). Then `active → unknown` for `A`, nothing counted, and:
+- **Mass classification** of a structurally complete snapshot (Ruling T19-b: on active postings on both
+  sides). The baseline `B` is `source_instances.last_snapshot_active_count`, §8.11's number of active
+  postings, frozen while an event is open; it is compared with the **disappeared** part `D` of `A`: the
+  postings of `A` that are `active`, and, while an event is open, those `unknown` since its opening snapshot
+  (`availability_changed_at ≥` its `taken_at`: the event's own snapshots made them unknown). A posting that
+  was already `unknown` (an incomplete snapshot, or an event that cleared) and is absent again is no new
+  disappearance. Mass: `|D| ≥ 5` and `|D| > B / 2` (no classification without a baseline). Then
+  `active → unknown` for `A`, nothing counted, and:
   - no open event: the event **opens**: status `mass_disappearance`, `mass_event_snapshot_id` := the
     snapshot, `A` written to `ats_snapshot_absences` (the event's frozen absent set, plan Deviation 22),
     `ats.mass_disappearance` (warn, subject `instance:<id>`) raised; the baseline stays frozen;
@@ -28,7 +34,8 @@ posting rows, the snapshot row and the instance row `FOR UPDATE`; then the write
   `taken_at - first_absent_at ≥ 24 h`. An open event **clears**: its alert is resolved. The baseline is reset
   to the instance's `active` count and `mass_event_snapshot_id := NULL`.
 - The snapshot row records its status, `event_snapshot_id`, `baseline_active_count` (`B` before it),
-  `absent_count` (`|A|`) and `applied_at := now` (the caller's clock).
+  `absent_count` (`|D|`, §7.7: "previously active postings absent from it") and `applied_at := now` (the
+  caller's clock).
 
 **Confirmation** (§8.11, over the applied structurally complete snapshots taken after the opening one): `S2`
 is the latest of them and `S1` the latest at least 24 h before `S2`; when `S1` exists the event is confirmed.
@@ -50,8 +57,9 @@ Every touched job's availability is recomputed (`rules.recompute_job_availabilit
 once, last, when one changed. Closures and `unknown` transitions are written through `transition()`; a closure
 keeps the database's `now()` as `availability_changed_at`, an `unknown` gets the snapshot's `taken_at`, the
 time of the evidence, so that the revival rule's "member of a later snapshot" compares in one time domain
-(carry 3). Applying the snapshots of one instance in the order they were taken is assumed (the node applies
-each run's own).
+(carry 3), but only when it is later than the change time before the transition (M-5): out-of-order evidence
+never moves `availability_changed_at` backwards. Applying the snapshots of one instance in the order they were
+taken is assumed (the node applies each run's own).
 
 **`apply_run_snapshots`** is node 6's snapshot pass (§9.2): every snapshot of the run with `applied_at IS
 NULL`, in id order, one transaction each under the run's owner row; its counters `SNAPSHOT_COUNTERS`.
@@ -67,13 +75,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.availability import rules
 from jobhunter.db import ranking
+from jobhunter.db.guards import Guard
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import FencedOut
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
-from jobhunter.scoring.filters import Guard
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.runs import RunOwner
@@ -100,8 +108,9 @@ _CANDIDATES: Final = q(
     "OR p.native_id IN (SELECT m.native_id FROM ats_snapshot_members m WHERE m.snapshot_id = :s))"
 )
 _LOCK_CANDIDATES: Final = q(
-    "SELECT p.id, p.job_id, p.availability, p.absent_snapshots, EXISTS (SELECT 1 FROM ats_snapshot_members m "
-    "WHERE m.snapshot_id = :s AND m.native_id = p.native_id) AS member FROM postings p "
+    "SELECT p.id, p.job_id, p.availability, p.availability_changed_at, p.absent_snapshots, "
+    "EXISTS (SELECT 1 FROM ats_snapshot_members m WHERE m.snapshot_id = :s AND m.native_id = p.native_id) "
+    "AS member FROM postings p "
     "WHERE p.id = ANY(CAST(:ids AS bigint[])) AND p.job_id = ANY(CAST(:jobs AS bigint[])) "
     "ORDER BY p.id FOR UPDATE OF p"
 )
@@ -110,12 +119,19 @@ _LOCK_HELD: Final = q(
     "AND job_id = ANY(CAST(:jobs AS bigint[])) ORDER BY id FOR UPDATE"
 )
 _LOCK_SNAPSHOT: Final = q("SELECT status, taken_at, applied_at FROM ats_snapshots WHERE id = :s FOR UPDATE")
+# The instance's baseline and open event, with the event's opening time.
 _LOCK_INSTANCE: Final = q(
-    "SELECT last_snapshot_active_count, mass_event_snapshot_id FROM source_instances WHERE id = :i FOR UPDATE"
+    "SELECT i.last_snapshot_active_count, i.mass_event_snapshot_id, (SELECT o.taken_at FROM ats_snapshots o "
+    "WHERE o.id = i.mass_event_snapshot_id) AS opened_at FROM source_instances i WHERE i.id = :i "
+    "FOR UPDATE OF i"
 )
+# The change time of the postings `transition()` just made `unknown` (at `now()`): the snapshot's `taken_at`
+# when the change time before the transition (`prev`) is earlier, and never earlier than `prev` (M-5).
 _UNKNOWN_AT: Final = q(
-    "UPDATE postings SET availability_changed_at = :taken_at WHERE id = ANY(CAST(:ids AS bigint[])) "
-    "AND availability = 'unknown'"
+    "UPDATE postings AS p SET availability_changed_at = CASE WHEN x.prev < CAST(:taken_at AS timestamptz) "
+    "THEN CAST(:taken_at AS timestamptz) ELSE greatest(p.availability_changed_at, x.prev) END "
+    "FROM unnest(CAST(:ids AS bigint[]), CAST(:prev AS timestamptz[])) AS x(id, prev) "
+    "WHERE p.id = x.id AND p.availability = 'unknown'"
 )
 _COUNT_ABSENCE: Final = q(
     "UPDATE postings SET absent_snapshots = least(absent_snapshots + 1, 2), "
@@ -207,9 +223,19 @@ def _subject(instance_id: int) -> str:
     return f"instance:{instance_id}"
 
 
-def _is_mass(absent: int, baseline: int | None) -> bool:
-    """More than half of the baseline, and at least `MASS_MIN_ABSENT` postings, absent (§8.11)."""
-    return baseline is not None and absent >= MASS_MIN_ABSENT and 2 * absent > baseline
+def _is_mass(disappeared: int, baseline: int | None) -> bool:
+    """More than half of the baseline, and at least `MASS_MIN_ABSENT` postings, disappeared (§8.11)."""
+    return baseline is not None and disappeared >= MASS_MIN_ABSENT and 2 * disappeared > baseline
+
+
+def _disappeared(row: Row[tuple[object, ...]], opened_at: datetime | None) -> bool:
+    """An absent posting counts against the active baseline (Ruling T19-b): it is `active`, or `unknown` since
+    the open event's opening snapshot (that event's snapshots made it so)."""
+    if row.availability == "active":
+        return True
+    return (
+        opened_at is not None and row.availability == "unknown" and row.availability_changed_at >= opened_at
+    )
 
 
 def _ids(rows: Iterable[Row[tuple[object, ...]]]) -> list[int]:
@@ -228,11 +254,13 @@ async def _close(
 async def _mark_unknown(
     conn: AsyncConnection, rows: Sequence[Row[tuple[object, ...]]], taken_at: datetime
 ) -> set[int]:
-    """`active → unknown` for each posting of `rows`, changed at the snapshot's `taken_at`; their jobs."""
+    """`active → unknown` for each posting of `rows`, changed at the snapshot's `taken_at` unless that is not
+    later than its change time before (`_UNKNOWN_AT`); their jobs."""
     for row in rows:
         await transition(conn, "postings", int(row.id), ["active"], "unknown", reason=CLEAR_REASON)
     if rows:
-        await conn.execute(_UNKNOWN_AT, {"ids": _ids(rows), "taken_at": taken_at})
+        prev = [row.availability_changed_at for row in rows]
+        await conn.execute(_UNKNOWN_AT, {"ids": _ids(rows), "prev": prev, "taken_at": taken_at})
     return {int(row.job_id) for row in rows}
 
 
@@ -315,8 +343,9 @@ async def apply_snapshot(
     baseline: int | None = instance.last_snapshot_active_count
     event: int | None = instance.mass_event_snapshot_id
     absent = [row for row in rows if not row.member and row.availability in ("active", "unknown")]
+    disappeared = sum(_disappeared(row, instance.opened_at) for row in absent)
     complete = snap.status in STRUCTURALLY_COMPLETE
-    mass = complete and _is_mass(len(absent), baseline)
+    mass = complete and _is_mass(disappeared, baseline)
 
     touched: set[int] = set()  # the jobs of the postings whose availability changed
     revived = 0
@@ -342,7 +371,7 @@ async def apply_snapshot(
         "status": status,
         "event": event_of_row,
         "baseline": baseline,
-        "absent": len(absent),
+        "absent": disappeared,
         "now": now,
     }
     await conn.execute(_CLASSIFY, classify)
@@ -359,7 +388,7 @@ async def apply_snapshot(
             context={
                 "snapshot_id": snapshot_id,
                 "source_instance_id": instance_id,
-                "absent": len(absent),
+                "absent": disappeared,
                 "baseline": baseline,
             },
         )
@@ -367,7 +396,7 @@ async def apply_snapshot(
             "mass_disappearance_opened",
             snapshot_id=snapshot_id,
             source_instance_id=instance_id,
-            absent=len(absent),
+            absent=disappeared,
             baseline=baseline,
         )
     elif mass and event is not None:

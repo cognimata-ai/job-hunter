@@ -44,7 +44,7 @@ unpublished targets of a job whose result changed are refiltered once `score_tar
 """
 
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property, lru_cache
@@ -54,6 +54,7 @@ from typing import Any, Final, Literal
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db.guards import Guard
 from jobhunter.db.seed import canonical_json, content_hash
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
@@ -446,8 +447,6 @@ _STALE: Final = q(
     "WHERE h.job_id IS NULL OR h.inputs_hash <> j.det_facts_hash OR h.det_algorithm_version <> :version) "
     "ORDER BY j.id LIMIT :limit FOR SHARE OF j"
 )
-
-type Guard = Callable[[AsyncConnection], Awaitable[None]]
 
 
 async def recompute_stale(

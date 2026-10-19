@@ -37,6 +37,9 @@ title, its other fields say nothing, and its `det_facts_hash` is no hash of its 
 `recompute_job` changes the det facts. `add_posting` adds such a posting to a job and `add_observation` a
 newer observation to a posting (it becomes the posting's latest), both on the caller's connection.
 
+Task 19: `activate_collection_settings` activates a copy of the active settings with `collection` values
+changed (for example `stale_ttl_days`).
+
 Task 18: `pending_item` stores a one-element page for a run (a `free` list request of the source's default
 instance, `succeeded`, its response fetched at `fetched_at`) and parses it with `items.parse_response` and an
 adapter whose one item is `observations.normalized` with the overrides: the `pending` raw item a resolver
@@ -420,6 +423,16 @@ async def seed_inputs(
         if enabled is not None:
             switches: dict[str, JSONValue] = {switch: switch in enabled for switch in SOURCE_SWITCHES}
             payload["sources"] = {**get_object(payload, "sources"), "enabled": switches}
+        version = int((await conn.execute(_NEXT_VERSION, {"payload": payload})).scalar_one())
+        await conn.execute(_ACTIVATE, {"v": version})
+
+
+async def activate_collection_settings(engine: AsyncEngine, **values: JSONValue) -> None:
+    """A new settings version copied from the active one with `collection.<key> = value` for each of `values`
+    (for example `stale_ttl_days=10`), committed and pointed at by `active_config` (Task 19)."""
+    async with engine.begin() as conn:
+        payload = dict(get_object((await conn.execute(_ACTIVE_PAYLOAD)).scalar_one(), ""))
+        payload["collection"] = {**get_object(payload, "collection"), **values}
         version = int((await conn.execute(_NEXT_VERSION, {"payload": payload})).scalar_one())
         await conn.execute(_ACTIVATE, {"v": version})
 

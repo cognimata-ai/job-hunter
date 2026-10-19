@@ -19,7 +19,7 @@ from jobhunter.worker import main as worker_main
 from jobhunter.worker import reconcilers as r
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from tests.support.collect import add_posting, ctx, job_lockable
+from tests.support.collect import activate_collection_settings, add_posting, ctx, job_lockable
 
 pytestmark = pytest.mark.integration
 
@@ -204,7 +204,7 @@ async def test_stale_sweep_takes_the_job_rows_before_its_guard(
 async def test_the_stale_sweep_reconciler_reads_the_ttl_and_is_fenced(
     engine, current_epoch, queue_app, posting_factory
 ) -> None:
-    assert r.REGISTRY["stale_sweep"][0] == {"tick", "daily"}
+    assert r.REGISTRY["stale_sweep"][0] == {"tick"}  # and `stale_sweep_daily` (fix round 1, M-2)
     assert "jobhunter.availability.rules" in worker_main._REGISTERING_MODULES
     reconcile = r.REGISTRY["stale_sweep"][1]
     old = await aggregator_posting(posting_factory, engine, "adzuna", "a1", 31 * DAY)
@@ -213,3 +213,39 @@ async def test_the_stale_sweep_reconciler_reads_the_ttl_and_is_fenced(
     assert await reconcile(ctx(engine, queue_app)) == 1  # `stale_ttl_days` null: `max_ad_age_days`, 30
     assert (await one(engine, POSTING, p=old)).availability == "stale"
     assert await reconcile(ctx(engine, queue_app)) == 0
+
+
+# ---- fix round 1 ------------------------------------------------------------------------------------------
+
+
+async def test_the_stale_sweep_reconciler_uses_a_set_stale_ttl_days(
+    engine, current_epoch, queue_app, posting_factory
+) -> None:
+    """M-7: `collection.stale_ttl_days` 10 (not null): 11 days unseen goes stale, 9 days does not."""
+    await activate_collection_settings(engine, stale_ttl_days=10)
+    old = await aggregator_posting(posting_factory, engine, "adzuna", "a1", 11 * DAY)
+    recent = await aggregator_posting(posting_factory, engine, "jsearch", "j1", 9 * DAY)
+    assert await r.REGISTRY["stale_sweep"][1](ctx(engine, queue_app)) == 1
+    assert (await one(engine, POSTING, p=old)).availability == "stale"
+    assert (await one(engine, POSTING, p=recent)).availability == "active"
+
+
+async def test_the_daily_stale_sweep_loops_over_batches_and_the_tick_runs_one(
+    engine, current_epoch, queue_app, posting_factory, monkeypatch
+) -> None:
+    """M-2: the tick sweeps one batch; the daily run sweeps batch after batch until a short one."""
+    assert r.REGISTRY["stale_sweep"][0] == {"tick"} and r.REGISTRY["stale_sweep_daily"][0] == {"daily"}
+    monkeypatch.setattr(rules, "STALE_BATCH", 2)
+    made = [
+        await aggregator_posting(posting_factory, engine, source_id, f"{source_id}-{n}", 40 * DAY)
+        for n in range(2)
+        for source_id in ("adzuna", "jsearch", "arbeitnow")
+    ]
+    assert (await r.run_reconcilers(ctx(engine, queue_app), "tick"))["stale_sweep"] == 2
+    states = [(await one(engine, POSTING, p=p)).availability for p in made]
+    assert sorted(states) == ["active"] * 4 + ["stale"] * 2
+    daily = r.REGISTRY["stale_sweep_daily"][1]
+    assert await daily(ctx(engine, queue_app, epoch=current_epoch + 1)) == 0  # a superseded worker
+    counts = await r.run_reconcilers(ctx(engine, queue_app), "daily")
+    assert counts["stale_sweep_daily"] == 4  # batches of 2, 2, then an empty one
+    assert {(await one(engine, POSTING, p=p)).availability for p in made} == {"stale"}

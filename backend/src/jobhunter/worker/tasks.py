@@ -7,8 +7,8 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 `operations` or `runs` row that the reconcilers re-defer from (§3.3.2).
 
 The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12), `reconcile_heavy` and
-`retention_daily` (Task 13). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
-`context.additional_context["runtime"]`.
+`retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19). Every body is
+`pass_context` and reads its inputs from the `WorkerRuntime` in `context.additional_context["runtime"]`.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 
@@ -107,11 +107,18 @@ async def reconcile_heavy(context: JobContext, timestamp: int) -> None:
 @blueprint.periodic(cron="17 3 * * *")
 @blueprint.task(name="retention_daily", queue="tick", pass_context=True)
 async def retention_daily(context: JobContext, timestamp: int) -> None:
-    # Imported here: `privacy.retention` imports this module (`delete_finished_jobs`).
+    # Imported here: `privacy.retention` and `reconcilers` import this module (`delete_finished_jobs`,
+    # `Deferrer`, `release_stalled_jobs`).
     from jobhunter.privacy.retention import run_retention_daily
+    from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow())
+    # The daily maintenance (§17.4, e.g. `stale_sweep_daily`, §8.11), after the retention pass.
+    await run_reconcilers(
+        ReconcileContext(engine=rt.engine, queue=rt.queue, defer=defer_in_tx, now=utcnow(), epoch=rt.epoch),
+        "daily",
+    )
 
 
 # The blueprint can be added to one app only (adding it namespaces its tasks), so a process has one task app.

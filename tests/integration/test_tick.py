@@ -333,6 +333,36 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     assert await runs(engine) == [(now, "queued", "schedule")]
 
 
+async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retention(
+    engine, queue_app, monkeypatch
+) -> None:  # Task 19 fix round 1, M-1: the `daily` cadence is dispatched
+    from jobhunter.privacy import retention
+
+    now = A + timedelta(days=1)
+    order: list[str] = []
+    seen: list[reconcilers.ReconcileContext] = []
+
+    async def retention_pass(engine_, queue, saver, *, now: datetime) -> None:
+        order.append("retention")
+
+    async def probe(ctx: reconcilers.ReconcileContext) -> int:
+        order.append("daily")
+        seen.append(ctx)
+        return 0
+
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the probe
+    reconcilers.reconciler("probe", "daily")(probe)
+    monkeypatch.setattr(retention, "run_retention_daily", retention_pass)
+    monkeypatch.setattr(tasks, "utcnow", lambda: now)
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, saver=object(), epoch=3)
+    context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
+    await tasks.retention_daily(context, timestamp=0)
+    assert order == ["retention", "daily"]
+    [ctx] = seen
+    assert ctx.engine is engine and ctx.queue is queue_app and ctx.defer is defer_in_tx
+    assert (ctx.now, ctx.epoch) == (now, runtime.epoch)
+
+
 # --- Final fix wave, item 4: the terminal runs a tick inserts are counted in RUNS ---------------------------
 
 

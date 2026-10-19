@@ -457,3 +457,99 @@ async def test_the_mass_events_reconciler_confirms_an_open_event_and_is_fenced(
     assert {p.availability for n, p in rows.items() if n not in ("p01", "p02")} == {"closed"}
     assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (0, None)
     assert await reconcile(ctx(engine, queue_app)) == 0
+
+
+# ---- fix round 1 ------------------------------------------------------------------------------------------
+
+ALERT_COUNT = sa.text("SELECT count(*) FROM alerts WHERE dedup_key = :k")
+
+
+async def test_unknown_postings_absent_again_open_no_new_event(engine, current_epoch, board20) -> None:
+    """Ruling T19-b, the review's trace: after an event clears (baseline 12, 8 still `unknown` and absent),
+    the next complete snapshot with the same 12 members is no new mass disappearance; the 8 keep counting
+    toward their ordinary close."""
+    d1 = (utcnow() - 10 * DAY).replace(hour=0, minute=0, second=0, microsecond=0)
+    await sighted_at(engine, board20.instance_id, d1 - DAY)
+    alert = {"k": f"{snapshots.MASS_ALERT}:instance:{board20.instance_id}"}
+    await taken(engine, board20, set(), d1 + 6 * H)  # opens: 20 absent
+    present = {f"p{k:02d}" for k in range(1, 13)}
+    _, effect = await taken(engine, board20, present, d1 + 12 * H)
+    assert effect.mass_cleared and tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (12, None)
+
+    again, effect = await taken(engine, board20, present, d1 + 18 * H)
+    assert effect == SnapshotEffect(absent_marked=8)  # no event: none of the 12 active postings is absent
+    row = await one(engine, SNAPSHOT_ROW, s=again)
+    assert (row.status, row.event_snapshot_id, row.baseline_active_count, row.absent_count) == (
+        "complete",
+        None,
+        12,
+        0,
+    )
+    assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (12, None)
+    assert tuple(await one(engine, ALERT, **alert)) == ("warn", False)  # the cleared one, not raised again
+    async with engine.connect() as c:
+        assert (await c.execute(ALERT_COUNT, alert)).scalar_one() == 1
+    rows = await postings(engine, board20.instance_id)
+    gone = {name for name in rows if name not in present}
+    assert {(rows[n].availability, rows[n].absent_snapshots, rows[n].first_absent_at) for n in gone} == {
+        ("unknown", 2, d1 + 12 * H)
+    }
+    _, effect = await taken(engine, board20, present, d1 + 36 * H)  # 24 h after their first absence
+    assert effect == SnapshotEffect(absent_marked=8, closed=8)
+    rows = await postings(engine, board20.instance_id)
+    assert {(rows[n].availability, rows[n].availability_reason) for n in gone} == {("closed", "ats_absent")}
+
+
+async def test_an_incomplete_snapshots_unknowns_are_no_disappearance(engine, current_epoch, board20) -> None:
+    """Ruling T19-b: 20 postings, an incomplete snapshot leaves 9 `unknown`; the complete snapshots without
+    them that follow (the second one after the baseline fell to 11) open no event."""
+    t0 = utcnow() - 10 * DAY
+    await sighted_at(engine, board20.instance_id, t0 - DAY)
+    present = {f"p{k:02d}" for k in range(10, 21)}  # 11 present, p01..p09 missing
+    _, effect = await taken(engine, board20, present, t0, complete=False)
+    assert effect == SnapshotEffect(unknown=9)
+    for hours in (6, 12):
+        snapshot_id, effect = await taken(engine, board20, present, t0 + hours * H)
+        assert effect == SnapshotEffect(absent_marked=9)
+        assert (await one(engine, SNAPSHOT_ROW, s=snapshot_id)).status == "complete"
+        assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (11, None)
+    async with engine.connect() as c:
+        alert = {"k": f"{snapshots.MASS_ALERT}:instance:{board20.instance_id}"}
+        assert (await c.execute(ALERT_COUNT, alert)).scalar_one() == 0
+        assert (await c.execute(sa.text("SELECT count(*) FROM ats_snapshot_absences"))).scalar_one() == 0
+
+
+async def test_the_absence_count_is_once_per_snapshot_without_applied_at(
+    engine, current_epoch, board
+) -> None:
+    """M-3: `last_absent_snapshot_id` alone keeps a snapshot's absence counted once, even when its
+    `applied_at` guard is bypassed."""
+    t0 = utcnow() - 3 * DAY
+    await sighted_at(engine, board.instance_id, t0 - DAY)
+    first, effect = await taken(engine, board, {"b", "c"}, t0)
+    assert effect == SnapshotEffect(absent_marked=1)
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE ats_snapshots SET applied_at = NULL WHERE id = :s"), {"s": first})
+    assert await apply(engine, first) == SnapshotEffect()  # applied again, counted nothing
+    a = (await postings(engine, board.instance_id))["a"]
+    assert (a.absent_snapshots, a.first_absent_at) == (1, t0)
+
+
+async def test_an_unknown_never_moves_the_change_time_backwards(engine, current_epoch, board) -> None:
+    """M-5: a posting whose availability changed after the snapshot was taken keeps a change time that is not
+    earlier than before; the others take the snapshot's time."""
+    t0 = utcnow() - 3 * DAY
+    await sighted_at(engine, board.instance_id, t0 - DAY)
+    rows = await postings(engine, board.instance_id)
+    later = t0 + 2 * H
+    async with engine.begin() as c:
+        await c.execute(
+            sa.text("UPDATE postings SET availability_changed_at = :at, last_seen_at = :at WHERE id = :p"),
+            {"at": later, "p": rows["b"].id},
+        )
+    _, effect = await taken(engine, board, {"a"}, t0, complete=False)
+    assert effect == SnapshotEffect(unknown=2)
+    rows = await postings(engine, board.instance_id)
+    assert (rows["b"].availability, rows["c"].availability) == ("unknown", "unknown")
+    assert rows["c"].availability_changed_at == t0
+    assert rows["b"].availability_changed_at >= later  # never moved back to `t0`

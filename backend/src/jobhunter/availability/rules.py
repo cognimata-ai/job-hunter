@@ -31,9 +31,10 @@ order, at most `limit`); their jobs are locked (`lock_posting_jobs`); then the c
 reconciler's `fence_epoch`); then the batch is re-checked under the posting rows' `FOR UPDATE` and each
 posting moves `active → stale` (no reason; `availability_changed_at` is the database's `now()`, carry 3);
 then the jobs are recomputed and, last, `ranking_state` bumped once when a job changed. `now` is the caller's
-clock for the TTL only. The reconciler `stale_sweep` (cadences `tick` and `daily`) runs one batch of
-`STALE_BATCH` per call with `stale_ttl_days` of the active settings (§13.1: `collection.stale_ttl_days`, or
-`max_ad_age_days` when `null`).
+clock for the TTL only. §17.4's `stale_sweep` is two reconcilers, each batch a transaction of its own fenced
+by the worker epoch, with `stale_ttl_days` of the active settings (§13.1: `collection.stale_ttl_days`, or
+`max_ad_age_days` when `null`): `stale_sweep` (cadence `tick`) runs one batch of `STALE_BATCH`;
+`stale_sweep_daily` (cadence `daily`, the `retention_daily` task) runs batches until one is short (M-2).
 """
 
 from collections.abc import Iterable
@@ -45,13 +46,13 @@ from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db import ranking
+from jobhunter.db.guards import Guard
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import load_run_settings
-from jobhunter.scoring.filters import Guard
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
@@ -229,20 +230,43 @@ async def stale_sweep(
     return len(rows)
 
 
-@reconciler("stale_sweep", "tick", "daily")
-async def stale_sweep_reconciler(ctx: ReconcileContext) -> int:
-    """§17.4 `stale_sweep`: one batch of `STALE_BATCH` postings with the active settings' `stale_ttl_days`,
-    fenced by the worker epoch after the job rows (Ruling T19-a). Returns how many postings went stale: 0
-    when `ctx.epoch` is no longer the current epoch, because a superseded worker writes nothing."""
+async def _active_stale_ttl_days(ctx: ReconcileContext) -> int:
     async with ctx.engine.connect() as conn:
         version = int((await conn.execute(_ACTIVE_SETTINGS)).scalar_one())
-        stale_ttl_days = (await load_run_settings(conn, version)).stale_ttl_days
+        return (await load_run_settings(conn, version)).stale_ttl_days
+
+
+async def _sweep(ctx: ReconcileContext, *, until_short: bool) -> int:
+    """Batches of `STALE_BATCH` (read when called), one fenced transaction each: one batch, or batches until
+    one is short. Returns how many postings went stale; a fenced batch wrote nothing and ends the sweep."""
+    stale_ttl_days, limit, swept = await _active_stale_ttl_days(ctx), STALE_BATCH, 0
 
     async def fenced(conn: AsyncConnection) -> None:
         await fence_epoch(conn, ctx.epoch)
 
-    try:
-        async with ctx.engine.begin() as conn:
-            return await stale_sweep(conn, now=ctx.now, stale_ttl_days=stale_ttl_days, guard=fenced)
-    except FencedOut:
-        return 0  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+    while True:
+        try:
+            async with ctx.engine.begin() as conn:
+                count = await stale_sweep(
+                    conn, now=ctx.now, stale_ttl_days=stale_ttl_days, limit=limit, guard=fenced
+                )
+        except FencedOut:
+            return swept  # `fence_epoch` logged it
+        swept += count
+        if not until_short or count < limit:
+            return swept
+
+
+@reconciler("stale_sweep", "tick")
+async def stale_sweep_reconciler(ctx: ReconcileContext) -> int:
+    """§17.4 `stale_sweep`, in the tick (≤ 1,000 rows): one batch of `STALE_BATCH` postings. Returns how many
+    went stale: 0 when `ctx.epoch` is no longer the current epoch, because a superseded worker writes
+    nothing."""
+    return await _sweep(ctx, until_short=False)
+
+
+@reconciler("stale_sweep_daily", "daily")
+async def stale_sweep_daily_reconciler(ctx: ReconcileContext) -> int:
+    """§17.4 `stale_sweep`, daily: batches of `STALE_BATCH` until a short one (M-2). Returns how many postings
+    went stale; a superseded worker stops at its first batch, which wrote nothing."""
+    return await _sweep(ctx, until_short=True)
