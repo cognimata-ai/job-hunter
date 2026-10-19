@@ -391,8 +391,9 @@ async def _firehose(
 
 
 async def _details(t: _Traversal, adapter: SmartRecruitersAdapter, listing: Served) -> None:
-    """The detail calls of a SmartRecruiters list page (§5.3.5), sent at most
-    `SMARTRECRUITERS_DETAIL.concurrency` at a time (the limiter's key bounds them); their outcomes are the
+    """The detail calls of a SmartRecruiters list page (§5.3.5), at most `SMARTRECRUITERS_DETAIL.concurrency`
+    inside `acquire_page` at a time (the gate: the limiter's key bounds only the sends, the gate also the
+    database work around them, so a page of many postings cannot drain the pool); their outcomes are the
     traversal's, and none of them ends it. An error of a call (a lost owner, a bug) is raised as it is, never
     wrapped in the `ExceptionGroup` of the task group: a `FencedOut` must still end the attempt quietly."""
     ids = sorted({native_id for native_id in adapter.peek_native_ids(listing.page) if native_id is not None})
@@ -404,10 +405,16 @@ async def _details(t: _Traversal, adapter: SmartRecruitersAdapter, listing: Serv
     specs = adapter.detail_specs(
         listing.page, known, now=t.ctx.clock(), parent_fetch_request_id=listing.fetch_request_id
     )
+    gate = asyncio.Semaphore(SMARTRECRUITERS_DETAIL.concurrency)
+
+    async def detail(spec: RequestSpec) -> None:
+        async with gate:
+            await t.acquire(spec, None, key=SMARTRECRUITERS_DETAIL.key, listing=False)
+
     try:
         async with asyncio.TaskGroup() as group:
             for spec in specs:
-                group.create_task(t.acquire(spec, None, key=SMARTRECRUITERS_DETAIL.key, listing=False))
+                group.create_task(detail(spec))
     except ExceptionGroup as failed:
         raise _first(failed) from None
 

@@ -31,6 +31,7 @@ from jobhunter.sources.ats import adapter_for
 from jobhunter.sources.ats.smartrecruiters import SmartRecruitersAdapter
 from jobhunter.sources.breaker import record_failure
 from jobhunter.sources.instances import InstanceRow, list_instances
+from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL
 from jobhunter.sources.serpapi import SerpApiAdapter
 from jobhunter.worker import runs
 from jobhunter.worker.runs import RunOwner, finalize_run
@@ -704,3 +705,40 @@ async def test_an_arbeitnow_failure_partway_proves_nothing_and_leaves_an_open_ga
     assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
         ("gap", "open", "source_failed", min(times), max(times))
     ]
+
+
+async def test_detail_acquisitions_never_run_more_than_the_gate_admits(
+    engine, current_epoch, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    """Fix round 2: a list page with 10 postings in Germany has 10 detail calls, of which at most
+    `SMARTRECRUITERS_DETAIL.concurrency` (4) are inside `acquire_page` (and its database work) at once."""
+    await seed_inputs(engine, companies=(("smartrecruiters", "DeliveryHero"),), enabled=("ats",))
+    listing = listing_in_germany()
+    for item in listing["content"]:
+        item["location"] = listing["content"][0]["location"]
+    respx_mock.get("https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings").mock(
+        return_value=httpx.Response(200, json=listing)
+    )
+    real, active, peak, made = acquire_page, [0], [0], [0]
+
+    async def counted(ctx, spec, **arguments):
+        if spec.operation != "detail":
+            return await real(ctx, spec, **arguments)
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        for _ in range(5):  # yields, as the protocol's database round trips do
+            await asyncio.sleep(0)
+        active[0] -= 1
+        made[0] += 1
+        return Denied(-made[0], "breaker_open")
+
+    monkeypatch.setattr(traverse, "acquire_page", counted)
+    async with engine.connect() as c:
+        board = next(i for i in await list_instances(c) if i.source_id == "smartrecruiters")
+    async with httpx.AsyncClient() as client:
+        adapter = adapter_for(board, client, clock=utcnow)
+        deps = make_deps(engine, lambda instance: adapter)
+        owner = await queued_run(engine, include_paid=False)
+        (fid,) = await plan_ids(deps, owner)
+        await traverse_and_record(deps, fid)
+    assert (made[0], peak[0]) == (10, SMARTRECRUITERS_DETAIL.concurrency)
