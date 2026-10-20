@@ -71,6 +71,6 @@ markers = [
     "perf: performance measurement, never a correctness assertion",
     "contract: runs an adapter or the fixture scan on the scrubbed fixtures (tests/contract, spec §18.4)",
     "live: calls a real provider; never run in CI and deselected by default",
-    "embedder_model: loads the real model from .model-cache/arctic (needs --group embedder); deselected by default",
+    "embedder_model: the real model in .model-cache/arctic; run with `uv run --group embedder pytest -m embedder_model`",
 ]
 addopts = "-m 'not stack and not perf and not live and not embedder_model'"

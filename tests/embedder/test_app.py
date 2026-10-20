@@ -186,17 +186,47 @@ def test_a_malformed_lock_is_refused(tmp_path: Path, lock_text: str) -> None:
 
 
 def test_the_committed_lock_pins_the_spec_model() -> None:
-    # spike V7 measured the int8 export's parity with fp32 below 0.99 (docs/spikes/V7.md), so the lock pins
-    # the fp16 export of the same revision (§19.7, §22 V7)
+    # Ruling T21-a (docs/spikes/V7.md): the fp32 export for M1. V7 measured the int8 export's parity with fp32
+    # below 0.99, and the fp16 export slower and larger than fp32 on this CPU. The sha256 values are the
+    # Hugging Face LFS object ids of the revision.
     entries = dict(line.split("=", 1) for line in LOCK.read_text().splitlines())
     assert entries == {
         "repo": "Snowflake/snowflake-arctic-embed-l-v2.0",
         "revision": "ac6544c8a46e00af67e330e85a9028c66b8cfd9a",
-        "model_id": "snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/fp16",
-        "onnx/model_fp16.onnx": "sha256:0b6846bcf4c0d9e53fdfc70d6dc1bbe3bb40fd205ebb7f0365da5b07064ddccc",
+        "model_id": "snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/fp32",
+        "onnx/model.onnx": "sha256:f74aa79745ccfb1e75daa7e8e6552a78402d4de193eb8ca67a931358d3e0a25e",
+        "onnx/model.onnx_data": "sha256:fe7d75ff258fbda10a6bea63c5422df5579d625355b1aca69ba6923c0ba604a9",
         "tokenizer.json": "sha256:39feb9863a378165ab9c5c689047203d789422966c0c58721c5309fd039a8edc",
     }
-    assert locked_onnx_file(LOCK) == "onnx/model_fp16.onnx"
+    assert locked_onnx_file(LOCK) == "onnx/model.onnx"
+
+
+@pytest.mark.parametrize(
+    ("files", "error"),
+    [
+        (["onnx/model.onnx", "model.onnx_data"], "beside"),  # external data in another directory
+        (["onnx/model.onnx", "onnx/other.onnx_data"], "beside"),  # data of another graph
+        (["onnx/a.onnx", "onnx/b.onnx"], "exactly one"),
+        (["tokenizer.json"], "exactly one"),
+    ],
+)
+def test_the_locked_graph_is_one_onnx_file_with_its_external_data_beside_it(
+    tmp_path: Path, files: list[str], error: str
+) -> None:
+    lock = tmp_path / "model.lock"
+    lock.write_text("repo=r\nrevision=v\nmodel_id=m\n" + "".join(f"{f}=sha256:{'0' * 64}\n" for f in files))
+    with pytest.raises(ValueError, match=error):
+        locked_onnx_file(lock)
+
+
+def test_the_external_data_file_is_verified_like_the_graph(tmp_path: Path) -> None:
+    lock = _write_lock(
+        tmp_path, {"onnx/model.onnx": b"graph", "onnx/model.onnx_data": b"weights", "tokenizer.json": b"tok"}
+    )
+    assert locked_onnx_file(lock) == "onnx/model.onnx" and verify_checksums(tmp_path, lock) == "r@v/int8"
+    (tmp_path / "onnx/model.onnx_data").write_bytes(b"other weights")
+    with pytest.raises(ChecksumMismatch, match=r"onnx/model\.onnx_data"):
+        verify_checksums(tmp_path, lock)
 
 
 def test_main_exits_78_and_names_the_file_on_a_checksum_mismatch(

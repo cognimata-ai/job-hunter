@@ -1,10 +1,11 @@
 """The embedder service (spec §2.1 U3, §3.2, §4.1, §16.8, §17.5): the pinned embedding model over HTTP.
 
 The image (embedder/Dockerfile) bakes in `Snowflake/snowflake-arctic-embed-l-v2.0` at the revision of
-`model.lock`, as the ONNX export the lock pins: fp16, since spike V7 measured the int8 export's parity with
-fp32 below 0.99 (docs/spikes/V7.md). At start `main()` checks every locked file's sha256 against the lock and
-exits with 78 on a mismatch, naming the file (§16.8: a failed startup check exits 78). Then it serves on
-0.0.0.0:8080:
+`model.lock`, as the ONNX export the lock pins: fp32 for M1 (ruling T21-a, docs/spikes/V7.md: the int8
+export's parity with fp32 is below 0.99, and on the V7 CPU the fp16 export is slower and larger than fp32;
+the deployment run of V7 decides again). At start `main()` checks every locked file's sha256 against the
+lock and exits with 78 on a mismatch, naming the file (§16.8: a failed startup check exits 78). Then it
+serves on 0.0.0.0:8080:
 
 - `GET /health`: `{"status": "ok", "model_id", "checksum_ok": true, "dim": 1024}` (503 when the check failed);
 - `POST /v1/embed`: `{"input_kind": "query" | "passage", "texts": [...]}` →
@@ -123,11 +124,18 @@ def verify_checksums(model_dir: Path, lock: Path) -> str:
 
 
 def locked_onnx_file(lock: Path) -> str:
-    """The one ONNX graph that model.lock pins (`onnx/model_fp16.onnx`)."""
+    """The one ONNX graph that model.lock pins (`onnx/model.onnx`).
+
+    A graph over 2 GB keeps its weights in an external-data file, which onnxruntime opens from the graph's
+    own directory: a locked `.onnx_data` file must be `<graph>_data`, beside it (`onnx/model.onnx_data`).
+    """
     _, files = read_lock(lock)
     graphs = [name for name in files if name.endswith(".onnx")]
     if len(graphs) != 1:
         raise ValueError(f"model.lock: {len(graphs)} .onnx files are locked, expected exactly one")
+    for name in files:
+        if name.endswith(".onnx_data") and name != graphs[0] + "_data":
+            raise ValueError(f"model.lock: {name} is not the external data beside {graphs[0]}")
     return graphs[0]
 
 
@@ -157,13 +165,17 @@ class OnnxModel(Model):
     int8 export, which quantises activations with one scale per tensor, a text's vector moved with the texts
     padded next to it (cos 0.974). One text per run keeps a vector a function of its text alone.
 
-    The vector is the export's pooled `sentence_embedding` when it has one (the int8 and fp16 exports both do:
-    the normalised CLS token), otherwise the CLS token of its token-level output, as the model pools (its
-    `1_Pooling/config.json`: `pooling_mode_cls_token`). `output_name` says which output is used.
+    The vector is the export's pooled `sentence_embedding` when it has one (the int8, fp16 and fp32 exports
+    all do: the normalised CLS token), otherwise the CLS token of its token-level output, as the model pools
+    (its `1_Pooling/config.json`: `pooling_mode_cls_token`). `output_name` says which output is used.
     """
 
     def __init__(self, model_dir: Path, *, onnx_file: str | None = None, threads: int | None = None) -> None:
-        """Load `onnx_file` (default: the export model.lock pins) and `tokenizer.json` from `model_dir`."""
+        """Load `onnx_file` (default: the export model.lock pins) and `tokenizer.json` from `model_dir`.
+
+        onnxruntime reads a graph's external data (`onnx/model.onnx_data` of the fp32 export) from the graph's
+        directory, so the lock keeps it beside the graph (`locked_onnx_file`).
+        """
         # onnxruntime 1.31 on Linux has Microsoft telemetry (1DS: a device id and an event store under
         # ~/.cache/Microsoft/DeveloperTools/.onnxruntime, posted to mobile.events.data.microsoft.com); the
         # switch only counts when it is set before the import (V7). The image sets it too (Dockerfile).

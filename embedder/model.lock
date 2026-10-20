@@ -1,5 +1,6 @@
 repo=Snowflake/snowflake-arctic-embed-l-v2.0
 revision=ac6544c8a46e00af67e330e85a9028c66b8cfd9a
-model_id=snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/fp16
-onnx/model_fp16.onnx=sha256:0b6846bcf4c0d9e53fdfc70d6dc1bbe3bb40fd205ebb7f0365da5b07064ddccc
+model_id=snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/fp32
+onnx/model.onnx=sha256:f74aa79745ccfb1e75daa7e8e6552a78402d4de193eb8ca67a931358d3e0a25e
+onnx/model.onnx_data=sha256:fe7d75ff258fbda10a6bea63c5422df5579d625355b1aca69ba6923c0ba604a9
 tokenizer.json=sha256:39feb9863a378165ab9c5c689047203d789422966c0c58721c5309fd039a8edc

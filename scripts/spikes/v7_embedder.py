@@ -1,17 +1,16 @@
 """Spike V7 (spec §22 V7, §19.7; Task 21): the arctic-embed-l-v2.0 ONNX exports in this container.
 
-    embedder/download_model.sh .model-cache/arctic
+    embedder/download_model.sh .model-cache/arctic          # the locked files: fp32 + tokenizer
     uv run --group embedder python scripts/spikes/v7_embedder.py .model-cache/arctic \\
-        --fp32 .model-cache/arctic-fp32 [--onnx onnx/model_int8.onnx]
+        [--onnx onnx/model_int8.onnx --fp32 .model-cache/arctic]
     uv run --group embedder python scripts/spikes/v7_embedder.py .model-cache/arctic --padded-batch 16 \\
-        --fp32 .model-cache/arctic-fp32 [--onnx onnx/model_int8.onnx]
+        [--onnx onnx/model_int8.onnx] [--fp32 .model-cache/arctic]
 
-It measures the export that embedder/model.lock pins, or the one `--onnx` names (int8 and fp16 are known by
-their sha256 in EXPORTS; V7 measured int8 first, and its parity moved the lock to fp16).
-
-The fp32 reference (`onnx/model.onnx` + `onnx/model.onnx_data`, 2.27 GB, and the same `tokenizer.json`) is
-downloaded into the gitignored `.model-cache/` for this spike only, with download_model.sh and a scratch lock
-of the sha256 values in FP32_FILES (docs/spikes/V7.md); this script checks those values again before use.
+It measures the export that embedder/model.lock pins (fp32 since ruling T21-a), or the one `--onnx` names (the
+int8, fp16 and fp32 files are known by their sha256 in EXPORTS; an int8 or fp16 file is downloaded beside the
+locked ones with a scratch lock of its sha256, docs/spikes/V7.md). `--fp32` names a directory holding the fp32
+export (`onnx/model.onnx`, `onnx/model.onnx_data`, `tokenizer.json`, checked against FP32_FILES), the parity
+reference.
 
 The main run loads `embedder.app.OnnxModel` (the service's own code: one inference per text, truncation at
 1,024 tokens, the export's `sentence_embedding`) and embeds the descriptions of 50 ads of the committed
@@ -51,10 +50,18 @@ FIXTURES: Final = ROOT / "tests" / "contract" / "fixtures"
 LOCK: Final = ROOT / "embedder" / "model.lock"
 # The fp32 reference at the locked revision, sha256 from the Hugging Face LFS metadata of that revision.
 FP32_ONNX: Final = "onnx/model.onnx"
-# The two exports V7 measured, sha256 from the same metadata (int8: the first lock; fp16: its fallback).
+# The exports V7 measured, each graph with its files and their sha256 (the revision's LFS object ids).
 EXPORTS: Final = {
-    "onnx/model_int8.onnx": "4b164a8bd09dd9806e035bdf3c34a2d81848b3db9642ba2e342b8367c00872d8",
-    "onnx/model_fp16.onnx": "0b6846bcf4c0d9e53fdfc70d6dc1bbe3bb40fd205ebb7f0365da5b07064ddccc",
+    "onnx/model_int8.onnx": {
+        "onnx/model_int8.onnx": "4b164a8bd09dd9806e035bdf3c34a2d81848b3db9642ba2e342b8367c00872d8"
+    },
+    "onnx/model_fp16.onnx": {
+        "onnx/model_fp16.onnx": "0b6846bcf4c0d9e53fdfc70d6dc1bbe3bb40fd205ebb7f0365da5b07064ddccc"
+    },
+    "onnx/model.onnx": {
+        "onnx/model.onnx": "f74aa79745ccfb1e75daa7e8e6552a78402d4de193eb8ca67a931358d3e0a25e",
+        "onnx/model.onnx_data": "fe7d75ff258fbda10a6bea63c5422df5579d625355b1aca69ba6923c0ba604a9",
+    },
 }
 FP32_FILES: Final = {
     "onnx/model.onnx": "f74aa79745ccfb1e75daa7e8e6552a78402d4de193eb8ca67a931358d3e0a25e",
@@ -178,8 +185,13 @@ def environment(threads: int) -> None:
 
 
 def check_export(model_dir: Path, onnx_file: str) -> None:
-    if onnx_file not in EXPORTS or sha256_of(model_dir / onnx_file) != EXPORTS[onnx_file]:
-        raise SystemExit(f"{onnx_file} is not one of the known exports with its sha256")
+    files = EXPORTS.get(onnx_file, {})
+    for name, digest in files.items():
+        path = model_dir / name
+        if not path.is_file() or sha256_of(path) != digest:
+            raise SystemExit(f"{name}: missing, or not the sha256 of the known {onnx_file} export")
+    if not files:
+        raise SystemExit(f"{onnx_file} is not one of the known exports")
 
 
 def main_run(model_dir: Path, onnx_file: str, fp32_dir: Path | None, threads: int) -> None:
