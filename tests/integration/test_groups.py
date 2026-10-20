@@ -13,6 +13,7 @@ from jobhunter.dedup.groups import GroupEffect
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
 from jobhunter.graphs.collect.state import initial_state
+from jobhunter.normalize.keys import AdKey
 from jobhunter.observability.metrics import REGISTRY
 from jobhunter.worker import main as worker_main
 from jobhunter.worker import reconcilers as r
@@ -680,3 +681,122 @@ async def test_a_member_that_no_longer_confirms_leaves_and_is_grouped_anew(
         "initial",
     )
     assert await regroup(engine, m) == GroupEffect(effect.group_id, False, False, (), False, False)
+
+
+# ---- final review I2: a key or posting change revalidates the group with G1 for every pair --------------
+
+_KEY = sa.text("INSERT INTO ad_keys (key_ns, key_value, exclusive, job_id) VALUES (:ns, :v, :exclusive, :j)")
+# What the item's observation states, as `canonical_job` states it for the jobs below: a re-sighting that
+# leaves the job's canonical content (its material) as it was.
+_SAME_CONTENT = {
+    "title_raw": "Senior Software Engineer",
+    "locations": [BERLIN],
+    "location_kind": "city",
+    "description_text": FULL_TEXT,
+}
+
+
+async def own(engine: AsyncEngine, job_id: int, ns: str, value: str, *, exclusive: bool = True) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(_KEY, {"ns": ns, "v": value, "exclusive": exclusive, "j": job_id})
+
+
+async def board_pair_and_a_second_board_posting(
+    engine: AsyncEngine, job_with_postings: Any
+) -> tuple[int, int, int, int]:
+    """Aggregator job A (full text, `pub:stepstone.de` 1) represents a group with B (partial text, the
+    Greenhouse key `ats:greenhouse:x` 1); C (A's text, `ats:greenhouse:x` 2: another posting of board X) is
+    ungrouped. Returns A, B, C and the group."""
+    make = jobs_maker(engine, job_with_postings)
+    a = await make("jsearch", description_text=FULL_TEXT)
+    b = await make("jsearch", description_text=PARTIAL, description_completeness="partial")
+    await own(engine, a, "pub:stepstone.de", "1")
+    await own(engine, b, "ats:greenhouse:x", "1")
+    formed = await regroup(engine, a)
+    assert formed.created and formed.group_id is not None
+    assert await members(engine, formed.group_id) == [a, b]
+    assert (await group_row(engine, formed.group_id))[1] == a  # A represents the group
+    c = await make("jsearch", description_text=FULL_TEXT)
+    native = str(await scalar(engine, "SELECT native_id FROM postings WHERE job_id = :j", j=c))
+    await own(engine, c, "htidocid", native, exclusive=False)
+    await own(engine, c, "ats:greenhouse:x", "2")
+    return a, b, c, formed.group_id
+
+
+async def test_a_board_key_gained_through_identity_ungroups_the_two_postings_of_that_board(
+    engine, current_epoch, job_with_postings
+) -> None:
+    """The review's scenario end to end through identity: a run re-sights C's posting with A's link, so C is
+    merged into A, and A now carries board X's key 2 beside B's key 1 (G1). The merge leaves A's material as
+    it was (no new revision), and yet the grouping pass of the same run revalidates A's group: B, on A's
+    board, leaves, and the group of two is dissolved."""
+    a, b, c, group = await board_pair_and_a_second_board_posting(engine, job_with_postings)
+    native = str(await scalar(engine, "SELECT native_id FROM postings WHERE job_id = :j", j=c))
+    owner = await queued_run(engine)
+    keys = (AdKey("htidocid", native), AdKey("pub:stepstone.de", "1"))
+    await pending_item(engine, owner, "jsearch", {**_SAME_CONTENT, "native_id": native, "raw_keys": keys})
+    node = make_resolve_identity(make_deps(engine, lambda instance: pytest.fail("no adapter is used")))
+    counters = (await node(initial_state(owner.run_id, owner.attempt_no)))["counters"]
+    assert (counters["merges"], counters["revisions_new"], counters["raw_items_linked"]) == (1, 0, 1)
+    assert await scalar(engine, "SELECT merged_into_job_id FROM jobs WHERE id = :j", j=c) == a
+    owned = await scalar(
+        engine, "SELECT job_id FROM ad_keys WHERE key_ns = 'ats:greenhouse:x' AND key_value = '2'"
+    )
+    assert owned == a
+    assert (await group_row(engine, group))[0] == "dissolved"
+    assert [await group_of_job(engine, job) for job in (a, b)] == [None, None]
+    assert counters["groups_changed"] == 1
+
+
+async def test_a_merge_triggered_validation_takes_the_company_lock_then_the_jobs_then_the_owner(
+    engine, current_epoch, job_with_postings, migrated, monkeypatch
+) -> None:
+    """Rulings T20-a and T18-c: the validation a merge schedules is the run's grouping pass, in a transaction
+    of its own after the merge committed: the company lock (two-key namespace 7261004) first, then the job
+    and the group's members in one ordered statement, then the run's owner row."""
+    from jobhunter.quota import ledger
+
+    a, b, c, group = await board_pair_and_a_second_board_posting(engine, job_with_postings)
+    owner = await queued_run(engine)
+    async with engine.begin() as conn:  # a strong-key merge of the run, committed before the pass
+        await merge.merge_jobs(conn, from_job_id=c, into_job_id=a, kind="strong_key_merge", evidence={})
+    calls: list[object] = []
+    real_lock, real_owner = merge.lock_jobs, ledger.lock_run_owner
+
+    async def locking(conn, job_ids, *, with_groups_of=()):
+        company_lock_held = advisory_held(migrated)
+        locked = await real_lock(conn, job_ids, with_groups_of=with_groups_of)
+        calls.append(("job rows", sorted(locked), company_lock_held))
+        return locked
+
+    async def owner_row(conn, run_owner):
+        calls.append(("owner row", [await job_lockable(engine, job) for job in (a, b)]))
+        await real_owner(conn, run_owner)
+
+    monkeypatch.setattr(merge, "lock_jobs", locking)
+    monkeypatch.setattr(ledger, "lock_run_owner", owner_row)
+    counts = await groups.regroup_run_jobs(engine, owner)
+    assert calls == [("job rows", [a, b], 1), ("owner row", [False, False])]
+    assert counts["groups_changed"] == 1 and (await group_row(engine, group))[0] == "dissolved"
+
+
+async def test_the_reconciler_revalidates_a_group_whose_members_share_a_board(
+    engine, current_epoch, job_with_postings, queue_app
+) -> None:
+    """A G1 conflict that no run regrouped (a key re-owned by a standalone unmerge, here written directly):
+    `group_representatives` finds it and revalidates the group with G1 for every pair. The member on the
+    representative's board leaves; the group keeps its other members and its representative."""
+    make = jobs_maker(engine, job_with_postings)
+    a = await make("jsearch", description_text=FULL_TEXT)
+    b = await make("jsearch", description_text=PARTIAL, description_completeness="partial")
+    d = await make("adzuna", description_text=PARTIAL, description_completeness="partial")
+    group = (await regroup(engine, a)).group_id
+    assert group is not None and (await regroup(engine, d)).joined
+    assert await members(engine, group) == [a, b, d] and (await group_row(engine, group))[1] == a
+    await own(engine, b, "ats:greenhouse:x", "1")
+    await own(engine, a, "ats:greenhouse:x", "2")  # A now on B's board
+    reconcile = r.REGISTRY["group_representatives"][1]
+    assert await reconcile(ctx(engine, queue_app)) == 1
+    assert await members(engine, group) == [a, d] and await group_of_job(engine, b) is None
+    assert (await group_row(engine, group))[:2] == ("active", a)
+    assert await reconcile(ctx(engine, queue_app)) == 0  # repaired: nothing left to do

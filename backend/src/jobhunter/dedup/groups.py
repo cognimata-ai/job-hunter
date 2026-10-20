@@ -30,13 +30,21 @@ evidence (text score, then lowest id) forms a new group with it, its representat
 **`regroup_job`** (the grouping of one job, in the caller's transaction): the candidates are the jobs of the
 same `company_key`, first seen at most `CANDIDATE_DAYS` apart, unmerged, with no `different` decision against
 it. A job already in a group whose representative it still confirms is left as it is, and nothing is
-written (idempotence; a group without a representative confirms its members too). A job that no longer
-confirms leaves (`member_left`) and is grouped anew. A representative whose content changed is revalidated
-against: its members that no longer confirm leave; when it is not eligible any more the group re-elects
-(`rep_inactive`). A joining `full` twin of a `partial` representative is elected (`fuller_member_joined`) when
-it is eligible. After every representative change the members are revalidated against the new one (G2-G5)
-and those that fail leave (`member_left`); a group left with fewer than two members is dissolved. The ranking
-generation is bumped, as the last statement, when anything was written.
+written (idempotence; a group without a representative confirms the members that pass G1 against every
+other member). A job that no longer confirms leaves (`member_left`) and is grouped anew. A representative
+whose content changed is revalidated against: its members that no longer confirm leave; when it is not
+eligible any more the group re-elects (`rep_inactive`). A joining `full` twin of a `partial` representative
+is elected (`fuller_member_joined`) when it is eligible. After every representative change the members are
+revalidated against the new one and those that fail leave (`member_left`); a group left with fewer than two
+members is dissolved. The ranking generation is bumped, as the last statement, when anything was written.
+
+**Revalidation** (`revalidation_departures`, pure; final review I2) is G2-G5 of every member against the
+representative, then G1 for every pair (spec §8.7: two postings of one ATS board are never grouped): the join
+rule replayed in the order the members joined, the representative first, so a member stays only when it
+carries no board key of the representative or of a member that stays before it. A member on the
+representative's board therefore leaves, and the representative never leaves for G1: a G1 conflict is no
+re-election trigger of §8.7, and every representative change is followed by this revalidation. A regroup of
+a member of a group without a representative keeps it only when it passes G1 against every other member.
 
 **Locks (Ruling T20-a, §3.3.3).** `regroup_job` takes the company lock, `pg_advisory_xact_lock(
 COMPANY_LOCK_NAMESPACE, hashtext(company_key))` (the two-key form: a key space of its own), FIRST, before any
@@ -59,19 +67,26 @@ rows. `split_member` and `confirm_group` (user actions) take no advisory lock ei
 group's members), then the group row; `confirm_group` takes `active_config` `FOR SHARE` before them.
 
 **`group_representatives`** (cadence `heavy`, §17.4): the active groups that break §7.17 #4 as it reads in M1
-(a representative that is not an eligible member; no representative while a member is eligible) or have
-fewer than two members are read; each is repaired in a transaction of its own: its members' rows (and its
-representative's: the FK of a new one takes `FOR KEY SHARE` on it) in one ordered statement, then
+(a representative that is not an eligible member; no representative while a member is eligible), have fewer
+than two members, or hold two members whose jobs carry keys of one ATS board (G1, final review I2: a key that
+moved outside any run, an unmerge's re-own or a conflict's merge, is found here) are read; each is repaired
+in a transaction of its own: its members' rows (and its representative's: the FK of a new one takes
+`FOR KEY SHARE` on it) in one ordered statement, then
 `fence_epoch` (Ruling T19-a: after the job rows; the brief's "fence first" holds only for a pass that locks no
 job row, and this one locks them), then the group row, and the violation is checked again. At most one
 election per group per pass (`reconciler_repair`, or `eligible_again` for a group without a representative),
 followed by the revalidation of the members, which Task 18's stand-in never did; a group of fewer than two
-is dissolved. Each repair is logged and counted in `DEDUP_GROUP_REPAIRS` once its transaction committed.
+is dissolved; a group whose only breach is G1 is revalidated (G1 alone without a representative), and no
+election runs. Each repair is logged and counted in `DEDUP_GROUP_REPAIRS` once its transaction committed.
 Because ineligible members are never elected, repair terminates.
 
 **`regroup_run_jobs`** (node 6's grouping pass): every unmerged job with a `job_revision_occurrences` row
 whose `became_current_at ≥ runs.started_at` (the first attempt's start: the `running → running` self-edge
-keeps it; both in the database clock), in id order, one transaction each, guarded by the run's owner row. The
+keeps it; both in the database clock), and every unmerged job whose strong keys or postings changed since
+then (final review I2): one that owns an `ad_keys` row created since (a posting attach) or that a
+`merge_events` row created since names (a merge moved postings and keys to its into-job; an unmerge re-owned
+them), in id order, one transaction each, guarded by the run's owner row. A key or posting change thus
+schedules the validation a revision change schedules, also when the job's material is unchanged. The
 selection is the durable trace of "created or changed in this run", never an in-memory result, so a resumed
 attempt re-runs it and a job already grouped is only confirmed. Returns `GROUPING_COUNTERS`: `groups_formed`
 (new groups), `groups_changed` (a regroup that joined an existing group, made a member leave or changed a
@@ -174,6 +189,10 @@ _MEMBERS_OF: Final = q(
     "ORDER BY group_id, job_id"
 )
 _MEMBERS: Final = q("SELECT job_id FROM duplicate_group_members WHERE group_id = :group ORDER BY job_id")
+# The members in the order they joined (the revalidation replays the join rule in that order).
+_MEMBERS_JOINED: Final = q(
+    "SELECT job_id FROM duplicate_group_members WHERE group_id = :group ORDER BY joined_at, job_id"
+)
 _GROUP: Final = q("SELECT status, representative_job_id FROM duplicate_groups WHERE id = :group")
 _GROUP_OF: Final = q(
     "SELECT g.id, g.status, g.representative_job_id FROM duplicate_group_members m "
@@ -192,16 +211,25 @@ _SAME: Final = q(
     "INSERT INTO dedup_decisions (job_a, job_b, decision, source) VALUES (:a, :b, 'same', :source) "
     "ON CONFLICT (job_a, job_b) DO UPDATE SET decision = 'same', source = EXCLUDED.source, decided_at = now()"
 )
-# The jobs created or changed in the run: a current revision that became current since its first attempt.
+# The jobs created or changed in the run: a current revision that became current since its first attempt, a
+# key created since (a posting attach) or a merge event since (its into-job; an unmerge's two jobs).
 _CHANGED_IN_RUN: Final = q(
-    "SELECT DISTINCT o.job_id FROM job_revision_occurrences o JOIN jobs j ON j.id = o.job_id "
-    "WHERE j.merged_into_job_id IS NULL "
-    "AND o.became_current_at >= (SELECT r.started_at FROM runs r WHERE r.id = :run) ORDER BY o.job_id"
+    "WITH since AS (SELECT r.started_at AS at FROM runs r WHERE r.id = :run), changed AS ("
+    "SELECT o.job_id FROM job_revision_occurrences o, since WHERE o.became_current_at >= since.at "
+    "UNION SELECT k.job_id FROM ad_keys k, since WHERE k.created_at >= since.at "
+    "UNION SELECT e.into_job_id FROM merge_events e, since WHERE e.created_at >= since.at "
+    "UNION SELECT e.from_job_id FROM merge_events e, since WHERE e.created_at >= since.at) "
+    "SELECT c.job_id FROM changed c JOIN jobs j ON j.id = c.job_id WHERE j.merged_into_job_id IS NULL "
+    "ORDER BY c.job_id"
 )
-# §7.17 #4 as it reads in M1, and a group of fewer than two members.
+# §7.17 #4 as it reads in M1, a group of fewer than two members, and two members on one ATS board (G1).
 _VIOLATIONS: Final = q(
     "SELECT g.id FROM duplicate_groups g WHERE g.status = 'active' AND ("  # noqa: S608 (constants only)
     "(SELECT count(*) FROM duplicate_group_members m WHERE m.group_id = g.id) < 2 "
+    "OR EXISTS (SELECT 1 FROM duplicate_group_members m1 JOIN duplicate_group_members m2 "
+    "ON m2.group_id = m1.group_id AND m2.job_id > m1.job_id "
+    "JOIN ad_keys k1 ON k1.job_id = m1.job_id AND starts_with(k1.key_ns, 'ats:') "
+    "JOIN ad_keys k2 ON k2.job_id = m2.job_id AND k2.key_ns = k1.key_ns WHERE m1.group_id = g.id) "
     "OR (g.representative_job_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM duplicate_group_members m "
     "JOIN jobs j ON j.id = m.job_id WHERE m.group_id = g.id AND m.job_id = g.representative_job_id "
     f"AND {ELIGIBLE_SQL})) "
@@ -308,6 +336,27 @@ def confirms(a: JobView, b: JobView, title_similarity: float) -> GroupEvidence |
 def pair_evidence(a: JobView, b: JobView, title_similarity: float) -> GroupEvidence | None:
     """G1-G5 of the pair (module docstring); `None` when one fails."""
     return None if same_board(a, b) else confirms(a, b, title_similarity)
+
+
+def revalidation_departures(
+    rep: JobView | None, others: Sequence[JobView], similarity: Mapping[int, float]
+) -> tuple[int, ...]:
+    """The members that leave a revalidation (module docstring): of `others` (every member but the
+    representative `rep`, in the order they joined; `similarity` of each title to `rep`'s), those that fail
+    G2-G5 against `rep`, then those that fail G1 against `rep` or a member that stays before them. Without a
+    representative, G1 alone."""
+    confirmed = [
+        view for view in others if rep is None or confirms(view, rep, similarity[view.id]) is not None
+    ]
+    staying: list[JobView] = [] if rep is None else [rep]
+    on_a_board: set[int] = set()
+    for view in confirmed:
+        if any(same_board(view, kept) for kept in staying):
+            on_a_board.add(view.id)
+        else:
+            staying.append(view)
+    confirmed_ids = {view.id for view in confirmed}
+    return tuple(view.id for view in others if view.id not in confirmed_ids or view.id in on_a_board)
 
 
 @dataclass(frozen=True)
@@ -454,15 +503,16 @@ async def _leave(conn: AsyncConnection, group_id: int, job_ids: Sequence[int], *
         log.info("duplicate_group_member_left", group_id=group_id, job_id=job_id, reason=reason)
 
 
-async def _revalidate(conn: AsyncConnection, group_id: int, representative_id: int) -> tuple[int, ...]:
-    """G2-G5 of every member against the representative: those that fail leave (`member_left`), and a group
-    left with fewer than two members is dissolved. The jobs that left. The caller holds every member's row."""
-    member_ids = await _members(conn, group_id)
+async def _revalidate(conn: AsyncConnection, group_id: int, representative_id: int | None) -> tuple[int, ...]:
+    """The revalidation of every member (`revalidation_departures`: G2-G5 against the representative, then G1
+    for every pair; G1 alone without one): those that fail leave (`member_left`), and a group left with fewer
+    than two members is dissolved. The jobs that left. The caller holds every member's row."""
+    member_ids = [int(job) for job in (await conn.execute(_MEMBERS_JOINED, {"group": group_id})).scalars()]
     views = await load_views(conn, member_ids)
-    rep = views[representative_id]
+    rep = None if representative_id is None else views[representative_id]
     others = [views[member] for member in member_ids if member != representative_id]
-    similarity = await _similarities(conn, rep.title_norm, others)
-    leaving = tuple(view.id for view in others if confirms(view, rep, similarity[view.id]) is None)
+    similarity = {} if rep is None else await _similarities(conn, rep.title_norm, others)
+    leaving = revalidation_departures(rep, others, similarity)
     if not leaving:
         return ()
     await _leave(conn, group_id, leaving, reason=MEMBER_LEFT)
@@ -620,12 +670,14 @@ class _Regroup:
         if old is not None:
             if self.groups.representative[old] == a.id:
                 return await self._representative(old, a)
-            confirmed = self.groups.representative[old] is None or (
-                join_evidence(
+            if self.groups.representative[old] is None:  # no representative to confirm against: G1 alone
+                others = (self.views[m] for m in self.groups.members[old] if m != a.id)
+                confirmed = not any(same_board(a, other) for other in others)
+            else:
+                evidence = join_evidence(
                     a, self.groups.view(old), self.views, different=self.different, similarity=self.similarity
                 )
-                is not None
-            )
+                confirmed = evidence is not None
             if confirmed:
                 return self.effect(old)  # in the right group: nothing written
             await self._write_leave(old, a.id, reason=MEMBER_LEFT)
@@ -878,6 +930,12 @@ async def regroup_run_jobs(engine: AsyncEngine, owner: RunOwner) -> dict[str, in
     return counts
 
 
+def _shares_a_board(views: Iterable[JobView]) -> bool:
+    """Whether two of the jobs carry keys of one ATS board (G1 fails for a pair of them)."""
+    listed = list(views)
+    return any(same_board(x, y) for i, x in enumerate(listed) for y in listed[i + 1 :])
+
+
 async def repair_group(conn: AsyncConnection, group_id: int, *, guard: Guard) -> bool:
     """One `group_representatives` repair (module docstring) in the caller's transaction: whether the group
     broke the invariant and was repaired. `guard` runs after the job rows; it raises `FencedOut` to stop."""
@@ -905,6 +963,9 @@ async def repair_group(conn: AsyncConnection, group_id: int, *, guard: Guard) ->
     elif rep is None and any(view.eligible for view in views.values()):
         reason = ELIGIBLE_AGAIN
         await _elect(conn, group_id, reason=reason)
+    elif _shares_a_board((await load_views(conn, member_ids)).values()):
+        reason = MEMBER_LEFT  # G1: no election, the members on a board leave (final review I2)
+        await _revalidate(conn, group_id, None if rep is None else int(rep))
     else:
         return False
     log.info("duplicate_group_repaired", group_id=group_id, reason=reason, representative_job_id=rep)

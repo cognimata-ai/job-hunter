@@ -7,9 +7,10 @@ most `identity.DEFERRED_LIMIT`), and `snapshots.apply_run_snapshots` applies the
 not applied yet (§8.11), one transaction each under the run's owner row, after the items, so a member's
 sighting is counted by its item alone. Then the grouping pass (§8.7, crash case C6b dies before it): it passes
 `collect.identity.before_grouping` and `groups.regroup_run_jobs` regroups every unmerged job with a
-`job_revision_occurrences` row since the run's `started_at` (the durable trace of "created or changed in this
-run", never an in-memory result), one transaction each, under the company lock, then the job rows, then the
-run's owner row.
+`job_revision_occurrences` row since the run's `started_at`, or whose strong keys or postings changed since
+then (a key created, a merge event: final review I2), the durable trace of "created or changed in this run",
+never an in-memory result, one transaction each, under the company lock, then the job rows, then the run's
+owner row.
 
 A resumed attempt continues every `pending` item from its stored `normalized` intermediate; the terminal
 dispositions are never touched again. The update's `counters` are what this call did:

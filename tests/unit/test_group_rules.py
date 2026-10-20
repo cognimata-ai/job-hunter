@@ -9,6 +9,7 @@ from jobhunter.dedup.groups import (
     choose_partner,
     compatible_location,
     pair_evidence,
+    revalidation_departures,
 )
 from jobhunter.dedup.representative import MemberView, elect, eligible
 
@@ -185,3 +186,24 @@ def test_the_representative_order() -> None:
     ) == member(2, availability="stale")
     assert eligible("active", merged=False) and eligible("stale", merged=False)
     assert not eligible("closed", merged=False) and not eligible("active", merged=True)
+
+
+def test_a_revalidation_rejects_every_g1_pair_the_representative_first() -> None:
+    """Final review I2: the revalidation against a representative checks G1 for every pair of members, not
+    only G2-G5. A member on the representative's board leaves; of two members on one board, the one that
+    joined later leaves (the members are given in the order they joined); a member failing G2-G5 leaves
+    and takes no other member with it."""
+    x, y = frozenset({"greenhouse:x"}), frozenset({"lever:eu:y"})
+    rep = job(id=1, ats_boards=x)
+    same_board_as_rep = job(id=2, ats_boards=x)
+    fine = job(id=3)
+    assert revalidation_departures(rep, [same_board_as_rep, fine], {2: 1.0, 3: 1.0}) == (2,)
+    # G2-G5 alone accept the pair: only G1 rejects it
+    assert pair_evidence(same_board_as_rep, rep, 1.0) is None and pair_evidence(fine, rep, 1.0) is not None
+    first_on_y, later_on_y = job(id=4, ats_boards=y), job(id=5, ats_boards=y)
+    assert revalidation_departures(job(id=1), [later_on_y, first_on_y], {4: 1.0, 5: 1.0}) == (4,)
+    assert revalidation_departures(job(id=1), [first_on_y, later_on_y], {4: 1.0, 5: 1.0}) == (5,)
+    # one that fails G4 leaves for it, and the member on its board stays
+    failing = job(id=6, ats_boards=y)
+    assert revalidation_departures(job(id=1), [failing, later_on_y], {6: 0.5, 5: 1.0}) == (6,)
+    assert revalidation_departures(job(id=1), [fine], {3: 1.0}) == ()
