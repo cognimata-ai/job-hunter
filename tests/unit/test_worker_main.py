@@ -527,6 +527,11 @@ M1_RECONCILERS = {
     "group_representatives": ["heavy"],
     "awaiting_embedding": ["heavy"],
 }
+# The reconcilers M2 adds, by task: the spend ledger's two (Task 3).
+M2_RECONCILERS = {
+    "llm_ledger_unsettled": ["tick"],
+    "budget_counters": ["heavy"],
+}
 # Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
 # from `sys.modules` (each registry module is imported by the modules that register into it).
 _REGISTRY_SCRIPT = """\
@@ -565,12 +570,12 @@ def registered_by(modules: tuple[str, ...]) -> dict[str, object]:
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
     """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
     (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
-    anyway), the registries hold exactly the M1 reconcilers with their cadences, the two takeover sweeps and
-    the `watchlist_validate` handler."""
+    anyway), the registries hold exactly the M1 and M2 reconcilers with their cadences, the two takeover
+    sweeps and the `watchlist_validate` handler."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
-        "reconcilers": M1_RECONCILERS,
+        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS},
         "sweeps": ["operations", "runs"],
         "handlers": ["watchlist_validate"],
         "main_imported": False,

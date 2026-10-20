@@ -1,0 +1,73 @@
+"""The LLM layer's domain errors (spec §6.9.1, §10.4, §10.5).
+
+`BudgetExhausted` is the spend ledger's (a reservation the monthly cap refuses); the others are the gateway's
+outcomes of a call (Task 5). Like every `DomainError` they carry codes, statuses, model ids and amounts only,
+never a prompt, a response or any CV or profile text, so their messages are safe to log and to put into a
+checkpoint.
+"""
+
+from decimal import Decimal
+
+from jobhunter.errors import DomainError
+from jobhunter.llm.budget import PurposeClass
+
+
+class LLMError(DomainError):
+    """Base of the outcomes of an LLM reservation or call."""
+
+
+class BudgetExhausted(LLMError):
+    """The §6.9.1 hard-cap check refused a reservation; `headroom_usd` is what its class could still reserve
+    (0 when nothing)."""
+
+    def __init__(self, purpose_class: PurposeClass, headroom_usd: Decimal) -> None:
+        super().__init__(f"LLM budget exhausted for {purpose_class} calls (headroom ${headroom_usd})")
+        self.purpose_class: PurposeClass = purpose_class
+        self.headroom_usd = headroom_usd
+
+
+class LLMTransient(LLMError):
+    """The retryable failures (§10.4: 408, 409, 429, 5xx, 529, timeouts, connection errors) outlasted the
+    tries a logical call may make."""
+
+
+class LLMRequestError(LLMError):
+    """A non-retryable HTTP status from the provider (§10.4)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"LLM request failed with HTTP {status}")
+        self.status = status
+
+
+class DeadlineExhausted(LLMError):
+    """Too little of the node deadline is left for another try (§10.4)."""
+
+
+class MaxTokensExhausted(LLMError):
+    """The enlarged `max_tokens` stage also stopped at `max_tokens` (§10.5)."""
+
+
+class InvalidOutput(LLMError):
+    """The response failed structural validation, or stopped for an unexpected reason (§10.5); `code` names
+    which (`structural`, `unexpected_stop_reason`)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"invalid LLM output: {code}")
+        self.code = code
+
+
+class Refused(LLMError):
+    """The model refused (`stop_reason='refusal'`, §10.5); `category` is the provider's refusal category."""
+
+    def __init__(self, category: str) -> None:
+        super().__init__(f"LLM refused: {category}")
+        self.category = category
+
+
+class ModelMismatch(LLMError):
+    """The provider served another model than the one requested (§10.5)."""
+
+    def __init__(self, requested: str, served: str) -> None:
+        super().__init__(f"LLM model mismatch: requested {requested}, served {served}")
+        self.requested = requested
+        self.served = served

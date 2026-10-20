@@ -128,6 +128,7 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.scoring.filters",
     "jobhunter.graphs.collect.nodes.embed",  # through `jobhunter.embeddings`: `awaiting_embedding`
     "jobhunter.sources.watchlist_validate",
+    "jobhunter.llm.spend_ledger",  # `llm_ledger_unsettled` and `budget_counters` (M2)
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
