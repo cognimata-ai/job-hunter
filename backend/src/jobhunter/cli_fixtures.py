@@ -26,19 +26,23 @@ else:
 
 Every other string is free text and goes through `scrub_text`. Every http(s) link in it (`URL_IN_TEXT`) gets
 the `url` rule. Outside the links, in this order: names near a contact marker (`Ansprechpartner`, `Kontakt`,
-`Contact`, `Your contact`: 2 or 3 capitalised words within 120 characters after it) and right before an
-e-mail address become `[person:n]`; e-mail addresses `[email:n]`; phone numbers (`redact.PHONE`, the
-parenthesised area code `PHONE_PAREN` of "(030) 123456", spaced groups `PHONE_GROUPS`, the unlabelled
-forms `PHONE_MORE`, a number after a phone label) `[phone:n]`; then
-every `redact.KEY` match `[token:n]`. A string under a person key (`PERSON_KEYS`: `creator`, `recruiter`, ...;
-its name or picture when it is an object) is `[person:n]` (a picture `[token:n]`). The `KEY` pass runs on
-non-URL free text only, because `KEY` matches
+`Contact`, `Your contact`: 2 or 3 capitalised words within 120 characters after it), right before an e-mail
+address or a phone number, after a salutation, in a team introduction, and next to a role word in narrative
+text (`ROLE_NAME`: "CEO und Gründer Max Mustermann", "Max Mustermann, CEO", "Gründer Max"; a later mention of
+that person, or of the first word of the name, gets the same placeholder) become `[person:n]`; e-mail
+addresses `[email:n]`; phone numbers (`redact.PHONE`, the parenthesised area code `PHONE_PAREN` of "(030)
+123456", spaced groups `PHONE_GROUPS`, the unlabelled forms `PHONE_MORE`, a number after a phone label)
+`[phone:n]`; then every `redact.KEY` match `[token:n]`. A string under a person key (`is_person_key`:
+`PERSON_KEYS` such as `creator` and `recruiter`, and by the suffix rule `contact`, `employer_contact`,
+`createdBy`, `recruiterName`, `hiring_manager_name`; its name or picture when it is an object) is
+`[person:n]` (a picture `[token:n]`). The `KEY` pass runs on non-URL free text only, because `KEY` matches
 the ids and slugs of real links. Object keys are never rewritten, so the wire structure stays. XML, HTML and
 text bodies are scrubbed as free text. Before any of it, the values of this machine's provider key variables
 (`SECRET_VARS`), wherever they stand, become `[key:n]`.
 
-`valid_url` and `validate_identifier` are the shape checks of the PII scan
-(tests/contract/test_fixture_pii.py).
+`valid_url`, `validate_identifier` and `ROLE_NAME` are also checks of the PII scan
+(tests/contract/test_fixture_pii.py). `valid_url` refuses a credential parameter (`api_key`, `token`, ...)
+whose value is set and is no placeholder.
 """
 
 import argparse
@@ -86,7 +90,8 @@ PHONE_GROUPS: Final = re.compile(
 )
 # Unlabelled forms that German pages use and none of the patterns above matches (6a review, finding 3):
 # `(0)30 1234567`, an `00` country prefix (`0049 30 1234567`), dotted (`+49.30.1234567`, `030.1234567`),
-# spaced groups after a slash (`030 / 12 34 56 78`) and a mobile number without separators (`01711234567`).
+# spaced groups after a slash (`030 / 12 34 56 78`), a mobile number without separators (`01711234567`) and
+# a dotted area code before mixed groups (`030.12 34 56`, `089.12.34.56`; fix wave F1, ledger L78).
 # Every repetition is bounded, so the pattern stays linear; an id, a UUID group (after `-`) and an epoch
 # timestamp (no leading 0) do not match.
 PHONE_MORE: Final = re.compile(
@@ -94,6 +99,7 @@ PHONE_MORE: Final = re.compile(
     r"\(0\)\s?\d{2,5}(?:[ /\-.]?\d{2,8}){1,4}"
     r"|00[1-9]\d{0,2}(?:[ /\-.]{1,3}\d{2,8}){2,5}"
     r"|\+\d{1,3}(?:\.\d{2,8}){2,5}"
+    r"|0\d{2,5}\.\d{2,8}(?:[ .]\d{2,8}){1,4}"
     r"|0\d{2,5}\.\d{3,8}(?:\.\d{2,8}){0,3}"
     r"|0\d{2,5}\s?/\s?\d{2,8}(?:\s\d{2,8}){0,5}"
     r"|01[5-7]\d{8,9}"
@@ -149,6 +155,69 @@ TEAM_INTRODUCTION: Final = re.compile(
     rf"(?:(?i:\b(?:stehen|sind)\s+wir|\b(?:that's|that is|this is|these are|meet)\s+us)\s*:{_TAGS}"
     rf"|(?i:\b(?:wir|we|us))\s*\(\s*)"
     rf"({_CAPITALISED}(?:{_TEAM_JOIN}{_CAPITALISED}){{1,4}})"
+)
+
+# Fix wave F1 (final review C1): a person named next to a role word in narrative text, which the contact rules
+# above miss ("gestaltest du mit unserem CEO und Gründer <name>"). Role words match in any case and chain with
+# "und", "and", "&", "/" or a comma ("CEO und Gründer", "Co-Founder & CTO"). A name is one to three
+# capitalised words with a particle or a middle initial between them ("Erika C. Musterfrau"):
+# - after a lead role (`LEAD_ROLE`) and a space, a line break or a few inline tags: one to three words
+#   ("Gründer Max"); after a dash two or three ("Founder-Max Mustermann"), as one word there is a compound
+#   ("CEO-Level"). After a comma the next item of a list follows ("the CFO, Strategic Finance"), after a colon
+#   a heading ("CEO: Regelmäßiger Austausch") and after a block tag the next line ("Reports to:
+#   CEO</p><p>Working ..."): no name;
+# - after a contact word (`CONTACT_ROLE`) and a space, a line break, a dash or a colon: two or three words, as
+#   one word there is a heading ("Contact Information");
+# - before a lead role, then a comma, an opening bracket or a dash: two or three words ("Max Mustermann, CEO",
+#   "Jane Doe (Co-Founder)"; an en or em dash between spaces counts as a dash).
+# A later bare mention of the name, or of its first word, in the same text gets the same placeholder
+# (`_echoes`). `_NOT_A_ROLE_NAME` is the narrow allow-list of capitalised words next to a role word that name
+# nobody: the role and contact words, the contact labels, pronouns and articles, job-title words ("Product
+# Owner, founder"), firm words ("Global Founders Capital") and the compounds of the recorded ads ("Founders
+# Associate", "Founder-Led Sales", "CEO Office", "mit dem Geschäftsführer Strukturen schaffen").
+_UE, _AE = "(?:ü|ue)", "(?:ä|ae)"
+LEAD_ROLE: Final = (
+    rf"(?:co-?founders?|cofounders?|founders?|(?:mit)?gr{_UE}nder(?:in(?:nen)?|s)?|ceo|cto|coo|cfo|cpo|cmo"
+    rf"|gesch{_AE}ftsf{_UE}hrer(?:in(?:nen)?|s)?|inhaber(?:in(?:nen)?|s)?|managing\s+director)"
+)
+CONTACT_ROLE: Final = r"(?:ansprechpartner(?:in(?:nen)?|s)?|ansprechperson(?:en)?|kontakt|contact)"
+_NOT_A_ROLE_NAME: Final = (
+    r"(?!(?:Ansprechpartner\w*|Ansprechperson\w*|Kontakt\w*|Contact\w*|Your|Tel|Telefon|Telephone|Phone|Mobil\w*"
+    r"|Handy|Fax|Mail|Email|E-Mail|Web|Website|Adresse|Address"
+    rf"|Co-?[Ff]ounders?|Cofounders?|Founders?|(?:Mit)?[Gg]r{_UE}nder\w*|Gesch{_AE}ftsf{_UE}hrer\w*|Inhaber\w*|Managing"
+    r"|Du|Dich|Dir|Dein\w*|Sie|Ihr\w*|Ihnen|Wir|Uns\w*|Der|Die|Das|Den|Dem|Des|Ein\w*|We|You|Our|Us|The|An?"
+    r"|Managers?|Owners?|Engineers?|Developers?|Directors?|Officers?|Leads?|Consultants?|Designers?|Analysts?"
+    r"|Architects?|Specialists?|Recruiters?|Partners?|Capital|Ventures?|Funds?|Group|Labs?|Holding"
+    r"|Associates?|Assistants?|Office|Teams?|Led|Strukturen)\b)"
+)
+_ROLE_NAME_WORD: Final = rf"{_NOT_A_ROLE_NAME}[{_UPPER}][{_LOWER}]+(?:[-'\u2019][{_UPPER}]?[{_LOWER}]+)*"
+_ROLE_NAME_GAP: Final = rf"[ \t]+(?:{_PARTICLE}[ \t]+|[{_UPPER}]\.[ \t]*)?"
+_ONE_TO_THREE: Final = rf"{_ROLE_NAME_WORD}(?:{_ROLE_NAME_GAP}{_ROLE_NAME_WORD}){{0,2}}"
+_TWO_OR_THREE: Final = rf"{_ROLE_NAME_WORD}(?:{_ROLE_NAME_GAP}{_ROLE_NAME_WORD}){{1,2}}"
+# Spaces, a line break and inline tags (`<strong>CEO</strong> Max`), raw or HTML-escaped; a block tag ends the
+# line. No two parts can match the same characters, so a long run of spaces cannot make the match slow.
+_INLINE_TAG: Final = (
+    r"(?:</?(?:strong|b|em|i|u|span|a|font)\b[^<>]{0,40}>"
+    r"|&lt;/?(?:strong|b|em|i|u|span|a|font)\b(?:(?!&gt;).){0,40}&gt;)"
+)
+_ROLE_SPACE: Final = rf"(?=[\s<&])[ \t]*(?:\r?\n[ \t]*)?(?:{_INLINE_TAG}[ \t]*(?:\r?\n[ \t]*)?)*"
+# A hyphen joins without spaces ("Founder-Max Mustermann"); a spaced hyphen separates the levels of a label
+# ("Brand Marketing - CMO - Acme"), an en or em dash may stand between spaces.
+_ROLE_DASH: Final = r"(?:-|[ \t]*[\u2013\u2014][ \t]*)"
+_NAME_END: Final = rf"(?![{_UPPER}{_LOWER}'\u2019])"
+
+
+def _role(words: str) -> str:
+    return rf"(?i:\b{words}\b)"
+
+
+_LEAD_CHAIN: Final = (
+    rf"{_role(LEAD_ROLE)}(?:[ \t]*(?:&(?:amp;)?|/|,|\bund\b|\band\b)[ \t]*{_role(LEAD_ROLE)})*"
+)
+ROLE_NAME: Final = re.compile(
+    rf"{_LEAD_CHAIN}(?:{_ROLE_SPACE}({_ONE_TO_THREE})|{_ROLE_DASH}({_TWO_OR_THREE})){_NAME_END}"
+    rf"|{_role(CONTACT_ROLE)}(?:{_ROLE_DASH}|[ \t]*:[ \t]*|{_ROLE_SPACE})({_TWO_OR_THREE}){_NAME_END}"
+    rf"|(?<![{_UPPER}{_LOWER}])({_TWO_OR_THREE})(?:[ \t]*[,(][ \t]*|{_ROLE_DASH}){_LEAD_CHAIN}"
 )
 
 # Query and fragment parameters whose value is a token whatever it looks like: Adzuna's `se`, `v`, `adref`;
@@ -276,36 +345,57 @@ def _sentinel_index(match: re.Match[str]) -> int:
     return int("".join(str(ord(ch) - _SENTINEL_DIGIT0) for ch in match.group(1)))
 
 
-def _name_spans(text: str) -> list[tuple[int, int]]:
-    """The spans of names: 2 or 3 capitalised words (or one after a preposition) within the window after a
-    contact marker, a name right before an e-mail address or a phone number, and the name after a salutation
-    or an academic title; overlapping spans are merged."""
-    spans: list[tuple[int, int]] = []
+def _role_names(text: str) -> list[tuple[int, int]]:
+    """The spans of the names that `ROLE_NAME` finds next to a role word."""
+    return [next(m.span(g) for g in range(1, 5) if m.group(g) is not None) for m in ROLE_NAME.finditer(text)]
+
+
+def _echoes(text: str, names: Iterable[tuple[int, int]]) -> list[tuple[int, int, str]]:
+    """Every other mention of a role-named person of two or more words: the whole name, or its first word
+    alone (a later "mit Max"), each as a whole word; with the person key of the whole name."""
+    echoes: list[tuple[int, int, str]] = []
+    # one search per person, not per mention
+    distinct = {tuple(text[start:end].split()) for start, end in names}
+    for words in sorted(w for w in distinct if len(w) >= 2):
+        key = " ".join(words)
+        whole = r"[ \t\r\n]+".join(map(re.escape, words))
+        for pattern in (whole, re.escape(words[0])):
+            mention = re.compile(rf"(?<![\w\-'\u2019]){pattern}(?![\w\-'\u2019])")
+            echoes.extend((m.start(), m.end(), key) for m in mention.finditer(text))
+    return echoes
+
+
+def _name_spans(text: str) -> list[tuple[int, int, str]]:
+    """The spans of names with their person keys: 2 or 3 capitalised words (or one after a preposition)
+    within the window after a contact marker, a name right before an e-mail address or a phone number, the
+    name after a salutation or an academic title, a name next to a role word and its later mentions.
+    Overlapping spans are merged; a merged span is keyed by its own text, unless it is exactly a later mention
+    of a role-named person."""
+    spans: list[tuple[int, int, str | None]] = []
     for marker in CONTACT_MARKER.finditer(text):
         limit = marker.end() + CONTACT_WINDOW
         for pattern, group in ((NAME, 0), (NAME_AFTER_PREPOSITION, 1)):
             for name in pattern.finditer(text, marker.end()):
                 if name.start() >= limit:
                     break
-                spans.append(name.span(group))
+                spans.append((*name.span(group), None))
     for pattern in (NAME_BEFORE_EMAIL, NAME_BEFORE_PHONE, SALUTED_NAME, TEAM_INTRODUCTION):
-        spans.extend(m.span(1) for m in pattern.finditer(text))
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(spans):
-        if merged and start < merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        spans.extend((*m.span(1), None) for m in pattern.finditer(text))
+    role_named = _role_names(text)
+    spans.extend((start, end, None) for start, end in role_named)
+    spans.extend(_echoes(text, role_named))
+    merged: list[tuple[int, int, list[tuple[int, int, str | None]]]] = []
+    for span in sorted(spans, key=lambda s: (s[0], -s[1])):
+        if merged and span[0] < merged[-1][1]:
+            start, end, parts = merged[-1]
+            merged[-1] = (start, max(end, span[1]), [*parts, span])
         else:
-            merged.append((start, end))
-    return merged
-
-
-def _replace_spans(text: str, spans: Iterable[tuple[int, int]], replace: Callable[[str], str]) -> str:
-    out, last = [], 0
-    for start, end in spans:
-        out += [text[last:start], replace(text[start:end])]
-        last = end
-    out.append(text[last:])
-    return "".join(out)
+            merged.append((span[0], span[1], [span]))
+    keyed: list[tuple[int, int, str]] = []
+    for start, end, parts in merged:
+        echo = next((key for s, e, key in parts if key is not None and (s, e) == (start, end)), None)
+        keyed.append((start, end, echo if echo is not None else _person_key(text[start:end])))
+    return keyed
 
 
 def _person_key(name: str) -> str:
@@ -318,7 +408,11 @@ def _phone_key(phone: str) -> str:
 
 def _scrub_free(text: str, p: Pseudonyms) -> str:
     """Names, e-mail addresses, phone numbers and key-shaped tokens, in that order (no link handling)."""
-    text = _replace_spans(text, _name_spans(text), lambda name: p.placeholder("person", _person_key(name)))
+    out, last = [], 0
+    for start, end, key in _name_spans(text):
+        out += [text[last:start], p.placeholder("person", key)]
+        last = end
+    text = "".join([*out, text[last:]])
     text = EMAIL.sub(lambda m: p.placeholder("email", m.group(0).lower()), text)
     for pattern in (PHONE_PAREN, PHONE, PHONE_GROUPS, PHONE_MORE):
         text = pattern.sub(lambda m: p.placeholder("phone", _phone_key(m.group(0))), text)
@@ -444,9 +538,19 @@ def valid_url(value: str) -> bool:
     for params in (parts.query, parts.fragment):
         for piece in _PARAM_SEPARATOR.split(params)[::2]:
             name, equals, raw = piece.partition("=")
-            if _shady(raw if equals else name):
+            if _shady(raw if equals else name) or (equals and _credential_value(name, raw)):
                 return False
     return True
+
+
+def _credential_value(name: str, raw: str) -> bool:
+    """A credential parameter (`_CREDENTIAL_PARAMS`: `api_key`, `app_id`, `token`, ...) whose value is set
+    and is no placeholder: the scrub turns every such value into `[token:n]`, whatever its shape (fix wave
+    F1)."""
+    value = unquote_plus(raw)
+    return (
+        unquote_plus(name).lower() in _CREDENTIAL_PARAMS and bool(value) and not PLACEHOLDER.fullmatch(value)
+    )
 
 
 # --- identifiers -------------------------------------------------------------------------------------------
@@ -549,18 +653,56 @@ _PERSON_NAMES: Final = frozenset(
 _PERSON_PICTURES: Final = frozenset(
     {"avatarurl", "avatar", "photourl", "photo", "imageurl", "pictureurl", "picture"}
 )
+# The suffix rule (fix wave F1, ledger L73). Keys are compared lower-case without `_`, `-` and spaces: a
+# person key is one of `PERSON_KEYS`, an audit key naming who did something (`createdBy`), a key that ends in
+# a person role (`contact`, `employer_contact`, `hiring_manager`), or a person role or `manager` followed by a
+# name field (`recruiterName`, `contactName`, `hiring_manager_name`).
+_PERSON_ROLES: Final = (
+    "contact",
+    "contactperson",
+    "recruiter",
+    "hiringmanager",
+    "creator",
+    "owner",
+    "author",
+    "coordinator",
+    "sourcer",
+)
+_NAMED_ROLES: Final = (*_PERSON_ROLES, "manager")
+_AUDIT_PERSON_KEYS: Final = frozenset({"createdby", "updatedby", "modifiedby", "postedby", "publishedby"})
+
+
+def _compact(key: str) -> str:
+    return re.sub(r"[_\-\s]", "", key.lower())
+
+
+_PERSON_KEYS_COMPACT: Final = frozenset(map(_compact, PERSON_KEYS))
+_PERSON_NAMES_COMPACT: Final = frozenset(map(_compact, _PERSON_NAMES))
+
+
+def is_person_key(key: str) -> bool:
+    """Whether a value under `key` names a person (`PERSON_KEYS` and the suffix rule)."""
+    k = _compact(key)
+    if not k:
+        return False
+    if k in _PERSON_KEYS_COMPACT or k in _AUDIT_PERSON_KEYS or k.endswith(_PERSON_ROLES):
+        return True
+    return any(
+        k.endswith(suffix) and k.removesuffix(suffix).endswith(_NAMED_ROLES)
+        for suffix in _PERSON_NAMES_COMPACT
+    )
 
 
 def _person_rule(path: tuple[str | int, ...]) -> Literal["person", "token"] | None:
-    keys = [k.lower() for k in path if isinstance(k, str)]
+    keys = [k for k in path if isinstance(k, str)]
     if not keys or not isinstance(path[-1], str):
-        return "person" if keys and keys[-1] in PERSON_KEYS else None
-    if keys[-1] in PERSON_KEYS:
+        return "person" if keys and is_person_key(keys[-1]) else None
+    if is_person_key(keys[-1]):
         return "person"
-    if len(keys) >= 2 and keys[-2] in PERSON_KEYS:
-        if keys[-1] in _PERSON_NAMES:
+    if len(keys) >= 2 and is_person_key(keys[-2]):
+        if keys[-1].lower() in _PERSON_NAMES:
             return "person"
-        if keys[-1] in _PERSON_PICTURES:
+        if keys[-1].lower() in _PERSON_PICTURES:
             return "token"
     return None
 

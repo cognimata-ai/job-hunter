@@ -7,7 +7,44 @@ contract tests (`tests/contract/test_*.py`), the adapter tests of Tasks 9–11, 
 **Raw recordings are never committed.** They live only in the gitignored `.fixtures-raw/` of the machine that
 recorded them. Every file here was written by the scrubber and passes `tests/contract/test_fixture_pii.py`; each
 was also reviewed by hand for recruiter and contact names, signatures and phone numbers in free text (the
-review and every scrubber fix it led to are recorded in the Task 6 report).
+review and every scrubber fix it led to are recorded in the Task 6 report), and again, in the final review's fix
+wave F1, for the names of real people in narrative text (below).
+
+## The PII scan
+
+`test_fixture_pii.py` fails on any e-mail address; any phone number (`redact.PHONE`, a parenthesised area code,
+and the unlabelled forms of `PHONE_MORE`: `(0)30 1234567`, `0049 30 1234567`, dotted and mixed groups such as
+`030.12 34 56`, `030 / 12 34 56 78`, a mobile number without separators); any `utm_source` value other than
+`scrubbed`; the value of a provider key variable of this machine; a key-shaped string outside a valid link or a
+validated identifier field (a valid link carries no credential parameter such as `api_key`, `app_id` or `token`
+with a value other than a placeholder); and a name next to a role word in narrative text (`cli_fixtures.ROLE_NAME`,
+the scrubber's own rule: `CEO und Gründer <name>`, `<name>, Founder of …`, `Gründer <name>`, `Kontakt: <name>`).
+A narrow allow-list in that rule keeps the capitalised words that stand next to a role word and name nobody
+(`Founders Associate`, `Founder-Led Sales`, `Product Owner, founder`). Company and product names are not personal
+names and stay.
+
+## Narrative names (fix wave F1)
+
+The final review found real names in narrative text that no contact rule had caught. Every committed fixture was
+audited again, and the names were replaced by hand with `[person:n]`, numbered above the highest placeholder of
+their source, one number per person in every file of the source, a later first-name mention included:
+
+| Files | Replaced |
+|---|---|
+| `ats/personio_everphone.xml`, `ats/personio_entity.xml` | 1 person, 4 mentions each → `[person:10]` |
+| `ats/lever_leverdemo.json` | 1 person, 8 mentions → `[person:11]` |
+| `arbeitnow/page2.json` | 4 people → `[person:55]` (3), `[person:56]` (3), `[person:57]` (2), `[person:58]` (6, and the name in 6 link paths) |
+| `arbeitnow/page1.json`, `arbeitnow/page1_remaining5.json` | 1 person, 2 mentions and 2 link paths each → `[person:58]` |
+| `adzuna/search_p1_rpp100.json`, `search_p1_distance10.json`, `search_p1_distance50.json`, `adzuna_reingest_pair.json` | 2 people, 2 mentions each → `[person:1]`, `[person:2]` |
+| `adzuna/search_p1_days1.json` | 2 people, 1 mention each → `[person:1]`, `[person:2]` |
+
+The scrubber gained the narrative-name rule (`ROLE_NAME`) at the same time. A scrub of `.fixtures-raw` with it
+numbers these people in order of appearance and renumbers the later placeholders of their source, so it no longer
+reproduces these files byte for byte; and it catches only the names next to a role word: a founders' introduction
+("founded … by <name> and <name>"), an interview title and its link, and the creator named in a demo posting are
+left to the manual review, as before. Kept on purpose: the lower-case first-name team handles (`@first`) and the
+first-name test posting title of the Lever demo board `leverdemo` (first names only, of a vendor's demo data), and
+SerpApi's publisher titles (`apply_options[].title`), which are the names of the publishing sites.
 
 ## How the tree is made
 

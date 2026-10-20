@@ -12,6 +12,7 @@ from jobhunter.cli_fixtures import (
     PHONE_PAREN,
     URL_IN_TEXT,
     Pseudonyms,
+    is_person_key,
     scrub_document,
     scrub_text,
     scrub_tree,
@@ -161,6 +162,16 @@ def test_a_secret_query_value_is_a_token_and_a_url_value_is_scrubbed_recursively
         # a form-encoded query value is judged decoded: these are words, not a key
         ("https://www.google.com/search?q=software+engineer+Berlin+since+yesterday&hl=en", True),
         ("https://www.example.com/x?k=" + "a1b2c3d4%2B" * 5, False),  # a percent-encoded key is still a key
+        # fix wave F1 (ledger L73): a credential parameter holds a placeholder or nothing, whatever its shape
+        ("https://api.example.com/x?app_id=abcd1234&app_key=[token:2]", False),
+        ("https://api.example.com/x?api_key=short", False),
+        ("https://api.example.com/x?Token=s3cr3t", False),
+        ("https://api.example.com/x?q=1&password=hunter2", False),
+        ("https://api.example.com/x#secret=abc", False),
+        ("https://api.example.com/x?key=AIzaSy1", False),
+        ("https://api.example.com/x?app_id=[token:1]&app_key=%5Btoken%3A2%5D", True),
+        ("https://api.example.com/x?token=&q=x", True),  # an empty value holds no secret
+        ("https://api.example.com/x?keyword=python&tokens=3", True),  # not a credential parameter
     ],
 )
 def test_valid_url(url: str, ok: bool) -> None:
@@ -380,7 +391,17 @@ def test_a_double_escaped_separator_keeps_the_parameter_rules() -> None:
 
 @pytest.mark.parametrize(
     "phone",
-    ["(0)30 1234567", "01711234567", "030.1234567", "+49.30.1234567", "0049 30 1234567", "030 / 12 34 56 78"],
+    [
+        "(0)30 1234567",
+        "01711234567",
+        "030.1234567",
+        "+49.30.1234567",
+        "0049 30 1234567",
+        "030 / 12 34 56 78",
+        "030.12 34 56",  # a dotted area code before mixed groups (fix wave F1, ledger L78)
+        "089.12.34.56",
+        "0711.123 45 67",
+    ],
 )
 def test_unlabelled_phone_forms_are_scrubbed(phone: str) -> None:
     out = scrub_text(f"Erreichbar unter {phone} oder vor Ort.", Pseudonyms())
@@ -433,3 +454,79 @@ def test_a_team_introduction_by_first_names_is_pseudonymised() -> None:
     assert "Lena" not in bracketed and "Jonas" not in bracketed and "wir ([person:1])" in bracketed
     benefits = "Das bieten wir: Urlaub und Gehalt"  # a list of benefits after "wir:" is no team
     assert scrub_text(benefits, Pseudonyms()) == benefits
+
+
+# Fix wave F1 (final review C1): a person named next to a role word in narrative text. Invented names only.
+@pytest.mark.parametrize(
+    ("text", "names"),
+    [
+        ("gestaltest du gemeinsam mit unserem CEO und Gründer Max Mustermann unsere", ("Max", "Mustermann")),
+        ("CEO Max Mustermann", ("Max", "Mustermann")),
+        ("Max Mustermann, CEO", ("Max", "Mustermann")),
+        ("Founder-Max Mustermann", ("Max", "Mustermann")),
+        ("Hinter Acme steht Gründer Max.", ("Max",)),
+        ("Erika Musterfrau (Geschäftsführerin)", ("Erika", "Musterfrau")),
+        ("\u201eWe win.\u201c \u2013 Jane C. Doe, Co-Founder of Acme", ("Jane", "Doe")),
+        ("Our co-founder & CTO Jane Doe built it.", ("Jane", "Doe")),
+        ("Inhaberin Erika von Musterfrau", ("Erika", "Musterfrau")),
+        ("Ihre Ansprechpartnerin\nErika Musterfrau", ("Erika", "Musterfrau")),
+        ("<p><strong>Gründer</strong> Max Mustermann</p>", ("Max", "Mustermann")),
+    ],
+)
+def test_a_name_next_to_a_role_word_is_pseudonymised(text: str, names: tuple[str, ...]) -> None:
+    out = scrub_text(text, Pseudonyms())
+    assert "[person:1]" in out and not any(name in out for name in names), out
+    assert "[person:2]" not in out  # one person, one placeholder
+
+
+def test_later_mentions_of_a_role_named_person_get_the_same_placeholder() -> None:
+    text = (
+        "Als Founder's Associate arbeitest du mit unserem CEO und Gründer Max Mustermann. Du berichtest "
+        "direkt an Max. Enge Zusammenarbeit mit Max, regelmäßig 1:1. Max Mustermann freut sich. "
+        "Max-Planck-Straße 1"
+    )
+    p = Pseudonyms()
+    out = scrub_text(text, p)
+    assert out.count("[person:1]") == 4 and "Mustermann" not in out and "Max " not in out
+    assert "Max-Planck-Straße" in out  # a word joined to others is no mention
+    assert scrub_text("Gründerin Erika Musterfrau", p) == "Gründerin [person:2]"
+    assert (
+        scrub_text("Kontakt: Erika Musterfrau", p) == "Kontakt: [person:2]"
+    )  # the same person, the same key
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Founders Associate - full-time (m/w/d)",
+        "Founder-Led Sales",
+        "Sparring mit dem CEO: Regelmäßiger Austausch mit dem Team",  # a heading after a colon
+        "Direkt mit dem Gründer: Enge Zusammenarbeit und kurze Wege",
+        "enterprise buying personas (CISO, CTO, Security, Risk teams)",  # a list after a comma
+        "gemeinsam mit dem Geschäftsführer Strukturen für weiteres Wachstum schafft",
+        "Contact Us",
+        "Delivery Hero und Ernst & Young, CEO-Level",  # company names; the role is no neighbour of a name
+        "CEO und Gründer [person:3] unsere",  # a placeholder is no name
+    ],
+)
+def test_role_compounds_headings_and_lists_are_no_names(text: str) -> None:
+    assert scrub_text(text, Pseudonyms()) == text
+
+
+@pytest.mark.parametrize(
+    "key", ["contact", "createdBy", "employer_contact", "recruiterName", "contactName", "hiring_manager_name"]
+)
+def test_the_person_key_suffix_rule(key: str) -> None:
+    # fix wave F1 (ledger L73): keys that name a person by their suffix, invented values
+    doc = cast(
+        Any, scrub_document({"jobs": [{key: "Max Mustermann", "title": "Engineer"}]}, "ats", Pseudonyms())
+    )
+    assert doc["jobs"][0] == {key: "[person:1]", "title": "Engineer"}
+    nested = cast(Any, scrub_document({key: {"name": "Erika Musterfrau", "id": "7"}}, "ats", Pseudonyms()))
+    assert nested[key]["name"] == "[person:1]"
+
+
+@pytest.mark.parametrize("key", ["company", "name", "contactEmail", "managerId", "department", "manager"])
+def test_keys_that_name_no_person_stay(key: str) -> None:
+    assert is_person_key(key) is False
+    assert scrub_document({key: "Acme Holding"}, "ats", Pseudonyms()) == {key: "Acme Holding"}

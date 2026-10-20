@@ -10,6 +10,7 @@ import pytest
 # validate_identifier(source, key, value) -> bool: the field's own shape check
 from jobhunter.cli_fixtures import (
     IDENTIFIER_FIELDS,
+    ROLE_NAME,
     URL_IN_TEXT,
     valid_url,
     validate_identifier,
@@ -29,12 +30,14 @@ PHONE_DE = re.compile(
 
 
 # More forms the scan checks on its own (6a review, finding 3): `(0)30 1234567`, a mobile number without
-# separators, dotted forms, an `00` country prefix, spaced groups after a slash. Bounded: it stays linear.
+# separators, dotted forms, an `00` country prefix, spaced groups after a slash, a dotted area code before
+# mixed groups (`030.12 34 56`; fix wave F1, ledger L78). Bounded: it stays linear.
 PHONE_MORE = re.compile(
     r"(?<![\w+\-.])(?:"
     r"\(0\)\s?\d{2,5}(?:[ /\-.]?\d{2,8}){1,4}"
     r"|00[1-9]\d{0,2}(?:[ /\-.]{1,3}\d{2,8}){2,5}"
     r"|\+\d{1,3}(?:\.\d{2,8}){2,5}"
+    r"|0\d{2,5}\.\d{2,8}(?:[ .]\d{2,8}){1,4}"
     r"|0\d{2,5}\.\d{3,8}(?:\.\d{2,8}){0,3}"
     r"|0\d{2,5}\s?/\s?\d{2,8}(?:\s\d{2,8}){0,5}"
     r"|01[5-7]\d{8,9}"
@@ -72,6 +75,8 @@ def test_fixture_has_no_pii_secret_or_key_shaped_value(path) -> None:
         "a phone number survived the scrub"
     )
     assert {m.group(1) for m in UTM.finditer(text)} <= {"scrubbed"}
+    # fix wave F1 (final review C1): a name next to a role word ("CEO und Gründer <name>", "<name>, Founder")
+    assert not ROLE_NAME.search(text), "a name next to a role word survived the scrub"
     for var in SECRET_VARS:  # the real keys of this machine, when present: never echoed in the message
         value = os.environ.get(var, "")
         assert len(value) < 8 or value not in text, f"the value of {var} is in the fixture"
@@ -86,6 +91,8 @@ def test_fixture_has_no_pii_secret_or_key_shaped_value(path) -> None:
             "x-rapidapi-key",
             "cookie",
         }
+    named = [p for p, v in strings(doc) if ROLE_NAME.search(v)]  # a JSON string decoded: line breaks are real
+    assert not named, f"a name next to a role word survived the scrub at {named}"
     strict = [
         (p, v) for p, v in strings(doc) if KEY.search(outside_links(v))
     ]  # a key-shaped value is allowed only in a valid link or a validated identifier field
@@ -120,7 +127,16 @@ def test_the_utm_check_flags_an_unscrubbed_value_and_passes_the_placeholder() ->
 
 @pytest.mark.parametrize(
     "phone",
-    ["(0)30 1234567", "01711234567", "030.1234567", "+49.30.1234567", "0049 30 1234567", "030 / 12 34 56 78"],
+    [
+        "(0)30 1234567",
+        "01711234567",
+        "030.1234567",
+        "+49.30.1234567",
+        "0049 30 1234567",
+        "030 / 12 34 56 78",
+        "030.12 34 56",  # a dotted area code before mixed groups (fix wave F1, ledger L78)
+        "089.12.34.56",
+    ],
 )
 def test_the_scan_detects_every_phone_form(phone: str) -> None:
     text = f"Ruf an: {phone}."
@@ -141,3 +157,41 @@ def test_the_scan_detects_every_phone_form(phone: str) -> None:
 )
 def test_the_scan_leaves_ids_uuids_and_timestamps_alone(value: str) -> None:
     assert not (PHONE.search(value) or PHONE_DE.search(value) or PHONE_MORE.search(value)), value
+
+
+# Fix wave F1 (final review C1): the narrative-name pattern of the scrubber, proved on invented names.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "gestaltest du gemeinsam mit unserem CEO und Gründer Max Mustermann unsere Vertriebsorganisation",
+        "Max Mustermann, CEO",
+        "Founder-Max Mustermann",
+        "Hinter Acme steht Gründer Max.",
+        "\u201eWe win together.\u201c \u2013 Erika C. Musterfrau, Founder of Acme",
+        "Jane Doe (Co-Founder & CTO)",
+        "Kontakt: Erika Musterfrau",
+        "Ihre Ansprechpartnerin\nErika Musterfrau",
+        "&lt;strong&gt;Geschäftsführerin&lt;/strong&gt; Erika Musterfrau",
+    ],
+)
+def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:
+    assert ROLE_NAME.search(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "gemeinsam mit unserem CEO und Gründer [person:10] unsere Vertriebsorganisation",  # the placeholder
+        "Delivery Hero, Ernst & Young, Mercuri Urval und Acme GmbH",  # company names next to no role
+        "Founders Associate - full-time (m/w/d)",
+        "Founder-Led Sales",
+        "Sparring mit dem CEO: Regelmäßiger Austausch",  # a heading after a colon
+        "enterprise buying personas (CISO, CTO, Security, Risk teams)",  # a list after a comma
+        "gemeinsam mit dem Geschäftsführer Strukturen für weiteres Wachstum schafft",
+        "Dein Kontakt Du hast Fragen?",
+        "Contact Us",
+        "direct access to the Head of Finance and the founders",
+    ],
+)
+def test_the_scan_passes_placeholders_companies_and_role_compounds(text: str) -> None:
+    assert not ROLE_NAME.search(text), text
