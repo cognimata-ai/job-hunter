@@ -701,7 +701,7 @@ async def run_row(engine, rid: int):
         )
 
 
-async def test_graph_runs_plan_fetch_and_pass_through_nodes_on_the_real_worker_protocol(
+async def test_graph_runs_every_node_on_the_real_worker_protocol(
     engine, current_epoch, migrated, adapters, respx_mock, serpapi_fixture_adapter: SerpApiAdapter
 ) -> None:
     await seed_inputs(engine, queries=(TEST_QUERY,), companies=(("greenhouse", "getyourguide"),))
@@ -718,8 +718,13 @@ async def test_graph_runs_plan_fetch_and_pass_through_nodes_on_the_real_worker_p
     admission, state = await run_graph(engine, migrated, collect_deps(engine, fixture_adapters), rid)
     assert admission == "started"
     rows = await requests(engine, rid)
-    # the pass-through finalize leaves the end to execute_run
-    assert await run_row(engine, rid) == ("succeeded", {"noop": True})
+    # the graph's finalize ends the run (Task 23): JSearch ended it `auth_failed`, and these deps have no
+    # embedder, so the run's revisions await their embedding
+    status, report = await run_row(engine, rid)
+    assert status == "partial" and report["execution"]["partial"] == [
+        "source_auth_failed",
+        "awaiting_embedding",
+    ]
     assert sorted((r.phase, r.source_id, r.page_no, r.status, r.skip_reason) for r in rows) == [
         ("fallback", "serpapi", 1, "succeeded", None),
         ("fallback", "serpapi", 2, "succeeded", None),  # page 1's ids are new: page 2 (§5.3.1)
@@ -741,7 +746,7 @@ async def test_graph_runs_plan_fetch_and_pass_through_nodes_on_the_real_worker_p
     fetched = [r for r in rows if r.status == "succeeded"]
     assert sorted(state["outcomes"]) == sorted(f"fr:{r.id}" for r in fetched)  # one outcome per page
     assert {o["status"] for o in state["outcomes"].values()} == {"succeeded"}
-    assert state["counters"]["fetch_pages"] == len(fetched) and state["final_status"] is None
+    assert state["counters"]["fetch_pages"] == len(fetched) and state["final_status"] == "partial"
     assert state["counters"]["hard_filter_backfilled"] == 0  # node 8 ran for real: no job was touched
     async with engine.connect() as c:
         assert state["settings_version_id"] == (await c.execute(ACTIVE_VERSION)).scalar_one()
@@ -794,7 +799,13 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
     )
     admission, state = await run_graph(engine, migrated, collect_deps(engine), rid)
     (failed,) = [r.id for r in await requests(engine, rid) if r.source_id == "arbeitnow"]
-    assert admission == "started" and await run_row(engine, rid) == ("succeeded", {"noop": True})
+    status, report = await run_row(engine, rid)
+    # the fake fetch_cell settles no request: the graph's finalize (Task 23) finds them all open (I2)
+    assert admission == "started" and status == "failed_invariant"
+    assert report["execution"]["invariants"]["I2"] == {
+        "ok": False,
+        "detail": {"requests": 3, "non_terminal": 3},
+    }
     assert state["outcomes"] == {
         f"fr:{failed}": {"work_id": f"fr:{failed}", "status": "failed", "items": 0, "new_postings": 0}
     }

@@ -1,4 +1,6 @@
 import json
+import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -10,7 +12,7 @@ from jobhunter.quota.planner import plan_run
 from jobhunter.run_settings import load_run_settings
 from jobhunter.sources.acquire import Served, acquire_page
 from jobhunter.sources.ats.common import SnapshotDraft
-from jobhunter.sources.base import CoverageWindow, RequestSpec
+from jobhunter.sources.base import CoverageWindow, RawPage, RequestSpec
 from jobhunter.sources.coverage import (
     CellStats,
     CoverageEffect,
@@ -22,7 +24,7 @@ from jobhunter.sources.coverage import (
 )
 from jobhunter.sources.instances import list_instances
 from jobhunter.sources.jsearch import JSearchAdapter
-from jobhunter.sources.receipts import insert_fetch_request
+from jobhunter.sources.receipts import insert_fetch_request, store_response
 from jobhunter.sources.traverse import End, TraversalResult
 from jobhunter.worker.runs import RunOwner, finalize_run
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -463,3 +465,68 @@ async def test_successive_incomplete_snapshots_open_gaps_that_follow_one_another
 async def rows(engine: AsyncEngine, statement: sa.TextClause, cell: int) -> list[tuple[object, ...]]:
     async with engine.connect() as c:
         return [tuple(r) for r in await c.execute(statement, {"c": cell})]
+
+
+# ---- Task 23 (carry 5) ------------------------------------------------------------------------------------
+
+COVERED_ROW = sa.text(
+    "INSERT INTO coverage_intervals (cell_id, kind, span, run_id) "
+    "VALUES (:c, 'covered', tstzrange(:lower, :upper, '[)'), NULL)"
+)
+
+
+async def settled_end_page(engine: AsyncEngine, owner: RunOwner, cell: int, window: CoverageWindow) -> None:
+    """A list page of the run for the cell that ended its traversal (`END`, succeeded), whose coverage commit
+    never happened: no interval row is recorded for it (a `fetch_cell` bug-class error the run survived)."""
+    spec = replace(await page1_spec(engine, cell), window=window, request_class="free")
+    async with engine.begin() as c:
+        request = await insert_fetch_request(
+            c,
+            owner=owner,
+            cell_id=cell,
+            source_instance_id=spec.source_instance_id,
+            phase="primary",
+            spec=spec,
+            request_key=uuid.uuid4().bytes,
+            attempt_seq=1,
+            status="planned",
+        )
+        await transition(c, "fetch_requests", request, ["planned"], "dispatched")
+        page = RawPage(spec, 200, {"content-type": "application/json"}, b'{"data": []}', window[1])
+        response = await store_response(
+            c,
+            request,
+            page,
+            source_instance_id=spec.source_instance_id,
+            ledger_entry_id=None,
+            succeeded=True,
+            items=0,
+        )
+        await transition(
+            c,
+            "fetch_requests",
+            request,
+            ["dispatched"],
+            "succeeded",
+            set_={"http_status": 200, "items": 0, "continuation": "end", "raw_response_id": response},
+        )
+
+
+async def test_last_covered_at_advances_only_from_a_committed_covered_row(engine, current_epoch) -> None:
+    """Carry 5: an END page whose coverage commit never happened leaves `last_covered_at` where it was; the
+    same END with a committed `covered` row of its window (here an earlier run's, the identical span) moves
+    it."""
+    never, before = await source_cell(engine, "jsearch"), DAY0 + DAY
+    covered_cell = await source_cell(engine, "jsearch", query="second query")
+    window = (DAY0, DAY0 + 3 * DAY)
+    async with engine.begin() as c:
+        await c.execute(COVERED, {"at": before, "c": covered_cell})
+        await c.execute(COVERED_ROW, {"c": covered_cell, "lower": window[0], "upper": window[1]})
+    owner = await queued_run(engine)
+    for cell in (never, covered_cell):
+        await settled_end_page(engine, owner, cell, window)
+    stats = await finalize(engine, owner.run_id, window[1])
+    assert stats[never].reached_end and stats[never].covered  # the traversal reached END
+    assert (await cell_row(engine, never)).last_covered_at is None  # but no covered row was committed
+    assert (await cell_row(engine, never)).consecutive_incomplete == 0
+    assert (await cell_row(engine, covered_cell)).last_covered_at == window[1]  # a committed covered row

@@ -143,6 +143,42 @@ def test_c3_after_response_before_settle(migrated, proc_env, procs, fixture_log)
     assert [int(r["pid"]) for r in served_requests(fixture_log) if r["case"] == "search_v2_page1"] == [a.pid]
 
 
+def test_c3b_after_coverage_commit_replays_without_double_stats(
+    migrated, proc_env, procs, fixture_log
+) -> None:
+    run_id = manual_paid_run(migrated, only="jsearch")
+    die_at(migrated, proc_env, procs, fixture_log, "collect.after_coverage_commit")
+    sent = served_requests(fixture_log)
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    (cell,) = cast(
+        tuple[int],
+        one(migrated, "SELECT cell_id FROM fetch_requests WHERE run_id = %s AND page_no = 1", run_id),
+    )
+    assert served_requests(fixture_log) == sent  # the pages are replayed: no further send
+    assert pg_rows(
+        migrated,
+        "superuser",
+        "SELECT kind, gap_status, reason FROM coverage_intervals WHERE cell_id = %s",
+        cell,
+    ) == [("gap", "open", "page_cap")]  # recorded once
+    ema, streak = cast(
+        tuple[float, int],
+        one(migrated, "SELECT yield_ema, consecutive_incomplete FROM coverage_cells WHERE id = %s", cell),
+    )
+    new, requests = cast(
+        tuple[int, int],
+        one(
+            migrated,
+            "SELECT sum(new_postings), count(*) FILTER (WHERE dispatched_at IS NOT NULL) FROM fetch_requests "
+            "WHERE run_id = %s AND cell_id = %s",
+            run_id,
+            cell,
+        ),
+    )
+    # applied once, by finalize (the column default 0.5 before)
+    assert streak == 1 and abs(ema - (0.3 * new / requests + 0.7 * 0.5)) < 1e-6
+
+
 def test_c4_after_settle_before_parse(migrated, proc_env, procs, fixture_log) -> None:
     run_id = manual_paid_run(migrated, only="jsearch")
     a = die_at(migrated, proc_env, procs, fixture_log, "collect.before_parse")

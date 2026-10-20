@@ -550,6 +550,12 @@ _END_PAGES = q(
     "SELECT DISTINCT ON (cell_id) cell_id, spec FROM fetch_requests WHERE run_id = :run "
     "AND status = 'succeeded' AND operation = 'list' AND continuation = 'end' ORDER BY cell_id, id DESC"
 )
+# A committed `covered` row of the cell with exactly this span: an earlier run recorded the same window, so
+# the run's own record of it inserted nothing (`ON CONFLICT DO NOTHING`).
+_COVERED_SPAN = q(
+    "SELECT EXISTS (SELECT 1 FROM coverage_intervals WHERE cell_id = :c AND kind = 'covered' "
+    "AND span = tstzrange(:lower, :upper, '[)'))"
+)
 _OPEN_BETWEEN = q(
     "SELECT EXISTS (SELECT 1 FROM coverage_intervals WHERE cell_id = :c AND kind = 'gap' "
     "AND gap_status = 'open' AND span && tstzrange(:lower, :upper, '[)'))"
@@ -607,10 +613,12 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
     per cell; `yield_ema` (alpha 0.3 of new postings per dispatched request) and `zero_yield_streak`,
     unchanged without a dispatched request. A search or firehose cell is covered when a list page of the
     run ended its traversal (`END`) or the run recorded a `covered` row, a board when its snapshot of the
-    run is structurally complete. `last_covered_at` advances to the upper bound of the covered window (the
-    run's `covered` row, else a search cell's `END` page's window) when it is `NULL`, when the window
-    starts at or before it, or when no open gap lies between them (§5.6), and to a structurally complete
-    snapshot's `taken_at` for a board, whose `complete` snapshot also becomes the instance's
+    run is structurally complete. `last_covered_at` advances only from a committed `covered` row (Task 23,
+    carry 5): to the upper bound of the run's `covered` row, else of a search cell's `END` page's window when
+    a `covered` row of exactly that span exists (an earlier run recorded the same window); an `END` page
+    without one (its coverage commit never happened) moves nothing. It advances when it is `NULL`, when the
+    window starts at or before it, or when no open gap lies between them (§5.6), and to a structurally
+    complete snapshot's `taken_at` for a board, whose `complete` snapshot also becomes the instance's
     `last_complete_snapshot_id`. `consecutive_incomplete` is reset by a covered run and incremented by a
     run that traversed the cell (a dispatched list request) without covering it, whether or not it wrote a
     new gap row, or that recorded a new gap of it; `last_exploration_at` is set for an attempted
@@ -646,7 +654,14 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
         # earlier run recorded already is no row of this run), a board by a structurally complete snapshot
         covered = (not board and bool(cell.reached_end)) or cell_id in covered_rows
         windowed = covered and cell.source_id in SEARCH_SOURCES  # a firehose spec's window is no coverage
-        span = covered_rows.get(cell_id) or (end_windows.get(cell_id) if windowed else None)
+        # `last_covered_at` moves only by a committed `covered` row (carry 5): an END page whose coverage
+        # commit never happened (a `fetch_cell` error the run survived) proves the pagination, not the span
+        span = covered_rows.get(cell_id)
+        end_window = end_windows.get(cell_id) if windowed else None
+        if span is None and end_window is not None:
+            same = {"c": cell_id, "lower": end_window[0], "upper": end_window[1]}
+            if (await conn.execute(_COVERED_SPAN, same)).scalar_one():
+                span = end_window
         if span is not None:
             contiguous = last_covered is None or span[0] <= last_covered
             if not contiguous:

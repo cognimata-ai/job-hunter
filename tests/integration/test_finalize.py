@@ -1,0 +1,406 @@
+"""Task 23: node 10, `finalize` (§9.2, §17.2, §17.3, §7.16.4, §17.6), and the run end owned by the graph."""
+
+import asyncio
+import json
+from typing import Any
+
+import pytest
+import sqlalchemy as sa
+from jobhunter.errors import FencedOut
+from jobhunter.graphs.collect.graph import build_collect_graph, build_noop_collect_graph
+from jobhunter.graphs.collect.nodes import finalize as finalize_module
+from jobhunter.graphs.collect.nodes.finalize import (
+    InvariantCode,
+    InvariantResult,
+    check_invariants,
+    decide_status,
+    finalize_from_graph,
+    partial_conditions,
+)
+from jobhunter.graphs.collect.state import initial_state
+from jobhunter.observability.metrics import REGISTRY
+from jobhunter.run_settings import load_run_settings
+from jobhunter.sources.instances import InstanceRow
+from jobhunter.worker import runs
+from jobhunter.worker.runs import RunCompletion, RunEnd
+from langgraph.checkpoint.memory import InMemorySaver
+
+from tests.support.collect import (
+    DEFAULT_BOARD,
+    TEST_QUERY,
+    conflicting_graph,
+    make_deps,
+    manual_run_id,
+    pending_item,
+    queued_run,
+    resolved,
+    run_to_the_end,
+    seed_inputs,
+    supersede,
+)
+from tests.support.pg import pg_rows
+
+pytestmark = pytest.mark.integration
+
+TEXTS = sa.text(
+    "SELECT title, description_text FROM jobs j JOIN job_revisions r ON r.id = j.current_revision_id"
+)
+RUN_END = sa.text("SELECT status, status_reason, report FROM runs WHERE id = :i")
+OPEN_ALERT = sa.text("SELECT severity FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL")
+ANY_ALERT = sa.text("SELECT count(*) FROM alerts WHERE dedup_key = :k")
+BOARD_INSTANCE = sa.text("SELECT id FROM source_instances WHERE source_id = :s AND instance_key = :k")
+
+
+async def run_end(engine, rid: int) -> tuple[str, str | None, dict[str, Any]]:
+    async with engine.connect() as c:
+        status, reason, report = (await c.execute(RUN_END, {"i": rid})).one()
+    return status, reason, report
+
+
+async def open_alert(engine, dedup_key: str) -> str | None:
+    async with engine.connect() as c:
+        severity = (await c.execute(OPEN_ALERT, {"k": dedup_key})).scalar()
+    return None if severity is None else str(severity)
+
+
+async def board_key(engine) -> str:
+    """The report key of the default board: its source and instance id, never its slug (carry 7)."""
+    async with engine.connect() as c:
+        instance = (
+            await c.execute(BOARD_INSTANCE, {"s": DEFAULT_BOARD[0], "k": DEFAULT_BOARD[1]})
+        ).scalar_one()
+    return f"{DEFAULT_BOARD[0]}/instance:{instance}"
+
+
+async def test_happy_run_succeeds_with_a_full_report(
+    engine, current_epoch, fake_http, fake_embedder, collect_deps
+) -> None:
+    # a watchlist company + Arbeitnow, the real graph through execute_run
+    rid = await run_to_the_end(engine, collect_deps)
+    async with engine.connect() as c:
+        status, reason, report = (
+            await c.execute(sa.text("SELECT status, status_reason, report FROM runs WHERE id=:i"), {"i": rid})
+        ).one()
+    assert (status, reason) == ("succeeded", None) and set(report) == {
+        "sources",
+        "identity",
+        "revisions",
+        "quota",
+        "execution",
+    }
+    assert all(v["ok"] for v in report["execution"]["invariants"].values()) and set(
+        report["execution"]["invariants"]
+    ) == {"I1", "I2", "I3", "I4", "I5", "I6", "I7"}
+    # Ruling T23-a: the Arbeitnow fixture run reads page 1, page 2 and the END page (T10-a)
+    assert (
+        report["sources"]["arbeitnow/default"]["requests"] == {"succeeded": 3}
+        and report["identity"]["jobs_created"] > 0
+        and "plan" in report["execution"]["nodes"]
+    )
+    board = report["sources"][await board_key(engine)]
+    assert board["requests"] == {"succeeded": 1} and board["health"] == "ok"
+    assert set(board) == {
+        "requests",
+        "units",
+        "items",
+        "items_out_of_scope",
+        "postings",
+        "availability",
+        "gaps",
+        "health",
+    }
+    arbeitnow = report["sources"]["arbeitnow/default"]
+    # the dispositions are counted from the rows; every posting of a first run is new
+    async with engine.connect() as c:
+        linked = (
+            await c.execute(
+                sa.text(
+                    "SELECT count(*) FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
+                    "JOIN fetch_requests f ON f.id = r.fetch_request_id JOIN source_instances s "
+                    "ON s.id = f.source_instance_id WHERE f.run_id = :r AND s.source_id = 'arbeitnow' "
+                    "AND i.disposition = 'linked'"
+                ),
+                {"r": rid},
+            )
+        ).scalar_one()
+    assert arbeitnow["items"].get("linked") == linked > 0
+    assert arbeitnow["postings"]["new"] > 0 and arbeitnow["postings"]["updated"] == 0
+    assert arbeitnow["units"] == {"billed": 0, "ambiguous": 0, "not_billed": 0}
+    revisions = report["revisions"]
+    assert revisions["created"] == revisions["embedded"] > 0 and revisions["awaiting"] == 0
+    assert revisions["targets"] == {} and report["quota"]["fallback"]["used"] is False
+    assert report["execution"]["warnings"] == [] and report["execution"]["partial"] == []
+    # no ad text anywhere: no title, no 40-character slice of any description of the run, is in the report
+    async with engine.connect() as c:
+        texts = (await c.execute(TEXTS)).all()
+        companies = (await c.execute(sa.text("SELECT DISTINCT company_display FROM jobs"))).scalars().all()
+    blob = json.dumps(report, ensure_ascii=False)
+    assert (
+        texts
+        and not [t.title for t in texts if t.title in blob]
+        and not [
+            t.title for t in texts if t.description_text[:40] in blob or t.description_text[-40:] in blob
+        ]
+    )
+    # carry 7: no company names either, neither the jobs' nor the board's slug
+    assert companies and not [name for name in companies if name in blob] and DEFAULT_BOARD[1] not in blob
+
+
+async def test_partial_and_invariant_failures(
+    engine,
+    current_epoch,
+    migrated,
+    fake_http,
+    fake_embedder,
+    collect_deps,
+    adapters,
+    jsearch_html_adapter,
+    monkeypatch,
+) -> None:
+    # (a) the JSearch cell served the html fixture: a failed('contract') request and a contract_broken source
+    def html_jsearch(instance: InstanceRow):
+        return jsearch_html_adapter if instance.source_id == "jsearch" else adapters(instance)
+
+    html_deps = make_deps(engine, html_jsearch, embedder=collect_deps.embedder)
+    rid = await run_to_the_end(
+        engine, html_deps, include_paid=True, queries=(TEST_QUERY,), companies=(), enabled=("jsearch",)
+    )
+    status, reason, report = await run_end(engine, rid)
+    assert (status, reason) == ("partial", "fetch_failed")
+    assert report["execution"]["partial"] == ["fetch_failed", "source_contract_broken"]
+    assert report["sources"]["jsearch/default"]["requests"] == {"failed": 1}
+    assert report["sources"]["jsearch/default"]["health"] == "contract_broken"
+    assert report["sources"]["jsearch/default"]["units"] == {"billed": 1, "ambiguous": 0, "not_billed": 0}
+    assert "source.contract_broken:instance:" in json.dumps(report["execution"]["alerts"])
+    assert await open_alert(engine, "run.partial:collect:fetch_failed") == "warn"
+    assert await open_alert(engine, "run.partial:collect:source_contract_broken") == "warn"
+
+    # (b) the embedder down: the run's revisions stay awaiting, the run is partial, I6 counts them
+    fake_embedder.down = True
+    rid = await run_to_the_end(engine, collect_deps)
+    fake_embedder.down = False
+    status, reason, report = await run_end(engine, rid)
+    awaiting = report["revisions"]["awaiting"]
+    assert (status, reason) == ("partial", "awaiting_embedding") and awaiting > 0
+    assert report["revisions"]["created"] == awaiting and report["revisions"]["embedded"] == 0
+    assert report["execution"]["invariants"]["I6"] == {"ok": False, "detail": {"awaiting": awaiting}}
+    assert report["execution"]["partial"] == ["awaiting_embedding"]
+    assert await open_alert(engine, "run.partial:collect:awaiting_embedding") == "warn"
+    # every other cause's alert is resolved: this run had neither
+    assert await open_alert(engine, "run.partial:collect:fetch_failed") is None
+    assert await open_alert(engine, "run.partial:collect:source_contract_broken") is None
+
+    # (c) a raw item forced back to `pending` after resolve (the database's own transition check is bypassed
+    # by the superuser, as a bug would): I1 fails
+    async def force_pending(name: str) -> None:
+        if name == "collect.before_finalize":
+            await asyncio.to_thread(pg_rows, migrated, "superuser", FORCE_PENDING)
+
+    monkeypatch.setattr(finalize_module, "afault_point", force_pending)
+    rid = await run_to_the_end(engine, collect_deps)
+    status, reason, report = await run_end(engine, rid)
+    assert (status, reason) == ("failed_invariant", "I1")
+    assert report["execution"]["invariants"]["I1"]["ok"] is False
+    assert report["execution"]["invariants"]["I1"]["detail"]["pending"] == 1
+    assert report["execution"]["invariants"]["I1"]["detail"]["mismatched"] == 0  # Σ dispositions still holds
+    assert await open_alert(engine, f"run.failed_invariant:run:{rid}") == "critical"
+    assert await open_alert(engine, "run.partial:collect:awaiting_embedding") is None  # no such cause now
+
+    # (d) an adjustment row pushing the (Adzuna) window the run touched over its limit: I3 fails
+    async def breach(name: str) -> None:
+        if name == "collect.before_finalize":
+            async with engine.begin() as c:
+                await c.execute(BREACH)
+
+    monkeypatch.setattr(finalize_module, "afault_point", breach)
+    rid = await run_to_the_end(engine, collect_deps, queries=(TEST_QUERY,), companies=(), enabled=("adzuna",))
+    status, reason, report = await run_end(engine, rid)
+    assert (status, reason) == ("failed_invariant", "I3")
+    (breached,) = report["execution"]["invariants"]["I3"]["detail"]["breaches"]
+    assert breached["provider"] == "adzuna" and breached["kind"] == "window"
+    assert breached["used"] > breached["limit"]
+    assert await open_alert(engine, "quota.limit_breach:provider:adzuna") == "critical"
+    assert await open_alert(engine, f"run.failed_invariant:run:{rid}") == "critical"
+    monkeypatch.undo()
+
+    # (e) a `deferred('job_fenced')` item does not fail I1: a board job fenced, its posting sighted again
+    async with engine.begin() as c:
+        job = (await c.execute(BOARD_JOB, {"s": DEFAULT_BOARD[0], "k": DEFAULT_BOARD[1]})).scalar_one()
+        await c.execute(FENCE_JOB, {"jobs": [job]})
+    rid = await run_to_the_end(engine, collect_deps)
+    status, reason, report = await run_end(engine, rid)
+    assert report["sources"][await board_key(engine)]["items"].get("deferred") == 1
+    assert report["execution"]["invariants"]["I1"]["ok"] is True and status != "failed_invariant"
+
+
+FORCE_PENDING = (
+    "SET session_replication_role = replica; "
+    "UPDATE raw_items SET disposition = 'pending', disposed_at = NULL, normalized = '{}', "
+    "observation_id = NULL WHERE id = (SELECT i.id FROM raw_items i JOIN raw_responses r "
+    "ON r.id = i.raw_response_id JOIN fetch_requests f ON f.id = r.fetch_request_id JOIN runs u "
+    "ON u.id = f.run_id WHERE u.status = 'running' AND i.disposition = 'linked' ORDER BY i.id LIMIT 1)"
+)
+BREACH = sa.text(
+    "INSERT INTO quota_ledger (provider, window_start, kind, units, evidence) "
+    "SELECT provider, window_start, 'adjustment', limit_units + 1, 'test_breach' FROM quota_windows "
+    "WHERE provider = 'adzuna' AND is_current"
+)
+BOARD_JOB = sa.text(
+    "SELECT p.job_id FROM postings p JOIN source_instances i ON i.id = p.source_instance_id "
+    "WHERE i.source_id = :s AND i.instance_key = :k ORDER BY p.id LIMIT 1"
+)
+FENCE_JOB = sa.text(
+    "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), 1)"
+)
+
+
+def test_decide_status_order() -> None:
+    def ok(c: InvariantCode) -> InvariantResult:
+        return InvariantResult(c, True, {})
+
+    def bad(c: InvariantCode) -> InvariantResult:
+        return InvariantResult(c, False, {})
+
+    assert decide_status([ok("I1"), bad("I3"), bad("I7")], ["fetch_failed"]) == ("failed_invariant", "I3")
+    assert decide_status([ok("I1"), bad("I6")], []) == ("succeeded", None) and decide_status(
+        [ok("I1")], ["awaiting_embedding", "fetch_failed"]
+    ) == ("partial", "awaiting_embedding")
+
+
+def runs_total(status: str) -> float:
+    return REGISTRY.get_sample_value("jobhunter_runs_total", {"status": status}) or 0.0
+
+
+ATTEMPTS = sa.text("SELECT attempt_no, end_reason, ended_at IS NOT NULL FROM run_attempts WHERE run_id = :r")
+FINISHED = sa.text("SELECT finished_at FROM runs WHERE id = :r")
+
+
+async def test_execute_run_uses_the_graph_finalize_once(
+    engine, current_epoch, fake_http, fake_embedder, collect_deps, monkeypatch
+) -> None:
+    finalized: list[str] = []
+    ends: list[RunEnd] = []
+    completions: list[RunCompletion | None] = []
+    real_finalize_run, real_observe, real_completion = (
+        runs.finalize_run,
+        runs.observe_run_ends,
+        runs.run_completion,
+    )
+
+    async def counted_finalize_run(*args: Any, **kwargs: Any) -> float | None:
+        finalized.append(kwargs["status"])
+        return await real_finalize_run(*args, **kwargs)
+
+    def observed(run_ends) -> None:
+        ends.extend(run_ends)
+        real_observe(run_ends)
+
+    async def looked_up(conn, run_id: int, attempt_no: int) -> RunCompletion | None:
+        completions.append(await real_completion(conn, run_id, attempt_no))
+        return completions[-1]
+
+    for module in (runs, finalize_module):
+        monkeypatch.setattr(module, "finalize_run", counted_finalize_run)
+        monkeypatch.setattr(module, "observe_run_ends", observed)
+    monkeypatch.setattr(runs, "run_completion", looked_up)
+    succeeded_before = runs_total("succeeded")
+
+    await seed_inputs(engine, companies=(DEFAULT_BOARD,), enabled=("arbeitnow", "ats"))
+    rid = await manual_run_id(engine)
+    graph = build_collect_graph(InMemorySaver(), collect_deps)
+    assert await runs.execute_run(engine, graph, rid, 1, epoch=1) == "started"
+    status, reason, report = await run_end(engine, rid)
+    assert (status, reason) == ("succeeded", None) and report != {"noop": True} and "execution" in report
+    assert finalized == ["succeeded"]  # the graph's finalize, once: execute_run wrote nothing more
+    async with engine.connect() as c:
+        finished_at = (await c.execute(FINISHED, {"r": rid})).scalar_one()
+        assert [tuple(r) for r in await c.execute(ATTEMPTS, {"r": rid})] == [(1, "completed", True)]
+    assert completions == [RunCompletion(status="succeeded", reason=None, finished_at=finished_at)]
+    (end,) = ends
+    assert end.status == "succeeded" and isinstance(end.duration_s, float) and end.duration_s > 0
+    assert runs_total("succeeded") == succeeded_before + 1
+
+    # the M0 no-op graph still ends `succeeded` with {"noop": true}: no completion was found after it returned
+    noop = await manual_run_id(engine)
+    assert (
+        await runs.execute_run(engine, build_noop_collect_graph(InMemorySaver()), noop, 1, epoch=1)
+        == "started"
+    )
+    assert (await run_end(engine, noop)) == ("succeeded", None, {"noop": True})
+    assert completions[-1] is None and finalized == ["succeeded", "succeeded"]
+    assert ends[-1].status == "succeeded" and isinstance(ends[-1].duration_s, float)
+    assert runs_total("succeeded") == succeeded_before + 2
+
+
+async def test_outcome_conflict_ends_failed_invariant_i7(
+    engine, current_epoch, fake_http, fake_embedder, collect_deps
+) -> None:
+    # two primary Sends (Arbeitnow and the board) of one step, each with its own outcome for one work id
+    rid = await run_to_the_end(engine, collect_deps, graph=conflicting_graph)
+    status, reason, report = await run_end(engine, rid)
+    assert (status, reason) == ("failed_invariant", "I7")
+    assert report["execution"]["invariants"]["I7"] == {
+        "ok": False,
+        "detail": {"error_class": "OutcomeConflict"},
+    }
+    assert await open_alert(engine, f"run.failed_invariant:run:{rid}") == "critical"
+    async with engine.connect() as c:
+        assert (await c.execute(ANY_ALERT, {"k": f"run.failed:run:{rid}"})).scalar_one() == 0
+
+
+CELLS = sa.text(
+    "SELECT id, last_attempted_at, yield_ema, consecutive_incomplete FROM coverage_cells ORDER BY id"
+)
+
+
+async def test_a_superseded_finalize_writes_nothing(
+    engine, current_epoch, queue_app, fake_http, fake_embedder, collect_deps
+) -> None:
+    """`FencedOut` propagates from the node's finalize: the attempt is lost, and its transaction (cells,
+    alerts, the run end) wrote nothing."""
+    owner = await queued_run(engine)
+    await pending_item(engine, owner, "jsearch", {"native_id": "fenced-1"})
+    async with engine.connect() as c:
+        cells, alerts = (
+            (await c.execute(CELLS)).all(),
+            (await c.execute(sa.text("SELECT count(*) FROM alerts"))).scalar_one(),
+        )
+    newer = await supersede(engine, owner)
+    with pytest.raises(FencedOut):
+        await finalize_from_graph(collect_deps, owner, initial_state(owner.run_id, owner.attempt_no))
+    async with engine.connect() as c:
+        assert (await c.execute(CELLS)).all() == cells
+        assert (await c.execute(sa.text("SELECT count(*) FROM alerts"))).scalar_one() == alerts
+        assert tuple((await c.execute(RUN_END, {"i": owner.run_id})).one()) == ("running", None, None)
+    assert newer.attempt_no == owner.attempt_no + 1
+
+
+async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, current_epoch) -> None:
+    """(e) at the function level: a `deferred('job_fenced')` item of the run keeps I1, and the partial
+    conditions of the run are read from its rows."""
+    owner = await queued_run(engine)
+    first = await pending_item(engine, owner, "jsearch", {"native_id": "H"})
+    assert await resolved(engine, owner, first) == "linked"
+    async with engine.begin() as c:
+        job = (await c.execute(sa.text("SELECT job_id FROM postings WHERE native_id = 'H'"))).scalar_one()
+        await c.execute(FENCE_JOB, {"jobs": [job]})
+    again = await pending_item(engine, owner, "jsearch", {"native_id": "H"})
+    assert await resolved(engine, owner, again) == "deferred"
+    async with engine.connect() as c:
+        version = (
+            await c.execute(
+                sa.text("SELECT settings_version_id FROM runs WHERE id = :r"), {"r": owner.run_id}
+            )
+        ).scalar_one()
+        settings = await load_run_settings(c, version)
+        results = {
+            r.code: r for r in await check_invariants(c, owner.run_id, settings=settings, outcome_conflicts=0)
+        }
+        assert [r.code for r in results.values()] == ["I1", "I2", "I3", "I4", "I5", "I6", "I7"]
+        assert results["I1"].ok and results["I1"].detail == {"responses": 2, "mismatched": 0, "pending": 0}
+        assert results["I2"].ok and results["I4"].ok and results["I5"].detail == {"llm_tuple_id": None}
+        # the run's one revision awaits its embedding: I6 counts it, and it is the run's one partial cause
+        assert results["I6"] == InvariantResult("I6", False, {"awaiting": 1})
+        assert await partial_conditions(c, owner.run_id) == ["awaiting_embedding"]
+        failed = await check_invariants(c, owner.run_id, settings=settings, outcome_conflicts=2)
+        assert failed[-1] == InvariantResult("I7", False, {"conflicts": 2})

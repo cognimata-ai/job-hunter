@@ -37,14 +37,23 @@ functions that end a run inside a caller's transaction report a `RunEnd`, and th
 `observe_run_ends` after its commit (`execute_run`, the reconcilers, and the takeover sweep through
 `epoch.Swept`). The tick counts the `missed` and `skipped_overlap` runs it inserts (`tick.observe_tick`).
 
+**The run end** (Task 23, plan Deviation 16) is owned by the graph: its `finalize` node ends the run in one
+owner-fenced transaction and observes the metrics after that commit. `run_owned` discards the graph's value,
+so `execute_run` learns of that end from the database (`run_completion`, the terminal row of the attempt);
+only a graph that returns without ending the run (the M0 no-op graph) is finalized here, `succeeded` with the
+report `{"noop": true}`.
+
 This module is a task boundary (ruff `BLE001` is allowed here). It needs no broad catch: `run_owned` reports
 an unexpected graph error as an outcome, which `execute_run` persists as `failed('bug')` plus the `run.failed`
-alert. LangGraph is imported for annotations only, so a process that only requests runs (the API) skips it.
+alert; an `OutcomeConflict` (the outcome reducer's, raised outside any node, §17.2 I7) as
+`failed_invariant('I7')` plus `run.failed_invariant`. LangGraph is imported for annotations only, so a process
+that only requests runs (the API) skips it.
 """
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 import sqlalchemy as sa
@@ -55,6 +64,7 @@ from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.state import initial_state
+from jobhunter.graphs.outcomes import OutcomeConflict
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.health import read_run_freshness, run_age_state
 from jobhunter.observability.logging import get_logger
@@ -91,6 +101,7 @@ REDEFERRED: Final = "redeferred"
 RESUME_EXHAUSTED_ALERT: Final = "run.resume_exhausted"
 ORPHANED_QUEUE_ALERT: Final = "run.orphaned_queue"
 FAILED_ALERT: Final = "run.failed"
+FAILED_INVARIANT_ALERT: Final = "run.failed_invariant"
 STALE_DATA_ALERT: Final = "schedule.stale_data"
 STALE_DATA_SUBJECT: Final = "collect"
 
@@ -100,6 +111,7 @@ _REQUEST_TRIES: Final = 3
 
 Admission = Literal["started", "resumed", "duplicate", "superseded", "foreign_epoch", "finished"]
 FinalStatus = Literal["succeeded", "partial", "failed_invariant", "failed"]
+FINAL_STATUSES: Final[tuple[FinalStatus, ...]] = ("succeeded", "partial", "failed_invariant", "failed")
 EndReason = Literal["worker_takeover", "heartbeat_stale"]
 
 # The graph a run executes; any compiled state graph (the worker's is the collection graph).
@@ -144,6 +156,15 @@ class RunEnd:
     duration_s: float | None
 
 
+@dataclass(frozen=True)
+class RunCompletion:
+    """How an attempt ended its run (the durable completion lookup of `execute_run`, `run_completion`)."""
+
+    status: FinalStatus
+    reason: str | None
+    finished_at: datetime
+
+
 def observe_run_ends(ends: Iterable[RunEnd]) -> None:
     """Count each ended run in `RUNS` and time it in `RUN_DURATION`; call only after the ending commit."""
     for end in ends:
@@ -174,6 +195,10 @@ _ANNOTATE = q(
     "UPDATE runs SET status_reason = :r WHERE id = :i AND status = 'queued' AND attempt_no = :a RETURNING id"
 )
 _DURATION = q("SELECT extract(epoch FROM finished_at - started_at) FROM runs WHERE id = :i")
+_COMPLETION = q(
+    "SELECT status, status_reason, finished_at FROM runs WHERE id = :i AND attempt_no = :a "
+    "AND status = ANY(:final)"
+)
 _ACTIVE_CONFIG = q("SELECT settings_version_id, scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
 _ACTIVE_RUN = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
@@ -314,6 +339,16 @@ async def _duration(conn: AsyncConnection, run_id: int) -> float | None:
     """The run's duration in seconds, from its first `started_at` to its `finished_at` (`None` if unset)."""
     seconds = (await conn.execute(_DURATION, {"i": run_id})).scalar_one()
     return None if seconds is None else float(seconds)
+
+
+async def run_completion(conn: AsyncConnection, run_id: int, attempt_no: int) -> RunCompletion | None:
+    """The end attempt `attempt_no` gave its run: the run's terminal row at that attempt, `None` while it is
+    `running` (or when another attempt, or no finalize, ended it)."""
+    params = {"i": run_id, "a": attempt_no, "final": list(FINAL_STATUSES)}
+    row = (await conn.execute(_COMPLETION, params)).first()
+    if row is None:
+        return None
+    return RunCompletion(status=row.status, reason=row.status_reason, finished_at=row.finished_at)
 
 
 async def begin_new_attempt(
@@ -575,15 +610,25 @@ async def _invoke(graph: RunGraph, owner: RunOwner) -> None:
     await graph.ainvoke(initial_state(owner.run_id, owner.attempt_no), config, durability=durability)
 
 
+# The critical alert an end raises in `_finalize`, by status, with its message.
+_END_ALERTS: Final[Mapping[str, tuple[str, str]]] = MappingProxyType(
+    {
+        "failed": (FAILED_ALERT, "run failed"),
+        "failed_invariant": (FAILED_INVARIANT_ALERT, "run invariant violated"),
+    }
+)
+
+
 async def _finalize(
     engine: AsyncEngine,
     owner: RunOwner,
     *,
-    status: Literal["succeeded", "failed"],
+    status: FinalStatus,
     reason: str | None,
     report: Mapping[str, JSONValue],
 ) -> None:
-    """Finalize `owner`'s run in a transaction of its own; a `failed` end raises `run.failed` in it.
+    """Finalize `owner`'s run in a transaction of its own; a `failed` end raises `run.failed` in it, a
+    `failed_invariant` one `run.failed_invariant` (both critical, subject `run:<id>`).
 
     `FencedOut` is caught outside the transaction, which wrote nothing; the run's new owner records the
     outcome. The run metrics are observed only once the transaction has committed (ruling T12-e).
@@ -591,19 +636,26 @@ async def _finalize(
     try:
         async with engine.begin() as conn:
             duration = await finalize_run(conn, owner, status=status, reason=reason, report=report)
-            if status == "failed":
+            if (alert := _END_ALERTS.get(status)) is not None:
+                code, message = alert
                 await raise_alert(
                     conn,
-                    code=FAILED_ALERT,
+                    code=code,
                     severity="critical",
                     subject=f"run:{owner.run_id}",
-                    message="run failed",
+                    message=message,
                 )
     except FencedOut:
         log.info("run_fenced", run_id=owner.run_id, attempt_no=owner.attempt_no, write="finalize")
         return
     observe_run_ends([RunEnd(status=status, duration_s=duration)])
     log.info("run_finished", run_id=owner.run_id, attempt_no=owner.attempt_no, status=status, reason=reason)
+
+
+# The report of a run the outcome reducer failed (§17.2 I7): its invariant result, no other section.
+_OUTCOME_CONFLICT_REPORT: Final[Mapping[str, JSONValue]] = MappingProxyType(
+    {"execution": {"invariants": {"I7": {"ok": False, "detail": {"error_class": "OutcomeConflict"}}}}}
+)
 
 
 async def execute_run(
@@ -624,12 +676,16 @@ async def execute_run(
     3. The graph runs through `run_owned(("run", id), attempt_no, …)`: the registry's task for the run, next
        to the heartbeat task `heartbeat:run:<id>` (`heartbeat_run` every `heartbeat_period_s`) whose loss
        cancels it. By outcome: `lost` (a refused or failed heartbeat, the `stale_runs` reconciler's or the
-       shutdown's cancel, or `FencedOut`) returns with no owner write; `raised` finalizes `failed('bug')` with
-       the critical `run.failed` alert in a new transaction; `returned` finalizes `succeeded` with the report
-       `{"noop": true}`. A local execution that is still live when the work starts (`AlreadyExecuting`, for
-       example an older one that ignored its cancel past the timeout) means nothing ran: `duplicate` is
-       returned and no further owner write is made; the admitted attempt is left without an executor, and
-       `stale_runs` gives the run a new attempt once its heartbeat is stale.
+       shutdown's cancel, or `FencedOut`) returns with no owner write; `raised` finalizes, in a new
+       transaction, an `OutcomeConflict` as `failed_invariant('I7')` with the critical `run.failed_invariant`
+       alert (the reducer conflicts outside any node, so the graph's `finalize` cannot see it) and any other
+       error as `failed('bug')` with the critical `run.failed` alert; `returned` looks the attempt's end up
+       (`run_completion`): a graph that ended the run itself (its `finalize` node, which observed the metrics
+       and logged `run_finished`) leaves nothing to write, and one that did not (the M0 no-op graph) is
+       finalized `succeeded` with the report `{"noop": true}`. A local execution that is still live when the
+       work starts (`AlreadyExecuting`, for example an older one that ignored its cancel past the timeout)
+       means nothing ran: `duplicate` is returned and no further owner write is made; the admitted attempt is
+       left without an executor, and `stale_runs` gives the run a new attempt once its heartbeat is stale.
 
     The caller's own cancellation propagates (the graph is cancelled and awaited first) and nothing is
     written: the run's next owner (the stale-run reconciler or the takeover sweep) records the outcome.
@@ -665,6 +721,13 @@ async def execute_run(
     match outcome.status:
         case "lost":
             pass
+        case "raised" if isinstance(outcome.error, OutcomeConflict):
+            log.error(
+                "run_outcome_conflict", run_id=run_id, attempt_no=attempt_no, work_id=outcome.error.work_id
+            )
+            await _finalize(
+                engine, admitted, status="failed_invariant", reason="I7", report=_OUTCOME_CONFLICT_REPORT
+            )
         case "raised":
             # The class only: an exception message may carry content.
             log.error(
@@ -675,5 +738,8 @@ async def execute_run(
             )
             await _finalize(engine, admitted, status="failed", reason="bug", report={})
         case "returned":
-            await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
+            async with engine.connect() as conn:
+                completion = await run_completion(conn, run_id, attempt_no)
+            if completion is None:  # a graph without a finalize of its own (M0's no-op graph)
+                await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
     return admission

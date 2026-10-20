@@ -53,6 +53,14 @@ NOWAIT`): `False` while another transaction holds it.
 Task 22: `make_deps` and `ctx` take an `embedder` client (none by default); the fixture `revisions_awaiting`
 inserts jobs whose one revision is `awaiting_embedding`, with texts of their own, duplicated or long on
 request (`insert_revisions_awaiting`).
+
+Task 23: the fixture `collect_deps` is `make_deps(engine, adapters)` with an `EmbedderClient` on the fake
+embedder; `manual_run_id` inserts a queued manual run (not admitted: `execute_run` starts it);
+`run_to_the_end` seeds the inputs of a run (by default a watchlist company, the Greenhouse board
+`getyourguide`, and Arbeitnow), inserts the run and executes attempt 1 through `execute_run` on the real
+collection graph (or `graph`, built over `saver`, an `InMemorySaver` unless given), and returns the run id;
+`conflicting_graph` is the real graph whose `fetch_cell` adds an outcome of its own for one shared work id
+(`CONFLICT_WORK_ID`) to every update, so two Sends of one step give the reducer two differing outcomes.
 """
 
 import asyncio
@@ -60,11 +68,12 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final, Protocol, cast
+from unittest import mock
 
 import httpx
 import procrastinate
@@ -74,8 +83,12 @@ from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error, q
 from jobhunter.db.transitions import transition
 from jobhunter.dedup.identity import resolve_item
-from jobhunter.embeddings import EmbedderClient
+from jobhunter.embeddings import EmbedderClient, make_http_client
+from jobhunter.graphs.collect import graph as collect_graph
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
+from jobhunter.graphs.collect.graph import CollectGraph, build_collect_graph
+from jobhunter.graphs.collect.nodes.fetch import make_fetch_cell
+from jobhunter.graphs.collect.state import CollectUpdate, FetchCellInput, FetchOutcome
 from jobhunter.normalize.companies import company_key
 from jobhunter.normalize.fields import ATS_SOURCES
 from jobhunter.normalize.keys import AdKey, keys_from_link
@@ -103,9 +116,12 @@ from jobhunter.worker import runs
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.runs import RunOwner
 from jobhunter.worker.tasks import defer_in_tx, make_queue_app
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.embedder import FakeEmbedder
 from tests.support.observations import normalized
 from tests.support.pg import PgServer, config_for
 from tests.support.quota import seeded_run_settings
@@ -1131,3 +1147,77 @@ async def insert_revisions_awaiting(
 def revisions_awaiting() -> RevisionsAwaiting:
     """`await revisions_awaiting(engine, n, duplicate_texts=0, long_texts=0)`: `insert_revisions_awaiting`."""
     return insert_revisions_awaiting
+
+
+# ---- Task 23 ----------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def collect_deps(
+    engine: AsyncEngine, adapters: Callable[[InstanceRow], SourceAdapter], fake_embedder: FakeEmbedder
+) -> AsyncIterator[CollectDeps]:
+    """`make_deps(engine, adapters)` with an `EmbedderClient` on the fake embedder (its HTTP client is closed
+    after the test)."""
+    async with make_http_client() as http:
+        yield make_deps(engine, adapters, embedder=EmbedderClient(fake_embedder.base_url, http))
+
+
+async def manual_run_id(engine: AsyncEngine, *, include_paid: bool = False) -> int:
+    """A queued manual run over the active configuration, not admitted (`execute_run` starts it)."""
+    async with engine.begin() as conn:
+        return int((await conn.execute(_QUEUED_RUN, {"include_paid": include_paid})).scalar_one())
+
+
+GraphFactory = Callable[[BaseCheckpointSaver[str], CollectDeps], CollectGraph]
+DEFAULT_BOARD: Final = ("greenhouse", "getyourguide")  # its fixture route answers `greenhouse_getyourguide`
+
+
+async def run_to_the_end(
+    engine: AsyncEngine,
+    deps: CollectDeps,
+    *,
+    include_paid: bool = False,
+    queries: Sequence[str] = (),
+    companies: Sequence[tuple[str, str]] = (DEFAULT_BOARD,),
+    enabled: Sequence[str] = ("arbeitnow", "ats"),
+    graph: GraphFactory = build_collect_graph,
+    saver: BaseCheckpointSaver[str] | None = None,
+) -> int:
+    """The id of a manual run over the inputs given (`seed_inputs`: by default the board `DEFAULT_BOARD` and
+    Arbeitnow), which `execute_run` admitted as attempt 1 of epoch 1 (it needs `current_epoch`) and ran to its
+    end on `graph(saver, deps)`; raises unless the admission was `started`."""
+    await seed_inputs(engine, queries=queries, companies=companies, enabled=enabled)
+    run_id = await manual_run_id(engine, include_paid=include_paid)
+    compiled = graph(InMemorySaver() if saver is None else saver, deps)
+    admission = await runs.execute_run(engine, compiled, run_id, 1, epoch=1)
+    if admission != "started":
+        raise RuntimeError(f"run_to_the_end: run {run_id} was not started ({admission})")
+    return run_id
+
+
+CONFLICT_WORK_ID: Final = "fr:0"  # no fetch request has id 0
+
+
+def conflicting_graph(saver: BaseCheckpointSaver[str], deps: CollectDeps) -> CollectGraph:
+    """The real collection graph whose `fetch_cell` adds the outcome `CONFLICT_WORK_ID` (its `items` the
+    Send's own fetch request id) to every update: two Sends of one step conflict in the reducer."""
+
+    def make(cell_deps: CollectDeps) -> Callable[[FetchCellInput], Awaitable[CollectUpdate]]:
+        cell = make_fetch_cell(cell_deps)
+
+        async def fetch_cell(state: FetchCellInput) -> CollectUpdate:
+            update = await cell(state)
+            conflict: FetchOutcome = {
+                "work_id": CONFLICT_WORK_ID,
+                "status": "succeeded",
+                "items": state["fetch_request_id"],
+                "new_postings": 0,
+            }
+            update["outcomes"] = {**update.get("outcomes", {}), CONFLICT_WORK_ID: conflict}
+            return update
+
+        return fetch_cell
+
+    # the name `build_collect_graph` calls, replaced while it builds the graph
+    with mock.patch(f"{collect_graph.__name__}.make_fetch_cell", make):
+        return build_collect_graph(saver, deps)

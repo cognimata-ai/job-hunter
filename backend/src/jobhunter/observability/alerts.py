@@ -4,7 +4,7 @@ An alert is identified by `code` and `subject` (`dedup_key = "<code>:<subject>"`
 it again only counts the occurrence; once it is resolved, the next raise opens a new row. The unique partial
 index `alerts_open_dedup` makes that atomic, so concurrent raisers never create two open rows.
 
-All three functions run on the caller's connection and leave the transaction to the caller: an alert is
+All four functions run on the caller's connection and leave the transaction to the caller: an alert is
 written in the transaction that decides to raise it, and persists only if that transaction commits.
 """
 
@@ -31,6 +31,9 @@ _RAISE = q(
 )
 _RESOLVE = q(
     "UPDATE alerts SET resolved_at = now() WHERE dedup_key = :dedup_key AND resolved_at IS NULL RETURNING id"
+)
+_RESOLVE_CODE = q(
+    "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL RETURNING id"
 )
 _OPEN_BY_SEVERITY = q(
     "SELECT severity, count(*) AS n FROM alerts WHERE resolved_at IS NULL GROUP BY severity"
@@ -72,6 +75,12 @@ async def resolve_alert(conn: AsyncConnection, *, code: str, subject: str) -> bo
     """Resolve the open alert `code`/`subject`; `False` when there was none."""
     result = await conn.execute(_RESOLVE, {"dedup_key": _dedup_key(code, subject)})
     return result.first() is not None
+
+
+async def resolve_alerts(conn: AsyncConnection, *, code: str) -> int:
+    """Resolve every open alert `code`, whatever its subject (`run.failed` is raised per run and resolved by
+    the next succeeded one); the number resolved."""
+    return len((await conn.execute(_RESOLVE_CODE, {"code": code})).all())
 
 
 async def refresh_alert_gauge(conn: AsyncConnection) -> dict[Severity, int]:

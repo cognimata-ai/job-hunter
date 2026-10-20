@@ -12,9 +12,11 @@ resolve_identity → embed → hard_filters → enqueue_targets → finalize →
 Every node has its §9.2 timeout; the nodes that make no source or embedder call retry a serialization
 failure, a deadlock or a lost connection (`DB_RETRY`, `is_retryable_db_error`), and nothing else.
 `parse_normalize` is `nodes.parse_normalize` (Task 15), `resolve_identity` is `nodes.resolve_identity` (Task
-18), `embed` is `nodes.embed` (Task 22) and `hard_filters` is `nodes.hard_filters` (Task 16);
-`enqueue_targets` and `finalize` are pass-through functions here until their tasks wire them (`finalize`
-keeps the fault point `collect.before_finalize`).
+18), `embed` is `nodes.embed` (Task 22), `hard_filters` is `nodes.hard_filters` (Task 16), `enqueue_targets`
+is `nodes.enqueue_targets` and `finalize` is `nodes.finalize` (Task 23): the graph ends the run itself, in
+`finalize`'s one owner-fenced transaction (after the fault point `collect.before_finalize`), and
+`execute_run` finds that end in the database (plan Deviation 16). Every node is timed (`timed`, on a
+monotonic clock): its seconds go to `node_durations`, which the run report shows.
 
 **Error handling (§9.1).** Every node runs inside `error_handled`, which turns a typed error that reached it
 into a persisted outcome (the checkpointed update) and lets everything else propagate. A `SourceError` gives
@@ -27,11 +29,13 @@ than using LangGraph's `error_handler=`: LangGraph 1.2.15 runs such a handler, b
 re-raises the handled error at the end of the run when the failing node ran next to others in its step (the
 `fetch_cell` fan-out).
 
-The no-op graph is `start` → `finalize`. It does no work; it proves the run lifecycle around it (admission,
-heartbeat, fenced finalize) and gives the crash tests the fault point `collect.before_finalize`.
+The no-op graph is `start` → `finalize` (the module's own `finalize`, which only passes the fault point
+`collect.before_finalize` and leaves the run's end to `execute_run`). It does no work; it proves the run
+lifecycle around it (admission, heartbeat, fenced finalize) for the M0 tests.
 """
 
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from types import MappingProxyType
 from typing import Final, Protocol
@@ -49,6 +53,7 @@ from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
 from jobhunter.graphs.collect.nodes.embed import NODE_TIMEOUT as EMBED_TIMEOUT
 from jobhunter.graphs.collect.nodes.embed import make_embed
+from jobhunter.graphs.collect.nodes.enqueue_targets import make_enqueue_targets
 from jobhunter.graphs.collect.nodes.fetch import (
     make_fetch_cell,
     make_fetch_fallback,
@@ -57,6 +62,7 @@ from jobhunter.graphs.collect.nodes.fetch import (
     route_after_fallback,
     route_after_primary,
 )
+from jobhunter.graphs.collect.nodes.finalize import make_finalize
 from jobhunter.graphs.collect.nodes.hard_filters import make_hard_filters
 from jobhunter.graphs.collect.nodes.parse_normalize import make_parse_normalize
 from jobhunter.graphs.collect.nodes.plan import make_plan
@@ -134,26 +140,37 @@ def error_handled[S: Mapping[str, object]](name: str, node: _Node[S]) -> _Node[S
     return handled
 
 
+def timed[S: Mapping[str, object]](
+    name: str, node: _Node[S], *, clock: Callable[[], float] = time.monotonic
+) -> _Node[S]:
+    """`node` whose update also carries `node_durations: {name: seconds}`, the time it took on `clock`; the
+    reducer adds up a node's runs (the `fetch_cell` Sends). A run that raises reports nothing: its error
+    propagates, and a retry is timed on its own."""
+
+    async def measured(state: S) -> CollectUpdate:
+        started = clock()
+        update = await node(state)
+        timed_update: CollectUpdate = {**update, "node_durations": {name: clock() - started}}
+        return timed_update
+
+    return measured
+
+
 async def start(state: CollectState) -> CollectUpdate:
     return {"steps": ["start"]}
 
 
 async def finalize(state: CollectState) -> CollectUpdate:
+    """The no-op graph's `finalize`: the fault point only; `execute_run` ends the run."""
     await afault_point("collect.before_finalize")
     return {"steps": ["finalize"]}
 
 
-def _pass_through(name: str) -> Node:
-    """The node `name` until its task wires it: it records that it ran and changes nothing else."""
-
-    async def node(state: CollectState) -> CollectUpdate:
-        return {"steps": [name]}
-
-    return node
-
-
-def build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDeps) -> CollectGraph:
-    """The §9.2 collection graph over `deps`, compiled with `checkpointer` (see the module docstring)."""
+def build_collect_graph(
+    checkpointer: BaseCheckpointSaver[str], deps: CollectDeps, *, timer: Callable[[], float] = time.monotonic
+) -> CollectGraph:
+    """The §9.2 collection graph over `deps`, compiled with `checkpointer`; `timer` times its nodes (see the
+    module docstring)."""
     graph = StateGraph(CollectState)
     nodes: dict[str, Node] = {
         "plan": make_plan(deps),
@@ -164,19 +181,19 @@ def build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDep
         "resolve_identity": make_resolve_identity(deps),
         "embed": make_embed(deps),
         "hard_filters": make_hard_filters(deps),
-        "enqueue_targets": _pass_through("enqueue_targets"),
-        "finalize": finalize,
+        "enqueue_targets": make_enqueue_targets(deps),
+        "finalize": make_finalize(deps),
     }
     for name, node in nodes.items():
         graph.add_node(
             name,
-            error_handled(name, node),
+            timed(name, error_handled(name, node), clock=timer),
             timeout=TimeoutPolicy(run_timeout=TIMEOUTS[name]),
             retry_policy=None if name in IO_NODES else DB_RETRY,
         )
     graph.add_node(
         "fetch_cell",
-        error_handled("fetch_cell", make_fetch_cell(deps)),
+        timed("fetch_cell", error_handled("fetch_cell", make_fetch_cell(deps)), clock=timer),
         input_schema=FetchCellInput,
         timeout=TimeoutPolicy(run_timeout=TIMEOUTS["fetch_cell"]),
     )

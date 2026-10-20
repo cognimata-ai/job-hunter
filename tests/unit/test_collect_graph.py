@@ -2,7 +2,7 @@ import asyncio
 import dataclasses
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -10,7 +10,18 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.embeddings import EmbedderError
 from jobhunter.errors import FencedOut
-from jobhunter.graphs.collect.graph import IO_NODES, TIMEOUTS, error_handled, is_retryable_db_error
+from jobhunter.graphs.collect.deps import CollectDeps
+from jobhunter.graphs.collect.graph import (
+    EMBEDDER_ERRORS,
+    IO_NODES,
+    SOURCE_ERRORS,
+    TIMEOUTS,
+    error_handled,
+    is_retryable_db_error,
+    timed,
+)
+from jobhunter.graphs.collect.nodes.enqueue_targets import make_enqueue_targets
+from jobhunter.graphs.collect.nodes.finalize import WARNING_COUNTERS
 from jobhunter.graphs.collect.nodes.plan_fallback import ACCOUNT_READ_TIMEOUT_S, route, serpapi_account
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate, FetchCellInput, initial_state
 from jobhunter.quota.windows import AccountObservation
@@ -148,3 +159,39 @@ async def test_no_account_is_read_when_serpapi_is_off() -> None:
     assert await serpapi_account(no_adapter, seeded_run_settings(), [disabled]) is None
     assert await serpapi_account(no_adapter, switched_off, [SERPAPI]) is None
     assert await serpapi_account(no_adapter, seeded_run_settings(), []) is None
+
+
+# ---- Task 23 ----------------------------------------------------------------------------------------------
+
+
+async def test_a_timed_node_reports_its_seconds_and_keeps_its_update() -> None:
+    ticks = iter([10.0, 12.5])
+
+    async def node(state: CollectState) -> CollectUpdate:
+        return {"steps": ["plan"], "counters": {"x": 1}}
+
+    measured = timed("plan", node, clock=lambda: next(ticks))
+    assert await measured(initial_state(1, 1)) == {
+        "steps": ["plan"],
+        "counters": {"x": 1},
+        "node_durations": {"plan": 2.5},
+    }
+
+
+async def test_a_timed_node_lets_its_error_propagate() -> None:
+    async def node(state: CollectState) -> CollectUpdate:
+        raise FencedOut("run")
+
+    with pytest.raises(FencedOut):
+        await timed("finalize", node)(initial_state(1, 1))
+
+
+async def test_enqueue_targets_records_its_step_and_refuses_a_tuple_until_m3() -> None:
+    node = make_enqueue_targets(cast(CollectDeps, None))
+    assert await node(initial_state(1, 1)) == {"steps": ["enqueue_targets"]}
+    with pytest.raises(NotImplementedError, match="M3"):
+        await node({**initial_state(1, 1), "llm_tuple_id": 4})
+
+
+def test_the_report_warns_of_the_error_handlers_counters() -> None:
+    assert WARNING_COUNTERS == (SOURCE_ERRORS, EMBEDDER_ERRORS)
