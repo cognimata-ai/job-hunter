@@ -111,8 +111,27 @@ async def test_two_runs_on_fixtures_through_the_real_graph(
     assert all(v["ok"] for v in report["execution"]["invariants"].values())
     assert report["quota"]["jsearch"]["used"] == 2
 
-    await run(engine, collect_deps, include_paid=False)
+    second = await run(engine, collect_deps, include_paid=False)
     async with engine.connect() as c:
+        second_status = (
+            await c.execute(sa.text("SELECT status, status_reason FROM runs WHERE id=:i"), {"i": second})
+        ).one()
+        billed = dict(
+            (
+                await c.execute(
+                    sa.text("SELECT provider, count(*) FROM quota_ledger WHERE state = 'billed' GROUP BY 1")
+                )
+            ).all()
+        )
+        paid_entries = (
+            await c.execute(
+                sa.text(
+                    "SELECT count(*) FROM quota_ledger WHERE run_id = :i "
+                    "AND provider IN ('jsearch', 'serpapi')"
+                ),
+                {"i": second},
+            )
+        ).scalar_one()
         again = (await c.execute(sa.text("SELECT count(*) FROM jobs"))).scalar_one()
         seen = (
             await c.execute(
@@ -127,3 +146,9 @@ async def test_two_runs_on_fixtures_through_the_real_graph(
         ).all()
     # the JSearch page-1-with-cursor rule of §5.6 (Carry-forward 5): the JSearch cell keeps an open gap
     assert again == jobs and seen == 2 and ("gap", "open", "page_cap") in {tuple(g) for g in gaps}
+    # Task 25 review, Minor 5: the free run succeeds and sends no paid request: the paid billed entries stay
+    # the first run's 2 (JSearch), and the run has no JSearch or SerpApi ledger entry at all. Adzuna, a quota
+    # source (`quota_search`, §7.5) and not a paid one, is read by a free run as well: its two pages are
+    # billed again.
+    assert tuple(second_status) == ("succeeded", None) and paid_entries == 0
+    assert billed == {"jsearch": 2, "adzuna": 4}

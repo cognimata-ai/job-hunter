@@ -23,7 +23,10 @@ creates nor recreates a container. Seven checks run in order and each prints exa
 4. `seed_inputs`: with `psql` (plan Deviation 3), the query `software engineer` (`en`, `user`) and the
    watchlist company `getyourguide` (Greenhouse) with its board instance, both enabled by entries appended to
    the active settings version's `queries[]` and `watchlist[]`;
-5. `run_now_paid`: `POST /api/runs` with `{"include_paid": true}` answers 202 with a new run;
+5. `run_now_paid`: first the running worker must be in fake mode (`JOBHUNTER_FAKE_SOURCES` is `1`, read with
+   `docker compose exec worker printenv` and compared here: only the boolean is printed, never the value),
+   so a stack without the fixtures overlay fails here, before any run is posted; then `POST /api/runs` with
+   `{"include_paid": true}` answers 202 with a new run;
 6. `collect_succeeded`: that run is the health's `last_run` and `succeeded` (the fixtures reject no item,
    tests/contract/README.md); then jobs exist, no raw item is `pending`, embeddings exist, the ledger holds
    4 `billed` entries (two JSearch pages, two Adzuna pages) and every invariant of the run report is `ok`;
@@ -79,6 +82,7 @@ FRESH_HINT: Final = (
 QUERY_TEXT: Final = "software engineer"
 BOARD_SLUG: Final = "getyourguide"  # Greenhouse; its fixture route answers `greenhouse_getyourguide`
 PAID_RUN_KEY: Final = "smoke-m1-run-paid-0001"
+FAKE_SOURCES_VAR: Final = "JOBHUNTER_FAKE_SOURCES"  # deploy/compose.fixtures.yaml sets it to 1 on the worker
 FREE_RUN_KEY: Final = "smoke-m1-run-free-0001"
 # The first run embeds every revision it creates (about 140 here) on the dev embedder, the fp32 export at
 # about 0.55 docs/s on the V7 CPU (ruling T21-a): some 4 to 5 minutes. The second run creates no revision.
@@ -217,9 +221,29 @@ def wait_succeeded(ctx: Context, run_id: int, *, within_s: int) -> float:
     return time.monotonic() - started
 
 
+def worker_fake_mode() -> bool:
+    """Whether the running worker container has `JOBHUNTER_FAKE_SOURCES=1` (the fixtures overlay). The value
+    is compared here and never printed; an unset variable is `False` (printenv's exit 1)."""
+    process = subprocess.run(
+        [*DC, "exec", "-T", "worker", "printenv", FAKE_SOURCES_VAR],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=DOCKER_TIMEOUT_S,
+    )
+    if process.returncode not in (0, 1):  # docker or the container failed: its stderr, never stdout
+        raise CheckFailed(f"docker compose exec worker: exit {process.returncode}: {stderr_tail(process)}")
+    return process.returncode == 0 and process.stdout.strip() == "1"
+
+
 def check_run_now_paid(ctx: Context) -> str | None:
+    # Task 25 review, Minor 1: a paid run on a stack without the fixtures overlay would reach the providers.
+    fake = worker_fake_mode()
+    if not fake:
+        raise CheckFailed(f"the worker is not on the fixtures (fake_sources={fake}): no run was posted")
     STATE.paid_run_id = run_now(ctx, include_paid=True, key=PAID_RUN_KEY)
-    return None
+    return f"fake_sources={fake}"
 
 
 def check_collect_succeeded(ctx: Context) -> str | None:
