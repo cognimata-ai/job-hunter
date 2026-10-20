@@ -369,16 +369,21 @@ def restart_pg_server(server: PgServer) -> None:
     _wait_ready(server)
 
 
-def server_env(server: PgServer, role: Role, **env: str) -> dict[str, str]:
+def server_env(
+    server: PgServer, role: Role, *, embedder_url: str | None = None, **env: str
+) -> dict[str, str]:
     """The `JOBHUNTER_*` environment of `role` against `server`; `env` adds to it or overrides it.
 
     The worker is in fake mode: its sources are served from `FIXTURES_DIR` (it has no provider secret).
+    `embedder_url` is the embedder the role reaches (`JOBHUNTER_EMBEDDER_URL`): the session's fake embedder,
+    as `make_config` and `proc_env` pass it (Task 22); without it the configuration's default stays.
     """
     fake_sources = (
         {"JOBHUNTER_FAKE_SOURCES": "1", "JOBHUNTER_FIXTURES_DIR": str(FIXTURES_DIR)}
         if role == "worker"
         else {}
     )
+    embedder = {} if embedder_url is None else {"JOBHUNTER_EMBEDDER_URL": embedder_url}
     return {
         "JOBHUNTER_ENV": "test",
         "JOBHUNTER_DB_HOST": server.host,
@@ -387,23 +392,26 @@ def server_env(server: PgServer, role: Role, **env: str) -> dict[str, str]:
         "JOBHUNTER_PUBLIC_ORIGIN": "https://testserver",
         "JOBHUNTER_SECRETS_DIR": str(server.secrets_dir(role)),
         **fake_sources,
+        **embedder,
         **env,
     }
 
 
-def config_for(server: PgServer, role: Role, **env: str) -> AppConfig:
+def config_for(server: PgServer, role: Role, *, embedder_url: str | None = None, **env: str) -> AppConfig:
     """The `AppConfig` of `role` against `server`, loaded from the harness environment only."""
-    return load_config(role, server_env(server, role, **env))
+    return load_config(role, server_env(server, role, embedder_url=embedder_url, **env))
 
 
-def process_env(server: PgServer, role: Role, **extra: str) -> dict[str, str]:
+def process_env(
+    server: PgServer, role: Role, *, embedder_url: str | None = None, **extra: str
+) -> dict[str, str]:
     """The environment of a child process of `role` against `server`.
 
     It is the test process's environment without the variables the application reads (`JOBHUNTER_*`,
-    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`), plus `server_env` and `extra`.
+    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`), plus `server_env` (with `embedder_url`) and `extra`.
     """
     inherited = {name: value for name, value in os.environ.items() if not name.startswith(ENV_PREFIXES)}
-    return {**inherited, **server_env(server, role), **extra}
+    return {**inherited, **server_env(server, role, embedder_url=embedder_url), **extra}
 
 
 def pg_rows(

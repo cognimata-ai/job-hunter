@@ -1,14 +1,16 @@
 import asyncio
 import dataclasses
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
 import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.embeddings import EmbedderError
 from jobhunter.errors import FencedOut
-from jobhunter.graphs.collect.graph import error_handled, is_retryable_db_error
+from jobhunter.graphs.collect.graph import IO_NODES, TIMEOUTS, error_handled, is_retryable_db_error
 from jobhunter.graphs.collect.nodes.plan_fallback import ACCOUNT_READ_TIMEOUT_S, route, serpapi_account
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate, FetchCellInput, initial_state
 from jobhunter.quota.windows import AccountObservation
@@ -60,6 +62,20 @@ async def test_the_error_handler_persists_a_source_error_as_an_outcome() -> None
         "counters": {"source_errors": 1},
         "outcomes": {"fr:9": {"work_id": "fr:9", "status": "failed", "items": 0, "new_postings": 0}},
     }
+
+
+async def test_the_error_handler_persists_an_embedder_error_as_the_nodes_outcome() -> None:
+    async def failing(state: CollectState) -> CollectUpdate:
+        raise EmbedderError("bad_response", code="dimension")
+
+    assert await error_handled("embed", failing)(initial_state(1, 1)) == {
+        "steps": ["embed"],
+        "counters": {"embedder_errors": 1},
+    }
+
+
+def test_the_embed_node_has_its_section_9_2_timeout_and_no_retry() -> None:
+    assert TIMEOUTS["embed"] == timedelta(minutes=20) and "embed" in IO_NODES
 
 
 @pytest.mark.parametrize("error", [FencedOut("run"), RuntimeError("a bug"), KeyError("x")])

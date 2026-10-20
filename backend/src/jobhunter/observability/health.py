@@ -1,9 +1,14 @@
-"""Readiness (spec §17.5): the serving prerequisites of the api, checked on one connection.
+"""Readiness (spec §17.5): the serving prerequisites of the api; the database's are checked on one connection.
 
 `check_readiness` answers; it never raises (ruling T14-e). Its probes, in this order:
-- `db`: a connection and `SELECT 1` within `DB_TIMEOUT_S`. When that fails, nothing else is probed.
+- `db`: a connection and `SELECT 1` within `DB_TIMEOUT_S`. When that fails, nothing else of the database is
+  probed.
 - `migrations`: `alembic_version` holds exactly the code head.
 - `worker_heartbeat`: the heartbeat row exists and is at most `HEARTBEAT_STALE_S` old.
+- `embedder` (Task 22): the embedder's `/health` within `embeddings.HEALTH_TIMEOUT_S` is `ok`, with its
+  checksum verified (`EmbedderClient.health`: an embedder this code can use). It runs beside the database's
+  probes, so one slow component does not add to the other's time, and it is reported after them. A caller
+  without an embedder client (`embedder=None`) skips it.
 
 Each schema probe runs in a savepoint of its own and its database error is caught outside that block, after
 the savepoint rolled back, so a failed probe (e.g. `42P01` on a database without the schema) never aborts the
@@ -15,12 +20,14 @@ too (`PROBES_TIMEOUT_S`), for a database that stops answering while its socket s
 then `db`.
 
 Every failed probe logs `readiness_probe_failed` with `probe`, `sqlstate` and `error_class` (`None` when no
-error was raised; `reason` says what was wrong then). Never an exception message.
+error was raised; `reason` says what was wrong then: for the embedder `checksum_failed`, `unavailable` when it
+gave no usable answer, `unusable` for another model or dimension). Never an exception message.
 
 `system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
 their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), the current quota
-window of each provider, disk and database sizes and the versions. Run ages are reported, never readiness
-gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs`.
+window of each provider, disk and database sizes, the versions and the embedder's health (with its model id)
+as the readiness check read it. Run ages are reported, never readiness gates. `RunOut` is the api's view of a
+run row, shared with `POST /api/runs`.
 
 **One freshness rule** (ruling T17-g): `read_run_freshness` is the one query of the run figures and
 `run_age_state` the one rule over them. System health reports that state, and the worker's `stale_data`
@@ -46,6 +53,7 @@ from sqlalchemy.sql.elements import TextClause
 
 from jobhunter import __version__
 from jobhunter.db.sql import pg_error, q
+from jobhunter.embeddings import NO_HEALTH, EmbedderClient, EmbedderHealth
 from jobhunter.heartbeats import HEARTBEAT_STALE_S
 from jobhunter.observability.alerts import refresh_alert_gauge
 from jobhunter.observability.logging import get_logger
@@ -54,7 +62,7 @@ from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, WindowState, current_snapshot
 from jobhunter.worker.tasks import QUEUES
 
-ReadinessCode = Literal["db", "migrations", "worker_heartbeat"]
+ReadinessCode = Literal["db", "migrations", "worker_heartbeat", "embedder"]
 
 DB_TIMEOUT_S: Final = 2.0
 # The client-side bound of the schema probes together; each one also has the server-side statement timeout.
@@ -74,8 +82,11 @@ log = get_logger("jobhunter.observability.health")
 
 @dataclass(frozen=True)
 class ReadinessReport:
+    """The verdict; `embedder` is the embedder's health as its probe read it (`None`: not probed)."""
+
     ok: bool
     failing: list[ReadinessCode]
+    embedder: EmbedderHealth | None = None
 
 
 class _ConnectionLost(Exception):
@@ -154,19 +165,52 @@ async def _probe_all(engine: AsyncEngine, code_head: str) -> list[ReadinessCode]
             return ["db"]
 
 
-async def check_readiness(engine: AsyncEngine, *, code_head: str, now: datetime) -> ReadinessReport:
+async def _database_probes(engine: AsyncEngine, code_head: str) -> list[ReadinessCode]:
+    try:
+        return await _probe_all(engine, code_head)
+    except Exception as exc:  # noqa: BLE001 - readiness is an answer, never an error (T14-e); the 503 is the outcome
+        _log_failed("db", exc)
+        return ["db"]
+
+
+def _embedder_ready(health: EmbedderHealth) -> bool:
+    return health.ok and health.checksum_ok is True
+
+
+async def _probe_embedder(embedder: EmbedderClient) -> EmbedderHealth:
+    try:
+        health = await embedder.health()
+    except Exception as exc:  # noqa: BLE001 - `health()` never raises; readiness stays an answer (T14-e)
+        _log_failed("embedder", exc)
+        return NO_HEALTH
+    if not _embedder_ready(health):
+        if health.checksum_ok is False:
+            reason = "checksum_failed"
+        elif health.model_id is None:
+            reason = "unavailable"
+        else:
+            reason = "unusable"
+        _log_failed("embedder", reason=reason)
+    return health
+
+
+async def check_readiness(
+    engine: AsyncEngine, *, code_head: str, now: datetime, embedder: EmbedderClient | None
+) -> ReadinessReport:
     """Probe the serving prerequisites; `failing` lists the failed ones in the order `db`, `migrations`,
-    `worker_heartbeat`.
+    `worker_heartbeat`, `embedder` (that last probe only with an `embedder` client).
 
     `now` is the caller's clock (system health passes the one it uses for everything else). No probe reads it:
     the heartbeat age is measured on the database clock that wrote the heartbeat.
     """
-    try:
-        failing = await _probe_all(engine, code_head)
-    except Exception as exc:  # noqa: BLE001 - readiness is an answer, never an error (T14-e); the 503 is the outcome
-        _log_failed("db", exc)
-        failing = ["db"]
-    return ReadinessReport(ok=not failing, failing=failing)
+    async with asyncio.TaskGroup() as probes:
+        database = probes.create_task(_database_probes(engine, code_head))
+        embedder_probe = None if embedder is None else probes.create_task(_probe_embedder(embedder))
+    failing = database.result()
+    health = None if embedder_probe is None else embedder_probe.result()
+    if health is not None and not _embedder_ready(health):
+        failing.append("embedder")
+    return ReadinessReport(ok=not failing, failing=failing, embedder=health)
 
 
 RunAgeState = Literal["ok", "warn", "critical", "grace", "none"]
@@ -241,6 +285,15 @@ class DiskUsage(BaseModel):
     free_bytes: int
 
 
+class EmbedderOut(BaseModel):
+    """The embedder's health as readiness read it: `ok` when this code can use it, the model it serves and
+    whether its checksum was verified (`null`: no usable answer)."""
+
+    ok: bool
+    model_id: str | None
+    checksum_ok: bool | None
+
+
 class Versions(BaseModel):
     app: str
     python: str
@@ -302,6 +355,7 @@ class SystemHealthOut(BaseModel):
     - `queue_depths`: procrastinate jobs by queue and status.
     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
+    - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
     """
 
     ready: ReadyState
@@ -317,6 +371,7 @@ class SystemHealthOut(BaseModel):
     database_bytes: int
     table_bytes: dict[str, int]
     versions: Versions
+    embedder: EmbedderOut
 
 
 @dataclass(frozen=True)
@@ -400,13 +455,14 @@ async def system_health(
     """The detailed health at `now` (the caller's clock), read on `conn`, with the caller's `readiness`.
 
     The caller runs `check_readiness` before it opens `conn`, so it never holds two pool connections at once
-    (readiness probes on a connection of its own). Read-only, apart from the gauges it refreshes:
-    `ALERTS_OPEN` and `TABLE_BYTES`.
+    (readiness probes on a connection of its own), and the embedder is asked once, by that check. Read-only,
+    apart from the gauges it refreshes: `ALERTS_OPEN` and `TABLE_BYTES`.
     """
     last = (await conn.execute(_LAST_RUN)).first()
     freshness = await read_run_freshness(conn)
     alerts = await refresh_alert_gauge(conn)
     disk = shutil.disk_usage(DISK_PATH)
+    embedder = NO_HEALTH if readiness.embedder is None else readiness.embedder
     return SystemHealthOut(
         ready=ReadyState(ok=readiness.ok, failing=readiness.failing),
         last_run=None if last is None else RunOut.of(last),
@@ -421,4 +477,5 @@ async def system_health(
         database_bytes=int((await conn.execute(_DATABASE_BYTES)).scalar_one()),
         table_bytes=await refresh_table_bytes(conn),
         versions=_versions(),
+        embedder=EmbedderOut(ok=embedder.ok, model_id=embedder.model_id, checksum_ok=embedder.checksum_ok),
     )

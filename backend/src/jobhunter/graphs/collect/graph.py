@@ -12,17 +12,20 @@ resolve_identity → embed → hard_filters → enqueue_targets → finalize →
 Every node has its §9.2 timeout; the nodes that make no source or embedder call retry a serialization
 failure, a deadlock or a lost connection (`DB_RETRY`, `is_retryable_db_error`), and nothing else.
 `parse_normalize` is `nodes.parse_normalize` (Task 15), `resolve_identity` is `nodes.resolve_identity` (Task
-18) and `hard_filters` is `nodes.hard_filters` (Task 16); `embed`, `enqueue_targets` and `finalize` are
-pass-through functions here until their tasks wire them (`finalize` keeps the fault point
-`collect.before_finalize`).
+18), `embed` is `nodes.embed` (Task 22) and `hard_filters` is `nodes.hard_filters` (Task 16);
+`enqueue_targets` and `finalize` are pass-through functions here until their tasks wire them (`finalize`
+keeps the fault point `collect.before_finalize`).
 
-**Error handling (§9.1).** Every node runs inside `error_handled`, which turns a typed `SourceError` that
-reached it into a persisted outcome (the checkpointed update: a `failed` `FetchOutcome` for the fetch request
-the node was sent, and the `source_errors` counter) and lets everything else propagate: a `Bug` (anything
-unclassified) fails the run, `FencedOut` ends the attempt quietly, and `OutcomeConflict`, raised by the
-reducer outside any node, reaches `execute_run`. It wraps the node rather than using LangGraph's
-`error_handler=`: LangGraph 1.2.15 runs such a handler, but its async executor still re-raises the handled
-error at the end of the run when the failing node ran next to others in its step (the `fetch_cell` fan-out).
+**Error handling (§9.1).** Every node runs inside `error_handled`, which turns a typed error that reached it
+into a persisted outcome (the checkpointed update) and lets everything else propagate. A `SourceError` gives
+a `failed` `FetchOutcome` for the fetch request the node was sent and the `source_errors` counter; an
+`EmbedderError` (`bad_response` or `checksum`: the `embed` node handles `unavailable` itself and raised the
+alert for either) the `embedder_errors` counter, its revisions left `awaiting_embedding`, so the run is
+`partial` (§17.1). A `Bug` (anything unclassified) fails the run, `FencedOut` ends the attempt quietly, and
+`OutcomeConflict`, raised by the reducer outside any node, reaches `execute_run`. It wraps the node rather
+than using LangGraph's `error_handler=`: LangGraph 1.2.15 runs such a handler, but its async executor still
+re-raises the handled error at the end of the run when the failing node ran next to others in its step (the
+`fetch_cell` fan-out).
 
 The no-op graph is `start` → `finalize`. It does no work; it proves the run lifecycle around it (admission,
 heartbeat, fenced finalize) and gives the crash tests the fault point `collect.before_finalize`.
@@ -40,9 +43,12 @@ from langgraph.types import RetryPolicy, TimeoutPolicy
 from sqlalchemy.exc import DBAPIError
 
 from jobhunter.db.sql import is_serialization_failure
+from jobhunter.embeddings import EmbedderError
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
+from jobhunter.graphs.collect.nodes.embed import NODE_TIMEOUT as EMBED_TIMEOUT
+from jobhunter.graphs.collect.nodes.embed import make_embed
 from jobhunter.graphs.collect.nodes.fetch import (
     make_fetch_cell,
     make_fetch_fallback,
@@ -65,6 +71,7 @@ from jobhunter.sources.base import SourceError
 type CollectGraph = CompiledStateGraph[CollectState, None, CollectState, CollectState]
 
 SOURCE_ERRORS: Final = "source_errors"  # the counter of source errors that reached a node's error handler
+EMBEDDER_ERRORS: Final = "embedder_errors"  # the counter of embedder errors that reached it
 _MINUTE: Final = timedelta(minutes=1)
 # The §9.2 timeout of each node; a fetch node's is per traversal, so `fetch_cell` has it too.
 TIMEOUTS: Final[Mapping[str, timedelta]] = MappingProxyType(
@@ -76,7 +83,7 @@ TIMEOUTS: Final[Mapping[str, timedelta]] = MappingProxyType(
         "fetch_fallback": 15 * _MINUTE,
         "parse_normalize": 10 * _MINUTE,
         "resolve_identity": 20 * _MINUTE,
-        "embed": 20 * _MINUTE,
+        "embed": EMBED_TIMEOUT,  # 20 min: the node's own budget stops it before (`nodes.embed.BUDGET`)
         "hard_filters": 5 * _MINUTE,
         "enqueue_targets": 5 * _MINUTE,
         "finalize": timedelta(seconds=60),
@@ -105,7 +112,8 @@ class _Node[S](Protocol):
 def error_handled[S: Mapping[str, object]](name: str, node: _Node[S]) -> _Node[S]:
     """`node` with the §9.1 error handler (see the module docstring): a `SourceError` becomes the update
     `{steps: [name], counters: {source_errors: 1}}`, plus a `failed` outcome for the fetch request the node
-    was sent (`fetch_request_id`); every other exception propagates."""
+    was sent (`fetch_request_id`); an `EmbedderError` becomes `{steps: [name], counters: {embedder_errors:
+    1}}`; every other exception propagates."""
 
     async def handled(state: S) -> CollectUpdate:
         try:
@@ -119,6 +127,9 @@ def error_handled[S: Mapping[str, object]](name: str, node: _Node[S]) -> _Node[S
                 failed: FetchOutcome = {"work_id": work_id, "status": "failed", "items": 0, "new_postings": 0}
                 update["outcomes"] = {work_id: failed}
             return update
+        except EmbedderError as err:  # the kind and code only, as for a source error
+            log.warning("node_embedder_error", node=name, error_kind=err.kind, error_code=err.code)
+            return {"steps": [name], "counters": {EMBEDDER_ERRORS: 1}}
 
     return handled
 
@@ -151,7 +162,7 @@ def build_collect_graph(checkpointer: BaseCheckpointSaver[str], deps: CollectDep
         "fetch_fallback": make_fetch_fallback(deps),
         "parse_normalize": make_parse_normalize(deps),
         "resolve_identity": make_resolve_identity(deps),
-        "embed": _pass_through("embed"),
+        "embed": make_embed(deps),
         "hard_filters": make_hard_filters(deps),
         "enqueue_targets": _pass_through("enqueue_targets"),
         "finalize": finalize,

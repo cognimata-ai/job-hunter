@@ -5,7 +5,9 @@
 #
 # Images come from deploy/images.lock only: `${name:?}` fails loudly when a digest line is missing. The one dev
 # origin is http://localhost:8080, served by devproxy on the host's loopback only. The api has no route out
-# (its networks `proxy` and `internal` are both internal); only the worker reaches `egress`.
+# (its networks `proxy` and `internal` are both internal); only the worker reaches `egress`. The embedder
+# (Task 22) is on `internal` only: its model is baked into its image, checked against embedder/model.lock at
+# every start (§16.8), and the worker starts once it is healthy.
 name: jobhunter-dev
 
 x-app-build: &app-build
@@ -91,6 +93,7 @@ services:
     environment:
       <<: *app-env
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
+      JOBHUNTER_EMBEDDER_URL: http://embedder:8080 # readiness and system health probe it
     secrets: [session_secret, data_key, db_app]
     networks: [proxy, internal] # both internal: no route to the internet
     healthcheck:
@@ -109,6 +112,7 @@ services:
     environment:
       <<: *app-env
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
+      JOBHUNTER_EMBEDDER_URL: http://embedder:8080
     secrets: [data_key, db_app]
     networks: [internal, egress]
     healthcheck:
@@ -116,8 +120,37 @@ services:
       interval: 30s
       start_period: 120s
       start_interval: 2s
-    depends_on: { migrate: { condition: service_completed_successfully } }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      embedder: { condition: service_healthy }
     mem_limit: 2g
+
+  embedder:
+    image: jobhunter-embedder:dev
+    build:
+      context: ..
+      dockerfile: embedder/Dockerfile
+      args:
+        PYTHON_IMAGE: "${python:?}"
+        UV_IMAGE: "${uv:?}"
+      secrets: [build_ca] # the optional CA bundle of the build's downloads, as for the app image
+    # Not in the secrets group and given no secret (§19.2); it writes nothing at run time.
+    read_only: true
+    user: "10004:10004"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal] # no route out: the model is in the image
+    # embedder-health: GET /health within 3 s, exit 0 iff 200 with checksum_ok (embedder/health.py). The model
+    # loads in a few seconds; a failed checksum exits 78 at start and the restart policy tries again.
+    healthcheck:
+      test: ["CMD", "embedder-health"]
+      interval: 30s
+      start_period: 120s
+      start_interval: 2s
+    logging: { driver: local, options: { max-size: 20m, max-file: "10" } }
+    mem_limit: 3500m # the fp32 export: about 2.6 GB RSS under load (V7, ruling T21-a)
+    cpus: 3
+    restart: unless-stopped
 
   devproxy:
     image: "${caddy:?}"

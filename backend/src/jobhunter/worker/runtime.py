@@ -15,6 +15,7 @@ from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.config import AppConfig
+from jobhunter.embeddings import EmbedderClient
 
 if TYPE_CHECKING:
     # Only for the annotation: `shutdown` imports this module.
@@ -44,3 +45,4 @@ class WorkerRuntime:
     collect_graph: CompiledStateGraph[Any, Any, Any, Any]
     epoch: int
     shutdown: ShutdownState
+    embedder: EmbedderClient | None  # the process's client (the `embed` node and the reconciler share it)

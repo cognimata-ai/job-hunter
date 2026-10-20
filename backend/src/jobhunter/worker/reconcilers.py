@@ -16,7 +16,7 @@ register theirs.
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import procrastinate
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -25,6 +25,10 @@ from jobhunter.observability.alerts import raise_alert, refresh_alert_gauge, res
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.worker.tasks import Deferrer, release_stalled_jobs
+
+if TYPE_CHECKING:
+    # Only for the annotation: `embeddings` imports this module to register its reconciler.
+    from jobhunter.embeddings import EmbedderClient
 
 Cadence = Literal["start", "tick", "heavy", "daily"]
 
@@ -35,11 +39,15 @@ log = get_logger("jobhunter.worker.reconcilers")
 
 @dataclass(frozen=True)
 class ReconcileContext:
+    """What a reconciler gets: the engine, the task app and its deferrer, the cadence's `now`, the worker
+    epoch, and the process's embedder client (`awaiting_embedding` needs it; `None` where there is none)."""
+
     engine: AsyncEngine
     queue: procrastinate.App
     defer: Deferrer
     now: datetime
     epoch: int
+    embedder: "EmbedderClient | None" = None
 
 
 ReconcilerFn = Callable[[ReconcileContext], Awaitable[int]]

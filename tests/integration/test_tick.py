@@ -322,7 +322,7 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     monkeypatch.setattr(reconcilers, "release_stalled_jobs", release_in_reconciler)
     monkeypatch.setattr(tasks, "release_stalled_jobs", release_in_task)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=3)  # the `WorkerRuntime` fields it reads
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=3, embedder=None)  # the fields it reads
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.tick(context, timestamp=0)
     assert released_by == ["reconciler"]  # the `stalled_jobs` reconciler releases; the body does not
@@ -354,7 +354,7 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     reconcilers.reconciler("probe", "daily")(probe)
     monkeypatch.setattr(retention, "run_retention_daily", retention_pass)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, saver=object(), epoch=3)
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None)
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
     assert order == ["retention", "daily"]
@@ -376,7 +376,7 @@ async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
 ) -> None:
     await schedule(engine, interval=3600, cursor=A)
     monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=1)  # the `WorkerRuntime` fields it reads
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=1, embedder=None)  # the fields it reads
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
 
     async def tick_task_at(now: datetime) -> None:

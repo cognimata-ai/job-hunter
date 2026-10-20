@@ -13,16 +13,18 @@
 7. the task app opened, the checkpointer, the collection graph on its `CollectDeps` (the HTTP layer
    configured by `http.configure`: in fake mode every source is served from the fixtures, with the keys
    `b"fake"`; one client per source, made on first use; the process's one `RateLimiter`; admission stopped
-   with the shutdown; Task 24 completes this wiring) and the `WorkerRuntime` with a fresh `ShutdownState`;
+   with the shutdown; the embedder client on `cfg.embedder_url`, which the `embed` node and the
+   `awaiting_embedding` reconciler share; Task 24 completes this wiring) and the `WorkerRuntime` with a fresh
+   `ShutdownState`;
 8. the start reconcilers (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the
    metrics server;
 9. SIGTERM and SIGINT handlers that request the shutdown;
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
 12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app, the source
-    clients and the engine closed, and the lock session closed last, which releases the lock; then
-    `worker_shutdown_complete`. Each of its waits takes at most what is left of the stop's one deadline
-    (`shutdown.StopDeadline`), so the whole stop fits in `shutdown.STOP_BUDGET_S`.
+    clients, the embedder's HTTP client and the engine closed, and the lock session closed last, which
+    releases the lock; then `worker_shutdown_complete`. Each of its waits takes at most what is left of the
+    stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits in `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -69,6 +71,7 @@ from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
+from jobhunter.embeddings import EmbedderClient, make_http_client
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.graphs.collect.graph import build_collect_graph
@@ -107,6 +110,7 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.availability.rules",
     "jobhunter.availability.snapshots",
     "jobhunter.dedup.groups",
+    "jobhunter.graphs.collect.nodes.embed",  # through `jobhunter.embeddings`: `awaiting_embedding`
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
@@ -219,6 +223,7 @@ class _WorkerProcess:
         self.watchdog: Watchdog | None = None
         self.saver_scope = AsyncExitStack()
         self.clients = SourceClients()
+        self.embedder_http: httpx.AsyncClient | None = None
         self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
@@ -259,10 +264,12 @@ class _WorkerProcess:
         saver = await self.saver_scope.enter_async_context(open_saver(dsn))
         http.configure(cfg)
         shutdown = self.shutdown
+        self.embedder_http = make_http_client()
+        embedder = EmbedderClient(cfg.embedder_url, self.embedder_http)
         deps = CollectDeps(
             engine=engine,
             adapters=source_adapters(cfg, self.clients),
-            embedder=None,
+            embedder=embedder,
             clock=utcnow,
             sleep=asyncio.sleep,
             admission_stopped=lambda: shutdown.admission_stopped,
@@ -277,9 +284,12 @@ class _WorkerProcess:
             collect_graph=build_collect_graph(saver, deps),
             epoch=epoch,
             shutdown=shutdown,
+            embedder=embedder,
         )
         # 8. The start reconcilers, and the metrics server outside the test env.
-        start = ReconcileContext(engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch)
+        start = ReconcileContext(
+            engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch, embedder=embedder
+        )
         await run_reconcilers(start, "start")
         if cfg.env != "test":
             start_metrics_server(METRICS_PORT)
@@ -318,6 +328,10 @@ class _WorkerProcess:
         if self.queue is not None:
             await self.queue.close_async()
 
+    async def _close_embedder(self) -> None:
+        if self.embedder_http is not None:
+            await self.embedder_http.aclose()
+
     async def _dispose_engine(self) -> None:
         if self.engine is not None:
             await self.engine.dispose()
@@ -347,6 +361,7 @@ class _WorkerProcess:
             ("saver", lambda: _within(deadline, self.saver_scope.aclose())),
             ("queue", lambda: _within(deadline, self._close_queue())),
             ("clients", lambda: _within(deadline, self.clients.aclose())),
+            ("embedder", lambda: _within(deadline, self._close_embedder())),
             ("engine", lambda: _within(deadline, self._dispose_engine())),
             ("lock_session", self._close_lock_session),  # last: closing it releases the lock
         )

@@ -3,7 +3,7 @@
 `CollectDeps` is made once per worker process (`worker.main`, Task 24) and shared by every run: one
 `RateLimiter` for the process (§5.2), the adapter of each source instance (`adapters`), the injected clock and
 sleep, and `admission_stopped`, which the shutdown sets so that no new request starts (§3.3.5). `embedder` is
-`None` until Task 22 gives it its client type.
+the process's embedder client (Task 22), `None` in tests of nodes that embed nothing.
 
 `FetchContext` holds the §9.2 semaphores the fetch nodes hold around a traversal: one per source (JSearch 1,
 SerpApi 1, Adzuna 1, Arbeitnow 1) and one per ATS host (`host`: 2 slots, `ATS_HOST_LIMIT`, made on first use,
@@ -20,6 +20,7 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from jobhunter.embeddings import EmbedderClient
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.sources.ratelimit import ATS_HOST_LIMIT, RateLimiter
@@ -53,7 +54,7 @@ class FetchContext:
 class CollectDeps:
     engine: AsyncEngine
     adapters: Callable[[InstanceRow], SourceAdapter]
-    embedder: object | None
+    embedder: EmbedderClient | None
     clock: Callable[[], datetime]
     sleep: Callable[[float], Awaitable[None]]
     admission_stopped: Callable[[], bool]

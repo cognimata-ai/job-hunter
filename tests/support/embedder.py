@@ -1,0 +1,179 @@
+"""The fake embedder (Task 22): Task 21's HTTP contract, served from the test process.
+
+`FakeEmbedder` is a `ThreadingHTTPServer` on `127.0.0.1:0` that answers `GET /health` and `POST /v1/embed` as
+`embedder/app.py` does (its field names, its 413 and 422 refusals, a 503 health when the checksum failed),
+with a deterministic unit vector per text, seeded from the sha256 of the text the model would see (a query
+with its `query: ` prefix). A text over 4,000 characters is flagged `truncated` and counted 1,024 tokens, the
+service's own truncation; every other text counts a token per 4 characters. Its switches:
+
+- `down`: every request is refused: the server closes each connection at once, without an answer, so the
+  client sees a transport error, as for a refused connection, while the port stays bound and the URL every
+  configuration carries stays valid;
+- `checksum_ok`: `False` gives a 503 health (`checksum_ok: false`) and a 503 for every embed request, the
+  answers of a service whose model failed its check;
+- `dim` and `model_id`: what every embed answer carries (a wrong dimension, a foreign model);
+- `batches`: the size of every embed request it received while up, in order.
+
+One server per session (`fake_embedder_server`): `make_config` and `proc_env` pass its `base_url` as
+`JOBHUNTER_EMBEDDER_URL` to every configuration and every child process. The function fixture
+`fake_embedder` hands it to a test after `reset()` and resets it again after the test, so no switch leaks
+into the next one.
+"""
+
+import hashlib
+import json
+import math
+import random
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socket import socket
+from typing import Any, Final
+
+import pytest
+from jobhunter.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_ID, MAX_TEXT_BYTES
+
+TRUNCATE_CHARS: Final = 4_000
+MAX_TOKENS: Final = 1_024
+MAX_BATCH: Final = 16
+QUERY_PREFIX: Final = "query: "
+
+
+def fake_vector(text: str, dim: int) -> list[float]:
+    """The unit vector of `text` (as the model sees it): Gaussian components seeded from its sha256."""
+    seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
+    rng = random.Random(seed)  # noqa: S311 - a test vector, deterministic on purpose
+    raw = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+    norm = math.sqrt(sum(x * x for x in raw))
+    return [x / norm for x in raw]
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, fake: "FakeEmbedder") -> None:
+        super().__init__(("127.0.0.1", 0), _Handler)
+        self.fake = fake
+
+    def verify_request(self, request: socket | tuple[bytes, socket], client_address: Any) -> bool:
+        # A refused request is closed by the server at once (`shutdown_request`), without an answer.
+        return not self.fake.down
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server: _Server
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass  # quiet: the test output stays clean
+
+    def _answer(self, status: int, body: object) -> None:
+        payload = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:
+        fake = self.server.fake
+        if self.path != "/health":
+            self._answer(404, {"detail": "Not Found"})
+            return
+        body = {
+            "status": "ok" if fake.checksum_ok else "error",
+            "model_id": fake.model_id,
+            "checksum_ok": fake.checksum_ok,
+            "dim": fake.dim,
+        }
+        self._answer(200 if fake.checksum_ok else 503, body)
+
+    def do_POST(self) -> None:
+        fake = self.server.fake
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        if self.path != "/v1/embed":
+            self._answer(404, {"detail": "Not Found"})
+            return
+        try:
+            request = json.loads(raw)
+        except ValueError:
+            self._answer(422, {"detail": "not JSON"})
+            return
+        texts = request.get("texts") if isinstance(request, dict) else None
+        kind = request.get("input_kind") if isinstance(request, dict) else None
+        if kind not in ("query", "passage") or not isinstance(texts, list) or not texts:
+            self._answer(422, {"detail": "bad request"})
+            return
+        if not all(isinstance(text, str) for text in texts):
+            self._answer(422, {"detail": "texts must be strings"})
+            return
+        fake.record(len(texts))
+        if len(texts) > MAX_BATCH or any(len(t.encode("utf-8")) > MAX_TEXT_BYTES for t in texts):
+            self._answer(413, {"detail": "too large"})
+            return
+        if not fake.checksum_ok:
+            self._answer(503, {"detail": "the model failed its checksum"})
+            return
+        seen = [QUERY_PREFIX + text if kind == "query" else text for text in texts]
+        body = {
+            "model_id": fake.model_id,
+            "vectors": [fake_vector(text, fake.dim) for text in seen],
+            "truncated": [len(text) > TRUNCATE_CHARS for text in texts],
+            "tokens": [MAX_TOKENS if len(t) > TRUNCATE_CHARS else max(1, len(t) // 4) for t in texts],
+        }
+        self._answer(200, body)
+
+
+class FakeEmbedder:
+    """The embedder's HTTP contract on `base_url`, with the switches of the module docstring."""
+
+    def __init__(self) -> None:
+        self.down = False
+        self.checksum_ok = True
+        self.dim = EMBEDDING_DIM
+        self.model_id = EMBEDDING_MODEL_ID
+        self.batches: list[int] = []
+        self._lock = threading.Lock()
+        self._server = _Server(self)
+        host, port = self._server.server_address[:2]
+        self.base_url = f"http://{host!s}:{port}"
+        self._thread = threading.Thread(target=self._server.serve_forever, name="fake-embedder", daemon=True)
+        self._thread.start()
+
+    def record(self, size: int) -> None:
+        with self._lock:
+            self.batches.append(size)
+
+    def reset(self) -> None:
+        """Up, with a good checksum, the pinned model and dimension, and no batch recorded."""
+        self.down = False
+        self.checksum_ok = True
+        self.dim = EMBEDDING_DIM
+        self.model_id = EMBEDDING_MODEL_ID
+        with self._lock:
+            self.batches.clear()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def fake_embedder_server() -> Iterator[FakeEmbedder]:
+    """The session's one `FakeEmbedder`; `make_config` and `proc_env` carry its URL."""
+    server = FakeEmbedder()
+    try:
+        yield server
+    finally:
+        server.close()
+
+
+@pytest.fixture
+def fake_embedder(fake_embedder_server: FakeEmbedder) -> Iterator[FakeEmbedder]:
+    """The session's `FakeEmbedder`, reset before the test and again after it."""
+    fake_embedder_server.reset()
+    try:
+        yield fake_embedder_server
+    finally:
+        fake_embedder_server.reset()

@@ -823,6 +823,9 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
         "groups_formed": 0,  # its grouping pass (Task 20): no job changed
         "groups_changed": 0,
         "elections": 0,
+        "revisions_embedded": 0,  # node 7 (Task 22) ran: these deps have no embedder, nothing awaits
+        "revisions_awaiting": 0,
+        "revisions_truncated": 0,
         "hard_filter_backfilled": 0,  # node 8 (Task 16) ran: no job was touched
     }
     assert state["steps"].count("fetch_cell") == 3 and state["steps"][-1] == "finalize"

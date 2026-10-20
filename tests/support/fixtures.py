@@ -26,6 +26,7 @@ from jobhunter.worker.lock import ADVISORY_LOCK_KEY, LockSession, acquire_lock
 from jobhunter.worker.tasks import make_queue_app
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.embedder import FakeEmbedder
 from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_pg_server, start_pg_server
 from tests.support.procs import ProcessGroup, wait_until
 
@@ -103,23 +104,35 @@ def fresh_pg_server(tmp_path: Path) -> Iterator[PgServer]:
         remove_pg_server(server)
 
 
+def _fake_embedder_url(request: pytest.FixtureRequest) -> str:
+    """The base URL of the session's fake embedder (started on first use)."""
+    server: FakeEmbedder = request.getfixturevalue("fake_embedder_server")
+    return server.base_url
+
+
 @pytest.fixture
 def make_config(request: pytest.FixtureRequest) -> ConfigFactory:
-    """`make_config(role, server=None, **env)`: the `AppConfig` of `role`, by default against `pg_server`."""
+    """`make_config(role, server=None, **env)`: the `AppConfig` of `role`, by default against `pg_server`.
+
+    Its embedder is the session's fake embedder (`JOBHUNTER_EMBEDDER_URL`, Task 22), unless `env` names one.
+    """
 
     def make(role: Role, server: PgServer | None = None, **env: str) -> AppConfig:
         # Resolved only when no server is given, so a test with its own server does not start the shared one.
-        return config_for(server or request.getfixturevalue("pg_server"), role, **env)
+        pg = server or request.getfixturevalue("pg_server")
+        return config_for(pg, role, embedder_url=_fake_embedder_url(request), **env)
 
     return make
 
 
 @pytest.fixture
 def proc_env(request: pytest.FixtureRequest) -> ProcessEnvFactory:
-    """`proc_env(role, server=None, **extra)`: the environment of a child process of `role`."""
+    """`proc_env(role, server=None, **extra)`: the environment of a child process of `role`, whose embedder
+    is the session's fake embedder (Task 22)."""
 
     def make(role: Role, server: PgServer | None = None, **extra: str) -> dict[str, str]:
-        return process_env(server or request.getfixturevalue("pg_server"), role, **extra)
+        pg = server or request.getfixturevalue("pg_server")
+        return process_env(pg, role, embedder_url=_fake_embedder_url(request), **extra)
 
     return make
 
@@ -281,6 +294,12 @@ def current_epoch(clean_db: None, migrated: PgServer) -> int:
     """
     pg_one(migrated, "app", _EPOCH_1_IS_CURRENT)
     return 1
+
+
+@pytest.fixture
+def worker_lock_heartbeat(current_epoch: int) -> None:
+    """A fresh `worker_heartbeat` row (the one `current_epoch` records), so readiness's `worker_heartbeat`
+    probe passes for the next 60 s (Task 22)."""
 
 
 @pytest.fixture

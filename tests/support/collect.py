@@ -18,11 +18,11 @@ a new settings version that enables them (and, with `enabled`, exactly those sou
 `active_config`, so a run queued afterwards plans them (plan Deviation 3).
 
 Task 14: `make_deps` is the `CollectDeps` of a test (the real `RateLimiter` over `SOURCE_LIMITS`, a fresh
-`FetchContext`, `utcnow`, no embedder); the fixture `job_factory` inserts a job with one posting and its
-observations directly, with the facts given (`MadeJob`); `seed_inputs_sync` is `seed_inputs` for the sync
-crash tests, on an engine of its own; `manual_paid_run` seeds the test query with only the source under test
-enabled (Ruling P5) and requests a manual run that includes paid sources, whose `run_collect(id, 1)` job waits
-for the worker.
+`FetchContext`, `utcnow`, no embedder unless given); the fixture `job_factory` inserts a job with one
+posting and its observations directly, with the facts given (`MadeJob`); `seed_inputs_sync` is
+`seed_inputs` for the sync crash tests, on an engine of its own; `manual_paid_run` seeds the test query with
+only the source under test enabled (Ruling P5) and requests a manual run that includes paid sources, whose
+`run_collect(id, 1)` job waits for the worker.
 
 Task 16: `posting_factory` inserts a posting with its job and one observation (the availability and the last
 sighting as given; a missing source instance is created); `board` and `board20` are the Greenhouse watchlist
@@ -49,6 +49,10 @@ primary link (`keys_from_link`), which is stored canonical. `key_pair` resolves 
 with `htidocid` `H` and `pub:stepstone.de` 1) and job B (an Adzuna posting with id 9) for a run, A first.
 `job_lockable` probes from a connection of its own whether a job row can be locked at once (`FOR UPDATE
 NOWAIT`): `False` while another transaction holds it.
+
+Task 22: `make_deps` and `ctx` take an `embedder` client (none by default); the fixture `revisions_awaiting`
+inserts jobs whose one revision is `awaiting_embedding`, with texts of their own, duplicated or long on
+request (`insert_revisions_awaiting`).
 """
 
 import asyncio
@@ -70,6 +74,7 @@ from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error, q
 from jobhunter.db.transitions import transition
 from jobhunter.dedup.identity import resolve_item
+from jobhunter.embeddings import EmbedderClient
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.normalize.companies import company_key
 from jobhunter.normalize.fields import ATS_SOURCES
@@ -310,11 +315,21 @@ async def supersede(engine: AsyncEngine, owner: RunOwner) -> RunOwner:
 
 
 def ctx(
-    engine: AsyncEngine, queue_app: procrastinate.App, now: datetime | None = None, epoch: int = 1
+    engine: AsyncEngine,
+    queue_app: procrastinate.App,
+    now: datetime | None = None,
+    epoch: int = 1,
+    *,
+    embedder: EmbedderClient | None = None,
 ) -> ReconcileContext:
-    """A reconcile context at `now` (the current time when omitted) for worker `epoch`."""
+    """A reconcile context at `now` (the current time when omitted) for worker `epoch`, with `embedder`."""
     return ReconcileContext(
-        engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow() if now is None else now, epoch=epoch
+        engine=engine,
+        queue=queue_app,
+        defer=defer_in_tx,
+        now=utcnow() if now is None else now,
+        epoch=epoch,
+        embedder=embedder,
     )
 
 
@@ -445,13 +460,14 @@ def make_deps(
     adapters: Callable[[InstanceRow], SourceAdapter],
     *,
     admission_stopped: Callable[[], bool] = lambda: False,
+    embedder: EmbedderClient | None = None,
 ) -> CollectDeps:
     """The `CollectDeps` of a test: the real `RateLimiter` over `SOURCE_LIMITS` on `time.monotonic` and
-    `asyncio.sleep`, a fresh `FetchContext`, `utcnow` and no embedder."""
+    `asyncio.sleep`, a fresh `FetchContext`, `utcnow` and `embedder` (none by default)."""
     return CollectDeps(
         engine=engine,
         adapters=adapters,
-        embedder=None,
+        embedder=embedder,
         clock=utcnow,
         sleep=asyncio.sleep,
         admission_stopped=admission_stopped,
@@ -1054,3 +1070,64 @@ async def job_lockable(engine: AsyncEngine, job_id: int) -> bool:
             return False
         raise
     return True
+
+
+# ---- Task 22 ----------------------------------------------------------------------------------------------
+
+# A description of this many characters is over the fake embedder's 4,000: its embedding is `truncated`.
+LONG_DESCRIPTION_CHARS: Final = 5_000
+_AWAITING_REVISION: Final = q(
+    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, description_text, "
+    "description_completeness, ad_language, embedding_status) VALUES (:job, 1, :hash, :llm_input, "
+    ":description, 'full', 'en', 'awaiting_embedding') RETURNING id",
+    jsonb=["llm_input"],
+)
+
+
+class RevisionsAwaiting(Protocol):
+    def __call__(
+        self, engine: AsyncEngine, n: int, *, duplicate_texts: int = 0, long_texts: int = 0
+    ) -> Awaitable[list[int]]: ...
+
+
+async def insert_revisions_awaiting(
+    engine: AsyncEngine, n: int, *, duplicate_texts: int = 0, long_texts: int = 0
+) -> list[int]:
+    """`n` jobs (`insert_job`), each with one revision `awaiting_embedding`; the revision ids, oldest first.
+
+    Each revision's `llm_input` has a `title`, a `company_display` and a `description_text` of its own, but
+    the first `duplicate_texts` revisions share one text, and the last `long_texts` have a description of
+    `LONG_DESCRIPTION_CHARS` characters. Every call makes jobs of its own (fresh native ids).
+    """
+    if duplicate_texts + long_texts > n or duplicate_texts == 1:
+        raise ValueError(
+            "revisions_awaiting: duplicate_texts must be 0 or at least 2, and fit with long_texts"
+        )
+    batch = uuid.uuid4().hex[:8]
+    ids: list[int] = []
+    for i in range(n):
+        job = await insert_job(engine, native_id=f"emb-{batch}-{i}")
+        k = 0 if i < duplicate_texts else i
+        description = f"Ad {batch}-{k}: build and run Python services for a logistics platform."
+        if i >= n - long_texts:
+            description = (description + " ") * (LONG_DESCRIPTION_CHARS // len(description) + 1)
+        llm_input = {
+            "title": f"Python Developer {k}",
+            "company_display": "Acme",
+            "description_text": description,
+        }
+        params = {
+            "job": job.job_id,
+            "hash": hashlib.sha256(f"{batch}:{i}".encode()).digest(),
+            "llm_input": llm_input,
+            "description": description,
+        }
+        async with engine.begin() as conn:
+            ids.append(int((await conn.execute(_AWAITING_REVISION, params)).scalar_one()))
+    return ids
+
+
+@pytest.fixture
+def revisions_awaiting() -> RevisionsAwaiting:
+    """`await revisions_awaiting(engine, n, duplicate_texts=0, long_texts=0)`: `insert_revisions_awaiting`."""
+    return insert_revisions_awaiting

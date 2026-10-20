@@ -371,7 +371,7 @@ async def test_readiness_flags_a_stale_heartbeat_and_a_foreign_revision(engine, 
                 "(1, gen_random_uuid(), 1, 'h', 1, 1, 'v', now(), now() - interval '90 seconds')"
             )
         )
-    stale = await check_readiness(engine, code_head="0000_not_the_head", now=utcnow())
+    stale = await check_readiness(engine, code_head="0000_not_the_head", now=utcnow(), embedder=None)
     assert stale == ReadinessReport(ok=False, failing=["migrations", "worker_heartbeat"])
     # no error was raised by either probe, so neither has a SQLSTATE
     assert [(e["probe"], e["sqlstate"]) for e in log_events() if e["event"] == "readiness_probe_failed"] == [
@@ -379,9 +379,9 @@ async def test_readiness_flags_a_stale_heartbeat_and_a_foreign_revision(engine, 
         ("worker_heartbeat", None),
     ]
     await fresh_heartbeat(engine)
-    assert await check_readiness(engine, code_head=code_head(), now=utcnow()) == ReadinessReport(
-        ok=True, failing=[]
-    )
+    assert await check_readiness(
+        engine, code_head=code_head(), now=utcnow(), embedder=None
+    ) == ReadinessReport(ok=True, failing=[])
 
 
 async def test_readiness_reports_db_when_the_connection_dies_mid_check(engine, migrated, log_events) -> None:
@@ -398,7 +398,7 @@ async def test_readiness_reports_db_when_the_connection_dies_mid_check(engine, m
 
     sa.event.listen(engine.sync_engine, "before_cursor_execute", kill_own_backend)
     try:
-        report = await check_readiness(engine, code_head=code_head(), now=utcnow())
+        report = await check_readiness(engine, code_head=code_head(), now=utcnow(), embedder=None)
     finally:
         sa.event.remove(engine.sync_engine, "before_cursor_execute", kill_own_backend)
     assert report == ReadinessReport(ok=False, failing=["db"])
@@ -424,7 +424,9 @@ async def test_a_probe_blocked_behind_a_lock_fails_alone(
         with psycopg.connect(migrated.dsn("migrator")) as locker:
             locker.execute("LOCK TABLE worker_heartbeat IN ACCESS EXCLUSIVE MODE")
             async with asyncio.timeout(10):  # without the statement timeout the probe would wait for the lock
-                report = await health.check_readiness(engine, code_head=code_head(), now=utcnow())
+                report = await health.check_readiness(
+                    engine, code_head=code_head(), now=utcnow(), embedder=None
+                )
             locker.rollback()
         assert report == health.ReadinessReport(ok=False, failing=["worker_heartbeat"])
         assert [
@@ -453,7 +455,9 @@ async def test_readyz_answers_503_db_for_an_unexpected_error(api_client, log_eve
     assert "secret detail" not in json.dumps(log_events())
 
 
-async def test_the_lifespan_builds_the_state_from_the_environment(migrated, monkeypatch) -> None:
+async def test_the_lifespan_builds_the_state_from_the_environment(
+    migrated, fake_embedder, monkeypatch
+) -> None:
     import logging
     import os
 
@@ -464,7 +468,8 @@ async def test_the_lifespan_builds_the_state_from_the_environment(migrated, monk
 
     for name in [name for name in os.environ if name.startswith(ENV_PREFIXES)]:
         monkeypatch.delenv(name)
-    for name, value in server_env(migrated, "api", JOBHUNTER_LOG_LEVEL="WARNING").items():
+    env = server_env(migrated, "api", embedder_url=fake_embedder.base_url, JOBHUNTER_LOG_LEVEL="WARNING")
+    for name, value in env.items():
         monkeypatch.setenv(name, value)
     app = create_app()  # nothing injected: the lifespan loads the config and builds the engine
     assert not hasattr(app.api.state, "engine")
@@ -484,13 +489,17 @@ async def test_the_lifespan_builds_the_state_from_the_environment(migrated, monk
         ) as c:
             r = await c.get("/readyz")
         assert_edge(r)
+        # the embedder probe passed: the lifespan's client reaches JOBHUNTER_EMBEDDER_URL
         assert r.status_code == 503 and r.json() == {"failing": ["worker_heartbeat"]}
         assert engine.pool.checkedin() == 1  # the readiness connection went back to the lifespan's pool
+        embedder = app.api.state.embedder
+        assert embedder.base_url == fake_embedder.base_url and not embedder.http.is_closed
     finally:
         await inbox.put({"type": "lifespan.shutdown"})
         assert (await outbox.get())["type"] == "lifespan.shutdown.complete"
         await lifespan
     assert engine.pool.checkedin() == 0  # disposed at shutdown
+    assert embedder.http.is_closed  # and the embedder's HTTP client closed
 
 
 async def test_a_422_message_returns_to_the_sender_and_never_reaches_a_log_line(
@@ -552,7 +561,7 @@ async def test_readiness_bounds_the_probe_sequence_client_side(engine, log_event
     monkeypatch.setattr(health, "_rows", stuck_heartbeat_probe)
     monkeypatch.setattr(health, "PROBES_TIMEOUT_S", 0.1)
     async with asyncio.timeout(10):  # without the bound the check would wait for ever
-        report = await health.check_readiness(engine, code_head=code_head(), now=utcnow())
+        report = await health.check_readiness(engine, code_head=code_head(), now=utcnow(), embedder=None)
     assert report == health.ReadinessReport(ok=False, failing=["db"])
     failed = [(e["probe"], e["error_class"]) for e in log_events() if e["event"] == "readiness_probe_failed"]
     assert failed == [("db", "TimeoutError")]  # the migrations probe passed; its result is not reported alone

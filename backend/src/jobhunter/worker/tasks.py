@@ -83,7 +83,14 @@ async def tick(context: JobContext, timestamp: int) -> None:
     rt: WorkerRuntime = context.additional_context["runtime"]
     # The `stalled_jobs` reconciler runs in this cadence, so the tick does not release stalled jobs itself.
     await run_reconcilers(
-        ReconcileContext(engine=rt.engine, queue=rt.queue, defer=defer_in_tx, now=utcnow(), epoch=rt.epoch),
+        ReconcileContext(
+            engine=rt.engine,
+            queue=rt.queue,
+            defer=defer_in_tx,
+            now=utcnow(),
+            epoch=rt.epoch,
+            embedder=rt.embedder,
+        ),
         "tick",
     )
     async with rt.engine.begin() as conn:
@@ -99,7 +106,14 @@ async def reconcile_heavy(context: JobContext, timestamp: int) -> None:
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     await run_reconcilers(
-        ReconcileContext(engine=rt.engine, queue=rt.queue, defer=defer_in_tx, now=utcnow(), epoch=rt.epoch),
+        ReconcileContext(
+            engine=rt.engine,
+            queue=rt.queue,
+            defer=defer_in_tx,
+            now=utcnow(),
+            epoch=rt.epoch,
+            embedder=rt.embedder,
+        ),
         "heavy",
     )
 
@@ -116,7 +130,14 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
     await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow())
     # The daily maintenance (§17.4, e.g. `stale_sweep_daily`, §8.11), after the retention pass.
     await run_reconcilers(
-        ReconcileContext(engine=rt.engine, queue=rt.queue, defer=defer_in_tx, now=utcnow(), epoch=rt.epoch),
+        ReconcileContext(
+            engine=rt.engine,
+            queue=rt.queue,
+            defer=defer_in_tx,
+            now=utcnow(),
+            epoch=rt.epoch,
+            embedder=rt.embedder,
+        ),
         "daily",
     )
 

@@ -260,3 +260,28 @@ def test_c6b_grouping_resumes_from_occurrences(migrated, proc_env, procs, fixtur
     )
     # B grouped them from the occurrences: a linked-but-ungrouped revision is never lost
     assert len(groups) == 2 and len(set(groups)) == 1
+
+
+def test_c7_crash_during_embed_leaves_awaiting_then_embedded(
+    migrated, proc_env, procs, fixture_log, fake_embedder
+) -> None:
+    run_id = manual_paid_run(migrated, only="adzuna")  # its page gives about 50 revisions: several batches
+    die_at(migrated, proc_env, procs, fixture_log, "collect.embed.between_batches")
+    # A died after its first batch
+    assert one(
+        migrated,
+        "SELECT count(*) FILTER (WHERE embedding_status = 'embedded'), "
+        "count(*) FILTER (WHERE embedding_status = 'awaiting_embedding') > 0 FROM job_revisions",
+    ) == (16, True)
+    assert fake_embedder.batches == [16]
+    resume(migrated, proc_env, procs, fixture_log, run_id)
+    # every revision embedded, no orphaned vector
+    assert one(
+        migrated,
+        "SELECT count(*) FILTER (WHERE embedding_status <> 'embedded'), "
+        "(SELECT count(*) FROM embeddings) = count(DISTINCT embedding_id) FROM job_revisions",
+    ) == (0, True)
+    # B embedded the rest only, in batches of at most 16: no revision was sent twice
+    revisions = one(migrated, "SELECT count(*) FROM job_revisions")
+    assert all(0 < size <= 16 for size in fake_embedder.batches)
+    assert revisions is not None and sum(fake_embedder.batches) == int(str(revisions[0]))
