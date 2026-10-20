@@ -4,9 +4,11 @@
 it to procrastinate as `additional_context={"runtime": runtime}`. Every task body reads it as
 `context.additional_context["runtime"]`, so Tasks 10 to 12 can type their bodies before the process exists.
 
-`request_shutdown` asks the process for its graceful stop from inside it, as SIGTERM does from outside: a task
-body whose admission or claim the epoch fence refused (`EPOCH_SUPERSEDED`, ruling T24-a) proves that this
-worker has been superseded (§3.3.1 item 5), so its loops must stop fetching.
+`request_shutdown` is the one way to ask the process for its graceful stop: the SIGTERM and SIGINT handlers
+call it from outside (the reason is the signal's name), and the worker itself once an epoch fence refused it
+(`EPOCH_SUPERSEDED`, ruling T24-a): a task body whose admission or claim was refused, a fenced tick or
+reconciler cadence, the start's cadence. That proves this worker has been superseded (§3.3.1 item 5), so its
+loops must stop fetching.
 """
 
 import asyncio
@@ -48,14 +50,19 @@ log = get_logger("jobhunter.worker.runtime")
 
 
 def request_shutdown(state: ShutdownState, *, reason: str) -> None:
-    """Ask the worker process for its graceful stop (what SIGTERM does): `shutdown.coordinate` then stops
-    admission and the procrastinate loops, which fetch no further job and let the running ones end.
+    """Ask the worker process for its graceful stop: `shutdown.coordinate` then stops admission and the
+    procrastinate loops, which fetch no further job and let the running ones end.
 
-    Logged once, `shutdown_requested` at `warning` with `reason`; a stop already requested is left as it is.
+    Logged once, `shutdown_requested` with `reason` (one shape for every request): at `warning` for the stop
+    a superseded worker requests of itself (`EPOCH_SUPERSEDED`), at `info` for an operator's signal (its
+    name). A stop already requested is left as it is.
     """
     if state.requested.is_set():
         return
-    log.warning("shutdown_requested", reason=reason)
+    if reason == EPOCH_SUPERSEDED:
+        log.warning("shutdown_requested", reason=reason)
+    else:
+        log.info("shutdown_requested", reason=reason)
     state.requested.set()
 
 

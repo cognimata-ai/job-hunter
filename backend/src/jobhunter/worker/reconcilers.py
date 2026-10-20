@@ -11,7 +11,8 @@ the reconciler succeeds again, the alert is resolved.
 own writes with `ctx.epoch` (`epoch.fence_epoch`), and so do the alert writes here (the first statement of
 their transaction; no job row is locked). A `FencedOut`, from a reconciler or from an alert write, is no
 failure: this worker is superseded, so the cadence stops there (logged `reconcilers_fenced` with the cadence
-and the reconciler), and a superseded worker never raises or resolves `reconciler.failed`.
+and the reconciler), a superseded worker never raises or resolves `reconciler.failed`, and it requests its
+own graceful stop (`ReconcileContext.on_superseded`, Ruling T24-a), as a fenced task body does.
 
 This module is a task boundary (ruff `BLE001` is allowed here), and the catch persists an outcome (§17.1).
 
@@ -48,7 +49,10 @@ log = get_logger("jobhunter.worker.reconcilers")
 @dataclass(frozen=True)
 class ReconcileContext:
     """What a reconciler gets: the engine, the task app and its deferrer, the cadence's `now`, the worker
-    epoch, and the process's embedder client (`awaiting_embedding` needs it; `None` where there is none)."""
+    epoch, and the process's embedder client (`awaiting_embedding` needs it; `None` where there is none).
+
+    `on_superseded` is what `run_reconcilers` calls once a fence refused `epoch`: the worker requests its own
+    graceful stop there (Ruling T24-a; the task bodies and the start pass it, `None` does nothing)."""
 
     engine: AsyncEngine
     queue: procrastinate.App
@@ -56,6 +60,7 @@ class ReconcileContext:
     now: datetime
     epoch: int
     embedder: "EmbedderClient | None" = None
+    on_superseded: Callable[[], None] | None = None
 
 
 ReconcilerFn = Callable[[ReconcileContext], Awaitable[int]]
@@ -119,7 +124,8 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
     recorded. Neither log line carries an exception message.
 
     A `FencedOut`, from a reconciler or its alert write, stops the cadence (module docstring): the counts so
-    far are returned, logged `reconcilers_fenced`, and no alert is written for it.
+    far are returned, logged `reconcilers_fenced`, and no alert is written for it; `ctx.on_superseded()`
+    then asks this superseded worker for its graceful stop.
     """
     counts: dict[str, int] = {}
     for name, (cadences, fn) in list(REGISTRY.items()):
@@ -141,6 +147,8 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
         except FencedOut:
             # `fence_epoch` logged both epochs; the fenced transaction wrote nothing.
             log.warning("reconcilers_fenced", cadence=cadence, reconciler=name)
+            if ctx.on_superseded is not None:
+                ctx.on_superseded()
             return counts
     return counts
 

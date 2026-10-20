@@ -8,9 +8,17 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 
 The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12), `reconcile_heavy` and
 `retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19, unless the
-worker epoch fenced that pass out, final review C2). Every body is `pass_context` and reads its inputs from
-the `WorkerRuntime` in `context.additional_context["runtime"]`. The tick's own scheduling step (`run_tick`)
-is fenced by the worker epoch too (Ruling FR-h): a superseded worker's tick writes nothing.
+worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running,
+ledger L312). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
+`context.additional_context["runtime"]`. The tick's own scheduling step (`run_tick`) is fenced by the worker
+epoch too (Ruling FR-h): a superseded worker's tick writes nothing. Whatever a fence refuses, a delivery, the
+tick's step, a cadence or the retention pass, the body then requests this worker's graceful stop
+(`_stop_when_superseded`, Ruling T24-a): the refusal proves it superseded.
+
+`tick`, `reconcile_heavy` and `retention_daily` share the `tick` queue, served with concurrency 1
+(`QUEUES`): a long heavy cadence or daily pass delays the minute's tick until it ends. The tick loses no
+slot to that (`run_tick` evaluates every slot since its cursor, and its queueing lock keeps one tick
+waiting), and the daily pass is batched (Task 19's `stale_sweep_daily`).
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 
@@ -38,7 +46,9 @@ from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 
 if TYPE_CHECKING:
-    # Only for annotations: the runtime pulls in langgraph, which a process that only defers (the API) skips.
+    # Only for annotations: the runtime pulls in langgraph, which a process that only defers (the API) skips;
+    # `reconcilers` imports this module.
+    from jobhunter.worker.reconcilers import ReconcileContext
     from jobhunter.worker.runtime import WorkerRuntime
 
 TASK_NAMESPACE: Final = "jh"
@@ -58,12 +68,29 @@ def job_task_name(name: TaskName) -> str:
 
 
 def _stop_when_superseded(rt: "WorkerRuntime") -> Callable[[], None]:
-    """What a body does once the epoch fence refused its delivery (ruling T24-a): this worker is superseded,
-    so it requests its own graceful stop (`runtime.request_shutdown`, reason `epoch_superseded`)."""
+    """What a body does once the epoch fence refused it (ruling T24-a): this worker is superseded, so it
+    requests its own graceful stop (`runtime.request_shutdown`, reason `epoch_superseded`)."""
     # Imported here: the runtime pulls in langgraph, which a process that only defers (the API) skips.
     from jobhunter.worker.runtime import EPOCH_SUPERSEDED, request_shutdown
 
     return lambda: request_shutdown(rt.shutdown, reason=EPOCH_SUPERSEDED)
+
+
+def _reconcile_context(rt: "WorkerRuntime") -> "ReconcileContext":
+    """The context of a cadence a task body runs: the runtime's engine, task app, epoch and embedder, this
+    module's deferrer, `now`, and the stop of a superseded worker (`_stop_when_superseded`)."""
+    # Imported here: `reconcilers` imports this module (`Deferrer`, `release_stalled_jobs`).
+    from jobhunter.worker.reconcilers import ReconcileContext
+
+    return ReconcileContext(
+        engine=rt.engine,
+        queue=rt.queue,
+        defer=defer_in_tx,
+        now=utcnow(),
+        epoch=rt.epoch,
+        embedder=rt.embedder,
+        on_superseded=_stop_when_superseded(rt),
+    )
 
 
 @blueprint.task(name="run_collect", queue="collect", lock="collect", pass_context=True)
@@ -97,79 +124,64 @@ async def run_operation(context: JobContext, operation_id: int) -> None:
 @blueprint.task(name="tick", queue="tick", queueing_lock="tick", pass_context=True)
 async def tick(context: JobContext, timestamp: int) -> None:
     # Imported here: `reconcilers` and `tick` import this module (`Deferrer`, `release_stalled_jobs`).
-    from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
+    from jobhunter.worker.reconcilers import run_reconcilers
     from jobhunter.worker.tick import observe_tick, run_tick
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     # The `stalled_jobs` reconciler runs in this cadence, so the tick does not release stalled jobs itself.
-    await run_reconcilers(
-        ReconcileContext(
-            engine=rt.engine,
-            queue=rt.queue,
-            defer=defer_in_tx,
-            now=utcnow(),
-            epoch=rt.epoch,
-            embedder=rt.embedder,
-        ),
-        "tick",
-    )
+    await run_reconcilers(_reconcile_context(rt), "tick")
     try:
         async with rt.engine.begin() as conn:
             # The `worker_heartbeat` row first, before `active_config` (Ruling FR-h; no job row is locked).
             await fence_epoch(conn, rt.epoch)
             report = await run_tick(conn, now=utcnow(), defer=defer_in_tx)
     except FencedOut:
-        return  # a newer worker owns the schedule (`fence_epoch` logged it): this tick wrote nothing
+        # A newer worker owns the schedule (`fence_epoch` logged it): this tick wrote nothing, and this
+        # superseded worker stops (Ruling T24-a).
+        _stop_when_superseded(rt)()
+        return
     observe_tick(report)  # after the commit: a rolled-back tick inserted nothing
 
 
+# On the `tick` queue, as the tick and `retention_daily` (module docstring): it holds the tick back while it
+# runs.
 @blueprint.periodic(cron="*/10 * * * *")
 @blueprint.task(name="reconcile_heavy", queue="tick", pass_context=True)
 async def reconcile_heavy(context: JobContext, timestamp: int) -> None:
     # Imported here: `reconcilers` imports this module (`Deferrer`, `release_stalled_jobs`).
-    from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
+    from jobhunter.worker.reconcilers import run_reconcilers
 
     rt: WorkerRuntime = context.additional_context["runtime"]
-    await run_reconcilers(
-        ReconcileContext(
-            engine=rt.engine,
-            queue=rt.queue,
-            defer=defer_in_tx,
-            now=utcnow(),
-            epoch=rt.epoch,
-            embedder=rt.embedder,
-        ),
-        "heavy",
-    )
+    await run_reconcilers(_reconcile_context(rt), "heavy")
 
 
+# On the `tick` queue too (module docstring): the daily pass holds the tick back while it runs.
 @blueprint.periodic(cron="17 3 * * *")
 @blueprint.task(name="retention_daily", queue="tick", pass_context=True)
 async def retention_daily(context: JobContext, timestamp: int) -> None:
     # Imported here: `privacy.retention` and `reconcilers` import this module (`delete_finished_jobs`,
     # `Deferrer`, `release_stalled_jobs`).
     from jobhunter.privacy.retention import run_retention_daily
-    from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
+    from jobhunter.worker.reconcilers import run_reconcilers
 
     rt: WorkerRuntime = context.additional_context["runtime"]
+    failure: Exception | None = None
     try:
         await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow(), epoch=rt.epoch)
     except FencedOut:
         # A newer worker owns the work (final review C2; `retention_fenced` logged it): the fenced pass wrote
-        # nothing, and no daily reconciler runs for this superseded worker either.
+        # nothing, no daily reconciler runs for this superseded worker either, and it stops (Ruling T24-a).
+        _stop_when_superseded(rt)()
         return
+    except Exception as exc:
+        # The pass isolates its rules itself; whatever still escapes it must not cost the daily reconcilers
+        # their run (ledger L312). The class only, never the message; the job still fails after them.
+        log.error("retention_daily_failed", error_class=type(exc).__name__)
+        failure = exc
     # The daily maintenance (§17.4, e.g. `stale_sweep_daily`, §8.11), after the retention pass.
-    await run_reconcilers(
-        ReconcileContext(
-            engine=rt.engine,
-            queue=rt.queue,
-            defer=defer_in_tx,
-            now=utcnow(),
-            epoch=rt.epoch,
-            embedder=rt.embedder,
-        ),
-        "daily",
-    )
+    await run_reconcilers(_reconcile_context(rt), "daily")
+    if failure is not None:
+        raise failure
 
 
 # The blueprint can be added to one app only (adding it namespaces its tasks), so a process has one task app.

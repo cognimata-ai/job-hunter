@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from jobhunter.observability.metrics import REGISTRY
 from jobhunter.worker import reconcilers, tasks
 from jobhunter.worker import tick as tick_module
+from jobhunter.worker.runtime import ShutdownState
 from jobhunter.worker.tasks import defer_in_tx, live_job_exists
 from jobhunter.worker.tick import insert_active_collect, run_tick
 from procrastinate.job_context import JobContext
@@ -323,7 +324,9 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     monkeypatch.setattr(tasks, "release_stalled_jobs", release_in_task)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
     # the fields it reads; its epoch is the current one (the reconcilers and the tick are fenced by it)
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=current_epoch, embedder=None)
+    runtime = SimpleNamespace(
+        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState()
+    )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.tick(context, timestamp=0)
     assert released_by == ["reconciler"]  # the `stalled_jobs` reconciler releases; the body does not
@@ -355,7 +358,9 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     reconcilers.reconciler("probe", "daily")(probe)
     monkeypatch.setattr(retention, "run_retention_daily", retention_pass)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None)
+    runtime = SimpleNamespace(
+        engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None, shutdown=ShutdownState()
+    )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
     assert order == ["retention@3", "daily"]  # the pass is fenced by the runtime's epoch (final review C2)
@@ -383,10 +388,49 @@ async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconciler
     monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the probe
     reconcilers.reconciler("probe", "daily")(probe)
     monkeypatch.setattr(retention, "run_retention_daily", fenced_pass)
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None)
+    runtime = SimpleNamespace(
+        engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None, shutdown=ShutdownState()
+    )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)  # returns: the job ends quietly
     assert order == ["retention"]
+    assert runtime.shutdown.requested.is_set()  # the superseded worker stops itself (Ruling T24-a)
+
+
+async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:  # ledger L312: the daily cadence is isolated from the pass; the job still fails after it
+    from jobhunter.privacy import retention
+
+    from tests.support.logs import logged
+
+    order: list[str] = []
+
+    async def failing_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+        order.append("retention")
+        raise RuntimeError("a detail that must not be logged")
+
+    async def probe(ctx: reconcilers.ReconcileContext) -> int:
+        order.append("daily")
+        return 0
+
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the probe
+    reconcilers.reconciler("probe", "daily")(probe)
+    monkeypatch.setattr(retention, "run_retention_daily", failing_pass)
+    runtime = SimpleNamespace(
+        engine=engine,
+        queue=queue_app,
+        saver=object(),
+        epoch=current_epoch,
+        embedder=None,
+        shutdown=ShutdownState(),
+    )
+    context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
+    with pytest.raises(RuntimeError):
+        await tasks.retention_daily(context, timestamp=0)
+    assert order == ["retention", "daily"]
+    assert [e["error_class"] for e in logged(caplog, "retention_daily_failed")] == ["RuntimeError"]
+    assert "must not be logged" not in caplog.text and not runtime.shutdown.requested.is_set()
 
 
 async def test_the_reconcile_heavy_task_hands_the_runtimes_embedder_to_its_reconcilers(
@@ -403,7 +447,9 @@ async def test_the_reconcile_heavy_task_hands_the_runtimes_embedder_to_its_recon
     reconcilers.reconciler("probe", "heavy")(probe)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
     embedder = object()  # the runtime's client, whatever it is: handed on as is
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=3, embedder=embedder)
+    runtime = SimpleNamespace(
+        engine=engine, queue=queue_app, epoch=3, embedder=embedder, shutdown=ShutdownState()
+    )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.reconcile_heavy(context, timestamp=0)
     [ctx] = seen
@@ -425,7 +471,9 @@ async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
 ) -> None:
     await schedule(engine, interval=3600, cursor=A)
     monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=1, embedder=None)  # the fields it reads
+    runtime = SimpleNamespace(  # the fields it reads
+        engine=engine, queue=queue_app, epoch=1, embedder=None, shutdown=ShutdownState()
+    )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
 
     async def tick_task_at(now: datetime) -> None:
@@ -479,10 +527,19 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
     monkeypatch.setattr(tasks, "utcnow", lambda: A + timedelta(hours=3))  # two slots missed, one due
     async with engine.begin() as c:
         await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
-    stale = SimpleNamespace(engine=engine, queue=queue_app, epoch=current_epoch, embedder=None)
+    stale = SimpleNamespace(
+        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState()
+    )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": stale})), timestamp=0)
     assert await runs(engine) == [] and await stored_cursor(engine) == A
     assert [e["current_epoch"] for e in logged(caplog, "worker_epoch_fenced")] == [current_epoch + 1]
-    current = SimpleNamespace(engine=engine, queue=queue_app, epoch=current_epoch + 1, embedder=None)
+    # final wave F5 (F2 re-review, observation 2): the superseded worker requests its graceful stop, once
+    assert stale.shutdown.requested.is_set()
+    [stop] = logged(caplog, "shutdown_requested")
+    assert (stop["level"], stop["reason"]) == ("warning", "epoch_superseded")
+    current = SimpleNamespace(
+        engine=engine, queue=queue_app, epoch=current_epoch + 1, embedder=None, shutdown=ShutdownState()
+    )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": current})), timestamp=0)
     assert len(await runs(engine)) == 3 and await stored_cursor(engine) == A + timedelta(hours=3)
+    assert not current.shutdown.requested.is_set()

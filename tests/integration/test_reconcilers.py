@@ -171,8 +171,17 @@ async def test_a_superseded_worker_stops_the_cadence_and_never_writes_reconciler
     monkeypatch.setattr(r, "REGISTRY", {})
     r.reconciler("flaky", "tick")(flaky)
     r.reconciler("after", "tick")(after)
-    ctx = r.ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=1)
+    stops: list[str] = []
+    ctx = r.ReconcileContext(
+        engine=engine,
+        queue=queue_app,
+        defer=defer_in_tx,
+        now=utcnow(),
+        epoch=1,
+        on_superseded=lambda: stops.append("stop"),
+    )
     assert await r.run_reconcilers(ctx, "tick") == {"flaky": -1, "after": 1}  # the current epoch: recorded
+    assert stops == []
     async with engine.begin() as c:
         assert tuple((await c.execute(_FAILED_ALERT)).one()) == (1, True)
         await c.execute(_TAKEOVER)
@@ -183,6 +192,7 @@ async def test_a_superseded_worker_stops_the_cadence_and_never_writes_reconciler
     state["fenced"] = True
     assert await r.run_reconcilers(ctx, "tick") == {}  # fenced out itself: no failure, stop
     assert ran == ["flaky", "flaky", "flaky"]
+    assert stops == ["stop"] * 3  # each fenced cadence asks this superseded worker to stop (Ruling T24-a)
     async with engine.connect() as c:
         assert tuple((await c.execute(_FAILED_ALERT)).one()) == (1, True)  # never raised again or resolved
     assert [(e["cadence"], e["reconciler"]) for e in logged(caplog, "reconcilers_fenced")] == [

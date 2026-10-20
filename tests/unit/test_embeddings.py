@@ -288,3 +288,20 @@ def test_the_error_names_its_kind_and_code_only() -> None:
     assert str(EmbedderError("unavailable")) == "unavailable: unavailable"
     assert EmbedderError("checksum", code="health_503").code == "health_503"
     assert isinstance(EmbedderError("bad_response"), DomainError)
+
+
+def test_every_embed_outcome_is_exported_at_zero_before_the_first_batch() -> None:
+    """Ledger L364: `EMBED_SECONDS` has its series from the import, each at 0, in a fresh interpreter."""
+    import subprocess
+    import sys
+
+    code = (
+        "import json; from jobhunter import embeddings; "
+        "from jobhunter.observability.metrics import REGISTRY; "
+        "print(json.dumps({o: REGISTRY.get_sample_value('jobhunter_embed_seconds_count', {'outcome': o}) "
+        "for o in embeddings.EMBED_OUTCOMES}))"
+    )
+    done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr[-400:]
+    counts = json.loads(done.stdout)
+    assert counts == {"ok": 0.0, "unavailable": 0.0, "bad_response": 0.0, "checksum": 0.0, "error": 0.0}

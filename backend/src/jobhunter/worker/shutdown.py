@@ -1,7 +1,9 @@
 """The shutdown coordinator of the worker process (spec §3.3.5).
 
-`coordinate` waits until the process is asked to stop (`ShutdownState.requested`, set by the SIGTERM and
-SIGINT handlers) or one of the procrastinate worker loops ends by itself, whichever comes first. Then:
+`coordinate` waits until the process is asked to stop (`ShutdownState.requested`, set through
+`runtime.request_shutdown`: by the SIGTERM and SIGINT handlers, and by the worker itself once an epoch fence
+proved it superseded, reason `epoch_superseded`, ruling T24-a) or one of the procrastinate worker loops ends
+by itself, whichever comes first. Then:
 1. it stops admission (`admission_stopped`): graphs start no new dispatch from here on;
 2. it starts the stop's one deadline (`StopDeadline`, `STOP_BUDGET_S` from now, in
    `ShutdownState.stop_deadline`);

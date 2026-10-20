@@ -66,7 +66,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, get_args
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -103,6 +103,11 @@ ALERT_SUBJECT: Final = "embedder"
 
 EmbedderErrorKind = Literal["unavailable", "bad_response", "checksum"]
 InputKind = Literal["query", "passage"]
+# Every `outcome` of `EMBED_SECONDS`: `ok`, an `EmbedderError` kind, `error` (anything else). Each series is
+# created at import, so it is exported at 0 before the first batch (ledger L364).
+EMBED_OUTCOMES: Final = ("ok", *get_args(EmbedderErrorKind), "error")
+for _outcome in EMBED_OUTCOMES:
+    EMBED_SECONDS.labels(outcome=_outcome)
 
 log = get_logger("jobhunter.embeddings")
 
@@ -472,6 +477,10 @@ async def reconcile_awaiting_embedding(ctx: ReconcileContext) -> int:
             await fenced(conn)
             running = bool((await conn.execute(_RUN_RUNNING)).scalar_one())
         if running:
+            # The pass yields to a running run (Ruling T22-a), whatever its state: a run left `running` by a
+            # dead worker keeps every pass skipping (logged `run_running` each time) until `stale_runs` gives
+            # it a new attempt or ends it, once its heartbeat is 3 min stale (`failed('resume_exhausted')`
+            # after 3 resumes); its revisions wait meanwhile, and the next run's embed node takes them up.
             log.info("awaiting_embedding_skipped", reason="run_running")
             return 0
         health = await client.health()

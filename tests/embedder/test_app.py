@@ -34,7 +34,7 @@ from embedder.app import (
     RUNTIME_ENV,
     ChecksumMismatch,
     create_app,
-    disable_telemetry,
+    isolate_runtime,
     locked_onnx_file,
     verify_checksums,
 )
@@ -270,11 +270,12 @@ def test_main_exits_78_on_a_malformed_lock(
     assert "embedder.startup_check_failed" in caplog.text and "model.lock: missing model_id" in caplog.text
 
 
-def test_disable_telemetry_sets_every_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_isolate_runtime_sets_every_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Set (to the opposite) before the call, so monkeypatch records each variable as the process had it and
+    # restores that after the test, removing one that was not set: the switches never leak into pytest.
     for name in ("ORT_DISABLE_TELEMETRY", "HF_HUB_OFFLINE", "HF_HUB_DISABLE_TELEMETRY"):
-        monkeypatch.delenv(name, raising=False)  # restored after the test
-    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
-    disable_telemetry()
+        monkeypatch.setenv(name, "0")
+    isolate_runtime()
     assert RUNTIME_ENV == {
         "ORT_DISABLE_TELEMETRY": "1",
         "HF_HUB_OFFLINE": "1",
@@ -283,10 +284,19 @@ def test_disable_telemetry_sets_every_switch(monkeypatch: pytest.MonkeyPatch) ->
     assert {name: os.environ[name] for name in RUNTIME_ENV} == RUNTIME_ENV
 
 
+# The runtime image's ENV that is not a switch of RUNTIME_ENV.
+IMAGE_ENV_OTHERS = {"PATH", "PYTHONDONTWRITEBYTECODE"}
+
+
 def test_the_image_sets_the_same_switches() -> None:
+    """Both directions: every switch of RUNTIME_ENV is in the runtime image's ENV with its value, and the ENV
+    sets no switch that RUNTIME_ENV lacks (only `IMAGE_ENV_OTHERS` besides)."""
     runtime = (ROOT / "embedder" / "Dockerfile").read_text().split("AS runtime", 1)[1].replace("\\\n", " ")
-    env_words = " ".join(line for line in runtime.splitlines() if line.startswith("ENV ")).split()
-    assert all(f"{name}={value}" in env_words for name, value in RUNTIME_ENV.items())
+    env_words = " ".join(
+        line.removeprefix("ENV ") for line in runtime.splitlines() if line.startswith("ENV ")
+    )
+    image_env = dict(word.split("=", 1) for word in env_words.split())
+    assert {name: value for name, value in image_env.items() if name not in IMAGE_ENV_OTHERS} == RUNTIME_ENV
 
 
 _FAKE_CURL = """#!/bin/sh

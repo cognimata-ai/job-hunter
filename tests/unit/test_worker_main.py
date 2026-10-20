@@ -2,7 +2,7 @@ import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pytest
 from jobhunter.worker.main import exit_unless_lock_held
@@ -194,9 +194,11 @@ class World:
             world.deps.append(deps)
             return object()
 
-        async def fake_reconcilers(ctx: object, cadence: str) -> dict[str, int]:
+        async def fake_reconcilers(ctx: Any, cadence: str) -> dict[str, int]:
             events.append(f"reconcile_{cadence}")
             world.contexts.append(ctx)
+            if world.start_fenced and cadence == "start":  # as `run_reconcilers` does when a fence refuses
+                ctx.on_superseded()
             return {}
 
         # Task 24: step 7's HTTP layer and clients (real, on no network), step 8's instance sync (faked).
@@ -233,6 +235,7 @@ class World:
         self.synced: list[object] = []
         self.fenced: list[int] = []  # the epochs step 8's guard fenced
         self.superseded = False  # a newer worker took over before step 8
+        self.start_fenced = False  # a newer worker took over after step 8's sync, before its reconcilers
         monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
         monkeypatch.setattr(http, "configure", recording_configure)
 
@@ -361,6 +364,44 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
     failing = World(monkeypatch, tmp_path / "again")
     failing.superseded, failing.dispose_fails = True, True
     assert await worker_main(failing.cfg) == WATCHDOG_EXIT_CODE
+
+
+async def test_a_worker_superseded_during_its_start_cadence_stops_itself_and_exits_0(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Final wave F5 (F2 re-review, observation 2): a takeover that commits between the startup sync and the
+    start reconcilers fences their cadence. The cadence requests the graceful stop of a superseded worker
+    (Ruling T24-a), so no worker loop starts; the teardown runs and the exit is that path's 0."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.start_fenced = True
+    assert await worker_main(world.cfg) == 0
+    assert world.events[world.events.index("sync_instances") :] == [
+        "sync_instances",
+        "reconcile_start",
+        *TEARDOWN,
+    ]
+    assert world.runtimes == []  # no loop ran
+    [event] = logged(caplog, "shutdown_requested")
+    assert (event["level"], event["reason"]) == ("warning", "epoch_superseded")
+    assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [0]
+
+
+def test_a_signal_requests_the_stop_with_the_one_log_shape(log_events) -> None:
+    """Ledger L390: a SIGTERM goes through `runtime.request_shutdown`, logged `shutdown_requested` with the
+    signal's name as its `reason` (at `info`), once however often a signal arrives."""
+    import signal
+
+    from jobhunter.worker.main import _on_signal
+    from jobhunter.worker.runtime import ShutdownState
+
+    state = ShutdownState()
+    _on_signal(state, signal.SIGTERM)
+    _on_signal(state, signal.SIGINT)
+    assert state.requested.is_set()
+    [event] = [e for e in log_events() if e["event"] == "shutdown_requested"]
+    assert (event["level"], event["reason"]) == ("info", "SIGTERM") and "signal" not in event
 
 
 async def test_the_worker_shares_one_embedder_client_on_its_configured_url(monkeypatch, tmp_path) -> None:

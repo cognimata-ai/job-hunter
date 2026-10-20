@@ -24,8 +24,13 @@
    (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the metrics server. When the
    fence refuses the epoch, a newer worker took over during this start (final review C2): the sync wrote
    nothing, so this worker's stale view of the secrets cannot undo the newer worker's sync, and the start
-   ends there (`worker_superseded_at_start`, exit 70 after the teardown, Ruling FR-i) before any loop runs;
-9. SIGTERM and SIGINT handlers that request the shutdown;
+   ends there (`worker_superseded_at_start`, exit 70 after the teardown, Ruling FR-i) before any loop runs.
+   When the start reconcilers' cadence is fenced instead (a takeover that committed after the sync), the
+   cadence requests the graceful stop of a superseded worker (`runtime.request_shutdown`, reason
+   `epoch_superseded`, Ruling T24-a), and the start ends there too, before any loop runs, with that path's
+   exit 0;
+9. SIGTERM and SIGINT handlers that request the shutdown (`runtime.request_shutdown`, the signal's name as
+   the reason);
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
 12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app, the source
@@ -41,19 +46,22 @@ it never reads as a lost lock. When the watchdog thread is still alive after tha
 inside a heartbeat on the lock session), the session is not closed under it: `lock_session_left_open` is
 logged and the process exit drops the socket, and with it the lock.
 
-Exit codes: 0 after a requested shutdown; 1 when a worker loop ended by itself, when the takeover was blocked
-(`takeover_blocked`: a row lock outlived the claim's lock timeout, ruling T13-b) and when the start failed
-(`worker_failed`), so the container restart tries again. 70 (`lock.WATCHDOG_EXIT_CODE`) means superseded: the
-watchdog's exit, and a worker that a newer one took over during its start (`worker_superseded_at_start`,
-Ruling FR-i): the newer worker's claim needed the singleton lock, so this one had lost it, the watchdog's
-condition, and one code holds whichever of the two sees it first; the restart stands by while the newer
-worker is healthy. The startup assertions exit 78.
+Exit codes: 0 after a requested shutdown: a signal's, or the one a superseded worker requests of itself once a
+fence refused its epoch (a task body, the tick, a reconciler cadence, the start's cadence; Ruling T24-a); 1
+when a worker loop ended by itself, when the takeover was blocked (`takeover_blocked`: a row lock outlived the
+claim's lock timeout, ruling T13-b) and when the start failed (`worker_failed`), so the container restart
+tries again. 70 (`lock.WATCHDOG_EXIT_CODE`) means superseded: the watchdog's exit, and a worker whose startup
+sync a newer one fenced out (`worker_superseded_at_start`, Ruling FR-i): the newer worker's claim needed the
+singleton lock, so this one had lost it, the watchdog's condition, and one code holds whichever of the two
+sees it first; the restart stands by while the newer worker is healthy. The startup assertions exit 78.
 
 A loop that ends by itself can be the first sign that this process lost the singleton lock: a zombie (frozen
 while a replacement took over, §18.2 C17) finds its procrastinate workers pruned by the replacement, so its
 next fetch fails, possibly before its watchdog's next heartbeat. Before its teardown, such a process therefore
 runs the heartbeat once more, and when that proves it no longer holds the lock it exits 70 at once, as the
-watchdog would (`worker_lock_lost`).
+watchdog would (`worker_lock_lost`). A zombie whose first sign is a refused epoch fence instead requests its
+own graceful stop (`epoch_superseded`) and exits 0, unless its watchdog's 70 comes first: one of the two
+codes, whichever sees the takeover first.
 
 This module is a task boundary (ruff `BLE001` is allowed here). Each broad catch logs the error class only,
 never a message, and its outcome is the process exit (§17.1). Neither a shutdown nor a failure rewrites any
@@ -98,7 +106,7 @@ from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep, fence_
 from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.lock import WATCHDOG_EXIT_CODE, LockSession, acquire_lock
 from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
-from jobhunter.worker.runtime import ShutdownState, WorkerRuntime
+from jobhunter.worker.runtime import EPOCH_SUPERSEDED, ShutdownState, WorkerRuntime, request_shutdown
 from jobhunter.worker.shutdown import GRACE_S, StopDeadline, coordinate
 from jobhunter.worker.tasks import QUEUES, defer_in_tx, make_queue_app
 from jobhunter.worker.watchdog import Watchdog
@@ -164,10 +172,9 @@ def exit_unless_lock_held(
         exit(WATCHDOG_EXIT_CODE)
 
 
-def _request_shutdown(state: ShutdownState, sig: signal.Signals) -> None:
-    if not state.requested.is_set():
-        log.info("shutdown_requested", signal=sig.name)
-    state.requested.set()
+def _on_signal(state: ShutdownState, sig: signal.Signals) -> None:
+    """A SIGTERM or SIGINT asks for the graceful stop, as every request does (`runtime.request_shutdown`)."""
+    request_shutdown(state, reason=sig.name)
 
 
 class _WorkerProcess:
@@ -265,15 +272,25 @@ class _WorkerProcess:
             log.critical("worker_superseded_at_start", epoch=epoch, exit_code=WATCHDOG_EXIT_CODE)
             return WATCHDOG_EXIT_CODE
         start = ReconcileContext(
-            engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch, embedder=embedder
+            engine=engine,
+            queue=queue,
+            defer=defer_in_tx,
+            now=utcnow(),
+            epoch=epoch,
+            embedder=embedder,
+            on_superseded=lambda: request_shutdown(shutdown, reason=EPOCH_SUPERSEDED),
         )
         await run_reconcilers(start, "start")
+        if shutdown.requested.is_set():
+            # The start cadence was fenced (a newer worker took over after the sync): this worker stopped
+            # itself, as a fenced task body does (Ruling T24-a). No loop starts; the teardown follows, exit 0.
+            return 0
         if cfg.env != "test":
             start_metrics_server(METRICS_PORT)
         # 9. The signal handlers.
         loop = asyncio.get_running_loop()
         for sig in _SHUTDOWN_SIGNALS:
-            loop.add_signal_handler(sig, _request_shutdown, runtime.shutdown, sig)
+            loop.add_signal_handler(sig, _on_signal, runtime.shutdown, sig)
         # 10. One worker loop per queue.
         loops = [
             asyncio.create_task(
