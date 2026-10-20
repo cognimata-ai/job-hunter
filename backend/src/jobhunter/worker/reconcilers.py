@@ -19,8 +19,8 @@ Minor 1).
 
 This module is a task boundary (ruff `BLE001` is allowed here), and the catch persists an outcome (§17.1).
 
-`stalled_jobs` and the heavy `metrics_refresh` are registered here; the tasks that own the other repairs
-register theirs.
+`stalled_jobs` (fenced like the others) and the heavy `metrics_refresh` (it only reads) are registered here;
+the tasks that own the other repairs register theirs.
 """
 
 from collections.abc import Awaitable, Callable
@@ -162,8 +162,17 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
 
 @reconciler("stalled_jobs", "start", "tick")
 async def stalled_jobs(ctx: ReconcileContext) -> int:
-    """Release the jobs of dead workers: the one stalled-job path (spike V2), at start and on every tick."""
-    return await release_stalled_jobs(ctx.queue)
+    """Release the jobs of dead workers: the one stalled-job path (spike V2), at start and on every tick.
+
+    Fenced by `ctx.epoch` like `queued_runs`, `operations` and `stale_data` (Ruling FR-h; fix wave F7): the
+    fence is held in an open transaction while procrastinate lists and retries the jobs on its own pool, so
+    no takeover commits in between, and a superseded worker raises `FencedOut` having released nothing,
+    which stops its cadence. No job row is locked before it. The fence is held for one listing and a retry
+    per stalled job (a dead worker's few jobs), far below the takeover's lock timeout.
+    """
+    async with ctx.engine.begin() as fenced:
+        await fence_epoch(fenced, ctx.epoch)
+        return await release_stalled_jobs(ctx.queue)
 
 
 @reconciler("metrics_refresh", "heavy")

@@ -244,3 +244,51 @@ async def test_a_fence_of_another_owner_is_a_failure_and_never_stops_the_worker(
     assert not any(
         FencedOut(o).worker_superseded for o in ("run", "operation", "purge_fence", "quota_ledger")
     )
+
+
+async def test_a_superseded_workers_stalled_jobs_reconciler_releases_nothing(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:
+    """Fix wave F7 (Ruling FR-h): `stalled_jobs` is fenced by the worker epoch like the other maintenance
+    writes. After a takeover, the superseded worker's reconciler raises its own fence having retried no
+    stalled job, so its cadence stops there and it requests its stop; the current worker's releases the
+    job."""
+    from jobhunter.errors import FencedOut
+
+    from tests.support.logs import logged
+
+    async with engine.begin() as c:
+        # A dead worker's operation: `doing` without a worker row, so procrastinate lists it as stalled.
+        job = await defer_in_tx(c, "run_operation", operation_id=7)
+        await c.execute(sa.text("UPDATE procrastinate_jobs SET status = 'doing' WHERE id = :i"), {"i": job})
+        await c.execute(_TAKEOVER)
+    stops: list[str] = []
+    superseded = r.ReconcileContext(
+        engine=engine,
+        queue=queue_app,
+        defer=defer_in_tx,
+        now=utcnow(),
+        epoch=current_epoch,
+        on_superseded=lambda: stops.append("stop"),
+    )
+
+    async def status() -> str:
+        async with engine.connect() as c:
+            query = sa.text("SELECT status FROM procrastinate_jobs WHERE id = :i")
+            return str((await c.execute(query, {"i": job})).scalar_one())
+
+    with pytest.raises(FencedOut) as fenced:
+        await r.stalled_jobs(superseded)
+    assert fenced.value.worker_superseded and await status() == "doing"
+    assert logged(caplog, "stalled_job_released") == []
+    for cadence in ("start", "tick"):
+        assert await r.run_reconcilers(superseded, cadence) == {}  # stopped at `stalled_jobs`, first in both
+    assert stops == ["stop", "stop"] and await status() == "doing"
+    assert [(e["cadence"], e["reconciler"]) for e in logged(caplog, "reconcilers_fenced")] == [
+        ("start", "stalled_jobs"),
+        ("tick", "stalled_jobs"),
+    ]
+    current = r.ReconcileContext(
+        engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=current_epoch + 1
+    )
+    assert await r.stalled_jobs(current) == 1 and await status() == "todo"

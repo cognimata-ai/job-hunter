@@ -607,8 +607,11 @@ async def test_a_superseded_epochs_stale_runs_reconciler_takes_nothing(
     def ctx(epoch: int) -> ReconcileContext:
         return ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=epoch)
 
-    # A zombie of epoch e1 neither stamps its epoch on a new attempt nor ends B's.
-    assert await runs.reconcile_stale_runs(ctx(e1)) == 0
+    # A zombie of epoch e1 neither stamps its epoch on a new attempt nor ends B's: its own fence propagates
+    # (fix wave F7, Ruling FR-r), so `run_reconcilers` stops its cadence at this reconciler.
+    with pytest.raises(FencedOut) as fenced:
+        await runs.reconcile_stale_runs(ctx(e1))
+    assert fenced.value.worker_superseded
     assert await attempts(engine, rid) == [(1, e2, None)]
     async with engine.begin() as c:
         with pytest.raises(FencedOut):

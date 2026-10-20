@@ -544,22 +544,23 @@ async def reconcile_stale_runs(ctx: ReconcileContext) -> int:
     the attempt that was taken back (its registry token, ruling T12-d), so it releases the procrastinate
     `collect` lock before the replacement attempt's job can run. Rows locked by an in-flight heartbeat or
     owner write are skipped this time. The runs it ends (`resume_exhausted`) are observed after the commit.
-    Returns the number of runs taken back: 0 when `ctx.epoch` is no longer the current worker epoch, because a
-    superseded worker gives no run a new attempt (the current worker's reconciler does).
+    Returns the number of runs taken back. A superseded worker gives no run a new attempt (the current
+    worker's reconciler does): when `ctx.epoch` is no longer the current worker epoch it raises `FencedOut`,
+    having written nothing (`fence_epoch` logged it), so that `run_reconcilers` stops the cadence at this
+    reconciler and the worker requests its stop, recording no failure (Ruling FR-r; fix wave F7). The fence
+    is the only one it can meet: `begin_new_attempt` fences the same epoch, under the row this transaction
+    already holds, and its owner checks are `TransitionConflict`s.
     """
     ends: list[RunEnd] = []
-    try:
-        async with ctx.engine.begin() as conn:
-            # Before any run row is locked: the `worker_heartbeat` row comes first in the lock order.
-            await fence_epoch(conn, ctx.epoch)
-            stale = (await conn.execute(_STALE, {"cutoff": ctx.now - RUN_STALE})).all()
-            taken = [(int(row.id), int(row.attempt_no)) for row in stale]
-            for run_id, _ in taken:
-                await begin_new_attempt(
-                    conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer, ends=ends
-                )
-    except FencedOut:
-        return 0  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+    async with ctx.engine.begin() as conn:
+        # Before any run row is locked: the `worker_heartbeat` row comes first in the lock order.
+        await fence_epoch(conn, ctx.epoch)
+        stale = (await conn.execute(_STALE, {"cutoff": ctx.now - RUN_STALE})).all()
+        taken = [(int(row.id), int(row.attempt_no)) for row in stale]
+        for run_id, _ in taken:
+            await begin_new_attempt(
+                conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer, ends=ends
+            )
     observe_run_ends(ends)
     for run_id, superseded in taken:
         key: ExecKey = ("run", run_id)

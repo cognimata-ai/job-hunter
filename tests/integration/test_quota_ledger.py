@@ -11,11 +11,12 @@ from jobhunter.quota.fallback import eligible
 from jobhunter.quota.pacing import Admit, Deny, PlannedSpec, QuotaClass, capacity
 from jobhunter.quota.windows import AccountObservation, current_snapshot, current_window_locked
 from jobhunter.sources.base import Observation
-from jobhunter.worker import runs
+from jobhunter.worker import reconcilers, runs
 from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import ctx, planned_request, queued_run, request_sent
+from tests.support.logs import logged
 from tests.support.quota import SETTINGS, account, insert_window, jsearch_window
 
 pytestmark = pytest.mark.integration
@@ -199,11 +200,13 @@ async def test_superseded_owner_cannot_reserve_or_dispatch_and_is_released(
     assert await ledger.reconcile_ledger_unsettled(ctx(engine, queue_app)) == 0  # idempotent
 
 
-async def test_a_superseded_workers_ledger_reconciler_stops_quietly_and_writes_nothing(
-    engine, current_epoch, queue_app
+async def test_a_superseded_workers_ledger_reconciler_raises_its_fence_and_stops_the_cadence_there(
+    engine, current_epoch, queue_app, monkeypatch, caplog
 ) -> None:
-    """Final review C2 audit: `ledger_unsettled` under a superseded epoch ends like the other fenced
-    reconcilers, with the count so far (0) and no raise: `run_reconcilers` then records no failure for it."""
+    """Final review C2 audit, fix wave F7 (Ruling FR-r): `ledger_unsettled` under a superseded epoch writes
+    nothing and lets the worker's own fence propagate, so `run_reconcilers` stops the cadence at this
+    reconciler (its count is not reported, the reconcilers after it do not run, no `reconciler.failed`
+    resolve is attempted) and the superseded worker requests its stop."""
     owner = await queued_run(engine)
     fr = await planned_request(engine, owner, provider="jsearch", key=K, attempt_seq=1)
     async with engine.begin() as c:
@@ -227,8 +230,36 @@ async def test_a_superseded_workers_ledger_reconciler_stops_quietly_and_writes_n
     async with engine.begin() as c:
         await c.execute(sa.text("UPDATE quota_ledger SET created_at = created_at - interval '16 minutes'"))
         await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
-    assert await ledger.reconcile_ledger_unsettled(ctx(engine, queue_app, epoch=current_epoch)) == 0
+    superseded = ctx(engine, queue_app, epoch=current_epoch)
+    with pytest.raises(FencedOut) as fenced:
+        await ledger.reconcile_ledger_unsettled(superseded)
+    assert fenced.value.worker_superseded
     assert await one(engine, "SELECT state FROM quota_ledger WHERE id = :i", i=r.entry_id) == ("reserved",)
+
+    ran: list[str] = []
+
+    async def after(_: reconcilers.ReconcileContext) -> int:
+        ran.append("after")
+        return 1
+
+    async def resolve_attempted(*args: object, **kwargs: object) -> None:
+        ran.append("resolve")
+
+    stops: list[str] = []
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})
+    monkeypatch.setattr(reconcilers, "_resolve_failure", resolve_attempted)
+    reconcilers.reconciler("ledger_unsettled", "tick")(ledger.reconcile_ledger_unsettled)
+    reconcilers.reconciler("after", "tick")(after)
+    cadence = replace(superseded, on_superseded=lambda: stops.append("stop"))
+    assert await reconcilers.run_reconcilers(cadence, "tick") == {}  # no count: it stopped at the reconciler
+    assert ran == [] and stops == ["stop"]  # neither its resolve nor the next reconciler ran
+    assert [(e["cadence"], e["reconciler"]) for e in logged(caplog, "reconcilers_fenced")] == [
+        ("tick", "ledger_unsettled")
+    ]
+    assert logged(caplog, "reconciler_failed") == []
+    assert await one(engine, "SELECT state FROM quota_ledger WHERE id = :i", i=r.entry_id) == ("reserved",)
+    assert await scalar(engine, "SELECT count(*) FROM alerts WHERE code = 'reconciler.failed'") == 0
+    # the current epoch's reconciler releases it
     assert await ledger.reconcile_ledger_unsettled(ctx(engine, queue_app, epoch=current_epoch + 1)) == 1
 
 

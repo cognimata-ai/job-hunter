@@ -929,8 +929,11 @@ async def reconcile_ledger_unsettled(ctx: ReconcileContext) -> int:
     longer holds -> `not_billed('never_dispatched')` and their fetch request `skipped('superseded')`;
     `dispatched` entries unsettled for longer -> `ambiguous` and their fetch request `ambiguous`. One
     transaction per entry, fenced by the worker epoch first; the owner row is locked `FOR UPDATE` before the
-    window. Returns the count: a superseded worker stops at its first fenced transaction, which wrote nothing,
-    and returns the count so far (final review C2: no failure is recorded for it).
+    window. Returns the count. A superseded worker raises `FencedOut` at its first fenced transaction, which
+    wrote nothing (`fence_epoch` logged it), so that `run_reconcilers` stops the cadence at this reconciler
+    and the worker requests its stop, recording no failure (Ruling FR-r; fix wave F7). That fence is the only
+    one a pass can meet: `_recover` locks the run row itself and its recovery writes return `False` on a
+    conflict.
     """
     cutoff = ctx.now - RECOVERY_AFTER
     async with ctx.engine.connect() as conn:
@@ -938,12 +941,9 @@ async def reconcile_ledger_unsettled(ctx: ReconcileContext) -> int:
         ids = [int(row.id) for row in found]
     recovered = 0
     for entry_id in ids:
-        try:
-            async with ctx.engine.begin() as conn:
-                await fence_epoch(conn, ctx.epoch)
-                recovered += await _recover(conn, entry_id, cutoff=cutoff, now=ctx.now)
-        except FencedOut:
-            break  # `fence_epoch` logged it
+        async with ctx.engine.begin() as conn:
+            await fence_epoch(conn, ctx.epoch)
+            recovered += await _recover(conn, entry_id, cutoff=cutoff, now=ctx.now)
     return recovered
 
 
