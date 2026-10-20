@@ -27,7 +27,7 @@ that comes later is added afterwards with ALTER TABLE ... ADD FOREIGN KEY, as th
          transition_matrix from the code registry
 
 These are the ONLY differences from the spec text. Each one carries a SQL comment naming its owner (plan
-Deviations 1 and 2):
+Deviations 1, 2 and 30):
 
   1. Five columns keep their type, their CHECKs and their place in the CHECKs, but not their foreign key,
      because the referenced table is M3's. M3 adds each with ALTER TABLE ... ADD FOREIGN KEY, as the spec has it:
@@ -39,6 +39,12 @@ Deviations 1 and 2):
      Until then nothing in M2 writes any of them (M2's calls are extraction, proposals and schema dry runs).
   2. profile_drafts.confirm_response jsonb, with CHECK (confirm_response IS NULL OR status = 'confirmed'): the
      stored body of a confirm, which a repeated confirm returns even under a new Idempotency-Key (§12.6).
+  3. Two llm_spend_ledger CHECKs refuse a NULL evidence (plan Deviation 30). The spec text passes it, because a
+     CHECK that evaluates to NULL is satisfied: a not_billed row with settled_usd = 0 and no evidence, and a billed
+     row above its reservation with no evidence (a silent bound violation), would both be stored. The first
+     gains `evidence IS NOT NULL` before the list of seven values; the second reads
+     `evidence IS NOT DISTINCT FROM 'reservation_bound_violated'` for `evidence = 'reservation_bound_violated'`.
+     Every other part of both CHECKs is verbatim.
 
 active_config.rubric_version_id and prompt_schema_version_id stay nullable here: the migration that seeds the
 rubric and the prompt schema restores NOT NULL (M0 Deviation 1).
@@ -228,10 +234,10 @@ CREATE TABLE llm_spend_ledger (                      -- retained indefinitely; h
   settled_at         timestamptz,
   CHECK ((kind = 'request') = (state IS NOT NULL)),
   CHECK (state NOT IN ('billed','not_billed') OR settled_usd IS NOT NULL),
-  CHECK (state <> 'not_billed' OR (settled_usd = 0 AND evidence IN ('error_response_no_content',
+  CHECK (state <> 'not_billed' OR (settled_usd = 0 AND evidence IS NOT NULL AND evidence IN ('error_response_no_content',   -- plan Deviation 30 (NULL evidence refused)
            'connect_failed_before_send','never_dispatched','batch_submit_rejected','batch_item_errored',
            'batch_item_canceled','batch_item_expired'))),
-  CHECK (state <> 'billed' OR settled_usd <= reserved_usd OR evidence = 'reservation_bound_violated'),
+  CHECK (state <> 'billed' OR settled_usd <= reserved_usd OR evidence IS NOT DISTINCT FROM 'reservation_bound_violated'),   -- plan Deviation 30 (NULL evidence refused)
   CHECK (purpose_class = 'scoring' OR bulk_operation_id IS NULL),
   CHECK (NOT eval_run OR purpose_class = 'nonscoring'),
   CHECK (purpose IN ('generate','revise','critic') OR purpose_class = 'nonscoring')

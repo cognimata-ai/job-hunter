@@ -164,13 +164,26 @@ BUDGET_ROW = (
     [
         {"state": "not_billed", "settled": 0, "evidence": "never_dispatched"},
         {"state": "not_billed", "settled": 0, "evidence": "batch_item_expired"},
+        # the usual billed row needs no evidence (Deviation 30 refuses only a NULL on a bound violation)
+        {"state": "billed", "settled": Decimal("0.4")},
+        {"state": "billed", "settled": 1},
+        {"state": "ambiguous"},
         # a billed row above its reservation is allowed only with the violation's own evidence
         {"state": "billed", "settled": 2, "evidence": "reservation_bound_violated"},
         # Deviation 1: bulk_operation_id has no foreign key until M3 creates bulk_operations
         {"purpose": "generate", "cls": "scoring", "bulk": 7},
         {"kind": "adjustment", "state": None},
     ],
-    ids=["not_billed", "batch_expired", "bound_violated", "bulk_without_fk", "adjustment"],
+    ids=[
+        "not_billed",
+        "batch_expired",
+        "billed_within_reservation",
+        "billed_at_reservation",
+        "ambiguous",
+        "bound_violated",
+        "bulk_without_fk",
+        "adjustment",
+    ],
 )
 async def test_ledger_rows_the_spec_allows(engine, overrides) -> None:
     async with engine.connect() as c:
@@ -182,6 +195,15 @@ async def test_ledger_rows_the_spec_allows(engine, overrides) -> None:
     ("overrides", "fragments"),
     [
         ({"state": "not_billed", "settled": 0, "evidence": "whatever"}, ("never_dispatched",)),
+        # Deviation 30: a NULL evidence is refused where the spec CHECK would pass it (NULL is not false)
+        (
+            {"state": "not_billed", "settled": 0, "evidence": None},
+            ("never_dispatched", "evidence IS NOT NULL"),
+        ),
+        (
+            {"state": "billed", "settled": 2, "evidence": None},
+            ("settled_usd <= reserved_usd", "reservation_bound_violated"),
+        ),
         (
             {"state": "not_billed", "settled": Decimal("0.5"), "evidence": "never_dispatched"},
             ("settled_usd", "never_dispatched"),
@@ -200,6 +222,8 @@ async def test_ledger_rows_the_spec_allows(engine, overrides) -> None:
     ],
     ids=[
         "unlisted_evidence",
+        "not_billed_without_evidence",
+        "billed_over_reservation_without_evidence",
         "charged_not_billed",
         "billed_without_settlement",
         "billed_over_reservation",
