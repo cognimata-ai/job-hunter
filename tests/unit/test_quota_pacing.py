@@ -206,3 +206,23 @@ def test_capacity_is_bounded_by_the_window_limit() -> None:
     assert short.capacity == 200 and short.tokens <= 200
     assert capacity(replace(w, limit_units=0, reserve_units=0), 21600) == Decimal(1)
     assert capacity(w, 21600) == Decimal("2.9067")  # an ordinary window is unchanged
+
+
+def test_minute_accruals_over_ten_days_credit_what_one_accrual_would() -> None:
+    """Fix wave F4 (ledger L92): a 4th-decimal floor at every 1-minute accrual used to lose its remainder
+    (about 1 % of the credit over 10 days); `tokens_at` now advances only by the credited time, so 14,400
+    accruals over 10 days credit what a single accrual over the 10 days does, to the last 4th decimal, and
+    never more."""
+    w = boot(interval_s=30 * 86400)  # a capacity of the whole limit: the bucket never caps the credit
+    w.state, w.tokens, w.tokens_at = "validated", Decimal(0), w.window_start
+    single = replace(w)
+    end = w.window_start + timedelta(days=10)
+    accrue(single, end, interval_s=30 * 86400)
+    for minute in range(1, 10 * 24 * 60 + 1):
+        accrue(w, w.window_start + timedelta(minutes=minute), interval_s=30 * 86400)
+    assert single.tokens > 50 and w.capacity == single.capacity == Decimal(w.limit_units)
+    assert single.tokens - Decimal("0.0001") <= w.tokens <= single.tokens
+    assert w.window_start <= w.tokens_at <= end  # the uncredited remainder waits for the next accrual
+    accrue(w, end + timedelta(minutes=1), interval_s=30 * 86400)
+    accrue(single, end + timedelta(minutes=1), interval_s=30 * 86400)
+    assert single.tokens - Decimal("0.0001") <= w.tokens <= single.tokens

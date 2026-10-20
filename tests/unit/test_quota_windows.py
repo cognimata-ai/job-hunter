@@ -12,6 +12,7 @@ from jobhunter.quota.windows import (
     ObservationEffects,
     Window,
     WindowChange,
+    WindowState,
     apply_observation_pure,
     bootstrap_window,
     limit_for,
@@ -231,6 +232,9 @@ def test_observation_steps_in_order() -> None:
         w3, Observation(observed_at=T0, status=200, remaining=0), SETTINGS, provider="jsearch", used_units=1
     )
     assert stale == w3 and stale_changes == [] and stale_fx.adjustment_units == 0  # step 0: a late response
+    assert stale is not w3  # a copy even then (fix wave F4, ledger L92): changing it leaves `w3` alone
+    stale.tokens = Decimal(0)
+    assert w3.tokens != Decimal(0)
     reset = Observation(
         observed_at=T0 + timedelta(days=31),
         status=200,
@@ -477,3 +481,75 @@ def test_a_bootstrap_from_a_lagging_account_read_validates_only_the_month_it_des
     )
     assert (fx, rc_changes) == (ObservationEffects(0, (), False), [])
     assert serpapi_decision(w, IN_THE_GAP, used=0) == Deny("window_cap")
+
+
+# ---- fix wave F4 (ledger L175): SerpApi's step 4 and the step-1 exhausted guard, pure ----------------------
+
+
+def serpapi_window(state: WindowState = "validated") -> Window:
+    """A SerpApi month `[Oct 8, Nov 8)` bootstrapped from a read with 200 of 250 searches left."""
+    renewal = datetime(2026, 11, 8, tzinfo=UTC)
+    read = AccountObservation(
+        observed_at=T0,
+        plan_renewal_date=renewal,
+        searches_per_month=250,
+        plan_searches_left=200,
+        this_hour_searches=0,
+        account_rate_limit_per_hour=250,
+    )
+    w = boot("serpapi", account=read)
+    w.last_observed_at = T0
+    return replace(w, state=state)
+
+
+def test_a_serpapi_observation_of_nothing_left_exhausts_the_month_until_its_renewal() -> None:
+    """Step 4 for SerpApi (T12-a): an account read with `plan_searches_left = 0`, or a search answered "out of
+    searches" (reported as `remaining = 0`, no reset), exhausts the window; any other `remaining` does not."""
+    w = serpapi_window()
+    later = T0 + timedelta(hours=1)
+    out = Observation(observed_at=later, status=200, remaining=0)  # the search's own report: no reset time
+    exhausted, changes, fx = apply_observation_pure(w, out, SETTINGS, provider="serpapi", used_units=50)
+    assert (exhausted.state, exhausted.window_end, changes) == ("exhausted_until_reset", w.window_end, [])
+    assert fx.adjustment_units == 200 and fx.alerts == ("quota.unaccounted_usage",)  # tighten-only
+    read = Observation(
+        observed_at=later,
+        status=200,
+        reset_at=w.window_end,
+        limit=250,
+        remaining=0,
+        this_hour=3,
+        hourly_cap=250,
+    )
+    assert apply_observation_pure(w, read, SETTINGS, provider="serpapi", used_units=250)[0].state == (
+        "exhausted_until_reset"
+    )
+    left = replace(out, remaining=1)
+    assert (
+        apply_observation_pure(w, left, SETTINGS, provider="serpapi", used_units=50)[0].state == "validated"
+    )
+    # JSearch is exhausted by a 429 only, never by a 2xx reporting 0 left
+    js = replace(boot("jsearch"), state="validated")
+    zero = Observation(observed_at=later, status=200, remaining=0)
+    assert (
+        apply_observation_pure(js, zero, SETTINGS, provider="jsearch", used_units=0)[0].state == "validated"
+    )
+
+
+def test_an_exhausted_serpapi_month_stays_exhausted_when_a_read_refines_it() -> None:
+    """The step-1 guard: a refining read (its renewal within half a period of the window's end) moves an
+    exhausted SerpApi window's end only, never back to `validated` (SerpApi is never probed: only the renewal
+    or the rollover ends the exhaustion), while it validates a JSearch window, exhausted or not."""
+    w = serpapi_window("exhausted_until_reset")
+    later = T0 + timedelta(hours=2)
+    renewal = w.window_end + timedelta(days=1)
+    read = Observation(observed_at=later, status=200, reset_at=renewal, limit=250, remaining=40)
+    kept, changes, _ = apply_observation_pure(w, read, SETTINGS, provider="serpapi", used_units=210)
+    assert (kept.state, kept.window_end, changes) == ("exhausted_until_reset", renewal, [])
+    validated = apply_observation_pure(serpapi_window(), read, SETTINGS, provider="serpapi", used_units=210)[
+        0
+    ]
+    assert (validated.state, validated.window_end) == ("validated", renewal)
+    js = replace(boot("jsearch"), state="exhausted_until_reset")
+    js_read = replace(read, reset_at=js.window_end + timedelta(hours=1))
+    refined = apply_observation_pure(js, js_read, SETTINGS, provider="jsearch", used_units=0)[0]
+    assert refined.state == "validated"

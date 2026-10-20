@@ -294,7 +294,8 @@ def apply_observation_pure(
     reset already, that entry is re-attributed to the new window and is its only usage (JSearch runs at
     concurrency 1), so step 3 measures the new window against it.
 
-    0. A response observed no later than `w.last_observed_at` is late: nothing changes.
+    0. A response observed no later than `w.last_observed_at` is late: nothing changes (the window returned
+       is still a copy: `w` is never the caller's result to modify).
        A reset time no later than `w.window_start` describes the previous window (Ruling T7-a): SerpApi's
        renewal date is a date, so the local window rolls over at 00:00 UTC hours before SerpApi renews, and
        until then its reads report the old renewal and the old month's remaining. Only `last_observed_at` and
@@ -314,7 +315,7 @@ def apply_observation_pure(
        searches", which the acquisition reports as `remaining = 0`).
     """
     if w.last_observed_at is not None and obs.observed_at <= w.last_observed_at:
-        return w, [], ObservationEffects(0, (), False)
+        return replace(w), [], ObservationEffects(0, (), False)  # a copy, as on every other path
     cur = replace(w, last_observed_at=obs.observed_at)
     if obs.reset_at is not None and obs.reset_at <= cur.window_start:
         # The previous window's figures (Ruling T7-a), e.g. a SerpApi read before the plan has renewed.

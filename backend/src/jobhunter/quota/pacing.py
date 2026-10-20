@@ -73,12 +73,25 @@ def accrue(w: Window, now: datetime, *, interval_s: int) -> None:
 
     `Δt` never runs backwards: a `now` before `tokens_at` (a transaction that started before the last save)
     adds nothing and leaves `tokens_at` where it is, so no stretch of time is credited twice.
+
+    The tokens round down to the column scale, and `tokens_at` advances only by the time the credited tokens
+    took to accrue (rounded up to the microsecond), so the fraction rounded away is credited by the next
+    accrual instead of being lost: frequent accruals (one a minute) earn what one accrual over the same span
+    would, never more (fix wave F4, ledger L92; the bucket used to lose about 1 % over 10 days of 1-minute
+    accruals). A full bucket stops the clock at `now`: no credit is saved up beyond the capacity.
     """
     w.capacity = capacity(w, interval_s)
+    units, length_us = _units(w), _length_us(w)
     elapsed_us = max(0, (now - w.tokens_at) // _MICROSECOND)
-    accrued = Decimal(_units(w) * elapsed_us) / Decimal(_length_us(w))
-    w.tokens = min(w.capacity, (w.tokens + accrued).quantize(_SCALE, rounding=ROUND_FLOOR))
-    w.tokens_at = max(w.tokens_at, now)
+    exact = w.tokens + Decimal(units * elapsed_us) / Decimal(length_us)
+    credited = exact.quantize(_SCALE, rounding=ROUND_FLOOR)
+    if credited >= w.capacity or units <= 0:
+        w.tokens = min(w.capacity, credited)
+        w.tokens_at = max(w.tokens_at, now)
+        return
+    spent_us = max(0, ceil((credited - w.tokens) * length_us / units))
+    w.tokens = credited
+    w.tokens_at += timedelta(microseconds=min(spent_us, elapsed_us))
 
 
 def effective_reserve(w: Window, now: datetime) -> int:

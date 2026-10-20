@@ -1038,15 +1038,19 @@ async def test_the_per_run_bound_holds_across_attempts_and_a_denial_persists_its
             c, owner.run_id, epoch=1, end_reason="heartbeat_stale", defer=defer_in_tx
         )
     second = runs.RunOwner(owner.run_id, 2)
-    paced_at = now + timedelta(seconds=1)
+    paced_at = now + timedelta(hours=1)
     assert await attempt(second, 3, "normal", paced_at) == ledger.Denial("paced")  # across the run's attempts
     async with engine.connect() as c:
         assert await ledger.normal_count_for_run(c, "jsearch", owner.run_id) == 2
         assert await ledger.latest_attempt(c, "jsearch", key(3)) is None  # a denial writes no ledger row
-    assert await one(
-        engine, "SELECT tokens_at FROM quota_windows WHERE provider = 'jsearch' AND is_current"
-    ) == (paced_at,)
-    retry = await attempt(second, 4, "retry", now + timedelta(seconds=2))
+    tokens, tokens_at = await one(
+        engine, "SELECT tokens, tokens_at FROM quota_windows WHERE provider = 'jsearch' AND is_current"
+    )
+    assert isinstance(tokens_at, datetime)
+    # the denial saved its accrual: an hour's 0.2422 credited, the clock at the credited time (the 0.33 s
+    # worth of the rounded-away fraction is credited by the next accrual, fix wave F4, ledger L92)
+    assert tokens == Decimal("48.2422") and paced_at - timedelta(seconds=1) < tokens_at < paced_at
+    retry = await attempt(second, 4, "retry", paced_at + timedelta(seconds=1))
     assert (
         isinstance(retry, ledger.Reservation) and retry.request_class == "retry"
     )  # retries bypass the bound
@@ -1227,3 +1231,204 @@ async def test_a_reservation_sets_the_quota_gauges(engine, current_epoch) -> Non
     assert REGISTRY.get_sample_value("jobhunter_quota_remaining_units", labels) == 2249
     tokens = await scalar(engine, "SELECT tokens FROM quota_windows WHERE provider = 'adzuna'")
     assert tokens == Decimal("32.7500") and r.window_start == now
+
+
+# ---- fix wave F4 -------------------------------------------------------------------------------------------
+
+US = timedelta(microseconds=1)
+
+PROBE_COLUMNS = f"SELECT state, probe_used, probe_failed, next_probe_at {JSEARCH_WINDOW}"
+VALIDATED_MEANWHILE = sa.text(
+    "UPDATE quota_windows SET state = 'validated', probe_used = false, probe_failed = false, "
+    "next_probe_at = NULL WHERE provider = 'jsearch' AND is_current"
+)
+
+
+async def settle_one(c, entry_id: int, **values: object) -> None:
+    arguments: dict[str, object] = {
+        "state": "billed",
+        "evidence": None,
+        "http_status": 200,
+        "provider_remaining": None,
+        "observation": None,
+        "settings": SETTINGS,
+        "interval_s": SIX_H,
+        "now": utcnow(),
+        **values,
+    }
+    await ledger.settle(c, entry_id, **arguments)  # type: ignore[arg-type]
+
+
+async def reserved_probe(engine, owner, now) -> ledger.Reservation:
+    """The first reservation of a fresh JSearch window: its probe."""
+    fr = await planned_request(engine, owner, provider="jsearch", key=K, attempt_seq=1)
+    async with engine.begin() as c:
+        r = reservation(
+            await ledger.reserve(
+                c,
+                "jsearch",
+                owner=owner,
+                request_key=K,
+                attempt_seq=1,
+                request_class="normal",
+                fetch_request_id=fr,
+                settings=SETTINGS,
+                interval_s=SIX_H,
+                now=now,
+            )
+        )
+    assert r.request_class == "probe"
+    return r
+
+
+@pytest.mark.parametrize("dispatched", [True, False])
+async def test_recovering_a_probe_of_a_window_validated_meanwhile_leaves_its_probe_columns_alone(
+    engine, current_epoch, dispatched: bool
+) -> None:
+    """Ledger L109: a validated window awaits no probe, so neither recovery write (`mark_ambiguous` of a
+    dispatched probe, `release_never_dispatched` of a reserved one) stamps its probe columns: a stale
+    `next_probe_at` would otherwise admit an early re-probe after a later 429."""
+    owner, now = await queued_run(engine), utcnow()
+    r = await reserved_probe(engine, owner, now)
+    async with engine.begin() as c:
+        if dispatched:
+            await ledger.mark_dispatched(c, r.entry_id, owner)
+        await c.execute(VALIDATED_MEANWHILE)  # say, by the late response of an earlier entry
+    async with engine.begin() as c:
+        if dispatched:
+            assert await ledger.mark_ambiguous(c, r.entry_id, now=now)
+        else:
+            assert await ledger.release_never_dispatched(c, r.entry_id, now=now)
+    assert await one(engine, PROBE_COLUMNS) == ("validated", False, False, None)
+    expected = "ambiguous" if dispatched else "not_billed"
+    assert await one(engine, "SELECT state FROM quota_ledger WHERE id = :i", i=r.entry_id) == (expected,)
+
+
+async def dispatched_entry(engine, owner, provider: str, n: int, now: datetime, **reserve: object) -> int:
+    """A reserved and dispatched attempt of `provider` (key `n`) at `now`."""
+    fr = await planned_request(engine, owner, provider=provider, key=key(n), attempt_seq=1)
+    async with engine.begin() as c:
+        r = reservation(
+            await ledger.reserve(
+                c,
+                provider,  # type: ignore[arg-type]
+                owner=owner,
+                request_key=key(n),
+                attempt_seq=1,
+                request_class="retry",
+                fetch_request_id=fr,
+                settings=SETTINGS,
+                interval_s=SIX_H,
+                now=now,
+                **reserve,  # type: ignore[arg-type]
+            )
+        )
+        await ledger.mark_dispatched(c, r.entry_id, owner)
+    return r.entry_id
+
+
+@pytest.mark.parametrize("provider", ["serpapi", "adzuna"])
+async def test_a_gateway_404_is_no_refund_evidence_outside_jsearch(engine, current_epoch, provider) -> None:
+    """Ledger L105: only JSearch sits behind the RapidAPI gateway; for SerpApi or Adzuna the evidence is
+    refused before anything is written, and the entry stays dispatched (counted)."""
+    owner, now = await queued_run(engine), utcnow()
+    extra = {"account": account(now, now + timedelta(days=20))} if provider == "serpapi" else {}
+    entry = await dispatched_entry(engine, owner, provider, 1, now, **extra)
+    async with engine.begin() as c:
+        with pytest.raises(ValueError, match="rapidapi_gateway_404"):
+            await settle_one(c, entry, state="not_billed", evidence="rapidapi_gateway_404", http_status=404)
+    assert await one(engine, "SELECT state FROM quota_ledger WHERE id = :i", i=entry) == ("dispatched",)
+
+
+async def test_a_jsearch_gateway_404_measures_the_window_without_its_own_entry(engine, current_epoch) -> None:
+    """The observation of a `not_billed` settlement is measured against the window's usage without the entry
+    (computed before its transition, which now comes after the window's changes): 2 billed, and a gateway
+    404 reporting 3 used is 1 unaccounted unit."""
+    owner, now = await queued_run(engine), utcnow()
+    await insert_window(engine, jsearch_window(now, limit=200, reserve=20, tokens=5, interval_s=SIX_H))
+    for n in (1, 2):
+        async with engine.begin() as c:
+            await settle_one(c, await dispatched_entry(engine, owner, "jsearch", n, now), now=now)
+    gateway = await dispatched_entry(engine, owner, "jsearch", 3, now)
+    async with engine.begin() as c:
+        await settle_one(
+            c,
+            gateway,
+            state="not_billed",
+            evidence="rapidapi_gateway_404",
+            http_status=404,
+            observation=Observation(now, 404, limit=200, remaining=197),
+            now=now,
+        )
+    assert await one(engine, "SELECT state, evidence FROM quota_ledger WHERE id = :i", i=gateway) == (
+        "not_billed",
+        "rapidapi_gateway_404",
+    )
+    assert (
+        await scalar(engine, "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE kind = 'adjustment'")
+        == 1
+    )
+
+
+async def test_an_out_of_searches_answer_settled_after_the_rollover_leaves_the_new_month_open(
+    engine, current_epoch
+) -> None:
+    """Ledger L175: a SerpApi search reserved in October whose "out of searches" answer settles after the
+    local rollover to November describes October; the new month is neither exhausted nor charged the rest of
+    its limit."""
+    await october_window(engine)
+    owner = await queued_run(engine)
+    before = RENEWAL - timedelta(seconds=30)
+    entry = await dispatched_entry(
+        engine, owner, "serpapi", 1, before, account=account(before, RENEWAL, left=1)
+    )
+    after = RENEWAL + timedelta(seconds=30)
+    async with engine.begin() as c:
+        await settle_one(
+            c, entry, provider_remaining=0, observation=Observation(after, 200, remaining=0), now=after
+        )
+        current = await current_snapshot(c, "serpapi")
+    assert current is not None and current.window_start == RENEWAL
+    assert current.state == "extrapolated_unvalidated"  # not exhausted_until_reset
+    november = "SELECT count(*) FROM quota_ledger WHERE kind = 'adjustment' AND window_start = :ws"
+    assert await scalar(engine, november, ws=RENEWAL) == 0  # nor charged the rest of its limit
+    assert await one(engine, "SELECT state, window_start FROM quota_ledger WHERE id = :i", i=entry) == (
+        "billed",
+        datetime(2026, 10, 8, tzinfo=UTC),
+    )
+    # the same answer within the month it describes exhausts that month (T12-a)
+    second = await dispatched_entry(engine, owner, "serpapi", 2, after, account=account(after, NEXT, left=5))
+    answered = after + timedelta(seconds=1)
+    async with engine.begin() as c:
+        await settle_one(
+            c, second, provider_remaining=0, observation=Observation(answered, 200, remaining=0), now=answered
+        )
+        november_window = await current_snapshot(c, "serpapi")
+    assert november_window is not None and november_window.state == "exhausted_until_reset"
+
+
+ADZUNA_ATTEMPT = sa.text(
+    "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, units, "
+    "state, per_run_cap, created_at, dispatched_at, settled_at) VALUES ('adzuna', :ws, 'request', 'normal', "
+    ":key, 1, 1, 'billed', 10, :at, :at, :at)"
+)
+
+
+@pytest.mark.parametrize("span", ledger.ADZUNA_SPANS)
+async def test_each_adzuna_rolling_window_ends_exactly_at_its_span(engine, current_epoch, span) -> None:
+    """Ledger L105: each rolling count is `created_at > now - span`: an attempt exactly `span` old has left
+    the window, one a microsecond younger is in it (with that window's cap 1, the others 100)."""
+    now = utcnow()
+    caps = {f"adzuna_cap_{name}": 100 for name in ("minute", "day", "week", "month")}
+    caps[f"adzuna_cap_{('minute', 'day', 'week', 'month')[ledger.ADZUNA_SPANS.index(span)]}"] = 1
+    tight = replace(SETTINGS, **caps)
+    async with engine.begin() as c:
+        w = await current_window_locked(c, "adzuna", now - timedelta(days=31), SETTINGS, interval_s=SIX_H)
+        assert w is not None
+        await c.execute(ADZUNA_ATTEMPT, {"ws": w.window_start, "key": key(1), "at": now - span})
+    async with engine.connect() as c:
+        assert await ledger.adzuna_windows_ok(c, now, 1, tight)  # exactly `span` old: out of the window
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE quota_ledger SET created_at = :at"), {"at": now - span + US})
+    async with engine.connect() as c:
+        assert not await ledger.adzuna_windows_ok(c, now, 1, tight)  # a microsecond younger: in it

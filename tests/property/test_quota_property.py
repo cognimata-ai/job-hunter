@@ -247,9 +247,8 @@ class QuotaMachine(RuleBasedStateMachine):
         self.current = self.windows[w.window_start] = w
         if w.state == "validated":
             self.reprobe_due.pop(w.window_start, None)
-        elif (
-            probe
-        ):  # §6.3: a probe that ended without validating is failed (next one 12 h later), or never sent
+        elif probe:
+            # §6.3: a probe that ended without validating is failed (next one 12 h later), or never sent
             never_sent = state == "not_billed" and status is None
             self.reprobe_due[w.window_start] = self.now if never_sent else self.now + PROBE_RETRY
         source = e.window_start
@@ -284,9 +283,8 @@ class QuotaMachine(RuleBasedStateMachine):
         self, e: Entry, outcome: Settlement, late: bool, charged: bool
     ) -> tuple[Settled, int | None, Observation | None]:
         at = self.last_observed if late and self.last_observed is not None else self.now
-        if (
-            self.provider == "adzuna"
-        ):  # every dispatched request is a hit, except a connect error before sending
+        if self.provider == "adzuna":
+            # every dispatched request is a hit, except a connect error before sending
             return ("not_billed", None, None) if outcome == "connect" else ("billed", 200, None)
         if outcome == "ok":
             self.p_used += 1
@@ -301,9 +299,8 @@ class QuotaMachine(RuleBasedStateMachine):
         if outcome == "lost":
             self.p_used += charged
             return "ambiguous", None, None
-        if (
-            outcome == "rate_limited_bare"
-        ):  # a 429 without the quota headers: `remaining` absent (§6.3 step 4)
+        if outcome == "rate_limited_bare":
+            # a 429 without the quota headers: `remaining` absent (§6.3 step 4)
             return "ambiguous", 429, Observation(observed_at=at, status=429)
         if outcome == "rate_limited":
             return "ambiguous", 429, self._observation(at, 429)
@@ -400,22 +397,22 @@ class QuotaMachine(RuleBasedStateMachine):
         self._advance(RECOVERY + timedelta(minutes=1))
         for e in self.entries:
             w = self.windows[e.window_start]
+            # `ledger.release_never_dispatched` and `mark_ambiguous`: a validated window awaits no probe, so
+            # neither records a probe outcome on it (fix wave F4, ledger L109)
             if e.state == "reserved" and self.now - e.created_at > RECOVERY:
                 e.state = "not_billed"
-                if e.request_class == "probe":
+                if e.request_class == "probe" and w.state != "validated":
                     note_probe_outcome(w, "never_sent", now=self.now)
-                    if w.state != "validated":  # a validated window awaits no probe
-                        self.reprobe_due[e.window_start] = self.now
+                    self.reprobe_due[e.window_start] = self.now
             elif (
                 e.state == "dispatched"
                 and e.dispatched_at is not None
                 and self.now - e.dispatched_at > RECOVERY
             ):
                 e.state = "ambiguous"
-                if e.request_class == "probe":
+                if e.request_class == "probe" and w.state != "validated":
                     note_probe_outcome(w, "failed", now=self.now)
-                    if w.state != "validated":
-                        self.reprobe_due[e.window_start] = self.now + PROBE_RETRY
+                    self.reprobe_due[e.window_start] = self.now + PROBE_RETRY
 
     # -- invariants ----------------------------------------------------------------------------------------
     @invariant()
@@ -499,9 +496,8 @@ class HourMachine(RuleBasedStateMachine):
         foreign = ledger.note_foreign_usage(
             self.w, this_hour=this_hour, local_before=local_before, now=self.now
         )
-        recent_own = sum(
-            1 for t in app_times if t > self.now - LAG
-        )  # own searches the account may not show yet
+        # own searches the account may not show yet
+        recent_own = sum(1 for t in app_times if t > self.now - LAG)
         true_foreign = self._in_hour(self.foreign, self.now)
         if foreign > ledger.FOREIGN_TOLERANCE:
             self.alerts += 1

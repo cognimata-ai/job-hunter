@@ -443,6 +443,14 @@ EXTRA_NORMAL = sa.text(
     "WHERE provider = 'jsearch' AND is_current"
 )
 
+# A counted normal unit of the run admitted under the per-run cap `:cap` (in id order: admission order).
+ADMITTED_NORMAL = sa.text(
+    "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, "
+    "run_id, run_attempt_no, units, state, per_run_cap) SELECT 'jsearch', window_start, 'request', "
+    "'normal', :key, 1, :run, 1, 1, 'reserved', :cap FROM quota_windows "
+    "WHERE provider = 'jsearch' AND is_current"
+)
+
 
 async def i3_of(engine, owner) -> InvariantResult:
     async with engine.connect() as c:
@@ -515,6 +523,37 @@ async def test_i3_holds_a_run_to_the_per_run_cap_its_reservations_were_admitted_
     async with engine.begin() as c:  # a normal unit admitted beyond the cap (a bug): I3 must catch it
         await c.execute(EXTRA_NORMAL, {"key": (99).to_bytes(32, "big"), "run": owner.run_id, "attempt": 1})
     failed = await i3_of(engine, owner)
-    assert not failed.ok and failed.detail["breaches"] == [
-        {"provider": "jsearch", "kind": "per_run_cap", "used": 26, "limit": 25}
+    assert not failed.ok and failed.detail["breaches"] == [  # the cap in force at the latest admission
+        {"provider": "jsearch", "kind": "per_run_cap", "used": 26, "limit": 19}
     ]
+
+
+async def test_i3_catches_units_admitted_beyond_a_cap_that_a_refinement_lowered(
+    engine, current_epoch
+) -> None:
+    """Fix wave F4 (final review F3, Minor 1): 15 normal units under a cap of 25; a refinement lowers it to
+    19; 6 more admitted under 19 (an admission bug) make 21. The largest recorded cap (25) would pass them;
+    the cap of the run's latest counted admission (19) is breached."""
+    settings = seeded_run_settings()
+    window = jsearch_window(
+        utcnow(), limit=REFINED_LIMIT, reserve=0, tokens=24, interval_s=settings.interval_s
+    )
+    await insert_window(engine, window)
+    owner = await queued_run(engine)
+    async with engine.begin() as c:
+        for n in range(21):
+            params = {"key": n.to_bytes(32, "big"), "run": owner.run_id, "cap": 25 if n < 15 else 19}
+            await c.execute(ADMITTED_NORMAL, params)
+    failed = await i3_of(engine, owner)
+    assert not failed.ok and failed.detail["breaches"] == [
+        {"provider": "jsearch", "kind": "per_run_cap", "used": 21, "limit": 19}
+    ]
+    async with engine.begin() as c:  # the six later units released (never sent): 15 are within the cap of 25
+        await c.execute(
+            sa.text(
+                "UPDATE quota_ledger SET state = 'not_billed', evidence = 'never_dispatched', "
+                "settled_at = now() WHERE run_id = :r AND per_run_cap = 19"
+            ),
+            {"r": owner.run_id},
+        )
+    assert (await i3_of(engine, owner)).ok

@@ -14,8 +14,8 @@ the foreign-usage and renewal alerts see the reads of a month without a SerpApi 
 **The dispatch marker** (`mark_dispatched`) commits `reserved -> dispatched` immediately before the send,
 under the owner's `FOR SHARE` again; a lost predicate or a row that is no longer `reserved` is `FencedOut`,
 and the caller must not send. **Settlement** (`settle`) moves `dispatched` to `billed`, `not_billed` (with
-refund evidence only: `rapidapi_gateway_404` or `connect_failed_before_send`) or `ambiguous`, and reconciles
-the response's observation on the locked current window (§6.3, `windows.apply_observation_pure`).
+refund evidence only: `connect_failed_before_send`, or for JSearch `rapidapi_gateway_404`) or `ambiguous`, and
+reconciles the response's observation on the locked current window (§6.3, `windows.apply_observation_pure`).
 
 **Recovery** has two writes, each under the lock of the entry's own window, and every recovery path uses them
 (the replay branch of the acquisition, the shutdown path, the reconciler `ledger_unsettled`):
@@ -95,7 +95,10 @@ COUNTED: Final = ("reserved", "dispatched", "billed", "ambiguous")
 RECOVERY_AFTER: Final = timedelta(minutes=15)
 MAX_ATTEMPT_SEQ: Final = 8
 # Positive evidence of no charge that a settlement may carry (§6.1); `never_dispatched` is the release's own.
-SETTLEMENT_EVIDENCE: Final = frozenset({"rapidapi_gateway_404", "connect_failed_before_send"})
+GATEWAY_404_EVIDENCE: Final = "rapidapi_gateway_404"
+SETTLEMENT_EVIDENCE: Final = frozenset({GATEWAY_404_EVIDENCE, "connect_failed_before_send"})
+# The providers behind the RapidAPI gateway, whose own 404 is the gateway's refund evidence (§6.1).
+GATEWAY_PROVIDERS: Final = frozenset({"jsearch"})
 
 # §6.5, SerpApi's hourly cap: provider lag for the app's own searches, the freshness an account observation
 # needs to admit a search (fail closed), the foreign-usage tolerance and the conservative mode.
@@ -181,10 +184,10 @@ _RUN_NORMAL = q(
     "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND run_id = :run "
     "AND request_class = 'normal' AND state = ANY(:counted)"
 )
-# The largest per-run cap the run's counted normal entries of a provider were admitted under (I3).
+# The per-run cap the run's latest counted normal entry of a provider was admitted under (I3).
 _RUN_CAP = q(
-    "SELECT max(per_run_cap) FROM quota_ledger WHERE provider = :p AND run_id = :run "
-    "AND request_class = 'normal' AND state = ANY(:counted)"
+    "SELECT per_run_cap FROM quota_ledger WHERE provider = :p AND run_id = :run "
+    "AND request_class = 'normal' AND state = ANY(:counted) ORDER BY id DESC LIMIT 1"
 )
 _INSERT_REQUEST = q(
     "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, "
@@ -195,7 +198,6 @@ _INSERT_ADJUSTMENT = q(
     "INSERT INTO quota_ledger (provider, window_start, kind, units, evidence, created_at) "
     "VALUES (:p, :ws, 'adjustment', :units, :evidence, :now)"
 )
-_REATTRIBUTE = q("UPDATE quota_ledger SET window_start = :ws WHERE id = :id")
 _LATEST = q(
     "SELECT id, attempt_seq, state, fetch_request_id, run_id, run_attempt_no, dispatched_at IS NOT NULL "
     "AS dispatched FROM quota_ledger WHERE provider = :p AND request_key = :key AND kind = 'request' "
@@ -275,12 +277,17 @@ async def normal_count_for_run(conn: AsyncConnection, provider: Provider, run_id
 
 
 async def admitted_run_cap(conn: AsyncConnection, provider: Provider, run_id: int) -> int | None:
-    """The per-run cap (§6.4) the run's counted normal entries of `provider` were admitted under, as each
-    reservation recorded it (`per_run_cap`): the largest, when the window changed between them; `None`
-    without such an entry. Every admission kept the run's count within the cap in force then, so the run's
-    normal units are within this cap (I3, §17.2), whatever the window has become since."""
+    """The per-run cap (§6.4) that the run's latest counted normal entry of `provider` was admitted under, as
+    its reservation recorded it (`per_run_cap`); `None` without such an entry.
+
+    The run's normal units are within it (I3, §17.2), whatever the window has become since: the reservations
+    of a provider serialise on its window row, so id order is admission order; that entry's admission kept
+    the run's count (every entry counted now was counted then: an entry only leaves the counted set) within
+    the cap in force then. A later lower cap is the bound, not an earlier higher one (final review F3, Minor
+    1): an admission that exceeded the cap in force is caught, and a refinement after the last admission
+    raises no false alarm."""
     params = {"p": provider, "run": run_id, **_counted()}
-    cap = (await conn.execute(_RUN_CAP, params)).scalar_one()
+    cap = (await conn.execute(_RUN_CAP, params)).scalar()
     return None if cap is None else int(cap)
 
 
@@ -733,14 +740,19 @@ async def settle(
     """Settle a dispatched attempt (§6.2 rule 4) in the caller's transaction, which also persists the response
     and holds the owner's lock.
 
-    The provider's current window is locked (rolled forward) first; then `dispatched -> state` (else
-    `FencedOut`: the entry was recovered meanwhile, so the late response is discarded with the transaction);
-    then the observation on the current window (§6.3), its changes, the entry re-attributed when the provider
-    is seen to have reset, the adjustment and the effect alerts. A probe's outcome is recorded on its window;
-    a JSearch 429 that exhausts the window raises `quota.exhausted`, and a later validated observation with
-    `remaining > 0` resolves it; an `ambiguous` settlement raises `quota.ambiguous_attempt`.
+    The provider's current window is locked (rolled forward) first; then the observation on the current
+    window (§6.3, pure), its changes (a window a provider reset opened is inserted), and `dispatched -> state`
+    in one `transition()` that also re-attributes the entry to that new window (`window_start` is settable,
+    so no write bypasses the registry; else `FencedOut`: the entry was recovered meanwhile, so the late
+    response is discarded with the transaction, which the caller rolls back); then the adjustment and the
+    effect alerts. A probe's outcome is recorded on its window; a JSearch 429 that exhausts the window raises
+    `quota.exhausted`, and a later validated observation with `remaining > 0` resolves it; an `ambiguous`
+    settlement raises `quota.ambiguous_attempt`. A SerpApi "out of searches" (`remaining = 0`) describes the
+    month its search was reserved in: settled after the rollover, it is not applied to the new month (fix
+    wave F4, ledger L175).
 
-    `not_billed` needs refund evidence (`SETTLEMENT_EVIDENCE`), else `ValueError` before anything is written.
+    `not_billed` needs refund evidence (`SETTLEMENT_EVIDENCE`), and `rapidapi_gateway_404` is JSearch's alone
+    (the RapidAPI gateway fronts no other provider), else `ValueError` before anything is written.
     """
     if state == "not_billed" and evidence not in SETTLEMENT_EVIDENCE:
         raise ValueError(f"not_billed needs refund evidence ({', '.join(sorted(SETTLEMENT_EVIDENCE))})")
@@ -748,21 +760,18 @@ async def settle(
     if entry is None:
         raise LookupError(f"no quota ledger request {entry_id}")
     provider = entry.provider
+    if evidence == GATEWAY_404_EVIDENCE and provider not in GATEWAY_PROVIDERS:
+        raise ValueError(f"{GATEWAY_404_EVIDENCE} is no refund evidence for {provider}: no RapidAPI gateway")
     cur = await current_window_locked(conn, provider, now, settings, interval_s=interval_s)
     if cur is None:
         raise LookupError(f"no current {provider} window")  # the entry's own window exists, so one is current
-    try:
-        await transition(
-            conn,
-            "quota_ledger",
-            entry_id,
-            ["dispatched"],
-            state,
-            reason=evidence,
-            set_={"http_status": http_status, "provider_remaining": provider_remaining},
-        )
-    except TransitionConflict as exc:
-        raise FencedOut("quota_ledger") from exc
+    own_window = entry.window_start == cur.window_start
+    if provider == "serpapi" and observation is not None and observation.remaining == 0 and not own_window:
+        observation = None  # the old month's "out of searches", not the rolled window's (ledger L175)
+    # `cur`'s counted usage after the entry's own state change: a `not_billed` entry of `cur` leaves it
+    used = await used_units(conn, provider, cur.window_start)
+    if own_window and state not in COUNTED:
+        used -= entry.units
     w, changes, fx = settle_window(
         cur,
         observation,
@@ -770,15 +779,20 @@ async def settle(
         provider=provider,
         state=state,
         http_status=http_status,
-        probe=entry.request_class == "probe" and entry.window_start == cur.window_start,
-        used_units=await used_units(conn, provider, cur.window_start),
+        probe=entry.request_class == "probe" and own_window,
+        used_units=used,
         entry_units=entry.units if state in COUNTED else 0,
         interval_s=interval_s,
         now=now,
     )
-    await apply_changes(conn, changes)
+    await apply_changes(conn, changes)  # first: a re-attributed entry's new window must exist (its FK)
+    settled: dict[str, object] = {"http_status": http_status, "provider_remaining": provider_remaining}
     if fx.reattribute:
-        await conn.execute(_REATTRIBUTE, {"ws": w.window_start, "id": entry_id})
+        settled["window_start"] = w.window_start
+    try:
+        await transition(conn, "quota_ledger", entry_id, ["dispatched"], state, reason=evidence, set_=settled)
+    except TransitionConflict as exc:
+        raise FencedOut("quota_ledger") from exc
     await _record_effects(conn, w, fx, observation, now=now)
     if provider == "jsearch" and observation is not None and _describes(cur, observation):
         if observation.status == 429 and w.state == "exhausted_until_reset":
@@ -812,11 +826,17 @@ async def _raise_ambiguous(
 
 
 # -- recovery (§6.2 rule 5), centralised under the window lock
+def _awaits_probe(entry: _Entry, w: Window) -> bool:
+    """Whether a recovered entry is a probe its window still waits on: a `validated` window waits on none."""
+    return entry.request_class == "probe" and w.state != "validated"
+
+
 async def release_never_dispatched(conn: AsyncConnection, entry_id: int, *, now: datetime) -> bool:
     """`reserved -> not_billed('never_dispatched')` under the lock of the entry's window (current or closed);
-    a probe's window records `never_sent`, so the next request probes at once. `False` when the entry is not
-    `reserved` (nothing written). The caller holds the owner row (the new owner's, or `FOR UPDATE` in
-    recovery) and knows the old owner can no longer dispatch it."""
+    a probe's window records `never_sent`, so the next request probes at once, unless the window is already
+    `validated` (it awaits no probe: its probe columns stay as its validation left them, ledger L109).
+    `False` when the entry is not `reserved` (nothing written). The caller holds the owner row (the new
+    owner's, or `FOR UPDATE` in recovery) and knows the old owner can no longer dispatch it."""
     entry = await _entry(conn, entry_id)
     if entry is None or entry.state != "reserved":
         return False
@@ -827,7 +847,7 @@ async def release_never_dispatched(conn: AsyncConnection, entry_id: int, *, now:
         )
     except TransitionConflict:
         return False
-    if entry.request_class == "probe":
+    if _awaits_probe(entry, w):
         note_probe_outcome(w, "never_sent", now=now)
         await save_window(conn, w)
     if w.is_current:
@@ -837,8 +857,9 @@ async def release_never_dispatched(conn: AsyncConnection, entry_id: int, *, now:
 
 async def mark_ambiguous(conn: AsyncConnection, entry_id: int, *, now: datetime) -> bool:
     """`dispatched -> ambiguous` under the lock of the entry's window: it stays charged. A probe's window
-    records `failed` (the next probe 12 h later); `quota.ambiguous_attempt` is raised. `False` when the entry
-    is not `dispatched` (nothing written)."""
+    records `failed` (the next probe 12 h later) unless it is already `validated` (no stale `next_probe_at`
+    could then admit an early re-probe after a later 429, ledger L109); `quota.ambiguous_attempt` is raised.
+    `False` when the entry is not `dispatched` (nothing written)."""
     entry = await _entry(conn, entry_id)
     if entry is None or entry.state != "dispatched":
         return False
@@ -847,7 +868,7 @@ async def mark_ambiguous(conn: AsyncConnection, entry_id: int, *, now: datetime)
         await transition(conn, "quota_ledger", entry_id, ["dispatched"], "ambiguous")
     except TransitionConflict:
         return False
-    if entry.request_class == "probe":
+    if _awaits_probe(entry, w):
         note_probe_outcome(w, "failed", now=now)
         await save_window(conn, w)
     await _raise_ambiguous(conn, entry.provider, entry_id, None)
