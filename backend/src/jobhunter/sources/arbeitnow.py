@@ -41,7 +41,10 @@ The covered bound this module proves, and nothing more:
   were made. An item created after the earliest of those instants can be missing although the read reaches
   past it: its page was made before it existed, and by the time a later page was made the item sat on an
   earlier page (pages fill one after the other, so in-order fills hide such an item as well). So nothing
-  newer than the earliest fill is proven, and the read part above it is recorded as a gap. Half-open, the
+  newer than the earliest fill is proven, and the read part above it is recorded as a gap, its reason
+  `unknown_continuation` (Ruling FR-o: no page cap stopped the read; what lies above is unknown). A page
+  whose age is unknown (a cached response without a readable `Age`, Ruling FR-q) proves nothing above the
+  cell's previous covered bound. Half-open, the
   upper instant itself is left to the next run: a claim may fall short of the truth, never exceed it. A
   residual risk stays (Ruling T10-b, accepted): an item older than every fill can still move from a page
   made later to a page made earlier and be read on neither; only reading every page at one instant would
@@ -70,9 +73,10 @@ dropped.
 """
 
 import re
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from math import ceil, isfinite
 from typing import Final, Literal
 
 import httpx
@@ -89,6 +93,7 @@ from jobhunter.sources.base import (
     ContractViolation,
     CoverageWindow,
     DuplicateInPage,
+    GapReason,
     ItemOutcome,
     NormalizedPosting,
     Observation,
@@ -115,6 +120,8 @@ MAX_PAGE_CAP: Final = 10
 _HOURS_PER_PAGE: Final = 30  # `ceil(interval_h / 30) + 1` (§5.3.4)
 
 _ALL_WORK_MODES: Final = frozenset({"remote", "hybrid", "onsite"})
+# The `cf-cache-status` values of a response the edge cache served (V8: every recorded page was a HIT).
+_CACHE_SERVED: Final = frozenset({"hit", "stale", "updating", "revalidated"})
 _NUMERIC_SUFFIX: Final = re.compile(r"-(\d+)$")
 _ESCAPED_TAG_FIRST: Final = re.compile(r"^\s*&lt;/?[A-Za-z]")
 
@@ -136,11 +143,18 @@ StopReason = Literal["cap", "remaining", "end"]
 
 @dataclass(frozen=True)
 class Gap:
-    """A hole in the cell's coverage on the `created_at` axis, `[lower, upper)`."""
+    """A hole in the cell's coverage on the `created_at` axis, `[lower, upper)`.
+
+    `reason` is why it is open when that is known here (`None`: the recorder gives it the reason of the run's
+    traversal): a gap above the earliest fill of a read's pages is `unknown_continuation` (Ruling FR-o), and
+    the remainder of a narrowed gap keeps its gap's reason. It is no part of a gap's identity
+    (`compare=False`): a gap is its span and its status.
+    """
 
     lower: datetime
     upper: datetime
     status: GapStatus
+    reason: GapReason | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not self.lower < self.upper:
@@ -166,12 +180,34 @@ def _cutoff(now: datetime, max_ad_age_days: int) -> datetime:
     return now - timedelta(days=max_ad_age_days)
 
 
-def filled_at(page: RawPage) -> datetime:
-    """When the page's content was made: its `Date` header less its `Age` (a Cloudflare cache hit, V8), else
-    its arrival (`fetched_at`) less the `Age`; an unreadable `Age` counts as 0."""
-    age = page.headers.get("age", "").strip()
-    seconds = int(age) if age.isascii() and age.isdigit() else 0
-    return response_date(page.headers, page.fetched_at) - timedelta(seconds=seconds)
+def _age_s(headers: Mapping[str, str]) -> int | None:
+    """The page's age in whole seconds, or `None` when it is unknown (Ruling FR-q: fail safe, never a claim
+    the headers do not prove). A joined `Age` (`1440, 1440`, two headers) takes the largest, a fraction is
+    rounded up; any other `Age` is unknown. Without an `Age`, a response the cache served
+    (`cf-cache-status`, V8's signal) has an unknown age, and any other one (a miss, or no cache at all) is
+    as old as its `Date`."""
+    raw = headers.get("age")
+    if raw is None:
+        return None if headers.get("cf-cache-status", "").strip().casefold() in _CACHE_SERVED else 0
+    seconds: list[int] = []
+    for part in raw.split(","):
+        try:
+            value = float(part.strip())
+        except ValueError:
+            return None
+        if not isfinite(value) or value < 0:
+            return None
+        seconds.append(ceil(value))
+    return max(seconds)
+
+
+def filled_at(page: RawPage) -> datetime | None:
+    """When the page's content was made: its `Date` header (else its arrival, `fetched_at`) less its `Age`;
+    `None` when its age is unknown (`_age_s`)."""
+    age = _age_s(page.headers)
+    if age is None:
+        return None
+    return response_date(page.headers, page.fetched_at) - timedelta(seconds=age)
 
 
 def covered_span(
@@ -179,8 +215,8 @@ def covered_span(
 ) -> CoverageWindow | None:
     """The span the read from page 1 proves covered: `[oldest, newest)` of the item times `times` it read,
     when it reached the end of the feed, its upper bound at most `filled_at` (the earliest fill instant of
-    its pages; `None`: no page was made before an item it read, as for a page read live); `None` otherwise or
-    when that span is empty.
+    its pages, or the cell's previous covered bound when a page's age is unknown; `None`: no clamp, as for a
+    page read live); `None` otherwise or when that span is empty.
 
     Task 14 writes it as the run's `covered` interval; `conclude` applies the same span.
     """
@@ -208,8 +244,8 @@ def _validate(*, pages: int, cap: int, stopped_by: StopReason) -> None:
         raise ValueError(f"a traversal stopped by the cap read {cap} pages, not {pages}")
 
 
-def _with_age(lower: datetime, upper: datetime, cutoff: datetime) -> Gap:
-    return Gap(lower, upper, "abandoned" if upper <= cutoff else "open")
+def _with_age(lower: datetime, upper: datetime, cutoff: datetime, reason: GapReason | None = None) -> Gap:
+    return Gap(lower, upper, "abandoned" if upper <= cutoff else "open", reason)
 
 
 def conclude(
@@ -244,9 +280,9 @@ def conclude(
         if gap.status == "open" and span is not None and gap.lower < span[1] and span[0] < gap.upper:
             updated = replace(gap, status="closed")
             if gap.lower < span[0]:
-                remainders.append(_with_age(gap.lower, span[0], cutoff))
+                remainders.append(_with_age(gap.lower, span[0], cutoff, gap.reason))
             if span[1] < gap.upper:
-                remainders.append(_with_age(span[1], gap.upper, cutoff))
+                remainders.append(_with_age(span[1], gap.upper, cutoff, gap.reason))
         elif gap.status == "open" and gap.upper <= cutoff:
             updated = replace(gap, status="abandoned")
         gaps += [updated, *remainders]
@@ -255,21 +291,30 @@ def conclude(
 
     newest_covered = state.newest_covered_upper
     if times:
-        # the unproven part: below the covered span when there is one, else everything read
-        unproven_upper = span[0] if span is not None else max(times)
+        oldest, newest = min(times), max(times)
+        # A read to the end whose pages were made before its newest item proves nothing above the earliest
+        # fill (`cut`, at least its oldest item): that part is a gap of its own (FR-o, FR-q).
+        cut = None
+        if stopped_by == "end" and filled_at is not None and filled_at < newest:
+            cut = max(filled_at, oldest)
+        # the unproven part below: below the covered span (or the cut) when there is one, else everything read
+        if cut is not None:
+            unproven_upper = oldest
+        else:
+            unproven_upper = span[0] if span is not None else newest
         if frontier is not None:
             unproven_lower = frontier
         else:  # a never-covered cell claims nothing older than what it read
-            unproven_lower = span[0] if span is not None else min(times)
+            unproven_lower = span[0] if span is not None else oldest
         if unproven_lower < unproven_upper:
             opened = _with_age(unproven_lower, unproven_upper, cutoff)
             gaps.append(opened)
             changed.append(opened)
-        if span is not None:
+        if cut is not None:
             # read but not proven: newer than the earliest fill (the part the frontier has not accounted)
-            above = span[1] if frontier is None else max(span[1], frontier)
-            if above < max(times):
-                newer = _with_age(above, max(times), cutoff)
+            above = cut if frontier is None else max(cut, frontier)
+            if above < newest:
+                newer = _with_age(above, newest, cutoff, "unknown_continuation")
                 gaps.append(newer)
                 changed.append(newer)
         if span is not None and (newest_covered is None or span[1] > newest_covered):

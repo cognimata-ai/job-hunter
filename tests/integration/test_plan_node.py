@@ -984,7 +984,7 @@ async def test_a_source_error_in_one_fetch_cell_send_is_its_outcome_and_the_run_
     rid = await queued_run_id(engine, include_paid=False)
     error = SourceError("transient", code="http_503", status=503)
     monkeypatch.setattr(
-        collect_graph, "make_fetch_cell", lambda deps: failing_fetch_cell(engine, "arbeitnow", error)
+        collect_graph, "make_fetch_cell", lambda deps, **_: failing_fetch_cell(engine, "arbeitnow", error)
     )
     admission, state = await run_graph(engine, migrated, collect_deps(engine), rid)
     (failed,) = [r.id for r in await requests(engine, rid) if r.source_id == "arbeitnow"]
@@ -1039,7 +1039,7 @@ async def test_fenced_out_in_one_fetch_cell_send_ends_the_attempt(
     monkeypatch.setattr(
         collect_graph,
         "make_fetch_cell",
-        lambda deps: failing_fetch_cell(engine, "arbeitnow", FencedOut("run")),
+        lambda deps, **_: failing_fetch_cell(engine, "arbeitnow", FencedOut("run")),
     )
     admission, state = await run_graph(engine, migrated, collect_deps(engine), rid)
     assert admission == "started" and "finalize" not in state.get("steps", [])

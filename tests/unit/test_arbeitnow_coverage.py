@@ -182,7 +182,39 @@ def test_a_page_was_made_at_its_date_less_its_age() -> None:
     )
     assert filled_at(page_with({"date": date}, T)) == datetime(2026, 10, 18, 20, 53, 22, tzinfo=UTC)
     assert filled_at(page_with({"age": "60"}, T)) == T - timedelta(seconds=60)  # no Date: its arrival
-    assert filled_at(page_with({"age": "soon", "date": "garbage"}, T)) == T  # unreadable: the arrival, age 0
+    assert filled_at(page_with({"age": "60", "date": "garbage"}, T)) == T - timedelta(seconds=60)
+
+
+@pytest.mark.parametrize(
+    ("headers", "age_s"),
+    [
+        # Ruling FR-q (F4 fix round 1): a joined `Age` takes the largest value, a fraction is rounded up
+        ({"age": "1440, 1440"}, 1440),
+        ({"age": "1440,1500"}, 1500),
+        ({"age": "1440.0"}, 1440),
+        ({"age": "1440.2"}, 1441),
+        ({"age": " 7 "}, 7),
+        # no `Age` on a response the cache did not serve: as old as its `Date`
+        ({"cf-cache-status": "MISS"}, 0),
+        ({"cf-cache-status": "DYNAMIC"}, 0),
+        ({}, 0),
+        # unknown: an unreadable `Age`, or a cache hit without one (V8's signal, `cf-cache-status`)
+        ({"age": "soon"}, None),
+        ({"age": ""}, None),
+        ({"age": "-5"}, None),
+        ({"age": "1440, x"}, None),
+        ({"age": "nan"}, None),
+        ({"age": "inf"}, None),
+        ({"cf-cache-status": "HIT"}, None),
+        ({"cf-cache-status": "hit"}, None),
+        ({"cf-cache-status": "STALE"}, None),
+        ({"cf-cache-status": "HIT", "age": "1440, 1440"}, 1440),
+    ],
+)
+def test_a_page_whose_age_is_unknown_has_no_fill_instant(headers: dict[str, str], age_s: int | None) -> None:
+    page = page_with({"date": "Sun, 18 Oct 2026 20:53:22 GMT", **headers}, T)
+    served = datetime(2026, 10, 18, 20, 53, 22, tzinfo=UTC)
+    assert filled_at(page) == (None if age_s is None else served - timedelta(seconds=age_s))
 
 
 def test_a_read_to_the_end_covers_nothing_newer_than_its_earliest_page_fill() -> None:
@@ -198,14 +230,53 @@ def test_a_read_to_the_end_covers_nothing_newer_than_its_earliest_page_fill() ->
     )
     assert gaps == [Gap(T - 20 * H, T - 10 * H, "open"), Gap(T - 2 * H, T, "open")]
     assert after == FirehoseState(T - 2 * H, tuple(gaps))
+    # Ruling FR-o: the gap above the fill is `unknown_continuation`; the one below keeps the run's reason
+    assert [gap.reason for gap in gaps] == [None, "unknown_continuation"]
     # the fill below the old frontier: only the part above the frontier is a new gap
     covered_late = FirehoseState(newest_covered_upper=T - H, gaps=())
     _, gaps = conclude(
         covered_late, read, pages=1, cap=3, stopped_by="end", now=T, max_ad_age_days=30, filled_at=T - 2 * H
     )
-    assert gaps == [Gap(T - H, T, "open")]
-    # a fill before every item read proves nothing: the read is one gap from the frontier, as a capped read
-    _, gaps = conclude(
+    assert gaps == [Gap(T - H, T, "open")] and gaps[0].reason == "unknown_continuation"
+    # a fill before every item read proves nothing: the read is a gap from the frontier, as a capped read's,
+    # split at its oldest item (below: items that left the feed; above: what the stale pages may miss)
+    after, gaps = conclude(
         state, read, pages=1, cap=3, stopped_by="end", now=T, max_ad_age_days=30, filled_at=T - 11 * H
     )
-    assert gaps == [Gap(T - 20 * H, T, "open")]
+    assert gaps == [Gap(T - 20 * H, T - 10 * H, "open"), Gap(T - 10 * H, T, "open")]
+    assert [gap.reason for gap in gaps] == [None, "unknown_continuation"] and after.newest_covered_upper == (
+        T - 20 * H
+    )
+    # never covered: nothing older than the read, and nothing of it proven
+    _, gaps = conclude(
+        FirehoseState(None, ()),
+        read,
+        pages=1,
+        cap=3,
+        stopped_by="end",
+        now=T,
+        max_ad_age_days=30,
+        filled_at=T - 11 * H,
+    )
+    assert gaps == [Gap(T - 10 * H, T, "open")] and gaps[0].reason == "unknown_continuation"
+
+
+def test_a_narrowed_gap_keeps_its_reason_and_a_reason_is_no_part_of_a_gap() -> None:
+    """F4 fix round 1 (FR-o review guidance): the remainders of a gap a read to the end narrows keep its
+    reason; the reason never makes two gaps of one span and status differ."""
+    gap = Gap(T - 40 * H, T - 20 * H, "open", "unknown_continuation")
+    assert gap == Gap(T - 40 * H, T - 20 * H, "open") and hash(gap) == hash(
+        Gap(T - 40 * H, T - 20 * H, "open")
+    )
+    state = FirehoseState(newest_covered_upper=T - 20 * H, gaps=(gap,))
+    read = hours_back(T - 25 * H, 6)  # T - 30 h .. T - 25 h: inside the gap
+    _, changed = conclude(state, read, pages=1, cap=3, stopped_by="end", now=T, max_ad_age_days=30)
+    closed, below, above = changed
+    assert (closed.status, below.lower, below.upper, above.lower, above.upper) == (
+        "closed",
+        T - 40 * H,
+        T - 30 * H,
+        T - 25 * H,
+        T - 20 * H,
+    )
+    assert below.reason == above.reason == "unknown_continuation"

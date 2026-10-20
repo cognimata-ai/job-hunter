@@ -43,6 +43,17 @@ Billing = Literal["paid", "quota", "free"]
 Operation = Literal["list", "detail"]
 RequestClass = Literal["normal", "retry", "probe", "free"]
 CoverageWindow = tuple[datetime, datetime]
+# Why a coverage gap is open (§5.6; the `coverage_intervals.reason` domain of §7.9).
+GapReason = Literal[
+    "page_cap",
+    "allowance",
+    "ambiguous_attempt",
+    "unknown_continuation",
+    "beyond_provider_window",
+    "incomplete_snapshot",
+    "source_failed",
+    "shutdown",
+]
 # The query parameters that carry provider credentials (SerpApi `api_key`, Adzuna `app_id`/`app_key`). They
 # are added at send time only, so a spec refuses them and the request log removes them.
 SECRET_PARAMS: Final = frozenset({"api_key", "app_id", "app_key"})

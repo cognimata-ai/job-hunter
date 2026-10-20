@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import json
 import re
 from dataclasses import replace
@@ -13,6 +12,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import canonical_json
 from jobhunter.errors import FencedOut
+from jobhunter.graphs.collect import graph as collect_graph
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.graph import TIMEOUTS, build_collect_graph
 from jobhunter.graphs.collect.nodes import fetch as fetch_node
@@ -39,6 +39,7 @@ from jobhunter.sources.base import element_sha256
 from jobhunter.sources.breaker import record_failure
 from jobhunter.sources.fixtures import fixture_transport
 from jobhunter.sources.instances import InstanceRow, list_instances
+from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL, SOURCE_LIMITS, RateLimiter
 from jobhunter.sources.serpapi import SerpApiAdapter
 from jobhunter.worker import runs
@@ -747,8 +748,93 @@ async def test_an_arbeitnow_read_to_the_end_covers_nothing_newer_than_its_page_w
     result = await traverse_and_record(deps, fid)
     assert (result.end, result.pages, result.covered) == ("end", 1, (oldest, made))
     assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
-        ("gap", "open", "page_cap", made, newest),  # read, but newer than the page's content: not proven
+        # read, but newer than the page's content: not proven, and no page cap stopped it (Ruling FR-o)
+        ("gap", "open", "unknown_continuation", made, newest),
         ("covered", None, None, oldest, made),
+    ]
+
+
+def ended_feed(headers: dict[str, str]) -> tuple[httpx.Response, datetime, datetime]:
+    """The recorded page 1 as the whole feed (no `links.next`) with `headers`, and its oldest and newest
+    items."""
+    status, recorded, body = load_fixture("arbeitnow", "page1")
+    doc = json.loads(body)
+    doc["links"]["next"] = None
+    times = [datetime.fromtimestamp(job["created_at"], UTC) for job in doc["data"]]
+    return httpx.Response(status, headers={**recorded, **headers}, json=doc), min(times), max(times)
+
+
+async def feed_run(
+    engine: AsyncEngine, adapter: ArbeitnowAdapter, served: datetime
+) -> tuple[traverse.TraversalResult, RunOwner]:
+    """One Arbeitnow traversal of the cell, its clock at `served`."""
+    deps = replace(make_deps(engine, lambda instance: adapter), clock=lambda: served)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    return await traverse_and_record(deps, fid), owner
+
+
+async def test_an_end_read_labels_the_gap_below_its_span_page_cap_and_the_gap_above_its_fill_unknown(
+    engine, current_epoch, respx_mock: respx.MockRouter, arbeitnow_adapter: ArbeitnowAdapter
+) -> None:
+    """Ruling FR-o (F4 fix round 1): one read to the end opens two gaps of different causes. Below its
+    oldest item, down to the cell's covered bound, items left the feed unread (earlier reads were capped):
+    `page_cap`. Above its page's fill instant, the page may miss items: `unknown_continuation`."""
+    await seed_inputs(engine, enabled=("arbeitnow",))
+    response, oldest, newest = ended_feed({})
+    made = newest - 30 * timedelta(minutes=1)
+    served = made + H
+    response.headers["date"] = served.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    response.headers["age"] = "3600"
+    respx_mock.get(FEED_URL, params={"page": "1"}).mock(return_value=response)
+    deps = make_deps(engine, lambda instance: arbeitnow_adapter)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    cell = await cell_of(engine, fid)
+    async with engine.begin() as c:  # covered up to 10 h before the oldest item the read will see
+        await c.execute(COVERED_ROW, {"c": cell, "l": oldest - 20 * H, "u": oldest - 10 * H})
+    result = await traverse_and_record(replace(deps, clock=lambda: served), fid)
+    assert (result.end, result.covered) == ("end", (oldest, made))
+    assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
+        ("gap", "open", "page_cap", oldest - 10 * H, oldest),
+        ("gap", "open", "unknown_continuation", made, newest),
+        ("covered", None, None, oldest, made),
+    ]
+
+
+@pytest.mark.parametrize("cache", [{"cf-cache-status": "HIT"}, {"age": "soon"}])
+async def test_a_cached_page_of_unknown_age_proves_nothing_above_the_previous_covered_bound(
+    engine, current_epoch, respx_mock: respx.MockRouter, arbeitnow_adapter: ArbeitnowAdapter, cache
+) -> None:
+    """Ruling FR-q (F4 fix round 1): a cache hit without an `Age`, or with one that does not read, has no
+    known fill instant. The read claims nothing above the cell's previous covered bound; what it read above it
+    is an `unknown_continuation` gap. In a never-covered cell it claims nothing at all."""
+    await seed_inputs(engine, enabled=("arbeitnow",))
+    response, oldest, newest = ended_feed({})
+    del response.headers["age"]
+    response.headers.update(cache)
+    served = newest + H
+    respx_mock.get(FEED_URL, params={"page": "1"}).mock(return_value=response)
+    result, first = await feed_run(engine, arbeitnow_adapter, served)  # never covered: nothing proven
+    assert (result.end, result.covered) == ("end", None)
+    assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=first.run_id)] == [
+        ("gap", "open", "unknown_continuation", oldest, newest)
+    ]
+    await finish(engine, first)
+    bound = oldest + H  # the cell covered up to an hour above the oldest item (an earlier, proven read)
+    async with engine.begin() as c:
+        cell = (
+            await c.execute(
+                sa.text("SELECT cell_id FROM coverage_intervals WHERE run_id = :r"), {"r": first.run_id}
+            )
+        ).scalar_one()
+        await c.execute(COVERED_ROW, {"c": cell, "l": oldest - 5 * H, "u": bound})
+        await c.execute(sa.text("DELETE FROM coverage_intervals WHERE run_id = :r"), {"r": first.run_id})
+    result, second = await feed_run(engine, arbeitnow_adapter, served)
+    assert result.covered == (oldest, bound)
+    assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=second.run_id)] == [
+        ("gap", "open", "unknown_continuation", bound, newest),
+        ("covered", None, None, oldest, bound),
     ]
 
 
@@ -795,7 +881,8 @@ async def test_two_boards_traversed_at_once_share_the_one_detail_gate(
     """Fix wave F4 (ledger L216): the gate is the process's (`RateLimiter.gate`), not the traversal's, so two
     SmartRecruiters boards traversed at once (the host's two fetch slots) together have at most
     `SMARTRECRUITERS_DETAIL.concurrency` (4) detail calls inside `acquire_page`, not 4 each. The detail calls
-    wait until both boards' list pages are in, so both boards' details compete for the gate at once."""
+    are held until both boards have taken the gate, so both boards' details compete for it at once; nothing
+    waits for real time (fix round 1, Minor 6)."""
     slugs = ("DeliveryHero", "SecondBoard")
     await seed_inputs(engine, companies=[("smartrecruiters", slug) for slug in slugs], enabled=("ats",))
     listing = listing_in_germany()
@@ -806,21 +893,16 @@ async def test_two_boards_traversed_at_once_share_the_one_detail_gate(
             return_value=httpx.Response(200, json=listing)
         )
     real, active, peak, made = acquire_page, [0], [0], [0]
-    entered: set[int | None] = set()  # the boards (their list pages) whose detail calls have started
-    both_entered = asyncio.Event()
+    both_gated = asyncio.Event()  # both boards' detail calls compete for the gate from now on
 
     async def counted(ctx, spec, **arguments):
         if spec.operation != "detail":
             return await real(ctx, spec, **arguments)
         active[0] += 1
         peak[0] = max(peak[0], active[0])
-        entered.add(spec.parent_fetch_request_id)
-        if len(entered) == len(slugs):
-            both_entered.set()
-        # held until the other board's details start too: at once with a gate per traversal (8 inside),
-        # never with the process's one gate (4 inside, the other board waits), which the timeout then ends
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(both_entered.wait(), 1.0)
+        await both_gated.wait()  # held until the other board reaches the gate too: no real time is spent
+        for _ in range(10):  # yields, as the protocol's database round trips do
+            await asyncio.sleep(0)
         active[0] -= 1
         made[0] += 1
         return Denied(-made[0], "breaker_open", replayed=False)
@@ -831,19 +913,26 @@ async def test_two_boards_traversed_at_once_share_the_one_detail_gate(
     async def no_wait(seconds: float) -> None:  # the host's 5 requests/s pass without real time
         clock.now += seconds
 
+    limiter = RateLimiter(SOURCE_LIMITS.values(), clock=clock, sleep=no_wait)
+    real_gate, gated = limiter.gate, [0]
+
+    def gate(key: str) -> asyncio.Semaphore:
+        gated[0] += 1
+        if gated[0] == len(slugs):
+            both_gated.set()
+        return real_gate(key)
+
+    monkeypatch.setattr(limiter, "gate", gate)
     async with engine.connect() as c:
         boards = [i for i in await list_instances(c) if i.source_id == "smartrecruiters"]
     async with httpx.AsyncClient() as client:
         by_instance = {board.id: adapter_for(board, client, clock=utcnow) for board in boards}
-        deps = replace(
-            make_deps(engine, lambda instance: by_instance[instance.id]),
-            limiter=RateLimiter(SOURCE_LIMITS.values(), clock=clock, sleep=no_wait),
-        )
+        deps = replace(make_deps(engine, lambda instance: by_instance[instance.id]), limiter=limiter)
         owner = await queued_run(engine, include_paid=False)
         ids = await plan_ids(deps, owner)
         assert len(ids) == 2
         await asyncio.gather(*(traverse_and_record(deps, fid) for fid in ids))
-    assert (made[0], peak[0]) == (20, SMARTRECRUITERS_DETAIL.concurrency)
+    assert gated[0] == len(slugs) and (made[0], peak[0]) == (20, SMARTRECRUITERS_DETAIL.concurrency)
 
 
 # ---- final review F3 --------------------------------------------------------------------------------------
@@ -1009,6 +1098,48 @@ async def test_a_page_two_the_rule_admitted_but_could_not_reserve_is_reused(
     assert await first_request(engine, second, cell) == (2, "planned", cursor)
 
 
+async def test_a_reused_cursor_whose_page_fails_leaves_its_gap_that_cursor(
+    engine, current_epoch, adapters: Adapters, job_factory: JobFactory
+) -> None:
+    """Ruling FR-p (ledger L216, §5.6 "the gap keeps the cursor"): the next run resumes page 2 from page 1's
+    kept cursor; that page answers 503 twice (its one paid retry included), so the traversal fails before any
+    page of its own was served. Its open gap keeps the cursor that fetches the page again, not NULL."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    await insert_window(engine, jsearch_window(utcnow(), limit=200, reserve=20, tokens=1, interval_s=SIX_H))
+    for uid in page1_ids()[:2]:  # 8 new: page 2 is admitted, then paced, so its cursor is kept
+        await job_factory(native_id=uid)
+    deps = make_deps(engine, adapters)
+    first = await queued_run(engine)
+    (fid,) = await plan_ids(deps, first)
+    cell = await cell_of(engine, fid)
+    await traverse_and_record(deps, fid)
+    await finalize_and_finish(engine, first)
+    cursor = json.loads(load_fixture("jsearch", "search_v2_page1")[2])["data"]["cursor"]
+    async with engine.begin() as c:
+        await c.execute(REFILL)
+        jsearch = await instance_id(c, "jsearch")
+        # the first run's own gap of the window (it kept the cursor too) is removed, so the row the resumed
+        # traversal writes is the one asserted (an identical span would leave the existing row in place)
+        await c.execute(sa.text("DELETE FROM coverage_intervals WHERE run_id = :r"), {"r": first.run_id})
+    second = await queued_run(engine)
+    (resumed,) = await plan_ids(deps, second)
+    assert await first_request(engine, second, cell) == (2, "planned", cursor)
+    sent: list[httpx.Request] = []
+
+    def down(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(down)) as client:
+        failing = JSearchAdapter(client, api_key=b"fake", instance_id=jsearch, clock=utcnow)
+        result = await traverse_and_record(make_deps(engine, lambda instance: failing), resumed)
+    assert (result.end, result.reason, result.pages, result.cursor_out) == ("failed", "transient", 0, cursor)
+    assert len(sent) == 2 and all(r.url.params["cursor"] == cursor for r in sent)
+    assert [(*r[:3], r[5]) for r in await rows(engine, RUN_INTERVALS, r=second.run_id)] == [
+        ("gap", "open", "source_failed", {"cursor": cursor})
+    ]
+
+
 async def test_no_continuation_leads_past_page_two(engine, current_epoch, adapters: Adapters) -> None:
     """§5.3.1 (final review F3, Important B): a traversal that read page 2 (with a cursor) leaves no
     continuation, so the next run never plans page 3."""
@@ -1138,18 +1269,22 @@ async def test_fetch_requests_counts_a_page_this_attempt_denied_but_not_its_repl
     }
 
 
-async def test_the_traversal_timeout_starts_once_the_traversal_holds_its_semaphore(
+async def test_the_cell_timeout_starts_once_the_traversal_holds_its_semaphore(
     engine, current_epoch, adapters: Adapters, monkeypatch
 ) -> None:
-    """Fix wave F4 (ledger L205/L216, §9.2 "15 min per traversal"): `fetch_cell` times the traversal from
-    the moment it holds its source's semaphore, so its wait behind another traversal never counts against
-    it; the graph node has no LangGraph timeout that would time the wait. With a timeout of 0 s, a traversal
-    that waited for the semaphore and then needs no wait completes, and one that waits at all times out."""
+    """Fix wave F4 (ledger L205/L216, §9.2 "15 min per traversal"; fix round 1, Minor 4): `fetch_cell`
+    applies `TIMEOUTS["fetch_cell"]` from the moment it holds its source's semaphore, to all of its work
+    after it (the traversal and the coverage transaction), and to the read of the planned row before it; its
+    wait behind another traversal never counts, and the graph node has no LangGraph timeout that would time
+    the wait. With a timeout of 0 s (it expires at the first wait it covers): a cell that waited for the
+    semaphore and then waits for nothing completes; a wait in the traversal, the coverage transaction or the
+    planned row's read times out."""
     await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
     deps = make_deps(engine, adapters)
     owner = await queued_run(engine)
     (fid,) = await plan_ids(deps, owner)
-    monkeypatch.setattr(fetch_node, "TRAVERSAL_TIMEOUT", timedelta(0))
+    zero = timedelta(0)
+    planned = await fetch_node.load_planned(engine, fid, attempt_no=None)
     done = traverse.TraversalResult(
         outcomes=[],
         end="skipped",
@@ -1160,18 +1295,27 @@ async def test_the_traversal_timeout_starts_once_the_traversal_holds_its_semapho
         snapshot=None,
         firehose=None,
     )
+    real_load, real_commit, committed = fetch_node.load_planned, fetch_node._commit, []
+
+    async def loaded(engine, fetch_request_id, *, attempt_no):  # the planned row, without a wait
+        return planned
 
     async def at_once(ctx, plan, first_fetch_request_id, *, limiter):
         return done
 
+    async def recorded(deps, planned, result):
+        committed.append(result)
+
+    monkeypatch.setattr(fetch_node, "load_planned", loaded)
     monkeypatch.setattr(fetch_node, "traverse_cell", at_once)
+    monkeypatch.setattr(fetch_node, "_commit", recorded)
     slot = deps.fetch_ctx.sources["jsearch"]
     async with slot:  # another JSearch traversal holds the source's one slot meanwhile
-        waiting = asyncio.create_task(traverse_and_record(deps, fid))
+        waiting = asyncio.create_task(traverse_and_record(deps, fid, cell_timeout=zero))
         for _ in range(20):
             await asyncio.sleep(0)
         assert not waiting.done()
-    assert await waiting is done
+    assert await waiting is done and committed == [done]  # the wait did not count
 
     async def slow(ctx, plan, first_fetch_request_id, *, limiter):
         await asyncio.sleep(0)  # any wait inside the traversal counts
@@ -1179,8 +1323,41 @@ async def test_the_traversal_timeout_starts_once_the_traversal_holds_its_semapho
 
     monkeypatch.setattr(fetch_node, "traverse_cell", slow)
     with pytest.raises(TimeoutError):
-        await traverse_and_record(deps, fid)
+        await traverse_and_record(deps, fid, cell_timeout=zero)
+    monkeypatch.setattr(fetch_node, "traverse_cell", at_once)
+    monkeypatch.setattr(fetch_node, "_commit", real_commit)  # the coverage transaction waits for the database
+    with pytest.raises(TimeoutError):
+        await traverse_and_record(deps, fid, cell_timeout=zero)
+    monkeypatch.setattr(fetch_node, "load_planned", real_load)  # and so does the planned row's read
+    with pytest.raises(TimeoutError):
+        await traverse_and_record(deps, fid, cell_timeout=zero)
+    # the graph passes `TIMEOUTS["fetch_cell"]` to the node, which has no LangGraph timeout of its own
+    given: list[timedelta] = []
+    real_make = fetch_node.make_fetch_cell
+
+    def made(deps, *, cell_timeout):
+        given.append(cell_timeout)
+        return real_make(deps, cell_timeout=cell_timeout)
+
+    monkeypatch.setattr(collect_graph, "make_fetch_cell", made)
     graph = build_collect_graph(InMemorySaver(), deps)
+    assert given == [TIMEOUTS["fetch_cell"]] == [timedelta(minutes=15)]
     assert graph.builder.nodes["fetch_cell"].timeout is None
     assert graph.builder.nodes["fetch_primary"].timeout is not None
-    assert fetch_node.TRAVERSAL_TIMEOUT == timedelta(0) and TIMEOUTS["fetch_cell"] == timedelta(minutes=15)
+
+
+async def test_fetch_requests_counts_the_skips_the_plan_wrote_once(
+    engine, current_epoch, adapters: Adapters
+) -> None:
+    """F4 fix round 1 (Minor 2, §17.5 `fetch_requests_total{source,status}`): a pacing deferral the plan node
+    writes (`skipped('paced')`: one token, two cells) is a `skipped` sample, counted after the planning
+    transaction committed; the node run again on the run's receipt counts nothing more."""
+    await seed_inputs(engine, queries=("first query", "second query"), enabled=("jsearch",))
+    await insert_window(engine, jsearch_window(utcnow(), limit=200, reserve=20, tokens=1, interval_s=SIX_H))
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine)
+    before = fetched("jsearch", "skipped")
+    planned = await plan_ids(deps, owner)
+    assert len(planned) == 1 and fetched("jsearch", "skipped") == before + 1
+    assert await plan_ids(deps, owner) == planned  # the receipt: the same plan, no new sample
+    assert fetched("jsearch", "skipped") == before + 1

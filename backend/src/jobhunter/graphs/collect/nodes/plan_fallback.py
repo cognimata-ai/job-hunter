@@ -17,10 +17,12 @@ the foreign-usage detection and the T7-b renewal check), exactly as the acquisit
 search, so `quota.serpapi_renewal_stale` opens in a month that the lagging renewal locks out and
 `quota.serpapi_foreign_usage` resolves without a search (final review F3). The source instances are then
 read again, so the planner sees a breaker the failed read opened. Then `planner.plan_fallback` in one
-transaction. `route` sends the graph to `fetch_fallback` when it planned specs, else to `parse_normalize`.
+transaction, whose new `skipped` receipts are counted in `FETCH_REQUESTS` after it commits. `route` sends the
+graph to `fetch_fallback` when it planned specs, else to `parse_normalize`.
 """
 
 import asyncio
+from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Final, Literal
@@ -28,6 +30,7 @@ from typing import Final, Literal
 from jobhunter.db.sql import q
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
+from jobhunter.graphs.collect.nodes.plan import count_skips_written
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger, planner
@@ -103,10 +106,18 @@ def make_plan_fallback(deps: CollectDeps) -> Node:
                     await ledger.record_account(conn, account, settings=settings, now=deps.clock())
             async with deps.engine.connect() as conn:  # after the read: a breaker it opened is seen
                 instances = await list_instances(conn)
+        written: Counter[str] = Counter()
         async with deps.engine.begin() as conn:
             ids = await planner.plan_fallback(
-                conn, owner=owner, settings=settings, instances=instances, now=deps.clock(), account=account
+                conn,
+                owner=owner,
+                settings=settings,
+                instances=instances,
+                now=deps.clock(),
+                account=account,
+                skips_written=written,
             )
+        count_skips_written(written)  # once, after the commit: a reused fallback plan wrote none
         return {"fallback_fetch_request_ids": ids, "steps": ["plan_fallback"]}
 
     return plan_fallback

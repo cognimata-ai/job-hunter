@@ -82,7 +82,8 @@ async def test_breaker_timestamps_clear_on_ok_and_disabled(engine) -> None:  # r
         ("adzuna", "disabled", None, None, 0),
         ("jsearch", "ok", None, None, 0),
     ]
-    # fix wave F4 (ledger L62): disabling the open instance resolves its alert, as a success does
+    # fix wave F4 (ledger L62): disabling the open instance resolves its alert, as a success does (a missing
+    # secret keeps only `source.auth_failed` open, below; this one is `source.contract_broken`)
     assert await open_alerts(engine) == set()
 
 
@@ -215,12 +216,18 @@ async def test_a_missing_provider_secret_disables_and_only_that_disable_is_resto
         "arbeitnow": "ok",
     }
     assert await state(engine, js.id) == ("disabled", 0, None, None, None, "missing_secret")
-    assert await open_alerts(engine) == set()  # the disable resolved `source.auth_failed` (ledger L62)
+    # F4 fix round 1 (Minor 3): the missing key stays visible: `source.auth_failed` stays open (§17.6 resolves
+    # it on a success only, Ruling FR-l), though the disable cleared the breaker
+    assert await open_alerts(engine) == {"source.auth_failed"}
     assert (await sync(engine, worker_config(tmp_path, "b", without_adzuna_key)))["adzuna"] == "disabled"
     assert await sync(engine, worker_config(tmp_path, "c", PROVIDER_SECRETS)) == dict.fromkeys(
         ("jsearch", "serpapi", "adzuna", "arbeitnow"), "ok"
     )
     assert await state(engine, js.id) == ("ok", 0, None, None, None, None)
+    assert await open_alerts(engine) == {"source.auth_failed"}  # restored, not yet used: still open
+    async with engine.begin() as c:
+        await record_success(c, js.id, now=utcnow())  # the restored key's first success resolves it
+    assert await open_alerts(engine) == set()
 
 
 async def test_sync_leaves_administrative_disables_and_breaker_states_untouched(engine, tmp_path) -> None:
@@ -295,3 +302,13 @@ async def test_instance_for_company_keys_by_slug_and_lever_region(engine) -> Non
     async with engine.begin() as c:
         with pytest.raises(LookupError):
             await instance_for_company(c, again + 1000)
+
+
+async def test_an_administrative_disable_resolves_every_open_state_alert(engine) -> None:
+    """F4 fix round 1 (Minor 3): only a missing secret keeps `source.auth_failed` open; any other disable
+    (the user's) resolves every open-state alert of the instance, as §17.6's "removal" does."""
+    now, js = utcnow(), await instance(engine, "jsearch")
+    async with engine.begin() as c:
+        await record_failure(c, js.id, "auth", billing="paid", now=now)
+        await disable(c, js.id, code="by_user")
+    assert await open_alerts(engine) == set()

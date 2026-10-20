@@ -1207,8 +1207,10 @@ def conflicting_graph(saver: BaseCheckpointSaver[str], deps: CollectDeps) -> Col
     """The real collection graph whose `fetch_cell` adds the outcome `CONFLICT_WORK_ID` (its `items` the
     Send's own fetch request id) to every update: two Sends of one step conflict in the reducer."""
 
-    def make(cell_deps: CollectDeps) -> Callable[[FetchCellInput], Awaitable[CollectUpdate]]:
-        cell = make_fetch_cell(cell_deps)
+    def make(
+        cell_deps: CollectDeps, *, cell_timeout: timedelta
+    ) -> Callable[[FetchCellInput], Awaitable[CollectUpdate]]:
+        cell = make_fetch_cell(cell_deps, cell_timeout=cell_timeout)
 
         async def fetch_cell(state: FetchCellInput) -> CollectUpdate:
             update = await cell(state)

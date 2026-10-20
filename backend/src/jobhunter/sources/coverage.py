@@ -57,7 +57,7 @@ from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.sources.arbeitnow import FirehoseState, Gap
 from jobhunter.sources.ats.common import SnapshotDraft
-from jobhunter.sources.base import CoverageWindow
+from jobhunter.sources.base import CoverageWindow, GapReason
 from jobhunter.sources.jsearch import admits_next_page
 from jobhunter.sources.watchlist_patterns import ATS_TYPES
 from jobhunter.types import JSONValue
@@ -170,16 +170,6 @@ class JSearchContinuation:
 
 # ---- intervals --------------------------------------------------------------------------------------------
 
-GapReason = Literal[
-    "page_cap",
-    "allowance",
-    "ambiguous_attempt",
-    "unknown_continuation",
-    "beyond_provider_window",
-    "incomplete_snapshot",
-    "source_failed",
-    "shutdown",
-]
 # The skips that end a traversal because the run was ending (§7.16.5); `breaker_open` is the source's failure
 # (Ruling T14-b), and every other skip a denial of the allowance (`paced`, `reserve_held`, `exhausted`,
 # `window_cap`, `awaiting_window_validation`).
@@ -343,7 +333,9 @@ async def record_firehose_traversal(
 
     `state` is the coverage the traversal started from and `gaps` what `arbeitnow.conclude` created or
     changed: a gap of `state` moves to its new status (`closed` or `abandoned`; one already moved stays),
-    every other gap is a new row with `reason` (an abandoned one closed at once). `covered` is
+    every other gap is a new row with its own reason when `conclude` gave it one (the gap above a page's
+    fill is `unknown_continuation`, Ruling FR-o; a narrowed gap's remainder keeps its reason), else
+    `reason` (an abandoned one closed at once). `covered` is
     `arbeitnow.covered_span` of the reads, the run's `covered` row.
     """
     known = {(gap.lower, gap.upper) for gap in state.gaps}
@@ -364,7 +356,7 @@ async def record_firehose_traversal(
             cell_id,
             (gap.lower, gap.upper),
             status=status,
-            reason=reason,
+            reason=gap.reason or reason,
             run_id=run_id,
         )
         opened += int(inserted and status == "open")

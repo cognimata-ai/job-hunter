@@ -6,11 +6,11 @@ sub-domain (Personio, Recruitee). A trailing slash, the rest of the path, the qu
 are ignored, with two exceptions that read the table by its meaning rather than literally (fix wave F4,
 ledger L151): the ATS's own site (`www.recruitee.com`, `www.jobs.personio.de`) names no board, and a
 Greenhouse embed URL (`boards.greenhouse.io/embed/job_board?for=acme`) names its board in the `for`
-parameter, not in the path (`embed` is no slug; without `for` the URL names none). The slug is taken as
-written, never decoded or normalised, and must match `SLUG` as a whole (`jobs.lever.co/../etc` and `%2e%2e`
-are `bad_slug`). Workable is recognised and unsupported in v1; any other host, and a board host without a
-slug, is `unsupported_pattern` (the user then enters ATS and slug by hand); a text that is not an http(s) URL
-with a host is `not_a_url`.
+parameter, not in the path (`embed` is no slug; without `for` the URL names none). The slug, the `for`
+value included, is taken as written, never decoded or normalised, and must match `SLUG` as a whole
+(`jobs.lever.co/../etc` and `%2e%2e` are `bad_slug`). Workable is recognised and unsupported in v1; any
+other host, and a board host without a slug, is `unsupported_pattern` (the user then enters ATS and slug by
+hand); a text that is not an http(s) URL with a host is `not_a_url`.
 
 `API_HOSTS` is the compile-time allowlist of §5.4: the only hosts an ATS adapter or the validation ever
 requests, with `{slug}` in the board sub-domain of Personio and Recruitee. No host is user-controlled: a
@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Literal, get_args
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 AtsType = Literal["greenhouse", "lever", "ashby", "personio", "recruitee", "smartrecruiters"]
 LeverRegion = Literal["global", "eu"]
@@ -88,6 +88,16 @@ def _board(slug: str, ats: AtsType, region: LeverRegion | None) -> Detected | Un
     return Detected(ats, slug, region)
 
 
+def _query_value(query: str, name: str) -> str:
+    """The value of the query's first `name` parameter as written, never decoded (`for=ac%6De` stays
+    `ac%6De`, which `SLUG` refuses, as a path slug is never decoded either); `""` without one."""
+    for pair in query.split("&"):
+        key, _, value = pair.partition("=")
+        if key == name:
+            return value
+    return ""
+
+
 def detect(url: str) -> Detected | Unsupported:
     """The ATS and slug of a careers URL by the §5.4 table; the URL is never fetched."""
     try:
@@ -103,7 +113,7 @@ def detect(url: str) -> Detected | Unsupported:
         ats, region = named
         slug = parts.path.split("/")[1] if parts.path.startswith("/") else ""
         if ats == "greenhouse" and slug == _GREENHOUSE_EMBED:
-            slug = next(iter(parse_qs(parts.query).get("for", [])), "")
+            slug = _query_value(parts.query, "for")
         return _board(slug, ats, region)
     for pattern, ats in _SUBDOMAIN_HOSTS:
         if (match := pattern.fullmatch(host)) is not None:

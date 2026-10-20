@@ -9,10 +9,11 @@ fallback phase to `parse_normalize` (only the fallback phase has fallback ids).
 `fetch_cell` (`traverse_and_record`): loads the planned row, its cell and its run (`load_planned`), builds the
 `CellPlan` from the stored spec (its window is the planned one, never recomputed) and the adapter of the
 instance, holds the source's semaphore (`deps.fetch_ctx`: a board holds its host's), runs
-`traverse.traverse_cell(…, limiter=deps.limiter)` within `TRAVERSAL_TIMEOUT` (§9.2: 15 min per traversal,
+`traverse.traverse_cell(…, limiter=deps.limiter)`, then records the coverage in one transaction that first
+holds the owner row `FOR SHARE`, all of it within `TIMEOUTS["fetch_cell"]` (§9.2: 15 min per traversal,
 timed from the moment it holds its semaphore, so the wait behind the traversals ahead of it never counts
-against it; fix wave F4, ledger L205: the node has no LangGraph timeout of its own), then records the
-coverage in one transaction that first holds the owner row `FOR SHARE` (`coverage.record_search_traversal`,
+against it; fix wave F4, ledger L205: the node has no LangGraph timeout of its own; the read of the planned
+row before the semaphore has the same bound) (`coverage.record_search_traversal`,
 `record_firehose_traversal` or `record_ats_snapshot`; a board whose traversal a shutdown or a takeover cut
 short writes no snapshot), then passes `afault_point("collect.after_coverage_commit")`, and counts in
 `FETCH_REQUESTS` the pages this attempt sent or denied, by status (a page a resumed attempt replays from its
@@ -49,8 +50,9 @@ from jobhunter.sources.traverse import TraversalResult, traverse_cell
 from jobhunter.worker.runs import RunOwner
 
 FETCH_CELL: Final = "fetch_cell"
-# §9.2 node 2: "15 min per traversal", from the moment the traversal holds its source's (or host's) semaphore.
-TRAVERSAL_TIMEOUT: Final = timedelta(minutes=15)
+# §9.2 node 2: "15 min per traversal", from the moment the traversal holds its source's (or host's) semaphore,
+# over all of the cell's work after it (the graph's `TIMEOUTS["fetch_cell"]`).
+CELL_TIMEOUT: Final = timedelta(minutes=15)
 # The ends of a traversal that a shutdown or a takeover cut short: no snapshot is written for them.
 INTERRUPTED: Final = frozenset({"shutdown", "superseded"})
 
@@ -171,29 +173,50 @@ async def _record(conn: AsyncConnection, planned: PlannedCell, result: Traversal
         )
 
 
-async def traverse_and_record(
-    deps: CollectDeps, fetch_request_id: int, *, attempt_no: int | None = None
-) -> TraversalResult:
-    """`fetch_cell`'s work (module docstring): the traversal of a planned request and its coverage."""
-    planned = await load_planned(deps.engine, fetch_request_id, attempt_no=attempt_no)
-    adapter = deps.adapters(planned.instance)
-    ctx = acquire_context(deps, planned, adapter)
-    async with _semaphore(deps, planned.instance.source_id, adapter):
-        async with asyncio.timeout(TRAVERSAL_TIMEOUT.total_seconds()):  # started once the slot is held
-            result = await traverse_cell(ctx, planned.plan, fetch_request_id, limiter=deps.limiter)
+async def _commit(deps: CollectDeps, planned: PlannedCell, result: TraversalResult) -> None:
+    """The traversal's coverage, in one transaction that first holds the owner row `FOR SHARE`."""
     async with deps.engine.begin() as conn:
         await ledger.lock_run_owner(conn, planned.owner)
         await _record(conn, planned, result)
+
+
+async def traverse_and_record(
+    deps: CollectDeps,
+    fetch_request_id: int,
+    *,
+    attempt_no: int | None = None,
+    cell_timeout: timedelta = CELL_TIMEOUT,
+) -> TraversalResult:
+    """`fetch_cell`'s work (module docstring): the traversal of a planned request and its coverage.
+
+    Everything the cell does after it holds its semaphore (the traversal and the coverage transaction) is
+    bounded by `cell_timeout` from that moment on (§9.2: 15 min per traversal), and so is the read of the
+    planned row before it; the wait for the semaphore is not: the traversals ahead of it are bounded each by
+    their own `cell_timeout`, and the run's end (a shutdown or a takeover) ends the waiters with it.
+    """
+    limit = cell_timeout.total_seconds()
+    async with asyncio.timeout(limit):
+        planned = await load_planned(deps.engine, fetch_request_id, attempt_no=attempt_no)
+    adapter = deps.adapters(planned.instance)
+    ctx = acquire_context(deps, planned, adapter)
+    async with asyncio.timeout(None) as cell:  # no deadline while the semaphore is awaited
+        async with _semaphore(deps, planned.instance.source_id, adapter):
+            cell.reschedule(asyncio.get_running_loop().time() + limit)  # from the held slot on
+            result = await traverse_cell(ctx, planned.plan, fetch_request_id, limiter=deps.limiter)
+        await _commit(deps, planned, result)
     await afault_point("collect.after_coverage_commit")
     for outcome in result.attempted:  # the pages this attempt sent or denied: never a replayed receipt
         FETCH_REQUESTS.labels(source=planned.instance.source_id, status=outcome["status"]).inc()
     return result
 
 
-def make_fetch_cell(deps: CollectDeps) -> FetchCellNode:
+def make_fetch_cell(deps: CollectDeps, *, cell_timeout: timedelta = CELL_TIMEOUT) -> FetchCellNode:
+    """The `fetch_cell` node; `cell_timeout` bounds each cell's work (the graph passes its
+    `TIMEOUTS["fetch_cell"]`)."""
+
     async def fetch_cell(state: FetchCellInput) -> CollectUpdate:
         result = await traverse_and_record(
-            deps, state["fetch_request_id"], attempt_no=state.get("attempt_no")
+            deps, state["fetch_request_id"], attempt_no=state.get("attempt_no"), cell_timeout=cell_timeout
         )
         return {
             "outcomes": {outcome["work_id"]: outcome for outcome in result.outcomes},

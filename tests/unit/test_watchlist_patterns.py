@@ -81,6 +81,10 @@ def test_detection_edges(url, expected) -> None:
         ("https://boards.greenhouse.io/embed/job_board", Unsupported("unsupported_pattern")),
         ("https://boards.greenhouse.io/embed/job_board?for=", Unsupported("unsupported_pattern")),
         ("https://boards.greenhouse.io/embed/job_board?for=../etc", Unsupported("bad_slug")),
+        # taken as written, never decoded (F4 fix round 1, Minor 5), as a path slug is
+        ("https://boards.greenhouse.io/embed/job_board?for=ac%6De", Unsupported("bad_slug")),
+        ("https://boards.greenhouse.io/embed/job_board?for=a+b", Unsupported("bad_slug")),
+        ("https://boards.greenhouse.io/embed/job_board?f%6Fr=acme", Unsupported("unsupported_pattern")),
         ("https://boards.greenhouse.io/acme?for=other", Detected("greenhouse", "acme", None)),
         (
             "https://jobs.lever.co/embed?for=acme",

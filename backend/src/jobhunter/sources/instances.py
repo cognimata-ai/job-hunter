@@ -27,11 +27,16 @@ from jobhunter.db.seed import DEFAULT_INSTANCES
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.sources.base import MISSING_SECRET
-from jobhunter.sources.breaker import Health, resolve_alerts
+from jobhunter.sources.breaker import ALERTS, Health, resolve_alerts
 
 # The §19.2 secret files a source's `default` instance cannot send without; the free sources need none.
 PROVIDER_SECRETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     {"jsearch": ("rapidapi_key",), "serpapi": ("serpapi_key",), "adzuna": ("adzuna_app_id", "adzuna_app_key")}
+)
+
+# The alerts a disable leaves open, by its code: the credential problem a missing secret still is.
+_KEPT_ON_DISABLE: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+    {MISSING_SECRET: frozenset({ALERTS["auth_failed"][0]})}
 )
 
 _log = get_logger("jobhunter.sources.instances")
@@ -90,10 +95,12 @@ async def list_instances(conn: AsyncConnection) -> list[InstanceRow]:
 async def disable(conn: AsyncConnection, instance_id: int, *, code: str) -> None:
     """`disabled` with `last_error_code = code`, the breaker cleared (no timestamps, no failures) and the
     alert of the open state it left resolved: a disabled instance is no open breaker
-    (`breaker.resolve_alerts`)."""
+    (`breaker.resolve_alerts`). A disable for a missing secret keeps an open `source.auth_failed`: the
+    credential is still missing, §17.6 resolves that alert on a success only, and a missing credential stays
+    visible (Ruling FR-l); the restored key's first success resolves it."""
     if (await conn.execute(_DISABLE, {"id": instance_id, "code": code})).first() is None:
         raise LookupError(f"source instance {instance_id} does not exist")
-    await resolve_alerts(conn, instance_id)
+    await resolve_alerts(conn, instance_id, keep=_KEPT_ON_DISABLE.get(code, frozenset()))
 
 
 def _secrets_present(cfg: AppConfig, source_id: str) -> bool:

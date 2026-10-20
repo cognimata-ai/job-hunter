@@ -18,12 +18,13 @@ The page rules (§5.3):
 - **Arbeitnow** (Ruling T10-a): the fresh head from page 1, read to the end of the feed (`end`), the page cap
   `arbeitnow.page_cap(interval_s)` (`cursor`, `page_cap`) or `remaining_low` (`cursor`, `allowance`); no
   item time stops it. Its reads go to `arbeitnow.conclude` and `covered_span` against the cell's
-  `FirehoseState`, rebuilt from its newest `covered` row and its gaps of every status, with the earliest
-  fill instant of its pages (`arbeitnow.filled_at`), past which nothing is covered. The read from page 1
-  ends every traversal (the end of the feed, the cap, the remaining-low rule or a failure), so no seek leg is
-  planned: no page would be left for one (plan Deviation 27). A traversal that fails after its first page
-  concludes with `stopped_by="remaining"` (its reads prove nothing), one that read nothing does not
-  conclude.
+  `FirehoseState`, rebuilt from its newest `covered` row and its gaps of every status (with their
+  reasons), with the earliest fill instant of its pages (`arbeitnow.filled_at`), past which nothing is
+  covered (nothing past the previous covered bound when a page's age is unknown, Ruling FR-q). The read
+  from page 1 ends every traversal (the end of the feed, the cap, the remaining-low rule or a failure), so
+  no seek leg is planned: no page would be left for one (plan Deviation 27). A traversal that fails after
+  its first page concludes with `stopped_by="remaining"` (its reads prove nothing), one that read nothing
+  does not conclude.
 - **ATS boards**: until `END` (Lever and SmartRecruiters by offset), at most `ATS_PAGE_CAP` list pages;
   SmartRecruiters detail calls for the postings `detail_specs` names after each list page (none once
   admission has stopped), at most `ratelimit.SMARTRECRUITERS_DETAIL.concurrency` at a time in the process
@@ -47,8 +48,8 @@ logged and changes nothing. The sends go through the process's `RateLimiter`: th
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Final, Literal
+from datetime import UTC, datetime
+from typing import Final, Literal, cast
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -83,7 +84,15 @@ from jobhunter.sources.arbeitnow import (
 )
 from jobhunter.sources.ats.common import AtsAdapter, SnapshotDraft, membership
 from jobhunter.sources.ats.smartrecruiters import SmartRecruitersAdapter
-from jobhunter.sources.base import CellPlan, Continuation, CoverageWindow, RawPage, RequestSpec, SourceError
+from jobhunter.sources.base import (
+    CellPlan,
+    Continuation,
+    CoverageWindow,
+    GapReason,
+    RawPage,
+    RequestSpec,
+    SourceError,
+)
 from jobhunter.sources.breaker import available, instance_availability
 from jobhunter.sources.instances import list_instances
 from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL, RateLimiter
@@ -106,9 +115,11 @@ _DETAILED = q(
     "AND native_id = ANY(CAST(:ids AS text[])) AND list_item_sha256 IS NOT NULL"
 )
 _INTERVALS = q(
-    "SELECT kind, lower(span) AS lower, upper(span) AS upper, gap_status FROM coverage_intervals "
+    "SELECT kind, lower(span) AS lower, upper(span) AS upper, gap_status, reason FROM coverage_intervals "
     "WHERE cell_id = :c ORDER BY lower(span), upper(span), id"
 )
+# The instant before every item: a read whose page's age is unknown, in a never-covered cell, proves nothing.
+_NOTHING_PROVEN: Final = datetime.min.replace(tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -299,7 +310,10 @@ def _rules_allow_next(plan: CellPlan, spec: RequestSpec, served: Served) -> bool
 async def _search(t: _Traversal, first: RequestSpec, first_id: int | None) -> TraversalResult:
     adapter, plan = t.ctx.adapter, t.plan
     spec, planned_id = first, first_id
-    cursor: str | None = None  # the continuation of the last served page (§5.6: the gap keeps it)
+    # the continuation of the last served page (§5.6: the gap keeps it), and before the first one the cursor
+    # the first spec resumes (a reused JSearch cursor): a resumed page that fails or is denied leaves its gap
+    # the cursor that fetches it again (Ruling FR-p, ledger L216)
+    cursor: str | None = first.cursor_in
     while True:
         result = await t.acquire(spec, planned_id, key=plan.source_id)
         if not isinstance(result, Served):
@@ -353,8 +367,18 @@ async def _firehose_state(engine: AsyncEngine, cell_id: int) -> FirehoseState:
             if row.kind == "covered":
                 newest = row.upper if newest is None else max(newest, row.upper)
             else:
-                gaps.append(Gap(row.lower, row.upper, row.gap_status))
+                gaps.append(Gap(row.lower, row.upper, row.gap_status, cast(GapReason | None, row.reason)))
     return FirehoseState(newest, tuple(gaps))
+
+
+def _earliest_fill(fills: Sequence[datetime | None], state: FirehoseState) -> datetime:
+    """The instant the read's coverage stops at: its earliest page fill (ledger L137); when a page's age is
+    unknown (`None`), at most the cell's previous covered bound, and nothing at all in a never-covered cell
+    (Ruling FR-q: no claim the headers do not prove)."""
+    known = [fill for fill in fills if fill is not None]
+    if len(known) < len(fills):
+        known.append(state.newest_covered_upper or _NOTHING_PROVEN)
+    return min(known)
 
 
 async def _firehose(
@@ -367,7 +391,7 @@ async def _firehose(
     cap = 1 if t.probe else page_cap(ctx.settings.interval_s)
     state = await _firehose_state(ctx.engine, plan.cell_id)
     times: list[datetime] = []
-    fills: list[datetime] = []  # when each served page was made (`arbeitnow.filled_at`)
+    fills: list[datetime | None] = []  # when each served page was made (`arbeitnow.filled_at`)
     spec, planned_id = first, first_id
     end: End
     reason: str | None
@@ -399,7 +423,7 @@ async def _firehose(
         spec, planned_id = nxt, None
     if not t.pages:
         return t.result(end, reason)
-    filled = min(fills)  # the coverage claims nothing newer than the earliest page's content (ledger L137)
+    filled = _earliest_fill(fills, state)
     _, changed = conclude(
         state,
         times,

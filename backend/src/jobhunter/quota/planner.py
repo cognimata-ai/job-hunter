@@ -471,8 +471,9 @@ class _Rows:
     planned: list[int] = field(default_factory=list)
     skipped: Counter[str] = field(default_factory=Counter)
     cells: int = 0
+    skips_by_source: Counter[str] = field(default_factory=Counter)  # the skipped receipts written, by source
 
-    async def write(self, draft: _Draft, *, skip: str | None) -> None:
+    async def write(self, draft: _Draft, *, skip: str | None, source_id: str) -> None:
         spec = draft.spec
         fetch_request_id = await insert_fetch_request(
             self.conn,
@@ -489,6 +490,7 @@ class _Rows:
         self.cells += 1
         if skip is not None:
             self.skipped[skip] += 1
+            self.skips_by_source[source_id] += 1
             return
         self.planned.append(fetch_request_id)
         if draft.abandoned is not None:
@@ -560,7 +562,7 @@ async def _plan_instance(
             now=rows.now,
             settings=settings,
         )
-        await rows.write(draft, skip=skip)
+        await rows.write(draft, skip=skip, source_id=instance.source_id)
 
 
 def _plans_primary(instance: InstanceRow, settings: RunSettings, *, include_paid: bool) -> bool:
@@ -620,11 +622,14 @@ async def plan_run(
     instances: Sequence[InstanceRow],
     now: datetime,
     account: AccountObservation | None,
+    skips_written: Counter[str] | None = None,
 ) -> PlanReport:
     """The primary plan of `owner`'s run (§9.2 node 1; see the module docstring), in the caller's transaction.
 
     `account` goes to a SerpApi projection only, never to JSearch's or Adzuna's (Ruling T13-c); the primary
-    plan has no SerpApi spec, so the `plan` node passes `None`.
+    plan has no SerpApi spec, so the `plan` node passes `None`. `skips_written` (when given) gains, by source,
+    the `skipped` receipts this call wrote (a pacing deferral, an open breaker): none when the plan is the
+    run's receipt already, so the caller counts each once, after its commit (`FETCH_REQUESTS`).
     """
     await lock_run_owner(conn, owner)
     reused = await _reuse(conn, owner, "primary")
@@ -647,6 +652,8 @@ async def plan_run(
                     rows, instance, mine, adapter_of(instance), settings=settings, account=account
                 )
         reused = rows.report()
+        if skips_written is not None:
+            skips_written.update(rows.skips_by_source)
     log.info(
         "run_planned",
         run_id=owner.run_id,
@@ -667,9 +674,10 @@ async def plan_fallback(
     instances: Sequence[InstanceRow],
     now: datetime,
     account: AccountObservation | None,
+    skips_written: Counter[str] | None = None,
 ) -> list[int]:
     """The SerpApi fallback of `owner`'s run (§6.6, §9.2 node 3): the ids of its planned specs, in the
-    caller's transaction (see the module docstring)."""
+    caller's transaction (see the module docstring); `skips_written` as for `plan_run`."""
     await lock_run_owner(conn, owner)
     if (reused := await _reuse(conn, owner, "fallback")) is not None:
         return reused.primary_fetch_request_ids
@@ -687,6 +695,8 @@ async def plan_fallback(
     rows = _Rows(conn, owner, "fallback", now)
     async with _spec_adapters(now) as adapter_of:
         await _plan_instance(rows, serpapi, cells, adapter_of(serpapi), settings=settings, account=account)
+    if skips_written is not None:
+        skips_written.update(rows.skips_by_source)
     if rows.planned:
         await raise_alert(
             conn,

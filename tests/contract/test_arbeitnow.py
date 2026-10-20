@@ -202,8 +202,10 @@ async def test_a_fixture_run_reads_pages_one_and_two_then_the_end_and_is_covered
     assert covered_span(times, stopped_by="end") == (min(times), max(times))
     # the recorded pages were made (V8: `date` less `age`, 20:29:22 the earliest) after their newest item:
     # the fill instant clamps nothing here (fix wave F4, ledger L137)
-    assert min(fills) == datetime(2026, 10, 18, 20, 29, 22, tzinfo=UTC) > max(times)
-    assert covered_span(times, stopped_by="end", filled_at=min(fills)) == (min(times), max(times))
+    known = [fill for fill in fills if fill is not None]
+    assert len(known) == len(fills)  # every recorded page is a hit with a readable `Age` (Ruling FR-q)
+    assert min(known) == datetime(2026, 10, 18, 20, 29, 22, tzinfo=UTC) > max(times)
+    assert covered_span(times, stopped_by="end", filled_at=min(known)) == (min(times), max(times))
 
 
 async def test_fetch_asks_for_the_page_of_the_spec_and_nothing_else() -> None:
