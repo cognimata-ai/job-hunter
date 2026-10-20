@@ -21,8 +21,12 @@ Three models took part, Claude Opus 5.5, Claude Fable 5.1 and Codex GPT‑6 Astr
    - First round: Codex rejected it (2 critical, 3 important). The critical findings were a real personal name left in two committed fixtures, and unfenced worker writes at startup and in retention. Fable approved with changes (3 important, 7 minor).
    - Fixes: seven fix dispatches, each with its own scoped review and re-review. They are recorded as Deviations 51–63, as amendments to earlier Deviations, and in the carry-forward list of the M1 plan.
    - Re-review: both approved, with all 15 findings fixed. Their remaining minors were applied in the last dispatch or carried forward.
-   - The scrubbed name remains in the feature branch's pre-fix history. It never reached `main`.
+   - The scrubbed name remains in the feature branch's pre-fix history, and it reached `main` with the merge commit of PR #2. Removing it needs a history rewrite of `main`, which is the user's decision.
    - The reviews refer to the controller ledger (`.superpowers/sdd/…/progress.md`), a git-ignored working file that is deleted once M1 is complete.
+10. **M2 plan 4-eyes review** ([`plan-reviews/`](plan-reviews/), `m2-round1-codex.md` to `m2-round6-codex.md`): six Codex rounds on the M2 plan (LLM gateway, CV profile and settings).
+    - Round 1 rejected it with 2 blockers and 12 major findings: the test reset, a stale cap at month rollover, the reservation owner, long calls, paid-work receipts, the overrun-buffer formula, the spike budget, checkpoint error writes, CV retention, and others.
+    - Rounds 2 to 5 each confirmed the earlier fixes and found narrower issues: the reset's delete order, approval generations and repair identity, native-PDF checks, thread names, failure hooks, and retention racing activation and retry.
+    - Round 6 approved, with no blocker or major finding left.
 
 ## Standing rules
 See [`notes.md`](notes.md): Codex GPT‑6 Astra is used only at `high` effort in council and review rounds.
