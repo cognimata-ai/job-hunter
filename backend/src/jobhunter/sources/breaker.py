@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.observability.alerts import Severity, raise_alert, resolve_alert
-from jobhunter.sources.base import Billing
+from jobhunter.sources.base import MISSING_SECRET, Billing
 
 if TYPE_CHECKING:
     from jobhunter.sources.instances import InstanceRow
@@ -124,6 +124,22 @@ async def record_success(conn: AsyncConnection, instance_id: int, *, now: dateti
     await conn.execute(_SUCCEEDED, {"id": instance_id, "now": now})
     await resolve_alerts(conn, instance_id)
     return "ok"
+
+
+async def raise_missing_secret(conn: AsyncConnection, instance_id: int, source_id: str) -> None:
+    """Open `source.auth_failed` (critical) for an instance disabled because its provider secret is missing
+    (Ruling FR-t, FR-l: a missing paid credential is an open alert, not only a `disabled` health), with the
+    code `missing_secret` in its context. §17.6 resolves it on a success: the instance's first successful
+    request once the key is back and the start's sync restored it (`record_success`)."""
+    code, severity = ALERTS["auth_failed"]
+    await raise_alert(
+        conn,
+        code=code,
+        severity=severity,
+        subject=_subject(instance_id),
+        message=f"source instance {instance_id} ({source_id}) is disabled: its provider secret is missing",
+        context={"instance_id": instance_id, "source_id": source_id, "code": MISSING_SECRET},
+    )
 
 
 async def resolve_alerts(

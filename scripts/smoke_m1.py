@@ -223,7 +223,8 @@ def wait_succeeded(ctx: Context, run_id: int, *, within_s: int) -> float:
 
 def worker_fake_mode() -> bool:
     """Whether the running worker container has `JOBHUNTER_FAKE_SOURCES=1` (the fixtures overlay). The value
-    is compared here and never printed; an unset variable is `False` (printenv's exit 1)."""
+    is compared here and never printed; an unset variable is `False` (printenv's silent exit 1). An exec that
+    fails (any other exit, or exit 1 with a message) raises `CheckFailed` with its stderr."""
     process = subprocess.run(
         [*DC, "exec", "-T", "worker", "printenv", FAKE_SOURCES_VAR],
         capture_output=True,
@@ -232,7 +233,10 @@ def worker_fake_mode() -> bool:
         check=False,
         timeout=DOCKER_TIMEOUT_S,
     )
-    if process.returncode not in (0, 1):  # docker or the container failed: its stderr, never stdout
+    # printenv exits 1, silently, for an unset variable; docker compose exec exits non-zero with a message of
+    # its own when it cannot run it (a worker that is not running exits 1 too). Either way no run is posted.
+    if process.returncode != 0 and (process.returncode != 1 or process.stderr.strip()):
+        # docker or the container failed: its stderr, never stdout
         raise CheckFailed(f"docker compose exec worker: exit {process.returncode}: {stderr_tail(process)}")
     return process.returncode == 0 and process.stdout.strip() == "1"
 

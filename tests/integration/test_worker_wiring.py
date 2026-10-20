@@ -16,7 +16,7 @@ from jobhunter.db.guards import Guard
 from jobhunter.embeddings import EmbedderClient, make_http_client
 from jobhunter.errors import FencedOut
 from jobhunter.sources import registry
-from jobhunter.sources.breaker import record_failure
+from jobhunter.sources.breaker import record_failure, record_success
 from jobhunter.sources.instances import InstanceRow, disable, sync_instances
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep, fence_epoch
 from jobhunter.worker.runs import FINAL_STATUSES
@@ -108,6 +108,51 @@ async def test_sync_instances_disables_sources_without_a_secret_and_fake_mode_ne
     assert await state(engine, "jsearch") == ("disabled", "by_user", None, None)
 
 
+AUTH_ALERT = sa.text(
+    "SELECT severity, context, resolved_at IS NULL AS open FROM alerts WHERE dedup_key = :k ORDER BY id"
+)
+
+
+async def auth_alerts(engine, source_id: str) -> list[tuple[object, ...]]:
+    """`source.auth_failed` of the source's `default` instance, oldest first: severity, context, open."""
+    async with engine.connect() as c:
+        instance = await instance_id(c, source_id)
+        return [
+            tuple(row)
+            for row in await c.execute(AUTH_ALERT, {"k": f"source.auth_failed:instance:{instance}"})
+        ]
+
+
+async def test_a_missing_paid_key_opens_source_auth_failed_until_the_restored_keys_first_success(
+    engine, make_config
+) -> None:
+    """Ruling FR-t (FR-l): the startup sync's disable of a paid instance for a missing secret opens
+    `source.auth_failed` (critical, code `missing_secret`) in its fenced transaction; a quota source (Adzuna)
+    is only disabled. Another start without the key adds no occurrence (the instance is already disabled);
+    the start that restores the key leaves the alert open; the first success resolves it (§17.6)."""
+    without = live_worker(make_config, {})
+    await sync(engine, without)
+    for source_id in ("jsearch", "serpapi"):
+        [(severity, context, still_open)] = await auth_alerts(engine, source_id)
+        async with engine.connect() as c:
+            instance = await instance_id(c, source_id)
+        assert (severity, still_open) == ("critical", True)
+        assert context == {"instance_id": instance, "source_id": source_id, "code": "missing_secret"}
+    assert await auth_alerts(engine, "adzuna") == []
+    await sync(engine, without)  # a second start without the key: already disabled, nothing more
+    async with engine.connect() as c:
+        occurrences = await c.execute(
+            sa.text("SELECT occurrences FROM alerts WHERE code = 'source.auth_failed' ORDER BY id")
+        )
+        assert list(occurrences.scalars()) == [1, 1]
+    assert (await sync(engine, live_worker(make_config, PROVIDER_SECRETS)))["jsearch"] == "ok"
+    assert [row[2] for row in await auth_alerts(engine, "jsearch")] == [True]  # the restore resolves nothing
+    async with engine.begin() as c:
+        await record_success(c, await instance_id(c, "jsearch"), now=utcnow())
+    assert [row[2] for row in await auth_alerts(engine, "jsearch")] == [False]
+    assert [row[2] for row in await auth_alerts(engine, "serpapi")] == [True]  # no success there yet
+
+
 async def test_a_worker_without_the_jsearch_key_plans_no_jsearch_spec_and_does_not_fail(
     engine, current_epoch, make_config, fake_http, fixture_log, fake_embedder
 ) -> None:
@@ -173,6 +218,8 @@ async def test_a_superseded_workers_startup_sync_is_refused_and_leaves_the_newer
         await sync(engine, live_worker(make_config, PROVIDER_SECRETS), fenced_by(stale))
     assert fenced.value.owner == "worker_epoch"
     assert await state(engine, "jsearch") == left  # as the newer owner left it
+    # the newer owner's missing-key alert stands (Ruling FR-t); the stale sync touched no alert
+    assert [row[2] for row in await auth_alerts(engine, "jsearch")] == [True]
     # The current epoch's own sync still restores the instance once its secret is there.
     assert (await sync(engine, live_worker(make_config, PROVIDER_SECRETS), fenced_by(newer)))[
         "jsearch"

@@ -89,13 +89,13 @@ class Client:
 
 
 def stub_printenv(
-    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, *, returncode: int, stdout: str
+    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, *, returncode: int, stdout: str, stderr: str = ""
 ) -> list[list[str]]:
     calls: list[list[str]] = []
 
     def run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(args)
-        return subprocess.CompletedProcess(args, returncode, stdout, "")
+        return subprocess.CompletedProcess(args, returncode, stdout, stderr)
 
     monkeypatch.setattr(
         smoke, "subprocess", SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired)
@@ -130,12 +130,18 @@ def test_the_paid_run_is_posted_on_the_fixtures_worker(smoke, monkeypatch) -> No
     assert client.posts == [f"{smoke.ORIGIN}/api/runs"] and smoke.STATE.paid_run_id == 7
 
 
-def test_a_failing_exec_is_reported_without_the_variable(smoke, monkeypatch) -> None:
-    stub_printenv(smoke, monkeypatch, returncode=125, stdout="")
+@pytest.mark.parametrize(
+    ("returncode", "stderr"),
+    [(125, ""), (1, 'service "worker" is not running\n')],  # F5 review, Minor 4: exit 1 with a message
+)
+def test_a_failing_exec_is_reported_as_such_without_the_variable(
+    smoke, monkeypatch, returncode: int, stderr: str
+) -> None:
+    stub_printenv(smoke, monkeypatch, returncode=returncode, stdout="", stderr=stderr)
     client = Client()
-    with pytest.raises(smoke.CheckFailed, match="exit 125"):
+    with pytest.raises(smoke.CheckFailed, match=f"docker compose exec worker: exit {returncode}") as failed:
         smoke.check_run_now_paid(smoke.Context(client=client, cookie="c"))
-    assert client.posts == []
+    assert client.posts == [] and "fake_sources" not in str(failed.value)
 
 
 @pytest.mark.parametrize("cached", [False, True])

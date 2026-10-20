@@ -227,6 +227,54 @@ async def test_an_ambiguous_job_joins_the_better_group(
     assert alert.resolved_at is not None
 
 
+async def test_the_ambiguity_of_a_job_that_stays_ends_when_no_other_group_qualifies(
+    engine, current_epoch, job_with_postings
+) -> None:
+    """F5 review, Minor 2: a job that joined the best of two groups and stays there keeps its alert while the
+    other group still qualifies, and has it resolved by the regroup that finds none left."""
+    make = jobs_maker(engine, job_with_postings)
+    first = [await make("adzuna", description_text=PARTIAL, description_completeness="partial") for _ in "xy"]
+    tail = varied(40, 30) + "…"  # as in the test above: the second group qualifies for A as well
+    second = [await make("jsearch", description_text=tail, description_completeness="partial") for _ in "xy"]
+    one, two = (await regroup(engine, first[0])).group_id, (await regroup(engine, second[0])).group_id
+    assert one is not None and two is not None
+    a = await make("greenhouse", description_text=FULL_TEXT)
+    assert (await regroup(engine, a)).ambiguous
+    key = f"dedup.ambiguous_grouping:job:{a}"
+    # the representative's own regroup confirms it: the other group still qualifies, the alert stays open
+    assert await regroup(engine, a) == GroupEffect(one, False, False, (), False, False)
+    [alert] = await fetch(engine, ALERT, k=key)
+    assert (alert.occurrences, alert.resolved_at) == (1, None)
+    async with engine.begin() as conn:
+        await groups.split_member(conn, two, second[1])  # the other group dissolves
+    assert (await group_row(engine, two))[0] == "dissolved"
+    start = await generation(engine)
+    assert await regroup(engine, a) == GroupEffect(one, False, False, (), False, False)
+    [alert] = await fetch(engine, ALERT, k=key)
+    assert alert.resolved_at is not None and await members(engine, one) == sorted([*first, a])
+    assert await generation(engine) == start  # a resolved alert changes nothing the list reads
+
+
+async def test_an_appointment_whose_revalidation_dissolves_the_group_reports_no_election(
+    engine, current_epoch, job_with_postings, monkeypatch
+) -> None:
+    """F5 review, Minor 3: as in `_representative`, a group that the revalidation after a fuller member's
+    appointment dissolves has no representative, so the join reports no election. Every pair rule is
+    symmetric and the join checked the pair, so the rules never dissolve a group there: the revalidation is
+    stubbed to let every other member leave."""
+    make = jobs_maker(engine, job_with_postings)
+    p, q = [await make("adzuna", description_text=PARTIAL, description_completeness="partial") for _ in "pq"]
+    group = (await regroup(engine, p)).group_id
+    assert group is not None and await members(engine, group) == [p, q]
+    c = await make("greenhouse", description_text=FULL_TEXT)
+    monkeypatch.setattr(
+        groups, "revalidation_departures", lambda rep, others, similarity: tuple(view.id for view in others)
+    )
+    effect = await regroup(engine, c)
+    assert effect == GroupEffect(None, True, False, (p, q, c), False, False)
+    assert await group_row(engine, group) == ("dissolved", None, None, "member_left")
+
+
 async def test_split_confirm_dissolve_and_reconciler(
     engine, current_epoch, job_with_postings, queue_app
 ) -> None:

@@ -23,9 +23,10 @@ confirms (G2-G5), against whose every member it passes G1 and has no `different`
 than `MAX_MEMBERS` members; a group without a representative cannot be validated and is not joined. Of
 several, the one with the best text score, then the lowest id: `dedup.ambiguous_grouping` is raised as an info
 alert (subject `job:<id>`, Ruling T20-b) when the job joins, logged, and kept in the member's evidence; a
-regroup that only confirms the job raises nothing, and the alert is resolved when the job leaves the group
-(`representative.leave`: it left, was split off or merged away, or the group dissolved). Otherwise the
-ungrouped candidate with the best pair evidence (text score, then lowest id) forms a new group with it, its
+regroup that only confirms the job raises nothing. The alert is resolved when the ambiguity is over: the job
+leaves the group (`representative.leave`: it left, was split off or merged away, or the group dissolved), or a
+regroup that keeps it there finds no other group still qualifying (`_end_ambiguity`). Otherwise the ungrouped
+candidate with the best pair evidence (text score, then lowest id) forms a new group with it, its
 representative elected by §8.7's order (`initial`). Groups are never merged together.
 
 **`regroup_job`** (the grouping of one job, in the caller's transaction): the candidates are the jobs of the
@@ -113,7 +114,7 @@ from jobhunter.dedup.representative import ELIGIBLE_SQL, MemberView, eligible
 from jobhunter.dedup.shingles import TextSide, text_confirms
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.geo.gazetteer import distance_km
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import DEDUP_GROUP_REPAIRS
 from jobhunter.quota import ledger
@@ -676,7 +677,8 @@ class _Regroup:
                 )
                 confirmed = evidence is not None
             if confirmed:
-                return self.effect(old)  # in the right group: nothing written
+                await self._end_ambiguity(old, a)
+                return self.effect(old)  # in the right group: nothing written but an ambiguity's end
             await self._write_leave(old, a.id, reason=MEMBER_LEFT)
         return await self._group(a, excluded=old)
 
@@ -704,7 +706,21 @@ class _Regroup:
         # A group dissolved instead of electing (fewer than two members), or by the revalidation after its
         # election, has no representative: that is no election (the run's `elections` counter, ledger L330).
         self.reelected |= elected and still
-        return self.effect(group_id if still and a.id not in left else None)
+        stays = still and a.id not in left
+        if stays:
+            await self._end_ambiguity(group_id, a)
+        return self.effect(group_id if stays else None)
+
+    async def _end_ambiguity(self, group_id: int, a: JobView) -> None:
+        """The job stays in the group it is in. When no other active group of its candidates qualifies for it
+        any more (§8.7's join rule, `choose_group`), the choice its `dedup.ambiguous_grouping` alert recorded
+        is over, and the alert is resolved (F5 review, Minor 2); a job without an open alert updates no row.
+        While another group still qualifies, the alert stays open. The candidates' groups are held (the one
+        ordered lock statement), so the answer holds until the commit."""
+        others = {self.groups.of[c.id] for c in self._candidates(a) if c.id in self.groups.of} - {group_id}
+        groups = [self.groups.view(g) for g in sorted(others) if self.groups.status[g] == "active"]
+        if choose_group(a, groups, self.views, different=self.different, similarity=self.similarity) is None:
+            await resolve_alert(self.conn, code=AMBIGUOUS_GROUPING, subject=f"job:{a.id}")
 
     def _candidates(self, a: JobView) -> list[JobView]:
         """The candidates as they are under the lock: unmerged, of `a`'s company, in the window."""
@@ -761,8 +777,15 @@ class _Regroup:
             and self.views[rep].completeness == "partial"
             and eligible(a.availability, a.merged)
         ):
-            self.left.extend(await _appoint(self.conn, choice.group_id, a.id, reason=FULLER_MEMBER_JOINED))
-            self.reelected = True
+            left = await _appoint(self.conn, choice.group_id, a.id, reason=FULLER_MEMBER_JOINED)
+            self.left.extend(left)
+            still = (await self.conn.execute(_GROUP, {"group": choice.group_id})).one().status == "active"
+            # As in `_representative`: a group its revalidation dissolved has no representative, so that is no
+            # election (F5 review, Minor 3). Every rule of the pair is symmetric and the join checked it, so
+            # the new representative's old one always stays and this cannot happen with the rules as they are.
+            self.reelected |= still
+            if not (still and a.id not in left):
+                return self.effect(None, joined=True, ambiguous=ambiguous)
         return self.effect(choice.group_id, joined=True, ambiguous=ambiguous)
 
     async def _form(self, a: JobView, partner: JobView, evidence: GroupEvidence) -> GroupEffect:
@@ -795,7 +818,8 @@ async def regroup_job(conn: AsyncConnection, job_id: int, *, guard: Guard) -> Gr
     deadlock freedom depends on no transaction ever waiting for it while holding a row (a caller that already
     holds rows must commit them first). A job that is merged or gone is left alone. `guard` runs after
     the job rows and before any write; it raises `FencedOut` to stop. Idempotent: a job already in the right
-    group is confirmed and nothing is written."""
+    group is confirmed and nothing is written, but the resolution of its ambiguous-grouping alert once no
+    other group qualifies."""
     locked = await _lock(conn, job_id)
     if not locked.found:
         return NO_EFFECT

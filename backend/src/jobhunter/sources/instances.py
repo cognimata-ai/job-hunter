@@ -3,7 +3,9 @@
 `sync_instances` applies plan Deviation 6 (a behaviour change approved by the user): a paid or quota
 `default` instance whose provider secret is absent is `disable`d with `last_error_code = 'missing_secret'`
 (an already disabled one keeps its own code), and an instance is restored to `ok` only from exactly that
-state once its secret is present again. Every other state is left untouched by the restore: an
+state once its secret is present again. A paid instance's disable also opens `source.auth_failed`
+(critical, code `missing_secret`; Ruling FR-t): the restore leaves it open, and the restored key's first
+success resolves it (§17.6). Every other state is left untouched by the restore: an
 administrative `disabled` with another code, and every breaker state with its timestamps. In fake mode
 (`JOBHUNTER_FAKE_SOURCES`) the fixtures need no secret, so every secret counts as present (Deviation 5).
 
@@ -23,11 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.config import AppConfig
 from jobhunter.db.guards import Guard
-from jobhunter.db.seed import DEFAULT_INSTANCES
+from jobhunter.db.seed import DEFAULT_INSTANCES, SOURCES
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.sources.base import MISSING_SECRET
-from jobhunter.sources.breaker import ALERTS, Health, resolve_alerts
+from jobhunter.sources.breaker import ALERTS, Health, raise_missing_secret, resolve_alerts
 
 # The §19.2 secret files a source's `default` instance cannot send without; the free sources need none.
 PROVIDER_SECRETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
@@ -38,6 +40,10 @@ PROVIDER_SECRETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
 _KEPT_ON_DISABLE: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
     {MISSING_SECRET: frozenset({ALERTS["auth_failed"][0]})}
 )
+
+# The sources whose missing secret also opens `source.auth_failed` at the disable (Ruling FR-t): the paid
+# ones (`paid_search`; Adzuna, a quota source, is only disabled).
+_PAID: Final = frozenset(source.id for source in SOURCES if source.kind == "paid_search")
 
 _log = get_logger("jobhunter.sources.instances")
 
@@ -122,6 +128,8 @@ async def sync_instances(conn: AsyncConnection, cfg: AppConfig, *, guard: Guard)
         present = _secrets_present(cfg, row.source_id)
         if not present and row.health != "disabled":
             await disable(conn, row.id, code=MISSING_SECRET)
+            if row.source_id in _PAID:  # Ruling FR-t: visible as an open alert, under the same fence
+                await raise_missing_secret(conn, row.id, row.source_id)
             health[row.source_id] = "disabled"
             _log.warning("source_instance_disabled", source_id=row.source_id, code=MISSING_SECRET)
         elif present and row.health == "disabled" and row.last_error_code == MISSING_SECRET:
