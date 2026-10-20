@@ -944,7 +944,8 @@ Also cover:
     - `register_operation_handler(kind, *, on_failed: FailureHook | None = None)` registers it.
     - `finish_operation(status='failed')` and `_release` (exhaustion by a requeue, the stale reclaim or the takeover sweep) call the hook right after the `failed` transition, in the same transaction.
     - A hook may lock only rows after the owner row in the §9.1 order.
-    - The text phase's hook moves the draft `extracting_text → failed(<code or 'attempts_exhausted'>)`; Task 13 adds the extract phase's.
+    - **One owner of the failure transition.** A hook first reads its domain row `FOR UPDATE` and moves it only while it is still live: a draft in `extracting_text` or `extracting_profile`, a proposal in `running`. A row the handler's own write already ended in the same transaction (a node's `failed(code)` followed by `finish_in(status='failed')`) is left as it is. So the direct failure and the operation's end commit together, and `transition()` never meets a row that is already terminal.
+    - The text phase's hook moves the draft `extracting_text → failed(<code or 'attempts_exhausted'>)`; Task 13 adds the extract phase's, and Task 20 the proposal's.
   - `class graphs.profile.state.ProfileState(TypedDict)`: `draft_id: int`, `operation_id: int`, `llm_call_id: int | None`, `steps: list[str]` and `outcome: str | None`, ids only. The validated LLM output between nodes lives in `llm_calls.output_json`, and the state holds only its id.
   - `graphs.profile.graph.sanitized(name, node) -> Node` wraps every profile node (Deviation 25). LangGraph persists an exception that escapes a node into `checkpoint_writes`, and an SQLAlchemy or Pydantic error can carry bound values (CV text, profile fields) in its message.
     - `FencedOut`, `asyncio.CancelledError`, LangGraph's `GraphBubbleUp` and the M2 domain errors whose `str()` is a code only (`LLMError` and its subclasses, `UploadRejected`, `TransitionConflict`) pass through unchanged.
@@ -989,6 +990,7 @@ Also cover:
 - an `encrypted` PDF gives `failed('encrypted')`;
 - the checkpoint rows of the thread contain no CV text: scan `checkpoints`, `checkpoint_blobs` **and** `checkpoint_writes` for a marker word of the synthetic CV, including after a node raises an `sqlalchemy.exc.StatementError` whose parameters hold the marker (`test_node_errors_reach_no_checkpoint_write`);
 - a text-phase operation exhausted by ten reclaims leaves the draft `failed('attempts_exhausted')` in the same transaction (the failure hook);
+- `test_direct_failures_commit_with_the_operation_end`: `low_text` here, and in Tasks 13 and 20 `refused` and an exhausted repair, each commit the domain row's `failed(code)` and the operation's `failed` in one transaction, with no rollback and no requeue;
 - `test_text_review_and_the_operation_end_commit_together`: a fault right after the `text_review` write's commit point finds the operation already `succeeded`;
 - two successive `extract_profile_text` operations of one draft history use two threads, and neither sees the other's state.
 - [ ] **Step 2: Run the tests and see them fail.**
@@ -1719,6 +1721,7 @@ Also cover, in `test_profile_confirm.py`:
       - **Kept:** the `cv_file_id` of the active profile version and of the previous one, and the file of any open draft. "Previous" follows the activation order, not `version_no`: it is the `confirmed_profile_version_id` of the newest confirmed draft before the newest one that names a different version. A reactivated older version therefore keeps the version it replaced as its previous.
       - **Purged at once:** every other file of a confirmed draft. That covers both the files of versions that are neither active nor previous, and an upload whose confirm reused another version with the same `profile_hash` (that version keeps its own `cv_file_id`).
       - **Purged after 30 days:** the files of drafts `discarded` or `failed` for 30 days (`status_changed_at`), and abandoned uploads (a row no draft references) 30 days after `uploaded_at`.
+      - **Serialised with activation.** Each batch of at most 100 files is one transaction, in the §9.1 order: `fence_epoch`, `active_config FOR SHARE`, the protection set computed under it, the candidate `cv_files` rows `FOR UPDATE`, the unlinks, the row updates, then the commit. A confirm, which takes `active_config FOR UPDATE`, waits for the batch. So no file is ever deleted under a protection set that a committed reactivation has changed.
       It deletes the file from `cv_store` first (missing is fine), then sets `storage_path`, `raw_text_enc` and `stripped_text` to NULL and sets `purged_at` (Deviation 21).
     - `RetentionRule("cv_store_orphans", timedelta(days=1))`: a file in `cv_store` that no `cv_files.storage_path` names and that is older than a day is deleted. That is an upload whose transaction rolled back after the file was written.
     - `RetentionRule("eval_runs", THIRTEEN_MONTHS)`: it keeps the latest completed run of each kind, and the calls cascade.
@@ -1743,6 +1746,9 @@ Also cover, in `test_profile_confirm.py`:
     - the active and the previous version's files are kept, and an older version's file is deleted on disk and nulled in the row;
     - a second upload whose confirm reused the active version (identical content, a different `cv_files` id) is purged, while the version's own file stays;
     - after V1, V2 and V3, a confirm reusing V1 keeps V1's and V3's files and purges V2's;
+    - `test_retention_and_reactivation_are_serialised`, both orders:
+      - a confirm reusing V1 that commits before the batch starts keeps V1's file;
+      - a batch paused at `retention.cv_files.after_select`, holding V1 as a candidate, makes a concurrent confirm reusing V1 wait on `active_config` (`tests/support/pg.lock_waits`); after the batch commits and the confirm proceeds, no unlink happens after the confirm's commit;
     - a proposal thread of a finished operation goes after 14 days, while a running proposal's thread of the same profile version stays;
     - the `content_purged_at` CHECKs hold;
     - the latest completed `eval_runs` row of a kind survives 14 months;
