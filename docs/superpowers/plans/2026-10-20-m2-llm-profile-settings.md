@@ -159,15 +159,18 @@ M2 adds:
   - Recorded Anthropic responses are generated from synthetic inputs only, and the M1 PII scan (`tests/contract/test_fixture_pii.py`) gates `tests/contract/fixtures/anthropic/**` too.
 - **Paid API (Anthropic), hard limits for the whole of M2:**
   - at most 8 paid messages;
-  - a sum of **worst-case reservations ≤ $0.45**, with expected actual spend about $0.15;
-  - the rest of the roadmap's "Anthropic < $1 in total" is left for M3's V5, V12 and V14.
+  - a running sum of **worst-case reservations ≤ $0.80**, each the exact `pricing.worst_case_usd` of the request about to be sent, the native-PDF extra share included;
+  - an expected actual spend of about $0.15, with the settled total recorded in `docs/spikes/V19.md`;
+  - the roadmap's "Anthropic < $1 in total" counts actual spend over V4, V5, V12, V13, V14 and V19, so M3's V5, V12 and V14 keep at least $0.80 of it.
 
   Planned use:
   - V13: 2 calls (Sonnet, Opus, `max_tokens` 1,024);
   - V4: 4 schema calls plus 1 informational `minimum` probe (`max_tokens` 2,000, effort `low`);
-  - V19: `messages.count_tokens`, which is free, plus **1** native-PDF extraction of a synthetic 1-page PDF (`max_tokens` 1,024).
+  - V19: `messages.count_tokens`, which is free, plus **1** native-PDF extraction of a synthetic 1-page PDF (`max_tokens` 1,024). It is reserved with the native-PDF extra share computed from the spike's own `overrun_buffer_usd = 0.50`, the §13.1 minimum, so the extra is $0.125. §22 V19 says "no new paid calls", but its native-PDF criterion compares recorded usage with `count_tokens`, and no native-PDF response is recorded yet (Deviation 9).
 
-  The spike recorder `scripts/spikes/record_anthropic.py` (Task 4) counts each send **before** it happens, under a file lock in `.fixtures-raw/anthropic-budget.json`. It refuses any send that would pass the spike's call count, the 8-message total, or the $0.45 running sum of worst-case reservations (`pricing.worst_case_usd`). It records the actual settled cost next to each entry. The key is the environment variable `JOBHUNTER_ANTHROPIC_API_KEY`, which the spike maps to the secret file `anthropic_key`. Never print, log or record the key. No paid call runs in CI. The payload tests are offline.
+  The worst cases at the floor overhead are about $0.08 for V13, $0.37 for V4 and $0.16 for V19.
+
+  The spike recorder `scripts/spikes/record_anthropic.py` (Task 4) counts each send **before** it happens, under a file lock in `.fixtures-raw/anthropic-budget.json`. It refuses any send that would pass the spike's call count, the 8-message total, or the $0.80 running sum of worst-case reservations (`pricing.worst_case_usd`, with the request's `extra_usd`). It records the actual settled cost next to each entry. The key is the environment variable `JOBHUNTER_ANTHROPIC_API_KEY`, which the spike maps to the secret file `anthropic_key`. Never print, log or record the key. No paid call runs in CI. The payload tests are offline.
 - No LangSmith tracing in M2 (`LANGSMITH_TRACING` unset; §17.8 is M5).
 - Commits use the scope `m2`, for example `feat(m2): …`.
 - **Test bodies (Ruling P4):** the Review Focus pins and the crash cases are given here as concrete code. Every other test given as `...` or comments is written by its implementer from the step's prose and its named assertions. A vacuous or tautological body is an Important review finding.
@@ -238,8 +241,8 @@ The paths follow §4.2 for the M2 subset. Modules that §4.2 does not list are m
 
 **Files:**
 - Create: `backend/src/jobhunter/db/migrations/versions/0006_m2_llm_profile_settings.py`
-- Modify: `backend/src/jobhunter/db/transitions.py`, `backend/src/jobhunter/db/migrate.py` (the backup-grant table list, if it names M1 tables), `tests/support/fixtures.py` (`_TRUNCATE`: `cv_files`, `profile_drafts`, `profile_versions`, `profile_vectors`, `query_proposals`, `llm_tuples`, `llm_calls`, `llm_spend_ledger`, `llm_budget`, `eval_runs`, in FK order; `_ACTIVE_CONFIG_RESET` keeps NULLing the profile and tuple pointers)
-- Test: `tests/integration/test_schema_m2.py`, `tests/integration/test_is_fenced_profile.py`; update `tests/integration/test_schema.py` (`LATER` loses `llm_tuples` and `profile_versions`), `tests/integration/test_schema_m1.py` (`profile_vectors` now exists), `tests/unit/test_transition_registry.py`
+- Modify: `backend/src/jobhunter/db/transitions.py`, `backend/src/jobhunter/db/migrate.py` (the backup-grant table list, if it names M1 tables), `tests/support/fixtures.py` (the M2 tables are emptied with `DELETE`, never by `_TRUNCATE`: `TRUNCATE … CASCADE` of any table that `active_config` reaches through a FK chain (`cv_files` → `profile_drafts` → `profile_versions`, `llm_calls`, `eval_runs`, `llm_tuples`) would truncate `active_config` itself. `reset_database` runs `_ACTIVE_CONFIG_RESET` first, which NULLs the profile, tuple and pending-scope pointers and restores the seeded ids, then `_M2_DELETE` child first: `profile_vectors`, `llm_spend_ledger` after `llm_calls` is detached (`UPDATE profile_drafts/query_proposals SET llm_call_id = NULL`), `llm_calls`, `query_proposals`, `eval_runs`, `llm_tuples`, then `profile_drafts`, `profile_versions` and `cv_files` in one transaction with `SET CONSTRAINTS ALL DEFERRED`, then `llm_budget`)
+- Test: `tests/integration/test_schema_m2.py`, `tests/integration/test_is_fenced_profile.py`, `tests/integration/test_clean_db.py` (`test_two_resets_keep_active_config`: with a profile version, a tuple and an LLM call inserted and pointed at, two consecutive resets leave the one `active_config` row with its seeded pointers); update `tests/integration/test_schema.py` (`LATER` loses `llm_tuples` and `profile_versions`), `tests/integration/test_schema_m1.py` (`profile_vectors` now exists), `tests/unit/test_transition_registry.py`
 
 **Interfaces:**
 - Consumes: the M0 and M1 DDL (inventory: `active_config`, `runs.llm_tuple_id`, `queries.proposal_id`, `purge_fences.kind='profile'`, `is_fenced` from 0005, the `assert_transition` trigger function).
@@ -268,8 +271,8 @@ The paths follow §4.2 for the M2 subset. Modules that §4.2 does not list are m
       - `reason_col="status_reason"`, `changed_at` `status_changed_at` on every edge;
       - settable: `reviewed_text`, `reviewed_text_sha256`, `native_pdf`, `transmitted_text_sha256`, `draft_json`, `validation_issues`, `failure_code`, `llm_call_id`, `confirmed_profile_version_id`, `confirm_response`, `updated_at`.
       - "ready ──field edits──► ready" is a plain `UPDATE` of `draft_json`, not a transition.
-    - `llm_spend_ledger`: `reserved→dispatched`, `reserved→not_billed`, `dispatched→billed`, `dispatched→not_billed`, `dispatched→ambiguous`, `ambiguous→billed`, `ambiguous→not_billed` (§7.16.7; the last two are used by M3's batches); `reason_col="evidence"`; `dispatched→dispatched_at`; every settled state `→settled_at`; settable `settled_usd`.
-    - `llm_calls`: `reserved→dispatched`, `reserved→cancelled`, `dispatched→completed`, `dispatched→error`, `dispatched→ambiguous`; settable: every usage, response and `output_json` column of §7.11.
+    - `llm_spend_ledger`: `reserved→dispatched`, `reserved→not_billed`, `dispatched→billed`, `dispatched→not_billed`, `dispatched→ambiguous`, `ambiguous→billed`, `ambiguous→not_billed` (§7.16.7; M3's batches use the last two, and M2's late online settlement uses them too, Deviation 24); `reason_col="evidence"`; `dispatched→dispatched_at`; every settled state `→settled_at`; settable `settled_usd`.
+    - `llm_calls`: `reserved→dispatched`, `reserved→cancelled`, `dispatched→completed`, `dispatched→error`, `dispatched→ambiguous`, plus `ambiguous→completed` and `ambiguous→error` for a late online settlement (Deviation 24); settable: every usage, response and `output_json` column of §7.11.
     - `query_proposals`: `running→ready`, `running→failed`; settable `items`, `llm_call_id`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -327,7 +330,7 @@ async def test_one_open_draft_and_purged_hash_reuse(engine) -> None:
   - `@dataclass(frozen=True) class pricing.Usage: input_tokens: int; output_tokens: int; cache_creation_input_tokens: int; cache_read_input_tokens: int`.
   - `pricing.worst_case_usd(model, *, input_tokens_bound: int, max_tokens: int, batch: bool = False, extra_usd: Decimal = Decimal(0)) -> Decimal`, rounded **up** to 6 dp, with the tier picked by the bound.
   - `pricing.settled_usd(model, usage: Usage, *, batch: bool = False) -> Decimal`, rounded **half-up** to 6 dp, with the tier picked by the actual prompt tokens (input plus both cache counts).
-  - `pricing.highest_input_price() -> Decimal`, used by the overrun-buffer validation of Task 15.
+  - `pricing.bound_input_price(model, *, batch: bool) -> Decimal`: the price per MTok at which a reservation bounds input, `max(input, cache_write)` of the model's highest tier, halved for `batch`. Task 15's overrun-buffer validation uses it.
   - `bounds.PROMPT_OVERHEAD_TOKENS: Final[Mapping[Model, int]]`, 1,000 per model until Task 7 sets the V19 values.
   - `@dataclass(frozen=True) class bounds.RenderedRequest: system: tuple[str, ...]; messages: tuple[str, ...]; schema_json: str`.
   - `bounds.text_input_bound(model, request: RenderedRequest) -> int`, which is `Σ len(c.encode("utf-8")) + PROMPT_OVERHEAD_TOKENS[model]`.
@@ -386,29 +389,34 @@ Property test: `worst_case_usd ≥ settled_usd(Usage(i, o, 0, 0))` for every `i 
   - Literals: `budget.Purpose = Literal["generate", "revise", "critic", "extract_profile", "propose_queries", "schema_dry_run"]` and `budget.PurposeClass = Literal["scoring", "nonscoring"]`.
   - `budget.month_of(t: datetime) -> date`, the UTC first-of-month, and `budget.month_length_s(month: date) -> int`.
   - `@dataclass(frozen=True) class budget.BudgetParams: cap_usd: Decimal; overrun_buffer_usd: Decimal; nonscoring_reserve_pct: int; min_bucket_capacity_usd: Decimal; collection_interval_s: int`, built from settings by `BudgetParams.from_payload(payload)`.
+  - **Which value wins.** Inside the database, `cap_usd` and `overrun_buffer_usd` come from the locked month row only. The row is created from the active settings, and every save of class `budget` writes the new values to it under its lock (Task 17). `BudgetParams.cap_usd`/`overrun_buffer_usd` are used only by the pure layer and by `ensure_month` for a new month. `nonscoring_reserve_pct`, `min_bucket_capacity_usd` and `collection_interval_s` are always the active settings' values, read in the same transaction (`spend_ledger.current_params`, below). No caller carries `BudgetParams` across transactions.
   - Pure budget arithmetic:
     - `budget.admissible(p) -> Decimal`, which is `A`;
     - `budget.rate_per_s(p, month) -> Decimal`;
     - `budget.bucket_capacity(p, month) -> Decimal`, which is `B_max`;
     - `budget.accrue(bucket_usd: Decimal, bucket_at: datetime, now: datetime, p, month) -> Decimal`.
   - `@dataclass class budget.BudgetRow`, with every `llm_budget` column.
-  - `budget.admits(row: BudgetRow, r: Decimal, purpose_class: PurposeClass, p: BudgetParams) -> bool`. It applies the §6.9.1 scoring and non-scoring rules, and admits nothing after `cap_lowered_at` while `counted_usd ≥ cap_usd − overrun_buffer_usd`.
+  - `budget.admits(row: BudgetRow, r: Decimal, purpose_class: PurposeClass, p: BudgetParams) -> bool`. It applies the §6.9.1 scoring and non-scoring rules with `A = row.cap_usd − row.overrun_buffer_usd` and `p.nonscoring_reserve_pct`, and admits nothing after `cap_lowered_at` while `counted_usd ≥ row.cap_usd − row.overrun_buffer_usd`.
   - Spend owners:
     - `SpendOwner = OperationOwner | EvalRunOwner`;
     - `@dataclass(frozen=True) class OperationOwner: claim: OperationClaim`;
     - `@dataclass(frozen=True) class EvalRunOwner: eval_run_id: int` (Task 7).
     - Each has `async lock(conn) -> None`, which takes `FOR SHARE` on its row and raises `FencedOut` when the predicate is lost.
+    - Each has `durable() -> dict[str, JSONValue]`, written into `llm_calls.input_refs["owner"]` by the same insert as the reservation: `{"kind": "operation", "id": <operation id>, "claim_id": "<uuid>"}` or `{"kind": "eval_run", "id": <eval run id>}`. This is the reconciler's only way to test the original owner after the in-memory owner is gone.
+    - `async def spend_ledger.owner_holds(conn, ref: Mapping[str, JSONValue], *, now) -> bool` locks the owner row `FOR UPDATE` and tests the predicate. For an operation, the row exists, `status = 'running'` and `claim_id` equals the recorded one. For an eval run, the row is `running` and younger than `EVAL_RUN_ABANDONED = timedelta(hours=1)`; an older `running` eval run is set to `failed` in the same transaction (a CLI that died). A missing row never holds.
     - M3 adds a target owner.
   - `@dataclass(frozen=True) class spend_ledger.Reservation: ledger_id: int; llm_call_id: int; month: date; reserved_usd: Decimal; purpose_class; model; batch: bool`.
   - Ledger operations:
-    - `async def spend_ledger.ensure_month(conn, month, p: BudgetParams, now) -> None`, an `INSERT … ON CONFLICT DO NOTHING` that copies the cap and buffer and starts the bucket full.
+    - `async def spend_ledger.current_params(conn) -> BudgetParams`. It reads the active settings payload through `active_config … FOR SHARE`, so it runs first in the transaction (§9.1), and waits for a settings save in progress, which holds `active_config FOR UPDATE`.
+    - `async def spend_ledger.ensure_month(conn, month, p: BudgetParams, now) -> None`, an `INSERT … ON CONFLICT DO NOTHING` that copies the cap and buffer from `p` (the current params) and starts the bucket full.
     - `async def spend_ledger.lock_month(conn, month) -> BudgetRow`, a `FOR UPDATE` that accrues and stores the bucket.
-    - `async def spend_ledger.reserve(conn, *, owner, purpose, purpose_class, model, effort, max_tokens, max_tokens_stage, transport_try, input_tokens_bound, extra_usd, execution_config_id, prompt_template_version, rendered_prompt_sha256, prefix_sha256, input_refs, profile_draft_id, eval_run_id, transport, p, now) -> Reservation`. It runs one transaction body in the caller's transaction:
+    - `async def spend_ledger.reserve(conn, *, owner, purpose, purpose_class, model, effort, max_tokens, max_tokens_stage, transport_try, input_tokens_bound, extra_usd, execution_config_id, prompt_template_version, rendered_prompt_sha256, prefix_sha256, input_refs, profile_draft_id, eval_run_id, transport, now) -> Reservation`. It runs one transaction body in the caller's transaction:
+      0. `p = current_params(conn)` (`active_config FOR SHARE`), then `ensure_month(conn, month_of(now), p, now)`;
       1. the owner lock;
       2. the month lock;
       3. admission, or `BudgetExhausted`;
       4. the ledger insert, with `admitted_cap_usd` and `counted_before_usd`;
-      5. the `llm_calls` insert (`reserved`);
+      5. the `llm_calls` insert (`reserved`), with `input_refs["owner"] = owner.durable()`;
       6. the counters and the bucket (scoring outside bulk operations only);
       7. the `llm.cap_80pct` check.
     - `async def spend_ledger.mark_dispatched(conn, res, owner, *, now) -> None`. It takes the owner lock again, then `reserved→dispatched` on both rows. It raises `FencedOut` when the owner is lost; the caller then calls `release_never_dispatched`.
@@ -419,7 +427,11 @@ Property test: `worst_case_usd ≥ settled_usd(Usage(i, o, 0, 0))` for every `i 
     - `async def spend_ledger.recompute(conn, month) -> Drift | None`, the counters recomputed from the ledger with the §7.11 comment's formula.
   - Reconcilers:
     - `@reconciler("budget_counters", "heavy")`: corrects drift under the month lock and raises `llm.budget_counter_drift` (critical); resolves it after a clean pass.
-    - `@reconciler("llm_ledger_unsettled", "tick")` (Deviation 5): `reserved` older than 15 min whose owner predicate fails (owner row `FOR UPDATE` first) becomes `not_billed('never_dispatched')`; online `dispatched` older than 15 min becomes `ambiguous`; the counters change in the same transaction.
+    - `@reconciler("llm_ledger_unsettled", "tick")` (Deviation 5), per entry in its own transaction, in the §9.1 order (owner row, month row, ledger row):
+      - a `reserved` entry older than 15 min for which `owner_holds(conn, input_refs["owner"])` is false becomes `not_billed('never_dispatched')`, and its call `cancelled`;
+      - an online `dispatched` entry becomes `ambiguous`, and its call too, once it is older than `max(15 min, deadline_s of its node in its execution config + 5 min)`. §17.4's flat 15 minutes would mark a legitimate 900 s or 1,800 s call ambiguous while its stream is live (Deviation 24);
+      - the counters change in the same transaction.
+    - **Late settlement** (Deviation 24). `settle` on a ledger row the reconciler already moved to `ambiguous` applies `ambiguous → billed` (with usage) or `ambiguous → not_billed` (with a listed evidence), and `ambiguous → completed`/`error` on the call, with the same counter adjustments. A settle that finds the row already `billed` or `not_billed` writes nothing and logs `llm_settle_duplicate`.
   - The alert codes are module constants: `CAP_80PCT_ALERT = "llm.cap_80pct"`, `COUNTER_DRIFT_ALERT`, `BOUND_VIOLATED_ALERT` and `CAP_REACHED_ALERT = "llm.cap_reached"` (raised by M3's scoring denial).
 
 - [ ] **Step 1: Write the failing tests**
@@ -434,8 +446,8 @@ P = BudgetParams(cap_usd=Decimal("100.00"), overrun_buffer_usd=Decimal("2.00"), 
 OCT = date(2026, 10, 1)
 def test_defaults_give_the_spec_shares() -> None:
     assert admissible(P) == Decimal("98.00")
-    assert round(rate_per_s(P, OCT) * 3600, 3) == Decimal("0.119")  # 93.10 / (31 d × 24 h); §6.9.2 quotes ≈ 0.127 for a 30.5-day month
-    assert round(bucket_capacity(P, OCT), 2) == Decimal("1.43")       # 2 × rate × 6 h; ≈ 1.53 in §6.9.2's 30-day month
+    assert round(rate_per_s(P, OCT) * 3600, 3) == Decimal("0.125")  # 93.10 / (31 d × 24 h); §6.9.2 quotes ≈ 0.127 for a 30.5-day month
+    assert round(bucket_capacity(P, OCT), 2) == Decimal("1.50")       # 2 × rate × 6 h; ≈ 1.53 in §6.9.2's 30.5-day month
     assert bucket_capacity(BudgetParams(**{**P.__dict__, "collection_interval_s": 3600}), OCT) == Decimal("1.00")
     assert month_of(datetime(2026, 10, 31, 23, 59, tzinfo=UTC)) == OCT
 def test_scoring_never_uses_the_unspent_nonscoring_reserve(budget_row) -> None:
@@ -459,22 +471,26 @@ A second machine covers the bucket. Over a simulated month with an unbounded sco
 - `test_lowered_cap_admits_nothing_but_settles_in_flight` (Review Focus 4);
 - `test_bound_violation_is_charged_in_full_and_alerts`;
 - `test_drift_is_corrected_and_alerted`;
-- `test_unsettled_entries_are_resolved_after_15_minutes`, for both edges, with the counters updated;
+- `test_unsettled_entries_are_resolved_after_15_minutes`, for both edges, with the counters updated: a reservation whose operation was reclaimed (a new `claim_id`) is released, while the replacement execution's own reservation, under the same operation id, is kept;
+- `test_dispatched_extraction_is_not_marked_ambiguous_inside_its_deadline`: an `extract_profile` call dispatched 16 min ago (deadline 900 s) is untouched, and at 21 min it is `ambiguous`;
+- `test_late_settlement_after_the_reconciler`: the reconciler marks a dispatched call `ambiguous`, then the gateway settles it `billed`; the counters equal the ledger;
+- `test_abandoned_eval_run_releases_its_reservation`: a `running` schema dry-run older than an hour with a `reserved` entry ends `failed`, and the entry becomes `not_billed('never_dispatched')`;
+- `test_old_context_cap_cut_and_rollover`, the three conditions in one scenario: an extraction reserves on 31 October with the cap at $100; a save lowers the cap to $10 (the October row is changed); the extraction's retry after midnight creates November from the **current** settings ($10), not from any value it held;
 - `test_superseded_operation_owner_cannot_reserve_or_dispatch`: `FencedOut`, and nothing is written.
 
 ```python
 # tests/integration/test_spend_ledger.py (the Review Focus 4 pins)
-async def test_settlement_after_rollover_adjusts_the_reservation_month(engine, op_owner, params) -> None:
+async def test_settlement_after_rollover_adjusts_the_reservation_month(engine, op_owner) -> None:
     t = datetime(2026, 10, 31, 23, 59, 30, tzinfo=UTC)
     async with engine.begin() as conn:
-        res = await reserve(conn, **reserve_kw(op_owner, params, now=t, bound=4000, max_tokens=1000))
+        res = await reserve(conn, **reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))
         await mark_dispatched(conn, res, op_owner, now=t)
     async with engine.begin() as conn:  # settled after midnight UTC
         await settle(conn, res, outcome="billed", evidence=None, usage=Usage(1000, 200, 0, 0),
                      call=completed_call(), now=t + timedelta(minutes=2))
     oct_row, nov_row = await budget_rows(engine, date(2026, 10, 1), date(2026, 11, 1))
     assert oct_row.counted_usd == Decimal("0.008000") and nov_row is None   # 1000×4 + 200×20 per MTok
-async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner, params) -> None:
+async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner) -> None:
     ...  # reserve r1 (dispatched), change_cap to below counted → cap_lowered_at set; a new reserve raises
          # BudgetExhausted; settle r1 billed succeeds and counted ≤ max(cap, counted_at_cap_change_usd)
 ```
@@ -511,7 +527,7 @@ async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner
 
 - [ ] **Step 1: Write the failing tests.**
   - `test_fake_llm.py` serves each scenario. `stall_after_first_event` sends one `message_start` and then nothing.
-  - `test_recorder_budget.py` checks that the 9th message, or one whose worst case would pass $0.45, is refused **before** any socket opens (no transport is created). The count survives a crash, because it is written before the send.
+  - `test_recorder_budget.py` checks that the 9th message, or one whose worst case would pass the $0.80 running sum, is refused **before** any socket opens (no transport is created). The count survives a crash, because it is written before the send.
   - `test_llm_transport.py` (integration, with a local SSE server on `127.0.0.1:0` in `tests/support/llm.py`, `LocalSSEServer`):
     - `_chat(...)` sends to the injected base URL host, with `stream: true`, `output_config.format.type == "json_schema"`, `output_config.effort`, no `tool_choice`, `tools` or `temperature`, and the exact `max_tokens`;
     - an injected 1 s read timeout fires on a stalled stream within 1 s ± 0.5. This is the mechanism of V5; the 120 s value is measured once in the spike, marked `slow`.
@@ -527,7 +543,7 @@ async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner
 ### Task 5: The gateway call loop, errors, `stop_reason` handling, the cache monitor, the boundary lint, spike V11 and crash cases C15 and C35 (dispatch marker)
 
 **Files:**
-- Modify: `backend/src/jobhunter/llm/gateway.py`, `observability/metrics.py` (the §17.5 names `jobhunter_llm_calls_total{model,effort,purpose,outcome}`, counted per HTTP try, and `jobhunter_llm_cache_read_ratio{model,effort,role}`), `.github/workflows/ci.yml` (`lint`: `uv run python scripts/check_llm_boundary.py`)
+- Modify: `backend/src/jobhunter/llm/gateway.py`, `backend/src/jobhunter/worker/operations.py` (the `registry` keyword of `execute_operation`), `observability/metrics.py` (the §17.5 names `jobhunter_llm_calls_total{model,effort,purpose,outcome}`, counted per HTTP try, and `jobhunter_llm_cache_read_ratio{model,effort,role}`), `.github/workflows/ci.yml` (`lint`: `uv run python scripts/check_llm_boundary.py`)
 - Create: `backend/src/jobhunter/llm/cache_monitor.py`, `scripts/check_llm_boundary.py`, `docs/spikes/V11.md`
 - Test: `tests/unit/test_gateway_policy.py`, `tests/integration/test_gateway.py`, `tests/integration/test_gateway_timeout_policy.py` (V11), `tests/integration/test_c15_stalled_stream.py`, `tests/integration/test_c35_operation_stall.py` (dispatch-marker part), `tests/unit/test_llm_boundary_check.py`
 
@@ -543,7 +559,7 @@ async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner
     - `rendered_sha256() -> bytes`;
     - `prefix_sha256() -> bytes | None`;
     - `as_request(schema) -> bounds.RenderedRequest`.
-  - `@dataclass class gateway.CallContext`: `owner: SpendOwner`, `purpose_class`, `execution_config_id`, `budget: BudgetParams`, `deadline: float` (monotonic), `profile_draft_id: int | None = None`, `eval_run_id: int | None = None`, `native_pdf: NativePdfBound | None = None`.
+  - `@dataclass class gateway.CallContext`: `owner: SpendOwner`, `purpose_class`, `execution_config_id`, `deadline: float` (monotonic), `profile_draft_id: int | None = None`, `eval_run_id: int | None = None`, `native_pdf: NativePdfBound | None = None`.
   - `@dataclass(frozen=True) class gateway.GatewayResult: parsed: BaseModel; llm_call_id: int; usage: Usage; model_served: str; stop_reason: str; cost_usd: Decimal`.
   - `class gateway.LLMGateway(engine, cfg, *, http_client: httpx2.AsyncClient, clock=utcnow, monotonic=time.monotonic, sleep=asyncio.sleep, cache: CacheMonitor)`. Its methods:
     - `async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult` is the §10.2 loop, verbatim in its order:
@@ -583,11 +599,12 @@ async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner
   - **The owner check:** a reclaimed operation (its `claim_id` cleared) makes `mark_dispatched` fail. The try is then `not_billed(never_dispatched)`, and **no request reaches the transport** (the transport counts requests).
   - `test_gateway_timeout_policy.py` (V11): a LangGraph node with `TimeoutPolicy(run_timeout=2)` calls the gateway on `stall_after_first_event`. Cancellation lands within 1 s of the deadline, the try is `ambiguous`, the `llm_calls` row is `ambiguous`, and `asyncio.all_tasks()` holds no task created by the call afterwards.
   - C15 (`tests/integration/test_c15_stalled_stream.py`; the stall is in the stream, not in a process, so it runs in-process): a gateway call meets `stall_after_first_event` on try 1 and a normal stream on try 2, with a read timeout of 2 s injected through `make_http_client(..., read_timeout_s=2)`. Try 1 settles `ambiguous` and keeps its reservation; try 2 makes a new reservation and is `billed`.
-  - C35, dispatch-marker part: this runs in one process, because a paused worker still holds the singleton lock, so a second worker process could never start.
-    1. Execution 1 of an operation pauses at `gateway.after_reserve` (`tests/support/faults.PausePoint`).
-    2. The `operations` reconciler reclaims the operation (`claim_id := NULL`, attempts + 1).
-    3. Execution 2 claims it and completes the call.
+  - C35, dispatch-marker part: this runs in one process, because a paused worker still holds the singleton lock, so a second worker process could never start. A real zombie is another process with its own execution registry, so each execution gets its own `ExecutionRegistry` through a new keyword `execute_operation(..., registry: ExecutionRegistry = EXECUTIONS)`, passed to `run_owned`. The default keeps the singleton's local-exclusion guarantee (`AlreadyExecuting`).
+    1. Execution 1 of an operation, on registry R1, pauses at `gateway.after_reserve` (`tests/support/faults.PausePoint`).
+    2. The reclaim statement of the `operations` reconciler runs on its own (`operations._reclaim_stale(conn, now=…)` with `now` past `OPERATION_STALE`): `claim_id := NULL`, attempts + 1. The reconciler's cancel step only cancels executions in `EXECUTIONS`, which R1 is not.
+    3. Execution 2, on registry R2, claims the operation and completes the call.
     4. Execution 1 resumes. Its `mark_dispatched` raises `FencedOut`, its try becomes `not_billed(never_dispatched)`, and **exactly one** HTTP request was served.
+    A second test, `test_reconciler_cancels_a_local_stalled_execution`, runs execution 1 on `EXECUTIONS` and the real `reconcile_operations`. The local execution is cancelled and awaited, nothing is sent, and its `reserved` entry is released by `llm_ledger_unsettled` 15 minutes later, because its recorded claim no longer holds.
     Task 13 adds the full extraction flow.
   - `test_llm_boundary_check.py` gives `check_llm_boundary.py` small source snippets: each banned construct fails, and the gateway's own `with_structured_output(..., method="json_schema", ...)` passes.
 
@@ -596,16 +613,16 @@ async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner
 async def test_reclaimed_operation_never_sends(engine, current_epoch, fake_llm, monkeypatch) -> None:
     op_id = await create_llm_call_operation(engine)                      # tests/support/llm.py: registers a gateway-calling handler for kind 'eval_run' for this test only
     pause = PausePoint("gateway.after_reserve"); monkeypatch.setattr(gateway_module, "afault_point", pause)
-    first = asyncio.create_task(execute_operation(engine, op_id, epoch=current_epoch, heartbeat_period_s=30, on_superseded=None))
+    first = asyncio.create_task(execute_operation(engine, op_id, epoch=current_epoch, registry=ExecutionRegistry()))
     await asyncio.wait_for(pause.reached.wait(), 10)
-    await reclaim_operation(engine, op_id)                               # claim_id := NULL, attempts + 1 (operations reconciler path)
-    await execute_operation(engine, op_id, epoch=current_epoch, heartbeat_period_s=30, on_superseded=None)
+    await reclaim_stale_now(engine, op_id)                               # the reconciler's reclaim statement only: claim_id := NULL, attempts + 1
+    await execute_operation(engine, op_id, epoch=current_epoch, registry=ExecutionRegistry())
     pause.resume(); await first
     assert fake_llm.served == 1
     assert await ledger_states(engine, op_id) == ["not_billed:never_dispatched", "billed"]
 ```
 
-(`PausePoint` holds only the first arrival at its point, so the second execution passes it at once.)
+(`PausePoint` holds only the first arrival at its point, so the second execution passes it at once. `reclaim_stale_now(engine, op_id)` in `tests/support/llm.py` runs `operations._reclaim_stale` with `now` past `OPERATION_STALE`, and asserts it reclaimed `op_id`.)
 
 - [ ] **Step 2: Run the tests and see them fail.**
 - [ ] **Step 3: Implement** the loop, the error mapping, the cache monitor, the refusal-rate reconciler and the AST checker. Add `gateway.after_reserve` and `gateway.after_dispatch` to the fault points. Write `docs/spikes/V11.md` from the test's measurements.
@@ -704,7 +721,8 @@ async def test_reclaimed_operation_never_sends(engine, current_epoch, fake_llm, 
     - For each it calls `messages.count_tokens` (free) per component and for the whole request, and checks `tokens ≤ bytes` per component.
     - It checks every recorded `usage` of Tasks 4 and 7 against the computed bound.
     - It writes `PROMPT_OVERHEAD_TOKENS[model] = 2 × max(whole − Σ components)` into `bounds.py`.
-    - It makes **1** paid native-PDF extraction of a synthetic 1-page PDF, to check `usage ≤ 1.25 × count_tokens`. Otherwise `bounds.NATIVE_PDF_ENABLED = False` and §12.7's native path stays disabled (Task 13 honours it).
+    - It makes **1** paid native-PDF extraction of a synthetic 1-page PDF through the recorder, to check `usage ≤ 1.25 × count_tokens`. The recorder budgets it at `pricing.worst_case_usd(model, input_tokens_bound=native_pdf_bound(model, count), max_tokens=1024, extra_usd=native_pdf_extra_usd(Decimal("0.50")))`, the extra share at the §13.1 minimum buffer. When the check fails, or the call is refused by the budget, `bounds.NATIVE_PDF_ENABLED = False` and §12.7's native path stays disabled (Task 13 and Task 14's `repairs` honour it).
+    - It recomputes `settings.validate.overrun_buffer_bound(load_settings_v1())` (Task 15) with the new constants. If the seeded `overrun_buffer_usd` ($2.00) falls below it, the task stops and reports to the user: the spec's default and §6.9.1's bound then disagree, and only a spec change (a larger default buffer or a smaller `batch_max_items`) resolves it. Validation is never weakened to make the seed pass.
 
 - [ ] **Step 1: Write the failing tests.**
   - `test_schema_dry_run.py`, on the fake transport with the Task 4 recordings, checks that:
@@ -727,7 +745,7 @@ async def test_reclaimed_operation_never_sends(engine, current_epoch, fake_llm, 
 
 **Files:**
 - Create: `docparse/{Dockerfile,worker.py,extract.py}`, `backend/src/jobhunter/profile/__init__.py`, `profile/parse_client.py`, `tests/docparse/{conftest.py,test_extract.py,test_worker.py}`, `tests/support/profile.py` (synthetic CV builders: `minimal_pdf(lines) -> bytes`, a hand-written PDF 1.4 with a Helvetica text stream; `image_only_pdf() -> bytes`; `docx_bytes(paragraphs, table=None, *, macro=False) -> bytes` built with `zipfile`; every name in them is invented)
-- Modify: `pyproject.toml` (group `docparse`: `pypdf==6.20.1`, `pdfplumber==0.11.10`, `python-docx==1.2.0`; marker `docparse`; `addopts` excludes `docparse` as it excludes `embedder_model`), `deploy/compose.dev.yaml` (service `docparse`, volumes `cv_store` and `parse_jobs`, the worker's `group_add: ["10011"]`, `api` and `worker` mount `cv_store`), `.github/workflows/ci.yml` (job `docparse`: `uv sync --frozen --group docparse` then `uv run pytest -W error -m docparse tests/docparse -q`; the `integration` job also syncs `--group docparse`, because Task 11's `op_runner` serves parse jobs with an in-process `docparse.worker` loop; the image build in the `integration` job's stack step or a dedicated build step), `.dockerignore`
+- Modify: `pyproject.toml` (group `docparse`: `pypdf==6.20.1`, `pdfplumber==0.11.10`, `python-docx==1.2.0`; marker `docparse`; `addopts` excludes `docparse` as it excludes `embedder_model`), `deploy/compose.dev.yaml` (service `docparse`, volumes `cv_store` and `parse_jobs`, the worker's `group_add: ["10010", "10011"]`: a service-level `group_add` replaces the `x-app` anchor's list, so both the secrets group and the parse group are named, as §19.1 has it; `api` and `worker` mount `cv_store`), `Dockerfile` (the runtime stage creates `/data/cv` owned by 10001:10001 with mode 0700 before `USER`, so a fresh named volume takes that ownership), `.github/workflows/ci.yml` (job `docparse`: `uv sync --frozen --group docparse` then `uv run pytest -W error -m docparse tests/docparse -q`; the `integration` job also syncs `--group docparse`, because Task 11's `op_runner` serves parse jobs with an in-process `docparse.worker` loop; the image build in the `integration` job's stack step or a dedicated build step), `.dockerignore`
 - Test: `tests/integration/test_parse_client.py`, `tests/stack/test_docparse_no_network.py` (marker `stack`)
 
 **Interfaces:**
@@ -800,6 +818,7 @@ def test_rlimit_kills_a_runaway_parse(tmp_path) -> None:
     It reads the ZIP central directory through the stdlib `zipfile` on the bytes and **never parses PDF structure**; encryption and page count are docparse's (Deviation 7).
   - `upload.check_paste(text: str) -> str`, which enforces 300–50,000 characters.
   - `upload.read_multipart_limited(request: Request, *, limit: int) -> UploadedFile(filename, data, native_pdf_opt_in: bool)`. It streams `request.stream()` into `python_multipart.MultipartParser` with a byte counter, and stops reading with 413 as soon as the file part passes `limit`, so nothing past the limit is ever held.
+  - The upload writes the encrypted file before its database transaction. When that transaction fails, the route deletes the file in its exception path. Task 23's `cv_store_orphans` rule catches a crash between the two.
   - `storage.CvStore(root: Path)`:
     - `write(data: bytes, keys) -> StoredFile(storage_path: str, sha256: bytes)` writes `<uuid4>.bin`, mode 0600, with AES-256-GCM and `aad=b"cv_file:" + name`;
     - `read(storage_path, keys) -> bytes`;
@@ -918,7 +937,10 @@ Also cover:
     - `finish_operation(status='failed')` and `_release` (exhaustion by a requeue, the stale reclaim or the takeover sweep) call the hook right after the `failed` transition, in the same transaction.
     - A hook may lock only rows after the owner row in the §9.1 order.
     - The text phase's hook moves the draft `extracting_text → failed(<code or 'attempts_exhausted'>)`; Task 13 adds the extract phase's.
-  - `class graphs.profile.state.ProfileState(TypedDict)`: `draft_id: int`, `operation_id: int`, `steps: list[str]` and `outcome: str | None`, ids only.
+  - `class graphs.profile.state.ProfileState(TypedDict)`: `draft_id: int`, `operation_id: int`, `llm_call_id: int | None`, `steps: list[str]` and `outcome: str | None`, ids only. The validated LLM output between nodes lives in `llm_calls.output_json`, and the state holds only its id.
+  - `graphs.profile.graph.sanitized(name, node) -> Node` wraps every profile node (Deviation 25). LangGraph persists an exception that escapes a node into `checkpoint_writes`, and an SQLAlchemy or Pydantic error can carry bound values (CV text, profile fields) in its message.
+    - `FencedOut`, `asyncio.CancelledError`, LangGraph's `GraphBubbleUp` and the M2 domain errors whose `str()` is a code only (`LLMError` and its subclasses, `UploadRejected`, `TransitionConflict`) pass through unchanged.
+    - Any other exception is logged with its class only and replaced by `NodeFailed(node=name, error_class=type(exc).__name__)`. The replacement is raised **after** the `except` block, so neither `__cause__` nor `__context__` refers to the original.
   - `graphs.profile.graph.ProfileGraphs`, holding `text`, `extract` and `propose`, each a compiled graph.
   - `build_profile_graphs(checkpointer, deps: ProfileDeps) -> ProfileGraphs`:
     - `text`: `parse → strip_contacts → END`;
@@ -953,7 +975,7 @@ Also cover:
 - pasted text reaches `text_review` without docparse;
 - `test_resume_skips_a_finished_parse`: a reclaim after `parse` committed reaches `text_review` with **one** docparse job (the loop counts jobs);
 - an `encrypted` PDF gives `failed('encrypted')`;
-- the checkpoint rows of the thread contain no CV text: scan the checkpoint blobs for a marker word of the synthetic CV;
+- the checkpoint rows of the thread contain no CV text: scan `checkpoints`, `checkpoint_blobs` **and** `checkpoint_writes` for a marker word of the synthetic CV, including after a node raises an `sqlalchemy.exc.StatementError` whose parameters hold the marker (`test_node_errors_reach_no_checkpoint_write`);
 - a text-phase operation exhausted by ten reclaims leaves the draft `failed('attempts_exhausted')` in the same transaction (the failure hook).
 - [ ] **Step 2: Run the tests and see them fail.**
 - [ ] **Step 3: Implement** `OperationDeps` and the wiring, the graphs module (text phase), the two nodes and the handler.
@@ -1019,9 +1041,10 @@ Also cover:
 - Test: `tests/integration/test_profile_extract_phase.py`, `tests/integration/test_c35_profile_extraction.py`
 
 **Interfaces:**
-- Consumes: `LLMGateway.call` and `count_tokens`, `node_config`, `render.extract_profile_prompt` and its native-PDF variant, `validate_profile`, `bounds.native_pdf_bound` and `NATIVE_PDF_ENABLED`, and `BudgetParams.from_payload`.
+- Consumes: `LLMGateway.call` and `count_tokens`, `node_config`, `render.extract_profile_prompt` and its native-PDF variant, `validate_profile`, `bounds.native_pdf_bound`/`native_pdf_extra_usd` and `NATIVE_PDF_ENABLED`; the buffer for the extra share is the current month row's `overrun_buffer_usd`, read by the gateway in the reservation transaction.
 - Produces:
   - The `extract_profile` node:
+    - **Receipt first** (§9.1; Deviation 26). A `completed` `extract_profile` call with `output_json IS NOT NULL` and `input_refs->>'operation_id'` equal to this operation's id is the work already paid for. The node returns its `llm_call_id` without any HTTP request. Every approval or retry inserts a new `extract_profile` operation, so a newly approved text can never reuse an older output, while a reclaimed or resumed execution of the same operation does. The operation id goes into the call's `input_refs` with `profile_draft_id`, `cv_file_id` and `reviewed_text_sha256`.
     - It reads `reviewed_text` and checks `sha256(reviewed_text) == reviewed_text_sha256` before rendering; a mismatch is a `Bug`.
     - It renders, and records `transmitted_text_sha256 = sha256(the exact string inside <cv_text>)`, which must equal `reviewed_text_sha256` (§9.5).
     - It calls the gateway with `purpose='extract_profile'`, `purpose_class='nonscoring'`, the **active** model policy and execution config (non-score calls use the active ones, §13.3), `ctx.owner = OperationOwner(claim)` and `profile_draft_id`.
@@ -1031,7 +1054,7 @@ Also cover:
     - `LLMRequestError(s)` gives `failed('llm_request_<s>')`, `ModelMismatch` gives `failed('model_mismatch')` and `MaxTokensExhausted` gives `failed('max_tokens')`.
     - `LLMTransient` and `DeadlineExhausted` call `requeue_operation(..., error_code='llm_transient', not_before=now + 5 min)`. The operation's 10-attempt limit then fails it, and the kind's `on_failed` hook (Task 11) moves the draft `extracting_profile → failed('llm_transient')` in that transaction (`failed('attempts_exhausted')` after reclaims).
     - The `llm_calls.output_json` holds the parsed output, and the draft's `llm_call_id` is set.
-  - The `validate` node runs `validate_profile` with `transmitted_text = reviewed_text`, or `None` for native PDF.
+  - The `validate` node reads the output from `llm_calls.output_json` by the state's `llm_call_id`, and runs `validate_profile` with `transmitted_text = reviewed_text`, or `None` for native PDF.
   - The `draft` node moves `extracting_profile → ready` with `draft_json` and `validation_issues`.
   - The native-PDF path:
     - `NATIVE_PDF_ENABLED` must be true (V19).
@@ -1049,7 +1072,9 @@ Also cover:
     - a cap below the worst case gives `failed('budget_exhausted')` and `fake_llm.served == 0`;
     - `overloaded_529` × 3 requeues the operation with `not_before`;
     - native PDF with `count_tokens` 1,800 reserves `ceil(2250) + overhead` plus $0.50;
-    - `count_tokens` failing gives `failed('input_unbounded')` and `served == 0`.
+    - `count_tokens` failing gives `failed('input_unbounded')` and `served == 0`;
+    - `test_crash_after_settlement_reuses_the_paid_output`: a fault after the call settles and before the `draft` node commits, then a reclaim. The second execution reaches `ready` with `fake_llm.served == 1` and one billed ledger row;
+    - a retry after `failed('invalid_output')` is a new operation, so it makes a new call.
   - C35, full: as Task 5's pin, but through the real `extract_profile` handler. Exactly one extraction is billed, the draft is `ready` once, and the first execution's late write updates no draft row (`TransitionConflict`/`FencedOut` swallowed by the obsolete-execution path).
 - [ ] **Step 2: Run the tests and see them fail.**
 - [ ] **Step 3: Implement** the three nodes, the graph wiring and the handler.
@@ -1066,7 +1091,7 @@ Also cover:
 - Consumes: `run_idempotent`, `check_idempotency_key`, `validate_profile` (Task 12), `contacts.restore`/`remove_span`/`strip_contacts` (Task 10), `CvStore.decrypt_text`, `create_operation`, `transition()`.
 - Produces the §14.2 routes, each documented with `SESSION_RESPONSES`, `CSRF_RESPONSES` and the problem codes it can return:
   - `GET /api/profile/drafts/{id}` → `DraftOut{status, draft, validation_issues, strip_report, stripped_text_preview, reviewed_text_sha256, failure_code, repairs}`.
-    - `repairs` is `["paste_text", "native_pdf"]` for `low_text`, `encrypted` and `too_many_pages`; `["retry_llm"]` for the LLM failure codes; and `[]` otherwise. Including `repairs` goes beyond the spec's summary and is documented.
+    - `repairs` is `["paste_text", "native_pdf"]` for `low_text`, `encrypted` and `too_many_pages` (`native_pdf` only while `bounds.NATIVE_PDF_ENABLED`; the pin below runs with it patched true); `["retry_llm"]` for the LLM failure codes; and `[]` otherwise. Including `repairs` goes beyond the spec's summary and is documented.
     - `stripped_text_preview` is the stripped text, never the raw text.
   - `PUT /api/profile/drafts/{id}` with `{draft: ConfirmedProfile}`, allowed in `ready` only: it revalidates against `reviewed_text` (for native PDF, against nothing), stores `draft_json` and `validation_issues` with a plain `UPDATE`, and returns `{validation_issues}`.
   - `PUT /api/profile/drafts/{id}/text` with `{span_edits: [{op: "remove" | "restore", start?, end?, replacement_index?}]}`:
@@ -1122,7 +1147,7 @@ Also cover:
 - Test: `tests/unit/test_settings_model.py`, `tests/unit/test_settings_validate.py`, `tests/unit/test_anchor_dst.py`, `tests/unit/test_seniority_derivation.py`, `tests/integration/test_settings_derive.py`, plus the existing `run_settings` tests unchanged
 
 **Interfaces:**
-- Consumes: `settings_v1.json`, `SETTINGS_SCHEMA_VERSION`, `seed.scope_payload`, `content_hash`, `pricing.SUPPORTED_EFFORTS`/`highest_input_price`, `bounds.PROMPT_OVERHEAD_TOKENS`, `DEFAULT_PROJECTED_CRITIC_RATE`.
+- Consumes: `settings_v1.json`, `SETTINGS_SCHEMA_VERSION`, `seed.scope_payload`, `content_hash`, `pricing.SUPPORTED_EFFORTS`/`bound_input_price`, `bounds.PROMPT_OVERHEAD_TOKENS`, `DEFAULT_PROJECTED_CRITIC_RATE`.
 - Produces:
   - `model.Settings`, a Pydantic v2 model with `extra="forbid"`. It mirrors §13.1 group by group, with every type, range and default verbatim, and decimals as strings in JSON. Its sub-models are `Schedule`, `Display`, `Scope` (with `ScopeLocation`, `SeniorityRange`, `KnockoutSeverity`), `Evaluation`, `Sources`, `QueryEntry`, `WatchlistEntry`, `Collection`, `Quota`, `Scoring` (with `ModelPolicy`, `NodeChoice`, `ExecutionNode`), `Llm`, `Retention` and `Notifications`. `Settings.model_validate(load_settings_v1())` succeeds, and `Settings.to_payload()` reproduces `settings_v1.json` as canonical JSON exactly.
   - `validate.FieldIssue(field: str, code: str, message: str)`. Its paths look like `payload.scope.locations[0].radius_km`, and its codes are `out_of_range`, `invalid`, `required`, `conflict` and `unsupported`.
@@ -1130,7 +1155,11 @@ Also cover:
     - the cross-field rules of §13.1;
     - model and effort support (G5);
     - the execution ranges;
-    - the overrun-buffer bound: `overrun_buffer_usd ≥ (3 + 2 + batch_max_items × 0.5) × max(PROMPT_OVERHEAD_TOKENS) × highest_input_price() / 1e6`, where batch items count at batch prices;
+    - the overrun-buffer bound of §6.9.1, `validate.overrun_buffer_bound(settings) -> Decimal`: `max_concurrent_llm_calls × PROMPT_OVERHEAD_TOKENS × the highest input price per token`, summed per slot:
+      - the 3 score and 2 auxiliary online slots, each at `max over the policy's configured models of PROMPT_OVERHEAD_TOKENS[m] × bound_input_price(m, batch=False)`;
+      - plus `batch_max_items` batch slots at `PROMPT_OVERHEAD_TOKENS[g] × bound_input_price(g, batch=True)` of the generator model `g` (batch items are generator items, §10.10);
+      - all divided by 1e6 and rounded up to the cent.
+      With the defaults (Sonnet generator, Opus elsewhere, 1,000 items, the floor overhead) that is 5 × 1,000 × $5.00 + 1,000 × 1,000 × $1.25, over 1e6, which is $1.28 and matches §6.9.1's "about $1.28". The $2.00 default holds;
     - the quota upper bounds (M1 Carry-forward 9, already in the §13.1 ranges);
     - generator effort `low`: an error unless the eval gate passes or is uncalibrated. `validate_fields` takes `gate: GateState = "uncalibrated"`, with `GateState = Literal["uncalibrated", "passed", "failed"]`. `async def validate.eval_gate_state(conn) -> GateState` returns `"uncalibrated"` while fewer than 30 golden cases exist (§11.13), which before M3's `golden_cases` table is always, without a query. So `low` is a warning `eval_uncalibrated` in M2.
   - `validate.warnings_only(...)`: the `serpapi_disabled_no_fallback` warning.
@@ -1141,13 +1170,13 @@ Also cover:
   - `run_settings.load_run_settings(conn, settings_version_id) -> RunSettings`, now `Settings.model_validate(row.payload)` and then `RunSettings.from_settings(...)`, with an unchanged signature and result.
 
 - [ ] **Step 1: Write the failing tests.**
-  - `test_settings_model.py`: the v1 defaults round-trip byte-equal, and `extra` keys are rejected.
+  - `test_settings_model.py`: the v1 defaults round-trip byte-equal, `extra` keys are rejected, and `validate_fields(load_settings_v1())` returns no issue under the constants in `bounds.py` (`test_seed_defaults_validate`; it must stay green after V19).
   - `test_settings_validate.py` is one parametrised table covering:
     - every §13.1 range edge and one past it, with the exact `FieldIssue` path and code;
     - each cross-field rule: no location without remote, include ∩ exclude, `min > max`, `t3_min_mid ≤ relevance_threshold`, and every source disabled;
     - an unsupported model or effort;
     - an execution `max_tokens_retry < max_tokens`;
-    - an overrun buffer below the bound at `batch_max_items = 10000`;
+    - an overrun buffer below the bound at `batch_max_items = 10000` ($12.53 at the defaults), and exactly $1.28 accepted at the defaults;
     - `radius_km = 0`.
   - `test_anchor_dst.py`: 02:30 on 2026-03-29 in Europe/Berlin → 01:00 UTC; 02:30 on 2026-10-25 → 00:30 UTC (the first occurrence).
   - `test_seniority_derivation.py`: `mid` ±1 gives `(junior, senior)`; the range clamps at both ends of the ladder; `intern` with `below = 3` gives `intern` as the minimum.
@@ -1237,15 +1266,15 @@ Also cover:
     5. Inserts the `settings_versions` row: `version_no = max + 1`, `schema_version = SETTINGS_SCHEMA_VERSION`, the derived ids, `base_version_id`, `effect_classes` sorted, `acknowledged_warnings` sorted, `eval_override_ack`.
     6. Applies the effect classes in the §13.3 order, `llm_tuple`, then `scope`, then the others, through one private function per class:
        - **`llm_tuple`**: `eval_gate_state(conn)` is `"uncalibrated"` in M2 (fewer than 30 golden cases), so the gate is skipped (§11.13). `model_policy_id := new`. When `profile_version_id` is set, the tuple `(profile, active rubric, active prompt-schema, new model policy)` is selected or inserted, `llm_tuple_id` flips and `ranking.bump` runs. §12.6 (d)–(f) and `create_targets_for_tuple` are M3's (Deviation 10).
-       - **`scope`**: a derived scope equal to the active `scope_version_id` sets `pending_scope_version_id := NULL` (a revert; the CHECK forbids pending = active). Otherwise it sets `pending_scope_version_id := new` and calls `scope_apply.request_apply(conn, new, defer=defer)` (Task 18). A pending apply of another scope is left to end obsolete at its own final check (§13.4 step 3).
-       - **`schedule`**: `schedule_state` is reset in one `UPDATE`: `anchor_utc := anchor_utc_for(now, hhmm, tz)`, `interval_s`, `enabled`, `last_evaluated_slot := latest_slot_at_or_before(now, anchor, interval)`, `settings_version_id := new` (§3.4). The dead-man period is M5's.
-       - **`collection`**: `instance_for_company` for every watchlist entry of the new payload, then `ensure_cells(conn, await load_run_settings(conn, new_id), await list_instances(conn))`. New cells start never-covered. This runs after `schedule`, because `load_run_settings` joins `schedule_state`.
+       - **`scope`**: `scope_apply.set_desired_scope(conn, derived_scope_id, defer=defer)` (Task 18). It clears the pending pointer when the desired scope is already the active one (a revert; the CHECK forbids pending = active), keeps it when it already names the desired scope, and otherwise points it at the desired scope and requests its apply. A pending apply of another scope is left to end obsolete at its own final check (§13.4 step 3).
+       - **`schedule`**: `schedule_state` is reset in one `UPDATE`: `anchor_utc := anchor_utc_for(now, hhmm, tz)`, `interval_s`, `enabled`, `last_evaluated_slot := latest_slot_at_or_before(anchor, interval_s, now)` (its signature is `(anchor, interval_s, t)`, `db/seed.py`), `settings_version_id := new` (§3.4). The dead-man period is M5's.
+       - **`collection`**: `instance_for_company` for every `watchlist[]` entry of the new payload (its key is `watchlist_company_id`, §13.1, as `run_settings` reads it), then `ensure_cells(conn, await load_run_settings(conn, new_id), await list_instances(conn))`. New cells start never-covered. This runs after `schedule`, because `load_run_settings` joins `schedule_state`.
        - **`admission`**: the flip only. The `max_ad_age_days` expiry sweep needs targets (M3, Deviation 10).
-       - **`budget`**: `ensure_month` then `change_cap(conn, month=month_of(now), cap_usd=…, overrun_buffer_usd=…, now=now)`, under the month-row lock after `active_config` (lock order).
+       - **`budget`**: `ensure_month(conn, month_of(now), BudgetParams.from_payload(<new payload>), now)` then `change_cap(conn, month=month_of(now), cap_usd=…, overrun_buffer_usd=…, now=now)` with the new values, under the month-row lock after `active_config` (lock order).
        - **`execution`**: `execution_config_id := new`.
        - **`evaluation_policy`**: the new row from `ensure_derived` (gate skipped as above), then `evaluation_policy_id := new`.
     7. Sets `active_config.settings_version_id := new` and `updated_at` in the same statement as the pointer flips of step 6, where it can.
-  - `effects.diff_payloads(before: JSONValue, after: JSONValue) -> list[DiffEntry]`, where `DiffEntry(path: str, before: JSONValue, after: JSONValue)` uses the `FieldIssue` path syntax. Lists of objects with an id key (`query_id`, `company_id`, `gazetteer_id`) are matched by that key; other lists compare by position.
+  - `effects.diff_payloads(before: JSONValue, after: JSONValue) -> list[DiffEntry]`, where `DiffEntry(path: str, before: JSONValue, after: JSONValue)` uses the `FieldIssue` path syntax. Lists of objects with an id key (`query_id`, `watchlist_company_id`, `gazetteer_id`) are matched by that key; other lists compare by position.
   - `pagination.cursor_key(cfg: AppConfig) -> bytes`, which is `hkdf_sha256(session_secret, b"cursor")`.
   - `pagination.encode_cursor(body: Mapping[str, JSONValue], *, key: bytes) -> str` and `decode_cursor(cursor: str, *, key: bytes, sort: str, filters_hash: str) -> Mapping[str, JSONValue]`. The cursor is `base64url(JSON) + "." + base64url(HMAC-SHA256)` (§14.3). A bad signature, a different `sort` or a different `filters_hash` raises `Problem(400, "invalid_cursor")`. M2 uses only the `"v": 2`, `"section": "all"` form for id-ordered lists; M4 adds the job sorts.
   - The routes, each with `SESSION_RESPONSES`, `CSRF_RESPONSES` where state-changing, and its problem codes:
@@ -1265,10 +1294,12 @@ async def test_stale_base_version_is_409(logged_in_client, engine) -> None:
     first = {**payload, "display": {**payload["display"], "ui_language": "de"}}
     second = {**payload, "schedule": {**payload["schedule"], "interval_hours": 12}}
     r1 = await logged_in_client.post("/api/settings", json={"payload": first, "base_version_id": base,
-                                     "acknowledged_warnings": []}, headers=idem("tab-one-key-0001"))
+                                     "acknowledged_warnings": await warning_codes(logged_in_client, first)},
+                                     headers=idem("tab-one-key-0001"))
     assert r1.status_code == 201
     r2 = await logged_in_client.post("/api/settings", json={"payload": second, "base_version_id": base,
-                                     "acknowledged_warnings": []}, headers=idem("tab-two-key-0001"))
+                                     "acknowledged_warnings": await warning_codes(logged_in_client, second)},
+                                     headers=idem("tab-two-key-0001"))
     assert r2.status_code == 409 and r2.json()["code"] == "stale_base_version"
     async with engine.connect() as conn:
         versions = (await conn.execute(text("SELECT count(*) FROM settings_versions"))).scalar_one()
@@ -1276,14 +1307,14 @@ async def test_stale_base_version_is_409(logged_in_client, engine) -> None:
     assert versions == 2 and interval == 6 * 3600   # the stale save wrote nothing
 ```
 
-(`save_scope(client, radius_km=…)` in `tests/support/settings.py` saves the active payload with one scope location, Berlin, at that radius, acknowledging the dry-run's warnings, and returns the 201 body.)
+(`warning_codes(client, payload)` in `tests/support/settings.py` returns the codes of `POST /api/settings/dry-run` for the payload, so both saves acknowledge exactly their own warnings and the test isolates the stale base. `save_scope(client, radius_km=…)` in the same module saves the active payload with one scope location, Berlin, at that radius, acknowledging the dry-run's warnings, and returns the 201 body.)
 
 Also cover, in `test_settings_save.py`:
 - an unchanged payload gives a new version with `effect_classes = {none}` and only the settings pointer moves;
 - a warning code missing from `acknowledged_warnings` gives 422 with `warning_not_acknowledged`, and acknowledging it gives 201;
 - an invalid payload gives 422 with the field paths of `validate_fields`;
 - **schedule:** an interval change resets `last_evaluated_slot` to the latest slot ≤ now under the new schedule, and the next `tick` inserts no `missed` row;
-- **collection:** enabling a new query creates its cells for every location key and `remote-de`, never covered;
+- **collection:** enabling a new query creates its cells for every location key and `remote-de`, never covered, and a `watchlist[]` entry `{watchlist_company_id, enabled: true}` creates its instance and cell;
 - **budget:** a cap change writes the current month's `llm_budget` row (a lowered cap below the counted spend sets `cap_lowered_at`);
 - **execution** and **evaluation_policy:** each flips its pointer, and the evaluation policy row is new with `projected_critic_rate = 0.450`;
 - **llm_tuple without a profile:** only `model_policy_id` flips and `llm_tuple_id` stays NULL;
@@ -1314,6 +1345,11 @@ Also cover, in `test_settings_save.py`:
 - Produces:
   - `scope_apply.KIND: Final = "apply_scope"`, `scope_apply.dedup_key(scope_version_id: int) -> str` (`"apply_scope:<id>"`), `scope_apply.APPLY_FAILED_ALERT: Final = "scope.apply_failed"`, `scope_apply.FINAL_CHECK_ROUNDS: Final = 5`.
   - `async def scope_apply.request_apply(conn, scope_version_id: int, *, defer: Deferrer) -> tuple[int, bool]`, the `create_operation` wrapper with payload `{"scope_version_id": id}`.
+  - `async def scope_apply.set_desired_scope(conn, desired_id: int, *, defer: Deferrer) -> int | None`, the one place that moves the pending pointer towards a desired scope. The caller holds `active_config FOR UPDATE`. It returns the `apply_scope` operation id, or `None` when no apply is needed:
+    - `desired = active`: `pending := NULL`;
+    - `desired = pending`: no change, and it returns the live operation's id;
+    - otherwise: `pending := desired` and `request_apply`.
+    The settings save (Task 17), the profile confirm (Task 21) and retry-apply use it.
   - `async def worker.operations.set_progress(conn, claim: OperationClaim, progress: Mapping[str, JSONValue]) -> None`: an `UPDATE … SET progress` under the claim predicate, `FencedOut` on 0 rows.
   - `async def scope_apply.incomplete_jobs(conn, scope_version_id: int) -> int`: the unmerged jobs that lack a `hard_filter_results` row for the scope, or whose row has `inputs_hash ≠ jobs.det_facts_hash` or another `det_algorithm_version` (the `filters._STALE` predicate without its limit).
   - The handler `@register_operation_handler("apply_scope") async def run_apply_scope(ctx)`:
@@ -1325,7 +1361,7 @@ Also cover, in `test_settings_save.py`:
     2. When `pending_scope_version_id = P` and the newest `apply_scope` operation of `apply_scope:P` is `failed` with no live one, it sets `pending_scope_version_id := NULL` and raises `scope.apply_failed` (critical, subject `scope:<P>`), in one transaction.
   - `POST /api/settings/scope/retry-apply` → 202 `{operation_id}`. The scope is `derived(active settings payload, profile=<active profile>)`, through `ensure_derived`.
     - It gives 409 `conflict_state` when that scope is already the active one, or when an `apply_scope` operation is live.
-    - Otherwise, holding `active_config FOR UPDATE`, it sets `pending_scope_version_id` and calls `request_apply`.
+    - Otherwise, holding `active_config FOR UPDATE`, it calls `set_desired_scope`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1446,7 +1482,7 @@ Also cover, in `test_scope_apply.py`:
     - **The set:** the kept set must have 6–16 items and at least one `exploration`; otherwise the result is `([], ["set_invalid"])`. A kept set over 16 items is cut to the first 16 in model order, with the issue `truncated`.
   - `proposals.KIND: Final = "propose_queries"`.
   - `async def proposals.request_proposal(conn, profile_version_id: int, *, defer) -> tuple[int, int, bool]`. It returns `(proposal_id, operation_id, created)`. A `running` proposal of the same version is returned with `created=False`; otherwise it inserts `query_proposals(status='running')` and the operation with payload `{"proposal_id": id}` and dedup key `propose_queries:<proposal_id>`.
-  - The `propose_queries` node (graph `propose`, thread `queries-<profile_version_id>-q<n>`):
+  - The `propose_queries` node (graph `propose`, thread `queries-<profile_version_id>-q<n>`) checks the same receipt first: a `completed` `propose_queries` call with `input_refs->>'operation_id'` equal to this operation's id and an `output_json` is validated and published without a new request. Its `input_refs` holds the operation id, `proposal_id` and `profile_version_id`. Then:
     - It renders `propose_queries_prompt(profile_json, scope location labels)` and calls the gateway with `purpose='propose_queries'`, non-scoring, the active model policy and execution config, and `OperationOwner(claim)`.
     - It validates the output. `set_invalid`, or `InvalidOutput("structural")`, is retried once with a new call; a second one ends the proposal `failed` and the operation `failed('invalid_output')`.
     - The error mapping is the one of Task 13 (`refused`, `budget_exhausted`, the request errors, and the transient requeue).
@@ -1478,6 +1514,7 @@ Also cover, in `test_scope_apply.py`:
     - `set_invalid` twice gives the proposal `failed` and the operation `failed('invalid_output')`;
     - `refusal` gives `failed`;
     - a repeat request while one is running returns it;
+    - a fault after settlement and before `running → ready`, then a reclaim, publishes with `fake_llm.served == 1`;
     - no profile gives 409.
   - `test_queries_api.py`:
     - `POST` creates an unenabled user query, and the active settings are unchanged;
@@ -1520,7 +1557,7 @@ Also cover, in `test_scope_apply.py`:
     7. **(b)** It selects or inserts the `llm_tuples` row (profile, active rubric, active prompt-schema, active model policy).
     8. **(c)** It sets `profile_version_id` and `llm_tuple_id`, then `ranking.bump`.
     9. **(d)–(f)** are M3's (Deviation 10).
-    10. **(g)** When the active settings scope has `seniority_range.mode = profile_relative`, `ensure_derived(derived(active settings, profile=new))` gives the derived scope. If it differs from the active scope, it sets `pending_scope_version_id` and calls `request_apply`.
+    10. **(g)** `ensure_derived(derived(active settings, profile=new))` gives the desired scope; with `seniority_range.mode = explicit` it is the settings' own scope. `set_desired_scope(conn, desired, defer=defer)` then reconciles the pending pointer on **every** confirm. So confirming A, then B (B's apply pending), then A again, clears the obsolete pending B instead of letting B's apply flip the filters to B's seniority range.
     11. **(h)** `request_embedding(version)` and `request_proposal(version)`. `create_targets_for_tuple` is M3's.
     12. **(i)** The draft moves `ready → confirmed` with `confirmed_profile_version_id` and `confirm_response = body`.
   - `@dataclass(frozen=True) class estimate.RescoreEstimate: targets: int; est_usd_online: Decimal; est_usd_batch: Decimal; month_spend: Decimal; cap: Decimal; bulk_budget_usd: Decimal`.
@@ -1574,6 +1611,7 @@ Also cover, in `test_profile_confirm.py`:
 - a `limit` issue gives 422, and an `ungrounded` issue does not block;
 - retained jobs without `expected_rescore_ack` give 422;
 - `profile_relative` seniority creates the derived scope and one `apply_scope` operation, and `explicit` creates neither;
+- `test_confirm_a_b_a_clears_the_obsolete_pending_scope`: confirm profile A (a `junior`) and let its apply flip; confirm B (a `senior`) and pause B's apply after its first chunk; confirm A again. `pending` is NULL, B's apply ends obsolete when resumed, and the active scope is still A's;
 - after confirm, a collect run on the fake sources ends `succeeded`, with node 9 a no-op and I5 `ok` (Deviation 10);
 - `GET /api/profile` lists the version.
 
@@ -1599,7 +1637,7 @@ Also cover, in `test_profile_confirm.py`:
     2. inserts `watchlist_companies` with `company_key`, and `detection` `'pattern'` when `input_url` is given, else `'manual'`;
     3. calls `instance_for_company`;
     4. calls `request_validation` (the M1 operation);
-    5. adds `{company_id, enabled: true}` to `watchlist[]` through `save_settings(..., internal=True)`, which gives a `collection` version.
+    5. adds `{watchlist_company_id, enabled: true}` to `watchlist[]` through `save_settings(..., internal=True)`, which gives a `collection` version.
     A board already on the list gives 409 `conflict_state` with the existing id.
   - `DELETE /api/watchlist/{id}` → 204. In one transaction it removes the `watchlist[]` entry through an internal save ("the settings version updates") and deletes the company row; `source_instances.watchlist_company_id` is set to NULL by its FK. An unknown id gives 404.
   - `GET /api/geo/places?q=<name or postal code>&limit=10` (limit 1–25) → `[{gazetteer_id, label, postal_codes, lat, lon, population}]`, served from the bundled gazetteer.
@@ -1628,6 +1666,7 @@ Also cover, in `test_profile_confirm.py`:
 - Create: `backend/src/jobhunter/quota/cells.py`, `backend/src/jobhunter/sources/spec_adapters.py` *(new; M1 Carry-forward 13)*, `deploy/compose.fakellm.yaml`, `tests/unit/test_quota_imports.py`
 - Modify:
   - `backend/src/jobhunter/quota/planner.py` (it imports from the two new modules);
+  - `backend/src/jobhunter/sources/coverage.py` (`CURSOR_REUSE_TTL` moves here from `sources/jsearch.py`, which imports it back);
   - `backend/src/jobhunter/worker/{main,runtime}.py`;
   - `backend/src/jobhunter/llm/{gateway,errors}.py` (`LLMNotConfigured`);
   - `backend/src/jobhunter/privacy/retention.py` (the M2 rules and M1 Carry-forward 17);
@@ -1650,7 +1689,12 @@ Also cover, in `test_profile_confirm.py`:
     - `config.py` treats an empty optional secret file as absent, because compose needs the file to exist.
   - **The M2 rows of `privacy.retention.RULES` (§20.1)**, each in bounded, fenced transactions (M1 Carry-forward 17):
     - `RetentionRule("draft_content", timedelta(days=30))`: for drafts `confirmed`, `discarded` or `failed` for 30 days with `content_purged_at IS NULL`, it sets `draft_json := NULL` and `reviewed_text := NULL`, sets `content_purged_at`, and nulls the `output_json` of the draft's `extract_profile` calls.
-    - `RetentionRule("cv_files", timedelta(days=30))`: the files of drafts discarded or failed 30 days ago, and of abandoned uploads (no draft row, or a draft never confirmed and ended 30 days ago), that belong to neither the active nor the previous profile version. It deletes the file from `cv_store` first (missing is fine), then sets `storage_path`, `raw_text_enc` and `stripped_text` to NULL and sets `purged_at` (Deviation 21).
+    - `RetentionRule("cv_files", timedelta(days=30))` (§20.1). It never touches a `cv_files` row that is the `cv_file_id` of the active profile version or of the previous one (the highest `version_no` below the active one), or that belongs to an open draft. Of the rest, it purges:
+      - the files of confirmed versions older than the previous one, at once;
+      - the files of drafts `discarded` or `failed` for 30 days (`status_changed_at`);
+      - abandoned uploads: a row no draft references, 30 days after `uploaded_at`.
+      It deletes the file from `cv_store` first (missing is fine), then sets `storage_path`, `raw_text_enc` and `stripped_text` to NULL and sets `purged_at` (Deviation 21).
+    - `RetentionRule("cv_store_orphans", timedelta(days=1))`: a file in `cv_store` that no `cv_files.storage_path` names and that is older than a day is deleted. That is an upload whose transaction rolled back after the file was written.
     - `RetentionRule("eval_runs", THIRTEEN_MONTHS)`: it keeps the latest completed run of each kind, and the calls cascade.
     - `RetentionRule("profile_checkpoints", timedelta(days=14))`: the threads `profile-<draft>-t*` and `-p*` of drafts that ended 14 days ago, and `queries-<version>-q*` of proposals that ended 14 days ago.
   - **Carry-forward 17.** `_purge_threads` and `_delete_finished_jobs` work in batches of 500 threads and 1,000 jobs, each batch its own fenced transaction.
@@ -1658,10 +1702,13 @@ Also cover, in `test_profile_confirm.py`:
     - `quota/cells.py` holds `CellRow`, `ensure_cells`, `_cell_rows`, `location_keys`, `_places` and the cell SQL.
     - `sources/spec_adapters.py` holds `_spec_adapters`, `_refuse` and `_no_secret` (the planning-time adapter factory).
     - `planner.py` re-exports nothing, and every importer is updated.
-    - `test_quota_imports.py` (an AST scan) fails when any module under `quota/` imports `jobhunter.sources.adapters`.
+    - `test_quota_imports.py` (an AST scan, `forbidden_imports(source: str) -> list[str]`):
+      - It fails when any module under `quota/` imports `jobhunter.sources.registry` (the adapter factory, `make_adapter`) or a concrete adapter module: `jobhunter.sources.{jsearch,serpapi,adzuna,arbeitnow}` and `jobhunter.sources.ats.*`.
+      - `CURSOR_REUSE_TTL` moves to `sources/coverage.py`, which `quota/` may import.
+      - The test also feeds `forbidden_imports` today's `planner.py` import lines (`from jobhunter.sources.registry import make_adapter` and `from jobhunter.sources.jsearch import CURSOR_REUSE_TTL`) and asserts both are rejected, so the check is proven against the pre-refactor imports.
   - **The dev stack.**
     - `deploy/compose.fakellm.yaml` sets `JOBHUNTER_FAKE_LLM=1` and `JOBHUNTER_FAKE_LLM_DIR=/data/fixtures/anthropic` on the worker, mounting `tests/contract/fixtures/anthropic` read-only.
-    - `scripts/dev-secrets.sh` writes `anthropic_key` from `JOBHUNTER_ANTHROPIC_API_KEY` when it is set, and an empty file otherwise, mode 0600. It never echoes the value.
+    - `scripts/dev-secrets.sh` writes `anthropic_key` from `JOBHUNTER_ANTHROPIC_API_KEY` when it is set, and an empty file otherwise, with the script's existing convention: group 10010, mode 0440, set before the file appears under its name. It never echoes the value, and it never overwrites an existing file.
     - The worker lists `anthropic_key` among its secrets.
 
 - [ ] **Step 1: Write the failing tests.**
@@ -1674,7 +1721,11 @@ Also cover, in `test_profile_confirm.py`:
   - `test_retention_batches.py`: 1,200 threads take three transactions; a takeover fence between batches stops the rule after the batch in flight, and the next run resumes.
   - `test_worker_main.py`: the pins above, and a worker without a key that is not in fake mode starts and logs `llm_not_configured`.
   - `test_config.py`: an empty `anthropic_key` reads as absent.
-  - `test_dev_stack.py`: `docparse` is running, and the worker reaches it through `parse_jobs`, checked with a paste-free PDF draft on the fakellm overlay.
+  - `test_dev_stack.py`, on a fresh stack (`down -v`) with a **non-empty dummy** `anthropic_key` and the fakellm overlay:
+    - `docparse` is running;
+    - the worker reads every secret, its startup assertions pass, and it holds groups 10010 and 10011;
+    - a PDF upload stores its file on `cv_store` (owned by 10001, mode 0600);
+    - the worker reaches docparse through `parse_jobs`, and the draft reaches `text_review`.
 - [ ] **Step 2: Run the tests and see them fail.** `uv run pytest -W error tests/integration/test_retention_m2.py tests/integration/test_retention_batches.py tests/unit/test_worker_main.py tests/unit/test_config.py tests/unit/test_quota_imports.py -q`
 - [ ] **Step 3: Implement** the wiring, the rules, the batching, the split and the stack files.
 - [ ] **Step 4: Run the whole suite**: `uv run pytest -W error -q`, `uv run ruff check .`, `uv run mypy`, `uv run python scripts/check_llm_boundary.py`, and the stack tests on `-f deploy/compose.dev.yaml -f deploy/compose.fakellm.yaml`.
@@ -1734,7 +1785,7 @@ uv run jobhunter schema-dry-run   # the fake transport: the five cases pass
 Expected: every command exits 0, and the smoke script prints ten `{"check": …, "ok": true}` lines. No paid call runs in this step.
 - [ ] **Step 4: Close the spikes and the roadmap.** This step is a gate:
   - `docs/spikes/V4.md`, `V5.md` (local part), `V11.md`, `V13.md` and `V19.md` hold their results;
-  - `.fixtures-raw/anthropic-budget.json` shows ≤ 8 paid messages and ≤ $0.45 of worst-case reservations, and the actual total is copied into `V19.md`, with no key and no content;
+  - `.fixtures-raw/anthropic-budget.json` shows ≤ 8 paid messages and ≤ $0.80 of worst-case reservations, and the actual total is copied into `V19.md`, with no key and no content;
   - `bounds.PROMPT_OVERHEAD_TOKENS` holds the V19 values;
   - `NATIVE_PDF_ENABLED` matches V19's verdict.
   Then set the M2 status cell of the roadmap to `complete`, and leave the other rows unchanged.
@@ -1771,7 +1822,10 @@ Each deviation stages a spec item across milestones, or settles something the sp
 6. **`llm.unexpected_stop_reason`** (warn) is a code §17.6 lacks. §10.5 asks for "a warn alert" on an unexpected `stop_reason` without naming it. M5's catalogue adds it.
 7. **Encryption and page count are checked by `docparse`, not by the upload** (§12.1 lists them as upload checks). Parsing PDF structure inside the API would put a PDF parser in the networked process that §12.2 keeps sandboxed. The API checks size, magic, extension and the ZIP structure; an encrypted PDF or one with more than 20 pages fails the draft with `failed('encrypted')` or `failed('too_many_pages')` within seconds, before any LLM call. User-visible: the rejection arrives on the draft, not on the upload response.
 8. **Native-PDF evidence is `unverifiable`.** §9.5's grounding needs a transmitted text, and a native PDF has none the worker can read without the parser it was sent around. Every evidence of a native-PDF profile is reported `unverifiable`, which does not block confirm. The contact scan of §12.7 still runs.
-9. **Spikes split with M3.** V5's 20 real streamed generator and critic calls and V14 (the cache) need M3's prompts. M2 runs V5's local timeout part, V4, V11, V13 and V19 within ≤ 8 paid messages and ≤ $0.45 of worst-case reservations. The rest of the roadmap's "< $1" is left for V5, V12 and V14.
+9. **Spikes split with M3, and V19's one paid call.**
+   - V5's 20 real streamed generator and critic calls and V14 (the cache) need M3's prompts.
+   - M2 runs V5's local timeout part, V4, V11, V13 and V19 within ≤ 8 paid messages and ≤ $0.80 of worst-case reservations, at an expected actual spend of about $0.15. The roadmap's "< $1" counts actual spend, and the rest is M3's.
+   - §22 says V19 makes "no new paid calls". Its native-PDF criterion needs a recorded native-PDF usage, and none exists, so M2 makes exactly one native-PDF extraction of a synthetic one-page PDF. Without it the native path stays disabled (§12.7).
 10. **Activation without targets** (supersedes M1 Carry-forward 9).
     - §12.6 (b), (c), (g), (h: `embed_profile`, `propose_queries`) and (i) are complete. (d) cancelling the old tuple's targets, (e) the batch cancellation, (f) the bulk operation and `create_targets_for_tuple` need M3's tables.
     - The `llm_tuple` effect class of a settings save does the same subset.
@@ -1788,7 +1842,7 @@ Each deviation stages a spec item across milestones, or settles something the sp
     - `settings_versions.scope_version_id` records the scope derived at save time. After a later confirm, `active_config.scope_version_id` may differ from it, and the active pointer is the truth.
     - Retry-apply derives again with the active profile.
     - Without a profile, the derived scope keeps `profile_relative` and the M1 filter passes (M1 Deviation 8).
-15. **Internal settings saves.** Editing a query, adding a watchlist company and removing one write a new settings version of class `collection`, in the route's own transaction. Each changes no quota quantity (a swapped id, or a free ATS source), so it copies the active version's `acknowledged_warnings` instead of asking again; field validation still runs.
+15. **Internal settings saves.** Editing a query, adding a watchlist company and removing one write a new settings version of class `collection`, in the route's own transaction (entries keyed `query_id` and `watchlist_company_id`, §13.1). Each changes no quota quantity (a swapped id, or a free ATS source), so it copies the active version's `acknowledged_warnings` instead of asking again; field validation still runs.
 16. **`projected_critic_rate` of new evaluation policies** is the §21.2 central 0.450 until M3's replay of §11.7.4 has drafts to replay.
 17. **Prompt-schema version 1** holds the M2 templates, `profile_extract` and `propose_queries`, and the four schemas. M3 ships its generator and critic templates as version 2, activated through §13.3's shipped-version flow.
 18. **Supersession of M1 Carry-forward 9.** M2 does activate a tuple, because §12.6 requires it; Deviation 10 keeps the collect graph safe.
@@ -1797,6 +1851,12 @@ Each deviation stages a spec item across milestones, or settles something the sp
 21. **CV file retention runs daily only.** §20.1 says "`retention_daily` / on confirm". A file deletion cannot join the confirm transaction, so the daily rule removes the files of versions older than the previous one.
 22. **`eval_runs` in M2** has only `kind='schema_dry_run'` rows. The golden and canary runs are M3's.
 23. **The `profile_vectors` reconciler** (heavy) is not in §17.4's table. It implements §12.6 step 3's "recomputed when it returns" for the profile side, as `awaiting_embedding` does for revisions.
+24. **Online `dispatched` entries and late settlement.**
+    - §17.4 and §7.16.7 turn an online `dispatched` entry into `ambiguous` after 15 minutes, while §13.1 allows node deadlines up to 1,800 s: `extract_profile`'s default is 900 s. M2 waits `max(15 min, the node's deadline + 5 min)`.
+    - A settlement that arrives after the reconciler moved the entry to `ambiguous` uses §7.16.7's `ambiguous → billed | not_billed` edges for online calls too, and two new `llm_calls` edges, `ambiguous → completed | error`. The counters change in the same transaction.
+    - No reservation is ever dropped or charged twice.
+25. **Profile-graph exceptions are sanitised before LangGraph sees them.** LangGraph stores a node's exception in `checkpoint_writes`, so §16's "no CV text in a checkpoint" needs every profile node wrapped (`sanitized`). Only exceptions whose text is a code pass through; any other becomes `NodeFailed(node, error_class)`. Diagnosis then relies on the logged error class and the operation's `last_error_code`.
+26. **Receipts of paid profile calls.** §9.1's receipt rule is applied to the `extract_profile` and `propose_queries` calls. A completed call with an `output_json`, recorded under the operation's id in `input_refs`, is the receipt, and a resumed or reclaimed execution of that operation reuses it instead of paying again. A new approval or retry is a new operation, so it never reuses an older output.
 
 ## Carry-forward to later milestones
 
