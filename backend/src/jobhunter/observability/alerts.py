@@ -4,7 +4,10 @@ An alert is identified by `code` and `subject` (`dedup_key = "<code>:<subject>"`
 it again only counts the occurrence; once it is resolved, the next raise opens a new row. The unique partial
 index `alerts_open_dedup` makes that atomic, so concurrent raisers never create two open rows.
 
-All three functions run on the caller's connection and leave the transaction to the caller: an alert is
+`open_alert` opens one only when none is open, and counts no occurrence of an open one: for a state that a
+later check finds still true, not a new occurrence of it (a start that finds a key still missing).
+
+All five functions run on the caller's connection and leave the transaction to the caller: an alert is
 written in the transaction that decides to raise it, and persists only if that transaction commits.
 """
 
@@ -29,8 +32,17 @@ _RAISE = q(
     "DO UPDATE SET occurrences = alerts.occurrences + 1, last_at = now() RETURNING id",
     jsonb=["context"],
 )
+_OPEN = q(
+    "INSERT INTO alerts (code, severity, dedup_key, message, context) "
+    "VALUES (:code, :severity, :dedup_key, :message, :context) "
+    "ON CONFLICT (dedup_key) WHERE resolved_at IS NULL DO NOTHING RETURNING id",
+    jsonb=["context"],
+)
 _RESOLVE = q(
     "UPDATE alerts SET resolved_at = now() WHERE dedup_key = :dedup_key AND resolved_at IS NULL RETURNING id"
+)
+_RESOLVE_CODE = q(
+    "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL RETURNING id"
 )
 _OPEN_BY_SEVERITY = q(
     "SELECT severity, count(*) AS n FROM alerts WHERE resolved_at IS NULL GROUP BY severity"
@@ -68,10 +80,41 @@ async def raise_alert(
     return int(result.scalar_one())
 
 
+async def open_alert(
+    conn: AsyncConnection,
+    *,
+    code: str,
+    severity: Severity,
+    subject: str,
+    message: str,
+    context: Mapping[str, JSONValue] | None = None,
+) -> int | None:
+    """Open the alert `code`/`subject` unless it is open; returns the new alert's id, `None` when one was
+    open already (left as it is: no occurrence counted, `last_at` unchanged). Atomic, as `raise_alert` is."""
+    result = await conn.execute(
+        _OPEN,
+        {
+            "code": code,
+            "severity": severity,
+            "dedup_key": _dedup_key(code, subject),
+            "message": message,
+            "context": {} if context is None else dict(context),
+        },
+    )
+    opened = result.scalar()
+    return None if opened is None else int(opened)
+
+
 async def resolve_alert(conn: AsyncConnection, *, code: str, subject: str) -> bool:
     """Resolve the open alert `code`/`subject`; `False` when there was none."""
     result = await conn.execute(_RESOLVE, {"dedup_key": _dedup_key(code, subject)})
     return result.first() is not None
+
+
+async def resolve_alerts(conn: AsyncConnection, *, code: str) -> int:
+    """Resolve every open alert `code`, whatever its subject (`run.failed` is raised per run and resolved by
+    the next succeeded one); the number resolved."""
+    return len((await conn.execute(_RESOLVE_CODE, {"code": code})).all())
 
 
 async def refresh_alert_gauge(conn: AsyncConnection) -> dict[Severity, int]:

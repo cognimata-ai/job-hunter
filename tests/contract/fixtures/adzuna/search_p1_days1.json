@@ -1,0 +1,306 @@
+{
+  "mean": 73000,
+  "count": 10,
+  "__CLASS__": "Adzuna::API::Response::JobSearchResults",
+  "results": [
+    {
+      "category": {
+        "label": "IT-Stellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs"
+      },
+      "id": "5933514068",
+      "adref": "[token:1]",
+      "redirect_url": "https://www.adzuna.de/details/5933514068?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Software Engineer - Embedded (Go, Python, Linux, C) (f/m/d)",
+      "company": {
+        "display_name": "Holoplot",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.38046,
+      "latitude": 52.43792,
+      "salary_is_predicted": "0",
+      "contract_time": "full_time",
+      "description": "The product you will work on The HOLOPLOT Matrix Array is a new type of sound system built around precise, software-defined control of audio in three dimensions - grounded in physics and delivered through a combination of custom hardware and software. HOLOPLOT Matrix Arrays are deployed in flagship venues worldwide, including Sphere in Las Vegas - home to the largest audio installation on Earth. Audio processing in HOLOPLOT systems is distributed: every loudspeaker runs embedded Linux, and hund…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Mariendorf"
+        ],
+        "display_name": "Mariendorf, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-18T18:42:17Z"
+    },
+    {
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "ALTEN Consulting Services"
+      },
+      "latitude": 52.51475,
+      "description": "Die ALTEN Consulting Services GmbH bietet mit über 20 Jahren Branchenerfahrung ihren namhaften Kunden aus Industrie und Wirtschaft hochspezialisierte Engineering- und IT-Dienstleistungen zur gemeinsamen Realisierung von branchen- und technologieübergreifenden Lösungen an. Kompetenz, Engagement und Leidenschaft verbinden alle unsere Mitarbeiter der ALTEN Consulting Services GmbH. Dabei stehen ein partnerschaftliches Miteinander, ein starkes WIR-Gefühl, der persönliche Kontakt zu unseren Kunden u…",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Friedrichshain, Berlin",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Friedrichshain"
+        ]
+      },
+      "created": "2026-10-18T18:23:08Z",
+      "category": {
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "IT-Stellen"
+      },
+      "id": "5933486747",
+      "adref": "[token:2]",
+      "redirect_url": "https://www.adzuna.de/details/5933486747?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Embedded Software Engineer – Rust / C++ &",
+      "longitude": 13.43856,
+      "salary_min": 60000,
+      "salary_is_predicted": "0",
+      "salary_max": 86000,
+      "contract_time": "full_time",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "location": {
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-18T10:21:51Z",
+      "description": "Wenn du dich für Capgemini entscheidest, wählst du ein Unternehmen, in dem du die Möglichkeit hast, deinen Karriereweg selbst zu gestalten. Du wirst von einem kollaborativen Netzwerk von Kolleg\\*innen auf der ganzen Welt unterstützt und inspiriert und kannst neu definieren, was möglich ist. Schließe dich uns an und unterstütze die führenden Organisationen der Welt, den Wert von Technologie zu erschließen und eine nachhaltigere, inklusivere Welt zu gestalten.  Deine Rolle Du möchtest moderne und…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "longitude": 13.420806,
+      "company": {
+        "display_name": "Capgemini",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "category": {
+        "tag": "graduate-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Stellen für Hochschulabsolventen"
+      },
+      "id": "5933082944",
+      "adref": "[token:3]",
+      "redirect_url": "https://www.adzuna.de/details/5933082944?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Software Engineer (w/m/d) - Anwendungsentwicklung, Ingenieur"
+    },
+    {
+      "description": "Position: Account Manager Job Description: Since 2000, SiliconExpert (https://www.siliconexpert.com/about/) helps you make better data-driven decisions with a human-driven experience. Over 500 electrical, software and data engineers handcraft our component database of more than one billion parts to deliver the most comprehensive and current tools in the industry. Customers globally use our solutions to manage risk, avoid redesigns, and mitigate obsolescence in innovative industries such as cons…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "created": "2026-10-18T09:26:42Z",
+      "location": {
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "adref": "[token:4]",
+      "title": "Account Manager",
+      "redirect_url": "https://www.adzuna.de/details/5933064953?utm_medium=scrubbed&utm_source=scrubbed",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "id": "5933064953",
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "company": {
+        "display_name": "Arrow Electronics",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806
+    },
+    {
+      "longitude": 13.420806,
+      "company": {
+        "display_name": "adesso",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "id": "5932908203",
+      "category": {
+        "label": "Unknown",
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5932908203?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Software Engineer KI (all genders)",
+      "adref": "[token:5]",
+      "location": {
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-18T05:44:54Z",
+      "contract_time": "full_time",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "adesso steht für IT-Exzellenz und damit auch für exzellente Entwicklungsmöglichkeiten für alle adessi. Wir wachsen gemeinsam und lernen voneinander – an unseren Projekten, im Team und mit herausragenden Trainingsangeboten. Wir haben IT im Herzen, die Branche im Blick und den Erfolg unserer Kunden im Sinn. Denn erfolgreiches Geschäft entsteht durch innovative Ideen, zukunftsfähige Strategien und kluge IT-Lösungen. Immer sind dabei Menschen beteiligt, die etwas bewegen wollen und das einfach mach…"
+    },
+    {
+      "description": "Description Kleinanzeigen is the leading online classifieds market in Germany. Users buy and sell on Germany's No. 1 for classifieds mainly second-hand. In this way they make an active contribution to more sustainability. On average, more than 55 million ads are available in numerous categories – from children's supplies to electronics and real estate. Kleinanzeigen also offers small and medium-sized businesses the opportunity to present their services online. Around 35 million users per month …",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "created": "2026-10-17T19:10:14Z",
+      "location": {
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "adref": "[token:6]",
+      "redirect_url": "https://www.adzuna.de/details/5932481485?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "(Senior) Product Analyst, Real Estate & Motors (d/f/m) - 1-year fixed-term contract",
+      "category": {
+        "label": "Stellen aus PR, Werbung & Marketing",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "pr-advertising-marketing-jobs"
+      },
+      "id": "5932481485",
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "longitude": 13.420806,
+      "company": {
+        "display_name": "Kleinanzeigen.de",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "contract_type": "contract"
+    },
+    {
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-17T18:44:33Z",
+      "contract_time": "full_time",
+      "description": "THE ROLE & THE TEAM As a Senior Applied Scientist, you will be part of an expert team of software engineers and applied scientists working towards keeping the delivery time promise for all Zalando customers. In this role you will translate real-world problems into mathematical models, and design algorithms that solve these models. Beyond the algorithmic challenges, a significant part of your role will be creation and maintenance of the software systems required to run these algorithms. Here, yo…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "company": {
+        "display_name": "Zalando",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "category": {
+        "tag": "logistics-warehouse-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Stellen aus Logistik & Lagerhaltung"
+      },
+      "id": "5932448834",
+      "adref": "[token:7]",
+      "redirect_url": "https://www.adzuna.de/details/5932448834?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Applied Scientist - Warehouse Fulfillment Quality Algorithms (all genders)"
+    },
+    {
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Delivery Hero"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "category": {
+        "label": "IT-Stellen",
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "id": "5932028657",
+      "adref": "[token:8]",
+      "title": "Software Engineer II, Content Quality - Quick Commerce",
+      "redirect_url": "https://www.adzuna.de/details/5932028657?utm_medium=scrubbed&utm_source=scrubbed",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-17T13:08:36Z",
+      "description": "Job Description We are on the lookout for a Software Engineer II to join the Content Quality team within our Quick Commerce department. We own how millions of customers interact with our product content in real time - the accuracy, completeness, and trustworthiness of the products behind our dark stores and local-shop partners around the globe (groceries, pharmaceuticals, flowers, and more). As a Software Engineer II, you won't just write code: you'll own real production services, help shape ho…",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "WeMaintain"
+      },
+      "longitude": 13.420806,
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown",
+        "label": "Unknown"
+      },
+      "id": "5931340604",
+      "adref": "[token:9]",
+      "title": "Lead Analytics Engineer (F/M/X)",
+      "redirect_url": "https://www.adzuna.de/details/5931340604?utm_medium=scrubbed&utm_source=scrubbed",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-17T02:57:22Z",
+      "description": "Lead Analytics Engineer (F/M/X) Full remote · Europe · Product & Engineering  Who are we? In 2017, after more than ten years in the lift industry across Europe and Asia, [person:1] noticed a system stuck in its ways, where speed takes priority over quality and frontline teams remain invisible. With [person:2] , he founded WeMaintain to put technology and trust back into building maintenance, and the people doing the work back at the centre of it. Their ambition: give technicians back thei…",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Vattenfall"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5931145892?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": ".NET Software Engineer (Backend)",
+      "adref": "[token:10]",
+      "id": "5931145892",
+      "category": {
+        "label": "IT-Stellen",
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "created": "2026-10-17T01:05:49Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Stellenbeschreibung Du bist auf der Suche nach neuen beruflichen Herausforderungen und möchtest zeitgleich etwas zu einer Fossilfreien Zukunft beitragen? Unsere Aufgabe im Bereich Customer IT der Vattenfall IT ist es, digitale Lösungen und Produkte zu entwickeln und zu betreiben, die es unseren Geschäftseinheiten ermöglichen unser gemeinsames Ziel zu erreichen: Fossilfreies Leben innerhalb einer Generation! Eine wesentliche Voraussetzung zur Erreichung dieses Ziels ist die Optimierung und Digit…"
+    }
+  ]
+}

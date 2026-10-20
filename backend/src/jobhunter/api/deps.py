@@ -12,6 +12,7 @@ from jobhunter.auth import sessions
 from jobhunter.auth.sessions import SessionInfo
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.embeddings import EmbedderClient
 
 
 @runtime_checkable
@@ -43,6 +44,14 @@ def get_code_head(request: Request) -> str:
     if not isinstance(head, str):
         raise RuntimeError("the api state has no code head: the lifespan has not run")
     return head
+
+
+def get_embedder(request: Request) -> EmbedderClient:
+    """The app's embedder client (`create_app`, or the lifespan): readiness and system health probe it."""
+    embedder = getattr(request.app.state, "embedder", None)
+    if not isinstance(embedder, EmbedderClient):
+        raise RuntimeError("the api state has no embedder client: the lifespan has not run")
+    return embedder
 
 
 def get_rate_limiter(request: Request) -> RateLimiter:

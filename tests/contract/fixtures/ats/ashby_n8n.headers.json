@@ -1,0 +1,10 @@
+{
+  "status": 200,
+  "headers": {
+    "age": "27",
+    "cache-control": "public, max-age=60, stale-while-revalidate=60",
+    "cf-cache-status": "HIT",
+    "content-type": "application/json; charset=utf-8",
+    "date": "Sun, 18 Oct 2026 20:49:46 GMT"
+  }
+}

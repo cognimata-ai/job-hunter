@@ -141,6 +141,8 @@ def image_check(head: str) -> str:
             "assert r.files('jobhunter.db').joinpath('seed_data/settings_v1.json').is_file()",
             f"assert r.files('jobhunter.db').joinpath('migrations/versions/{head}.py').is_file()",
             "assert r.files('jobhunter.auth').joinpath('common_passwords.txt').is_file()",
+            "assert r.files('jobhunter.geo').joinpath('data/de_places.tsv').is_file()",
+            "assert r.files('jobhunter.geo').joinpath('data/non_de_places.tsv').is_file()",
             f"assert code_head() == {head!r}, code_head()",
             "assert not pathlib.Path('/src').exists()",
             "assert os.getuid() == 10001, os.getuid()",
@@ -169,6 +171,29 @@ def test_dev_stack_serves_through_devproxy(stack) -> None:
     while httpx.get("http://localhost:8080/readyz", timeout=5).status_code != 200:
         assert time.monotonic() < deadline, "readyz never 200"
         time.sleep(2)
+
+
+def test_embedder_is_healthy_and_readiness_reports_no_embedder_failure(stack) -> None:
+    """Task 25: the embedder service passes its healthcheck (`embedder-health`: `/health` 200 with the model's
+    checksum verified), and `/readyz`, which probes it (§17.5), ends 200 with no failing code at all."""
+    container = subprocess.run(
+        [*DC, "ps", "--quiet", "embedder"], capture_output=True, text=True, check=True, timeout=CALL_TIMEOUT_S
+    ).stdout.split()
+    assert len(container) == 1, container
+    health = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Health.Status}}", container[0]],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=CALL_TIMEOUT_S,
+    ).stdout.strip()
+    assert health == "healthy"
+    deadline = time.monotonic() + 60
+    while (r := httpx.get("http://localhost:8080/readyz", timeout=10)).status_code != 200:
+        assert r.status_code == 503 and "embedder" not in r.json()["failing"], (r.status_code, r.text)
+        assert time.monotonic() < deadline, f"readyz never 200 (last: {r.text})"
+        time.sleep(2)
+    assert r.json() == {}
 
 
 def run_in(role: str, *command: str) -> subprocess.CompletedProcess[str]:

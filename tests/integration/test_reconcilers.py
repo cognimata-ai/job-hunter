@@ -7,7 +7,9 @@ from jobhunter.worker.tasks import defer_in_tx
 pytestmark = pytest.mark.integration
 
 
-async def test_failure_is_persisted_isolated_and_resolved(engine, queue_app, monkeypatch, caplog) -> None:
+async def test_failure_is_persisted_isolated_and_resolved(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:
     state = {"fail": True}
 
     async def flaky(ctx: r.ReconcileContext) -> int:
@@ -49,7 +51,7 @@ async def test_failure_is_persisted_isolated_and_resolved(engine, queue_app, mon
 
 
 async def test_alert_write_failure_is_logged_and_does_not_stop_the_other_reconcilers(
-    engine, queue_app, monkeypatch, caplog
+    engine, current_epoch, queue_app, monkeypatch, caplog
 ) -> None:
     async def flaky(ctx: r.ReconcileContext) -> int:
         raise RuntimeError("detail that must not be stored")
@@ -79,7 +81,7 @@ async def test_alert_write_failure_is_logged_and_does_not_stop_the_other_reconci
 
 
 async def test_resolve_failure_is_logged_and_does_not_stop_the_other_reconcilers(
-    engine, queue_app, monkeypatch, caplog
+    engine, current_epoch, queue_app, monkeypatch, caplog
 ) -> None:
     async def first(ctx: r.ReconcileContext) -> int:
         return 1
@@ -104,7 +106,9 @@ async def test_resolve_failure_is_logged_and_does_not_stop_the_other_reconcilers
     assert "must not be" not in caplog.text
 
 
-async def test_heavy_metrics_refresh_sets_table_sizes_and_the_open_alert_gauge(engine, queue_app) -> None:
+async def test_heavy_metrics_refresh_sets_table_sizes_and_the_open_alert_gauge(
+    engine, current_epoch, queue_app
+) -> None:
     from jobhunter.observability.alerts import raise_alert
     from jobhunter.observability.metrics import ALERTS_OPEN, REGISTRY, TABLE_BYTES, refresh_table_bytes
 
@@ -129,3 +133,162 @@ async def test_heavy_metrics_refresh_sets_table_sizes_and_the_open_alert_gauge(e
         sizes = await refresh_table_bytes(c)  # the one collector, which system health reuses (ruling T13-c)
     assert {table: sizes[table] for table in tables} == set_by_reconciler  # nothing was written in between
     assert "alembic_version" in sizes and not any(name.startswith("pg_") for name in sizes)
+
+
+# --- Ruling FR-h: the alert writes are fenced, and a fenced cadence stops ----------------------------------
+
+_TAKEOVER = sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1")
+_FAILED_ALERT = sa.text(
+    "SELECT occurrences, resolved_at IS NULL AS open FROM alerts WHERE code = 'reconciler.failed'"
+)
+
+
+async def test_a_superseded_worker_stops_the_cadence_and_never_writes_reconciler_failed(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:
+    """A newer worker took over: a reconciler of the superseded one that fails raises no
+    `reconciler.failed`, one that succeeds resolves none, and one fenced out itself is no failure. Each stops
+    the cadence there (`reconcilers_fenced`): the reconcilers after it do not run."""
+    from jobhunter.errors import FencedOut
+
+    from tests.support.logs import logged
+
+    state = {"fail": True, "fenced": False}
+    ran: list[str] = []
+
+    async def flaky(ctx: r.ReconcileContext) -> int:
+        ran.append("flaky")
+        if state["fenced"]:
+            raise FencedOut(owner="worker_epoch")
+        if state["fail"]:
+            raise RuntimeError("detail")
+        return 0
+
+    async def after(ctx: r.ReconcileContext) -> int:
+        ran.append("after")
+        return 1
+
+    monkeypatch.setattr(r, "REGISTRY", {})
+    r.reconciler("flaky", "tick")(flaky)
+    r.reconciler("after", "tick")(after)
+    stops: list[str] = []
+    ctx = r.ReconcileContext(
+        engine=engine,
+        queue=queue_app,
+        defer=defer_in_tx,
+        now=utcnow(),
+        epoch=1,
+        on_superseded=lambda: stops.append("stop"),
+    )
+    assert await r.run_reconcilers(ctx, "tick") == {"flaky": -1, "after": 1}  # the current epoch: recorded
+    assert stops == []
+    async with engine.begin() as c:
+        assert tuple((await c.execute(_FAILED_ALERT)).one()) == (1, True)
+        await c.execute(_TAKEOVER)
+    ran.clear()
+    assert await r.run_reconcilers(ctx, "tick") == {"flaky": -1}  # its alert write was fenced: stop
+    state["fail"] = False
+    assert await r.run_reconcilers(ctx, "tick") == {"flaky": 0}  # its resolution was fenced: stop
+    state["fenced"] = True
+    assert await r.run_reconcilers(ctx, "tick") == {}  # fenced out itself: no failure, stop
+    assert ran == ["flaky", "flaky", "flaky"]
+    assert stops == ["stop"] * 3  # each fenced cadence asks this superseded worker to stop (Ruling T24-a)
+    async with engine.connect() as c:
+        assert tuple((await c.execute(_FAILED_ALERT)).one()) == (1, True)  # never raised again or resolved
+    assert [(e["cadence"], e["reconciler"]) for e in logged(caplog, "reconcilers_fenced")] == [
+        ("tick", "flaky")
+    ] * 3
+    assert len(logged(caplog, "reconciler_failed")) == 2  # the two real failures; the fenced pass is none
+    assert logged(caplog, "reconciler_alert_write_failed") == []
+
+
+async def test_a_fence_of_another_owner_is_a_failure_and_never_stops_the_worker(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:
+    """F5 review, Minor 1: only the worker's own fence (`FencedOut.worker_superseded`) stops the cadence and
+    the worker. A `FencedOut` of another owner (here a purge fence) that a reconciler lets escape is recorded
+    as its failure, the reconcilers after it still run, and no stop is requested."""
+    from jobhunter.errors import FencedOut
+
+    from tests.support.logs import logged
+
+    ran: list[str] = []
+    stops: list[str] = []
+
+    async def fenced_job(ctx: r.ReconcileContext) -> int:
+        ran.append("fenced_job")
+        raise FencedOut(owner="purge_fence")
+
+    async def after(ctx: r.ReconcileContext) -> int:
+        ran.append("after")
+        return 1
+
+    monkeypatch.setattr(r, "REGISTRY", {})
+    r.reconciler("fenced_job", "tick")(fenced_job)
+    r.reconciler("after", "tick")(after)
+    ctx = r.ReconcileContext(
+        engine=engine,
+        queue=queue_app,
+        defer=defer_in_tx,
+        now=utcnow(),
+        epoch=current_epoch,
+        on_superseded=lambda: stops.append("stop"),
+    )
+    assert await r.run_reconcilers(ctx, "tick") == {"fenced_job": -1, "after": 1}
+    assert ran == ["fenced_job", "after"] and stops == []
+    assert [e["error_class"] for e in logged(caplog, "reconciler_failed")] == ["FencedOut"]
+    assert logged(caplog, "reconcilers_fenced") == []
+    async with engine.connect() as c:
+        assert tuple((await c.execute(_FAILED_ALERT)).one()) == (1, True)
+    assert FencedOut(owner="worker_epoch").worker_superseded and FencedOut("worker_lock").worker_superseded
+    assert not any(
+        FencedOut(o).worker_superseded for o in ("run", "operation", "purge_fence", "quota_ledger")
+    )
+
+
+async def test_a_superseded_workers_stalled_jobs_reconciler_releases_nothing(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:
+    """Fix wave F7 (Ruling FR-h): `stalled_jobs` is fenced by the worker epoch like the other maintenance
+    writes. After a takeover, the superseded worker's reconciler raises its own fence having retried no
+    stalled job, so its cadence stops there and it requests its stop; the current worker's releases the
+    job."""
+    from jobhunter.errors import FencedOut
+
+    from tests.support.logs import logged
+
+    async with engine.begin() as c:
+        # A dead worker's operation: `doing` without a worker row, so procrastinate lists it as stalled.
+        job = await defer_in_tx(c, "run_operation", operation_id=7)
+        await c.execute(sa.text("UPDATE procrastinate_jobs SET status = 'doing' WHERE id = :i"), {"i": job})
+        await c.execute(_TAKEOVER)
+    stops: list[str] = []
+    superseded = r.ReconcileContext(
+        engine=engine,
+        queue=queue_app,
+        defer=defer_in_tx,
+        now=utcnow(),
+        epoch=current_epoch,
+        on_superseded=lambda: stops.append("stop"),
+    )
+
+    async def status() -> str:
+        async with engine.connect() as c:
+            query = sa.text("SELECT status FROM procrastinate_jobs WHERE id = :i")
+            return str((await c.execute(query, {"i": job})).scalar_one())
+
+    with pytest.raises(FencedOut) as fenced:
+        await r.stalled_jobs(superseded)
+    assert fenced.value.worker_superseded and await status() == "doing"
+    assert logged(caplog, "stalled_job_released") == []
+    for cadence in ("start", "tick"):
+        assert await r.run_reconcilers(superseded, cadence) == {}  # stopped at `stalled_jobs`, first in both
+    assert stops == ["stop", "stop"] and await status() == "doing"
+    assert [(e["cadence"], e["reconciler"]) for e in logged(caplog, "reconcilers_fenced")] == [
+        ("start", "stalled_jobs"),
+        ("tick", "stalled_jobs"),
+    ]
+    current = r.ReconcileContext(
+        engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=current_epoch + 1
+    )
+    assert await r.stalled_jobs(current) == 1 and await status() == "todo"

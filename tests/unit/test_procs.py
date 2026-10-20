@@ -19,7 +19,7 @@ _LEADER = (
 def _gone(pid: int) -> bool:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before the open, or between open and read
         return True
     return stat.rpartition(")")[2].split()[0] == "Z"  # dead, waiting only to be reaped by its new parent
 

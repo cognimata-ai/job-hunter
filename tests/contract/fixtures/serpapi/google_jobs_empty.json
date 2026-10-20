@@ -1,0 +1,21 @@
+{
+  "search_metadata": {
+    "id": "[token:5]",
+    "status": "Success",
+    "json_endpoint": "https://serpapi.com/searches/CMBs8ntFVc1-rLBcG4FWhKU5l-nZuMsMnOqfZ-NRMe8/6ad5311a4188d5f8a7edcfa4.json",
+    "markdown_endpoint": "https://serpapi.com/searches/CMBs8ntFVc1-rLBcG4FWhKU5l-nZuMsMnOqfZ-NRMe8/6ad5311a4188d5f8a7edcfa4.md",
+    "created_at": "2026-10-18 20:50:34 UTC",
+    "processed_at": "2026-10-18 20:50:34 UTC",
+    "google_jobs_url": "https://www.google.com/search?q=software+engineer+Berlin&hl=en&gl=de&udm=8",
+    "raw_html_file": "https://serpapi.com/searches/CMBs8ntFVc1-rLBcG4FWhKU5l-nZuMsMnOqfZ-NRMe8/6ad5311a4188d5f8a7edcfa4.html",
+    "total_time_taken": 13.11
+  },
+  "search_parameters": {
+    "q": "software engineer Berlin",
+    "engine": "google_jobs",
+    "google_domain": "google.com",
+    "hl": "en",
+    "gl": "de"
+  },
+  "error": "Google hasn't returned any results for this query."
+}

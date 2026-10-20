@@ -1,4 +1,6 @@
-# CI for Job Hunter (spec §18.8, the M0 subset): lint, unit, integration, frontend and audit.
+# CI for Job Hunter (spec §18.8, the M0 and M1 subset): lint, unit, integration, contract, frontend and audit.
+# The live smoke of the free sources is the separate, manual and weekly smoke-free-sources.yml; no job here calls
+# a provider.
 #
 # Supply chain: every action is pinned to a full commit SHA (the release tag is the trailing comment), uv and Node
 # to exact versions, the container images (PostgreSQL, gitleaks) to digests in deploy/images.lock. No job uses a
@@ -62,7 +64,10 @@ jobs:
         with:
           version: "0.13.1"
       - run: uv sync --frozen
-      - run: uv run pytest -W error tests/unit tests/property -q
+      # tests/embedder runs in the base environment: the embedder app tests need no model and no `embedder`
+      # group (Task 21); the `embedder_model` tests that load the model are deselected (pyproject addopts).
+      # tests/live: addopts deselects its `live` tests too, so only its offline paid-host guards run here.
+      - run: uv run pytest -W error tests/unit tests/property tests/embedder tests/live -q
 
   integration:
     runs-on: ubuntu-24.04
@@ -78,6 +83,21 @@ jobs:
       # The harness (tests/support/pg.py) runs this image and is the only test code that needs Docker.
       - run: docker pull "$(grep ^pgvector= deploy/images.lock | cut -d= -f2)"
       - run: uv run pytest -W error tests/integration tests/crash -q
+
+  # The adapter contract tests on the scrubbed fixtures and the fixture PII scan (spec §18.4): offline, no
+  # database.
+  contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      - run: uv run pytest -W error tests/contract -q
 
   frontend:
     runs-on: ubuntu-24.04

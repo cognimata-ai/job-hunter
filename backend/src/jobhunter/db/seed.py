@@ -1,8 +1,11 @@
-"""Default settings and the seed rows `migrate` writes (spec §13.1, §19.3 step 6).
+"""Default settings and the seed rows `migrate` writes (spec §13.1, §19.3 step 6, §7.5).
 
 `settings_v1.json` holds every §13.1 default; decimals are JSON strings. The derived rows (scope, model
 policy, execution config, evaluation policy) are immutable and deduplicated by the SHA-256 of the canonical
 JSON of the payload as stored (§13.2), so a second `seed_defaults` finds the rows of the first.
+
+The `sources` rows (`SOURCES`) and the `default` instance of each non-ATS source (`DEFAULT_INSTANCES`) are
+inserted when absent and never updated.
 
 The transition matrix is different: it is derived from code, so `sync_transition_matrix` replaces its rows on
 every run instead of freezing them.
@@ -12,6 +15,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from importlib import resources
@@ -36,6 +40,44 @@ _HASH_COLUMN: Final = {
     "model_policies": "policy_hash",
     "execution_configs": "config_hash",
 }
+
+
+@dataclass(frozen=True)
+class SourceSeed:
+    """One `sources` row (§7.5)."""
+
+    id: str
+    kind: str
+    precedence_rank: int
+    can_close: bool
+    default_completeness: str
+
+
+SOURCES: Final[tuple[SourceSeed, ...]] = (
+    SourceSeed("jsearch", "paid_search", 2, False, "full"),
+    SourceSeed("serpapi", "paid_search", 2, False, "full"),
+    SourceSeed("adzuna", "quota_search", 4, False, "partial"),
+    SourceSeed("arbeitnow", "firehose", 3, False, "full"),
+    *(
+        SourceSeed(ats, "ats", 1, True, "full")
+        for ats in ("greenhouse", "lever", "ashby", "personio", "recruitee", "smartrecruiters")
+    ),
+)
+# The sources with one `default` instance each; an ATS instance belongs to a watchlist company instead.
+DEFAULT_INSTANCES: Final = ("jsearch", "serpapi", "adzuna", "arbeitnow")
+_INSERT_SOURCES: Final = (
+    "INSERT INTO sources (id, kind, precedence_rank, can_close, default_completeness) "
+    "VALUES (:id, :kind, :precedence_rank, :can_close, :default_completeness) ON CONFLICT DO NOTHING"
+)
+_DEFAULT_INSTANCE_IDS: Final = ", ".join(f"'{source_id}'" for source_id in DEFAULT_INSTANCES)
+# Static SQL over the constants above, never input: the test reset runs it on a plain psycopg connection, so
+# it has no parameters. Looking first keeps a re-run from burning identity values, as `_ensure_id` does.
+DEFAULT_INSTANCES_SQL: Final = (
+    "INSERT INTO source_instances (source_id, instance_key) "  # noqa: S608
+    f"SELECT d.id, 'default' FROM unnest(ARRAY[{_DEFAULT_INSTANCE_IDS}]) AS d(id) "
+    "WHERE NOT EXISTS (SELECT 1 FROM source_instances i "
+    "WHERE i.source_id = d.id AND i.instance_key = 'default') ON CONFLICT DO NOTHING"
+)
 
 
 def canonical_json(value: JSONValue) -> bytes:
@@ -193,7 +235,7 @@ async def sync_transition_matrix(conn: AsyncConnection) -> int:
 
 
 async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
-    """Write the default settings chain, `active_config`, `schedule_state` and `ranking_state`.
+    """Write the default settings chain, the three single rows, `sources` and the default source instances.
 
     Idempotent and never an overwrite. Settings version 1 is frozen once stored: the derived rows (scope,
     model policy, execution config, evaluation policy) and the version are created from the packaged
@@ -248,5 +290,8 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     )
 
     await conn.execute(q("INSERT INTO ranking_state (id, generation) VALUES (1, 0) ON CONFLICT DO NOTHING"))
+
+    await conn.execute(q(_INSERT_SOURCES), [asdict(source) for source in SOURCES])
+    await conn.execute(q(DEFAULT_INSTANCES_SQL))
 
     await sync_transition_matrix(conn)

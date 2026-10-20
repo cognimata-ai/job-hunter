@@ -1,0 +1,174 @@
+source	string	country	kind
+adzuna	Adlershof, Berlin	DE	city
+adzuna	Berlin, Deutschland	DE	city
+adzuna	Friedrichshain, Berlin	DE	city
+adzuna	Kreuzberg, Berlin	DE	city
+adzuna	Mariendorf, Berlin	DE	city
+adzuna	Potsdam, Brandenburg	DE	city
+adzuna	Wedding, Berlin	DE	city
+arbeitnow	Bad Homburg	DE	city
+arbeitnow	Berlin	DE	city
+arbeitnow	Berlin, Berlin, Deutschland	DE	city
+arbeitnow	Berlin, Berlin, Germany	DE	city
+arbeitnow	Darmstadt	DE	city
+arbeitnow	Detmold, Nordrhein-Westfalen, Deutschland	DE	city
+arbeitnow	Düsseldorf, Nordrhein-Westfalen, Germany	DE	city
+arbeitnow	Düsseldorf, North Rhine-Westphalia	DE	city
+arbeitnow	Eschborn, Hesse	DE	city
+arbeitnow	Freiburg (Germany)	DE	city
+arbeitnow	Gütersloh, Nordrhein-Westfalen, Deutschland	DE	city
+arbeitnow	Hamburg	DE	city
+arbeitnow	Hannover, Niedersachsen, Germany	DE	city
+arbeitnow	Hörstel	DE	city
+arbeitnow	Koblenz, Rheinland-Pfalz, Deutschland	DE	city
+arbeitnow	Köln, Nordrhein-Westfalen, Deutschland	DE	city
+arbeitnow	Leverkusen, Nordrhein-Westfalen, Deutschland	DE	city
+arbeitnow	London	GB	city
+arbeitnow	Munich	DE	city
+arbeitnow	Munich, Bavaria	DE	city
+arbeitnow	Munich, Bayern, Germany	DE	city
+arbeitnow	Munich, Berlin, Germany	DE	multi
+arbeitnow	München, Bavaria	DE	city
+arbeitnow	München, Bayern, Deutschland	DE	city
+arbeitnow	Regensburg, Bayern, Germany	DE	city
+arbeitnow	Remote	-	remote
+arbeitnow	Remote job	-	remote
+arbeitnow	Rostock	DE	city
+arbeitnow	Stuttgart	DE	city
+arbeitnow	Tübingen	DE	city
+ashby	Albania	-	country_wide
+ashby	Atlanta	US	city
+ashby	Austria	-	country_wide
+ashby	Belgium	-	country_wide
+ashby	Berlin	DE	city
+ashby	Berlin Office	DE	city
+ashby	Bosnia	-	country_wide
+ashby	Boston	US	city
+ashby	Bulgaria	-	country_wide
+ashby	California	-	unknown
+ashby	Colorado	-	unknown
+ashby	Croatia	-	country_wide
+ashby	Czech Republic	-	country_wide
+ashby	Denmark	-	country_wide
+ashby	Denver	US	city
+ashby	Estonia	-	country_wide
+ashby	Europe	-	unknown
+ashby	Finland	-	country_wide
+ashby	Florida	-	unknown
+ashby	France	-	country_wide
+ashby	Georgia	-	unknown
+ashby	Germany	-	country_wide
+ashby	Greece	-	country_wide
+ashby	Hungary	-	country_wide
+ashby	Ireland	-	country_wide
+ashby	Italy	-	country_wide
+ashby	Kosovo	-	country_wide
+ashby	Latvia	-	country_wide
+ashby	Lithuania	-	country_wide
+ashby	London	GB	city
+ashby	London Office	GB	city
+ashby	Los Angeles	US	city
+ashby	Massachusetts	-	unknown
+ashby	Moldova	-	country_wide
+ashby	Montenegro	-	country_wide
+ashby	Netherlands	-	country_wide
+ashby	New Jersey	-	unknown
+ashby	New York	US	city
+ashby	Norway	-	country_wide
+ashby	Ottawa	CA	city
+ashby	Pennsylvania	-	unknown
+ashby	Poland	-	country_wide
+ashby	Portugal	-	country_wide
+ashby	Romania	-	country_wide
+ashby	San Francisco	US	city
+ashby	Serbia	-	country_wide
+ashby	Slovakia	-	country_wide
+ashby	Slovenia	-	country_wide
+ashby	Spain	-	country_wide
+ashby	Texas	-	unknown
+ashby	Toronto	CA	city
+ashby	United Kingdom	-	country_wide
+ashby	United States	-	country_wide
+ashby	Virginia	-	unknown
+ashby	Washington State	-	unknown
+greenhouse	Barcelona	ES	city
+greenhouse	Berlin	DE	city
+greenhouse	Mexico City	MX	city
+greenhouse	Paris	FR	city
+greenhouse	San Francisco	US	city
+greenhouse	Sao Paulo	BR	city
+jsearch	Beliebiger Ort   •  über Adzuna.de	-	country_wide
+jsearch	Beliebiger Ort   •  über JobLeads	-	country_wide
+jsearch	Beliebiger Ort   •  über LinkedIn	-	country_wide
+jsearch	Beliebiger Ort   •  über Trabajo.org	-	country_wide
+jsearch	Berlin     •  über Arbeitnow	DE	city
+jsearch	Berlin     •  über BeBee	DE	city
+jsearch	Berlin     •  über JobLeads	DE	city
+jsearch	Berlin     •  über Join	DE	city
+jsearch	Berlin     •  über Learn4Good	DE	city
+jsearch	Berlin     •  über LinkedIn	DE	city
+jsearch	Berlin     •  über Snowflake Careers	DE	city
+jsearch	Berlin     •  über Stepstone	DE	city
+jsearch	Berlin     •  über Trabajo.org	DE	city
+jsearch	Berlin     •  über Vattenfall Careers	DE	city
+jsearch	Berlin     •  über Veralto Global Jobs	DE	city
+jsearch	Berlin  (+ 1 weiterer Standort)      •  über Talent.com	DE	multi
+lever	Albuquerque, New Mexico	US	city
+lever	Amsterdam, Netherlands	NL	city
+lever	Arborg, Manitoba	CA	city
+lever	Arlington, TX	US	city
+lever	Atlanta, Georgia	US	city
+lever	Austin, TX	US	city
+lever	Baltimore, MD	US	city
+lever	Bay Area, CA	-	unknown
+lever	Belfast, Ireland	GB	city
+lever	Bombay, MH	IN	city
+lever	Boston, MA	US	city
+lever	Bothell, WA	US	city
+lever	Brussels, Belgium	BE	city
+lever	Buffalo, NY	US	city
+lever	Denver, CO	US	city
+lever	Hogwarts, Scottish Highlands	-	unknown
+lever	Houston, TX	US	city
+lever	Irvine, CA	US	city
+lever	London, UK	GB	city
+lever	Los Angeles or San Francisco, CA	US	multi
+lever	Los Angeles, CA	US	city
+lever	Minneapolis, MN	US	city
+lever	Mountain View	US	city
+lever	Multiple Locations	-	unknown
+lever	New York, New York	US	city
+lever	Oakland, CA	US	city
+lever	Renamed job location	-	unknown
+lever	San Diego, CA	US	city
+lever	San Francisco, CA	US	city
+lever	Tampa, FL	US	city
+lever	Toronto	CA	city
+lever	Toronto, Ontario	CA	city
+personio	Berlin Köpenicker Straße 154, 10997 Berlin	DE	city
+personio	Ludwig-Prandtl-Straße 36, 12526 Berlin	DE	city
+recruitee	Amsterdam	NL	city
+recruitee	Amsterdam, Noord-Holland, Netherlands	NL	city
+recruitee	Brussels	BE	city
+recruitee	Brussels, Brussels, Belgium	BE	city
+recruitee	Sofia	BG	city
+recruitee	Sofia, Sofia (stolitsa), Bulgaria	BG	city
+recruitee	İstanbul	TR	city
+recruitee	İstanbul, İstanbul, Türkiye	TR	city
+serpapi	Berlin	DE	city
+serpapi	Berlin (+2 others)	DE	multi
+smartrecruiters	Barcelona	ES	city
+smartrecruiters	Barcelona, , Spain	ES	city
+smartrecruiters	Buenos Aires	AR	city
+smartrecruiters	Buenos Aires, , Argentina	AR	city
+smartrecruiters	Dubai	AE	city
+smartrecruiters	Dubai, Dubai, United Arab Emirates	AE	city
+smartrecruiters	Milan	IT	city
+smartrecruiters	Milan, Lombardy, Italy	IT	city
+smartrecruiters	Montevideo	UY	city
+smartrecruiters	Montevideo, , Uruguay	UY	city
+smartrecruiters	Montevideo, Montevideo Department, Uruguay	UY	city
+smartrecruiters	San Salvador	SV	city
+smartrecruiters	San Salvador, , El Salvador	SV	city
+smartrecruiters	Santa Cruz	BO	city
+smartrecruiters	Santa Cruz, , Bolivia	BO	city

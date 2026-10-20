@@ -1,0 +1,9 @@
+{
+  "status": 200,
+  "headers": {
+    "cache-control": "max-age=3600, public",
+    "cf-cache-status": "MISS",
+    "content-type": "application/json; charset=utf-8",
+    "date": "Sun, 18 Oct 2026 20:50:48 GMT"
+  }
+}

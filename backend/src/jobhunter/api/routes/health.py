@@ -7,8 +7,9 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.responses import JSONResponse, Response
 
-from jobhunter.api.deps import get_code_head, get_engine
+from jobhunter.api.deps import get_code_head, get_embedder, get_engine
 from jobhunter.clock import utcnow
+from jobhunter.embeddings import EmbedderClient
 from jobhunter.observability.health import ReadinessCode, check_readiness
 
 router = APIRouter()
@@ -40,10 +41,13 @@ async def healthz() -> HealthOut:
     responses={503: {"model": NotReadyOut, "description": "A serving prerequisite does not hold"}},
 )
 async def readyz(
-    engine: Annotated[AsyncEngine, Depends(get_engine)], code_head: Annotated[str, Depends(get_code_head)]
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    code_head: Annotated[str, Depends(get_code_head)],
+    embedder: Annotated[EmbedderClient, Depends(get_embedder)],
 ) -> Response | ReadyOut:
-    """200 when the database, the schema revision and the worker heartbeat hold, else 503 with the codes."""
-    report = await check_readiness(engine, code_head=code_head, now=utcnow())
+    """200 when the database, the schema revision, the worker heartbeat and the embedder (healthy, with its
+    checksum verified) hold, else 503 with the codes."""
+    report = await check_readiness(engine, code_head=code_head, now=utcnow(), embedder=embedder)
     if report.ok:
         return ReadyOut()
     return JSONResponse(NotReadyOut(failing=report.failing).model_dump(), status_code=503)

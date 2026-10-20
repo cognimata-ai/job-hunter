@@ -15,9 +15,15 @@ Every attempt has a checkpoint thread of its own, `run-<run_id>-a<attempt_no>` (
    is still the current worker epoch (else `foreign_epoch`): `started` (a `queued` run at attempt `n - 1`
    moves to `running` and gets `run_attempts(n, epoch)`), `resumed` (attempt `n` is `running` and this
    epoch's sweep or reconciler created it), `superseded`, `foreign_epoch` or `finished`. Only `started` and
-   `resumed` execute.
+   `resumed` execute. A delivery whose epoch the fence refused re-defers `run_collect(id, n)` in a transaction
+   of its own (M0 carry-forward 6, plan Deviation 18): its job is consumed, and the current worker's
+   reconcilers would take minutes to repair the attempt; the queueing lock `run:<id>:<n>` keeps it to one
+   waiting job. That refusal proves this worker superseded, so it first asks for its own graceful stop
+   (`on_superseded`, ruling T24-a): its loops stop fetching, and it never re-takes its own job under the
+   global `collect` lock; the current worker does.
 3. The graph runs through `executions.run_owned(("run", id), n, …)`, next to a heartbeat whose loss cancels
-   it.
+   it. That heartbeat is a task of its own (every 30 s), so it covers every node however long it runs (the
+   fetch fan-out, `embed`): no node beats itself (Task 24, carry 4).
 
 **New attempts** (`begin_new_attempt`) come from the takeover sweep `runs` (the current attempt belongs to an
 older worker epoch) and from the reconciler `stale_runs` (heartbeat older than `RUN_STALE`). Each moves the
@@ -37,15 +43,31 @@ functions that end a run inside a caller's transaction report a `RunEnd`, and th
 `observe_run_ends` after its commit (`execute_run`, the reconcilers, and the takeover sweep through
 `epoch.Swept`). The tick counts the `missed` and `skipped_overlap` runs it inserts (`tick.observe_tick`).
 
-This module is a task boundary (ruff `BLE001` is allowed here). It needs no broad catch: `run_owned` reports
-an unexpected graph error as an outcome, which `execute_run` persists as `failed('bug')` plus the `run.failed`
-alert. LangGraph is imported for annotations only, so a process that only requests runs (the API) skips it.
+**The run end** (Task 23, plan Deviation 16) is owned by the graph: its `finalize` node ends the run in one
+owner-fenced transaction and observes the metrics after that commit. `run_owned` discards the graph's value,
+so `execute_run` learns of that end from the database (`run_completion`, the terminal row of the attempt);
+only a graph that returns without ending the run (the M0 no-op graph) is finalized here, `succeeded` with the
+report `{"noop": true}`. A graph that raises after its `finalize` committed (for example writing its last
+checkpoint) is not finalized again either. A heartbeat that fires during the `finalize` transaction waits
+for its row lock and then finds the run ended: the beat is refused and the attempt is `lost`
+(`execution_lost`), which is harmless, because `lost` writes nothing: the run is never finalized twice and
+its end is counted once, by the node, or, when the cancel landed before the node's commit returned to it, by
+`execute_run` (`observe_graph_end` records which; addendum 11). The same holds for a graph that raised after
+its `finalize` committed but before the node observed the end.
+
+This module is a task boundary (ruff `BLE001` is allowed here). It needs one broad catch only, around the
+lookup of an end to count (`_observe_unobserved_end`: its outcome is the log line): `run_owned` reports an
+unexpected graph error as an outcome, which `execute_run` persists as `failed('bug')` plus the `run.failed`
+alert; an `OutcomeConflict` (the outcome reducer's, raised outside any node, §17.2 I7) as
+`failed_invariant('I7')` plus `run.failed_invariant`. LangGraph is imported for annotations only, so a process
+that only requests runs (the API) skips it.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Final, Literal
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -54,6 +76,8 @@ from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.faults import afault_point
+from jobhunter.graphs.collect.state import initial_state
+from jobhunter.graphs.outcomes import OutcomeConflict
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.health import read_run_freshness, run_age_state
 from jobhunter.observability.logging import get_logger
@@ -70,8 +94,6 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
     from langgraph.types import Durability
 
-    from jobhunter.graphs.collect.graph import CollectState
-
 # These thresholds compare times the database wrote (`heartbeat_at`, `queued_at`: its `now()`) with the
 # caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
 # one VPS and read its one kernel clock, so the two never drift apart (ruling T21-d). If the database moves to
@@ -86,11 +108,13 @@ MAX_RESUMES: Final = 3
 # At most this many queued runs without a live job are repaired per tick; the next tick takes the rest.
 QUEUED_BATCH: Final = 100
 RECURSION_LIMIT: Final = 200
+MAX_CONCURRENCY: Final = 4  # the graph's parallel tasks: the fetch fan-out (§9.2)
 
 REDEFERRED: Final = "redeferred"
 RESUME_EXHAUSTED_ALERT: Final = "run.resume_exhausted"
 ORPHANED_QUEUE_ALERT: Final = "run.orphaned_queue"
 FAILED_ALERT: Final = "run.failed"
+FAILED_INVARIANT_ALERT: Final = "run.failed_invariant"
 STALE_DATA_ALERT: Final = "schedule.stale_data"
 STALE_DATA_SUBJECT: Final = "collect"
 
@@ -100,6 +124,7 @@ _REQUEST_TRIES: Final = 3
 
 Admission = Literal["started", "resumed", "duplicate", "superseded", "foreign_epoch", "finished"]
 FinalStatus = Literal["succeeded", "partial", "failed_invariant", "failed"]
+FINAL_STATUSES: Final[tuple[FinalStatus, ...]] = get_args(FinalStatus)  # the type is the one list
 EndReason = Literal["worker_takeover", "heartbeat_stale"]
 
 # The graph a run executes; any compiled state graph (the worker's is the collection graph).
@@ -144,12 +169,33 @@ class RunEnd:
     duration_s: float | None
 
 
+@dataclass(frozen=True)
+class RunCompletion:
+    """How an attempt ended its run (the durable completion lookup of `execute_run`, `run_completion`)."""
+
+    status: FinalStatus
+    reason: str | None
+    finished_at: datetime
+
+
 def observe_run_ends(ends: Iterable[RunEnd]) -> None:
     """Count each ended run in `RUNS` and time it in `RUN_DURATION`; call only after the ending commit."""
     for end in ends:
         RUNS.labels(status=end.status).inc()
         if end.duration_s is not None:
             RUN_DURATION.observe(end.duration_s)
+
+
+# The attempts (run id, attempt number) whose end their graph's `finalize` observed in this process, kept
+# until `execute_run` is done with the attempt (addendum 11, below `execute_run`'s `lost`).
+_GRAPH_OBSERVED: set[tuple[int, int]] = set()
+
+
+def observe_graph_end(owner: RunOwner, end: RunEnd) -> None:
+    """`observe_run_ends([end])` for the end `owner`'s graph committed (its `finalize` node), recorded so
+    that `execute_run` does not observe it again."""
+    _GRAPH_OBSERVED.add((owner.run_id, owner.attempt_no))
+    observe_run_ends([end])
 
 
 # The run row and its current attempt, the run row locked: the DB step of the admission.
@@ -174,6 +220,14 @@ _ANNOTATE = q(
     "UPDATE runs SET status_reason = :r WHERE id = :i AND status = 'queued' AND attempt_no = :a RETURNING id"
 )
 _DURATION = q("SELECT extract(epoch FROM finished_at - started_at) FROM runs WHERE id = :i")
+# The run's terminal row at the attempt, when the attempt's own `finalize_run` wrote it: that closes the
+# attempt `completed`, while a reconciler or the takeover sweep that ends the run (`resume_exhausted`) keeps
+# its `attempt_no` and closes the attempt `heartbeat_stale` or `worker_takeover` (F5 review, Important 1).
+_COMPLETION = q(
+    "SELECT r.status, r.status_reason, r.finished_at FROM runs r JOIN run_attempts a "
+    "ON a.run_id = r.id AND a.attempt_no = r.attempt_no WHERE r.id = :i AND r.attempt_no = :a "
+    "AND r.status = ANY(:final) AND a.end_reason = 'completed'"
+)
 _ACTIVE_CONFIG = q("SELECT settings_version_id, scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
 _ACTIVE_RUN = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
@@ -240,17 +294,29 @@ async def start_attempt(
 
     Only `started` and `resumed` return the owner; the others write nothing.
     """
+    admission, owner, _ = await _admit(conn, run_id, attempt_no, epoch=epoch)
+    return admission, owner
+
+
+async def _admit(
+    conn: AsyncConnection, run_id: int, attempt_no: int, *, epoch: int
+) -> tuple[Admission, RunOwner | None, bool]:
+    """`start_attempt`, and whether the epoch fence refused `epoch` (the `foreign_epoch` that re-defers).
+    Only the worker's own fence (`FencedOut.worker_superseded`) is that refusal; a fence of any other owner
+    propagates, a failure of the delivery, never a supersession (F5 review, Minor 1)."""
     try:
         await fence_epoch(conn, epoch)
-    except FencedOut:
-        return "foreign_epoch", None
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise
+        return "foreign_epoch", None, True
     row = (await conn.execute(_ADMISSION, {"i": run_id})).first()
     if row is None:
-        return "finished", None
+        return "finished", None, False
     owner = RunOwner(run_id=run_id, attempt_no=attempt_no)
     if row.status == "queued":
         if row.attempt_no != attempt_no - 1:
-            return "superseded", None
+            return "superseded", None, False
         thread = thread_id(run_id, attempt_no)
         await transition(
             conn,
@@ -263,15 +329,15 @@ async def start_attempt(
             set_={"attempt_no": attempt_no, "heartbeat_at": sa.func.now(), "current_thread_id": thread},
         )
         await conn.execute(_INSERT_ATTEMPT, {"i": run_id, "a": attempt_no, "epoch": epoch, "thread": thread})
-        return "started", owner
+        return "started", owner, False
     if row.status != "running":
-        return "finished", None
+        return "finished", None, False
     if row.attempt_no != attempt_no:
-        return "superseded", None
+        return "superseded", None, False
     if row.worker_epoch != epoch or row.ended_at is not None:
-        return "foreign_epoch", None
+        return "foreign_epoch", None, False
     await heartbeat_run(conn, owner)
-    return "resumed", owner
+    return "resumed", owner, False
 
 
 async def heartbeat_run(conn: AsyncConnection, owner: RunOwner) -> bool:
@@ -314,6 +380,19 @@ async def _duration(conn: AsyncConnection, run_id: int) -> float | None:
     """The run's duration in seconds, from its first `started_at` to its `finished_at` (`None` if unset)."""
     seconds = (await conn.execute(_DURATION, {"i": run_id})).scalar_one()
     return None if seconds is None else float(seconds)
+
+
+async def run_completion(conn: AsyncConnection, run_id: int, attempt_no: int) -> RunCompletion | None:
+    """The end attempt `attempt_no` gave its run: the run's terminal row at that attempt, when that attempt's
+    `finalize_run` wrote it (the attempt closed `completed`). `None` while the run is `running`, and when
+    another attempt, no finalize, or a reconciler or takeover that ended the run at this attempt number
+    (`resume_exhausted`, the attempt closed `heartbeat_stale` or `worker_takeover`) ended it: such an end is
+    counted by its own owner, never by the attempt's execution."""
+    params = {"i": run_id, "a": attempt_no, "final": list(FINAL_STATUSES)}
+    row = (await conn.execute(_COMPLETION, params)).first()
+    if row is None:
+        return None
+    return RunCompletion(status=row.status, reason=row.status_reason, finished_at=row.finished_at)
 
 
 async def begin_new_attempt(
@@ -465,22 +544,23 @@ async def reconcile_stale_runs(ctx: ReconcileContext) -> int:
     the attempt that was taken back (its registry token, ruling T12-d), so it releases the procrastinate
     `collect` lock before the replacement attempt's job can run. Rows locked by an in-flight heartbeat or
     owner write are skipped this time. The runs it ends (`resume_exhausted`) are observed after the commit.
-    Returns the number of runs taken back: 0 when `ctx.epoch` is no longer the current worker epoch, because a
-    superseded worker gives no run a new attempt (the current worker's reconciler does).
+    Returns the number of runs taken back. A superseded worker gives no run a new attempt (the current
+    worker's reconciler does): when `ctx.epoch` is no longer the current worker epoch it raises `FencedOut`,
+    having written nothing (`fence_epoch` logged it), so that `run_reconcilers` stops the cadence at this
+    reconciler and the worker requests its stop, recording no failure (Ruling FR-r; fix wave F7). The fence
+    is the only one it can meet: `begin_new_attempt` fences the same epoch, under the row this transaction
+    already holds, and its owner checks are `TransitionConflict`s.
     """
     ends: list[RunEnd] = []
-    try:
-        async with ctx.engine.begin() as conn:
-            # Before any run row is locked: the `worker_heartbeat` row comes first in the lock order.
-            await fence_epoch(conn, ctx.epoch)
-            stale = (await conn.execute(_STALE, {"cutoff": ctx.now - RUN_STALE})).all()
-            taken = [(int(row.id), int(row.attempt_no)) for row in stale]
-            for run_id, _ in taken:
-                await begin_new_attempt(
-                    conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer, ends=ends
-                )
-    except FencedOut:
-        return 0  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+    async with ctx.engine.begin() as conn:
+        # Before any run row is locked: the `worker_heartbeat` row comes first in the lock order.
+        await fence_epoch(conn, ctx.epoch)
+        stale = (await conn.execute(_STALE, {"cutoff": ctx.now - RUN_STALE})).all()
+        taken = [(int(row.id), int(row.attempt_no)) for row in stale]
+        for run_id, _ in taken:
+            await begin_new_attempt(
+                conn, run_id, epoch=ctx.epoch, end_reason="heartbeat_stale", defer=ctx.defer, ends=ends
+            )
     observe_run_ends(ends)
     for run_id, superseded in taken:
         key: ExecKey = ("run", run_id)
@@ -498,7 +578,8 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
     A run without a reason is re-deferred once and annotated `redeferred`. A `redeferred` run that still has
     no live job `QUEUED_ORPHANED_AFTER` after it was queued ends `failed('orphaned_queue')` with the warn
     alert `run.orphaned_queue`; it is counted in `RUNS` after the commit (never timed: it never started). At
-    most `QUEUED_BATCH` runs per tick.
+    most `QUEUED_BATCH` runs per tick. Fenced by `ctx.epoch` first, before any run row is locked (Ruling
+    FR-h): a superseded worker raises `FencedOut` having written nothing, which stops its cadence.
     """
     params = {
         "cutoff": ctx.now - QUEUED_REDEFER_AFTER,
@@ -508,6 +589,7 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
     repaired = 0
     ends: list[RunEnd] = []
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         for row in (await conn.execute(_QUEUED_WITHOUT_JOB, params)).all():
             run_id, attempt_no = int(row.id), int(row.attempt_no)
             if row.status_reason is None:
@@ -547,9 +629,11 @@ async def reconcile_stale_data(ctx: ReconcileContext) -> int:
     That is the one freshness rule system health reports too (ruling T17-g): after the grace (twice the
     interval after the first settings version, §17.5), no `succeeded` or `partial` run within twice the
     interval, aged from the first settings version when none succeeded yet. Returns 1 when it raised or
-    resolved the alert, else 0.
+    resolved the alert, else 0. Fenced by `ctx.epoch` first (Ruling FR-h): a superseded worker raises
+    `FencedOut` having written nothing, which stops its cadence.
     """
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         if run_age_state(ctx.now, await read_run_freshness(conn)) == "critical":
             await raise_alert(
                 conn,
@@ -567,23 +651,33 @@ async def _invoke(graph: RunGraph, owner: RunOwner) -> None:
     config: RunnableConfig = {
         "configurable": {"thread_id": thread_id(owner.run_id, owner.attempt_no)},
         "recursion_limit": RECURSION_LIMIT,
+        "max_concurrency": MAX_CONCURRENCY,
     }
-    state: CollectState = {"run_id": owner.run_id, "attempt_no": owner.attempt_no, "steps": []}
     # `durability` acts on the graph's own saver; LangGraph warns when it is given to a graph without one.
     saver = graph.checkpointer
     durability: Durability | None = "sync" if saver is not None and not isinstance(saver, bool) else None
-    await graph.ainvoke(state, config, durability=durability)
+    await graph.ainvoke(initial_state(owner.run_id, owner.attempt_no), config, durability=durability)
+
+
+# The critical alert an end raises in `_finalize`, by status, with its message.
+_END_ALERTS: Final[Mapping[str, tuple[str, str]]] = MappingProxyType(
+    {
+        "failed": (FAILED_ALERT, "run failed"),
+        "failed_invariant": (FAILED_INVARIANT_ALERT, "run invariant violated"),
+    }
+)
 
 
 async def _finalize(
     engine: AsyncEngine,
     owner: RunOwner,
     *,
-    status: Literal["succeeded", "failed"],
+    status: FinalStatus,
     reason: str | None,
     report: Mapping[str, JSONValue],
 ) -> None:
-    """Finalize `owner`'s run in a transaction of its own; a `failed` end raises `run.failed` in it.
+    """Finalize `owner`'s run in a transaction of its own; a `failed` end raises `run.failed` in it, a
+    `failed_invariant` one `run.failed_invariant` (both critical, subject `run:<id>`).
 
     `FencedOut` is caught outside the transaction, which wrote nothing; the run's new owner records the
     outcome. The run metrics are observed only once the transaction has committed (ruling T12-e).
@@ -591,19 +685,64 @@ async def _finalize(
     try:
         async with engine.begin() as conn:
             duration = await finalize_run(conn, owner, status=status, reason=reason, report=report)
-            if status == "failed":
+            if (alert := _END_ALERTS.get(status)) is not None:
+                code, message = alert
                 await raise_alert(
                     conn,
-                    code=FAILED_ALERT,
+                    code=code,
                     severity="critical",
                     subject=f"run:{owner.run_id}",
-                    message="run failed",
+                    message=message,
                 )
     except FencedOut:
         log.info("run_fenced", run_id=owner.run_id, attempt_no=owner.attempt_no, write="finalize")
         return
     observe_run_ends([RunEnd(status=status, duration_s=duration)])
     log.info("run_finished", run_id=owner.run_id, attempt_no=owner.attempt_no, status=status, reason=reason)
+
+
+# The report of a run the outcome reducer failed (§17.2 I7): its invariant result, no other section.
+_OUTCOME_CONFLICT_REPORT: Final[Mapping[str, JSONValue]] = MappingProxyType(
+    {"execution": {"invariants": {"I7": {"ok": False, "detail": {"error_class": "OutcomeConflict"}}}}}
+)
+
+
+async def _redefer(engine: AsyncEngine, run_id: int, attempt_no: int) -> None:
+    """Defer `run_collect(run_id, attempt_no)` again, in a transaction of its own (carry-forward 6)."""
+    async with engine.begin() as conn:
+        job_id = await defer_run_attempt(conn, defer_in_tx, run_id, attempt_no)
+    log.info("run_redeferred", run_id=run_id, attempt_no=attempt_no, deduplicated=job_id is None)
+
+
+async def _settle_raised(engine: AsyncEngine, owner: RunOwner, error: Exception | None) -> None:
+    """The `raised` outcome of `owner`'s graph (see `execute_run`, step 3)."""
+    async with engine.connect() as conn:
+        completion = await run_completion(conn, owner.run_id, owner.attempt_no)
+    # The class only: an exception message may carry content.
+    error_class = type(error).__name__
+    if completion is not None:
+        # The graph's `finalize` committed the run's end before the error (and observed it, unless the error
+        # was its commit's reply: `_observe_unobserved_end` counts it then).
+        log.warning(
+            "run_graph_failed_after_end",
+            run_id=owner.run_id,
+            attempt_no=owner.attempt_no,
+            status=completion.status,
+            error_class=error_class,
+        )
+        await _observe_unobserved_end(engine, owner)
+    elif isinstance(error, OutcomeConflict):
+        log.error(
+            "run_outcome_conflict", run_id=owner.run_id, attempt_no=owner.attempt_no, work_id=error.work_id
+        )
+        await _finalize(
+            engine, owner, status="failed_invariant", reason="I7", report=_OUTCOME_CONFLICT_REPORT
+        )
+    else:
+        log.error(
+            "run_graph_failed", run_id=owner.run_id, attempt_no=owner.attempt_no, error_class=error_class
+        )
+        await _finalize(engine, owner, status="failed", reason="bug", report={})
 
 
 async def execute_run(
@@ -614,18 +753,35 @@ async def execute_run(
     *,
     epoch: int,
     heartbeat_period_s: float = 30.0,
+    on_superseded: Callable[[], None] = lambda: None,
 ) -> Admission:
     """Admit and run attempt `attempt_no` of run `run_id` (the `run_collect` task body); its admission.
 
     1. Local check: a live local execution of the run with token `attempt_no` makes this a `duplicate`
        (nothing is written); one with an older token is cancelled and awaited first.
     2. `start_attempt` in a transaction of its own (fenced by the current worker epoch); anything but
-       `started` or `resumed` returns at once.
+       `started` or `resumed` returns at once. When the fence refused `epoch` (a superseded worker), the
+       delivery's job is deferred again first, `run_collect(run_id, attempt_no)` through `defer_run_attempt`
+       in a transaction of its own (`None`, logged `deduplicated`, when that attempt's job already waits), so
+       the current worker runs it at once (carry-forward 6). Before that re-defer, `on_superseded()` asks
+       this worker for its graceful stop (ruling T24-a; the task body requests the runtime's shutdown): its
+       loops have stopped fetching by the time the re-deferred job commits, so this worker cannot take it
+       again. The other `foreign_epoch` (the attempt belongs to another epoch while this one is current)
+       re-defers nothing and stops nothing: this worker would take the job again at once, and the
+       `stale_runs` reconciler repairs that run.
     3. The graph runs through `run_owned(("run", id), attempt_no, …)`: the registry's task for the run, next
        to the heartbeat task `heartbeat:run:<id>` (`heartbeat_run` every `heartbeat_period_s`) whose loss
        cancels it. By outcome: `lost` (a refused or failed heartbeat, the `stale_runs` reconciler's or the
-       shutdown's cancel, or `FencedOut`) returns with no owner write; `raised` finalizes `failed('bug')` with
-       the critical `run.failed` alert in a new transaction; `returned` finalizes `succeeded` with the report
+       shutdown's cancel, or `FencedOut`) returns with no owner write, having counted an end its graph
+       committed but did not observe (`_observe_unobserved_end`, addendum 11); `raised` first looks the
+       attempt's end up (`run_completion`): when the graph's `finalize` had already ended the run, the error
+       came after it (logged `run_graph_failed_after_end`) and nothing is written (the end is counted here
+       when the node had not observed it); otherwise it finalizes, in a new transaction, an `OutcomeConflict`
+       as `failed_invariant('I7')` with the critical `run.failed_invariant` alert (the reducer conflicts
+       outside any node, so the graph's `finalize` cannot see it) and any other error as `failed('bug')` with
+       the critical `run.failed` alert; `returned` looks the attempt's end up (`run_completion`): a graph that
+       ended the run itself (its `finalize` node, which observed the metrics and logged `run_finished`) leaves
+       nothing to write, and one that did not (the M0 no-op graph) is finalized `succeeded` with the report
        `{"noop": true}`. A local execution that is still live when the work starts (`AlreadyExecuting`, for
        example an older one that ignored its cancel past the timeout) means nothing ran: `duplicate` is
        returned and no further owner write is made; the admitted attempt is left without an executor, and
@@ -645,8 +801,11 @@ async def execute_run(
             await EXECUTIONS.cancel_and_await(key)
     await afault_point("collect.before_admission")
     async with engine.begin() as conn:
-        admission, owner = await start_attempt(conn, run_id, attempt_no, epoch=epoch)
+        admission, owner, epoch_refused = await _admit(conn, run_id, attempt_no, epoch=epoch)
     log.info("run_admission", run_id=run_id, attempt_no=attempt_no, admission=admission)
+    if epoch_refused:
+        on_superseded()  # first: the loops stop fetching while the re-defer below commits
+        await _redefer(engine, run_id, attempt_no)
     if owner is None:
         return admission
     admitted = owner
@@ -662,18 +821,52 @@ async def execute_run(
     except AlreadyExecuting:
         log.warning("run_already_executing", run_id=run_id, attempt_no=attempt_no, admission=admission)
         return "duplicate"
-    match outcome.status:
-        case "lost":
-            pass
-        case "raised":
-            # The class only: an exception message may carry content.
-            log.error(
-                "run_graph_failed",
-                run_id=run_id,
-                attempt_no=attempt_no,
-                error_class=type(outcome.error).__name__,
-            )
-            await _finalize(engine, admitted, status="failed", reason="bug", report={})
-        case "returned":
-            await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
+    try:
+        match outcome.status:
+            case "lost":
+                await _observe_unobserved_end(engine, admitted)
+            case "raised":
+                await _settle_raised(engine, admitted, outcome.error)
+            case "returned":
+                async with engine.connect() as conn:
+                    completion = await run_completion(conn, run_id, attempt_no)
+                if completion is None:  # a graph without a finalize of its own (M0's no-op graph)
+                    await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
+    finally:
+        _GRAPH_OBSERVED.discard((run_id, attempt_no))
     return admission
+
+
+async def _observe_unobserved_end(engine: AsyncEngine, owner: RunOwner) -> None:
+    """Addendum 11: count an end that `owner`'s graph committed but did not observe.
+
+    A heartbeat that waited on the run row during the graph's `finalize` transaction finds the run ended once
+    it commits, so the beat is refused and the work cancelled (`lost`). When that cancel lands while the
+    `finalize` node still awaits its commit's reply, the end is committed but the node never observes it; so
+    it is when that await raises after the server committed (`raised`). Here such an end is counted in
+    `RUNS` and `RUN_DURATION` and logged `run_finished` (`observed_by` names this path), unless the node
+    observed it (`observe_graph_end`). An attempt that ended nothing counts nothing; nor does one whose run a
+    reconciler ended at its attempt number (`stale_runs`' `resume_exhausted`, counted by that reconciler):
+    `run_completion` finds only an end the attempt's own `finalize_run` wrote. The lookup failing (the
+    database gone) is logged, error class only, and the end stays uncounted.
+    """
+    if (owner.run_id, owner.attempt_no) in _GRAPH_OBSERVED:
+        return
+    try:
+        async with engine.connect() as conn:
+            completion = await run_completion(conn, owner.run_id, owner.attempt_no)
+            duration = None if completion is None else await _duration(conn, owner.run_id)
+    except Exception as exc:
+        log.warning("lost_run_end_unread", run_id=owner.run_id, error_class=type(exc).__name__)
+        return
+    if completion is None:
+        return
+    observe_run_ends([RunEnd(status=completion.status, duration_s=duration)])
+    log.info(
+        "run_finished",
+        run_id=owner.run_id,
+        attempt_no=owner.attempt_no,
+        status=completion.status,
+        reason=completion.reason,
+        observed_by="execute_run",
+    )

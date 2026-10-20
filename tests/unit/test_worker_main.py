@@ -1,8 +1,8 @@
 import asyncio
 import functools
 import uuid
-from collections.abc import Callable
-from typing import NoReturn
+from collections.abc import Awaitable, Callable
+from typing import Any, NoReturn
 
 import pytest
 from jobhunter.worker.main import exit_unless_lock_held
@@ -106,6 +106,10 @@ class World:
         self.on_executions_cancelled: Callable[[], None] = lambda: None
         self.on_watchdog_stopped: Callable[[], None] = lambda: None
         self.saver_close_hangs = False
+        # What the start handed on (Task 22 fix round 1, M-2): the runtime, the reconcile contexts, the deps.
+        self.runtimes: list[object] = []
+        self.contexts: list[object] = []
+        self.deps: list[object] = []
         world = self
 
         class FakeLockSession:
@@ -134,6 +138,9 @@ class World:
                 world.timeouts["watchdog"] = timeout_s
                 world.on_watchdog_stopped()
 
+            def is_alive(self) -> bool:
+                return False  # its thread ended within the stop (`test_teardown.py` covers the other case)
+
         class FakeExecutions:
             async def cancel_all(self, *, timeout_s: float = 30.0) -> int:
                 world.timeouts["executions"] = timeout_s
@@ -141,6 +148,10 @@ class World:
                 return 0
 
         class FakeEngine:
+            @asynccontextmanager
+            async def begin(self):
+                yield object()  # the connection of step 8's `sync_instances`, which is faked as well
+
             async def dispose(self) -> None:
                 events.append("engine_dispose")
                 if world.dispose_fails:
@@ -156,6 +167,7 @@ class World:
                 events.append("queue_close")
 
             async def run_worker_async(self, **options: object) -> None:
+                world.runtimes.append(options["additional_context"]["runtime"])  # type: ignore[index]
                 if options["name"] == "jh-tick":  # this loop asks for the shutdown, as a SIGTERM would
                     options["additional_context"]["runtime"].shutdown.requested.set()  # type: ignore[index]
                 try:
@@ -178,9 +190,55 @@ class World:
             events.append("claim")
             return 3, {}
 
-        async def fake_reconcilers(ctx: object, cadence: str) -> dict[str, int]:
+        def fake_build_collect_graph(saver: object, deps: object) -> object:
+            world.deps.append(deps)
+            return object()
+
+        async def fake_reconcilers(ctx: Any, cadence: str) -> dict[str, int]:
             events.append(f"reconcile_{cadence}")
+            world.contexts.append(ctx)
+            if world.start_fenced and cadence == "start":  # as `run_reconcilers` does when a fence refuses
+                ctx.on_superseded()
             return {}
+
+        # Task 24: step 7's HTTP layer and clients (real, on no network), step 8's instance sync (faked).
+        from jobhunter.sources import http, registry
+
+        real_configure = http.configure
+        self.clients: dict[str, object] = {}
+
+        def recording_configure(cfg: object) -> None:
+            events.append("http_configure")
+            real_configure(cfg)  # type: ignore[arg-type]
+
+        def recording_make_clients(cfg: object) -> object:
+            events.append("make_clients")
+            made = registry.make_clients(cfg)  # type: ignore[arg-type]
+            world.clients.update(made)
+            return made
+
+        async def fake_sync_instances(
+            conn: object, cfg: object, *, guard: Callable[[object], Awaitable[None]]
+        ) -> dict[str, str]:
+            events.append("sync_instances")
+            await guard(conn)  # the real sync's first statement (final review C2)
+            world.synced.append(cfg)
+            return {}
+
+        async def fake_fence_epoch(conn: object, epoch: int) -> None:
+            from jobhunter.errors import FencedOut
+
+            world.fenced.append(epoch)
+            if world.superseded:
+                raise FencedOut(owner=world.fence_owner)
+
+        self.synced: list[object] = []
+        self.fenced: list[int] = []  # the epochs step 8's guard fenced
+        self.superseded = False  # a newer worker took over before step 8
+        self.fence_owner = "worker_epoch"  # the owner of the fence step 8's guard raises when `superseded`
+        self.start_fenced = False  # a newer worker took over after step 8's sync, before its reconcilers
+        monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
+        monkeypatch.setattr(http, "configure", recording_configure)
 
         for name, fake in {
             "LockSession": FakeLockSession,
@@ -190,9 +248,12 @@ class World:
             "claim_epoch_and_sweep": fake_claim,
             "Watchdog": FakeWatchdog,
             "open_saver": fake_open_saver,
-            "build_noop_collect_graph": lambda saver: object(),
+            "build_collect_graph": fake_build_collect_graph,
             "run_reconcilers": fake_reconcilers,
             "EXECUTIONS": FakeExecutions(),
+            "make_clients": recording_make_clients,
+            "sync_instances": fake_sync_instances,
+            "fence_epoch": fake_fence_epoch,
         }.items():
             monkeypatch.setattr(main, name, fake)
         secrets = tmp_path / "secrets"
@@ -219,10 +280,168 @@ async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch,
         "watchdog_start",
         "queue_open",
         "saver_open",
+        "http_configure",
+        "make_clients",
+        "sync_instances",
         "reconcile_start",
         *TEARDOWN,
     ]
     assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [0]
+
+
+async def test_step_7_configures_http_before_the_clients_and_step_8_syncs_the_instances_first(
+    monkeypatch, tmp_path
+) -> None:
+    """Task 24, carries 1 to 3: `http.configure(cfg)` comes before `make_clients(cfg)` (a client made earlier
+    in fake mode would be on the live transport); the graph's adapters are the registry's, on those clients;
+    `sync_instances(conn, cfg)` runs before the start reconcilers; the teardown closes every client."""
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.sources.arbeitnow import ArbeitnowAdapter
+    from jobhunter.sources.instances import InstanceRow
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    events = world.events
+    assert events.index("http_configure") < events.index("make_clients") < events.index("sync_instances")
+    assert events.index("sync_instances") < events.index("reconcile_start")
+    assert world.synced == [world.cfg]
+    [deps], [runtime] = world.deps, {id(r): r for r in world.runtimes}.values()
+    assert isinstance(deps, CollectDeps) and isinstance(runtime, WorkerRuntime)
+    arbeitnow = InstanceRow(3, "arbeitnow", "default", None, "ok", None, None, None, None)
+    adapter = deps.adapters(arbeitnow)
+    assert isinstance(adapter, ArbeitnowAdapter)
+    # The shutdown stops the admission of new requests (§3.3.5): the deps read the runtime's state.
+    runtime.shutdown.admission_stopped = False
+    assert deps.admission_stopped() is False
+    runtime.shutdown.admission_stopped = True
+    assert deps.admission_stopped() is True
+    assert world.clients and all(client.is_closed for client in world.clients.values())  # type: ignore[attr-defined]
+
+
+async def test_step_8_syncs_the_instances_under_the_fence_of_the_workers_own_epoch(
+    monkeypatch, tmp_path
+) -> None:
+    """Final review C2: the startup sync's guard is the epoch fence of the epoch this worker claimed."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    assert world.fenced == [3] and world.synced == [world.cfg]
+
+
+async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_exits_70(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Final review C2, Ruling FR-i: a newer worker took over while this one was starting. Its fenced sync
+    writes nothing, and the start ends there: no start reconciler, no worker loop; the teardown runs and the
+    exit is the watchdog's superseded code, also when a teardown step fails."""
+    from jobhunter.worker.lock import WATCHDOG_EXIT_CODE
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.superseded = True
+    assert WATCHDOG_EXIT_CODE == 70
+    assert await worker_main(world.cfg) == WATCHDOG_EXIT_CODE
+    assert world.events == [
+        "lock_connect",
+        "lock_acquire",
+        "claim",
+        "watchdog_start",
+        "queue_open",
+        "saver_open",
+        "http_configure",
+        "make_clients",
+        "sync_instances",
+        *TEARDOWN,
+    ]
+    assert world.synced == [] and world.runtimes == []
+    [event] = logged(caplog, "worker_superseded_at_start")
+    assert (event["epoch"], event["exit_code"], event["level"]) == (3, 70, "critical")
+    assert logged(caplog, "worker_failed") == []
+    # a failing teardown step leaves the superseded code as it is
+    (tmp_path / "again").mkdir()
+    failing = World(monkeypatch, tmp_path / "again")
+    failing.superseded, failing.dispose_fails = True, True
+    assert await worker_main(failing.cfg) == WATCHDOG_EXIT_CODE
+
+
+async def test_a_fence_of_another_owner_at_the_startup_sync_fails_the_start_and_exits_1(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Fix wave F6 (F5 re-review, out-of-scope observation): only the worker's own fence proves a takeover.
+    Should the sync ever raise another owner's fence, the start failed (`worker_failed`, exit 1, the restart
+    tries again), never `worker_superseded_at_start` (70). No start reconciler and no loop runs."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.superseded, world.fence_owner = True, "run"
+    assert await worker_main(world.cfg) == 1
+    assert world.events[world.events.index("sync_instances") :] == ["sync_instances", *TEARDOWN]
+    assert world.synced == [] and world.runtimes == []
+    assert [e["error_class"] for e in logged(caplog, "worker_failed")] == ["FencedOut"]
+    assert logged(caplog, "worker_superseded_at_start") == []
+
+
+async def test_a_worker_superseded_during_its_start_cadence_stops_itself_and_exits_0(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Final wave F5 (F2 re-review, observation 2): a takeover that commits between the startup sync and the
+    start reconcilers fences their cadence. The cadence requests the graceful stop of a superseded worker
+    (Ruling T24-a), so no worker loop starts; the teardown runs and the exit is that path's 0."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.start_fenced = True
+    assert await worker_main(world.cfg) == 0
+    assert world.events[world.events.index("sync_instances") :] == [
+        "sync_instances",
+        "reconcile_start",
+        *TEARDOWN,
+    ]
+    assert world.runtimes == []  # no loop ran
+    [event] = logged(caplog, "shutdown_requested")
+    assert (event["level"], event["reason"]) == ("warning", "epoch_superseded")
+    assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [0]
+
+
+def test_a_signal_requests_the_stop_with_the_one_log_shape(log_events) -> None:
+    """Ledger L390: a SIGTERM goes through `runtime.request_shutdown`, logged `shutdown_requested` with the
+    signal's name as its `reason` (at `info`), once however often a signal arrives."""
+    import signal
+
+    from jobhunter.worker.main import _on_signal
+    from jobhunter.worker.runtime import ShutdownState
+
+    state = ShutdownState()
+    _on_signal(state, signal.SIGTERM)
+    _on_signal(state, signal.SIGINT)
+    assert state.requested.is_set()
+    [event] = [e for e in log_events() if e["event"] == "shutdown_requested"]
+    assert (event["level"], event["reason"]) == ("info", "SIGTERM") and "signal" not in event
+
+
+async def test_the_worker_shares_one_embedder_client_on_its_configured_url(monkeypatch, tmp_path) -> None:
+    """Task 22 fix round 1, M-2: the graph's deps, the runtime (whose task bodies hand it to every reconcile
+    context) and the start's reconcile context carry one client on `cfg.embedder_url`, closed at teardown."""
+    from jobhunter.embeddings import EmbedderClient
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.reconcilers import ReconcileContext
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    runtime = world.runtimes[0]
+    assert isinstance(runtime, WorkerRuntime) and all(r is runtime for r in world.runtimes)
+    embedder = runtime.embedder
+    assert isinstance(embedder, EmbedderClient) and embedder.base_url == world.cfg.embedder_url
+    [start] = world.contexts
+    assert isinstance(start, ReconcileContext) and start.embedder is embedder
+    [deps] = world.deps
+    assert isinstance(deps, CollectDeps) and deps.embedder is embedder
+    assert embedder.http.is_closed  # the teardown's `embedder` step
 
 
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(
@@ -288,3 +507,71 @@ async def test_the_teardown_shares_what_is_left_of_the_one_stop_deadline(
     assert (event["step"], event["error_class"]) == ("saver", "TimeoutError")
     assert world.events[-len(TEARDOWN) :] == TEARDOWN  # every step still ran, the lock session last
     assert clock.now == 1000.0 + shutdown.STOP_BUDGET_S  # the whole stop took exactly its budget
+
+
+# --- Task 24: step 4's modules register every reconciler, sweep and handler the worker runs -----------------
+
+# Every reconciler of M1 with its cadences (spec §17.4), as `worker_main` has them before its takeover.
+M1_RECONCILERS = {
+    "stalled_jobs": ["start", "tick"],
+    "metrics_refresh": ["heavy"],
+    "operations": ["tick"],
+    "stale_runs": ["tick"],
+    "queued_runs": ["tick"],
+    "stale_data": ["tick"],
+    "ledger_unsettled": ["tick"],
+    "hard_filter_completeness": ["heavy"],
+    "stale_sweep": ["tick"],
+    "stale_sweep_daily": ["daily"],
+    "ats_mass_events": ["tick"],
+    "group_representatives": ["heavy"],
+    "awaiting_embedding": ["heavy"],
+}
+# Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
+# from `sys.modules` (each registry module is imported by the modules that register into it).
+_REGISTRY_SCRIPT = """\
+import importlib, json, sys
+for module in sys.argv[1:]:
+    importlib.import_module(module)
+print(json.dumps({
+    "reconcilers": {
+        name: sorted(cadences)
+        for name, (cadences, _) in sys.modules["jobhunter.worker.reconcilers"].REGISTRY.items()
+    },
+    "sweeps": sorted(sys.modules["jobhunter.worker.epoch"]._SWEEPS),
+    "handlers": sorted(sys.modules["jobhunter.worker.operations"].HANDLERS),
+    "main_imported": "jobhunter.worker.main" in sys.modules,
+}))
+"""
+
+
+def registered_by(modules: tuple[str, ...]) -> dict[str, object]:
+    """What a fresh interpreter has registered after importing only `modules`."""
+    import json
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_SCRIPT, *modules],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    registered: dict[str, object] = json.loads(done.stdout.strip().splitlines()[-1])
+    return registered
+
+
+def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
+    """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
+    (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
+    anyway), the registries hold exactly the M1 reconcilers with their cadences, the two takeover sweeps and
+    the `watchlist_validate` handler."""
+    from jobhunter.worker.main import _REGISTERING_MODULES
+
+    assert registered_by(_REGISTERING_MODULES) == {
+        "reconcilers": M1_RECONCILERS,
+        "sweeps": ["operations", "runs"],
+        "handlers": ["watchlist_validate"],
+        "main_imported": False,
+    }

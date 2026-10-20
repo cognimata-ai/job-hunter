@@ -47,11 +47,15 @@ MIGRATE_ORDER: Final[tuple[MigrateStep, ...]] = (
 # Tables of later milestones that the backup role writes (the backup role has no default privileges).
 BACKUP_GRANT_TABLES: Final = ("backup_sets", "backup_runs", "manifest_shipments", "manifest_shipment_items")
 _MANIFEST_NOOP_REASON: Final = "manifest_stream_arrives_in_M5"
-# Session-level advisory lock that serialises `migrate` runs. The project's advisory keys, which share one
-# lock space (session and transaction locks on the same key conflict), so each has its own:
-#   7261001  worker singleton
-#   7261002  login throttle (transaction lock)
-#   7261003  migrate
+# Session-level advisory lock that serialises `migrate` runs. The project's advisory keys: a session lock and
+# a transaction lock on the same key conflict, so each use has a key of its own. PostgreSQL keeps the one-key
+# form (one bigint; `objsubid = 1` in `pg_locks`) and the two-key form (two integers; `objsubid = 2`) apart,
+# so these are two key spaces, and a two-key lock never conflicts with a one-key lock of the same number:
+#   7261001  worker singleton (one key, session lock)
+#   7261002  login throttle (one key, transaction lock)
+#   7261003  migrate (one key, session lock)
+#   7261004  duplicate grouping's company lock: the two-key form `(7261004, hashtext(company_key))`, a
+#            transaction lock (`dedup.groups.COMPANY_LOCK_NAMESPACE`, plan Deviation 46)
 MIGRATE_LOCK_KEY: Final = 7261003
 _LOCK_POLL_S: Final = 0.5
 

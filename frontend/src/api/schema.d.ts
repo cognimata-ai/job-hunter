@@ -93,7 +93,8 @@ export interface paths {
         };
         /**
          * Get System Health
-         * @description Readiness, run ages and their state, queue depths, open alerts, disk and table sizes, versions.
+         * @description Readiness, run ages and their state, queue depths, open alerts, disk and table sizes, versions, and
+         *     the embedder's health and model id.
          */
         get: operations["get_system_health_api_system_health_get"];
         put?: never;
@@ -133,7 +134,8 @@ export interface paths {
         };
         /**
          * Readyz
-         * @description 200 when the database, the schema revision and the worker heartbeat hold, else 503 with the codes.
+         * @description 200 when the database, the schema revision, the worker heartbeat and the embedder (healthy, with its
+         *     checksum verified) hold, else 503 with the codes.
          */
         get: operations["readyz_readyz_get"];
         put?: never;
@@ -165,6 +167,19 @@ export interface components {
             path: string;
             /** Total Bytes */
             total_bytes: number;
+        };
+        /**
+         * EmbedderOut
+         * @description The embedder's health as readiness read it: `ok` when this code can use it, the model it serves and
+         *     whether its checksum was verified (`null`: no usable answer).
+         */
+        EmbedderOut: {
+            /** Checksum Ok */
+            checksum_ok: boolean | null;
+            /** Model Id */
+            model_id: string | null;
+            /** Ok */
+            ok: boolean;
         };
         /**
          * FieldError
@@ -200,7 +215,7 @@ export interface components {
         /** NotReadyOut */
         NotReadyOut: {
             /** Failing */
-            failing: ("db" | "migrations" | "worker_heartbeat")[];
+            failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
         };
         /**
          * Problem
@@ -240,6 +255,35 @@ export interface components {
             [key: string]: unknown;
         };
         /**
+         * QuotaOut
+         * @description A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket.
+         */
+        QuotaOut: {
+            /** Limit Units */
+            limit_units: number;
+            /** Remaining Units */
+            remaining_units: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Tokens */
+            tokens: number;
+            /** Used Units */
+            used_units: number;
+            /**
+             * Window End
+             * Format: date-time
+             */
+            window_end: string;
+            /**
+             * Window Start
+             * Format: date-time
+             */
+            window_start: string;
+        };
+        /**
          * ReadyOut
          * @description Every serving prerequisite holds; the body is `{}`.
          */
@@ -247,7 +291,7 @@ export interface components {
         /** ReadyState */
         ReadyState: {
             /** Failing */
-            failing: ("db" | "migrations" | "worker_heartbeat")[];
+            failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
             /** Ok */
             ok: boolean;
         };
@@ -317,13 +361,16 @@ export interface components {
          *       `last_fully_successful_run_age_s`: of a `succeeded` one only.
          *     - `run_age_state`: see `run_age_state`.
          *     - `queue_depths`: procrastinate jobs by queue and status.
+         *     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
          *     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
+         *     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
          */
         SystemHealthOut: {
             alerts_open: components["schemas"]["AlertsOpen"];
             /** Database Bytes */
             database_bytes: number;
             disk: components["schemas"]["DiskUsage"];
+            embedder: components["schemas"]["EmbedderOut"];
             /** Last Fully Successful Run Age S */
             last_fully_successful_run_age_s: number | null;
             last_run: components["schemas"]["RunOut"] | null;
@@ -336,6 +383,10 @@ export interface components {
                 [key: string]: {
                     [key: string]: number;
                 };
+            };
+            /** Quota */
+            quota: {
+                [key: string]: components["schemas"]["QuotaOut"] | null;
             };
             ready: components["schemas"]["ReadyState"];
             /**

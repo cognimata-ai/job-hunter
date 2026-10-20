@@ -46,7 +46,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
-from jobhunter.errors import FencedOut
+from jobhunter.errors import WORKER_EPOCH, WORKER_LOCK, FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.observability.logging import get_logger
 
@@ -157,7 +157,7 @@ async def claim_epoch_and_sweep(
         if holds_lock is not True:
             # At most the uncommitted placeholder row was written: ending the transaction by raising loses it.
             log.warning("worker_epoch_claim_fenced", lock_backend_pid=ident.lock_backend_pid)
-            raise FencedOut(owner="worker_lock")
+            raise FencedOut(owner=WORKER_LOCK)
         await afault_point("takeover.before_epoch_write")
         claimed = (await conn.execute(q(_CLAIM_EPOCH), claimant)).scalar_one()
         epoch = int(claimed)
@@ -185,7 +185,7 @@ async def fence_epoch(conn: AsyncConnection, epoch: int) -> None:
     current = (await conn.execute(q(_CURRENT_EPOCH))).scalar_one_or_none()
     if current is None or int(current) != epoch:
         log.warning("worker_epoch_fenced", epoch=epoch, current_epoch=current)
-        raise FencedOut(owner="worker_epoch")
+        raise FencedOut(owner=WORKER_EPOCH)
 
 
 def _after_commit(name: str, epoch: int, action: Callable[[], None]) -> None:

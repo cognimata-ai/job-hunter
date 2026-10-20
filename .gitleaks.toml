@@ -29,3 +29,14 @@ targetRules = ["generic-api-key"]
 paths = ['''^tests/unit/test_config\.py$''']
 regexTarget = "line"
 regexes = ['''^\s*adzuna_key\s*=\s*"[A-Za-z0-9]+"\s*$''']
+
+# scripts/spikes/v7_embedder.py (spike V7) pins the embedding model's files by sha256: each entry maps a file of
+# the public model revision to its Hugging Face LFS object id, 64 lowercase hex characters. They are checksums
+# of published files, not credentials. Only a dict entry of exactly that shape is allowed.
+[[allowlists]]
+description = "sha256 checksums of the public model files in scripts/spikes/v7_embedder.py"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^scripts/spikes/v7_embedder\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*"[A-Za-z0-9_./-]+"\s*:\s*"[0-9a-f]{64}",?\s*$''']

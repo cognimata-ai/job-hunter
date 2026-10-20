@@ -33,6 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
     http_check.add_argument("url", help="the http or https URL to probe, e.g. http://127.0.0.1:8000/healthz")
     _add_user_commands(commands)
     _add_sessions_commands(commands)
+    _add_fixtures_commands(commands)
     return parser
 
 
@@ -81,6 +82,16 @@ def _add_sessions_commands(commands: "argparse._SubParsersAction[argparse.Argume
     sessions_commands.add_parser(
         "unlock", help="lift every login lockout and resolve the global auth.lockout alert"
     )
+
+
+def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    fixtures = commands.add_parser("fixtures", help="source fixture tooling (§18.4)")
+    fixtures_commands = fixtures.add_subparsers(dest="fixtures_command", required=True)
+    scrub = fixtures_commands.add_parser(
+        "scrub", help="scrub raw recordings into contract fixtures (pseudonyms for PII, tokens and keys)"
+    )
+    scrub.add_argument("input", help="the directory of raw recordings, e.g. .fixtures-raw")
+    scrub.add_argument("output", help="the fixture directory to write, e.g. tests/contract/fixtures")
 
 
 def _worker_health() -> int:
@@ -163,6 +174,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.cli_sessions import run_sessions_command
 
         return run_sessions_command(args)
+    if args.command == "fixtures":
+        # Imported here: only the fixture tooling needs the scrubber.
+        from jobhunter.cli_fixtures import run_fixtures_command
+
+        return run_fixtures_command(args)
     parser.error(f"unknown command {args.command!r}")
 
 

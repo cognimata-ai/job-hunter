@@ -1,0 +1,15 @@
+{
+  "source": "ats",
+  "case": "smartrecruiters_deliveryhero_detail_2",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://api.smartrecruiters.com/v1/companies/DeliveryHero/postings/744000156094379",
+  "params": {},
+  "fetched_at": "2026-10-18T20:49:53.164262+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 756,
+  "free": false,
+  "body_bytes": 8601,
+  "body_sha256": "[token:12]"
+}

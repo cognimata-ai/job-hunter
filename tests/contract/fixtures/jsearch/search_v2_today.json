@@ -1,0 +1,15 @@
+{
+  "status": "OK",
+  "request_id": "[token:47]",
+  "parameters": {
+    "query": "software engineer in Berlin, Germany",
+    "num_pages": 1,
+    "date_posted": "today",
+    "country": "de",
+    "language": "de"
+  },
+  "data": {
+    "jobs": [],
+    "cursor": null
+  }
+}

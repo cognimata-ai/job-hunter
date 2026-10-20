@@ -1,0 +1,20 @@
+{
+  "source": "jsearch",
+  "case": "search_v2_page1_day2",
+  "phase": 3,
+  "method": "GET",
+  "url": "https://jsearch.p.rapidapi.com/search-v2",
+  "params": {
+    "query": "software engineer in Berlin, Germany",
+    "country": "de",
+    "num_pages": "1",
+    "date_posted": "week"
+  },
+  "fetched_at": "2026-10-19T20:52:20.812351+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 8508,
+  "free": false,
+  "body_bytes": 58237,
+  "body_sha256": "[token:52]"
+}

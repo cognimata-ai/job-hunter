@@ -98,3 +98,9 @@ def test_start_retries_when_the_chosen_port_is_taken(monkeypatch: pytest.MonkeyP
             assert pg_rows(server, "app", "SELECT 1") == [(1,)]
         finally:
             remove_pg_server(server)
+
+
+def test_the_worker_role_is_served_from_the_fixtures(make_config) -> None:
+    worker, api = make_config("worker"), make_config("api")
+    assert (worker.fake_sources, worker.fixtures_dir) == (True, pg.FIXTURES_DIR)
+    assert api.fake_sources is False

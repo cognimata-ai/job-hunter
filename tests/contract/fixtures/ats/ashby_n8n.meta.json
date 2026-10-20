@@ -1,0 +1,17 @@
+{
+  "source": "ats",
+  "case": "ashby_n8n",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://api.ashbyhq.com/posting-api/job-board/n8n",
+  "params": {
+    "includeCompensation": "true"
+  },
+  "fetched_at": "2026-10-18T20:49:46.108688+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 480,
+  "free": false,
+  "body_bytes": 994314,
+  "body_sha256": "[token:1]"
+}

@@ -1,4 +1,5 @@
-"""Daily retention of the M0 data (spec §20.1): the body of the `retention_daily` task.
+"""Daily retention (spec §20.1), of the M0 data and of the M1 collection data: the body of the
+`retention_daily` task.
 
 Each rule removes what has passed its window. Every window is measured from the caller's `now`, never from the
 database's `now()` (ruling P14), with one exception: procrastinate's finished jobs are deleted through its own
@@ -15,17 +16,56 @@ The rules run in dependency order (§20.1: a row goes only after what references
 of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
 run (`queued` or `running`) is never deleted, however old.
 
+**The M1 rules** (Task 24), after `operations`; none deletes what the live pipeline still uses:
+- `raw_items`: 90 days by `created_at`; an observation keeps its provenance copy (`raw_item_id := NULL`). A
+  `deferred('job_fenced')` item stays past the 90 days, as long as its request: a later run re-resolves it
+  once its fence is released (§7.16.1).
+- `raw_bodies`: `body_zstd := NULL, purged_at := now` once `expires_at` has passed. The window is 0, so the
+  cutoff is `now`: `expires_at` already holds `fetched_at + 30 d` and the deduplication extension (§7.7: a row
+  whose body a newer row references expires no earlier than that row), so a 30-day window compared with it
+  would keep a body about 60 days.
+- `ats_snapshots`: 30 days by `taken_at`, except each instance's last complete snapshot, its open mass
+  event's first snapshot (`mass_event_snapshot_id`) and every unacknowledged `mass_disappearance` snapshot
+  of an event that is still open (Task 19: the confirmation and the acknowledgement read them).
+- `embeddings`: every row no `job_revisions.embedding_id` references (`profile_vectors` joins in M2). A row
+  that an embedding writer holds `FOR KEY SHARE` (`embeddings.upsert_embedding`, about to reference it) is
+  skipped (`SKIP LOCKED`) and goes in a later pass if it is still unreferenced then.
+- `coverage_intervals`: 13 months by `coalesce(closed_at, created_at)`.
+- `fetch_requests`: terminal ones 13 months by `created_at`, their responses and raw items with them
+  (cascade); it depends on `raw_items`.
+
+**Shared bodies.** A response whose body a newer, unpurged response still references (`body_ref_id`; an
+unchanged board answers the same bytes every day) is kept with its request, and its run, by both
+`fetch_requests` and `runs`: its deletion would set the newer row's `body_ref_id` to NULL while that row has
+no body of its own and no `purged_at`, which its CHECK refuses. Once that body expires, `raw_bodies` purges
+the newer row too, and both rules can delete in that same pass. So while identical bytes recur (each new
+response references the stored body and extends its `expires_at`), the oldest request of that body and its
+run stay past the 13 months, for as long as the bytes keep recurring: metadata only, plus the one stored
+body that the newest response still needs. The controller records this as a plan deviation (Task 24).
+
 Isolation has one exception, the dependent rules (ruling T21-f): a rule names in `depends_on` the rules whose
 work its own would make impossible to finish later. `runs` depends on `checkpoints`, because its cascade
-removes the `run_attempts` through which the checkpoint threads are found. A rule whose dependency failed (or
+removes the `run_attempts` through which the checkpoint threads are found; `fetch_requests` depends on
+`raw_items`, because its cascade deletes the raw items of the requests' responses, which the `raw_items` rule
+(with its exception for deferred items) must have handled first. A rule whose dependency failed (or
 was skipped itself) earlier in the same pass is skipped: it is reported as `-1` and logged
 `retention_rule_skipped` (with `blocked_by`), and it neither raises nor resolves an alert, so the failed
 dependency's alert stays open until a pass in which both succeed. Independent rules still run.
 
+**The epoch fence** (final review C2). Retention is worker-owned maintenance, so every write of a pass is
+fenced by the worker epoch (`epoch.fence_epoch`, the first statement of its transaction; no rule locks a job
+row, so the guard may come first, Ruling T19-a): each row rule's transaction and each alert write. The two
+rules that delete through another pool, the saver's (`checkpoints`, per thread) and procrastinate's
+(`procrastinate_jobs`), hold the fence in an open transaction while they delete, so no takeover can commit
+in between. A superseded worker's pass (a newer epoch is current) is therefore `FencedOut` before its first
+write, or before the first one after the takeover: it is logged `retention_fenced` (the rule it stopped at,
+the counts so far), writes nothing more (no other rule, no alert) and raises the `FencedOut` to its caller.
+
 This module is a task boundary (ruff `BLE001` is allowed here). The catch around a rule persists its outcome
 as the alert, written in a transaction of its own. When that write fails too, `retention_alert_write_failed`
 is logged: the database that would hold the outcome is the one that failed, so the log line is what is left
-(as in `worker.reconcilers`). Neither log line carries an exception message.
+(as in `worker.reconcilers`). Neither log line carries an exception message. A `FencedOut` is no failure of a
+rule: it is never caught as one.
 """
 
 from collections.abc import Awaitable
@@ -39,8 +79,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q
+from jobhunter.errors import FencedOut
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import delete_finished_jobs
 
 
@@ -66,13 +108,21 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("login_attempts", timedelta(days=30)),
     RetentionRule("alerts", timedelta(days=90)),  # after resolution
     RetentionRule("operations", timedelta(days=30)),  # after they finished
+    RetentionRule("raw_items", timedelta(days=90)),
+    RetentionRule("raw_bodies", timedelta(0)),  # once `expires_at` (fetched + 30 days, extended) has passed
+    RetentionRule("ats_snapshots", timedelta(days=30)),
+    RetentionRule("embeddings", timedelta(0)),  # once nothing references them
+    RetentionRule("coverage_intervals", THIRTEEN_MONTHS),
+    # Its cascade deletes the raw items of the requests' responses, so never after a failed `raw_items`.
+    RetentionRule("fetch_requests", THIRTEEN_MONTHS, depends_on=("raw_items",)),
     RetentionRule("checkpoints", timedelta(days=14)),  # threads of the runs that ended that long ago
     # Its cascade deletes the run_attempts that name the checkpoint threads, so never after a failed purge.
     RetentionRule("runs", THIRTEEN_MONTHS, depends_on=("checkpoints",)),
     RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
 )
 
-# One DELETE per row rule, each bound to its rule's `cutoff` (`now - window`).
+# One statement per row rule, each bound to its rule's `cutoff` (`now - window`): a DELETE, or for
+# `raw_bodies` the UPDATE that nulls the bodies.
 _DELETES: Final[dict[str, TextClause]] = {
     "api_idempotency": q("DELETE FROM api_idempotency WHERE expires_at < :cutoff"),
     "sessions": q("DELETE FROM sessions WHERE absolute_expires_at < :cutoff OR idle_expires_at < :cutoff"),
@@ -82,11 +132,47 @@ _DELETES: Final[dict[str, TextClause]] = {
         "DELETE FROM operations "
         "WHERE status IN ('succeeded', 'failed', 'cancelled') AND finished_at < :cutoff"
     ),
-    # Terminal and finished, or never started (`missed`, `skipped_overlap`) and queued, before the cutoff.
+    "raw_items": q("DELETE FROM raw_items WHERE created_at < :cutoff AND disposition <> 'deferred'"),
+    "raw_bodies": q(
+        "UPDATE raw_responses SET body_zstd = NULL, purged_at = :cutoff "
+        "WHERE expires_at < :cutoff AND purged_at IS NULL"
+    ),
+    "ats_snapshots": q(
+        "DELETE FROM ats_snapshots s WHERE s.taken_at < :cutoff "
+        "AND NOT EXISTS (SELECT 1 FROM source_instances i "
+        "WHERE i.last_complete_snapshot_id = s.id OR i.mass_event_snapshot_id = s.id) "
+        "AND NOT (s.status = 'mass_disappearance' AND s.acknowledged_at IS NULL "
+        "AND EXISTS (SELECT 1 FROM source_instances i "
+        "WHERE i.mass_event_snapshot_id = coalesce(s.event_snapshot_id, s.id)))"
+    ),
+    "embeddings": q(
+        "DELETE FROM embeddings WHERE id IN (SELECT e.id FROM embeddings e WHERE e.created_at < :cutoff "
+        "AND NOT EXISTS (SELECT 1 FROM job_revisions r WHERE r.embedding_id = e.id) "
+        "ORDER BY e.id FOR UPDATE SKIP LOCKED)"
+    ),
+    "coverage_intervals": q("DELETE FROM coverage_intervals WHERE coalesce(closed_at, created_at) < :cutoff"),
+    # Terminal and created before the cutoff, unless a newer, unpurged response references the body of its
+    # response or of a detail request's (with a list request goes its detail requests: cascade). A shared
+    # body therefore keeps its oldest request (metadata) past 13 months while identical bytes recur
+    # ("Shared bodies" above; a deviation the controller records).
+    "fetch_requests": q(
+        "DELETE FROM fetch_requests p "
+        "WHERE p.status IN ('succeeded', 'failed', 'ambiguous', 'skipped') AND p.created_at < :cutoff "
+        "AND NOT EXISTS (SELECT 1 FROM fetch_requests f "
+        "JOIN raw_responses b ON b.fetch_request_id = f.id JOIN raw_responses d ON d.body_ref_id = b.id "
+        "WHERE (f.id = p.id OR f.parent_fetch_request_id = p.id) AND d.purged_at IS NULL)"
+    ),
+    # Terminal and finished, or never started (`missed`, `skipped_overlap`) and queued, before the cutoff;
+    # not while a newer, unpurged response references a body of its requests (their cascade would orphan it),
+    # so the run of a shared body's oldest request stays past 13 months too while its bytes recur.
     "runs": q(
-        "DELETE FROM runs "
-        "WHERE (status IN ('succeeded', 'partial', 'failed', 'failed_invariant', 'cancelled') "
-        "AND finished_at < :cutoff) OR (status IN ('missed', 'skipped_overlap') AND queued_at < :cutoff)"
+        "DELETE FROM runs r "
+        "WHERE ((r.status IN ('succeeded', 'partial', 'failed', 'failed_invariant', 'cancelled') "
+        "AND r.finished_at < :cutoff) "
+        "OR (r.status IN ('missed', 'skipped_overlap') AND r.queued_at < :cutoff)) "
+        "AND NOT EXISTS (SELECT 1 FROM fetch_requests f "
+        "JOIN raw_responses b ON b.fetch_request_id = f.id JOIN raw_responses d ON d.body_ref_id = b.id "
+        "WHERE f.run_id = r.id AND d.purged_at IS NULL)"
     ),
 }
 
@@ -107,25 +193,32 @@ FAILED_ALERT_CODE: Final = "retention.failed"
 log = get_logger("jobhunter.privacy.retention")
 
 
-async def _delete_rows(engine: AsyncEngine, statement: TextClause, cutoff: datetime) -> int:
+async def _delete_rows(engine: AsyncEngine, statement: TextClause, cutoff: datetime, epoch: int) -> int:
     async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
         return (await conn.execute(statement, {"cutoff": cutoff})).rowcount
 
 
-async def _purge_threads(engine: AsyncEngine, saver: AsyncPostgresSaver, cutoff: datetime) -> int:
+async def _purge_threads(engine: AsyncEngine, saver: AsyncPostgresSaver, cutoff: datetime, epoch: int) -> int:
     """Delete the checkpoint threads of the runs that ended before `cutoff`; the number of threads."""
     async with engine.connect() as conn:
         threads = [
             str(thread) for thread in (await conn.execute(_ENDED_THREADS, {"cutoff": cutoff})).scalars()
         ]
     for thread in threads:
-        # The saver's own deletion: checkpoints, blobs and writes of the thread, on its autocommit pool.
-        await saver.adelete_thread(thread)
+        async with engine.begin() as fenced:
+            await fence_epoch(fenced, epoch)  # held while the saver deletes: no takeover commits meanwhile
+            # The saver's own deletion: checkpoints, blobs and writes of the thread, on its autocommit pool.
+            await saver.adelete_thread(thread)
     return len(threads)
 
 
-async def _delete_finished_jobs(queue: procrastinate.App, window: timedelta) -> int:
-    await delete_finished_jobs(queue, older_than_hours=int(window / timedelta(hours=1)))
+async def _delete_finished_jobs(
+    engine: AsyncEngine, queue: procrastinate.App, window: timedelta, epoch: int
+) -> int:
+    async with engine.begin() as fenced:
+        await fence_epoch(fenced, epoch)  # held while procrastinate deletes on its own pool
+        await delete_finished_jobs(queue, older_than_hours=int(window / timedelta(hours=1)))
     return -1  # procrastinate returns no count
 
 
@@ -135,17 +228,19 @@ async def _apply(
     queue: procrastinate.App,
     saver: AsyncPostgresSaver,
     now: datetime,
+    epoch: int,
 ) -> int:
     cutoff = now - rule.window
     if rule.name == "checkpoints":
-        return await _purge_threads(engine, saver, cutoff)
+        return await _purge_threads(engine, saver, cutoff, epoch)
     if rule.name == "procrastinate_jobs":
-        return await _delete_finished_jobs(queue, rule.window)
-    return await _delete_rows(engine, _DELETES[rule.name], cutoff)
+        return await _delete_finished_jobs(engine, queue, rule.window, epoch)
+    return await _delete_rows(engine, _DELETES[rule.name], cutoff, epoch)
 
 
-async def _raise_failure(engine: AsyncEngine, name: str, error_class: str) -> None:
+async def _raise_failure(engine: AsyncEngine, name: str, error_class: str, epoch: int) -> None:
     async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
         await raise_alert(
             conn,
             code=FAILED_ALERT_CODE,
@@ -156,26 +251,32 @@ async def _raise_failure(engine: AsyncEngine, name: str, error_class: str) -> No
         )
 
 
-async def _resolve_failure(engine: AsyncEngine, name: str) -> None:
+async def _resolve_failure(engine: AsyncEngine, name: str, epoch: int) -> None:
     async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
         await resolve_alert(conn, code=FAILED_ALERT_CODE, subject=name)
 
 
 async def _record_alert_outcome(name: str, write: Awaitable[None]) -> None:
-    """Await the alert `write` of rule `name`; a failure of it is logged and goes no further."""
+    """Await the alert `write` of rule `name`; a failure of it is logged and goes no further, except a
+    `FencedOut` (a newer epoch is current), which ends the pass."""
     try:
         await write
+    except FencedOut:
+        raise
     except Exception as exc:
         log.error("retention_alert_write_failed", rule=name, error_class=type(exc).__name__)
 
 
 async def run_retention_daily(
-    engine: AsyncEngine, queue: procrastinate.App, saver: AsyncPostgresSaver, *, now: datetime
+    engine: AsyncEngine, queue: procrastinate.App, saver: AsyncPostgresSaver, *, now: datetime, epoch: int
 ) -> dict[str, int]:
-    """Apply every rule of `RULES` at `now`, in order; the number deleted by rule name, `-1` when it failed
-    or was skipped (a dependency of it failed in this pass).
+    """Apply every rule of `RULES` at `now` for worker `epoch`, in order; the number deleted by rule name,
+    `-1` when it failed or was skipped (a dependency of it failed in this pass).
 
-    `checkpoints` counts threads; `procrastinate_jobs` is always `-1`. `queue` must be open.
+    `checkpoints` counts threads; `procrastinate_jobs` is always `-1`. `queue` must be open. Raises
+    `FencedOut`, logged `retention_fenced`, once `epoch` is no longer the current worker epoch: the pass stops
+    before that write and writes nothing more (see "The epoch fence").
     """
     report: dict[str, int] = {}
     not_done: set[str] = set()  # the rules that failed or were skipped in this pass
@@ -187,15 +288,22 @@ async def run_retention_daily(
             log.warning("retention_rule_skipped", rule=rule.name, blocked_by=blocked_by)
             continue
         try:
-            report[rule.name] = await _apply(rule, engine, queue, saver, now)
-        except Exception as exc:
-            report[rule.name] = -1
-            not_done.add(rule.name)
-            error_class = type(exc).__name__
-            # Not the exception's message and not its traceback: either may carry content.
-            log.error("retention_rule_failed", rule=rule.name, error_class=error_class)
-            await _record_alert_outcome(rule.name, _raise_failure(engine, rule.name, error_class))
-        else:
-            await _record_alert_outcome(rule.name, _resolve_failure(engine, rule.name))
+            try:
+                report[rule.name] = await _apply(rule, engine, queue, saver, now, epoch)
+            except FencedOut:
+                raise
+            except Exception as exc:
+                report[rule.name] = -1
+                not_done.add(rule.name)
+                error_class = type(exc).__name__
+                # Not the exception's message and not its traceback: either may carry content.
+                log.error("retention_rule_failed", rule=rule.name, error_class=error_class)
+                await _record_alert_outcome(rule.name, _raise_failure(engine, rule.name, error_class, epoch))
+            else:
+                await _record_alert_outcome(rule.name, _resolve_failure(engine, rule.name, epoch))
+        except FencedOut:
+            # `fence_epoch` logged both epochs; the fenced transaction wrote nothing.
+            log.warning("retention_fenced", rule=rule.name, **report)
+            raise
     log.info("retention_done", **report)
     return report

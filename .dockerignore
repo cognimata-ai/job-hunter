@@ -1,5 +1,6 @@
-# The build context is the repository root; the Dockerfile copies only pyproject.toml, uv.lock,
-# .python-version and backend/. Secrets, the local virtualenv, git metadata and caches never enter it.
+# The build context is the repository root; the Dockerfiles copy only pyproject.toml, uv.lock,
+# .python-version and backend/ (Dockerfile) or embedder/ (embedder/Dockerfile). Secrets, the local virtualenv,
+# git metadata and caches never enter it.
 .git
 .venv
 .secrets
@@ -10,3 +11,7 @@ frontend/dist
 .pytest_cache
 .ruff_cache
 .hypothesis
+# Raw source recordings hold recruiter personal data (Task 6): never part of a build context.
+.fixtures-raw
+# Local model downloads (embedder/download_model.sh, spike V7): the embedder image downloads its own at build.
+.model-cache

@@ -1,0 +1,630 @@
+{
+  "search_metadata": {
+    "id": "[token:5]",
+    "status": "Success",
+    "json_endpoint": "https://serpapi.com/searches/CMBs8ntFVc1-rLBcG4FWhKU5l-nZuMsMnOqfZ-NRMe8/6ad5311a4188d5f8a7edcfa4.json",
+    "markdown_endpoint": "https://serpapi.com/searches/CMBs8ntFVc1-rLBcG4FWhKU5l-nZuMsMnOqfZ-NRMe8/6ad5311a4188d5f8a7edcfa4.md",
+    "created_at": "2026-10-18 20:50:34 UTC",
+    "processed_at": "2026-10-18 20:50:34 UTC",
+    "google_jobs_url": "https://www.google.com/search?q=software+engineer+Berlin&hl=en&gl=de&udm=8",
+    "raw_html_file": "https://serpapi.com/searches/CMBs8ntFVc1-rLBcG4FWhKU5l-nZuMsMnOqfZ-NRMe8/6ad5311a4188d5f8a7edcfa4.html",
+    "total_time_taken": 13.11
+  },
+  "search_parameters": {
+    "q": "software engineer Berlin",
+    "engine": "google_jobs",
+    "google_domain": "google.com",
+    "hl": "en",
+    "gl": "de"
+  },
+  "filters": [
+    {
+      "name": "Date posted",
+      "options": [
+        {
+          "name": "Yesterday",
+          "parameters": {
+            "uds": "[token:6]",
+            "q": "software engineer Berlin since yesterday"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+since+yesterday&uds=[token:6]&udm=8&sa=X&ved=[token:9]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+since+yesterday&uds=[token:6]"
+        },
+        {
+          "name": "Last 3 days",
+          "parameters": {
+            "uds": "[token:10]",
+            "q": "software engineer Berlin in the last 3 days"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+in+the+last+3+days&uds=[token:10]&udm=8&sa=X&ved=[token:11]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+in+the+last+3+days&uds=[token:10]"
+        },
+        {
+          "name": "Last week",
+          "parameters": {
+            "uds": "[token:12]",
+            "q": "software engineer Berlin in the last week"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+in+the+last+week&uds=[token:12]&udm=8&sa=X&ved=[token:13]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+in+the+last+week&uds=[token:12]"
+        },
+        {
+          "name": "Last month",
+          "parameters": {
+            "uds": "[token:14]",
+            "q": "software engineer Berlin in the last month"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+in+the+last+month&uds=[token:14]&udm=8&sa=X&ved=[token:15]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+in+the+last+month&uds=[token:14]"
+        }
+      ]
+    },
+    {
+      "name": "Date posted",
+      "options": [
+        {
+          "name": "Yesterday",
+          "parameters": {
+            "uds": "[token:6]",
+            "q": "software engineer Berlin since yesterday"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+since+yesterday&uds=[token:6]&udm=8&sa=X&ved=[token:9]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+since+yesterday&uds=[token:6]"
+        },
+        {
+          "name": "Last 3 days",
+          "parameters": {
+            "uds": "[token:10]",
+            "q": "software engineer Berlin in the last 3 days"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+in+the+last+3+days&uds=[token:10]&udm=8&sa=X&ved=[token:11]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+in+the+last+3+days&uds=[token:10]"
+        },
+        {
+          "name": "Last week",
+          "parameters": {
+            "uds": "[token:12]",
+            "q": "software engineer Berlin in the last week"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+in+the+last+week&uds=[token:12]&udm=8&sa=X&ved=[token:13]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+in+the+last+week&uds=[token:12]"
+        },
+        {
+          "name": "Last month",
+          "parameters": {
+            "uds": "[token:14]",
+            "q": "software engineer Berlin in the last month"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+in+the+last+month&uds=[token:14]&udm=8&sa=X&ved=[token:15]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+in+the+last+month&uds=[token:14]"
+        }
+      ]
+    },
+    {
+      "name": "Job type",
+      "options": [
+        {
+          "name": "Full time",
+          "parameters": {
+            "uds": "[token:16]",
+            "q": "software engineer Berlin full time"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+full+time&uds=[token:16]&udm=8&sa=X&ved=[token:17]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+full+time&uds=[token:16]"
+        },
+        {
+          "name": "Part time",
+          "parameters": {
+            "uds": "[token:18]",
+            "q": "software engineer Berlin part time"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+part+time&uds=[token:18]&udm=8&sa=X&ved=[token:19]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+part+time&uds=[token:18]"
+        },
+        {
+          "name": "Contract",
+          "parameters": {
+            "uds": "[token:20]",
+            "q": "software engineer Berlin contract"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+contract&uds=[token:20]&udm=8&sa=X&ved=[token:21]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+contract&uds=[token:20]"
+        },
+        {
+          "name": "Internship",
+          "parameters": {
+            "uds": "[token:22]",
+            "q": "software engineer Berlin internship"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+internship&uds=[token:22]&udm=8&sa=X&ved=[token:23]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+internship&uds=[token:22]"
+        }
+      ]
+    },
+    {
+      "name": "Job type",
+      "options": [
+        {
+          "name": "Full time",
+          "parameters": {
+            "uds": "[token:16]",
+            "q": "software engineer Berlin full time"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+full+time&uds=[token:16]&udm=8&sa=X&ved=[token:17]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+full+time&uds=[token:16]"
+        },
+        {
+          "name": "Part time",
+          "parameters": {
+            "uds": "[token:18]",
+            "q": "software engineer Berlin part time"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+part+time&uds=[token:18]&udm=8&sa=X&ved=[token:19]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+part+time&uds=[token:18]"
+        },
+        {
+          "name": "Contract",
+          "parameters": {
+            "uds": "[token:20]",
+            "q": "software engineer Berlin contract"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+contract&uds=[token:20]&udm=8&sa=X&ved=[token:21]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+contract&uds=[token:20]"
+        },
+        {
+          "name": "Internship",
+          "parameters": {
+            "uds": "[token:22]",
+            "q": "software engineer Berlin internship"
+          },
+          "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=software+engineer+Berlin+internship&uds=[token:22]&udm=8&sa=X&ved=[token:23]",
+          "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=software+engineer+Berlin+internship&uds=[token:22]"
+        }
+      ]
+    },
+    {
+      "name": "Junior",
+      "parameters": {
+        "uds": "[token:24]",
+        "q": "Junior software engineer berlin"
+      },
+      "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=Junior+software+engineer+berlin&uds=[token:24]&udm=8&sa=X&ved=[token:25]&ictx=0",
+      "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=Junior+software+engineer+berlin&uds=[token:24]"
+    },
+    {
+      "name": "Entry level",
+      "parameters": {
+        "uds": "[token:26]",
+        "q": "Entry level software engineer berlin"
+      },
+      "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=Entry+level+software+engineer+berlin&uds=[token:26]&udm=8&sa=X&ved=[token:27]&ictx=0",
+      "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=Entry+level+software+engineer+berlin&uds=[token:26]"
+    },
+    {
+      "name": "Freelance",
+      "parameters": {
+        "uds": "[token:28]",
+        "q": "Freelance software engineer berlin"
+      },
+      "link": "https://www.google.com/search?sca_esv=[token:7]&gl=de&hl=en&sxsrf=[token:8]&q=Freelance+software+engineer+berlin&uds=[token:28]&udm=8&sa=X&ved=[token:29]&ictx=0",
+      "serpapi_link": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&q=Freelance+software+engineer+berlin&uds=[token:28]"
+    }
+  ],
+  "jobs_results": [
+    {
+      "title": "Full-Stack Software Engineer (m/f/d) in Berlin or Konstanz",
+      "company_name": "KNIME GmbH",
+      "location": "Berlin",
+      "via": "Stepstone",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=KL3O-6lo_D6yo9OEAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:31]&shmds=[token:32]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=KL3O-6lo_D6yo9OEAAAAAA%3D%3D",
+      "thumbnail": "https://serpapi.com/images/i/iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAMAAACfWMssAAAAA1BMVEX___-nxBvIAAAAGklEQVRIie3BMQEAAADCoPVPbQo_oAAAAL4GDHgAAYf3oeUAAAAASUVORK5CYII.png",
+      "extensions": [
+        "2 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://www.stepstone.de/stellenangebote--Full-Stack-Software-Engineer-m-f-d-in-Berlin-or-Konstanz-10967-Berlin-KNIME-GmbH--14633904-inline.html",
+      "job_title": "Full-Stack Software Engineer (m/f/d) in Berlin or Konstanz",
+      "description": "Introduction\nMission\nJoin KNIME in developing a state-of-the-art end-to-end AI and data science platform that helps thousands of professionals around the world to answer their data questions via one of the most reliable and transparent computation frameworks – KNIME workflows.\n\n\n About us\nKNIME is a leading AI platform that enables organisations to make sense of their data through intuitive, scalable, and collaborative data science. We empower data professionals and business users alike to build, deploy, and manage AI and data workflows that drive better decisions. Hundreds of global enterprises use the KNIME platform including Citi, Bosch and P&G.\n\n\nYour tasks\n Role Overview\nAs a Full-Stack Software Engineer in the user-facing Sleek UX team, you will provide meaningful contributions to enhance the day-to-day experience of the people who build with KNIME. Together with a team of outstanding engineers, you will be involved in designing and implementing cross-stack features within KNIME’s family of products, written in Java and Vue. You will be working closely together with our product managers and designers to make the user experience frictionless, enjoyable, and consistent.\n\n\nResponsibilities\n\n Build and maintain end-to-end features that provide value to the many people building their data workflows with KNIME.\n Design and implement robust backend business logic to ensure reliable application performance.\n Partner with stakeholders to translate product requirements into intuitive user experiences.\n Leverage AI-assisted coding tools to accelerate development workflows while maintaining strict engineering standards.\n Uphold code quality through automated testing, peer reviews, and continuous delivery pipelines.\n Track usage of AI agents within daily development routines to ensure they are deployed for suitable tasks with proper oversight.\n\nWhat Success Looks Like\n\n Contribute ideas and technical insight to team discussions and code reviews.\n Surface and mitigate technical debt, security issues, and architectural risks.\n Grow knowledge and experience measurably by navigating technical challenges and enhancing user value.\n Add to a healthy, collaborative environment where trust enables a genuine sense of enjoyment and pride in building great software together\n\nRequirements\n\n Degree in Computer Science or related field.\n Minimum 5 years of experience in professional software development.\n High competence in frontend development (Vue, React, or similar).\n High competence in backend development (Java and modern Java frameworks).\n Experience in contributing to the architecture of existing software systems.\n Experience with AI-assisted software engineering (experience with AI agents is a plus).\n Ability to work effectively in unfamiliar codebases.\n Solid understanding of full stack development.\n Practical experience with Golang is a plus.\n Fluent in English (both verbal and in writing).\n\nWe offer\n Leveling\nYou will be a Full-Stack Software Engineer in the Sleek UX team, reporting to the team lead, with ample opportunity for career and personal growth with KNIME’s comprehensive levelling framework.\n\n\nWhat we offer\n\n Ownership across the stack: Own features end to end across Java, TypeScript influencing architecture and direction.\n An exceptional team to work with: highly capable, independent engineers who are a pleasure to work with.\n Visible impact: Help shape an intuitive experience that thousands of data professionals around the world rely on every day.\n Deep collaboration in a low-ego, global culture: Work closely with fellow engineers, architects, QA, and UX in an open environment spanning more than 30 nationalities that values transparency, low-ego collaboration.\n Continuous learning: Hands-on challenges, peer exchange, soft-skill training and learning cafés, and exposure to cutting-edge AI and data-analytics work.\n Flexibility, health and wellbeing: Hybrid working, flexible hours, subsidised sports or yoga courses, physiotherapy, and flu shots at select locations.\n Great places to work: Beautiful offices, including one in the heart of Berlin Kreuzberg, along with the everyday things that make office days good: shared breakfasts and lunches, a stocked fruit basket, and celebrations.\n\nKNIME is an equal opportunity employer. We’re all about providing opportunities for different perspectives to come together, where everyone feels included no matter their background.",
+      "apply_options": [
+        {
+          "title": "Stepstone",
+          "link": "https://www.stepstone.de/stellenangebote--Full-Stack-Software-Engineer-m-f-d-in-Berlin-or-Konstanz-10967-Berlin-KNIME-GmbH--14633904-inline.html?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJGdWxsLVN0YWNrIFNvZnR3YXJlIEVuZ2luZWVyIChtL2YvZCkgaW4gQmVybGluIG9yIEtvbnN0YW56IiwiY29tcGFueV9uYW1lIjoiS05JTUUgR21iSCIsImh0aWRvY2lkIjoiS0wzTy02bG9fRDZ5bzlPRUFBQUFBQT09IiwiZ2wiOiJkZSIsImhsIjoiZW4iLCJmYyI6InNjcnViYmVkIiwiZmN2IjoiMyIsImZjX2lkIjoiS0wzTy02bG9fRDZ5bzlPRUFBQUFBQT09In0="
+    },
+    {
+      "title": ".NET Software Engineer (Backend)",
+      "company_name": "Vattenfall",
+      "location": "Berlin",
+      "via": "Vattenfall Careers",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=QcwUhESexphtm8lLAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:33]&shmds=[token:34]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=QcwUhESexphtm8lLAAAAAA%3D%3D",
+      "thumbnail": "https://serpapi.com/images/i/iVBORw0KGgoAAAANSUhEUgAAADgAAAAkCAMAAADrTAnMAAAAb1BMVEX____29vbs7Oz8_PyUlJKCgX6YmJb___3y8vL5-fn86Ij81gD99c-urazp6eiMioi5uLe_vr2gn53Hx8Z1dHHg4OD_-d__2wD_3wBFRD7Y2Ndwbmrg6vUAV7UAarwAZ7sAb7yKrtIAXrAAZrPR3uyaVq1yAAAAfklEQVRIie3PSRLDIAwEwEEswXGQsUEJIfvy_zcmL8BHX-g5qqamBHRdt43dyt1DDZo8kSIFpQiD_gfYj-OhWQxspmhns1gXnLMmZZkl4ngqpbQnzynnSKnaEMJlkmzDkhxdb_fHs10UD2LtFVcCMxhSpTJe78935cuu67bzA0ZTBWgArCaoAAAAAElFTkSuQmCC.png",
+      "extensions": [
+        "3 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://careers.vattenfall.com/job/net-software-engineer-backend-in-berlin-jid-53160",
+      "job_title": ".NET Software Engineer (Backend)",
+      "description": "Du bist auf der Suche nach neuen beruflichen Herausforderungen und möchtest zeitgleich etwas zu einer Fossilfreien Zukunft beitragen?\n\nUnsere Aufgabe im Bereich Customer IT der Vattenfall IT ist es, digitale Lösungen und Produkte zu entwickeln und zu betreiben, die es unseren Geschäftseinheiten ermöglichen unser gemeinsames Ziel zu erreichen: Fossilfreies Leben innerhalb einer Generation!\n\nEine wesentliche Voraussetzung zur Erreichung dieses Ziels ist die Optimierung und Digitalisierung unserer Geschäftsprozesse. Die tägliche Arbeit unserer Spezialisten aus den Fachabteilungen im Zusammenspiel mit Kunden, Servicepartnern und Kollegen soll dadurch vereinfacht werden. Dabei gewonnene Freiräume können genutzt werden, um unserem übergeordneten Ziel mit innovativen Ideen und Produkten näher zu kommen.\n\nDas Backend System von Vattenfall Sales Germany durchläuft eine Transition von einer monolithischen Architektur in eine cloud-native Microservice Architektur. In der Position als .NET Software Engineer (Backend) wirst Du zu dieser Transformation beitragen, indem Du .NET Applikationen auf unserer Azure Cloud Plattform aufbaust.\n\nDu bist Teil eines agilen Teams, das in Berlin / Hamburg und auch remote ansässig ist und fokussierst Dich in diesem Kontext auf betriebsnahe Tätigkeiten und Herausforderungen im Umfeld von AWS und Microsoft Azure.\n\nWas wirst Du tun?\n\nAls .NET Software Engineer (Backend) wirst Du zentrale Backend-Komponenten für Vattenfall Sales Germany entwickeln. Unsere Systeme verarbeiten mehrere Millionen Aufrufe pro Tag – Du spielst eine entscheidende Rolle bei der Umsetzung leistungsfähiger, cloud-nativer Anwendungen. Dabei bringst Du dein Know-how in der .NET-Entwicklung und im Umgang mit Azure-Services ein, um robuste und skalierbare Lösungen zu schaffen.\n\nDeine Aufgaben und Verantwortlichkeiten:\n\nEntwicklung moderner .NET-Backend-Anwendungen in einer cloud-nativen ArchitekturNutzung von Azure-Services zur Umsetzung skalierbarer und wartbarer LösungenAufbau und Pflege von CI/CD-Pipelines mit Azure DevOpsAktive Mitgestaltung architektonischer Entscheidungen im Bereich Software- und LösungsarchitekturVerantwortung für den operativen Betrieb und die kontinuierliche Weiterentwicklung der entwickelten SystemeEnge Zusammenarbeit mit dem Business zur Analyse und Umsetzung fachlicher AnforderungenLocation  \n\nBerlin oder Hamburg \n\n\n\n      \n\n      Qualifikationen\n    \n\n    Wer bist Du?\n\n\n\nAls unser:e neue:r .NET Software Engineer (Backend) bringst Du fundierte Erfahrung in der Entwicklung moderner Backend-Anwendungen mit – idealerweise in cloudbasierten Umgebungen. Du bewegst Dich sicher im .NET-Ökosystem und hast ein gutes technisches Verständnis für angrenzende Themen wie Infrastruktur, CI/CD und Observability.\n\nDu arbeitest gern an sauberen, wartbaren Architekturen und verstehst die Bedeutung von Automatisierung, Unit Tests und Integration Tests. Microservices, Event-getriebene Kommunikation oder die 12-Factor-Prinzipien sind für Dich keine Theorie – Du setzt sie im Alltag ganz praktisch um.\n\nDazu bringst Du mit:\n\nAbgeschlossenes Bachelorstudium in (Wirtschafts-)Informatik oder einer vergleichbaren FachrichtungMehrjährige Erfahrung in der Backend-Entwicklung mit .NETGrundlegende Kenntnisse im Umgang mit verschiedenen Azure-Cloud-Services wie Key Vaults, App Configurations oder der Microsoft Graph APIErfahrung im Einsatz von Container-Technologien wie Docker, Docker Compose und HelmPraxiserfahrung mit Hosting-Services wie Kubernetes oder Azure App ServiceKenntnisse in Infrastructure-as-Code-Tools wie Terraform oder BicepWissen im Bereich von Database und Storage Technologien wie PostgreSQL, Oracle oder Azure StorageVertrautheit mit CI/CD-Lösungen wie ArgoCD, Azure DevOps oder GitHub ActionsErfahrung mit Observability-Tools wie Grafana, OpenTelemetry, Prometheus oder SplunkKenntnisse in der Implementierung automatisierter Tests mit Tools wie xUnit oder TestcontainersVerständnis gängiger Architekturprinzipien wie den 12-Factor-App-Prinzipien, Microservices, Event-driven Design oder CQRSFließende Deutsch- und Englischkenntnisse in Wort und SchriftUnd keine Sorge: Du musst nicht jeden einzelnen Punkt auf dieser Liste perfekt abdecken. Wenn Du Dich in der Rolle wiedererkennst und glaubst, dass Du gut zu uns passt, freuen wir uns auf Deine Bewerbung – ganz unabhängig vom Häkchen hinter jedem Stichpunkt.\n\n\n\n      \n\n      Zusätzliche Informationen\n    \n\n    Was wir bieten \n\nArbeiten bei Vattenfall ist mehr als „nur“ ein interessanter Job in einem ergebnisorientierten Unternehmen. Du wirst Teil eines spannenden, innovativen und internationalen Arbeitsumfeldes, welches unsere Zukunft aktiv mitgestalten kann. Wir wollen die Besten in dem sein, was wir tun. Wir bieten dir eine wettbewerbsfähige Vergütung sowie Möglichkeiten für Schulungen und persönliche Weiterentwicklung. \n\n \n\nWir möchten unseren Mitarbeiter:innen eine ausgewogene Balance zwischen Beruf und Familie ermöglichen. Aus diesem Grund bieten wir flexible Optionen an, wie die Möglichkeit, im Home Office zu arbeiten. \n\nWeitere Informationen \n\nWir freuen uns über Deine Bewerbung in deutscher Sprache bis spätestens zum 15.11.2026. Wir bitten Dich, Bewerbungen ausschließlich über unsere Website einzureichen, da wir nicht garantieren können, dass wir Bewerbungen bearbeiten, die nicht über unsere Website eingehen.\n\nWenn Du inhaltliche Fragen zur Stelle hast, dann kannst Du Dich gerne an den einstellenden [person:1] unter [email:2] wenden. Wenn Du mehr zum Bewerbungsprozess wissen möchtest, kannst Du Dich gerne an [person:2] unter [email:3] wenden. \n\nWir sind davon überzeugt, dass Vielfalt dazu beiträgt, unser Unternehmen leistungsfähiger und attraktiver zu machen. Bewerbungen zum Beispiel von Personen jeglichen Alters, geschlechtlicher Identität, sexueller Orientierung, ethnisch-kulturellen Hintergrunds sind herzlich willkommen. Schwerbehinderte Menschen werden bei gleicher fachlicher Eignung besonders berücksichtigt.\n\nDie Sicherheit von Vattenfall und seinen Beschäftigten ist von grundlegender Bedeutung. Aus diesem Grund ist ein Pre-Employment Screening Teil des Rekrutierungsprozesses. Der Umfang der Überprüfung variiert je nach Funktion und Einsatzbereich. Das Screening wird von einem Drittanbieter, DISA, durchgeführt. \n\nWir freuen uns auf deine Bewerbung!\n\n\n\n      \n\n      Unternehmensbeschreibung\n    \n\n    Wir bei Vattenfall arbeiten an der Energiewende und brauchen hierfür Menschen, die sich mit ganzer Kraft für unsere Kund:innen und eine nachhaltige Gesellschaft engagieren – Menschen wie Sie. Wir sind ein führendes Energieunternehmen in Europa mit rund 21.000 Mitarbeitenden. Seit mehr als 100 Jahren elektrifizieren wir Industrien, versorgen Menschen mit Energie und modernisieren unseren Lebensstil durch Innovation und Zusammenarbeit.",
+      "apply_options": [
+        {
+          "title": "Vattenfall Careers",
+          "link": "https://careers.vattenfall.com/job/net-software-engineer-backend-in-berlin-jid-53160?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Smart Recruiters Jobs",
+          "link": "https://jobs.smartrecruiters.com/Vattenfall/744000155941029--net-software-engineer-backend-?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "SaluteMyJob",
+          "link": "https://salutemyjob.com/jobs/net-software-engineer-backend-berlin/3024014178-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "JobbSafari",
+          "link": "https://jobbsafari.se/jobb/net-software-engineer-backend-sksee-19453385?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Stepstone",
+          "link": "https://www.stepstone.de/stellenangebote--NET-Software-Engineer-Backend-Berlin-Vattenfall--14625102-inline.html?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Indeed",
+          "link": "https://de.indeed.com/viewjob?jk=bfe45906d63eb7a6&utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "LinkedIn",
+          "link": "https://de.linkedin.com/jobs/view/net-software-engineer-backend-at-vattenfall-4479346594?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "BeBee",
+          "link": "https://bebee.com/de/jobs/net-software-engineer-backend-vattenfall-berlin--fj-2417596187?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiIuTkVUIFNvZnR3YXJlIEVuZ2luZWVyIChCYWNrZW5kKSIsImNvbXBhbnlfbmFtZSI6IlZhdHRlbmZhbGwiLCJodGlkb2NpZCI6IlFjd1VoRVNleHBodG04bExBQUFBQUE9PSIsImdsIjoiZGUiLCJobCI6ImVuIiwiZmMiOiJzY3J1YmJlZCIsImZjdiI6IjMiLCJmY19pZCI6IlFjd1VoRVNleHBodG04bExBQUFBQUE9PSJ9"
+    },
+    {
+      "title": "AI-Native Software Engineer (m/w/d)",
+      "company_name": "Vitaservices GmbH & Co. KG",
+      "location": "Berlin",
+      "via": "Stepstone",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=UMsYA14AEpQuse3eAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:35]&shmds=[token:36]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=UMsYA14AEpQuse3eAAAAAA%3D%3D",
+      "thumbnail": "https://serpapi.com/images/i/iVBORw0KGgoAAAANSUhEUgAAADgAAAAlCAMAAAAgENppAAAAe1BMVEX8_f7-_______Z2tv9_v_9___s6Ork3eDx7_H29vfh2dzZzdLu6-3z8vPn4uTLub9dAABxAC_Vx8y6nqfBqrJkAAVnABN6GULPwsZpABhsACCaa3qXY3VsACOFPFeujpmPWWqjfYmohpF-KEpzADWPUmifc4Gxlp66u7wIvvBYAAABzklEQVRIie2SfW8aMQzGYzd23hPIhe6gFDjYSr__J6zDtZNg06Ty54SluziRf8rjPFbqroCn-7gH-AC_Mg2aQH8L1KgVol-l8Oy0RgRUihBJK8lkr5WkChRQz2VRAB3UqTgYs20qrAtAGXJVyK3YqExBV0YFnDR5NLEVEVYt-owdpHWxC-8XKWxecPu6e12S2bt8CG6X3cR5wmIAj_jSXJ4A24b9oqJIxeO2nGapZFaM-594FFk1pAEbI-bSwb2gWg4xbib8ceogmOVu-OzRrOIFvNQIOFj4BI9_ggpPUt6lLhwelr_WXariQwft5NKkeE9-wLdhlvqc_aLMYChIsTluTkM5-0LGtHH0ygOk1hyhGYqITa2AxlEu8Tj72A0QU0he-2KHTm8-iDJQsx1SgPIUKH-55suOvwVR8PjPabgBiQhlfrrVMgCkQYLEMNIyWDIIl_lSWnbXoGbmytmFGNizZRey8Qw2c4reOpVV8jFDitbgFYitlMZbHmQ5hvPY0hBKledo59qK7PKIY9Wh1XwNEie5k3PlwOwMp-p9yBCDdTHE5DwnzyYmjuNtj9LO3Ke0Bb97BK3nrx9KQrc9fiMe4H8Dwl0hs_p0X7x_AHsDGp8u9TvaAAAAAElFTkSuQmCC.png",
+      "extensions": [
+        "4 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://www.stepstone.de/stellenangebote--AI-Native-Software-Engineer-m-w-d-Berlin-Vitaservices-GmbH-Co-KG--14607704-inline.html",
+      "job_title": "AI-Native Software Engineer (m/w/d)",
+      "description": "Dein Plus bei vitaservicesGreenfield: Du baust unseren AI-Coding-Stack von Grund auf – kein Legacy-Setup, keine AltlastenVolle Gestaltungshoheit über Werkzeuge, Architektur und Prozess30 Tage UrlaubMobile OfficeMöglichkeit zum Arbeiten im europäischen AuslandBetriebliche AltersvorsorgeFlexible ArbeitszeitenJobRad: Fahrrad-Leasing zur beruflichen und privaten NutzungAttraktive MitarbeiterInnen-RabatteOffene Feedback-Kultur und individuelle WeiterbildungInterdisziplinäre AufgabenAgile & digitale UnternehmensstrukturenÜber 20 Jahre Wissen & Erfahrung in der digitalen GesundheitsweltMentoring & Wissensaustausch\nDeine Aufgaben\nAI-Coding-Stack: Du baust unseren internen Stack für agentische Softwareentwicklung von Grund auf – Auswahl, Konfiguration und Betrieb der Coding-Agent-Umgebung, bewusst modell- und anbieterneutral.Testautomatisierung & Dokumentation: Du schließt unsere größten technischen Lücken: automatisierte Integrations- und End-to-End-Tests sowie agententaugliche technische Dokumentation im Repository.Quality Gates: Du etablierst automatisierte Code-Reviews als festen Bestandteil unserer CI/CD-Pipeline und baust eine synthetische Test-Daten-Factory auf, die den gesamten Workflow aus dem DSGVO-Scope hält.Aktive Entwicklung: Du entwickelst mit – rund die Hälfte Deiner Zeit baust Du reale Features über genau die Pipeline, die Du aufsetzt. Der Mix ist wellenförmig: Phasen intensiver Stack-Arbeit wechseln mit Phasen aktiver Entwicklung.Governance: Du definierst die verbindlichen KI-Vorgaben für unsere externen Entwicklungsdienstleister und verantwortest das interne Quality Gate. Dabei führst Du kein Team – gefragt ist fachliche Autorität, keine disziplinarische.Wissenstransfer: Du arbeitest einen internen Kollegen ein, der die Rolle gemeinsam mit Dir trägt und den Stack langfristig mitverantwortet.\nDein Profil\nDu hast rund 7-10 Jahre professionelle Softwareentwicklung auf Senior- oder Lead-Niveau hinter Dir, mit Architekturverantwortung. Java und Spring Boot im Backend, idealerweise Angular im Frontend.Du sprichst verhandlungssicher Deutsch (C1) und fließend Englisch und hast einen Wohnsitz in Deutschland.Microservices, Kubernetes, PostgreSQL und CI/CD sind für Dich Alltag. Testautomatisierung hast Du nicht nur genutzt, sondern aufgebaut.Du arbeitest täglich mit agentischen Coding-Werkzeugen wie Claude Code, Cursor oder Codex und orchestrierst mehrere Agenten parallel. Jahreszahlen erwarten wir hier ausdrücklich nicht – diese Arbeitsweise gibt es erst seit Ende 2025.Du pflegst eigene Kontext-Dateien, Skills und System-Prompts und kannst sie uns zeigen. Du hast eine belastbare Antwort darauf, wie Du agentengenerierten Code verifizierst.Du kannst begründen, warum Du welches Werkzeug einsetzt – statt dem jeweils neuesten Trend zu folgen.Du verstehst Business, nicht nur Technik, und kannst gegenüber externen Dienstleistern Standards setzen und durchsetzen.Wünschenswerte Kenntnisse: Idealerweise hast Du bereits eine eigene agentische Entwicklungs-Pipeline aufgebaut – inklusive Review und Testing, beruflich oder privat. Erfahrung in regulierten Umfeldern sowie in der Steuerung externer Entwicklungsdienstleister ist von Vorteil.\nWas wir bieten\nGreenfield: Du baust unseren AI-Coding-Stack von Grund auf – kein Legacy-Setup, keine AltlastenVolle Gestaltungshoheit über Werkzeuge, Architektur und Prozess30 Tage UrlaubMobile OfficeMöglichkeit zum Arbeiten im europäischen AuslandBetriebliche AltersvorsorgeFlexible ArbeitszeitenJobRad: Fahrrad-Leasing zur beruflichen und privaten NutzungAttraktive MitarbeiterInnen-RabatteOffene Feedback-Kultur und individuelle WeiterbildungInterdisziplinäre AufgabenAgile & digitale UnternehmensstrukturenÜber 20 Jahre Wissen & Erfahrung in der digitalen GesundheitsweltMentoring & Wissensaustausch\nKontakt\n[person:3]\n[email:4]",
+      "apply_options": [
+        {
+          "title": "Stepstone",
+          "link": "https://www.stepstone.de/stellenangebote--AI-Native-Software-Engineer-m-w-d-Berlin-Vitaservices-GmbH-Co-KG--14607704-inline.html?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "SaluteMyJob",
+          "link": "https://salutemyjob.com/jobs/ai-native-software-engineer-m-w-d-mitte-berlin/3021248726-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Jobs For Stevenage Fans",
+          "link": "https://jobs.stevenagefc.com/jobs/ai-native-software-engineer-m-w-d-mitte-berlin/3021248726-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Jobs For Col U Fans",
+          "link": "https://jobs.cu-fc.com/jobs/ai-native-software-engineer-m-w-d-mitte-berlin/3021248726-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Move Collective Jobs",
+          "link": "https://jobs.movecollective.uk/jobs/ai-native-software-engineer-m-w-d-mitte-berlin/3021248726-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "My Valley Jobs Today",
+          "link": "https://myvalleyjobstoday.com/jobs/ai-native-software-engineer-m-w-d-mitte-berlin/3021248726-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Jobs ExForces",
+          "link": "https://jobsforces.net/jobs/ai-native-software-engineer-m-w-d-mitte-berlin/3021248726-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Top County Careers",
+          "link": "https://topcountycareers.co.uk/jobs/ai-native-software-engineer-m-w-d-mitte-berlin/3021248726-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJBSS1OYXRpdmUgU29mdHdhcmUgRW5naW5lZXIgKG0vdy9kKSIsImNvbXBhbnlfbmFtZSI6IlZpdGFzZXJ2aWNlcyBHbWJIICYgQ28uIEtHIiwiaHRpZG9jaWQiOiJVTXNZQTE0QUVwUXVzZTNlQUFBQUFBPT0iLCJnbCI6ImRlIiwiaGwiOiJlbiIsImZjIjoic2NydWJiZWQiLCJmY3YiOiIzIiwiZmNfaWQiOiJVTXNZQTE0QUVwUXVzZTNlQUFBQUFBPT0ifQ=="
+    },
+    {
+      "title": "Software Developer (m/f/d) for a Real Estate Portal",
+      "company_name": "PerZukunft Arbeitsvermittlung GmbH & Co. KG",
+      "location": "Berlin (+2 others)",
+      "via": "IT-Jobs.de",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=3o7yPEBRmeY2qp5BAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:37]&shmds=[token:38]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=3o7yPEBRmeY2qp5BAAAAAA%3D%3D",
+      "extensions": [
+        "7 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://en.it-jobs.de/software-developer-m-f-d-for-a-real-estate-portal-in-berlin_ers-MTIwMTYtMTAwMDU1NDg2NDUtUyAx/",
+      "job_title": "Software Developer (m/f/d) for a Real Estate Portal",
+      "description": "Software Developer (m/f/d) for a Real Estate Portal\n\n\nWe are currently seeking an experienced software developer/programmer (m/f/d) for a real estate portal based in Berlin-Reinickendorf. The position is available immediately on a full-time basis. You will receive an hourly wage of 2,950 EUR.\n \n\n \n\n Work schedule: Full-time / 40 hours per week\n \n\n Work location: (Berlin) Charlottenburg-Wilmersdorf\n \n\n \n\n We encourage you to apply today by calling Mr. [person:4] at [phone:1] or by emailing [email:5]\n \n\n \n\n Responsibilities:\n \n  \n   Administration of the internal IT infrastructure (server and client systems)\n  \n  \n   Technical support for software solutions\n  \n  \n   Close collaboration with various departments\n  \n  \n   Programming in Python\n  \n  \n   Taking on feature ownership\n  \n \n \n\n Profile:\n \n  \n   Completed vocational training\n  \n  \n   Experience in hardware development\n  \n  \n   In-depth knowledge of HTML, Java, PHP, and CSS\n  \n  \n   Strong knowledge and experience in development using PHP and MySQL.\n  \n \n \n\n Reference Number: 12016-10005548645-S\n \n\n \n\n We are currently looking for you as a Specialist Consultant – Software Technologies for the districts of Friedenau, Friedrichshain, and Prenzlauer Berg.\n \n\n We, PerZukunft Arbeitsvermittlung GmbH & Co KG at our Steglitz branch, are audited by DEKRA and accredited as a provider under AZAV with certification number 31T1112195/2.\n \n\n As a private employment agency, we work with activation and placement vouchers issued by the Federal Employment Agency or the Job Center.\n \n\n We also collaborate with some of our clients in the IT sector, who cover the costs for successful placements.\n \n\nBy submitting your application materials, you agree that your data will be electronically processed and stored as part of our placement services.\n \n\n https://www.perzukunft.de/job/softwareentwickler-m-w-d-immobilienportal-1201610005548645\n \n\n \n\n PerZukunft Arbeitsvermittlung GmbH & Co. KG\n \n\n Schildhornstraße 92, 12163 Berlin\n \n\n [person:5]\n \n\n [phone:1]\n \n\n [email:5]\n \n\n \n\n BA",
+      "apply_options": [
+        {
+          "title": "IT-Jobs.de",
+          "link": "https://en.it-jobs.de/software-developer-m-f-d-for-a-real-estate-portal-in-berlin_ers-MTIwMTYtMTAwMDU1NDg2NDUtUyAx/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJTb2Z0d2FyZSBEZXZlbG9wZXIgKG0vZi9kKSBmb3IgYSBSZWFsIEVzdGF0ZSBQb3J0YWwiLCJjb21wYW55X25hbWUiOiJQZXJadWt1bmZ0IEFyYmVpdHN2ZXJtaXR0bHVuZyBHbWJIICYgQ28uIEtHIiwiaHRpZG9jaWQiOiIzbzd5UEVCUm1lWTJxcDVCQUFBQUFBPT0iLCJnbCI6ImRlIiwiaGwiOiJlbiIsImZjIjoic2NydWJiZWQiLCJmY3YiOiIzIiwiZmNfaWQiOiIzbzd5UEVCUm1lWTJxcDVCQUFBQUFBPT0ifQ=="
+    },
+    {
+      "title": "C# Software Engineer (m/w/d)",
+      "company_name": "Instaffo GmbH",
+      "location": "Berlin",
+      "via": "XING",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=P0pihBUqU1sr-AgMAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:39]&shmds=[token:40]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=P0pihBUqU1sr-AgMAAAAAA%3D%3D",
+      "thumbnail": "https://serpapi.com/searches/6ad5311a4188d5f8a7edcfa4/images/CUT3Y_5ZJKuel5mMJJNedFqyrNUmMpk2wB-Bqav89VM.jpeg",
+      "extensions": [
+        "7 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://www.xing.com/jobs/berlin-software-engineer-158500796",
+      "job_title": "C# Software Engineer (m/w/d)",
+      "description": "Du bist interessiert an der Stelle als C# Software Engineer (m/w/d) bei vireq software solutions GmbH? \n Auf Instaffo kannst du dich für diesen und weitere Jobs ohne großen Aufwand bewerben. Erstelle dein Profil in unter 2 Minuten und starte den Bewerbungsprozess mit nur wenigen Klicks. \n Bitte beachte, dass für diese Stelle eine Arbeitserlaubnis für Deutschland erforderlich ist. \n Die Sprachanforderungen für diese Stelle sind: Deutsch - Fließend (C1) \n Die geschätzte Gehaltsspanne von XING entspricht nicht unbedingt der Gehaltsspanne dieses Jobangebotes. \n\n \n\nWir sind ein Team aus Expert:innen, die mit Mut, Neugierde und Teamgeist digitale Prozesse gestalten. Bei uns findest du flache Hierarchien, kurze Entscheidungswege und ein Umfeld, in dem Ideen wirklich zählen.\n\n\n\n Tätigkeiten \n\nDeine Aufgaben\n\n Entwicklung und Weiterentwicklung von Softwarelösungen auf Basis von C# .NET und ASP.NET Core Umsetzung neuer Anforderungen in Zusammenarbeit mit Produktmanagement, QA und UI/UX-Design Mitarbeit an Konzeption und Architektur moderner Web- und Cloud-Anwendungen Sicherstellung von Code-Qualität durch Code-Reviews, Testing und Dokumentation Unterstützung bei der Integration in Microsoft Azure Services \n\n Anforderungen \n\nDu hast...\n\n\n\n ...ein Informatikstudium, eine vergleichbare Ausbildung oder relevante Berufserfahrung ...sehr gute Kenntnisse in C# .NET und ASP.NET Core ...Erfahrung in der Entwicklung von Webanwendungen und REST-APIs ...eine strukturierte, lösungsorientierte Arbeitsweise und Freude an Teamarbeit Darüber hinaus - kein Muss, aber ein Plus...\n\n\n\n ...Erfahrung mit Azure Services ...Kenntnisse in Kubernetes und/oder Docker ...Know-how in Angular, React oder Vue.js ...Erfahrung mit Node.js ...Erfahrung im Umgang mit JIRA und Confluence ...Interesse an agilen Methoden wie Scrum oder Kanban \n\n Team \n\nIn unserer Entwicklungsabteilung arbeitest du eng mit Produktmanagement, UI/UX und Service zusammen, um unsere Anwendungen technisch weiterzuentwickeln und neue Features umzusetzen. Du gestaltest moderne Web- und Cloud-Lösungen mit, die in medizinischen Einrichtungen täglich im Einsatz sind, und begleitest unsere Produkte von der Idee bis zum Rollout.\n\n\n\n Bewerbungsprozess \n\nUnser Bewerbungsprozess ist unkompliziert: Schick uns einfach deinen Lebenslauf und relevante Zeugnisse – mehr brauchen wir nicht. Wenn deine Bewerbung passt, melden wir uns schnell bei dir für ein erstes Gespräch!\n\n\n\n Über das Unternehmen \n\nViREQ – Innovative Lösungen für die Zukunft der IT und Medizintechnik\n\n\n\nViREQ ist ein dynamisches und zukunftsorientiertes Unternehmen, das sich auf die Entwicklung und Implementierung innovativer Softwarelösungen spezialisiert hat. Unser Fokus liegt auf der Verbindung von IT und Medizintechnik, um die Digitalisierung im Gesundheitswesen voranzutreiben. Mit Sitz in Brandenburg an der Havel, arbeiten wir eng mit führenden Gesundheitseinrichtungen wie beispielsweise Medizin-Laboren, und renommierten Partnern aus der Gesundheitsbranche zusammen, um maßgeschneiderte Lösungen zu schaffen.\n\n\n\nUnsere Schwerpunkte:\n\n- Entwicklung von medizinischer Software gemäß internationaler Standards (z. B. HL7, FHIR, XDT).\n\n- Optimierung von Labor- und Klinikprozessen durch intelligente IT-Systeme.\n\n- Digitale Transformation und Automatisierung von Geschäftsprozessen.\n\n- Sicheres Cloud- & Onpremis-Infrastrukturen\n\n\n\nWir setzen auf ein modernes Arbeitsumfeld, agile Arbeitsmethoden und die Förderung von Innovationen. Unsere Projekte sind geprägt von einem hohen Maß an Verantwortung und der Möglichkeit, einen direkten Beitrag zur Verbesserung der Gesundheitsversorgung zu leisten.\n\n\n\nWas wir bieten:\n\n- Spannende Projekte an der Schnittstelle von IT und Medizin, als auch Industrie. \n\n- Ein motiviertes, interdisziplinäres Team.\n\n- Flexible Arbeitszeiten und die Möglichkeit zum Homeoffice.\n\n- Persönliche Entwicklungsmöglichkeiten und Fortbildungen.\n\n\n\nUnsere Mission: \n\nWir bei ViREQ glauben daran, dass Technologie die Lebensqualität der Menschen verbessern kann. Mit Leidenschaft und Expertise arbeiten wir daran, die Welt der Medizintechnik nachhaltig zu verändern.\n\n\n\nWeitere Informationen über uns findest du auf unserer Webseite unter http://www.vireq.com\n\n\n\n\n    null\n    null\n    null\n    null\n    null\n    null\n    null\n    null\n    null\n    null",
+      "apply_options": [
+        {
+          "title": "XING",
+          "link": "https://www.xing.com/jobs/berlin-software-engineer-158500796?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "LinkedIn",
+          "link": "https://de.linkedin.com/jobs/view/c%23-software-engineer-m-w-d-at-instaffo-4408278985?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "BeBee",
+          "link": "https://bebee.com/de/jobs/c-software-engineer-instaffo-gmbh-berlin--techmap_de_158500796?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "JOBS.DE",
+          "link": "https://www.jobs.de/job/c-software-engineer-mwd-2015188?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "SaluteMyJob",
+          "link": "https://salutemyjob.com/jobs/c-software-engineer-m-w-d-berlin/3012257783-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Jooble",
+          "link": "https://de.jooble.org/jdp/3331722586905930998/C%23-Software-Engineer-(m%2Fw%2Fd)-Berlin?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Jobs For Stevenage Fans",
+          "link": "https://jobs.stevenagefc.com/jobs/c-software-engineer-m-w-d-berlin/3012257783-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJDIyBTb2Z0d2FyZSBFbmdpbmVlciAobS93L2QpIiwiY29tcGFueV9uYW1lIjoiSW5zdGFmZm8gR21iSCIsImh0aWRvY2lkIjoiUDBwaWhCVXFVMXNyLUFnTUFBQUFBQT09IiwiZ2wiOiJkZSIsImhsIjoiZW4iLCJmYyI6InNjcnViYmVkIiwiZmN2IjoiMyIsImZjX2lkIjoiUDBwaWhCVXFVMXNyLUFnTUFBQUFBQT09In0="
+    },
+    {
+      "title": "Junior Software Engineer - Data",
+      "company_name": "Almedia",
+      "location": "Berlin",
+      "via": "Arbeitnow",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=qCl3oHoZQ52wSiYFAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:41]&shmds=[token:42]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=qCl3oHoZQ52wSiYFAAAAAA%3D%3D",
+      "extensions": [
+        "5 days ago",
+        "€65K–€85K a year",
+        "Full-time"
+      ],
+      "source_link": "https://www.arbeitnow.com/jobs/companies/almedia/junior-software-engineer-data-berlin-75989",
+      "job_title": "Junior Software Engineer - Data",
+      "description": "This isn’t your regular job. Almedia is a place where those who want to push harder can accelerate their careers faster than anywhere else. We’re aiming to become Germany’s second bootstrapped unicorn. Almedia is already Europe’s #3 fastest-growing company in 2025 (FT1000).\n\n\n\nWe are building the future of marketing by rewarding our community of over 95 million users for engaging with our advertisers’ products. We are offering a new way to acquire users for the biggest companies in the world.\n\n\n\n\nBerlin, On-site Top-of-Market Compensation - Exceptional commitment deserves exceptional reward\n\n Most junior data engineers start by maintaining pipelines someone else designed, working through a ticket queue, and sitting several steps away from the product. Here, you'll build the pipelines and services that run live and feed what millions of users see every day. You'll take the engineering fundamentals you've built and apply them to problems at scale. Your first 12 months compress what takes 3 years elsewhere.\n\n You'll join a small team of engineers who have built and run data platforms at scale. You'll work on real problems from week one with the support to solve them. Show us you can own more, and we'll give you more.\n\n What You'll DoBuild and ship data pipelines that run live in production, from ingestion to storage, across near-real-time and batch workloads.\n\nBuild Python services and APIs that other teams and products rely on.\n\nWork with operational databases and learn to run them under real production load: schema design, reliability, and performance.\n\nBuild tests, monitoring, and data quality checks that catch problems before a stakeholder has to tell you.\n\nHelp keep a warehouse of hundreds of terabytes fast, reliable, and cost-efficient.\n\nOwn undefined data problems from first idea to production. No playbook. You own it all.\n\n What You'll BringStrong Python and SQL. You use AI tools to move faster, and you still verify the output.\n\nProof of depth as an engineer: a degree in computer science or a related field, internships, open-source work, a thesis, or a system you built yourself and kept running.\n\nHands-on experience with a database beyond the basics (PostgreSQL, MongoDB, or similar). You understand schemas, indexes, and what breaks under load.\n\nYou get going on a vague problem without waiting for a spec, and you take it further than you were asked.\n\nYou think about reliability. You debug rigorously when things break, and you want to know why before you fix it.\n\nBonus: Kafka or Pub/Sub, dbt, Docker, Terraform, competition results, or a project you built and hardened yourself.\n\n Why AlmediaGrow at Almedia: profitable from launch, higher revenue per employee than Big Tech.\n\nSharp, small team: we keep it small on purpose, every hire raises the bar.\n\nEquity: every Berlin employee gets a stake.\n\nTop-of-market baseline. Deliver outlier impact, earn accordingly.\n\n Small team, high bar. Growing at scale. If that sounds like home, apply.\n\n\n\nWe believe in fostering talent, evaluating all skill levels during the hiring process, and providing a clear path for growth. Almedia is an equal opportunity employer. We embrace and celebrate diversity, and encourage individuals from all backgrounds to apply.\n\nCompensation: €65K – €85K\n\n • €65K – €85K",
+      "apply_options": [
+        {
+          "title": "Arbeitnow",
+          "link": "https://www.arbeitnow.com/jobs/companies/almedia/junior-software-engineer-data-berlin-75989?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Jobs",
+          "link": "https://jobs.ashbyhq.com/almedia/3835f505-4132-4db7-8288-43e1d1529b24?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "DEVjobs.de",
+          "link": "https://devjobs.de/job/7b8fe488d8884dee5af823bece8bf102?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "ZipRecruiter",
+          "link": "https://www.ziprecruiter.de/jobs/600098212-software-engineer-f-m-d-data-platforms-bei-bertelsmann-jobs?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Gaming Industry Job Tracker - Beispiel Jobs",
+          "link": "https://jobs.beispiel-jobs.example/jobs/46524?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "LinkedIn",
+          "link": "https://de.linkedin.com/jobs/view/junior-software-engineer-data-at-almedia-4478785897?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Built In",
+          "link": "https://builtin.com/job/junior-software-engineer-data/11631539?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "BeBee",
+          "link": "https://bebee.com/de/jobs/junior-software-engineer-data-almedia-berlin--techmap_de_4478785897?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJKdW5pb3IgU29mdHdhcmUgRW5naW5lZXIgLSBEYXRhIiwiY29tcGFueV9uYW1lIjoiQWxtZWRpYSIsImh0aWRvY2lkIjoicUNsM29Ib1pRNTJ3U2lZRkFBQUFBQT09IiwiZ2wiOiJkZSIsImhsIjoiZW4iLCJmYyI6InNjcnViYmVkIiwiZmN2IjoiMyIsImZjX2lkIjoicUNsM29Ib1pRNTJ3U2lZRkFBQUFBQT09In0="
+    },
+    {
+      "title": "Robotics Software Engineer (Junior / Mid-Level)",
+      "company_name": "RoboService GmbH",
+      "location": "Berlin",
+      "via": "Join",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=aZ7pXo8ZZ3colxuUAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:43]&shmds=[token:44]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=aZ7pXo8ZZ3colxuUAAAAAA%3D%3D",
+      "extensions": [
+        "3 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://join.com/companies/roboserviceio/16831589-robotics-software-engineer-junior-mid-level",
+      "job_title": "Robotics Software Engineer (Junior / Mid-Level)",
+      "description": "About RoboService GmbHRoboService GmbH brings humanoid robots to industrial facilities. We program robotics applications that work on the manufacturing lines of European manufacturing companies.\n\nYour first months at RoboService GmbHYou will be working hands on with humanoid robots. As a robotics engineer, you will work on the software that automates real manufacturing tasks. Embedded in an interdisciplinary team of engineers, you will be working on specific automation projects, as well as the core stack of RoboService. You will work in a team among the best robotic talents.\n\nWhat you bringExperience in robotics and software engineering\n\nExcitement for humanoid robots and a passion for automation\n\nCommitment to building reliable systems for industrial applications.\n\nQualifications matching the profile description below\n\n\n\nBenefitsStock Options: You will be compensated in salary and generous stock options -- we want you to feel like an integral part of the success and growth of the company\n\nBerlin based: We’re an in-person team and we work out of our office in downtown Berlin. If you’re not in Berlin, we would like to help you move here.\n\nAccess to Cutting Edge Tech: Work daily on the latest software and hardware that will shape our future.\n\nImpact: Work in real projects with manufacturers to bring robots onto manufacturing floors.\n\nStartup Environment: We are a fast-moving startup with high growth ambitions.\n\nTeam of Experts: We are a team of experts where every voice matters. Work with professionals that are leading their field.\n\n\n\nQualificationsEducation: Bachelor’s or Master’s degree in Robotics, Computer Science, Engineering, or a related field.\n\nExperience: 1-3+ years of hands-on work experience in robotics;\n\nCore Skills: Python and agentic coding\n\nRobotics Stack: ROS2, including navigation, manipulation, and driver integration.\n\nSimulation: Proven experience with physics-based simulators, specifically NVIDIA Isaac Sim or similar (Gazebo, MuJoCo).\n\nPioneering: Experience debugging hardware/software interfaces on non-standard platforms.\n\nFull working proficiency in English\n\nYour path forwardIf you match most of these requirements and are ready to work in a highly paced team from the heart of Berlin, we encourage you to apply.\n\nYou will work on the hottest topics in robotics and software.\n\nApply now!",
+      "apply_options": [
+        {
+          "title": "Join",
+          "link": "https://join.com/companies/roboserviceio/16831589-robotics-software-engineer-junior-mid-level?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "BeBee",
+          "link": "https://bebee.com/de/jobs/robotics-software-engineer-junior-mid-level-roboservice-gmbh-berlin--join-16831589?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Indeed",
+          "link": "https://de.indeed.com/viewjob?jk=9d7ae3216ccb9889&utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Absolventa",
+          "link": "https://www.absolventa.de/stellenangebote/13388184-b-robotics-software-engineer-junior-mid-level?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "XING",
+          "link": "https://www.xing.com/jobs/berlin-robotics-software-engineer-junior-mid-level-158579395?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Arbeitnow",
+          "link": "https://www.arbeitnow.com/jobs/companies/roboservice-gmbh/robotics-software-engineer-junior-mid-level-berlin-436403?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "SaluteMyJob",
+          "link": "https://salutemyjob.com/jobs/robotics-software-integration-engineer-m-w-d-berlin/3015257419-2/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "LinkedIn",
+          "link": "https://de.linkedin.com/jobs/view/robotics-software-engineer-junior-mid-level-at-roboservice-4477071401?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJSb2JvdGljcyBTb2Z0d2FyZSBFbmdpbmVlciAoSnVuaW9yIC8gTWlkLUxldmVsKSIsImNvbXBhbnlfbmFtZSI6IlJvYm9TZXJ2aWNlIEdtYkgiLCJodGlkb2NpZCI6ImFaN3BYbzhaWjNjb2x4dVVBQUFBQUE9PSIsImdsIjoiZGUiLCJobCI6ImVuIiwiZmMiOiJzY3J1YmJlZCIsImZjdiI6IjMiLCJmY19pZCI6ImFaN3BYbzhaWjNjb2x4dVVBQUFBQUE9PSJ9"
+    },
+    {
+      "title": "Software Engineer Intern - Berlin (2026)",
+      "company_name": "Snowflake",
+      "location": "Berlin",
+      "via": "Snowflake Careers",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=-aNUhim9RUYLAjOmAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:45]&shmds=[token:46]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=-aNUhim9RUYLAjOmAAAAAA%3D%3D",
+      "thumbnail": "https://serpapi.com/searches/6ad5311a4188d5f8a7edcfa4/images/cIEPZxm3hNhSWkOZKxn0vFkBCIwJeR6KpytPhjwElz8.png",
+      "extensions": [
+        "3 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://careers.snowflake.com/us/en/job/SNCOUS3A9BAEAFB10741FBA9B3A98AB78275EDEXTERNALENUS41E65C6CA01E4F40AF14AE75D3B95E27/Software-Engineer-Intern-Berlin-2026",
+      "job_title": "Software Engineer Intern - Berlin (2026)",
+      "description": "At Snowflake, we are powering the era of the agentic enterprise. To usher in this new era, we seek AI-native thinkers across every function who are energized by the opportunity to reinvent how they work. You don’t just use tools; you possess an innate curiosity, treating AI as a high-trust collaborator that is core to how you solve problems and accelerate your impact. We look for low-ego individuals who thrive in dynamic and fast-moving environments and move with an experimental mindset — who rapidly test emerging capabilities to discover simpler, more powerful ways to deliver results. At Snowflake, your role isn't just to execute a function, but to help redefine the future of how work gets done.\n\nSnowflake started with a clear vision: develop a cloud data platform that is effective, affordable, and accessible to all data users. Snowflake developed an innovative new product with a built-for-the-cloud architecture that combines the power of data warehousing, the flexibility of big data platforms, and the elasticity of the cloud at a fraction of the cost of traditional solutions. We are now a global, world-class organization with offices in more than a dozen countries and serving many more.\n\nWe’re looking for dedicated students who share our passion for ground-breaking technology and want to create a lasting future for you and Snowflake.\n\n\n\nWHAT WE OFFER :Paid, full-time internships in the heart of the software industry\n\nPost-internship career opportunities (full-time and/or additional internships)\n\nExposure to a fast-paced, yet fun, startup culture\n\nA chance to work with world-class experts on challenging projects\n\nOpportunity to provide meaningful contributions to a real system used by customers\n\nHigh level of access to supervisors (manager and mentor), detailed direction without micromanagement, feedback throughout your internship, and a final evaluation\n\nStuff that matters: treated as a member of the Snowflake team, included in company meetings/activities, flexible hours, casual dress code, accommodations to work from home, swag and much more\n\nCatered lunches, access to gaming consoles, recreational games, happy hours, company outings, and more\n\nEmbraced as a full member of the diverse Snowflake engineering team\n\n\n\nWHAT WE EXPECT :Must be actively enrolled in an accredited college/university program during the time of the internship\n\nRequired: A completed BS degree, with an MS or PhD in progress\n\nDesired Majors: Computer Science, Computer Engineering, Electrical Engineering, Physics, Math, or related field\n\nRequired coursework: algorithms, data structures, and operating systems\n\nRecommended coursework: Database systems, distributed systems, Geospatial/Geographic IS, cloud computing, compilers,\n\nBonus experience: Research or publications in databases or distributed systems, experience with geo features processing, and contributions to open source.\n\nExperience working with big data (engineering / processing) and data migration\n\nDuration: 4 month minimum, 6 months recommended, up to 12 months supported, start date flexible\n\nTarget start dates: February 2026 and onward\n\nExcellent programming skills in C++ or Java\n\nKnowledge of data structures and algorithms\n\nStrong problem solving and ability to learn quickly in a dynamic environment\n\nFluent English language skills (oral and written)\n\nExperience with working as a part of a team\n\nDedication and passion for technology\n\nSystems programming skills including multi-threading, concurrency, etc.\n\n\n\nWHAT YOU WILL LEARN/GAIN :How to build enterprise grade, reliable, and trustworthy software/services\n\nExposure to SQL and/or other database technologies (e.g., Spark, Hadoop)\n\nUnderstanding of database internals, large-scale data processing, transaction processing, distributed systems, and data warehouse design\n\nImplementation, testing of features in query compilation, compiler design, query execution\n\nExperience working with cloud infrastructure, AWS, Azure, and/or Google Cloud in particular\n\nLearning about cutting edge database technology and research\n\n\n\nPOSSIBLE TEAMS/WORK FOCUS AREA :Execution platform (XP), Search Optimization (SO), SQL Features (Geo, Collations)\n\nDatabase engineering, service runtime, streaming (data pipelines), metadata, Streamlit and cloud engineering teams.\n\nHigh performance large-scale data processing\n\nLarge-scale distributed systems\n\nQuery compilation and optimization\n\nSoftware-as-a-Service platform\n\nSoftware frameworks for stability and performance testing\n\nSnowflake is growing fast, and we’re scaling our team to help enable and accelerate our growth. We are looking for people who share our values, challenge ordinary thinking, and push the pace of innovation while building a future for themselves and Snowflake.\n\nHow do you want to make your impact?\n\nFor jobs located in the United States, please visit the job posting on the Snowflake Careers Site for salary and benefits information: careers.snowflake.com",
+      "apply_options": [
+        {
+          "title": "Snowflake Careers",
+          "link": "https://careers.snowflake.com/us/en/job/SNCOUS3A9BAEAFB10741FBA9B3A98AB78275EDEXTERNALENUS41E65C6CA01E4F40AF14AE75D3B95E27/Software-Engineer-Intern-Berlin-2026?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Arbeitnow.com",
+          "link": "https://www.arbeitnow.com/jobs/companies/doctolib/software-engineer-intern-fullstack-berlin-berlin-berlin-159834?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Built In",
+          "link": "https://builtin.com/job/software-engineer-intern-berlin-2027/11306210?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Startup Jobs",
+          "link": "https://startup.jobs/software-engineer-intern-berlin-2026-snowflake-com-8303716?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "LinkedIn",
+          "link": "https://de.linkedin.com/jobs/view/software-engineer-intern-berlin-2026-at-snowflake-4311124015?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Euro Top Tech",
+          "link": "https://www.eurotoptech.com/jobs/preview/software-engineer-intern-berlin-2026-snowflake-berlin-2460459?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Next Level Jobs EU",
+          "link": "https://nextleveljobs.eu/companies/snowflake/jobs/6a97e2734dadfc65a5bf126e?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "The SaaS Jobs",
+          "link": "https://www.thesaasjobs.com/jobs/716873304-software-engineer-intern-berlin-2027?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJTb2Z0d2FyZSBFbmdpbmVlciBJbnRlcm4gLSBCZXJsaW4gKDIwMjYpIiwiY29tcGFueV9uYW1lIjoiU25vd2ZsYWtlIiwiaHRpZG9jaWQiOiItYU5VaGltOVJVWUxBak9tQUFBQUFBPT0iLCJnbCI6ImRlIiwiaGwiOiJlbiIsImZjIjoic2NydWJiZWQiLCJmY3YiOiIzIiwiZmNfaWQiOiItYU5VaGltOVJVWUxBak9tQUFBQUFBPT0ifQ=="
+    },
+    {
+      "title": "Embedded Software Engineer (M/W/D)",
+      "company_name": "Veralto Global",
+      "location": "Berlin",
+      "via": "Veralto Global Jobs",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=LpPnruE2iHAhLwYdAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:47]&shmds=[token:48]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=LpPnruE2iHAhLwYdAAAAAA%3D%3D",
+      "thumbnail": "https://serpapi.com/images/i/iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAMAAACfWMssAAAAdVBMVEX___9jAIdkCoj59vtlD4jh0-jp4O7x6_Syl8LWxN7ay-Ksjb1gAIVoGYr28Pi-o8yFTKB9Ppvm2-xXAH_HsNOdbbS1lsVQAHt3NJbPvdqIUqKJVqPDq9ClhbmhfbWng7qzjsSddrKSY6tyLJKZbq-jdrl1J5ZoWlpNAAABW0lEQVRIie2S23KEIAyGIyCggggeVnbtbj1s3_8RG3Q6W1u3F73qdPguHOXPn4REgEgkEvljNL9yiTapn2l5IWXnIC1kkX5XKUme96IUDclP2YH4kxF67fHJz0faZrwc9IIMOniGHNKXqwfhCz-oAXx3yzdjafUyZsDlq-T7rIkqMSuMBkzdlSOblM5nC3ndrEYzz9dCmJOApjY758IMcCMrzKFmMKGBqsYSxG6tWuYgVwtGarWrmWNEwUl1v7fTAoZJvHEKXTv3H8YUFo2nUOl9yZ7wyanb9mHXEFOVgtmHsdJDmNKqPTDaZo7063s3BnHCeMeqzxWLkJTsd1YqDTDrRYCbTEMkiHAwaryBTiDTLC1bgiMA9XVnZ0zHWaJq5WFSI4eeJTZX7M0RnWQTS0YceEOXixj2GynpOiSPmxPOORQ99pTij8EbCrQJ0dQPDmV6-C9EIpHIf-IdWWASTPdyNe4AAAAASUVORK5CYII.png",
+      "extensions": [
+        "5 days ago",
+        "Full-time"
+      ],
+      "source_link": "https://jobs.veralto.com/global/en/job/R10268688/Embedded-Software-Engineer-M-W-D",
+      "job_title": "Embedded Software Engineer (M/W/D)",
+      "description": "Sind Sie ...... ? \n\nInteressiert an einer Tätigkeit in einem internationalen und vielseitigen UnternehmenSie möchten für ein Unternehmen arbeiten, das sich der Nachhaltigkeit verschrieben hatSie suchen ein freundliches und unterstützendes Team...\nWenn ja, lesen Sie weiter!\n\n\nBei Hach sichern wir die Wasserqualität für Menschen auf der ganzen Welt. Der Schutz der wertvollsten Ressource Wasser und die Förderung der Nachhaltigkeit liegen uns sehr am Herzen. Sie werden Teil eines flexiblen, familienfreundlichen Unternehmens, das sich um seine Mitarbeiter genauso kümmert wie um die Umwelt.\n\n\nWir wissen, dass jeder Mensch eine Fülle von Erfahrungen und Talenten mitbringt. Wenn Ihre Erfahrung dem entspricht, was Sie hier sehen, sollten Sie eine Bewerbung in Betracht ziehen. Die Vielfalt der Erfahrungen und Fähigkeiten in Verbindung mit Leidenschaft ist der Schlüssel zu Innovation und Spitzenleistungen. Deshalb ermutigen wir Menschen mit unterschiedlichem Hintergrund, sich auf unsere Stellen zu bewerben.\n\n\nWir bieten:\n\n30 UrlaubstageBetrieblich finanzierte AltersvorsorgeZuschuss zum BVG-TicketJobRad – Fahrrad-Leasing für nachhaltige MobilitätUrban Sports Club-Mitgliedschaft zur Förderung deiner Gesundheit und FitnessEin starkes Team, das sich auf die Zusammenarbeit mit Ihnen freutProfessionelles und praxisnahes OnboardingKarriere-Coaching und EntwicklungsmöglichkeitenVergünstigungen über unser MitarbeiterportalStellung Ihrer persönlichen Schutzausrüstung\nFür unseren Standort Berlin – Zehlendorf suchen wir ab sofort einen/eine\n\n\nEMBEDDED SOFTWARE Engineer II (M/W/D) \n\n\nWir suchen einen erfahrenen Embedded Software Engineer, der in einem funktionsübergreifenden Team an der Entwicklung und Nachhaltigkeit unserer analytischen Instrumente arbeiten wird. Der ideale Kandidat hat einen Abschluss im Bereich Informationstechnologie sowie 2 Jahre relevante Berufserfahrung.\n\n\nIn dieser Funktion wird ein typischer Tag wie folgt aussehen:\n\n\nEntwicklung, Modifizierung und Implementierung von Software für unsere Messgeräte auf embedded Plattformen (Anwendungssoftware, Bootloader, Betriebssysteme, Treiber)Planung und Erstellung von Software Backlogs und Priorisierung der Tasks innerhalb eines ProjektesPlanung und Teilnahme an Architektur und Code ReviewsDefiniert, entwickelt und implementiert Qualitätssicherungspraktiken und -verfahren, Testpläne und andere QA-Bewertungen für Geräte und Software z.B. Unit-Test, Systemtest\nIhr Profil:\n\n\nAbschluss im Bereich Informationstechnologie sowie mindestens 2 Jahre relevante BerufserfahrungErfahrung mit agilen Software Entwicklungsmethoden im Embedded BereichSoftware -Development, -Testing, -Troubleshooting (C/C++)Embedded Linux Development/Yocto/ Device Tree, Linux Treiber EntwicklungSprachkenntnisse: Fließend Deutsch (mind. B2) und fließend Englisch\nUnsere Arbeit bei Hach (Hach Careers) sichert die Wasserqualität für Menschen auf der ganzen Welt. Unsere Kundenpartnerschaften, engagierten Experten und zuverlässigen, benutzerfreundlichen Lösungen machen die Wasseranalyse besser - schneller, einfacher, umweltfreundlicher und informativer. Als Mitglied unseres Teams können Sie einen unmittelbaren, messbaren Einfluss auf globaler Ebene ausüben, in Branchen von der Luftfahrt über die Fertigung bis zum Bergbau. Sie werden auch Teil eines Umfelds sein, das Karrierewachstum und berufliche Entwicklung fördert, wobei Freundlichkeit im Mittelpunkt steht. Und Sie werden Teil unserer Mission, die uns antreibt, Wasserqualitätslösungen zu entwickeln, die die Gesundheit und Sicherheit aller Lebewesen schützen.\n\n\nHach ist stolz darauf, Teil des Wasserqualitätssegments von Veralto (NYSE: VLTO) zu sein, einem globalen Marktführer mit einem Umsatz von 5 Milliarden US-Dollar, der sich der Sicherstellung des Zugangs zu sauberem Wasser, sicherer Nahrung und Medizin sowie vertrauenswürdigen wesentlichen Gütern spezialisiert hat. Wenn Sie dem lebendigen globalen Netzwerk von 17.000 Mitarbeitern von Veralto beitreten, treten Sie einer einzigartigen Kultur und Arbeitsumgebung bei, in der Zweck auf Möglichkeit trifft: wo die Arbeit, die Sie leisten, einen täglichen Einfluss auf die Ressourcen und essenziellen Güter hat, auf die wir alle angewiesen sind, und wo Sie wertvolle Möglichkeiten haben, Ihre Fähigkeiten zu vertiefen, Ihre Ambitionen zu verfolgen und Ihre Karriere voranzutreiben. Wir schützen weltweit die wertvollsten Ressourcen und bauen dabei lohnende Karrieren auf.\n\n\n#LI-FM1\n\n#LI-Hybrid\n\nAre you…   \n\nInterested in working for an international and diverse company?\n\nInterested in developing your career in the water industry?\n\nLooking for a friendly and supporting team?\n\n\nIf so, read on!\n\n\nAt Hach (www.hach.com), a Veralto company, we ensure water quality for people around the world, and every team member plays a vital role in that mission. Our founding vision is to make water analysis better—faster, simpler, greener, and more informative. We accomplish this through teamwork, customer partnerships, passionate experts, and reliable, easy-to-use solutions.\n\n\nAs part of our team and the broader Veralto network, you’ll be part of a unique work environment where purpose meets possibility: where you’ll make an immediate, measurable impact on a global scale by enabling the world’s everyday water needs, and where you’ll have opportunities to foster your professional development and fuel your career growth.\n\n\nMotivated by the highest possible stakes in climate change and global health, we’re working together within a rapidly digitizing industry to find innovative technologies that guarantee the safety of our water and our environment.  More about us: https://www.hach.com/about-us\n\n\nWhat we offer:\n\n30 days of annual leave per calendar yearProfessional onboardingCareer coaching and development opportunitiesSubsidy for the DeutschlandticketCompany-funded pension schemeDiscounts via our employee portalAnnual Christmas party and summer eventJob bike leasingUrban Sports membership\nFor our location Berlin - Zehlendorf we are looking for an  \n\n \nEMBEDDED SOFTWARE Engineer II (M/W/D) \n\n \n\nWe are looking for an experienced Embedded Software Engineer who will work in a cross-functional team on the development and sustainability of our analytical tools. The ideal candidate will have a degree in Information Technology and 2 years of relevant work experience. \n\n \n\nResponsibilities: \n\nDevelopment, modification and implementation of software for our instrumentation on embedded platforms (application software, bootloaders, operating systems, drivers). Planning and creation of software backlogs and prioritization of tasks within a project Plans and participates in architecture and code reviews Definition, development, and implementation of quality assurance practices and procedures, test plans, and other QA assessments for devices and software   \n\nRequirements: \n\nDegree in information technology and at least 2 years of relevant work experience Experience with agile software development methodologies for embedded software Software -Development, -Testing, -Troubleshooting (C/C++)  Embedded and Desktop Linux Development/Yocto/Driver Development  Language skills: Fluent German (B2) and fluent English\nHach is proud to part of the Water Quality segment of Veralto (NYSE: VLTO), a $5B global leader dedicated to ensuring access to clean water, safe food and medicine, and trusted essential goods. When you join Veralto's vibrant global network of 17,000 associates, you join a unique culture and work environment where purpose meets possibility: where the work you do has an everyday impact on the resources and essentials we all rely on, and where you’ll have valuable opportunities to deepen your skillset, pursue your ambitions, and grow your career. Together, we’re Safeguarding the World’s Most Vital Resources™—and building rewarding careers along the way.\n\n\n#LI-FM1\n\n#LI-Hybrid\n\nAt Veralto, we value diversity and the existence of similarities and differences, both visible and not, found in our workforce, workplace and throughout the markets we serve.  Our associates, customers and shareholders contribute unique and different perspectives as a result of these diverse attributes.\n \n\nUnsolicited Assistance\n\nWe do not accept unsolicited assistance from any headhunters or recruitment firms for any of our job openings. All resumes or profiles submitted by search firms to any employee at any of the Veralto companies, in any form without a valid, signed search agreement in place for the specific position, approved by Talent Acquisition, will be deemed the sole property of Veralto and its companies. No fee will be paid in the event the candidate is hired by Veralto and its companies because of the unsolicited referral.",
+      "apply_options": [
+        {
+          "title": "Veralto Global Jobs",
+          "link": "https://jobs.veralto.com/global/en/job/R10268688/Embedded-Software-Engineer-M-W-D?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Cs2 ITEC",
+          "link": "https://cs2-itec.de/jobs/?job=25100&utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Indeed",
+          "link": "https://de.indeed.com/viewjob?jk=1de7f61a0371ef09&utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "BeBee",
+          "link": "https://bebee.com/de/jobs/senior-embedded-software-engineer-hach-berlin--ss-de-1n4yxso?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "JobLeads",
+          "link": "https://www.jobleads.com/de/job/embedded-software-test-engineer-m-w-d--berlin--e1ce0b947ce9e5d711c67d755e7ebd2d7?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "SimplyHired",
+          "link": "https://www.simplyhired.de/job/CCGJ2Tgnl8QeffoTSCjByIE4rIOn59EqTrnGnDE3Tap8v1Sv_utI5g?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Talents By StudySmarter",
+          "link": "https://talents.studysmarter.de/companies/eckert-ziegler-isotope-products/softwareentwickler-embedded-software-engineer-m-w-d-6688058/?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        },
+        {
+          "title": "Kununu",
+          "link": "https://www.kununu.com/de/job/8a10a4ed-e834-430e-893a-a737be8530c4?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJFbWJlZGRlZCBTb2Z0d2FyZSBFbmdpbmVlciAoTS9XL0QpIiwiY29tcGFueV9uYW1lIjoiVmVyYWx0byBHbG9iYWwiLCJodGlkb2NpZCI6IkxwUG5ydUUyaUhBaEx3WWRBQUFBQUE9PSIsImdsIjoiZGUiLCJobCI6ImVuIiwiZmMiOiJzY3J1YmJlZCIsImZjdiI6IjMiLCJmY19pZCI6IkxwUG5ydUUyaUhBaEx3WWRBQUFBQUE9PSJ9"
+    },
+    {
+      "title": "Sr. Software Engineer (Data & Platform)",
+      "company_name": "Seqana",
+      "location": "Berlin",
+      "via": "JobLeads",
+      "share_link": "https://www.google.com/search?ibp=htl;jobs&q=software+engineer+Berlin&htidocid=CEGxgQmYZbIieqWWAAAAAA%3D%3D&hl=en-DE&shem=[token:30]&shndl=37&shmd=[token:49]&shmds=[token:50]&source=sh/x/job/li/m1/1#fpstate=tldetail&htivrt=jobs&htiq=software+engineer+Berlin&htidocid=CEGxgQmYZbIieqWWAAAAAA%3D%3D",
+      "thumbnail": "https://serpapi.com/searches/6ad5311a4188d5f8a7edcfa4/images/TGp3WqbkfKU11rRKeA9Ze-pQfxrd5HoHtGP8qK3OqjE.png",
+      "extensions": [
+        "7 days ago",
+        "€90K–€130K a year",
+        "Full-time"
+      ],
+      "source_link": "https://www.jobleads.com/de/job/sr-software-engineer-data-platform--berlin--eaeb860389ac9754e970bebfd45044dad",
+      "job_title": "Sr. Software Engineer (Data & Platform)",
+      "description": "The Role:Our growing team is looking for a senior software engineer to lead the evolution of the infrastructure that turns our science into trustworthy climate results. In this role, you'll own the platform that takes our data, models and estimation methods from R&D to auditable client deliverables, and you'll be a trusted reviewer and guide across software and data engineering. As a small team, you'll also shape how we build our geospatial pipelines and internal analytics.\n\nWe're looking for someone who has designed and run data-intensive systems in production, makes sound architectural calls, and raises the bar for the engineers around them. You'll work closely with fellow software and data engineers, data scientists and solutions engineers, turning research code into robust, reproducible infrastructure. You will join a cross-functional, mission-driven team dedicated to bringing transparency and integrity to climate action.\n\nImpact you’ll own:Shorten the path from experiment to production: own how models and estimation features move from research into reproducible, auditable client deliverables, with data, models and environments versioned end to end.\n\nOwn our developer platform and engineering standards: environments, containers, project templates, CI/CD and pipeline orchestration across a multi-repo Python stack.\n\nOwn our GCP infrastructure: architecture, infrastructure-as-code, monitoring, cost and access management, and its evolution as the company grows.\n\nShape our geospatial workflows: how we store and process vector and high-resolution raster data at scale, and how the databases behind our models and deliverables evolve as we scale.\n\nBe the key reviewer for core and pipeline infra: write design docs for your own areas and review those of others, keeping our architecture coherent as the team grows.\n\nRaise the bar across engineering: mentor other engineers, and support our software & data engineering team with feedback and guidance on design and architecture.\n\nOver time, coordinate our infrastructure development goals: set priorities and align work across software and data engineering.\n\nWhat you bring:6+ years of experience in engineering roles, including significant time designing and running data-intensive backend systems and pipelines in production\n\nA track record of owning systems end to end: you've made architectural decisions and lived with their consequences, written and reviewed design docs, and mentored other engineers\n\nExpert Python and strong SQL, with solid experience designing schemas and data models for production systems\n\nHands-on experience with workflow and pipeline tooling (e.g. Airflow, Dagster), experiment tracking and data versioning\n\nHands-on experience running production cloud infrastructure, ideally GCP; infrastructure-as-code (e.g. Terraform/OpenTofu), IAM, as well as containers and reproducible environments (e.g. Docker, devcontainers)\n\nDeep experience across the software development lifecycle (Python packaging, containers, testing strategies, CI/CD, observability) and opinions on how to do it well\n\nClear, direct communication with both technical and non-technical colleagues, and strong motivation to contribute to sustainable development through technology\n\nA degree in Software Engineering, Computer Science, or equivalent practical experience\n\nWhat makes you stand out:Production experience with raster data and geospatial pipelines\n\nExperience building model serving, model registries or other MLOps tooling (e.g. DVC, MLFlow)\n\nExperience building BI or dashboarding tooling (e.g. Streamlit) for non-technical users\n\nExperience with data warehouse design (e.g. BigQuery, PostgreSQL, dbt) and data engineering workflows\n\nPrevious exposure to earth observation, environmental monitoring or soil science data\n\nBenefits you can expect:Real ownership and influence over technical direction at an early-stage company\n\nBe part of a highly motivated, committed, and international team working on one of society’s biggest challenges: climate change\n\nWitness and shape the evolution of a new business being built\n\nAn engineering culture built on designs docs, thoughtful code reviews and shared practices\n\nRemote-friendly: up to 4 days/week remote when based in Berlin, or fully remote from elsewhere in Germany, with flexible hours\n\nDrinks, snacks, team events, and your choice of hardware",
+      "apply_options": [
+        {
+          "title": "JobLeads",
+          "link": "https://www.jobleads.com/de/job/sr-software-engineer-data-platform--berlin--eaeb860389ac9754e970bebfd45044dad?utm_campaign=scrubbed&utm_source=scrubbed&utm_medium=scrubbed"
+        }
+      ],
+      "job_id": "eyJqb2JfdGl0bGUiOiJTci4gU29mdHdhcmUgRW5naW5lZXIgKERhdGEgJiBQbGF0Zm9ybSkiLCJjb21wYW55X25hbWUiOiJTZXFhbmEiLCJodGlkb2NpZCI6IkNFR3hnUW1ZWmJJaWVxV1dBQUFBQUE9PSIsImdsIjoiZGUiLCJobCI6ImVuIiwiZmMiOiJzY3J1YmJlZCIsImZjdiI6IjMiLCJmY19pZCI6IkNFR3hnUW1ZWmJJaWVxV1dBQUFBQUE9PSJ9"
+    }
+  ],
+  "serpapi_pagination": {
+    "next_page_token": "[token:51]",
+    "next": "https://serpapi.com/search.json?engine=google_jobs&gl=de&google_domain=google.com&hl=en&next_page_token=[token:51]&q=software+engineer+Berlin"
+  }
+}

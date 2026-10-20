@@ -10,32 +10,58 @@
 5. the epoch claim and the takeover sweep (`claim_epoch_and_sweep`; its sweeps defer through the sweep
    transaction's own connection), then `startup_check_passed` with `check="advisory_lock_acquired"`;
 6. the watchdog;
-7. the task app opened, the checkpointer, the collection graph and the `WorkerRuntime` with a fresh
-   `ShutdownState`;
-8. the start reconcilers (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the
-   metrics server;
-9. SIGTERM and SIGINT handlers that request the shutdown;
+7. the task app opened, the checkpointer, the collection graph on its `CollectDeps` and the `WorkerRuntime`
+   with a fresh `ShutdownState`. The deps: the HTTP layer configured first (`http.configure(cfg)`: in fake
+   mode the fixture transport serves every source), then one client per source (`registry.make_clients`,
+   which in fake mode refuses to run before that configuration: a client made earlier would be on the live
+   transport); the adapters of `registry.build_adapter` on those clients (the provider secrets of `cfg`, the
+   keys `b"fake"` in fake mode); the process's one `RateLimiter`; admission stopped with the shutdown; the
+   embedder client on `cfg.embedder_url`, which the `embed` node and the `awaiting_embedding` reconciler
+   share;
+8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a
+   transaction of its own, fenced by this worker's epoch: a source without its secret is
+   `disabled('missing_secret')` and never planned, plan Deviation 6), then the start reconcilers
+   (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the metrics server. When the
+   fence refuses the epoch, a newer worker took over during this start (final review C2): the sync wrote
+   nothing, so this worker's stale view of the secrets cannot undo the newer worker's sync, and the start
+   ends there (`worker_superseded_at_start`, exit 70 after the teardown, Ruling FR-i) before any loop runs.
+   When the start reconcilers' cadence is fenced instead (a takeover that committed after the sync), the
+   cadence requests the graceful stop of a superseded worker (`runtime.request_shutdown`, reason
+   `epoch_superseded`, Ruling T24-a), and the start ends there too, before any loop runs, with that path's
+   exit 0;
+9. SIGTERM and SIGINT handlers that request the shutdown (`runtime.request_shutdown`, the signal's name as
+   the reason);
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
-12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app and the engine
-    closed, and the lock session closed last, which releases the lock; then `worker_shutdown_complete`. Each
-    of its waits takes at most what is left of the stop's one deadline (`shutdown.StopDeadline`), so the
-    whole stop fits in `shutdown.STOP_BUDGET_S`.
+12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app, the source
+    clients, the embedder's HTTP client and the engine closed, and the lock session closed last, which
+    releases the lock; then `worker_shutdown_complete`. Each of its waits takes at most what is left of the
+    stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits in `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
 Each of its steps runs even when an earlier one failed (logged `worker_teardown_failed`; the exit code is then
-1). The watchdog is always stopped before the lock session closes, so closing it never reads as a lost lock.
+1, unless it is the superseded 70). The watchdog is always stopped before the lock session closes, so closing
+it never reads as a lost lock. When the watchdog thread is still alive after that stop (its join timed out
+inside a heartbeat on the lock session), the session is not closed under it: `lock_session_left_open` is
+logged and the process exit drops the socket, and with it the lock.
 
-Exit codes: 0 after a requested shutdown; 1 when a worker loop ended by itself, when the takeover was blocked
-(`takeover_blocked`: a row lock outlived the claim's lock timeout, ruling T13-b) and when the start failed
-(`worker_failed`), so the container restart tries again. The watchdog exits 70, the startup assertions 78.
+Exit codes: 0 after a requested shutdown: a signal's, or the one a superseded worker requests of itself once a
+fence refused its epoch (a task body, the tick, a reconciler cadence, the start's cadence; Ruling T24-a); 1
+when a worker loop ended by itself, when the takeover was blocked (`takeover_blocked`: a row lock outlived the
+claim's lock timeout, ruling T13-b) and when the start failed (`worker_failed`), so the container restart
+tries again. 70 (`lock.WATCHDOG_EXIT_CODE`) means superseded: the watchdog's exit, and a worker whose startup
+sync a newer one fenced out (`worker_superseded_at_start`, Ruling FR-i): the newer worker's claim needed the
+singleton lock, so this one had lost it, the watchdog's condition, and one code holds whichever of the two
+sees it first; the restart stands by while the newer worker is healthy. The startup assertions exit 78.
 
 A loop that ends by itself can be the first sign that this process lost the singleton lock: a zombie (frozen
 while a replacement took over, §18.2 C17) finds its procrastinate workers pruned by the replacement, so its
 next fetch fails, possibly before its watchdog's next heartbeat. Before its teardown, such a process therefore
 runs the heartbeat once more, and when that proves it no longer holds the lock it exits 70 at once, as the
-watchdog would (`worker_lock_lost`).
+watchdog would (`worker_lock_lost`). A zombie whose first sign is a refused epoch fence instead requests its
+own graceful stop (`epoch_superseded`) and exits 0, unless its watchdog's 70 comes first: one of the two
+codes, whichever sees the takeover first.
 
 This module is a task boundary (ruff `BLE001` is allowed here). Each broad catch logs the error class only,
 never a message, and its outcome is the process exit (§17.1). Neither a shutdown nor a failure rewrites any
@@ -47,30 +73,40 @@ import importlib
 import os
 import signal
 import socket
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from typing import Final, NoReturn, Protocol
 
+import httpx
 import procrastinate
 import sqlalchemy as sa
 from procrastinate.exceptions import ConnectorException
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter import __version__
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
+from jobhunter.embeddings import EmbedderClient, make_http_client
+from jobhunter.errors import FencedOut
 from jobhunter.graphs.checkpointer import open_saver
-from jobhunter.graphs.collect.graph import build_noop_collect_graph
+from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
+from jobhunter.graphs.collect.graph import build_collect_graph
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
-from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
+from jobhunter.sources import http
+from jobhunter.sources.base import SourceAdapter
+from jobhunter.sources.instances import InstanceRow, sync_instances
+from jobhunter.sources.ratelimit import SOURCE_LIMITS, RateLimiter
+from jobhunter.sources.registry import build_adapter, make_clients
+from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep, fence_epoch
 from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.lock import WATCHDOG_EXIT_CODE, LockSession, acquire_lock
 from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
-from jobhunter.worker.runtime import ShutdownState, WorkerRuntime
+from jobhunter.worker.runtime import EPOCH_SUPERSEDED, ShutdownState, WorkerRuntime, request_shutdown
 from jobhunter.worker.shutdown import GRACE_S, StopDeadline, coordinate
 from jobhunter.worker.tasks import QUEUES, defer_in_tx, make_queue_app
 from jobhunter.worker.watchdog import Watchdog
@@ -82,7 +118,17 @@ QUEUE_POOL_MAX_SIZE: Final = 4
 EXECUTIONS_CANCEL_S: Final = 30.0
 WATCHDOG_STOP_S: Final = 15.0
 # Imported before the takeover (step 4): importing them registers their sweeps, reconcilers and handlers.
-_REGISTERING_MODULES: Final = ("jobhunter.worker.operations", "jobhunter.worker.runs")
+_REGISTERING_MODULES: Final = (
+    "jobhunter.worker.operations",
+    "jobhunter.worker.runs",
+    "jobhunter.quota.ledger",
+    "jobhunter.availability.rules",
+    "jobhunter.availability.snapshots",
+    "jobhunter.dedup.groups",
+    "jobhunter.scoring.filters",
+    "jobhunter.graphs.collect.nodes.embed",  # through `jobhunter.embeddings`: `awaiting_embedding`
+    "jobhunter.sources.watchlist_validate",
+)
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
 log = get_logger("jobhunter.worker.main")
@@ -126,10 +172,9 @@ def exit_unless_lock_held(
         exit(WATCHDOG_EXIT_CODE)
 
 
-def _request_shutdown(state: ShutdownState, sig: signal.Signals) -> None:
-    if not state.requested.is_set():
-        log.info("shutdown_requested", signal=sig.name)
-    state.requested.set()
+def _on_signal(state: ShutdownState, sig: signal.Signals) -> None:
+    """A SIGTERM or SIGINT asks for the graceful stop, as every request does (`runtime.request_shutdown`)."""
+    request_shutdown(state, reason=sig.name)
 
 
 class _WorkerProcess:
@@ -142,6 +187,8 @@ class _WorkerProcess:
         self.queue: procrastinate.App | None = None  # its `close_async` is a no-op until it is open
         self.watchdog: Watchdog | None = None
         self.saver_scope = AsyncExitStack()
+        self.clients: dict[str, httpx.AsyncClient] = {}  # the source clients (step 7), closed at teardown
+        self.embedder_http: httpx.AsyncClient | None = None
         self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
@@ -180,24 +227,72 @@ class _WorkerProcess:
         # 7. The task app opened, the checkpointer, the collection graph and the runtime.
         await queue.open_async()
         saver = await self.saver_scope.enter_async_context(open_saver(dsn))
+        http.configure(cfg)  # before the clients: in fake mode they must be on the fixture transport
+        clients = self.clients = make_clients(cfg)
+        shutdown = self.shutdown
+        self.embedder_http = make_http_client()
+        embedder = EmbedderClient(cfg.embedder_url, self.embedder_http)
+
+        def adapter_of(instance: InstanceRow) -> SourceAdapter:
+            return build_adapter(instance, cfg, clients)
+
+        deps = CollectDeps(
+            engine=engine,
+            adapters=adapter_of,
+            embedder=embedder,
+            clock=utcnow,
+            sleep=asyncio.sleep,
+            admission_stopped=lambda: shutdown.admission_stopped,
+            limiter=RateLimiter(SOURCE_LIMITS.values(), clock=time.monotonic, sleep=asyncio.sleep),
+            fetch_ctx=FetchContext(),
+        )
         runtime = WorkerRuntime(
             cfg=cfg,
             engine=engine,
             queue=queue,
             saver=saver,
-            collect_graph=build_noop_collect_graph(saver),
+            collect_graph=build_collect_graph(saver, deps),
             epoch=epoch,
-            shutdown=self.shutdown,
+            shutdown=shutdown,
+            embedder=embedder,
         )
-        # 8. The start reconcilers, and the metrics server outside the test env.
-        start = ReconcileContext(engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch)
+
+        # 8. The source instances synced with the secrets under this worker's epoch fence, the start
+        # reconcilers, the metrics server.
+        async def fenced(conn: AsyncConnection) -> None:
+            await fence_epoch(conn, epoch)
+
+        try:
+            async with engine.begin() as conn:
+                await sync_instances(conn, cfg, guard=fenced)
+        except FencedOut as refused:
+            if not refused.worker_superseded:
+                raise  # not this worker's own fence: the start failed (`worker_failed`, exit 1), F5 Minor 1
+            # A newer worker owns the work (`fence_epoch` logged both epochs) and the sync wrote nothing. No
+            # loop has started; the teardown follows (it closes what the start built), then the watchdog's
+            # superseded exit (Ruling FR-i). The restart stands by while that worker is healthy.
+            log.critical("worker_superseded_at_start", epoch=epoch, exit_code=WATCHDOG_EXIT_CODE)
+            return WATCHDOG_EXIT_CODE
+        start = ReconcileContext(
+            engine=engine,
+            queue=queue,
+            defer=defer_in_tx,
+            now=utcnow(),
+            epoch=epoch,
+            embedder=embedder,
+            on_superseded=lambda: request_shutdown(shutdown, reason=EPOCH_SUPERSEDED),
+        )
         await run_reconcilers(start, "start")
+        if shutdown.requested.is_set():
+            # The start cadence was fenced (a newer worker took over after the sync): this worker stopped
+            # itself, as a fenced task body does (Ruling T24-a). No loop starts; the teardown follows, exit 0.
+            return 0
         if cfg.env != "test":
             start_metrics_server(METRICS_PORT)
         # 9. The signal handlers.
         loop = asyncio.get_running_loop()
         for sig in _SHUTDOWN_SIGNALS:
-            loop.add_signal_handler(sig, _request_shutdown, runtime.shutdown, sig)
+            loop.add_signal_handler(sig, _on_signal, runtime.shutdown, sig)
         # 10. One worker loop per queue.
         loops = [
             asyncio.create_task(
@@ -229,11 +324,26 @@ class _WorkerProcess:
         if self.queue is not None:
             await self.queue.close_async()
 
+    async def _close_clients(self) -> None:
+        clients, self.clients = list(self.clients.values()), {}
+        for client in clients:
+            await client.aclose()
+
+    async def _close_embedder(self) -> None:
+        if self.embedder_http is not None:
+            await self.embedder_http.aclose()
+
     async def _dispose_engine(self) -> None:
         if self.engine is not None:
             await self.engine.dispose()
 
     async def _close_lock_session(self) -> None:
+        if self.watchdog is not None and self.watchdog.is_alive():
+            # Its stop timed out joining the thread, which is still in a heartbeat on this very session:
+            # closing the connection under that statement is not safe (M0 carry-forward 5). The process exit
+            # drops the socket, and the server then ends the session and releases the lock.
+            log.warning("lock_session_left_open")
+            return
         self.lock_session.close()
 
     async def teardown(self) -> bool:
@@ -241,8 +351,9 @@ class _WorkerProcess:
 
         Every wait takes at most what is left of the stop's one deadline: the coordinator's, or one that
         starts now when the start failed before it. A step that would wait past it is cut off (`TimeoutError`,
-        logged like any failed step); one that needs no wait still runs. The lock session is closed last,
-        always.
+        logged like any failed step); one that needs no wait still runs. The lock session is the last step,
+        always: it is closed unless the watchdog thread is still alive (`lock_session_left_open`, which is not
+        a failed step).
         """
         deadline = self.shutdown.stop_deadline or StopDeadline.start()
         steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
@@ -250,6 +361,8 @@ class _WorkerProcess:
             ("watchdog", lambda: self._stop_watchdog(deadline.remaining(WATCHDOG_STOP_S))),
             ("saver", lambda: _within(deadline, self.saver_scope.aclose())),
             ("queue", lambda: _within(deadline, self._close_queue())),
+            ("clients", lambda: _within(deadline, self._close_clients())),
+            ("embedder", lambda: _within(deadline, self._close_embedder())),
             ("engine", lambda: _within(deadline, self._dispose_engine())),
             ("lock_session", self._close_lock_session),  # last: closing it releases the lock
         )
@@ -287,7 +400,7 @@ async def worker_main(cfg: AppConfig) -> int:
         code = 1
     finally:
         clean = await process.teardown()
-    if not clean:
+    if not clean and code != WATCHDOG_EXIT_CODE:  # superseded stays 70 (Ruling FR-i)
         code = 1
     log.info("worker_shutdown_complete", exit_code=code)
     return code

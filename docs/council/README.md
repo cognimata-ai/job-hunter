@@ -16,5 +16,13 @@ Three models took part, Claude Opus 5.5, Claude Fable 5.1 and Codex GPT‑6 Astr
 6. **Specification 4-eyes review** ([`spec-reviews/`](spec-reviews/)): six rounds of review of the written spec by Codex and Fable, until both approved revision 3.3.
 7. **M0 final 4-eyes review** ([`m0-final-review/`](m0-final-review/)): a whole-branch review of the M0 implementation by Codex and Fable. Codex rejected it and Fable approved with changes. One fix wave followed, recorded as Deviations 17–28 and the carry-forward list in the M0 plan, and both approved the re-review. The reviews refer to the controller ledger (`.superpowers/sdd/…/progress.md`), which was a git-ignored working file and was deleted once M0 was complete.
 
+8. **M1 plan 4-eyes review** ([`plan-reviews/`](plan-reviews/)): three Codex rounds on the M1 collection-pipeline plan. Round 1 rejected it (2 blockers, 15 major findings), round 2 rejected it on a narrower list, and round 3 approved.
+9. **M1 final 4-eyes review** ([`m1-final-review/`](m1-final-review/)): a whole-branch review of the M1 implementation by Codex and Fable.
+   - First round: Codex rejected it (2 critical, 3 important). The critical findings were a real personal name left in two committed fixtures, and unfenced worker writes at startup and in retention. Fable approved with changes (3 important, 7 minor).
+   - Fixes: seven fix dispatches, each with its own scoped review and re-review. They are recorded as Deviations 51–63, as amendments to earlier Deviations, and in the carry-forward list of the M1 plan.
+   - Re-review: both approved, with all 15 findings fixed. Their remaining minors were applied in the last dispatch or carried forward.
+   - The scrubbed name remains in the feature branch's pre-fix history. It never reached `main`.
+   - The reviews refer to the controller ledger (`.superpowers/sdd/…/progress.md`), a git-ignored working file that is deleted once M1 is complete.
+
 ## Standing rules
 See [`notes.md`](notes.md): Codex GPT‑6 Astra is used only at `high` effort in council and review rounds.

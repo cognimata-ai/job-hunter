@@ -1,0 +1,15 @@
+{
+  "source": "ats",
+  "case": "personio_everphone",
+  "phase": 1,
+  "method": "GET",
+  "url": "https://everphone.jobs.personio.de/xml",
+  "params": {},
+  "fetched_at": "2026-10-18T20:49:47.746720+00:00",
+  "status": 200,
+  "error": null,
+  "duration_ms": 962,
+  "free": false,
+  "body_bytes": 79456,
+  "body_sha256": "[token:7]"
+}

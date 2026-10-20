@@ -21,6 +21,10 @@ dependencies = [
     "structlog==26.1.0",
     "prometheus-client==0.26.0",
     "segno==1.6.6",
+    "nh3==0.3.7",
+    "httpx==0.28.1",
+    "defusedxml==0.7.1",
+    "zstandard==0.25.0",
 ]
 
 [dependency-groups]
@@ -30,8 +34,19 @@ dev = [
     "hypothesis==6.170.0",
     "ruff==0.17.1",
     "mypy==2.4.0",
-    "httpx==0.28.1",
+    "respx==0.23.1",
     "pip-audit==2.10.1",
+]
+# The embedder image only (embedder/Dockerfile: `uv sync --only-group embedder`); never in the app image. The
+# base environment runs tests/embedder without it: embedder/app.py imports onnxruntime, tokenizers and numpy
+# inside OnnxModel only. Runs that load the model add `--group embedder` (spike V7, `-m embedder_model`).
+embedder = [
+    "fastapi==0.143.2",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.1",
+    "onnxruntime==1.31.0",
+    "tokenizers==0.23.3",
+    "numpy==2.5.4",
 ]
 
 [project.scripts]
@@ -54,5 +69,8 @@ markers = [
     "stack: needs the full docker compose stack",
     "slow: takes more than a few seconds",
     "perf: performance measurement, never a correctness assertion",
+    "contract: runs an adapter or the fixture scan on the scrubbed fixtures (tests/contract, spec §18.4)",
+    "live: calls a real provider; never run in CI and deselected by default",
+    "embedder_model: the real model in .model-cache/arctic; run with `uv run --group embedder pytest -m embedder_model`",
 ]
-addopts = "-m 'not stack and not perf'"
+addopts = "-m 'not stack and not perf and not live and not embedder_model'"

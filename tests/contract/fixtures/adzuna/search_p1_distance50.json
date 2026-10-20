@@ -1,0 +1,1535 @@
+{
+  "mean": 80314.79,
+  "__CLASS__": "Adzuna::API::Response::JobSearchResults",
+  "count": 539,
+  "results": [
+    {
+      "category": {
+        "label": "IT-Stellen",
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "id": "5933514068",
+      "adref": "[token:65]",
+      "title": "Senior Software Engineer - Embedded (Go, Python, Linux, C) (f/m/d)",
+      "redirect_url": "https://www.adzuna.de/details/5933514068?utm_medium=scrubbed&utm_source=scrubbed",
+      "company": {
+        "display_name": "Holoplot",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.38046,
+      "latitude": 52.43792,
+      "salary_is_predicted": "0",
+      "contract_time": "full_time",
+      "description": "The product you will work on The HOLOPLOT Matrix Array is a new type of sound system built around precise, software-defined control of audio in three dimensions - grounded in physics and delivered through a combination of custom hardware and software. HOLOPLOT Matrix Arrays are deployed in flagship venues worldwide, including Sphere in Las Vegas - home to the largest audio installation on Earth. Audio processing in HOLOPLOT systems is distributed: every loudspeaker runs embedded Linux, and hund…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Mariendorf"
+        ],
+        "display_name": "Mariendorf, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-18T18:42:17Z"
+    },
+    {
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "ALTEN Consulting Services"
+      },
+      "latitude": 52.51475,
+      "description": "Die ALTEN Consulting Services GmbH bietet mit über 20 Jahren Branchenerfahrung ihren namhaften Kunden aus Industrie und Wirtschaft hochspezialisierte Engineering- und IT-Dienstleistungen zur gemeinsamen Realisierung von branchen- und technologieübergreifenden Lösungen an. Kompetenz, Engagement und Leidenschaft verbinden alle unsere Mitarbeiter der ALTEN Consulting Services GmbH. Dabei stehen ein partnerschaftliches Miteinander, ein starkes WIR-Gefühl, der persönliche Kontakt zu unseren Kunden u…",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Friedrichshain"
+        ],
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Friedrichshain, Berlin"
+      },
+      "created": "2026-10-18T18:23:08Z",
+      "id": "5933486747",
+      "category": {
+        "label": "IT-Stellen",
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5933486747?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Embedded Software Engineer – Rust / C++ &",
+      "adref": "[token:66]",
+      "salary_min": 60000,
+      "longitude": 13.43856,
+      "salary_is_predicted": "0",
+      "contract_time": "full_time",
+      "salary_max": 86000,
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Wenn du dich für Capgemini entscheidest, wählst du ein Unternehmen, in dem du die Möglichkeit hast, deinen Karriereweg selbst zu gestalten. Du wirst von einem kollaborativen Netzwerk von Kolleg\\*innen auf der ganzen Welt unterstützt und inspiriert und kannst neu definieren, was möglich ist. Schließe dich uns an und unterstütze die führenden Organisationen der Welt, den Wert von Technologie zu erschließen und eine nachhaltigere, inklusivere Welt zu gestalten.  Deine Rolle Du möchtest moderne und…",
+      "created": "2026-10-18T10:21:51Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "title": "Software Engineer (w/m/d) - Anwendungsentwicklung, Ingenieur",
+      "redirect_url": "https://www.adzuna.de/details/5933082944?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:67]",
+      "id": "5933082944",
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "graduate-jobs",
+        "label": "Stellen für Hochschulabsolventen"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Capgemini"
+      }
+    },
+    {
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "id": "5933064953",
+      "adref": "[token:68]",
+      "title": "Account Manager",
+      "redirect_url": "https://www.adzuna.de/details/5933064953?utm_medium=scrubbed&utm_source=scrubbed",
+      "longitude": 13.420806,
+      "company": {
+        "display_name": "Arrow Electronics",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "description": "Position: Account Manager Job Description: Since 2000, SiliconExpert (https://www.siliconexpert.com/about/) helps you make better data-driven decisions with a human-driven experience. Over 500 electrical, software and data engineers handcraft our component database of more than one billion parts to deliver the most comprehensive and current tools in the industry. Customers globally use our solutions to manage risk, avoid redesigns, and mitigate obsolescence in innovative industries such as cons…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-18T09:26:42Z"
+    },
+    {
+      "redirect_url": "https://www.adzuna.de/details/5932908203?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Software Engineer KI (all genders)",
+      "adref": "[token:69]",
+      "id": "5932908203",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "company": {
+        "display_name": "adesso",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "adesso steht für IT-Exzellenz und damit auch für exzellente Entwicklungsmöglichkeiten für alle adessi. Wir wachsen gemeinsam und lernen voneinander – an unseren Projekten, im Team und mit herausragenden Trainingsangeboten. Wir haben IT im Herzen, die Branche im Blick und den Erfolg unserer Kunden im Sinn. Denn erfolgreiches Geschäft entsteht durch innovative Ideen, zukunftsfähige Strategien und kluge IT-Lösungen. Immer sind dabei Menschen beteiligt, die etwas bewegen wollen und das einfach mach…",
+      "contract_time": "full_time",
+      "created": "2026-10-18T05:44:54Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      }
+    },
+    {
+      "category": {
+        "label": "Stellen aus PR, Werbung & Marketing",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "pr-advertising-marketing-jobs"
+      },
+      "id": "5932481485",
+      "adref": "[token:70]",
+      "title": "(Senior) Product Analyst, Real Estate & Motors (d/f/m) - 1-year fixed-term contract",
+      "redirect_url": "https://www.adzuna.de/details/5932481485?utm_medium=scrubbed&utm_source=scrubbed",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Kleinanzeigen.de"
+      },
+      "contract_type": "contract",
+      "longitude": 13.420806,
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "description": "Description Kleinanzeigen is the leading online classifieds market in Germany. Users buy and sell on Germany's No. 1 for classifieds mainly second-hand. In this way they make an active contribution to more sustainability. On average, more than 55 million ads are available in numerous categories – from children's supplies to electronics and real estate. Kleinanzeigen also offers small and medium-sized businesses the opportunity to present their services online. Around 35 million users per month …",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-17T19:10:14Z"
+    },
+    {
+      "redirect_url": "https://www.adzuna.de/details/5932449071?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Systemadministrator (w_m_d) - Automatisierung und Cloud-Infrastruktur",
+      "adref": "[token:71]",
+      "id": "5932449071",
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown",
+        "label": "Unknown"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.39407,
+      "longitude": 13.10641,
+      "company": {
+        "display_name": "GFZ Helmholtz-Zentrum für Geoforschung",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Das GFZ Helmholtz-Zentrum für Geoforschung zählt zu den weltweit führenden Forschungseinrichtungen im Bereich der Geowissenschaften. Als Teil der Helmholtz-Gemeinschaft, der größten Wissenschaftsorganisation Deutschlands, widmen wir uns globalen Herausforderungen wie Naturgefahren, dem Klimawandel und der nachhaltigen Nutzung natürlicher Ressourcen. Dabei verbinden wir exzellente Forschung mit gesellschaftlicher Relevanz. Unsere internationale Gemeinschaft aus rund 1.200 Mitarbeitenden und ca. …",
+      "contract_time": "full_time",
+      "created": "2026-10-17T18:45:03Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Potsdam, Brandenburg",
+        "area": [
+          "Deutschland",
+          "Brandenburg",
+          "Potsdam"
+        ]
+      }
+    },
+    {
+      "created": "2026-10-17T18:44:33Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "description": "THE ROLE & THE TEAM As a Senior Applied Scientist, you will be part of an expert team of software engineers and applied scientists working towards keeping the delivery time promise for all Zalando customers. In this role you will translate real-world problems into mathematical models, and design algorithms that solve these models. Beyond the algorithmic challenges, a significant part of your role will be creation and maintenance of the software systems required to run these algorithms. Here, yo…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Zalando"
+      },
+      "adref": "[token:72]",
+      "redirect_url": "https://www.adzuna.de/details/5932448834?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Applied Scientist - Warehouse Fulfillment Quality Algorithms (all genders)",
+      "category": {
+        "label": "Stellen aus Logistik & Lagerhaltung",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "logistics-warehouse-jobs"
+      },
+      "id": "5932448834"
+    },
+    {
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-17T13:08:36Z",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Job Description We are on the lookout for a Software Engineer II to join the Content Quality team within our Quick Commerce department. We own how millions of customers interact with our product content in real time - the accuracy, completeness, and trustworthiness of the products behind our dark stores and local-shop partners around the globe (groceries, pharmaceuticals, flowers, and more). As a Software Engineer II, you won't just write code: you'll own real production services, help shape ho…",
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Delivery Hero"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "id": "5932028657",
+      "category": {
+        "label": "IT-Stellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5932028657?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Software Engineer II, Content Quality - Quick Commerce",
+      "adref": "[token:73]"
+    },
+    {
+      "description": "Lead Analytics Engineer (F/M/X) Full remote · Europe · Product & Engineering  Who are we? In 2017, after more than ten years in the lift industry across Europe and Asia, [person:1] noticed a system stuck in its ways, where speed takes priority over quality and frontline teams remain invisible. With [person:2] , he founded WeMaintain to put technology and trust back into building maintenance, and the people doing the work back at the centre of it. Their ambition: give technicians back thei…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-17T02:57:22Z",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "id": "5931340604",
+      "adref": "[token:74]",
+      "redirect_url": "https://www.adzuna.de/details/5931340604?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Lead Analytics Engineer (F/M/X)",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "WeMaintain"
+      },
+      "longitude": 13.420806,
+      "latitude": 52.507706,
+      "salary_is_predicted": "0"
+    },
+    {
+      "title": ".NET Software Engineer (Backend)",
+      "redirect_url": "https://www.adzuna.de/details/5931145892?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:75]",
+      "id": "5931145892",
+      "category": {
+        "label": "IT-Stellen",
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "company": {
+        "display_name": "Vattenfall",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Stellenbeschreibung Du bist auf der Suche nach neuen beruflichen Herausforderungen und möchtest zeitgleich etwas zu einer Fossilfreien Zukunft beitragen? Unsere Aufgabe im Bereich Customer IT der Vattenfall IT ist es, digitale Lösungen und Produkte zu entwickeln und zu betreiben, die es unseren Geschäftseinheiten ermöglichen unser gemeinsames Ziel zu erreichen: Fossilfreies Leben innerhalb einer Generation! Eine wesentliche Voraussetzung zur Erreichung dieses Ziels ist die Optimierung und Digit…",
+      "created": "2026-10-17T01:05:49Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland"
+      }
+    },
+    {
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Vattenfall"
+      },
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "category": {
+        "label": "IT-Stellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs"
+      },
+      "id": "5931040273",
+      "adref": "[token:76]",
+      "title": ".NET Software Engineer (Backend)",
+      "redirect_url": "https://www.adzuna.de/details/5931040273?utm_medium=scrubbed&utm_source=scrubbed",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-16T20:10:34Z",
+      "description": "Wir bei Vattenfall arbeiten an der Energiewende und brauchen hierfür Menschen, die sich mit ganzer Kraft für unsere Kund:innen und eine nachhaltige Gesellschaft engagieren – Menschen wie Sie. Wir sind ein führendes Energieunternehmen in Europa mit rund 21.000 Mitarbeitenden. Seit mehr als 100 Jahren elektrifizieren wir Industrien, versorgen Menschen mit Energie und modernisieren unseren Lebensstil durch Innovation und Zusammenarbeit. Aufgaben Du bist auf der Suche nach neuen beruflichen Herausf…",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Statista"
+      },
+      "longitude": 13.420806,
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "id": "5930997678",
+      "category": {
+        "label": "Unknown",
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "title": "Engineering Manager - Data Platform (m/f/d)",
+      "redirect_url": "https://www.adzuna.de/details/5930997678?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:77]",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland"
+      },
+      "created": "2026-10-16T19:23:58Z",
+      "contract_time": "full_time",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "At Statista , we’re all about facts and data, for we are the world's leading business data platform. By providing reliable and easy-to-use data as well as various data analytics products and services, we empower people worldwide to make fact-based decisions. Founded in Hamburg in 2007, we have quickly grown into a global company with offices in major cities such as London, New York, Berlin and Tokyo. And we still have a lot of plans. Our constant growth does not only prove our success, but also…"
+    },
+    {
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "contract_type": "contract",
+      "company": {
+        "display_name": "Taktile",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "adref": "[token:78]",
+      "redirect_url": "https://www.adzuna.de/details/5930951799?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Software Engineer Internship for HPI Students",
+      "category": {
+        "label": "IT-Stellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs"
+      },
+      "id": "5930951799",
+      "created": "2026-10-16T18:45:00Z",
+      "location": {
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "description": "About the role Banks and fintechs use Taktile to automate critical decisions, like credit, fraud, and compliance, in real time. We're building the infrastructure that makes financial institutions truly AI-native, and we've partnered with the Hasso Plattner Institute (HPI), a leading computer science institute in Europe, to offer a dedicated opportunity designed only for HPI students. Starting in April 2027, you'll join one of our engineering teams for 6 months in Berlin and ship real features, …",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-16T18:36:31Z",
+      "contract_time": "full_time",
+      "description": "THE ROLE & THE TEAM As a Senior Software Engineer - Carrier Platform, you will constantly improve our delivery and returns proposition to bridge the last mile for our customers to get the right package to the right customers at the right time. The team is responsible for managing the platform to provide delivery and returns products, including tracking. Your focus will be to deliver a high-performance, stable, auto-scaling system and you will have a direct impact on our customers’ happiness. We…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "longitude": 13.420806,
+      "company": {
+        "display_name": "Zalando",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "category": {
+        "label": "IT-Stellen",
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "id": "5930926307",
+      "adref": "[token:79]",
+      "redirect_url": "https://www.adzuna.de/details/5930926307?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Software Engineer- Carrier Platform (All Genders)"
+    },
+    {
+      "adref": "[token:80]",
+      "redirect_url": "https://www.adzuna.de/details/5930920023?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Principal Software Engineer - Real-Time Voice",
+      "category": {
+        "label": "IT-Stellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs"
+      },
+      "id": "5930920023",
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "longitude": 13.420806,
+      "company": {
+        "display_name": "Parloa",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "description": "About Parloa Parloa’s mission is to make every customer conversation feel effortless for both customers and the companies serving them. As agentic AI accelerates, Parloans are shaping the foundation of a new era in customer experience, one where customer support is no longer transactions, but meaningful exchanges. It is not just a vision; Parloa has powered over ONE BILLION interactions between global enterprise brands and their customers, with companies like Booking.com , HealthEquity, Allianz…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "created": "2026-10-16T18:34:32Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland"
+      }
+    },
+    {
+      "redirect_url": "https://www.adzuna.de/details/5930843850?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Software Engineer (Data/ML) - all genders",
+      "adref": "[token:81]",
+      "id": "5930843850",
+      "category": {
+        "label": "IT-Stellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs"
+      },
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "company": {
+        "display_name": "Zalando",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "THE ROLE & THE TEAM As a Senior Software Engineer (Data/ML) in the Pricing Platform department, you will be responsible for building cutting-edge algorithmic pricing solutions that are essential for optimising profit and managing the stock risk across all articles on the Zalando platform. You will make these products reliable in production. You will build the data, software, deployment, and monitoring foundations that allow models to move safely from experimentation into daily commercial use. T…",
+      "contract_time": "full_time",
+      "created": "2026-10-16T18:06:41Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      }
+    },
+    {
+      "created": "2026-10-16T15:41:57Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "description": "Wir bei Vattenfall arbeiten an der Energiewende und brauchen hierfür Menschen, die sich mit ganzer Kraft für unsere Kund:innen und eine nachhaltige Gesellschaft engagieren – Menschen wie Sie. Wir sind ein führendes Energieunternehmen in Europa mit rund 21.000 Mitarbeitenden. Seit mehr als 100 Jahren elektrifizieren wir Industrien, versorgen Menschen mit Energie und modernisieren unseren Lebensstil durch Innovation und Zusammenarbeit. JLFT1_DE",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "company": {
+        "display_name": "Vattenfall",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "adref": "[token:82]",
+      "redirect_url": "https://www.adzuna.de/land/ad/5930678664?se=[token:83]&utm_medium=scrubbed&utm_source=scrubbed&v=[token:29]",
+      "title": ".NET Software Engineer (Backend)",
+      "category": {
+        "label": "Sonstige/Allgemeine Stellen",
+        "tag": "other-general-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "id": "5930678664"
+    },
+    {
+      "title": "System­administrator (w_m_d) – Automatisierung und Cloud-Infrastruktur",
+      "redirect_url": "https://www.adzuna.de/land/ad/5929754872?se=[token:83]&utm_medium=scrubbed&utm_source=scrubbed&v=[token:84]",
+      "adref": "[token:85]",
+      "id": "5929754872",
+      "category": {
+        "label": "Sonstige/Allgemeine Stellen",
+        "tag": "other-general-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "latitude": 52.39407,
+      "salary_is_predicted": "0",
+      "company": {
+        "display_name": "Helmholtz-Zentrum für Geoforschung",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.10641,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Das GFZ Helmholtz-Zentrum für Geoforschung zählt zu den weltweit führenden Forschungs­einrichtungen im Bereich der Geowissen­schaften. Als Teil der Helmholtz-Gemeinschaft, der größten Wissen­schafts­organisation Deutschlands, widmen wir uns globalen Heraus­forderungen wie Naturgefahren, dem Klima­wandel und der nachhaltigen Nutzung natürlicher Ressourcen. Dabei verbinden wir exzellente Forschung mit gesell­schaftlicher Relevanz. Unsere internationale Gemeinschaft aus rund 1.200 Mitarbeitenden u…",
+      "created": "2026-10-16T03:47:45Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Potsdam, Brandenburg",
+        "area": [
+          "Deutschland",
+          "Brandenburg",
+          "Potsdam"
+        ]
+      }
+    },
+    {
+      "latitude": 52.4984,
+      "salary_is_predicted": "0",
+      "contract_type": "permanent",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "LiveEO GmbH"
+      },
+      "longitude": 13.396,
+      "adref": "[token:86]",
+      "title": "Senior DevOps / Platform Engineer - Secure Infrastructure (f/m/d)",
+      "redirect_url": "https://www.adzuna.de/details/5929715902?utm_medium=scrubbed&utm_source=scrubbed",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "id": "5929715902",
+      "created": "2026-10-16T03:39:32Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Kreuzberg, Berlin",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "description": "Build the Market Leader in Satellite Analytics with us at LiveEO We are looking for a Senior DevOps / Platform Engineer (f/m/x) to build and run secure infrastructure for customers with high requirements on confidentiality, isolation and control, including public-sector and critical-infrastructure organisations. You will build and operate our secure environments across cloud and on-premises, make our products deployable in isolated customer environments, and help our engineers ship models and s…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time"
+    },
+    {
+      "description": "Senior Fullstack Engineer (F/M/X) Full remote - Europe - Product & Engineering  Who are we? In 2017, after more than ten years in the lift industry across Europe and Asia, [person:1] noticed a system stuck in its ways where speed takes priority over quality and frontline teams remain invisible. With [person:2] , he founded WeMaintain to put technology, trust and people back at the heart of building maintenance. Their ambition: give technicians back their autonomy, rely on in-house IoT tec…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "created": "2026-10-16T02:55:47Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "adref": "[token:87]",
+      "redirect_url": "https://www.adzuna.de/details/5929639648?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Fullstack Engineer (F/M/X)",
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "id": "5929639648",
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "WeMaintain"
+      },
+      "longitude": 13.420806
+    },
+    {
+      "longitude": 13.10641,
+      "company": {
+        "display_name": "Helmholtz-Zentrum für Geoforschung",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.39407,
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "id": "5929343714",
+      "adref": "[token:88]",
+      "redirect_url": "https://www.adzuna.de/details/5929343714?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "System­administrator (w_m_d) – Automatisierung und Cloud-Infrastruktur",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Potsdam, Brandenburg",
+        "area": [
+          "Deutschland",
+          "Brandenburg",
+          "Potsdam"
+        ]
+      },
+      "created": "2026-10-15T20:25:53Z",
+      "description": "Das GFZ Helmholtz-Zentrum für Geoforschung zählt zu den weltweit führenden Forschungs­einrichtungen im Bereich der Geowissen­schaften. Als Teil der Helmholtz-Gemeinschaft, der größten Wissen­schafts­organisation Deutschlands, widmen wir uns globalen Heraus­forderungen wie Naturgefahren, dem Klima­wandel und der nachhaltigen Nutzung natürlicher Ressourcen. Dabei verbinden wir exzellente Forschung mit gesell­schaftlicher Relevanz. Unsere internationale Gemeinschaft aus rund 1.200 Mitarbeitenden u…",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "redirect_url": "https://www.adzuna.de/details/5929259859?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "R&D Laser Engineer (Laser & Spectrometer Development, Prototyping)",
+      "adref": "[token:89]",
+      "id": "5929259859",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.4363,
+      "longitude": 13.5501,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Quantune Technologies"
+      },
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Your mission You are at the core of our Laser R&D labs. You take ownership for developing new laser generations, for building prototypes, and for defining their scalable manufacturing routes. You design and perform suitable assembly steps from the bare chip to a fully functional spectrometer. You build our first prototypes and help scale their manufacturing. Development, prototyping and manufacturing of EC-QCL setups with advanced optical components. Responsibility for wire bonding, die bonding…",
+      "contract_time": "full_time",
+      "created": "2026-10-15T18:53:44Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Adlershof"
+        ],
+        "display_name": "Adlershof, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      }
+    },
+    {
+      "description": "This isn’t your regular job. Almedia is a place where those who want to push harder can accelerate their careers faster than anywhere else. We’re aiming to become Germany’s second bootstrapped unicorn. Almedia is already Europe’s 3 fastest-growing company in 2025 (FT1000). We are building the future of marketing by rewarding our community of over 95 million users for engaging with our advertisers’ products. We are offering a new way to acquire users for the biggest companies in the world. Berli…",
+      "created": "2026-10-15T18:39:04Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "latitude": 52.507706,
+      "company": {
+        "display_name": "Almedia",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "salary_max": 85000,
+      "redirect_url": "https://www.adzuna.de/details/5929232959?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Junior Engineer (Typescript / Python / DevOps / AI)",
+      "adref": "[token:90]",
+      "id": "5929232959",
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "salary_is_predicted": "0",
+      "salary_min": 65000,
+      "longitude": 13.420806
+    },
+    {
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Quantune Technologies"
+      },
+      "longitude": 13.5501,
+      "latitude": 52.4363,
+      "salary_is_predicted": "0",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "id": "5929229575",
+      "adref": "[token:91]",
+      "title": "R&D Sensor Engineer (Photoacoustics Development, Prototyping)",
+      "redirect_url": "https://www.adzuna.de/details/5929229575?utm_medium=scrubbed&utm_source=scrubbed",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Adlershof, Berlin",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Adlershof"
+        ]
+      },
+      "created": "2026-10-15T18:35:06Z",
+      "contract_time": "full_time",
+      "description": "Your mission You are at the core of our Sensor R&D labs. You take ownership for developing new photoacoustic sensor generations from the sketch to integration into a fully functional laser spectrometer, for building prototypes, and for defining their scalable manufacturing routes. Development, prototyping and manufacturing of photoacoustic sensors. Responsibility for bonding, glueing and soldering processes. Definition of SOPs for assembly, optical alignment, packaging and quality control. Char…",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "company": {
+        "display_name": "GFZ Helmholtz-Zentrum für Geoforschung",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.10641,
+      "salary_is_predicted": "0",
+      "latitude": 52.39407,
+      "id": "5929199395",
+      "category": {
+        "label": "Unknown",
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5929199395?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "System­administrator (w_m_d) – Automatisierung und Cloud-Infrastruktur - Inklusiver Job   ",
+      "adref": "[token:92]",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Brandenburg",
+          "Potsdam"
+        ],
+        "display_name": "Potsdam, Brandenburg",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-15T18:19:33Z",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Deutsches Helmholtz GeoForschungs-Zentrum Das GFZ Helmholtz-Zentrum für Geoforschung zählt zu den weltweit führenden Forschungs­einrichtungen im Bereich der Geowissen­schaften. Als Teil der Helmholtz-Gemeinschaft, der größten Wissen­schafts­organisation Deutschlands, widmen wir uns globalen Heraus­forderungen wie Naturgefahren, dem Klima­wandel und der nachhaltigen Nutzung natürlicher Ressourcen. Dabei verbinden wir exzellente Forschung mit gesell­schaftlicher Relevanz. Unsere internationale Ge…"
+    },
+    {
+      "adref": "[token:93]",
+      "title": "Hardware Engineer / Electronics Engineer (System Integration / Mixed Signal Design for Wearables)",
+      "redirect_url": "https://www.adzuna.de/details/5929183727?utm_medium=scrubbed&utm_source=scrubbed",
+      "category": {
+        "label": "Stellen aus Kreation & Design",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "creative-design-jobs"
+      },
+      "id": "5929183727",
+      "latitude": 52.4363,
+      "salary_is_predicted": "0",
+      "longitude": 13.5501,
+      "company": {
+        "display_name": "Quantune Technologies",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "description": "Your mission You take ownership for system integration and improving heat / power management of our battery-driven laser electronics in close collaboration with the R&D Team. You design and miniaturize mixed signal circuitry in close alignment with our Digital Hardware & Embedded Software Team. This will expand into integrating analog signal blocks into our current ASIC designs. You routinely design helper PCB boards and carry out electrical characterization and soldering jobs. You are embedded…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "created": "2026-10-15T18:10:12Z",
+      "location": {
+        "display_name": "Adlershof, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Adlershof"
+        ]
+      }
+    },
+    {
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown",
+        "label": "Unknown"
+      },
+      "id": "5929169784",
+      "adref": "[token:94]",
+      "title": "Java-Entwickler (m/w/d)",
+      "redirect_url": "https://www.adzuna.de/details/5929169784?utm_medium=scrubbed&utm_source=scrubbed",
+      "company": {
+        "display_name": "FindYou Consulting GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "contract_time": "full_time",
+      "description": " Digitalisiere das Rückgrat des Welthandels und die technologische Souveränität Deutschlands im Large-Scale Projekt.  Zum Unternehmen: ​​​​​​​Unser Kunde ist einer der führenden deutschen IT-Dienstleister mit über 25 Jahren Erfolgsgeschichte und einer außergewöhnlich hohen Mitarbeiterbindung. Als strategischer Partner der öffentlichen Verwaltung verantwortet das Unternehmen die Entwicklung und den Betrieb der kritischsten IT-Verfahren der Bundesrepublik. In diesem speziellen Geschäftsbereich ar…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-15T17:45:54Z"
+    },
+    {
+      "created": "2026-10-15T17:45:45Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Kreuzberg, Berlin",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "description": "Intro px dynamics is a small quantitative trading firm in Berlin and Cologne. We are four people. We trade European short-term power markets systematically, on our own account, and we sell trading signals to a few trading desks. We build and run everything ourselves: the data, the models, the execution and the servers. We are looking for one more person to research and run trading strategies with us. The problem What we try to understand is price formation in a physical system. The European pow…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "latitude": 52.4984,
+      "salary_is_predicted": "0",
+      "longitude": 13.396,
+      "company": {
+        "display_name": "px dynamics GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "adref": "[token:95]",
+      "redirect_url": "https://www.adzuna.de/details/5929169047?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Quant (m/w/d)",
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "id": "5929169047"
+    },
+    {
+      "created": "2026-10-15T13:20:59Z",
+      "location": {
+        "display_name": "Kreuzberg, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "description": "Deine Mission About Wallround Wallround is headquartered in Berlin, with additional locations in Hamburg, Frankfurt am Main, Munich, Friedrichshafen and NRW. Our mission: we turn energy-efficient retrofits for multi-family residential buildings into predictable, lucrative investment opportunities. When it comes to modernisations, the real estate market is often a black box of rough estimates and fragmented processes. We are changing that. Through our integrated platform and streamlined workflow…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "latitude": 52.4984,
+      "salary_is_predicted": "0",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Wallround GmbH"
+      },
+      "longitude": 13.396,
+      "adref": "[token:96]",
+      "redirect_url": "https://www.adzuna.de/details/5928937056?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "AI Senior Software Engineer",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "id": "5928937056"
+    },
+    {
+      "longitude": 13.396,
+      "company": {
+        "display_name": "Wallround GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.4984,
+      "id": "5928922237",
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "title": "AI Lead Product Manager - German Speaker",
+      "redirect_url": "https://www.adzuna.de/details/5928922237?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:97]",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Kreuzberg, Berlin",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "created": "2026-10-15T13:18:53Z",
+      "contract_time": "full_time",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Deine Mission About Wallround Wallround is headquartered in Berlin, with additional locations in Hamburg, Frankfurt am Main, Munich, Friedrichshafen and NRW. Our mission: we turn energy-efficient retrofits for multi-family residential buildings into predictable, lucrative investment opportunities. When it comes to modernisations, the real estate market is often a black box of rough estimates and fragmented processes. We are changing that. Through our integrated platform and streamlined workflow…"
+    },
+    {
+      "salary_is_predicted": "0",
+      "latitude": 52.4984,
+      "company": {
+        "display_name": "Wallround GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.396,
+      "adref": "[token:98]",
+      "title": "Senior Software Automation Engineer - Low-Code",
+      "redirect_url": "https://www.adzuna.de/details/5928908455?utm_medium=scrubbed&utm_source=scrubbed",
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown",
+        "label": "Unknown"
+      },
+      "id": "5928908455",
+      "created": "2026-10-15T13:16:03Z",
+      "location": {
+        "display_name": "Kreuzberg, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "description": "Deine Mission About Wallround Wallround is headquartered in Berlin, with additional locations in Hamburg, Frankfurt am Main, Munich, Friedrichshafen, and NRW. Our mission: we turn energy-efficient retrofits for multi-family residential buildings into predictable, lucrative investment opportunities. When it comes to modernisations, the real estate market is often a black box of rough estimates and fragmented processes. We are changing that. Through our integrated platform and streamlined workflo…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time"
+    },
+    {
+      "latitude": 52.53261,
+      "salary_is_predicted": "0",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "RoboService GmbH"
+      },
+      "longitude": 13.3777,
+      "adref": "[token:99]",
+      "redirect_url": "https://www.adzuna.de/details/5928754150?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Robotics Software Engineer (Junior / Mid-Level)",
+      "category": {
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "IT-Stellen"
+      },
+      "id": "5928754150",
+      "created": "2026-10-15T11:49:43Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Wedding"
+        ],
+        "display_name": "Wedding, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "description": "About RoboService GmbH RoboService GmbH brings humanoid robots to industrial facilities. We program robotics applications that work on the manufacturing lines of European manufacturing companies. Your first months at RoboService GmbH You will be working hands on with humanoid robots. As a robotics engineer, you will work on the software that automates real manufacturing tasks. Embedded in an interdisciplinary team of engineers, you will be working on specific automation projects, as well as the…",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "created": "2026-10-15T11:49:42Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Wedding"
+        ],
+        "display_name": "Wedding, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "description": "About RoboService GmbH RoboService GmbH brings humanoid robots to industrial facilities. We program robotics applications that work on the manufacturing lines of European manufacturing companies. Your first months at RoboService GmbH You will be working hands on with humanoid robots. As a senior robotics engineer, your task is to architect and implement robotics applications for our clients. You will work in a team among the best robotic talents. You will be able to take on responsibility for t…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "latitude": 52.53261,
+      "salary_is_predicted": "0",
+      "longitude": 13.3777,
+      "company": {
+        "display_name": "RoboService GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "adref": "[token:100]",
+      "title": "Robotics Software Engineer (Senior)",
+      "redirect_url": "https://www.adzuna.de/details/5928754022?utm_medium=scrubbed&utm_source=scrubbed",
+      "category": {
+        "label": "IT-Stellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs"
+      },
+      "id": "5928754022"
+    },
+    {
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Amazon"
+      },
+      "longitude": 13.420806,
+      "adref": "[token:101]",
+      "title": "Software Development Engineer - 2026",
+      "redirect_url": "https://www.adzuna.de/details/5928660777?utm_medium=scrubbed&utm_source=scrubbed",
+      "category": {
+        "label": "Unknown",
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "id": "5928660777",
+      "created": "2026-10-15T09:31:38Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "description": "Description Do you want to solve real customer problems through innovative technology? Do you enjoy working on scalable services in a collaborative team environment? Do you want to see your code directly impact millions of customers worldwide? At Amazon, we hire the best minds in technology to innovate and build on behalf of our customers. Customer obsession is part of our company DNA, which has made us one of the world's most beloved brands. Our Software Development Engineers (SDEs) use modern…",
+      "__CLASS__": "Adzuna::API::Response::Job"
+    },
+    {
+      "salary_max": 75000,
+      "contract_time": "full_time",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "salary_min": 55000,
+      "longitude": 13.396,
+      "salary_is_predicted": "0",
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs",
+        "label": "IT-Stellen"
+      },
+      "id": "5928572530",
+      "adref": "[token:102]",
+      "title": "Senior Software Engineer (all genders) - Berlin",
+      "redirect_url": "https://www.adzuna.de/details/5928572530?utm_medium=scrubbed&utm_source=scrubbed",
+      "location": {
+        "display_name": "Kreuzberg, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "created": "2026-10-15T07:52:25Z",
+      "description": "Salary: 55.000 - 75.000 € per year Requirements: Leadership & Ownership: Du verfügst über ca. 5 Jahre praktische Erfahrung in der Software-Entwicklung und übernimmst Verantwortung für die erfolgreiche Umsetzung anspruchsvoller Softwareprojekte. Je nach Projektkontext bringst Du Dich beispielsweise in Themen aus Backend, Frontend, DevOps oder AI Engineering ein. Communication: Du besitzt sehr gute Deutsch- und Englischkenntnisse (mind. C1-Niveau) und kannst komplexe technische Zusammenhänge adre…",
+      "company": {
+        "display_name": "XITASO GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "latitude": 52.4984
+    },
+    {
+      "description": "Salary: 60.000 - 65.000 € per year Requirements: High quality standards: while moving fast, you still care deeply about code quality and architectural soundness of the product. Fluency with AI-assisted / agentic development: hands-on experience driving tools like Claude Code to build real, non-trivial features, plus the discipline to review and verify their output rigorously. Strong 3D graphics engineering with Three.js / WebGL: scene, camera & projection math, raycasting/picking, mesh/BufferGe…",
+      "created": "2026-10-15T07:52:25Z",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ],
+        "display_name": "Kreuzberg, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "latitude": 52.4984,
+      "company": {
+        "display_name": "20° GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "salary_max": 65000,
+      "title": "(Senior) Full-Stack Software Engineer (m/w/d)",
+      "redirect_url": "https://www.adzuna.de/details/5928572535?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:103]",
+      "id": "5928572535",
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs",
+        "label": "IT-Stellen"
+      },
+      "salary_is_predicted": "0",
+      "longitude": 13.396,
+      "salary_min": 60000
+    },
+    {
+      "latitude": 52.53261,
+      "company": {
+        "display_name": "WhyBrilliant GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "description": "Also searchable as: Robotics Hardware Engineer · Mechatronics Engineer · Robotics Mechatronics Engineer · Electromechanical Engineer - Robotics Original title: Hardware Engineer – Robotic Hand (m/f/d) WhyBrilliant is sourcing applicants for this role on behalf of a Berlin-based deep-tech robotics startup. The company's identity may stay confidential until first contact. Atlas, our AI Recruiter, is running this search and will pick the best candidates from Nova's network. The next step is to spe…",
+      "created": "2026-10-15T06:29:57Z",
+      "location": {
+        "display_name": "Wedding, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Wedding"
+        ]
+      },
+      "redirect_url": "https://www.adzuna.de/details/5928509532?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Hardware Engineer – Robotic Hand (m/f/d)",
+      "adref": "[token:104]",
+      "id": "5928509532",
+      "category": {
+        "tag": "engineering-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Technikerstellen"
+      },
+      "salary_is_predicted": "0",
+      "longitude": 13.3777,
+      "salary_min": 65000,
+      "contract_type": "permanent",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "salary_max": 80000
+    },
+    {
+      "id": "5928509242",
+      "category": {
+        "label": "Technikerstellen",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "engineering-jobs"
+      },
+      "title": "System Integrator / Software Engineer – Robotic Hand (m/f/d)",
+      "redirect_url": "https://www.adzuna.de/details/5928509242?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:105]",
+      "contract_type": "permanent",
+      "longitude": 13.3777,
+      "salary_min": 70000,
+      "salary_is_predicted": "0",
+      "contract_time": "full_time",
+      "salary_max": 85000,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "company": {
+        "display_name": "WhyBrilliant GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "latitude": 52.53261,
+      "description": "Also searchable as: Robotics Software Engineer · Robotic Manipulation Engineer · Robotics Systems Engineer · Robotics Controls Engineer Original title: System Integrator / Software Engineer – Robotic Hand (m/f/d) WhyBrilliant is sourcing applicants for this role on behalf of an early-stage Berlin-based deep-tech robotics startup. The company's identity may stay confidential until first contact. Atlas, our AI Recruiter, is running this search and will pick the best candidates from Nova's network…",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Wedding"
+        ],
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Wedding, Berlin"
+      },
+      "created": "2026-10-15T06:29:55Z"
+    },
+    {
+      "created": "2026-10-15T03:41:34Z",
+      "location": {
+        "display_name": "Kreuzberg, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "description": "Deine Mission About Wallround Wallround is headquartered in Berlin, with additional locations in Hamburg, Frankfurt am Main, Munich, Friedrichshafen, and NRW. Our mission: we turn energy-efficient retrofits for multi-family residential buildings into predictable, lucrative investment opportunities. When it comes to modernisations, the real estate market is often a black box of rough estimates and fragmented processes. We are changing that. Through our integrated platform and streamlined workflo…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "contract_time": "full_time",
+      "salary_is_predicted": "0",
+      "latitude": 52.4984,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Wallround GmbH"
+      },
+      "contract_type": "permanent",
+      "longitude": 13.396,
+      "adref": "[token:106]",
+      "title": "Senior Software Automation Engineer - Low-Code",
+      "redirect_url": "https://www.adzuna.de/details/5928294213?utm_medium=scrubbed&utm_source=scrubbed",
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "id": "5928294213"
+    },
+    {
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ],
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Kreuzberg, Berlin"
+      },
+      "created": "2026-10-15T03:38:39Z",
+      "contract_time": "full_time",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Deine Mission About Wallround Wallround is headquartered in Berlin, with additional locations in Hamburg, Frankfurt am Main, Munich, Friedrichshafen and NRW. Our mission: we turn energy-efficient retrofits for multi-family residential buildings into predictable, lucrative investment opportunities. When it comes to modernisations, the real estate market is often a black box of rough estimates and fragmented processes. We are changing that. Through our integrated platform and streamlined workflow…",
+      "longitude": 13.396,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Wallround GmbH"
+      },
+      "contract_type": "permanent",
+      "latitude": 52.4984,
+      "salary_is_predicted": "0",
+      "id": "5928276712",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5928276712?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "AI Senior Software Engineer",
+      "adref": "[token:107]"
+    },
+    {
+      "company": {
+        "display_name": "prefix.dev GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.3777,
+      "salary_min": 68000,
+      "latitude": 52.53261,
+      "salary_is_predicted": "0",
+      "id": "5928024699",
+      "category": {
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "IT-Stellen"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5928024699?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Software engineer, AI model supply chain and package security",
+      "adref": "[token:108]",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Wedding"
+        ],
+        "display_name": "Wedding, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-14T23:48:13Z",
+      "salary_max": 88000,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "We build fast, modern developer tools in Rust, and a surprising amount of serious software runs on them. Pixi, rattler and rattler-build are open source and used by hundreds of thousands of developers: quant teams in finance, physicists at CERN, biotech labs, and humanoid robot companies you've probably seen videos of. We are also core maintainers of conda-forge, one of the largest open source package ecosystems, and we maintain RoboStack, which gets ROS running on any OS from a single lockfile…"
+    },
+    {
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs",
+        "label": "IT-Stellen"
+      },
+      "id": "5927925394",
+      "adref": "[token:109]",
+      "title": "Senior Software Engineer (all genders) - ZEOS",
+      "redirect_url": "https://www.adzuna.de/details/5927925394?utm_medium=scrubbed&utm_source=scrubbed",
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Zalando"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "contract_time": "full_time",
+      "description": "THE ROLE & THE TEAM The ZEOS Outbound team handles article liquidation and return of articles to merchants. As a Senior Software Engineer, you will join an agile, cross-functional team dedicated to building the high-performance services that power our partner-facing products. We work in an API-first environment where we turn complex business logic into scalable, reliable software. In this role, you will work alongside Software Engineers and Product Managers to implement new features and evolve …",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ],
+        "display_name": "Berlin, Deutschland",
+        "__CLASS__": "Adzuna::API::Response::Location"
+      },
+      "created": "2026-10-14T19:55:17Z"
+    },
+    {
+      "title": "Senior Software Engineer, K4B",
+      "redirect_url": "https://www.adzuna.de/details/5927828184?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:110]",
+      "id": "5927828184",
+      "category": {
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "it-jobs",
+        "label": "IT-Stellen"
+      },
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "longitude": 13.420806,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Kayak"
+      },
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "KAYAK, part of Booking Holdings (NASDAQ: BKNG), is the world's leading travel search engine. With billions of queries across our platforms, we help people find their perfect flight, stay, rental car and vacation package. We're also transforming business travel with a new corporate travel solution, KAYAK for Business. As an employee of KAYAK, you will be part of a travel company that operates a portfolio of global metasearch brands including momondo, Cheapflights and HotelsCombined, among others…",
+      "contract_time": "full_time",
+      "created": "2026-10-14T19:15:10Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      }
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Job Description We are expanding our Product organization and are looking for an impact-driven (Associate) Product Manager (m/f/x) to join our Onboarding and Client Data domain. In this role, you will help shape the foundations of the client’s relationship with Scalable. This includes seamless onboarding, keeping important client information up to date, managing statuses and blocks, and reliably handling key lifecycle events. Throughout the recruitment process, we will explore your strengths, t…",
+      "created": "2026-10-14T19:14:13Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "title": "(Associate) Product Manager - Client Data & Onboarding (m/f/x)",
+      "redirect_url": "https://www.adzuna.de/details/5927825279?utm_medium=scrubbed&utm_source=scrubbed",
+      "adref": "[token:111]",
+      "id": "5927825279",
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.507706,
+      "company": {
+        "display_name": "Scalable GmbH",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "SoundCloud empowers artists, tastemakers and fans to connect and share through music. Founded in 2007, SoundCloud is a creator-first platform helping artists build and grow their careers by providing them with the most advanced tools, services, and resources. With over 4x the music catalog of every other major streaming platform, spanning 40 million artists across 190 countries, SoundCloud is where emerging artists find their sound, hidden gems are discovered, and music culture is shaped in rea…",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      },
+      "created": "2026-10-14T18:57:28Z",
+      "id": "5927786745",
+      "category": {
+        "tag": "it-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "IT-Stellen"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5927786745?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Backend Engineer - Media Streaming",
+      "adref": "[token:112]",
+      "company": {
+        "display_name": "SoundCloud",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "longitude": 13.420806,
+      "salary_is_predicted": "0",
+      "latitude": 52.507706
+    },
+    {
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Kreuzberg, Berlin",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Kreuzberg"
+        ]
+      },
+      "created": "2026-10-14T17:43:47Z",
+      "contract_time": "full_time",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "The Role: Our growing team is looking for a senior software engineer to lead the evolution of the infrastructure that turns our science into trustworthy climate results. In this role, you'll own the platform that takes our data, models and estimation methods from R&D to auditable client deliverables, and you'll be a trusted reviewer and guide across software and data engineering. As a small team, you'll also shape how we build our geospatial pipelines and internal analytics. We're looking for s…",
+      "longitude": 13.396,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Seqana GmbH"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.4984,
+      "id": "5927684301",
+      "category": {
+        "tag": "unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "label": "Unknown"
+      },
+      "redirect_url": "https://www.adzuna.de/details/5927684301?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior Software Engineer (Data & Platform)",
+      "adref": "[token:113]"
+    },
+    {
+      "location": {
+        "display_name": "Wedding, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Wedding"
+        ]
+      },
+      "created": "2026-10-14T17:43:44Z",
+      "contract_time": "full_time",
+      "description": "Dein Plus bei vitaservices Greenfield: Du baust unseren AI-Coding-Stack von Grund auf – kein Legacy-Setup, keine Altlasten Volle Gestaltungshoheit über Werkzeuge, Architektur und Prozess 30 Tage Urlaub Mobile Office Möglichkeit zum Arbeiten im europäischen Ausland Betriebliche Altersvorsorge Flexible Arbeitszeiten JobRad: Fahrrad-Leasing zur beruflichen und privaten Nutzung Attraktive MitarbeiterInnen-Rabatte Offene Feedback-Kultur und individuelle Weiterbildung Interdisziplinäre Aufgaben Agile…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "longitude": 13.3777,
+      "company": {
+        "display_name": "Vitaservices GmbH & Co. KG",
+        "__CLASS__": "Adzuna::API::Response::Company"
+      },
+      "salary_is_predicted": "0",
+      "latitude": 52.53261,
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "id": "5927683940",
+      "adref": "[token:114]",
+      "redirect_url": "https://www.adzuna.de/details/5927683940?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "AI-Native Software Engineer (m/w/d)"
+    },
+    {
+      "redirect_url": "https://www.adzuna.de/details/5927550932?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "Senior AI Software Engineer (all genders) in Berlin - PRODYNA SE",
+      "adref": "[token:115]",
+      "id": "5927550932",
+      "category": {
+        "label": "Unknown",
+        "__CLASS__": "Adzuna::API::Response::Category",
+        "tag": "unknown"
+      },
+      "latitude": 52.507706,
+      "salary_is_predicted": "0",
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "PRODYNA SE"
+      },
+      "longitude": 13.420806,
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "description": "Bist du auf der Suche nach einem Arbeitsplatz, an dem positive Einstellung und Teamgeist groß geschrieben werden? Wir validieren und implementieren neue Technologien und entwickeln maßgeschneiderte Lösungen für unsere Kunden. Wir setzen uns für eine Kultur der Innovation und der Integration neuer Technologien ein. Wir sind mutig, wenn es darum geht, für die beste Lösung einzutreten und ehrlich zu unseren Kunden und Kollegen. Wir legen Wert auf Teamwork und Zusammenarbeit und glauben, dass unser…",
+      "contract_time": "full_time",
+      "created": "2026-10-14T15:19:36Z",
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Berlin, Deutschland",
+        "area": [
+          "Deutschland",
+          "Berlin"
+        ]
+      }
+    },
+    {
+      "salary_max": 120000,
+      "description": "Dein Plus bei vitaservices Greenfield: Du baust unseren AI-Coding-Stack von Grund auf – kein Legacy-Setup, keine Altlasten Volle Gestaltungshoheit über Werkzeuge, Architektur und Prozess 30 Tage Urlaub Mobile Office Möglichkeit zum Arbeiten im europäischen Ausland Betriebliche Altersvorsorge Flexible Arbeitszeiten JobRad: Fahrrad-Leasing zur beruflichen und privaten Nutzung Attraktive MitarbeiterInnen-Rabatte Offene Feedback-Kultur und individuelle Weiterbildung Interdisziplinäre Aufgaben Agile…",
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "location": {
+        "display_name": "Wedding, Berlin",
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "area": [
+          "Deutschland",
+          "Berlin",
+          "Wedding"
+        ]
+      },
+      "created": "2026-10-14T11:47:52Z",
+      "category": {
+        "label": "Stellen aus Gesundheitswesen & Pflege",
+        "tag": "healthcare-nursing-jobs",
+        "__CLASS__": "Adzuna::API::Response::Category"
+      },
+      "id": "5927230714",
+      "adref": "[token:116]",
+      "redirect_url": "https://www.adzuna.de/details/5927230714?utm_medium=scrubbed&utm_source=scrubbed",
+      "title": "AI-Native Software Engineer (m/w/d)",
+      "salary_min": 110000,
+      "company": {
+        "__CLASS__": "Adzuna::API::Response::Company",
+        "display_name": "Vitaservices GmbH & Co. KG"
+      },
+      "longitude": 13.3777,
+      "latitude": 52.53261,
+      "salary_is_predicted": "0"
+    }
+  ]
+}

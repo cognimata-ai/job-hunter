@@ -3,9 +3,15 @@
 `create_app()` builds the FastAPI app, its routers, exception handlers, per-session rate limiter
 (`SessionRateLimiter`) and Argon2 admission gate (`argon2_gate.Argon2Gate`), and wraps it in `EdgeMiddleware`.
 It touches no configuration, engine or queue: the lifespan builds all of that from the configuration it loads
-(`startup_or_exit("api")`, then the task app, the log level, the engine, the code head and, outside the test
-env, the metrics server on port 8001). With `cfg` and `engine` injected (tests), the state, the task app
-included, is set at once and the lifespan does nothing; the caller owns and disposes that engine.
+(`startup_or_exit("api")`, then the task app, the log level, the engine, the code head, the embedder client
+and, outside the test env, the metrics server on port 8001). With `cfg` and `engine` injected (tests), the
+state, the task app included, is set at once and the lifespan does nothing; the caller owns and disposes that
+engine.
+
+The embedder client (Task 22) is an `embeddings.EmbedderClient` on `cfg.embedder_url`, which readiness and
+system health probe. The lifespan's HTTP client is closed when the lifespan ends. An injected app (tests) gets
+one of its own on the injected `cfg`, which nothing closes: the tests' fake embedder closes every connection
+after its answer, so the client holds none open.
 
 The task app: `defer_in_tx` defers through the process-global `tasks.task_app()`, which the first
 `make_queue_app` call of the process creates and registers; building `make_queue_app(cfg.dsn("psycopg"))` here
@@ -21,6 +27,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Final
 
+import httpx
 from fastapi import APIRouter, FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.types import Receive, Scope, Send
@@ -34,6 +41,7 @@ from jobhunter.api.routes import auth, health, runs, system
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.session import make_engine
+from jobhunter.embeddings import EmbedderClient, make_http_client
 from jobhunter.observability.logging import configure_logging
 from jobhunter.observability.metrics import start_metrics_server
 from jobhunter.worker.tasks import make_queue_app
@@ -108,19 +116,26 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
     queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: from the config the lifespan loads
     configure_logging(cfg.log_level)  # ruling T14-b
     engine = make_engine(cfg, pool_size=ENGINE_POOL_SIZE)
+    embedder_http: httpx.AsyncClient | None = None
     try:
         api.state.code_head = code_head()
         if cfg.env != "test":
             start_metrics_server(METRICS_PORT)
+        embedder_http = make_http_client()
         api.state.cfg = cfg
         api.state.engine = engine
         api.state.queue = queue
+        api.state.embedder = EmbedderClient(cfg.embedder_url, embedder_http)
         yield
     finally:
         try:
             await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
         finally:
-            await engine.dispose()
+            try:
+                if embedder_http is not None:
+                    await embedder_http.aclose()
+            finally:
+                await engine.dispose()
 
 
 def _state_config(api: FastAPI) -> AppConfig | None:
@@ -168,6 +183,7 @@ def create_app(
         api.state.engine = engine
         api.state.code_head = code_head()
         api.state.queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: built, not opened
+        api.state.embedder = EmbedderClient(cfg.embedder_url, make_http_client())
     edge = EdgeMiddleware(api, config=lambda: _state_config(api), engine=lambda: _state_engine(api))
     return JobHunterApp(api, edge)
 

@@ -17,7 +17,7 @@ from jobhunter.auth import users
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, Role
 from jobhunter.db.migrate import run_migrate
-from jobhunter.db.seed import anchor_utc_for, latest_slot_at_or_before
+from jobhunter.db.seed import DEFAULT_INSTANCES_SQL, anchor_utc_for, latest_slot_at_or_before
 from jobhunter.db.session import make_engine
 from jobhunter.observability import redact
 from jobhunter.observability.logging import configure_logging
@@ -26,17 +26,27 @@ from jobhunter.worker.lock import ADVISORY_LOCK_KEY, LockSession, acquire_lock
 from jobhunter.worker.tasks import make_queue_app
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.embedder import FakeEmbedder
 from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_pg_server, start_pg_server
 from tests.support.procs import ProcessGroup, wait_until
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
 # Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
-# configuration chain, `active_config` and `ranking_state` are kept, `schedule_state` is reset (below), and so
-# is `checkpoint_migrations`: the checkpointer reads it to know its schema is set up.
+# configuration chain, `active_config`, `ranking_state` and `sources` are kept (`reset_database` restores the
+# first three to their seeded state), `schedule_state` is reset (below), and so is `checkpoint_migrations`:
+# the checkpointer reads it to know its schema is set up. `source_instances` is named on purpose: CASCADE
+# empties it anyway with `watchlist_companies` and `ats_snapshots`, so `reset_database` inserts the default
+# instances again.
 _TRUNCATE: Final = (
     "TRUNCATE runs, run_attempts, operations, sessions, login_attempts, login_lockouts, api_idempotency, "
     "alerts, purge_fences, worker_heartbeat, users, procrastinate_jobs, procrastinate_periodic_defers, "
-    "procrastinate_workers, checkpoints, checkpoint_writes, checkpoint_blobs CASCADE"
+    "procrastinate_workers, checkpoints, checkpoint_writes, checkpoint_blobs, "
+    "watchlist_companies, source_instances, queries, coverage_cells, coverage_intervals, fetch_requests, "
+    "raw_responses, raw_items, ats_snapshots, ats_snapshot_members, ats_snapshot_absences, quota_windows, "
+    "quota_ledger, postings, posting_observations, jobs, job_revisions, job_revision_occurrences, "
+    "job_revision_sources, ad_keys, ad_key_sources, merge_events, identity_conflicts, duplicate_groups, "
+    "duplicate_group_members, dedup_decisions, job_tombstones, tombstone_keys, embeddings, "
+    "hard_filter_results CASCADE"
 )
 
 
@@ -94,23 +104,35 @@ def fresh_pg_server(tmp_path: Path) -> Iterator[PgServer]:
         remove_pg_server(server)
 
 
+def _fake_embedder_url(request: pytest.FixtureRequest) -> str:
+    """The base URL of the session's fake embedder (started on first use)."""
+    server: FakeEmbedder = request.getfixturevalue("fake_embedder_server")
+    return server.base_url
+
+
 @pytest.fixture
 def make_config(request: pytest.FixtureRequest) -> ConfigFactory:
-    """`make_config(role, server=None, **env)`: the `AppConfig` of `role`, by default against `pg_server`."""
+    """`make_config(role, server=None, **env)`: the `AppConfig` of `role`, by default against `pg_server`.
+
+    Its embedder is the session's fake embedder (`JOBHUNTER_EMBEDDER_URL`, Task 22), unless `env` names one.
+    """
 
     def make(role: Role, server: PgServer | None = None, **env: str) -> AppConfig:
         # Resolved only when no server is given, so a test with its own server does not start the shared one.
-        return config_for(server or request.getfixturevalue("pg_server"), role, **env)
+        pg = server or request.getfixturevalue("pg_server")
+        return config_for(pg, role, embedder_url=_fake_embedder_url(request), **env)
 
     return make
 
 
 @pytest.fixture
 def proc_env(request: pytest.FixtureRequest) -> ProcessEnvFactory:
-    """`proc_env(role, server=None, **extra)`: the environment of a child process of `role`."""
+    """`proc_env(role, server=None, **extra)`: the environment of a child process of `role`, whose embedder
+    is the session's fake embedder (Task 22)."""
 
     def make(role: Role, server: PgServer | None = None, **extra: str) -> dict[str, str]:
-        return process_env(server or request.getfixturevalue("pg_server"), role, **extra)
+        pg = server or request.getfixturevalue("pg_server")
+        return process_env(pg, role, embedder_url=_fake_embedder_url(request), **extra)
 
     return make
 
@@ -124,22 +146,47 @@ ON CONFLICT (id) DO UPDATE SET
   anchor_utc = EXCLUDED.anchor_utc, interval_s = EXCLUDED.interval_s, enabled = true,
   last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
   updated_at = now()"""
+# Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds and the
+# pointers M2 sets left NULL (the pending scope, the profile, the rubric, the prompt schema and the tuple).
+_ACTIVE_CONFIG_RESET: Final = """\
+UPDATE active_config SET settings_version_id = v.id, scope_version_id = v.scope_version_id,
+  model_policy_id = v.model_policy_id, execution_config_id = v.execution_config_id,
+  evaluation_policy_id = v.evaluation_policy_id, pending_scope_version_id = NULL, profile_version_id = NULL,
+  rubric_version_id = NULL, prompt_schema_version_id = NULL, llm_tuple_id = NULL, updated_at = now()
+  FROM settings_versions v WHERE v.version_no = 1"""
+# Run after every row that references a newer version points at version 1 again (`schedule_state`'s FK is
+# immediate), in this order.
+_CONFIGURATION_RESET: Final = (
+    "DELETE FROM settings_versions WHERE version_no > 1",
+    "DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)",
+    "UPDATE ranking_state SET generation = 0, updated_at = now()",
+)
 
 
 def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> None:
-    """Return the tables of `_TRUNCATE` to empty and `schedule_state` to its seeded row, in one transaction.
+    """Empty the tables of `_TRUNCATE` and restore the seeded configuration, in one transaction.
 
     The TRUNCATE waits for the locks of any transaction a test leaked; after `lock_timeout` it fails with
     SQLSTATE 55P03 instead of hanging the suite.
 
+    In this order: the TRUNCATE; the `default` source instances inserted again with the seed's own statement
+    (their ids change with every reset, so tests look them up by `(source_id, instance_key)`); `active_config`
+    as the seed wrote it (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, every M2 pointer NULL);
+    the schedule reset; then
+    the settings versions after 1 and the scope versions no settings version uses deleted, and the ranking
+    generation set to 0.
+
     The schedule keeps the interval and the anchor that `migrate` seeded: both come from the stored settings
     version 1 (the anchor on the day that version was created, as the seed computes it), not from constants
-    here. Its `last_evaluated_slot` is the latest slot at or before the database's `now()`, and it is enabled.
+    here. Its `last_evaluated_slot` is the latest slot at or before the database's `now()`, it is enabled, and
+    it points at version 1.
     """
     # The block commits when it ends and closes the connection.
     with psycopg.connect(server.dsn("migrator")) as conn:
         conn.execute("SELECT set_config('lock_timeout', %s, true)", (lock_timeout,))
         conn.execute(_TRUNCATE)
+        conn.execute(DEFAULT_INSTANCES_SQL)
+        conn.execute(_ACTIVE_CONFIG_RESET)
         stored = conn.execute(
             "SELECT payload, created_at FROM settings_versions WHERE version_no = 1"
         ).fetchone()
@@ -153,6 +200,8 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         )
         slot = latest_slot_at_or_before(anchor, interval_s, db_now[0])
         conn.execute(_SCHEDULE_RESET, {"anchor": anchor, "interval_s": interval_s, "slot": slot})
+        for statement in _CONFIGURATION_RESET:
+            conn.execute(statement)
 
 
 @pytest.fixture
@@ -250,6 +299,12 @@ def current_epoch(clean_db: None, migrated: PgServer) -> int:
     """
     pg_one(migrated, "app", _EPOCH_1_IS_CURRENT)
     return 1
+
+
+@pytest.fixture
+def worker_lock_heartbeat(current_epoch: int) -> None:
+    """A fresh `worker_heartbeat` row (the one `current_epoch` records), so readiness's `worker_heartbeat`
+    probe passes for the next 60 s (Task 22)."""
 
 
 @pytest.fixture
