@@ -275,7 +275,7 @@ The paths follow §4.2 for the M2 subset. Modules that §4.2 does not list are m
     - `profile_drafts`:
       - the §7.16.8 edges, verbatim, every one: `uploaded→extracting_text`, `uploaded→extracting_profile`, `extracting_text→text_review`, `extracting_text→failed`, `text_review→extracting_profile`, `extracting_profile→ready`, `extracting_profile→failed`, `ready→text_review`, `ready→confirmed`, `text_review→discarded`, `ready→discarded`, `failed→discarded`, `failed→extracting_profile`;
       - `reason_col="status_reason"`, `changed_at` `status_changed_at` on every edge;
-      - settable: `reviewed_text`, `reviewed_text_sha256`, `native_pdf`, `transmitted_text_sha256`, `draft_json`, `validation_issues`, `failure_code`, `llm_call_id`, `confirmed_profile_version_id`, `confirm_response`, `updated_at`.
+      - settable: `reviewed_text`, `reviewed_text_sha256`, `native_pdf`, `transmitted_text_sha256`, `draft_json`, `validation_issues`, `failure_code`, `llm_call_id`, `confirmed_profile_version_id`, `confirm_response`, `content_purged_at`, `updated_at`.
       - "ready ──field edits──► ready" is a plain `UPDATE` of `draft_json`, not a transition.
     - `llm_spend_ledger`: `reserved→dispatched`, `reserved→not_billed`, `dispatched→billed`, `dispatched→not_billed`, `dispatched→ambiguous`, `ambiguous→billed`, `ambiguous→not_billed` (§7.16.7; M3's batches use the last two, and M2's late online settlement uses them too, Deviation 24); `reason_col="evidence"`; `dispatched→dispatched_at`; every settled state `→settled_at`; settable `settled_usd`.
     - `llm_calls`: `reserved→dispatched`, `reserved→cancelled`, `dispatched→completed`, `dispatched→error`, `dispatched→ambiguous`, plus `ambiguous→completed` and `ambiguous→error` for a late online settlement (Deviation 24); settable: every usage, response and `output_json` column of §7.11.
@@ -1125,6 +1125,7 @@ Also cover:
   - `POST /api/profile/drafts/{id}/retry` (Idempotency-Key) with `{mode: "llm" | "native_pdf", ack_native_pdf?: bool}`, from `failed` only:
     - `native_pdf` requires `ack_native_pdf: true` (else 422 `validation_failed`), a PDF file, and a draft failed with `low_text` or an LLM failure code (else 409 `conflict_state`);
     - it sets `cv_files.native_pdf_opt_in := true`, `extraction_method := 'native_pdf'` and the draft's `native_pdf := true`.
+    - The reopening transition (`failed → extracting_profile`) also sets `content_purged_at := NULL` when it is set. A native retry is admitted after the content purge as long as the file remains, and it generates new content, which must then purge again 30 days after the draft next ends.
     - **Input still there** (§20.1 purges a failed draft's file and content 30 days after it failed). The route takes the draft `FOR UPDATE`, then its `cv_files` row `FOR SHARE`, the order the retention rules use. `mode="llm"` needs `content_purged_at IS NULL` (its `reviewed_text`), or a PDF file not purged for a native draft. `mode="native_pdf"` needs the file. Without its input, the route gives 409 `conflict_state` with the detail "The CV was deleted after 30 days; upload or paste it again", and nothing changes: no transition and no operation.
     - It returns 202.
   - `POST /api/profile/drafts/{id}/discard` → 204, from `text_review`, `ready` or `failed`.
@@ -1151,6 +1152,7 @@ Also cover:
 - the text edits remove and restore;
 - `ready → text` editing discards `draft_json`;
 - a retry of a draft whose content or file was purged gives 409 `conflict_state`, and creates no operation;
+- a native retry of a draft whose content was purged but whose file remains reopens it with `content_purged_at` NULL;
 - approve stores the sha256 and creates exactly one operation, and a repeat with the same key returns the stored 202;
 - `PUT` of the draft revalidates;
 - discard;
@@ -1751,6 +1753,7 @@ Also cover, in `test_profile_confirm.py`:
     - `test_retention_and_retry_are_serialised`, both orders, for a native-PDF draft `failed('refused')` 31 days ago:
       - a retry with `mode="llm"` that commits first reopens the draft, and the batch then skips its file and content;
       - a batch paused at `retention.cv_files.after_select` holds the draft lock, the concurrent retry waits, and after the purge commits the retry gives 409 `conflict_state` with no operation created;
+    - `test_regenerated_content_is_purged_again`: a native-PDF draft `failed` 31 days ago; the `draft_content` batch commits, and a successful native retry follows before the file batch runs. The draft reaches `ready` and is discarded, and 30 days later the new `draft_json` and the new call's `output_json` are purged;
     - `test_retention_and_reactivation_are_serialised`, both orders:
       - a confirm reusing V1 that commits before the batch starts keeps V1's file;
       - a batch paused at `retention.cv_files.after_select`, holding V1 as a candidate, makes a concurrent confirm reusing V1 wait on `active_config` (`tests/support/pg.lock_waits`); after the batch commits and the confirm proceeds, no unlink happens after the confirm's commit;
