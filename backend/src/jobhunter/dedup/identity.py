@@ -40,7 +40,12 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    `observed_at`; when `t > availability_changed_at`, the absence reset (also only after `first_absent_at`)
    and the revival of a `stale`, `unknown` or `closed` posting through `transition()` (a `closed` one logs
    `posting_reopened`), with `availability_changed_at := t` (Ruling T18-d, a plan deviation: the sighting's
-   own time, so later receipts compare `t > availability_changed_at` in one time domain).
+   own time, so later receipts compare `t > availability_changed_at` in one time domain). An observation
+   of a SmartRecruiters detail call (its response's request is a `detail` one) also sets the posting's
+   change markers of §5.3.5, which the traversal's `detail_specs` reads: `list_item_sha256`, the
+   `item_sha256` of the posting's list item on the detail call's parent list page (`element_sha256` of its
+   element, the hash `detail_specs` compares), and `detail_fetched_at = t`. Both move together and only
+   forward (`detail_fetched_at < t`), so an older observation resolved later never moves them back.
 5. **Keys, then provenance**: the missing `ad_keys` rows owned by the decided job (`ON CONFLICT DO NOTHING`:
    ownership never changes here), then the `ad_key_sources` rows of the posting.
 6. **Merges or the conflict**: `merge.merge_jobs(strong_key_merge, recompute=False, locked=<the rows of
@@ -107,7 +112,13 @@ _PLACEHOLDER_ID: Final = 0  # the posting and observation ids of the view a new 
 _ITEM: Final = q(
     "SELECT i.disposition, i.normalized, r.fetched_at, r.body_sha256, r.source_instance_id, s.source_id, "
     "w.display_name AS watchlist_display, "
-    "(SELECT o.id FROM posting_observations o WHERE o.raw_item_id = i.id) AS observation_id "
+    "(SELECT o.id FROM posting_observations o WHERE o.raw_item_id = i.id) AS observation_id, "
+    # a SmartRecruiters detail observation: its list item on the parent list page (the first, as
+    # `detail_specs` reads it), whose `item_sha256` is the posting's change marker (§5.3.5)
+    "(SELECT l.item_sha256 FROM fetch_requests f JOIN fetch_requests p ON p.id = f.parent_fetch_request_id "
+    "JOIN raw_items l ON l.raw_response_id = p.raw_response_id WHERE f.id = r.fetch_request_id "
+    "AND f.operation = 'detail' AND l.native_id = i.native_id ORDER BY l.item_index LIMIT 1) "
+    "AS list_item_sha256 "
     "FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
     "JOIN source_instances s ON s.id = r.source_instance_id "
     "LEFT JOIN watchlist_companies w ON w.id = s.watchlist_company_id WHERE i.id = :item"
@@ -171,6 +182,11 @@ _INSERT_OBSERVATION: Final = q(
     jsonb=["normalized"],
 )
 _FIRST_LATEST: Final = q("UPDATE postings SET latest_observation_id = :observation WHERE id = :posting")
+# The SmartRecruiters change markers of a detail observation (§5.3.5), together and only forward.
+_DETAIL_MARKERS: Final = q(
+    "UPDATE postings SET list_item_sha256 = :sha, detail_fetched_at = :t WHERE id = :posting "
+    "AND (detail_fetched_at IS NULL OR detail_fetched_at < :t)"
+)
 _INSERT_KEY: Final = q(
     "INSERT INTO ad_keys (key_ns, key_value, exclusive, job_id) VALUES (:ns, :value, :exclusive, :job) "
     "ON CONFLICT (key_ns, key_value) DO NOTHING"
@@ -267,6 +283,7 @@ class _Item:
     source_instance_id: int
     source_id: str
     watchlist_display: str | None
+    list_item_sha256: bytes | None  # a SmartRecruiters detail observation's list-item marker (§5.3.5)
 
 
 def _exclusive_conflicts(
@@ -523,6 +540,9 @@ async def _link(
         await conn.execute(_FIRST_LATEST, {"posting": posting_id, "observation": observation_id})
     else:
         await rules.apply_sighting(conn, posting_id, observed_at=item.t, observation_id=observation_id)
+    if item.list_item_sha256 is not None:
+        markers = {"posting": posting_id, "sha": item.list_item_sha256, "t": item.t}
+        await conn.execute(_DETAIL_MARKERS, markers)
 
     if keys:
         await conn.execute(
@@ -619,6 +639,7 @@ async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> 
         source_instance_id=int(row.source_instance_id),
         source_id=row.source_id,
         watchlist_display=row.watchlist_display,
+        list_item_sha256=None if row.list_item_sha256 is None else bytes(row.list_item_sha256),
     )
     return await _link(conn, owner, item, scopes)
 

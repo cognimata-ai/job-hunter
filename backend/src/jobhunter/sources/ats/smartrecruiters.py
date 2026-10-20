@@ -16,7 +16,9 @@ its detail alone (the full description is in `jobAd.sections`). `detail_specs` p
 list item whose posting is new, whose list item changed (`list_item_sha256`, `element_sha256` of the
 item's element, the sha256 of its canonical JSON: the `postings.list_item_sha256` marker) or whose last
 detail call is older than `DETAIL_MAX_AGE`, at the `SMARTRECRUITERS_DETAIL` limit (concurrency 4, 5 per
-second). A list item positively outside Germany and not remote is `OutOfScope("not_germany")` and gets no
+second). Identity writes both markers when it resolves a detail observation: the list item's
+`raw_items.item_sha256` (the same `element_sha256`) and the detail's `fetched_at` (`dedup/identity.py`).
+A list item positively outside Germany and not remote is `OutOfScope("not_germany")` and gets no
 detail call: its structured `location.country` is another country's code (without one, every place
 `location.fullLocation` names lies outside Germany, §8.12). Every other list item is
 `OutOfScope("detail_call")`: the list page is not where it is normalised.

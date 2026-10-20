@@ -10,6 +10,7 @@ import pytest
 import respx
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.seed import canonical_json
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes.fetch import (
@@ -18,8 +19,10 @@ from jobhunter.graphs.collect.nodes.fetch import (
     make_fetch_cell,
     traverse_and_record,
 )
+from jobhunter.graphs.collect.nodes.parse_normalize import make_parse_normalize
 from jobhunter.graphs.collect.nodes.plan import make_plan
 from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback
+from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.metrics import REGISTRY
 from jobhunter.sources import acquire, traverse
@@ -29,7 +32,9 @@ from jobhunter.sources.adzuna import AdzunaAdapter
 from jobhunter.sources.arbeitnow import FEED_URL, ArbeitnowAdapter
 from jobhunter.sources.ats import adapter_for
 from jobhunter.sources.ats.smartrecruiters import SmartRecruitersAdapter
+from jobhunter.sources.base import element_sha256
 from jobhunter.sources.breaker import record_failure
+from jobhunter.sources.fixtures import fixture_transport
 from jobhunter.sources.instances import InstanceRow, list_instances
 from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL
 from jobhunter.sources.serpapi import SerpApiAdapter
@@ -49,7 +54,7 @@ from tests.support.collect import (
 )
 from tests.support.faults import PausePoint
 from tests.support.quota import SIX_H, insert_window, jsearch_window
-from tests.support.sources import Adapters, load_fixture, served_requests
+from tests.support.sources import Adapters, fixture_variant, load_fixture, served_requests
 
 pytestmark = pytest.mark.integration
 GAPS = sa.text(
@@ -742,3 +747,84 @@ async def test_detail_acquisitions_never_run_more_than_the_gate_admits(
         (fid,) = await plan_ids(deps, owner)
         await traverse_and_record(deps, fid)
     assert (made[0], peak[0]) == (10, SMARTRECRUITERS_DETAIL.concurrency)
+
+
+# ---- final review F3 --------------------------------------------------------------------------------------
+
+DETAIL_MARKERS = sa.text(
+    "SELECT p.native_id, p.list_item_sha256, p.detail_fetched_at, "
+    "(SELECT max(r.fetched_at) FROM raw_responses r JOIN fetch_requests f ON f.id = r.fetch_request_id "
+    "WHERE f.operation = 'detail' AND f.detail_native_id = p.native_id) AS detailed_at "
+    "FROM postings p WHERE p.source_instance_id = :i ORDER BY p.native_id"
+)
+
+
+async def detail_markers(engine: AsyncEngine, instance: int) -> dict[str, tuple[bytes, datetime]]:
+    """The change markers of the instance's postings by native id: `(list_item_sha256, detail_fetched_at)`,
+    where `detail_fetched_at` must be the arrival of the posting's latest detail response."""
+    async with engine.connect() as c:
+        found = (await c.execute(DETAIL_MARKERS, {"i": instance})).all()
+    assert all(r.detail_fetched_at == r.detailed_at for r in found)
+    return {r.native_id: (bytes(r.list_item_sha256), r.detail_fetched_at) for r in found}
+
+
+async def test_smartrecruiters_details_are_fetched_again_only_when_new_changed_or_older_than_seven_days(
+    engine, current_epoch, tmp_path, fixture_log
+) -> None:
+    """§5.3.5 (final review F3, Important A): identity writes the change markers of a detail
+    observation (the list item's `element_sha256` and the detail's fetch time), so a second run of an
+    unchanged board makes no detail call; a changed list item, and a detail older than 7 days, are fetched
+    again. The board is served by the fixture transport over a copy of the recordings whose first two
+    postings are in Germany (the two with recorded details)."""
+    await seed_inputs(engine, companies=(("smartrecruiters", "DeliveryHero"),), enabled=("ats",))
+    fixtures = fixture_variant(tmp_path, "ats", {})
+    listing = json.loads(load_fixture("ats", "smartrecruiters_deliveryhero_list")[2])
+    berlin = {"city": "Berlin", "country": "de", "remote": False, "fullLocation": "Berlin, Germany"}
+    for item in listing["content"][:2]:
+        item["location"] = berlin
+
+    def serve(doc: dict[str, Any]) -> None:
+        (fixtures / "ats" / "smartrecruiters_deliveryhero_list.json").write_text(json.dumps(doc), "utf-8")
+
+    def marker(index: int) -> bytes:
+        return element_sha256(canonical_json(listing["content"][index]))
+
+    serve(listing)
+    first, second = (str(item["id"]) for item in listing["content"][:2])
+    async with engine.connect() as c:
+        board = next(i for i in await list_instances(c) if i.source_id == "smartrecruiters")
+    async with httpx.AsyncClient(transport=fixture_transport(fixtures, log_path=fixture_log)) as client:
+        adapter = adapter_for(board, client, clock=utcnow)
+        deps = make_deps(engine, lambda instance: adapter)
+
+        async def run(clock=utcnow) -> list[str]:
+            """One run of the board (plan, traverse on `clock`, parse, resolve); the detail cases it sent."""
+            sent = len(served_requests(fixture_log))
+            owner = await queued_run(engine, include_paid=False)
+            state = initial_state(owner.run_id, owner.attempt_no)
+            (fid,) = await plan_ids(deps, owner)
+            await traverse_and_record(replace(deps, clock=clock), fid)
+            await make_parse_normalize(deps)(state)
+            await make_resolve_identity(deps)(state)
+            await finish(engine, owner)
+            return sorted(r["case"] for r in served_requests(fixture_log)[sent:] if "_detail_" in r["case"])
+
+        details = ["smartrecruiters_deliveryhero_detail_1", "smartrecruiters_deliveryhero_detail_2"]
+        assert await run() == details  # new postings
+        markers = await detail_markers(engine, board.id)
+        assert {native_id: sha for native_id, (sha, _) in markers.items()} == {
+            first: marker(0),
+            second: marker(1),
+        }
+        assert await run() == []  # unchanged and fresh: no detail call
+        listing["content"][1]["name"] = f"{listing['content'][1]['name']} (updated)"
+        serve(listing)
+        assert await run() == details[1:]  # the changed list item only
+        changed = await detail_markers(engine, board.id)
+        assert {native_id: sha for native_id, (sha, _) in changed.items()} == {
+            first: marker(0),
+            second: marker(1),
+        }
+        assert changed[first][1] == markers[first][1]
+        assert changed[second][1] > markers[second][1]  # the hash and the time moved forward together
+        assert await run(lambda: utcnow() + timedelta(days=8)) == details  # older than 7 days
