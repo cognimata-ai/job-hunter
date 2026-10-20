@@ -1125,6 +1125,7 @@ Also cover:
   - `POST /api/profile/drafts/{id}/retry` (Idempotency-Key) with `{mode: "llm" | "native_pdf", ack_native_pdf?: bool}`, from `failed` only:
     - `native_pdf` requires `ack_native_pdf: true` (else 422 `validation_failed`), a PDF file, and a draft failed with `low_text` or an LLM failure code (else 409 `conflict_state`);
     - it sets `cv_files.native_pdf_opt_in := true`, `extraction_method := 'native_pdf'` and the draft's `native_pdf := true`.
+    - **Input still there** (§20.1 purges a failed draft's file and content 30 days after it failed). The route takes the draft `FOR UPDATE`, then its `cv_files` row `FOR SHARE`, the order the retention rules use. `mode="llm"` needs `content_purged_at IS NULL` (its `reviewed_text`), or a PDF file not purged for a native draft. `mode="native_pdf"` needs the file. Without its input, the route gives 409 `conflict_state` with the detail "The CV was deleted after 30 days; upload or paste it again", and nothing changes: no transition and no operation.
     - It returns 202.
   - `POST /api/profile/drafts/{id}/discard` → 204, from `text_review`, `ready` or `failed`.
   - `GET /api/profile` → `{active: ProfileVersionOut | null, versions: [...]}`, empty until Task 21's confirm.
@@ -1149,6 +1150,7 @@ async def test_native_pdf_retry_requires_the_disclosure_ack(logged_in_client, fa
 Also cover:
 - the text edits remove and restore;
 - `ready → text` editing discards `draft_json`;
+- a retry of a draft whose content or file was purged gives 409 `conflict_state`, and creates no operation;
 - approve stores the sha256 and creates exactly one operation, and a repeat with the same key returns the stored 202;
 - `PUT` of the draft revalidates;
 - discard;
@@ -1716,12 +1718,12 @@ Also cover, in `test_profile_confirm.py`:
     - The worker logs `llm_not_configured` once at start.
     - `config.py` treats an empty optional secret file as absent, because compose needs the file to exist.
   - **The M2 rows of `privacy.retention.RULES` (§20.1)**, each in bounded, fenced transactions (M1 Carry-forward 17):
-    - `RetentionRule("draft_content", timedelta(days=30))`: for drafts `confirmed`, `discarded` or `failed` for 30 days with `content_purged_at IS NULL`, it sets `draft_json := NULL` and `reviewed_text := NULL`, sets `content_purged_at`, and nulls the `output_json` of the draft's `extract_profile` calls.
+    - `RetentionRule("draft_content", timedelta(days=30))`: for drafts `confirmed`, `discarded` or `failed` for 30 days with `content_purged_at IS NULL`, it sets `draft_json := NULL` and `reviewed_text := NULL`, sets `content_purged_at`, and nulls the `output_json` of the draft's `extract_profile` calls. Each batch locks its drafts `FOR UPDATE` and re-checks status and age under the lock, so a draft that a retry reopened (`failed → extracting_profile`) in the meantime is skipped.
     - `RetentionRule("cv_files", timedelta(days=30))` (§20.1).
       - **Kept:** the `cv_file_id` of the active profile version and of the previous one, and the file of any open draft. "Previous" follows the activation order, not `version_no`: it is the `confirmed_profile_version_id` of the newest confirmed draft before the newest one that names a different version. A reactivated older version therefore keeps the version it replaced as its previous.
       - **Purged at once:** every other file of a confirmed draft. That covers both the files of versions that are neither active nor previous, and an upload whose confirm reused another version with the same `profile_hash` (that version keeps its own `cv_file_id`).
       - **Purged after 30 days:** the files of drafts `discarded` or `failed` for 30 days (`status_changed_at`), and abandoned uploads (a row no draft references) 30 days after `uploaded_at`.
-      - **Serialised with activation.** Each batch of at most 100 files is one transaction, in the §9.1 order: `fence_epoch`, `active_config FOR SHARE`, the protection set computed under it, the candidate `cv_files` rows `FOR UPDATE`, the unlinks, the row updates, then the commit. A confirm, which takes `active_config FOR UPDATE`, waits for the batch. So no file is ever deleted under a protection set that a committed reactivation has changed.
+      - **Serialised with activation.** Each batch of at most 100 files is one transaction, in the §9.1 order: `fence_epoch`, `active_config FOR SHARE`, the protection set computed under it, the candidates' drafts `FOR UPDATE` with their status and age re-checked under that lock, the candidate `cv_files` rows `FOR UPDATE`, the unlinks, the row updates, then the commit. A confirm, which takes `active_config FOR UPDATE`, waits for the batch, and so does a retry, which takes the draft `FOR UPDATE` (Task 14). So no file is ever deleted under a protection set that a committed reactivation or reopening has changed.
       It deletes the file from `cv_store` first (missing is fine), then sets `storage_path`, `raw_text_enc` and `stripped_text` to NULL and sets `purged_at` (Deviation 21).
     - `RetentionRule("cv_store_orphans", timedelta(days=1))`: a file in `cv_store` that no `cv_files.storage_path` names and that is older than a day is deleted. That is an upload whose transaction rolled back after the file was written.
     - `RetentionRule("eval_runs", THIRTEEN_MONTHS)`: it keeps the latest completed run of each kind, and the calls cascade.
@@ -1746,6 +1748,9 @@ Also cover, in `test_profile_confirm.py`:
     - the active and the previous version's files are kept, and an older version's file is deleted on disk and nulled in the row;
     - a second upload whose confirm reused the active version (identical content, a different `cv_files` id) is purged, while the version's own file stays;
     - after V1, V2 and V3, a confirm reusing V1 keeps V1's and V3's files and purges V2's;
+    - `test_retention_and_retry_are_serialised`, both orders, for a native-PDF draft `failed('refused')` 31 days ago:
+      - a retry with `mode="llm"` that commits first reopens the draft, and the batch then skips its file and content;
+      - a batch paused at `retention.cv_files.after_select` holds the draft lock, the concurrent retry waits, and after the purge commits the retry gives 409 `conflict_state` with no operation created;
     - `test_retention_and_reactivation_are_serialised`, both orders:
       - a confirm reusing V1 that commits before the batch starts keeps V1's file;
       - a batch paused at `retention.cv_files.after_select`, holding V1 as a candidate, makes a concurrent confirm reusing V1 wait on `active_config` (`tests/support/pg.lock_waits`); after the batch commits and the confirm proceeds, no unlink happens after the confirm's commit;
