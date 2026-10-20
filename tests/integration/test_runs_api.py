@@ -316,8 +316,8 @@ async def test_system_health_holds_one_pool_connection_at_a_time(logged_in_clien
 
 
 async def test_no_run_after_the_grace_is_critical_in_health_and_alerts(
-    logged_in_client, engine, queue_app, monkeypatch
-) -> None:  # ruling T17-g: one freshness rule
+    logged_in_client, engine, current_epoch, queue_app, monkeypatch
+) -> None:  # ruling T17-g: one freshness rule; the reconciler is fenced by the current epoch (Ruling FR-h)
     async with engine.begin() as c:
         await c.execute(sa.text("UPDATE schedule_state SET interval_s = 3600"))
         seeded = (await c.execute(sa.text("SELECT min(created_at) FROM settings_versions"))).scalar_one()
