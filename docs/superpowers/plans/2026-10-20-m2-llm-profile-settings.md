@@ -241,8 +241,14 @@ The paths follow §4.2 for the M2 subset. Modules that §4.2 does not list are m
 
 **Files:**
 - Create: `backend/src/jobhunter/db/migrations/versions/0006_m2_llm_profile_settings.py`
-- Modify: `backend/src/jobhunter/db/transitions.py`, `backend/src/jobhunter/db/migrate.py` (the backup-grant table list, if it names M1 tables), `tests/support/fixtures.py` (the M2 tables are emptied with `DELETE`, never by `_TRUNCATE`: `TRUNCATE … CASCADE` of any table that `active_config` reaches through a FK chain (`cv_files` → `profile_drafts` → `profile_versions`, `llm_calls`, `eval_runs`, `llm_tuples`) would truncate `active_config` itself. `reset_database` runs `_ACTIVE_CONFIG_RESET` first, which NULLs the profile, tuple and pending-scope pointers and restores the seeded ids, then `_M2_DELETE` child first: `profile_vectors`, `llm_spend_ledger` after `llm_calls` is detached (`UPDATE profile_drafts/query_proposals SET llm_call_id = NULL`), `llm_calls`, `query_proposals`, `eval_runs`, `llm_tuples`, then `profile_drafts`, `profile_versions` and `cv_files` in one transaction with `SET CONSTRAINTS ALL DEFERRED`, then `llm_budget`)
-- Test: `tests/integration/test_schema_m2.py`, `tests/integration/test_is_fenced_profile.py`, `tests/integration/test_clean_db.py` (`test_two_resets_keep_active_config`: with a profile version, a tuple and an LLM call inserted and pointed at, two consecutive resets leave the one `active_config` row with its seeded pointers); update `tests/integration/test_schema.py` (`LATER` loses `llm_tuples` and `profile_versions`), `tests/integration/test_schema_m1.py` (`profile_vectors` now exists), `tests/unit/test_transition_registry.py`
+- Modify: `backend/src/jobhunter/db/transitions.py`, `backend/src/jobhunter/db/migrate.py` (the backup-grant table list, if it names M1 tables), `tests/support/fixtures.py` (the M2 tables are emptied with `DELETE`, never by `_TRUNCATE`: `TRUNCATE … CASCADE` of any table that `active_config` reaches through a FK chain (`cv_files` → `profile_drafts` → `profile_versions`, `llm_calls`, `eval_runs`, `llm_tuples`) would truncate `active_config` itself. `reset_database` runs `_ACTIVE_CONFIG_RESET` first, which NULLs the profile, tuple and pending-scope pointers and restores the seeded ids, then `_M2_DELETE`, every child before its parent under the immediate FKs, in one transaction with `SET CONSTRAINTS ALL DEFERRED` (only the `profile_drafts` ↔ `profile_versions` pair is deferrable):
+  1. `UPDATE profile_drafts SET llm_call_id = NULL` and `UPDATE query_proposals SET llm_call_id = NULL`;
+  2. `profile_vectors`, then `llm_calls` (it references `llm_spend_ledger`, `profile_drafts` and `eval_runs`), then `llm_spend_ledger` (it references `llm_budget`);
+  3. `query_proposals`, `eval_runs` and `llm_tuples` (the M1 `_TRUNCATE` has already emptied `runs`, which references it);
+  4. `profile_drafts`, `profile_versions` and `cv_files`;
+  5. `llm_budget`.
+  `_CONFIGURATION_RESET` then also deletes the `model_policies`, `execution_configs` and `evaluation_policies` rows that no remaining `settings_versions` row or `active_config` names, which settings saves of earlier tests created. The `_M2_DELETE` runs between `_ACTIVE_CONFIG_RESET` and `_CONFIGURATION_RESET`, after the M1 `_TRUNCATE`)
+- Test: `tests/integration/test_schema_m2.py`, `tests/integration/test_is_fenced_profile.py`, `tests/integration/test_clean_db.py` (`test_two_resets_keep_active_config`: with a cv file, a confirmed draft, a profile version, a tuple, a proposal, a vector, an eval run and an LLM call with its ledger row, all inserted and pointed at, two consecutive resets succeed and leave the one `active_config` row with its seeded pointers and every M2 table empty); update `tests/integration/test_schema.py` (`LATER` loses `llm_tuples` and `profile_versions`), `tests/integration/test_schema_m1.py` (`profile_vectors` now exists), `tests/unit/test_transition_registry.py`
 
 **Interfaces:**
 - Consumes: the M0 and M1 DDL (inventory: `active_config`, `runs.llm_tuple_id`, `queries.proposal_id`, `purge_fences.kind='profile'`, `is_fenced` from 0005, the `assert_transition` trigger function).
@@ -403,20 +409,21 @@ Property test: `worst_case_usd ≥ settled_usd(Usage(i, o, 0, 0))` for every `i 
     - `@dataclass(frozen=True) class EvalRunOwner: eval_run_id: int` (Task 7).
     - Each has `async lock(conn) -> None`, which takes `FOR SHARE` on its row and raises `FencedOut` when the predicate is lost.
     - Each has `durable() -> dict[str, JSONValue]`, written into `llm_calls.input_refs["owner"]` by the same insert as the reservation: `{"kind": "operation", "id": <operation id>, "claim_id": "<uuid>"}` or `{"kind": "eval_run", "id": <eval run id>}`. This is the reconciler's only way to test the original owner after the in-memory owner is gone.
-    - `async def spend_ledger.owner_holds(conn, ref: Mapping[str, JSONValue], *, now) -> bool` locks the owner row `FOR UPDATE` and tests the predicate. For an operation, the row exists, `status = 'running'` and `claim_id` equals the recorded one. For an eval run, the row is `running` and younger than `EVAL_RUN_ABANDONED = timedelta(hours=1)`; an older `running` eval run is set to `failed` in the same transaction (a CLI that died). A missing row never holds.
+    - `async def spend_ledger.owner_holds(conn, ref: Mapping[str, JSONValue], *, now) -> bool` locks the owner row `FOR UPDATE` and tests the predicate. For an operation, the row exists, `status = 'running'` and `claim_id` equals the recorded one. For an eval run, the row is `running`. A missing row never holds.
+    - The `llm_ledger_unsettled` pass first fails every `eval_runs` row that has been `running` for longer than `EVAL_RUN_ABANDONED = timedelta(hours=1)` (a CLI that died, whether between cases or inside a call), so its unsettled entries then fail `owner_holds`.
     - M3 adds a target owner.
   - `@dataclass(frozen=True) class spend_ledger.Reservation: ledger_id: int; llm_call_id: int; month: date; reserved_usd: Decimal; purpose_class; model; batch: bool`.
   - Ledger operations:
     - `async def spend_ledger.current_params(conn) -> BudgetParams`. It reads the active settings payload through `active_config … FOR SHARE`, so it runs first in the transaction (§9.1), and waits for a settings save in progress, which holds `active_config FOR UPDATE`.
     - `async def spend_ledger.ensure_month(conn, month, p: BudgetParams, now) -> None`, an `INSERT … ON CONFLICT DO NOTHING` that copies the cap and buffer from `p` (the current params) and starts the bucket full.
     - `async def spend_ledger.lock_month(conn, month) -> BudgetRow`, a `FOR UPDATE` that accrues and stores the bucket.
-    - `async def spend_ledger.reserve(conn, *, owner, purpose, purpose_class, model, effort, max_tokens, max_tokens_stage, transport_try, input_tokens_bound, extra_usd, execution_config_id, prompt_template_version, rendered_prompt_sha256, prefix_sha256, input_refs, profile_draft_id, eval_run_id, transport, now) -> Reservation`. It runs one transaction body in the caller's transaction:
+    - `async def spend_ledger.reserve(conn, *, owner, purpose, purpose_class, model, effort, max_tokens, max_tokens_stage, transport_try, logical_call_no, deadline_s, input_tokens_bound, extra_usd, execution_config_id, prompt_template_version, rendered_prompt_sha256, prefix_sha256, input_refs, profile_draft_id, eval_run_id, transport, now) -> Reservation`. It runs one transaction body in the caller's transaction:
       0. `p = current_params(conn)` (`active_config FOR SHARE`), then `ensure_month(conn, month_of(now), p, now)`;
       1. the owner lock;
       2. the month lock;
       3. admission, or `BudgetExhausted`;
       4. the ledger insert, with `admitted_cap_usd` and `counted_before_usd`;
-      5. the `llm_calls` insert (`reserved`), with `input_refs["owner"] = owner.durable()`;
+      5. the `llm_calls` insert (`reserved`), with `input_refs["owner"] = owner.durable()` and `input_refs["deadline_s"] = deadline_s`, the deadline the call runs under, and `logical_call_no` (1 for a node's first logical call, 2 for its repair; Deviation 26);
       6. the counters and the bucket (scoring outside bulk operations only);
       7. the `llm.cap_80pct` check.
     - `async def spend_ledger.mark_dispatched(conn, res, owner, *, now) -> None`. It takes the owner lock again, then `reserved→dispatched` on both rows. It raises `FencedOut` when the owner is lost; the caller then calls `release_never_dispatched`.
@@ -429,7 +436,7 @@ Property test: `worst_case_usd ≥ settled_usd(Usage(i, o, 0, 0))` for every `i 
     - `@reconciler("budget_counters", "heavy")`: corrects drift under the month lock and raises `llm.budget_counter_drift` (critical); resolves it after a clean pass.
     - `@reconciler("llm_ledger_unsettled", "tick")` (Deviation 5), per entry in its own transaction, in the §9.1 order (owner row, month row, ledger row):
       - a `reserved` entry older than 15 min for which `owner_holds(conn, input_refs["owner"])` is false becomes `not_billed('never_dispatched')`, and its call `cancelled`;
-      - an online `dispatched` entry becomes `ambiguous`, and its call too, once it is older than `max(15 min, deadline_s of its node in its execution config + 5 min)`. §17.4's flat 15 minutes would mark a legitimate 900 s or 1,800 s call ambiguous while its stream is live (Deviation 24);
+      - an online `dispatched` entry becomes `ambiguous`, and its call too, once it is older than `max(15 min, input_refs["deadline_s"] + 5 min)`: the deadline recorded with the call, which covers every purpose, the schema dry-run's 300 s included. §17.4's flat 15 minutes would mark a legitimate 900 s or 1,800 s call ambiguous while its stream is live (Deviation 24);
       - the counters change in the same transaction.
     - **Late settlement** (Deviation 24). `settle` on a ledger row the reconciler already moved to `ambiguous` applies `ambiguous → billed` (with usage) or `ambiguous → not_billed` (with a listed evidence), and `ambiguous → completed`/`error` on the call, with the same counter adjustments. A settle that finds the row already `billed` or `not_billed` writes nothing and logs `llm_settle_duplicate`.
   - The alert codes are module constants: `CAP_80PCT_ALERT = "llm.cap_80pct"`, `COUNTER_DRIFT_ALERT`, `BOUND_VIOLATED_ALERT` and `CAP_REACHED_ALERT = "llm.cap_reached"` (raised by M3's scoring denial).
@@ -474,7 +481,7 @@ A second machine covers the bucket. Over a simulated month with an unbounded sco
 - `test_unsettled_entries_are_resolved_after_15_minutes`, for both edges, with the counters updated: a reservation whose operation was reclaimed (a new `claim_id`) is released, while the replacement execution's own reservation, under the same operation id, is kept;
 - `test_dispatched_extraction_is_not_marked_ambiguous_inside_its_deadline`: an `extract_profile` call dispatched 16 min ago (deadline 900 s) is untouched, and at 21 min it is `ambiguous`;
 - `test_late_settlement_after_the_reconciler`: the reconciler marks a dispatched call `ambiguous`, then the gateway settles it `billed`; the counters equal the ledger;
-- `test_abandoned_eval_run_releases_its_reservation`: a `running` schema dry-run older than an hour with a `reserved` entry ends `failed`, and the entry becomes `not_billed('never_dispatched')`;
+- `test_abandoned_eval_run_releases_its_reservation`: a `running` schema dry-run older than an hour with a `reserved` entry ends `failed`, and the entry becomes `not_billed('never_dispatched')`; one that died between two completed cases, with no unsettled entry, ends `failed` too; a schema dry-run call dispatched 16 minutes ago is `ambiguous` (its recorded deadline is 300 s);
 - `test_old_context_cap_cut_and_rollover`, the three conditions in one scenario: an extraction reserves on 31 October with the cap at $100; a save lowers the cap to $10 (the October row is changed); the extraction's retry after midnight creates November from the **current** settings ($10), not from any value it held;
 - `test_superseded_operation_owner_cannot_reserve_or_dispatch`: `FencedOut`, and nothing is written.
 
@@ -569,7 +576,7 @@ async def test_lowered_cap_admits_nothing_but_settles_in_flight(engine, op_owner
       - the jittered backoff is 2 s then 8 s ± 25%, and `Retry-After` is honoured.
     - `async def count_tokens(self, model, body) -> int` (native PDF and V19).
   - The `stop_reason` and status mapping (§10.5, §10.4):
-    - `end_turn` with `parsed` returns the result. `parsing_error` raises `InvalidOutput("structural")`; the caller owns its one structural repair.
+    - `end_turn` with `parsed` returns the result. `parsing_error` raises `InvalidOutput("structural")`; the try settles `billed`, its call `completed` with `output_json = NULL` and `error_code = 'invalid_output'`, and the caller owns its one structural repair.
     - `refusal` is billed and raises `Refused(category or "unspecified")`.
     - `max_tokens` moves to the enlarged stage, then `MaxTokensExhausted`.
     - Any other stop reason raises `InvalidOutput("unexpected_stop_reason")` with a warn alert, `llm.unexpected_stop_reason` (Deviation 6).
@@ -751,8 +758,9 @@ async def test_reclaimed_operation_never_sends(engine, current_epoch, fake_llm, 
 **Interfaces:**
 - Produces:
   - The protocol, version 1, on `/data/parse/<job_id>/`:
-    - the worker writes `input.<pdf|docx>` (mode 0660), then `request.json` atomically (tmp then rename): `{"v": 1, "mime": …, "input": "input.pdf"}`.
+    - the worker writes `input.<pdf|docx>` (mode 0660), then `request.json` atomically (tmp then rename): `{"v": 1, "mime": …, "input": "input.pdf", "mode": "extract" | "validate"}`. `validate` checks a PDF (encryption, page count) and extracts no text; `text.txt` is then not written.
     - `docparse` claims it by renaming `request.json` to `request.claimed`, extracts, and writes `text.txt` plus `result.json` atomically: `{"v": 1, "status": "ok" | "error", "code": null | "encrypted" | "too_many_pages" | "parse_error" | "parse_limit" | "unsupported", "method": "pypdf" | "pdfplumber" | "docx", "page_count": int | null, "chars": int}`.
+  - `docparse.extract.validate_pdf(path) -> Validated(page_count)`, which gives `encrypted` or `too_many_pages` as `extract_pdf` does, and `ParseClient.validate(data) -> ParseOutcome` for it.
   - `docparse.extract.extract_pdf(path) -> Extracted` (pypdf, then pdfplumber when the text is < 300 characters or > 5% U+FFFD; `page_count`; encrypted → `encrypted`; > 20 pages → `too_many_pages`), `extract_docx(path) -> Extracted` (paragraphs and table cells in document order) and `@dataclass(frozen=True) Extracted(text, method, page_count)`.
   - `docparse.worker.run_job(job_dir: Path, *, extractor=extract_document, limits: Limits = Limits(cpu_s=30, as_bytes=768 * 2**20)) -> None` runs the extraction in a `multiprocessing` child with `resource.setrlimit` for `RLIMIT_CPU` and `RLIMIT_AS`. A child killed by a limit gives `parse_limit`, and any other child failure gives `parse_error`. `docparse.worker.main()` loops: it scans every 0.2 s, never opens a socket, and logs only job ids and codes.
   - `profile.parse_client.ParseClient(root: Path, *, timeout_s: float = 60.0, poll_s: float = 0.2)`. Its methods:
@@ -829,7 +837,7 @@ def test_rlimit_kills_a_runaway_parse(tmp_path) -> None:
     2. raises `Problem(409, "conflict_state")` when the open draft is `uploaded`, `extracting_text` or `extracting_profile`;
     3. discards an open draft in `text_review`, `ready` or `failed`;
     4. inserts `cv_files` and `profile_drafts(status='uploaded')`;
-    5. inserts the operation `extract_profile_text(draft_id)` with dedup key `extract_profile_text:<draft_id>`, or `extract_profile` (`uploaded→extracting_profile`, `native_pdf := true`) on a PDF native opt-in.
+    5. inserts the operation `extract_profile_text(draft_id)` with dedup key `extract_profile_text:<draft_id>`, or `extract_profile` (`uploaded→extracting_profile`, `native_pdf := true`) on a PDF native opt-in. That path still validates the PDF in docparse before any token count or LLM call (Task 13's `check_pdf`).
   - The routes:
     - `POST /api/profile/cv` takes multipart `file` and `native_pdf_opt_in?`, and returns 202 `{draft_id}`.
     - `POST /api/profile/cv-text` takes `{text}` and returns 202 `{draft_id}`. Pasted text is stored as `cv_files(mime='text/plain', extraction_method='pasted', raw_text_enc=…)` with no file on disk.
@@ -921,7 +929,7 @@ Also cover:
 
 **Files:**
 - Create: `backend/src/jobhunter/graphs/profile/{__init__,graph,state,deps}.py`, `graphs/profile/nodes/{__init__,parse,strip_contacts}.py`, `backend/src/jobhunter/profile/operations.py`
-- Modify: `backend/src/jobhunter/worker/operations.py` (`OperationContext` gains `deps: OperationDeps`), `worker/runtime.py` (`WorkerRuntime` gains `gateway`, `parse_client`, `cv_store`, `profile_graphs`), `worker/main.py` (build them after `open_saver`; `parse_client.cleanup_leftovers()` at start; `_REGISTERING_MODULES` += `jobhunter.profile.operations`), `worker/tasks.py` (`run_operation` passes the deps), `tests/unit/test_worker_main.py`
+- Modify: `backend/src/jobhunter/worker/operations.py` (`OperationContext` gains `deps: OperationDeps` and `finish_in`; the failure hooks), `worker/runtime.py` (`WorkerRuntime` gains `gateway`, `parse_client`, `cv_store`, `profile_graphs`), `worker/main.py` (build them after `open_saver`; `parse_client.cleanup_leftovers()` at start; `_REGISTERING_MODULES` += `jobhunter.profile.operations`), `worker/tasks.py` (`run_operation` passes the deps), `tests/unit/test_worker_main.py`
 - Test: `tests/integration/test_profile_text_phase.py`, `tests/unit/test_profile_graph_shape.py`
 
 **Interfaces:**
@@ -944,17 +952,21 @@ Also cover:
   - `graphs.profile.graph.ProfileGraphs`, holding `text`, `extract` and `propose`, each a compiled graph.
   - `build_profile_graphs(checkpointer, deps: ProfileDeps) -> ProfileGraphs`:
     - `text`: `parse → strip_contacts → END`;
-    - `extract`: `extract_profile → validate → draft → END` (Task 13);
+    - `extract`: `check_pdf → extract_profile → validate → draft → END` (Task 13; `check_pdf` passes at once unless the draft is native PDF);
     - `propose`: `propose_queries → END` (Task 20).
     The non-LLM nodes take `DB_RETRY` and `TimeoutPolicy(run_timeout=…)` (`parse` 120 s, `strip_contacts` 30 s). The LLM nodes take no `RetryPolicy`, the deadline from the execution config, and `TracePolicy(process_inputs=omit, process_outputs=omit)` (§9.1).
-  - `graphs.profile.graph.thread_id(kind: Literal["t", "p", "q"], draft_or_version_id: int, n: int) -> str`, which is `profile-<id>-t<n>` / `-p<n>` and `queries-<profile_version_id>-q<n>`. `n` is the operation's `attempts` value at claim.
+  - `graphs.profile.graph.thread_id(kind: Literal["t", "p", "q"], subject_id: int, operation_id: int, attempts: int) -> str` (Deviation 27):
+    - `profile-<draft_id>-t<operation_id>-a<attempts>` and `-p<operation_id>-a<attempts>`;
+    - `queries-<proposal_id>-q<operation_id>-a<attempts>`.
+    Every execution of every operation gets a thread of its own, so no state of an earlier operation or attempt leaks into a later one through omitted keys or reducers. Work done before a crash is found through the receipts (Task 13), not through the thread.
+  - `OperationContext.finish_in(conn, *, status: Literal["succeeded", "failed"], error_code: str | None = None) -> None` finishes the claimed operation inside the caller's transaction, so a node's last domain write and the operation's end commit together. `execute_operation` then writes nothing more for that execution: it reads the context's `finished` flag after the handler returns. Every M2 handler ends this way: the profile nodes' `ready`/`text_review`/`failed` writes, the proposal publication, the scope flip and `embed_profile`.
   - The `parse` node:
     - skips when `cv_files.raw_text_enc` is set (receipt);
     - pasted text skips docparse;
     - otherwise it decrypts the file, calls `parse_client.extract`, and stores `raw_text_enc`, `extraction_method` and `page_count` under the owner lock.
     - A `ParseFailed(code)` moves the draft `extracting_text → failed(code)`. Text under 300 characters moves it to `failed('low_text')` (`LOW_TEXT_CHARS: Final = 300`).
   - The `strip_contacts` node writes `stripped_text` and `strip_report`, then `extracting_text → text_review`.
-  - The `extract_profile_text` handler moves the draft `uploaded → extracting_text` under the owner lock, then invokes `profile_graphs.text` with the thread id. A draft that is no longer `uploaded` or `extracting_text` makes the operation succeed as obsolete.
+  - The `extract_profile_text` handler moves the draft `uploaded → extracting_text` under the owner lock, then invokes `profile_graphs.text` with the thread id. The `strip_contacts` node's `text_review` write, and every `failed(code)` write of the text phase, finish the operation in the same transaction (`finish_in`). A draft that is no longer `uploaded` or `extracting_text` makes the operation succeed as obsolete.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -976,7 +988,9 @@ Also cover:
 - `test_resume_skips_a_finished_parse`: a reclaim after `parse` committed reaches `text_review` with **one** docparse job (the loop counts jobs);
 - an `encrypted` PDF gives `failed('encrypted')`;
 - the checkpoint rows of the thread contain no CV text: scan `checkpoints`, `checkpoint_blobs` **and** `checkpoint_writes` for a marker word of the synthetic CV, including after a node raises an `sqlalchemy.exc.StatementError` whose parameters hold the marker (`test_node_errors_reach_no_checkpoint_write`);
-- a text-phase operation exhausted by ten reclaims leaves the draft `failed('attempts_exhausted')` in the same transaction (the failure hook).
+- a text-phase operation exhausted by ten reclaims leaves the draft `failed('attempts_exhausted')` in the same transaction (the failure hook);
+- `test_text_review_and_the_operation_end_commit_together`: a fault right after the `text_review` write's commit point finds the operation already `succeeded`;
+- two successive `extract_profile_text` operations of one draft history use two threads, and neither sees the other's state.
 - [ ] **Step 2: Run the tests and see them fail.**
 - [ ] **Step 3: Implement** `OperationDeps` and the wiring, the graphs module (text phase), the two nodes and the handler.
 - [ ] **Step 4: Run the tests and see them pass**, plus `tests/unit/test_worker_main.py` and the M1 `watchlist_validate` tests.
@@ -1044,23 +1058,27 @@ Also cover:
 - Consumes: `LLMGateway.call` and `count_tokens`, `node_config`, `render.extract_profile_prompt` and its native-PDF variant, `validate_profile`, `bounds.native_pdf_bound`/`native_pdf_extra_usd` and `NATIVE_PDF_ENABLED`; the buffer for the extra share is the current month row's `overrun_buffer_usd`, read by the gateway in the reservation transaction.
 - Produces:
   - The `extract_profile` node:
-    - **Receipt first** (§9.1; Deviation 26). A `completed` `extract_profile` call with `output_json IS NOT NULL` and `input_refs->>'operation_id'` equal to this operation's id is the work already paid for. The node returns its `llm_call_id` without any HTTP request. Every approval or retry inserts a new `extract_profile` operation, so a newly approved text can never reuse an older output, while a reclaimed or resumed execution of the same operation does. The operation id goes into the call's `input_refs` with `profile_draft_id`, `cv_file_id` and `reviewed_text_sha256`.
+    - **Receipts first** (§9.1; Deviation 26). `async def spend_ledger.receipts(conn, *, operation_id: int, purpose) -> dict[int, Receipt]` returns, per `logical_call_no`, the newest `completed` call of the operation: `Receipt(llm_call_id, output_json: JSONValue | None, error_code: str | None)`. The operation id goes into each call's `input_refs` with `profile_draft_id`, `cv_file_id`, `reviewed_text_sha256` and `native_pdf`.
+      - Logical call 1 with an `output_json` is used without any HTTP request.
+      - Logical call 1 without one (`error_code = 'invalid_output'`: billed, structurally invalid) means the repair is due. Logical call 2 with an `output_json` is used; logical call 2 without one ends the draft `failed('invalid_output')`. The one structural repair is therefore never repeated or skipped across a reclaim.
+      - Receipts belong to one operation. While it is live the draft stays in its generation: approval needs `text_review`, and discard needs `text_review`, `ready` or `failed`. Every way out of `extracting_profile` finishes the operation in the same transaction (`finish_in`), so a later generation never meets a live older operation.
     - It reads `reviewed_text` and checks `sha256(reviewed_text) == reviewed_text_sha256` before rendering; a mismatch is a `Bug`.
     - It renders, and records `transmitted_text_sha256 = sha256(the exact string inside <cv_text>)`, which must equal `reviewed_text_sha256` (§9.5).
     - It calls the gateway with `purpose='extract_profile'`, `purpose_class='nonscoring'`, the **active** model policy and execution config (non-score calls use the active ones, §13.3), `ctx.owner = OperationOwner(claim)` and `profile_draft_id`.
-    - `InvalidOutput("structural")` is retried **once** (the structural repair); a second one gives `failed('invalid_output')`.
+    - `InvalidOutput("structural")` is retried **once** as logical call 2 (the structural repair); a second one gives `failed('invalid_output')`. The gateway settles a structurally invalid response `billed`, with its call `completed`, `output_json = NULL` and `error_code = 'invalid_output'`, so the receipts can tell it apart.
     - `Refused` gives `failed('refused')`.
     - `BudgetExhausted` gives `failed('budget_exhausted')`, with no HTTP request (the reservation is refused first).
     - `LLMRequestError(s)` gives `failed('llm_request_<s>')`, `ModelMismatch` gives `failed('model_mismatch')` and `MaxTokensExhausted` gives `failed('max_tokens')`.
     - `LLMTransient` and `DeadlineExhausted` call `requeue_operation(..., error_code='llm_transient', not_before=now + 5 min)`. The operation's 10-attempt limit then fails it, and the kind's `on_failed` hook (Task 11) moves the draft `extracting_profile → failed('llm_transient')` in that transaction (`failed('attempts_exhausted')` after reclaims).
     - The `llm_calls.output_json` holds the parsed output, and the draft's `llm_call_id` is set.
   - The `validate` node reads the output from `llm_calls.output_json` by the state's `llm_call_id`, and runs `validate_profile` with `transmitted_text = reviewed_text`, or `None` for native PDF.
-  - The `draft` node moves `extracting_profile → ready` with `draft_json` and `validation_issues`.
+  - The `draft` node moves `extracting_profile → ready` with `draft_json` and `validation_issues`, and finishes the operation in the same transaction (`finish_in`). Its `UPDATE` also requires `reviewed_text_sha256` (or `native_pdf`) to equal the value the call was made for, a defence that no reordering can defeat. Every `failed(code)` of the extract phase finishes the operation the same way.
   - The native-PDF path:
     - `NATIVE_PDF_ENABLED` must be true (V19).
+    - The `check_pdf` node runs first, before any token count. It decrypts the file and calls `ParseClient.validate`. `encrypted` or `too_many_pages` ends the draft `failed(code)` with no outbound request of any kind (§12.1; Deviation 7). `ok` records `page_count`.
     - The gateway counts tokens for the exact request. The reservation uses `native_pdf_bound(model, count)` input tokens plus `native_pdf_extra_usd(buffer)`.
     - A count failure, or a count over the model's context window (`pricing.CONTEXT_WINDOW[model]`), gives `failed('input_unbounded')` with nothing sent.
-  - The `extract_profile` handler moves the draft `text_review|failed → extracting_profile`, or passes when the draft is already in `extracting_profile` (set by the API, Task 14), then invokes `profile_graphs.extract`.
+  - The `extract_profile` handler moves the draft `text_review|failed → extracting_profile`, or passes when the draft is already in `extracting_profile` (set by the API, Task 14), then invokes `profile_graphs.extract`. A draft in any other state finishes the operation `succeeded` as obsolete without touching the draft.
 
 - [ ] **Step 1: Write the failing tests.**
   - `test_profile_extract_phase.py`, on the fake LLM with the recorded profile output for `tests/support/profile.SYNTHETIC_CV`:
@@ -1073,8 +1091,11 @@ Also cover:
     - `overloaded_529` × 3 requeues the operation with `not_before`;
     - native PDF with `count_tokens` 1,800 reserves `ceil(2250) + overhead` plus $0.50;
     - `count_tokens` failing gives `failed('input_unbounded')` and `served == 0`;
+    - a native opt-in upload of an encrypted PDF, and one of a 21-page PDF, end `failed('encrypted')` and `failed('too_many_pages')` with zero requests to the fake transport, `count_tokens` included;
+    - receipts: a crash after logical call 1 settled invalid, then a reclaim, makes exactly one more request (the repair); a crash after the repair settled valid makes none;
     - `test_crash_after_settlement_reuses_the_paid_output`: a fault after the call settles and before the `draft` node commits, then a reclaim. The second execution reaches `ready` with `fake_llm.served == 1` and one billed ledger row;
-    - a retry after `failed('invalid_output')` is a new operation, so it makes a new call.
+    - a retry after `failed('invalid_output')` is a new operation, so it makes a new call;
+    - `test_old_extraction_cannot_publish_into_a_new_approval`: operation A reaches `ready` (A finished in that transaction); the user edits and approves new text (operation B); a stale execution of A, replayed through `execute_operation` with A's old claim, writes nothing. B's extraction uses the new text, and the draft's `draft_json` comes from B's call.
   - C35, full: as Task 5's pin, but through the real `extract_profile` handler. Exactly one extraction is billed, the draft is `ready` once, and the first execution's late write updates no draft row (`TransitionConflict`/`FencedOut` swallowed by the obsolete-execution path).
 - [ ] **Step 2: Run the tests and see them fail.**
 - [ ] **Step 3: Implement** the three nodes, the graph wiring and the handler.
@@ -1091,7 +1112,7 @@ Also cover:
 - Consumes: `run_idempotent`, `check_idempotency_key`, `validate_profile` (Task 12), `contacts.restore`/`remove_span`/`strip_contacts` (Task 10), `CvStore.decrypt_text`, `create_operation`, `transition()`.
 - Produces the §14.2 routes, each documented with `SESSION_RESPONSES`, `CSRF_RESPONSES` and the problem codes it can return:
   - `GET /api/profile/drafts/{id}` → `DraftOut{status, draft, validation_issues, strip_report, stripped_text_preview, reviewed_text_sha256, failure_code, repairs}`.
-    - `repairs` is `["paste_text", "native_pdf"]` for `low_text`, `encrypted` and `too_many_pages` (`native_pdf` only while `bounds.NATIVE_PDF_ENABLED`; the pin below runs with it patched true); `["retry_llm"]` for the LLM failure codes; and `[]` otherwise. Including `repairs` goes beyond the spec's summary and is documented.
+    - `repairs` is `["paste_text", "native_pdf"]` for `low_text` (`native_pdf` only while `bounds.NATIVE_PDF_ENABLED`; the pin below runs with it patched true), and `["paste_text"]` for `encrypted` and `too_many_pages`: those fail §12.1's PDF checks, which the native path must pass too; `["retry_llm"]` for the LLM failure codes; and `[]` otherwise. Including `repairs` goes beyond the spec's summary and is documented.
     - `stripped_text_preview` is the stripped text, never the raw text.
   - `PUT /api/profile/drafts/{id}` with `{draft: ConfirmedProfile}`, allowed in `ready` only: it revalidates against `reviewed_text` (for native PDF, against nothing), stores `draft_json` and `validation_issues` with a plain `UPDATE`, and returns `{validation_issues}`.
   - `PUT /api/profile/drafts/{id}/text` with `{span_edits: [{op: "remove" | "restore", start?, end?, replacement_index?}]}`:
@@ -1100,7 +1121,7 @@ Also cover:
     - it returns `{stripped_text_preview}`.
   - `POST /api/profile/drafts/{id}/text-review` (Idempotency-Key): in `text_review` only, it stores `reviewed_text` (the current stripped text, edits applied) and its sha256, moves `text_review → extracting_profile`, and inserts `extract_profile(draft_id)`. It returns 202 `{status: "extracting_profile"}`.
   - `POST /api/profile/drafts/{id}/retry` (Idempotency-Key) with `{mode: "llm" | "native_pdf", ack_native_pdf?: bool}`, from `failed` only:
-    - `native_pdf` requires `ack_native_pdf: true` (else 422 `validation_failed`) and a PDF file;
+    - `native_pdf` requires `ack_native_pdf: true` (else 422 `validation_failed`), a PDF file, and a draft failed with `low_text` or an LLM failure code (else 409 `conflict_state`);
     - it sets `cv_files.native_pdf_opt_in := true`, `extraction_method := 'native_pdf'` and the draft's `native_pdf := true`.
     - It returns 202.
   - `POST /api/profile/drafts/{id}/discard` → 204, from `text_review`, `ready` or `failed`.
@@ -1354,7 +1375,7 @@ Also cover, in `test_settings_save.py`:
   - `async def scope_apply.incomplete_jobs(conn, scope_version_id: int) -> int`: the unmerged jobs that lack a `hard_filter_results` row for the scope, or whose row has `inputs_hash ≠ jobs.det_facts_hash` or another `det_algorithm_version` (the `filters._STALE` predicate without its limit).
   - The handler `@register_operation_handler("apply_scope") async def run_apply_scope(ctx)`:
     1. **Precompute**, outside any `active_config` lock (§13.4 step 2). Each chunk is one transaction: a plain read of `active_config.pending_scope_version_id`, and when it is no longer this scope the operation finishes `succeeded` with progress `{"obsolete": true}`; otherwise `recompute_stale(conn, {sid: scope}, guard=<owner lock>)`, then `set_progress(conn, claim, {"done": …, "total": …})`. `total` is the count of unmerged jobs at the start. It loops until a chunk returns fewer than `BATCH`.
-    2. **The final transaction**, in the §9.1 order: `active_config FOR UPDATE`, then the owner row. A pending pointer that differs from `sid` gives the obsolete end. When `incomplete_jobs(conn, sid) > 0` the transaction rolls back and step 1 runs again, at most `FINAL_CHECK_ROUNDS` times; after that the operation is requeued with `error_code='scope_incomplete'` and `not_before = now + 1 min`. Otherwise it runs `UPDATE active_config SET scope_version_id = pending_scope_version_id, pending_scope_version_id = NULL, updated_at = :now`, then `ranking.bump`, resolves `scope.apply_failed`, and finishes `succeeded`.
+    2. **The final transaction**, in the §9.1 order: `active_config FOR UPDATE`, then the owner row. A pending pointer that differs from `sid` gives the obsolete end. When `incomplete_jobs(conn, sid) > 0` the transaction rolls back and step 1 runs again, at most `FINAL_CHECK_ROUNDS` times; after that the operation is requeued with `error_code='scope_incomplete'` and `not_before = now + 1 min`. Otherwise it runs `UPDATE active_config SET scope_version_id = pending_scope_version_id, pending_scope_version_id = NULL, updated_at = :now`, then `ranking.bump`, resolves `scope.apply_failed`, and finishes `succeeded` in that transaction (`finish_in`).
     3. The `det_results` part of the final check and the `filtered_out ⇄ pending` target moves are M3's (Deviation 12).
   - `@reconciler("scope_apply_failed", "tick")` (§13.4 step 5; Deviation 12):
     1. `fence_epoch`, then `active_config FOR UPDATE`.
@@ -1443,7 +1464,7 @@ Also cover, in `test_scope_apply.py`:
     - It reads the version.
     - A purged version, or one under an active `profile` purge fence, finishes `succeeded` with progress `{"skipped": "purged" | "fenced"}`.
     - It embeds the texts in one batch with `input_kind="query"`. The embedder adds the `query: ` prefix (`embedder/app.py`).
-    - In one owner-fenced transaction it upserts the embeddings, then `INSERT INTO profile_vectors … ON CONFLICT (profile_version_id, kind) DO UPDATE SET embedding_id = EXCLUDED.embedding_id`. Kinds no longer present for the version are deleted.
+    - In one owner-fenced transaction it upserts the embeddings, then `INSERT INTO profile_vectors … ON CONFLICT (profile_version_id, kind) DO UPDATE SET embedding_id = EXCLUDED.embedding_id`, deletes kinds no longer present for the version, and finishes the operation (`finish_in`).
     - `EmbedderError` requeues with `error_code='embedder_unavailable'` and `not_before = now + 10 min`.
   - `@reconciler("profile_vectors", "heavy")` (§12.6 step 3, "recomputed when it returns"; Deviation 23). When the embedder reports healthy, an active profile version with fewer vectors than `vector_texts` and no live `embed_profile` operation gets one. M3's targets read the vectors.
 
@@ -1482,11 +1503,14 @@ Also cover, in `test_scope_apply.py`:
     - **The set:** the kept set must have 6–16 items and at least one `exploration`; otherwise the result is `([], ["set_invalid"])`. A kept set over 16 items is cut to the first 16 in model order, with the issue `truncated`.
   - `proposals.KIND: Final = "propose_queries"`.
   - `async def proposals.request_proposal(conn, profile_version_id: int, *, defer) -> tuple[int, int, bool]`. It returns `(proposal_id, operation_id, created)`. A `running` proposal of the same version is returned with `created=False`; otherwise it inserts `query_proposals(status='running')` and the operation with payload `{"proposal_id": id}` and dedup key `propose_queries:<proposal_id>`.
-  - The `propose_queries` node (graph `propose`, thread `queries-<profile_version_id>-q<n>`) checks the same receipt first: a `completed` `propose_queries` call with `input_refs->>'operation_id'` equal to this operation's id and an `output_json` is validated and published without a new request. Its `input_refs` holds the operation id, `proposal_id` and `profile_version_id`. Then:
+  - The `propose_queries` node (graph `propose`, thread `queries-<proposal_id>-q<operation_id>-a<attempts>`) reads `spend_ledger.receipts(conn, operation_id=…, purpose='propose_queries')` first, as Task 13 does. Its `input_refs` hold the operation id, `proposal_id` and `profile_version_id`.
+    - Logical call 1 with an `output_json` is validated again (validation is pure and deterministic). A usable set is published without a request; `set_invalid`, or a structurally invalid call 1, makes logical call 2 due.
+    - Logical call 2 with an `output_json` is validated and published, or ends the proposal `failed`. Logical call 2 without one ends it `failed`. So the one repair is consumed exactly once across reclaims.
+    Then:
     - It renders `propose_queries_prompt(profile_json, scope location labels)` and calls the gateway with `purpose='propose_queries'`, non-scoring, the active model policy and execution config, and `OperationOwner(claim)`.
     - It validates the output. `set_invalid`, or `InvalidOutput("structural")`, is retried once with a new call; a second one ends the proposal `failed` and the operation `failed('invalid_output')`.
     - The error mapping is the one of Task 13 (`refused`, `budget_exhausted`, the request errors, and the transient requeue).
-    - On success it moves the proposal `running → ready` with `items = {"queries": [kept items as dicts]}` and `llm_call_id`.
+    - On success it moves the proposal `running → ready` with `items = {"queries": [kept items as dicts]}` and `llm_call_id`, and finishes the operation in the same transaction (`finish_in`). Its failures end the proposal and the operation together the same way.
     - The failure hook moves the proposal `running → failed`.
   - The routes:
     - `POST /api/profile/query-proposals` (Idempotency-Key) → 202 `{proposal_id}`. It needs an active profile (otherwise 409 `conflict_state`), and the call counts against the non-scoring reserve.
@@ -1515,6 +1539,8 @@ Also cover, in `test_scope_apply.py`:
     - `refusal` gives `failed`;
     - a repeat request while one is running returns it;
     - a fault after settlement and before `running → ready`, then a reclaim, publishes with `fake_llm.served == 1`;
+    - a crash after a `set_invalid` logical call 1 and another after a settled valid logical call 2: the first resumes with exactly one request (the repair), and the second with none;
+    - two successive proposals of one profile version use two threads;
     - no profile gives 409.
   - `test_queries_api.py`:
     - `POST` creates an unenabled user query, and the active settings are unchanged;
@@ -1689,14 +1715,14 @@ Also cover, in `test_profile_confirm.py`:
     - `config.py` treats an empty optional secret file as absent, because compose needs the file to exist.
   - **The M2 rows of `privacy.retention.RULES` (§20.1)**, each in bounded, fenced transactions (M1 Carry-forward 17):
     - `RetentionRule("draft_content", timedelta(days=30))`: for drafts `confirmed`, `discarded` or `failed` for 30 days with `content_purged_at IS NULL`, it sets `draft_json := NULL` and `reviewed_text := NULL`, sets `content_purged_at`, and nulls the `output_json` of the draft's `extract_profile` calls.
-    - `RetentionRule("cv_files", timedelta(days=30))` (§20.1). It never touches a `cv_files` row that is the `cv_file_id` of the active profile version or of the previous one (the highest `version_no` below the active one), or that belongs to an open draft. Of the rest, it purges:
-      - the files of confirmed versions older than the previous one, at once;
-      - the files of drafts `discarded` or `failed` for 30 days (`status_changed_at`);
-      - abandoned uploads: a row no draft references, 30 days after `uploaded_at`.
+    - `RetentionRule("cv_files", timedelta(days=30))` (§20.1).
+      - **Kept:** the `cv_file_id` of the active profile version and of the previous one, and the file of any open draft. "Previous" follows the activation order, not `version_no`: it is the `confirmed_profile_version_id` of the newest confirmed draft before the newest one that names a different version. A reactivated older version therefore keeps the version it replaced as its previous.
+      - **Purged at once:** every other file of a confirmed draft. That covers both the files of versions that are neither active nor previous, and an upload whose confirm reused another version with the same `profile_hash` (that version keeps its own `cv_file_id`).
+      - **Purged after 30 days:** the files of drafts `discarded` or `failed` for 30 days (`status_changed_at`), and abandoned uploads (a row no draft references) 30 days after `uploaded_at`.
       It deletes the file from `cv_store` first (missing is fine), then sets `storage_path`, `raw_text_enc` and `stripped_text` to NULL and sets `purged_at` (Deviation 21).
     - `RetentionRule("cv_store_orphans", timedelta(days=1))`: a file in `cv_store` that no `cv_files.storage_path` names and that is older than a day is deleted. That is an upload whose transaction rolled back after the file was written.
     - `RetentionRule("eval_runs", THIRTEEN_MONTHS)`: it keeps the latest completed run of each kind, and the calls cascade.
-    - `RetentionRule("profile_checkpoints", timedelta(days=14))`: the threads `profile-<draft>-t*` and `-p*` of drafts that ended 14 days ago, and `queries-<version>-q*` of proposals that ended 14 days ago.
+    - `RetentionRule("profile_checkpoints", timedelta(days=14))`: a `profile-…` or `queries-…` thread is deleted when the operation whose id its name carries (Deviation 27) finished 14 days ago or no longer exists. Each thread is tied to its own execution, so a newer or running operation's thread is never touched.
   - **Carry-forward 17.** `_purge_threads` and `_delete_finished_jobs` work in batches of 500 threads and 1,000 jobs, each batch its own fenced transaction.
   - **Carry-forward 13.**
     - `quota/cells.py` holds `CellRow`, `ensure_cells`, `_cell_rows`, `location_keys`, `_places` and the cell SQL.
@@ -1715,6 +1741,9 @@ Also cover, in `test_profile_confirm.py`:
   - `test_retention_m2.py`:
     - each new rule at its edge (29 and 31 days);
     - the active and the previous version's files are kept, and an older version's file is deleted on disk and nulled in the row;
+    - a second upload whose confirm reused the active version (identical content, a different `cv_files` id) is purged, while the version's own file stays;
+    - after V1, V2 and V3, a confirm reusing V1 keeps V1's and V3's files and purges V2's;
+    - a proposal thread of a finished operation goes after 14 days, while a running proposal's thread of the same profile version stays;
     - the `content_purged_at` CHECKs hold;
     - the latest completed `eval_runs` row of a kind survives 14 months;
     - profile threads are deleted with their checkpoints, and run threads are untouched.
@@ -1820,7 +1849,7 @@ Each deviation stages a spec item across milestones, or settles something the sp
    - Also new: `scripts/spikes/{record_anthropic,v13_structured_stream,v19_token_bound}.py`, `scripts/check_llm_boundary.py` and `tests/{payload,docparse}/`.
 5. **`llm_ledger_unsettled` is its own reconciler.** §17.4's `ledger_unsettled` row covers quota and spend entries, and M1 built the quota half. The LLM half has the same conditions and actions, and updates the `llm_budget` counters in the same transaction. It runs on the same cadence (tick) under its own name, so a failure of one half never hides the other.
 6. **`llm.unexpected_stop_reason`** (warn) is a code §17.6 lacks. §10.5 asks for "a warn alert" on an unexpected `stop_reason` without naming it. M5's catalogue adds it.
-7. **Encryption and page count are checked by `docparse`, not by the upload** (§12.1 lists them as upload checks). Parsing PDF structure inside the API would put a PDF parser in the networked process that §12.2 keeps sandboxed. The API checks size, magic, extension and the ZIP structure; an encrypted PDF or one with more than 20 pages fails the draft with `failed('encrypted')` or `failed('too_many_pages')` within seconds, before any LLM call. User-visible: the rejection arrives on the draft, not on the upload response.
+7. **Encryption and page count are checked by `docparse`, not by the upload** (§12.1 lists them as upload checks). Parsing PDF structure inside the API would put a PDF parser in the networked process that §12.2 keeps sandboxed. The API checks size, magic, extension and the ZIP structure; an encrypted PDF or one with more than 20 pages fails the draft with `failed('encrypted')` or `failed('too_many_pages')` within seconds, before any LLM call. The native-PDF path validates in docparse too (`check_pdf`), and such a draft offers only "paste text", since a native send would bypass §12.1. User-visible: the rejection arrives on the draft, not on the upload response.
 8. **Native-PDF evidence is `unverifiable`.** §9.5's grounding needs a transmitted text, and a native PDF has none the worker can read without the parser it was sent around. Every evidence of a native-PDF profile is reported `unverifiable`, which does not block confirm. The contact scan of §12.7 still runs.
 9. **Spikes split with M3, and V19's one paid call.**
    - V5's 20 real streamed generator and critic calls and V14 (the cache) need M3's prompts.
@@ -1856,7 +1885,12 @@ Each deviation stages a spec item across milestones, or settles something the sp
     - A settlement that arrives after the reconciler moved the entry to `ambiguous` uses §7.16.7's `ambiguous → billed | not_billed` edges for online calls too, and two new `llm_calls` edges, `ambiguous → completed | error`. The counters change in the same transaction.
     - No reservation is ever dropped or charged twice.
 25. **Profile-graph exceptions are sanitised before LangGraph sees them.** LangGraph stores a node's exception in `checkpoint_writes`, so §16's "no CV text in a checkpoint" needs every profile node wrapped (`sanitized`). Only exceptions whose text is a code pass through; any other becomes `NodeFailed(node, error_class)`. Diagnosis then relies on the logged error class and the operation's `last_error_code`.
-26. **Receipts of paid profile calls.** §9.1's receipt rule is applied to the `extract_profile` and `propose_queries` calls. A completed call with an `output_json`, recorded under the operation's id in `input_refs`, is the receipt, and a resumed or reclaimed execution of that operation reuses it instead of paying again. A new approval or retry is a new operation, so it never reuses an older output.
+26. **Receipts of paid profile calls.** §9.1's receipt rule is applied to the `extract_profile` and `propose_queries` calls.
+    - The receipts are the completed calls recorded under the operation's id in `input_refs`, per `logical_call_no` (1 the call, 2 its one repair; `llm_calls.logical_call_no` is otherwise a scoring column).
+    - A resumed or reclaimed execution reuses them instead of paying again, and never repeats or skips the repair.
+    - Every handler's last domain write finishes its operation in the same transaction (`OperationContext.finish_in`), so a draft or proposal never moves to a later generation while an older operation is still live.
+    - A new approval or retry is a new operation.
+27. **Thread names carry the operation.** §9.5 names the threads `profile-<draft_id>-t<n>` and `-p<n>` without defining `n`. M2 uses `n = <operation_id>-a<attempts>`, and `queries-<proposal_id>-q<operation_id>-a<attempts>` for proposals. Successive operations of one draft or profile then never share a thread, and retention deletes a thread by its own operation's end.
 
 ## Carry-forward to later milestones
 
