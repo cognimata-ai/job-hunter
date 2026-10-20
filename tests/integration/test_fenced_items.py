@@ -196,3 +196,72 @@ async def test_a_fenced_backlog_larger_than_the_limit_never_starves_a_released_i
     for item in backlog:
         assert await item_row(engine, item) == ("deferred", "job_fenced", True, None)
     assert {item: await row_version(engine, item) for item in backlog} == versions
+
+
+# --- Final wave F5 (ledger L294): the SQL selection of released items follows the Python job set ------------
+
+
+async def test_the_released_selection_follows_the_posting_branch(engine, current_epoch) -> None:
+    """An item whose only path to a fenced job is its posting (the same instance and native id, no key) is
+    deferred by the Python job set and left out of the selection until the fence is released."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=6)
+    first = await pending_item(engine, owner, "jsearch", {"native_id": "P"}, fetched_at=at)
+    assert await resolved(engine, owner, first) == "linked"
+    job = (await jobs_of_native(engine, "P"))["jsearch"]
+    released = await fence(engine, "jobs", jobs=(job,))
+    keyless = await pending_item(
+        engine, owner, "jsearch", {"native_id": "P", "raw_keys": ()}, fetched_at=at + timedelta(hours=1)
+    )
+    assert await resolve_run_items(engine, owner, clock=utcnow) == {"deferred": 1}
+    assert await item_row(engine, keyless) == ("deferred", "job_fenced", True, None)
+    async with engine.begin() as c:
+        await finalize_run(c, owner, status="succeeded", reason=None, report={})
+    later = await queued_run(engine)
+    version = await row_version(engine, keyless)
+    assert await resolve_deferred_items(engine, later) == {}  # not selected: the row is untouched
+    assert await row_version(engine, keyless) == version
+    async with engine.begin() as c:
+        await c.execute(RELEASE, {"f": released})
+    assert await resolve_deferred_items(engine, later) == {"linked": 1}
+    assert (await item_row(engine, keyless))[0] == "linked"
+
+
+ROOT_OF = sa.text("UPDATE jobs SET merged_into_job_id = :root WHERE id = :job")
+
+
+async def test_the_released_selection_follows_a_key_to_its_merged_root(engine, current_epoch) -> None:
+    """An item whose key's owner is merged into a fenced root (the key read before the merge moved it, a
+    state made by hand here) is deferred by the Python job set, which follows the owner to its root, and the
+    selection follows it to that root as well: the item waits for the root's fence, not the owner's."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=6)
+    for source, native_id, hours in (("jsearch", "M", 0), ("adzuna", "9", 1)):
+        item = await pending_item(
+            engine, owner, source, {"native_id": native_id}, fetched_at=at + timedelta(hours=hours)
+        )
+        assert await resolved(engine, owner, item) == "linked"
+    merged, root = (
+        (await jobs_of_native(engine, "M"))["jsearch"],
+        (await jobs_of_native(engine, "9"))["adzuna"],
+    )
+    async with engine.begin() as c:
+        await c.execute(ROOT_OF, {"root": root, "job": merged})  # the key `htidocid:M` stays on `merged`
+    released = await fence(engine, "jobs", jobs=(root,))  # the root only: `merged` itself is not fenced
+    async with engine.connect() as c:
+        fenced = sa.text("SELECT is_fenced(:j)")
+        assert [(await c.execute(fenced, {"j": j})).scalar_one() for j in (merged, root)] == [False, True]
+    held = await pending_item(
+        engine, owner, "serpapi", {"native_id": "M"}, fetched_at=at + timedelta(hours=2)
+    )  # its one key, `htidocid:M`, is owned by `merged`
+    assert await resolve_run_items(engine, owner, clock=utcnow) == {"deferred": 1}
+    async with engine.begin() as c:
+        await finalize_run(c, owner, status="succeeded", reason=None, report={})
+    later = await queued_run(engine)
+    version = await row_version(engine, held)
+    assert await resolve_deferred_items(engine, later) == {}
+    assert await row_version(engine, held) == version
+    async with engine.begin() as c:
+        await c.execute(RELEASE, {"f": released})
+    assert await resolve_deferred_items(engine, later) == {"linked": 1}
+    assert await jobs_of_native(engine, "M") == {"jsearch": merged, "serpapi": root}

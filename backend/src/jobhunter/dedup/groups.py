@@ -23,9 +23,10 @@ confirms (G2-G5), against whose every member it passes G1 and has no `different`
 than `MAX_MEMBERS` members; a group without a representative cannot be validated and is not joined. Of
 several, the one with the best text score, then the lowest id: `dedup.ambiguous_grouping` is raised as an info
 alert (subject `job:<id>`, Ruling T20-b) when the job joins, logged, and kept in the member's evidence; a
-regroup that only confirms the job raises nothing. Otherwise the ungrouped candidate with the best pair
-evidence (text score, then lowest id) forms a new group with it, its representative elected by §8.7's order
-(`initial`). Groups are never merged together.
+regroup that only confirms the job raises nothing, and the alert is resolved when the job leaves the group
+(`representative.leave`: it left, was split off or merged away, or the group dissolved). Otherwise the
+ungrouped candidate with the best pair evidence (text score, then lowest id) forms a new group with it, its
+representative elected by §8.7's order (`initial`). Groups are never merged together.
 
 **`regroup_job`** (the grouping of one job, in the caller's transaction): the candidates are the jobs of the
 same `company_key`, first seen at most `CANDIDATE_DAYS` apart, unmerged, with no `different` decision against
@@ -128,7 +129,8 @@ CANDIDATE_DAYS: Final = 45
 MAX_MEMBERS: Final = 10
 G2_KM: Final = 25.0
 GROUPING_COUNTERS: Final = ("groups_formed", "groups_changed", "elections")
-AMBIGUOUS_GROUPING: Final = "dedup.ambiguous_grouping"  # an info alert, subject `job:<id>` (Ruling T20-b)
+# An info alert, subject `job:<id>` (Ruling T20-b), resolved when the job leaves its group (`representative`).
+AMBIGUOUS_GROUPING: Final = representative.AMBIGUOUS_GROUPING
 # election reasons (§7.9 `duplicate_groups.election_reason`)
 INITIAL: Final = "initial"
 FULLER_MEMBER_JOINED: Final = "fuller_member_joined"
@@ -188,7 +190,6 @@ _MEMBERS_OF: Final = q(
     "SELECT group_id, job_id FROM duplicate_group_members WHERE group_id = ANY(CAST(:ids AS bigint[])) "
     "ORDER BY group_id, job_id"
 )
-_MEMBERS: Final = q("SELECT job_id FROM duplicate_group_members WHERE group_id = :group ORDER BY job_id")
 # The members in the order they joined (the revalidation replays the join rule in that order).
 _MEMBERS_JOINED: Final = q(
     "SELECT job_id FROM duplicate_group_members WHERE group_id = :group ORDER BY joined_at, job_id"
@@ -440,15 +441,15 @@ def choose_partner(
 
 
 def member_view(view: JobView) -> MemberView:
-    """The election's view of a job."""
-    return MemberView(
+    """The election's view of a job (`representative.member_view`)."""
+    return representative.member_view(
         job_id=view.id,
         availability=view.availability,
         completeness=view.completeness,
         source_rank=view.source_rank,
         description_length=len(view.description_text),
         first_seen_at=view.first_seen_at,
-        eligible=eligible(view.availability, view.merged),
+        merged=view.merged,
     )
 
 
@@ -493,10 +494,6 @@ async def _similarities(conn: AsyncConnection, title: str, views: Iterable[JobVi
     return {int(row.id): float(row.similarity) for row in await conn.execute(_SIMILARITY, params)}
 
 
-async def _members(conn: AsyncConnection, group_id: int) -> list[int]:
-    return [int(job) for job in (await conn.execute(_MEMBERS, {"group": group_id})).scalars()]
-
-
 async def _leave(conn: AsyncConnection, group_id: int, job_ids: Sequence[int], *, reason: str) -> None:
     await representative.leave(conn, group_id, job_ids)
     for job_id in job_ids:
@@ -525,7 +522,7 @@ async def _elect(conn: AsyncConnection, group_id: int, *, reason: str) -> tuple[
     """An election for `reason`, then the revalidation against the new representative; the jobs that left,
     those of a group of fewer than two members that is dissolved instead (as `reelect` would) among them."""
     group = (await conn.execute(_GROUP, {"group": group_id})).one()
-    if group.status == "active" and len(await _members(conn, group_id)) < 2:
+    if group.status == "active" and len(await representative.member_ids(conn, group_id)) < 2:
         return await representative.dissolve(conn, group_id, reason=reason)
     elected = await representative.reelect(conn, group_id, reason=reason)
     return () if elected is None else await _revalidate(conn, group_id, elected)
@@ -695,14 +692,18 @@ class _Regroup:
     async def _representative(self, group_id: int, a: JobView) -> GroupEffect:
         """The job represents its group and its content changed: revalidate, or re-elect if it is not
         eligible any more."""
-        if eligible(a.availability, a.merged):
-            left = await _revalidate(self.conn, group_id, a.id)
-        else:
+        elected = not eligible(a.availability, a.merged)
+        if elected:
             left = await _elect(self.conn, group_id, reason=REP_INACTIVE)
-            self.reelected = self.wrote = True
+            self.wrote = True
+        else:
+            left = await _revalidate(self.conn, group_id, a.id)
         self.left.extend(left)
         self.wrote |= bool(left)
         still = (await self.conn.execute(_GROUP, {"group": group_id})).one().status == "active"
+        # A group dissolved instead of electing (fewer than two members), or by the revalidation after its
+        # election, has no representative: that is no election (the run's `elections` counter, ledger L330).
+        self.reelected |= elected and still
         return self.effect(group_id if still and a.id not in left else None)
 
     def _candidates(self, a: JobView) -> list[JobView]:
@@ -818,7 +819,7 @@ async def leave_group(conn: AsyncConnection, job_id: int, *, reason: str, held: 
     if group is None:
         return
     group_id = int(group.id)
-    member_ids = await _members(conn, group_id)
+    member_ids = await representative.member_ids(conn, group_id)
     if unheld := sorted(set(member_ids) - set(held)):
         raise InvariantViolation(f"group {group_id}: the rows of jobs {unheld} are not locked")
     await _leave(conn, group_id, [job_id], reason=reason)
@@ -832,18 +833,18 @@ async def leave_group(conn: AsyncConnection, job_id: int, *, reason: str, held: 
 
 async def _lock_group(
     conn: AsyncConnection, group_id: int, job_ids: Sequence[int]
-) -> tuple[Row[tuple[object, ...]], list[int], frozenset[int]]:
+) -> tuple[Row[tuple[object, ...]], tuple[int, ...], frozenset[int]]:
     """The rows of `job_ids` and of the group's members in one ordered statement, then the group row: the
     group, its members under the lock and the job rows held. Raises `LookupError` for a group that does not
     exist and `InvariantViolation` for one that is not active or whose members changed meanwhile."""
-    read = await _members(conn, group_id)
+    read = await representative.member_ids(conn, group_id)
     held = frozenset(await merge.lock_jobs(conn, (*job_ids, *read), with_groups_of=read))
     rows = (await conn.execute(_LOCK_GROUPS, {"ids": [group_id]})).all()
     if not rows:
         raise LookupError(f"duplicate group {group_id} does not exist")
     if rows[0].status != "active":
         raise InvariantViolation(f"duplicate group {group_id} is {rows[0].status}, not active")
-    member_ids = await _members(conn, group_id)
+    member_ids = await representative.member_ids(conn, group_id)
     if not set(member_ids) <= held:
         raise InvariantViolation(f"duplicate group {group_id} changed while it was being locked")
     return rows[0], member_ids, held
@@ -942,14 +943,14 @@ async def repair_group(conn: AsyncConnection, group_id: int, *, guard: Guard) ->
     row = (await conn.execute(_GROUP, {"group": group_id})).first()
     if row is None or row.status != "active":
         return False
-    read = await _members(conn, group_id)
+    read = await representative.member_ids(conn, group_id)
     named = [] if row.representative_job_id is None else [int(row.representative_job_id)]
     held = frozenset(await merge.lock_jobs(conn, (*read, *named), with_groups_of=read))
     await guard(conn)
     rows = (await conn.execute(_LOCK_GROUPS, {"ids": [group_id]})).all()
     if not rows or rows[0].status != "active":
         return False
-    member_ids = await _members(conn, group_id)
+    member_ids = await representative.member_ids(conn, group_id)
     if not set(member_ids) <= held:
         return False  # it changed since the read: the next pass sees it again
     rep = rows[0].representative_job_id

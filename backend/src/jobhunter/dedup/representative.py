@@ -22,6 +22,8 @@ reason it did not find again. Representative changes are not state transitions (
 **`dissolve`**: the remaining members leave (`duplicate_group_members` rows deleted, `jobs.duplicate_group_id
 := NULL`) and the group moves `active → dissolved` through `transition()` with the reason as its
 `election_reason`; its representative and `unscorable_reason` are cleared, since a dissolved group has none.
+A job that leaves a group (`leave`, which `dissolve` and every path of `groups` use) has its
+`dedup.ambiguous_grouping` alert resolved.
 
 Every timestamp written is the database's `now()` (Ruling T18-b's convention: no caller clock).
 """
@@ -36,9 +38,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
+from jobhunter.observability.alerts import resolve_alert
 from jobhunter.observability.logging import get_logger
 
 NO_ACTIVE_MEMBER: Final = "no_active_member"
+# An info alert, subject `job:<id>` (Ruling T20-b): raised by `groups` when a job joins the best of several
+# groups, resolved here when it leaves.
+AMBIGUOUS_GROUPING: Final = "dedup.ambiguous_grouping"
 # §8.7's order of the eligible availabilities; `closed` is never eligible.
 AVAILABILITY_ORDER: Final = ("active", "unknown", "stale")
 WORST_RANK: Final = 99  # the precedence rank of a job without a known source
@@ -103,15 +109,38 @@ def elect(members: Sequence[MemberView]) -> MemberView | None:
     return min((m for m in members if m.eligible), key=_order, default=None)
 
 
-def _member_view(row: Row[tuple[object, ...]]) -> MemberView:
+def member_view(
+    *,
+    job_id: int,
+    availability: str,
+    completeness: str,
+    source_rank: int,
+    description_length: int,
+    first_seen_at: datetime,
+    merged: bool,
+) -> MemberView:
+    """The election's view of a job, its eligibility derived here (`eligible`): the one constructor, for a
+    member read from the database (`member_views`) and for a job `groups` holds in memory."""
     return MemberView(
+        job_id=job_id,
+        availability=availability,
+        completeness=completeness,
+        source_rank=source_rank,
+        description_length=description_length,
+        first_seen_at=first_seen_at,
+        eligible=eligible(availability, merged),
+    )
+
+
+def _member_view(row: Row[tuple[object, ...]]) -> MemberView:
+    return member_view(
         job_id=int(row.id),
         availability=str(row.availability),
         completeness=str(row.completeness),
         source_rank=int(row.source_rank),
         description_length=int(row.description_length),
         first_seen_at=row.first_seen_at,
-        eligible=eligible(str(row.availability), bool(row.merged)),
+        merged=bool(row.merged),
     )
 
 
@@ -121,16 +150,25 @@ async def member_views(conn: AsyncConnection, group_id: int) -> list[MemberView]
     return [_member_view(row) for row in rows]
 
 
+async def member_ids(conn: AsyncConnection, group_id: int) -> tuple[int, ...]:
+    """The job ids of the group's members, in id order."""
+    return tuple(int(job) for job in (await conn.execute(_MEMBERS, {"group": group_id})).scalars())
+
+
 async def leave(conn: AsyncConnection, group_id: int, job_ids: Sequence[int]) -> None:
     """The jobs leave the group: their membership rows and their `duplicate_group_id`. The caller holds
-    their rows."""
+    their rows. A job that joined as the best of several groups stands in that choice no longer, so its
+    `dedup.ambiguous_grouping` alert is resolved (ledger L330): every leave path comes here, a member that
+    leaves or is split off, a dissolution and the from-job of a merge."""
     await conn.execute(_LEAVE, {"group": group_id, "jobs": list(job_ids)})
     await conn.execute(_UNGROUP, {"group": group_id, "jobs": list(job_ids)})
+    for job_id in job_ids:
+        await resolve_alert(conn, code=AMBIGUOUS_GROUPING, subject=f"job:{job_id}")
 
 
 async def dissolve(conn: AsyncConnection, group_id: int, *, reason: str) -> tuple[int, ...]:
     """Dissolve the active group (module docstring); the members that left it with the dissolution."""
-    remaining = tuple(int(job) for job in (await conn.execute(_MEMBERS, {"group": group_id})).scalars())
+    remaining = await member_ids(conn, group_id)
     await leave(conn, group_id, remaining)
     await transition(
         conn,

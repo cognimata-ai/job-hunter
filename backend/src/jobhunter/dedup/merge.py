@@ -75,7 +75,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
-from jobhunter.dedup import groups, revisions
+from jobhunter.dedup import revisions
 from jobhunter.dedup.revisions import FIELD_CONFLICT_ALERT, RecomputeResult
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.normalize.fields import CONFLICT_FIELDS, CONFLICT_RULE
@@ -341,10 +341,18 @@ async def merge_jobs(
 ) -> int:
     """Merge `from_job_id` into `into_job_id` (§8.6.1 steps 1, 2, 5, 6 and 7; module docstring) in the
     caller's transaction; returns the `merge_events` id. `locked` is the job rows the caller holds (the pair
-    and the from-job's group members among them); without it the merge locks them itself. The caller writes
+    and the from-job's group members among them); without it the merge locks them itself. A transaction that
+    merges several jobs (identity's strong-key merges, `resolve_conflict(merge)`, `groups.confirm_group`)
+    locks every job and co-member of all its merges once, in one `lock_jobs` statement before the first
+    merge, and passes that set as `locked` to each: a merge that locked its own pair after an earlier merge
+    of the transaction would take rows out of id order (Ruling T18-c). The caller writes
     the hard-filter results and bumps the ranking. Raises `FencedOut` for a fenced job, `InvariantViolation`
     for a job already merged, a job merged into itself or a row the transaction does not hold, and
     `LookupError` for a job that does not exist, having written nothing."""
+    # Imported here, not at the top: `groups` imports this module (`lock_jobs`, `merge_jobs`), and a module-
+    # level import back would make the two a cycle (ledger L323).
+    from jobhunter.dedup import groups
+
     held = await _hold_pair(conn, from_job_id, into_job_id, locked)
     snapshot = await _snapshot(conn, from_job_id, into_job_id)
     moved = sorted(

@@ -329,6 +329,47 @@ async def test_the_work_mode_conflict_alert_follows_the_conflict(
     assert resolved.resolved_at is not None and (reopened.occurrences, reopened.resolved_at) == (1, None)
 
 
+async def test_a_tainted_refusal_still_follows_the_field_conflict(
+    engine: AsyncEngine, current_epoch: int, job_with_postings: JobWithPostings
+) -> None:
+    """Ledger L264: a recompute that refuses a tainted reuse still records the selection's conflicts. The
+    conflict that persists under the fence raises nothing more, and one the fence removes is resolved."""
+
+    def structured(*modes: str) -> dict[str, Any]:
+        return {"work_mode_possible": frozenset(modes), "work_mode_source": "structured"}
+
+    made = await job_with_postings({"adzuna": structured("remote")})  # revision 1, its lineage Adzuna's
+    job = made.job_id
+    first = await recompute(engine, job)
+    async with engine.begin() as conn:
+        jsearch, _ = await add_posting(conn, job, "jsearch", observed_at=utcnow(), **structured("remote"))
+        await add_posting(conn, job, "arbeitnow", observed_at=utcnow(), **structured("onsite"))
+    # the same projection (JSearch, the best rank, keeps `remote`), now with a conflict: revision 1 reused
+    conflicted = await recompute(engine, job)
+    assert (conflicted.revision_id, conflicted.revision_created) == (first.revision_id, False)
+    assert conflicted.conflicts == ("work_mode_possible",)
+    key = f"dedup.field_conflict:job:{job}:work_mode_possible"
+    [alert] = await fetch(engine, ALERTS, key=key)
+    assert (alert.severity, alert.occurrences, alert.resolved_at) == ("info", 1, None)
+
+    # Adzuna fenced: the projection (JSearch and Arbeitnow) hashes as revision 1, whose lineage names Adzuna,
+    # so the reuse is refused; the conflict holds and is recorded, and its alert counts no new occurrence
+    refused = await recompute(engine, job, fenced=frozenset({"adzuna"}))
+    assert (refused.tainted_reuse_refused, refused.revision_id) == (True, first.revision_id)
+    assert refused.conflicts == ("work_mode_possible",)
+    provenance = (await job_row(engine, job)).field_provenance["work_mode_possible"]
+    assert (provenance["rule"], provenance["posting_id"]) == ("structured_conflict", jsearch)
+    [alert] = await fetch(engine, ALERTS, key=key)
+    assert (alert.occurrences, alert.resolved_at) == (1, None)
+
+    # Arbeitnow fenced as well: still refused, and the conflict it carried is gone, so its alert is resolved
+    gone = await recompute(engine, job, fenced=frozenset({"adzuna", "arbeitnow"}))
+    assert (gone.tainted_reuse_refused, gone.conflicts) == (True, ())
+    [alert] = await fetch(engine, ALERTS, key=key)
+    assert alert.resolved_at is not None
+    assert len(await fetch(engine, REVISIONS, job=job)) == 1  # no twin of revision 1 at any step
+
+
 async def test_a_recompute_after_only_observed_at_moved_creates_nothing(
     engine: AsyncEngine, current_epoch: int, job_with_postings: JobWithPostings
 ) -> None:

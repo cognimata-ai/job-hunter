@@ -98,13 +98,23 @@ def jobs_maker(engine: AsyncEngine, job_with_postings: Any, start_days_ago: int 
     return make
 
 
+# The backends of the test's own database (`pg_one` connects to it): a `transactionid` lock has no
+# `database`, so the probes below scope every lock by its backend instead.
+OWN_BACKENDS = "pid IN (SELECT pid FROM pg_stat_activity WHERE datname = current_database())"
+# A company lock: a two-key advisory lock (`objsubid = 2`) of `groups.COMPANY_LOCK_NAMESPACE`.
+COMPANY_LOCK = "locktype = 'advisory' AND objsubid = 2 AND classid::bigint = %s"
+
+
 def waiting(server: PgServer, *locktypes: str) -> int:
-    """Lock requests of these `pg_locks` types that wait right now."""
+    """Lock requests of these `pg_locks` types that wait right now in the test's database; an `advisory` one
+    only when it is a company lock (ledger L330)."""
     row = pg_one(
         server,
         "superuser",
-        "SELECT count(*) FROM pg_locks WHERE NOT granted AND locktype = ANY(%s)",
+        f"SELECT count(*) FROM pg_locks WHERE NOT granted AND {OWN_BACKENDS} AND locktype = ANY(%s) "  # noqa: S608
+        f"AND (locktype <> 'advisory' OR ({COMPANY_LOCK}))",
         list(locktypes),
+        groups.COMPANY_LOCK_NAMESPACE,
     )
     return 0 if row is None else int(str(row[0]))
 
@@ -114,12 +124,11 @@ def repairs_total() -> float:
 
 
 def advisory_held(server: PgServer) -> int:
-    """Granted company locks: two-key advisory locks (`objsubid = 2`) of `groups.COMPANY_LOCK_NAMESPACE`."""
+    """Granted company locks in the test's database."""
     row = pg_one(
         server,
         "superuser",
-        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 2 "
-        "AND classid::bigint = %s",
+        f"SELECT count(*) FROM pg_locks WHERE granted AND {OWN_BACKENDS} AND {COMPANY_LOCK}",  # noqa: S608
         groups.COMPANY_LOCK_NAMESPACE,
     )
     return 0 if row is None else int(str(row[0]))
@@ -211,6 +220,11 @@ async def test_an_ambiguous_job_joins_the_better_group(
     assert [row.occurrences for row in await fetch(engine, ALERT, k=f"dedup.ambiguous_grouping:job:{a}")] == [
         1
     ]
+    # ledger L330: once the job leaves the group it chose, the choice is over and its alert resolved
+    async with engine.begin() as conn:
+        await groups.split_member(conn, one, a)
+    [alert] = await fetch(engine, ALERT, k=f"dedup.ambiguous_grouping:job:{a}")
+    assert alert.resolved_at is not None
 
 
 async def test_split_confirm_dissolve_and_reconciler(
@@ -643,7 +657,8 @@ async def test_a_representative_that_closed_re_elects_on_its_own_regroup(
             sa.text("UPDATE jobs SET duplicate_group_id = :g WHERE id = :x"), {"g": lonely, "x": x}
         )
         await conn.execute(close, {"j": x})
-    assert await regroup(engine, x) == GroupEffect(None, False, False, (x,), True, False)
+    # ledger L330: dissolved instead of electing, so no election is reported (nor counted by the node)
+    assert await regroup(engine, x) == GroupEffect(None, False, False, (x,), False, False)
     assert await group_row(engine, lonely) == ("dissolved", None, None, "rep_inactive")
 
 

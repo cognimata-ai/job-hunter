@@ -412,11 +412,14 @@ async def group_of(engine: AsyncEngine, representative: int, members: tuple[int,
     return group
 
 
-async def test_step_5_locks_a_lower_id_member_in_the_one_ordered_statement(
+async def test_step_5_takes_a_lower_id_member_in_the_merge_jobs_one_lock_statement(
     engine, current_epoch, monkeypatch
 ) -> None:
-    """Ruling T18-c: the member a dissolving group leaves behind has a lower id than both merge jobs; its row
-    is locked by the ordered statement, before the owner row, and never lazily."""
+    """Ruling T18-c: the member a dissolving group leaves behind has a lower id than both merge jobs. The
+    recorded `lock_jobs` call carries the claim: one statement locked the member with the two jobs, in
+    ascending id order (the member first), and `lock_jobs` ran once. The NOWAIT probe at the
+    item's crash point shows less: that the identity transaction holds the member's row by then, and no
+    unrelated job's; not when or by which statement the row was locked."""
     owner = await queued_run(engine)
     at = utcnow() - timedelta(hours=8)
     member, a, b, unrelated = await jsearch_jobs(engine, owner, at, "GM", "HA", "HB", "GU")
@@ -442,7 +445,7 @@ async def test_step_5_locks_a_lower_id_member_in_the_one_ordered_statement(
     )
     resolving = asyncio.create_task(resolved(engine, owner, linking))
     await asyncio.wait_for(pause.reached.wait(), 10)
-    # the identity transaction holds the member's row, and only the rows it needs
+    # by the crash point the identity transaction holds the member's row, and only the rows it needs
     assert [await job_lockable(engine, job) for job in (member, a, b, unrelated)] == [
         False,
         False,
@@ -451,7 +454,8 @@ async def test_step_5_locks_a_lower_id_member_in_the_one_ordered_statement(
     ]
     pause.resume()
     assert await asyncio.wait_for(resolving, 10) == "linked"
-    assert calls == [([a, b], [b], [member, a, b])]  # one statement, ascending: the member first
+    # what proves the order: the one lock call, ascending, the member first
+    assert calls == [([a, b], [b], [member, a, b])]
     assert await scalar(engine, "SELECT status FROM duplicate_groups WHERE id = :g", g=group) == "dissolved"
     assert await scalar(engine, "SELECT count(*) FROM duplicate_group_members") == 0
     assert await scalar(engine, "SELECT duplicate_group_id FROM jobs WHERE id = :m", m=member) is None
