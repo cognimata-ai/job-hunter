@@ -52,8 +52,10 @@ COPY --from=build /opt/venv /opt/venv
 COPY --from=model /opt/model /opt/model
 COPY embedder/app.py embedder/health.py embedder/model.lock /app/
 RUN chmod 0555 /app/health.py && ln -s /app/health.py /usr/local/bin/embedder-health
-# onnxruntime's Microsoft telemetry off (app.py sets it again before its import)
-ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 ORT_DISABLE_TELEMETRY=1
+# onnxruntime's Microsoft telemetry off, the Hugging Face hub offline and without telemetry (app.py's
+# RUNTIME_ENV, which OnnxModel sets again before its imports)
+ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 ORT_DISABLE_TELEMETRY=1 HF_HUB_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
 WORKDIR /
 USER 10004:10004
 EXPOSE 8080

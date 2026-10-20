@@ -6,7 +6,8 @@
 #
 # The embedder image runs this at build (embedder/Dockerfile); locally it fills the gitignored .model-cache/
 # for spike V7 and the `embedder_model` tests. A file that is already present with the locked digest is not
-# downloaded again. Any digest mismatch exits non-zero: the lock is the authority, never the download.
+# downloaded again. A download is checked before it takes its name, so a file of another digest never gets
+# the locked name; any mismatch exits non-zero: the lock is the authority, never the download.
 # MODEL_LOCK overrides the lock path (default: model.lock next to this script).
 set -eu
 
@@ -53,8 +54,15 @@ while IFS='=' read -r file digest; do
     echo "downloading: $file"
     curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
         --output "$dest/$file.part" "https://huggingface.co/$repo/resolve/$revision/$file"
+    # A download takes the locked name only once it has the locked digest.
+    got=$(sha256sum < "$dest/$file.part" | cut -d ' ' -f 1)
+    if [ "$got" != "$hex" ]; then
+        rm -f "$dest/$file.part"
+        echo "$file: sha256 mismatch: model.lock sha256:$hex, download sha256:$got" >&2
+        exit 1
+    fi
     mv "$dest/$file.part" "$dest/$file"
 done < "$work/files"
 
-# The authoritative check: every locked file against its locked digest; a mismatch fails the script.
+# The final check: every locked file, the present ones included, against its locked digest.
 (cd "$dest" && sha256sum --check --strict "$sums")

@@ -49,6 +49,12 @@ EXIT_STARTUP_CHECK: Final = 78  # EX_CONFIG: every failed startup check exits wi
 HOST: Final = "0.0.0.0"  # noqa: S104 - the container's port, on the internal network only (§16.9, §19.1)
 PORT: Final = 8080
 LOCK_PATH: Final = Path(__file__).resolve().with_name("model.lock")
+# Set before onnxruntime or tokenizers is imported (disable_telemetry); the image sets the same (Dockerfile).
+# onnxruntime 1.31 on Linux has Microsoft telemetry (1DS: a device id and an event store under
+# ~/.cache/Microsoft/DeveloperTools/.onnxruntime, posted to mobile.events.data.microsoft.com), and its switch
+# only counts before the import (V7). The Hugging Face hub (a dependency of tokenizers) is kept offline and
+# without telemetry as well, though the service only reads local files.
+RUNTIME_ENV: Final = {"ORT_DISABLE_TELEMETRY": "1", "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"}
 
 _LOCK_META: Final = ("repo", "revision", "model_id")
 _SHA256: Final = re.compile(r"sha256:([0-9a-f]{64})")
@@ -139,6 +145,11 @@ def locked_onnx_file(lock: Path) -> str:
     return graphs[0]
 
 
+def disable_telemetry() -> None:
+    """Set RUNTIME_ENV in this process's environment, overriding any other value."""
+    os.environ.update(RUNTIME_ENV)
+
+
 def threads_from_env() -> int:
     """onnxruntime's intra-op threads: EMBEDDER_THREADS, default 3 (the service's 3 CPUs, §19.1)."""
     raw = os.environ.get("EMBEDDER_THREADS", str(DEFAULT_THREADS))
@@ -176,10 +187,7 @@ class OnnxModel(Model):
         onnxruntime reads a graph's external data (`onnx/model.onnx_data` of the fp32 export) from the graph's
         directory, so the lock keeps it beside the graph (`locked_onnx_file`).
         """
-        # onnxruntime 1.31 on Linux has Microsoft telemetry (1DS: a device id and an event store under
-        # ~/.cache/Microsoft/DeveloperTools/.onnxruntime, posted to mobile.events.data.microsoft.com); the
-        # switch only counts when it is set before the import (V7). The image sets it too (Dockerfile).
-        os.environ["ORT_DISABLE_TELEMETRY"] = "1"
+        disable_telemetry()  # before the imports: onnxruntime reads its switch at import
         import numpy as np
         import onnxruntime as ort
         from tokenizers import Tokenizer

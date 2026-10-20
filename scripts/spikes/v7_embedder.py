@@ -24,11 +24,18 @@ so its peak RSS is its own.
 Only numbers are printed, never an ad's text.
 """
 
+import os
+
+# onnxruntime's Microsoft telemetry off before anything can import onnxruntime: its switch only counts before
+# the import, and this script imports it itself (environment(), padded_run) as well as through OnnxModel.
+os.environ["ORT_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
 import argparse
 import hashlib
 import json
 import math
-import os
 import platform
 import resource
 import statistics
@@ -288,7 +295,6 @@ def main_run(model_dir: Path, onnx_file: str, fp32_dir: Path | None, threads: in
 
 def padded_run(model_dir: Path, onnx_file: str, fp32_dir: Path | None, threads: int, batch: int) -> None:
     """The road not taken: the 1,024-token ads as padded batches of `batch` through onnxruntime directly."""
-    os.environ["ORT_DISABLE_TELEMETRY"] = "1"
     import numpy as np
     import onnxruntime as ort
     from tokenizers import Tokenizer

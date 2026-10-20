@@ -8,6 +8,7 @@ run with `uv run --group embedder pytest tests/embedder -m embedder_model`.
 
 import hashlib
 import http.server
+import importlib.util
 import json
 import logging
 import math
@@ -30,8 +31,10 @@ from embedder.app import (
     MAX_TEXT_BYTES,
     MAX_TOKENS,
     QUERY_PREFIX,
+    RUNTIME_ENV,
     ChecksumMismatch,
     create_app,
+    disable_telemetry,
     locked_onnx_file,
     verify_checksums,
 )
@@ -39,6 +42,8 @@ from embedder.app import (
 ROOT = Path(__file__).resolve().parents[2]
 LOCK = ROOT / "embedder" / "model.lock"
 MODEL_DIR = ROOT / ".model-cache" / "arctic"
+DOWNLOAD = ROOT / "embedder" / "download_model.sh"
+SPIKE = ROOT / "scripts" / "spikes" / "v7_embedder.py"
 
 
 class FakeModel:
@@ -239,6 +244,103 @@ def test_main_exits_78_and_names_the_file_on_a_checksum_mismatch(
     assert "embedder.checksum_mismatch" in caplog.text and f"file={locked_onnx_file(LOCK)}" in caplog.text
 
 
+def test_main_exits_78_on_an_invalid_thread_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    lock = _write_lock(tmp_path, {"onnx/model.onnx": b"graph", "tokenizer.json": b"tok"})  # the files match
+    monkeypatch.setattr(embedder_app, "LOCK_PATH", lock)
+    monkeypatch.setenv("EMBEDDER_MODEL_DIR", str(tmp_path))
+    monkeypatch.setenv("EMBEDDER_THREADS", "0")
+    with caplog.at_level(logging.CRITICAL, logger="embedder"), pytest.raises(SystemExit) as exc:
+        embedder_app.main()
+    assert exc.value.code == 78
+    assert "embedder.startup_check_failed" in caplog.text and "EMBEDDER_THREADS" in caplog.text
+
+
+def test_main_exits_78_on_a_malformed_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    lock = tmp_path / "model.lock"
+    lock.write_text("repo=r\nrevision=v\nonnx/model.onnx=sha256:" + "0" * 64 + "\n")  # no model_id
+    monkeypatch.setattr(embedder_app, "LOCK_PATH", lock)
+    monkeypatch.setenv("EMBEDDER_MODEL_DIR", str(tmp_path))
+    with caplog.at_level(logging.CRITICAL, logger="embedder"), pytest.raises(SystemExit) as exc:
+        embedder_app.main()
+    assert exc.value.code == 78
+    assert "embedder.startup_check_failed" in caplog.text and "model.lock: missing model_id" in caplog.text
+
+
+def test_disable_telemetry_sets_every_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("ORT_DISABLE_TELEMETRY", "HF_HUB_OFFLINE", "HF_HUB_DISABLE_TELEMETRY"):
+        monkeypatch.delenv(name, raising=False)  # restored after the test
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    disable_telemetry()
+    assert RUNTIME_ENV == {
+        "ORT_DISABLE_TELEMETRY": "1",
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+    }
+    assert {name: os.environ[name] for name in RUNTIME_ENV} == RUNTIME_ENV
+
+
+def test_the_image_sets_the_same_switches() -> None:
+    runtime = (ROOT / "embedder" / "Dockerfile").read_text().split("AS runtime", 1)[1].replace("\\\n", " ")
+    env_words = " ".join(line for line in runtime.splitlines() if line.startswith("ENV ")).split()
+    assert all(f"{name}={value}" in env_words for name, value in RUNTIME_ENV.items())
+
+
+_FAKE_CURL = """#!/bin/sh
+# curl as download_model.sh calls it: the last argument is the URL, `--output` names the file to write
+out=""; url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in --output) out=$2; shift 2 ;; *) url=$1; shift ;; esac
+done
+cp "$FAKE_HF/${url#*/resolve/*/}" "$out"
+"""
+
+
+def _run_download(
+    tmp_path: Path, served: dict[str, bytes], locked: dict[str, bytes]
+) -> subprocess.CompletedProcess[str]:
+    """download_model.sh against a fake curl that serves `served`, with a lock of the sha256 of `locked`."""
+    for name, content in served.items():
+        (tmp_path / "hf" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "hf" / name).write_bytes(content)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "curl").write_text(_FAKE_CURL)
+    (tmp_path / "bin" / "curl").chmod(0o755)
+    lines = ["repo=o/m", f"revision={'a' * 40}", "model_id=m"]
+    lines += [f"{name}=sha256:{hashlib.sha256(content).hexdigest()}" for name, content in locked.items()]
+    (tmp_path / "model.lock").write_text("\n".join(lines) + "\n")
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "MODEL_LOCK": str(tmp_path / "model.lock"),
+        "FAKE_HF": str(tmp_path / "hf"),
+    }
+    return subprocess.run(
+        ["sh", str(DOWNLOAD), str(tmp_path / "model")], env=env, capture_output=True, text=True, check=False
+    )
+
+
+def test_download_model_places_the_locked_files(tmp_path: Path) -> None:
+    files = {"onnx/model.onnx": b"graph", "onnx/model.onnx_data": b"weights", "tokenizer.json": b"tok"}
+    r = _run_download(tmp_path, served=files, locked=files)
+    assert r.returncode == 0, r.stderr
+    assert {
+        p.relative_to(tmp_path / "model").as_posix() for p in (tmp_path / "model").rglob("*") if p.is_file()
+    } == set(files)
+
+
+def test_download_model_never_gives_a_mismatched_download_the_locked_name(tmp_path: Path) -> None:
+    locked = {"onnx/model.onnx": b"graph", "tokenizer.json": b"tok"}
+    r = _run_download(tmp_path, served={**locked, "tokenizer.json": b"tampered"}, locked=locked)
+    assert r.returncode != 0
+    assert "tokenizer.json" in r.stderr and hashlib.sha256(b"tampered").hexdigest() in r.stderr
+    assert not (tmp_path / "model" / "tokenizer.json").exists()
+    assert not (tmp_path / "model" / "tokenizer.json.part").exists()
+
+
 class _HealthStub(http.server.BaseHTTPRequestHandler):
     status = 200
     body = b""
@@ -299,18 +401,28 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b, strict=True)) / (math.hypot(*a) * math.hypot(*b))
 
 
-@pytest.mark.embedder_model
-def test_real_model_vectors_are_unit_length_and_prefix_sensitive() -> None:
+def _require_embedder_group() -> None:
+    """The `embedder_model` tests run only with the `embedder` dependency group; they fail, never skip."""
+    missing = [m for m in ("onnxruntime", "tokenizers", "numpy") if importlib.util.find_spec(m) is None]
+    if missing:
+        pytest.fail(
+            f"the embedder dependency group is not installed ({', '.join(missing)} missing): run with"
+            " `uv run --group embedder pytest tests/embedder -m embedder_model`"
+        )
+
+
+def _require_model() -> None:
+    _require_embedder_group()
     if not (MODEL_DIR / "tokenizer.json").is_file():
         pytest.fail("the model is not downloaded: run embedder/download_model.sh .model-cache/arctic")
-    try:
-        from embedder.app import OnnxModel
 
-        model = OnnxModel(MODEL_DIR)
-    except ImportError as exc:
-        pytest.fail(
-            f"the embedder dependency group is not installed ({exc}): run with `uv run --group embedder`"
-        )
+
+@pytest.mark.embedder_model
+def test_real_model_vectors_are_unit_length_and_prefix_sensitive() -> None:
+    _require_model()
+    from embedder.app import OnnxModel
+
+    model = OnnxModel(MODEL_DIR)
     assert (
         verify_checksums(MODEL_DIR, LOCK)
         == dict(line.split("=", 1) for line in LOCK.read_text().splitlines())["model_id"]
@@ -340,13 +452,38 @@ def test_real_model_vectors_are_unit_length_and_prefix_sensitive() -> None:
     assert _cosine(solo[0], passages[0]) > 0.99999
 
 
+def _fresh_home_env(home: Path) -> dict[str, str]:
+    """The environment with a fresh HOME and none of the switches.
+
+    onnxruntime 1.31 writes a telemetry device id and event store under ~/.cache/Microsoft unless
+    ORT_DISABLE_TELEMETRY is set before its import.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "ORT_", "HF_"))}
+    env["HOME"] = str(home)
+    return env
+
+
 @pytest.mark.embedder_model
 def test_real_model_load_persists_no_telemetry(tmp_path: Path) -> None:
-    # onnxruntime 1.31 writes a telemetry device id and event store under ~/.cache unless switched off
-    if not (MODEL_DIR / "tokenizer.json").is_file():
-        pytest.fail("the model is not downloaded: run embedder/download_model.sh .model-cache/arctic")
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "ORT_"))}
-    env["HOME"] = str(tmp_path)
+    _require_model()
     load = "import sys, pathlib, embedder.app as e; e.OnnxModel(pathlib.Path(sys.argv[1]))"
-    subprocess.run([sys.executable, "-c", load, str(MODEL_DIR)], cwd=ROOT, env=env, check=True)
+    subprocess.run(
+        [sys.executable, "-c", load, str(MODEL_DIR)], cwd=ROOT, env=_fresh_home_env(tmp_path), check=True
+    )
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+@pytest.mark.embedder_model
+def test_the_v7_spike_runs_onnxruntime_without_telemetry(tmp_path: Path) -> None:
+    # the spike imports onnxruntime itself (environment(), padded_run), not only through OnnxModel
+    _require_embedder_group()
+    run = "import runpy, sys; runpy.run_path(sys.argv[1], run_name='v7_spike')['environment'](3)"
+    subprocess.run(
+        [sys.executable, "-c", run, str(SPIKE)],
+        cwd=ROOT,
+        env=_fresh_home_env(tmp_path),
+        check=True,
+        capture_output=True,
+    )
+    assert not (tmp_path / ".cache" / "Microsoft").exists()
     assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
