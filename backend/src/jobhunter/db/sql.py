@@ -14,6 +14,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql.elements import TextClause
 
 UNIQUE_VIOLATION: Final = "23505"
+FOREIGN_KEY_VIOLATION: Final = "23503"
 CHECK_VIOLATION: Final = "23514"
 UNDEFINED_TABLE: Final = "42P01"
 LOCK_NOT_AVAILABLE: Final = "55P03"

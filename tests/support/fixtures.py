@@ -146,9 +146,13 @@ ON CONFLICT (id) DO UPDATE SET
   anchor_utc = EXCLUDED.anchor_utc, interval_s = EXCLUDED.interval_s, enabled = true,
   last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
   updated_at = now()"""
+# Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds and the
+# pointers M2 sets left NULL (the pending scope, the profile, the rubric, the prompt schema and the tuple).
 _ACTIVE_CONFIG_RESET: Final = """\
 UPDATE active_config SET settings_version_id = v.id, scope_version_id = v.scope_version_id,
-  pending_scope_version_id = NULL, llm_tuple_id = NULL
+  model_policy_id = v.model_policy_id, execution_config_id = v.execution_config_id,
+  evaluation_policy_id = v.evaluation_policy_id, pending_scope_version_id = NULL, profile_version_id = NULL,
+  rubric_version_id = NULL, prompt_schema_version_id = NULL, llm_tuple_id = NULL, updated_at = now()
   FROM settings_versions v WHERE v.version_no = 1"""
 # Run after every row that references a newer version points at version 1 again (`schedule_state`'s FK is
 # immediate), in this order.
@@ -167,7 +171,8 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
 
     In this order: the TRUNCATE; the `default` source instances inserted again with the seed's own statement
     (their ids change with every reset, so tests look them up by `(source_id, instance_key)`); `active_config`
-    pointed at settings version 1 and its scope, with no pending scope and no tuple; the schedule reset; then
+    as the seed wrote it (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, every M2 pointer NULL);
+    the schedule reset; then
     the settings versions after 1 and the scope versions no settings version uses deleted, and the ranking
     generation set to 0.
 

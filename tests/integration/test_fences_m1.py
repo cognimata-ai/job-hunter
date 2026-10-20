@@ -1,5 +1,6 @@
 import pytest
 import sqlalchemy as sa
+from jobhunter.db.sql import FOREIGN_KEY_VIOLATION, PgErrorInfo, pg_error
 
 pytestmark = pytest.mark.integration
 
@@ -55,7 +56,13 @@ async def test_source_fence_matches_posting_lineage_and_stored_set(engine) -> No
         assert await fenced(other) is False
         await c.execute(sa.text("UPDATE purge_fences SET released_at = now() WHERE id=:f"), {"f": fence})
         assert await fenced(job_a) is False
-        with pytest.raises(sa.exc.IntegrityError):  # purge_fences.source_id -> sources (M0 Deviation 1)
-            await c.execute(
-                sa.text("INSERT INTO purge_fences (kind, source_id, manifest_id) VALUES ('source','nope',1)")
-            )
+        # purge_fences.source_id -> sources (M0 Deviation 1)
+        with pytest.raises(sa.exc.IntegrityError) as bad:
+            async with c.begin_nested():
+                await c.execute(
+                    sa.text(
+                        "INSERT INTO purge_fences (kind, source_id, manifest_id) VALUES ('source','nope',1)"
+                    )
+                )
+    # The exact foreign key, through M0's helper: no other constraint refused the row.
+    assert pg_error(bad.value) == PgErrorInfo(FOREIGN_KEY_VIOLATION, "purge_fences_source_id_fkey")

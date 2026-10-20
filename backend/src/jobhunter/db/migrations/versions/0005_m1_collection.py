@@ -14,12 +14,13 @@ right after `fetch_requests`):
          (+ queries_text_live), coverage_cells, coverage_intervals (+ coverage_intervals_cell, coverage_open_gaps)
   §7.8   quota_windows (+ quota_windows_current), quota_ledger (+ quota_ledger_window, quota_ledger_rolling,
          quota_ledger_unsettled)
-  §7.7   fetch_requests (+ fetch_requests_run), raw_responses (+ raw_responses_expiry, raw_responses_body),
-         raw_items (+ raw_items_attention, raw_items_arbeitnow_ts), ats_snapshots (+ ats_snapshots_instance),
-         ats_snapshot_members
-  §7.9   postings (+ postings_job, postings_active_seen), posting_observations (+ observations_posting), jobs
-         (+ jobs_list_posted, jobs_list_first_seen, jobs_title_trgm, jobs_company, jobs_group, jobs_sources),
-         job_revisions (+ job_revisions_tsv, job_revisions_awaiting), job_revision_occurrences,
+  §7.7   fetch_requests (+ fetch_requests_run, fetch_requests_parent), raw_responses (+ raw_responses_expiry,
+         raw_responses_body, raw_responses_body_ref), raw_items (+ raw_items_attention, raw_items_arbeitnow_ts),
+         ats_snapshots (+ ats_snapshots_instance, ats_snapshots_event), ats_snapshot_members
+  §7.9   postings (+ postings_job, postings_active_seen, postings_last_absent_snapshot), posting_observations
+         (+ observations_posting), jobs (+ jobs_list_posted, jobs_list_first_seen, jobs_title_trgm, jobs_company,
+         jobs_group, jobs_sources), job_revisions (+ job_revisions_tsv, job_revisions_awaiting,
+         job_revisions_embedding), job_revision_occurrences,
          job_revision_sources (+ job_revision_sources_source), ad_keys (+ ad_keys_job), ad_key_sources
          (+ ad_key_sources_posting), merge_events (+ merge_events_into), identity_conflicts
          (+ identity_conflicts_open), duplicate_groups, duplicate_group_members, dedup_decisions,
@@ -34,7 +35,8 @@ right after `fetch_requests`):
          transition_matrix from the code registry
 
 These are the ONLY differences from the spec text. Each one carries a SQL comment naming its owner (plan
-Deviations 1, 2 and 22, Task 16 ruling T16-a, M0 Deviations 1 and 2, and plan Task 1 for the constraint names):
+Deviations 1, 2 and 22, Task 16 ruling T16-a, M0 Deviations 1 and 2, plan Task 1 for the constraint names, and
+notes 8 and 9 below):
 
   1. queries.proposal_id has no foreign key: M2 adds REFERENCES query_proposals(id) ON DELETE SET NULL with
      query_proposals. query_proposals and profile_vectors are not created (M2, with profile_versions).
@@ -60,6 +62,13 @@ Deviations 1, 2 and 22, Task 16 ruling T16-a, M0 Deviations 1 and 2, and plan Ta
      compares the run's normal units with, because a window refined after a reservation changes the cap
      its current row gives (final review F3, Minor 2). A cap past the column's range (a window refined to
      seconds, T8-a) is stored as its maximum: no run spends that many units.
+  9. Five indexes the spec does not list, one on each foreign-key column that a retention delete reaches
+     through its referencing side (`ON DELETE SET NULL`, `CASCADE` or the check of a plain reference), so
+     that each such delete looks the referencing rows up by index instead of scanning the table:
+     fetch_requests_parent (parent_fetch_request_id), raw_responses_body_ref (body_ref_id),
+     ats_snapshots_event (event_snapshot_id), postings_last_absent_snapshot (last_absent_snapshot_id) and
+     job_revisions_embedding (embedding_id); each is partial (`IS NOT NULL`), which the lookup's `= $1`
+     implies (final review, ledger L383).
 
 Migrations are expand/contract: there is no downgrade.
 """
@@ -289,6 +298,9 @@ CREATE TABLE fetch_requests (                        -- metadata retained 13 mon
   CHECK (request_class = 'free' OR status IN ('planned','skipped') OR quota_ledger_id IS NOT NULL)
 );""")
     op.execute("CREATE INDEX fetch_requests_run ON fetch_requests (run_id, status);")
+    op.execute(
+        "CREATE INDEX fetch_requests_parent ON fetch_requests (parent_fetch_request_id) WHERE parent_fetch_request_id IS NOT NULL;  -- note 9: an FK column retention deletes through"
+    )
 
     # §7.8: the cyclic FK of quota_ledger, now that fetch_requests exists
     op.execute("""\
@@ -317,6 +329,9 @@ CREATE TABLE raw_responses (
     )
     op.execute("CREATE INDEX raw_responses_expiry ON raw_responses (expires_at) WHERE purged_at IS NULL;")
     op.execute("CREATE INDEX raw_responses_body ON raw_responses (body_sha256) WHERE purged_at IS NULL;")
+    op.execute(
+        "CREATE INDEX raw_responses_body_ref ON raw_responses (body_ref_id) WHERE body_ref_id IS NOT NULL;  -- note 9: an FK column retention deletes through"
+    )
     op.execute("""\
 CREATE TABLE raw_items (                              -- retained 90 days (§20.1)
   id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -365,6 +380,9 @@ CREATE TABLE ats_snapshots (
 );""")
     op.execute("CREATE INDEX ats_snapshots_instance ON ats_snapshots (source_instance_id, taken_at DESC);")
     op.execute(
+        "CREATE INDEX ats_snapshots_event ON ats_snapshots (event_snapshot_id) WHERE event_snapshot_id IS NOT NULL;  -- note 9: an FK column retention deletes through"
+    )
+    op.execute(
         "ALTER TABLE source_instances ADD FOREIGN KEY (last_complete_snapshot_id) REFERENCES ats_snapshots(id) ON DELETE SET NULL;"
     )
     op.execute(
@@ -403,6 +421,9 @@ CREATE TABLE postings (
 );""")
     op.execute("CREATE INDEX postings_job ON postings (job_id);")
     op.execute("CREATE INDEX postings_active_seen ON postings (last_seen_at) WHERE availability = 'active';")
+    op.execute(
+        "CREATE INDEX postings_last_absent_snapshot ON postings (last_absent_snapshot_id) WHERE last_absent_snapshot_id IS NOT NULL;  -- note 9: an FK column retention deletes through"
+    )
     op.execute("""\
 CREATE TABLE ats_snapshot_absences (              -- plan Deviation 22: the frozen absent set of a mass-disappearance opening snapshot
   snapshot_id bigint NOT NULL REFERENCES ats_snapshots(id) ON DELETE CASCADE,
@@ -513,6 +534,9 @@ CREATE TABLE job_revisions (
     op.execute("CREATE INDEX job_revisions_tsv ON job_revisions USING gin (tsv);")
     op.execute(
         "CREATE INDEX job_revisions_awaiting ON job_revisions (created_at) WHERE embedding_status = 'awaiting_embedding';"
+    )
+    op.execute(
+        "CREATE INDEX job_revisions_embedding ON job_revisions (embedding_id) WHERE embedding_id IS NOT NULL;  -- note 9: an FK column retention deletes through"
     )
     op.execute(
         "ALTER TABLE jobs ADD FOREIGN KEY (current_revision_id) REFERENCES job_revisions(id) DEFERRABLE INITIALLY DEFERRED;"

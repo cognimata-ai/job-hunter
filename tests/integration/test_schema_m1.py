@@ -111,6 +111,64 @@ async def test_checks_reject_violations(engine, statement, constraint) -> None:
     assert pg_error(bad.value) == PgErrorInfo(CHECK_VIOLATION, constraint)
 
 
+BREAKER_ROW = (
+    "INSERT INTO source_instances (source_id, instance_key, health, breaker_opened_at, half_open_after) "
+    "VALUES ('jsearch', :key, :health, CAST(:opened AS timestamptz), CAST(:probe AS timestamptz))"
+)
+
+
+@pytest.mark.parametrize(
+    ("health", "timestamped", "admitted"),
+    [
+        ("auth_failed", True, True),  # plan Deviation 2: every open state carries the half-open timestamps
+        ("auth_failed", False, False),
+        ("contract_broken", True, True),
+        ("not_found", True, True),
+        ("breaker_open", True, True),
+        ("ok", True, False),  # a closed breaker carries none
+        ("ok", False, True),
+    ],
+)
+async def test_the_widened_breaker_check_pairs_every_open_state_with_its_timestamps(
+    engine, health: str, timestamped: bool, admitted: bool
+) -> None:
+    at = datetime(2026, 10, 1, tzinfo=UTC) if timestamped else None
+    params = {"key": f"breaker-{health}", "health": health, "opened": at, "probe": at}
+    async with engine.begin() as c:
+        if admitted:
+            await c.execute(sa.text(BREAKER_ROW), params)
+            return
+        with pytest.raises(sa.exc.IntegrityError) as bad:
+            await c.execute(sa.text(BREAKER_ROW), params)
+    assert pg_error(bad.value) == PgErrorInfo(CHECK_VIOLATION, "source_instances_breaker_check")
+
+
+# Ledger L383: each column a retention delete reaches through its referencing side, with the index on it.
+RETENTION_FK_INDEXES = [
+    ("fetch_requests", "parent_fetch_request_id", "fetch_requests_parent"),
+    ("raw_responses", "body_ref_id", "raw_responses_body_ref"),
+    ("ats_snapshots", "event_snapshot_id", "ats_snapshots_event"),
+    ("postings", "last_absent_snapshot_id", "postings_last_absent_snapshot"),
+    ("job_revisions", "embedding_id", "job_revisions_embedding"),
+]
+
+
+@pytest.mark.parametrize(("table", "column", "index"), RETENTION_FK_INDEXES)
+async def test_a_retention_delete_finds_the_referencing_rows_by_index(
+    engine, table: str, column: str, index: str
+) -> None:
+    """The lookup a foreign key's action runs on the referencing side (`<column> = $1`, a generic plan, as a
+    referential trigger prepares it) uses the partial index; the names are constants of this module."""
+    async with engine.connect() as c:
+        await c.execute(sa.text("SET LOCAL plan_cache_mode = force_generic_plan"))
+        await c.execute(sa.text("SET LOCAL enable_seqscan = off"))  # the tables are empty: no cost choice
+        await c.execute(sa.text(f"PREPARE lookup (bigint) AS SELECT 1 FROM {table} WHERE {column} = $1"))  # noqa: S608
+        plan = "\n".join((await c.execute(sa.text("EXPLAIN EXECUTE lookup (1)"))).scalars())
+        await c.execute(sa.text("DEALLOCATE lookup"))
+        await c.rollback()
+    assert index in plan, plan
+
+
 async def test_one_current_window_per_provider(engine) -> None:
     ins = sa.text(
         "INSERT INTO quota_windows (provider, window_start, window_end, is_current, limit_units, "
@@ -207,28 +265,97 @@ V2 = (
 )
 
 
+# The whole `active_config` row, and what `seed_defaults` writes into it from settings version 1.
+ACTIVE_CONFIG = (
+    "SELECT settings_version_id, scope_version_id, pending_scope_version_id, profile_version_id, "
+    "rubric_version_id, prompt_schema_version_id, model_policy_id, execution_config_id, "
+    "evaluation_policy_id, llm_tuple_id FROM active_config WHERE id = 1"
+)
+SEEDED_CONFIG = (
+    "SELECT id, scope_version_id, NULL::bigint, NULL::bigint, NULL::bigint, NULL::bigint, model_policy_id, "
+    "execution_config_id, evaluation_policy_id, NULL::bigint FROM settings_versions WHERE version_no = 1"
+)
+# Every pointer of the row moved off the seed: a second scope (active) with the seeded one pending, a profile
+# and a tuple (they are NULL together), a rubric, a prompt schema, and a second model policy, execution config
+# and evaluation policy. `reset_database` keeps those last five tables, so the test deletes its rows again.
+DIRTY_CONFIG = (
+    "INSERT INTO scope_versions (scope_hash, payload) VALUES ('\\x5eed', '{}')",
+    "INSERT INTO model_policies (policy_hash, payload) VALUES ('\\x5eed', '{}')",
+    "INSERT INTO execution_configs (config_hash, payload) VALUES ('\\x5eed', '{}')",
+    "INSERT INTO evaluation_policies (version_no, policy_hash, payload, projected_critic_rate) "
+    "VALUES (2, '\\x5eed', '{}', 0.1)",
+    "INSERT INTO rubric_versions (version, content_hash, weights, anchors) "
+    "VALUES ('test', '\\x5eed', '{}', '{}')",
+    "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
+    "VALUES ('\\x5eed', '{}', '{}')",
+    "UPDATE active_config SET pending_scope_version_id = scope_version_id, "
+    "scope_version_id = (SELECT id FROM scope_versions WHERE scope_hash = '\\x5eed'), "
+    "profile_version_id = 1, llm_tuple_id = 1, "
+    "rubric_version_id = (SELECT id FROM rubric_versions WHERE content_hash = '\\x5eed'), "
+    "prompt_schema_version_id = "
+    "(SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = '\\x5eed'), "
+    "model_policy_id = (SELECT id FROM model_policies WHERE policy_hash = '\\x5eed'), "
+    "execution_config_id = (SELECT id FROM execution_configs WHERE config_hash = '\\x5eed'), "
+    "evaluation_policy_id = (SELECT id FROM evaluation_policies WHERE policy_hash = '\\x5eed')",
+)
+DIRTY_ROWS_DELETE = (
+    "DELETE FROM model_policies WHERE policy_hash = '\\x5eed'",
+    "DELETE FROM execution_configs WHERE config_hash = '\\x5eed'",
+    "DELETE FROM evaluation_policies WHERE policy_hash = '\\x5eed'",
+    "DELETE FROM rubric_versions WHERE content_hash = '\\x5eed'",
+    "DELETE FROM prompt_schema_versions WHERE prompt_schema_hash = '\\x5eed'",
+)
+
+
 async def test_reset_reseeds_the_default_instances_and_the_configuration(engine, migrated) -> None:
-    async with engine.begin() as c:
-        await c.execute(
-            sa.text(
-                "INSERT INTO watchlist_companies (display_name, company_key, ats_type, board_slug, "
-                "detection, validation_status) VALUES ('X','x','greenhouse','x','manual','ok')"
+    try:
+        async with engine.connect() as c:
+            seeded = tuple((await c.execute(sa.text(SEEDED_CONFIG))).one())
+            assert tuple((await c.execute(sa.text(ACTIVE_CONFIG))).one()) == seeded  # as `migrate` left it
+        async with engine.begin() as c:
+            await c.execute(
+                sa.text(
+                    "INSERT INTO watchlist_companies (display_name, company_key, ats_type, board_slug, "
+                    "detection, validation_status) VALUES ('X','x','greenhouse','x','manual','ok')"
+                )
             )
-        )
-        await c.execute(sa.text("UPDATE ranking_state SET generation = 7"))
-        # A newer version that the schedule and the active config point at, as the M1 tests do.
-        v2 = (await c.execute(sa.text(V2))).scalar_one()
-        await c.execute(sa.text("UPDATE active_config SET settings_version_id = :v"), {"v": v2})
-        await c.execute(sa.text("UPDATE schedule_state SET settings_version_id = :v"), {"v": v2})
-    # Must not fail on schedule_state's FK: the schedule is re-pointed before version 2 is deleted.
-    reset_database(migrated)
-    async with engine.connect() as c:
-        v1 = (await c.execute(sa.text("SELECT id FROM settings_versions WHERE version_no = 1"))).scalar_one()
-        defaults = sa.text("SELECT source_id FROM source_instances WHERE instance_key='default'")
-        assert sorted((await c.execute(defaults)).scalars()) == ["adzuna", "arbeitnow", "jsearch", "serpapi"]
-        assert (await c.execute(sa.text("SELECT max(version_no) FROM settings_versions"))).scalar_one() == 1
-        schedule = (await c.execute(sa.text("SELECT settings_version_id FROM schedule_state"))).scalar_one()
-        active = (await c.execute(sa.text("SELECT settings_version_id FROM active_config"))).scalar_one()
-        assert schedule == v1 == active
-        assert (await c.execute(sa.text("SELECT generation FROM ranking_state"))).scalar_one() == 0
-        assert (await c.execute(sa.text("SELECT count(*) FROM watchlist_companies"))).scalar_one() == 0
+            await c.execute(sa.text("UPDATE ranking_state SET generation = 7"))
+            # A newer version that the schedule and the active config point at, as the M1 tests do.
+            v2 = (await c.execute(sa.text(V2))).scalar_one()
+            await c.execute(sa.text("UPDATE active_config SET settings_version_id = :v"), {"v": v2})
+            await c.execute(sa.text("UPDATE schedule_state SET settings_version_id = :v"), {"v": v2})
+            for statement in DIRTY_CONFIG:  # ledger L27: every other pointer of the row moved as well
+                await c.execute(sa.text(statement))
+            assert tuple((await c.execute(sa.text(ACTIVE_CONFIG))).one()) != seeded
+        # Must not fail on schedule_state's FK: the schedule is re-pointed before version 2 is deleted.
+        reset_database(migrated)
+        async with engine.connect() as c:
+            v1 = (
+                await c.execute(sa.text("SELECT id FROM settings_versions WHERE version_no = 1"))
+            ).scalar_one()
+            defaults = sa.text("SELECT source_id FROM source_instances WHERE instance_key='default'")
+            assert sorted((await c.execute(defaults)).scalars()) == [
+                "adzuna",
+                "arbeitnow",
+                "jsearch",
+                "serpapi",
+            ]
+            assert (
+                await c.execute(sa.text("SELECT max(version_no) FROM settings_versions"))
+            ).scalar_one() == 1
+            schedule = (
+                await c.execute(sa.text("SELECT settings_version_id FROM schedule_state"))
+            ).scalar_one()
+            active = (await c.execute(sa.text("SELECT settings_version_id FROM active_config"))).scalar_one()
+            assert schedule == v1 == active
+            # every column of the row is the seed's again, and the scope no settings version uses is deleted
+            assert tuple((await c.execute(sa.text(ACTIVE_CONFIG))).one()) == seeded
+            scopes = sa.text("SELECT count(*) FROM scope_versions WHERE scope_hash = '\\x5eed'")
+            assert (await c.execute(scopes)).scalar_one() == 0
+            assert (await c.execute(sa.text("SELECT generation FROM ranking_state"))).scalar_one() == 0
+            assert (await c.execute(sa.text("SELECT count(*) FROM watchlist_companies"))).scalar_one() == 0
+    finally:
+        reset_database(migrated)  # nothing points at the test's rows any more
+        async with engine.begin() as c:
+            for statement in DIRTY_ROWS_DELETE:
+                await c.execute(sa.text(statement))
