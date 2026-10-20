@@ -36,19 +36,19 @@ feed stops it earlier.
 The covered bound this module proves, and nothing more:
 
 - **A read from page 1 to the end of the feed covers `[oldest item read, newest item read)`, its upper bound
-  clamped to the earliest fill instant of its pages** (`filled_at`: the response's `Date` less its `Age`, the
-  moment the cached page was made, fix wave F4, ledger L137). It saw every item the feed held when its pages
-  were made. An item created after the earliest of those instants can be missing although the read reaches
-  past it: its page was made before it existed, and by the time a later page was made the item sat on an
-  earlier page (pages fill one after the other, so in-order fills hide such an item as well). So nothing
-  newer than the earliest fill is proven, and the read part above it is recorded as a gap, its reason
-  `unknown_continuation` (Ruling FR-o: no page cap stopped the read; what lies above is unknown). A page
-  whose age is unknown (a cached response without a readable `Age`, Ruling FR-q) proves nothing above the
-  cell's previous covered bound. Half-open, the
-  upper instant itself is left to the next run: a claim may fall short of the truth, never exceed it. A
-  residual risk stays (Ruling T10-b, accepted): an item older than every fill can still move from a page
-  made later to a page made earlier and be read on neither; only reading every page at one instant would
-  close it, which a cached feed does not allow.
+  clamped to the earliest fill instant of its pages** (`filled_at`: the response's `Date`, never later than
+  its arrival (Ruling FR-u), less its `Age`, the moment the cached page was made, fix wave F4, ledger L137).
+  It saw every item the feed held when its pages were made. An item created after the earliest of those
+  instants can be missing although the read reaches past it: its page was made before it existed, and by the
+  time a later page was made the item sat on an earlier page (pages fill one after the other, so in-order
+  fills hide such an item as well). So nothing newer than the earliest fill is proven, and the read part
+  above it is recorded as a gap, its reason `unknown_continuation` (Ruling FR-o: no page cap stopped the
+  read; what lies above is unknown). A page whose age is unknown (a cached response without a readable
+  `Age`, Ruling FR-q) proves nothing above the cell's previous covered bound. Half-open, the upper instant
+  itself is left to the next run: a claim may fall short of the truth, never exceed it. A residual risk
+  stays (Ruling T10-b, accepted): an item older than every fill can still move from a page made later to a
+  page made earlier and be read on neither; only reading every page at one instant would close it, which a
+  cached feed does not allow.
 - **A read stopped by the cap or by the remaining-low rule covers nothing.** The bound "everything newer
   than the newest of the runs' oldest items is read" does not survive V8's own data: after page 1 that bound
   is 19:30:49 (run 3's oldest), and page 2's fourth run holds five items at 20:00:43 and 20:00:44. With run 4
@@ -216,14 +216,17 @@ def _age_s(headers: Mapping[str, str]) -> int | None:
 
 
 def filled_at(page: RawPage) -> datetime | None:
-    """When the page's content was made: its `Date` header (else its arrival, `fetched_at`) less its `Age`;
-    `None` when its age is unknown (`_age_s`). It never raises on a header value: an instant out of the
-    representable range is unknown as well."""
+    """When the page's content was made: its `Date` header, never later than its arrival (`fetched_at`, the
+    local instant the response came in, live or as its receipt stored it; Ruling FR-u: a server clock ahead
+    of ours never dates a fill after what was observed), less its `Age`; the arrival when there is no
+    readable `Date`. `None` when its age is unknown (`_age_s`). It never raises on a header value: an
+    instant out of the representable range is unknown as well."""
     age = _age_s(page.headers)
     if age is None:
         return None
+    served = min(response_date(page.headers, page.fetched_at), page.fetched_at)
     try:
-        return response_date(page.headers, page.fetched_at) - timedelta(seconds=age)
+        return served - timedelta(seconds=age)
     except OverflowError:
         return None
 

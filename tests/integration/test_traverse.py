@@ -754,6 +754,38 @@ async def test_an_arbeitnow_read_to_the_end_covers_nothing_newer_than_its_page_w
     ]
 
 
+async def test_a_server_clock_ahead_of_ours_never_moves_the_covered_bound_past_arrival_less_age(
+    engine, current_epoch, respx_mock: respx.MockRouter
+) -> None:
+    """Ruling FR-u (fix wave F6): the feed's one page arrives an hour after it was made, but the server's
+    clock runs 10 minutes ahead, so its `Date` is 10 minutes past the arrival. The fill instant is the
+    arrival less the `Age` (the `Date` clamped to the arrival), never `Date - Age`: the covered bound is no
+    later than `arrival - Age`, and the newer part of the read stays an open gap."""
+    await seed_inputs(engine, enabled=("arbeitnow",))
+    response, oldest, newest = ended_feed({})
+    made = newest - 30 * timedelta(minutes=1)
+    arrived = made + H
+    age = 3600
+    response.headers["date"] = (arrived + 10 * timedelta(minutes=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    response.headers["age"] = str(age)
+    respx_mock.get(FEED_URL, params={"page": "1"}).mock(return_value=response)
+    async with engine.connect() as c:
+        feed = await instance_id(c, "arbeitnow")
+    async with httpx.AsyncClient() as client:  # the arrival is the adapter's clock when the response came in
+        adapter = ArbeitnowAdapter(client, instance_id=feed, clock=lambda: arrived)
+        deps = replace(make_deps(engine, lambda instance: adapter), clock=lambda: arrived)
+        owner = await queued_run(engine, include_paid=False)
+        (fid,) = await plan_ids(deps, owner)
+        result = await traverse_and_record(deps, fid)
+    bound = arrived - timedelta(seconds=age)
+    assert bound == made and result.covered is not None and result.covered[1] <= bound
+    assert (result.end, result.pages, result.covered) == ("end", 1, (oldest, made))  # not `made + 10 min`
+    assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
+        ("gap", "open", "unknown_continuation", made, newest),
+        ("covered", None, None, oldest, made),
+    ]
+
+
 def ended_feed(headers: dict[str, str]) -> tuple[httpx.Response, datetime, datetime]:
     """The recorded page 1 as the whole feed (no `links.next`) with `headers`, and its oldest and newest
     items."""

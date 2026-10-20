@@ -188,14 +188,33 @@ def page_with(headers: dict[str, str], fetched_at: datetime) -> RawPage:
     return RawPage(spec, 200, headers, b"{}", fetched_at)
 
 
+# V8 phase 1's response: its `Date`, and its arrival here a second later (a clock in step with the server's)
+SERVED = datetime(2026, 10, 18, 20, 53, 22, tzinfo=UTC)
+ARRIVED = SERVED + timedelta(seconds=1)
+
+
 def test_a_page_was_made_at_its_date_less_its_age() -> None:
     date = "Sun, 18 Oct 2026 20:53:22 GMT"  # V8 phase 1: a Cloudflare hit 1440 s old
-    assert filled_at(page_with({"date": date, "age": "1440"}, T)) == datetime(
+    assert filled_at(page_with({"date": date, "age": "1440"}, ARRIVED)) == datetime(
         2026, 10, 18, 20, 29, 22, tzinfo=UTC
     )
-    assert filled_at(page_with({"date": date}, T)) == datetime(2026, 10, 18, 20, 53, 22, tzinfo=UTC)
+    assert filled_at(page_with({"date": date}, ARRIVED)) == SERVED
     assert filled_at(page_with({"age": "60"}, T)) == T - timedelta(seconds=60)  # no Date: its arrival
     assert filled_at(page_with({"age": "60", "date": "garbage"}, T)) == T - timedelta(seconds=60)
+
+
+@pytest.mark.parametrize("ahead", [timedelta(minutes=10), timedelta(days=2), timedelta(seconds=1)])
+def test_a_date_later_than_the_arrival_counts_from_the_arrival(ahead: timedelta) -> None:
+    """Ruling FR-u (fix wave F6): a server clock ahead of ours never dates a fill after what was observed.
+    A `Date` 10 minutes past the response's arrival makes the page `arrival - Age`, not `Date - Age`; a
+    `Date` at or before the arrival is taken as it is."""
+    future = (ARRIVED + ahead).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert filled_at(page_with({"date": future, "age": "1440"}, ARRIVED)) == ARRIVED - timedelta(seconds=1440)
+    assert filled_at(page_with({"date": future}, ARRIVED)) == ARRIVED  # a miss: as old as its arrival
+    earlier = (ARRIVED - ahead).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert filled_at(page_with({"date": earlier, "age": "60"}, ARRIVED)) == ARRIVED - ahead - timedelta(
+        seconds=60
+    )
 
 
 @pytest.mark.parametrize(
@@ -247,9 +266,8 @@ def test_a_page_was_made_at_its_date_less_its_age() -> None:
     ],
 )
 def test_a_page_whose_age_is_unknown_has_no_fill_instant(headers: dict[str, str], age_s: int | None) -> None:
-    page = page_with({"date": "Sun, 18 Oct 2026 20:53:22 GMT", **headers}, T)
-    served = datetime(2026, 10, 18, 20, 53, 22, tzinfo=UTC)
-    assert filled_at(page) == (None if age_s is None else served - timedelta(seconds=age_s))
+    page = page_with({"date": "Sun, 18 Oct 2026 20:53:22 GMT", **headers}, ARRIVED)
+    assert filled_at(page) == (None if age_s is None else SERVED - timedelta(seconds=age_s))
 
 
 def test_a_date_out_of_range_falls_back_to_the_arrival_and_an_absurd_age_is_unknown() -> None:
@@ -300,11 +318,12 @@ _HEADER_TEXT = st.one_of(
     ),
     cache=st.sampled_from([None, "HIT", "MISS", "STALE", "DYNAMIC", "weird"]),
 )
-def test_filled_at_never_raises_and_never_dates_a_page_after_its_date(
+def test_filled_at_never_raises_and_never_dates_a_page_after_its_date_or_arrival(
     age: str | None, date: str | None, cache: str | None
 ) -> None:
-    """Fix wave F6 (F4 re-review Minor 1): any `Age`, `Date` and cache status reads as a fill instant at or
-    before the response's `Date` (else its arrival), or as unknown; it never raises."""
+    """Fix wave F6 (F4 re-review Minor 1, Ruling FR-u): any `Age`, `Date` and cache status reads as a fill
+    instant at or before both the response's `Date` (else its arrival) and its arrival, or as unknown; it
+    never raises."""
     headers = {
         name: value
         for name, value in (("age", age), ("date", date), ("cf-cache-status", cache))
@@ -312,7 +331,7 @@ def test_filled_at_never_raises_and_never_dates_a_page_after_its_date(
     }
     made = filled_at(page_with(headers, T))
     if made is not None:
-        assert made <= response_date(headers, T)
+        assert made <= response_date(headers, T) and made <= T
 
 
 @pytest.mark.parametrize(

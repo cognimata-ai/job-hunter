@@ -175,8 +175,11 @@ async def test_a_fixture_run_reads_pages_one_and_two_then_the_end_and_is_covered
     # Ruling T10-a, part 4 (Tasks 23 and 25 rely on it): the fixture transport serves page >= 3 as `page_end`,
     # so a fixture run reads pages 1, 2 and the end, within the smallest page cap, and its read is covered.
     log = tmp_path / "served.jsonl"
+    # The pages arrive as recorded (their `meta.json`: page 2, the last, at 21:13:54.6), never before their
+    # `Date`: an arrival earlier than the `Date` would clamp the fill instant to it (Ruling FR-u).
+    arrived = datetime(2026, 10, 18, 21, 13, 55, tzinfo=UTC)
     async with httpx.AsyncClient(transport=fixture_transport(FIXTURES, log_path=log)) as client:
-        a = ArbeitnowAdapter(client, instance_id=1, clock=lambda: T)
+        a = ArbeitnowAdapter(client, instance_id=1, clock=lambda: arrived)
         state = FirehoseState(newest_covered_upper=None, gaps=())
         spec, cap, times, pages, fills = a.plan(arbeitnow_cell()), page_cap(3600), [], 0, []
         while True:
