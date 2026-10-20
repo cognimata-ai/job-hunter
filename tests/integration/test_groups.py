@@ -255,6 +255,43 @@ async def test_the_ambiguity_of_a_job_that_stays_ends_when_no_other_group_qualif
     assert await generation(engine) == start  # a resolved alert changes nothing the list reads
 
 
+async def test_the_ambiguity_of_a_member_that_stays_ends_when_no_other_group_qualifies(
+    engine, current_epoch, job_with_postings
+) -> None:
+    """Fix wave F6 (F5 re-review, Minor 1): the member path of the test above. A partial job qualifies for two
+    groups of full-text representatives, joins the better one and is not appointed (it is partial). Its
+    regroup confirms it against the representative: the alert stays open while the other group qualifies, and
+    the regroup after that group dissolved resolves it."""
+    make = jobs_maker(engine, job_with_postings)
+    first = [await make("jsearch", description_text=FULL_TEXT) for _ in "xy"]
+    # PARTIAL's words, then 30 of their own: PARTIAL's 26 shingles are in it (1.0), only 26 of its 56 in
+    # FULL_TEXT's 56 (Jaccard 0.30, containment 0.46), so the two groups never merge
+    other_text = varied(30) + " " + varied(30, 200)
+    second = [await make("jsearch", description_text=other_text) for _ in "xy"]
+    one, two = (await regroup(engine, first[0])).group_id, (await regroup(engine, second[0])).group_id
+    assert one is not None and two is not None and one != two
+    a = await make("adzuna", description_text=PARTIAL, description_completeness="partial")
+    joined = await regroup(engine, a)
+    assert joined.joined and joined.ambiguous and not joined.reelected  # a partial joiner: no appointment
+    chosen = joined.group_id
+    assert chosen in (one, two)
+    other, others = (two, second) if chosen == one else (one, first)
+    rep = (await group_row(engine, chosen))[1]
+    assert rep is not None and rep != a  # a member, so its regroup confirms it against the representative
+    key = f"dedup.ambiguous_grouping:job:{a}"
+    assert await regroup(engine, a) == GroupEffect(chosen, False, False, (), False, False)
+    [alert] = await fetch(engine, ALERT, k=key)
+    assert (alert.occurrences, alert.resolved_at) == (1, None)  # the other group still qualifies
+    async with engine.begin() as conn:
+        await groups.split_member(conn, other, others[1])  # the other group dissolves
+    assert (await group_row(engine, other))[0] == "dissolved"
+    start = await generation(engine)
+    assert await regroup(engine, a) == GroupEffect(chosen, False, False, (), False, False)
+    [alert] = await fetch(engine, ALERT, k=key)
+    assert alert.resolved_at is not None and a in await members(engine, chosen)
+    assert await generation(engine) == start  # a resolved alert changes nothing the list reads
+
+
 async def test_an_appointment_whose_revalidation_dissolves_the_group_reports_no_election(
     engine, current_epoch, job_with_postings, monkeypatch
 ) -> None:

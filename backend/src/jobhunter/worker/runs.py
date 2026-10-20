@@ -301,10 +301,14 @@ async def start_attempt(
 async def _admit(
     conn: AsyncConnection, run_id: int, attempt_no: int, *, epoch: int
 ) -> tuple[Admission, RunOwner | None, bool]:
-    """`start_attempt`, and whether the epoch fence refused `epoch` (the `foreign_epoch` that re-defers)."""
+    """`start_attempt`, and whether the epoch fence refused `epoch` (the `foreign_epoch` that re-defers).
+    Only the worker's own fence (`FencedOut.worker_superseded`) is that refusal; a fence of any other owner
+    propagates, a failure of the delivery, never a supersession (F5 review, Minor 1)."""
     try:
         await fence_epoch(conn, epoch)
-    except FencedOut:
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise
         return "foreign_epoch", None, True
     row = (await conn.execute(_ADMISSION, {"i": run_id})).first()
     if row is None:

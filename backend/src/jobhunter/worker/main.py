@@ -265,7 +265,9 @@ class _WorkerProcess:
         try:
             async with engine.begin() as conn:
                 await sync_instances(conn, cfg, guard=fenced)
-        except FencedOut:
+        except FencedOut as refused:
+            if not refused.worker_superseded:
+                raise  # not this worker's own fence: the start failed (`worker_failed`, exit 1), F5 Minor 1
             # A newer worker owns the work (`fence_epoch` logged both epochs) and the sync wrote nothing. No
             # loop has started; the teardown follows (it closes what the start built), then the watchdog's
             # superseded exit (Ruling FR-i). The restart stands by while that worker is healthy.

@@ -230,11 +230,12 @@ class World:
 
             world.fenced.append(epoch)
             if world.superseded:
-                raise FencedOut(owner="worker_epoch")
+                raise FencedOut(owner=world.fence_owner)
 
         self.synced: list[object] = []
         self.fenced: list[int] = []  # the epochs step 8's guard fenced
         self.superseded = False  # a newer worker took over before step 8
+        self.fence_owner = "worker_epoch"  # the owner of the fence step 8's guard raises when `superseded`
         self.start_fenced = False  # a newer worker took over after step 8's sync, before its reconcilers
         monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
         monkeypatch.setattr(http, "configure", recording_configure)
@@ -364,6 +365,23 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
     failing = World(monkeypatch, tmp_path / "again")
     failing.superseded, failing.dispose_fails = True, True
     assert await worker_main(failing.cfg) == WATCHDOG_EXIT_CODE
+
+
+async def test_a_fence_of_another_owner_at_the_startup_sync_fails_the_start_and_exits_1(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Fix wave F6 (F5 re-review, out-of-scope observation): only the worker's own fence proves a takeover.
+    Should the sync ever raise another owner's fence, the start failed (`worker_failed`, exit 1, the restart
+    tries again), never `worker_superseded_at_start` (70). No start reconciler and no loop runs."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.superseded, world.fence_owner = True, "run"
+    assert await worker_main(world.cfg) == 1
+    assert world.events[world.events.index("sync_instances") :] == ["sync_instances", *TEARDOWN]
+    assert world.synced == [] and world.runtimes == []
+    assert [e["error_class"] for e in logged(caplog, "worker_failed")] == ["FencedOut"]
+    assert logged(caplog, "worker_superseded_at_start") == []
 
 
 async def test_a_worker_superseded_during_its_start_cadence_stops_itself_and_exits_0(

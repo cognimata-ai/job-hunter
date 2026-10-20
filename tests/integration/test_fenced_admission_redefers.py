@@ -225,3 +225,49 @@ async def test_a_superseded_workers_collect_loop_stops_and_leaves_the_redeferred
             await c.execute(sa.text("SELECT status, attempt_no FROM runs WHERE id = :i"), {"i": run_id})
         ).one()
     assert tuple(row) == ("queued", 0)
+
+
+async def test_a_fence_of_another_owner_at_the_admission_or_the_claim_is_a_failure_never_a_supersession(
+    engine, queue_app, current_epoch, migrated, monkeypatch, log_events
+) -> None:
+    """Fix wave F6 (F5 re-review, out-of-scope observation): only the worker's own fence
+    (`FencedOut.worker_superseded`) proves a takeover. Should the admission's or the claim's fenced call ever
+    raise another owner's fence, the delivery fails with it: nothing is re-deferred and the worker is never
+    asked to stop. (Today both calls can only raise the epoch fence, which the test above covers.)"""
+    run_id = await manual_run_id(engine)
+    async with engine.begin() as c:
+        op, _ = await ops.create_operation(
+            c, kind="export", payload={"export_id": 1}, dedup_key="export:other-owner", defer=None
+        )
+    stops: list[str] = []
+
+    def fenced_by(owner: str):
+        async def fence(conn, epoch: int) -> None:
+            raise FencedOut(owner=owner)
+
+        return fence
+
+    monkeypatch.setattr(runs, "fence_epoch", fenced_by("run"))
+    async with open_saver(migrated.dsn("app")) as saver:
+        graph = build_noop_collect_graph(saver)
+        with pytest.raises(FencedOut) as admission:
+            await runs.execute_run(
+                engine, graph, run_id, 1, epoch=current_epoch, on_superseded=lambda: stops.append("run")
+            )
+    assert admission.value.owner == "run"
+    monkeypatch.setattr(ops, "fence_epoch", fenced_by("operation"))
+    with pytest.raises(FencedOut) as claim:
+        await ops.execute_operation(
+            engine, op, epoch=current_epoch, on_superseded=lambda: stops.append("operation")
+        )
+    assert claim.value.owner == "operation"
+    assert stops == [] and stop_requests(log_events) == []
+    assert await live_jobs(engine, "run_collect") == [] and await live_jobs(engine, "run_operation") == []
+    events = {e["event"] for e in log_events()}
+    assert not events & {"run_redeferred", "operation_redeferred", "run_admission"}
+    async with engine.connect() as c:  # neither was admitted nor claimed
+        run = (await c.execute(sa.text("SELECT status FROM runs WHERE id = :i"), {"i": run_id})).scalar_one()
+        status = (
+            await c.execute(sa.text("SELECT status FROM operations WHERE id = :i"), {"i": op})
+        ).scalar_one()
+    assert (run, status) == ("queued", "pending")

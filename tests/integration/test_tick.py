@@ -397,6 +397,44 @@ async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconciler
     assert runtime.shutdown.requested.is_set()  # the superseded worker stops itself (Ruling T24-a)
 
 
+async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops_the_worker(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:  # fix wave F6 (F5 re-review, nit 2): F5 Minor 1's branch of the daily task
+    from jobhunter.errors import FencedOut
+    from jobhunter.privacy import retention
+
+    from tests.support.logs import logged
+
+    order: list[str] = []
+
+    async def fenced_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+        order.append("retention")
+        raise FencedOut(owner="purge_fence")
+
+    async def probe(ctx: reconcilers.ReconcileContext) -> int:
+        order.append("daily")
+        return 0
+
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the probe
+    reconcilers.reconciler("probe", "daily")(probe)
+    monkeypatch.setattr(retention, "run_retention_daily", fenced_pass)
+    runtime = SimpleNamespace(
+        engine=engine,
+        queue=queue_app,
+        saver=object(),
+        epoch=current_epoch,  # the daily cadence's own fence admits it
+        embedder=None,
+        shutdown=ShutdownState(),
+    )
+    context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
+    with pytest.raises(FencedOut) as fenced:  # the job fails, after the daily cadence ran
+        await tasks.retention_daily(context, timestamp=0)
+    assert fenced.value.owner == "purge_fence" and order == ["retention", "daily"]
+    [event] = logged(caplog, "retention_daily_failed")
+    assert (event["error_class"], event["owner"]) == ("FencedOut", "purge_fence")
+    assert not runtime.shutdown.requested.is_set()
+
+
 async def test_a_fence_of_another_owner_fails_the_tick_and_never_stops_the_worker(
     engine, current_epoch, queue_app, monkeypatch
 ) -> None:  # F5 review, Minor 1: only the worker's own fence is proof of a takeover

@@ -486,7 +486,8 @@ async def execute_operation(
     """Claim and run operation `operation_id` (the `run_operation` task body), one protocol for every end.
 
     1. Claim it; return when it is not claimable. When `epoch` is no longer the current worker epoch
-       (`FencedOut`), `on_superseded()` asks this worker for its graceful stop (ruling T24-a; the task body
+       (`FencedOut` with `worker_superseded`; a fence of any other owner propagates, F5 review Minor 1),
+       `on_superseded()` asks this worker for its graceful stop (ruling T24-a; the task body
        requests the runtime's shutdown), then the job is deferred again, `run_operation(operation_id)` under
        `op:<id>` in a transaction of its own (deduplicated by that queueing lock while one waits): the
        current worker claims it, the stopping one fetches no more. A kind without a handler ends
@@ -508,7 +509,9 @@ async def execute_operation(
     try:
         async with engine.begin() as conn:
             claim = await claim_operation(conn, operation_id, epoch=epoch)
-    except FencedOut:  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+    except FencedOut as fenced:  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the delivery, never a reason to stop
         on_superseded()  # first: the loops stop fetching while the re-defer below commits
         async with engine.begin() as conn:
             job_id = await defer_operation_job(conn, defer_in_tx, operation_id)
