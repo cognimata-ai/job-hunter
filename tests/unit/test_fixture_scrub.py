@@ -2,6 +2,7 @@
 import base64
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -558,7 +559,14 @@ def test_a_person_introduced_by_a_verb_or_an_interview_is_pseudonymised(text: st
     "text",
     [
         "founded by Acme Data Solutions GmbH in 2019",  # a legal form follows: a company
-        "created by Acme Labs Inc. for you",
+        "created by Beispiel Ltd for you",  # fix round 2: the legal form itself, no allow-listed word
+        "founded by Acme Inc.",
+        "founded by Acme Data Inc. in Berlin",
+        "erstellt von Muster Co. KG",
+        "founded by Muster Corp",
+        "gegründet von Muster Oy",
+        "gegründet von Muster Verein e. V.",
+        "Kontakt: Muster Software GmbH",  # the contact window too
         "erstellt von Muster Software AG",
         "founded by Google veterans",  # one capitalised word only
         "Interview mit dem Fachbereich",
@@ -576,13 +584,71 @@ def test_companies_and_job_titles_after_the_introducing_words_stay(text: str) ->
 
 
 def test_a_one_word_name_that_is_also_a_place_stays_a_name() -> None:
-    # F1 fix round 1: only a name of two or more place words is a title ("CTO Berlin Hamburg"); a dozen common
-    # first names are places too (Sofia, a city), so a single one is still scrubbed
+    # ruling FR-m: only the explicit vocabulary makes a title, so a first name that is a city is scrubbed, and
+    # so are place names after a role word (an over-scrub the fail-safe prefers)
     assert (
         scrub_text("Hinter Acme steht Gründerin Sofia.", Pseudonyms())
         == "Hinter Acme steht Gründerin [person:1]."
     )
-    assert scrub_text("CTO Berlin Hamburg", Pseudonyms()) == "CTO Berlin Hamburg"
+    assert scrub_text("CTO Berlin Hamburg", Pseudonyms()) == "CTO [person:1]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Gründer Julien",
+        "Founder Damien",
+        "CEO Clement",
+        "Founder Jordan",
+        "Gründerin Georgia",
+        "Gründer Chad",
+    ],
+)
+def test_a_single_first_name_that_is_a_country_or_ends_like_a_noun_is_scrubbed(text: str) -> None:
+    # F1 re-review, Minor 3 (ruling FR-m): no country or suffix heuristic; invented contexts
+    role = text.split()[0]
+    assert scrub_text(f"Hinter Acme steht {text}.", Pseudonyms()) == f"Hinter Acme steht {role} [person:1]."
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        (
+            "Unser CEO Max Mustermann sucht einen Developer (m/w/d)",
+            "Unser CEO [person:1] sucht einen Developer (m/w/d)",
+        ),
+        (
+            "Max Mustermann, CEO, sucht einen Entwickler (m/w/d)",
+            "[person:1], CEO, sucht einen Entwickler (m/w/d)",
+        ),
+        (
+            "Ansprechpartner Max Mustermann, bei uns als Engineer (m)",
+            "Ansprechpartner [person:1], bei uns als Engineer (m)",
+        ),
+        ("Kontakt: Max Mustermann, Acme GmbH", "Kontakt: [person:1], Acme GmbH"),  # a comma ends the name
+        ("Created by: Jane Doe", "Created by: [person:1]"),
+        ("Erstellt von: Max Mustermann", "Erstellt von: [person:1]"),
+    ],
+)
+def test_a_gender_marker_later_in_the_sentence_does_not_hide_a_name(text: str, scrubbed: str) -> None:
+    # F1 re-review, Important 1: only vocabulary words and joiners may stand between a name and the marker
+    assert scrub_text(text, Pseudonyms()) == scrubbed
+
+
+@pytest.mark.parametrize(
+    "padding",
+    [
+        " " + "A" + "a" * 199 + " (m/w/d)",  # a 200-letter word after the name
+        " " * 100_000 + "(m/w/d)",  # a 100,000-space run
+        (" " * 30 + "Vertrieb") * 4 + " (m/w/d)",  # four long gaps between title words
+    ],
+)
+def test_the_name_rules_stay_linear(padding: str) -> None:
+    # F1 re-review, Minor 2: every space run of the title tail is bounded; this measured 8.7 s and 42 s before
+    started = time.perf_counter()
+    scrub_text("CEO Max Mustermann" + padding, Pseudonyms())
+    scrub_text("founded" + padding + " by Max Mustermann", Pseudonyms())
+    assert time.perf_counter() - started < 2
 
 
 def test_a_later_mention_by_surname_gets_the_same_placeholder() -> None:

@@ -23,10 +23,14 @@ of …`, `Gründer <name>`), introduced by a verb or an interview (`founded by`,
 `erstellt von`, `interview with`, `Interview mit`, then two or three capitalised words that no legal form such as
 `GmbH` or `Inc` follows), or in the window after a contact marker (`Your contact person: <name>`, `Ihr
 Ansprechpartner für Fragen: <name>`, `Kontakt: <name>`). A narrow allow-list keeps the capitalised words that
-stand next to a role word and name nobody (`Founders Associate`, `Founder-Led Sales`, `Product Owner, founder`),
-and a found name whose words are all department, region or place words, or abstract nouns, or that a gender tag
-follows, is a job title (`Geschäftsführer Vertrieb (m/w/d)`, `Managing Director Germany`). Company and product
-names are not personal names and stay. The JSON rules run on every decoded string, as the scrubber reads it.
+stand next to a role word and name nobody (`Founders Associate`, `Founder-Led Sales`, `Product Owner, founder`).
+By ruling FR-m (the privacy fail-safe: an over-scrub rather than a leak), a found name is a job title only through
+an explicit, case-sensitive vocabulary (`cli_fixtures.TITLE_WORDS`: every word of it a department or region word,
+or a gender marker after it with only such words and joiners between: `Geschäftsführer Vertrieb (m/w/d)`,
+`Managing Director Germany`), and a company only through a legal form in or right after it
+(`cli_fixtures.LEGAL_FORMS`: `founded by Acme Inc.`, `Kontakt: Muster Software GmbH`). A gate false positive on a
+committed fixture goes to that documented vocabulary, never to a weaker rule. Company and product names are not
+personal names and stay. The JSON rules run on every decoded string, as the scrubber reads it.
 
 ## Narrative names (fix wave F1)
 

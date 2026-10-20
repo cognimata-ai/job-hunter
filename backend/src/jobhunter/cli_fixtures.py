@@ -27,22 +27,26 @@ else:
 Every other string is free text and goes through `scrub_text`. Every http(s) link in it (`URL_IN_TEXT`) gets
 the `url` rule. Outside the links, in this order: names near a contact marker (`Ansprechpartner`, `Kontakt`,
 `Contact`, `Your contact`: 2 or 3 capitalised words within 120 characters after it), right before an e-mail
-address or a phone number, after a salutation, in a team introduction, and next to a role word in narrative
-text (`ROLE_NAME`: "CEO und Gründer Max Mustermann", "Max Mustermann, CEO", "Gründer Max"; a later mention of
-that person, or of the first word of the name, gets the same placeholder) become `[person:n]`; e-mail
-addresses `[email:n]`; phone numbers (`redact.PHONE`, the parenthesised area code `PHONE_PAREN` of "(030)
-123456", spaced groups `PHONE_GROUPS`, the unlabelled forms `PHONE_MORE`, a number after a phone label)
+address or a phone number, after a salutation, in a team introduction, next to a role word in narrative text
+(`ROLE_NAME`: "CEO und Gründer Max Mustermann", "Max Mustermann, CEO", "Gründer Max") and after an introducing
+verb or an interview (`INTRODUCED_NAME`: "founded by", "gegründet von", "created by", "erstellt von",
+"interview with", "Interview mit") become `[person:n]`, except a job title (every word in `TITLE_WORDS`, or a
+gender marker after it) and a company (a legal form of `LEGAL_FORMS` in or right after it); a later mention of
+a role-named or introduced person, by the whole name, its first or its last word, gets the same placeholder.
+E-mail addresses `[email:n]`; phone numbers (`redact.PHONE`, the parenthesised area code `PHONE_PAREN` of
+"(030) 123456", spaced groups `PHONE_GROUPS`, the unlabelled forms `PHONE_MORE`, a number after a phone label)
 `[phone:n]`; then every `redact.KEY` match `[token:n]`. A string under a person key (`is_person_key`:
 `PERSON_KEYS` such as `creator` and `recruiter`, and by the suffix rule `contact`, `employer_contact`,
-`createdBy`, `recruiterName`, `hiring_manager_name`; its name or picture when it is an object) is
-`[person:n]` (a picture `[token:n]`). The `KEY` pass runs on non-URL free text only, because `KEY` matches
-the ids and slugs of real links. Object keys are never rewritten, so the wire structure stays. XML, HTML and
-text bodies are scrubbed as free text. Before any of it, the values of this machine's provider key variables
+`createdBy`, `recruiterName`, `hiring_manager_name`; its name or picture when it is an object) is `[person:n]`
+(a picture `[token:n]`). The `KEY` pass runs on non-URL free text only, because `KEY` matches the ids and
+slugs of real links. Object keys are never rewritten, so the wire structure stays. XML, HTML and text bodies
+are scrubbed as free text. Before any of it, the values of this machine's provider key variables
 (`SECRET_VARS`), wherever they stand, become `[key:n]`.
 
-`valid_url`, `validate_identifier` and `ROLE_NAME` are also checks of the PII scan
-(tests/contract/test_fixture_pii.py). `valid_url` refuses a credential parameter (`api_key`, `token`, ...)
-whose value is set and is no placeholder.
+`valid_url`, `validate_identifier`, `role_names` (`ROLE_NAME` and `INTRODUCED_NAME`) and `contact_names` (the
+contact window) are also checks of the PII scan (tests/contract/test_fixture_pii.py). `valid_url` refuses a
+credential parameter (`api_key`, `token`, ...) whose value is set and is no placeholder. Ruling FR-m: where a
+rule is unsure, it scrubs.
 """
 
 import argparse
@@ -60,8 +64,6 @@ from urllib.parse import quote_plus, unquote, unquote_plus, urlsplit
 
 import httpx
 
-from jobhunter.geo.gazetteer import Gazetteer
-from jobhunter.normalize.text import fold
 from jobhunter.normalize.titles import GENDER_TAG
 from jobhunter.normalize.urls import host_is
 from jobhunter.observability.redact import EMAIL, KEY, PHONE
@@ -223,52 +225,58 @@ ROLE_NAME: Final = re.compile(
     rf"|(?<![{_UPPER}{_LOWER}])({_TWO_OR_THREE})(?:[ \t]*[,(][ \t]*|{_ROLE_DASH}){_LEAD_CHAIN}"
 )
 # Ruling FR-f (fix round 1): the verbs that introduce a person ("founded by", "co-founded by", "gegründet
-# von", "created by", "erstellt von", with a short "in Berlin 2019" between the verb and "by"/"von") and an
-# interview ("interview with", "Interview mit"), then two or three capitalised words that no legal form
-# follows: "founded by Acme Data Solutions GmbH" is a company.
-_LEGAL_FORM: Final = (
-    r"(?:GmbH|gGmbH|AG|SE|KG|KGaA|OHG|UG|eG|e\.\s?V\.|Inc\.?|Ltd\.?|LLC|LLP|PLC|plc|Corp\.?|Co\.|S\.A\.|SAS"
-    r"|SARL|B\.V\.|N\.V\.|AB|ASA|Oy|S\.p\.A\.|S\.r\.l\.)"
-)
-_NO_LEGAL_FORM: Final = (
-    rf"(?![ \t]*(?:[{_UPPER}][\w\-]*[ \t]+){{0,3}}(?:&[ \t]*Co\.?[ \t]*(?:KG[ \t]*)?)?{_LEGAL_FORM}(?!\w))"
-)
-_SHORT_GAP: Final = r"(?:[ \t]+[^.;:!?<>\n]{1,40}?)?"
+# von", "created by", "erstellt von", with a short "in Berlin 2019" between the verb and "by"/"von", and an
+# optional colon after it) and an interview ("interview with", "Interview mit"), then two or three capitalised
+# words. Every space run here is bounded, and no two parts can match the same characters, so a match stays
+# linear in the text (fix round 2).
+_SHORT_GAP: Final = r"(?:[ \t]{1,3}[^\s.;:!?<>][^.;:!?<>\n]{0,39}?)?"
+_LABEL_COLON: Final = r"(?:[ \t]{0,3}:)?"
 INTRODUCED_NAME: Final = re.compile(
-    rf"(?:(?i:\b(?:co-?)?founded){_SHORT_GAP}[ \t]+(?i:by)"
-    rf"|(?i:\b(?:mit)?gegr(?:ü|ue)ndet){_SHORT_GAP}[ \t]+(?i:von)"
-    rf"|(?i:\bcreated[ \t]+by|\berstellt[ \t]+von|\binterview[ \t]+(?:with|mit)))\b"
-    rf"{_ROLE_SPACE}({_TWO_OR_THREE}){_NAME_END}{_NO_LEGAL_FORM}"
+    rf"(?:(?i:\b(?:co-?)?founded){_SHORT_GAP}[ \t]{{1,3}}(?i:by)"
+    rf"|(?i:\b(?:mit)?gegr(?:ü|ue)ndet){_SHORT_GAP}[ \t]{{1,3}}(?i:von)"
+    rf"|(?i:\bcreated[ \t]{{1,3}}by|\berstellt[ \t]{{1,3}}von|\binterview[ \t]{{1,3}}(?:with|mit)))\b"
+    rf"{_LABEL_COLON}{_ROLE_SPACE}({_TWO_OR_THREE}){_NAME_END}"
 )
 # A second or third person right after an introduced one ("founded by <name> and <name>").
 _JOINED_NAME: Final = re.compile(
-    rf"[ \t]*(?:,|\band\b|\bund\b|&(?:amp;)?)[ \t]*({_TWO_OR_THREE}){_NAME_END}{_NO_LEGAL_FORM}"
+    rf"[ \t]{{0,3}}(?:,|\band\b|\bund\b|&(?:amp;)?)[ \t]{{0,3}}({_TWO_OR_THREE}){_NAME_END}"
 )
-# Minor 1 of the F1 review: a job title next to a role word is no name ("Geschäftsführer Vertrieb und
-# Marketing (m/w/d)", "Managing Director Germany", "CTO Platform Engineering", "Contact Customer Service"). A
-# found name is dropped when every word of it is a department or region word (`_TITLE_WORDS`), an abstract
-# noun (`_ABSTRACT_NOUN`: "Umsetzung von Vertriebsstrategien") or a country, or, for a name of two or more
-# words, a German place or a European city of the gazetteer; or when a gender tag follows it (after more
-# capitalised words and joiners only), as in a title. A one-word name that is a place stays a name: a dozen
-# common first names are places too ("an Julia", "Gründer Leon").
-_TITLE_WORDS: Final = frozenset(
-    {"vertrieb", "technik", "marketing", "finanzen", "finance", "personal", "operations", "platform"}
-    | {"engineering", "customer", "service", "services", "formular", "seite", "page", "sales", "produkt"}
-    | {"product", "products", "einkauf", "logistik", "produktion", "entwicklung", "forschung", "recht"}
-    | {"legal", "strategy", "strategie", "digital", "business", "data", "technology", "technologie"}
-    | {"people", "human", "resources", "development", "software", "hardware", "infrastructure", "security"}
-    | {"commercial", "growth", "revenue", "partnerships", "innovation", "research", "support"}
-    | {"administration", "verwaltung", "kommunikation", "communications", "center", "centre", "desk"}
-    | {"region", "international", "global", "europe", "europa", "nord", "sud", "ost", "west", "north"}
-    | {"south", "east", "central", "deutschland", "germany"}
+# A company is no person (ruling FR-f): a found name is dropped when one of its words, or of the capitalised
+# words right after it, is a legal form ("founded by Acme Inc.", "created by Beispiel Ltd for you", "Kontakt:
+# Muster Software GmbH", "erstellt von Muster Co. KG"). Compared case-sensitively, without a trailing comma,
+# bracket or full stop.
+LEGAL_FORMS: Final = frozenset(
+    {"GmbH", "gGmbH", "mbH", "AG", "SE", "KG", "KGaA", "OHG", "UG", "eG", "e.V", "e. V", "GbR", "PartG"}
+    | {"Inc", "Ltd", "LLC", "LLP", "PLC", "plc", "Corp", "Co", "Limited", "S.A", "SAS", "SARL", "B.V", "N.V"}
+    | {"AB", "ASA", "Oy", "S.p.A", "S.r.l", "SA", "BV", "NV"}
 )
-_ABSTRACT_NOUN: Final = re.compile(
-    r".{3,}(?:ung|ungen|heit|heiten|keit|keiten|schaft|schaften|tion|tionen|itat|itaten|ismus|ien|ment|ments)"
-)  # on the folded word
+# Ruling FR-m (fix round 2, the privacy fail-safe): the scrubber prefers a false positive to a false negative,
+# so a job title suppresses a found name only through this explicit, case-sensitive vocabulary of department,
+# region and title-tail words, plus the gender markers (`_TITLE_TAIL`); no suffix or place heuristic. A found
+# name is a title when every word of it is in `TITLE_WORDS` ("Geschäftsführer Vertrieb und Marketing (m/w/d)",
+# "Managing Director Germany", "CTO Platform Engineering", "Contact Customer Service"), or when a gender
+# marker follows it, after more vocabulary words and joiners only ("Geschäftsführer Spedition (m/w/d)"). The
+# last group are the gate's false positives on the committed fixtures, the documented allow-list: a contact
+# window in `arbeitnow/page1.json` reaches "Umsetzung von Vertriebsstrategien" once placeholders have
+# shortened the text before it.
+TITLE_WORDS: Final = frozenset(
+    {"Vertrieb", "Technik", "Marketing", "Finanzen", "Finance", "Personal", "Operations", "Platform"}
+    | {"Engineering", "Customer", "Service", "Services", "Formular", "Seite", "Page", "Sales", "Produkt"}
+    | {"Product", "Products", "Einkauf", "Logistik", "Produktion", "Entwicklung", "Forschung", "Recht"}
+    | {"Legal", "Strategy", "Strategie", "Digital", "Business", "Data", "Technology", "Technologie"}
+    | {"People", "Human", "Resources", "Development", "Software", "Hardware", "Infrastructure", "Security"}
+    | {"Commercial", "Growth", "Revenue", "Partnerships", "Innovation", "Research", "Support"}
+    | {"Administration", "Verwaltung", "Kommunikation", "Communications", "Center", "Centre", "Desk"}
+    | {"Region", "International", "Global", "Europe", "Europa", "EMEA", "DACH", "Nord", "Süd", "Ost"}
+    | {"West", "North", "South", "East", "Central", "Deutschland", "Germany", "Österreich", "Austria"}
+    | {"Schweiz", "Switzerland"}
+    | {"Umsetzung", "Vertriebsstrategien"}
+)
+_TITLE_WORD: Final = "|".join(sorted(map(re.escape, TITLE_WORDS), key=lambda w: (-len(w), w)))
 _TITLE_TAIL: Final = re.compile(
-    rf"(?:[ \t]*(?:und|and|&|/|,|-)?[ \t]*[{_UPPER}][{_LOWER}]+){{0,4}}[ \t]*(?:{GENDER_TAG.pattern}"
-    r"|\(?(?:m/w/d|w/m/d|m/f/d|f/m/d)\)?)",
-    re.IGNORECASE,
+    rf"(?:(?:[ \t]{{0,3}}(?:und|and|&|/|,|-)[ \t]{{0,3}}|[ \t]{{1,3}})"
+    rf"(?:{_TITLE_WORD})(?![\w\-'\u2019])){{0,4}}"
+    rf"[ \t]{{0,3}}(?:(?i:{GENDER_TAG.pattern})|\(?(?:m/w/d|w/m/d|m/f/d|f/m/d|m/w/x|w/m/x)\)?(?![\w/]))"
 )
 
 # Query and fragment parameters whose value is a token whatever it looks like: Adzuna's `se`, `v`, `adref`;
@@ -397,24 +405,33 @@ def _sentinel_index(match: re.Match[str]) -> int:
 
 
 def _is_title(text: str, start: int, end: int) -> bool:
-    """Whether the name found at `text[start:end]` is the rest of a job title (`_TITLE_WORDS`,
-    `_TITLE_TAIL`)."""
-    if _TITLE_TAIL.match(text, end):
-        return True
-    gaz = Gazetteer.load()
-    words = [fold(w) for w in text[start:end].split() if not w.endswith(".") and w[:1].isupper()]
+    """Whether the name found at `text[start:end]` is the rest of a job title: every word of it in
+    `TITLE_WORDS`, or a gender marker after it (`_TITLE_TAIL`). Ruling FR-m: nothing else counts."""
+    words = [w for w in text[start:end].split() if w[:1].isupper() and not w.endswith(".")]
+    return _TITLE_TAIL.match(text, end) is not None or all(w in TITLE_WORDS for w in words)
 
-    def title_word(w: str) -> bool:
-        known = gaz.non_de(w)
-        if (
-            w in _TITLE_WORDS
-            or _ABSTRACT_NOUN.fullmatch(w)
-            or (known is not None and known.kind == "country")
-        ):
+
+def _is_company(text: str, start: int, end: int) -> bool:
+    """Whether the name found at `text[start:end]` names a company: one of its words, or of the up to three
+    capitalised words (or `&`) right after it, is a legal form (`LEGAL_FORMS`; `e. V.` as two words too). A
+    comma, colon, semicolon or closing bracket ends the name, so "Max Mustermann, Acme GmbH" stays a person.
+    The words are the text's own, so a name that `NAME` ends inside "GmbH" is seen with the whole word."""
+    count = len(text[start:end].split())
+    words = text[start:].split(None, count + 3)[: count + 3]
+    bare = [word.strip(",;:()[]").rstrip(".") for word in words]
+    for index, word in enumerate(words):
+        if index >= count and words[index - 1][-1:] in ",;:)":
+            return False
+        if bare[index] in LEGAL_FORMS or (bare[index] == "e" and bare[index + 1 : index + 2] == ["V"]):
             return True
-        return len(words) > 1 and (known is not None or gaz.is_german_place_name(w))
+        if index >= count and not (word[:1].isupper() or word == "&"):
+            return False
+    return False
 
-    return all(map(title_word, words))
+
+def _kept(text: str, start: int, end: int) -> bool:
+    """A found name that is neither a job title nor a company."""
+    return not _is_title(text, start, end) and not _is_company(text, start, end)
 
 
 def role_names(text: str) -> list[tuple[int, int]]:
@@ -429,7 +446,7 @@ def role_names(text: str) -> list[tuple[int, int]]:
                 break
             found.append(joined.span(1))
             end = joined.end()
-    return [(start, end) for start, end in sorted(set(found)) if not _is_title(text, start, end)]
+    return [(start, end) for start, end in sorted(set(found)) if _kept(text, start, end)]
 
 
 def contact_names(text: str) -> list[tuple[int, int]]:
@@ -443,7 +460,7 @@ def contact_names(text: str) -> list[tuple[int, int]]:
             for name in pattern.finditer(text, marker.end()):
                 if name.start() >= limit:
                     break
-                if not _is_title(text, *name.span(group)):
+                if _kept(text, *name.span(group)):
                     spans.append(name.span(group))
     return spans
 

@@ -190,6 +190,10 @@ def test_the_scan_leaves_ids_uuids_and_timestamps_alone(value: str) -> None:
         "Die Seite wurde erstellt von Erika Musterfrau.",
         "Your contact person: Jane Doe",
         "Ihr Ansprechpartner für Fragen: Max Mustermann",
+        # F1 re-review, Important 1 (ruling FR-m): a gender marker later in the sentence hides no name
+        "Unser CEO Max Mustermann sucht einen Developer (m/w/d)",
+        "Max Mustermann, CEO, sucht einen Entwickler (m/w/d)",
+        "Created by: Jane Doe",
     ],
 )
 def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:
@@ -211,7 +215,9 @@ def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:
         "direct access to the Head of Finance and the founders",
         # ruling FR-f: a company after the introducing words, and the job titles of review Minor 1
         "founded by Acme Data Solutions GmbH in 2019",
-        "created by Acme Labs Inc. for you",
+        "created by Beispiel Ltd for you",
+        "founded by Acme Inc.",
+        "Kontakt: Muster Software GmbH",
         "founded by Google veterans",
         "Interview mit Hiring Manager und Team",
         "Ein Interview mit [person:3] über KI.",
