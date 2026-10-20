@@ -102,11 +102,12 @@ def parse_iso(text: str, *, precision: Precision) -> ParsedDate | None:
 
 
 def response_date(headers: Mapping[str, str], fallback: datetime) -> datetime:
-    """The response's RFC 7231 `Date` header in UTC (the header name in any case), else `fallback`."""
+    """The response's RFC 7231 `Date` header in UTC (the header name in any case), else `fallback`; so is a
+    value that does not parse, or whose UTC instant is out of range (`31 Dec 9999 23:59:59 -2359`)."""
     for name, value in headers.items():
         if name.casefold() == "date":
             try:
                 return _utc(parsedate_to_datetime(value))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return fallback
     return fallback

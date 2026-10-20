@@ -7,12 +7,25 @@ newest item: any page not read can hold items from anywhere in the span. Such a 
 cell's accounting frontier to its newest item.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
-from jobhunter.sources.arbeitnow import FirehoseState, Gap, conclude, covered_span, filled_at, page_cap
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from jobhunter.sources import arbeitnow
+from jobhunter.sources.arbeitnow import (
+    MAX_AGE_S,
+    FirehoseState,
+    Gap,
+    conclude,
+    covered_span,
+    filled_at,
+    page_cap,
+)
 from jobhunter.sources.base import RawPage, RequestSpec
+from jobhunter.sources.parsing.dates import response_date
+from jobhunter.sources.traverse import _NOTHING_PROVEN, _earliest_fill
 
 T = datetime(2026, 10, 16, tzinfo=UTC)
 H = timedelta(hours=1)
@@ -188,12 +201,16 @@ def test_a_page_was_made_at_its_date_less_its_age() -> None:
 @pytest.mark.parametrize(
     ("headers", "age_s"),
     [
-        # Ruling FR-q (F4 fix round 1): a joined `Age` takes the largest value, a fraction is rounded up
+        # Ruling FR-q (F4 fix round 1): a joined `Age` takes the largest value
         ({"age": "1440, 1440"}, 1440),
         ({"age": "1440,1500"}, 1500),
-        ({"age": "1440.0"}, 1440),
-        ({"age": "1440.2"}, 1441),
         ({"age": " 7 "}, 7),
+        ({"age": "\t7"}, 7),
+        # fix wave F6: RFC 9111 delta-seconds, ASCII digits only, at most 2^31
+        ({"age": "0060"}, 60),
+        ({"age": "0"}, 0),
+        ({"age": str(MAX_AGE_S)}, MAX_AGE_S),
+        ({"age": "1440, 0" + str(MAX_AGE_S)}, MAX_AGE_S),
         # no `Age` on a response the cache did not serve: as old as its `Date`
         ({"cf-cache-status": "MISS"}, 0),
         ({"cf-cache-status": "DYNAMIC"}, 0),
@@ -205,6 +222,24 @@ def test_a_page_was_made_at_its_date_less_its_age() -> None:
         ({"age": "1440, x"}, None),
         ({"age": "nan"}, None),
         ({"age": "inf"}, None),
+        # fix wave F6: not delta-seconds (a sign, a fraction, an exponent, a separator, a non-ASCII digit, an
+        # empty part of a joined header), or past 2^31: unknown, and unknown when any part of a joined one is
+        ({"age": "+5"}, None),
+        ({"age": "1440.0"}, None),
+        ({"age": "1440.2"}, None),
+        ({"age": "1e3"}, None),
+        ({"age": "1_0"}, None),
+        ({"age": "0x10"}, None),
+        ({"age": "\u0661\u0662"}, None),  # Arabic-Indic digits: `int` would read them
+        ({"age": "\uff11\uff12"}, None),  # fullwidth digits
+        ({"age": "1440,"}, None),
+        ({"age": "1440, 1e3"}, None),
+        ({"age": "1440, 1500.5"}, None),
+        ({"age": str(MAX_AGE_S + 1)}, None),
+        ({"age": "99999999999"}, None),
+        ({"age": "1440, 99999999999"}, None),
+        ({"age": "1" + "0" * 5000}, None),  # longer than `int` reads from a string
+        ({"age": "1e20"}, None),
         ({"cf-cache-status": "HIT"}, None),
         ({"cf-cache-status": "hit"}, None),
         ({"cf-cache-status": "STALE"}, None),
@@ -215,6 +250,92 @@ def test_a_page_whose_age_is_unknown_has_no_fill_instant(headers: dict[str, str]
     page = page_with({"date": "Sun, 18 Oct 2026 20:53:22 GMT", **headers}, T)
     served = datetime(2026, 10, 18, 20, 53, 22, tzinfo=UTC)
     assert filled_at(page) == (None if age_s is None else served - timedelta(seconds=age_s))
+
+
+def test_a_date_out_of_range_falls_back_to_the_arrival_and_an_absurd_age_is_unknown() -> None:
+    """Fix wave F6 (F4 re-review Minor 1): `filled_at` never raises on a header value. A `Date` whose UTC
+    instant is past year 9999 is unreadable (its arrival stands in); an `Age` past 2^31 used to overflow."""
+    future = {"date": "Fri, 31 Dec 9999 23:59:59 -2359", "age": "60"}
+    assert filled_at(page_with(future, T)) == T - timedelta(seconds=60)
+    oldest = {"date": "Mon, 01 Jan 0100 00:00:00 +2359", "age": str(MAX_AGE_S)}
+    assert filled_at(page_with(oldest, T)) == datetime(99, 12, 31, 0, 1, tzinfo=UTC) - timedelta(
+        seconds=MAX_AGE_S
+    )
+    for age in ("99999999999", "1e20", "1" + "0" * 30):
+        assert filled_at(page_with({"date": "Sun, 18 Oct 2026 20:53:22 GMT", "age": age}, T)) is None
+
+
+def test_a_fill_instant_out_of_range_is_unknown(monkeypatch) -> None:
+    """Fix wave F6: should a `Date` ever read as an instant less than 2^31 s after the first representable
+    one, its fill would precede it: unknown, never an `OverflowError` out of the traversal."""
+    monkeypatch.setattr(
+        arbeitnow, "response_date", lambda headers, fallback: datetime.min.replace(tzinfo=UTC)
+    )
+    assert filled_at(page_with({"age": "60"}, T)) is None
+    assert filled_at(page_with({}, T)) == datetime.min.replace(tzinfo=UTC)  # age 0: the instant itself
+
+
+_HEADER_TEXT = st.one_of(
+    st.text(max_size=40),
+    st.from_regex(r"[ \t]*[+-]?[0-9]{0,25}([._][0-9]{0,5})?([eE][+-]?[0-9]{0,4})?[ \t]*", fullmatch=True),
+    st.integers(min_value=-(2**70), max_value=2**70).map(str),
+)
+
+
+@settings(max_examples=400, deadline=None)
+@given(
+    age=st.one_of(st.none(), _HEADER_TEXT, st.lists(_HEADER_TEXT, min_size=1, max_size=4).map(", ".join)),
+    date=st.one_of(
+        st.none(),
+        st.text(max_size=40),
+        st.tuples(
+            st.dates(min_value=date(100, 1, 1)), st.sampled_from(["00:00:00", "12:34:56", "23:59:59"])
+        ).map(lambda moment: f"{moment[0].strftime('%a, %d %b %Y')} {moment[1]}"),
+    ).flatmap(
+        lambda base: (
+            st.just(base)
+            if base is None
+            else st.sampled_from(["", " GMT", " -2359", " +2359", " +0000"]).map(lambda zone: base + zone)
+        )
+    ),
+    cache=st.sampled_from([None, "HIT", "MISS", "STALE", "DYNAMIC", "weird"]),
+)
+def test_filled_at_never_raises_and_never_dates_a_page_after_its_date(
+    age: str | None, date: str | None, cache: str | None
+) -> None:
+    """Fix wave F6 (F4 re-review Minor 1): any `Age`, `Date` and cache status reads as a fill instant at or
+    before the response's `Date` (else its arrival), or as unknown; it never raises."""
+    headers = {
+        name: value
+        for name, value in (("age", age), ("date", date), ("cf-cache-status", cache))
+        if value is not None
+    }
+    made = filled_at(page_with(headers, T))
+    if made is not None:
+        assert made <= response_date(headers, T)
+
+
+@pytest.mark.parametrize(
+    ("fills", "bound", "earliest"),
+    [
+        # fix wave F6 (F4 re-review Minor 2): a read of known and unknown fills stops at the earliest known
+        # fill or at the cell's previous covered bound, whichever is earlier, in any page order
+        ((T - 3 * H, None), T - H, T - 3 * H),
+        ((None, T - 3 * H), T - H, T - 3 * H),
+        ((T - H, None), T - 3 * H, T - 3 * H),
+        ((None, T - H), T - 3 * H, T - 3 * H),
+        ((T - H, None, T - 2 * H), T, T - 2 * H),
+        ((T - H, None, T - 2 * H, None), T - 5 * H, T - 5 * H),
+        ((T - H, None), None, _NOTHING_PROVEN),  # a never-covered cell: nothing proven at all
+        # every fill known: the earliest, whatever the bound; every fill unknown: the bound
+        ((T - H, T - 2 * H), T - 5 * H, T - 2 * H),
+        ((None, None), T - 5 * H, T - 5 * H),
+    ],
+)
+def test_a_mixed_read_stops_at_its_earliest_known_fill_or_the_covered_bound(
+    fills: tuple[datetime | None, ...], bound: datetime | None, earliest: datetime
+) -> None:
+    assert _earliest_fill(fills, FirehoseState(bound, ())) == earliest
 
 
 def test_a_read_to_the_end_covers_nothing_newer_than_its_earliest_page_fill() -> None:

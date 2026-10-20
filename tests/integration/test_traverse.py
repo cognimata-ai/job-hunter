@@ -838,6 +838,50 @@ async def test_a_cached_page_of_unknown_age_proves_nothing_above_the_previous_co
     ]
 
 
+@pytest.mark.parametrize("bound_below_the_fill", [False, True], ids=["fill_first", "bound_first"])
+async def test_a_read_of_a_known_and_an_unknown_fill_stops_at_the_earlier_of_the_fill_and_the_bound(
+    engine,
+    current_epoch,
+    respx_mock: respx.MockRouter,
+    arbeitnow_adapter: ArbeitnowAdapter,
+    bound_below_the_fill,
+) -> None:
+    """Fix wave F6 (F4 re-review Minor 2): page 1 has a known fill (`Date` less `Age`), page 2 is a cache hit
+    without an `Age` and ends the feed. The read covers nothing newer than the earlier of page 1's fill and
+    the cell's previous covered bound (`traverse._earliest_fill`): neither the known fill alone nor the bound
+    alone; what it read above the bound is an `unknown_continuation` gap."""
+    await seed_inputs(engine, enabled=("arbeitnow",))
+    oldest, newest = feed_times()
+    made = newest - 30 * timedelta(minutes=1)
+    served = made + H
+    status, headers, body = load_fixture("arbeitnow", "page1")
+    known = {**headers, "date": served.strftime("%a, %d %b %Y %H:%M:%S GMT"), "age": "3600"}
+    respx_mock.get(FEED_URL, params={"page": "1"}).mock(
+        return_value=httpx.Response(status, headers=known, content=body)
+    )
+    status, headers, body = load_fixture("arbeitnow", "page2")
+    doc = json.loads(body)
+    doc["links"]["next"] = None  # the end of the feed
+    unknown = {name: value for name, value in headers.items() if name != "age"}
+    assert unknown["cf-cache-status"] == "HIT"
+    respx_mock.get(FEED_URL, params={"page": "2"}).mock(
+        return_value=httpx.Response(status, headers=unknown, json=doc)
+    )
+    deps = make_deps(engine, lambda instance: arbeitnow_adapter)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    bound = oldest + H if bound_below_the_fill else made + 10 * timedelta(minutes=1)
+    async with engine.begin() as c:  # an earlier, proven read covered the cell up to `bound`
+        await c.execute(COVERED_ROW, {"c": await cell_of(engine, fid), "l": oldest - 20 * H, "u": bound})
+    result = await traverse_and_record(replace(deps, clock=lambda: served), fid)
+    upper = bound if bound_below_the_fill else made
+    assert (result.end, result.pages, result.covered) == ("end", 2, (oldest, upper))
+    assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
+        ("gap", "open", "unknown_continuation", bound, newest),
+        ("covered", None, None, oldest, upper),
+    ]
+
+
 async def test_detail_acquisitions_never_run_more_than_the_gate_admits(
     engine, current_epoch, respx_mock: respx.MockRouter, monkeypatch
 ) -> None:

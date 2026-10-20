@@ -76,7 +76,6 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from math import ceil, isfinite
 from typing import Final, Literal
 
 import httpx
@@ -122,6 +121,9 @@ _HOURS_PER_PAGE: Final = 30  # `ceil(interval_h / 30) + 1` (§5.3.4)
 _ALL_WORK_MODES: Final = frozenset({"remote", "hybrid", "onsite"})
 # The `cf-cache-status` values of a response the edge cache served (V8: every recorded page was a HIT).
 _CACHE_SERVED: Final = frozenset({"hit", "stale", "updating", "revalidated"})
+# An `Age` part is RFC 9111 delta-seconds (§1.2.2: `1*DIGIT`, ASCII digits only), at most `MAX_AGE_S`.
+_DELTA_SECONDS: Final = re.compile(r"[0-9]+")
+MAX_AGE_S: Final = 2**31  # RFC 9111 §1.2.2's bound; a larger age (68 years) is no age a page has
 _NUMERIC_SUFFIX: Final = re.compile(r"-(\d+)$")
 _ESCAPED_TAG_FIRST: Final = re.compile(r"^\s*&lt;/?[A-Za-z]")
 
@@ -180,34 +182,50 @@ def _cutoff(now: datetime, max_ad_age_days: int) -> datetime:
     return now - timedelta(days=max_ad_age_days)
 
 
+def _delta_seconds(text: str) -> int | None:
+    """`text` as RFC 9111 delta-seconds (ASCII digits, optional whitespace around them) of at most
+    `MAX_AGE_S`; `None` for anything else."""
+    digits = text.strip(" \t")
+    if _DELTA_SECONDS.fullmatch(digits) is None:
+        return None
+    significant = digits.lstrip("0") or "0"
+    if len(significant) > len(str(MAX_AGE_S)):  # before `int`, which refuses very long digit strings
+        return None
+    value = int(significant)
+    return value if value <= MAX_AGE_S else None
+
+
 def _age_s(headers: Mapping[str, str]) -> int | None:
     """The page's age in whole seconds, or `None` when it is unknown (Ruling FR-q: fail safe, never a claim
-    the headers do not prove). A joined `Age` (`1440, 1440`, two headers) takes the largest, a fraction is
-    rounded up; any other `Age` is unknown. Without an `Age`, a response the cache served
-    (`cf-cache-status`, V8's signal) has an unknown age, and any other one (a miss, or no cache at all) is
-    as old as its `Date`."""
+    the headers do not prove). An `Age` reads only as RFC 9111 delta-seconds (`_delta_seconds`: digits,
+    no sign, fraction, exponent or separator, at most `MAX_AGE_S`); a joined `Age` (`1440, 1440`, two
+    headers) takes the largest of its parts, and when any part does not read the whole `Age` is unknown (a
+    part left out could be the oldest). Without an `Age`, a response the cache served (`cf-cache-status`,
+    V8's signal) has an unknown age, and any other one (a miss, or no cache at all) is as old as its
+    `Date`."""
     raw = headers.get("age")
     if raw is None:
         return None if headers.get("cf-cache-status", "").strip().casefold() in _CACHE_SERVED else 0
     seconds: list[int] = []
     for part in raw.split(","):
-        try:
-            value = float(part.strip())
-        except ValueError:
+        value = _delta_seconds(part)
+        if value is None:
             return None
-        if not isfinite(value) or value < 0:
-            return None
-        seconds.append(ceil(value))
+        seconds.append(value)
     return max(seconds)
 
 
 def filled_at(page: RawPage) -> datetime | None:
     """When the page's content was made: its `Date` header (else its arrival, `fetched_at`) less its `Age`;
-    `None` when its age is unknown (`_age_s`)."""
+    `None` when its age is unknown (`_age_s`). It never raises on a header value: an instant out of the
+    representable range is unknown as well."""
     age = _age_s(page.headers)
     if age is None:
         return None
-    return response_date(page.headers, page.fetched_at) - timedelta(seconds=age)
+    try:
+        return response_date(page.headers, page.fetched_at) - timedelta(seconds=age)
+    except OverflowError:
+        return None
 
 
 def covered_span(

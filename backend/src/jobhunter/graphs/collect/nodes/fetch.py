@@ -163,7 +163,10 @@ async def _record(conn: AsyncConnection, planned: PlannedCell, result: Traversal
             state,
             gaps,
             covered=result.covered,
-            # an END read's gaps: earlier reads were capped, or its pages were made before its newest items
+            # the reason of a gap `conclude` gave none: for an END read, the gap below its span (items that
+            # left the feed unread while earlier reads were capped); the gap above its pages' earliest fill
+            # carries its own `unknown_continuation` (Ruling FR-o), and a narrowed gap's remainder keeps its
+            # gap's reason
             reason=coverage.gap_reason(result) or "page_cap",
             run_id=run_id,
         )

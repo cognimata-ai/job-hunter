@@ -241,7 +241,16 @@ def test_response_date_reads_the_date_header_in_any_case_and_zone() -> None:
     assert response_date({"date": "Fri, 16 Oct 2026 11:47:00 -0000"}, REF) == stored
 
 
-@pytest.mark.parametrize("value", ["", "yesterday", "Fri, 99 Oct 2026 09:47:00 GMT", "16 Oct"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "yesterday",
+        "Fri, 99 Oct 2026 09:47:00 GMT",
+        "16 Oct",
+        "Fri, 31 Dec 9999 23:59:59 -2359",  # fix wave F6: its UTC instant is past year 9999 (OverflowError)
+    ],
+)
 def test_response_date_falls_back_when_the_header_is_missing_or_malformed(value) -> None:
     fallback = datetime(2026, 10, 17, 1, 2, 3, tzinfo=UTC)
     assert response_date({"date": value}, fallback) == fallback
