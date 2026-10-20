@@ -66,7 +66,8 @@ jobs:
       - run: uv sync --frozen
       # tests/embedder runs in the base environment: the embedder app tests need no model and no `embedder`
       # group (Task 21); the `embedder_model` tests that load the model are deselected (pyproject addopts).
-      - run: uv run pytest -W error tests/unit tests/property tests/embedder -q
+      # tests/live: addopts deselects its `live` tests too, so only its offline paid-host guards run here.
+      - run: uv run pytest -W error tests/unit tests/property tests/embedder tests/live -q
 
   integration:
     runs-on: ubuntu-24.04

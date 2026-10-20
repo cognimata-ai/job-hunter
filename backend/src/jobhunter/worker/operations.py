@@ -21,7 +21,9 @@ subject `operation:<id>`) exactly once, in the transaction that ends the row (§
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
 the one ownership-loss protocol shared with runs. A claim that the epoch fence refuses (a superseded worker,
 `FencedOut`) re-defers the operation's job under its queueing lock `op:<id>` instead of consuming it (M0
-carry-forward 6, plan Deviation 18), so the current worker claims it at once. Every time comparison of the
+carry-forward 6, plan Deviation 18), so the current worker claims it at once; first it asks its own worker
+for the graceful stop (`on_superseded`, ruling T24-a), so the superseded worker's loops fetch it no more.
+Every time comparison of the
 sweeps and reconcilers uses the caller's clock (`ctx.now`, or `now`), never the database's `now()`.
 
 This module is a task boundary (ruff `BLE001` is allowed here); it needs no broad catch, because `run_owned`
@@ -469,14 +471,21 @@ async def _invoke(handler: OperationHandler, ctx: OperationContext) -> None:
 
 
 async def execute_operation(
-    engine: AsyncEngine, operation_id: int, *, epoch: int, heartbeat_period_s: float = 30.0
+    engine: AsyncEngine,
+    operation_id: int,
+    *,
+    epoch: int,
+    heartbeat_period_s: float = 30.0,
+    on_superseded: Callable[[], None] = lambda: None,
 ) -> None:
     """Claim and run operation `operation_id` (the `run_operation` task body), one protocol for every end.
 
     1. Claim it; return when it is not claimable. When `epoch` is no longer the current worker epoch
-       (`FencedOut`), the job is deferred again first, `run_operation(operation_id)` under `op:<id>` in a
-       transaction of its own (deduplicated by that queueing lock while one waits). A kind without a handler
-       ends `failed('no_handler')` with the `operation.failed` alert (raised by `finish_operation`).
+       (`FencedOut`), `on_superseded()` asks this worker for its graceful stop (ruling T24-a; the task body
+       requests the runtime's shutdown), then the job is deferred again, `run_operation(operation_id)` under
+       `op:<id>` in a transaction of its own (deduplicated by that queueing lock while one waits): the
+       current worker claims it, the stopping one fetches no more. A kind without a handler ends
+       `failed('no_handler')` with the `operation.failed` alert (raised by `finish_operation`).
     2. Run the handler through `run_owned(("operation", id), claim_id, …)`: the registry's task for the
        operation, next to the heartbeat task `heartbeat:operation:<id>` whose loss cancels it.
     3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, even one
@@ -495,6 +504,7 @@ async def execute_operation(
         async with engine.begin() as conn:
             claim = await claim_operation(conn, operation_id, epoch=epoch)
     except FencedOut:  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+        on_superseded()  # first: the loops stop fetching while the re-defer below commits
         async with engine.begin() as conn:
             job_id = await defer_operation_job(conn, defer_in_tx, operation_id)
         log.info("operation_redeferred", operation_id=operation_id, deduplicated=job_id is None)

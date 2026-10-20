@@ -408,36 +408,51 @@ M1_RECONCILERS = {
     "group_representatives": ["heavy"],
     "awaiting_embedding": ["heavy"],
 }
+# Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
+# from `sys.modules` (each registry module is imported by the modules that register into it).
 _REGISTRY_SCRIPT = """\
-import importlib, json
-from jobhunter.worker import main
-for module in main._REGISTERING_MODULES:
+import importlib, json, sys
+for module in sys.argv[1:]:
     importlib.import_module(module)
-from jobhunter.worker.epoch import _SWEEPS
-from jobhunter.worker.operations import HANDLERS
-from jobhunter.worker.reconcilers import REGISTRY
 print(json.dumps({
-    "reconcilers": {name: sorted(cadences) for name, (cadences, _) in REGISTRY.items()},
-    "sweeps": sorted(_SWEEPS),
-    "handlers": sorted(HANDLERS),
+    "reconcilers": {
+        name: sorted(cadences)
+        for name, (cadences, _) in sys.modules["jobhunter.worker.reconcilers"].REGISTRY.items()
+    },
+    "sweeps": sorted(sys.modules["jobhunter.worker.epoch"]._SWEEPS),
+    "handlers": sorted(sys.modules["jobhunter.worker.operations"].HANDLERS),
+    "main_imported": "jobhunter.worker.main" in sys.modules,
 }))
 """
 
 
-def test_the_registering_modules_register_every_reconciler_sweep_and_handler() -> None:
-    """In a fresh interpreter (no test registered anything there): `worker.main` and its
-    `_REGISTERING_MODULES` (step 4, before the takeover) register exactly the M1 reconcilers, the two
-    takeover sweeps and the `watchlist_validate` handler."""
+def registered_by(modules: tuple[str, ...]) -> dict[str, object]:
+    """What a fresh interpreter has registered after importing only `modules`."""
     import json
     import subprocess
     import sys
 
     done = subprocess.run(
-        [sys.executable, "-c", _REGISTRY_SCRIPT], capture_output=True, text=True, check=True, timeout=120
+        [sys.executable, "-c", _REGISTRY_SCRIPT, *modules],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
     )
-    registered = json.loads(done.stdout.strip().splitlines()[-1])
-    assert registered == {
+    registered: dict[str, object] = json.loads(done.stdout.strip().splitlines()[-1])
+    return registered
+
+
+def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
+    """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
+    (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
+    anyway), the registries hold exactly the M1 reconcilers with their cadences, the two takeover sweeps and
+    the `watchlist_validate` handler."""
+    from jobhunter.worker.main import _REGISTERING_MODULES
+
+    assert registered_by(_REGISTERING_MODULES) == {
         "reconcilers": M1_RECONCILERS,
         "sweeps": ["operations", "runs"],
         "handlers": ["watchlist_validate"],
+        "main_imported": False,
     }

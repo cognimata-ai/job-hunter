@@ -38,7 +38,10 @@ run (`queued` or `running`) is never deleted, however old.
 unchanged board answers the same bytes every day) is kept with its request, and its run, by both
 `fetch_requests` and `runs`: its deletion would set the newer row's `body_ref_id` to NULL while that row has
 no body of its own and no `purged_at`, which its CHECK refuses. Once that body expires, `raw_bodies` purges
-the newer row too, and both rules can delete in that same pass.
+the newer row too, and both rules can delete in that same pass. So while identical bytes recur (each new
+response references the stored body and extends its `expires_at`), the oldest request of that body and its
+run stay past the 13 months, for as long as the bytes keep recurring: metadata only, plus the one stored
+body that the newest response still needs. The controller records this as a plan deviation (Task 24).
 
 Isolation has one exception, the dependent rules (ruling T21-f): a rule names in `depends_on` the rules whose
 work its own would make impossible to finish later. `runs` depends on `checkpoints`, because its cascade
@@ -137,7 +140,9 @@ _DELETES: Final[dict[str, TextClause]] = {
     ),
     "coverage_intervals": q("DELETE FROM coverage_intervals WHERE coalesce(closed_at, created_at) < :cutoff"),
     # Terminal and created before the cutoff, unless a newer, unpurged response references the body of its
-    # response or of a detail request's (with a list request goes its detail requests: cascade).
+    # response or of a detail request's (with a list request goes its detail requests: cascade). A shared
+    # body therefore keeps its oldest request (metadata) past 13 months while identical bytes recur
+    # ("Shared bodies" above; a deviation the controller records).
     "fetch_requests": q(
         "DELETE FROM fetch_requests p "
         "WHERE p.status IN ('succeeded', 'failed', 'ambiguous', 'skipped') AND p.created_at < :cutoff "
@@ -146,7 +151,8 @@ _DELETES: Final[dict[str, TextClause]] = {
         "WHERE (f.id = p.id OR f.parent_fetch_request_id = p.id) AND d.purged_at IS NULL)"
     ),
     # Terminal and finished, or never started (`missed`, `skipped_overlap`) and queued, before the cutoff;
-    # not while a newer, unpurged response references a body of its requests (their cascade would orphan it).
+    # not while a newer, unpurged response references a body of its requests (their cascade would orphan it),
+    # so the run of a shared body's oldest request stays past 13 months too while its bytes recur.
     "runs": q(
         "DELETE FROM runs r "
         "WHERE ((r.status IN ('succeeded', 'partial', 'failed', 'failed_invariant', 'cancelled') "

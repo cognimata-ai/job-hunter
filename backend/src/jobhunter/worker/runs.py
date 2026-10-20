@@ -18,7 +18,9 @@ Every attempt has a checkpoint thread of its own, `run-<run_id>-a<attempt_no>` (
    `resumed` execute. A delivery whose epoch the fence refused re-defers `run_collect(id, n)` in a transaction
    of its own (M0 carry-forward 6, plan Deviation 18): its job is consumed, and the current worker's
    reconcilers would take minutes to repair the attempt; the queueing lock `run:<id>:<n>` keeps it to one
-   waiting job.
+   waiting job. That refusal proves this worker superseded, so it first asks for its own graceful stop
+   (`on_superseded`, ruling T24-a): its loops stop fetching, and it never re-takes its own job under the
+   global `collect` lock; the current worker does.
 3. The graph runs through `executions.run_owned(("run", id), n, …)`, next to a heartbeat whose loss cancels
    it. That heartbeat is a task of its own (every 30 s), so it covers every node however long it runs (the
    fetch fan-out, `embed`): no node beats itself (Task 24, carry 4).
@@ -58,7 +60,7 @@ alert; an `OutcomeConflict` (the outcome reducer's, raised outside any node, §1
 that only requests runs (the API) skips it.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
@@ -718,6 +720,7 @@ async def execute_run(
     *,
     epoch: int,
     heartbeat_period_s: float = 30.0,
+    on_superseded: Callable[[], None] = lambda: None,
 ) -> Admission:
     """Admit and run attempt `attempt_no` of run `run_id` (the `run_collect` task body); its admission.
 
@@ -727,9 +730,12 @@ async def execute_run(
        `started` or `resumed` returns at once. When the fence refused `epoch` (a superseded worker), the
        delivery's job is deferred again first, `run_collect(run_id, attempt_no)` through `defer_run_attempt`
        in a transaction of its own (`None`, logged `deduplicated`, when that attempt's job already waits), so
-       the current worker runs it at once (carry-forward 6). The other `foreign_epoch` (the attempt belongs
-       to another epoch while this one is current) re-defers nothing: this worker would take the job again
-       at once, and the `stale_runs` reconciler repairs that run.
+       the current worker runs it at once (carry-forward 6). Before that re-defer, `on_superseded()` asks
+       this worker for its graceful stop (ruling T24-a; the task body requests the runtime's shutdown): its
+       loops have stopped fetching by the time the re-deferred job commits, so this worker cannot take it
+       again. The other `foreign_epoch` (the attempt belongs to another epoch while this one is current)
+       re-defers nothing and stops nothing: this worker would take the job again at once, and the
+       `stale_runs` reconciler repairs that run.
     3. The graph runs through `run_owned(("run", id), attempt_no, …)`: the registry's task for the run, next
        to the heartbeat task `heartbeat:run:<id>` (`heartbeat_run` every `heartbeat_period_s`) whose loss
        cancels it. By outcome: `lost` (a refused or failed heartbeat, the `stale_runs` reconciler's or the
@@ -763,6 +769,7 @@ async def execute_run(
         admission, owner, epoch_refused = await _admit(conn, run_id, attempt_no, epoch=epoch)
     log.info("run_admission", run_id=run_id, attempt_no=attempt_no, admission=admission)
     if epoch_refused:
+        on_superseded()  # first: the loops stop fetching while the re-defer below commits
         await _redefer(engine, run_id, attempt_no)
     if owner is None:
         return admission

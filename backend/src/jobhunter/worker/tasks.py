@@ -17,7 +17,7 @@ A process has one task app, and the first call of `make_queue_app` wins: it fixe
 blueprint to an app namespaces its tasks, so it can be added once.) `_reset_task_app` undoes that for tests.
 """
 
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 import procrastinate
@@ -53,6 +53,15 @@ def job_task_name(name: TaskName) -> str:
     return f"{TASK_NAMESPACE}:{name}"
 
 
+def _stop_when_superseded(rt: "WorkerRuntime") -> Callable[[], None]:
+    """What a body does once the epoch fence refused its delivery (ruling T24-a): this worker is superseded,
+    so it requests its own graceful stop (`runtime.request_shutdown`, reason `epoch_superseded`)."""
+    # Imported here: the runtime pulls in langgraph, which a process that only defers (the API) skips.
+    from jobhunter.worker.runtime import EPOCH_SUPERSEDED, request_shutdown
+
+    return lambda: request_shutdown(rt.shutdown, reason=EPOCH_SUPERSEDED)
+
+
 @blueprint.task(name="run_collect", queue="collect", lock="collect", pass_context=True)
 async def run_collect(context: JobContext, run_id: int, attempt_no: int) -> None:
     # Imported here: `runs` imports this module (`Deferrer`, `defer_in_tx`, `job_task_name`). The worker
@@ -60,7 +69,14 @@ async def run_collect(context: JobContext, run_id: int, attempt_no: int) -> None
     from jobhunter.worker.runs import execute_run
 
     rt: WorkerRuntime = context.additional_context["runtime"]
-    await execute_run(rt.engine, rt.collect_graph, run_id, attempt_no, epoch=rt.epoch)
+    await execute_run(
+        rt.engine,
+        rt.collect_graph,
+        run_id,
+        attempt_no,
+        epoch=rt.epoch,
+        on_superseded=_stop_when_superseded(rt),
+    )
 
 
 @blueprint.task(name="run_operation", queue="aux", pass_context=True)
@@ -70,7 +86,7 @@ async def run_operation(context: JobContext, operation_id: int) -> None:
     from jobhunter.worker.operations import execute_operation
 
     rt: WorkerRuntime = context.additional_context["runtime"]
-    await execute_operation(rt.engine, operation_id, epoch=rt.epoch)
+    await execute_operation(rt.engine, operation_id, epoch=rt.epoch, on_superseded=_stop_when_superseded(rt))
 
 
 @blueprint.periodic(cron="* * * * *")
@@ -357,15 +373,19 @@ async def release_stalled_jobs(app: procrastinate.App, *, seconds_since_heartbea
     - any other error propagates, and the `stalled_jobs` reconciler records it as `reconciler.failed`.
 
     Which tasks can be superseded (ruling T9-d): only one whose queueing lock a new job can take while the
-    stalled job is still `doing`. In M0 that is `tick` alone: the periodic deferrer queues the next minute's
+    stalled job is still `doing`. In M0 that was `tick` alone: the periodic deferrer queues the next minute's
     `tick` (queueing lock `tick`) while a dead worker's `tick` is stalled, and the new one does the same work.
-    `run_collect` cannot be: its queueing lock names the attempt (`run:<id>:<n>`), and nothing defers that
-    attempt again while its job is live (`todo` or `doing`; a new attempt has a lock of its own). Neither can
-    `run_operation` (`op:<id>`, re-deferred only for an operation without a live job), nor `reconcile_heavy`
-    and `retention_daily` (no queueing lock). A task that a later milestone gives a queueing lock inherits
-    this: if anything can defer a job with that lock while the stalled one is `doing`, the stalled job ends
-    `failed` here and never runs again, so either its successor must do the same work (as `tick`'s does) or
-    its re-deferral must skip work that has a live job, as `run_collect`'s and `run_operation`'s do.
+    Since M1 (Task 24, M0 carry-forward 6) `run_collect` and `run_operation` can be too: a delivery whose
+    epoch the fence refused re-defers its own attempt (`run:<id>:<n>`) or operation (`op:<id>`) while its
+    job is still `doing`, and when that superseded worker dies before the job ends (its watchdog's exit 70),
+    the stalled job is superseded here by the waiting one. That is safe for the same reason as `tick`'s: the
+    waiting job is the same attempt or operation, so it does the same work, and the stalled one did nothing
+    (a refused delivery writes nothing but the re-defer). The reconcilers still re-defer only work without a
+    live job (`queued_runs`, `operations`). Neither `reconcile_heavy` nor `retention_daily` can be (no
+    queueing lock). A task that a later milestone gives a queueing lock inherits this: if anything can defer
+    a job with that lock while the stalled one is `doing`, the stalled job ends `failed` here and never runs
+    again, so either its successor must do the same work (as these do) or its re-deferral must skip work
+    that has a live job.
 
     `app` must be open.
     """

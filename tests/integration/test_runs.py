@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from collections.abc import Callable
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,6 +17,7 @@ from jobhunter.worker import runs
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
+from jobhunter.worker.runtime import ShutdownState
 from jobhunter.worker.tasks import defer_in_tx, job_task_name, live_job_exists, run_collect
 from langgraph.graph import END, START, StateGraph
 from procrastinate.job_context import JobContext
@@ -326,19 +328,28 @@ async def test_run_collect_body_executes_the_run_with_the_runtime(monkeypatch) -
     calls: list[tuple[object, object, int, int, int]] = []
 
     async def fake_execute_run(
-        engine: object, graph: object, run_id: int, attempt_no: int, *, epoch: int
+        engine: object,
+        graph: object,
+        run_id: int,
+        attempt_no: int,
+        *,
+        epoch: int,
+        on_superseded: Callable[[], None],
     ) -> str:
         calls.append((engine, graph, run_id, attempt_no, epoch))
-        return "started"
+        on_superseded()  # as an admission whose epoch the fence refused calls it
+        return "foreign_epoch"
 
     monkeypatch.setattr(runs, "execute_run", fake_execute_run)
     engine, graph = object(), object()
     runtime = SimpleNamespace(
-        engine=engine, collect_graph=graph, epoch=7
+        engine=engine, collect_graph=graph, epoch=7, shutdown=ShutdownState()
     )  # the `WorkerRuntime` fields it reads
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await run_collect(context, run_id=5, attempt_no=2)
     assert calls == [(engine, graph, 5, 2, 7)]
+    # Ruling T24-a: a superseded delivery asks this worker's runtime for the graceful stop.
+    assert runtime.shutdown.requested.is_set()
 
 
 async def test_graph_error_fails_the_run_as_bug_with_a_critical_alert(engine, queue_app) -> None:
