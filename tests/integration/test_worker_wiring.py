@@ -123,34 +123,91 @@ async def auth_alerts(engine, source_id: str) -> list[tuple[object, ...]]:
         ]
 
 
+PAID = ("jsearch", "serpapi", "adzuna")  # every budgeted source (Global Constraints)
+OCCURRENCES = sa.text("SELECT occurrences FROM alerts WHERE code = 'source.auth_failed' ORDER BY id")
+
+
+async def assert_missing_secret_alerts(engine, sources: tuple[str, ...]) -> None:
+    """Each source's `default` instance has exactly one `source.auth_failed`, open, for its missing key."""
+    for source_id in sources:
+        [(severity, context, still_open)] = await auth_alerts(engine, source_id)
+        async with engine.connect() as c:
+            instance = await instance_id(c, source_id)
+        assert (severity, still_open) == ("critical", True), source_id
+        assert context == {"instance_id": instance, "source_id": source_id, "code": "missing_secret"}
+
+
 async def test_a_missing_paid_key_opens_source_auth_failed_until_the_restored_keys_first_success(
     engine, make_config
 ) -> None:
     """Ruling FR-t (FR-l): the startup sync's disable of a paid instance for a missing secret opens
-    `source.auth_failed` (critical, code `missing_secret`) in its fenced transaction; a quota source (Adzuna)
-    is only disabled. Another start without the key adds no occurrence (the instance is already disabled);
-    the start that restores the key leaves the alert open; the first success resolves it (§17.6)."""
+    `source.auth_failed` (critical, code `missing_secret`) in its fenced transaction, for each of the three
+    paid sources (fix wave F6: Adzuna, a budgeted quota source, too). Another start without the key adds no
+    occurrence (the instance is already disabled); the start that restores the key leaves the alert open; the
+    first success resolves it (§17.6)."""
     without = live_worker(make_config, {})
     await sync(engine, without)
-    for source_id in ("jsearch", "serpapi"):
-        [(severity, context, still_open)] = await auth_alerts(engine, source_id)
-        async with engine.connect() as c:
-            instance = await instance_id(c, source_id)
-        assert (severity, still_open) == ("critical", True)
-        assert context == {"instance_id": instance, "source_id": source_id, "code": "missing_secret"}
-    assert await auth_alerts(engine, "adzuna") == []
+    await assert_missing_secret_alerts(engine, PAID)
+    assert await auth_alerts(engine, "arbeitnow") == []  # a free source needs no key
     await sync(engine, without)  # a second start without the key: already disabled, nothing more
     async with engine.connect() as c:
-        occurrences = await c.execute(
-            sa.text("SELECT occurrences FROM alerts WHERE code = 'source.auth_failed' ORDER BY id")
-        )
-        assert list(occurrences.scalars()) == [1, 1]
-    assert (await sync(engine, live_worker(make_config, PROVIDER_SECRETS)))["jsearch"] == "ok"
-    assert [row[2] for row in await auth_alerts(engine, "jsearch")] == [True]  # the restore resolves nothing
-    async with engine.begin() as c:
-        await record_success(c, await instance_id(c, "jsearch"), now=utcnow())
-    assert [row[2] for row in await auth_alerts(engine, "jsearch")] == [False]
+        assert list((await c.execute(OCCURRENCES)).scalars()) == [1, 1, 1]
+    assert (await sync(engine, live_worker(make_config, PROVIDER_SECRETS))) == dict.fromkeys(
+        (*PAID, "arbeitnow"), "ok"
+    )
+    for source_id in PAID:  # the restore resolves nothing
+        assert [row[2] for row in await auth_alerts(engine, source_id)] == [True], source_id
+    for source_id in ("jsearch", "adzuna"):
+        async with engine.begin() as c:
+            await record_success(c, await instance_id(c, source_id), now=utcnow())
+        assert [row[2] for row in await auth_alerts(engine, source_id)] == [False], source_id
     assert [row[2] for row in await auth_alerts(engine, "serpapi")] == [True]  # no success there yet
+
+
+async def test_a_start_that_finds_a_paid_instance_disabled_for_its_missing_key_opens_its_alert_once(
+    engine, make_config, caplog
+) -> None:
+    """Fix wave F6 (F5 re-review, FR-t edge): an instance already `disabled('missing_secret')` without an open
+    `source.auth_failed` (a database an older worker started without the key) has the alert opened by the
+    next start that still finds the key missing, under the same fence. An open one is left as it is (no
+    occurrence counted), one resolved by hand is opened again, and an administrative disable opens none."""
+    import logging
+
+    from tests.support.logs import logged
+
+    caplog.set_level(logging.WARNING)
+    async with engine.begin() as c:  # as the older code left it: disabled, no alert
+        for source_id in PAID:
+            await disable(c, await instance_id(c, source_id), code="missing_secret")
+    assert [await auth_alerts(engine, source_id) for source_id in PAID] == [[], [], []]
+    without = live_worker(make_config, {})
+
+    async def superseded(conn) -> None:
+        raise FencedOut(owner="worker_epoch")
+
+    with pytest.raises(FencedOut):  # the guard comes first: a refused sync opens nothing
+        await sync(engine, without, superseded)
+    assert [await auth_alerts(engine, source_id) for source_id in PAID] == [[], [], []]
+    assert await sync(engine, without) == {**dict.fromkeys(PAID, "disabled"), "arbeitnow": "ok"}
+    await assert_missing_secret_alerts(engine, PAID)
+    assert sorted(e["source_id"] for e in logged(caplog, "missing_secret_alert_opened")) == sorted(PAID)
+    assert logged(caplog, "source_instance_disabled") == []  # no instance changed state
+    caplog.clear()
+    await sync(engine, without)  # still open: left as it is
+    async with engine.connect() as c:
+        assert list((await c.execute(OCCURRENCES)).scalars()) == [1, 1, 1]
+    assert logged(caplog, "missing_secret_alert_opened") == []
+    async with engine.begin() as c:  # resolved by hand while the key is still missing: opened again
+        jsearch = await instance_id(c, "jsearch")
+        await c.execute(
+            sa.text("UPDATE alerts SET resolved_at = now() WHERE dedup_key = :k"),
+            {"k": f"source.auth_failed:instance:{jsearch}"},
+        )
+        await disable(c, await instance_id(c, "serpapi"), code="by_user")  # resolves its alert
+    await sync(engine, without)
+    assert [row[2] for row in await auth_alerts(engine, "jsearch")] == [False, True]
+    assert [row[2] for row in await auth_alerts(engine, "serpapi")] == [False]  # the user's disable
+    assert [e["source_id"] for e in logged(caplog, "missing_secret_alert_opened")] == ["jsearch"]
 
 
 async def test_a_worker_without_the_jsearch_key_plans_no_jsearch_spec_and_does_not_fail(

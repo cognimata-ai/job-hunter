@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Final, Literal
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.observability.alerts import Severity, raise_alert, resolve_alert
+from jobhunter.observability.alerts import Severity, open_alert, raise_alert, resolve_alert
 from jobhunter.sources.base import MISSING_SECRET, Billing
 
 if TYPE_CHECKING:
@@ -126,13 +126,20 @@ async def record_success(conn: AsyncConnection, instance_id: int, *, now: dateti
     return "ok"
 
 
-async def raise_missing_secret(conn: AsyncConnection, instance_id: int, source_id: str) -> None:
+async def raise_missing_secret(
+    conn: AsyncConnection, instance_id: int, source_id: str, *, if_not_open: bool = False
+) -> bool:
     """Open `source.auth_failed` (critical) for an instance disabled because its provider secret is missing
     (Ruling FR-t, FR-l: a missing paid credential is an open alert, not only a `disabled` health), with the
     code `missing_secret` in its context. §17.6 resolves it on a success: the instance's first successful
-    request once the key is back and the start's sync restored it (`record_success`)."""
+    request once the key is back and the start's sync restored it (`record_success`).
+
+    An open one counts one more occurrence (`raise_alert`: the disable is a new occurrence of a credential
+    problem), unless `if_not_open`, which leaves an open one as it is (`open_alert`: a start that finds the
+    instance still disabled for the same missing key). Returns whether it wrote the alert."""
     code, severity = ALERTS["auth_failed"]
-    await raise_alert(
+    write = open_alert if if_not_open else raise_alert
+    written = await write(
         conn,
         code=code,
         severity=severity,
@@ -140,6 +147,7 @@ async def raise_missing_secret(conn: AsyncConnection, instance_id: int, source_i
         message=f"source instance {instance_id} ({source_id}) is disabled: its provider secret is missing",
         context={"instance_id": instance_id, "source_id": source_id, "code": MISSING_SECRET},
     )
+    return written is not None
 
 
 async def resolve_alerts(

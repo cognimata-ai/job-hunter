@@ -3,11 +3,14 @@
 `sync_instances` applies plan Deviation 6 (a behaviour change approved by the user): a paid or quota
 `default` instance whose provider secret is absent is `disable`d with `last_error_code = 'missing_secret'`
 (an already disabled one keeps its own code), and an instance is restored to `ok` only from exactly that
-state once its secret is present again. A paid instance's disable also opens `source.auth_failed`
-(critical, code `missing_secret`; Ruling FR-t): the restore leaves it open, and the restored key's first
-success resolves it (§17.6). Every other state is left untouched by the restore: an
-administrative `disabled` with another code, and every breaker state with its timestamps. In fake mode
-(`JOBHUNTER_FAKE_SOURCES`) the fixtures need no secret, so every secret counts as present (Deviation 5).
+state once its secret is present again. A paid instance's disable (JSearch, SerpApi and Adzuna: every
+budgeted source, Global Constraints) also opens `source.auth_failed` (critical, code `missing_secret`;
+Ruling FR-t), and a start that finds a paid instance already disabled for its still missing secret opens
+that alert when none is open (a database that an older worker started without the key, or an alert resolved
+by hand), never one more occurrence. The restore leaves it open, and the restored key's first success
+resolves it (§17.6). Every other state is left untouched by the restore: an administrative `disabled` with
+another code, and every breaker state with its timestamps. In fake mode (`JOBHUNTER_FAKE_SOURCES`) the
+fixtures need no secret, so every secret counts as present (Deviation 5).
 
 The sync is worker-owned work: its `guard` (the worker's epoch fence, `epoch.fence_epoch`) runs first, so a
 superseded worker, whose view of the secrets is stale, can never restore an instance that its successor
@@ -41,9 +44,9 @@ _KEPT_ON_DISABLE: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
     {MISSING_SECRET: frozenset({ALERTS["auth_failed"][0]})}
 )
 
-# The sources whose missing secret also opens `source.auth_failed` at the disable (Ruling FR-t): the paid
-# ones (`paid_search`; Adzuna, a quota source, is only disabled).
-_PAID: Final = frozenset(source.id for source in SOURCES if source.kind == "paid_search")
+# The sources whose missing secret also opens `source.auth_failed` (Ruling FR-t): the paid ones, every
+# budgeted source (Global Constraints): `paid_search` (JSearch, SerpApi) and `quota_search` (Adzuna).
+_PAID: Final = frozenset(source.id for source in SOURCES if source.kind in ("paid_search", "quota_search"))
 
 _log = get_logger("jobhunter.sources.instances")
 
@@ -132,6 +135,11 @@ async def sync_instances(conn: AsyncConnection, cfg: AppConfig, *, guard: Guard)
                 await raise_missing_secret(conn, row.id, row.source_id)
             health[row.source_id] = "disabled"
             _log.warning("source_instance_disabled", source_id=row.source_id, code=MISSING_SECRET)
+        elif not present and row.last_error_code == MISSING_SECRET and row.source_id in _PAID:
+            # Already disabled for this missing key: its alert stays open, opened again only when none is
+            # (Ruling FR-t; F5 re-review), under the same fence and with no occurrence counted.
+            if await raise_missing_secret(conn, row.id, row.source_id, if_not_open=True):
+                _log.warning("missing_secret_alert_opened", source_id=row.source_id, code=MISSING_SECRET)
         elif present and row.health == "disabled" and row.last_error_code == MISSING_SECRET:
             await conn.execute(_RESTORE, {"id": row.id, "code": MISSING_SECRET})
             health[row.source_id] = "ok"

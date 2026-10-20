@@ -4,7 +4,10 @@ An alert is identified by `code` and `subject` (`dedup_key = "<code>:<subject>"`
 it again only counts the occurrence; once it is resolved, the next raise opens a new row. The unique partial
 index `alerts_open_dedup` makes that atomic, so concurrent raisers never create two open rows.
 
-All four functions run on the caller's connection and leave the transaction to the caller: an alert is
+`open_alert` opens one only when none is open, and counts no occurrence of an open one: for a state that a
+later check finds still true, not a new occurrence of it (a start that finds a key still missing).
+
+All five functions run on the caller's connection and leave the transaction to the caller: an alert is
 written in the transaction that decides to raise it, and persists only if that transaction commits.
 """
 
@@ -27,6 +30,12 @@ _RAISE = q(
     "VALUES (:code, :severity, :dedup_key, :message, :context) "
     "ON CONFLICT (dedup_key) WHERE resolved_at IS NULL "
     "DO UPDATE SET occurrences = alerts.occurrences + 1, last_at = now() RETURNING id",
+    jsonb=["context"],
+)
+_OPEN = q(
+    "INSERT INTO alerts (code, severity, dedup_key, message, context) "
+    "VALUES (:code, :severity, :dedup_key, :message, :context) "
+    "ON CONFLICT (dedup_key) WHERE resolved_at IS NULL DO NOTHING RETURNING id",
     jsonb=["context"],
 )
 _RESOLVE = q(
@@ -69,6 +78,31 @@ async def raise_alert(
         },
     )
     return int(result.scalar_one())
+
+
+async def open_alert(
+    conn: AsyncConnection,
+    *,
+    code: str,
+    severity: Severity,
+    subject: str,
+    message: str,
+    context: Mapping[str, JSONValue] | None = None,
+) -> int | None:
+    """Open the alert `code`/`subject` unless it is open; returns the new alert's id, `None` when one was
+    open already (left as it is: no occurrence counted, `last_at` unchanged). Atomic, as `raise_alert` is."""
+    result = await conn.execute(
+        _OPEN,
+        {
+            "code": code,
+            "severity": severity,
+            "dedup_key": _dedup_key(code, subject),
+            "message": message,
+            "context": {} if context is None else dict(context),
+        },
+    )
+    opened = result.scalar()
+    return None if opened is None else int(opened)
 
 
 async def resolve_alert(conn: AsyncConnection, *, code: str, subject: str) -> bool:

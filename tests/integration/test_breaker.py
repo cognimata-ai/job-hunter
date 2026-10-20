@@ -34,6 +34,18 @@ async def open_alerts(engine) -> set[str]:
         return set((await c.execute(sa.text("SELECT code FROM alerts WHERE resolved_at IS NULL"))).scalars())
 
 
+async def open_auth_failed(engine) -> set[int]:
+    """The instances with an open `source.auth_failed`."""
+    async with engine.connect() as c:
+        rows = await c.execute(
+            sa.text(
+                "SELECT (context->>'instance_id')::bigint FROM alerts "
+                "WHERE code = 'source.auth_failed' AND resolved_at IS NULL"
+            )
+        )
+        return {int(instance_id) for instance_id in rows.scalars()}
+
+
 async def test_thresholds_half_open_and_alerts(engine) -> None:
     now, js, an = utcnow(), await instance(engine, "jsearch"), await instance(engine, "arbeitnow")
     async with engine.begin() as c:
@@ -225,8 +237,15 @@ async def test_a_missing_provider_secret_disables_and_only_that_disable_is_resto
     )
     assert await state(engine, js.id) == ("ok", 0, None, None, None, None)
     assert await open_alerts(engine) == {"source.auth_failed"}  # restored, not yet used: still open
+    # Ruling FR-t, fix wave F6: Adzuna's missing key opened its own (each paid source's restored key's first
+    # success resolves that source's alert)
+    az = await instance(engine, "adzuna")
+    assert await open_auth_failed(engine) == {js.id, az.id}
     async with engine.begin() as c:
         await record_success(c, js.id, now=utcnow())  # the restored key's first success resolves it
+    assert await open_auth_failed(engine) == {az.id}
+    async with engine.begin() as c:
+        await record_success(c, az.id, now=utcnow())
     assert await open_alerts(engine) == set()
 
 
