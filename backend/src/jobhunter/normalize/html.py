@@ -23,7 +23,9 @@ _BLOCK_TAGS: Final = frozenset({"p", "ul", "ol", "li", "h3", "h4"})
 # these tags as well, drops comments, scripts and styles, and escapes every `<` and `>` of text and attribute
 # values, so in its output every `<` starts a tag. A comment holding `<div`, a `>` inside an attribute value
 # and tag text inside a link can then no longer be taken for a block tag. The second pass applies the
-# allow-list and stays the only judge of what survives.
+# allow-list and stays the only judge of what survives. A limit (F1 review, Minor 3): text that a malformed
+# table holds outside its cells moves before the table, as the HTML parser places it, and joins the text
+# there.
 _STRIPPED_BLOCK_TAGS: Final = frozenset(
     {"address", "article", "aside", "blockquote", "caption", "dd", "details", "div", "dl", "dt", "fieldset"}
     | {"figcaption", "figure", "footer", "form", "h1", "h2", "h5", "h6", "header", "hr", "main", "nav", "pre"}

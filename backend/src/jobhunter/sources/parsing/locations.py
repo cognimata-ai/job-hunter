@@ -281,6 +281,7 @@ def _german_near(gaz: Gazetteer, district: str, city: str) -> list[Candidate]:
         for d in gaz.by_name(district)
         if any(
             d.gazetteer_id != c.gazetteer_id
+            and d.municipality != ""  # an empty key never matches (F1 review, Minor 4)
             and d.municipality == c.municipality
             and d.population < c.population
             and distance_km(d.lat, d.lon, c.lat, c.lon) <= DISTRICT_KM

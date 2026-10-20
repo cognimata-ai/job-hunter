@@ -125,6 +125,25 @@ def test_a_comment_an_attribute_value_or_a_link_cannot_fake_a_block_tag() -> Non
     )
 
 
+def test_text_outside_the_cells_of_a_malformed_table_moves_before_the_table() -> None:
+    # F1 review, Minor 3, a pinned limit: the first nh3 pass parses the table, and the HTML parser places text
+    # that stands between rows in front of the table, next to the text before it; a well-formed table keeps
+    # its order
+    assert html_to_text(sanitize_html("<table><tr><td>a</td></tr>Outro</table>")) == "Outro\na"
+    assert (
+        html_to_text(sanitize_html("Intro <table><tr><td>a</td></tr>Outro</table>Ende"))
+        == "Intro Outro\na\nEnde"
+    )
+    assert (
+        html_to_text(sanitize_html("Intro<table><tr><td>a</td></tr>Outro</table>Ende"))
+        == "IntroOutro\na\nEnde"
+    )
+    assert (
+        html_to_text(sanitize_html("Intro<table><tr><td>a</td><td>b</td></tr></table>Ende"))
+        == "Intro\na\nb\nEnde"
+    )
+
+
 def test_unterminated_tags_do_not_make_the_sanitiser_quadratic() -> None:
     started = time.perf_counter()
     out = sanitize_html("<div " * 200_000)

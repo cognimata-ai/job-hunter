@@ -84,10 +84,16 @@ def test_gender_tag_variants_are_stripped(raw) -> None:
         "DevOps/Infrastructure Engineer",
         "Vertrieb/Innendienst",
         "Sales national/international",
+        "Werkstudent/Intern",  # ruling FR-g: the `intern` seniority token survives
     ],
 )
 def test_text_that_is_not_a_gender_tag_is_kept(raw) -> None:
     assert strip_gender_tags(raw) == raw
+
+
+def test_a_slash_compound_keeps_its_seniority_token() -> None:
+    # ruling FR-g (plan Deviation 51): the literal §8.2 reading would give "Werkstudenttern" and lose `intern`
+    assert normalize_title("Werkstudent/Intern Marketing").seniority_tokens == {"working_student", "intern"}
 
 
 @pytest.mark.parametrize(

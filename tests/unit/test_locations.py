@@ -698,6 +698,20 @@ def test_a_district_resolves_in_the_municipality_of_its_city(text: str, city: st
     assert district.municipality in {p.municipality for p in g.by_name(city)}, text
 
 
+@pytest.mark.parametrize(("key", "resolution"), [("", "unresolved"), ("06412000", "unique")])
+def test_an_empty_municipality_key_is_no_shared_municipality(
+    monkeypatch: pytest.MonkeyPatch, key: str, resolution: str
+) -> None:
+    # F1 review, Minor 4: two neighbouring places without a key are no district and its city
+    rows = [
+        f"geonames:1\tKleinort\tkleinort\t\tDE\t05\t{key}\t50.0\t8.0\t2000\t",
+        f"geonames:2\tGrossstadt\tgrossstadt\t\tDE\t05\t{key}\t50.02\t8.02\t90000\t",
+    ]
+    g = Gazetteer.from_tsv("\n".join(["\t".join(PLACE_COLUMNS), *rows, ""]), "\t".join(NON_DE_COLUMNS) + "\n")
+    monkeypatch.setattr(Gazetteer, "load", classmethod(lambda cls: g))
+    assert [loc.resolution for loc in parse("Kleinort, Grossstadt").locations] == [resolution]
+
+
 @pytest.mark.parametrize(
     ("text", "kind"),
     [
