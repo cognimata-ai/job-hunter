@@ -199,6 +199,39 @@ async def test_superseded_owner_cannot_reserve_or_dispatch_and_is_released(
     assert await ledger.reconcile_ledger_unsettled(ctx(engine, queue_app)) == 0  # idempotent
 
 
+async def test_a_superseded_workers_ledger_reconciler_stops_quietly_and_writes_nothing(
+    engine, current_epoch, queue_app
+) -> None:
+    """Final review C2 audit: `ledger_unsettled` under a superseded epoch ends like the other fenced
+    reconcilers, with the count so far (0) and no raise: `run_reconcilers` then records no failure for it."""
+    owner = await queued_run(engine)
+    fr = await planned_request(engine, owner, provider="jsearch", key=K, attempt_seq=1)
+    async with engine.begin() as c:
+        r = await ledger.reserve(
+            c,
+            "jsearch",
+            owner=owner,
+            request_key=K,
+            attempt_seq=1,
+            request_class="normal",
+            fetch_request_id=fr,
+            settings=SETTINGS,
+            interval_s=21600,
+            now=utcnow(),
+        )
+    assert isinstance(r, ledger.Reservation)
+    async with engine.begin() as c:  # the owner is superseded: the reservation is the reconciler's to release
+        await runs.begin_new_attempt(
+            c, owner.run_id, epoch=1, end_reason="heartbeat_stale", defer=defer_in_tx
+        )
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE quota_ledger SET created_at = created_at - interval '16 minutes'"))
+        await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
+    assert await ledger.reconcile_ledger_unsettled(ctx(engine, queue_app, epoch=current_epoch)) == 0
+    assert await one(engine, "SELECT state FROM quota_ledger WHERE id = :i", i=r.entry_id) == ("reserved",)
+    assert await ledger.reconcile_ledger_unsettled(ctx(engine, queue_app, epoch=current_epoch + 1)) == 1
+
+
 async def test_a_live_owners_reservation_is_kept_and_a_global_purge_fence_refuses(
     engine, current_epoch, queue_app
 ) -> None:

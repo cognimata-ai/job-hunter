@@ -19,9 +19,12 @@
    embedder client on `cfg.embedder_url`, which the `embed` node and the `awaiting_embedding` reconciler
    share;
 8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a
-   transaction of its own: a source without its secret is `disabled('missing_secret')` and never planned,
-   plan Deviation 6), then the start reconcilers (`stalled_jobs` releases the jobs of dead workers) and,
-   outside the test env, the metrics server;
+   transaction of its own, fenced by this worker's epoch: a source without its secret is
+   `disabled('missing_secret')` and never planned, plan Deviation 6), then the start reconcilers
+   (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the metrics server. When the
+   fence refuses the epoch, a newer worker took over during this start (final review C2): the sync wrote
+   nothing, so this worker's stale view of the secrets cannot undo the newer worker's sync, and the start
+   ends there (`worker_superseded_at_start`, exit 1) before any loop runs;
 9. SIGTERM and SIGINT handlers that request the shutdown;
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
@@ -39,8 +42,10 @@ session), the session is not closed under it: `lock_session_left_open` is logged
 the socket, and with it the lock.
 
 Exit codes: 0 after a requested shutdown; 1 when a worker loop ended by itself, when the takeover was blocked
-(`takeover_blocked`: a row lock outlived the claim's lock timeout, ruling T13-b) and when the start failed
-(`worker_failed`), so the container restart tries again. The watchdog exits 70, the startup assertions 78.
+(`takeover_blocked`: a row lock outlived the claim's lock timeout, ruling T13-b), when a newer worker took
+over during the start (`worker_superseded_at_start`) and when the start failed (`worker_failed`), so the
+container restart tries again (and stands by while a healthy worker holds the lock). The watchdog exits 70,
+the startup assertions 78.
 
 A loop that ends by itself can be the first sign that this process lost the singleton lock: a zombie (frozen
 while a replacement took over, §18.2 C17) finds its procrastinate workers pruned by the replacement, so its
@@ -68,7 +73,7 @@ import httpx
 import procrastinate
 import sqlalchemy as sa
 from procrastinate.exceptions import ConnectorException
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter import __version__
 from jobhunter.clock import utcnow
@@ -76,6 +81,7 @@ from jobhunter.config import AppConfig
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
 from jobhunter.embeddings import EmbedderClient, make_http_client
+from jobhunter.errors import FencedOut
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.graphs.collect.graph import build_collect_graph
@@ -86,7 +92,7 @@ from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow, sync_instances
 from jobhunter.sources.ratelimit import SOURCE_LIMITS, RateLimiter
 from jobhunter.sources.registry import build_adapter, make_clients
-from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
+from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep, fence_epoch
 from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.lock import WATCHDOG_EXIT_CODE, LockSession, acquire_lock
 from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
@@ -241,9 +247,20 @@ class _WorkerProcess:
             shutdown=shutdown,
             embedder=embedder,
         )
-        # 8. The source instances synced with the secrets, the start reconcilers, the metrics server.
-        async with engine.begin() as conn:
-            await sync_instances(conn, cfg)
+
+        # 8. The source instances synced with the secrets under this worker's epoch fence, the start
+        # reconcilers, the metrics server.
+        async def fenced(conn: AsyncConnection) -> None:
+            await fence_epoch(conn, epoch)
+
+        try:
+            async with engine.begin() as conn:
+                await sync_instances(conn, cfg, guard=fenced)
+        except FencedOut:
+            # A newer worker owns the work (`fence_epoch` logged both epochs) and the sync wrote nothing. No
+            # loop has started; the teardown follows, and the restart stands by while that worker is healthy.
+            log.error("worker_superseded_at_start", epoch=epoch)
+            return 1
         start = ReconcileContext(
             engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch, embedder=embedder
         )

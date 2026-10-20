@@ -342,8 +342,8 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     order: list[str] = []
     seen: list[reconcilers.ReconcileContext] = []
 
-    async def retention_pass(engine_, queue, saver, *, now: datetime) -> None:
-        order.append("retention")
+    async def retention_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+        order.append(f"retention@{epoch}")
 
     async def probe(ctx: reconcilers.ReconcileContext) -> int:
         order.append("daily")
@@ -357,10 +357,35 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     runtime = SimpleNamespace(engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None)
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
-    assert order == ["retention", "daily"]
+    assert order == ["retention@3", "daily"]  # the pass is fenced by the runtime's epoch (final review C2)
     [ctx] = seen
     assert ctx.engine is engine and ctx.queue is queue_app and ctx.defer is defer_in_tx
     assert (ctx.now, ctx.epoch) == (now, runtime.epoch)
+
+
+async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconcilers(
+    engine, queue_app, monkeypatch
+) -> None:  # final review C2: a superseded worker's daily task writes nothing more after its fenced pass
+    from jobhunter.errors import FencedOut
+    from jobhunter.privacy import retention
+
+    order: list[str] = []
+
+    async def fenced_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+        order.append("retention")
+        raise FencedOut(owner="worker_epoch")
+
+    async def probe(ctx: reconcilers.ReconcileContext) -> int:
+        order.append("daily")
+        return 0
+
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the probe
+    reconcilers.reconciler("probe", "daily")(probe)
+    monkeypatch.setattr(retention, "run_retention_daily", fenced_pass)
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None)
+    context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
+    await tasks.retention_daily(context, timestamp=0)  # returns: the job ends quietly
+    assert order == ["retention"]
 
 
 async def test_the_reconcile_heavy_task_hands_the_runtimes_embedder_to_its_reconcilers(

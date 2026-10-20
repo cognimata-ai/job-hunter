@@ -17,7 +17,7 @@ from jobhunter.sources.instances import (
     list_instances,
     sync_instances,
 )
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 pytestmark = pytest.mark.integration
 
@@ -190,9 +190,13 @@ def worker_config(
     return load_config("worker", env, directory)
 
 
+async def unfenced(conn: AsyncConnection) -> None:
+    """The guard of a sync that no worker epoch owns (the worker passes its epoch fence)."""
+
+
 async def sync(engine: AsyncEngine, cfg: AppConfig) -> dict[str, str]:
     async with engine.begin() as c:
-        return dict(await sync_instances(c, cfg))
+        return dict(await sync_instances(c, cfg, guard=unfenced))
 
 
 async def test_a_missing_provider_secret_disables_and_only_that_disable_is_restored(engine, tmp_path) -> None:

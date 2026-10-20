@@ -10,8 +10,11 @@ on the client and with the clock it is given, its keys read through `secret`. It
   (`JOBHUNTER_FAKE_SOURCES`, whose fixture transport serves every request). A secret that is absent gives the
   empty key and never an error: `sync_instances` disabled that source's `default` instance when the worker
   started (plan Deviation 6, `MISSING_SECRET`), so the planner never plans it and the breaker gate skips
-  every new attempt of it (a resumed run's receipts included), and nothing is ever sent with that key.
-  Building the adapter therefore cannot fail a traversal (carry 3).
+  every new attempt of it (a resumed run's receipts included). Building the adapter therefore cannot fail a
+  traversal (carry 3), and the adapter of a stored response still parses it. Nothing is ever sent with that
+  key even if an attempt reaches the adapter anyway (an instance restored to `ok` from a stale view of the
+  secrets, final review C2): the paid adapter refuses locally, builds no request and fails the attempt as
+  `auth` before the send (`http.missing_credential`).
 - the planner's spec adapters (`quota.planner`), which plan and never send: on a client that refuses every
   request, without credentials.
 
@@ -86,7 +89,7 @@ def build_adapter(
     def secret(name: str) -> bytes:
         if cfg.fake_sources:
             return FAKE_KEY
-        return cfg.secrets.get(name, b"")  # absent: the instance is disabled, nothing is sent with it
+        return cfg.secrets.get(name, b"")  # absent: the instance is disabled, and the adapter sends nothing
 
     return make_adapter(instance, clients[instance.source_id], secret=secret, clock=clock)
 

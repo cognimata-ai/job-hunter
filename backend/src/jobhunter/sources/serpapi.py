@@ -64,7 +64,7 @@ from jobhunter.sources.base import (
     SourceError,
     SourceErrorKind,
 )
-from jobhunter.sources.http import HttpOutcome, send
+from jobhunter.sources.http import HttpOutcome, missing_credential, send
 from jobhunter.sources.parsing.dates import parse_iso, response_date
 from jobhunter.sources.parsing.description import plain_description
 from jobhunter.sources.parsing.employment import parse_employment
@@ -306,7 +306,11 @@ class SerpApiAdapter:
         )
 
     async def fetch(self, spec: RequestSpec) -> HttpOutcome:
-        """One attempt: the key and the continuation token, if any, are added to the query here; no retry."""
+        """One attempt: the key and the continuation token, if any, are added to the query here; no retry.
+        Without a key nothing is built or sent (`http.missing_credential`, an `auth` failure before the
+        send)."""
+        if (refused := missing_credential(spec, self._api_key)) is not None:
+            return HttpOutcome(None, refused)
         params = dict(spec.params)
         if spec.cursor_in is not None:
             params["next_page_token"] = spec.cursor_in
@@ -328,6 +332,8 @@ class SerpApiAdapter:
             window=None,
             request_class="free",
         )
+        if (refused := missing_credential(spec, self._api_key)) is not None:
+            raise refused  # without a key, no read is sent either
         request = self._client.build_request(
             "GET", ACCOUNT_URL, params={"api_key": self._api_key.decode("utf-8")}
         )

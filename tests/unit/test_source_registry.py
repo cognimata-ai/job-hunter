@@ -3,8 +3,9 @@
 Every adapter is built by `registry.build_adapter` (the worker's, live or fake) or `registry.make_adapter`
 (the planner's, without credentials, carry 2). The keys are the configured secrets, `b"fake"` in fake mode,
 and the empty key for a secret that is absent (carry 3: the source's instance is disabled by
-`sync_instances`, so building its adapter must not fail a traversal). Nothing here reaches the network: every
-client runs on an `httpx.MockTransport` that records the requests.
+`sync_instances`, so building its adapter must not fail a traversal), with which the paid adapter sends
+nothing (final review C2). Nothing here reaches the network: every client runs on an `httpx.MockTransport`
+that records the requests.
 """
 
 import base64
@@ -29,7 +30,7 @@ from jobhunter.sources.ats import (
     RecruiteeAdapter,
     SmartRecruitersAdapter,
 )
-from jobhunter.sources.base import REMOTE_DE, CellPlan
+from jobhunter.sources.base import REMOTE_DE, CellPlan, SourceError
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.sources.serpapi import SerpApiAdapter
@@ -213,16 +214,35 @@ async def test_fake_mode_sends_the_fake_keys_and_needs_no_secret(tmp_path, recor
         }
 
 
-async def test_a_missing_secret_still_builds_its_adapter(tmp_path, recorder) -> None:
+async def test_a_missing_secret_still_builds_its_adapter_which_refuses_to_send(tmp_path, recorder) -> None:
     """Carry 3: building the adapter of a source without its secret never raises (its instance is disabled
-    by `sync_instances`, so the breaker gate stops every attempt of it); its key is empty."""
+    by `sync_instances`, so the breaker gate stops every attempt of it). Final review C2, defence in depth:
+    should an attempt reach it anyway, the adapter builds no request and sends nothing; the attempt fails as
+    `auth` (`missing_secret`) before any byte was sent. SerpApi's account read refuses the same way."""
     cfg, clients = worker_config(tmp_path, {}), recorder.clients()
-    keys = await fetch_keys(lambda s: registry.build_adapter(instance(s), cfg, clients), recorder)
-    assert keys == {
-        "jsearch": {"x-rapidapi-key": ""},
-        "serpapi": {"api_key": ""},
-        "adzuna": {"app_id": "", "app_key": ""},
-    }
+    for source_id in ("jsearch", "serpapi", "adzuna"):
+        adapter = registry.build_adapter(instance(source_id), cfg, clients)
+        outcome = await adapter.fetch(adapter.plan(cell(source_id)))
+        assert outcome.page is None and outcome.error is not None, source_id
+        error = outcome.error
+        assert (error.kind, error.code, error.before_send) == ("auth", "missing_secret", True), source_id
+    serpapi = registry.build_adapter(instance("serpapi"), cfg, clients)
+    assert isinstance(serpapi, SerpApiAdapter)
+    with pytest.raises(SourceError) as refused:
+        await serpapi.account()
+    assert (refused.value.kind, refused.value.code) == ("auth", "missing_secret")
+    assert recorder.requests == []  # nothing reached the transport
+
+
+@pytest.mark.parametrize("empty", ["rapidapi_key", "adzuna_app_id", "adzuna_app_key"])
+async def test_one_empty_credential_is_refused_like_a_missing_one(tmp_path, recorder, empty) -> None:
+    """An empty secret file counts as missing; Adzuna needs both of its credentials."""
+    cfg = worker_config(tmp_path, {**PROVIDER_SECRETS, empty: b""})
+    source_id = "jsearch" if empty == "rapidapi_key" else "adzuna"
+    adapter = registry.build_adapter(instance(source_id), cfg, recorder.clients())
+    outcome = await adapter.fetch(adapter.plan(cell(source_id)))
+    assert outcome.error is not None and outcome.error.code == "missing_secret"
+    assert recorder.requests == []
 
 
 async def test_make_adapter_is_the_planners_factory_without_credentials(recorder) -> None:

@@ -32,9 +32,13 @@ M1_RULES = ("raw_items", "raw_bodies", "ats_snapshots", "embeddings", "coverage_
 DAY = timedelta(days=1)
 
 
+# The worker epoch of a pass: the one the `current_epoch` fixture records (every pass is fenced by it).
+CURRENT_EPOCH = 1
+
+
 async def retention_at(engine, queue_app, migrated, now) -> dict[str, int]:
     async with open_saver(migrated.dsn("app")) as saver:
-        return await run_retention_daily(engine, queue_app, saver, now=now)
+        return await run_retention_daily(engine, queue_app, saver, now=now, epoch=CURRENT_EPOCH)
 
 
 async def ids(engine, table: str) -> set[int]:
@@ -71,7 +75,7 @@ def test_the_m1_rules_follow_operations_in_order_with_their_windows() -> None:
     }
 
 
-async def test_m1_windows(engine, queue_app, migrated, m1_rows, monkeypatch, caplog) -> None:
+async def test_m1_windows(engine, current_epoch, queue_app, migrated, m1_rows, monkeypatch, caplog) -> None:
     now, rows = m1_rows.now, m1_rows
     # A pass in which `raw_items` fails skips `fetch_requests` (its cascade would take the items); the rules
     # that do not depend on it still run.
@@ -146,7 +150,9 @@ async def test_m1_windows(engine, queue_app, migrated, m1_rows, monkeypatch, cap
     assert purged[0] is False and purged[1] is not None and purged[2] is None
 
 
-async def test_a_body_still_referenced_keeps_its_request_and_its_run(engine, queue_app, migrated) -> None:
+async def test_a_body_still_referenced_keeps_its_request_and_its_run(
+    engine, current_epoch, queue_app, migrated
+) -> None:
     """A 13-month-old run whose response body a newer, unpurged row references (an unchanged board answers the
     same bytes every day) is kept, its request too, until that row's body expires; then both go."""
     now = utcnow() + RETENTION_SHIFT

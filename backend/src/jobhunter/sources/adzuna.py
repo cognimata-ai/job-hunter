@@ -62,7 +62,7 @@ from jobhunter.sources.base import (
     Settlement,
     SourceError,
 )
-from jobhunter.sources.http import HttpOutcome, send
+from jobhunter.sources.http import HttpOutcome, missing_credential, send
 from jobhunter.sources.parsing.dates import parse_iso
 from jobhunter.sources.parsing.description import plain_description
 from jobhunter.sources.parsing.employment import adzuna_employment
@@ -290,7 +290,11 @@ class AdzunaAdapter:
         )
 
     async def fetch(self, spec: RequestSpec) -> HttpOutcome:
-        """One attempt for page `spec.page_no`: the credentials join the query here; never a retry."""
+        """One attempt for page `spec.page_no`: the credentials join the query here; never a retry. Without
+        both credentials nothing is built or sent (`http.missing_credential`, an `auth` failure before the
+        send)."""
+        if (refused := missing_credential(spec, self._app_id, self._app_key)) is not None:
+            return HttpOutcome(None, refused)
         params = {
             **spec.params,
             "app_id": self._app_id.decode("utf-8"),

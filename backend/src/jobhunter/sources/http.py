@@ -18,6 +18,9 @@ classifies:
 The page keeps only the `STORED_HEADERS`, with lower-case names. Each attempt logs one `source_request` line
 with the source, the host, the path and the query without its credential parameters; the full URL is never
 logged.
+
+`missing_credential` is the paid adapters' local refusal (final review C2, defence in depth): a request whose
+credential is missing or empty is never built and never sent, whatever the instance's health says.
 """
 
 import asyncio
@@ -69,6 +72,10 @@ FULL_BOARD_SOURCES: Final = frozenset(
 _SOURCE_IDS: Final = frozenset(source.id for source in SOURCES)
 PERSONIO_HOST_SUFFIX: Final = ".jobs.personio.de"
 MAX_PERSONIO_REDIRECTS: Final = 3
+
+# The code of a request refused because its credential is missing or empty: the code with which
+# `sources.instances.sync_instances` disables such an instance.
+MISSING_SECRET: Final = "missing_secret"  # noqa: S105 (an error code, not a secret)
 
 _log = get_logger("jobhunter.sources.http")
 
@@ -256,3 +263,26 @@ async def send(
         duration_ms=round((loop.time() - started) * 1000),
     )
     return outcome
+
+
+def missing_credential(spec: RequestSpec, *credentials: bytes) -> SourceError | None:
+    """The refusal of a paid request for `spec` when any of its `credentials` is missing or empty (blank),
+    else `None`; the adapter then builds no request and sends nothing.
+
+    Should an attempt reach an adapter without its key (its instance restored to `ok` from a stale view of
+    the secrets, final review C2), it fails as `auth` (code `missing_secret`) with nothing sent: the
+    settlement refunds it (`before_send`: no byte left the process, `connect_failed_before_send`) and the
+    breaker opens `auth_failed` at once, so no later attempt is reserved. Logged `source_request_refused` with
+    the source instance and the code only, never a credential or its length.
+    """
+    if all(credential.strip() for credential in credentials):
+        return None
+    _log.warning(
+        "source_request_refused",
+        source_instance_id=spec.source_instance_id,
+        cell_id=spec.cell_id,
+        page_no=spec.page_no,
+        error_kind="auth",
+        error_code=MISSING_SECRET,
+    )
+    return SourceError("auth", code=MISSING_SECRET, before_send=True)

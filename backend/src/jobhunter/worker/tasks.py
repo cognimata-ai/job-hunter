@@ -7,8 +7,9 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 `operations` or `runs` row that the reconcilers re-defer from (§3.3.2).
 
 The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12), `reconcile_heavy` and
-`retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19). Every body is
-`pass_context` and reads its inputs from the `WorkerRuntime` in `context.additional_context["runtime"]`.
+`retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19, unless the
+worker epoch fenced that pass out, final review C2). Every body is `pass_context` and reads its inputs from
+the `WorkerRuntime` in `context.additional_context["runtime"]`.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 
@@ -30,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
+from jobhunter.errors import FencedOut
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
 
@@ -143,7 +145,12 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
     from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
 
     rt: WorkerRuntime = context.additional_context["runtime"]
-    await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow())
+    try:
+        await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow(), epoch=rt.epoch)
+    except FencedOut:
+        # A newer worker owns the work (final review C2; `retention_fenced` logged it): the fenced pass wrote
+        # nothing, and no daily reconciler runs for this superseded worker either.
+        return
     # The daily maintenance (§17.4, e.g. `stale_sweep_daily`, §8.11), after the retention pass.
     await run_reconcilers(
         ReconcileContext(

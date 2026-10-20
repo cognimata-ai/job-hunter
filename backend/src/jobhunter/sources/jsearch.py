@@ -51,7 +51,7 @@ from jobhunter.sources.base import (
     Settlement,
     SourceError,
 )
-from jobhunter.sources.http import HttpOutcome, send
+from jobhunter.sources.http import HttpOutcome, missing_credential, send
 from jobhunter.sources.parsing.dates import Precision, from_epoch, jsearch_precision
 from jobhunter.sources.parsing.description import plain_description
 from jobhunter.sources.parsing.employment import JSEARCH_TYPES, EmploymentType
@@ -281,7 +281,10 @@ class JSearchAdapter:
         )
 
     async def fetch(self, spec: RequestSpec) -> HttpOutcome:
-        """One attempt: the key goes in a header and the cursor, if any, in the query; never a retry."""
+        """One attempt: the key goes in a header and the cursor, if any, in the query; never a retry. Without
+        a key nothing is built or sent (`http.missing_credential`, an `auth` failure before the send)."""
+        if (refused := missing_credential(spec, self._api_key)) is not None:
+            return HttpOutcome(None, refused)
         params = dict(spec.params)
         if spec.cursor_in is not None:
             params["cursor"] = spec.cursor_in

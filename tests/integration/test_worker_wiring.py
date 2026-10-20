@@ -1,19 +1,24 @@
 """Task 24: the worker's source wiring (carry 3: missing secrets fail closed per instance).
 
-At its start (step 8) the worker runs `sync_instances(conn, cfg)`: a source whose provider secret is absent is
-`disabled('missing_secret')` and never planned; fake mode needs no secret. A run of a worker without the
-JSearch key therefore plans no JSearch spec and ends for its other sources, never `failed`.
+At its start (step 8) the worker runs `sync_instances(conn, cfg, guard=...)` under its epoch fence: a
+source whose provider secret is absent is `disabled('missing_secret')` and never planned; fake mode needs no
+secret. A run of a worker without the JSearch key therefore plans no JSearch spec and ends for its other
+sources, never `failed`.
 """
 
+import uuid
 from dataclasses import replace
 
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.guards import Guard
 from jobhunter.embeddings import EmbedderClient, make_http_client
+from jobhunter.errors import FencedOut
 from jobhunter.sources import registry
 from jobhunter.sources.breaker import record_failure
 from jobhunter.sources.instances import InstanceRow, disable, sync_instances
+from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep, fence_epoch
 from jobhunter.worker.runs import FINAL_STATUSES
 
 from tests.support.collect import TEST_QUERY, instance_id, make_deps, run_to_the_end
@@ -38,9 +43,22 @@ async def state(engine, source_id: str) -> tuple[object, ...]:
         return tuple((await c.execute(STATE, {"s": source_id})).one())
 
 
-async def sync(engine, cfg) -> dict[str, str]:
+async def unfenced(conn) -> None:
+    """The guard of a sync that no worker epoch owns (these tests' own syncs)."""
+
+
+def fenced_by(epoch: int) -> Guard:
+    """The worker's guard of its startup sync: its epoch fence (`epoch.fence_epoch`)."""
+
+    async def guard(conn) -> None:
+        await fence_epoch(conn, epoch)
+
+    return guard
+
+
+async def sync(engine, cfg, guard: Guard = unfenced) -> dict[str, str]:
     async with engine.begin() as c:
-        return dict(await sync_instances(c, cfg))
+        return dict(await sync_instances(c, cfg, guard=guard))
 
 
 def live_worker(make_config, secrets: dict[str, bytes]):
@@ -131,3 +149,81 @@ async def test_a_worker_without_the_jsearch_key_plans_no_jsearch_spec_and_does_n
     assert "jsearch" not in sources and {"arbeitnow", "greenhouse"} <= sources
     assert status in FINAL_STATUSES and status not in ("failed", "failed_invariant"), (status, reason)
     assert not [r for r in served_requests(fixture_log) if r["host"] == "jsearch.p.rapidapi.com"]
+
+
+# --- Final review C2: the startup sync is fenced by the worker epoch; a paid adapter never sends without
+# its credential ---------------------------------------------------------------------------------------------
+
+
+async def test_a_superseded_workers_startup_sync_is_refused_and_leaves_the_newer_owners_state(
+    engine, current_epoch, worker_lock, make_config
+) -> None:
+    """Worker A (epoch 1) has its secrets and pauses before its startup sync; worker B takes over (epoch 2)
+    without the JSearch key and disables JSearch. A's sync, fenced by its own epoch, is refused before it
+    reads or writes an instance: it cannot restore `ok` from its stale view, so B never plans JSearch."""
+    stale = current_epoch
+    newer, _ = await claim_epoch_and_sweep(
+        engine, WorkerIdentity(uuid.uuid4(), "h", 2, worker_lock.backend_pid, "v")
+    )
+    without_key = live_worker(make_config, {k: v for k, v in PROVIDER_SECRETS.items() if k != "rapidapi_key"})
+    assert (await sync(engine, without_key, fenced_by(newer)))["jsearch"] == "disabled"
+    left = await state(engine, "jsearch")
+    assert left == ("disabled", "missing_secret", None, None)
+    with pytest.raises(FencedOut) as fenced:
+        await sync(engine, live_worker(make_config, PROVIDER_SECRETS), fenced_by(stale))
+    assert fenced.value.owner == "worker_epoch"
+    assert await state(engine, "jsearch") == left  # as the newer owner left it
+    # The current epoch's own sync still restores the instance once its secret is there.
+    assert (await sync(engine, live_worker(make_config, PROVIDER_SECRETS), fenced_by(newer)))[
+        "jsearch"
+    ] == "ok"
+
+
+async def test_a_paid_instance_left_ok_without_its_key_sends_nothing_and_fails_as_auth(
+    engine, current_epoch, make_config, fake_http, fixture_log, fake_embedder
+) -> None:
+    """Defence in depth: should a JSearch instance be `ok` while the worker has no key (the stale restore
+    above, before its fence), the adapter refuses locally: no request reaches the transport, the attempt is
+    `failed('auth')`, its reservation is refunded `not_billed` (nothing left the process) and the breaker
+    opens `auth_failed`, so no later attempt reserves anything."""
+    cfg = live_worker(make_config, {k: v for k, v in PROVIDER_SECRETS.items() if k != "rapidapi_key"})
+    assert await state(engine, "jsearch") == ("ok", None, None, None)  # never synced: the seed's state
+    clients = registry.make_clients(cfg)  # on `fake_http`'s fixture transport: nothing leaves the process
+
+    def adapter_of(instance: InstanceRow):
+        return registry.build_adapter(instance, cfg, clients)
+
+    try:
+        async with make_http_client() as embedder_http:
+            deps = make_deps(
+                engine, adapter_of, embedder=EmbedderClient(fake_embedder.base_url, embedder_http)
+            )
+            run_id = await run_to_the_end(
+                engine, deps, include_paid=True, queries=[TEST_QUERY], enabled=("jsearch", "arbeitnow", "ats")
+            )
+    finally:
+        for client in clients.values():
+            await client.aclose()
+    assert not [r for r in served_requests(fixture_log) if r["host"] == "jsearch.p.rapidapi.com"]
+    assert [r for r in served_requests(fixture_log) if r["host"] == "www.arbeitnow.com"]  # the others ran
+    async with engine.connect() as c:
+        status, reason = (
+            await c.execute(sa.text("SELECT status, status_reason FROM runs WHERE id = :i"), {"i": run_id})
+        ).one()
+        attempts = (
+            await c.execute(
+                sa.text(
+                    "SELECT f.status, f.error_code, f.skip_reason, l.state, l.evidence FROM fetch_requests f "
+                    "JOIN source_instances i ON i.id = f.source_instance_id "
+                    "LEFT JOIN quota_ledger l ON l.id = f.quota_ledger_id "
+                    "WHERE f.run_id = :i AND i.source_id = 'jsearch' ORDER BY f.id"
+                ),
+                {"i": run_id},
+            )
+        ).all()
+    assert status in FINAL_STATUSES and status not in ("failed", "failed_invariant"), (status, reason)
+    refused = ("failed", "auth", None, "not_billed", "connect_failed_before_send")
+    assert attempts and tuple(attempts[0]) == refused
+    assert all(tuple(a) in (refused, ("skipped", None, "breaker_open", None, None)) for a in attempts[1:])
+    health, code, opened, _ = await state(engine, "jsearch")
+    assert (health, code) == ("auth_failed", "auth") and opened is not None

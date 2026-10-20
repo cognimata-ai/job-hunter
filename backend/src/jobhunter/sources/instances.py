@@ -6,6 +6,11 @@
 state once its secret is present again. Every other state is left untouched by the restore: an
 administrative `disabled` with another code, and every breaker state with its timestamps. In fake mode
 (`JOBHUNTER_FAKE_SOURCES`) the fixtures need no secret, so every secret counts as present (Deviation 5).
+
+The sync is worker-owned work: its `guard` (the worker's epoch fence, `epoch.fence_epoch`) runs first, so a
+superseded worker, whose view of the secrets is stale, can never restore an instance that its successor
+disabled for a missing secret (final review C2). It locks no job row, so the guard may come first (Ruling
+T19-a).
 """
 
 from collections.abc import Mapping
@@ -17,6 +22,7 @@ from typing import Final
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.config import AppConfig
+from jobhunter.db.guards import Guard
 from jobhunter.db.seed import DEFAULT_INSTANCES
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
@@ -91,11 +97,14 @@ def _secrets_present(cfg: AppConfig, source_id: str) -> bool:
     return cfg.fake_sources or all(cfg.secrets.get(name) for name in PROVIDER_SECRETS.get(source_id, ()))
 
 
-async def sync_instances(conn: AsyncConnection, cfg: AppConfig) -> dict[str, Health]:
+async def sync_instances(conn: AsyncConnection, cfg: AppConfig, *, guard: Guard) -> dict[str, Health]:
     """Disable or restore the `default` instances by their provider secrets (plan Deviation 6).
 
-    Returns the health of every `default` instance afterwards, by source id. The caller owns the transaction.
+    Returns the health of every `default` instance afterwards, by source id. `guard` runs first, before any
+    instance is read or locked; a `FencedOut` from it propagates, nothing written. The caller owns the
+    transaction.
     """
+    await guard(conn)
     health: dict[str, Health] = {}
     rows = (await conn.execute(_DEFAULTS, {"sources": list(DEFAULT_INSTANCES)})).all()
     for row in rows:

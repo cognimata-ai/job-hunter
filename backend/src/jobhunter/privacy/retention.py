@@ -52,10 +52,20 @@ was skipped itself) earlier in the same pass is skipped: it is reported as `-1` 
 `retention_rule_skipped` (with `blocked_by`), and it neither raises nor resolves an alert, so the failed
 dependency's alert stays open until a pass in which both succeed. Independent rules still run.
 
+**The epoch fence** (final review C2). Retention is worker-owned maintenance, so every write of a pass is
+fenced by the worker epoch (`epoch.fence_epoch`, the first statement of its transaction; no rule locks a job
+row, so the guard may come first, Ruling T19-a): each row rule's transaction and each alert write. The two
+rules that delete through another pool, the saver's (`checkpoints`, per thread) and procrastinate's
+(`procrastinate_jobs`), hold the fence in an open transaction while they delete, so no takeover can commit
+in between. A superseded worker's pass (a newer epoch is current) is therefore `FencedOut` before its first
+write, or before the first one after the takeover: it is logged `retention_fenced` (the rule it stopped at,
+the counts so far), writes nothing more (no other rule, no alert) and raises the `FencedOut` to its caller.
+
 This module is a task boundary (ruff `BLE001` is allowed here). The catch around a rule persists its outcome
 as the alert, written in a transaction of its own. When that write fails too, `retention_alert_write_failed`
 is logged: the database that would hold the outcome is the one that failed, so the log line is what is left
-(as in `worker.reconcilers`). Neither log line carries an exception message.
+(as in `worker.reconcilers`). Neither log line carries an exception message. A `FencedOut` is no failure of a
+rule: it is never caught as one.
 """
 
 from collections.abc import Awaitable
@@ -69,8 +79,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q
+from jobhunter.errors import FencedOut
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import delete_finished_jobs
 
 
@@ -181,25 +193,32 @@ FAILED_ALERT_CODE: Final = "retention.failed"
 log = get_logger("jobhunter.privacy.retention")
 
 
-async def _delete_rows(engine: AsyncEngine, statement: TextClause, cutoff: datetime) -> int:
+async def _delete_rows(engine: AsyncEngine, statement: TextClause, cutoff: datetime, epoch: int) -> int:
     async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
         return (await conn.execute(statement, {"cutoff": cutoff})).rowcount
 
 
-async def _purge_threads(engine: AsyncEngine, saver: AsyncPostgresSaver, cutoff: datetime) -> int:
+async def _purge_threads(engine: AsyncEngine, saver: AsyncPostgresSaver, cutoff: datetime, epoch: int) -> int:
     """Delete the checkpoint threads of the runs that ended before `cutoff`; the number of threads."""
     async with engine.connect() as conn:
         threads = [
             str(thread) for thread in (await conn.execute(_ENDED_THREADS, {"cutoff": cutoff})).scalars()
         ]
     for thread in threads:
-        # The saver's own deletion: checkpoints, blobs and writes of the thread, on its autocommit pool.
-        await saver.adelete_thread(thread)
+        async with engine.begin() as fenced:
+            await fence_epoch(fenced, epoch)  # held while the saver deletes: no takeover commits meanwhile
+            # The saver's own deletion: checkpoints, blobs and writes of the thread, on its autocommit pool.
+            await saver.adelete_thread(thread)
     return len(threads)
 
 
-async def _delete_finished_jobs(queue: procrastinate.App, window: timedelta) -> int:
-    await delete_finished_jobs(queue, older_than_hours=int(window / timedelta(hours=1)))
+async def _delete_finished_jobs(
+    engine: AsyncEngine, queue: procrastinate.App, window: timedelta, epoch: int
+) -> int:
+    async with engine.begin() as fenced:
+        await fence_epoch(fenced, epoch)  # held while procrastinate deletes on its own pool
+        await delete_finished_jobs(queue, older_than_hours=int(window / timedelta(hours=1)))
     return -1  # procrastinate returns no count
 
 
@@ -209,17 +228,19 @@ async def _apply(
     queue: procrastinate.App,
     saver: AsyncPostgresSaver,
     now: datetime,
+    epoch: int,
 ) -> int:
     cutoff = now - rule.window
     if rule.name == "checkpoints":
-        return await _purge_threads(engine, saver, cutoff)
+        return await _purge_threads(engine, saver, cutoff, epoch)
     if rule.name == "procrastinate_jobs":
-        return await _delete_finished_jobs(queue, rule.window)
-    return await _delete_rows(engine, _DELETES[rule.name], cutoff)
+        return await _delete_finished_jobs(engine, queue, rule.window, epoch)
+    return await _delete_rows(engine, _DELETES[rule.name], cutoff, epoch)
 
 
-async def _raise_failure(engine: AsyncEngine, name: str, error_class: str) -> None:
+async def _raise_failure(engine: AsyncEngine, name: str, error_class: str, epoch: int) -> None:
     async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
         await raise_alert(
             conn,
             code=FAILED_ALERT_CODE,
@@ -230,26 +251,32 @@ async def _raise_failure(engine: AsyncEngine, name: str, error_class: str) -> No
         )
 
 
-async def _resolve_failure(engine: AsyncEngine, name: str) -> None:
+async def _resolve_failure(engine: AsyncEngine, name: str, epoch: int) -> None:
     async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
         await resolve_alert(conn, code=FAILED_ALERT_CODE, subject=name)
 
 
 async def _record_alert_outcome(name: str, write: Awaitable[None]) -> None:
-    """Await the alert `write` of rule `name`; a failure of it is logged and goes no further."""
+    """Await the alert `write` of rule `name`; a failure of it is logged and goes no further, except a
+    `FencedOut` (a newer epoch is current), which ends the pass."""
     try:
         await write
+    except FencedOut:
+        raise
     except Exception as exc:
         log.error("retention_alert_write_failed", rule=name, error_class=type(exc).__name__)
 
 
 async def run_retention_daily(
-    engine: AsyncEngine, queue: procrastinate.App, saver: AsyncPostgresSaver, *, now: datetime
+    engine: AsyncEngine, queue: procrastinate.App, saver: AsyncPostgresSaver, *, now: datetime, epoch: int
 ) -> dict[str, int]:
-    """Apply every rule of `RULES` at `now`, in order; the number deleted by rule name, `-1` when it failed
-    or was skipped (a dependency of it failed in this pass).
+    """Apply every rule of `RULES` at `now` for worker `epoch`, in order; the number deleted by rule name,
+    `-1` when it failed or was skipped (a dependency of it failed in this pass).
 
-    `checkpoints` counts threads; `procrastinate_jobs` is always `-1`. `queue` must be open.
+    `checkpoints` counts threads; `procrastinate_jobs` is always `-1`. `queue` must be open. Raises
+    `FencedOut`, logged `retention_fenced`, once `epoch` is no longer the current worker epoch: the pass stops
+    before that write and writes nothing more (see "The epoch fence").
     """
     report: dict[str, int] = {}
     not_done: set[str] = set()  # the rules that failed or were skipped in this pass
@@ -261,15 +288,22 @@ async def run_retention_daily(
             log.warning("retention_rule_skipped", rule=rule.name, blocked_by=blocked_by)
             continue
         try:
-            report[rule.name] = await _apply(rule, engine, queue, saver, now)
-        except Exception as exc:
-            report[rule.name] = -1
-            not_done.add(rule.name)
-            error_class = type(exc).__name__
-            # Not the exception's message and not its traceback: either may carry content.
-            log.error("retention_rule_failed", rule=rule.name, error_class=error_class)
-            await _record_alert_outcome(rule.name, _raise_failure(engine, rule.name, error_class))
-        else:
-            await _record_alert_outcome(rule.name, _resolve_failure(engine, rule.name))
+            try:
+                report[rule.name] = await _apply(rule, engine, queue, saver, now, epoch)
+            except FencedOut:
+                raise
+            except Exception as exc:
+                report[rule.name] = -1
+                not_done.add(rule.name)
+                error_class = type(exc).__name__
+                # Not the exception's message and not its traceback: either may carry content.
+                log.error("retention_rule_failed", rule=rule.name, error_class=error_class)
+                await _record_alert_outcome(rule.name, _raise_failure(engine, rule.name, error_class, epoch))
+            else:
+                await _record_alert_outcome(rule.name, _resolve_failure(engine, rule.name, epoch))
+        except FencedOut:
+            # `fence_epoch` logged both epochs; the fenced transaction wrote nothing.
+            log.warning("retention_fenced", rule=rule.name, **report)
+            raise
     log.info("retention_done", **report)
     return report

@@ -1,7 +1,7 @@
 import asyncio
 import functools
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import NoReturn
 
 import pytest
@@ -215,12 +215,24 @@ class World:
             world.clients.update(made)
             return made
 
-        async def fake_sync_instances(conn: object, cfg: object) -> dict[str, str]:
+        async def fake_sync_instances(
+            conn: object, cfg: object, *, guard: Callable[[object], Awaitable[None]]
+        ) -> dict[str, str]:
             events.append("sync_instances")
+            await guard(conn)  # the real sync's first statement (final review C2)
             world.synced.append(cfg)
             return {}
 
+        async def fake_fence_epoch(conn: object, epoch: int) -> None:
+            from jobhunter.errors import FencedOut
+
+            world.fenced.append(epoch)
+            if world.superseded:
+                raise FencedOut(owner="worker_epoch")
+
         self.synced: list[object] = []
+        self.fenced: list[int] = []  # the epochs step 8's guard fenced
+        self.superseded = False  # a newer worker took over before step 8
         monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
         monkeypatch.setattr(http, "configure", recording_configure)
 
@@ -237,6 +249,7 @@ class World:
             "EXECUTIONS": FakeExecutions(),
             "make_clients": recording_make_clients,
             "sync_instances": fake_sync_instances,
+            "fence_epoch": fake_fence_epoch,
         }.items():
             monkeypatch.setattr(main, name, fake)
         secrets = tmp_path / "secrets"
@@ -301,6 +314,45 @@ async def test_step_7_configures_http_before_the_clients_and_step_8_syncs_the_in
     runtime.shutdown.admission_stopped = True
     assert deps.admission_stopped() is True
     assert world.clients and all(client.is_closed for client in world.clients.values())  # type: ignore[attr-defined]
+
+
+async def test_step_8_syncs_the_instances_under_the_fence_of_the_workers_own_epoch(
+    monkeypatch, tmp_path
+) -> None:
+    """Final review C2: the startup sync's guard is the epoch fence of the epoch this worker claimed."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    assert world.fenced == [3] and world.synced == [world.cfg]
+
+
+async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_exits_1(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Final review C2: a newer worker took over while this one was starting. Its fenced sync writes nothing,
+    and the start ends there: no start reconciler, no worker loop; the teardown runs and the exit is 1, so
+    the restart stands by while the newer worker is healthy."""
+    from jobhunter.worker.main import worker_main
+
+    world = World(monkeypatch, tmp_path)
+    world.superseded = True
+    assert await worker_main(world.cfg) == 1
+    assert world.events == [
+        "lock_connect",
+        "lock_acquire",
+        "claim",
+        "watchdog_start",
+        "queue_open",
+        "saver_open",
+        "http_configure",
+        "make_clients",
+        "sync_instances",
+        *TEARDOWN,
+    ]
+    assert world.synced == [] and world.runtimes == []
+    assert [e["epoch"] for e in logged(caplog, "worker_superseded_at_start")] == [3]
+    assert logged(caplog, "worker_failed") == []
 
 
 async def test_the_worker_shares_one_embedder_client_on_its_configured_url(monkeypatch, tmp_path) -> None:
