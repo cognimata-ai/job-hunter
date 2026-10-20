@@ -167,6 +167,7 @@ class Served:
 class Denied:
     fetch_request_id: int
     skip_reason: str
+    replayed: bool  # an earlier attempt's skip found on its receipt, not a denial of this call
 
 
 @dataclass(frozen=True)
@@ -391,9 +392,10 @@ class _Acquisition:
             return await self._replay(last)
         if last.status == "skipped":
             reason = last.skip_reason or ""
+            replay = Denied(last.id, reason, replayed=True)
             if reason in _REATTEMPTED:
-                return _following(last, cast(RequestClass, last.request_class)) or Denied(last.id, reason)
-            return Denied(last.id, reason)
+                return _following(last, cast(RequestClass, last.request_class)) or replay
+            return replay
         if last.status == "failed":
             nxt = self._retry(history, last)
             if nxt is not None:
@@ -476,7 +478,9 @@ class _Acquisition:
         except _Moved:
             return _AGAIN  # recovered meanwhile (the reconciler moves both together)
         log.info("reservation_released", fetch_request_id=last.id, attempt_seq=last.attempt_seq)
-        return _following(last, cast(RequestClass, last.request_class)) or Denied(last.id, "superseded")
+        return _following(last, cast(RequestClass, last.request_class)) or Denied(
+            last.id, "superseded", replayed=False
+        )
 
     async def _close_ambiguous(self, last: FetchAttempt) -> bool:
         """`dispatched -> ambiguous` for the request and its ledger entry (which stays charged); `False`, with
@@ -540,7 +544,7 @@ class _Acquisition:
                     "skipped",
                     {"skip_reason": "shutdown"},
                 )
-            return Denied(row, "shutdown")
+            return Denied(row, "shutdown", replayed=False)
         async with ctx.engine.begin() as conn:
             if entry is not None:
                 await ledger.mark_dispatched(conn, entry, owner)  # FencedOut: abort without sending
@@ -549,7 +553,7 @@ class _Acquisition:
                 await ledger.lock_run_owner(conn, owner)
                 if await self._gate(conn):  # a free attempt: the breaker is read where it is marked
                     await _move(conn, row, ["planned"], "skipped", {"skip_reason": BREAKER_OPEN})
-                    return Denied(row, BREAKER_OPEN)
+                    return Denied(row, BREAKER_OPEN, replayed=False)
                 await _move(conn, row, ["planned"], "dispatched")
         await afault_point("collect.after_dispatch_marker")
         async with self.throttle() if self.throttle is not None else nullcontext():
@@ -616,7 +620,7 @@ class _Acquisition:
                 await breaker.record_failure(
                     conn, spec.source_instance_id, failure, billing=self.ctx.billing, now=self.ctx.clock()
                 )
-        return Denied(row, reason)
+        return Denied(row, reason, replayed=False)
 
     async def _reserve(
         self,
@@ -634,7 +638,7 @@ class _Acquisition:
             await ledger.lock_run_owner(conn, ctx.owner)
             if await self._gate(conn):  # no reservation while the breaker blocks (Ruling T14-b)
                 await _move(conn, row, ["planned"], "skipped", {"skip_reason": BREAKER_OPEN})
-                return Denied(row, BREAKER_OPEN)
+                return Denied(row, BREAKER_OPEN, replayed=False)
             decision = await ledger.reserve(
                 conn,
                 provider,
@@ -650,7 +654,7 @@ class _Acquisition:
             )
             if isinstance(decision, ledger.Denial):
                 await _move(conn, row, ["planned"], "skipped", {"skip_reason": decision.code})
-                return Denied(row, decision.code)
+                return Denied(row, decision.code, replayed=False)
             await _move(conn, row, ["planned"], "reserved", {"quota_ledger_id": decision.entry_id})
         return decision.entry_id
 

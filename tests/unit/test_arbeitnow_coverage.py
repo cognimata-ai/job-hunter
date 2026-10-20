@@ -11,7 +11,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from jobhunter.sources.arbeitnow import FirehoseState, Gap, conclude, covered_span, page_cap
+from jobhunter.sources.arbeitnow import FirehoseState, Gap, conclude, covered_span, filled_at, page_cap
+from jobhunter.sources.base import RawPage, RequestSpec
 
 T = datetime(2026, 10, 16, tzinfo=UTC)
 H = timedelta(hours=1)
@@ -153,3 +154,58 @@ def test_gaps_are_well_formed() -> None:
         Gap(T, T, "open")
     with pytest.raises(ValueError):
         Gap(T, T - H, "open")
+
+
+# ---- fix wave F4 (ledger L137): no coverage past the earliest page's fill instant --------------------------
+
+
+def page_with(headers: dict[str, str], fetched_at: datetime) -> RawPage:
+    spec = RequestSpec(
+        source_instance_id=1,
+        operation="list",
+        cell_id=1,
+        page_no=1,
+        params={},
+        cursor_in=None,
+        detail_native_id=None,
+        parent_fetch_request_id=None,
+        window=None,
+        request_class="free",
+    )
+    return RawPage(spec, 200, headers, b"{}", fetched_at)
+
+
+def test_a_page_was_made_at_its_date_less_its_age() -> None:
+    date = "Sun, 18 Oct 2026 20:53:22 GMT"  # V8 phase 1: a Cloudflare hit 1440 s old
+    assert filled_at(page_with({"date": date, "age": "1440"}, T)) == datetime(
+        2026, 10, 18, 20, 29, 22, tzinfo=UTC
+    )
+    assert filled_at(page_with({"date": date}, T)) == datetime(2026, 10, 18, 20, 53, 22, tzinfo=UTC)
+    assert filled_at(page_with({"age": "60"}, T)) == T - timedelta(seconds=60)  # no Date: its arrival
+    assert filled_at(page_with({"age": "soon", "date": "garbage"}, T)) == T  # unreadable: the arrival, age 0
+
+
+def test_a_read_to_the_end_covers_nothing_newer_than_its_earliest_page_fill() -> None:
+    read = hours_back(T, 11)  # T - 10 h .. T
+    assert covered_span(read, stopped_by="end", filled_at=T - 2 * H) == (T - 10 * H, T - 2 * H)
+    assert covered_span(read, stopped_by="end", filled_at=T + H) == (T - 10 * H, T)  # made after: no clamp
+    assert covered_span(read, stopped_by="end", filled_at=T - 10 * H) is None  # made before every item read
+    assert covered_span(read, stopped_by="cap", filled_at=T + H) is None
+    # a covered cell: the read part newer than the fill is a gap, so everything read is still accounted for
+    state = FirehoseState(newest_covered_upper=T - 20 * H, gaps=())
+    after, gaps = conclude(
+        state, read, pages=1, cap=3, stopped_by="end", now=T, max_ad_age_days=30, filled_at=T - 2 * H
+    )
+    assert gaps == [Gap(T - 20 * H, T - 10 * H, "open"), Gap(T - 2 * H, T, "open")]
+    assert after == FirehoseState(T - 2 * H, tuple(gaps))
+    # the fill below the old frontier: only the part above the frontier is a new gap
+    covered_late = FirehoseState(newest_covered_upper=T - H, gaps=())
+    _, gaps = conclude(
+        covered_late, read, pages=1, cap=3, stopped_by="end", now=T, max_ad_age_days=30, filled_at=T - 2 * H
+    )
+    assert gaps == [Gap(T - H, T, "open")]
+    # a fill before every item read proves nothing: the read is one gap from the frontier, as a capped read
+    _, gaps = conclude(
+        state, read, pages=1, cap=3, stopped_by="end", now=T, max_ad_age_days=30, filled_at=T - 11 * H
+    )
+    assert gaps == [Gap(T - 20 * H, T, "open")]

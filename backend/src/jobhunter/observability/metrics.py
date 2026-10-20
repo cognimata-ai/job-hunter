@@ -26,11 +26,11 @@ TABLE_BYTES = Gauge(
     "jobhunter_table_bytes", "Size of a database table in bytes.", ["table"], registry=REGISTRY
 )
 ALERTS_OPEN = Gauge("jobhunter_alerts_open", "Open alerts by severity.", ["severity"], registry=REGISTRY)
-# The pages the fetch nodes sent (one per receipt an attempt sent; a replayed receipt and a denied page are
-# not counted), by source and receipt status.
+# The pages the fetch nodes sent or denied (one per receipt an attempt settled itself: `succeeded`, `failed`,
+# `ambiguous` or `skipped`; a receipt a resumed attempt replays is not counted again), by source and status.
 FETCH_REQUESTS = Counter(
     "jobhunter_fetch_requests",
-    "Fetch request pages sent by the fetch nodes.",
+    "Fetch request pages the fetch nodes sent or denied, by receipt status.",
     ["source", "status"],
     registry=REGISTRY,
 )

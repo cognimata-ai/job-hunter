@@ -18,6 +18,7 @@ from jobhunter.graphs.collect.graph import build_collect_graph, is_retryable_db_
 from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback
 from jobhunter.graphs.collect.state import CollectUpdate, FetchCellInput, initial_state
 from jobhunter.quota import ledger
+from jobhunter.quota import planner as planner_module
 from jobhunter.quota.fallback import cell_outcome
 from jobhunter.quota.planner import PlanReport, ensure_cells, plan_fallback, plan_run
 from jobhunter.quota.windows import current_snapshot, current_window_locked
@@ -346,7 +347,48 @@ async def _sent(engine, owner, fetch_request_id: int, *, now) -> None:
         await ledger.mark_dispatched(c, reserved.entry_id, owner)
 
 
-async def test_plan_fallback_follows_the_eligibility_table(engine, current_epoch, fake_http) -> None:
+def spy_projections(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, object]]:
+    """Record `(provider, account)` of every projection the planner makes (it calls the real one)."""
+    seen: list[tuple[str, object]] = []
+    real = ledger.project_allowance  # the planner's (it imports it from the ledger)
+
+    async def recorded(conn, provider, specs, now, settings, *, interval_s, account=None):
+        seen.append((provider, account))
+        return await real(conn, provider, specs, now, settings, interval_s=interval_s, account=account)
+
+    monkeypatch.setattr(planner_module, "project_allowance", recorded)
+    return seen
+
+
+async def test_only_a_serpapi_projection_receives_the_account_read(
+    engine, current_epoch, monkeypatch
+) -> None:
+    """Fix wave F4 (ledger L196): the planner's guard (`account if provider == "serpapi" else None`, Ruling
+    T13-c): handed an account read, the primary plan's JSearch and Adzuna projections never see it."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "adzuna"))
+    owner, now = await queued_run(engine), utcnow()
+    seen = spy_projections(monkeypatch)
+    async with engine.begin() as c:
+        version = (
+            await c.execute(
+                sa.text("SELECT settings_version_id FROM runs WHERE id = :r"), {"r": owner.run_id}
+            )
+        ).scalar_one()
+        await plan_run(
+            c,
+            owner=owner,
+            include_paid=True,
+            settings=await load_run_settings(c, version),
+            instances=await list_instances(c),
+            now=now,
+            account=account(now, now + timedelta(days=20)),
+        )
+    assert sorted(seen, key=lambda call: call[0]) == [("adzuna", None), ("jsearch", None)]
+
+
+async def test_plan_fallback_follows_the_eligibility_table(
+    engine, current_epoch, fake_http, monkeypatch
+) -> None:
     outcomes = {
         "python developer": "exhausted",
         "data engineer": "contract_broken",
@@ -396,6 +438,8 @@ async def test_plan_fallback_follows_the_eligibility_table(engine, current_epoch
         )
         js = await instance_id(c, "jsearch")
         assert await record_failure(c, js, "contract", billing="paid", now=now) == "contract_broken"
+    seen = spy_projections(monkeypatch)
+    read = account(now, now + timedelta(days=20))
     async with engine.begin() as c:
         assert {q: await cell_outcome(c, owner.run_id, request[q].cell_id) for q in outcomes} == outcomes
         version = (await c.execute(ACTIVE_VERSION)).scalar_one()
@@ -405,8 +449,9 @@ async def test_plan_fallback_follows_the_eligibility_table(engine, current_epoch
             settings=await load_run_settings(c, version),
             instances=await list_instances(c),
             now=now,
-            account=account(now, now + timedelta(days=20)),
+            account=read,
         )
+    assert seen == [("serpapi", read)]  # the SerpApi projection gets the read (fix wave F4, ledger L196)
     planned = [r for r in await requests(engine, owner.run_id) if r.phase == "fallback"]
     async with engine.connect() as c:
         served = sorted([(await c.execute(QUERY_OF, {"c": r.cell_id})).scalar_one() for r in planned])

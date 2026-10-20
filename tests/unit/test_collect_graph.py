@@ -150,6 +150,44 @@ async def test_the_fallback_account_read_is_bounded_and_a_failed_read_is_no_read
         await _account(_bug)
 
 
+class _RaisingAccount:
+    """A SerpApi adapter whose account read raises `error` (it satisfies `AccountAdapter` and no more)."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def account(self) -> AccountObservation:
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FencedOut("run"),
+        sa.exc.DBAPIError("SELECT 1", {}, ConnectionError("reset"), connection_invalidated=True),
+        asyncio.CancelledError(),
+    ],
+    ids=["fenced_out", "dbapi_error", "cancelled"],
+)
+async def test_a_lost_owner_a_database_error_or_a_cancellation_propagates_from_the_account_read(
+    error: BaseException,
+) -> None:
+    """Fix wave F4 (ledger L196): only a `SourceError` or the read's own timeout is "no read"; a fenced
+    owner, a database error and a cancellation propagate, from the read or from `on_auth_failure`."""
+    adapter = cast(SourceAdapter, _RaisingAccount(error))
+    with pytest.raises(type(error)):
+        await serpapi_account(lambda instance: adapter, seeded_run_settings(), [SERPAPI], now=utcnow())
+    revoked = cast(SourceAdapter, _RaisingAccount(SourceError("auth", code="http_401", status=401)))
+
+    async def failing(instance_id: int) -> None:
+        raise error
+
+    with pytest.raises(type(error)):
+        await serpapi_account(
+            lambda instance: revoked, seeded_run_settings(), [SERPAPI], now=utcnow(), on_auth_failure=failing
+        )
+
+
 async def test_no_account_is_read_when_serpapi_is_off() -> None:
     disabled = dataclasses.replace(SERPAPI, health="disabled")
     sources = SourcesEnabled(jsearch=True, serpapi=False, adzuna=True, arbeitnow=True, ats=True)

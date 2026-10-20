@@ -25,8 +25,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Final, Literal
 
-import httpx
-
 from jobhunter.db.sql import q
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
@@ -60,9 +58,9 @@ async def serpapi_account(
 ) -> AccountObservation | None:
     """The free SerpApi account read for the fallback projection (§5.3.2), or `None`: SerpApi disabled (by
     settings or health) or blocked by its breaker at `now` (no read is sent), an adapter without the read,
-    or a read that failed (`SourceError`, a transport error) or did not end within `timeout_s`. A read that
-    failed as `auth` is handed to `on_auth_failure` (the instance id) first. Anything else (a bug, a fenced
-    owner, a database error) propagates."""
+    or a read that failed (`SourceError`: `http.send` folds every transport error into one) or did not end
+    within `timeout_s`. A read that failed as `auth` is handed to `on_auth_failure` (the instance id) first.
+    Anything else (a bug, a fenced owner, a database error, a cancellation) propagates."""
     instance = next((i for i in instances if i.source_id == "serpapi"), None)
     if not settings.sources.serpapi or instance is None or available(instance, now) == "blocked":
         return None  # `blocked` covers `disabled`
@@ -78,8 +76,6 @@ async def serpapi_account(
         log.warning("account_read_failed", error_kind=err.kind, error_code=err.code)
         if on_auth_failure is not None and failure_kind(err) == "auth":
             await on_auth_failure(instance.id)
-    except httpx.TransportError as err:  # the class only: a message may carry the URL
-        log.warning("account_read_failed", error_kind="transport", error_code=type(err).__name__)
     return None
 
 

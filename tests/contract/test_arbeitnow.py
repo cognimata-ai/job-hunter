@@ -14,6 +14,7 @@ from jobhunter.sources.arbeitnow import (
     FirehoseState,
     conclude,
     covered_span,
+    filled_at,
     page_cap,
 )
 from jobhunter.sources.base import (
@@ -177,10 +178,11 @@ async def test_a_fixture_run_reads_pages_one_and_two_then_the_end_and_is_covered
     async with httpx.AsyncClient(transport=fixture_transport(FIXTURES, log_path=log)) as client:
         a = ArbeitnowAdapter(client, instance_id=1, clock=lambda: T)
         state = FirehoseState(newest_covered_upper=None, gaps=())
-        spec, cap, times, pages = a.plan(arbeitnow_cell()), page_cap(3600), [], 0
+        spec, cap, times, pages, fills = a.plan(arbeitnow_cell()), page_cap(3600), [], 0, []
         while True:
             outcome = await a.fetch(spec)
             assert outcome.error is None and outcome.page is not None and outcome.page.status == 200
+            fills.append(filled_at(outcome.page))
             pages += 1
             a.check_envelope(outcome.page)
             items = [o.item_ts for o in a.parse(outcome.page) if o.item_ts is not None]
@@ -198,6 +200,10 @@ async def test_a_fixture_run_reads_pages_one_and_two_then_the_end_and_is_covered
     after, gaps = conclude(state, times, pages=pages, cap=cap, stopped_by="end", now=T, max_ad_age_days=30)
     assert gaps == [] and after == FirehoseState(newest_covered_upper=max(times), gaps=())
     assert covered_span(times, stopped_by="end") == (min(times), max(times))
+    # the recorded pages were made (V8: `date` less `age`, 20:29:22 the earliest) after their newest item:
+    # the fill instant clamps nothing here (fix wave F4, ledger L137)
+    assert min(fills) == datetime(2026, 10, 18, 20, 29, 22, tzinfo=UTC) > max(times)
+    assert covered_span(times, stopped_by="end", filled_at=min(fills)) == (min(times), max(times))
 
 
 async def test_fetch_asks_for_the_page_of_the_spec_and_nothing_else() -> None:

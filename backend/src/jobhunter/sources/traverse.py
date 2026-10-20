@@ -18,15 +18,16 @@ The page rules (§5.3):
 - **Arbeitnow** (Ruling T10-a): the fresh head from page 1, read to the end of the feed (`end`), the page cap
   `arbeitnow.page_cap(interval_s)` (`cursor`, `page_cap`) or `remaining_low` (`cursor`, `allowance`); no
   item time stops it. Its reads go to `arbeitnow.conclude` and `covered_span` against the cell's
-  `FirehoseState`, rebuilt from its newest `covered` row and its gaps of every status. The read from page 1
+  `FirehoseState`, rebuilt from its newest `covered` row and its gaps of every status, with the earliest
+  fill instant of its pages (`arbeitnow.filled_at`), past which nothing is covered. The read from page 1
   ends every traversal (the end of the feed, the cap, the remaining-low rule or a failure), so no seek leg is
   planned: no page would be left for one (plan Deviation 27). A traversal that fails after its first page
   concludes with `stopped_by="remaining"` (its reads prove nothing), one that read nothing does not
   conclude.
 - **ATS boards**: until `END` (Lever and SmartRecruiters by offset), at most `ATS_PAGE_CAP` list pages;
   SmartRecruiters detail calls for the postings `detail_specs` names after each list page (none once
-  admission has stopped), at most `ratelimit.SMARTRECRUITERS_DETAIL.concurrency` at a time, which never end
-  the traversal. The snapshot's
+  admission has stopped), at most `ratelimit.SMARTRECRUITERS_DETAIL.concurrency` at a time in the process
+  (`RateLimiter.gate`, shared by every board), which never end the traversal. The snapshot's
   membership comes from the list pages alone (`ats.common.membership`, one final attempt per page, numbered
   from 1); `snapshot` is `None` when no list page was served (a board whose first page failed writes no
   snapshot and ages nothing, §8.11).
@@ -34,12 +35,13 @@ The page rules (§5.3):
 Every traversal: an instance whose breaker is `half_open` gets one page (its probe); `admission_stopped()`
 between two pages ends it `skipped('shutdown')` (inside a page `acquire_page` makes the receipt itself); a
 page that is `Failed`, `Ambiguous` or `Denied` ends it `failed`, `ambiguous` or `skipped`. After the last
-search of a SerpApi traversal that sent one, the free account read is made once more and persisted with
-`ledger.record_account` (§5.3.2); a read that fails as `auth` (a key revoked mid-run: a 401/403) is counted
-by the instance's breaker, which opens `auth_failed` with `source.auth_failed` at once, as the read before a
-search does (Ruling FR-l); any other failed read is logged and changes nothing. The sends go through the
-process's `RateLimiter`: the source's own key, `ats-host:<host>` for a board's list pages and
-`smartrecruiters-detail` for the detail calls. `traverse_cell` never raises `SourceError`.
+search of a SerpApi traversal that sent one, the free account read is made once more, unless the instance's
+breaker now blocks it, and persisted with `ledger.record_account` (§5.3.2); a read that fails as `auth` (a
+key revoked mid-run: a 401/403) is counted by the instance's breaker, which opens `auth_failed` with
+`source.auth_failed` at once, as the read before a search does (Ruling FR-l); any other failed read is
+logged and changes nothing. The sends go through the process's `RateLimiter`: the source's own key,
+`ats-host:<host>` for a board's list pages and `smartrecruiters-detail` for the detail calls.
+`traverse_cell` never raises `SourceError`.
 """
 
 import asyncio
@@ -57,6 +59,7 @@ from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
 from jobhunter.sources import adzuna, jsearch
 from jobhunter.sources.acquire import (
+    BREAKER_OPEN,
     AccountAdapter,
     AcquireContext,
     Ambiguous,
@@ -75,12 +78,13 @@ from jobhunter.sources.arbeitnow import (
     StopReason,
     conclude,
     covered_span,
+    filled_at,
     page_cap,
 )
 from jobhunter.sources.ats.common import AtsAdapter, SnapshotDraft, membership
 from jobhunter.sources.ats.smartrecruiters import SmartRecruitersAdapter
 from jobhunter.sources.base import CellPlan, Continuation, CoverageWindow, RawPage, RequestSpec, SourceError
-from jobhunter.sources.breaker import available
+from jobhunter.sources.breaker import available, instance_availability
 from jobhunter.sources.instances import list_instances
 from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL, RateLimiter
 
@@ -117,9 +121,10 @@ class TraversalResult:
     the last one when it had one. `snapshot` is a board's membership (`None` without a served list page),
     `firehose` the Arbeitnow cell's coverage before the traversal with the gaps `conclude` created or
     changed, and `covered` the span the Arbeitnow reads prove covered (`covered_span`). `taken_at` is the
-    arrival of the first served list page (a snapshot's `taken_at`). `sent` holds the outcomes of the pages
-    this attempt sent, which `FETCH_REQUESTS` counts: a receipt a resumed attempt replays and a denied page
-    are not among them.
+    arrival of the first served list page (a snapshot's `taken_at`). `attempted` holds the outcomes of the
+    pages this attempt itself settled, which `FETCH_REQUESTS` counts by status (§17.5 `{source,status}`): the
+    pages it sent (`succeeded`, `failed`, `ambiguous`) and the pages it denied (`skipped`: paced, exhausted,
+    breaker open, shutdown); a receipt of an earlier attempt that a resumed one replays is not among them.
     """
 
     outcomes: list[FetchOutcome]
@@ -132,7 +137,7 @@ class TraversalResult:
     firehose: tuple[FirehoseState, list[Gap]] | None
     covered: CoverageWindow | None = None
     taken_at: datetime | None = None
-    sent: list[FetchOutcome] = field(default_factory=list)
+    attempted: list[FetchOutcome] = field(default_factory=list)
 
 
 def _outcome(result: PageResult, items: int) -> FetchOutcome:
@@ -168,7 +173,7 @@ class _Traversal:
     limiter: RateLimiter
     probe: bool  # a half-open instance: one page
     outcomes: list[FetchOutcome] = field(default_factory=list)
-    sent_outcomes: list[FetchOutcome] = field(default_factory=list)  # of the pages this attempt sent
+    attempted: list[FetchOutcome] = field(default_factory=list)  # of the pages this attempt sent or denied
     pages: list[RawPage] = field(default_factory=list)  # the served list pages, in order
     items: int = 0
     sent: bool = False  # whether an attempt of this traversal may have reached the provider
@@ -196,8 +201,8 @@ class _Traversal:
         self.sent = self.sent or fresh or isinstance(result, Ambiguous)
         outcome = _outcome(result, items)
         self.outcomes.append(outcome)
-        if isinstance(result, Served | Failed | Ambiguous) and not result.replayed:  # sent by this call
-            self.sent_outcomes.append(outcome)
+        if not result.replayed:  # sent, or denied, by this call: never a receipt found from an earlier one
+            self.attempted.append(outcome)
         return result
 
     async def _known(self, conn: AsyncConnection, ids: Sequence[str | None]) -> int:
@@ -240,7 +245,7 @@ class _Traversal:
             firehose=firehose,
             covered=covered,
             taken_at=self.pages[0].fetched_at if self.pages else None,
-            sent=list(self.sent_outcomes),
+            attempted=list(self.attempted),
         )
 
 
@@ -318,7 +323,13 @@ async def _search(t: _Traversal, first: RequestSpec, first_id: int | None) -> Tr
 
 async def _account_after(ctx: AcquireContext, adapter: AccountAdapter, instance_id: int) -> None:
     """The account read after the traversal's last search (§5.3.2), persisted under the owner lock; one that
-    fails as `auth` is the breaker's `auth` failure (Ruling FR-l)."""
+    fails as `auth` is the breaker's `auth` failure (Ruling FR-l). The read is a send to the provider too, so
+    none is made while the instance's breaker blocks (a search of this traversal opened it, fix wave F4,
+    ledger L216), as before a search (`acquire`) and in the fallback projection (`plan_fallback`)."""
+    async with ctx.engine.connect() as conn:
+        if await instance_availability(conn, instance_id, now=ctx.clock()) == "blocked":
+            log.info("account_read_skipped", source_instance_id=instance_id, reason=BREAKER_OPEN)
+            return
     try:
         observation = await adapter.account()
     except SourceError as err:  # the read is information only: nothing else depends on it
@@ -356,6 +367,7 @@ async def _firehose(
     cap = 1 if t.probe else page_cap(ctx.settings.interval_s)
     state = await _firehose_state(ctx.engine, plan.cell_id)
     times: list[datetime] = []
+    fills: list[datetime] = []  # when each served page was made (`arbeitnow.filled_at`)
     spec, planned_id = first, first_id
     end: End
     reason: str | None
@@ -367,6 +379,7 @@ async def _firehose(
             (end, reason), stopped_by = _stopped(result), "remaining"
             break
         times += [item.item_ts for item in adapter.parse(result.page) if item.item_ts is not None]
+        fills.append(filled_at(result.page))
         kind, cursor = adapter.continuation(result.page)
         if kind is Continuation.END:
             end, reason, stopped_by = "end", None, "end"
@@ -386,6 +399,7 @@ async def _firehose(
         spec, planned_id = nxt, None
     if not t.pages:
         return t.result(end, reason)
+    filled = min(fills)  # the coverage claims nothing newer than the earliest page's content (ledger L137)
     _, changed = conclude(
         state,
         times,
@@ -394,22 +408,25 @@ async def _firehose(
         stopped_by=stopped_by,
         now=ctx.clock(),
         max_ad_age_days=max_age,
+        filled_at=filled,
     )
     return t.result(
         end,
         reason,
         cursor_out=None if end == "end" else cursor,
         firehose=(state, changed),
-        covered=covered_span(times, stopped_by=stopped_by),
+        covered=covered_span(times, stopped_by=stopped_by, filled_at=filled),
     )
 
 
 async def _details(t: _Traversal, adapter: SmartRecruitersAdapter, listing: Served) -> None:
     """The detail calls of a SmartRecruiters list page (§5.3.5), at most `SMARTRECRUITERS_DETAIL.concurrency`
-    inside `acquire_page` at a time (the gate: the limiter's key bounds only the sends, the gate also the
-    database work around them, so a page of many postings cannot drain the pool); their outcomes are the
-    traversal's, and none of them ends it. An error of a call (a lost owner, a bug) is raised as it is, never
-    wrapped in the `ExceptionGroup` of the task group: a `FencedOut` must still end the attempt quietly."""
+    inside `acquire_page` at a time in the whole process (the limiter's `gate`: the limiter's key bounds only
+    the sends, the gate also the database work around them, so neither a page of many postings nor two boards
+    traversed at once can drain the pool, and §5.3.5's "concurrency 4" holds for the one host they share);
+    their outcomes are the traversal's, and none of them ends it. An error of a call (a lost owner, a bug)
+    is raised as it is, never wrapped in the `ExceptionGroup` of the task group: a `FencedOut` must still end
+    the attempt quietly."""
     ids = sorted({native_id for native_id in adapter.peek_native_ids(listing.page) if native_id is not None})
     known: dict[str, tuple[bytes, datetime | None]] = {}
     if ids:
@@ -419,7 +436,7 @@ async def _details(t: _Traversal, adapter: SmartRecruitersAdapter, listing: Serv
     specs = adapter.detail_specs(
         listing.page, known, now=t.ctx.clock(), parent_fetch_request_id=listing.fetch_request_id
     )
-    gate = asyncio.Semaphore(SMARTRECRUITERS_DETAIL.concurrency)
+    gate = t.limiter.gate(SMARTRECRUITERS_DETAIL.key)  # the process's: every board's details share it
 
     async def detail(spec: RequestSpec) -> None:
         async with gate:

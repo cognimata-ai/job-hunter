@@ -35,9 +35,17 @@ feed stops it earlier.
 
 The covered bound this module proves, and nothing more:
 
-- **A read from page 1 to the end of the feed covers `[oldest item read, newest item read)`.** It saw every
-  item the feed holds. Half-open, the newest instant itself is left to the next run: a claim may fall short
-  of the truth, never exceed it.
+- **A read from page 1 to the end of the feed covers `[oldest item read, newest item read)`, its upper bound
+  clamped to the earliest fill instant of its pages** (`filled_at`: the response's `Date` less its `Age`, the
+  moment the cached page was made, fix wave F4, ledger L137). It saw every item the feed held when its pages
+  were made. An item created after the earliest of those instants can be missing although the read reaches
+  past it: its page was made before it existed, and by the time a later page was made the item sat on an
+  earlier page (pages fill one after the other, so in-order fills hide such an item as well). So nothing
+  newer than the earliest fill is proven, and the read part above it is recorded as a gap. Half-open, the
+  upper instant itself is left to the next run: a claim may fall short of the truth, never exceed it. A
+  residual risk stays (Ruling T10-b, accepted): an item older than every fill can still move from a page
+  made later to a page made earlier and be read on neither; only reading every page at one instant would
+  close it, which a cached feed does not allow.
 - **A read stopped by the cap or by the remaining-low rule covers nothing.** The bound "everything newer
   than the newest of the runs' oldest items is read" does not survive V8's own data: after page 1 that bound
   is 19:30:49 (run 3's oldest), and page 2's fourth run holds five items at 20:00:43 and 20:00:44. With run 4
@@ -54,9 +62,11 @@ frontier, back to the cell's first read, is in a covered span or in a recorded g
 nothing records the gap `[frontier, newest item read)` (from its oldest item when there is no frontier yet: a
 never-covered cell claims nothing older than what it read). A read that reached the end records the gap
 `[frontier, oldest item read)` when the feed no longer reaches back to the frontier (those items left the
-feed unread), closes every open gap its covered span touches and reopens the parts outside it as new gaps
-(narrowing is recorded, never silent). A gap whose upper bound is at or older than
-`now - max_ad_age_days` is abandoned. Every interval is `[older, newer)`; gaps are never dropped.
+feed unread) and, when the earliest fill clamped its span, the gap from the span's upper bound (or the
+frontier, when that is newer) to its newest item; it closes every open gap its covered span touches and
+reopens the parts outside it as new gaps (narrowing is recorded, never silent). A gap whose upper bound is
+at or older than `now - max_ad_age_days` is abandoned. Every interval is `[older, newer)`; gaps are never
+dropped.
 """
 
 import re
@@ -91,7 +101,7 @@ from jobhunter.sources.base import (
     Settlement,
 )
 from jobhunter.sources.http import HttpOutcome, send
-from jobhunter.sources.parsing.dates import from_epoch
+from jobhunter.sources.parsing.dates import from_epoch, response_date
 from jobhunter.sources.parsing.employment import EmploymentType, parse_employment
 from jobhunter.sources.parsing.locations import ParsedLocations, parse_location_text
 from jobhunter.types import JSONValue
@@ -156,15 +166,29 @@ def _cutoff(now: datetime, max_ad_age_days: int) -> datetime:
     return now - timedelta(days=max_ad_age_days)
 
 
-def covered_span(times: Sequence[datetime], *, stopped_by: StopReason) -> CoverageWindow | None:
+def filled_at(page: RawPage) -> datetime:
+    """When the page's content was made: its `Date` header less its `Age` (a Cloudflare cache hit, V8), else
+    its arrival (`fetched_at`) less the `Age`; an unreadable `Age` counts as 0."""
+    age = page.headers.get("age", "").strip()
+    seconds = int(age) if age.isascii() and age.isdigit() else 0
+    return response_date(page.headers, page.fetched_at) - timedelta(seconds=seconds)
+
+
+def covered_span(
+    times: Sequence[datetime], *, stopped_by: StopReason, filled_at: datetime | None = None
+) -> CoverageWindow | None:
     """The span the read from page 1 proves covered: `[oldest, newest)` of the item times `times` it read,
-    when it reached the end of the feed; `None` otherwise or when that span is empty.
+    when it reached the end of the feed, its upper bound at most `filled_at` (the earliest fill instant of
+    its pages; `None`: no page was made before an item it read, as for a page read live); `None` otherwise or
+    when that span is empty.
 
     Task 14 writes it as the run's `covered` interval; `conclude` applies the same span.
     """
     if stopped_by != "end" or not times:
         return None
     lower, upper = min(times), max(times)
+    if filled_at is not None:
+        upper = min(upper, filled_at)
     return (lower, upper) if lower < upper else None
 
 
@@ -197,18 +221,20 @@ def conclude(
     stopped_by: StopReason,
     now: datetime,
     max_ad_age_days: int,
+    filled_at: datetime | None = None,
 ) -> tuple[FirehoseState, list[Gap]]:
     """The cell's coverage after a traversal (T10-a; the rules are the module docstring's).
 
     `times` holds the `created_at` of every item the read from page 1 saw, in reading order; `pages` counts
-    its pages. Returns the new state, whose `gaps` keep every earlier gap in place (with its new
-    status), each narrowed gap followed by its remainders, then the gap this run opened; and the gaps this run
-    created or changed, in the same order: the rows Task 14 writes, with `covered_span` for the covered row.
-    Raises `ValueError` for reads no traversal produces.
+    its pages; `filled_at` is the earliest fill instant of those pages (`covered_span`). Returns the new
+    state, whose `gaps` keep every earlier gap in place (with its new status), each narrowed gap followed by
+    its remainders, then the gaps this run opened (below the covered span, then above it); and the gaps this
+    run created or changed, in the same order: the rows Task 14 writes, with `covered_span` for the covered
+    row. Raises `ValueError` for reads no traversal produces.
     """
     _validate(pages=pages, cap=cap, stopped_by=stopped_by)
     cutoff = _cutoff(now, max_ad_age_days)
-    span = covered_span(times, stopped_by=stopped_by)
+    span = covered_span(times, stopped_by=stopped_by, filled_at=filled_at)
     frontier = _frontier(state)
 
     gaps: list[Gap] = []
@@ -239,6 +265,13 @@ def conclude(
             opened = _with_age(unproven_lower, unproven_upper, cutoff)
             gaps.append(opened)
             changed.append(opened)
+        if span is not None:
+            # read but not proven: newer than the earliest fill (the part the frontier has not accounted)
+            above = span[1] if frontier is None else max(span[1], frontier)
+            if above < max(times):
+                newer = _with_age(above, max(times), cutoff)
+                gaps.append(newer)
+                changed.append(newer)
         if span is not None and (newest_covered is None or span[1] > newest_covered):
             newest_covered = span[1]
     return FirehoseState(newest_covered, tuple(gaps)), changed

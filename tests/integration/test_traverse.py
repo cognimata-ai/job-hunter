@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import re
 from dataclasses import replace
@@ -13,6 +14,8 @@ from jobhunter.clock import utcnow
 from jobhunter.db.seed import canonical_json
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.deps import CollectDeps
+from jobhunter.graphs.collect.graph import TIMEOUTS, build_collect_graph
+from jobhunter.graphs.collect.nodes import fetch as fetch_node
 from jobhunter.graphs.collect.nodes.fetch import (
     acquire_context,
     load_planned,
@@ -36,13 +39,15 @@ from jobhunter.sources.base import element_sha256
 from jobhunter.sources.breaker import record_failure
 from jobhunter.sources.fixtures import fixture_transport
 from jobhunter.sources.instances import InstanceRow, list_instances
-from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL
+from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL, SOURCE_LIMITS, RateLimiter
 from jobhunter.sources.serpapi import SerpApiAdapter
 from jobhunter.worker import runs
 from jobhunter.worker.runs import RunOwner, finalize_run
 from jobhunter.worker.tasks import defer_in_tx
+from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.clock import FakeClock
 from tests.support.collect import (
     TEST_QUERY,
     JobFactory,
@@ -718,6 +723,35 @@ async def test_an_arbeitnow_failure_partway_proves_nothing_and_leaves_an_open_ga
     ]
 
 
+async def test_an_arbeitnow_read_to_the_end_covers_nothing_newer_than_its_page_was_made(
+    engine, current_epoch, respx_mock: respx.MockRouter, arbeitnow_adapter: ArbeitnowAdapter
+) -> None:
+    """Fix wave F4 (ledger L137, §5.6): the feed's one page, a cache hit made an hour before it was served
+    (`Date` less `Age`) and before its newest item, ends the feed. The covered span stops at that fill
+    instant; the newer part of what was read is an open gap, not coverage."""
+    await seed_inputs(engine, enabled=("arbeitnow",))
+    status, headers, body = load_fixture("arbeitnow", "page1")
+    doc = json.loads(body)
+    doc["links"]["next"] = None  # the end of the feed
+    times = [datetime.fromtimestamp(job["created_at"], UTC) for job in doc["data"]]
+    oldest, newest = min(times), max(times)
+    made = newest - 30 * timedelta(minutes=1)
+    served = made + H
+    cached = {**headers, "date": served.strftime("%a, %d %b %Y %H:%M:%S GMT"), "age": "3600"}
+    respx_mock.get(FEED_URL, params={"page": "1"}).mock(
+        return_value=httpx.Response(status, headers=cached, json=doc)
+    )
+    deps = replace(make_deps(engine, lambda instance: arbeitnow_adapter), clock=lambda: served)
+    owner = await queued_run(engine, include_paid=False)
+    (fid,) = await plan_ids(deps, owner)
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.pages, result.covered) == ("end", 1, (oldest, made))
+    assert [r[:5] for r in await rows(engine, RUN_INTERVALS, r=owner.run_id)] == [
+        ("gap", "open", "page_cap", made, newest),  # read, but newer than the page's content: not proven
+        ("covered", None, None, oldest, made),
+    ]
+
+
 async def test_detail_acquisitions_never_run_more_than_the_gate_admits(
     engine, current_epoch, respx_mock: respx.MockRouter, monkeypatch
 ) -> None:
@@ -741,7 +775,7 @@ async def test_detail_acquisitions_never_run_more_than_the_gate_admits(
             await asyncio.sleep(0)
         active[0] -= 1
         made[0] += 1
-        return Denied(-made[0], "breaker_open")
+        return Denied(-made[0], "breaker_open", replayed=False)
 
     monkeypatch.setattr(traverse, "acquire_page", counted)
     async with engine.connect() as c:
@@ -753,6 +787,63 @@ async def test_detail_acquisitions_never_run_more_than_the_gate_admits(
         (fid,) = await plan_ids(deps, owner)
         await traverse_and_record(deps, fid)
     assert (made[0], peak[0]) == (10, SMARTRECRUITERS_DETAIL.concurrency)
+
+
+async def test_two_boards_traversed_at_once_share_the_one_detail_gate(
+    engine, current_epoch, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    """Fix wave F4 (ledger L216): the gate is the process's (`RateLimiter.gate`), not the traversal's, so two
+    SmartRecruiters boards traversed at once (the host's two fetch slots) together have at most
+    `SMARTRECRUITERS_DETAIL.concurrency` (4) detail calls inside `acquire_page`, not 4 each. The detail calls
+    wait until both boards' list pages are in, so both boards' details compete for the gate at once."""
+    slugs = ("DeliveryHero", "SecondBoard")
+    await seed_inputs(engine, companies=[("smartrecruiters", slug) for slug in slugs], enabled=("ats",))
+    listing = listing_in_germany()
+    for item in listing["content"]:
+        item["location"] = listing["content"][0]["location"]
+    for slug in slugs:
+        respx_mock.get(f"https://api.smartrecruiters.com/v1/companies/{slug}/postings").mock(
+            return_value=httpx.Response(200, json=listing)
+        )
+    real, active, peak, made = acquire_page, [0], [0], [0]
+    entered: set[int | None] = set()  # the boards (their list pages) whose detail calls have started
+    both_entered = asyncio.Event()
+
+    async def counted(ctx, spec, **arguments):
+        if spec.operation != "detail":
+            return await real(ctx, spec, **arguments)
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        entered.add(spec.parent_fetch_request_id)
+        if len(entered) == len(slugs):
+            both_entered.set()
+        # held until the other board's details start too: at once with a gate per traversal (8 inside),
+        # never with the process's one gate (4 inside, the other board waits), which the timeout then ends
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(both_entered.wait(), 1.0)
+        active[0] -= 1
+        made[0] += 1
+        return Denied(-made[0], "breaker_open", replayed=False)
+
+    monkeypatch.setattr(traverse, "acquire_page", counted)
+    clock = FakeClock(0.0)
+
+    async def no_wait(seconds: float) -> None:  # the host's 5 requests/s pass without real time
+        clock.now += seconds
+
+    async with engine.connect() as c:
+        boards = [i for i in await list_instances(c) if i.source_id == "smartrecruiters"]
+    async with httpx.AsyncClient() as client:
+        by_instance = {board.id: adapter_for(board, client, clock=utcnow) for board in boards}
+        deps = replace(
+            make_deps(engine, lambda instance: by_instance[instance.id]),
+            limiter=RateLimiter(SOURCE_LIMITS.values(), clock=clock, sleep=no_wait),
+        )
+        owner = await queued_run(engine, include_paid=False)
+        ids = await plan_ids(deps, owner)
+        assert len(ids) == 2
+        await asyncio.gather(*(traverse_and_record(deps, fid) for fid in ids))
+    assert (made[0], peak[0]) == (20, SMARTRECRUITERS_DETAIL.concurrency)
 
 
 # ---- final review F3 --------------------------------------------------------------------------------------
@@ -966,6 +1057,37 @@ async def test_an_auth_failure_of_the_account_read_after_the_last_search_opens_t
         assert alert.scalar_one() == "critical"
 
 
+async def test_no_account_read_follows_a_search_that_opened_the_breaker(
+    engine, current_epoch, respx_mock: respx.MockRouter, serpapi_fixture_adapter: SerpApiAdapter
+) -> None:
+    """Fix wave F4 (ledger L216): the account read after a traversal's last search is a send to SerpApi
+    too, so it is gated like the read before a search: page 1 is served, page 2 and its one retry answer 503,
+    which opens the breaker (paid threshold 2), and then no read follows."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "serpapi"))
+    async with engine.begin() as c:  # JSearch is closed: its cell falls back to SerpApi
+        await record_failure(c, await instance_id(c, "jsearch"), "auth", billing="paid", now=utcnow())
+        serpapi = await instance_id(c, "serpapi")
+    status, headers, body = load_fixture("serpapi", "google_jobs_hl_en")
+    respx_mock["serpapi_search"].side_effect = [
+        httpx.Response(status, headers=headers, content=body),
+        httpx.Response(503),
+        httpx.Response(503),
+    ]
+    owner = await queued_run(engine)
+    deps = make_deps(engine, lambda instance: serpapi_fixture_adapter)
+    state = initial_state(owner.run_id, owner.attempt_no)
+    await make_plan(deps)(state)
+    (fallback,) = (await make_plan_fallback(deps)(state))["fallback_fetch_request_ids"]
+    result = await traverse_and_record(deps, fallback)
+    assert (result.end, result.reason, result.pages) == ("failed", "transient", 1)
+    assert respx_mock["serpapi_search"].call_count == 3
+    # plan_fallback's read and the reads before page 1, page 2 and its retry; none after the last search
+    assert respx_mock["serpapi_account"].call_count == 4
+    async with engine.connect() as c:
+        health = await c.execute(sa.text("SELECT health FROM source_instances WHERE id = :i"), {"i": serpapi})
+        assert health.scalar_one() == "breaker_open"
+
+
 async def test_fetch_requests_counts_the_pages_an_attempt_sent_never_a_replayed_one(
     engine, current_epoch, queue_app, adapters: Adapters
 ) -> None:
@@ -983,3 +1105,82 @@ async def test_fetch_requests_counts_the_pages_an_attempt_sent_never_a_replayed_
     again = await traverse_and_record(deps, fid, attempt_no=resumed.attempt_no)
     assert again.pages == 2 and [o["status"] for o in again.outcomes] == ["succeeded", "succeeded"]
     assert fetched("jsearch", "succeeded") == before + 2  # the replays sent nothing
+
+
+async def test_fetch_requests_counts_a_page_this_attempt_denied_but_not_its_replay(
+    engine, current_epoch, queue_app, adapters: Adapters, job_factory: JobFactory
+) -> None:
+    """Fix wave F4 (the controller's FETCH_REQUESTS item): §17.5 names `fetch_requests_total{source,status}`,
+    and a receipt's status includes `skipped`, so a page this attempt denied (page 2 `paced`: one token) is
+    a `skipped` sample; a resumed attempt that finds both receipts again counts neither."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    await insert_window(engine, jsearch_window(utcnow(), limit=200, reserve=20, tokens=1, interval_s=SIX_H))
+    for uid in page1_ids()[:2]:  # 8 new: page 2 is admitted by the page-2 rule, then paced
+        await job_factory(native_id=uid)
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine)
+    (fid,) = await plan_ids(deps, owner)
+    before = {status: fetched("jsearch", status) for status in ("succeeded", "skipped")}
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason) == ("skipped", "paced")
+    assert [o["status"] for o in result.attempted] == ["succeeded", "skipped"]
+    assert {status: fetched("jsearch", status) - n for status, n in before.items()} == {
+        "succeeded": 1,
+        "skipped": 1,
+    }
+    resumed = await supersede(engine, owner)
+    assert await plan_ids(deps, resumed) == [fid]
+    again = await traverse_and_record(deps, fid, attempt_no=resumed.attempt_no)
+    assert [o["status"] for o in again.outcomes] == ["succeeded", "skipped"] and again.attempted == []
+    assert {status: fetched("jsearch", status) - n for status, n in before.items()} == {
+        "succeeded": 1,
+        "skipped": 1,
+    }
+
+
+async def test_the_traversal_timeout_starts_once_the_traversal_holds_its_semaphore(
+    engine, current_epoch, adapters: Adapters, monkeypatch
+) -> None:
+    """Fix wave F4 (ledger L205/L216, §9.2 "15 min per traversal"): `fetch_cell` times the traversal from
+    the moment it holds its source's semaphore, so its wait behind another traversal never counts against
+    it; the graph node has no LangGraph timeout that would time the wait. With a timeout of 0 s, a traversal
+    that waited for the semaphore and then needs no wait completes, and one that waits at all times out."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine)
+    (fid,) = await plan_ids(deps, owner)
+    monkeypatch.setattr(fetch_node, "TRAVERSAL_TIMEOUT", timedelta(0))
+    done = traverse.TraversalResult(
+        outcomes=[],
+        end="skipped",
+        reason="shutdown",
+        pages=0,
+        items=0,
+        cursor_out=None,
+        snapshot=None,
+        firehose=None,
+    )
+
+    async def at_once(ctx, plan, first_fetch_request_id, *, limiter):
+        return done
+
+    monkeypatch.setattr(fetch_node, "traverse_cell", at_once)
+    slot = deps.fetch_ctx.sources["jsearch"]
+    async with slot:  # another JSearch traversal holds the source's one slot meanwhile
+        waiting = asyncio.create_task(traverse_and_record(deps, fid))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not waiting.done()
+    assert await waiting is done
+
+    async def slow(ctx, plan, first_fetch_request_id, *, limiter):
+        await asyncio.sleep(0)  # any wait inside the traversal counts
+        return done
+
+    monkeypatch.setattr(fetch_node, "traverse_cell", slow)
+    with pytest.raises(TimeoutError):
+        await traverse_and_record(deps, fid)
+    graph = build_collect_graph(InMemorySaver(), deps)
+    assert graph.builder.nodes["fetch_cell"].timeout is None
+    assert graph.builder.nodes["fetch_primary"].timeout is not None
+    assert fetch_node.TRAVERSAL_TIMEOUT == timedelta(0) and TIMEOUTS["fetch_cell"] == timedelta(minutes=15)

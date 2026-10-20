@@ -9,8 +9,11 @@ planned primary spec (`nodes.fetch.route_after_primary`, or straight on when the
 → [fetch_fallback → a fetch_cell Send per fallback spec | parse_normalize]`, then `parse_normalize →
 resolve_identity → embed → hard_filters → enqueue_targets → finalize → END`; after a `fetch_cell`,
 `route_after_cell` goes to `plan_fallback` in the primary phase and to `parse_normalize` in the fallback one.
-Every node has its §9.2 timeout; the nodes that make no source or embedder call retry a serialization
-failure, a deadlock or a lost connection (`DB_RETRY`, `is_retryable_db_error`), and nothing else.
+Every node has its §9.2 timeout, `fetch_cell` its per-traversal one: it times the traversal itself, from the
+moment the traversal holds its semaphore (`nodes.fetch.TRAVERSAL_TIMEOUT`), so a Send's wait behind the
+traversals ahead of it never counts against it (a LangGraph timeout would time that wait too). The nodes that
+make no source or embedder call retry a serialization failure, a deadlock or a lost connection (`DB_RETRY`,
+`is_retryable_db_error`), and nothing else.
 `parse_normalize` is `nodes.parse_normalize` (Task 15), `resolve_identity` is `nodes.resolve_identity` (Task
 18), `embed` is `nodes.embed` (Task 22), `hard_filters` is `nodes.hard_filters` (Task 16), `enqueue_targets`
 is `nodes.enqueue_targets` and `finalize` is `nodes.finalize` (Task 23): the graph ends the run itself, in
@@ -55,6 +58,7 @@ from jobhunter.graphs.collect.nodes.embed import NODE_TIMEOUT as EMBED_TIMEOUT
 from jobhunter.graphs.collect.nodes.embed import make_embed
 from jobhunter.graphs.collect.nodes.enqueue_targets import make_enqueue_targets
 from jobhunter.graphs.collect.nodes.fetch import (
+    TRAVERSAL_TIMEOUT,
     make_fetch_cell,
     make_fetch_fallback,
     make_fetch_primary,
@@ -79,12 +83,13 @@ type CollectGraph = CompiledStateGraph[CollectState, None, CollectState, Collect
 SOURCE_ERRORS: Final = "source_errors"  # the counter of source errors that reached a node's error handler
 EMBEDDER_ERRORS: Final = "embedder_errors"  # the counter of embedder errors that reached it
 _MINUTE: Final = timedelta(minutes=1)
-# The §9.2 timeout of each node; a fetch node's is per traversal, so `fetch_cell` has it too.
+# The §9.2 timeout of each node; a fetch node's is per traversal, so `fetch_cell` has it too (its own, from
+# its semaphore on: `nodes.fetch.TRAVERSAL_TIMEOUT`, not a LangGraph `TimeoutPolicy`).
 TIMEOUTS: Final[Mapping[str, timedelta]] = MappingProxyType(
     {
         "plan": timedelta(seconds=60),
         "fetch_primary": 15 * _MINUTE,
-        "fetch_cell": 15 * _MINUTE,
+        "fetch_cell": TRAVERSAL_TIMEOUT,
         "plan_fallback": timedelta(seconds=30),
         "fetch_fallback": 15 * _MINUTE,
         "parse_normalize": 10 * _MINUTE,
@@ -191,11 +196,10 @@ def build_collect_graph(
             timeout=TimeoutPolicy(run_timeout=TIMEOUTS[name]),
             retry_policy=None if name in IO_NODES else DB_RETRY,
         )
-    graph.add_node(
+    graph.add_node(  # no TimeoutPolicy: the node times its traversal itself (`TRAVERSAL_TIMEOUT`)
         "fetch_cell",
         timed("fetch_cell", error_handled("fetch_cell", make_fetch_cell(deps)), clock=timer),
         input_schema=FetchCellInput,
-        timeout=TimeoutPolicy(run_timeout=TIMEOUTS["fetch_cell"]),
     )
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "fetch_primary")

@@ -15,7 +15,7 @@ from jobhunter.sources import acquire, ats, http
 from jobhunter.sources.acquire import AcquireContext, Ambiguous, Denied, Failed, Served, acquire_page
 from jobhunter.sources.arbeitnow import FEED_URL
 from jobhunter.sources.base import CellPlan, RequestSpec, SourceError, request_key
-from jobhunter.sources.breaker import record_success
+from jobhunter.sources.breaker import record_failure, record_success
 from jobhunter.sources.instances import instance_for_company, list_instances
 from jobhunter.sources.jsearch import SEARCH_URL as JSEARCH_URL
 from jobhunter.sources.jsearch import JSearchAdapter
@@ -479,8 +479,11 @@ async def test_denial_and_shutdown_send_nothing(
     ]
     assert await scalar(engine, "SELECT count(*) FROM quota_ledger") == 0
     assert served_requests(fixture_log) == []
-    # a denial is the request's receipt: resolving it again replays the denial
-    assert await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None) == denied
+    # a denial is the request's receipt: resolving it again replays the denial (marked so: the metric of the
+    # attempt that denied it counted it already, fix wave F4)
+    assert not denied.replayed
+    replayed = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+    assert replayed == replace(denied, replayed=True)
     assert len(await attempts(engine, spec, owner)) == 1
 
 
@@ -713,6 +716,8 @@ async def test_timeouts_count_for_the_breaker_and_a_billed_provider_error_is_nev
         assert [a[2:8] for a in await attempts(engine, spec, owner)] == [
             ("failed", None, "transient", 200, "billed", None)
         ]
+        async with engine.connect() as c:  # the billed 200 error is a failure the breaker counts (T9-a)
+            assert tuple((await c.execute(JSEARCH)).one())[1:] == ("degraded", 1)
         # timeouts: the ledger keeps them ambiguous, the breaker counts them transient, open at 2 (T5 carry)
         route.side_effect = httpx.ReadTimeout("read timed out")
         await close_breaker(engine, spec.source_instance_id)  # the 200 error counted one failure already
@@ -1090,6 +1095,33 @@ async def test_a_paid_5xx_earns_exactly_one_retry(
             (1, "normal", "failed", None, "transient", 502, "ambiguous", None, "normal"),
             (2, "retry", "succeeded", None, None, 200, "billed", None, "retry"),
         ]
+
+
+async def test_a_retry_is_not_made_once_the_failure_it_follows_opened_the_breaker(
+    engine, current_epoch, respx_mock
+) -> None:
+    """Fix wave F4 (ledger L216): a 503 that is the instance's second consecutive failure opens the paid
+    breaker; the §5.2 retry it would earn is a new attempt, so the runtime gate (Ruling T14-b) skips it
+    `breaker_open` in the same `acquire_page` call: nothing reserved, nothing sent."""
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    async with engine.begin() as c:  # one failure already counted: the next one opens the breaker
+        assert await record_failure(
+            c, spec.source_instance_id, "transient", billing="paid", now=utcnow()
+        ) == ("degraded")
+    route = respx_mock.get(JSEARCH_URL)
+    route.side_effect = [httpx.Response(503), httpx.Response(200, json={"status": "OK"})]
+    async with httpx.AsyncClient() as client:
+        ctx = await jsearch_on_respx(engine, client, owner)
+        result = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+    assert isinstance(result, Denied) and result.skip_reason == "breaker_open"
+    assert await attempts(engine, spec, owner) == [
+        (1, "normal", "failed", None, "transient", 503, "ambiguous", None, "normal"),
+        (2, "retry", "skipped", "breaker_open", None, None, None, None, None),
+    ]
+    assert route.call_count == 1  # the retry was never sent
+    async with engine.connect() as c:
+        assert tuple((await c.execute(JSEARCH)).one())[1:] == ("breaker_open", 2)
 
 
 async def test_a_paid_connect_error_before_send_is_not_billed_and_not_retried(

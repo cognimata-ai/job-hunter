@@ -14,7 +14,9 @@ checked:
 - every gap has `lower < upper`;
 - an open gap is closed, narrowed or abandoned, and every such change is reported; no gap is ever dropped, and
   no open gap outlives the ad age;
-- no span is marked covered, and no gap closed, without every feed item in it having been read;
+- no span is marked covered, and no gap closed, without every feed item in it having been read, and no
+  covered span reaches past the earliest fill instant of the read's pages (`filled_at`, fix wave F4: the
+  simulated pages are made a drawn lag before the newest item read, or after it);
 - every item read lies below the accounting frontier afterwards (it is in a covered span or a recorded gap),
   no time between the old and the new frontier is left out of every covered span and gap, and no two open
   gaps overlap (no span is recorded as a hole twice).
@@ -105,6 +107,7 @@ def frontier(state: FirehoseState) -> datetime | None:
     retention_h=48,
     max_age_days=5,
     low_at=None,
+    fill_lag_s=None,
 )
 @settings(max_examples=60, deadline=None)
 @given(
@@ -118,6 +121,7 @@ def frontier(state: FirehoseState) -> datetime | None:
     retention_h=st.one_of(st.none(), st.integers(24, 240)),
     max_age_days=st.integers(1, 5),
     low_at=st.one_of(st.none(), st.tuples(st.integers(0, 7), st.integers(1, 4))),
+    fill_lag_s=st.one_of(st.none(), st.integers(0, 6 * 3600)),
 )
 def test_a_growing_feed_never_starves_the_head_and_never_hides_a_gap(
     seed: int,
@@ -128,6 +132,7 @@ def test_a_growing_feed_never_starves_the_head_and_never_hides_a_gap(
     retention_h: int | None,
     max_age_days: int,
     low_at: tuple[int, int] | None,
+    fill_lag_s: int | None,
 ) -> None:
     rng = random.Random(seed)  # noqa: S311 - a reproducible simulation, not a secret
     interval, cap = timedelta(hours=interval_h), page_cap(interval_h * 3600)
@@ -180,10 +185,20 @@ def test_a_growing_feed_never_starves_the_head_and_never_hides_a_gap(
         assert pages == expected
         assert {i.id for n in range(1, pages + 1) for i in feed.page(n)} <= read
 
+        # the earliest page's fill instant: a drawn lag below the newest item read (a cached page), or none
+        filled = None if fill_lag_s is None or not times else max(times) - timedelta(seconds=fill_lag_s)
         after, changed = conclude(
-            state, times, pages=pages, cap=cap, stopped_by=stopped_by, now=now, max_ad_age_days=max_age_days
+            state,
+            times,
+            pages=pages,
+            cap=cap,
+            stopped_by=stopped_by,
+            now=now,
+            max_ad_age_days=max_age_days,
+            filled_at=filled,
         )
-        span = covered_span(times, stopped_by=stopped_by)
+        span = covered_span(times, stopped_by=stopped_by, filled_at=filled)
+        assert span is None or filled is None or span[1] <= filled
 
         # gaps are chronological intervals
         assert all(g.lower < g.upper for g in (*after.gaps, *changed))

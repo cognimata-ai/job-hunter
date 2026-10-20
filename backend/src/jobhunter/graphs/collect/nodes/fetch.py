@@ -9,17 +9,21 @@ fallback phase to `parse_normalize` (only the fallback phase has fallback ids).
 `fetch_cell` (`traverse_and_record`): loads the planned row, its cell and its run (`load_planned`), builds the
 `CellPlan` from the stored spec (its window is the planned one, never recomputed) and the adapter of the
 instance, holds the source's semaphore (`deps.fetch_ctx`: a board holds its host's), runs
-`traverse.traverse_cell(…, limiter=deps.limiter)`, then records the coverage in one transaction that first
-holds the owner row `FOR SHARE` (`coverage.record_search_traversal`, `record_firehose_traversal` or
-`record_ats_snapshot`; a board whose traversal a shutdown or a takeover cut short writes no snapshot), then
-passes `afault_point("collect.after_coverage_commit")`, and counts in `FETCH_REQUESTS` the pages this attempt
-sent (a page a resumed attempt replays from its receipt, or a denied one, is not counted again). It returns
-the traversal's page outcomes and counters. It settles its own `fetch_requests` rows and never raises
-`SourceError`; a lost owner (`FencedOut`) and bugs propagate.
+`traverse.traverse_cell(…, limiter=deps.limiter)` within `TRAVERSAL_TIMEOUT` (§9.2: 15 min per traversal,
+timed from the moment it holds its semaphore, so the wait behind the traversals ahead of it never counts
+against it; fix wave F4, ledger L205: the node has no LangGraph timeout of its own), then records the
+coverage in one transaction that first holds the owner row `FOR SHARE` (`coverage.record_search_traversal`,
+`record_firehose_traversal` or `record_ats_snapshot`; a board whose traversal a shutdown or a takeover cut
+short writes no snapshot), then passes `afault_point("collect.after_coverage_commit")`, and counts in
+`FETCH_REQUESTS` the pages this attempt sent or denied, by status (a page a resumed attempt replays from its
+receipt is not counted again). It returns the traversal's page outcomes and counters. It settles its own
+`fetch_requests` rows and never raises `SourceError`; a lost owner (`FencedOut`) and bugs propagate, and so
+does the `TimeoutError` of a traversal past its timeout, which fails the run as the LangGraph timeout did.
 """
 
 import asyncio
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Final, Literal, Protocol, cast
 
 from langgraph.types import Send
@@ -45,6 +49,8 @@ from jobhunter.sources.traverse import TraversalResult, traverse_cell
 from jobhunter.worker.runs import RunOwner
 
 FETCH_CELL: Final = "fetch_cell"
+# §9.2 node 2: "15 min per traversal", from the moment the traversal holds its source's (or host's) semaphore.
+TRAVERSAL_TIMEOUT: Final = timedelta(minutes=15)
 # The ends of a traversal that a shutdown or a takeover cut short: no snapshot is written for them.
 INTERRUPTED: Final = frozenset({"shutdown", "superseded"})
 
@@ -155,7 +161,8 @@ async def _record(conn: AsyncConnection, planned: PlannedCell, result: Traversal
             state,
             gaps,
             covered=result.covered,
-            reason=coverage.gap_reason(result) or "page_cap",  # an END read's gap: earlier reads were capped
+            # an END read's gaps: earlier reads were capped, or its pages were made before its newest items
+            reason=coverage.gap_reason(result) or "page_cap",
             run_id=run_id,
         )
     elif result.snapshot is not None and result.taken_at is not None and not _interrupted(result):
@@ -172,12 +179,13 @@ async def traverse_and_record(
     adapter = deps.adapters(planned.instance)
     ctx = acquire_context(deps, planned, adapter)
     async with _semaphore(deps, planned.instance.source_id, adapter):
-        result = await traverse_cell(ctx, planned.plan, fetch_request_id, limiter=deps.limiter)
+        async with asyncio.timeout(TRAVERSAL_TIMEOUT.total_seconds()):  # started once the slot is held
+            result = await traverse_cell(ctx, planned.plan, fetch_request_id, limiter=deps.limiter)
     async with deps.engine.begin() as conn:
         await ledger.lock_run_owner(conn, planned.owner)
         await _record(conn, planned, result)
     await afault_point("collect.after_coverage_commit")
-    for outcome in result.sent:  # the pages this attempt sent: never a replayed receipt or a denial
+    for outcome in result.attempted:  # the pages this attempt sent or denied: never a replayed receipt
         FETCH_REQUESTS.labels(source=planned.instance.source_id, status=outcome["status"]).inc()
     return result
 
