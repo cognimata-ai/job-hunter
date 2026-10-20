@@ -421,10 +421,15 @@ async def reconcile_operations(ctx: ReconcileContext) -> int:
     creation and its `not_before` (at most `REDEFER_BATCH` per tick). A `running` one whose heartbeat is
     older than `OPERATION_STALE` is taken back; after that commit, its local execution is cancelled and
     awaited when, and only when, it runs for the claim that was taken back (its registry token).
+
+    Both transactions are fenced by `ctx.epoch` first, before any operation row is locked (Ruling FR-h): a
+    superseded worker raises `FencedOut` having written nothing, which stops its cadence.
     """
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         redeferred = await _redefer_lost_jobs(conn, now=ctx.now, defer=ctx.defer)
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         reclaimed = await _reclaim_stale(conn, now=ctx.now)
     for operation_id, claim_id in reclaimed:
         key: ExecKey = ("operation", operation_id)

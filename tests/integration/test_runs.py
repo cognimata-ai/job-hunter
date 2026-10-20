@@ -756,3 +756,32 @@ async def test_a_heartbeat_blocked_by_the_finalize_loses_the_attempt_and_writes_
     assert not [e for e in events if e["event"] in ("run_graph_failed", "run_fenced", "run_finished")]
     assert await run_failed_alerts(engine) == 0
     assert await attempts(engine, rid) == [(1, 1, "completed")]
+
+
+# --- Ruling FR-h: the M0 run reconcilers are fenced by the worker epoch -------------------------------------
+
+
+async def test_the_queued_runs_and_stale_data_reconcilers_of_a_superseded_epoch_write_nothing(
+    engine, queue_app
+) -> None:
+    from jobhunter.worker import reconcilers
+
+    rid = await queued(engine)
+    async with engine.connect() as c:
+        seeded = (await c.execute(sa.text("SELECT min(created_at) FROM settings_versions"))).scalar_one()
+    async with engine.begin() as c:
+        await c.execute(sa.text("DELETE FROM procrastinate_jobs"))  # its job is lost: due for a re-defer
+        await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
+    late = max(utcnow() + timedelta(minutes=5), seeded + timedelta(hours=13))  # both due
+    ctx = ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=late, epoch=1)
+    for name in ("queued_runs", "stale_data"):
+        with pytest.raises(FencedOut):
+            await reconcilers.REGISTRY[name][1](ctx)
+    assert (await fetch(engine, rid))[0::5] == ("queued", None)  # not re-deferred, not annotated
+    async with engine.connect() as c:
+        assert not await live_job_exists(c, "run_collect", args_match={"run_id": rid})
+        assert (await c.execute(sa.text("SELECT count(*) FROM alerts"))).scalar_one() == 0
+    # the current epoch's pass does both
+    current = ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=late, epoch=2)
+    assert await reconcilers.REGISTRY["queued_runs"][1](current) == 1
+    assert await reconcilers.REGISTRY["stale_data"][1](current) == 1

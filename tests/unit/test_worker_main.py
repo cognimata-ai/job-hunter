@@ -327,17 +327,19 @@ async def test_step_8_syncs_the_instances_under_the_fence_of_the_workers_own_epo
     assert world.fenced == [3] and world.synced == [world.cfg]
 
 
-async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_exits_1(
+async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_exits_70(
     monkeypatch, tmp_path, caplog
 ) -> None:
-    """Final review C2: a newer worker took over while this one was starting. Its fenced sync writes nothing,
-    and the start ends there: no start reconciler, no worker loop; the teardown runs and the exit is 1, so
-    the restart stands by while the newer worker is healthy."""
+    """Final review C2, Ruling FR-i: a newer worker took over while this one was starting. Its fenced sync
+    writes nothing, and the start ends there: no start reconciler, no worker loop; the teardown runs and the
+    exit is the watchdog's superseded code, also when a teardown step fails."""
+    from jobhunter.worker.lock import WATCHDOG_EXIT_CODE
     from jobhunter.worker.main import worker_main
 
     world = World(monkeypatch, tmp_path)
     world.superseded = True
-    assert await worker_main(world.cfg) == 1
+    assert WATCHDOG_EXIT_CODE == 70
+    assert await worker_main(world.cfg) == WATCHDOG_EXIT_CODE
     assert world.events == [
         "lock_connect",
         "lock_acquire",
@@ -351,8 +353,14 @@ async def test_a_worker_superseded_before_its_startup_sync_starts_no_loop_and_ex
         *TEARDOWN,
     ]
     assert world.synced == [] and world.runtimes == []
-    assert [e["epoch"] for e in logged(caplog, "worker_superseded_at_start")] == [3]
+    [event] = logged(caplog, "worker_superseded_at_start")
+    assert (event["epoch"], event["exit_code"], event["level"]) == (3, 70, "critical")
     assert logged(caplog, "worker_failed") == []
+    # a failing teardown step leaves the superseded code as it is
+    (tmp_path / "again").mkdir()
+    failing = World(monkeypatch, tmp_path / "again")
+    failing.superseded, failing.dispose_fails = True, True
+    assert await worker_main(failing.cfg) == WATCHDOG_EXIT_CODE
 
 
 async def test_the_worker_shares_one_embedder_client_on_its_configured_url(monkeypatch, tmp_path) -> None:

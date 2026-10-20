@@ -9,7 +9,8 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12), `reconcile_heavy` and
 `retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19, unless the
 worker epoch fenced that pass out, final review C2). Every body is `pass_context` and reads its inputs from
-the `WorkerRuntime` in `context.additional_context["runtime"]`.
+the `WorkerRuntime` in `context.additional_context["runtime"]`. The tick's own scheduling step (`run_tick`)
+is fenced by the worker epoch too (Ruling FR-h): a superseded worker's tick writes nothing.
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 
@@ -34,6 +35,7 @@ from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
+from jobhunter.worker.epoch import fence_epoch
 
 if TYPE_CHECKING:
     # Only for annotations: the runtime pulls in langgraph, which a process that only defers (the API) skips.
@@ -111,8 +113,13 @@ async def tick(context: JobContext, timestamp: int) -> None:
         ),
         "tick",
     )
-    async with rt.engine.begin() as conn:
-        report = await run_tick(conn, now=utcnow(), defer=defer_in_tx)
+    try:
+        async with rt.engine.begin() as conn:
+            # The `worker_heartbeat` row first, before `active_config` (Ruling FR-h; no job row is locked).
+            await fence_epoch(conn, rt.epoch)
+            report = await run_tick(conn, now=utcnow(), defer=defer_in_tx)
+    except FencedOut:
+        return  # a newer worker owns the schedule (`fence_epoch` logged it): this tick wrote nothing
     observe_tick(report)  # after the commit: a rolled-back tick inserted nothing
 
 

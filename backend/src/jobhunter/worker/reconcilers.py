@@ -7,6 +7,12 @@ order, and isolates them from each other: a reconciler that raises is recorded a
 alert and the log line carry the reconciler's name and the exception's class only, never its message. When
 the reconciler succeeds again, the alert is resolved.
 
+**The epoch fence** (final review F2, Ruling FR-h). Reconcilers are worker-owned maintenance: each fences its
+own writes with `ctx.epoch` (`epoch.fence_epoch`), and so do the alert writes here (the first statement of
+their transaction; no job row is locked). A `FencedOut`, from a reconciler or from an alert write, is no
+failure: this worker is superseded, so the cadence stops there (logged `reconcilers_fenced` with the cadence
+and the reconciler), and a superseded worker never raises or resolves `reconciler.failed`.
+
 This module is a task boundary (ruff `BLE001` is allowed here), and the catch persists an outcome (§17.1).
 
 `stalled_jobs` and the heavy `metrics_refresh` are registered here; the tasks that own the other repairs
@@ -21,9 +27,11 @@ from typing import TYPE_CHECKING, Literal
 import procrastinate
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from jobhunter.errors import FencedOut
 from jobhunter.observability.alerts import raise_alert, refresh_alert_gauge, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
+from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, release_stalled_jobs
 
 if TYPE_CHECKING:
@@ -70,8 +78,10 @@ def reconciler(name: str, *cadences: Cadence) -> Callable[[ReconcilerFn], Reconc
 
 
 async def _persist_failure(ctx: ReconcileContext, name: str, error_class: str) -> None:
-    """Raise (or count one more occurrence of) the alert for `name`, in a transaction of its own."""
+    """Raise (or count one more occurrence of) the alert for `name`, in a transaction of its own, fenced by
+    `ctx.epoch`."""
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         await raise_alert(
             conn,
             code=FAILED_ALERT_CODE,
@@ -84,13 +94,17 @@ async def _persist_failure(ctx: ReconcileContext, name: str, error_class: str) -
 
 async def _resolve_failure(ctx: ReconcileContext, name: str) -> None:
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         await resolve_alert(conn, code=FAILED_ALERT_CODE, subject=name)
 
 
 async def _record_alert_outcome(name: str, write: Awaitable[None]) -> None:
-    """Await the alert `write` of reconciler `name`; a failure of it is logged and does not propagate."""
+    """Await the alert `write` of reconciler `name`; a failure of it is logged and does not propagate, except
+    a `FencedOut` (a newer epoch is current), which stops the cadence."""
     try:
         await write
+    except FencedOut:
+        raise
     except Exception as exc:
         log.error("reconciler_alert_write_failed", reconciler=name, error_class=type(exc).__name__)
 
@@ -103,21 +117,31 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
     `reconciler_alert_write_failed`: the database that would hold the outcome is the one that failed, so the
     log line is the outcome left. It does not stop the reconcilers that follow, and the `-1` is still
     recorded. Neither log line carries an exception message.
+
+    A `FencedOut`, from a reconciler or its alert write, stops the cadence (module docstring): the counts so
+    far are returned, logged `reconcilers_fenced`, and no alert is written for it.
     """
     counts: dict[str, int] = {}
     for name, (cadences, fn) in list(REGISTRY.items()):
         if cadence not in cadences:
             continue
         try:
-            counts[name] = await fn(ctx)
-        except Exception as exc:
-            counts[name] = -1
-            error_class = type(exc).__name__
-            # Not the exception's message and not its traceback: either may carry content.
-            log.error("reconciler_failed", reconciler=name, error_class=error_class)
-            await _record_alert_outcome(name, _persist_failure(ctx, name, error_class))
-        else:
-            await _record_alert_outcome(name, _resolve_failure(ctx, name))
+            try:
+                counts[name] = await fn(ctx)
+            except FencedOut:
+                raise
+            except Exception as exc:
+                counts[name] = -1
+                error_class = type(exc).__name__
+                # Not the exception's message and not its traceback: either may carry content.
+                log.error("reconciler_failed", reconciler=name, error_class=error_class)
+                await _record_alert_outcome(name, _persist_failure(ctx, name, error_class))
+            else:
+                await _record_alert_outcome(name, _resolve_failure(ctx, name))
+        except FencedOut:
+            # `fence_epoch` logged both epochs; the fenced transaction wrote nothing.
+            log.warning("reconcilers_fenced", cadence=cadence, reconciler=name)
+            return counts
     return counts
 
 

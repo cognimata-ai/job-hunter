@@ -634,3 +634,20 @@ async def test_a_claim_during_a_takeover_waits_for_it_and_is_fenced(
         await asyncio.wait_for(zombie, 5)
     assert (waited, counts["operations"]) == (True, 0)
     assert (await row(engine, op))[:5] == ("pending", None, None, None, 0)
+
+
+# --- Ruling FR-h: the M0 operations reconciler is fenced by the worker epoch --------------------------------
+
+
+async def test_the_operations_reconciler_of_a_superseded_epoch_writes_nothing(engine, queue_app) -> None:
+    op, _ = await new_op(engine, defer=None)  # its job is lost: due for a re-defer after two minutes
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
+    later = utcnow() + timedelta(minutes=3)
+    stale = ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=later, epoch=1)
+    with pytest.raises(FencedOut):
+        await ops.reconcile_operations(stale)
+    async with engine.connect() as c:
+        assert not await live_job_exists(c, "run_operation", args_match={"operation_id": op})
+    current = ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=later, epoch=2)
+    assert await ops.reconcile_operations(current) == 1

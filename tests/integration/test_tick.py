@@ -296,7 +296,7 @@ async def test_scheduled_run_takes_include_paid_from_the_active_settings(engine,
 
 
 async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
-    engine, queue_app, monkeypatch
+    engine, current_epoch, queue_app, monkeypatch
 ) -> None:
     await schedule(engine, interval=21600, cursor=A)
     now = A + timedelta(hours=6)
@@ -322,7 +322,8 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     monkeypatch.setattr(reconcilers, "release_stalled_jobs", release_in_reconciler)
     monkeypatch.setattr(tasks, "release_stalled_jobs", release_in_task)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
-    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=3, embedder=None)  # the fields it reads
+    # the fields it reads; its epoch is the current one (the reconcilers and the tick are fenced by it)
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=current_epoch, embedder=None)
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.tick(context, timestamp=0)
     assert released_by == ["reconciler"]  # the `stalled_jobs` reconciler releases; the body does not
@@ -420,7 +421,7 @@ def runs_total(status: str) -> float:
 
 
 async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
-    engine, queue_app, monkeypatch
+    engine, current_epoch, queue_app, monkeypatch
 ) -> None:
     await schedule(engine, interval=3600, cursor=A)
     monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
@@ -466,3 +467,22 @@ async def test_the_tick_and_the_runs_defer_a_run_attempt_through_one_function(en
         ).one()
     run_id = rep.queued_run_id
     assert tuple(job) == ("jh:run_collect", "collect", f"run:{run_id}:1", {"run_id": run_id, "attempt_no": 1})
+
+
+async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:  # Ruling FR-h: the tick's own scheduling step is fenced by the worker epoch
+    from tests.support.logs import logged
+
+    await schedule(engine, interval=3600, cursor=A)
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
+    monkeypatch.setattr(tasks, "utcnow", lambda: A + timedelta(hours=3))  # two slots missed, one due
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1"))  # a takeover
+    stale = SimpleNamespace(engine=engine, queue=queue_app, epoch=current_epoch, embedder=None)
+    await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": stale})), timestamp=0)
+    assert await runs(engine) == [] and await stored_cursor(engine) == A
+    assert [e["current_epoch"] for e in logged(caplog, "worker_epoch_fenced")] == [current_epoch + 1]
+    current = SimpleNamespace(engine=engine, queue=queue_app, epoch=current_epoch + 1, embedder=None)
+    await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": current})), timestamp=0)
+    assert len(await runs(engine)) == 3 and await stored_cursor(engine) == A + timedelta(hours=3)

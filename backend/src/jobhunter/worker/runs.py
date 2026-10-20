@@ -551,7 +551,8 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
     A run without a reason is re-deferred once and annotated `redeferred`. A `redeferred` run that still has
     no live job `QUEUED_ORPHANED_AFTER` after it was queued ends `failed('orphaned_queue')` with the warn
     alert `run.orphaned_queue`; it is counted in `RUNS` after the commit (never timed: it never started). At
-    most `QUEUED_BATCH` runs per tick.
+    most `QUEUED_BATCH` runs per tick. Fenced by `ctx.epoch` first, before any run row is locked (Ruling
+    FR-h): a superseded worker raises `FencedOut` having written nothing, which stops its cadence.
     """
     params = {
         "cutoff": ctx.now - QUEUED_REDEFER_AFTER,
@@ -561,6 +562,7 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
     repaired = 0
     ends: list[RunEnd] = []
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         for row in (await conn.execute(_QUEUED_WITHOUT_JOB, params)).all():
             run_id, attempt_no = int(row.id), int(row.attempt_no)
             if row.status_reason is None:
@@ -600,9 +602,11 @@ async def reconcile_stale_data(ctx: ReconcileContext) -> int:
     That is the one freshness rule system health reports too (ruling T17-g): after the grace (twice the
     interval after the first settings version, §17.5), no `succeeded` or `partial` run within twice the
     interval, aged from the first settings version when none succeeded yet. Returns 1 when it raised or
-    resolved the alert, else 0.
+    resolved the alert, else 0. Fenced by `ctx.epoch` first (Ruling FR-h): a superseded worker raises
+    `FencedOut` having written nothing, which stops its cadence.
     """
     async with ctx.engine.begin() as conn:
+        await fence_epoch(conn, ctx.epoch)
         if run_age_state(ctx.now, await read_run_freshness(conn)) == "critical":
             await raise_alert(
                 conn,

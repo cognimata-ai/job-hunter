@@ -24,7 +24,7 @@
    (`stalled_jobs` releases the jobs of dead workers) and, outside the test env, the metrics server. When the
    fence refuses the epoch, a newer worker took over during this start (final review C2): the sync wrote
    nothing, so this worker's stale view of the secrets cannot undo the newer worker's sync, and the start
-   ends there (`worker_superseded_at_start`, exit 1) before any loop runs;
+   ends there (`worker_superseded_at_start`, exit 70 after the teardown, Ruling FR-i) before any loop runs;
 9. SIGTERM and SIGINT handlers that request the shutdown;
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
@@ -36,16 +36,18 @@
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
 Each of its steps runs even when an earlier one failed (logged `worker_teardown_failed`; the exit code is then
-1). The watchdog is always stopped before the lock session closes, so closing it never reads as a lost lock.
-When the watchdog thread is still alive after that stop (its join timed out inside a heartbeat on the lock
-session), the session is not closed under it: `lock_session_left_open` is logged and the process exit drops
-the socket, and with it the lock.
+1, unless it is the superseded 70). The watchdog is always stopped before the lock session closes, so closing
+it never reads as a lost lock. When the watchdog thread is still alive after that stop (its join timed out
+inside a heartbeat on the lock session), the session is not closed under it: `lock_session_left_open` is
+logged and the process exit drops the socket, and with it the lock.
 
 Exit codes: 0 after a requested shutdown; 1 when a worker loop ended by itself, when the takeover was blocked
-(`takeover_blocked`: a row lock outlived the claim's lock timeout, ruling T13-b), when a newer worker took
-over during the start (`worker_superseded_at_start`) and when the start failed (`worker_failed`), so the
-container restart tries again (and stands by while a healthy worker holds the lock). The watchdog exits 70,
-the startup assertions 78.
+(`takeover_blocked`: a row lock outlived the claim's lock timeout, ruling T13-b) and when the start failed
+(`worker_failed`), so the container restart tries again. 70 (`lock.WATCHDOG_EXIT_CODE`) means superseded: the
+watchdog's exit, and a worker that a newer one took over during its start (`worker_superseded_at_start`,
+Ruling FR-i): the newer worker's claim needed the singleton lock, so this one had lost it, the watchdog's
+condition, and one code holds whichever of the two sees it first; the restart stands by while the newer
+worker is healthy. The startup assertions exit 78.
 
 A loop that ends by itself can be the first sign that this process lost the singleton lock: a zombie (frozen
 while a replacement took over, §18.2 C17) finds its procrastinate workers pruned by the replacement, so its
@@ -258,9 +260,10 @@ class _WorkerProcess:
                 await sync_instances(conn, cfg, guard=fenced)
         except FencedOut:
             # A newer worker owns the work (`fence_epoch` logged both epochs) and the sync wrote nothing. No
-            # loop has started; the teardown follows, and the restart stands by while that worker is healthy.
-            log.error("worker_superseded_at_start", epoch=epoch)
-            return 1
+            # loop has started; the teardown follows (it closes what the start built), then the watchdog's
+            # superseded exit (Ruling FR-i). The restart stands by while that worker is healthy.
+            log.critical("worker_superseded_at_start", epoch=epoch, exit_code=WATCHDOG_EXIT_CODE)
+            return WATCHDOG_EXIT_CODE
         start = ReconcileContext(
             engine=engine, queue=queue, defer=defer_in_tx, now=utcnow(), epoch=epoch, embedder=embedder
         )
@@ -378,7 +381,7 @@ async def worker_main(cfg: AppConfig) -> int:
         code = 1
     finally:
         clean = await process.teardown()
-    if not clean:
+    if not clean and code != WATCHDOG_EXIT_CODE:  # superseded stays 70 (Ruling FR-i)
         code = 1
     log.info("worker_shutdown_complete", exit_code=code)
     return code
