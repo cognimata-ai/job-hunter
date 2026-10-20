@@ -199,6 +199,10 @@ def test_the_scan_leaves_ids_uuids_and_timestamps_alone(value: str) -> None:
         "Kontakt: Max Mustermann\nAcme AG",
         "Kontakt: Max Mustermann<br>Acme GmbH is hiring",
         "Our CEO Jane Doe. Acme Inc. grew fast",
+        # final wave F5 (F1 re-review 3, Minor 1): an `&` before anything but a legal form ends the name
+        "founded by Max Mustermann & Acme GmbH",
+        "Kontakt: Max Mustermann & Acme GmbH",
+        "Kontakt: Max Mustermann &amp; Acme GmbH",
     ],
 )
 def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:
@@ -232,6 +236,11 @@ def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:
         "CTO Platform Engineering",
         "Kontakt Formular Seite",
         "Contact Customer Service",
+        # final wave F5: a company joined by `&`, and an `&` right before a legal form, stay companies
+        "founded by Müller & Schmidt GmbH",
+        "Kontakt: Müller & Schmidt GmbH",
+        "founded by Beispiel Muster & Co. KG",
+        "Kontakt: Beispiel Muster &amp; Co. KG",
     ],
 )
 def test_the_scan_passes_placeholders_companies_and_role_compounds(text: str) -> None:

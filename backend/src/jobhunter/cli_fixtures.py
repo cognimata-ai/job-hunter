@@ -423,28 +423,36 @@ def _legal(word: str) -> bool:
     return word.strip(",;:()[]").rstrip(".") in LEGAL_FORMS
 
 
+_JOINERS: Final = ("&", "&amp;")
+
+
 def _is_company(text: str, start: int, end: int) -> bool:
     """Whether the name found at `text[start:end]` names a company (fix round 3: only within its own clause).
 
     A legal form (`LEGAL_FORMS`; `e. V.` as two words too) counts when it is a word of the name or follows it
-    directly on the same line: up to three more capitalised words (or `&`), each after one to three spaces or
-    tabs. A full stop, `!`, `?`, comma, colon, semicolon or closing bracket after a word ends the clause,
-    unless the word is a legal form (`Inc.`, `Co.`) or an initial; so does a line break, a tag, an entity, `|`
-    or a quote. Where it is unsure, it scrubs (ruling FR-m): "Gegründet von Max Mustermann. Acme GmbH …" and
-    "Kontakt: Max Mustermann<br>Acme GmbH" stay persons."""
+    directly on the same line: up to three more capitalised words, each after one to three spaces or tabs, or
+    `&` (`&amp;`) when a legal form follows it directly (`Muster & Co. KG`). A full stop, `!`, `?`, comma,
+    colon, semicolon or closing bracket after a word ends the clause, unless the word is a legal form (`Inc.`,
+    `Co.`), an initial or that `&amp;`; so does a line break, a tag, an entity, `|` or a quote. Where it is
+    unsure, it scrubs (ruling FR-m): "Gegründet von Max Mustermann. Acme GmbH …", "Kontakt: Max
+    Mustermann<br>Acme GmbH" and "founded by Max Mustermann & Acme GmbH" (an `&` before another word ends the
+    name's span: a person and a company joined) stay persons."""
     if (rest := _WORD_REST.match(text, end)) is not None:  # it always matches, possibly empty
         end = rest.end()
     words = text[start:end].split()  # a bounded slice: the name and the rest of its last word
     pos = end
     for _ in range(3):
         last = words[-1] if words else ""
-        if last[-1:] in ".!?,;:)" and not (_legal(last) or _INITIAL.fullmatch(last) or last == "e."):
+        closed = last[-1:] in ".!?,;:)" and last not in _JOINERS
+        if closed and not (_legal(last) or _INITIAL.fullmatch(last) or last == "e."):
             break
         found = _CLAUSE_WORD.match(text, pos)
         if found is None:
             break
         word = found.group(1)
-        joiner = word in ("&", "&amp;")
+        joiner = word in _JOINERS
+        if joiner and not ((after := _CLAUSE_WORD.match(text, found.end())) and _legal(after.group(1))):
+            break  # final wave F5: `&` before anything but a legal form ends the name's span (ruling FR-m)
         if ("&" in word and not joiner) or not (word[:1].isupper() or joiner or _legal(word) or word == "e."):
             break
         words.append(word)

@@ -569,6 +569,12 @@ def test_a_person_introduced_by_a_verb_or_an_interview_is_pseudonymised(text: st
         "Kontakt: Muster Software GmbH",  # the contact window too
         "erstellt von Muster Software AG",
         "founded by Google veterans",  # one capitalised word only
+        # final wave F5: a company joined by `&`, and an `&` right before a legal form
+        "founded by Müller & Schmidt GmbH",
+        "Kontakt: Müller & Schmidt GmbH",
+        "founded by Beispiel Muster & Co. KG",
+        "Kontakt: Beispiel Muster &amp; Co. KG",
+        "Kontakt: Beispiel Muster GmbH & Co. KG",
         "Interview mit dem Fachbereich",
         # F1 review, Minor 1: job titles after a role or contact word, and the echo they would spread
         "Geschäftsführer Vertrieb und Marketing (m/w/d)",
@@ -670,6 +676,10 @@ def test_the_name_rules_stay_linear(padding: str) -> None:
         ("Gründer Max Mustermann&nbsp;Acme GmbH", "Gründer [person:1]&nbsp;Acme GmbH"),
         ("Founded by Max Mustermann.Acme GmbH", "Founded by [person:1].Acme GmbH"),
         ("Kontakt: Max Mustermann | Acme GmbH", "Kontakt: [person:1] | Acme GmbH"),
+        # final wave F5 (F1 re-review 3, Minor 1): `&` continues the name only into a legal form
+        ("founded by Max Mustermann & Acme GmbH", "founded by [person:1] & Acme GmbH"),
+        ("Kontakt: Max Mustermann & Acme GmbH", "Kontakt: [person:1] & Acme GmbH"),
+        ("Kontakt: Max Mustermann &amp; Acme GmbH", "Kontakt: [person:1] &amp; Acme GmbH"),
     ],
 )
 def test_a_company_in_the_next_sentence_line_or_tag_hides_no_name(text: str, scrubbed: str) -> None:
