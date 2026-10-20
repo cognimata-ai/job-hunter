@@ -7,8 +7,9 @@ before the attempt and counted until positive evidence says it was not charged.
 (`observe_account`), the bucket accrued, `decide` with the hard caps of §6.5 (`serpapi_hour_ok`,
 `adzuna_windows_ok`), and then either the `reserved` row and the saved window, or (a denial) the saved accrual
 and nothing else. Global lock order: owner row -> `quota_windows` row -> ledger rows -> other domain rows.
-`record_account` applies a SerpApi account read made outside a reservation (the read after a traversal's
-last search) with the same code under the same lock.
+`record_account` applies a SerpApi account read made outside a reservation (the fallback projection's read in
+`plan_fallback`, and the read after a traversal's last search) with the same code under the same lock, so
+the foreign-usage and renewal alerts see the reads of a month without a SerpApi search.
 
 **The dispatch marker** (`mark_dispatched`) commits `reserved -> dispatched` immediately before the send,
 under the owner's `FOR SHARE` again; a lost predicate or a row that is no longer `reserved` is `FencedOut`,
@@ -605,9 +606,10 @@ async def _account_window(
 async def record_account(
     conn: AsyncConnection, obs: AccountObservation, *, settings: RunSettings, now: datetime
 ) -> None:
-    """Persist a SerpApi account read made outside a reservation (the read after the last search of a
-    traversal, §5.3.2) in the caller's transaction: the window lock, the observation and the foreign-usage
-    detection, exactly as `reserve` applies the read it is given."""
+    """Persist a SerpApi account read made outside a reservation (the fallback projection's read, and the read
+    after the last search of a traversal, §5.3.2) in the caller's transaction, after its owner row: the window
+    lock, the observation, the foreign-usage detection and the renewal check (T7-b), exactly as `reserve`
+    applies the read it is given."""
     await _account_window(conn, obs, settings=settings.quota, interval_s=settings.interval_s, now=now)
 
 

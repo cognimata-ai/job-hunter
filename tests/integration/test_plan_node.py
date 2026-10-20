@@ -1,8 +1,9 @@
 import asyncio
 import time
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
@@ -19,20 +20,23 @@ from jobhunter.graphs.collect.state import CollectUpdate, FetchCellInput, initia
 from jobhunter.quota import ledger
 from jobhunter.quota.fallback import cell_outcome
 from jobhunter.quota.planner import PlanReport, ensure_cells, plan_fallback, plan_run
+from jobhunter.quota.windows import current_snapshot, current_window_locked
 from jobhunter.run_settings import load_run_settings
 from jobhunter.sources.base import RawPage, RequestSpec, SourceAdapter, SourceError, request_key
 from jobhunter.sources.breaker import HALF_OPEN_AFTER, record_failure
 from jobhunter.sources.coverage import JSearchContinuation
+from jobhunter.sources.fixtures import ACCOUNT_RENEWAL_AHEAD
 from jobhunter.sources.instances import InstanceRow, list_instances
 from jobhunter.sources.jsearch import CURSOR_REUSE_TTL
 from jobhunter.sources.ratelimit import SOURCE_LIMITS, RateLimiter
 from jobhunter.sources.receipts import insert_fetch_request, store_response
-from jobhunter.sources.serpapi import SerpApiAdapter
+from jobhunter.sources.serpapi import ACCOUNT_URL, SerpApiAdapter
 from jobhunter.worker import runs
 from jobhunter.worker.runs import finalize_run
 
 from tests.support.collect import TEST_QUERY, instance_id, queued_run, request_sent, seed_inputs
-from tests.support.quota import SETTINGS, SIX_H, account, insert_window, jsearch_window
+from tests.support.quota import SETTINGS, SIX_H, account, insert_window, jsearch_window, seeded_run_settings
+from tests.support.sources import serpapi_account_response
 
 pytestmark = pytest.mark.integration
 ROWS = sa.text(
@@ -799,6 +803,87 @@ async def test_plan_fallback_reads_its_inputs_from_the_run_row(engine, current_e
         "fallback_fetch_request_ids": [],
         "steps": ["plan_fallback"],
     }  # a free run reads no account
+
+
+# The SerpApi renewal gap of Rulings T7-a and T7-b: the plan renews on Nov 8 (the local rollover at 00:00
+# UTC), and a lagging account still reports that date afterwards.
+RENEWAL = datetime(2026, 11, 8, tzinfo=UTC)
+NEXT_RENEWAL = datetime(2026, 12, 8, tzinfo=UTC)
+OPEN_ALERT = sa.text("SELECT severity FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL")
+
+
+async def open_alert(engine, dedup_key: str) -> str | None:
+    async with engine.connect() as c:
+        severity = (await c.execute(OPEN_ALERT, {"k": dedup_key})).scalar()
+    return None if severity is None else str(severity)
+
+
+async def plan_fallback_once(engine, deps: CollectDeps) -> None:
+    """`plan_fallback` of a new paid run, which is then ended."""
+    owner = await queued_run(engine)
+    await make_plan_fallback(deps)(initial_state(owner.run_id, owner.attempt_no))
+    await finish(engine, owner)
+
+
+async def test_the_fallback_account_read_is_persisted_so_the_renewal_stale_alert_opens_and_resolves(
+    engine, current_epoch, respx_mock
+) -> None:
+    """Ruling T7-b (final review F3, Important C): while JSearch serves, `plan_fallback`'s free account read
+    is the only SerpApi read; it is persisted (`ledger.record_account`), so a lagging renewal 49 h after the
+    rollover raises `quota.serpapi_renewal_stale`, and the read that shows the renewal resolves it."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "serpapi"))
+    before = RENEWAL - timedelta(days=12)
+    async with engine.begin() as c:  # October's window, from a read 12 days before the renewal
+        await current_window_locked(
+            c, "serpapi", before, SETTINGS, interval_s=SIX_H, account=account(before, RENEWAL, left=240)
+        )
+        serpapi = await instance_id(c, "serpapi")
+    clock = [RENEWAL + 49 * H]
+    reads = respx_mock.get(ACCOUNT_URL)
+    stale_key = "quota.serpapi_renewal_stale:provider:serpapi"
+    async with httpx.AsyncClient() as client:
+        adapter = SerpApiAdapter(client, api_key=b"fake", instance_id=serpapi, clock=lambda: clock[0])
+        deps = replace(collect_deps(engine, lambda instance: adapter), clock=lambda: clock[0])
+        reads.mock(return_value=serpapi_account_response(plan_renewal_date="2026-11-08"))
+        await plan_fallback_once(engine, deps)  # the lagging read, 49 h after the rollover
+        assert await open_alert(engine, stale_key) == "warn"
+        async with engine.connect() as c:
+            stored = await current_snapshot(c, "serpapi")
+        assert stored is not None and (stored.window_start, stored.state) == (
+            RENEWAL,
+            "extrapolated_unvalidated",
+        )
+        assert stored.last_observed_at == RENEWAL + 49 * H
+        clock[0] = RENEWAL + 50 * H
+        reads.mock(
+            return_value=serpapi_account_response(plan_renewal_date="2026-12-08", plan_searches_left=250)
+        )
+        await plan_fallback_once(engine, deps)  # the renewal shows: the window is validated
+    assert await open_alert(engine, stale_key) is None
+    async with engine.connect() as c:
+        validated = await current_snapshot(c, "serpapi")
+    assert validated is not None and (validated.window_end, validated.state) == (NEXT_RENEWAL, "validated")
+    assert reads.call_count == 2
+
+
+async def test_the_fallback_account_read_resolves_the_foreign_usage_alert_after_conservative_mode(
+    engine, current_epoch, serpapi_fixture_adapter: SerpApiAdapter
+) -> None:
+    """Final review F3, Minor 3: `quota.serpapi_foreign_usage` resolves on a read without foreign usage once
+    the conservative mode has ended; `plan_fallback`'s persisted read is such a read, so the alert does not
+    stay open while JSearch serves every cell."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "serpapi"))
+    detected = utcnow() - 25 * H
+    # the renewal the fixture's account read reports
+    renewal = datetime.combine(utcnow().date() + ACCOUNT_RENEWAL_AHEAD, datetime.min.time(), UTC)
+    async with engine.begin() as c:  # five searches this hour that the app did not make: conservative mode
+        await ledger.record_account(
+            c, account(detected, renewal, this_hour=5), settings=seeded_run_settings(), now=detected
+        )
+    foreign_key = "quota.serpapi_foreign_usage:provider:serpapi"
+    assert await open_alert(engine, foreign_key) == "warn"
+    await plan_fallback_once(engine, collect_deps(engine, lambda instance: serpapi_fixture_adapter))
+    assert await open_alert(engine, foreign_key) is None  # 25 h later, a read with no search this hour
 
 
 def failing_fetch_cell(engine, source_id: str, error: Exception):

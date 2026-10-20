@@ -6,8 +6,16 @@ run row and, in a run that includes paid sources, makes the free SerpApi account
 account again before every search). A read that expires or fails is no read: the projection then fails
 closed by its own rules (`window_cap` without an account window). A read that fails as `auth` (a missing key,
 refused locally, or a 401/403) is counted by the instance's breaker as well, which opens `auth_failed` with
-`source.auth_failed` at once (Ruling FR-l: a missing credential is visible). Then `planner.plan_fallback` in
-one transaction. `route` sends the graph to `fetch_fallback` when it planned specs, else to `parse_normalize`.
+`source.auth_failed` at once (Ruling FR-l: a missing credential is visible).
+
+A read is an observation of the SerpApi window (§5.3.2: "read immediately before every SerpApi search"), and
+while JSearch serves every cell it is the only SerpApi read there is: it is persisted under the run's owner
+row in a transaction of its own (`ledger.record_account`: the window lock, the stale-renewal rule of T7-a,
+the foreign-usage detection and the T7-b renewal check), exactly as the acquisition applies its read before a
+search, so `quota.serpapi_renewal_stale` opens in a month that the lagging renewal locks out and
+`quota.serpapi_foreign_usage` resolves without a search (final review F3). The source instances are then
+read again, so the planner sees a breaker the failed read opened. Then `planner.plan_fallback` in one
+transaction. `route` sends the graph to `fetch_fallback` when it planned specs, else to `parse_normalize`.
 """
 
 import asyncio
@@ -21,7 +29,7 @@ from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate
 from jobhunter.observability.logging import get_logger
-from jobhunter.quota import planner
+from jobhunter.quota import ledger, planner
 from jobhunter.quota.windows import AccountObservation
 from jobhunter.run_settings import RunSettings, load_run_settings
 from jobhunter.sources.acquire import AccountAdapter, failure_kind, record_account_auth_failure
@@ -82,11 +90,15 @@ def make_plan_fallback(deps: CollectDeps) -> Node:
                 deps.engine, owner, instance_id, billing="paid", now=deps.clock()
             )
 
-        account = (
-            await serpapi_account(deps.adapters, settings, instances, on_auth_failure=auth_failed)
-            if run.include_paid
-            else None
-        )
+        account: AccountObservation | None = None
+        if run.include_paid:
+            account = await serpapi_account(deps.adapters, settings, instances, on_auth_failure=auth_failed)
+            if account is not None:  # an observation of the window, persisted (Ruling T7-b)
+                async with deps.engine.begin() as conn:
+                    await ledger.lock_run_owner(conn, owner)
+                    await ledger.record_account(conn, account, settings=settings, now=deps.clock())
+            async with deps.engine.connect() as conn:  # after the read: a breaker it opened is seen
+                instances = await list_instances(conn)
         async with deps.engine.begin() as conn:
             ids = await planner.plan_fallback(
                 conn, owner=owner, settings=settings, instances=instances, now=deps.clock(), account=account

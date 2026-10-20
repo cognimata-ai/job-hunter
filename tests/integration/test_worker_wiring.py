@@ -273,4 +273,15 @@ async def test_a_serpapi_instance_left_ok_without_its_key_is_visible_as_auth_fai
         status = (
             await c.execute(sa.text("SELECT status FROM runs WHERE id = :i"), {"i": run_id})
         ).scalar_one()
+        fallback = (
+            await c.execute(
+                sa.text(
+                    "SELECT status, skip_reason FROM fetch_requests WHERE run_id = :r AND phase = 'fallback'"
+                ),
+                {"r": run_id},
+            )
+        ).all()
     assert status in FINAL_STATUSES and status not in ("failed", "failed_invariant")
+    # final review F3: the planner reads the instance after the failed read, so it plans no fallback spec
+    # on the breaker that read opened (it skips each `breaker_open` itself)
+    assert [tuple(row) for row in fallback] == [("skipped", "breaker_open")]

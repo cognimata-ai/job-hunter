@@ -94,7 +94,15 @@ async def test_two_runs_on_fixtures_through_the_real_graph(
     # JSearch: page 1 (the probe) plus page 2 (10 new ids ≥ 7); Adzuna: page 1 then the empty page 2. The
     # two JSearch adjustments (state NULL) are §6.3 step 3's tighten-only reconciliation: the recordings'
     # remaining counts (198 after page 1, 196 after page 2) show one more used unit than the ledger each time.
-    assert ledger == {"jsearch:billed": 2, "adzuna:billed": 2, "jsearch:adjustment": 2}
+    # The SerpApi adjustment is the same reconciliation of plan_fallback's account read, which is persisted
+    # (final review F3, Ruling T7-b): the recorded account has 248 of its 250 searches left, 2 the ledger
+    # never counted.
+    assert ledger == {
+        "jsearch:billed": 2,
+        "adzuna:billed": 2,
+        "jsearch:adjustment": 2,
+        "serpapi:adjustment": 1,
+    }
     assert [s.status for s in snapshots] == ["complete", "complete"] and all(
         s.member_count > 0 for s in snapshots
     )

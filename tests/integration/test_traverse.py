@@ -54,7 +54,13 @@ from tests.support.collect import (
 )
 from tests.support.faults import PausePoint
 from tests.support.quota import SIX_H, insert_window, jsearch_window
-from tests.support.sources import Adapters, fixture_variant, load_fixture, served_requests
+from tests.support.sources import (
+    Adapters,
+    fixture_variant,
+    load_fixture,
+    serpapi_account_response,
+    served_requests,
+)
 
 pytestmark = pytest.mark.integration
 GAPS = sa.text(
@@ -835,6 +841,7 @@ FIRST_REQUEST = sa.text(
     "AND cell_id = :c ORDER BY id LIMIT 1"
 )
 CONTINUATION = sa.text("SELECT continuation FROM coverage_cells WHERE id = :c")
+OPEN_ALERT = sa.text("SELECT severity FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL")
 REFILL = sa.text("UPDATE quota_windows SET tokens = capacity WHERE provider = 'jsearch' AND is_current")
 
 
@@ -926,3 +933,34 @@ async def test_no_continuation_leads_past_page_two(engine, current_epoch, adapte
     second = await queued_run(engine)
     await plan_ids(deps, second)
     assert await first_request(engine, second, cell) == (1, "planned", None)
+
+
+async def test_an_auth_failure_of_the_account_read_after_the_last_search_opens_the_breaker(
+    engine, current_epoch, respx_mock: respx.MockRouter, serpapi_fixture_adapter: SerpApiAdapter
+) -> None:
+    """Final review F3 (F2 re-review, out-of-scope observation 1): the account read after a traversal's last
+    search that fails as `auth` (a 401: the key was revoked mid-run) is counted by the breaker, which opens
+    `auth_failed` with `source.auth_failed` at once, as the read before a search does (Ruling FR-l); the
+    traversal's own result stands."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "serpapi"))
+    async with engine.begin() as c:  # JSearch is closed: its cell falls back to SerpApi
+        await record_failure(c, await instance_id(c, "jsearch"), "auth", billing="paid", now=utcnow())
+        serpapi = await instance_id(c, "serpapi")
+    revoked = httpx.Response(401, json={"error": "Invalid API key."})
+    # plan_fallback's read, the read before each of the two searches, then the read after the last one
+    respx_mock["serpapi_account"].side_effect = [*(serpapi_account_response() for _ in range(3)), revoked]
+    owner = await queued_run(engine)
+    deps = make_deps(engine, lambda instance: serpapi_fixture_adapter)
+    state = initial_state(owner.run_id, owner.attempt_no)
+    await make_plan(deps)(state)
+    (fallback,) = (await make_plan_fallback(deps)(state))["fallback_fetch_request_ids"]
+    result = await traverse_and_record(deps, fallback)
+    assert (result.end, result.reason, result.pages) == ("cursor", "page_cap", 2)
+    assert respx_mock["serpapi_account"].call_count == 4
+    async with engine.connect() as c:
+        health = await c.execute(
+            sa.text("SELECT health, last_error_code FROM source_instances WHERE id = :i"), {"i": serpapi}
+        )
+        assert tuple(health.one()) == ("auth_failed", "auth")
+        alert = await c.execute(OPEN_ALERT, {"k": f"source.auth_failed:instance:{serpapi}"})
+        assert alert.scalar_one() == "critical"

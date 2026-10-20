@@ -35,7 +35,9 @@ Every traversal: an instance whose breaker is `half_open` gets one page (its pro
 between two pages ends it `skipped('shutdown')` (inside a page `acquire_page` makes the receipt itself); a
 page that is `Failed`, `Ambiguous` or `Denied` ends it `failed`, `ambiguous` or `skipped`. After the last
 search of a SerpApi traversal that sent one, the free account read is made once more and persisted with
-`ledger.record_account` (§5.3.2); a failed read is logged and changes nothing. The sends go through the
+`ledger.record_account` (§5.3.2); a read that fails as `auth` (a key revoked mid-run: a 401/403) is counted
+by the instance's breaker, which opens `auth_failed` with `source.auth_failed` at once, as the read before a
+search does (Ruling FR-l); any other failed read is logged and changes nothing. The sends go through the
 process's `RateLimiter`: the source's own key, `ats-host:<host>` for a board's list pages and
 `smartrecruiters-detail` for the detail calls. `traverse_cell` never raises `SourceError`.
 """
@@ -63,6 +65,8 @@ from jobhunter.sources.acquire import (
     PageResult,
     Served,
     acquire_page,
+    failure_kind,
+    record_account_auth_failure,
 )
 from jobhunter.sources.arbeitnow import (
     ArbeitnowAdapter,
@@ -267,7 +271,7 @@ async def traverse_cell(
         return await _board(t, adapter, first, first_fetch_request_id)
     result = await _search(t, first, first_fetch_request_id)
     if isinstance(adapter, AccountAdapter) and t.sent:
-        await _account_after(ctx, adapter)
+        await _account_after(ctx, adapter, plan.instance_id)
     return result
 
 
@@ -305,12 +309,17 @@ async def _search(t: _Traversal, first: RequestSpec, first_id: int | None) -> Tr
         spec, planned_id = nxt, None
 
 
-async def _account_after(ctx: AcquireContext, adapter: AccountAdapter) -> None:
-    """The account read after the traversal's last search (§5.3.2), persisted under the owner lock."""
+async def _account_after(ctx: AcquireContext, adapter: AccountAdapter, instance_id: int) -> None:
+    """The account read after the traversal's last search (§5.3.2), persisted under the owner lock; one that
+    fails as `auth` is the breaker's `auth` failure (Ruling FR-l)."""
     try:
         observation = await adapter.account()
-    except SourceError as err:  # the read is information only: nothing depends on it
+    except SourceError as err:  # the read is information only: nothing else depends on it
         log.warning("account_read_failed", error_kind=err.kind, error_code=err.code, after_search=True)
+        if failure_kind(err) == "auth":  # a revoked key: visible at once, never a silent read
+            await record_account_auth_failure(
+                ctx.engine, ctx.owner, instance_id, billing=ctx.billing, now=ctx.clock()
+            )
         return
     async with ctx.engine.begin() as conn:
         await ledger.lock_run_owner(conn, ctx.owner)
