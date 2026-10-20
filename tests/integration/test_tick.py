@@ -397,6 +397,26 @@ async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconciler
     assert runtime.shutdown.requested.is_set()  # the superseded worker stops itself (Ruling T24-a)
 
 
+async def test_a_fence_of_another_owner_fails_the_tick_and_never_stops_the_worker(
+    engine, current_epoch, queue_app, monkeypatch
+) -> None:  # F5 review, Minor 1: only the worker's own fence is proof of a takeover
+    from jobhunter.errors import FencedOut
+
+    async def fenced_tick(conn, *, now: datetime, defer) -> None:
+        raise FencedOut(owner="run")
+
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
+    monkeypatch.setattr(tick_module, "run_tick", fenced_tick)
+    runtime = SimpleNamespace(
+        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState()
+    )
+    with pytest.raises(FencedOut):
+        await tasks.tick(
+            cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime})), timestamp=0
+        )
+    assert not runtime.shutdown.requested.is_set()
+
+
 async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
     engine, current_epoch, queue_app, monkeypatch, caplog
 ) -> None:  # ledger L312: the daily cadence is isolated from the pass; the job still fails after it

@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import math
 from datetime import datetime, timedelta
 
@@ -252,12 +253,19 @@ async def test_superseded_owner_batch_is_fenced_after_the_http_call(
         await finish(engine, taker)  # the reconciler yields to a running run (T22-a)
 
         # the reconciler entry point is fenced by the worker epoch: a superseded epoch writes nothing, and its
-        # first transaction refuses it before any embed request
-        assert (
-            await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow() + LATER, 2, embedder=client))
-            == 0
-        )
+        # first transaction refuses it before any embed request; the fence propagates (Ruling FR-r) ...
+        superseded = ctx(engine, queue_app, utcnow() + LATER, 2, embedder=client)
+        with pytest.raises(FencedOut) as fenced:
+            await reconcile_awaiting_embedding(superseded)
+        assert fenced.value.worker_superseded
         assert await statuses(engine) == {"awaiting_embedding": 3} and await embeddings_rows(engine) == 0
+        assert fake_embedder.batches == [3]
+        # ... so its cadence stops there and the superseded worker requests its stop, as for every reconciler
+        stops: list[str] = []
+        monkeypatch.setattr(reconcilers, "REGISTRY", {})
+        reconcilers.reconciler("awaiting_embedding", "heavy")(reconcile_awaiting_embedding)
+        cadence = dataclasses.replace(superseded, on_superseded=lambda: stops.append("stop"))
+        assert await reconcilers.run_reconcilers(cadence, "heavy") == {} and stops == ["stop"]
         assert fake_embedder.batches == [3]
         # the current epoch passes fence_epoch and embeds them
         n = await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow() + LATER, embedder=client))

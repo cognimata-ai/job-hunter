@@ -9,10 +9,13 @@ the reconciler succeeds again, the alert is resolved.
 
 **The epoch fence** (final review F2, Ruling FR-h). Reconcilers are worker-owned maintenance: each fences its
 own writes with `ctx.epoch` (`epoch.fence_epoch`), and so do the alert writes here (the first statement of
-their transaction; no job row is locked). A `FencedOut`, from a reconciler or from an alert write, is no
-failure: this worker is superseded, so the cadence stops there (logged `reconcilers_fenced` with the cadence
-and the reconciler), a superseded worker never raises or resolves `reconciler.failed`, and it requests its
-own graceful stop (`ReconcileContext.on_superseded`, Ruling T24-a), as a fenced task body does.
+their transaction; no job row is locked). A `FencedOut` of that fence (`FencedOut.worker_superseded`), from a
+reconciler or from an alert write, is no failure: this worker is superseded, so the cadence stops there
+(logged `reconcilers_fenced` with the cadence and the reconciler), a superseded worker never raises or
+resolves `reconciler.failed`, and it requests its own graceful stop (`ReconcileContext.on_superseded`, Ruling
+T24-a), as a fenced task body does. A `FencedOut` of another owner (a run, a purge fence) that a reconciler
+lets escape is a failure of that reconciler, recorded like any other; it never stops the worker (F5 review,
+Minor 1).
 
 This module is a task boundary (ruff `BLE001` is allowed here), and the catch persists an outcome (§17.1).
 
@@ -123,9 +126,10 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
     log line is the outcome left. It does not stop the reconcilers that follow, and the `-1` is still
     recorded. Neither log line carries an exception message.
 
-    A `FencedOut`, from a reconciler or its alert write, stops the cadence (module docstring): the counts so
-    far are returned, logged `reconcilers_fenced`, and no alert is written for it; `ctx.on_superseded()`
-    then asks this superseded worker for its graceful stop.
+    A `FencedOut` of the worker's own fence (`FencedOut.worker_superseded`), from a reconciler or its alert
+    write, stops the cadence (module docstring): the counts so far are returned, logged `reconcilers_fenced`,
+    and no alert is written for it; `ctx.on_superseded()` then asks this superseded worker for its graceful
+    stop. A `FencedOut` of another owner that a reconciler lets escape is a failure like any other.
     """
     counts: dict[str, int] = {}
     for name, (cadences, fn) in list(REGISTRY.items()):
@@ -134,9 +138,11 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
         try:
             try:
                 counts[name] = await fn(ctx)
-            except FencedOut:
-                raise
             except Exception as exc:
+                if isinstance(exc, FencedOut) and exc.worker_superseded:
+                    raise
+                # Any other `FencedOut` (a run's, a purge fence's) is one piece of work lost: a failure of
+                # this reconciler, never a reason to stop the worker (F5 review, Minor 1).
                 counts[name] = -1
                 error_class = type(exc).__name__
                 # Not the exception's message and not its traceback: either may carry content.
@@ -144,10 +150,11 @@ async def run_reconcilers(ctx: ReconcileContext, cadence: Cadence) -> dict[str, 
                 await _record_alert_outcome(name, _persist_failure(ctx, name, error_class))
             else:
                 await _record_alert_outcome(name, _resolve_failure(ctx, name))
-        except FencedOut:
-            # `fence_epoch` logged both epochs; the fenced transaction wrote nothing.
+        except FencedOut as exc:
+            # `fence_epoch` logged both epochs; the fenced transaction wrote nothing. Only the worker's own
+            # fence gets here (the alert writes are fenced by the epoch alone).
             log.warning("reconcilers_fenced", cadence=cadence, reconciler=name)
-            if ctx.on_superseded is not None:
+            if exc.worker_superseded and ctx.on_superseded is not None:
                 ctx.on_superseded()
             return counts
     return counts

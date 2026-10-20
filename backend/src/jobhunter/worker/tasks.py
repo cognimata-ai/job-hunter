@@ -11,9 +11,10 @@ The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12)
 worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running,
 ledger L312). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
 `context.additional_context["runtime"]`. The tick's own scheduling step (`run_tick`) is fenced by the worker
-epoch too (Ruling FR-h): a superseded worker's tick writes nothing. Whatever a fence refuses, a delivery, the
-tick's step, a cadence or the retention pass, the body then requests this worker's graceful stop
-(`_stop_when_superseded`, Ruling T24-a): the refusal proves it superseded.
+epoch too (Ruling FR-h): a superseded worker's tick writes nothing. Whatever the worker's own fence refuses
+(`FencedOut.worker_superseded`), a delivery, the tick's step, a cadence or the retention pass, the body then
+requests this worker's graceful stop (`_stop_when_superseded`, Ruling T24-a): the refusal proves it
+superseded. A fence of any other owner is a failure of that body, never a reason to stop.
 
 `tick`, `reconcile_heavy` and `retention_daily` share the `tick` queue, served with concurrency 1
 (`QUEUES`): a long heavy cadence or daily pass delays the minute's tick until it ends (ledger L312). A slot
@@ -136,7 +137,9 @@ async def tick(context: JobContext, timestamp: int) -> None:
             # The `worker_heartbeat` row first, before `active_config` (Ruling FR-h; no job row is locked).
             await fence_epoch(conn, rt.epoch)
             report = await run_tick(conn, now=utcnow(), defer=defer_in_tx)
-    except FencedOut:
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the tick, never a reason to stop (F5 Minor 1)
         # A newer worker owns the schedule (`fence_epoch` logged it): this tick wrote nothing, and this
         # superseded worker stops (Ruling T24-a).
         _stop_when_superseded(rt)()
@@ -169,11 +172,16 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
     failure: Exception | None = None
     try:
         await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow(), epoch=rt.epoch)
-    except FencedOut:
-        # A newer worker owns the work (final review C2; `retention_fenced` logged it): the fenced pass wrote
-        # nothing, no daily reconciler runs for this superseded worker either, and it stops (Ruling T24-a).
-        _stop_when_superseded(rt)()
-        return
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:  # not this worker's own fence: a failure of the pass (F5 Minor 1)
+            log.error("retention_daily_failed", error_class=type(fenced).__name__, owner=fenced.owner)
+            failure = fenced
+        else:
+            # A newer worker owns the work (final review C2; `retention_fenced` logged it): the fenced pass
+            # wrote nothing, no daily reconciler runs for this superseded worker either, and it stops (Ruling
+            # T24-a).
+            _stop_when_superseded(rt)()
+            return
     except Exception as exc:
         # The pass isolates its rules itself; whatever still escapes it must not cost the daily reconcilers
         # their run (ledger L312). The class only, never the message; the job still fails after them.

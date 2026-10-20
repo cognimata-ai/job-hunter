@@ -72,7 +72,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
-from jobhunter.errors import DomainError, FencedOut
+from jobhunter.errors import DomainError
 from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
@@ -460,9 +460,11 @@ async def raise_unavailable(conn: AsyncConnection, *, kind: EmbedderErrorKind, r
 async def reconcile_awaiting_embedding(ctx: ReconcileContext) -> int:
     """§17.4 `awaiting_embedding` (see the module docstring); how many revisions it embedded.
 
-    0, having asked the embedder for no vector: without a client (`ctx.embedder`), while a run is `running`,
-    while the embedder is not healthy (each logged `awaiting_embedding_skipped`), and when `ctx.epoch` is no
-    longer the current worker epoch (`fence_epoch` logged it; the fenced transaction wrote nothing).
+    0, having asked the embedder for no vector: without a client (`ctx.embedder`), while a run is `running`
+    and while the embedder is not healthy (each logged `awaiting_embedding_skipped`). Raises `FencedOut` when
+    `ctx.epoch` is no longer the current worker epoch (`fence_epoch` logged it; the fenced transaction wrote
+    nothing), so that `run_reconcilers` stops the cadence and the superseded worker stops, as for every
+    other reconciler (Ruling FR-r).
     """
     client = ctx.embedder
     if client is None:
@@ -472,32 +474,27 @@ async def reconcile_awaiting_embedding(ctx: ReconcileContext) -> int:
     async def fenced(conn: AsyncConnection) -> None:
         await fence_epoch(conn, ctx.epoch)
 
-    try:
-        async with ctx.engine.begin() as conn:
-            await fenced(conn)
-            running = bool((await conn.execute(_RUN_RUNNING)).scalar_one())
-        if running:
-            # The pass yields to a running run (Ruling T22-a), whatever its state: a run left `running` by a
-            # dead worker keeps every pass skipping (logged `run_running` each time) until `stale_runs` gives
-            # it a new attempt or ends it, once its heartbeat is 3 min stale (`failed('resume_exhausted')`
-            # after 3 resumes); its revisions wait meanwhile, and the next run's embed node takes them up.
-            log.info("awaiting_embedding_skipped", reason="run_running")
-            return 0
-        health = await client.health()
-        if not health.ok:
-            # Not the model id: its 40-hex revision reads as a key to the redaction (§16.8).
-            log.info(
-                "awaiting_embedding_skipped", reason="embedder_unhealthy", checksum_ok=health.checksum_ok
-            )
-            return 0
-        report = await embed_awaiting(
-            ctx.engine, client, guard=fenced, limit=RECONCILE_LIMIT, created_before=ctx.now - AWAITING_GRACE
-        )
-        if not report.unavailable:
-            async with ctx.engine.begin() as conn:
-                await fence_epoch(conn, ctx.epoch)
-                if await count_awaiting(conn) == 0:
-                    await resolve_alert(conn, code=UNAVAILABLE_ALERT, subject=ALERT_SUBJECT)
-    except FencedOut:
+    async with ctx.engine.begin() as conn:
+        await fenced(conn)
+        running = bool((await conn.execute(_RUN_RUNNING)).scalar_one())
+    if running:
+        # The pass yields to a running run (Ruling T22-a), whatever its state: a run left `running` by a
+        # dead worker keeps every pass skipping (logged `run_running` each time) until `stale_runs` gives
+        # it a new attempt or ends it, once its heartbeat is 3 min stale (`failed('resume_exhausted')`
+        # after 3 resumes); its revisions wait meanwhile, and the next run's embed node takes them up.
+        log.info("awaiting_embedding_skipped", reason="run_running")
         return 0
+    health = await client.health()
+    if not health.ok:
+        # Not the model id: its 40-hex revision reads as a key to the redaction (§16.8).
+        log.info("awaiting_embedding_skipped", reason="embedder_unhealthy", checksum_ok=health.checksum_ok)
+        return 0
+    report = await embed_awaiting(
+        ctx.engine, client, guard=fenced, limit=RECONCILE_LIMIT, created_before=ctx.now - AWAITING_GRACE
+    )
+    if not report.unavailable:
+        async with ctx.engine.begin() as conn:
+            await fence_epoch(conn, ctx.epoch)
+            if await count_awaiting(conn) == 0:
+                await resolve_alert(conn, code=UNAVAILABLE_ALERT, subject=ALERT_SUBJECT)
     return report.embedded

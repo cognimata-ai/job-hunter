@@ -220,9 +220,13 @@ _ANNOTATE = q(
     "UPDATE runs SET status_reason = :r WHERE id = :i AND status = 'queued' AND attempt_no = :a RETURNING id"
 )
 _DURATION = q("SELECT extract(epoch FROM finished_at - started_at) FROM runs WHERE id = :i")
+# The run's terminal row at the attempt, when the attempt's own `finalize_run` wrote it: that closes the
+# attempt `completed`, while a reconciler or the takeover sweep that ends the run (`resume_exhausted`) keeps
+# its `attempt_no` and closes the attempt `heartbeat_stale` or `worker_takeover` (F5 review, Important 1).
 _COMPLETION = q(
-    "SELECT status, status_reason, finished_at FROM runs WHERE id = :i AND attempt_no = :a "
-    "AND status = ANY(:final)"
+    "SELECT r.status, r.status_reason, r.finished_at FROM runs r JOIN run_attempts a "
+    "ON a.run_id = r.id AND a.attempt_no = r.attempt_no WHERE r.id = :i AND r.attempt_no = :a "
+    "AND r.status = ANY(:final) AND a.end_reason = 'completed'"
 )
 _ACTIVE_CONFIG = q("SELECT settings_version_id, scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
 _ACTIVE_RUN = q(
@@ -375,8 +379,11 @@ async def _duration(conn: AsyncConnection, run_id: int) -> float | None:
 
 
 async def run_completion(conn: AsyncConnection, run_id: int, attempt_no: int) -> RunCompletion | None:
-    """The end attempt `attempt_no` gave its run: the run's terminal row at that attempt, `None` while it is
-    `running` (or when another attempt, or no finalize, ended it)."""
+    """The end attempt `attempt_no` gave its run: the run's terminal row at that attempt, when that attempt's
+    `finalize_run` wrote it (the attempt closed `completed`). `None` while the run is `running`, and when
+    another attempt, no finalize, or a reconciler or takeover that ended the run at this attempt number
+    (`resume_exhausted`, the attempt closed `heartbeat_stale` or `worker_takeover`) ended it: such an end is
+    counted by its own owner, never by the attempt's execution."""
     params = {"i": run_id, "a": attempt_no, "final": list(FINAL_STATUSES)}
     row = (await conn.execute(_COMPLETION, params)).first()
     if row is None:
@@ -833,7 +840,9 @@ async def _observe_unobserved_end(engine: AsyncEngine, owner: RunOwner) -> None:
     `finalize` node still awaits its commit's reply, the end is committed but the node never observes it; so
     it is when that await raises after the server committed (`raised`). Here such an end is counted in
     `RUNS` and `RUN_DURATION` and logged `run_finished` (`observed_by` names this path), unless the node
-    observed it (`observe_graph_end`). An attempt that ended nothing counts nothing. The lookup failing (the
+    observed it (`observe_graph_end`). An attempt that ended nothing counts nothing; nor does one whose run a
+    reconciler ended at its attempt number (`stale_runs`' `resume_exhausted`, counted by that reconciler):
+    `run_completion` finds only an end the attempt's own `finalize_run` wrote. The lookup failing (the
     database gone) is logged, error class only, and the end stays uncounted.
     """
     if (owner.run_id, owner.attempt_no) in _GRAPH_OBSERVED:

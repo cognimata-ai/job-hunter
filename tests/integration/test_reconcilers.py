@@ -200,3 +200,47 @@ async def test_a_superseded_worker_stops_the_cadence_and_never_writes_reconciler
     ] * 3
     assert len(logged(caplog, "reconciler_failed")) == 2  # the two real failures; the fenced pass is none
     assert logged(caplog, "reconciler_alert_write_failed") == []
+
+
+async def test_a_fence_of_another_owner_is_a_failure_and_never_stops_the_worker(
+    engine, current_epoch, queue_app, monkeypatch, caplog
+) -> None:
+    """F5 review, Minor 1: only the worker's own fence (`FencedOut.worker_superseded`) stops the cadence and
+    the worker. A `FencedOut` of another owner (here a purge fence) that a reconciler lets escape is recorded
+    as its failure, the reconcilers after it still run, and no stop is requested."""
+    from jobhunter.errors import FencedOut
+
+    from tests.support.logs import logged
+
+    ran: list[str] = []
+    stops: list[str] = []
+
+    async def fenced_job(ctx: r.ReconcileContext) -> int:
+        ran.append("fenced_job")
+        raise FencedOut(owner="purge_fence")
+
+    async def after(ctx: r.ReconcileContext) -> int:
+        ran.append("after")
+        return 1
+
+    monkeypatch.setattr(r, "REGISTRY", {})
+    r.reconciler("fenced_job", "tick")(fenced_job)
+    r.reconciler("after", "tick")(after)
+    ctx = r.ReconcileContext(
+        engine=engine,
+        queue=queue_app,
+        defer=defer_in_tx,
+        now=utcnow(),
+        epoch=current_epoch,
+        on_superseded=lambda: stops.append("stop"),
+    )
+    assert await r.run_reconcilers(ctx, "tick") == {"fenced_job": -1, "after": 1}
+    assert ran == ["fenced_job", "after"] and stops == []
+    assert [e["error_class"] for e in logged(caplog, "reconciler_failed")] == ["FencedOut"]
+    assert logged(caplog, "reconcilers_fenced") == []
+    async with engine.connect() as c:
+        assert tuple((await c.execute(_FAILED_ALERT)).one()) == (1, True)
+    assert FencedOut(owner="worker_epoch").worker_superseded and FencedOut("worker_lock").worker_superseded
+    assert not any(
+        FencedOut(o).worker_superseded for o in ("run", "operation", "purge_fence", "quota_ledger")
+    )

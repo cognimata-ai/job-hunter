@@ -413,6 +413,36 @@ async def test_stale_runs_counts_an_exhausted_run_after_its_commit(engine, queue
     assert (runs_total("failed"), timed_runs()) == (failed + 1, timed + 1)
 
 
+async def test_an_exhausted_run_with_a_live_execution_is_counted_once_by_the_reconciler(
+    engine, queue_app, log_events
+) -> None:
+    """F5 review, Important 1: `stale_runs` ends a run `resume_exhausted` while its execution is still live in
+    this worker. The reconciler counts the end after its commit and cancels the execution, which is `lost`;
+    `execute_run` must not count that end again, because the attempt's own `finalize_run` did not write it
+    (the attempt closed `heartbeat_stale`), though the run keeps that attempt number."""
+    rid, gate, entered = await queued(engine), asyncio.Event(), asyncio.Event()
+    await resume_three_times(engine, rid, epoch=1)  # running at attempt 4, the next resume exhausts it
+    failed, timed = runs_total("failed"), timed_runs()
+    live = asyncio.create_task(
+        runs.execute_run(engine, gated_graph(gate, entered), rid, 4, epoch=1, heartbeat_period_s=3600)
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    await age_heartbeat(engine, rid)
+    await run_reconcilers(
+        ReconcileContext(engine=engine, queue=queue_app, defer=defer_in_tx, now=utcnow(), epoch=1), "tick"
+    )
+    assert await asyncio.wait_for(live, 5) == "resumed"
+    assert (await fetch(engine, rid))[:2] == ("failed", 4) and (await fetch(engine, rid))[
+        5
+    ] == "resume_exhausted"
+    assert (runs_total("failed"), timed_runs()) == (failed + 1, timed + 1)  # the reconciler's count only
+    events = log_events()
+    assert [e["key"] for e in events if e["event"] == "execution_lost"] == [f"run:{rid}"]
+    assert not [e for e in events if e["event"] == "run_finished"]
+    async with engine.connect() as c:
+        assert await runs.run_completion(c, rid, 4) is None  # no end of the attempt's own
+
+
 async def test_takeover_sweep_counts_an_exhausted_run_only_after_the_takeover_commits(
     engine, queue_app, worker_lock, monkeypatch
 ) -> None:
