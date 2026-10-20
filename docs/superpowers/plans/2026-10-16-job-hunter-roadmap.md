@@ -59,7 +59,7 @@ Each spike records its result in `docs/spikes/V<n>.md`.
 | Milestone | Plan | Status |
 |---|---|---|
 | M0 | [`2026-10-16-m0-foundation.md`](2026-10-16-m0-foundation.md) | complete |
-| M1 | [`2026-10-17-m1-collection-pipeline.md`](2026-10-17-m1-collection-pipeline.md) | plan approved by Codex (3 review rounds) and the user; in progress |
+| M1 | [`2026-10-17-m1-collection-pipeline.md`](2026-10-17-m1-collection-pipeline.md) | acceptance passed; final 4-eyes review in progress |
 | M2 | written after M1 lands | — |
 | M3 | written after M2 lands | — |
 | M4 | written after M3 lands | — |
