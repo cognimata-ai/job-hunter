@@ -688,7 +688,11 @@ async def make_posting(
 @pytest.fixture
 def posting_factory() -> PostingFactory:
     """`await posting_factory(engine, source_id=…, native_id=…, availability=…, last_seen_at=…,
-    availability_changed_at=…)`: a posting with its job and one observation; returns the posting id."""
+    availability_changed_at=…)`: a posting with its job and one observation; returns the posting id.
+
+    As `make_posting` says: a missing instance is created without a watchlist company (`greenhouse` /
+    `default` is such a board), so a test that plans a run over the watchlist must not expect it to be planned
+    or served; the watchlist boards come from `seed_inputs`."""
     return make_posting
 
 

@@ -24,7 +24,9 @@ detail call: its structured `location.country` is another country's code (withou
 Items: `native_id` is the posting `id`, the key `ats:smartrecruiters:{slug}:{id}`; `releasedDate` is the
 posted date (exact). The work mode is structured: `location.remote`, `location.hybrid`, on site otherwise.
 The location is the posting's coordinates when it has them (§8.12), else its `fullLocation` text.
-`typeOfEmployment.label` is the employment type and `experienceLevel.id` the structured seniority.
+`typeOfEmployment.label` is the employment type and `experienceLevel.id` the structured seniority; the
+structured language is `language.code` (`en`, `es-MX`) and the industry `industry.label` (`Internet`), the
+§8.8 rows of `ad_language` and `industry_structured` (carry from Task 11, fix wave F1).
 """
 
 import re
@@ -296,7 +298,15 @@ class SmartRecruitersAdapter(AtsAdapter):
             return rejected(0, native_id, "name is not a string")
         location = job.get("location")
         employment = text_of(field(job.get("typeOfEmployment"), "label"))
-        seniority = text_of(field(job.get("experienceLevel"), "id"))
+        structured: dict[str, JSONValue] = {
+            key: value
+            for key, value in (
+                ("seniority", text_of(field(job.get("experienceLevel"), "id"))),
+                ("language", text_of(field(job.get("language"), "code"))),
+                ("industry", text_of(field(job.get("industry"), "label"))),
+            )
+            if value is not None
+        }
         posting = self._posting(
             native_id,
             title=title,
@@ -307,6 +317,6 @@ class SmartRecruitersAdapter(AtsAdapter):
             posted=iso_posted(job.get("releasedDate")),
             description=_description(job.get("jobAd")),
             link=text_of(job.get("postingUrl")),
-            structured={"seniority": seniority} if seniority is not None else {},
+            structured=structured,
         )
         return Parsed(0, native_id, posting.item_ts, posting)

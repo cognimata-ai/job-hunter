@@ -335,7 +335,7 @@ def test_a_structured_level_fails_only_outside_every_level_it_may_describe(provi
         assert result.passed == (level in LEVELS_OF[provider_level]), (provider_level, level)
 
 
-def test_the_provider_levels_of_the_fixtures_are_all_mapped() -> None:
+def test_the_structured_level_map_matches_the_test_table_and_the_ladder() -> None:
     assert set(STRUCTURED_LEVELS) == set(LEVELS_OF)
     assert all(level in SENIORITY_LADDER for levels in STRUCTURED_LEVELS.values() for level in levels)
 

@@ -600,6 +600,8 @@ def test_descriptions_are_sanitised_and_work_modes_come_from_structured_fields()
     assert all(p.primary_link and p.primary_link.startswith("https://job-boards.greenhouse.io/") for p in gh)
     assert all(set(p.source_structured) <= {"requisition_id", "language"} for p in gh)
     assert any(p.source_structured.get("language") == "en" for p in gh)
+    # the structured language is the posting's `ad_language_structured` too (fix wave F1)
+    assert all(p.ad_language_structured == p.source_structured.get("language") for p in gh)
     lever = parsed_of("lever", "lever_leverdemo")
     assert {frozenset(p.work_mode_possible) for p in lever} >= {frozenset({"remote"}), frozenset({"hybrid"})}
     assert all(p.remote_countries == () for p in lever if p.work_mode_possible != frozenset({"remote"}))
@@ -698,7 +700,14 @@ def test_a_smartrecruiters_detail_must_be_the_posting_asked_for() -> None:
     posting = detail.normalized
     assert posting.company_raw == "Delivery Hero" and posting.posted_precision == "exact"
     assert posting.work_mode_possible == frozenset({"onsite"}) and posting.work_mode_source == "structured"
-    assert posting.source_structured == {"seniority": "mid_senior_level"}
+    # the recorded `experienceLevel.id`, `language.code` and `industry.label` (carry from Task 11, fix wave
+    # F1)
+    assert posting.source_structured == {
+        "seniority": "mid_senior_level",
+        "language": "en",
+        "industry": "Internet",
+    }
+    assert posting.ad_language_structured == "en"
     assert posting.employment_types == ("full_time",)
     # the coordinates are the location; Dubai is in no gazetteer list (§8.12), so it stays unresolved
     assert [loc.label for loc in posting.locations] == ["Dubai, Dubai, United Arab Emirates"]
@@ -709,6 +718,8 @@ def test_a_smartrecruiters_detail_must_be_the_posting_asked_for() -> None:
     )
     hybrid = a.parse_detail(fixture_page("ats", "smartrecruiters_deliveryhero_detail_2", SPEC, fetched_at=T))
     assert isinstance(hybrid, Parsed) and hybrid.normalized.work_mode_possible == frozenset({"hybrid"})
+    assert hybrid.normalized.ad_language_structured == "es-MX"  # §8.8 maps it to `other`
+    assert hybrid.normalized.source_structured["industry"] == "Internet"
 
 
 def test_fixture_helpers_read_the_board_from_the_case_name() -> None:

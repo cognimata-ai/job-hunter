@@ -389,10 +389,13 @@ class AtsAdapter(ABC):
         structured: dict[str, JSONValue] | None = None,
     ) -> NormalizedPosting:
         """The `NormalizedPosting` of an item, with the board's key as its only strong key and a full
-        description (`description` is the plain text and the sanitised HTML)."""
+        description (`description` is the plain text and the sanitised HTML). `structured` is kept as
+        `source_structured`; its `language`, when the board states one, is also `ad_language_structured`."""
         modes, mode_source = work_modes
         text, sanitized = description
         types = tuple(dict.fromkeys(employment))
+        extras = structured or {}
+        language = extras.get("language")  # Greenhouse `language`, SmartRecruiters `language.code`
         return NormalizedPosting(
             native_id=native_id,
             title_raw=title,
@@ -413,13 +416,13 @@ class AtsAdapter(ABC):
             description_html_sanitized=sanitized,
             description_completeness="full",
             description_quality=description_quality(text),
-            ad_language_structured=None,
+            ad_language_structured=language if isinstance(language, str) else None,
             primary_link=canonical_url(link) if link else None,
             outbound_url_private=None,
             publisher=None,
             raw_keys=(self.key(native_id),),
             requisition_id=requisition_id,
-            source_structured=structured or {},
+            source_structured=extras,
         )
 
 
