@@ -1095,7 +1095,7 @@ Also cover:
     - receipts: a crash after logical call 1 settled invalid, then a reclaim, makes exactly one more request (the repair); a crash after the repair settled valid makes none;
     - `test_crash_after_settlement_reuses_the_paid_output`: a fault after the call settles and before the `draft` node commits, then a reclaim. The second execution reaches `ready` with `fake_llm.served == 1` and one billed ledger row;
     - a retry after `failed('invalid_output')` is a new operation, so it makes a new call;
-    - `test_old_extraction_cannot_publish_into_a_new_approval`: operation A reaches `ready` (A finished in that transaction); the user edits and approves new text (operation B); a stale execution of A, replayed through `execute_operation` with A's old claim, writes nothing. B's extraction uses the new text, and the draft's `draft_json` comes from B's call.
+    - `test_old_extraction_cannot_publish_into_a_new_approval`: execution 1 of operation A pauses before its `draft` node's transaction (own registry, as in Task 5's C35); A is reclaimed, and execution 2 reaches `ready` and finishes A; the user edits and approves new text (operation B), and B reaches `ready`. Execution 1 then resumes: its `draft` write fails the owner predicate and writes nothing. The draft's `draft_json` comes from B's call, made with the new text.
   - C35, full: as Task 5's pin, but through the real `extract_profile` handler. Exactly one extraction is billed, the draft is `ready` once, and the first execution's late write updates no draft row (`TransitionConflict`/`FencedOut` swallowed by the obsolete-execution path).
 - [ ] **Step 2: Run the tests and see them fail.**
 - [ ] **Step 3: Implement** the three nodes, the graph wiring and the handler.
