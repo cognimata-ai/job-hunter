@@ -128,6 +128,24 @@ def test_the_period_is_the_one_that_follows_the_amount() -> None:
     assert (s.min, s.period) == (60000, "year")
     assert salary("5.000 € pro Monat (60.000 € pro Jahr)").period == "month"
     assert salary("Pro Monat: 5.000 €").period == "month"
+    # the search is not bounded to the clause (the docstring's "short strings only"): a later period wins
+    assert salary("60.000 € bei Vollzeit, Bonus pro Monat").period == "month"
+
+
+@pytest.mark.parametrize(
+    ("text", "low", "high"),
+    [
+        ("32,3K EUR", 32300, 32300),  # 32.3 * 1000 is 32299.999999999996 as a float
+        ("16,1 Tsd. € jährlich", 16100, 16100),
+        ("2,01 - 4,03K € monatlich", 2010, 4030),  # the shared multiplier is rounded too
+        ("4,02K-32,7K EUR", 4020, 32700),
+    ],
+)
+def test_a_multiplied_amount_is_rounded_to_cents(text: str, low: float, high: float) -> None:
+    # fix wave F1 (ledger L40): no float drift in `min`/`max`, so equal amounts compare and hash equal
+    s = salary(text)
+    assert (s.min, s.max) == (low, high) and s.min is not None and s.min == round(s.min, 2)
+    assert s.annual_eur_min == round(s.annual_eur_min or 0, 2)
 
 
 @pytest.mark.parametrize(

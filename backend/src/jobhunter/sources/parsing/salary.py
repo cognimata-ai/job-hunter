@@ -170,8 +170,20 @@ def _number(token: str) -> float | None:
         return None
 
 
+def _thousands(amount: float) -> float:
+    """`amount` times 1,000 (`K`, `Tsd.`, `Tausend`), rounded to cents (fix wave F1): `32,3K` is 32300.0,
+    not the float product 32299.999999999996."""
+    return round(amount * 1000, 2)
+
+
 def _period_near(text: str, start: int, end: int) -> Period:
-    """The period named right after the amount at `text[start:end]`, else right before it, else `year`."""
+    """The period of the amount at `text[start:end]`: the first period phrase anywhere after it, else the last
+    one before it, else `year`.
+
+    The search is not bounded to the amount's clause: a period named later in the string wins ("60.000 € bei
+    Vollzeit, Bonus pro Monat" reads as monthly). It is meant for the short salary strings that providers send
+    (a SerpApi salary chip), not for an ad's free text.
+    """
     after = [
         (m.start(), period) for period, pattern in _PERIOD_PHRASES.items() if (m := pattern.search(text, end))
     ]
@@ -201,15 +213,15 @@ def parse_salary(text: str, *, kind: SalaryKind = "stated") -> Salary | None:
         low = _number(match["na"])
         if code is None or low is None:
             continue
-        low *= 1000 if match["ma"] else 1
+        low = _thousands(low) if match["ma"] else low
         high: float | None = low
         if match["nb"] is not None:
             high = _number(match["nb"])
             if high is None:
                 continue
             if match["mb"]:
-                high *= 1000
-                low *= 1 if match["ma"] else 1000  # `60-70K`: the multiplier is shared
+                high = _thousands(high)
+                low = low if match["ma"] else _thousands(low)  # `60-70K`: the multiplier is shared
         else:
             before = normalised[: match.start()]
             if _AT_LEAST.search(before):

@@ -93,6 +93,8 @@ UNACCENT_PAIRS = [
 def test_unaccent_map(char: str, plain: str) -> None:
     assert unaccent(char) == plain
     assert unaccent(f"x{char}y") == f"x{plain}y"
+    if char == "ß":  # the plan's check of this pair through `fold` (Task 2: `test_unaccent_map` holds it)
+        assert fold("Straße") == "strasse"
 
 
 def test_transliteration_table_is_consistent() -> None:
@@ -132,7 +134,6 @@ def test_unaccent_is_the_identity_on_ascii(s: str) -> None:
 
 
 def test_fold() -> None:
-    assert fold("Straße") == "strasse"
     assert fold("STRASSE") == "strasse"
     assert fold("Müller") == "muller"
     assert fold("Łódź Đakovo Þór") == "lodz dakovo thor"

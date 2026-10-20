@@ -19,23 +19,27 @@ ALLOWED_TAGS: Final = frozenset({"p", "br", "ul", "ol", "li", "strong", "em", "b
 _BLOCK_TAGS: Final = frozenset({"p", "ul", "ol", "li", "h3", "h4"})
 # Block-level tags that the allow-list strips. Stripped without a trace they would glue the words on either
 # side (`<h2>Aufgaben</h2><div>Entwicklung</div>` would read "AufgabenEntwicklung"), so a run of them becomes
-# one `<br>` before nh3 runs; nh3 stays the last step and the only judge of what survives. The attribute span
-# is bounded so that a tag that never closes cannot make the scan quadratic; a `>` inside an attribute value
-# ends the match.
+# one `<br>`. The run is found in nh3's own output, not in the raw HTML (fix wave F1): a first nh3 pass keeps
+# these tags as well, drops comments, scripts and styles, and escapes every `<` and `>` of text and attribute
+# values, so in its output every `<` starts a tag. A comment holding `<div`, a `>` inside an attribute value
+# and tag text inside a link can then no longer be taken for a block tag. The second pass applies the
+# allow-list and stays the only judge of what survives.
+_STRIPPED_BLOCK_TAGS: Final = frozenset(
+    {"address", "article", "aside", "blockquote", "caption", "dd", "details", "div", "dl", "dt", "fieldset"}
+    | {"figcaption", "figure", "footer", "form", "h1", "h2", "h5", "h6", "header", "hr", "main", "nav", "pre"}
+    | {"section", "summary", "table", "tbody", "td", "tfoot", "th", "thead", "tr"}
+)
 _STRIPPED_BLOCKS: Final = re.compile(
-    r"(?:</?(?:address|article|aside|blockquote|caption|dd|details|div|dl|dt|fieldset|figcaption|figure|footer"
-    r"|form|h[1256]|header|hr|main|nav|pre|section|summary|table|tbody|td|tfoot|th|thead|tr)\b[^>]{0,1000}>\s*)+",
-    re.IGNORECASE,
+    r"(?:</?(?:" + "|".join(sorted(_STRIPPED_BLOCK_TAGS)) + r")\b[^>]*>\s*)+", re.IGNORECASE
 )
 _LINK_REL: Final = "noopener noreferrer nofollow"
 _URL_SCHEMES: Final = frozenset({"http", "https"})
 
 
-def sanitize_html(raw: str) -> str:
-    """Strip all but `ALLOWED_TAGS`; keep an http(s) `href` on `a`; force `rel` and `target` on every link."""
+def _clean(html: str, tags: frozenset[str]) -> str:
     return nh3.clean(
-        _STRIPPED_BLOCKS.sub("<br>", raw),
-        tags=set(ALLOWED_TAGS),
+        html,
+        tags=set(tags),
         clean_content_tags={"script", "style"},
         attributes={"a": {"href"}},
         url_schemes=set(_URL_SCHEMES),
@@ -45,6 +49,12 @@ def sanitize_html(raw: str) -> str:
         set_tag_attribute_values={"a": {"target": "_blank"}},
         strip_comments=True,
     )
+
+
+def sanitize_html(raw: str) -> str:
+    """Strip all but `ALLOWED_TAGS`; keep an http(s) `href` on `a`; force `rel` and `target` on every link."""
+    parsed = _clean(raw, ALLOWED_TAGS | _STRIPPED_BLOCK_TAGS)
+    return _clean(_STRIPPED_BLOCKS.sub("<br>", parsed), ALLOWED_TAGS)
 
 
 class _TextExtractor(HTMLParser):

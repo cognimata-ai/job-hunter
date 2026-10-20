@@ -1,3 +1,4 @@
+import re
 import time
 from importlib import resources
 
@@ -109,6 +110,21 @@ def test_stripped_block_tags_still_separate_words() -> None:
     assert html_to_text(sanitize_html("line<hr>line")) == "line\nline"
 
 
+def test_a_comment_an_attribute_value_or_a_link_cannot_fake_a_block_tag() -> None:
+    # fix wave F1 (ledger L40): the block tags are found in nh3's output, where every `<` starts a tag
+    assert sanitize_html("<p>a</p><!-- <div --> <p>b</p> c") == "<p>a</p> <p>b</p> c"  # nothing swallowed
+    assert html_to_text(sanitize_html("<p>a</p><!-- x <div class=y> z --><p>b</p>")) == "a\nb"
+    assert sanitize_html('<div title="a>b">text</div>') == "<br>text<br>"  # no `b">` left behind
+    assert (
+        sanitize_html('<a href="https://e.x/?q=<td>">x</a>')
+        == f'<a href="https://e.x/?q=&lt;td&gt;" {LINK}>x</a>'
+    )
+    assert (
+        sanitize_html('<a href="https://e.x/</div>">x</a>')
+        == f'<a href="https://e.x/&lt;/div&gt;" {LINK}>x</a>'
+    )
+
+
 def test_unterminated_tags_do_not_make_the_sanitiser_quadratic() -> None:
     started = time.perf_counter()
     out = sanitize_html("<div " * 200_000)
@@ -129,12 +145,65 @@ def test_text_is_escaped_and_not_double_escaped() -> None:
     assert sanitize_html("") == ""
 
 
-@given(st.text(max_size=300))
-@settings(max_examples=200, deadline=None)
+# Ledger L40: plain `st.text()` almost never draws markup, so the properties draw documents from tag
+# fragments: allowed and stripped tags, comments, scripts, links with and without an allowed scheme, `>`
+# inside an attribute value and tag text inside a link, mixed with words, entities and stray brackets.
+_FRAGMENTS = st.sampled_from(
+    [
+        "<p>",
+        "</p>",
+        "<div>",
+        "</div>",
+        '<div class="c" title="a>b">',
+        "<h2>",
+        "</h2>",
+        "<table><tr><td>",
+        "</td></tr></table>",
+        "<hr>",
+        "<br>",
+        "<ul><li>",
+        "</li></ul>",
+        "<strong>",
+        "</strong>",
+        "<span>",
+        "</span>",
+        "<!--",
+        "-->",
+        "<!-- <div -->",
+        "<script>alert(1)",
+        "</script>",
+        "<style>p{}",
+        "</style>",
+        '<a href="https://e.x/?q=<td>">',
+        '<a href="javascript:alert(1)">',
+        '<a href="/relative">',
+        "</a>",
+        '<img src=x onerror="alert(1)">',
+        "&amp;",
+        "&lt;",
+        "&nbsp;",
+        "<",
+        ">",
+        "&",
+        " ",
+        "\n",
+        "Wort",
+        "word",
+    ]
+)
+HTML_DOCUMENTS = st.lists(_FRAGMENTS | st.text(max_size=4), max_size=40).map("".join)
+_TAG_NAME = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9]*)")
+_HREF = re.compile(r'href="([^"]*)"')
+
+
+@given(st.text(max_size=300) | HTML_DOCUMENTS)
+@settings(max_examples=300, deadline=None)
 def test_property_sanitising_is_idempotent_and_never_leaves_a_script(raw: str) -> None:
     once = sanitize_html(raw)
     assert sanitize_html(once) == once
-    assert "<script" not in once.casefold()
+    assert "<script" not in once.casefold() and "<!--" not in once
+    assert {m.group(2) for m in _TAG_NAME.finditer(once)} <= ALLOWED_TAGS
+    assert all(href.startswith(("http://", "https://")) for href in _HREF.findall(once))
 
 
 @pytest.mark.parametrize(
@@ -161,8 +230,8 @@ def test_html_to_text(html, text) -> None:
     assert html_to_text(html) == text
 
 
-@given(st.text(max_size=300))
-@settings(max_examples=200, deadline=None)
+@given(st.text(max_size=300) | HTML_DOCUMENTS)
+@settings(max_examples=300, deadline=None)
 def test_property_text_of_sanitised_html_is_normalised_lines(raw: str) -> None:
     text = html_to_text(sanitize_html(raw))
     assert all(line and line == norm_text(line) for line in text.split("\n")) or text == ""
@@ -283,9 +352,12 @@ def test_the_stop_word_files_are_the_postgresql_lists() -> None:
     en = (data / "stopwords_en.txt").read_text(encoding="utf-8").split("\n")
     assert de[-1] == "" and en[-1] == ""
     de, en = de[:-1], en[:-1]
-    assert (len(de), de[0], de[-1]) == (200, "aber", "während")
+    assert (len(de), de[0], de[-1]) == (231, "aber", "zwischen")  # the full german.stop (ruling T3-a)
     assert (len(en), en[0], en[-1]) == (127, "i", "now")
-    assert len(set(de)) == 200 and len(set(en)) == 127
+    assert len(set(de)) == 231 and len(set(en)) == 127
     assert {"und", "der", "die", "für", "nicht"} <= set(de)
+    assert {"wir", "zu", "wird", "werden", "wie", "wenn"} <= set(
+        de
+    )  # frequent words the alphabetical cut dropped
     assert {"the", "and", "of", "to", "is"} <= set(en)
     assert all(w == w.strip() and w for w in de + en)

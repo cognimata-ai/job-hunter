@@ -79,12 +79,44 @@ def test_gender_tag_variants_are_stripped(raw) -> None:
         "Engineer (Berlin)",
         "m/w/d Engineer",  # the bare list is only stripped at the end
         "Consultant (SAP) - Stuttgart",
-        "Entwickler:innenteam",  # no word boundary after "innen"
         "Software-Entwickler",
+        # a capital or a singular `in` after a slash starts a word, it is no suffix (fix wave F1)
+        "DevOps/Infrastructure Engineer",
+        "Vertrieb/Innendienst",
+        "Sales national/international",
     ],
 )
 def test_text_that_is_not_a_gender_tag_is_kept(raw) -> None:
     assert strip_gender_tags(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "stripped"),
+    [
+        # spec §8.2: only `In` needs a word boundary; the symbol forms also end a compound's first part
+        ("Entwickler:innenteam", "Entwicklerteam"),
+        ("Entwickler*innenteam", "Entwicklerteam"),
+        ("Entwickler_innenteam Berlin", "Entwicklerteam Berlin"),
+        ("Kolleg/innenkreis", "Kollegkreis"),
+    ],
+)
+def test_a_gender_suffix_inside_a_compound_is_stripped(raw: str, stripped: str) -> None:
+    assert strip_gender_tags(raw) == stripped
+
+
+@pytest.mark.parametrize(
+    ("raw", "title"),
+    [
+        ("DevOps Engineer (m/w/d), Berlin", "DevOps Engineer, Berlin"),  # no space before the comma
+        ("Engineer (m/w/d): Backend", "Engineer: Backend"),
+        ("Engineer ( m / w / d ) , Berlin", "Engineer, Berlin"),
+        ("Engineer (Data (m/w/d))", "Engineer (Data)"),
+        ("Engineer (m/w/d) - Berlin", "Engineer - Berlin"),  # a dash is a separator, not punctuation
+        ("Backend (m/w/d) Entwickler", "Backend Entwickler"),
+    ],
+)
+def test_a_removed_tag_leaves_no_space_before_punctuation(raw: str, title: str) -> None:
+    assert normalize_title(raw).title == title
 
 
 def test_gender_tag_pattern_is_the_bracketed_list_of_the_spec() -> None:

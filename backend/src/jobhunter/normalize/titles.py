@@ -28,13 +28,22 @@ GENDER_TAG: Final[re.Pattern[str]] = re.compile(
     r"(\s*[/|,_\-]\s*(m|w|f|d|x|div|gn|i|\*))*\s*[\)\]]",
     re.IGNORECASE,
 )
+# A tag list of the first rule with the space before it (fix wave F1). It becomes one space, or nothing
+# before punctuation, the space after it included: "DevOps Engineer (m/w/d), Berlin" becomes "DevOps
+# Engineer, Berlin".
+_TAG_GAP: Final = re.compile(rf"\s*(?:{GENDER_TAG.pattern})(?P<punct>\s*(?=[,;:.!?)\]]))?", re.IGNORECASE)
 # Second rule: a trailing bare `m/w/d` or `w/m/d`.
 _BARE_TAG: Final = re.compile(r"(?<!\S)(?:m/w/d|w/m/d)\s*$", re.IGNORECASE)
 # Third rule: a gender-inclusive suffix after a letter. `*in`, `*innen`, `:in`, `:innen`, `_in`, `/-in`, `/in`
 # and, with the inflected plural, `_innen`, `/innen`, `/-innen` ignore the case. `In` and `Innen` count only
-# after a lower-case letter (`EntwicklerIn`) and, like all of them, only before a word boundary: `Berlin`,
-# `Admin` and `Plug-In` are not tagged.
-_GENDER_SUFFIX: Final = re.compile(r"(?<=[^\W\d_])(?i:(?:[*:_]|/-?)in(?:nen)?)\b|(?<=[a-zäöüß])In(?:nen)?\b")
+# after a lower-case letter (`EntwicklerIn`) and only before a word boundary (spec §8.2: "`In` when followed
+# by a word boundary"): `Berlin`, `Admin`, `BuildInfo` and `Plug-In` are not tagged. The symbol forms need no
+# boundary where the suffix starts a compound, the lower-case plural before more letters
+# ("Entwickler:innenteam" is "Entwicklerteam"); a capital or a singular `in` there is the start of a word, not
+# a suffix ("DevOps/Infrastructure", "Vertrieb/Innendienst", "national/international").
+_GENDER_SUFFIX: Final = re.compile(
+    r"(?<=[^\W\d_])(?:(?i:(?:[*:_]|/-?)in(?:nen)?)\b|(?:[*:_]|/-?)innen(?=[a-zäöüß]))|(?<=[a-zäöüß])In(?:nen)?\b"
+)
 
 # §8.2 step 3. A period that is glued to the next word ("Sr.Engineer") leaves a space behind.
 _SENIOR: Final = re.compile(r"\b(?:sr|snr)\b(?:\.(?P<glued>(?=\w))|\.?)", re.IGNORECASE)
@@ -47,7 +56,7 @@ _SEPARATOR_RUN: Final = re.compile(rf"(?:\s*[{re.escape(_SEPARATORS)}])+\s*")
 
 def strip_gender_tags(s: str) -> str:
     """Remove the gender tags of §8.2 step 2 and tidy the whitespace they leave behind."""
-    s = GENDER_TAG.sub(" ", s)
+    s = _TAG_GAP.sub(lambda m: "" if m["punct"] is not None else " ", s)
     s = _BARE_TAG.sub("", s)
     s = _GENDER_SUFFIX.sub("", s)
     return " ".join(s.split())

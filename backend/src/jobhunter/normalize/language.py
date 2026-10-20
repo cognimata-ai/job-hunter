@@ -3,10 +3,10 @@
 Over at least 50 tokens, the share of German stop words and the share of English stop words are compared. The
 text is `de` when the German share is at least 0.2 above the English one, `en` for the reverse and `unknown`
 otherwise. The lists are shipped as data files (`normalize/data/stopwords_de.txt` and `stopwords_en.txt`, one
-word per line): `stopwords_en.txt` is PostgreSQL's `english.stop` (127 words), `stopwords_de.txt` the first
-200 of the 231 words of its `german.stop`, in file order (the files carry no frequencies to trim by).
-PostgreSQL 16 and 17 ship identical lists. Tokens and list entries are both `fold`ed, so `für` matches
-`FUR` and `fur`.
+word per line): PostgreSQL's full `english.stop` (127 words) and `german.stop` (231 words), byte for byte
+(ruling T3-a: §8.9's "top 200" means the most frequent words, and the full list holds every one of them, so
+no ranking source is needed). PostgreSQL 16 and 17 ship identical lists. Tokens and list entries are both
+`fold`ed, so `für` matches `FUR` and `fur`.
 """
 
 import functools
