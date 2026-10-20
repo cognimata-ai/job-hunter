@@ -10,11 +10,12 @@ cell. A span longer than the provider allows (720 h) is cut to `month`, and the 
 `JSearchContinuation` is the `coverage_cells.continuation` document of a JSearch cell (Ruling T13-b): the
 cursor its last traversal left, when that cursor was obtained, the window of that traversal, the page the
 cursor fetches and the new native ids of the page that handed it out. It exists only for a page the §5.3.1
-rule admitted but the traversal did not read (`jsearch.admits_next_page`: page 2 after a page 1 with at
-least 7 new ids; its reservation was denied or the run ended first), never for a page beyond the rule (final
-review F3). The planner reads it for the cursor reuse of §5.3.1 and checks the rule again, `finalize_cells`
-writes it, both through `parse` and `dump`; a document that is absent or malformed (one without
-`new_native_ids`, written before the rule, included) parses as `None` (plan from page 1).
+rule admitted but the traversal did not successfully read (`jsearch.admits_next_page`: page 2 after a page 1
+with at least 7 new ids; its reservation was denied, the run ended first, or its attempt failed or was
+ambiguous: page 1 is then the run's last succeeded page, so its eligible cursor is kept), never for a page
+beyond the rule (final review F3). The planner reads it for the cursor reuse of §5.3.1 and checks the rule
+again, `finalize_cells` writes it, both through `parse` and `dump`; a document that is absent or malformed
+(one without `new_native_ids`, written before the rule, included) parses as `None` (plan from page 1).
 
 **Intervals** (`coverage_intervals`, written by the fetch node in the transaction after a traversal). Every
 row is inserted `ON CONFLICT (cell_id, kind, span) DO NOTHING` with the run's id, so a resumed attempt that
@@ -640,8 +641,10 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
     run that traversed the cell (a dispatched list request) without covering it, whether or not it wrote a
     new gap row, or that recorded a new gap of it; `last_exploration_at` is set for an attempted
     exploration cell; a JSearch cell's `continuation` comes from its last succeeded page
-    (`JSearchContinuation`), only for a next page the §5.3.1 rule admitted but the run did not read
-    (cleared otherwise: that page ended the traversal, had fewer than 7 new ids, or was page 2).
+    (`JSearchContinuation`), only for a next page the §5.3.1 rule admitted but the run did not successfully
+    read: a page 2 whose reservation was denied, or whose attempt failed or was ambiguous, keeps page 1's
+    eligible cursor, page 1 being the last succeeded page (cleared otherwise: that page ended the traversal,
+    had fewer than 7 new ids, or was page 2).
     `coverage.too_broad` (info) is raised for a paid cell at `consecutive_incomplete >= 3` and resolved
     when the cell is covered. `now` is the finalize time, for the log.
     """
