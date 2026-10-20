@@ -19,7 +19,7 @@ import httpx
 import pytest
 from jobhunter.config import AppConfig, load_config
 from jobhunter.db.seed import SOURCES
-from jobhunter.sources import http, registry
+from jobhunter.sources import http, instances, registry
 from jobhunter.sources.adzuna import AdzunaAdapter
 from jobhunter.sources.arbeitnow import ArbeitnowAdapter
 from jobhunter.sources.ats import (
@@ -226,6 +226,7 @@ async def test_a_missing_secret_still_builds_its_adapter_which_refuses_to_send(t
         assert outcome.page is None and outcome.error is not None, source_id
         error = outcome.error
         assert (error.kind, error.code, error.before_send) == ("auth", "missing_secret", True), source_id
+        assert error.code == instances.MISSING_SECRET  # the one code the startup sync disables with
     serpapi = registry.build_adapter(instance("serpapi"), cfg, clients)
     assert isinstance(serpapi, SerpApiAdapter)
     with pytest.raises(SourceError) as refused:

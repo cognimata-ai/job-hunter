@@ -37,7 +37,10 @@ call; never the replay of a receipt) is made only while the instance's breaker a
 (`breaker.instance_availability`: `available`, or `half_open` for the probe): the reserving transaction of a
 quota source and the marking transaction of a free one read it right after the owner row, and a `blocked`
 instance skips the request `planned -> skipped('breaker_open')` (`Denied('breaker_open')`) with nothing
-reserved or sent; SerpApi also checks it before its account read.
+reserved or sent; SerpApi also checks it before its account read. An account read that fails as `auth` (a
+missing key refused locally, `http.missing_credential`, or a 401/403) counts as the breaker's `auth` failure,
+which opens `auth_failed` with `source.auth_failed` at once, and skips the request `breaker_open` (Ruling
+FR-l); any other failed read is `skipped('window_cap')` (§5.3.2 fails closed).
 
 Fault points `collect.after_reserve`, `collect.after_dispatch_marker`, `collect.after_response` and
 `collect.after_settle` mark the crash windows (§18.3 C1-C4). Every transaction that writes a receipt first
@@ -193,6 +196,17 @@ def failure_kind(err: SourceError) -> FailureKind | None:
     if err.kind == "ambiguous":
         return "transient"
     return _FAILURE_KINDS.get(err.kind)
+
+
+async def record_account_auth_failure(
+    engine: AsyncEngine, owner: "RunOwner", instance_id: int, *, billing: Billing, now: datetime
+) -> None:
+    """An account read that failed as `auth` outside an attempt (the fallback projection's, before any spec
+    exists): the instance's breaker counts it, under the run's owner row, in a transaction of its own; it
+    opens `auth_failed` at once and raises `source.auth_failed` (Ruling FR-l)."""
+    async with engine.begin() as conn:
+        await ledger.lock_run_owner(conn, owner)
+        await breaker.record_failure(conn, instance_id, "auth", billing=billing, now=now)
 
 
 def status_error(status: int, billing: Billing, *, operation: Operation, evidence: str | None) -> SourceError:
@@ -492,6 +506,8 @@ class _Acquisition:
                     account = await ctx.adapter.account()
                 except SourceError as err:  # §5.3.2: no fresh account read, no search
                     log.warning("account_read_failed", error_kind=err.kind, error_code=err.code)
+                    if failure_kind(err) == "auth":  # a missing key or a 401/403: visible (Ruling FR-l)
+                        return await self._skip(row, spec, nxt, cell_id, BREAKER_OPEN, failure="auth")
                     return await self._skip(row, spec, nxt, cell_id, "window_cap")
             if row is None:
                 async with ctx.engine.begin() as conn:
@@ -576,15 +592,27 @@ class _Acquisition:
         )
 
     async def _skip(
-        self, row: int | None, spec: RequestSpec, nxt: _Attempt, cell_id: int, reason: str
+        self,
+        row: int | None,
+        spec: RequestSpec,
+        nxt: _Attempt,
+        cell_id: int,
+        reason: str,
+        *,
+        failure: FailureKind | None = None,
     ) -> Denied:
-        """The attempt ends before any reservation: its receipt `skipped(reason)`."""
+        """The attempt ends before any reservation: its receipt `skipped(reason)`; with `failure`, the
+        instance's breaker counts that failure in the same transaction (the `source_instances` row last)."""
         async with self.ctx.engine.begin() as conn:
             await ledger.lock_run_owner(conn, self.ctx.owner)
             if row is None:
                 row = await self._insert(conn, spec, nxt, cell_id, "skipped", reason)
             else:
                 await _move(conn, row, ["planned"], "skipped", {"skip_reason": reason})
+            if failure is not None:
+                await breaker.record_failure(
+                    conn, spec.source_instance_id, failure, billing=self.ctx.billing, now=self.ctx.clock()
+                )
         return Denied(row, reason)
 
     async def _reserve(

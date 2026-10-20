@@ -36,7 +36,14 @@ from jobhunter.clock import utcnow
 from jobhunter.config import DEFAULT_HTTP_USER_AGENT, AppConfig
 from jobhunter.db.seed import SOURCES
 from jobhunter.observability.logging import get_logger
-from jobhunter.sources.base import ContractViolation, RawPage, RequestSpec, SourceError, public_query
+from jobhunter.sources.base import (
+    MISSING_SECRET,
+    ContractViolation,
+    RawPage,
+    RequestSpec,
+    SourceError,
+    public_query,
+)
 from jobhunter.sources.fixtures import fixture_transport
 
 
@@ -72,10 +79,6 @@ FULL_BOARD_SOURCES: Final = frozenset(
 _SOURCE_IDS: Final = frozenset(source.id for source in SOURCES)
 PERSONIO_HOST_SUFFIX: Final = ".jobs.personio.de"
 MAX_PERSONIO_REDIRECTS: Final = 3
-
-# The code of a request refused because its credential is missing or empty: the code with which
-# `sources.instances.sync_instances` disables such an instance.
-MISSING_SECRET: Final = "missing_secret"  # noqa: S105 (an error code, not a secret)
 
 _log = get_logger("jobhunter.sources.http")
 

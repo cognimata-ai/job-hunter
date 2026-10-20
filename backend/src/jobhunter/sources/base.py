@@ -188,6 +188,9 @@ def request_key(spec: RequestSpec, run_id: int) -> bytes:
 SourceErrorKind = Literal[
     "transient", "rate_limited", "auth", "quota_exhausted", "contract", "not_found", "client", "ambiguous"
 ]
+# The one code of a missing provider secret: `instances.sync_instances` disables the instance with it, and a
+# paid adapter's local refusal (`http.missing_credential`) is `SourceError("auth", code=MISSING_SECRET)`.
+MISSING_SECRET: Final = "missing_secret"  # noqa: S105 (an error code, not a secret)
 
 
 class SourceError(DomainError):

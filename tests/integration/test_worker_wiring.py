@@ -227,3 +227,50 @@ async def test_a_paid_instance_left_ok_without_its_key_sends_nothing_and_fails_a
     assert all(tuple(a) in (refused, ("skipped", None, "breaker_open", None, None)) for a in attempts[1:])
     health, code, opened, _ = await state(engine, "jsearch")
     assert (health, code) == ("auth_failed", "auth") and opened is not None
+
+
+async def test_a_serpapi_instance_left_ok_without_its_key_is_visible_as_auth_failed(
+    engine, current_epoch, make_config, fake_http, fixture_log, fake_embedder
+) -> None:
+    """Ruling FR-l (the F2 review's Minor 1): SerpApi's first send is the account read, refused locally like
+    the search. That refusal is counted by the breaker as an `auth` failure, so the instance is
+    `auth_failed` with the critical `source.auth_failed` open, never a silent `window_cap`; no request
+    reaches SerpApi or JSearch."""
+    without = {k: v for k, v in PROVIDER_SECRETS.items() if k not in ("rapidapi_key", "serpapi_key")}
+    cfg = live_worker(make_config, without)
+    assert (await state(engine, "serpapi"))[0] == "ok"  # never synced: the seed's state
+    clients = registry.make_clients(cfg)
+
+    def adapter_of(instance: InstanceRow):
+        return registry.build_adapter(instance, cfg, clients)
+
+    try:
+        async with make_http_client() as embedder_http:
+            deps = make_deps(
+                engine, adapter_of, embedder=EmbedderClient(fake_embedder.base_url, embedder_http)
+            )
+            run_id = await run_to_the_end(
+                engine,
+                deps,
+                include_paid=True,
+                queries=[TEST_QUERY],
+                enabled=("jsearch", "serpapi", "arbeitnow", "ats"),
+            )
+    finally:
+        for client in clients.values():
+            await client.aclose()
+    hosts = {r["host"] for r in served_requests(fixture_log)}
+    assert not hosts & {"serpapi.com", "jsearch.p.rapidapi.com"} and "www.arbeitnow.com" in hosts
+    health, code, opened, _ = await state(engine, "serpapi")
+    assert (health, code) == ("auth_failed", "auth") and opened is not None
+    async with engine.connect() as c:
+        serpapi = await instance_id(c, "serpapi")
+        alert = await c.execute(
+            sa.text("SELECT severity FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL"),
+            {"k": f"source.auth_failed:instance:{serpapi}"},
+        )
+        assert alert.scalar_one() == "critical"
+        status = (
+            await c.execute(sa.text("SELECT status FROM runs WHERE id = :i"), {"i": run_id})
+        ).scalar_one()
+    assert status in FINAL_STATUSES and status not in ("failed", "failed_invariant")

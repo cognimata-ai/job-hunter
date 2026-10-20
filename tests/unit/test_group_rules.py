@@ -8,6 +8,7 @@ from jobhunter.dedup.groups import (
     choose_group,
     choose_partner,
     compatible_location,
+    confirms,
     pair_evidence,
     revalidation_departures,
 )
@@ -199,6 +200,7 @@ def test_a_revalidation_rejects_every_g1_pair_the_representative_first() -> None
     fine = job(id=3)
     assert revalidation_departures(rep, [same_board_as_rep, fine], {2: 1.0, 3: 1.0}) == (2,)
     # G2-G5 alone accept the pair: only G1 rejects it
+    assert confirms(same_board_as_rep, rep, 1.0) is not None
     assert pair_evidence(same_board_as_rep, rep, 1.0) is None and pair_evidence(fine, rep, 1.0) is not None
     first_on_y, later_on_y = job(id=4, ats_boards=y), job(id=5, ats_boards=y)
     assert revalidation_departures(job(id=1), [later_on_y, first_on_y], {4: 1.0, 5: 1.0}) == (4,)

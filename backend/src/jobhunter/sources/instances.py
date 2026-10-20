@@ -26,9 +26,9 @@ from jobhunter.db.guards import Guard
 from jobhunter.db.seed import DEFAULT_INSTANCES
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
+from jobhunter.sources.base import MISSING_SECRET
 from jobhunter.sources.breaker import Health
 
-MISSING_SECRET: Final = "missing_secret"  # noqa: S105 (an error code, not a secret)
 # The §19.2 secret files a source's `default` instance cannot send without; the free sources need none.
 PROVIDER_SECRETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     {"jsearch": ("rapidapi_key",), "serpapi": ("serpapi_key",), "adzuna": ("adzuna_app_id", "adzuna_app_key")}

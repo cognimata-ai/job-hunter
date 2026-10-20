@@ -870,6 +870,40 @@ async def test_acquire_never_raises_a_source_error_for_an_account_read(
     assert respx_mock.routes["serpapi_search"].call_count == 0
 
 
+async def test_a_serpapi_account_read_without_its_key_opens_the_breaker_as_auth_failed(
+    engine, current_epoch, respx_mock
+) -> None:
+    """Ruling FR-l: the account read of a SerpApi adapter without its key is refused locally (nothing sent),
+    and the refusal is visible: the breaker counts an `auth` failure, which opens `auth_failed` with the
+    critical `source.auth_failed` at once, and the request is `skipped('breaker_open')`, not `window_cap`."""
+    owner = await queued_run(engine)
+    cell = await source_cell(engine, "serpapi")
+    async with engine.connect() as c:
+        instance = await instance_id(c, "serpapi")
+    async with httpx.AsyncClient() as client:
+        adapter = SerpApiAdapter(client, api_key=b"", instance_id=instance, clock=utcnow)
+        spec = await serpapi_spec(engine, adapter, cell)
+        r = await acquire_page(
+            acquire_ctx(engine, owner, adapter, billing="paid", provider="serpapi"),
+            spec,
+            cell_id=cell,
+            phase="fallback",
+            planned_id=None,
+        )
+    assert isinstance(r, Denied) and r.skip_reason == "breaker_open"
+    assert not respx_mock.calls  # neither the account read nor a search was sent
+    async with engine.connect() as c:
+        health = await c.execute(
+            sa.text("SELECT health, last_error_code FROM source_instances WHERE id = :i"), {"i": instance}
+        )
+        assert tuple(health.one()) == ("auth_failed", "auth")
+        alert = await c.execute(
+            sa.text("SELECT severity FROM alerts WHERE code = 'source.auth_failed' AND resolved_at IS NULL")
+        )
+        assert alert.scalar_one() == "critical"
+        assert (await c.execute(sa.text("SELECT count(*) FROM quota_ledger"))).scalar_one() == 0
+
+
 class Ticking:
     """A clock that moves one second at every reading, from `now`; the test may set `now` to jump it."""
 

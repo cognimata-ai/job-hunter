@@ -500,18 +500,25 @@ async def test_unknown_postings_absent_again_open_no_new_event(engine, current_e
     assert {(rows[n].availability, rows[n].availability_reason) for n in gone} == {("closed", "ats_absent")}
 
 
-async def test_an_incomplete_snapshots_unknowns_are_no_disappearance(engine, current_epoch, board20) -> None:
-    """Ruling T19-b: 20 postings, an incomplete snapshot leaves 9 `unknown`; the complete snapshots without
-    them that follow (the second one after the baseline fell to 11) open no event."""
+async def test_an_incomplete_reads_unknowns_count_as_disappeared_but_below_half_open_no_event(
+    engine, current_epoch, board20
+) -> None:
+    """Rulings T19-b and FR-d: 20 postings, complete at first (baseline 20); an incomplete snapshot leaves 9
+    `unknown`. The next complete snapshot without them counts the 9 as disappeared (they were active at the
+    baseline's snapshot, FR-d), but 9 is not more than half of 20: no event, the ordinary rule counts them,
+    and the baseline falls to 11. The one after it counts none of them (they were `unknown` at its baseline's
+    snapshot) and opens no event either."""
     t0 = utcnow() - 10 * DAY
     await sighted_at(engine, board20.instance_id, t0 - DAY)
+    await taken(engine, board20, set(board20.postings), t0 - 6 * H)  # complete: baseline 20
     present = {f"p{k:02d}" for k in range(10, 21)}  # 11 present, p01..p09 missing
     _, effect = await taken(engine, board20, present, t0, complete=False)
     assert effect == SnapshotEffect(unknown=9)
-    for hours in (6, 12):
+    for hours, disappeared in ((6, 9), (12, 0)):
         snapshot_id, effect = await taken(engine, board20, present, t0 + hours * H)
         assert effect == SnapshotEffect(absent_marked=9)
-        assert (await one(engine, SNAPSHOT_ROW, s=snapshot_id)).status == "complete"
+        row = await one(engine, SNAPSHOT_ROW, s=snapshot_id)
+        assert (row.status, row.absent_count) == ("complete", disappeared)
         assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (11, None)
     async with engine.connect() as c:
         alert = {"k": f"{snapshots.MASS_ALERT}:instance:{board20.instance_id}"}

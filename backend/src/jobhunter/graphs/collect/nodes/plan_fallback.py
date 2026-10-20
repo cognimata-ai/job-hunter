@@ -4,12 +4,14 @@ It runs once every primary spec is terminal. It reads the run's settings version
 run row and, in a run that includes paid sources, makes the free SerpApi account read for the projection
 (`serpapi_account`, outside any transaction and within `ACCOUNT_READ_TIMEOUT_S`; the acquisition reads the
 account again before every search). A read that expires or fails is no read: the projection then fails
-closed by its own rules (`window_cap` without an account window). Then `planner.plan_fallback` in one
-transaction. `route` sends the graph to `fetch_fallback` when it planned specs, else to `parse_normalize`.
+closed by its own rules (`window_cap` without an account window). A read that fails as `auth` (a missing key,
+refused locally, or a 401/403) is counted by the instance's breaker as well, which opens `auth_failed` with
+`source.auth_failed` at once (Ruling FR-l: a missing credential is visible). Then `planner.plan_fallback` in
+one transaction. `route` sends the graph to `fetch_fallback` when it planned specs, else to `parse_normalize`.
 """
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Final, Literal
 
 import httpx
@@ -22,7 +24,7 @@ from jobhunter.observability.logging import get_logger
 from jobhunter.quota import planner
 from jobhunter.quota.windows import AccountObservation
 from jobhunter.run_settings import RunSettings, load_run_settings
-from jobhunter.sources.acquire import AccountAdapter
+from jobhunter.sources.acquire import AccountAdapter, failure_kind, record_account_auth_failure
 from jobhunter.sources.base import SourceAdapter, SourceError
 from jobhunter.sources.instances import InstanceRow, list_instances
 from jobhunter.worker.runs import RunOwner
@@ -41,10 +43,12 @@ async def serpapi_account(
     instances: Sequence[InstanceRow],
     *,
     timeout_s: float = ACCOUNT_READ_TIMEOUT_S,
+    on_auth_failure: Callable[[int], Awaitable[None]] | None = None,
 ) -> AccountObservation | None:
     """The free SerpApi account read for the fallback projection (§5.3.2), or `None`: SerpApi disabled (by
     settings or health), an adapter without the read, or a read that failed (`SourceError`, a transport error)
-    or did not end within `timeout_s`. Anything else (a bug, a fenced owner, a database error) propagates."""
+    or did not end within `timeout_s`. A read that failed as `auth` is handed to `on_auth_failure` (the
+    instance id) first. Anything else (a bug, a fenced owner, a database error) propagates."""
     instance = next((i for i in instances if i.source_id == "serpapi"), None)
     if not settings.sources.serpapi or instance is None or instance.health == "disabled":
         return None
@@ -58,6 +62,8 @@ async def serpapi_account(
         log.warning("account_read_failed", error_kind="timeout", error_code="account_read_timeout")
     except SourceError as err:
         log.warning("account_read_failed", error_kind=err.kind, error_code=err.code)
+        if on_auth_failure is not None and failure_kind(err) == "auth":
+            await on_auth_failure(instance.id)
     except httpx.TransportError as err:  # the class only: a message may carry the URL
         log.warning("account_read_failed", error_kind="transport", error_code=type(err).__name__)
     return None
@@ -70,7 +76,17 @@ def make_plan_fallback(deps: CollectDeps) -> Node:
             run = (await conn.execute(_RUN, {"i": owner.run_id})).one()
             settings = await load_run_settings(conn, int(run.settings_version_id))
             instances = await list_instances(conn)
-        account = await serpapi_account(deps.adapters, settings, instances) if run.include_paid else None
+
+        async def auth_failed(instance_id: int) -> None:
+            await record_account_auth_failure(
+                deps.engine, owner, instance_id, billing="paid", now=deps.clock()
+            )
+
+        account = (
+            await serpapi_account(deps.adapters, settings, instances, on_auth_failure=auth_failed)
+            if run.include_paid
+            else None
+        )
         async with deps.engine.begin() as conn:
             ids = await planner.plan_fallback(
                 conn, owner=owner, settings=settings, instances=instances, now=deps.clock(), account=account

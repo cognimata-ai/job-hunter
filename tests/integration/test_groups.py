@@ -800,3 +800,30 @@ async def test_the_reconciler_revalidates_a_group_whose_members_share_a_board(
     assert await members(engine, group) == [a, d] and await group_of_job(engine, b) is None
     assert (await group_row(engine, group))[:2] == ("active", a)
     assert await reconcile(ctx(engine, queue_app)) == 0  # repaired: nothing left to do
+
+
+async def test_a_posting_attached_by_a_strong_key_schedules_the_validation_without_a_merge(
+    engine, current_epoch, job_with_postings
+) -> None:
+    """The selection's posting-attach leg (the F2 review's Minor 3): a new board-X posting attaches to A by
+    A's link key, with A's material unchanged, no merge event and no new revision. Only the `ad_keys` row it
+    created in the run selects A, and the grouping pass of the run ungroups A and B."""
+    a, b, _, group = await board_pair_and_a_second_board_posting(engine, job_with_postings)
+    owner = await queued_run(engine)
+    keys = (
+        AdKey("htidocid", "fresh-posting"),
+        AdKey("pub:stepstone.de", "1"),
+        AdKey("ats:greenhouse:x", "3"),
+    )
+    await pending_item(
+        engine, owner, "jsearch", {**_SAME_CONTENT, "native_id": "fresh-posting", "raw_keys": keys}
+    )
+    node = make_resolve_identity(make_deps(engine, lambda instance: pytest.fail("no adapter is used")))
+    counters = (await node(initial_state(owner.run_id, owner.attempt_no)))["counters"]
+    assert (counters["merges"], counters["revisions_new"], counters["jobs_created"]) == (0, 0, 0)
+    owned = await scalar(
+        engine, "SELECT job_id FROM ad_keys WHERE key_ns = 'ats:greenhouse:x' AND key_value = '3'"
+    )
+    assert owned == a and await scalar(engine, "SELECT count(*) FROM merge_events") == 0
+    assert (await group_row(engine, group))[0] == "dissolved"
+    assert [await group_of_job(engine, job) for job in (a, b)] == [None, None]
