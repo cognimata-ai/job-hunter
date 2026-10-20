@@ -154,17 +154,55 @@ UPDATE active_config SET settings_version_id = v.id, scope_version_id = v.scope_
   evaluation_policy_id = v.evaluation_policy_id, pending_scope_version_id = NULL, profile_version_id = NULL,
   rubric_version_id = NULL, prompt_schema_version_id = NULL, llm_tuple_id = NULL, updated_at = now()
   FROM settings_versions v WHERE v.version_no = 1"""
+# The M2 tables are emptied with DELETE, never by `_TRUNCATE`: `TRUNCATE ... CASCADE` of a table that
+# `active_config` reaches through its foreign keys (`cv_files` -> `profile_drafts` -> `profile_versions`,
+# `llm_calls`, `eval_runs`, `llm_tuples`) would truncate `active_config` itself. Run after
+# `_ACTIVE_CONFIG_RESET` (nothing points at them any more) and after the M1 `_TRUNCATE` (it emptied `runs`,
+# which references `llm_tuples`), in this order: every child before its parent under the immediate foreign
+# keys. Only the pair `profile_drafts` <-> `profile_versions` is deferrable, so those two go in any order.
+_M2_DELETE: Final = (
+    "SET CONSTRAINTS ALL DEFERRED",
+    "UPDATE profile_drafts SET llm_call_id = NULL",
+    "UPDATE query_proposals SET llm_call_id = NULL",
+    "DELETE FROM profile_vectors",
+    "DELETE FROM llm_calls",  # it references llm_spend_ledger, profile_drafts and eval_runs
+    "DELETE FROM llm_spend_ledger",  # it references llm_budget
+    "DELETE FROM query_proposals",
+    "DELETE FROM eval_runs",
+    "DELETE FROM llm_tuples",
+    "DELETE FROM profile_drafts",
+    "DELETE FROM profile_versions",
+    "DELETE FROM cv_files",
+    "DELETE FROM llm_budget",
+)
 # Run after every row that references a newer version points at version 1 again (`schedule_state`'s FK is
-# immediate), in this order.
+# immediate) and after `_M2_DELETE` (tuples and eval runs reference the configuration rows), in this order.
+# The last five statements delete the rows nothing names any more: the seeded ones stay, because version 1
+# and `active_config` name them, and the others were made by a settings save or by a test. They use NOT
+# EXISTS, because `active_config` points at no rubric or prompt schema yet and `NOT IN` over a NULL deletes
+# no row at all.
 _CONFIGURATION_RESET: Final = (
     "DELETE FROM settings_versions WHERE version_no > 1",
     "DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)",
+    "DELETE FROM model_policies m WHERE NOT EXISTS (SELECT 1 FROM settings_versions s "
+    "WHERE s.model_policy_id = m.id) AND NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.model_policy_id = m.id)",
+    "DELETE FROM execution_configs e WHERE NOT EXISTS (SELECT 1 FROM settings_versions s "
+    "WHERE s.execution_config_id = e.id) AND NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.execution_config_id = e.id)",
+    "DELETE FROM evaluation_policies p WHERE NOT EXISTS (SELECT 1 FROM settings_versions s "
+    "WHERE s.evaluation_policy_id = p.id) AND NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.evaluation_policy_id = p.id)",
+    "DELETE FROM rubric_versions r WHERE NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.rubric_version_id = r.id)",
+    "DELETE FROM prompt_schema_versions p WHERE NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.prompt_schema_version_id = p.id)",
     "UPDATE ranking_state SET generation = 0, updated_at = now()",
 )
 
 
 def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> None:
-    """Empty the tables of `_TRUNCATE` and restore the seeded configuration, in one transaction.
+    """Empty the tables of `_TRUNCATE` and `_M2_DELETE`, restore the seeded configuration, in one transaction.
 
     The TRUNCATE waits for the locks of any transaction a test leaked; after `lock_timeout` it fails with
     SQLSTATE 55P03 instead of hanging the suite.
@@ -172,9 +210,10 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
     In this order: the TRUNCATE; the `default` source instances inserted again with the seed's own statement
     (their ids change with every reset, so tests look them up by `(source_id, instance_key)`); `active_config`
     as the seed wrote it (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, every M2 pointer NULL);
-    the schedule reset; then
-    the settings versions after 1 and the scope versions no settings version uses deleted, and the ranking
-    generation set to 0.
+    the M2 tables deleted (`_M2_DELETE`); the schedule reset; then the settings versions after 1, the scope
+    versions no settings version uses, the model policies, execution configs and evaluation policies that no
+    settings version or `active_config` names, and the rubric and prompt-schema rows `active_config` does not
+    name deleted, and the ranking generation set to 0.
 
     The schedule keeps the interval and the anchor that `migrate` seeded: both come from the stored settings
     version 1 (the anchor on the day that version was created, as the seed computes it), not from constants
@@ -187,6 +226,8 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         conn.execute(_TRUNCATE)
         conn.execute(DEFAULT_INSTANCES_SQL)
         conn.execute(_ACTIVE_CONFIG_RESET)
+        for statement in _M2_DELETE:
+            conn.execute(statement)
         stored = conn.execute(
             "SELECT payload, created_at FROM settings_versions WHERE version_no = 1"
         ).fetchone()

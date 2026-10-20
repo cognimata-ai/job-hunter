@@ -29,7 +29,7 @@ M0_TABLES = {
     "purge_fences",
     "alembic_version",
 }
-LATER = {"llm_tuples", "profile_versions", "score_cycles", "deletion_manifests"}  # sources, postings: M1
+LATER = {"score_cycles", "deletion_manifests"}  # sources, postings: M1; llm_tuples, profile_versions: M2
 
 
 def rows(server: PgServer, statement: str, role: PgRole = "migrator") -> list[tuple[object, ...]]:
