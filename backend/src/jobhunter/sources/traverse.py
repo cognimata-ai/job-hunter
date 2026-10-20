@@ -82,9 +82,8 @@ from jobhunter.sources.instances import list_instances
 from jobhunter.sources.ratelimit import SMARTRECRUITERS_DETAIL, RateLimiter
 
 End = Literal["end", "cursor", "unknown", "ambiguous", "failed", "skipped"]
-# The paid aggregators that follow the page-2 rule of §5.3.1, and the last page their traversal reads.
+# The paid aggregators that follow the page-2 rule of §5.3.1 (`jsearch.admits_next_page`).
 PAGE2_SOURCES: Final = frozenset({"jsearch", "serpapi"})
-PAID_LAST_PAGE: Final = 2
 # The list pages a board traversal reads at most (10,000 postings at 100 a page): a guard against a
 # pagination that never ends, not a rule of §5.3.5. A board cut there ends `unknown`, its snapshot incomplete.
 ATS_PAGE_CAP: Final = 100
@@ -275,7 +274,7 @@ async def traverse_cell(
 def _rules_allow_next(plan: CellPlan, spec: RequestSpec, served: Served) -> bool:
     """Whether the §5.3 page rules let a search traversal read on after the served page `spec`."""
     if plan.source_id in PAGE2_SOURCES:
-        return spec.page_no < PAID_LAST_PAGE and (served.new_native_ids or 0) >= jsearch.PAGE2_MIN_NEW
+        return jsearch.admits_next_page(spec.page_no, served.new_native_ids)
     if plan.source_id == "adzuna":
         return spec.page_no < adzuna.PAGE_CAP
     return True

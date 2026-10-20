@@ -8,9 +8,13 @@ cell. A span longer than the provider allows (720 h) is cut to `month`, and the 
 `b` is `max_days_old` days (`adzuna_max_days_old`).
 
 `JSearchContinuation` is the `coverage_cells.continuation` document of a JSearch cell (Ruling T13-b): the
-cursor its last traversal left, when that cursor was obtained, the window of that traversal and the page the
-cursor fetches. The planner reads it for the cursor reuse of §5.3.1, `finalize_cells` writes it, both through
-`parse` and `dump`; a document that is absent or malformed parses as `None` (plan from page 1).
+cursor its last traversal left, when that cursor was obtained, the window of that traversal, the page the
+cursor fetches and the new native ids of the page that handed it out. It exists only for a page the §5.3.1
+rule admitted but the traversal did not read (`jsearch.admits_next_page`: page 2 after a page 1 with at
+least 7 new ids; its reservation was denied or the run ended first), never for a page beyond the rule (final
+review F3). The planner reads it for the cursor reuse of §5.3.1 and checks the rule again, `finalize_cells`
+writes it, both through `parse` and `dump`; a document that is absent or malformed (one without
+`new_native_ids`, written before the rule, included) parses as `None` (plan from page 1).
 
 **Intervals** (`coverage_intervals`, written by the fetch node in the transaction after a traversal). Every
 row is inserted `ON CONFLICT (cell_id, kind, span) DO NOTHING` with the run's id, so a resumed attempt that
@@ -54,6 +58,7 @@ from jobhunter.observability.logging import get_logger
 from jobhunter.sources.arbeitnow import FirehoseState, Gap
 from jobhunter.sources.ats.common import SnapshotDraft
 from jobhunter.sources.base import CoverageWindow
+from jobhunter.sources.jsearch import admits_next_page
 from jobhunter.sources.watchlist_patterns import ATS_TYPES
 from jobhunter.types import JSONValue
 
@@ -114,12 +119,17 @@ def _aware(value: JSONValue) -> datetime | None:
 @dataclass(frozen=True)
 class JSearchContinuation:
     """A JSearch cell's continuation: `cursor` fetches page `page_no` (≥ 2) of the traversal of `window`,
-    handed out at `obtained_at`."""
+    handed out at `obtained_at` by a page with `new_native_ids` new ids."""
 
     cursor: str
     obtained_at: datetime
     window: CoverageWindow
     page_no: int
+    new_native_ids: int
+
+    def admitted(self) -> bool:
+        """Whether the §5.3.1 page rule admits the page the cursor fetches (`jsearch.admits_next_page`)."""
+        return admits_next_page(self.page_no - 1, self.new_native_ids)
 
     @classmethod
     def parse(cls, doc: JSONValue) -> "JSearchContinuation | None":
@@ -127,17 +137,25 @@ class JSearchContinuation:
         if not isinstance(doc, dict):
             return None
         cursor, page_no, bounds = doc.get("cursor"), doc.get("page_no"), doc.get("window")
-        obtained_at = _aware(doc.get("obtained_at"))
+        obtained_at, new_ids = _aware(doc.get("obtained_at")), doc.get("new_native_ids")
         if not isinstance(cursor, str) or not cursor or obtained_at is None:
             return None
         if isinstance(page_no, bool) or not isinstance(page_no, int) or page_no < 2:
+            return None
+        if isinstance(new_ids, bool) or not isinstance(new_ids, int) or new_ids < 0:
             return None
         if not isinstance(bounds, list) or len(bounds) != 2:
             return None
         lower, upper = _aware(bounds[0]), _aware(bounds[1])
         if lower is None or upper is None or lower >= upper:
             return None
-        return cls(cursor=cursor, obtained_at=obtained_at, window=(lower, upper), page_no=page_no)
+        return cls(
+            cursor=cursor,
+            obtained_at=obtained_at,
+            window=(lower, upper),
+            page_no=page_no,
+            new_native_ids=new_ids,
+        )
 
     def dump(self) -> dict[str, JSONValue]:
         """The `coverage_cells.continuation` document."""
@@ -146,6 +164,7 @@ class JSearchContinuation:
             "obtained_at": self.obtained_at.isoformat(),
             "window": [self.window[0].isoformat(), self.window[1].isoformat()],
             "page_no": self.page_no,
+            "new_native_ids": self.new_native_ids,
         }
 
 
@@ -562,9 +581,10 @@ _OPEN_BETWEEN = q(
 )
 # The last succeeded list page of each cell of the run, with the time its response (and cursor) arrived.
 _LAST_PAGES = q(
-    "SELECT DISTINCT ON (f.cell_id) f.cell_id, f.page_no, f.next_cursor, f.spec, r.fetched_at "
-    "FROM fetch_requests f JOIN raw_responses r ON r.id = f.raw_response_id WHERE f.run_id = :run "
-    "AND f.status = 'succeeded' AND f.operation = 'list' ORDER BY f.cell_id, f.page_no DESC, f.id DESC"
+    "SELECT DISTINCT ON (f.cell_id) f.cell_id, f.page_no, f.next_cursor, f.new_native_ids, f.spec, "
+    "r.fetched_at FROM fetch_requests f JOIN raw_responses r ON r.id = f.raw_response_id "
+    "WHERE f.run_id = :run AND f.status = 'succeeded' AND f.operation = 'list' "
+    "ORDER BY f.cell_id, f.page_no DESC, f.id DESC"
 )
 _UPDATE_CELL = q(
     "UPDATE coverage_cells SET last_attempted_at = coalesce(:attempted_at, last_attempted_at), "
@@ -586,16 +606,21 @@ def _window_of(spec: JSONValue) -> CoverageWindow | None:
 
 def _continuation(page: Row[Any]) -> JSONValue:
     """The continuation document of a JSearch cell whose last succeeded page of the run is `page`: its
-    cursor, the time it arrived and the traversal's window; `None` when that page ended the traversal."""
+    cursor, the time it arrived, the traversal's window and the page's new ids; `None` when that page ended
+    the traversal or the §5.3.1 rule admits no next page after it (fewer than 7 new ids, or page 2 itself)."""
     cursor = page.next_cursor
     token = cursor.get("cursor") if isinstance(cursor, dict) else None
     window = _window_of(page.spec)
-    if not isinstance(token, str) or not token or window is None:
+    if not isinstance(token, str) or not token or window is None or page.new_native_ids is None:
         return None
     continuation = JSearchContinuation(
-        cursor=token, obtained_at=page.fetched_at, window=window, page_no=int(page.page_no) + 1
+        cursor=token,
+        obtained_at=page.fetched_at,
+        window=window,
+        page_no=int(page.page_no) + 1,
+        new_native_ids=int(page.new_native_ids),
     )
-    return continuation.dump()
+    return continuation.dump() if continuation.admitted() else None
 
 
 def _ema(previous: float, requests: int, new_postings: int) -> float:
@@ -623,9 +648,10 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
     run that traversed the cell (a dispatched list request) without covering it, whether or not it wrote a
     new gap row, or that recorded a new gap of it; `last_exploration_at` is set for an attempted
     exploration cell; a JSearch cell's `continuation` comes from its last succeeded page
-    (`JSearchContinuation`; cleared when that page ended the traversal). `coverage.too_broad` (info) is
-    raised for a paid cell at `consecutive_incomplete >= 3` and resolved when the cell is covered. `now`
-    is the finalize time, for the log.
+    (`JSearchContinuation`), only for a next page the §5.3.1 rule admitted but the run did not read
+    (cleared otherwise: that page ended the traversal, had fewer than 7 new ids, or was page 2).
+    `coverage.too_broad` (info) is raised for a paid cell at `consecutive_incomplete >= 3` and resolved
+    when the cell is covered. `now` is the finalize time, for the log.
     """
     await conn.execute(_LOCK_CELLS, {"run": run_id})
     cells = (await conn.execute(_RUN_CELLS, {"run": run_id})).all()

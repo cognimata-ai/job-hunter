@@ -194,7 +194,9 @@ async def test_plan_reuses_a_fresh_jsearch_cursor(engine, current_epoch, fake_ht
         settings = await load_run_settings(c, (await c.execute(ACTIVE_VERSION)).scalar_one())
         (cell,) = await ensure_cells(c, settings, await list_instances(c))
         await c.execute(OPEN_GAP, {"c": cell.id, "lower": covered, "upper": window[1]})
-        fresh = JSearchContinuation(cursor="cursor-2", obtained_at=now - H, window=window, page_no=2)
+        fresh = JSearchContinuation(
+            cursor="cursor-2", obtained_at=now - H, window=window, page_no=2, new_native_ids=7
+        )
         await c.execute(CELL_STATE, {"doc": fresh.dump(), "covered": covered, "c": cell.id})
     first = await queued_run(engine)
     await plan_once(engine, first, now, include_paid=True)
@@ -209,9 +211,7 @@ async def test_plan_reuses_a_fresh_jsearch_cursor(engine, current_epoch, fake_ht
     )
     assert spec.params["date_posted"] == "3days"  # the query of the traversal the cursor continues
     await finish(engine, first)
-    stale = JSearchContinuation(
-        cursor="cursor-2", obtained_at=now - CURSOR_REUSE_TTL - timedelta(minutes=1), window=window, page_no=2
-    )
+    stale = replace(fresh, obtained_at=now - CURSOR_REUSE_TTL - timedelta(minutes=1))
     async with engine.begin() as c:
         await c.execute(CELL_STATE, {"doc": stale.dump(), "covered": covered, "c": cell.id})
     second = await queued_run(engine)
@@ -227,6 +227,42 @@ async def test_plan_reuses_a_fresh_jsearch_cursor(engine, current_epoch, fake_ht
     assert [(g[0], g[1], g[2]) for g in await gaps(engine, cell.id)] == [
         ("gap", "open", "page_cap")
     ]  # kept (§5.3.1)
+
+
+async def test_plan_reuses_only_a_cursor_of_a_page_two_the_page_two_rule_admitted(
+    engine, current_epoch, fake_http
+) -> None:
+    """§5.3.1 (final review F3, Important B), the planner's own check: a fresh continuation is reused only
+    for page 2 after a page 1 with at least 7 new ids. A document from before that rule (no
+    `new_native_ids`), one of a page 1 with 3 new ids, and one that would fetch page 3 plan page 1."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    now = utcnow()
+    window = (now - 73 * H, now - H)
+    async with engine.begin() as c:
+        settings = await load_run_settings(c, (await c.execute(ACTIVE_VERSION)).scalar_one())
+        (cell,) = await ensure_cells(c, settings, await list_instances(c))
+    reusable = {
+        "cursor": "cursor-2",
+        "obtained_at": (now - H).isoformat(),
+        "window": [bound.isoformat() for bound in window],
+        "page_no": 2,
+        "new_native_ids": 7,
+    }
+    before_the_rule = {key: value for key, value in reusable.items() if key != "new_native_ids"}
+    cases = [
+        (before_the_rule, (1, None)),
+        ({**reusable, "new_native_ids": 3}, (1, None)),
+        ({**reusable, "page_no": 3, "new_native_ids": 10}, (1, None)),
+        (reusable, (2, "cursor-2")),
+    ]
+    for doc, planned in cases:
+        async with engine.begin() as c:
+            await c.execute(CELL_STATE, {"doc": doc, "covered": now - 49 * H, "c": cell.id})
+        owner = await queued_run(engine)
+        await plan_once(engine, owner, now, include_paid=True)
+        (row,) = await requests(engine, owner.run_id)
+        assert (row.page_no, RequestSpec.from_json(row.spec).cursor_in) == planned, doc
+        await finish(engine, owner)
 
 
 async def test_plan_abandons_the_part_beyond_the_provider_window(engine, current_epoch) -> None:

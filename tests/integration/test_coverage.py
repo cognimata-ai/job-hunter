@@ -1,5 +1,6 @@
 import json
 import uuid
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -240,7 +241,13 @@ async def test_cell_stats_are_finalized_from_durable_rows_once(
     cell = await jsearch_cell(engine)
     spec = await page1_spec(engine, cell)
     ctx = acquire_ctx(engine, owner, jsearch_fixture_adapter, billing="paid", provider="jsearch")
-    served = await acquire_page(ctx, spec, cell_id=cell, phase="primary", planned_id=None)
+
+    async def nothing_known(ids: Sequence[str | None]) -> int:
+        return 0  # page 1's 10 ids are new: the §5.3.1 rule admits page 2
+
+    served = await acquire_page(
+        ctx, spec, cell_id=cell, phase="primary", planned_id=None, known_native_ids=nothing_known
+    )
     assert isinstance(served, Served)  # the run's one dispatched request of the cell
     async with engine.begin() as c:
         request = (await c.execute(REQUEST, {"i": served.fetch_request_id})).one()
@@ -280,8 +287,8 @@ async def test_cell_stats_are_finalized_from_durable_rows_once(
     cursor = json.loads(load_fixture("jsearch", "search_v2_page1")[2])["data"]["cursor"]
     assert spec.window is not None
     assert (
-        row.continuation == JSearchContinuation(cursor, fetched_at, spec.window, 2).dump()
-    )  # page 2's cursor
+        row.continuation == JSearchContinuation(cursor, fetched_at, spec.window, 2, 10).dump()
+    )  # page 2's cursor: a page the rule admitted that the run did not read
     # the third run in a row that leaves the paid cell incomplete raises `coverage.too_broad`; a covered run
     # resolves it
     await finish(engine, owner)

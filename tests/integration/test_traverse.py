@@ -25,7 +25,7 @@ from jobhunter.graphs.collect.nodes.plan_fallback import make_plan_fallback
 from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.metrics import REGISTRY
-from jobhunter.sources import acquire, traverse
+from jobhunter.sources import acquire, coverage, traverse
 from jobhunter.sources.acquire import Denied, acquire_page
 from jobhunter.sources.adzuna import SEARCH_URL as ADZUNA_URL
 from jobhunter.sources.adzuna import AdzunaAdapter
@@ -828,3 +828,101 @@ async def test_smartrecruiters_details_are_fetched_again_only_when_new_changed_o
         assert changed[first][1] == markers[first][1]
         assert changed[second][1] > markers[second][1]  # the hash and the time moved forward together
         assert await run(lambda: utcnow() + timedelta(days=8)) == details  # older than 7 days
+
+
+FIRST_REQUEST = sa.text(
+    "SELECT page_no, status, spec ->> 'cursor_in' AS cursor_in FROM fetch_requests WHERE run_id = :r "
+    "AND cell_id = :c ORDER BY id LIMIT 1"
+)
+CONTINUATION = sa.text("SELECT continuation FROM coverage_cells WHERE id = :c")
+REFILL = sa.text("UPDATE quota_windows SET tokens = capacity WHERE provider = 'jsearch' AND is_current")
+
+
+async def finalize_and_finish(engine: AsyncEngine, owner: RunOwner) -> None:
+    """The run's cell statistics (`finalize_cells`, which writes a JSearch cell's continuation) and its end,
+    in one transaction, as the finalize node commits them."""
+    async with engine.begin() as c:
+        await coverage.finalize_cells(c, owner.run_id, now=utcnow())
+        await finalize_run(c, owner, status="succeeded", reason=None, report={})
+
+
+async def continuation_of(engine: AsyncEngine, cell: int) -> object:
+    async with engine.connect() as c:
+        return (await c.execute(CONTINUATION, {"c": cell})).scalar_one()
+
+
+async def first_request(engine: AsyncEngine, owner: RunOwner, cell: int) -> tuple[object, ...]:
+    """`(page_no, status, cursor_in)` of the run's first request of the cell: the page the planner chose."""
+    (found,) = await rows(engine, FIRST_REQUEST, r=owner.run_id, c=cell)
+    return found
+
+
+async def test_a_page_one_cursor_below_the_page_two_rule_is_not_kept_for_reuse(
+    engine, current_epoch, adapters: Adapters, job_factory: JobFactory
+) -> None:
+    """§5.3.1 (final review F3, Important B): page 1 with 3 new of its 10 job_uids admits no page 2, so its
+    cursor is no continuation: the next run within the reuse TTL plans page 1 with a fresh window, not page
+    2 from the cursor."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    for uid in page1_ids()[:7]:  # 7 of page 1's ids are postings already: 3 new
+        await job_factory(native_id=uid)
+    deps = make_deps(engine, adapters)
+    first = await queued_run(engine)
+    (fid,) = await plan_ids(deps, first)
+    cell = await cell_of(engine, fid)
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason, result.pages) == ("cursor", "page_cap", 1)
+    assert [r[:4] for r in await rows(engine, PAGES, r=first.run_id, c=cell)] == [
+        (1, "succeeded", "probe", 3)
+    ]
+    await finalize_and_finish(engine, first)
+    assert await continuation_of(engine, cell) is None
+    second = await queued_run(engine)
+    await plan_ids(deps, second)
+    assert await first_request(engine, second, cell) == (1, "planned", None)
+
+
+async def test_a_page_two_the_rule_admitted_but_could_not_reserve_is_reused(
+    engine, current_epoch, adapters: Adapters, job_factory: JobFactory
+) -> None:
+    """§5.3.1 (final review F3, Important B): page 1 with 8 new ids admits page 2, whose reservation is
+    denied (`paced`: one token in the bucket); the next run within the reuse TTL plans that page 2 from page
+    1's cursor."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    await insert_window(engine, jsearch_window(utcnow(), limit=200, reserve=20, tokens=1, interval_s=SIX_H))
+    for uid in page1_ids()[:2]:  # 8 new
+        await job_factory(native_id=uid)
+    deps = make_deps(engine, adapters)
+    first = await queued_run(engine)
+    (fid,) = await plan_ids(deps, first)
+    cell = await cell_of(engine, fid)
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason, result.pages) == ("skipped", "paced", 1)
+    assert [r[:4] for r in await rows(engine, PAGES, r=first.run_id, c=cell)] == [
+        (1, "succeeded", "normal", 8),
+        (2, "skipped", "normal", None),
+    ]
+    await finalize_and_finish(engine, first)
+    cursor = json.loads(load_fixture("jsearch", "search_v2_page1")[2])["data"]["cursor"]
+    async with engine.begin() as c:
+        await c.execute(REFILL)
+    second = await queued_run(engine)
+    await plan_ids(deps, second)
+    assert await first_request(engine, second, cell) == (2, "planned", cursor)
+
+
+async def test_no_continuation_leads_past_page_two(engine, current_epoch, adapters: Adapters) -> None:
+    """§5.3.1 (final review F3, Important B): a traversal that read page 2 (with a cursor) leaves no
+    continuation, so the next run never plans page 3."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    deps = make_deps(engine, adapters)
+    first = await queued_run(engine)
+    (fid,) = await plan_ids(deps, first)
+    cell = await cell_of(engine, fid)
+    result = await traverse_and_record(deps, fid)
+    assert (result.end, result.reason, result.pages) == ("cursor", "page_cap", 2)
+    await finalize_and_finish(engine, first)
+    assert await continuation_of(engine, cell) is None
+    second = await queued_run(engine)
+    await plan_ids(deps, second)
+    assert await first_request(engine, second, cell) == (1, "planned", None)

@@ -30,11 +30,12 @@ on, so that the rows of successive runs never overlap, and the cell's open gaps 
 window are abandoned with it (`coverage.abandon_beyond_provider_window`: one that straddles the window's lower
 bound keeps its newer part open, so contiguity can advance past it); Adzuna `max_days_old` days; the
 free sources the scope's ad age. **Cursor reuse** (§5.3.1, Ruling P3): a JSearch cell whose continuation holds
-a cursor obtained less than `jsearch.CURSOR_REUSE_TTL` ago is planned from it, `next_page(plan(cell_plan),
-cursor)` over the continuation's window and on its page, so that traversal's `END` closes its open gap;
-otherwise from page 1 with a fresh window, the open gap kept. The specs are built by the registry's adapters
-(`registry.make_adapter`, the one factory) on a transport that refuses every request (`_spec_adapters`):
-`plan` and `next_page` never send.
+a cursor obtained less than `jsearch.CURSOR_REUSE_TTL` ago, for a page the page-2 rule admitted (page 2 after
+a page 1 with at least 7 new ids, `jsearch.admits_next_page`; final review F3), is planned from it,
+`next_page(plan(cell_plan), cursor)` over the continuation's window and on its page, so that traversal's
+`END` closes its open gap; otherwise from page 1 with a fresh window, the open gap kept. The specs are built
+by the registry's adapters (`registry.make_adapter`, the one factory) on a transport that refuses every
+request (`_spec_adapters`): `plan` and `next_page` never send.
 
 **The fallback plan** (`plan_fallback`, node 3, §6.6): for every JSearch cell of the run whose
 `fallback.cell_outcome` is eligible, one SerpApi spec `phase='fallback'` on the SerpApi cell with the same
@@ -400,9 +401,13 @@ def _bucket_of(window: CoverageWindow) -> Bucket | None:
 
 def _reusable_cursor(cell: CellRow, now: datetime) -> tuple[JSearchContinuation, Bucket] | None:
     """The cell's continuation when its cursor may start this traversal (§5.3.1): obtained less than
-    `CURSOR_REUSE_TTL` ago, over a window of a bucket's span (the query that cursor continues)."""
+    `CURSOR_REUSE_TTL` ago, for a page the page-2 rule admits (`JSearchContinuation.admitted`: page 2 after
+    a page 1 with at least 7 new ids, checked here again so that no stored row plans past the rule), over a
+    window of a bucket's span (the query that cursor continues)."""
     continuation = JSearchContinuation.parse(cell.continuation)
     if continuation is None or continuation.obtained_at + CURSOR_REUSE_TTL <= now:
+        return None
+    if not continuation.admitted():
         return None
     bucket = _bucket_of(continuation.window)
     return None if bucket is None else (continuation, bucket)

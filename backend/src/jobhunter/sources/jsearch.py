@@ -67,14 +67,24 @@ ITEMS_PATH: Final[tuple[str, ...]] = ("data", "jobs")
 CURSOR_PATH: Final[tuple[str, ...]] = ("data", "cursor")
 # Page 2 is requested only when at least this many of the page's 10 `job_uid`s are new (§5.3.1).
 PAGE2_MIN_NEW: Final = 7
+# The last page a traversal reads (§5.3.1 defines no page 3; SerpApi, JSearch's fallback, follows the rule).
+PAID_LAST_PAGE: Final = 2
 # How long after it was handed out a cursor may start a later run's traversal (§5.3.1; read by the planner's
 # cursor reuse). It is the longest interval at which reuse was observed to work, never an extrapolation: the
 # 24.04 h old page-1 cursor still returned page 2 of the query (V10 phase 3, `docs/spikes/V10.md`: 6 of its
 # 8 `job_uid`s are those of `search_v2_page2`), after 2.01 h had worked in V9 phase 2.
 CURSOR_REUSE_TTL: Final[timedelta] = timedelta(hours=24)
 
+
 _ALL_WORK_MODES: Final = frozenset({"remote", "hybrid", "onsite"})
 _GATEWAY_MARKER: Final = "x-rapidapi-proxy-response"
+
+
+def admits_next_page(page_no: int, new_native_ids: int | None) -> bool:
+    """The page rule of §5.3.1: page `page_no + 1` follows page `page_no` only when that page had at least
+    `PAGE2_MIN_NEW` new native ids and it is not past `PAID_LAST_PAGE`. The one statement of the rule: the
+    traversal reads by it, and the continuation a later run may reuse is written and reused by it."""
+    return page_no < PAID_LAST_PAGE and (new_native_ids or 0) >= PAGE2_MIN_NEW
 
 
 def _lookup(doc: JSONValue, path: Sequence[str]) -> tuple[bool, JSONValue]:
