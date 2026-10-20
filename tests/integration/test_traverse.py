@@ -964,3 +964,22 @@ async def test_an_auth_failure_of_the_account_read_after_the_last_search_opens_t
         assert tuple(health.one()) == ("auth_failed", "auth")
         alert = await c.execute(OPEN_ALERT, {"k": f"source.auth_failed:instance:{serpapi}"})
         assert alert.scalar_one() == "critical"
+
+
+async def test_fetch_requests_counts_the_pages_an_attempt_sent_never_a_replayed_one(
+    engine, current_epoch, queue_app, adapters: Adapters
+) -> None:
+    """Final review F3, Minor 6: `FETCH_REQUESTS` counts a page when this attempt sent it; the resumed
+    attempt, which replays both stored pages without HTTP, counts nothing."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch",))
+    deps = make_deps(engine, adapters)
+    owner = await queued_run(engine)
+    (fid,) = await plan_ids(deps, owner)
+    before = fetched("jsearch", "succeeded")
+    result = await traverse_and_record(deps, fid)
+    assert result.pages == 2 and fetched("jsearch", "succeeded") == before + 2
+    resumed = await supersede(engine, owner)
+    assert await plan_ids(deps, resumed) == [fid]
+    again = await traverse_and_record(deps, fid, attempt_no=resumed.attempt_no)
+    assert again.pages == 2 and [o["status"] for o in again.outcomes] == ["succeeded", "succeeded"]
+    assert fetched("jsearch", "succeeded") == before + 2  # the replays sent nothing

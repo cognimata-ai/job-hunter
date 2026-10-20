@@ -10,14 +10,22 @@ The locations are what the parser stores in `jobs.locations`, with gazetteer ids
 Potsdam but lies 40 km from the centre of Berlin (52.52, 13.405), which puts it between 1x and 2x a 25 km
 radius around it; the real Potsdam is 27 km out. `AMBIGUOUS_WITH_ONE_DE_CANDIDATE` is `Linz`: Linz am Rhein
 and Linz in Austria.
+
+`load_facts(conn, job_id)` reads a job's `DetFacts` and its current revision's `description_text` (empty
+without one) through the mapping `refilter_job` evaluates (`filters._facts`), without a lock; `LookupError`
+for a job that does not exist (final review F3: moved here from `scoring/filters.py`, where nothing called
+it).
 """
 
 from dataclasses import replace
 from typing import Any, Final
 
+from jobhunter.db.sql import q
 from jobhunter.run_settings import ScopeSettings, scope_from_payload
+from jobhunter.scoring import filters
 from jobhunter.scoring.filters import DetFacts
 from jobhunter.sources.parsing.locations import Candidate, Location
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from tests.support.quota import seeded_payload
 
@@ -77,3 +85,14 @@ def seeded_scope() -> ScopeSettings:
 def scope(**overrides: Any) -> ScopeSettings:
     """The seeded scope with the given fields replaced."""
     return replace(seeded_scope(), **overrides)
+
+
+_READ_JOB: Final = q(filters._JOB)
+
+
+async def load_facts(conn: AsyncConnection, job_id: int) -> tuple[DetFacts, str]:
+    """The job's `DetFacts` and its current revision's `description_text` (see the module docstring)."""
+    row = (await conn.execute(_READ_JOB, {"job": job_id})).first()
+    if row is None:
+        raise LookupError(f"job {job_id} does not exist")
+    return filters._facts(row), str(row.description_text)

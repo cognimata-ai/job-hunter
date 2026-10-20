@@ -3,7 +3,9 @@
 It runs once every primary spec is terminal. It reads the run's settings version and `include_paid` from the
 run row and, in a run that includes paid sources, makes the free SerpApi account read for the projection
 (`serpapi_account`, outside any transaction and within `ACCOUNT_READ_TIMEOUT_S`; the acquisition reads the
-account again before every search). A read that expires or fails is no read: the projection then fails
+account again before every search), unless the instance's breaker blocks it (`breaker.available`: the read
+is a send to SerpApi as well, so an `auth_failed` or open instance gets none before its half-open time;
+final review F3). A read that expires or fails is no read: the projection then fails
 closed by its own rules (`window_cap` without an account window). A read that fails as `auth` (a missing key,
 refused locally, or a 401/403) is counted by the instance's breaker as well, which opens `auth_failed` with
 `source.auth_failed` at once (Ruling FR-l: a missing credential is visible).
@@ -20,6 +22,7 @@ transaction. `route` sends the graph to `fetch_fallback` when it planned specs, 
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime
 from typing import Final, Literal
 
 import httpx
@@ -34,6 +37,7 @@ from jobhunter.quota.windows import AccountObservation
 from jobhunter.run_settings import RunSettings, load_run_settings
 from jobhunter.sources.acquire import AccountAdapter, failure_kind, record_account_auth_failure
 from jobhunter.sources.base import SourceAdapter, SourceError
+from jobhunter.sources.breaker import available
 from jobhunter.sources.instances import InstanceRow, list_instances
 from jobhunter.worker.runs import RunOwner
 
@@ -50,16 +54,18 @@ async def serpapi_account(
     settings: RunSettings,
     instances: Sequence[InstanceRow],
     *,
+    now: datetime,
     timeout_s: float = ACCOUNT_READ_TIMEOUT_S,
     on_auth_failure: Callable[[int], Awaitable[None]] | None = None,
 ) -> AccountObservation | None:
     """The free SerpApi account read for the fallback projection (§5.3.2), or `None`: SerpApi disabled (by
-    settings or health), an adapter without the read, or a read that failed (`SourceError`, a transport error)
-    or did not end within `timeout_s`. A read that failed as `auth` is handed to `on_auth_failure` (the
-    instance id) first. Anything else (a bug, a fenced owner, a database error) propagates."""
+    settings or health) or blocked by its breaker at `now` (no read is sent), an adapter without the read,
+    or a read that failed (`SourceError`, a transport error) or did not end within `timeout_s`. A read that
+    failed as `auth` is handed to `on_auth_failure` (the instance id) first. Anything else (a bug, a fenced
+    owner, a database error) propagates."""
     instance = next((i for i in instances if i.source_id == "serpapi"), None)
-    if not settings.sources.serpapi or instance is None or instance.health == "disabled":
-        return None
+    if not settings.sources.serpapi or instance is None or available(instance, now) == "blocked":
+        return None  # `blocked` covers `disabled`
     adapter = adapters(instance)
     if not isinstance(adapter, AccountAdapter):
         return None
@@ -92,7 +98,9 @@ def make_plan_fallback(deps: CollectDeps) -> Node:
 
         account: AccountObservation | None = None
         if run.include_paid:
-            account = await serpapi_account(deps.adapters, settings, instances, on_auth_failure=auth_failed)
+            account = await serpapi_account(
+                deps.adapters, settings, instances, now=deps.clock(), on_auth_failure=auth_failed
+            )
             if account is not None:  # an observation of the window, persisted (Ruling T7-b)
                 async with deps.engine.begin() as conn:
                     await ledger.lock_run_owner(conn, owner)

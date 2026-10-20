@@ -12,9 +12,10 @@ instance, holds the source's semaphore (`deps.fetch_ctx`: a board holds its host
 `traverse.traverse_cell(…, limiter=deps.limiter)`, then records the coverage in one transaction that first
 holds the owner row `FOR SHARE` (`coverage.record_search_traversal`, `record_firehose_traversal` or
 `record_ats_snapshot`; a board whose traversal a shutdown or a takeover cut short writes no snapshot), then
-passes `afault_point("collect.after_coverage_commit")`. It returns the traversal's page outcomes and
-counters. It settles its own `fetch_requests` rows and never raises `SourceError`; a lost owner
-(`FencedOut`) and bugs propagate.
+passes `afault_point("collect.after_coverage_commit")`, and counts in `FETCH_REQUESTS` the pages this attempt
+sent (a page a resumed attempt replays from its receipt, or a denied one, is not counted again). It returns
+the traversal's page outcomes and counters. It settles its own `fetch_requests` rows and never raises
+`SourceError`; a lost owner (`FencedOut`) and bugs propagate.
 """
 
 import asyncio
@@ -176,7 +177,7 @@ async def traverse_and_record(
         await ledger.lock_run_owner(conn, planned.owner)
         await _record(conn, planned, result)
     await afault_point("collect.after_coverage_commit")
-    for outcome in result.outcomes:
+    for outcome in result.sent:  # the pages this attempt sent: never a replayed receipt or a denial
         FETCH_REQUESTS.labels(source=planned.instance.source_id, status=outcome["status"]).inc()
     return result
 

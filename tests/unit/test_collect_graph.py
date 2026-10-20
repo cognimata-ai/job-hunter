@@ -136,7 +136,9 @@ def _bug(request: httpx.Request) -> httpx.Response:
 async def _account(handler: Callable[[httpx.Request], Any], **options: Any) -> AccountObservation | None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         adapter = SerpApiAdapter(client, api_key=b"fake", instance_id=SERPAPI.id, clock=utcnow)
-        return await serpapi_account(lambda instance: adapter, seeded_run_settings(), [SERPAPI], **options)
+        return await serpapi_account(
+            lambda instance: adapter, seeded_run_settings(), [SERPAPI], now=utcnow(), **options
+        )
 
 
 async def test_the_fallback_account_read_is_bounded_and_a_failed_read_is_no_read() -> None:
@@ -156,9 +158,14 @@ async def test_no_account_is_read_when_serpapi_is_off() -> None:
     def no_adapter(instance: InstanceRow) -> SourceAdapter:
         raise AssertionError("no read")
 
-    assert await serpapi_account(no_adapter, seeded_run_settings(), [disabled]) is None
-    assert await serpapi_account(no_adapter, switched_off, [SERPAPI]) is None
-    assert await serpapi_account(no_adapter, seeded_run_settings(), []) is None
+    now = utcnow()
+    assert await serpapi_account(no_adapter, seeded_run_settings(), [disabled], now=now) is None
+    assert await serpapi_account(no_adapter, switched_off, [SERPAPI], now=now) is None
+    assert await serpapi_account(no_adapter, seeded_run_settings(), [], now=now) is None
+    # final review F3, Minor 4: an instance its breaker blocks gets no read either (the read is a send)
+    for health in ("auth_failed", "breaker_open"):
+        blocked = dataclasses.replace(SERPAPI, health=health, half_open_after=now + timedelta(hours=1))
+        assert await serpapi_account(no_adapter, seeded_run_settings(), [blocked], now=now) is None
 
 
 # ---- Task 23 ----------------------------------------------------------------------------------------------

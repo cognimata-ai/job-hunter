@@ -12,12 +12,9 @@ from jobhunter.sources.arbeitnow import (
     PAGE_SIZE,
     ArbeitnowAdapter,
     FirehoseState,
-    Leg,
     conclude,
     covered_span,
     page_cap,
-    plan_legs,
-    step,
 )
 from jobhunter.sources.base import (
     Capabilities,
@@ -180,8 +177,6 @@ async def test_a_fixture_run_reads_pages_one_and_two_then_the_end_and_is_covered
     async with httpx.AsyncClient(transport=fixture_transport(FIXTURES, log_path=log)) as client:
         a = ArbeitnowAdapter(client, instance_id=1, clock=lambda: T)
         state = FirehoseState(newest_covered_upper=None, gaps=())
-        (leg,) = plan_legs(state, n_newer={}, now=T, max_ad_age_days=30)
-        assert leg == Leg("fresh", None, 1)
         spec, cap, times, pages = a.plan(arbeitnow_cell()), page_cap(3600), [], 0
         while True:
             outcome = await a.fetch(spec)
@@ -193,9 +188,6 @@ async def test_a_fixture_run_reads_pages_one_and_two_then_the_end_and_is_covered
             kind, cursor = a.continuation(outcome.page)
             if kind is Continuation.END:
                 break
-            assert step(
-                items, leg, state, first_item_older_than_target=False, last_item_newer_than_target=False
-            ) == ("continue")
             assert pages < cap
             next_spec = a.next_page(spec, cursor)
             assert next_spec is not None
@@ -203,11 +195,9 @@ async def test_a_fixture_run_reads_pages_one_and_two_then_the_end_and_is_covered
     assert [s["case"] for s in served_requests(log)] == ["page1", "page2", "page_end"]
     assert [s["query"] for s in served_requests(log)] == ["page=1", "page=2", "page=3"]
     assert pages == 3 == cap and len(times) == 60
-    after, gaps = conclude(
-        state, [(leg, times)], pages=pages, cap=cap, stopped_by="end", now=T, max_ad_age_days=30
-    )
+    after, gaps = conclude(state, times, pages=pages, cap=cap, stopped_by="end", now=T, max_ad_age_days=30)
     assert gaps == [] and after == FirehoseState(newest_covered_upper=max(times), gaps=())
-    assert covered_span([(leg, times)], stopped_by="end") == (min(times), max(times))
+    assert covered_span(times, stopped_by="end") == (min(times), max(times))
 
 
 async def test_fetch_asks_for_the_page_of_the_spec_and_nothing_else() -> None:

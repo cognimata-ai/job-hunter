@@ -138,12 +138,6 @@ async def fetch_attempts(conn: AsyncConnection, request_key: bytes) -> list[Fetc
     return [FetchAttempt(**row) for row in rows.mappings()]
 
 
-async def latest_fetch_attempt(conn: AsyncConnection, request_key: bytes) -> FetchAttempt | None:
-    """The attempt of `request_key` with the highest `attempt_seq`, or `None` when it has none."""
-    found = await fetch_attempts(conn, request_key)
-    return found[-1] if found else None
-
-
 async def store_response(
     conn: AsyncConnection,
     fetch_request_id: int,

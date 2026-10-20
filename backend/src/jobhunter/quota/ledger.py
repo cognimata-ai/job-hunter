@@ -114,6 +114,8 @@ ADZUNA_SPANS: Final = (timedelta(seconds=60), timedelta(hours=24), timedelta(day
 RECOVERY_BATCH: Final = 100
 # `quota_ledger.units` is a smallint: a larger adjustment is written as several rows.
 _MAX_UNITS: Final = 32_767
+# `quota_ledger.per_run_cap` is an integer: a larger cap (a window refined to seconds, T8-a) never binds.
+_MAX_RUN_CAP: Final = 2**31 - 1
 _HTTP_OK: Final = range(200, 300)
 
 AMBIGUOUS_ALERT: Final = "quota.ambiguous_attempt"
@@ -179,10 +181,15 @@ _RUN_NORMAL = q(
     "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND run_id = :run "
     "AND request_class = 'normal' AND state = ANY(:counted)"
 )
+# The largest per-run cap the run's counted normal entries of a provider were admitted under (I3).
+_RUN_CAP = q(
+    "SELECT max(per_run_cap) FROM quota_ledger WHERE provider = :p AND run_id = :run "
+    "AND request_class = 'normal' AND state = ANY(:counted)"
+)
 _INSERT_REQUEST = q(
     "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, "
-    "run_id, run_attempt_no, fetch_request_id, units, state, created_at) VALUES (:p, :ws, 'request', :cls, "
-    ":key, :seq, :run, :attempt, :fr, :units, 'reserved', :now) RETURNING id"
+    "run_id, run_attempt_no, fetch_request_id, units, state, per_run_cap, created_at) VALUES (:p, :ws, "
+    "'request', :cls, :key, :seq, :run, :attempt, :fr, :units, 'reserved', :cap, :now) RETURNING id"
 )
 _INSERT_ADJUSTMENT = q(
     "INSERT INTO quota_ledger (provider, window_start, kind, units, evidence, created_at) "
@@ -265,6 +272,16 @@ async def normal_count_for_run(conn: AsyncConnection, provider: Provider, run_id
     """The run's counted normal-class units of `provider`, across all its attempts (per-run bound, §6.4)."""
     params = {"p": provider, "run": run_id, **_counted()}
     return int((await conn.execute(_RUN_NORMAL, params)).scalar_one())
+
+
+async def admitted_run_cap(conn: AsyncConnection, provider: Provider, run_id: int) -> int | None:
+    """The per-run cap (§6.4) the run's counted normal entries of `provider` were admitted under, as each
+    reservation recorded it (`per_run_cap`): the largest, when the window changed between them; `None`
+    without such an entry. Every admission kept the run's count within the cap in force then, so the run's
+    normal units are within this cap (I3, §17.2), whatever the window has become since."""
+    params = {"p": provider, "run": run_id, **_counted()}
+    cap = (await conn.execute(_RUN_CAP, params)).scalar_one()
+    return None if cap is None else int(cap)
 
 
 async def latest_attempt(
@@ -633,7 +650,8 @@ async def reserve(
     In order: the owner lock (`FencedOut` before anything is written), the window lock with its roll-forward
     or bootstrap (SerpApi bootstraps from `account`; without a window it is denied `window_cap`), the account
     read applied (SerpApi), accrual, and `decide` with the hard caps. An admission inserts the `reserved` row
-    (`created_at = now`) and saves the window; a denial saves the accrual (and the read) only.
+    (`created_at = now`, `per_run_cap` the §6.4 cap it was admitted under, which I3 checks the run against)
+    and saves the window; a denial saves the accrual (and the read) only.
     """
     if not 1 <= attempt_seq <= MAX_ATTEMPT_SEQ:
         raise ValueError(f"attempt_seq must be 1 to {MAX_ATTEMPT_SEQ}, got {attempt_seq}")
@@ -672,6 +690,8 @@ async def reserve(
         "attempt": owner.attempt_no,
         "fr": fetch_request_id,
         "units": units,
+        # the cap `admission` decided with (accrual and the probe change neither the limit nor the period)
+        "cap": min(per_run_cap(settings, fair_share(w, interval_s)), _MAX_RUN_CAP),
         "now": now,
     }
     entry_id = int((await conn.execute(_INSERT_REQUEST, params)).scalar_one())

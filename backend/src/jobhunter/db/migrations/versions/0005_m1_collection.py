@@ -55,6 +55,11 @@ Deviations 1, 2 and 22, Task 16 ruling T16-a, M0 Deviations 1 and 2, and plan Ta
   7. jobs.structured_seniority text (nullable) is not in the spec's §7.9: the hard filter
      seniority_out_of_range reads the structured level (§11.1) as one of the det-facts that det_facts_hash
      covers, and no other column holds it (Task 16 ruling T16-a; written by Task 17's canonical selection).
+  8. quota_ledger.per_run_cap integer (set on every request row, NULL on an adjustment) is not in the
+     spec's §7.8: the per-run cap of §6.4 in force when the entry was reserved, which invariant I3 (§17.2)
+     compares the run's normal units with, because a window refined after a reservation changes the cap
+     its current row gives (final review F3, Minor 2). A cap past the column's range (a window refined to
+     seconds, T8-a) is stored as its maximum: no run spends that many units.
 
 Migrations are expand/contract: there is no downgrade.
 """
@@ -222,6 +227,7 @@ CREATE TABLE quota_ledger (                          -- retained indefinitely; h
   evidence           text,
   http_status        smallint,
   provider_remaining integer,
+  per_run_cap        integer CHECK (per_run_cap >= 1),    -- the §6.4 cap in force at the reservation (note 8)
   created_at         timestamptz NOT NULL DEFAULT now(),  -- = reservation time
   dispatched_at      timestamptz,
   settled_at         timestamptz,
@@ -232,7 +238,8 @@ CREATE TABLE quota_ledger (                          -- retained indefinitely; h
   CHECK (state <> 'not_billed' OR evidence IN ('rapidapi_gateway_404','connect_failed_before_send','never_dispatched')),
   CHECK (kind <> 'adjustment' OR (units > 0 AND evidence IS NOT NULL)),
   CHECK (state NOT IN ('billed','not_billed','ambiguous') OR settled_at IS NOT NULL),
-  CHECK (state <> 'reserved' OR dispatched_at IS NULL)
+  CHECK (state <> 'reserved' OR dispatched_at IS NULL),
+  CHECK ((kind = 'request') = (per_run_cap IS NOT NULL))
 );""")
     op.execute("CREATE INDEX quota_ledger_window ON quota_ledger (provider, window_start, state);")
     op.execute("CREATE INDEX quota_ledger_rolling ON quota_ledger (provider, created_at DESC);")

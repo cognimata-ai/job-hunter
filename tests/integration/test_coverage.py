@@ -28,7 +28,7 @@ from jobhunter.sources.jsearch import JSearchAdapter
 from jobhunter.sources.receipts import insert_fetch_request, store_response
 from jobhunter.sources.traverse import End, TraversalResult
 from jobhunter.worker.runs import RunOwner, finalize_run
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import (
     TEST_QUERY,
@@ -242,7 +242,7 @@ async def test_cell_stats_are_finalized_from_durable_rows_once(
     spec = await page1_spec(engine, cell)
     ctx = acquire_ctx(engine, owner, jsearch_fixture_adapter, billing="paid", provider="jsearch")
 
-    async def nothing_known(ids: Sequence[str | None]) -> int:
+    async def nothing_known(conn: AsyncConnection, ids: Sequence[str | None]) -> int:
         return 0  # page 1's 10 ids are new: the §5.3.1 rule admits page 2
 
     served = await acquire_page(

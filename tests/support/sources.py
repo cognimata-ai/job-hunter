@@ -4,7 +4,9 @@
 turns it into the `RawPage` an adapter parses; `mock_fixture` serves it on a respx route; `served_requests`
 reads the fixture transport's request log (Task 5), each `case` reduced to its name (`search_v2_page1`);
 `make_cell_plan` builds the `CellPlan` an adapter's `plan` takes (Task 9: a JSearch cell for Berlin, the
-`week` bucket), with any field changed.
+`week` bucket), with any field changed. `jsearch_items` and `jsearch_cursor` read a recorded JSearch
+document's item array and cursor at the V9 paths, as the adapter reads them (final review F3: moved here
+from `sources/jsearch.py`, where nothing called them).
 
 Task 11: `adapter_for_fixture` is the ATS adapter of the board an `ats/` case was recorded from (its slug, and
 for Lever its region, read from the case name), instance 1, on a client it never uses; `parsed_of` is the
@@ -53,7 +55,7 @@ from jobhunter.config import AppConfig, load_config
 from jobhunter.db.sql import q
 from jobhunter.quota.windows import Provider
 from jobhunter.sources import ats as ats_adapters
-from jobhunter.sources import http, registry
+from jobhunter.sources import http, jsearch, registry
 from jobhunter.sources.acquire import acquire_page
 from jobhunter.sources.arbeitnow import FEED_URL, ArbeitnowAdapter
 from jobhunter.sources.ats.common import AtsAdapter
@@ -119,6 +121,20 @@ def served_requests(log_path: Path) -> list[dict[str, str]]:
             }
         )
     return served
+
+
+def jsearch_items(doc: JSONValue) -> list[JSONValue]:
+    """The item array of a JSearch `search-v2` document at `jsearch.ITEMS_PATH`, read as the adapter reads
+    it (anything else is a violation): a recording's envelope without a `RawPage` (final review F3: no
+    backend code reads a bare document, so this lives here)."""
+    return jsearch._items(doc, None)
+
+
+def jsearch_cursor(doc: JSONValue) -> str | None:
+    """The continuation cursor of a JSearch `search-v2` document at `jsearch.CURSOR_PATH`, read as the
+    adapter reads it: `None` when the key is missing or `null` (the end form); a malformed one is a
+    violation."""
+    return jsearch._cursor(doc, None)
 
 
 def make_cell_plan(**changes: Any) -> CellPlan:

@@ -24,8 +24,10 @@ crash, restart or takeover ever sends a paid request twice or loses a paid respo
 4. **Send once**: the throttle (the caller's rate limiter) and `adapter.fetch`, outside any transaction.
 5. **Persist and settle in one transaction**: the response classified by its **HTTP status first**
    (`check_envelope`, `peek_native_ids` and `continuation` run on a 2xx page only, and every `SourceError`
-   they raise is an outcome, never an exception), then the stored response (`receipts.store_response`), the
-   request `succeeded | failed(error_code) | ambiguous`, the ledger settled by the transport outcome and the
+   they raise is an outcome, never an exception), then the page's new-id count (the caller's
+   `known_native_ids`, on the settlement transaction's connection: no read stands between the response in
+   hand and its settlement), the stored response (`receipts.store_response`), the request
+   `succeeded | failed(error_code) | ambiguous`, the ledger settled by the transport outcome and the
    status alone (`adapter.settle`: a JSearch HTML 200 is `billed` and `failed('contract')` at once, Deviation
    23) with the response's observation (a provider's "out of quota" report, `quota_exhausted`, observed as
    nothing left: the window is exhausted until its reset), and the breaker (`failure_kind`, the one mapping:
@@ -178,9 +180,13 @@ class Failed:
 @dataclass(frozen=True)
 class Ambiguous:
     fetch_request_id: int
+    replayed: bool  # an earlier attempt's dispatch found unsettled, not a send of this call
 
 
 PageResult = Served | Denied | Failed | Ambiguous
+# How many distinct ids of a served page are postings of the instance already, read on the connection of the
+# page's settlement transaction (`acquire_page`'s `known_native_ids`).
+KnownNativeIds = Callable[[AsyncConnection, Sequence[str | None]], Awaitable[int]]
 
 
 def error_code(err: SourceError) -> str:
@@ -361,7 +367,7 @@ class _Acquisition:
         spec: RequestSpec,
         *,
         phase: Literal["primary", "fallback"],
-        known_native_ids: Callable[[Sequence[str | None]], Awaitable[int]] | None,
+        known_native_ids: KnownNativeIds | None,
         throttle: Callable[[], AbstractAsyncContextManager[object]] | None,
     ) -> None:
         self.ctx = ctx
@@ -405,10 +411,11 @@ class _Acquisition:
         # dispatched or ambiguous: no response was stored (persistence and settlement commit together)
         if last.status == "dispatched" and not await self._close_ambiguous(last):
             return _AGAIN
+        closed = Ambiguous(last.id, replayed=not here)
         if self.ctx.billing == "paid" or here:
             log.warning("page_ambiguous", fetch_request_id=last.id, attempt_seq=last.attempt_seq)
-            return Ambiguous(last.id)
-        return _following(last, cast(RequestClass, last.request_class)) or Ambiguous(last.id)
+            return closed
+        return _following(last, cast(RequestClass, last.request_class)) or closed
 
     async def _replay(self, last: FetchAttempt) -> Served:
         if last.raw_response_id is None:
@@ -549,11 +556,7 @@ class _Acquisition:
             outcome = await ctx.adapter.fetch(spec)
         await afault_point("collect.after_response")
         verdict = _classify(ctx.adapter, outcome, ctx.billing)
-        new_ids = None
-        if isinstance(verdict, _Envelope) and self.known_native_ids is not None:
-            distinct = {native_id for native_id in verdict.ids if native_id is not None}
-            new_ids = max(0, len(distinct) - await self.known_native_ids(verdict.ids))
-        result = await self._settle(row, entry, spec, outcome, verdict, new_ids)
+        result = await self._settle(row, entry, spec, outcome, verdict)
         await afault_point("collect.after_settle")
         self.settled_here.add(row)
         self.last_page = outcome.page
@@ -658,17 +661,18 @@ class _Acquisition:
         spec: RequestSpec,
         outcome: HttpOutcome,
         verdict: _Envelope | SourceError,
-        new_ids: int | None,
     ) -> PageResult | int:
-        """Step 5: the response, the request, the ledger and the breaker in one transaction. A transaction the
-        server rolled back as a serialization failure or a deadlock is run again with the response in hand,
-        `SETTLE_TRANSACTIONS` in all; any other error (a lost connection: its commit is unknown) propagates
-        and leaves the request `dispatched`, which the next resolution closes `ambiguous`."""
+        """Step 5: the new-id count, the response, the request, the ledger and the breaker in one
+        transaction. A transaction the server rolled back as a serialization failure or a deadlock is run
+        again with the response in hand, `SETTLE_TRANSACTIONS` in all; any other error (a lost connection:
+        its commit is unknown) propagates and leaves the request `dispatched`, which the next resolution
+        closes `ambiguous`."""
         now = self.ctx.clock()
+        new_ids: int | None = None
         for transaction in range(1, SETTLE_TRANSACTIONS + 1):
             try:
                 async with self.ctx.engine.begin() as conn:
-                    await self._settle_in(conn, row, entry, spec, outcome, verdict, new_ids, now)
+                    new_ids = await self._settle_in(conn, row, entry, spec, outcome, verdict, now)
                 break
             except DBAPIError as exc:
                 if transaction == SETTLE_TRANSACTIONS or not is_serialization_failure(exc):
@@ -683,7 +687,7 @@ class _Acquisition:
             return Served(row, verdict.page, replayed=False, new_native_ids=new_ids)
         if verdict.kind == "ambiguous":
             log.warning("page_ambiguous", fetch_request_id=row, error_code=verdict.code)
-            return Ambiguous(row)
+            return Ambiguous(row, replayed=False)
         return row
 
     async def _settle_in(
@@ -694,13 +698,17 @@ class _Acquisition:
         spec: RequestSpec,
         outcome: HttpOutcome,
         verdict: _Envelope | SourceError,
-        new_ids: int | None,
         now: datetime,
-    ) -> None:
+    ) -> int | None:
+        """The settlement transaction's writes; the page's new native ids (`None` without a count)."""
         ctx, page = self.ctx, outcome.page
         status = None if page is None else page.status
         envelope = verdict if isinstance(verdict, _Envelope) else None
         await ledger.lock_run_owner(conn, ctx.owner)
+        new_ids = None
+        if envelope is not None and self.known_native_ids is not None:  # a plain read of the postings
+            distinct = {native_id for native_id in envelope.ids if native_id is not None}
+            new_ids = max(0, len(distinct) - await self.known_native_ids(conn, envelope.ids))
         if entry is not None:  # billed by the transport outcome and the status alone, never by the body
             state, evidence = ctx.adapter.settle(outcome)
             observation = _observation(ctx.adapter, page, verdict)
@@ -736,7 +744,7 @@ class _Acquisition:
             }
             await _move(conn, row, ["dispatched"], "succeeded", done)
             await breaker.record_success(conn, spec.source_instance_id, now=now)
-            return
+            return new_ids
         err = cast(SourceError, verdict)
         to_state = "ambiguous" if err.kind == "ambiguous" else "failed"
         await _move(
@@ -744,6 +752,7 @@ class _Acquisition:
         )
         if (kind := failure_kind(err)) is not None:
             await breaker.record_failure(conn, spec.source_instance_id, kind, billing=ctx.billing, now=now)
+        return None
 
 
 async def acquire_page(
@@ -753,15 +762,16 @@ async def acquire_page(
     cell_id: int,
     phase: Literal["primary", "fallback"],
     planned_id: int | None,
-    known_native_ids: Callable[[Sequence[str | None]], Awaitable[int]] | None = None,
+    known_native_ids: KnownNativeIds | None = None,
     throttle: Callable[[], AbstractAsyncContextManager[object]] | None = None,
 ) -> PageResult:
     """Acquire one page of `spec` for `ctx.owner` (see the module docstring).
 
     `planned_id` is the receipt the planner made for this request, if any (it must be one of the key's
     attempts); the latest attempt of the key decides either way. `known_native_ids` counts how many distinct
-    ids of a served page are known postings already; `new_native_ids` is the page's distinct ids minus that
-    count, persisted with the receipt. `throttle` is entered around each send (the caller's rate limit).
+    ids of a served page are known postings already, on the settlement transaction's connection;
+    `new_native_ids` is the page's distinct ids minus that count, persisted with the receipt. `throttle` is
+    entered around each send (the caller's rate limit).
     """
     if spec.cell_id != cell_id:
         raise ValueError(f"the spec is for cell {spec.cell_id}, not {cell_id}")

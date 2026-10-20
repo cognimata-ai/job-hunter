@@ -21,10 +21,18 @@ from jobhunter.sources.base import (
 )
 from jobhunter.sources.fixtures import fixture_transport
 from jobhunter.sources.http import HttpOutcome
-from jobhunter.sources.jsearch import PAGE2_MIN_NEW, JSearchAdapter, cursor_of, items_of
+from jobhunter.sources.jsearch import PAGE2_MIN_NEW, JSearchAdapter
 from jobhunter.types import get_object
 
-from tests.support.sources import FIXTURES, fixture_page, make_cell_plan, mock_fixture, served_requests
+from tests.support.sources import (
+    FIXTURES,
+    fixture_page,
+    jsearch_cursor,
+    jsearch_items,
+    make_cell_plan,
+    mock_fixture,
+    served_requests,
+)
 from tests.unit.test_sources_base import SPEC
 
 pytestmark = pytest.mark.contract
@@ -41,7 +49,7 @@ def test_page_one_contract() -> None:
     ids = a.peek_native_ids(page)
     outcomes = a.parse(page)
     # the recorded envelope: items and cursor at the V9 paths, together
-    assert len(items_of(page.json())) == 10 and isinstance(cursor_of(page.json()), str)
+    assert len(jsearch_items(page.json())) == 10 and isinstance(jsearch_cursor(page.json()), str)
     assert len(ids) == 10 and all(ids) and a.continuation(page)[0] is Continuation.CURSOR
     assert (
         len(outcomes) == 10

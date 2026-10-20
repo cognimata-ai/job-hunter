@@ -43,10 +43,10 @@ The covered bound this module proves, and nothing more:
   is 19:30:49 (run 3's oldest), and page 2's fourth run holds five items at 20:00:43 and 20:00:44. With run 4
   restarting at the top of every page, an unread page can hold items from anywhere in the span, even seconds
   below the newest item read, so the only bound that survives is the empty one.
-- **A seek leg proves nothing.** A count does not locate a time in such a feed. Moreover, the fresh leg
-  reads to the cap or to the end, so no page budget remains for a seek leg (the end of the feed ends the
-  traversal). `plan_legs` still plans them, fresh head first (T10-a, part 3), and `conclude` treats their
-  reads as reads, never as proof.
+- **No seek leg is planned.** §5.3.4's seek to an open gap (a page found by a count of newer items) does not
+  locate a time in such a feed, and the read from page 1 runs to the cap or to the end of the feed, so no
+  page budget would ever remain for one (the end of the feed ends the traversal). Every traversal is that
+  one read; a gap is closed only by a later read that reaches the end of the feed (plan Deviation 27).
 
 `newest_covered_upper` is the upper bound of the newest proven covered span (`None` before the first). The
 cell's accounting frontier is the newest of it and every gap's upper bound: every instant below the
@@ -60,7 +60,7 @@ feed unread), closes every open gap its covered span touches and reopens the par
 """
 
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Final, Literal
@@ -117,19 +117,11 @@ def page_cap(interval_s: int) -> int:
     return min(MAX_PAGE_CAP, max(MIN_PAGE_CAP, pages_for_interval))
 
 
-def seek_page(n_newer: int) -> int:
-    """`max(1, floor(n_newer / 300))`: the page a seek to a gap starts on (§5.3.4)."""
-    if n_newer < 0:
-        raise ValueError(f"a count is not negative, got {n_newer}")
-    return max(1, n_newer // PAGE_SIZE)
-
-
 # ---- the coverage model -------------------------------------------------------------------------------
 
 GapStatus = Literal["open", "closed", "abandoned"]
 # What ended a run (T10-a): the page cap, the remaining-low rule, or the end of the feed. No time stops a run.
 StopReason = Literal["cap", "remaining", "end"]
-StepDecision = Literal["continue", "step_back", "step_forward"]
 
 
 @dataclass(frozen=True)
@@ -160,82 +152,19 @@ class FirehoseState:
     gaps: tuple[Gap, ...]
 
 
-@dataclass(frozen=True)
-class Leg:
-    """One leg of a traversal: the fresh head from page 1, or a seek to an open gap from `start_page`."""
-
-    kind: Literal["fresh", "seek"]
-    gap: Gap | None
-    start_page: int
-
-    def __post_init__(self) -> None:
-        if self.kind == "fresh" and (self.gap is not None or self.start_page != 1):
-            raise ValueError("the fresh leg has no gap and starts on page 1")
-        if self.kind == "seek" and (self.gap is None or self.start_page < 1):
-            raise ValueError("a seek leg has its gap and starts on a page >= 1")
-
-
-LegReads = Sequence[tuple[Leg, Sequence[datetime]]]
-
-
 def _cutoff(now: datetime, max_ad_age_days: int) -> datetime:
     return now - timedelta(days=max_ad_age_days)
 
 
-def plan_legs(
-    state: FirehoseState, *, n_newer: Mapping[Gap, int], now: datetime, max_ad_age_days: int
-) -> list[Leg]:
-    """The fresh head from page 1, then one seek leg per open gap newer than the ad age, newest gap first, at
-    `seek_page(n_newer[gap])` (`n_newer` is the caller's count per open gap, Task 14).
-
-    Every page of every leg counts against the cap, and a leg starts only while pages remain. Under T10-a
-    the fresh leg reads to the cap or to the end of the feed, which ends the traversal, so the head is read
-    on every run and the seek legs wait (see the module docstring).
-    """
-    cutoff = _cutoff(now, max_ad_age_days)
-    sought = sorted(
-        (gap for gap in state.gaps if gap.status == "open" and gap.upper > cutoff),
-        key=lambda gap: (gap.upper, gap.lower),
-        reverse=True,
-    )
-    return [Leg("fresh", None, 1), *(Leg("seek", gap, seek_page(n_newer[gap])) for gap in sought)]
-
-
-def step(
-    page_items: Sequence[datetime],
-    leg: Leg,
-    state: FirehoseState,
-    *,
-    first_item_older_than_target: bool,
-    last_item_newer_than_target: bool,
-) -> StepDecision:
-    """What a leg does after one of its pages (T10-a): never stop on a time.
-
-    The fresh leg continues; the caller ends the traversal at the end of the feed (`continuation` is `END`),
-    at the cap and at `remaining_low`, and nothing else ends it. A seek leg steps back one page when its first
-    page's first item is older than the gap's upper bound and forward one page when that page's last item is
-    newer (the caller sets the flags for a seek leg's first page only), and otherwise continues to the same
-    stops. `page_items` and `state` take no part in the decision: no page bounds the feed's creation times
-    (V8), so no item time or coverage state can end a leg.
-    """
-    if leg.kind == "seek":
-        if first_item_older_than_target:
-            return "step_back"
-        if last_item_newer_than_target:
-            return "step_forward"
-    return "continue"
-
-
-def covered_span(legs: LegReads, *, stopped_by: StopReason) -> CoverageWindow | None:
-    """The span the reads prove covered: `[oldest, newest)` of a fresh leg that read from page 1 to the end
-    of the feed, alone (a seek leg means the fresh leg stopped short); `None` otherwise or when that span is
-    empty.
+def covered_span(times: Sequence[datetime], *, stopped_by: StopReason) -> CoverageWindow | None:
+    """The span the read from page 1 proves covered: `[oldest, newest)` of the item times `times` it read,
+    when it reached the end of the feed; `None` otherwise or when that span is empty.
 
     Task 14 writes it as the run's `covered` interval; `conclude` applies the same span.
     """
-    if stopped_by != "end" or len(legs) != 1 or legs[0][0].kind != "fresh" or not legs[0][1]:
+    if stopped_by != "end" or not times:
         return None
-    lower, upper = min(legs[0][1]), max(legs[0][1])
+    lower, upper = min(times), max(times)
     return (lower, upper) if lower < upper else None
 
 
@@ -246,9 +175,7 @@ def _frontier(state: FirehoseState) -> datetime | None:
     return max(bounds, default=None)
 
 
-def _validate(legs: LegReads, *, pages: int, cap: int, stopped_by: StopReason) -> None:
-    if not legs or legs[0][0].kind != "fresh" or any(leg.kind == "fresh" for leg, _ in legs[1:]):
-        raise ValueError("a traversal reads the fresh leg first, and only once")
+def _validate(*, pages: int, cap: int, stopped_by: StopReason) -> None:
     if pages < 1:
         raise ValueError(f"a traversal reads at least one page, got {pages}")
     if pages > cap:
@@ -263,7 +190,7 @@ def _with_age(lower: datetime, upper: datetime, cutoff: datetime) -> Gap:
 
 def conclude(
     state: FirehoseState,
-    legs: LegReads,
+    times: Sequence[datetime],
     *,
     pages: int,
     cap: int,
@@ -273,16 +200,15 @@ def conclude(
 ) -> tuple[FirehoseState, list[Gap]]:
     """The cell's coverage after a traversal (T10-a; the rules are the module docstring's).
 
-    `legs` holds each leg with the `created_at` of every item it read, in reading order; `pages` counts the
-    pages of every leg. Returns the new state, whose `gaps` keep every earlier gap in place (with its new
+    `times` holds the `created_at` of every item the read from page 1 saw, in reading order; `pages` counts
+    its pages. Returns the new state, whose `gaps` keep every earlier gap in place (with its new
     status), each narrowed gap followed by its remainders, then the gap this run opened; and the gaps this run
     created or changed, in the same order: the rows Task 14 writes, with `covered_span` for the covered row.
     Raises `ValueError` for reads no traversal produces.
     """
-    _validate(legs, pages=pages, cap=cap, stopped_by=stopped_by)
+    _validate(pages=pages, cap=cap, stopped_by=stopped_by)
     cutoff = _cutoff(now, max_ad_age_days)
-    times = [moment for _, read in legs for moment in read]
-    span = covered_span(legs, stopped_by=stopped_by)
+    span = covered_span(times, stopped_by=stopped_by)
     frontier = _frontier(state)
 
     gaps: list[Gap] = []
@@ -514,7 +440,7 @@ class ArbeitnowAdapter:
         return Continuation.CURSOR, str(page.spec.page_no + 1)
 
     def next_page(self, spec: RequestSpec, cursor: str | None) -> RequestSpec | None:
-        """The page `cursor` names (a page number, from `continuation` or a seek leg), in the same class."""
+        """The page `cursor` names (a page number, from `continuation`), in the same class."""
         if not cursor:
             return None
         if not (cursor.isascii() and cursor.isdigit()) or int(cursor) < 1:

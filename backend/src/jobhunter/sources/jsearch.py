@@ -121,26 +121,15 @@ def _items(doc: JSONValue, status: int | None) -> list[JSONValue]:
 
 
 def _cursor(doc: JSONValue, status: int | None) -> str | None:
+    """The continuation cursor (at `CURSOR_PATH`); `None` when the key is missing or `null`, the end form. A
+    cursor that is not a non-empty string is a violation, never the end: a malformed token must not close a
+    traversal as complete."""
     found, cursor = _lookup(doc, CURSOR_PATH)
     if not found or cursor is None:
         return None
     if isinstance(cursor, str) and cursor:
         return cursor
     raise ContractViolation("cursor_invalid", status=status)
-
-
-def items_of(doc: JSONValue) -> list[JSONValue]:
-    """The item array of a `search-v2` document (at `ITEMS_PATH`); anything else is a violation."""
-    return _items(doc, None)
-
-
-def cursor_of(doc: JSONValue) -> str | None:
-    """The continuation cursor (at `CURSOR_PATH`); `None` when the key is missing or `null`, the end form.
-
-    A cursor that is not a non-empty string is a violation, never the end: a malformed token must not close
-    a traversal as complete.
-    """
-    return _cursor(doc, None)
 
 
 def _text(job: dict[str, JSONValue], key: str) -> str | None:

@@ -24,7 +24,8 @@ groups, alerts, posting availability changes and gaps closed or abandoned.
 - I2: every fetch request of the run is terminal;
 - I3: every quota window the run's ledger entries touched has counted units (`ledger.used_units`) within
   its `limit_units`, and the run's counted normal units of a paid provider (JSearch, SerpApi) are within the
-  per-run cap of its current window (`pacing.per_run_cap`, §6.4);
+  per-run cap they were admitted under (`ledger.admitted_run_cap`, §6.4: the cap each reservation recorded,
+  never the one of the window as it is now, which a later refinement changes; final review F3);
 - I4: every `linked` raw item of the run has an observation whose posting has a job;
 - I5: vacuous while `active_config.llm_tuple_id` is NULL (plan Deviation 11); with a tuple it fails, since
   M1 creates no targets;
@@ -82,10 +83,9 @@ from jobhunter.observability.alerts import raise_alert, resolve_alert, resolve_a
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
 from jobhunter.quota.fallback import cell_outcome
-from jobhunter.quota.pacing import fair_share, per_run_cap
 from jobhunter.quota.planner import FALLBACK_ACTIVE_ALERT
-from jobhunter.quota.windows import Provider, current_snapshot
-from jobhunter.run_settings import RunSettings, load_run_settings
+from jobhunter.quota.windows import Provider
+from jobhunter.run_settings import load_run_settings
 from jobhunter.sources.coverage import abandon_old_gaps, finalize_cells
 from jobhunter.sources.watchlist_patterns import ATS_TYPES
 from jobhunter.types import JSONValue, get_list, get_str
@@ -221,7 +221,7 @@ async def _i2(conn: AsyncConnection, run_id: int) -> InvariantResult:
     return InvariantResult("I2", open_requests == 0, detail)
 
 
-async def _i3(conn: AsyncConnection, run_id: int, settings: RunSettings) -> InvariantResult:
+async def _i3(conn: AsyncConnection, run_id: int) -> InvariantResult:
     breaches: list[JSONValue] = []
     providers: set[Provider] = set()
     windows = (await conn.execute(_RUN_WINDOWS, {"run": run_id})).all()
@@ -239,11 +239,12 @@ async def _i3(conn: AsyncConnection, run_id: int, settings: RunSettings) -> Inva
             }
             breaches.append(breach)
     for provider in sorted(providers & PER_RUN_CAPPED):
-        window = await current_snapshot(conn, provider)
-        if window is None:
-            raise InvariantViolation(f"{provider} has ledger entries of run {run_id} but no current window")
-        cap = per_run_cap(settings.quota, fair_share(window, settings.interval_s))
         normal = await ledger.normal_count_for_run(conn, provider, run_id)
+        if normal == 0:
+            continue
+        cap = await ledger.admitted_run_cap(conn, provider, run_id)
+        if cap is None:
+            raise InvariantViolation(f"run {run_id} has {provider} normal entries without an admitted cap")
         if normal > cap:
             breaches.append({"provider": provider, "kind": "per_run_cap", "used": normal, "limit": cap})
     return InvariantResult("I3", not breaches, {"windows": len(windows), "breaches": breaches})
@@ -263,14 +264,14 @@ async def _i5(conn: AsyncConnection) -> InvariantResult:
 
 
 async def check_invariants(
-    conn: AsyncConnection, run_id: int, *, settings: RunSettings, outcome_conflicts: int
+    conn: AsyncConnection, run_id: int, *, outcome_conflicts: int
 ) -> list[InvariantResult]:
     """The §17.2 invariants I1 to I7 of run `run_id`, in order, from its rows (module docstring)."""
     revisions = await _run_revisions(conn, run_id)
     return [
         await _i1(conn, run_id),
         await _i2(conn, run_id),
-        await _i3(conn, run_id, settings),
+        await _i3(conn, run_id),
         await _i4(conn, run_id),
         await _i5(conn),
         InvariantResult("I6", revisions.awaiting == 0, {"awaiting": revisions.awaiting}),
@@ -630,7 +631,7 @@ async def finalize_from_graph(deps: CollectDeps, owner: RunOwner, state: Collect
             )
         await finalize_cells(conn, owner.run_id, now=now)
         await abandon_old_gaps(conn, now=now, max_ad_age_days=settings.scope.max_ad_age_days)
-        invariants = await check_invariants(conn, owner.run_id, settings=settings, outcome_conflicts=0)
+        invariants = await check_invariants(conn, owner.run_id, outcome_conflicts=0)
         partial = await partial_conditions(conn, owner.run_id)
         status, reason = decide_status(invariants, partial)
         await _alerts(conn, owner.run_id, status, invariants, partial)

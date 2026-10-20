@@ -314,7 +314,6 @@ _JOB: Final = (
     "j.det_facts_hash, coalesce(r.description_text, '') AS description_text "
     "FROM jobs j LEFT JOIN job_revisions r ON r.id = j.current_revision_id WHERE j.id = :job"
 )
-_READ_JOB: Final = q(_JOB)
 _LOCK_JOB: Final = q(_JOB + " FOR SHARE OF j")
 
 
@@ -346,20 +345,12 @@ def _facts(row: Row[tuple[object, ...]]) -> DetFacts:
     )
 
 
-async def _load(conn: AsyncConnection, job_id: int, *, lock: bool) -> _Loaded:
-    row = (await conn.execute(_LOCK_JOB if lock else _READ_JOB, {"job": job_id})).first()
+async def _load(conn: AsyncConnection, job_id: int) -> _Loaded:
+    """The job's facts, description and `det_facts_hash`, its row `FOR SHARE`."""
+    row = (await conn.execute(_LOCK_JOB, {"job": job_id})).first()
     if row is None:
         raise LookupError(f"job {job_id} does not exist")
     return _Loaded(_facts(row), row.description_text, bytes(row.det_facts_hash))
-
-
-async def load_facts(conn: AsyncConnection, job_id: int) -> tuple[DetFacts, str]:
-    """The job's `DetFacts` and the `description_text` of its current revision (empty when it has none).
-
-    Raises `LookupError` for a job that does not exist.
-    """
-    loaded = await _load(conn, job_id, lock=False)
-    return loaded.facts, loaded.description_text
 
 
 # -- writing results -----------------------------------------------------------------------------------------
@@ -425,7 +416,7 @@ async def refilter_job(
     The caller holds `active_config` `FOR SHARE` (`active_scopes`). Raises `LookupError` for a job that does
     not exist.
     """
-    loaded = await _load(conn, job_id, lock=True)
+    loaded = await _load(conn, job_id)
     description = _Description(loaded.description_text)  # normalised at most once, whatever the scopes
     results: dict[int, HardFilterResult] = {}
     for scope_version_id, scope in scopes.items():

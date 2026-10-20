@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+from datetime import timedelta
 from typing import Any
 
 import pytest
 import sqlalchemy as sa
+from jobhunter.clock import utcnow
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.graph import build_collect_graph, build_noop_collect_graph
 from jobhunter.graphs.collect.nodes import finalize as finalize_module
@@ -19,7 +21,10 @@ from jobhunter.graphs.collect.nodes.finalize import (
 )
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.metrics import REGISTRY
-from jobhunter.run_settings import load_run_settings
+from jobhunter.quota import ledger
+from jobhunter.quota.pacing import fair_share, per_run_cap
+from jobhunter.quota.windows import current_snapshot
+from jobhunter.sources.base import Observation
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.worker import runs
 from jobhunter.worker.runs import RunCompletion, RunEnd
@@ -32,6 +37,7 @@ from tests.support.collect import (
     make_deps,
     manual_run_id,
     pending_item,
+    planned_request,
     queued_run,
     resolved,
     run_to_the_end,
@@ -39,6 +45,7 @@ from tests.support.collect import (
     supersede,
 )
 from tests.support.pg import pg_rows
+from tests.support.quota import insert_window, jsearch_window, seeded_run_settings
 
 pytestmark = pytest.mark.integration
 
@@ -387,22 +394,14 @@ async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, 
     again = await pending_item(engine, owner, "jsearch", {"native_id": "H"})
     assert await resolved(engine, owner, again) == "deferred"
     async with engine.connect() as c:
-        version = (
-            await c.execute(
-                sa.text("SELECT settings_version_id FROM runs WHERE id = :r"), {"r": owner.run_id}
-            )
-        ).scalar_one()
-        settings = await load_run_settings(c, version)
-        results = {
-            r.code: r for r in await check_invariants(c, owner.run_id, settings=settings, outcome_conflicts=0)
-        }
+        results = {r.code: r for r in await check_invariants(c, owner.run_id, outcome_conflicts=0)}
         assert [r.code for r in results.values()] == ["I1", "I2", "I3", "I4", "I5", "I6", "I7"]
         assert results["I1"].ok and results["I1"].detail == {"responses": 2, "mismatched": 0, "pending": 0}
         assert results["I2"].ok and results["I4"].ok and results["I5"].detail == {"llm_tuple_id": None}
         # the run's one revision awaits its embedding: I6 counts it, and it is the run's one partial cause
         assert results["I6"] == InvariantResult("I6", False, {"awaiting": 1})
         assert await partial_conditions(c, owner.run_id) == ["awaiting_embedding"]
-        failed = await check_invariants(c, owner.run_id, settings=settings, outcome_conflicts=2)
+        failed = await check_invariants(c, owner.run_id, outcome_conflicts=2)
         assert failed[-1] == InvariantResult("I7", False, {"conflicts": 2})
 
 
@@ -431,3 +430,91 @@ async def test_a_succeeded_run_resolves_every_orphaned_queue_alert_and_a_partial
     rid = await run_to_the_end(engine, collect_deps)
     assert (await run_end(engine, rid))[0] == "succeeded"
     assert [await open_alert(engine, key) for key in keys] == [None, None]
+
+
+# --- final review F3, Minor 2: I3 against the per-run cap admitted at reservation ---------------------------
+
+REFINED_LIMIT = 1500  # a fair share of about 12 units per 6 h run: a per-run cap of 25, above the floor of 10
+ADMITTED_CAPS = sa.text("SELECT per_run_cap FROM quota_ledger WHERE run_id = :r ORDER BY id")
+EXTRA_NORMAL = sa.text(
+    "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, "
+    "run_id, run_attempt_no, units, state, per_run_cap) SELECT 'jsearch', window_start, 'request', "
+    "'normal', :key, 1, :run, :attempt, 1, 'reserved', 19 FROM quota_windows "
+    "WHERE provider = 'jsearch' AND is_current"
+)
+
+
+async def i3_of(engine, owner) -> InvariantResult:
+    async with engine.connect() as c:
+        results = await check_invariants(c, owner.run_id, outcome_conflicts=0)
+    return next(r for r in results if r.code == "I3")
+
+
+async def test_i3_holds_a_run_to_the_per_run_cap_its_reservations_were_admitted_under(
+    engine, current_epoch
+) -> None:
+    """A run spends exactly its per-run cap (25 normal JSearch units); a response then refines the window to
+    a longer period (its reset 40 days after the start), which lowers the window's cap to 19. The run kept
+    to the cap in force at each reservation, so I3 holds; one normal unit beyond the admitted cap fails it."""
+    settings = seeded_run_settings()  # 6 h interval, `paid_max_requests_per_run` auto
+    t0 = utcnow()
+    window = jsearch_window(t0, limit=REFINED_LIMIT, reserve=0, tokens=24, interval_s=settings.interval_s)
+    await insert_window(engine, window)
+    owner = await queued_run(engine)
+    decisions: list[ledger.Reservation | ledger.Denial] = []
+    for n in range(26):
+        key = n.to_bytes(32, "big")
+        fr = await planned_request(engine, owner, provider="jsearch", key=key, attempt_seq=1)
+        async with engine.begin() as c:  # 24 tokens at t0; the 25th unit accrues within the hour
+            decisions.append(
+                await ledger.reserve(
+                    c,
+                    "jsearch",
+                    owner=owner,
+                    request_key=key,
+                    attempt_seq=1,
+                    request_class="normal",
+                    fetch_request_id=fr,
+                    settings=settings.quota,
+                    interval_s=settings.interval_s,
+                    now=t0 if n < 24 else t0 + timedelta(hours=1),
+                )
+            )
+    assert all(isinstance(d, ledger.Reservation) for d in decisions[:25])
+    assert decisions[25] == ledger.Denial("paced")  # the 26th: the per-run cap of 25
+    async with engine.connect() as c:  # every reservation records the cap it was admitted under
+        caps = (await c.execute(ADMITTED_CAPS, {"r": owner.run_id})).scalars().all()
+    assert caps == [25] * 25
+    last = decisions[24]
+    assert isinstance(last, ledger.Reservation)
+    refined_at = t0 + timedelta(hours=1)
+    async with engine.begin() as c:  # the last response's headers refine the window to a longer period
+        await ledger.mark_dispatched(c, last.entry_id, owner)
+        await ledger.settle(
+            c,
+            last.entry_id,
+            state="billed",
+            evidence=None,
+            http_status=200,
+            provider_remaining=REFINED_LIMIT - 25,
+            settings=settings.quota,
+            interval_s=settings.interval_s,
+            now=refined_at,
+            observation=Observation(
+                observed_at=refined_at,
+                status=200,
+                reset_at=t0 + timedelta(days=40),
+                limit=REFINED_LIMIT,
+                remaining=REFINED_LIMIT - 25,
+            ),
+        )
+        refined = await current_snapshot(c, "jsearch")
+    assert refined is not None and refined.window_end == t0 + timedelta(days=40)
+    assert per_run_cap(settings.quota, fair_share(refined, settings.interval_s)) == 19  # below the 25 spent
+    assert await i3_of(engine, owner) == InvariantResult("I3", True, {"windows": 1, "breaches": []})
+    async with engine.begin() as c:  # a normal unit admitted beyond the cap (a bug): I3 must catch it
+        await c.execute(EXTRA_NORMAL, {"key": (99).to_bytes(32, "big"), "run": owner.run_id, "attempt": 1})
+    failed = await i3_of(engine, owner)
+    assert not failed.ok and failed.detail["breaches"] == [
+        {"provider": "jsearch", "kind": "per_run_cap", "used": 26, "limit": 25}
+    ]

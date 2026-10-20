@@ -24,7 +24,7 @@ from jobhunter.sources.serpapi import SerpApiAdapter
 from jobhunter.worker import runs
 from jobhunter.worker.runs import RunOwner
 from jobhunter.worker.tasks import defer_in_tx
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import (
     acquire_ctx,
@@ -214,7 +214,7 @@ async def test_replay_order_of_rule_two(
     owner = await queued_run(engine)
     seen: list[Sequence[str | None]] = []
 
-    async def known(ids: Sequence[str | None]) -> int:
+    async def known(conn: AsyncConnection, ids: Sequence[str | None]) -> int:
         seen.append(ids)
         return 4  # four of the page's ten ids are known postings
 
@@ -1116,7 +1116,7 @@ async def test_an_exception_between_send_and_settlement_leaves_the_row_dispatche
     spec = await page1_spec(engine, cell)
     ctx = acquire_ctx(engine, owner, jsearch_fixture_adapter, billing="paid", provider="jsearch")
 
-    async def broken(ids: Sequence[str | None]) -> int:
+    async def broken(conn: AsyncConnection, ids: Sequence[str | None]) -> int:
         raise RuntimeError("a bug after the send")
 
     with pytest.raises(RuntimeError, match="a bug after the send"):
@@ -1173,6 +1173,37 @@ async def test_a_serialization_failure_in_the_settlement_is_retried_with_the_res
         await acquire_page(ctx, third, cell_id=cell, phase="primary", planned_id=None)
     assert injected == ["40P01"] and [a[2] for a in await attempts(engine, third, owner)] == ["dispatched"]
     assert len(served_requests(fixture_log)) == 3  # one send each
+
+
+async def test_the_new_id_count_is_part_of_the_settlement_so_a_failed_count_keeps_the_response(
+    engine, current_epoch, jsearch_fixture_adapter, fixture_log
+) -> None:  # final review F3, Minor 1
+    """The known-postings count (`new_native_ids`) is read in the settlement transaction: a serialization
+    failure there is retried with the response in hand, never a paid response lost to an ambiguous entry."""
+    owner, cell = await queued_run(engine), await jsearch_cell(engine)
+    spec = await page1_spec(engine, cell)
+    calls: list[int] = []
+
+    async def known(conn: AsyncConnection, ids: Sequence[str | None]) -> int:
+        calls.append(len(calls))
+        if len(calls) == 1:  # the first count fails as the server's serialization failure
+            async with engine.connect() as c:
+                await c.execute(sa.text(RAISE.format("40001")))
+        return 4
+
+    r = await acquire_page(
+        jsearch_ctx(engine, owner, jsearch_fixture_adapter),
+        spec,
+        cell_id=cell,
+        phase="primary",
+        planned_id=None,
+        known_native_ids=known,
+    )
+    assert isinstance(r, Served) and not r.replayed and r.new_native_ids == 6 and calls == [0, 1]
+    assert await attempts(engine, spec, owner) == [
+        (1, "normal", "succeeded", None, None, 200, "billed", None, "probe")
+    ]
+    assert len(served_requests(fixture_log)) == 1
 
 
 async def test_a_receipt_moved_under_the_resolution_is_resolved_again(

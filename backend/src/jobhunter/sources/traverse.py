@@ -18,11 +18,11 @@ The page rules (§5.3):
 - **Arbeitnow** (Ruling T10-a): the fresh head from page 1, read to the end of the feed (`end`), the page cap
   `arbeitnow.page_cap(interval_s)` (`cursor`, `page_cap`) or `remaining_low` (`cursor`, `allowance`); no
   item time stops it. Its reads go to `arbeitnow.conclude` and `covered_span` against the cell's
-  `FirehoseState`, rebuilt from its newest `covered` row and its gaps of every status. The fresh leg ends
-  every traversal (the end of the feed, the cap, the remaining-low rule or a failure), so no page is ever left
-  for the seek legs of `plan_legs`: they are not read, and their `n_newer` counts are not queried. A traversal
-  that fails after its first page concludes with `stopped_by="remaining"` (its reads prove nothing), one
-  that read nothing does not conclude.
+  `FirehoseState`, rebuilt from its newest `covered` row and its gaps of every status. The read from page 1
+  ends every traversal (the end of the feed, the cap, the remaining-low rule or a failure), so no seek leg is
+  planned: no page would be left for one (plan Deviation 27). A traversal that fails after its first page
+  concludes with `stopped_by="remaining"` (its reads prove nothing), one that read nothing does not
+  conclude.
 - **ATS boards**: until `END` (Lever and SmartRecruiters by offset), at most `ATS_PAGE_CAP` list pages;
   SmartRecruiters detail calls for the postings `detail_specs` names after each list page (none once
   admission has stopped), at most `ratelimit.SMARTRECRUITERS_DETAIL.concurrency` at a time, which never end
@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Final, Literal
 
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut, InvariantViolation
@@ -72,7 +72,6 @@ from jobhunter.sources.arbeitnow import (
     ArbeitnowAdapter,
     FirehoseState,
     Gap,
-    Leg,
     StopReason,
     conclude,
     covered_span,
@@ -118,7 +117,9 @@ class TraversalResult:
     the last one when it had one. `snapshot` is a board's membership (`None` without a served list page),
     `firehose` the Arbeitnow cell's coverage before the traversal with the gaps `conclude` created or
     changed, and `covered` the span the Arbeitnow reads prove covered (`covered_span`). `taken_at` is the
-    arrival of the first served list page (a snapshot's `taken_at`).
+    arrival of the first served list page (a snapshot's `taken_at`). `sent` holds the outcomes of the pages
+    this attempt sent, which `FETCH_REQUESTS` counts: a receipt a resumed attempt replays and a denied page
+    are not among them.
     """
 
     outcomes: list[FetchOutcome]
@@ -131,6 +132,7 @@ class TraversalResult:
     firehose: tuple[FirehoseState, list[Gap]] | None
     covered: CoverageWindow | None = None
     taken_at: datetime | None = None
+    sent: list[FetchOutcome] = field(default_factory=list)
 
 
 def _outcome(result: PageResult, items: int) -> FetchOutcome:
@@ -166,6 +168,7 @@ class _Traversal:
     limiter: RateLimiter
     probe: bool  # a half-open instance: one page
     outcomes: list[FetchOutcome] = field(default_factory=list)
+    sent_outcomes: list[FetchOutcome] = field(default_factory=list)  # of the pages this attempt sent
     pages: list[RawPage] = field(default_factory=list)  # the served list pages, in order
     items: int = 0
     sent: bool = False  # whether an attempt of this traversal may have reached the provider
@@ -191,17 +194,20 @@ class _Traversal:
                 self.items += items
         fresh = isinstance(result, Served | Failed) and not result.replayed
         self.sent = self.sent or fresh or isinstance(result, Ambiguous)
-        self.outcomes.append(_outcome(result, items))
+        outcome = _outcome(result, items)
+        self.outcomes.append(outcome)
+        if isinstance(result, Served | Failed | Ambiguous) and not result.replayed:  # sent by this call
+            self.sent_outcomes.append(outcome)
         return result
 
-    async def _known(self, ids: Sequence[str | None]) -> int:
-        """How many distinct ids of a served page are postings of the instance already (§5.3.1)."""
+    async def _known(self, conn: AsyncConnection, ids: Sequence[str | None]) -> int:
+        """How many distinct ids of a served page are postings of the instance already (§5.3.1), read on the
+        page's settlement transaction (`conn`)."""
         distinct = sorted({native_id for native_id in ids if native_id is not None})
         if not distinct:
             return 0
-        async with self.ctx.engine.connect() as conn:
-            params = {"i": self.plan.instance_id, "ids": distinct}
-            return int((await conn.execute(_KNOWN, params)).scalar_one())
+        params = {"i": self.plan.instance_id, "ids": distinct}
+        return int((await conn.execute(_KNOWN, params)).scalar_one())
 
     def result(
         self,
@@ -234,6 +240,7 @@ class _Traversal:
             firehose=firehose,
             covered=covered,
             taken_at=self.pages[0].fetched_at if self.pages else None,
+            sent=list(self.sent_outcomes),
         )
 
 
@@ -379,10 +386,9 @@ async def _firehose(
         spec, planned_id = nxt, None
     if not t.pages:
         return t.result(end, reason)
-    legs = [(Leg("fresh", None, 1), times)]
     _, changed = conclude(
         state,
-        legs,
+        times,
         pages=len(t.pages),
         cap=cap,
         stopped_by=stopped_by,
@@ -394,7 +400,7 @@ async def _firehose(
         reason,
         cursor_out=None if end == "end" else cursor,
         firehose=(state, changed),
-        covered=covered_span(legs, stopped_by=stopped_by),
+        covered=covered_span(times, stopped_by=stopped_by),
     )
 
 

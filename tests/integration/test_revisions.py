@@ -9,11 +9,11 @@ from jobhunter.dedup import revisions
 from jobhunter.dedup.revisions import RecomputeResult
 from jobhunter.errors import InvariantViolation
 from jobhunter.normalize.companies import company_key
-from jobhunter.scoring.filters import det_facts_hash, load_facts
+from jobhunter.scoring.filters import det_facts_hash
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import JobWithPostings, add_observation, add_posting
-from tests.support.facts import BERLIN, HAMBURG
+from tests.support.facts import BERLIN, HAMBURG, load_facts
 from tests.support.observations import predicted, stated
 
 pytestmark = pytest.mark.integration

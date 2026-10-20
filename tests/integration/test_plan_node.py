@@ -649,8 +649,8 @@ async def test_a_half_open_paid_instance_gets_exactly_one_spec(engine, current_e
 
 LEDGER_ENTRY = sa.text(
     "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, units, "
-    "state, created_at, dispatched_at, settled_at) VALUES ('jsearch', :ws, 'request', 'normal', :key, 1, 1, "
-    "'billed', :at, :at, :at)"
+    "state, per_run_cap, created_at, dispatched_at, settled_at) VALUES ('jsearch', :ws, 'request', 'normal', "
+    ":key, 1, 1, 'billed', 10, :at, :at, :at)"
 )
 ATTEMPTED = sa.text("UPDATE coverage_cells SET last_attempted_at = :at WHERE id = :c")
 
@@ -864,6 +864,29 @@ async def test_the_fallback_account_read_is_persisted_so_the_renewal_stale_alert
         validated = await current_snapshot(c, "serpapi")
     assert validated is not None and (validated.window_end, validated.state) == (NEXT_RENEWAL, "validated")
     assert reads.call_count == 2
+
+
+async def test_no_fallback_account_read_is_made_while_the_serpapi_breaker_blocks(
+    engine, current_epoch, respx_mock, serpapi_fixture_adapter: SerpApiAdapter
+) -> None:
+    """Final review F3, Minor 4: the projection's account read is a send to SerpApi too, so an `auth_failed`
+    instance (a revoked key) gets none before its half-open time; once half open, the read is made (the
+    breaker's probe)."""
+    await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("jsearch", "serpapi"))
+    deps = collect_deps(engine, lambda instance: serpapi_fixture_adapter)
+    reads = respx_mock["serpapi_account"]
+    async with engine.begin() as c:
+        serpapi = await instance_id(c, "serpapi")
+        assert await record_failure(c, serpapi, "auth", billing="paid", now=utcnow()) == "auth_failed"
+    await plan_fallback_once(engine, deps)
+    assert reads.call_count == 0  # blocked for 6 h
+    async with engine.begin() as c:  # six hours on: half open
+        await c.execute(
+            sa.text("UPDATE source_instances SET half_open_after = :at WHERE id = :i"),
+            {"at": utcnow() - timedelta(minutes=1), "i": serpapi},
+        )
+    await plan_fallback_once(engine, deps)
+    assert reads.call_count == 1
 
 
 async def test_the_fallback_account_read_resolves_the_foreign_usage_alert_after_conservative_mode(

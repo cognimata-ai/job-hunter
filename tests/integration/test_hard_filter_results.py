@@ -23,7 +23,7 @@ from jobhunter.worker import reconcilers as r
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import ctx, make_deps, queued_run, supersede
-from tests.support.facts import BERLIN, HAMBURG, facts, scope
+from tests.support.facts import BERLIN, HAMBURG, facts, load_facts, scope
 from tests.support.procs import await_until
 from tests.support.quota import seeded_payload
 
@@ -258,7 +258,7 @@ async def test_load_facts_reads_every_det_fact_from_a_jobs_column_and_the_curren
             },
         )
     async with engine.connect() as conn:
-        loaded, description = await filters.load_facts(conn, made.job_id)
+        loaded, description = await load_facts(conn, made.job_id)
     assert description == ""  # no current revision
     assert loaded == DetFacts(
         company_key="initech",
@@ -286,18 +286,18 @@ async def test_load_facts_reads_every_det_fact_from_a_jobs_column_and_the_curren
 
     await set_description(engine, made.job_id, "Wir nutzen SAP.")
     async with engine.connect() as conn:
-        assert (await filters.load_facts(conn, made.job_id))[1] == "Wir nutzen SAP."
+        assert (await load_facts(conn, made.job_id))[1] == "Wir nutzen SAP."
     with pytest.raises(LookupError):
         async with engine.connect() as conn:
-            await filters.load_facts(conn, made.job_id + 1000)
+            await load_facts(conn, made.job_id + 1000)
 
 
 async def test_a_job_without_a_structured_seniority_loads_none(engine, current_epoch, job_factory) -> None:
     plain = await job_factory(native_id="a")
     tagged = await job_factory(native_id="b", structured_seniority="entry-level")
     async with engine.connect() as conn:
-        assert (await filters.load_facts(conn, plain.job_id))[0].structured_seniority is None
-        assert (await filters.load_facts(conn, tagged.job_id))[0].structured_seniority == "entry-level"
+        assert (await load_facts(conn, plain.job_id))[0].structured_seniority is None
+        assert (await load_facts(conn, tagged.job_id))[0].structured_seniority == "entry-level"
 
 
 async def test_refilter_job_writes_a_row_per_scope_with_the_stored_hash(
@@ -489,7 +489,7 @@ async def test_the_facts_of_a_job_that_knows_nothing_pass_every_filter(
     """The factory's job has an unknown work mode, language and location: positive evidence only."""
     job = (await job_factory(native_id="a")).job_id
     async with engine.connect() as conn:
-        loaded, description = await filters.load_facts(conn, job)
+        loaded, description = await load_facts(conn, job)
     assert loaded == facts() and description == ""
     assert filters.evaluate(loaded, description, scope()).passed
 

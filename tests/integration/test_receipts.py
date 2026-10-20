@@ -9,8 +9,8 @@ from jobhunter.sources.base import RawPage, RequestSpec, request_key
 from jobhunter.sources.http import ERROR_BODY_BYTES
 from jobhunter.sources.receipts import (
     RAW_BODY_TTL,
+    fetch_attempts,
     insert_fetch_request,
-    latest_fetch_attempt,
     load_response,
     store_response,
 )
@@ -123,13 +123,13 @@ async def test_store_and_load_roundtrip_with_dedup_and_error_truncation(engine, 
         assert (await load_response(c, late, specs[3])).body == body
 
 
-async def test_latest_fetch_attempt_picks_the_highest_attempt_seq(engine, current_epoch) -> None:
+async def test_fetch_attempts_are_a_key_s_attempts_in_attempt_seq_order(engine, current_epoch) -> None:
     owner, cell = await queued_run(engine), await jsearch_cell(engine)
     spec = await page1_spec(engine, cell)
     other = replace(spec, page_no=2)
     key = request_key(spec, owner.run_id)
     async with engine.connect() as c:
-        assert await latest_fetch_attempt(c, key) is None
+        assert await fetch_attempts(c, key) == []
     ids = {
         2: await planned(engine, owner, spec, attempt_seq=2, status="skipped", skip_reason="superseded"),
         3: await planned(engine, owner, spec, attempt_seq=3),
@@ -137,9 +137,11 @@ async def test_latest_fetch_attempt_picks_the_highest_attempt_seq(engine, curren
     }
     other_id = await planned(engine, owner, other, attempt_seq=5)
     async with engine.connect() as c:
-        latest = await latest_fetch_attempt(c, key)
-        latest_other = await latest_fetch_attempt(c, request_key(other, owner.run_id))
-    assert latest is not None and latest_other is not None
+        found = await fetch_attempts(c, key)
+        (latest_other,) = await fetch_attempts(c, request_key(other, owner.run_id))
+    # in attempt_seq order, whatever the insert order
+    assert [(a.id, a.attempt_seq) for a in found] == [(ids[n], n) for n in (1, 2, 3)]
+    latest = found[-1]  # the latest attempt, which the acquisition resolves (§6.2 rule 2)
     assert (latest.id, latest.attempt_seq, latest.status) == (ids[3], 3, "planned")
     assert (latest.run_id, latest.run_attempt_no) == (owner.run_id, owner.attempt_no)
     assert (latest.raw_response_id, latest.quota_ledger_id, latest.http_status) == (None, None, None)
