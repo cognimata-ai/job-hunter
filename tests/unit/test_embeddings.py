@@ -92,12 +92,12 @@ Handler = Callable[[httpx.Request], Any]
 
 
 async def _call(handler: Handler, texts: list[str], **options: Any) -> list[Embedded]:
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as http:
         return await EmbedderClient(BASE + "/", http).embed(texts, input_kind="passage", **options)
 
 
 async def _health(handler: Handler, **options: Any) -> EmbedderHealth:
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as http:
         return await EmbedderClient(BASE, http).health(**options)
 
 
@@ -207,6 +207,43 @@ async def test_a_malformed_answer_is_a_bad_response(
         await _call(lambda request: respond(texts), texts)
     assert (raised.value.kind, raised.value.code) == ("bad_response", code)
     assert str(raised.value) == f"bad_response: {code}"  # the kind and the code, never content
+
+
+def _one_hot(value: float, rest: float = 0.0) -> list[float]:
+    return [value] + [rest] * (EMBEDDING_DIM - 1)
+
+
+@pytest.mark.parametrize(
+    ("vector", "code"),
+    [
+        (_one_hot(65_505.0), "out_of_range"),  # past the largest finite half (65,504): halfvec refuses it
+        (_one_hot(-1e6), "out_of_range"),
+        (_one_hot(65_504.0), "norm"),  # in the halfvec range, far from unit length
+        (_one_hot(0.0), "norm"),  # the zero vector
+        (_one_hot(1.011), "norm"),
+        (_one_hot(0.989), "norm"),
+        (_one_hot(0.5, 0.5), "norm"),
+    ],
+)
+async def test_a_vector_halfvec_cannot_hold_or_not_of_unit_length_is_a_bad_response(
+    vector: list[float], code: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_embed_body(["a"], vectors=[vector]))
+
+    with pytest.raises(EmbedderError) as raised:
+        await _call(handler, ["a"])
+    assert (raised.value.kind, raised.value.code) == ("bad_response", code)
+
+
+async def test_a_vector_within_the_norm_tolerance_is_accepted() -> None:
+    for value in (1.009, 0.991):
+
+        def handler(request: httpx.Request, value: float = value) -> httpx.Response:
+            return httpx.Response(200, json=_embed_body(["a"], vectors=[_one_hot(value)]))
+
+        (out,) = await _call(handler, ["a"])
+        assert out.vector[0] == value
 
 
 async def test_a_non_finite_component_is_a_bad_response() -> None:

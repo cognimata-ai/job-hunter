@@ -12,7 +12,9 @@ answer; it raises `EmbedderError` with a kind and a short code, never content:
 
 - `unavailable`: a connect error, a timeout (each batch has `BATCH_TIMEOUT_S` in all, §9.2) or a 5xx;
 - `bad_response`: a 4xx, a body that is not the contract's JSON, a wrong count, a wrong dimension, a value
-  that is no finite number, or a `model_id` other than `EMBEDDING_MODEL_ID`;
+  that is no finite number or lies outside the `halfvec` range (`HALFVEC_MAX`), a vector whose L2 norm is
+  not within `1 ± NORM_TOLERANCE`, or a `model_id` other than `EMBEDDING_MODEL_ID`. All of it is checked
+  before anything is written, so no database range error can turn an answer into a failed run;
 - `checksum`: a 5xx while `/health` answers 503 with `checksum_ok: false`. **Known limitation (ruling
   T21-b):** the real embedder exits 78 on a checksum mismatch (§16.8), so the worker and the api see
   `unavailable` (and the container's restart loop); the critical `embedder.checksum_mismatch` alert is not
@@ -26,8 +28,9 @@ usable by this code: a 200 with status `ok`, the checksum verified, `EMBEDDING_M
 413 and no revision stays awaiting for its length. The service flags its own 1,024-token truncation.
 
 **`embed_awaiting`** embeds the revisions `awaiting_embedding`, oldest first (`created_at`, then `id`), in
-batches of `BATCH`, as passages. Per batch: one `/v1/embed` call (its duration observed in `EMBED_SECONDS`),
-the fault point `collect.embed.after_http`, then one transaction that **first** runs `guard(conn)`, the
+batches of `BATCH`, as passages. Per batch: one `/v1/embed` call (its duration observed in `EMBED_SECONDS`
+with its outcome: `ok`, the `EmbedderError` kind, or `error`, failed and timed-out calls included), the fault
+point `collect.embed.after_http`, then one transaction that **first** runs `guard(conn)`, the
 post-I/O ownership check (the node: the run's owner row, `ledger.lock_run_owner`; the reconciler: the worker
 epoch, `fence_epoch`). `FencedOut` propagates and the attempt is lost, so no vector of a superseded owner is
 committed. Then each vector is upserted (`upsert_embedding`: two revisions with one text share one row) and
@@ -40,14 +43,20 @@ asked before each batch (the node's deadline and the worker's shutdown).
 **In flight.** The service embeds one batch at a time (Task 21), about 28 s for a batch of 16 on the V7 CPU,
 so a fourth queued batch would pass `BATCH_TIMEOUT_S`. Each caller runs one sequential loop, one batch in
 flight: the `embed` node (the collect queue runs one run at a time) and the `awaiting_embedding` reconciler
-(the tick queue's one worker), at most two batches together in M1; with M2's profile embedding at most
-three.
+(the tick queue's one worker), which yields to a running run, so the two overlap only when a run starts during
+a reconciler pass: at most two batches together in M1; with M2's profile embedding at most three.
 
-**The reconciler** `awaiting_embedding` (§17.4, cadence `heavy`) runs only while the embedder is healthy: it
-embeds the revisions awaiting for more than `AWAITING_GRACE` (at most `RECONCILE_LIMIT` per pass, so the tick
-queue is not held for long), fenced by the worker epoch, and resolves `embedder.unavailable` once no revision
-awaits at all ("embedder healthy and backlog cleared", §17.6). M1 has no score targets, so there is no
-similarity to set yet. The `embed` node raises that alert (`raise_unavailable`).
+**The reconciler** `awaiting_embedding` (§17.4, cadence `heavy`) runs only while the embedder is healthy and
+**no run is `running`** (ruling T22-a: a running run's `embed` node embeds the backlog itself, oldest first,
+so the two never compete for one batch). Its first transaction proves the worker epoch (`fence_epoch`) and
+reads whether a run is running; a pass that skips logs `awaiting_embedding_skipped` with its `reason`. It
+embeds the revisions awaiting for more than `AWAITING_GRACE`, fenced by the worker epoch, at most
+`RECONCILE_LIMIT` (32, two batches) per pass. `reconcile_heavy` runs on the `tick` queue, whose one worker
+the minute tick shares, so one pass holds that queue for about 1 min at the measured 0.57 docs/s, and for at
+most twice `BATCH_TIMEOUT_S` (4 min) when the embedder is slow. A run that starts during a pass can overlap
+it by that one pass. It resolves `embedder.unavailable` once no revision awaits at all ("embedder healthy
+and backlog cleared", §17.6). M1 has no score targets, so there is no similarity to set yet. The `embed`
+node raises that alert (`raise_unavailable`).
 """
 
 import asyncio
@@ -83,8 +92,12 @@ TEXT_FIELDS: Final = ("title", "company_display", "description_text")
 AFTER_HTTP: Final = "collect.embed.after_http"
 # §17.4: the reconciler embeds revisions awaiting for longer than this.
 AWAITING_GRACE: Final = timedelta(minutes=10)
-# The most revisions one reconciler pass embeds: 4 batches, about 2 min on the V7 CPU.
-RECONCILE_LIMIT: Final = 4 * BATCH
+# The most revisions one reconciler pass embeds (ruling T22-a): 2 batches, about 1 min on the V7 CPU.
+RECONCILE_LIMIT: Final = 2 * BATCH
+# The largest finite half-precision value: `halfvec` refuses a component beyond it.
+HALFVEC_MAX: Final = 65_504.0
+# The service's vectors are L2-normalised; a norm off by more than this is no answer of the pinned model.
+NORM_TOLERANCE: Final = 1e-2
 UNAVAILABLE_ALERT: Final = "embedder.unavailable"
 ALERT_SUBJECT: Final = "embedder"
 
@@ -136,7 +149,17 @@ def _number(value: object) -> float:
     number = float(value)
     if not math.isfinite(number):
         raise _bad("non_finite")
+    if abs(number) > HALFVEC_MAX:
+        raise _bad("out_of_range")
     return number
+
+
+def _unit_vector(vector: list[object]) -> tuple[float, ...]:
+    """The components of `vector`: finite numbers in the `halfvec` range, of L2 norm `1 ± NORM_TOLERANCE`."""
+    components = tuple(_number(x) for x in vector)
+    if abs(math.sqrt(math.fsum(x * x for x in components)) - 1.0) > NORM_TOLERANCE:
+        raise _bad("norm")
+    return components
 
 
 def _embedded(body: object, n: int) -> list[Embedded]:
@@ -160,7 +183,7 @@ def _embedded(body: object, n: int) -> list[Embedded]:
             raise _bad("truncated")
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise _bad("tokens")
-        out.append(Embedded(vector=tuple(_number(x) for x in vector), truncated=flag, tokens=count))
+        out.append(Embedded(vector=_unit_vector(vector), truncated=flag, tokens=count))
     return out
 
 
@@ -328,6 +351,8 @@ _COUNT_AWAITING: Final = q(
     "AND created_at < :before"
 )
 
+_RUN_RUNNING: Final = q("SELECT EXISTS (SELECT 1 FROM runs WHERE status = 'running')")
+
 Guard = Callable[[AsyncConnection], Awaitable[None]]
 
 
@@ -390,16 +415,19 @@ async def embed_awaiting(
         after_at, after_id = rows[-1].created_at, int(rows[-1].id)
         taken += len(rows)
         texts = [embedding_text(row.llm_input) for row in rows]
-        started = time.monotonic()
+        started, outcome = time.monotonic(), "error"
         try:
             out = await client.embed(texts, input_kind="passage")
+            outcome = "ok"
         except EmbedderError as err:
+            outcome = err.kind
             if err.kind != "unavailable":
                 raise
             log.warning("embed_unavailable", error_code=err.code, batch=len(rows))
             unavailable = True
             break
-        EMBED_SECONDS.observe(time.monotonic() - started)
+        finally:  # every batch, a failed or timed-out one included
+            EMBED_SECONDS.labels(outcome=outcome).observe(time.monotonic() - started)
         await afault_point(AFTER_HTTP)
         done, flagged = await _write_batch(engine, guard, rows, texts, out)
         embedded += done
@@ -427,17 +455,32 @@ async def raise_unavailable(conn: AsyncConnection, *, kind: EmbedderErrorKind, r
 async def reconcile_awaiting_embedding(ctx: ReconcileContext) -> int:
     """§17.4 `awaiting_embedding` (see the module docstring); how many revisions it embedded.
 
-    0 without a client (`ctx.embedder`), while the embedder is not healthy, and when `ctx.epoch` is no
+    0, having asked the embedder for no vector: without a client (`ctx.embedder`), while a run is `running`,
+    while the embedder is not healthy (each logged `awaiting_embedding_skipped`), and when `ctx.epoch` is no
     longer the current worker epoch (`fence_epoch` logged it; the fenced transaction wrote nothing).
     """
     client = ctx.embedder
-    if client is None or not (await client.health()).ok:
+    if client is None:
+        log.warning("awaiting_embedding_skipped", reason="no_embedder")
         return 0
 
     async def fenced(conn: AsyncConnection) -> None:
         await fence_epoch(conn, ctx.epoch)
 
     try:
+        async with ctx.engine.begin() as conn:
+            await fenced(conn)
+            running = bool((await conn.execute(_RUN_RUNNING)).scalar_one())
+        if running:
+            log.info("awaiting_embedding_skipped", reason="run_running")
+            return 0
+        health = await client.health()
+        if not health.ok:
+            # Not the model id: its 40-hex revision reads as a key to the redaction (§16.8).
+            log.info(
+                "awaiting_embedding_skipped", reason="embedder_unhealthy", checksum_ok=health.checksum_ok
+            )
+            return 0
         report = await embed_awaiting(
             ctx.engine, client, guard=fenced, limit=RECONCILE_LIMIT, created_before=ctx.now - AWAITING_GRACE
         )

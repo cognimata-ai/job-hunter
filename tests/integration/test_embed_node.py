@@ -2,7 +2,6 @@ import asyncio
 import math
 from datetime import datetime, timedelta
 
-import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter import embeddings
@@ -13,6 +12,7 @@ from jobhunter.embeddings import (
     EmbedderError,
     EmbedReport,
     embed_awaiting,
+    make_http_client,
     mark_embedded,
     reconcile_awaiting_embedding,
     upsert_embedding,
@@ -25,10 +25,13 @@ from jobhunter.observability.metrics import REGISTRY
 from jobhunter.quota import ledger
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow
-from jobhunter.worker import reconcilers
+from jobhunter.worker import reconcilers, runs
+from jobhunter.worker.runs import RunOwner
 
 from tests.support.collect import ctx, make_deps, queued_run, supersede
 from tests.support.faults import PausePoint
+from tests.support.pg import blocked_or_done
+from tests.support.procs import await_until
 
 pytestmark = pytest.mark.integration
 
@@ -44,9 +47,20 @@ def no_adapter(instance: InstanceRow) -> SourceAdapter:
     raise AssertionError(f"the embed node fetches nothing, asked for {instance.source_id}")
 
 
-def embed_calls() -> float:
-    """How many embed batch calls `jobhunter_embed_seconds` observed in this process."""
-    return REGISTRY.get_sample_value("jobhunter_embed_seconds_count") or 0.0
+def embed_calls(outcome: str = "ok") -> float:
+    """How many embed batch calls `jobhunter_embed_seconds` observed in this process with `outcome`."""
+    return REGISTRY.get_sample_value("jobhunter_embed_seconds_count", {"outcome": outcome}) or 0.0
+
+
+def skips(log_events) -> list[dict[str, object]]:
+    """The `awaiting_embedding_skipped` lines logged so far (at INFO, as rendered)."""
+    return [e for e in log_events() if e["event"] == "awaiting_embedding_skipped"]
+
+
+async def finish(engine, owner: RunOwner) -> None:
+    """End `owner`'s run `succeeded`: no run is `running` any more (the reconciler yields to one, T22-a)."""
+    async with engine.begin() as c:
+        await runs.finalize_run(c, owner, status="succeeded", reason=None, report={})
 
 
 async def statuses(engine) -> dict[str, int]:
@@ -74,7 +88,7 @@ async def test_batches_dedup_and_truncation(engine, current_epoch, fake_embedder
         await ledger.lock_run_owner(c, owner)
 
     calls = embed_calls()
-    async with httpx.AsyncClient() as http:
+    async with make_http_client() as http:
         report = await embed_awaiting(engine, EmbedderClient(fake_embedder.base_url, http), guard=guard)
     assert (report.embedded, report.awaiting, report.truncated, report.unavailable) == (20, 0, 1, False)
     assert fake_embedder.batches == [16, 4] and embed_calls() == calls + 2  # `EMBED_SECONDS`, once per batch
@@ -113,14 +127,16 @@ async def test_unavailable_leaves_awaiting_and_the_reconciler_catches_up(
     await revisions_awaiting(engine, 5)
     owner = await queued_run(engine)
     fake_embedder.down = True
+    unavailable = embed_calls("unavailable")
 
     async def guard(c) -> None:
         await ledger.lock_run_owner(c, owner)
 
-    async with httpx.AsyncClient() as http:
+    async with make_http_client() as http:
         client = EmbedderClient(fake_embedder.base_url, http)
         report = await embed_awaiting(engine, client, guard=guard)
         assert report == EmbedReport(embedded=0, awaiting=5, truncated=0, unavailable=True)
+        assert embed_calls("unavailable") == unavailable + 1  # a failed batch is observed too
         assert await statuses(engine) == {"awaiting_embedding": 5} and await embeddings_rows(engine) == 0
 
         # the node: the same stop, counted, and the warn alert
@@ -131,6 +147,7 @@ async def test_unavailable_leaves_awaiting_and_the_reconciler_catches_up(
             "steps": ["embed"],
         }
         assert await open_alert(engine) == ("warn", {"kind": "unavailable", "run_id": owner.run_id})
+        await finish(engine, owner)  # the reconciler yields to a running run (T22-a)
 
         # the reconciler waits for a healthy embedder, then for the revisions to be 10 minutes old
         assert (
@@ -157,7 +174,7 @@ async def test_the_reconciler_leaves_the_alert_open_while_a_backlog_remains(
     async with engine.begin() as c:
         await embeddings.raise_unavailable(c, kind="unavailable", run_id=None)
     monkeypatch.setattr(embeddings, "RECONCILE_LIMIT", 2)  # every pass embeds at most this many
-    async with httpx.AsyncClient() as http:
+    async with make_http_client() as http:
         context = ctx(
             engine, queue_app, utcnow() + LATER, embedder=EmbedderClient(fake_embedder.base_url, http)
         )
@@ -180,7 +197,8 @@ async def test_bad_response_is_an_error_not_a_write(
     async def guard(c) -> None:
         await ledger.lock_run_owner(c, owner)
 
-    async with httpx.AsyncClient() as http:
+    observed = {kind: embed_calls(kind) for kind in ("bad_response", "checksum")}
+    async with make_http_client() as http:
         client = EmbedderClient(fake_embedder.base_url, http)
         for switch, value, kind in (
             ("dim", 8, "bad_response"),
@@ -201,6 +219,11 @@ async def test_bad_response_is_an_error_not_a_write(
         update = await node(initial_state(owner.run_id, owner.attempt_no))
     assert update == {"steps": ["embed"], "counters": {"embedder_errors": 1}}
     assert await open_alert(engine) == ("warn", {"kind": "bad_response", "run_id": owner.run_id})
+    # every failed batch is observed, by its outcome
+    assert (embed_calls("bad_response"), embed_calls("checksum")) == (
+        observed["bad_response"] + 3,
+        observed["checksum"] + 1,
+    )
     assert await embeddings_rows(engine) == 0 and await statuses(engine) == {"awaiting_embedding": 3}
 
 
@@ -215,24 +238,27 @@ async def test_superseded_owner_batch_is_fenced_after_the_http_call(
     async def guard(c) -> None:
         await ledger.lock_run_owner(c, owner)
 
-    async with httpx.AsyncClient() as http:
+    async with make_http_client() as http:
         client = EmbedderClient(fake_embedder.base_url, http)
         task = asyncio.create_task(embed_awaiting(engine, client, guard=guard))
         await asyncio.wait_for(pause.reached.wait(), 10)
         assert fake_embedder.batches == [3]  # the vectors are back
-        await supersede(engine, owner)  # a takeover: the attempt loses the run meanwhile
+        taker = await supersede(engine, owner)  # a takeover: the attempt loses the run meanwhile
         pause.resume()
         with pytest.raises(FencedOut):
             await task
         # no revision of that batch embedded, no vector of the superseded owner committed
         assert await statuses(engine) == {"awaiting_embedding": 3} and await embeddings_rows(engine) == 0
+        await finish(engine, taker)  # the reconciler yields to a running run (T22-a)
 
-        # the reconciler entry point is fenced by the worker epoch: a superseded epoch writes nothing
+        # the reconciler entry point is fenced by the worker epoch: a superseded epoch writes nothing, and its
+        # first transaction refuses it before any embed request
         assert (
             await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow() + LATER, 2, embedder=client))
             == 0
         )
         assert await statuses(engine) == {"awaiting_embedding": 3} and await embeddings_rows(engine) == 0
+        assert fake_embedder.batches == [3]
         # the current epoch passes fence_epoch and embeds them
         n = await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow() + LATER, embedder=client))
     assert n == 3 and await statuses(engine) == {"embedded": 3} and await embeddings_rows(engine) == 3
@@ -249,7 +275,7 @@ async def test_a_revision_embedded_meanwhile_is_left_alone(
     async def guard(c) -> None:
         await ledger.lock_run_owner(c, owner)
 
-    async with httpx.AsyncClient() as http:
+    async with make_http_client() as http:
         task = asyncio.create_task(
             embed_awaiting(engine, EmbedderClient(fake_embedder.base_url, http), guard=guard)
         )
@@ -300,7 +326,7 @@ async def test_the_node_stops_between_batches_at_its_deadline(
     )  # 20 min node timeout - 120 s for a batch - 60 s for its transaction
     await revisions_awaiting(engine, 40)
     owner = await queued_run(engine)
-    async with httpx.AsyncClient() as http:
+    async with make_http_client() as http:
         client = EmbedderClient(fake_embedder.base_url, http)
         deps = make_deps(engine, no_adapter, embedder=client)
         # readings: the deadline (start + 17 min), then one before each batch: 10 min in, then 20 min in
@@ -334,3 +360,91 @@ async def test_the_node_without_an_embedder_counts_what_awaits(
         "steps": ["embed"],
     }
     assert await open_alert(engine) is None
+
+
+# ---- Fix round 1 ------------------------------------------------------------------------------------------
+
+
+async def test_the_reconciler_yields_to_a_running_run(
+    engine, current_epoch, fake_embedder, revisions_awaiting, queue_app, log_events
+) -> None:
+    """Ruling T22-a: while a run is `running`, its `embed` node does the embedding; the pass does nothing."""
+    await revisions_awaiting(engine, 5)
+    owner = await queued_run(engine)  # admitted: `running`
+    async with make_http_client() as http:
+        context = ctx(
+            engine, queue_app, utcnow() + LATER, embedder=EmbedderClient(fake_embedder.base_url, http)
+        )
+        assert await reconcile_awaiting_embedding(context) == 0
+        assert fake_embedder.batches == [] and await statuses(engine) == {"awaiting_embedding": 5}
+        assert [e["reason"] for e in skips(log_events)] == ["run_running"]
+        await finish(engine, owner)
+        assert await reconcile_awaiting_embedding(context) == 5
+    assert fake_embedder.batches == [5] and await statuses(engine) == {"embedded": 5}
+
+
+async def test_a_reconciler_pass_embeds_at_most_32_after_the_grace(
+    engine, current_epoch, fake_embedder, revisions_awaiting, queue_app
+) -> None:
+    assert embeddings.RECONCILE_LIMIT == 32  # two batches: about 1 min of the shared tick queue (T22-a)
+    await revisions_awaiting(engine, 40)
+    async with make_http_client() as http:
+        client = EmbedderClient(fake_embedder.base_url, http)
+        # the grace: revisions awaiting for less than 10 minutes are left to the run that made them
+        assert await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow(), embedder=client)) == 0
+        assert fake_embedder.batches == []
+        later = ctx(engine, queue_app, utcnow() + LATER, embedder=client)
+        assert await reconcile_awaiting_embedding(later) == 32
+        assert fake_embedder.batches == [16, 16]
+        assert await statuses(engine) == {"embedded": 32, "awaiting_embedding": 8}
+        assert await reconcile_awaiting_embedding(later) == 8
+    assert fake_embedder.batches == [16, 16, 8] and await statuses(engine) == {"embedded": 40}
+
+
+async def test_the_reconciler_logs_why_it_skips(
+    engine, current_epoch, fake_embedder, revisions_awaiting, queue_app, log_events
+) -> None:
+    await revisions_awaiting(engine, 2)
+    assert await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow() + LATER)) == 0
+    fake_embedder.checksum_ok = False
+    async with make_http_client() as http:
+        client = EmbedderClient(fake_embedder.base_url, http)
+        assert (
+            await reconcile_awaiting_embedding(ctx(engine, queue_app, utcnow() + LATER, embedder=client)) == 0
+        )
+    skipped = skips(log_events)
+    assert [e["reason"] for e in skipped] == ["no_embedder", "embedder_unhealthy"]
+    assert skipped[1]["checksum_ok"] is False
+    assert fake_embedder.batches == [] and await statuses(engine) == {"awaiting_embedding": 2}
+
+
+async def test_an_embedding_another_transaction_committed_is_reused(engine, migrated) -> None:
+    """M-3: the `DO NOTHING` then `SELECT` path, across transactions: both callers get the one row's id."""
+    async with engine.connect() as first:
+        await first.begin()
+        first_id = await _upsert_unit_vector(first)  # inserted, not committed yet
+        second = asyncio.create_task(_upsert_in_own_transaction(engine))
+        # the second insert waits for the first transaction's row (its unique key) before it can decide
+        await await_until(lambda: blocked_or_done(migrated, second), 10, 0.02)
+        assert not second.done()
+        await first.commit()
+    second_id = await asyncio.wait_for(second, 10)  # DO NOTHING, then a SELECT that sees the committed row
+    assert second_id == first_id
+    # and once both committed, a third caller gets it at once
+    assert await _upsert_in_own_transaction(engine) == first_id
+    assert await embeddings_rows(engine) == 1
+
+
+async def _upsert_unit_vector(conn) -> int:
+    return await upsert_embedding(
+        conn,
+        model_id=EMBEDDING_MODEL_ID,
+        text_sha256=b"\x07" * 32,
+        input_kind="passage",
+        vector=[1.0] + [0.0] * 1023,
+    )
+
+
+async def _upsert_in_own_transaction(engine) -> int:
+    async with engine.begin() as c:
+        return await _upsert_unit_vector(c)

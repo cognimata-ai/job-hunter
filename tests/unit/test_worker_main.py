@@ -106,6 +106,10 @@ class World:
         self.on_executions_cancelled: Callable[[], None] = lambda: None
         self.on_watchdog_stopped: Callable[[], None] = lambda: None
         self.saver_close_hangs = False
+        # What the start handed on (Task 22 fix round 1, M-2): the runtime, the reconcile contexts, the deps.
+        self.runtimes: list[object] = []
+        self.contexts: list[object] = []
+        self.deps: list[object] = []
         world = self
 
         class FakeLockSession:
@@ -159,6 +163,7 @@ class World:
                 events.append("queue_close")
 
             async def run_worker_async(self, **options: object) -> None:
+                world.runtimes.append(options["additional_context"]["runtime"])  # type: ignore[index]
                 if options["name"] == "jh-tick":  # this loop asks for the shutdown, as a SIGTERM would
                     options["additional_context"]["runtime"].shutdown.requested.set()  # type: ignore[index]
                 try:
@@ -181,8 +186,13 @@ class World:
             events.append("claim")
             return 3, {}
 
+        def fake_build_collect_graph(saver: object, deps: object) -> object:
+            world.deps.append(deps)
+            return object()
+
         async def fake_reconcilers(ctx: object, cadence: str) -> dict[str, int]:
             events.append(f"reconcile_{cadence}")
+            world.contexts.append(ctx)
             return {}
 
         for name, fake in {
@@ -193,7 +203,7 @@ class World:
             "claim_epoch_and_sweep": fake_claim,
             "Watchdog": FakeWatchdog,
             "open_saver": fake_open_saver,
-            "build_collect_graph": lambda saver, deps: object(),
+            "build_collect_graph": fake_build_collect_graph,
             "run_reconcilers": fake_reconcilers,
             "EXECUTIONS": FakeExecutions(),
         }.items():
@@ -226,6 +236,28 @@ async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch,
         *TEARDOWN,
     ]
     assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [0]
+
+
+async def test_the_worker_shares_one_embedder_client_on_its_configured_url(monkeypatch, tmp_path) -> None:
+    """Task 22 fix round 1, M-2: the graph's deps, the runtime (whose task bodies hand it to every reconcile
+    context) and the start's reconcile context carry one client on `cfg.embedder_url`, closed at teardown."""
+    from jobhunter.embeddings import EmbedderClient
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.reconcilers import ReconcileContext
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    runtime = world.runtimes[0]
+    assert isinstance(runtime, WorkerRuntime) and all(r is runtime for r in world.runtimes)
+    embedder = runtime.embedder
+    assert isinstance(embedder, EmbedderClient) and embedder.base_url == world.cfg.embedder_url
+    [start] = world.contexts
+    assert isinstance(start, ReconcileContext) and start.embedder is embedder
+    [deps] = world.deps
+    assert isinstance(deps, CollectDeps) and deps.embedder is embedder
+    assert embedder.http.is_closed  # the teardown's `embedder` step
 
 
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(

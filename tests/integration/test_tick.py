@@ -363,6 +363,29 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     assert (ctx.now, ctx.epoch) == (now, runtime.epoch)
 
 
+async def test_the_reconcile_heavy_task_hands_the_runtimes_embedder_to_its_reconcilers(
+    engine, queue_app, monkeypatch
+) -> None:  # Task 22 fix round 1, M-2: `awaiting_embedding` gets the process's client
+    now = A + timedelta(minutes=10)
+    seen: list[reconcilers.ReconcileContext] = []
+
+    async def probe(ctx: reconcilers.ReconcileContext) -> int:
+        seen.append(ctx)
+        return 0
+
+    monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the probe
+    reconcilers.reconciler("probe", "heavy")(probe)
+    monkeypatch.setattr(tasks, "utcnow", lambda: now)
+    embedder = object()  # the runtime's client, whatever it is: handed on as is
+    runtime = SimpleNamespace(engine=engine, queue=queue_app, epoch=3, embedder=embedder)
+    context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
+    await tasks.reconcile_heavy(context, timestamp=0)
+    [ctx] = seen
+    assert ctx.embedder is embedder
+    assert ctx.engine is engine and ctx.queue is queue_app and ctx.defer is defer_in_tx
+    assert (ctx.now, ctx.epoch) == (now, runtime.epoch)
+
+
 # --- Final fix wave, item 4: the terminal runs a tick inserts are counted in RUNS ---------------------------
 
 

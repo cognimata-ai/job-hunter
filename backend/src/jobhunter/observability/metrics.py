@@ -54,11 +54,16 @@ QUOTA_REMAINING_UNITS = Gauge(
     registry=REGISTRY,
 )
 
-# The duration of each embed batch's successful `/v1/embed` call (§9.2 node 7, the `awaiting_embedding`
-# reconciler): about 28 s for 16 texts on the V7 CPU, at most `embeddings.BATCH_TIMEOUT_S` (120 s).
+# The duration of every embed batch's `/v1/embed` call (§9.2 node 7, the `awaiting_embedding` reconciler):
+# about 28 s for 16 texts on the V7 CPU, at most `embeddings.BATCH_TIMEOUT_S` (120 s). `outcome` is `ok`, the
+# `EmbedderError` kind (`unavailable` for a timeout, `bad_response`, `checksum`) or `error` (anything else).
 EMBED_BUCKETS = (0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90, 120)
 EMBED_SECONDS = Histogram(
-    "jobhunter_embed_seconds", "Duration of one embed batch call.", buckets=EMBED_BUCKETS, registry=REGISTRY
+    "jobhunter_embed_seconds",
+    "Duration of one embed batch call, by outcome.",
+    ["outcome"],
+    buckets=EMBED_BUCKETS,
+    registry=REGISTRY,
 )
 
 # The duplicate groups the `group_representatives` reconciler repaired (§8.7, §17.4: one election per group
