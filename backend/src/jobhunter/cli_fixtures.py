@@ -242,9 +242,9 @@ _JOINED_NAME: Final = re.compile(
     rf"[ \t]{{0,3}}(?:,|\band\b|\bund\b|&(?:amp;)?)[ \t]{{0,3}}({_TWO_OR_THREE}){_NAME_END}"
 )
 # A company is no person (ruling FR-f): a found name is dropped when one of its words, or of the capitalised
-# words right after it, is a legal form ("founded by Acme Inc.", "created by Beispiel Ltd for you", "Kontakt:
-# Muster Software GmbH", "erstellt von Muster Co. KG"). Compared case-sensitively, without a trailing comma,
-# bracket or full stop.
+# words right after it in the same clause (`_is_company`), is a legal form ("founded by Acme Inc.", "created
+# by Beispiel Ltd for you", "Kontakt: Muster Software GmbH", "erstellt von Muster Co. KG"). Compared
+# case-sensitively, without a trailing comma, bracket or full stop.
 LEGAL_FORMS: Final = frozenset(
     {"GmbH", "gGmbH", "mbH", "AG", "SE", "KG", "KGaA", "OHG", "UG", "eG", "e.V", "e. V", "GbR", "PartG"}
     | {"Inc", "Ltd", "LLC", "LLP", "PLC", "plc", "Corp", "Co", "Limited", "S.A", "SAS", "SARL", "B.V", "N.V"}
@@ -411,22 +411,46 @@ def _is_title(text: str, start: int, end: int) -> bool:
     return _TITLE_TAIL.match(text, end) is not None or all(w in TITLE_WORDS for w in words)
 
 
+# The rest of a word that a name pattern stopped inside ("Gmb" of "GmbH"), and one more word of the same
+# clause: one to three spaces or tabs, then a word without a line break, tag bracket, `|`, quote or closing
+# bracket.
+_WORD_REST: Final = re.compile(r"[\w\-]*\.?")
+_CLAUSE_WORD: Final = re.compile(r"[ \t]{1,3}([^\s<>|\"'\u201c\u201d\u201e\u2018\u2019)\]]{1,60})")
+_INITIAL: Final = re.compile(rf"[{_UPPER}]\.")
+
+
+def _legal(word: str) -> bool:
+    return word.strip(",;:()[]").rstrip(".") in LEGAL_FORMS
+
+
 def _is_company(text: str, start: int, end: int) -> bool:
-    """Whether the name found at `text[start:end]` names a company: one of its words, or of the up to three
-    capitalised words (or `&`) right after it, is a legal form (`LEGAL_FORMS`; `e. V.` as two words too). A
-    comma, colon, semicolon or closing bracket ends the name, so "Max Mustermann, Acme GmbH" stays a person.
-    The words are the text's own, so a name that `NAME` ends inside "GmbH" is seen with the whole word."""
-    count = len(text[start:end].split())
-    words = text[start:].split(None, count + 3)[: count + 3]
-    bare = [word.strip(",;:()[]").rstrip(".") for word in words]
-    for index, word in enumerate(words):
-        if index >= count and words[index - 1][-1:] in ",;:)":
-            return False
-        if bare[index] in LEGAL_FORMS or (bare[index] == "e" and bare[index + 1 : index + 2] == ["V"]):
-            return True
-        if index >= count and not (word[:1].isupper() or word == "&"):
-            return False
-    return False
+    """Whether the name found at `text[start:end]` names a company (fix round 3: only within its own clause).
+
+    A legal form (`LEGAL_FORMS`; `e. V.` as two words too) counts when it is a word of the name or follows it
+    directly on the same line: up to three more capitalised words (or `&`), each after one to three spaces or
+    tabs. A full stop, `!`, `?`, comma, colon, semicolon or closing bracket after a word ends the clause,
+    unless the word is a legal form (`Inc.`, `Co.`) or an initial; so does a line break, a tag, an entity, `|`
+    or a quote. Where it is unsure, it scrubs (ruling FR-m): "Gegründet von Max Mustermann. Acme GmbH …" and
+    "Kontakt: Max Mustermann<br>Acme GmbH" stay persons."""
+    if (rest := _WORD_REST.match(text, end)) is not None:  # it always matches, possibly empty
+        end = rest.end()
+    words = text[start:end].split()  # a bounded slice: the name and the rest of its last word
+    pos = end
+    for _ in range(3):
+        last = words[-1] if words else ""
+        if last[-1:] in ".!?,;:)" and not (_legal(last) or _INITIAL.fullmatch(last) or last == "e."):
+            break
+        found = _CLAUSE_WORD.match(text, pos)
+        if found is None:
+            break
+        word = found.group(1)
+        joiner = word in ("&", "&amp;")
+        if ("&" in word and not joiner) or not (word[:1].isupper() or joiner or _legal(word) or word == "e."):
+            break
+        words.append(word)
+        pos = found.end()
+    pairs = zip(words, [*words[1:], ""], strict=True)
+    return any(_legal(word) or (word == "e." and following.rstrip(".") == "V") for word, following in pairs)
 
 
 def _kept(text: str, start: int, end: int) -> bool:

@@ -638,17 +638,43 @@ def test_a_gender_marker_later_in_the_sentence_does_not_hide_a_name(text: str, s
 @pytest.mark.parametrize(
     "padding",
     [
-        " " + "A" + "a" * 199 + " (m/w/d)",  # a 200-letter word after the name
-        " " * 100_000 + "(m/w/d)",  # a 100,000-space run
-        (" " * 30 + "Vertrieb") * 4 + " (m/w/d)",  # four long gaps between title words
+        # F1 fix round 3: endings that do not match, so a backtracking pattern tries every split; measured on
+        # the title tail of 1377b1b: 8.7 s, 1.8 s and 12.1 s; now about 0.001 s each
+        " " + "a" * 200 + " x",  # a 200-letter word after the name
+        (" " * 30 + "vertrieb") * 4 + " x",  # four 30-space gaps
+        (" " * 50 + "vertrieb") * 4 + " x",  # four 50-space gaps
+        " " * 100_000 + "(m/w/d)",  # a 100,000-space run (42 s on 1377b1b)
     ],
 )
 def test_the_name_rules_stay_linear(padding: str) -> None:
-    # F1 re-review, Minor 2: every space run of the title tail is bounded; this measured 8.7 s and 42 s before
-    started = time.perf_counter()
-    scrub_text("CEO Max Mustermann" + padding, Pseudonyms())
-    scrub_text("founded" + padding + " by Max Mustermann", Pseudonyms())
-    assert time.perf_counter() - started < 2
+    # F1 re-review, Minor 2: every space run of the title tail is bounded and no two parts can match the same
+    # characters; the bound is generous against the about 0.001 s it takes now
+    for text in ("CEO Max Mustermann" + padding, "founded" + padding + " by Max Mustermann"):
+        started = time.perf_counter()
+        scrub_text(text, Pseudonyms())
+        assert time.perf_counter() - started < 1.0, text[:40]
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        (
+            "Gegründet von Max Mustermann. Acme GmbH bietet Software.",
+            "Gegründet von [person:1]. Acme GmbH bietet Software.",
+        ),
+        ("Kontakt: Max Mustermann\nAcme AG", "Kontakt: [person:1]\nAcme AG"),
+        ("Kontakt: Max Mustermann<br>Acme GmbH is hiring", "Kontakt: [person:1]<br>Acme GmbH is hiring"),
+        ("Founded by Max Mustermann! Acme GmbH is hiring.", "Founded by [person:1]! Acme GmbH is hiring."),
+        ("Ihr Ansprechpartner\nMax Mustermann\nAcme GmbH", "Ihr Ansprechpartner\n[person:1]\nAcme GmbH"),
+        ("Our CEO Jane Doe. Acme Inc. grew fast", "Our CEO [person:1]. Acme Inc. grew fast"),
+        ("Gründer Max Mustermann&nbsp;Acme GmbH", "Gründer [person:1]&nbsp;Acme GmbH"),
+        ("Founded by Max Mustermann.Acme GmbH", "Founded by [person:1].Acme GmbH"),
+        ("Kontakt: Max Mustermann | Acme GmbH", "Kontakt: [person:1] | Acme GmbH"),
+    ],
+)
+def test_a_company_in_the_next_sentence_line_or_tag_hides_no_name(text: str, scrubbed: str) -> None:
+    # F1 re-review 2, Important 1 (ruling FR-m): the legal form counts only in the name's own clause
+    assert scrub_text(text, Pseudonyms()) == scrubbed
 
 
 def test_a_later_mention_by_surname_gets_the_same_placeholder() -> None:

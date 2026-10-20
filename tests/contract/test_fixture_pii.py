@@ -194,6 +194,11 @@ def test_the_scan_leaves_ids_uuids_and_timestamps_alone(value: str) -> None:
         "Unser CEO Max Mustermann sucht einen Developer (m/w/d)",
         "Max Mustermann, CEO, sucht einen Entwickler (m/w/d)",
         "Created by: Jane Doe",
+        # F1 re-review 2, Important 1: a company in the next sentence, line or tag hides no name
+        "Gegründet von Max Mustermann. Acme GmbH bietet Software.",
+        "Kontakt: Max Mustermann\nAcme AG",
+        "Kontakt: Max Mustermann<br>Acme GmbH is hiring",
+        "Our CEO Jane Doe. Acme Inc. grew fast",
     ],
 )
 def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:

@@ -50,11 +50,15 @@ their source, one number per person in every file of the source, a later first-n
 The scrubber gained the narrative-name rules at the same time (`ROLE_NAME`; `INTRODUCED_NAME` in fix round 1,
 ruling FR-f). A scrub of `.fixtures-raw` with them numbers these people in order of appearance and renumbers the
 later placeholders of their source, so it no longer reproduces these files byte for byte. The rules do not see
-every form: a name in a link slug, "With <name>, he founded …", or a second founder after a parenthetical stay
-with the manual review. Kept on purpose: the lower-case first-name team handles (`@first`, four distinct ones in
-four description fields of `ats/lever_eu_leverdemo.json`) and the two first-name test posting titles (one in
-`ats/lever_leverdemo.json`, one in `ats/lever_eu_leverdemo.json`) of the Lever demo board `leverdemo`: first names
-only, of a vendor's demo data.
+every form; these limits are accepted and stay with the manual review: a name in a link slug, "With <name>, he
+founded …", a second founder after a parenthetical; a gender marker right after a name, which reads as a job title
+(ruling FR-n: `Gründer <name> (m/w/d)`); a person directly followed by a company without a separator, which reads
+as one company name (`Kontakt: <name> Beispiel GmbH`); and the gate has no salutation rule, so `Interview with Dr.
+<name>` is scrubbed by the scrubber's `SALUTED_NAME` but would not fail the scan (ruling FR-n). Kept on purpose:
+the lower-case first-name team handles (`@first`, four distinct ones in eight description fields of two postings
+of `ats/lever_eu_leverdemo.json`) and the two first-name test posting titles (one in `ats/lever_leverdemo.json`,
+one in `ats/lever_eu_leverdemo.json`) of the Lever demo board `leverdemo`: first names only, of a vendor's demo
+data.
 
 In fix round 1 (ruling FR-e) one SerpApi publisher title (`apply_options[].title` of `serpapi/google_jobs_hl_en`
 and `google_jobs_drift`) that was a job site branded with its owner's full name became the invented brand
