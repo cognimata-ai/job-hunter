@@ -3180,6 +3180,7 @@ Each deviation stages a spec item across milestones or settles something the spe
     - `embedder.checksum_mismatch` is surfaced from the compose health and restart status (T21-b);
     - the §17.6 catalogue gains `dedup.ambiguous_grouping` (Deviation 46);
     - poison-batch quarantine for the embedder.
+12. **Location parsing limits accepted for M1 (T4; ledger L48, L53; the remote forms were fixed in the final fix wave F1):** a comma list of known places (`Berlin, Hamburg`) stays one unresolved part instead of two; `Halle/Saale` splits at the slash into two parts; a German postal code overrides a foreign name (`20144 Milano` resolves to the German place of that code); `location_from_coordinates` leaves a point farther than 50 km from every known place unresolved; the federal-state stoplist lacks some space and abbreviation variants (`BW`, `BaWü`, `Meck-Pomm`). The parser and the stoplist (`sources/parsing/locations.py`) are revisited when a recorded location shows one of them.
 
 ## Pre-flight corrections
 

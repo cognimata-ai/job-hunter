@@ -2,6 +2,7 @@ import math
 
 import pytest
 from jobhunter.geo.gazetteer import NON_DE_COLUMNS, PLACE_COLUMNS, Gazetteer
+from jobhunter.normalize.text import fold
 from jobhunter.sources.parsing.locations import (
     Candidate,
     Location,
@@ -102,9 +103,9 @@ def test_an_unknown_postal_code_falls_back_to_the_name_and_is_kept() -> None:
 def small_gazetteer(monkeypatch: pytest.MonkeyPatch) -> Gazetteer:
     """Alpha and Beta are 6.8 km apart, Gamma is far away; the codes name one, two near or two far places."""
     rows = [
-        "geonames:1\tAlpha\talpha\t\tDE\t05\t50.0\t8.0\t5000\t11111|22222|33333",
-        "geonames:2\tBeta\tbeta\t\tDE\t05\t50.05\t8.05\t9000\t11111",
-        "geonames:3\tGamma\tgamma\t\tDE\t02\t51.0\t9.0\t7000\t22222",
+        "geonames:1\tAlpha\talpha\t\tDE\t05\t06411000\t50.0\t8.0\t5000\t11111|22222|33333",
+        "geonames:2\tBeta\tbeta\t\tDE\t05\t06432001\t50.05\t8.05\t9000\t11111",
+        "geonames:3\tGamma\tgamma\t\tDE\t02\t09162000\t51.0\t9.0\t7000\t22222",
     ]
     non_de = ["Vienna\twien\tAT\tcity\tgeonames:9\t48.2\t16.4", "Austria\taustria\tAT\tcountry\t\t\t"]
     g = Gazetteer.from_tsv(
@@ -652,10 +653,71 @@ def test_a_foreign_qualifier_never_moves_a_city_to_another_foreign_country() -> 
 
 @pytest.mark.parametrize(
     "text",
-    ["Köln, Bonn", "Berlin, Potsdam", "Nürnberg, Fürth", "Mannheim, Heidelberg", "Düsseldorf, Neuss"],
+    [
+        "Köln, Bonn",
+        "Berlin, Potsdam",
+        "Nürnberg, Fürth",
+        "Mannheim, Heidelberg",
+        "Düsseldorf, Neuss",
+        # ruling T6-c: in the reversed order the smaller head is no district either, for it is not in the
+        # tail city's municipality
+        "Bonn, Köln",
+        "Potsdam, Berlin",
+        "Offenbach, Frankfurt",
+        "Offenbach am Main, Frankfurt am Main",
+        "Fürth, Nürnberg",
+        "Neuss, Düsseldorf",
+    ],
 )
 def test_a_list_of_neighbouring_cities_stays_unresolved(text: str) -> None:
     # 6a review, finding 5: `<district>, <city>` needs the head to be smaller than the city it names (§8.12:
     # positive evidence only); two cities near each other are a list, not a district and its city
     p = parse(text)
     assert [loc.resolution for loc in p.locations] == ["unresolved"] and not p.positively_non_de, text
+
+
+@pytest.mark.parametrize(
+    ("text", "city"),
+    [
+        ("Kreuzberg, Berlin", "berlin"),
+        ("Adlershof, Berlin", "berlin"),
+        ("Friedrichshain, Berlin", "berlin"),
+        ("Wedding, Berlin", "berlin"),
+        ("Altona, Hamburg", "hamburg"),
+        ("Zwötzen, Gera", "gera"),  # an Ortsteil that GeoNames lists as a populated place of its own
+    ],
+)
+def test_a_district_resolves_in_the_municipality_of_its_city(text: str, city: str) -> None:
+    # ruling T6-c: the head is a true district, a place in the tail city's municipality
+    (loc,) = parse(text).locations
+    assert loc.resolution == "unique", text
+    g = Gazetteer.load()
+    (district,) = [
+        p for p in g.by_name(fold(text.split(",")[0])) if p.gazetteer_id == loc.candidates[0].gazetteer_id
+    ]
+    assert district.municipality in {p.municipality for p in g.by_name(city)}, text
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("Remote, Germany", "remote"),
+        ("Germany (Remote)", "remote"),
+        ("Remote (Deutschland)", "remote"),
+        ("Deutschland, remote", "remote"),
+        ("Homeoffice, Deutschland", "remote"),
+        ("Remote - Germany", "remote"),
+        ("Deutschlandweit (Germany)", "country_wide"),
+    ],
+)
+def test_a_marker_qualified_by_germany_is_the_marker(text: str, kind: str) -> None:
+    # fix wave F1 (ledger L48): not one unresolved `city` label; the same as `Remote (Germany)`
+    p = parse(text)
+    assert (p.kind, p.locations, p.positively_non_de) == (kind, [], False), text
+
+
+def test_a_marker_with_another_country_or_place_is_not_only_a_marker() -> None:
+    assert (
+        parse("Remote, Austria").kind == "city"
+    )  # a foreign remote stays an unresolved label (T4, as before)
+    assert labels("Germany (Remote) / Berlin") == ["Berlin"]  # a marker part beside a place

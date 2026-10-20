@@ -22,9 +22,10 @@ Downloaded on 2026-10-18 from <https://download.geonames.org/export/>.
 
 ## Filters
 
-- `de_places.tsv`: feature class `P` in country `DE` with a population of at least 1,000.
-  Alternate names: Latin script, capitalised, no short all-capitals code. A postal code maps to the places
-  with the same folded name in the same state, else to the nearest place within 10 km.
+- `de_places.tsv`: feature class `P` in country `DE` with a population of at least 1,000,
+  with its municipality (admin4) code. Alternate names: Latin script, capitalised, no short all-capitals
+  code. A postal code maps to the places with the same folded name in the same state, else to the nearest
+  place within 10 km.
 - `non_de_places.tsv`: cities of `cities15000` with more than 100,000 inhabitants in a
   country of continent `EU` other than `DE`, under their name and usable alternate names; every country name
   other than Germany in English (`countryInfo.txt`) and German (`country_names_de.tsv`).

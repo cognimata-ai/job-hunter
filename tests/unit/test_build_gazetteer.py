@@ -40,10 +40,26 @@ def geonames_row(
     fclass: str = "P",
     country: str = "DE",
     admin1: str = "05",
+    municipality: str = "06412000",
     population: int = 5_000,
 ) -> str:
-    """One row of a GeoNames `dump` file (19 tab-separated cells)."""
-    cells = [geoname_id, name, name, alt, str(lat), str(lon), fclass, "PPL", country, "", admin1, "", "", ""]
+    """One row of a GeoNames `dump` file (19 tab-separated cells); `municipality` is the admin4 code."""
+    cells = [
+        geoname_id,
+        name,
+        name,
+        alt,
+        str(lat),
+        str(lon),
+        fclass,
+        "PPL",
+        country,
+        "",
+        admin1,
+        "",
+        "",
+        municipality,
+    ]
     return "\t".join([*cells, str(population), "", "", "Europe/Berlin", "2020-01-01"])
 
 
@@ -138,6 +154,20 @@ def test_german_places_are_populated_places_of_at_least_1000_inhabitants(build: 
     assert set(places) == {"Berlin", "Grenzfall", "München", "Nürnberg"}
     assert places["Grenzfall"].gazetteer_id == "geonames:2" and places["Grenzfall"].country_code == "DE"
     assert places["Berlin"].population == 3_400_000 and places["Berlin"].postal_codes == ()
+
+
+def test_a_place_keeps_its_municipality_key(build: ModuleType) -> None:
+    # fix wave F1 (ruling T6-c): the GeoNames admin4 code, which a city and its districts share
+    text = dump(
+        geonames_row("1", "Berlin", admin1="16", municipality="11000000", population=3_400_000),
+        geonames_row("2", "Kreuzberg", admin1="16", municipality="11000000", population=150_000),
+        geonames_row("3", "Potsdam", admin1="12", municipality="12054000", population=180_000),
+    )
+    places = {p.name: p for p in build.de_places(text)}
+    assert places["Berlin"].municipality == places["Kreuzberg"].municipality == "11000000"
+    assert places["Potsdam"].municipality == "12054000"
+    g = Gazetteer.from_tsv(build.render_de_places(places.values()), build.render_non_de_places([]))
+    assert [p.municipality for p in g.by_name("kreuzberg")] == ["11000000"]
 
 
 def test_alt_folded_holds_alternate_names_and_the_umlaut_transliteration(build: ModuleType) -> None:
@@ -359,7 +389,7 @@ def test_rendered_tsvs_load_back_into_the_same_gazetteer(build: ModuleType) -> N
 
 
 def test_a_cell_with_a_tab_or_newline_cannot_be_written(build: ModuleType) -> None:
-    bad: Iterable[Any] = [Place("geonames:1", "A\tB", "a b", (), "DE", "05", 1.0, 2.0, 1000, ())]
+    bad: Iterable[Any] = [Place("geonames:1", "A\tB", "a b", (), "DE", "05", "06412000", 1.0, 2.0, 1000, ())]
     with pytest.raises(ValueError, match="holds a tab or newline"):
         build.render_de_places(bad)
 

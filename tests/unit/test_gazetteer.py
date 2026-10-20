@@ -160,9 +160,9 @@ NON_DE_HEADER = "\t".join(NON_DE_COLUMNS)
 SMALL_PLACES = "\n".join(
     [
         PLACES_HEADER,
-        "geonames:1\tAlt\talt\talten|altstadt\tDE\t05\t50.0\t8.0\t5000\t11111|22222",
-        "geonames:2\tNeu\tneu\talt\tDE\t05\t50.05\t8.05\t9000\t11111",
-        "geonames:3\tFern\tfern\t\tDE\t02\t49.0\t11.0\t1200\t",
+        "geonames:1\tAlt\talt\talten|altstadt\tDE\t05\t06412000\t50.0\t8.0\t5000\t11111|22222",
+        "geonames:2\tNeu\tneu\talt\tDE\t05\t06412000\t50.05\t8.05\t9000\t11111",
+        "geonames:3\tFern\tfern\t\tDE\t02\t09162000\t49.0\t11.0\t1200\t",
         "",
     ]
 )
@@ -204,7 +204,7 @@ def test_loader_on_a_small_gazetteer() -> None:
         (
             PLACES_HEADER + "\ngeonames:1\tAlt\n",
             NON_DE_HEADER + "\n",
-            "de_places line 2: 2 cells, expected 10",
+            "de_places line 2: 2 cells, expected 11",
         ),
         (PLACES_HEADER + "\n", NON_DE_HEADER + "\nx\ty\tAT\tvillage\t\t\t\n", "unknown kind 'village'"),
         (

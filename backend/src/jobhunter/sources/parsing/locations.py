@@ -15,7 +15,8 @@
    often as it qualifies a name, and guessing would lose locations. A federal state (`Sachsen`, `NRW`; not the
    city-states) is a region, never the town of that name: it is unresolved and never foreign. Text shaped like
    coordinates that lie outside latitude ±90 / longitude ±180 (`95.10115, 11.5`) is one unresolved label;
-4. `Remote`, `Homeoffice`, `Deutschlandweit` and `Beliebiger Ort` are markers, not places: they set `kind`.
+4. `Remote`, `Homeoffice`, `Deutschlandweit` and `Beliebiger Ort` are markers, not places: they set `kind`. A
+   marker qualified by Germany's name only (`Remote, Germany`, `Germany (Remote)`) is that marker.
 
 `ParsedLocations.positively_non_de` is the §5.3.4 evidence for `OutOfScope('not_germany')`: every part names
 a place or a country outside Germany and no part has a German candidate. `positively_outside_germany` is the
@@ -268,15 +269,21 @@ def _german(gaz: Gazetteer, folded: str, *, admin1: str | None) -> list[Candidat
 
 
 def _german_near(gaz: Gazetteer, district: str, city: str) -> list[Candidate]:
-    """`<district>, <city>`: the German places named `district` within `DISTRICT_KM` of a `city` place and
-    smaller than it. Two cities near each other (`Köln, Bonn`, `Berlin, Potsdam`) are a list, not a district
-    and its city, and stay unresolved (§8.12: positive evidence only)."""
+    """`<district>, <city>`: the German places named `district` that are districts of a `city` place: in its
+    municipality (the same GeoNames municipality key), smaller than it and within `DISTRICT_KM` of it.
+
+    Two cities near each other are a list, not a district and its city, in either order (`Köln, Bonn` and
+    `Bonn, Köln`, `Potsdam, Berlin`, `Offenbach, Frankfurt`; ruling T6-c): each is its own municipality, so
+    the part stays unresolved (§8.12: positive evidence only)."""
     cities = gaz.by_name(city)
     near = [
         d
         for d in gaz.by_name(district)
         if any(
-            d.population < c.population and distance_km(d.lat, d.lon, c.lat, c.lon) <= DISTRICT_KM
+            d.gazetteer_id != c.gazetteer_id
+            and d.municipality == c.municipality
+            and d.population < c.population
+            and distance_km(d.lat, d.lon, c.lat, c.lon) <= DISTRICT_KM
             for c in cities
         )
     ]
@@ -288,7 +295,8 @@ def _resolve_qualified(gaz: Gazetteer, text: str, country_hint: str | None) -> t
 
     - `<place>, <country>` (`Zürich, Schweiz`): the candidates in that country;
     - `<city>, <federal state>` (`Munich, Bavaria`): the German candidates in that state;
-    - `<district>, <city>` (`Kreuzberg, Berlin`): the German candidates near that city and smaller than it;
+    - `<district>, <city>` (`Kreuzberg, Berlin`): the German candidates in that city's municipality, near it
+      and smaller than it;
     - `<city>, <state>, <country>` (`Detmold, Nordrhein-Westfalen, Deutschland`; `Berlin, Berlin, Germany`, a
       city-state under its own name; `Amsterdam, Noord-Holland, Netherlands`): the city in that state or
       country. Abroad the middle must be no German place, state, country or marker.
@@ -329,7 +337,24 @@ def _is_not_a_place(gaz: Gazetteer, folded: str) -> bool:
     )
 
 
+_QUALIFIER_PIECES: Final = re.compile(r"[,()]|\s[-\u2013\u2014]\s")  # a comma, brackets or a spaced dash
+
+
+def _marker_in_germany(part: str) -> Literal["remote", "country_wide"] | None:
+    """The marker of a part that is a marker qualified by Germany's name only (fix wave F1, ledger L48):
+    `Remote, Germany`, `Germany (Remote)`, `Deutschland, remote`, `Remote - Deutschland`. Germany names no
+    place, so the part is the marker, as `Remote (Germany)` already was."""
+    pieces = [fold(piece) for piece in _QUALIFIER_PIECES.split(part) if _HAS_CONTENT.search(piece)]
+    if len(pieces) < 2 or not all(p in _REMOTE or p in _COUNTRY_WIDE or p in _GERMANY_NAMES for p in pieces):
+        return None
+    if any(p in _COUNTRY_WIDE for p in pieces):
+        return "country_wide"
+    return "remote" if any(p in _REMOTE for p in pieces) else None
+
+
 def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | None) -> _Part:
+    if (marker := _marker_in_germany(part)) is not None:
+        return _Part(None, marker, False)
     if not _is_known(gaz, fold(part)):
         part = _TRAILING_PARENTHETICAL.sub("", part).strip(" ,") or part
     if not _is_known(gaz, fold(part)) and _is_known(gaz, fold(site := _SITE_SUFFIX.sub("", part))):

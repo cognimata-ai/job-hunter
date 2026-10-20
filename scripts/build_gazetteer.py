@@ -11,10 +11,11 @@ German input of the build. CI does not run this script; for one download its out
 
 The rules (the tests in tests/unit/test_build_gazetteer.py pin them with small synthetic inputs):
 
-- German places: GeoNames feature class `P` in `dump/DE.zip` with a population of at least 1,000. A place's
-  `alt_folded` holds its folded GeoNames `alternatenames` that a German text can contain (Latin script,
-  capitalised, no airport or station code) and the umlaut transliteration of its name (`ä`->`ae`, `ö`->`oe`,
-  `ü`->`ue`, `ß`->`ss`), so `moenchengladbach` finds Mönchengladbach.
+- German places: GeoNames feature class `P` in `dump/DE.zip` with a population of at least 1,000, each with
+  its municipality (the GeoNames admin4 code, the German municipality key: a city's districts carry the
+  city's). A place's `alt_folded` holds its folded GeoNames `alternatenames` that a German text can contain
+  (Latin script, capitalised, no airport or station code) and the umlaut transliteration of its name
+  (`ä`->`ae`, `ö`->`oe`, `ü`->`ue`, `ß`->`ss`), so `moenchengladbach` finds Mönchengladbach.
 - Postal codes (`zip/DE.zip`): a code maps to the places with the same folded name (any spelling) in the same
   admin1 code as one of its rows, else to the nearest German place within 10 km, else to nothing. The brief's
   rule is refined three ways, see `attach_postal_codes` and `_named`: it is applied per code, not per row;
@@ -184,6 +185,7 @@ def de_places(dump_text: str) -> list[Place]:
                 alt_folded=tuple(a for a in spellings if a != folded),
                 country_code="DE",
                 admin1=row[10],
+                municipality=row[13],
                 lat=float(lat),
                 lon=float(lon),
                 population=population,
@@ -386,6 +388,7 @@ def render_de_places(places: Iterable[Place]) -> str:
                 "|".join(p.alt_folded),
                 p.country_code,
                 p.admin1,
+                p.municipality,
                 repr(p.lat),
                 repr(p.lon),
                 str(p.population),
@@ -442,9 +445,10 @@ Downloaded on {downloaded_on} from <https://download.geonames.org/export/>.
 
 ## Filters
 
-- `de_places.tsv`: feature class `P` in country `DE` with a population of at least {MIN_DE_POPULATION:,}.
-  Alternate names: Latin script, capitalised, no short all-capitals code. A postal code maps to the places
-  with the same folded name in the same state, else to the nearest place within {POSTAL_NEAREST_KM:g} km.
+- `de_places.tsv`: feature class `P` in country `DE` with a population of at least {MIN_DE_POPULATION:,},
+  with its municipality (admin4) code. Alternate names: Latin script, capitalised, no short all-capitals
+  code. A postal code maps to the places with the same folded name in the same state, else to the nearest
+  place within {POSTAL_NEAREST_KM:g} km.
 - `non_de_places.tsv`: cities of `cities15000` with more than {MIN_CITY_POPULATION:,} inhabitants in a
   country of continent `EU` other than `DE`, under their name and usable alternate names; every country name
   other than Germany in English (`countryInfo.txt`) and German (`country_names_de.tsv`).
