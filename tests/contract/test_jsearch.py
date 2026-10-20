@@ -50,6 +50,10 @@ def test_page_one_contract() -> None:
     outcomes = a.parse(page)
     # the recorded envelope: items and cursor at the V9 paths, together
     assert len(jsearch_items(page.json())) == 10 and isinstance(jsearch_cursor(page.json()), str)
+    for read in (jsearch_items, jsearch_cursor):  # a violation names the recording's status (ledger L120)
+        with pytest.raises(ContractViolation) as broken:
+            read({"data": {"jobs": {}, "cursor": 3}})
+        assert broken.value.status == 200
     assert len(ids) == 10 and all(ids) and a.continuation(page)[0] is Continuation.CURSOR
     assert (
         len(outcomes) == 10
@@ -288,9 +292,8 @@ def test_locations_come_from_the_city_or_the_parsed_job_location() -> None:
     assert berlin.location_kind == "city" and [loc.label for loc in berlin.locations] == ["Berlin"]
     assert berlin.locations[0].resolution == "unique" and berlin.locations[0].source == "jsearch"
     munich = parsed_one(job_city="München", job_country="DE", job_location="Irgendwo • über X")
-    assert [loc.label for loc in munich.locations] == ["München"] and munich.locations[
-        0
-    ].resolution == "unique"
+    assert [loc.label for loc in munich.locations] == ["München"]
+    assert munich.locations[0].resolution == "unique"
     anywhere = parsed_one(job_location="Beliebiger Ort   •  über LinkedIn")
     assert anywhere.location_kind == "country_wide"
     nowhere = parsed_one(job_location=None)
@@ -368,6 +371,15 @@ def test_an_envelope_that_breaks_the_contract_is_a_violation(doc: Any, code: str
     assert (exc.value.kind, exc.value.code, exc.value.status) == ("contract", code, 200)
 
 
+@pytest.mark.parametrize("value", ["OK", "Ok", "ok", "oK"])
+def test_the_status_is_ok_in_any_case(value: str) -> None:
+    """Fix wave F4 (ledger L126): `Ok` is `OK`, never the provider's error report."""
+    page = doc_page({"status": value, "data": {"jobs": [item()], "cursor": None}})
+    a = adapter()
+    a.check_envelope(page)
+    assert len(a.peek_native_ids(page)) == 1 and a.continuation(page) == (Continuation.END, None)
+
+
 @pytest.mark.parametrize("status", [200, 201])
 @pytest.mark.parametrize(
     "doc",
@@ -429,7 +441,10 @@ def test_a_malformed_cursor_is_never_read_as_the_end() -> None:
         adapter().continuation(items_page([item()], cursor=""))
 
 
-def test_page_two_is_worth_a_request_when_seven_of_ten_ids_are_new() -> None:
+def test_the_recorded_page_two_has_seven_new_ids_and_the_reused_page_fewer() -> None:
+    """The fixtures the page-2 rule's tests rely on (the rule itself: `jsearch.admits_next_page` and the
+    traversal tests): page 2 holds at least `PAGE2_MIN_NEW` ids that page 1 does not, the reused page fewer
+    than that beyond page 2."""
     a = adapter()
     ids = {
         case: {i for i in a.peek_native_ids(fixture_page("jsearch", case, SPEC, fetched_at=T)) if i}

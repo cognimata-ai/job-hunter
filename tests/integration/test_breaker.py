@@ -82,6 +82,8 @@ async def test_breaker_timestamps_clear_on_ok_and_disabled(engine) -> None:  # r
         ("adzuna", "disabled", None, None, 0),
         ("jsearch", "ok", None, None, 0),
     ]
+    # fix wave F4 (ledger L62): disabling the open instance resolves its alert, as a success does
+    assert await open_alerts(engine) == set()
 
 
 INSTANCE_STATE = sa.text(
@@ -213,6 +215,7 @@ async def test_a_missing_provider_secret_disables_and_only_that_disable_is_resto
         "arbeitnow": "ok",
     }
     assert await state(engine, js.id) == ("disabled", 0, None, None, None, "missing_secret")
+    assert await open_alerts(engine) == set()  # the disable resolved `source.auth_failed` (ledger L62)
     assert (await sync(engine, worker_config(tmp_path, "b", without_adzuna_key)))["adzuna"] == "disabled"
     assert await sync(engine, worker_config(tmp_path, "c", PROVIDER_SECRETS)) == dict.fromkeys(
         ("jsearch", "serpapi", "adzuna", "arbeitnow"), "ok"

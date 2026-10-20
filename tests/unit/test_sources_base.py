@@ -70,6 +70,15 @@ def test_spec_json_round_trip_keeps_every_field() -> None:
     assert RequestSpec.from_json(doc) == spec
 
 
+def test_a_spec_is_declared_unhashable() -> None:
+    """Fix wave F4 (ledger L62): `params` is a read-only mapping, so a spec has no hash; the class says so
+    instead of carrying a dataclass `__hash__` that fails only when called."""
+    assert RequestSpec.__hash__ is None
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(SPEC)
+    assert RequestSpec(**SPEC.__dict__) == SPEC  # equality stays by value (frozen: see the posting test)
+
+
 @pytest.mark.parametrize("name", ["api_key", "app_id", "app_key", "API_KEY", "App_Key"])
 def test_a_spec_never_holds_a_provider_secret_parameter(name: str) -> None:
     with pytest.raises(ValueError, match=name):

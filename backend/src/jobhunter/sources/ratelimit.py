@@ -5,9 +5,14 @@ request that waited for a slot cannot start right after another one: the bucket 
 bucket holds at most one token and is refilled continuously at `per_second`, so consecutive starts of one
 key are at least `1 / per_second` apart and no burst is saved up while a key is idle.
 
-A key `<family>:<suffix>` (for example `ats-host:boards-api.greenhouse.io`) whose family is a configured
-limit gets a bucket and a semaphore of its own with the family's values, created on first use: the §5.3
-"every ATS host" limit. Any other unknown key raises `KeyError`, so a misspelt key never runs unlimited.
+A key `ats-host:<host>` (for example `ats-host:boards-api.greenhouse.io`) gets a bucket and a semaphore of its
+own with the `ats-host` limit's values, created on first use: the §5.3 "every ATS host" limit. That is the one
+family (`HOST_FAMILIES`): `jsearch:x` is no second JSearch bucket. Any other unknown key raises `KeyError`, so
+a misspelt key never runs unlimited.
+
+`gate(key)` is the key's process-wide admission gate, `concurrency` slots made on first use and separate from
+the send's semaphore: a caller holds it around the whole of an acquisition (its database work included), so
+every traversal of the process shares the bound (the SmartRecruiters detail calls of §5.3.5).
 """
 
 import asyncio
@@ -35,6 +40,8 @@ SOURCE_LIMITS: Final[Mapping[str, RateLimit]] = MappingProxyType(
         )
     }
 )
+# The families whose `<family>:<suffix>` keys get a bucket of their own per suffix (§5.3: per ATS host).
+HOST_FAMILIES: Final = frozenset({ATS_HOST_LIMIT.key})
 _FULL: Final = 1.0
 # A wake-up a hair early (float rounding) must not count as a missing token and cause a second wait.
 _EPSILON: Final = 1e-9
@@ -71,17 +78,29 @@ class RateLimiter:
         self._clock = clock
         self._sleep = sleep
         self._buckets: dict[str, _Bucket] = {}
+        self._gates: dict[str, asyncio.Semaphore] = {}
+
+    def _limit(self, key: str) -> RateLimit:
+        limit = self._limits.get(key)
+        family, separator, suffix = key.partition(":")
+        if limit is None and separator and suffix and family in HOST_FAMILIES:
+            limit = self._limits.get(family)
+        if limit is None:
+            raise KeyError(f"no rate limit for {key!r}")
+        return limit
 
     def _bucket(self, key: str) -> _Bucket:
         bucket = self._buckets.get(key)
         if bucket is None:
-            limit = self._limits.get(key)
-            if limit is None and ":" in key:
-                limit = self._limits.get(key.partition(":")[0])
-            if limit is None:
-                raise KeyError(f"no rate limit for {key!r}")
-            bucket = self._buckets[key] = _Bucket(limit, self._clock())
+            bucket = self._buckets[key] = _Bucket(self._limit(key), self._clock())
         return bucket
+
+    def gate(self, key: str) -> asyncio.Semaphore:
+        """The key's process-wide gate (module docstring): `concurrency` slots, one semaphore per key."""
+        gate = self._gates.get(key)
+        if gate is None:
+            gate = self._gates[key] = asyncio.Semaphore(self._limit(key).concurrency)
+        return gate
 
     def acquire(self, key: str) -> AbstractAsyncContextManager[None]:
         """`async with limiter.acquire(key):` holds a slot of the key's semaphore and has taken a token."""

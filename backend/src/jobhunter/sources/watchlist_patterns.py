@@ -3,10 +3,14 @@
 `detect` parses a careers URL against the §5.4 table and never fetches it. The host decides the ATS (case
 insensitive); the slug is the first path segment (Greenhouse, Lever, Ashby, SmartRecruiters) or the board's
 sub-domain (Personio, Recruitee). A trailing slash, the rest of the path, the query, the fragment and a port
-are ignored. The slug is taken as written, never decoded or normalised, and must match `SLUG` as a whole
-(`jobs.lever.co/../etc` and `%2e%2e` are `bad_slug`). Workable is recognised and unsupported in v1; any other
-host, and a board host without a slug, is `unsupported_pattern` (the user then enters ATS and slug by hand);
-a text that is not an http(s) URL with a host is `not_a_url`.
+are ignored, with two exceptions that read the table by its meaning rather than literally (fix wave F4,
+ledger L151): the ATS's own site (`www.recruitee.com`, `www.jobs.personio.de`) names no board, and a
+Greenhouse embed URL (`boards.greenhouse.io/embed/job_board?for=acme`) names its board in the `for`
+parameter, not in the path (`embed` is no slug; without `for` the URL names none). The slug is taken as
+written, never decoded or normalised, and must match `SLUG` as a whole (`jobs.lever.co/../etc` and `%2e%2e`
+are `bad_slug`). Workable is recognised and unsupported in v1; any other host, and a board host without a
+slug, is `unsupported_pattern` (the user then enters ATS and slug by hand); a text that is not an http(s) URL
+with a host is `not_a_url`.
 
 `API_HOSTS` is the compile-time allowlist of §5.4: the only hosts an ATS adapter or the validation ever
 requests, with `{slug}` in the board sub-domain of Personio and Recruitee. No host is user-controlled: a
@@ -18,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Literal, get_args
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 AtsType = Literal["greenhouse", "lever", "ashby", "personio", "recruitee", "smartrecruiters"]
 LeverRegion = Literal["global", "eu"]
@@ -55,6 +59,11 @@ _SUBDOMAIN_HOSTS: Final[tuple[tuple[re.Pattern[str], AtsType], ...]] = (
     (re.compile(r"([^.]+)\.jobs\.personio\.(?:de|com)"), "personio"),
     (re.compile(r"([^.]+)\.recruitee\.com"), "recruitee"),
 )
+# The sub-domains of the ATS's own site, never a board (`www.recruitee.com`).
+_NOT_A_BOARD: Final = frozenset({"www"})
+# Greenhouse's embed path (`/embed/job_board?for=<slug>`, `/embed/job_app?for=<slug>&token=...`): the board
+# is the `for` parameter.
+_GREENHOUSE_EMBED: Final = "embed"
 _WORKABLE: Final = "apply.workable.com"
 _WEB_SCHEMES: Final = frozenset({"http", "https"})
 
@@ -92,10 +101,13 @@ def detect(url: str) -> Detected | Unsupported:
         return Unsupported("workable")
     if (named := _PATH_HOSTS.get(host)) is not None:
         ats, region = named
-        return _board(parts.path.split("/")[1] if parts.path.startswith("/") else "", ats, region)
+        slug = parts.path.split("/")[1] if parts.path.startswith("/") else ""
+        if ats == "greenhouse" and slug == _GREENHOUSE_EMBED:
+            slug = next(iter(parse_qs(parts.query).get("for", [])), "")
+        return _board(slug, ats, region)
     for pattern, ats in _SUBDOMAIN_HOSTS:
         if (match := pattern.fullmatch(host)) is not None:
-            return _board(match[1], ats, None)
+            return _board("" if match[1] in _NOT_A_BOARD else match[1], ats, None)
     return Unsupported("unsupported_pattern")
 
 

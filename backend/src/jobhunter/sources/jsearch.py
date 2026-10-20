@@ -9,10 +9,11 @@ Envelope (spike V9, `docs/spikes/V9.md`): the items are at `ITEMS_PATH` and the 
 `CURSOR_PATH`. The end of the results is the cursor key present with `null` (or missing), never an empty page:
 `continuation` follows the cursor whatever the page length. `check_envelope` asserts the status, the item
 array and the cursor together, so a drift of any of them breaks the contract instead of reading as an empty
-page. A `status` that is a string other than `OK` is the provider's own error report, delivered with a 2xx
-(T9-a): `SourceError("transient", code="provider_error")`, a failed attempt that counts toward the breaker
-threshold, not a broken contract. A missing or non-string `status` is a contract violation. `parse`,
-`peek_native_ids` and `continuation` apply the same check, so no path reads an error body as a page.
+page. A `status` that is a string other than `OK` (in any case: `Ok` is `OK`) is the provider's own error
+report, delivered with a 2xx (T9-a): `SourceError("transient", code="provider_error")`, a failed attempt that
+counts toward the breaker threshold, not a broken contract. A missing or non-string `status` is a contract
+violation. `parse`, `peek_native_ids` and `continuation` apply the same check, so no path reads an error body
+as a page.
 
 Identity: `native_id` is `job_uid`, the Google `htidocid`. `job_id` embeds a session blob that changes from
 request to request and is never read.
@@ -105,7 +106,7 @@ def _document(page: RawPage) -> dict[str, JSONValue]:
     status = doc.get("status")
     if not isinstance(status, str):
         raise ContractViolation("status_invalid", status=page.status)
-    if status != "OK":
+    if status.casefold() != "ok":  # by its meaning, whatever the case: `Ok` is no provider error
         # The provider's text is not copied into the error: it is neither logged nor stored.
         raise SourceError("transient", code="provider_error", status=page.status)
     return doc

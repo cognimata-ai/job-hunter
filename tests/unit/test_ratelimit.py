@@ -98,6 +98,12 @@ async def test_an_unknown_key_is_refused() -> None:
     with pytest.raises(KeyError, match="jsaerch"):
         async with rl.acquire("jsaerch"):
             pass
+    # fix wave F4 (ledger L62): only the ATS host family expands; `jsearch:x` is no second JSearch bucket
+    for key in ("jsearch:x", "smartrecruiters-detail:x", "ats-host:", "arbeitnow:2"):
+        with pytest.raises(KeyError, match=key):
+            rl.acquire(key)
+        with pytest.raises(KeyError, match=key):
+            rl.gate(key)
     with pytest.raises(ValueError, match="twice"):
         RateLimiter(
             [RateLimit("jsearch", 1.0, 1), RateLimit("jsearch", 2.0, 1)],
@@ -119,3 +125,20 @@ def test_the_section_5_3_limits() -> None:
         RateLimit("ats-host", 5.0, 2),
         RateLimit("smartrecruiters-detail", 5.0, 4),
     )
+
+
+async def test_the_gate_of_a_key_is_one_semaphore_of_its_concurrency_for_the_process() -> None:
+    """Fix wave F4 (ledger L216): the gate is shared by every caller of the limiter (one per key), so two
+    SmartRecruiters traversals together hold at most `concurrency` detail acquisitions."""
+    rl = RateLimiter(SOURCE_LIMITS.values(), clock=FakeClock(0.0), sleep=asyncio.sleep)
+    detail = rl.gate(SMARTRECRUITERS_DETAIL.key)
+    assert rl.gate(SMARTRECRUITERS_DETAIL.key) is detail
+    host = rl.gate("ats-host:api.smartrecruiters.com")
+    assert host is not rl.gate("ats-host:api.lever.co")
+    for gate, slots in ((detail, SMARTRECRUITERS_DETAIL.concurrency), (host, ATS_HOST_LIMIT.concurrency)):
+        for _ in range(slots):
+            assert not gate.locked()
+            await gate.acquire()
+        assert gate.locked()  # the next caller waits
+        for _ in range(slots):
+            gate.release()

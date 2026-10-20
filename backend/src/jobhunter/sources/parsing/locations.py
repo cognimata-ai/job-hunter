@@ -366,9 +366,8 @@ def _resolve_part(gaz: Gazetteer, part: str, source: str, country_hint: str | No
     if folded in _COUNTRY_WIDE:
         return _Part(None, "country_wide", False)
 
-    if (
-        pair := _COORDINATES.fullmatch(part)
-    ) is not None:  # before the postal code: `47.80331` holds a 5-digit run
+    # coordinates before the postal code: `47.80331` holds a 5-digit run
+    if (pair := _COORDINATES.fullmatch(part)) is not None:
         lat, lon = float(pair[1]), float(pair[2])
         if not _is_coordinate_pair(lat, lon):
             # Text shaped like coordinates that no point on Earth has (`95.10115, 11.5`) is one unresolved

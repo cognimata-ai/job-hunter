@@ -162,3 +162,27 @@ async def test_a_removed_company_ends_its_validation_quietly(
     async with engine.connect() as c:
         assert tuple((await c.execute(OPERATION, {"i": op})).one()) == ("succeeded", None)
     assert await instances(engine) == []
+
+
+async def test_a_validation_whose_claim_was_lost_meanwhile_writes_nothing(
+    engine, current_epoch, queue_app, fake_http
+) -> None:
+    """Fix wave F4 (ledger L151): the owner lock comes after the GET, in the transaction of the writes; a
+    claim that lost the operation meanwhile (reclaimed, or a newer execution) is `FencedOut` there, so neither
+    the validation result nor the board's instance is written."""
+    from uuid import uuid4
+
+    from jobhunter.errors import FencedOut
+    from jobhunter.sources.watchlist_validate import run_watchlist_validate
+
+    company_id = await company(engine, "getyourguide")
+    async with engine.begin() as c:
+        op, _ = await request_validation(c, company_id, defer=defer_in_tx)
+    before = await validation(engine, company_id)
+    lost = ops.OperationClaim(op, uuid4(), "watchlist_validate", {"watchlist_company_id": company_id})
+    with pytest.raises(FencedOut):
+        await run_watchlist_validate(ops.OperationContext(claim=lost, engine=engine))
+    assert await validation(engine, company_id) == before
+    assert await instances(engine) == []
+    async with engine.connect() as c:  # the operation itself is untouched: still waiting for its own claim
+        assert tuple((await c.execute(OPERATION, {"i": op})).one()) == ("pending", None)

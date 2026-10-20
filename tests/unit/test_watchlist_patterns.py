@@ -63,6 +63,35 @@ def test_detection_edges(url, expected) -> None:
     assert detect(url) == expected
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # fix wave F4 (ledger L151): the ATS's own site names no board
+        ("https://www.recruitee.com/", Unsupported("unsupported_pattern")),
+        ("https://www.recruitee.com/en/careers", Unsupported("unsupported_pattern")),
+        ("https://www.jobs.personio.de/", Unsupported("unsupported_pattern")),
+        ("https://WWW.Recruitee.com", Unsupported("unsupported_pattern")),
+        ("https://wwwacme.recruitee.com", Detected("recruitee", "wwwacme", None)),  # only the label `www`
+        # a Greenhouse embed URL names its board in `for`, never `embed`
+        ("https://boards.greenhouse.io/embed/job_board?for=acme", Detected("greenhouse", "acme", None)),
+        (
+            "https://job-boards.greenhouse.io/embed/job_app?token=123&for=acme&b=x",
+            Detected("greenhouse", "acme", None),
+        ),
+        ("https://boards.greenhouse.io/embed/job_board", Unsupported("unsupported_pattern")),
+        ("https://boards.greenhouse.io/embed/job_board?for=", Unsupported("unsupported_pattern")),
+        ("https://boards.greenhouse.io/embed/job_board?for=../etc", Unsupported("bad_slug")),
+        ("https://boards.greenhouse.io/acme?for=other", Detected("greenhouse", "acme", None)),
+        (
+            "https://jobs.lever.co/embed?for=acme",
+            Detected("lever", "embed", "global"),
+        ),  # Greenhouse's form only
+    ],
+)
+def test_the_ats_site_and_the_greenhouse_embed_form(url, expected) -> None:
+    assert detect(url) == expected
+
+
 def test_slug_pattern_is_anchored_on_the_whole_value() -> None:
     assert SLUG.fullmatch("a" * 100) and not SLUG.fullmatch("a" * 101)
     assert SLUG.fullmatch("Acme_Co.de-1") and not SLUG.fullmatch("-acme") and not SLUG.fullmatch("acme\n")

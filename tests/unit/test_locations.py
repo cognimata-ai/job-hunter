@@ -3,6 +3,7 @@ import math
 import pytest
 from jobhunter.geo.gazetteer import NON_DE_COLUMNS, PLACE_COLUMNS, Gazetteer
 from jobhunter.normalize.text import fold
+from jobhunter.sources.parsing import locations
 from jobhunter.sources.parsing.locations import (
     Candidate,
     Location,
@@ -458,10 +459,24 @@ def test_an_out_of_range_coordinate_pair_leaves_the_other_parts_of_the_string_al
     assert parse_jsearch_location("99.5, 200.1 • über X", None, None).locations[0].resolution == "unresolved"
 
 
-@pytest.mark.parametrize("text", ["90.0, 180.0", "-90.0, -180.0", "0.0, 0.0"])
-def test_coordinates_at_the_edge_of_the_range_are_still_coordinates(text: str) -> None:
+@pytest.mark.parametrize(
+    "text, point",
+    [("90.0, 180.0", (90.0, 180.0)), ("-90.0, -180.0", (-90.0, -180.0)), ("0.0, 0.0", (0.0, 0.0))],
+)
+def test_coordinates_at_the_edge_of_the_range_are_still_coordinates(
+    text: str, point: tuple[float, float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix wave F4 (ledger L120): the edge of the range takes the coordinate path, which resolves the point,
+    not the out-of-range path (both leave such a point unresolved, so the path itself is asserted)."""
+    calls: list[tuple[float, float]] = []
+
+    def resolve(label: str, lat: float, lon: float, *, source: str) -> Location:
+        calls.append((lat, lon))
+        return location_from_coordinates(label, lat, lon, source=source)
+
+    monkeypatch.setattr(locations, "location_from_coordinates", resolve)
     (loc,) = parse(text).locations
-    assert loc.label == text and loc.postal_code is None
+    assert calls == [point] and loc.label == text and loc.postal_code is None
 
 
 def test_coordinates_far_from_every_known_place_have_no_known_country() -> None:

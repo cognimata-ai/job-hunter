@@ -394,9 +394,7 @@ def test_a_repeated_htidocid_is_a_duplicate_of_its_first_occurrence() -> None:
 def test_a_coordinate_shaped_location_that_is_out_of_range_never_fails_the_job() -> None:
     for text in ("95.10115, 11.5", "99.5, 200.1"):
         (location,) = parsed_one(location=text).locations
-        assert (
-            location.resolution == "unresolved" and location.candidates == [] and location.postal_code is None
-        )
+        assert (location.resolution, location.candidates, location.postal_code) == ("unresolved", [], None)
 
 
 def test_locations_and_their_absence() -> None:
@@ -459,6 +457,21 @@ def test_an_envelope_that_breaks_the_contract_is_a_violation(
     with pytest.raises(ContractViolation) as exc:
         adapter().check_envelope(page_of(doc))
     assert (exc.value.kind, exc.value.code, exc.value.status) == ("contract", code, 200)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [lambda d: d.pop("search_metadata"), lambda d: d.update(search_metadata=["Success"])],
+)
+def test_every_read_of_a_page_checks_its_search_metadata(mutate: Callable[[dict[str, Any]], Any]) -> None:
+    """Fix wave F4 (ledger L126): `peek_native_ids`, `elements`, `parse` and `continuation` re-check
+    `search_metadata` themselves, as `check_envelope` does, instead of relying on it having run first."""
+    doc = recorded_doc()
+    mutate(doc)
+    a, page = adapter(), page_of(doc)
+    for read in (a.check_envelope, a.peek_native_ids, a.elements, a.parse, a.continuation):
+        with pytest.raises(ContractViolation, match="search_metadata_missing"):
+            read(page)
 
 
 def test_drift_lists_and_non_json_bodies_are_violations() -> None:

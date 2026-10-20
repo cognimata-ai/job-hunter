@@ -2,6 +2,7 @@
 import asyncio
 import itertools
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -120,12 +121,24 @@ async def test_a_body_that_does_not_decode_is_a_contract_failure() -> None:
 async def test_lost_responses_are_ambiguous() -> None:
     respx.get("https://api.example/lost").mock(side_effect=httpx.RemoteProtocolError("peer closed"))
     respx.get("https://api.example/write").mock(side_effect=httpx.WriteTimeout("write"))
+    respx.get("https://api.example/read").mock(side_effect=httpx.ReadTimeout("read"))
     respx.get("https://api.example/pool").mock(side_effect=httpx.PoolTimeout("pool"))
+    respx.get("https://api.example/connect").mock(side_effect=httpx.ConnectTimeout("connect"))
+    codes = {}
     async with make_client("jsearch") as c:
-        for path in ("lost", "write", "pool"):
+        for path in ("lost", "write", "read", "pool", "connect"):
             out = await send(c, SPEC, c.build_request("GET", f"https://api.example/{path}"), now=NOW)
             assert out.page is None and out.error is not None
             assert (out.error.kind, out.error.before_send) == ("ambiguous", False)
+            codes[path] = out.error.code
+    # fix wave F4 (ledger L62): a connect or pool timeout is named apart from a timeout after the send
+    assert codes == {
+        "lost": "transport",
+        "write": "timeout",
+        "read": "timeout",
+        "pool": "connect_timeout",
+        "connect": "connect_timeout",
+    }
 
 
 async def test_the_total_deadline_ends_the_attempt_as_ambiguous() -> None:
@@ -134,9 +147,8 @@ async def test_the_total_deadline_ends_the_attempt_as_ambiguous() -> None:
         raise AssertionError("unreachable")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(hang)) as c:
-        out = await send(
-            c, SPEC, c.build_request("GET", "https://api.example/hang"), now=NOW, deadline_s=0.01
-        )
+        # a deadline of 0 s expires at the attempt's first wait: no real time is spent
+        out = await send(c, SPEC, c.build_request("GET", "https://api.example/hang"), now=NOW, deadline_s=0)
     assert out.page is None and out.error is not None
     assert (out.error.kind, out.error.code, out.error.before_send) == ("ambiguous", "deadline", False)
 
@@ -282,3 +294,27 @@ async def test_send_works_with_a_plain_client_and_the_default_cap() -> None:
     async with httpx.AsyncClient() as c:
         out = await send(c, SPEC, c.build_request("GET", "https://api.example/ok"), now=NOW)
     assert out.error is None and out.page is not None and out.page.json() == [1]
+
+
+async def test_a_smartrecruiters_detail_call_reads_for_30_s_and_its_list_page_for_60_s() -> None:
+    """Fix wave F4 (ledger L62): §5.2 gives the full boards a 60 s read; a detail call reads one posting, so
+    it has the ordinary 30 s read on the board's own client."""
+    from jobhunter.sources.ats.smartrecruiters import SmartRecruitersAdapter
+
+    seen: dict[str, dict[str, float | None]] = {}
+
+    def record(request: httpx.Request) -> httpx.Response:
+        operation = "detail" if request.url.path.endswith("/744000") else "list"
+        seen[operation] = request.extensions["timeout"]
+        return httpx.Response(404)
+
+    board = make_client("smartrecruiters")
+    async with httpx.AsyncClient(timeout=board.timeout, transport=httpx.MockTransport(record)) as client:
+        adapter = SmartRecruitersAdapter(client, instance_id=1, slug="DeliveryHero", clock=NOW)
+        listing = adapter.first_spec(cell_id=1, window=None, request_class="free")
+        await adapter.fetch(listing)
+        detail = replace(listing, operation="detail", detail_native_id="744000", parent_fetch_request_id=9)
+        await adapter.fetch(detail)
+    await board.aclose()
+    assert seen["list"] == {"connect": 5.0, "read": 60.0, "write": 10.0, "pool": 5.0}
+    assert seen["detail"] == {"connect": 5.0, "read": 30.0, "write": 10.0, "pool": 5.0}

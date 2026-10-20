@@ -27,7 +27,7 @@ from jobhunter.db.seed import DEFAULT_INSTANCES
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.sources.base import MISSING_SECRET
-from jobhunter.sources.breaker import Health
+from jobhunter.sources.breaker import Health, resolve_alerts
 
 # The §19.2 secret files a source's `default` instance cannot send without; the free sources need none.
 PROVIDER_SECRETS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
@@ -88,9 +88,12 @@ async def list_instances(conn: AsyncConnection) -> list[InstanceRow]:
 
 
 async def disable(conn: AsyncConnection, instance_id: int, *, code: str) -> None:
-    """`disabled` with `last_error_code = code`, the breaker cleared (no timestamps, no failures)."""
+    """`disabled` with `last_error_code = code`, the breaker cleared (no timestamps, no failures) and the
+    alert of the open state it left resolved: a disabled instance is no open breaker
+    (`breaker.resolve_alerts`)."""
     if (await conn.execute(_DISABLE, {"id": instance_id, "code": code})).first() is None:
         raise LookupError(f"source instance {instance_id} does not exist")
+    await resolve_alerts(conn, instance_id)
 
 
 def _secrets_present(cfg: AppConfig, source_id: str) -> bool:

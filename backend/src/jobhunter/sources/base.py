@@ -118,6 +118,10 @@ class RequestSpec:
     window: CoverageWindow | None
     request_class: RequestClass
 
+    # Frozen but not hashable: `params` is a read-only mapping, which has no hash. Declared, so the dataclass
+    # makes no `__hash__` that fails only when called; a spec is identified by its `request_key` (§5.1).
+    __hash__ = None  # type: ignore[assignment]
+
     def __post_init__(self) -> None:
         if secrets := {name for name in self.params if name.lower() in SECRET_PARAMS}:
             raise ValueError(

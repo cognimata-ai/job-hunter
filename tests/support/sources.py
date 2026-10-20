@@ -123,18 +123,19 @@ def served_requests(log_path: Path) -> list[dict[str, str]]:
     return served
 
 
-def jsearch_items(doc: JSONValue) -> list[JSONValue]:
+def jsearch_items(doc: JSONValue, *, status: int = 200) -> list[JSONValue]:
     """The item array of a JSearch `search-v2` document at `jsearch.ITEMS_PATH`, read as the adapter reads
-    it (anything else is a violation): a recording's envelope without a `RawPage` (final review F3: no
-    backend code reads a bare document, so this lives here)."""
-    return jsearch._items(doc, None)
+    it (anything else is a violation, raised with `status`: the recording's, 200 unless given): a recording's
+    envelope without a `RawPage` (final review F3: no backend code reads a bare document, so this lives
+    here). It calls the adapter's private reader, so a rename there breaks only the tests that use it."""
+    return jsearch._items(doc, status)
 
 
-def jsearch_cursor(doc: JSONValue) -> str | None:
+def jsearch_cursor(doc: JSONValue, *, status: int = 200) -> str | None:
     """The continuation cursor of a JSearch `search-v2` document at `jsearch.CURSOR_PATH`, read as the
     adapter reads it: `None` when the key is missing or `null` (the end form); a malformed one is a
-    violation."""
-    return jsearch._cursor(doc, None)
+    violation, raised with `status` (private reader, as `jsearch_items`)."""
+    return jsearch._cursor(doc, status)
 
 
 def make_cell_plan(**changes: Any) -> CellPlan:

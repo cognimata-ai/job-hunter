@@ -26,7 +26,8 @@ any results" or `search_information.jobs_results_state` is `Fully empty` (T9-c).
 `search_metadata.status == "Error"` and an `error` string is the provider's own error report, delivered with a
 2xx (T9-a): `SourceError("transient", code="provider_error")`, a failed attempt that counts toward the breaker
 threshold, or the `quota_exhausted` kind when the account has run out of searches. A missing `search_metadata`
-or any other body without `jobs_results` is a contract violation.
+or any other body without `jobs_results` is a contract violation, on every read of the page (`_document`), not
+only in `check_envelope`.
 
 Settlement (§5.3.2): a 2xx is `billed`, an empty result too; a connect error before any byte was sent is
 `not_billed`; everything else is `ambiguous`.
@@ -88,9 +89,14 @@ _VIA_PREFIX: Final = re.compile(r"^via\s+", re.IGNORECASE)
 
 
 def _document(page: RawPage) -> dict[str, JSONValue]:
+    """The body as an object with a `search_metadata` object; anything else raises. Every reader goes through
+    it (`check_envelope`, `peek_native_ids`, `elements`, `parse`, `continuation`), so none of them relies on
+    `check_envelope` having run first (fix wave F4, ledger L126)."""
     doc = page.json()
     if not isinstance(doc, dict):
         raise ContractViolation("not_object", status=page.status)
+    if not isinstance(doc.get("search_metadata"), dict):
+        raise ContractViolation("search_metadata_missing", status=page.status)
     return doc
 
 
@@ -341,9 +347,8 @@ class SerpApiAdapter:
         if outcome.error is not None:
             raise outcome.error
         page = outcome.page
-        if (
-            page is None
-        ):  # `send` returns a page or an error; this keeps a broken transport from reading as data
+        # `send` returns a page or an error; this keeps a broken transport from reading as data
+        if page is None:
             raise SourceError("transient", code="account_no_response")
         if not 200 <= page.status < 300:
             raise _account_status_error(page.status)
@@ -365,8 +370,6 @@ class SerpApiAdapter:
 
     def check_envelope(self, page: RawPage) -> None:
         doc = _document(page)
-        if not isinstance(doc.get("search_metadata"), dict):
-            raise ContractViolation("search_metadata_missing", status=page.status)
         _jobs(doc, page.status)
         _next_token(doc, page.status)
 

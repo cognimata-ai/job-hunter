@@ -9,8 +9,9 @@ open (a failed probe) keeps the open state and arms it for another `HALF_OPEN_AF
 `ok` and clears both timestamps. A `disabled` instance is left as it is by both: only `instances` enables it.
 
 Each failure that leaves the instance open raises (or counts one more occurrence of) the alert of its state,
-subject `instance:<id>`; a success resolves all four. Both functions lock the instance row and run in the
-caller's transaction; `source_instances` is the last lock of the §3.3.3 order.
+subject `instance:<id>`; a success resolves all four (`resolve_alerts`, which `instances.disable` calls as
+well). Both functions lock the instance row and run in the caller's transaction; `source_instances` is the
+last lock of the §3.3.3 order.
 """
 
 from collections.abc import Mapping
@@ -121,9 +122,15 @@ async def record_success(conn: AsyncConnection, instance_id: int, *, now: dateti
     if current == "disabled":
         return current
     await conn.execute(_SUCCEEDED, {"id": instance_id, "now": now})
+    await resolve_alerts(conn, instance_id)
+    return "ok"
+
+
+async def resolve_alerts(conn: AsyncConnection, instance_id: int) -> None:
+    """Resolve the alert of every open state of the instance (a success, or `instances.disable`: neither
+    leaves the instance open)."""
     for code, _severity in ALERTS.values():
         await resolve_alert(conn, code=code, subject=_subject(instance_id))
-    return "ok"
 
 
 Availability = Literal["available", "half_open", "blocked"]

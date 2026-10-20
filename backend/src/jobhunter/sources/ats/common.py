@@ -65,7 +65,7 @@ from jobhunter.sources.base import (
     Settlement,
     SourceError,
 )
-from jobhunter.sources.http import HttpOutcome, send
+from jobhunter.sources.http import HttpOutcome, request_timeout, send
 from jobhunter.sources.parsing.dates import ParsedDate, parse_iso
 from jobhunter.sources.parsing.description import plain_description
 from jobhunter.sources.parsing.employment import EmploymentType
@@ -299,8 +299,11 @@ class AtsAdapter(ABC):
     def _url(self, spec: RequestSpec) -> str: ...
 
     async def fetch(self, spec: RequestSpec) -> HttpOutcome:
-        """One attempt at the board's fixed host with the spec's parameters; never a retry."""
-        request = self._client.build_request("GET", self._url(spec), params=dict(spec.params))
+        """One attempt at the board's fixed host with the spec's parameters; never a retry. A detail call
+        reads for 30 s, not a full board's 60 s (`http.request_timeout`, §5.2)."""
+        request = self._client.build_request(
+            "GET", self._url(spec), params=dict(spec.params), timeout=request_timeout(self._client, spec)
+        )
         return await send(self._client, spec, request, now=self._clock)
 
     def next_page(self, spec: RequestSpec, cursor: str | None) -> RequestSpec | None:

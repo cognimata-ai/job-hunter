@@ -78,7 +78,6 @@ def test_capabilities_and_the_v3_language() -> None:
 
 
 def test_the_adapter_satisfies_the_source_adapter_protocol() -> None:
-    conforming: SourceAdapter = (
-        adapter()
-    )  # checked by mypy: plan(cell) -> RequestSpec, fetch(spec) -> HttpOutcome
+    # checked by mypy: plan(cell) -> RequestSpec, fetch(spec) -> HttpOutcome
+    conforming: SourceAdapter = adapter()
     assert conforming.capabilities().source_id == "serpapi"

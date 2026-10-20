@@ -7,7 +7,9 @@ classifies:
 
 - a `ConnectError` is `SourceError("transient", before_send=True)`: no request byte was written (§6.1
   `connect_failed_before_send`); on a redirect hop of the attempt it is not, as the first request was sent;
-- a timeout, the total deadline, or a response lost after the send is `SourceError("ambiguous")`;
+- a timeout, the total deadline, or a response lost after the send is `SourceError("ambiguous")`: code
+  `connect_timeout` for a connect or pool timeout (no connection was made, but §6.1 refunds a `ConnectError`
+  only), `timeout` for a read or write timeout, `deadline` and `transport` for the others;
 - a body over the cap is read no further and is `ContractViolation("body_too_large")` with the first
   `ERROR_BODY_BYTES` kept as the page (Deviation 19), and a body that does not decode (`content-encoding`) is
   `ContractViolation("undecodable_body")` with what was read; nothing else of the body is judged here, so an
@@ -52,7 +54,7 @@ class Timeouts:
 
     CONNECT: Final = 5.0
     READ: Final = 30.0
-    READ_FULL_BOARD: Final = 60.0  # Arbeitnow and the ATS boards
+    READ_FULL_BOARD: Final = 60.0  # Arbeitnow and the ATS boards (a list page; a detail call reads 30 s)
     WRITE: Final = 10.0
     POOL: Final = 5.0
     DEADLINE: Final = 90.0  # the total of one attempt
@@ -143,12 +145,22 @@ class _SourceClient(httpx.AsyncClient):
         self.max_body_bytes = max_body_bytes
 
 
+def _timeout(read: float) -> httpx.Timeout:
+    return httpx.Timeout(connect=Timeouts.CONNECT, read=read, write=Timeouts.WRITE, pool=Timeouts.POOL)
+
+
+def request_timeout(client: httpx.AsyncClient, spec: RequestSpec) -> httpx.Timeout:
+    """The timeout of one request of `client`: the client's (`make_client`), except that a detail call (a
+    SmartRecruiters posting) reads one posting, not a full board, so it reads for the §5.2 30 s."""
+    return _timeout(Timeouts.READ) if spec.operation == "detail" else client.timeout
+
+
 def make_client(source_id: str, *, max_body_bytes: int = MAX_BODY_BYTES) -> httpx.AsyncClient:
     """The client of `source_id` (one of the `sources` ids): §5.2 timeouts, User-Agent, no redirects."""
     if source_id not in _SOURCE_IDS:
         raise ValueError(f"unknown source {source_id!r}")
     read = Timeouts.READ_FULL_BOARD if source_id in FULL_BOARD_SOURCES else Timeouts.READ
-    timeout = httpx.Timeout(connect=Timeouts.CONNECT, read=read, write=Timeouts.WRITE, pool=Timeouts.POOL)
+    timeout = _timeout(read)
     return _SourceClient(
         source_id=source_id,
         max_body_bytes=max_body_bytes,
@@ -242,6 +254,8 @@ async def send(
     except httpx.ConnectError:
         # Only the first request of the attempt fails before anything was sent.
         outcome = HttpOutcome(None, SourceError("transient", code="connect", before_send=len(hops) <= 1))
+    except (httpx.ConnectTimeout, httpx.PoolTimeout):
+        outcome = HttpOutcome(None, SourceError("ambiguous", code="connect_timeout"))
     except httpx.TimeoutException:
         outcome = HttpOutcome(None, SourceError("ambiguous", code="timeout"))
     except TimeoutError:
