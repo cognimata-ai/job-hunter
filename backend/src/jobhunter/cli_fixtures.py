@@ -60,6 +60,9 @@ from urllib.parse import quote_plus, unquote, unquote_plus, urlsplit
 
 import httpx
 
+from jobhunter.geo.gazetteer import Gazetteer
+from jobhunter.normalize.text import fold
+from jobhunter.normalize.titles import GENDER_TAG
 from jobhunter.normalize.urls import host_is
 from jobhunter.observability.redact import EMAIL, KEY, PHONE
 from jobhunter.sources.http import stored_headers
@@ -219,6 +222,54 @@ ROLE_NAME: Final = re.compile(
     rf"|{_role(CONTACT_ROLE)}(?:{_ROLE_DASH}|[ \t]*:[ \t]*|{_ROLE_SPACE})({_TWO_OR_THREE}){_NAME_END}"
     rf"|(?<![{_UPPER}{_LOWER}])({_TWO_OR_THREE})(?:[ \t]*[,(][ \t]*|{_ROLE_DASH}){_LEAD_CHAIN}"
 )
+# Ruling FR-f (fix round 1): the verbs that introduce a person ("founded by", "co-founded by", "gegründet
+# von", "created by", "erstellt von", with a short "in Berlin 2019" between the verb and "by"/"von") and an
+# interview ("interview with", "Interview mit"), then two or three capitalised words that no legal form
+# follows: "founded by Acme Data Solutions GmbH" is a company.
+_LEGAL_FORM: Final = (
+    r"(?:GmbH|gGmbH|AG|SE|KG|KGaA|OHG|UG|eG|e\.\s?V\.|Inc\.?|Ltd\.?|LLC|LLP|PLC|plc|Corp\.?|Co\.|S\.A\.|SAS"
+    r"|SARL|B\.V\.|N\.V\.|AB|ASA|Oy|S\.p\.A\.|S\.r\.l\.)"
+)
+_NO_LEGAL_FORM: Final = (
+    rf"(?![ \t]*(?:[{_UPPER}][\w\-]*[ \t]+){{0,3}}(?:&[ \t]*Co\.?[ \t]*(?:KG[ \t]*)?)?{_LEGAL_FORM}(?!\w))"
+)
+_SHORT_GAP: Final = r"(?:[ \t]+[^.;:!?<>\n]{1,40}?)?"
+INTRODUCED_NAME: Final = re.compile(
+    rf"(?:(?i:\b(?:co-?)?founded){_SHORT_GAP}[ \t]+(?i:by)"
+    rf"|(?i:\b(?:mit)?gegr(?:ü|ue)ndet){_SHORT_GAP}[ \t]+(?i:von)"
+    rf"|(?i:\bcreated[ \t]+by|\berstellt[ \t]+von|\binterview[ \t]+(?:with|mit)))\b"
+    rf"{_ROLE_SPACE}({_TWO_OR_THREE}){_NAME_END}{_NO_LEGAL_FORM}"
+)
+# A second or third person right after an introduced one ("founded by <name> and <name>").
+_JOINED_NAME: Final = re.compile(
+    rf"[ \t]*(?:,|\band\b|\bund\b|&(?:amp;)?)[ \t]*({_TWO_OR_THREE}){_NAME_END}{_NO_LEGAL_FORM}"
+)
+# Minor 1 of the F1 review: a job title next to a role word is no name ("Geschäftsführer Vertrieb und
+# Marketing (m/w/d)", "Managing Director Germany", "CTO Platform Engineering", "Contact Customer Service"). A
+# found name is dropped when every word of it is a department or region word (`_TITLE_WORDS`), an abstract
+# noun (`_ABSTRACT_NOUN`: "Umsetzung von Vertriebsstrategien") or a country, or, for a name of two or more
+# words, a German place or a European city of the gazetteer; or when a gender tag follows it (after more
+# capitalised words and joiners only), as in a title. A one-word name that is a place stays a name: a dozen
+# common first names are places too ("an Julia", "Gründer Leon").
+_TITLE_WORDS: Final = frozenset(
+    {"vertrieb", "technik", "marketing", "finanzen", "finance", "personal", "operations", "platform"}
+    | {"engineering", "customer", "service", "services", "formular", "seite", "page", "sales", "produkt"}
+    | {"product", "products", "einkauf", "logistik", "produktion", "entwicklung", "forschung", "recht"}
+    | {"legal", "strategy", "strategie", "digital", "business", "data", "technology", "technologie"}
+    | {"people", "human", "resources", "development", "software", "hardware", "infrastructure", "security"}
+    | {"commercial", "growth", "revenue", "partnerships", "innovation", "research", "support"}
+    | {"administration", "verwaltung", "kommunikation", "communications", "center", "centre", "desk"}
+    | {"region", "international", "global", "europe", "europa", "nord", "sud", "ost", "west", "north"}
+    | {"south", "east", "central", "deutschland", "germany"}
+)
+_ABSTRACT_NOUN: Final = re.compile(
+    r".{3,}(?:ung|ungen|heit|heiten|keit|keiten|schaft|schaften|tion|tionen|itat|itaten|ismus|ien|ment|ments)"
+)  # on the folded word
+_TITLE_TAIL: Final = re.compile(
+    rf"(?:[ \t]*(?:und|and|&|/|,|-)?[ \t]*[{_UPPER}][{_LOWER}]+){{0,4}}[ \t]*(?:{GENDER_TAG.pattern}"
+    r"|\(?(?:m/w/d|w/m/d|m/f/d|f/m/d)\)?)",
+    re.IGNORECASE,
+)
 
 # Query and fragment parameters whose value is a token whatever it looks like: Adzuna's `se`, `v`, `adref`;
 # the Google `fc` session and the other Google session and tracking tokens (`sxsrf` holds a `:`, which keeps
@@ -345,21 +396,73 @@ def _sentinel_index(match: re.Match[str]) -> int:
     return int("".join(str(ord(ch) - _SENTINEL_DIGIT0) for ch in match.group(1)))
 
 
-def _role_names(text: str) -> list[tuple[int, int]]:
-    """The spans of the names that `ROLE_NAME` finds next to a role word."""
-    return [next(m.span(g) for g in range(1, 5) if m.group(g) is not None) for m in ROLE_NAME.finditer(text)]
+def _is_title(text: str, start: int, end: int) -> bool:
+    """Whether the name found at `text[start:end]` is the rest of a job title (`_TITLE_WORDS`,
+    `_TITLE_TAIL`)."""
+    if _TITLE_TAIL.match(text, end):
+        return True
+    gaz = Gazetteer.load()
+    words = [fold(w) for w in text[start:end].split() if not w.endswith(".") and w[:1].isupper()]
+
+    def title_word(w: str) -> bool:
+        known = gaz.non_de(w)
+        if (
+            w in _TITLE_WORDS
+            or _ABSTRACT_NOUN.fullmatch(w)
+            or (known is not None and known.kind == "country")
+        ):
+            return True
+        return len(words) > 1 and (known is not None or gaz.is_german_place_name(w))
+
+    return all(map(title_word, words))
+
+
+def role_names(text: str) -> list[tuple[int, int]]:
+    """The spans of the names next to a role word (`ROLE_NAME`) or introduced by a verb or an interview
+    (`INTRODUCED_NAME`), job titles left out. The scrubber replaces them; the PII scan fails on any."""
+    found = [next(m.span(g) for g in range(1, 5) if m.group(g) is not None) for m in ROLE_NAME.finditer(text)]
+    for introduced in INTRODUCED_NAME.finditer(text):
+        found.append(introduced.span(1))
+        end = introduced.end()
+        for _ in range(2):  # at most two more people joined to the first
+            if (joined := _JOINED_NAME.match(text, end)) is None:
+                break
+            found.append(joined.span(1))
+            end = joined.end()
+    return [(start, end) for start, end in sorted(set(found)) if not _is_title(text, start, end)]
+
+
+def contact_names(text: str) -> list[tuple[int, int]]:
+    """The spans of the names in the window after a contact marker: 2 or 3 capitalised words, or one after a
+    preposition ("Your contact person: Jane Doe", "Ihr Ansprechpartner für Fragen: Max Mustermann"), job
+    titles left out ("Kontakt Formular Seite", "Contact Customer Service"). The PII scan fails on any."""
+    spans: list[tuple[int, int]] = []
+    for marker in CONTACT_MARKER.finditer(text):
+        limit = marker.end() + CONTACT_WINDOW
+        for pattern, group in ((NAME, 0), (NAME_AFTER_PREPOSITION, 1)):
+            for name in pattern.finditer(text, marker.end()):
+                if name.start() >= limit:
+                    break
+                if not _is_title(text, *name.span(group)):
+                    spans.append(name.span(group))
+    return spans
+
+
+_NAME_WORD: Final = re.compile(_ROLE_NAME_WORD)
 
 
 def _echoes(text: str, names: Iterable[tuple[int, int]]) -> list[tuple[int, int, str]]:
-    """Every other mention of a role-named person of two or more words: the whole name, or its first word
-    alone (a later "mit Max"), each as a whole word; with the person key of the whole name."""
+    """Every other mention of a role-named person of two or more words: the whole name, its first word
+    alone (a later "mit Max") or its last word alone (a later "Mustermann sagt"), each as a whole word that
+    is no allow-listed word; with the person key of the whole name."""
     echoes: list[tuple[int, int, str]] = []
     # one search per person, not per mention
     distinct = {tuple(text[start:end].split()) for start, end in names}
     for words in sorted(w for w in distinct if len(w) >= 2):
         key = " ".join(words)
         whole = r"[ \t\r\n]+".join(map(re.escape, words))
-        for pattern in (whole, re.escape(words[0])):
+        single = [w for w in dict.fromkeys((words[0], words[-1])) if _NAME_WORD.fullmatch(w)]
+        for pattern in (whole, *map(re.escape, single)):
             mention = re.compile(rf"(?<![\w\-'\u2019]){pattern}(?![\w\-'\u2019])")
             echoes.extend((m.start(), m.end(), key) for m in mention.finditer(text))
     return echoes
@@ -371,17 +474,10 @@ def _name_spans(text: str) -> list[tuple[int, int, str]]:
     name after a salutation or an academic title, a name next to a role word and its later mentions.
     Overlapping spans are merged; a merged span is keyed by its own text, unless it is exactly a later mention
     of a role-named person."""
-    spans: list[tuple[int, int, str | None]] = []
-    for marker in CONTACT_MARKER.finditer(text):
-        limit = marker.end() + CONTACT_WINDOW
-        for pattern, group in ((NAME, 0), (NAME_AFTER_PREPOSITION, 1)):
-            for name in pattern.finditer(text, marker.end()):
-                if name.start() >= limit:
-                    break
-                spans.append((*name.span(group), None))
+    spans: list[tuple[int, int, str | None]] = [(start, end, None) for start, end in contact_names(text)]
     for pattern in (NAME_BEFORE_EMAIL, NAME_BEFORE_PHONE, SALUTED_NAME, TEAM_INTRODUCTION):
         spans.extend((*m.span(1), None) for m in pattern.finditer(text))
-    role_named = _role_names(text)
+    role_named = role_names(text)
     spans.extend((start, end, None) for start, end in role_named)
     spans.extend(_echoes(text, role_named))
     merged: list[tuple[int, int, list[tuple[int, int, str | None]]]] = []

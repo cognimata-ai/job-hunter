@@ -17,11 +17,16 @@ and the unlabelled forms of `PHONE_MORE`: `(0)30 1234567`, `0049 30 1234567`, do
 `030.12 34 56`, `030 / 12 34 56 78`, a mobile number without separators); any `utm_source` value other than
 `scrubbed`; the value of a provider key variable of this machine; a key-shaped string outside a valid link or a
 validated identifier field (a valid link carries no credential parameter such as `api_key`, `app_id` or `token`
-with a value other than a placeholder); and a name next to a role word in narrative text (`cli_fixtures.ROLE_NAME`,
-the scrubber's own rule: `CEO und Gründer <name>`, `<name>, Founder of …`, `Gründer <name>`, `Kontakt: <name>`).
-A narrow allow-list in that rule keeps the capitalised words that stand next to a role word and name nobody
-(`Founders Associate`, `Founder-Led Sales`, `Product Owner, founder`). Company and product names are not personal
-names and stay.
+with a value other than a placeholder); and a name in narrative text, by the scrubber's own rules
+(`cli_fixtures.role_names` and `contact_names`): next to a role word (`CEO und Gründer <name>`, `<name>, Founder
+of …`, `Gründer <name>`), introduced by a verb or an interview (`founded by`, `gegründet von`, `created by`,
+`erstellt von`, `interview with`, `Interview mit`, then two or three capitalised words that no legal form such as
+`GmbH` or `Inc` follows), or in the window after a contact marker (`Your contact person: <name>`, `Ihr
+Ansprechpartner für Fragen: <name>`, `Kontakt: <name>`). A narrow allow-list keeps the capitalised words that
+stand next to a role word and name nobody (`Founders Associate`, `Founder-Led Sales`, `Product Owner, founder`),
+and a found name whose words are all department, region or place words, or abstract nouns, or that a gender tag
+follows, is a job title (`Geschäftsführer Vertrieb (m/w/d)`, `Managing Director Germany`). Company and product
+names are not personal names and stay. The JSON rules run on every decoded string, as the scrubber reads it.
 
 ## Narrative names (fix wave F1)
 
@@ -38,13 +43,20 @@ their source, one number per person in every file of the source, a later first-n
 | `adzuna/search_p1_rpp100.json`, `search_p1_distance10.json`, `search_p1_distance50.json`, `adzuna_reingest_pair.json` | 2 people, 2 mentions each → `[person:1]`, `[person:2]` |
 | `adzuna/search_p1_days1.json` | 2 people, 1 mention each → `[person:1]`, `[person:2]` |
 
-The scrubber gained the narrative-name rule (`ROLE_NAME`) at the same time. A scrub of `.fixtures-raw` with it
-numbers these people in order of appearance and renumbers the later placeholders of their source, so it no longer
-reproduces these files byte for byte; and it catches only the names next to a role word: a founders' introduction
-("founded … by <name> and <name>"), an interview title and its link, and the creator named in a demo posting are
-left to the manual review, as before. Kept on purpose: the lower-case first-name team handles (`@first`) and the
-first-name test posting title of the Lever demo board `leverdemo` (first names only, of a vendor's demo data), and
-SerpApi's publisher titles (`apply_options[].title`), which are the names of the publishing sites.
+The scrubber gained the narrative-name rules at the same time (`ROLE_NAME`; `INTRODUCED_NAME` in fix round 1,
+ruling FR-f). A scrub of `.fixtures-raw` with them numbers these people in order of appearance and renumbers the
+later placeholders of their source, so it no longer reproduces these files byte for byte. The rules do not see
+every form: a name in a link slug, "With <name>, he founded …", or a second founder after a parenthetical stay
+with the manual review. Kept on purpose: the lower-case first-name team handles (`@first`, four distinct ones in
+four description fields of `ats/lever_eu_leverdemo.json`) and the two first-name test posting titles (one in
+`ats/lever_leverdemo.json`, one in `ats/lever_eu_leverdemo.json`) of the Lever demo board `leverdemo`: first names
+only, of a vendor's demo data.
+
+In fix round 1 (ruling FR-e) one SerpApi publisher title (`apply_options[].title` of `serpapi/google_jobs_hl_en`
+and `google_jobs_drift`) that was a job site branded with its owner's full name became the invented brand
+`Gaming Industry Job Tracker - Beispiel Jobs`, and its link host `jobs.beispiel-jobs.example`; the rest of the
+link (path `/jobs/46524`, the scrubbed parameters) is as recorded. The audit found no other personal name in a
+publisher title.
 
 ## How the tree is made
 

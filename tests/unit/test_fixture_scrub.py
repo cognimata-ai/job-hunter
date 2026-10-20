@@ -530,3 +530,64 @@ def test_the_person_key_suffix_rule(key: str) -> None:
 def test_keys_that_name_no_person_stay(key: str) -> None:
     assert is_person_key(key) is False
     assert scrub_document({key: "Acme Holding"}, "ats", Pseudonyms()) == {key: "Acme Holding"}
+
+
+# Ruling FR-f (F1 fix round 1): the verbs and the interview that introduce a person, invented names only.
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        ("Founded in Berlin in 2019 by Max Mustermann.", "Founded in Berlin in 2019 by [person:1]."),
+        ("founded by Max Mustermann and Erika Musterfrau", "founded by [person:1] and [person:2]"),
+        ("Acme wurde 2019 gegründet von Erika Musterfrau.", "Acme wurde 2019 gegründet von [person:1]."),
+        ("Watch the interview with Jane Doe.", "Watch the interview with [person:1]."),
+        ("Ein Interview mit Max Mustermann über KI.", "Ein Interview mit [person:1] über KI."),
+        (
+            "This is a test job - created by Jane Doe, for testing.",
+            "This is a test job - created by [person:1], for testing.",
+        ),
+        ("Die Seite wurde erstellt von Erika Musterfrau.", "Die Seite wurde erstellt von [person:1]."),
+        ("Your contact person: Jane Doe", "Your contact person: [person:1]"),
+        ("Ihr Ansprechpartner für Fragen: Max Mustermann", "Ihr Ansprechpartner für Fragen: [person:1]"),
+    ],
+)
+def test_a_person_introduced_by_a_verb_or_an_interview_is_pseudonymised(text: str, scrubbed: str) -> None:
+    assert scrub_text(text, Pseudonyms()) == scrubbed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "founded by Acme Data Solutions GmbH in 2019",  # a legal form follows: a company
+        "created by Acme Labs Inc. for you",
+        "erstellt von Muster Software AG",
+        "founded by Google veterans",  # one capitalised word only
+        "Interview mit dem Fachbereich",
+        # F1 review, Minor 1: job titles after a role or contact word, and the echo they would spread
+        "Geschäftsführer Vertrieb und Marketing (m/w/d)",
+        "Geschäftsführer Technik Deutschland (m/w/d). Wir suchen den Vorstand Technik.",
+        "Managing Director Germany",
+        "CTO Platform Engineering",
+        "Kontakt Formular Seite",
+        "Contact Customer Service",
+    ],
+)
+def test_companies_and_job_titles_after_the_introducing_words_stay(text: str) -> None:
+    assert scrub_text(text, Pseudonyms()) == text
+
+
+def test_a_one_word_name_that_is_also_a_place_stays_a_name() -> None:
+    # F1 fix round 1: only a name of two or more place words is a title ("CTO Berlin Hamburg"); a dozen common
+    # first names are places too (Sofia, a city), so a single one is still scrubbed
+    assert (
+        scrub_text("Hinter Acme steht Gründerin Sofia.", Pseudonyms())
+        == "Hinter Acme steht Gründerin [person:1]."
+    )
+    assert scrub_text("CTO Berlin Hamburg", Pseudonyms()) == "CTO Berlin Hamburg"
+
+
+def test_a_later_mention_by_surname_gets_the_same_placeholder() -> None:
+    # F1 review, Minor 2
+    out = scrub_text("Max Mustermann, CEO. Später sagt Mustermann: Max lacht.", Pseudonyms())
+    assert out == "[person:1], CEO. Später sagt [person:1]: [person:1] lacht."
+    titled = scrub_text("Jane C. Doe, Founder of Acme. Doe says hi.", Pseudonyms())
+    assert titled == "[person:1], Founder of Acme. [person:1] says hi."

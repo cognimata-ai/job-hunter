@@ -10,8 +10,9 @@ import pytest
 # validate_identifier(source, key, value) -> bool: the field's own shape check
 from jobhunter.cli_fixtures import (
     IDENTIFIER_FIELDS,
-    ROLE_NAME,
     URL_IN_TEXT,
+    contact_names,
+    role_names,
     valid_url,
     validate_identifier,
 )
@@ -75,13 +76,17 @@ def test_fixture_has_no_pii_secret_or_key_shaped_value(path) -> None:
         "a phone number survived the scrub"
     )
     assert {m.group(1) for m in UTM.finditer(text)} <= {"scrubbed"}
-    # fix wave F1 (final review C1): a name next to a role word ("CEO und Gründer <name>", "<name>, Founder")
-    assert not ROLE_NAME.search(text), "a name next to a role word survived the scrub"
+    # fix wave F1 (final review C1, ruling FR-f): a name next to a role word ("CEO und Gründer <name>",
+    # "<name>, Founder"), introduced by a verb or an interview ("founded by <name>", "Interview mit <name>")
+    assert not role_names(text), "a name next to a role word survived the scrub"
     for var in SECRET_VARS:  # the real keys of this machine, when present: never echoed in the message
         value = os.environ.get(var, "")
         assert len(value) < 8 or value not in text, f"the value of {var} is in the fixture"
     if path.suffix != ".json":
         assert not KEY.search(outside_links(text)), "a key-shaped value in a non-JSON fixture"
+        # review Minor 6: the scrubber's contact window ("Your contact person: <name>"), on the text as
+        # scrubbed
+        assert not contact_names(text), "a name after a contact marker survived the scrub"
         return
     doc = json.loads(text)
     if path.name.endswith(".headers.json"):
@@ -91,8 +96,10 @@ def test_fixture_has_no_pii_secret_or_key_shaped_value(path) -> None:
             "x-rapidapi-key",
             "cookie",
         }
-    named = [p for p, v in strings(doc) if ROLE_NAME.search(v)]  # a JSON string decoded: line breaks are real
-    assert not named, f"a name next to a role word survived the scrub at {named}"
+    # each JSON string decoded, as the scrubber reads it: line breaks are real, and a contact window never
+    # reaches into the next field
+    named = [p for p, v in strings(doc) if role_names(v) or contact_names(v)]
+    assert not named, f"a name next to a role or contact word survived the scrub at {named}"
     strict = [
         (p, v) for p, v in strings(doc) if KEY.search(outside_links(v))
     ]  # a key-shaped value is allowed only in a valid link or a validated identifier field
@@ -159,7 +166,8 @@ def test_the_scan_leaves_ids_uuids_and_timestamps_alone(value: str) -> None:
     assert not (PHONE.search(value) or PHONE_DE.search(value) or PHONE_MORE.search(value)), value
 
 
-# Fix wave F1 (final review C1): the narrative-name pattern of the scrubber, proved on invented names.
+# Fix wave F1 (final review C1, ruling FR-f): the narrative-name rules of the scrubber, proved on invented
+# names.
 @pytest.mark.parametrize(
     "text",
     [
@@ -172,10 +180,20 @@ def test_the_scan_leaves_ids_uuids_and_timestamps_alone(value: str) -> None:
         "Kontakt: Erika Musterfrau",
         "Ihre Ansprechpartnerin\nErika Musterfrau",
         "&lt;strong&gt;Geschäftsführerin&lt;/strong&gt; Erika Musterfrau",
+        # ruling FR-f: the six introducing forms, and the contact forms of the scrubber's window (review Minor
+        # 6)
+        "Founded in Berlin in 2019 by Max Mustermann and Erika Musterfrau.",
+        "Acme wurde 2019 gegründet von Erika Musterfrau.",
+        "Watch the interview with Jane Doe on our blog.",
+        "Ein Interview mit Max Mustermann über KI.",
+        "This is a test job - created by Jane Doe, for testing candidate insights.",
+        "Die Seite wurde erstellt von Erika Musterfrau.",
+        "Your contact person: Jane Doe",
+        "Ihr Ansprechpartner für Fragen: Max Mustermann",
     ],
 )
 def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:
-    assert ROLE_NAME.search(text), text
+    assert role_names(text) or contact_names(text), text
 
 
 @pytest.mark.parametrize(
@@ -191,7 +209,19 @@ def test_the_scan_detects_a_name_next_to_a_role_word(text: str) -> None:
         "Dein Kontakt Du hast Fragen?",
         "Contact Us",
         "direct access to the Head of Finance and the founders",
+        # ruling FR-f: a company after the introducing words, and the job titles of review Minor 1
+        "founded by Acme Data Solutions GmbH in 2019",
+        "created by Acme Labs Inc. for you",
+        "founded by Google veterans",
+        "Interview mit Hiring Manager und Team",
+        "Ein Interview mit [person:3] über KI.",
+        "Geschäftsführer Vertrieb und Marketing (m/w/d)",
+        "Geschäftsführer Technik Deutschland (m/w/d). Wir suchen den Vorstand Technik.",
+        "Managing Director Germany",
+        "CTO Platform Engineering",
+        "Kontakt Formular Seite",
+        "Contact Customer Service",
     ],
 )
 def test_the_scan_passes_placeholders_companies_and_role_compounds(text: str) -> None:
-    assert not ROLE_NAME.search(text), text
+    assert not role_names(text) and not contact_names(text), text
