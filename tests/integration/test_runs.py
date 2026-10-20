@@ -2,7 +2,7 @@ import asyncio
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import sqlalchemy as sa
@@ -21,7 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from procrastinate.job_context import JobContext
 
 from tests.support.faults import PausePoint
-from tests.support.pg import blocked_or_done
+from tests.support.pg import blocked_or_done, lock_waits
 from tests.support.procs import await_until
 
 # Every test here admits or claims as `epoch=1` (or a later claimed epoch): epoch 1 must be the current one.
@@ -633,3 +633,115 @@ async def test_a_redeferred_run_that_then_runs_keeps_no_stale_reason(engine, que
     async with open_saver(migrated.dsn("app")) as saver:
         assert await runs.execute_run(engine, build_noop_collect_graph(saver), rid, 1, epoch=1) == "resumed"
     assert (await fetch(engine, rid))[0::5] == ("succeeded", None)
+
+
+# --- Task 24: carry 4 (the run heartbeat covers a long node) and Task 23's review addenda 9 and 11 ---------
+
+
+def one_node_graph(node: Any) -> Any:
+    """A graph (no checkpointer) of the one node `work`."""
+    g = StateGraph(CollectState)
+    g.add_node("work", node)
+    g.add_edge(START, "work")
+    g.add_edge("work", END)
+    return g.compile()
+
+
+async def heartbeat_at(engine, rid: int):
+    return await scalar(engine, "SELECT heartbeat_at FROM runs WHERE id=:i", i=rid)
+
+
+async def test_the_run_heartbeat_beats_while_one_long_node_runs(engine, queue_app) -> None:
+    """Carry 4: the heartbeat is a task of its own beside the graph (`run_owned`), so one node that runs for
+    many periods (the fetch fan-out, `embed`) keeps the run's `heartbeat_at` fresh; no node beats itself."""
+    rid, beats = await queued(engine), list[Any]()
+
+    async def long_node(state: CollectState) -> CollectUpdate:
+        admitted = await heartbeat_at(engine, rid)
+
+        async def three_more_beats() -> bool:
+            latest = await heartbeat_at(engine, rid)
+            if latest > (beats[-1] if beats else admitted):
+                beats.append(latest)
+            return len(beats) >= 3
+
+        await await_until(three_more_beats, 10, step_s=0.02)  # all within this one node
+        return {"steps": ["work"]}
+
+    graph = one_node_graph(long_node)
+    assert await runs.execute_run(engine, graph, rid, 1, epoch=1, heartbeat_period_s=0.05) == "started"
+    assert len(beats) == 3 and beats == sorted(beats)
+    assert (await fetch(engine, rid))[:2] == ("succeeded", 1)
+
+
+def ending_node(engine, *, then: str, server=None):
+    """A node that ends the run itself, as the graph's `finalize` does (one owner-fenced transaction, the end
+    observed after its commit), and then raises (`then="raise"`) or, once a heartbeat waits for its
+    transaction on `server`, commits and waits until it is cancelled (`then="wait"`: the refused beat
+    cancels it)."""
+
+    async def node(state: CollectState) -> CollectUpdate:
+        owner = runs.RunOwner(state["run_id"], state["attempt_no"])
+        async with engine.begin() as c:
+            duration = await runs.finalize_run(
+                c, owner, status="succeeded", reason=None, report={"by": "graph"}
+            )
+            if then == "wait":
+                # The next beat waits for this transaction's lock on the run row ...
+                async def a_beat_waits() -> bool:
+                    return lock_waits(server) > 0
+
+                await await_until(a_beat_waits, 5, step_s=0.01)
+        runs.observe_run_ends([runs.RunEnd(status="succeeded", duration_s=duration)])
+        if then == "raise":
+            raise RuntimeError("the last checkpoint write failed")
+        await asyncio.get_running_loop().create_future()  # ... and after the commit is refused: cancelled
+        return {"steps": ["work"]}
+
+    return node
+
+
+async def run_failed_alerts(engine) -> int:
+    return int(await scalar(engine, "SELECT count(*) FROM alerts WHERE code = 'run.failed'"))
+
+
+async def test_an_error_after_the_graph_ended_its_run_writes_nothing_more(
+    engine, queue_app, log_events
+) -> None:
+    """Addendum 9: `raised` looks the attempt's end up first; a graph that committed its finalize before the
+    error (here, as if writing the last checkpoint failed) is neither `run_graph_failed` nor finalized
+    again."""
+    rid = await queued(engine)
+    succeeded, failed = runs_total("succeeded"), runs_total("failed")
+    graph = one_node_graph(ending_node(engine, then="raise"))
+    assert await runs.execute_run(engine, graph, rid, 1, epoch=1) == "started"
+    row = await fetch(engine, rid)
+    assert (row[0], row[4]) == ("succeeded", {"by": "graph"})
+    assert (runs_total("succeeded"), runs_total("failed")) == (succeeded + 1, failed)  # counted once
+    events = log_events()
+    assert not [e for e in events if e["event"] in ("run_graph_failed", "run_fenced", "run_finished")]
+    [event] = [e for e in events if e["event"] == "run_graph_failed_after_end"]
+    assert (event["run_id"], event["status"], event["error_class"]) == (rid, "succeeded", "RuntimeError")
+    assert await run_failed_alerts(engine) == 0
+    assert await attempts(engine, rid) == [(1, 1, "completed")]
+
+
+async def test_a_heartbeat_blocked_by_the_finalize_loses_the_attempt_and_writes_nothing(
+    engine, queue_app, migrated, log_events
+) -> None:
+    """Addendum 11: a beat that fires during the finalize transaction waits for its lock and, after the
+    commit, finds the run ended: the beat is refused, the work is cancelled and the attempt is `lost`
+    (`execution_lost`). That is harmless: `lost` writes nothing, so the run is never finalized again and its
+    end is counted once, by the node that ended it."""
+    rid = await queued(engine)
+    succeeded, timed = runs_total("succeeded"), timed_runs()
+    graph = one_node_graph(ending_node(engine, then="wait", server=migrated))
+    assert await runs.execute_run(engine, graph, rid, 1, epoch=1, heartbeat_period_s=0.05) == "started"
+    row = await fetch(engine, rid)
+    assert (row[0], row[4]) == ("succeeded", {"by": "graph"})
+    assert (runs_total("succeeded"), timed_runs()) == (succeeded + 1, timed + 1)
+    events = log_events()
+    assert [e["key"] for e in events if e["event"] == "execution_lost"] == [f"run:{rid}"]
+    assert not [e for e in events if e["event"] in ("run_graph_failed", "run_fenced", "run_finished")]
+    assert await run_failed_alerts(engine) == 0
+    assert await attempts(engine, rid) == [(1, 1, "completed")]

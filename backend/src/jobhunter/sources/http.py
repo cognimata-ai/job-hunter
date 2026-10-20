@@ -102,6 +102,12 @@ def configure(cfg: AppConfig) -> None:
     _configuration = _Configuration(cfg.http_user_agent, transport)
 
 
+def serves_fixtures() -> bool:
+    """Whether `configure` put the fixture transport in place: the clients made from now on are served from
+    the fixtures (fake mode)."""
+    return _configuration.transport is not None
+
+
 def _reset_configuration() -> None:
     """Back to the defaults (for tests)."""
     global _configuration

@@ -44,7 +44,8 @@ reported, never a cause; so is a source error that a node's error handler caught
 **Alerts** (§17.6): `run.failed_invariant` (critical, subject `run:<id>`) for a `failed_invariant` end;
 `quota.limit_breach` (critical, `provider:<name>`) per provider I3 found over its limit; `run.partial` (warn,
 `collect:<cause>`) per cause of a `partial` end, and every absent cause's alert resolved (whatever the
-status); every open `run.failed` resolved by a `succeeded` end; `quota.fallback_active` resolved when the
+status); every open `run.failed` and `run.orphaned_queue` resolved by a `succeeded` end (§17.6 "next
+success", Task 24); `quota.fallback_active` resolved when the
 run dispatched no fallback request; `coverage.gap_abandoned` by `abandon_old_gaps`.
 
 **Report** (§17.3, `build_report`, `runs.report`): `sources`, `identity`, `revisions`, `quota` and
@@ -91,6 +92,7 @@ from jobhunter.types import JSONValue, get_list, get_str
 from jobhunter.worker.runs import (
     FAILED_ALERT,
     FAILED_INVARIANT_ALERT,
+    ORPHANED_QUEUE_ALERT,
     FinalStatus,
     RunEnd,
     RunOwner,
@@ -608,6 +610,7 @@ async def _alerts(
             )
     if status == "succeeded":
         await resolve_alerts(conn, code=FAILED_ALERT)
+        await resolve_alerts(conn, code=ORPHANED_QUEUE_ALERT)
     if not int((await conn.execute(_FALLBACK, {"run": run_id})).one().served):
         await resolve_alert(conn, code=FALLBACK_ACTIVE_ALERT, subject=_SERPAPI_SUBJECT)
 

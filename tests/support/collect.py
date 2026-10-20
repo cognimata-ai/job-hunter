@@ -66,6 +66,7 @@ collection graph (or `graph`, built over `saver`, an `InMemorySaver` unless give
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -1221,3 +1222,319 @@ def conflicting_graph(saver: BaseCheckpointSaver[str], deps: CollectDeps) -> Col
     # the name `build_collect_graph` calls, replaced while it builds the graph
     with mock.patch(f"{collect_graph.__name__}.make_fetch_cell", make):
         return build_collect_graph(saver, deps)
+
+
+# ---- Task 24 ----------------------------------------------------------------------------------------------
+
+# Far from the database clock, as in the M0 retention tests: a window measured from the database's `now()`
+# instead of the caller's `now` would delete nothing, or everything.
+RETENTION_SHIFT: Final = timedelta(days=1000)
+_DAY: Final = timedelta(days=1)
+
+_FINISHED_RUN: Final = q(
+    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id, "
+    "attempt_no, queued_at, started_at, finished_at) SELECT 'manual', NULL, 'succeeded', false, "
+    "settings_version_id, scope_version_id, 1, :at, :at, :at FROM active_config RETURNING id"
+)
+_FREE_CELL: Final = q("INSERT INTO coverage_cells (source_instance_id) VALUES (:i) ON CONFLICT DO NOTHING")
+_FREE_CELL_ID: Final = q(
+    "SELECT id FROM coverage_cells WHERE source_instance_id = :i AND query_id IS NULL "
+    "AND location_key IS NULL"
+)
+# A request of the run on the cell; a terminal one `failed` (a page may come with it), else `planned`.
+_AGED_REQUEST: Final = q(
+    "INSERT INTO fetch_requests (run_id, run_attempt_no, cell_id, source_instance_id, phase, operation, "
+    "request_key, page_no, request_class, spec, status, error_code, http_status, created_at, finished_at) "
+    "SELECT CAST(:run AS bigint), 1, c.id, c.source_instance_id, 'primary', 'list', CAST(:key AS bytea), 1, "
+    "'free', '{}', CAST(:status AS text), CASE WHEN CAST(:status AS text) = 'failed' THEN 'http_500' END, "
+    "CASE WHEN CAST(:status AS text) = 'failed' THEN 500 END, CAST(:at AS timestamptz), "
+    "CASE WHEN CAST(:status AS text) = 'failed' THEN CAST(:at AS timestamptz) END FROM coverage_cells c "
+    "WHERE c.id = :cell RETURNING id"
+)
+_AGED_RESPONSE: Final = q(
+    "INSERT INTO raw_responses (fetch_request_id, source_instance_id, http_status, headers, body_zstd, "
+    "body_sha256, body_ref_id, fetched_at, expires_at, purged_at) SELECT f.id, f.source_instance_id, 500, "
+    "'{}', CAST(:body AS bytea), CAST(:sha AS bytea), CAST(:ref AS bigint), CAST(:fetched AS timestamptz), "
+    "CAST(:expires AS timestamptz), CAST(:purged AS timestamptz) FROM fetch_requests f WHERE f.id = :fr "
+    "RETURNING id"
+)
+_LINK_RESPONSE: Final = q("UPDATE fetch_requests SET raw_response_id = :r WHERE id = :f")
+_AGED_ITEM: Final = q(
+    "INSERT INTO raw_items (raw_response_id, item_index, native_id, item_sha256, disposition, reason_code, "
+    "normalized, created_at, disposed_at) VALUES (:r, :index, :native, :sha, :disposition, :reason, "
+    "NULLIF(:normalized, CAST('null' AS jsonb)), :at, :at) RETURNING id",  # JSONB binds None as JSON null
+    jsonb=["normalized"],
+)
+_AGED_SNAPSHOT: Final = q(
+    "INSERT INTO ats_snapshots (source_instance_id, status, incomplete_reason, event_snapshot_id, "
+    "member_count, taken_at, applied_at, acknowledged_at) VALUES (:i, :status, "
+    "CASE WHEN :status = 'incomplete' THEN 'no_end' END, :event, 0, :at, :at, :acknowledged) RETURNING id"
+)
+_POINT_SNAPSHOTS: Final = q(
+    "UPDATE source_instances SET last_complete_snapshot_id = :complete, mass_event_snapshot_id = :mass "
+    "WHERE id = :i"
+)
+_EMBEDDING: Final = q(
+    "INSERT INTO embeddings (embedding_model_id, text_sha256, input_kind, vector, created_at) "
+    "VALUES ('m1-retention-test', :sha, 'passage', CAST(:vector AS halfvec), :at) RETURNING id"
+)
+_EMBEDDED_REVISION: Final = q(
+    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, description_text, "
+    "description_completeness, ad_language, embedding_status, embedding_id) VALUES (:job, 1, :hash, '{}', "
+    "'Build Python services.', 'full', 'en', 'embedded', :embedding) RETURNING id"
+)
+_INTERVAL: Final = q(
+    "INSERT INTO coverage_intervals (cell_id, kind, span, gap_status, reason, created_at, closed_at) "
+    "VALUES (:cell, :kind, tstzrange(:lower, :upper, '[)'), :gap_status, :reason, :created, :closed) "
+    "RETURNING id"
+)
+_UNIT_VECTOR: Final = "[" + ",".join(["0"] * 1023 + ["1"]) + "]"
+
+
+@dataclass(frozen=True)
+class M1Rows:
+    """The aged rows of `m1_rows`, by name, and the `now` they are aged from (`utcnow() +
+    RETENTION_SHIFT`)."""
+
+    now: datetime
+    ids: Mapping[str, int]
+
+    def __getitem__(self, name: str) -> int:
+        return self.ids[name]
+
+
+async def insert_finished_run(conn: AsyncConnection, *, at: datetime) -> int:
+    """A `succeeded` manual run at attempt 1 that was queued, started and finished at `at`."""
+    return int((await conn.execute(_FINISHED_RUN, {"at": at})).scalar_one())
+
+
+async def free_cell(conn: AsyncConnection, source_id: str, instance_key: str = "default") -> int:
+    """The coverage cell without query and location of the instance (Arbeitnow's, a board's)."""
+    instance = await instance_id(conn, source_id, instance_key)
+    await conn.execute(_FREE_CELL, {"i": instance})
+    return int((await conn.execute(_FREE_CELL_ID, {"i": instance})).scalar_one())
+
+
+async def aged_request(
+    conn: AsyncConnection, *, run_id: int, cell_id: int, created_at: datetime, status: str = "failed"
+) -> int:
+    """A fetch request of `run_id` on `cell_id` created at `created_at`: `failed` (terminal) or `planned`."""
+    params = {"run": run_id, "cell": cell_id, "key": os.urandom(32), "status": status, "at": created_at}
+    return int((await conn.execute(_AGED_REQUEST, params)).scalar_one())
+
+
+async def aged_response(
+    conn: AsyncConnection,
+    fetch_request_id: int,
+    *,
+    fetched_at: datetime,
+    expires_at: datetime,
+    body: bool = True,
+    ref: int | None = None,
+    purged_at: datetime | None = None,
+) -> int:
+    """The stored response of the request: its own body, or (`body=False`) the body of the row `ref` (§7.7
+    deduplication), or nothing once `purged_at` is set."""
+    params = {
+        "fr": fetch_request_id,
+        "body": os.urandom(16) if body else None,
+        "sha": os.urandom(32),
+        "ref": ref,
+        "fetched": fetched_at,
+        "expires": expires_at,
+        "purged": purged_at,
+    }
+    response = int((await conn.execute(_AGED_RESPONSE, params)).scalar_one())
+    await conn.execute(_LINK_RESPONSE, {"r": response, "f": fetch_request_id})
+    return response
+
+
+async def _aged_item(
+    conn: AsyncConnection, response: int, index: int, *, created_at: datetime, deferred: bool = False
+) -> int:
+    params = {
+        "r": response,
+        "index": index,
+        "native": f"m1-{index}",
+        "sha": os.urandom(32),
+        "disposition": "deferred" if deferred else "linked",
+        "reason": "job_fenced" if deferred else None,
+        "normalized": {"title": "Python Developer"} if deferred else None,
+        "at": created_at,
+    }
+    return int((await conn.execute(_AGED_ITEM, params)).scalar_one())
+
+
+async def _snapshot(
+    conn: AsyncConnection,
+    board: int,
+    status: str,
+    *,
+    taken_at: datetime,
+    event: int | None = None,
+    acknowledged_at: datetime | None = None,
+) -> int:
+    params = {"i": board, "status": status, "event": event, "at": taken_at, "acknowledged": acknowledged_at}
+    return int((await conn.execute(_AGED_SNAPSHOT, params)).scalar_one())
+
+
+async def _interval(
+    conn: AsyncConnection,
+    cell: int,
+    kind: str,
+    *,
+    lower: datetime,
+    created_at: datetime,
+    closed_at: datetime | None = None,
+) -> int:
+    gap = kind == "gap"
+    params = {
+        "cell": cell,
+        "kind": kind,
+        "lower": lower,
+        "upper": lower + _DAY,
+        "gap_status": None if not gap else ("open" if closed_at is None else "closed"),
+        "reason": "page_cap" if gap else None,
+        "created": created_at,
+        "closed": closed_at,
+    }
+    return int((await conn.execute(_INTERVAL, params)).scalar_one())
+
+
+@pytest.fixture
+async def m1_rows(engine: AsyncEngine) -> M1Rows:
+    """The aged rows of the M1 retention rules, on either side of each window, at `now = utcnow() + 1000 d`:
+
+    - `raw_items` (90 d by `created_at`): `item_old` (91 d, linked to the observation `obs_old`),
+      `item_recent` (89 d, linked to `obs_recent`) and `item_deferred` (91 d, `deferred('job_fenced')`: a
+      later run re-resolves it), all on `items_response`;
+    - `raw_bodies` (by `expires_at`): `body_expired` (1 s before `now`), `body_live` (1 s after) and the
+      deduplicated `body_shared` (fetched 398 d ago, on the 398-day-old request `fr_shared`), whose
+      `expires_at` its referencing row `body_ref` (no body of its own) raised to `now + 10 d`;
+    - `fetch_requests` (397 d by `created_at`, terminal): `fr_old` (398 d, `failed`, with its response
+      `response_old`), `fr_recent` (396 d), `fr_open` (398 d, still `planned`) and `fr_shared`;
+    - `ats_snapshots` (30 d by `taken_at`) of the board instance `board`: `snap_old` (31 d), `snap_recent`
+      (29 d), the board's `last_complete` (45 d) and its open mass event: `mass_open` (40 d, the instance's
+      `mass_event_snapshot_id`) and its unacknowledged follow-up `mass_followup` (35 d); `mass_closed` (50 d)
+      opened an event that is no longer open;
+    - `embeddings`: `emb_used` (the embedding of the revision `revision`) and `emb_orphan` (no revision);
+    - `coverage_intervals` (397 d by `coalesce(closed_at, created_at)`) of the Arbeitnow cell:
+      `gap_closed_old` (closed 398 d ago), `gap_closed_recent` (created 400 d, closed 396 d ago),
+      `covered_old` (398 d), `covered_recent` (396 d) and `gap_open` (open, 10 d).
+
+    Every request belongs to `run`, a run that finished a day before `now` (the `runs` rule keeps it).
+    """
+    now = utcnow() + RETENTION_SHIFT
+    ids: dict[str, int] = {}
+    async with engine.begin() as conn:
+        ids["run"] = run = await insert_finished_run(conn, at=now - _DAY)
+        ids["cell"] = cell = await free_cell(conn, "arbeitnow")
+        await conn.execute(_ENSURE_INSTANCE, {"s": "greenhouse", "k": "m1-retention-board"})
+        ids["board"] = board = await instance_id(conn, "greenhouse", "m1-retention-board")
+        board_cell = await free_cell(conn, "greenhouse", "m1-retention-board")
+
+        async def request(name: str, days: float, status: str = "failed") -> int:
+            ids[name] = await aged_request(
+                conn, run_id=run, cell_id=board_cell, created_at=now - days * _DAY, status=status
+            )
+            return ids[name]
+
+        purged_at = now - 60 * _DAY  # a body purged long ago
+        ids["response_old"] = await aged_response(
+            conn,
+            await request("fr_old", 398),
+            fetched_at=now - 398 * _DAY,
+            expires_at=now - 368 * _DAY,
+            body=False,
+            purged_at=purged_at,
+        )
+        await aged_response(
+            conn,
+            await request("fr_recent", 396),
+            fetched_at=now - 396 * _DAY,
+            expires_at=now - 366 * _DAY,
+            body=False,
+            purged_at=purged_at,
+        )
+        await request("fr_open", 398, status="planned")
+        ids["body_expired"] = await aged_response(
+            conn,
+            await request("fr_expired", 31),
+            fetched_at=now - 30 * _DAY - timedelta(seconds=1),
+            expires_at=now - timedelta(seconds=1),
+        )
+        ids["body_live"] = await aged_response(
+            conn,
+            await request("fr_live", 29),
+            fetched_at=now - 30 * _DAY + timedelta(seconds=1),
+            expires_at=now + timedelta(seconds=1),
+        )
+        ids["body_shared"] = shared = await aged_response(
+            conn, await request("fr_shared", 398), fetched_at=now - 398 * _DAY, expires_at=now + 10 * _DAY
+        )
+        ids["body_ref"] = await aged_response(
+            conn,
+            await request("fr_ref", 20),
+            fetched_at=now - 20 * _DAY,
+            expires_at=now + 10 * _DAY,
+            body=False,
+            ref=shared,
+        )
+        ids["items_response"] = items = await aged_response(
+            conn,
+            await request("fr_items", 100),
+            fetched_at=now - 100 * _DAY,
+            expires_at=now - 70 * _DAY,
+            body=False,
+            purged_at=purged_at,
+        )
+        ids["item_old"] = await _aged_item(conn, items, 0, created_at=now - 91 * _DAY)
+        ids["item_recent"] = await _aged_item(conn, items, 1, created_at=now - 89 * _DAY)
+        ids["item_deferred"] = await _aged_item(conn, items, 2, created_at=now - 91 * _DAY, deferred=True)
+
+        ids["snap_old"] = await _snapshot(conn, board, "incomplete", taken_at=now - 31 * _DAY)
+        ids["snap_recent"] = await _snapshot(conn, board, "incomplete", taken_at=now - 29 * _DAY)
+        ids["last_complete"] = last = await _snapshot(conn, board, "complete", taken_at=now - 45 * _DAY)
+        ids["mass_closed"] = await _snapshot(conn, board, "mass_disappearance", taken_at=now - 50 * _DAY)
+        ids["mass_open"] = mass = await _snapshot(conn, board, "mass_disappearance", taken_at=now - 40 * _DAY)
+        ids["mass_followup"] = await _snapshot(
+            conn, board, "mass_disappearance", taken_at=now - 35 * _DAY, event=mass
+        )
+        await conn.execute(_POINT_SNAPSHOTS, {"i": board, "complete": last, "mass": mass})
+
+        vector = {"vector": _UNIT_VECTOR, "at": now - _DAY}
+        ids["emb_used"] = used = int(
+            (await conn.execute(_EMBEDDING, {"sha": os.urandom(32), **vector})).scalar_one()
+        )
+        ids["emb_orphan"] = int(
+            (await conn.execute(_EMBEDDING, {"sha": os.urandom(32), **vector})).scalar_one()
+        )
+
+        for offset, (name, kind, created, closed) in enumerate(
+            (
+                ("gap_closed_old", "gap", 400, 398),
+                ("gap_closed_recent", "gap", 400, 396),
+                ("covered_old", "covered", 398, None),
+                ("covered_recent", "covered", 396, None),
+                ("gap_open", "gap", 10, None),
+            )
+        ):
+            ids[name] = await _interval(
+                conn,
+                cell,
+                kind,
+                lower=now - (500 + 10 * offset) * _DAY,  # a span of its own
+                created_at=now - created * _DAY,
+                closed_at=None if closed is None else now - closed * _DAY,
+            )
+    old = await insert_job(
+        engine, native_id="m1-retention-old", observations=[(now - 91 * _DAY, ids["item_old"])]
+    )
+    recent = await insert_job(
+        engine, native_id="m1-retention-recent", observations=[(now - 89 * _DAY, ids["item_recent"])]
+    )
+    ids["obs_old"], ids["obs_recent"] = old.observation_ids[0], recent.observation_ids[0]
+    async with engine.begin() as conn:
+        params = {"job": old.job_id, "hash": os.urandom(32), "embedding": used}
+        ids["revision"] = int((await conn.execute(_EMBEDDED_REVISION, params)).scalar_one())
+    return M1Rows(now=now, ids=MappingProxyType(ids))

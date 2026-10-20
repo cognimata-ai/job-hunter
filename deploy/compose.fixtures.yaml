@@ -1,0 +1,15 @@
+# Dev only: the worker served from the scrubbed contract fixtures instead of the providers (fake mode, spec
+# §18.4; plan Deviation 5). Every source answers from tests/contract/fixtures with the keys "fake", so no
+# provider secret is needed and no request leaves the stack. Layered over the dev stack:
+#
+#   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fixtures.yaml \
+#     up -d --build --wait
+#
+# Never in prod: the startup assertion `fake_mode_in_prod` refuses JOBHUNTER_FAKE_SOURCES there (exit 78).
+services:
+  worker:
+    environment:
+      JOBHUNTER_FAKE_SOURCES: "1"
+      JOBHUNTER_FIXTURES_DIR: /data/fixtures
+    volumes:
+      - ../tests/contract/fixtures:/data/fixtures:ro

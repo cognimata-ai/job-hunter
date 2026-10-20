@@ -628,6 +628,9 @@ async def test_a_claim_during_a_takeover_waits_for_it_and_is_fenced(
     finally:
         pause.resume()
     _, counts = await asyncio.wait_for(takeover, 5)
-    # ... and then finds the new epoch: no claim, nothing written.
-    assert (await asyncio.wait_for(zombie, 5), waited, counts["operations"]) == (None, True, 0)
+    # ... and then finds the new epoch: no claim, nothing written. Task 24 (plan Deviation 18): a stale epoch
+    # raises `FencedOut`, so `execute_operation` can re-defer exactly that case.
+    with pytest.raises(FencedOut):
+        await asyncio.wait_for(zombie, 5)
+    assert (waited, counts["operations"]) == (True, 0)
     assert (await row(engine, op))[:5] == ("pending", None, None, None, 0)

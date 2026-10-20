@@ -67,6 +67,29 @@ def test_idle_sigterm_exits_zero_and_releases_lock(migrated, proc_env, procs) ->
     )
 
 
+def test_the_start_syncs_the_source_instances_before_the_worker_is_ready(migrated, proc_env, procs) -> None:
+    """Task 24, step 8: `sync_instances(conn, cfg)` before the start reconcilers. The test worker is in fake
+    mode, where every provider secret counts as present, so an instance disabled for a missing secret is
+    restored before `worker_ready`."""
+    one(
+        migrated,
+        "UPDATE source_instances SET health = 'disabled', last_error_code = 'missing_secret' "
+        "WHERE source_id = 'jsearch' AND instance_key = 'default'",
+    )
+    w = procs.spawn(WORKER, proc_env("worker", migrated))
+    w.wait_event("worker_ready", 60)
+    assert w.wait_event("source_instance_restored", 1)["source_id"] == "jsearch"
+    out = w.output()
+    assert out.index('"source_instance_restored"') < out.index('"worker_ready"')
+    assert one(
+        migrated,
+        "SELECT health, last_error_code FROM source_instances "
+        "WHERE source_id = 'jsearch' AND instance_key = 'default'",
+    ) == ("ok", None)
+    w.signal(signal.SIGTERM)
+    assert w.exit_within(30) == 0
+
+
 def test_busy_sigterm_drains_inflight_run(migrated, proc_env, procs) -> None:
     w = procs.spawn(WORKER, proc_env("worker", migrated, JOBHUNTER_FAULT="collect.before_finalize:sleep=5"))
     w.wait_event("worker_ready", 60)

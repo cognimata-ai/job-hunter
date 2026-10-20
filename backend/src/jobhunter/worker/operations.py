@@ -19,8 +19,10 @@ instead. Every permanent failure (a `failed` finish, or exhaustion) raises the `
 subject `operation:<id>`) exactly once, in the transaction that ends the row (§7.3; ruling T10-g).
 
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
-the one ownership-loss protocol shared with runs. Every time comparison of the sweeps and reconcilers uses the
-caller's clock (`ctx.now`, or `now`), never the database's `now()`.
+the one ownership-loss protocol shared with runs. A claim that the epoch fence refuses (a superseded worker,
+`FencedOut`) re-defers the operation's job under its queueing lock `op:<id>` instead of consuming it (M0
+carry-forward 6, plan Deviation 18), so the current worker claims it at once. Every time comparison of the
+sweeps and reconcilers uses the caller's clock (`ctx.now`, or `now`), never the database's `now()`.
 
 This module is a task boundary (ruff `BLE001` is allowed here); it needs no broad catch, because `run_owned`
 reports an unexpected handler error as an outcome, which `execute_operation` persists as a requeue (`bug`).
@@ -46,7 +48,7 @@ from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch, register_takeover_sweep
 from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
-from jobhunter.worker.tasks import Deferrer, job_task_name
+from jobhunter.worker.tasks import Deferrer, defer_in_tx, job_task_name
 
 OperationKind = Literal[
     "extract_profile_text",
@@ -185,9 +187,7 @@ async def create_operation(
         if inserted is not None:
             operation_id = int(inserted)
             if defer is not None:
-                await defer(
-                    conn, "run_operation", queueing_lock=f"op:{operation_id}", operation_id=operation_id
-                )
+                await defer_operation_job(conn, defer, operation_id)
             return operation_id, True
         # The insert met a live row; a statement later it may have ended, and the next insert then succeeds.
         live = (await conn.execute(_LIVE_ID, {"kind": kind, "dedup_key": dedup_key})).scalar_one_or_none()
@@ -196,17 +196,22 @@ async def create_operation(
     raise RuntimeError(f"operations: the live {kind} row of a dedup key kept ending during its creation")
 
 
-async def claim_operation(conn: AsyncConnection, operation_id: int, *, epoch: int) -> OperationClaim | None:
-    """Claim a `pending` operation whose `not_before` has passed, with a fresh `claim_id`; `None` otherwise.
+async def defer_operation_job(conn: AsyncConnection, defer: Deferrer, operation_id: int) -> int | None:
+    """Defer `run_operation(operation_id)` with `defer` under the queueing lock `op:<id>`, in the caller's
+    transaction: the job id, or `None` when that operation's job already waits."""
+    return await defer(conn, "run_operation", queueing_lock=f"op:{operation_id}", operation_id=operation_id)
 
-    `pending → running` sets the claim, the worker `epoch` and the first heartbeat in one statement. `None`
-    too, having written nothing, when `epoch` is no longer the current worker epoch (`epoch.fence_epoch`, the
-    first statement, before the row is locked): a superseded worker claims nothing.
+
+async def claim_operation(conn: AsyncConnection, operation_id: int, *, epoch: int) -> OperationClaim | None:
+    """Claim a `pending` operation whose `not_before` has passed, with a fresh `claim_id`; `None` otherwise
+    (absent, not `pending`, not due, or claimed meanwhile).
+
+    `pending → running` sets the claim, the worker `epoch` and the first heartbeat in one statement. Raises
+    `FencedOut`, having written nothing, when `epoch` is no longer the current worker epoch
+    (`epoch.fence_epoch`, the first statement, before the row is locked; plan Deviation 18): a superseded
+    worker claims nothing, and its caller re-defers the job.
     """
-    try:
-        await fence_epoch(conn, epoch)
-    except FencedOut:
-        return None
+    await fence_epoch(conn, epoch)
     row = (await conn.execute(_CLAIMABLE, {"i": operation_id})).first()
     if row is None:
         return None
@@ -401,9 +406,7 @@ async def _redefer_lost_jobs(conn: AsyncConnection, *, now: datetime, defer: Def
     params = {"cutoff": now - REDEFER_AFTER, "task": job_task_name("run_operation"), "limit": REDEFER_BATCH}
     redeferred = 0
     for operation_id in (await conn.execute(_REDEFER_DUE, params)).scalars().all():
-        job_id = await defer(
-            conn, "run_operation", queueing_lock=f"op:{operation_id}", operation_id=operation_id
-        )
+        job_id = await defer_operation_job(conn, defer, int(operation_id))
         redeferred += job_id is not None
     return redeferred
 
@@ -470,9 +473,10 @@ async def execute_operation(
 ) -> None:
     """Claim and run operation `operation_id` (the `run_operation` task body), one protocol for every end.
 
-    1. Claim it; return when it is not claimable (or `epoch` is no longer the current worker epoch). A kind
-       without a handler ends `failed('no_handler')` with the `operation.failed` alert (raised by
-       `finish_operation`).
+    1. Claim it; return when it is not claimable. When `epoch` is no longer the current worker epoch
+       (`FencedOut`), the job is deferred again first, `run_operation(operation_id)` under `op:<id>` in a
+       transaction of its own (deduplicated by that queueing lock while one waits). A kind without a handler
+       ends `failed('no_handler')` with the `operation.failed` alert (raised by `finish_operation`).
     2. Run the handler through `run_owned(("operation", id), claim_id, …)`: the registry's task for the
        operation, next to the heartbeat task `heartbeat:operation:<id>` whose loss cancels it.
     3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, even one
@@ -487,8 +491,14 @@ async def execute_operation(
     (reclaim or takeover) records the outcome.
     """
     await afault_point("operation.before_claim")
-    async with engine.begin() as conn:
-        claim = await claim_operation(conn, operation_id, epoch=epoch)
+    try:
+        async with engine.begin() as conn:
+            claim = await claim_operation(conn, operation_id, epoch=epoch)
+    except FencedOut:  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+        async with engine.begin() as conn:
+            job_id = await defer_operation_job(conn, defer_in_tx, operation_id)
+        log.info("operation_redeferred", operation_id=operation_id, deduplicated=job_id is None)
+        return
     if claim is None:
         log.info("operation_not_claimable", operation_id=operation_id)
         return

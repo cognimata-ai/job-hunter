@@ -32,8 +32,9 @@ bound keeps its newer part open, so contiguity can advance past it); Adzuna `max
 free sources the scope's ad age. **Cursor reuse** (§5.3.1, Ruling P3): a JSearch cell whose continuation holds
 a cursor obtained less than `jsearch.CURSOR_REUSE_TTL` ago is planned from it, `next_page(plan(cell_plan),
 cursor)` over the continuation's window and on its page, so that traversal's `END` closes its open gap;
-otherwise from page 1 with a fresh window, the open gap kept. The specs are built by adapters on a transport
-that refuses every request (`_spec_adapters`): `plan` and `next_page` never send.
+otherwise from page 1 with a fresh window, the open gap kept. The specs are built by the registry's adapters
+(`registry.make_adapter`, the one factory) on a transport that refuses every request (`_spec_adapters`):
+`plan` and `next_page` never send.
 
 **The fallback plan** (`plan_fallback`, node 3, §6.6): for every JSearch cell of the run whose
 `fallback.cell_outcome` is eligible, one SerpApi spec `phase='fallback'` on the SerpApi cell with the same
@@ -66,9 +67,6 @@ from jobhunter.quota.ledger import MAX_ATTEMPT_SEQ, lock_run_owner, project_allo
 from jobhunter.quota.pacing import Admit, PlannedSpec
 from jobhunter.quota.windows import AccountObservation, Provider
 from jobhunter.run_settings import RunSettings, ScopeLocation, ScopeSettings
-from jobhunter.sources import ats
-from jobhunter.sources.adzuna import AdzunaAdapter
-from jobhunter.sources.arbeitnow import ArbeitnowAdapter
 from jobhunter.sources.base import (
     REMOTE_DE,
     CellPlan,
@@ -90,9 +88,9 @@ from jobhunter.sources.coverage import (
     record_search_gap,
 )
 from jobhunter.sources.instances import InstanceRow
-from jobhunter.sources.jsearch import CURSOR_REUSE_TTL, JSearchAdapter
+from jobhunter.sources.jsearch import CURSOR_REUSE_TTL
 from jobhunter.sources.receipts import insert_fetch_request
-from jobhunter.sources.serpapi import SerpApiAdapter
+from jobhunter.sources.registry import make_adapter
 from jobhunter.sources.watchlist_patterns import ATS_TYPES
 from jobhunter.types import JSONValue
 
@@ -366,10 +364,15 @@ def _refuse(request: httpx.Request) -> httpx.Response:
     raise RuntimeError(f"the planner's adapters build specs and never send (a request to {request.url.host})")
 
 
+def _no_secret(name: str) -> bytes:
+    return b""
+
+
 @asynccontextmanager
 async def _spec_adapters(now: datetime) -> AsyncIterator[Callable[[InstanceRow], SourceAdapter]]:
-    """The adapter of an instance for building specs: `plan` and `next_page` only, on a transport that
-    refuses every request, without credentials and with the planning time as its clock."""
+    """The adapter of an instance for building specs (the registry's `make_adapter`, the one factory):
+    `plan` and `next_page` only, on a transport that refuses every request, so nothing is sent from inside
+    the planning transaction; without credentials and with the planning time as its clock."""
     async with httpx.AsyncClient(transport=httpx.MockTransport(_refuse)) as client:
         built: dict[int, SourceAdapter] = {}
 
@@ -377,22 +380,8 @@ async def _spec_adapters(now: datetime) -> AsyncIterator[Callable[[InstanceRow],
             return now
 
         def adapter_of(instance: InstanceRow) -> SourceAdapter:
-            if (adapter := built.get(instance.id)) is not None:
-                return adapter
-            match instance.source_id:
-                case "jsearch":
-                    adapter = JSearchAdapter(client, api_key=b"", instance_id=instance.id, clock=clock)
-                case "serpapi":
-                    adapter = SerpApiAdapter(client, api_key=b"", instance_id=instance.id, clock=clock)
-                case "adzuna":
-                    adapter = AdzunaAdapter(
-                        client, app_id=b"", app_key=b"", instance_id=instance.id, clock=clock
-                    )
-                case "arbeitnow":
-                    adapter = ArbeitnowAdapter(client, instance_id=instance.id, clock=clock)
-                case _:
-                    adapter = ats.adapter_for(instance, client, clock=clock)
-            built[instance.id] = adapter
+            if (adapter := built.get(instance.id)) is None:
+                adapter = built[instance.id] = make_adapter(instance, client, secret=_no_secret, clock=clock)
             return adapter
 
         yield adapter_of

@@ -148,6 +148,10 @@ class World:
                 return 0
 
         class FakeEngine:
+            @asynccontextmanager
+            async def begin(self):
+                yield object()  # the connection of step 8's `sync_instances`, which is faked as well
+
             async def dispose(self) -> None:
                 events.append("engine_dispose")
                 if world.dispose_fails:
@@ -195,6 +199,31 @@ class World:
             world.contexts.append(ctx)
             return {}
 
+        # Task 24: step 7's HTTP layer and clients (real, on no network), step 8's instance sync (faked).
+        from jobhunter.sources import http, registry
+
+        real_configure = http.configure
+        self.clients: dict[str, object] = {}
+
+        def recording_configure(cfg: object) -> None:
+            events.append("http_configure")
+            real_configure(cfg)  # type: ignore[arg-type]
+
+        def recording_make_clients(cfg: object) -> object:
+            events.append("make_clients")
+            made = registry.make_clients(cfg)  # type: ignore[arg-type]
+            world.clients.update(made)
+            return made
+
+        async def fake_sync_instances(conn: object, cfg: object) -> dict[str, str]:
+            events.append("sync_instances")
+            world.synced.append(cfg)
+            return {}
+
+        self.synced: list[object] = []
+        monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
+        monkeypatch.setattr(http, "configure", recording_configure)
+
         for name, fake in {
             "LockSession": FakeLockSession,
             "acquire_lock": lambda session: events.append("lock_acquire"),
@@ -206,6 +235,8 @@ class World:
             "build_collect_graph": fake_build_collect_graph,
             "run_reconcilers": fake_reconcilers,
             "EXECUTIONS": FakeExecutions(),
+            "make_clients": recording_make_clients,
+            "sync_instances": fake_sync_instances,
         }.items():
             monkeypatch.setattr(main, name, fake)
         secrets = tmp_path / "secrets"
@@ -232,10 +263,44 @@ async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch,
         "watchdog_start",
         "queue_open",
         "saver_open",
+        "http_configure",
+        "make_clients",
+        "sync_instances",
         "reconcile_start",
         *TEARDOWN,
     ]
     assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [0]
+
+
+async def test_step_7_configures_http_before_the_clients_and_step_8_syncs_the_instances_first(
+    monkeypatch, tmp_path
+) -> None:
+    """Task 24, carries 1 to 3: `http.configure(cfg)` comes before `make_clients(cfg)` (a client made earlier
+    in fake mode would be on the live transport); the graph's adapters are the registry's, on those clients;
+    `sync_instances(conn, cfg)` runs before the start reconcilers; the teardown closes every client."""
+    from jobhunter.graphs.collect.deps import CollectDeps
+    from jobhunter.sources.arbeitnow import ArbeitnowAdapter
+    from jobhunter.sources.instances import InstanceRow
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path)
+    assert await worker_main(world.cfg) == 0
+    events = world.events
+    assert events.index("http_configure") < events.index("make_clients") < events.index("sync_instances")
+    assert events.index("sync_instances") < events.index("reconcile_start")
+    assert world.synced == [world.cfg]
+    [deps], [runtime] = world.deps, {id(r): r for r in world.runtimes}.values()
+    assert isinstance(deps, CollectDeps) and isinstance(runtime, WorkerRuntime)
+    arbeitnow = InstanceRow(3, "arbeitnow", "default", None, "ok", None, None, None, None)
+    adapter = deps.adapters(arbeitnow)
+    assert isinstance(adapter, ArbeitnowAdapter)
+    # The shutdown stops the admission of new requests (§3.3.5): the deps read the runtime's state.
+    runtime.shutdown.admission_stopped = False
+    assert deps.admission_stopped() is False
+    runtime.shutdown.admission_stopped = True
+    assert deps.admission_stopped() is True
+    assert world.clients and all(client.is_closed for client in world.clients.values())  # type: ignore[attr-defined]
 
 
 async def test_the_worker_shares_one_embedder_client_on_its_configured_url(monkeypatch, tmp_path) -> None:
@@ -323,3 +388,56 @@ async def test_the_teardown_shares_what_is_left_of_the_one_stop_deadline(
     assert (event["step"], event["error_class"]) == ("saver", "TimeoutError")
     assert world.events[-len(TEARDOWN) :] == TEARDOWN  # every step still ran, the lock session last
     assert clock.now == 1000.0 + shutdown.STOP_BUDGET_S  # the whole stop took exactly its budget
+
+
+# --- Task 24: step 4's modules register every reconciler, sweep and handler the worker runs -----------------
+
+# Every reconciler of M1 with its cadences (spec §17.4), as `worker_main` has them before its takeover.
+M1_RECONCILERS = {
+    "stalled_jobs": ["start", "tick"],
+    "metrics_refresh": ["heavy"],
+    "operations": ["tick"],
+    "stale_runs": ["tick"],
+    "queued_runs": ["tick"],
+    "stale_data": ["tick"],
+    "ledger_unsettled": ["tick"],
+    "hard_filter_completeness": ["heavy"],
+    "stale_sweep": ["tick"],
+    "stale_sweep_daily": ["daily"],
+    "ats_mass_events": ["tick"],
+    "group_representatives": ["heavy"],
+    "awaiting_embedding": ["heavy"],
+}
+_REGISTRY_SCRIPT = """\
+import importlib, json
+from jobhunter.worker import main
+for module in main._REGISTERING_MODULES:
+    importlib.import_module(module)
+from jobhunter.worker.epoch import _SWEEPS
+from jobhunter.worker.operations import HANDLERS
+from jobhunter.worker.reconcilers import REGISTRY
+print(json.dumps({
+    "reconcilers": {name: sorted(cadences) for name, (cadences, _) in REGISTRY.items()},
+    "sweeps": sorted(_SWEEPS),
+    "handlers": sorted(HANDLERS),
+}))
+"""
+
+
+def test_the_registering_modules_register_every_reconciler_sweep_and_handler() -> None:
+    """In a fresh interpreter (no test registered anything there): `worker.main` and its
+    `_REGISTERING_MODULES` (step 4, before the takeover) register exactly the M1 reconcilers, the two
+    takeover sweeps and the `watchlist_validate` handler."""
+    import json
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_SCRIPT], capture_output=True, text=True, check=True, timeout=120
+    )
+    registered = json.loads(done.stdout.strip().splitlines()[-1])
+    assert registered == {
+        "reconcilers": M1_RECONCILERS,
+        "sweeps": ["operations", "runs"],
+        "handlers": ["watchlist_validate"],
+    }

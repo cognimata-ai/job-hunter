@@ -95,6 +95,13 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         "login_attempts": timedelta(days=30),
         "alerts": timedelta(days=90),
         "operations": timedelta(days=30),
+        # Task 24: the M1 rules (their own tests are in test_retention_m1.py)
+        "raw_items": timedelta(days=90),
+        "raw_bodies": timedelta(0),
+        "ats_snapshots": timedelta(days=30),
+        "embeddings": timedelta(0),
+        "coverage_intervals": timedelta(days=397),
+        "fetch_requests": timedelta(days=397),
         "checkpoints": timedelta(days=14),
         "runs": timedelta(days=397),  # 13 months, never fewer days than any 13 calendar months
         "procrastinate_jobs": timedelta(days=7),
@@ -102,7 +109,10 @@ def test_rules_name_every_report_key_with_its_window() -> None:
     names = [rule.name for rule in RULES]
     assert names.index("checkpoints") < names.index("runs")  # threads go while their attempts still name them
     # A dependency is named explicitly (ruling T21-f), and only ever on a rule that runs before it.
-    assert {rule.name: rule.depends_on for rule in RULES if rule.depends_on} == {"runs": ("checkpoints",)}
+    assert {rule.name: rule.depends_on for rule in RULES if rule.depends_on} == {
+        "fetch_requests": ("raw_items",),
+        "runs": ("checkpoints",),
+    }
     for rule in RULES:
         assert all(names.index(name) < names.index(rule.name) for name in rule.depends_on), rule.name
 

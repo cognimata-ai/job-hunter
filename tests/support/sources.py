@@ -24,7 +24,9 @@ moved 20 days ahead of today by `serpapi_account_response`, so its window is cur
 
 Task 14: `fake_http` also logs every request its fixture transport serves to `fixture_log`; `adapters` is the
 fixture-backed adapter factory of the fetch nodes (`Callable[[InstanceRow], SourceAdapter]`): every adapter on
-`fake_http`'s fixture transport (one `http.make_client` per source), clock `utcnow`, keys `b"fake"`.
+`fake_http`'s fixture transport (one `http.make_client` per source), clock `utcnow`, keys `b"fake"`. Task 24:
+`fake_http` yields its fake-mode worker configuration, and `adapters` is the worker's own factory on it
+(`registry.build_adapter` over `registry.make_clients`).
 
 Task 15: `served_response` acquires one page for a run through the one-page protocol (`acquire_page`) and
 returns its stored response; `arbeitnow_spec` is a page spec of the Arbeitnow default instance's cell. Two
@@ -47,13 +49,12 @@ import httpx
 import pytest
 import respx
 from jobhunter.clock import utcnow
-from jobhunter.config import load_config
+from jobhunter.config import AppConfig, load_config
 from jobhunter.db.sql import q
 from jobhunter.quota.windows import Provider
 from jobhunter.sources import ats as ats_adapters
-from jobhunter.sources import http
+from jobhunter.sources import http, registry
 from jobhunter.sources.acquire import acquire_page
-from jobhunter.sources.adzuna import AdzunaAdapter
 from jobhunter.sources.arbeitnow import FEED_URL, ArbeitnowAdapter
 from jobhunter.sources.ats.common import AtsAdapter
 from jobhunter.sources.base import (
@@ -196,9 +197,10 @@ def fixture_log(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def fake_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_log: Path) -> Iterator[None]:
+def fake_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_log: Path) -> Iterator[AppConfig]:
     """`http.configure` in fake mode over `FIXTURES` (every new client is served by the fixture transport,
-    which logs to `fixture_log`); the process-wide configuration it found is restored after the test."""
+    which logs to `fixture_log`); the process-wide configuration it found is restored after the test. Yields
+    that fake-mode worker configuration (no secret)."""
     env = {
         "JOBHUNTER_ENV": "test",
         "JOBHUNTER_DB_NAME": "jobhunter",
@@ -207,37 +209,22 @@ def fake_http(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_log: Path
         "JOBHUNTER_FIXTURE_LOG": str(fixture_log),
     }
     monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
-    http.configure(load_config("worker", env, tmp_path / "no-secrets"))
-    yield
+    cfg = load_config("worker", env, tmp_path / "no-secrets")
+    http.configure(cfg)
+    yield cfg
 
 
 Adapters = Callable[[InstanceRow], SourceAdapter]
 
 
 @pytest.fixture
-async def adapters(fake_http: None) -> AsyncIterator[Adapters]:
-    """The adapter of an instance on `fake_http`'s fixture transport, clock `utcnow`, keys `b"fake"`."""
-    clients: dict[str, httpx.AsyncClient] = {}
-
-    def client(source_id: str) -> httpx.AsyncClient:
-        if source_id not in clients:
-            clients[source_id] = http.make_client(source_id)
-        return clients[source_id]
+async def adapters(fake_http: AppConfig) -> AsyncIterator[Adapters]:
+    """The adapter of an instance on `fake_http`'s fixture transport: the worker's factory
+    (`registry.build_adapter` on `registry.make_clients`), clock `utcnow`, keys `b"fake"` (Task 24)."""
+    clients = registry.make_clients(fake_http)
 
     def adapter_of(instance: InstanceRow) -> SourceAdapter:
-        on = client(instance.source_id)
-        match instance.source_id:
-            case "jsearch":
-                return JSearchAdapter(on, api_key=b"fake", instance_id=instance.id, clock=utcnow)
-            case "serpapi":
-                return SerpApiAdapter(on, api_key=b"fake", instance_id=instance.id, clock=utcnow)
-            case "adzuna":
-                return AdzunaAdapter(
-                    on, app_id=b"fake", app_key=b"fake", instance_id=instance.id, clock=utcnow
-                )
-            case "arbeitnow":
-                return ArbeitnowAdapter(on, instance_id=instance.id, clock=utcnow)
-        return ats_adapters.adapter_for(instance, on, clock=utcnow)
+        return registry.build_adapter(instance, fake_http, clients)
 
     try:
         yield adapter_of

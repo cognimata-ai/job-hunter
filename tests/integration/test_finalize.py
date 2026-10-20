@@ -404,3 +404,30 @@ async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, 
         assert await partial_conditions(c, owner.run_id) == ["awaiting_embedding"]
         failed = await check_invariants(c, owner.run_id, settings=settings, outcome_conflicts=2)
         assert failed[-1] == InvariantResult("I7", False, {"conflicts": 2})
+
+
+# --- Task 24 (Task 23 review, addendum 10): `run.orphaned_queue` resolves on the next success (§17.6) ------
+
+
+async def test_a_succeeded_run_resolves_every_orphaned_queue_alert_and_a_partial_one_does_not(
+    engine, current_epoch, fake_http, fake_embedder, collect_deps
+) -> None:
+    from jobhunter.observability.alerts import raise_alert
+
+    keys = [f"{runs.ORPHANED_QUEUE_ALERT}:run:{n}" for n in (900001, 900002)]
+    async with engine.begin() as c:
+        for key in keys:
+            await raise_alert(
+                c,
+                code=runs.ORPHANED_QUEUE_ALERT,
+                severity="warn",
+                subject=key.removeprefix(f"{runs.ORPHANED_QUEUE_ALERT}:"),
+                message="queued run orphaned",
+            )
+        # A partial end (or any end but `succeeded`) leaves them open, as it leaves `run.failed` open; the
+        # alerts of the end of a run without requests (no such run needs to exist for them).
+        await finalize_module._alerts(c, 900003, "partial", [], ["fetch_failed"])
+    assert [await open_alert(engine, key) for key in keys] == ["warn", "warn"]
+    rid = await run_to_the_end(engine, collect_deps)
+    assert (await run_end(engine, rid))[0] == "succeeded"
+    assert [await open_alert(engine, key) for key in keys] == [None, None]

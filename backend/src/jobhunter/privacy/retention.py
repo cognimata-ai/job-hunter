@@ -1,4 +1,5 @@
-"""Daily retention of the M0 data (spec §20.1): the body of the `retention_daily` task.
+"""Daily retention (spec §20.1), of the M0 data and of the M1 collection data: the body of the
+`retention_daily` task.
 
 Each rule removes what has passed its window. Every window is measured from the caller's `now`, never from the
 database's `now()` (ruling P14), with one exception: procrastinate's finished jobs are deleted through its own
@@ -15,9 +16,35 @@ The rules run in dependency order (§20.1: a row goes only after what references
 of a run's attempts go before the run, and a run's `run_attempts` go with it (`ON DELETE CASCADE`). A live
 run (`queued` or `running`) is never deleted, however old.
 
+**The M1 rules** (Task 24), after `operations`; none deletes what the live pipeline still uses:
+- `raw_items`: 90 days by `created_at`; an observation keeps its provenance copy (`raw_item_id := NULL`). A
+  `deferred('job_fenced')` item stays past the 90 days, as long as its request: a later run re-resolves it
+  once its fence is released (§7.16.1).
+- `raw_bodies`: `body_zstd := NULL, purged_at := now` once `expires_at` has passed. The window is 0, so the
+  cutoff is `now`: `expires_at` already holds `fetched_at + 30 d` and the deduplication extension (§7.7: a row
+  whose body a newer row references expires no earlier than that row), so a 30-day window compared with it
+  would keep a body about 60 days.
+- `ats_snapshots`: 30 days by `taken_at`, except each instance's last complete snapshot, its open mass
+  event's first snapshot (`mass_event_snapshot_id`) and every unacknowledged `mass_disappearance` snapshot
+  of an event that is still open (Task 19: the confirmation and the acknowledgement read them).
+- `embeddings`: every row no `job_revisions.embedding_id` references (`profile_vectors` joins in M2). A row
+  that an embedding writer holds `FOR KEY SHARE` (`embeddings.upsert_embedding`, about to reference it) is
+  skipped (`SKIP LOCKED`) and goes in a later pass if it is still unreferenced then.
+- `coverage_intervals`: 13 months by `coalesce(closed_at, created_at)`.
+- `fetch_requests`: terminal ones 13 months by `created_at`, their responses and raw items with them
+  (cascade); it depends on `raw_items`.
+
+**Shared bodies.** A response whose body a newer, unpurged response still references (`body_ref_id`; an
+unchanged board answers the same bytes every day) is kept with its request, and its run, by both
+`fetch_requests` and `runs`: its deletion would set the newer row's `body_ref_id` to NULL while that row has
+no body of its own and no `purged_at`, which its CHECK refuses. Once that body expires, `raw_bodies` purges
+the newer row too, and both rules can delete in that same pass.
+
 Isolation has one exception, the dependent rules (ruling T21-f): a rule names in `depends_on` the rules whose
 work its own would make impossible to finish later. `runs` depends on `checkpoints`, because its cascade
-removes the `run_attempts` through which the checkpoint threads are found. A rule whose dependency failed (or
+removes the `run_attempts` through which the checkpoint threads are found; `fetch_requests` depends on
+`raw_items`, because its cascade deletes the raw items of the requests' responses, which the `raw_items` rule
+(with its exception for deferred items) must have handled first. A rule whose dependency failed (or
 was skipped itself) earlier in the same pass is skipped: it is reported as `-1` and logged
 `retention_rule_skipped` (with `blocked_by`), and it neither raises nor resolves an alert, so the failed
 dependency's alert stays open until a pass in which both succeed. Independent rules still run.
@@ -66,13 +93,21 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("login_attempts", timedelta(days=30)),
     RetentionRule("alerts", timedelta(days=90)),  # after resolution
     RetentionRule("operations", timedelta(days=30)),  # after they finished
+    RetentionRule("raw_items", timedelta(days=90)),
+    RetentionRule("raw_bodies", timedelta(0)),  # once `expires_at` (fetched + 30 days, extended) has passed
+    RetentionRule("ats_snapshots", timedelta(days=30)),
+    RetentionRule("embeddings", timedelta(0)),  # once nothing references them
+    RetentionRule("coverage_intervals", THIRTEEN_MONTHS),
+    # Its cascade deletes the raw items of the requests' responses, so never after a failed `raw_items`.
+    RetentionRule("fetch_requests", THIRTEEN_MONTHS, depends_on=("raw_items",)),
     RetentionRule("checkpoints", timedelta(days=14)),  # threads of the runs that ended that long ago
     # Its cascade deletes the run_attempts that name the checkpoint threads, so never after a failed purge.
     RetentionRule("runs", THIRTEEN_MONTHS, depends_on=("checkpoints",)),
     RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
 )
 
-# One DELETE per row rule, each bound to its rule's `cutoff` (`now - window`).
+# One statement per row rule, each bound to its rule's `cutoff` (`now - window`): a DELETE, or for
+# `raw_bodies` the UPDATE that nulls the bodies.
 _DELETES: Final[dict[str, TextClause]] = {
     "api_idempotency": q("DELETE FROM api_idempotency WHERE expires_at < :cutoff"),
     "sessions": q("DELETE FROM sessions WHERE absolute_expires_at < :cutoff OR idle_expires_at < :cutoff"),
@@ -82,11 +117,44 @@ _DELETES: Final[dict[str, TextClause]] = {
         "DELETE FROM operations "
         "WHERE status IN ('succeeded', 'failed', 'cancelled') AND finished_at < :cutoff"
     ),
-    # Terminal and finished, or never started (`missed`, `skipped_overlap`) and queued, before the cutoff.
+    "raw_items": q("DELETE FROM raw_items WHERE created_at < :cutoff AND disposition <> 'deferred'"),
+    "raw_bodies": q(
+        "UPDATE raw_responses SET body_zstd = NULL, purged_at = :cutoff "
+        "WHERE expires_at < :cutoff AND purged_at IS NULL"
+    ),
+    "ats_snapshots": q(
+        "DELETE FROM ats_snapshots s WHERE s.taken_at < :cutoff "
+        "AND NOT EXISTS (SELECT 1 FROM source_instances i "
+        "WHERE i.last_complete_snapshot_id = s.id OR i.mass_event_snapshot_id = s.id) "
+        "AND NOT (s.status = 'mass_disappearance' AND s.acknowledged_at IS NULL "
+        "AND EXISTS (SELECT 1 FROM source_instances i "
+        "WHERE i.mass_event_snapshot_id = coalesce(s.event_snapshot_id, s.id)))"
+    ),
+    "embeddings": q(
+        "DELETE FROM embeddings WHERE id IN (SELECT e.id FROM embeddings e WHERE e.created_at < :cutoff "
+        "AND NOT EXISTS (SELECT 1 FROM job_revisions r WHERE r.embedding_id = e.id) "
+        "ORDER BY e.id FOR UPDATE SKIP LOCKED)"
+    ),
+    "coverage_intervals": q("DELETE FROM coverage_intervals WHERE coalesce(closed_at, created_at) < :cutoff"),
+    # Terminal and created before the cutoff, unless a newer, unpurged response references the body of its
+    # response or of a detail request's (with a list request goes its detail requests: cascade).
+    "fetch_requests": q(
+        "DELETE FROM fetch_requests p "
+        "WHERE p.status IN ('succeeded', 'failed', 'ambiguous', 'skipped') AND p.created_at < :cutoff "
+        "AND NOT EXISTS (SELECT 1 FROM fetch_requests f "
+        "JOIN raw_responses b ON b.fetch_request_id = f.id JOIN raw_responses d ON d.body_ref_id = b.id "
+        "WHERE (f.id = p.id OR f.parent_fetch_request_id = p.id) AND d.purged_at IS NULL)"
+    ),
+    # Terminal and finished, or never started (`missed`, `skipped_overlap`) and queued, before the cutoff;
+    # not while a newer, unpurged response references a body of its requests (their cascade would orphan it).
     "runs": q(
-        "DELETE FROM runs "
-        "WHERE (status IN ('succeeded', 'partial', 'failed', 'failed_invariant', 'cancelled') "
-        "AND finished_at < :cutoff) OR (status IN ('missed', 'skipped_overlap') AND queued_at < :cutoff)"
+        "DELETE FROM runs r "
+        "WHERE ((r.status IN ('succeeded', 'partial', 'failed', 'failed_invariant', 'cancelled') "
+        "AND r.finished_at < :cutoff) "
+        "OR (r.status IN ('missed', 'skipped_overlap') AND r.queued_at < :cutoff)) "
+        "AND NOT EXISTS (SELECT 1 FROM fetch_requests f "
+        "JOIN raw_responses b ON b.fetch_request_id = f.id JOIN raw_responses d ON d.body_ref_id = b.id "
+        "WHERE f.run_id = r.id AND d.purged_at IS NULL)"
     ),
 }
 
