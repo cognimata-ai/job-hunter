@@ -685,11 +685,12 @@ async def test_the_run_heartbeat_beats_while_one_long_node_runs(engine, queue_ap
     assert (await fetch(engine, rid))[:2] == ("succeeded", 1)
 
 
-def ending_node(engine, *, then: str, server=None):
+def ending_node(engine, *, then: str, server=None, observes: bool = True):
     """A node that ends the run itself, as the graph's `finalize` does (one owner-fenced transaction, the end
-    observed after its commit), and then raises (`then="raise"`) or, once a heartbeat waits for its
-    transaction on `server`, commits and waits until it is cancelled (`then="wait"`: the refused beat
-    cancels it)."""
+    observed after its commit through `runs.observe_graph_end`), and then raises (`then="raise"`) or, once a
+    heartbeat waits for its transaction on `server`, commits and waits until it is cancelled (`then="wait"`:
+    the refused beat cancels it). With `observes=False` it never observes the end, as when the cancel lands
+    while the node still awaits its commit's reply (addendum 11)."""
 
     async def node(state: CollectState) -> CollectUpdate:
         owner = runs.RunOwner(state["run_id"], state["attempt_no"])
@@ -703,7 +704,8 @@ def ending_node(engine, *, then: str, server=None):
                     return lock_waits(server) > 0
 
                 await await_until(a_beat_waits, 5, step_s=0.01)
-        runs.observe_run_ends([runs.RunEnd(status="succeeded", duration_s=duration)])
+        if observes:
+            runs.observe_graph_end(owner, runs.RunEnd(status="succeeded", duration_s=duration))
         if then == "raise":
             raise RuntimeError("the last checkpoint write failed")
         await asyncio.get_running_loop().create_future()  # ... and after the commit is refused: cancelled
@@ -754,6 +756,30 @@ async def test_a_heartbeat_blocked_by_the_finalize_loses_the_attempt_and_writes_
     events = log_events()
     assert [e["key"] for e in events if e["event"] == "execution_lost"] == [f"run:{rid}"]
     assert not [e for e in events if e["event"] in ("run_graph_failed", "run_fenced", "run_finished")]
+    assert await run_failed_alerts(engine) == 0
+    assert await attempts(engine, rid) == [(1, 1, "completed")]
+
+
+@pytest.mark.parametrize("then", ["wait", "raise"])
+async def test_an_end_the_graph_committed_but_never_observed_is_counted_once_by_execute_run(
+    engine, queue_app, migrated, log_events, then: str
+) -> None:
+    """Addendum 11 (ledger L383): the refused beat's cancel, or an error, lands after the node's `finalize`
+    committed but before the node observed the end. `execute_run` finds the attempt's end and counts it once
+    (`RUNS`, `RUN_DURATION`) and logs `run_finished`; nothing is finalized again."""
+    rid = await queued(engine)
+    succeeded, timed = runs_total("succeeded"), timed_runs()
+    graph = one_node_graph(ending_node(engine, then=then, server=migrated, observes=False))
+    assert await runs.execute_run(engine, graph, rid, 1, epoch=1, heartbeat_period_s=0.05) == "started"
+    row = await fetch(engine, rid)
+    assert (row[0], row[4]) == ("succeeded", {"by": "graph"})
+    assert (runs_total("succeeded"), timed_runs()) == (succeeded + 1, timed + 1)
+    [finished] = [e for e in log_events() if e["event"] == "run_finished"]
+    assert (finished["run_id"], finished["status"], finished["observed_by"]) == (
+        rid,
+        "succeeded",
+        "execute_run",
+    )
     assert await run_failed_alerts(engine) == 0
     assert await attempts(engine, rid) == [(1, 1, "completed")]
 

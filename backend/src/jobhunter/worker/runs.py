@@ -51,10 +51,13 @@ report `{"noop": true}`. A graph that raises after its `finalize` committed (for
 checkpoint) is not finalized again either. A heartbeat that fires during the `finalize` transaction waits
 for its row lock and then finds the run ended: the beat is refused and the attempt is `lost`
 (`execution_lost`), which is harmless, because `lost` writes nothing: the run is never finalized twice and
-its end is counted once, by the node.
+its end is counted once, by the node, or, when the cancel landed before the node's commit returned to it, by
+`execute_run` (`observe_graph_end` records which; addendum 11). The same holds for a graph that raised after
+its `finalize` committed but before the node observed the end.
 
-This module is a task boundary (ruff `BLE001` is allowed here). It needs no broad catch: `run_owned` reports
-an unexpected graph error as an outcome, which `execute_run` persists as `failed('bug')` plus the `run.failed`
+This module is a task boundary (ruff `BLE001` is allowed here). It needs one broad catch only, around the
+lookup of an end to count (`_observe_unobserved_end`: its outcome is the log line): `run_owned` reports an
+unexpected graph error as an outcome, which `execute_run` persists as `failed('bug')` plus the `run.failed`
 alert; an `OutcomeConflict` (the outcome reducer's, raised outside any node, §17.2 I7) as
 `failed_invariant('I7')` plus `run.failed_invariant`. LangGraph is imported for annotations only, so a process
 that only requests runs (the API) skips it.
@@ -64,7 +67,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -121,7 +124,7 @@ _REQUEST_TRIES: Final = 3
 
 Admission = Literal["started", "resumed", "duplicate", "superseded", "foreign_epoch", "finished"]
 FinalStatus = Literal["succeeded", "partial", "failed_invariant", "failed"]
-FINAL_STATUSES: Final[tuple[FinalStatus, ...]] = ("succeeded", "partial", "failed_invariant", "failed")
+FINAL_STATUSES: Final[tuple[FinalStatus, ...]] = get_args(FinalStatus)  # the type is the one list
 EndReason = Literal["worker_takeover", "heartbeat_stale"]
 
 # The graph a run executes; any compiled state graph (the worker's is the collection graph).
@@ -181,6 +184,18 @@ def observe_run_ends(ends: Iterable[RunEnd]) -> None:
         RUNS.labels(status=end.status).inc()
         if end.duration_s is not None:
             RUN_DURATION.observe(end.duration_s)
+
+
+# The attempts (run id, attempt number) whose end their graph's `finalize` observed in this process, kept
+# until `execute_run` is done with the attempt (addendum 11, below `execute_run`'s `lost`).
+_GRAPH_OBSERVED: set[tuple[int, int]] = set()
+
+
+def observe_graph_end(owner: RunOwner, end: RunEnd) -> None:
+    """`observe_run_ends([end])` for the end `owner`'s graph committed (its `finalize` node), recorded so
+    that `execute_run` does not observe it again."""
+    _GRAPH_OBSERVED.add((owner.run_id, owner.attempt_no))
+    observe_run_ends([end])
 
 
 # The run row and its current attempt, the run row locked: the DB step of the admission.
@@ -694,7 +709,8 @@ async def _settle_raised(engine: AsyncEngine, owner: RunOwner, error: Exception 
     # The class only: an exception message may carry content.
     error_class = type(error).__name__
     if completion is not None:
-        # The graph's `finalize` committed the run's end (and observed it) before the error.
+        # The graph's `finalize` committed the run's end before the error (and observed it, unless the error
+        # was its commit's reply: `_observe_unobserved_end` counts it then).
         log.warning(
             "run_graph_failed_after_end",
             run_id=owner.run_id,
@@ -702,6 +718,7 @@ async def _settle_raised(engine: AsyncEngine, owner: RunOwner, error: Exception 
             status=completion.status,
             error_class=error_class,
         )
+        await _observe_unobserved_end(engine, owner)
     elif isinstance(error, OutcomeConflict):
         log.error(
             "run_outcome_conflict", run_id=owner.run_id, attempt_no=owner.attempt_no, work_id=error.work_id
@@ -743,7 +760,8 @@ async def execute_run(
     3. The graph runs through `run_owned(("run", id), attempt_no, …)`: the registry's task for the run, next
        to the heartbeat task `heartbeat:run:<id>` (`heartbeat_run` every `heartbeat_period_s`) whose loss
        cancels it. By outcome: `lost` (a refused or failed heartbeat, the `stale_runs` reconciler's or the
-       shutdown's cancel, or `FencedOut`) returns with no owner write; `raised` first looks the attempt's
+       shutdown's cancel, or `FencedOut`) returns with no owner write, having counted an end its graph
+       committed but did not observe (`_observe_lost_end`, addendum 11); `raised` first looks the attempt's
        end up (`run_completion`): when the graph's `finalize` had already ended the run, the error came after
        it (logged `run_graph_failed_after_end`) and nothing is written; otherwise it finalizes, in a new
        transaction, an `OutcomeConflict` as `failed_invariant('I7')` with the critical `run.failed_invariant`
@@ -790,14 +808,50 @@ async def execute_run(
     except AlreadyExecuting:
         log.warning("run_already_executing", run_id=run_id, attempt_no=attempt_no, admission=admission)
         return "duplicate"
-    match outcome.status:
-        case "lost":
-            pass
-        case "raised":
-            await _settle_raised(engine, admitted, outcome.error)
-        case "returned":
-            async with engine.connect() as conn:
-                completion = await run_completion(conn, run_id, attempt_no)
-            if completion is None:  # a graph without a finalize of its own (M0's no-op graph)
-                await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
+    try:
+        match outcome.status:
+            case "lost":
+                await _observe_unobserved_end(engine, admitted)
+            case "raised":
+                await _settle_raised(engine, admitted, outcome.error)
+            case "returned":
+                async with engine.connect() as conn:
+                    completion = await run_completion(conn, run_id, attempt_no)
+                if completion is None:  # a graph without a finalize of its own (M0's no-op graph)
+                    await _finalize(engine, admitted, status="succeeded", reason=None, report={"noop": True})
+    finally:
+        _GRAPH_OBSERVED.discard((run_id, attempt_no))
     return admission
+
+
+async def _observe_unobserved_end(engine: AsyncEngine, owner: RunOwner) -> None:
+    """Addendum 11: count an end that `owner`'s graph committed but did not observe.
+
+    A heartbeat that waited on the run row during the graph's `finalize` transaction finds the run ended once
+    it commits, so the beat is refused and the work cancelled (`lost`). When that cancel lands while the
+    `finalize` node still awaits its commit's reply, the end is committed but the node never observes it; so
+    it is when that await raises after the server committed (`raised`). Here such an end is counted in
+    `RUNS` and `RUN_DURATION` and logged `run_finished` (`observed_by` names this path), unless the node
+    observed it (`observe_graph_end`). An attempt that ended nothing counts nothing. The lookup failing (the
+    database gone) is logged, error class only, and the end stays uncounted.
+    """
+    if (owner.run_id, owner.attempt_no) in _GRAPH_OBSERVED:
+        return
+    try:
+        async with engine.connect() as conn:
+            completion = await run_completion(conn, owner.run_id, owner.attempt_no)
+            duration = None if completion is None else await _duration(conn, owner.run_id)
+    except Exception as exc:
+        log.warning("lost_run_end_unread", run_id=owner.run_id, error_class=type(exc).__name__)
+        return
+    if completion is None:
+        return
+    observe_run_ends([RunEnd(status=completion.status, duration_s=duration)])
+    log.info(
+        "run_finished",
+        run_id=owner.run_id,
+        attempt_no=owner.attempt_no,
+        status=completion.status,
+        reason=completion.reason,
+        observed_by="execute_run",
+    )

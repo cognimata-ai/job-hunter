@@ -8,16 +8,19 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.graph import build_collect_graph, build_noop_collect_graph
 from jobhunter.graphs.collect.nodes import finalize as finalize_module
 from jobhunter.graphs.collect.nodes.finalize import (
+    FallbackRequests,
     InvariantCode,
     InvariantResult,
     check_invariants,
     decide_status,
     finalize_from_graph,
     partial_conditions,
+    run_revisions,
 )
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.metrics import REGISTRY
@@ -35,6 +38,7 @@ from tests.support.collect import (
     TEST_QUERY,
     conflicting_graph,
     make_deps,
+    make_posting,
     manual_run_id,
     pending_item,
     planned_request,
@@ -42,6 +46,7 @@ from tests.support.collect import (
     resolved,
     run_to_the_end,
     seed_inputs,
+    source_cell,
     supersede,
 )
 from tests.support.pg import pg_rows
@@ -56,6 +61,7 @@ RUN_END = sa.text("SELECT status, status_reason, report FROM runs WHERE id = :i"
 OPEN_ALERT = sa.text("SELECT severity FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL")
 ANY_ALERT = sa.text("SELECT count(*) FROM alerts WHERE dedup_key = :k")
 BOARD_INSTANCE = sa.text("SELECT id FROM source_instances WHERE source_id = :s AND instance_key = :k")
+NO_FALLBACK = FallbackRequests(planned=0, served=0)  # a run without SerpApi fallback requests
 
 
 async def run_end(engine, rid: int) -> tuple[str, str | None, dict[str, Any]]:
@@ -308,7 +314,7 @@ async def test_execute_run_uses_the_graph_finalize_once(
 
     for module in (runs, finalize_module):
         monkeypatch.setattr(module, "finalize_run", counted_finalize_run)
-        monkeypatch.setattr(module, "observe_run_ends", observed)
+    monkeypatch.setattr(runs, "observe_run_ends", observed)  # the node observes through `observe_graph_end`
     monkeypatch.setattr(runs, "run_completion", looked_up)
     succeeded_before = runs_total("succeeded")
 
@@ -394,14 +400,18 @@ async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, 
     again = await pending_item(engine, owner, "jsearch", {"native_id": "H"})
     assert await resolved(engine, owner, again) == "deferred"
     async with engine.connect() as c:
-        results = {r.code: r for r in await check_invariants(c, owner.run_id, outcome_conflicts=0)}
+        revisions = await run_revisions(c, owner.run_id)
+        results = {
+            r.code: r
+            for r in await check_invariants(c, owner.run_id, outcome_conflicts=0, revisions=revisions)
+        }
         assert [r.code for r in results.values()] == ["I1", "I2", "I3", "I4", "I5", "I6", "I7"]
         assert results["I1"].ok and results["I1"].detail == {"responses": 2, "mismatched": 0, "pending": 0}
         assert results["I2"].ok and results["I4"].ok and results["I5"].detail == {"llm_tuple_id": None}
         # the run's one revision awaits its embedding: I6 counts it, and it is the run's one partial cause
         assert results["I6"] == InvariantResult("I6", False, {"awaiting": 1})
-        assert await partial_conditions(c, owner.run_id) == ["awaiting_embedding"]
-        failed = await check_invariants(c, owner.run_id, outcome_conflicts=2)
+        assert await partial_conditions(c, owner.run_id, revisions=revisions) == ["awaiting_embedding"]
+        failed = await check_invariants(c, owner.run_id, outcome_conflicts=2, revisions=revisions)
         assert failed[-1] == InvariantResult("I7", False, {"conflicts": 2})
 
 
@@ -425,7 +435,7 @@ async def test_a_succeeded_run_resolves_every_orphaned_queue_alert_and_a_partial
             )
         # A partial end (or any end but `succeeded`) leaves them open, as it leaves `run.failed` open; the
         # alerts of the end of a run without requests (no such run needs to exist for them).
-        await finalize_module._alerts(c, 900003, "partial", [], ["fetch_failed"])
+        await finalize_module._alerts(c, 900003, "partial", [], ["fetch_failed"], fallback=NO_FALLBACK)
     assert [await open_alert(engine, key) for key in keys] == ["warn", "warn"]
     rid = await run_to_the_end(engine, collect_deps)
     assert (await run_end(engine, rid))[0] == "succeeded"
@@ -454,7 +464,8 @@ ADMITTED_NORMAL = sa.text(
 
 async def i3_of(engine, owner) -> InvariantResult:
     async with engine.connect() as c:
-        results = await check_invariants(c, owner.run_id, outcome_conflicts=0)
+        revisions = await run_revisions(c, owner.run_id)
+        results = await check_invariants(c, owner.run_id, outcome_conflicts=0, revisions=revisions)
     return next(r for r in results if r.code == "I3")
 
 
@@ -557,3 +568,141 @@ async def test_i3_catches_units_admitted_beyond_a_cap_that_a_refinement_lowered(
             {"r": owner.run_id},
         )
     assert (await i3_of(engine, owner)).ok
+
+
+# --- Final wave F5 (ledger L372): the run end's alerts and the report's availability and updated postings ---
+
+OLD_GAP = sa.text(
+    "INSERT INTO coverage_intervals (cell_id, kind, span, gap_status, reason) VALUES (:c, 'gap', "
+    "tstzrange(now() - interval '120 days', now() - interval '100 days'), 'open', 'source_failed')"
+)
+
+
+async def test_a_succeeded_end_resolves_run_failed_and_the_fallback_alert_and_abandons_old_gaps(
+    engine, current_epoch
+) -> None:
+    """§17.6: every open `run.failed` resolves on the next success; `quota.fallback_active` resolves when the
+    run served no fallback request; a gap older than the ad age is abandoned with `coverage.gap_abandoned`,
+    which the run's report lists. A partial end that served a fallback request resolves neither."""
+    from jobhunter.observability.alerts import raise_alert
+    from jobhunter.quota.planner import FALLBACK_ACTIVE_ALERT
+
+    failed = [f"{runs.FAILED_ALERT}:run:{n}" for n in (900001, 900002)]
+    fallback_active = f"{FALLBACK_ACTIVE_ALERT}:provider:serpapi"
+    cell = await source_cell(engine, "jsearch")
+
+    async def raise_both() -> None:
+        async with engine.begin() as c:
+            for key in failed:
+                subject = key.removeprefix(f"{runs.FAILED_ALERT}:")
+                await raise_alert(
+                    c, code=runs.FAILED_ALERT, severity="critical", subject=subject, message="m"
+                )
+            await raise_alert(
+                c, code=FALLBACK_ACTIVE_ALERT, severity="info", subject="provider:serpapi", message="m"
+            )
+
+    await raise_both()
+    # a partial end that served a fallback request resolves neither
+    async with engine.begin() as c:
+        served = FallbackRequests(planned=1, served=1)
+        await finalize_module._alerts(c, 900003, "partial", [], ["fetch_failed"], fallback=served)
+    assert [await open_alert(engine, key) for key in failed] == ["critical", "critical"]
+    assert await open_alert(engine, fallback_active) == "info"
+    async with engine.begin() as c:
+        await c.execute(OLD_GAP, {"c": cell})
+    owner = await queued_run(engine)
+    deps = make_deps(engine, lambda instance: pytest.fail("no adapter is used"))
+    assert (
+        await finalize_from_graph(deps, owner, initial_state(owner.run_id, owner.attempt_no)) == "succeeded"
+    )
+    assert [await open_alert(engine, key) for key in failed] == [None, None]
+    assert await open_alert(engine, fallback_active) is None
+    abandoned = f"coverage.gap_abandoned:cell:{cell}"
+    assert await open_alert(engine, abandoned) == "warn"
+    async with engine.connect() as c:
+        status = await c.execute(
+            sa.text("SELECT gap_status FROM coverage_intervals WHERE cell_id = :c"), {"c": cell}
+        )
+        assert status.scalar_one() == "abandoned"
+    _, _, report = await run_end(engine, owner.run_id)
+    assert abandoned in report["execution"]["alerts"]
+
+
+POSTING_OF = sa.text(
+    "SELECT p.id FROM postings p JOIN source_instances i ON i.id = p.source_instance_id "
+    "WHERE i.source_id = :s AND p.native_id = :n"
+)
+SNAPSHOT_OF_RUN = sa.text(
+    "INSERT INTO ats_snapshots (source_instance_id, run_id, status, member_count, taken_at, applied_at) "
+    "VALUES (:i, :run, 'complete', 1, now(), now()) RETURNING id"
+)
+MEMBER = sa.text("INSERT INTO ats_snapshot_members (snapshot_id, native_id) VALUES (:s, :n)")
+
+
+async def report_sources(engine, run_id: int) -> dict[str, Any]:
+    async with engine.connect() as c:
+        report = await finalize_module.build_report(
+            c,
+            run_id,
+            invariants=[],
+            partial=[],
+            revisions=await run_revisions(c, run_id),
+            fallback=NO_FALLBACK,
+            node_durations={},
+            counters={},
+            alerts_raised=[],
+        )
+    sources = report["sources"]
+    assert isinstance(sources, dict)
+    return sources
+
+
+async def test_the_report_counts_the_changes_the_run_made_and_the_postings_it_saw_change(
+    engine, current_epoch
+) -> None:
+    """Ledger L372. `availability`: a revival the run sighted, an `unknown` or `closed` posting absent from
+    the run's snapshot of its board; never the stale sweep's `→ stale` that happened while the run ran.
+    `postings.updated`: a posting the run saw with another content, not one it only sighted again."""
+    earlier = await queued_run(engine)
+    at = utcnow() - timedelta(hours=6)
+    for n, native_id in enumerate(("J1", "J2", "J3")):
+        item = await pending_item(engine, earlier, "jsearch", {"native_id": native_id}, fetched_at=at)
+        assert await resolved(engine, earlier, item) == "linked", n
+    async with engine.begin() as c:
+        await runs.finalize_run(c, earlier, status="succeeded", reason=None, report={})
+        j1, j2 = [(await c.execute(POSTING_OF, {"s": "jsearch", "n": n})).scalar_one() for n in ("J1", "J2")]
+        await transition(c, "postings", j1, ["active"], "stale", reason=CLEAR_REASON)  # before the run
+    board = {
+        native_id: await make_posting(
+            engine,
+            source_id="greenhouse",
+            native_id=native_id,
+            availability="active",
+            last_seen_at=at,
+            availability_changed_at=at,
+        )
+        for native_id in ("a", "b", "c", "d")
+    }
+    run = await queued_run(engine)
+    # the run sights J1 with a new title (a revival and an update) and J3 unchanged (neither)
+    for native_id, overrides in (("J1", {"title_raw": "Senior Python Developer"}), ("J3", {})):
+        item = await pending_item(engine, run, "jsearch", {"native_id": native_id, **overrides})
+        assert await resolved(engine, run, item) == "linked"
+    await planned_request(engine, run, provider="greenhouse", key=b"board".ljust(32, b"-"), attempt_seq=1)
+    async with engine.begin() as c:
+        await transition(c, "postings", j2, ["active"], "stale", reason=CLEAR_REASON)  # the sweep, meanwhile
+        instance = (await c.execute(BOARD_INSTANCE, {"s": "greenhouse", "k": "default"})).scalar_one()
+        snapshot = (await c.execute(SNAPSHOT_OF_RUN, {"i": instance, "run": run.run_id})).scalar_one()
+        for member in ("a", "d"):
+            await c.execute(MEMBER, {"s": snapshot, "n": member})
+        await transition(c, "postings", board["b"], ["active"], "unknown", reason=CLEAR_REASON)
+        await transition(c, "postings", board["c"], ["active"], "closed", reason="ats_absent")
+        # `d` is a member of the run's snapshot: whatever made it unknown meanwhile, it was not the run
+        await transition(c, "postings", board["d"], ["active"], "unknown", reason=CLEAR_REASON)
+    sources = await report_sources(engine, run.run_id)
+    jsearch = sources["jsearch/default"]
+    assert jsearch["availability"] == {"closed|stale|unknown→active": 1}  # J1; J2's `→ stale` is the sweep's
+    assert jsearch["postings"] == {"new": 0, "updated": 1}  # J1; J3 was only sighted again
+    greenhouse = sources[f"greenhouse/instance:{instance}"]
+    assert greenhouse["availability"] == {"active→unknown": 1, "active|unknown→closed": 1}
