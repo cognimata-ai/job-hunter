@@ -553,3 +553,115 @@ async def test_an_unknown_never_moves_the_change_time_backwards(engine, current_
     assert (rows["b"].availability, rows["c"].availability) == ("unknown", "unknown")
     assert rows["c"].availability_changed_at == t0
     assert rows["b"].availability_changed_at >= later  # never moved back to `t0`
+
+
+# ---- final review I1 (Ruling FR-d) ------------------------------------------------------------------------
+
+
+async def test_an_incomplete_snapshot_cannot_hide_a_mass_disappearance_from_the_next_complete_one(
+    engine, current_epoch, board20
+) -> None:
+    """Complete (20 members, baseline 20) → incomplete (none: the 20 go `unknown`, the baseline stays 20) →
+    complete and empty → complete and empty. The 20 were active at the last structurally complete snapshot,
+    so the first empty complete snapshot finds them disappeared: it opens a mass disappearance instead of
+    counting them toward an ordinary close; the next one is its follow-up, and only the event's confirmation
+    (two follow-ups 24 h apart) closes them, never `ats_absent`."""
+    d1 = (utcnow() - 10 * DAY).replace(hour=0, minute=0, second=0, microsecond=0)
+    await sighted_at(engine, board20.instance_id, d1 - DAY)
+    every = set(board20.postings)
+    alert = {"k": f"{snapshots.MASS_ALERT}:instance:{board20.instance_id}"}
+
+    _, effect = await taken(engine, board20, every, d1)
+    assert effect == SnapshotEffect()
+    assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (20, None)
+
+    _, effect = await taken(engine, board20, set(), d1 + 6 * H, complete=False)
+    assert effect == SnapshotEffect(unknown=20)
+    assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (20, None)  # never lowered
+
+    opening, effect = await taken(engine, board20, set(), d1 + 12 * H)
+    assert effect == SnapshotEffect(mass_opened=True)  # all 20 are `unknown` already: none newly so
+    row = await one(engine, SNAPSHOT_ROW, s=opening)
+    assert (row.status, row.event_snapshot_id, row.baseline_active_count, row.absent_count) == (
+        "mass_disappearance",
+        None,
+        20,
+        20,
+    )
+    assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (20, opening)
+    assert tuple(await one(engine, ALERT, **alert)) == ("warn", True)
+    async with engine.connect() as c:
+        frozen = list((await c.execute(ABSENCES, {"s": opening})).scalars())
+    assert frozen == sorted(board20.postings.values())
+    rows = await postings(engine, board20.instance_id)
+    assert {(p.availability, p.absent_snapshots) for p in rows.values()} == {("unknown", 0)}  # not counted
+
+    followup, effect = await taken(engine, board20, set(), d1 + 36 * H)
+    assert effect == SnapshotEffect(mass_followup=True)  # 24 h later: no ordinary close
+    row = await one(engine, SNAPSHOT_ROW, s=followup)
+    assert (row.status, row.event_snapshot_id, row.baseline_active_count, row.absent_count) == (
+        "mass_disappearance",
+        opening,
+        20,
+        20,
+    )
+    rows = await postings(engine, board20.instance_id)
+    assert {(p.availability, p.absent_snapshots) for p in rows.values()} == {("unknown", 0)}
+
+    _, effect = await taken(engine, board20, set(), d1 + 60 * H)  # 24 h after the first follow-up
+    assert effect == SnapshotEffect(closed=20, mass_followup=True, mass_confirmed=True)
+    rows = await postings(engine, board20.instance_id)
+    assert {(p.availability, p.availability_reason) for p in rows.values()} == {
+        ("closed", "mass_disappearance_confirmed")
+    }
+    assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (0, None)
+    assert tuple(await one(engine, ALERT, **alert)) == ("warn", False)
+
+
+async def test_an_event_opened_across_an_incomplete_read_counts_those_postings_in_its_follow_ups(
+    engine, current_epoch, board20
+) -> None:
+    """FR-d with the T19-b addendum: 15 of 20 go `unknown` through an incomplete read, then a complete
+    snapshot without any of the 20 opens the event (all 20 disappeared). Its follow-ups keep comparing the
+    same population with the frozen baseline: the 15 still count, so the event does not clear at its first
+    follow-up (which would reset the baseline to 0 and let the ordinary rule close them)."""
+    d1 = (utcnow() - 10 * DAY).replace(hour=0, minute=0, second=0, microsecond=0)
+    await sighted_at(engine, board20.instance_id, d1 - DAY)
+    every = set(board20.postings)
+    await taken(engine, board20, every, d1)
+    kept = {f"p{k:02d}" for k in range(16, 21)}  # p01..p15 missed by the incomplete read
+    _, effect = await taken(engine, board20, kept, d1 + 6 * H, complete=False)
+    assert effect == SnapshotEffect(unknown=15)
+    opening, effect = await taken(engine, board20, set(), d1 + 12 * H)
+    assert effect == SnapshotEffect(unknown=5, mass_opened=True)
+    assert (await one(engine, SNAPSHOT_ROW, s=opening)).absent_count == 20
+    followup, effect = await taken(engine, board20, set(), d1 + 18 * H)
+    assert effect == SnapshotEffect(mass_followup=True)
+    row = await one(engine, SNAPSHOT_ROW, s=followup)
+    assert (row.status, row.event_snapshot_id, row.absent_count) == ("mass_disappearance", opening, 20)
+    assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (20, opening)
+
+
+async def test_postings_unknown_before_the_last_complete_snapshot_still_never_count(
+    engine, current_epoch, board20
+) -> None:
+    """FR-d keeps T19-b's exclusion: 12 of 20 go `unknown` through an incomplete read, a complete snapshot
+    with the 8 others follows (12 of 20 absent: a mass disappearance) and its event clears at a complete
+    snapshot with 12 present. The `unknown` postings left over from before that clearing snapshot are not
+    part of its baseline, so later complete snapshots without them open no new event."""
+    d1 = (utcnow() - 10 * DAY).replace(hour=0, minute=0, second=0, microsecond=0)
+    await sighted_at(engine, board20.instance_id, d1 - DAY)
+    every = set(board20.postings)
+    await taken(engine, board20, every, d1)
+    eight = {f"p{k:02d}" for k in range(13, 21)}
+    await taken(engine, board20, eight, d1 + 6 * H, complete=False)  # p01..p12 unknown
+    opening, effect = await taken(engine, board20, eight, d1 + 12 * H)
+    assert effect.mass_opened and (await one(engine, SNAPSHOT_ROW, s=opening)).absent_count == 12
+    twelve = eight | {"p01", "p02", "p03", "p04"}
+    _, effect = await taken(engine, board20, twelve, d1 + 18 * H)  # 8 of 20 absent: the event clears
+    assert effect.mass_cleared
+    assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (12, None)
+    again, effect = await taken(engine, board20, twelve, d1 + 24 * H)
+    assert not (effect.mass_opened or effect.mass_followup)
+    row = await one(engine, SNAPSHOT_ROW, s=again)
+    assert (row.status, row.absent_count) == ("complete", 0)

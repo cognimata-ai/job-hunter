@@ -15,14 +15,19 @@ posting rows, the snapshot row and the instance row `FOR UPDATE`; then the write
 - The snapshot's **absent set** `A` is the instance's `active`/`unknown` postings that are not members: the
   set that is counted, closed and frozen.
 - **Structurally incomplete** (`incomplete`): `active → unknown` for `A`, nothing counted.
-- **Mass classification** of a structurally complete snapshot (Ruling T19-b: on active postings on both
-  sides). The baseline `B` is `source_instances.last_snapshot_active_count`, §8.11's number of active
-  postings, frozen while an event is open; it is compared with the **disappeared** part `D` of `A`: the
-  postings of `A` that are `active`, and, while an event is open, those `unknown` since its opening snapshot
-  (`availability_changed_at ≥` its `taken_at`: the event's own snapshots made them unknown). A posting that
-  was already `unknown` (an incomplete snapshot, or an event that cleared) and is absent again is no new
-  disappearance. Mass: `|D| ≥ 5` and `|D| > B / 2` (no classification without a baseline). Then
-  `active → unknown` for `A`, nothing counted, and:
+- **Mass classification** of a structurally complete snapshot (Ruling T19-b and its addendum, extended by
+  Ruling FR-d). The baseline `B` is `source_instances.last_snapshot_active_count`, §8.11's number of active
+  postings, which only a structurally complete snapshot (or the end of an event) sets, never an incomplete
+  one, and which is frozen while an event is open. It is compared with the **disappeared** part `D` of `A`:
+  the "previously active" postings of §5.3.5, those active at the snapshot `B` was taken at. That is the
+  instance's last applied structurally complete snapshot taken before the open event's opening snapshot, or
+  before this one when no event is open (its `taken_at`, `baseline_at`), so `D` is the postings of `A` that
+  are `active` and those `unknown` since `baseline_at` (`availability_changed_at >` it): an incomplete read
+  after the baseline (FR-d) or the open event's own snapshots (the addendum) made them unknown, and an
+  incomplete read never hides them from the next complete snapshot. A posting already `unknown` at that
+  snapshot (an incomplete read before it, or an event that cleared at it) is absent again, no new
+  disappearance; without any such snapshot every `unknown` one counts. Mass: `|D| ≥ 5` and `|D| > B / 2`
+  (no classification without a baseline). Then `active → unknown` for `A`, nothing counted, and:
   - no open event: the event **opens**: status `mass_disappearance`, `mass_event_snapshot_id` := the
     snapshot, `A` written to `ats_snapshot_absences` (the event's frozen absent set, plan Deviation 22),
     `ats.mass_disappearance` (warn, subject `instance:<id>`) raised; the baseline stays frozen;
@@ -124,6 +129,13 @@ _LOCK_INSTANCE: Final = q(
     "SELECT i.last_snapshot_active_count, i.mass_event_snapshot_id, (SELECT o.taken_at FROM ats_snapshots o "
     "WHERE o.id = i.mass_event_snapshot_id) AS opened_at FROM source_instances i WHERE i.id = :i "
     "FOR UPDATE OF i"
+)
+# When the baseline was taken (Ruling FR-d): the `taken_at` of the instance's last applied structurally
+# complete snapshot before :before (the open event's opening snapshot, else the snapshot being applied).
+_BASELINE_AT: Final = q(
+    "SELECT max(taken_at) FROM ats_snapshots WHERE source_instance_id = :i "
+    "AND status IN ('complete','mass_disappearance') AND applied_at IS NOT NULL "
+    "AND taken_at < CAST(:before AS timestamptz)"
 )
 # The change time of the postings `transition()` just made `unknown` (at `now()`): the snapshot's `taken_at`
 # when the change time before the transition (`prev`) is earlier, and never earlier than `prev` (M-5).
@@ -228,13 +240,14 @@ def _is_mass(disappeared: int, baseline: int | None) -> bool:
     return baseline is not None and disappeared >= MASS_MIN_ABSENT and 2 * disappeared > baseline
 
 
-def _disappeared(row: Row[tuple[object, ...]], opened_at: datetime | None) -> bool:
-    """An absent posting counts against the active baseline (Ruling T19-b): it is `active`, or `unknown` since
-    the open event's opening snapshot (that event's snapshots made it so)."""
+def _disappeared(row: Row[tuple[object, ...]], baseline_at: datetime | None) -> bool:
+    """An absent posting counts against the baseline (Rulings T19-b and FR-d): it is `active`, or `unknown`
+    since the snapshot the baseline was taken at (`baseline_at`, module docstring), every `unknown` one when
+    there is no such snapshot."""
     if row.availability == "active":
         return True
-    return (
-        opened_at is not None and row.availability == "unknown" and row.availability_changed_at >= opened_at
+    return row.availability == "unknown" and (
+        baseline_at is None or row.availability_changed_at > baseline_at
     )
 
 
@@ -342,8 +355,10 @@ async def apply_snapshot(
     taken_at: datetime = snap.taken_at
     baseline: int | None = instance.last_snapshot_active_count
     event: int | None = instance.mass_event_snapshot_id
+    before = taken_at if instance.opened_at is None else instance.opened_at
+    baseline_at = (await conn.execute(_BASELINE_AT, {"i": instance_id, "before": before})).scalar()
     absent = [row for row in rows if not row.member and row.availability in ("active", "unknown")]
-    disappeared = sum(_disappeared(row, instance.opened_at) for row in absent)
+    disappeared = sum(_disappeared(row, baseline_at) for row in absent)
     complete = snap.status in STRUCTURALLY_COMPLETE
     mass = complete and _is_mass(disappeared, baseline)
 
