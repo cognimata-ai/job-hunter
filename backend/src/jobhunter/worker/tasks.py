@@ -16,9 +16,10 @@ tick's step, a cadence or the retention pass, the body then requests this worker
 (`_stop_when_superseded`, Ruling T24-a): the refusal proves it superseded.
 
 `tick`, `reconcile_heavy` and `retention_daily` share the `tick` queue, served with concurrency 1
-(`QUEUES`): a long heavy cadence or daily pass delays the minute's tick until it ends. The tick loses no
-slot to that (`run_tick` evaluates every slot since its cursor, and its queueing lock keeps one tick
-waiting), and the daily pass is batched (Task 19's `stale_sweep_daily`).
+(`QUEUES`): a long heavy cadence or daily pass delays the minute's tick until it ends (ledger L312). A slot
+that comes due meanwhile is still recorded once and queued late (`run_tick` evaluates every slot since its
+cursor; its queueing lock keeps one tick waiting), as a `catch_up` run after 5 min; only a delay longer than
+the schedule's interval would make a slot `missed`. The daily pass is batched (Task 19's `stale_sweep_daily`).
 
 `release_stalled_jobs` is called from the `stalled_jobs` reconciler only (spike V2); no task body calls it.
 

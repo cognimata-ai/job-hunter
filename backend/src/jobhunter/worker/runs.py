@@ -761,18 +761,19 @@ async def execute_run(
        to the heartbeat task `heartbeat:run:<id>` (`heartbeat_run` every `heartbeat_period_s`) whose loss
        cancels it. By outcome: `lost` (a refused or failed heartbeat, the `stale_runs` reconciler's or the
        shutdown's cancel, or `FencedOut`) returns with no owner write, having counted an end its graph
-       committed but did not observe (`_observe_lost_end`, addendum 11); `raised` first looks the attempt's
-       end up (`run_completion`): when the graph's `finalize` had already ended the run, the error came after
-       it (logged `run_graph_failed_after_end`) and nothing is written; otherwise it finalizes, in a new
-       transaction, an `OutcomeConflict` as `failed_invariant('I7')` with the critical `run.failed_invariant`
-       alert (the reducer conflicts outside any node, so the graph's `finalize` cannot see it) and any other
-       error as `failed('bug')` with the critical `run.failed` alert; `returned` looks the attempt's end up
-       (`run_completion`): a graph that ended the run itself (its `finalize` node, which observed the metrics
-       and logged `run_finished`) leaves nothing to write, and one that did not (the M0 no-op graph) is
-       finalized `succeeded` with the report `{"noop": true}`. A local execution that is still live when the
-       work starts (`AlreadyExecuting`, for example an older one that ignored its cancel past the timeout)
-       means nothing ran: `duplicate` is returned and no further owner write is made; the admitted attempt is
-       left without an executor, and `stale_runs` gives the run a new attempt once its heartbeat is stale.
+       committed but did not observe (`_observe_unobserved_end`, addendum 11); `raised` first looks the
+       attempt's end up (`run_completion`): when the graph's `finalize` had already ended the run, the error
+       came after it (logged `run_graph_failed_after_end`) and nothing is written (the end is counted here
+       when the node had not observed it); otherwise it finalizes, in a new transaction, an `OutcomeConflict`
+       as `failed_invariant('I7')` with the critical `run.failed_invariant` alert (the reducer conflicts
+       outside any node, so the graph's `finalize` cannot see it) and any other error as `failed('bug')` with
+       the critical `run.failed` alert; `returned` looks the attempt's end up (`run_completion`): a graph that
+       ended the run itself (its `finalize` node, which observed the metrics and logged `run_finished`) leaves
+       nothing to write, and one that did not (the M0 no-op graph) is finalized `succeeded` with the report
+       `{"noop": true}`. A local execution that is still live when the work starts (`AlreadyExecuting`, for
+       example an older one that ignored its cancel past the timeout) means nothing ran: `duplicate` is
+       returned and no further owner write is made; the admitted attempt is left without an executor, and
+       `stale_runs` gives the run a new attempt once its heartbeat is stale.
 
     The caller's own cancellation propagates (the graph is cancelled and awaited first) and nothing is
     written: the run's next owner (the stale-run reconciler or the takeover sweep) records the outcome.

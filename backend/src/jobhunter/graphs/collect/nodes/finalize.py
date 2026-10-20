@@ -530,6 +530,7 @@ class FallbackRequests:
 
 
 async def fallback_requests(conn: AsyncConnection, run_id: int) -> FallbackRequests:
+    """Run `run_id`'s fallback requests, planned and served (`FallbackRequests`)."""
     row = (await conn.execute(_FALLBACK, {"run": run_id})).one()
     return FallbackRequests(planned=int(row.planned), served=int(row.served))
 
