@@ -37,6 +37,17 @@ dev = [
     "respx==0.23.1",
     "pip-audit==2.10.1",
 ]
+# The embedder image only (embedder/Dockerfile: `uv sync --only-group embedder`); never in the app image. The
+# base environment runs tests/embedder without it: embedder/app.py imports onnxruntime, tokenizers and numpy
+# inside OnnxModel only. Runs that load the model add `--group embedder` (spike V7, `-m embedder_model`).
+embedder = [
+    "fastapi==0.143.2",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.1",
+    "onnxruntime==1.31.0",
+    "tokenizers==0.23.3",
+    "numpy==2.5.4",
+]
 
 [project.scripts]
 jobhunter = "jobhunter.cli:main"
@@ -60,5 +71,6 @@ markers = [
     "perf: performance measurement, never a correctness assertion",
     "contract: runs an adapter or the fixture scan on the scrubbed fixtures (tests/contract, spec §18.4)",
     "live: calls a real provider; never run in CI and deselected by default",
+    "embedder_model: loads the real model from .model-cache/arctic (needs --group embedder); deselected by default",
 ]
-addopts = "-m 'not stack and not perf and not live'"
+addopts = "-m 'not stack and not perf and not live and not embedder_model'"
