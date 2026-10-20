@@ -238,7 +238,10 @@ async def _active_stale_ttl_days(ctx: ReconcileContext) -> int:
 
 async def _sweep(ctx: ReconcileContext, *, until_short: bool) -> int:
     """Batches of `STALE_BATCH` (read when called), one fenced transaction each: one batch, or batches until
-    one is short. Returns how many postings went stale; a fenced batch wrote nothing and ends the sweep."""
+    one is short. Returns how many postings went stale. A fenced batch wrote nothing: the worker's own fence
+    propagates, so that `run_reconcilers` stops the cadence at the reconciler and the superseded worker
+    requests its stop (Ruling FR-r; fix wave F7, Ruling FR-w); a `FencedOut` of another owner ends the sweep
+    with the count so far."""
     stale_ttl_days, limit, swept = await _active_stale_ttl_days(ctx), STALE_BATCH, 0
 
     async def fenced(conn: AsyncConnection) -> None:
@@ -250,8 +253,10 @@ async def _sweep(ctx: ReconcileContext, *, until_short: bool) -> int:
                 count = await stale_sweep(
                     conn, now=ctx.now, stale_ttl_days=stale_ttl_days, limit=limit, guard=fenced
                 )
-        except FencedOut:
-            return swept  # `fence_epoch` logged it
+        except FencedOut as fenced_out:
+            if fenced_out.worker_superseded:
+                raise  # `fence_epoch` logged it
+            return swept
         swept += count
         if not until_short or count < limit:
             return swept
@@ -260,13 +265,12 @@ async def _sweep(ctx: ReconcileContext, *, until_short: bool) -> int:
 @reconciler("stale_sweep", "tick")
 async def stale_sweep_reconciler(ctx: ReconcileContext) -> int:
     """§17.4 `stale_sweep`, in the tick (≤ 1,000 rows): one batch of `STALE_BATCH` postings. Returns how many
-    went stale: 0 when `ctx.epoch` is no longer the current epoch, because a superseded worker writes
-    nothing."""
+    went stale; a superseded worker writes nothing and raises its fence (`_sweep`)."""
     return await _sweep(ctx, until_short=False)
 
 
 @reconciler("stale_sweep_daily", "daily")
 async def stale_sweep_daily_reconciler(ctx: ReconcileContext) -> int:
     """§17.4 `stale_sweep`, daily: batches of `STALE_BATCH` until a short one (M-2). Returns how many postings
-    went stale; a superseded worker stops at its first batch, which wrote nothing."""
+    went stale; a superseded worker raises its fence at its first batch, which wrote nothing (`_sweep`)."""
     return await _sweep(ctx, until_short=True)

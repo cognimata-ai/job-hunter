@@ -547,7 +547,9 @@ async def apply_run_snapshots(
 async def ats_mass_events(ctx: ReconcileContext) -> int:
     """§17.4 `ats_mass_events`: the confirmation check of every open mass disappearance, one transaction per
     instance, fenced by the worker epoch after the job rows (Ruling T19-a). Returns how many events it
-    confirmed; a superseded worker stops at its first fenced transaction, which wrote nothing."""
+    confirmed. A superseded worker raises `FencedOut` at its first fenced transaction, which wrote nothing,
+    so that `run_reconcilers` stops the cadence at this reconciler and the worker requests its stop (Ruling
+    FR-r; fix wave F7, Ruling FR-w); a `FencedOut` of another owner ends the pass with the count so far."""
     async with ctx.engine.connect() as conn:
         instances = [int(i) for i in (await conn.execute(_OPEN_EVENTS)).scalars()]
 
@@ -560,6 +562,8 @@ async def ats_mass_events(ctx: ReconcileContext) -> int:
             async with ctx.engine.begin() as conn:
                 if await confirm_event(conn, instance_id, guard=fenced) is not None:
                     confirmed += 1
-        except FencedOut:
-            break  # `fence_epoch` logged it
+        except FencedOut as fenced_out:
+            if fenced_out.worker_superseded:
+                raise  # `fence_epoch` logged it
+            break
     return confirmed

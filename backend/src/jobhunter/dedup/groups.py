@@ -1001,8 +1001,10 @@ async def repair_group(conn: AsyncConnection, group_id: int, *, guard: Guard) ->
 @reconciler("group_representatives", "heavy")
 async def group_representatives(ctx: ReconcileContext) -> int:
     """§17.4 `group_representatives` (module docstring): at most one election per violating group, one
-    transaction each, fenced by the worker epoch after the job rows. Returns how many groups it repaired: 0
-    for a superseded worker, which writes nothing."""
+    transaction each, fenced by the worker epoch after the job rows. Returns how many groups it repaired. A
+    superseded worker raises `FencedOut` at its first fenced transaction, which wrote nothing, so that
+    `run_reconcilers` stops the cadence at this reconciler and the worker requests its stop (Ruling FR-r;
+    fix wave F7, Ruling FR-w); a `FencedOut` of another owner ends the pass with the count so far."""
     async with ctx.engine.connect() as conn:
         violating = [int(group_id) for group_id in (await conn.execute(_VIOLATIONS)).scalars()]
 
@@ -1014,8 +1016,10 @@ async def group_representatives(ctx: ReconcileContext) -> int:
         try:
             async with ctx.engine.begin() as conn:
                 done = await repair_group(conn, group_id, guard=fenced)
-        except FencedOut:
-            return repaired  # `fence_epoch` logged it
+        except FencedOut as fenced_out:
+            if fenced_out.worker_superseded:
+                raise  # `fence_epoch` logged it
+            return repaired
         if done:
             repaired += 1
             DEDUP_GROUP_REPAIRS.inc()

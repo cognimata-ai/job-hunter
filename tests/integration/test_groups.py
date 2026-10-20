@@ -33,6 +33,7 @@ from tests.support.groups import BERLIN, FULL_TEXT, canonical_job, varied
 from tests.support.logs import logged
 from tests.support.pg import PgServer, lock_waits, pg_one
 from tests.support.procs import await_until
+from tests.support.reconcile import assert_fence_rule
 
 pytestmark = pytest.mark.integration
 
@@ -360,7 +361,14 @@ async def test_split_confirm_dissolve_and_reconciler(
     reconcile = r.REGISTRY["group_representatives"][1]
     assert r.REGISTRY["group_representatives"][0] == {"heavy"}
     assert "jobhunter.dedup.groups" in worker_main._REGISTERING_MODULES
-    assert await reconcile(ctx(engine, queue_app, epoch=current_epoch + 1)) == 0  # a superseded worker
+    # a superseded worker: its own fence propagates, and the cadence stops at the reconciler (Ruling FR-w)
+    await assert_fence_rule(
+        "group_representatives",
+        "heavy",
+        ctx(engine, queue_app, epoch=current_epoch + 1),
+        ctx(engine, queue_app),
+        groups,
+    )
     assert await group_row(engine, repaired) == ("active", u, None, "initial")
     repairs = repairs_total()
     start = await generation(engine)

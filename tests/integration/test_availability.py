@@ -20,6 +20,7 @@ from jobhunter.worker import reconcilers as r
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import activate_collection_settings, add_posting, ctx, job_lockable
+from tests.support.reconcile import assert_fence_rule
 
 pytestmark = pytest.mark.integration
 
@@ -208,7 +209,10 @@ async def test_the_stale_sweep_reconciler_reads_the_ttl_and_is_fenced(
     assert "jobhunter.availability.rules" in worker_main._REGISTERING_MODULES
     reconcile = r.REGISTRY["stale_sweep"][1]
     old = await aggregator_posting(posting_factory, engine, "adzuna", "a1", 31 * DAY)
-    assert await reconcile(ctx(engine, queue_app, epoch=current_epoch + 1)) == 0  # a superseded worker
+    # a superseded worker: its own fence propagates, and the cadence stops at the reconciler (Ruling FR-w)
+    await assert_fence_rule(
+        "stale_sweep", "tick", ctx(engine, queue_app, epoch=current_epoch + 1), ctx(engine, queue_app), rules
+    )
     assert (await one(engine, POSTING, p=old)).availability == "active"
     assert await reconcile(ctx(engine, queue_app)) == 1  # `stale_ttl_days` null: `max_ad_age_days`, 30
     assert (await one(engine, POSTING, p=old)).availability == "stale"
@@ -244,8 +248,8 @@ async def test_the_daily_stale_sweep_loops_over_batches_and_the_tick_runs_one(
     assert (await r.run_reconcilers(ctx(engine, queue_app), "tick"))["stale_sweep"] == 2
     states = [(await one(engine, POSTING, p=p)).availability for p in made]
     assert sorted(states) == ["active"] * 4 + ["stale"] * 2
-    daily = r.REGISTRY["stale_sweep_daily"][1]
-    assert await daily(ctx(engine, queue_app, epoch=current_epoch + 1)) == 0  # a superseded worker
+    superseded = ctx(engine, queue_app, epoch=current_epoch + 1)  # its fence propagates (Ruling FR-w)
+    await assert_fence_rule("stale_sweep_daily", "daily", superseded, ctx(engine, queue_app), rules)
     counts = await r.run_reconcilers(ctx(engine, queue_app), "daily")
     assert counts["stale_sweep_daily"] == 4  # batches of 2, 2, then an empty one
     assert {(await one(engine, POSTING, p=p)).availability for p in made} == {"stale"}

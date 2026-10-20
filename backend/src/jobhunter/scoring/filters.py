@@ -474,8 +474,10 @@ async def recompute_stale(
 async def hard_filter_completeness(ctx: ReconcileContext) -> int:
     """§17.4 `hard_filter_completeness`: the unmerged jobs without a current result for the active (or
     pending) scope are recomputed, under `active_config` `FOR SHARE`, `BATCH` jobs per pass. Returns the
-    count of jobs recomputed: 0 when `ctx.epoch` is no longer the current worker epoch (`fence_epoch`),
-    because a superseded worker writes nothing."""
+    count of jobs recomputed. When `ctx.epoch` is no longer the current worker epoch it raises `FencedOut`
+    (`fence_epoch`), having written nothing, so that `run_reconcilers` stops the cadence at this reconciler
+    and the superseded worker requests its stop (Ruling FR-r; fix wave F7, Ruling FR-w); a `FencedOut` of
+    another owner returns 0."""
 
     async def fenced(conn: AsyncConnection) -> None:
         await fence_epoch(conn, ctx.epoch)
@@ -483,5 +485,7 @@ async def hard_filter_completeness(ctx: ReconcileContext) -> int:
     try:
         async with ctx.engine.begin() as conn:
             return await recompute_stale(conn, await active_scopes(conn), guard=fenced)
-    except FencedOut:
-        return 0  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+    except FencedOut as fenced_out:
+        if fenced_out.worker_superseded:
+            raise  # the fenced transaction wrote nothing (`fence_epoch` logged it)
+        return 0

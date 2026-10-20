@@ -26,6 +26,7 @@ from tests.support.collect import ctx, make_deps, queued_run, supersede
 from tests.support.facts import BERLIN, HAMBURG, facts, load_facts, scope
 from tests.support.procs import await_until
 from tests.support.quota import seeded_payload
+from tests.support.reconcile import assert_fence_rule
 
 pytestmark = pytest.mark.integration
 
@@ -558,7 +559,14 @@ async def test_the_reconciler_of_a_superseded_worker_epoch_writes_nothing(
     job = (await job_factory(native_id="a")).job_id
     active = await active_scope_id(engine)
     reconcile = r.REGISTRY["hard_filter_completeness"][1]
-    assert await reconcile(ctx(engine, queue_app, epoch=current_epoch + 1)) == 0
+    # its own fence propagates, and the cadence stops at the reconciler (Ruling FR-w)
+    await assert_fence_rule(
+        "hard_filter_completeness",
+        "heavy",
+        ctx(engine, queue_app, epoch=current_epoch + 1),
+        ctx(engine, queue_app),
+        filters,
+    )
     assert await row(engine, job, active) is None
     assert await reconcile(ctx(engine, queue_app, epoch=current_epoch)) == 1
     assert (await row(engine, job, active)).passed is True

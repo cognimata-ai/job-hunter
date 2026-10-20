@@ -18,6 +18,7 @@ from jobhunter.worker import reconcilers as r
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import Board, ctx, job_lockable, make_deps, queued_run
+from tests.support.reconcile import assert_fence_rule
 
 pytestmark = pytest.mark.integration
 
@@ -448,7 +449,14 @@ async def test_the_mass_events_reconciler_confirms_an_open_event_and_is_fenced(
             {"e": opening, "s": later},
         )
         await c.execute(sa.text("UPDATE ats_snapshots SET applied_at = now() WHERE id = :s"), {"s": between})
-    assert await reconcile(ctx(engine, queue_app, epoch=current_epoch + 1)) == 0  # a superseded worker
+    # a superseded worker: its own fence propagates, and the cadence stops at the reconciler (Ruling FR-w)
+    await assert_fence_rule(
+        "ats_mass_events",
+        "tick",
+        ctx(engine, queue_app, epoch=current_epoch + 1),
+        ctx(engine, queue_app),
+        snapshots,
+    )
     assert tuple(await one(engine, INSTANCE, i=board20.instance_id)) == (20, opening)
     assert await reconcile(ctx(engine, queue_app)) == 1  # one event confirmed
     rows = await postings(engine, board20.instance_id)
