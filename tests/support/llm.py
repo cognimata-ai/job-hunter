@@ -12,6 +12,9 @@ prompt, and the C35 helpers `create_llm_call_operation`, `reclaim_stale_now` and
 Task 6 adds the payload contract side (§10.9): `CapturingTransport`, `capture_request` (one `gateway._chat`
 try on it, no database, no network) and `assert_single_call_payload`.
 
+Task 13 adds `write_synthetic_recording`, the builder of a hand-authored synthetic stream and its sidecars
+(the committed `extract_profile` fixture; Task 20's `propose_queries` one).
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
@@ -476,6 +479,46 @@ def synthetic_sse(
         fake.SSEEvent("message_stop", {"type": "message_stop"}),
     ]
     return fake.render_sse(events)
+
+
+# The one response header a hand-authored stream keeps: the fixture PII gate allows it, the fake serves it.
+SYNTHETIC_HEADERS: Final = {"content-type": "text/event-stream; charset=utf-8"}
+
+
+def _sidecar_json(doc: Any) -> bytes:
+    """A sidecar as the recorder writes one: indented, sorted keys, UTF-8, a final newline."""
+    return (json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def write_synthetic_recording(
+    root: Path,
+    purpose: str,
+    model: str,
+    schema: type[BaseModel],
+    body: Any,
+    *,
+    case: str,
+    usage: dict[str, int],
+) -> Path:
+    """Write a hand-authored synthetic stream (Tasks 13 and 20) in the layout `llm/fake.py` serves, and return
+    the stream's path, `root/<purpose>/<model>/<schema12>.sse` of the schema a request of `schema` sends:
+    - the stream, `synthetic_sse(body, model=model, usage=usage)` with a message id of its schema key;
+    - `<schema12>.headers.json`: status 200 and the content type only (`SYNTHETIC_HEADERS`), the one header
+      the fixture PII gate (`tests/contract/test_fixture_pii.py`) and the fake both expect;
+    - `<schema12>.components.json` labelled `"source": "synthetic"`: no recording, so the recorded-bounds
+      check (`tests/payload/test_recorded_bounds.py`) skips it.
+    The same arguments always give the same bytes, so a test can rebuild a committed fixture and compare."""
+    sent = anthropic.transform_schema(schema)
+    path = fake.recording_path(root, purpose, model, sent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    message_id = f"msg_synthetic_{fake.schema12(sent)}"
+    path.write_bytes(synthetic_sse(body, model=model, usage=usage, message_id=message_id))
+    path.with_suffix(".headers.json").write_bytes(
+        _sidecar_json({"status": 200, "headers": SYNTHETIC_HEADERS})
+    )
+    components = {"source": "synthetic", "case": case, "purpose": purpose, "model": model, "usage": usage}
+    path.with_suffix(".components.json").write_bytes(_sidecar_json(components))
+    return path
 
 
 def _block_start(index: int, block: dict[str, Any]) -> fake.SSEEvent:

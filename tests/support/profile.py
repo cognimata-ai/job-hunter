@@ -36,8 +36,22 @@ Task 11 adds the operation side:
   the logged-in client), `await upload("text")` pastes (`POST /api/profile/cv-text`); either answers the new
   draft's id and requires 202;
 - `draft_row(engine, draft_id)` and `cv_row(engine, draft_id)`: the draft's row and its `cv_files` row.
+
+Task 13 adds the extract phase:
+- `SYNTHETIC_CV`, a pasted CV of an invented candidate, and `SYNTHETIC_PROFILE`, the `extract_profile` body of
+  the hand-authored synthetic stream (`write_extract_profile_fixture`, committed under
+  `tests/contract/fixtures/anthropic/extract_profile/`): every `evidence` is a passage of `SYNTHETIC_CV` that
+  contact stripping keeps, and its one planted issue is `total_years_experience`, far below what its roles
+  cover (`years_mismatch`);
+- `upload(pdf, native_pdf_opt_in=True)`: the native-PDF opt-in upload (§12.7);
+- `approve_text`, `retry_draft` and `reopen_text_review`: the approval, the retry and the edit from `ready` as
+  Task 14's routes will make them (the draft's transition and, for the first two, the `extract_profile`
+  operation, no job deferred);
+- `OpRunner.sleeps`: the backoff waits of the runner's gateway, recorded instead of waited.
 """
 
+import asyncio
+import hashlib
 import importlib
 import importlib.util
 import io
@@ -45,7 +59,7 @@ import pkgutil
 import struct
 import threading
 import zipfile
-from collections.abc import AsyncIterator, Awaitable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,14 +71,17 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.db.transitions import transition
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.profile.deps import ProfileDeps
 from jobhunter.graphs.profile.graph import build_profile_graphs
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
+from jobhunter.llm.schemas.profile import ProfileOut
 from jobhunter.llm.transport import make_http_client
 from jobhunter.profile.parse_client import ParseClient
 from jobhunter.profile.storage import CvStore
+from jobhunter.profile.upload import request_draft_operation
 from jobhunter.worker.executions import EXECUTIONS, ExecutionRegistry
 from jobhunter.worker.operations import OperationDeps, execute_operation
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -73,7 +90,7 @@ import docparse.worker as docparse_worker
 from docparse.worker import serve
 from tests.support.faults import PausePoint, PausePoints
 from tests.support.fixtures import ConfigFactory
-from tests.support.llm import FAKE_LLM_DIR
+from tests.support.llm import FAKE_LLM_DIR, Sleeps, write_synthetic_recording
 
 PDF_MIME: Final = "application/pdf"
 DOCX_MIME: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -357,14 +374,17 @@ _CV = sa.text("SELECT c.* FROM cv_files c JOIN profile_drafts d ON d.cv_file_id 
 
 
 @asynccontextmanager
-async def operation_deps(engine: AsyncEngine, cfg: AppConfig) -> AsyncIterator[OperationDeps]:
-    """A real `OperationDeps` on `cfg` (module docstring); `cfg` must be in fake LLM mode or carry a key."""
+async def operation_deps(
+    engine: AsyncEngine, cfg: AppConfig, *, sleep: Callable[[float], Awaitable[object]] = asyncio.sleep
+) -> AsyncIterator[OperationDeps]:
+    """A real `OperationDeps` on `cfg` (module docstring); `cfg` must be in fake LLM mode or carry a key.
+    `sleep` is the gateway's backoff wait."""
     async with open_saver(cfg.dsn("psycopg")) as saver:
         http_client = make_http_client(cfg)
         try:
             yield OperationDeps(
                 cfg=cfg,
-                gateway=LLMGateway(engine, cfg, http_client=http_client, cache=CacheMonitor()),
+                gateway=LLMGateway(engine, cfg, http_client=http_client, cache=CacheMonitor(), sleep=sleep),
                 parse_client=ParseClient(
                     cfg.parse_jobs_dir, timeout_s=_PARSE_TIMEOUT_S, poll_s=_PARSE_POLL_S
                 ),
@@ -402,6 +422,7 @@ class OpRunner:
     epoch: int
     monkeypatch: pytest.MonkeyPatch
     docparse_jobs: list[str] = field(default_factory=list)  # the job ids the docparse loop ran
+    sleeps: Sleeps = field(default_factory=Sleeps)  # the gateway's backoff waits, recorded and not waited
 
     async def due(self) -> list[int]:
         """The `pending` operations whose `not_before` has passed, oldest first."""
@@ -463,25 +484,37 @@ async def op_runner(
         JOBHUNTER_FAKE_LLM="1",
         JOBHUNTER_FAKE_LLM_DIR=str(FAKE_LLM_DIR),
     )
-    async with operation_deps(engine, cfg) as deps:
+    sleeps = Sleeps()
+    async with operation_deps(engine, cfg, sleep=sleeps) as deps:
         yield OpRunner(
-            engine=engine, deps=deps, epoch=current_epoch, monkeypatch=monkeypatch, docparse_jobs=jobs
+            engine=engine,
+            deps=deps,
+            epoch=current_epoch,
+            monkeypatch=monkeypatch,
+            docparse_jobs=jobs,
+            sleeps=sleeps,
         )
 
 
 class Upload(Protocol):
-    def __call__(self, content: bytes | str, *, filename: str = ...) -> Awaitable[int]: ...
+    def __call__(
+        self, content: bytes | str, *, filename: str = ..., native_pdf_opt_in: bool = ...
+    ) -> Awaitable[int]: ...
 
 
 @pytest.fixture
 def upload(logged_in_client: httpx.AsyncClient) -> Upload:
-    """`await upload(file_bytes, filename="Lebenslauf.pdf")` or `await upload(pasted_text)`: the new draft."""
+    """`await upload(file_bytes, filename="Lebenslauf.pdf")` or `await upload(pasted_text)`: the new draft.
+    `native_pdf_opt_in=True` sends the §12.7 opt-in with a file."""
 
-    async def post(content: bytes | str, *, filename: str = "Lebenslauf.pdf") -> int:
+    async def post(
+        content: bytes | str, *, filename: str = "Lebenslauf.pdf", native_pdf_opt_in: bool = False
+    ) -> int:
         if isinstance(content, str):
             r = await logged_in_client.post("/api/profile/cv-text", json={"text": content})
         else:
-            r = await logged_in_client.post("/api/profile/cv", files={"file": (filename, content)})
+            data = {"native_pdf_opt_in": "true"} if native_pdf_opt_in else None
+            r = await logged_in_client.post("/api/profile/cv", files={"file": (filename, content)}, data=data)
         assert r.status_code == 202, (r.status_code, r.json())
         return int(r.json()["draft_id"])
 
@@ -498,3 +531,198 @@ async def cv_row(engine: AsyncEngine, draft_id: int) -> sa.Row[Any]:
     """The `cv_files` row of draft `draft_id`."""
     async with engine.connect() as conn:
         return (await conn.execute(_CV, {"d": draft_id})).one()
+
+
+# --- Task 13: the extract phase ---------------------------------------------------------------------------
+
+# A pasted CV of an invented candidate (§12, privacy rules): the header name and the e-mail address are what
+# contact stripping replaces; everything else reaches the model as it is.
+SYNTHETIC_CV: Final = "\n".join(
+    [
+        "Erika Musterfrau",
+        "Senior Backend-Entwicklerin",
+        "E-Mail: erika.musterfrau@example.org",
+        "",
+        "Berufserfahrung",
+        "03/2020 - heute: Senior Backend-Entwicklerin, Musterfirma GmbH",
+        "Entwicklung von Zahlungsdiensten mit Python, FastAPI und PostgreSQL.",
+        "Einführung von Code-Reviews und automatisierten Tests im Team.",
+        "01/2016 - 02/2020: Backend-Entwicklerin, Beispiel AG",
+        "Aufbau einer Datenplattform mit Kafka und Apache Spark.",
+        "",
+        "Ausbildung",
+        "2010 - 2015 Informatik (M.Sc.), Technische Universität Musterstadt",
+        "",
+        "Kenntnisse: Python (8 Jahre), FastAPI, PostgreSQL, Kafka, Docker",
+        "Sprachen: Deutsch (Muttersprache), Englisch (C1)",
+        "Zertifikate: AWS Certified Developer (2021)",
+    ]
+)
+
+# The `extract_profile` body of the synthetic stream: what a model could answer for `SYNTHETIC_CV`. Every
+# `evidence` is a passage of it that contact stripping keeps. The one planted issue: 3 years of experience,
+# while the roles cover more than ten (`years_mismatch`, whatever today is).
+SYNTHETIC_PROFILE: Final[dict[str, Any]] = {
+    "summary": (
+        "Senior Backend-Entwicklerin mit langjähriger Erfahrung in Python, Zahlungsdiensten und "
+        "Datenplattformen. Führt Code-Reviews und automatisierte Tests im Team ein."
+    ),
+    "target_titles": [
+        {"title": "Senior Backend-Entwicklerin", "lang": "de"},
+        {"title": "Senior Backend Developer", "lang": "en"},
+    ],
+    "seniority": "senior",
+    "total_years_experience": 3,
+    "roles": [
+        {
+            "title": "Senior Backend-Entwicklerin",
+            "employer": "Musterfirma GmbH",
+            "start": "2020-03-01",
+            "end": "present",
+            "seniority": "senior",
+            "domain": "Payments",
+            "highlights": [
+                "Entwicklung von Zahlungsdiensten mit Python, FastAPI und PostgreSQL.",
+                "Einführung von Code-Reviews und automatisierten Tests im Team.",
+            ],
+        },
+        {
+            "title": "Backend-Entwicklerin",
+            "employer": "Beispiel AG",
+            "start": "2016-01-01",
+            "end": "2020-02-01",
+            "seniority": "mid",
+            "domain": "Datenplattformen",
+            "highlights": ["Aufbau einer Datenplattform mit Kafka und Apache Spark."],
+        },
+    ],
+    "skills": [
+        {
+            "name": "Python",
+            "category": "programming_language",
+            "level": "expert",
+            "years": 8,
+            "evidence": "Python (8 Jahre)",
+        },
+        {
+            "name": "FastAPI",
+            "category": "framework",
+            "level": "advanced",
+            "years": None,
+            "evidence": "Python, FastAPI und PostgreSQL",
+        },
+        {
+            "name": "PostgreSQL",
+            "category": "tool",
+            "level": "advanced",
+            "years": None,
+            "evidence": "FastAPI, PostgreSQL, Kafka",
+        },
+        {
+            "name": "Apache Kafka",
+            "category": "platform",
+            "level": "intermediate",
+            "years": None,
+            "evidence": "Datenplattform mit Kafka",
+        },
+        {
+            "name": "Apache Spark",
+            "category": "framework",
+            "level": "intermediate",
+            "years": None,
+            "evidence": "Kafka und Apache Spark",
+        },
+        {
+            "name": "Docker",
+            "category": "tool",
+            "level": "intermediate",
+            "years": None,
+            "evidence": "Kafka, Docker",
+        },
+    ],
+    "languages": [
+        {"code": "de", "code_other": None, "cefr": "native", "evidence": "Deutsch (Muttersprache)"},
+        {"code": "en", "code_other": None, "cefr": "C1", "evidence": "Englisch (C1)"},
+    ],
+    "education": [
+        {
+            "level": "master",
+            "field": "Informatik",
+            "institution": "Technische Universität Musterstadt",
+            "year": 2015,
+        }
+    ],
+    "certifications": [{"name": "AWS Certified Developer", "issuer": "Amazon Web Services", "year": 2021}],
+    "domains": ["Payments", "Datenplattformen"],
+}
+# The usage the synthetic stream reports: within the reservation of any extraction of `SYNTHETIC_CV`.
+SYNTHETIC_USAGE: Final = {
+    "input_tokens": 2600,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 900,
+}
+EXTRACT_PURPOSE: Final = "extract_profile"
+EXTRACT_MODEL: Final = "claude-opus-5-5"
+
+
+def write_extract_profile_fixture(root: Path = FAKE_LLM_DIR) -> Path:
+    """The synthetic `extract_profile` stream of `SYNTHETIC_PROFILE` for the default model and the profile
+    schema, with its sidecars, under `root` (by default the committed recordings); the stream's path."""
+    return write_synthetic_recording(
+        root,
+        EXTRACT_PURPOSE,
+        EXTRACT_MODEL,
+        ProfileOut,
+        SYNTHETIC_PROFILE,
+        case="task13_synthetic_cv",
+        usage=SYNTHETIC_USAGE,
+    )
+
+
+def sha256(text: str) -> bytes:
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+_REVIEWABLE = sa.text(
+    "SELECT d.status, c.stripped_text FROM profile_drafts d JOIN cv_files c ON c.id = d.cv_file_id "
+    "WHERE d.id = :d FOR UPDATE OF d"
+)
+
+
+async def approve_text(engine: AsyncEngine, draft_id: int, text: str | None = None) -> int:
+    """The approval of Task 14's `POST …/text-review`: `reviewed_text` (`text`, by default the draft's
+    stripped text) and its sha256, `text_review → extracting_profile` and the `extract_profile` operation; its
+    id."""
+    async with engine.begin() as conn:
+        row = (await conn.execute(_REVIEWABLE, {"d": draft_id})).one()
+        reviewed = row.stripped_text if text is None else text
+        await transition(
+            conn,
+            "profile_drafts",
+            draft_id,
+            ["text_review"],
+            "extracting_profile",
+            set_={"reviewed_text": reviewed, "reviewed_text_sha256": sha256(reviewed)},
+        )
+        op_id, created = await request_draft_operation(conn, "extract_profile", draft_id, defer=None)
+    assert created, "an approval creates a new operation"
+    return op_id
+
+
+async def retry_draft(engine: AsyncEngine, draft_id: int) -> int:
+    """Task 14's `POST …/retry` with `mode="llm"`: `failed → extracting_profile` and a new `extract_profile`
+    operation; its id."""
+    async with engine.begin() as conn:
+        await transition(conn, "profile_drafts", draft_id, ["failed"], "extracting_profile")
+        op_id, created = await request_draft_operation(conn, "extract_profile", draft_id, defer=None)
+    assert created, "a retry creates a new operation"
+    return op_id
+
+
+async def reopen_text_review(engine: AsyncEngine, draft_id: int) -> None:
+    """Task 14's text edit from `ready`: `ready → text_review`, the `draft_json` discarded (§12.3)."""
+    async with engine.begin() as conn:
+        await transition(
+            conn, "profile_drafts", draft_id, ["ready"], "text_review", set_={"draft_json": None}
+        )

@@ -22,8 +22,27 @@ never meets a terminal row. The draft row comes after the owner row in the §9.1
 usable `draft_id` is logged (`profile_hook_payload_invalid`, the operation id and an error class) and moves
 nothing: the hook runs inside a reclaim, the takeover sweep or a tick, which it must never fail.
 
-Tasks 13 (`extract_profile`), 19 (`embed_profile`) and 20 (`propose_queries`) add their handlers and hooks
-here. Logs carry ids and codes only.
+**`extract_profile`** (Task 13; payload `{"draft_id": <id>}`, dedup key `extract_profile:<id>`). Only the
+transaction that moves the draft into `extracting_profile` creates it: the approval or the retry (Task 14) or
+the native opt-in upload (Task 9). In one transaction, the owner row, then the draft `FOR UPDATE`: a draft in
+`extracting_profile` goes on; one in any other state (`text_review` and `failed` included) or gone ends the
+operation `succeeded` as obsolete without touching it, so no extraction ever starts on text the user has not
+approved (§12.3). Then the handler invokes `profile_graphs.extract` on the execution's own thread
+(`thread_id("p", draft_id, claim.operation_id, claim.attempts)`) with the same invoke shape. Its nodes end
+the operation in the transaction of their last domain write: `ready`, or `failed(code)`, or a requeue
+(`graphs.profile.nodes.check_pdf`, `.extract_profile`, `.draft`). Whatever the graph's end, the handler then
+discards what its `validate` node handed on in memory (`validate.VALIDATED`, by thread).
+
+**Its failure hook** (`extract_phase_failed`) moves a draft still in `extracting_profile` to
+`failed(<code or 'attempts_exhausted'>)`: a requeue's last attempt (`llm_transient`), or a reclaim or the
+takeover sweep that spent the attempts (`attempts_exhausted`). A draft the handler's own write already ended,
+or one in another state, is left as it is. It needs no generation predicate: while its operation is live the
+draft stays in that operation's generation (a new approval needs `text_review`, a retry `failed`, and each
+creates a new operation), and the hook runs in the transaction that ends that operation. A malformed payload
+is logged and moves nothing, as for the text phase.
+
+Tasks 19 (`embed_profile`) and 20 (`propose_queries`) add their handlers and hooks here. Logs carry ids and
+codes only.
 """
 
 from collections.abc import Mapping
@@ -33,7 +52,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.transitions import transition
 from jobhunter.graphs.profile.graph import invoke_config
-from jobhunter.graphs.profile.nodes import end_obsolete, fail_draft, lock_draft
+from jobhunter.graphs.profile.nodes import EXTRACTING_PROFILE, end_obsolete, fail_draft, lock_draft
+from jobhunter.graphs.profile.nodes.validate import VALIDATED
 from jobhunter.graphs.profile.state import initial_state
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue, get_int
@@ -45,6 +65,7 @@ from jobhunter.worker.operations import (
 )
 
 EXTRACT_PROFILE_TEXT: Final = "extract_profile_text"
+EXTRACT_PROFILE: Final = "extract_profile"
 _DRAFTS: Final = "profile_drafts"
 _BIGINT_END: Final = 2**63
 
@@ -105,3 +126,39 @@ async def extract_profile_text(ctx: OperationContext) -> None:
     await ctx.deps.profile_graphs.text.ainvoke(
         initial_state(draft_id, claim.operation_id), invoke_config("t", draft_id, ctx), durability="sync"
     )
+
+
+async def extract_phase_failed(
+    conn: AsyncConnection, operation_id: int, payload: Mapping[str, JSONValue], error_code: str | None
+) -> None:
+    """The extract phase's failure hook (module docstring)."""
+    draft_id = _hook_draft_id(operation_id, payload)
+    if draft_id is None:
+        return  # no draft to name: the operation still ends `failed`
+    if await lock_draft(conn, draft_id) != EXTRACTING_PROFILE:
+        return  # ended by the handler's own write, or in another phase: not this hook's to move
+    code = error_code or ATTEMPTS_EXHAUSTED
+    await fail_draft(conn, draft_id, code, from_state=EXTRACTING_PROFILE)
+    log.warning("profile_draft_failed", operation_id=operation_id, draft_id=draft_id, code=code)
+
+
+@register_operation_handler("extract_profile", on_failed=extract_phase_failed)
+async def extract_profile(ctx: OperationContext) -> None:
+    """The extract phase of a draft (module docstring)."""
+    if ctx.deps is None:
+        raise RuntimeError("extract_profile runs with the worker's OperationDeps")
+    claim = ctx.claim
+    draft_id = _draft_id(claim.payload)
+    async with ctx.engine.begin() as conn:
+        await lock_operation_owner(conn, claim)
+        status = await lock_draft(conn, draft_id)
+        if status != EXTRACTING_PROFILE:
+            await end_obsolete(conn, ctx, draft_id, status)
+            return
+    config = invoke_config("p", draft_id, ctx)
+    try:
+        await ctx.deps.profile_graphs.extract.ainvoke(
+            initial_state(draft_id, claim.operation_id), config, durability="sync"
+        )
+    finally:
+        VALIDATED.discard(config["configurable"]["thread_id"])

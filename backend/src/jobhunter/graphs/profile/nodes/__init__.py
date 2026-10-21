@@ -14,9 +14,26 @@ the domain rows):
   `code` (the CHECK `status <> 'failed' OR failure_code IS NOT NULL`);
 - `end_obsolete(conn, op, draft_id, status)`: a draft that left the state the node works on ends the
   operation `succeeded` as obsolete, untouched.
+
+The extract phase (Task 13) adds:
+- `read_extract_draft(engine, draft_id)`: the draft as its nodes read it (`ExtractDraft`), without a lock
+  (`fetch_extract_draft(conn, draft_id)` on the caller's connection);
+- `generation_owner(native_pdf=…, reviewed_text_sha256=…)`: the owner predicate of every write of the phase,
+  on the `owner_cols` of `profile_drafts`. A text draft's generation is the text the user approved,
+  `{"reviewed_text_sha256": <digest>, "native_pdf": False}`; a native draft's is `{"native_pdf": True}`
+  alone, since its `reviewed_text_sha256` may be NULL, which SQL's `=` never matches (the ruling carried from
+  Task 1). A write for another generation matches no row: no reordering lets a stale result land on newer
+  text;
+- `end_obsolete_in_own_tx(engine, op, draft_id)` and `fail_extraction(engine, op, draft_id, code, owner=…)`:
+  one transaction each in the §9.1 order (the owner row, then the draft `FOR UPDATE`), the second moving the
+  draft `extracting_profile → failed(code)` for `owner`'s generation and finishing the operation
+  `failed(code)` in that transaction, or ending it obsolete when the draft is in another state or generation;
+- `execution_thread(config)`: the execution's thread id, the key of what one execution's nodes hand on in
+  memory (`validate.VALIDATED`).
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Final, Literal, Protocol
 
 from langchain_core.runnables import RunnableConfig
@@ -24,13 +41,15 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
-from jobhunter.graphs.profile.state import ProfileState, ProfileUpdate
+from jobhunter.errors import InvariantViolation, TransitionConflict
+from jobhunter.graphs.profile.state import FAILED, OBSOLETE, ProfileState, ProfileUpdate
 from jobhunter.observability.logging import get_logger
-from jobhunter.worker.operations import OperationContext, OperationDeps
+from jobhunter.worker.operations import OperationContext, OperationDeps, lock_operation_owner
 
 # A stored CV that cannot be read: no file (`FileNotFoundError`), or a file or text that does not open with
 # the data keys (`crypto.DecryptError`: a wrong key, or another row's blob).
 CV_FILE_UNREADABLE: Final = "cv_file_unreadable"
+EXTRACTING_PROFILE: Final = "extracting_profile"
 _TABLE: Final = "profile_drafts"
 
 _CV = q(
@@ -38,6 +57,10 @@ _CV = q(
     "JOIN cv_files c ON c.id = d.cv_file_id WHERE d.id = :d"
 )
 _LOCK_DRAFT = q("SELECT status FROM profile_drafts WHERE id = :d FOR UPDATE")
+_EXTRACT_DRAFT = q(
+    "SELECT d.status, d.cv_file_id, d.reviewed_text, d.reviewed_text_sha256, d.native_pdf, c.storage_path "
+    "FROM profile_drafts d JOIN cv_files c ON c.id = d.cv_file_id WHERE d.id = :d"
+)
 
 log = get_logger("jobhunter.graphs.profile")
 
@@ -88,9 +111,13 @@ async def fail_draft(
     code: str,
     *,
     from_state: Literal["extracting_text", "extracting_profile"],
+    owner: Mapping[str, object] | None = None,
 ) -> None:
-    """Move the draft `from_state → failed(code)`: `failure_code` and the reason are `code`."""
-    await transition(conn, _TABLE, draft_id, [from_state], "failed", reason=code, set_={"failure_code": code})
+    """Move the draft `from_state → failed(code)`: `failure_code` and the reason are `code`. With `owner`,
+    only a draft of that generation moves (`generation_owner`); `TransitionConflict` otherwise."""
+    await transition(
+        conn, _TABLE, draft_id, [from_state], "failed", reason=code, owner=owner, set_={"failure_code": code}
+    )
 
 
 async def end_obsolete(
@@ -101,3 +128,97 @@ async def end_obsolete(
     log.info(
         "profile_operation_obsolete", operation_id=op.claim.operation_id, draft_id=draft_id, status=status
     )
+
+
+# --- the extract phase (Task 13) ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExtractDraft:
+    """A draft as the extract-phase nodes read it, without a lock: its status, its generation (the approved
+    text, or the native PDF) and its CV file. The reviewed text stays out of every `repr`."""
+
+    status: str
+    cv_file_id: int
+    storage_path: str | None
+    native_pdf: bool
+    reviewed_text_sha256: bytes | None
+    reviewed_text: str | None = field(repr=False)
+
+    def owner(self) -> dict[str, object]:
+        """The owner predicate of this generation (`generation_owner`)."""
+        return generation_owner(native_pdf=self.native_pdf, reviewed_text_sha256=self.reviewed_text_sha256)
+
+
+async def read_extract_draft(engine: AsyncEngine, draft_id: int) -> ExtractDraft | None:
+    """Draft `draft_id` with its CV file's storage path, or `None` when it is gone."""
+    async with engine.connect() as conn:
+        return await fetch_extract_draft(conn, draft_id)
+
+
+async def fetch_extract_draft(conn: AsyncConnection, draft_id: int) -> ExtractDraft | None:
+    """`read_extract_draft` on the caller's connection (in its transaction, after its locks)."""
+    row = (await conn.execute(_EXTRACT_DRAFT, {"d": draft_id})).first()
+    if row is None:
+        return None
+    digest = None if row.reviewed_text_sha256 is None else bytes(row.reviewed_text_sha256)
+    return ExtractDraft(
+        status=str(row.status),
+        cv_file_id=int(row.cv_file_id),
+        storage_path=row.storage_path,
+        native_pdf=bool(row.native_pdf),
+        reviewed_text_sha256=digest,
+        reviewed_text=row.reviewed_text,
+    )
+
+
+def generation_owner(*, native_pdf: bool, reviewed_text_sha256: bytes | None) -> dict[str, object]:
+    """The owner predicate of the extract phase's writes for one generation (module docstring)."""
+    if native_pdf:
+        return {"native_pdf": True}
+    if reviewed_text_sha256 is None:  # the §7.4 CHECK refuses such a draft in `extracting_profile`
+        raise InvariantViolation("a reviewed-text generation without its reviewed_text_sha256")
+    return {"reviewed_text_sha256": reviewed_text_sha256, "native_pdf": False}
+
+
+def execution_thread(config: RunnableConfig) -> str:
+    """The thread id of the execution (`graph.thread_id`): unique per operation and attempt."""
+    thread = config.get("configurable", {}).get("thread_id")
+    if not isinstance(thread, str) or not thread:
+        raise TypeError("a profile node runs on its execution's thread (configurable['thread_id'])")
+    return thread
+
+
+async def end_obsolete_in_own_tx(engine: AsyncEngine, op: OperationContext, draft_id: int) -> str:
+    """The operation `succeeded` as obsolete in a transaction of its own, after the owner lock (a lost claim
+    is `FencedOut` and writes nothing) and the draft's; the state's `outcome`."""
+    async with engine.begin() as conn:
+        await lock_operation_owner(conn, op.claim)
+        await end_obsolete(conn, op, draft_id, await lock_draft(conn, draft_id))
+    return OBSOLETE
+
+
+async def fail_extraction(
+    engine: AsyncEngine, op: OperationContext, draft_id: int, code: str, *, owner: Mapping[str, object]
+) -> str:
+    """`extracting_profile → failed(code)` for `owner`'s generation and the operation `failed(code)`, in one
+    transaction (module docstring); the state's `outcome`, `failed` or `obsolete`."""
+    async with engine.begin() as conn:
+        await lock_operation_owner(conn, op.claim)
+        status = await lock_draft(conn, draft_id)
+        if status == EXTRACTING_PROFILE:
+            try:
+                await fail_draft(conn, draft_id, code, from_state=EXTRACTING_PROFILE, owner=owner)
+            except TransitionConflict:
+                pass  # another generation: the update matched no row and wrote nothing
+            else:
+                await op.finish_in(conn, status="failed", error_code=code)
+                log.info(
+                    "profile_extract_failed",
+                    operation_id=op.claim.operation_id,
+                    draft_id=draft_id,
+                    code=code,
+                )
+                return FAILED
+        await end_obsolete(conn, op, draft_id, status)
+    return OBSOLETE

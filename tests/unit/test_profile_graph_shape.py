@@ -2,7 +2,7 @@
 nodes, edges and policies, the LLM nodes' policies, the thread names, and the node wrapper `sanitized` that
 keeps an exception's content out of `checkpoint_writes`.
 
-Tasks 13 and 20 add the `extract` and `propose` graphs to `ProfileGraphs`, and their shapes here.
+Task 13 adds the `extract` graph to `ProfileGraphs`, and its shape here; Task 20 adds `propose`.
 """
 
 import asyncio
@@ -55,9 +55,9 @@ def graphs() -> ProfileGraphs:
     )
 
 
-def test_profile_graphs_hold_the_text_graph() -> None:
-    """Tasks 13 and 20 add `extract` and `propose` with their nodes; no placeholder graph exists before."""
-    assert [field.name for field in dataclasses.fields(ProfileGraphs)] == ["text"]
+def test_profile_graphs_hold_the_text_and_the_extract_graph() -> None:
+    """Task 20 adds `propose` with its node; no placeholder graph exists before."""
+    assert [field.name for field in dataclasses.fields(ProfileGraphs)] == ["text", "extract"]
 
 
 def test_the_text_graph_is_parse_then_strip_contacts() -> None:
@@ -75,12 +75,51 @@ def test_the_text_graph_is_parse_then_strip_contacts() -> None:
 def test_the_text_nodes_retry_database_errors_within_their_timeouts() -> None:
     nodes = graphs().text.builder.nodes
     assert set(nodes) == {"parse", "strip_contacts"}
-    assert dict(NODE_TIMEOUTS) == {"parse": timedelta(seconds=120), "strip_contacts": timedelta(seconds=30)}
+    assert dict(NODE_TIMEOUTS) == {
+        "parse": timedelta(seconds=120),
+        "strip_contacts": timedelta(seconds=30),
+        "check_pdf": timedelta(seconds=120),
+        "validate": timedelta(seconds=30),
+        "draft": timedelta(seconds=30),
+    }
     for name, seconds in (("parse", 120), ("strip_contacts", 30)):
         spec = nodes[name]
         assert spec.retry_policy == DB_RETRY
         assert spec.timeout == TimeoutPolicy(run_timeout=seconds)
         assert spec.trace_policy is None
+
+
+def test_the_extract_graph_is_check_pdf_extract_profile_validate_then_draft() -> None:
+    """Each of the first three goes to `END` when it ended the draft itself (failed, requeued or obsolete:
+    the state's `outcome`)."""
+    drawn = graphs().extract.get_graph()
+    edges = {(edge.source, edge.target, edge.conditional) for edge in drawn.edges}
+    assert edges == {
+        (START, "check_pdf", False),
+        ("check_pdf", "extract_profile", True),
+        ("check_pdf", END, True),
+        ("extract_profile", "validate", True),
+        ("extract_profile", END, True),
+        ("validate", "draft", True),
+        ("validate", END, True),
+        ("draft", END, False),
+    }
+
+
+def test_the_extract_nodes_have_their_policies() -> None:
+    """`extract_profile` is an LLM node (no retry, the maximum deadline, nothing traced); the others retry
+    database errors within their timeouts."""
+    nodes = graphs().extract.builder.nodes
+    assert set(nodes) == {"check_pdf", "extract_profile", "validate", "draft"}
+    llm = nodes["extract_profile"]
+    assert (llm.retry_policy, llm.timeout, llm.trace_policy) == (None, LLM_NODE_TIMEOUT, LLM_NODE_TRACE)
+    for name, seconds in (("check_pdf", 120), ("validate", 30), ("draft", 30)):
+        spec = nodes[name]
+        assert (spec.retry_policy, spec.timeout, spec.trace_policy) == (
+            DB_RETRY,
+            TimeoutPolicy(run_timeout=seconds),
+            None,
+        )
 
 
 def test_an_llm_node_has_no_retry_the_maximum_deadline_and_traces_nothing() -> None:

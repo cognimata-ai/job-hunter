@@ -1,11 +1,13 @@
 """`profile_graph` (spec §9.1, §9.5; M2 plan Task 11, Deviations 25, 27 and 28).
 
 **The graphs.** `build_profile_graphs(checkpointer, deps)` compiles them once per process into
-`ProfileGraphs`. This task defines `text`: `parse → strip_contacts → END`, where `parse` goes straight to
-`END` when it ended the draft itself (`failed`, or obsolete: the state's `outcome`). Tasks 13 and 20 add the
-fields
-`extract` (`check_pdf → extract_profile → validate → draft → END`) and `propose` (`propose_queries → END`)
-with their nodes; no graph exists here before its nodes do.
+`ProfileGraphs`:
+- `text` (Task 11): `parse → strip_contacts → END`, where `parse` goes straight to `END` when it ended the
+  draft itself (`failed`, or obsolete: the state's `outcome`);
+- `extract` (Task 13): `check_pdf → extract_profile → validate → draft → END`, where each of the first three
+  goes straight to `END` when it ended the phase itself (`failed`, `requeued` or obsolete).
+Task 20 adds the field `propose` (`propose_queries → END`) with its node; no graph exists here before its
+nodes do.
 
 **The invoke shape** (§9.1). A handler invokes its graph with `invoke_config(kind, subject_id, ctx)`,
 `{"configurable": {"thread_id": thread_id(…), "op": ctx}, "recursion_limit": RECURSION_LIMIT,
@@ -21,12 +23,12 @@ and `attempts`. Every execution of every operation gets a thread of its own, so 
 operation or attempt reaches a later one through an omitted key or a reducer (`steps` adds up). Work done
 before a crash is found through the receipts in the database (§9.1), not through the thread.
 
-**The policies** (§9.1). A node without an LLM call takes `DB_RETRY` and its `TimeoutPolicy`
-(`NODE_TIMEOUTS`: `parse` 120 s, `strip_contacts` 30 s; `add_node`). An LLM node (`add_llm_node`, Tasks 13
-and 20) takes no `RetryPolicy` (the gateway owns the retries, §10.4), `LLM_NODE_TIMEOUT` (the §13.1 maximum
-`deadline_s` of 1,800 s plus a margin: a graph compiled once cannot take the deadline an `execution` save
-changes at runtime, Deviation 28; the gateway enforces the active one per call through
-`CallContext.deadline`) and `LLM_NODE_TRACE` (its input and output omitted from any trace).
+**The policies** (§9.1). A node without an LLM call takes `DB_RETRY` and its `TimeoutPolicy` (`NODE_TIMEOUTS`:
+`parse` and `check_pdf` 120 s, `strip_contacts`, `validate` and `draft` 30 s; `add_node`). An LLM node
+(`add_llm_node`, Tasks 13 and 20) takes no `RetryPolicy` (the gateway owns the retries, §10.4),
+`LLM_NODE_TIMEOUT` (the §13.1 maximum `deadline_s` of 1,800 s plus a margin: a graph compiled once cannot take
+the deadline an `execution` save changes at runtime, Deviation 28; the gateway enforces the active one per
+call through `CallContext.deadline`) and `LLM_NODE_TRACE` (its input and output omitted from any trace).
 
 **`sanitized`** (Deviation 25) wraps every profile node. LangGraph 1.2.15 stores the exception that escapes
 a node in `checkpoint_writes` (the write `(__error__, exc)` of `PregelRunner.commit`), through its
@@ -44,7 +46,8 @@ stripped. The stand-in of a retryable database error (`NodeFailed.retryable_db_e
 `DB_RETRY` retries.
 """
 
-from collections.abc import Mapping
+import itertools
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from types import MappingProxyType
@@ -61,8 +64,12 @@ from jobhunter.errors import FencedOut, NodeFailed, TransitionConflict
 from jobhunter.graphs.collect.graph import DB_RETRY, is_retryable_db_error
 from jobhunter.graphs.profile.deps import ProfileDeps
 from jobhunter.graphs.profile.nodes import Node, log
+from jobhunter.graphs.profile.nodes import check_pdf as check_pdf_node
+from jobhunter.graphs.profile.nodes import draft as draft_node
+from jobhunter.graphs.profile.nodes import extract_profile as extract_node
 from jobhunter.graphs.profile.nodes import parse as parse_node
 from jobhunter.graphs.profile.nodes import strip_contacts as strip_node
+from jobhunter.graphs.profile.nodes import validate as validate_node
 from jobhunter.graphs.profile.state import ProfileState as ProfileState
 from jobhunter.graphs.profile.state import ProfileUpdate
 from jobhunter.llm.errors import LLMError
@@ -77,7 +84,13 @@ RECURSION_LIMIT: Final = 200  # §9.1
 MAX_CONCURRENCY: Final = 1
 # The §9.1 timeout of each node without an LLM call.
 NODE_TIMEOUTS: Final[Mapping[str, timedelta]] = MappingProxyType(
-    {parse_node.NAME: parse_node.NODE_TIMEOUT, strip_node.NAME: strip_node.NODE_TIMEOUT}
+    {
+        parse_node.NAME: parse_node.NODE_TIMEOUT,
+        strip_node.NAME: strip_node.NODE_TIMEOUT,
+        check_pdf_node.NAME: check_pdf_node.NODE_TIMEOUT,
+        validate_node.NAME: validate_node.NODE_TIMEOUT,
+        draft_node.NAME: draft_node.NODE_TIMEOUT,
+    }
 )
 # The §13.1 maximum `deadline_s` (1,800 s) plus a margin (Deviation 28).
 LLM_NODE_TIMEOUT: Final = TimeoutPolicy(run_timeout=1800 + 60)
@@ -92,9 +105,10 @@ _THREAD_PREFIX: Final[Mapping[ThreadKind, str]] = MappingProxyType(
 
 @dataclass(frozen=True)
 class ProfileGraphs:
-    """The compiled profile graphs. Task 13 adds `extract` and Task 20 `propose`."""
+    """The compiled profile graphs: the text phase and the extract phase. Task 20 adds `propose`."""
 
     text: ProfileGraph
+    extract: ProfileGraph
 
 
 def thread_id(kind: ThreadKind, subject_id: int, operation_id: int, attempts: int) -> str:
@@ -153,6 +167,15 @@ def after_parse(state: ProfileState) -> Literal["strip_contacts", "__end__"]:
     return "__end__" if state["outcome"] is not None else "strip_contacts"  # "__end__" is `END`
 
 
+def _continue_unless_ended(next_node: str) -> Callable[[ProfileState], str]:
+    """The route after a node that may end the phase itself: `next_node`, or `END` once `outcome` is set."""
+
+    def route(state: ProfileState) -> str:
+        return END if state["outcome"] is not None else next_node
+
+    return route
+
+
 def _text_graph(checkpointer: BaseCheckpointSaver[str], deps: ProfileDeps) -> ProfileGraph:
     graph = StateGraph(ProfileState)
     add_node(graph, parse_node.NAME, parse_node.make_parse(deps))
@@ -163,6 +186,20 @@ def _text_graph(checkpointer: BaseCheckpointSaver[str], deps: ProfileDeps) -> Pr
     return graph.compile(checkpointer=checkpointer)
 
 
+def _extract_graph(checkpointer: BaseCheckpointSaver[str], deps: ProfileDeps) -> ProfileGraph:
+    graph = StateGraph(ProfileState)
+    add_node(graph, check_pdf_node.NAME, check_pdf_node.make_check_pdf(deps))
+    add_llm_node(graph, extract_node.NAME, extract_node.make_extract_profile(deps))
+    add_node(graph, validate_node.NAME, validate_node.make_validate(deps))
+    add_node(graph, draft_node.NAME, draft_node.make_draft(deps))
+    graph.add_edge(START, check_pdf_node.NAME)
+    chain = (check_pdf_node.NAME, extract_node.NAME, validate_node.NAME, draft_node.NAME)
+    for node, next_node in itertools.pairwise(chain):
+        graph.add_conditional_edges(node, _continue_unless_ended(next_node), [next_node, END])
+    graph.add_edge(draft_node.NAME, END)
+    return graph.compile(checkpointer=checkpointer)
+
+
 def build_profile_graphs(checkpointer: BaseCheckpointSaver[str], deps: ProfileDeps) -> ProfileGraphs:
     """The profile graphs over the process-wide `deps`, compiled with `checkpointer` (once per process)."""
-    return ProfileGraphs(text=_text_graph(checkpointer, deps))
+    return ProfileGraphs(text=_text_graph(checkpointer, deps), extract=_extract_graph(checkpointer, deps))

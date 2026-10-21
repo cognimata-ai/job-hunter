@@ -28,6 +28,9 @@ Deviation 24); one already `billed` or `not_billed` is left alone (`llm_settle_d
 no metric: it returns the figures (`SettleFigures`), and the gateway records them after its transaction has
 committed (`record_settlement_metrics`), so a rolled-back settlement is never counted.
 
+**Receipts** (`receipts`, plan Task 13, Deviation 26): the newest `completed` call of each logical call of an
+operation, which a resumed or reclaimed execution reuses instead of paying again (§9.1).
+
 **Reconcilers.** `llm_ledger_unsettled` (tick, plan Deviation 5) fails the `eval_runs` abandoned for more than
 an hour, releases `reserved` entries older than 15 minutes whose recorded owner no longer holds, and marks
 online `dispatched` entries `ambiguous` once older than `max(15 min, deadline_s + 5 min)` (plan Deviation 24),
@@ -848,6 +851,43 @@ async def _raise_bound_violated(conn: AsyncConnection, entry: _Entry, cost: Deci
             "settled_usd": str(cost),
         },
     )
+
+
+# ---- receipts of an operation's calls (§9.1; plan Task 13, Deviation 26) ----------------------------------
+
+# The newest `completed` call per `logical_call_no` of one operation and purpose. The operation is matched by
+# the id `OperationOwner.durable()` writes into `input_refs["owner"]`, never by a second key.
+_RECEIPTS = q(
+    "SELECT DISTINCT ON (logical_call_no) logical_call_no, id, output_json, error_code FROM llm_calls "
+    "WHERE input_refs -> 'owner' ->> 'kind' = 'operation' "
+    "AND (input_refs -> 'owner' ->> 'id')::bigint = :operation_id "
+    "AND purpose = :purpose AND status = 'completed' AND logical_call_no IS NOT NULL "
+    "ORDER BY logical_call_no, id DESC"
+)
+
+
+@dataclass(frozen=True)
+class Receipt:
+    """The newest `completed` call of one logical call: its parsed output (`output_json`), or the code of why
+    it has none (`error_code`: `invalid_output`, `refused`, `max_tokens_first_stage`, `max_tokens`,
+    `unexpected_stop_reason`, `model_mismatch`)."""
+
+    llm_call_id: int
+    output_json: JSONValue | None
+    error_code: str | None
+
+
+async def receipts(conn: AsyncConnection, *, operation_id: int, purpose: Purpose) -> dict[int, Receipt]:
+    """The receipts of operation `operation_id`'s `purpose` calls, by `logical_call_no` (§9.1): the newest
+    `completed` call of each. A node reads them under its owner lock, before it pays for a call again. Calls
+    that did not complete (an error response, a lost stream, a released try) are no receipts."""
+    rows = await conn.execute(_RECEIPTS, {"operation_id": operation_id, "purpose": purpose})
+    return {
+        int(row.logical_call_no): Receipt(
+            llm_call_id=int(row.id), output_json=row.output_json, error_code=row.error_code
+        )
+        for row in rows
+    }
 
 
 # ---- the counters recomputed from the ledger (§7.11, §6.9.1) ----------------------------------------------
