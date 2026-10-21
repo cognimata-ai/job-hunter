@@ -46,6 +46,8 @@ SEPARATORS = [
     *["\N{EN DASH}", " \N{EN DASH} ", "\N{EM DASH}"],
 ]
 BREAKS = ["\n", " \n", "\n ", "\r\n", "\r\n "]
+# The separators without a dash: after a year-like group they make it part of a number, not a year range.
+PLAIN_SEPARATORS = {" ", "/", ".", " / ", ") ", " (", "\xa0", "\N{NARROW NO-BREAK SPACE}"}
 
 
 def digits_in(text: str) -> int:
@@ -83,12 +85,14 @@ def phones(*, allow_break: bool = True) -> st.SearchStrategy[str]:
         joints = [draw(st.sampled_from(SEPARATORS)) for _ in groups]
         if allow_break and draw(st.booleans()):
             # A break may stand before group k when the line before it holds too few digits and the line after
-            # it does not start with a year (a short number never takes in a year range).
+            # it does not start a year range (a short number never takes in `2019 - 2022`): a year-like group
+            # is allowed there when more digits follow it with no dash between (`+49 30` / `2012 3456`).
             before_digits = digits_in(head)
             allowed = []
             for k, group in enumerate(groups):
                 year_like = len(group) == 4 and group[:2] in {"19", "20"}
-                if before_digits < enough and not year_like:
+                digits_follow = k + 1 < len(groups) and joints[k + 1] in PLAIN_SEPARATORS
+                if before_digits < enough and (not year_like or digits_follow):
                     allowed.append(k)
                 before_digits += len(group)
             if allowed:
@@ -159,6 +163,10 @@ FRAGMENTS = [
     *["(01.02.1990)", "(ledig)", "(TT.MM.JJJJ)", "(deutsch)", "Geburtsdatum-Ort:", "Geburtsort-Datum:"],
     *["Leiter Controlling\n", "Leiterin Finanzen\n", "Kaufmann für Büromanagement\n", "Max Kaufmann"],
     *["Am Spring 5", "Spring 5", "0-306-40615-2", "0 30 / 231 254 56"],
+    *["Technischer Leiter\n", "Peter Leiter\n", "IT Leiter\n", "Stellv. Leiter\n", "Geprüfte Kauffrau\n"],
+    *["Evin Mustermann", "Heimweg 5", "Bildungsweg 2", "im Spring 5", "Im Monitoring 24/7", "zur "],
+    *["Geschlecht (M / W / D)\n", "(m/w/d)", "+49 30\n2012 3456", "0815\n2019 - 2022", "2019 bis heute"],
+    *["Kinder\n030 2312\n54563 Berlin", "https://example.org/a\u2013geb.a@b.de: Religion", "\u2013"],
     *"Familienstand ledig Kinder Children Gender Nationalität [EMAIL] [PHONE] [NAME] [PERSONAL]".split(),
     *"max.mustermann@example.org erika@mail.example.org ß ä Ö x Q9 0 00 +".split(),
     *[" ", " ", " ", "\n", "\n", "\n\n", "\t", "\r\n", "\u00a0"],
@@ -259,6 +267,25 @@ def test_restoring_every_replacement_gives_the_original(text: str) -> None:
     assert all((r.start, r.end) in personal for r in final.replacements)
     if not final.replacements:
         assert final.stripped_text == text
+
+
+@settings(max_examples=500, deadline=None)
+@given(st.one_of(documents, tables))
+def test_restoring_a_personal_replacement_reveals_nothing_the_other_rules_find_in_it(text: str) -> None:
+    """A personal span takes in the rest of its line; once it is restored, every letter and digit that the
+    other rules claim in it (also a claim that runs past it, or into a replacement that stays) is still
+    replaced."""
+    base = strip_contacts(text)
+    others = contacts._detect(text, with_name=True, with_personal=False)
+    for i, personal in enumerate(base.replacements):
+        if personal.category != "personal":
+            continue
+        back = restore(text, base, i)
+        covered = {p for r in back.replacements for p in range(r.start, r.end)}
+        for claim in others:
+            if claim.start < personal.end and personal.start < claim.end:
+                clear = [p for p in range(claim.start, claim.end) if text[p].isalnum() and p not in covered]
+                assert not clear, (claim, back.stripped_text)
 
 
 @settings(max_examples=500, deadline=None)

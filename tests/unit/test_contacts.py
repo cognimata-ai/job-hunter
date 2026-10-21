@@ -14,6 +14,7 @@ import sys
 import time
 from dataclasses import replace
 from typing import Any, get_args
+from unittest.mock import patch
 
 import pytest
 from jobhunter.profile import contacts
@@ -775,6 +776,123 @@ def test_a_claim_that_ends_in_a_word_does_not_hide_what_follows_it() -> None:
         assert strip_contacts(once).stripped_text == once
 
 
+@pytest.mark.parametrize(
+    ("text", "stripped"),
+    [
+        ("+49 30 2312 5456" * 7 + "www.example.org", "[PHONE]" * 7 + "[URL]"),
+        ("+49 30\n2012 3456" * 3 + "www.example.org", "[PHONE]" * 3 + "[URL]"),
+        ("+49 30 23125456" * 9 + "Geburtsdatum: 01.02.1990", "[PHONE]" * 9 + "[PERSONAL]"),
+    ],
+)
+def test_a_run_of_glued_phone_numbers_is_stripped_in_one_pass(text: str, stripped: str) -> None:
+    # Each number ends in a digit, which kept the next one's lookbehind from matching: a number that starts
+    # where the previous one ended is a number (a second pass reads a token there), so no number of the run is
+    # left for a second pass, however long the run is.
+    with patch.object(contacts, "_MAX_ROUNDS", 3):
+        assert strip_contacts(text).stripped_text == stripped
+    assert strip_contacts(text).stripped_text == stripped
+    assert strip_contacts(stripped).stripped_text == stripped
+
+
+@pytest.mark.parametrize(
+    ("text", "stripped"),
+    [
+        # The value cell below a label holds the first line of a number that goes on below it.
+        ("Geschlecht (M/W/D)\n\nTel. +49 30\n2012 3456\nSkills", "[PERSONAL]\nSkills"),
+        ("Familienstand\n\nKontakt: +49 30\n1234 5678\nSkills", "[PERSONAL]\nSkills"),
+        # ... and the rest of the line the number joined to the label's line.
+        ("Geburtsort: Tel. 030 23\n2019 456 Berlin\nSkills", "[PERSONAL]\nSkills"),
+        # ... also when the number is glued to what stands before it in the cell.
+        ("Geburtsort / Kinder\nmax@example.org+49 30\n2019 1234\nSkills", "[PERSONAL]\nSkills"),
+        # A postal code or an e-mail address that starts in the rest keeps its own claim.
+        ("Kinder\n030 2312\n54563 Berlin\nSkills", "[PERSONAL]\n[ADDRESS]\nSkills"),
+        ("Kinder\n030 2312\n5456@example.org\nSkills", "[PERSONAL]\n[EMAIL]\nSkills"),
+        # A "city" on the next line (the postal rule allows a line break) is no reason to stop; here it is
+        # a label.
+        ("Kinder\n030 231\n25456\n\nReligion ledig", "[PERSONAL]\n\n[PERSONAL]"),
+        # ... and so is a "city" that is a label on the same line.
+        ("Familienstand\ndeutsch 030 231\n25456 Geburtsort: Musterstadt", "[PERSONAL]"),
+        # A complete number in the cell does not take in the next line.
+        ("Familienstand\n030 23125456\n2019 Erfahrung", "[PERSONAL]\n2019 Erfahrung"),
+    ],
+)
+def test_a_personal_span_takes_the_rest_of_a_number_that_runs_out_of_it(text: str, stripped: str) -> None:
+    r = strip_contacts(text)
+    assert r.stripped_text == stripped
+    assert strip_contacts(stripped).stripped_text == stripped
+
+
+@pytest.mark.parametrize(
+    ("text", "stripped"),
+    [
+        # A word that is no street does not hide a street that starts in it.
+        ("Karriereweg 3-Heimweg 4", "Karriereweg [ADDRESS]"),
+        ("Clustering 3Musterstraße 12", "Clustering [ADDRESS]"),
+        ("Erster Platz 1Musterweg 5", "Erster Platz [ADDRESS]"),
+        # A `+` number may follow a digit, a number with a leading 0 may not.
+        ("2019 - 2022+49 30 23125456", "2019 - 2022[PHONE]"),
+        ("Bordering 2+44 20 7946 0958", "Bordering 2[PHONE]"),
+        ("DE89370400440532013000", "DE89370400440532013000"),
+        ("Kennung 1203023125456", "Kennung 1203023125456"),
+        # A postal code right before a street belongs to the street's replacement.
+        ("01067 Am Spring 5", "[ADDRESS]"),
+        ("Wohnort: 10115 Musterstraße 12", "Wohnort: [ADDRESS]"),
+        # A year glued to a URL or a label ends a range of years, as a blank would (glued table cells).
+        ("2019 - 2022www.example.org", "2019 - 2022[URL]"),
+        ("2019 \u2013 2022linkedin.com/in/max-mustermann", "2019 \u2013 2022[URL]"),
+        ("2019 - 2022Geburtsdatum: 01.02.1990", "2019 - 2022[PERSONAL]"),
+        ("2019 - 2022Berliner Allee 14-16", "2019 - 2022[ADDRESS]"),
+        # ... a year only, not any digit: an e-mail domain or a longer number keeps its boundary.
+        ("max@2www.example.org", "[EMAIL]"),
+        ("Kennung 12022www.example.org", "Kennung 12022www.example.org"),
+        # ... and no label after a year when an e-mail address goes on from it: it is one address.
+        ("2019 - 2022geb.a@b.de", "2019 - [EMAIL]"),
+        ("01.02.1990dob@example.org", "[EMAIL]"),
+        # A URL that runs into a glued e-mail address or phone number ends before it.
+        ("github.com/maxmustermann/geb.a@b.de", "[URL]/[EMAIL]"),
+        ("https://example.org/a\u2013+49 30 23125456", "[URL][PHONE]"),
+        ("linkedin.com/in/max-mustermann-030 23125456", "[URL][PHONE]"),
+        ("linkedin.com/in/max-mustermann-12345 und mehr", "[URL] und mehr"),
+    ],
+)
+def test_what_a_false_positive_fix_leaves_in_place_does_not_hide_a_glued_contact(
+    text: str, stripped: str
+) -> None:
+    assert strip_contacts(text).stripped_text == stripped
+    assert strip_contacts(stripped).stripped_text == stripped
+
+
+@pytest.mark.parametrize(
+    ("text", "stripped"),
+    [
+        # A number whose last group starts a postal code and its city ends before it when it is complete
+        # without it.
+        ("Tel. 0 30 / 231 254 56 10115 Berlin", "Tel. [PHONE] [ADDRESS]"),
+        ("Tel. 030 23125456 10115 Berlin", "Tel. [PHONE] [ADDRESS]"),
+        # A second number in one match that is short on its line goes on below; a complete one does not.
+        ("Tel. (0)30 23125456 030 231\n25456", "Tel. [PHONE]"),
+        ("Tel. 030 23125456 / 0171 23\n12345 neue Kunden", "Tel. [PHONE] neue Kunden"),
+        ("Tel. 030 23125456 / 0171 2345678\n2019 Erfahrung", "Tel. [PHONE]\n2019 Erfahrung"),
+        ("Tel. 030 23125456\n2019 1234", "Tel. [PHONE]\n2019 1234"),
+        # A line that starts with 0 is a number of its own, not the rest of a group of the number above.
+        ("Tel. +44 20 7946 0958\n030 231\n25456", "Tel. [PHONE]\n[PHONE]"),
+        # The line a number goes on to may end in a number that goes on in turn.
+        ("Tel. 030/2312545\u2013030 231\n25456 030 23\n2019 456", "Tel. [PHONE]"),
+        # More groups than one match holds: a run of numbers glued by blanks is one number, none left behind.
+        ("Tel. 0 30 / 231 254 56 0171 123 0 30 / 231 254 56", "Tel. [PHONE]"),
+        # A next line that starts with 0 but is too short to be a number of its own is the rest of the second.
+        ("Tel. (0)30 23125456.01067\n0171 123", "Tel. [PHONE]"),
+        # A line of digits holds no number inside a digit run (`2012 3456` is no `012 3456`).
+        ("Tel. +49 30\n2012 3456\n0 1 2 3 4 5 6 7-030 23125456", "Tel. [PHONE]\n0 1 2 3 4 5 6 7-[PHONE]"),
+    ],
+)
+def test_a_number_next_to_a_postal_code_or_a_second_number_leaves_neither_half(
+    text: str, stripped: str
+) -> None:
+    assert strip_contacts(text).stripped_text == stripped
+    assert strip_contacts(stripped).stripped_text == stripped
+
+
 def test_a_text_with_windows_line_breaks_is_stripped_as_well() -> None:
     crlf = CV.replace("\n", "\r\n")
     r = strip_contacts(crlf)
@@ -876,11 +994,22 @@ def test_a_year_range_on_the_next_line_is_no_part_of_a_short_number() -> None:
         "Projekt 0815\n2019 - 2022 Senior Engineer\n",
         "Projekt 0815\n1999 bis 2004 Entwickler\n",
         "Tel. 030 231\n2022 - heute\n",
+        "Projekt 0815\n2019\u20132022\n",
+        "Projekt 0815\n2019 Senior Engineer\n",
+        "Projekt 0815\n2020 \u2013 today\n",
+        "Projekt 0815\n2021 - present\n",
     ):
         assert strip_contacts(text).stripped_text == text, text
     # Digits that are no year still join.
     assert strip_contacts("Tel. 030 231\n25456").stripped_text == "Tel. [PHONE]"
     assert strip_contacts("Tel. 030 23\n1254 56").stripped_text == "Tel. [PHONE]"
+    # A year-like group that more digits follow is part of the number (Berlin has 030 20xx exchanges).
+    for text in ("Tel. +49 30\n2012 3456", "Tel. +49 30\n2019 1234", "Tel. 030 23\n2019 456"):
+        r = strip_contacts(text)
+        assert r.stripped_text == "Tel. [PHONE]", text
+        assert r.report["phone"] == 1
+    # A year alone on its line is no year range either.
+    assert strip_contacts("Projekt 0815\n2019\nSenior").stripped_text == "Projekt [PHONE]\nSenior"
 
 
 def test_a_house_number_is_not_the_start_of_a_version_or_a_decimal() -> None:
@@ -964,7 +1093,28 @@ def test_a_long_run_of_labels_is_stripped_in_one_pass(text: str) -> None:
 def test_a_label_that_starts_where_the_cut_of_the_previous_one_ended_is_a_label() -> None:
     text = ("geb." + "1" * 97) * 12
     once = strip_contacts(text).stripped_text
-    assert once == "[PERSONAL]" * 3  # three cuts of 404 characters, each one a label of its own
+    # Each cut runs on to the next label and stops there: four spans of 303 characters, each a label of its
+    # own.
+    assert once == "[PERSONAL]" * 4
+    assert [r.end - r.start for r in strip_contacts(text).replacements] == [303] * 4
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Familienstand: " + "x" * 198 + "geb.01.02.1990 in Musterstadt\nSkills",
+        "Geburtsort\n" + "y" * 200 + "geb.01.02.1990 in Musterstadt\nSkills",
+        "Religion: " + "z" * 199 + "Geburtsort: Musterstadt, Kinder: 2\nSkills",
+    ],
+)
+def test_the_run_on_of_a_cut_stops_at_a_label_that_takes_the_rest_of_its_line(text: str) -> None:
+    # A cut that falls on a label: the run-on to the end of the word stops there, and the label takes the rest
+    # of the line after it, so nothing of the line after the run is left in the clear.
+    r = strip_contacts(text)
+    assert r.stripped_text == "[PERSONAL][PERSONAL]\nSkills"
+    for secret in ("1990", "Musterstadt", "Kinder"):
+        assert secret not in r.stripped_text
+    assert strip_contacts(r.stripped_text).stripped_text == r.stripped_text
 
 
 def test_restoring_a_personal_false_positive_keeps_the_contacts_inside_it_replaced() -> None:
@@ -1043,7 +1193,7 @@ BRACKET_VALUES = [
     ("Max, Geburtsdatum: (01.02.1990)\nSkills", "Max, [PERSONAL]\nSkills"),
     ("Geburtsdatum (01.02.1990)\nSkills\n", "[PERSONAL]\nSkills\n"),  # the next line is no value cell
     ("Nationality (USA)\nSkills\n", "[PERSONAL]\nSkills\n"),  # letters that are no format mask
-    ("Geschlecht (M/F)\nSkills\n", "[PERSONAL]\nSkills\n"),
+    ("Geschlecht (M)\nSkills\n", "[PERSONAL]\nSkills\n"),  # one letter is a value, not a list of options
     ("Familienstand (ledig)\nSkills\n", "[PERSONAL]\nSkills\n"),
 ]
 
@@ -1057,7 +1207,14 @@ def test_a_value_in_brackets_after_a_label_is_a_value_and_takes_no_line_below(
         assert secret not in strip_contacts(text).stripped_text, secret
 
 
-@pytest.mark.parametrize("mask", ["(TT.MM.JJJJ)", "(DD/MM/YYYY)", "(TT/MM/JJ)", "(JJJJ-MM-TT)", "(D.M.YYYY)"])
+@pytest.mark.parametrize(
+    "mask",
+    [
+        *["(TT.MM.JJJJ)", "(DD/MM/YYYY)", "(TT/MM/JJ)", "(JJJJ-MM-TT)", "(D.M.YYYY)"],
+        # An option list of single letters is a hint as well: the value is the cell below it.
+        *["(M / W / D)", "(M/W/D)", "(m/w/d)", "(M/F)", "( M / F / X )"],
+    ],
+)
 def test_only_a_format_mask_is_a_hint_and_the_cell_below_it_is_the_value(mask: str) -> None:
     assert strip_contacts(f"Geburtsdatum {mask}\n01.02.1990\nSkills").stripped_text == "[PERSONAL]\nSkills"
     # No cell below: the label line is claimed, as it was before the hint rule.
@@ -1101,13 +1258,137 @@ def test_a_title_word_that_is_also_a_surname_starts_a_title_line_and_ends_a_name
         assert strip_contacts(f"{name}\nSkills").stripped_text == "[NAME]\nSkills", name
 
 
+ADJECTIVE_TITLES = [
+    ("Technischer Leiter", "Max Mustermann"),
+    ("Kaufmännischer Leiter", "Max Mustermann"),
+    ("Stellvertretender Leiter", "Max Mustermann"),
+    ("Kaufmännische Leiterin", "Erika Musterfrau"),
+    ("Gelernter Kaufmann", "Max Mustermann"),
+    ("Geprüfte Kauffrau", "Erika Musterfrau"),
+    ("Geprüfter Kaufmann im Einzelhandel", "Max Mustermann"),
+    ("Staatlich geprüfter Kaufmann", "Max Mustermann"),
+    ("Diplomierte Kauffrau", "Erika Musterfrau"),
+    ("Selbstständiger Kaufmann", "Max Mustermann"),
+]
+
+
+@pytest.mark.parametrize(("title", "name"), ADJECTIVE_TITLES)
+def test_an_adjective_before_a_surname_like_title_word_makes_the_line_a_title(title: str, name: str) -> None:
+    text = f"{title}\n{name}\nSkills\nGruß, {name}\n"
+    r = strip_contacts(text)
+    assert r.stripped_text == f"{title}\n[NAME]\nSkills\nGruß, [NAME]\n"
+    assert r.report["name"] == 2
+    assert strip_contacts(r.stripped_text).stripped_text == r.stripped_text
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Max Kaufmann", "Erika Leiter", "Peter Leiter", "Walter Kaufmann", "Kevin Leiter", "Justin Kaufmann"],
+)
+def test_a_first_name_before_a_surname_like_title_word_is_a_name(name: str) -> None:
+    r = strip_contacts(f"{name}\nSenior Backend Engineer\nBerlin\nGruß, {name.upper()}\n")
+    assert r.stripped_text == "[NAME]\nSenior Backend Engineer\nBerlin\nGruß, [NAME]\n"
+    assert r.report["name"] == 2
+
+
+@pytest.mark.parametrize(
+    "title", ["IT Leiter", "Diplom Kaufmann", "Ehemaliger Leiter", "Operativer Leiter", "Peter Leiter"]
+)
+def test_a_line_that_may_be_a_title_or_a_name_is_taken_and_the_name_below_it_too(title: str) -> None:
+    # `IT Leiter` reads like `Peter Leiter`: when in doubt it is a name, and the search goes on to the next
+    # line, so the name below a title is never left in the clear.
+    text = f"{title}\nMax Mustermann\nSkills\nGruß, Max Mustermann\n"
+    r = strip_contacts(text)
+    assert r.stripped_text == "[NAME]\n[NAME]\nSkills\nGruß, [NAME]\n"
+    assert r.report["name"] == 3
+    assert strip_contacts(r.stripped_text).stripped_text == r.stripped_text
+    # Each is a replacement of its own, restored on its own.
+    assert restore(text, r, 0).stripped_text == f"{title}\n[NAME]\nSkills\nGruß, [NAME]\n"
+
+
+def test_a_title_line_with_a_surname_like_title_word_that_is_no_name_is_passed_over() -> None:
+    for title in ("Stellv. Leiter", "Kfm. Leiter Vertrieb", "Leiter/in Einkauf", "Bereich: Leiter"):
+        r = strip_contacts(f"{title}\nMax Mustermann\nSkills")
+        assert r.stripped_text == f"{title}\n[NAME]\nSkills", title
+    # It counts towards the three lines passed over.
+    text = "Lebenslauf\nCurriculum Vitae\nProfil\nStellv. Leiter\nErika Musterfrau\n"
+    assert strip_contacts(text).report["name"] == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "stripped"),
+    [
+        # A title or heading line that holds a contact is passed over, and the name below it is found.
+        (
+            "Lebenslauf\nZur Spring 5, Projekt\nMax Mustermann\nSkills",
+            "Lebenslauf\n[ADDRESS], Projekt\n[NAME]\nSkills",
+        ),
+        (
+            "Senior Backend Engineer | max@example.org\nMax Mustermann\nSkills",
+            "Senior Backend Engineer | [EMAIL]\n[NAME]\nSkills",
+        ),
+        # Any other line that holds one ends the search, and a token is no title word (`[PERSONAL]`).
+        ("Tel. 030 23125456\nMax Mustermann\nSkills", "Tel. [PHONE]\nMax Mustermann\nSkills"),
+        ("[PERSONAL][PERSONAL]\nEvin Mustermann\nSkills", "[PERSONAL][PERSONAL]\nEvin Mustermann\nSkills"),
+    ],
+)
+def test_a_title_line_that_holds_a_contact_is_passed_over_and_any_other_ends_the_search(
+    text: str, stripped: str
+) -> None:
+    r = strip_contacts(text)
+    assert r.stripped_text == stripped
+    assert strip_contacts(stripped).stripped_text == stripped
+
+
+def test_the_length_of_a_header_line_does_not_count_claims_so_a_second_pass_reads_it_the_same() -> None:
+    # A claim is as long as its text and its token is shorter: the 120-character cap counts neither (found by
+    # the idempotence property).
+    text = (
+        "MaxMaxMaxMaxMaxMaxwww.example.orgSoftware Engineering 2Software Engineering 2Im Monitoring 24/7"
+        "max.mustermann@example.org\nMax Kaufmann"
+    )
+    once = strip_contacts(text).stripped_text
+    assert once.endswith("[EMAIL]\n[NAME]")
+    assert strip_contacts(once).stripped_text == once
+
+
+def test_the_feminine_form_of_a_title_word_needs_a_stem_of_four_letters() -> None:
+    # `Evin` is no feminine `ev` (a legal form), `Agin` no feminine `ag`.
+    for name in ("Evin Mustermann", "Agin Mustermann", "Lin Mustermann"):
+        assert strip_contacts(f"{name}\nSkills").stripped_text == "[NAME]\nSkills", name
+    for title in ("Architektin", "Softwareentwicklerin", "Seniorin", "Ingenieurin"):
+        assert (
+            strip_contacts(f"{title}\nErika Musterfrau\nSkills").stripped_text == f"{title}\n[NAME]\nSkills"
+        )
+
+
+def test_a_way_that_one_walks_is_a_street_and_a_way_of_life_is_not() -> None:
+    for street in ("Heimweg 5", "Umweg 3", "Rückweg 2", "Fußweg 4", "Kirchweg 7"):
+        r = strip_contacts(f"Adresse: {street}")
+        assert r.stripped_text == "Adresse: [ADDRESS]", street
+    for text in ("Bildungsweg 2", "Lösungsweg 3", "Karriereweg 2", "Ausweg 3", "Berufsweg 2", "Lebensweg 4"):
+        assert strip_contacts(text).stripped_text == text, text
+    assert contacts.NOT_A_STREET >= {"bildungsweg", "lösungsweg", "karriereweg", "ausweg"}
+    assert not contacts.NOT_A_STREET & {"heimweg", "umweg", "rückweg"}
+
+
 def test_spring_is_a_framework_unless_a_german_preposition_makes_it_a_street() -> None:
     for text in ("Spring 5", "Spring 5 und Spring Boot 3", "Mit Spring 5 gebaut", "Kenntnisse: Spring 5"):
         assert strip_contacts(text).stripped_text == text, text
-    for text in ("Am Spring 5", "Im Spring 5", "Zum Spring 5", "Zur Spring 5", "am Spring 5"):
+    for text in ("Am Spring 5", "Im Spring 5", "Zum Spring 5", "Zur Spring 5", "Wohnhaft Am Spring 5"):
         r = strip_contacts(text)
-        assert r.stripped_text == "[ADDRESS]", text
+        assert r.stripped_text.endswith("[ADDRESS]"), text
         assert r.report["address"] == 1
+    # A street name keeps its capital preposition; a lower-case one is a preposition of the sentence.
+    for text in (
+        "am Spring 5",
+        "Erfahrung im Spring 5 Projekt",
+        "Betrieb im Monitoring 24/7",
+        "zum Clustering 3 Knoten",
+        "zur Spring 5 Migration",
+    ):
+        assert strip_contacts(text).stripped_text == text, text
+    assert strip_contacts("Im Monitoring 24/7").stripped_text == "[ADDRESS]"  # `24/7` reads as `4/2`
     assert (
         strip_contacts("Wohnhaft: Im Spring 5, 10115 Berlin").stripped_text
         == "Wohnhaft: [ADDRESS], [ADDRESS]"
@@ -1129,7 +1410,8 @@ def test_a_restored_personal_span_that_is_one_contact_keeps_that_contact_replace
 def test_a_restored_personal_span_takes_the_contact_that_runs_past_its_end() -> None:
     text = "Kinder\n030 2312\n5456\nSkills\n"
     base = strip_contacts(text)
-    assert base.stripped_text == "[PERSONAL]\n5456\nSkills\n"
+    # The value cell holds the first line of the number: the personal span takes the rest of it (round 4).
+    assert base.stripped_text == "[PERSONAL]\nSkills\n"
     back = restore(text, base, 0)
     assert back.stripped_text == "Kinder\n[PHONE]\nSkills\n"
     assert (back.report["phone"], back.report["personal"]) == (1, 0)
@@ -1139,6 +1421,41 @@ def test_a_restored_personal_span_takes_the_contact_that_runs_past_its_end() -> 
     a = remove_span(text, back, start, start + 6)
     b = restore(text, remove_span(text, base, start, start + 6), 0)
     assert a == b and apply_edits(text, a.edits) == a
+
+
+@pytest.mark.parametrize(
+    ("text", "restored", "secrets"),
+    [
+        # The number runs into the postal code, which stays replaced: the number is clipped to what is left.
+        ("Kinder\n030 2312\n54563 Berlin", "Kinder\n[PHONE]\n[ADDRESS]", ["030", "2312", "54563"]),
+        # The URL that the personal-less rules find runs over the URL that stays: its rest is replaced.
+        ("https://example.org/a\u2013geb.a@b.de: Religion", "[URL][URL]: Religion", ["a@b.de", "geb."]),
+    ],
+)
+def test_a_claim_that_a_staying_replacement_partly_covers_is_clipped_not_dropped(
+    text: str, restored: str, secrets: list[str]
+) -> None:
+    base = strip_contacts(text)
+    personal = index_of(base, "personal")
+    back = restore(text, base, personal)
+    assert back.stripped_text == restored
+    for secret in secrets:
+        assert secret not in back.stripped_text, secret
+    # Commutation with a removal, and the edit set rebuilds the result.
+    start = text.index("Religion") if "Religion" in text else text.index("Kinder")
+    a = remove_span(text, back, start, start + 3)
+    b = restore(text, remove_span(text, base, start, start + 3), personal)
+    assert a == b
+    assert apply_edits(text, a.edits) == a
+    assert apply_edits(text, back.edits) == back
+    # A clipped part is restored by its span, like any contact inside a restored personal span.
+    inner = next(
+        r for r in back.replacements if (r.start, r.end) not in {(x.start, x.end) for x in base.replacements}
+    )
+    alone = apply_edits(text, replace(back.edits, restored=back.edits.restored | {(inner.start, inner.end)}))
+    assert alone.stripped_text.count("[") == back.stripped_text.count("[") - 1
+    # Stripping stays idempotent on these texts.
+    assert strip_contacts(base.stripped_text).stripped_text == base.stripped_text
 
 
 REGRESSION_CASES = [
@@ -1194,7 +1511,85 @@ REGRESSION_CASES = [
     ("Im Spring 5", "Spring", "address"),
     ("Zum Spring 5", "Spring", "address"),
     ("Musterstraße 12, 10115 Berlin", "Musterstraße", "address"),
+    # round 4: an adjective before a surname-like title word (R1)
+    ("Technischer Leiter\nMax Mustermann", "Mustermann", "name"),
+    ("Kaufmännischer Leiter\nMax Mustermann", "Mustermann", "name"),
+    ("Stellvertretender Leiter\nMax Mustermann", "Mustermann", "name"),
+    ("Kaufmännische Leiterin\nErika Musterfrau", "Musterfrau", "name"),
+    ("Gelernter Kaufmann\nMax Mustermann", "Mustermann", "name"),
+    ("Geprüfte Kauffrau\nErika Musterfrau", "Musterfrau", "name"),
+    ("Geprüfter Kaufmann im Einzelhandel\nMax Mustermann", "Mustermann", "name"),
+    ("Peter Leiter\nSkills", "Leiter", "name"),
+    ("Walter Kaufmann\nSkills", "Kaufmann", "name"),
+    ("Kevin Leiter\nSkills", "Leiter", "name"),
+    ("Justin Kaufmann\nSkills", "Kaufmann", "name"),
+    # ... and the title lines that were passed over at 1381d69 and are no adjective
+    ("IT Leiter\nMax Mustermann", "Mustermann", "name"),
+    ("Diplom Kaufmann\nMax Mustermann", "Mustermann", "name"),
+    ("Stellv. Leiter\nMax Mustermann", "Mustermann", "name"),
+    ("Ehemaliger Leiter\nMax Mustermann", "Mustermann", "name"),
+    # a year-like group that digits follow belongs to the number (R2)
+    ("Tel. +49 30\n2012 3456", "2012 3456", "phone"),
+    ("Tel. +49 30\n2019 1234", "2019 1234", "phone"),
+    ("Tel. 030 23\n2019 456", "2019 456", "phone"),
+    # the feminine `-in` needs a stem of four letters (R3)
+    ("Evin Mustermann\nSkills", "Mustermann", "name"),
+    ("Agin Mustermann\nSkills", "Mustermann", "name"),
+    # a way that one walks is a street (R4)
+    ("Heimweg 5", "Heimweg", "address"),
+    ("Umweg 3", "Umweg", "address"),
+    ("Rückweg 2", "Rückweg", "address"),
+    # the capital preposition of a street name (R5)
+    ("Zur Spring 5", "Spring", "address"),
+    # the base strip of the two restore cases (R6; their restore is tested on its own)
+    ("Kinder\n030 2312\n54563 Berlin", "2312", "personal"),
+    ("Kinder\n030 2312\n54563 Berlin", "54563", "address"),
+    ("https://example.org/a\u2013geb.a@b.de: Religion", "a@b.de", "personal"),
+    # an option list of single letters is a hint, and the value cell below is taken (R7)
+    ("Geschlecht (M / W / D)\nmännlich", "männlich", "personal"),
+    ("Geschlecht (m/w/d)\nweiblich", "weiblich", "personal"),
+    # found by the differential check against 1381d69: the run-on of a cut swallowed a label at the cut
+    ("Familienstand: " + "x" * 198 + "geb.01.02.1990 in Musterstadt", "Musterstadt", "personal"),
+    ("Geburtsort\n" + "y" * 200 + "geb.01.02.1990 in Musterstadt", "Musterstadt", "personal"),
 ]
+
+
+# What the reviews ruled is no contact: the intended false-positive fixes since 1381d69. Each must stay in the
+# stripped text (the differential check of round 4 allows exactly these to be left in the clear).
+MUST_STAY_CASES = [
+    # (text, the part that must stay in the stripped text)
+    ("Projekt 0815\n2019 - 2022 Senior Engineer\n", "Projekt 0815\n2019 - 2022 Senior Engineer\n"),
+    ("Projekt 0815\n1999 bis 2004 Entwickler\n", "Projekt 0815\n1999 bis 2004 Entwickler\n"),
+    ("Tel. 030 231\n2022 - heute\n", "030 231\n2022 - heute"),
+    ("Arbeitsplatz 4.0", "Arbeitsplatz 4.0"),
+    ("Musterweg 4,5 Stunden", "Musterweg 4,5 Stunden"),
+    ("Hauptstraße 5.1 Kapitel", "Hauptstraße 5.1 Kapitel"),
+    ("Clustering 3", "Clustering 3"),
+    ("Software Engineering 2", "Software Engineering 2"),
+    ("Knowledge Sharing 3", "Knowledge Sharing 3"),
+    ("Spring 5 und Spring Boot 3", "Spring 5 und Spring Boot 3"),
+    ("Erfahrung im Spring 5 Projekt", "Erfahrung im Spring 5 Projekt"),
+    ("Betrieb im Monitoring 24/7", "Betrieb im Monitoring 24/7"),
+    ("Nationality-neutral hiring", "Nationality-neutral hiring"),
+    ("Religion-based hiring", "Religion-based hiring"),
+    ("Gender-neutral language", "Gender-neutral language"),
+    ("ISBN 0-306-40615-2", "ISBN 0-306-40615-2"),
+    ("0 - 2019 - 2022", "0 - 2019 - 2022"),
+    ("0 1 2 3 4 5 6 7", "0 1 2 3 4 5 6 7"),
+    ("Zweiter Bildungsweg 2", "Bildungsweg 2"),
+    ("Lösungsweg 3", "Lösungsweg 3"),
+    ("Karriereweg 2", "Karriereweg 2"),
+    ("Ausweg 3", "Ausweg 3"),
+    # a title line with an adjective stays a title, only the name below it is replaced
+    *[(f"{title}\n{name}\nSkills", f"{title}\n") for title, name in ADJECTIVE_TITLES],
+]
+
+
+@pytest.mark.parametrize(("text", "kept"), MUST_STAY_CASES)
+def test_what_the_reviews_named_as_no_contact_stays(text: str, kept: str) -> None:
+    r = strip_contacts(text)
+    assert kept in r.stripped_text, r.stripped_text
+    assert strip_contacts(r.stripped_text).stripped_text == r.stripped_text
 
 
 @pytest.mark.parametrize(("text", "secret", "category"), REGRESSION_CASES)
@@ -1425,6 +1820,19 @@ _ADVERSARIAL = [
     "-" * 200_000,
     ". " * 100_000,
     "(((" * 60_000,
+    # round 4: title lines, year-like groups after a short number, option lists, prepositions, clipping
+    "Peter Leiter\n" * 15_000,
+    "Technischer Leiter\n" * 10_000,
+    "IT Leiter\nMax Mustermann\n" + "max mustermann it leiter " * 8_000,
+    "Stellv. Leiter\n" * 13_000,
+    "0815\n2019 1234\n" * 15_000,
+    "2019 - " * 30_000,
+    "+49 30\n2012 3456\n" * 10_000,
+    "Geschlecht (M / W / D)\n" * 8_000,
+    "Geschlecht " + "(M/" * 60_000,
+    "Im Spring 5 " * 15_000,
+    "Am " * 60_000,
+    "Kinder\n030 2312\n54563 Berlin\n" * 6_000,
 ]
 
 
@@ -1435,3 +1843,20 @@ def test_the_patterns_stay_linear_on_adversarial_input(text: str) -> None:
     scan_value(text)
     assert time.perf_counter() - started < 5.0
     assert isinstance(result.stripped_text, str)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Kinder\n030 2312\n54563 Berlin\n" * 6_000,
+        "https://example.org/a\u2013geb.a@b.de: Religion\n" * 4_000,
+        "Religion: max@example.org, Tel. 030 23125456\n" * 4_000,
+    ],
+    ids=["clipped-phone", "clipped-url", "inner-contacts"],
+)
+def test_restoring_a_personal_span_of_a_long_text_stays_linear(text: str) -> None:
+    base = strip_contacts(text)
+    started = time.perf_counter()
+    back = restore(text, base, index_of(base, "personal"))
+    assert time.perf_counter() - started < 5.0
+    assert len(back.replacements) > len(base.replacements) - 1
