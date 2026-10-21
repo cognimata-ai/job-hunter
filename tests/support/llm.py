@@ -1,20 +1,32 @@
 """LLM test helpers (Task 3; Tasks 4 and 5 extend it): spend owners, reservation arguments, a completed call's
 response fields, the stored month rows, and the settings save of class `budget` that Task 17 will make.
 
+Task 4 adds the transport side: `FakeAnthropic` (the recorded-SSE fake as a test drives it), the autouse
+fixture that gives every test its own fake state, `LocalSSEServer` (a real socket on `127.0.0.1:0`) and
+`synthetic_sse` (a stream in the event shapes V13 recorded).
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
+import asyncio
+import json
 import uuid
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator
+from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Final
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Final, Literal, Self
 
+import httpx2
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.config import AppConfig, load_config
 from jobhunter.db.sql import q
+from jobhunter.llm import fake
 from jobhunter.llm.budget import BudgetParams, BudgetRow, month_of
 from jobhunter.llm.pricing import Usage
 from jobhunter.llm.spend_ledger import (
@@ -25,6 +37,7 @@ from jobhunter.llm.spend_ledger import (
     change_cap,
     ensure_month,
 )
+from jobhunter.llm.transport import make_http_client
 from jobhunter.types import JSONValue, get_object
 from jobhunter.worker import operations as ops
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -283,3 +296,279 @@ async def open_alerts(engine: AsyncEngine, code: str) -> list[tuple[str, str, in
             {"code": code},
         )
         return [(r.dedup_key, r.severity, int(r.occurrences)) for r in rows]
+
+
+# --- Task 4: the recorded-SSE fake, a local SSE server and synthetic streams -------------------------------
+
+# The committed recordings, whatever the cwd.
+FAKE_LLM_DIR: Final = Path(__file__).resolve().parents[1] / "contract/fixtures/anthropic"
+
+
+@pytest.fixture(autouse=True)
+def _fake_llm_state() -> Iterator[fake.FakeLLMState]:
+    """Every test has its own fake LLM state: every try `ok`, no `count_tokens` answer, no request served."""
+    with fake.fresh_state() as state:
+        yield state
+
+
+def fake_llm_config(root: Path, secrets_dir: Path) -> AppConfig:
+    """A worker config in fake LLM mode over the recordings under `root` (no secret files needed)."""
+    env = {
+        "JOBHUNTER_ENV": "test",
+        "JOBHUNTER_DB_NAME": "jobhunter",
+        "JOBHUNTER_FAKE_LLM": "1",
+        "JOBHUNTER_FAKE_LLM_DIR": str(root),
+    }
+    return load_config("worker", env, secrets_dir)
+
+
+class FakeAnthropic:
+    """The recorded-SSE fake as a test drives it: clients in fake mode, the scenario of the test, the
+    `count_tokens` answer, and the message tries the fake received (`served`, `requests`)."""
+
+    def __init__(self, cfg: AppConfig) -> None:
+        if not cfg.fake_llm:
+            raise ValueError("FakeAnthropic needs a config in fake LLM mode")
+        self.cfg = cfg
+
+    @property
+    def root(self) -> Path:
+        return self.cfg.fake_llm_dir
+
+    @property
+    def state(self) -> fake.FakeLLMState:
+        return fake.state()
+
+    @property
+    def served(self) -> int:
+        """Every message try that reached the fake (a `count_tokens` request is none)."""
+        return self.state.served
+
+    @property
+    def requests(self) -> list[fake.ServedRequest]:
+        return self.state.requests
+
+    def client(self, *, read_timeout_s: float = 120.0) -> httpx2.AsyncClient:
+        """A gateway http client on the fake (the caller closes it); `read_timeout_s` as in
+        `make_http_client`."""
+        return make_http_client(self.cfg, read_timeout_s=read_timeout_s)
+
+    def scenario(self, *names: fake.Scenario) -> None:
+        fake.scenario(*names)
+
+    def count_tokens(self, result: int | Literal["error"]) -> None:
+        fake.count_tokens(result)
+
+
+@pytest.fixture
+def fake_anthropic(tmp_path: Path) -> FakeAnthropic:
+    """The fake over the committed recordings (`tests/contract/fixtures/anthropic`)."""
+    return FakeAnthropic(fake_llm_config(FAKE_LLM_DIR, tmp_path / "no-secrets"))
+
+
+_SYNTHETIC_SIGNATURE: Final = "U3ludGhldGljU2lnbmF0dXJlRm9yVGhlVGVzdHNPbmx5" * 2  # key-shaped on purpose
+_SYNTHETIC_USAGE: Final = {
+    "input_tokens": 120,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 60,
+}
+
+
+def synthetic_sse(
+    body: Any,
+    *,
+    model: str,
+    stop_reason: str = "end_turn",
+    usage: dict[str, int] | None = None,
+    thinking: str | None = None,
+    message_id: str = "msg_0123456789synthetic",
+) -> bytes:
+    """A streamed Messages answer whose text is `body` (a JSON value, or a string sent as it is), in the event
+    shapes of the V13 recordings (docs/spikes/V13.md): `message_start` (the message with `container`,
+    `stop_details` and `diagnostics` null, its usage with the `cache_creation` breakdown), one text block
+    (`content_block_start`, a `ping`, two `text_delta`s, `content_block_stop`), `message_delta` with the
+    cumulative usage and `output_tokens_details`, and `message_stop`. Every value is synthetic.
+
+    `thinking` adds a thinking block with a key-shaped signature before the text block. V13 recorded none
+    (effort `low` did not think), so its shape is the SDK's `ThinkingBlock` and `signature_delta`; it exists
+    to test that a recording keeps no thinking."""
+    text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+    totals = {**_SYNTHETIC_USAGE, **(usage or {})}
+    start_usage = {
+        "input_tokens": totals["input_tokens"],
+        "cache_creation_input_tokens": totals["cache_creation_input_tokens"],
+        "cache_read_input_tokens": totals["cache_read_input_tokens"],
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": totals["cache_creation_input_tokens"],
+            "ephemeral_1h_input_tokens": 0,
+        },
+        "output_tokens": 8,
+        "service_tier": "standard",
+        "inference_geo": "global",
+        "speed": "standard",
+    }
+    message: dict[str, Any] = {
+        "model": model,
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "container": None,
+        "stop_reason": None,
+        "stop_sequence": None,
+        "stop_details": None,
+        "usage": start_usage,
+        "diagnostics": None,
+    }
+    events = [fake.SSEEvent("message_start", {"type": "message_start", "message": message})]
+    index = 0
+    if thinking is not None:
+        events += [
+            _block_start(index, {"type": "thinking", "thinking": "", "signature": ""}),
+            _delta(index, {"type": "thinking_delta", "thinking": thinking}),
+            _delta(index, {"type": "signature_delta", "signature": _SYNTHETIC_SIGNATURE}),
+            fake.SSEEvent("content_block_stop", {"type": "content_block_stop", "index": index}),
+        ]
+        index += 1
+    half = len(text) // 2
+    events += [
+        _block_start(index, {"type": "text", "text": ""}),
+        fake.SSEEvent("ping", {"type": "ping"}),
+        _delta(index, {"type": "text_delta", "text": text[:half]}),
+        _delta(index, {"type": "text_delta", "text": text[half:]}),
+        fake.SSEEvent("content_block_stop", {"type": "content_block_stop", "index": index}),
+        fake.SSEEvent(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": None,
+                    "stop_details": None,
+                    "container": None,
+                },
+                "usage": {**totals, "output_tokens_details": {"thinking_tokens": 0}},
+            },
+        ),
+        fake.SSEEvent("message_stop", {"type": "message_stop"}),
+    ]
+    return fake.render_sse(events)
+
+
+def _block_start(index: int, block: dict[str, Any]) -> fake.SSEEvent:
+    return fake.SSEEvent(
+        "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
+    )
+
+
+def _delta(index: int, delta: dict[str, Any]) -> fake.SSEEvent:
+    return fake.SSEEvent(
+        "content_block_delta", {"type": "content_block_delta", "index": index, "delta": delta}
+    )
+
+
+@dataclass(frozen=True)
+class ReceivedRequest:
+    """A request as `LocalSSEServer` read it off its socket; header names are lower-case."""
+
+    method: str
+    path: str
+    headers: dict[str, str]
+    body: bytes = field(repr=False)
+
+
+class _ToLocalServer(httpx2.AsyncBaseTransport):
+    """Sends each request to `127.0.0.1:<port>` over plain HTTP with its headers unchanged, so its `Host` is
+    still the API's; the request's timeouts travel with it."""
+
+    def __init__(self, port: int) -> None:
+        self._port = port
+        self._inner = httpx2.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        url = request.url.copy_with(scheme="http", host="127.0.0.1", port=self._port)
+        forwarded = httpx2.Request(
+            request.method, url, headers=request.headers, stream=request.stream, extensions=request.extensions
+        )
+        return await self._inner.handle_async_request(forwarded)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class LocalSSEServer:
+    """An HTTP/1.1 server on `127.0.0.1:0` that answers every request with `body` as `text/event-stream`.
+
+    `stall_after_first_event` writes the first event and then nothing until the server closes;
+    `stall_before_headers` writes nothing at all. Use it as `async with LocalSSEServer(...) as server`, and
+    reach it with `make_http_client(cfg, mount=server.transport())`.
+    """
+
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        stall_after_first_event: bool = False,
+        stall_before_headers: bool = False,
+    ) -> None:
+        self._body = body
+        self._status = status
+        self._stall_after_first_event = stall_after_first_event
+        self._stall_before_headers = stall_before_headers
+        self.requests: list[ReceivedRequest] = []
+        self.first_event_sent = False
+        self.port = 0
+        self._server: asyncio.Server | None = None
+        self._release = asyncio.Event()
+
+    async def __aenter__(self) -> Self:
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = int(self._server.sockets[0].getsockname()[1])
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        self._release.set()  # every stalled answer ends, so its connection closes
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+    def transport(self) -> httpx2.AsyncBaseTransport:
+        return _ToLocalServer(self.port)
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1").split("\r\n")
+            method, target, _version = head[0].split(" ", 2)
+            headers = {}
+            for line in head[1:]:
+                if line:
+                    name, _, value = line.partition(":")
+                    headers[name.strip().lower()] = value.strip()
+            body = await reader.readexactly(int(headers.get("content-length", "0")))
+            self.requests.append(ReceivedRequest(method, target, headers, body))
+            if self._stall_before_headers:
+                await self._release.wait()
+                return
+            status_line = f"HTTP/1.1 {self._status} X\r\n"
+            writer.write(
+                f"{status_line}content-type: text/event-stream\r\nconnection: close\r\n\r\n".encode()
+            )
+            if self._stall_after_first_event:
+                first, separator, _rest = self._body.partition(b"\n\n")
+                writer.write(first + separator)
+                await writer.drain()
+                self.first_event_sent = True
+                await self._release.wait()
+                return
+            writer.write(self._body)
+            await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            return  # the client went away
+        finally:
+            writer.close()
+            with suppress(ConnectionError):
+                await writer.wait_closed()

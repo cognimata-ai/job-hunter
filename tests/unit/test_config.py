@@ -638,3 +638,29 @@ def test_fake_sources_are_still_refused_in_prod(tmp_path: Path) -> None:
         "fake_mode_in_prod",
         "JOBHUNTER_FAKE_SOURCES must not be set in prod",
     )
+
+
+# --- M2 Task 4: the recorded-SSE fake LLM (`JOBHUNTER_FAKE_LLM`, `JOBHUNTER_FAKE_LLM_DIR`) ------------------
+
+
+@pytest.mark.parametrize("value", ["1", "yes", ""])  # set to anything, the empty string included
+def test_fake_llm_is_set_by_the_variable_being_present(tmp_path: Path, value: str) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_FAKE_LLM": value}
+    assert load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)).fake_llm is True
+
+
+def test_fake_llm_defaults_to_off_and_the_recorded_anthropic_fixtures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg = load_config("worker", BASE_ENV, write_secrets(tmp_path / "s", **WORKER_SECRETS))
+    assert cfg.fake_llm is False
+    assert cfg.fake_llm_dir == (tmp_path / "tests/contract/fixtures/anthropic").resolve()
+    assert cfg.fake_llm_dir.is_absolute()
+
+
+def test_fake_llm_dir_from_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    env = {**BASE_ENV, "JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": "llm-fx"}
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS))
+    assert (cfg.fake_llm, cfg.fake_llm_dir) == (True, (tmp_path / "llm-fx").resolve())

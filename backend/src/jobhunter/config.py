@@ -36,6 +36,8 @@ LANGSMITH_EU_ENDPOINT: Final = "https://eu.api.smith.langchain.com"
 DEFAULT_FIXTURES_DIR: Final = Path("tests/contract/fixtures")
 DEFAULT_EMBEDDER_URL: Final = "http://embedder:8080"
 DEFAULT_HTTP_USER_AGENT: Final = "JobHunter/1.0 (personal job search)"
+# M2 (plan Task 4): the recorded Anthropic streams served in fake LLM mode.
+DEFAULT_FAKE_LLM_DIR: Final = Path("tests/contract/fixtures/anthropic")
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
@@ -125,6 +127,10 @@ class AppConfig:
     # `fixtures_dir` (dev and test only; `fake_mode_in_prod` refuses it in prod).
     fake_sources: bool
     fixtures_dir: Path
+    # `JOBHUNTER_FAKE_LLM` set to anything (the empty string included): every Claude call is served by the
+    # recorded-SSE fake transport from `fake_llm_dir` (`llm/fake.py`; dev and test only, refused in prod).
+    fake_llm: bool
+    fake_llm_dir: Path
     embedder_url: str
     http_user_agent: str
     # Neither mapping appears in repr(): a config that is logged or shown in a traceback must not leak.
@@ -230,6 +236,8 @@ def load_config(
         fake_sources="JOBHUNTER_FAKE_SOURCES" in env,
         # A relative directory (the default included) is resolved from the current directory.
         fixtures_dir=Path(env.get("JOBHUNTER_FIXTURES_DIR") or DEFAULT_FIXTURES_DIR).resolve(),
+        fake_llm="JOBHUNTER_FAKE_LLM" in env,
+        fake_llm_dir=Path(env.get("JOBHUNTER_FAKE_LLM_DIR") or DEFAULT_FAKE_LLM_DIR).resolve(),
         embedder_url=env.get("JOBHUNTER_EMBEDDER_URL") or DEFAULT_EMBEDDER_URL,
         http_user_agent=env.get("JOBHUNTER_HTTP_USER_AGENT") or DEFAULT_HTTP_USER_AGENT,
         secrets=MappingProxyType(contents),
