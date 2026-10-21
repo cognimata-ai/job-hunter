@@ -609,6 +609,7 @@ print(json.dumps({
     },
     "sweeps": sorted(sys.modules["jobhunter.worker.epoch"]._SWEEPS),
     "handlers": sorted(sys.modules["jobhunter.worker.operations"].HANDLERS),
+    "failure_hooks": sorted(sys.modules["jobhunter.worker.operations"].FAILURE_HOOKS),
     "main_imported": "jobhunter.worker.main" in sys.modules,
 }))
 """
@@ -635,12 +636,14 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
     (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
     anyway), the registries hold exactly the M1 and M2 reconcilers with their cadences, the two takeover
-    sweeps and the `extract_profile_text` (Task 11) and `watchlist_validate` handlers."""
+    sweeps, the `extract_profile_text` (Task 11) and `watchlist_validate` handlers, and the failure hook of
+    `extract_profile_text`."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
         "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS},
         "sweeps": ["operations", "runs"],
         "handlers": ["extract_profile_text", "watchlist_validate"],
+        "failure_hooks": ["extract_profile_text"],
         "main_imported": False,
     }

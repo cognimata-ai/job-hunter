@@ -83,6 +83,11 @@ _CONTENT_LOGGERS = ("anthropic", "httpx2", "httpcore2")
 # and a CV upload's body is a CV (M2 Task 9). It logs nothing above WARNING, so it is held at ERROR; the
 # upload route logs that a form was refused, with its status and code.
 _BODY_QUOTING_LOGGERS = ("python_multipart",)
+# LangGraph logs a node's retry at INFO as `f"Retrying task … after {cls} {exc}"`, with the error's traceback:
+# a retried database error's text quotes its SQL and bound values (posting content, CV text) unless the
+# engine hides them. It is held at WARNING (M2 Task 11 fix round 1); its one warning, a failed timeout
+# observer, still passes.
+_ERROR_QUOTING_LOGGERS = ("langgraph.pregel._retry",)
 # The format of the root handler `logging.basicConfig` adds when the SDK is imported with `ANTHROPIC_LOG` set
 # and the root logger has no handler yet (anthropic 1.15.0 `_utils/_logs.py`): it writes records unredacted.
 _SDK_BASIC_CONFIG_FORMAT = "[%(asctime)s - %(name)s:%(lineno)d - %(levelname)s] %(message)s"
@@ -113,12 +118,12 @@ def _no_library_content(record: logging.LogRecord) -> bool:
 
 
 def quiet_library_loggers() -> None:
-    """Hold the `_QUIET_LOGGERS` and `_CONTENT_LOGGERS` at WARNING, the latter with no handler of their own
-    (so their records reach the app's redacting handler only), and the `_BODY_QUOTING_LOGGERS` at ERROR; and
-    remove the unredacted root handler that the SDK's import may have added. `configure_logging` calls it,
-    and so does `llm/transport.py` right after it imports the SDK, which may set its levels again at that
-    import."""
-    for name in (*_QUIET_LOGGERS, *_CONTENT_LOGGERS):
+    """Hold the `_QUIET_LOGGERS`, `_CONTENT_LOGGERS` and `_ERROR_QUOTING_LOGGERS` at WARNING, the content
+    loggers with no handler of their own (so their records reach the app's redacting handler only), and the
+    `_BODY_QUOTING_LOGGERS` at ERROR; and remove the unredacted root handler that the SDK's import may have
+    added. `configure_logging` calls it, and so does `llm/transport.py` right after it imports the SDK, which
+    may set its levels again at that import."""
+    for name in (*_QUIET_LOGGERS, *_CONTENT_LOGGERS, *_ERROR_QUOTING_LOGGERS):
         logging.getLogger(name).setLevel(logging.WARNING)
     for name in _BODY_QUOTING_LOGGERS:
         logging.getLogger(name).setLevel(logging.ERROR)

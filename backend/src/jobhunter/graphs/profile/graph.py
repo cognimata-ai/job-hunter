@@ -7,8 +7,9 @@ fields
 `extract` (`check_pdf → extract_profile → validate → draft → END`) and `propose` (`propose_queries → END`)
 with their nodes; no graph exists here before its nodes do.
 
-**The invoke shape** (§9.1). A handler invokes its graph with `config={"configurable": {"thread_id":
-thread_id(…), "op": ctx}, "recursion_limit": RECURSION_LIMIT}` and `durability="sync"`. LangGraph never
+**The invoke shape** (§9.1). A handler invokes its graph with `invoke_config(kind, subject_id, ctx)`,
+`{"configurable": {"thread_id": thread_id(…), "op": ctx}, "recursion_limit": RECURSION_LIMIT,
+"max_concurrency": MAX_CONCURRENCY}`, and `durability="sync"`. LangGraph never
 checkpoints `configurable` (it copies only its string and number values into a checkpoint's metadata, and the
 context is neither), so a node reads its execution, the claim, `finish_in`, `requeue_in` and the worker's
 `OperationDeps`, from `config["configurable"]["op"]` (`nodes.execution`), never from the state.
@@ -66,11 +67,14 @@ from jobhunter.graphs.profile.state import ProfileState as ProfileState
 from jobhunter.graphs.profile.state import ProfileUpdate
 from jobhunter.llm.errors import LLMError
 from jobhunter.profile.errors import UploadRejected
+from jobhunter.worker.operations import OperationContext
 
 type ProfileGraph = CompiledStateGraph[ProfileState, None, ProfileState, ProfileState]
 type ThreadKind = Literal["t", "p", "q"]
 
 RECURSION_LIMIT: Final = 200  # §9.1
+# §9.1's `max_concurrency`: every profile graph is a chain, one node at a time.
+MAX_CONCURRENCY: Final = 1
 # The §9.1 timeout of each node without an LLM call.
 NODE_TIMEOUTS: Final[Mapping[str, timedelta]] = MappingProxyType(
     {parse_node.NAME: parse_node.NODE_TIMEOUT, strip_node.NAME: strip_node.NODE_TIMEOUT}
@@ -97,6 +101,19 @@ def thread_id(kind: ThreadKind, subject_id: int, operation_id: int, attempts: in
     """The checkpoint thread of one execution (module docstring): the subject is the draft (`t`, `p`) or the
     proposal (`q`); `operation_id` and `attempts` are the claim's."""
     return f"{_THREAD_PREFIX[kind]}-{subject_id}-{kind}{operation_id}-a{attempts}"
+
+
+def invoke_config(kind: ThreadKind, subject_id: int, op: OperationContext) -> RunnableConfig:
+    """The §9.1 invoke config of execution `op` on its own thread (module docstring)."""
+    claim = op.claim
+    return {
+        "configurable": {
+            "thread_id": thread_id(kind, subject_id, claim.operation_id, claim.attempts),
+            "op": op,
+        },
+        "recursion_limit": RECURSION_LIMIT,
+        "max_concurrency": MAX_CONCURRENCY,
+    }
 
 
 def sanitized(name: str, node: Node) -> Node:

@@ -123,6 +123,7 @@ def make_parse(deps: ProfileDeps) -> Node:
             await conn.execute(_STORE_TEXT, params)
         log.info(
             "profile_text_extracted",
+            operation_id=op.claim.operation_id,
             draft_id=draft_id,
             method=extracted.method,
             page_count=extracted.page_count,

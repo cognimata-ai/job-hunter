@@ -33,8 +33,16 @@ from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_p
 from tests.support.procs import ProcessGroup, wait_until
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
-# `configure_logging` also holds these (`observability/logging._CONTENT_LOGGERS`, `_BODY_QUOTING_LOGGERS`).
-_LIBRARY_LOGGERS = (*_QUIET_LOGGERS, "anthropic", "httpx2", "httpcore2", "python_multipart")
+# `configure_logging` also holds these (`observability/logging._CONTENT_LOGGERS`, `_BODY_QUOTING_LOGGERS`,
+# `_ERROR_QUOTING_LOGGERS`).
+_LIBRARY_LOGGERS = (
+    *_QUIET_LOGGERS,
+    "anthropic",
+    "httpx2",
+    "httpcore2",
+    "python_multipart",
+    "langgraph.pregel._retry",
+)
 # Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
 # configuration chain, `active_config`, `ranking_state` and `sources` are kept (`reset_database` restores the
 # first three to their seeded state), `schedule_state` is reset (below), and so is `checkpoint_migrations`:

@@ -23,12 +23,14 @@ from jobhunter.graphs.profile.nodes import strip_contacts as strip_node
 from jobhunter.graphs.profile.nodes.parse import LOW_TEXT_CHARS
 from jobhunter.llm.errors import Refused
 from jobhunter.profile.contacts import strip_contacts
+from jobhunter.profile.operations import text_phase_failed
 from jobhunter.profile.upload import request_draft_operation
 from jobhunter.types import JSONValue
 from jobhunter.worker import operations as ops
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.collect import ctx as collect_ctx
 from tests.support.faults import PausePoint
 from tests.support.fixtures import count_rows
 from tests.support.llm import reclaim_stale_now
@@ -585,3 +587,91 @@ async def test_a_failed_finish_runs_the_hook_and_a_succeeded_one_does_not(
         assert claim is not None and claim.attempts == 0
         await ops.finish_operation(conn, claim, status="succeeded")
     assert len(hook.calls) == 1
+
+
+# --- fix round 1 ------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_class"),
+    [({}, "KeyError"), ({"draft_id": "7"}, "TypeError"), ({"draft_id": 2**70}, "OutOfRange")],
+    ids=["no_draft_id", "not_an_int", "out_of_bigint_range"],
+)
+async def test_a_malformed_payload_never_fails_the_tick_that_runs_the_hook(
+    engine, queue_app, current_epoch, log_events, payload, error_class
+) -> None:
+    """The hook runs inside `_release`: a payload it cannot read must not abort the reconcile tick (or the
+    takeover). The operation still ends `failed`, and the hook logs the id and an error class only."""
+    assert ops.FAILURE_HOOKS["extract_profile_text"] is text_phase_failed
+    async with engine.begin() as conn:
+        op_id, _ = await ops.create_operation(
+            conn,
+            kind="extract_profile_text",
+            payload=payload,
+            dedup_key="extract_profile_text:bad",
+            defer=None,
+        )
+        await conn.execute(sa.text("UPDATE operations SET attempts = 9 WHERE id = :i"), {"i": op_id})
+        assert await ops.claim_operation(conn, op_id, epoch=current_epoch) is not None
+    later = utcnow() + ops.OPERATION_STALE + timedelta(seconds=1)
+    # the whole `operations` cadence of a tick: its reclaim exhausts the operation and runs the hook
+    assert await ops.reconcile_operations(collect_ctx(engine, queue_app, now=later, epoch=current_epoch)) == 1
+    op = await op_row(engine, op_id)
+    assert (op.status, op.last_error_code) == ("failed", "attempts_exhausted")
+    [invalid] = events_named(log_events, "profile_hook_payload_invalid")
+    assert (invalid["operation_id"], invalid["error_class"]) == (op_id, error_class)
+
+
+@pytest.mark.parametrize("second", ["finish_in", "requeue_in"])
+async def test_a_second_end_in_one_transaction_fails_closed(
+    engine, current_epoch, monkeypatch, log_events, second
+) -> None:
+    """A second handler-side end in the transaction of the first is `FencedOut`: the transaction rolls back
+    with both (no partial write: neither the `failed` end nor its alert), and the execution is lost, so
+    `execute_operation` writes nothing either; the operation keeps its claim until a reclaim."""
+
+    async def twice(ctx: ops.OperationContext) -> None:
+        async with ctx.engine.begin() as conn:
+            await ops.lock_operation_owner(conn, ctx.claim)
+            await ctx.finish_in(conn, status="failed", error_code="test_failure")
+            if second == "finish_in":
+                await ctx.finish_in(conn, status="succeeded")
+            else:
+                await ctx.requeue_in(conn, error_code="test_wait", not_before=utcnow())
+
+    monkeypatch.setitem(ops.HANDLERS, "export", twice)
+    op_id = await _create(engine)
+    await ops.execute_operation(engine, op_id, epoch=current_epoch)
+    op = await op_row(engine, op_id)
+    assert (op.status, op.attempts, op.last_error_code) == ("running", 0, None) and op.claim_id is not None
+    assert await count_rows(engine, "alerts", code="operation.failed") == 0
+    assert len(events_named(log_events, "execution_lost")) == 1
+    for event in ("operation_finished", "operation_requeued", "operation_fenced", "operation_handler_failed"):
+        assert events_named(log_events, event) == [], event
+
+
+async def test_a_crash_right_after_the_text_review_commit_writes_nothing_more(
+    engine, op_runner, upload, monkeypatch, log_events
+) -> None:
+    """A raising fault (not a pause) right after the `text_review` commit: the handler raises, its `bug`
+    requeue finds the operation ended (`operation_fenced`) and writes nothing; it stays `succeeded`."""
+
+    async def raising(name: str) -> None:
+        if name == "profile.text.after_text_review_commit":
+            raise RuntimeError("a crash right after the commit")
+
+    monkeypatch.setattr(strip_node, "afault_point", raising)
+    draft_id = await upload(TWO_PAGE_PDF)
+    [op_id] = await op_runner.run_pending()
+    op = await op_row(engine, op_id)
+    assert (op.status, op.attempts, op.last_error_code) == ("succeeded", 0, None)
+    assert (await draft_row(engine, draft_id)).status == "text_review"
+    assert await draft_xmin(engine, draft_id) == op.xmin  # the text_review commit is the row's last write
+    watched = {"profile_node_failed", "operation_handler_failed", "operation_fenced", "operation_finished"}
+    assert [e["event"] for e in log_events() if e["event"] in watched] == [
+        "profile_node_failed",
+        "operation_handler_failed",
+        "operation_fenced",
+    ]
+    [fenced] = events_named(log_events, "operation_fenced")
+    assert (fenced["operation_id"], fenced["write"]) == (op_id, "requeue")

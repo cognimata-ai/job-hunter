@@ -44,6 +44,7 @@ from jobhunter.llm import bounds
 from jobhunter.observability.logging import get_logger
 from jobhunter.profile import upload
 from jobhunter.profile.storage import CvStore
+from jobhunter.profile.text import drop_nul
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(
@@ -232,7 +233,8 @@ async def paste_cv(
     try:
         text = upload.check_paste(body.text)
     except upload.UploadRejected as exc:
-        raise _rejected(exc, field_name=_TEXT_FIELD, chars=len(body.text)) from None
+        # the length `check_paste` measured: without the NUL characters it drops
+        raise _rejected(exc, field_name=_TEXT_FIELD, chars=len(drop_nul(body.text))) from None
     utf8 = text.encode("utf-8")
     store = CvStore(cfg.cv_store_dir)
     cv = upload.NewCvFile(

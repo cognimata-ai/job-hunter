@@ -8,6 +8,7 @@ Tasks 13 and 20 add the `extract` and `propose` graphs to `ProfileGraphs`, and t
 import asyncio
 import dataclasses
 import logging
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, cast
@@ -26,12 +27,14 @@ from jobhunter.graphs.profile.graph import (
     ProfileGraphs,
     add_llm_node,
     build_profile_graphs,
+    invoke_config,
     sanitized,
     thread_id,
 )
 from jobhunter.graphs.profile.state import ProfileState, ProfileUpdate, initial_state
 from jobhunter.llm.errors import BudgetExhausted, InvalidOutput, LLMTransient, Refused
 from jobhunter.profile.errors import UploadRejected
+from jobhunter.worker import operations as ops
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphBubbleUp, GraphInterrupt
@@ -99,6 +102,17 @@ def test_every_execution_has_a_thread_of_its_own() -> None:
     assert thread_id("t", 7, 42, 1) == "profile-7-t42-a1"
     assert thread_id("p", 7, 43, 2) == "profile-7-p43-a2"
     assert thread_id("q", 9, 44, 0) == "queries-9-q44-a0"
+
+
+def test_the_invoke_config_has_the_section_9_1_shape() -> None:
+    """§9.1: the thread, `recursion_limit` 200 and `max_concurrency`; the execution in `configurable`."""
+    claim = ops.OperationClaim(42, uuid.uuid4(), "extract_profile_text", {"draft_id": 7}, 2)
+    op = ops.OperationContext(claim=claim, engine=cast(AsyncEngine, object()))
+    assert invoke_config("t", 7, op) == {
+        "configurable": {"thread_id": "profile-7-t42-a2", "op": op},
+        "recursion_limit": 200,
+        "max_concurrency": 1,
+    }
 
 
 def test_the_initial_state_holds_ids_only() -> None:
@@ -198,7 +212,7 @@ def test_the_stand_in_of_a_retryable_database_error_is_retryable() -> None:
 async def test_the_db_retry_retries_a_node_through_the_wrapper(caplog) -> None:
     """The retry policy sees the stand-in, never the original: a serialization failure is retried, and the
     retry's log line (LangGraph logs the error's text, at INFO) names the stand-in only."""
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.INFO, logger="langgraph.pregel._retry")  # the app holds it at WARNING
     calls: list[int] = []
 
     async def flaky(state: ProfileState, config: RunnableConfig) -> ProfileUpdate:

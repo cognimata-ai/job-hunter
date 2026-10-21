@@ -483,6 +483,16 @@ async def test_rejections_are_logged_with_their_reason_only(logged_in_client, lo
     assert "Musterfrau" not in json.dumps(log_events())
 
 
+async def test_a_refused_paste_is_logged_with_the_length_check_paste_measured(
+    logged_in_client, log_events
+) -> None:
+    """Task 11 fix round 1: the length is counted without the NUL characters `check_paste` drops."""
+    r = await post_text(logged_in_client, "Erika Musterfrau" + "\x00" * 400)
+    assert (r.status_code, errors_of(r)) == (422, [("text", "too_short")])
+    [event] = [e for e in log_events() if e["event"] == "cv_upload_rejected"]
+    assert (event["reason"], event["chars"]) == ("too_short", len("Erika Musterfrau"))
+
+
 async def test_two_first_uploads_at_once_open_one_draft_and_the_other_is_409(
     engine: AsyncEngine, migrated: PgServer
 ) -> None:

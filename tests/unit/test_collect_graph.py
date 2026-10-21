@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import json
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, cast
@@ -105,6 +106,35 @@ def test_only_database_errors_that_may_run_again_are_retried() -> None:
     assert not is_retryable_db_error(other)
     assert not is_retryable_db_error(RuntimeError("40001"))
     assert not is_retryable_db_error(SourceError("transient", code="http_503", status=503))
+
+
+async def test_a_retried_database_error_of_a_collect_node_logs_no_bound_value(log_events) -> None:
+    """M2 Task 11 fix round 1: LangGraph logs a retry with the error's text, which quotes the statement's
+    bound values (posting content). Its retry logger is held at WARNING (`quiet_library_loggers`)."""
+    from jobhunter.graphs.collect.graph import DB_RETRY
+    from langgraph.graph import END, START, StateGraph
+
+    marker = "Quastenflosser-Stellenanzeige"
+    calls: list[int] = []
+
+    async def flaky(state: CollectState) -> CollectUpdate:
+        calls.append(1)
+        if len(calls) == 1:  # a lost connection: retried
+            raise sa.exc.DBAPIError(
+                "UPDATE raw_items SET normalized = %(n)s",
+                {"n": marker},
+                ConnectionError("reset"),
+                connection_invalidated=True,
+            )
+        return {"steps": ["flaky"]}
+
+    graph = StateGraph(CollectState)
+    graph.add_node("flaky", timed("flaky", error_handled("flaky", flaky)), retry_policy=DB_RETRY)
+    graph.add_edge(START, "flaky")
+    graph.add_edge("flaky", END)
+    out = await graph.compile().ainvoke(initial_state(7, 1))
+    assert len(calls) == 2 and out["steps"] == ["flaky"]  # the retry ran
+    assert marker not in json.dumps(log_events(), ensure_ascii=False)
 
 
 SERPAPI = InstanceRow(

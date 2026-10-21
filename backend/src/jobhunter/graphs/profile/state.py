@@ -10,9 +10,8 @@ A node returns a `ProfileUpdate`, the partial update LangGraph merges into the s
 """
 
 import operator
-from typing import Annotated, Final, Literal, TypedDict
+from typing import Annotated, Final, TypedDict
 
-Outcome = Literal["text_review", "failed", "obsolete"]
 TEXT_REVIEW: Final = "text_review"
 FAILED: Final = "failed"
 OBSOLETE: Final = "obsolete"
