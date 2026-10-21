@@ -22,8 +22,11 @@ result. It is a best-effort aid; the user's review is the guarantee. Task 11 cal
   (the white space and the city are bounded).
 - *Personal*: a birth label anywhere; a protected-attribute label at the start of a line (after a bullet or
   a table pipe) or followed by a colon anywhere. The span is the label and the rest of its line, at most
-  `_REST_OF_LINE_MAX` characters; a label with no value after it is no hit. `Kinder`, `Children` and
-  `Gender` need a colon, a pipe or a tab after them (`Kinder- und Jugendarbeit` stays).
+  `_REST_OF_LINE_MAX` characters. A label with no value after it is no hit, except at the start of a line:
+  `docparse` writes every table cell on a line of its own (`Geburtsdatum`, then `01.02.1990`), so such a
+  label takes the next non-empty line too, in the same replacement (after at most two blank lines; never a
+  line that is itself a label line or a token). `Kinder`, `Children` and `Gender` need a colon, a pipe or a
+  tab after them, or must stand alone on their line (`Kinder- und Jugendarbeit` stays).
 - *Name*: the header name and its later occurrences; see `ROLE_KEYWORDS` and `_header_name`.
 
 **The order the categories claim text in** is `APPLY_ORDER`: personal, url, email, phone, address, name.
@@ -168,15 +171,21 @@ _BIRTH_LABELS: Final = (
 )
 _LINE_START: Final = rf"(?<![^{_EOL}])[ \t\xa0\u2022\u00b7*|>\-\u2013\u2014]{{0,10}}"
 # One pattern for all the labels, so that the first label of a line takes the rest of the line, other labels
-# included: a birth label anywhere; a protected-attribute label at the start of a line (after a bullet or a
-# table pipe) or followed by a colon anywhere; `Kinder`, `Children` and `Gender` only with a colon, a pipe
-# or a tab after them.
+# included. A label at the start of a line (after a bullet or a table pipe) is group `line`: a
+# protected-attribute or birth label, or `Kinder`, `Children`, `Gender` with a colon, a pipe or a tab after
+# them or alone on the line. Elsewhere: a birth label (`birth`), or a protected-attribute label with a colon
+# after it (`inline`).
 _PERSONAL: Final = re.compile(
-    rf"(?:{_LINE_START}(?P<line>(?i:{_DISTINCT_LABELS})(?!\w)"
-    rf"|(?i:{_AMBIGUOUS_LABELS})(?!\w)(?=[ \t]*[:|]|\t))"
+    rf"(?:{_LINE_START}(?P<line>(?i:{_DISTINCT_LABELS}|{_BIRTH_LABELS})(?!\w)|(?i:geb\.)"
+    rf"|(?i:{_AMBIGUOUS_LABELS})(?!\w)(?=[ \t]*[:|]|\t|[ \t.,;]*(?:[{_EOL}]|\Z)))"
     rf"|{_LABEL_START}(?:(?P<birth>(?i:{_BIRTH_LABELS})(?!\w)|(?i:geb\.))"
     rf"|(?P<inline>(?i:{_DISTINCT_LABELS}|{_AMBIGUOUS_LABELS})(?!\w)(?=[ \t]{{0,3}}:))))"
     rf"(?P<rest>{_REST})"
+)
+# The line after a label that has no value on its own: up to two blank lines, then the next non-empty line.
+_NEXT_LINE: Final = re.compile(
+    rf"(?:(?:\r\n|[{_EOL}])[ \t\xa0]*){{0,2}}(?:\r\n|[{_EOL}])"
+    rf"(?P<line>[ \t\xa0]*(?P<value>[^ \t\xa0{_EOL}][^{_EOL}]{{0,{_REST_OF_LINE_MAX}}}))"
 )
 
 _URL_CHAR: Final = r"[^\s<>\"'\[\]\x00]"
@@ -233,12 +242,33 @@ _WORD_EDGES: Final = ".,;:()[]{}|/-\u2013\u2014"
 # --- finding the spans, category by category --------------------------------------------------
 
 
+def _value_cell(text: str, at: int) -> int | None:
+    """The end of the value line of a label that stands alone on its line, or None. `docparse` writes each
+    table cell on a line of its own, so `Geburtsdatum` is followed by `01.02.1990`. The value is the next
+    non-empty line, after at most two blank lines; a line that is a label line, a token or a claimed span is
+    none (a second pass reads a claim as a token, and a label takes the line after it by itself)."""
+    m = _NEXT_LINE.match(text, at)
+    if m is None:
+        return None
+    value = m.start("value")
+    if text[value] == _MASK or _PLACEHOLDER.match(text, value) or _PERSONAL.match(text, m.start("line")):
+        return None
+    return m.end()
+
+
 def _personal_spans(text: str) -> Iterator[Span]:
-    """The spans of a label and the rest of its line; a label with nothing after it is skipped."""
-    for m in _PERSONAL.finditer(text):
+    """The spans of a label and the rest of its line. A label with nothing after it is a hit only when it
+    starts its line, and then it takes the value line below it as well (one span)."""
+    position = 0
+    while (m := _PERSONAL.search(text, position)) is not None:
+        label = next(g for g in ("line", "birth", "inline") if m[g] is not None)
+        start = m.start(label)
+        end = position = m.end()
         if m["rest"].strip(_NO_VALUE):
-            label = next(g for g in ("line", "birth", "inline") if m[g] is not None)
-            yield m.start(label), m.end()
+            yield start, end
+        elif label == "line" and (cell_end := _value_cell(text, end)) is not None:
+            end = position = cell_end
+            yield start, end
 
 
 def _regex_spans(pattern: re.Pattern[str]) -> Callable[[str], Iterator[Span]]:

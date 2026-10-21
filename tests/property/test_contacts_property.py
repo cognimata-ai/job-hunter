@@ -93,19 +93,54 @@ FRAGMENTS = [
     *"Familienstand ledig Kinder Children Gender Nationalität [EMAIL] [PHONE] [NAME] [PERSONAL]".split(),
     *"max.mustermann@example.org erika@mail.example.org ß ä Ö x Q9 0 00 +".split(),
     *[" ", " ", " ", "\n", "\n", "\n\n", "\t", "\r\n", "\u00a0"],
+    *["Geburtsdatum\n01.02.1990\n", "Familienstand\nledig\n", "Kinder\n2\n", "Religion\n\n\nevangelisch\n"],
 ]
 
 documents = st.lists(st.sampled_from(FRAGMENTS), max_size=45).map("".join)
 anything = st.text(alphabet=st.characters(blacklist_categories=["Cs"]), max_size=300)
 
+LABELS = [
+    *"Geburtsdatum Geburtsort geboren geb. DOB Familienstand Staatsangehörigkeit Nationalität".split(),
+    *["Nationality"],
+    *"Konfession Religion Geschlecht Gender Kinder Children".split(),
+    *["Date of birth", "Place of birth", "Marital status"],
+]
+VALUES = ["01.02.1990", "ledig", "evangelisch", "Musterstadt", "2", "deutsch", "weiblich", "max@example.org"]
+
+
+@st.composite
+def table_rows(draw: st.DrawFn) -> list[tuple[str, str, str]]:
+    """Rows of a personal data table as `docparse` writes them: label and value on lines of their own, the
+    label with or without a colon, up to two blank lines between the cells and after a row."""
+    rows = draw(st.lists(st.tuples(st.sampled_from(LABELS), st.sampled_from(VALUES)), min_size=1, max_size=6))
+    out = []
+    for label, value in rows:
+        gap = draw(st.sampled_from(["\n", "\n\n", "\n \n", "\n\n\n", "\r\n"]))
+        out.append((label + draw(st.sampled_from(["", ":", " :"])), gap, value))
+    return out
+
+
+tables = table_rows().map(lambda rows: "\n".join(f"{label}{gap}{value}" for label, gap, value in rows))
+
 
 @settings(max_examples=2000, deadline=None)
-@given(st.one_of(documents, anything))
+@given(st.one_of(documents, anything, tables))
 def test_stripping_twice_changes_nothing(text: str) -> None:
     once = strip_contacts(text)
     twice = strip_contacts(once.stripped_text)
     assert twice.stripped_text == once.stripped_text
     assert twice.replacements == ()
+
+
+@settings(max_examples=400, deadline=None)
+@given(table_rows())
+def test_a_table_with_every_cell_on_its_own_line_is_stripped_row_by_row(
+    rows: list[tuple[str, str, str]],
+) -> None:
+    text = "\n".join(f"{label}{gap}{value}" for label, gap, value in rows)
+    r = strip_contacts(text)
+    assert r.stripped_text == "\n".join(["[PERSONAL]"] * len(rows))
+    assert dict(r.report) == {**dict.fromkeys(CATEGORIES, 0), "personal": len(rows)}
 
 
 def render(original: str, result: StripResult) -> str:
@@ -118,7 +153,7 @@ def render(original: str, result: StripResult) -> str:
 
 
 @settings(max_examples=1000, deadline=None)
-@given(st.one_of(documents, anything))
+@given(st.one_of(documents, anything, tables))
 def test_the_replacements_are_ordered_disjoint_offsets_into_the_original(text: str) -> None:
     result = strip_contacts(text)
     previous_end = 0
@@ -132,7 +167,7 @@ def test_the_replacements_are_ordered_disjoint_offsets_into_the_original(text: s
 
 
 @settings(max_examples=500, deadline=None)
-@given(st.one_of(documents, anything))
+@given(st.one_of(documents, anything, tables))
 def test_restoring_every_replacement_gives_the_original(text: str) -> None:
     result = strip_contacts(text)
     for i in range(len(result.replacements)):

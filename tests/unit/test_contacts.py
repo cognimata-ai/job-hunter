@@ -418,6 +418,109 @@ def test_words_that_only_look_like_a_label_stay(text: str) -> None:
     assert strip_contacts(text).stripped_text == text
 
 
+BIRTH_LABELS = ["Geburtsdatum", "Geburtsort", "Date of birth", "Place of birth", "DOB", "geboren", "geb."]
+PROTECTED_LABELS = [
+    "Familienstand",
+    "Marital status",
+    "Staatsangehörigkeit",
+    "Nationalität",
+    "Nationality",
+    "Konfession",
+    "Religion",
+    "Geschlecht",
+    "Gender",
+    "Kinder",
+    "Children",
+]
+
+
+@pytest.mark.parametrize("label", [*BIRTH_LABELS, *PROTECTED_LABELS])
+@pytest.mark.parametrize("separator", ["", ":", " :", " | ", "\t"])
+def test_a_label_cell_with_its_value_cell_on_the_next_line_is_one_personal_replacement(
+    label: str, separator: str
+) -> None:
+    # `docparse` writes every table cell on a line of its own: `Geburtsdatum` / `01.02.1990`.
+    text = f"Berufserfahrung\n{label}{separator}\n01.02.1990\nSkills: Python\n"
+    r = strip_contacts(text)
+    assert r.stripped_text == "Berufserfahrung\n[PERSONAL]\nSkills: Python\n", (label, separator)
+    assert r.report["personal"] == 1
+    assert dict(r.report) == {**dict.fromkeys(CATEGORIES, 0), "personal": 1}
+    assert found(text, r) == [("personal", f"{label}{separator}\n01.02.1990")]
+
+
+def test_a_personal_data_table_in_cell_order_is_stripped_row_by_row() -> None:
+    text = (
+        "Persönliche Daten\nGeburtsdatum\n01.02.1990\nGeburtsort\nMusterstadt\nFamilienstand\nledig\n"
+        "Staatsangehörigkeit\ndeutsch\nKinder\n2\nBerufserfahrung\n2019 - 2022\n"
+    )
+    r = strip_contacts(text)
+    assert r.stripped_text == "Persönliche Daten\n" + "[PERSONAL]\n" * 5 + "Berufserfahrung\n2019 - 2022\n"
+    assert (r.report["personal"], r.report["name"], r.report["phone"]) == (5, 0, 0)
+    for i in range(5):
+        assert restore(text, r, i).stripped_text.count("[PERSONAL]") == 4
+    everything = r
+    for i in range(5):
+        everything = restore(text, everything, i)
+    assert everything.stripped_text == text
+
+
+def test_the_value_cell_may_follow_after_blank_lines_but_not_after_three() -> None:
+    assert strip_contacts("Familienstand:\n\nledig\nSkills").stripped_text == "[PERSONAL]\nSkills"
+    assert strip_contacts("Familienstand:\n \n\t\nledig\nSkills").stripped_text == "[PERSONAL]\nSkills"
+    far = "Familienstand:\n\n\n\nledig\nSkills"
+    assert strip_contacts(far).stripped_text == far  # three blank lines: the label stays alone
+    assert strip_contacts("Familienstand:\r\n\r\nledig\r\nSkills").stripped_text == "[PERSONAL]\r\nSkills"
+
+
+def test_only_the_single_next_non_empty_line_is_taken() -> None:
+    assert strip_contacts("Geburtsdatum\n01.02.1990\nBerlin\n").stripped_text == "[PERSONAL]\nBerlin\n"
+    # A label that has a value on its line does not take the next line.
+    r = strip_contacts("Familienstand: ledig\nBerlin\nSkills\n")
+    assert r.stripped_text == "[PERSONAL]\nBerlin\nSkills\n"
+    r = strip_contacts("Geburtsdatum: 01.02.1990\nGeburtsort\nMusterstadt\n")
+    assert r.stripped_text == "[PERSONAL]\n[PERSONAL]\n"
+    assert r.report["personal"] == 2
+
+
+def test_a_label_followed_by_another_label_line_is_not_given_that_line_as_its_value() -> None:
+    text = "Geburtsdatum\nFamilienstand\nledig\nSkills\n"
+    r = strip_contacts(text)
+    assert r.stripped_text == "Geburtsdatum\n[PERSONAL]\nSkills\n"
+    assert r.report["personal"] == 1
+    assert strip_contacts(r.stripped_text).stripped_text == r.stripped_text
+    # The same for a label with a value on the next line and a line that is already a token.
+    assert strip_contacts("Geburtsdatum\n[PERSONAL]\n").stripped_text == "Geburtsdatum\n[PERSONAL]\n"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Geburtsdatum",  # nothing follows
+        "Geburtsdatum:\n",
+        "Ich bin 1990 geboren.\nIch arbeite bei Beispiel GmbH\n",  # not a label line
+        "Max, geb.\n01.02.1990\n",  # a label in the middle of a line has no value cell
+        "Kinder und Jugendliche\n2019 - 2022\n",  # a look-alike is no label
+        "Children's hospital\nVolunteer\n",
+        "Skills\nGender Pay Gap\nAnalysis\n",
+    ],
+)
+def test_a_label_without_a_value_cell_or_a_label_that_is_none_takes_no_next_line(text: str) -> None:
+    assert strip_contacts(text).stripped_text == text
+
+
+def test_a_cell_per_line_value_is_taken_whatever_it_looks_like() -> None:
+    for value in (
+        "max@example.org",
+        "+49 30 23125456",
+        "https://example.org",
+        "Musterstraße 12",
+        "10115 Berlin",
+    ):
+        r = strip_contacts(f"Geburtsort\n{value}\nSkills\n")
+        assert r.stripped_text == "[PERSONAL]\nSkills\n", value
+        assert dict(r.report) == {**dict.fromkeys(CATEGORIES, 0), "personal": 1}, value
+
+
 def test_a_label_inside_a_url_does_not_start_a_personal_line() -> None:
     r = strip_contacts("Blog: https://example.org/geboren-in-berlin und mehr")
     assert r.stripped_text == "Blog: [URL] und mehr"
@@ -792,6 +895,10 @@ _ADVERSARIAL = [
     "Geburtsdatum: " + "x" * 200_000,
     "Geburtsdatum: x\n" * 12_000,
     "Kinder " * 30_000,
+    "Kinder\n" * 100_000,
+    "Geburtsdatum\n" * 40_000,
+    "Familienstand\n\n\n" * 30_000,
+    "Geburtsdatum\n \t \n" * 30_000,
     "| Familienstand " * 12_000,
     "geb." * 50_000,
     ("Max Mustermann\n" + "max mustermann " * 15_000),
