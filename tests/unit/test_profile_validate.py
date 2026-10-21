@@ -24,7 +24,7 @@ from jobhunter.llm.schemas.profile import (
     UserEntered,
 )
 from jobhunter.profile import schema
-from jobhunter.profile.validate import Issue, validate_profile, validate_user_entered
+from jobhunter.profile.validate import Issue, recompute_total_years, validate_profile, validate_user_entered
 
 TODAY = date(2026, 10, 20)
 
@@ -222,7 +222,7 @@ def test_a_contact_in_any_string_field_blanks_that_string_with_an_issue_at_its_p
     assert all("example.org" not in i.message and "mustermann" not in i.message for i in issues)
 
 
-def test_a_contact_in_a_list_of_strings_drops_the_item_and_names_its_input_position() -> None:
+def test_a_contact_in_a_list_of_strings_drops_the_item_and_reports_the_list() -> None:
     out = profile_out(
         highlights=["Built the billing service", f"Contact {EMAIL}", "Led the migration"],
         domains=["Logistik", "www.example.org/cv", "Payments"],
@@ -231,9 +231,32 @@ def test_a_contact_in_a_list_of_strings_drops_the_item_and_names_its_input_posit
     assert fixed.roles[0].highlights == ["Built the billing service", "Led the migration"]
     assert fixed.domains == ["Logistik", "Payments"]
     assert pairs(with_code(issues, "contact_removed")) == [
-        ("roles[0].highlights[1]", "contact_removed"),
-        ("domains[1]", "contact_removed"),
+        ("roles[0].highlights", "contact_removed"),
+        ("domains", "contact_removed"),
     ]
+    assert all(i.proposal is None for i in issues)
+    messages = [i.message for i in with_code(issues, "contact_removed")]
+    assert messages[0].startswith("A highlight held contact data (email)")
+    assert messages[1].startswith("A domain held contact data (url)")
+
+
+def test_a_list_has_one_index_space_the_returned_profiles() -> None:
+    out = profile_out(highlights=[f"Mail {EMAIL}", "Built billing", "x" * 301])
+    fixed, issues = run(out)
+    assert fixed.roles[0].highlights == ["Built billing", "x" * 301]
+    assert pairs(issues) == [("roles[0].highlights", "contact_removed"), ("roles[0].highlights[1]", "limit")]
+
+
+def test_a_dropped_last_item_names_no_position_past_the_end() -> None:
+    fixed, issues = run(profile_out(highlights=["ok", f"Mail {EMAIL}"]))
+    assert fixed.roles[0].highlights == ["ok"]
+    assert pairs(issues) == [("roles[0].highlights", "contact_removed")]
+
+
+def test_every_dropped_item_is_an_issue_at_its_list() -> None:
+    fixed, issues = run(profile_out(domains=[EMAIL, "Payments", "www.example.org", "+49 30 1234 5678"]))
+    assert fixed.domains == ["Payments"]
+    assert pairs(issues) == [("domains", "contact_removed")] * 3
 
 
 @pytest.mark.parametrize(
@@ -347,6 +370,39 @@ def test_an_unparsable_date_becomes_null_with_date_invalid_and_is_not_quoted(bad
     assert bad.strip() == "" or bad not in issues[0].message
 
 
+@pytest.mark.parametrize(
+    ("value", "field", "proposal"),
+    [
+        ("2018", "start", "2018-01-01"),
+        (" 2018 ", "start", "2018-01-01"),
+        ("0001", "start", "0001-01-01"),
+        ("2030", "start", "2030-01-01"),
+        ("2018", "end", "2018-12-01"),
+        ("2026", "end", "2026-10-01"),  # December 2026 is after today: the current month
+        ("2030", "end", "2026-10-01"),
+        ("0000", "start", None),
+        ("0000", "end", None),
+        ("20190", "start", None),
+        ("March 2019", "end", None),
+        ("2019-13", "end", None),
+        ("", "start", None),
+    ],
+)
+def test_a_year_only_date_proposes_the_prompts_repair_and_is_still_nulled(
+    value: str, field: str, proposal: str | None
+) -> None:
+    fixed, issues = role_dates(value, "2020-05-01") if field == "start" else role_dates("2019-03-01", value)
+    assert getattr(fixed, field) is None
+    assert pairs(issues) == [(f"roles[0].{field}", "date_invalid")]
+    assert issues[0].proposal == proposal
+
+
+def test_a_year_only_end_in_the_current_year_keeps_a_day_precise_start_before_it() -> None:
+    fixed, issues = role_dates("2026-10-15", "2026")
+    assert fixed.end is None
+    assert [(i.code, i.proposal) for i in issues] == [("date_invalid", "2026-10-15")]
+
+
 def test_start_after_end_is_date_order_and_both_dates_are_kept() -> None:
     fixed, issues = role_dates("2021-01-01", "2020-01-01")
     assert (fixed.start, fixed.end) == ("2021-01-01", "2020-01-01")
@@ -388,6 +444,23 @@ def test_an_end_date_is_after_today_only_from_the_next_day() -> None:
 def test_the_proposal_is_the_first_of_the_month_of_the_given_today() -> None:
     _, issues = role_dates("2019-01-01", "2027-06-01", today=date(2027, 3, 31))
     assert issues[0].proposal == "2027-03-01"
+
+
+def test_the_future_end_proposal_never_precedes_a_day_precise_start_in_the_current_month() -> None:
+    _, issues = role_dates("2026-10-15", "2026-12-01")
+    assert [(i.path, i.code, i.proposal) for i in issues] == [("roles[0].end", "date_order", "2026-10-15")]
+    assert role_dates("2026-10-20", "2026-12-01")[1][0].proposal == "2026-10-20"  # a start on today
+    assert role_dates("2026-10-01", "2026-12-01")[1][0].proposal == "2026-10-01"
+    assert role_dates("2026-09-15", "2026-12-01")[1][0].proposal == "2026-10-01"
+    assert role_dates(None, "2026-12-01")[1][0].proposal == "2026-10-01"
+
+
+def test_the_future_end_of_a_role_that_starts_later_than_today_proposes_the_current_month() -> None:
+    _, issues = role_dates("2026-10-25", "2026-12-01")
+    assert [(i.path, i.proposal) for i in issues] == [
+        ("roles[0].start", None),
+        ("roles[0].end", "2026-10-01"),
+    ]
 
 
 def test_a_start_after_today_is_date_order_without_a_proposal() -> None:
@@ -440,6 +513,10 @@ def test_overlapping_roles_are_merged_and_present_ends_today() -> None:
     assert years_issue(roles, 5.0)[0].proposal == 8.8
     assert years_issue(roles, 8.8) == []
     assert years_issue(roles, 9.7) == []  # 0.9 apart
+    assert (
+        years_issue(roles, 7.8) == []
+    )  # one year apart to the tenth: 8.8 - 7.8 is 1.0000000000000009 in floats
+    assert [i.proposal for i in years_issue(roles, 7.7)] == [8.8]
 
 
 def test_a_year_apart_is_no_issue_and_more_than_a_year_is() -> None:
@@ -498,6 +575,46 @@ def test_nothing_to_recompute_is_no_mismatch() -> None:
     assert years_issue([], 12.0) == []
     assert years_issue([role(start=None, end=None)], 12.0) == []
     assert years_issue([role()], None) == []
+
+
+def test_a_recomputed_total_outside_the_limit_is_no_proposal() -> None:
+    issues = years_issue([role(start="0001-01-01", end="9999-12-31")], 5.0)  # 2,025.8 years to today
+    assert [(i.path, i.proposal) for i in issues] == [("total_years_experience", None)]
+
+
+@pytest.mark.parametrize(
+    ("start", "extracted", "proposal"),
+    [
+        ("1966-10-20", 5.0, 60.0),  # 21,915 days to today: exactly 60 years
+        ("1966-10-19", 5.0, 60.0),  # 60.003 years, 60.0 to 0.1
+        ("1966-09-01", 5.0, None),  # 60.14 years, 60.1 to 0.1: over the limit
+        ("1965-10-20", 5.0, None),
+        ("2026-10-20", 30.0, 0.0),  # a role that starts today: the lower bound is inside the limit
+    ],
+)
+def test_the_proposal_is_given_only_inside_the_total_years_limit(
+    start: str, extracted: float, proposal: float | None
+) -> None:
+    issues = years_issue([role(start=start, end="present")], extracted)
+    assert [(i.path, i.proposal) for i in issues] == [("total_years_experience", proposal)]
+
+
+def test_recompute_total_years_takes_roles_as_extracted_and_is_the_proposal() -> None:
+    roles = [role(start="2018-01", end="2021-12"), role(start="2020-01", end="Present")]
+    assert recompute_total_years(roles, TODAY) == 8.8
+    assert years_issue(roles, 5.0)[0].proposal == recompute_total_years(roles, TODAY)
+    assert recompute_total_years([role(start="2020-01-01", end="present")], date(2024, 1, 1)) == 4.0
+
+
+def test_recompute_total_years_is_none_without_a_usable_role() -> None:
+    assert recompute_total_years([], TODAY) is None
+    unusable = [
+        role(start=None, end="present"),
+        role(start="x", end="2020-01-01"),
+        role(start="2020-01-01", end=None),
+    ]
+    assert recompute_total_years(unusable, TODAY) is None
+    assert recompute_total_years([*unusable, role(start="2010-01-01", end="2014-01-01")], TODAY) == 4.0
 
 
 # --- grounding --------------------------------------------------------------------------------------------
@@ -573,14 +690,54 @@ def test_a_native_pdf_has_no_text_so_every_evidence_is_unverifiable() -> None:
     ]
 
 
-def test_blank_skill_evidence_is_not_a_grounding_issue_but_blank_language_evidence_is_an_issue() -> None:
-    assert evidence_issues(skills=[skill(evidence=""), skill(evidence="  \n ")]) == []
-    assert evidence_issues(skills=[skill(evidence="")], text=None) == []
+def test_a_blank_skill_evidence_is_ungrounded_with_or_without_a_text() -> None:
+    for text in (REVIEWED, None):
+        issues = evidence_issues(skills=[skill(evidence=""), skill(evidence="  \n "), skill()], text=text)
+        assert pairs(issues)[:2] == [
+            ("skills[0].evidence", "ungrounded"),
+            ("skills[1].evidence", "ungrounded"),
+        ]
+    assert pairs(evidence_issues(skills=[skill(evidence="")], text="")) == [
+        ("skills[0].evidence", "ungrounded")
+    ]
+
+
+def test_a_blank_language_evidence_is_language_without_evidence() -> None:
     issues = evidence_issues(languages=[language(evidence=""), language(code="en", evidence="  \n")])
     assert pairs(issues) == [
         ("languages[0].evidence", "language_without_evidence"),
         ("languages[1].evidence", "language_without_evidence"),
     ]
+
+
+TRIVIAL_TEXT = REVIEWED + "e C1 Go SQL a--b --- --- 1 2 Java a-b-c a-b"
+
+
+@pytest.mark.parametrize("evidence", ["e", " e ", "C1", "Go", "SQL", "a-b", "a--b", "--- ---", "1 2", "…"])
+@pytest.mark.parametrize("text", [TRIVIAL_TEXT, None])
+def test_an_evidence_below_the_quote_floor_is_ungrounded_even_when_the_text_has_it(
+    evidence: str, text: str | None
+) -> None:
+    kubernetes = skill(name="Kubernetes", level="expert", evidence=evidence)
+    french = language(code="fr", cefr="C2", evidence=evidence)
+    assert pairs(evidence_issues(skills=[kubernetes], text=text)) == [("skills[0].evidence", "ungrounded")]
+    assert pairs(evidence_issues(languages=[french], text=text)) == [("languages[0].evidence", "ungrounded")]
+
+
+def test_the_quote_floor_is_four_characters_and_three_letters_or_digits() -> None:
+    for evidence in ("Java", "a-b-c", "a b c", "C++ 11"):
+        assert (
+            evidence_issues(skills=[skill(evidence=evidence)], text=TRIVIAL_TEXT + " C++ 11 a b c") == []
+        ), evidence
+    for evidence in ("Jav", "a--b", "a-b"):
+        assert pairs(evidence_issues(skills=[skill(evidence=evidence)], text=TRIVIAL_TEXT)) == [
+            ("skills[0].evidence", "ungrounded")
+        ], evidence
+
+
+def test_a_bare_level_is_no_language_evidence() -> None:
+    issues = evidence_issues(languages=[language(code="en", cefr="C1", evidence="C1")], text=REVIEWED + " C1")
+    assert pairs(issues) == [("languages[0].evidence", "ungrounded")]
 
 
 def test_a_language_without_evidence_is_reported_for_a_native_pdf_too() -> None:
@@ -855,6 +1012,7 @@ def test_empty_strings_and_missing_optional_fields_are_validated_without_raising
     assert sorted(pairs(issues)) == [
         ("languages[0].code_other", "code_other"),
         ("languages[0].evidence", "language_without_evidence"),
+        ("skills[0].evidence", "ungrounded"),
     ]
 
 
@@ -869,6 +1027,32 @@ def test_a_confirmed_profile_keeps_its_type_and_its_user_entered_block() -> None
     assert fixed.summary == ""
     assert fixed.user_entered == out.user_entered
     assert pairs(issues) == [("summary", "contact_removed")]
+
+
+def test_the_result_shares_no_object_with_the_input() -> None:
+    clearance = SecurityClearance(name="Ü2", level=None)
+    out = ConfirmedProfile(
+        **profile_out().model_dump(),
+        user_entered=UserEntered(security_clearances=[clearance]),
+    )
+    fixed, _ = run(out)
+    assert fixed is not out and fixed == out
+    assert fixed.user_entered is not out.user_entered
+    assert fixed.user_entered.security_clearances is not out.user_entered.security_clearances
+    assert fixed.user_entered.security_clearances[0] is not clearance
+    assert fixed.roles[0] is not out.roles[0]
+    assert fixed.roles[0].highlights is not out.roles[0].highlights
+    assert fixed.target_titles[0] is not out.target_titles[0]
+    assert fixed.skills[0] is not out.skills[0] and fixed.languages[0] is not out.languages[0]
+    assert fixed.education[0] is not out.education[0] and fixed.certifications[0] is not out.certifications[0]
+    assert fixed.domains is not out.domains
+    before = out.model_dump_json()
+    fixed.roles[0].highlights.append("added")
+    fixed.user_entered.security_clearances.clear()
+    fixed.user_entered.security_clearances.append(SecurityClearance(name="new", level=None))
+    fixed.skills[0].name = "changed"
+    fixed.domains.append("added")
+    assert out.model_dump_json() == before
 
 
 def test_validation_twice_gives_the_same_profile_and_no_repair_issue() -> None:

@@ -1,25 +1,28 @@
 """Profile validation (spec §12.3 grounding and re-scan, §12.4 limits, dates and years, §12.5 languages).
 
 `validate_profile` runs over the extraction output, repairs what has a safe repair and reports every issue for
-the user's review; `validate_user_entered` checks the block the review form adds. The module is pure: no
-database, no I/O, no clock (`today` is a parameter) and no logging.
+the user's review; `validate_user_entered` checks the block the review form adds; `recompute_total_years` is
+the years figure that the review form shows. The module is pure: no database, no I/O, no clock (`today` is a
+parameter) and no logging. The profile that `validate_profile` returns shares no object with its input.
 
 **Repairs**, which never lose information the user could have used:
 - a month date `YYYY-MM` becomes `YYYY-MM-01`; `"Present"` and a padded date are written in their normal form;
-- a date that is none of those becomes `null` (`date_invalid`);
+- a date that is none of those becomes `null` (`date_invalid`); a year-only date (`"2018"`) proposes the
+  prompt's own repair, `YYYY-01-01` for a start and `YYYY-12-01` for an end;
 - a string field with a contact (`scan_value`) becomes `""`, a list item (a highlight, a domain) is dropped
   (`contact_removed`).
 
 **Reports, never repairs**: an excess (a list over its limit, a text over its length, a number out of range),
 a date after today or an end before its start, a total of years more than 1 apart from the roles', an evidence
-quote that is not in the transmitted text, a language without evidence and a wrong `code_other`. The value
-stays as it is, so that the user decides; `proposal` carries the value the validator would suggest.
+quote that is not in the transmitted text (or is too short to be a quote), a language without evidence and a
+wrong `code_other`. The value stays as it is, so that the user decides; `proposal` carries the value the
+validator would suggest.
 
 **Issue paths** are the field names joined by `.`, with a zero-based `[index]` after a list, from the root of
-the profile: `summary`, `roles[0].highlights[1]`, `languages[2].code_other`. The user-entered block's paths
-start with `user_entered.`. A path names the position in the profile that `validate_profile` returns, with
-one exception: `contact_removed` for a dropped list item names the item's position in the input, because the
-item no longer exists in the output.
+the profile, and all of them name a position in the profile that `validate_profile` returns: `summary`,
+`roles[0].highlights[1]`, `languages[2].code_other`. The user-entered block's paths start with
+`user_entered.`. A list item that was dropped for its contact data exists no more, so `contact_removed` names
+the list (`roles[0].highlights`, `domains`), once per dropped item.
 
 **No message holds a value.** A message is made of fixed text, the limits of `profile/schema.py` and the
 names of the contact categories; the user finds the value through the path.
@@ -74,6 +77,7 @@ class Issue:
 _DAYS_PER_YEAR: Final = 365.25
 _YEARS_TOLERANCE: Final = 1.0
 _DATE: Final = re.compile(r"([0-9]{4})-([0-9]{2})(?:-([0-9]{2}))?")
+_YEAR: Final = re.compile(r"[0-9]{4}")
 
 
 @dataclass
@@ -120,13 +124,14 @@ def _scrub_optional(run: _Run, value: str | None, path: str) -> str | None:
     return None if value is None else _scrub(run, value, path)
 
 
-def _scrub_items(run: _Run, items: list[str], path: str) -> list[str]:
-    """`items` without those that hold a contact; each dropped item is reported at its input position."""
+def _scrub_items(run: _Run, items: list[str], path: str, noun: str) -> list[str]:
+    """`items` without those that hold a contact; each dropped item is reported at the list's `path`."""
     kept: list[str] = []
-    for index, item in enumerate(items):
+    for item in items:
         found = scan_value(item)
         if found:
-            run.add(f"{path}[{index}]", "contact_removed", _contact_message(found))
+            message = f"A {noun} held contact data ({', '.join(found)}) and was removed."
+            run.add(path, "contact_removed", message)
         else:
             kept.append(item)
     return kept
@@ -146,8 +151,33 @@ def _parse_date(value: str) -> date | None:
         return None
 
 
-def _month_start(day: date) -> str:
-    return day.replace(day=1).isoformat()
+def _parse_end(value: str | None, today: date) -> tuple[date | None, bool]:
+    """An end as `(date, present)`: `present` is `today`; `null` and a non-date are `(None, False)`."""
+    if value is None:
+        return None, False
+    if value.strip().casefold() == "present":
+        return today, True
+    return _parse_date(value), False
+
+
+def _current_month(today: date, start: date | None) -> str:
+    """The end date that the validator proposes for one after today: the 1st of the current month, or the
+    start when that is later in the month (a day-precise start must not come after its end)."""
+    first = today.replace(day=1)
+    return start.isoformat() if start is not None and first < start <= today else first.isoformat()
+
+
+def _year_only_proposal(value: str, *, end: bool, today: date, start: date | None) -> str | None:
+    """The prompt's repair of a year-only date (rule 4: January for a start, December for an end), or `None`
+    for any other value. An end after today is proposed as the current month instead."""
+    stripped = value.strip()
+    if not _YEAR.fullmatch(stripped) or int(stripped) < 1:
+        return None
+    year = int(stripped)
+    if not end:
+        return date(year, 1, 1).isoformat()
+    december = date(year, 12, 1)
+    return _current_month(today, start) if december > today else december.isoformat()
 
 
 @dataclass(frozen=True)
@@ -167,23 +197,21 @@ def _repair_dates(run: _Run, path: str, role: Role) -> _Span:
     if role.start is not None:
         start = _parse_date(role.start)
         if start is None:
-            run.add(f"{path}.start", "date_invalid", "Not a date (YYYY-MM-DD or YYYY-MM); removed.")
+            proposal = _year_only_proposal(role.start, end=False, today=run.today, start=None)
+            run.add(f"{path}.start", "date_invalid", "Not a date (YYYY-MM-DD or YYYY-MM); removed.", proposal)
         else:
             start_text = start.isoformat()
     end_text: str | None = None
-    end: date | None = None
-    present = False
+    end, present = _parse_end(role.end, run.today)
     if role.end is not None:
-        if role.end.strip().casefold() == "present":
-            end_text, end, present = "present", run.today, True
+        if present:
+            end_text = "present"
+        elif end is None:
+            proposal = _year_only_proposal(role.end, end=True, today=run.today, start=start)
+            message = "Not a date (YYYY-MM-DD, YYYY-MM or present); removed."
+            run.add(f"{path}.end", "date_invalid", message, proposal)
         else:
-            end = _parse_date(role.end)
-            if end is None:
-                run.add(
-                    f"{path}.end", "date_invalid", "Not a date (YYYY-MM-DD, YYYY-MM or present); removed."
-                )
-            else:
-                end_text = end.isoformat()
+            end_text = end.isoformat()
     return _Span(start_text, end_text, start, end, present)
 
 
@@ -192,26 +220,28 @@ def _check_order(run: _Run, path: str, span: _Span) -> None:
         run.add(f"{path}.start", "date_order", "The start date is after today.")
     if span.end is not None and not span.present:
         if span.end > run.today:
+            proposal = _current_month(run.today, span.start)
             run.add(
                 f"{path}.end",
                 "date_order",
                 "The end date is after today; the current month is proposed.",
-                _month_start(run.today),
+                proposal,
             )
         if span.start is not None and span.start > span.end:
             run.add(f"{path}.end", "date_order", "The end date is before the start date.")
 
 
-def _interval(run: _Run, span: _Span) -> tuple[date, date] | None:
-    """The days a role covers, up to today; `None` for a role with an open or unusable date."""
-    if span.start is None or span.end is None:
-        return None
-    stop = min(span.end, run.today)
-    return (span.start, stop) if span.start <= stop else None
-
-
-def _recomputed_years(intervals: list[tuple[date, date]]) -> float | None:
-    """The years the intervals cover with overlaps (and touching ends) merged; `None` without an interval."""
+def recompute_total_years(roles: Sequence[Role], today: date) -> float | None:
+    """The years of experience the roles' dates give, to 0.1: the intervals of the roles with both dates
+    (`present` and an end after today count to `today`; a start after today or after the end, an open end
+    and a date that does not parse count nothing), overlapping or touching intervals merged, days / 365.25.
+    `None` when no role has an interval."""
+    intervals: list[tuple[date, date]] = []
+    for role in roles:
+        start = None if role.start is None else _parse_date(role.start)
+        end, _ = _parse_end(role.end, today)
+        if start is not None and end is not None and start <= min(end, today):
+            intervals.append((start, min(end, today)))
     if not intervals:
         return None
     merged: list[tuple[date, date]] = []
@@ -221,7 +251,7 @@ def _recomputed_years(intervals: list[tuple[date, date]]) -> float | None:
                 merged[-1] = (merged[-1][0], end)
         else:
             merged.append((start, end))
-    return sum((end - start).days for start, end in merged) / _DAYS_PER_YEAR
+    return round(sum((end - start).days for start, end in merged) / _DAYS_PER_YEAR, 1)
 
 
 # --- sections ---------------------------------------------------------------------------------------------
@@ -237,12 +267,12 @@ def _target_titles(run: _Run, titles: list[TargetTitle]) -> list[TargetTitle]:
     ]
 
 
-def _role(run: _Run, index: int, role: Role) -> tuple[Role, tuple[date, date] | None]:
+def _role(run: _Run, index: int, role: Role) -> Role:
     path = f"roles[{index}]"
     title = _scrub(run, role.title, f"{path}.title")
     employer = _scrub_optional(run, role.employer, f"{path}.employer")
     domain = _scrub_optional(run, role.domain, f"{path}.domain")
-    highlights = _scrub_items(run, role.highlights, f"{path}.highlights")
+    highlights = _scrub_items(run, role.highlights, f"{path}.highlights", "highlight")
     span = _repair_dates(run, path, role)
     _check_order(run, path, span)
     if len(highlights) > schema.HIGHLIGHTS_MAX:
@@ -250,7 +280,7 @@ def _role(run: _Run, index: int, role: Role) -> tuple[Role, tuple[date, date] | 
     for i, highlight in enumerate(highlights):
         if len(highlight) > schema.HIGHLIGHT_CHARS:
             run.limit(f"{path}.highlights[{i}]", _at_most(schema.HIGHLIGHT_CHARS, "characters"))
-    repaired = role.model_copy(
+    return role.model_copy(
         update={
             "title": title,
             "employer": employer,
@@ -260,16 +290,18 @@ def _role(run: _Run, index: int, role: Role) -> tuple[Role, tuple[date, date] | 
             "end": span.end_text,
         }
     )
-    return repaired, _interval(run, span)
 
 
 def _check_evidence(run: _Run, path: str, evidence: str, *, language: bool) -> None:
-    """§12.3 grounding: the folded evidence must be a part of the folded transmitted text. A language needs
-    an evidence quote (§12.5); a blank skill evidence claims nothing, so there is nothing to ground."""
+    """§12.3 grounding: the folded evidence must be a part of the folded transmitted text. It must also be a
+    quote: V3's floor (§11.6, at least 4 characters and 3 letters or digits) is applied here, so that a blank
+    or trivial evidence cannot ground a claim, and it holds for a native PDF too. A language without any
+    evidence is `language_without_evidence` (§12.5)."""
     folded = fold(evidence)
-    if not folded:
-        if language:
-            run.add(path, "language_without_evidence", "A language needs a quote from the CV as evidence.")
+    if not folded and language:
+        run.add(path, "language_without_evidence", "A language needs a quote from the CV as evidence.")
+    elif len(folded) < schema.QUOTE_MIN_CHARS or sum(c.isalnum() for c in folded) < schema.QUOTE_MIN_ALNUM:
+        run.add(path, "ungrounded", "The evidence is missing or too short to be a quote from your CV text.")
     elif run.haystack is None:
         run.add(path, "unverifiable", "The evidence cannot be checked: the original PDF was sent, not text.")
     elif folded not in run.haystack:
@@ -324,17 +356,20 @@ def _certification(run: _Run, index: int, cert: Certification) -> Certification:
     return cert.model_copy(update={"name": name, "issuer": issuer})
 
 
-def _total_years(run: _Run, extracted: float | None, intervals: list[tuple[date, date]]) -> None:
+def _total_years(run: _Run, extracted: float | None, roles: list[Role]) -> None:
     lo, hi = schema.TOTAL_YEARS
     if extracted is not None and not lo <= extracted <= hi:
         run.limit("total_years_experience", _range("The total", lo, hi, " years"))
-    recomputed = _recomputed_years(intervals)
-    if extracted is not None and recomputed is not None and abs(extracted - recomputed) > _YEARS_TOLERANCE:
+    recomputed = recompute_total_years(roles, run.today)
+    if recomputed is None or extracted is None:
+        return
+    # Rounded to nine places, so that 8.8 against 7.8 is exactly one year apart and not 1.0000000000000009.
+    if round(abs(extracted - recomputed), 9) > _YEARS_TOLERANCE:
         run.add(
             "total_years_experience",
             "years_mismatch",
-            "The total differs by more than a year from the one the roles' dates give; that one is proposed.",
-            round(recomputed, 1),
+            "The total differs by more than a year from the one the roles' dates give.",
+            recomputed if lo <= recomputed <= hi else None,  # a figure the limit would refuse is no proposal
         )
 
 
@@ -346,46 +381,41 @@ def validate_profile[P: ProfileOut](
     `transmitted_text` is the reviewed text the model received, or `None` for a native PDF, whose evidence is
     then `unverifiable`. A `ConfirmedProfile` comes back as one, its `user_entered` block untouched.
     """
+    own = out.model_copy(deep=True)  # nothing of `out` is shared with the result
     run = _Run(today, None if transmitted_text is None else fold(transmitted_text), [])
 
-    summary = _scrub(run, out.summary, "summary")
+    summary = _scrub(run, own.summary, "summary")
     if len(summary) > schema.SUMMARY_MAX:
         run.limit("summary", _at_most(schema.SUMMARY_MAX, "characters"))
-    target_titles = _target_titles(run, out.target_titles)
+    target_titles = _target_titles(run, own.target_titles)
 
-    if len(out.roles) > schema.ROLES_MAX:
+    if len(own.roles) > schema.ROLES_MAX:
         run.limit("roles", _at_most(schema.ROLES_MAX, "roles"))
-    roles: list[Role] = []
-    intervals: list[tuple[date, date]] = []
-    for index, role in enumerate(out.roles):
-        repaired, interval = _role(run, index, role)
-        roles.append(repaired)
-        if interval is not None:
-            intervals.append(interval)
+    roles = [_role(run, i, role) for i, role in enumerate(own.roles)]
 
-    if len(out.skills) > schema.SKILLS_MAX:
+    if len(own.skills) > schema.SKILLS_MAX:
         run.limit("skills", _at_most(schema.SKILLS_MAX, "skills"))
-    skills = [_skill(run, i, skill) for i, skill in enumerate(out.skills)]
+    skills = [_skill(run, i, skill) for i, skill in enumerate(own.skills)]
 
-    if len(out.languages) > schema.LANGUAGES_MAX:
+    if len(own.languages) > schema.LANGUAGES_MAX:
         run.limit("languages", _at_most(schema.LANGUAGES_MAX, "languages"))
-    languages = [_language(run, i, lang) for i, lang in enumerate(out.languages)]
+    languages = [_language(run, i, lang) for i, lang in enumerate(own.languages)]
 
-    if len(out.education) > schema.EDUCATION_MAX:
+    if len(own.education) > schema.EDUCATION_MAX:
         run.limit("education", _at_most(schema.EDUCATION_MAX, "entries"))
-    education = [_education(run, i, entry) for i, entry in enumerate(out.education)]
+    education = [_education(run, i, entry) for i, entry in enumerate(own.education)]
 
-    if len(out.certifications) > schema.CERTIFICATIONS_MAX:
+    if len(own.certifications) > schema.CERTIFICATIONS_MAX:
         run.limit("certifications", _at_most(schema.CERTIFICATIONS_MAX, "certifications"))
-    certifications = [_certification(run, i, cert) for i, cert in enumerate(out.certifications)]
+    certifications = [_certification(run, i, cert) for i, cert in enumerate(own.certifications)]
 
-    domains = _scrub_items(run, out.domains, "domains")
+    domains = _scrub_items(run, own.domains, "domains", "domain")
     if len(domains) > schema.DOMAINS_MAX:
         run.limit("domains", _at_most(schema.DOMAINS_MAX, "domains"))
 
-    _total_years(run, out.total_years_experience, intervals)
+    _total_years(run, own.total_years_experience, roles)
 
-    repaired_profile = out.model_copy(
+    repaired_profile = own.model_copy(
         update={
             "summary": summary,
             "target_titles": target_titles,

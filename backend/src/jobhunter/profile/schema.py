@@ -47,8 +47,14 @@ LIMITS: Final[Mapping[str, int | tuple[int, int] | tuple[int, int | None]]] = Ma
     }
 )
 
-# `user_entered` (§12.4) has no limits in the spec. These bound what the review form can put into the profile
-# JSON: a clearance name or level is as long as the ad side's `security_clearance.level` (§11.4: 60
-# characters), and a profile holds as many clearances as it has languages.
+# Not in `LIMITS`. `user_entered` (§12.4) has no limits in the spec. These bound what the review form can
+# put into the profile JSON: a clearance name or level is at most as long as the ad side's
+# `security_clearance.level` (spec §11.5, line 4342: "≤ 60 characters"), and a profile holds as many
+# clearances as it has languages.
 CLEARANCES_MAX: Final = 10
 CLEARANCE_CHARS: Final = 60
+
+# Not in `LIMITS`. Spec §11.6 V3's floor for a quote (line 4362): fewer than 4 characters, or fewer than 3
+# letters or digits, is no quote. The validator applies it to the folded evidence of a skill or a language.
+QUOTE_MIN_CHARS: Final = 4
+QUOTE_MIN_ALNUM: Final = 3
