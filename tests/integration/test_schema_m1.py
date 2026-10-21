@@ -272,7 +272,7 @@ ACTIVE_CONFIG = (
     "rubric_version_id, prompt_schema_version_id, model_policy_id, execution_config_id, "
     "evaluation_policy_id, llm_tuple_id FROM active_config WHERE id = 1"
 )
-# The rubric and prompt-schema pointers name the rows migration 0007 seeded (M2): rubric `v1` and the
+# The rubric and prompt-schema pointers name the rows the migrate seed inserted (M2): rubric `v1` and the
 # prompt-schema version of this code's templates and schemas.
 SEEDED_CONFIG = (
     "SELECT id, scope_version_id, NULL::bigint, NULL::bigint, "

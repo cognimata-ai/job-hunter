@@ -46,8 +46,9 @@ Deviations 1, 2 and 30):
      `evidence IS NOT DISTINCT FROM 'reservation_bound_violated'` for `evidence = 'reservation_bound_violated'`.
      Every other part of both CHECKs is verbatim.
 
-active_config.rubric_version_id and prompt_schema_version_id stay nullable here: the migration that seeds the
-rubric and the prompt schema restores NOT NULL (M0 Deviation 1).
+active_config.rubric_version_id and prompt_schema_version_id stay nullable here and through M2: `migrate`'s seed
+step inserts rubric v1 and prompt-schema version 1 and sets both pointers (§19.3 step 6; no migration inserts
+them), and M3's first migration restores NOT NULL (M0 Deviation 1, M2 plan Deviation 32).
 
 Migrations are expand/contract: there is no downgrade.
 """

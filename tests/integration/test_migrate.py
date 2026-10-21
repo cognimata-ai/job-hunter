@@ -81,7 +81,7 @@ async def test_seed_values(fresh_pg_server, make_config) -> None:
         1,
         "0.450",
     )
-    # The rubric and prompt-schema pointers name the seeded rows (M2 migration 0007 and `seed_defaults`).
+    # The rubric and prompt-schema pointers name the rows `seed_defaults` inserted (M2).
     assert pg_one(
         fresh_pg_server,
         "migrator",

@@ -7,7 +7,7 @@
 - `anchors` is an object with an entry for each of the six LLM-rated criteria.
 
 `Rubric.content_hash` is the content hash of `{"weights", "anchors"}`, the `rubric_versions.content_hash` of
-the row migration 0007 and `seed_defaults` insert.
+the row `seed_defaults` inserts.
 """
 
 import re

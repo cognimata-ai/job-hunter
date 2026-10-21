@@ -153,8 +153,8 @@ ON CONFLICT (id) DO UPDATE SET
   last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
   updated_at = now()"""
 # Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds, the seeded
-# rubric v1 and prompt-schema version (M2 Task 6; NOT NULL, so a missing seeded row fails the reset), and the
-# pointers a profile or a scope apply sets left NULL (the pending scope, the profile and the tuple).
+# rubric v1 and prompt-schema version (M2 Task 6; `_SEEDED_POINTERS` fails the reset when one is missing),
+# and the pointers a profile or a scope apply sets left NULL (the pending scope, the profile and the tuple).
 _ACTIVE_CONFIG_RESET: Final = """\
 UPDATE active_config SET settings_version_id = v.id, scope_version_id = v.scope_version_id,
   model_policy_id = v.model_policy_id, execution_config_id = v.execution_config_id,
@@ -166,6 +166,12 @@ UPDATE active_config SET settings_version_id = v.id, scope_version_id = v.scope_
   FROM settings_versions v WHERE v.version_no = 1"""
 # The hash of the prompt-schema version `seed_defaults` points at: this code's templates and schemas.
 _SEEDED_PROMPT_SCHEMA_HASH: Final = prompt_schema_hash(*prompt_schema_v1())
+# The columns are nullable in M2 (NOT NULL is M3's, plan Deviation 32), so a seeded row that is missing would
+# leave a NULL pointer behind silently: the reset checks for it.
+_SEEDED_POINTERS: Final = (
+    "SELECT rubric_version_id IS NOT NULL AND prompt_schema_version_id IS NOT NULL "
+    "FROM active_config WHERE id = 1"
+)
 # The M2 tables are emptied with DELETE, never by `_TRUNCATE`: `TRUNCATE ... CASCADE` of a table that
 # `active_config` reaches through its foreign keys (`cv_files` -> `profile_drafts` -> `profile_versions`,
 # `llm_calls`, `eval_runs`, `llm_tuples`) would truncate `active_config` itself. Run after
@@ -238,6 +244,10 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         conn.execute(_TRUNCATE)
         conn.execute(DEFAULT_INSTANCES_SQL)
         conn.execute(_ACTIVE_CONFIG_RESET, {"prompt_schema_hash": _SEEDED_PROMPT_SCHEMA_HASH})
+        if conn.execute(_SEEDED_POINTERS).fetchone() != (True,):
+            raise LookupError(
+                "active_config or a seeded rubric or prompt-schema row is missing: `migrated` seeds them"
+            )
         for statement in _M2_DELETE:
             conn.execute(statement)
         stored = conn.execute(

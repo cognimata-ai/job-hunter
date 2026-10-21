@@ -6,8 +6,10 @@ JSON of the payload as stored (§13.2), so a second `seed_defaults` finds the ro
 
 The `sources` rows (`SOURCES`) and the `default` instance of each non-ATS source (`DEFAULT_INSTANCES`) are
 inserted when absent and never updated. So are rubric v1 (found by its version) and the prompt-schema version
-of this code's templates and schemas (found by its hash), which migration 0007 already inserted on every
-database it migrated: a fresh `active_config` row points at both (M2).
+of this code's templates and schemas (found by its hash), §19.3 step 6: no migration inserts them (§19.3
+step 2; plan Deviation 32). `active_config` points at both: a fresh row from its insert, and a row an M1
+install left with NULL pointers from the update after it. The two columns stay nullable in M2; M3's first
+migration restores their NOT NULL (expand/contract).
 
 The transition matrix is different: it is derived from code, so `sync_transition_matrix` replaces its rows on
 every run instead of freezing them.
@@ -283,7 +285,9 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     """Write the default settings chain, rubric v1 and the prompt-schema version, the three single rows,
     `sources` and the default source instances.
 
-    Idempotent and never an overwrite. Settings version 1 is frozen once stored: the derived rows (scope,
+    Idempotent and never an overwrite: a NULL rubric or prompt-schema pointer is set, a set one is never
+    changed (a shipped version activates through Settings only, §13.3). Settings version 1 is frozen once
+    stored: the derived rows (scope,
     model policy, execution config, evaluation policy) and the version are created from the packaged
     defaults only when version 1 does not exist yet. Afterwards a release that edits `settings_v1.json`
     changes nothing here, and the three single rows below are created, when absent, from the STORED version 1
@@ -305,8 +309,8 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     settings = get_object(stored["payload"], "")
 
     # The active pointers are those of the settings version they activate, so the two cannot disagree, plus
-    # rubric v1 and the prompt-schema version (both NOT NULL). The profile and tuple pointers stay NULL until
-    # a profile is confirmed (§12.6).
+    # rubric v1 and the prompt-schema version. The profile and tuple pointers stay NULL until a profile is
+    # confirmed (§12.6).
     rubric_id, prompt_schema_id = await _shipped_rubric_and_prompt_schema(conn)
     await conn.execute(
         q(
@@ -317,6 +321,16 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
             "ON CONFLICT DO NOTHING"
         ),
         {"settings_id": settings_id, "rubric_id": rubric_id, "prompt_schema_id": prompt_schema_id},
+    )
+    # An install upgraded from M1 has the row with both pointers NULL: they are set here, and only where NULL.
+    await conn.execute(
+        q(
+            "UPDATE active_config SET rubric_version_id = coalesce(rubric_version_id, :rubric_id), "
+            "prompt_schema_version_id = coalesce(prompt_schema_version_id, :prompt_schema_id), "
+            "updated_at = now() "
+            "WHERE id = 1 AND (rubric_version_id IS NULL OR prompt_schema_version_id IS NULL)"
+        ),
+        {"rubric_id": rubric_id, "prompt_schema_id": prompt_schema_id},
     )
 
     interval_s = get_int(settings, "schedule.interval_hours") * _SECONDS_PER_HOUR
