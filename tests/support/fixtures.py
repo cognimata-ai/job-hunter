@@ -31,6 +31,8 @@ from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_p
 from tests.support.procs import ProcessGroup, wait_until
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
+# `configure_logging` also holds these (`observability/logging._CONTENT_LOGGERS`).
+_LIBRARY_LOGGERS = (*_QUIET_LOGGERS, "anthropic", "httpx2", "httpcore2")
 # Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
 # configuration chain, `active_config`, `ranking_state` and `sources` are kept (`reset_database` restores the
 # first three to their seeded state), `schedule_state` is reset (below), and so is `checkpoint_migrations`:
@@ -55,14 +57,17 @@ def _restore_logging_state() -> Iterator[None]:
     """`configure_logging` changes process-wide state; give every test the state it found."""
     root = logging.getLogger()
     handlers, level = list(root.handlers), root.level
-    quiet_levels = {name: logging.getLogger(name).level for name in _QUIET_LOGGERS}
+    libraries = {name: logging.getLogger(name) for name in _LIBRARY_LOGGERS}
+    library_state = {name: (lg.level, list(lg.handlers), lg.propagate) for name, lg in libraries.items()}
     structlog_config = structlog.get_config()
     bound_context = structlog.contextvars.get_contextvars()
     yield
     root.handlers[:] = handlers
     root.setLevel(level)
-    for name, quiet_level in quiet_levels.items():
-        logging.getLogger(name).setLevel(quiet_level)
+    for name, (library_level, library_handlers, propagate) in library_state.items():
+        libraries[name].setLevel(library_level)
+        libraries[name].handlers[:] = library_handlers
+        libraries[name].propagate = propagate
     structlog.configure(**structlog_config)
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(**bound_context)

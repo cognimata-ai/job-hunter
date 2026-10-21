@@ -220,6 +220,50 @@ def test_http_client_loggers_stay_quiet_because_they_log_full_urls() -> None:
     assert buf.getvalue() == ""
 
 
+# The root handler `logging.basicConfig` adds when the Anthropic SDK is imported with `ANTHROPIC_LOG` set
+# (anthropic 1.15.0 `_utils/_logs.py`): it writes records unredacted.
+SDK_BASIC_CONFIG_FORMAT = "[%(asctime)s - %(name)s:%(lineno)d - %(levelname)s] %(message)s"
+SDK_LOGGERS = ("anthropic", "httpx2", "httpcore2")
+
+
+def test_the_anthropic_sdk_and_its_http_loggers_never_write_below_warning() -> None:
+    """With `ANTHROPIC_LOG=debug` the SDK's import sets these loggers to DEBUG (it would log each request's
+    options, the whole prompt) and adds an unredacted root handler; `configure_logging` undoes both."""
+    root = logging.getLogger()
+    foreign = logging.NullHandler()
+    sdk_root = logging.StreamHandler(io.StringIO())
+    sdk_root.setFormatter(logging.Formatter(SDK_BASIC_CONFIG_FORMAT))
+    root.addHandler(foreign)
+    root.addHandler(sdk_root)
+    own = logging.StreamHandler(io.StringIO())
+    logging.getLogger("anthropic").addHandler(own)
+    for name in SDK_LOGGERS:
+        logging.getLogger(name).setLevel(logging.DEBUG)
+    buf = io.StringIO()
+    configure_logging("DEBUG", stream=buf)
+    assert sdk_root not in root.handlers and foreign in root.handlers
+    assert own not in logging.getLogger("anthropic").handlers
+    assert all(logging.getLogger(name).level == logging.WARNING for name in SDK_LOGGERS)
+    logging.getLogger("anthropic._base_client").debug("Request options: %s", {"json_data": "Zebrafinch"})
+    logging.getLogger("httpx2").info("HTTP Request: POST https://api.anthropic.com/v1/messages")
+    logging.getLogger("httpcore2.http11").debug("receive_response_body.complete")
+    assert buf.getvalue() == ""
+    logging.getLogger("anthropic").warning("still reported")
+    assert [json.loads(line)["event"] for line in buf.getvalue().splitlines()] == ["still reported"]
+
+
+def test_a_library_logger_set_to_debug_after_configure_logging_still_writes_nothing_below_warning() -> None:
+    """An SDK imported after `configure_logging` sets its level again; the app's handler drops its records
+    below WARNING, while the app's own loggers keep the configured level."""
+    buf = io.StringIO()
+    configure_logging("DEBUG", stream=buf)
+    logging.getLogger("anthropic").setLevel(logging.DEBUG)
+    logging.getLogger("anthropic._base_client").debug("Request options: Zebrafinch")
+    get_logger("jobhunter.llm.gateway").debug("kept")
+    logging.getLogger("jobhunter.worker").debug("kept too")
+    assert [json.loads(line)["event"] for line in buf.getvalue().splitlines()] == ["kept", "kept too"]
+
+
 def test_configure_logging_is_idempotent_and_leaves_foreign_handlers_alone() -> None:
     root = logging.getLogger()
     foreign = logging.NullHandler()

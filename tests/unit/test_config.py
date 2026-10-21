@@ -664,3 +664,24 @@ def test_fake_llm_dir_from_the_environment(tmp_path: Path, monkeypatch: pytest.M
     env = {**BASE_ENV, "JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": "llm-fx"}
     cfg = load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS))
     assert (cfg.fake_llm, cfg.fake_llm_dir) == (True, (tmp_path / "llm-fx").resolve())
+
+
+# --- M2 Task 4 (fix round 1): `ANTHROPIC_LOG` makes the Anthropic SDK log request content ------------------
+
+
+@pytest.mark.parametrize("value", ["debug", "info", "DEBUG", " info "])
+def test_anthropic_log_debug_or_info_is_refused_in_prod(tmp_path: Path, value: str) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "ANTHROPIC_LOG": value}
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS)))
+    assert (exc.value.check, exc.value.detail) == (
+        "anthropic_log_in_prod",
+        "ANTHROPIC_LOG must not be debug or info in prod",
+    )
+
+
+@pytest.mark.parametrize(("env_name", "value"), [("prod", "warning"), ("prod", ""), ("dev", "debug")])
+def test_anthropic_log_otherwise_passes(tmp_path: Path, env_name: str, value: str) -> None:
+    # outside prod the app's logging setup holds the SDK's loggers at WARNING (tests/unit/test_redact.py)
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "ANTHROPIC_LOG": value}
+    run_startup_assertions(load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS)))

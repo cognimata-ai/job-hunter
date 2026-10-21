@@ -22,6 +22,11 @@ import httpx2
 
 from jobhunter.config import AppConfig
 from jobhunter.llm import fake
+from jobhunter.observability.logging import quiet_library_loggers
+
+# The SDK's import may have set its loggers to DEBUG and added an unredacted root handler (`ANTHROPIC_LOG`):
+# undo both now that it is imported, whether or not `configure_logging` has run yet.
+quiet_library_loggers()
 
 ANTHROPIC_BASE_URL: Final = "https://api.anthropic.com"
 

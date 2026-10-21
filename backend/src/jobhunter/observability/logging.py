@@ -73,6 +73,15 @@ _STRUCTLOG_PROCESSORS: list[Processor] = [
 
 # Libraries that log full request URLs at INFO, and those URLs may carry API keys in the query string.
 _QUIET_LOGGERS = ("httpx", "httpcore")
+# The Anthropic SDK and its HTTP stack (`httpx2`, `httpcore2`). With `ANTHROPIC_LOG=debug` the SDK's import
+# sets their levels to DEBUG, and the SDK then logs each request's options: the whole prompt, with CV text
+# (privacy rule: CV text, profile JSON and LLM output never reach a log). They are held at WARNING with no
+# handler of their own, and the app's handlers drop anything of theirs below WARNING, whatever level a later
+# import sets.
+_CONTENT_LOGGERS = ("anthropic", "httpx2", "httpcore2")
+# The format of the root handler `logging.basicConfig` adds when the SDK is imported with `ANTHROPIC_LOG` set
+# and the root logger has no handler yet (anthropic 1.15.0 `_utils/_logs.py`): it writes records unredacted.
+_SDK_BASIC_CONFIG_FORMAT = "[%(asctime)s - %(name)s:%(lineno)d - %(levelname)s] %(message)s"
 
 _installed_handler: logging.Handler | None = None
 
@@ -90,7 +99,43 @@ def _configure_structlog() -> None:
 _configure_structlog()
 
 
+def _from_content_logger(name: str) -> bool:
+    return any(name == prefix or name.startswith(f"{prefix}.") for prefix in _CONTENT_LOGGERS)
+
+
+def _no_library_content(record: logging.LogRecord) -> bool:
+    """A handler filter: a `_CONTENT_LOGGERS` record below WARNING is dropped."""
+    return record.levelno >= logging.WARNING or not _from_content_logger(record.name)
+
+
+def quiet_library_loggers() -> None:
+    """Hold the `_QUIET_LOGGERS` and `_CONTENT_LOGGERS` at WARNING, the latter with no handler of their own
+    (so their records reach the app's redacting handler only), and remove the unredacted root handler that
+    the SDK's import may have added. `configure_logging` calls it, and so does `llm/transport.py` right after
+    it imports the SDK, which may set its levels again at that import."""
+    for name in (*_QUIET_LOGGERS, *_CONTENT_LOGGERS):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    for name in _CONTENT_LOGGERS:
+        logger = logging.getLogger(name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+        logger.propagate = True
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        formatter = handler.formatter
+        if (
+            type(handler) is logging.StreamHandler
+            and formatter is not None
+            and formatter._fmt == _SDK_BASIC_CONFIG_FORMAT
+        ):
+            root.removeHandler(handler)
+
+
 class _JsonStreamHandler(logging.StreamHandler[IO[str]]):
+    def __init__(self, stream: IO[str]) -> None:
+        super().__init__(stream)
+        self.addFilter(_no_library_content)
+
     def handleError(self, record: logging.LogRecord) -> None:
         # The default prints the failing message and its arguments to stderr, unredacted. This never
         # raises: a log call must not fail because the line about its failure could not be written.
@@ -152,8 +197,7 @@ def configure_logging(level: str = "INFO", *, stream: IO[str] | None = None) -> 
         root.removeHandler(_installed_handler)
     root.addHandler(handler)
     root.setLevel(level.upper())
-    for name in _QUIET_LOGGERS:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    quiet_library_loggers()
     _installed_handler = handler
 
 

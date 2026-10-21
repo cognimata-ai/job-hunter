@@ -7,6 +7,9 @@ idle read timeout fires.
 """
 
 import json
+import os
+import subprocess
+import sys
 import time
 from typing import Any
 
@@ -14,7 +17,7 @@ import anthropic
 import httpx2
 import pytest
 from jobhunter.config import AppConfig, load_config
-from jobhunter.llm import transport
+from jobhunter.llm import fake, transport
 from jobhunter.llm.gateway import GatewayChatAnthropic, _chat
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import SecretStr, ValidationError
@@ -240,3 +243,89 @@ def test_v5_chat_anthropic_alone_takes_neither_the_sdk_timeout_nor_the_http_clie
     with pytest.warns(UserWarning, match="http_client was transferred to model_kwargs"):
         llm = base(**common, http_client=object())
     assert "http_client" in llm.model_kwargs
+
+
+# --- the Anthropic SDK's own logging (privacy: CV text and LLM output never reach a log) --------------------
+
+MARKER = "Zebrafinch4711"  # a word nothing else logs: in the prompt and in the fake's answer
+SDK_LOG_SCRIPT = """
+import asyncio, json, logging, sys
+from pathlib import Path
+order, root, schema_json = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+records = []
+
+class Capture(logging.Handler):
+    def emit(self, record):
+        records.append((record.name, record.levelno, record.getMessage()))
+
+if order == "configure_first":
+    from jobhunter.observability.logging import configure_logging
+    configure_logging("DEBUG")
+from jobhunter.config import load_config
+from jobhunter.llm.gateway import _chat
+from jobhunter.llm.transport import make_http_client
+from jobhunter.observability.logging import configure_logging
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import SecretStr
+if order == "import_first":
+    configure_logging("DEBUG")
+logging.getLogger().addHandler(Capture())
+marker = sys.argv[4]
+env = {"JOBHUNTER_ENV": "dev", "JOBHUNTER_DB_NAME": "x", "JOBHUNTER_FAKE_LLM": "1"}
+env["JOBHUNTER_FAKE_LLM_DIR"] = str(root)
+cfg = load_config("worker", env, root / "no-secrets")
+
+async def main():
+    async with make_http_client(cfg) as client:
+        key = SecretStr("fake-anthropic-key-0001")
+        schema = json.loads(schema_json)
+        runnable = _chat("claude-opus-5-5", "low", 100, schema, api_key=key, http_client=client,
+                         purpose="propose_queries")
+        prompt = [SystemMessage("Answer the probe."), HumanMessage(f"Say {marker}.")]
+        out = await runnable.ainvoke(prompt)
+    assert out["parsed"] == {"answer": marker}, out
+
+asyncio.run(main())
+sdk = ("anthropic", "httpx2", "httpcore2")
+library = [r for r in records if r[0].split(".")[0] in sdk and r[1] < logging.WARNING]
+with_marker = sum(marker in r[2] for r in records)
+summary = {"library_records_below_warning": len(library), "records_with_marker": with_marker}
+print("RESULT " + json.dumps(summary))
+"""
+
+
+@pytest.mark.parametrize("order", ["import_first", "configure_first"])
+def test_anthropic_log_debug_logs_no_request_or_response_content(tmp_path: Any, order: str) -> None:
+    """With `ANTHROPIC_LOG=debug` the SDK, at its import, sets its loggers to DEBUG (it would log each
+    request's options, the whole prompt) and may add an unredacted root handler. A fake-transport call in a
+    fresh process, with the app's logging at DEBUG and either import order, writes nothing of the prompt or
+    the answer."""
+    schema = {
+        "title": "probe",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}},
+    }
+    path = fake.recording_path(
+        tmp_path, "propose_queries", "claude-opus-5-5", anthropic.transform_schema(schema)
+    )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(synthetic_sse({"answer": MARKER}, model="claude-opus-5-5"))
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("ANTHROPIC_", "JOBHUNTER_ANTHROPIC"))}
+    env["ANTHROPIC_LOG"] = "debug"
+    result = subprocess.run(
+        [sys.executable, "-c", SDK_LOG_SCRIPT, order, str(tmp_path), json.dumps(schema), MARKER],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    (line,) = [line for line in result.stdout.splitlines() if line.startswith("RESULT ")]
+    assert json.loads(line.removeprefix("RESULT ")) == {
+        "library_records_below_warning": 0,
+        "records_with_marker": 0,
+    }
+    assert MARKER not in result.stdout.replace(line, "") and MARKER not in result.stderr

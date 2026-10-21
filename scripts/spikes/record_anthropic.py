@@ -54,7 +54,6 @@ import copy
 import fcntl
 import importlib.util
 import json
-import logging
 import os
 import shutil
 import sys
@@ -750,8 +749,7 @@ def main(
 ) -> int:
     """Run one spike; the exit status is `OK`, `FAILED`, `LOCKED`, `REFUSED` or `STOPPED`. `root`,
     `fixtures_out` and `transport_factory` (tests only) replace the repository directories and the network."""
-    configure_logging()
-    logging.getLogger("httpx2").setLevel(logging.WARNING)  # its INFO line per request is noise here
+    configure_logging()  # it also holds the SDK's and httpx2's loggers at WARNING
     stream = sys.stdout if out is None else out
     key = ""
     try:

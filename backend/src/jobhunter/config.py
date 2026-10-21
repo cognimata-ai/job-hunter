@@ -49,6 +49,11 @@ _TRACING_VARS: Final = (
 )
 _FAKE_MODE_VARS: Final = ("JOBHUNTER_FAKE_SOURCES", "JOBHUNTER_FAKE_LLM", "JOBHUNTER_FAULT")
 _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_API_KEY")
+# The values with which the Anthropic SDK configures its own logging at its import, and at `debug` logs each
+# request's options, the prompt included (anthropic 1.15.0 `_utils/_logs.py`). The SDK compares exactly; the
+# check is case- and space-insensitive, so no near miss passes. Outside prod `configure_logging` holds the
+# SDK's loggers at WARNING anyway (`observability/logging.quiet_library_loggers`).
+_ANTHROPIC_LOG_VALUES: Final = ("debug", "info")
 _WORLD_READABLE: Final = 0o004
 # The levels `configure_logging` accepts (`JOBHUNTER_LOG_LEVEL`, compared upper-cased).
 LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -390,6 +395,11 @@ def run_startup_assertions(cfg: AppConfig) -> None:
 
     if cfg.env == "prod" and (anthropic := [name for name in _ANTHROPIC_ENV_VARS if name in env]):
         raise StartupCheckFailed("anthropic_env_in_prod", f"{', '.join(anthropic)} must not be set in prod")
+
+    # The privacy rule (CV text and LLM output never reach a log): fail fast rather than rely on the logging
+    # setup alone.
+    if cfg.env == "prod" and env.get("ANTHROPIC_LOG", "").strip().lower() in _ANTHROPIC_LOG_VALUES:
+        raise StartupCheckFailed("anthropic_log_in_prod", "ANTHROPIC_LOG must not be debug or info in prod")
 
     # After the §16.8 checks (ruling T13-a): the process applies this level when it configures its logging.
     if cfg.log_level not in LOG_LEVELS:
