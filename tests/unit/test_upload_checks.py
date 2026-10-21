@@ -223,6 +223,15 @@ def test_pasted_text_that_is_no_utf8_is_refused() -> None:
     assert paste_reason("Erika Musterfrau " * 20 + "\ud800") == "not_utf8"  # a lone surrogate
 
 
+def test_a_paste_is_answered_without_its_nul_characters() -> None:
+    """Task 11 (Task 9 carry): PostgreSQL's `text` refuses U+0000, so the paste is stored without it; the
+    length is that of the text without them."""
+    text = "Erika Musterfrau\x00 Entwicklerin " * 12
+    assert check_paste(text) == text.replace("\x00", "")
+    assert paste_reason("x" * 299 + "\x00") == "too_short"
+    assert paste_reason("\x00" * 400) == "too_short"
+
+
 # --- read_multipart_limited ------------------------------------------------------------------------------
 
 

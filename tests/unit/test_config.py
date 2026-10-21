@@ -676,6 +676,16 @@ def test_cv_store_dir_defaults_to_the_volume_and_follows_the_environment(tmp_pat
     assert load_config("api", env, secrets).cv_store_dir == tmp_path / "cv"
 
 
+# --- M2 Task 11: the docparse jobs' tmpfs (`JOBHUNTER_PARSE_JOBS_DIR`) -------------------------------------
+
+
+def test_parse_jobs_dir_defaults_to_the_tmpfs_and_follows_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    assert load_config("worker", BASE_ENV, secrets).parse_jobs_dir == Path("/data/parse")
+    env = {**BASE_ENV, "JOBHUNTER_PARSE_JOBS_DIR": str(tmp_path / "parse")}
+    assert load_config("worker", env, secrets).parse_jobs_dir == tmp_path / "parse"
+
+
 # --- M2 Task 4 (fix round 1): `ANTHROPIC_LOG` makes the Anthropic SDK log request content ------------------
 
 

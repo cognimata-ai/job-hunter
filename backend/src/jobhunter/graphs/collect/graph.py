@@ -52,6 +52,7 @@ from sqlalchemy.exc import DBAPIError
 
 from jobhunter.db.sql import is_serialization_failure
 from jobhunter.embeddings import EmbedderError
+from jobhunter.errors import NodeFailed
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
@@ -108,7 +109,13 @@ log = get_logger("jobhunter.graphs.collect")
 
 
 def is_retryable_db_error(exc: BaseException) -> bool:
-    """A serialization failure (40001), a deadlock (40P01) or a lost connection: the non-I/O retry (§9.1)."""
+    """A serialization failure (40001), a deadlock (40P01) or a lost connection: the non-I/O retry (§9.1).
+
+    Also the content-free stand-in of one (`errors.NodeFailed` with `retryable_db_error`), which a profile
+    node's wrapper raises in its place (M2 plan Deviation 25), so `DB_RETRY` applies to those nodes too.
+    """
+    if isinstance(exc, NodeFailed):
+        return exc.retryable_db_error
     return is_serialization_failure(exc) or (isinstance(exc, DBAPIError) and exc.connection_invalidated)
 
 

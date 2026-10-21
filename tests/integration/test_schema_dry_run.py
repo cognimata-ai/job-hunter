@@ -655,7 +655,9 @@ async def test_the_cli_runs_on_the_fake_prints_only_the_case_table_and_fails_on_
 async def test_live_needs_the_anthropic_key_and_sends_nothing_without_it(
     migrated: PgServer, proc_env: Callable[..., dict[str, str]], engine: AsyncEngine
 ) -> None:
-    done = await asyncio.to_thread(_cli, proc_env("worker", migrated), "--live")
+    env = proc_env("worker", migrated)
+    del env["JOBHUNTER_FAKE_LLM"]  # a worker child runs on the fake LLM by default (M2 Task 11): a live run
+    done = await asyncio.to_thread(_cli, env, "--live")
     assert done.returncode == 2
     assert "anthropic_key" in done.stderr
     async with engine.connect() as conn:

@@ -15,8 +15,10 @@
   structure is never parsed here: its encryption and page count are docparse's (plan Deviation 7), so no PDF
   parser runs in the networked api. The route runs `check_file` in a worker thread: it is pure, and the
   parse of a hostile central directory costs seconds of CPU that the event loop must not wait for;
-- `check_paste(text)` answers a pasted text of `PASTE_MIN` to `PASTE_MAX` characters, or raises
-  `UploadRejected` with `too_short`, `too_long`, or `not_utf8` (a lone surrogate, which JSON can carry).
+- `check_paste(text)` answers a pasted text of `PASTE_MIN` to `PASTE_MAX` characters without its NUL
+  characters (`profile.text.drop_nul`; counted without them), or raises `UploadRejected` with `too_short`,
+  `too_long`, or `not_utf8` (a lone surrogate, which JSON can carry). `UploadRejected` lives in
+  `profile.errors`, which the worker imports without FastAPI, and is re-exported here.
 
 **Streaming** (`read_multipart_limited`): the request body goes from `request.stream()` straight into
 `python_multipart.MultipartParser`, never through `request.form()` or `request.body()`, so the body is never
@@ -56,6 +58,9 @@ from starlette.requests import Request
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db.sql import is_unique_violation, q
 from jobhunter.db.transitions import transition
+from jobhunter.profile.errors import RejectReason as RejectReason
+from jobhunter.profile.errors import UploadRejected as UploadRejected
+from jobhunter.profile.text import drop_nul
 from jobhunter.worker.operations import create_operation
 from jobhunter.worker.tasks import Deferrer
 
@@ -86,18 +91,6 @@ Detected = Literal[
     "application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 ]
 CvFileMime = Detected | Literal["text/plain"]
-RejectReason = Literal[
-    "too_large",
-    "unknown_type",
-    "extension_mismatch",
-    "docx_structure",
-    "docx_macro",
-    "docx_expansion",
-    # a pasted text
-    "too_short",
-    "too_long",
-    "not_utf8",
-]
 DraftKind = Literal["extract_profile_text", "extract_profile"]
 
 FILE_FIELD: Final = "file"
@@ -137,14 +130,6 @@ _INSERT_CV = q(
 )
 _SEAL_TEXT = q("UPDATE cv_files SET raw_text_enc = :enc WHERE id = :id")
 _INSERT_DRAFT = q("INSERT INTO profile_drafts (cv_file_id, status) VALUES (:cv, 'uploaded') RETURNING id")
-
-
-class UploadRejected(Exception):
-    """A file or a pasted text failed a check of §12.1; `reason` is the problem's `errors[0].code`."""
-
-    def __init__(self, reason: RejectReason) -> None:
-        super().__init__(reason)
-        self.reason: RejectReason = reason
 
 
 def _detect(head: bytes) -> Detected | None:
@@ -188,7 +173,9 @@ def check_file(head: bytes, data: bytes, filename: str) -> Detected:
 
 
 def check_paste(text: str) -> str:
-    """`text` when it is a pasted CV §12.1 accepts: 300 to 50,000 characters of UTF-8."""
+    """`text` without its NUL characters (`profile.text.drop_nul`: PostgreSQL's `text` refuses them, Task 11)
+    when that is a pasted CV §12.1 accepts: 300 to 50,000 characters of UTF-8."""
+    text = drop_nul(text)
     if len(text) < PASTE_MIN:
         raise UploadRejected("too_short")
     if len(text) > PASTE_MAX:

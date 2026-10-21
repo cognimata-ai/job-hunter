@@ -8,6 +8,8 @@ no real CV and no real person's data is ever used (§12, privacy rules).
 - `replacement_char_pdf(lines)`: as `minimal_pdf`, with a font whose ToUnicode map reads every "€" of `lines`
   as U+FFFD, as a PDF with a broken text map reads;
 - `image_only_pdf()`: a one-page PDF 1.4 holding a single grey image and no text at all (a scanned CV);
+- `encrypted_pdf(data)`: a PDF encrypted with a user password (moved here from `tests/docparse/conftest.py`
+  in Task 11; it needs the `docparse` group);
 - `docx_bytes(paragraphs, table=None, *, macro=False, declared_expansion=None)`: a minimal DOCX built with
   `zipfile`; the `table` rows follow the first paragraph, so a reader that keeps document order puts its cells
   between the paragraphs. `macro=True` makes it a macro-enabled document (`word/vbaProject.bin`, the
@@ -18,21 +20,60 @@ no real CV and no real person's data is ever used (§12, privacy rules).
 
 `docparse_root` is a parse_jobs root (mode 2770, as the tmpfs of §12.2) served by a `docparse.worker.serve`
 loop thread for the length of a test; it needs the `docparse` group (`uv run --group docparse pytest`).
+
+Task 11 adds the operation side:
+- `nul_char_pdf(lines)`: as `replacement_char_pdf`, with "€" read as U+0000 (a text PostgreSQL refuses);
+- `operation_deps(engine, cfg)`: a real `OperationDeps` on `cfg` (the gateway on its fake LLM transport, the
+  parse client on `cfg.parse_jobs_dir`, the CV store on `cfg.cv_store_dir`, the profile graphs on a
+  checkpointer of their own), closed when the block ends;
+- the `op_runner` fixture (`OpRunner`): claims and executes operations in process with those deps, served by
+  a docparse loop that counts its jobs (`docparse_jobs`). `run_pending()` runs every due `pending` operation;
+  `run_one(op_id, *, pause=None, registry=None)` runs one through `execute_operation(…, deps=…,
+  registry=…)`. A pause replaces `afault_point` in every module of `PAUSABLE_MODULES` that exists and binds
+  it, for the rest of the test; with a pause and no registry the execution gets a fresh `ExecutionRegistry`,
+  so a paused execution and a second one of the same operation never meet `AlreadyExecuting`;
+- the `upload` fixture: `await upload(pdf_bytes)` posts a file through the api (`POST /api/profile/cv`, as
+  the logged-in client), `await upload("text")` pastes (`POST /api/profile/cv-text`); either answers the new
+  draft's id and requires 202;
+- `draft_row(engine, draft_id)` and `cv_row(engine, draft_id)`: the draft's row and its `cv_files` row.
 """
 
+import importlib
 import importlib.util
 import io
+import pkgutil
 import struct
 import threading
 import zipfile
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Iterator, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, Protocol
 from xml.sax.saxutils import escape
 
+import httpx
 import pytest
+import sqlalchemy as sa
+from jobhunter.clock import utcnow
+from jobhunter.config import AppConfig
+from jobhunter.graphs.checkpointer import open_saver
+from jobhunter.graphs.profile.deps import ProfileDeps
+from jobhunter.graphs.profile.graph import build_profile_graphs
+from jobhunter.llm.cache_monitor import CacheMonitor
+from jobhunter.llm.gateway import LLMGateway
+from jobhunter.llm.transport import make_http_client
+from jobhunter.profile.parse_client import ParseClient
+from jobhunter.profile.storage import CvStore
+from jobhunter.worker.executions import EXECUTIONS, ExecutionRegistry
+from jobhunter.worker.operations import OperationDeps, execute_operation
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+import docparse.worker as docparse_worker
 from docparse.worker import serve
+from tests.support.faults import PausePoint, PausePoints
+from tests.support.fixtures import ConfigFactory
+from tests.support.llm import FAKE_LLM_DIR
 
 PDF_MIME: Final = "application/pdf"
 DOCX_MIME: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -98,11 +139,22 @@ def _pages_pdf(contents: Sequence[bytes], resources: bytes, extra: Sequence[byte
 
 
 _HELVETICA: Final = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding"
-# Printable ASCII as itself, and the code of "€" in WinAnsiEncoding (0x80) as U+FFFD.
-_FFFD_CMAP: Final = b"""/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Synthetic def
+
+
+def _euro_cmap(code_point: bytes) -> bytes:
+    """A ToUnicode map: printable ASCII as itself, and the code of "€" in WinAnsiEncoding (0x80) as the
+    hex `code_point`."""
+    return (
+        b"""/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Synthetic def
 /CMapType 2 def 1 begincodespacerange <00> <FF> endcodespacerange
-1 beginbfrange <20> <7E> <0020> endbfrange 1 beginbfchar <80> <FFFD> endbfchar
+1 beginbfrange <20> <7E> <0020> endbfrange 1 beginbfchar <80> <%s> endbfchar
 endcmap CMapName currentdict /CMap defineresource pop end end"""
+        % code_point
+    )
+
+
+_FFFD_CMAP: Final = _euro_cmap(b"FFFD")
+_NUL_CMAP: Final = _euro_cmap(b"0000")
 
 
 def _text_pdf(lines: Sequence[str], lines_per_page: int, fonts: Sequence[bytes]) -> bytes:
@@ -122,6 +174,22 @@ def minimal_pdf(lines: Sequence[str], *, lines_per_page: int = 50) -> bytes:
 def replacement_char_pdf(lines: Sequence[str]) -> bytes:
     """A one-page text PDF of `lines` (ASCII and "€") whose ToUnicode map (object 4) reads "€" as U+FFFD."""
     return _text_pdf(lines, len(lines) or 1, [_HELVETICA + b" /ToUnicode 4 0 R >>", _stream(b"", _FFFD_CMAP)])
+
+
+def nul_char_pdf(lines: Sequence[str]) -> bytes:
+    """As `replacement_char_pdf`, with a ToUnicode map that reads "€" as U+0000: pypdf's text holds NUL."""
+    return _text_pdf(lines, len(lines) or 1, [_HELVETICA + b" /ToUnicode 4 0 R >>", _stream(b"", _NUL_CMAP)])
+
+
+def encrypted_pdf(data: bytes) -> bytes:
+    """`data` (a PDF) encrypted with a user password, as a password-protected CV is (the `docparse` group)."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter(clone_from=io.BytesIO(data))
+    writer.encrypt(user_password="geheim", algorithm="AES-256")
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 def image_only_pdf() -> bytes:
@@ -264,3 +332,169 @@ def docparse_root(tmp_path: Path) -> Iterator[Path]:
         stop.set()
         loop.join(_LOOP_JOIN_S)
     assert not loop.is_alive(), "the docparse loop did not stop"
+
+
+# --- Task 11: the operation runtime in process -----------------------------------------------------------
+
+# The modules whose `afault_point` a pause replaces, where they exist at this point of the plan (Tasks 18 and
+# 21 create the last two); `jobhunter.graphs.profile.nodes` stands for each of its node modules.
+PAUSABLE_MODULES: Final = (
+    "jobhunter.llm.gateway",
+    "jobhunter.graphs.profile.nodes",
+    "jobhunter.settings.scope_apply",
+    "jobhunter.profile.activation",
+)
+_PARSE_TIMEOUT_S: Final = 60.0
+_PARSE_POLL_S: Final = 0.05
+# A run of `run_pending` takes at most this many rounds (an operation that stays due would loop forever).
+_PENDING_ROUNDS: Final = 50
+_DUE = sa.text(
+    "SELECT id FROM operations WHERE status = 'pending' AND (not_before IS NULL OR not_before <= now()) "
+    "ORDER BY id"
+)
+_DRAFT = sa.text("SELECT * FROM profile_drafts WHERE id = :d")
+_CV = sa.text("SELECT c.* FROM cv_files c JOIN profile_drafts d ON d.cv_file_id = c.id WHERE d.id = :d")
+
+
+@asynccontextmanager
+async def operation_deps(engine: AsyncEngine, cfg: AppConfig) -> AsyncIterator[OperationDeps]:
+    """A real `OperationDeps` on `cfg` (module docstring); `cfg` must be in fake LLM mode or carry a key."""
+    async with open_saver(cfg.dsn("psycopg")) as saver:
+        http_client = make_http_client(cfg)
+        try:
+            yield OperationDeps(
+                cfg=cfg,
+                gateway=LLMGateway(engine, cfg, http_client=http_client, cache=CacheMonitor()),
+                parse_client=ParseClient(
+                    cfg.parse_jobs_dir, timeout_s=_PARSE_TIMEOUT_S, poll_s=_PARSE_POLL_S
+                ),
+                cv_store=CvStore(cfg.cv_store_dir),
+                profile_graphs=build_profile_graphs(saver, ProfileDeps(engine=engine, clock=utcnow)),
+                embedder=None,
+                clock=utcnow,
+            )
+        finally:
+            await http_client.aclose()
+
+
+def _pausable_modules() -> list[Any]:
+    modules = []
+    for name in PAUSABLE_MODULES:
+        try:
+            module = importlib.import_module(name)
+        except ModuleNotFoundError as missing:  # not yet at this point of the plan; nothing else is hidden
+            if missing.name is None or not name.startswith(missing.name):
+                raise
+            continue
+        modules.append(module)
+        if hasattr(module, "__path__"):  # a package: each of its modules
+            for info in pkgutil.iter_modules(module.__path__, f"{name}."):
+                modules.append(importlib.import_module(info.name))
+    return [module for module in modules if hasattr(module, "afault_point")]
+
+
+@dataclass
+class OpRunner:
+    """Operations executed in process with a real `OperationDeps` (module docstring)."""
+
+    engine: AsyncEngine
+    deps: OperationDeps
+    epoch: int
+    monkeypatch: pytest.MonkeyPatch
+    docparse_jobs: list[str] = field(default_factory=list)  # the job ids the docparse loop ran
+
+    async def due(self) -> list[int]:
+        """The `pending` operations whose `not_before` has passed, oldest first."""
+        async with self.engine.connect() as conn:
+            return [int(op_id) for op_id in (await conn.execute(_DUE)).scalars()]
+
+    async def run_pending(self) -> list[int]:
+        """Execute every due `pending` operation until none is left; the ids executed, in order."""
+        executed: list[int] = []
+        for _ in range(_PENDING_ROUNDS):
+            due = await self.due()
+            if not due:
+                return executed
+            for op_id in due:
+                await self.run_one(op_id)
+                executed.append(op_id)
+        raise RuntimeError("operations stayed due after every round")
+
+    async def run_one(
+        self,
+        op_id: int,
+        *,
+        pause: PausePoint | PausePoints | None = None,
+        registry: ExecutionRegistry | None = None,
+    ) -> None:
+        """One execution of operation `op_id` (module docstring)."""
+        if pause is not None:
+            for module in _pausable_modules():
+                self.monkeypatch.setattr(module, "afault_point", pause)
+        if registry is None:
+            registry = ExecutionRegistry() if pause is not None else EXECUTIONS
+        await execute_operation(self.engine, op_id, epoch=self.epoch, deps=self.deps, registry=registry)
+
+
+@pytest.fixture
+async def op_runner(
+    engine: AsyncEngine,
+    current_epoch: int,
+    make_config: ConfigFactory,
+    cv_store_dir: Path,
+    docparse_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[OpRunner]:
+    """An `OpRunner` on the api's CV store, a counting docparse loop and the committed fake LLM recordings."""
+    jobs: list[str] = []
+    real_run_job = docparse_worker.run_job
+
+    def counting_run_job(job_dir: Path) -> None:
+        jobs.append(job_dir.name)
+        real_run_job(job_dir)
+
+    # the loop thread looks the function up at every job
+    monkeypatch.setattr(docparse_worker, "run_job", counting_run_job)
+    importlib.import_module("jobhunter.profile.operations")  # registers the profile handlers and hooks
+    cfg = make_config(
+        "worker",
+        JOBHUNTER_CV_STORE_DIR=str(cv_store_dir),
+        JOBHUNTER_PARSE_JOBS_DIR=str(docparse_root),
+        JOBHUNTER_FAKE_LLM="1",
+        JOBHUNTER_FAKE_LLM_DIR=str(FAKE_LLM_DIR),
+    )
+    async with operation_deps(engine, cfg) as deps:
+        yield OpRunner(
+            engine=engine, deps=deps, epoch=current_epoch, monkeypatch=monkeypatch, docparse_jobs=jobs
+        )
+
+
+class Upload(Protocol):
+    def __call__(self, content: bytes | str, *, filename: str = ...) -> Awaitable[int]: ...
+
+
+@pytest.fixture
+def upload(logged_in_client: httpx.AsyncClient) -> Upload:
+    """`await upload(file_bytes, filename="Lebenslauf.pdf")` or `await upload(pasted_text)`: the new draft."""
+
+    async def post(content: bytes | str, *, filename: str = "Lebenslauf.pdf") -> int:
+        if isinstance(content, str):
+            r = await logged_in_client.post("/api/profile/cv-text", json={"text": content})
+        else:
+            r = await logged_in_client.post("/api/profile/cv", files={"file": (filename, content)})
+        assert r.status_code == 202, (r.status_code, r.json())
+        return int(r.json()["draft_id"])
+
+    return post
+
+
+async def draft_row(engine: AsyncEngine, draft_id: int) -> sa.Row[Any]:
+    """The `profile_drafts` row of `draft_id`."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_DRAFT, {"d": draft_id})).one()
+
+
+async def cv_row(engine: AsyncEngine, draft_id: int) -> sa.Row[Any]:
+    """The `cv_files` row of draft `draft_id`."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_CV, {"d": draft_id})).one()

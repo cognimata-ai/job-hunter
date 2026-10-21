@@ -6,12 +6,19 @@
    thread, because both block;
 3. the engine (a pool of 10);
 4. the task app (`make_queue_app`, a pool of 4) and the modules whose import registers the takeover sweeps,
-   the reconcilers and the operation handlers (`operations`, `runs`): all of them exist before the takeover;
+   the reconcilers and the operation handlers and failure hooks (`operations`, `runs`, `profile.operations`,
+   …: `_REGISTERING_MODULES`): all of them exist before the takeover;
 5. the epoch claim and the takeover sweep (`claim_epoch_and_sweep`; its sweeps defer through the sweep
    transaction's own connection), then `startup_check_passed` with `check="advisory_lock_acquired"`;
 6. the watchdog;
-7. the task app opened, the checkpointer, the collection graph on its `CollectDeps` and the `WorkerRuntime`
-   with a fresh `ShutdownState`. The deps: the HTTP layer configured first (`http.configure(cfg)`: in fake
+7. the task app opened, the checkpointer, the M2 operation dependencies (Task 11), the collection graph on
+   its `CollectDeps` and the `WorkerRuntime` with a fresh `ShutdownState`. The operation dependencies, after
+   the checkpointer: the LLM gateway on its `httpx2` client (`llm.transport.make_http_client`: in fake LLM
+   mode the recorded transport, else the `anthropic_key` secret), the docparse client on
+   `cfg.parse_jobs_dir` (every leftover a crashed worker left there removed first, §12.2), the CV store on
+   `cfg.cv_store_dir`, the profile graphs on their process-wide `ProfileDeps`, and `OperationDeps` over
+   them, the embedder and the clock, which `run_operation` hands to every execution. The collection deps:
+   the HTTP layer configured first (`http.configure(cfg)`: in fake
    mode the fixture transport serves every source), then one client per source (`registry.make_clients`,
    which in fake mode refuses to run before that configuration: a client made earlier would be on the live
    transport); the adapters of `registry.build_adapter` on those clients (the provider secrets of `cfg`, the
@@ -34,9 +41,10 @@
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
 12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app, the source
-    clients, the embedder's HTTP client and the engine closed, and the lock session closed last, which
-    releases the lock; then `worker_shutdown_complete`. Each of its waits takes at most what is left of the
-    stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits in `shutdown.STOP_BUDGET_S`.
+    clients, the embedder's and the gateway's HTTP clients and the engine closed, and the lock session closed
+    last, which releases the lock; then `worker_shutdown_complete`. Each of its waits takes at most what is
+    left of the stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits in
+    `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -80,6 +88,7 @@ from contextlib import AsyncExitStack
 from typing import Final, NoReturn, Protocol
 
 import httpx
+import httpx2
 import procrastinate
 import sqlalchemy as sa
 from procrastinate.exceptions import ConnectorException
@@ -95,8 +104,15 @@ from jobhunter.errors import FencedOut
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.graphs.collect.graph import build_collect_graph
+from jobhunter.graphs.profile.deps import ProfileDeps
+from jobhunter.graphs.profile.graph import build_profile_graphs
+from jobhunter.llm import transport as llm_transport
+from jobhunter.llm.cache_monitor import CacheMonitor
+from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
+from jobhunter.profile.parse_client import ParseClient
+from jobhunter.profile.storage import CvStore
 from jobhunter.sources import http
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow, sync_instances
@@ -105,6 +121,7 @@ from jobhunter.sources.registry import build_adapter, make_clients
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep, fence_epoch
 from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.lock import WATCHDOG_EXIT_CODE, LockSession, acquire_lock
+from jobhunter.worker.operations import OperationDeps
 from jobhunter.worker.reconcilers import ReconcileContext, run_reconcilers
 from jobhunter.worker.runtime import EPOCH_SUPERSEDED, ShutdownState, WorkerRuntime, request_shutdown
 from jobhunter.worker.shutdown import GRACE_S, StopDeadline, coordinate
@@ -130,6 +147,7 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.sources.watchlist_validate",
     "jobhunter.llm.spend_ledger",  # `llm_ledger_unsettled` and `budget_counters` (M2)
     "jobhunter.llm.gateway",  # `llm_refusal_rate` (M2)
+    "jobhunter.profile.operations",  # the `extract_profile_text` handler and its failure hook (M2 Task 11)
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
@@ -191,6 +209,7 @@ class _WorkerProcess:
         self.saver_scope = AsyncExitStack()
         self.clients: dict[str, httpx.AsyncClient] = {}  # the source clients (step 7), closed at teardown
         self.embedder_http: httpx.AsyncClient | None = None
+        self.llm_http: httpx2.AsyncClient | None = None  # the gateway's client (step 7), closed at teardown
         self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
@@ -226,9 +245,16 @@ class _WorkerProcess:
         # 6. The watchdog.
         self.watchdog = Watchdog(self.lock_session, ident.instance_id, epoch)
         self.watchdog.start()
-        # 7. The task app opened, the checkpointer, the collection graph and the runtime.
+        # 7. The task app opened, the checkpointer, the operation dependencies, the collection graph and the
+        # runtime.
         await queue.open_async()
         saver = await self.saver_scope.enter_async_context(open_saver(dsn))
+        llm_http = self.llm_http = llm_transport.make_http_client(cfg)
+        gateway = LLMGateway(engine, cfg, http_client=llm_http, cache=CacheMonitor())
+        parse_client = ParseClient(cfg.parse_jobs_dir)
+        parse_client.cleanup_leftovers()  # before any job: what a crashed worker left (§12.2)
+        cv_store = CvStore(cfg.cv_store_dir)
+        profile_graphs = build_profile_graphs(saver, ProfileDeps(engine=engine, clock=utcnow))
         http.configure(cfg)  # before the clients: in fake mode they must be on the fixture transport
         clients = self.clients = make_clients(cfg)
         shutdown = self.shutdown
@@ -248,6 +274,15 @@ class _WorkerProcess:
             limiter=RateLimiter(SOURCE_LIMITS.values(), clock=time.monotonic, sleep=asyncio.sleep),
             fetch_ctx=FetchContext(),
         )
+        operation_deps = OperationDeps(
+            cfg=cfg,
+            gateway=gateway,
+            parse_client=parse_client,
+            cv_store=cv_store,
+            profile_graphs=profile_graphs,
+            embedder=embedder,
+            clock=utcnow,
+        )
         runtime = WorkerRuntime(
             cfg=cfg,
             engine=engine,
@@ -257,6 +292,11 @@ class _WorkerProcess:
             epoch=epoch,
             shutdown=shutdown,
             embedder=embedder,
+            gateway=gateway,
+            parse_client=parse_client,
+            cv_store=cv_store,
+            profile_graphs=profile_graphs,
+            operation_deps=operation_deps,
         )
 
         # 8. The source instances synced with the secrets under this worker's epoch fence, the start
@@ -335,6 +375,10 @@ class _WorkerProcess:
         if self.embedder_http is not None:
             await self.embedder_http.aclose()
 
+    async def _close_llm(self) -> None:
+        if self.llm_http is not None:
+            await self.llm_http.aclose()
+
     async def _dispose_engine(self) -> None:
         if self.engine is not None:
             await self.engine.dispose()
@@ -365,6 +409,7 @@ class _WorkerProcess:
             ("queue", lambda: _within(deadline, self._close_queue())),
             ("clients", lambda: _within(deadline, self._close_clients())),
             ("embedder", lambda: _within(deadline, self._close_embedder())),
+            ("llm", lambda: _within(deadline, self._close_llm())),
             ("engine", lambda: _within(deadline, self._dispose_engine())),
             ("lock_session", self._close_lock_session),  # last: closing it releases the lock
         )

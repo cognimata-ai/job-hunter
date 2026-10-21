@@ -32,6 +32,8 @@ _IMAGES_LOCK: Final = _REPO_ROOT / "deploy" / "images.lock"
 _POSTGRES_DIR: Final = _REPO_ROOT / "deploy" / "postgres"
 # The scrubbed fixtures a test worker is served from (M1: `JOBHUNTER_FAKE_SOURCES`, no provider key needed).
 FIXTURES_DIR: Final = _REPO_ROOT / "tests" / "contract" / "fixtures"
+# The committed Anthropic recordings a spawned worker's gateway is served from (M2 Task 11).
+FAKE_LLM_DIR: Final = FIXTURES_DIR / "anthropic"
 
 # Database user and secret file (in the container's /run/secrets) of every PgRole.
 _DB_USER: Final[Mapping[PgRole, str]] = MappingProxyType(
@@ -374,12 +376,17 @@ def server_env(
 ) -> dict[str, str]:
     """The `JOBHUNTER_*` environment of `role` against `server`; `env` adds to it or overrides it.
 
-    The worker is in fake mode: its sources are served from `FIXTURES_DIR` (it has no provider secret).
+    The worker is in fake mode: its sources are served from `FIXTURES_DIR` (it has no provider secret). Its
+    docparse jobs' root (M2 Task 11) is the server's own directory, never the container's `/data/parse`.
     `embedder_url` is the embedder the role reaches (`JOBHUNTER_EMBEDDER_URL`): the session's fake embedder,
     as `make_config` and `proc_env` pass it (Task 22); without it the configuration's default stays.
     """
     fake_sources = (
-        {"JOBHUNTER_FAKE_SOURCES": "1", "JOBHUNTER_FIXTURES_DIR": str(FIXTURES_DIR)}
+        {
+            "JOBHUNTER_FAKE_SOURCES": "1",
+            "JOBHUNTER_FIXTURES_DIR": str(FIXTURES_DIR),
+            "JOBHUNTER_PARSE_JOBS_DIR": str(server.workdir / "parse_jobs"),
+        }
         if role == "worker"
         else {}
     )
@@ -408,10 +415,15 @@ def process_env(
     """The environment of a child process of `role` against `server`.
 
     It is the test process's environment without the variables the application reads (`JOBHUNTER_*`,
-    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`), plus `server_env` (with `embedder_url`) and `extra`.
+    `LANGSMITH_*`, `LANGCHAIN_*`, `ANTHROPIC_*`), plus `server_env` (with `embedder_url`) and `extra`. A
+    worker child is in fake LLM mode too (M2 Task 11): it has no `anthropic_key`, and its gateway is built at
+    its start, on the committed recordings (`FAKE_LLM_DIR`), so nothing it does can reach the network.
     """
     inherited = {name: value for name, value in os.environ.items() if not name.startswith(ENV_PREFIXES)}
-    return {**inherited, **server_env(server, role, embedder_url=embedder_url), **extra}
+    fake_llm = (
+        {"JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": str(FAKE_LLM_DIR)} if role == "worker" else {}
+    )
+    return {**inherited, **server_env(server, role, embedder_url=embedder_url), **fake_llm, **extra}
 
 
 def pg_rows(

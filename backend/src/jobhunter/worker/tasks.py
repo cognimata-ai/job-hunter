@@ -119,7 +119,13 @@ async def run_operation(context: JobContext, operation_id: int) -> None:
     from jobhunter.worker.operations import execute_operation
 
     rt: WorkerRuntime = context.additional_context["runtime"]
-    await execute_operation(rt.engine, operation_id, epoch=rt.epoch, on_superseded=_stop_when_superseded(rt))
+    await execute_operation(
+        rt.engine,
+        operation_id,
+        epoch=rt.epoch,
+        deps=rt.operation_deps,
+        on_superseded=_stop_when_superseded(rt),
+    )
 
 
 @blueprint.periodic(cron="* * * * *")

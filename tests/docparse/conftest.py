@@ -7,7 +7,6 @@ functions of a test module. Every text in them is invented.
 
 import contextlib
 import fcntl
-import io
 import json
 import os
 import resource
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import Final, NoReturn
 
 from docparse.extract import Extracted
+from tests.support.profile import encrypted_pdf as encrypted_pdf  # moved there (Task 11)
 
 INPUT_NAMES: Final = {
     "application/pdf": "input.pdf",
@@ -51,17 +51,6 @@ def make_job(root: Path, data: bytes, mime: str, *, mode: str = "extract", name:
 def result_of(job: Path) -> dict[str, object]:
     loaded: dict[str, object] = json.loads((job / "result.json").read_text())
     return loaded
-
-
-def encrypted_pdf(data: bytes) -> bytes:
-    """`data` (a PDF) encrypted with a user password, as a password-protected CV is."""
-    from pypdf import PdfWriter
-
-    writer = PdfWriter(clone_from=io.BytesIO(data))
-    writer.encrypt(user_password="geheim", algorithm="AES-256")
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
 
 
 def burn(_path: Path, _mime: str) -> NoReturn:  # never returns: CPU-bound

@@ -179,7 +179,7 @@ async def test_a_validation_whose_claim_was_lost_meanwhile_writes_nothing(
     async with engine.begin() as c:
         op, _ = await request_validation(c, company_id, defer=defer_in_tx)
     before = await validation(engine, company_id)
-    lost = ops.OperationClaim(op, uuid4(), "watchlist_validate", {"watchlist_company_id": company_id})
+    lost = ops.OperationClaim(op, uuid4(), "watchlist_validate", {"watchlist_company_id": company_id}, 0)
     with pytest.raises(FencedOut):
         await run_watchlist_validate(ops.OperationContext(claim=lost, engine=engine))
     assert await validation(engine, company_id) == before
