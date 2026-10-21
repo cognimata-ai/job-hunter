@@ -62,15 +62,17 @@ whose wait would leave less than `RETRY_MIN_REMAINING_S`, or the last try, is `L
 **What a try records** (G10): the requested and served model, the usage with both cache counts (langchain's
 `input_tokens` includes them, so they are subtracted, and a missing count is 0), `stop_reason`, the refusal
 category, the provider `request-id` (from the HTTP response: langchain does not expose it; `TryReceipt`) and
-the `execution_config_id`. A completed call feeds the in-process `CacheMonitor` (§10.8), whose alerts are
-written in the settlement transaction. The per-try log line `llm_try` names the purpose, model, effort, stage,
-try, outcome and ids only: never a prompt, a response or any CV or profile text. The domain errors raised here
-carry codes, statuses and model ids only, and are raised `from None`, so no provider error (which holds the
-request) rides along.
+the `execution_config_id`. Once its settlement has committed, a completed call feeds the in-process
+`CacheMonitor` (§10.8), whose alerts are then written in a transaction of their own. The per-try log line
+`llm_try` names the purpose, model, effort, stage, try, outcome and ids only: never a prompt, a response or
+any CV or profile text. The domain errors raised here carry codes, statuses and model ids only, and each is
+raised after the handler that classified its cause has ended, so neither its `__cause__` nor its
+`__context__` refers to a provider error (which holds the request) or to an encoding error (which holds the
+prompt).
 
 **The reconciler** `llm_refusal_rate` (heavy, §17.6): more than 5% refusals among the completed calls of the
-last 24 h, with at least 20 of them, opens `llm.refusal_rate` (warn); the condition no longer holding resolves
-it.
+last 24 h, with at least 20 of them, opens `llm.refusal_rate` (warn); a rate of 5% or less resolves it (a
+window without calls is 0%), and too few calls at a rate above 5% leave it as it is.
 """
 
 import asyncio
@@ -460,6 +462,14 @@ class RenderedPrompt:
         )
 
 
+def _hashes(prompt: RenderedPrompt) -> tuple[bytes, bytes | None] | None:
+    """`(rendered_sha256, prefix_sha256)` of `prompt`; `None` when a component cannot be encoded as UTF-8."""
+    try:
+        return prompt.rendered_sha256(), prompt.prefix_sha256()
+    except UnicodeEncodeError:
+        return None
+
+
 def to_messages(prompt: RenderedPrompt) -> list[BaseMessage]:
     """The langchain messages of `prompt`: one system message (a plain string for a single uncached block,
     else text blocks with `cache_control: {"type": "ephemeral"}` on the cached ones), then the user turns."""
@@ -646,10 +656,10 @@ class LLMGateway:
     async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult:
         """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries)."""
         messages = to_messages(prompt)  # the last is a user turn: never a prefill (RenderedPrompt)
-        try:
-            rendered, prefix = prompt.rendered_sha256(), prompt.prefix_sha256()
-        except UnicodeEncodeError:
-            raise InputUnbounded("unencodable") from None
+        hashes = _hashes(prompt)
+        if hashes is None:  # raised outside the handler: the encoding error holds the whole prompt
+            raise InputUnbounded("unencodable")
+        rendered, prefix = hashes
         bound = await self._input_bound(node, prompt, ctx)
         counted = Decimal(0)
         stages: tuple[tuple[Stage, int], ...] = (
@@ -706,19 +716,26 @@ class LLMGateway:
         return int(counted.input_tokens)
 
     async def _input_bound(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> int:
-        """The reservation's input bound (§10.7), before anything is reserved; `InputUnbounded` otherwise."""
+        """The reservation's input bound (§10.7), before anything is reserved; `InputUnbounded` otherwise.
+
+        Each `InputUnbounded` is raised after the handler that classified its cause has ended, so neither its
+        `__cause__` nor its `__context__` refers to that error: an encoding error holds the prompt, and the
+        SDK's error holds its request, the count body with the native PDF."""
         if not ctx.native_pdf:
             try:
                 return text_input_bound(node.model, prompt.as_request(node.schema))
             except UnicodeEncodeError:
-                raise InputUnbounded("unencodable") from None
+                pass
+            raise InputUnbounded("unencodable")
+        count: int | None = None
+        failure = ""
         try:
             count = await self.count_tokens(node.model, self.count_body(node, prompt))
         except anthropic.APIError as exc:
-            log.warning(
-                "llm_count_failed", purpose=node.purpose, model=node.model, error_class=type(exc).__name__
-            )
-            raise InputUnbounded("count_failed") from None
+            failure = type(exc).__name__
+        if count is None:
+            log.warning("llm_count_failed", purpose=node.purpose, model=node.model, error_class=failure)
+            raise InputUnbounded("count_failed")
         if count > CONTEXT_WINDOW[node.model]:
             log.warning(
                 "llm_input_over_context_window", purpose=node.purpose, model=node.model, counted=count
@@ -911,18 +928,8 @@ class LLMGateway:
                     message="an LLM call stopped for an unexpected reason",
                     context={"purpose": t.node.purpose, "model": t.node.model, "stop_reason": stop_reason},
                 )
-            self._cache.observe(
-                served,
-                t.node.effort,
-                t.node.purpose,
-                prefix,
-                t.started_at,
-                usage.cache_read_input_tokens,
-                input_tokens=usage.input_tokens,
-                cache_creation_tokens=usage.cache_creation_input_tokens,
-            )
-            await write_alerts(conn, self._cache.drain())
         self._committed(t, receipt, "billed", figures, code)
+        await self._observe_cache(t, served, prefix, usage)
         match code:
             case None:
                 result = GatewayResult(
@@ -946,6 +953,30 @@ class LLMGateway:
                 raise InvalidOutput("structural")
             case _:
                 raise InvalidOutput("unexpected_stop_reason")
+
+    async def _observe_cache(self, t: _Try, served: str, prefix: bytes | None, usage: Usage) -> None:
+        """After the settlement committed (plan F32): the cache monitor's ratio gauge and streak, then the
+        alerts that queued, in a transaction of their own. A failed alert write never fails the billed call:
+        it is logged (its class only) and the alerts go back to the monitor, written after the next call."""
+        self._cache.observe(
+            served,
+            t.node.effort,
+            t.node.purpose,
+            prefix,
+            t.started_at,
+            usage.cache_read_input_tokens,
+            input_tokens=usage.input_tokens,
+            cache_creation_tokens=usage.cache_creation_input_tokens,
+        )
+        alerts = self._cache.drain()
+        if not alerts:
+            return
+        try:
+            async with self._engine.begin() as conn:
+                await write_alerts(conn, alerts)
+        except SQLAlchemyError as exc:
+            self._cache.requeue(alerts)
+            log.warning("llm_cache_alerts_unwritten", alerts=len(alerts), error_class=type(exc).__name__)
 
     async def _error_response(self, t: _Try, receipt: TryReceipt, status: int) -> _Next:
         """An error response without content: not billed; retried for a retryable status (§10.4)."""
@@ -1072,17 +1103,19 @@ _REFUSALS: Final = q(
 
 @reconciler("llm_refusal_rate", "heavy")
 async def reconcile_refusal_rate(ctx: ReconcileContext) -> int:
-    """§17.6 `llm.refusal_rate`: open it (warn, once) while more than 5% of the completed calls started in
-    the 24 h before `ctx.now` were refused and there were at least 20; resolve it once that no longer holds
-    (5% or less, or too few calls to judge). Returns 1 when it opened or resolved the alert, else 0. Fenced by
-    the worker epoch first: the worker's own `FencedOut` propagates (Ruling FR-w), another owner's ends the
-    pass with 0."""
+    """§17.6 `llm.refusal_rate` over the completed calls started in the 24 h before `ctx.now`: opened (warn,
+    once) while more than 5% of them were refused and there were at least 20; resolved once the rate is 5% or
+    less ("rate below threshold"), a window without calls counting as 0%. With fewer than 20 calls and a
+    rate above 5% there is too little to raise on and nothing to resolve, so the alert is left as it is.
+    Returns 1 when it opened or resolved the alert, else 0. Fenced by the worker epoch first: the worker's
+    own `FencedOut` propagates (Ruling FR-w), another owner's ends the pass with 0."""
     try:
         async with ctx.engine.begin() as conn:
             await fence_epoch(conn, ctx.epoch)
             row = (await conn.execute(_REFUSALS, {"since": ctx.now - REFUSAL_WINDOW})).one()
             calls, refusals = int(row.calls), int(row.refusals)
-            if calls >= REFUSAL_MIN_CALLS and refusals * 100 > REFUSAL_MAX_PCT * calls:
+            above = refusals * 100 > REFUSAL_MAX_PCT * calls  # exact: no float; 0 of 0 is not above
+            if above and calls >= REFUSAL_MIN_CALLS:
                 opened = await open_alert(
                     conn,
                     code=REFUSAL_RATE_ALERT,
@@ -1094,6 +1127,8 @@ async def reconcile_refusal_rate(ctx: ReconcileContext) -> int:
                 if opened is not None:
                     log.warning("llm_refusal_rate_high", calls=calls, refusals=refusals)
                 return 0 if opened is None else 1
+            if above:
+                return 0
             return int(await resolve_alert(conn, code=REFUSAL_RATE_ALERT, subject=_REFUSAL_SUBJECT))
     except FencedOut as fenced_out:
         if fenced_out.worker_superseded:

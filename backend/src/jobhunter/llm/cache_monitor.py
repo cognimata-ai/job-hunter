@@ -12,9 +12,11 @@ call.
   cache_write)` over the calls of the role that started within the hour before its newest one.
 
 A call without a cached prefix (`prefix_sha256` None, every M2 call: §10.6 "single calls with no cache
-marker") counts towards the ratio but never streaks. The monitor writes nothing itself: `observe` queues its
-alerts and the gateway drains them (`drain`, right after `observe`, with no await in between) into the
-settlement transaction of the call (`write_alerts`). A key unseen for an hour is forgotten.
+marker") counts towards the ratio but never streaks. The monitor writes nothing itself: the gateway calls
+`observe` once the call's settlement has committed (plan F32: no gauge or streak moves for a rolled-back
+settlement), drains the alerts it queued (`drain`, with no await in between) and writes them in a
+transaction of their own (`write_alerts`); a failed write gives them back (`requeue`) for the next call. A key
+unseen for an hour is forgotten.
 """
 
 from collections.abc import Mapping, Sequence
@@ -128,6 +130,10 @@ class CacheMonitor:
         """The alert writes queued since the last drain, oldest first."""
         alerts, self._pending = self._pending, []
         return alerts
+
+    def requeue(self, alerts: Sequence[CacheAlert]) -> None:
+        """Give back drained alerts that could not be written, ahead of any queued since."""
+        self._pending[:0] = alerts
 
     def streak(self, model_served: str, effort: str, purpose: str, prefix_sha256: bytes) -> int:
         """The key's current `zero_read_streak` (0 for a key not seen)."""

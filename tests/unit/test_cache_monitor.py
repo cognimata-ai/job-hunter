@@ -127,3 +127,30 @@ def test_the_ratio_gauge_follows_the_rolling_hour() -> None:
     )
     assert gauge("claude-haiku-5-5", role="extract_profile") == 0.0
     assert gauge("claude-haiku-5-5") == 100 / 500
+
+
+def miss(monitor: CacheMonitor, seconds: float) -> None:
+    """A zero-read call of key A at `seconds`, its alerts left queued."""
+    started = T0 + timedelta(seconds=seconds)
+    monitor.observe(
+        "claude-sonnet-5-5",
+        "medium",
+        "generate",
+        PREFIX_A,
+        started,
+        0,
+        input_tokens=100,
+        cache_creation_tokens=0,
+    )
+
+
+def test_requeued_alerts_are_drained_again_first() -> None:
+    monitor = CacheMonitor()
+    for second in (0, 10, 20, 30, 40):
+        miss(monitor, second)  # streak 3 at 30 s and 4 at 40 s
+    first, second_alert = monitor.drain()
+    monitor.requeue([first])  # its write failed
+    miss(monitor, 50)  # streak 5
+    again = monitor.drain()
+    assert again[0] is first and len(again) == 2 and monitor.drain() == []
+    assert [a.context["zero_read_streak"] for a in (first, second_alert, again[1])] == [3, 4, 5]

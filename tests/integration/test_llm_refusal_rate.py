@@ -1,5 +1,6 @@
 """`llm_refusal_rate` (heavy; spec §17.6, plan Task 5): more than 5% refusals among the completed calls of the
-last 24 h, with at least 20 of them, raises `llm.refusal_rate` (warn); a rate at or below 5% resolves it."""
+last 24 h, with at least 20 of them, raises `llm.refusal_rate` (warn); a rate at or below 5% resolves it (no
+calls is 0%), while fewer than 20 calls at a higher rate leave it as it is."""
 
 from datetime import datetime, timedelta
 
@@ -95,8 +96,30 @@ async def test_a_rate_falling_to_5_percent_resolves_the_alert(engine, queue_app,
     await add_calls(engine, 1, at=now - timedelta(hours=1))  # 2 of 40: 5%, no longer above
     assert await check(engine, queue_app, now) == 1
     assert await open_alerts(engine, REFUSAL_RATE_ALERT) == []
-    # once the refusals leave the window there is no rate to judge, and nothing opens again
+    # 23 h on, the refusals have left the window: 0 of the 20 later calls, and nothing opens again
     assert await check(engine, queue_app, now + timedelta(hours=23)) == 0
+    assert await open_alerts(engine, REFUSAL_RATE_ALERT) == []
+
+
+async def test_too_few_calls_at_a_high_rate_leave_the_alert_open(engine, queue_app, current_epoch) -> None:
+    now = utcnow()
+    await add_calls(engine, 1, at=now - timedelta(hours=23, minutes=30))  # the oldest, not refused
+    await add_calls(engine, 19, refused=10, at=now - timedelta(hours=1))
+    assert await check(engine, queue_app, now) == 1  # 10 of 20: 50%
+    assert await open_alerts(engine, REFUSAL_RATE_ALERT) == [(KEY, "warn", 1)]
+    # an hour on the oldest call has left the window: 10 of 19, still 53%, too few to judge but not below
+    assert await check(engine, queue_app, now + timedelta(hours=1)) == 0
+    assert await open_alerts(engine, REFUSAL_RATE_ALERT) == [(KEY, "warn", 1)]
+    await add_calls(engine, 181, at=now)  # 10 of 200: 5%, no longer above
+    assert await check(engine, queue_app, now + timedelta(hours=1)) == 1
+    assert await open_alerts(engine, REFUSAL_RATE_ALERT) == []
+
+
+async def test_a_window_without_calls_resolves_the_alert(engine, queue_app, current_epoch) -> None:
+    now = utcnow()
+    await add_calls(engine, 20, refused=2, at=now - timedelta(hours=1))
+    assert await check(engine, queue_app, now) == 1
+    assert await check(engine, queue_app, now + timedelta(hours=24)) == 1  # 0 calls: a rate of 0%
     assert await open_alerts(engine, REFUSAL_RATE_ALERT) == []
 
 

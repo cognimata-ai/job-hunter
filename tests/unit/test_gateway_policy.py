@@ -134,6 +134,8 @@ async def test_a_lone_surrogate_is_refused_before_any_reservation(tmp_path: Path
         await _refused_call(tmp_path, left_s=900, text="half a pair: \ud800")
     assert refused.value.reason == "unencodable"
     assert "\ud800" not in str(refused.value)
+    # the encoding error, whose `.object` is the whole rendered prompt, is neither its cause nor its context
+    assert refused.value.__cause__ is None and refused.value.__context__ is None
     assert time.monotonic() - started < 5
 
 
@@ -171,3 +173,16 @@ def test_node_config_refuses_a_policy_without_a_supported_effort() -> None:
     }
     with pytest.raises(ValueError, match="unknown model"):
         node_config("extract_profile", model_policy=unknown, execution=execution, schema=GatewayOut)
+
+
+async def test_the_input_bound_raises_unencodable_without_the_encoding_error(tmp_path: Path) -> None:
+    cfg = fake_llm_config(FAKE_LLM_DIR, tmp_path / "no-secrets")
+    async with make_http_client(cfg) as client:
+        gw = LLMGateway(cast(AsyncEngine, _NoEngine()), cfg, http_client=client, cache=CacheMonitor())
+        ctx = gateway.CallContext(
+            owner=EvalRunOwner(1), purpose_class="nonscoring", execution_config_id=1, deadline=0.0
+        )
+        with pytest.raises(InputUnbounded) as refused:
+            await gw._input_bound(GATEWAY_NODE, gateway_prompt("half a pair: \ud800"), ctx)
+    assert refused.value.reason == "unencodable"
+    assert refused.value.__cause__ is None and refused.value.__context__ is None

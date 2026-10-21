@@ -19,6 +19,7 @@ from jobhunter.errors import FencedOut
 from jobhunter.llm import gateway as gateway_module
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.bounds import native_pdf_bound, text_input_bound
+from jobhunter.llm.cache_monitor import CacheMonitor, write_alerts
 from jobhunter.llm.errors import (
     BudgetExhausted,
     DeadlineExhausted,
@@ -355,6 +356,8 @@ async def test_an_unbounded_native_pdf_reserves_and_sends_nothing(
             GATEWAY_NODE, gateway_prompt(), call_context(owner, ec, native_pdf=True)
         )
     assert unbounded.value.reason == ("count_failed" if answer == "error" else "context_window")
+    # the SDK's error, whose request holds the count body (the native PDF), is neither cause nor context
+    assert unbounded.value.__cause__ is None and unbounded.value.__context__ is None
     assert await tries(engine) == [] and fake_llm.served == 0
 
 
@@ -411,26 +414,67 @@ class FailingSettlementCommit:
         return self._engine.connect()
 
 
+def cache_ratio() -> float | None:
+    labels = {"model": MODEL, "effort": "medium", "role": "extract_profile"}
+    return REGISTRY.get_sample_value("jobhunter_llm_cache_read_ratio", labels)
+
+
 async def test_the_spend_metrics_move_only_after_the_settlement_commits(
     engine, fake_llm: FakeLLM, owner, ec, monkeypatch
 ) -> None:
-    await fake_llm.gateway(engine).call(GATEWAY_NODE, gateway_prompt(), call_context(owner, ec))
+    monitor = CacheMonitor()  # both gateways share it, as one worker's calls do
+    prompt = gateway_prompt(cached_prefix=True)
+    prefix = prompt.prefix_sha256()
+    assert prefix is not None
+    # the first call reads 50 tokens from the cache: ratio 50 / (120 + 50)
+    fake_llm.record("extract_profile", MODEL, usage={"cache_read_input_tokens": 50})
+    await fake_llm.gateway(engine, cache=monitor).call(GATEWAY_NODE, prompt, call_context(owner, ec))
     after_first = spend_gauges()
     assert after_first["billed"] is not None and after_first["billed"] > 0
-    ratio_before = REGISTRY.get_sample_value(
+    assert cache_ratio() == 50 / 170
+    reservation_ratio = REGISTRY.get_sample_value(
         "jobhunter_llm_reservation_ratio_count", {"purpose": "extract_profile"}
     )
     counted = Counted("ok")
-    failing = fake_llm.gateway(cast(AsyncEngine, FailingSettlementCommit(engine, monkeypatch)))
+    # the second reads nothing 0 s later: observed, it would move the ratio and start the zero-read streak
+    fake_llm.record("extract_profile", MODEL)
+    failing = fake_llm.gateway(cast(AsyncEngine, FailingSettlementCommit(engine, monkeypatch)), cache=monitor)
     with pytest.raises(RuntimeError, match="injected"):
-        await failing.call(GATEWAY_NODE, gateway_prompt(), call_context(owner, ec))
+        await failing.call(GATEWAY_NODE, prompt, call_context(owner, ec))
     assert spend_gauges() == after_first and counted.delta() == {"ok": 0}
-    ratio_after = REGISTRY.get_sample_value(
-        "jobhunter_llm_reservation_ratio_count", {"purpose": "extract_profile"}
+    assert (
+        REGISTRY.get_sample_value("jobhunter_llm_reservation_ratio_count", {"purpose": "extract_profile"})
+        == reservation_ratio
     )
-    assert ratio_after == ratio_before
+    assert cache_ratio() == 50 / 170 and monitor.ratio(MODEL, "medium", "extract_profile") == 50 / 170
+    assert monitor.streak(MODEL, "medium", "extract_profile", prefix) == 0
     rows = await tries(engine)
     assert states(rows) == ["billed", "dispatched"]  # the settlement rolled back; the reconciler takes it
+
+
+async def test_a_failed_cache_alert_write_never_fails_the_billed_call(
+    engine, fake_llm: FakeLLM, owner, ec, monkeypatch, log_events
+) -> None:
+    monitor = CacheMonitor()
+    gw = fake_llm.gateway(engine, cache=monitor)
+    prompt = gateway_prompt(cached_prefix=True)
+    for _ in range(3):  # the prefix's first call, then two misses
+        await gw.call(GATEWAY_NODE, prompt, call_context(owner, ec))
+
+    async def unreachable_database(*args: Any, **kwargs: Any) -> None:
+        raise sa.exc.OperationalError("INSERT", {}, ConnectionError("database unreachable"))
+
+    monkeypatch.setattr(gateway_module, "write_alerts", unreachable_database)
+    result = await gw.call(GATEWAY_NODE, prompt, call_context(owner, ec))  # the third miss: the streak alert
+    assert result.parsed == GatewayOut.model_validate(GATEWAY_BODY)
+    (event,) = [e for e in log_events() if e["event"] == "llm_cache_alerts_unwritten"]
+    assert (event["alerts"], event["error_class"]) == (1, "OperationalError")
+    assert await open_alerts(engine, "llm.cache_miss_streak") == []
+    monkeypatch.setattr(gateway_module, "write_alerts", write_alerts)
+    await gw.call(GATEWAY_NODE, prompt, call_context(owner, ec))  # the given-back alert is written with it
+    ((_, severity, occurrences),) = await open_alerts(engine, "llm.cache_miss_streak")
+    assert (severity, occurrences) == ("warn", 2)
+    assert states(await tries(engine)) == ["billed"] * 5
 
 
 async def test_a_reclaimed_owner_never_sends_and_releases_its_try(
