@@ -28,7 +28,12 @@ class BudgetExhausted(LLMError):
 
 class LLMTransient(LLMError):
     """The retryable failures (§10.4: 408, 409, 429, 5xx, 529, timeouts, connection errors) outlasted the
-    tries a logical call may make."""
+    tries a logical call may make, or the deadline left no room for the next; `code` is the last try's
+    (`http_<status>`, `connect_failed`, `stream_interrupted`)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"LLM call failed transiently: {code}")
+        self.code = code
 
 
 class LLMRequestError(LLMError):
@@ -45,6 +50,17 @@ class DeadlineExhausted(LLMError):
 
 class MaxTokensExhausted(LLMError):
     """The enlarged `max_tokens` stage also stopped at `max_tokens` (§10.5)."""
+
+
+class InputUnbounded(LLMError):
+    """The input of a call could not be bounded, so nothing was reserved or sent (§10.7): `reason` is
+    `count_failed` (the native-PDF `count_tokens` failed), `context_window` (it counted more than the model's
+    context window) or `unencodable` (a text component cannot be encoded as UTF-8, as with a lone surrogate,
+    so it has no byte bound and could not be sent either). Not retryable."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"LLM input could not be bounded: {reason}")
+        self.reason = reason
 
 
 class InvalidOutput(LLMError):

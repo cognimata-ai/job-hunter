@@ -5,13 +5,18 @@ Task 4 adds the transport side: `FakeAnthropic` (the recorded-SSE fake as a test
 fixture that gives every test its own fake state, `LocalSSEServer` (a real socket on `127.0.0.1:0`) and
 `synthetic_sse` (a stream in the event shapes V13 recorded).
 
+Task 5 adds the gateway side: the `fake_llm` fixture (`FakeLLM`: recordings of the test schema `GatewayOut`
+written for the test, gateways on them, the tries `served`, the backoff waits `sleeps`), the test node and
+prompt, and the C35 helpers `create_llm_call_operation`, `reclaim_stale_now` and `ledger_states`.
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
 import asyncio
 import json
+import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -20,6 +25,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Final, Literal, Self
 
+import anthropic
 import httpx2
 import pytest
 import sqlalchemy as sa
@@ -28,7 +34,9 @@ from jobhunter.config import AppConfig, load_config
 from jobhunter.db.sql import q
 from jobhunter.llm import fake
 from jobhunter.llm.budget import BudgetParams, BudgetRow, month_of
-from jobhunter.llm.pricing import Usage
+from jobhunter.llm.cache_monitor import CacheMonitor
+from jobhunter.llm.gateway import CallContext, LLMGateway, NodeConfig, RenderedPrompt, SystemBlock
+from jobhunter.llm.pricing import MODELS, Usage
 from jobhunter.llm.spend_ledger import (
     CallOutcome,
     EvalRunOwner,
@@ -40,6 +48,8 @@ from jobhunter.llm.spend_ledger import (
 from jobhunter.llm.transport import make_http_client
 from jobhunter.types import JSONValue, get_object
 from jobhunter.worker import operations as ops
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.m2 import insert_eval_run
@@ -572,3 +582,237 @@ class LocalSSEServer:
             writer.close()
             with suppress(ConnectionError):
                 await writer.wait_closed()
+
+
+# --- Task 5: the gateway on the fake, and the C35 helpers --------------------------------------------------
+
+
+class GatewayOut(BaseModel):
+    """The structured-output schema of the gateway tests (synthetic, no profile shape)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
+    score: int
+
+
+GATEWAY_BODY: Final[dict[str, JSONValue]] = {"answer": "a synthetic answer", "score": 3}
+# The purposes the `fake_llm` fixture records `GatewayOut` for, on every model.
+GATEWAY_PURPOSES: Final = ("extract_profile", "propose_queries", "schema_dry_run")
+# A non-scoring node of an operation: `extract_profile`'s purpose with small stages and its 900 s deadline.
+GATEWAY_NODE: Final = NodeConfig(
+    purpose="extract_profile",
+    model="claude-opus-5-5",
+    effort="medium",
+    max_tokens=1000,
+    max_tokens_retry=2000,
+    deadline_s=900,
+    schema=GatewayOut,
+)
+
+
+def gateway_prompt(text: str = "A synthetic question.", *, cached_prefix: bool = False) -> RenderedPrompt:
+    """A synthetic prompt: one system block (cached when `cached_prefix`) and one user message."""
+    return RenderedPrompt(
+        system=(SystemBlock("You answer in JSON.", cache=cached_prefix),),
+        messages=(HumanMessage(text),),
+        template_version="gateway-test@1",
+        input_refs={"test": "gateway"},
+    )
+
+
+class Sleeps:
+    """An injected `sleep` that records each wait and only yields to the loop."""
+
+    def __init__(self) -> None:
+        self.waits: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.waits.append(seconds)
+        await asyncio.sleep(0)
+
+
+class FakeLLM(FakeAnthropic):
+    """The fake over recordings written for the test (`GatewayOut` for every model and `GATEWAY_PURPOSES`),
+    with gateways on it. `served` counts the message tries that reached the fake; `sleeps` records the backoff
+    waits of every gateway made here with the default sleep."""
+
+    def __init__(self, cfg: AppConfig) -> None:
+        super().__init__(cfg)
+        self.sleeps = Sleeps()
+        self._clients: list[httpx2.AsyncClient] = []
+        self.handlers: dict[ops.OperationKind, ops.OperationHandler] = {}  # registered for this test only
+
+    def record(
+        self,
+        purpose: str,
+        model: str,
+        body: Any = GATEWAY_BODY,
+        *,
+        schema: type[BaseModel] = GatewayOut,
+        **sse: Any,
+    ) -> Path:
+        """Write the stream the fake serves for `(purpose, model, schema)`: `synthetic_sse(body, **sse)`."""
+        path = fake.recording_path(self.root, purpose, model, anthropic.transform_schema(schema))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(synthetic_sse(body, model=model, **sse))
+        return path
+
+    def gateway(
+        self,
+        engine: AsyncEngine,
+        *,
+        read_timeout_s: float = 120.0,
+        sleep: Callable[[float], Any] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        cache: CacheMonitor | None = None,
+    ) -> LLMGateway:
+        """A gateway on a fresh fake client (closed after the test)."""
+        client = self.client(read_timeout_s=read_timeout_s)
+        self._clients.append(client)
+        return LLMGateway(
+            engine,
+            self.cfg,
+            http_client=client,
+            monotonic=monotonic,
+            sleep=self.sleeps if sleep is None else sleep,
+            cache=CacheMonitor() if cache is None else cache,
+        )
+
+    async def aclose(self) -> None:
+        for client in self._clients:
+            await client.aclose()
+
+
+_active_fake: list[FakeLLM] = []
+
+
+@pytest.fixture
+async def fake_llm(tmp_path: Path) -> AsyncIterator[FakeLLM]:
+    """The fake over `GatewayOut` recordings under `tmp_path`, for the gateway; any operation handler that
+    `create_llm_call_operation` registered is removed after the test."""
+    root = tmp_path / "anthropic"
+    fake_llm = FakeLLM(fake_llm_config(root, tmp_path / "no-secrets"))
+    for purpose in GATEWAY_PURPOSES:
+        for model in MODELS:
+            fake_llm.record(purpose, model)
+    _active_fake.append(fake_llm)
+    try:
+        yield fake_llm
+    finally:
+        _active_fake.remove(fake_llm)
+        for kind, handler in fake_llm.handlers.items():
+            if ops.HANDLERS.get(kind) is handler:
+                del ops.HANDLERS[kind]
+        await fake_llm.aclose()
+
+
+async def active_execution_config(engine: AsyncEngine) -> int:
+    async with engine.connect() as conn:
+        return int((await conn.execute(sa.text(_ACTIVE_EXECUTION_CONFIG))).scalar_one())
+
+
+def call_context(owner: SpendOwner, execution_config_id: int, **overrides: Any) -> CallContext:
+    """A non-scoring call of `owner` with `GATEWAY_NODE`'s deadline from now; `overrides` replace fields."""
+    values: dict[str, Any] = {
+        "owner": owner,
+        "purpose_class": "nonscoring",
+        "execution_config_id": execution_config_id,
+        "deadline": time.monotonic() + GATEWAY_NODE.deadline_s,
+        **overrides,
+    }
+    return CallContext(**values)
+
+
+async def create_llm_call_operation(engine: AsyncEngine) -> int:
+    """A `pending` operation of kind `eval_run` whose handler, registered for this test only (the `fake_llm`
+    fixture removes it), makes one gateway call of `GATEWAY_NODE` as the operation's spend owner. The handler
+    closes over its gateway and uses nothing of the operation context but the claim (no `deps`)."""
+    if not _active_fake:
+        raise RuntimeError("create_llm_call_operation needs the fake_llm fixture")
+    fake_llm = _active_fake[-1]
+    gateway = fake_llm.gateway(engine)
+    execution_config_id = await active_execution_config(engine)
+
+    async def handler(ctx: ops.OperationContext) -> None:
+        owner = OperationOwner(ctx.claim)
+        await gateway.call(GATEWAY_NODE, gateway_prompt(), call_context(owner, execution_config_id))
+
+    if ops.HANDLERS.get("eval_run", handler) is not handler:
+        raise RuntimeError("another eval_run handler is registered")
+    ops.HANDLERS["eval_run"] = fake_llm.handlers["eval_run"] = handler
+    async with engine.begin() as conn:
+        op_id, _ = await ops.create_operation(
+            conn, kind="eval_run", payload={}, dedup_key=f"llm-call:{uuid.uuid4()}", defer=None
+        )
+    return op_id
+
+
+async def reclaim_stale_now(engine: AsyncEngine, op_id: int) -> None:
+    """The `operations` reconciler's reclaim statement alone, with `now` past `OPERATION_STALE`: every stale
+    `running` operation back to `pending`, `claim_id := NULL`, one more attempt. `op_id` must be one."""
+    stale = utcnow() + ops.OPERATION_STALE + timedelta(seconds=1)
+    async with engine.begin() as conn:
+        reclaimed = await ops._reclaim_stale(conn, now=stale)
+    assert op_id in [operation_id for operation_id, _ in reclaimed]
+
+
+_OPERATION_LEDGER: Final = sa.text(
+    "SELECT l.state, l.evidence FROM llm_spend_ledger l JOIN llm_calls c ON c.spend_ledger_id = l.id "
+    "WHERE c.input_refs -> 'owner' ->> 'kind' = 'operation' "
+    "AND (c.input_refs -> 'owner' ->> 'id')::bigint = :op ORDER BY l.id"
+)
+
+
+async def ledger_states(engine: AsyncEngine, op_id: int) -> list[str]:
+    """The ledger states of operation `op_id`'s tries, oldest first: `state`, or `state:evidence`."""
+    async with engine.connect() as conn:
+        rows = await conn.execute(_OPERATION_LEDGER, {"op": op_id})
+        return [row.state if row.evidence is None else f"{row.state}:{row.evidence}" for row in rows]
+
+
+@dataclass(frozen=True)
+class Try:
+    """One try as the ledger and its call record it, oldest first (`tries`)."""
+
+    ledger_id: int
+    state: str
+    evidence: str | None
+    reserved_usd: Decimal
+    settled_usd: Decimal | None
+    input_tokens_bound: int
+    budget_month: date
+    call_id: int
+    status: str
+    error_code: str | None
+    http_status: int | None
+    stop_reason: str | None
+    refusal_category: str | None
+    model_served: str | None
+    provider_request_id: str | None
+    max_tokens: int
+    max_tokens_stage: str
+    transport_try: int
+    logical_call_no: int | None
+    input_tokens: int | None
+    cache_read_input_tokens: int | None
+    output_tokens: int | None
+    cost_usd: Decimal | None
+    output_json: Any
+    first_event_at: datetime | None
+
+
+_TRIES: Final = sa.text(
+    "SELECT l.id AS ledger_id, l.state, l.evidence, l.reserved_usd, l.settled_usd, l.input_tokens_bound, "
+    "l.budget_month, c.id AS call_id, c.status, c.error_code, c.http_status, c.stop_reason, "
+    "c.refusal_category, c.model_served, c.provider_request_id, c.max_tokens, c.max_tokens_stage, "
+    "c.transport_try, c.logical_call_no, c.input_tokens, c.cache_read_input_tokens, c.output_tokens, "
+    "c.cost_usd, c.output_json, c.first_event_at "
+    "FROM llm_spend_ledger l JOIN llm_calls c ON c.spend_ledger_id = l.id ORDER BY l.id"
+)
+
+
+async def tries(engine: AsyncEngine) -> list[Try]:
+    """Every try in the database, oldest first."""
+    async with engine.connect() as conn:
+        return [Try(**row._mapping) for row in await conn.execute(_TRIES)]

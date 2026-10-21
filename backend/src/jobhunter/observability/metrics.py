@@ -102,6 +102,27 @@ LLM_RESERVATION_RATIO = Histogram(
 )
 
 
+# Every HTTP try of the gateway (§17.5), counted once its settlement has committed. `model` is the requested
+# model, `purpose` the node; `outcome` is `ok` or the try's `llm_calls.error_code`: `invalid_output`,
+# `refused`, `max_tokens_first_stage`, `max_tokens`, `unexpected_stop_reason`, `model_mismatch`,
+# `http_<status>`, `connect_failed`, `stream_interrupted`, `deadline` or `cancelled`. A try fenced before its
+# dispatch marker sent nothing and is not counted.
+LLM_CALLS = Counter(
+    "jobhunter_llm_calls",
+    "HTTP tries of LLM calls, by model, effort, purpose and outcome.",
+    ["model", "effort", "purpose", "outcome"],
+    registry=REGISTRY,
+)
+# The prompt-cache read share of the completed calls of the last hour (§10.8): cache_read / (input +
+# cache_read + cache_write), by served model, effort and role (the call's purpose); set by `CacheMonitor`.
+LLM_CACHE_READ_RATIO = Gauge(
+    "jobhunter_llm_cache_read_ratio",
+    "Share of prompt tokens read from the cache over a rolling hour, by model, effort and role.",
+    ["model", "effort", "role"],
+    registry=REGISTRY,
+)
+
+
 def start_metrics_server(port: int) -> None:
     """Serve `REGISTRY` over HTTP on `port` from a daemon thread."""
     start_http_server(port, registry=REGISTRY)

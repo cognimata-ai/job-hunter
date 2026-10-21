@@ -527,10 +527,11 @@ M1_RECONCILERS = {
     "group_representatives": ["heavy"],
     "awaiting_embedding": ["heavy"],
 }
-# The reconcilers M2 adds, by task: the spend ledger's two (Task 3).
+# The reconcilers M2 adds, by task: the spend ledger's two (Task 3) and the gateway's refusal rate (Task 5).
 M2_RECONCILERS = {
     "llm_ledger_unsettled": ["tick"],
     "budget_counters": ["heavy"],
+    "llm_refusal_rate": ["heavy"],
 }
 # Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
 # from `sys.modules` (each registry module is imported by the modules that register into it).

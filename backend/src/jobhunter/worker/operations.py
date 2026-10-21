@@ -48,7 +48,7 @@ from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch, register_takeover_sweep
-from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
+from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, ExecutionRegistry, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer, defer_in_tx, job_task_name
 
@@ -482,6 +482,7 @@ async def execute_operation(
     epoch: int,
     heartbeat_period_s: float = 30.0,
     on_superseded: Callable[[], None] = lambda: None,
+    registry: ExecutionRegistry = EXECUTIONS,
 ) -> None:
     """Claim and run operation `operation_id` (the `run_operation` task body), one protocol for every end.
 
@@ -493,7 +494,9 @@ async def execute_operation(
        current worker claims it, the stopping one fetches no more. A kind without a handler ends
        `failed('no_handler')` with the `operation.failed` alert (raised by `finish_operation`).
     2. Run the handler through `run_owned(("operation", id), claim_id, …)`: the registry's task for the
-       operation, next to the heartbeat task `heartbeat:operation:<id>` whose loss cancels it.
+       operation, next to the heartbeat task `heartbeat:operation:<id>` whose loss cancels it. `registry` is
+       the process's `EXECUTIONS` (its local exclusion: `AlreadyExecuting`, and the one the `operations`
+       reconciler cancels in); a test that plays a second process's execution passes one of its own (C35).
     3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, even one
        the handler swallowed, or `FencedOut`) returns with no further owner write; `raised` requeues with
        `error_code='bug'` and `not_before = now + RETRY_DELAY`; `returned` finishes `succeeded`. A local
@@ -537,6 +540,7 @@ async def execute_operation(
             _invoke(handler, OperationContext(claim=claim, engine=engine)),
             beat=beat,
             period_s=heartbeat_period_s,
+            registry=registry,
         )
     except AlreadyExecuting:
         log.warning("operation_already_executing", operation_id=operation_id)
