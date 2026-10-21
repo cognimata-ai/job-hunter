@@ -339,6 +339,12 @@ def test_an_email_address_on_a_www_host_is_an_email_address() -> None:
         "Pariser Platz 3",
         "Stadtring 12",
         "Kaiserring 3",
+        "Hansaring 5",
+        "Hansering 12",
+        "Kaiser-Wilhelm-Ring 3",
+        "Hohenzollernring 48",
+        "Ostring 7",
+        "Mittlerer Ring 2",
     ],
 )
 def test_a_street_address_or_postal_code_with_a_city_is_replaced(value: str) -> None:
@@ -376,6 +382,7 @@ def test_a_street_and_a_postal_code_are_two_addresses() -> None:
         "Hiring 2",
         "Engineering 2020-2022",
         "Software Engineering",
+        "Software Engineering 2",
         "Musterstraße",  # no house number
         "123456 Berlin",  # a postal code that is part of a longer number
         "1234567 Berlin",
@@ -866,11 +873,41 @@ def test_a_house_number_is_not_the_start_of_a_version_or_a_decimal() -> None:
     assert strip_contacts("Hauptstraße 5, 10115 Berlin").stripped_text == "[ADDRESS], [ADDRESS]"
 
 
-def test_the_ring_suffix_after_a_vowel_is_an_english_gerund_not_a_street() -> None:
-    for word in ("Clustering", "Rendering", "Sharing", "Catering", "Hiring", "Scoring", "Manufacturing"):
-        assert strip_contacts(f"{word} 3").stripped_text == f"{word} 3", word
-    for word in ("Königsring", "Stadtring", "Kaiserring", "Hauptring", "Gürtelring"):
-        assert strip_contacts(f"{word} 3").stripped_text == "[ADDRESS]", word
+def test_an_english_ring_word_of_the_list_is_no_street_and_every_other_ring_word_is() -> None:
+    english = (
+        "Clustering Rendering Sharing Catering Hiring Scoring Manufacturing Engineering Monitoring".split()
+    )
+    english += "Mentoring Tutoring Refactoring Offering Gathering Ordering Filtering Wiring Tiering".split()
+    english += "Recovering Delivering Steering Covering Docstring Spring String".split()
+    for word in english:
+        for form in (word, word.lower(), word.upper()):  # the whole word, in any case
+            assert strip_contacts(f"{form} 3").stripped_text == f"{form} 3", form
+        assert strip_contacts(f"Cloud-{word} 3").stripped_text == f"Cloud-{word} 3", (
+            word
+        )  # the last part decides
+    # A German street that ends in `ring` is stripped whatever letter stands before it; so is a word of the
+    # list with something in front of it (the list is of whole words, and stripping is the safe default).
+    for street in (
+        "Königsring",
+        "Stadtring",
+        "Kaiserring",
+        "Hauptring",
+        "Gürtelring",
+        "Hansaring",
+        "Hansering",
+    ):
+        assert strip_contacts(f"{street} 3").stripped_text == "[ADDRESS]", street
+    for street in (
+        "Ostring",
+        "Hohenzollernring",
+        "Kaiser-Wilhelm-Ring",
+        "Luisenring",
+        "Ottoring",
+        "Maiering",
+    ):
+        assert strip_contacts(f"{street} 3").stripped_text == "[ADDRESS]", street
+    assert strip_contacts("Mittlerer Ring 2").stripped_text == "[ADDRESS]"
+    assert strip_contacts("Hauptclustering 3").stripped_text == "[ADDRESS]"
 
 
 def test_a_pass_over_a_text_longer_than_the_cap_leaves_no_half_token() -> None:

@@ -155,6 +155,7 @@ FRAGMENTS = [
     *"1234567 23125456 01.02.1990 2019 - / . , ( ) : | @ example.org www. www.example.org https://".split(),
     *"http://example.org/a linkedin.com/in/ github.com/ xing.com/profile/ Geburtsdatum".split(),
     *"geb. geboren DOB".split(),
+    *["Hansaring 5", "Clustering 3", "Software Engineering 2", "Mittlerer Ring 2", "Cloud-Sharing 4"],
     *"Familienstand ledig Kinder Children Gender Nationalität [EMAIL] [PHONE] [NAME] [PERSONAL]".split(),
     *"max.mustermann@example.org erika@mail.example.org ß ä Ö x Q9 0 00 +".split(),
     *[" ", " ", " ", "\n", "\n", "\n\n", "\t", "\r\n", "\u00a0"],

@@ -19,10 +19,11 @@ result. It is a best-effort aid; the user's review is the guarantee. Task 11 cal
 - *Address*: a street and a house number of one to three digits (`12`, `12a`, `12-14`; not `4.0`). The street
   is a word that ends in a suffix of the table (`strasse` too), a capitalised word before `Straße`, `Allee`,
   `Gasse`, `Ufer`, `Damm`, `Ring` or `Weg`, or a capitalised word that ends in `er` before `Platz`
-  (`Potsdamer Platz`, not `Auf Platz 1`). Not a street: a word that ends in `ring` after a vowel (the English
-  gerunds `Clustering`, `Sharing`, `Hiring`, ...), the words of `NOT_A_STREET` (`Spring`, `Bildungsweg`), an
-  ordinal before `Platz`. The postal code and city are the spec's regex: five digits, white space, a
-  capitalised word (the white space and the city are bounded).
+  (`Potsdamer Platz`, not `Auf Platz 1`). Not a street: the words of `NOT_A_STREET` (the English `ring`
+  words of `ENGLISH_RING_WORDS` such as `Clustering` and `Engineering`, as whole words; `Bildungsweg`), an
+  ordinal before `Platz`. No rule about the letter before `ring`: `Hansaring` is a street. The postal code
+  and city are the spec's regex: five digits, white space, a capitalised word (the white space and the city
+  are bounded).
 - *Personal*: a birth label anywhere; a protected-attribute label at the start of a line (after a bullet or
   a table pipe) or followed by a colon anywhere; a label is a word of its own (`Nationality-neutral` is none).
   The span is the label and the rest of its line, at most `_REST_OF_LINE_MAX` characters, and a cut inside a
@@ -141,17 +142,30 @@ ROLE_KEYWORDS: Final[frozenset[str]] = frozenset(
 # compound (`Industriekaufmann`, `Teamleiter`), never as a word of their own.
 _COMPOUND_ONLY: Final = frozenset({"kaufmann", "kauffrau", "leiter", "leiterin"})
 _COMPOUND_KEYWORDS: Final = tuple(sorted(k for k in ROLE_KEYWORDS if len(k) >= 6))
-# Words that end in a street suffix and read like a street before a number. A word that ends in `ring`
-# after a vowel (`Clustering`, `Sharing`, `Hiring`, `Scoring`, `Manufacturing`: an English gerund) is
-# none, whatever it is (see `_street_spans`); this list holds the rest: gerunds with a consonant before
-# `ring`, and German words for a path that are no street (`Bildungsweg`).
-NOT_A_STREET: Final = frozenset(
+# English words that end in `ring` and are no street before a number (`Clustering 3`, `Software
+# Engineering 2`, `Spring 5`). Spec §12.3 lists `ring` as a street suffix and stripping is the safe
+# default (a false positive is restored in the review), so a word is excluded only when it is on this
+# list: there is no rule about the letters before `ring` (`Hansaring`, `Hansering` and `Ostring` are
+# German streets). The match is on the whole word, in any case; of a hyphenated word the last part
+# counts (`Cloud-Engineering`).
+ENGLISH_RING_WORDS: Final = frozenset(
     [
-        *"spring string docstring substring referring transferring occurring recurring".split(),
-        *"deferring preferring bildungsweg ausweg umweg rückweg lebensweg karriereweg".split(),
-        *"berufsweg lösungsweg heimweg".split(),
+        *"spring string docstring substring clustering rendering catering engineering monitoring".split(),
+        *"mentoring tutoring refactoring offering gathering ordering filtering sharing hiring wiring".split(),
+        *"tiering scoring recovering delivering steering covering authoring manufacturing featuring".split(),
+        *"referring transferring occurring recurring deferring preferring conferring measuring".split(),
+        *"structuring restructuring configuring ensuring assuring insuring securing restoring".split(),
+        *"exploring ignoring storing centering entering registering mastering partnering powering".split(),
+        *"pioneering volunteering answering altering bordering discovering uncovering suffering".split(),
+        *"considering remembering administering sheltering tendering scattering sponsoring caring".split(),
+        *"firing acquiring requiring inspiring stirring".split(),
     ]
 )
+# Words that end in `weg` and are no street (`Bildungsweg 2`).
+_GERMAN_PATH_WORDS: Final = frozenset(
+    "bildungsweg ausweg umweg rückweg lebensweg karriereweg berufsweg lösungsweg heimweg".split()
+)
+NOT_A_STREET: Final = ENGLISH_RING_WORDS | _GERMAN_PATH_WORDS
 # A word before `Platz` that is an ordinal, not a place (`Erster Platz 1`).
 _ORDINALS: Final = frozenset(
     "erster zweiter dritter vierter fünfter sechster siebter achter neunter zehnter letzter bester".split()
@@ -389,12 +403,11 @@ def _regex_spans(pattern: re.Pattern[str]) -> Callable[[str], Iterator[Span]]:
 
 
 def _street_spans(text: str) -> Iterator[Span]:
-    """The streets with a house number. Not a street: an attached word that ends in `ring` after a vowel
-    (an English gerund: `Clustering 3`), a word of `NOT_A_STREET`, an ordinal before `Platz`
-    (`Erster Platz 1`)."""
+    """The streets with a house number. Not a street: a word of `NOT_A_STREET` (whole word, any case, the
+    last part of a hyphenated word), an ordinal before `Platz` (`Erster Platz 1`)."""
     for m in _STREET.finditer(text):
         word = (m["attached"] or "").casefold()
-        if word and (word in NOT_A_STREET or (word.endswith("ring") and word[-5:-4] in set("aeiouäöü"))):
+        if word and (word in NOT_A_STREET or word.rsplit("-", 1)[-1] in NOT_A_STREET):
             continue
         if (m["lead_er"] or "").casefold() in _ORDINALS:
             continue
