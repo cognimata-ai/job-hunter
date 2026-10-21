@@ -102,7 +102,7 @@ KEY_VAR: Final = "JOBHUNTER_ANTHROPIC_API_KEY"
 
 MAX_MESSAGES: Final = 8
 MAX_WORST_CASE_USD: Final = Decimal("0.80")
-SPIKE_CALLS: Final = {"v13": 2, "v4": 5, "v19": 1}
+SPIKE_CALLS: Final = {"v13": 2, "v4": 4, "v19": 1}  # V4: the 4 gating cases, no probe message (R7-2)
 SPIKE_MODULES: Final = {"v13": "v13_structured_stream", "v4": "v4_schema_dry_run", "v19": "v19_token_bound"}
 BANNED_REQUEST_KEYS: Final = ("tool_choice", "tools", "temperature", "top_p", "top_k", "betas", "fallbacks")
 # The response headers a committed recording keeps; every other one (request-id, anthropic-organization-id,

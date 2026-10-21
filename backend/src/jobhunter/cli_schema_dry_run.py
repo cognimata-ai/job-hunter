@@ -8,6 +8,7 @@ and its startup assertions), reads the active prompt-schema version, model polic
 - with `--live` on the Anthropic API, which needs the worker's `anthropic_key` secret and refuses
   `JOBHUNTER_FAKE_LLM`.
 
+Either way the run records its transport (`fake` or `live`) as `metrics.transport` in its `eval_runs` row.
 Its stdout is the case table only (schema, model, result) and one summary line; the logs go to stderr. Neither
 ever carries content: no prompt, no output, no key. The exit status is 0 when the run passed, 1 when it did
 not or failed, and 2 when it could not start.
@@ -74,7 +75,10 @@ def case_table(report: DryRunReport, *, transport: str) -> list[str]:
     return lines
 
 
-async def _dry_run(cfg: AppConfig) -> DryRunReport:
+async def _dry_run(cfg: AppConfig, *, transport: schema_dry_run.Transport) -> DryRunReport:
+    """The run on `cfg`'s client, recorded with `transport`, which must be the one `cfg` sends to."""
+    if (transport == "fake") != cfg.fake_llm:
+        raise ValueError(f"transport {transport!r} does not match the config's fake_llm={cfg.fake_llm}")
     engine = make_engine(cfg, pool_size=2)
     try:
         async with engine.connect() as conn:
@@ -87,6 +91,7 @@ async def _dry_run(cfg: AppConfig) -> DryRunReport:
                 prompt_schema_version_id=int(ids.prompt_schema_version_id),
                 model_policy_id=int(ids.model_policy_id),
                 execution_config_id=int(ids.execution_config_id),
+                transport=transport,
                 now=utcnow(),
             )
     finally:
@@ -102,16 +107,17 @@ def run_schema_dry_run(args: argparse.Namespace) -> int:
     if (why := start_refusal(cfg, live=live)) is not None:
         print(f"schema-dry-run: {why}; nothing sent", file=sys.stderr)
         return NOT_STARTED
+    transport: schema_dry_run.Transport = "live" if live else "fake"
     if not live:
         cfg = dataclasses.replace(cfg, fake_llm=True)
     try:
-        report = asyncio.run(_dry_run(cfg))
+        report = asyncio.run(_dry_run(cfg, transport=transport))
     except SQLAlchemyError as exc:
         print(f"schema-dry-run: database error ({type(exc).__name__})", file=sys.stderr)
         return NOT_PASSED
     except Exception as exc:  # noqa: BLE001 - the class only: the run's own row records what it reached
         print(f"schema-dry-run: failed ({type(exc).__name__})", file=sys.stderr)
         return NOT_PASSED
-    for line in case_table(report, transport="live" if live else "fake"):
+    for line in case_table(report, transport=transport):
         print(line)
     return PASSED if report.passed else NOT_PASSED

@@ -659,6 +659,11 @@ class LLMGateway:
         sent there, through a request hook)."""
         return self._http
 
+    @property
+    def monotonic(self) -> Callable[[], float]:
+        """The clock the loop compares `CallContext.deadline` with: a caller builds its deadline from it."""
+        return self._monotonic
+
     async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult:
         """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries)."""
         messages = to_messages(prompt)  # the last is a user turn: never a prefill (RenderedPrompt)

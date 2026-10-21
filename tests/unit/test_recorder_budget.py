@@ -151,7 +151,8 @@ def expected_worst_case(call: dict[str, Any]) -> Decimal:
 
 
 def test_the_ninth_message_is_refused_before_any_transport_exists(rec: ModuleType, tmp_path: Path) -> None:
-    # 8 messages counted: 6 of V4, 1 of V19, and the Sonnet case of V13; the Opus case would be the 9th
+    # 8 messages counted (more V4 entries than its cap of 4, so that only the M2 total can refuse): 6 of V4,
+    # 1 of V19 and the Sonnet case of V13; the Opus case would be the 9th
     seed_budget(
         tmp_path,
         *(entry("v4", f"case{i}") for i in range(6)),
@@ -177,6 +178,19 @@ def test_the_spike_call_count_is_enforced(rec: ModuleType, tmp_path: Path) -> No
     factory = Factory(recorded_stream)
     assert run(rec, tmp_path, factory, "--spike", "v13", "--live") == rec.REFUSED
     assert factory.created == 0 and len(budget(tmp_path)["entries"]) == 2
+
+
+def test_the_spike_call_counts_are_the_rulings(rec: ModuleType) -> None:
+    # R7-2: V4 sends its 4 gating cases and its probe goes to the free counting endpoint, never as a message
+    assert rec.SPIKE_CALLS == {"v13": 2, "v4": 4, "v19": 1}
+    assert sum(rec.SPIKE_CALLS.values()) <= rec.MAX_MESSAGES
+
+
+def test_v4_sends_no_fifth_message(rec: ModuleType, tmp_path: Path) -> None:
+    seed_budget(tmp_path, *(entry("v4", f"earlier{i}") for i in range(4)))  # V4 has 4 of its 4
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", "v4", "--live") == rec.REFUSED
+    assert factory.created == 0 and len(budget(tmp_path)["entries"]) == 4
 
 
 def test_a_case_is_never_sent_twice(rec: ModuleType, tmp_path: Path) -> None:

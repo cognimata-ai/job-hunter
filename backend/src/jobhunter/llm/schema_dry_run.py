@@ -10,6 +10,11 @@ schema for `propose_queries`'s, then the probe on `generate`'s model. Each reque
 block and one user turn with a synthetic profile, ad or CV (`prompt_for`), at effort `DRY_RUN_EFFORT`, with
 `DRY_RUN_MAX_TOKENS` in both `max_tokens` stages and a `DRY_RUN_DEADLINE_S` node deadline, purpose
 `schema_dry_run` (non-scoring), owned by the run's `eval_runs` row (`EvalRunOwner`: it must be `running`).
+The deadline is taken from the gateway's own clock (`LLMGateway.monotonic`), which its loop compares it to.
+Both stages being `DRY_RUN_MAX_TOKENS` is deliberate: a first-stage `max_tokens` stop makes the gateway send a
+second, identical paid try (2,000 tokens again), not a larger one, so a case that cannot finish within 2,000
+tokens ends `max_tokens` after two stages instead of escalating. With 3 transport tries per stage a case is at
+most 6 paid HTTP tries; the manual workflow's cost note states the resulting worst case.
 
 **A schema case passes** when every check holds (`CaseResult.checks`):
 - `http_200` and `end_turn`: the call's HTTP status and stop reason, as its `llm_calls` row records them;
@@ -35,18 +40,18 @@ or `error:<code>`, and whether the keyword reached the wire; it reserves nothing
 **The record.** The run inserts its `eval_runs` row `running` (`route='production'`, the three config ids),
 runs the cases one by one, and ends it through `transition()`: `completed` once every case has an outcome,
 with `passed` true exactly when every schema case passed; `failed` when the run stops early (an exception
-other than a gateway outcome, re-raised), with `passed` false and the cases it ran. `metrics` holds the case
-table (schemas, models, outcomes, checks, violation paths, call ids), never content; `cost_usd` is what the
-ledger counts for the run's calls (billed at their cost, ambiguous at their reservation), at the column's 4
-decimals. For prompt-schema version 1 that record is `completed` and not passed: the API rejects the §11.5
-generator schema ("The compiled grammar is too large", spike V4, `docs/spikes/V4.md`), and making it
-compilable is a spec change for M3 (controller ruling R7-1).
+other than a gateway outcome, re-raised), with `passed` false and the cases it ran. `metrics` holds the
+transport (`fake` or `live`, as the caller names it) and the case table (schemas, models, outcomes, checks,
+violation paths, call ids), never content; `cost_usd` is what the ledger counts for the run's calls (billed
+at their cost, ambiguous at their reservation), at the column's 4 decimals. For prompt-schema version 1 that
+record is `completed` and not passed: the API rejects the §11.5 generator schema ("The compiled grammar is
+too large", spike V4, `docs/spikes/V4.md`), and making it compilable is a spec change for M3 (controller
+ruling R7-1).
 """
 
 import copy
 import hashlib
 import json
-import time
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -95,6 +100,11 @@ DRY_RUN_EFFORT: Final[Effort] = "low"
 DRY_RUN_MAX_TOKENS: Final = 2000
 DRY_RUN_DEADLINE_S: Final = 300
 PROBE_KEYWORD: Final = "minimum"
+
+Transport = Literal["fake", "live"]
+# What the run's requests went to: the recorded-SSE fake, or the Anthropic API (`--live`). The CLI names it,
+# and the run records it as `metrics.transport`, so a fake run's record can never pass for a live one.
+TRANSPORTS: Final[tuple[Transport, ...]] = ("fake", "live")
 
 SchemaName = Literal["generator", "critic", "profile", "queries"]
 # Each schema and the model-policy nodes it serves (§10.3, §10.11).
@@ -301,7 +311,11 @@ def prompt_for(case: DryRunCase) -> RenderedPrompt:
 
 def node_for(case: DryRunCase) -> NodeConfig:
     """The case's node: purpose `schema_dry_run`, the case's model at `DRY_RUN_EFFORT`, `DRY_RUN_MAX_TOKENS`
-    in both stages and `DRY_RUN_DEADLINE_S` (the probe's is the generator's)."""
+    in both stages and `DRY_RUN_DEADLINE_S` (the probe's is the generator's).
+
+    `max_tokens_retry == max_tokens` on purpose: a first-stage `max_tokens` stop triggers a second paid try
+    identical to the first (same 2,000-token cap), never a larger one. A case is thus at most 2 stages x 3
+    transport tries = 6 paid HTTP tries, which the workflow's worst-case cost note counts."""
     return NodeConfig(
         purpose="schema_dry_run",
         model=case.model,
@@ -563,6 +577,7 @@ class _Run:
     eval_run_id: int
     execution_config_id: int
     schemas: Mapping[str, Any]
+    transport: Transport
 
     async def case(self, case: DryRunCase) -> CaseResult:
         expected = self.schemas.get(case.schema_name)
@@ -575,7 +590,7 @@ class _Run:
             owner=EvalRunOwner(self.eval_run_id),
             purpose_class="nonscoring",
             execution_config_id=self.execution_config_id,
-            deadline=time.monotonic() + DRY_RUN_DEADLINE_S,
+            deadline=self.gateway.monotonic() + DRY_RUN_DEADLINE_S,  # the clock the gateway checks it with
             eval_run_id=self.eval_run_id,
         )
         sent: list[SentRequest] = []
@@ -651,7 +666,7 @@ class _Run:
                 status,
                 set_={
                     "passed": passed,
-                    "metrics": metrics(results),
+                    "metrics": metrics(results, transport=self.transport),
                     "cost_usd": cost.quantize(_COST_QUANTUM, rounding=ROUND_HALF_UP),
                 },
             )
@@ -666,8 +681,9 @@ class _Run:
         return DryRunReport(self.eval_run_id, status, passed, cost, tuple(results))
 
 
-def metrics(results: Sequence[CaseResult]) -> dict[str, JSONValue]:
-    """The `eval_runs.metrics` of a run: the case table and the probe (ids, codes and flags only)."""
+def metrics(results: Sequence[CaseResult], *, transport: Transport) -> dict[str, JSONValue]:
+    """The `eval_runs.metrics` of a run: its transport, the case table and the probe (ids, codes and flags
+    only)."""
     table: list[JSONValue] = []
     probe: JSONValue = None
     for r in results:
@@ -694,6 +710,7 @@ def metrics(results: Sequence[CaseResult]) -> dict[str, JSONValue]:
             entry["violations"] = list(r.violations)
         table.append(entry)
     return {
+        "transport": transport,
         "cases": table,
         "probe": probe,
         "cases_total": len(table),
@@ -708,10 +725,15 @@ async def run(
     prompt_schema_version_id: int,
     model_policy_id: int,
     execution_config_id: int,
+    transport: Transport,
     now: datetime,
 ) -> DryRunReport:
     """Run the dry-run of a prompt-schema version, a model policy and an execution config (module docstring).
-    A configuration row that does not exist is a `ValueError`, raised before the run's row exists."""
+    `transport` names where the gateway's client sends (`TRANSPORTS`) and is recorded as `metrics.transport`.
+    A transport outside `TRANSPORTS` or a configuration row that does not exist is a `ValueError`, raised
+    before the run's row exists."""
+    if transport not in TRANSPORTS:
+        raise ValueError(f"the dry-run transport must be one of {TRANSPORTS}, not {transport!r}")
     async with engine.begin() as conn:
         policy = (await conn.execute(_POLICY, {"id": model_policy_id})).scalar_one_or_none()
         schemas = (await conn.execute(_VERSION, {"id": prompt_schema_version_id})).scalar_one_or_none()
@@ -738,7 +760,7 @@ async def run(
             ).scalar_one()
         )
     _install_capture(gateway.http_client)
-    dry_run = _Run(engine, gateway, eval_run_id, execution_config_id, schemas)
+    dry_run = _Run(engine, gateway, eval_run_id, execution_config_id, schemas, transport)
     results: list[CaseResult] = []
     try:
         for case in planned:

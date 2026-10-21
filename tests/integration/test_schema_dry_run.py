@@ -19,9 +19,11 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator, Callable
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final
 
 import anthropic
@@ -80,12 +82,25 @@ class DryRun:
     fake_llm: FakeAnthropic
     ids: dict[str, int]
 
-    async def __call__(self, **ids: int) -> schema_dry_run.DryRunReport:
+    async def __call__(
+        self,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        transport: schema_dry_run.Transport = "fake",
+        **ids: int,
+    ) -> schema_dry_run.DryRunReport:
         async with self.fake_llm.client() as client:
             gateway = LLMGateway(
-                self.engine, self.fake_llm.cfg, http_client=client, sleep=no_sleep, cache=CacheMonitor()
+                self.engine,
+                self.fake_llm.cfg,
+                http_client=client,
+                sleep=no_sleep,
+                monotonic=monotonic,
+                cache=CacheMonitor(),
             )
-            return await schema_dry_run.run(self.engine, gateway, **{**self.ids, **ids}, now=utcnow())
+            return await schema_dry_run.run(
+                self.engine, gateway, **{**self.ids, **ids}, transport=transport, now=utcnow()
+            )
 
 
 async def active_ids(engine: AsyncEngine) -> dict[str, int]:
@@ -257,6 +272,7 @@ async def test_the_default_run_completes_unpassed_with_the_generator_rejected(
         "enums_allowed": False,
     }
     assert (row.metrics["cases_passed"], row.metrics["cases_total"]) == (3, 4)
+    assert row.metrics["transport"] == "fake"
     assert "Beispiel" not in json.dumps(row.metrics)
 
 
@@ -494,6 +510,97 @@ async def test_a_run_that_aborts_ends_failed_with_the_cases_it_ran(
     stored = await eval_run(engine, int(row.id))
     assert (stored.status, stored.passed) == ("failed", False)
     assert [c["outcome"] for c in stored.metrics["cases"]] == ["http_400", "passed"]
+
+
+async def test_the_case_deadline_is_taken_from_the_gateways_clock(dry_run: DryRun) -> None:
+    # The gateway compares `CallContext.deadline` with its own injected clock: a run on a gateway whose clock
+    # reads 1e9 must build each deadline from that clock (a deadline from `time.monotonic()` would lie ~1e9 s
+    # in the past, and every case would end `deadline` without a try).
+    report = await dry_run(monotonic=lambda: 1e9)
+    assert outcomes(report) == {
+        "generator": "http_400",
+        "critic": "passed",
+        "profile": "passed",
+        "queries": "passed",
+    }
+    assert fake.state().served == 4
+
+
+async def test_the_eval_run_records_its_transport(dry_run: DryRun, engine: AsyncEngine) -> None:
+    fake_run = await dry_run(transport="fake")
+    # the live path, with the fake transport injected as the live one: nothing leaves the process
+    live_run = await dry_run(transport="live")
+    assert (await eval_run(engine, fake_run.eval_run_id)).metrics["transport"] == "fake"
+    assert (await eval_run(engine, live_run.eval_run_id)).metrics["transport"] == "live"
+    with pytest.raises(ValueError, match="transport"):
+        await dry_run(transport="recorded")  # type: ignore[arg-type]
+
+
+async def test_the_cli_live_path_records_a_live_run(
+    engine: AsyncEngine,
+    make_config: Callable[..., Any],
+    migrated: PgServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jobhunter import cli_schema_dry_run
+    from jobhunter.llm.transport import make_http_client
+
+    worker = make_config("worker", migrated)
+    secrets = MappingProxyType({**worker.secrets, "anthropic_key": b"test-key-never-leaves-the-process"})
+    live_cfg = dataclasses.replace(worker, secrets=secrets)
+    fake_cfg = fake_llm_config(FAKE_LLM_DIR, tmp_path / "no-secrets")
+    # the live client replaced by one on the fake transport: no request reaches the network
+    monkeypatch.setattr(cli_schema_dry_run, "make_http_client", lambda cfg: make_http_client(fake_cfg))
+    report = await cli_schema_dry_run._dry_run(live_cfg, transport="live")
+    assert outcomes(report)["critic"] == "passed"
+    assert (await eval_run(engine, report.eval_run_id)).metrics["transport"] == "live"
+    assert fake.state().served == 4
+
+
+async def test_a_schema_the_version_lacks_fails_its_case_without_a_call(
+    dry_run: DryRun, engine: AsyncEngine
+) -> None:
+    async with engine.begin() as conn:
+        templates, schemas = (
+            await conn.execute(
+                sa.text("SELECT templates, schemas FROM prompt_schema_versions WHERE id = :id"),
+                {"id": dry_run.ids["prompt_schema_version_id"]},
+            )
+        ).one()
+        del schemas["critic"]
+        version = (
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
+                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS jsonb)) RETURNING id"
+                ),
+                {"hash": b"\x08" * 32, "t": json.dumps(templates), "s": json.dumps(schemas)},
+            )
+        ).scalar_one()
+    report = await dry_run(prompt_schema_version_id=int(version))
+    critic = next(r for r in report.results if r.case.schema_name == "critic")
+    assert (critic.outcome, critic.passed, critic.llm_call_id) == ("schema_not_in_version", False, None)
+    assert report.passed is False
+    assert fake.state().served == 3  # nothing was sent for the critic case
+    assert [c.model_requested for c in await calls(engine)] == [SONNET, OPUS, OPUS]
+
+
+async def test_a_run_whose_sent_requests_are_not_seen_fails_its_cases(
+    dry_run: DryRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(schema_dry_run, "_install_capture", lambda client: None)  # no request hook
+    report = await dry_run()
+    assert outcomes(report) == {
+        "generator": "http_400",
+        "critic": "no_request_captured",
+        "profile": "no_request_captured",
+        "queries": "no_request_captured",
+    }
+    critic = next(r for r in report.results if r.case.schema_name == "critic")
+    assert critic.checks["schema_bytes_equal"] is False and critic.checks["structural"] is True
+    assert report.probe is not None and report.probe.keyword_sent is False
+    assert report.passed is False
 
 
 # ---- the CLI ----------------------------------------------------------------------------------------------
