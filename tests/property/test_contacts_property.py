@@ -53,9 +53,9 @@ def digits_in(text: str) -> int:
 
 
 def phones(*, allow_break: bool = True) -> st.SearchStrategy[str]:
-    """A number of the table's forms: `+<cc>`, `00<cc>` or a leading 0 (also `(0)30` and `0 30`, the area code
-    of one digit too), then at least 7 digits in two to six groups with the separators of the table (NBSP and
-    Unicode dashes too) and, where the first line is still short, one line break."""
+    """A number of the table's forms: `+<cc>`, `00<cc>` or a leading 0 (also `(0)30` and `0 30`, with an area
+    code of two or three digits), then at least 7 digits in two to six groups with the separators of the table
+    (NBSP and Unicode dashes too) and, where the first line is still short, one line break."""
 
     @st.composite
     def numbers(draw: st.DrawFn) -> str:
@@ -72,7 +72,7 @@ def phones(*, allow_break: bool = True) -> st.SearchStrategy[str]:
             head, enough = "(0)" + area, 8
         else:
             head, enough = (
-                "0" + draw(st.sampled_from([" ", " / ", "/", "\xa0"])) + area[: draw(st.integers(1, 3))],
+                "0" + draw(st.sampled_from([" ", " / ", "/", "\xa0"])) + area[: draw(st.integers(2, 3))],
                 8,
             )
         groups = draw(
@@ -156,6 +156,9 @@ FRAGMENTS = [
     *"http://example.org/a linkedin.com/in/ github.com/ xing.com/profile/ Geburtsdatum".split(),
     *"geb. geboren DOB".split(),
     *["Hansaring 5", "Clustering 3", "Software Engineering 2", "Mittlerer Ring 2", "Cloud-Sharing 4"],
+    *["(01.02.1990)", "(ledig)", "(TT.MM.JJJJ)", "(deutsch)", "Geburtsdatum-Ort:", "Geburtsort-Datum:"],
+    *["Leiter Controlling\n", "Leiterin Finanzen\n", "Kaufmann für Büromanagement\n", "Max Kaufmann"],
+    *["Am Spring 5", "Spring 5", "0-306-40615-2", "0 30 / 231 254 56"],
     *"Familienstand ledig Kinder Children Gender Nationalität [EMAIL] [PHONE] [NAME] [PERSONAL]".split(),
     *"max.mustermann@example.org erika@mail.example.org ß ä Ö x Q9 0 00 +".split(),
     *[" ", " ", " ", "\n", "\n", "\n\n", "\t", "\r\n", "\u00a0"],
@@ -248,9 +251,14 @@ def test_restoring_every_replacement_gives_the_original(text: str) -> None:
     result = strip_contacts(text)
     for i in range(len(result.replacements)):
         result = restore(text, result, i)
-    # What a restored personal span lets through is a replacement of its own, restored by its span.
+    # What a restored personal span lets through is a replacement of its own, restored by its span, unless
+    # it has the extent of the personal span itself (`dob@example.org`): that span names the personal one.
     inner = {(r.start, r.end) for r in result.replacements}
-    assert apply_edits(text, Edits(restored=result.edits.restored | inner)).stripped_text == text
+    final = apply_edits(text, Edits(restored=result.edits.restored | inner))
+    personal = {(r.start, r.end) for r in strip_contacts(text).replacements if r.category == "personal"}
+    assert all((r.start, r.end) in personal for r in final.replacements)
+    if not final.replacements:
+        assert final.stripped_text == text
 
 
 @settings(max_examples=500, deadline=None)

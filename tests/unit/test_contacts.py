@@ -255,6 +255,11 @@ def test_a_phone_number_spans_one_line_break_and_no_more() -> None:
         "0171 123",
         "Postleitzahl 01067",
         "Kennzahl 0815",
+        "0-306-40615-2",
+        "ISBN 0-306-40615-2",
+        "0 - 2019 - 2022",
+        "0 1 2 3 4 5 6 7",
+        "0 5 9 12 34 56 78",
     ],
 )
 def test_digits_that_are_no_phone_number_stay(text: str) -> None:
@@ -613,6 +618,18 @@ def test_a_label_inside_a_url_does_not_start_a_personal_line() -> None:
         ("Name: Max Mustermann\nSkills", "Name: [NAME]\nSkills"),
         ("Vorname/Nachname: Erika Musterfrau\nSkills", "Vorname/Nachname: [NAME]\nSkills"),
         ("Name : Dr. Max Mustermann\nSkills", "Name : [NAME]\nSkills"),
+        ("Leiter Controlling\nMax Mustermann\nSkills", "Leiter Controlling\n[NAME]\nSkills"),
+        ("Leiterin Finanzen\nErika Musterfrau\nSkills", "Leiterin Finanzen\n[NAME]\nSkills"),
+        (
+            "Kaufmann für Büromanagement\nMax Mustermann\nSkills",
+            "Kaufmann für Büromanagement\n[NAME]\nSkills",
+        ),
+        (
+            "Kauffrau für Büromanagement\nErika Musterfrau\nSkills",
+            "Kauffrau für Büromanagement\n[NAME]\nSkills",
+        ),
+        ("Architektin\nErika Musterfrau\nSkills", "Architektin\n[NAME]\nSkills"),
+        ("Softwareentwicklerin\nErika Musterfrau\nSkills", "Softwareentwicklerin\n[NAME]\nSkills"),
     ],
 )
 def test_the_header_name_is_replaced(text: str, stripped: str) -> None:
@@ -1011,6 +1028,182 @@ def test_restore_resolves_the_index_against_the_fresh_strip_after_a_prior_edit()
     assert restore(CV, once, 0).stripped_text.count("Max Mustermann") == 1
     # The replacements of an edited result are not a list of indexes: the fresh strip's list is.
     assert [r.category for r in strip_contacts(CV).replacements] == [r.category for r in base.replacements]
+
+
+BRACKET_VALUES = [
+    ("Geburtsdatum (01.02.1990)\nFamilienstand: ledig\n", "[PERSONAL]\n[PERSONAL]\n"),
+    ("Geburtsdatum (01.02.1990)", "[PERSONAL]"),
+    ("Geburtsdatum (01.02.1990)\n", "[PERSONAL]\n"),
+    ("Geburtsdatum (01.02.1990)\n\n\n\nSkills", "[PERSONAL]\n\n\n\nSkills"),
+    ("Familienstand (ledig)\nGeburtsdatum: 01.02.1990", "[PERSONAL]\n[PERSONAL]"),
+    ("Religion (evangelisch)\nFamilienstand: ledig", "[PERSONAL]\n[PERSONAL]"),
+    ("Staatsangehörigkeit (deutsch)", "[PERSONAL]"),
+    ("Staatsangehörigkeit (deutsch)\n\n\n\nSkills", "[PERSONAL]\n\n\n\nSkills"),
+    ("Max, geboren (1990)\nSkills", "Max, [PERSONAL]\nSkills"),
+    ("Max, Geburtsdatum: (01.02.1990)\nSkills", "Max, [PERSONAL]\nSkills"),
+    ("Geburtsdatum (01.02.1990)\nSkills\n", "[PERSONAL]\nSkills\n"),  # the next line is no value cell
+    ("Nationality (USA)\nSkills\n", "[PERSONAL]\nSkills\n"),  # letters that are no format mask
+    ("Geschlecht (M/F)\nSkills\n", "[PERSONAL]\nSkills\n"),
+    ("Familienstand (ledig)\nSkills\n", "[PERSONAL]\nSkills\n"),
+]
+
+
+@pytest.mark.parametrize(("text", "stripped"), BRACKET_VALUES)
+def test_a_value_in_brackets_after_a_label_is_a_value_and_takes_no_line_below(
+    text: str, stripped: str
+) -> None:
+    assert strip_contacts(text).stripped_text == stripped
+    for secret in ("01.02.1990", "ledig", "evangelisch", "deutsch", "1990"):
+        assert secret not in strip_contacts(text).stripped_text, secret
+
+
+@pytest.mark.parametrize("mask", ["(TT.MM.JJJJ)", "(DD/MM/YYYY)", "(TT/MM/JJ)", "(JJJJ-MM-TT)", "(D.M.YYYY)"])
+def test_only_a_format_mask_is_a_hint_and_the_cell_below_it_is_the_value(mask: str) -> None:
+    assert strip_contacts(f"Geburtsdatum {mask}\n01.02.1990\nSkills").stripped_text == "[PERSONAL]\nSkills"
+    # No cell below: the label line is claimed, as it was before the hint rule.
+    assert strip_contacts(f"Geburtsdatum {mask}").stripped_text == "[PERSONAL]"
+    assert (
+        strip_contacts(f"Geburtsdatum {mask}\nFamilienstand: ledig").stripped_text == "[PERSONAL]\n[PERSONAL]"
+    )
+    assert strip_contacts(f"Geburtsdatum {mask}\n\n\n\nSkills").stripped_text == "[PERSONAL]\n\n\n\nSkills"
+
+
+def test_a_label_of_label_words_without_a_value_cell_is_still_claimed() -> None:
+    for text in ("Familienstand / Kinder", "Geburtsdatum/-ort", "Geburtsdatum und -ort", "Geburtsort-Datum"):
+        assert strip_contacts(text).stripped_text == "[PERSONAL]", text
+        assert strip_contacts(f"{text}\n\n\n\nSkills").stripped_text == "[PERSONAL]\n\n\n\nSkills", text
+        assert (
+            strip_contacts(f"{text}\nGeburtsdatum: 01.02.1990").stripped_text == "[PERSONAL]\n[PERSONAL]"
+        ), text
+    # A label that is alone on its line with nothing after it is still no hit.
+    assert strip_contacts("Geburtsdatum\n\n\n\nSkills").stripped_text == "Geburtsdatum\n\n\n\nSkills"
+
+
+@pytest.mark.parametrize(
+    "label", ["Geburtsdatum-Ort", "Geburtsort-Datum", "GEBURTSDATUM-ORT", "geburtsort-datum"]
+)
+def test_a_label_joined_to_ort_or_datum_by_a_hyphen_is_a_label(label: str) -> None:
+    for text in (f"{label}: 01.02.1990, Musterstadt", f"Max, {label}: 01.02.1990, Musterstadt"):
+        r = strip_contacts(text)
+        assert "1990" not in r.stripped_text and "Musterstadt" not in r.stripped_text, text
+        assert r.report["personal"] == 1, text
+    assert strip_contacts(f"{label}\n01.02.1990 in Musterstadt\nSkills").stripped_text == "[PERSONAL]\nSkills"
+
+
+def test_a_title_word_that_is_also_a_surname_starts_a_title_line_and_ends_a_name() -> None:
+    for title in ("Leiter Controlling", "Leiterin Finanzen", "Kaufmann für Büromanagement"):
+        r = strip_contacts(f"{title}\nMax Mustermann\nSkills")
+        assert r.stripped_text == f"{title}\n[NAME]\nSkills", title
+        # The title is not turned into a name for later occurrences either.
+        r = strip_contacts(f"{title}\nMax Mustermann\nSkills\n{title}\n")
+        assert r.stripped_text == f"{title}\n[NAME]\nSkills\n{title}\n", title
+    for name in ("Max Kaufmann", "Erika Leiter", "Erika Leiterin"):
+        assert strip_contacts(f"{name}\nSkills").stripped_text == "[NAME]\nSkills", name
+
+
+def test_spring_is_a_framework_unless_a_german_preposition_makes_it_a_street() -> None:
+    for text in ("Spring 5", "Spring 5 und Spring Boot 3", "Mit Spring 5 gebaut", "Kenntnisse: Spring 5"):
+        assert strip_contacts(text).stripped_text == text, text
+    for text in ("Am Spring 5", "Im Spring 5", "Zum Spring 5", "Zur Spring 5", "am Spring 5"):
+        r = strip_contacts(text)
+        assert r.stripped_text == "[ADDRESS]", text
+        assert r.report["address"] == 1
+    assert (
+        strip_contacts("Wohnhaft: Im Spring 5, 10115 Berlin").stripped_text
+        == "Wohnhaft: [ADDRESS], [ADDRESS]"
+    )
+    assert strip_contacts("Im Spring 5").replacements == (Replacement("address", 0, 11),)
+
+
+def test_a_restored_personal_span_that_is_one_contact_keeps_that_contact_replaced() -> None:
+    for text, token in (
+        ("dob@example.org", "[EMAIL]"),
+        ("geb.a@b.de", "[EMAIL]"),
+        ("DOB@example.org\n", "[EMAIL]\n"),
+    ):
+        base = strip_contacts(text)
+        assert base.stripped_text.startswith("[PERSONAL]"), text
+        assert restore(text, base, 0).stripped_text == token, text
+
+
+def test_a_restored_personal_span_takes_the_contact_that_runs_past_its_end() -> None:
+    text = "Kinder\n030 2312\n5456\nSkills\n"
+    base = strip_contacts(text)
+    assert base.stripped_text == "[PERSONAL]\n5456\nSkills\n"
+    back = restore(text, base, 0)
+    assert back.stripped_text == "Kinder\n[PHONE]\nSkills\n"
+    assert (back.report["phone"], back.report["personal"]) == (1, 0)
+    assert "2312" not in back.stripped_text and "5456" not in back.stripped_text
+    # Commutation and the edit set.
+    start = text.index("Skills")
+    a = remove_span(text, back, start, start + 6)
+    b = restore(text, remove_span(text, base, start, start + 6), 0)
+    assert a == b and apply_edits(text, a.edits) == a
+
+
+REGRESSION_CASES = [
+    # (text, what must be gone, the category that must be counted)
+    # round 1 (the rest of the label, a value cell below a label, compound labels)
+    ("Geburtsdatum\n01.02.1990", "01.02.1990", "personal"),
+    ("Familienstand\nledig", "ledig", "personal"),
+    ("Geburtsdatum/-ort\n01.02.1990 in Musterstadt", "1990", "personal"),
+    ("Geburtsdatum und -ort\n01.02.1990 in Musterstadt", "Musterstadt", "personal"),
+    ("Geburtsdatum (TT.MM.JJJJ)\n01.02.1990", "1990", "personal"),
+    ("Familienstand / Kinder\nledig, 2", "ledig", "personal"),
+    ("Staatsangehörigkeit / Nationality\ndeutsch", "deutsch", "personal"),
+    ("Kinder\nmax@example.org", "max@example.org", "personal"),
+    ("Familienstand: " + "x" * 190 + " max@example.org", "mple.org", "personal"),
+    # N1: a value in brackets is a value
+    ("Geburtsdatum (01.02.1990)\nFamilienstand: ledig", "01.02.1990", "personal"),
+    ("Geburtsdatum (01.02.1990)", "01.02.1990", "personal"),
+    ("Geburtsdatum (01.02.1990)\n\n\n\nSkills", "01.02.1990", "personal"),
+    ("Familienstand (ledig)\nGeburtsdatum: 01.02.1990", "ledig", "personal"),
+    ("Religion (evangelisch)\nFamilienstand: ledig", "evangelisch", "personal"),
+    ("Staatsangehörigkeit (deutsch)", "deutsch", "personal"),
+    ("Max, geboren (1990)", "1990", "personal"),
+    ("Max, Geburtsdatum: (01.02.1990)", "01.02.1990", "personal"),
+    # N3: a label joined to ort or datum
+    ("Geburtsdatum-Ort: 01.02.1990, Musterstadt", "Musterstadt", "personal"),
+    ("Geburtsort-Datum: 01.02.1990, Musterstadt", "01.02.1990", "personal"),
+    # N2: a title line above the name
+    ("Leiter Controlling\nMax Mustermann", "Mustermann", "name"),
+    ("Leiterin Finanzen\nErika Musterfrau", "Musterfrau", "name"),
+    ("Kaufmann für Büromanagement\nMax Mustermann", "Mustermann", "name"),
+    ("Max Kaufmann\nSkills", "Kaufmann", "name"),
+    ("Erika Leiter\nSkills", "Leiter", "name"),
+    ("Persönliche Daten\nName\nMax Mustermann", "Mustermann", "name"),
+    ("Name: Max Mustermann", "Mustermann", "name"),
+    ("Vorname/Nachname: Erika Musterfrau", "Musterfrau", "name"),
+    # phones (round 1)
+    ("Tel: (0)30 23125456", "23125456", "phone"),
+    ("Tel: +49 (0)30 23125456", "23125456", "phone"),
+    ("Tel: 0 30 / 231 254 56", "231 254 56", "phone"),
+    ("Tel: 030 23125456", "23125456", "phone"),
+    ("Tel. +49 30\n1234 5678", "1234 5678", "phone"),
+    # addresses (rounds 1 and 2, the spring ruling)
+    ("Potsdamer Platz 1", "Potsdamer", "address"),
+    ("Pariser Platz 3", "Pariser", "address"),
+    ("Hansaring 5", "Hansaring", "address"),
+    ("Hansering 12", "Hansering", "address"),
+    ("Kaiser-Wilhelm-Ring 3", "Wilhelm", "address"),
+    ("Hohenzollernring 48", "Hohenzollernring", "address"),
+    ("Ostring 7", "Ostring", "address"),
+    ("Mittlerer Ring 2", "Mittlerer", "address"),
+    ("Königsring 5", "Königsring", "address"),
+    ("Am Spring 5", "Spring", "address"),
+    ("Im Spring 5", "Spring", "address"),
+    ("Zum Spring 5", "Spring", "address"),
+    ("Musterstraße 12, 10115 Berlin", "Musterstraße", "address"),
+]
+
+
+@pytest.mark.parametrize(("text", "secret", "category"), REGRESSION_CASES)
+def test_everything_the_reviews_named_as_stripped_is_stripped(text: str, secret: str, category: str) -> None:
+    r = strip_contacts(text)
+    assert secret not in r.stripped_text, r.stripped_text
+    assert r.report[category] >= 1, dict(r.report)  # type: ignore[index]
+    once = r.stripped_text
+    assert strip_contacts(once).stripped_text == once
 
 
 # --- the edit set --------------------------------------------------------------------------------

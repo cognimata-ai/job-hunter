@@ -8,12 +8,13 @@ result. It is a best-effort aid; the user's review is the guarantee. Task 11 cal
 **The rules** are the table of §12.3, rule by rule. Where a rule needed a decision:
 
 - *E-mail*: a local part of word characters and `. % + -`, `@`, a dotted domain, a TLD of letters only.
-- *Phone*: `+<cc>`, `00<cc>` or a leading `0` (`030`, `(0)30`, `0 30`), then digit groups with space, tab,
-  `/`, `-`, `.` or `()` as separators (Unicode dashes too) and at least 7 digits after the prefix (the
-  country code of `+` and `00` counts as digits). A number that is short on its first line goes on over
-  **one** line break, unless the next line starts with a year (`Projekt 0815` / `2019 - 2022`); a complete
-  number never takes in the next line. A date is no phone number: `01.02.1990` has its zero inside its group,
-  where a national number has an area code of its own after the zero.
+- *Phone*: `+<cc>`, `00<cc>` or a leading `0` (`030`, `(0)30`, `0 30`: a lone 0 is followed by a blank or a
+  slash, never a hyphen, and an area code of two digits or more), then digit groups with space, tab, `/`,
+  `-`, `.` or `()` as separators (Unicode dashes too) and at least 7 digits after the prefix (the country
+  code of `+` and `00` counts as digits). A number that is short on its first line goes on over **one** line
+  break, unless the next line starts with a year (`Projekt 0815` / `2019 - 2022`); a complete number never
+  takes in the next line. A date is no phone number (`01.02.1990` has its zero inside its group) and neither
+  is an ISBN (`0-306-40615-2`).
 - *URL*: `http(s)://...`, `www....`, `linkedin.com/in/...`, `xing.com/profile/...` and `github.com/<user>`
   (with one or two path segments after it). Trailing punctuation stays outside.
 - *Address*: a street and a house number of one to three digits (`12`, `12a`, `12-14`; not `4.0`). The street
@@ -21,23 +22,30 @@ result. It is a best-effort aid; the user's review is the guarantee. Task 11 cal
   `Gasse`, `Ufer`, `Damm`, `Ring` or `Weg`, or a capitalised word that ends in `er` before `Platz`
   (`Potsdamer Platz`, not `Auf Platz 1`). Not a street: the words of `NOT_A_STREET` (the English `ring`
   words of `ENGLISH_RING_WORDS` such as `Clustering` and `Engineering`, as whole words; `Bildungsweg`), an
-  ordinal before `Platz`. No rule about the letter before `ring`: `Hansaring` is a street. The postal code
-  and city are the spec's regex: five digits, white space, a capitalised word (the white space and the city
-  are bounded).
+  ordinal before `Platz`; but after `Am`, `Im`, `Zum` or `Zur` such a word is a street name (`Am Spring 5`
+  is an address, `Spring 5` is not). No rule about the letter before `ring`: `Hansaring` is a street. The
+  postal code and city are the spec's regex: five digits, white space, a capitalised word (the white space
+  and the city are bounded).
 - *Personal*: a birth label anywhere; a protected-attribute label at the start of a line (after a bullet or
   a table pipe) or followed by a colon anywhere; a label is a word of its own (`Nationality-neutral` is none).
   The span is the label and the rest of its line, at most `_REST_OF_LINE_MAX` characters, and a cut inside a
-  word goes on to the end of the word (at most as far again), so a token is never cut in half. The rest has
-  no value when it holds only punctuation, label words, what joins them and a short hint in brackets
-  (`Geburtsdatum/-ort`, `Familienstand / Kinder`, `Geburtsdatum (TT.MM.JJJJ)`). A label without a value is no
-  hit, except at the start of a line: `docparse` writes every table cell on a line of its own
-  (`Geburtsdatum`, then `01.02.1990`), so such a label takes the next non-empty line too, in the same
-  replacement (after at most two blank lines; never a line that is itself a label line or a token).
+  word goes on to the end of the word (at most as far again), so a token is never cut in half. Anywhere but
+  at the start of a line a label is a hit when anything but punctuation follows it. At the start of a line
+  the rest has no value when it holds only punctuation (`empty`), or only label words, what joins them and a
+  format mask (`labels`: `Geburtsdatum/-ort`, `Familienstand / Kinder`, `Geburtsdatum (TT.MM.JJJJ)`); a
+  format mask is upper-case letters of a date format in brackets, any other bracket (`(01.02.1990)`,
+  `(ledig)`, `(USA)`) holds a value. `docparse` writes every table cell on a line of its own (`Geburtsdatum`,
+  then `01.02.1990`), so a label without a value takes the next non-empty line too, in the same replacement
+  (after at most two blank lines; never a line that is itself a label line or a token). If there is none,
+  an empty label is no hit, and a label of label words is claimed as it is. A label may be joined to `ort` or
+  `datum` by a hyphen (`Geburtsdatum-Ort`), to no other word.
   `Kinder`, `Children` and `Gender` need a colon, a pipe or a tab after them, or must stand alone on their
   line (`Kinder- und Jugendarbeit` stays).
 - *Name*: the header name and its later occurrences; see `ROLE_KEYWORDS` and `_header_name`. `Name: Max
   Mustermann` (also `Vorname/Nachname:`) names its value; a line `Name`, `Persönliche Daten` or `Personal
-  details` is a heading that is passed over.
+  details` is a heading that is passed over. A title word that is also a surname (`Leiter`, `Kaufmann`) is a
+  title as the first word of a line (`Leiter Controlling`, `Kaufmann für Büromanagement`), a name later
+  (`Max Kaufmann`); the feminine `-in` form of a title word is a title word.
 
 **The order the categories claim text in** is `APPLY_ORDER`: personal, url, email, phone, address, name.
 Each category runs on the text with everything claimed so far masked out (NUL, which no pattern matches or
@@ -79,14 +87,17 @@ were made in does not matter.
   a stale edit set cannot put back the wrong thing.
 - Restoring a `[PERSONAL]` span (a false positive such as `Religion und Ethik, Kontakt: ...`) must not
   reveal what is inside it: personal runs first and takes in the rest of its line, so the other categories
-  are run again over the original without the personal rule, and what lies wholly inside the restored span
-  is replaced as usual. Those contacts are replacements of their own (they appear in `result.replacements`,
-  but have no index in the fresh strip); the user restores one by its `(start, end)` in `Edits.restored`.
+  are run again over the original without the personal rule, and what overlaps the restored span is replaced
+  as usual (also a number that runs past the end of the span, unless another replacement covers part of it).
+  Those contacts are replacements of their own (they appear in `result.replacements`, but have no index in
+  the fresh strip); the user restores one by its `(start, end)` in `Edits.restored`, except one that has
+  the extent of the personal span itself (`dob@example.org`): that span names the personal replacement.
 
 `scan_value(value)` runs the same rules without the name rule on one profile value (Task 12).
 """
 
 import re
+from bisect import bisect_left
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -217,9 +228,12 @@ _EOL: Final = "\r\n\x0b\x0c\x85\u2028\u2029"
 _REST: Final = rf"[^{_EOL}]{{0,{_REST_OF_LINE_MAX}}}(?:(?<=\S)\S{{1,{_REST_OF_LINE_MAX}}})?"
 # A label inside a word, a URL or an e-mail address is no label.
 _LABEL_START: Final = r"(?<![\w/@.:=&?%#~+\-])"
-_NO_VALUE: Final = " \t\xa0:|.,;/&\u2022\u00b7*>\u2013\u2014-"
-# What is not a value in the rest of a label line: the words of the labels and what joins them
-# (`Geburtsdatum/-ort`, `Familienstand / Kinder`), and a short hint in brackets (`(TT.MM.JJJJ)`).
+# Punctuation and blanks: a rest of nothing else holds no value. `_JOINERS` are what also joins the words of
+# a compound label (`Geburtsdatum/-ort`, `Familienstand / Kinder`).
+_PUNCT: Final = " \t\xa0:|.,;\u2022\u00b7*>\u2013\u2014-"
+_JOINERS: Final = _PUNCT + "/&"
+# At the start of a line a label whose rest holds only label words, joiners and a format mask is a label of
+# labels: it takes the cell below it, and if there is none it is claimed as it is.
 _LABEL_WORDS: Final = frozenset(
     [
         *"geburtsdatum geburtsort familienstand marital status staatsangehörigkeit".split(),
@@ -228,7 +242,12 @@ _LABEL_WORDS: Final = frozenset(
         *"date of birth place dob geboren geb und and oder or ort datum".split(),
     ]
 )
-_HINT: Final = re.compile(r"\([^()]{0,40}\)")
+# A format mask in brackets, `(TT.MM.JJJJ)` or `(DD/MM/YYYY)`: upper-case letters and separators, every run of
+# letters one repeated letter of a date format. Any other bracket, one with a digit or a lower-case word or
+# letters that are no format (`(USA)`), holds a value.
+_MASK_HINT: Final = re.compile(r"\([A-Z./\- ]{2,20}\)")
+_FORMAT_LETTERS: Final = frozenset("TMJDY")
+_CAPITALS: Final = re.compile(r"[A-Z]{1,20}")
 _LETTERS: Final = re.compile(r"[^\W\d_]{1,40}")
 _DISTINCT_LABELS: Final = (
     r"Familienstand|Marital[ \t]{1,3}status|Staatsangeh(?:ö|oe)rigkeit|Nationalit(?:ä|ae)t|Nationality"
@@ -239,8 +258,9 @@ _BIRTH_LABELS: Final = (
     r"Geburtsdatum|Geburtsort|Date[ \t]{1,3}of[ \t]{1,3}birth|Place[ \t]{1,3}of[ \t]{1,3}birth|DOB|geboren"
 )
 _LINE_START: Final = rf"(?<![^{_EOL}])[ \t\xa0\u2022\u00b7*|>\-\u2013\u2014]{{0,10}}"
-# A label is a word of its own: not `Nationality-neutral`, not `Gender-based`.
-_LABEL_END: Final = r"(?!\w)(?!-[^\W\d_])"
+# A label is a word of its own: not `Nationality-neutral`, not `Gender-based`; only `-ort` and `-datum` may
+# join it (`Geburtsdatum-Ort`, `Geburtsort-Datum`).
+_LABEL_END: Final = r"(?!\w)(?!-(?!(?i:ort|datum)(?!\w))[^\W\d_])"
 # One pattern for all the labels, so that the first label of a line takes the rest of the line, other labels
 # included. A label at the start of a line (after a bullet or a table pipe) is group `line`: a
 # protected-attribute or birth label, or `Kinder`, `Children`, `Gender` with a colon, a pipe or a tab after
@@ -287,11 +307,12 @@ _EMAIL: Final = re.compile(r"[\w.%+\-]{1,64}@[\w\-]{1,63}(?:\.[\w\-]{1,63}){0,8}
 
 _PHONE_SEP: Final = r"[ \t\xa0\u202f./()\-\u2010-\u2015]"
 _PHONE_GROUPS: Final = rf"(?:{_PHONE_SEP}{{1,3}}[0-9]{{1,14}}){{0,8}}(?![0-9])"
-# The prefix: `+<cc>`, `00<cc>`, or a leading 0 as `030`, `(0)30` or `0 30` (a 0 of its own, then a group
-# of an area code; a date such as `01.02.1990` has the 0 inside its group, so it never matches).
+# The prefix: `+<cc>`, `00<cc>`, or a leading 0 as `030`, `(0)30` or `0 30` (a 0 of its own, a blank or a
+# slash, then an area code of two digits or more; a date such as `01.02.1990` has the 0 inside its group, and
+# the ISBN `0-306-40615-2` has a hyphen, so neither matches).
 _PHONE: Final = re.compile(
     rf"(?<![\w+])(?:\((?=0[1-9][0-9]{{1,5}}\)))?(?:\+[0-9]{{1,14}}|00[0-9]{{1,14}}|0[1-9][0-9]{{1,12}}"
-    rf"|\(0\)[ \xa0]?[1-9][0-9]{{1,12}}|0[ \t\xa0/\-]{{1,3}}[1-9][0-9]{{0,5}}){_PHONE_GROUPS}"
+    rf"|\(0\)[ \xa0]?[1-9][0-9]{{1,12}}|0[ \t\xa0/]{{1,3}}[1-9][0-9]{{1,5}}){_PHONE_GROUPS}"
 )
 # What a number that is short on its first line may go on with: one line break, then more digit groups. A
 # line that starts with a year (19xx, 20xx) is no continuation: `Projekt 0815` / `2019 - 2022 ...`.
@@ -363,18 +384,27 @@ def _value_cell(text: str, at: int) -> int | None:
     return m.end()
 
 
-def _is_value(rest: str) -> bool:
-    """Whether the rest of a label's line holds a value: anything but white space, punctuation, the words of
-    the labels, what joins them (`/-ort`, `und`) and a short hint in brackets (`(TT.MM.JJJJ)`)."""
-    bare = _LETTERS.sub(
-        lambda m: " " if m.group().casefold() in _LABEL_WORDS else m.group(), _HINT.sub(" ", rest)
-    )
-    return bool(bare.strip(_NO_VALUE))
+def _is_format_mask(hint: str) -> bool:
+    runs = _CAPITALS.findall(hint)
+    return bool(runs) and all(len(set(run)) == 1 and run[0] in _FORMAT_LETTERS for run in runs)
+
+
+def _rest_kind(rest: str) -> Literal["empty", "labels", "value"]:
+    """What the rest of a label's line holds: nothing (`empty`), only label words, joiners and a format
+    mask (`labels`: `/-ort`, `und`, `(TT.MM.JJJJ)`), or a value (anything else, a bracket with a digit or a
+    lower-case word too)."""
+    if not rest.strip(_PUNCT):
+        return "empty"
+    unmasked = _MASK_HINT.sub(lambda m: " " if _is_format_mask(m.group()) else m.group(), rest)
+    bare = _LETTERS.sub(lambda m: " " if m.group().casefold() in _LABEL_WORDS else m.group(), unmasked)
+    return "value" if bare.strip(_JOINERS) else "labels"
 
 
 def _personal_spans(text: str) -> Iterator[Span]:
-    """The spans of a label and the rest of its line. A label with nothing after it is a hit only when it
-    starts its line, and then it takes the value line below it as well (one span)."""
+    """The spans of a label and the rest of its line. A label that starts its line and has nothing after it
+    (or only label words and a format mask) takes the value line below it as well (one span); if there is
+    none, a label of label words is claimed as it is. Anywhere else a label is a hit when anything but
+    punctuation follows it."""
     position = 0
     adjacent = -1  # where the last span ended: a label may start there
     while True:
@@ -386,11 +416,15 @@ def _personal_spans(text: str) -> Iterator[Span]:
         label = next(g for g in ("line", "birth", "inline") if groups.get(g) is not None)
         start = m.start(label)
         end = position = m.end()
-        if _is_value(m["rest"]):
+        kind = _rest_kind(m["rest"]) if label == "line" else ("value" if m["rest"].strip(_PUNCT) else "empty")
+        if kind == "value":
             adjacent = end
             yield start, end
         elif label == "line" and (cell_end := _value_cell(text, end)) is not None:
             end = position = adjacent = cell_end
+            yield start, end
+        elif kind == "labels":
+            adjacent = end
             yield start, end
 
 
@@ -402,16 +436,27 @@ def _regex_spans(pattern: re.Pattern[str]) -> Callable[[str], Iterator[Span]]:
     return spans
 
 
+# `Am Spring 5`, `Im Spring 5`, `Zum Spring 5`: a word of `NOT_A_STREET` after a preposition is a street name.
+_PREPOSITION: Final = re.compile(r"(?:Am|Im|Zum|Zur)[ \t]{1,3}\Z", re.IGNORECASE)
+
+
 def _street_spans(text: str) -> Iterator[Span]:
     """The streets with a house number. Not a street: a word of `NOT_A_STREET` (whole word, any case, the
     last part of a hyphenated word), an ordinal before `Platz` (`Erster Platz 1`)."""
+    taken = 0  # where the last street ended
     for m in _STREET.finditer(text):
+        start = m.start()
         word = (m["attached"] or "").casefold()
         if word and (word in NOT_A_STREET or word.rsplit("-", 1)[-1] in NOT_A_STREET):
-            continue
+            window = max(taken, start - 9)
+            preposition = _PREPOSITION.search(text, window, start)
+            if preposition is None or (preposition.start() > 0 and text[preposition.start() - 1].isalnum()):
+                continue
+            start = preposition.start()
         if (m["lead_er"] or "").casefold() in _ORDINALS:
             continue
-        yield m.start(), m.end()
+        taken = m.end()
+        yield start, taken
 
 
 def _digits(text: str) -> int:
@@ -434,12 +479,18 @@ def _phone_spans(text: str) -> Iterator[Span]:
         yield start, end
 
 
-def _is_role_word(token: str) -> bool:
+def _is_role_word(token: str, *, first: bool = False) -> bool:
+    """Whether a token of a line is a title or heading word: a keyword, its feminine `-in` form, or a
+    compound that ends in one. A word that is also a surname (`_COMPOUND_ONLY`) counts as the first token of
+    a line (`Leiter Controlling`, `Kaufmann für Büromanagement`: titles start with it), not later
+    (`Max Kaufmann`)."""
     word = token.casefold().strip(_WORD_EDGES)
     if not word:
         return False
-    if any(piece in ROLE_KEYWORDS and piece not in _COMPOUND_ONLY for piece in _WORD_SPLIT.split(word)):
-        return True
+    for piece in _WORD_SPLIT.split(word):
+        for stem in (piece, piece[:-2] if piece.endswith("in") else ""):
+            if stem in ROLE_KEYWORDS and (first or stem not in _COMPOUND_ONLY):
+                return True
     return any(word.endswith(k) and len(word) > len(k) for k in _COMPOUND_KEYWORDS)
 
 
@@ -496,7 +547,7 @@ def _header_name(text: str) -> tuple[Span, list[str]] | None:
         if (
             not value
             or (label is None and content.casefold().strip(" :.") in _NAME_HEADINGS)
-            or (label is None and any(_is_role_word(t) for t in value.split()))
+            or (label is None and any(_is_role_word(t, first=i == 0) for i, t in enumerate(value.split())))
         ):
             skipped += 1
             if skipped > _HEADER_SKIPS:
@@ -605,22 +656,29 @@ def _check_span(span: Span, length: int) -> None:
 
 
 def _inner_claims(original: str, base: tuple[Replacement, ...], edits: Edits) -> list[Replacement]:
-    """The replacements inside the personal replacements that the user put back. A personal span takes in
-    everything else that lies in its line (e-mail addresses, numbers), so those claims are not in `base`; once
-    the span is restored they apply again: the other categories run over the original text without the
-    personal rule, and what lies wholly inside a restored span counts."""
+    """The replacements that a restored personal replacement lets through. A personal span takes in
+    everything else in its line (e-mail addresses, numbers), so those claims are not in `base`; once the span
+    is restored they apply again: the other categories run over the original text without the personal rule,
+    and a claim that overlaps a restored span counts (also one that runs past its end: `Kinder` / `030 2312`
+    / `5456`), unless another replacement that stays covers part of it."""
     spans = [
         (r.start, r.end) for r in base if r.category == "personal" and (r.start, r.end) in edits.restored
     ]
     if not spans:
         return []
+    staying = [r for r in base if (r.start, r.end) not in edits.restored]
+    starts = [r.start for r in staying]
     inner: list[Replacement] = []
     j = 0
     for claim in _detect(original, with_name=True, with_personal=False):
         while j < len(spans) and spans[j][1] <= claim.start:
             j += 1
-        if j < len(spans) and spans[j][0] <= claim.start and claim.end <= spans[j][1]:
-            inner.append(claim)
+        if j == len(spans) or spans[j][0] >= claim.end:
+            continue
+        k = bisect_left(starts, claim.end)  # the last staying replacement that starts before the claim ends
+        if k > 0 and staying[k - 1].end > claim.start:
+            continue
+        inner.append(claim)
     return inner
 
 
@@ -630,10 +688,16 @@ def _build(original: str, base: tuple[Replacement, ...], edits: Edits) -> StripR
     # The replacements still in force (those of the fresh strip that are not restored, and the contacts inside
     # a restored personal span) and the removed spans, as one list sorted by position. Overlapping entries
     # merge into one group; a group that holds a removed span is `[REMOVED]` over its union.
+    # A restored span names the personal replacement, not a contact of the same extent inside it.
+    personal = {(r.start, r.end) for r in base if r.category == "personal"}
+    restored_inner = edits.restored - personal
     parts: list[tuple[int, int, Replacement | None]] = [
-        (r.start, r.end, r)
-        for r in [*base, *_inner_claims(original, base, edits)]
-        if (r.start, r.end) not in edits.restored
+        (r.start, r.end, r) for r in base if (r.start, r.end) not in edits.restored
+    ]
+    parts += [
+        (c.start, c.end, c)
+        for c in _inner_claims(original, base, edits)
+        if (c.start, c.end) not in restored_inner
     ]
     parts += [(start, end, None) for start, end in edits.removed]
     parts.sort(key=lambda part: part[:2])
