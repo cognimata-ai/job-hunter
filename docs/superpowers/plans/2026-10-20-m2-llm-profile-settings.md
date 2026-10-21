@@ -2019,7 +2019,7 @@ Each deviation stages a spec item across milestones, or settles something the sp
 ## Carry-forward to later milestones
 
 1. **M3:**
-   - a compilable generator output schema (Deviation 33: the API rejects the §11.5 schema's grammar as too large), as a spec change approved with M3's plan, shipped as prompt-schema version 2 and verified by the live schema dry-run before any scoring call;
+   - a compilable generator output schema (Deviation 33: the API rejects the §11.5 schema's grammar as too large), as a spec change approved with M3's plan, shipped as prompt-schema version 2 and verified by the live schema dry-run before any scoring call; activation requires a `schema_dry_run` eval run with `passed = true` and `metrics.transport = "live"` for that version, and `PROMPT_OVERHEAD_TOKENS` is re-measured against it (V19's free `--count`/`--analyse`), because 2,640 came from the rejected generator schema;
    - restore `NOT NULL` on `active_config.rubric_version_id` and `prompt_schema_version_id` in M3's first migration (Deviation 32);
    - the FKs of Deviation 1;
    - V5's paid part and V14;
