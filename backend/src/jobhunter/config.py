@@ -38,6 +38,8 @@ DEFAULT_EMBEDDER_URL: Final = "http://embedder:8080"
 DEFAULT_HTTP_USER_AGENT: Final = "JobHunter/1.0 (personal job search)"
 # M2 (plan Task 4): the recorded Anthropic streams served in fake LLM mode.
 DEFAULT_FAKE_LLM_DIR: Final = Path("tests/contract/fixtures/anthropic")
+# M2 (plan Task 9): the `cv_store` volume of the encrypted CV files (§12.1), on the api and the worker.
+DEFAULT_CV_STORE_DIR: Final = Path("/data/cv")
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
@@ -138,6 +140,8 @@ class AppConfig:
     fake_llm_dir: Path
     embedder_url: str
     http_user_agent: str
+    # `JOBHUNTER_CV_STORE_DIR`: where `profile.storage.CvStore` keeps the encrypted CV files.
+    cv_store_dir: Path
     # Neither mapping appears in repr(): a config that is logged or shown in a traceback must not leak.
     secrets: Mapping[str, bytes] = field(repr=False)
     environ: Mapping[str, str] = field(repr=False)
@@ -245,6 +249,7 @@ def load_config(
         fake_llm_dir=Path(env.get("JOBHUNTER_FAKE_LLM_DIR") or DEFAULT_FAKE_LLM_DIR).resolve(),
         embedder_url=env.get("JOBHUNTER_EMBEDDER_URL") or DEFAULT_EMBEDDER_URL,
         http_user_agent=env.get("JOBHUNTER_HTTP_USER_AGENT") or DEFAULT_HTTP_USER_AGENT,
+        cv_store_dir=Path(env.get("JOBHUNTER_CV_STORE_DIR") or DEFAULT_CV_STORE_DIR),
         secrets=MappingProxyType(contents),
         environ=MappingProxyType(env),
         secrets_dir=secrets_dir,

@@ -11,6 +11,7 @@ import httpx
 import procrastinate
 import psycopg
 import pytest
+import sqlalchemy as sa
 import structlog
 from jobhunter.api.app import JobHunterApp, create_app
 from jobhunter.auth import users
@@ -32,8 +33,8 @@ from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_p
 from tests.support.procs import ProcessGroup, wait_until
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
-# `configure_logging` also holds these (`observability/logging._CONTENT_LOGGERS`).
-_LIBRARY_LOGGERS = (*_QUIET_LOGGERS, "anthropic", "httpx2", "httpcore2")
+# `configure_logging` also holds these (`observability/logging._CONTENT_LOGGERS`, `_BODY_QUOTING_LOGGERS`).
+_LIBRARY_LOGGERS = (*_QUIET_LOGGERS, "anthropic", "httpx2", "httpcore2", "python_multipart")
 # Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
 # configuration chain, `active_config`, `ranking_state` and `sources` are kept (`reset_database` restores the
 # first three to their seeded state), `schedule_state` is reset (below), and so is `checkpoint_migrations`:
@@ -382,14 +383,33 @@ async def queue_app(migrated: PgServer, make_config: ConfigFactory) -> AsyncIter
 
 
 @pytest.fixture
-def api_app(engine: AsyncEngine, make_config: ConfigFactory) -> JobHunterApp:
+def cv_store_dir(tmp_path: Path) -> Path:
+    """The `cv_store` of the test's api (`JOBHUNTER_CV_STORE_DIR`): an empty directory of mode 0700."""
+    root = tmp_path / "cv_store"
+    root.mkdir(mode=0o700)
+    return root
+
+
+@pytest.fixture
+def api_app(engine: AsyncEngine, make_config: ConfigFactory, cv_store_dir: Path) -> JobHunterApp:
     """The whole api (edge included) on the shared database; `api_client` and `logged_in_client` share it.
 
-    The app gets its config and engine injected, so no lifespan runs.
+    The app gets its config and engine injected, so no lifespan runs. Its CV files go to `cv_store_dir`.
     """
     # Its `make_queue_app` may be the process's first (first call wins: which DSN registers depends on test
     # order), but deferring never uses the task app's DSN, only its registry.
-    return create_app(cfg=make_config("api"), engine=engine)
+    cfg = make_config("api", JOBHUNTER_CV_STORE_DIR=str(cv_store_dir))
+    return create_app(cfg=cfg, engine=engine)
+
+
+async def count_rows(engine: AsyncEngine, table: str, **filters: object) -> int:
+    """How many rows of `table` match every filter: `column = value`, or `column IN value` for a tuple."""
+    query = sa.select(sa.func.count()).select_from(sa.table(table))
+    for name, value in filters.items():
+        column: sa.ColumnClause[Any] = sa.column(name)
+        query = query.where(column.in_(value) if isinstance(value, tuple) else column == value)
+    async with engine.connect() as conn:
+        return int((await conn.execute(query)).scalar_one())
 
 
 def _app_client(app: JobHunterApp, client: tuple[str, int], headers: dict[str, str]) -> httpx.AsyncClient:

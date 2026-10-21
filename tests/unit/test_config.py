@@ -666,6 +666,16 @@ def test_fake_llm_dir_from_the_environment(tmp_path: Path, monkeypatch: pytest.M
     assert (cfg.fake_llm, cfg.fake_llm_dir) == (True, (tmp_path / "llm-fx").resolve())
 
 
+# --- M2 Task 9: the encrypted CV files' volume (`JOBHUNTER_CV_STORE_DIR`) ---------------------------------
+
+
+def test_cv_store_dir_defaults_to_the_volume_and_follows_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **API_SECRETS)
+    assert load_config("api", BASE_ENV, secrets).cv_store_dir == Path("/data/cv")
+    env = {**BASE_ENV, "JOBHUNTER_CV_STORE_DIR": str(tmp_path / "cv")}
+    assert load_config("api", env, secrets).cv_store_dir == tmp_path / "cv"
+
+
 # --- M2 Task 4 (fix round 1): `ANTHROPIC_LOG` makes the Anthropic SDK log request content ------------------
 
 

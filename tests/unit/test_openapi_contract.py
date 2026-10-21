@@ -103,6 +103,8 @@ def test_the_readiness_503_is_the_report_not_a_problem(document) -> None:
         ("get", "/api/auth/session", {"401", "429"}),
         ("post", "/api/runs", {"400", "401", "403", "409", "422", "429"}),
         ("get", "/api/system/health", {"401", "429"}),
+        ("post", "/api/profile/cv", {"401", "403", "409", "413", "422", "429"}),
+        ("post", "/api/profile/cv-text", {"401", "403", "409", "422", "429"}),
         ("get", "/readyz", {"503"}),
         ("get", "/healthz", set()),
     ],

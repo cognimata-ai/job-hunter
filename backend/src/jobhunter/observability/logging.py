@@ -79,6 +79,10 @@ _QUIET_LOGGERS = ("httpx", "httpcore")
 # handler of their own, and the app's handlers drop anything of theirs below WARNING, whatever level a later
 # import sets.
 _CONTENT_LOGGERS = ("anthropic", "httpx2", "httpcore2")
+# python-multipart's parse-error warnings quote the offending byte of a request body ("got 88 at index 9"),
+# and a CV upload's body is a CV (M2 Task 9). It logs nothing above WARNING, so it is held at ERROR; the
+# upload route logs that a form was refused, with its status and code.
+_BODY_QUOTING_LOGGERS = ("python_multipart",)
 # The format of the root handler `logging.basicConfig` adds when the SDK is imported with `ANTHROPIC_LOG` set
 # and the root logger has no handler yet (anthropic 1.15.0 `_utils/_logs.py`): it writes records unredacted.
 _SDK_BASIC_CONFIG_FORMAT = "[%(asctime)s - %(name)s:%(lineno)d - %(levelname)s] %(message)s"
@@ -110,11 +114,14 @@ def _no_library_content(record: logging.LogRecord) -> bool:
 
 def quiet_library_loggers() -> None:
     """Hold the `_QUIET_LOGGERS` and `_CONTENT_LOGGERS` at WARNING, the latter with no handler of their own
-    (so their records reach the app's redacting handler only), and remove the unredacted root handler that
-    the SDK's import may have added. `configure_logging` calls it, and so does `llm/transport.py` right after
-    it imports the SDK, which may set its levels again at that import."""
+    (so their records reach the app's redacting handler only), and the `_BODY_QUOTING_LOGGERS` at ERROR; and
+    remove the unredacted root handler that the SDK's import may have added. `configure_logging` calls it,
+    and so does `llm/transport.py` right after it imports the SDK, which may set its levels again at that
+    import."""
     for name in (*_QUIET_LOGGERS, *_CONTENT_LOGGERS):
         logging.getLogger(name).setLevel(logging.WARNING)
+    for name in _BODY_QUOTING_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
     for name in _CONTENT_LOGGERS:
         logger = logging.getLogger(name)
         for handler in list(logger.handlers):

@@ -10,6 +10,10 @@ sealed the blob without revealing it, so `decrypt` can pick the right one of sev
 secret): a blob moved to another column does not open.
 
 Failures never carry key material, plaintext or a key id: `DecryptError` has one of four fixed messages.
+
+`data_keys(cfg)` lists the keys of a configuration: the data key, which seals, and during a rotation the
+previous one, which still opens. It lives here rather than in the api so that the worker reads the keys
+without importing FastAPI.
 """
 
 import hashlib
@@ -21,6 +25,8 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from jobhunter.config import AppConfig
 
 FORMAT_VERSION: Final = 1
 KEY_BYTES: Final = 32
@@ -82,3 +88,12 @@ def decrypt(keys: Sequence[bytes], blob: bytes, *, aad: bytes) -> bytes:
         except InvalidTag:
             continue
     raise DecryptError("authentication failed")
+
+
+def data_keys(cfg: AppConfig) -> list[bytes]:
+    """The data key, then `data_key_previous` when it is configured (a rotation): `encrypt` takes the first,
+    `decrypt` tries them all."""
+    keys = [cfg.secret_b64("data_key")]
+    if "data_key_previous" in cfg.secrets:
+        keys.append(cfg.secret_b64("data_key_previous"))
+    return keys

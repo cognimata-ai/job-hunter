@@ -8,9 +8,11 @@ no real CV and no real person's data is ever used (§12, privacy rules).
 - `replacement_char_pdf(lines)`: as `minimal_pdf`, with a font whose ToUnicode map reads every "€" of `lines`
   as U+FFFD, as a PDF with a broken text map reads;
 - `image_only_pdf()`: a one-page PDF 1.4 holding a single grey image and no text at all (a scanned CV);
-- `docx_bytes(paragraphs, table=None, *, macro=False)`: a minimal DOCX built with `zipfile`; the `table` rows
-  follow the first paragraph, so a reader that keeps document order puts its cells between the paragraphs.
-  `macro=True` makes it a macro-enabled document (`word/vbaProject.bin`, the macroEnabled main part type);
+- `docx_bytes(paragraphs, table=None, *, macro=False, declared_expansion=None)`: a minimal DOCX built with
+  `zipfile`; the `table` rows follow the first paragraph, so a reader that keeps document order puts its cells
+  between the paragraphs. `macro=True` makes it a macro-enabled document (`word/vbaProject.bin`, the
+  macroEnabled main part type). `declared_expansion=n` makes the ZIP central directory declare `n` expanded
+  bytes in all (the declared size of `word/document.xml` grows; its data does not), as a ZIP bomb declares;
 - `docx_of_body(body)`: the same package around a hand-written `<w:body>` content (merged cells, nested
   tables), with `paragraph_xml(text)` for its paragraphs.
 
@@ -20,6 +22,7 @@ loop thread for the length of a test; it needs the `docparse` group (`uv run --g
 
 import importlib.util
 import io
+import struct
 import threading
 import zipfile
 from collections.abc import Iterator, Sequence
@@ -152,13 +155,46 @@ def _table(rows: Sequence[Sequence[str]]) -> str:
 
 
 def docx_bytes(
-    paragraphs: Sequence[str], table: Sequence[Sequence[str]] | None = None, *, macro: bool = False
+    paragraphs: Sequence[str],
+    table: Sequence[Sequence[str]] | None = None,
+    *,
+    macro: bool = False,
+    declared_expansion: int | None = None,
 ) -> bytes:
-    """A DOCX of `paragraphs`, with `table` (rows of cell texts) after the first paragraph."""
+    """A DOCX of `paragraphs`, with `table` (rows of cell texts) after the first paragraph; its central
+    directory declares `declared_expansion` expanded bytes in all when that is given."""
     blocks = [paragraph_xml(text) for text in paragraphs]
     if table is not None:
         blocks.insert(min(1, len(blocks)), _table(table))
-    return docx_of_body("".join(blocks), macro=macro)
+    data = docx_of_body("".join(blocks), macro=macro)
+    return data if declared_expansion is None else _declare_expansion(data, declared_expansion)
+
+
+_CENTRAL_HEADER: Final = b"PK\x01\x02"
+_END_RECORD: Final = b"PK\x05\x06"
+
+
+def _declare_expansion(data: bytes, total: int) -> bytes:
+    """`data` (a ZIP without ZIP64 records) whose central directory declares `total` expanded bytes in all:
+    the uncompressed size of `word/document.xml` (offset 24 of its central header) is raised to make up the
+    rest. The local header and the data are left as they are."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        others = sum(info.file_size for info in archive.infolist() if info.filename != "word/document.xml")
+    declared = total - others
+    if not 0 < declared < 2**32:
+        raise ValueError("the declared expansion must exceed the other entries and fit in 32 bits")
+    out = bytearray(data)
+    end = out.rfind(_END_RECORD)
+    count, _, offset = struct.unpack_from("<HII", out, end + 10)
+    for _ in range(count):
+        if out[offset : offset + 4] != _CENTRAL_HEADER:
+            raise ValueError("not a central directory header")
+        name_len, extra_len, comment_len = struct.unpack_from("<HHH", out, offset + 28)
+        if out[offset + 46 : offset + 46 + name_len] == b"word/document.xml":
+            struct.pack_into("<I", out, offset + 24, declared)
+            return bytes(out)
+        offset += 46 + name_len + extra_len + comment_len
+    raise ValueError("the DOCX has no word/document.xml")
 
 
 def docx_of_body(body: str, *, macro: bool = False) -> bytes:

@@ -12,6 +12,7 @@ from jobhunter.auth import sessions
 from jobhunter.auth.sessions import SessionInfo
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.crypto import data_keys
 from jobhunter.embeddings import EmbedderClient
 
 
@@ -36,6 +37,11 @@ def get_config(request: Request) -> AppConfig:
     if not isinstance(cfg, AppConfig):
         raise RuntimeError("the api state has no config: the lifespan has not run")
     return cfg
+
+
+def get_data_keys(request: Request) -> list[bytes]:
+    """The data keys of the app's config (`crypto.data_keys`): the sealing one first, then a previous one."""
+    return data_keys(get_config(request))
 
 
 def get_code_head(request: Request) -> str:
