@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.transitions import transition
 from jobhunter.graphs.profile.graph import thread_id
 from jobhunter.llm import bounds, fake
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS
@@ -31,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import PausePoint
 from tests.support.fixtures import count_rows
-from tests.support.llm import ledger_states, reclaim_stale_now, save_budget, tries
+from tests.support.llm import ledger_states, open_alerts, reclaim_stale_now, save_budget, tries
 from tests.support.profile import (
     EXTRACT_MODEL,
     SYNTHETIC_CV,
@@ -308,6 +309,21 @@ async def test_the_last_transient_attempt_fails_the_draft_through_the_hook(engin
     draft = await draft_row(engine, draft_id)
     assert (draft.status, draft.failure_code) == ("failed", "llm_transient")  # the requeue's code
     assert await draft_xmin(engine, draft_id) == op.xmin
+    # the requeue that spent the last attempt ended the phase `failed`, not `requeued`
+    state = await op_runner.deps.profile_graphs.extract.aget_state(
+        {"configurable": {"thread_id": thread_id("p", draft_id, op_id, 9)}}
+    )
+    assert (state.values["steps"], state.values["outcome"]) == (["check_pdf", "extract_profile"], "failed")
+
+
+async def test_a_requeued_operation_leaves_requeued_as_the_phases_outcome(engine, op_runner, upload) -> None:
+    fake.scenario("overloaded_529")
+    draft_id, op_id = await reviewed_draft(engine, op_runner, upload)
+    await op_runner.run_one(op_id)
+    state = await op_runner.deps.profile_graphs.extract.aget_state(
+        {"configurable": {"thread_id": thread_id("p", draft_id, op_id, 0)}}
+    )
+    assert state.values["outcome"] == "requeued"
 
 
 async def test_the_hook_moves_a_draft_left_in_extracting_profile_and_tolerates_a_bad_payload(
@@ -549,7 +565,8 @@ async def test_a_retry_after_invalid_output_is_a_new_operation_and_a_new_call(
     assert second_op != first_op
     assert await op_runner.run_pending() == [second_op]
     draft = await draft_row(engine, draft_id)
-    assert (draft.status, draft.failure_code) == ("ready", "invalid_output")
+    # the retried draft carries no trace of its earlier failure once it is ready
+    assert (draft.status, draft.failure_code, draft.status_reason) == ("ready", None, None)
     rows = await tries(engine)
     assert [r.logical_call_no for r in rows] == [
         1,
@@ -561,7 +578,26 @@ async def test_a_retry_after_invalid_output_is_a_new_operation_and_a_new_call(
     assert owner["id"] == second_op
 
 
-async def test_old_extraction_cannot_publish_into_a_new_approval(engine, op_runner, upload) -> None:
+async def test_the_ready_write_clears_a_stale_failure_code_and_reason(engine, op_runner, upload) -> None:
+    """Even a draft reopened without clearing them (a route that forgot) is `ready` with no failure trace."""
+    fake.scenario("refusal")
+    draft_id, _ = await reviewed_draft(engine, op_runner, upload)
+    await op_runner.run_pending()
+    assert (await draft_row(engine, draft_id)).failure_code == "refused"
+    fake.scenario("ok")
+    async with engine.begin() as conn:
+        await transition(conn, "profile_drafts", draft_id, ["failed"], "extracting_profile")
+        op_id, _ = await request_draft_operation(conn, "extract_profile", draft_id, defer=None)
+    stale = await draft_row(engine, draft_id)
+    assert (stale.failure_code, stale.status_reason) == ("refused", "refused")
+    assert await op_runner.run_pending() == [op_id]
+    draft = await draft_row(engine, draft_id)
+    assert (draft.status, draft.failure_code, draft.status_reason) == ("ready", None, None)
+
+
+async def test_old_extraction_cannot_publish_into_a_new_approval(
+    engine, op_runner, upload, log_events
+) -> None:
     draft_id, op_a = await reviewed_draft(engine, op_runner, upload)
     pause = PausePoint("profile.draft.before_tx")
     first = asyncio.create_task(op_runner.run_one(op_a, pause=pause))  # a fresh registry: another process
@@ -577,7 +613,9 @@ async def test_old_extraction_cannot_publish_into_a_new_approval(engine, op_runn
     await op_runner.run_one(op_b)
     published = await draft_xmin(engine, draft_id)
     pause.resume()
-    await asyncio.wait_for(first, 30)  # execution 1's draft write fails the owner predicate
+    # execution 1's draft transaction is fenced by the claim (`FencedOut` at `lock_operation_owner`, A is
+    # finished); the generation predicate is pinned by test_a_write_for_another_generation_writes_nothing
+    await asyncio.wait_for(first, 30)
     assert await draft_xmin(engine, draft_id) == published
     draft = await draft_row(engine, draft_id)
     assert draft.status == "ready"
@@ -590,6 +628,8 @@ async def test_old_extraction_cannot_publish_into_a_new_approval(engine, op_runn
     # B's validation, against the new text: the Docker evidence is no longer in it
     assert ("skills[5].evidence", "ungrounded") in codes(draft.validation_issues)
     assert draft.validation_issues == expected(new_text)[1]
+    fenced = [e for e in log_events() if e["event"] == "execution_lost"]
+    assert len(fenced) == 1  # execution 1 ended as lost, with no owner write
 
 
 async def _change_generation(engine: AsyncEngine, draft_id: int) -> None:
@@ -609,16 +649,22 @@ async def _change_generation(engine: AsyncEngine, draft_id: int) -> None:
 
 @pytest.mark.parametrize("path", ["text", "native"])
 @pytest.mark.parametrize(
-    ("scenario", "point"),
-    [("ok", "profile.draft.before_tx"), ("refusal", "profile.extract.after_call")],
-    ids=["ready_write", "failed_write"],
+    ("scenario", "point", "last_step"),
+    [
+        ("ok", "profile.draft.before_tx", "draft"),
+        ("refusal", "profile.extract.after_call", "extract_profile"),
+        ("ok", "profile.extract.after_call", "validate"),
+    ],
+    ids=["ready_write", "failed_write", "validate_gate"],
 )
 async def test_a_write_for_another_generation_writes_nothing(
-    engine, op_runner, upload, log_events, path: str, scenario: fake.Scenario, point: str
+    engine, op_runner, upload, log_events, path: str, scenario: fake.Scenario, point: str, last_step: str
 ) -> None:
     """Ruling 1 (carried from Task 1): a text draft's writes are guarded by `{"reviewed_text_sha256": <the
     call's>, "native_pdf": False}`, a native draft's by `{"native_pdf": True}`. A stale execution's `ready`
-    or `failed(code)` write meets another generation: it moves nothing and the operation ends obsolete."""
+    or `failed(code)` write, or the `validate` node's gate, meets another generation: nothing moves, the
+    operation ends obsolete, and the draft, left in `extracting_profile` with nothing to drive it, is
+    reported: a warning and the warn alert `profile.extract_generation_mismatch`, ids only."""
     fake.scenario(scenario)
     fake.count_tokens(1800)
     if path == "text":
@@ -639,6 +685,77 @@ async def test_a_write_for_another_generation_writes_nothing(
     assert (op.status, op.last_error_code) == ("succeeded", None)
     [obsolete] = [e for e in log_events() if e["event"] == "profile_operation_obsolete"]
     assert (obsolete["operation_id"], obsolete["draft_id"]) == (op_id, draft_id)
+    # the node that met the other generation is the one that ended the phase
+    state = await op_runner.deps.profile_graphs.extract.aget_state(
+        {"configurable": {"thread_id": thread_id("p", draft_id, op_id, 0)}}
+    )
+    assert (state.values["steps"][-1], state.values["outcome"]) == (last_step, "obsolete")
+    [mismatch] = [e for e in log_events() if e["event"] == "profile_extract_generation_mismatch"]
+    assert (mismatch["level"], mismatch["operation_id"], mismatch["draft_id"]) == ("warning", op_id, draft_id)
+    assert await open_alerts(engine, "profile.extract_generation_mismatch") == [
+        (f"profile.extract_generation_mismatch:profile_draft:{draft_id}", "warn", 1)
+    ]
+    assert await alert_context(engine, "profile.extract_generation_mismatch") == {
+        "operation_id": op_id,
+        "draft_id": draft_id,
+    }
+
+
+async def test_a_draft_that_left_the_phase_ends_the_operation_quietly(engine, op_runner, upload) -> None:
+    """The obsolete end of a draft that left `extracting_profile` (here: failed by another writer under the
+    paused execution) is the ordinary one: no alert, and the draft keeps the other writer's end."""
+    draft_id, op_id = await reviewed_draft(engine, op_runner, upload)
+    pause = PausePoint("profile.draft.before_tx")
+    execution = asyncio.create_task(op_runner.run_one(op_id, pause=pause))
+    await asyncio.wait_for(pause.reached.wait(), 60)
+    async with engine.begin() as conn:
+        await transition(
+            conn,
+            "profile_drafts",
+            draft_id,
+            ["extracting_profile"],
+            "failed",
+            reason="elsewhere",
+            set_={"failure_code": "elsewhere"},
+        )
+    pause.resume()
+    await asyncio.wait_for(execution, 30)
+    draft = await draft_row(engine, draft_id)
+    assert (draft.status, draft.failure_code, draft.draft_json) == ("failed", "elsewhere", None)
+    assert (await op_row(engine, op_id)).status == "succeeded"
+    assert await open_alerts(engine, "profile.extract_generation_mismatch") == []
+
+
+async def alert_context(engine: AsyncEngine, code: str) -> dict[str, Any]:
+    async with engine.connect() as conn:
+        statement = sa.text("SELECT context FROM alerts WHERE code = :c AND resolved_at IS NULL")
+        return dict((await conn.execute(statement, {"c": code})).scalar_one())
+
+
+# --- the sha256 guard ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("corrupt", ["reviewed_text", "reviewed_text_sha256"])
+async def test_a_reviewed_text_that_does_not_match_its_sha256_is_never_sent(
+    engine, op_runner, upload, corrupt: str
+) -> None:
+    """§9.5: the model receives exactly the approved text. A `reviewed_text` that no longer hashes to
+    `reviewed_text_sha256` is a bug (`InvariantViolation`, as `NodeFailed`): nothing is reserved or sent, and
+    the operation is requeued as `bug`."""
+    draft_id, op_id = await reviewed_draft(engine, op_runner, upload)
+    column = {"reviewed_text": "reviewed_text || ' (changed)'", "reviewed_text_sha256": "sha256('other')"}
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text(f"UPDATE profile_drafts SET {corrupt} = {column[corrupt]} WHERE id = :d"),  # noqa: S608
+            {"d": draft_id},
+        )
+    await op_runner.run_one(op_id)
+    assert served() == 0 and fake.state().count_tokens_requests == 0
+    assert await count_rows(engine, "llm_calls") == 0 and await count_rows(engine, "llm_spend_ledger") == 0
+    op = await op_row(engine, op_id)
+    assert (op.status, op.last_error_code, op.attempts) == ("pending", "bug", 1)
+    draft = await draft_row(engine, draft_id)
+    assert (draft.status, draft.failure_code, draft.draft_json) == ("extracting_profile", None, None)
 
 
 # --- no content outside the content tables ---------------------------------------------------------------

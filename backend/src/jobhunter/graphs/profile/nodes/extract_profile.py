@@ -18,11 +18,13 @@
    id, the native flag (the gateway then counts the exact request and reserves `native_pdf_bound` plus the
    locked month row's buffer share), `logical_call_no` 1 or 2, and `deadline = monotonic() + deadline_s` of
    that execution config, per call (Deviation 28). The fault point `profile.extract.after_call` follows every
-   call that settled, whether it returned or raised.
+   gateway call that returned or raised an `LLMError`: after a settled try, and also after `BudgetExhausted`
+   and `InputUnbounded`, where nothing was reserved, sent or settled.
 4. **The outcome** (`llm_outcome`'s mapping): the call's id goes to the state (`llm_call_id`; its output stays
    in `llm_calls.output_json`, never in a checkpoint); a failure ends the draft `failed(code)` with the
    operation (`fail_extraction`, guarded by the generation's owner predicate); a transient failure gives the
-   operation back with `ctx.requeue_in(…, error_code='llm_transient', not_before=now + 5 min)`, whose attempt
+   operation back with `ctx.requeue_in(…, error_code='llm_transient', not_before=now + 5 min)` (the state's
+   `outcome` is `requeued`, or `failed` when that was the operation's last attempt), whose attempt
    limit and failure hook end the draft once it is spent.
 
 Logs carry ids, codes and amounts only: never the text, the PDF or the output.
@@ -54,7 +56,7 @@ from jobhunter.graphs.profile.nodes import (
     log,
 )
 from jobhunter.graphs.profile.nodes.llm_outcome import Call, Fail, Requeue, Use
-from jobhunter.graphs.profile.state import REQUEUED, ProfileState, ProfileUpdate
+from jobhunter.graphs.profile.state import FAILED, REQUEUED, ProfileState, ProfileUpdate
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.errors import LLMError
 from jobhunter.llm.gateway import CallContext, NodeConfig, RenderedPrompt, node_config
@@ -154,7 +156,9 @@ def _caller(
     native_pdf: bool,
 ) -> Callable[[int], Awaitable[int]]:
     """The gateway call of one logical call (module docstring, step 3), for `llm_outcome.drive`: the call's
-    id, or the gateway's `LLMError`. The fault point `profile.extract.after_call` follows the settled call."""
+    id, or the gateway's `LLMError`. The fault point `profile.extract.after_call` follows the call whether it
+    returned or raised: after its settled tries, or after `BudgetExhausted` or `InputUnbounded`, which
+    reserved, sent and settled nothing."""
     claim = op.claim
 
     async def call(logical_call_no: int) -> int:
@@ -170,7 +174,7 @@ def _caller(
         try:
             result = await od.gateway.call(node, prompt, ctx)
         except LLMError:
-            await afault_point(AFTER_CALL)  # the call settled (its tries did), with no output
+            await afault_point(AFTER_CALL)  # no output: its tries settled, or none was reserved
             raise
         await afault_point(AFTER_CALL)
         log.info(
@@ -224,9 +228,15 @@ def make_extract_profile(deps: ProfileDeps) -> Node:
             raise InvariantViolation(f"profile draft {draft_id}: a call was left unmade")
         async with deps.engine.begin() as conn:
             await op.requeue_in(conn, error_code=step.code, not_before=od.clock() + llm_outcome.REQUEUE_AFTER)
+        # the requeue of the last attempt ends the operation `failed` (and its hook the draft)
+        spent = op.ended is not None and op.ended.status == "failed"
         log.info(
-            "profile_extract_requeued", operation_id=claim.operation_id, draft_id=draft_id, code=step.code
+            "profile_extract_requeued",
+            operation_id=claim.operation_id,
+            draft_id=draft_id,
+            code=step.code,
+            attempts_spent=spent,
         )
-        return {"steps": [NAME], "outcome": REQUEUED}
+        return {"steps": [NAME], "outcome": FAILED if spent else REQUEUED}
 
     return extract_profile

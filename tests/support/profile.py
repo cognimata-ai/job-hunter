@@ -45,8 +45,8 @@ Task 13 adds the extract phase:
   cover (`years_mismatch`);
 - `upload(pdf, native_pdf_opt_in=True)`: the native-PDF opt-in upload (§12.7);
 - `approve_text`, `retry_draft` and `reopen_text_review`: the approval, the retry and the edit from `ready` as
-  Task 14's routes will make them (the draft's transition and, for the first two, the `extract_profile`
-  operation, no job deferred);
+  Task 14's routes will make them (the draft's transition, which clears any `failure_code` and reason, and,
+  for the first two, the `extract_profile` operation, no job deferred);
 - `OpRunner.sleeps`: the backoff waits of the runner's gateway, recorded instead of waited.
 """
 
@@ -71,7 +71,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.db.transitions import transition
+from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.profile.deps import ProfileDeps
 from jobhunter.graphs.profile.graph import build_profile_graphs
@@ -703,7 +703,12 @@ async def approve_text(engine: AsyncEngine, draft_id: int, text: str | None = No
             draft_id,
             ["text_review"],
             "extracting_profile",
-            set_={"reviewed_text": reviewed, "reviewed_text_sha256": sha256(reviewed)},
+            reason=CLEAR_REASON,
+            set_={
+                "reviewed_text": reviewed,
+                "reviewed_text_sha256": sha256(reviewed),
+                "failure_code": None,
+            },
         )
         op_id, created = await request_draft_operation(conn, "extract_profile", draft_id, defer=None)
     assert created, "an approval creates a new operation"
@@ -711,10 +716,18 @@ async def approve_text(engine: AsyncEngine, draft_id: int, text: str | None = No
 
 
 async def retry_draft(engine: AsyncEngine, draft_id: int) -> int:
-    """Task 14's `POST …/retry` with `mode="llm"`: `failed → extracting_profile` and a new `extract_profile`
-    operation; its id."""
+    """Task 14's `POST …/retry` with `mode="llm"`: `failed → extracting_profile`, its failure code and reason
+    cleared, and a new `extract_profile` operation; its id."""
     async with engine.begin() as conn:
-        await transition(conn, "profile_drafts", draft_id, ["failed"], "extracting_profile")
+        await transition(
+            conn,
+            "profile_drafts",
+            draft_id,
+            ["failed"],
+            "extracting_profile",
+            reason=CLEAR_REASON,
+            set_={"failure_code": None},
+        )
         op_id, created = await request_draft_operation(conn, "extract_profile", draft_id, defer=None)
     assert created, "a retry creates a new operation"
     return op_id
@@ -724,5 +737,11 @@ async def reopen_text_review(engine: AsyncEngine, draft_id: int) -> None:
     """Task 14's text edit from `ready`: `ready → text_review`, the `draft_json` discarded (§12.3)."""
     async with engine.begin() as conn:
         await transition(
-            conn, "profile_drafts", draft_id, ["ready"], "text_review", set_={"draft_json": None}
+            conn,
+            "profile_drafts",
+            draft_id,
+            ["ready"],
+            "text_review",
+            reason=CLEAR_REASON,
+            set_={"draft_json": None, "failure_code": None},
         )

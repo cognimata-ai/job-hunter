@@ -856,11 +856,12 @@ async def _raise_bound_violated(conn: AsyncConnection, entry: _Entry, cost: Deci
 # ---- receipts of an operation's calls (§9.1; plan Task 13, Deviation 26) ----------------------------------
 
 # The newest `completed` call per `logical_call_no` of one operation and purpose. The operation is matched by
-# the id `OperationOwner.durable()` writes into `input_refs["owner"]`, never by a second key.
+# the id `OperationOwner.durable()` writes into `input_refs["owner"]`, never by a second key: by containment,
+# the kind and the id as a JSON number, so no cast ever runs on another owner kind's id.
 _RECEIPTS = q(
     "SELECT DISTINCT ON (logical_call_no) logical_call_no, id, output_json, error_code FROM llm_calls "
-    "WHERE input_refs -> 'owner' ->> 'kind' = 'operation' "
-    "AND (input_refs -> 'owner' ->> 'id')::bigint = :operation_id "
+    "WHERE input_refs -> 'owner' @> "
+    "jsonb_build_object('kind', 'operation', 'id', CAST(:operation_id AS bigint)) "
     "AND purpose = :purpose AND status = 'completed' AND logical_call_no IS NOT NULL "
     "ORDER BY logical_call_no, id DESC"
 )

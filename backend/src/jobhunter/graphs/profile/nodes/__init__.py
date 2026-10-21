@@ -17,7 +17,8 @@ the domain rows):
 
 The extract phase (Task 13) adds:
 - `read_extract_draft(engine, draft_id)`: the draft as its nodes read it (`ExtractDraft`), without a lock
-  (`fetch_extract_draft(conn, draft_id)` on the caller's connection);
+  (`fetch_extract_draft(conn, draft_id)` on the caller's connection; `lock_extract_draft(conn, draft_id)`
+  with its row `FOR UPDATE`);
 - `generation_owner(native_pdf=…, reviewed_text_sha256=…)`: the owner predicate of every write of the phase,
   on the `owner_cols` of `profile_drafts`. A text draft's generation is the text the user approved,
   `{"reviewed_text_sha256": <digest>, "native_pdf": False}`; a native draft's is `{"native_pdf": True}`
@@ -28,21 +29,27 @@ The extract phase (Task 13) adds:
   one transaction each in the §9.1 order (the owner row, then the draft `FOR UPDATE`), the second moving the
   draft `extracting_profile → failed(code)` for `owner`'s generation and finishing the operation
   `failed(code)` in that transaction, or ending it obsolete when the draft is in another state or generation;
-- `execution_thread(config)`: the execution's thread id, the key of what one execution's nodes hand on in
-  memory (`validate.VALIDATED`).
+- `end_off_generation(conn, op, draft_id, status)`: the end of an execution whose draft is no longer its own.
+  A draft in another state ends the operation obsolete, quietly. A draft still in `extracting_profile` but in
+  another generation is a state no route makes (a new generation needs `text_review` or `failed` first, and
+  each ends the old operation): it is logged as a warning and raises the warn alert
+  `profile.extract_generation_mismatch` (ids only), since nothing would drive that draft any further; then the
+  operation ends obsolete as well, and nothing of the stale result is written.
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 from langchain_core.runnables import RunnableConfig
+from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.errors import InvariantViolation, TransitionConflict
 from jobhunter.graphs.profile.state import FAILED, OBSOLETE, ProfileState, ProfileUpdate
+from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.worker.operations import OperationContext, OperationDeps, lock_operation_owner
 
@@ -50,6 +57,7 @@ from jobhunter.worker.operations import OperationContext, OperationDeps, lock_op
 # the data keys (`crypto.DecryptError`: a wrong key, or another row's blob).
 CV_FILE_UNREADABLE: Final = "cv_file_unreadable"
 EXTRACTING_PROFILE: Final = "extracting_profile"
+GENERATION_MISMATCH_ALERT: Final = "profile.extract_generation_mismatch"
 _TABLE: Final = "profile_drafts"
 
 _CV = q(
@@ -57,10 +65,12 @@ _CV = q(
     "JOIN cv_files c ON c.id = d.cv_file_id WHERE d.id = :d"
 )
 _LOCK_DRAFT = q("SELECT status FROM profile_drafts WHERE id = :d FOR UPDATE")
-_EXTRACT_DRAFT = q(
+_EXTRACT_DRAFT_SQL: Final = (
     "SELECT d.status, d.cv_file_id, d.reviewed_text, d.reviewed_text_sha256, d.native_pdf, c.storage_path "
     "FROM profile_drafts d JOIN cv_files c ON c.id = d.cv_file_id WHERE d.id = :d"
 )
+_EXTRACT_DRAFT = q(_EXTRACT_DRAFT_SQL)
+_LOCK_EXTRACT_DRAFT = q(_EXTRACT_DRAFT_SQL + " FOR UPDATE OF d")
 
 log = get_logger("jobhunter.graphs.profile")
 
@@ -158,7 +168,15 @@ async def read_extract_draft(engine: AsyncEngine, draft_id: int) -> ExtractDraft
 
 async def fetch_extract_draft(conn: AsyncConnection, draft_id: int) -> ExtractDraft | None:
     """`read_extract_draft` on the caller's connection (in its transaction, after its locks)."""
-    row = (await conn.execute(_EXTRACT_DRAFT, {"d": draft_id})).first()
+    return _extract_draft((await conn.execute(_EXTRACT_DRAFT, {"d": draft_id})).first())
+
+
+async def lock_extract_draft(conn: AsyncConnection, draft_id: int) -> ExtractDraft | None:
+    """`fetch_extract_draft` with the draft's row held `FOR UPDATE` for the transaction."""
+    return _extract_draft((await conn.execute(_LOCK_EXTRACT_DRAFT, {"d": draft_id})).first())
+
+
+def _extract_draft(row: Row[Any] | None) -> ExtractDraft | None:
     if row is None:
         return None
     digest = None if row.reviewed_text_sha256 is None else bytes(row.reviewed_text_sha256)
@@ -181,12 +199,24 @@ def generation_owner(*, native_pdf: bool, reviewed_text_sha256: bytes | None) ->
     return {"reviewed_text_sha256": reviewed_text_sha256, "native_pdf": False}
 
 
-def execution_thread(config: RunnableConfig) -> str:
-    """The thread id of the execution (`graph.thread_id`): unique per operation and attempt."""
-    thread = config.get("configurable", {}).get("thread_id")
-    if not isinstance(thread, str) or not thread:
-        raise TypeError("a profile node runs on its execution's thread (configurable['thread_id'])")
-    return thread
+async def end_off_generation(
+    conn: AsyncConnection, op: OperationContext, draft_id: int, status: str | None
+) -> str:
+    """End the operation obsolete, loudly when the draft is still `extracting_profile` (module docstring); in
+    the caller's transaction, after its owner and draft locks. The state's `outcome`."""
+    if status == EXTRACTING_PROFILE:
+        operation_id = op.claim.operation_id
+        log.warning("profile_extract_generation_mismatch", operation_id=operation_id, draft_id=draft_id)
+        await raise_alert(
+            conn,
+            code=GENERATION_MISMATCH_ALERT,
+            severity="warn",
+            subject=f"profile_draft:{draft_id}",
+            message="an extraction met its draft in another generation; the draft stays extracting_profile",
+            context={"operation_id": operation_id, "draft_id": draft_id},
+        )
+    await end_obsolete(conn, op, draft_id, status)
+    return OBSOLETE
 
 
 async def end_obsolete_in_own_tx(engine: AsyncEngine, op: OperationContext, draft_id: int) -> str:
@@ -220,5 +250,4 @@ async def fail_extraction(
                     code=code,
                 )
                 return FAILED
-        await end_obsolete(conn, op, draft_id, status)
-    return OBSOLETE
+        return await end_off_generation(conn, op, draft_id, status)

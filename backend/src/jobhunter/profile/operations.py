@@ -30,8 +30,7 @@ operation `succeeded` as obsolete without touching it, so no extraction ever sta
 approved (§12.3). Then the handler invokes `profile_graphs.extract` on the execution's own thread
 (`thread_id("p", draft_id, claim.operation_id, claim.attempts)`) with the same invoke shape. Its nodes end
 the operation in the transaction of their last domain write: `ready`, or `failed(code)`, or a requeue
-(`graphs.profile.nodes.check_pdf`, `.extract_profile`, `.draft`). Whatever the graph's end, the handler then
-discards what its `validate` node handed on in memory (`validate.VALIDATED`, by thread).
+(`graphs.profile.nodes.check_pdf`, `.extract_profile`, `.draft`).
 
 **Its failure hook** (`extract_phase_failed`) moves a draft still in `extracting_profile` to
 `failed(<code or 'attempts_exhausted'>)`: a requeue's last attempt (`llm_transient`), or a reclaim or the
@@ -53,7 +52,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db.transitions import transition
 from jobhunter.graphs.profile.graph import invoke_config
 from jobhunter.graphs.profile.nodes import EXTRACTING_PROFILE, end_obsolete, fail_draft, lock_draft
-from jobhunter.graphs.profile.nodes.validate import VALIDATED
 from jobhunter.graphs.profile.state import initial_state
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue, get_int
@@ -155,10 +153,6 @@ async def extract_profile(ctx: OperationContext) -> None:
         if status != EXTRACTING_PROFILE:
             await end_obsolete(conn, ctx, draft_id, status)
             return
-    config = invoke_config("p", draft_id, ctx)
-    try:
-        await ctx.deps.profile_graphs.extract.ainvoke(
-            initial_state(draft_id, claim.operation_id), config, durability="sync"
-        )
-    finally:
-        VALIDATED.discard(config["configurable"]["thread_id"])
+    await ctx.deps.profile_graphs.extract.ainvoke(
+        initial_state(draft_id, claim.operation_id), invoke_config("p", draft_id, ctx), durability="sync"
+    )
