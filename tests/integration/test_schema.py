@@ -42,12 +42,14 @@ def test_tables(migrated: PgServer) -> None:
 
 
 def test_active_config_m2_columns_nullable(migrated: PgServer) -> None:
+    """M0 left the rubric and prompt-schema pointers nullable; M2's migration 0007 seeds both rows and
+    restores the spec's NOT NULL (M0 Deviation 1)."""
     assert rows(
         migrated,
         "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name='active_config' "
         "AND column_name IN ('rubric_version_id','prompt_schema_version_id','settings_version_id') "
         "ORDER BY 1",
-    ) == [("prompt_schema_version_id", "YES"), ("rubric_version_id", "YES"), ("settings_version_id", "NO")]
+    ) == [("prompt_schema_version_id", "NO"), ("rubric_version_id", "NO"), ("settings_version_id", "NO")]
 
 
 def test_text_search_and_unaccent(migrated: PgServer) -> None:

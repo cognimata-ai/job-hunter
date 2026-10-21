@@ -27,6 +27,7 @@ dependencies = [
     "httpx==0.28.1",
     "defusedxml==0.7.1",
     "zstandard==0.25.0",
+    "pyyaml==6.0.3",
 ]
 
 [dependency-groups]
@@ -38,6 +39,7 @@ dev = [
     "mypy==2.4.0",
     "respx==0.23.1",
     "pip-audit==2.10.1",
+    "types-PyYAML==6.0.12.20260906",
 ]
 # The embedder image only (embedder/Dockerfile: `uv sync --only-group embedder`); never in the app image. The
 # base environment runs tests/embedder without it: embedder/app.py imports onnxruntime, tokenizers and numpy
@@ -74,5 +76,6 @@ markers = [
     "contract: runs an adapter or the fixture scan on the scrubbed fixtures (tests/contract, spec §18.4)",
     "live: calls a real provider; never run in CI and deselected by default",
     "embedder_model: the real model in .model-cache/arctic; run with `uv run --group embedder pytest -m embedder_model`",
+    "payload: an LLM payload contract test (tests/payload, spec §10.9): offline, no database",
 ]
 addopts = "-m 'not stack and not perf and not live and not embedder_model'"

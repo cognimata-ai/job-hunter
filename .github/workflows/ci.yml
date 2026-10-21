@@ -1,4 +1,5 @@
-# CI for Job Hunter (spec §18.8, the M0 and M1 subset): lint, unit, integration, contract, frontend and audit.
+# CI for Job Hunter (spec §18.8, the M0 to M2 subset): lint, unit, integration, contract, payload, frontend and
+# audit.
 # The live smoke of the free sources is the separate, manual and weekly smoke-free-sources.yml; no job here calls
 # a provider.
 #
@@ -101,6 +102,21 @@ jobs:
           version: "0.13.1"
       - run: uv sync --frozen
       - run: uv run pytest -W error tests/contract -q
+
+  # The LLM payload contract tests (spec §10.9, §18.5; M0 Deviation 15): the request bodies of the gateway
+  # against the policy, offline, no database and no provider key.
+  payload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      - run: uv run pytest -W error tests/payload -q
 
   frontend:
     runs-on: ubuntu-24.04

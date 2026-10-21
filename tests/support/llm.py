@@ -9,6 +9,9 @@ Task 5 adds the gateway side: the `fake_llm` fixture (`FakeLLM`: recordings of t
 written for the test, gateways on them, the tries `served`, the backoff waits `sleeps`), the test node and
 prompt, and the C35 helpers `create_llm_call_operation`, `reclaim_stale_now` and `ledger_states`.
 
+Task 6 adds the payload contract side (§10.9): `CapturingTransport`, `capture_request` (one `gateway._chat`
+try on it, no database, no network) and `assert_single_call_payload`.
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
@@ -35,8 +38,17 @@ from jobhunter.db.sql import q
 from jobhunter.llm import fake
 from jobhunter.llm.budget import BudgetParams, BudgetRow, month_of
 from jobhunter.llm.cache_monitor import CacheMonitor
-from jobhunter.llm.gateway import CallContext, LLMGateway, NodeConfig, RenderedPrompt, SystemBlock
+from jobhunter.llm.gateway import (
+    CallContext,
+    LLMGateway,
+    NodeConfig,
+    RenderedPrompt,
+    SystemBlock,
+    _chat,
+    to_messages,
+)
 from jobhunter.llm.pricing import MODELS, Usage
+from jobhunter.llm.schemas import transformed
 from jobhunter.llm.spend_ledger import (
     CallOutcome,
     EvalRunOwner,
@@ -49,7 +61,7 @@ from jobhunter.llm.transport import make_http_client
 from jobhunter.types import JSONValue, get_object
 from jobhunter.worker import operations as ops
 from langchain_core.messages import HumanMessage
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.m2 import insert_eval_run
@@ -816,3 +828,111 @@ async def tries(engine: AsyncEngine) -> list[Try]:
     """Every try in the database, oldest first."""
     async with engine.connect() as conn:
         return [Try(**row._mapping) for row in await conn.execute(_TRIES)]
+
+
+# --- Task 6: the payload contract tests (§10.9) ------------------------------------------------------------
+
+PAYLOAD_KEY: Final = SecretStr("payload-test-key-0001")  # never a real key: nothing leaves the process
+# The request keys no call may carry (G6, G11).
+BANNED_REQUEST_KEYS: Final = ("tool_choice", "tools", "temperature", "top_p", "top_k", "fallbacks", "betas")
+
+
+@dataclass(frozen=True)
+class CapturedRequest:
+    """One request as `CapturingTransport` received it."""
+
+    method: str
+    url: httpx2.URL
+    headers: httpx2.Headers
+    body: dict[str, Any] = field(repr=False)
+
+
+class CapturingTransport(httpx2.AsyncBaseTransport):
+    """The transport of the API origin in a payload test (`make_http_client(cfg, mount=…)`): it keeps every
+    request and answers each with `answer`, a 200 SSE stream. Nothing leaves the process: every other origin
+    is unreachable, so a request that does not name the API origin fails instead of being captured."""
+
+    def __init__(self, answer: bytes) -> None:
+        self._answer = answer
+        self.requests: list[CapturedRequest] = []
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(await request.aread())
+        self.requests.append(CapturedRequest(request.method, request.url, request.headers, body))
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream; charset=utf-8", "request-id": "req_payload_0001"},
+            content=self._answer,
+        )
+
+
+async def capture_request(
+    cfg: AppConfig, node: NodeConfig, prompt: RenderedPrompt, answer: Any
+) -> CapturedRequest:
+    """The request one `gateway._chat` try sends for `node` (its model, effort, first `max_tokens` stage and
+    schema) with `prompt`, on a capturing transport that answers with `answer` as the structured output. The
+    answer must parse as `node.schema`, so the whole try ran. No database and no network: the `payload` CI
+    job has neither."""
+    transport = CapturingTransport(synthetic_sse(answer, model=node.model))
+    async with make_http_client(cfg, mount=transport) as client:
+        runnable = _chat(
+            node.model,
+            node.effort,
+            node.max_tokens,
+            node.schema,
+            api_key=PAYLOAD_KEY,
+            http_client=client,
+            purpose=node.purpose,
+        )
+        out = await runnable.ainvoke(to_messages(prompt))
+    assert out["parsing_error"] is None and isinstance(out["parsed"], node.schema)
+    (request,) = transport.requests
+    return request
+
+
+def cache_control_paths(doc: Any, path: str = "") -> list[str]:
+    """The paths of every `cache_control` key in `doc`."""
+    found: list[str] = []
+    if isinstance(doc, dict):
+        for key, value in doc.items():
+            if key == "cache_control":
+                found.append(f"{path}/{key}")
+            found.extend(cache_control_paths(value, f"{path}/{key}"))
+    elif isinstance(doc, list):
+        for i, item in enumerate(doc):
+            found.extend(cache_control_paths(item, f"{path}/{i}"))
+    return found
+
+
+def assert_single_call_payload(
+    request: CapturedRequest,
+    node: NodeConfig,
+    *,
+    model_policy: dict[str, JSONValue],
+    execution: dict[str, JSONValue],
+) -> None:
+    """The §10.9 assertions for a single (uncached) call of `node`, against the stored policy and execution
+    config it was configured from: the API host, the json_schema output format with exactly the transformed
+    schema, the policy's model and effort, the execution config's first `max_tokens` stage, `stream`, none
+    of the banned keys, a user turn last, and no `cache_control` anywhere (§10.6: a single call)."""
+    policy_node = get_object(model_policy, f"nodes.{node.purpose}")
+    stages = get_object(execution, node.purpose)
+    assert (request.method, request.url.scheme, request.url.host, request.url.path) == (
+        "POST",
+        "https",
+        "api.anthropic.com",
+        "/v1/messages",
+    )
+    assert request.headers["x-api-key"] == PAYLOAD_KEY.get_secret_value()
+    assert "anthropic-beta" not in request.headers  # no betas (G6)
+    body = request.body
+    assert body["model"] == policy_node["model"] == node.model
+    assert body["output_config"]["format"] == {"type": "json_schema", "schema": transformed(node.schema)}
+    assert body["output_config"]["effort"] == policy_node["effort"]
+    assert body["max_tokens"] == stages["max_tokens"]
+    assert body["stream"] is True
+    assert not set(BANNED_REQUEST_KEYS) & set(body), sorted(set(BANNED_REQUEST_KEYS) & set(body))
+    assert "budget_tokens" not in (body.get("thinking") or {})  # effort only, never a thinking budget (G6)
+    assert body["messages"] and body["messages"][-1]["role"] == "user"
+    assert {message["role"] for message in body["messages"]} == {"user"}  # never an assistant prefill
+    assert cache_control_paths(body) == []

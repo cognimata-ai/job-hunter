@@ -5,7 +5,9 @@ policy, execution config, evaluation policy) are immutable and deduplicated by t
 JSON of the payload as stored (§13.2), so a second `seed_defaults` finds the rows of the first.
 
 The `sources` rows (`SOURCES`) and the `default` instance of each non-ATS source (`DEFAULT_INSTANCES`) are
-inserted when absent and never updated.
+inserted when absent and never updated. So are rubric v1 (found by its version) and the prompt-schema version
+of this code's templates and schemas (found by its hash), which migration 0007 already inserted on every
+database it migrated: a fresh `active_config` row points at both (M2).
 
 The transition matrix is different: it is derived from code, so `sync_transition_matrix` replaces its rows on
 every run instead of freezing them.
@@ -162,6 +164,49 @@ async def _ensure_hashed(
     return await _ensure_id(conn, select, insert, {"hash": digest}, {"hash": digest, "payload": payload})
 
 
+async def _shipped_rubric_and_prompt_schema(conn: AsyncConnection) -> tuple[int, int]:
+    """The ids of rubric v1 and of the prompt-schema version this code renders, each inserted when absent.
+
+    A release whose templates or schemas differ ships a new prompt-schema version this way; it never activates
+    itself (§13.3). Imported here, not at the top: the rubric loader and the renderer import this module's
+    `content_hash` and `canonical_json`.
+    """
+    from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
+    from jobhunter.scoring.rubric import RUBRIC_V1, load_rubric
+
+    rubric = load_rubric(RUBRIC_V1)
+    rubric_id = await _ensure_id(
+        conn,
+        q("SELECT id FROM rubric_versions WHERE version = :version"),
+        q(
+            "INSERT INTO rubric_versions (version, content_hash, weights, anchors) "
+            "VALUES (:version, :hash, :weights, :anchors) ON CONFLICT DO NOTHING RETURNING id",
+            jsonb=["weights", "anchors"],
+        ),
+        {"version": RUBRIC_V1},
+        {
+            "version": RUBRIC_V1,
+            "hash": rubric.content_hash,
+            "weights": dict(rubric.weights),
+            "anchors": dict(rubric.anchors),
+        },
+    )
+    templates, schemas = prompt_schema_v1()
+    digest = prompt_schema_hash(templates, schemas)
+    prompt_schema_id = await _ensure_id(
+        conn,
+        q("SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = :hash"),
+        q(
+            "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
+            "VALUES (:hash, :templates, :schemas) ON CONFLICT DO NOTHING RETURNING id",
+            jsonb=["templates", "schemas"],
+        ),
+        {"hash": digest},
+        {"hash": digest, "templates": templates, "schemas": schemas},
+    )
+    return rubric_id, prompt_schema_id
+
+
 _STORED_SETTINGS_V1 = q("SELECT id, payload FROM settings_versions WHERE version_no = 1")
 
 
@@ -235,7 +280,8 @@ async def sync_transition_matrix(conn: AsyncConnection) -> int:
 
 
 async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
-    """Write the default settings chain, the three single rows, `sources` and the default source instances.
+    """Write the default settings chain, rubric v1 and the prompt-schema version, the three single rows,
+    `sources` and the default source instances.
 
     Idempotent and never an overwrite. Settings version 1 is frozen once stored: the derived rows (scope,
     model policy, execution config, evaluation policy) and the version are created from the packaged
@@ -258,16 +304,19 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     settings_id = int(stored["id"])
     settings = get_object(stored["payload"], "")
 
-    # The active pointers are those of the settings version they activate, so the two cannot disagree.
-    # The profile, tuple, rubric and prompt-schema pointers stay NULL until M2.
+    # The active pointers are those of the settings version they activate, so the two cannot disagree, plus
+    # rubric v1 and the prompt-schema version (both NOT NULL). The profile and tuple pointers stay NULL until
+    # a profile is confirmed (§12.6).
+    rubric_id, prompt_schema_id = await _shipped_rubric_and_prompt_schema(conn)
     await conn.execute(
         q(
             "INSERT INTO active_config (id, settings_version_id, scope_version_id, model_policy_id, "
-            "execution_config_id, evaluation_policy_id) "
-            "SELECT 1, id, scope_version_id, model_policy_id, execution_config_id, evaluation_policy_id "
-            "FROM settings_versions WHERE id = :settings_id ON CONFLICT DO NOTHING"
+            "execution_config_id, evaluation_policy_id, rubric_version_id, prompt_schema_version_id) "
+            "SELECT 1, id, scope_version_id, model_policy_id, execution_config_id, evaluation_policy_id, "
+            ":rubric_id, :prompt_schema_id FROM settings_versions WHERE id = :settings_id "
+            "ON CONFLICT DO NOTHING"
         ),
-        {"settings_id": settings_id},
+        {"settings_id": settings_id, "rubric_id": rubric_id, "prompt_schema_id": prompt_schema_id},
     )
 
     interval_s = get_int(settings, "schedule.interval_hours") * _SECONDS_PER_HOUR
