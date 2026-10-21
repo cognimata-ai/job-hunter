@@ -79,14 +79,55 @@ async def test_the_base_url_and_key_ignore_the_anthropic_environment(
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("ANTHROPIC_API_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "env-key-must-not-be-sent")
+    # The SDK merges these into every request, after its auth headers, so they could add a beta (G2, G6),
+    # forward a header meant for another service, or replace the key.
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS", "anthropic-beta: x\nx-leak: 1\nx-api-key: env-key-must-not-be-sent"
+    )
     async with LocalSSEServer(STREAM) as server:
         async with transport.make_http_client(_config(tmp_path), mount=server.transport()) as client:
-            await _chat("claude-opus-5-5", "low", 100, SCHEMA, api_key=KEY, http_client=client).ainvoke(
-                MESSAGES
-            )
+            await _chat(
+                "claude-opus-5-5",
+                "low",
+                100,
+                SCHEMA,
+                api_key=KEY,
+                http_client=client,
+                purpose="extract_profile",
+            ).ainvoke(MESSAGES)
     (request,) = server.requests
     assert request.headers["host"] == "api.anthropic.com"
     assert request.headers["x-api-key"] == KEY.get_secret_value()
+    assert "anthropic-beta" not in request.headers and "x-leak" not in request.headers
+    assert request.headers["x-jh-purpose"] == "extract_profile"  # the gateway's own header still goes
+
+
+async def test_the_sdk_client_emits_no_span_and_propagates_no_trace_context_whatever_the_environment(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No SDK span can carry request or response content (privacy), and no request carries a trace context,
+    even with the SDK's `ANTHROPIC_OPEN_TELEMETRY*` variables asking for content."""
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY", "true")
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE", "content")
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY_PROPAGATION", "true")
+    async with LocalSSEServer(STREAM) as server:
+        async with transport.make_http_client(_config(tmp_path), mount=server.transport()) as client:
+            llm = GatewayChatAnthropic(
+                model="claude-opus-5-5",
+                base_url=transport.ANTHROPIC_BASE_URL,
+                api_key=KEY,
+                max_tokens=100,
+                reasoning_effort="low",
+                streaming=True,
+                max_retries=0,
+                timeout=client.timeout,
+                http_client=client,
+            )
+            options = llm._async_client.open_telemetry
+            assert options["traces"]["enabled"] is False and options["propagation"] is False
+            await llm.with_structured_output(SCHEMA, method="json_schema", include_raw=True).ainvoke(MESSAGES)
+    (request,) = server.requests
+    assert not {"traceparent", "tracestate", "baggage"} & set(request.headers)
 
 
 async def test_an_injected_one_second_read_timeout_fires_on_a_stalled_stream(tmp_path: Any) -> None:

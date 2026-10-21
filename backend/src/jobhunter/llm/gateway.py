@@ -12,7 +12,7 @@ sync client: every gateway call is async.
 """
 
 from functools import cached_property
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import anthropic
 import httpx2
@@ -27,6 +27,9 @@ from jobhunter.llm.pricing import SUPPORTED_EFFORTS, Effort, Model
 from jobhunter.llm.transport import ANTHROPIC_BASE_URL, TIMEOUT
 
 StructuredChat = Runnable[LanguageModelInput, dict[str, Any]]
+
+# The SDK client's OpenTelemetry option: no spans, no trace-context propagation.
+_NO_TELEMETRY: Final[anthropic.OpenTelemetryOptions] = {"traces": False, "propagation": False}
 
 
 class GatewayChatAnthropic(ChatAnthropic):
@@ -54,14 +57,25 @@ class GatewayChatAnthropic(ChatAnthropic):
 
     @cached_property
     def _async_client(self) -> anthropic.AsyncClient:
-        return anthropic.AsyncAnthropic(
+        headers = dict(self.default_headers or {})
+        client = anthropic.AsyncAnthropic(
             api_key=self.anthropic_api_key.get_secret_value(),
             base_url=ANTHROPIC_BASE_URL,
             timeout=self.default_request_timeout,
             max_retries=0,
             http_client=self.http_client,
-            default_headers=self.default_headers,
+            default_headers=headers,
+            # Any option, even this one, makes the SDK read none of its `ANTHROPIC_OPEN_TELEMETRY*` variables:
+            # no span (which could carry request or response content) and no trace context on a request.
+            open_telemetry=_NO_TELEMETRY,
         )
+        # The SDK's constructor always merges `ANTHROPIC_CUSTOM_HEADERS` from the environment under the given
+        # headers into `_custom_headers`, the one store that both of its header layers read, and after its
+        # auth headers (anthropic 1.15.0 `_client.py`, `_base_client.py`; its own `lib/_scoped_client.py`
+        # edits that store the same way). Such a header could add a beta (G2, G6), replace the key or forward
+        # a header meant for another service, so the gateway's headers are exactly its own (G1).
+        client._custom_headers = headers
+        return client
 
     @cached_property
     def _client(self) -> anthropic.Client:
