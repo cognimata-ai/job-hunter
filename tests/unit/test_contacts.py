@@ -3,13 +3,17 @@ text in, the edit set (`restore`, `remove_span`, `apply_edits`) and `scan_value`
 
 Every person and datum below is invented: Max Mustermann, Erika Musterfrau, example.org domains and phone
 numbers in the ranges that regulators reserve for fiction (BNetzA 030 23125-xxx, 089 99998-xxx and
-040 66969-xxx; Ofcom 020 7946 0xxx and 07700 900xxx; NANP 555-01xx).
+040 66969-xxx; Ofcom 020 7946 0xxx and 07700 900xxx; NANP 555-01xx). The exceptions are the brief's pin
+(`Tel. +49 30` / `1234 5678`) and digit strings that only test a boundary (`0171 123`, `010670049www.Max`).
 """
 
+import importlib
+import re
 import subprocess
 import sys
 import time
-from typing import get_args
+from dataclasses import replace
+from typing import Any, get_args
 
 import pytest
 from jobhunter.profile import contacts
@@ -35,6 +39,37 @@ CV = (
     "Familienstand: ledig\n\nMit freundlichen Grüßen\nmax mustermann\n"
 )
 CATEGORIES: tuple[Category, ...] = get_args(Category)
+
+_sre_parse = importlib.import_module("re._parser")
+_MAXREPEAT = importlib.import_module("re._constants").MAXREPEAT
+
+
+def repeat_bounds(source: str, flags: int = 0) -> list[tuple[int, int]]:
+    """The (min, max) of every repeat in a pattern, from the regular expression parser."""
+    found: list[tuple[int, int]] = []
+
+    def walk(node: Any) -> None:
+        for op, av in node:
+            name = str(op)
+            if name in {"MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"}:
+                found.append((av[0], av[1]))
+                walk(av[2])
+            elif name == "SUBPATTERN":
+                walk(av[3])
+            elif name == "BRANCH":
+                for alternative in av[1]:
+                    walk(alternative)
+            elif name in {"ASSERT", "ASSERT_NOT"}:
+                walk(av[1])
+            elif name == "ATOMIC_GROUP":
+                walk(av)
+            elif name == "GROUPREF_EXISTS":
+                for part in av[1:]:
+                    if part is not None:
+                        walk(part)
+
+    walk(_sre_parse.parse(source, flags))
+    return found
 
 
 def test_contacts_in_footer_table_and_signature_are_stripped() -> None:
@@ -168,12 +203,15 @@ def test_text_that_is_no_email_address_stays(text: str) -> None:
         "089 99998-123",
         "040 / 66969 123",
         "030 2312545",
-        "0301234567",
+        "03023125456",
         "+44 20 7946 0958",
         "+44 7700 900123",
         "+1 202 555 0143",
         "+1 (202) 555-0143",
-        "+41 44 123 45 67",
+        "+44 20 7946 01 23",
+        "(0)30 23125456",
+        "0 30 / 231 254 56",
+        "0 30 231 25456",
         "+49\xa030\xa023125456",
         "030 \u2013 23125456",
         "+49 30 23125\u202f456",
@@ -297,6 +335,10 @@ def test_an_email_address_on_a_www_host_is_an_email_address() -> None:
         "80331 München",
         "20095 Hamburg-Mitte",
         "50667 Köln",
+        "Potsdamer Platz 1",
+        "Pariser Platz 3",
+        "Stadtring 12",
+        "Kaiserring 3",
     ],
 )
 def test_a_street_address_or_postal_code_with_a_city_is_replaced(value: str) -> None:
@@ -320,6 +362,18 @@ def test_a_street_and_a_postal_code_are_two_addresses() -> None:
         "Spring 5 und Spring Boot 3",
         "Die String 2 Klasse",
         "Monitoring 4 Dashboards",
+        "Erster Platz 1 im Ranking",
+        "Zweiter Platz 2",
+        "Arbeitsplatz 4.0",
+        "Manufacturing 4.0 Projekt",
+        "Clustering 3",
+        "Rendering 2",
+        "Knowledge Sharing 3",
+        "Catering 5",
+        "Docstring 2",
+        "Bildungsweg 2",
+        "Ausweg 3",
+        "Hiring 2",
         "Engineering 2020-2022",
         "Software Engineering",
         "Musterstraße",  # no house number
@@ -412,6 +466,9 @@ def test_a_birth_date_is_personal_and_not_also_a_phone_number() -> None:
         "Ihre Nationalität ist kein Kriterium",
         "Kinder:",
         "Geburtsdatum:",
+        "Nationality-neutral hiring",
+        "Gender-neutral language",
+        "Religion-based hiring",
     ],
 )
 def test_words_that_only_look_like_a_label_stay(text: str) -> None:
@@ -542,6 +599,13 @@ def test_a_label_inside_a_url_does_not_start_a_personal_line() -> None:
         ("Max Jonas Peter Mustermann\nSkills", "[NAME]\nSkills"),
         ("\n\nMax Mustermann\nSkills", "\n\n[NAME]\nSkills"),
         ("Max Mustermann", "[NAME]"),
+        ("Max Kaufmann\nSkills", "[NAME]\nSkills"),  # a surname that is also a title word
+        ("Erika Leiter\nSkills", "[NAME]\nSkills"),
+        ("Persönliche Daten\nName\nMax Mustermann\nSkills", "Persönliche Daten\nName\n[NAME]\nSkills"),
+        ("Personal details\nName:\nMax Mustermann\nSkills", "Personal details\nName:\n[NAME]\nSkills"),
+        ("Name: Max Mustermann\nSkills", "Name: [NAME]\nSkills"),
+        ("Vorname/Nachname: Erika Musterfrau\nSkills", "Vorname/Nachname: [NAME]\nSkills"),
+        ("Name : Dr. Max Mustermann\nSkills", "Name : [NAME]\nSkills"),
     ],
 )
 def test_the_header_name_is_replaced(text: str, stripped: str) -> None:
@@ -569,6 +633,10 @@ def test_the_header_name_is_replaced(text: str, stripped: str) -> None:
         "Projektleiter Softwareentwicklung\n",
         "Backend Developer\n",
         "[NAME]\nBerlin Germany\n",
+        "Industriekaufmann Hamburg\nSkills",  # a title word in a compound is a title
+        "Teamleiter Entwicklung\nSkills",
+        "Name: berlin\nSkills",  # a name label whose value is no name
+        "Name\nSkills\n",
     ],
 )
 def test_text_without_a_header_name_has_no_name_replaced(text: str) -> None:
@@ -701,6 +769,211 @@ def test_the_module_is_pure_and_imports_nothing_of_the_application() -> None:
     )
     done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=False)
     assert done.returncode == 0, done.stderr
+
+
+def test_the_name_label_value_is_the_header_name_for_later_occurrences() -> None:
+    text = "Persönliche Daten\nName\nMax Mustermann\nSkills\nGruß, MAX MUSTERMANN\n"
+    r = strip_contacts(text)
+    assert r.stripped_text == "Persönliche Daten\nName\n[NAME]\nSkills\nGruß, [NAME]\n"
+    assert r.report["name"] == 2
+    text = "Name: Erika Musterfrau\nSkills\nerika musterfrau\n"
+    assert strip_contacts(text).stripped_text == "Name: [NAME]\nSkills\n[NAME]\n"
+    for text in ("Name: Max Mustermann\nSkills", "Persönliche Daten\nName\nMax Mustermann\nSkills"):
+        once = strip_contacts(text).stripped_text
+        assert strip_contacts(once).stripped_text == once
+
+
+def test_every_compiled_pattern_is_bounded() -> None:
+    """No `*`, `+` or `{n,}` in any pattern of the module (the M1 F1 lesson): the allow-list is empty."""
+    unbounded_allowed: set[str] = set()  # patterns by name that may hold an unbounded repeat; none does
+    patterns = {n: v for n, v in vars(contacts).items() if isinstance(v, re.Pattern)}
+    patterns["_name_pattern"] = contacts._name_pattern(["Max", "von", "Mustermann"])
+    assert len(patterns) >= 15
+    for name, pattern in patterns.items():
+        if name in unbounded_allowed:
+            continue
+        unbounded = [b for b in repeat_bounds(pattern.pattern, pattern.flags) if b[1] == _MAXREPEAT]
+        assert not unbounded, (name, pattern.pattern)
+
+
+def test_the_bound_check_sees_an_unbounded_repeat() -> None:
+    for source in ("a*", "a+", "a{2,}", "(?:ab|c*)d", "(?<=x)y[0-9]+", "(?=a+)b", "a{1,3}?b+?"):
+        assert any(b[1] == _MAXREPEAT for b in repeat_bounds(source)), source
+    for source in ("a?", "a{0,5}", "[ \\t]{0,200}(?:b|c){1,3}", "(?!x{1,2})y", "\\*\\+[*+]"):
+        assert not any(b[1] == _MAXREPEAT for b in repeat_bounds(source)), source
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Geburtsdatum/-ort",
+        "Geburtsdatum und -ort",
+        "Geburtsdatum (TT.MM.JJJJ)",
+        "Familienstand / Kinder",
+        "Staatsangehörigkeit / Nationality",
+        "Geburtsdatum / Geburtsort",
+        "Date of birth (DD/MM/YYYY)",
+        "Geburtsdatum, Geburtsort:",
+        "Marital status / Children:",
+    ],
+)
+def test_a_compound_label_cell_takes_the_value_cell_below_it(label: str) -> None:
+    text = f"Berufserfahrung\n{label}\n01.02.1990 in Musterstadt\nSkills: Python\n"
+    r = strip_contacts(text)
+    assert r.stripped_text == "Berufserfahrung\n[PERSONAL]\nSkills: Python\n", label
+    assert r.report["personal"] == 1
+    assert "1990" not in r.stripped_text
+    assert "Musterstadt" not in r.stripped_text
+
+
+def test_a_label_with_words_of_its_own_after_it_has_a_value_and_takes_no_line_below() -> None:
+    r = strip_contacts("Religion und Ethik unterrichtet\nBerlin\n")
+    assert r.stripped_text == "[PERSONAL]\nBerlin\n"
+    r = strip_contacts("Familienstand: ledig (seit 2019)\nBerlin\n")
+    assert r.stripped_text == "[PERSONAL]\nBerlin\n"
+
+
+def test_a_phone_number_with_a_leading_zero_in_its_own_group_is_found_and_dates_are_not() -> None:
+    for value in (
+        "(0)30 23125456",
+        "0 30 / 231 254 56",
+        "0 30 231 25456",
+        "0 89 99998 123",
+        "(0) 30 23125456",
+    ):
+        r = strip_contacts(f"Tel: {value}.")
+        assert r.stripped_text == "Tel: [PHONE].", value
+    for text in ("0.5 FTE", "0 / 2019", "Stand 0 3 2019", "01.02.1990", "0 5 9"):
+        assert strip_contacts(text).stripped_text == text, text
+
+
+def test_a_year_range_on_the_next_line_is_no_part_of_a_short_number() -> None:
+    for text in (
+        "Projekt 0815\n2019 - 2022 Senior Engineer\n",
+        "Projekt 0815\n1999 bis 2004 Entwickler\n",
+        "Tel. 030 231\n2022 - heute\n",
+    ):
+        assert strip_contacts(text).stripped_text == text, text
+    # Digits that are no year still join.
+    assert strip_contacts("Tel. 030 231\n25456").stripped_text == "Tel. [PHONE]"
+    assert strip_contacts("Tel. 030 23\n1254 56").stripped_text == "Tel. [PHONE]"
+
+
+def test_a_house_number_is_not_the_start_of_a_version_or_a_decimal() -> None:
+    for text in ("Arbeitsplatz 4.0", "Musterweg 4,5 Stunden", "Hauptstraße 5.1 Kapitel"):
+        assert strip_contacts(text).stripped_text == text, text
+    assert strip_contacts("Hauptstraße 5. Etage").stripped_text == "[ADDRESS]. Etage"
+    assert strip_contacts("Hauptstraße 5, 10115 Berlin").stripped_text == "[ADDRESS], [ADDRESS]"
+
+
+def test_the_ring_suffix_after_a_vowel_is_an_english_gerund_not_a_street() -> None:
+    for word in ("Clustering", "Rendering", "Sharing", "Catering", "Hiring", "Scoring", "Manufacturing"):
+        assert strip_contacts(f"{word} 3").stripped_text == f"{word} 3", word
+    for word in ("Königsring", "Stadtring", "Kaiserring", "Hauptring", "Gürtelring"):
+        assert strip_contacts(f"{word} 3").stripped_text == "[ADDRESS]", word
+
+
+def test_a_pass_over_a_text_longer_than_the_cap_leaves_no_half_token() -> None:
+    cut = "Familienstand: " + "x" * 190 + " max@example.org"
+    assert strip_contacts(cut).stripped_text == "[PERSONAL]"
+    cell = "Geburtsdatum\n" + "x" * 190 + " max@example.org\nSkills"
+    assert strip_contacts(cell).stripped_text == "[PERSONAL]\nSkills"
+    # A cut at a blank leaves the rest to the other categories.
+    exact = "Familienstand: " + "x" * 198 + " max@example.org"
+    assert strip_contacts(exact).stripped_text == "[PERSONAL] [EMAIL]"
+    # A token longer than any bound is cut, and what is left of it is a fragment, never a whole address.
+    huge = strip_contacts("Familienstand: " + "x" * 190 + " " + "y" * 500 + "@example.org").stripped_text
+    assert huge.startswith("[PERSONAL]y") and huge.endswith("y[EMAIL]")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "geb." * 310,  # all label words: no value, nothing to strip, and a second pass agrees
+        ("geb." + "1" * 97)
+        * 12,  # a cut lands exactly on the next label, which a second pass reads after a token
+        ("Religion:" + "1" * 399) * 4,
+        ("geboren " + "1" * 394) * 4,
+        "geb. 1 " * 400,
+        "Kinder: 2 " * 200,
+        "x " + "Gender: 1" * 200,
+        "DOB 1 " * 500,
+    ],
+)
+def test_a_long_run_of_labels_is_stripped_in_one_pass(text: str) -> None:
+    once = strip_contacts(text).stripped_text
+    assert strip_contacts(once).stripped_text == once
+    if any(c.isdigit() for c in text):  # a value after the label: something is stripped
+        assert "[PERSONAL]" in once
+
+
+def test_a_label_that_starts_where_the_cut_of_the_previous_one_ended_is_a_label() -> None:
+    text = ("geb." + "1" * 97) * 12
+    once = strip_contacts(text).stripped_text
+    assert once == "[PERSONAL]" * 3  # three cuts of 404 characters, each one a label of its own
+
+
+def test_restoring_a_personal_false_positive_keeps_the_contacts_inside_it_replaced() -> None:
+    text = "Religion und Ethik, Kontakt: max@example.org, Tel. 030 23125456\nSkills\n"
+    base = strip_contacts(text)
+    assert base.stripped_text == "[PERSONAL]\nSkills\n"
+    back = restore(text, base, 0)
+    assert back.stripped_text == "Religion und Ethik, Kontakt: [EMAIL], Tel. [PHONE]\nSkills\n"
+    assert (back.report["email"], back.report["phone"], back.report["personal"]) == (1, 1, 0)
+    for value in ("max@example.org", "030 23125456"):
+        assert value not in back.stripped_text
+    # The contacts inside are replacements of their own: restored by their span, never by an index.
+    email = next(r for r in back.replacements if r.category == "email")
+    assert text[email.start : email.end] == "max@example.org"
+    only_phone = apply_edits(
+        text, replace(back.edits, restored=back.edits.restored | {(email.start, email.end)})
+    )
+    assert only_phone.stripped_text == "Religion und Ethik, Kontakt: max@example.org, Tel. [PHONE]\nSkills\n"
+    assert restore(text, back, 0) == back  # index 0 of the fresh strip is the personal span again
+    # The value cell below a lone label.
+    cell = "Kinder\nmax@example.org\nSkills\n"
+    assert strip_contacts(cell).stripped_text == "[PERSONAL]\nSkills\n"
+    assert restore(cell, strip_contacts(cell), 0).stripped_text == "Kinder\n[EMAIL]\nSkills\n"
+    # Every category applies inside it, the header name too.
+    mixed = "Max Mustermann\nReligion: Musterstraße 12, 10115 Berlin, www.example.org, Max Mustermann\n"
+    base = strip_contacts(mixed)
+    assert base.stripped_text == "[NAME]\n[PERSONAL]\n"
+    back = restore(mixed, base, 1)
+    assert back.stripped_text == "[NAME]\nReligion: [ADDRESS], [ADDRESS], [URL], [NAME]\n"
+    assert dict(back.report) == {**dict.fromkeys(CATEGORIES, 0), "name": 2, "address": 2, "url": 1}
+
+
+def test_a_restored_personal_span_and_a_removal_commute_and_the_edit_set_rebuilds_the_result() -> None:
+    text = "Religion: max@example.org, Tel. 030 23125456\nSkills: Python\n"
+    base = strip_contacts(text)
+    start = text.index("Skills")
+    a = remove_span(text, restore(text, base, 0), start, start + 6)
+    b = restore(text, remove_span(text, base, start, start + 6), 0)
+    assert a == b
+    assert a.stripped_text == "Religion: [EMAIL], Tel. [PHONE]\n[REMOVED]: Python\n"
+    assert apply_edits(text, a.edits) == a
+    # The contacts inside a restored span are claims of their own: a removal over one of them merges with it.
+    email = text.index("max@")
+    c = remove_span(text, restore(text, base, 0), email + 2, email + 6)
+    assert c.stripped_text == "Religion: [REMOVED], Tel. [PHONE]\nSkills: Python\n"
+
+
+def test_restore_resolves_the_index_against_the_fresh_strip_after_a_prior_edit() -> None:
+    base = strip_contacts(CV)
+    start = CV.index("Beispiel GmbH")
+    edited = remove_span(CV, base, start, start + 13)
+    email = index_of(base, "email")
+    assert restore(CV, edited, email).stripped_text == edited.stripped_text.replace(
+        "[EMAIL]", "max.mustermann@example.org"
+    )
+    # Index 0 is the header name of the fresh strip, restored once; asking again names the same replacement,
+    # not the first one that is left in `result.replacements` (which is now the e-mail address).
+    once = restore(CV, base, 0)
+    assert once.replacements[0].category == "email"
+    assert restore(CV, once, 0) == once
+    assert restore(CV, once, 0).stripped_text.count("Max Mustermann") == 1
+    # The replacements of an edited result are not a list of indexes: the fresh strip's list is.
+    assert [r.category for r in strip_contacts(CV).replacements] == [r.category for r in base.replacements]
 
 
 # --- the edit set --------------------------------------------------------------------------------
@@ -896,6 +1169,22 @@ _ADVERSARIAL = [
     "Geburtsdatum: x\n" * 12_000,
     "Kinder " * 30_000,
     "Kinder\n" * 100_000,
+    "Kinder" + " " * 200_000 + "x",
+    "Geburtsdatum\n" + " " * 200_000 + "x",
+    ("Geburtsdatum\n \n \n" + " " * 50 + "x\n") * 15_000,
+    "Familienstand: " + "(" * 100_000,
+    "Familienstand " + "(a)" * 60_000,
+    "Name: " * 30_000,
+    "Name\n" * 60_000,
+    "0 " * 100_000,
+    "0/" * 100_000,
+    "(0)" * 70_000,
+    "0 3 " * 50_000,
+    "Platz " * 40_000,
+    "Potsdamer Platz " * 12_000,
+    "Aer Platz 1" * 20_000,
+    "Hauptstraße 1.0" * 15_000,
+    "0815\n2019\n" * 30_000,
     "Geburtsdatum\n" * 40_000,
     "Familienstand\n\n\n" * 30_000,
     "Geburtsdatum\n \t \n" * 30_000,

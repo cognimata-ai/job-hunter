@@ -9,9 +9,11 @@ Every datum is generated; no real person's data is used.
 """
 
 from typing import get_args
+from unittest.mock import patch
 
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
+from jobhunter.profile import contacts
 from jobhunter.profile.contacts import (
     REPLACEMENT,
     Category,
@@ -39,47 +41,110 @@ def emails(draw: st.DrawFn) -> str:
     return f"{local}@{'.'.join(labels)}.{tld}"
 
 
-@st.composite
-def phones(draw: st.DrawFn) -> str:
-    """A number of the table's forms: `+<cc>`, `00<cc>` or a leading 0, then at least 7 digits in groups."""
-    kind = draw(st.sampled_from(["plus", "double0", "national"]))
-    if kind == "national":
-        head = (
-            "0" + draw(st.sampled_from("123456789")) + draw(st.text(alphabet=DIGITS, min_size=1, max_size=4))
+SEPARATORS = [
+    *[" ", "/", "-", ".", " - ", " / ", ") ", " (", ")-", "\xa0", "\N{NARROW NO-BREAK SPACE}"],
+    *["\N{EN DASH}", " \N{EN DASH} ", "\N{EM DASH}"],
+]
+BREAKS = ["\n", " \n", "\n ", "\r\n", "\r\n "]
+
+
+def digits_in(text: str) -> int:
+    return sum(c in DIGITS for c in text)
+
+
+def phones(*, allow_break: bool = True) -> st.SearchStrategy[str]:
+    """A number of the table's forms: `+<cc>`, `00<cc>` or a leading 0 (also `(0)30` and `0 30`, the area code
+    of one digit too), then at least 7 digits in two to six groups with the separators of the table (NBSP and
+    Unicode dashes too) and, where the first line is still short, one line break."""
+
+    @st.composite
+    def numbers(draw: st.DrawFn) -> str:
+        kind = draw(st.sampled_from(["plus", "double0", "national", "paren0", "zero_sep"]))
+        cc = draw(st.sampled_from(["49", "44", "1", "43", "41", "33"]))
+        area = draw(st.sampled_from("123456789")) + draw(st.text(alphabet=DIGITS, min_size=1, max_size=4))
+        if kind == "plus":
+            head, enough = "+" + cc, 8
+        elif kind == "double0":
+            head, enough = "00" + cc, 10
+        elif kind == "national":
+            head, enough = "0" + area, 8
+        elif kind == "paren0":
+            head, enough = "(0)" + area, 8
+        else:
+            head, enough = (
+                "0" + draw(st.sampled_from([" ", " / ", "/", "\xa0"])) + area[: draw(st.integers(1, 3))],
+                8,
+            )
+        groups = draw(
+            st.lists(st.text(alphabet=DIGITS, min_size=2, max_size=5), min_size=2, max_size=6).filter(
+                lambda g: digits_in(head) + sum(map(len, g)) >= enough
+            )
         )
-    else:
-        head = ("+" if kind == "plus" else "00") + draw(st.sampled_from(["49", "44", "1", "43", "41", "33"]))
-    groups = draw(
-        st.lists(st.text(alphabet=DIGITS, min_size=2, max_size=5), min_size=2, max_size=4).filter(
-            lambda g: sum(map(len, g)) >= 7
-        )
-    )
-    separators = st.sampled_from([" ", "/", "-", ".", " - ", " / ", ") ", " ("])
-    number = head
-    for group in groups:
-        number += draw(separators) + group
-    return number
+        joints = [draw(st.sampled_from(SEPARATORS)) for _ in groups]
+        if allow_break and draw(st.booleans()):
+            # A break may stand before group k when the line before it holds too few digits and the line after
+            # it does not start with a year (a short number never takes in a year range).
+            before_digits = digits_in(head)
+            allowed = []
+            for k, group in enumerate(groups):
+                year_like = len(group) == 4 and group[:2] in {"19", "20"}
+                if before_digits < enough and not year_like:
+                    allowed.append(k)
+                before_digits += len(group)
+            if allowed:
+                joints[draw(st.sampled_from(allowed))] = draw(st.sampled_from(BREAKS))
+        return head + "".join(j + g for j, g in zip(joints, groups, strict=True))
+
+    return numbers()
 
 
 BEFORE = st.sampled_from(["", " ", "Tel: ", "Mail ", "(", "<", "\n", "Kontakt:\n"])
 AFTER = st.sampled_from(["", ".", ", ", " ", "\n", ")", ">", ";"])
+FILLER = st.text(alphabet="xyz ", max_size=30)  # no word of it can be a label, a name or a keyword
 settings_ = settings(max_examples=400, deadline=None)
 
 
 @settings_
-@given(emails(), BEFORE, AFTER, st.text(alphabet=LOWER + " ", max_size=30))
-def test_a_generated_email_address_never_survives(value: str, before: str, after: str, filler: str) -> None:
-    text = f"{filler}\n{before}{value}{after}{filler}"
-    assert value not in strip_contacts(text).stripped_text
-    assert scan_value(f"{before}{value}{after}") != []
+@given(emails(), BEFORE, AFTER, FILLER)
+def test_a_generated_email_address_is_replaced_and_nothing_else_changes(
+    value: str, before: str, after: str, filler: str
+) -> None:
+    result = strip_contacts(f"{filler}\n{before}{value}{after}\n{filler}")
+    assert result.stripped_text == f"{filler}\n{before}[EMAIL]{after}\n{filler}"
+    assert dict(result.report) == {**dict.fromkeys(CATEGORIES, 0), "email": 1}
+    assert scan_value(f"{before}{value}{after}") == ["email"]
 
 
 @settings_
-@given(phones(), BEFORE, AFTER, st.text(alphabet=LOWER + " ", max_size=30))
-def test_a_generated_phone_number_never_survives(value: str, before: str, after: str, filler: str) -> None:
-    text = f"{filler}\n{before}{value}{after}{filler}"
-    assert value not in strip_contacts(text).stripped_text
-    assert scan_value(f"{before}{value}{after}") != []
+@given(phones(), BEFORE, AFTER, FILLER)
+def test_a_generated_phone_number_is_replaced_and_nothing_else_changes(
+    value: str, before: str, after: str, filler: str
+) -> None:
+    assume(not (before == "(" and ")" in value))  # `(0100) 00 00`: the paren is the number's own
+    result = strip_contacts(f"{filler}\n{before}{value}{after}\n{filler}")
+    assert result.stripped_text == f"{filler}\n{before}[PHONE]{after}\n{filler}"
+    assert dict(result.report) == {**dict.fromkeys(CATEGORIES, 0), "phone": 1}
+
+
+@settings_
+@given(
+    emails(),
+    phones(allow_break=False),
+    st.sampled_from(
+        ["Religion und Ethik", "Geburtsort Musterstadt", "Gender: divers", "Familienstand ledig"]
+    ),
+)
+def test_restoring_a_personal_replacement_keeps_the_contacts_inside_it_replaced(
+    email: str, phone: str, head: str
+) -> None:
+    text = f"{head}, Kontakt: {email}, Tel. {phone}\nSkills\n"
+    base = strip_contacts(text)
+    assert base.stripped_text == "[PERSONAL]\nSkills\n"
+    assert restore(text, base, 0).stripped_text == f"{head}, Kontakt: [EMAIL], Tel. [PHONE]\nSkills\n"
+    for label, value, token in (("Kinder", email, "[EMAIL]"), ("Familienstand", phone, "[PHONE]")):
+        cell = f"{label}\n{value}\nSkills\n"
+        assert strip_contacts(cell).stripped_text == "[PERSONAL]\nSkills\n"
+        assert restore(cell, strip_contacts(cell), 0).stripped_text == f"{label}\n{token}\nSkills\n"
 
 
 # Fragments that meet every rule and every boundary of the rules: glued together at random, they put a
@@ -94,6 +159,7 @@ FRAGMENTS = [
     *"max.mustermann@example.org erika@mail.example.org ß ä Ö x Q9 0 00 +".split(),
     *[" ", " ", " ", "\n", "\n", "\n\n", "\t", "\r\n", "\u00a0"],
     *["Geburtsdatum\n01.02.1990\n", "Familienstand\nledig\n", "Kinder\n2\n", "Religion\n\n\nevangelisch\n"],
+    *["x" * 150, "y" * 190, "z" * 250, "word " * 40, "abc " * 60, "geb." * 60, "Religion: " * 25],
 ]
 
 documents = st.lists(st.sampled_from(FRAGMENTS), max_size=45).map("".join)
@@ -143,6 +209,15 @@ def test_a_table_with_every_cell_on_its_own_line_is_stripped_row_by_row(
     assert dict(r.report) == {**dict.fromkeys(CATEGORIES, 0), "personal": len(rows)}
 
 
+@settings(max_examples=2000, deadline=None)
+@given(st.one_of(documents, anything, tables))
+def test_three_rounds_are_enough_for_one_pass_to_reach_the_fixed_point(text: str) -> None:
+    """`_MAX_ROUNDS` is 6; the chains of claims that expose one another are at most three links long."""
+    with patch.object(contacts, "_MAX_ROUNDS", 3):
+        once = strip_contacts(text).stripped_text
+        assert strip_contacts(once).stripped_text == once
+
+
 def render(original: str, result: StripResult) -> str:
     out: list[str] = []
     position = 0
@@ -172,7 +247,9 @@ def test_restoring_every_replacement_gives_the_original(text: str) -> None:
     result = strip_contacts(text)
     for i in range(len(result.replacements)):
         result = restore(text, result, i)
-    assert result.stripped_text == text
+    # What a restored personal span lets through is a replacement of its own, restored by its span.
+    inner = {(r.start, r.end) for r in result.replacements}
+    assert apply_edits(text, Edits(restored=result.edits.restored | inner)).stripped_text == text
 
 
 @settings(max_examples=500, deadline=None)
