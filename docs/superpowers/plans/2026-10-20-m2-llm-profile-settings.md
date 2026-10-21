@@ -2040,7 +2040,7 @@ Each deviation stages a spec item across milestones, or settles something the sp
    - the job sorts of `api/pagination.py`;
    - the "Re-scoring pending" display.
 3. **M5:**
-   - the alert-catalogue dispatch for the new `llm.*`, `scope.apply_failed` and `operation.failed` codes, `llm.unexpected_stop_reason` included (Deviation 6);
+   - the alert-catalogue dispatch for the new `llm.*`, `scope.apply_failed` and `operation.failed` codes, `llm.unexpected_stop_reason` included (Deviation 6), and `profile.extract_generation_mismatch` (warn, Task 13: an extraction met a draft still `extracting_profile` in another generation; the draft holds the one open-draft slot until it is repaired by hand, so the runbook entry says how to fail it);
    - the dead-man period update on `schedule` saves;
    - the profile purge (§20.2), which nulls `profile_json`, `query_proposals.items` and the vectors;
    - LangSmith with hidden I/O (§17.8);
