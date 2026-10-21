@@ -273,24 +273,34 @@ async def read_month(
     return row
 
 
-async def _check_cap_share(conn: AsyncConnection, row: BudgetRow) -> None:
-    """`llm.cap_80pct` (warn) open while the month's counted spend is at or above 80% of its cap; checked at
-    each reservation of the current month, so a new month or a raised cap resolves it."""
-    if budget.cap_share_reached(row):
+# The month an open `llm.cap_80pct` was raised for (its context); the alert has one subject, so one open row.
+_OPEN_CAP_ALERT_MONTH = q(
+    "SELECT context ->> 'month' FROM alerts WHERE code = :code AND resolved_at IS NULL "
+    "ORDER BY id DESC LIMIT 1"
+)
+
+
+async def _check_cap_share(conn: AsyncConnection, row: BudgetRow, *, raised: bool = False) -> None:
+    """`llm.cap_80pct` (warn, §17.6) for `row`'s month: opened once its counted spend reaches 80% of the cap,
+    and resolved only by what §17.6 names, a new month (the open alert was raised for an earlier month) or a
+    raised cap (`raised`, from `change_cap`) that brings the share below 80%. A share that falls below 80%
+    otherwise (in-flight worst cases settling, refunds) leaves it open: `counted_usd` moves around the
+    threshold with every reservation and settlement, and resolving there would re-open it again and again."""
+    open_for = (await conn.execute(_OPEN_CAP_ALERT_MONTH, {"code": CAP_80PCT_ALERT})).scalar_one_or_none()
+    reached = budget.cap_share_reached(row)
+    month = row.month.isoformat()
+    if open_for is not None and (open_for < month or (raised and not reached and open_for == month)):
+        await resolve_alert(conn, code=CAP_80PCT_ALERT, subject=_CAP_SUBJECT)
+        open_for = None
+    if reached and open_for is None:
         await open_alert(
             conn,
             code=CAP_80PCT_ALERT,
             severity="warn",
             subject=_CAP_SUBJECT,
             message="LLM spend reached 80% of the monthly cap",
-            context={
-                "month": row.month.isoformat(),
-                "counted_usd": str(row.counted_usd),
-                "cap_usd": str(row.cap_usd),
-            },
+            context={"month": month, "counted_usd": str(row.counted_usd), "cap_usd": str(row.cap_usd)},
         )
-    else:
-        await resolve_alert(conn, code=CAP_80PCT_ALERT, subject=_CAP_SUBJECT)
 
 
 async def change_cap(
@@ -298,11 +308,13 @@ async def change_cap(
 ) -> None:
     """A save of class `budget` (Task 17) changes `month`'s row under its lock (§6.9.1): raising the cap takes
     effect at once, lowering it below `counted_usd` records `cap_lowered_at` and `counted_at_cap_change_usd`.
-    The `llm.cap_80pct` state follows the new share. The row must exist (`ensure_month` first)."""
+    `llm.cap_80pct` opens when the new share reaches 80%, and a raised cap below 80% resolves it. The row
+    must exist (`ensure_month` first)."""
     row = await _lock_row(conn, month)
+    raised = cap_usd > row.cap_usd
     budget.change_cap(row, cap_usd, overrun_buffer_usd, now)
     await _save(conn, row, now)
-    await _check_cap_share(conn, row)
+    await _check_cap_share(conn, row, raised=raised)
     log.info(
         "llm_cap_changed",
         month=month.isoformat(),
@@ -533,7 +545,7 @@ async def reserve(
     # 8. the counters, and the bucket for scoring outside bulk operations (M2 has no bulk operation)
     budget.apply_count(row, r, purpose_class, bucket=purpose_class == "scoring")
     await _save(conn, row, now)
-    await _check_cap_share(conn, row)  # 9.
+    await _check_cap_share(conn, row)  # 9. opens at 80%; resolves only for a new month
     return Reservation(
         ledger_id=int(ledger_id),
         llm_call_id=int(call_id),

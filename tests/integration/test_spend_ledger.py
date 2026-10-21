@@ -306,22 +306,86 @@ async def test_old_context_cap_cut_and_rollover(engine, op_owner) -> None:
     assert nov_row.counted_usd == retry.reserved_usd
 
 
-async def test_cap_80pct_opens_at_a_reservation_and_a_raise_resolves_it(engine, op_owner) -> None:
-    t = utcnow()
+CAP_ALERT = ("llm.cap_80pct:budget", "warn", 1)
+
+
+async def cap_alert_rows(engine: AsyncEngine) -> int:
+    """Every `llm.cap_80pct` row ever written, resolved ones included: each re-opening would add one."""
+    async with engine.connect() as conn:
+        found = await conn.execute(
+            sa.text("SELECT count(*) FROM alerts WHERE code = :c"), {"c": CAP_80PCT_ALERT}
+        )
+        return int(found.scalar_one())
+
+
+async def small_cap(engine: AsyncEngine, now: datetime, cap: str = "0.05") -> None:
+    """The month of `now` with a cap of `cap` and no buffer (a reservation of $0.04 reaches 80% of $0.05)."""
     async with engine.begin() as conn:
-        await ensure_month(conn, month_of(t), await current_params(conn), t)
+        await ensure_month(conn, month_of(now), await current_params(conn), now)
+        await change_cap(
+            conn, month=month_of(now), cap_usd=Decimal(cap), overrun_buffer_usd=Decimal(0), now=now
+        )
+
+
+async def test_cap_80pct_stays_open_while_in_flight_spend_moves(engine, op_owner) -> None:
+    """§17.6: the alert auto-resolves on a new month or a raised cap only. In-flight worst cases move the
+    counted share up and down around 80% with every reservation and settlement; that must not re-open it."""
+    t = utcnow()
+    await small_cap(engine, t)
+    first = await dispatched(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))  # $0.04: 80%
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT]
+    await billed(engine, first, now=t)  # settled at $0.008: 16%
+    await reserved(engine, reserve_kw(op_owner, now=t, bound=100, max_tokens=256))  # + $0.00562: 27%
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT]  # still the same open alert
+    await reserved(engine, reserve_kw(op_owner, now=t, bound=1000, max_tokens=1000))  # + $0.025: 77%
+    await reserved(engine, reserve_kw(op_owner, now=t, bound=100, max_tokens=256))  # + $0.00562: 88%
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT]  # crossing again counts nothing
+    assert await cap_alert_rows(engine) == 1
+    async with engine.begin() as conn:  # an edit that raises nothing does not resolve it either
         await change_cap(
             conn, month=month_of(t), cap_usd=Decimal("0.05"), overrun_buffer_usd=Decimal(0), now=t
         )
-    await reserved(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))  # $0.04 of $0.05
-    assert await open_alerts(engine, CAP_80PCT_ALERT) == [("llm.cap_80pct:budget", "warn", 1)]
-    await reserved(engine, reserve_kw(op_owner, now=t, bound=100, max_tokens=256))
-    assert await open_alerts(engine, CAP_80PCT_ALERT) == [("llm.cap_80pct:budget", "warn", 1)]  # still open
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT]
+
+
+async def test_cap_80pct_is_resolved_by_a_raised_cap(engine, op_owner) -> None:
+    t = utcnow()
+    await small_cap(engine, t, cap="0.04")
+    await reserved(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))  # 100%
+    async with engine.begin() as conn:  # raised to $0.05, but the share is still 80%: it stays open
+        await change_cap(
+            conn, month=month_of(t), cap_usd=Decimal("0.05"), overrun_buffer_usd=Decimal(0), now=t
+        )
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT]
     async with engine.begin() as conn:
         await change_cap(
             conn, month=month_of(t), cap_usd=Decimal("1.00"), overrun_buffer_usd=Decimal(0), now=t
         )
     assert await open_alerts(engine, CAP_80PCT_ALERT) == []
+    assert await cap_alert_rows(engine) == 1
+    async with engine.begin() as conn:  # a lowered cap that reaches 80% opens it again
+        await change_cap(
+            conn, month=month_of(t), cap_usd=Decimal("0.05"), overrun_buffer_usd=Decimal(0), now=t
+        )
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT]
+
+
+async def test_cap_80pct_is_resolved_by_a_new_month(engine, op_owner) -> None:
+    oct31 = datetime(2026, 10, 31, 23, 50, tzinfo=UTC)
+    await small_cap(engine, oct31)
+    await reserved(engine, reserve_kw(op_owner, now=oct31, bound=4000, max_tokens=1000))  # 80% of October
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT]
+    nov1 = datetime(2026, 11, 1, 0, 5, tzinfo=UTC)
+    await reserved(engine, reserve_kw(op_owner, now=nov1, bound=100, max_tokens=256))  # November, cap $100
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == []
+    assert await cap_alert_rows(engine) == 1
+    # a new month at 80% at once opens a new alert for itself: the old month's one is resolved first
+    async with engine.begin() as conn:
+        await change_cap(
+            conn, month=date(2026, 11, 1), cap_usd=Decimal("0.05"), overrun_buffer_usd=Decimal(0), now=nov1
+        )
+    await reserved(engine, reserve_kw(op_owner, now=nov1, bound=4000, max_tokens=1000))
+    assert await open_alerts(engine, CAP_80PCT_ALERT) == [CAP_ALERT] and await cap_alert_rows(engine) == 2
 
 
 async def test_native_pdf_extra_comes_from_the_locked_month_row(engine, op_owner) -> None:
