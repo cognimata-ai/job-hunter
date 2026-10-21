@@ -5,13 +5,16 @@
   `UploadRejected(reason)`. In this order: `too_large` (over `MAX_UPLOAD_BYTES`); `unknown_type` (no
   `%PDF-` within the first 1,024 bytes of `head`, and no ZIP signature `PK\\x03\\x04` at its start; a ZIP
   signature is looked at first); `extension_mismatch` (the name does not end in `.pdf` or `.docx` for the
-  detected type, in any case). A DOCX is then read through the stdlib `zipfile`, which reads the ZIP central
-  directory only and inflates nothing: an archive it cannot read is `docx_structure`; more than
-  `MAX_DOCX_ENTRIES` entries, or declared expanded sizes over `MAX_DOCX_EXPANDED` in all, is
-  `docx_expansion`; a `vbaProject.bin` anywhere (in any case) is `docx_macro`; no `[Content_Types].xml` or
-  no `word/document.xml` (part names compared without case, as OPC does) is `docx_structure`. A PDF's
+  detected type, in any case). A DOCX whose bytes hold more central-directory signatures than
+  `CENTRAL_RECORDS_MAX` is `docx_expansion` before any parsing (`_check_docx`); it is then read through the
+  stdlib `zipfile`, which reads the ZIP central directory only and inflates nothing: an archive it cannot read
+  is `docx_structure`; more than `MAX_DOCX_ENTRIES` entries, or declared expanded sizes over
+  `MAX_DOCX_EXPANDED` in all, is `docx_expansion`; a `vbaProject.bin` anywhere (in any case) is
+  `docx_macro`; no `[Content_Types].xml` or no `word/document.xml` (part names compared without case, as
+  OPC does) is `docx_structure`. A PDF's
   structure is never parsed here: its encryption and page count are docparse's (plan Deviation 7), so no PDF
-  parser runs in the networked api;
+  parser runs in the networked api. The route runs `check_file` in a worker thread: it is pure, and the
+  parse of a hostile central directory costs seconds of CPU that the event loop must not wait for;
 - `check_paste(text)` answers a pasted text of `PASTE_MIN` to `PASTE_MAX` characters, or raises
   `UploadRejected` with `too_short`, `too_long`, or `not_utf8` (a lone surrogate, which JSON can carry).
 
@@ -22,7 +25,9 @@ buffered whole. The file part's bytes are counted as they arrive; the part that 
 further message is read. The whole body is bounded too, at `limit + MULTIPART_OVERHEAD_BYTES` (413 again): an
 ignored part is not kept, but neither is it read without end. A body that is no multipart form, has no
 boundary, has no `file` part, more than one, or more than `MULTIPART_MAX_PARTS` parts, or ends early is a 422
-`validation_failed` naming the field.
+`validation_failed` naming the field. `read_body_limited` is the same bound for a body that FastAPI parses
+afterwards (the paste's JSON): a declared `Content-Length` over the limit is refused before any read, and a
+body sent without one is counted as it streams.
 
 **The draft** (`open_new_draft`, in the caller's transaction): the open draft is locked, refused (409) while
 it is being extracted, otherwise discarded with every `failed` draft; then the `cv_files` row, the
@@ -68,7 +73,11 @@ MULTIPART_OVERHEAD_BYTES: Final = 64 * 1024
 MULTIPART_MAX_PARTS: Final = 8
 # The opt-in is a boolean: "true", "false", "1", "0" and their kin; longer is no boolean.
 _FLAG_MAX_BYTES: Final = 16
-_PDF_MAGIC_WITHIN: Final = 1024
+# §12.1: `%PDF-` within the first 1,024 bytes; the route hands `check_file` that much as `head`.
+PDF_MAGIC_WITHIN: Final = 1024
+# The JSON body of a paste: 50,000 characters, each at most 12 bytes JSON-escaped (a character outside the
+# BMP is two `\uXXXX` escapes), is about 600 KB; 1 MiB leaves room for whitespace and the member name.
+PASTE_BODY_MAX_BYTES: Final = 2**20
 
 PDF_MIME: Final = "application/pdf"
 DOCX_MIME: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -97,6 +106,15 @@ NATIVE_FIELD: Final = "native_pdf_opt_in"
 _EXTENSIONS: Final[dict[Detected, str]] = {PDF_MIME: ".pdf", DOCX_MIME: ".docx"}
 _REQUIRED_PARTS: Final = frozenset({"[content_types].xml", "word/document.xml"})
 _MACRO_PART: Final = "vbaproject.bin"
+# Every record `zipfile` parses starts with this signature, so the count of its occurrences bounds the records
+# it would build before the entry check could refuse them: 200,000 minimal records fit in 10 MiB. The bound is
+# four times the entry cap: a DOCX may hold embedded packages (a chart's workbook, an OLE object) stored
+# uncompressed, whose own central directories count here too, and compressed data can hold the four bytes by
+# chance (about once in 4 GiB). A document under the entry cap is refused by the count only when its stored
+# embedded packages hold some 3,000 entries more, and the parse the count lets through stays at a few
+# thousand records.
+_CENTRAL_HEADER: Final = b"PK\x01\x02"
+CENTRAL_RECORDS_MAX: Final = 4 * MAX_DOCX_ENTRIES
 # What `zipfile` raises for an archive it cannot read: a damaged one (`BadZipFile`), a version or feature it
 # does not support (`NotImplementedError`), a name that is not the UTF-8 its flag claims (`ValueError`).
 _UNREADABLE_ZIP: Final = (zipfile.BadZipFile, NotImplementedError, ValueError)
@@ -132,12 +150,14 @@ class UploadRejected(Exception):
 def _detect(head: bytes) -> Detected | None:
     if head.startswith(b"PK\x03\x04"):
         return DOCX_MIME
-    if b"%PDF-" in head[:_PDF_MAGIC_WITHIN]:
+    if b"%PDF-" in head[:PDF_MAGIC_WITHIN]:
         return PDF_MIME
     return None
 
 
 def _check_docx(data: bytes) -> None:
+    if data.count(_CENTRAL_HEADER) > CENTRAL_RECORDS_MAX:
+        raise UploadRejected("docx_expansion")
     try:
         with zipfile.ZipFile(BytesIO(data)) as archive:
             entries = archive.infolist()
@@ -180,14 +200,18 @@ def check_paste(text: str) -> str:
     return text
 
 
-def rejected_problem(exc: UploadRejected, *, field_name: str = FILE_FIELD) -> Problem:
-    """The problem of a rejection: 413 for `too_large`, else 422, `upload_rejected` with the reason."""
+def rejected_problem(
+    exc: UploadRejected, *, field_name: str = FILE_FIELD, message: str | None = None
+) -> Problem:
+    """The problem of a rejection: 413 for `too_large`, else 422, `upload_rejected` with the reason; the
+    field error's message is the reason's fixed text unless `message` (also fixed) replaces it."""
     status = 413 if exc.reason == "too_large" else 422
+    text = REJECT_MESSAGES[exc.reason] if message is None else message
     return Problem(
         status,
         "upload_rejected",
         "Upload rejected",
-        errors=[FieldError(field=field_name, code=exc.reason, message=REJECT_MESSAGES[exc.reason])],
+        errors=[FieldError(field=field_name, code=exc.reason, message=text)],
     )
 
 
@@ -351,6 +375,30 @@ async def read_multipart_limited(request: Request, *, limit: int) -> UploadedFil
     return UploadedFile(
         filename=reader.filename, data=bytes(reader.file), native_pdf_opt_in=_opt_in(reader.flag)
     )
+
+
+def _body_too_large(field_name: str, limit: int) -> Problem:
+    return rejected_problem(
+        UploadRejected("too_large"),
+        field_name=field_name,
+        message=f"The request body is larger than {limit} bytes",
+    )
+
+
+async def read_body_limited(request: Request, *, limit: int, field_name: str) -> bytes:
+    """The whole body of `request`, at most `limit` bytes, or the 413 `upload_rejected` (`too_large` on
+    `field_name`): at once for a declared `Content-Length` over the limit, else as soon as the streamed bytes
+    pass it, without reading further. A `Content-Length` that is no number is left to the stream count."""
+    declared = request.headers.get("content-length", "")
+    if declared.isascii() and declared.isdigit() and int(declared) > limit:
+        raise _body_too_large(field_name, limit)
+    body = bytearray()
+    async with aclosing(request.stream()) as chunks:
+        async for chunk in chunks:
+            if len(body) + len(chunk) > limit:
+                raise _body_too_large(field_name, limit)
+            body += chunk
+    return bytes(body)
 
 
 # --- the draft and its operation -------------------------------------------------------------------------

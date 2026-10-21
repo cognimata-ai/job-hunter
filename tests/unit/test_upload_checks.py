@@ -5,6 +5,7 @@ Every name and datum here is invented (Erika Musterfrau, Max Mustermann, Musterf
 
 import hashlib
 import io
+import json
 import os
 import re
 import stat
@@ -172,6 +173,35 @@ def test_more_than_1000_entries_is_an_expansion_failure() -> None:
     )
 
 
+def test_too_many_central_records_are_refused_before_zipfile_parses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every record `zipfile` would build carries the central-directory signature, so counting it bounds
+    that work: past `CENTRAL_RECORDS_MAX` the archive is refused without being parsed."""
+    required = {"[Content_Types].xml": b"<Types/>", "word/document.xml": b"<w:d/>"}
+    padding = {f"p{i}": b"" for i in range(upload.CENTRAL_RECORDS_MAX - len(required) + 1)}
+    many = zip_of(required | padding)
+    assert many.count(b"PK\x01\x02") == upload.CENTRAL_RECORDS_MAX + 1
+
+    def no_parse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("zipfile.ZipFile was built for an archive the count refuses")
+
+    monkeypatch.setattr(zipfile, "ZipFile", no_parse)  # the module `upload` reads it from at call time
+    assert rejected(many, "cv.docx") == "docx_expansion"
+
+
+def test_a_stored_embedded_package_does_not_trip_the_record_count() -> None:
+    """A workbook embedded uncompressed brings its own central directory: its records count, but the four-fold
+    bound leaves room for it, and the DOCX itself has four entries."""
+    workbook = zip_of({f"xl/worksheets/s{i}.xml": b"<w/>" for i in range(1500)})
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", b"<Types/>")
+        archive.writestr("word/document.xml", b"<w:d/>")
+        archive.writestr("word/embeddings/Workbook1.xlsx", workbook, compress_type=zipfile.ZIP_STORED)
+    docx = buffer.getvalue()
+    assert upload.MAX_DOCX_ENTRIES < docx.count(b"PK\x01\x02") <= upload.CENTRAL_RECORDS_MAX
+    assert checked(docx, "cv.docx") == DOCX_MIME
+
+
 # --- check_paste -----------------------------------------------------------------------------------------
 
 
@@ -217,7 +247,12 @@ def form(*parts: bytes) -> bytes:
     return b"".join(parts) + f"--{BOUNDARY}--\r\n".encode()
 
 
-def counting_request(messages: Sequence[bytes], *, content_type: str | None = None) -> tuple[Request, Pulled]:
+def counting_request(
+    messages: Sequence[bytes],
+    *,
+    content_type: str | None = None,
+    headers: Sequence[tuple[bytes, bytes]] = (),
+) -> tuple[Request, Pulled]:
     """A request whose body arrives as `messages`, one ASGI message each; `Pulled` counts what was taken."""
     pulled = Pulled()
 
@@ -235,7 +270,7 @@ def counting_request(messages: Sequence[bytes], *, content_type: str | None = No
         "type": "http",
         "method": "POST",
         "path": "/api/profile/cv",
-        "headers": [(b"content-type", ctype.encode("latin-1"))],
+        "headers": [(b"content-type", ctype.encode("latin-1")), *headers],
     }
     return Request(scope, receive), pulled
 
@@ -388,6 +423,42 @@ async def test_a_malformed_form_is_a_validation_failure(
     body: bytes, content_type: str | None, expected: list[tuple[str, str]]
 ) -> None:
     assert summary(await problem_of(body, content_type=content_type)) == (422, "validation_failed", expected)
+
+
+# --- read_body_limited (the paste's JSON body) -----------------------------------------------------------
+
+
+async def test_a_declared_length_over_the_cap_is_refused_before_any_read() -> None:
+    request, pulled = counting_request(
+        [b"{}"], content_type="application/json", headers=[(b"content-length", b"%d" % (4096 + 1))]
+    )
+    with pytest.raises(Problem) as exc:
+        await upload.read_body_limited(request, limit=4096, field_name="text")
+    assert summary(exc.value) == (413, "upload_rejected", [("text", "too_large")])
+    assert pulled.messages == 0
+
+
+async def test_a_body_without_a_length_is_counted_as_it_streams() -> None:
+    limit, chunk = 4096, 512
+    body = b'{"text": "' + b"x" * (50 * limit) + b'"}'
+    request, pulled = counting_request(chunked(body, chunk), content_type="application/json")
+    with pytest.raises(Problem) as exc:
+        await upload.read_body_limited(request, limit=limit, field_name="text")
+    assert summary(exc.value) == (413, "upload_rejected", [("text", "too_large")])
+    assert pulled.bytes <= limit + chunk and pulled.messages < len(chunked(body, chunk)) // 10
+
+
+async def test_a_body_within_the_cap_is_read_whole() -> None:
+    body = b'{"text": "' + b"x" * 4000 + b'"}'
+    for headers in ([], [(b"content-length", b"%d" % len(body))], [(b"content-length", b"garbage")]):
+        request, _ = counting_request(chunked(body, 512), content_type="application/json", headers=headers)
+        assert await upload.read_body_limited(request, limit=len(body), field_name="text") == body
+
+
+def test_the_paste_body_cap_covers_the_longest_escaped_text() -> None:
+    """50,000 characters outside the BMP, each two `\\uXXXX` escapes: the JSON body stays under the cap."""
+    longest = json.dumps({"text": "\U0001f600" * upload.PASTE_MAX}).encode()
+    assert len(longest) <= upload.PASTE_BODY_MAX_BYTES and len(longest) > upload.PASTE_BODY_MAX_BYTES // 2
 
 
 # --- CvStore ---------------------------------------------------------------------------------------------

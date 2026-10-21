@@ -7,6 +7,8 @@ import asyncio
 import hashlib
 import json
 import stat
+import threading
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -239,6 +241,97 @@ async def test_a_failed_transaction_after_the_file_write_deletes_the_file(
     assert await count_rows(engine, "cv_files", mime=PDF_MIME) == 0
     assert await statuses(engine) == {ready: ("ready", None)}  # the discard rolled back with the rest
     assert await operations(engine) == [] and await jobs(engine) == []
+
+
+# A row whose deferred foreign key (`profile_versions.draft_id`) names no draft: the INSERT takes it, the
+# COMMIT refuses it. The transaction then fails at its commit, after the route's last statement in it.
+_FAILS_AT_COMMIT = sa.text(
+    "INSERT INTO profile_versions (version_no, draft_id, profile_json, profile_hash) "
+    "VALUES (999999, -1, '{}', '\\x00')"
+)
+
+
+async def test_an_error_of_the_commit_itself_leaves_the_file(
+    logged_in_client, engine, cv_store_dir, monkeypatch, log_events
+) -> None:
+    """The commit's outcome is unknown to the route, so the file stays: a committed row may name it, and an
+    uncommitted one leaves an orphan for Task 23's `cv_store_orphans` rule."""
+    request = upload.request_draft_operation
+
+    async def then_fail_at_commit(conn: AsyncConnection, *args: Any, **kwargs: Any) -> tuple[int, bool]:
+        created = await request(conn, *args, **kwargs)
+        await conn.execute(_FAILS_AT_COMMIT)
+        return created
+
+    monkeypatch.setattr(upload, "request_draft_operation", then_fail_at_commit)
+    r = await post_cv(logged_in_client)
+    assert r.status_code == 500 and r.json()["code"] == "internal"
+    assert len(list(cv_store_dir.iterdir())) == 1  # kept: here an orphan, since nothing was committed
+    assert await count_rows(engine, "cv_files") == 0 and await count_rows(engine, "profile_versions") == 0
+    assert [e["error_class"] for e in log_events() if e["event"] == "cv_upload_commit_failed"] == [
+        "IntegrityError"
+    ]
+
+
+async def test_a_failing_delete_never_hides_the_transaction_error(
+    logged_in_client, engine, cv_store_dir, monkeypatch, log_events
+) -> None:
+    async def fault(*args: object, **kwargs: object) -> tuple[int, bool]:
+        raise RuntimeError("injected transaction fault")
+
+    def refuse(self: CvStore, storage_path: str) -> None:
+        raise PermissionError("injected delete fault")
+
+    monkeypatch.setattr(upload, "request_draft_operation", fault)
+    monkeypatch.setattr(CvStore, "delete", refuse)
+    r = await post_cv(logged_in_client)
+    assert r.status_code == 500 and r.json()["code"] == "internal"
+    events = log_events()
+    assert [e["error_class"] for e in events if e["event"] == "cv_file_delete_failed"] == ["PermissionError"]
+    assert [e["error_class"] for e in events if e["event"] == "unhandled_exception"] == ["RuntimeError"]
+    assert "injected" not in json.dumps(events)  # classes only, never a message
+    assert len(list(cv_store_dir.iterdir())) == 1 and await count_rows(engine, "cv_files") == 0
+
+
+async def test_the_route_checks_the_file_off_the_event_loop(logged_in_client, monkeypatch) -> None:
+    """`check_file` is pure and a hostile central directory costs seconds: it runs in a worker thread."""
+    loop_thread, check_threads = threading.get_ident(), []
+    check_file = upload.check_file
+
+    def spy(head: bytes, data: bytes, filename: str) -> upload.Detected:
+        check_threads.append(threading.get_ident())
+        return check_file(head, data, filename)
+
+    monkeypatch.setattr(upload, "check_file", spy)
+    assert (await post_cv(logged_in_client)).status_code == 202
+    assert len(check_threads) == 1 and check_threads[0] != loop_thread
+
+
+async def test_a_paste_body_over_1_mib_is_413_before_it_is_parsed(logged_in_client, engine) -> None:
+    """Declared with a `Content-Length`, or streamed without one (chunked): both stop at the cap."""
+    oversized = json.dumps({"text": "Erika Musterfrau " * (2**20 // 16)}).encode()
+    assert len(oversized) > upload.PASTE_BODY_MAX_BYTES
+
+    async def stream() -> AsyncIterator[bytes]:
+        for i in range(0, len(oversized), 65536):
+            yield oversized[i : i + 65536]
+
+    declared = await logged_in_client.post(
+        "/api/profile/cv-text", content=oversized, headers={"Content-Type": "application/json"}
+    )
+    streamed = await logged_in_client.post(
+        "/api/profile/cv-text", content=stream(), headers={"Content-Type": "application/json"}
+    )
+    assert declared.request.headers["content-length"] == str(len(oversized))
+    assert "content-length" not in streamed.request.headers
+    for r in (declared, streamed):
+        assert (r.status_code, r.json()["code"], errors_of(r)) == (
+            413,
+            "upload_rejected",
+            [("text", "too_large")],
+        )
+    assert await count_rows(engine, "cv_files") == 0
+    assert (await post_text(logged_in_client)).status_code == 202  # under the cap the body reaches FastAPI
 
 
 async def test_a_native_opt_in_while_native_pdf_is_disabled_is_422_and_stores_nothing(

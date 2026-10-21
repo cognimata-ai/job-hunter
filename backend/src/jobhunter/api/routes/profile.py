@@ -4,28 +4,37 @@
 1. the form is read while streaming (`upload.read_multipart_limited`): a file over 10 MiB is a 413
    `upload_rejected` before anything past the limit is read; a malformed form is a 422 `validation_failed`;
 2. a native opt-in while `bounds.NATIVE_PDF_ENABLED` is false is a 422 `validation_failed` on
-   `native_pdf_opt_in` (plan Deviation 9; the flag is read per request); the file is checked
-   (`upload.check_file`: 413 or 422 `upload_rejected` with `errors=[{field: "file", code: <reason>}]`); an
-   opt-in for a DOCX is a 422 on `native_pdf_opt_in`. Nothing is stored for any of them;
+   `native_pdf_opt_in` (plan Deviation 9; the flag is read per request); the file is checked in a worker
+   thread, so a hostile archive's parse never holds the event loop (`upload.check_file`: 413 or 422
+   `upload_rejected` with `errors=[{field: "file", code: <reason>}]`); an opt-in for a DOCX is a 422 on
+   `native_pdf_opt_in`. Nothing is stored for any of them;
 3. the file is written encrypted to the `cv_store` (`CvStore.write`), then one transaction opens the draft
-   (`upload.open_new_draft`: 409 `conflict_state` while a draft is being extracted). When that transaction
-   fails in any way, the file is deleted again before the error goes on (a crash in between leaves an orphan
-   that Task 23's `cv_store_orphans` rule removes).
+   (`upload.open_new_draft`: 409 `conflict_state` while a draft is being extracted). An error before the
+   transaction's body ended (it rolls back) deletes the file again before the error goes on. An error of the
+   COMMIT itself leaves it: the commit may have happened, and a row would then name a missing file. A file no
+   committed row names, as after a crash in between, is an orphan that Task 23's `cv_store_orphans` rule
+   removes; so is one whose deletion fails (`cv_file_delete_failed`), which never hides the first error.
 
-`POST /api/profile/cv-text` (`{text}`) → 202 `{draft_id}`: the text is checked (`upload.check_paste`: 422
-`upload_rejected` on `text`) and stored sealed in its `cv_files` row (`raw_text_enc`, `extraction_method =
-'pasted'`), never as a file; the same transaction opens the draft.
+`POST /api/profile/cv-text` (`{text}`) → 202 `{draft_id}`: its body is read with a 1 MiB cap before FastAPI
+parses it (`_CappedBodyRoute`: 413 `upload_rejected`, `too_large` on `text`); the text is checked
+(`upload.check_paste`: 422 `upload_rejected` on `text`) and stored sealed in its `cv_files` row
+(`raw_text_enc`, `extraction_method = 'pasted'`), never as a file; the same transaction opens the draft.
 
 Both need a session and pass the edge's CSRF check. Logs carry ids, sizes and reason codes only: never a file
 name, a file's content or a pasted text.
 """
 
+import asyncio
 import hashlib
+from collections.abc import Callable, Coroutine
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.responses import Response
+from starlette.types import Message
 
 from jobhunter.api.deps import get_config, get_data_keys, get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
@@ -42,8 +51,7 @@ router = APIRouter(
 )
 log = get_logger("jobhunter.api.profile")
 
-# How much of the file the type detection looks at (§12.1: `%PDF-` within the first 1,024 bytes).
-_HEAD_BYTES: Final = 1024
+_TEXT_FIELD: Final = "text"
 _CONFLICT_RESPONSE: Final[dict[int | str, dict[str, Any]]] = {
     409: {"description": "A draft is being extracted (`conflict_state`)"}
 }
@@ -92,6 +100,52 @@ def _native_refused(code: str, message: str) -> Problem:
     )
 
 
+def _delete_quietly(store: CvStore, storage_path: str) -> None:
+    """Delete a file no row names; a failure is logged (its class only) and leaves an orphan for Task 23's
+    `cv_store_orphans` rule, so the error that led here is the one that goes on."""
+    try:
+        store.delete(storage_path)
+    except OSError as exc:
+        log.error("cv_file_delete_failed", error_class=type(exc).__name__)
+
+
+def _replayed(request: Request, body: bytes) -> Request:
+    """A request like `request` whose body, already read, is `body`; later receives (a disconnect) pass on."""
+    delivered = False
+
+    async def receive() -> Message:
+        nonlocal delivered
+        if delivered:
+            return await request.receive()
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(request.scope, receive)
+
+
+class _CappedBodyRoute(APIRoute):
+    """A route whose body is read with the paste's cap (`upload.read_body_limited`) before FastAPI parses it.
+
+    FastAPI reads a JSON body whole, and turns any error of that read into a 400, so the cap runs first and
+    the body read under it is replayed to FastAPI's own handler.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def capped(request: Request) -> Response:
+            try:
+                body = await upload.read_body_limited(
+                    request, limit=upload.PASTE_BODY_MAX_BYTES, field_name=_TEXT_FIELD
+                )
+            except Problem as problem:
+                log.info("cv_upload_refused", status=problem.status, code=problem.code)
+                raise
+            return await handler(_replayed(request, body))
+
+        return capped
+
+
 def _rejected(exc: upload.UploadRejected, *, field_name: str, **measures: int) -> Problem:
     """The problem of a refused file or text, logged with its reason and size (`size_bytes` or `chars`)."""
     log.info("cv_upload_rejected", reason=exc.reason, field=field_name, **measures)
@@ -108,7 +162,10 @@ async def _accepted_form(request: Request) -> tuple[upload.UploadedFile, upload.
     if form.native_pdf_opt_in and not bounds.NATIVE_PDF_ENABLED:
         raise _native_refused("native_pdf_disabled", "Sending the original PDF is not enabled")
     try:
-        detected = upload.check_file(form.data[:_HEAD_BYTES], form.data, form.filename)
+        # Pure, and seconds of CPU for a hostile central directory: off the event loop.
+        detected = await asyncio.to_thread(
+            upload.check_file, form.data[: upload.PDF_MAGIC_WITHIN], form.data, form.filename
+        )
     except upload.UploadRejected as exc:
         raise _rejected(exc, field_name=upload.FILE_FIELD, size_bytes=len(form.data)) from None
     if form.native_pdf_opt_in and detected != upload.PDF_MIME:
@@ -141,13 +198,19 @@ async def upload_cv(
     cv = upload.NewCvFile(
         mime=detected, sha256=stored.sha256, size_bytes=len(form.data), storage_path=stored.storage_path
     )
+    committing = False
     try:
         async with engine.begin() as conn:
             draft_id = await upload.open_new_draft(
                 conn, cv=cv, native_pdf=form.native_pdf_opt_in, defer=defer_in_tx
             )
-    except BaseException:
-        store.delete(stored.storage_path)  # nothing names it: the row was never committed
+            committing = True  # the last statement: what fails from here on is the COMMIT
+    except BaseException as exc:
+        if committing:
+            # The outcome is unknown: a committed row may name the file, so it stays (an orphan otherwise).
+            log.warning("cv_upload_commit_failed", error_class=type(exc).__name__)
+        else:
+            _delete_quietly(store, stored.storage_path)  # rolled back: nothing names it
         raise
     log.info(
         "cv_uploaded",
@@ -159,16 +222,6 @@ async def upload_cv(
     return DraftCreatedOut(draft_id=draft_id)
 
 
-@router.post(
-    "/cv-text",
-    status_code=202,
-    response_model=DraftCreatedOut,
-    responses={
-        **_CONFLICT_RESPONSE,
-        422: {"description": "An invalid body (`validation_failed`) or a refused text (`upload_rejected`)"},
-        **CSRF_RESPONSES,
-    },
-)
 async def paste_cv(
     body: CvTextIn,
     engine: Annotated[AsyncEngine, Depends(get_engine)],
@@ -179,7 +232,7 @@ async def paste_cv(
     try:
         text = upload.check_paste(body.text)
     except upload.UploadRejected as exc:
-        raise _rejected(exc, field_name="text", chars=len(body.text)) from None
+        raise _rejected(exc, field_name=_TEXT_FIELD, chars=len(body.text)) from None
     utf8 = text.encode("utf-8")
     store = CvStore(cfg.cv_store_dir)
     cv = upload.NewCvFile(
@@ -192,3 +245,20 @@ async def paste_cv(
         draft_id = await upload.open_new_draft(conn, cv=cv, native_pdf=False, defer=defer_in_tx)
     log.info("cv_pasted", draft_id=draft_id, size_bytes=len(utf8))
     return DraftCreatedOut(draft_id=draft_id)
+
+
+# `router.post` takes no route class, so the paste route is added with the capped one.
+router.add_api_route(
+    "/cv-text",
+    paste_cv,
+    methods=["POST"],
+    status_code=202,
+    response_model=DraftCreatedOut,
+    responses={
+        **_CONFLICT_RESPONSE,
+        413: {"description": "The body is larger than 1 MiB (`upload_rejected`, `too_large`)"},
+        422: {"description": "An invalid body (`validation_failed`) or a refused text (`upload_rejected`)"},
+        **CSRF_RESPONSES,
+    },
+    route_class_override=_CappedBodyRoute,
+)
