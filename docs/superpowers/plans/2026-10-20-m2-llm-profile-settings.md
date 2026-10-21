@@ -1922,10 +1922,10 @@ uv run pytest tests/stack -m stack -q && uv run pytest tests/perf -m perf -q
 docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fixtures.yaml -f deploy/compose.fakellm.yaml down -v
 docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fixtures.yaml -f deploy/compose.fakellm.yaml up -d --build --wait
 uv run python scripts/smoke_m2.py
-uv run jobhunter schema-dry-run   # the fake transport: the five cases pass
+uv run jobhunter schema-dry-run || true   # the fake transport: the case table of V4.md (generator rejected, Deviation 33); exits non-zero while a gating case fails
 ```
 
-Expected: every command exits 0, and the smoke script prints ten `{"check": …, "ok": true}` lines. No paid call runs in this step.
+Expected: every command exits 0 except `schema-dry-run`, whose case table must equal V4.md's (generator rejected with the grammar error, the other gating cases as V4 recorded them, the probe answered by `count_tokens`), and the smoke script prints ten `{"check": …, "ok": true}` lines. No paid call runs in this step.
 - [ ] **Step 4: Close the spikes and the roadmap.** This step is a gate:
   - `docs/spikes/V4.md`, `V5.md` (local part), `V11.md`, `V13.md` and `V19.md` hold their results;
   - `.fixtures-raw/anthropic-budget.json` shows ≤ 8 paid messages and ≤ $0.80 of worst-case reservations, and the actual total is copied into `V19.md`, with no key and no content;
@@ -2013,10 +2013,12 @@ Each deviation stages a spec item across milestones, or settles something the sp
 30. **Two ledger CHECKs refuse NULL evidence** (Task 1 review). Under SQL's three-valued logic the verbatim §7.11 CHECKs `state <> 'not_billed' OR (settled_usd = 0 AND evidence IN (…))` and `state <> 'billed' OR settled_usd <= reserved_usd OR evidence = 'reservation_bound_violated'` both pass a row whose `evidence` is NULL, so an unexplained `not_billed` or a silent bound violation would be stored. Migration 0006 adds `evidence IS NOT NULL` to the first and uses `IS NOT DISTINCT FROM` in the second. The CHECKs refuse only rows the spec already calls invalid; no behaviour change.
 31. **The SDK's environment is shut out of the gateway client** (Task 4 review). §10.1 G1 names `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_URL` and `ANTHROPIC_API_KEY`, but the pinned SDK also reads `ANTHROPIC_CUSTOM_HEADERS` (merged into every request; an `x-api-key` there replaced the explicit key), the `ANTHROPIC_OPEN_TELEMETRY*` variables (spans that can carry content) and `ANTHROPIC_LOG` (debug logging of whole request bodies). The gateway client therefore sends exactly its own headers, turns SDK tracing and trace propagation off, and the `anthropic`, `httpx2` and `httpcore2` loggers are held at WARNING with no handlers of their own. A new startup assertion, `anthropic_log_in_prod`, refuses `ANTHROPIC_LOG=debug` or `info` in prod, beyond §16.8's list. No behaviour change for a correctly configured deployment.
 32. **Rubric v1 and prompt-schema version 1 are seeded, not migrated; the pointers stay nullable until M3** (Task 6). Task 6's text had migration 0007 insert both rows and restore the NOT NULL of `active_config.rubric_version_id` and `prompt_schema_version_id` (M0 Deviation 1). §19.3 step 2 forbids migrations from inserting rows into identity tables (seeding is step 6, after the identity advancement). So `seed_defaults` inserts both rows and sets both pointers on every `migrate`, on a fresh install and on an upgrade alike, and a test pins that every `migrate` leaves both pointers set. The NOT NULL moves to M3's first migration, one release after the seed that populates it (expand/contract). No behaviour change.
+33. **V4: the API rejects the §11.5 generator schema** (Task 7). The first V4 case, the generator schema on `claude-sonnet-5-5`, got HTTP 400 `invalid_request_error`, "The compiled grammar is too large…"; `messages.count_tokens` does not catch it. The `minimum` probe was answered by `count_tokens` for free (400, `minimum` not supported for integers), so no paid probe is sent, and the dry-run's probe case uses `count_tokens` and never gates `passed`. The schema dry-run keeps the generator case and reports it failed (the fake replays the recorded 400), so prompt-schema version 1's dry-run is `passed = false`, and `jobhunter schema-dry-run` exits non-zero until M3 ships a compilable generator schema as prompt-schema version 2. M2 makes no generator call, so no M2 behaviour changes. Making §11.5's output compilable is a spec change for M3's plan, put to the user with it.
 
 ## Carry-forward to later milestones
 
 1. **M3:**
+   - a compilable generator output schema (Deviation 33: the API rejects the §11.5 schema's grammar as too large), as a spec change approved with M3's plan, shipped as prompt-schema version 2 and verified by the live schema dry-run before any scoring call;
    - restore `NOT NULL` on `active_config.rubric_version_id` and `prompt_schema_version_id` in M3's first migration (Deviation 32);
    - the FKs of Deviation 1;
    - V5's paid part and V14;
