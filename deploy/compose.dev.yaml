@@ -219,7 +219,7 @@ volumes:
   # per-job directory the group that both the worker and docparse hold.
   parse_jobs:
     driver: local
-    driver_opts: { type: tmpfs, device: tmpfs, o: "mode=2770,uid=0,gid=10011" }
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=256m,uid=0,gid=10011,mode=2770" } # as §19.1
 
 # The files of scripts/dev-secrets.sh: group 10010, mode 0440, in a 0750 directory (§19.2).
 secrets:

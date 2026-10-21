@@ -18,7 +18,16 @@ from docparse.extract import (
 )
 from docparse.worker import run_job
 from tests.docparse.conftest import encrypted_pdf, make_job, result_of
-from tests.support.profile import DOCX_MIME, PDF_MIME, docx_bytes, image_only_pdf, minimal_pdf
+from tests.support.profile import (
+    DOCX_MIME,
+    PDF_MIME,
+    docx_bytes,
+    docx_of_body,
+    image_only_pdf,
+    minimal_pdf,
+    paragraph_xml,
+    replacement_char_pdf,
+)
 
 pytestmark = pytest.mark.docparse
 
@@ -49,6 +58,23 @@ def test_a_two_page_text_pdf_yields_its_text_in_page_order_with_pypdf(tmp_path) 
     assert extracted.method == "pypdf" and extracted.page_count == 2
     assert [line.strip() for line in extracted.text.splitlines()] == CV_LINES
     assert "\ufffd" not in extracted.text
+
+
+def test_a_pdf_whose_pypdf_text_is_over_5_percent_replacement_characters_is_read_by_pdfplumber(
+    tmp_path,
+) -> None:
+    from pypdf import PdfReader
+
+    pdf = write(tmp_path, "garbled.pdf", replacement_char_pdf(["Max Mustermann €€€ Softwareentwickler"] * 12))
+    pypdf_text = PdfReader(pdf).pages[0].extract_text()
+    # The precondition: enough text, but more than 5% of it U+FFFD in pypdf's reading.
+    assert len(pypdf_text) >= 300 and pypdf_text.count("\ufffd") > 0.05 * len(pypdf_text)
+    extracted = extract_pdf(pdf)
+    assert extracted.method == "pdfplumber" and extracted.page_count == 1
+    assert extracted.text.count("Max Mustermann") == 12 and "Softwareentwickler" in extracted.text
+    job = make_job(tmp_path, pdf.read_bytes(), PDF_MIME)
+    run_job(job)
+    assert result_of(job)["method"] == "pdfplumber"
 
 
 def test_an_image_only_pdf_yields_little_text_and_its_job_is_ok_with_the_count(tmp_path) -> None:
@@ -121,6 +147,48 @@ def test_a_docx_with_a_table_keeps_paragraphs_and_cells_in_document_order(tmp_pa
         "Hobbys: Schach & Laufen",
     ]
     assert extract_document(docx, DOCX_MIME) == extracted
+
+
+def table_xml(columns: int, rows: str) -> str:
+    return f"<w:tbl><w:tblPr/><w:tblGrid>{'<w:gridCol/>' * columns}</w:tblGrid>{rows}</w:tbl>"
+
+
+def test_a_merged_cell_is_read_once(tmp_path) -> None:
+    p = paragraph_xml
+    spanned = f'<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr>{p("Berufserfahrung")}</w:tc>'
+    merged_down = f'<w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr>{p("Musterstadt")}</w:tc>'
+    continued = "<w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>"
+    rows = (
+        f"<w:tr>{spanned}{merged_down}</w:tr>"
+        f"<w:tr><w:tc>{p('2019-2024')}</w:tc><w:tc>{p('Entwickler')}</w:tc>{continued}</w:tr>"
+    )
+    docx = write(tmp_path, "cv.docx", docx_of_body(p("Max Mustermann") + table_xml(3, rows)))
+    # python-docx repeats a cell once per grid column it spans and per row it is merged down.
+    assert extract_docx(docx).text.splitlines() == [
+        "Max Mustermann",
+        "Berufserfahrung",
+        "Musterstadt",
+        "2019-2024",
+        "Entwickler",
+    ]
+
+
+def test_a_nested_table_is_read_in_its_cells_place(tmp_path) -> None:
+    p = paragraph_xml
+    inner = table_xml(2, f"<w:tr><w:tc>{p('Python')}</w:tc><w:tc>{p('SQL')}</w:tc></w:tr>")
+    outer = table_xml(
+        2, f"<w:tr><w:tc>{p('Kenntnisse')}{inner}{p('Stand 2024')}</w:tc><w:tc>{p('Sprachen')}</w:tc></w:tr>"
+    )
+    docx = write(tmp_path, "cv.docx", docx_of_body(p("Erika Musterfrau") + outer + p("Hobbys: Schach")))
+    assert extract_docx(docx).text.splitlines() == [
+        "Erika Musterfrau",
+        "Kenntnisse",
+        "Python",
+        "SQL",
+        "Stand 2024",
+        "Sprachen",
+        "Hobbys: Schach",
+    ]
 
 
 def test_a_macro_enabled_document_or_a_broken_pdf_is_a_parse_error(tmp_path) -> None:

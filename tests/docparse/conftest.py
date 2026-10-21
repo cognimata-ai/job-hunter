@@ -5,10 +5,14 @@ therefore module-level functions of this importable module (`tests.docparse.conf
 functions of a test module. Every text in them is invented.
 """
 
+import contextlib
+import fcntl
 import io
 import json
 import os
+import stat
 import time
+from multiprocessing import resource_tracker
 from pathlib import Path
 from typing import Final, NoReturn
 
@@ -89,6 +93,21 @@ def die(_path: Path, _mime: str) -> NoReturn:
 def flood(_path: Path, _mime: str) -> Extracted:
     """More text than the loop takes from a child (`docparse.worker.MAX_ANSWER_BYTES`, 16 MiB)."""
     return Extracted("x" * (17 * 2**20), "pypdf", 1)
+
+
+def stall_mid_answer(_path: Path, _mime: str) -> NoReturn:
+    """Writes the start of an answer to the loop's pipe (the child's write-only pipe above the standard
+    streams that is not the resource tracker's, which a spawn child inherits too), then blocks: a child stuck
+    mid-message."""
+    tracker_fd = resource_tracker.getfd()
+    for name in os.listdir("/proc/self/fd"):
+        fd = int(name)
+        with contextlib.suppress(OSError):  # the descriptor listdir itself used is gone
+            write_only = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
+            if fd > 2 and fd != tracker_fd and write_only and stat.S_ISFIFO(os.fstat(fd).st_mode):
+                os.write(fd, b'{"code": null, "method": "pypdf", "text": "Max Muster')
+    time.sleep(120)
+    os._exit(0)
 
 
 def mark(path: Path, _mime: str) -> Extracted:

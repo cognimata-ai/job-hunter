@@ -8,13 +8,22 @@ alone, so a decrypted CV never reaches a disk.
   enter it, and the setgid bit, so the files inside take that group too), writes `input.pdf` or
   `input.docx` (0660), publishes `request.json` atomically, then polls for `result.json` every `poll_s`
   until `timeout_s`. It answers `ParseOk(text, method, page_count)` or `ParseFailed(code)`: docparse's own
-  code, `timeout` when no result came in time, or `parse_error` for a result it cannot trust (not version 1,
-  an unknown status, code or method, `text.txt` missing, not UTF-8, or not of `chars` characters). The
+  code, `timeout` when no result came in time, or `parse_error` for a result it cannot trust (below). The
   directory is removed in a `finally`, whatever the outcome, cancellation included.
 - `validate(data)` is the same exchange in `validate` mode, for a PDF: encryption and page count, no text,
   so an `ok` is `ParseOk("", "pypdf", page_count)`.
 - `cleanup_leftovers()` removes every entry under the root at worker start: what a crashed worker left. A
   missing root removes nothing and returns 0.
+
+**docparse is the sandbox of hostile documents**, and anything its parser child runs can write anything in
+the job directory. Its answer is read as untrusted: every file goes through the job directory's own file
+descriptor (opened when it is created, so a directory swapped for a symlink later is never followed) and
+`_read_regular`, which follows no symlink, never blocks on a FIFO, takes a regular file only and caps its
+size: `RESULT_MAX_BYTES` for `result.json`, and for `text.txt` four bytes a character of the result's `chars`
+(UTF-8), never more than `TEXT_MAX_BYTES`. Any failure of that, any result that is not version 1 with a known
+status, code and method, and a `text.txt` that is not UTF-8 of exactly `chars` characters is
+`ParseFailed("parse_error")`; reading the answer never raises. Writing the job (a missing or unwritable root)
+does raise: that is the worker's environment, not the document.
 
 The file work runs on the event loop: a job is at most 10 MiB (§12.1) on a tmpfs, and work done in place
 cannot outlive the `finally` that removes its directory, as a write in a thread could. Nothing here logs a
@@ -22,6 +31,7 @@ file name, a text or a document's bytes: job ids, codes and counts only.
 """
 
 import asyncio
+import errno
 import json
 import os
 import shutil
@@ -51,7 +61,13 @@ TEXT: Final = "text.txt"
 RESULT: Final = "result.json"
 DIR_MODE: Final = 0o770
 FILE_MODE: Final = 0o660
+# A result is six short fields; the text is UTF-8, at most four bytes a character.
+RESULT_MAX_BYTES: Final = 4096
+TEXT_MAX_BYTES: Final = 16 * 2**20
+UTF8_MAX_BYTES_PER_CHAR: Final = 4
 _REMOVE_ATTEMPTS: Final = 3
+_READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 @dataclass(frozen=True)
@@ -81,35 +97,64 @@ def _is_docparse_code(value: object) -> TypeIs[DocparseCode]:
     return value in get_args(DocparseCode)
 
 
-def _write_new(path: Path, data: bytes) -> None:
-    """A new file of `data`, 0660 whatever the umask: docparse reads it through the group."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, FILE_MODE)
+def _write_new(dir_fd: int, name: str, data: bytes) -> None:
+    """A new file `name` of `data` in the job directory, 0660 whatever the umask: docparse reads it through
+    the group."""
+    fd = os.open(
+        name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, FILE_MODE, dir_fd=dir_fd
+    )
     with os.fdopen(fd, "wb") as out:
         os.fchmod(out.fileno(), FILE_MODE)
         out.write(data)
 
 
-def _submit(job_dir: Path, data: bytes, mime: str, mode: str) -> None:
+def _submit(job_dir: Path, data: bytes, mime: str, mode: str) -> int:
+    """Create the job and publish its request; the job directory's descriptor, which the caller closes."""
     input_name = INPUT_NAMES[mime]
     job_dir.mkdir(mode=DIR_MODE)
-    # The umask narrows mkdir's mode, so it is set again; the setgid bit inherited from the root stays.
-    os.chmod(job_dir, DIR_MODE | (job_dir.stat().st_mode & stat.S_ISGID))
-    _write_new(job_dir / input_name, data)
-    request = {"v": PROTOCOL_VERSION, "mime": mime, "input": input_name, "mode": mode}
-    tmp = job_dir / f"{REQUEST}.tmp"
-    _write_new(tmp, json.dumps(request).encode("ascii"))
-    os.replace(tmp, job_dir / REQUEST)
-
-
-def _read_outcome(job_dir: Path, mode: str) -> ParseOutcome | None:
-    """docparse's result, or None while there is none yet."""
+    dir_fd = os.open(job_dir, _DIR_FLAGS)
     try:
-        raw = (job_dir / RESULT).read_bytes()
+        # The umask narrows mkdir's mode, so it is set again; the setgid bit inherited from the root stays.
+        os.fchmod(dir_fd, DIR_MODE | (os.fstat(dir_fd).st_mode & stat.S_ISGID))
+        _write_new(dir_fd, input_name, data)
+        request = {"v": PROTOCOL_VERSION, "mime": mime, "input": input_name, "mode": mode}
+        _write_new(dir_fd, f"{REQUEST}.tmp", json.dumps(request).encode("ascii"))
+        os.replace(f"{REQUEST}.tmp", REQUEST, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
+
+
+def _read_regular(dir_fd: int, name: str, max_bytes: int) -> bytes:
+    """The bytes of the regular file `name` in the job directory: no symlink is followed, a FIFO or a device
+    never blocks, and a file of more than `max_bytes` is refused. Raises OSError for anything else."""
+    fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        data = bytearray()
+        while len(data) <= max_bytes and (chunk := os.read(fd, max_bytes + 1 - len(data))):
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > max_bytes:
+        raise OSError(errno.EFBIG, "file too large")
+    return bytes(data)
+
+
+def _read_outcome(dir_fd: int, mode: str) -> ParseOutcome | None:
+    """docparse's result, or None while there is none yet. Never raises: anything it cannot trust is
+    `parse_error`."""
+    try:
+        raw = _read_regular(dir_fd, RESULT, RESULT_MAX_BYTES)
     except FileNotFoundError:
         return None
+    except OSError:
+        return ParseFailed("parse_error")
     try:
         result = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, not UTF-8, or nested past the parser's depth
         return ParseFailed("parse_error")
     if not isinstance(result, dict) or not _is_count(result.get("v")) or result["v"] != PROTOCOL_VERSION:
         return ParseFailed("parse_error")
@@ -128,8 +173,9 @@ def _read_outcome(job_dir: Path, mode: str) -> ParseOutcome | None:
     if mode == "validate":
         return ParseOk("", method, page_count)
     try:
+        raw_text = _read_regular(dir_fd, TEXT, min(UTF8_MAX_BYTES_PER_CHAR * chars, TEXT_MAX_BYTES))
         # Bytes, then UTF-8: reading in text mode would turn "\r\n" into "\n" and change the length.
-        text = (job_dir / TEXT).read_bytes().decode("utf-8")
+        text = raw_text.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return ParseFailed("parse_error")
     return ParseOk(text, method, page_count) if len(text) == chars else ParseFailed("parse_error")
@@ -137,10 +183,13 @@ def _read_outcome(job_dir: Path, mode: str) -> ParseOutcome | None:
 
 def _remove(job_dir: Path) -> None:
     # docparse may still be writing when a timeout or a cancellation removes the directory, so a file can
-    # appear after rmtree listed it; removal is tried again until the directory is gone.
+    # appear after rmtree listed it; removal is tried again until the directory is gone. A job directory that
+    # docparse swapped for a symlink is unlinked, never followed.
     for _ in range(_REMOVE_ATTEMPTS):
+        if job_dir.is_symlink():
+            job_dir.unlink(missing_ok=True)
         shutil.rmtree(job_dir, ignore_errors=True)
-        if not job_dir.exists():
+        if not os.path.lexists(job_dir):
             return
     log.warning("parse_job_dir_not_removed", job_id=job_dir.name)
 
@@ -161,17 +210,20 @@ class ParseClient:
 
     async def _exchange(self, data: bytes, mime: str, mode: str) -> ParseOutcome:
         job_dir = self.root / uuid.uuid4().hex
+        dir_fd: int | None = None
         try:
-            _submit(job_dir, data, mime, mode)
+            dir_fd = _submit(job_dir, data, mime, mode)
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self.timeout_s
-            while (outcome := _read_outcome(job_dir, mode)) is None:
+            while (outcome := _read_outcome(dir_fd, mode)) is None:
                 if loop.time() >= deadline:
                     log.warning("parse_job_timeout", job_id=job_dir.name, timeout_s=self.timeout_s)
                     return ParseFailed("timeout")
                 await asyncio.sleep(self.poll_s)
             return outcome
         finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
             _remove(job_dir)
 
     def cleanup_leftovers(self) -> int:

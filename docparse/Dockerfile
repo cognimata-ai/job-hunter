@@ -30,7 +30,8 @@ RUN --mount=type=secret,id=build_ca,required=false \
 
 FROM ${PYTHON_IMAGE} AS runtime
 COPY --from=build /opt/venv /opt/venv
-COPY docparse/__init__.py docparse/extract.py docparse/worker.py /app/docparse/
+# The whole package, so no module of it is ever left out; .dockerignore keeps this Dockerfile and caches out.
+COPY docparse/ /app/docparse/
 # PYTHONPATH: the loop runs as `python -m docparse.worker`, and each job's spawn child imports docparse too.
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
 WORKDIR /

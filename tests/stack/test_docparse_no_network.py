@@ -94,8 +94,17 @@ def test_docparse_runs_unprivileged_on_a_read_only_root_with_only_the_parse_grou
     assert exec_("id", "-u").stdout.split() == [b"10002"]
     assert sorted(exec_("id", "-G").stdout.split()) == [b"10002", b"10011"]  # never the secrets group 10010
     assert exec_("stat", "-c", "%a %u %g", "/data/parse").stdout.split() == [b"2770", b"0", b"10011"]
+    # The tmpfs of §19.1: size=256m, so a flood of job files cannot take the host's memory.
+    size = exec_("python", "-c", "import os; s = os.statvfs('/data/parse'); print(s.f_blocks * s.f_frsize)")
+    assert size.stdout.split() == [str(256 * 2**20).encode()]
     assert exec_("ls", "-A", "/run/secrets").returncode != 0  # no secret is mounted
     assert exec_("touch", "/app/x").returncode != 0  # read-only root
+
+
+def test_the_image_holds_the_whole_docparse_package_and_nothing_else(docparse) -> None:
+    listed = exec_("python", "-c", "import os; print(sorted(os.listdir('/app/docparse')))")
+    expected = sorted(p.name for p in (REPO / "docparse").glob("*.py"))
+    assert listed.stdout.decode().strip() == str(expected)  # every module, and no Dockerfile or cache
 
 
 def test_the_docparse_image_extracts_a_job_on_its_parse_root(docparse) -> None:

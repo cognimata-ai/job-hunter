@@ -5,10 +5,14 @@ no real CV and no real person's data is ever used (§12, privacy rules).
 
 - `minimal_pdf(lines)`: a hand-written PDF 1.4 whose pages show `lines` in Helvetica (WinAnsiEncoding), at
   most `lines_per_page` lines per page, so `len(lines)` and `lines_per_page` set the page count;
+- `replacement_char_pdf(lines)`: as `minimal_pdf`, with a font whose ToUnicode map reads every "€" of `lines`
+  as U+FFFD, as a PDF with a broken text map reads;
 - `image_only_pdf()`: a one-page PDF 1.4 holding a single grey image and no text at all (a scanned CV);
 - `docx_bytes(paragraphs, table=None, *, macro=False)`: a minimal DOCX built with `zipfile`; the `table` rows
   follow the first paragraph, so a reader that keeps document order puts its cells between the paragraphs.
-  `macro=True` makes it a macro-enabled document (`word/vbaProject.bin`, the macroEnabled main part type).
+  `macro=True` makes it a macro-enabled document (`word/vbaProject.bin`, the macroEnabled main part type);
+- `docx_of_body(body)`: the same package around a hand-written `<w:body>` content (merged cells, nested
+  tables), with `paragraph_xml(text)` for its paragraphs.
 
 `docparse_root` is a parse_jobs root (mode 2770, as the tmpfs of §12.2) served by a `docparse.worker.serve`
 loop thread for the length of a test; it needs the `docparse` group (`uv run --group docparse pytest`).
@@ -90,15 +94,31 @@ def _pages_pdf(contents: Sequence[bytes], resources: bytes, extra: Sequence[byte
     return _pdf(objects)
 
 
-def minimal_pdf(lines: Sequence[str], *, lines_per_page: int = 50) -> bytes:
-    """A text PDF of `lines` (cp1252 text), `lines_per_page` to a page; no lines give one empty page."""
+_HELVETICA: Final = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding"
+# Printable ASCII as itself, and the code of "€" in WinAnsiEncoding (0x80) as U+FFFD.
+_FFFD_CMAP: Final = b"""/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Synthetic def
+/CMapType 2 def 1 begincodespacerange <00> <FF> endcodespacerange
+1 beginbfrange <20> <7E> <0020> endbfrange 1 beginbfchar <80> <FFFD> endbfchar
+endcmap CMapName currentdict /CMap defineresource pop end end"""
+
+
+def _text_pdf(lines: Sequence[str], lines_per_page: int, fonts: Sequence[bytes]) -> bytes:
     chunks = [lines[i : i + lines_per_page] for i in range(0, len(lines), lines_per_page)] or [[]]
     contents = []
     for chunk in chunks:
         shown = b" T* ".join(_pdf_string(line) + b" Tj" for line in chunk)
         contents.append(b"BT /F1 11 Tf %d TL %d %d Td %s ET" % (_LEADING, _LEFT, _TOP, shown))
-    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
-    return _pages_pdf(contents, b"<< /Font << /F1 3 0 R >> >>", [font])
+    return _pages_pdf(contents, b"<< /Font << /F1 3 0 R >> >>", fonts)
+
+
+def minimal_pdf(lines: Sequence[str], *, lines_per_page: int = 50) -> bytes:
+    """A text PDF of `lines` (cp1252 text), `lines_per_page` to a page; no lines give one empty page."""
+    return _text_pdf(lines, lines_per_page, [_HELVETICA + b" >>"])
+
+
+def replacement_char_pdf(lines: Sequence[str]) -> bytes:
+    """A one-page text PDF of `lines` (ASCII and "€") whose ToUnicode map (object 4) reads "€" as U+FFFD."""
+    return _text_pdf(lines, len(lines) or 1, [_HELVETICA + b" /ToUnicode 4 0 R >>", _stream(b"", _FFFD_CMAP)])
 
 
 def image_only_pdf() -> bytes:
@@ -117,7 +137,8 @@ _MAIN_TYPE: Final = "application/vnd.openxmlformats-officedocument.wordprocessin
 _MACRO_MAIN_TYPE: Final = "application/vnd.ms-word.document.macroEnabled.main+xml"
 
 
-def _paragraph(text: str) -> str:
+def paragraph_xml(text: str) -> str:
+    """A `<w:p>` of `text`, for `docx_of_body`."""
     return f'<w:p><w:r><w:t xml:space="preserve">{escape(text)}</w:t></w:r></w:p>'
 
 
@@ -125,7 +146,7 @@ def _table(rows: Sequence[Sequence[str]]) -> str:
     columns = max((len(row) for row in rows), default=0)
     grid = "".join("<w:gridCol/>" for _ in range(columns))
     body = "".join(
-        "<w:tr>" + "".join(f"<w:tc>{_paragraph(cell)}</w:tc>" for cell in row) + "</w:tr>" for row in rows
+        "<w:tr>" + "".join(f"<w:tc>{paragraph_xml(cell)}</w:tc>" for cell in row) + "</w:tr>" for row in rows
     )
     return f"<w:tbl><w:tblPr/><w:tblGrid>{grid}</w:tblGrid>{body}</w:tbl>"
 
@@ -134,12 +155,17 @@ def docx_bytes(
     paragraphs: Sequence[str], table: Sequence[Sequence[str]] | None = None, *, macro: bool = False
 ) -> bytes:
     """A DOCX of `paragraphs`, with `table` (rows of cell texts) after the first paragraph."""
-    blocks = [_paragraph(text) for text in paragraphs]
+    blocks = [paragraph_xml(text) for text in paragraphs]
     if table is not None:
         blocks.insert(min(1, len(blocks)), _table(table))
+    return docx_of_body("".join(blocks), macro=macro)
+
+
+def docx_of_body(body: str, *, macro: bool = False) -> bytes:
+    """A DOCX whose `<w:body>` holds `body` (WordprocessingML, prefix `w`), then the section properties."""
     document = (
         f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document xmlns:w="{_W}"><w:body>'
-        + "".join(blocks)
+        + body
         + "<w:sectPr/></w:body></w:document>"
     )
     content_types = (

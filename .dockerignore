@@ -15,3 +15,6 @@ frontend/dist
 .fixtures-raw
 # Local model downloads (embedder/download_model.sh, spike V7): the embedder image downloads its own at build.
 .model-cache
+# docparse/Dockerfile copies the docparse/ package whole; its build file is not part of the package. (Docker
+# still reads it: an ignored Dockerfile is only kept out of COPY.)
+docparse/Dockerfile

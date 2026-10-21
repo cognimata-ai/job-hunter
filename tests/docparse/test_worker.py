@@ -5,6 +5,7 @@ Run with `uv run --group docparse pytest -W error -m docparse tests/docparse`. T
 child live in `tests.docparse.conftest`, which the spawn child imports by module path.
 """
 
+import errno
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from tests.docparse.conftest import (
     report_inherited,
     result_of,
     sleeper,
+    stall_mid_answer,
 )
 from tests.support.profile import DOCX_MIME, PDF_MIME, docx_bytes, minimal_pdf
 
@@ -98,6 +100,53 @@ def test_the_child_is_a_fresh_spawned_interpreter_never_a_fork_of_the_loop(tmp_p
     job = make_job(tmp_path, minimal_pdf(["Max Mustermann"]), PDF_MIME)
     run_job(job, extractor=report_inherited)
     assert (job / "text.txt").read_text(encoding="utf-8") == "inherited=False"
+
+
+def test_a_child_that_stops_mid_answer_is_ended_at_the_deadline(tmp_path) -> None:
+    job = make_job(tmp_path, minimal_pdf(["Max Mustermann"]), PDF_MIME)
+    limits = Limits(cpu_s=30, as_bytes=768 * 2**20, wall_s=1)
+    # In a daemon thread: a loop that waited for the rest of the answer for ever fails here, never hangs.
+    runner = threading.Thread(
+        target=run_job, args=(job,), kwargs={"extractor": stall_mid_answer, "limits": limits}
+    )
+    runner.daemon = True
+    runner.start()
+    runner.join(LIMIT_WAIT_S)
+    assert not runner.is_alive(), "the loop still waits for the rest of the answer"
+    assert result_of(job)["code"] == "parse_limit" and not (job / "text.txt").exists()
+
+
+def no_pipe_for_the_child(monkeypatch) -> None:
+    """The first os.pipe (the answer pipe) is made; the next, inside child.start(), fails with EMFILE."""
+    real_pipe, calls = os.pipe, []
+
+    def pipe() -> tuple[int, int]:
+        calls.append(1)
+        if len(calls) > 1:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_pipe()
+
+    monkeypatch.setattr(os, "pipe", pipe)
+
+
+@pytest.mark.parametrize("failure", ["unpicklable", "emfile"])
+def test_a_child_that_cannot_start_gives_a_parse_error_at_once(
+    tmp_path, monkeypatch, caplog, failure
+) -> None:
+    caplog.set_level(logging.INFO)
+    job = make_job(tmp_path, minimal_pdf(["Max Mustermann"]), PDF_MIME)
+    if failure == "emfile":
+        no_pipe_for_the_child(monkeypatch)
+        run_job(job, extractor=mark)
+    else:
+        run_job(job, extractor=lambda path, mime: mark(path, mime))  # a lambda never reaches a spawn child
+    monkeypatch.undo()
+    assert result_of(job)["code"] == "parse_error" and not list(job.glob("ran-*"))
+    failed = [
+        r.getMessage() for r in caplog.records if r.name == "docparse" and "child_failed" in r.getMessage()
+    ]
+    error = "OSError" if failure == "emfile" else "AttributeError"  # "Can't pickle local object"
+    assert failed == [f"docparse.child_failed job_id={job.name} error={error}"]
 
 
 def test_a_failing_parse_is_a_parse_error_and_only_its_job_id_and_code_are_logged(

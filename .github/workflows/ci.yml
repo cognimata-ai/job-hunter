@@ -175,8 +175,9 @@ jobs:
         with:
           version: "0.13.1"
       # Without the project itself: it is installed editable and is not on PyPI, so `pip-audit --strict` cannot
-      # audit it and fails the run. `--no-sync` keeps `uv run` from installing it again.
-      - run: uv sync --frozen --no-install-project
+      # audit it and fails the run. `--no-sync` keeps `uv run` from installing it again. With the docparse
+      # group: its parsers read untrusted files (§12.2).
+      - run: uv sync --frozen --no-install-project --group docparse
       - run: uv run --no-sync pip-audit --strict
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:

@@ -23,10 +23,13 @@ group 10011 that only the worker and docparse mount (§19.1), so the plaintext n
 fork (a fork from a multi-threaded process warns on Python 3.12+, and the worker's tests serve this loop
 from a thread). The child imports its extractor by module path. It lowers RLIMIT_CPU, RLIMIT_AS and
 RLIMIT_CORE before it opens the file, silences logging and warnings (a parser's message can quote the
-document), and answers over a one-way `os.pipe` with JSON, never a pickle (it has read a hostile file). A
-child ended by a limit gives `parse_limit`: SIGXCPU or SIGKILL, a MemoryError, the wall-clock bound
-`Limits.wall_s` (a parse that blocks without using CPU), or an answer over `MAX_ANSWER_BYTES`. Any other
-failure gives `parse_error`.
+document), and answers over a one-way `os.pipe` with JSON, never a pickle (it has read a hostile file): the
+answer is everything it writes before its end of the pipe closes, and it counts only when the child then
+exits with status 0. The loop reads it against one deadline, `SPAWN_MARGIN_S` plus `Limits.wall_s` after the
+start, however the bytes arrive, and kills the child when it overruns. A child ended by a limit gives
+`parse_limit`: SIGXCPU or SIGKILL, a MemoryError, the deadline (a parse that blocks without using CPU, or one
+that stops mid-answer), or an answer over `MAX_ANSWER_BYTES`. Any other failure gives `parse_error`, also a
+child that cannot be started at all (EMFILE, ENOMEM): the job is never left without a result.
 
 **The loop.** `serve` scans the root every 0.2 s, the oldest request first, one job at a time (a child may
 take 768 MiB of the container's 1 GiB), until `stop` is set; one job's failure never ends it. It opens no
@@ -43,6 +46,7 @@ import resource
 import signal
 import sys
 import threading
+import time
 import warnings
 from collections.abc import Callable
 from contextlib import suppress
@@ -76,13 +80,19 @@ TYPE_METHODS: Final[dict[str, ResultMethod]] = {PDF_MIME: "pypdf", DOCX_MIME: "d
 # container's memory.
 MAX_ANSWER_BYTES: Final = 16 * 2**20
 _LIMIT_SIGNALS: Final = frozenset({-signal.SIGXCPU, -signal.SIGKILL})
-_EXIT_JOIN_S: Final = 5.0
+_READ_CHUNK: Final = 2**16
+# The child's start (a fresh interpreter importing docparse) before `Limits.wall_s` begins, and the wait for
+# its exit after an answer or a kill. With the default wall_s they stay below the client's 60 s timeout
+# (tests/integration/test_parse_client.py pins it), so a stuck parse answers parse_limit, not a timeout.
+SPAWN_MARGIN_S: Final = 2.0
+EXIT_JOIN_S: Final = 5.0
 
 
 @dataclass(frozen=True)
 class Limits:
     """The child's limits: CPU seconds (RLIMIT_CPU), address space in bytes (RLIMIT_AS), and the wall-clock
-    seconds the loop waits for an answer before it kills the child."""
+    seconds, after `SPAWN_MARGIN_S` for its start, within which its whole answer must arrive before the loop
+    kills it."""
 
     cpu_s: int
     as_bytes: int
@@ -179,25 +189,33 @@ def _child(sender: Connection, extractor: Extractor, request: _Request, limits: 
     except BaseException:  # noqa: BLE001 - a hostile parse's failure is its code; its message may quote the CV
         answer = {"code": "parse_error"}
     with suppress(BaseException):  # no answer is an answer too: the loop reads the exit status
-        sender.send_bytes(json.dumps(answer).encode("ascii"))
+        view = memoryview(json.dumps(answer).encode("ascii"))
+        while view:
+            view = view[os.write(sender.fileno(), view) :]
     sender.close()
 
 
-def _receive(receiver: Connection, wall_s: float) -> bytes | Literal["ended", "broken", "timeout"]:
-    if not receiver.poll(wall_s):
-        return "timeout"
-    try:
-        return receiver.recv_bytes(MAX_ANSWER_BYTES)
-    except EOFError:
-        return "ended"  # the child ended without an answer
-    except OSError:
-        return "broken"  # an answer over MAX_ANSWER_BYTES, or one cut off by the child's end
+def _receive(receiver: Connection, deadline: float) -> bytes | Literal["timeout", "oversize"]:
+    """Everything the child writes until its end of the pipe closes, read against `deadline` (monotonic):
+    a child that stops mid-answer is a timeout, not a loop that waits for ever."""
+    fd = receiver.fileno()
+    answer = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not receiver.poll(remaining):
+            return "timeout"
+        chunk = os.read(fd, _READ_CHUNK)  # readable: it does not block
+        if not chunk:
+            return bytes(answer)  # the child's end closed
+        answer += chunk
+        if len(answer) > MAX_ANSWER_BYTES:
+            return "oversize"
 
 
 def _reap(child: multiprocessing.process.BaseProcess, *, kill: bool) -> int | None:
     if kill:
         child.kill()
-    child.join(_EXIT_JOIN_S)
+    child.join(EXIT_JOIN_S)
     if child.exitcode is None:  # answered, but still running
         child.kill()
         child.join()
@@ -211,7 +229,7 @@ def _answer_outcome(answer: bytes, method: ResultMethod, mode: Mode) -> _Outcome
     `parse_error`."""
     try:
         payload = json.loads(answer)
-    except ValueError:
+    except (ValueError, RecursionError):
         return _Outcome("parse_error", method)
     if not isinstance(payload, dict):
         return _Outcome("parse_error", method)
@@ -236,12 +254,16 @@ def _run_child(request: _Request, extractor: Extractor, limits: Limits) -> _Outc
     with receiver:
         with sender:  # the child holds its own copy: the receiver sees EOF once the child has ended
             child.start()
-        answer = _receive(receiver, limits.wall_s)
-    # A child still running after a timeout or an oversized answer is killed, so its status is SIGKILL's.
-    exitcode = _reap(child, kill=answer in ("timeout", "broken"))
-    if isinstance(answer, bytes):
-        return _answer_outcome(answer, method, request.mode)
-    return _Outcome("parse_limit" if exitcode in _LIMIT_SIGNALS else "parse_error", method)
+        answer: bytes | Literal["timeout", "oversize"] = "timeout"  # if the read fails, the child is killed
+        try:
+            answer = _receive(receiver, time.monotonic() + SPAWN_MARGIN_S + limits.wall_s)
+        finally:
+            exitcode = _reap(child, kill=not isinstance(answer, bytes))
+    if not isinstance(answer, bytes):
+        return _Outcome("parse_limit", method)  # killed at the deadline or for the size of its answer
+    if exitcode != 0:  # ended without its whole answer: what ended it decides
+        return _Outcome("parse_limit" if exitcode in _LIMIT_SIGNALS else "parse_error", method)
+    return _answer_outcome(answer, method, request.mode)
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -282,7 +304,14 @@ def run_job(
     if not claim(job_dir):
         return
     request = _read_request(job_dir / CLAIMED)
-    outcome = request if isinstance(request, _Outcome) else _run_child(request, extractor, limits)
+    if isinstance(request, _Outcome):
+        outcome = request
+    else:
+        try:
+            outcome = _run_child(request, extractor, limits)
+        except Exception as exc:  # noqa: BLE001 - a child that cannot run is the job's parse_error; class only
+            log.error("docparse.child_failed job_id=%s error=%s", job_dir.name, type(exc).__name__)
+            outcome = _Outcome("parse_error", TYPE_METHODS[request.mime])
     _publish(job_dir, outcome)
     status = "ok" if outcome.code is None else "error"
     log.info("docparse.job_done job_id=%s status=%s code=%s", job_dir.name, status, outcome.code or "-")
