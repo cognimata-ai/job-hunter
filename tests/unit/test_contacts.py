@@ -853,6 +853,14 @@ def test_a_personal_span_takes_the_rest_of_a_number_that_runs_out_of_it(text: st
         ("https://example.org/a\u2013+49 30 23125456", "[URL][PHONE]"),
         ("linkedin.com/in/max-mustermann-030 23125456", "[URL][PHONE]"),
         ("linkedin.com/in/max-mustermann-12345 und mehr", "[URL] und mehr"),
+        # ... and only before a real e-mail address: an `@` with no address after it leaves the URL whole.
+        ("linkedin.com/in/maxmustermann@maxmuster", "[URL]@maxmuster"),
+        ("xing.com/profile/Max_Mustermann@", "[URL]@"),
+        (
+            "LinkedIn: linkedin.com/in/max-mustermann@maxmuster (Twitter)",
+            "LinkedIn: [URL]@maxmuster (Twitter)",
+        ),
+        ("github.com/maxmustermann/max@example.org", "[URL]/[EMAIL]"),
     ],
 )
 def test_what_a_false_positive_fix_leaves_in_place_does_not_hide_a_glued_contact(
@@ -1551,6 +1559,14 @@ REGRESSION_CASES = [
     # found by the differential check against 1381d69: the run-on of a cut swallowed a label at the cut
     ("Familienstand: " + "x" * 198 + "geb.01.02.1990 in Musterstadt", "Musterstadt", "personal"),
     ("Geburtsort\n" + "y" * 200 + "geb.01.02.1990 in Musterstadt", "Musterstadt", "personal"),
+    # round 5: a URL followed by an `@` and no e-mail address stays whole (D11 cut only before a real address)
+    ("linkedin.com/in/maxmustermann@maxmuster", "maxmustermann", "url"),
+    ("github.com/maxmustermann@maxmuster", "maxmustermann", "url"),
+    ("www.max-mustermann.de@maxmuster", "max-mustermann", "url"),
+    ("xing.com/profile/Max_Mustermann@", "Max_Mustermann", "url"),
+    ("LinkedIn: linkedin.com/in/max-mustermann@maxmuster (Twitter)", "max-mustermann", "url"),
+    ("github.com/max@foo", "max", "url"),
+    ("linkedin.com/in/max@x", "max", "url"),
 ]
 
 

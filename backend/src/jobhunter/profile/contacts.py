@@ -817,14 +817,16 @@ _LOCAL_PART_END: Final = re.compile(r"[\w.%+\-]{1,64}\Z")
 def _url_spans(text: str) -> Iterator[Span]:
     """The URLs. A URL that runs into an e-mail address or a phone number glued to it ends before it, so the
     address or the number keeps its own claim and no part of it is left in the clear: `github.com/max/geb.a`
-    before `@b.de`, `https://example.org/a\u2013+49 30 ...` (the number goes on past the URL)."""
+    before `@b.de`, `https://example.org/a\u2013+49 30 ...` (the number goes on past the URL). An `@` after a
+    URL with no e-mail address after it (`linkedin.com/in/max@x`) leaves the URL whole."""
     position = 0
     while (m := _URL.search(text, position)) is not None:
         start, end = m.span()
         cut = end
-        local = _LOCAL_PART_END.search(text, max(start, end - 64), end) if text.startswith("@", end) else None
-        if local is not None:
-            cut = local.start()
+        if text.startswith("@", end):
+            local = _LOCAL_PART_END.search(text, max(start, end - 64), end)
+            if local is not None and _EMAIL.match(text, local.start()) is not None:
+                cut = local.start()
         else:
             for p in range(max(start + 1, end - 16), end):
                 if text[p] in "+0" and not text[p - 1].isdigit():
