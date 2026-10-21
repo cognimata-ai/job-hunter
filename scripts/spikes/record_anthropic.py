@@ -34,14 +34,26 @@ that has an entry is never sent again, and the first unexpected outcome stops th
   `anthropic-organization-id` and `cf-ray` are removed) in `<schema12>.headers.json`.
   `<schema12>.components.json` holds the byte size of each rendered component of the sent request (system
   blocks, messages, the `output_config` schema as canonical JSON) and the recorded usage, so a payload test
-  can compute the recording's input bound without the request capture.
+  can compute the recording's input bound without the request capture; a native-PDF call's also holds its
+  `native_pdf_count_tokens` and its `input_tokens_bound`.
+- A spike whose module sets `RECORD_EVERY_ANSWER = True` (V4: the dry-run replays each case's live result,
+  controller ruling R7-3) commits whatever answer a call got and goes on to its next call: a completed stream
+  whatever its stop reason, or an error response, whose body is committed without its `request_id` at the same
+  path (its status and `content-type` in `<schema12>.headers.json`, and no sidecar: an error has no usage). It
+  still counts every send first and never sends a case twice. `--commit-recorded` writes that committed error
+  answer from the raw capture of a counted case (one answered before its spike recorded every answer); it
+  sends nothing and needs no key.
 
 **Spikes.** A spike is a module next to this one (`SPIKE_MODULES`) that sends nothing itself: `calls()` gives
 its calls in order, as dicts with `case`, `purpose`, `model`, `effort`, `max_tokens`, `system` (a list of
 texts), `user` (the one user message: a text, or a list of content blocks with an explicit
-`input_tokens_bound`), `schema` (a JSON schema dict) and optionally `extra_usd` (a decimal string) and
-`input_tokens_bound`; `check(observation)` returns the spike's verdict of one call (field paths, never
-content). V13 is `v13_structured_stream.py`; Task 7 adds V4 and V19.
+`input_tokens_bound` or `native_pdf_count_tokens`), `schema` (a JSON schema dict, or a Pydantic model as the
+gateway passes its node's: langchain needs a `title` on a dict schema, which is then sent too) and optionally
+`extra_usd` (a decimal string), `input_tokens_bound` and `native_pdf_count_tokens` (the call's `count_tokens`:
+its bound is `bounds.native_pdf_bound` of it); `check(observation)` returns the spike's verdict of one call
+(field paths, never content). V13 is `v13_structured_stream.py`, V4 `v4_schema_dry_run.py` and V19
+`v19_token_bound.py`. `counting_gateway(key)` gives the spikes a gateway for the free
+`messages.count_tokens` endpoint, with the key mapped as a live run maps it.
 
 `--dry-run` sends nothing, needs no key and writes nothing: it prints the plan, each call's input bound and
 worst case, the budget the live run would meet, and the request each call would send, built by the same code
@@ -59,7 +71,7 @@ import shutil
 import sys
 import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -71,12 +83,14 @@ import anthropic
 import httpx2
 from jobhunter.config import AppConfig, load_config
 from jobhunter.llm import bounds, fake, pricing
-from jobhunter.llm.gateway import _chat
+from jobhunter.llm.cache_monitor import CacheMonitor
+from jobhunter.llm.gateway import LLMGateway, _chat
 from jobhunter.llm.transport import ANTHROPIC_BASE_URL, make_http_client
 from jobhunter.observability.logging import configure_logging
 from jobhunter.observability.redact import register_secret_values
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
+from sqlalchemy.ext.asyncio import create_async_engine
 
 HERE: Final = Path(__file__).resolve().parent
 REPO: Final = HERE.parents[1]
@@ -115,15 +129,21 @@ class PlannedCall:
     max_tokens: int
     system: tuple[str, ...]
     user: str | tuple[Mapping[str, Any], ...]
-    schema: Mapping[str, Any]
+    schema: Mapping[str, Any] | type[BaseModel]
     extra_usd: Decimal = Decimal(0)
     bound_override: int | None = None
+    native_pdf_count_tokens: int | None = None
 
     @property
     def transformed_schema(self) -> dict[str, Any]:
+        """The `output_config.format.schema` the call sends."""
+        if isinstance(self.schema, type):
+            return anthropic.transform_schema(self.schema)
         return anthropic.transform_schema(copy.deepcopy(dict(self.schema)))
 
     def input_tokens_bound(self) -> int:
+        if self.native_pdf_count_tokens is not None:
+            return bounds.native_pdf_bound(self.model, self.native_pdf_count_tokens)
         if self.bound_override is not None:
             return self.bound_override
         if not isinstance(self.user, str):
@@ -169,6 +189,10 @@ def plan(spike: str, module: ModuleType) -> list[PlannedCall]:
         if model not in pricing.MODELS or effort not in pricing.SUPPORTED_EFFORTS[model]:
             raise ValueError(f"{spike} {raw['case']}: model {model!r} with effort {effort!r} is not allowed")
         user = raw["user"] if isinstance(raw["user"], str) else tuple(raw["user"])
+        if raw.get("input_tokens_bound") is not None and raw.get("native_pdf_count_tokens") is not None:
+            raise ValueError(
+                f"{spike} {raw['case']}: an input_tokens_bound or a native_pdf_count_tokens, not both"
+            )
         calls.append(
             PlannedCall(
                 spike=spike,
@@ -182,6 +206,7 @@ def plan(spike: str, module: ModuleType) -> list[PlannedCall]:
                 schema=raw["schema"],
                 extra_usd=Decimal(str(raw.get("extra_usd", "0"))),
                 bound_override=raw.get("input_tokens_bound"),
+                native_pdf_count_tokens=raw.get("native_pdf_count_tokens"),
             )
         )
     if len({c.case for c in calls}) != len(calls):
@@ -231,7 +256,12 @@ class Budget:
         return sum((Decimal(str(e["settled_usd"])) for e in self.entries if e.get("settled_usd")), Decimal(0))
 
     def has(self, call: PlannedCall) -> bool:
-        return any(e.get("spike") == call.spike and e.get("case") == call.case for e in self.entries)
+        return self.entry(call) is not None
+
+    def entry(self, call: PlannedCall) -> dict[str, Any] | None:
+        """The counted entry of `call`, if it has one."""
+        same = (e for e in self.entries if e.get("spike") == call.spike and e.get("case") == call.case)
+        return next(same, None)
 
     def refusal(self, call: PlannedCall, worst_case: Decimal) -> str | None:
         """Why `call` must not be sent, or None."""
@@ -325,6 +355,21 @@ def _worker_config(key: str) -> AppConfig:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+@asynccontextmanager
+async def counting_gateway(key: str) -> AsyncIterator[LLMGateway]:
+    """A gateway for the free `messages.count_tokens` endpoint (V4's probe, V19): the key mapped as a live run
+    maps it and registered with the log redaction, a direct connection to the API, and an engine that is never
+    connected (a count reserves nothing). Its owner must never call `LLMGateway.call` on it."""
+    register_secret_values([key])
+    cfg = _worker_config(key)
+    engine = create_async_engine("postgresql+psycopg://unused@127.0.0.1:1/unused")
+    try:
+        async with make_http_client(cfg, mount=httpx2.AsyncHTTPTransport()) as client:
+            yield LLMGateway(engine, cfg, http_client=client, cache=CacheMonitor())
+    finally:
+        await engine.dispose()
+
+
 def _without_key(data: bytes, key: str) -> bytes:
     return data.replace(key.encode("utf-8"), b"[secret:" + KEY_VAR.encode() + b"]") if key else data
 
@@ -407,7 +452,7 @@ async def _send(call: PlannedCall, cfg: AppConfig, inner: httpx2.AsyncBaseTransp
             call.model,
             call.effort,
             call.max_tokens,
-            dict(call.schema),
+            call.schema if isinstance(call.schema, type) else dict(call.schema),
             api_key=SecretStr(key),
             http_client=client,
             purpose=call.purpose,
@@ -638,6 +683,8 @@ class Recorder:
         stop_reason = next(
             (e.data["delta"].get("stop_reason") for e in events if e.name == "message_delta"), None
         )
+        every_answer = self.records_every_answer
+        error_answer = every_answer and not streamed and status is not None and status >= 400
         entry.update(
             state="done",
             status=status,
@@ -654,19 +701,73 @@ class Recorder:
             f"error={outcome.error} worst_case_usd={entry['worst_case_usd']} settled_usd={settled} "
             f"{budget.left()}"
         )
+        if error_answer and status is not None and capture.request is not None:
+            # The spike records every answer (V4): this error is the case's live result; the spike goes on.
+            self._record_error(
+                call, capture.request["body"], status, capture.headers, bytes(capture.body), key
+            )
+            return True
         if not complete or outcome.error is not None or usage is None:
+            if every_answer:
+                self.say(f"{call.spike} {call.case} no answer to record; the spike goes on")
+                return True
             return False
         observation = self._observation(call, events, capture, outcome)
         report = self.module.check(observation)
         _atomic_write(raw_dir / f"{call.case}.check.json", _json(report, key))
         self.say(f"{call.spike} {call.case} check missing={report.get('missing')}")
-        # Only a turn that ended and parsed is the stored `ok` stream of the fake.
+        # Only a turn that ended and parsed is the stored `ok` stream of the fake, unless the spike records
+        # every answer.
         parsed = observation["parsed_ok"]
-        if stop_reason != "end_turn" or not parsed:
+        if (stop_reason != "end_turn" or not parsed) and not every_answer:
             self.say(f"{call.spike} {call.case} not committed: stop_reason={stop_reason} parsed={parsed}")
             return False
         self._commit(call, events, capture, usage, key)
         return True
+
+    @property
+    def records_every_answer(self) -> bool:
+        return getattr(self.module, "RECORD_EVERY_ANSWER", False) is True
+
+    def _record_error(
+        self,
+        call: PlannedCall,
+        request_body: Mapping[str, Any],
+        status: int,
+        headers: Mapping[str, str],
+        body: bytes,
+        key: str,
+    ) -> None:
+        """Check an error answer and commit it as the fake's answer of the call."""
+        report = self.module.check(self._error_observation(call, request_body, status, body))
+        _atomic_write(self.root / "anthropic" / call.spike / f"{call.case}.check.json", _json(report, key))
+        self.say(f"{call.spike} {call.case} answer {status} recorded; check missing={report.get('missing')}")
+        self._commit_error(call, request_body, status, headers, body, key)
+
+    def commit_recorded(self) -> int:
+        """`--commit-recorded`: commit the fake's answer of each counted case of a spike that records every
+        answer, whose raw capture is an error response; nothing is sent and no key is read."""
+        if not self.records_every_answer:
+            self.say(f"{self.spike}: REFUSED, the spike does not record every answer; nothing written")
+            return REFUSED
+        with exclusive(self.root) as held:
+            if not held:
+                self.say(
+                    f"{self.spike}: LOCKED, another recorder holds {self.root / 'anthropic-budget.lock'}"
+                )
+                return LOCKED
+            budget = Budget(self.root)
+            raw_dir = self.root / "anthropic" / self.spike
+            for call in self.calls:
+                entry = budget.entry(call) or {}
+                status = entry.get("status")
+                if entry.get("state") != "done" or not isinstance(status, int) or status < 400:
+                    continue
+                request = json.loads((raw_dir / f"{call.case}.request.json").read_text("utf-8"))
+                response = json.loads((raw_dir / f"{call.case}.response.headers.json").read_text("utf-8"))
+                body = (raw_dir / f"{call.case}.response.json").read_bytes()
+                self._record_error(call, request["body"], status, response["headers"], body, "")
+            return OK
 
     def _commit(
         self,
@@ -700,7 +801,49 @@ class Recorder:
             },
             "usage": usage,
         }
+        if call.native_pdf_count_tokens is not None:
+            components["native_pdf_count_tokens"] = call.native_pdf_count_tokens
+            components["input_tokens_bound"] = call.input_tokens_bound()
         _atomic_write(path.with_suffix(".components.json"), _json(components, key))
+
+    def _commit_error(
+        self,
+        call: PlannedCall,
+        request_body: Mapping[str, Any],
+        status: int,
+        headers: Mapping[str, str],
+        body: bytes,
+        key: str,
+    ) -> None:
+        """The fake's answer of an error response: its JSON body without the `request_id`, and its status and
+        `content-type`; no sidecar (an error carries no usage)."""
+        schema = request_body["output_config"]["format"]["schema"]
+        path = fake.recording_path(self.fixtures_out, call.purpose, call.model, schema)
+        error = json.loads(body)
+        if not isinstance(error, dict):
+            raise ValueError("an error response that is no JSON object")
+        error.pop("request_id", None)
+        _atomic_write(path, _json(error, key))
+        kept = {k: v for k, v in headers.items() if k.lower() in COMMITTED_HEADERS}
+        _atomic_write(path.with_suffix(".headers.json"), _json({"status": status, "headers": kept}, key))
+
+    @staticmethod
+    def _error_observation(
+        call: PlannedCall, request_body: Mapping[str, Any], status: int, body: bytes
+    ) -> dict[str, Any]:
+        try:
+            error = json.loads(body)
+        except ValueError:
+            error = None
+        detail = error.get("error", {}) if isinstance(error, dict) else {}
+        return {
+            "requested_model": call.model,
+            "transformed_schema": call.transformed_schema,
+            "request": request_body,
+            "status": status,
+            "error_type": detail.get("type"),
+            "error_message": detail.get("message"),
+        }
 
     @staticmethod
     def _observation(
@@ -734,6 +877,7 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
+    mode.add_argument("--commit-recorded", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -784,6 +928,8 @@ def main(
         )
         if args.dry_run:
             return asyncio.run(recorder.dry_run())
+        if args.commit_recorded:
+            return recorder.commit_recorded()
         key = env.get(KEY_VAR, "").strip()
         if not key:
             print(f"{args.spike}: REFUSED, {KEY_VAR} is not set; nothing sent", file=stream)

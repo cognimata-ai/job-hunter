@@ -32,7 +32,10 @@ stream; without a scenario every try is `ok`):
   had stripped the constraint from the schema;
 - `set_invalid`: a structurally valid queries body (§11.12) with `SET_INVALID_ITEMS` (5) items.
 `count_tokens(result)` sets the answer of `POST /v1/messages/count_tokens`, a JSON endpoint: `{"input_tokens":
-result}`, or a 500 `api_error` for `"error"`; without an answer it is a 404. A count is no message try.
+result}`, or a 500 `api_error` for `"error"`. Without an answer set, a recorded one is served: the
+`{"status", "body"}` of `root/count_tokens/<model>/<schema12>.json` (`count_recording_path`), chosen by the
+request's `model` and `output_config.format.schema` (the schema dry-run's keyword probe, plan Task 7); without
+either it is a 404. A count is no message try.
 
 The state of a test (its scenario, the count answer, the requests served) lives in a context variable;
 `fresh_state()` gives a block its own. Outside any (a dev worker in fake mode) a process-wide state counts the
@@ -207,6 +210,14 @@ def recording_path(root: Path, purpose: str, model: str, schema: Mapping[str, An
     return root / purpose / model / f"{schema12(schema)}.sse"
 
 
+COUNT_DIR: Final = "count_tokens"
+
+
+def count_recording_path(root: Path, model: str, schema: Mapping[str, Any]) -> Path:
+    """Where the recorded `count_tokens` answer of `(model, schema)` is stored under `root`."""
+    return root / COUNT_DIR / model / f"{schema12(schema)}.json"
+
+
 # --- the per-test state ------------------------------------------------------------------------------------
 
 
@@ -346,7 +357,7 @@ class RecordedSSETransport(httpx2.AsyncBaseTransport):
         current = state()
         content = await request.aread()
         if request.method == "POST" and request.url.path == "/v1/messages/count_tokens":
-            return self._count(current)
+            return self._count(current, json.loads(content))
         if request.method != "POST" or request.url.path != "/v1/messages":
             return _error(
                 404, "not_found_error", f"fake: no route {request.method} {request.url.path}", "req_fake"
@@ -368,16 +379,32 @@ class RecordedSSETransport(httpx2.AsyncBaseTransport):
                 status = None if response is None else response.status_code
                 current.requests.append(ServedRequest(name, purpose, model, max_tokens, status, body))
 
-    def _count(self, current: FakeLLMState) -> httpx2.Response:
+    def _count(self, current: FakeLLMState, body: Mapping[str, Any]) -> httpx2.Response:
         current.count_tokens_requests += 1
         answer = current.count_tokens_answer
         if answer is None:
+            if (recorded := self._recorded_count(body)) is not None:
+                return recorded
             return _error(
                 404, "not_found_error", "fake: no count_tokens answer was set (fake.count_tokens)", "req_fake"
             )
         if answer == "error":
             return _error(500, "api_error", "fake: count_tokens failed", "req_fake")
         return httpx2.Response(200, json={"input_tokens": answer})
+
+    def _recorded_count(self, body: Mapping[str, Any]) -> httpx2.Response | None:
+        """The recorded `count_tokens` answer for the request's model and schema, if there is one."""
+        model = body.get("model")
+        schema = (body.get("output_config") or {}).get("format", {}).get("schema")
+        if not isinstance(model, str) or not _MODEL.fullmatch(model) or not isinstance(schema, dict):
+            return None
+        path = count_recording_path(self._root, model, schema)
+        if not path.is_file():
+            return None
+        recorded = json.loads(path.read_text("utf-8"))
+        return httpx2.Response(
+            int(recorded["status"]), headers={"request-id": "req_fake"}, json=recorded["body"]
+        )
 
     def _respond(
         self,

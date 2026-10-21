@@ -25,6 +25,8 @@ import anthropic
 import httpx2
 import pytest
 from jobhunter.llm import bounds, fake, pricing
+from jobhunter.llm.schemas import transformed
+from jobhunter.llm.schemas.queries import QueryProposalOut
 
 from tests.support.llm import synthetic_sse
 
@@ -429,3 +431,150 @@ def test_the_v13_check_reads_the_field_paths_and_writes_no_content(rec: ModuleTy
     assert report["response_metadata"]["model_name"] == "claude-sonnet-5-5"
     assert report["response_metadata"]["stop_reason"] == "end_turn"
     assert "Backend Engineer" not in json.dumps(report)  # field paths and flags, never the content
+
+
+# --- Task 7: every answer recorded, a recorded error committed, a native-PDF count ------------------------
+
+
+def _spike(calls: list[dict[str, Any]], *, every_answer: bool = False) -> ModuleType:
+    """A spike definition with `calls` and a check that reports nothing missing."""
+    module = ModuleType("test_spike")
+    module.calls = lambda: calls  # type: ignore[attr-defined]
+    module.check = lambda observation: {"missing": []}  # type: ignore[attr-defined]
+    if every_answer:
+        module.RECORD_EVERY_ANSWER = True  # type: ignore[attr-defined]
+    return module
+
+
+SCHEMA = transformed(QueryProposalOut)
+CALL: dict[str, Any] = {
+    "case": "plain",
+    "purpose": "schema_dry_run",
+    "model": "claude-sonnet-5-5",
+    "effort": "low",
+    "max_tokens": 1024,
+    "system": ["Synthetic system text."],
+    "user": "Synthetic user text.",
+    "schema": QueryProposalOut,  # the mirror, as the gateway passes it
+}
+ERROR = {"type": "invalid_request_error", "message": "synthetic: the compiled grammar is too large"}
+
+
+def grammar_error(request: httpx2.Request) -> httpx2.Response:
+    body = {"type": "error", "error": ERROR, "request_id": "req_0123456789abcdef"}
+    return httpx2.Response(400, headers={"request-id": "req_0123456789abcdef"}, json=body)
+
+
+def test_a_mirror_schema_is_sent_as_the_gateway_sends_it(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike([CALL]))
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", "v4", "--live") == rec.OK
+    (request,) = factory.requests
+    assert json.loads(request.content)["output_config"]["format"]["schema"] == SCHEMA  # no title added
+    sse = fake.recording_path(tmp_path / "fixtures", "schema_dry_run", "claude-sonnet-5-5", SCHEMA)
+    assert json.loads(fake.text_of(fake.parse_sse(sse.read_bytes()))) == QUERIES
+
+
+def test_a_spike_that_records_every_answer_commits_an_error_and_goes_on(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rejected = {**CALL, "case": "rejected"}
+    after = {**CALL, "case": "after", "model": "claude-opus-5-5"}
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike([rejected, after], every_answer=True))
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        is_sonnet = json.loads(request.content)["model"] == "claude-sonnet-5-5"
+        return grammar_error(request) if is_sonnet else recorded_stream(request)
+
+    assert run(rec, tmp_path, Factory(answer), "--spike", "v4", "--live") == rec.OK
+    entries = budget(tmp_path)["entries"]
+    assert [(e["case"], e["status"], e["settlement"]) for e in entries] == [
+        ("rejected", 400, "not_billed:error_response_no_content"),
+        ("after", 200, "billed"),
+    ]
+    assert Decimal(entries[0]["settled_usd"]) == 0
+    answer_path = fake.recording_path(tmp_path / "fixtures", "schema_dry_run", "claude-sonnet-5-5", SCHEMA)
+    assert json.loads(answer_path.read_text("utf-8")) == {"type": "error", "error": ERROR}
+    assert json.loads(answer_path.with_suffix(".headers.json").read_text("utf-8")) == {
+        "status": 400,
+        "headers": {"content-type": "application/json"},
+    }
+    assert not answer_path.with_suffix(".components.json").exists()  # an error carries no usage
+    assert fake.recording_path(tmp_path / "fixtures", "schema_dry_run", "claude-opus-5-5", SCHEMA).is_file()
+    assert all("req_0123456789abcdef" not in text for text in every_file(tmp_path / "fixtures"))
+
+
+def test_without_record_every_answer_an_error_still_stops_the_spike(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    two = [{**CALL, "case": "a"}, {**CALL, "case": "b"}]
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike(two))
+    assert run(rec, tmp_path, Factory(grammar_error), "--spike", "v4", "--live") == rec.STOPPED
+    assert [e["case"] for e in budget(tmp_path)["entries"]] == ["a"]  # nothing more was sent
+    assert not (tmp_path / "fixtures").exists()
+
+
+def test_commit_recorded_writes_a_counted_error_answer_from_its_raw_capture_and_sends_nothing(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # sent while the spike still stopped at an error: counted and captured raw, not committed
+    first = [{**CALL, "case": "rejected"}]
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike(first))
+    assert run(rec, tmp_path, Factory(grammar_error), "--spike", "v4", "--live") == rec.STOPPED
+    answer_path = fake.recording_path(tmp_path / "fixtures", "schema_dry_run", "claude-sonnet-5-5", SCHEMA)
+    assert not answer_path.exists()
+    # the spike records every answer now: the counted case's answer is committed, nothing is sent
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike(first, every_answer=True))
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", "v4", "--commit-recorded", environ={}) == rec.OK
+    assert factory.created == 0
+    assert json.loads(answer_path.read_text("utf-8")) == {"type": "error", "error": ERROR}
+    assert json.loads(answer_path.with_suffix(".headers.json").read_text("utf-8"))["status"] == 400
+    assert len(budget(tmp_path)["entries"]) == 1
+    assert all("req_0123456789abcdef" not in text for text in every_file(tmp_path / "fixtures"))
+
+
+def test_commit_recorded_is_refused_for_a_spike_that_stops_at_errors(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike([CALL]))
+    assert run(rec, tmp_path, Factory(recorded_stream), "--spike", "v4", "--commit-recorded") == rec.REFUSED
+
+
+def test_a_native_pdf_count_sets_the_bound_the_worst_case_and_the_sidecar(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+    }
+    call = {
+        **CALL,
+        "case": "native_pdf",
+        "purpose": "v19_native_pdf",
+        "user": [document, {"type": "text", "text": "Synthetic instruction."}],
+        "native_pdf_count_tokens": 1_800,
+        "extra_usd": "0.125",
+    }
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike([call]))
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", "v19", "--live") == rec.OK
+    (counted,) = budget(tmp_path)["entries"]
+    bound = bounds.native_pdf_bound("claude-sonnet-5-5", 1_800)
+    assert counted["input_tokens_bound"] == bound
+    assert Decimal(counted["worst_case_usd"]) == pricing.worst_case_usd(
+        "claude-sonnet-5-5", input_tokens_bound=bound, max_tokens=1024, extra_usd=Decimal("0.125")
+    )
+    (request,) = factory.requests
+    assert json.loads(request.content)["messages"][-1]["content"][0]["type"] == "document"
+    sse = fake.recording_path(tmp_path / "fixtures", "v19_native_pdf", "claude-sonnet-5-5", SCHEMA)
+    sidecar = json.loads(sse.with_suffix(".components.json").read_text("utf-8"))
+    assert (sidecar["native_pdf_count_tokens"], sidecar["input_tokens_bound"]) == (1_800, bound)
+
+
+def test_a_call_with_both_a_bound_and_a_count_is_refused(rec: ModuleType) -> None:
+    call = {**CALL, "input_tokens_bound": 5_000, "native_pdf_count_tokens": 1_800}
+    with pytest.raises(ValueError, match="not both"):
+        rec.plan("v19", _spike([call]))

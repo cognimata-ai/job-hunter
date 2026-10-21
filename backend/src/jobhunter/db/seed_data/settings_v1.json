@@ -26,6 +26,6 @@
       "extract_profile": {"max_tokens": 16000, "max_tokens_retry": 32000, "deadline_s": 900},
       "propose_queries": {"max_tokens": 8000, "max_tokens_retry": 16000, "deadline_s": 300}},
    "max_targets_per_cycle": 60, "min_cycle_targets": 10, "batch_bulk_rescore": true, "batch_min_targets": 200,
-   "batch_max_items": 1000, "bulk_rescore_max_budget_share": "0.4"},
+   "batch_max_items": 500, "bulk_rescore_max_budget_share": "0.4"},
  "llm": {"cap_usd": "100.00", "nonscoring_reserve_pct": 5, "overrun_buffer_usd": "2.00", "min_bucket_capacity_usd": "1.00"},
  "retention": {"score_history_months": 12}, "notifications": {"push_min_severity": "warn"}}

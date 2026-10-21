@@ -18,7 +18,7 @@ from jobhunter.clock import utcnow
 from jobhunter.errors import FencedOut
 from jobhunter.llm import gateway as gateway_module
 from jobhunter.llm import spend_ledger
-from jobhunter.llm.bounds import native_pdf_bound, text_input_bound
+from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS, native_pdf_bound, text_input_bound
 from jobhunter.llm.cache_monitor import CacheMonitor, write_alerts
 from jobhunter.llm.errors import (
     BudgetExhausted,
@@ -338,7 +338,8 @@ async def test_native_pdf_reserves_the_counted_bound_and_the_buffer_share(
     )
     (row,) = await tries(engine)
     bound = native_pdf_bound(MODEL, 1800)
-    assert row.input_tokens_bound == bound == 3250
+    # ceil(1.25 x 1800), plus the model's overhead
+    assert row.input_tokens_bound == bound == 2250 + PROMPT_OVERHEAD_TOKENS[MODEL]
     # the seeded month row's buffer is $2.00, so the share is $0.50
     assert row.reserved_usd == worst_case_usd(
         MODEL, input_tokens_bound=bound, max_tokens=1000, extra_usd=Decimal("0.50")

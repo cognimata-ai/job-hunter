@@ -653,6 +653,12 @@ class LLMGateway:
         self._cache = cache
         self._key = _api_key(cfg)
 
+    @property
+    def http_client(self) -> httpx2.AsyncClient:
+        """The `httpx2` client every try and every token count is sent on (the schema dry-run reads what it
+        sent there, through a request hook)."""
+        return self._http
+
     async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult:
         """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries)."""
         messages = to_messages(prompt)  # the last is a user turn: never a prefill (RenderedPrompt)

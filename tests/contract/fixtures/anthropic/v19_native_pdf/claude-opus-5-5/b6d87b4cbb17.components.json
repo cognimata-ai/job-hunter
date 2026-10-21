@@ -1,0 +1,26 @@
+{
+  "case": "native_pdf",
+  "component_bytes": {
+    "messages": [
+      75
+    ],
+    "schema": 2906,
+    "system": [
+      6096
+    ]
+  },
+  "effort": "low",
+  "input_tokens_bound": 10330,
+  "max_tokens": 1024,
+  "model": "claude-opus-5-5",
+  "native_pdf_count_tokens": 6152,
+  "purpose": "v19_native_pdf",
+  "source": "recorded",
+  "spike": "v19",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "input_tokens": 6152,
+    "output_tokens": 778
+  }
+}
