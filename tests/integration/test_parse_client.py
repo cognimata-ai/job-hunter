@@ -27,6 +27,7 @@ pytestmark = pytest.mark.integration
 
 PARSE_GID: Final = 10011  # jobhunter-parse, the group of the parse_jobs tmpfs (§19.1)
 WAIT_S: Final = 10.0
+POLL_S: Final = 0.001
 CV_LINES = [
     "Erika Musterfrau",
     "Projektleiterin",
@@ -149,14 +150,17 @@ def answer_when_published(root: Path, answer: Callable[[Path], None]) -> None:
     answer(job)
 
 
-def exchange(root: Path, answer: Callable[[Path], None], *, timeout_s: float = 10.0) -> ParseOutcome:
-    """One `extract` on `root`, answered by `answer` (docparse's half, by hand) once the request is published.
-    Both run in a daemon thread with its own event loop, so a client that blocks (on a FIFO, say) fails the
-    test instead of hanging it."""
+def exchange(
+    root: Path, answer: Callable[[Path], None], *, timeout_s: float = 10.0, data: bytes = b"%PDF-1.4"
+) -> ParseOutcome:
+    """One `extract` of `data` on `root`, answered by `answer` (docparse's half, by hand) once the request is
+    published. The client polls every millisecond, so a half-written answer would be seen. Both run in a
+    daemon thread with its own event loop, so a client that blocks (on a FIFO, say) fails the test instead of
+    hanging it."""
 
     async def run() -> ParseOutcome:
         responder = asyncio.create_task(asyncio.to_thread(answer_when_published, root, answer))
-        outcome = await ParseClient(root, timeout_s=timeout_s, poll_s=0.02).extract(b"%PDF-1.4", PDF_MIME)
+        outcome = await ParseClient(root, timeout_s=timeout_s, poll_s=POLL_S).extract(data, PDF_MIME)
         await responder
         return outcome
 
@@ -178,15 +182,27 @@ def exchange(root: Path, answer: Callable[[Path], None], *, timeout_s: float = 1
     return outcomes[0]
 
 
+def publish(path: Path, data: str | bytes, *, mode: int | None = None) -> None:
+    """`data` at `path` as docparse publishes a file: written to `<name>.tmp`, its mode set there, renamed."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data.encode() if isinstance(data, str) else data)
+    if mode is not None:
+        tmp.chmod(mode)
+    tmp.rename(path)
+
+
 def files(**contents: str | bytes) -> Callable[[Path], None]:
-    """An answer that writes `contents` (file name with "." spelled "_") in order, as docparse would."""
+    """An answer that publishes `contents` (file name with "." spelled "_") in order, as docparse would."""
 
     def answer(job: Path) -> None:
         for name, data in contents.items():
-            path = job / name.replace("_", ".")
-            path.write_bytes(data.encode() if isinstance(data, str) else data)
+            publish(job / name.replace("_", "."), data)
 
     return answer
+
+
+TEXT_CAP = 16 * 2**20  # TEXT_MAX_BYTES
+RESULT_CAP = 4096  # RESULT_MAX_BYTES
 
 
 @pytest.mark.parametrize(
@@ -206,11 +222,26 @@ def files(**contents: str | bytes) -> Callable[[Path], None]:
         (files(result_json=error_result("melted")), ParseFailed("parse_error")),
         (files(result_json="{not json"), ParseFailed("parse_error")),
         (files(result_json="[" * 3000), ParseFailed("parse_error")),  # nested past the JSON parser's depth
-        (files(result_json=ok_result(14) + " " * 5000), ParseFailed("parse_error")),  # over 4 KiB
+        # The caps, at their edges. Each refused answer is otherwise valid (a text of exactly `chars`
+        # characters, a result that is valid JSON), so only the cap refuses it.
         (
-            files(text_txt="x" * 100, result_json=ok_result(5)),
+            files(text_txt="Max Mustermann", result_json=ok_result(14).ljust(RESULT_CAP)),
+            ParseOk("Max Mustermann", "pypdf", 1),
+        ),
+        (
+            files(text_txt="Max Mustermann", result_json=ok_result(14).ljust(RESULT_CAP + 1)),
             ParseFailed("parse_error"),
-        ),  # over 4 bytes a char
+        ),
+        (
+            files(text_txt=b"x" * TEXT_CAP, result_json=ok_result(TEXT_CAP)),
+            ParseOk("x" * TEXT_CAP, "pypdf", 1),
+        ),
+        (
+            files(text_txt=b"x" * (TEXT_CAP + 1), result_json=ok_result(TEXT_CAP + 1)),
+            ParseFailed("parse_error"),
+        ),
+        # More bytes than 4 a character: refused before the length check reads them all.
+        (files(text_txt="x" * 100, result_json=ok_result(5)), ParseFailed("parse_error")),
     ],
     ids=[
         "ok",
@@ -224,8 +255,11 @@ def files(**contents: str | bytes) -> Callable[[Path], None]:
         "unknown-code",
         "not-json",
         "deep-json",
-        "result-oversized",
-        "text-oversized",
+        "result-at-4-kib",
+        "result-over-4-kib",
+        "text-at-16-mib",
+        "text-over-16-mib",
+        "text-over-4-bytes-a-char",
     ],
 )
 def test_an_answer_the_client_cannot_trust_is_a_parse_error(tmp_path, answer, expected) -> None:
@@ -246,27 +280,23 @@ def hostile(kind: str, outside: Path) -> Callable[[Path], None]:
     def answer(job: Path) -> None:
         if kind == "text-symlink":  # text.txt names a file outside the job directory
             (job / "text.txt").symlink_to(secret)
-            (job / "result.json").write_text(ok_result(len(SECRET)))
+            publish(job / "result.json", ok_result(len(SECRET)))
         elif kind == "result-symlink":
-            (job / "text.txt").write_text(SECRET)
+            publish(job / "text.txt", SECRET)
             (job / "result.json").symlink_to(outside / "result.json")
         elif kind == "result-fifo":  # opened for reading, a FIFO blocks until a writer comes
             os.mkfifo(job / "result.json")
         elif kind == "text-fifo":
             os.mkfifo(job / "text.txt")
-            (job / "result.json").write_text(ok_result(14))
+            publish(job / "result.json", ok_result(14))
         elif kind == "result-directory":
             (job / "result.json").mkdir()
-        elif kind == "text-over-16-mib":  # a `chars` that would allow any size
-            (job / "text.txt").write_bytes(b"x" * (16 * 2**20 + 1))
-            (job / "result.json").write_text(ok_result(2**40))
 
     return answer
 
 
 @pytest.mark.parametrize(
-    "kind",
-    ["text-symlink", "result-symlink", "result-fifo", "text-fifo", "result-directory", "text-over-16-mib"],
+    "kind", ["text-symlink", "result-symlink", "result-fifo", "text-fifo", "result-directory"]
 )
 def test_a_hostile_answer_is_a_parse_error_at_once_and_the_job_is_still_removed(tmp_path, kind) -> None:
     root, outside = parse_root(tmp_path), tmp_path / "outside"
@@ -281,29 +311,50 @@ def test_a_hostile_answer_is_a_parse_error_at_once_and_the_job_is_still_removed(
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file whatever its mode")
 def test_an_unreadable_result_is_a_parse_error(tmp_path) -> None:
     def answer(job: Path) -> None:
-        (job / "text.txt").write_text("Max Mustermann")
-        (job / "result.json").write_text(ok_result(14))
-        (job / "result.json").chmod(0)
+        publish(job / "text.txt", "Max Mustermann")
+        publish(job / "result.json", ok_result(14), mode=0)  # unreadable before it appears
 
     root = parse_root(tmp_path)
     assert exchange(root, answer) == ParseFailed("parse_error")
     assert list(root.iterdir()) == []
 
 
-def test_a_job_directory_swapped_for_a_symlink_is_never_read_through(tmp_path) -> None:
+def holding(root: Path, data: bytes) -> list[Path]:
+    """Every file under `root` (no symlink followed) whose content holds `data`."""
+    found = []
+    for directory, _, names in os.walk(root, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_symlink() and path.is_file() and data in path.read_bytes():
+                found.append(path)
+    return found
+
+
+def test_a_job_directory_swapped_for_a_symlink_is_never_read_through_and_its_plaintext_removed(
+    tmp_path,
+) -> None:
     root, elsewhere = parse_root(tmp_path), tmp_path / "elsewhere"
     elsewhere.mkdir()
     (elsewhere / "text.txt").write_text(SECRET)
     (elsewhere / "result.json").write_text(ok_result(len(SECRET)))
+    plaintext = minimal_pdf(["Max Mustermann", "Musterstraße 1, 12345 Musterstadt"])
 
     def answer(job: Path) -> None:
-        job.rename(job.with_name(job.name + ".moved"))
+        moved = job.with_name(job.name + ".moved")
+        job.rename(moved)
         job.symlink_to(elsewhere, target_is_directory=True)
+        (moved / "nested").mkdir()  # a parser's leftovers too, beside the decrypted input
+        (moved / "nested" / "copy.pdf").write_bytes(plaintext)
+        os.mkfifo(moved / "pipe")
+        (moved / "link").symlink_to(elsewhere / "text.txt")
 
-    # The client reads through the descriptor of the directory it made, which never gets a result.
-    assert exchange(root, answer, timeout_s=0.5) == ParseFailed("timeout")
-    assert [p.name.endswith(".moved") for p in root.iterdir()] == [True]  # only the moved directory is left
-    assert (elsewhere / "text.txt").read_text() == SECRET
+    # The client reads through the descriptor of the directory it made, which never gets a result, and
+    # empties that directory through it before it closes it.
+    assert exchange(root, answer, timeout_s=0.5, data=plaintext) == ParseFailed("timeout")
+    assert holding(root, plaintext) == []
+    [moved] = root.iterdir()  # only the moved directory, emptied: the client cannot know its new name
+    assert moved.name.endswith(".moved") and list(moved.iterdir()) == []
+    assert (elsewhere / "text.txt").read_text() == SECRET  # no link was followed
 
 
 def test_the_client_waits_longer_than_docparse_takes_for_one_job() -> None:

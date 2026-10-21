@@ -10,6 +10,7 @@ import fcntl
 import io
 import json
 import os
+import resource
 import stat
 import time
 from multiprocessing import resource_tracker
@@ -106,6 +107,15 @@ def stall_mid_answer(_path: Path, _mime: str) -> NoReturn:
             write_only = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY
             if fd > 2 and fd != tracker_fd and write_only and stat.S_ISFIFO(os.fstat(fd).st_mode):
                 os.write(fd, b'{"code": null, "method": "pypdf", "text": "Max Muster')
+    time.sleep(120)
+    os._exit(0)
+
+
+def close_all_and_linger(_path: Path, _mime: str) -> NoReturn:
+    """Closes every descriptor it inherited above the standard streams (the answer pipe, the end of the
+    process sentinel, the resource tracker's pipe), so the loop sees EOF everywhere, then stays alive without
+    using CPU: only a bounded reap that kills it ends the job."""
+    os.closerange(3, resource.getrlimit(resource.RLIMIT_NOFILE)[0])
     time.sleep(120)
     os._exit(0)
 

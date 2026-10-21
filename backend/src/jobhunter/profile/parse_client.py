@@ -10,6 +10,9 @@ alone, so a decrypted CV never reaches a disk.
   until `timeout_s`. It answers `ParseOk(text, method, page_count)` or `ParseFailed(code)`: docparse's own
   code, `timeout` when no result came in time, or `parse_error` for a result it cannot trust (below). The
   directory is removed in a `finally`, whatever the outcome, cancellation included.
+  The directory is emptied through its own descriptor first, so its content goes even when docparse has
+  moved it and planted a symlink in its place (an emptied directory under a name the client cannot know
+  then stays until the next `cleanup_leftovers`).
 - `validate(data)` is the same exchange in `validate` mode, for a PDF: encryption and page count, no text,
   so an `ok` is `ParseOk("", "pypdf", page_count)`.
 - `cleanup_leftovers()` removes every entry under the root at worker start: what a crashed worker left. A
@@ -181,6 +184,26 @@ def _read_outcome(dir_fd: int, mode: str) -> ParseOutcome | None:
     return ParseOk(text, method, page_count) if len(text) == chars else ParseFailed("parse_error")
 
 
+def _empty(dir_fd: int, job_id: str) -> None:
+    """Remove everything in the job directory through its descriptor, best effort: entries are unlinked or
+    removed fd-relative and no link is followed, so this reaches the directory the worker made even when
+    docparse has renamed it and planted a symlink in its place (§12.2: the plaintext goes in the `finally`).
+    An error is logged by its class and never raised."""
+    try:
+        names = os.listdir(dir_fd)
+    except OSError as exc:
+        log.warning("parse_job_dir_not_emptied", job_id=job_id, error=type(exc).__name__)
+        return
+    for name in names:
+        try:
+            if stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+                shutil.rmtree(name, dir_fd=dir_fd)  # fd-based, never through a symlink
+            else:
+                os.unlink(name, dir_fd=dir_fd)  # a file, a symlink itself, a FIFO
+        except (OSError, RecursionError) as exc:
+            log.warning("parse_job_entry_not_removed", job_id=job_id, error=type(exc).__name__)
+
+
 def _remove(job_dir: Path) -> None:
     # docparse may still be writing when a timeout or a cancellation removes the directory, so a file can
     # appear after rmtree listed it; removal is tried again until the directory is gone. A job directory that
@@ -223,6 +246,7 @@ class ParseClient:
             return outcome
         finally:
             if dir_fd is not None:
+                _empty(dir_fd, job_dir.name)
                 os.close(dir_fd)
             _remove(job_dir)
 

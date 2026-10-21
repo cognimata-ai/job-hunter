@@ -26,6 +26,7 @@ from tests.docparse.conftest import (
     MARKED_TEXT,
     SECRET_TEXT,
     burn,
+    close_all_and_linger,
     die,
     explode,
     flood,
@@ -114,6 +115,21 @@ def test_a_child_that_stops_mid_answer_is_ended_at_the_deadline(tmp_path) -> Non
     runner.join(LIMIT_WAIT_S)
     assert not runner.is_alive(), "the loop still waits for the rest of the answer"
     assert result_of(job)["code"] == "parse_limit" and not (job / "text.txt").exists()
+
+
+def test_a_child_that_closes_its_pipes_and_lingers_is_killed_within_the_bound(tmp_path) -> None:
+    job = make_job(tmp_path, minimal_pdf(["Max Mustermann"]), PDF_MIME)
+    limits = Limits(cpu_s=30, as_bytes=768 * 2**20, wall_s=1)
+    bound = worker.SPAWN_MARGIN_S + limits.wall_s + worker.EXIT_JOIN_S
+    runner = threading.Thread(
+        target=run_job, args=(job,), kwargs={"extractor": close_all_and_linger, "limits": limits}, daemon=True
+    )
+    started = time.monotonic()
+    runner.start()
+    runner.join(bound + LIMIT_WAIT_S)  # a reap that waits for the child's exit fails here, never hangs
+    assert not runner.is_alive(), "run_job still waits for a child that closed its pipes"
+    assert time.monotonic() - started < bound + 1  # the bound, plus the child's start
+    assert result_of(job)["code"] == "parse_limit"
 
 
 def no_pipe_for_the_child(monkeypatch) -> None:

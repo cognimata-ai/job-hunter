@@ -86,6 +86,7 @@ _READ_CHUNK: Final = 2**16
 # (tests/integration/test_parse_client.py pins it), so a stuck parse answers parse_limit, not a timeout.
 SPAWN_MARGIN_S: Final = 2.0
 EXIT_JOIN_S: Final = 5.0
+_REAP_POLL_S: Final = 0.01
 
 
 @dataclass(frozen=True)
@@ -213,12 +214,19 @@ def _receive(receiver: Connection, deadline: float) -> bytes | Literal["timeout"
 
 
 def _reap(child: multiprocessing.process.BaseProcess, *, kill: bool) -> int | None:
+    """The child's exit status, within `EXIT_JOIN_S`: a child still alive then is killed and reaped.
+
+    `Process.join(timeout)` is no bound: it waits for the process sentinel, then calls a blocking
+    `waitpid`, and a child can close its end of the sentinel (and of the answer pipe) and stay alive.
+    `exitcode` polls with WNOHANG, so the wait here is bounded whatever the child does."""
     if kill:
         child.kill()
-    child.join(EXIT_JOIN_S)
-    if child.exitcode is None:  # answered, but still running
+    deadline = time.monotonic() + EXIT_JOIN_S
+    while child.exitcode is None and time.monotonic() < deadline:
+        time.sleep(_REAP_POLL_S)
+    if child.exitcode is None:  # alive after its answer or its EOF: an overrun, killed
         child.kill()
-        child.join()
+        child.join()  # after SIGKILL, waitpid returns as soon as the kernel has ended the process
     exitcode = child.exitcode
     child.close()
     return exitcode
