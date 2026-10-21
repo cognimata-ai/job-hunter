@@ -29,6 +29,9 @@ RUN --mount=type=secret,id=build_ca,required=false \
 
 FROM ${PYTHON_IMAGE} AS runtime
 COPY --from=build /opt/venv /opt/venv
+# The mount point of the cv_store volume (encrypted CV files, §12.1), owned by the app user and private to it:
+# Docker gives a fresh named volume the ownership and mode of the image's directory.
+RUN mkdir -p /data/cv && chown 10001:10001 /data/cv && chmod 0700 /data/cv
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1
 WORKDIR /
 USER 10001:10001
