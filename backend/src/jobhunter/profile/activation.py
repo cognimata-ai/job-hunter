@@ -70,7 +70,6 @@ is a name of this module, so a test replaces it.
 """
 
 import asyncio
-from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -94,7 +93,7 @@ from jobhunter.queries import proposals
 from jobhunter.settings import save, scope_apply
 from jobhunter.settings.derive import derived, ensure_derived
 from jobhunter.settings.dryrun import active_settings
-from jobhunter.types import JSONValue
+from jobhunter.types import JSONValue, json_strings
 from jobhunter.worker.tasks import Deferrer
 
 # Deviation 19: the issues that make the stored profile wrong. The others (`ungrounded`, `unverifiable`,
@@ -213,23 +212,11 @@ def _purge_in_progress() -> Problem:
     )
 
 
-def _strings(value: JSONValue, path: str) -> Iterator[tuple[str, str]]:
-    """Every string in `value` with its issue path (`.` between names, `[i]` after a list)."""
-    if isinstance(value, str):
-        yield path, value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield from _strings(item, f"{path}.{key}")
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            yield from _strings(item, f"{path}[{index}]")
-
-
 def user_entered_contacts(profile: ConfirmedProfile) -> list[FieldError]:
     """A `contact_found` error for each string of `user_entered` that holds a contact (Deviation 36). The
     message names the categories, never the value."""
     errors: list[FieldError] = []
-    for path, value in _strings(profile.user_entered.model_dump(mode="json"), "user_entered"):
+    for path, value in json_strings(profile.user_entered.model_dump(mode="json"), "user_entered"):
         found = scan_value(value)
         if found:
             message = f"Contact data ({', '.join(found)}) is not allowed in this value; remove it to confirm."

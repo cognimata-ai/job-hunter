@@ -47,7 +47,9 @@ text that cannot be encoded as UTF-8 is `InputUnbounded`, with nothing reserved 
   follows (no backoff), in the enlarged stage `max_tokens` and `MaxTokensExhausted`; `refusal` is `refused`
   and `Refused(category or "unspecified")`; `end_turn` with its parsed output returns the `GatewayResult`
   (the `output_json`), with a parsing or structural error it is `invalid_output` and
-  `InvalidOutput("structural")`, the caller's one repair; any other stop reason is `unexpected_stop_reason`,
+  `InvalidOutput("structural")`, the caller's one repair, and so is an output a string of which holds a NUL
+  character or a lone surrogate (`storable`: no JSONB value can hold it, so the billed settlement, which
+  writes `output_json`, would roll back); any other stop reason is `unexpected_stop_reason`,
   `InvalidOutput("unexpected_stop_reason")` and the warn `llm.unexpected_stop_reason` (Deviation 6).
 - An error response (4xx, 5xx) is `not_billed(error_response_no_content)`, its call `error` with
   `http_<status>`. 408, 409, 429, 5xx and 529 are retried after the `Retry-After` it asks for, else after the
@@ -134,7 +136,7 @@ from jobhunter.llm.transport import ANTHROPIC_BASE_URL, TIMEOUT
 from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import LLM_CALLS
-from jobhunter.types import JSONValue, get_int, get_object, get_str
+from jobhunter.types import JSONValue, get_int, get_object, get_str, json_strings, unstorable
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
@@ -487,6 +489,14 @@ class RenderedPrompt:
             messages=tuple(_message_text(m) for m in self.messages),
             schema_json=canonical_schema_json(output_schema(schema)),
         )
+
+
+def storable(parsed: BaseModel) -> bool:
+    """Whether `parsed` can be stored as `llm_calls.output_json` (and the domain rows that take it): no string
+    of it holds a NUL character, which no JSONB value holds, or a lone surrogate, which no UTF-8 text does
+    (`types.unstorable`). An output that cannot is an invalid output, decided before the settlement's
+    transaction, so the billed settlement always commits."""
+    return all(unstorable(text) is None for _, text in json_strings(parsed.model_dump(mode="json"), ""))
 
 
 def _hashes(prompt: RenderedPrompt) -> tuple[bytes, bytes | None] | None:
@@ -959,7 +969,7 @@ class LLMGateway:
         elif stop_reason == "refusal":
             code = REFUSED
         elif stop_reason == "end_turn":
-            ok = isinstance(parsed, t.node.schema) and out.get("parsing_error") is None
+            ok = isinstance(parsed, t.node.schema) and out.get("parsing_error") is None and storable(parsed)
             code = None if ok else INVALID_OUTPUT
         else:
             code = UNEXPECTED_STOP_REASON

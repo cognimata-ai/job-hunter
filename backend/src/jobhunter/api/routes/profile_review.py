@@ -12,9 +12,12 @@ rules.
   ruling R14-1), the review map (`segments`, R14-2: in `text_review` and `ready`, rebuilt from the decrypted
   raw text with the stored set, offsets and categories only) and the years the roles give
   (`recomputed_total_years`, R14-3, with the injected clock).
-- `PUT /drafts/{id}` (`{draft}`), in `ready` only: the profile validated again (`validate_profile` against
-  the approved text, against nothing for a native PDF, and `validate_user_entered`), stored repaired with its
-  issues by a plain `UPDATE`; → `{validation_issues}`.
+- `PUT /drafts/{id}` (`{draft}`), in `ready` only: a string of the profile that holds a NUL character or a
+  lone surrogate (a JSON body can escape both; no JSONB value or UTF-8 text holds them) is a 422
+  `validation_failed` with a `FieldError` (`invalid`) at its path (`body.draft.roles[0].highlights[1]`),
+  before anything is read; otherwise the profile is validated again (`validate_profile` against the approved
+  text, against nothing for a native PDF, and `validate_user_entered`) and stored repaired with its issues by
+  a plain `UPDATE`; → `{validation_issues}`.
 - `PUT /drafts/{id}/text` (`{span_edits}`): the complete edit set (plan Deviation 29, `review.rebuild`; an
   invalid set is a 422 `validation_failed` naming each invalid edit), in `text_review` or `ready` (which moves
   `ready → text_review` first, `draft_json := NULL` and its issues emptied, §12.3). One transaction stores the
@@ -92,6 +95,7 @@ from jobhunter.profile.validate import (
     validate_profile,
     validate_user_entered,
 )
+from jobhunter.types import json_strings, unstorable
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(
@@ -448,6 +452,15 @@ async def get_draft(
     )
 
 
+def _unstorable(draft: ConfirmedProfile) -> list[FieldError]:
+    """An `invalid` error at each string of `draft` that no JSONB value can hold (module docstring)."""
+    return [
+        FieldError(field=path, code="invalid", message=message)
+        for path, text in json_strings(draft.model_dump(mode="json"), "body.draft")
+        if (message := unstorable(text)) is not None
+    ]
+
+
 def _validated(
     draft: ConfirmedProfile, transmitted_text: str | None, today: date
 ) -> tuple[ConfirmedProfile, list[Issue]]:
@@ -469,6 +482,8 @@ async def save_draft(
     draft_id: DraftId, body: DraftIn, engine: Annotated[AsyncEngine, Depends(get_engine)]
 ) -> ValidationIssuesOut:
     """Save the edited profile of a `ready` draft: validated again and stored repaired, with its issues."""
+    if errors := _unstorable(body.draft):
+        raise Problem(422, "validation_failed", "Request validation failed", errors=errors)
     today = utcnow().date()
     async with engine.begin() as conn:
         row = (await conn.execute(_LOCK_DRAFT_TEXT, {"d": draft_id})).first()

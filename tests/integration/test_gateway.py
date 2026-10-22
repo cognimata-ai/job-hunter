@@ -297,6 +297,38 @@ async def test_a_parse_error_is_billed_and_invalid_output_for_the_callers_repair
     assert counted.delta() == {"invalid_output": 1} and fake_llm.served == 1
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"answer": "a synthetic\u0000answer", "score": 3}, id="nul"),
+        # as raw JSON text: the escape of a lone surrogate, which `json.loads` takes and no UTF-8 holds
+        pytest.param('{"answer": "a synthetic\\ud800answer", "score": 3}', id="lone-surrogate"),
+    ],
+)
+async def test_an_unstorable_output_is_billed_invalid_output_and_its_settlement_commits(
+    engine, fake_llm: FakeLLM, owner, ec, body: Any
+) -> None:
+    """Final review FR-1 (d): a parsed output that holds a NUL (which no JSONB stores) or a lone surrogate is
+    an invalid output, decided before the settlement writes `output_json`: the try settles billed with its
+    usage, `output_json` NULL and `invalid_output`, and nothing is left `dispatched` or `ambiguous`."""
+    fake_llm.record("extract_profile", MODEL, body)
+    counted = Counted("invalid_output")
+    with pytest.raises(InvalidOutput) as invalid:
+        await fake_llm.gateway(engine).call(GATEWAY_NODE, gateway_prompt(), call_context(owner, ec))
+    assert invalid.value.code == "structural" and invalid.value.__context__ is None
+    (row,) = await tries(engine)
+    assert states([row]) == ["billed"] and row.settled_usd == settled_usd(MODEL, SYNTHETIC_USAGE)
+    assert (row.status, row.stop_reason, row.error_code, row.output_json) == (
+        "completed",
+        "end_turn",
+        "invalid_output",
+        None,
+    )
+    assert (row.input_tokens, row.output_tokens, row.cost_usd) == (120, 60, row.settled_usd)
+    assert counted.delta() == {"invalid_output": 1} and fake_llm.served == 1
+    assert await no_drift(engine, [row])
+
+
 async def test_an_unexpected_stop_reason_is_invalid_output_with_a_warn_alert(
     engine, fake_llm: FakeLLM, owner, ec
 ) -> None:

@@ -526,6 +526,44 @@ async def test_a_saved_draft_is_validated_again_and_stored_repaired(
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        pytest.param("Backend\x00Entwicklerin", "must not contain a NUL character", id="nul"),
+        pytest.param("Backend\ud800Entwicklerin", "must be valid Unicode text", id="lone-surrogate"),
+    ],
+)
+async def test_an_unstorable_string_in_a_saved_draft_is_a_422_at_its_path(
+    engine, logged_in_client, op_runner, upload, value: str, message: str
+) -> None:
+    """Final review FR-1 (a): no JSONB value holds a NUL, and no UTF-8 a lone surrogate (a JSON body carries
+    both as escapes). Each string that holds one is a `FieldError` at its path, before anything is read or
+    written, never a 500 with an alert."""
+    draft_id = await make_ready_draft(logged_in_client, op_runner, upload, text=REVIEW_CV)
+    draft = (await draft_row_api(logged_in_client, draft_id))["draft"]
+    draft["summary"] = value
+    draft["roles"][0]["highlights"].append(value)
+    last = len(draft["roles"][0]["highlights"]) - 1
+    before = await draft_row(engine, draft_id)
+    body = json.dumps({"draft": draft})  # ensure_ascii: sent as the escapes `\u0000` and `\ud800`
+    r = await logged_in_client.put(
+        f"/api/profile/drafts/{draft_id}", content=body, headers={"content-type": "application/json"}
+    )
+    assert problem(r) == (422, "validation_failed"), r.text
+    assert [(e["field"], e["code"], e["message"]) for e in r.json()["errors"]] == [
+        ("body.draft.summary", "invalid", message),
+        (f"body.draft.roles[0].highlights[{last}]", "invalid", message),
+    ]
+    after = await draft_row(engine, draft_id)
+    assert (after.draft_json, after.validation_issues) == (before.draft_json, before.validation_issues)
+    assert await count_rows(engine, "alerts", code="api.unhandled_exception") == 0
+    # an unknown draft is refused the same way: the body is checked before any read
+    unknown = await logged_in_client.put(
+        "/api/profile/drafts/987654", content=body, headers={"content-type": "application/json"}
+    )
+    assert problem(unknown) == (422, "validation_failed")
+
+
 async def test_the_recomputed_years_use_the_injected_clock(
     logged_in_client, op_runner, upload, monkeypatch
 ) -> None:

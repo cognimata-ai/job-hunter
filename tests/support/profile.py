@@ -486,6 +486,13 @@ class OpRunner:
 
 
 @pytest.fixture
+def fake_llm_root() -> Path:
+    """The recordings `op_runner`'s fake LLM serves: the committed ones. A test module that needs other
+    synthetic streams overrides this fixture with a root of its own."""
+    return FAKE_LLM_DIR
+
+
+@pytest.fixture
 async def op_runner(
     engine: AsyncEngine,
     current_epoch: int,
@@ -493,8 +500,10 @@ async def op_runner(
     cv_store_dir: Path,
     docparse_root: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fake_llm_root: Path,
 ) -> AsyncIterator[OpRunner]:
-    """An `OpRunner` on the api's CV store, a counting docparse loop and the committed fake LLM recordings."""
+    """An `OpRunner` on the api's CV store, a counting docparse loop and the fake LLM's recordings
+    (`fake_llm_root`: the committed ones unless a test module overrides it)."""
     jobs: list[str] = []
     real_run_job = docparse_worker.run_job
 
@@ -510,7 +519,7 @@ async def op_runner(
         JOBHUNTER_CV_STORE_DIR=str(cv_store_dir),
         JOBHUNTER_PARSE_JOBS_DIR=str(docparse_root),
         JOBHUNTER_FAKE_LLM="1",
-        JOBHUNTER_FAKE_LLM_DIR=str(FAKE_LLM_DIR),
+        JOBHUNTER_FAKE_LLM_DIR=str(fake_llm_root),
     )
     sleeps = Sleeps()
     async with operation_deps(engine, cfg, sleep=sleeps) as deps:

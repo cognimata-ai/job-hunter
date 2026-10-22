@@ -339,6 +339,28 @@ async def test_a_lone_surrogate_in_a_string_is_refused_not_a_500(logged_in_clien
     )
 
 
+@pytest.mark.parametrize("field", ["industries_include", "industries_exclude"])
+async def test_a_lone_surrogate_in_an_industry_is_refused_not_a_500(logged_in_client, engine, field) -> None:
+    """Final review FR-1 (b): an industry is a plain string, which Pydantic takes with a lone surrogate; the
+    effect classification then raised `UnicodeEncodeError` (a 500 with an alert). It is `invalid` at its
+    path: in the preview's errors (200) and in the save's 422."""
+    payload = await active_payload(logged_in_client)
+    payload["scope"][field] = ["Abc\ud800xyz"]
+    expected = [(f"payload.scope.{field}[0]", "invalid")]
+    dry = await logged_in_client.post(
+        "/api/settings/dry-run", content=json.dumps({"payload": payload}), headers=JSON
+    )
+    assert dry.status_code == 200, dry.text
+    assert [(e["field"], e["code"]) for e in dry.json()["errors"]] == expected
+    base = (await active_row(engine)).settings_version_id
+    body = json.dumps({"payload": payload, "base_version_id": base, "acknowledged_warnings": []})
+    r = await logged_in_client.post(SETTINGS_URL, content=body, headers={**JSON, **idem(fresh_key())})
+    assert r.status_code == 422 and r.json()["code"] == "validation_failed", r.text
+    assert [(e["field"], e["code"]) for e in r.json()["errors"]] == expected
+    assert await count_rows(engine, "settings_versions") == 1
+    assert await count_rows(engine, "alerts", code="api.unhandled_exception") == 0
+
+
 async def test_a_nul_character_in_a_string_is_refused_not_a_500(logged_in_client, engine) -> None:
     payload = await active_payload(logged_in_client)
     payload["scope"]["excluded_keywords"] = ["Prak\u0000tikum"]  # JSON "\\u0000", which no JSONB stores

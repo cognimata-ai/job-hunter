@@ -537,8 +537,41 @@ CASES: list[Any] = [
         [("payload.scope.excluded_keywords[0]", "invalid"), ("payload.evaluation.t3_min_mid", "conflict")],
         id="NUL before the cross-field rules",
     ),
+    # a lone surrogate (a JSON escape `\ud800`, which no UTF-8 text holds) in any string, at its path: final
+    # review FR-1 (b); Pydantic itself refuses one only in a constrained string (the keywords)
+    C(
+        {"scope.industries_include": ["Abc\ud800xyz"]},
+        bad("scope.industries_include[0]"),
+        id="surrogate industry",
+    ),
+    C({"scope.industries_exclude": ["Abc\udfffxyz"]}, bad("scope.industries_exclude[0]"), id="surrogate"),
+    C(
+        {"scope.locations": [loc(1, label="Muster\ud800stadt")]},
+        bad("scope.locations[0].label"),
+        id="surrogate label",
+    ),
+    C(
+        {"scope.excluded_companies": ["Muster\ud800AG"]},
+        bad("scope.excluded_companies[0]"),
+        id="surr. company",
+    ),
+    C(
+        {"scope.excluded_keywords": ["Prak\ud800tikum"]},
+        bad("scope.excluded_keywords[0]"),
+        id="surr. keyword",
+    ),
     C({"scope.locations": {"label": "Musterstadt"}}, bad("scope.locations"), id="locations not a list"),
 ]
+
+
+def test_a_lone_surrogate_never_reaches_the_effect_classification() -> None:
+    """Final review FR-1 (b): before the fix the industry passed validation and `classify_effects` raised
+    `UnicodeEncodeError` on it; now the payload has no settings and one `invalid` issue."""
+    settings, issues = validate_fields(apply({"scope.industries_include": ["Abc\ud800xyz"]}))
+    assert settings is None
+    assert [(i.field, i.code, i.message) for i in issues] == [
+        ("payload.scope.industries_include[0]", "invalid", "must be valid Unicode text")
+    ]
 
 
 @pytest.mark.parametrize(("changes", "expected"), CASES)
