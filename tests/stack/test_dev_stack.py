@@ -1,5 +1,13 @@
 """The dev stack (Task 18): digest-pinned images, real UID/GID secret access, the dev part of V21.
 
+M2 Task 23 runs it with the fake-LLM overlay (`deploy/compose.fakellm.yaml`: no request reaches Anthropic) and
+a non-empty dummy `anthropic_key` that is no key (`DUMMY_KEY`, given to `scripts/dev-secrets.sh` alone; an
+`anthropic_key` that exists already is kept, as the script keeps every secret, and one this module created is
+removed at its end), and adds the M2 services: `docparse` runs, the worker reads every secret it is given and
+holds the secrets and the parse groups, and a PDF upload is stored on `cv_store` and reaches `text_review`
+through the worker and docparse on the `parse_jobs` tmpfs. The checks never read a secret's value into
+anything they print: a secret file is compared by its inode, size and modification time.
+
 Run explicitly with `-m stack`. The stack runs as a compose project of its own, `jobhunter-stacktest` (every
 compose call passes `-p jobhunter-stacktest`; ruling T21-g), never as the normal dev stack `jobhunter-dev`,
 whose database it must not touch. The fixture removes every container, network and volume of
@@ -9,15 +17,19 @@ run left behind) and after the module, also when the start fails. It never stops
 and port `127.0.0.1:8080` would collide), the module is skipped with a message saying so.
 """
 
+import os
 import stat
 import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Final
 
 import httpx
 import pytest
 from jobhunter.db.alembic_runner import code_head
+
+from tests.support.profile import SYNTHETIC_CV, minimal_pdf
 
 pytestmark = pytest.mark.stack
 REPO = Path(__file__).resolve().parents[2]
@@ -32,6 +44,8 @@ DC = [
     str(REPO / "deploy/images.lock"),
     "-f",
     str(REPO / "deploy/compose.dev.yaml"),
+    "-f",
+    str(REPO / "deploy/compose.fakellm.yaml"),  # M2 Task 23: every Claude call answered by the recorded fake
 ]
 PROBE_NAME = f"{PROJECT}-egress-probe"
 LOG_TAIL_LINES = 60
@@ -45,7 +59,26 @@ SECRET_NAMES = (
     "db_migrator",
     "db_backup",
     "db_restore",
+    "anthropic_key",
 )
+SECRETS_DIR: Final = REPO / ".secrets/dev"
+KEY_VARIABLE: Final = "JOBHUNTER_ANTHROPIC_API_KEY"
+# What `scripts/dev-secrets.sh` writes as `anthropic_key` when it creates it here: not empty, and no key.
+DUMMY_KEY: Final = "dummy-not-a-key"
+# Whether this module created `.secrets/dev/anthropic_key` (and so removes it at its end).
+_created_key: list[bool] = []
+ORIGIN: Final = "http://localhost:8080"
+USERNAME: Final = "stacktest"
+PASSWORD: Final = "Kupferkessel-Fichtenzweig-4"  # the fixed credential of the stack test's own user
+SESSION_COOKIE: Final = "__Host-jh_session"
+TEXT_PDF: Final = minimal_pdf(SYNTHETIC_CV.splitlines())
+TEXT_REVIEW_WITHIN_S: Final = 120
+# The services the stack builds (`up --build`), and those of them whose existing image is used as it is when
+# `JOBHUNTER_STACK_PREBUILT` names them (comma-separated, e.g. `embedder`): for a host that can reach PyPI
+# but not the embedder's other build sources (its Debian mirror, the model download). Unset, every image is
+# built, as always; a named image that does not exist fails the start.
+BUILT_SERVICES: Final = ("migrate", "api", "worker", "embedder", "docparse")
+PREBUILT: Final = tuple(name for name in os.environ.get("JOBHUNTER_STACK_PREBUILT", "").split(",") if name)
 
 
 def _dev_stack_in_use() -> str | None:
@@ -65,6 +98,20 @@ def _dev_stack_in_use() -> str | None:
         if listed.stdout.split():
             found.append(f"{kind} ({len(listed.stdout.split())})")
     return ", ".join(found) or None
+
+
+def dev_secrets() -> None:
+    """`scripts/dev-secrets.sh` on `.secrets/dev` with the dummy key for the script alone (never the key the
+    test process may have)."""
+    env = {name: value for name, value in os.environ.items() if name != KEY_VARIABLE}
+    env[KEY_VARIABLE] = DUMMY_KEY
+    subprocess.run(
+        [str(REPO / "scripts/dev-secrets.sh")],
+        check=True,
+        timeout=CALL_TIMEOUT_S,
+        env=env,
+        capture_output=True,
+    )
 
 
 def _remove_stack() -> subprocess.CompletedProcess[str]:
@@ -98,9 +145,16 @@ def stack() -> Iterator[None]:
             "volumes) to run the stack tests."
         )
     _remove_stack()
+    key_file = SECRETS_DIR / "anthropic_key"
+    _created_key[:] = [not key_file.exists() and not key_file.is_symlink()]
     try:
-        subprocess.run([str(REPO / "scripts/dev-secrets.sh")], check=True, timeout=CALL_TIMEOUT_S)
-        up = subprocess.run([*DC, "up", "-d", "--build", "--wait"], check=False, timeout=900)
+        dev_secrets()
+        if PREBUILT:
+            built = [name for name in BUILT_SERVICES if name not in PREBUILT]
+            subprocess.run([*DC, "build", *built], check=True, timeout=900)
+            up = subprocess.run([*DC, "up", "-d", "--wait"], check=False, timeout=900)
+        else:
+            up = subprocess.run([*DC, "up", "-d", "--build", "--wait"], check=False, timeout=900)
         if up.returncode != 0:
             pytest.fail(f"docker compose up failed ({up.returncode}); last log lines:\n{_logs_tail()}")
         python = next(
@@ -115,6 +169,8 @@ def stack() -> Iterator[None]:
         yield
     finally:
         down = _remove_stack()
+        if _created_key == [True]:  # only the file this module created; the others are kept
+            key_file.unlink(missing_ok=True)
     assert down.returncode == 0, down.stderr
 
 
@@ -238,12 +294,117 @@ def mode_and_group(path: Path) -> tuple[str, int]:
     return oct(stat.S_IMODE(st.st_mode)), st.st_gid
 
 
+def unchanged_signature(path: Path) -> tuple[int, int, int]:
+    """What shows a file was neither replaced nor rewritten, without reading its value: inode, size, mtime."""
+    st = path.stat()
+    return st.st_ino, st.st_size, st.st_mtime_ns
+
+
 def test_secrets_are_group_10010_0440_and_not_overwritten(stack) -> None:  # stack: .secrets/dev exists alone
-    d = REPO / ".secrets/dev"
-    before = {name: (d / name).read_bytes() for name in SECRET_NAMES}
-    subprocess.run([str(REPO / "scripts/dev-secrets.sh")], check=True, timeout=CALL_TIMEOUT_S)
-    assert {name: (d / name).read_bytes() for name in SECRET_NAMES} == before
+    d = SECRETS_DIR
+    before = {name: unchanged_signature(d / name) for name in SECRET_NAMES}
+    dev_secrets()
+    assert {name: unchanged_signature(d / name) for name in SECRET_NAMES} == before
     assert {name: mode_and_group(d / name) for name in SECRET_NAMES} == dict.fromkeys(
         SECRET_NAMES, ("0o440", 10010)
     )
     assert mode_and_group(d) == ("0o750", 10010)
+    if _created_key == [True]:
+        assert (d / "anthropic_key").stat().st_size == len(DUMMY_KEY)  # the dummy, not empty
+
+
+# --- M2 Task 23: docparse, the worker's secrets and groups, an upload through the text phase -------------
+
+
+def run_capture(*command: str, stdin: str | None = None, timeout: int = CALL_TIMEOUT_S) -> str:
+    """`command` (0 required); its output, which holds no secret's value."""
+    done = subprocess.run(command, input=stdin, capture_output=True, text=True, timeout=timeout, check=False)
+    assert done.returncode == 0, (done.returncode, done.stdout[-1000:], done.stderr[-1000:])
+    return done.stdout
+
+
+def test_docparse_is_running_without_a_network(stack) -> None:
+    (container,) = run_capture(*DC, "ps", "--quiet", "docparse").split()
+    state = run_capture(
+        "docker", "inspect", "--format", "{{.State.Status}} {{.HostConfig.NetworkMode}}", container
+    )
+    assert state.split() == ["running", "none"]
+
+
+WORKER_SECRETS_CHECK: Final = "\n".join(
+    [
+        "import os, pathlib",
+        "root = pathlib.Path('/run/secrets')",
+        "names = sorted(p.name for p in root.iterdir())",
+        "assert names == ['anthropic_key', 'data_key', 'db_app'], names",
+        # every file read through, its length only kept: no value is ever printed
+        "empty = [name for name in names if not len((root / name).read_bytes())]",
+        "assert {10010, 10011} <= set(os.getgroups()), sorted(os.getgroups())",
+        "print(','.join(empty))",
+    ]
+)
+
+
+def test_the_worker_reads_every_secret_passes_its_assertions_and_holds_both_groups(stack) -> None:
+    empty = run_capture(*DC, "exec", "-T", "worker", "python", "-c", WORKER_SECRETS_CHECK).strip()
+    if _created_key == [True]:
+        assert empty == ""  # the dummy key is not empty
+    else:
+        assert empty in ("", "anthropic_key")  # only an earlier run's key may be empty: it is kept
+    run_capture(*DC, "exec", "-T", "worker", "jobhunter", "startup-check", "--role", "worker")
+    assert set(run_capture(*DC, "exec", "-T", "worker", "id", "-G").split()) >= {"10010", "10011"}
+    status = run_capture(*DC, "exec", "-T", "worker", "printenv", "JOBHUNTER_FAKE_LLM").strip()
+    assert status == "1"  # the overlay is in force: no Claude call leaves the stack
+
+
+CV_STORE_CHECK: Final = "\n".join(
+    [
+        "import pathlib, stat",
+        "files = sorted(pathlib.Path('/data/cv').glob('*.bin'))",
+        "assert len(files) == 1, len(files)",
+        "st = files[0].stat()",
+        "assert (st.st_uid, stat.S_IMODE(st.st_mode)) == (10001, 0o600), (st.st_uid, oct(st.st_mode))",
+    ]
+)
+
+
+def login(client: httpx.Client) -> dict[str, str]:
+    """The stack test's user, created and logged in through devproxy: the headers of its requests."""
+    create = ["jobhunter", "user", "create", "--username", USERNAME, "--password-stdin"]
+    run_capture(*DC, "run", "--rm", "-T", "api", *create, stdin=f"{PASSWORD}\n", timeout=300)
+    r = client.post(
+        "/api/auth/login", json={"username": USERNAME, "password": PASSWORD}, headers={"Origin": ORIGIN}
+    )
+    assert r.status_code == 204, r.status_code
+    for set_cookie in r.headers.get_list("set-cookie"):
+        pair = set_cookie.split(";", 1)[0].strip()
+        if pair.startswith(f"{SESSION_COOKIE}="):
+            return {"Cookie": pair, "Origin": ORIGIN, "X-JH-Request": "1"}
+    raise AssertionError(f"no {SESSION_COOKIE} cookie in the login's answer")
+
+
+def test_a_pdf_upload_is_stored_and_reaches_text_review_through_docparse(stack) -> None:
+    with httpx.Client(base_url=ORIGIN, timeout=30) as client:
+        headers = login(client)
+        r = client.post(
+            "/api/profile/cv",
+            files={"file": ("Lebenslauf.pdf", TEXT_PDF, "application/pdf")},
+            headers=headers,
+        )
+        assert r.status_code == 202, (r.status_code, r.text)
+        draft_id = int(r.json()["draft_id"])
+        run_capture(
+            *DC, "exec", "-T", "api", "python", "-c", CV_STORE_CHECK
+        )  # the api wrote it, on the volume
+        deadline = time.monotonic() + TEXT_REVIEW_WITHIN_S
+        while (draft := client.get(f"/api/profile/drafts/{draft_id}", headers=headers).json())[
+            "status"
+        ] != "text_review":
+            # the worker's text phase: docparse reads the PDF on the parse_jobs tmpfs
+            assert draft["status"] in ("uploaded", "extracting_text"), (
+                draft["status"],
+                draft["failure_code"],
+            )
+            assert time.monotonic() < deadline, f"no text_review within {TEXT_REVIEW_WITHIN_S} s"
+            time.sleep(1)
+    assert draft["stripped_text_preview"]  # docparse extracted the text

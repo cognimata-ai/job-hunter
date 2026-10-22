@@ -1,0 +1,15 @@
+# Dev only: the worker's Claude calls served by the recorded fake (llm/fake.py, spec §18.4; plan Task 23) from
+# the committed streams under tests/contract/fixtures/anthropic, so no request reaches Anthropic whatever the
+# anthropic_key holds. Layered over the dev stack, alone or with the source fixtures:
+#
+#   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fakellm.yaml \
+#     up -d --build --wait
+#
+# Never in prod: the startup assertion `fake_mode_in_prod` refuses JOBHUNTER_FAKE_LLM there (exit 78).
+services:
+  worker:
+    environment:
+      JOBHUNTER_FAKE_LLM: "1"
+      JOBHUNTER_FAKE_LLM_DIR: /data/fixtures/anthropic
+    volumes:
+      - ../tests/contract/fixtures/anthropic:/data/fixtures/anthropic:ro

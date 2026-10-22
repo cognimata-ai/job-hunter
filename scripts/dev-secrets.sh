@@ -4,10 +4,14 @@
 #   scripts/dev-secrets.sh [dir]        dir defaults to .secrets/dev in the repository root (git-ignored)
 #
 # Each missing secret is a new random value: `openssl rand -base64 32` for session_secret and data_key,
-# `openssl rand -hex 24` for the database passwords. A file gets group 10010 (jobhunter-secrets) and mode 0440
-# before it appears under its name, so it is never readable by anyone else, and the directory gets group 10010
-# and mode 0750. An existing secret is never overwritten. The script prints `created <name>`, or `kept <name>`
-# when another run created the file meanwhile; it never prints a value.
+# `openssl rand -hex 24` for the database passwords. The worker's anthropic_key is the value of
+# JOBHUNTER_ANTHROPIC_API_KEY when it is set, else an empty file: compose needs the file to exist, and the
+# worker reads an empty one as no key (its LLM calls then fail llm_not_configured; M2 Task 23). The value is
+# written by a shell builtin, so it never appears in a command line. A file gets group 10010
+# (jobhunter-secrets) and mode 0440 before it appears under its name, so it is never readable by anyone else,
+# and the directory gets group 10010 and mode 0750. An existing secret is never overwritten (a key given later
+# needs the old anthropic_key removed first). The script prints `created <name>`, or `kept <name>` when another
+# run created the file meanwhile; it never prints a value.
 #
 # Compose bind-mounts a secret with the host file's owner and mode, and the app runs as uid 10001 with the
 # supplementary group 10010, so setting the group needs root: run it with sudo.
@@ -62,3 +66,8 @@ done
 for name in pg_bootstrap db_app db_migrator db_backup db_restore; do
     create "$name" openssl rand -hex 24
 done
+# The key, or nothing: `printf` is a builtin, so the value is never an argument of another process.
+anthropic_key_value() {
+    printf '%s' "${JOBHUNTER_ANTHROPIC_API_KEY:-}"
+}
+create anthropic_key anthropic_key_value

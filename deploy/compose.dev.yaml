@@ -3,6 +3,11 @@
 #   scripts/dev-secrets.sh            # once; as root (sudo), it sets group 10010 on the secret files
 #   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml up -d --build --wait
 #
+# The worker's anthropic_key is the JOBHUNTER_ANTHROPIC_API_KEY that dev-secrets.sh was run with (`sudo
+# --preserve-env=JOBHUNTER_ANTHROPIC_API_KEY`), or an empty file: the worker then starts without a key and every
+# LLM call fails llm_not_configured (M2 Task 23). deploy/compose.fakellm.yaml serves every Claude call from the
+# recorded fixtures instead.
+#
 # Images come from deploy/images.lock only: `${name:?}` fails loudly when a digest line is missing. The one dev
 # origin is http://localhost:8080, served by devproxy on the host's loopback only. The api has no route out
 # (its networks `proxy` and `internal` are both internal); only the worker reaches `egress`. The embedder
@@ -115,7 +120,7 @@ services:
       <<: *app-env
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
       JOBHUNTER_EMBEDDER_URL: http://embedder:8080
-    secrets: [data_key, db_app]
+    secrets: [data_key, db_app, anthropic_key] # anthropic_key may be empty: no key (M2 Task 23)
     volumes: [cv_store:/data/cv, parse_jobs:/data/parse]
     # A service-level group_add replaces the x-app list: the secrets group again, and jobhunter-parse, the
     # group of the parse_jobs tmpfs it shares with docparse (§19.1).
@@ -230,4 +235,5 @@ secrets:
   db_backup: { file: ../.secrets/dev/db_backup }
   db_restore: { file: ../.secrets/dev/db_restore }
   pg_bootstrap: { file: ../.secrets/dev/pg_bootstrap }
+  anthropic_key: { file: ../.secrets/dev/anthropic_key }
   build_ca: { file: "${SSL_CERT_FILE:-/dev/null}" }
