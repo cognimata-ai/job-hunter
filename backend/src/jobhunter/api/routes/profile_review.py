@@ -31,7 +31,8 @@ rules.
   `extraction_method = 'native_pdf'`) and the draft (`native_pdf := true`); `failed → extracting_profile`
   clears the failure and `content_purged_at`, and the operation is created; → 202.
 - `POST /drafts/{id}/discard` → 204, from `text_review`, `ready` or `failed` (reason `user_discard`).
-- `GET /api/profile` → `{active, versions}` (`ProfileVersionOut`), empty until Task 21's confirm.
+- `GET /api/profile` → `{active, versions}` (`ProfileVersionOut`, newest first): the versions the confirm
+  (`api/routes/profile.py`, Task 21) writes, each with its profile, `null` once purged.
 A repeated `Idempotency-Key` returns the stored response (`run_idempotent`); a refused request stores
 nothing. Logs carry ids, codes and counts only; no response holds the raw text or a value that was stripped
 or removed (R14-5).

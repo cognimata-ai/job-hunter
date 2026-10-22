@@ -63,6 +63,14 @@ Task 20 adds the query proposal's side:
   eight queries a model could propose for `SYNTHETIC_PROFILE`, each of them valid by §11.12 (no location word,
   two of them `exploration`), so every one of them is kept;
 - `QUERIES_USAGE`: the usage that stream reports, within the reservation of any proposal for that profile.
+
+Task 21 adds the confirm's side:
+- `make_ready_draft(client, op_runner, upload, *, edit=None)`: a pasted `SYNTHETIC_CV` through the real
+  pipeline (the text phase, the approval through `POST …/text-review`, the extraction on the synthetic
+  stream), `ready`; with `edit`, its profile changed by `edit` and saved through `PUT /drafts/{id}` (200
+  required). Its id. The `ready_draft` fixture is one such draft;
+- `active_profile(engine)`: `active_config`'s `(profile_version_id, llm_tuple_id)`;
+- `ranking_generation(engine)`: the ranking generation (`ranking_state`).
 """
 
 import asyncio
@@ -73,6 +81,7 @@ import io
 import pkgutil
 import struct
 import threading
+import uuid
 import zipfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
@@ -873,3 +882,51 @@ def write_propose_queries_fixture(root: Path = FAKE_LLM_DIR) -> Path:
         case="task20_synthetic_profile",
         usage=QUERIES_USAGE,
     )
+
+
+# --- Task 21: the confirm ---------------------------------------------------------------------------------
+
+_ACTIVE_PROFILE = sa.text("SELECT profile_version_id, llm_tuple_id FROM active_config WHERE id = 1")
+_RANKING_GENERATION = sa.text("SELECT generation FROM ranking_state WHERE id = 1")
+
+ProfileEdit = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+async def make_ready_draft(
+    client: httpx.AsyncClient, op_runner: OpRunner, upload: Upload, *, edit: ProfileEdit | None = None
+) -> int:
+    """A `ready` draft of `SYNTHETIC_CV` through the real pipeline, its profile saved edited by `edit` when
+    one is given (module docstring); its id. Every due operation runs on the way (`run_pending`)."""
+    draft_id = await upload(SYNTHETIC_CV)
+    await op_runner.run_pending()
+    assert (await draft_row(op_runner.engine, draft_id)).status == "text_review"
+    approved = await client.post(
+        f"/api/profile/drafts/{draft_id}/text-review", headers=idem(f"approve-{uuid.uuid4().hex}")
+    )
+    assert approved.status_code == 202, (approved.status_code, approved.text)
+    await op_runner.run_pending()
+    assert (await draft_row(op_runner.engine, draft_id)).status == "ready"
+    if edit is not None:
+        draft = (await draft_row_api(client, draft_id))["draft"]
+        saved = await client.put(f"/api/profile/drafts/{draft_id}", json={"draft": edit(draft)})
+        assert saved.status_code == 200, (saved.status_code, saved.text)
+    return draft_id
+
+
+@pytest.fixture
+async def ready_draft(logged_in_client: httpx.AsyncClient, op_runner: OpRunner, upload: Upload) -> int:
+    """A `ready` draft of `SYNTHETIC_CV` (`make_ready_draft`), its profile as the synthetic stream gave it."""
+    return await make_ready_draft(logged_in_client, op_runner, upload)
+
+
+async def active_profile(engine: AsyncEngine) -> tuple[int | None, int | None]:
+    """`active_config`'s `(profile_version_id, llm_tuple_id)`."""
+    async with engine.connect() as conn:
+        row = (await conn.execute(_ACTIVE_PROFILE)).one()
+    return row.profile_version_id, row.llm_tuple_id
+
+
+async def ranking_generation(engine: AsyncEngine) -> int:
+    """The ranking generation (`ranking_state.generation`)."""
+    async with engine.connect() as conn:
+        return int((await conn.execute(_RANKING_GENERATION)).scalar_one())

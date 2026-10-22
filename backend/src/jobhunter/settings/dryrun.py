@@ -220,9 +220,10 @@ def _after_save(row: BudgetRow, p: BudgetParams, now: datetime) -> BudgetRow:
     return after
 
 
-def _bulk_budget(settings: Settings, p: BudgetParams, row: BudgetRow) -> Decimal:
+def bulk_budget(settings: Settings, p: BudgetParams, row: BudgetRow) -> Decimal:
     """§6.9.3: `bulk_rescore_max_budget_share` of the scoring headroom at the start, `A x (1 - reserve_frac)
-    - scoring_counted_usd`."""
+    - scoring_counted_usd`, with `A` of `p` (never below zero; not rounded). The confirm's re-score estimate
+    uses it too (Task 21)."""
     headroom = max(_ZERO, scoring_share(p) - row.scoring_counted_usd)
     return settings.scoring.bulk_rescore_max_budget_share * headroom
 
@@ -293,7 +294,7 @@ async def dry_run(
                 "llm_rescore",
                 targets=targets,
                 est_usd=_usd(targets * c_hat),
-                bulk_budget_usd=_usd(_bulk_budget(proposed, p, after)),
+                bulk_budget_usd=_usd(bulk_budget(proposed, p, after)),
             )
         )
     if "evaluation_policy" in effects:

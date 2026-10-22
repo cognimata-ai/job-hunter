@@ -18,6 +18,8 @@ preset label: a Haiku node counts 30% more tokens (its tokenizer uplift), and a 
 generator", triggers more reviews (critic rate 0.55, `q1 = 0.45`, `q2 = 0.35`, §21.2's config C). The figure
 is rounded half-up to $0.000001. It needs no input bound, so `PROMPT_OVERHEAD_TOKENS` plays no part. For the
 default policy B it is $0.052646 (§21.2: $0.0526), for A $0.079255 ($0.0793) and for C $0.019352 ($0.0194).
+`target_cost` gives its four parts unrounded: the confirm's re-score estimate prices §21.4's batch path from
+them (`profile.estimate`, Task 21).
 
 **`cache_writes_per_cycle`** is §21.1's cache-write overhead of one score cycle (Ruling R16-2). The per-call
 costs charge every prefix as a read; a cycle's first call on each (model, effort) prefix writes it instead,
@@ -99,19 +101,20 @@ WEAK_GENERATORS: Final[frozenset[Model]] = frozenset({"claude-haiku-5-5"})
 TOKENIZER_UPLIFT: Final = MappingProxyType({"claude-haiku-5-5": Decimal("1.3")})
 
 
-def _uplift(model: Model) -> Decimal:
+def uplift(model: Model) -> Decimal:
+    """The tokenizer uplift of `model` (§21.2: 1.3 for Haiku, else 1)."""
     return TOKENIZER_UPLIFT.get(model, Decimal(1))
 
 
 def _price(model: Model, tokens: CallTokens) -> pricing.Price:
     """The price tier of a call of `tokens` on `model` (its prompt: uncached and cached input, uplifted)."""
-    return pricing.price_for(model, prompt_tokens=int(_uplift(model) * (tokens.uncached + tokens.cached)))
+    return pricing.price_for(model, prompt_tokens=int(uplift(model) * (tokens.uncached + tokens.cached)))
 
 
 def _call_usd(model: Model, tokens: CallTokens) -> Decimal:
     """The cost of one call of `tokens` on `model`, the cached prefix read (not rounded)."""
-    uplift = _uplift(model)
-    uncached, cached, output = (uplift * n for n in (tokens.uncached, tokens.cached, tokens.output))
+    factor = uplift(model)
+    uncached, cached, output = (factor * n for n in (tokens.uncached, tokens.cached, tokens.output))
     price = _price(model, tokens)
     micro_usd = uncached * price.input + cached * price.cache_read + output * price.output
     return micro_usd / _TOKENS_PER_MTOK
@@ -120,7 +123,7 @@ def _call_usd(model: Model, tokens: CallTokens) -> Decimal:
 def _prefix_write_usd(model: Model) -> Decimal:
     """`w(m)`: what writing a cached prefix on `model` adds to reading it (not rounded)."""
     price = _price(model, GENERATE)
-    return _uplift(model) * GENERATE.cached * (price.cache_write - price.cache_read) / _TOKENS_PER_MTOK
+    return uplift(model) * GENERATE.cached * (price.cache_write - price.cache_read) / _TOKENS_PER_MTOK
 
 
 def cache_writes_per_cycle(model_policy: ModelPolicy) -> Decimal:
@@ -138,9 +141,19 @@ def _critic_tokens(effort: Effort) -> CallTokens:
     return CRITIC_LOW if effort == "low" else CRITIC
 
 
-def central_cost_per_target(model_policy: ModelPolicy) -> Decimal:
-    """The §21.2 central cost of one target under `model_policy` (module docstring), rounded half-up to
-    $0.000001."""
+@dataclass(frozen=True)
+class TargetCost:
+    """One target's central spend by part (module docstring), not rounded: the generator call, the critic
+    rounds, the revisions, and the structural repairs (`repairs` of the generator call)."""
+
+    generator: Decimal
+    critic: Decimal
+    revise: Decimal
+    repairs: Decimal
+
+
+def target_cost(model_policy: ModelPolicy) -> TargetCost:
+    """The parts of `central_cost_per_target` under `model_policy`, each online (the cached prefix read)."""
     nodes = model_policy.nodes
     funnel = WEAK_GENERATOR_FUNNEL if nodes.generate.model in WEAK_GENERATORS else DEFAULT_FUNNEL
     generator = _call_usd(nodes.generate.model, GENERATE)
@@ -149,9 +162,19 @@ def central_cost_per_target(model_policy: ModelPolicy) -> Decimal:
     revision = _call_usd(nodes.revise.model, REVISE)
     follow_ups = funnel.q1 + funnel.q1 * funnel.q2  # revisions per reviewed draft, each re-reviewed
     first_round = funnel.light_share * light_critic + (1 - funnel.light_share) * full_critic
-    critic = funnel.first_round_rate * (first_round + follow_ups * full_critic)
-    revise = funnel.first_round_rate * follow_ups * revision
-    total = generator + critic + revise + funnel.repairs * generator
+    return TargetCost(
+        generator=generator,
+        critic=funnel.first_round_rate * (first_round + follow_ups * full_critic),
+        revise=funnel.first_round_rate * follow_ups * revision,
+        repairs=funnel.repairs * generator,
+    )
+
+
+def central_cost_per_target(model_policy: ModelPolicy) -> Decimal:
+    """The §21.2 central cost of one target under `model_policy` (module docstring), rounded half-up to
+    $0.000001."""
+    cost = target_cost(model_policy)
+    total = cost.generator + cost.critic + cost.revise + cost.repairs
     return total.quantize(budget.USD_QUANTUM, rounding=ROUND_HALF_UP)
 
 

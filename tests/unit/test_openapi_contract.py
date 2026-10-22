@@ -113,6 +113,8 @@ def test_the_readiness_503_is_the_report_not_a_problem(document) -> None:
         ("post", "/api/profile/drafts/{draft_id}/text-review", IDEMPOTENT_DRAFT_ROUTE),
         ("post", "/api/profile/drafts/{draft_id}/retry", IDEMPOTENT_DRAFT_ROUTE),
         ("post", "/api/profile/drafts/{draft_id}/discard", {"401", "403", "404", "409", "422", "429"}),
+        ("post", "/api/profile/drafts/{draft_id}/confirm", IDEMPOTENT_DRAFT_ROUTE),
+        ("get", "/api/profile/drafts/{draft_id}/rescore-estimate", {"401", "404", "422", "429"}),
         ("get", "/api/profile", {"401", "429"}),
         ("post", "/api/profile/query-proposals", {"400", "401", "403", "409", "422", "429"}),
         ("get", "/api/profile/query-proposals/{proposal_id}", {"401", "404", "422", "429"}),

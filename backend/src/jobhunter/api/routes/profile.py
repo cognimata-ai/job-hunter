@@ -31,8 +31,30 @@ owner is that operation, §6.9.1). `GET /api/profile/query-proposals/{id}` → `
 list of kept queries of a `ready` proposal (`{text, lang, target_title, exploration, rationale}` each), `null`
 before and otherwise; an unknown id is 404 `not_found`.
 
+`POST /api/profile/drafts/{id}/confirm` (Idempotency-Key, `{expected_rescore_ack}`) → 201
+`{profile_version_id, targets_to_create, est_usd, bulk_budget_usd}` (Task 21, §12.6 step 2): a malformed key
+is refused before any SQL. Then one transaction: `active_config` `FOR UPDATE` first, then `run_idempotent`
+around `profile.activation.confirm_draft`, whose own `FOR UPDATE` is then a no-op. Like the settings save it
+never takes `FOR SHARE` first: two confirms holding the shared lock would deadlock on the upgrade, where this
+way the second waits. A repeat with the key returns the stored response; a repeat with another key of a
+confirmed draft returns the draft's stored body (Deviation 2). 404 `not_found`; 409 `conflict_state` (not
+`ready`), `profile_purge_in_progress` (an identical version is being purged) and `idempotency_in_progress`;
+422 `validation_failed` (a blocking issue or a contact in `user_entered` at its path, the missing
+`expected_rescore_ack` at `body.expected_rescore_ack`, an unknown body member) and `idempotency_key_reused`.
+`profile_confirmed` is logged with the ids after the commit, a refusal as `profile_confirm_refused` with its
+codes and counts.
+
+`GET /api/profile/drafts/{id}/rescore-estimate` → `{targets, est_usd_online, est_usd_batch, month_spend,
+cap}` (§14.2, `profile.estimate.rescore_estimate`): what confirming would re-score and cost under the active
+settings in the current month, read without a lock; an unknown draft is 404 `not_found`. The figures do not
+depend on the draft's state.
+
+`utcnow` is a name of this module, so a test injects the clock by patching
+`jobhunter.api.routes.profile.utcnow`; the confirm takes its `now` from it.
+
 Every route needs a session, and the POSTs pass the edge's CSRF check. Logs carry ids, sizes and reason codes
-only: never a file name, a file's content, a pasted text or a query text.
+only: never a file name, a file's content, a pasted text, a profile value or a query text (a version's id is
+logged as `version_id`: a key that starts with `profile` is redacted).
 """
 
 import asyncio
@@ -42,13 +64,14 @@ from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, Header, Path, Request
 from fastapi.routing import APIRoute
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 from starlette.types import Message
 
 from jobhunter.api.deps import get_config, get_data_keys, get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
+from jobhunter.api.models import DecimalOut
 from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
@@ -62,10 +85,12 @@ from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.llm import bounds
 from jobhunter.observability.logging import get_logger
-from jobhunter.profile import upload
+from jobhunter.profile import activation, upload
+from jobhunter.profile.estimate import rescore_estimate
 from jobhunter.profile.storage import CvStore
 from jobhunter.profile.text import drop_nul
 from jobhunter.queries import proposals
+from jobhunter.settings.dryrun import active_settings
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(
@@ -114,6 +139,11 @@ _ACTIVE_VERSION: Final = q(
 _PROPOSAL: Final = q("SELECT status, items FROM query_proposals WHERE id = :p")
 
 ProposalId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a query proposal")]
+DraftId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a profile draft")]
+
+CONFIRM_ROUTE: Final = "profile.confirm"
+_LOCK_ACTIVE_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
+_DRAFT_EXISTS: Final = q("SELECT 1 FROM profile_drafts WHERE id = :d")
 
 
 class DraftCreatedOut(BaseModel):
@@ -143,6 +173,35 @@ class ProposalOut(BaseModel):
 
 class CvTextIn(BaseModel):
     text: str
+
+
+class ConfirmIn(BaseModel):
+    """`expected_rescore_ack` acknowledges the re-score estimate; it is required when retained ads exist."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_rescore_ack: bool = False
+
+
+class ConfirmOut(BaseModel):
+    """§14.2's 201 of a confirm: the activated version, the re-score count, its online cost and the bulk
+    budget (§6.9.3). A repeat returns the original body."""
+
+    profile_version_id: int
+    targets_to_create: int
+    est_usd: DecimalOut
+    bulk_budget_usd: DecimalOut
+
+
+class RescoreEstimateOut(BaseModel):
+    """The re-score preview (§12.6 step 2, §21.4): the retained ads to score again, their cost online and in
+    Batches, the month's counted spend and its cap."""
+
+    targets: int
+    est_usd_online: DecimalOut
+    est_usd_batch: DecimalOut
+    month_spend: DecimalOut
+    cap: DecimalOut
 
 
 def _native_refused(code: str, message: str) -> Problem:
@@ -401,3 +460,109 @@ async def get_query_proposal(
     if row.status == proposals.READY and isinstance(row.items, dict):
         items = [ProposedQueryOut.model_validate(item) for item in row.items.get("queries", [])]
     return ProposalOut(status=row.status, items=items)
+
+
+# --- confirm and activate (Task 21) -------------------------------------------------------------------------
+
+
+def _draft_not_found() -> Problem:
+    return Problem(404, "not_found", "Profile draft not found")
+
+
+@router.post(
+    "/drafts/{draft_id}/confirm",
+    status_code=201,
+    response_model=ConfirmOut,
+    responses={
+        400: {"description": "Idempotency-Key missing or malformed (`idempotency_key_required`)"},
+        404: {"description": "No such draft (`not_found`)"},
+        409: {
+            "description": "The draft is not ready (`conflict_state`), an identical profile version is being "
+            "purged (`profile_purge_in_progress`), or a request with this key is still running "
+            "(`idempotency_in_progress`)"
+        },
+        422: {
+            "description": "Invalid body, a blocking validation issue, a contact in the user-entered values "
+            "or the re-score not acknowledged (`validation_failed`), or the key was used for another request "
+            "(`idempotency_key_reused`)"
+        },
+        **CSRF_RESPONSES,
+    },
+)
+async def confirm_draft(
+    draft_id: DraftId,
+    body: ConfirmIn,
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
+) -> Response:
+    """Confirm a ready draft and activate its profile (201); a repeat returns the original outcome."""
+    key = check_idempotency_key(idempotency_key)  # a malformed key costs no database round trip
+    now = utcnow()
+    activated: list[activation.Activated] = []  # empty on a replay
+
+    async def handler(conn: AsyncConnection) -> StoredResponse:
+        status, outcome = await activation.confirm_draft(
+            conn,
+            draft_id,
+            expected_rescore_ack=body.expected_rescore_ack,
+            now=now,
+            defer=defer_in_tx,
+            activated=activated,
+        )
+        return StoredResponse(status, outcome)
+
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(_LOCK_ACTIVE_CONFIG)  # the first lock (§9.1), before the key's row
+            stored = await run_idempotent(
+                conn,
+                route=CONFIRM_ROUTE,
+                key=key,
+                fingerprint=request_fingerprint(body.model_dump(mode="json"), {"draft_id": draft_id}),
+                now=now,
+                handler=handler,
+            )
+    except Problem as problem:  # codes and counts: a field path names the user's own entries
+        log.info(
+            "profile_confirm_refused",
+            draft_id=draft_id,
+            code=problem.code,
+            errors=len(problem.errors or []),
+            issue_codes=sorted({e.code for e in problem.errors or []}),
+        )
+        raise
+    for done in activated:  # after the commit; a replay is logged by `run_idempotent` (`idempotent_replay`)
+        log.info(
+            "profile_confirmed",
+            draft_id=done.draft_id,
+            version_id=done.version_id,
+            version_created=done.version_created,
+            llm_tuple_id=done.llm_tuple_id,
+            apply_scope_operation_id=done.apply_scope_operation_id,
+            embed_operation_id=done.embed_operation_id,
+            proposal_id=done.proposal_id,
+            targets_to_create=done.targets_to_create,
+        )
+    return JSONResponse(stored.body, status_code=stored.status)
+
+
+@router.get(
+    "/drafts/{draft_id}/rescore-estimate",
+    response_model=RescoreEstimateOut,
+    responses={404: {"description": "No such draft (`not_found`)"}},
+)
+async def get_rescore_estimate(
+    draft_id: DraftId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> RescoreEstimateOut:
+    """What confirming a draft would re-score and cost (§12.6 step 2, §21.4)."""
+    async with engine.connect() as conn:  # plain reads, rolled back when the block ends
+        if (await conn.execute(_DRAFT_EXISTS, {"d": draft_id})).first() is None:
+            raise _draft_not_found()
+        estimate = await rescore_estimate(conn, await active_settings(conn), now=utcnow())
+    return RescoreEstimateOut(
+        targets=estimate.targets,
+        est_usd_online=estimate.est_usd_online,
+        est_usd_batch=estimate.est_usd_batch,
+        month_spend=estimate.month_spend,
+        cap=estimate.cap,
+    )

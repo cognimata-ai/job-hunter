@@ -149,6 +149,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/profile/drafts/{draft_id}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm Draft
+         * @description Confirm a ready draft and activate its profile (201); a repeat returns the original outcome.
+         */
+        post: operations["confirm_draft_api_profile_drafts__draft_id__confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/profile/drafts/{draft_id}/discard": {
         parameters: {
             query?: never;
@@ -163,6 +183,26 @@ export interface paths {
          * @description Discard a draft in text review, ready or failed.
          */
         post: operations["discard_draft_api_profile_drafts__draft_id__discard_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/rescore-estimate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Rescore Estimate
+         * @description What confirming a draft would re-score and cost (§12.6 step 2, §21.4).
+         */
+        get: operations["get_rescore_estimate_api_profile_drafts__draft_id__rescore_estimate_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -549,6 +589,32 @@ export interface components {
             year: number | null;
         };
         /**
+         * ConfirmIn
+         * @description `expected_rescore_ack` acknowledges the re-score estimate; it is required when retained ads exist.
+         */
+        ConfirmIn: {
+            /**
+             * Expected Rescore Ack
+             * @default false
+             */
+            expected_rescore_ack: boolean;
+        };
+        /**
+         * ConfirmOut
+         * @description §14.2's 201 of a confirm: the activated version, the re-score count, its online cost and the bulk
+         *     budget (§6.9.3). A repeat returns the original body.
+         */
+        ConfirmOut: {
+            /** Bulk Budget Usd */
+            bulk_budget_usd: string;
+            /** Est Usd */
+            est_usd: string;
+            /** Profile Version Id */
+            profile_version_id: number;
+            /** Targets To Create */
+            targets_to_create: number;
+        };
+        /**
          * ConfirmedProfile
          * @description `profile_versions.profile_json` and a draft's `draft_json`: the extraction plus `user_entered`.
          */
@@ -813,7 +879,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "unauthenticated" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "internal";
+            code: "unauthenticated" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
             /**
              * Detail
              * @default null
@@ -993,6 +1059,23 @@ export interface components {
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
             /** Ok */
             ok: boolean;
+        };
+        /**
+         * RescoreEstimateOut
+         * @description The re-score preview (§12.6 step 2, §21.4): the retained ads to score again, their cost online and in
+         *     Batches, the month's counted spend and its cap.
+         */
+        RescoreEstimateOut: {
+            /** Cap */
+            cap: string;
+            /** Est Usd Batch */
+            est_usd_batch: string;
+            /** Est Usd Online */
+            est_usd_online: string;
+            /** Month Spend */
+            month_spend: string;
+            /** Targets */
+            targets: number;
         };
         /** RetryApplyOut */
         RetryApplyOut: {
@@ -1954,6 +2037,98 @@ export interface operations {
             };
         };
     };
+    confirm_draft_api_profile_drafts__draft_id__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfirmIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfirmOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not ready (`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, a blocking validation issue, a contact in the user-entered values or the re-score not acknowledged (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     discard_draft_api_profile_drafts__draft_id__discard_post: {
         parameters: {
             query?: never;
@@ -2002,6 +2177,65 @@ export interface operations {
             };
             /** @description The draft is not in text review, ready or failed (`conflict_state`) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_rescore_estimate_api_profile_drafts__draft_id__rescore_estimate_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RescoreEstimateOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
