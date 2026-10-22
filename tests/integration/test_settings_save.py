@@ -18,11 +18,13 @@ import sqlalchemy as sa
 from jobhunter.api.errors import Problem
 from jobhunter.api.routes import settings as settings_routes
 from jobhunter.db import ranking
-from jobhunter.db.seed import load_settings_v1
+from jobhunter.db.seed import ensure_hashed, load_settings_v1
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.llm.spend_ledger import ensure_month
 from jobhunter.settings import save as save_module
+from jobhunter.settings import scope_apply
+from jobhunter.settings.derive import ensure_derived
 from jobhunter.settings.effects import EFFECT_CLASSES
 from jobhunter.settings.save import ACTION_ORDER, SaveRequest, save_settings
 from jobhunter.settings.validate import validate_fields
@@ -266,20 +268,63 @@ async def test_the_request_body_is_checked(logged_in_client, engine) -> None:
     assert await count_rows(engine, "settings_versions") == 1
 
 
-async def test_unknown_queries_and_watchlist_companies_are_422(logged_in_client, engine) -> None:
+async def dry_run_errors(client: httpx.AsyncClient, payload: Any) -> list[tuple[str, str]]:
+    r = await client.post("/api/settings/dry-run", json={"payload": payload})
+    assert r.status_code == 200, r.text
+    return [(e["field"], e["code"]) for e in r.json()["errors"]]
+
+
+async def assert_refused_like_the_dry_run(
+    client: httpx.AsyncClient, engine: AsyncEngine, payload: Any, expected: list[tuple[str, str]]
+) -> None:
+    """The preview shows `expected` as its errors (200), and the save refuses the same with a 422; nothing
+    is written."""
+    assert await dry_run_errors(client, payload) == expected
+    base = (await active_row(engine)).settings_version_id
+    r = await post(client, {"payload": payload, "base_version_id": base, "acknowledged_warnings": []})
+    assert r.status_code == 422 and r.json()["code"] == "validation_failed", r.text
+    assert [(e["field"], e["code"]) for e in r.json()["errors"]] == expected
+    assert await count_rows(engine, "settings_versions") == 1 and await count_rows(engine, "operations") == 0
+
+
+async def test_unknown_queries_and_watchlist_companies_are_refused(logged_in_client, engine) -> None:
     payload = await active_payload(logged_in_client)
     payload["queries"] = [{"query_id": 987654, "enabled": True}]
     payload["watchlist"] = [{"watchlist_company_id": 876543, "enabled": False}]
-    r = await post(logged_in_client, await request_for(logged_in_client, payload))
-    assert r.status_code == 422, r.text
-    assert [(e["field"], e["code"]) for e in r.json()["errors"]] == [
+    expected = [
         ("payload.queries[0].query_id", "invalid"),
         ("payload.watchlist[0].watchlist_company_id", "invalid"),
     ]
-    assert (
-        await count_rows(engine, "settings_versions") == 1
-        and await count_rows(engine, "source_instances") == 4
-    )
+    await assert_refused_like_the_dry_run(logged_in_client, engine, payload, expected)
+    assert await count_rows(engine, "source_instances") == 4
+
+
+@pytest.mark.parametrize(
+    ("group", "entry", "path"),
+    [
+        ("queries", {"query_id": 2**63, "enabled": True}, "payload.queries[0].query_id"),
+        (
+            "watchlist",
+            {"watchlist_company_id": 2**63, "enabled": True},
+            "payload.watchlist[0].watchlist_company_id",
+        ),
+    ],
+)
+async def test_an_id_beyond_bigint_is_refused_not_a_500(logged_in_client, engine, group, entry, path) -> None:
+    payload = await active_payload(logged_in_client)
+    payload[group] = [entry]
+    await assert_refused_like_the_dry_run(logged_in_client, engine, payload, [(path, "out_of_range")])
+
+
+async def test_a_nul_character_in_a_string_is_refused_not_a_500(logged_in_client, engine) -> None:
+    payload = await active_payload(logged_in_client)
+    payload["scope"]["excluded_keywords"] = ["Prak\u0000tikum"]  # JSON "\\u0000", which no JSONB stores
+    payload["scope"]["locations"] = [berlin(10) | {"label": "Ber\u0000lin"}]
+    expected = [
+        ("payload.scope.locations[0].label", "invalid"),
+        ("payload.scope.excluded_keywords[0]", "invalid"),
+    ]
+    await assert_refused_like_the_dry_run(logged_in_client, engine, payload, expected)
 
 
 # --- schedule -----------------------------------------------------------------------------------------------
@@ -474,6 +519,28 @@ async def test_a_budget_save_without_a_cap_change_leaves_the_month_row(
     assert await month_row(engine) == before  # the lowering stays recorded at its own time
 
 
+async def test_a_buffer_only_edit_writes_the_buffer_and_keeps_the_lowering(
+    logged_in_client, engine, clock
+) -> None:
+    lowered_at = NOW - timedelta(days=1)
+    async with engine.begin() as conn:
+        await ensure_month(
+            conn, MONTH, BudgetParams.from_payload(load_settings_v1()), NOW - timedelta(days=3)
+        )
+        await conn.execute(
+            text("UPDATE llm_budget SET counted_usd = 120, nonscoring_counted_usd = 120, "
+                 "cap_lowered_at = :t, counted_at_cap_change_usd = 120 WHERE month = :m"),
+            {"m": MONTH, "t": lowered_at},
+        )  # fmt: skip
+    payload = await active_payload(logged_in_client)
+    payload["llm"]["overrun_buffer_usd"] = "3.00"
+    assert (await save(logged_in_client, payload))["version"]["effect_classes"] == ["budget"]
+    row = await month_row(engine)
+    assert (row.cap_usd, row.overrun_buffer_usd) == (Decimal("100.00"), Decimal("3.00"))
+    assert (row.cap_lowered_at, row.counted_at_cap_change_usd) == (lowered_at, Decimal("120.000000"))
+    assert row.updated_at == NOW
+
+
 # --- execution and evaluation policy ------------------------------------------------------------------------
 
 
@@ -562,12 +629,27 @@ async def test_the_eval_gate_needs_the_override_once_it_has_failed(
     async def failed(conn: object) -> str:
         return "failed"
 
+    derived_rows: list[object] = []
+    real_ensure_derived = ensure_derived
+
+    async def spy_ensure_derived(*args: Any, **kwargs: Any) -> Any:
+        derived_rows.append(args)
+        return await real_ensure_derived(*args, **kwargs)
+
     monkeypatch.setattr(save_module, "eval_gate_state", failed)
-    request = await request_for(
-        logged_in_client, with_generator_effort(await active_payload(logged_in_client), "high")
-    )
+    monkeypatch.setattr(save_module, "ensure_derived", spy_ensure_derived)
+    payload = with_generator_effort(await active_payload(logged_in_client), "high")
+    payload["scope"]["locations"] = [berlin(30)]  # a scope change too: refused before any write
+    request = await request_for(logged_in_client, payload)
     r = await post(logged_in_client, request)
     assert r.status_code == 409 and r.json()["code"] == "eval_gate_failed"
+    assert await count_rows(engine, "operations") == 0 and await count_rows(engine, "scope_versions") == 1
+    assert await count_rows(engine, "settings_versions") == 1
+    evaluation_only = await active_payload(logged_in_client)
+    evaluation_only["evaluation"]["t2_band"] = 8
+    r = await post(logged_in_client, await request_for(logged_in_client, evaluation_only))
+    assert r.status_code == 409 and r.json()["code"] == "eval_gate_failed"  # evaluation policies are gated
+    assert derived_rows == []  # the gate refused both before step 4's first write
     r = await post(logged_in_client, {**request, "eval_override_ack": True})
     assert r.status_code == 201, r.text
     assert (await version_row(engine, r.json()["version"]["id"])).eval_override_ack is True
@@ -609,6 +691,27 @@ async def test_a_scope_save_points_pending_at_the_scope_and_requests_its_apply(
     assert same["apply_scope_operation_id"] == op_id and other["apply_scope_operation_id"] != op_id
     assert (await active_row(engine)).pending_scope_version_id == scope_a
     assert [op[0] for op in await apply_scope_operations(engine)] == ["pending", "pending"]
+
+
+async def test_set_desired_scope_stamps_the_callers_now(engine) -> None:
+    """The pending pointer's `updated_at` is the caller's injected `now` (Tasks 18 and 21 do not overwrite
+    it), for a new pending scope and for the clearing revert."""
+    active = await active_row(engine)
+    async with engine.begin() as conn:
+        await conn.execute(text("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE"))
+        other = await ensure_hashed(conn, "scope_versions", {"test": "another scope"})
+        op_id = await scope_apply.set_desired_scope(conn, other, now=NOW, defer=defer_in_tx)
+    after = await active_row(engine)
+    assert (after.pending_scope_version_id, after.updated_at) == (other, NOW) and op_id is not None
+    async with engine.begin() as conn:
+        await conn.execute(text("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE"))
+        again = await scope_apply.set_desired_scope(conn, other, now=NOW, defer=defer_in_tx)
+        cleared = await scope_apply.set_desired_scope(
+            conn, active.scope_version_id, now=NOW + timedelta(hours=1), defer=defer_in_tx
+        )
+    assert again == op_id and cleared is None  # the live apply is found through its dedup key
+    after = await active_row(engine)
+    assert (after.pending_scope_version_id, after.updated_at) == (None, NOW + timedelta(hours=1))
 
 
 async def test_a_scope_save_that_reverts_the_scope_clears_pending(logged_in_client, engine) -> None:
@@ -756,14 +859,14 @@ async def test_two_concurrent_saves_from_one_base_give_201_and_409(
     second = copy.deepcopy(payload)
     second["schedule"]["interval_hours"] = 12
     r1_body, r2_body = await request_for(logged_in_client, first), await request_for(logged_in_client, second)
-    real_save, held, release, entered = settings_routes.save_settings, asyncio.Event(), asyncio.Event(), []
+    held, release, entered = asyncio.Event(), asyncio.Event(), list[int]()
 
     async def held_first(conn: Any, *args: Any, **kwargs: Any) -> Any:
         entered.append(len(entered) + 1)
         if len(entered) == 1:  # the first tab: inside its transaction, holding the route's lock only
             held.set()
             await release.wait()
-        return await real_save(conn, *args, **kwargs)
+        return await save_settings(conn, *args, **kwargs)  # the route's own, by name
 
     monkeypatch.setattr(settings_routes, "save_settings", held_first)
     one = asyncio.create_task(post(logged_in_client, r1_body, key="tab-one-concurrent-1"))
@@ -872,3 +975,26 @@ async def test_the_save_logs_ids_and_codes_only(logged_in_client, engine, log_ev
     }
     rendered = str(log_events())
     assert "musterfirma" not in rendered.lower()
+
+
+async def test_a_replay_logs_no_second_save(logged_in_client, log_events) -> None:
+    payload = await active_payload(logged_in_client)
+    payload["display"]["ui_language"] = "de"
+    request = await request_for(logged_in_client, payload)
+    for _ in range(2):
+        assert (await post(logged_in_client, request, key="replay-log-key-0001")).status_code == 201
+    events = [e["event"] for e in log_events()]
+    assert events.count("settings_saved") == 1 and events.count("idempotent_replay") == 1
+
+
+async def test_a_refusal_logs_counts_and_codes_not_paths(logged_in_client, engine, log_events) -> None:
+    payload = await active_payload(logged_in_client)
+    payload["geheimer_schluessel"] = 1  # an unknown key: its path names what the sender typed
+    base = (await active_row(engine)).settings_version_id
+    r = await post(
+        logged_in_client, {"payload": payload, "base_version_id": base, "acknowledged_warnings": []}
+    )
+    assert r.status_code == 422
+    (event,) = [e for e in log_events() if e["event"] == "settings_save_refused"]
+    assert (event["code"], event["errors"], event["issue_codes"]) == ("validation_failed", 1, ["invalid"])
+    assert "geheimer" not in str(log_events())

@@ -400,6 +400,13 @@ CASES: list[Any] = [
         id="query twice",
     ),
     C({"queries": [{"query_id": 0, "enabled": True}]}, out("queries[0].query_id"), id="query id 0"),
+    C({"queries": [{"query_id": 2**63 - 1, "enabled": True}]}, OK, id="query id bigint max"),
+    C({"queries": [{"query_id": 2**63, "enabled": True}]}, out("queries[0].query_id"), id="query id 2^63"),
+    C(
+        {"watchlist": [{"watchlist_company_id": 2**63, "enabled": True}]},
+        out("watchlist[0].watchlist_company_id"),
+        id="company id 2^63",
+    ),
     C({"queries": [{"query_id": 4}]}, bad("queries[0].enabled", "required"), id="query without enabled"),
     C(
         {"watchlist": [{"watchlist_company_id": i, "enabled": True} for i in range(1, 101)]},
@@ -507,6 +514,29 @@ CASES: list[Any] = [
     C({"retention.score_history_months": 12.0}, bad("retention.score_history_months"), id="months as float"),
     C({"schedule.enabled": 1}, bad("schedule.enabled"), id="enabled as 1"),
     C({"colour": "blue"}, bad("colour"), id="unknown top-level key"),
+    # a NUL character in any string, at its path (no JSONB column stores one)
+    C({"scope.excluded_keywords": ["Prak\x00tikum"]}, bad("scope.excluded_keywords[0]"), id="NUL keyword"),
+    C(
+        {"scope.locations": [loc(1, label="Muster\x00stadt")]},
+        bad("scope.locations[0].label"),
+        id="NUL label",
+    ),
+    C({"scope.excluded_companies": ["Muster\x00AG"]}, bad("scope.excluded_companies[0]"), id="NUL company"),
+    C({"scope.industries_include": ["Lo\x00gistik"]}, bad("scope.industries_include[0]"), id="NUL industry"),
+    C(
+        {"scope.excluded_keywords": ["Prak\x00tikum"], "schedule.interval_hours": 0},
+        [
+            ("payload.schedule.interval_hours", "out_of_range"),
+            ("payload.scope.excluded_keywords[0]", "invalid"),
+        ],
+        id="NUL beside a Pydantic error",
+    ),
+    C({"schedule.anchor_local": "06:\x000"}, bad("schedule.anchor_local"), id="NUL in a refused field, once"),
+    C(
+        {"scope.excluded_keywords": ["Prak\x00tikum"], "evaluation.t3_min_mid": 60},
+        [("payload.scope.excluded_keywords[0]", "invalid"), ("payload.evaluation.t3_min_mid", "conflict")],
+        id="NUL before the cross-field rules",
+    ),
     C({"scope.locations": {"label": "Musterstadt"}}, bad("scope.locations"), id="locations not a list"),
 ]
 

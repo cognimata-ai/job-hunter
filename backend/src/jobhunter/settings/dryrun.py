@@ -2,7 +2,10 @@
 settings page shows on every change and that a save runs again (Task 17).
 
 `dry_run` composes §6.8's pseudo-code in its order:
-1. `validate_fields` (with the eval gate, `eval_gate_state`); on any issue the result holds the errors only;
+1. `validate_fields` (with the eval gate, `eval_gate_state`), then `unknown_references` (Task 17): an entry
+   of `queries[]` or `watchlist[]` whose id names no row is an `invalid` error at the entry's id. On any issue
+   the result holds the errors only, so the preview and the save (which runs this again) refuse the same
+   documents;
 2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `serpapi_disabled_no_fallback`);
 3. `paid_cells`: the enabled queries times the location keys (the scope's locations, plus `remote-de` with
    remote work within Germany, `quota.planner.location_keys`);
@@ -64,7 +67,13 @@ from jobhunter.settings.llm_projection import (
     scoring_share,
 )
 from jobhunter.settings.model import Settings
-from jobhunter.settings.validate import FieldIssue, eval_gate_state, validate_fields, warnings_only
+from jobhunter.settings.validate import (
+    FieldIssue,
+    eval_gate_state,
+    field_path,
+    validate_fields,
+    warnings_only,
+)
 from jobhunter.types import JSONValue
 
 # A proposal has no settings version or scope version yet; the quota projections read neither id.
@@ -83,6 +92,14 @@ _RETAINED_CURRENT_REVISIONS: Final = q(
 )
 _EVALUATION_POLICY_RATE: Final = q(
     "SELECT projected_critic_rate FROM evaluation_policies WHERE policy_hash = :h"
+)
+_MISSING_QUERIES: Final = q(
+    "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
+    "WHERE NOT EXISTS (SELECT 1 FROM queries q WHERE q.id = u.id)"
+)
+_MISSING_COMPANIES: Final = q(
+    "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
+    "WHERE NOT EXISTS (SELECT 1 FROM watchlist_companies w WHERE w.id = u.id)"
 )
 
 
@@ -103,6 +120,26 @@ async def active_settings(conn: AsyncConnection) -> Settings:
     if payload is None:
         raise LookupError("active_config has no settings version")
     return Settings.model_validate(payload)
+
+
+async def unknown_references(conn: AsyncConnection, settings: Settings) -> list[FieldIssue]:
+    """An `invalid` issue at each `queries[]` or `watchlist[]` entry of `settings` whose id names no row
+    (plain reads; the ids are bounded by the model, so they fit `bigint`)."""
+    query_ids = [entry.query_id for entry in settings.queries]
+    company_ids = [entry.watchlist_company_id for entry in settings.watchlist]
+    missing_queries = set((await conn.execute(_MISSING_QUERIES, {"ids": query_ids})).scalars())
+    missing_companies = set((await conn.execute(_MISSING_COMPANIES, {"ids": company_ids})).scalars())
+    return [
+        FieldIssue(field_path(("queries", i, "query_id")), "invalid", "no such query")
+        for i, query_id in enumerate(query_ids)
+        if query_id in missing_queries
+    ] + [
+        FieldIssue(
+            field_path(("watchlist", i, "watchlist_company_id")), "invalid", "no such watchlist company"
+        )
+        for i, company_id in enumerate(company_ids)
+        if company_id in missing_companies
+    ]
 
 
 async def count_retained_current_revisions(conn: AsyncConnection) -> int:
@@ -196,7 +233,9 @@ async def dry_run(
     """The §6.8 dry-run of `payload` against the `active` settings at `now` (module docstring)."""
     gate = await eval_gate_state(conn)
     proposed, errors = validate_fields(payload, gate=gate)
-    if proposed is None:
+    if proposed is not None:
+        errors = await unknown_references(conn, proposed)
+    if proposed is None or errors:
         return DryRunResult(errors=errors, warnings=[], projections={}, effects=frozenset())
     warns = warnings_only(proposed, gate=gate)
 

@@ -11,10 +11,13 @@ a map (`payload.scope.locations[0].radius_km`, `payload.scope.language_policy.fr
   overrun buffer below its §6.9.1 bound (a lower limit that the other fields set);
 - `unsupported`: a model or effort that §10.3 does not list, or that the node's model does not support (G5);
 - `conflict`: a rule across fields (below), and generator effort `low` while the eval gate has failed;
-- `invalid`: anything else, an unknown key, a wrong JSON type or value, a repeated set value included.
+- `invalid`: anything else, an unknown key, a wrong JSON type or value, a repeated set value included, and a
+  string holding a NUL character (U+0000), which no JSONB column can store, at any depth of the document.
 
-**Order.** The Pydantic errors come first; when there is any, the payload has no `Settings` and no other rule
-runs. Otherwise every rule runs, in document order, and every issue it finds is reported:
+**Order.** The Pydantic errors come first, then a NUL issue at each string path the Pydantic errors do not
+already name; when there is any Pydantic error, the payload has no `Settings` and no other rule runs.
+Otherwise the NUL issues come first, then every rule runs, in document order, and every issue it finds is
+reported:
 1. scope: at least one location or `remote_within_germany`; no place twice (`gazetteer_id`), a label that
    has a location key (`run_settings.slug`, the `coverage_cells.location_key`), no key twice and none equal
    to `sources.base.REMOTE_DE`, the key of the remote-within-Germany cells; no industry and no company twice
@@ -112,18 +115,35 @@ def _issue(code: IssueCode, message: str, *loc: str | int) -> FieldIssue:
     return FieldIssue(field_path(loc), code, message)
 
 
+def _nul_strings(value: JSONValue, loc: tuple[str | int, ...] = ()) -> Iterator[FieldIssue]:
+    """An `invalid` issue at each string of `value` that holds a NUL character, in document order."""
+    if isinstance(value, str):
+        if "\x00" in value:
+            yield FieldIssue(field_path(loc), "invalid", "must not contain a NUL character")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _nul_strings(item, (*loc, key))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            yield from _nul_strings(item, (*loc, i))
+
+
 def validate_fields(
     payload: JSONValue, *, gate: GateState = "uncalibrated"
 ) -> tuple[Settings | None, list[FieldIssue]]:
     """The settings of `payload` and no issue, or no settings and every issue (module docstring)."""
+    nul = list(_nul_strings(payload))
     try:
         settings = Settings.model_validate(payload)
     except ValidationError as exc:
-        return None, [
+        errors = [
             FieldIssue(field_path(error["loc"]), _code(error["type"]), error["msg"])
             for error in exc.errors(include_url=False, include_input=False)
         ]
+        named = {error.field for error in errors}
+        return None, [*errors, *(issue for issue in nul if issue.field not in named)]
     issues = [
+        *nul,
         *_scope(settings),
         *_evaluation(settings),
         *_sources(settings),

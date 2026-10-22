@@ -6,12 +6,14 @@
    Deviation 15's internal saves) makes this a no-op; a second save waits here for the first one's commit.
 2. A `base_version_id` other than the active version is 409 `stale_base_version` (§13.2): of two tabs saving
    from one base, the second waits at step 1 and fails here, never deadlocks.
-3. The dry-run again (`dryrun.dry_run`, §13.2), on the payload against the active settings: its errors are
-   422 `validation_failed` with each issue's path, code and message; each warning code missing from
-   `acknowledged_warnings` is 422 `validation_failed` with `FieldError("acknowledged_warnings",
-   "warning_not_acknowledged", <code>)`. An internal save (`internal=True`, Deviation 15) skips the
-   acknowledgement check and copies the active version's acknowledgements. A save of class `collection`
-   also needs its `queries[]` and `watchlist[]` entries to name existing rows (422 at the entry's id).
+3. The dry-run again (`dryrun.dry_run`, §13.2), on the payload against the active settings: its errors (the
+   field rules, and `queries[]`/`watchlist[]` entries that name no row) are 422 `validation_failed` with each
+   issue's path, code and message; each warning code missing from `acknowledged_warnings` is 422
+   `validation_failed` with `FieldError("acknowledged_warnings", "warning_not_acknowledged", <code>)`. An
+   internal save (`internal=True`, Deviation 15) skips the acknowledgement check and copies the active
+   version's acknowledgements. Then the eval gate (§11.13), once, when the classes hold `llm_tuple` or
+   `evaluation_policy`: uncalibrated in M2, so skipped; a failed gate without `eval_override_ack` is 409
+   `eval_gate_failed`. Every refusal therefore comes before the first write.
 4. The derived rows (`derive.derived` with the active profile, Deviation 14; `ensure_derived`).
 5. The version row: `version_no = max + 1` (the step-1 lock serialises the writers, the unique constraint
    backs it), the stored payload `Settings.to_payload()` (the normal form, never the request; Deviation 38),
@@ -21,20 +23,20 @@
    (`active_config` → owner row → `llm_budget` → … → other domain rows → `ranking_state`), and `collection`
    after `schedule`, since `load_run_settings` joins `schedule_state`. The fault point
    `settings.after_llm_tuple` lies between `llm_tuple` and `scope`.
-   - `llm_tuple`: the eval gate (§11.13; uncalibrated in M2, so skipped), `model_policy_id := new`, and with
-     an active profile the tuple (`ensure_tuple`) and `llm_tuple_id := it`. §12.6 (d) to (f) and
-     `create_targets_for_tuple` are M3's (Deviation 10);
+   - `llm_tuple`: `model_policy_id := new`, and with an active profile the tuple (`ensure_tuple`) and
+     `llm_tuple_id := it`. §12.6 (d) to (f) and `create_targets_for_tuple` are M3's (Deviation 10);
    - `scope`: `scope_apply.set_desired_scope` with the derived scope;
-   - `budget`: when the cap or the buffer changed, the month row is created if new (`ensure_month`) and
-     changed under its lock (`change_cap`; §6.9.1). The other budget fields live in the settings only, so a
-     save of them leaves the row, and a lowering recorded earlier keeps its time;
+   - `budget`: the month row is created if new (`ensure_month`) and changed under its lock (§6.9.1): a new cap
+     through `change_cap` (with the new buffer), a new buffer alone through `change_buffer`, which leaves a
+     lowering `change_cap` recorded earlier at its own time. The other budget fields live in the settings
+     only, so a save of them leaves the row;
    - `schedule`: `schedule_state` reset in one statement (§3.4): the anchor on the save date, the interval,
      `enabled`, the cursor at the latest slot at or before `now`, and the version;
    - `collection`: the instance of every `watchlist[]` board (`instance_for_company`), then the cells of the
      new version (`ensure_cells`; new cells start never covered);
    - `admission`: the flip only (the `max_ad_age_days` expiry sweep needs targets, M3);
    - `execution`: `execution_config_id := new`;
-   - `evaluation_policy`: the eval gate, then `evaluation_policy_id := new` (the row is step 4's).
+   - `evaluation_policy`: `evaluation_policy_id := new` (the row is step 4's).
    After every action, when the tuple pointer changed, `ranking.bump` runs once: `ranking_state` is the
    last lock of §3.3.3, after the `budget` action's month row.
 7. `settings_version_id := new` and `updated_at`, in the statement that flips the pointers of step 6.
@@ -44,8 +46,9 @@ Every write of the class actions that takes a row lock follows that order. The r
 row (the derived rows, the version, the tuple) are new rows of tables that only writers holding
 `active_config` `FOR UPDATE` insert into, so no other transaction can hold or wait for them.
 
-`ensure_tuple` is the one select-or-insert of an `llm_tuples` row (Task 21's confirm reuses it). Nothing here
-logs: the caller logs ids and codes after its commit.
+`ensure_tuple` is the one select-or-insert of an `llm_tuples` row (Task 21's confirm reuses it). Neither this
+module nor `scope_apply` logs: the caller logs ids and codes after its commit. (`spend_ledger.change_cap` and
+`change_buffer` log the month row's change in the transaction, as every month-row writer of Task 3 does.)
 """
 
 from collections.abc import Awaitable, Callable, Mapping
@@ -72,7 +75,7 @@ from jobhunter.settings.derive import DerivedIds, derived, ensure_derived
 from jobhunter.settings.dryrun import dry_run
 from jobhunter.settings.effects import EffectClass
 from jobhunter.settings.model import Settings
-from jobhunter.settings.validate import eval_gate_state, field_path
+from jobhunter.settings.validate import eval_gate_state
 from jobhunter.sources.instances import instance_for_company, list_instances
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import Deferrer
@@ -113,14 +116,6 @@ _INSERT_TUPLE: Final = q(
 _RESET_SCHEDULE: Final = q(
     "UPDATE schedule_state SET anchor_utc = :anchor_utc, interval_s = :interval_s, enabled = :enabled, "
     "last_evaluated_slot = :slot, settings_version_id = :settings_version_id, updated_at = :now WHERE id = 1"
-)
-_MISSING_QUERIES: Final = q(
-    "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
-    "WHERE NOT EXISTS (SELECT 1 FROM queries q WHERE q.id = u.id)"
-)
-_MISSING_COMPANIES: Final = q(
-    "SELECT u.id FROM unnest(CAST(:ids AS bigint[])) AS u(id) "
-    "WHERE NOT EXISTS (SELECT 1 FROM watchlist_companies w WHERE w.id = u.id)"
 )
 # A pointer the save does not flip keeps its value (`coalesce` over a NULL parameter).
 _FLIP: Final = q(
@@ -192,10 +187,13 @@ class _Activation:
     apply_scope_operation_id: int | None = None
 
 
-async def _check_eval_gate(a: _Activation) -> None:
+_GATED: Final[frozenset[EffectClass]] = frozenset({"llm_tuple", "evaluation_policy"})
+
+
+async def _check_eval_gate(conn: AsyncConnection, req: SaveRequest) -> None:
     """§11.13: a change the gate covers must pass, or the override is acknowledged. Before 30 golden cases the
     gate is `uncalibrated` and skipped, which in M2 it always is (`eval_gate_state`)."""
-    if await eval_gate_state(a.conn) == "failed" and not a.req.eval_override_ack:
+    if await eval_gate_state(conn) == "failed" and not req.eval_override_ack:
         raise Problem(
             409,
             "eval_gate_failed",
@@ -205,7 +203,6 @@ async def _check_eval_gate(a: _Activation) -> None:
 
 
 async def _apply_llm_tuple(a: _Activation) -> None:
-    await _check_eval_gate(a)
     a.flips["model_policy_id"] = a.ids.model_policy_id
     profile_version_id = a.active.profile_version_id
     if isinstance(profile_version_id, int):
@@ -219,19 +216,25 @@ async def _apply_llm_tuple(a: _Activation) -> None:
 
 async def _apply_scope(a: _Activation) -> None:
     a.apply_scope_operation_id = await scope_apply.set_desired_scope(
-        a.conn, a.ids.scope_version_id, defer=a.defer
+        a.conn, a.ids.scope_version_id, now=a.now, defer=a.defer
     )
 
 
 async def _apply_budget(a: _Activation) -> None:
     new, old = BudgetParams.from_payload(a.payload), BudgetParams.from_payload(a.before.to_payload())
-    if (new.cap_usd, new.overrun_buffer_usd) == (old.cap_usd, old.overrun_buffer_usd):
+    cap_changed = new.cap_usd != old.cap_usd
+    if not cap_changed and new.overrun_buffer_usd == old.overrun_buffer_usd:
         return
     month = budget.month_of(a.now)
     await spend_ledger.ensure_month(a.conn, month, new, a.now)
-    await spend_ledger.change_cap(
-        a.conn, month=month, cap_usd=new.cap_usd, overrun_buffer_usd=new.overrun_buffer_usd, now=a.now
-    )
+    if cap_changed:
+        await spend_ledger.change_cap(
+            a.conn, month=month, cap_usd=new.cap_usd, overrun_buffer_usd=new.overrun_buffer_usd, now=a.now
+        )
+    else:
+        await spend_ledger.change_buffer(
+            a.conn, month=month, overrun_buffer_usd=new.overrun_buffer_usd, now=a.now
+        )
 
 
 async def _apply_schedule(a: _Activation) -> None:
@@ -269,7 +272,6 @@ async def _apply_execution(a: _Activation) -> None:
 
 
 async def _apply_evaluation_policy(a: _Activation) -> None:
-    await _check_eval_gate(a)
     a.flips["evaluation_policy_id"] = a.ids.evaluation_policy_id
 
 
@@ -291,27 +293,6 @@ ACTION_ORDER: Final[tuple[EffectClass, ...]] = tuple(_ACTIONS)
 
 def _validation_failed(errors: list[FieldError]) -> Problem:
     return Problem(422, "validation_failed", "Settings validation failed", errors=errors)
-
-
-async def _check_references(conn: AsyncConnection, proposed: Settings) -> None:
-    """422 at each `queries[]` or `watchlist[]` entry whose id names no row."""
-    query_ids = [entry.query_id for entry in proposed.queries]
-    company_ids = [entry.watchlist_company_id for entry in proposed.watchlist]
-    missing_queries = set((await conn.execute(_MISSING_QUERIES, {"ids": query_ids})).scalars())
-    missing_companies = set((await conn.execute(_MISSING_COMPANIES, {"ids": company_ids})).scalars())
-    errors = [
-        FieldError(field_path(("queries", i, "query_id")), "invalid", "no such query")
-        for i, query_id in enumerate(query_ids)
-        if query_id in missing_queries
-    ] + [
-        FieldError(
-            field_path(("watchlist", i, "watchlist_company_id")), "invalid", "no such watchlist company"
-        )
-        for i, company_id in enumerate(company_ids)
-        if company_id in missing_companies
-    ]
-    if errors:
-        raise _validation_failed(errors)
 
 
 async def _active_profile(conn: AsyncConnection, profile_version_id: object) -> ConfirmedProfile | None:
@@ -355,8 +336,8 @@ async def save_settings(
         acknowledged = sorted(req.acknowledged_warnings)
     proposed = Settings.model_validate(req.payload)  # valid: the dry-run found no error
     effects = result.effects
-    if "collection" in effects:
-        await _check_references(conn, proposed)
+    if effects & _GATED:
+        await _check_eval_gate(conn, req)
 
     payload = proposed.to_payload()
     ids = await ensure_derived(

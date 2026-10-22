@@ -2,8 +2,8 @@
 `settings.dryrun.dry_run` on PostgreSQL.
 
 Every payload is the seeded document with one location and four enabled queries (synthetic: an invented
-town and query ids), changed for the case. The projections run on fresh windows: no quota window exists, so
-each is simulated in memory.
+town and query ids, whose rows `query_rows` inserts), changed for the case. The projections run on fresh
+windows: no quota window exists, so each is simulated in memory.
 """
 
 import asyncio
@@ -53,6 +53,20 @@ def with_(doc: dict[str, Any], path: str, value: Any) -> dict[str, Any]:
         node = node[part]
     node[key] = value
     return doc
+
+
+# The dry-run refuses a `queries[]` entry whose id names no row (Task 17): `base` names ids 1 to 24.
+_QUERY_ROWS = sa.text(
+    "INSERT INTO queries (id, text, lang, origin) OVERRIDING SYSTEM VALUE "
+    "SELECT i, 'Testabfrage ' || i, 'de', 'user' FROM generate_series(1, 24) AS i"
+)
+
+
+@pytest.fixture(autouse=True)
+async def query_rows(engine: AsyncEngine) -> None:
+    """The query rows of `base`'s ids, with invented texts; the reset after the test removes them."""
+    async with engine.begin() as conn:
+        await conn.execute(_QUERY_ROWS)
 
 
 @pytest.fixture

@@ -14,7 +14,8 @@ eval_override_ack?}`) → 201 `{version: {id, version_no, effect_classes}, apply
 `active_config` `FOR UPDATE` first, then `run_idempotent` around the save, whose own `FOR UPDATE` is then a
 no-op. Unlike `POST /api/runs` it never takes `FOR SHARE` first: two tabs holding the shared lock would
 deadlock on the upgrade, where this way the second waits and gets 409 `stale_base_version`. The request's
-fingerprint takes the acknowledged codes as a set (sorted), so a reordered retry replays. 409 is also
+fingerprint takes the acknowledged codes as a set (sorted), so a reordered retry replays. `settings_saved` is
+logged after the commit when the save ran (a replay is `run_idempotent`'s `idempotent_replay`). 409 is also
 `eval_gate_failed` (§11.13) and `idempotency_in_progress`; 422 is `validation_failed` (the dry-run's errors,
 an unacknowledged warning, an unknown query or watchlist company) and `idempotency_key_reused`.
 
@@ -327,9 +328,12 @@ async def save_settings_version(
     codes: list[JSONValue] = [*sorted(acknowledged)]  # a set: a reordered retry is the same request
     fingerprint = request_fingerprint({**body.model_dump(mode="json"), "acknowledged_warnings": codes}, {})
 
+    saved: list[SaveOut] = []  # the handler's outcome; empty on a replay of the stored response
+
     async def handler(conn: AsyncConnection) -> StoredResponse:
-        outcome = await save_settings(conn, request, now=now, defer=defer_in_tx)
-        return StoredResponse(201, _saved(outcome).model_dump(mode="json"))
+        outcome = _saved(await save_settings(conn, request, now=now, defer=defer_in_tx))
+        saved.append(outcome)
+        return StoredResponse(201, outcome.model_dump(mode="json"))
 
     try:
         async with engine.begin() as conn:
@@ -337,22 +341,22 @@ async def save_settings_version(
             stored = await run_idempotent(
                 conn, route=SAVE_ROUTE, key=key, fingerprint=fingerprint, now=now, handler=handler
             )
-    except Problem as problem:
+    except Problem as problem:  # counts and codes: a field path can hold a key the sender typed
         log.info(
             "settings_save_refused",
             code=problem.code,
-            fields=sorted({e.field for e in problem.errors or []}),
+            errors=len(problem.errors or []),
             issue_codes=sorted({e.code for e in problem.errors or []}),
         )
         raise
-    saved = SaveOut.model_validate(stored.body)
-    log.info(
-        "settings_saved",
-        version_id=saved.version.id,
-        version_no=saved.version.version_no,
-        effects=saved.version.effect_classes,
-        apply_scope_operation_id=saved.apply_scope_operation_id,
-    )
+    for outcome in saved:  # after the commit; a replay is logged by `run_idempotent` (`idempotent_replay`)
+        log.info(
+            "settings_saved",
+            version_id=outcome.version.id,
+            version_no=outcome.version.version_no,
+            effects=outcome.version.effect_classes,
+            apply_scope_operation_id=outcome.apply_scope_operation_id,
+        )
     return JSONResponse(stored.body, status_code=stored.status)
 
 

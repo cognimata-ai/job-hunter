@@ -4,9 +4,9 @@ positive evidence says it was not charged. Every function runs in the caller's t
 
 **Lock order** (§3.3.3, §9.1): `active_config` (`current_params`, `FOR SHARE`) → the owner row (`FOR SHARE`
 with its predicate; `FOR UPDATE` in recovery) → the `llm_budget` month row (`FOR UPDATE`) → ledger rows.
-Every reservation, settlement, release, cap edit and accrual takes the month row; the dispatch marker takes
-the owner row only (it changes no counter). So a caller that holds the owner row must not call `settle` or
-`release_never_dispatched` afterwards in the same transaction: both read `active_config` first.
+Every reservation, settlement, release, cap or buffer edit and accrual takes the month row; the dispatch
+marker takes the owner row only (it changes no counter). So a caller that holds the owner row must not call
+`settle` or `release_never_dispatched` afterwards in the same transaction: both read `active_config` first.
 
 **Reservation** (`reserve`, in the §3.3.3 order): the params, the owner lock (and no active `global` purge
 fence unless the owner is the purge operation itself, §20.2), the month row created from the current params if
@@ -340,6 +340,19 @@ async def change_cap(
         overrun_buffer_usd=str(overrun_buffer_usd),
         cap_lowered=row.cap_lowered_at == now,
     )
+
+
+async def change_buffer(
+    conn: AsyncConnection, *, month: date, overrun_buffer_usd: Decimal, now: datetime
+) -> None:
+    """A save of class `budget` that changes the overrun buffer and not the cap (Task 17): the buffer is
+    written to `month`'s row under its lock (§6.9.1). The cap, and a lowering `change_cap` recorded with its
+    time and counted spend, stay as they are; the 80% share reads the cap only. The row must exist
+    (`ensure_month` first)."""
+    row = await _lock_row(conn, month)
+    row.overrun_buffer_usd = overrun_buffer_usd
+    await _save(conn, row, now)
+    log.info("llm_buffer_changed", month=month.isoformat())
 
 
 # ---- reservation and dispatch (§6.9.1, §10.7, §7.16.7) ----------------------------------------------------

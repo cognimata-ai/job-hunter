@@ -87,6 +87,7 @@ _USD_PLACES: Final = 2  # the fixed scale of the USD amounts (`llm_budget`: nume
 _RATE_PLACES: Final = 2  # the most places of a rate, written without trailing zeros (Ruling R15-5)
 _INDUSTRY_LENGTH: Final = (2, 60)
 _SETTLE_ROUNDS: Final = 8
+_BIGINT_MAX: Final = 2**63 - 1  # the ids are `bigint` row ids (`queries.id`, `watchlist_companies.id`)
 
 
 class _Group(BaseModel):
@@ -356,12 +357,12 @@ class Sources(_Group):
 
 
 class QueryEntry(_Group):
-    query_id: int = Field(ge=1)  # the texts live in `queries`
+    query_id: int = Field(ge=1, le=_BIGINT_MAX)  # the texts live in `queries`
     enabled: bool
 
 
 class WatchlistEntry(_Group):
-    watchlist_company_id: int = Field(ge=1)
+    watchlist_company_id: int = Field(ge=1, le=_BIGINT_MAX)
     enabled: bool
 
 
