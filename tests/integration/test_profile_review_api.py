@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import pytest
 import sqlalchemy as sa
-from jobhunter.api.routes import profile as profile_routes
+from jobhunter.api.routes import profile_review as profile_routes
 from jobhunter.db.transitions import transition
 from jobhunter.llm import bounds, fake
 from jobhunter.profile.contacts import Edits, apply_edits, strip_contacts
@@ -46,6 +46,8 @@ EMAIL_VALUE = "erika.musterfrau@example.org"
 # What contact stripping takes out of `REVIEW_CV`: no response or log line may hold any of them.
 STRIPPED_VALUES = ("Erika Musterfrau", EMAIL_VALUE, "Religion und Ethik", "Wahlfach")
 FIRM = (REVIEW_CV.index("Musterfirma GmbH"), REVIEW_CV.index("Musterfirma GmbH") + len("Musterfirma GmbH"))
+# The header's e-mail address, replacement EMAIL of the fresh strip.
+HEADER_EMAIL = (REVIEW_CV.index(EMAIL_VALUE), REVIEW_CV.index(EMAIL_VALUE) + len(EMAIL_VALUE))
 # The e-mail address inside the personal line, which has no index in the fresh strip.
 INNER_EMAIL = (REVIEW_CV.rindex(EMAIL_VALUE), REVIEW_CV.rindex(EMAIL_VALUE) + len(EMAIL_VALUE))
 PURGED = "The CV was deleted after 30 days; upload or paste it again"
@@ -351,6 +353,21 @@ async def test_restore_by_span_reaches_a_contact_inside_a_restored_personal_span
         ),
         pytest.param([remove(-3, 4)], [("body.span_edits.0.start", "out_of_range")], id="negative-start"),
         pytest.param(
+            [remove(10, 20), remove(10, 20)],
+            [("body.span_edits.1.start", "duplicate")],
+            id="duplicate-removal",
+        ),
+        pytest.param(
+            [restore(EMAIL), restore(EMAIL)],
+            [("body.span_edits.1.replacement_index", "duplicate")],
+            id="same-index-twice",
+        ),
+        pytest.param(
+            [restore(EMAIL), restore_span(*HEADER_EMAIL)],
+            [("body.span_edits.1.start", "duplicate")],
+            id="index-and-its-span",
+        ),
+        pytest.param(
             [restore(3)], [("body.span_edits.0.replacement_index", "unknown_replacement")], id="index"
         ),
         pytest.param(
@@ -411,7 +428,10 @@ async def test_a_text_edit_outside_the_review_states_is_a_409(
 
 async def test_a_native_draft_has_no_text_to_edit(engine, logged_in_client, upload) -> None:
     draft_id = await upload(TEXT_PDF, native_pdf_opt_in=True)  # the PDF itself is sent: no text was read
-    async with engine.begin() as conn:  # as its extraction would end (not run here)
+    # The draft is moved to `ready` by hand while its `extract_profile` operation is still pending: no route
+    # makes that state (the extraction ends the operation with its `ready` write). It is harmless here: the
+    # operation never runs in this test, and the 409 asserted below depends only on the missing raw text.
+    async with engine.begin() as conn:
         await transition(
             conn,
             "profile_drafts",
@@ -567,6 +587,29 @@ async def test_no_native_pdf_repair_or_retry_while_the_native_path_is_disabled(
     r = await retry(logged_in_client, did, mode="native_pdf", ack_native_pdf=True)
     assert problem(r) == (409, "conflict_state")
     assert await extract_ops(engine) == [] and (await draft_row(engine, did)).status == "failed"
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["native-enabled", "native-disabled"])
+async def test_a_native_draft_that_check_pdf_failed_offers_paste_text_only(
+    engine, logged_in_client, op_runner, upload, monkeypatch, enabled: bool
+) -> None:
+    """Fix round 1: `check_pdf` answers `encrypted` again for the same file, so neither retry is admitted."""
+    draft_id = await upload(encrypted_pdf(TEXT_PDF), native_pdf_opt_in=True)
+    await op_runner.run_pending()  # check_pdf: docparse finds the encryption before anything is sent
+    draft = await draft_row(engine, draft_id)
+    assert (draft.status, draft.failure_code, draft.native_pdf) == ("failed", "encrypted", True)
+    assert await count_rows(engine, "llm_calls") == 0
+    monkeypatch.setattr(bounds, "NATIVE_PDF_ENABLED", enabled)  # after the opt-in upload, which needs it
+    assert (await draft_row_api(logged_in_client, draft_id))["repairs"] == ["paste_text"]
+    [upload_op] = await extract_ops(engine)  # the opt-in upload's own, ended with the failure
+    llm = await retry(logged_in_client, draft_id, mode="llm")
+    native = await retry(
+        logged_in_client, draft_id, "retry-key-000002", mode="native_pdf", ack_native_pdf=True
+    )
+    for r in (llm, native):
+        assert problem(r) == (409, "conflict_state") and r.json()["detail"] != PURGED
+    assert [op.id for op in await extract_ops(engine)] == [upload_op.id]
+    assert (await draft_row(engine, draft_id)).status == "failed"
 
 
 async def test_retry_llm_of_a_text_phase_failure_is_a_409_not_a_500(

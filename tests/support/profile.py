@@ -44,9 +44,11 @@ Task 13 adds the extract phase:
   contact stripping keeps, and its one planted issue is `total_years_experience`, far below what its roles
   cover (`years_mismatch`);
 - `upload(pdf, native_pdf_opt_in=True)`: the native-PDF opt-in upload (§12.7);
-- `approve_text`, `retry_draft` and `reopen_text_review`: the approval, the retry and the edit from `ready` as
-  Task 14's routes will make them (the draft's transition, which clears any `failure_code` and reason, and,
-  for the first two, the `extract_profile` operation, no job deferred);
+- `approve_text`, `retry_draft` and `reopen_text_review`: the approval, the retry and the edit from `ready`,
+  written directly for the extract-phase tests (the draft's transition, which clears any `failure_code` and
+  reason, and, for the first two, the `extract_profile` operation, no job deferred). They are no copy of Task
+  14's routes (`api/routes/profile_review.py`): each docstring says where it differs, and a test of a route's
+  own behaviour calls the route;
 - `OpRunner.sleeps`: the backoff waits of the runner's gateway, recorded instead of waited.
 
 Task 14 adds the review routes' side:
@@ -697,9 +699,14 @@ _REVIEWABLE = sa.text(
 
 
 async def approve_text(engine: AsyncEngine, draft_id: int, text: str | None = None) -> int:
-    """The approval of Task 14's `POST …/text-review`: `reviewed_text` (`text`, by default the draft's
-    stripped text) and its sha256, `text_review → extracting_profile` and the `extract_profile` operation; its
-    id."""
+    """An approval as `POST …/text-review` makes it: `reviewed_text` (`text`, by default the draft's stripped
+    text) and its sha256, `text_review → extracting_profile` and the `extract_profile` operation; its id.
+
+    Unlike the route: `text` may differ from the stored stripped text (the sha256 guard tests need that); it
+    leaves `native_pdf` as it is (the route sets it false); it takes no `Idempotency-Key` and stores no
+    response; it defers no job (`defer=None`); and it reads the stripped text in the statement that locks the
+    draft (`FOR UPDATE OF d`), with no lock on the `cv_files` row, where the route takes the file `FOR SHARE`
+    after the draft."""
     async with engine.begin() as conn:
         row = (await conn.execute(_REVIEWABLE, {"d": draft_id})).one()
         reviewed = row.stripped_text if text is None else text
@@ -722,8 +729,13 @@ async def approve_text(engine: AsyncEngine, draft_id: int, text: str | None = No
 
 
 async def retry_draft(engine: AsyncEngine, draft_id: int) -> int:
-    """Task 14's `POST …/retry` with `mode="llm"`: `failed → extracting_profile`, its failure code and reason
-    cleared, and a new `extract_profile` operation; its id."""
+    """A retry as `POST …/retry` with `mode="llm"` makes it: `failed → extracting_profile`, its failure code
+    and reason cleared, and a new `extract_profile` operation; its id.
+
+    Unlike the route: it checks none of the route's preconditions (`review.retry_refusal`: the approved text
+    or the PDF still there, not purged, the native path enabled for a native draft), so it reopens any failed
+    draft; it neither locks nor reads the `cv_files` row; it leaves `content_purged_at` as it is (the route
+    clears it); it takes no `Idempotency-Key`; and it defers no job."""
     async with engine.begin() as conn:
         await transition(
             conn,
@@ -740,7 +752,10 @@ async def retry_draft(engine: AsyncEngine, draft_id: int) -> int:
 
 
 async def reopen_text_review(engine: AsyncEngine, draft_id: int) -> None:
-    """Task 14's text edit from `ready`: `ready → text_review`, the `draft_json` discarded (§12.3)."""
+    """The draft side of a text edit from `ready` (§12.3): `ready → text_review`, the `draft_json` discarded.
+
+    Unlike `PUT …/text`: it applies no edit set (`stripped_text`, `strip_report` and `text_edits` stay as they
+    are), it leaves `validation_issues` (the route empties them), and it reads no raw text."""
     async with engine.begin() as conn:
         await transition(
             conn,

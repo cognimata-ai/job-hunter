@@ -8,8 +8,10 @@ Every name and datum is invented (Max Mustermann, Erika Musterfrau, example.org)
 from dataclasses import replace
 
 import pytest
+from jobhunter.llm.gateway import INVALID_OUTPUT, MAX_TOKENS, MODEL_MISMATCH, REFUSED, UNEXPECTED_STOP_REASON
 from jobhunter.profile.contacts import Edits, apply_edits, restore, strip_contacts
 from jobhunter.profile.review import (
+    MODEL_OUTCOME_CODES,
     PURGED_DETAIL,
     FailedDraft,
     InvalidEditSet,
@@ -88,12 +90,54 @@ CASES = [
     pytest.param(NATIVE, True, ["native_pdf", "retry_llm"], id="native-refused"),
     pytest.param(NATIVE, False, [], id="native-refused-native-disabled"),  # its retry sends the PDF again
     pytest.param(replace(NATIVE, has_file=False), True, [], id="native-file-purged"),
-    pytest.param(replace(NATIVE, failure_code="encrypted"), True, ["paste_text"], id="native-encrypted"),
+    # A docparse timeout may pass the next time; the flag decides.
     pytest.param(
-        replace(NATIVE, failure_code="parse_error"), True, ["paste_text", "retry_llm"], id="native-parse"
+        replace(NATIVE, failure_code="timeout"), True, ["paste_text", "retry_llm"], id="native-timeout"
+    ),
+    pytest.param(
+        replace(NATIVE, failure_code="timeout"), False, ["paste_text"], id="native-timeout-disabled"
     ),
     pytest.param(
         replace(NATIVE, failure_code="native_pdf_disabled"), False, ["paste_text"], id="native-disabled-code"
+    ),
+    pytest.param(
+        replace(NATIVE, failure_code="native_pdf_disabled"),
+        True,
+        ["paste_text", "retry_llm"],
+        id="native-disabled-code-flag-back",
+    ),
+    pytest.param(replace(NATIVE, failure_code="budget_exhausted"), True, ["retry_llm"], id="native-budget"),
+    # The model's outcomes: the original PDF may change them.
+    *(
+        pytest.param(
+            replace(REFUSED_UPLOAD, failure_code=code), True, ["native_pdf", "retry_llm"], id=f"upload-{code}"
+        )
+        for code in ("invalid_output", "refused", "max_tokens", "unexpected_stop_reason", "model_mismatch")
+    ),
+    # Every other extract-phase failure: the PDF cures none of them, and it sends the contacts (fix round 1).
+    *(
+        pytest.param(replace(REFUSED_UPLOAD, failure_code=code), True, ["retry_llm"], id=f"upload-{code}")
+        for code in (
+            "budget_exhausted",
+            "bug",
+            "llm_transient",
+            "attempts_exhausted",
+            "input_unbounded",
+            "llm_request_401",
+            "llm_request_500",
+        )
+    ),
+    # What `check_pdf` gives again for the same file: never a retry of the native path (fix round 1).
+    *(
+        pytest.param(replace(NATIVE, failure_code=code), True, ["paste_text"], id=f"native-{code}")
+        for code in (
+            "encrypted",
+            "too_many_pages",
+            "parse_error",
+            "parse_limit",
+            "unsupported",
+            "cv_file_unreadable",
+        )
     ),
 ]
 
@@ -125,6 +169,13 @@ def test_the_refusals_name_their_reason() -> None:
     assert reason(replace(TEXT_PHASE, mime=DOCX), "native_pdf") == "not_a_pdf"
     assert reason(REFUSED_PASTE, "native_pdf") == "not_a_pdf"
     assert reason(replace(NATIVE, failure_code="too_many_pages"), "llm") == "pdf_checks_failed"
+    assert reason(replace(NATIVE, failure_code="parse_error"), "llm") == "pdf_checks_failed"
+    assert (
+        reason(replace(REFUSED_UPLOAD, failure_code="budget_exhausted"), "native_pdf")
+        == "failure_not_admitted"
+    )
+    assert reason(replace(NATIVE, failure_code="encrypted"), "native_pdf") == "failure_not_admitted"
+    assert reason(NATIVE, "llm", enabled=False) == "native_disabled"
     purged = [
         retry_refusal(
             replace(REFUSED_PASTE, has_reviewed_text=False, content_purged=True), "llm", native_enabled=True
@@ -135,6 +186,12 @@ def test_the_refusals_name_their_reason() -> None:
     for refusal in purged:
         assert refusal is not None and (refusal.reason, refusal.detail) == ("input_purged", PURGED_DETAIL)
     assert PURGED_DETAIL == "The CV was deleted after 30 days; upload or paste it again"
+
+
+def test_the_model_outcome_codes_are_the_gateways() -> None:
+    assert frozenset({INVALID_OUTPUT, REFUSED, MAX_TOKENS, UNEXPECTED_STOP_REASON, MODEL_MISMATCH}) == (
+        MODEL_OUTCOME_CODES
+    )
 
 
 # --- the complete edit set -------------------------------------------------------------------------------
@@ -203,7 +260,12 @@ def test_a_contact_inside_a_restored_personal_span_is_restored_by_its_span() -> 
     ("edits", "errors"),
     [
         pytest.param([remove(1, 5), remove(4, 9)], [(1, "start", "overlap")], id="overlapping-removals"),
-        pytest.param([remove(4, 9), remove(4, 9)], [(1, "start", "overlap")], id="duplicate-removal"),
+        pytest.param([remove(4, 9), remove(4, 9)], [(1, "start", "duplicate")], id="duplicate-removal"),
+        pytest.param(
+            [restore_index(EMAIL), restore_index(EMAIL)],
+            [(1, "replacement_index", "duplicate")],
+            id="same-index-twice",
+        ),
         pytest.param(
             [remove(len(CV) - 1, len(CV) + 1)], [(0, "end", "out_of_range")], id="end-past-the-text"
         ),
@@ -253,6 +315,28 @@ def test_an_invalid_edit_set_names_each_invalid_edit(
     assert [(e.index, e.member, e.code) for e in bad.value.errors] == errors
     for error in bad.value.errors:  # fixed texts: no value of the CV
         assert "max@" not in error.message and "Mustermann" not in error.message and error.message
+
+
+def test_a_replacement_or_a_span_named_twice_is_a_duplicate_on_the_later_entry() -> None:
+    email = strip_contacts(CV).replacements[EMAIL]
+    cases = [
+        ([restore_index(EMAIL), restore_span(email.start, email.end)], [(1, "start", "duplicate")]),
+        (
+            [restore_span(email.start, email.end), restore_index(EMAIL)],
+            [(1, "replacement_index", "duplicate")],
+        ),
+        ([restore_index(PERSONAL), restore_span(*INNER), restore_span(*INNER)], [(2, "start", "duplicate")]),
+        (
+            [remove(*PYTHON), remove(PYTHON[0], PYTHON[1] + 2), remove(*PYTHON)],
+            [(1, "start", "overlap"), (2, "start", "duplicate")],
+        ),
+    ]
+    for edits, errors in cases:
+        with pytest.raises(InvalidEditSet) as bad:
+            rebuild(CV, edits)
+        assert [(e.index, e.member, e.code) for e in bad.value.errors] == errors, edits
+    # Without its duplicate the same set is valid.
+    assert rebuild(CV, [restore_index(PERSONAL), restore_span(*INNER)]).stripped_text.count("erika@") == 1
 
 
 def test_touching_removals_and_a_removal_over_a_replacement_are_valid() -> None:

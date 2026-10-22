@@ -410,7 +410,10 @@ export interface components {
             strip_report: {
                 [key: string]: number;
             } | null;
-            /** Stripped Text Preview */
+            /**
+             * Stripped Text Preview
+             * @description The contact-stripped text, never the raw text; `segments` index it. Offsets are Unicode code points, not UTF-16 code units: a JavaScript client must convert them, for example with Array.from(text).
+             */
             stripped_text_preview: string | null;
             /** Validation Issues */
             validation_issues: components["schemas"]["ValidationIssueOut"][];
@@ -690,7 +693,8 @@ export interface components {
          * @description One run of `stripped_text_preview` and the raw span it stands for (ruling R14-2): `text` (the same
          *     characters), `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact
          *     inside a restored personal span, which is restored by its span; `restorable` false for one that the edit
-         *     set cannot name), or `removed`. Offsets are code points.
+         *     set cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript
+         *     client must convert them, for example with `Array.from(text)`.
          */
         SegmentOut: {
             /** Category */
@@ -752,7 +756,9 @@ export interface components {
         /**
          * SpanEditIn
          * @description One edit of the set: `remove` with `start` and `end`, or `restore` with `replacement_index` (into the
-         *     fresh strip) or with the replacement's `start` and `end`. Offsets are code points of the raw text.
+         *     fresh strip) or with the replacement's `start` and `end`, offsets into the raw text. Offsets are Unicode
+         *     code points, not UTF-16 code units: a JavaScript client must convert them, for example with
+         *     `Array.from(text)`.
          */
         SpanEditIn: {
             /** End */
@@ -769,7 +775,8 @@ export interface components {
         };
         /**
          * SpanOut
-         * @description A span of the raw text: `start` and `end` are offsets (code points) into it.
+         * @description A span of the raw text: `start` and `end` are offsets into it. Offsets are Unicode code points, not
+         *     UTF-16 code units: a JavaScript client must convert them, for example with `Array.from(text)`.
          */
         SpanOut: {
             /** End */
@@ -779,7 +786,10 @@ export interface components {
         };
         /** StrippedTextOut */
         StrippedTextOut: {
-            /** Stripped Text Preview */
+            /**
+             * Stripped Text Preview
+             * @description The rebuilt contact-stripped text, never the raw text. Offsets are Unicode code points, not UTF-16 code units: a JavaScript client must convert them, for example with Array.from(text).
+             */
             stripped_text_preview: string;
         };
         /**
