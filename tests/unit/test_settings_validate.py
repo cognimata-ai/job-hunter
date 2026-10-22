@@ -485,15 +485,19 @@ CASES: list[Any] = [
     C({"llm.cap_usd": "-0"}, out("llm.cap_usd"), id="cap negative zero"),
     C({"evaluation.t2_straddle_max_coverage": "0.700"}, OK, id="coverage with trailing zeros"),
     C({"evaluation.t2_straddle_max_coverage": "-0"}, OK, id="coverage negative zero"),
+    # the rates take at most 2 decimal places (Ruling R15-5)
+    C({"evaluation.t2_straddle_max_coverage": "0.65"}, OK, id="coverage with 2 places"),
+    C({"evaluation.t2_straddle_max_coverage": "0.650"}, OK, id="coverage with a zero third place"),
     C(
-        {"evaluation.t2_straddle_max_coverage": "0.75"},
+        {"evaluation.t2_straddle_max_coverage": "0.655"},
         bad("evaluation.t2_straddle_max_coverage"),
-        id="2 places",
+        id="coverage with 3 places",
     ),
+    C({"scoring.bulk_rescore_max_budget_share": "0.45"}, OK, id="share with 2 places"),
     C(
-        {"scoring.bulk_rescore_max_budget_share": "0.45"},
+        {"scoring.bulk_rescore_max_budget_share": "0.455"},
         bad("scoring.bulk_rescore_max_budget_share"),
-        id="share",
+        id="share with 3 places",
     ),
     C({"llm.overrun_buffer_usd": "2.000"}, OK, id="buffer with a zero third place"),
     C({"llm.cap_usd": "hundred"}, bad("llm.cap_usd"), id="cap word"),

@@ -81,16 +81,25 @@ def written(doc: dict[str, Any], group: str, field: str) -> object:
         ("llm", "cap_usd", "2.00", "2.00"),
         ("llm", "overrun_buffer_usd", "2.000", "2.00"),
         ("llm", "min_bucket_capacity_usd", "0.1", "0.10"),
-        # the rates at 1 place, the scale of their seed values
+        # the rates with at most 2 places and no trailing zero (Ruling R15-5)
         ("evaluation", "t2_straddle_max_coverage", "0.7", "0.7"),
         ("evaluation", "t2_straddle_max_coverage", "0.70", "0.7"),
         ("evaluation", "t2_straddle_max_coverage", "0.700000", "0.7"),
-        ("evaluation", "t2_straddle_max_coverage", "1", "1.0"),
-        ("evaluation", "t2_straddle_max_coverage", "0", "0.0"),
-        ("evaluation", "t2_straddle_max_coverage", "-0", "0.0"),
-        ("evaluation", "t2_straddle_max_coverage", "-0.0", "0.0"),
-        ("scoring", "bulk_rescore_max_budget_share", "1", "1.0"),
+        ("evaluation", "t2_straddle_max_coverage", "0.65", "0.65"),
+        ("evaluation", "t2_straddle_max_coverage", "0.650", "0.65"),
+        ("evaluation", "t2_straddle_max_coverage", "1", "1"),
+        ("evaluation", "t2_straddle_max_coverage", "1.0", "1"),
+        ("evaluation", "t2_straddle_max_coverage", "1.00", "1"),
+        ("evaluation", "t2_straddle_max_coverage", "0", "0"),
+        ("evaluation", "t2_straddle_max_coverage", "0.00", "0"),
+        ("evaluation", "t2_straddle_max_coverage", "-0", "0"),
+        ("evaluation", "t2_straddle_max_coverage", "-0.0", "0"),
+        ("scoring", "bulk_rescore_max_budget_share", "1", "1"),
+        ("scoring", "bulk_rescore_max_budget_share", "1.0", "1"),
+        ("scoring", "bulk_rescore_max_budget_share", "0.1", "0.1"),
+        ("scoring", "bulk_rescore_max_budget_share", "0.10", "0.1"),
         ("scoring", "bulk_rescore_max_budget_share", "0.40", "0.4"),
+        ("scoring", "bulk_rescore_max_budget_share", "0.45", "0.45"),
     ],
 )
 def test_a_decimal_is_written_at_its_fields_scale(group: str, field: str, value: str, stored: str) -> None:
@@ -103,11 +112,31 @@ def test_one_value_writes_one_form() -> None:
     short, long = defaults(), defaults()
     short["evaluation"]["t2_straddle_max_coverage"] = "0.7"
     long["evaluation"]["t2_straddle_max_coverage"] = "0.700"
+    short["scoring"]["bulk_rescore_max_budget_share"] = "1"
+    long["scoring"]["bulk_rescore_max_budget_share"] = "1.0"
     short["llm"]["cap_usd"] = "2"
     long["llm"]["cap_usd"] = "2.00"
     assert canonical_json(Settings.model_validate(short).to_payload()) == canonical_json(
         Settings.model_validate(long).to_payload()
     )
+
+
+def test_no_decimal_is_written_with_an_exponent() -> None:
+    # every value of each decimal field's range at its finest step, written and read back: plain notation,
+    # and a fixed point of the model
+    for group, field, step, count in [
+        ("evaluation", "t2_straddle_max_coverage", Decimal("0.01"), 101),
+        ("scoring", "bulk_rescore_max_budget_share", Decimal("0.01"), 91),
+    ]:
+        low = Decimal("0.1") if field == "bulk_rescore_max_budget_share" else Decimal(0)
+        for i in range(count):
+            doc = defaults()
+            doc[group][field] = low + i * step
+            once = written(doc, group, field)
+            assert isinstance(once, str) and "E" not in once and "e" not in once, once
+            assert not (once.endswith("0") and "." in once), once  # no trailing zero after the point
+            doc[group][field] = once
+            assert written(doc, group, field) == once
 
 
 @pytest.mark.parametrize(
@@ -117,8 +146,13 @@ def test_one_value_writes_one_form() -> None:
         ("llm", "cap_usd", Decimal("1.0E+3"), "1000.00"),
         ("llm", "min_bucket_capacity_usd", Decimal("1E-1"), "0.10"),
         ("evaluation", "t2_straddle_max_coverage", Decimal("7E-1"), "0.7"),
-        ("evaluation", "t2_straddle_max_coverage", Decimal("-0E+2"), "0.0"),
+        ("evaluation", "t2_straddle_max_coverage", Decimal("6.5E-1"), "0.65"),
+        ("evaluation", "t2_straddle_max_coverage", Decimal("-0E+2"), "0"),
+        ("evaluation", "t2_straddle_max_coverage", Decimal("0E+1"), "0"),
+        ("evaluation", "t2_straddle_max_coverage", Decimal("1E+0"), "1"),
+        ("evaluation", "t2_straddle_max_coverage", Decimal("100E-2"), "1"),
         ("scoring", "bulk_rescore_max_budget_share", Decimal("4E-1"), "0.4"),
+        ("scoring", "bulk_rescore_max_budget_share", Decimal("0.1E+1"), "1"),
     ],
 )
 def test_a_python_decimal_never_writes_an_exponent(
@@ -129,7 +163,9 @@ def test_a_python_decimal_never_writes_an_exponent(
     assert written(doc, group, field) == stored
 
 
-@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("1E-7")])
+@pytest.mark.parametrize(
+    "value", [Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("1E-7"), Decimal("6.55E-1")]
+)
 def test_a_python_decimal_off_the_scale_is_refused(value: Decimal) -> None:
     doc = defaults()
     doc["evaluation"]["t2_straddle_max_coverage"] = value

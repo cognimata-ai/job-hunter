@@ -7,14 +7,16 @@
   left out takes its default; `to_payload()` always writes the complete document.
 - **Strict JSON types.** Unknown keys are refused at every level (`extra="forbid"`); a JSON `"6"` is no
   integer, `6.0` no integer either, and `1` no boolean. A coordinate may be a JSON integer.
-- **Decimals** are JSON strings of plain decimal notation (`"2.00"`; no exponent, no float), each field at
-  one fixed scale, the scale of its value in `settings_v1.json`: the USD amounts (`cap_usd`,
-  `overrun_buffer_usd`, `min_bucket_capacity_usd`) at 2 places, as `llm_budget` stores them
-  (`numeric(10,2)`, §7.11), and `t2_straddle_max_coverage` and `bulk_rescore_max_budget_share` at 1 place.
-  A value is brought to its scale when it is read (`"0.700"` and `"0.7"`, `"2"` and `"2.00"` are one value;
-  `"-0"` is `0`), a value with more places than its scale is refused, and the JSON form is the fixed-point
-  string at that scale (`format(value, "f")`), never an exponent, also for a `Decimal` built in Python. So
-  every value has one form, and `to_payload()` validates to itself.
+- **Decimals** are JSON strings of plain decimal notation (`"2.00"`; no exponent, no float), read into
+  `Decimal`; each value has one canonical form, written as the fixed-point string `format(value, "f")` (never
+  an exponent, also for a `Decimal` built in Python), so `to_payload()` validates to itself, and `-0` is `0`:
+  - the USD amounts (`cap_usd`, `overrun_buffer_usd`, `min_bucket_capacity_usd`) have a fixed scale of 2
+    places, as `llm_budget` stores them (`numeric(10,2)`, §7.11): `"2"`, `"2.0"` and `"2.00"` write `"2.00"`;
+  - the rates (`t2_straddle_max_coverage`, `bulk_rescore_max_budget_share`; §13.1 gives them no precision)
+    take at most 2 decimal places and drop trailing zeros (Ruling R15-5): `"0.70"`, `"0.7"` and `"0.700"`
+    write `"0.7"`, `"1.0"` writes `"1"`, `"0.65"` is kept and `"0.655"` is refused. The seed's `"0.7"` and
+    `"0.4"` are already in that form.
+  A value with more places than its field allows is refused (`invalid`).
 - **Normal forms.** `industries_include`/`industries_exclude` are stored case-folded (`normalize.text.fold`;
   §13.1 "case-folded") and `excluded_companies` as company keys (`normalize.companies.company_key`, §8.3: what
   the hard filter compares a job's `company_key` with, §11.1), so a change of case or legal form is no
@@ -81,8 +83,8 @@ _DEFAULT_LIGHT_TRIGGERS: Final[tuple[LightTrigger, ...]] = ("T2", "T8")
 
 _EFFORTS: Final[tuple[str, ...]] = get_args(Effort)
 _DECIMAL_TEXT: Final = re.compile(r"-?[0-9]+(\.[0-9]+)?")
-_USD_PLACES: Final = 2  # the scale of the USD amounts (`llm_budget`: numeric(10,2))
-_SHARE_PLACES: Final = 1  # the scale of `t2_straddle_max_coverage` and `bulk_rescore_max_budget_share`
+_USD_PLACES: Final = 2  # the fixed scale of the USD amounts (`llm_budget`: numeric(10,2))
+_RATE_PLACES: Final = 2  # the most places of a rate, written without trailing zeros (Ruling R15-5)
 _INDUSTRY_LENGTH: Final = (2, 60)
 _SETTLE_ROUNDS: Final = 8
 
@@ -107,9 +109,10 @@ def _decimal(value: object) -> object:
     return Decimal(value)
 
 
-def _scaled(low: str, high: str, *, places: int) -> AfterValidator:
-    """The check of a decimal range `[low, high]`, then the value at its field's scale of `places` decimal
-    places: one with more places is refused, and a negative zero is zero."""
+def _canonical(low: str, high: str, *, places: int, fixed: bool) -> AfterValidator:
+    """The check of a decimal range `[low, high]` and of at most `places` decimal places, then the value's
+    canonical form: at exactly `places` places when `fixed`, otherwise without trailing zeros (and never with
+    a positive exponent, so `1.0` is `1`, not `1E+0`); a negative zero is zero."""
     lowest, highest = Decimal(low), Decimal(high)
     quantum = Decimal(1).scaleb(-places)
 
@@ -121,9 +124,22 @@ def _scaled(low: str, high: str, *, places: int) -> AfterValidator:
         scaled = value.quantize(quantum)
         if scaled != value:
             raise PydanticCustomError("invalid", "at most {places} decimal places", {"places": places})
-        return scaled + 0  # `+ 0` turns -0.00 into 0.00 and keeps the scale
+        scaled += 0  # -0.00 becomes 0.00; the scale is kept
+        if fixed:
+            return scaled
+        trimmed = scaled.normalize()
+        exponent = trimmed.as_tuple().exponent
+        return trimmed.quantize(Decimal(1)) if isinstance(exponent, int) and exponent > 0 else trimmed
 
     return AfterValidator(check)
+
+
+def _usd(low: str, high: str) -> AfterValidator:
+    return _canonical(low, high, places=_USD_PLACES, fixed=True)
+
+
+def _rate(low: str, high: str) -> AfterValidator:
+    return _canonical(low, high, places=_RATE_PLACES, fixed=False)
 
 
 def _fixed_point(value: Decimal) -> str:
@@ -315,9 +331,8 @@ class Scope(ScopeVersionPayload):
 class Evaluation(_Group):
     relevance_threshold: int = Field(60, ge=0, le=100)
     t2_band: int = Field(5, ge=0, le=20)
-    t2_straddle_max_coverage: Annotated[  # 1 decimal place
-        Decimal, _DECIMAL, _scaled("0.0", "1.0", places=_SHARE_PLACES), _AS_STRING
-    ] = Decimal("0.7")
+    # a rate: at most 2 decimal places, no trailing zero
+    t2_straddle_max_coverage: Annotated[Decimal, _DECIMAL, _rate("0", "1"), _AS_STRING] = Decimal("0.7")
     t3_min_mid: int = Field(80, ge=50, le=100)
     t8_sample_pct: int = Field(5, ge=0, le=100)
     critic_light_triggers: Annotated[list[LightTrigger], _set_of(get_args(LightTrigger))] = Field(
@@ -432,27 +447,24 @@ class Scoring(_Group):
     batch_bulk_rescore: bool = True
     batch_min_targets: int = Field(200, ge=200, le=100_000)
     batch_max_items: int = Field(500, ge=200, le=10_000)  # 500 since spec revision 3.4 (Deviation 34)
-    bulk_rescore_max_budget_share: Annotated[  # 1 decimal place
-        Decimal, _DECIMAL, _scaled("0.1", "1.0", places=_SHARE_PLACES), _AS_STRING
-    ] = Decimal("0.4")
+    # a rate: at most 2 decimal places, no trailing zero
+    bulk_rescore_max_budget_share: Annotated[Decimal, _DECIMAL, _rate("0.1", "1.0"), _AS_STRING] = Decimal(
+        "0.4"
+    )
 
 
 # --- Budget, Retention, Notifications ---
 
 
 class Llm(_Group):
-    # The USD amounts have 2 decimal places.
-    cap_usd: Annotated[Decimal, _DECIMAL, _scaled("1.00", "10000.00", places=_USD_PLACES), _AS_STRING] = (
-        Decimal("100.00")
-    )
+    # The USD amounts have a fixed scale of 2 decimal places.
+    cap_usd: Annotated[Decimal, _DECIMAL, _usd("1.00", "10000.00"), _AS_STRING] = Decimal("100.00")
     nonscoring_reserve_pct: int = Field(5, ge=0, le=20)
     # and ≥ the §6.9.1 bound of the configured concurrency and `batch_max_items` (validate)
-    overrun_buffer_usd: Annotated[
-        Decimal, _DECIMAL, _scaled("0.50", "50.00", places=_USD_PLACES), _AS_STRING
-    ] = Decimal("2.00")
-    min_bucket_capacity_usd: Annotated[
-        Decimal, _DECIMAL, _scaled("0.10", "100.00", places=_USD_PLACES), _AS_STRING
-    ] = Decimal("1.00")
+    overrun_buffer_usd: Annotated[Decimal, _DECIMAL, _usd("0.50", "50.00"), _AS_STRING] = Decimal("2.00")
+    min_bucket_capacity_usd: Annotated[Decimal, _DECIMAL, _usd("0.10", "100.00"), _AS_STRING] = Decimal(
+        "1.00"
+    )
 
 
 class Retention(_Group):
