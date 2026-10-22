@@ -13,6 +13,10 @@ system health probe. The lifespan's HTTP client is closed when the lifespan ends
 one of its own on the injected `cfg`, which nothing closes: the tests' fake embedder closes every connection
 after its answer, so the client holds none open.
 
+The gazetteer (M2 Task 22) is loaded by the first `/api/geo/places` request, in a worker thread, and kept on
+the state (`deps.get_gazetteer`): `create_app` sets only its slot and the lock that makes a first load happen
+once.
+
 The task app: `defer_in_tx` defers through the process-global `tasks.task_app()`, which the first
 `make_queue_app` call of the process creates and registers; building `make_queue_app(cfg.dsn("psycopg"))` here
 (kept as `api.state.queue`) is what registers it in the api. Deferring uses its task registry, not its pool or
@@ -22,6 +26,7 @@ it at shutdown, which closes a pool only if something opened one. An injected ap
 whoever opened it.
 """
 
+import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -39,6 +44,7 @@ from jobhunter.api.errors import exception_handlers
 from jobhunter.api.openapi import JobHunterAPI
 from jobhunter.api.routes import (
     auth,
+    geo,
     health,
     profile,
     profile_review,
@@ -47,6 +53,7 @@ from jobhunter.api.routes import (
     settings,
     spend,
     system,
+    watchlist,
 )
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
@@ -189,10 +196,14 @@ def create_app(
     api.include_router(profile_review.router)
     api.include_router(settings.router)
     api.include_router(queries.router)
+    api.include_router(watchlist.router)
+    api.include_router(geo.router)
     for router in extra_routers:
         api.include_router(router)
     api.state.rate_limiter = SessionRateLimiter()
     api.state.argon2_gate = Argon2Gate()  # every Argon2 computation of the process goes through it
+    api.state.gazetteer = None  # loaded by the first `/api/geo/places` request (`deps.get_gazetteer`)
+    api.state.gazetteer_lock = asyncio.Lock()
     if cfg is not None and engine is not None:
         api.state.cfg = cfg
         api.state.engine = engine

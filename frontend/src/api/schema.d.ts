@@ -64,6 +64,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/geo/places": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Places
+         * @description Search places by name, other spelling or postal code (200), the most populous first.
+         */
+        get: operations["search_places_api_geo_places_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/profile": {
         parameters: {
             query?: never;
@@ -516,6 +536,67 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/watchlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add Company
+         * @description Add a board (201): company, instance, validation and settings version in one transaction.
+         */
+        post: operations["add_company_api_watchlist_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/watchlist/parse-url": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Parse Url
+         * @description Read a careers URL by pattern (200): the board it names, or why it names none. Never fetches it.
+         */
+        post: operations["parse_url_api_watchlist_parse_url_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/watchlist/{company_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove Company
+         * @description Remove a board (204): its settings entry goes in a new version, the company row is deleted, and the
+         *     board's instance and postings stay.
+         */
+        delete: operations["remove_company_api_watchlist__company_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -856,6 +937,26 @@ export interface components {
             /** Failing */
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
         };
+        /** ParseUrlIn */
+        ParseUrlIn: {
+            /** Url */
+            url: string;
+        };
+        /**
+         * ParsedUrlOut
+         * @description The board a careers URL names; `region` is Lever's and `null` for every other ATS.
+         */
+        ParsedUrlOut: {
+            /**
+             * Ats
+             * @enum {string}
+             */
+            ats: "greenhouse" | "lever" | "ashby" | "personio" | "recruitee" | "smartrecruiters";
+            /** Region */
+            region: ("global" | "eu") | null;
+            /** Slug */
+            slug: string;
+        };
         /**
          * PendingScopeOut
          * @description The scope being applied (§13.4) and its live apply's progress; `progress` is `null` while no apply is
@@ -865,6 +966,21 @@ export interface components {
             progress: components["schemas"]["ProgressOut"] | null;
             /** Version Id */
             version_id: number;
+        };
+        /** PlaceOut */
+        PlaceOut: {
+            /** Gazetteer Id */
+            gazetteer_id: string;
+            /** Label */
+            label: string;
+            /** Lat */
+            lat: number;
+            /** Lon */
+            lon: number;
+            /** Population */
+            population: number;
+            /** Postal Codes */
+            postal_codes: string[];
         };
         /**
          * Problem
@@ -1445,6 +1561,14 @@ export interface components {
             /** Restored */
             restored: components["schemas"]["SpanOut"][];
         };
+        /** UnsupportedUrlOut */
+        UnsupportedUrlOut: {
+            /**
+             * Unsupported
+             * @enum {string}
+             */
+            unsupported: "workable" | "unsupported_pattern" | "bad_slug" | "not_a_url";
+        };
         /**
          * UserEntered
          * @description Entered by the user in the review form, never by the LLM (§12.4, §12.5).
@@ -1541,6 +1665,38 @@ export interface components {
             detail: {
                 [key: string]: components["schemas"]["JsonValue"];
             };
+        };
+        /** WatchlistCreatedOut */
+        WatchlistCreatedOut: {
+            /** Id */
+            id: number;
+            /**
+             * Validation Status
+             * @constant
+             */
+            validation_status: "unvalidated";
+        };
+        /** WatchlistIn */
+        WatchlistIn: {
+            /**
+             * Ats Type
+             * @enum {string}
+             */
+            ats_type: "greenhouse" | "lever" | "ashby" | "personio" | "recruitee" | "smartrecruiters";
+            /**
+             * Board Slug
+             * @description Taken as written, as `detect` does
+             */
+            board_slug: string;
+            /** Display Name */
+            display_name: string;
+            /** Input Url */
+            input_url?: string | null;
+            /**
+             * Lever Region
+             * @description Required for Lever, refused otherwise
+             */
+            lever_region?: ("global" | "eu") | null;
         };
     };
     responses: never;
@@ -1674,6 +1830,57 @@ export interface operations {
             };
             /** @description No valid session (`unauthenticated`) */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    search_places_api_geo_places_get: {
+        parameters: {
+            query?: {
+                /** @description A place name or a postal code; empty lists the largest */
+                q?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaceOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `q` over 100 characters or with a NUL, or a `limit` outside 1 to 25 */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3300,6 +3507,201 @@ export interface operations {
             };
             /** @description No valid session (`unauthenticated`) */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    add_company_api_watchlist_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WatchlistIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchlistCreatedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The board is already on the watchlist (`conflict_state`, with the company's `watchlist_company_id`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, or settings the new entry cannot be saved in (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    parse_url_api_watchlist_parse_url_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ParseUrlIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ParsedUrlOut"] | components["schemas"]["UnsupportedUrlOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    remove_company_api_watchlist__company_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a watchlist company */
+                company_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such watchlist company (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid id (`validation_failed`) */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
