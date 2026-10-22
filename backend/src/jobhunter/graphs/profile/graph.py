@@ -36,7 +36,8 @@ call through `CallContext.deadline`; final review FR-7) and `LLM_NODE_TRACE` (it
 from any trace).
 `sanitized` and `add_llm_node` take a node of either state (`nodes.StateNode`).
 
-**`sanitized`** (Deviation 25) wraps every profile node. LangGraph 1.2.15 stores the exception that escapes
+**`sanitized`** (Deviation 25) wraps every profile node, with the wrapper the collection graph uses too
+(`graphs.sanitize.sanitized`, final review FR-12). LangGraph 1.2.15 stores the exception that escapes
 a node in `checkpoint_writes` (the write `(__error__, exc)` of `PregelRunner.commit`), through its
 `JsonPlusSerializer`, which encodes an exception as its `repr`: the class name and the arguments, never its
 traceback, its frames' locals, its `__cause__` or its `__context__`. An SQLAlchemy or Pydantic error can quote
@@ -67,8 +68,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import TimeoutPolicy, TracePolicy, omit_payload
 
-from jobhunter.errors import FencedOut, NodeFailed, TransitionConflict
-from jobhunter.graphs.collect.graph import DB_RETRY, is_retryable_db_error
+from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.graphs.profile.deps import ProfileDeps
 from jobhunter.graphs.profile.nodes import Node, StateNode, log
 from jobhunter.graphs.profile.nodes import check_pdf as check_pdf_node
@@ -80,6 +80,8 @@ from jobhunter.graphs.profile.nodes import strip_contacts as strip_node
 from jobhunter.graphs.profile.nodes import validate as validate_node
 from jobhunter.graphs.profile.state import ProfileState as ProfileState
 from jobhunter.graphs.profile.state import ProposalState
+from jobhunter.graphs.sanitize import DB_RETRY
+from jobhunter.graphs.sanitize import sanitized as shared_sanitized
 from jobhunter.llm.errors import LLMError
 from jobhunter.profile.errors import UploadRejected
 from jobhunter.worker.operations import OperationContext
@@ -158,20 +160,9 @@ def invoke_config(kind: ThreadKind, subject_id: int, op: OperationContext) -> Ru
 
 
 def sanitized[S, U](name: str, node: StateNode[S, U]) -> StateNode[S, U]:
-    """`node` whose unclassified errors become `NodeFailed(name, <class>)` (module docstring)."""
-
-    async def guarded(state: S, config: RunnableConfig) -> U:
-        try:
-            return await node(state, config)
-        except PASS_THROUGH:
-            raise
-        except Exception as exc:  # noqa: BLE001 - replaced by a content-free stand-in, raised below
-            log.error("profile_node_failed", node=name, error_class=type(exc).__name__)
-            failure = NodeFailed(name, type(exc).__name__, retryable_db_error=is_retryable_db_error(exc))
-        # Outside the handler: the stand-in has no `__context__`, and the original is unreachable from it.
-        raise failure
-
-    return guarded
+    """`node` whose unclassified errors become `NodeFailed(name, <class>)` (module docstring): the wrapper
+    the collection graph uses too (`graphs.sanitize`), with this graph's `PASS_THROUGH`."""
+    return shared_sanitized(name, node, passing=PASS_THROUGH, log=log, event="profile_node_failed")
 
 
 def add_node(graph: StateGraph[ProfileState], name: str, node: Node) -> None:
