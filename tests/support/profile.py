@@ -362,11 +362,13 @@ def docparse_root(tmp_path: Path) -> Iterator[Path]:
 # --- Task 11: the operation runtime in process -----------------------------------------------------------
 
 # The modules whose `afault_point` a pause replaces, where they exist at this point of the plan (Tasks 18 and
-# 21 create the last two); `jobhunter.graphs.profile.nodes` stands for each of its node modules.
+# 21 create `scope_apply` and `activation`; Task 19's `embed_profile` handler is in `profile.operations`);
+# `jobhunter.graphs.profile.nodes` stands for each of its node modules.
 PAUSABLE_MODULES: Final = (
     "jobhunter.llm.gateway",
     "jobhunter.graphs.profile.nodes",
     "jobhunter.settings.scope_apply",
+    "jobhunter.profile.operations",
     "jobhunter.profile.activation",
 )
 _PARSE_TIMEOUT_S: Final = 60.0

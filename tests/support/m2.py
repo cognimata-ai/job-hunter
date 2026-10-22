@@ -2,16 +2,21 @@
 
 `insert_profile_chain` builds the rows an active LLM tuple stands on, the way production does: a CV file, a
 `ready` draft, the profile version it confirms (the two foreign keys between draft and version are deferred
-and satisfied by the confirm), and a tuple over that version, a test rubric row, a test prompt-schema row and
-the seeded model policy. `reset_database` removes every one of them again, as it does the rows of the other
-helpers here.
+and satisfied by the confirm; its `profile_json` is `{}` unless a `profile` is given), and a tuple over that
+version, a test rubric row, a test prompt-schema row and the seeded model policy. `reset_database` removes
+every one of them again, as it does the rows of the other helpers here.
+
+`insert_vector` gives each (profile version, kind) an embedding row of its own, so two versions can both hold
+a `summary` vector (it once hashed the kind alone, and a second version's `summary` collided on that row).
 """
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
+from jobhunter.types import JSONValue
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 _CV_FILE = q("INSERT INTO cv_files (sha256, mime, size_bytes) VALUES (:h, 'text/plain', 1) RETURNING id")
@@ -21,7 +26,9 @@ _DRAFT = q(
 )
 _VERSION = q(
     "INSERT INTO profile_versions (version_no, draft_id, cv_file_id, profile_json, profile_hash) "
-    "VALUES ((SELECT coalesce(max(version_no), 0) + 1 FROM profile_versions), :d, :cv, '{}', :h) RETURNING id"
+    "VALUES ((SELECT coalesce(max(version_no), 0) + 1 FROM profile_versions), :d, :cv, :profile, :h) "
+    "RETURNING id",
+    jsonb=["profile"],
 )
 _RUBRIC = q(
     "INSERT INTO rubric_versions (version, content_hash, weights, anchors) VALUES (:v, :h, '{}', '{}') "
@@ -92,12 +99,17 @@ async def insert_cv_file(c: AsyncConnection, n: int = 1) -> int:
     return int((await c.execute(_CV_FILE, {"h": digest(n)})).scalar_one())
 
 
-async def insert_profile_chain(c: AsyncConnection, n: int = 1) -> ProfileChain:
-    """Insert chain number `n`; two chains of one transaction use two numbers."""
+async def insert_profile_chain(
+    c: AsyncConnection, n: int = 1, *, profile: Mapping[str, JSONValue] | None = None
+) -> ProfileChain:
+    """Insert chain number `n`; two chains of one transaction use two numbers. The version's `profile_json`
+    is `profile` (`{}` when omitted)."""
     h = digest(n)
     cv = await insert_cv_file(c, n)
     draft = (await c.execute(_DRAFT, {"cv": cv, "h": h})).scalar_one()
-    version = (await c.execute(_VERSION, {"d": draft, "cv": cv, "h": h})).scalar_one()
+    version = (
+        await c.execute(_VERSION, {"d": draft, "cv": cv, "h": h, "profile": dict(profile or {})})
+    ).scalar_one()
     await transition(
         c,
         "profile_drafts",
@@ -145,10 +157,16 @@ async def insert_proposal(
     return int(row.scalar_one())
 
 
+async def insert_embedding(c: AsyncConnection, label: str) -> int:
+    """An `embeddings` row (a query, the unit vector) whose text hash is that of `label`; nothing references
+    it. Returns its id; the same `label` twice violates the table's unique key."""
+    text_hash = hashlib.sha256(label.encode()).digest()
+    return int((await c.execute(_EMBEDDING, {"h": text_hash, "vector": _UNIT_VECTOR})).scalar_one())
+
+
 async def insert_vector(c: AsyncConnection, profile_version_id: int, kind: str = "summary") -> int:
-    """A `profile_vectors` row over a fresh unit-vector embedding; returns the embedding id."""
-    embedding = (
-        await c.execute(_EMBEDDING, {"h": hashlib.sha256(kind.encode()).digest(), "vector": _UNIT_VECTOR})
-    ).scalar_one()
+    """A `profile_vectors` row over a fresh unit-vector embedding; returns the embedding id. The embedding's
+    text hash comes from the version id and the kind, so every (version, kind) has a row of its own."""
+    embedding = await insert_embedding(c, f"{profile_version_id}:{kind}")
     await c.execute(_VECTOR, {"pv": profile_version_id, "kind": kind, "e": embedding})
-    return int(embedding)
+    return embedding

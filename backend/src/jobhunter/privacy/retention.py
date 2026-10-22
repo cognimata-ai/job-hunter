@@ -27,9 +27,14 @@ run (`queued` or `running`) is never deleted, however old.
 - `ats_snapshots`: 30 days by `taken_at`, except each instance's last complete snapshot, its open mass
   event's first snapshot (`mass_event_snapshot_id`) and every unacknowledged `mass_disappearance` snapshot
   of an event that is still open (Task 19: the confirmation and the acknowledgement read them).
-- `embeddings`: every row no `job_revisions.embedding_id` references (`profile_vectors` joins in M2). A row
-  that an embedding writer holds `FOR KEY SHARE` (`embeddings.upsert_embedding`, about to reference it) is
-  skipped (`SKIP LOCKED`) and goes in a later pass if it is still unreferenced then.
+- `embeddings`: every row that no `job_revisions.embedding_id` and no `profile_vectors.embedding_id`
+  references (§20.1; M2 Task 19). A row that an embedding writer holds `FOR KEY SHARE`
+  (`embeddings.upsert_embedding`, about to reference it: a revision's embed batch, or `embed_profile`'s write)
+  is skipped (`SKIP LOCKED`) and goes in a later pass if it is still unreferenced then. A profile purge
+  deletes the version's `profile_vectors` itself (§20.2 step 3; the schema's `ON DELETE CASCADE` of
+  `profile_vectors.profile_version_id` fires only when the version row is deleted, which only
+  delete-everything does), so their embeddings are unreferenced from then on and go with the next pass; until
+  the purge has deleted the vectors they are kept, as the foreign key (which has no cascade) requires.
 - `coverage_intervals`: 13 months by `coalesce(closed_at, created_at)`.
 - `fetch_requests`: terminal ones 13 months by `created_at`, their responses and raw items with them
   (cascade); it depends on `raw_items`.
@@ -148,6 +153,7 @@ _DELETES: Final[dict[str, TextClause]] = {
     "embeddings": q(
         "DELETE FROM embeddings WHERE id IN (SELECT e.id FROM embeddings e WHERE e.created_at < :cutoff "
         "AND NOT EXISTS (SELECT 1 FROM job_revisions r WHERE r.embedding_id = e.id) "
+        "AND NOT EXISTS (SELECT 1 FROM profile_vectors v WHERE v.embedding_id = e.id) "
         "ORDER BY e.id FOR UPDATE SKIP LOCKED)"
     ),
     "coverage_intervals": q("DELETE FROM coverage_intervals WHERE coalesce(closed_at, created_at) < :cutoff"),

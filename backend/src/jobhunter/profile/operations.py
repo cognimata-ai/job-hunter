@@ -40,8 +40,28 @@ draft stays in that operation's generation (a new approval needs `text_review`, 
 creates a new operation), and the hook runs in the transaction that ends that operation. A malformed payload
 is logged and moves nothing, as for the text phase.
 
-Tasks 19 (`embed_profile`) and 20 (`propose_queries`) add their handlers and hooks here. Logs carry ids and
-codes only.
+**`embed_profile`** (Task 19; payload `{"profile_version_id": <id>}`, dedup key `embed_profile:<id>`, created
+with the version by the confirm and by the `profile_vectors` reconciler, `profile.vectors.request_embedding`).
+It stores the vectors of a profile version's summary and target titles (`profile.vectors` says which texts and
+how they are written). No domain row is driven by this operation, so it has no failure hook: its permanent
+failure (ten requeues) is the `operation.failed` alert, and the reconciler creates a new operation once the
+embedder is healthy again. The steps:
+1. Without a lock, the version's state. A version that is gone or purged, or under an active purge fence,
+   ends the operation `succeeded` with the progress `{"skipped": "purged" | "fenced"}`; so does a version
+   whose vectors are already complete (a second run is a no-op, and needs no embedder).
+2. Otherwise the texts go to the embedder in one batch as queries, outside any transaction. A worker
+   without an embedder (`OperationDeps.embedder is None`) and any `EmbedderError` give the operation back
+   (`requeue_in`, code `embedder_unavailable`, `not_before` ten minutes on the injected clock) and write
+   nothing.
+3. Then, in one transaction: the owner row (`lock_operation_owner`), the version row `FOR SHARE` and its state
+   again, and, only if the version is still usable, the embeddings, the `profile_vectors` rows, the deletion
+   of the kinds it no longer has and the operation's end (`finish_in`). A version purged or fenced between the
+   embedder call and this transaction (the fault point `embed_profile.after_embed` sits there) ends
+   `succeeded` with the skip and writes nothing, so a purged profile never gets a vector back. A claim lost
+   meanwhile is `FencedOut` at the owner lock and nothing is written.
+Logs carry the operation id, the version id, counts and short codes, never a text.
+
+Task 20 (`propose_queries`) adds its handler and hook here.
 """
 
 from collections.abc import Mapping
@@ -50,16 +70,20 @@ from typing import Final
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.transitions import transition
+from jobhunter.embeddings import EmbedderError
+from jobhunter.faults import afault_point
 from jobhunter.graphs.profile.graph import invoke_config
 from jobhunter.graphs.profile.nodes import EXTRACTING_PROFILE, end_obsolete, fail_draft, lock_draft
 from jobhunter.graphs.profile.state import initial_state
 from jobhunter.observability.logging import get_logger
+from jobhunter.profile import vectors
 from jobhunter.types import JSONValue, get_int
 from jobhunter.worker.operations import (
     ATTEMPTS_EXHAUSTED,
     OperationContext,
     lock_operation_owner,
     register_operation_handler,
+    set_progress,
 )
 
 EXTRACT_PROFILE_TEXT: Final = "extract_profile_text"
@@ -156,3 +180,87 @@ async def extract_profile(ctx: OperationContext) -> None:
     await ctx.deps.profile_graphs.extract.ainvoke(
         initial_state(draft_id, claim.operation_id), invoke_config("p", draft_id, ctx), durability="sync"
     )
+
+
+async def _end_embed(ctx: OperationContext, conn: AsyncConnection, skipped: vectors.Skipped | None) -> None:
+    """End the `embed_profile` operation `succeeded` in `conn`, after its owner lock; a skip records why."""
+    if skipped is not None:
+        await set_progress(conn, ctx.claim, {"skipped": skipped})
+    await ctx.finish_in(conn, status="succeeded")
+
+
+def _log_embed_end(
+    ctx: OperationContext, version_id: int, skipped: vectors.Skipped | None, *, count: int, embedded: bool
+) -> None:
+    """The log line of an `embed_profile` that ended `succeeded`, after its commit: ids and counts only."""
+    if skipped is not None:
+        log.info(
+            "embed_profile_skipped",
+            operation_id=ctx.claim.operation_id,
+            version_id=version_id,
+            reason=skipped,
+        )
+    else:
+        log.info(
+            "embed_profile_done",
+            operation_id=ctx.claim.operation_id,
+            version_id=version_id,
+            vectors=count,
+            embedded=embedded,
+        )
+
+
+async def _requeue_embed(
+    ctx: OperationContext, version_id: int, *, reason: str, error: EmbedderError | None = None
+) -> None:
+    """Give the `embed_profile` operation back for `vectors.REQUEUE_AFTER` (module docstring, step 2)."""
+    if ctx.deps is None:
+        raise RuntimeError("embed_profile runs with the worker's OperationDeps")
+    async with ctx.engine.begin() as conn:
+        await ctx.requeue_in(
+            conn, error_code=vectors.REQUEUE_CODE, not_before=ctx.deps.clock() + vectors.REQUEUE_AFTER
+        )
+    log.warning(
+        "embed_profile_requeued",
+        operation_id=ctx.claim.operation_id,
+        version_id=version_id,
+        reason=reason,
+        error_kind=None if error is None else error.kind,
+        error_code=None if error is None else error.code,
+    )
+
+
+@register_operation_handler("embed_profile")
+async def embed_profile(ctx: OperationContext) -> None:
+    """The vectors of a profile version (module docstring)."""
+    if ctx.deps is None:
+        raise RuntimeError("embed_profile runs with the worker's OperationDeps")
+    claim = ctx.claim
+    version_id = get_int(dict(claim.payload), "profile_version_id")
+    async with ctx.engine.connect() as conn:  # plain reads, rolled back when the block ends
+        read = await vectors.read_version(conn, version_id)
+        texts = [] if read.profile is None else vectors.vector_texts(read.profile)
+        complete = read.profile is not None and await vectors.vectors_complete(conn, version_id, texts)
+    if read.profile is None or complete:  # step 1: nothing to embed
+        async with ctx.engine.begin() as conn:
+            await lock_operation_owner(conn, claim)
+            await _end_embed(ctx, conn, read.skipped)
+        _log_embed_end(ctx, version_id, read.skipped, count=len(texts), embedded=False)
+        return
+    if ctx.deps.embedder is None:  # step 2
+        await _requeue_embed(ctx, version_id, reason="no_embedder")
+        return
+    try:
+        embedded = await ctx.deps.embedder.embed([text for _, text in texts], input_kind=vectors.INPUT_KIND)
+    except EmbedderError as err:
+        await _requeue_embed(ctx, version_id, reason="embedder_error", error=err)
+        return
+    await afault_point(vectors.AFTER_EMBED_POINT)
+    async with ctx.engine.begin() as conn:  # step 3
+        await lock_operation_owner(conn, claim)
+        locked = await vectors.read_version(conn, version_id, lock=True)  # again, under the version's lock
+        written = 0
+        if locked.skipped is None:
+            written = await vectors.write_vectors(conn, version_id, texts, embedded)
+        await _end_embed(ctx, conn, locked.skipped)
+    _log_embed_end(ctx, version_id, locked.skipped, count=written, embedded=True)
