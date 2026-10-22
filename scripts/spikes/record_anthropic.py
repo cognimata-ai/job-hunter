@@ -58,6 +58,14 @@ its bound is `bounds.native_pdf_bound` of it); `check(observation)` returns the 
 `--dry-run` sends nothing, needs no key and writes nothing: it prints the plan, each call's input bound and
 worst case, the budget the live run would meet, and the request each call would send, built by the same code
 on a transport that answers locally.
+
+**LangSmith.** langchain traces a call to LangSmith (its prompt and output included) when tracing is on in
+the environment, which the SDK's own telemetry switch does not cover. So with any of `TRACING_VARS` set, every
+mode refuses at once and calls nothing (final review FR-13); the refusal names the variables, never a value.
+
+**Modes.** The raw files, the budget and its lock are 0600 in 0700 directories; the committed recordings are
+0644 in 0755 directories, whatever the umask, so the dev stack's worker (uid 10001) can serve a recording
+another uid made (final review FR-14). The key file is 0600 in a 0700 temporary directory.
 """
 
 import argparse
@@ -99,6 +107,20 @@ REPO: Final = HERE.parents[1]
 DEFAULT_ROOT: Final = REPO / ".fixtures-raw"
 DEFAULT_FIXTURES: Final = REPO / "tests/contract/fixtures/anthropic"
 KEY_VAR: Final = "JOBHUNTER_ANTHROPIC_API_KEY"
+RAW_FILE_MODE: Final = 0o600
+RAW_DIR_MODE: Final = 0o700
+FIXTURE_FILE_MODE: Final = 0o644
+FIXTURE_DIR_MODE: Final = 0o755
+# Any of these makes langchain (or langsmith under it) trace a call to LangSmith, prompts and outputs
+# included, or gives it the key to (final review FR-13): the recorder refuses to start.
+TRACING_VARS: Final = (
+    "LANGSMITH_TRACING",
+    "LANGSMITH_TRACING_V2",
+    "LANGCHAIN_TRACING",
+    "LANGCHAIN_TRACING_V2",
+    "LANGSMITH_API_KEY",
+    "LANGCHAIN_API_KEY",
+)
 
 MAX_MESSAGES: Final = 8
 MAX_WORST_CASE_USD: Final = Decimal("0.80")
@@ -221,11 +243,44 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat()
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+@dataclass(frozen=True)
+class Tree:
+    """A directory the recorder writes under, with the modes of the files and directories it writes there."""
+
+    root: Path
+    file_mode: int
+    dir_mode: int
+
+    @classmethod
+    def raw(cls, root: Path) -> "Tree":
+        """`.fixtures-raw`: the captures, the budget and its lock, private (0600 in 0700 directories)."""
+        return cls(root, RAW_FILE_MODE, RAW_DIR_MODE)
+
+    @classmethod
+    def committed(cls, root: Path) -> "Tree":
+        """`tests/contract/fixtures/anthropic`: readable by every uid (0644 in 0755 directories), so the dev
+        stack's worker (uid 10001) serves what another uid recorded (final review FR-14)."""
+        return cls(root, FIXTURE_FILE_MODE, FIXTURE_DIR_MODE)
+
+
+def _directories(tree: Tree, directory: Path) -> None:
+    """`directory`, and every directory from `tree.root` down to it, at `tree.dir_mode` whatever the umask."""
+    tree.root.mkdir(parents=True, exist_ok=True)
+    current = tree.root
+    os.chmod(current, tree.dir_mode)
+    for part in directory.relative_to(tree.root).parts:
+        current = current / part
+        current.mkdir(exist_ok=True)
+        os.chmod(current, tree.dir_mode)
+
+
+def _atomic_write(tree: Tree, path: Path, data: bytes) -> None:
+    """`data` at `path` under `tree`, at the tree's modes whatever the umask, by atomic rename."""
+    _directories(tree, path.parent)
     tmp = path.with_name(f".{path.name}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, tree.file_mode)
     try:
+        os.fchmod(fd, tree.file_mode)
         os.write(fd, data)
         os.fsync(fd)
     finally:
@@ -242,6 +297,7 @@ class Budget:
     """`.fixtures-raw/anthropic-budget.json`; the totals are always recomputed from the entries."""
 
     def __init__(self, root: Path) -> None:
+        self.root = root
         self.path = root / "anthropic-budget.json"
         data = json.loads(self.path.read_text("utf-8")) if self.path.exists() else {}
         self.entries: list[dict[str, Any]] = list(data.get("entries", []))
@@ -313,7 +369,9 @@ class Budget:
             "settled_usd": str(self.settled_sum()),
             "entries": self.entries,
         }
-        _atomic_write(self.path, (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+        _atomic_write(
+            Tree.raw(self.root), self.path, (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
 
     def left(self) -> str:
         left_usd = MAX_WORST_CASE_USD - self.worst_case_sum()
@@ -648,16 +706,17 @@ class Recorder:
         """Settle and record one sent call; whether it completed as expected."""
         capture = outcome.capture
         raw_dir = self.root / "anthropic" / call.spike
+        raw = Tree.raw(self.root)
         if capture.request is not None:
-            _atomic_write(raw_dir / f"{call.case}.request.json", _json(capture.request, key))
+            _atomic_write(raw, raw_dir / f"{call.case}.request.json", _json(capture.request, key))
         status = capture.status
         streamed = status == 200 and capture.headers.get("content-type", "").startswith("text/event-stream")
         events: list[fake.SSEEvent] = []
         if status is not None:
             headers = {"status": status, "headers": dict(sorted(capture.headers.items()))}
-            _atomic_write(raw_dir / f"{call.case}.response.headers.json", _json(headers, key))
+            _atomic_write(raw, raw_dir / f"{call.case}.response.headers.json", _json(headers, key))
             suffix = ".response.sse" if streamed else ".response.json"
-            _atomic_write(raw_dir / f"{call.case}{suffix}", _without_key(bytes(capture.body), key))
+            _atomic_write(raw, raw_dir / f"{call.case}{suffix}", _without_key(bytes(capture.body), key))
             if streamed:
                 try:
                     events = fake.parse_sse(bytes(capture.body))
@@ -714,7 +773,7 @@ class Recorder:
             return False
         observation = self._observation(call, events, capture, outcome)
         report = self.module.check(observation)
-        _atomic_write(raw_dir / f"{call.case}.check.json", _json(report, key))
+        _atomic_write(raw, raw_dir / f"{call.case}.check.json", _json(report, key))
         self.say(f"{call.spike} {call.case} check missing={report.get('missing')}")
         # Only a turn that ended and parsed is the stored `ok` stream of the fake, unless the spike records
         # every answer.
@@ -740,7 +799,8 @@ class Recorder:
     ) -> None:
         """Check an error answer and commit it as the fake's answer of the call."""
         report = self.module.check(self._error_observation(call, request_body, status, body))
-        _atomic_write(self.root / "anthropic" / call.spike / f"{call.case}.check.json", _json(report, key))
+        check = self.root / "anthropic" / call.spike / f"{call.case}.check.json"
+        _atomic_write(Tree.raw(self.root), check, _json(report, key))
         self.say(f"{call.spike} {call.case} answer {status} recorded; check missing={report.get('missing')}")
         self._commit_error(call, request_body, status, headers, body, key)
 
@@ -781,10 +841,13 @@ class Recorder:
         schema = body["output_config"]["format"]["schema"]
         path = fake.recording_path(self.fixtures_out, call.purpose, call.model, schema)
         stream = committed_stream(events, f"msg_recorded_{fake.schema12(schema)}")
-        _atomic_write(path, _without_key(fake.render_sse(stream), key))
+        committed = Tree.committed(self.fixtures_out)
+        _atomic_write(committed, path, _without_key(fake.render_sse(stream), key))
         kept = {k: v for k, v in capture.headers.items() if k.lower() in COMMITTED_HEADERS}
         _atomic_write(
-            path.with_suffix(".headers.json"), _json({"status": capture.status, "headers": kept}, key)
+            committed,
+            path.with_suffix(".headers.json"),
+            _json({"status": capture.status, "headers": kept}, key),
         )
         components = {
             "source": "recorded",
@@ -804,7 +867,7 @@ class Recorder:
         if call.native_pdf_count_tokens is not None:
             components["native_pdf_count_tokens"] = call.native_pdf_count_tokens
             components["input_tokens_bound"] = call.input_tokens_bound()
-        _atomic_write(path.with_suffix(".components.json"), _json(components, key))
+        _atomic_write(committed, path.with_suffix(".components.json"), _json(components, key))
 
     def _commit_error(
         self,
@@ -823,9 +886,12 @@ class Recorder:
         if not isinstance(error, dict):
             raise ValueError("an error response that is no JSON object")
         error.pop("request_id", None)
-        _atomic_write(path, _json(error, key))
+        committed = Tree.committed(self.fixtures_out)
+        _atomic_write(committed, path, _json(error, key))
         kept = {k: v for k, v in headers.items() if k.lower() in COMMITTED_HEADERS}
-        _atomic_write(path.with_suffix(".headers.json"), _json({"status": status, "headers": kept}, key))
+        _atomic_write(
+            committed, path.with_suffix(".headers.json"), _json({"status": status, "headers": kept}, key)
+        )
 
     @staticmethod
     def _error_observation(
@@ -899,6 +965,13 @@ def main(
     try:
         args = _parse(sys.argv[1:] if argv is None else argv)
         env = os.environ if environ is None else environ
+        if traced := [name for name in TRACING_VARS if name in env]:  # their names only: a key is a value
+            print(
+                f"{args.spike}: REFUSED, LangSmith tracing could export the prompts; unset "
+                f"{', '.join(traced)}; nothing sent",
+                file=stream,
+            )
+            return REFUSED
         module = load_spike(args.spike)
         if module is None:
             print(

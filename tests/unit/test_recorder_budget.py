@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -237,6 +238,42 @@ def test_a_plan_longer_than_the_spike_call_count_is_refused_whole(
     assert factory.created == 0 and not (tmp_path / "raw/anthropic-budget.json").exists()
 
 
+TRACING_VARIABLES = (
+    "LANGSMITH_TRACING",
+    "LANGCHAIN_TRACING_V2",
+    "LANGSMITH_API_KEY",
+    "LANGCHAIN_API_KEY",
+    "LANGSMITH_TRACING_V2",
+    "LANGCHAIN_TRACING",
+)
+
+
+@pytest.mark.parametrize("variable", TRACING_VARIABLES)
+@pytest.mark.parametrize("mode", ["--live", "--dry-run", "--commit-recorded"])
+def test_a_langsmith_tracing_environment_is_refused_before_anything(
+    rec: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variable: str,
+    mode: str,
+) -> None:
+    """Final review FR-13: with LangSmith tracing or its key in the environment, langchain could export the
+    prompts, so the recorder refuses every mode and calls nothing: no spike is loaded, no transport made, no
+    file written. The refusal names the variable, never its value."""
+
+    def no_spike(spike: str) -> None:
+        raise AssertionError("the spike was loaded")
+
+    monkeypatch.setattr(rec, "load_spike", no_spike)
+    factory = Factory(recorded_stream)
+    environ = {**ENV, variable: "lsv2_fake_tracing_value"}
+    assert run(rec, tmp_path, factory, "--spike", "v13", mode, environ=environ) == rec.REFUSED
+    assert factory.created == 0 and not (tmp_path / "raw").exists() and not (tmp_path / "fixtures").exists()
+    out = capsys.readouterr().out
+    assert variable in out and "REFUSED" in out and "lsv2_fake_tracing_value" not in out
+
+
 # --- counted before the send, and the count survives a crash ----------------------------------------------
 
 
@@ -434,6 +471,48 @@ def test_a_live_run_writes_raw_captures_the_fixture_and_its_sidecars_and_settles
     assert "v13 sonnet 200" in out and "v13 opus 200" in out
     for text in [*every_file(tmp_path), out]:
         assert FAKE_KEY not in text
+
+
+def modes(root: Path) -> dict[str, set[int]]:
+    """The permission bits of the directories (`root` included) and of the files under `root`."""
+    found: dict[str, set[int]] = {"dirs": {stat.S_IMODE(root.stat().st_mode)}, "files": set()}
+    for path in root.rglob("*"):
+        found["dirs" if path.is_dir() else "files"].add(stat.S_IMODE(path.stat().st_mode))
+    return found
+
+
+@pytest.mark.parametrize("umask", [0o077, 0o022], ids=["umask-077", "umask-022"])
+def test_recordings_are_readable_by_every_uid_and_the_raw_captures_and_the_key_stay_private(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, umask: int
+) -> None:
+    """Final review FR-14: the committed recordings are 0644 in 0755 directories (the dev worker, uid 10001,
+    reads them), whatever the umask; the raw captures, the budget, its lock and the key file stay 0600 in
+    0700 directories."""
+    key_modes: list[tuple[int, int]] = []
+    real_load_config = rec.load_config
+
+    def load_config(role: str, env: dict[str, str], directory: Path) -> Any:
+        key = directory / "anthropic_key"
+        if key.exists():
+            key_modes.append((stat.S_IMODE(key.stat().st_mode), stat.S_IMODE(directory.stat().st_mode)))
+        return real_load_config(role, env, directory)
+
+    monkeypatch.setattr(rec, "load_config", load_config)
+    previous = os.umask(umask)
+    try:
+        assert run(rec, tmp_path, Factory(recorded_stream), "--spike", "v13", "--live") == 0
+    finally:
+        os.umask(previous)
+    fixtures = modes(tmp_path / "fixtures")
+    assert fixtures == {"dirs": {0o755}, "files": {0o644}}
+    assert len(list((tmp_path / "fixtures").rglob("*.sse"))) == 2
+    assert modes(tmp_path / "raw") == {"dirs": {0o700}, "files": {0o600}}
+    assert {p.name for p in (tmp_path / "raw").iterdir()} == {
+        "anthropic",
+        "anthropic-budget.json",
+        "anthropic-budget.lock",
+    }
+    assert key_modes == [(0o600, 0o700)]
 
 
 def test_the_v13_check_reads_the_field_paths_and_writes_no_content(rec: ModuleType, tmp_path: Path) -> None:
