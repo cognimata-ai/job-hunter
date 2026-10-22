@@ -119,6 +119,7 @@ STALE_DATA_ALERT: Final = "schedule.stale_data"
 STALE_DATA_SUBJECT: Final = "collect"
 
 _TABLE: Final = "runs"
+_SCHEDULE_ENABLED: Final = q("SELECT enabled FROM schedule_state WHERE id = 1")
 # How often `request_manual_run` tries when the active collection it conflicted with ended before it was read.
 _REQUEST_TRIES: Final = 3
 
@@ -624,17 +625,22 @@ async def reconcile_queued_runs(ctx: ReconcileContext) -> int:
 
 @reconciler("stale_data", "tick")
 async def reconcile_stale_data(ctx: ReconcileContext) -> int:
-    """Raise `schedule.stale_data` (critical) exactly while `run_age_state` is `critical`, else resolve it.
+    """Raise `schedule.stale_data` (critical) exactly while the schedule is enabled and `run_age_state` is
+    `critical`, else resolve it.
 
     That is the one freshness rule system health reports too (ruling T17-g): after the grace (twice the
     interval after the first settings version, §17.5), no `succeeded` or `partial` run within twice the
-    interval, aged from the first settings version when none succeeded yet. Returns 1 when it raised or
-    resolved the alert, else 0. Fenced by `ctx.epoch` first (Ruling FR-h): a superseded worker raises
-    `FencedOut` having written nothing, which stops its cadence.
+    interval, aged from the first settings version when none succeeded yet. While `schedule_state.enabled`
+    is false no collection is due, so the alert is never raised and an open one is resolved (M0
+    Carry-forward 2, plan Task 17); enabled again, the same rule applies, and the run age it judges is the one
+    health reports throughout. Returns 1 when it raised or resolved the alert, else 0. Fenced by `ctx.epoch`
+    first (Ruling FR-h): a superseded worker raises `FencedOut` having written nothing, which stops its
+    cadence.
     """
     async with ctx.engine.begin() as conn:
         await fence_epoch(conn, ctx.epoch)
-        if run_age_state(ctx.now, await read_run_freshness(conn)) == "critical":
+        enabled = (await conn.execute(_SCHEDULE_ENABLED)).scalar_one_or_none() is not False
+        if enabled and run_age_state(ctx.now, await read_run_freshness(conn)) == "critical":
             await raise_alert(
                 conn,
                 code=STALE_DATA_ALERT,

@@ -250,6 +250,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Settings
+         * @description The active settings version, its document and the scope being applied, if any.
+         */
+        get: operations["get_settings_api_settings_get"];
+        put?: never;
+        /**
+         * Save Settings Version
+         * @description Save the document as a new settings version and activate it (201).
+         */
+        post: operations["save_settings_version_api_settings_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/settings/dry-run": {
         parameters: {
             query?: never;
@@ -264,6 +288,46 @@ export interface paths {
          * @description Validate and preview a proposed settings document: its errors, warnings, projections and effects.
          */
         post: operations["settings_dry_run_api_settings_dry_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Versions
+         * @description The settings versions, newest first, keyset-paged (§14.3).
+         */
+        get: operations["list_versions_api_settings_versions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/versions/{version_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Version
+         * @description A settings version, its document and its diff against the previous version.
+         */
+        get: operations["get_version_api_settings_versions__version_id__get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -418,6 +482,16 @@ export interface components {
         CvTextIn: {
             /** Text */
             text: string;
+        };
+        /**
+         * DiffEntryOut
+         * @description One changed leaf at its path (`payload.…`); `before` or `after` is null where the value is absent.
+         */
+        DiffEntryOut: {
+            after: components["schemas"]["JsonValue"];
+            before: components["schemas"]["JsonValue"];
+            /** Path */
+            path: string;
         };
         /** DiskUsage */
         DiskUsage: {
@@ -617,6 +691,16 @@ export interface components {
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
         };
         /**
+         * PendingScopeOut
+         * @description The scope being applied (§13.4) and its live apply's progress; `progress` is `null` while no apply is
+         *     live (one that failed for good, until the pointer is cleared).
+         */
+        PendingScopeOut: {
+            progress: components["schemas"]["ProgressOut"] | null;
+            /** Version Id */
+            version_id: number;
+        };
+        /**
          * Problem
          * @description The `application/problem+json` document of every error response (RFC 9457, §14.4).
          *
@@ -673,6 +757,13 @@ export interface components {
             purged: boolean;
             /** Version No */
             version_no: number;
+        };
+        /** ProgressOut */
+        ProgressOut: {
+            /** Done */
+            done: number;
+            /** Total */
+            total: number;
         };
         /**
          * QuotaOut
@@ -788,6 +879,41 @@ export interface components {
             /** Trigger */
             trigger: string;
         };
+        /**
+         * SaveIn
+         * @description A save (§13.2): `acknowledged_warnings` must cover every warning code the dry-run of `payload` gives;
+         *     `eval_override_ack` acknowledges a failed eval gate (§11.13).
+         */
+        SaveIn: {
+            /** Acknowledged Warnings */
+            acknowledged_warnings: string[];
+            /** Base Version Id */
+            base_version_id: number;
+            /**
+             * Eval Override Ack
+             * @default false
+             */
+            eval_override_ack: boolean;
+            payload: components["schemas"]["JsonValue"];
+        };
+        /** SaveOut */
+        SaveOut: {
+            /**
+             * Apply Scope Operation Id
+             * @description The `apply_scope` operation the version's scope needs (§13.4), or null when none does
+             */
+            apply_scope_operation_id: number | null;
+            version: components["schemas"]["SavedVersionOut"];
+        };
+        /** SavedVersionOut */
+        SavedVersionOut: {
+            /** Effect Classes */
+            effect_classes: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
+            /** Id */
+            id: number;
+            /** Version No */
+            version_no: number;
+        };
         /** SecurityClearance */
         SecurityClearance: {
             /** Level */
@@ -840,6 +966,15 @@ export interface components {
             totp_enabled: boolean;
             /** Username */
             username: string;
+        };
+        /** SettingsOut */
+        SettingsOut: {
+            /** Payload */
+            payload: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            pending_scope: components["schemas"]["PendingScopeOut"] | null;
+            version: components["schemas"]["VersionOut"];
         };
         /** Skill */
         Skill: {
@@ -1062,6 +1197,33 @@ export interface components {
             /** Validation Issues */
             validation_issues: components["schemas"]["ValidationIssueOut"][];
         };
+        /** VersionDetailOut */
+        VersionDetailOut: {
+            /** Diff */
+            diff: components["schemas"]["DiffEntryOut"][];
+            /** Payload */
+            payload: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            version: components["schemas"]["VersionOut"];
+        };
+        /**
+         * VersionOut
+         * @description A settings version as the lists show it; `created_at` in UTC, `effect_classes` sorted.
+         */
+        VersionOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Effect Classes */
+            effect_classes: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
+            /** Id */
+            id: number;
+            /** Version No */
+            version_no: number;
+        };
         /** Versions */
         Versions: {
             /** App */
@@ -1078,6 +1240,13 @@ export interface components {
             python: string;
             /** Sqlalchemy */
             sqlalchemy: string;
+        };
+        /** VersionsPageOut */
+        VersionsPageOut: {
+            /** Items */
+            items: components["schemas"]["VersionOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /**
          * WarningOut
@@ -2005,6 +2174,124 @@ export interface operations {
             };
         };
     };
+    get_settings_api_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    save_settings_version_api_settings_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SaveOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The base is not the active version (`stale_base_version`), the eval gate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body or settings, an unacknowledged warning (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     settings_dry_run_api_settings_dry_run_post: {
         parameters: {
             query?: never;
@@ -2046,6 +2333,125 @@ export interface operations {
                 };
             };
             /** @description Invalid body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_versions_api_settings_versions_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_version_api_settings_versions__version_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a settings version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionDetailOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such settings version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;

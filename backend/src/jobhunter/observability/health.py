@@ -31,8 +31,9 @@ reported, never readiness gates. `RunOut` is the api's view of a run row, shared
 
 **One freshness rule** (ruling T17-g): `read_run_freshness` is the one query of the run figures and
 `run_age_state` the one rule over them. System health reports that state, and the worker's `stale_data`
-reconciler raises `schedule.stale_data` exactly while it is `critical`, so the page and the alert never
-disagree.
+reconciler raises `schedule.stale_data` exactly while it is `critical` and the schedule is enabled (a
+disabled schedule runs nothing on purpose, M0 Carry-forward 2), so the page and the alert never disagree
+while a collection is due.
 """
 
 import asyncio

@@ -17,15 +17,29 @@ with `llm_tuple`, `scoring.execution` with `execution`, and `evaluation` with `e
 includes the model policy's `preset`: §13.1 lists it inside `scoring.model_policy` (effect `llm_tuple`),
 and its hash covers the label, so a label-only preset change derives a new `model_policies` row and is an
 `llm_tuple` change (Task 16 ruling 2).
+
+`diff_payloads` (Task 17) lists what changed between two documents, for `GET /api/settings/versions/{id}`:
+one `DiffEntry` per changed leaf, at its `FieldIssue` path (`payload.scope.locations[0].radius_km`,
+`settings.validate.field_path`), in the order of the `after` document (keys only `before` has come after its
+own). The callers pass normal forms, so a formatting difference is none here either. Values compare as
+canonical JSON, so `true` is never `1`. `None` stands for a side where the value is absent: a list entry or a
+map key that only one side has (a stored document has every other key). Lists:
+- a list whose entries are all objects with one of `ID_KEYS` (`query_id`, `watchlist_company_id`,
+  `gazetteer_id`; §13.1), unique on each side, is matched by that key: an entry of both sides is compared
+  field by field at its index in `after`, a new entry is reported whole at its index in `after`, a removed one
+  whole at its index in `before`. A move alone is no entry, as the run view keys these lists by id;
+- any other list compares by position, an entry beyond the shorter list against `None`.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Literal, get_args
 
 from jobhunter.db.seed import canonical_json
 from jobhunter.settings.model import Settings
-from jobhunter.types import json_get
+from jobhunter.settings.validate import ROOT
+from jobhunter.types import JSONValue, json_get
 
 EffectClass = Literal[
     "none",
@@ -119,3 +133,78 @@ def classify_effects(active: Settings, proposed: Settings) -> frozenset[EffectCl
             classes |= effects
     classes.discard("none")
     return frozenset(classes) if classes else _NONE
+
+
+# The id keys of §13.1's lists of objects (`queries[]`, `watchlist[]`, `scope.locations[]`), tried in order.
+ID_KEYS: Final[tuple[str, ...]] = ("query_id", "watchlist_company_id", "gazetteer_id")
+
+
+@dataclass(frozen=True)
+class DiffEntry:
+    """One changed leaf: its path and its value on each side (`None` where absent; module docstring)."""
+
+    path: str
+    before: JSONValue
+    after: JSONValue
+
+
+def diff_payloads(before: JSONValue, after: JSONValue) -> list[DiffEntry]:
+    """What changed from `before` to `after`, one entry per changed leaf (module docstring)."""
+    entries: list[DiffEntry] = []
+    _diff(ROOT, before, after, entries)
+    return entries
+
+
+def _same(a: JSONValue, b: JSONValue) -> bool:
+    return canonical_json(a) == canonical_json(b)
+
+
+def _diff(path: str, before: JSONValue, after: JSONValue, out: list[DiffEntry]) -> None:
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in [*after, *(key for key in before if key not in after)]:
+            _diff(f"{path}.{key}", before.get(key), after.get(key), out)
+    elif isinstance(before, list) and isinstance(after, list):
+        id_key = _id_key(before, after)
+        if id_key is None:
+            for i in range(max(len(before), len(after))):
+                old = before[i] if i < len(before) else None
+                new = after[i] if i < len(after) else None
+                _diff(f"{path}[{i}]", old, new, out)
+        else:
+            _diff_keyed(path, before, after, id_key, out)
+    elif not _same(before, after):
+        out.append(DiffEntry(path, before, after))
+
+
+def _ids(entries: Sequence[JSONValue], key: str) -> list[bytes] | None:
+    """The canonical id of each entry, or `None` when an entry is no object with `key` or an id repeats."""
+    ids = [canonical_json(entry[key]) for entry in entries if isinstance(entry, dict) and key in entry]
+    return ids if len(ids) == len(entries) and len(set(ids)) == len(ids) else None
+
+
+def _id_key(before: list[JSONValue], after: list[JSONValue]) -> str | None:
+    if not before and not after:
+        return None
+    for key in ID_KEYS:
+        if _ids(before, key) is not None and _ids(after, key) is not None:
+            return key
+    return None
+
+
+def _diff_keyed(
+    path: str, before: list[JSONValue], after: list[JSONValue], key: str, out: list[DiffEntry]
+) -> None:
+    old = {
+        ident: (i, entry)
+        for i, (ident, entry) in enumerate(zip(_ids(before, key) or [], before, strict=True))
+    }
+    seen: set[bytes] = set()
+    for j, (ident, entry) in enumerate(zip(_ids(after, key) or [], after, strict=True)):
+        seen.add(ident)
+        if ident in old:
+            _diff(f"{path}[{j}]", old[ident][1], entry, out)
+        else:
+            out.append(DiffEntry(f"{path}[{j}]", None, entry))
+    for ident, (i, entry) in old.items():
+        if ident not in seen:
+            out.append(DiffEntry(f"{path}[{i}]", entry, None))
