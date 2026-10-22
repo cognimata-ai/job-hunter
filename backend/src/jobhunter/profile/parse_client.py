@@ -12,11 +12,13 @@ alone, so a decrypted CV never reaches a disk.
   directory is removed in a `finally`, whatever the outcome, cancellation included.
   The directory is emptied through its own descriptor first, so its content goes even when docparse has
   moved it and planted a symlink in its place (an emptied directory under a name the client cannot know
-  then stays until the next `cleanup_leftovers`).
+  then stays until docparse's own sweep removes it, or the next `cleanup_leftovers`).
 - `validate(data)` is the same exchange in `validate` mode, for a PDF: encryption and page count, no text,
   so an `ok` is `ParseOk("", "pypdf", page_count)`.
 - `cleanup_leftovers()` removes every entry under the root at worker start: what a crashed worker left. A
-  missing root removes nothing and returns 0.
+  missing root removes nothing and returns 0. docparse sweeps the root too, and it can remove what a
+  compromised parse left that this uid cannot (`docparse.worker.sweep`, final review FR-11); it keeps a
+  job's protocol files for longer than this client waits for the job.
 
 **docparse is the sandbox of hostile documents**, and anything its parser child runs can write anything in
 the job directory. Its answer is read as untrusted: every file goes through the job directory's own file
