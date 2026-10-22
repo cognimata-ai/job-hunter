@@ -80,7 +80,9 @@ def test_prod_without_live_exits_2_before_anything_runs(
     assert out.err == f"schema-dry-run: {PROD_WITHOUT_LIVE}; nothing sent\n"
 
 
-@pytest.mark.parametrize("blank", [b" ", b" \t ", b"\n\n"], ids=["space", "tab", "newlines"])
+@pytest.mark.parametrize(
+    "blank", [b" ", b" \t ", b"\n\n", b"\xff\xfe"], ids=["space", "tab", "newlines", "not_utf8"]
+)
 def test_a_blank_key_is_refused_at_the_start_like_a_missing_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], blank: bytes
 ) -> None:

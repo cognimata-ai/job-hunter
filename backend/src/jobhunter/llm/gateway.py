@@ -649,8 +649,12 @@ class _Next:
 
 
 def _secret_key(cfg: AppConfig) -> str:
-    """The worker's `anthropic_key` secret without surrounding whitespace; empty when it holds none."""
-    return cfg.secrets.get("anthropic_key", b"").decode("utf-8").strip()
+    """The worker's `anthropic_key` secret without surrounding whitespace; empty when it holds none, or
+    bytes that are not UTF-8 (no key, and the decode error, which quotes a byte, is never raised)."""
+    try:
+        return cfg.secrets.get("anthropic_key", b"").decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return ""
 
 
 def has_api_key(cfg: AppConfig) -> bool:
