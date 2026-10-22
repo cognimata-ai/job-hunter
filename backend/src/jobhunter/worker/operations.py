@@ -32,7 +32,9 @@ end commit together. Either records the end in the context's outcome holder, and
 reads it once the handler has returned, then writes nothing more for that execution. Such a call must be
 part of a transaction that commits before the handler returns (an exception that rolls it back propagates,
 and the execution is then requeued as `bug` like any other raise). The context also carries the worker's
-`OperationDeps` (`deps`), which the M2 handlers need; an M1 handler runs with `deps=None`.
+`OperationDeps` (`deps`), which the M2 handlers need; an M1 handler runs with `deps=None`. A handler records
+its progress (`operations.progress`, which the API polls) with `set_progress`, under the claim predicate like
+every owner write (M2 Task 18).
 
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
 the one ownership-loss protocol shared with runs. A claim that the epoch fence refuses (a superseded worker,
@@ -263,6 +265,11 @@ _HEARTBEAT = q(
     "WHERE id = :i AND claim_id = :c AND status = 'running' RETURNING id"
 )
 _LOCK_OWNER = q("SELECT id FROM operations WHERE id = :i AND claim_id = :c AND status = 'running' FOR SHARE")
+_SET_PROGRESS = q(
+    "UPDATE operations SET progress = :progress "
+    "WHERE id = :i AND claim_id = :c AND status = 'running' RETURNING id",
+    jsonb=["progress"],
+)
 # The three reads that lead to `_release` also read the kind and the payload: its failure hook needs both.
 _OWNED_ATTEMPTS = q(
     "SELECT attempts, kind, payload FROM operations "
@@ -375,6 +382,20 @@ async def lock_operation_owner(conn: AsyncConnection, claim: OperationClaim) -> 
     Every reservation, dispatch marker and domain write made on the operation's behalf runs after it.
     """
     if (await conn.execute(_LOCK_OWNER, _owner(claim))).first() is None:
+        raise FencedOut("operation")
+
+
+async def set_progress(
+    conn: AsyncConnection, claim: OperationClaim, progress: Mapping[str, JSONValue]
+) -> None:
+    """Replace the claimed operation's `progress` (counts and flags only, never content; the API polls it),
+    in the caller's transaction; `FencedOut`, having written nothing, when `claim` lost the row (M2 Task 18).
+
+    It updates the owner row, so a transaction that waits on that row's update (an `INSERT … ON CONFLICT` on
+    `operations_live_dedup` that meets this live row) waits until the caller commits: a caller that holds a
+    long transaction makes it the last statement (the scope apply's chunk does).
+    """
+    if (await conn.execute(_SET_PROGRESS, {**_owner(claim), "progress": dict(progress)})).first() is None:
         raise FencedOut("operation")
 
 

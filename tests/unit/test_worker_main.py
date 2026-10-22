@@ -590,11 +590,13 @@ M1_RECONCILERS = {
     "group_representatives": ["heavy"],
     "awaiting_embedding": ["heavy"],
 }
-# The reconcilers M2 adds, by task: the spend ledger's two (Task 3) and the gateway's refusal rate (Task 5).
+# The reconcilers M2 adds, by task: the spend ledger's two (Task 3), the gateway's refusal rate (Task 5) and
+# the scope apply's permanent-failure recovery (Task 18).
 M2_RECONCILERS = {
     "llm_ledger_unsettled": ["tick"],
     "budget_counters": ["heavy"],
     "llm_refusal_rate": ["heavy"],
+    "scope_apply_failed": ["tick"],
 }
 # Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
 # from `sys.modules` (each registry module is imported by the modules that register into it).
@@ -636,14 +638,14 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
     (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
     anyway), the registries hold exactly the M1 and M2 reconcilers with their cadences, the two takeover
-    sweeps, the `extract_profile_text` (Task 11), `extract_profile` (Task 13) and `watchlist_validate`
-    handlers, and the failure hooks of the two profile phases."""
+    sweeps, the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `apply_scope` (Task 18) and
+    `watchlist_validate` handlers, and the failure hooks of the two profile phases."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
         "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS},
         "sweeps": ["operations", "runs"],
-        "handlers": ["extract_profile", "extract_profile_text", "watchlist_validate"],
+        "handlers": ["apply_scope", "extract_profile", "extract_profile_text", "watchlist_validate"],
         "failure_hooks": ["extract_profile", "extract_profile_text"],
         "main_imported": False,
     }

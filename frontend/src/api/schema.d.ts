@@ -294,6 +294,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/scope/retry-apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Scope Apply
+         * @description Apply the active settings version's scope again, after its apply failed for good (202).
+         */
+        post: operations["retry_scope_apply_api_settings_scope_retry_apply_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/settings/versions": {
         parameters: {
             query?: never;
@@ -805,6 +825,14 @@ export interface components {
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
             /** Ok */
             ok: boolean;
+        };
+        /** RetryApplyOut */
+        RetryApplyOut: {
+            /**
+             * Operation Id
+             * @description The new `apply_scope` operation of the active version's scope
+             */
+            operation_id: number;
         };
         /** RetryIn */
         RetryIn: {
@@ -2334,6 +2362,62 @@ export interface operations {
             };
             /** @description Invalid body (`validation_failed`) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    retry_scope_apply_api_settings_scope_retry_apply_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryApplyOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The active settings version's scope is already the active scope, or an `apply_scope` operation is live (`conflict_state`) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

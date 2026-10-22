@@ -32,6 +32,16 @@ The reads, each a plain `SELECT` (no lock):
   previous version's document and this one's (empty for version 1), both read as normal forms. 404
   `not_found` for an unknown id.
 
+`POST /api/settings/scope/retry-apply` (Task 18, §13.4 step 5) → 202 `{operation_id}`: a new `apply_scope`
+operation for the active settings version's scope, after a permanent failure cleared the pending pointer. In
+one transaction: `active_config` `FOR UPDATE` first (§9.1), then the scope `derive.derived` gives for the
+active version's document with the active profile (`ensure_derived`, as a save derives it). It is 409
+`conflict_state` when that scope is already the active one, or while any `apply_scope` operation is live
+(`scope_apply.live_apply`); otherwise `scope_apply.set_desired_scope` points `pending` at it and requests the
+apply. It takes no `Idempotency-Key` (§14.1 does not list it): a repeated request finds the apply live and is
+refused. `scope_apply_retry_requested` is logged with the ids after the commit, a refusal as
+`scope_apply_retry_refused` with its reason code.
+
 `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.settings.utcnow`; the save takes its `now` from it too. The log lines hold ids, counts,
 warning codes and effect classes only, never a value of the payload.
@@ -68,6 +78,8 @@ from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
+from jobhunter.settings import scope_apply
+from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import active_settings, dry_run
 from jobhunter.settings.effects import EffectClass, diff_payloads
 from jobhunter.settings.model import Settings
@@ -110,6 +122,10 @@ _VERSION: Final = q(
     "SELECT id, version_no, created_at, effect_classes, payload FROM settings_versions WHERE id = :id"
 )
 _PREVIOUS: Final = q("SELECT payload FROM settings_versions WHERE version_no = :no")
+_LOCK_ACTIVE_VERSION: Final = q(
+    "SELECT a.scope_version_id, a.profile_version_id, v.payload FROM active_config a "
+    "JOIN settings_versions v ON v.id = a.settings_version_id WHERE a.id = 1 FOR UPDATE OF a"
+)
 _NEVER: Final = (
     "null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is "
     "ever refreshed"
@@ -227,6 +243,10 @@ class VersionDetailOut(BaseModel):
     version: VersionOut
     payload: dict[str, JsonValue]
     diff: list[DiffEntryOut]
+
+
+class RetryApplyOut(BaseModel):
+    operation_id: int = Field(description="The new `apply_scope` operation of the active version's scope")
 
 
 VersionId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a settings version")]
@@ -430,3 +450,39 @@ async def get_version(
         payload=payload,
         diff=[DiffEntryOut(path=e.path, before=e.before, after=e.after) for e in diff],
     )
+
+
+def _retry_refused(reason: str, detail: str) -> Problem:
+    log.info("scope_apply_retry_refused", reason=reason)
+    return Problem(409, "conflict_state", "The scope cannot be applied again now", detail=detail)
+
+
+@router.post(
+    "/scope/retry-apply",
+    status_code=202,
+    response_model=RetryApplyOut,
+    responses={
+        409: {
+            "description": "The active settings version's scope is already the active scope, or an "
+            "`apply_scope` operation is live (`conflict_state`)"
+        },
+        **CSRF_RESPONSES,
+    },
+)
+async def retry_scope_apply(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> RetryApplyOut:
+    """Apply the active settings version's scope again, after its apply failed for good (202)."""
+    now = utcnow()
+    async with engine.begin() as conn:
+        active = (await conn.execute(_LOCK_ACTIVE_VERSION)).one()  # the first lock (§9.1)
+        profile = await active_profile(conn, active.profile_version_id)
+        ids = await ensure_derived(conn, derived(Settings.model_validate(active.payload), profile=profile))
+        scope_version_id = ids.scope_version_id
+        if scope_version_id == active.scope_version_id:
+            raise _retry_refused("scope_active", "the active settings version's scope is the active scope")
+        if await scope_apply.live_apply(conn) is not None:
+            raise _retry_refused("apply_live", "a scope is being applied; wait for it to end")
+        operation_id = await scope_apply.set_desired_scope(conn, scope_version_id, now=now, defer=defer_in_tx)
+        if operation_id is None:  # only for the active scope, refused above
+            raise RuntimeError("set_desired_scope requested no apply for a scope that is not the active one")
+    log.info("scope_apply_retry_requested", operation_id=operation_id, scope_version_id=scope_version_id)
+    return RetryApplyOut(operation_id=operation_id)

@@ -148,6 +148,7 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.llm.spend_ledger",  # `llm_ledger_unsettled` and `budget_counters` (M2)
     "jobhunter.llm.gateway",  # `llm_refusal_rate` (M2)
     "jobhunter.profile.operations",  # the `extract_profile_text` handler and its failure hook (M2 Task 11)
+    "jobhunter.settings.scope_apply",  # the `apply_scope` handler and `scope_apply_failed` (M2 Task 18)
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

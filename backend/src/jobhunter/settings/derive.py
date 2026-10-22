@@ -14,17 +14,24 @@ earlier one. The payloads are the settings document's own objects, as `db.seed` 
 A new evaluation policy takes `version_no = max + 1` and `projected_critic_rate =
 DEFAULT_PROJECTED_CRITIC_RATE`, the §21.2 central 0.450: §11.7.4's replay needs the round-0 drafts of M3
 (`seed.ensure_evaluation_policy`, Deviation 16).
+
+`active_profile(conn, profile_version_id)` is the profile a scope is resolved with: the settings save and
+retry-apply (Task 18) pass the active one.
 """
 
 from dataclasses import dataclass
+from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.seed import ensure_evaluation_policy, ensure_hashed, scope_payload
+from jobhunter.db.sql import q
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.normalize.titles import SENIORITY_LADDER
 from jobhunter.settings.model import Settings
 from jobhunter.types import JSONValue, get_object
+
+_PROFILE: Final = q("SELECT profile_json FROM profile_versions WHERE id = :id")
 
 
 @dataclass(frozen=True)
@@ -89,3 +96,12 @@ async def ensure_derived(conn: AsyncConnection, d: DerivedPayloads) -> DerivedId
         execution_config_id=await ensure_hashed(conn, "execution_configs", d.execution),
         evaluation_policy_id=await ensure_evaluation_policy(conn, d.evaluation),
     )
+
+
+async def active_profile(conn: AsyncConnection, profile_version_id: object) -> ConfirmedProfile | None:
+    """The profile of `profile_version_id` (`active_config.profile_version_id`), or `None` without one; a
+    purged version has no content to resolve with."""
+    if not isinstance(profile_version_id, int):
+        return None
+    profile_json = (await conn.execute(_PROFILE, {"id": profile_version_id})).scalar_one()
+    return None if profile_json is None else ConfirmedProfile.model_validate(profile_json)

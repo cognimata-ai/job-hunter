@@ -67,11 +67,10 @@ from jobhunter.db.sql import q
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, spend_ledger
 from jobhunter.llm.budget import BudgetParams
-from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.quota.planner import ensure_cells
 from jobhunter.run_settings import load_run_settings
 from jobhunter.settings import scope_apply
-from jobhunter.settings.derive import DerivedIds, derived, ensure_derived
+from jobhunter.settings.derive import DerivedIds, active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import dry_run
 from jobhunter.settings.effects import EffectClass
 from jobhunter.settings.model import Settings
@@ -89,7 +88,6 @@ _LOCK_ACTIVE: Final = q(
     "SELECT settings_version_id, profile_version_id, llm_tuple_id FROM active_config WHERE id = 1 FOR UPDATE"
 )
 _VERSION: Final = q("SELECT payload, acknowledged_warnings FROM settings_versions WHERE id = :id")
-_PROFILE: Final = q("SELECT profile_json FROM profile_versions WHERE id = :id")
 _INSERT_VERSION: Final = q(
     "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, "
     "execution_config_id, evaluation_policy_id, base_version_id, effect_classes, acknowledged_warnings, "
@@ -295,14 +293,6 @@ def _validation_failed(errors: list[FieldError]) -> Problem:
     return Problem(422, "validation_failed", "Settings validation failed", errors=errors)
 
 
-async def _active_profile(conn: AsyncConnection, profile_version_id: object) -> ConfirmedProfile | None:
-    """The active profile, or `None` without one; a purged version has no content to resolve with."""
-    if not isinstance(profile_version_id, int):
-        return None
-    profile_json = (await conn.execute(_PROFILE, {"id": profile_version_id})).scalar_one()
-    return None if profile_json is None else ConfirmedProfile.model_validate(profile_json)
-
-
 async def save_settings(
     conn: AsyncConnection, req: SaveRequest, *, now: datetime, defer: Deferrer, internal: bool = False
 ) -> SaveOutcome:
@@ -341,7 +331,7 @@ async def save_settings(
 
     payload = proposed.to_payload()
     ids = await ensure_derived(
-        conn, derived(proposed, profile=await _active_profile(conn, active.profile_version_id))
+        conn, derived(proposed, profile=await active_profile(conn, active.profile_version_id))
     )
     version = (
         await conn.execute(

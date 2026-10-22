@@ -41,6 +41,9 @@ refilters up to `BATCH` of them. The heavy reconciler `hard_filter_completeness`
 (`active_scopes`), then the batch's job rows `FOR SHARE` in ascending id and in one statement (a job merged or
 deleted meanwhile is skipped), then the caller's `guard` (the owner or epoch fence), then the writes. The
 unpublished targets of a job whose result changed are refiltered once `score_targets` exists (M3).
+`STALE_PREDICATE` is that stale-result condition as one SQL fragment, which the scope apply's final
+completeness check (`settings.scope_apply.incomplete_jobs`, M2 Task 18) counts with; the apply's precompute
+calls `recompute_stale` for its pending scope alone and outside any `active_config` lock (§13.4 step 2).
 """
 
 import re
@@ -428,14 +431,21 @@ async def refilter_job(
 
 # -- completeness --------------------------------------------------------------------------------------------
 
+# The stale-result condition of the job `j` (M2 Task 18: written once, shared with
+# `scope_apply.incomplete_jobs`): for a scope of `:scopes` (bigint[] of scope version ids) the job has no
+# `hard_filter_results` row, or its row has an `inputs_hash` other than `jobs.det_facts_hash` or an algorithm
+# version other than `:version` (`DET_ALGORITHM_VERSION`).
+STALE_PREDICATE: Final = (
+    "EXISTS (SELECT 1 FROM unnest(CAST(:scopes AS bigint[])) AS s(id) "
+    "LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = s.id "
+    "WHERE h.job_id IS NULL OR h.inputs_hash <> j.det_facts_hash OR h.det_algorithm_version <> :version)"
+)
 # The unmerged jobs (touched since `since`, when given) that lack a row for a scope, or whose row is stale,
 # in id order, locked `FOR SHARE` as they are returned: a job merged or deleted since the scan is skipped.
 _STALE: Final = q(
-    "SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL "
+    "SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL "  # noqa: S608 (constants only)
     "AND (CAST(:since AS timestamptz) IS NULL OR j.updated_at >= :since) "
-    "AND EXISTS (SELECT 1 FROM unnest(CAST(:scopes AS bigint[])) AS s(id) "
-    "LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = s.id "
-    "WHERE h.job_id IS NULL OR h.inputs_hash <> j.det_facts_hash OR h.det_algorithm_version <> :version) "
+    f"AND {STALE_PREDICATE} "
     "ORDER BY j.id LIMIT :limit FOR SHARE OF j"
 )
 
@@ -452,10 +462,11 @@ async def recompute_stale(
     jobs updated at or after `since` when it is given. Returns how many jobs it recomputed (a pass that
     returns `BATCH` may have left more).
 
-    In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `active_scopes`): the batch's
-    job rows `FOR SHARE` in one statement, then `await guard(conn)`, which proves the caller still owns the
-    work (the owner row of the run, or the worker epoch) and raises `FencedOut`, having written nothing, when
-    it does not; then the results are written.
+    In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `active_scopes`, except the
+    scope apply's precompute, which runs outside any `active_config` lock, §13.4 step 2): the batch's job
+    rows `FOR SHARE` in one statement, then `await guard(conn)`, which proves the caller still owns the work
+    (the owner row of the run or operation, or the worker epoch) and raises `FencedOut`, having written
+    nothing, when it does not; then the results are written.
     """
     if not scopes:
         return 0
