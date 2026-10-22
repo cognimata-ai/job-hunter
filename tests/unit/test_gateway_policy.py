@@ -96,6 +96,14 @@ def test_a_first_try_needs_30_s_and_any_later_try_120_s() -> None:
     assert min_remaining_s("enlarged", 3) == 120
 
 
+def test_a_call_resumed_at_the_enlarged_stage_makes_its_first_try_with_30_s() -> None:
+    """Final review FR-2: a call that starts at the enlarged stage (`CallContext.start_stage`) has a fresh
+    deadline, and its first try is a first try; its retries need 120 s as any other."""
+    assert min_remaining_s("enlarged", 1, start_stage="enlarged") == 30
+    assert min_remaining_s("enlarged", 2, start_stage="enlarged") == 120
+    assert min_remaining_s("enlarged", 3, start_stage="enlarged") == 120
+
+
 class _NoEngine:
     """An engine a test must never reach: the gateway refuses before any transaction."""
 

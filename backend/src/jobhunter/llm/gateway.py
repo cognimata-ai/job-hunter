@@ -39,6 +39,12 @@ and its tries reserve with `native_pdf_extra=True`. A failed count, a count abov
 text that cannot be encoded as UTF-8 is `InputUnbounded`, with nothing reserved or sent. A first try needs
 `FIRST_TRY_MIN_REMAINING_S` of the deadline left, any later try `RETRY_MIN_REMAINING_S` (`DeadlineExhausted`).
 
+**The stages.** A logical call runs its first stage (`max_tokens`), then its enlarged one
+(`max_tokens_retry`). A call resumed after its paid first stage stopped at `max_tokens` (the receipts walk of
+`graphs.profile.nodes.llm_outcome`) starts at the enlarged stage (`CallContext.start_stage`, final review
+FR-2): the first stage is not sent again. Its first try is the call's first try (30 s of its fresh deadline),
+it reserves the enlarged stage's worst case, and the logical call counts the tries of this execution.
+
 **Each try's end** (§10.4, §10.5, §10.7): the ledger state, the `llm_calls` status and `error_code` (also the
 `outcome` label of `jobhunter_llm_calls_total`, `ok` when there is none), and what follows.
 - A response that streamed to its end is `billed` from its usage and its call `completed`, checked in this
@@ -527,7 +533,8 @@ def to_messages(prompt: RenderedPrompt) -> list[BaseMessage]:
 class CallContext:
     """Who a call is for: the spend owner and class, the pinned execution config, the deadline (monotonic,
     the node's active `deadline_s` from now, enforced per call: Deviation 28), the draft or eval run it
-    records, its `logical_call_no` (2 for a node's one repair) and whether its input is a native PDF."""
+    records, its `logical_call_no` (2 for a node's one repair), whether its input is a native PDF, and the
+    stage it starts at (`enlarged` for a call resumed after its paid first stage stopped at `max_tokens`)."""
 
     owner: SpendOwner
     purpose_class: PurposeClass
@@ -537,6 +544,7 @@ class CallContext:
     eval_run_id: int | None = None
     logical_call_no: int = 1
     native_pdf: bool = False
+    start_stage: Stage = "first"
 
 
 @dataclass(frozen=True)
@@ -601,10 +609,11 @@ def retry_wait(
     return retry_after_seconds(headers, now=now) or jittered_backoff(transport_try, rng=rng)
 
 
-def min_remaining_s(stage: Stage, transport_try: int) -> int:
-    """The deadline a try needs left: 30 s for the first try, 120 s for any later one (a retry or the enlarged
-    stage)."""
-    return FIRST_TRY_MIN_REMAINING_S if (stage, transport_try) == ("first", 1) else RETRY_MIN_REMAINING_S
+def min_remaining_s(stage: Stage, transport_try: int, *, start_stage: Stage = "first") -> int:
+    """The deadline a try needs left: 30 s for the call's first try (the first try of `start_stage`), 120 s
+    for any later one (a retry or the enlarged stage after the first)."""
+    first_try = (stage, transport_try) == (start_stage, 1)
+    return FIRST_TRY_MIN_REMAINING_S if first_try else RETRY_MIN_REMAINING_S
 
 
 def _connect_failed_before_send(exc: BaseException) -> bool:
@@ -730,8 +739,8 @@ class LLMGateway:
         return self._monotonic
 
     async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult:
-        """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries); a
-        gateway without a key raises `LLMNotConfigured` first."""
+        """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries) from
+        `ctx.start_stage`; a gateway without a key raises `LLMNotConfigured` first."""
         api_key = self._configured_key()
         messages = to_messages(prompt)  # the last is a user turn: never a prefill (RenderedPrompt)
         hashes = _hashes(prompt)
@@ -744,9 +753,12 @@ class LLMGateway:
             ("first", node.max_tokens),
             ("enlarged", node.max_tokens_retry),
         )
+        if ctx.start_stage == "enlarged":  # resumed after its paid first stage (module docstring)
+            stages = stages[1:]
         for stage, max_tokens in stages:
             for transport_try in range(1, TRANSPORT_TRIES + 1):
-                if ctx.deadline - self._monotonic() < min_remaining_s(stage, transport_try):
+                needed = min_remaining_s(stage, transport_try, start_stage=ctx.start_stage)
+                if ctx.deadline - self._monotonic() < needed:
                     raise DeadlineExhausted("too little of the node deadline is left for another try")
                 # built before the reservation: nothing is reserved for a request that cannot be made
                 receipt = TryReceipt(self._clock)

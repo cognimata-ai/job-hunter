@@ -209,6 +209,42 @@ async def test_max_tokens_in_both_stages_is_max_tokens_exhausted(
     ]
 
 
+async def test_a_call_resumed_at_the_enlarged_stage_never_sends_the_first_stage(
+    engine, fake_llm: FakeLLM, owner, ec
+) -> None:
+    """Final review FR-2: a call whose `start_stage` is `enlarged` (its paid first stage stopped at
+    `max_tokens` before a crash) sends the enlarged request first: its reservation is the enlarged worst case,
+    its first try needs the first try's 30 s of a fresh deadline, and the logical call counts this
+    execution's tries."""
+    deadline = time.monotonic() + 119.5  # less than a later try's 120 s, more than a first try's 30 s
+    ctx = call_context(owner, ec, start_stage="enlarged", deadline=deadline)
+    result = await fake_llm.gateway(engine).call(GATEWAY_NODE, gateway_prompt(), ctx)
+    (row,) = await tries(engine)
+    assert [r.max_tokens for r in fake_llm.requests] == [GATEWAY_NODE.max_tokens_retry]
+    assert (row.max_tokens, row.max_tokens_stage, row.transport_try, row.error_code) == (
+        2000,
+        "enlarged",
+        1,
+        None,
+    )
+    bound = text_input_bound(MODEL, gateway_prompt().as_request(GatewayOut))
+    assert row.reserved_usd == worst_case_usd(MODEL, input_tokens_bound=bound, max_tokens=2000)
+    assert (result.llm_call_id, result.cost_usd) == (row.call_id, row.settled_usd)
+    assert await no_drift(engine, [row])
+    # at the enlarged stage a max_tokens stop is the terminal one, with no first-stage try before it
+    fake_llm.scenario("max_tokens")
+    with pytest.raises(MaxTokensExhausted):
+        await fake_llm.gateway(engine).call(
+            GATEWAY_NODE, gateway_prompt(), call_context(owner, ec, start_stage="enlarged")
+        )
+    rows = await tries(engine)
+    assert [(r.max_tokens_stage, r.error_code) for r in rows] == [
+        ("enlarged", None),
+        ("enlarged", "max_tokens"),
+    ]
+    assert [r.max_tokens for r in fake_llm.requests] == [2000, 2000]
+
+
 async def test_refusal_is_billed_and_refused_with_its_category(engine, fake_llm: FakeLLM, owner, ec) -> None:
     fake_llm.scenario("refusal")
     counted = Counted("refused")

@@ -77,13 +77,23 @@ def test_a_terminal_code_ends_with_that_code_and_no_request(code: str, logical_c
 
 
 @pytest.mark.parametrize("logical_call_no", [1, 2])
-def test_a_settled_first_stage_max_tokens_try_is_neither_terminal_nor_usable(logical_call_no: int) -> None:
-    """Carried ruling (Task 5): the gateway enlarges after `max_tokens_first_stage`; a crash before the
-    enlarged stage settled leaves that try the newest completed one, and the call is made again under the
-    same `logical_call_no`."""
+def test_a_settled_first_stage_max_tokens_try_resumes_the_call_at_the_enlarged_stage(
+    logical_call_no: int,
+) -> None:
+    """Carried ruling (Task 5) and final review FR-2: the gateway enlarges after `max_tokens_first_stage`; a
+    crash before the enlarged stage settled leaves that try the newest completed one. It is neither terminal
+    nor usable, and the paid first stage is known to be too small: the same `logical_call_no` is made again
+    from its enlarged stage, never from the first one."""
     receipts = {1: failed(11, "invalid_output")} if logical_call_no == 2 else {}
     receipts[logical_call_no] = failed(10 + logical_call_no, "max_tokens_first_stage")
-    assert walk(receipts) == Call(logical_call_no)
+    assert walk(receipts) == Call(logical_call_no, start_stage="enlarged")
+
+
+def test_every_other_call_starts_at_the_first_stage() -> None:
+    assert Call(1) == Call(1, start_stage="first")
+    assert walk({}) == Call(1, start_stage="first")
+    assert walk({1: failed(11, "invalid_output")}) == Call(2, start_stage="first")
+    assert after_error(InvalidOutput("structural"), 1) == Call(2, start_stage="first")
 
 
 def test_terminal_codes_are_the_four_of_the_gateway() -> None:
@@ -148,14 +158,16 @@ def test_transient_errors_requeue_the_operation(error: LLMError) -> None:
 
 class Calls:
     """A node's call function: each logical call answers the next of `answers` (an llm_call id or an
-    error)."""
+    error). `made` records the logical call numbers and `stages` the stage each started at."""
 
     def __init__(self, *answers: int | LLMError) -> None:
         self.answers = list(answers)
         self.made: list[int] = []
+        self.stages: list[str] = []
 
-    async def __call__(self, logical_call_no: int) -> int:
-        self.made.append(logical_call_no)
+    async def __call__(self, step: Call) -> int:
+        self.made.append(step.logical_call_no)
+        self.stages.append(step.start_stage)
         answer = self.answers.pop(0)
         if isinstance(answer, LLMError):
             raise answer
@@ -193,6 +205,17 @@ async def test_drive_makes_only_the_repair_when_it_is_due() -> None:
     assert calls.made == [2]
 
 
+async def test_drive_starts_a_resumed_call_at_its_stage_and_its_repair_at_the_first() -> None:
+    """FR-2: the walk's `Call(n, start_stage="enlarged")` reaches the node's call as it is; the repair after
+    it is a new logical call, from the first stage."""
+    calls = Calls(21)
+    assert await drive(Call(1, start_stage="enlarged"), calls) == Use(1, 21)
+    assert (calls.made, calls.stages) == ([1], ["enlarged"])
+    calls = Calls(InvalidOutput("structural"), 22)
+    assert await drive(Call(1, start_stage="enlarged"), calls) == Use(2, 22)
+    assert (calls.made, calls.stages) == ([1, 2], ["enlarged", "first"])
+
+
 async def test_drive_maps_a_transient_error_to_a_requeue() -> None:
     assert await drive(Call(1), Calls(LLMTransient("http_529"))) == Requeue("llm_transient")
 
@@ -201,7 +224,7 @@ async def test_drive_lets_a_non_llm_error_through() -> None:
     class Boom(Exception):
         pass
 
-    async def call(logical_call_no: int) -> int:
+    async def call(step: Call) -> int:
         raise Boom
 
     with pytest.raises(Boom):

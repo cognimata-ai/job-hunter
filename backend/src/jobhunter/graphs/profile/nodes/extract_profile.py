@@ -16,10 +16,12 @@
 3. **The call** (`llm_outcome.drive`): `purpose='extract_profile'`, non-scoring, the **active** model policy
    and execution config (a non-score call uses the active ones, §13.3), `OperationOwner(claim)`, the draft's
    id, the native flag (the gateway then counts the exact request and reserves `native_pdf_bound` plus the
-   locked month row's buffer share), `logical_call_no` 1 or 2, and `deadline = monotonic() + deadline_s` of
-   that execution config, per call (Deviation 28). The fault point `profile.extract.after_call` follows every
-   gateway call that returned or raised an `LLMError`: after a settled try, and also after `BudgetExhausted`
-   and `InputUnbounded`, where nothing was reserved, sent or settled.
+   locked month row's buffer share), `logical_call_no` 1 or 2 with the stage the walk gives it
+   (`start_stage`: `enlarged` after a paid first stage that stopped at `max_tokens`), and `deadline =
+   monotonic() + deadline_s` of that execution config, per call (Deviation 28). The fault point
+   `profile.extract.after_call` follows every gateway call that returned or raised an `LLMError`: after a
+   settled try, and also after `BudgetExhausted` and `InputUnbounded`, where nothing was reserved, sent or
+   settled.
 4. **The outcome** (`llm_outcome`'s mapping): the call's id goes to the state (`llm_call_id`; its output stays
    in `llm_calls.output_json`, never in a checkpoint); a failure ends the draft `failed(code)` with the
    operation (`fail_extraction`, guarded by the generation's owner predicate); a transient failure gives the
@@ -138,14 +140,15 @@ def _caller(
     draft_id: int,
     *,
     native_pdf: bool,
-) -> Callable[[int], Awaitable[int]]:
+) -> Callable[[Call], Awaitable[int]]:
     """The gateway call of one logical call (module docstring, step 3), for `llm_outcome.drive`: the call's
     id, or the gateway's `LLMError`. The fault point `profile.extract.after_call` follows the call whether it
     returned or raised: after its settled tries, or after `BudgetExhausted` or `InputUnbounded`, which
     reserved, sent and settled nothing."""
     claim = op.claim
 
-    async def call(logical_call_no: int) -> int:
+    async def call(step: Call) -> int:
+        logical_call_no = step.logical_call_no
         ctx = CallContext(
             owner=OperationOwner(claim),
             purpose_class="nonscoring",
@@ -154,6 +157,7 @@ def _caller(
             profile_draft_id=draft_id,
             logical_call_no=logical_call_no,
             native_pdf=native_pdf,
+            start_stage=step.start_stage,
         )
         try:
             result = await od.gateway.call(node, prompt, ctx)

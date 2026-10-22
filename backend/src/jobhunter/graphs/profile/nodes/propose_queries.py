@@ -19,9 +19,11 @@ and 28): the one node of the `propose` graph, the paid call of a query proposal 
    fails the proposal `profile_unavailable` without a request; a paid usable set is still published.
 3. **The call** (`llm_outcome.drive` with the semantic check as its `usable`): `purpose='propose_queries'`,
    non-scoring, the active model policy and execution config (`gateway.active_node_config`, §13.3),
-   `OperationOwner(claim)`, `logical_call_no` 1 or 2, and `deadline = monotonic() + deadline_s` of that
-   execution config, per call (Deviation 28). The fault point `queries.propose.after_call` follows every
-   gateway call that returned or raised an `LLMError`: after the settled tries and before `running → ready`.
+   `OperationOwner(claim)`, `logical_call_no` 1 or 2 with the stage the walk gives it (`start_stage`:
+   `enlarged` after a paid first stage that stopped at `max_tokens`), and `deadline = monotonic() +
+   deadline_s` of that execution config, per call (Deviation 28). The fault point
+   `queries.propose.after_call` follows every gateway call that returned or raised an `LLMError`: after the
+   settled tries and before `running → ready`.
    `set_invalid` and `InvalidOutput("structural")` take the one repair (`llm_outcome.after_invalid`); the
    gateway's other errors map as for `extract_profile` (`llm_outcome.after_error`, the same mapping).
 4. **The outcome**, each in one transaction after the owner lock and the proposal `FOR UPDATE`: a usable set
@@ -157,19 +159,21 @@ def _caller(
     execution_config_id: int,
     proposal_id: int,
     checker: _Checker,
-) -> Callable[[int], Awaitable[int]]:
+) -> Callable[[Call], Awaitable[int]]:
     """The gateway call of one logical call (module docstring, step 3), for `llm_outcome.drive`: the call's
     id, or the gateway's `LLMError`. The fault point `queries.propose.after_call` follows the call whether it
     returned or raised."""
     claim = op.claim
 
-    async def call(logical_call_no: int) -> int:
+    async def call(step: Call) -> int:
+        logical_call_no = step.logical_call_no
         ctx = CallContext(
             owner=OperationOwner(claim),
             purpose_class="nonscoring",
             execution_config_id=execution_config_id,
             deadline=od.gateway.monotonic() + node.deadline_s,  # the active deadline, per call
             logical_call_no=logical_call_no,
+            start_stage=step.start_stage,
         )
         try:
             result = await od.gateway.call(node, prompt, ctx)

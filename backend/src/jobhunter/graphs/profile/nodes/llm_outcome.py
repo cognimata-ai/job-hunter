@@ -3,19 +3,24 @@ receipts walk and the mapping of the gateway's errors. Task 20's `propose_querie
 one addition it needs, a node's own check of a parsed output (`usable`, below).
 
 **A step** is what a node does next for its operation: `Use` a completed call's output (no request), make a
-`Call` (logical call 1, or 2 for the one structural repair), `Fail` the domain row with a code, or `Requeue`
-the operation for a later attempt.
+`Call` (logical call 1, or 2 for the one structural repair, from its `start_stage`), `Fail` the domain row
+with a code, or `Requeue` the operation for a later attempt.
 
 **The receipts walk** (`walk`), over `spend_ledger.receipts` (the newest `completed` call per
 `logical_call_no` of the operation), read under the owner lock before anything is paid again:
 - the repair (logical call 2) outranks the first call, since it exists only after call 1 was invalid;
 - a call with its `output_json` is used without a request;
-- `invalid_output` (billed, structurally invalid) on call 1 makes the repair due; on call 2 it is
-  `Fail('invalid_output')`. So the one repair is never repeated or skipped across a reclaim;
+- `invalid_output` (billed, structurally invalid, or holding a string no JSONB value stores) on call 1 makes
+  the repair due; on call 2 it is `Fail('invalid_output')`. So the one repair is never repeated or skipped
+  across a reclaim;
 - `refused`, `model_mismatch`, `max_tokens` and `unexpected_stop_reason` are terminal: `Fail(<that code>)`;
 - `max_tokens_first_stage` is neither terminal nor usable (the gateway goes on to the enlarged stage after
-  it, and a crash came first): the same logical call is made again;
+  it, and a crash came first): the same logical call is made again, from its enlarged stage
+  (`Call(n, start_stage="enlarged")`, the gateway's `CallContext.start_stage`), so the first stage, paid and
+  known to be too small, is never sent again (final review FR-2). Its retry allowance is the enlarged stage's
+  own, as for any call made again after a crash;
 - no receipt: logical call 1.
+Every other `Call` starts at the first stage, the repair included.
 A completed call with neither an output nor a known code breaks the gateway's contract (Task 5: every
 completed call without an output carries its code): `InvariantViolation`.
 
@@ -32,8 +37,9 @@ completed call without an output carries its code): `InvariantViolation`.
 `Fail('invalid_output')` after the repair: the walk's `invalid_output` receipt, the gateway's
 `InvalidOutput("structural")` and a node's own refusal of a parsed output all go through it.
 
-`drive(step, call, usable=None)` makes the calls a step asks for, with `call(logical_call_no)` (the node's
-gateway call, returning the call's id), and returns the step that needs no further call. With `usable` (Task
+`drive(step, call, usable=None)` makes the calls a step asks for, with `call(step)` (the node's gateway call
+of that `Call`'s logical call and start stage, returning the call's id), and returns the step that needs no
+further call. With `usable` (Task
 20: the semantic check of a query set, §11.12), every `Use` it reaches, a receipt's or a new call's, is
 checked first: one it refuses is an invalid output (`after_invalid`), so a refused call 1 makes the repair due
 and a refused repair fails. It makes at most two calls: call 2 only after call 1 was invalid, and nothing
@@ -66,6 +72,7 @@ from jobhunter.llm.gateway import (
     MODEL_MISMATCH,
     REFUSED,
     UNEXPECTED_STOP_REASON,
+    Stage,
 )
 from jobhunter.llm.spend_ledger import Receipt
 
@@ -92,9 +99,11 @@ class Use:
 
 @dataclass(frozen=True)
 class Call:
-    """Make logical call `logical_call_no` (1, or 2 for the repair)."""
+    """Make logical call `logical_call_no` (1, or 2 for the repair), from its `start_stage`: `enlarged` only
+    when the call resumes after its paid `max_tokens_first_stage` try (module docstring)."""
 
     logical_call_no: int
+    start_stage: Stage = "first"
 
 
 @dataclass(frozen=True)
@@ -124,7 +133,7 @@ def walk(receipts: Mapping[int, Receipt]) -> Use | Call | Fail:
             return Use(logical_call_no, receipt.llm_call_id)
         code = receipt.error_code
         if code == MAX_TOKENS_FIRST_STAGE:
-            return Call(logical_call_no)
+            return Call(logical_call_no, start_stage="enlarged")
         if code == INVALID_OUTPUT:
             return after_invalid(logical_call_no)
         if code in TERMINAL_CODES:
@@ -169,7 +178,7 @@ _FAILURES: Final[tuple[tuple[type[LLMError], str], ...]] = (
 
 
 async def drive(
-    step: Step, call: Callable[[int], Awaitable[int]], *, usable: Callable[[Use], bool] | None = None
+    step: Step, call: Callable[[Call], Awaitable[int]], *, usable: Callable[[Use], bool] | None = None
 ) -> Use | Fail | Requeue:
     """Make the calls `step` asks for, checking every `Use` with `usable` when given (module docstring); an
     error other than an `LLMError` propagates."""
@@ -177,7 +186,7 @@ async def drive(
         if isinstance(step, Call):
             logical_call_no = step.logical_call_no
             try:
-                llm_call_id = await call(logical_call_no)
+                llm_call_id = await call(step)
             except LLMError as error:
                 step = after_error(error, logical_call_no)
                 continue

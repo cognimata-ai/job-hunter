@@ -511,26 +511,53 @@ async def test_a_reclaim_after_a_refusal_fails_the_draft_without_a_request(engin
     assert served() == 1
 
 
-async def test_a_reclaim_after_a_first_stage_max_tokens_try_makes_the_call_again(
+async def test_a_reclaim_after_a_first_stage_max_tokens_try_resumes_at_the_enlarged_stage(
     engine, op_runner, upload
 ) -> None:
-    """Carried ruling (Task 5): a settled `max_tokens_first_stage` try is neither terminal nor usable.
-    Execution 1 is held after the enlarged stage's reservation; execution 2 makes logical call 1 again and
-    reaches `ready`; execution 1's enlarged try is fenced at its dispatch marker and never sent."""
+    """Carried ruling (Task 5) and final review FR-2: a settled `max_tokens_first_stage` try is neither
+    terminal nor usable, and its paid first stage is known to be too small. Execution 1 is held after the
+    enlarged stage's reservation, between the first stage's settlement and the enlarged try; execution 2 makes
+    logical call 1 again from its enlarged stage (`max_tokens` 32,000), never sends the first stage again,
+    and reaches `ready`; execution 1's enlarged try is fenced at its dispatch marker and never sent."""
     fake.scenario("max_tokens", "ok")
     draft_id, op_id = await reviewed_draft(engine, op_runner, upload)
     await _reclaim_during(op_runner, engine, op_id, PausePoint("gateway.after_reserve", arrival=2))
     draft = await draft_row(engine, draft_id)
     assert (draft.status, draft.failure_code) == ("ready", None)
-    assert served() == 2
+    assert [r.max_tokens for r in fake.state().requests] == [NODE.max_tokens, NODE.max_tokens_retry]
     rows = await tries(engine)
-    assert [(r.logical_call_no, r.max_tokens_stage, r.error_code) for r in rows] == [
-        (1, "first", "max_tokens_first_stage"),
-        (1, "enlarged", "never_dispatched"),
-        (1, "first", None),
+    assert [(r.logical_call_no, r.max_tokens_stage, r.max_tokens, r.error_code) for r in rows] == [
+        (1, "first", 16000, "max_tokens_first_stage"),
+        (1, "enlarged", 32000, "never_dispatched"),
+        (1, "enlarged", 32000, None),
     ]
     assert await ledger_states(engine, op_id) == ["billed", "not_billed:never_dispatched", "billed"]
     assert draft.llm_call_id == rows[2].call_id
+
+
+async def test_a_requeue_after_a_transient_enlarged_stage_resumes_at_the_enlarged_stage(
+    engine, op_runner, upload
+) -> None:
+    """FR-2, the other way to the same receipt: the enlarged stage's three tries are overloaded and the
+    operation is requeued. The next attempt starts at the enlarged stage with three tries of its own, and the
+    first stage is sent once in all."""
+    fake.scenario("max_tokens", "overloaded_529", "overloaded_529", "overloaded_529", "ok")
+    draft_id, op_id = await reviewed_draft(engine, op_runner, upload)
+    await op_runner.run_one(op_id)
+    assert (await op_row(engine, op_id)).last_error_code == "llm_transient"
+    async with engine.begin() as conn:  # the requeue's five minutes have passed
+        await conn.execute(sa.text("UPDATE operations SET not_before = now() WHERE id = :i"), {"i": op_id})
+    await op_runner.run_one(op_id)
+    assert (await draft_row(engine, draft_id)).status == "ready"
+    assert [r.max_tokens for r in fake.state().requests] == [16000, 32000, 32000, 32000, 32000]
+    rows = await tries(engine)
+    assert [(r.max_tokens_stage, r.transport_try, r.error_code) for r in rows] == [
+        ("first", 1, "max_tokens_first_stage"),
+        ("enlarged", 1, "http_529"),
+        ("enlarged", 2, "http_529"),
+        ("enlarged", 3, "http_529"),
+        ("enlarged", 1, None),
+    ]
 
 
 async def test_crash_after_settlement_reuses_the_paid_output(engine, op_runner, upload) -> None:
