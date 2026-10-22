@@ -1,9 +1,9 @@
-"""The edge's request-body ceiling (final review FR-4; spec §14.1): every request body but the CV upload's and
-the paste's, which read their own under their own limits, is bounded at `MAX_BODY_BYTES` (1 MiB) before the
-app sees it. A declared `Content-Length` over the limit is refused before any byte is read; a body without
-one (chunked) is counted as it streams and refused as soon as it passes the limit. Either is a 413
-`upload_rejected` (`too_large` on `body`), the code the upload routes give a body that is too large, and no
-alert. A body within the limit reaches the app whole, in its messages.
+"""The edge's request-body ceiling (final review FR-4, beyond §14.1's conventions): every request body but the
+CV upload's and the paste's, which read their own under their own limits, is bounded at `MAX_BODY_BYTES`
+(1 MiB) before the app sees it. A declared `Content-Length` over the limit is refused before any byte is read;
+a body without one (chunked) is counted as it streams and refused as soon as it passes the limit. Either is a
+413 `upload_rejected` (`too_large` on `body`), the code the upload routes give a body that is too large, and
+no alert. A body within the limit reaches the app whole, in its messages.
 
 Offline: the edge around a recording ASGI app, driven with raw ASGI messages.
 """
