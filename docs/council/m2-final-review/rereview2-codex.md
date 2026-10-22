@@ -1,0 +1,11 @@
+### Verdict
+
+**APPROVE WITH CHANGES** — N1’s status mismatch is fixed and the M3 deferral is acceptable, but Deviation 44 retains one Minor factual error: `/cv-text` reports the field `text`, not “no path.”
+
+### Checks
+
+1. **N1: fixed in substance; one wording correction remains.** [Plan:2028](/home/user/job-hunter/docs/superpowers/plans/2026-10-20-m2-llm-profile-settings.md:2028) correctly distinguishes dry-run’s 200 preview from save’s 422, matching [settings.py:272](/home/user/job-hunter/backend/src/jobhunter/api/routes/settings.py:272) and the assertions in [test_settings_save.py:353](/home/user/job-hunter/tests/integration/test_settings_save.py:353). NUL removal and surrogate refusal also match [upload.py:185](/home/user/job-hunter/backend/src/jobhunter/profile/upload.py:185). However, replace **“not_utf8, no path”** with **“not_utf8, field `text`”**: the handler supplies that field at [profile.py:354](/home/user/job-hunter/backend/src/jobhunter/api/routes/profile.py:354), explicitly asserted by [test_profile_upload_api.py:383](/home/user/job-hunter/tests/integration/test_profile_upload_api.py:383).
+
+2. **Fable Minor 1: acceptable to carry to M3; nonblocking.** The concrete remedy is recorded at [plan:2046](/home/user/job-hunter/docs/superpowers/plans/2026-10-20-m2-llm-profile-settings.md:2046). Recovery currently skips directly to the active enlarged limit ([gateway.py:752](/home/user/job-hunter/backend/src/jobhunter/llm/gateway.py:752)). After an intervening limit increase, this can unnecessarily exhaust admission headroom; the budget check still refuses unaffordable reservations ([spend_ledger.py:514](/home/user/job-hunter/backend/src/jobhunter/llm/spend_ledger.py:514)), and billed settlement uses actual usage ([spend_ledger.py:837](/home/user/job-hunter/backend/src/jobhunter/llm/spend_ledger.py:837)). This remains a bounded recovery/admission limitation.
+
+3. **Nothing else blocking in `66016f5..746496b`.** The range adds the historical review records ([Codex:1](/home/user/job-hunter/docs/council/m2-final-review/rereview-codex.md:1), [Fable:1](/home/user/job-hunter/docs/council/m2-final-review/rereview-fable.md:1)) and changes only the two plan lines cited above; no runtime code changes. Review was static and read-only; tests were inspected, not rerun. No network, excluded directories, or key material accessed.
