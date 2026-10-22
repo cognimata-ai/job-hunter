@@ -20,11 +20,13 @@ import pytest
 from jobhunter.profile import contacts
 from jobhunter.profile.contacts import (
     APPLY_ORDER,
+    REMOVED,
     REPLACEMENT,
     ROLE_KEYWORDS,
     Category,
     Edits,
     Replacement,
+    Segment,
     StripResult,
     apply_edits,
     remove_span,
@@ -1778,6 +1780,102 @@ def test_the_dataclasses_are_frozen() -> None:
     with pytest.raises(AttributeError):
         r.replacements[0].start = 1  # type: ignore[misc]
     assert Replacement("email", 1, 2) == Replacement("email", 1, 2)
+
+
+# --- the review map (Task 14, ruling R14-2) ---------------------------------------------------------
+
+
+def assert_map(original: str, result: StripResult) -> None:
+    """`result.segments` cover the stripped text and the original, each in order and without a gap; a text run
+    is the same characters in both, a replacement its token, a removal `[REMOVED]`."""
+    stripped_at = raw_at = 0
+    for s in result.segments:
+        assert (s.stripped_start, s.raw_start) == (stripped_at, raw_at), s
+        assert s.stripped_end > s.stripped_start and s.raw_end > s.raw_start, s
+        shown = result.stripped_text[s.stripped_start : s.stripped_end]
+        if s.kind == "text":
+            assert shown == original[s.raw_start : s.raw_end], s
+            assert (s.category, s.replacement_index, s.restorable) == (None, None, False), s
+        elif s.kind == "replacement":
+            assert s.category is not None and shown == REPLACEMENT[s.category], s
+        else:
+            assert shown == REMOVED and (s.category, s.replacement_index, s.restorable) == (None, None, False)
+        stripped_at, raw_at = s.stripped_end, s.raw_end
+    assert (stripped_at, raw_at) == (len(result.stripped_text), len(original))
+    assert [(s.raw_start, s.raw_end) for s in result.segments if s.kind == "replacement"] == [
+        (r.start, r.end) for r in result.replacements
+    ]
+
+
+def test_the_segments_map_the_stripped_text_onto_the_original() -> None:
+    base = strip_contacts(CV)
+    assert_map(CV, base)
+    replacements = [s for s in base.segments if s.kind == "replacement"]
+    # Each names its replacement of the fresh strip, the index `restore` takes, and can be restored.
+    assert [s.replacement_index for s in replacements] == list(range(len(base.replacements)))
+    assert [s.category for s in replacements] == [r.category for r in base.replacements]
+    assert all(s.restorable for s in replacements)
+    email = replacements[index_of(base, "email")]
+    assert CV[email.raw_start : email.raw_end] == "max.mustermann@example.org"
+    assert base.stripped_text[email.stripped_start : email.stripped_end] == "[EMAIL]"
+    # A text run holds no replacement: a selection in it maps to the original by its offset alone.
+    run = next(
+        s for s in base.segments if s.kind == "text" and "Beispiel GmbH" in CV[s.raw_start : s.raw_end]
+    )
+    at = base.stripped_text.index("Beispiel GmbH")
+    assert run.stripped_start <= at < run.stripped_end
+    assert CV.index("Beispiel GmbH") == run.raw_start + (at - run.stripped_start)
+
+
+def test_the_segments_follow_the_edits() -> None:
+    base = strip_contacts(CV)
+    email = index_of(base, "email")
+    start = CV.index("Beispiel GmbH")
+    edited = remove_span(CV, restore(CV, base, email), start, start + len("Beispiel GmbH"))
+    assert_map(CV, edited)
+    removed = [s for s in edited.segments if s.kind == "removed"]
+    assert [(s.raw_start, s.raw_end) for s in removed] == [(start, start + len("Beispiel GmbH"))]
+    # The restored e-mail address is text again, and the indexes of the others still name the fresh strip.
+    assert all(s.replacement_index != email for s in edited.segments)
+    assert {s.replacement_index for s in edited.segments if s.kind == "replacement"} == set(
+        range(len(base.replacements))
+    ) - {email}
+    # A removal over a replacement is one `[REMOVED]` over the union of both.
+    over = remove_span(CV, base, CV.index("mustermann@exam"), CV.index("mustermann@exam") + 4)
+    assert_map(CV, over)
+    merged = next(s for s in over.segments if s.kind == "removed")
+    assert (merged.raw_start, merged.raw_end) == (
+        base.replacements[email].start,
+        base.replacements[email].end,
+    )
+
+
+def test_the_contacts_inside_a_restored_personal_span_have_no_index_and_are_restored_by_their_span() -> None:
+    text = "Religion und Ethik, Kontakt: max@example.org, Tel. 030 23125456\nSkills\n"
+    back = restore(text, strip_contacts(text), 0)
+    assert_map(text, back)
+    inner = [s for s in back.segments if s.kind == "replacement"]
+    assert [(s.category, s.replacement_index, s.restorable) for s in inner] == [
+        ("email", None, True),
+        ("phone", None, True),
+    ]
+    assert text[inner[0].raw_start : inner[0].raw_end] == "max@example.org"
+    # One with the extent of the personal span itself is no separate restore: no control for it (R14-2).
+    for same in ("dob@example.org", "geb.a@b.de"):
+        r = restore(same, strip_contacts(same), 0)
+        assert_map(same, r)
+        [segment] = r.segments
+        assert (segment.kind, segment.category, segment.replacement_index, segment.restorable) == (
+            "replacement",
+            "email",
+            None,
+            False,
+        )
+
+
+def test_the_segments_of_an_empty_or_a_clean_text() -> None:
+    assert strip_contacts("").segments == ()
+    assert strip_contacts("Python, FastAPI").segments == (Segment("text", 0, 15, 0, 15),)
 
 
 # --- bounded, linear patterns (the M1 F1 lesson) --------------------------------------------------

@@ -2,8 +2,8 @@
 
 Stripping never leaves a generated e-mail address or phone number in the text, stripping twice changes
 nothing (Task 14 and the LLM payload rely on it), the replacements are ordered, disjoint offsets into the
-original text that rebuild `stripped_text`, and an edit set gives the same text whatever order its edits were
-made in.
+original text that rebuild `stripped_text`, an edit set gives the same text whatever order its edits were
+made in, and the review map (Task 14) covers the stripped text and the original without a gap.
 
 Every datum is generated; no real person's data is used.
 """
@@ -322,3 +322,44 @@ def test_an_edit_set_gives_the_same_text_in_any_order(data: st.DataObject) -> No
     )
     assert result == expected
     assert apply_edits(text, result.edits) == result
+
+
+@settings(max_examples=500, deadline=None)
+@given(st.data())
+def test_the_review_map_covers_both_texts_whatever_the_edit_set(data: st.DataObject) -> None:
+    """Task 14 (R14-2): the segments run over the stripped text and the original in order and without a gap; a
+    text run is the same characters in both, a token its category's, and the replacements are the result's."""
+    text = data.draw(st.one_of(documents, tables))
+    base = strip_contacts(text)
+    restored = (
+        {(r.start, r.end) for r in data.draw(st.sets(st.sampled_from(base.replacements), max_size=3))}
+        if (base.replacements)
+        else set()
+    )
+    removed = data.draw(
+        st.sets(
+            st.tuples(st.integers(0, len(text)), st.integers(0, len(text))).filter(lambda s: s[0] < s[1]),
+            max_size=3,
+        )
+        if text
+        else st.just(set())
+    )
+    result = apply_edits(text, Edits(restored=frozenset(restored), removed=frozenset(removed)))
+    stripped_at = raw_at = 0
+    for s in result.segments:
+        assert (s.stripped_start, s.raw_start) == (stripped_at, raw_at)
+        shown = result.stripped_text[s.stripped_start : s.stripped_end]
+        if s.kind == "text":
+            assert shown == text[s.raw_start : s.raw_end]
+        elif s.kind == "replacement":
+            assert s.category is not None and shown == REPLACEMENT[s.category]
+            if s.replacement_index is not None:
+                fresh = base.replacements[s.replacement_index]
+                assert (fresh.category, fresh.start, fresh.end) == (s.category, s.raw_start, s.raw_end)
+        else:
+            assert shown == contacts.REMOVED
+        stripped_at, raw_at = s.stripped_end, s.raw_end
+    assert (stripped_at, raw_at) == (len(result.stripped_text), len(text))
+    assert [(s.category, s.raw_start, s.raw_end) for s in result.segments if s.kind == "replacement"] == [
+        (r.category, r.start, r.end) for r in result.replacements
+    ]

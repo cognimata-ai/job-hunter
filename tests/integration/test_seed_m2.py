@@ -23,6 +23,7 @@ from tests.support.pg import PgServer, pg_one, pg_rows
 pytestmark = pytest.mark.integration
 NOW = datetime(2026, 10, 21, 10, 0, tzinfo=UTC)
 M2_SCHEMA = "0006_m2_llm_profile_settings"
+M2_HEAD = "0007_m2_draft_text_edits"  # the draft's stored text edit set (Task 14, R14-1)
 
 # What `active_config` points at, as stored.
 POINTED = (
@@ -80,7 +81,7 @@ def assert_points_at_v1(server: PgServer) -> None:
 
 async def test_after_migrate_active_config_points_at_the_v1_rows(fresh_pg_server, make_config) -> None:
     await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW)
-    assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (M2_SCHEMA,) == (code_head(),)
+    assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (M2_HEAD,) == (code_head(),)
     assert_points_at_v1(fresh_pg_server)
 
 

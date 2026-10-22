@@ -64,6 +64,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Profile
+         * @description The active profile version and every version, newest first (empty until a draft is confirmed).
+         */
+        get: operations["get_profile_api_profile_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/profile/cv": {
         parameters: {
             query?: never;
@@ -98,6 +118,112 @@ export interface paths {
          * @description Paste a CV's text: 202 with the new draft; the text is stored sealed in its row, never as a file.
          */
         post: operations["paste_cv_api_profile_cv_text_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Draft
+         * @description The draft's status, its profile and issues, its stripped text with the edit set and the review map,
+         *     and the repairs of a failed draft.
+         */
+        get: operations["get_draft_api_profile_drafts__draft_id__get"];
+        /**
+         * Save Draft
+         * @description Save the edited profile of a `ready` draft: validated again and stored repaired, with its issues.
+         */
+        put: operations["save_draft_api_profile_drafts__draft_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/discard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discard Draft
+         * @description Discard a draft in text review, ready or failed.
+         */
+        post: operations["discard_draft_api_profile_drafts__draft_id__discard_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Draft
+         * @description Repair a failed draft (§12.7): extract again from the same input (`llm`) or from the original PDF
+         *     (`native_pdf`, with the disclosure acknowledged).
+         */
+        post: operations["retry_draft_api_profile_drafts__draft_id__retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Edit Text
+         * @description Replace the draft's edit set and rebuild its stripped text; from `ready`, back to `text_review`.
+         */
+        put: operations["edit_text_api_profile_drafts__draft_id__text_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/text-review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve Text
+         * @description Approve the reviewed text: it is stored with its sha256 and the profile extraction starts (§12.3).
+         */
+        post: operations["approve_text_api_profile_drafts__draft_id__text_review_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -199,6 +325,45 @@ export interface components {
             /** Warn */
             warn: number;
         };
+        /** Certification */
+        Certification: {
+            /** Issuer */
+            issuer: string | null;
+            /** Name */
+            name: string;
+            /** Year */
+            year: number | null;
+        };
+        /**
+         * ConfirmedProfile
+         * @description `profile_versions.profile_json` and a draft's `draft_json`: the extraction plus `user_entered`.
+         */
+        ConfirmedProfile: {
+            /** Certifications */
+            certifications: components["schemas"]["Certification"][];
+            /** Domains */
+            domains: string[];
+            /** Education */
+            education: components["schemas"]["Education"][];
+            /** Languages */
+            languages: components["schemas"]["Language"][];
+            /** Roles */
+            roles: components["schemas"]["Role"][];
+            /**
+             * Seniority
+             * @enum {string}
+             */
+            seniority: "intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head";
+            /** Skills */
+            skills: components["schemas"]["Skill"][];
+            /** Summary */
+            summary: string;
+            /** Target Titles */
+            target_titles: components["schemas"]["TargetTitle"][];
+            /** Total Years Experience */
+            total_years_experience: number | null;
+            user_entered?: components["schemas"]["UserEntered"];
+        };
         /** CvTextIn */
         CvTextIn: {
             /** Text */
@@ -218,6 +383,52 @@ export interface components {
             /** Draft Id */
             draft_id: number;
         };
+        /** DraftIn */
+        DraftIn: {
+            draft: components["schemas"]["ConfirmedProfile"];
+        };
+        /** DraftOut */
+        DraftOut: {
+            draft: components["schemas"]["ConfirmedProfile"] | null;
+            edits: components["schemas"]["TextEditsOut"];
+            /** Failure Code */
+            failure_code: string | null;
+            /** Recomputed Total Years */
+            recomputed_total_years: number | null;
+            /** Repairs */
+            repairs: ("paste_text" | "native_pdf" | "retry_llm")[];
+            /** Reviewed Text Sha256 */
+            reviewed_text_sha256: string | null;
+            /** Segments */
+            segments: components["schemas"]["SegmentOut"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "uploaded" | "extracting_text" | "text_review" | "extracting_profile" | "ready" | "failed" | "confirmed" | "discarded";
+            /** Strip Report */
+            strip_report: {
+                [key: string]: number;
+            } | null;
+            /** Stripped Text Preview */
+            stripped_text_preview: string | null;
+            /** Validation Issues */
+            validation_issues: components["schemas"]["ValidationIssueOut"][];
+        };
+        /** Education */
+        Education: {
+            /** Field */
+            field: string;
+            /** Institution */
+            institution: string | null;
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "vocational" | "bachelor" | "master" | "phd" | "other";
+            /** Year */
+            year: number | null;
+        };
         /**
          * EmbedderOut
          * @description The embedder's health as readiness read it: `ok` when this code can use it, the model it serves and
@@ -230,6 +441,14 @@ export interface components {
             model_id: string | null;
             /** Ok */
             ok: boolean;
+        };
+        /** ExtractingOut */
+        ExtractingOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "extracting_profile";
         };
         /**
          * FieldError
@@ -252,6 +471,26 @@ export interface components {
              * @constant
              */
             status: "ok";
+        };
+        /** @enum {string} */
+        IssueCode: "limit" | "date_invalid" | "date_order" | "years_mismatch" | "contact_removed" | "ungrounded" | "language_without_evidence" | "code_other" | "unverifiable";
+        JsonValue: unknown;
+        /** Language */
+        Language: {
+            /**
+             * Cefr
+             * @enum {string}
+             */
+            cefr: "A1" | "A2" | "B1" | "B2" | "C1" | "C2" | "native" | "unspecified";
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "de" | "en" | "fr" | "es" | "it" | "nl" | "pl" | "pt" | "other";
+            /** Code Other */
+            code_other: string | null;
+            /** Evidence */
+            evidence: string;
         };
         /** LoginIn */
         LoginIn: {
@@ -304,6 +543,27 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** ProfileListOut */
+        ProfileListOut: {
+            active: components["schemas"]["ProfileVersionOut"] | null;
+            /** Versions */
+            versions: components["schemas"]["ProfileVersionOut"][];
+        };
+        /** ProfileVersionOut */
+        ProfileVersionOut: {
+            /**
+             * Confirmed At
+             * Format: date-time
+             */
+            confirmed_at: string;
+            /** Id */
+            id: number;
+            profile: components["schemas"]["ConfirmedProfile"] | null;
+            /** Purged */
+            purged: boolean;
+            /** Version No */
+            version_no: number;
+        };
         /**
          * QuotaOut
          * @description A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket.
@@ -345,6 +605,39 @@ export interface components {
             /** Ok */
             ok: boolean;
         };
+        /** RetryIn */
+        RetryIn: {
+            /**
+             * Ack Native Pdf
+             * @default false
+             */
+            ack_native_pdf: boolean;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "llm" | "native_pdf";
+        };
+        /** Role */
+        Role: {
+            /** Domain */
+            domain: string | null;
+            /** Employer */
+            employer: string | null;
+            /** End */
+            end: string | "present" | null;
+            /** Highlights */
+            highlights: string[];
+            /**
+             * Seniority
+             * @enum {string}
+             */
+            seniority: "intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head" | "unspecified";
+            /** Start */
+            start: string | null;
+            /** Title */
+            title: string;
+        };
         /** RunNowIn */
         RunNowIn: {
             /** Include Paid */
@@ -385,6 +678,41 @@ export interface components {
             /** Trigger */
             trigger: string;
         };
+        /** SecurityClearance */
+        SecurityClearance: {
+            /** Level */
+            level: string | null;
+            /** Name */
+            name: string;
+        };
+        /**
+         * SegmentOut
+         * @description One run of `stripped_text_preview` and the raw span it stands for (ruling R14-2): `text` (the same
+         *     characters), `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact
+         *     inside a restored personal span, which is restored by its span; `restorable` false for one that the edit
+         *     set cannot name), or `removed`. Offsets are code points.
+         */
+        SegmentOut: {
+            /** Category */
+            category: ("email" | "phone" | "url" | "address" | "personal" | "name") | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "text" | "replacement" | "removed";
+            /** Raw End */
+            raw_end: number;
+            /** Raw Start */
+            raw_start: number;
+            /** Replacement Index */
+            replacement_index: number | null;
+            /** Restorable */
+            restorable: boolean;
+            /** Stripped End */
+            stripped_end: number;
+            /** Stripped Start */
+            stripped_start: number;
+        };
         /** SessionOut */
         SessionOut: {
             /**
@@ -401,6 +729,58 @@ export interface components {
             totp_enabled: boolean;
             /** Username */
             username: string;
+        };
+        /** Skill */
+        Skill: {
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "programming_language" | "framework" | "tool" | "platform" | "method" | "domain_knowledge" | "soft_skill" | "other";
+            /** Evidence */
+            evidence: string;
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "basic" | "intermediate" | "advanced" | "expert";
+            /** Name */
+            name: string;
+            /** Years */
+            years: number | null;
+        };
+        /**
+         * SpanEditIn
+         * @description One edit of the set: `remove` with `start` and `end`, or `restore` with `replacement_index` (into the
+         *     fresh strip) or with the replacement's `start` and `end`. Offsets are code points of the raw text.
+         */
+        SpanEditIn: {
+            /** End */
+            end?: number | null;
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "remove" | "restore";
+            /** Replacement Index */
+            replacement_index?: number | null;
+            /** Start */
+            start?: number | null;
+        };
+        /**
+         * SpanOut
+         * @description A span of the raw text: `start` and `end` are offsets (code points) into it.
+         */
+        SpanOut: {
+            /** End */
+            end: number;
+            /** Start */
+            start: number;
+        };
+        /** StrippedTextOut */
+        StrippedTextOut: {
+            /** Stripped Text Preview */
+            stripped_text_preview: string;
         };
         /**
          * SystemHealthOut
@@ -449,6 +829,66 @@ export interface components {
                 [key: string]: number;
             };
             versions: components["schemas"]["Versions"];
+        };
+        /** TargetTitle */
+        TargetTitle: {
+            /**
+             * Lang
+             * @enum {string}
+             */
+            lang: "de" | "en";
+            /** Title */
+            title: string;
+        };
+        /**
+         * TextEditsIn
+         * @description The draft's complete edit set, never a delta (plan Deviation 29): an edit left out is undone.
+         */
+        TextEditsIn: {
+            /** Span Edits */
+            span_edits: components["schemas"]["SpanEditIn"][];
+        };
+        /**
+         * TextEditsOut
+         * @description The draft's stored edit set (ruling R14-1): the replacements put back and the spans removed, as spans
+         *     of the raw text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it.
+         */
+        TextEditsOut: {
+            /** Removed */
+            removed: components["schemas"]["SpanOut"][];
+            /** Restored */
+            restored: components["schemas"]["SpanOut"][];
+        };
+        /**
+         * UserEntered
+         * @description Entered by the user in the review form, never by the LLM (§12.4, §12.5).
+         */
+        UserEntered: {
+            /** Security Clearances */
+            security_clearances?: components["schemas"]["SecurityClearance"][];
+            /**
+             * Work Authorization De
+             * @default unspecified
+             * @enum {string}
+             */
+            work_authorization_de: "authorized" | "requires_sponsorship" | "unspecified";
+        };
+        /**
+         * ValidationIssueOut
+         * @description An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal.
+         */
+        ValidationIssueOut: {
+            code: components["schemas"]["IssueCode"];
+            /** Message */
+            message: string;
+            /** Path */
+            path: string;
+            proposal?: components["schemas"]["JsonValue"];
+        };
+        /** ValidationIssuesOut */
+        ValidationIssuesOut: {
+            /** Validation Issues */
+            validation_issues: components["schemas"]["ValidationIssueOut"][];
         };
         /** Versions */
         Versions: {
@@ -595,6 +1035,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SessionOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_profile_api_profile_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProfileListOut"];
                 };
             };
             /** @description No valid session (`unauthenticated`) */
@@ -765,6 +1243,482 @@ export interface operations {
                 };
             };
             /** @description An invalid body (`validation_failed`) or a refused text (`upload_rejected`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_draft_api_profile_drafts__draft_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DraftOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    save_draft_api_profile_drafts__draft_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DraftIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ValidationIssuesOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not ready (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    discard_draft_api_profile_drafts__draft_id__discard_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not in text review, ready or failed (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    retry_draft_api_profile_drafts__draft_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetryIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractingOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not failed, the mode is not admitted for it or its input was purged (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    edit_text_api_profile_drafts__draft_id__text_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TextEditsIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StrippedTextOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not in text review or ready, or has no text (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body or edit set (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    approve_text_api_profile_drafts__draft_id__text_review_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractingOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not in text review (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
             422: {
                 headers: {
                     [name: string]: unknown;

@@ -117,6 +117,14 @@ were made in does not matter.
   the fresh strip); the user restores one by its `(start, end)` in `Edits.restored`, except one that has
   the extent of the personal span itself (`dob@example.org`): that span names the personal replacement.
 
+**The review map** (`StripResult.segments`, Task 14 ruling R14-2): the runs of the stripped text in order,
+each with the span of the stripped text and the span of the original it stands for (`Segment`): text kept as
+it is, a replacement token (its category, its index into the fresh strip when it has one, and whether it can
+be restored: not a contact with the extent of a personal span, which the edit set cannot name), or
+`[REMOVED]`. `_build` makes the map in the same pass that renders the stripped text, so the two never
+disagree. The review UI highlights the replacements with it and turns a selection in the stripped text into
+original offsets; it holds offsets and categories only, never a value.
+
 `scan_value(value)` runs the same rules without the name rule on one profile value (Task 12).
 """
 
@@ -244,15 +252,37 @@ class Edits:
     removed: frozenset[Span] = frozenset()
 
 
+SegmentKind = Literal["text", "replacement", "removed"]
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One run of the stripped text (`stripped_start`, `stripped_end`) and the span of the original it stands
+    for (`raw_start`, `raw_end`): `text` (the same characters in both), `replacement` (the token of
+    `category`; `replacement_index` is its index into the fresh `strip_contacts(original).replacements`,
+    `None` for a contact inside a restored personal span; `restorable` is whether an edit set can put it
+    back), or `removed` (`[REMOVED]` over the union of a removal and what it merged with). Offsets only."""
+
+    kind: SegmentKind
+    stripped_start: int
+    stripped_end: int
+    raw_start: int
+    raw_end: int
+    category: Category | None = None
+    replacement_index: int | None = None
+    restorable: bool = False
+
+
 @dataclass(frozen=True)
 class StripResult:
-    """The stripped text, the counts per category (never a value), the replacements still in the text, and the
-    edit set this result was built from (empty for `strip_contacts`)."""
+    """The stripped text, the counts per category (never a value), the replacements still in the text, the
+    edit set this result was built from (empty for `strip_contacts`) and the review map (`segments`)."""
 
     stripped_text: str
     report: Mapping[Category, int]
     replacements: tuple[Replacement, ...]
     edits: Edits = field(default_factory=Edits)
+    segments: tuple[Segment, ...] = ()
 
 
 # --- the patterns --------------------------------------------------------------------------------
@@ -971,7 +1001,8 @@ def _build(original: str, base: tuple[Replacement, ...], edits: Edits) -> StripR
     ]
     parts += [(start, end, None) for start, end in edits.removed]
     parts.sort(key=lambda part: part[:2])
-    segments: list[tuple[int, int, str]] = []
+    # Each group: its span, and the replacement it is (one that stays) or None for `[REMOVED]`.
+    groups: list[tuple[int, int, Replacement | None]] = []
     kept: list[Replacement] = []
     index = 0
     while index < len(parts):
@@ -984,19 +1015,49 @@ def _build(original: str, base: tuple[Replacement, ...], edits: Edits) -> StripR
             index += 1
         if len(members) == 1 and first is not None:
             kept.append(first)
-            segments.append((start, end, REPLACEMENT[first.category]))
+            groups.append((start, end, first))
         else:
-            segments.append((start, end, REMOVED))
+            groups.append((start, end, None))
+    # The text and its map in one pass (the module docstring's review map).
+    fresh_index = {r: i for i, r in enumerate(base)}
     out: list[str] = []
-    position = 0
-    for start, end, token in segments:
-        out += [original[position:start], token]
+    segments: list[Segment] = []
+    position = cursor = 0  # in the original, in the stripped text
+
+    def keep_text(stop: int) -> None:
+        nonlocal cursor
+        if stop > position:
+            segments.append(Segment("text", cursor, cursor + stop - position, position, stop))
+            out.append(original[position:stop])
+            cursor += stop - position
+
+    for start, end, member in groups:
+        keep_text(start)
+        if member is None:
+            token = REMOVED
+            segment = Segment("removed", cursor, cursor + len(token), start, end)
+        else:
+            token = REPLACEMENT[member.category]
+            at = fresh_index.get(member)
+            segment = Segment(
+                "replacement",
+                cursor,
+                cursor + len(token),
+                start,
+                end,
+                category=member.category,
+                replacement_index=at,
+                restorable=at is not None or (member.start, member.end) not in personal,
+            )
+        out.append(token)
+        segments.append(segment)
+        cursor += len(token)
         position = end
-    out.append(original[position:])
+    keep_text(len(original))
     counts = dict.fromkeys(CATEGORIES, 0)
     for r in kept:
         counts[r.category] += 1
-    return StripResult("".join(out), MappingProxyType(counts), tuple(kept), edits)
+    return StripResult("".join(out), MappingProxyType(counts), tuple(kept), edits, tuple(segments))
 
 
 def apply_edits(original: str, edits: Edits) -> StripResult:

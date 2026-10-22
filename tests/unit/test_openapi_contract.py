@@ -12,6 +12,8 @@ PROBLEM_REF: Final = "#/components/schemas/Problem"
 HTTP_METHODS: Final = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 # The one error response that is not a problem document: the readiness report (§14.1, §17.5).
 READINESS_503: Final = ("get", "/readyz", "503")
+# What an idempotent draft route can answer besides its 202 (Task 14).
+IDEMPOTENT_DRAFT_ROUTE: Final = {"400", "401", "403", "404", "409", "422", "429"}
 
 
 @pytest.fixture(scope="module")
@@ -105,6 +107,13 @@ def test_the_readiness_503_is_the_report_not_a_problem(document) -> None:
         ("get", "/api/system/health", {"401", "429"}),
         ("post", "/api/profile/cv", {"401", "403", "409", "413", "422", "429"}),
         ("post", "/api/profile/cv-text", {"401", "403", "409", "413", "422", "429"}),
+        ("get", "/api/profile/drafts/{draft_id}", {"401", "404", "422", "429"}),
+        ("put", "/api/profile/drafts/{draft_id}", {"401", "403", "404", "409", "422", "429"}),
+        ("put", "/api/profile/drafts/{draft_id}/text", {"401", "403", "404", "409", "422", "429"}),
+        ("post", "/api/profile/drafts/{draft_id}/text-review", IDEMPOTENT_DRAFT_ROUTE),
+        ("post", "/api/profile/drafts/{draft_id}/retry", IDEMPOTENT_DRAFT_ROUTE),
+        ("post", "/api/profile/drafts/{draft_id}/discard", {"401", "403", "404", "409", "422", "429"}),
+        ("get", "/api/profile", {"401", "429"}),
         ("get", "/readyz", {"503"}),
         ("get", "/healthz", set()),
     ],

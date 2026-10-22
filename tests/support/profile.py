@@ -48,6 +48,12 @@ Task 13 adds the extract phase:
   Task 14's routes will make them (the draft's transition, which clears any `failure_code` and reason, and,
   for the first two, the `extract_profile` operation, no job deferred);
 - `OpRunner.sleeps`: the backoff waits of the runner's gateway, recorded instead of waited.
+
+Task 14 adds the review routes' side:
+- `idem(key)`: the `Idempotency-Key` header of a request (later tasks import it);
+- `draft_row_api(client, draft_id)`: `GET /api/profile/drafts/{id}` as the client sees it (200 required);
+- the `failed_low_text_draft` fixture: a scanned PDF uploaded through the api and run through the text phase,
+  so its draft is `failed('low_text')` with its PDF file kept (the draft's id).
 """
 
 import asyncio
@@ -745,3 +751,29 @@ async def reopen_text_review(engine: AsyncEngine, draft_id: int) -> None:
             reason=CLEAR_REASON,
             set_={"draft_json": None, "failure_code": None},
         )
+
+
+# --- Task 14: the review routes ---------------------------------------------------------------------------
+
+
+def idem(key: str) -> dict[str, str]:
+    """The `Idempotency-Key` header of a request that needs one (§14.1)."""
+    return {"Idempotency-Key": key}
+
+
+async def draft_row_api(client: httpx.AsyncClient, draft_id: int) -> dict[str, Any]:
+    """The draft as `GET /api/profile/drafts/{id}` answers it (`DraftOut`)."""
+    r = await client.get(f"/api/profile/drafts/{draft_id}")
+    assert r.status_code == 200, (r.status_code, r.json())
+    body: dict[str, Any] = r.json()
+    return body
+
+
+@pytest.fixture
+async def failed_low_text_draft(engine: AsyncEngine, op_runner: OpRunner, upload: Upload) -> int:
+    """A scanned PDF through the text phase: its draft `failed('low_text')`, with the PDF file kept."""
+    draft_id = await upload(image_only_pdf())
+    await op_runner.run_pending()
+    draft = await draft_row(engine, draft_id)
+    assert (draft.status, draft.failure_code) == ("failed", "low_text")
+    return draft_id
