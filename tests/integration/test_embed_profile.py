@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.collect import ctx
 from tests.support.embedder import QUERY_PREFIX, FakeEmbedder, fake_vector
 from tests.support.faults import PausePoint, SimulatedCrash
-from tests.support.m2 import ProfileChain, insert_profile_chain
+from tests.support.m2 import ProfileChain, insert_embedding, insert_profile_chain
 from tests.support.pg import blocked_or_done
 from tests.support.procs import await_until
 from tests.support.profile import SYNTHETIC_PROFILE, OpRunner
@@ -258,6 +258,75 @@ async def test_a_run_restores_a_lost_vector_and_removes_a_stale_kind(engine, run
     assert await count(engine, "embeddings") == 4
 
 
+# A vector over an embedding that is not the version's text embedded as a query by the current model: another
+# text, another model, or a passage. Each is stored under the right kind, so only the comparison of the text
+# hash, the model id and the input kind tells that the version is not complete.
+FOREIGN = {
+    "text": {"label": "Some other text", "model_id": EMBEDDING_MODEL_ID, "input_kind": "query"},
+    "model": {"label": TITLES[1], "model_id": "some-other-model", "input_kind": "query"},
+    "input_kind": {"label": TITLES[1], "model_id": EMBEDDING_MODEL_ID, "input_kind": "passage"},
+}
+
+
+async def point_title_at_foreign_embedding(engine: AsyncEngine, version_id: int, case: str) -> int:
+    """Re-point the version's `title:1` at an embedding row of `FOREIGN[case]`; the row's id."""
+    async with engine.begin() as conn:
+        foreign = await insert_embedding(conn, **FOREIGN[case])
+        await conn.execute(
+            sa.text(
+                "UPDATE profile_vectors SET embedding_id = :e "
+                "WHERE profile_version_id = :p AND kind = 'title:1'"
+            ),
+            {"e": foreign, "p": version_id},
+        )
+    return foreign
+
+
+@pytest.mark.parametrize("case", sorted(FOREIGN))
+async def test_a_vector_over_another_text_model_or_input_kind_is_not_complete(
+    engine, runner, embedder, case
+) -> None:
+    chain = await make_version(engine)
+    await runner.run_one(await request(engine, chain.profile_version_id))
+    before = await vector_ids(engine, chain.profile_version_id)
+    foreign = await point_title_at_foreign_embedding(engine, chain.profile_version_id, case)
+    assert (await vector_ids(engine, chain.profile_version_id))["title:1"] == foreign
+
+    await runner.run_one(await request(engine, chain.profile_version_id))
+
+    assert len(embedder.requests) == 2  # it embedded again: the version was not complete
+    assert await vector_ids(engine, chain.profile_version_id) == before  # and the right rows are back
+
+
+async def test_the_embeddings_are_upserted_in_the_order_of_their_text_hash(
+    engine, runner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two writes of shared texts for different versions meet the embeddings' unique key in one order."""
+    seen: list[bytes] = []
+    upsert = embeddings.upsert_embedding
+
+    async def recording(conn: Any, **kwargs: Any) -> int:
+        seen.append(kwargs["text_sha256"])
+        return await upsert(conn, **kwargs)
+
+    monkeypatch.setattr(
+        "jobhunter.profile.vectors.upsert_embedding", recording
+    )  # the name `write_vectors` calls
+    chain = await make_version(engine)
+    in_kind_order = [text_sha256(text) for text in (SUMMARY, *TITLES)]
+    assert in_kind_order != sorted(in_kind_order)  # the test would pass vacuously otherwise
+
+    await runner.run_one(await request(engine, chain.profile_version_id))
+
+    assert seen == sorted(in_kind_order)
+    assert sorted(await vector_ids(engine, chain.profile_version_id)) == [
+        "summary",
+        "title:0",
+        "title:1",
+        "title:2",
+    ]
+
+
 async def test_versions_with_the_same_texts_share_their_embedding_rows(engine, runner) -> None:
     first, second = await make_version(engine, 1), await make_version(engine, 2)
     await runner.run_one(await request(engine, first.profile_version_id))
@@ -371,7 +440,15 @@ async def test_an_exhausted_operation_is_recreated_by_the_reconciler_once_the_em
         )
     fake_embedder.down = True
     await runner.run_one(op_id)
-    assert (await operation(engine, op_id)).status == "failed"
+    exhausted = await operation(engine, op_id)
+    assert (exhausted.status, exhausted.last_error_code) == ("failed", "attempts_exhausted")
+    # the alert is the only signal that a profile has no vectors (the handler's docstring relies on it)
+    [alert] = await rows(
+        engine,
+        "SELECT severity FROM alerts WHERE dedup_key = :k AND resolved_at IS NULL",
+        k=f"operation.failed:operation:{op_id}",
+    )
+    assert alert.severity == "warn"
 
     # while the embedder is down, nothing is re-created
     context = ctx(engine, queue_app, epoch=current_epoch, embedder=embedder)
@@ -396,6 +473,54 @@ async def test_an_exhausted_operation_is_recreated_by_the_reconciler_once_the_em
     # complete now: the next pass has nothing to do
     assert await vectors.reconcile_profile_vectors(context) == 0
     assert await count(engine, "operations") == 2
+
+
+@pytest.mark.parametrize("damage", ["missing", *sorted(FOREIGN)])
+async def test_the_reconciler_repairs_a_version_with_three_of_its_four_vectors(
+    engine, queue_app, current_epoch, runner, embedder, damage
+) -> None:
+    """Not only a version without any vector: a lost vector, or one over another text, model or input kind."""
+    chain = await make_version(engine)
+    await activate(engine, chain)
+    await runner.run_one(await request(engine, chain.profile_version_id))
+    context = ctx(engine, queue_app, epoch=current_epoch, embedder=embedder)
+    assert await vectors.reconcile_profile_vectors(context) == 0  # complete: nothing to do
+    if damage == "missing":
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text("DELETE FROM profile_vectors WHERE profile_version_id = :p AND kind = 'title:2'"),
+                {"p": chain.profile_version_id},
+            )
+        assert len(await vector_ids(engine, chain.profile_version_id)) == 3
+    else:
+        await point_title_at_foreign_embedding(engine, chain.profile_version_id, damage)
+
+    assert await vectors.reconcile_profile_vectors(context) == 1
+
+    created = await rows(engine, "SELECT status, payload FROM operations WHERE status = 'pending'")
+    assert [(row.status, row.payload) for row in created] == [
+        ("pending", {"profile_version_id": chain.profile_version_id})
+    ]
+    await runner.run_pending()
+    assert sorted(await vector_ids(engine, chain.profile_version_id)) == [
+        "summary",
+        "title:0",
+        "title:1",
+        "title:2",
+    ]
+    assert await vectors.reconcile_profile_vectors(context) == 0
+
+
+async def test_a_default_test_chain_has_a_profile_the_reconciler_can_read(
+    engine, queue_app, current_epoch, embedder
+) -> None:
+    """`insert_profile_chain`'s default `profile_json` is a valid profile (it once was `{}`, which no
+    `ConfirmedProfile` accepts), so an active default chain does not break a heavy reconciler pass."""
+    async with engine.begin() as conn:
+        chain = await insert_profile_chain(conn, 1)
+    await activate(engine, chain)
+    context = ctx(engine, queue_app, epoch=current_epoch, embedder=embedder)
+    assert await vectors.reconcile_profile_vectors(context) == 1
 
 
 async def test_the_reconciler_leaves_alone_what_does_not_need_it(

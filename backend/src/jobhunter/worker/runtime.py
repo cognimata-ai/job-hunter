@@ -81,7 +81,9 @@ class WorkerRuntime:
     collect_graph: CompiledStateGraph[Any, Any, Any, Any]
     epoch: int
     shutdown: ShutdownState
-    embedder: EmbedderClient | None  # the process's client (the `embed` node and the reconciler share it)
+    # the process's client, shared by the `embed` node, the `awaiting_embedding` and `profile_vectors`
+    # reconcilers and the `embed_profile` handler (through `operation_deps`)
+    embedder: EmbedderClient | None
     # M2 (Task 11): the process's gateway, docparse client, CV store and profile graphs, and the operation
     # dependencies `run_operation` hands to every execution (the same objects).
     gateway: "LLMGateway"

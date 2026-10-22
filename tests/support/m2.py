@@ -2,8 +2,9 @@
 
 `insert_profile_chain` builds the rows an active LLM tuple stands on, the way production does: a CV file, a
 `ready` draft, the profile version it confirms (the two foreign keys between draft and version are deferred
-and satisfied by the confirm; its `profile_json` is `{}` unless a `profile` is given), and a tuple over that
-version, a test rubric row, a test prompt-schema row and the seeded model policy. `reset_database` removes
+and satisfied by the confirm; its `profile_json` is `MINIMAL_PROFILE`, a valid `ConfirmedProfile`, unless a
+`profile` is given), and a tuple over that version, a test rubric row, a test prompt-schema row and the
+seeded model policy. `reset_database` removes
 every one of them again, as it does the rows of the other helpers here.
 
 `insert_vector` gives each (profile version, kind) an embedding row of its own, so two versions can both hold
@@ -13,6 +14,7 @@ a `summary` vector (it once hashed the kind alone, and a second version's `summa
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Final
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
@@ -72,10 +74,27 @@ _PROPOSAL = q(
 )
 _EMBEDDING = q(
     "INSERT INTO embeddings (embedding_model_id, text_sha256, input_kind, vector) "
-    "VALUES ('m2-test', :h, 'query', CAST(:vector AS halfvec)) RETURNING id"
+    "VALUES (:model, :h, :input_kind, CAST(:vector AS halfvec)) RETURNING id"
 )
 _VECTOR = q("INSERT INTO profile_vectors (profile_version_id, kind, embedding_id) VALUES (:pv, :kind, :e)")
 _UNIT_VECTOR = "[" + ",".join(["0"] * 1023 + ["1"]) + "]"
+
+# The `profile_json` of a chain's version unless a test gives one: a valid, invented `ConfirmedProfile` (a
+# summary, one target title, nothing else), so code that reads the active profile (the `profile_vectors`
+# reconciler, a later task's heavy reconcilers) validates it.
+MINIMAL_PROFILE: Final[Mapping[str, JSONValue]] = {
+    "summary": "Testprofil einer erfundenen Person.",
+    "target_titles": [{"title": "Test Engineer", "lang": "en"}],
+    "seniority": "mid",
+    "total_years_experience": None,
+    "roles": [],
+    "skills": [],
+    "languages": [],
+    "education": [],
+    "certifications": [],
+    "domains": [],
+    "user_entered": {"work_authorization_de": "unspecified", "security_clearances": []},
+}
 
 
 @dataclass(frozen=True)
@@ -103,12 +122,15 @@ async def insert_profile_chain(
     c: AsyncConnection, n: int = 1, *, profile: Mapping[str, JSONValue] | None = None
 ) -> ProfileChain:
     """Insert chain number `n`; two chains of one transaction use two numbers. The version's `profile_json`
-    is `profile` (`{}` when omitted)."""
+    is `profile` (`MINIMAL_PROFILE` when omitted)."""
     h = digest(n)
     cv = await insert_cv_file(c, n)
     draft = (await c.execute(_DRAFT, {"cv": cv, "h": h})).scalar_one()
     version = (
-        await c.execute(_VERSION, {"d": draft, "cv": cv, "h": h, "profile": dict(profile or {})})
+        await c.execute(
+            _VERSION,
+            {"d": draft, "cv": cv, "h": h, "profile": dict(MINIMAL_PROFILE if profile is None else profile)},
+        )
     ).scalar_one()
     await transition(
         c,
@@ -157,11 +179,15 @@ async def insert_proposal(
     return int(row.scalar_one())
 
 
-async def insert_embedding(c: AsyncConnection, label: str) -> int:
-    """An `embeddings` row (a query, the unit vector) whose text hash is that of `label`; nothing references
-    it. Returns its id; the same `label` twice violates the table's unique key."""
+async def insert_embedding(
+    c: AsyncConnection, label: str, *, model_id: str = "m2-test", input_kind: str = "query"
+) -> int:
+    """An `embeddings` row (the unit vector) of `model_id` and `input_kind` whose text hash is that of `label`
+    (`embeddings.text_sha256(label)`); nothing references it. Returns its id; the same three values twice
+    violate the table's unique key."""
     text_hash = hashlib.sha256(label.encode()).digest()
-    return int((await c.execute(_EMBEDDING, {"h": text_hash, "vector": _UNIT_VECTOR})).scalar_one())
+    params = {"model": model_id, "h": text_hash, "input_kind": input_kind, "vector": _UNIT_VECTOR}
+    return int((await c.execute(_EMBEDDING, params)).scalar_one())
 
 
 async def insert_vector(c: AsyncConnection, profile_version_id: int, kind: str = "summary") -> int:

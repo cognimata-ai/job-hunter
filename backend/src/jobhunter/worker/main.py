@@ -23,8 +23,8 @@
    which in fake mode refuses to run before that configuration: a client made earlier would be on the live
    transport); the adapters of `registry.build_adapter` on those clients (the provider secrets of `cfg`, the
    keys `b"fake"` in fake mode); the process's one `RateLimiter`; admission stopped with the shutdown; the
-   embedder client on `cfg.embedder_url`, which the `embed` node and the `awaiting_embedding` reconciler
-   share;
+   embedder client on `cfg.embedder_url`, which the `embed` node, the `awaiting_embedding` and
+   `profile_vectors` reconcilers and the `embed_profile` handler (through `OperationDeps`) share;
 8. the source instances synced with the provider secrets (`sources.instances.sync_instances`, in a
    transaction of its own, fenced by this worker's epoch: a source without its secret is
    `disabled('missing_secret')` and never planned, plan Deviation 6), then the start reconcilers
@@ -147,7 +147,9 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.sources.watchlist_validate",
     "jobhunter.llm.spend_ledger",  # `llm_ledger_unsettled` and `budget_counters` (M2)
     "jobhunter.llm.gateway",  # `llm_refusal_rate` (M2)
-    "jobhunter.profile.operations",  # the `extract_profile_text` handler and its failure hook (M2 Task 11)
+    # the profile handlers and hooks (M2 Tasks 11 and 13), `embed_profile` and, through `profile.vectors`, the
+    # `profile_vectors` reconciler (Task 19)
+    "jobhunter.profile.operations",
     "jobhunter.settings.scope_apply",  # the `apply_scope` handler and `scope_apply_failed` (M2 Task 18)
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)

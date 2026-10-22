@@ -29,8 +29,9 @@ key `embed_profile:<id>`, so a version has at most one live operation.
    `FOR SHARE` and reads the state again: the profile purge fences the version, then locks its row
    `FOR UPDATE` before it deletes anything (§20.2 step 1). A version purged or fenced since step 1 writes
    nothing, not an embedding row either (a vector must never outlive its purge). Otherwise the embeddings are
-   upserted (`upsert_embedding`: a row another version or an earlier run left is reused, and held
-   `FOR KEY SHARE` against the retention rule until the commit), the `profile_vectors` rows upserted
+   upserted in the order of their text hash (`upsert_embedding`: a row another version or an earlier run left
+   is reused, and held `FOR KEY SHARE` against the retention rule until the commit; the fixed order keeps two
+   writes of shared texts from deadlocking on the unique key), the `profile_vectors` rows upserted
    (`ON CONFLICT (profile_version_id, kind) DO UPDATE`), and the kinds the version no longer has deleted.
 
 **The reconciler** `profile_vectors` (heavy) implements §12.6 step 3's "recomputed when it returns" for the
@@ -170,16 +171,27 @@ async def write_vectors(
 ) -> int:
     """Upsert the embeddings and the version's `profile_vectors` of `texts` (`embedded[i]` is the answer for
     `texts[i]`) and delete the kinds it no longer has; the number of vectors. The caller's transaction holds
-    the owner row and the version row (`read_version(…, lock=True)`) and ends the operation."""
-    kinds: list[str] = []
-    for (kind, text), item in zip(texts, embedded, strict=True):
-        embedding_id = await upsert_embedding(
+    the owner row and the version row (`read_version(…, lock=True)`) and ends the operation.
+
+    The embeddings go in the order of their `text_sha256`, one statement per distinct text: two transactions
+    that write the same texts for different versions (identical titles are common) then meet the unique key
+    `(embedding_model_id, text_sha256, input_kind)` in the same order, so neither can wait for a row the other
+    holds while it holds one the other needs. The `profile_vectors` rows follow, in kind order.
+    """
+    by_hash = {text_sha256(text): item for (_, text), item in zip(texts, embedded, strict=True)}
+    embedding_ids = {
+        digest: await upsert_embedding(
             conn,
             model_id=EMBEDDING_MODEL_ID,
-            text_sha256=text_sha256(text),
+            text_sha256=digest,
             input_kind=INPUT_KIND,
-            vector=item.vector,
+            vector=by_hash[digest].vector,
         )
+        for digest in sorted(by_hash)
+    }
+    kinds: list[str] = []
+    for kind, text in texts:
+        embedding_id = embedding_ids[text_sha256(text)]
         await conn.execute(
             _UPSERT_VECTOR, {"pv": profile_version_id, "kind": kind, "embedding": embedding_id}
         )

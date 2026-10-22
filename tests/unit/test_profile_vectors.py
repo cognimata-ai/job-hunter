@@ -11,6 +11,8 @@ from jobhunter.embeddings import BATCH
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.profile import schema, vectors
 
+from tests.support.m2 import MINIMAL_PROFILE
+
 
 def profile_of(summary: str, titles: list[tuple[str, str]]) -> ConfirmedProfile:
     """A valid profile of invented content with `summary` and the `(title, lang)` target titles."""
@@ -64,3 +66,8 @@ def test_a_validated_profile_always_fits_one_embed_batch() -> None:
     the most target titles §12.4 allows."""
     most_titles = schema.TARGET_TITLES[1]
     assert 1 + most_titles <= BATCH
+
+
+def test_the_default_profile_of_a_test_chain_is_a_valid_profile() -> None:
+    profile = ConfirmedProfile.model_validate(MINIMAL_PROFILE)
+    assert [kind for kind, _ in vectors.vector_texts(profile)] == ["summary", "title:0"]
