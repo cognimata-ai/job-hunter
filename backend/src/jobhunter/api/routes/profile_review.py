@@ -11,7 +11,11 @@ rules.
   predicate; beyond the spec's summary, plan Deviation 3), and, beyond it too: the stored edit set (`edits`,
   ruling R14-1), the review map (`segments`, R14-2: in `text_review` and `ready`, rebuilt from the decrypted
   raw text with the stored set, offsets and categories only) and the years the roles give
-  (`recomputed_total_years`, R14-3, with the injected clock).
+  (`recomputed_total_years`, R14-3, with the injected clock). A stored profile that the current model refuses
+  (a later release tightened it; final review FR-3) is shown as `draft: null` with one issue
+  `schema_mismatch` at the path `""` and no value, `recomputed_total_years: null`, and `repairs` with
+  `paste_text` (a new draft, which discards this one), so the client can discard it; a stored issue the
+  current model refuses is left out. Neither quotes a stored value or the validation error.
 - `PUT /drafts/{id}` (`{draft}`), in `ready` only: a string of the profile that holds a NUL character or a
   lone surrogate (a JSON body can escape both; no JSONB value or UTF-8 text holds them) is a 422
   `validation_failed` with a `FieldError` (`invalid`) at its path (`body.draft.roles[0].highlights[1]`),
@@ -35,7 +39,8 @@ rules.
   clears the failure and `content_purged_at`, and the operation is created; → 202.
 - `POST /drafts/{id}/discard` → 204, from `text_review`, `ready` or `failed` (reason `user_discard`).
 - `GET /api/profile` → `{active, versions}` (`ProfileVersionOut`, newest first): the versions the confirm
-  (`api/routes/profile.py`, Task 21) writes, each with its profile, `null` once purged.
+  (`api/routes/profile.py`, Task 21) writes, each with its profile, `null` once purged, and `null` with
+  `purged: false` for a stored profile that the current model refuses (FR-3).
 A repeated `Idempotency-Key` returns the stored response (`run_idempotent`); a refused request stores
 nothing. Logs carry ids, codes and counts only; no response holds the raw text or a value that was stripped
 or removed (R14-5).
@@ -61,14 +66,14 @@ from typing import Annotated, Any, Final, Literal
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Header, Path
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_config, get_data_keys, get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
     StoredResponse,
@@ -112,6 +117,11 @@ MAX_SPAN_EDITS: Final = 1000
 _BIGINT_MAX: Final = 2**63 - 1
 _DRAFTS: Final = "profile_drafts"
 _REVIEWABLE: Final = ("text_review", "ready")
+SCHEMA_MISMATCH: Final = "schema_mismatch"
+SCHEMA_MISMATCH_MESSAGE: Final = (
+    "The stored profile no longer matches the profile schema; discard this draft and paste or upload the CV "
+    "again."
+)
 _DISCARDABLE: Final = ("text_review", "ready", "failed")
 
 DraftId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a profile draft")]
@@ -221,10 +231,12 @@ class SegmentOut(BaseModel):
 
 
 class ValidationIssueOut(BaseModel):
-    """An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal."""
+    """An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal. The
+    code `schema_mismatch` (path `""`, no proposal) says that the stored profile no longer matches the profile
+    schema and is not shown."""
 
     path: str
-    code: IssueCode
+    code: IssueCode | Literal["schema_mismatch"]
     message: str
     proposal: JsonValue = None
 
@@ -415,6 +427,37 @@ async def _review_map(
     ]
 
 
+def _profile_or_none(stored: Any) -> ConfirmedProfile | None:
+    """`stored` as a `ConfirmedProfile`, or `None` when the current model refuses it (FR-3). The validation
+    error quotes the stored values, so it is dropped here and never logged or answered."""
+    try:
+        return ConfirmedProfile.model_validate(stored)
+    except ValidationError:
+        return None
+
+
+def _stored_profile(
+    stored: Any, stored_issues: Sequence[Any], draft_id: int
+) -> tuple[ConfirmedProfile | None, list[ValidationIssueOut]]:
+    """The draft's profile and issues as `GET` shows them (module docstring): a profile the current model
+    refuses is `None` with the one `schema_mismatch` issue, and a stored issue it refuses is left out."""
+    if stored is None:
+        draft = None
+    elif (draft := _profile_or_none(stored)) is None:
+        log.warning("profile_draft_schema_mismatch", draft_id=draft_id)
+        mismatch = ValidationIssueOut(path="", code=SCHEMA_MISMATCH, message=SCHEMA_MISMATCH_MESSAGE)
+        return None, [mismatch]
+    issues: list[ValidationIssueOut] = []
+    for stored_issue in stored_issues:
+        try:
+            issues.append(ValidationIssueOut.model_validate(stored_issue))
+        except ValidationError:
+            continue
+    if left_out := len(stored_issues) - len(issues):
+        log.warning("profile_draft_issues_left_out", draft_id=draft_id, issues=left_out)
+    return draft, issues
+
+
 @router.get("/drafts/{draft_id}", response_model=DraftOut, responses=_NOT_FOUND_RESPONSE)
 async def get_draft(
     draft_id: DraftId,
@@ -430,17 +473,19 @@ async def get_draft(
         raise _not_found()
     edits = _stored_edits(row.text_edits)
     segments = await _review_map(row, edits, CvStore(cfg.cv_store_dir), keys, draft_id)
-    draft = None if row.draft_json is None else ConfirmedProfile.model_validate(row.draft_json)
+    draft, issues = _stored_profile(row.draft_json, row.validation_issues, draft_id)
     repairs = (
         review.repairs(_failed(row, row), native_enabled=bounds.NATIVE_PDF_ENABLED)
         if row.status == "failed"
         else []
     )
+    if draft is None and row.draft_json is not None and "paste_text" not in repairs:
+        repairs = ["paste_text", *repairs]  # the schema mismatch: a new draft replaces this one
     sha = None if row.reviewed_text_sha256 is None else bytes(row.reviewed_text_sha256).hex()
     return DraftOut(
         status=row.status,
         draft=draft,
-        validation_issues=[ValidationIssueOut.model_validate(issue) for issue in row.validation_issues],
+        validation_issues=issues,
         strip_report=row.strip_report,
         stripped_text_preview=row.stripped_text,
         reviewed_text_sha256=sha,
@@ -476,6 +521,7 @@ def _validated(
         409: {"description": "The draft is not ready (`conflict_state`)"},
         422: {"description": "Invalid body (`validation_failed`)"},
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def save_draft(
@@ -521,6 +567,7 @@ def _invalid_edits(exc: review.InvalidEditSet) -> Problem:
         409: {"description": "The draft is not in text review or ready, or has no text (`conflict_state`)"},
         422: {"description": "Invalid body or edit set (`validation_failed`)"},
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def edit_text(
@@ -668,6 +715,7 @@ async def approve_text(
             "description": "The draft is not failed, the mode is not admitted for it or its input was purged "
             "(`conflict_state`), or a request with this key is still running (`idempotency_in_progress`)"
         },
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def retry_draft(
@@ -767,6 +815,16 @@ async def discard_draft(draft_id: DraftId, engine: Annotated[AsyncEngine, Depend
     return Response(status_code=204)
 
 
+def _version_profile(version_id: int, stored: Any) -> ConfirmedProfile | None:
+    """A version's profile, `None` once purged or when the current model refuses it (FR-3)."""
+    if stored is None:
+        return None
+    profile = _profile_or_none(stored)
+    if profile is None:
+        log.warning("profile_version_schema_mismatch", version_id=version_id)
+    return profile
+
+
 @router.get("", response_model=ProfileListOut)
 async def get_profile(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> ProfileListOut:
     """The active profile version and every version, newest first (empty until a draft is confirmed)."""
@@ -779,7 +837,7 @@ async def get_profile(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> Pr
             version_no=row.version_no,
             confirmed_at=row.confirmed_at,
             purged=row.purged,
-            profile=None if row.profile_json is None else ConfirmedProfile.model_validate(row.profile_json),
+            profile=_version_profile(row.id, row.profile_json),
         )
         for row in rows
     ]

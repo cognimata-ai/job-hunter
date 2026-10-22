@@ -57,7 +57,7 @@ from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
     CURSOR_VERSION,
     SECTION_ALL,
@@ -252,7 +252,11 @@ VersionId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a s
 @router.post(
     "/dry-run",
     response_model=DryRunOut,
-    responses={422: {"description": "Invalid body (`validation_failed`)"}, **CSRF_RESPONSES},
+    responses={
+        422: {"description": "Invalid body (`validation_failed`)"},
+        **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
+    },
 )
 async def settings_dry_run(body: DryRunIn, engine: Annotated[AsyncEngine, Depends(get_engine)]) -> DryRunOut:
     """Validate and preview a proposed settings document: its errors, warnings, projections and effects."""
@@ -325,6 +329,7 @@ def _saved(outcome: SaveOutcome) -> SaveOut:
             "the key was used for another request (`idempotency_key_reused`)"
         },
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def save_settings_version(

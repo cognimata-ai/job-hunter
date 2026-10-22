@@ -464,6 +464,39 @@ async def test_a_body_within_the_cap_is_read_whole() -> None:
         assert await upload.read_body_limited(request, limit=len(body), field_name="text") == body
 
 
+def disconnecting_request(chunks: Sequence[bytes], *, content_type: str) -> Request:
+    """A request whose client sends `chunks`, each with more to come, and then disconnects mid-body."""
+    sent = iter(chunks)
+
+    async def receive() -> Message:
+        chunk = next(sent, None)
+        if chunk is None:
+            return {"type": "http.disconnect"}
+        return {"type": "http.request", "body": chunk, "more_body": True}
+
+    headers = [(b"content-type", content_type.encode("latin-1"))]
+    return Request({"type": "http", "method": "POST", "path": "/api/profile/cv", "headers": headers}, receive)
+
+
+@pytest.mark.parametrize("reader", ["multipart", "body"])
+async def test_a_client_disconnect_mid_body_is_a_400_logged_at_info(reader: str, log_events) -> None:
+    """Final review FR-5: Starlette's `ClientDisconnect` was no problem, so it reached the catch-all (a 500
+    and an `api.unhandled_exception` alert). It is a 400 `validation_failed`, logged `client_disconnected`
+    at info; the response is moot, as the client is gone."""
+    start = form(part("file", b"%PDF-1.4\n" + b"0" * 2048, "cv.pdf"))[:1024]
+    with pytest.raises(Problem) as exc:
+        if reader == "multipart":
+            request = disconnecting_request([start], content_type=f"multipart/form-data; boundary={BOUNDARY}")
+            await upload.read_multipart_limited(request, limit=upload.MAX_UPLOAD_BYTES)
+        else:
+            request = disconnecting_request([b'{"text": "', b"x" * 512], content_type="application/json")
+            await upload.read_body_limited(request, limit=4096, field_name="text")
+    assert (exc.value.status, exc.value.code) == (400, "validation_failed")
+    assert exc.value.__cause__ is None and exc.value.__suppress_context__  # `from None`, as its siblings
+    events = [e for e in log_events() if e["event"] == "client_disconnected"]
+    assert [(e["level"], e["reader"]) for e in events] == [("info", reader)]
+
+
 def test_the_paste_body_cap_covers_the_longest_escaped_text() -> None:
     """50,000 characters outside the BMP, each two `\\uXXXX` escapes: the JSON body stays under the cap."""
     longest = json.dumps({"text": "\U0001f600" * upload.PASTE_MAX}).encode()

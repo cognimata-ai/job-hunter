@@ -29,7 +29,10 @@ ignored part is not kept, but neither is it read without end. A body that is no 
 boundary, has no `file` part, more than one, or more than `MULTIPART_MAX_PARTS` parts, or ends early is a 422
 `validation_failed` naming the field. `read_body_limited` is the same bound for a body that FastAPI parses
 afterwards (the paste's JSON): a declared `Content-Length` over the limit is refused before any read, and a
-body sent without one is counted as it streams.
+body sent without one is counted as it streams. A client that disconnects before its body is complete
+(Starlette's `ClientDisconnect`) is, in either reader, a 400 `validation_failed` logged
+`client_disconnected` at info (final review FR-5): the response is moot, and it is no unhandled exception
+(which would persist an `api.unhandled_exception` alert).
 
 **The draft** (`open_new_draft`, in the caller's transaction): the open draft is locked, refused (409) while
 it is being extracted, otherwise discarded with every `failed` draft; then the `cv_files` row, the
@@ -37,8 +40,9 @@ it is being extracted, otherwise discarded with every `failed` draft; then the `
 draft, so the second meets the first's row in the `profile_drafts_one_open` index: that is the same 409.
 
 The file is stored before this transaction (the route deletes it when the transaction fails; Task 23's
-`cv_store_orphans` rule removes what a crash in between leaves). Nothing here logs; a name, a content or a
-text never reaches a problem's message either.
+`cv_store_orphans` rule removes what a crash in between leaves). Nothing here logs but a client's
+disconnect (its reader and the bytes received); a name, a content or a text never reaches a log line or a
+problem's message.
 """
 
 import zipfile
@@ -53,11 +57,12 @@ from pydantic import TypeAdapter, ValidationError
 from python_multipart.exceptions import FormParserError
 from python_multipart.multipart import MultipartParser, parse_options_header
 from sqlalchemy.ext.asyncio import AsyncConnection
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db.sql import is_unique_violation, q
 from jobhunter.db.transitions import transition
+from jobhunter.observability.logging import get_logger
 from jobhunter.profile.errors import RejectReason as RejectReason
 from jobhunter.profile.errors import UploadRejected as UploadRejected
 from jobhunter.profile.text import drop_nul
@@ -95,6 +100,8 @@ DraftKind = Literal["extract_profile_text", "extract_profile"]
 
 FILE_FIELD: Final = "file"
 NATIVE_FIELD: Final = "native_pdf_opt_in"
+
+log = get_logger("jobhunter.profile.upload")
 
 _EXTENSIONS: Final[dict[Detected, str]] = {PDF_MIME: ".pdf", DOCX_MIME: ".docx"}
 _REQUIRED_PARTS: Final = frozenset({"[content_types].xml", "word/document.xml"})
@@ -241,6 +248,17 @@ def _too_large() -> Problem:
     return rejected_problem(UploadRejected("too_large"))
 
 
+def _client_disconnected(reader: Literal["multipart", "body"], received: int) -> Problem:
+    """The 400 of a body its client left before its end (module docstring), logged here."""
+    log.info("client_disconnected", reader=reader, received_bytes=received)
+    return Problem(
+        400,
+        "validation_failed",
+        "Request body incomplete",
+        detail="The client disconnected before the request body was complete.",
+    )
+
+
 class _FormReader:
     """The parser's callbacks: they keep the file and the opt-in, and drop every other part's data."""
 
@@ -342,9 +360,9 @@ async def read_multipart_limited(request: Request, *, limit: int) -> UploadedFil
     if not boundary:
         raise _invalid("body", "boundary_missing", "The multipart body has no boundary")
     reader = _FormReader(limit)
+    received, max_body = 0, limit + MULTIPART_OVERHEAD_BYTES
     try:
         parser = MultipartParser(boundary, reader.callbacks())
-        received, max_body = 0, limit + MULTIPART_OVERHEAD_BYTES
         async with aclosing(request.stream()) as chunks:
             async for chunk in chunks:
                 received += len(chunk)
@@ -355,6 +373,8 @@ async def read_multipart_limited(request: Request, *, limit: int) -> UploadedFil
                     break
     except FormParserError:  # a malformed boundary, header or part (`MultipartParseError` among them)
         raise _invalid("body", "malformed_multipart", "The multipart body is malformed") from None
+    except ClientDisconnect:
+        raise _client_disconnected("multipart", received) from None
     if not reader.ended:
         raise _invalid("body", "malformed_multipart", "The multipart body ended before its closing boundary")
     if reader.file is None:
@@ -380,11 +400,14 @@ async def read_body_limited(request: Request, *, limit: int, field_name: str) ->
     if declared.isascii() and declared.isdigit() and int(declared) > limit:
         raise _body_too_large(field_name, limit)
     body = bytearray()
-    async with aclosing(request.stream()) as chunks:
-        async for chunk in chunks:
-            if len(body) + len(chunk) > limit:
-                raise _body_too_large(field_name, limit)
-            body += chunk
+    try:
+        async with aclosing(request.stream()) as chunks:
+            async for chunk in chunks:
+                if len(body) + len(chunk) > limit:
+                    raise _body_too_large(field_name, limit)
+                body += chunk
+    except ClientDisconnect:
+        raise _client_disconnected("body", len(body)) from None
     return bytes(body)
 
 

@@ -50,7 +50,7 @@ from starlette.responses import Response
 from jobhunter.api.deps import get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.api.models import clean_text
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.normalize.companies import company_key
@@ -256,7 +256,11 @@ async def _insert_company(
 @router.post(
     "/parse-url",
     response_model=ParsedUrlOut | UnsupportedUrlOut,
-    responses={422: {"description": "Invalid body (`validation_failed`)"}, **CSRF_RESPONSES},
+    responses={
+        422: {"description": "Invalid body (`validation_failed`)"},
+        **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
+    },
 )
 async def parse_url(body: ParseUrlIn) -> ParsedUrlOut | UnsupportedUrlOut:
     """Read a careers URL by pattern (200): the board it names, or why it names none. Never fetches it."""
@@ -279,6 +283,7 @@ async def parse_url(body: ParseUrlIn) -> ParsedUrlOut | UnsupportedUrlOut:
             "description": "Invalid body, or settings the new entry cannot be saved in (`validation_failed`)"
         },
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def add_company(

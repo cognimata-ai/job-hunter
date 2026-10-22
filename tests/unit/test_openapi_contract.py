@@ -14,6 +14,8 @@ HTTP_METHODS: Final = frozenset({"get", "put", "post", "delete", "options", "hea
 READINESS_503: Final = ("get", "/readyz", "503")
 # What an idempotent draft route can answer besides its 202 (Task 14).
 IDEMPOTENT_DRAFT_ROUTE: Final = {"400", "401", "403", "404", "409", "422", "429"}
+# The routes that read their bodies under their own limits (`edge.OWN_BODY_LIMITS`), with their own 413.
+OWN_LIMIT_ROUTES: Final = {("post", "/api/profile/cv"), ("post", "/api/profile/cv-text")}
 
 
 @pytest.fixture(scope="module")
@@ -100,33 +102,33 @@ def test_the_readiness_503_is_the_report_not_a_problem(document) -> None:
 @pytest.mark.parametrize(
     ("method", "path", "statuses"),
     [
-        ("post", "/api/auth/login", {"401", "403", "422", "429"}),
+        ("post", "/api/auth/login", {"401", "403", "413", "422", "429"}),
         ("post", "/api/auth/logout", {"401", "403", "429"}),
         ("get", "/api/auth/session", {"401", "429"}),
-        ("post", "/api/runs", {"400", "401", "403", "409", "422", "429"}),
+        ("post", "/api/runs", {"400", "401", "403", "409", "413", "422", "429"}),
         ("get", "/api/system/health", {"401", "429"}),
         ("post", "/api/profile/cv", {"401", "403", "409", "413", "422", "429"}),
         ("post", "/api/profile/cv-text", {"401", "403", "409", "413", "422", "429"}),
         ("get", "/api/profile/drafts/{draft_id}", {"401", "404", "422", "429"}),
-        ("put", "/api/profile/drafts/{draft_id}", {"401", "403", "404", "409", "422", "429"}),
-        ("put", "/api/profile/drafts/{draft_id}/text", {"401", "403", "404", "409", "422", "429"}),
+        ("put", "/api/profile/drafts/{draft_id}", {"401", "403", "404", "409", "413", "422", "429"}),
+        ("put", "/api/profile/drafts/{draft_id}/text", {"401", "403", "404", "409", "413", "422", "429"}),
         ("post", "/api/profile/drafts/{draft_id}/text-review", IDEMPOTENT_DRAFT_ROUTE),
-        ("post", "/api/profile/drafts/{draft_id}/retry", IDEMPOTENT_DRAFT_ROUTE),
+        ("post", "/api/profile/drafts/{draft_id}/retry", IDEMPOTENT_DRAFT_ROUTE | {"413"}),
         ("post", "/api/profile/drafts/{draft_id}/discard", {"401", "403", "404", "409", "422", "429"}),
-        ("post", "/api/profile/drafts/{draft_id}/confirm", IDEMPOTENT_DRAFT_ROUTE),
+        ("post", "/api/profile/drafts/{draft_id}/confirm", IDEMPOTENT_DRAFT_ROUTE | {"413"}),
         ("get", "/api/profile/drafts/{draft_id}/rescore-estimate", {"401", "404", "422", "429"}),
         ("get", "/api/profile", {"401", "429"}),
         ("post", "/api/profile/query-proposals", {"400", "401", "403", "409", "422", "429"}),
         ("get", "/api/profile/query-proposals/{proposal_id}", {"401", "404", "422", "429"}),
-        ("post", "/api/queries", {"401", "403", "409", "422", "429"}),
-        ("patch", "/api/queries/{query_id}", {"401", "403", "404", "409", "422", "429"}),
-        ("post", "/api/watchlist/parse-url", {"401", "403", "422", "429"}),
-        ("post", "/api/watchlist", {"401", "403", "409", "422", "429"}),
+        ("post", "/api/queries", {"401", "403", "409", "413", "422", "429"}),
+        ("patch", "/api/queries/{query_id}", {"401", "403", "404", "409", "413", "422", "429"}),
+        ("post", "/api/watchlist/parse-url", {"401", "403", "413", "422", "429"}),
+        ("post", "/api/watchlist", {"401", "403", "409", "413", "422", "429"}),
         ("delete", "/api/watchlist/{company_id}", {"401", "403", "404", "422", "429"}),
         ("get", "/api/geo/places", {"401", "422", "429"}),
-        ("post", "/api/settings/dry-run", {"401", "403", "422", "429"}),
+        ("post", "/api/settings/dry-run", {"401", "403", "413", "422", "429"}),
         ("get", "/api/settings", {"401", "429"}),
-        ("post", "/api/settings", {"400", "401", "403", "409", "422", "429"}),
+        ("post", "/api/settings", {"400", "401", "403", "409", "413", "422", "429"}),
         ("get", "/api/settings/versions", {"400", "401", "422", "429"}),
         ("get", "/api/settings/versions/{version_id}", {"401", "404", "422", "429"}),
         ("get", "/api/system/spend", {"401", "429"}),
@@ -148,6 +150,18 @@ def test_edge_and_session_errors_are_documented_on_every_api_route(document) -> 
         assert ("403" in statuses) == (method.upper() in STATE_CHANGING_METHODS), (method, path)
         if path != LOGIN_PATH:
             assert {"401", "429"} <= statuses, (method, path)
+
+
+def test_the_edges_body_ceiling_is_documented_on_every_route_with_a_body(document) -> None:
+    """Final review FR-4: the edge refuses a body over 1 MiB (`edge.MAX_BODY_BYTES`) with a 413 before the
+    route; the upload and the paste document their own."""
+    with_body = {key: op for key, op in operations(document).items() if "requestBody" in op}
+    assert OWN_LIMIT_ROUTES < set(with_body)
+    for key, operation in operations(document).items():
+        response = operation["responses"].get("413")
+        assert (response is not None) == (key in with_body), key
+        if key in with_body and key not in OWN_LIMIT_ROUTES:
+            assert response["description"] == openapi.BODY_LIMIT_RESPONSES[413]["description"], key
 
 
 def test_only_the_403_of_routes_that_need_x_jh_request_names_it(document) -> None:

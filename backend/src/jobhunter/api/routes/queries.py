@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.api.deps import get_engine, require_session
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
@@ -93,6 +93,7 @@ def _out(row: authoring.QueryRow) -> QueryOut:
         },
         422: {"description": "Invalid body, text or proposal (`validation_failed`)"},
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def add_query(body: QueryIn, engine: Annotated[AsyncEngine, Depends(get_engine)]) -> QueryOut:
@@ -118,6 +119,7 @@ async def add_query(body: QueryIn, engine: Annotated[AsyncEngine, Depends(get_en
         409: {"description": "A live query has the new text (`conflict_state`, with its `query_id`)"},
         422: {"description": "Invalid body or text, or settings the swap cannot save (`validation_failed`)"},
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def edit_query(

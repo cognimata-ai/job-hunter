@@ -1234,7 +1234,10 @@ export interface components {
             /** Title */
             title: string;
         };
-        /** RunNowIn */
+        /**
+         * RunNowIn
+         * @description `include_paid` only: an unknown member is refused (422 `validation_failed`), as by every other body.
+         */
         RunNowIn: {
             /** Include Paid */
             include_paid: boolean;
@@ -1585,10 +1588,13 @@ export interface components {
         };
         /**
          * ValidationIssueOut
-         * @description An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal.
+         * @description An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal. The
+         *     code `schema_mismatch` (path `""`, no proposal) says that the stored profile no longer matches the profile
+         *     schema and is not shown.
          */
         ValidationIssueOut: {
-            code: components["schemas"]["IssueCode"];
+            /** Code */
+            code: components["schemas"]["IssueCode"] | "schema_mismatch";
             /** Message */
             message: string;
             /** Path */
@@ -1738,6 +1744,15 @@ export interface operations {
             };
             /** @description Origin check failed (`csrf_failed`) */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2224,6 +2239,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body (`validation_failed`) */
             422: {
                 headers: {
@@ -2309,6 +2333,15 @@ export interface operations {
             };
             /** @description The draft is not ready or its stored profile no longer fits the schema (`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2542,6 +2575,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
             422: {
                 headers: {
@@ -2616,6 +2658,15 @@ export interface operations {
             };
             /** @description The draft is not in text review or ready, or has no text (`conflict_state`) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2915,6 +2966,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body, text or proposal (`validation_failed`) */
             422: {
                 headers: {
@@ -2996,6 +3056,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body or text, or settings the swap cannot save (`validation_failed`) */
             422: {
                 headers: {
@@ -3069,6 +3138,15 @@ export interface operations {
             };
             /** @description A request with this key is still running (`idempotency_in_progress`) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3194,6 +3272,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body or settings, an unacknowledged warning (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
             422: {
                 headers: {
@@ -3247,6 +3334,15 @@ export interface operations {
             };
             /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3574,6 +3670,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body, or settings the new entry cannot be saved in (`validation_failed`) */
             422: {
                 headers: {
@@ -3627,6 +3732,15 @@ export interface operations {
             };
             /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -26,7 +26,8 @@ SURROGATE: Final = "\ud800"
         ("/api/profile/drafts/1/retry", {"mode": f"llm{SURROGATE}"}, 422),
         ("/api/profile/drafts/1/retry", {"mode": "llm", f"note{SURROGATE}": "x"}, 422),  # extra="forbid"
         ("/api/runs", {"include_paid": SURROGATE}, 422),
-        ("/api/runs", {"include_paid": False, f"x{SURROGATE}": 1}, 202),  # M0's body ignores unknown keys
+        ("/api/runs", {"include_paid": False, f"x{SURROGATE}": 1}, 422),  # extra="forbid" (final review FR-6)
+        ("/api/runs", {"include_paid": False, "note": "x"}, 422),
     ],
 )
 async def test_a_lone_surrogate_is_never_a_500(

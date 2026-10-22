@@ -29,7 +29,9 @@ when there is one (a repeat with a new key gets the same id) and otherwise opens
 `propose_queries` operation and job. The call counts against the non-scoring share of the budget (its spend
 owner is that operation, §6.9.1). `GET /api/profile/query-proposals/{id}` → `{status, items}`: `items` is the
 list of kept queries of a `ready` proposal (`{text, lang, target_title, exploration, rationale}` each), `null`
-before and otherwise; an unknown id is 404 `not_found`.
+before and otherwise; an unknown id is 404 `not_found`. A stored item that the current model refuses (a
+later release tightened it; final review FR-3) is left out, and neither it nor the validation error is
+quoted.
 
 `POST /api/profile/drafts/{id}/confirm` (Idempotency-Key, `{expected_rescore_ack}`) → 201
 `{profile_version_id, targets_to_create, est_usd, bulk_budget_usd}` (Task 21, §12.6 step 2): a malformed key
@@ -66,7 +68,7 @@ from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, Header, Path, Request
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 from starlette.types import Message
@@ -74,7 +76,7 @@ from starlette.types import Message
 from jobhunter.api.deps import get_config, get_data_keys, get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.api.models import DecimalOut
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
     StoredResponse,
@@ -461,8 +463,20 @@ async def get_query_proposal(
         raise Problem(404, "not_found", "Query proposal not found")
     items = None
     if row.status == proposals.READY and isinstance(row.items, dict):
-        items = [ProposedQueryOut.model_validate(item) for item in row.items.get("queries", [])]
+        stored = row.items.get("queries")
+        stored = stored if isinstance(stored, list) else []
+        items = [item for item in map(_proposed_query, stored) if item is not None]
+        if left_out := len(stored) - len(items):
+            log.warning("query_proposal_items_left_out", proposal_id=proposal_id, items=left_out)
     return ProposalOut(status=row.status, items=items)
+
+
+def _proposed_query(stored: Any) -> ProposedQueryOut | None:
+    """A stored item, or `None` when the current model refuses it (its error quotes the item: dropped)."""
+    try:
+        return ProposedQueryOut.model_validate(stored)
+    except ValidationError:
+        return None
 
 
 # --- confirm and activate (Task 21) -------------------------------------------------------------------------
@@ -486,6 +500,7 @@ async def get_query_proposal(
             "(`idempotency_key_reused`)"
         },
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def confirm_draft(
