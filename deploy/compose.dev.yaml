@@ -187,6 +187,10 @@ services:
     volumes: [parse_jobs:/data/parse]
     logging: { driver: local, options: { max-size: 20m, max-file: "10" } }
     mem_limit: 1g # one job at a time: a child of at most 768 MiB (RLIMIT_AS)
+    # The loop, its resource tracker and one parse child (which starts no process: RLIMIT_NPROC 0), with room
+    # for an operator's `exec`. Past it, a parse that escaped its limits can fork nothing more (final review
+    # FR-11). A failed leftover sweep exits 70 and the restart ends every process in the container.
+    pids_limit: 16
     restart: unless-stopped
 
   devproxy:

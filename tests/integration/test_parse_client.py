@@ -363,6 +363,14 @@ def test_the_client_waits_longer_than_docparse_takes_for_one_job() -> None:
     assert worker.SPAWN_MARGIN_S + worker.DEFAULT_LIMITS.wall_s + worker.EXIT_JOIN_S < client_timeout
 
 
+def test_docparse_sweeps_a_job_only_once_the_client_has_given_up_on_it() -> None:
+    """docparse removes an entry of the root unchanged for `LEFTOVER_AFTER_S` (final review FR-11): never a
+    job the client still waits for, and the client only writes before it waits."""
+    client_timeout = inspect.signature(ParseClient).parameters["timeout_s"].default
+    assert client_timeout < worker.LEFTOVER_AFTER_S
+    assert set(worker.PROTOCOL_FILES) >= {"input.pdf", "input.docx", "request.json.tmp", "request.json"}
+
+
 def stale_job(root: Path, name: str, files: dict[str, bytes]) -> None:
     (root / name).mkdir()
     for file, data in files.items():

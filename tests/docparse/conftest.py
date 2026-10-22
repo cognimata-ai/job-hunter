@@ -6,11 +6,13 @@ functions of a test module. Every text in them is invented.
 """
 
 import contextlib
+import errno
 import fcntl
 import json
 import os
 import resource
 import stat
+import threading
 import time
 from multiprocessing import resource_tracker
 from pathlib import Path
@@ -118,3 +120,88 @@ def mark(path: Path, _mime: str) -> Extracted:
 def report_inherited(_path: Path, _mime: str) -> Extracted:
     """Answers whether the child sees the loop process's `LOOP_PROCESS_STATE`, as only a fork would."""
     return Extracted(f"inherited={bool(LOOP_PROCESS_STATE)}", "pypdf", 1)
+
+
+# --- a compromised parse (final review FR-11) --------------------------------------------------------------
+
+GRANDCHILD_PID: Final = "grandchild.pid"  # where `fork_and_overrun` leaves the pid of the process it started
+
+
+def _linger_detached() -> NoReturn:
+    """In a forked process: let go of every inherited descriptor (the answer pipe, the sentinel), so the loop
+    sees the child's EOF and exit, and stay alive without using CPU."""
+    os.closerange(3, resource.getrlimit(resource.RLIMIT_NOFILE)[0])
+    time.sleep(120)
+    os._exit(0)
+
+
+def fork_and_linger(_path: Path, _mime: str) -> Extracted:
+    """Starts a process that outlives the parse, then answers at once with its pid."""
+    pid = os.fork()
+    if pid == 0:
+        _linger_detached()
+    return Extracted(f"grandchild={pid}", "pypdf", 1)
+
+
+def fork_and_overrun(path: Path, _mime: str) -> NoReturn:
+    """Starts a process that outlives the parse, leaves its pid beside the input, then blocks until the loop
+    kills the child at its deadline."""
+    pid = os.fork()
+    if pid == 0:
+        _linger_detached()
+    (path.parent / GRANDCHILD_PID).write_text(str(pid))
+    time.sleep(120)
+    os._exit(0)
+
+
+def report_groups(_path: Path, _mime: str) -> Extracted:
+    """Answers the child's pid, process group and session."""
+    return Extracted(f"{os.getpid()} {os.getpgid(0)} {os.getsid(0)}", "pypdf", 1)
+
+
+def try_to_start(_path: Path, _mime: str) -> Extracted:
+    """Answers whether the child could start a process and a thread."""
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        forked = f"refused:{errno.errorcode.get(exc.errno or 0, exc.errno)}"
+    else:
+        if pid == 0:
+            os._exit(0)
+        os.waitpid(pid, 0)
+        forked = "started"
+    try:
+        thread = threading.Thread(target=lambda: None)
+        thread.start()
+        thread.join()
+    except RuntimeError:
+        threaded = "refused"
+    else:
+        threaded = "started"
+    return Extracted(f"fork={forked} thread={threaded}", "pypdf", 1)
+
+
+def litter(path: Path, _mime: str) -> Extracted:
+    """Leaves copies of the decrypted input where a compromised parser can: in the job directory (a
+    subdirectory that only its owner may enter, a FIFO) and beside it on the parse root (a hard link, a
+    symlink, a directory of its own, one shaped like a job the worker is still writing)."""
+    job, root = path.parent, path.parent.parent
+    data = path.read_bytes()
+    stash = job / "stash"
+    stash.mkdir(mode=0o700)
+    (stash / "copy.pdf").write_bytes(data)
+    stash.chmod(0)  # only its owner may open it up again
+    os.mkfifo(job / "pipe")
+    os.link(path, root / "beside.pdf")
+    (root / "link").symlink_to(path)
+    (root / "hidden").mkdir()
+    (root / "hidden" / "copy.txt").write_bytes(data)
+    (root / "mimic").mkdir()
+    (root / "mimic" / "input.pdf").write_bytes(data)
+    return Extracted(MARKED_TEXT, "pypdf", 1)
+
+
+def plant_stuck(path: Path, _mime: str) -> Extracted:
+    """Leaves the file `stuck` beside the job, which a test makes impossible to remove."""
+    (path.parent.parent / "stuck").write_bytes(path.read_bytes())
+    return Extracted(MARKED_TEXT, "pypdf", 1)
