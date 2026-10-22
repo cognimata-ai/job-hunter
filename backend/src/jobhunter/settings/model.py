@@ -7,10 +7,20 @@
   left out takes its default; `to_payload()` always writes the complete document.
 - **Strict JSON types.** Unknown keys are refused at every level (`extra="forbid"`); a JSON `"6"` is no
   integer, `6.0` no integer either, and `1` no boolean. A coordinate may be a JSON integer.
-- **Decimals** (the USD amounts, `t2_straddle_max_coverage`, `bulk_rescore_max_budget_share`) are JSON
-  strings of plain decimal notation (`"2.00"`, no exponent), read into `Decimal` without a float in between
-  and written back as they were read. USD amounts have at most two decimal places: `llm_budget` keeps them as
-  `numeric(10,2)` (§7.11), so a third place would be rounded away there.
+- **Decimals** are JSON strings of plain decimal notation (`"2.00"`; no exponent, no float), each field at
+  one fixed scale, the scale of its value in `settings_v1.json`: the USD amounts (`cap_usd`,
+  `overrun_buffer_usd`, `min_bucket_capacity_usd`) at 2 places, as `llm_budget` stores them
+  (`numeric(10,2)`, §7.11), and `t2_straddle_max_coverage` and `bulk_rescore_max_budget_share` at 1 place.
+  A value is brought to its scale when it is read (`"0.700"` and `"0.7"`, `"2"` and `"2.00"` are one value;
+  `"-0"` is `0`), a value with more places than its scale is refused, and the JSON form is the fixed-point
+  string at that scale (`format(value, "f")`), never an exponent, also for a `Decimal` built in Python. So
+  every value has one form, and `to_payload()` validates to itself.
+- **Normal forms.** `industries_include`/`industries_exclude` are stored case-folded (`normalize.text.fold`;
+  §13.1 "case-folded") and `excluded_companies` as company keys (`normalize.companies.company_key`, §8.3: what
+  the hard filter compares a job's `company_key` with, §11.1), so a change of case or legal form is no
+  change. Each normaliser is applied until the value no longer changes (`_settled`): both are idempotent on
+  ordinary text, but not on a few inputs (`company_key` of a name ending in two country words, `fold` of a
+  spacing diacritic), and a stored value must validate to itself.
 - **Set-valued lists** (`work_modes`, `employment_types`, `accepted_ad_languages`, `critic_light_triggers`)
   hold no value twice and are kept in the order their type declares, so a reordering is no change and derives
   no new row (§13.2). Other lists keep their order.
@@ -20,8 +30,10 @@
   also one that a later rule refuses: a database seeded before spec revision 3.4 keeps `batch_max_items` 1,000
   in its version 1 (plan Deviation 34).
 - **Error types.** A model or effort outside §10.3's lists raises the error type `unsupported` (G5); a
-  decimal outside its range `out_of_range`; a malformed decimal or anchor, an unknown time zone or a repeated
-  set value `invalid`. `validate` maps these and Pydantic's own types to `FieldIssue` codes.
+  decimal outside its range, or an industry outside 2 to 60 characters once folded, `out_of_range`; a
+  malformed decimal or anchor, an unknown time zone, a repeated set value or a company name with no key
+  `invalid`. `validate` maps these and Pydantic's own types to `FieldIssue` codes; it also refuses an
+  industry or company that repeats once normalised (`conflict`).
 
 `ScopeVersionPayload` is the scope without the admission field `max_ad_age_days`: the payload of a
 `scope_versions` row (`db.seed.scope_payload`). `Scope` adds that field.
@@ -39,6 +51,8 @@ from pydantic_core import PydanticCustomError
 
 from jobhunter.db.seed import ANCHOR_LOCAL
 from jobhunter.llm.pricing import MODELS, Effort, Model
+from jobhunter.normalize.companies import company_key
+from jobhunter.normalize.text import fold
 from jobhunter.types import JSONValue
 
 Node = Literal["generate", "revise", "critic", "extract_profile", "propose_queries"]
@@ -67,7 +81,10 @@ _DEFAULT_LIGHT_TRIGGERS: Final[tuple[LightTrigger, ...]] = ("T2", "T8")
 
 _EFFORTS: Final[tuple[str, ...]] = get_args(Effort)
 _DECIMAL_TEXT: Final = re.compile(r"-?[0-9]+(\.[0-9]+)?")
-_USD_PLACES: Final = 2
+_USD_PLACES: Final = 2  # the scale of the USD amounts (`llm_budget`: numeric(10,2))
+_SHARE_PLACES: Final = 1  # the scale of `t2_straddle_max_coverage` and `bulk_rescore_max_budget_share`
+_INDUSTRY_LENGTH: Final = (2, 60)
+_SETTLE_ROUNDS: Final = 8
 
 
 class _Group(BaseModel):
@@ -75,8 +92,11 @@ class _Group(BaseModel):
 
 
 def _decimal(value: object) -> object:
-    """A JSON string of plain decimal notation as a `Decimal`; any other value is refused, a float too."""
+    """A JSON string of plain decimal notation, or a finite `Decimal`, as a `Decimal`; any other value is
+    refused, a float too."""
     if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise PydanticCustomError("invalid", "not a finite decimal number")
         return value
     if not isinstance(value, str):
         raise PydanticCustomError("invalid", 'a decimal is a JSON string, such as "2.00"')
@@ -87,25 +107,62 @@ def _decimal(value: object) -> object:
     return Decimal(value)
 
 
-def _within(low: str, high: str, *, places: int | None = None) -> AfterValidator:
-    """The check of a decimal range `[low, high]` and, with `places`, of the number of decimal places."""
+def _scaled(low: str, high: str, *, places: int) -> AfterValidator:
+    """The check of a decimal range `[low, high]`, then the value at its field's scale of `places` decimal
+    places: one with more places is refused, and a negative zero is zero."""
     lowest, highest = Decimal(low), Decimal(high)
+    quantum = Decimal(1).scaleb(-places)
 
     def check(value: Decimal) -> Decimal:
         if not lowest <= value <= highest:
             raise PydanticCustomError(
                 "out_of_range", "must be from {low} to {high}", {"low": low, "high": high}
             )
-        exponent = value.as_tuple().exponent
-        if places is not None and isinstance(exponent, int) and -exponent > places:
+        scaled = value.quantize(quantum)
+        if scaled != value:
             raise PydanticCustomError("invalid", "at most {places} decimal places", {"places": places})
-        return value
+        return scaled + 0  # `+ 0` turns -0.00 into 0.00 and keeps the scale
 
     return AfterValidator(check)
 
 
+def _fixed_point(value: Decimal) -> str:
+    return format(value, "f")
+
+
 _DECIMAL: Final = BeforeValidator(_decimal)
-_AS_STRING: Final = PlainSerializer(str, return_type=str, when_used="json")
+_AS_STRING: Final = PlainSerializer(_fixed_point, return_type=str, when_used="json")
+
+
+def _settled(normalize: Callable[[str], str], value: str) -> str:
+    """`normalize` applied until the value no longer changes (module docstring, normal forms)."""
+    for _ in range(_SETTLE_ROUNDS):
+        again = normalize(value)
+        if again == value:
+            return value
+        value = again
+    raise PydanticCustomError("invalid", "has no stable normal form")
+
+
+def _industry(value: str) -> str:
+    """The case-folded industry, 2 to 60 characters long."""
+    folded = _settled(fold, value)
+    shortest, longest = _INDUSTRY_LENGTH
+    if not shortest <= len(folded) <= longest:
+        raise PydanticCustomError(
+            "out_of_range",
+            "must have from {shortest} to {longest} characters once case-folded",
+            {"shortest": shortest, "longest": longest},
+        )
+    return folded
+
+
+def _company(value: str) -> str:
+    """The company key of a name or of a key (§8.3)."""
+    key = _settled(company_key, value)
+    if not key.strip():
+        raise PydanticCustomError("invalid", "a company name needs a letter, a digit or a symbol")
+    return key
 
 
 def _set_of[T](declared: tuple[T, ...]) -> AfterValidator:
@@ -164,9 +221,9 @@ def _paid_max(value: object) -> object:
 
 SupportedModel = Annotated[Model, _supported("model", MODELS)]
 SupportedEffort = Annotated[Effort, _supported("effort", _EFFORTS)]
-Industry = Annotated[str, Field(min_length=2, max_length=60)]
+Industry = Annotated[str, AfterValidator(_industry)]  # stored case-folded
 Keyword = Annotated[str, Field(min_length=2, max_length=60)]
-CompanyKey = Annotated[str, Field(min_length=1)]
+CompanyKey = Annotated[str, Field(min_length=1), AfterValidator(_company)]  # stored as the company key
 
 
 def _all[T](values: tuple[T, ...]) -> Callable[[], list[T]]:
@@ -258,7 +315,9 @@ class Scope(ScopeVersionPayload):
 class Evaluation(_Group):
     relevance_threshold: int = Field(60, ge=0, le=100)
     t2_band: int = Field(5, ge=0, le=20)
-    t2_straddle_max_coverage: Annotated[Decimal, _DECIMAL, _within("0", "1"), _AS_STRING] = Decimal("0.7")
+    t2_straddle_max_coverage: Annotated[  # 1 decimal place
+        Decimal, _DECIMAL, _scaled("0.0", "1.0", places=_SHARE_PLACES), _AS_STRING
+    ] = Decimal("0.7")
     t3_min_mid: int = Field(80, ge=50, le=100)
     t8_sample_pct: int = Field(5, ge=0, le=100)
     critic_light_triggers: Annotated[list[LightTrigger], _set_of(get_args(LightTrigger))] = Field(
@@ -373,25 +432,26 @@ class Scoring(_Group):
     batch_bulk_rescore: bool = True
     batch_min_targets: int = Field(200, ge=200, le=100_000)
     batch_max_items: int = Field(500, ge=200, le=10_000)  # 500 since spec revision 3.4 (Deviation 34)
-    bulk_rescore_max_budget_share: Annotated[Decimal, _DECIMAL, _within("0.1", "1.0"), _AS_STRING] = Decimal(
-        "0.4"
-    )
+    bulk_rescore_max_budget_share: Annotated[  # 1 decimal place
+        Decimal, _DECIMAL, _scaled("0.1", "1.0", places=_SHARE_PLACES), _AS_STRING
+    ] = Decimal("0.4")
 
 
 # --- Budget, Retention, Notifications ---
 
 
 class Llm(_Group):
-    cap_usd: Annotated[Decimal, _DECIMAL, _within("1.00", "10000.00", places=_USD_PLACES), _AS_STRING] = (
+    # The USD amounts have 2 decimal places.
+    cap_usd: Annotated[Decimal, _DECIMAL, _scaled("1.00", "10000.00", places=_USD_PLACES), _AS_STRING] = (
         Decimal("100.00")
     )
     nonscoring_reserve_pct: int = Field(5, ge=0, le=20)
     # and ≥ the §6.9.1 bound of the configured concurrency and `batch_max_items` (validate)
     overrun_buffer_usd: Annotated[
-        Decimal, _DECIMAL, _within("0.50", "50.00", places=_USD_PLACES), _AS_STRING
+        Decimal, _DECIMAL, _scaled("0.50", "50.00", places=_USD_PLACES), _AS_STRING
     ] = Decimal("2.00")
     min_bucket_capacity_usd: Annotated[
-        Decimal, _DECIMAL, _within("0.10", "100.00", places=_USD_PLACES), _AS_STRING
+        Decimal, _DECIMAL, _scaled("0.10", "100.00", places=_USD_PLACES), _AS_STRING
     ] = Decimal("1.00")
 
 

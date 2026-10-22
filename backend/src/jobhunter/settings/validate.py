@@ -15,10 +15,12 @@ a map (`payload.scope.locations[0].radius_km`, `payload.scope.language_policy.fr
 
 **Order.** The Pydantic errors come first; when there is any, the payload has no `Settings` and no other rule
 runs. Otherwise every rule runs, in document order, and every issue it finds is reported:
-1. scope: at least one location or `remote_within_germany`; no place twice (`gazetteer_id`) and no location
-   key twice (`run_settings.slug` of the label, the `coverage_cells.location_key`), and a label that has a
-   key; `industries_include ∩ industries_exclude = ∅` case-folded (`normalize.text.fold`), at each excluded
-   entry that is also included; `seniority_range.min ≤ max` on the ladder when both are set;
+1. scope: at least one location or `remote_within_germany`; no place twice (`gazetteer_id`), a label that
+   has a location key (`run_settings.slug`, the `coverage_cells.location_key`), no key twice and none equal
+   to `sources.base.REMOTE_DE`, the key of the remote-within-Germany cells; no industry and no company twice
+   once normalised (the model stores them case-folded and as company keys), and `industries_include ∩
+   industries_exclude = ∅`, at each excluded entry that is also included; `seniority_range.min ≤ max` on the
+   ladder when both are set;
 2. `evaluation.t3_min_mid > relevance_threshold`;
 3. not every source disabled (SerpApi alone is the warning `serpapi_disabled_no_fallback`);
 4. no `query_id` and no `watchlist_company_id` twice (the run view keys them, `RunSettings.queries`);
@@ -42,11 +44,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.llm import bounds, pricing
 from jobhunter.llm.pricing import Model
-from jobhunter.normalize.text import fold
 from jobhunter.normalize.titles import SENIORITY_LADDER
 from jobhunter.quota import dryrun
 from jobhunter.run_settings import slug
 from jobhunter.settings.model import Settings
+from jobhunter.sources.base import REMOTE_DE
 from jobhunter.types import JSONValue
 
 GateState = Literal["uncalibrated", "passed", "failed"]
@@ -150,15 +152,28 @@ def _scope(settings: Settings) -> Iterator[FieldIssue]:
         except ValueError:
             yield _issue("invalid", "a label needs a letter or a digit", "scope", "locations", i, "label")
             continue
-        if key in keys:
+        if key == REMOTE_DE:
+            yield _issue(
+                "conflict",
+                f"the location key {REMOTE_DE} is reserved for remote work within Germany",
+                *("scope", "locations", i, "label"),
+            )
+        elif key in keys:
             yield _issue(
                 "conflict", "two locations have the same location key", "scope", "locations", i, "label"
             )
         keys.add(key)
-    included = {fold(industry) for industry in scope.industries_include}
-    for j, industry in enumerate(scope.industries_exclude):
-        if fold(industry) in included:
+    # industries are stored case-folded and companies as company keys (settings.model): compared as stored
+    yield from _repeats(scope.industries_include, "the same industry appears twice", "industries_include")
+    included = set(scope.industries_include)
+    excluded: set[str] = set()
+    for j, industry in enumerate(scope.industries_exclude):  # one issue per entry: a repeat first
+        if industry in excluded:
+            yield _issue("conflict", "the same industry appears twice", "scope", "industries_exclude", j)
+        elif industry in included:
             yield _issue("conflict", "also in industries_include", "scope", "industries_exclude", j)
+        excluded.add(industry)
+    yield from _repeats(scope.excluded_companies, "the same company appears twice", "excluded_companies")
     seniority = scope.seniority_range
     if (
         seniority.min is not None
@@ -166,6 +181,15 @@ def _scope(settings: Settings) -> Iterator[FieldIssue]:
         and _LEVEL[seniority.min] > _LEVEL[seniority.max]
     ):
         yield _issue("conflict", "min is above max", "scope", "seniority_range", "min")
+
+
+def _repeats(values: list[str], message: str, field: str) -> Iterator[FieldIssue]:
+    """A `conflict` at each scope list entry whose normal form an earlier entry already has."""
+    seen: set[str] = set()
+    for i, value in enumerate(values):
+        if value in seen:
+            yield _issue("conflict", message, "scope", field, i)
+        seen.add(value)
 
 
 def _evaluation(settings: Settings) -> Iterator[FieldIssue]:

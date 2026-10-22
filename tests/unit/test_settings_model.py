@@ -15,7 +15,11 @@ from typing import Any, get_args
 import pytest
 from jobhunter.db.seed import canonical_json, load_settings_v1
 from jobhunter.llm import bounds
+from jobhunter.normalize.companies import company_key
+from jobhunter.normalize.text import fold
 from jobhunter.normalize.titles import SENIORITY_LADDER
+from jobhunter.run_settings import RunSettings, scope_from_payload
+from jobhunter.scoring.filters import evaluate
 from jobhunter.settings.model import (
     ModelPolicy,
     Scope,
@@ -25,6 +29,8 @@ from jobhunter.settings.model import (
 )
 from jobhunter.settings.validate import overrun_buffer_bound, validate_fields
 from pydantic import ValidationError
+
+from tests.support.facts import facts
 
 
 def defaults() -> dict[str, Any]:
@@ -59,12 +65,135 @@ def test_decimals_are_strings_in_json_and_decimals_in_the_model() -> None:
     assert isinstance(evaluation, dict) and evaluation["t2_straddle_max_coverage"] == "0.7"
 
 
-def test_a_decimal_keeps_its_written_scale() -> None:
+def written(doc: dict[str, Any], group: str, field: str) -> object:
+    group_payload = Settings.model_validate(doc).to_payload()[group]
+    assert isinstance(group_payload, dict)
+    return group_payload[field]
+
+
+@pytest.mark.parametrize(
+    ("group", "field", "value", "stored"),
+    [
+        # the USD amounts at 2 places
+        ("llm", "cap_usd", "250.5", "250.50"),
+        ("llm", "cap_usd", "2", "2.00"),
+        ("llm", "cap_usd", "2.0", "2.00"),
+        ("llm", "cap_usd", "2.00", "2.00"),
+        ("llm", "overrun_buffer_usd", "2.000", "2.00"),
+        ("llm", "min_bucket_capacity_usd", "0.1", "0.10"),
+        # the rates at 1 place, the scale of their seed values
+        ("evaluation", "t2_straddle_max_coverage", "0.7", "0.7"),
+        ("evaluation", "t2_straddle_max_coverage", "0.70", "0.7"),
+        ("evaluation", "t2_straddle_max_coverage", "0.700000", "0.7"),
+        ("evaluation", "t2_straddle_max_coverage", "1", "1.0"),
+        ("evaluation", "t2_straddle_max_coverage", "0", "0.0"),
+        ("evaluation", "t2_straddle_max_coverage", "-0", "0.0"),
+        ("evaluation", "t2_straddle_max_coverage", "-0.0", "0.0"),
+        ("scoring", "bulk_rescore_max_budget_share", "1", "1.0"),
+        ("scoring", "bulk_rescore_max_budget_share", "0.40", "0.4"),
+    ],
+)
+def test_a_decimal_is_written_at_its_fields_scale(group: str, field: str, value: str, stored: str) -> None:
+    doc = defaults()
+    doc[group][field] = value
+    assert written(doc, group, field) == stored
+
+
+def test_one_value_writes_one_form() -> None:
+    short, long = defaults(), defaults()
+    short["evaluation"]["t2_straddle_max_coverage"] = "0.7"
+    long["evaluation"]["t2_straddle_max_coverage"] = "0.700"
+    short["llm"]["cap_usd"] = "2"
+    long["llm"]["cap_usd"] = "2.00"
+    assert canonical_json(Settings.model_validate(short).to_payload()) == canonical_json(
+        Settings.model_validate(long).to_payload()
+    )
+
+
+@pytest.mark.parametrize(
+    ("group", "field", "value", "stored"),
+    [
+        ("llm", "cap_usd", Decimal("1E+2"), "100.00"),
+        ("llm", "cap_usd", Decimal("1.0E+3"), "1000.00"),
+        ("llm", "min_bucket_capacity_usd", Decimal("1E-1"), "0.10"),
+        ("evaluation", "t2_straddle_max_coverage", Decimal("7E-1"), "0.7"),
+        ("evaluation", "t2_straddle_max_coverage", Decimal("-0E+2"), "0.0"),
+        ("scoring", "bulk_rescore_max_budget_share", Decimal("4E-1"), "0.4"),
+    ],
+)
+def test_a_python_decimal_never_writes_an_exponent(
+    group: str, field: str, value: Decimal, stored: str
+) -> None:
+    doc = defaults()
+    doc[group][field] = value
+    assert written(doc, group, field) == stored
+
+
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("1E-7")])
+def test_a_python_decimal_off_the_scale_is_refused(value: Decimal) -> None:
+    doc = defaults()
+    doc["evaluation"]["t2_straddle_max_coverage"] = value
+    _, issues = validate_fields(doc)
+    assert [(i.field, i.code) for i in issues] == [("payload.evaluation.t2_straddle_max_coverage", "invalid")]
+
+
+def test_industries_are_stored_case_folded_and_companies_as_company_keys() -> None:
+    doc = defaults()
+    doc["scope"]["industries_include"] = ["FinTech", "  Öffentlicher   Dienst "]
+    doc["scope"]["industries_exclude"] = ["GAMING"]
+    doc["scope"]["excluded_companies"] = ["Zalando SE", "Vitaservices GmbH & Co. KG", "acme"]
+    scope = Settings.model_validate(doc).scope
+    assert scope.industries_include == ["fintech", "offentlicher dienst"]
+    assert scope.industries_exclude == ["gaming"]
+    assert scope.excluded_companies == ["zalando", "vitaservices", "acme"]
+    # a stored key and a stored industry validate to themselves; the seed's empty lists stay empty
+    stored = Settings.model_validate(Settings.model_validate(doc).to_payload()).scope
+    assert (stored.excluded_companies, stored.industries_include) == (
+        scope.excluded_companies,
+        scope.industries_include,
+    )
+    assert company_key("zalando") == "zalando"
+    seeded = Settings().scope
+    assert (seeded.excluded_companies, seeded.industries_include, seeded.industries_exclude) == ([], [], [])
+
+
+def test_a_normaliser_is_applied_until_the_value_settles() -> None:
+    # `company_key` and `fold` are idempotent on ordinary text but not on a few inputs: the stored value is
+    # the one a second pass leaves as it is, so the payload validates to itself
+    assert company_key("Muster Germany Deutschland") == "muster germany" != company_key("muster germany")
+    assert fold("Bau" + chr(0xB4)) == "bau " != fold("bau ")
+    doc = defaults()
+    doc["scope"]["excluded_companies"] = ["Muster Germany Deutschland"]
+    doc["scope"]["industries_include"] = ["Bau" + chr(0xB4)]
+    scope = Settings.model_validate(doc).scope
+    assert (scope.excluded_companies, scope.industries_include) == (["muster"], ["bau"])
+
+
+def test_to_payload_is_a_fixed_point() -> None:
     doc = defaults()
     doc["llm"]["cap_usd"] = "250.5"
-    payload = Settings.model_validate(doc).to_payload()
-    llm = payload["llm"]
-    assert isinstance(llm, dict) and llm["cap_usd"] == "250.5"
+    doc["llm"]["min_bucket_capacity_usd"] = Decimal("1E-1")
+    doc["evaluation"]["t2_straddle_max_coverage"] = "-0"
+    doc["scoring"]["bulk_rescore_max_budget_share"] = "1"
+    doc["scope"]["industries_include"] = ["FinTech", "Bau" + chr(0xB4)]
+    doc["scope"]["excluded_companies"] = ["Zalando SE", "Muster Germany Deutschland"]
+    doc["scope"]["work_modes"] = ["onsite", "remote"]
+    once = Settings.model_validate(doc).to_payload()
+    twice = Settings.model_validate(once).to_payload()
+    assert canonical_json(twice) == canonical_json(once)
+
+
+def test_the_hard_filter_excludes_a_company_entered_by_its_name() -> None:
+    # §13.1 stores excluded companies as company keys; the M1 filter compares the job's `company_key` (§11.1)
+    doc = defaults()
+    doc["scope"]["excluded_companies"] = ["Zalando SE"]
+    settings = Settings.model_validate(doc)
+    view = RunSettings.from_settings(settings, settings_version_id=1, scope_version_id=1, interval_s=21_600)
+    assert view.scope.excluded_companies == frozenset({"zalando"})
+    assert scope_from_payload(settings.to_payload()["scope"]).excluded_companies == frozenset({"zalando"})  # type: ignore[arg-type]
+    zalando = facts(company_key=company_key("Zalando SE"))
+    assert evaluate(zalando, "", view.scope).reasons == ("excluded_company",)
+    assert evaluate(facts(company_key=company_key("Zalando Lounge GmbH")), "", view.scope).passed
 
 
 @pytest.mark.parametrize(

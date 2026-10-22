@@ -194,6 +194,17 @@ CASES: list[Any] = [
         bad("scope.locations[1].label", "conflict"),
         id="two labels with one location key",
     ),
+    # `remote-de` is the key of the remote-within-Germany cells (sources.base.REMOTE_DE), on or off
+    C(
+        {"scope.locations": [loc(0, label="Remote DE")]},
+        bad("scope.locations[0].label", "conflict"),
+        id="remote-de",
+    ),
+    C(
+        {"scope.locations": [loc(0, label="remote-de")], "scope.remote_within_germany": False},
+        bad("scope.locations[0].label", "conflict"),
+        id="remote-de with remote off",
+    ),
     # cross-field: at least one location, or remote_within_germany
     C(
         {"scope.remote_within_germany": False},
@@ -208,6 +219,30 @@ CASES: list[Any] = [
         id="include and exclude overlap",
     ),
     C({"scope.industries_include": ["Fintech"], "scope.industries_exclude": ["Gaming"]}, OK, id="disjoint"),
+    # industries are stored case-folded: a repeat once folded is a conflict
+    C(
+        {"scope.industries_include": ["FinTech", "Logistik", "fintech"]},
+        bad("scope.industries_include[2]", "conflict"),
+        id="industry twice once folded",
+    ),
+    C(
+        {"scope.industries_exclude": ["Gaming", " GAMING "]},
+        bad("scope.industries_exclude[1]", "conflict"),
+        id="excluded industry twice once folded",
+    ),
+    C(
+        {"scope.industries_include": ["Gaming"], "scope.industries_exclude": ["gaming", "GAMING"]},
+        [
+            ("payload.scope.industries_exclude[0]", "conflict"),
+            ("payload.scope.industries_exclude[1]", "conflict"),
+        ],
+        id="one issue per excluded entry",
+    ),
+    C(
+        {"scope.industries_include": ["Öffentlicher Dienst", "Offentlicher Dienst"]},
+        bad("scope.industries_include[1]", "conflict"),
+        id="industry twice without its umlaut",
+    ),
     # cross-field: seniority_range.min ≤ max
     C(
         {
@@ -268,6 +303,20 @@ CASES: list[Any] = [
         id="201",
     ),
     C({"scope.excluded_companies": [""]}, out("scope.excluded_companies[0]"), id="empty company key"),
+    # companies are stored as company keys (§8.3): a name without a key is invalid, a repeat once keyed is a
+    # conflict
+    C({"scope.excluded_companies": ["Zalando SE", "Vitaservices GmbH & Co. KG"]}, OK, id="company names"),
+    C({"scope.excluded_companies": ["   "]}, bad("scope.excluded_companies[0]"), id="company name of spaces"),
+    C(
+        {"scope.excluded_companies": ["Zalando SE", "Acme", "zalando"]},
+        bad("scope.excluded_companies[2]", "conflict"),
+        id="company twice once keyed",
+    ),
+    C(
+        {"scope.excluded_companies": ["Muster GmbH", "Muster AG"]},
+        bad("scope.excluded_companies[1]", "conflict"),
+        id="one company in two legal forms",
+    ),
     C({"scope.excluded_keywords": [f"wort{i}" for i in range(100)]}, OK, id="100 keywords"),
     C(
         {"scope.excluded_keywords": [f"wort{i}" for i in range(101)]},
@@ -433,6 +482,20 @@ CASES: list[Any] = [
     C({"llm.cap_usd": "100.005"}, bad("llm.cap_usd"), id="cap with three places"),
     C({"llm.cap_usd": "1e2"}, bad("llm.cap_usd"), id="cap in exponent form"),
     C({"llm.cap_usd": "NaN"}, bad("llm.cap_usd"), id="cap NaN"),
+    C({"llm.cap_usd": "-0"}, out("llm.cap_usd"), id="cap negative zero"),
+    C({"evaluation.t2_straddle_max_coverage": "0.700"}, OK, id="coverage with trailing zeros"),
+    C({"evaluation.t2_straddle_max_coverage": "-0"}, OK, id="coverage negative zero"),
+    C(
+        {"evaluation.t2_straddle_max_coverage": "0.75"},
+        bad("evaluation.t2_straddle_max_coverage"),
+        id="2 places",
+    ),
+    C(
+        {"scoring.bulk_rescore_max_budget_share": "0.45"},
+        bad("scoring.bulk_rescore_max_budget_share"),
+        id="share",
+    ),
+    C({"llm.overrun_buffer_usd": "2.000"}, OK, id="buffer with a zero third place"),
     C({"llm.cap_usd": "hundred"}, bad("llm.cap_usd"), id="cap word"),
     C({"evaluation.t2_straddle_max_coverage": 0.7}, bad("evaluation.t2_straddle_max_coverage"), id="float"),
     # strict JSON types and unknown keys

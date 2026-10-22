@@ -672,7 +672,10 @@ async def finalize_from_graph(deps: CollectDeps, owner: RunOwner, state: Collect
         await ledger.lock_run_owner(conn, owner)
         run = (await conn.execute(_RUN, {"run": owner.run_id})).one()
         settings = await load_run_settings(conn, int(run.settings_version_id))
-        if settings.scope.max_ad_age_days is None:  # `load_run_settings` refuses such a version
+        # Narrows the type only: `RunSettings.from_settings` always sets `max_ad_age_days` (a settings payload
+        # without it takes the default 30, `settings.model.Scope`); the field is `None` only in a scope read
+        # from a `scope_versions` payload, which no run settings hold.
+        if settings.scope.max_ad_age_days is None:
             raise InvariantViolation(
                 f"settings version {settings.settings_version_id} has no max_ad_age_days"
             )
