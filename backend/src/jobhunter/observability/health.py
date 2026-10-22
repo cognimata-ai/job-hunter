@@ -43,16 +43,16 @@ from collections.abc import Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
 from importlib import metadata
-from typing import Annotated, Any, Final, Literal
+from typing import Any, Final, Literal
 
 import sqlalchemy as sa
-from pydantic import BaseModel, PlainSerializer, field_validator
+from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter import __version__
+from jobhunter.api.models import DecimalOut, usd_micro
 from jobhunter.db.sql import pg_error, q
 from jobhunter.embeddings import NO_HEALTH, EmbedderClient, EmbedderHealth
 from jobhunter.heartbeats import HEARTBEAT_STALE_S
@@ -351,19 +351,6 @@ async def quota_health(conn: AsyncConnection) -> dict[Provider, QuotaOut | None]
             tokens=float(w.tokens),
         )
     return out
-
-
-def usd_micro(amount: Decimal) -> Decimal:
-    """A computed USD amount as the api shows it: at $0.000001 (the ledger's scale), rounded half-up."""
-    return amount.quantize(budget.USD_QUANTUM, rounding=ROUND_HALF_UP)
-
-
-def _fixed_point(amount: Decimal) -> str:
-    return format(amount, "f")
-
-
-# A decimal (a USD amount, a rate) in a response: a string in plain notation (`"93.100000"`), never a float.
-DecimalOut = Annotated[Decimal, PlainSerializer(_fixed_point, return_type=str)]
 
 
 class LlmSpendOut(BaseModel):

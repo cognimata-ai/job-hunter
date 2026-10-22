@@ -109,3 +109,17 @@ def test_serpapi_fallback_capacity_from_its_window() -> None:
     )
     fallback = proj["serpapi_fallback"]
     assert isinstance(fallback, dict) and fallback["state"] == "extrapolated_unvalidated"
+
+
+def test_no_adzuna_allowance_is_a_cadence_of_never() -> None:
+    # a monthly cap of 1 reserves its one unit (N = 0.9 x 1, rounded down): no allowance, so no cell is ever
+    # refreshed; `cadence_days` is None (JSON null), never an infinite float, in the projection and warning
+    capped = replace(seeded_run_settings(), quota=replace(SETTINGS, adzuna_cap_month=1, adzuna_cap_day=10))
+    warns, proj = quota_projections(capped, jsearch=None, adzuna=None, serpapi=None, cells=4, now=NOW)
+    assert proj["adzuna"] == {
+        "calls_per_day": 16.0,
+        "allowance_per_day": 0.0,
+        "cadence_days": None,
+        "cells": 4,
+    }
+    assert [(w.code, w.detail) for w in warns] == [("adzuna_rotation", {"cadence_days": None})]

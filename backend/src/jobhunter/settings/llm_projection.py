@@ -1,8 +1,8 @@
 """The LLM part of the settings dry-run (spec §6.8, §6.9.2, §13.5, §21; plan Task 16).
 
 **`central_cost_per_target`** is the §21.1/§21.2 central estimate of one target's scoring spend under a model
-policy: §21.1's token assumptions priced with `llm.pricing` (each prefix read from the cache; §21.3's cache
-writes are added per cycle in `llm_projection`), under §21.1's critic funnel:
+policy: §21.1's token assumptions priced with `llm.pricing` (each prefix read from the cache; the cache
+writes are added per cycle, `cache_writes_per_cycle`), under §21.1's critic funnel:
 - one generator call (2,200 uncached, 4,500 cached, 1,700 out: the slim outputs of U14);
 - a first critic round for `first_round_rate` (0.45) of the targets, at the policy's light critic effort for
   the `light_share` (35%) of rounds whose triggers are T2 and/or T8 alone, at the critic's effort otherwise
@@ -19,13 +19,25 @@ generator", triggers more reviews (critic rate 0.55, `q1 = 0.45`, `q2 = 0.35`, �
 is rounded half-up to $0.000001. It needs no input bound, so `PROMPT_OVERHEAD_TOKENS` plays no part. For the
 default policy B it is $0.052646 (§21.2: $0.0526), for A $0.079255 ($0.0793) and for C $0.019352 ($0.0194).
 
+**`cache_writes_per_cycle`** is §21.1's cache-write overhead of one score cycle (Ruling R16-2). The per-call
+costs charge every prefix as a read; a cycle's first call on each (model, effort) prefix writes it instead,
+which adds `w(m) = u(m) x 4,500 x (cache write - cache read)` per MTok (`u(m)`: the tokenizer uplift), in the
+price tier of a generator call. The prefixes are the distinct (model, effort) pairs of the generate, revise
+and critic nodes, one write each, plus the light critic prefix (the critic's model at
+`critic_light_effort`) in 80% of cycles when it is not one of them. That is $0.04923 for B (Sonnet/medium
+$0.01035, Opus/medium $0.0216, Opus/low 0.8 x $0.0216), $0.03888 for A (one Opus/medium prefix shared by
+every node, Opus/low in 80%) and $0.019303 for C (Haiku/medium $0.00067275, Sonnet/medium $0.01035,
+Sonnet/low 0.8 x $0.01035), rounded half-up to $0.000001.
+
 **`llm_projection`** gives the §6.9.2 bucket of the settings in the month of `now` (rate per hour and
 capacity), `ĉ`, the evaluation policy's projected critic rate, and §21.3's capacity of a month:
-`targets_per_month = floor(scoring share / (ĉ + 0.04923 / 10))`, the scoring share `A x (1 - reserve_frac)`,
-with §21.3's cache writes of config B ($0.04923 per cycle) over its ten-target cycles; `projected_month_spend`
-is what the targets that arrive and fit cost with those cache writes. A cap at or below the overrun buffer
-admits nothing (`A ≤ 0`): no target, no accrual. `cap_binding` is §6.8's `llm_cap_binding` condition: more
-arrivals than capacity, or no capacity at all.
+`targets_per_month = floor(scoring share / (ĉ + cache writes per cycle / min_cycle_targets))`, the scoring
+share `A x (1 - reserve_frac)`, with one cycle per `scoring.min_cycle_targets` targets (§6.9.2: a cycle starts
+when the bucket holds that many). With the defaults that is B's 1,617 (§21.3: about 1,620); A gives 1,119
+(about 1,120) and C 4,374 (about 4,370); `min_cycle_targets` 20 gives B 1,689 (§21.5: about +70) with about
+$4.16 of cache writes. `projected_month_spend` is what the targets that arrive and fit cost with their cache
+writes. A cap at or below the overrun buffer admits nothing (`A ≤ 0`): no target, no accrual. `cap_binding`
+is §6.8's `llm_cap_binding` condition: more arrivals than capacity, or no capacity at all.
 """
 
 from dataclasses import dataclass
@@ -40,9 +52,8 @@ from jobhunter.llm.pricing import Effort, Model
 from jobhunter.settings.model import ModelPolicy, Settings
 
 DEFAULT_ARRIVAL_PER_MONTH: Final = 3000  # §6.8: new targets a month when there is no target history
-CACHE_WRITE_USD_PER_CYCLE: Final = Decimal("0.04923")  # §21.1/§21.3, config B
-TARGETS_PER_CYCLE: Final = 10  # §21.1: "the model below assumes ten-target cycles"
-_CACHE_WRITE_PER_TARGET: Final = CACHE_WRITE_USD_PER_CYCLE / TARGETS_PER_CYCLE
+# §21.1: the light critic prefix is written "in about 80% of cycles"
+LIGHT_PREFIX_CYCLE_SHARE: Final = Decimal("0.8")
 _SECONDS_PER_HOUR: Final = 3600
 _TOKENS_PER_MTOK: Final = 1_000_000
 _ZERO: Final = Decimal(0)
@@ -88,13 +99,39 @@ WEAK_GENERATORS: Final[frozenset[Model]] = frozenset({"claude-haiku-5-5"})
 TOKENIZER_UPLIFT: Final = MappingProxyType({"claude-haiku-5-5": Decimal("1.3")})
 
 
+def _uplift(model: Model) -> Decimal:
+    return TOKENIZER_UPLIFT.get(model, Decimal(1))
+
+
+def _price(model: Model, tokens: CallTokens) -> pricing.Price:
+    """The price tier of a call of `tokens` on `model` (its prompt: uncached and cached input, uplifted)."""
+    return pricing.price_for(model, prompt_tokens=int(_uplift(model) * (tokens.uncached + tokens.cached)))
+
+
 def _call_usd(model: Model, tokens: CallTokens) -> Decimal:
     """The cost of one call of `tokens` on `model`, the cached prefix read (not rounded)."""
-    uplift = TOKENIZER_UPLIFT.get(model, Decimal(1))
+    uplift = _uplift(model)
     uncached, cached, output = (uplift * n for n in (tokens.uncached, tokens.cached, tokens.output))
-    price = pricing.price_for(model, prompt_tokens=int(uncached + cached))
+    price = _price(model, tokens)
     micro_usd = uncached * price.input + cached * price.cache_read + output * price.output
     return micro_usd / _TOKENS_PER_MTOK
+
+
+def _prefix_write_usd(model: Model) -> Decimal:
+    """`w(m)`: what writing a cached prefix on `model` adds to reading it (not rounded)."""
+    price = _price(model, GENERATE)
+    return _uplift(model) * GENERATE.cached * (price.cache_write - price.cache_read) / _TOKENS_PER_MTOK
+
+
+def cache_writes_per_cycle(model_policy: ModelPolicy) -> Decimal:
+    """The cache writes of one score cycle under `model_policy` (module docstring), rounded half-up to
+    $0.000001."""
+    nodes = model_policy.nodes
+    prefixes = {(choice.model, choice.effort) for choice in (nodes.generate, nodes.revise, nodes.critic)}
+    total = sum((_prefix_write_usd(model) for model, _ in prefixes), _ZERO)
+    if (nodes.critic.model, model_policy.critic_light_effort) not in prefixes:
+        total += LIGHT_PREFIX_CYCLE_SHARE * _prefix_write_usd(nodes.critic.model)
+    return total.quantize(budget.USD_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _critic_tokens(effort: Effort) -> CallTokens:
@@ -151,7 +188,8 @@ def llm_projection(
     """The LLM projection of `settings` in the month of `now` (module docstring)."""
     p = BudgetParams.from_payload(settings.to_payload())
     month = budget.month_of(now)
-    per_target = c_hat + _CACHE_WRITE_PER_TARGET
+    scoring = settings.scoring
+    per_target = c_hat + cache_writes_per_cycle(scoring.model_policy) / scoring.min_cycle_targets
     targets = int((scoring_share(p) / per_target).to_integral_value(rounding=ROUND_FLOOR))
     return LlmProjection(
         # A ≤ 0 accrues nothing; the capacity is then its floor, `min_bucket_capacity_usd`

@@ -11,16 +11,18 @@ import copy
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 import httpx
 import pytest
 import sqlalchemy as sa
-from jobhunter.db.seed import load_settings_v1
+from jobhunter.db.seed import content_hash, load_settings_v1
+from jobhunter.db.sql import q
 from jobhunter.llm.budget import BudgetParams, month_of
 from jobhunter.llm.spend_ledger import ensure_month
 from jobhunter.quota import dryrun as quota_dryrun
 from jobhunter.settings import dryrun
+from jobhunter.settings.derive import derived
 from jobhunter.settings.model import Settings
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -244,6 +246,43 @@ async def test_llm_rescore_counts_the_retained_revisions_and_uses_the_bulk_share
     body = await post(logged_in_client, with_(tuple_change, "scoring.bulk_rescore_max_budget_share", "0.5"))
     assert body["effects"] == ["budget", "collection", "llm_tuple", "scope"]
     assert warning(body, "llm_rescore")["bulk_budget_usd"] == "43.050000"
+
+
+async def test_no_adzuna_allowance_is_null_for_never(logged_in_client, clock) -> None:
+    """A monthly cap of 1 leaves Adzuna no allowance: the cadence is JSON null ("never"), in the projection
+    and in the rotation warning (8 cells x 4 runs = 32 calls a day against a daily cap of 10)."""
+    doc = with_(with_(base(), "quota.adzuna_cap_month", 1), "quota.adzuna_cap_day", 10)
+    body = await post(logged_in_client, doc)
+    assert body["projections"]["adzuna"] == {
+        "calls_per_day": 32.0,
+        "allowance_per_day": 0.0,
+        "cadence_days": None,
+        "cells": 8,
+    }
+    assert warning(body, "adzuna_rotation") == {"cadence_days": None}
+
+
+_STORED_POLICY: Final = q(
+    "INSERT INTO evaluation_policies (version_no, policy_hash, payload, projected_critic_rate) "
+    "SELECT max(version_no) + 1, :hash, :payload, :rate FROM evaluation_policies",
+    jsonb=["payload"],
+)
+
+
+async def test_a_stored_evaluation_policy_gives_its_own_critic_rate(logged_in_client, engine, clock) -> None:
+    """An evaluation policy that already has a row (an earlier version, M3's replay) is projected at its
+    stored rate, not at the 0.450 a new row gets (§11.7.4)."""
+    doc = with_(base(), "evaluation.t2_band", 3)
+    evaluation = derived(Settings.model_validate(doc)).evaluation
+    async with engine.begin() as conn:
+        params = {"hash": content_hash(evaluation), "payload": evaluation, "rate": Decimal("0.520")}
+        await conn.execute(_STORED_POLICY, params)
+    body = await post(logged_in_client, doc)
+    assert body["projections"]["critic_rate"] == "0.520"
+    assert body["projections"]["llm"]["projected_critic_rate"] == "0.520"
+    # another evaluation, with no row yet, still gets the default
+    body = await post(logged_in_client, with_(base(), "evaluation.t2_band", 4))
+    assert body["projections"]["critic_rate"] == "0.450"
 
 
 async def test_effect_dependent_projections(logged_in_client, clock) -> None:

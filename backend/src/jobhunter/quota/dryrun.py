@@ -12,7 +12,9 @@ Figures are rounded to 3 decimals in the projections and to 1 in the warning det
 - **Adzuna.** Every cell runs every run (its first page, §5.5.3): `calls_per_day = cells x runs per day`. The
   allowance per day is the tightest of the daily cap, the weekly cap over 7 days and the bucket's `N` over its
   window (§6.5); cells rotate (`cadence_days`) when the calls exceed it. `adzuna_rotation` is warned when the
-  calls exceed the daily cap (§6.8).
+  calls exceed the daily cap (§6.8). With no allowance at all (a monthly cap of 1 leaves a bucket of 0 units)
+  a cell is never refreshed: `cadence_days` is then `None` ("never"), in the projection and in the warning,
+  never an infinite float, which JSON cannot carry.
 - **Arbeitnow.** `page_cap = min(10, max(3, ceil(interval_h / 30) + 1))`, `expected_pages = interval_h / 37 +
   1` (page 1 holds about 37 h of postings); `arbeitnow_coverage_risk` when more pages are expected than
   allowed.
@@ -101,14 +103,16 @@ def _adzuna(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning]
     calls_per_day = cells / interval_days
     bucket_per_day = (w.limit_units - w.reserve_units) / _length_days(w)
     allowance_per_day = min(q.adzuna_cap_day, q.adzuna_cap_week / 7, bucket_per_day)
-    cadence_days = max(interval_days, cells / allowance_per_day) if allowance_per_day > 0 else float("inf")
+    # None: never (no allowance)
+    cadence_days = max(interval_days, cells / allowance_per_day) if allowance_per_day > 0 else None
     warns = []
     if calls_per_day > q.adzuna_cap_day:
-        warns.append(Warning("adzuna_rotation", cadence_days=round(cadence_days, 1)))
+        rotation = None if cadence_days is None else round(cadence_days, 1)
+        warns.append(Warning("adzuna_rotation", cadence_days=rotation))
     projection: dict[str, JSONValue] = {
         "calls_per_day": round(calls_per_day, 3),
         "allowance_per_day": round(allowance_per_day, 3),
-        "cadence_days": round(cadence_days, 3),
+        "cadence_days": None if cadence_days is None else round(cadence_days, 3),
         "cells": cells,
     }
     return warns, projection

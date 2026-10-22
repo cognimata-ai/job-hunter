@@ -478,7 +478,10 @@ export interface components {
             effects: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
             /** Errors */
             errors: components["schemas"]["FieldIssueOut"][];
-            /** Projections */
+            /**
+             * Projections
+             * @description The preview by part (§13.5). In `adzuna`, `cadence_days` is days or null; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed.
+             */
             projections: {
                 [key: string]: components["schemas"]["JsonValue"];
             };
@@ -1083,7 +1086,10 @@ export interface components {
         WarningOut: {
             /** Code */
             code: string;
-            /** Detail */
+            /**
+             * Detail
+             * @description The warning's details. In `adzuna_rotation`, `cadence_days` is days or null; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed.
+             */
             detail: {
                 [key: string]: components["schemas"]["JsonValue"];
             };

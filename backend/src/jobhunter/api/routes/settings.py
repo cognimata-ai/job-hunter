@@ -15,7 +15,7 @@ never a value of the payload.
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.api.deps import get_engine, require_session
@@ -33,6 +33,10 @@ router = APIRouter(
 log = get_logger("jobhunter.api.settings")
 
 _READ_ONLY: Final = q("SET TRANSACTION READ ONLY")
+_NEVER: Final = (
+    "null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is "
+    "ever refreshed"
+)
 
 
 class DryRunIn(BaseModel):
@@ -54,13 +58,17 @@ class WarningOut(BaseModel):
     """A warning a save must acknowledge by its `code` (§13.2), with its details."""
 
     code: str
-    detail: dict[str, JsonValue]
+    detail: dict[str, JsonValue] = Field(
+        description=f"The warning's details. In `adzuna_rotation`, `cadence_days` is days or null; {_NEVER}."
+    )
 
 
 class DryRunOut(BaseModel):
     errors: list[FieldIssueOut]
     warnings: list[WarningOut]
-    projections: dict[str, JsonValue]
+    projections: dict[str, JsonValue] = Field(
+        description=f"The preview by part (§13.5). In `adzuna`, `cadence_days` is days or null; {_NEVER}."
+    )
     effects: list[EffectClass]
 
 

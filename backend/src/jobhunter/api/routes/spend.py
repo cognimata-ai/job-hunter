@@ -8,7 +8,8 @@ ledger (`spend_totals`, `spend_by_model_effort_role`).
 - `counted`, `cap` and `headroom` (the scoring headroom, §6.9.4) are the month row's; `billed`, `ambiguous`
   and `reserved` (in flight) sum the ledger's tries;
 - `bucket` is the USD bucket (§6.9.2) at now, its capacity and its accrual per hour, on the row's cap and
-  buffer;
+  buffer; a cap at or below the buffer (`A ≤ 0`) accrues nothing, so the rate is never negative, as in the
+  dry-run's projection;
 - `c_hat` is §21.2's central cost per target of the active model policy (no attempt history before M3), and
   `projected_critic_rate` the active evaluation policy's;
 - `critic_rate_7d` and `bulk_operation` are `null` and `quarantined_batch_usd` is `"0"` until M3 scores
@@ -28,19 +29,20 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.api.deps import get_engine, require_session
+from jobhunter.api.models import DecimalOut, usd_micro
 from jobhunter.api.openapi import SESSION_RESPONSES
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams, Purpose
 from jobhunter.llm.spend_ledger import read_month_or_new, spend_by_model_effort_role, spend_totals
-from jobhunter.observability.health import DecimalOut, usd_micro
 from jobhunter.settings.llm_projection import central_cost_per_target
 from jobhunter.settings.model import Settings
 
 router = APIRouter(prefix="/api/system", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
 _SECONDS_PER_HOUR: Final = 3600
+_ZERO: Final = Decimal(0)
 _ACTIVE: Final = q(
     "SELECT v.payload, e.projected_critic_rate FROM active_config a "
     "JOIN settings_versions v ON v.id = a.settings_version_id "
@@ -103,7 +105,7 @@ async def _spend(conn: AsyncConnection) -> SpendOut:
         bucket=BucketOut(
             usd=usd_micro(row.bucket_usd),
             capacity=usd_micro(budget.bucket_capacity(on_row, month)),
-            rate_per_h=usd_micro(budget.rate_per_s(on_row, month) * _SECONDS_PER_HOUR),
+            rate_per_h=usd_micro(max(_ZERO, budget.rate_per_s(on_row, month)) * _SECONDS_PER_HOUR),
         ),
         c_hat=central_cost_per_target(settings.scoring.model_policy),
         critic_rate_7d=None,

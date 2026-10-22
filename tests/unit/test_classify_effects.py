@@ -201,6 +201,15 @@ def test_the_comparison_is_symmetric() -> None:
     )
 
 
+# Each derived row (§13.2) and the class whose activation creates or selects it (§13.3).
+ROW_CLASSES = {
+    "scope": "scope",
+    "model_policy": "llm_tuple",
+    "execution": "execution",
+    "evaluation": "evaluation_policy",
+}
+
+
 @pytest.mark.parametrize(
     ("active", "sent"),
     [
@@ -232,8 +241,12 @@ def test_the_comparison_is_symmetric() -> None:
     ],
 )
 def test_formatting_alone_is_no_change(active, sent) -> None:
-    """Ruling 1: the normal forms are compared, so a request that differs only in formatting gives `none`."""
+    """Ruling 1: the normal forms are compared, so a request that differs only in formatting gives `none`,
+    and no derived row (§13.2) changes either."""
     assert classify_effects(proposed(active), proposed(sent)) == NONE
+    before, after = derived(proposed(active)), derived(proposed(sent))
+    for row in ROW_CLASSES:
+        assert content_hash(getattr(before, row)) == content_hash(getattr(after, row)), row
 
 
 def test_keys_left_out_take_their_defaults() -> None:
@@ -248,15 +261,6 @@ def test_a_label_only_preset_change_is_an_llm_tuple_change() -> None:
     assert custom.scoring.model_policy.nodes == Settings().scoring.model_policy.nodes
     assert classify_effects(Settings(), custom) == LLM_TUPLE
     assert content_hash(derived(custom).model_policy) != content_hash(derived(Settings()).model_policy)
-
-
-# Each derived row (§13.2) and the class whose activation creates or selects it (§13.3).
-ROW_CLASSES = {
-    "scope": "scope",
-    "model_policy": "llm_tuple",
-    "execution": "execution",
-    "evaluation": "evaluation_policy",
-}
 
 
 @pytest.mark.parametrize(("path", "value", "classes"), CASES, ids=[case[0] for case in CASES])

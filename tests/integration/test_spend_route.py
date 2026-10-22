@@ -143,6 +143,15 @@ async def test_a_saved_cap_is_the_row_s_cap(logged_in_client, engine, now) -> No
     assert (body["cap"], body["headroom"]) == ("40.00", "36.100000")  # (40 - 2) x 0.95
 
 
+async def test_a_cap_at_or_below_the_buffer_accrues_nothing(logged_in_client, engine, now) -> None:
+    """`A = $1.00 - $2.00 < 0` admits nothing: the bucket rate is 0, never negative (as in the dry-run), the
+    capacity its floor and the headroom 0."""
+    await save_budget(engine, now=now, cap_usd="1.00")
+    body = await spend(logged_in_client)
+    assert (body["cap"], body["headroom"]) == ("1.00", "0.000000")
+    assert (body["bucket"]["rate_per_h"], body["bucket"]["capacity"]) == ("0.000000", "1.000000")
+
+
 async def test_spend_takes_no_lock_and_needs_a_session(
     api_client, logged_in_client, engine, op_owner, now
 ) -> None:
