@@ -177,7 +177,9 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
     rt: WorkerRuntime = context.additional_context["runtime"]
     failure: Exception | None = None
     try:
-        await run_retention_daily(rt.engine, rt.queue, rt.saver, now=utcnow(), epoch=rt.epoch)
+        await run_retention_daily(
+            rt.engine, rt.queue, rt.saver, cv_store=rt.cv_store, now=utcnow(), epoch=rt.epoch
+        )
     except FencedOut as fenced:
         if not fenced.worker_superseded:  # not this worker's own fence: a failure of the pass (F5 Minor 1)
             log.error("retention_daily_failed", error_class=type(fenced).__name__, owner=fenced.owner)
@@ -440,8 +442,30 @@ async def release_stalled_jobs(app: procrastinate.App, *, seconds_since_heartbea
     return released
 
 
-async def delete_finished_jobs(app: procrastinate.App, *, older_than_hours: int = 168) -> None:
-    """Delete the jobs that ended (succeeded, failed, cancelled, aborted) more than `older_than_hours` ago."""
-    await app.job_manager.delete_old_jobs(
-        nb_hours=older_than_hours, include_failed=True, include_cancelled=True, include_aborted=True
+# procrastinate's own `delete_old_jobs` query (procrastinate 3.10 `sql/queries.sql`: a job's age is that of
+# its latest event, on the database clock), bounded to `limit` jobs so that retention deletes in batches (M1
+# Carry-forward 17); the ids it deleted.
+_DELETE_FINISHED: Final = """\
+DELETE FROM procrastinate_jobs
+WHERE id IN (
+    SELECT job.id FROM (
+        SELECT DISTINCT ON (job.id) job.id, job.status, event.at AS latest_at
+            FROM procrastinate_jobs job
+            JOIN procrastinate_events event ON job.id = event.job_id
+            ORDER BY job.id, event.at DESC
+    ) AS job
+    WHERE job.status IN ('succeeded', 'failed', 'cancelled', 'aborted')
+      AND latest_at < NOW() - (%(nb_hours)s || 'HOUR')::INTERVAL
+    ORDER BY job.id
+    LIMIT %(limit)s
+)
+RETURNING id"""
+
+
+async def delete_finished_jobs(app: procrastinate.App, *, older_than_hours: int = 168, limit: int) -> int:
+    """Delete at most `limit` jobs that ended (succeeded, failed, cancelled, aborted) more than
+    `older_than_hours` ago, on procrastinate's own pool; how many it deleted."""
+    deleted = await app.connector.execute_query_all_async(
+        query=_DELETE_FINISHED, nb_hours=older_than_hours, limit=limit
     )
+    return len(deleted)

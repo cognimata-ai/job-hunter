@@ -25,12 +25,14 @@ from jobhunter.graphs.profile.graph import (
     LLM_NODE_TIMEOUT,
     LLM_NODE_TRACE,
     NODE_TIMEOUTS,
+    THREAD_PREFIXES,
     ProfileGraphs,
     add_llm_node,
     build_profile_graphs,
     invoke_config,
     sanitized,
     thread_id,
+    thread_operation_id,
 )
 from jobhunter.graphs.profile.state import (
     ProfileState,
@@ -189,6 +191,39 @@ def test_every_execution_has_a_thread_of_its_own() -> None:
     assert thread_id("t", 7, 42, 1) == "profile-7-t42-a1"
     assert thread_id("p", 7, 43, 2) == "profile-7-p43-a2"
     assert thread_id("q", 9, 44, 0) == "queries-9-q44-a0"
+
+
+@pytest.mark.parametrize("kind", ["t", "p", "q"])
+@pytest.mark.parametrize(
+    ("subject_id", "operation_id", "attempts"), [(7, 42, 0), (1, 1, 10), (10**12, 2**62, 3)]
+)
+def test_a_thread_name_gives_back_the_operation_it_was_written_with(
+    kind: Any, subject_id: int, operation_id: int, attempts: int
+) -> None:
+    """Task 23: the `profile_checkpoints` retention rule reads a thread's operation from its name, the inverse
+    of `thread_id`, and only from a name `thread_id` writes."""
+    name = thread_id(kind, subject_id, operation_id, attempts)
+    assert thread_operation_id(name) == operation_id
+    assert THREAD_PREFIXES == {"profile", "queries"} and name.split("-", 1)[0] in THREAD_PREFIXES
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "run-7-a1",  # a run's thread
+        "profile-7-q42-a0",  # a proposal's kind under the profile prefix
+        "queries-7-p42-a0",
+        "profile-7-t42",  # no attempt
+        "profile-7-t42-a0-x",
+        "profile-07-t42-a0",  # not as `str(int)` writes it
+        "profile-7-t042-a0",
+        "profile--7-t42-a0",
+        "Profile-7-t42-a0",
+        "",
+    ],
+)
+def test_any_other_name_carries_no_operation(name: str) -> None:
+    assert thread_operation_id(name) is None
 
 
 def test_the_invoke_config_has_the_section_9_1_shape() -> None:

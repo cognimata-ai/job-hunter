@@ -7,7 +7,9 @@ unpurged response still references (§7.7 deduplication) is kept with its reques
 expires: deleting it would leave the newer row without a body (its CHECK refuses that).
 """
 
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -16,6 +18,7 @@ from jobhunter.db.sql import q
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.privacy import retention
 from jobhunter.privacy.retention import RULES, run_retention_daily
+from jobhunter.profile.storage import CvStore
 
 from tests.support.collect import (
     RETENTION_SHIFT,
@@ -37,8 +40,12 @@ CURRENT_EPOCH = 1
 
 
 async def retention_at(engine, queue_app, migrated, now) -> dict[str, int]:
-    async with open_saver(migrated.dsn("app")) as saver:
-        return await run_retention_daily(engine, queue_app, saver, now=now, epoch=CURRENT_EPOCH)
+    """A pass on an empty CV store of its own (M2 Task 23): these rules delete no CV file."""
+    with tempfile.TemporaryDirectory() as cv_store_dir:
+        async with open_saver(migrated.dsn("app")) as saver:
+            return await run_retention_daily(
+                engine, queue_app, saver, cv_store=CvStore(Path(cv_store_dir)), now=now, epoch=CURRENT_EPOCH
+            )
 
 
 async def ids(engine, table: str) -> set[int]:

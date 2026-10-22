@@ -65,10 +65,11 @@ Task 20 adds the query proposal's side:
 - `QUERIES_USAGE`: the usage that stream reports, within the reservation of any proposal for that profile.
 
 Task 21 adds the confirm's side:
-- `make_ready_draft(client, op_runner, upload, *, text=SYNTHETIC_CV, edit=None)`: a pasted `text` through the
-  real pipeline (the text phase, the approval through `POST …/text-review` with a key of its own, the
-  extraction on the synthetic stream), `ready`; with `edit`, its profile changed by `edit` and saved through
-  `PUT /drafts/{id}` (200 required). Its id. The `ready_draft` fixture is one such draft;
+- `make_ready_draft(client, op_runner, upload, *, text=SYNTHETIC_CV, edit=None)`: a pasted `text` (or, as
+  bytes, an uploaded file: Task 23's PDFs) through the real pipeline (the text phase, the approval through
+  `POST …/text-review` with a key of its own, the extraction on the synthetic stream), `ready`; with `edit`,
+  its profile changed by `edit` and saved through `PUT /drafts/{id}` (200 required). Its id. The
+  `ready_draft` fixture is one such draft;
 - `active_profile(engine)`: `active_config`'s `(profile_version_id, llm_tuple_id)`;
 - `ranking_generation(engine)`: the ranking generation (`ranking_state`).
 """
@@ -897,7 +898,7 @@ async def make_ready_draft(
     op_runner: OpRunner,
     upload: Upload,
     *,
-    text: str = SYNTHETIC_CV,
+    text: str | bytes = SYNTHETIC_CV,
     edit: ProfileEdit | None = None,
 ) -> int:
     """A `ready` draft of the pasted `text` through the real pipeline, its profile saved edited by `edit` when

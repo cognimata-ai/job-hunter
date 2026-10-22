@@ -517,6 +517,25 @@ def test_only_names_the_store_made_are_read_or_deleted(tmp_path: Path, bad: str)
         store.delete(bad)
 
 
+def test_stored_lists_the_files_the_store_wrote_with_their_times(tmp_path: Path) -> None:
+    """Task 23 (`cv_store_orphans`): the names `write` made, each with its modification time; a file of
+    another name, a directory or a symbolic link under a store name is not the store's."""
+    import os
+    import uuid
+    from datetime import UTC, datetime
+
+    store = CvStore(tmp_path)
+    first, second = (store.write(data, [KEY]).storage_path for data in (b"erste", b"zweite"))
+    os.utime(tmp_path / first, (1_700_000_000, 1_700_000_000))
+    (tmp_path / "notes.txt").write_text("not the store's")
+    (tmp_path / f"{uuid.uuid4()}.bin").mkdir()
+    (tmp_path / f"{uuid.uuid4()}.bin").symlink_to(tmp_path / second)
+    listed = {name.storage_path: name.modified_at for name in store.stored()}
+    assert set(listed) == {first, second}
+    assert listed[first] == datetime.fromtimestamp(1_700_000_000, UTC)
+    assert [name.storage_path for name in store.stored()] == sorted([first, second])
+
+
 def test_a_write_needs_a_key(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="key"):
         CvStore(tmp_path).write(b"x", [])

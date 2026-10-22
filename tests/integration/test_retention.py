@@ -8,13 +8,22 @@ from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.graph import build_noop_collect_graph
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.privacy.retention import RULES, run_retention_daily
+from jobhunter.profile.storage import CvStore
 from jobhunter.worker.tasks import defer_in_tx
 from procrastinate.jobs import Status
 
 pytestmark = pytest.mark.integration
 
 
-async def test_m0_rules_delete_only_expired_rows(engine, current_epoch, queue_app, migrated) -> None:
+@pytest.fixture
+def cv_store(cv_store_dir) -> CvStore:
+    """The CV store of a pass (M2 Task 23): an empty directory, as these rules delete no CV file."""
+    return CvStore(cv_store_dir)
+
+
+async def test_m0_rules_delete_only_expired_rows(
+    engine, current_epoch, queue_app, cv_store, migrated
+) -> None:
     now = utcnow()
     async with engine.begin() as c:
         for ago in (31, 29):
@@ -41,7 +50,9 @@ async def test_m0_rules_delete_only_expired_rows(engine, current_epoch, queue_ap
             {"e": now - timedelta(seconds=1), "f": now + timedelta(days=1)},
         )
     async with open_saver(migrated.dsn("app")) as saver:
-        report = await run_retention_daily(engine, queue_app, saver, now=now, epoch=current_epoch)
+        report = await run_retention_daily(
+            engine, queue_app, saver, cv_store=cv_store, now=now, epoch=current_epoch
+        )
     assert (report["login_attempts"], report["alerts"], report["api_idempotency"]) == (1, 1, 1)
     async with engine.connect() as c:
         assert (await c.execute(sa.text("SELECT count(*) FROM login_attempts"))).scalar_one() == 1
@@ -88,9 +99,11 @@ async def insert_run(c, status: str, *, queued, finished=None, attempts: int = 0
 CURRENT_EPOCH = 1
 
 
-async def retention_at(engine, queue_app, migrated, now, *, epoch: int = CURRENT_EPOCH) -> dict[str, int]:
+async def retention_at(
+    engine, queue_app, migrated, now, *, cv_store: CvStore, epoch: int = CURRENT_EPOCH
+) -> dict[str, int]:
     async with open_saver(migrated.dsn("app")) as saver:
-        return await run_retention_daily(engine, queue_app, saver, now=now, epoch=epoch)
+        return await run_retention_daily(engine, queue_app, saver, cv_store=cv_store, now=now, epoch=epoch)
 
 
 def test_rules_name_every_report_key_with_its_window() -> None:
@@ -107,11 +120,18 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         "embeddings": timedelta(0),
         "coverage_intervals": timedelta(days=397),
         "fetch_requests": timedelta(days=397),
+        # M2 Task 23: the profile rules (their own tests are in test_retention_m2.py)
+        "draft_content": timedelta(days=30),
+        "cv_files": timedelta(days=30),
+        "cv_store_orphans": timedelta(days=1),
+        "eval_runs": timedelta(days=397),
         "checkpoints": timedelta(days=14),
+        "profile_checkpoints": timedelta(days=14),
         "runs": timedelta(days=397),  # 13 months, never fewer days than any 13 calendar months
         "procrastinate_jobs": timedelta(days=7),
     }
     names = [rule.name for rule in RULES]
+    assert names.index("draft_content") < names.index("cv_files")  # the content, then the file
     assert names.index("checkpoints") < names.index("runs")  # threads go while their attempts still name them
     # A dependency is named explicitly (ruling T21-f), and only ever on a rule that runs before it.
     assert {rule.name: rule.depends_on for rule in RULES if rule.depends_on} == {
@@ -123,7 +143,7 @@ def test_rules_name_every_report_key_with_its_window() -> None:
 
 
 async def test_sessions_and_operations_go_one_day_after_expiry_and_30_days_after_they_finish(
-    engine, current_epoch, queue_app, migrated
+    engine, current_epoch, queue_app, cv_store, migrated
 ) -> None:
     now = utcnow() + SHIFT
     async with engine.begin() as c:
@@ -160,7 +180,7 @@ async def test_sessions_and_operations_go_one_day_after_expiry_and_30_days_after
                 ),
                 {"k": key, "s": status, "e": error, "created": now - timedelta(days=60), "f": finished},
             )
-    report = await retention_at(engine, queue_app, migrated, now)
+    report = await retention_at(engine, queue_app, migrated, now, cv_store=cv_store)
     assert (report["sessions"], report["operations"]) == (2, 2)
     async with engine.connect() as c:
         kept = (await c.execute(sa.text("SELECT token_hmac FROM sessions"))).scalars().all()
@@ -170,7 +190,7 @@ async def test_sessions_and_operations_go_one_day_after_expiry_and_30_days_after
 
 
 async def test_runs_go_with_their_attempts_after_13_months_and_a_live_run_never_goes(
-    engine, current_epoch, queue_app, migrated
+    engine, current_epoch, queue_app, cv_store, migrated
 ) -> None:
     now = utcnow() + SHIFT
     old, recent = now - timedelta(days=398), now - timedelta(days=396)
@@ -180,7 +200,7 @@ async def test_runs_go_with_their_attempts_after_13_months_and_a_live_run_never_
         missed_old = await insert_run(c, "missed", queued=old, slot=old)
         skipped_recent = await insert_run(c, "skipped_overlap", queued=recent, slot=recent)
         queued_old = await insert_run(c, "queued", queued=old - timedelta(days=30))  # live: never deleted
-    report = await retention_at(engine, queue_app, migrated, now)
+    report = await retention_at(engine, queue_app, migrated, now, cv_store=cv_store)
     assert report["runs"] == 2
     async with engine.connect() as c:
         left = (await c.execute(sa.text("SELECT id FROM runs ORDER BY id"))).scalars().all()
@@ -191,7 +211,7 @@ async def test_runs_go_with_their_attempts_after_13_months_and_a_live_run_never_
 
 
 async def test_checkpoint_threads_of_runs_finished_over_14_days_ago_are_deleted(
-    engine, current_epoch, queue_app, migrated
+    engine, current_epoch, queue_app, cv_store, migrated
 ) -> None:
     now = utcnow() + SHIFT
     async with engine.begin() as c:
@@ -206,8 +226,12 @@ async def test_checkpoint_threads_of_runs_finished_over_14_days_ago_are_deleted(
                 {"configurable": {"thread_id": thread}},
                 durability="sync",
             )
-        first = await run_retention_daily(engine, queue_app, saver, now=now, epoch=current_epoch)
-        second = await run_retention_daily(engine, queue_app, saver, now=now, epoch=current_epoch)
+        first = await run_retention_daily(
+            engine, queue_app, saver, cv_store=cv_store, now=now, epoch=current_epoch
+        )
+        second = await run_retention_daily(
+            engine, queue_app, saver, cv_store=cv_store, now=now, epoch=current_epoch
+        )
     assert (first["checkpoints"], second["checkpoints"]) == (1, 0)  # threads with rows left, so once
     async with engine.connect() as c:
         for table in ("checkpoints", "checkpoint_writes", "checkpoint_blobs"):
@@ -222,8 +246,8 @@ async def test_checkpoint_threads_of_runs_finished_over_14_days_ago_are_deleted(
         ).scalar_one() == 2  # runs stay 13 months
 
 
-async def test_finished_procrastinate_jobs_go_after_7_days_and_report_minus_one(
-    engine, current_epoch, queue_app, migrated
+async def test_finished_procrastinate_jobs_go_after_7_days_and_are_counted(
+    engine, current_epoch, queue_app, cv_store, migrated
 ) -> None:
     async with engine.begin() as c:
         old = await defer_in_tx(c, "retention_daily", timestamp=1)
@@ -243,8 +267,8 @@ async def test_finished_procrastinate_jobs_go_after_7_days_and_report_minus_one(
             sa.text("UPDATE procrastinate_events SET at = now() - interval '8 days' WHERE job_id = :j"),
             {"j": old},
         )
-    report = await retention_at(engine, queue_app, migrated, utcnow())
-    assert report["procrastinate_jobs"] == -1  # procrastinate reports no count
+    report = await retention_at(engine, queue_app, migrated, utcnow(), cv_store=cv_store)
+    assert report["procrastinate_jobs"] == 1  # M2 Task 23: the batches count what they delete
     async with engine.connect() as c:
         left = (await c.execute(sa.text("SELECT id FROM procrastinate_jobs"))).scalars().all()
     assert left == [recent]
@@ -254,7 +278,7 @@ async def test_finished_procrastinate_jobs_go_after_7_days_and_report_minus_one(
 
 
 async def test_a_failing_rule_is_alerted_and_the_rules_after_it_still_run(
-    engine, current_epoch, queue_app, migrated, monkeypatch, caplog
+    engine, current_epoch, queue_app, cv_store, migrated, monkeypatch, caplog
 ) -> None:
     from jobhunter.db.sql import q
     from jobhunter.privacy import retention
@@ -285,7 +309,7 @@ async def test_a_failing_rule_is_alerted_and_the_rules_after_it_still_run(
     monkeypatch.setitem(
         retention._DELETES, "login_attempts", q("DELETE FROM no_such_table WHERE at < :cutoff")
     )
-    report = await retention_at(engine, queue_app, migrated, now)
+    report = await retention_at(engine, queue_app, migrated, now, cv_store=cv_store)
     assert report["login_attempts"] == -1
     assert report["alerts"] == 1 and report["checkpoints"] == 0  # the rules after it ran
     async with engine.connect() as c:
@@ -297,7 +321,7 @@ async def test_a_failing_rule_is_alerted_and_the_rules_after_it_still_run(
         ("login_attempts", "ProgrammingError")
     ]
     monkeypatch.undo()
-    report = await retention_at(engine, queue_app, migrated, now)
+    report = await retention_at(engine, queue_app, migrated, now, cv_store=cv_store)
     assert report["login_attempts"] == 1  # the rule works again, and its alert is resolved
     async with engine.connect() as c:
         assert (await c.execute(open_failure)).first() is None
@@ -307,7 +331,7 @@ async def test_a_failing_rule_is_alerted_and_the_rules_after_it_still_run(
 
 
 async def test_a_failed_checkpoint_rule_keeps_the_runs_that_name_its_threads(
-    engine, current_epoch, queue_app, migrated, monkeypatch, caplog
+    engine, current_epoch, queue_app, cv_store, migrated, monkeypatch, caplog
 ) -> None:
     from tests.support.logs import logged
 
@@ -347,7 +371,9 @@ async def test_a_failed_checkpoint_rule_keeps_the_runs_that_name_its_threads(
             raise RuntimeError("checkpoint store unavailable")
 
         monkeypatch.setattr(saver, "adelete_thread", unavailable)
-        first = await run_retention_daily(engine, queue_app, saver, now=now, epoch=current_epoch)
+        first = await run_retention_daily(
+            engine, queue_app, saver, cv_store=cv_store, now=now, epoch=current_epoch
+        )
         runs, attempts, checkpoints = await left()
         assert (first["checkpoints"], first["runs"], first["login_attempts"]) == (-1, -1, 1)
         assert (runs, attempts) == (1, 1) and checkpoints > 0  # the run and the attempt that names the thread
@@ -360,7 +386,9 @@ async def test_a_failed_checkpoint_rule_keeps_the_runs_that_name_its_threads(
             ("runs", ["checkpoints"])
         ]
         monkeypatch.undo()
-        second = await run_retention_daily(engine, queue_app, saver, now=now, epoch=current_epoch)
+        second = await run_retention_daily(
+            engine, queue_app, saver, cv_store=cv_store, now=now, epoch=current_epoch
+        )
     assert (second["checkpoints"], second["runs"]) == (1, 1)
     assert await left() == (0, 0, 0)
     async with engine.connect() as c:
@@ -373,7 +401,7 @@ _TAKEOVER = sa.text("UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1
 
 
 async def test_a_pass_under_a_superseded_epoch_writes_nothing(
-    engine, current_epoch, queue_app, migrated, caplog
+    engine, current_epoch, queue_app, cv_store, migrated, caplog
 ) -> None:
     """A superseded worker's pass (a newer worker took over before it ran) deletes no row, writes no alert
     and stops at its first rule: `FencedOut`, logged `retention_fenced`, no `retention_done`. The current
@@ -410,20 +438,20 @@ async def test_a_pass_under_a_superseded_epoch_writes_nothing(
         "(SELECT count(*) FROM alerts), (SELECT count(*) FROM alerts WHERE resolved_at IS NULL)"
     )
     with pytest.raises(FencedOut) as fenced:
-        await retention_at(engine, queue_app, migrated, now, epoch=current_epoch)
+        await retention_at(engine, queue_app, migrated, now, epoch=current_epoch, cv_store=cv_store)
     assert fenced.value.owner == "worker_epoch"
     async with engine.connect() as c:
         assert tuple((await c.execute(left)).one()) == (1, 1, 2, 1)  # nothing deleted, the alert still open
     assert [e["rule"] for e in logged(caplog, "retention_fenced")] == ["api_idempotency"]
     assert logged(caplog, "retention_done") == []
-    report = await retention_at(engine, queue_app, migrated, now, epoch=current_epoch + 1)
+    report = await retention_at(engine, queue_app, migrated, now, epoch=current_epoch + 1, cv_store=cv_store)
     assert (report["api_idempotency"], report["login_attempts"], report["alerts"]) == (1, 1, 1)
     async with engine.connect() as c:
         assert tuple((await c.execute(left)).one()) == (0, 0, 1, 0)  # the open alert resolved by this pass
 
 
 async def test_the_checkpoint_and_job_purges_of_a_superseded_epoch_delete_nothing(
-    engine, current_epoch, queue_app, migrated, monkeypatch
+    engine, current_epoch, queue_app, cv_store, migrated, monkeypatch
 ) -> None:
     """The two rules that delete through another pool (the saver's threads, procrastinate's finished jobs)
     hold the fence while they delete: under a superseded epoch neither deletes anything."""
@@ -464,13 +492,15 @@ async def test_the_checkpoint_and_job_purges_of_a_superseded_epoch_delete_nothin
         for rule in [r for r in RULES if r.name in ("checkpoints", "procrastinate_jobs")]:
             monkeypatch.setattr(retention, "RULES", (rule,))
             with pytest.raises(FencedOut):
-                await run_retention_daily(engine, queue_app, saver, now=now, epoch=current_epoch)
+                await run_retention_daily(
+                    engine, queue_app, saver, cv_store=cv_store, now=now, epoch=current_epoch
+                )
             async with engine.connect() as c:
                 assert tuple((await c.execute(left, {"t": thread})).one()) == before, rule.name
 
 
 async def test_an_alert_write_after_a_takeover_is_refused(
-    engine, current_epoch, queue_app, migrated, monkeypatch
+    engine, current_epoch, queue_app, cv_store, migrated, monkeypatch
 ) -> None:
     """A takeover that commits between a rule's transaction and the write of its alert outcome: the alert
     write is fenced too, so the superseded pass resolves nothing and stops."""
@@ -495,7 +525,7 @@ async def test_an_alert_write_after_a_takeover_is_refused(
 
     monkeypatch.setattr(retention, "_apply", apply_then_taken_over)
     with pytest.raises(FencedOut):
-        await retention_at(engine, queue_app, migrated, now, epoch=current_epoch)
+        await retention_at(engine, queue_app, migrated, now, epoch=current_epoch, cv_store=cv_store)
     async with engine.connect() as c:
         still_open = await c.execute(sa.text("SELECT count(*) FROM alerts WHERE resolved_at IS NULL"))
         assert still_open.scalar_one() == 1

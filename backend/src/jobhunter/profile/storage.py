@@ -11,6 +11,8 @@ which no web root serves:
 - `read(storage_path, keys)` opens a file with any of `keys` (a rotation); `delete(storage_path)` removes one,
   and a missing file is no error (retention and a failed upload may race to it). Both accept only a name
   `write` makes, never a path, so no caller value can reach outside the root;
+- `stored()` lists the files `write` made, each with its modification time (the `cv_store_orphans` retention
+  rule, Task 23: a file no `cv_files` row names); any other entry of the root is not the store's;
 - `encrypt_text(text, keys, *, cv_file_id)` and `decrypt_text(blob, keys, *, cv_file_id)` seal a CV text for
   its `cv_files` row (`raw_text_enc`: a pasted text, or the text docparse extracted) with the associated data
   `b"cv_text:%d" % cv_file_id`, so a text moved to another row does not open. A text never becomes a file.
@@ -26,6 +28,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
@@ -42,6 +45,14 @@ _CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os
 class StoredFile:
     storage_path: str
     sha256: bytes
+
+
+@dataclass(frozen=True)
+class StoredName:
+    """A file of the store: its name (`cv_files.storage_path`) and when it was last written (UTC)."""
+
+    storage_path: str
+    modified_at: datetime
 
 
 def _file_aad(storage_path: str) -> bytes:
@@ -88,6 +99,23 @@ class CvStore:
     def delete(self, storage_path: str) -> None:
         """Remove a stored file; one that is already gone is fine."""
         self._path(storage_path).unlink(missing_ok=True)
+
+    def stored(self) -> list[StoredName]:
+        """The files of the store that `write` made, by name: regular files with a name of its form (a
+        symbolic link or a directory is not one); one removed while the root is read is left out."""
+        found: list[StoredName] = []
+        with os.scandir(self.root) as entries:
+            for entry in entries:
+                if not _STORAGE_NAME.fullmatch(entry.name):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    modified = entry.stat(follow_symlinks=False).st_mtime
+                except FileNotFoundError:
+                    continue
+                found.append(StoredName(entry.name, datetime.fromtimestamp(modified, UTC)))
+        return sorted(found, key=lambda name: name.storage_path)
 
     def encrypt_text(self, text: str, keys: Sequence[bytes], *, cv_file_id: int) -> bytes:
         """`text` (UTF-8) sealed under `keys[0]` for the `cv_files` row `cv_file_id`."""

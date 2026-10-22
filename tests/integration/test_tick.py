@@ -405,8 +405,9 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     order: list[str] = []
     seen: list[reconcilers.ReconcileContext] = []
 
-    async def retention_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def retention_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append(f"retention@{epoch}")
+        assert cv_store is runtime.cv_store  # M2 Task 23: the worker's CV store, whose files two rules delete
 
     async def probe(ctx: reconcilers.ReconcileContext) -> int:
         order.append("daily")
@@ -418,7 +419,13 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     monkeypatch.setattr(retention, "run_retention_daily", retention_pass)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        saver=object(),
+        cv_store=object(),
+        epoch=3,
+        embedder=None,
+        shutdown=ShutdownState(),
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
@@ -436,7 +443,7 @@ async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconciler
 
     order: list[str] = []
 
-    async def fenced_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def fenced_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append("retention")
         raise FencedOut(owner="worker_epoch")
 
@@ -448,7 +455,13 @@ async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconciler
     reconcilers.reconciler("probe", "daily")(probe)
     monkeypatch.setattr(retention, "run_retention_daily", fenced_pass)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        saver=object(),
+        cv_store=object(),
+        epoch=3,
+        embedder=None,
+        shutdown=ShutdownState(),
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)  # returns: the job ends quietly
@@ -466,7 +479,7 @@ async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops
 
     order: list[str] = []
 
-    async def fenced_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def fenced_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append("retention")
         raise FencedOut(owner="purge_fence")
 
@@ -481,6 +494,7 @@ async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops
         engine=engine,
         queue=queue_app,
         saver=object(),
+        cv_store=object(),
         epoch=current_epoch,  # the daily cadence's own fence admits it
         embedder=None,
         shutdown=ShutdownState(),
@@ -523,7 +537,7 @@ async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
 
     order: list[str] = []
 
-    async def failing_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def failing_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append("retention")
         raise RuntimeError("a detail that must not be logged")
 
@@ -538,6 +552,7 @@ async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
         engine=engine,
         queue=queue_app,
         saver=object(),
+        cv_store=object(),
         epoch=current_epoch,
         embedder=None,
         shutdown=ShutdownState(),
