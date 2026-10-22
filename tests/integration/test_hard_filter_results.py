@@ -16,6 +16,7 @@ from jobhunter.run_settings import ScopeSettings, SeniorityRange
 from jobhunter.scoring import filters
 from jobhunter.scoring.filters import DetFacts, HardFilterResult
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
+from jobhunter.settings import scope_apply
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.worker import main as worker_main
@@ -102,6 +103,30 @@ async def add_pending_scope(engine: AsyncEngine, **changes: Any) -> int:
     return pending
 
 
+async def test_a_result_written_under_algorithm_version_1_is_stale(
+    engine, current_epoch, queue_app, job_factory
+) -> None:
+    """Final review FR-16: the job side's fixed-point company key and industry (FR-9) changed the hard
+    filter's result function, so `DET_ALGORITHM_VERSION` is "2" (§11.11). A row written under "1" is stale:
+    the scope apply counts its job incomplete, and the completeness reconciler recomputes it."""
+    assert DET_ALGORITHM_VERSION == "2"
+    job = (await job_factory(native_id="v1")).job_id
+    scope_id = await active_scope_id(engine)
+    async with engine.begin() as conn:
+        await filters.write_result(
+            conn, job, scope_id, HardFilterResult(True, ()), inputs_hash=await job_hash(engine, job)
+        )
+        await conn.execute(sa.text("UPDATE hard_filter_results SET det_algorithm_version = '1'"))
+    async with engine.connect() as conn:
+        assert await scope_apply.incomplete_jobs(conn, scope_id) == 1
+    reconcile = r.REGISTRY["hard_filter_completeness"][1]
+    assert await reconcile(ctx(engine, queue_app)) == 1
+    assert (await row(engine, job, scope_id)).det_algorithm_version == "2"
+    async with engine.connect() as conn:
+        assert await scope_apply.incomplete_jobs(conn, scope_id) == 0
+    assert await reconcile(ctx(engine, queue_app)) == 0
+
+
 async def test_write_recompute_and_reconciler(engine, current_epoch, queue_app, job_factory) -> None:
     job = (await job_factory(native_id="a")).job_id
     scope_id = await active_scope_id(engine)
@@ -113,7 +138,7 @@ async def test_write_recompute_and_reconciler(engine, current_epoch, queue_app, 
         True,
         [],
         h1,
-        "1",
+        "2",
     )
 
     # The job's det facts change (its hash moves): the reconciler recomputes the row from the facts now.
