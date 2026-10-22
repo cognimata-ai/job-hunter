@@ -367,11 +367,14 @@ _WRITE: Final = q(
     "det_algorithm_version = EXCLUDED.det_algorithm_version, computed_at = EXCLUDED.computed_at"
 )
 # The scopes whose results are required: the active one and, while a flip is being prepared, the pending
-# one, with `active_config` held `FOR SHARE` (§9.1 lock order: the first lock).
-_ACTIVE_SCOPES: Final = q(
-    "SELECT s.id, s.payload FROM active_config a "
-    "JOIN scope_versions s ON s.id IN (a.scope_version_id, a.pending_scope_version_id) "
-    "WHERE a.id = 1 ORDER BY s.id FOR SHARE OF a"
+# one, with `active_config` held `FOR SHARE` (§9.1 lock order: the first lock). The scope rows are read by a
+# statement of their own: joined to the lock, a statement that waited behind a settings save would look for
+# the save's new pending scope in the snapshot of its own start, which lacks it (`settings/active.py`).
+_LOCK_SCOPE_POINTERS: Final = q(
+    "SELECT scope_version_id, pending_scope_version_id FROM active_config WHERE id = 1 FOR SHARE"
+)
+_SCOPES: Final = q(
+    "SELECT id, payload FROM scope_versions WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id"
 )
 
 
@@ -404,9 +407,13 @@ async def active_scopes(conn: AsyncConnection) -> dict[int, ScopeSettings]:
     Takes `active_config` `FOR SHARE`: the rows of these scopes are written under that lock until the
     transaction ends, so no scope flip commits between the facts read and the results written.
     """
-    rows = (await conn.execute(_ACTIVE_SCOPES)).all()
-    if not rows:
+    pointers = (await conn.execute(_LOCK_SCOPE_POINTERS)).first()
+    if pointers is None:
         raise LookupError("there is no active configuration")
+    ids = [pointers.scope_version_id] + (
+        [] if pointers.pending_scope_version_id is None else [pointers.pending_scope_version_id]
+    )
+    rows = (await conn.execute(_SCOPES, {"ids": ids})).all()
     return {int(row.id): scope_from_payload(get_object(row.payload, "")) for row in rows}
 
 

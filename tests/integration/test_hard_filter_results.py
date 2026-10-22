@@ -27,6 +27,7 @@ from tests.support.facts import BERLIN, HAMBURG, facts, load_facts, scope
 from tests.support.procs import await_until
 from tests.support.quota import seeded_payload
 from tests.support.reconcile import assert_fence_rule
+from tests.support.settings import berlin, held_save, pending_scope_id
 
 pytestmark = pytest.mark.integration
 
@@ -202,6 +203,47 @@ async def test_active_scopes_reads_the_active_and_the_pending_scope_under_share(
             await other.execute(
                 sa.text("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE NOWAIT")
             )  # a reader can
+
+
+async def test_active_scopes_queued_behind_a_settings_save_reads_the_pending_scope_it_sets(
+    engine, logged_in_client, current_epoch, job_factory
+) -> None:
+    """Task 22 fix round 2: the statement waits at `active_config` while a save is open. Joined to the lock,
+    it kept only the scope rows its own snapshot could see and returned the active scope alone, so the new
+    pending scope's results were not written; now the pointers are read after the wait and the scopes by
+    their ids."""
+    job = (await job_factory(native_id="a")).job_id
+    active = await active_scope_id(engine)
+
+    def another_scope(payload: dict[str, Any]) -> None:
+        payload["scope"]["locations"] = [berlin(30)]
+
+    async def allow(conn: AsyncConnection) -> None:
+        return None
+
+    async def recompute() -> dict[int, ScopeSettings]:
+        async with engine.begin() as conn:
+            scopes = await filters.active_scopes(conn)
+            await filters.recompute_stale(conn, scopes, guard=allow)
+            return scopes
+
+    async with held_save(engine, logged_in_client, another_scope) as held:
+        task = asyncio.create_task(recompute())
+        await asyncio.sleep(0.4)
+        assert not task.done()
+        await held.commit()
+    scopes = await asyncio.wait_for(task, 10)
+    pending = await pending_scope_id(engine)
+    assert pending is not None and pending != active
+    assert sorted(scopes) == sorted([active, pending])
+    async with engine.connect() as conn:
+        written = (
+            await conn.execute(
+                sa.text("SELECT scope_version_id FROM hard_filter_results WHERE job_id = :j ORDER BY 1"),
+                {"j": job},
+            )
+        ).scalars()
+        assert sorted(written) == sorted([active, pending])  # the pending scope's result is written
 
 
 async def set_description(engine: AsyncEngine, job: int, text: str) -> None:

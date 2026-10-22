@@ -71,6 +71,7 @@ from jobhunter.observability.metrics import (
     LLM_RESERVATION_RATIO,
     LLM_SPEND_USD,
 )
+from jobhunter.settings.active import lock_active
 from jobhunter.types import JSONValue, get_int
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.operations import OperationClaim, lock_operation_owner
@@ -182,10 +183,6 @@ async def owner_holds(conn: AsyncConnection, ref: Mapping[str, JSONValue], *, no
 
 # ---- the month row (§6.9.1) ------------------------------------------------------------------------------
 
-_PARAMS = q(
-    "SELECT v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
-    "WHERE a.id = 1 FOR SHARE OF a"
-)
 _ENSURE_MONTH = q(
     "INSERT INTO llm_budget (month, cap_usd, overrun_buffer_usd, bucket_usd, bucket_at, updated_at) "
     "VALUES (:month, :cap_usd, :overrun_buffer_usd, :bucket_usd, :bucket_at, :updated_at) "
@@ -217,8 +214,9 @@ def _budget_row(row: Row[tuple[object, ...]]) -> BudgetRow:
 
 async def current_params(conn: AsyncConnection) -> BudgetParams:
     """The budget params of the active settings, holding `active_config FOR SHARE` (§9.1: the first lock, so
-    call it first in the transaction). It waits for a settings save in progress (`FOR UPDATE`)."""
-    payload = (await conn.execute(_PARAMS)).scalar_one_or_none()
+    call it first in the transaction). It waits for a settings save in progress (`FOR UPDATE`) and then reads
+    the version that save made active (`settings.active`: the lock and the document are two statements)."""
+    payload = (await lock_active(conn, share=True)).payload
     if not isinstance(payload, dict):
         raise LookupError("active_config has no settings version")
     return BudgetParams.from_payload(payload)

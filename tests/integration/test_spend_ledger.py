@@ -54,6 +54,7 @@ from tests.support.logs import logged
 from tests.support.pg import PgServer, blocked_or_done, lock_waits
 from tests.support.procs import await_until
 from tests.support.reconcile import assert_fence_rule
+from tests.support.settings import held_save
 
 pytestmark = pytest.mark.integration
 MINUTE = timedelta(minutes=1)
@@ -178,6 +179,47 @@ async def test_eight_concurrent_sessions_never_exceed_the_cap(engine, op_owner, 
     assert stored is not None and stored.cap_usd == Decimal("0.60")
     assert stored.counted_usd == Decimal("0.25") * len(admitted) and budget.cap_holds(stored)
     assert await drift(engine, month) is None
+
+
+def lower_cap(payload: dict[str, object]) -> None:
+    """An `edit` for `held_save`: a settings save of class `budget` that sets the cap to $10.00."""
+    llm = payload["llm"]
+    assert isinstance(llm, dict)
+    llm["cap_usd"] = "10.00"
+
+
+async def test_a_reservation_queued_behind_a_settings_save_reads_that_save(
+    engine, op_owner, logged_in_client
+) -> None:
+    """Task 22 fix round 2: step 0 (`current_params`) waits at `active_config` while a settings save is open
+    and then reads the version that save made active. Joined to the lock, its statement looked for that
+    version in the snapshot of its own start, found no row and raised `LookupError`: an LLM reservation
+    failed while a settings save committed."""
+    now = utcnow()
+    async with held_save(engine, logged_in_client, lower_cap) as held:
+        task = asyncio.create_task(
+            reserved(engine, reserve_kw(op_owner, now=now, bound=4000, max_tokens=1000))
+        )
+        await asyncio.sleep(0.4)
+        assert not task.done()
+        await held.commit()
+    res = await asyncio.wait_for(task, 10)
+    row = await ledger_row(engine, res.ledger_id)
+    assert (row.state, row.admitted_cap_usd) == ("reserved", Decimal("10.00"))  # the saved cap
+
+
+async def test_a_settlement_queued_behind_a_settings_save_reads_that_save(
+    engine, op_owner, logged_in_client
+) -> None:
+    now = utcnow()
+    res = await dispatched(engine, reserve_kw(op_owner, now=now, bound=4000, max_tokens=1000))
+    async with held_save(engine, logged_in_client, lower_cap) as held:
+        task = asyncio.create_task(billed(engine, res, now=now))
+        await asyncio.sleep(0.4)
+        assert not task.done()
+        await held.commit()
+    await asyncio.wait_for(task, 10)
+    assert (await ledger_row(engine, res.ledger_id)).state == "billed"
 
 
 async def test_lock_order_owner_then_month(engine, op_owner, migrated: PgServer) -> None:
