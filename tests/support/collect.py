@@ -12,7 +12,7 @@ query (`TEST_QUERY`) and a location key, created when absent, and `jsearch_cell`
 cell; `page1_spec` the JSearch page-1 spec of a cell (bucket `week`), its instance read from the cell row;
 `supersede` gives a run its next attempt, as a takeover does.
 
-Task 13: `DEFAULT_CELL` is every `planner.CellRow` field of a never-attempted JSearch `remote-de` cell, as a
+Task 13: `DEFAULT_CELL` is every `cells.CellRow` field of a never-attempted JSearch `remote-de` cell, as a
 dict; `seed_inputs` writes the queries and the watchlist companies (with their board instances) of a test and
 a new settings version that enables them (and, with `enabled`, exactly those sources), pointed at by
 `active_config`, so a run queued afterwards plans them (plan Deviation 3).
@@ -356,7 +356,7 @@ def ctx(
     )
 
 
-# Every `planner.CellRow` field of a never-attempted JSearch `remote-de` cell, with the column defaults of
+# Every `cells.CellRow` field of a never-attempted JSearch `remote-de` cell, with the column defaults of
 # `coverage_cells` (`yield_ema` 0.5, no streaks).
 DEFAULT_CELL: Final[Mapping[str, object]] = MappingProxyType(
     {

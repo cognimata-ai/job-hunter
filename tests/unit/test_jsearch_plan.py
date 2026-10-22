@@ -3,7 +3,8 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from jobhunter.sources.base import Capabilities, RateLimit, SourceAdapter
-from jobhunter.sources.jsearch import CURSOR_PATH, CURSOR_REUSE_TTL, ITEMS_PATH, PAGE2_MIN_NEW, JSearchAdapter
+from jobhunter.sources.coverage import CURSOR_REUSE_TTL
+from jobhunter.sources.jsearch import CURSOR_PATH, ITEMS_PATH, PAGE2_MIN_NEW, JSearchAdapter
 from jobhunter.types import get_object
 
 from tests.support.sources import make_cell_plan

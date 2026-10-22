@@ -1,7 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from jobhunter.quota.planner import CellRow, location_keys, order_paid, priority
+from jobhunter.quota.cells import CellRow, location_keys
+from jobhunter.quota.planner import order_paid, priority
 from jobhunter.run_settings import scope_from_payload
 
 # DEFAULT_CELL: the CellRow fields of a never-attempted JSearch cell, as a dict

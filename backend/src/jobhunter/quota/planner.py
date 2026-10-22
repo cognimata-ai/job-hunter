@@ -1,10 +1,9 @@
 """The runtime planner (spec §5.5, §6.6, §6.7, §9.2 nodes 1 and 3): the coverage cells of a run's inputs,
 their order, and the fetch requests the run starts from.
 
-**Cells** (§5.5.2, `ensure_cells`): one per `(instance, query, location_key)` for the search sources (JSearch,
-SerpApi, Adzuna), over the enabled queries of the run's settings and the scope's location keys
-(`location_keys`: the slug of every scope location, plus `remote-de` when remote work within Germany is on);
-one Arbeitnow cell; one cell per enabled watchlist board. Inserted `ON CONFLICT DO NOTHING`, then read back.
+**Cells** (§5.5.2): `quota.cells.ensure_cells` creates and reads them (one per `(instance, query,
+location_key)` for the search sources, one Arbeitnow cell, one per enabled watchlist board); this module
+orders them and drafts their requests (M1 Carry-forward 13).
 
 **The primary plan** (`plan_run`, node 1): a run that has fetch requests already reuses them (the receipt,
 `_reuse`): the latest attempt of every planned request is the work list, a `skipped(shutdown | superseded)`
@@ -30,12 +29,13 @@ on, so that the rows of successive runs never overlap, and the cell's open gaps 
 window are abandoned with it (`coverage.abandon_beyond_provider_window`: one that straddles the window's lower
 bound keeps its newer part open, so contiguity can advance past it); Adzuna `max_days_old` days; the
 free sources the scope's ad age. **Cursor reuse** (§5.3.1, Ruling P3): a JSearch cell whose continuation holds
-a cursor obtained less than `jsearch.CURSOR_REUSE_TTL` ago, for a page the page-2 rule admitted (page 2 after
+a cursor obtained less than `coverage.CURSOR_REUSE_TTL` ago, for a page the page-2 rule admitted (page 2 after
 a page 1 with at least 7 new ids, `jsearch.admits_next_page`; final review F3), is planned from it,
 `next_page(plan(cell_plan), cursor)` over the continuation's window and on its page, so that traversal's
 `END` closes its open gap; otherwise from page 1 with a fresh window, the open gap kept. The specs are built
 by the registry's adapters (`registry.make_adapter`, the one factory) on a transport that refuses every
-request (`_spec_adapters`): `plan` and `next_page` never send.
+request (`sources.spec_adapters._spec_adapters`): `plan` and `next_page` never send, and `quota/` imports
+neither the factory nor any concrete adapter (`tests/unit/test_quota_imports.py`).
 
 **The fallback plan** (`plan_fallback`, node 3, §6.6): for every JSearch cell of the run whose
 `fallback.cell_outcome` is eligible, one SerpApi spec `phase='fallback'` on the SerpApi cell with the same
@@ -49,27 +49,24 @@ Every function runs in the caller's transaction, which this module opens with th
 """
 
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
-import httpx
 from sqlalchemy.ext.asyncio import AsyncConnection
-from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.db.sql import q
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.quota.cells import _COUNTERPARTS, CellRow, _cell_rows, _source_enabled, ensure_cells
 from jobhunter.quota.fallback import cell_outcome, eligible
 from jobhunter.quota.ledger import MAX_ATTEMPT_SEQ, lock_run_owner, project_allowance
 from jobhunter.quota.pacing import Admit, PlannedSpec
 from jobhunter.quota.windows import AccountObservation, Provider
-from jobhunter.run_settings import RunSettings, ScopeLocation, ScopeSettings
+from jobhunter.run_settings import RunSettings
 from jobhunter.sources.base import (
-    REMOTE_DE,
     CellPlan,
     CoverageWindow,
     RequestClass,
@@ -80,6 +77,7 @@ from jobhunter.sources.base import (
 from jobhunter.sources.breaker import available
 from jobhunter.sources.coverage import (
     BUCKETS,
+    CURSOR_REUSE_TTL,
     SEARCH_SOURCES,
     Bucket,
     JSearchContinuation,
@@ -89,11 +87,8 @@ from jobhunter.sources.coverage import (
     record_search_gap,
 )
 from jobhunter.sources.instances import InstanceRow
-from jobhunter.sources.jsearch import CURSOR_REUSE_TTL
 from jobhunter.sources.receipts import insert_fetch_request
-from jobhunter.sources.registry import make_adapter
-from jobhunter.sources.watchlist_patterns import ATS_TYPES
-from jobhunter.types import JSONValue
+from jobhunter.sources.spec_adapters import _spec_adapters
 
 if TYPE_CHECKING:
     # `worker.runs` imports `observability.health`, which imports the quota ledger: the owner type only.
@@ -120,40 +115,6 @@ _DAY: Final = timedelta(days=1)
 
 log = get_logger("jobhunter.quota.planner")
 
-# The columns of a `CellRow` but its location label and radius, which the scope gives.
-_CELLS = q(
-    "SELECT c.id, c.source_instance_id, c.query_id, c.location_key, c.enabled, c.last_attempted_at, "
-    "c.last_covered_at, c.last_success_at, c.continuation, c.yield_ema, c.zero_yield_streak, "
-    "c.consecutive_incomplete, c.last_exploration_at, i.source_id, i.instance_key, qr.text AS query_text, "
-    "qr.lang AS query_lang, coalesce(qr.exploration, false) AS exploration FROM coverage_cells c "
-    "JOIN source_instances i ON i.id = c.source_instance_id LEFT JOIN queries qr ON qr.id = c.query_id "
-    "WHERE c.enabled AND ((c.source_instance_id = ANY(CAST(:search AS bigint[])) "
-    "AND c.query_id = ANY(CAST(:queries AS bigint[])) AND c.location_key = ANY(CAST(:keys AS text[]))) "
-    "OR (c.source_instance_id = ANY(CAST(:single AS bigint[])) AND c.query_id IS NULL "
-    "AND c.location_key IS NULL)) ORDER BY c.id"
-)
-# The SerpApi cells (instance `:instance`) with the query and location key of the JSearch cells `:cells`.
-_COUNTERPARTS = q(
-    "SELECT c.id, c.source_instance_id, c.query_id, c.location_key, c.enabled, c.last_attempted_at, "
-    "c.last_covered_at, c.last_success_at, c.continuation, c.yield_ema, c.zero_yield_streak, "
-    "c.consecutive_incomplete, c.last_exploration_at, i.source_id, i.instance_key, qr.text AS query_text, "
-    "qr.lang AS query_lang, coalesce(qr.exploration, false) AS exploration FROM coverage_cells j "
-    "JOIN coverage_cells c ON c.query_id = j.query_id AND c.location_key = j.location_key "
-    "JOIN source_instances i ON i.id = c.source_instance_id LEFT JOIN queries qr ON qr.id = c.query_id "
-    "WHERE j.id = ANY(CAST(:cells AS bigint[])) AND c.source_instance_id = :instance AND c.enabled "
-    "ORDER BY c.id"
-)
-_INSERT_SEARCH_CELLS = q(
-    "INSERT INTO coverage_cells (source_instance_id, query_id, location_key) "
-    "SELECT i.id, qr.id, k.key FROM unnest(CAST(:instances AS bigint[])) AS i(id) "
-    "CROSS JOIN (SELECT id FROM queries WHERE id = ANY(CAST(:queries AS bigint[]))) AS qr "
-    "CROSS JOIN unnest(CAST(:keys AS text[])) WITH ORDINALITY AS k(key, ord) "
-    "ORDER BY i.id, qr.id, k.ord ON CONFLICT DO NOTHING"
-)
-_INSERT_SINGLE_CELLS = q(
-    "INSERT INTO coverage_cells (source_instance_id) SELECT i.id FROM unnest(CAST(:instances AS bigint[])) "
-    "AS i(id) ORDER BY i.id ON CONFLICT DO NOTHING"
-)
 # Normal-class JSearch entries since the last exploration request of a JSearch cell (all of them before one).
 _UNITS_SINCE_EXPLORATION = q(
     "SELECT count(*) FROM quota_ledger WHERE provider = 'jsearch' AND kind = 'request' "
@@ -186,32 +147,6 @@ _ABANDON = q(
     "AND reason = 'beyond_provider_window') AS b "
     "WHERE b.lower < CAST(:upper AS timestamptz) ON CONFLICT (cell_id, kind, span) DO NOTHING"
 )
-
-
-@dataclass(frozen=True)
-class CellRow:
-    """A `coverage_cells` row with its instance, its query and (from the scope) its place."""
-
-    id: int
-    source_instance_id: int
-    query_id: int | None
-    location_key: str | None
-    enabled: bool
-    last_attempted_at: datetime | None
-    last_covered_at: datetime | None
-    last_success_at: datetime | None
-    continuation: JSONValue
-    yield_ema: float
-    zero_yield_streak: int
-    consecutive_incomplete: int
-    last_exploration_at: datetime | None
-    source_id: str
-    instance_key: str
-    query_text: str | None
-    query_lang: str | None
-    exploration: bool
-    location_label: str | None  # the scope location's label; `None` for `remote-de` and cells without one
-    radius_km: int | None
 
 
 @dataclass(frozen=True)
@@ -256,22 +191,6 @@ def cell_plan(
     )
 
 
-def _places(scope: ScopeSettings) -> dict[str, ScopeLocation | None]:
-    """The location keys of the scope, in order, each with its first location (`None` for `remote-de`)."""
-    places: dict[str, ScopeLocation | None] = {}
-    for location in scope.locations:
-        places.setdefault(location.key, location)
-    if scope.remote_within_germany:
-        places.setdefault(REMOTE_DE, None)
-    return places
-
-
-def location_keys(scope: ScopeSettings) -> list[tuple[str, str | None]]:
-    """`(slug, label)` per scope location, de-duplicated on the slug (the first label wins), then
-    `("remote-de", None)` when remote work within Germany is on (§5.5.2)."""
-    return [(key, None if place is None else place.label) for key, place in _places(scope).items()]
-
-
 def priority(cell: CellRow, now: datetime) -> float:
     """`staleness_h * weight * (0.5 + yield_ema)` (§5.5.3): `staleness_h` is 10,000 for a never-attempted
     cell, `weight` 0.25 for a demoted one (zero-yield streak ≥ 3) unless it is due its 7-day refresh."""
@@ -305,87 +224,6 @@ def _stalest_first(cells: Sequence[CellRow]) -> list[CellRow]:
     return sorted(
         cells, key=lambda cell: (cell.last_attempted_at is not None, cell.last_attempted_at, cell.id)
     )
-
-
-def _source_enabled(settings: RunSettings, instance: InstanceRow) -> bool:
-    """Whether the run's settings enable the instance's source (and, for a board, its watchlist company)."""
-    switches = settings.sources
-    match instance.source_id:
-        case "jsearch":
-            return switches.jsearch
-        case "serpapi":
-            return switches.serpapi
-        case "adzuna":
-            return switches.adzuna
-        case "arbeitnow":
-            return switches.arbeitnow
-    company = instance.watchlist_company_id
-    return (
-        instance.source_id in ATS_TYPES
-        and switches.ats
-        and company is not None
-        and settings.watchlist.get(company, False)
-    )
-
-
-async def _cell_rows(
-    conn: AsyncConnection, statement: TextClause, params: Mapping[str, Any], scope: ScopeSettings
-) -> list[CellRow]:
-    places = _places(scope)
-    cells: list[CellRow] = []
-    for row in (await conn.execute(statement, params)).mappings():
-        place = None if row["location_key"] is None else places.get(row["location_key"])
-        cells.append(
-            CellRow(
-                **row,
-                location_label=None if place is None else place.label,
-                radius_km=None if place is None else place.radius_km,
-            )
-        )
-    return cells
-
-
-async def ensure_cells(
-    conn: AsyncConnection, settings: RunSettings, instances: Sequence[InstanceRow]
-) -> list[CellRow]:
-    """The enabled cells of the run's inputs, created when absent (§5.5.2; see the module docstring)."""
-    keys = [key for key, _label in location_keys(settings.scope)]
-    queries = sorted(query_id for query_id, enabled in settings.queries.items() if enabled)
-    search = [i.id for i in instances if i.source_id in SEARCH_SOURCES and _source_enabled(settings, i)]
-    single = [i.id for i in instances if i.source_id not in SEARCH_SOURCES and _source_enabled(settings, i)]
-    if search and queries and keys:
-        await conn.execute(_INSERT_SEARCH_CELLS, {"instances": search, "queries": queries, "keys": keys})
-    if single:
-        await conn.execute(_INSERT_SINGLE_CELLS, {"instances": single})
-    params = {"search": search, "queries": queries, "keys": keys, "single": single}
-    return await _cell_rows(conn, _CELLS, params, settings.scope)
-
-
-def _refuse(request: httpx.Request) -> httpx.Response:
-    raise RuntimeError(f"the planner's adapters build specs and never send (a request to {request.url.host})")
-
-
-def _no_secret(name: str) -> bytes:
-    return b""
-
-
-@asynccontextmanager
-async def _spec_adapters(now: datetime) -> AsyncIterator[Callable[[InstanceRow], SourceAdapter]]:
-    """The adapter of an instance for building specs (the registry's `make_adapter`, the one factory):
-    `plan` and `next_page` only, on a transport that refuses every request, so nothing is sent from inside
-    the planning transaction; without credentials and with the planning time as its clock."""
-    async with httpx.AsyncClient(transport=httpx.MockTransport(_refuse)) as client:
-        built: dict[int, SourceAdapter] = {}
-
-        def clock() -> datetime:
-            return now
-
-        def adapter_of(instance: InstanceRow) -> SourceAdapter:
-            if (adapter := built.get(instance.id)) is None:
-                adapter = built[instance.id] = make_adapter(instance, client, secret=_no_secret, clock=clock)
-            return adapter
-
-        yield adapter_of
 
 
 def _ad_age_days(settings: RunSettings) -> int:

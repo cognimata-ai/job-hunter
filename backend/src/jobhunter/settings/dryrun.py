@@ -8,7 +8,7 @@ settings page shows on every change and that a save runs again (Task 17).
    documents;
 2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `serpapi_disabled_no_fallback`);
 3. `paid_cells`: the enabled queries times the location keys (the scope's locations, plus `remote-de` with
-   remote work within Germany, `quota.planner.location_keys`);
+   remote work within Germany, `quota.cells.location_keys`);
 4. `quota_projections` with the run view of the proposed settings (`RunSettings.from_settings`, the proposed
    interval), on the current window snapshots (none: simulated in memory). Paid search also shows its window:
    the counted units (`ledger.used_units`), the limit and the reset (`window`);
@@ -51,9 +51,9 @@ from jobhunter.db.sql import q
 from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams, BudgetRow
 from jobhunter.llm.spend_ledger import read_month_or_new
+from jobhunter.quota.cells import location_keys
 from jobhunter.quota.dryrun import Warning, quota_projections
 from jobhunter.quota.ledger import used_units
-from jobhunter.quota.planner import location_keys
 from jobhunter.quota.windows import Provider, Window, current_snapshot, roll_forward
 from jobhunter.run_settings import RunSettings, ScopeSettings
 from jobhunter.settings.derive import derived

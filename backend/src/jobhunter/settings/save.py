@@ -70,7 +70,7 @@ from jobhunter.db.sql import q
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, spend_ledger
 from jobhunter.llm.budget import BudgetParams
-from jobhunter.quota.planner import ensure_cells
+from jobhunter.quota.cells import ensure_cells
 from jobhunter.run_settings import load_run_settings
 from jobhunter.settings import scope_apply
 from jobhunter.settings.derive import DerivedIds, active_profile, derived, ensure_derived
