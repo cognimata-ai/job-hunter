@@ -22,7 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import insert_job
 from tests.support.fixtures import count_rows
-from tests.support.settings import procrastinate_job_exists_for, save, save_scope, settings_body
+from tests.support.settings import (
+    change_interval,
+    held_save,
+    procrastinate_job_exists_for,
+    save,
+    save_scope,
+    settings_body,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -363,6 +370,36 @@ async def test_an_invalid_body_is_refused_and_writes_nothing(
     await untouched(engine, logged_in_client, before)
 
 
+@pytest.mark.parametrize(
+    ("path", "body", "field"),
+    [
+        (PARSE_URL, {"url": "x" * 2049}, "body.url"),
+        (
+            URL,
+            {"display_name": "x" * 121, "ats_type": "greenhouse", "board_slug": "acme"},
+            "body.display_name",
+        ),
+        (URL, {"display_name": "Acme", "ats_type": "greenhouse", "board_slug": "a" * 101}, "body.board_slug"),
+        (
+            URL,
+            {
+                "display_name": "Acme",
+                "ats_type": "greenhouse",
+                "board_slug": "acme",
+                "input_url": "https://boards.greenhouse.io/acme/" + "x" * 2048,
+            },
+            "body.input_url",
+        ),
+    ],
+)
+async def test_every_length_error_has_one_code(
+    logged_in_client, path: str, body: dict[str, Any], field: str
+) -> None:
+    r = await post(logged_in_client, path, body)
+    assert r.status_code == 422
+    assert [(e["field"], e["code"]) for e in r.json()["errors"]] == [(field, "string_too_long")]
+
+
 async def test_a_lever_region_must_match_the_url(engine, logged_in_client) -> None:
     before = await settings_body(logged_in_client)
     r = await add(
@@ -433,6 +470,25 @@ async def test_an_add_waits_for_active_config_before_it_touches_a_company(engine
         await holder.commit()
     r = await asyncio.wait_for(request, timeout=10)
     assert (r.status_code, r.json()["watchlist_company_id"]) == (409, rival)
+
+
+async def test_an_add_queued_behind_a_settings_save_builds_on_it(engine, logged_in_client) -> None:
+    """The add waits at `active_config` while a save is open, then reads that save's version, not the one its
+    own snapshot started with: it is 201, keeps the save's change, and its base is the save's version."""
+    async with held_save(engine, logged_in_client, change_interval) as held:
+        request = asyncio.create_task(add(logged_in_client))
+        await asyncio.sleep(0.4)
+        assert not request.done()
+        await held.commit()
+    r = await asyncio.wait_for(request, timeout=10)
+    assert r.status_code == 201, r.text
+    after = await settings_body(logged_in_client)
+    assert after["version"]["version_no"] == held.version_no + 1
+    assert after["payload"]["schedule"] == held.payload["schedule"]  # the save's change is still there
+    assert after["payload"]["watchlist"] == [{"watchlist_company_id": r.json()["id"], "enabled": True}]
+    async with engine.connect() as conn:
+        version = (await conn.execute(_VERSION, {"v": after["version"]["id"]})).one()
+    assert version.base_version_id == held.version_id
 
 
 # --- DELETE /api/watchlist/{id} ----------------------------------------------------------------------------
@@ -537,6 +593,25 @@ async def test_an_unknown_company_is_not_found_and_a_removed_one_too(engine, log
 async def test_a_company_id_outside_bigint_is_refused(logged_in_client, company_id: str) -> None:
     r = await logged_in_client.delete(f"{URL}/{company_id}")
     assert (r.status_code, r.json()["code"]) == (422, "validation_failed")
+
+
+async def test_a_remove_queued_behind_a_settings_save_builds_on_it(engine, logged_in_client) -> None:
+    company_id = await added(logged_in_client)
+    async with held_save(engine, logged_in_client, change_interval) as held:
+        request = asyncio.create_task(logged_in_client.delete(f"{URL}/{company_id}"))
+        await asyncio.sleep(0.4)
+        assert not request.done()
+        await held.commit()
+    r = await asyncio.wait_for(request, timeout=10)
+    assert r.status_code == 204, r.text
+    after = await settings_body(logged_in_client)
+    assert after["version"]["version_no"] == held.version_no + 1
+    assert after["payload"]["schedule"] == held.payload["schedule"]
+    assert after["payload"]["watchlist"] == []
+    async with engine.connect() as conn:
+        version = (await conn.execute(_VERSION, {"v": after["version"]["id"]})).one()
+    assert version.base_version_id == held.version_id
+    assert await company_row(engine, company_id) is None
 
 
 async def test_a_remove_waits_for_active_config_before_it_touches_the_company(

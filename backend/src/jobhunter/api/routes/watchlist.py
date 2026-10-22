@@ -49,12 +49,13 @@ from starlette.responses import Response
 
 from jobhunter.api.deps import get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
-from jobhunter.api.models import CleanStr, clean_text
+from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.normalize.companies import company_key
 from jobhunter.observability.logging import get_logger
+from jobhunter.settings.active import lock_active
 from jobhunter.settings.save import SaveOutcome, SaveRequest, save_settings
 from jobhunter.sources.instances import instance_for_company
 from jobhunter.sources.watchlist_patterns import (
@@ -77,15 +78,13 @@ log = get_logger("jobhunter.api.watchlist")
 _BIGINT_MAX: Final = 2**63 - 1
 DISPLAY_NAME_CHARS: Final = (1, 120)  # the CHECK of `watchlist_companies.display_name` (§7.5)
 INPUT_URL_MAX_CHARS: Final = 2048
+SLUG_MAX_CHARS: Final = 100  # `watchlist_patterns.SLUG` allows 1 to 100 characters
+_SLUG_RULE: Final = "Letters, digits, `.`, `_` and `-`, 1 to 100 characters, starting with a letter or digit"
 # How often an insert that met a board retries when that company was removed before it could be read.
 _INSERT_TRIES: Final = 3
 _FIELD_REGION: Final = "body.lever_region"
 _FIELD_URL: Final = "body.input_url"
 
-# The first lock (§9.1). The active document is read by a statement of its own: joined to the lock, a request
-# that waited for a save would look for the new version in the snapshot of its own start, which lacks it.
-_LOCK_ACTIVE: Final = q("SELECT settings_version_id FROM active_config WHERE id = 1 FOR UPDATE")
-_ACTIVE_PAYLOAD: Final = q("SELECT payload FROM settings_versions WHERE id = :id")
 # The conflict target repeats the unique constraint of `watchlist_companies` exactly (NULLS NOT DISTINCT: the
 # region of a board that is not Lever's is NULL, and two such boards of one slug still collide).
 _INSERT: Final = q(
@@ -104,12 +103,13 @@ _DELETE: Final = q("DELETE FROM watchlist_companies WHERE id = :id")
 
 CompanyId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a watchlist company")]
 UnsupportedReason = Literal["workable", "unsupported_pattern", "bad_slug", "not_a_url"]
+Detection = Literal["pattern", "manual"]
 
 
 class ParseUrlIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    url: Annotated[CleanStr, Field(max_length=INPUT_URL_MAX_CHARS)]
+    url: Annotated[str, StringConstraints(max_length=INPUT_URL_MAX_CHARS), AfterValidator(clean_text)]
 
 
 class ParsedUrlOut(BaseModel):
@@ -135,7 +135,12 @@ class WatchlistIn(BaseModel):
         AfterValidator(clean_text),
     ]
     ats_type: AtsType
-    board_slug: Annotated[CleanStr, Field(max_length=100, description="Taken as written, as `detect` does")]
+    board_slug: Annotated[
+        str,
+        StringConstraints(max_length=SLUG_MAX_CHARS),
+        AfterValidator(clean_text),
+        Field(description=_SLUG_RULE + ", taken as written"),
+    ]
     lever_region: LeverRegion | None = Field(
         default=None, description="Required for Lever, refused otherwise"
     )
@@ -153,7 +158,7 @@ class WatchlistIn(BaseModel):
     @classmethod
     def _slug(cls, value: str) -> str:
         if SLUG.fullmatch(value) is None:
-            raise ValueError("a board slug must match the pattern of §5.4")
+            raise ValueError(_SLUG_RULE)
         return value
 
 
@@ -163,32 +168,24 @@ class WatchlistCreatedOut(BaseModel):
 
 
 def _checked(body: WatchlistIn) -> Detected:
-    """The board `body` names, or 422 `validation_failed` on `body.lever_region` and `body.input_url`: the
+    """The board `body` names, or 422 `validation_failed` on `body.lever_region` or `body.input_url`: the
     region goes with Lever alone, and an `input_url` must read as this very board (module docstring)."""
     board = Detected(body.ats_type, body.board_slug, body.lever_region)
-    errors: list[FieldError] = []
     if (body.ats_type == "lever") != (body.lever_region is not None):
-        errors.append(
-            FieldError(
-                _FIELD_REGION,
-                "required" if body.ats_type == "lever" else "not_applicable",
-                "A Lever board has its region (global or eu); no other board has one",
-            )
-        )
+        code = "required" if body.ats_type == "lever" else "not_applicable"
+        message = "A Lever board has its region (global or eu); no other board has one"
+        field = _FIELD_REGION
     elif body.input_url is not None and detect(body.input_url) != board:
-        errors.append(
-            FieldError(
-                _FIELD_URL,
-                "mismatch",
-                "The URL does not name this board; leave it out for a board entered by hand",
-            )
-        )
-    if errors:
-        raise Problem(422, "validation_failed", "Request validation failed", errors=errors)
-    return board
+        code, field = "mismatch", _FIELD_URL
+        message = "The URL does not name this board; leave it out for a board entered by hand"
+    else:
+        return board
+    raise Problem(
+        422, "validation_failed", "Request validation failed", errors=[FieldError(field, code, message)]
+    )
 
 
-def _detection(body: WatchlistIn) -> Literal["pattern", "manual"]:
+def _detection(body: WatchlistIn) -> Detection:
     """How the board was named: by a careers URL read by pattern, or by hand (Deviation 3)."""
     return "manual" if body.input_url is None else "pattern"
 
@@ -218,12 +215,6 @@ def _object(payload: JSONValue) -> dict[str, JSONValue]:
     return payload
 
 
-async def _lock_active(conn: AsyncConnection) -> tuple[int, JSONValue]:
-    """`active_config` `FOR UPDATE`, the first lock (§9.1), then the active version's id and document."""
-    version_id = int((await conn.execute(_LOCK_ACTIVE)).scalar_one())
-    return version_id, (await conn.execute(_ACTIVE_PAYLOAD, {"id": version_id})).scalar_one()
-
-
 async def _save_internally(
     conn: AsyncConnection, payload: dict[str, JSONValue], base_version_id: int, *, now: datetime
 ) -> SaveOutcome:
@@ -231,7 +222,9 @@ async def _save_internally(
     return await save_settings(conn, request, now=now, defer=defer_in_tx, internal=True)
 
 
-async def _insert_company(conn: AsyncConnection, body: WatchlistIn, board: Detected, *, now: datetime) -> int:
+async def _insert_company(
+    conn: AsyncConnection, body: WatchlistIn, board: Detected, detection: Detection, *, now: datetime
+) -> int:
     """The new company's id, or 409 with the company that already holds the board."""
     board_key = {"ats_type": board.ats, "board_slug": board.slug, "lever_region": board.lever_region}
     params = {
@@ -239,7 +232,7 @@ async def _insert_company(conn: AsyncConnection, body: WatchlistIn, board: Detec
         "display_name": body.display_name,
         "company_key": company_key(body.display_name),
         "input_url": body.input_url,
-        "detection": _detection(body),
+        "detection": detection,
         "now": now,
     }
     for _ in range(_INSERT_TRIES):
@@ -293,18 +286,20 @@ async def add_company(
 ) -> WatchlistCreatedOut:
     """Add a board (201): company, instance, validation and settings version in one transaction."""
     board = _checked(body)
+    detection = _detection(body)
     now = utcnow()
     async with engine.begin() as conn:
-        version_id, payload = await _lock_active(conn)
-        company_id = await _insert_company(conn, body, board, now=now)
+        active = await lock_active(conn)  # the first lock (§9.1), then the active document
+        company_id = await _insert_company(conn, body, board, detection, now=now)
         await instance_for_company(conn, company_id)
         operation_id, _ = await request_validation(conn, company_id, defer=defer_in_tx)
-        outcome = await _save_internally(conn, _with_entry(payload, company_id), version_id, now=now)
+        payload = _with_entry(active.payload, company_id)
+        outcome = await _save_internally(conn, payload, active.settings_version_id, now=now)
     log.info(
         "watchlist_company_added",
         watchlist_company_id=company_id,
         ats=board.ats,
-        detection=_detection(body),
+        detection=detection,
         operation_id=operation_id,
         settings_version_id=outcome.version_id,
     )
@@ -328,12 +323,12 @@ async def remove_company(
     board's instance and postings stay."""
     now = utcnow()
     async with engine.begin() as conn:
-        version_id, active = await _lock_active(conn)
+        active = await lock_active(conn)  # the first lock (§9.1), then the active document
         if (await conn.execute(_LOCK_COMPANY, {"id": company_id})).first() is None:
             raise Problem(404, "not_found", "Watchlist company not found")
         outcome: SaveOutcome | None = None
-        if (payload := _without_entry(active, company_id)) is not None:
-            outcome = await _save_internally(conn, payload, version_id, now=now)
+        if (payload := _without_entry(active.payload, company_id)) is not None:
+            outcome = await _save_internally(conn, payload, active.settings_version_id, now=now)
         await conn.execute(_DELETE, {"id": company_id})
     log.info(
         "watchlist_company_removed",

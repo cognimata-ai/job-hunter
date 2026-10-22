@@ -35,7 +35,9 @@ from tests.support.settings import (
     activate_profile,
     active_row,
     active_scope_id,
+    change_interval,
     generation,
+    held_save,
     incomplete_jobs_for,
     operation_end,
     pending_scope_id,
@@ -458,6 +460,45 @@ async def test_retry_apply_is_409_while_an_apply_is_live_or_when_the_scope_is_ac
     assert refused.status_code == 409 and refused.json()["code"] == "conflict_state", refused.text
     assert await apply_operations(engine) == [(saved["apply_scope_operation_id"], "pending", sid)]
     assert (await active_scope_id(engine), await pending_scope_id(engine)) == (active, sid)
+
+
+async def test_retry_apply_queued_behind_a_settings_save_reads_that_save(
+    logged_in_client, engine, current_epoch
+) -> None:
+    """Task 22 fix round 1: a retry that waits at `active_config` while a save is open meets the version the
+    save inserts, not the snapshot of its own start (which lacks it, so a joined lock statement found no row
+    and the route answered 500). Here it is 202: the save changes no scope, and the failed apply of the active
+    version's scope was cleared."""
+    s0 = await active_scope_id(engine)
+    saved = await save_scope(logged_in_client, radius_km=30)
+    (sid,) = await scope_ids_of(engine, saved)
+    await fail_for_good(engine, saved["apply_scope_operation_id"])
+    assert await run_reconciler(RECONCILER, engine, now=NOW, epoch=current_epoch) == 1
+    assert (await active_scope_id(engine), await pending_scope_id(engine)) == (s0, None)
+
+    async with held_save(engine, logged_in_client, change_interval) as held:
+        request = asyncio.create_task(logged_in_client.post(RETRY_URL))
+        await asyncio.sleep(0.4)
+        assert not request.done()
+        await held.commit()
+    retry = await asyncio.wait_for(request, timeout=10)
+    assert retry.status_code == 202, retry.text
+    assert await pending_scope_id(engine) == sid
+    assert (await active_row(engine)).settings_version_id == held.version_id
+    assert [row[1:] for row in await apply_operations(engine)] == [("failed", sid), ("pending", sid)]
+
+
+async def test_retry_apply_queued_behind_a_settings_save_is_409_when_the_scope_is_active(
+    logged_in_client, engine
+) -> None:
+    async with held_save(engine, logged_in_client, change_interval) as held:
+        request = asyncio.create_task(logged_in_client.post(RETRY_URL))
+        await asyncio.sleep(0.4)
+        assert not request.done()
+        await held.commit()
+    refused = await asyncio.wait_for(request, timeout=10)
+    assert (refused.status_code, refused.json()["code"]) == (409, "conflict_state"), refused.text
+    assert await apply_operations(engine) == []
 
 
 async def test_retry_apply_derives_the_scope_with_the_active_profile(

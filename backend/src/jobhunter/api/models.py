@@ -1,9 +1,11 @@
 """Shared input and output types of the api's models (spec §14.1: JSON in and out).
 
-- `CleanStr`, `clean_text`: a string of a request that holds no NUL character and no lone surrogate. Neither
-  can reach PostgreSQL (a `text` value refuses both), so a field of this type answers 422 `validation_failed`
-  at the edge of the model, however the route then uses it (M2 Task 22). A field that is also trimmed or
-  length-checked lists `clean_text` after its `StringConstraints`, which `Annotated[CleanStr, …]` would not.
+- `clean_text`: the `AfterValidator` of a request string that may hold no NUL character and no lone surrogate.
+  Neither can reach PostgreSQL (a `text` value refuses both), so a field with it answers 422
+  `validation_failed` at the edge of the model, however the route then uses it (M2 Task 22). A field lists it
+  after its `StringConstraints`, as in `Annotated[str, StringConstraints(max_length=…),
+  AfterValidator(clean_text)]`, so that trimming and length rules come first and every length error has
+  pydantic's one code, `string_too_long`.
 - `DecimalOut`: a decimal (a USD amount, a rate) in a response, serialised as a string in plain notation
   (`"93.100000"`, never an exponent and never a float), so a client reads it without binary rounding. Its
   OpenAPI type is `string`.
@@ -16,7 +18,7 @@ This module imports nothing of the api, so `observability.health`, whose models 
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated
 
-from pydantic import AfterValidator, PlainSerializer
+from pydantic import PlainSerializer
 
 from jobhunter.llm.budget import USD_QUANTUM
 
@@ -35,8 +37,6 @@ def clean_text(text: str) -> str:
         raise ValueError("must be valid Unicode text") from None
     return text
 
-
-CleanStr = Annotated[str, AfterValidator(clean_text)]
 
 DecimalOut = Annotated[Decimal, PlainSerializer(_fixed_point, return_type=str)]
 

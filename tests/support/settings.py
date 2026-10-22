@@ -33,13 +33,24 @@ Task 18 adds the scope apply's side:
   `operation_status_sync` read through `pg_one`;
 - the `seeded_jobs_sync` fixture: `SEEDED_JOBS` (1,200) jobs with the active scope's results
   (`collect.insert_jobs` on an engine of its own), so the precompute takes three chunks; their ids.
+
+Task 22 (fix round 1) adds the save that has not committed yet:
+- `held_save(engine, client, edit)`: an async context manager that runs `save_settings` (internal, `edit`
+  applied to a copy of the active payload) in a transaction of its own and leaves it open, holding
+  `active_config` `FOR UPDATE` and the pointer flipped inside it. It yields a `HeldSave` (`version_id`,
+  `version_no`, `payload`, `commit()`); a request queued behind it waits for `commit()` and then meets the
+  save's version. Leaving the block without `commit()` rolls the save back;
+- `change_interval(payload)`: an `edit` for it that changes `schedule.interval_hours` (class `schedule`, so
+  no scope apply and no job).
 """
 
 import asyncio
 import copy
 import hashlib
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Final
 
 import httpx
@@ -54,7 +65,7 @@ from jobhunter.settings.dryrun import dry_run
 from jobhunter.settings.model import Settings
 from jobhunter.settings.save import SaveRequest, ensure_tuple, save_settings
 from jobhunter.worker.tasks import defer_in_tx, job_task_name, make_queue_app
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import insert_jobs
 from tests.support.pg import PgServer, config_for, pg_one
@@ -141,6 +152,53 @@ async def save_scope(client: httpx.AsyncClient, *, radius_km: int) -> dict[str, 
     payload = copy.deepcopy(active["payload"])
     payload["scope"]["locations"] = [berlin(radius_km)]
     return await save(client, payload, base=int(active["version"]["id"]))
+
+
+def change_interval(payload: dict[str, Any]) -> None:
+    """An `edit` for `held_save`: another `schedule.interval_hours` (class `schedule`)."""
+    payload["schedule"]["interval_hours"] = 7 if payload["schedule"]["interval_hours"] != 7 else 8
+
+
+@dataclass(frozen=True)
+class HeldSave:
+    """A settings save whose transaction is still open (`held_save`)."""
+
+    version_id: int
+    version_no: int
+    payload: dict[str, Any]
+    _conn: AsyncConnection
+
+    async def commit(self) -> None:
+        await self._conn.commit()
+
+
+@asynccontextmanager
+async def held_save(
+    engine: AsyncEngine, client: httpx.AsyncClient, edit: Callable[[dict[str, Any]], None]
+) -> AsyncIterator[HeldSave]:
+    """`save_settings` (internal) of the active payload changed by `edit`, in a transaction of its own that
+    stays open: `active_config` is locked and its pointer flipped to the new version, none of it visible to
+    anyone else until `commit()`. A request that needs the lock queues behind it. A block that ends without
+    `commit()` rolls the save back."""
+    active = await settings_body(client)
+    payload = copy.deepcopy(active["payload"])
+    edit(payload)
+    conn = await engine.connect()
+    try:
+        outcome = await save_settings(
+            conn,
+            SaveRequest(
+                payload=payload,
+                base_version_id=int(active["version"]["id"]),
+                acknowledged_warnings=frozenset(),
+            ),
+            now=utcnow(),
+            defer=defer_in_tx,
+            internal=True,
+        )
+        yield HeldSave(outcome.version_id, outcome.version_no, payload, conn)
+    finally:
+        await conn.close()
 
 
 async def active_row(engine: AsyncEngine) -> sa.Row[Any]:

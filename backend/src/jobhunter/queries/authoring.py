@@ -12,8 +12,8 @@ concurrent creates of one text cannot both succeed. A new query is **not** enabl
 save (`queries[]`), with its quota preview (§13.5).
 
 **`edit_query`** (§5.5.1, "retire + create"), in the caller's transaction:
-1. `active_config` `FOR UPDATE`, the first lock (§9.1); a caller that already holds it (the PATCH route)
-   makes this a no-op;
+1. `active_config` `FOR UPDATE`, the first lock (§9.1), and the active document in a statement of its own
+   (`settings.active.lock_active`); a caller that already holds the lock (the PATCH route) makes it a no-op;
 2. the query's row `FOR UPDATE`: a missing or retired one is 404 `not_found`. The new text (trimmed, checked
    as above) and language default to the row's; an edit that changes neither returns the row as it is, so its
    id and its coverage stay. Otherwise the row is retired (`retired_at := now`) and a new one is created with
@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db.sql import q
 from jobhunter.queries import proposals
+from jobhunter.settings.active import lock_active
 from jobhunter.settings.save import SaveRequest, save_settings
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import Deferrer
@@ -59,13 +60,11 @@ _INSERT: Final = q(
     "RETURNING id, text, lang, origin, exploration, proposal_id"
 )
 _LIVE_TEXT: Final = q("SELECT id FROM queries WHERE lower(text) = lower(:text) AND retired_at IS NULL")
-_LOCK_ACTIVE: Final = q("SELECT settings_version_id FROM active_config WHERE id = 1 FOR UPDATE")
 _LOCK_QUERY: Final = q(
     "SELECT id, text, lang, origin, exploration, proposal_id, retired_at FROM queries "
     "WHERE id = :id FOR UPDATE"
 )
 _RETIRE: Final = q("UPDATE queries SET retired_at = :now WHERE id = :id AND retired_at IS NULL")
-_ACTIVE_PAYLOAD: Final = q("SELECT payload FROM settings_versions WHERE id = :id")
 
 
 @dataclass(frozen=True)
@@ -214,7 +213,7 @@ async def edit_query(
 ) -> QueryRow:
     """Retire `query_id` and create its successor, the row returned (module docstring); the row as it is when
     the edit changes nothing."""
-    active_version_id = int((await conn.execute(_LOCK_ACTIVE)).scalar_one())  # the first lock (§9.1)
+    active = await lock_active(conn)  # the first lock (§9.1), then the active document
     row = (await conn.execute(_LOCK_QUERY, {"id": query_id})).first()
     if row is None or row.retired_at is not None:
         raise Problem(404, "not_found", "Query not found")
@@ -233,11 +232,10 @@ async def edit_query(
         proposal_id=old.proposal_id,
         now=now,
     )
-    payload = (await conn.execute(_ACTIVE_PAYLOAD, {"id": active_version_id})).scalar_one()
-    swapped = _swapped(payload, old.id, new.id)
+    swapped = _swapped(active.payload, old.id, new.id)
     if swapped is not None:
         request = SaveRequest(
-            payload=swapped, base_version_id=active_version_id, acknowledged_warnings=frozenset()
+            payload=swapped, base_version_id=active.settings_version_id, acknowledged_warnings=frozenset()
         )
         await save_settings(conn, request, now=now, defer=defer, internal=True)
     return new

@@ -79,10 +79,10 @@ async def test_a_limit_outside_1_to_25_is_refused(logged_in_client, limit: str) 
 
 async def test_the_query_is_at_most_100_characters_without_a_nul(logged_in_client) -> None:
     assert await places(logged_in_client, q="x" * 100) == []
-    for q, field in (("x" * 101, "query.q"), ("Ber\x00lin", "query.q")):
+    for q, code in (("x" * 101, "string_too_long"), ("Ber\x00lin", "value_error")):
         r = await logged_in_client.get(URL, params={"q": q})
         assert (r.status_code, r.json()["code"]) == (422, "validation_failed"), repr(q)
-        assert [e["field"] for e in r.json()["errors"]] == [field], repr(q)
+        assert [(e["field"], e["code"]) for e in r.json()["errors"]] == [("query.q", code)], repr(q)
 
 
 async def test_the_route_needs_a_session(api_client) -> None:

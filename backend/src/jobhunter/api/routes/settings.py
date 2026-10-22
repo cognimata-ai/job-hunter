@@ -79,6 +79,7 @@ from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.settings import scope_apply
+from jobhunter.settings.active import lock_active
 from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import active_settings, dry_run
 from jobhunter.settings.effects import EffectClass, diff_payloads
@@ -122,10 +123,6 @@ _VERSION: Final = q(
     "SELECT id, version_no, created_at, effect_classes, payload FROM settings_versions WHERE id = :id"
 )
 _PREVIOUS: Final = q("SELECT payload FROM settings_versions WHERE version_no = :no")
-_LOCK_ACTIVE_VERSION: Final = q(
-    "SELECT a.scope_version_id, a.profile_version_id, v.payload FROM active_config a "
-    "JOIN settings_versions v ON v.id = a.settings_version_id WHERE a.id = 1 FOR UPDATE OF a"
-)
 _NEVER: Final = (
     "null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is "
     "ever refreshed"
@@ -473,7 +470,7 @@ async def retry_scope_apply(engine: Annotated[AsyncEngine, Depends(get_engine)])
     """Apply the active settings version's scope again, after its apply failed for good (202)."""
     now = utcnow()
     async with engine.begin() as conn:
-        active = (await conn.execute(_LOCK_ACTIVE_VERSION)).one()  # the first lock (§9.1)
+        active = await lock_active(conn)  # the first lock (§9.1), then the active document
         profile = await active_profile(conn, active.profile_version_id)
         ids = await ensure_derived(conn, derived(Settings.model_validate(active.payload), profile=profile))
         scope_version_id = ids.scope_version_id

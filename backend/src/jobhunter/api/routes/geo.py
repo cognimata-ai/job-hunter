@@ -13,10 +13,10 @@ place's name. The gazetteer is loaded on the first request, off the event loop, 
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel, StringConstraints
 
 from jobhunter.api.deps import get_gazetteer, require_session
-from jobhunter.api.models import CleanStr
+from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import SESSION_RESPONSES
 from jobhunter.geo.gazetteer import Gazetteer
 
@@ -44,10 +44,10 @@ class PlaceOut(BaseModel):
 async def search_places(
     gazetteer: Annotated[Gazetteer, Depends(get_gazetteer)],
     q: Annotated[
-        CleanStr,
-        Query(
-            max_length=MAX_QUERY_CHARS, description="A place name or a postal code; empty lists the largest"
-        ),
+        str,
+        StringConstraints(max_length=MAX_QUERY_CHARS),
+        AfterValidator(clean_text),
+        Query(description="A place name or a postal code; empty lists the largest"),
     ] = "",
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> list[PlaceOut]:

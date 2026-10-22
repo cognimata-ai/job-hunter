@@ -5,6 +5,7 @@ moves the active settings' `queries[]` entry to it in one internal settings save
 Every query text is an invented job title; the proposal rows are synthetic.
 """
 
+import asyncio
 import copy
 import json
 from datetime import UTC, datetime
@@ -19,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.fixtures import count_rows
 from tests.support.m2 import insert_profile_chain
-from tests.support.settings import active_row, berlin, save, settings_body
+from tests.support.settings import active_row, berlin, change_interval, held_save, save, settings_body
 
 pytestmark = pytest.mark.integration
 
@@ -197,6 +198,33 @@ async def test_an_edit_retires_the_row_and_moves_the_settings_entry_to_its_succe
     ]
     assert version.base_version_id == before["version"]["id"]
     assert (await active_row(engine)).settings_version_id == after["version"]["id"]
+
+
+async def test_an_edit_queued_behind_a_settings_save_builds_on_it(engine, logged_in_client) -> None:
+    """Task 22 fix round 1: the edit waits at `active_config` while a save is open and then reads that save's
+    version: its entry swap keeps the save's change, and its base is the save's version."""
+    old = await created(logged_in_client, {"text": "Data Engineer", "lang": "en"})
+    await enabled_in_settings(logged_in_client, old["id"], enabled=True)
+    async with held_save(engine, logged_in_client, change_interval) as held:
+        request = asyncio.create_task(
+            logged_in_client.patch(f"{URL}/{old['id']}", json={"text": "Data Engineer Kafka"})
+        )
+        await asyncio.sleep(0.4)
+        assert not request.done()
+        await held.commit()
+    r = await asyncio.wait_for(request, timeout=10)
+    assert r.status_code == 200, r.text
+    after = await settings_body(logged_in_client)
+    assert after["payload"]["queries"] == [{"query_id": r.json()["id"], "enabled": True}]
+    assert after["payload"]["schedule"] == held.payload["schedule"]
+    async with engine.connect() as conn:
+        base = (
+            await conn.execute(
+                sa.text("SELECT base_version_id FROM settings_versions WHERE id = :v"),
+                {"v": after["version"]["id"]},
+            )
+        ).scalar_one()
+    assert base == held.version_id
 
 
 async def test_an_edit_keeps_a_disabled_flag_and_the_proposal_origin(engine, logged_in_client) -> None:

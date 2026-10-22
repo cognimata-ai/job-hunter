@@ -1685,7 +1685,7 @@ export interface components {
             ats_type: "greenhouse" | "lever" | "ashby" | "personio" | "recruitee" | "smartrecruiters";
             /**
              * Board Slug
-             * @description Taken as written, as `detect` does
+             * @description Letters, digits, `.`, `_` and `-`, 1 to 100 characters, starting with a letter or digit, taken as written
              */
             board_slug: string;
             /** Display Name */
