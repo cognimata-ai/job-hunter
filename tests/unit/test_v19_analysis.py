@@ -23,7 +23,6 @@ import pytest
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import bounds
 from jobhunter.llm.pricing import MODELS
-from jobhunter.types import get_int, get_str
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -152,16 +151,8 @@ def test_the_overrun_buffer_bound_arithmetic() -> None:
     measured: dict[str, int] = dict.fromkeys(MODELS, 2_640)
     assert V19.overrun_buffer_bound(thousand, measured) == Decimal("3.37")
     assert V19.overrun_buffer_bound(_with_batch_items(thousand, 500), measured) == Decimal("1.72")  # 1.716
-
-
-def test_the_seeded_buffer_covers_the_bound_with_the_written_constants() -> None:
-    # The standing guard until Task 15's `test_seed_defaults_validate`: the seeded settings (500 batch items)
-    # with the V19 constants of `bounds.py` need at most the seeded $2.00 overrun buffer.
-    settings = load_settings_v1()
-    assert get_int(settings, "scoring.batch_max_items") == 500
-    bound = V19.overrun_buffer_bound(settings, dict(bounds.PROMPT_OVERHEAD_TOKENS))
-    assert bound == Decimal("1.72")
-    assert bound <= Decimal(get_str(settings, "llm.overrun_buffer_usd")) == Decimal("2.00")
+    # The seeded settings with the constants `bounds.py` holds are guarded by Task 15's
+    # `test_seed_defaults_validate` (tests/unit/test_settings_model.py), the settings validation's own check.
 
 
 def test_the_rewrite_replaces_only_the_generated_block_of_bounds_py() -> None:

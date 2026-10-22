@@ -38,7 +38,8 @@ They carry no person's name and no contact data.
   its count.
 - `overrun_buffer_bound` is §6.9.1's `max_concurrent_llm_calls x PROMPT_OVERHEAD_TOKENS x the highest input
   price`: 3 score and 2 auxiliary online slots at the policy's costliest model, and `batch_max_items` batch
-  slots of the generator model at batch prices, rounded up to the cent.
+  slots of the generator model at batch prices, rounded up to the cent. It is the settings validation's
+  formula (`settings.validate.overrun_buffer_bound`, plan Task 15) with the overhead constants under analysis.
 
 Every printed line names counts, sizes, models and codes only, never a prompt or an output, and never the
 key (read from `JOBHUNTER_ANTHROPIC_API_KEY` by `record_anthropic.counting_gateway`).
@@ -54,7 +55,7 @@ import os
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import ROUND_CEILING, Decimal
+from decimal import Decimal
 from fractions import Fraction
 from importlib import resources
 from pathlib import Path
@@ -66,11 +67,13 @@ from jobhunter.db.seed import canonical_json, load_settings_v1
 from jobhunter.llm import bounds, fake
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_FLOOR
 from jobhunter.llm.gateway import LLMGateway, NodeConfig, RenderedPrompt, SystemBlock
-from jobhunter.llm.pricing import MODELS, Model, bound_input_price
+from jobhunter.llm.pricing import MODELS, Model
 from jobhunter.llm.prompts import render
 from jobhunter.llm.schemas import SCHEMAS
 from jobhunter.llm.schemas.profile import ConfirmedProfile, ProfileOut
-from jobhunter.types import get_int, get_object, get_str
+from jobhunter.settings import validate
+from jobhunter.settings.model import Settings
+from jobhunter.types import get_object
 from langchain_core.messages import HumanMessage
 
 HERE: Final = Path(__file__).resolve().parent
@@ -95,9 +98,6 @@ NATIVE_BUFFER_USD: Final = Decimal("0.50")  # the §13.1 minimum overrun buffer
 NATIVE_COUNT_FILE: Final = RAW / "native-pdf.count.json"
 COUNTS_FILE: Final = RAW / "counts.json"
 ANALYSIS_FILE: Final = RAW / "analysis.json"
-
-ONLINE_SCORE_SLOTS: Final = 3  # §6.9.1
-ONLINE_AUX_SLOTS: Final = 2
 
 
 # ---- the pure analysis ------------------------------------------------------------------------------------
@@ -223,23 +223,10 @@ def usage_breaches(recorded: Iterable[RecordedUsage]) -> list[RecordedUsage]:
     return [r for r in recorded if r.used > r.bound]
 
 
-def overrun_buffer_bound(settings: Mapping[str, Any], overhead: Mapping[str, int]) -> Decimal:
-    """§6.9.1's lower bound on `overrun_buffer_usd` for `settings`, with the overhead constants `overhead`."""
-    nodes = get_object(dict(settings), "scoring.model_policy.nodes")
-    models: list[Model] = []
-    for node in nodes.values():
-        model = get_str(node, "model")
-        if model not in MODELS:
-            raise ValueError(f"unknown model {model!r}")
-        models.append(model)
-    online = max(overhead[m] * bound_input_price(m, batch=False) for m in models)
-    generator = get_str(get_object(nodes, "generate"), "model")
-    if generator not in MODELS:
-        raise ValueError(f"unknown model {generator!r}")
-    batch_items = get_int(dict(settings), "scoring.batch_max_items")
-    batch = batch_items * overhead[generator] * bound_input_price(generator, batch=True)
-    total = (ONLINE_SCORE_SLOTS + ONLINE_AUX_SLOTS) * online + batch
-    return (total / 1_000_000).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+def overrun_buffer_bound(settings: Mapping[str, Any], overhead: Mapping[Model, int]) -> Decimal:
+    """§6.9.1's lower bound on `overrun_buffer_usd` for the settings document `settings`, with the overhead
+    constants `overhead`: the settings validation's own formula (`settings.validate.overrun_buffer_bound`)."""
+    return validate.overrun_buffer_bound(Settings.model_validate(dict(settings)), overhead=overhead)
 
 
 def rewrite_bounds(source: str, constants: Mapping[str, int], *, native_pdf_enabled: bool) -> str:
