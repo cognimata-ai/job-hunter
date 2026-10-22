@@ -71,9 +71,25 @@ def test_each_secret_is_created_once_as_0440_and_only_its_name_is_printed(tmp_pa
     assert all(len(values[name].strip()) == 48 and int(values[name], 16) >= 0 for name in PASSWORDS)
     assert values["anthropic_key"] == ""  # no key given: an empty file, which the worker reads as none
 
-    second = run_script(tmp_path, {"chgrp": CHGRP_OK}, key=DUMMY_KEY)  # a key given later changes nothing
+    second = run_script(tmp_path, {"chgrp": CHGRP_OK})
     assert (second.returncode, second.stdout, second.stderr) == (0, "", "")
     assert {name: (secrets_dir / name).read_text() for name in NAMES} == values
+
+
+def test_a_key_given_once_the_file_exists_is_not_written_and_says_how_to_set_it(tmp_path: Path) -> None:
+    """Fix round 1, Minor 3: the existing (here empty) `anthropic_key` is kept, never overwritten, and the run
+    says that removing it sets the key; the key itself is never printed."""
+    assert run_script(tmp_path, {"chgrp": CHGRP_OK}).returncode == 0
+    key_file = tmp_path / "dev" / "anthropic_key"
+    before = key_file.stat()
+    later = run_script(tmp_path, {"chgrp": CHGRP_OK}, key=DUMMY_KEY)
+    assert (later.returncode, later.stderr) == (0, "")
+    assert later.stdout == "dev-secrets: kept anthropic_key (remove it to set a key)\n"
+    assert DUMMY_KEY not in later.stdout and key_file.read_text() == ""
+    assert (key_file.stat().st_ino, key_file.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    key_file.unlink()  # as the message says
+    again = run_script(tmp_path, {"chgrp": CHGRP_OK}, key=DUMMY_KEY)
+    assert again.stdout == "dev-secrets: created anthropic_key\n" and key_file.read_text() == DUMMY_KEY
 
 
 def test_the_anthropic_key_is_the_variables_value_and_is_never_printed(tmp_path: Path) -> None:

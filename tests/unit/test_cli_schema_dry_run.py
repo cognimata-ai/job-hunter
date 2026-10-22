@@ -80,6 +80,31 @@ def test_prod_without_live_exits_2_before_anything_runs(
     assert out.err == f"schema-dry-run: {PROD_WITHOUT_LIVE}; nothing sent\n"
 
 
+@pytest.mark.parametrize("blank", [b" ", b" \t ", b"\n\n"], ids=["space", "tab", "newlines"])
+def test_a_blank_key_is_refused_at_the_start_like_a_missing_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], blank: bytes
+) -> None:
+    """Task 23 fix round 1: a whitespace-only `anthropic_key` is no key for the gateway, so `--live` refuses
+    it before anything runs (exit 2), as it refuses a missing one, instead of failing at the first call."""
+    blank_key = dataclasses.replace(
+        config(tmp_path, "dev"), secrets=MappingProxyType({"anthropic_key": blank})
+    )
+    assert start_refusal(blank_key, live=True) == "--live needs the worker's anthropic_key secret"
+    monkeypatch.setattr(cli_schema_dry_run, "startup_or_exit", lambda role: blank_key)
+    monkeypatch.setattr(cli_schema_dry_run, "configure_logging", lambda *a, **k: None)
+
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the refused dry-run must not start")
+
+    monkeypatch.setattr(cli_schema_dry_run, "_dry_run", never)
+    assert cli_schema_dry_run.run_schema_dry_run(argparse.Namespace(live=True)) == NOT_STARTED
+    out = capsys.readouterr()
+    assert (out.out, out.err) == (
+        "",
+        "schema-dry-run: --live needs the worker's anthropic_key secret; nothing sent\n",
+    )
+
+
 def test_the_workflow_states_the_worst_case_from_pricing() -> None:
     # Each case's try reserves the gateway's own worst case, and every try of a case reserves the same, since
     # both max_tokens stages are DRY_RUN_MAX_TOKENS: the run's worst case is 6 x the sum over its cases.

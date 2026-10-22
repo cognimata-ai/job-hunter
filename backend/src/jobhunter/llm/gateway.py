@@ -648,12 +648,23 @@ class _Next:
     result: GatewayResult | None = None
 
 
+def _secret_key(cfg: AppConfig) -> str:
+    """The worker's `anthropic_key` secret without surrounding whitespace; empty when it holds none."""
+    return cfg.secrets.get("anthropic_key", b"").decode("utf-8").strip()
+
+
+def has_api_key(cfg: AppConfig) -> bool:
+    """Whether `cfg` holds a key a live gateway can send: an `anthropic_key` that is not blank (a blank one
+    leaves the gateway not configured, module docstring). The live schema dry-run checks it at its start."""
+    return bool(_secret_key(cfg))
+
+
 def _api_key(cfg: AppConfig) -> SecretStr | None:
     """The key every request sends (G1): the worker's `anthropic_key` secret, or in fake LLM mode a
     placeholder; `None` without either (the gateway is not configured, module docstring)."""
     if cfg.fake_llm:
         return SecretStr(_FAKE_API_KEY)  # the fake ignores the key; a real one is never sent there
-    key = cfg.secrets.get("anthropic_key", b"").decode("utf-8").strip()
+    key = _secret_key(cfg)
     return SecretStr(key) if key else None
 
 

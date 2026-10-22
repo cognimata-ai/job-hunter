@@ -59,19 +59,25 @@ body that the newest response still needs. The controller records this as a plan
 - `cv_files`: a CV file and its texts (`storage_path`, `raw_text_enc`, `stripped_text`). Kept: the file of the
   active profile version and of the previous one, and that of every open draft. "Previous" follows the
   activation order, not `version_no`: the version of the newest confirmed draft before the newest one that
-  names another version (the draft ids are the confirm order: one draft is open at a time, and only an open
-  draft is confirmed), so a reactivated older version keeps the version it replaced as its previous. Purged
-  at once: every other file of a confirmed draft (an older version's, and an upload whose confirm reused
-  another version with the same `profile_hash`: that version keeps its own file). Purged after 30 days: the
-  file of a draft `discarded` or `failed` that long (`status_changed_at`), and an upload that no draft
+  names another version, so a reactivated older version keeps the version it replaced as its previous. The
+  draft ids are the confirm order: one draft is open at a time and only an open (`ready`) draft is confirmed,
+  and a draft older than the open one cannot come back to confirm after it, since every new upload discards
+  every `failed` draft (`profile.upload.open_new_draft`, pinned by `test_profile_upload_api.py`'s
+  `test_a_new_upload_discards_the_reviewable_draft_and_every_failed_one`), so a retry reopens the newest draft
+  only. Purged at once: every other file of a confirmed draft (an older version's, and an upload whose confirm
+  reused another version with the same `profile_hash`: that version keeps its own file). Purged after 30 days:
+  the file of a draft `discarded` or `failed` that long (`status_changed_at`), and an upload that no draft
   references (`uploaded_at`). The file is deleted from the CV store first (one already gone is fine), then the
-  row loses the three columns and gets `purged_at` (Deviation 21). A batch is one transaction in the §9.1
-  order: the fence, `active_config` `FOR SHARE` on its own (`settings.active.lock_active`, Deviation 43), the
-  protection set read under it, the candidates' drafts `FOR UPDATE` with their status and age checked again,
-  the candidate rows `FOR UPDATE` (the fault point `retention.cv_files.after_select` follows), the deletions
-  and the row updates. A confirm takes `active_config` `FOR UPDATE` and a retry the draft `FOR UPDATE`, so
-  either waits for the batch, or the batch waits for it and then sees what it committed: no file is deleted
-  under a protection set that a committed reactivation or reopening changed.
+  row loses the three columns and gets `purged_at` (Deviation 21). A file whose deletion fails otherwise (an
+  `OSError`) keeps its row as it is and is logged `cv_file_unlink_failed` (its row's id, `file_id`, and the
+  error class); the batch's other files go and commit, the later batches run, and then the rule fails
+  (`CvFilesNotDeleted`, so `retention.failed` is raised) until a pass deletes it. A batch is one transaction
+  in the §9.1 order: the fence, `active_config` `FOR SHARE` on its own (`settings.active.lock_active`,
+  Deviation 43), the protection set read under it, the candidates' drafts `FOR UPDATE` with their status and
+  age checked again, the candidate rows `FOR UPDATE` (the fault point `retention.cv_files.after_select`
+  follows), the deletions and the row updates. A confirm takes `active_config` `FOR UPDATE` and a retry the
+  draft `FOR UPDATE`, so either waits for the batch, or the batch waits for it and then sees what it
+  committed: no file is deleted under a protection set that a committed reactivation or reopening changed.
 - `cv_store_orphans`: a file of the CV store that no `cv_files.storage_path` names and that was written more
   than a day ago (its modification time): the file of an upload whose transaction rolled back (Task 9).
 - `eval_runs`: a run that ended 13 months ago (`finished_at`, else `started_at`), except the latest
@@ -342,6 +348,16 @@ _DELETE_EVAL_RUNS: Final = q(
 
 FAILED_ALERT_CODE: Final = "retention.failed"
 
+
+class CvFilesNotDeleted(Exception):
+    """The `cv_files` rule ran to its end, but `count` files could not be deleted (`cv_file_unlink_failed`
+    names their rows); their rows still name them, and the next pass tries again."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(f"{count} CV files could not be deleted")
+        self.count = count
+
+
 log = get_logger("jobhunter.privacy.retention")
 
 
@@ -451,42 +467,58 @@ def _lets_its_file_go(draft: Any, cutoff: datetime) -> bool:
 
 async def _cv_files_batch(
     conn: AsyncConnection, cv_store: CvStore, cutoff: datetime, now: datetime, after: int
-) -> tuple[list[int], list[int]]:
-    """One `cv_files` batch after its fence, in the §9.1 order (module docstring): `(candidates, purged)`."""
+) -> tuple[list[int], list[int], list[int]]:
+    """One `cv_files` batch after its fence, in the §9.1 order (module docstring): `(candidates, purged,
+    not deleted)`."""
     active = await lock_active(conn, share=True)  # §9.1's first lock, a statement of its own (Deviation 43)
     protection = await conn.execute(_PROTECTED_FILES, {"active": active.profile_version_id})
     protected = [int(cv_file_id) for cv_file_id in protection.scalars()]
     params = {"after": after, "protected": protected, "cutoff": cutoff, "limit": CV_FILE_BATCH}
     batch = [int(cv_file_id) for cv_file_id in (await conn.execute(_FILE_CANDIDATES, params)).scalars()]
     if not batch:
-        return batch, []
+        return batch, [], []
     drafts = (await conn.execute(_LOCK_FILE_DRAFTS, {"files": batch})).all()
     # Again under the drafts' lock: a retry may have reopened one since the candidates were read.
     held = {int(draft.cv_file_id) for draft in drafts if not _lets_its_file_go(draft, cutoff)}
     files = (await conn.execute(_LOCK_FILES, {"files": [f for f in batch if f not in held]})).all()
     await afault_point(CV_FILES_AFTER_SELECT)
+    purged: list[int] = []
+    failed: list[int] = []
     for row in files:
         if row.storage_path is not None:
-            cv_store.delete(row.storage_path)  # the file first (Deviation 21); one already gone is fine
-    purged = [int(row.id) for row in files]
+            try:
+                cv_store.delete(row.storage_path)  # the file first (Deviation 21); one already gone is fine
+            except OSError as exc:
+                # The row keeps naming its file; the batch's other files go, and the rule fails once it has
+                # run (`CvFilesNotDeleted`). The log has the row's id and the class, never the path; the id is
+                # `file_id`, since the §16.8 redaction masks every `cv*` key.
+                log.error("cv_file_unlink_failed", file_id=int(row.id), error_class=type(exc).__name__)
+                failed.append(int(row.id))
+                continue
+        purged.append(int(row.id))
     if purged:
         await conn.execute(_PURGE_FILES, {"files": purged, "now": now})
-    return batch, purged
+    return batch, purged, failed
 
 
 async def _purge_cv_files(
     engine: AsyncEngine, cv_store: CvStore, cutoff: datetime, now: datetime, epoch: int
 ) -> int:
-    """`cv_files` (module docstring), `CV_FILE_BATCH` files per fenced transaction; the files purged."""
-    purged, after = 0, 0
+    """`cv_files` (module docstring), `CV_FILE_BATCH` files per fenced transaction; the files purged.
+    `CvFilesNotDeleted` once every batch has run when a file could not be deleted (its row is kept)."""
+    purged, not_deleted, after = 0, 0, 0
     while True:
         async with engine.begin() as conn:
             await fence_epoch(conn, epoch)  # held while the batch deletes its files
-            batch, files = await _cv_files_batch(conn, cv_store, cutoff, now, after)
+            batch, files, failed = await _cv_files_batch(conn, cv_store, cutoff, now, after)
         purged += len(files)
+        not_deleted += len(failed)
         if len(batch) < CV_FILE_BATCH:
-            return purged
+            break
         after = batch[-1]
+    if not_deleted:
+        raise CvFilesNotDeleted(not_deleted)
+    return purged
 
 
 async def _purge_orphans(engine: AsyncEngine, cv_store: CvStore, cutoff: datetime, epoch: int) -> int:

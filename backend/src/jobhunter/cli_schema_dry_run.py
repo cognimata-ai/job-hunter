@@ -5,7 +5,7 @@ and its startup assertions), reads the active prompt-schema version, model polic
 `active_config`, and runs `llm.schema_dry_run.run` on a gateway of its own:
 - without `--live` on the recorded-SSE fake (`JOBHUNTER_FAKE_LLM_DIR`, by default the committed recordings),
   which prod refuses, as it refuses `JOBHUNTER_FAKE_LLM`;
-- with `--live` on the Anthropic API, which needs the worker's `anthropic_key` secret and refuses
+- with `--live` on the Anthropic API, which needs the worker's `anthropic_key` secret (not blank) and refuses
   `JOBHUNTER_FAKE_LLM`.
 
 Either way the run records its transport (`fake` or `live`) as `metrics.transport` in its `eval_runs` row.
@@ -28,7 +28,7 @@ from jobhunter.db.session import make_engine
 from jobhunter.db.sql import q
 from jobhunter.llm import schema_dry_run
 from jobhunter.llm.cache_monitor import CacheMonitor
-from jobhunter.llm.gateway import LLMGateway
+from jobhunter.llm.gateway import LLMGateway, has_api_key
 from jobhunter.llm.schema_dry_run import DryRunReport
 from jobhunter.llm.transport import make_http_client
 from jobhunter.observability.logging import configure_logging
@@ -44,7 +44,7 @@ def start_refusal(cfg: AppConfig, *, live: bool) -> str | None:
     """Why the dry-run must not start with `cfg`, or `None`."""
     if live and cfg.fake_llm:
         return "--live sends to the Anthropic API: unset JOBHUNTER_FAKE_LLM"
-    if live and not cfg.secrets.get("anthropic_key"):
+    if live and not has_api_key(cfg):  # a blank key too: the gateway would send nothing (Task 23)
         return "--live needs the worker's anthropic_key secret"
     if not live and cfg.env == "prod":
         return "without --live the dry-run runs on the fake transport, which prod refuses"

@@ -370,6 +370,56 @@ async def test_cv_files_of_ended_drafts_and_abandoned_uploads_go_after_30_days(
     assert (await retention_pass(engine, queue_app, migrated, cv_store))["cv_files"] == 0
 
 
+async def test_a_file_that_cannot_be_deleted_keeps_its_row_and_fails_the_rule_after_the_others(
+    engine, current_epoch, queue_app, migrated, cv_store, cv_store_dir, monkeypatch, caplog
+) -> None:
+    """Fix round 1, Minor 1: a deletion that fails (not a missing file) leaves that row naming its file, is
+    logged `cv_file_unlink_failed` (the row's id and the error class, no path), and the batch's other files
+    are deleted and their rows purged in the same commit; the rule then fails (`retention.failed`), and the
+    next pass purges the file once its cause is gone."""
+    from tests.support.logs import logged
+
+    async with engine.begin() as c:
+        files = [await stored_file(c, cv_store, n) for n in (1, 2, 3)]
+        for cv_file_id, _ in files:
+            await insert_draft(c, cv_file_id, "discarded", days=31)
+    (first, first_path), (stuck, stuck_path), (third, third_path) = files
+    real_delete = cv_store.delete
+
+    def delete(storage_path: str) -> None:
+        if storage_path == stuck_path:
+            raise PermissionError(13, "Permission denied", str(cv_store_dir / storage_path))
+        real_delete(storage_path)
+
+    monkeypatch.setattr(cv_store, "delete", delete)
+    report = await retention_pass(engine, queue_app, migrated, cv_store)
+
+    assert report["cv_files"] == -1
+    for cv_file_id, path in ((first, first_path), (third, third_path)):
+        assert await file_row(engine, cv_file_id) == PURGED_ROW
+        assert not (cv_store_dir / path).exists()
+    assert await file_row(engine, stuck) == (stuck_path, *KEPT_TEXTS)
+    assert (cv_store_dir / stuck_path).is_file()
+    [event] = logged(caplog, "cv_file_unlink_failed")
+    assert (event["file_id"], event["error_class"]) == (stuck, "PermissionError")  # a `cv*` key is redacted
+    assert stuck_path not in caplog.text
+    open_failure = sa.text(
+        "SELECT context FROM alerts WHERE dedup_key = 'retention.failed:cv_files' AND resolved_at IS NULL"
+    )
+    async with engine.connect() as c:
+        assert (await c.execute(open_failure)).scalar_one() == {
+            "rule": "cv_files",
+            "error_class": "CvFilesNotDeleted",
+        }
+
+    monkeypatch.setattr(cv_store, "delete", real_delete)  # the cause is gone
+    assert (await retention_pass(engine, queue_app, migrated, cv_store))["cv_files"] == 1
+    assert await file_row(engine, stuck) == PURGED_ROW
+    assert not (cv_store_dir / stuck_path).exists()
+    async with engine.connect() as c:
+        assert (await c.execute(open_failure)).first() is None
+
+
 async def test_cv_store_orphans_go_a_day_after_they_were_written(
     engine, current_epoch, queue_app, migrated, cv_store, cv_store_dir
 ) -> None:

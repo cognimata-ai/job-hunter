@@ -9,9 +9,10 @@
 # worker reads an empty one as no key (its LLM calls then fail llm_not_configured; M2 Task 23). The value is
 # written by a shell builtin, so it never appears in a command line. A file gets group 10010
 # (jobhunter-secrets) and mode 0440 before it appears under its name, so it is never readable by anyone else,
-# and the directory gets group 10010 and mode 0750. An existing secret is never overwritten (a key given later
-# needs the old anthropic_key removed first). The script prints `created <name>`, or `kept <name>` when another
-# run created the file meanwhile; it never prints a value.
+# and the directory gets group 10010 and mode 0750. An existing secret is never overwritten: a key given once
+# anthropic_key exists is not written, and the script prints `kept anthropic_key (remove it to set a key)`.
+# Otherwise it prints `created <name>`, or `kept <name>` when another run created the file meanwhile; it never
+# prints a value.
 #
 # Compose bind-mounts a secret with the host file's owner and mode, and the app runs as uid 10001 with the
 # supplementary group 10010, so setting the group needs root: run it with sudo.
@@ -70,4 +71,9 @@ done
 anthropic_key_value() {
     printf '%s' "${JOBHUNTER_ANTHROPIC_API_KEY:-}"
 }
-create anthropic_key anthropic_key_value
+key_file="$dir/anthropic_key"
+if [ -n "${JOBHUNTER_ANTHROPIC_API_KEY:-}" ] && { [ -e "$key_file" ] || [ -L "$key_file" ]; }; then
+    echo "dev-secrets: kept anthropic_key (remove it to set a key)"
+else
+    create anthropic_key anthropic_key_value
+fi

@@ -1,7 +1,10 @@
 # The dev stack (spec §19.1, §19.2; Task 18). Every call passes the digest lock as its env file:
 #
-#   scripts/dev-secrets.sh            # once; as root (sudo), it sets group 10010 on the secret files
+#   scripts/dev-secrets.sh            # as root (sudo), it sets group 10010 on the secret files
 #   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml up -d --build --wait
+#
+# Run dev-secrets.sh again after a change that adds a secret file: it creates the missing ones and keeps the
+# others. M2 Task 23 added the worker's anthropic_key, so a stack set up before it does not start until then.
 #
 # The worker's anthropic_key is the JOBHUNTER_ANTHROPIC_API_KEY that dev-secrets.sh was run with (`sudo
 # --preserve-env=JOBHUNTER_ANTHROPIC_API_KEY`), or an empty file: the worker then starts without a key and every
