@@ -61,8 +61,9 @@ embedder is healthy again. The steps:
    meanwhile is `FencedOut` at the owner lock and nothing is written.
 Logs carry the operation id, the version id, counts and short codes, never a text.
 
-**`propose_queries`** (Task 20; payload `{"proposal_id": <id>}`, dedup key `propose_queries:<id>`, created
-with its `running` proposal by `queries.proposals.request_proposal`, which registers nothing). In one
+**`propose_queries`** (Task 20; payload `{"proposal_id": <id>, "scope_version_id": <id>}`, the scope active at
+the request, dedup key `propose_queries:<id>`, created with its `running` proposal by
+`queries.proposals.request_proposal`, which registers nothing). In one
 transaction, the owner row, then the proposal `FOR UPDATE`: a proposal still `running` goes on; one in any
 other state, or gone, ends the operation `succeeded` as obsolete without touching it. Then the handler
 invokes `profile_graphs.propose` on the execution's own thread (`thread_id("q", proposal_id,

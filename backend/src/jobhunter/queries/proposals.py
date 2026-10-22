@@ -6,10 +6,13 @@ location (§5.5.2). A text holds one when a location word, folded (`normalize.te
 words, is a run of whole words of the folded text: `Software Engineer Berlin` and `DevOps Engineer
 Home-Office` do, `Hallenmanager` (which contains `halle`) and `Java Entwickler` do not. The words are:
 - the words of the scope's location labels, each on its own, without the particles of German and English place
-  names (`LABEL_PARTICLES`: `am`, `an`, `der`, …), which would otherwise drop any query that uses them
-  (`Frankfurt am Main` gives `frankfurt` and `main`);
-- the folded name and every other folded spelling of each gazetteer place with at least 100,000 inhabitants
-  (`LARGE_PLACE_POPULATION`), whole: `munchen`, `munich`, `frankfurt am main`, `frankfurt`;
+  names (`LABEL_PARTICLES`: `am`, `an`, `der`, …) and the generic words of German place names
+  (`LABEL_STOPWORDS`: `bad`, `neu`, `oder`, `weil`, `main`), which would otherwise drop any query that uses
+  them (`Frankfurt am Main` gives `frankfurt`, `Bad Homburg` gives `homburg`);
+- the folded name of each gazetteer place with at least 100,000 inhabitants (`LARGE_PLACE_POPULATION`), and
+  each of its other folded spellings but those that are common words (`ALT_SPELLING_STOPWORDS`: `gerne` for
+  Herne, `monster` for Münster, …), each whole: `munchen`, `munich`, `frankfurt am main`, `frankfurt`,
+  `mitte`;
 - `LOCATION_WORDS_EXTRA`: the work-mode and country words and the federal states (its comment lists them).
 
 **The check** (`validate_proposal`), in two levels (Deviation 20). An item's text and rationale are trimmed
@@ -27,9 +30,13 @@ gazetteer is passed in, and the words of its large places are computed once per 
 UPDATE`, which serialises two requests for one version without blocking the foreign-key checks of other
 writers; then a `running` proposal of that version is returned as it is (`created=False`), with its live
 operation (recreated if none is live, so a running proposal is never left without one); otherwise a
-`query_proposals` row in `running` and its `propose_queries` operation (`KIND`), payload `{"proposal_id": id}`
-and dedup key `propose_queries:<id>`, with its job deferred by `defer`. The handler of that operation and its
-failure hook are `profile.operations`' (this module registers nothing).
+`query_proposals` row in `running` and its `propose_queries` operation (`KIND`), payload
+`{"proposal_id": id, "scope_version_id": <the active scope version>}` and dedup key `propose_queries:<id>`,
+with its job deferred by `defer`. The scope version is pinned with the request: every execution of the
+operation renders its prompt from that version's location labels and checks every output, a receipt's
+included, against them, so a scope saved between a crash and its reclaim never changes whether a paid answer
+is usable. The handler of that operation and its failure hook are `profile.operations`' (this module registers
+nothing).
 
 **The row** (`lock_proposal`, `publish`, `fail`, `end_obsolete`): every write runs after the owner row of the
 proposal's operation (§9.1: the owner row, then the domain rows). `publish` moves `running → ready` with
@@ -53,6 +60,7 @@ from jobhunter.geo.gazetteer import Gazetteer
 from jobhunter.llm.schemas.queries import QueryProposalOut
 from jobhunter.normalize.text import fold
 from jobhunter.observability.logging import get_logger
+from jobhunter.types import JSONValue
 from jobhunter.worker.operations import OperationContext, create_operation
 from jobhunter.worker.tasks import Deferrer
 
@@ -159,6 +167,33 @@ LABEL_PARTICLES: Final[frozenset[str]] = frozenset(
         "zur",
     }
 )
+# Generic words of German place names, folded: a label's word that is one of them is no location word, since
+# it is a common word too (`oder` is "or") or names a whole class of places (`Bad …`, `Neu-…`, `Weil am …`,
+# the river of `Frankfurt am Main`). The place's own words (`homburg`, `isenburg`, `frankfurt`) stay.
+LABEL_STOPWORDS: Final[frozenset[str]] = frozenset({"bad", "neu", "oder", "weil", "main"})
+# Other spellings of the large places that are common words of German or English, or of a job query, folded:
+# never a location word, though the place's own name is (`herne`, `munster`, `kiel`, `bonn`, `essen`, `halle`,
+# `neuss`, `moers`, `koln`). Only the listed spelling is left out: `colonia agrippina` and the like stay.
+# `gerne` (Herne), `monster` and `minster` (Münster), `kilo`, `kil` and `kyle` (Kiel), `bon` (Bonn), `esse`
+# (Essen), `galle` (Halle), `nuss` (Neuss), `mers` and `mors` (Moers), `mite` (Mitte), `colonia` (Köln).
+ALT_SPELLING_STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "gerne",
+        "monster",
+        "kilo",
+        "kil",
+        "kyle",
+        "bon",
+        "esse",
+        "galle",
+        "nuss",
+        "mers",
+        "mors",
+        "mite",
+        "minster",
+        "colonia",
+    }
+)
 _WORD: Final = re.compile(r"[^\W_]+")
 
 log = get_logger("jobhunter.queries.proposals")
@@ -182,16 +217,18 @@ def words(text: str) -> tuple[str, ...]:
 
 @functools.cache
 def _large_place_words(gazetteer: Gazetteer) -> frozenset[str]:
-    names: set[str] = set()
-    for place in gazetteer.places_of_population(LARGE_PLACE_POPULATION):
-        names.add(place.folded)
-        names.update(place.alt_folded)
-    return frozenset(names)
+    """The names of the large places, and their other spellings but `ALT_SPELLING_STOPWORDS`; a stop-listed
+    spelling that is a large place's own name stays."""
+    places = gazetteer.places_of_population(LARGE_PLACE_POPULATION)
+    names = {place.folded for place in places}
+    spellings = {spelling for place in places for spelling in place.alt_folded}
+    return frozenset(names | (spellings - ALT_SPELLING_STOPWORDS))
 
 
 def location_words(scope_labels: Sequence[str], gazetteer: Gazetteer) -> frozenset[str]:
     """The location words of a proposal for a scope with `scope_labels` (module docstring)."""
-    label_words = {word for label in scope_labels for word in words(label) if word not in LABEL_PARTICLES}
+    left_out = LABEL_PARTICLES | LABEL_STOPWORDS
+    label_words = {word for label in scope_labels for word in words(label) if word not in left_out}
     return frozenset(label_words) | _large_place_words(gazetteer) | LOCATION_WORDS_EXTRA
 
 
@@ -247,6 +284,7 @@ def validate_proposal(
 # --- the request and the row --------------------------------------------------------------------------------
 
 _LOCK_VERSION: Final = q("SELECT id FROM profile_versions WHERE id = :pv FOR NO KEY UPDATE")
+_ACTIVE_SCOPE: Final = q("SELECT scope_version_id FROM active_config WHERE id = 1")
 _RUNNING: Final = q(
     "SELECT id FROM query_proposals WHERE profile_version_id = :pv AND status = 'running' ORDER BY id LIMIT 1"
 )
@@ -262,8 +300,11 @@ def dedup_key(proposal_id: int) -> str:
 
 
 async def _operation(conn: AsyncConnection, proposal_id: int, defer: Deferrer | None) -> tuple[int, bool]:
+    """The live operation of the proposal, created with the active scope version pinned when there is none."""
+    scope_version_id = int((await conn.execute(_ACTIVE_SCOPE)).scalar_one())
+    payload: dict[str, JSONValue] = {"proposal_id": proposal_id, "scope_version_id": scope_version_id}
     return await create_operation(
-        conn, kind=KIND, payload={"proposal_id": proposal_id}, dedup_key=dedup_key(proposal_id), defer=defer
+        conn, kind=KIND, payload=payload, dedup_key=dedup_key(proposal_id), defer=defer
     )
 
 

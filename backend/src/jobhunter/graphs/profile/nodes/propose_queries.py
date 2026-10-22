@@ -4,16 +4,19 @@ and 28): the one node of the `propose` graph, the paid call of a query proposal 
 1. **Receipts first** (§9.1). In one transaction, after the owner lock (a lost claim is `FencedOut` and reads
    nothing), the proposal and `spend_ledger.receipts(…, purpose='propose_queries')` of this operation: the
    newest completed call per `logical_call_no`, matched on the owner the gateway writes into `input_refs`.
-   `llm_outcome.walk` gives the step. A completed call with an output is checked again (`validate_proposal`
-   is pure, so the check a crash interrupted gives the same answer): a usable set is published with no
-   request; a `set_invalid` on call 1 makes the repair (logical call 2) due, and on call 2 fails the proposal
-   `invalid_output`. A structurally invalid call 1 (`invalid_output` without an output) makes the repair due
-   as well, and a terminal code fails with it, all as `walk` has it. So the one repair is made exactly once
-   across reclaims. A proposal that is no longer `running` ends the operation `succeeded` as obsolete.
+   `llm_outcome.walk` gives the step. A completed call with an output is checked again against the location
+   words of the scope version pinned in the operation's payload (`scope_version_id`, the active one when the
+   proposal was requested; `validate_proposal` is pure, so the check a crash interrupted gives the same answer
+   whatever scope was saved since): a usable set is published with no request; a `set_invalid` on call 1 makes
+   the repair (logical call 2) due, and on call 2 fails the proposal `invalid_output`. A structurally invalid
+   call 1 (`invalid_output` without an output) makes the repair due as well, and a terminal code fails with
+   it, all as `walk` has it. So the one repair is made exactly once across reclaims. A proposal that is no
+   longer `running` ends the operation `succeeded` as obsolete.
 2. **The request**, only when a call is due: `render.propose_queries_prompt` of the proposal's profile version
-   and the labels of the **active** scope's locations (§5.5.1), with `input_refs` of ids and hex hashes only:
-   `proposal_id`, `profile_version_id` and `profile_hash` (the gateway adds the owner and `deadline_s`). A
-   version whose profile is gone (purged) fails the proposal `profile_unavailable` without a request.
+   and the location labels of the pinned scope version, the scope active at the request (§5.5.1), with
+   `input_refs` of ids and hex hashes only: `proposal_id`, `profile_version_id`, `scope_version_id` and
+   `profile_hash` (the gateway adds the owner and `deadline_s`). A version whose profile is gone (purged)
+   fails the proposal `profile_unavailable` without a request; a paid usable set is still published.
 3. **The call** (`llm_outcome.drive` with the semantic check as its `usable`): `purpose='propose_queries'`,
    non-scoring, the active model policy and execution config (`gateway.active_node_config`, §13.3),
    `OperationOwner(claim)`, `logical_call_no` 1 or 2, and `deadline = monotonic() + deadline_s` of that
@@ -29,10 +32,12 @@ and 28): the one node of the `propose` graph, the paid call of a query proposal 
    minutes on the injected clock); a requeue that spends the last attempt ends it `failed`, and its hook the
    proposal.
 
-The state holds ids only (the call's id, never its output, §16). Logs carry ids, codes and counts: never a
-query text, a rationale or a profile value.
+The packaged gazetteer is loaded in a worker thread (`asyncio.to_thread`): its first load reads the data
+files, which would otherwise hold the event loop. The state holds ids only (the call's id, never its output,
+§16). Logs carry ids, codes and counts: never a query text, a rationale or a profile value.
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Final
@@ -58,7 +63,7 @@ from jobhunter.llm.spend_ledger import OperationOwner, Receipt
 from jobhunter.queries import proposals
 from jobhunter.queries.proposals import ProposalRow, ProposedQuery
 from jobhunter.run_settings import scope_from_payload
-from jobhunter.types import JSONValue
+from jobhunter.types import JSONValue, get_int
 from jobhunter.worker.operations import OperationContext, OperationDeps, lock_operation_owner
 
 NAME: Final = "propose_queries"
@@ -68,9 +73,7 @@ PROFILE_UNAVAILABLE: Final = "profile_unavailable"
 
 _PROPOSAL: Final = q("SELECT status, profile_version_id FROM query_proposals WHERE id = :p")
 _VERSION: Final = q("SELECT profile_json, profile_hash FROM profile_versions WHERE id = :pv")
-_ACTIVE_SCOPE: Final = q(
-    "SELECT s.payload FROM active_config a JOIN scope_versions s ON s.id = a.scope_version_id WHERE a.id = 1"
-)
+_SCOPE: Final = q("SELECT payload FROM scope_versions WHERE id = :s")
 
 type Checked = tuple[list[ProposedQuery], list[str]]
 
@@ -87,15 +90,20 @@ async def _receipts(
     return proposal, receipts
 
 
-async def _scope_labels(engine: AsyncEngine) -> tuple[str, ...]:
-    """The labels of the active scope's locations (§5.5.1), read without a lock."""
+async def _scope_labels(engine: AsyncEngine, scope_version_id: int) -> tuple[str, ...]:
+    """The labels of the scope version's locations (§5.5.1), read without a lock (scope versions are
+    immutable)."""
     async with engine.connect() as conn:
-        payload = (await conn.execute(_ACTIVE_SCOPE)).scalar_one()
+        payload = (await conn.execute(_SCOPE, {"s": scope_version_id})).scalar_one()
     return tuple(location.label for location in scope_from_payload(payload).locations)
 
 
 async def _request(
-    engine: AsyncEngine, proposal_id: int, profile_version_id: int, labels: tuple[str, ...]
+    engine: AsyncEngine,
+    proposal_id: int,
+    profile_version_id: int,
+    scope_version_id: int,
+    labels: tuple[str, ...],
 ) -> RenderedPrompt | None:
     """The request of the proposal (module docstring, step 2), or `None` when its profile is gone."""
     async with engine.connect() as conn:
@@ -106,6 +114,7 @@ async def _request(
     refs: dict[str, JSONValue] = {
         "proposal_id": proposal_id,
         "profile_version_id": profile_version_id,
+        "scope_version_id": scope_version_id,
         "profile_hash": bytes(row.profile_hash).hex(),
     }
     return replace(prompt, input_refs=refs)
@@ -243,8 +252,10 @@ def make_propose_queries(deps: ProfileDeps) -> ProposalNode:
                 locked = await proposals.lock_proposal(conn, proposal_id)
                 await proposals.end_obsolete(conn, op, proposal_id, None if locked is None else locked.status)
             return {"steps": [NAME], "outcome": OBSOLETE}
-        labels = await _scope_labels(deps.engine)
-        checker = _Checker(proposals.location_words(labels, Gazetteer.load()))
+        scope_version_id = get_int(dict(claim.payload), "scope_version_id")  # pinned at the request
+        labels = await _scope_labels(deps.engine, scope_version_id)
+        gazetteer = await asyncio.to_thread(Gazetteer.load)  # its first load reads files: off the loop
+        checker = _Checker(proposals.location_words(labels, gazetteer))
         checker.add_receipts(receipts)
         step: Use | Call | Fail | Requeue = llm_outcome.walk(receipts)
         if isinstance(step, Use):
@@ -260,7 +271,9 @@ def make_propose_queries(deps: ProfileDeps) -> ProposalNode:
                 _log_set_invalid(op, proposal_id, step, receipt=True)
                 step = llm_outcome.after_invalid(step.logical_call_no)
         if isinstance(step, Call):
-            prompt = await _request(deps.engine, proposal_id, proposal.profile_version_id, labels)
+            prompt = await _request(
+                deps.engine, proposal_id, proposal.profile_version_id, scope_version_id, labels
+            )
             if prompt is None:
                 step = Fail(PROFILE_UNAVAILABLE)
             else:

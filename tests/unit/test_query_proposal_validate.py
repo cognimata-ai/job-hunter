@@ -15,6 +15,8 @@ from jobhunter.geo.gazetteer import Gazetteer
 from jobhunter.llm.schemas.queries import QueryProposal, QueryProposalOut
 from jobhunter.normalize.text import fold
 from jobhunter.queries.proposals import (
+    ALT_SPELLING_STOPWORDS,
+    LABEL_STOPWORDS,
     LOCATION_WORDS_EXTRA,
     ProposedQuery,
     location_words,
@@ -126,10 +128,62 @@ def test_a_place_is_a_location_word_only_as_whole_words() -> None:
 
 
 def test_a_label_particle_is_no_location_word() -> None:
-    """`Frankfurt am Main` is a scope label: its place words are location words, its particle `am` is not."""
-    assert {"frankfurt", "main"} <= WORDS and "am" not in WORDS
-    kept, issues = check([*base_items(), item("Leiter am Standort", lang="de")])
-    assert (texts(kept), issues) == ([*BASE_TEXTS, "Leiter am Standort"], [])
+    """`Frankfurt am Main` is a scope label: its place word is a location word, its particle `am` and its
+    generic word `main` are not."""
+    assert "frankfurt" in WORDS and not {"am", "main"} & WORDS
+    kept, issues = check([*base_items(), item("Leiter am Standort", lang="de"), item("Main Developer")])
+    assert (texts(kept), issues) == ([*BASE_TEXTS, "Leiter am Standort", "Main Developer"], [])
+
+
+# Labels whose generic words are stop-listed (`bad`, `neu`, `oder`, `weil`, `main`); invented locations aside,
+# each is a German place.
+STOP_LABELS: Final = ["Bad Homburg vor der Höhe", "Neu-Isenburg", "Frankfurt (Oder)", "Weil am Rhein"]
+SPELLING_STOPS: Final = {
+    "gerne",
+    "monster",
+    "kilo",
+    "kil",
+    "kyle",
+    "bon",
+    "esse",
+    "galle",
+    "nuss",
+    "mers",
+    "mors",
+    "mite",
+    "minster",
+    "colonia",
+}
+
+
+def test_stop_listed_words_are_no_location_words() -> None:
+    gazetteer = Gazetteer.load()
+    words = location_words([*STOP_LABELS, "Frankfurt am Main"], gazetteer)
+    assert ALT_SPELLING_STOPWORDS == SPELLING_STOPS
+    assert LABEL_STOPWORDS == {"bad", "neu", "oder", "weil", "main"}
+    assert not (SPELLING_STOPS | LABEL_STOPWORDS) & words
+    assert all(word == fold(word) for word in ALT_SPELLING_STOPWORDS | LABEL_STOPWORDS)
+    # each stop-listed spelling is another spelling of a large place, never a large place's own name
+    large = gazetteer.places_of_population(100_000)
+    assert SPELLING_STOPS <= {spelling for place in large for spelling in place.alt_folded}
+    assert not SPELLING_STOPS & {place.folded for place in large}
+    common = [item("Gerne Teamlead", lang="de"), item("Monster Truck Mechaniker", lang="de")]
+    common += [item("Kilo Logistik Planer", lang="de"), item("Oder Weil Bad Neu Analyst", lang="de")]
+    kept, issues = validate_proposal(QueryProposalOut(queries=[*base_items(), *common]), location_words=words)
+    assert (texts(kept), issues) == ([*BASE_TEXTS, *(query.text for query in common)], [])
+
+
+def test_the_places_stay_location_words_beside_the_stop_lists() -> None:
+    """The primary names, the real other spellings and the place words of the labels are kept."""
+    words = location_words(STOP_LABELS, Gazetteer.load())
+    spellings = {"munich", "cologne", "koeln", "frankfurt", "colonia agrippina"}
+    names = {"koln", "herne", "munster", "kiel", "bonn", "essen", "halle", "neuss", "moers", "mitte"}
+    labels = {"homburg", "hohe", "isenburg", "rhein"}
+    assert spellings | names | labels <= words
+    kept, issues = check(
+        [*base_items(), item("Backend Developer Cologne"), item("Entwickler Koeln", lang="de")]
+    )
+    assert (texts(kept), issues) == (BASE_TEXTS, ["location_word", "location_word"])
 
 
 def test_five_valid_items_are_an_invalid_set() -> None:

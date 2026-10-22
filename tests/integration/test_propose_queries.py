@@ -8,6 +8,7 @@ invented candidate). No real CV, and no paid call.
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any, Final
 
@@ -16,12 +17,15 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import canonical_json
+from jobhunter.geo.gazetteer import Gazetteer
 from jobhunter.graphs.profile.graph import thread_id
 from jobhunter.llm import fake
 from jobhunter.llm.prompts.render import propose_queries_prompt
 from jobhunter.llm.schemas.profile import ConfirmedProfile
+from jobhunter.llm.schemas.queries import QueryProposalOut
 from jobhunter.profile.operations import proposal_failed
 from jobhunter.queries import proposals
+from jobhunter.queries.proposals import location_words, validate_proposal
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import PausePoint
@@ -80,6 +84,44 @@ async def proposed(engine: AsyncEngine, client: httpx.AsyncClient) -> tuple[int,
     return version_id, proposal_id, int((await operation_of(engine, proposal_id)).id)
 
 
+_ACTIVE_SCOPE: Final = sa.text(
+    "SELECT a.scope_version_id, s.payload FROM active_config a "
+    "JOIN scope_versions s ON s.id = a.scope_version_id"
+)
+_NEW_SCOPE: Final = sa.text(
+    "INSERT INTO scope_versions (scope_hash, payload) VALUES (sha256(:h), CAST(:p AS jsonb)) "
+    "ON CONFLICT (scope_hash) DO NOTHING"
+)
+_SCOPE_OF_HASH: Final = sa.text("SELECT id FROM scope_versions WHERE scope_hash = sha256(:h)")
+
+
+async def active_scope_id(engine: AsyncEngine) -> int:
+    async with engine.connect() as conn:
+        return int((await conn.execute(_ACTIVE_SCOPE)).one().scope_version_id)
+
+
+async def activate_scope(engine: AsyncEngine, locations: list[dict[str, Any]]) -> int:
+    """The scope version of the active scope with `locations` (inserted when new), made active as a finished
+    apply leaves it."""
+    async with engine.begin() as conn:
+        payload = dict((await conn.execute(_ACTIVE_SCOPE)).one().payload)
+        payload["locations"] = locations
+        params = {"h": canonical_json(payload), "p": json.dumps(payload)}
+        await conn.execute(_NEW_SCOPE, params)
+        scope_id = int((await conn.execute(_SCOPE_OF_HASH, {"h": params["h"]})).scalar_one())
+        await conn.execute(sa.text("UPDATE active_config SET scope_version_id = :s"), {"s": scope_id})
+    return scope_id
+
+
+async def purge_profile(engine: AsyncEngine, version_id: int) -> None:
+    """The profile version's content purged, as §20.2's purge leaves it."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE profile_versions SET profile_json = NULL, purged_at = now() WHERE id = :v"),
+            {"v": version_id},
+        )
+
+
 async def assert_failed_with_the_operation(engine: AsyncEngine, proposal_id: int, code: str) -> None:
     """The proposal `failed` and its operation `failed(code)`, in one transaction, without a requeue."""
     proposal, op = await proposal_row(engine, proposal_id), await operation_of(engine, proposal_id)
@@ -106,7 +148,7 @@ async def test_a_request_creates_a_running_proposal_and_its_operation(engine, lo
     assert (op.status, op.dedup_key, op.payload) == (
         "pending",
         f"propose_queries:{proposal_id}",
-        {"proposal_id": proposal_id},
+        {"proposal_id": proposal_id, "scope_version_id": await active_scope_id(engine)},  # pinned
     )
     async with engine.connect() as conn:  # its job was deferred with the request
         jobs = await conn.execute(
@@ -137,6 +179,15 @@ async def test_the_same_key_replays_the_stored_response(engine, logged_in_client
         )
     assert await propose(logged_in_client, key) == first
     assert await count_rows(engine, "query_proposals") == 1
+
+
+async def test_a_purged_active_profile_is_a_conflict(engine, logged_in_client) -> None:
+    version_id, _ = await activate_profile(engine)
+    await purge_profile(engine, version_id)
+    r = await logged_in_client.post(URL, headers=idem(fresh_key("proposal")))
+    assert (r.status_code, r.json()["code"]) == (409, "conflict_state")
+    assert await count_rows(engine, "query_proposals") == 0
+    assert await count_rows(engine, "operations", kind="propose_queries") == 0
 
 
 async def test_no_active_profile_is_a_conflict(engine, logged_in_client) -> None:
@@ -230,6 +281,7 @@ async def test_the_call_is_a_non_scoring_propose_queries_call_with_the_active_co
     assert refs == {
         "proposal_id": proposal_id,
         "profile_version_id": version_id,
+        "scope_version_id": active.scope_version_id,
         "profile_hash": bytes(version.profile_hash).hex(),
         "deadline_s": 300,
     }
@@ -245,28 +297,13 @@ async def test_the_call_is_a_non_scoring_propose_queries_call_with_the_active_co
 
 
 async def test_the_request_names_the_active_scope_locations(engine, op_runner, logged_in_client) -> None:
-    """§5.5.1: the active scope's locations, by label; a pending scope is not yet active."""
-    async with engine.begin() as conn:
-        payload = (
-            await conn.execute(
-                sa.text(
-                    "SELECT s.payload FROM active_config a JOIN scope_versions s ON s.id = a.scope_version_id"
-                )
-            )
-        ).scalar_one()
-        payload["locations"] = [BERLIN]
-        scope_id = (
-            await conn.execute(
-                sa.text(
-                    "INSERT INTO scope_versions (scope_hash, payload) VALUES (sha256(:h), CAST(:p AS jsonb)) "
-                    "RETURNING id"
-                ),
-                {"h": canonical_json(payload), "p": json.dumps(payload)},
-            )
-        ).scalar_one()
-        await conn.execute(sa.text("UPDATE active_config SET scope_version_id = :s"), {"s": scope_id})
+    """§5.5.1: the locations of the scope active at the request, by label, even when another scope is active
+    when the operation runs."""
+    berlin_scope = await activate_scope(engine, [BERLIN])
     _, proposal_id, _ = await proposed(engine, logged_in_client)
+    await activate_scope(engine, [])  # saved after the request: not this proposal's scope
     await op_runner.run_pending()
+    assert (await operation_of(engine, proposal_id)).payload["scope_version_id"] == berlin_scope
     (request,) = fake.state().requests
     assert request.body["messages"][0]["content"].endswith('<search_locations>["Berlin"]</search_locations>')
     assert (await proposal_row(engine, proposal_id)).status == "ready"
@@ -435,11 +472,20 @@ async def test_two_successive_proposals_of_one_version_use_two_threads(
 # --- receipts: a reclaimed execution reuses what was paid ---------------------------------------------------
 
 
-async def _reclaim_during(op_runner: OpRunner, engine: AsyncEngine, op_id: int, pause: PausePoint) -> None:
-    """Execution 1 of `op_id` held at `pause`, the reconciler's reclaim, execution 2 to its end, then
-    execution 1 resumed: its next owner write is fenced, and it writes nothing."""
+async def _reclaim_during(
+    op_runner: OpRunner,
+    engine: AsyncEngine,
+    op_id: int,
+    pause: PausePoint,
+    meanwhile: Callable[[], Awaitable[object]] | None = None,
+) -> None:
+    """Execution 1 of `op_id` held at `pause`, `meanwhile` (a change while it is held), the reconciler's
+    reclaim, execution 2 to its end, then execution 1 resumed: its next owner write is fenced, and it writes
+    nothing."""
     first = asyncio.create_task(op_runner.run_one(op_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 60)
+    if meanwhile is not None:
+        await meanwhile()
     await reclaim_stale_now(engine, op_id)
     await op_runner.run_one(op_id)
     pause.resume()
@@ -515,6 +561,75 @@ async def test_a_reclaim_after_a_refusal_fails_without_a_request(engine, op_runn
     await _reclaim_during(op_runner, engine, op_id, PausePoint(AFTER_CALL))
     op = await operation_of(engine, proposal_id)
     assert ((await proposal_row(engine, proposal_id)).status, op.last_error_code) == ("failed", "refused")
+    assert served() == 1
+
+
+async def test_a_scope_saved_between_a_crash_and_the_reclaim_leaves_a_usable_receipt_usable(
+    engine, op_runner, logged_in_client
+) -> None:
+    """The receipt is checked against the scope pinned at the request, not the one active at the resume: under
+    the new scope the paid set would be invalid, and its repair paid for."""
+    _, proposal_id, op_id = await proposed(engine, logged_in_client)
+    # a synthetic label whose word four of the eight stored queries hold: four kept items are too few
+    backend_scope = [{**BERLIN, "label": "Backend"}]
+    stored = QueryProposalOut.model_validate(SYNTHETIC_QUERIES)
+    under_new_scope = location_words(["Backend"], Gazetteer.load())
+    assert validate_proposal(stored, location_words=under_new_scope) == ([], ["set_invalid"])
+
+    async def save_scope() -> None:
+        await activate_scope(engine, backend_scope)
+
+    await _reclaim_during(op_runner, engine, op_id, PausePoint(AFTER_CALL), meanwhile=save_scope)
+    proposal = await proposal_row(engine, proposal_id)
+    assert (proposal.status, proposal.items) == ("ready", {"queries": QUERIES})
+    assert served() == 1 and [r.logical_call_no for r in await tries(engine)] == [1]  # no repair paid
+    assert await ledger_states(engine, op_id) == ["billed"]
+    assert (await operation_of(engine, proposal_id)).attempts == 1
+
+
+# --- a purged profile ------------------------------------------------------------------------------------
+
+
+async def test_a_purged_profile_fails_the_proposal_without_a_request(
+    engine, op_runner, logged_in_client
+) -> None:
+    version_id, proposal_id, _ = await proposed(engine, logged_in_client)
+    await purge_profile(engine, version_id)
+    await op_runner.run_pending()
+    await assert_failed_with_the_operation(engine, proposal_id, "profile_unavailable")
+    assert served() == 0 and await count_rows(engine, "llm_calls") == 0
+
+
+async def test_a_purge_after_an_invalid_set_fails_without_paying_the_repair(
+    engine, op_runner, logged_in_client
+) -> None:
+    fake.scenario("set_invalid", "ok")
+    version_id, proposal_id, op_id = await proposed(engine, logged_in_client)
+
+    async def purge() -> None:
+        await purge_profile(engine, version_id)
+
+    await _reclaim_during(op_runner, engine, op_id, PausePoint(AFTER_CALL), meanwhile=purge)
+    proposal, op = await proposal_row(engine, proposal_id), await operation_of(engine, proposal_id)
+    assert (proposal.status, op.status, op.last_error_code, op.attempts) == (
+        "failed",
+        "failed",
+        "profile_unavailable",
+        1,
+    )
+    assert served() == 1 and [r.logical_call_no for r in await tries(engine)] == [1]
+
+
+async def test_a_purge_after_a_usable_set_still_publishes_it(engine, op_runner, logged_in_client) -> None:
+    """The paid set needs no request, so the purged profile is never read."""
+    version_id, proposal_id, op_id = await proposed(engine, logged_in_client)
+
+    async def purge() -> None:
+        await purge_profile(engine, version_id)
+
+    await _reclaim_during(op_runner, engine, op_id, PausePoint(AFTER_CALL), meanwhile=purge)
+    proposal = await proposal_row(engine, proposal_id)
+    assert (proposal.status, proposal.items) == ("ready", {"queries": QUERIES})
     assert served() == 1
 
 
