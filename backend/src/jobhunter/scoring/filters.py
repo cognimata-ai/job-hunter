@@ -14,7 +14,8 @@ expiry).
   and every job location lies beyond twice the radius of *each* scope location (a location is *beyond* only
   when it is resolved and all its candidates are; candidates in different bands make the band unknown, §8.12).
 - `work_mode_excluded`, `employment_type_excluded`, `excluded_industry`: structured values only; an empty
-  structured set says nothing.
+  structured set says nothing. The structured industry is compared as the fixed point of `fold`, the form the
+  scope stores its industries in (FR-9).
 - `seniority_out_of_range`: only for `seniority_range.mode == "explicit"` (a `profile_relative` range is
   unknown in M1, plan Deviation 8). The title's tokens and the structured level map onto `SENIORITY_LADDER`;
   the job fails when it has such evidence and every level of it lies outside `[min, max]`. A bound that is
@@ -22,7 +23,10 @@ expiry).
   level is the value a provider wrote (`STRUCTURED_LEVELS`: SmartRecruiters' `experienceLevel.id`, Personio's
   `seniority`) or a ladder level; it stands for every level it may cover (`mid_senior_level` for mid to
   principal), and a value that is not known says nothing.
-- `excluded_company`: the company key is one of the scope's.
+- `excluded_company`: the company key is one of the scope's. The scope stores an exclusion as the fixed point
+  of `company_key` (`settings.model`), while identity keys a job in one pass (`jobs.company_key`, which stays
+  as it is), so the job's key is compared as its fixed point (`normalize.text.fixed_point`; final review
+  FR-9); a key with no stable form matches nothing.
 - `excluded_keyword`: a whole-word match in the title (and in the description when the scope says so). Text
   and keywords go through the normalisation of `title_norm` (`normalize_title`: separators, `Sr.`, accents,
   case) before the match, so `Front-End` and a title normalised to `front end` meet.
@@ -62,7 +66,8 @@ from jobhunter.db.seed import canonical_json, content_hash
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.geo.gazetteer import distance_km
-from jobhunter.normalize.text import fold
+from jobhunter.normalize.companies import company_key
+from jobhunter.normalize.text import fixed_point, fold
 from jobhunter.normalize.titles import SENIORITY_LADDER, normalize_title
 from jobhunter.run_settings import ScopeLocation, ScopeSettings, scope_from_payload
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
@@ -297,13 +302,14 @@ def _evaluate(facts: DetFacts, description: _Description, scope: ScopeSettings) 
         reasons.append("employment_type_excluded")
     if _seniority_out_of_range(facts, scope):
         reasons.append("seniority_out_of_range")
-    if facts.company_key in scope.excluded_companies:
+    if fixed_point(company_key, facts.company_key) in scope.excluded_companies:
         reasons.append("excluded_company")
     if _excluded_keyword(facts, description, scope):
         reasons.append("excluded_keyword")
     if facts.ad_language != "unknown" and facts.ad_language not in scope.accepted_ad_languages:
         reasons.append("ad_language_excluded")
-    if facts.industry_structured is not None and fold(facts.industry_structured) in scope.industries_exclude:
+    industry = facts.industry_structured
+    if industry is not None and fixed_point(fold, industry) in scope.industries_exclude:
         reasons.append("excluded_industry")
     return HardFilterResult(not reasons, tuple(reasons))
 

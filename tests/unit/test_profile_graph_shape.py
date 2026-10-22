@@ -44,6 +44,7 @@ from jobhunter.graphs.profile.state import (
 )
 from jobhunter.llm.errors import BudgetExhausted, InvalidOutput, LLMTransient, Refused
 from jobhunter.profile.errors import UploadRejected
+from jobhunter.settings.model import ExecutionNode
 from jobhunter.worker import operations as ops
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
@@ -172,11 +173,16 @@ async def test_sanitized_wraps_a_proposal_node_too() -> None:
     assert (raised.value.node, raised.value.error_class) == ("propose_queries", "ValueError")
 
 
-def test_an_llm_node_has_no_retry_the_maximum_deadline_and_traces_nothing() -> None:
-    """Deviation 28: a graph compiled once cannot take the active `deadline_s`, so an LLM node's timeout is
-    the §13.1 maximum (1,800 s) plus a margin, and the gateway enforces the deadline per call. §9.1: the
-    gateway owns the retries and the node's input and output are omitted from any trace (Tasks 13 and 20)."""
-    assert LLM_NODE_TIMEOUT == TimeoutPolicy(run_timeout=1800 + 60)
+def test_an_llm_node_has_no_retry_two_maximum_deadlines_and_traces_nothing() -> None:
+    """Deviation 28: a graph compiled once cannot take the active `deadline_s`, and the gateway enforces the
+    deadline per call. An LLM node makes up to two logical calls, the call and its one repair, each with the
+    active `deadline_s` (final review FR-7), so its timeout is twice the §13.1 maximum (1,800 s) plus a
+    margin: a slow call and a slow repair within their own deadlines are never cut by the node's policy.
+    §9.1: the gateway owns the retries and the node's input and output are omitted from any trace (Tasks 13
+    and 20)."""
+    (most,) = [m.le for m in ExecutionNode.model_fields["deadline_s"].metadata if hasattr(m, "le")]
+    assert most == 1800
+    assert LLM_NODE_TIMEOUT == TimeoutPolicy(run_timeout=2 * most + 60)
     assert (LLM_NODE_TRACE.process_inputs, LLM_NODE_TRACE.process_outputs) == (omit_payload, omit_payload)
     graph = StateGraph(ProfileState)
     add_llm_node(graph, "extract_profile", _returning)

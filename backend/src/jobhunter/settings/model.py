@@ -20,9 +20,10 @@
 - **Normal forms.** `industries_include`/`industries_exclude` are stored case-folded (`normalize.text.fold`;
   §13.1 "case-folded") and `excluded_companies` as company keys (`normalize.companies.company_key`, §8.3: what
   the hard filter compares a job's `company_key` with, §11.1), so a change of case or legal form is no
-  change. Each normaliser is applied until the value no longer changes (`_settled`): both are idempotent on
-  ordinary text, but not on a few inputs (`company_key` of a name ending in two country words, `fold` of a
-  spacing diacritic), and a stored value must validate to itself.
+  change. Each normaliser is applied until the value no longer changes (`_settled`, `normalize.text.
+  fixed_point`): both are idempotent on ordinary text, but not on a few inputs (`company_key` of a name ending
+  in two country words, `fold` of a spacing diacritic), and a stored value must validate to itself. The hard
+  filter compares the same fixed point of a job's one-pass key and industry with them (`scoring.filters`).
 - **Set-valued lists** (`work_modes`, `employment_types`, `accepted_ad_languages`, `critic_light_triggers`)
   hold no value twice and are kept in the order their type declares, so a reordering is no change and derives
   no new row (§13.2). Other lists keep their order.
@@ -54,7 +55,7 @@ from pydantic_core import PydanticCustomError
 from jobhunter.db.seed import ANCHOR_LOCAL
 from jobhunter.llm.pricing import MODELS, Effort, Model
 from jobhunter.normalize.companies import company_key
-from jobhunter.normalize.text import fold
+from jobhunter.normalize.text import fixed_point, fold
 from jobhunter.types import JSONValue
 
 Node = Literal["generate", "revise", "critic", "extract_profile", "propose_queries"]
@@ -86,7 +87,6 @@ _DECIMAL_TEXT: Final = re.compile(r"-?[0-9]+(\.[0-9]+)?")
 _USD_PLACES: Final = 2  # the fixed scale of the USD amounts (`llm_budget`: numeric(10,2))
 _RATE_PLACES: Final = 2  # the most places of a rate, written without trailing zeros (Ruling R15-5)
 _INDUSTRY_LENGTH: Final = (2, 60)
-_SETTLE_ROUNDS: Final = 8
 _BIGINT_MAX: Final = 2**63 - 1  # the ids are `bigint` row ids (`queries.id`, `watchlist_companies.id`)
 
 
@@ -152,13 +152,12 @@ _AS_STRING: Final = PlainSerializer(_fixed_point, return_type=str, when_used="js
 
 
 def _settled(normalize: Callable[[str], str], value: str) -> str:
-    """`normalize` applied until the value no longer changes (module docstring, normal forms)."""
-    for _ in range(_SETTLE_ROUNDS):
-        again = normalize(value)
-        if again == value:
-            return value
-        value = again
-    raise PydanticCustomError("invalid", "has no stable normal form")
+    """`normalize` applied until the value no longer changes (module docstring, normal forms): its
+    `normalize.text.fixed_point`, which the hard filter also takes of a job's key and industry."""
+    settled = fixed_point(normalize, value)
+    if settled is None:
+        raise PydanticCustomError("invalid", "has no stable normal form")
+    return settled
 
 
 def _industry(value: str) -> str:

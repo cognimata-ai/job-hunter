@@ -11,8 +11,8 @@ Home-Office` do, `Hallenmanager` (which contains `halle`) and `Java Entwickler` 
   them (`Frankfurt am Main` gives `frankfurt`, `Bad Homburg` gives `homburg`);
 - the folded name of each gazetteer place with at least 100,000 inhabitants (`LARGE_PLACE_POPULATION`), and
   each of its other folded spellings but those that are common words (`ALT_SPELLING_STOPWORDS`: `gerne` for
-  Herne, `monster` for Münster, …), each whole: `munchen`, `munich`, `frankfurt am main`, `frankfurt`,
-  `mitte`;
+  Herne, `monster` for Münster, …, compared in words, so `kil'` is `kil`), each whole: `munchen`, `munich`,
+  `frankfurt am main`, `frankfurt`, `mitte`;
 - `LOCATION_WORDS_EXTRA`: the work-mode and country words and the federal states (its comment lists them).
 
 **The check** (`validate_proposal`), in two levels (Deviation 20). An item's text and rationale are trimmed
@@ -218,11 +218,16 @@ def words(text: str) -> tuple[str, ...]:
 @functools.cache
 def _large_place_words(gazetteer: Gazetteer) -> frozenset[str]:
     """The names of the large places, and their other spellings but `ALT_SPELLING_STOPWORDS`; a stop-listed
-    spelling that is a large place's own name stays."""
+    spelling that is a large place's own name stays. A spelling is compared with the stop list as the match
+    sees both, split into `words`, so `kil'` (Kiel), whose words are those of the stop-listed `kil`, is left
+    out as well (final review FR-8)."""
     places = gazetteer.places_of_population(LARGE_PLACE_POPULATION)
     names = {place.folded for place in places}
-    spellings = {spelling for place in places for spelling in place.alt_folded}
-    return frozenset(names | (spellings - ALT_SPELLING_STOPWORDS))
+    stopped = {words(stopword) for stopword in ALT_SPELLING_STOPWORDS}
+    spellings = {
+        spelling for place in places for spelling in place.alt_folded if words(spelling) not in stopped
+    }
+    return frozenset(names | spellings)
 
 
 def location_words(scope_labels: Sequence[str], gazetteer: Gazetteer) -> frozenset[str]:

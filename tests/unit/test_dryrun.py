@@ -1,8 +1,10 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from jobhunter.quota.dryrun import Warning, quota_projections
 from jobhunter.quota.windows import AccountObservation, Provider, Window, bootstrap_window
+from jobhunter.settings.model import Schedule
 
 from tests.support.quota import SETTINGS, account, seeded_run_settings
 
@@ -89,6 +91,32 @@ def test_arbeitnow_risk_beyond_the_page_cap() -> None:
     warns, proj = quota_projections(long, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
     assert proj["arbeitnow"] == {"page_cap": 10, "expected_pages": 11.811}
     assert "arbeitnow_coverage_risk" in codes(warns)
+
+
+def _interval_hours_range() -> range:
+    """§13.1's `schedule.interval_hours` range, read from the settings model (1 to 168)."""
+    metadata = Schedule.model_fields["interval_hours"].metadata
+    (low,) = [m.ge for m in metadata if hasattr(m, "ge")]
+    (high,) = [m.le for m in metadata if hasattr(m, "le")]
+    return range(low, high + 1)
+
+
+@pytest.mark.parametrize("hours", _interval_hours_range())
+def test_arbeitnow_coverage_risk_cannot_fire_within_the_settings_interval_range(hours: int) -> None:
+    """Plan Deviation 39, pinned for the spec owner (final review FR-10): with page 1 holding about 37 h and
+    `page_cap = min(10, max(3, ceil(h / 30) + 1))`, `h / 37 + 1 <= page_cap` for every interval §13.1
+    allows, so §6.8's `arbeitnow_coverage_risk` stays silent; it is a guard for a lower measured yield."""
+    settings = seeded_run_settings(interval_s=hours * 3600)
+    warns, proj = quota_projections(settings, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
+    assert "arbeitnow_coverage_risk" not in codes(warns)
+    arbeitnow = proj["arbeitnow"]
+    assert isinstance(arbeitnow, dict)
+    expected, cap = arbeitnow["expected_pages"], arbeitnow["page_cap"]
+    assert isinstance(expected, float) and isinstance(cap, int) and expected <= cap
+
+
+def test_the_sweep_covers_the_whole_settings_range() -> None:
+    assert _interval_hours_range() == range(1, 169)
 
 
 def test_serpapi_fallback_capacity_from_its_window() -> None:

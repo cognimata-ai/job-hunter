@@ -29,9 +29,11 @@ thread by its own operation's end (Task 23, §20.1).
 **The policies** (§9.1). A node without an LLM call takes `DB_RETRY` and its `TimeoutPolicy` (`NODE_TIMEOUTS`:
 `parse` and `check_pdf` 120 s, `strip_contacts`, `validate` and `draft` 30 s; `add_node`). An LLM node
 (`add_llm_node`, Tasks 13 and 20) takes no `RetryPolicy` (the gateway owns the retries, §10.4),
-`LLM_NODE_TIMEOUT` (the §13.1 maximum `deadline_s` of 1,800 s plus a margin: a graph compiled once cannot take
-the deadline an `execution` save changes at runtime, Deviation 28; the gateway enforces the active one per
-call through `CallContext.deadline`) and `LLM_NODE_TRACE` (its input and output omitted from any trace).
+`LLM_NODE_TIMEOUT` (twice the §13.1 maximum `deadline_s` of 1,800 s plus a margin: a graph compiled once
+cannot take the deadline an `execution` save changes at runtime, Deviation 28, and the node makes up to two
+logical calls, the call and its one repair, each with the active deadline, which the gateway enforces per
+call through `CallContext.deadline`; final review FR-7) and `LLM_NODE_TRACE` (its input and output omitted
+from any trace).
 `sanitized` and `add_llm_node` take a node of either state (`nodes.StateNode`).
 
 **`sanitized`** (Deviation 25) wraps every profile node. LangGraph 1.2.15 stores the exception that escapes
@@ -99,8 +101,9 @@ NODE_TIMEOUTS: Final[Mapping[str, timedelta]] = MappingProxyType(
         draft_node.NAME: draft_node.NODE_TIMEOUT,
     }
 )
-# The §13.1 maximum `deadline_s` (1,800 s) plus a margin (Deviation 28).
-LLM_NODE_TIMEOUT: Final = TimeoutPolicy(run_timeout=1800 + 60)
+# Two logical calls (the call and its repair) at the §13.1 maximum `deadline_s` (1,800 s), plus a margin
+# (Deviation 28, final review FR-7).
+LLM_NODE_TIMEOUT: Final = TimeoutPolicy(run_timeout=2 * 1800 + 60)
 LLM_NODE_TRACE: Final = TracePolicy(process_inputs=omit_payload, process_outputs=omit_payload)
 # The errors whose text is a code (module docstring); `asyncio.CancelledError` is no `Exception` at all.
 PASS_THROUGH: Final = (FencedOut, GraphBubbleUp, LLMError, UploadRejected, TransitionConflict)

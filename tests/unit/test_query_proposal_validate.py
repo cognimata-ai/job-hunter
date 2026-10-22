@@ -173,6 +173,27 @@ def test_stop_listed_words_are_no_location_words() -> None:
     assert (texts(kept), issues) == ([*BASE_TEXTS, *(query.text for query in common)], [])
 
 
+def test_a_stop_listed_spelling_is_left_out_as_the_match_compares_it() -> None:
+    """Final review FR-8: Kiel's other spelling `kil'` is no stop-listed word as written, but the match splits
+    it into the word `kil`, which is. The stop list is compared in that representation, so the ordinary word
+    is no location word; the places stay ones."""
+    gazetteer = Gazetteer.load()
+    assert "kil'" in {s for p in gazetteer.places_of_population(100_000) for s in p.alt_folded}
+    words = location_words(["Musterstadt"], gazetteer)
+    kept, issues = validate_proposal(
+        QueryProposalOut(queries=[*base_items(), item("Kil Spezialist", lang="de")]), location_words=words
+    )
+    assert (texts(kept), issues) == ([*BASE_TEXTS, "Kil Spezialist"], [])
+    places = [
+        item("Backend Developer Munich"),
+        item("Entwickler Koeln", lang="de"),
+        item("Frankfurt Engineer"),
+    ]
+    kept, issues = validate_proposal(QueryProposalOut(queries=[*base_items(), *places]), location_words=words)
+    assert (texts(kept), issues) == (BASE_TEXTS, ["location_word"] * 3)
+    assert {"munich", "koeln", "frankfurt", "kiel"} <= words
+
+
 def test_the_places_stay_location_words_beside_the_stop_lists() -> None:
     """The primary names, the real other spellings and the place words of the labels are kept."""
     words = location_words(STOP_LABELS, Gazetteer.load())
