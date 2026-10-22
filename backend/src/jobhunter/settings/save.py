@@ -25,7 +25,10 @@
    `settings.after_llm_tuple` lies between `llm_tuple` and `scope`.
    - `llm_tuple`: `model_policy_id := new`, and with an active profile the tuple (`ensure_tuple`) and
      `llm_tuple_id := it`. §12.6 (d) to (f) and `create_targets_for_tuple` are M3's (Deviation 10);
-   - `scope`: `scope_apply.set_desired_scope` with the derived scope;
+   - `scope`: `scope_apply.set_desired_scope` with the derived scope. When that is the active scope (a
+     revert, §13.4 step 5's second remedy), nothing is left unapplied: after every action, so after the
+     `budget` action's month row, every open `scope.apply_failed` is resolved
+     (`scope_apply.resolve_apply_failed`, other domain rows), before `ranking_state`;
    - `budget`: the month row is created if new (`ensure_month`) and changed under its lock (§6.9.1): a new cap
      through `change_cap` (with the new buffer), a new buffer alone through `change_buffer`, which leaves a
      lowering `change_cap` recorded earlier at its own time. The other budget fields live in the settings
@@ -183,6 +186,7 @@ class _Activation:
     flips: dict[str, int] = field(default_factory=dict)
     tuple_flipped: bool = False
     apply_scope_operation_id: int | None = None
+    scope_is_active: bool = False  # the `scope` action's desired scope is the active one
 
 
 _GATED: Final[frozenset[EffectClass]] = frozenset({"llm_tuple", "evaluation_policy"})
@@ -216,6 +220,7 @@ async def _apply_scope(a: _Activation) -> None:
     a.apply_scope_operation_id = await scope_apply.set_desired_scope(
         a.conn, a.ids.scope_version_id, now=a.now, defer=a.defer
     )
+    a.scope_is_active = a.apply_scope_operation_id is None
 
 
 async def _apply_budget(a: _Activation) -> None:
@@ -369,6 +374,8 @@ async def save_settings(
             await _ACTIONS[effect](a)
         if effect == "llm_tuple":
             await afault_point(AFTER_LLM_TUPLE_POINT)
+    if a.scope_is_active:  # other domain rows: after the month row, before `ranking_state` (step 6)
+        await scope_apply.resolve_apply_failed(conn)
     if a.tuple_flipped:
         await ranking.bump(conn)
     await conn.execute(

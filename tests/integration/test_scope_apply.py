@@ -5,11 +5,15 @@ Every job is synthetic (`job_factory.many`: an invented company per job, the act
 every scope is the seeded one with a Berlin location at some radius (`save_scope`). The fault point
 `scope_apply.after_chunk` is reached after each chunk's commit: a test replaces it to pause there, to record
 the progress, or to change a job between the last chunk and the final transaction.
+
+Every test also checks, when it ends, that each `scope_apply_*` event it logged carries ids, counts and codes
+only (`scope_apply_events`, autouse); one test logs every such event.
 """
 
 import asyncio
 import dataclasses
 import hashlib
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
@@ -47,6 +51,50 @@ pytestmark = pytest.mark.integration
 NOW: Final = datetime(2026, 10, 22, 9, 30, tzinfo=UTC)
 RETRY_URL: Final = "/api/settings/scope/retry-apply"
 RECONCILER: Final = "scope_apply_failed"
+SCOPE_APPLY_EVENTS: Final = frozenset(
+    {
+        "scope_apply_flipped",
+        "scope_apply_obsolete",
+        "scope_apply_incomplete",
+        "scope_apply_failed_cleared",
+        "scope_apply_rerequested",
+        "scope_apply_retry_requested",
+        "scope_apply_retry_refused",
+    }
+)
+# What every rendered event has (`request_id`: the api's own UUIDv7, bound by the edge).
+_STANDARD_LOG_KEYS: Final = frozenset({"event", "level", "logger", "ts", "request_id"})
+_ID_LOG_KEYS: Final = frozenset(
+    {"operation_id", "scope_version_id", "pending_scope_version_id", "previous_operation_id"}
+)
+_RETRY_REFUSALS: Final = frozenset({"scope_active", "apply_live"})
+
+
+def scope_apply_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The `scope_apply_*` events of `events`, each checked to be a known event whose fields are ids (an int,
+    or null for an absent pointer), the `checks` count, or the retry refusal's `reason` code: no value of a
+    payload, a scope or a job."""
+    found = [e for e in events if str(e["event"]).startswith("scope_apply_")]
+    for event in found:
+        assert event["event"] in SCOPE_APPLY_EVENTS, event["event"]
+        for key, value in event.items():
+            if key in _STANDARD_LOG_KEYS:
+                continue
+            if key in _ID_LOG_KEYS:
+                assert value is None or type(value) is int, (event["event"], key)
+            elif key == "checks":
+                assert type(value) is int and value >= 1, (event["event"], key)
+            elif key == "reason":
+                assert event["event"] == "scope_apply_retry_refused" and value in _RETRY_REFUSALS, value
+            else:
+                pytest.fail(f"{event['event']} logs the field {key!r}")
+    return found
+
+
+@pytest.fixture(autouse=True)
+def _scope_apply_logs_carry_ids_and_codes_only(log_events: Any) -> Iterator[None]:
+    yield
+    scope_apply_events(log_events())
 
 
 # --- Review Focus 5 pin -------------------------------------------------------------------------------------
@@ -272,6 +320,34 @@ async def test_a_pointer_moved_back_keeps_the_reused_apply_and_ends_the_other_ob
     assert (await active_scope_id(engine), await pending_scope_id(engine)) == (a, None)
 
 
+async def test_a_hint_never_ends_the_apply_whose_pointer_moves_back_before_its_final_check(
+    logged_in_client, engine, op_runner, job_factory, monkeypatch
+) -> None:
+    """Ruling R18-1: A's chunk reads pointer B and only stops its precompute; the pointer moves back to A (a
+    save that reuses A's live apply) before A's final transaction, which then finds A pending and incomplete,
+    precomputes again and flips. An apply ended on its hint would leave A pending with no live apply."""
+    await job_factory.many(5)
+    first = await save_scope(logged_in_client, radius_km=30)  # pending = A
+    await save_scope(logged_in_client, radius_km=50)  # pending = B
+    (a,) = await scope_ids_of(engine, first)
+    op_a = first["apply_scope_operation_id"]
+    real_final = scope_apply._final
+    between: list[tuple[int, int]] = []  # (A's incomplete jobs, the reused apply), once
+
+    async def pointer_back_first(ctx: Any, sid: int, *, now: datetime) -> Any:
+        if not between:  # after A's hint returned, before its first final transaction
+            reused = await save_scope(logged_in_client, radius_km=30)  # pending = A again
+            between.append((await incomplete_jobs_for(engine, a), reused["apply_scope_operation_id"]))
+        return await real_final(ctx, sid, now=now)
+
+    monkeypatch.setattr(scope_apply, "_final", pointer_back_first)
+    await op_runner.run_one(op_a)
+    assert between == [(5, op_a)]  # the hint stopped A before any chunk; the save reused A's live apply
+    assert await operation_end(engine, op_a) == ("succeeded", {"done": 5, "total": 5})
+    assert (await active_scope_id(engine), await pending_scope_id(engine)) == (a, None)
+    assert await incomplete_jobs_for(engine, a) == 0
+
+
 async def test_a_scope_reverted_to_the_active_one_ends_its_apply_obsolete(
     logged_in_client, engine, op_runner, job_factory
 ) -> None:
@@ -328,6 +404,46 @@ async def test_a_permanently_failed_apply_is_cleared_and_retry_apply_flips_it(
     await op_runner.run_one(new_op)
     assert (await active_scope_id(engine), await pending_scope_id(engine)) == (sid, None)
     assert await open_apply_failed_alerts(engine) == []  # resolved by the successful apply
+
+
+async def test_a_scope_revert_after_a_permanent_failure_resolves_the_alert(
+    logged_in_client, engine, current_epoch
+) -> None:
+    """§13.4 step 5's second remedy: reverting the scope fields (a new settings version whose scope is the
+    active one) leaves nothing unapplied, so the save resolves `scope.apply_failed`."""
+    s0 = await active_scope_id(engine)
+    saved = await save_scope(logged_in_client, radius_km=30)
+    (sid,) = await scope_ids_of(engine, saved)
+    await fail_for_good(engine, saved["apply_scope_operation_id"])
+    assert await run_reconciler(RECONCILER, engine, now=NOW, epoch=current_epoch) == 1
+    assert [key for key, _, _ in await open_apply_failed_alerts(engine)] == [
+        f"scope.apply_failed:scope:{sid}"
+    ]
+    payload = (await settings_body(logged_in_client))["payload"]
+    payload["scope"]["locations"] = []
+    reverted = await save(logged_in_client, payload)
+    assert "scope" in reverted["version"]["effect_classes"] and reverted["apply_scope_operation_id"] is None
+    assert await open_apply_failed_alerts(engine) == []
+    assert (await active_scope_id(engine), await pending_scope_id(engine)) == (s0, None)
+    assert await scope_ids_of(engine, reverted) == [s0]
+
+
+async def test_a_save_that_leaves_the_scope_unapplied_keeps_the_alert(
+    logged_in_client, engine, current_epoch
+) -> None:
+    """The alert stays while the active version's scope is still not the active one: a save of another
+    class, and a save of yet another scope (its own apply now pending), resolve nothing."""
+    saved = await save_scope(logged_in_client, radius_km=30)
+    (sid,) = await scope_ids_of(engine, saved)
+    await fail_for_good(engine, saved["apply_scope_operation_id"])
+    assert await run_reconciler(RECONCILER, engine, now=NOW, epoch=current_epoch) == 1
+    payload = (await settings_body(logged_in_client))["payload"]
+    payload["display"]["ui_language"] = "de" if payload["display"]["ui_language"] != "de" else "en"
+    assert "scope" not in (await save(logged_in_client, payload))["version"]["effect_classes"]
+    await save_scope(logged_in_client, radius_km=60)
+    assert [key for key, _, _ in await open_apply_failed_alerts(engine)] == [
+        f"scope.apply_failed:scope:{sid}"
+    ]
 
 
 async def test_retry_apply_is_409_while_an_apply_is_live_or_when_the_scope_is_active(
@@ -439,3 +555,54 @@ async def test_the_scope_apply_failed_reconciler_follows_the_fence_rule(
     )  # nothing written
     assert await run_reconciler(RECONCILER, engine, now=NOW, epoch=current_epoch) == 1
     assert await pending_scope_id(engine) is None
+
+
+async def test_the_reconciler_takes_no_active_config_lock_when_nothing_is_pending(
+    engine, current_epoch
+) -> None:
+    """With no pending scope a tick's pass ends on its plain read: it does not queue behind a transaction that
+    holds `active_config` `FOR SHARE` (a publish, a collection transaction) while it holds the epoch fence."""
+    async with engine.connect() as holder:
+        await holder.execute(text("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE"))
+        assert (
+            await asyncio.wait_for(run_reconciler(RECONCILER, engine, now=NOW, epoch=current_epoch), 5) == 0
+        )
+        await holder.rollback()
+
+
+async def test_every_scope_apply_event_carries_ids_and_codes_only(
+    logged_in_client, engine, op_runner, job_factory, current_epoch, monkeypatch, log_events
+) -> None:
+    job_ids = await job_factory.many(3)
+    s0 = await active_scope_id(engine)
+    assert (await logged_in_client.post(RETRY_URL)).status_code == 409  # retry refused: the scope is active
+    first = await save_scope(logged_in_client, radius_km=30)
+    second = await save_scope(logged_in_client, radius_km=50)
+    await op_runner.run_one(first["apply_scope_operation_id"])  # obsolete
+    rounds = 0
+
+    async def change_every_round(point: str) -> None:
+        nonlocal rounds
+        if point == scope_apply.AFTER_CHUNK_POINT:
+            rounds += 1
+            digest = hashlib.sha256(f"events round {rounds}".encode()).digest()
+            await change_det_facts(engine, job_ids[0], digest, active_scope=s0)
+
+    monkeypatch.setattr(scope_apply, "afault_point", change_every_round)
+    op_b = second["apply_scope_operation_id"]
+    await op_runner.run_one(op_b)  # incomplete: requeued
+    monkeypatch.setattr(scope_apply, "afault_point", no_fault)
+    await make_due(engine, op_b)
+    await op_runner.run_one(op_b)  # flipped
+    third = await save_scope(logged_in_client, radius_km=70)
+    await fail_for_good(engine, third["apply_scope_operation_id"])
+    assert await run_reconciler(RECONCILER, engine, now=NOW, epoch=current_epoch) == 1  # failed, cleared
+    retry = await logged_in_client.post(RETRY_URL)  # retry requested
+    assert retry.status_code == 202, retry.text
+    async with engine.begin() as conn:
+        assert await cancel_operation(conn, retry.json()["operation_id"], reason="test_cancelled")
+    assert await run_reconciler(RECONCILER, engine, now=NOW, epoch=current_epoch) == 1  # re-requested
+    events = scope_apply_events(log_events())
+    assert {e["event"] for e in events} == SCOPE_APPLY_EVENTS
+    rendered = str(log_events()).lower()
+    assert "berlin" not in rendered and "musterfirma" not in rendered and "geonames" not in rendered

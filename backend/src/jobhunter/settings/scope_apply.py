@@ -15,7 +15,11 @@ active scope once they are complete.
   reconciler). The caller holds `active_config FOR UPDATE` (§9.1: the first lock; it is taken again here, a
   no-op, before the pointers are read). It returns the `apply_scope` operation's id, or `None` when no apply
   is needed:
-  - the desired scope is the active one (a revert): `pending := NULL`, as the CHECK forbids pending = active;
+  - the desired scope is the active one (a revert): `pending := NULL`, as the CHECK forbids pending = active.
+    `None` then means that nothing is left unapplied, so the caller resolves `scope.apply_failed`
+    (`resolve_apply_failed`) at its other-domain-rows position (§9.1: after `llm_budget`, before
+    `ranking_state`): the save after its class actions (§13.4 step 5's revert remedy); Task 21's confirm
+    likewise;
   - it is the pending one: no change, and the live operation's id (`request_apply`; when that apply has just
     failed for good and the reconciler has not cleared the pointer yet, this requests a new one, as
     retry-apply would);
@@ -59,7 +63,10 @@ scope that kept its rows, a revert, starts near the end); `progress` is `{"done"
    clock (`OperationDeps.clock`; `utcnow` for an execution without deps).
 
 **The reconciler** `scope_apply_failed` (tick; §13.4 step 5, Deviation 12, Ruling R18-2), one transaction:
-`fence_epoch`, then `active_config FOR UPDATE`. With `pending = P` and no live apply of `P`:
+`fence_epoch`, then a plain read of the pointer: with nothing pending the pass ends there, having taken no
+`active_config` lock, so a tick never queues behind the publishes' and collections' `FOR SHARE` while it holds
+the epoch fence. Otherwise `active_config FOR UPDATE`, and the decision on the pointer read under that lock.
+With `pending = P` and no live apply of `P`:
 - the newest apply of `P` `failed`: `pending := NULL` (`updated_at` the reconciler's `now`), so the view and
   the filters stay on the old scope, and the critical alert `scope.apply_failed` (`APPLY_FAILED_ALERT`,
   subject `scope:<P>`, context ids only). A permanent failure happens inside a reclaim or the takeover sweep,
@@ -121,7 +128,8 @@ _POINTERS: Final = q(
 _SET_PENDING: Final = q(
     "UPDATE active_config SET pending_scope_version_id = :pending, updated_at = :now WHERE id = 1"
 )
-_PENDING_HINT: Final = q("SELECT pending_scope_version_id FROM active_config WHERE id = 1")
+# A plain read (no lock): the chunk's hint and the reconciler's pre-read; neither decides on it.
+_PENDING_PLAIN: Final = q("SELECT pending_scope_version_id FROM active_config WHERE id = 1")
 _FLIP: Final = q(
     "UPDATE active_config SET scope_version_id = pending_scope_version_id, pending_scope_version_id = NULL, "
     "updated_at = :now WHERE id = 1"
@@ -183,6 +191,13 @@ async def incomplete_jobs(conn: AsyncConnection, scope_version_id: int) -> int:
     return int((await conn.execute(_INCOMPLETE, params)).scalar_one())
 
 
+async def resolve_apply_failed(conn: AsyncConnection) -> int:
+    """Resolve every open `scope.apply_failed`, whatever its scope: the active settings version's scope is the
+    active one (a flip, or a revert). An other-domain-rows write (§9.1: after `llm_budget`, before
+    `ranking_state`). The number resolved."""
+    return await resolve_alerts(conn, code=APPLY_FAILED_ALERT)
+
+
 async def live_apply(conn: AsyncConnection) -> int | None:
     """The id of a live (`pending` or `running`) `apply_scope` operation of any scope, or `None`."""
     found = (await conn.execute(_ANY_LIVE, {"kind": KIND})).scalar_one_or_none()
@@ -221,7 +236,7 @@ async def _precompute(ctx: OperationContext, sid: int, scope: ScopeSettings, pro
 
     while True:
         async with ctx.engine.begin() as conn:
-            if (await conn.execute(_PENDING_HINT)).scalar_one_or_none() != sid:
+            if (await conn.execute(_PENDING_PLAIN)).scalar_one_or_none() != sid:
                 return  # a hint only: the final transaction reads the pointer again under its lock
             recomputed = await recompute_stale(conn, {sid: scope}, guard=owner)
             await set_progress(conn, claim, progress.add(recomputed))  # the last statement (module docstring)
@@ -244,7 +259,7 @@ async def _final(ctx: OperationContext, sid: int, *, now: datetime) -> tuple[Fin
                 raise _Incomplete  # rolls the transaction back: nothing was written
             await conn.execute(_FLIP, {"now": now})
             await ctx.finish_in(conn, status="succeeded")
-            await resolve_alerts(conn, code=APPLY_FAILED_ALERT)
+            await resolve_apply_failed(conn)
             await ranking.bump(conn)  # `ranking_state`, the last lock (§9.1)
     except _Incomplete:
         return "incomplete", sid
@@ -299,7 +314,9 @@ class _Repair:
 
 
 async def _repair(ctx: ReconcileContext, conn: AsyncConnection) -> _Repair | None:
-    pending = (await conn.execute(_POINTERS)).one().pending_scope_version_id
+    if (await conn.execute(_PENDING_PLAIN)).scalar_one_or_none() is None:
+        return None  # nothing pending: no lock taken (module docstring)
+    pending = (await conn.execute(_POINTERS)).one().pending_scope_version_id  # the decision, under the lock
     if pending is None:
         return None
     newest = (await conn.execute(_NEWEST, {"kind": KIND, "key": dedup_key(pending)})).first()
