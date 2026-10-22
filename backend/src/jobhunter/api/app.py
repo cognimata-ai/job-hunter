@@ -37,7 +37,7 @@ from jobhunter.api.argon2_gate import Argon2Gate
 from jobhunter.api.edge import EdgeMiddleware
 from jobhunter.api.errors import exception_handlers
 from jobhunter.api.openapi import JobHunterAPI
-from jobhunter.api.routes import auth, health, profile, profile_review, runs, system
+from jobhunter.api.routes import auth, health, profile, profile_review, runs, settings, spend, system
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.session import make_engine
@@ -174,8 +174,10 @@ def create_app(
     api.include_router(auth.router)
     api.include_router(runs.router)
     api.include_router(system.router)
+    api.include_router(spend.router)
     api.include_router(profile.router)
     api.include_router(profile_review.router)
+    api.include_router(settings.router)
     for router in extra_routers:
         api.include_router(router)
     api.state.rate_limiter = SessionRateLimiter()

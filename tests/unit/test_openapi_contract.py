@@ -114,6 +114,8 @@ def test_the_readiness_503_is_the_report_not_a_problem(document) -> None:
         ("post", "/api/profile/drafts/{draft_id}/retry", IDEMPOTENT_DRAFT_ROUTE),
         ("post", "/api/profile/drafts/{draft_id}/discard", {"401", "403", "404", "409", "422", "429"}),
         ("get", "/api/profile", {"401", "429"}),
+        ("post", "/api/settings/dry-run", {"401", "403", "422", "429"}),
+        ("get", "/api/system/spend", {"401", "429"}),
         ("get", "/readyz", {"503"}),
         ("get", "/healthz", set()),
     ],

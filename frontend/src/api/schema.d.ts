@@ -250,6 +250,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/dry-run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Settings Dry Run
+         * @description Validate and preview a proposed settings document: its errors, warnings, projections and effects.
+         */
+        post: operations["settings_dry_run_api_settings_dry_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/system/health": {
         parameters: {
             query?: never;
@@ -263,6 +283,27 @@ export interface paths {
          *     the embedder's health and model id.
          */
         get: operations["get_system_health_api_system_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/spend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Spend
+         * @description The LLM spend of the current month: counted, billed, ambiguous and in flight, the cap and headroom,
+         *     the USD bucket, `ĉ`, the projected critic rate, and the spend per model, effort and role.
+         */
+        get: operations["get_spend_api_system_spend_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -324,6 +365,15 @@ export interface components {
             info: number;
             /** Warn */
             warn: number;
+        };
+        /** BucketOut */
+        BucketOut: {
+            /** Capacity */
+            capacity: string;
+            /** Rate Per H */
+            rate_per_h: string;
+            /** Usd */
+            usd: string;
         };
         /** Certification */
         Certification: {
@@ -418,6 +468,23 @@ export interface components {
             /** Validation Issues */
             validation_issues: components["schemas"]["ValidationIssueOut"][];
         };
+        /** DryRunIn */
+        DryRunIn: {
+            payload: components["schemas"]["JsonValue"];
+        };
+        /** DryRunOut */
+        DryRunOut: {
+            /** Effects */
+            effects: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
+            /** Errors */
+            errors: components["schemas"]["FieldIssueOut"][];
+            /** Projections */
+            projections: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /** Warnings */
+            warnings: components["schemas"]["WarningOut"][];
+        };
         /** Education */
         Education: {
             /** Field */
@@ -467,6 +534,22 @@ export interface components {
             /** Message */
             message: string;
         };
+        /**
+         * FieldIssueOut
+         * @description A refused field (`settings.validate.FieldIssue`): its path from `payload`, a code and a message that
+         *     never repeats the value.
+         */
+        FieldIssueOut: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "out_of_range" | "invalid" | "required" | "conflict" | "unsupported";
+            /** Field */
+            field: string;
+            /** Message */
+            message: string;
+        };
         /** HealthOut */
         HealthOut: {
             /**
@@ -494,6 +577,27 @@ export interface components {
             code_other: string | null;
             /** Evidence */
             evidence: string;
+        };
+        /**
+         * LlmSpendOut
+         * @description The month's LLM spend (§17.5 "LLM spend", M0 Deviation 6): the counted spend, the cap, the scoring
+         *     headroom (§6.9.4) and the USD bucket accrued to now, from the month row as `read_month` gives it; a month
+         *     without a row is the one a reservation would create, with the settings' cap and nothing counted.
+         */
+        LlmSpendOut: {
+            /** Bucket Usd */
+            bucket_usd: string;
+            /** Cap */
+            cap: string;
+            /** Counted */
+            counted: string;
+            /** Headroom */
+            headroom: string;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
         };
         /** LoginIn */
         LoginIn: {
@@ -784,6 +888,59 @@ export interface components {
             /** Start */
             start: number;
         };
+        /**
+         * SpendGroupOut
+         * @description The month's tries of one model, effort and role (`effort` is `null` for a try whose call row was
+         *     purged), and what they count.
+         */
+        SpendGroupOut: {
+            /** Calls */
+            calls: number;
+            /** Counted */
+            counted: string;
+            /** Effort */
+            effort: string | null;
+            /** Model */
+            model: string;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "generate" | "revise" | "critic" | "extract_profile" | "propose_queries" | "schema_dry_run";
+        };
+        /** SpendOut */
+        SpendOut: {
+            /** Ambiguous */
+            ambiguous: string;
+            /** Billed */
+            billed: string;
+            bucket: components["schemas"]["BucketOut"];
+            /** Bulk Operation */
+            bulk_operation: null;
+            /** By Model Effort Role */
+            by_model_effort_role: components["schemas"]["SpendGroupOut"][];
+            /** C Hat */
+            c_hat: string;
+            /** Cap */
+            cap: string;
+            /** Counted */
+            counted: string;
+            /** Critic Rate 7D */
+            critic_rate_7d: string | null;
+            /** Headroom */
+            headroom: string;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+            /** Projected Critic Rate */
+            projected_critic_rate: string;
+            /** Quarantined Batch Usd */
+            quarantined_batch_usd: string;
+            /** Reserved */
+            reserved: string;
+        };
         /** StrippedTextOut */
         StrippedTextOut: {
             /**
@@ -802,6 +959,7 @@ export interface components {
          *     - `run_age_state`: see `run_age_state`.
          *     - `queue_depths`: procrastinate jobs by queue and status.
          *     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
+         *     - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
          *     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
          *     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
          */
@@ -818,6 +976,7 @@ export interface components {
             last_run_age_s: number | null;
             /** Last Successful Run Age S */
             last_successful_run_age_s: number | null;
+            llm: components["schemas"]["LlmSpendOut"] | null;
             /** Queue Depths */
             queue_depths: {
                 [key: string]: {
@@ -916,6 +1075,18 @@ export interface components {
             python: string;
             /** Sqlalchemy */
             sqlalchemy: string;
+        };
+        /**
+         * WarningOut
+         * @description A warning a save must acknowledge by its `code` (§13.2), with its details.
+         */
+        WarningOut: {
+            /** Code */
+            code: string;
+            /** Detail */
+            detail: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
         };
     };
     responses: never;
@@ -1828,6 +1999,66 @@ export interface operations {
             };
         };
     };
+    settings_dry_run_api_settings_dry_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DryRunIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DryRunOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_system_health_api_system_health_get: {
         parameters: {
             query?: never;
@@ -1844,6 +2075,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SystemHealthOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_spend_api_system_spend_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendOut"];
                 };
             };
             /** @description No valid session (`unauthenticated`) */

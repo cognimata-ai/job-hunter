@@ -28,6 +28,11 @@ Deviation 24); one already `billed` or `not_billed` is left alone (`llm_settle_d
 no metric: it returns the figures (`SettleFigures`), and the gateway records them after its transaction has
 committed (`record_settlement_metrics`), so a rolled-back settlement is never counted.
 
+**Read-only views** (plan Task 16: the settings dry-run, `GET /api/system/spend`, system health): `read_month`
+accrues the month row in memory from a plain `SELECT`, `read_month_or_new` also gives a month without a row
+as `ensure_month` would create it, and `spend_totals` and `spend_by_model_effort_role` sum the month's ledger
+rows. None of them locks or writes.
+
 **Receipts** (`receipts`, plan Task 13, Deviation 26): the newest `completed` call of each logical call of an
 operation, which a resumed or reclaimed execution reuses instead of paying again (§9.1).
 
@@ -274,6 +279,16 @@ async def read_month(
     row = _budget_row(found)
     budget.accrue_row(row, p, now)
     return row
+
+
+async def read_month_or_new(
+    conn: AsyncConnection, month: date, p: BudgetParams, *, now: datetime
+) -> BudgetRow:
+    """`read_month`, or, for a month without a row, the row `ensure_month` would create from `p` (its cap and
+    buffer, nothing counted, the bucket full), in memory: nothing is locked or stored (the dry-run, the spend
+    summary and system health)."""
+    row = await read_month(conn, month, p, now=now)
+    return budget.new_row(month, p, now) if row is None else row
 
 
 # The month an open `llm.cap_80pct` was raised for (its context); the alert has one subject, so one open row.
@@ -629,6 +644,54 @@ _SPEND_BY_STATE = q(
     "COALESCE(SUM(reserved_usd) FILTER (WHERE state IN ('reserved', 'dispatched')), 0) AS reserved "
     "FROM llm_spend_ledger WHERE budget_month = :month AND kind = 'request'"
 )
+# The month's tries per (model, effort, purpose), each at what it counts (§7.11): billed its cost, reserved,
+# dispatched and ambiguous their reservation, not billed nothing. A try whose `llm_calls` row a purge deleted
+# (§20.2) keeps its ledger row and is grouped with no effort.
+_SPEND_BY_MODEL_EFFORT_ROLE = q(
+    "SELECT l.model_requested AS model, c.effort, l.purpose AS role, count(*) AS calls, "
+    "COALESCE(SUM(CASE WHEN l.state = 'billed' THEN l.settled_usd "
+    "WHEN l.state IN ('reserved', 'dispatched', 'ambiguous') THEN l.reserved_usd ELSE 0 END), 0) AS counted "
+    "FROM llm_spend_ledger l LEFT JOIN llm_calls c ON c.spend_ledger_id = l.id "
+    "WHERE l.budget_month = :month AND l.kind = 'request' "
+    "GROUP BY l.model_requested, c.effort, l.purpose ORDER BY l.model_requested, c.effort, l.purpose"
+)
+
+
+@dataclass(frozen=True)
+class SpendTotals:
+    """A month's tries by state (§17.5 `jobhunter_llm_spend_usd{state}`): `billed` at their cost, `ambiguous`
+    and `reserved` (in flight: reserved or dispatched) at their reservation."""
+
+    billed: Decimal
+    ambiguous: Decimal
+    reserved: Decimal
+
+
+@dataclass(frozen=True)
+class SpendGroup:
+    """The tries of one (model, effort, role) in a month and what they count; `effort` is `None` for a try
+    whose call row was purged."""
+
+    model: str
+    effort: str | None
+    role: Purpose
+    calls: int
+    counted_usd: Decimal
+
+
+async def spend_totals(conn: AsyncConnection, month: date) -> SpendTotals:
+    """`month`'s ledger totals by state, one plain `SELECT` (no lock)."""
+    row = (await conn.execute(_SPEND_BY_STATE, {"month": month})).one()
+    return SpendTotals(billed=row.billed, ambiguous=row.ambiguous, reserved=row.reserved)
+
+
+async def spend_by_model_effort_role(conn: AsyncConnection, month: date) -> list[SpendGroup]:
+    """`month`'s tries per (model, effort, role), ordered by them, one plain `SELECT` (no lock)."""
+    rows = await conn.execute(_SPEND_BY_MODEL_EFFORT_ROLE, {"month": month})
+    return [
+        SpendGroup(model=r.model, effort=r.effort, role=r.role, calls=int(r.calls), counted_usd=r.counted)
+        for r in rows
+    ]
 
 
 @dataclass(frozen=True)
@@ -701,7 +764,7 @@ def _check_settlement(
 async def _figures(
     conn: AsyncConnection, entry: _Entry, row: BudgetRow, p: BudgetParams, counted_at: Decimal
 ) -> SettleFigures:
-    spend = (await conn.execute(_SPEND_BY_STATE, {"month": entry.month})).one()
+    spend = await spend_totals(conn, entry.month)
     return SettleFigures(
         settled_usd=counted_at,
         reserved_usd=entry.reserved_usd,

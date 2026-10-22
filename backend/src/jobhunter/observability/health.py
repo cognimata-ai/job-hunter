@@ -25,9 +25,9 @@ gave no usable answer, `unusable` for another model or dimension). Never an exce
 
 `system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
 their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), the current quota
-window of each provider, disk and database sizes, the versions and the embedder's health (with its model id)
-as the readiness check read it. Run ages are reported, never readiness gates. `RunOut` is the api's view of a
-run row, shared with `POST /api/runs`.
+window of each provider, the LLM spend of the month (`llm_spend`, plan Task 16), disk and database sizes,
+the versions and the embedder's health (with its model id) as the readiness check read it. Run ages are
+reported, never readiness gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs`.
 
 **One freshness rule** (ruling T17-g): `read_run_freshness` is the one query of the run figures and
 `run_age_state` the one rule over them. System health reports that state, and the worker's `stale_data`
@@ -42,12 +42,13 @@ import shutil
 from collections.abc import Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from importlib import metadata
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 
 import sqlalchemy as sa
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, PlainSerializer, field_validator
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
@@ -55,6 +56,9 @@ from jobhunter import __version__
 from jobhunter.db.sql import pg_error, q
 from jobhunter.embeddings import NO_HEALTH, EmbedderClient, EmbedderHealth
 from jobhunter.heartbeats import HEARTBEAT_STALE_S
+from jobhunter.llm import budget
+from jobhunter.llm.budget import BudgetParams, BudgetRow
+from jobhunter.llm.spend_ledger import read_month_or_new
 from jobhunter.observability.alerts import refresh_alert_gauge
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
@@ -241,6 +245,10 @@ _QUEUE_DEPTHS: Final = q(
     "GROUP BY queue_name, status ORDER BY queue_name, status"
 )
 _DATABASE_BYTES: Final = q("SELECT pg_database_size(current_database())")
+_ACTIVE_PAYLOAD: Final = q(
+    "SELECT v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
+    "WHERE a.id = 1"
+)
 
 
 class RunOut(BaseModel):
@@ -345,6 +353,56 @@ async def quota_health(conn: AsyncConnection) -> dict[Provider, QuotaOut | None]
     return out
 
 
+def usd_micro(amount: Decimal) -> Decimal:
+    """A computed USD amount as the api shows it: at $0.000001 (the ledger's scale), rounded half-up."""
+    return amount.quantize(budget.USD_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _fixed_point(amount: Decimal) -> str:
+    return format(amount, "f")
+
+
+# A decimal (a USD amount, a rate) in a response: a string in plain notation (`"93.100000"`), never a float.
+DecimalOut = Annotated[Decimal, PlainSerializer(_fixed_point, return_type=str)]
+
+
+class LlmSpendOut(BaseModel):
+    """The month's LLM spend (§17.5 "LLM spend", M0 Deviation 6): the counted spend, the cap, the scoring
+    headroom (§6.9.4) and the USD bucket accrued to now, from the month row as `read_month` gives it; a month
+    without a row is the one a reservation would create, with the settings' cap and nothing counted."""
+
+    month: date
+    counted: DecimalOut
+    cap: DecimalOut
+    headroom: DecimalOut
+    bucket_usd: DecimalOut
+
+    @classmethod
+    def of(cls, row: BudgetRow, p: BudgetParams) -> "LlmSpendOut":
+        return cls(
+            month=row.month,
+            counted=usd_micro(row.counted_usd),
+            cap=row.cap_usd,
+            headroom=usd_micro(budget.headroom(row, "scoring", p)),
+            bucket_usd=usd_micro(row.bucket_usd),
+        )
+
+
+async def active_budget_params(conn: AsyncConnection) -> BudgetParams | None:
+    """The budget params of the active settings version, read with a plain `SELECT` (no lock, unlike
+    `spend_ledger.current_params`); `None` when nothing is seeded."""
+    payload = (await conn.execute(_ACTIVE_PAYLOAD)).scalar_one_or_none()
+    return BudgetParams.from_payload(payload) if isinstance(payload, dict) else None
+
+
+async def llm_spend(conn: AsyncConnection, *, now: datetime) -> LlmSpendOut | None:
+    """The LLM spend of the month of `now`, read without a lock; `None` when nothing is seeded."""
+    p = await active_budget_params(conn)
+    if p is None:
+        return None
+    return LlmSpendOut.of(await read_month_or_new(conn, budget.month_of(now), p, now=now), p)
+
+
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -354,6 +412,7 @@ class SystemHealthOut(BaseModel):
     - `run_age_state`: see `run_age_state`.
     - `queue_depths`: procrastinate jobs by queue and status.
     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
+    - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
     """
@@ -366,6 +425,7 @@ class SystemHealthOut(BaseModel):
     run_age_state: RunAgeState
     queue_depths: dict[str, dict[str, int]]
     quota: dict[Provider, QuotaOut | None]
+    llm: LlmSpendOut | None
     alerts_open: AlertsOpen
     disk: DiskUsage
     database_bytes: int
@@ -472,6 +532,7 @@ async def system_health(
         run_age_state=run_age_state(now, freshness),
         queue_depths=await _queue_depths(conn),
         quota=await quota_health(conn),
+        llm=await llm_spend(conn, now=now),
         alerts_open=AlertsOpen(info=alerts["info"], warn=alerts["warn"], critical=alerts["critical"]),
         disk=DiskUsage(path=DISK_PATH, total_bytes=disk.total, free_bytes=disk.free),
         database_bytes=int((await conn.execute(_DATABASE_BYTES)).scalar_one()),
