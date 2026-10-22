@@ -26,8 +26,12 @@ only in its final transaction, which takes `active_config FOR UPDATE`, then its 
 the pending pointer again. A chunk's plain read of the pointer is only a hint to go to that final
 transaction. Every writer of the pointer holds `active_config FOR UPDATE` too, so a pointer that a writer
 moved to a scope whose live apply it reused is the pointer that apply's final transaction reads: such an apply
-never ends obsolete for a pointer that names its scope. No operation row is locked here, so a save never waits
-for a running chunk while it holds `active_config`.
+never ends obsolete for a pointer that names its scope. No operation row is locked here. The dedup insert
+(`INSERT … ON CONFLICT` on `operations_live_dedup`) can still wait for a transaction that has updated the live
+row and not committed yet, a chunk's `set_progress` or a heartbeat, until that transaction commits; a row lock
+alone (a chunk's owner check) makes it wait for nothing. Task 18 keeps `set_progress` the last statement of a
+chunk's transaction, so a save holding `active_config` waits at most for the tail of that transaction, never
+for a whole chunk.
 
 Task 18 adds the handler, `incomplete_jobs`, the reconciler and the route, and registers the module with the
 worker; until then an `apply_scope` operation waits `pending` without a handler. Lock order (§9.1):

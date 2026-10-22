@@ -8,6 +8,7 @@ route's clock (`jobhunter.api.routes.settings.utcnow`), which the save and its d
 
 import asyncio
 import copy
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
@@ -56,6 +57,7 @@ pytestmark = pytest.mark.integration
 NOW: Final = datetime(2026, 10, 22, 9, 30, tzinfo=UTC)  # 11:30 CEST: Berlin is at UTC+2 until 25 October
 MONTH: Final = date(2026, 10, 1)
 CLOCK: Final = "jobhunter.api.routes.settings.utcnow"
+JSON: Final = {"content-type": "application/json"}
 
 
 @pytest.fixture
@@ -314,6 +316,27 @@ async def test_an_id_beyond_bigint_is_refused_not_a_500(logged_in_client, engine
     payload = await active_payload(logged_in_client)
     payload[group] = [entry]
     await assert_refused_like_the_dry_run(logged_in_client, engine, payload, [(path, "out_of_range")])
+
+
+async def test_a_lone_surrogate_in_a_string_is_refused_not_a_500(logged_in_client, engine) -> None:
+    """A JSON body may escape a lone UTF-16 surrogate (`"\\ud800"`), which no UTF-8 text holds: the request
+    fingerprint takes it (`request_fingerprint`), and the save answers the dry-run's refusal with a 422."""
+    payload = await active_payload(logged_in_client)
+    payload["scope"]["excluded_keywords"] = ["Prak\ud800tikum"]
+    raw = json.dumps({"payload": payload})  # ensure_ascii: sent as the escape
+    dry = await logged_in_client.post("/api/settings/dry-run", content=raw, headers=JSON)
+    assert dry.status_code == 200, dry.text
+    expected = [("payload.scope.excluded_keywords[0]", "invalid")]
+    assert [(e["field"], e["code"]) for e in dry.json()["errors"]] == expected
+    base = (await active_row(engine)).settings_version_id
+    body = json.dumps({"payload": payload, "base_version_id": base, "acknowledged_warnings": []})
+    r = await logged_in_client.post(SETTINGS_URL, content=body, headers={**JSON, **idem(fresh_key())})
+    assert r.status_code == 422 and r.json()["code"] == "validation_failed", r.text
+    assert [(e["field"], e["code"]) for e in r.json()["errors"]] == expected
+    assert (
+        await count_rows(engine, "settings_versions") == 1
+        and await count_rows(engine, "api_idempotency") == 0
+    )
 
 
 async def test_a_nul_character_in_a_string_is_refused_not_a_500(logged_in_client, engine) -> None:

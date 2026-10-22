@@ -62,11 +62,20 @@ _QUERY_ROWS = sa.text(
 )
 
 
+# Explicit ids leave the identity sequence behind the rows; it is moved past them (never back), so a later
+# identity insert cannot take one of them. Only the sequence's owner may (`setval` needs UPDATE on it).
+_SEQUENCE_PAST_ROWS = (
+    "SELECT setval(pg_get_serial_sequence('queries', 'id'), "
+    "greatest(24, (SELECT last_value FROM queries_id_seq)))"
+)
+
+
 @pytest.fixture(autouse=True)
-async def query_rows(engine: AsyncEngine) -> None:
+async def query_rows(engine: AsyncEngine, migrated: PgServer) -> None:
     """The query rows of `base`'s ids, with invented texts; the reset after the test removes them."""
     async with engine.begin() as conn:
         await conn.execute(_QUERY_ROWS)
+    pg_rows(migrated, "migrator", _SEQUENCE_PAST_ROWS)
 
 
 @pytest.fixture
