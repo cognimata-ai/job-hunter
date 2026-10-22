@@ -11,6 +11,7 @@ no paid call. The route's clock is fixed (`jobhunter.api.routes.profile.utcnow`)
 import asyncio
 import contextlib
 import copy
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Final
@@ -260,7 +261,7 @@ async def test_the_ranking_bump_is_the_confirms_last_statement(engine, ready_dra
 
 
 async def test_a_repeated_confirm_returns_the_original_body_even_with_a_newer_profile_active(
-    logged_in_client, engine, op_runner, upload
+    logged_in_client, engine, op_runner, upload, log_events
 ) -> None:
     """Deviation 2: a confirmed draft answers its stored body to any key, and nothing is written again."""
     first_draft = await make_ready_draft(logged_in_client, op_runner, upload)
@@ -273,6 +274,16 @@ async def test_a_repeated_confirm_returns_the_original_body_even_with_a_newer_pr
     assert again == first
     assert await written_counts(engine) == (*before[:5], before[5] + 1, before[6])  # only the key's row
     assert (await active_profile(engine))[0] == second["profile_version_id"]
+    (replayed,) = [e for e in log_events() if e["event"] == "profile_confirm_replayed"]
+    assert {k: v for k, v in replayed.items() if k not in {"level", "logger", "ts", "request_id"}} == {
+        "event": "profile_confirm_replayed",
+        "draft_id": first_draft,
+        "version_id": first["profile_version_id"],
+    }
+    # a replay under the same key never reaches the handler: `run_idempotent` logs it
+    assert await confirmed(logged_in_client, first_draft, key="confirm-again-key-0001") == first
+    assert len([e for e in log_events() if e["event"] == "profile_confirm_replayed"]) == 1
+    assert [e["route"] for e in log_events() if e["event"] == "idempotent_replay"] == ["profile.confirm"]
 
 
 async def test_two_concurrent_confirms_activate_once(
@@ -467,6 +478,35 @@ async def test_a_contact_in_user_entered_is_422_on_its_field(
     assert version.profile_json["user_entered"]["security_clearances"] == [
         {"name": "Sicherheitsfreigabe Ü2", "level": None}
     ]
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param({"foo": 1}, id="unknown-member"),
+        pytest.param([], id="list"),
+        pytest.param("text", id="string"),
+        pytest.param(None, id="invalid-seniority"),  # the extracted profile with `seniority` out of its enum
+    ],
+)
+async def test_a_stored_profile_that_fails_the_schema_is_409_and_writes_nothing(
+    logged_in_client, engine, ready_draft, log_events, stored: Any
+) -> None:
+    if stored is None:
+        stored = {**(await draft_row(engine, ready_draft)).draft_json, "seniority": "grandmaster"}
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE profile_drafts SET draft_json = CAST(:j AS jsonb) WHERE id = :d"),
+            {"j": json.dumps(stored), "d": ready_draft},
+        )
+    before = await written_counts(engine)
+    r = await confirm(logged_in_client, ready_draft)
+    assert problem(r) == (409, "conflict_state")
+    assert "no longer matches the profile schema" in r.json()["detail"]
+    assert await written_counts(engine) == before and (await draft_row(engine, ready_draft)).status == "ready"
+    # neither the response nor a log line quotes the stored values or the validation error
+    for value in ("foo", "grandmaster", "literal_error", "model_type"):
+        assert value not in r.text and not any(value in str(e) for e in log_events()), value
 
 
 async def test_retained_ads_without_the_ack_are_422(logged_in_client, engine, ready_draft) -> None:

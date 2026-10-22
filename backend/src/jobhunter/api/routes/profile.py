@@ -38,10 +38,12 @@ around `profile.activation.confirm_draft`, whose own `FOR UPDATE` is then a no-o
 never takes `FOR SHARE` first: two confirms holding the shared lock would deadlock on the upgrade, where this
 way the second waits. A repeat with the key returns the stored response; a repeat with another key of a
 confirmed draft returns the draft's stored body (Deviation 2). 404 `not_found`; 409 `conflict_state` (not
-`ready`), `profile_purge_in_progress` (an identical version is being purged) and `idempotency_in_progress`;
-422 `validation_failed` (a blocking issue or a contact in `user_entered` at its path, the missing
-`expected_rescore_ack` at `body.expected_rescore_ack`, an unknown body member) and `idempotency_key_reused`.
-`profile_confirmed` is logged with the ids after the commit, a refusal as `profile_confirm_refused` with its
+`ready`, or a stored profile that no longer fits the schema), `profile_purge_in_progress` (an identical
+version is being purged) and `idempotency_in_progress`; 422 `validation_failed` (a blocking issue or a
+contact in `user_entered` at its path, the missing `expected_rescore_ack` at `body.expected_rescore_ack`, an
+unknown body member) and `idempotency_key_reused`.
+`profile_confirmed` is logged with the ids after the commit, a confirmed draft's stored body under a new key
+as `profile_confirm_replayed` (the draft and version ids), a refusal as `profile_confirm_refused` with its
 codes and counts.
 
 `GET /api/profile/drafts/{id}/rescore-estimate` → `{targets, est_usd_online, est_usd_batch, month_spend,
@@ -91,6 +93,7 @@ from jobhunter.profile.storage import CvStore
 from jobhunter.profile.text import drop_nul
 from jobhunter.queries import proposals
 from jobhunter.settings.dryrun import active_settings
+from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(
@@ -465,10 +468,6 @@ async def get_query_proposal(
 # --- confirm and activate (Task 21) -------------------------------------------------------------------------
 
 
-def _draft_not_found() -> Problem:
-    return Problem(404, "not_found", "Profile draft not found")
-
-
 @router.post(
     "/drafts/{draft_id}/confirm",
     status_code=201,
@@ -477,9 +476,9 @@ def _draft_not_found() -> Problem:
         400: {"description": "Idempotency-Key missing or malformed (`idempotency_key_required`)"},
         404: {"description": "No such draft (`not_found`)"},
         409: {
-            "description": "The draft is not ready (`conflict_state`), an identical profile version is being "
-            "purged (`profile_purge_in_progress`), or a request with this key is still running "
-            "(`idempotency_in_progress`)"
+            "description": "The draft is not ready or its stored profile no longer fits the schema "
+            "(`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), "
+            "or a request with this key is still running (`idempotency_in_progress`)"
         },
         422: {
             "description": "Invalid body, a blocking validation issue, a contact in the user-entered values "
@@ -498,7 +497,8 @@ async def confirm_draft(
     """Confirm a ready draft and activate its profile (201); a repeat returns the original outcome."""
     key = check_idempotency_key(idempotency_key)  # a malformed key costs no database round trip
     now = utcnow()
-    activated: list[activation.Activated] = []  # empty on a replay
+    activated: list[activation.Activated] = []  # the handler's activation; empty on any replay
+    replayed: list[JSONValue] = []  # the version of a confirmed draft's stored body, under a new key
 
     async def handler(conn: AsyncConnection) -> StoredResponse:
         status, outcome = await activation.confirm_draft(
@@ -509,6 +509,8 @@ async def confirm_draft(
             defer=defer_in_tx,
             activated=activated,
         )
+        if not activated:  # the draft was confirmed already: its stored body (Deviation 2)
+            replayed.append(outcome.get("profile_version_id"))
         return StoredResponse(status, outcome)
 
     try:
@@ -531,7 +533,12 @@ async def confirm_draft(
             issue_codes=sorted({e.code for e in problem.errors or []}),
         )
         raise
-    for done in activated:  # after the commit; a replay is logged by `run_idempotent` (`idempotent_replay`)
+    # After the commit. A replay under the same key never reaches the handler and is logged by
+    # `run_idempotent` (`idempotent_replay`); a confirmed draft's stored body under a new key is
+    # `profile_confirm_replayed`.
+    for version_id in replayed:
+        log.info("profile_confirm_replayed", draft_id=draft_id, version_id=version_id)
+    for done in activated:
         log.info(
             "profile_confirmed",
             draft_id=done.draft_id,
@@ -557,7 +564,7 @@ async def get_rescore_estimate(
     """What confirming a draft would re-score and cost (§12.6 step 2, §21.4)."""
     async with engine.connect() as conn:  # plain reads, rolled back when the block ends
         if (await conn.execute(_DRAFT_EXISTS, {"d": draft_id})).first() is None:
-            raise _draft_not_found()
+            raise activation.draft_not_found()
         estimate = await rescore_estimate(conn, await active_settings(conn), now=utcnow())
     return RescoreEstimateOut(
         targets=estimate.targets,

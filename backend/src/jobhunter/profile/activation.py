@@ -10,7 +10,8 @@ its profile in the caller's **one transaction**, and returns the response `(stat
 2. A draft already `confirmed` returns `(201, confirm_response)`: the body its confirm stored, whatever key
    the request carries and whichever profile is active now (Deviation 2). Nothing is written, and the ranking
    generation stays (R21-4).
-3. Any state but `ready`, or a `ready` draft whose content was purged (§20.1), is 409 `conflict_state`.
+3. Any state but `ready`, or a `ready` draft whose content was purged (§20.1), is 409 `conflict_state`; so is
+   a stored profile that no longer validates as a `ConfirmedProfile` (step 4).
 4. The profile is validated again: `draft_json` as a `ConfirmedProfile`, `validate_profile` against the
    approved text (against nothing for a native PDF) and `validate_user_entered`. Each issue whose code is in
    `BLOCKING_ISSUES` (Deviation 19) is a `FieldError` at its path, with its code and message; the other issues
@@ -75,6 +76,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Final
 
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.api.errors import FieldError, Problem
@@ -165,7 +167,8 @@ class Activated:
     targets_to_create: int
 
 
-def _not_found() -> Problem:
+def draft_not_found() -> Problem:
+    """404 `not_found` for a draft id with no row (the confirm and the estimate route)."""
     return Problem(404, "not_found", "Profile draft not found")
 
 
@@ -184,6 +187,16 @@ def _content_purged() -> Problem:
         "conflict_state",
         "The draft's content was deleted",
         detail="The extracted profile of this draft was deleted after 30 days; upload or paste the CV again.",
+    )
+
+
+def _schema_mismatch() -> Problem:
+    return Problem(
+        409,
+        "conflict_state",
+        "The draft's profile cannot be read",
+        detail="The draft's profile no longer matches the profile schema; discard it and upload or paste the "
+        "CV again.",
     )
 
 
@@ -227,10 +240,16 @@ def user_entered_contacts(profile: ConfirmedProfile) -> list[FieldError]:
 def revalidated(
     draft_json: JSONValue, *, transmitted_text: str | None, today: date
 ) -> tuple[ConfirmedProfile, list[FieldError]]:
-    """Step 4: the repaired profile of `draft_json` and the errors that refuse its confirm (pure)."""
-    profile, issues = validate_profile(
-        ConfirmedProfile.model_validate(draft_json), transmitted_text=transmitted_text, today=today
-    )
+    """Step 4: the repaired profile of `draft_json` and the errors that refuse its confirm (pure). A stored
+    profile that is no `ConfirmedProfile` is 409 `conflict_state`; the validation error, which quotes the
+    stored values, goes nowhere."""
+    try:
+        draft: ConfirmedProfile | None = ConfirmedProfile.model_validate(draft_json)
+    except ValidationError:
+        draft = None  # raised below, outside the handler: the problem carries no `__context__` either
+    if draft is None:
+        raise _schema_mismatch()
+    profile, issues = validate_profile(draft, transmitted_text=transmitted_text, today=today)
     issues = [*issues, *validate_user_entered(profile.user_entered)]
     errors = [
         FieldError(field=issue.path, code=issue.code, message=issue.message)
@@ -268,7 +287,7 @@ async def confirm_draft(
     model_policy_id = (await conn.execute(_LOCK_ACTIVE)).scalar_one()
     draft = (await conn.execute(_LOCK_DRAFT, {"d": draft_id})).first()
     if draft is None:
-        raise _not_found()
+        raise draft_not_found()
     if draft.status == "confirmed":
         if not isinstance(draft.confirm_response, dict):
             raise InvariantViolation(f"profile draft {draft_id} is confirmed without its stored response")
@@ -304,6 +323,8 @@ async def confirm_draft(
     apply_id = await scope_apply.set_desired_scope(conn, ids.scope_version_id, now=now, defer=defer)
     embed_id, _ = await vectors.request_embedding(conn, version_id, defer=defer)
     proposal_id: int | None = None
+    # A benign race: a proposal of this version published between this read and `request_proposal` (its
+    # publish does not wait for this transaction) costs one more proposal, never a wrong one.
     if not (await conn.execute(_READY_PROPOSAL, {"v": version_id})).scalar_one():
         proposal_id, _, _ = await proposals.request_proposal(conn, version_id, defer=defer)
 

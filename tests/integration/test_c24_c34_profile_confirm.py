@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.faults import no_fault, raising_at
 from tests.support.fixtures import count_rows
 from tests.support.profile import active_profile, draft_row, idem, ranking_generation
+from tests.support.settings import pending_scope_id
 
 pytestmark = pytest.mark.integration
 
@@ -28,6 +29,8 @@ async def test_c24_crash_inside_activation_is_all_or_nothing(
     logged_in_client, engine, ready_draft, point, monkeypatch
 ) -> None:
     generation_before = await ranking_generation(engine)
+    jobs_before = await count_rows(engine, "procrastinate_jobs")
+    scopes_before, pending_before = await count_rows(engine, "scope_versions"), await pending_scope_id(engine)
     monkeypatch.setattr(activation_module, "afault_point", raising_at(point))  # SimulatedCrash at the point
     r = await logged_in_client.post(
         f"/api/profile/drafts/{ready_draft}/confirm",
@@ -43,6 +46,10 @@ async def test_c24_crash_inside_activation_is_all_or_nothing(
     assert await count_rows(engine, "query_proposals") == 0
     assert await count_rows(engine, "api_idempotency", route="profile.confirm") == 0
     assert await ranking_generation(engine) == generation_before
+    # no job deferred, no derived scope, the pending pointer as it was
+    assert await count_rows(engine, "procrastinate_jobs") == jobs_before
+    assert await count_rows(engine, "scope_versions") == scopes_before
+    assert await pending_scope_id(engine) == pending_before
     draft = await draft_row(engine, ready_draft)
     assert (draft.status, draft.confirmed_profile_version_id, draft.confirm_response) == ("ready", None, None)
 

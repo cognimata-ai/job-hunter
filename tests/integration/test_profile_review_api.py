@@ -32,6 +32,7 @@ from tests.support.profile import (
     draft_row_api,
     encrypted_pdf,
     idem,
+    make_ready_draft,
     minimal_pdf,
     sha256,
 )
@@ -97,14 +98,6 @@ async def text_review_draft(op_runner: OpRunner, upload: Upload, text: str = REV
 
 async def approve(client: httpx.AsyncClient, draft_id: int, key: str = "approve-key-0001") -> httpx.Response:
     return await client.post(f"/api/profile/drafts/{draft_id}/text-review", headers=idem(key))
-
-
-async def ready_draft(client: httpx.AsyncClient, op_runner: OpRunner, upload: Upload) -> int:
-    draft_id = await text_review_draft(op_runner, upload)
-    assert (await approve(client, draft_id)).status_code == 202
-    await op_runner.run_pending()
-    assert (await draft_row(op_runner.engine, draft_id)).status == "ready"
-    return draft_id
 
 
 async def refused_paste(client: httpx.AsyncClient, op_runner: OpRunner, upload: Upload) -> int:
@@ -401,7 +394,7 @@ async def test_an_invalid_edit_set_is_a_422_on_its_field_and_changes_nothing(
 async def test_editing_the_text_of_a_ready_draft_discards_the_extracted_draft(
     engine, logged_in_client, op_runner, upload
 ) -> None:
-    draft_id = await ready_draft(logged_in_client, op_runner, upload)
+    draft_id = await make_ready_draft(logged_in_client, op_runner, upload, text=REVIEW_CV)
     ready = await draft_row_api(logged_in_client, draft_id)
     assert ready["status"] == "ready" and ready["draft"] is not None and ready["validation_issues"]
     r = await put_text(logged_in_client, draft_id, remove(*FIRM))
@@ -490,7 +483,7 @@ async def test_approve_stores_the_reviewed_text_and_its_sha256_and_creates_one_o
 async def test_a_saved_draft_is_validated_again_and_stored_repaired(
     engine, logged_in_client, op_runner, upload
 ) -> None:
-    draft_id = await ready_draft(logged_in_client, op_runner, upload)
+    draft_id = await make_ready_draft(logged_in_client, op_runner, upload, text=REVIEW_CV)
     draft = (await draft_row_api(logged_in_client, draft_id))["draft"]
     assert draft["user_entered"] == {"work_authorization_de": "unspecified", "security_clearances": []}
     draft["summary"] = "Senior Backend-Entwicklerin, Kontakt: max.mustermann@example.org"
@@ -536,7 +529,7 @@ async def test_a_saved_draft_is_validated_again_and_stored_repaired(
 async def test_the_recomputed_years_use_the_injected_clock(
     logged_in_client, op_runner, upload, monkeypatch
 ) -> None:
-    draft_id = await ready_draft(logged_in_client, op_runner, upload)
+    draft_id = await make_ready_draft(logged_in_client, op_runner, upload, text=REVIEW_CV)
     # 2016-01 to 2020-02 and 2020-03 to the day, merged: 3,917 days on 2026-10-21, 5,085 on 2030-01-01.
     monkeypatch.setattr(profile_routes, "utcnow", lambda: datetime(2026, 10, 21, 9, 0, tzinfo=UTC))
     assert (await draft_row_api(logged_in_client, draft_id))["recomputed_total_years"] == 10.7
@@ -702,7 +695,9 @@ async def test_discard_ends_a_reviewable_or_failed_draft(
 ) -> None:
     await discard_once(engine, logged_in_client, failed_low_text_draft)
     await discard_once(engine, logged_in_client, await text_review_draft(op_runner, upload))
-    await discard_once(engine, logged_in_client, await ready_draft(logged_in_client, op_runner, upload))
+    await discard_once(
+        engine, logged_in_client, await make_ready_draft(logged_in_client, op_runner, upload, text=REVIEW_CV)
+    )
     extracting = await text_review_draft(op_runner, upload)
     assert (await approve(logged_in_client, extracting, "approve-key-0004")).status_code == 202
     assert problem(await logged_in_client.post(f"/api/profile/drafts/{extracting}/discard")) == (

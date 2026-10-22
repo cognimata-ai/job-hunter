@@ -2100,7 +2100,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The draft is not ready (`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The draft is not ready or its stored profile no longer fits the schema (`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;
