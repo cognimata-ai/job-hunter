@@ -390,6 +390,25 @@ def node_config(
     )
 
 
+# The active model policy and execution config (§13.3: every non-score call uses the active ones).
+_ACTIVE_LLM_CONFIG: Final = q(
+    "SELECT a.execution_config_id, m.payload AS model_policy, e.payload AS execution FROM active_config a "
+    "JOIN model_policies m ON m.id = a.model_policy_id "
+    "JOIN execution_configs e ON e.id = a.execution_config_id WHERE a.id = 1"
+)
+
+
+async def active_node_config(
+    engine: AsyncEngine, purpose: NodePurpose, schema: type[BaseModel]
+) -> tuple[NodeConfig, int]:
+    """The node of `purpose` from the active model policy and execution config, read without a lock, and the
+    execution config's id (the profile graphs' LLM nodes, Tasks 13 and 20)."""
+    async with engine.connect() as conn:
+        row = (await conn.execute(_ACTIVE_LLM_CONFIG)).one()
+    node = node_config(purpose, model_policy=row.model_policy, execution=row.execution, schema=schema)
+    return node, int(row.execution_config_id)
+
+
 @dataclass(frozen=True)
 class SystemBlock:
     """One `system` block; `cache` puts the 5-minute cache breakpoint at its end (§10.6; never a 1 h ttl, so

@@ -61,7 +61,20 @@ embedder is healthy again. The steps:
    meanwhile is `FencedOut` at the owner lock and nothing is written.
 Logs carry the operation id, the version id, counts and short codes, never a text.
 
-Task 20 (`propose_queries`) adds its handler and hook here.
+**`propose_queries`** (Task 20; payload `{"proposal_id": <id>}`, dedup key `propose_queries:<id>`, created
+with its `running` proposal by `queries.proposals.request_proposal`, which registers nothing). In one
+transaction, the owner row, then the proposal `FOR UPDATE`: a proposal still `running` goes on; one in any
+other state, or gone, ends the operation `succeeded` as obsolete without touching it. Then the handler
+invokes `profile_graphs.propose` on the execution's own thread (`thread_id("q", proposal_id,
+claim.operation_id, claim.attempts)`, `queries-<proposal_id>-q<operation_id>-a<attempts>`) with the same
+invoke shape. Its one node ends the proposal and the operation in one transaction: `ready`, `failed(code)`,
+or a requeue (`graphs.profile.nodes.propose_queries`).
+
+**Its failure hook** (`proposal_failed`) moves a proposal still `running` to `failed`: a requeue's last
+attempt, or a reclaim or the takeover sweep that spent the attempts (the code is the operation's;
+`query_proposals` has no reason column). A proposal the node's own write already ended is left as it is. A
+payload without a usable `proposal_id` is logged (`query_proposal_hook_payload_invalid`) and moves nothing, as
+for the drafts.
 """
 
 from collections.abc import Mapping
@@ -74,9 +87,10 @@ from jobhunter.embeddings import EmbedderError
 from jobhunter.faults import afault_point
 from jobhunter.graphs.profile.graph import invoke_config
 from jobhunter.graphs.profile.nodes import EXTRACTING_PROFILE, end_obsolete, fail_draft, lock_draft
-from jobhunter.graphs.profile.state import initial_state
+from jobhunter.graphs.profile.state import initial_proposal_state, initial_state
 from jobhunter.observability.logging import get_logger
 from jobhunter.profile import vectors
+from jobhunter.queries import proposals
 from jobhunter.types import JSONValue, get_int
 from jobhunter.worker.operations import (
     ATTEMPTS_EXHAUSTED,
@@ -98,19 +112,26 @@ def _draft_id(payload: Mapping[str, JSONValue]) -> int:
     return get_int(dict(payload), "draft_id")
 
 
-def _hook_draft_id(operation_id: int, payload: Mapping[str, JSONValue]) -> int | None:
-    """The payload's draft id for the failure hook, or `None` (logged) when the payload holds none that a
-    `bigint` column can hold: the hook runs inside a reclaim, a takeover or a tick, which must not fail with
-    it."""
+def _hook_payload_id(
+    operation_id: int, payload: Mapping[str, JSONValue], key: str, *, event: str
+) -> int | None:
+    """The payload's `key` id for a failure hook, or `None` (logged as `event`) when the payload holds none
+    that a `bigint` column can hold: the hook runs inside a reclaim, a takeover or a tick, which must not fail
+    with it."""
     try:
-        draft_id = _draft_id(payload)
+        subject_id = get_int(dict(payload), key)
     except (KeyError, TypeError) as exc:
-        log.error("profile_hook_payload_invalid", operation_id=operation_id, error_class=type(exc).__name__)
+        log.error(event, operation_id=operation_id, error_class=type(exc).__name__)
         return None
-    if not 0 < draft_id < _BIGINT_END:
-        log.error("profile_hook_payload_invalid", operation_id=operation_id, error_class="OutOfRange")
+    if not 0 < subject_id < _BIGINT_END:
+        log.error(event, operation_id=operation_id, error_class="OutOfRange")
         return None
-    return draft_id
+    return subject_id
+
+
+def _hook_draft_id(operation_id: int, payload: Mapping[str, JSONValue]) -> int | None:
+    """The payload's draft id for a draft's failure hook (`_hook_payload_id`)."""
+    return _hook_payload_id(operation_id, payload, "draft_id", event="profile_hook_payload_invalid")
 
 
 async def text_phase_failed(
@@ -179,6 +200,45 @@ async def extract_profile(ctx: OperationContext) -> None:
             return
     await ctx.deps.profile_graphs.extract.ainvoke(
         initial_state(draft_id, claim.operation_id), invoke_config("p", draft_id, ctx), durability="sync"
+    )
+
+
+async def proposal_failed(
+    conn: AsyncConnection, operation_id: int, payload: Mapping[str, JSONValue], error_code: str | None
+) -> None:
+    """The query proposal's failure hook (module docstring)."""
+    proposal_id = _hook_payload_id(
+        operation_id, payload, "proposal_id", event="query_proposal_hook_payload_invalid"
+    )
+    if proposal_id is None:
+        return  # no proposal to name: the operation still ends `failed`
+    proposal = await proposals.lock_proposal(conn, proposal_id)
+    if proposal is None or proposal.status != proposals.RUNNING:
+        return  # ended by the node's own write: not this hook's to move
+    await proposals.fail(conn, proposal_id)
+    code = error_code or ATTEMPTS_EXHAUSTED
+    log.warning("query_proposal_hook_failed", operation_id=operation_id, proposal_id=proposal_id, code=code)
+
+
+@register_operation_handler("propose_queries", on_failed=proposal_failed)
+async def propose_queries(ctx: OperationContext) -> None:
+    """A query proposal (module docstring)."""
+    if ctx.deps is None:
+        raise RuntimeError("propose_queries runs with the worker's OperationDeps")
+    claim = ctx.claim
+    proposal_id = get_int(dict(claim.payload), "proposal_id")
+    async with ctx.engine.begin() as conn:
+        await lock_operation_owner(conn, claim)
+        proposal = await proposals.lock_proposal(conn, proposal_id)
+        if proposal is None or proposal.status != proposals.RUNNING:
+            await proposals.end_obsolete(
+                conn, ctx, proposal_id, None if proposal is None else proposal.status
+            )
+            return
+    await ctx.deps.profile_graphs.propose.ainvoke(
+        initial_proposal_state(proposal_id, claim.operation_id),
+        invoke_config("q", proposal_id, ctx),
+        durability="sync",
     )
 
 

@@ -5,9 +5,9 @@
 - `text` (Task 11): `parse → strip_contacts → END`, where `parse` goes straight to `END` when it ended the
   draft itself (`failed`, or obsolete: the state's `outcome`);
 - `extract` (Task 13): `check_pdf → extract_profile → validate → draft → END`, where each of the first three
-  goes straight to `END` when it ended the phase itself (`failed`, `requeued` or obsolete).
-Task 20 adds the field `propose` (`propose_queries → END`) with its node; no graph exists here before its
-nodes do.
+  goes straight to `END` when it ended the phase itself (`failed`, `requeued` or obsolete);
+- `propose` (Task 20): `propose_queries → END`, over a query proposal (`ProposalState`), not a draft. Its one
+  node ends the proposal and the operation itself.
 
 **The invoke shape** (§9.1). A handler invokes its graph with `invoke_config(kind, subject_id, ctx)`,
 `{"configurable": {"thread_id": thread_id(…), "op": ctx}, "recursion_limit": RECURSION_LIMIT,
@@ -29,6 +29,7 @@ before a crash is found through the receipts in the database (§9.1), not throug
 `LLM_NODE_TIMEOUT` (the §13.1 maximum `deadline_s` of 1,800 s plus a margin: a graph compiled once cannot take
 the deadline an `execution` save changes at runtime, Deviation 28; the gateway enforces the active one per
 call through `CallContext.deadline`) and `LLM_NODE_TRACE` (its input and output omitted from any trace).
+`sanitized` and `add_llm_node` take a node of either state (`nodes.StateNode`).
 
 **`sanitized`** (Deviation 25) wraps every profile node. LangGraph 1.2.15 stores the exception that escapes
 a node in `checkpoint_writes` (the write `(__error__, exc)` of `PregelRunner.commit`), through its
@@ -63,20 +64,22 @@ from langgraph.types import TimeoutPolicy, TracePolicy, omit_payload
 from jobhunter.errors import FencedOut, NodeFailed, TransitionConflict
 from jobhunter.graphs.collect.graph import DB_RETRY, is_retryable_db_error
 from jobhunter.graphs.profile.deps import ProfileDeps
-from jobhunter.graphs.profile.nodes import Node, log
+from jobhunter.graphs.profile.nodes import Node, StateNode, log
 from jobhunter.graphs.profile.nodes import check_pdf as check_pdf_node
 from jobhunter.graphs.profile.nodes import draft as draft_node
 from jobhunter.graphs.profile.nodes import extract_profile as extract_node
 from jobhunter.graphs.profile.nodes import parse as parse_node
+from jobhunter.graphs.profile.nodes import propose_queries as propose_node
 from jobhunter.graphs.profile.nodes import strip_contacts as strip_node
 from jobhunter.graphs.profile.nodes import validate as validate_node
 from jobhunter.graphs.profile.state import ProfileState as ProfileState
-from jobhunter.graphs.profile.state import ProfileUpdate
+from jobhunter.graphs.profile.state import ProposalState
 from jobhunter.llm.errors import LLMError
 from jobhunter.profile.errors import UploadRejected
 from jobhunter.worker.operations import OperationContext
 
 type ProfileGraph = CompiledStateGraph[ProfileState, None, ProfileState, ProfileState]
+type ProposalGraph = CompiledStateGraph[ProposalState, None, ProposalState, ProposalState]
 type ThreadKind = Literal["t", "p", "q"]
 
 RECURSION_LIMIT: Final = 200  # §9.1
@@ -105,10 +108,11 @@ _THREAD_PREFIX: Final[Mapping[ThreadKind, str]] = MappingProxyType(
 
 @dataclass(frozen=True)
 class ProfileGraphs:
-    """The compiled profile graphs: the text phase and the extract phase. Task 20 adds `propose`."""
+    """The compiled profile graphs: the text phase, the extract phase and the query proposal."""
 
     text: ProfileGraph
     extract: ProfileGraph
+    propose: ProposalGraph
 
 
 def thread_id(kind: ThreadKind, subject_id: int, operation_id: int, attempts: int) -> str:
@@ -130,10 +134,10 @@ def invoke_config(kind: ThreadKind, subject_id: int, op: OperationContext) -> Ru
     }
 
 
-def sanitized(name: str, node: Node) -> Node:
+def sanitized[S, U](name: str, node: StateNode[S, U]) -> StateNode[S, U]:
     """`node` whose unclassified errors become `NodeFailed(name, <class>)` (module docstring)."""
 
-    async def guarded(state: ProfileState, config: RunnableConfig) -> ProfileUpdate:
+    async def guarded(state: S, config: RunnableConfig) -> U:
         try:
             return await node(state, config)
         except PASS_THROUGH:
@@ -157,7 +161,9 @@ def add_node(graph: StateGraph[ProfileState], name: str, node: Node) -> None:
     )
 
 
-def add_llm_node(graph: StateGraph[ProfileState], name: str, node: Node) -> None:
+def add_llm_node[S: (ProfileState, ProposalState), U](
+    graph: StateGraph[S], name: str, node: StateNode[S, U]
+) -> None:
     """Add the LLM node `name`: no `RetryPolicy`, `LLM_NODE_TIMEOUT` and `LLM_NODE_TRACE` (Tasks 13, 20)."""
     graph.add_node(name, sanitized(name, node), timeout=LLM_NODE_TIMEOUT, trace_policy=LLM_NODE_TRACE)
 
@@ -200,6 +206,18 @@ def _extract_graph(checkpointer: BaseCheckpointSaver[str], deps: ProfileDeps) ->
     return graph.compile(checkpointer=checkpointer)
 
 
+def _propose_graph(checkpointer: BaseCheckpointSaver[str], deps: ProfileDeps) -> ProposalGraph:
+    graph = StateGraph(ProposalState)
+    add_llm_node(graph, propose_node.NAME, propose_node.make_propose_queries(deps))
+    graph.add_edge(START, propose_node.NAME)
+    graph.add_edge(propose_node.NAME, END)
+    return graph.compile(checkpointer=checkpointer)
+
+
 def build_profile_graphs(checkpointer: BaseCheckpointSaver[str], deps: ProfileDeps) -> ProfileGraphs:
     """The profile graphs over the process-wide `deps`, compiled with `checkpointer` (once per process)."""
-    return ProfileGraphs(text=_text_graph(checkpointer, deps), extract=_extract_graph(checkpointer, deps))
+    return ProfileGraphs(
+        text=_text_graph(checkpointer, deps),
+        extract=_extract_graph(checkpointer, deps),
+        propose=_propose_graph(checkpointer, deps),
+    )

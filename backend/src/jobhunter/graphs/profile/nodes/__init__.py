@@ -1,10 +1,11 @@
 """The node modules of `profile_graph` (spec §9.5) and what they share; each `make_*(deps)` builds its node.
 
-A node is called with the graph's state and the invoke config (`Node`: LangGraph passes the config to a node
-whose parameter is named `config`, and `mypy --strict` matches the names). It reads its execution from
-`config["configurable"]["op"]` (`execution`): the handler's `OperationContext`, with the claim (for the
-owner lock and `OperationOwner`), `finish_in`, `requeue_in` and the worker's `OperationDeps`. Never from the
-state: the state is checkpointed, `configurable` is not.
+A node is called with the graph's state and the invoke config (`StateNode`: LangGraph passes the config to a
+node whose parameter is named `config`, and `mypy --strict` matches the names). `Node` is a node of the draft
+graphs (`ProfileState`), `ProposalNode` one of the `propose` graph (`ProposalState`, Task 20). It reads its
+execution from `config["configurable"]["op"]` (`execution`): the handler's `OperationContext`, with the claim
+(for the owner lock and `OperationOwner`), `finish_in`, `requeue_in` and the worker's `OperationDeps`. Never
+from the state: the state is checkpointed, `configurable` is not.
 
 What the nodes share, each write in the caller's transaction after the owner lock (§9.1: the owner row, then
 the domain rows):
@@ -48,7 +49,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.errors import InvariantViolation, TransitionConflict
-from jobhunter.graphs.profile.state import FAILED, OBSOLETE, ProfileState, ProfileUpdate
+from jobhunter.graphs.profile.state import (
+    FAILED,
+    OBSOLETE,
+    ProfileState,
+    ProfileUpdate,
+    ProposalState,
+    ProposalUpdate,
+)
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.worker.operations import OperationContext, OperationDeps, lock_operation_owner
@@ -75,8 +83,14 @@ _LOCK_EXTRACT_DRAFT = q(_EXTRACT_DRAFT_SQL + " FOR UPDATE OF d")
 log = get_logger("jobhunter.graphs.profile")
 
 
-class Node(Protocol):
-    async def __call__(self, state: ProfileState, config: RunnableConfig) -> ProfileUpdate: ...
+class StateNode[S, U](Protocol):
+    """A node over the state `S` that returns the update `U`."""
+
+    async def __call__(self, state: S, config: RunnableConfig) -> U: ...
+
+
+type Node = StateNode[ProfileState, ProfileUpdate]
+type ProposalNode = StateNode[ProposalState, ProposalUpdate]
 
 
 def execution(config: RunnableConfig) -> tuple[OperationContext, OperationDeps]:

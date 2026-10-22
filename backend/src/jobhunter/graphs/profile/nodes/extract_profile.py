@@ -39,7 +39,6 @@ from langchain_core.runnables import RunnableConfig
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.crypto import DecryptError, data_keys
-from jobhunter.db.sql import q
 from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.graphs.profile.deps import ProfileDeps
@@ -59,7 +58,7 @@ from jobhunter.graphs.profile.nodes.llm_outcome import Call, Fail, Requeue, Use
 from jobhunter.graphs.profile.state import FAILED, REQUEUED, ProfileState, ProfileUpdate
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.errors import LLMError
-from jobhunter.llm.gateway import CallContext, NodeConfig, RenderedPrompt, node_config
+from jobhunter.llm.gateway import CallContext, NodeConfig, RenderedPrompt, active_node_config
 from jobhunter.llm.prompts.render import extract_profile_native_pdf_prompt, extract_profile_prompt
 from jobhunter.llm.schemas.profile import ProfileOut
 from jobhunter.llm.spend_ledger import OperationOwner, Receipt
@@ -71,13 +70,6 @@ PURPOSE: Final = "extract_profile"
 AFTER_CALL: Final = "profile.extract.after_call"
 _CV_OPEN: Final = "<cv_text>"
 _CV_CLOSE: Final = "</cv_text>"
-
-# The active model policy and execution config (§13.3: every non-score call uses the active ones).
-_ACTIVE_LLM_CONFIG = q(
-    "SELECT a.execution_config_id, m.payload AS model_policy, e.payload AS execution FROM active_config a "
-    "JOIN model_policies m ON m.id = a.model_policy_id "
-    "JOIN execution_configs e ON e.id = a.execution_config_id WHERE a.id = 1"
-)
 
 
 def sha256(text: str) -> bytes:
@@ -93,14 +85,6 @@ async def _receipts(
         draft = await fetch_extract_draft(conn, draft_id)
         receipts = await spend_ledger.receipts(conn, operation_id=op.claim.operation_id, purpose=PURPOSE)
     return draft, receipts
-
-
-async def _active_node(engine: AsyncEngine) -> tuple[NodeConfig, int]:
-    """`extract_profile`'s node from the active model policy and execution config, and the config's id."""
-    async with engine.connect() as conn:
-        row = (await conn.execute(_ACTIVE_LLM_CONFIG)).one()
-    node = node_config(PURPOSE, model_policy=row.model_policy, execution=row.execution, schema=ProfileOut)
-    return node, int(row.execution_config_id)
 
 
 def _transmitted_text(prompt: RenderedPrompt) -> str:
@@ -214,7 +198,7 @@ def make_extract_profile(deps: ProfileDeps) -> Node:
             if isinstance(request, str):
                 step = Fail(request)
             else:
-                node, execution_config_id = await _active_node(deps.engine)
+                node, execution_config_id = await active_node_config(deps.engine, PURPOSE, ProfileOut)
                 call = _caller(
                     op, od, node, request, execution_config_id, draft_id, native_pdf=draft.native_pdf
                 )

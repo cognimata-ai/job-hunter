@@ -15,6 +15,7 @@ serves user input.
 
 import bisect
 import functools
+import itertools
 import math
 from collections import defaultdict
 from collections.abc import Iterable
@@ -182,6 +183,11 @@ class Gazetteer:
         places = [_place(row) for row in _table(de_places, PLACE_COLUMNS, "de_places")]
         non_de = [_non_de_place(row) for row in _table(non_de_places, NON_DE_COLUMNS, "non_de_places")]
         return cls(places, non_de)
+
+    def places_of_population(self, at_least: int) -> list[Place]:
+        """The German places with at least `at_least` inhabitants, most populous first (M2 Task 20: the large
+        places whose names are location words of a query proposal)."""
+        return list(itertools.takewhile(lambda place: place.population >= at_least, self._places))
 
     def by_name(self, folded: str) -> list[Place]:
         """The places whose `folded` or any `alt_folded` equals `folded`, most populous first."""

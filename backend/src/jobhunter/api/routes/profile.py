@@ -21,31 +21,51 @@ parses it (`_CappedBodyRoute`: 413 `upload_rejected`, `too_large` on `text`); th
 (`upload.check_paste`: 422 `upload_rejected` on `text`) and stored sealed in its `cv_files` row
 (`raw_text_enc`, `extraction_method = 'pasted'`), never as a file; the same transaction opens the draft.
 
-Both need a session and pass the edge's CSRF check. Logs carry ids, sizes and reason codes only: never a file
-name, a file's content or a pasted text.
+`POST /api/profile/query-proposals` (Idempotency-Key, no body) → 202 `{proposal_id}` (Task 20, §5.5.1): a
+query proposal for the active profile version. In one transaction: the key's row (`run_idempotent`), the
+active profile version (`active_config`, read without a lock; none, or a purged one, is 409 `conflict_state`
+and stores nothing), then `queries.proposals.request_proposal`, which returns the version's running proposal
+when there is one (a repeat with a new key gets the same id) and otherwise opens one with its
+`propose_queries` operation and job. The call counts against the non-scoring share of the budget (its spend
+owner is that operation, §6.9.1). `GET /api/profile/query-proposals/{id}` → `{status, items}`: `items` is the
+list of kept queries of a `ready` proposal (`{text, lang, target_title, exploration, rationale}` each), `null`
+before and otherwise; an unknown id is 404 `not_found`.
+
+Every route needs a session, and the POSTs pass the edge's CSRF check. Logs carry ids, sizes and reason codes
+only: never a file name, a file's content, a pasted text or a query text.
 """
 
 import asyncio
 import hashlib
 from collections.abc import Callable, Coroutine
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Header, Path, Request
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncEngine
-from starlette.responses import Response
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from starlette.responses import JSONResponse, Response
 from starlette.types import Message
 
 from jobhunter.api.deps import get_config, get_data_keys, get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api_idempotency import (
+    IDEMPOTENCY_HEADER,
+    StoredResponse,
+    check_idempotency_key,
+    request_fingerprint,
+    run_idempotent,
+)
+from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.db.sql import q
 from jobhunter.llm import bounds
 from jobhunter.observability.logging import get_logger
 from jobhunter.profile import upload
 from jobhunter.profile.storage import CvStore
 from jobhunter.profile.text import drop_nul
+from jobhunter.queries import proposals
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(
@@ -85,8 +105,40 @@ _CV_FORM: Final[dict[str, Any]] = {
 }
 
 
+PROPOSAL_ROUTE: Final = "profile.query_proposals"
+_BIGINT_MAX: Final = 2**63 - 1
+_ACTIVE_VERSION: Final = q(
+    "SELECT a.profile_version_id, v.purged_at IS NOT NULL AS purged FROM active_config a "
+    "LEFT JOIN profile_versions v ON v.id = a.profile_version_id WHERE a.id = 1"
+)
+_PROPOSAL: Final = q("SELECT status, items FROM query_proposals WHERE id = :p")
+
+ProposalId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a query proposal")]
+
+
 class DraftCreatedOut(BaseModel):
     draft_id: int
+
+
+class ProposalCreatedOut(BaseModel):
+    proposal_id: int
+
+
+class ProposedQueryOut(BaseModel):
+    """A kept item of a proposal (§11.12), as `POST /api/queries` accepts it."""
+
+    text: str
+    lang: Literal["de", "en"]
+    target_title: str
+    exploration: bool
+    rationale: str
+
+
+class ProposalOut(BaseModel):
+    """A proposal's status and, once `ready`, its kept queries; `items` is `null` in every other status."""
+
+    status: Literal["running", "ready", "failed", "purged"]
+    items: list[ProposedQueryOut] | None
 
 
 class CvTextIn(BaseModel):
@@ -265,3 +317,87 @@ router.add_api_route(
     },
     route_class_override=_CappedBodyRoute,
 )
+
+
+# --- query proposals (Task 20) ------------------------------------------------------------------------------
+
+
+def _no_profile() -> Problem:
+    return Problem(
+        409,
+        "conflict_state",
+        "No active profile",
+        detail="Confirm a profile before asking for query proposals.",
+    )
+
+
+@router.post(
+    "/query-proposals",
+    status_code=202,
+    response_model=ProposalCreatedOut,
+    responses={
+        400: {"description": "Idempotency-Key missing or malformed (`idempotency_key_required`)"},
+        409: {
+            "description": "No active profile (`conflict_state`), or a request with this key is still "
+            "running (`idempotency_in_progress`)"
+        },
+        422: {"description": "The key was used for another request (`idempotency_key_reused`)"},
+        **CSRF_RESPONSES,
+    },
+)
+async def request_query_proposal(
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
+) -> Response:
+    """Ask the LLM to propose search queries for the active profile (202); a running proposal is returned."""
+    key = check_idempotency_key(idempotency_key)
+    requested: list[tuple[int, int, int, bool]] = []  # logged after the commit
+
+    async def handler(conn: AsyncConnection) -> StoredResponse:
+        active = (await conn.execute(_ACTIVE_VERSION)).one()
+        if active.profile_version_id is None or active.purged:
+            raise _no_profile()
+        version_id = int(active.profile_version_id)
+        proposal_id, operation_id, created = await proposals.request_proposal(
+            conn, version_id, defer=defer_in_tx
+        )
+        requested.append((proposal_id, operation_id, version_id, created))
+        return StoredResponse(202, ProposalCreatedOut(proposal_id=proposal_id).model_dump(mode="json"))
+
+    async with engine.begin() as conn:
+        stored = await run_idempotent(
+            conn,
+            route=PROPOSAL_ROUTE,
+            key=key,
+            fingerprint=request_fingerprint({}, {}),
+            now=utcnow(),
+            handler=handler,
+        )
+    for proposal_id, operation_id, version_id, created in requested:
+        log.info(
+            "query_proposal_requested",
+            proposal_id=proposal_id,
+            operation_id=operation_id,
+            version_id=version_id,
+            created=created,
+        )
+    return JSONResponse(stored.body, status_code=stored.status)
+
+
+@router.get(
+    "/query-proposals/{proposal_id}",
+    response_model=ProposalOut,
+    responses={404: {"description": "No such proposal (`not_found`)"}},
+)
+async def get_query_proposal(
+    proposal_id: ProposalId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> ProposalOut:
+    """A query proposal's status and, once ready, its queries."""
+    async with engine.connect() as conn:
+        row = (await conn.execute(_PROPOSAL, {"p": proposal_id})).first()
+    if row is None:
+        raise Problem(404, "not_found", "Query proposal not found")
+    items = None
+    if row.status == proposals.READY and isinstance(row.items, dict):
+        items = [ProposedQueryOut.model_validate(item) for item in row.items.get("queries", [])]
+    return ProposalOut(status=row.status, items=items)

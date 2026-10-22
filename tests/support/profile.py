@@ -56,6 +56,13 @@ Task 14 adds the review routes' side:
 - `draft_row_api(client, draft_id)`: `GET /api/profile/drafts/{id}` as the client sees it (200 required);
 - the `failed_low_text_draft` fixture: a scanned PDF uploaded through the api and run through the text phase,
   so its draft is `failed('low_text')` with its PDF file kept (the draft's id).
+
+Task 20 adds the query proposal's side:
+- `SYNTHETIC_QUERIES`, the `propose_queries` body of the hand-authored synthetic stream
+  (`write_propose_queries_fixture`, committed under `tests/contract/fixtures/anthropic/propose_queries/`):
+  eight queries a model could propose for `SYNTHETIC_PROFILE`, each of them valid by §11.12 (no location word,
+  two of them `exploration`), so every one of them is kept;
+- `QUERIES_USAGE`: the usage that stream reports, within the reservation of any proposal for that profile.
 """
 
 import asyncio
@@ -86,6 +93,7 @@ from jobhunter.graphs.profile.graph import build_profile_graphs
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.llm.schemas.profile import ProfileOut
+from jobhunter.llm.schemas.queries import QueryProposalOut
 from jobhunter.llm.transport import make_http_client
 from jobhunter.profile.parse_client import ParseClient
 from jobhunter.profile.storage import CvStore
@@ -794,3 +802,74 @@ async def failed_low_text_draft(engine: AsyncEngine, op_runner: OpRunner, upload
     draft = await draft_row(engine, draft_id)
     assert (draft.status, draft.failure_code) == ("failed", "low_text")
     return draft_id
+
+
+# --- Task 20: the query proposal ---------------------------------------------------------------------------
+
+
+def _query(
+    text: str, lang: str, target_title: str, rationale: str, *, exploration: bool = False
+) -> dict[str, Any]:
+    return {
+        "text": text,
+        "lang": lang,
+        "target_title": target_title,
+        "exploration": exploration,
+        "rationale": rationale,
+    }
+
+
+_DE_TITLE: Final = "Senior Backend-Entwicklerin"
+_EN_TITLE: Final = "Senior Backend Developer"
+# The `propose_queries` body of the synthetic stream: what a model could propose for `SYNTHETIC_PROFILE`, with
+# no place, no work mode and no personal detail in any text or rationale (module docstring).
+SYNTHETIC_QUERIES: Final[dict[str, Any]] = {
+    "queries": [
+        _query(
+            "Senior Backend Developer Python", "en", _EN_TITLE, "Python is the main language of every role."
+        ),
+        _query("Senior Backend-Entwicklerin Python", "de", _DE_TITLE, "Der Zieltitel mit der Hauptsprache."),
+        _query(
+            "Backend Developer FastAPI", "en", _EN_TITLE, "FastAPI services are named in the recent role."
+        ),
+        _query("Backend Entwickler PostgreSQL", "de", _DE_TITLE, "PostgreSQL begleitet beide Rollen."),
+        _query("Python Entwickler Zahlungsverkehr", "de", _DE_TITLE, "Die aktuelle Domäne sind Zahlungen."),
+        _query("Senior Python Engineer", "en", _EN_TITLE, "A common English title for the same work."),
+        _query(
+            "Data Engineer Kafka",
+            "en",
+            _EN_TITLE,
+            "The data platform work with Kafka and Spark supports a broader data role.",
+            exploration=True,
+        ),
+        _query(
+            "Platform Engineer",
+            "en",
+            _EN_TITLE,
+            "Code reviews, tests and services point to a neighbouring platform role.",
+            exploration=True,
+        ),
+    ]
+}
+QUERIES_USAGE: Final = {
+    "input_tokens": 1900,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 700,
+}
+PROPOSE_PURPOSE: Final = "propose_queries"
+PROPOSE_MODEL: Final = "claude-opus-5-5"
+
+
+def write_propose_queries_fixture(root: Path = FAKE_LLM_DIR) -> Path:
+    """The synthetic `propose_queries` stream of `SYNTHETIC_QUERIES` for the default model and the queries
+    schema, with its sidecars, under `root` (by default the committed recordings); the stream's path."""
+    return write_synthetic_recording(
+        root,
+        PROPOSE_PURPOSE,
+        PROPOSE_MODEL,
+        QueryProposalOut,
+        SYNTHETIC_QUERIES,
+        case="task20_synthetic_profile",
+        usage=QUERIES_USAGE,
+    )

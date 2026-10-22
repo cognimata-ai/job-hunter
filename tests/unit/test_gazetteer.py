@@ -23,6 +23,18 @@ def test_lookups_and_sizes() -> None:
     assert 3.0 < distance_km(52.52, 13.405, 52.5, 13.35) < 5.0
 
 
+def test_places_of_population_are_the_large_places_most_populous_first() -> None:
+    """M2 Task 20: the places whose names are location words of a query proposal."""
+    g = Gazetteer.load()
+    large = g.places_of_population(100_000)
+    assert large and large[0].name == "Berlin"
+    assert all(p.population >= 100_000 for p in large)
+    assert [p.population for p in large] == sorted((p.population for p in large), reverse=True)
+    assert {p.gazetteer_id for p in large} == {
+        p.gazetteer_id for p in everything(g) if p.population >= 100_000
+    }
+
+
 def test_load_is_cached_and_reads_the_packaged_files() -> None:
     assert Gazetteer.load() is Gazetteer.load()
 

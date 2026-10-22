@@ -1,6 +1,7 @@
 """The two pieces both LLM nodes share (plan Task 13; Task 20 reuses them): the receipts walk over the
 completed calls of an operation (§9.1, Deviation 26), and the mapping of the gateway's errors to a failure
-code, the one structural repair or a requeue. Pure: no database."""
+code, the one structural repair or a requeue. Task 20 adds the node's own check of a parsed output (`usable`):
+a refused output counts as invalid, with the same one repair. Pure: no database."""
 
 from decimal import Decimal
 from typing import Any
@@ -8,7 +9,16 @@ from typing import Any
 import pytest
 from jobhunter.errors import InvariantViolation
 from jobhunter.graphs.profile.nodes import llm_outcome
-from jobhunter.graphs.profile.nodes.llm_outcome import Call, Fail, Requeue, Use, after_error, drive, walk
+from jobhunter.graphs.profile.nodes.llm_outcome import (
+    Call,
+    Fail,
+    Requeue,
+    Use,
+    after_error,
+    after_invalid,
+    drive,
+    walk,
+)
 from jobhunter.llm.errors import (
     BudgetExhausted,
     DeadlineExhausted,
@@ -194,3 +204,73 @@ async def test_drive_lets_a_non_llm_error_through() -> None:
 
     with pytest.raises(Boom):
         await drive(Call(1), call)
+
+
+# --- a node's own check of a parsed output (Task 20) ------------------------------------------------------
+
+
+def test_an_invalid_output_is_repaired_once_whatever_found_it() -> None:
+    assert after_invalid(1) == Call(2)
+    assert after_invalid(2) == Fail("invalid_output")
+    # the structural failure and the walk's receipt take the same rule
+    assert after_error(InvalidOutput("structural"), 1) == after_invalid(1)
+    assert walk({1: failed(11, "invalid_output")}) == after_invalid(1)
+
+
+class Refusing:
+    """A node's `usable`: it refuses the outputs of the calls `refused`, recording what it was asked."""
+
+    def __init__(self, *refused: int) -> None:
+        self.refused = refused
+        self.asked: list[Use] = []
+
+    def __call__(self, use: Use) -> bool:
+        self.asked.append(use)
+        return use.llm_call_id not in self.refused
+
+
+def refusing(*refused: int) -> Refusing:
+    return Refusing(*refused)
+
+
+async def test_a_usable_receipt_is_used_without_a_request() -> None:
+    calls, usable = Calls(), refusing()
+    assert await drive(Use(1, 11), calls, usable=usable) == Use(1, 11)
+    assert (calls.made, usable.asked) == ([], [Use(1, 11)])
+
+
+async def test_a_refused_first_receipt_makes_only_the_repair() -> None:
+    calls, usable = Calls(22), refusing(11)
+    assert await drive(Use(1, 11), calls, usable=usable) == Use(2, 22)
+    assert (calls.made, usable.asked) == ([2], [Use(1, 11), Use(2, 22)])
+
+
+async def test_a_refused_repair_receipt_fails_without_a_request() -> None:
+    calls = Calls()
+    assert await drive(Use(2, 22), calls, usable=refusing(22)) == Fail("invalid_output")
+    assert calls.made == []
+
+
+async def test_a_refused_new_call_is_repaired_once() -> None:
+    calls = Calls(21, 22)
+    assert await drive(Call(1), calls, usable=refusing(21)) == Use(2, 22)
+    assert calls.made == [1, 2]
+
+
+async def test_a_refused_repair_fails_and_is_never_repeated() -> None:
+    calls = Calls(21, 22, 23)
+    assert await drive(Call(1), calls, usable=refusing(21, 22)) == Fail("invalid_output")
+    assert calls.made == [1, 2]
+
+
+async def test_a_structural_failure_then_a_refused_repair_fails() -> None:
+    calls = Calls(InvalidOutput("structural"), 22)
+    assert await drive(Call(1), calls, usable=refusing(22)) == Fail("invalid_output")
+    assert calls.made == [1, 2]
+
+
+async def test_usable_is_never_asked_about_a_failure_or_a_requeue() -> None:
+    usable = refusing()
+    assert await drive(Fail("refused"), Calls(), usable=usable) == Fail("refused")
+    assert await drive(Call(1), Calls(LLMTransient("http_529")), usable=usable) == Requeue("llm_transient")
+    assert usable.asked == []

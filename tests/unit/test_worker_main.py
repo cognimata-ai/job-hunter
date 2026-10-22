@@ -641,10 +641,10 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
     anyway), the registries hold exactly the M1 and M2 reconcilers with their cadences, the two takeover
     sweeps, the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
-    `apply_scope` (Task 18) and `watchlist_validate` handlers, and the failure hooks of the two profile
-    phases (`embed_profile` has none: it drives no domain row). `embed_profile` and the `profile_vectors`
-    reconciler come with `profile.operations`, which imports `profile.vectors`; `worker.main` lists
-    neither."""
+    `propose_queries` (Task 20), `apply_scope` (Task 18) and `watchlist_validate` handlers, and the failure
+    hooks of the two profile phases and of the query proposal (`embed_profile` has none: it drives no domain
+    row). `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with
+    `profile.operations`, which imports `profile.vectors`; `worker.main` lists neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
@@ -655,8 +655,9 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
             "embed_profile",
             "extract_profile",
             "extract_profile_text",
+            "propose_queries",
             "watchlist_validate",
         ],
-        "failure_hooks": ["extract_profile", "extract_profile_text"],
+        "failure_hooks": ["extract_profile", "extract_profile_text", "propose_queries"],
         "main_imported": False,
     }

@@ -1,5 +1,6 @@
 """What both LLM nodes of the profile graphs share (spec §9.1, §10.4, §10.5; plan Task 13, Deviation 26): the
-receipts walk and the mapping of the gateway's errors. Task 20's `propose_queries` node reuses both unchanged.
+receipts walk and the mapping of the gateway's errors. Task 20's `propose_queries` node reuses both, with the
+one addition it needs, a node's own check of a parsed output (`usable`, below).
 
 **A step** is what a node does next for its operation: `Use` a completed call's output (no request), make a
 `Call` (logical call 1, or 2 for the one structural repair), `Fail` the domain row with a code, or `Requeue`
@@ -26,10 +27,16 @@ completed call without an output carries its code): `InvariantViolation`.
 `model_mismatch` and `max_tokens`; `LLMTransient` and `DeadlineExhausted` requeue the operation
 (`Requeue('llm_transient')`, `REQUEUE_AFTER` from now), whose attempt limit and failure hook then end the row.
 
-`drive(step, call)` makes the calls a step asks for, with `call(logical_call_no)` (the node's gateway call,
-returning the call's id), and returns the step that needs no further call. It makes at most two: the walk asks
-for call 2 only after call 1 was invalid, and the mapping asks for nothing after call 2. Pure: no I/O but the
-node's own `call`, no clock and no logging.
+**An invalid output** (`after_invalid`), whatever found it, is the one repair after call 1 (`Call(2)`) and
+`Fail('invalid_output')` after the repair: the walk's `invalid_output` receipt, the gateway's
+`InvalidOutput("structural")` and a node's own refusal of a parsed output all go through it.
+
+`drive(step, call, usable=None)` makes the calls a step asks for, with `call(logical_call_no)` (the node's
+gateway call, returning the call's id), and returns the step that needs no further call. With `usable` (Task
+20: the semantic check of a query set, §11.12), every `Use` it reaches, a receipt's or a new call's, is
+checked first: one it refuses is an invalid output (`after_invalid`), so a refused call 1 makes the repair due
+and a refused repair fails. It makes at most two calls: call 2 only after call 1 was invalid, and nothing
+after call 2. Pure: no I/O but the node's own `call` and `usable`, no clock and no logging.
 """
 
 from collections.abc import Awaitable, Callable, Mapping
@@ -116,7 +123,7 @@ def walk(receipts: Mapping[int, Receipt]) -> Use | Call | Fail:
         if code == MAX_TOKENS_FIRST_STAGE:
             return Call(logical_call_no)
         if code == INVALID_OUTPUT:
-            return Call(REPAIR_CALL) if logical_call_no == FIRST_CALL else Fail(INVALID_OUTPUT)
+            return after_invalid(logical_call_no)
         if code in TERMINAL_CODES:
             return Fail(code)
         raise InvariantViolation(
@@ -125,11 +132,16 @@ def walk(receipts: Mapping[int, Receipt]) -> Use | Call | Fail:
     return Call(FIRST_CALL)
 
 
+def after_invalid(logical_call_no: int) -> Call | Fail:
+    """The step after logical call `logical_call_no` gave an invalid output (module docstring)."""
+    return Call(REPAIR_CALL) if logical_call_no == FIRST_CALL else Fail(INVALID_OUTPUT)
+
+
 def after_error(error: LLMError, logical_call_no: int) -> Call | Fail | Requeue:
     """The step after logical call `logical_call_no` raised `error` (module docstring)."""
     if isinstance(error, InvalidOutput):
         if error.code == _STRUCTURAL:
-            return Call(REPAIR_CALL) if logical_call_no == FIRST_CALL else Fail(INVALID_OUTPUT)
+            return after_invalid(logical_call_no)
         if error.code == UNEXPECTED_STOP_REASON:
             return Fail(UNEXPECTED_STOP_REASON)
         raise ValueError(f"an unknown InvalidOutput code {error.code!r}")
@@ -152,14 +164,21 @@ _FAILURES: Final[tuple[tuple[type[LLMError], str], ...]] = (
 )
 
 
-async def drive(step: Step, call: Callable[[int], Awaitable[int]]) -> Use | Fail | Requeue:
-    """Make the calls `step` asks for (module docstring); an error other than an `LLMError` propagates."""
-    while isinstance(step, Call):
-        logical_call_no = step.logical_call_no
-        try:
-            llm_call_id = await call(logical_call_no)
-        except LLMError as error:
-            step = after_error(error, logical_call_no)
-        else:
-            return Use(logical_call_no, llm_call_id)
-    return step
+async def drive(
+    step: Step, call: Callable[[int], Awaitable[int]], *, usable: Callable[[Use], bool] | None = None
+) -> Use | Fail | Requeue:
+    """Make the calls `step` asks for, checking every `Use` with `usable` when given (module docstring); an
+    error other than an `LLMError` propagates."""
+    while True:
+        if isinstance(step, Call):
+            logical_call_no = step.logical_call_no
+            try:
+                llm_call_id = await call(logical_call_no)
+            except LLMError as error:
+                step = after_error(error, logical_call_no)
+                continue
+            step = Use(logical_call_no, llm_call_id)
+        if isinstance(step, Use) and usable is not None and not usable(step):
+            step = after_invalid(step.logical_call_no)
+            continue
+        return step

@@ -2,7 +2,8 @@
 nodes, edges and policies, the LLM nodes' policies, the thread names, and the node wrapper `sanitized` that
 keeps an exception's content out of `checkpoint_writes`.
 
-Task 13 adds the `extract` graph to `ProfileGraphs`, and its shape here; Task 20 adds `propose`.
+Task 13 adds the `extract` graph to `ProfileGraphs`, and its shape here; Task 20 adds `propose`, the graph of
+a query proposal, with a state of its own (`ProposalState`).
 """
 
 import asyncio
@@ -31,7 +32,14 @@ from jobhunter.graphs.profile.graph import (
     sanitized,
     thread_id,
 )
-from jobhunter.graphs.profile.state import ProfileState, ProfileUpdate, initial_state
+from jobhunter.graphs.profile.state import (
+    ProfileState,
+    ProfileUpdate,
+    ProposalState,
+    ProposalUpdate,
+    initial_proposal_state,
+    initial_state,
+)
 from jobhunter.llm.errors import BudgetExhausted, InvalidOutput, LLMTransient, Refused
 from jobhunter.profile.errors import UploadRejected
 from jobhunter.worker import operations as ops
@@ -55,9 +63,9 @@ def graphs() -> ProfileGraphs:
     )
 
 
-def test_profile_graphs_hold_the_text_and_the_extract_graph() -> None:
-    """Task 20 adds `propose` with its node; no placeholder graph exists before."""
-    assert [field.name for field in dataclasses.fields(ProfileGraphs)] == ["text", "extract"]
+def test_profile_graphs_hold_the_text_the_extract_and_the_propose_graph() -> None:
+    """Each task added its graph with its nodes (Task 11's ruling): no placeholder graph exists."""
+    assert [field.name for field in dataclasses.fields(ProfileGraphs)] == ["text", "extract", "propose"]
 
 
 def test_the_text_graph_is_parse_then_strip_contacts() -> None:
@@ -120,6 +128,46 @@ def test_the_extract_nodes_have_their_policies() -> None:
             TimeoutPolicy(run_timeout=seconds),
             None,
         )
+
+
+def test_the_propose_graph_is_propose_queries_then_end() -> None:
+    drawn = graphs().propose.get_graph()
+    edges = {(edge.source, edge.target, edge.conditional) for edge in drawn.edges}
+    assert edges == {(START, "propose_queries", False), ("propose_queries", END, False)}
+
+
+def test_propose_queries_is_an_llm_node() -> None:
+    """The policies of `extract_profile` (Deviation 28): no retry, the maximum deadline, nothing traced."""
+    nodes = graphs().propose.builder.nodes
+    assert set(nodes) == {"propose_queries"}
+    spec = nodes["propose_queries"]
+    assert (spec.retry_policy, spec.timeout, spec.trace_policy) == (None, LLM_NODE_TIMEOUT, LLM_NODE_TRACE)
+    assert graphs().propose.builder.state_schema is ProposalState
+
+
+def test_the_initial_proposal_state_holds_ids_only() -> None:
+    assert initial_proposal_state(9, 44) == {
+        "proposal_id": 9,
+        "operation_id": 44,
+        "llm_call_id": None,
+        "steps": [],
+        "outcome": None,
+    }
+
+
+def test_a_proposal_runs_on_a_queries_thread_of_its_own() -> None:
+    claim = ops.OperationClaim(44, uuid.uuid4(), "propose_queries", {"proposal_id": 9}, 1)
+    op = ops.OperationContext(claim=claim, engine=cast(AsyncEngine, object()))
+    assert invoke_config("q", 9, op)["configurable"] == {"thread_id": "queries-9-q44-a1", "op": op}
+
+
+async def test_sanitized_wraps_a_proposal_node_too() -> None:
+    async def failing(state: ProposalState, config: RunnableConfig) -> ProposalUpdate:
+        raise ValueError(MARKER)
+
+    with pytest.raises(NodeFailed) as raised:
+        await sanitized("propose_queries", failing)(initial_proposal_state(9, 44), NO_CONFIG)
+    assert (raised.value.node, raised.value.error_class) == ("propose_queries", "ValueError")
 
 
 def test_an_llm_node_has_no_retry_the_maximum_deadline_and_traces_nothing() -> None:
