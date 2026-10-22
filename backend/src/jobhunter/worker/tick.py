@@ -13,7 +13,9 @@ given, never from the database's clock:
 
 There is no check before an insert: the two unique indexes decide, and a violation is an outcome, never an
 error loop. `insert_active_collect` is the one place that inserts an active collection, shared with the
-manual run (`request_manual_run`).
+manual run (`request_manual_run`). Every run records the settings version, the scope version and the LLM tuple
+of one `active_config` read (`llm_tuple_id` is NULL before a profile is active; node 9 reads it from the run,
+plan Task 23).
 
 `missed` and `skipped_overlap` are terminal statuses: the tick task counts the rows a tick inserted with them
 in `RUNS` once its transaction has committed (`observe_tick`, ruling T12-e). They are never timed: such a run
@@ -41,7 +43,10 @@ SLOT_INDEX: Final = "runs_slot_uq"
 
 log = get_logger("jobhunter.worker.tick")
 
-_ACTIVE_CONFIG = q("SELECT settings_version_id, scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
+# The versions every run records, in one read (Task 23: the LLM tuple too, which node 9 reads from the run).
+_ACTIVE_CONFIG = q(
+    "SELECT settings_version_id, scope_version_id, llm_tuple_id FROM active_config WHERE id = 1 FOR SHARE"
+)
 _SCHEDULE_STATE = q(
     "SELECT anchor_utc, interval_s, enabled, last_evaluated_slot FROM schedule_state WHERE id = 1 FOR UPDATE"
 )
@@ -50,18 +55,21 @@ _STORE_CURSOR = q("UPDATE schedule_state SET last_evaluated_slot = :slot, update
 
 # The conflict target is the partial unique index `runs_slot_uq`, exactly as its DDL defines it (§7.6).
 _INSERT_MISSED = q(
-    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id) "
-    "SELECT 'schedule', u.slot, 'missed', :include_paid, :settings_version_id, :scope_version_id "
-    "FROM unnest(CAST(:slots AS timestamptz[])) AS u(slot) ORDER BY u.slot "
+    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id, "
+    "llm_tuple_id) "
+    "SELECT 'schedule', u.slot, 'missed', :include_paid, :settings_version_id, :scope_version_id, "
+    ":llm_tuple_id FROM unnest(CAST(:slots AS timestamptz[])) AS u(slot) ORDER BY u.slot "
     "ON CONFLICT (kind, scheduled_slot) WHERE scheduled_slot IS NOT NULL DO NOTHING"
 )
 _INSERT_QUEUED = q(
-    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id) "
-    "VALUES (:trigger, :slot, 'queued', :include_paid, :settings_version_id, :scope_version_id) RETURNING id"
+    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id, "
+    "llm_tuple_id) VALUES (:trigger, :slot, 'queued', :include_paid, :settings_version_id, "
+    ":scope_version_id, :llm_tuple_id) RETURNING id"
 )
 _INSERT_SKIPPED_OVERLAP = q(
-    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id) "
-    "VALUES (:trigger, :slot, 'skipped_overlap', :include_paid, :settings_version_id, :scope_version_id)"
+    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id, "
+    "llm_tuple_id) VALUES (:trigger, :slot, 'skipped_overlap', :include_paid, :settings_version_id, "
+    ":scope_version_id, :llm_tuple_id)"
 )
 
 
@@ -137,9 +145,12 @@ async def insert_active_collect(
     include_paid: bool,
     settings_version_id: int,
     scope_version_id: int,
+    llm_tuple_id: int | None,
     path: Literal["tick", "manual"],
 ) -> int | Literal["active_conflict", "slot_conflict"]:
-    """Insert a `queued` collection and return its id, or the unique violation that stopped it.
+    """Insert a `queued` collection and return its id, or the unique violation that stopped it. The versions
+    are those of the caller's one `active_config` read, the LLM tuple included (`None` before a profile is
+    active).
 
     This is the only insert of an active collection (tick and manual run). It runs in a savepoint, so the
     caller's transaction stays usable after a violation. The error is caught outside the savepoint block and
@@ -157,6 +168,7 @@ async def insert_active_collect(
                     "include_paid": include_paid,
                     "settings_version_id": settings_version_id,
                     "scope_version_id": scope_version_id,
+                    "llm_tuple_id": llm_tuple_id,
                 },
             )
             return int(result.scalar_one())
@@ -177,6 +189,7 @@ async def _insert_skipped_overlap(
     include_paid: bool,
     settings_version_id: int,
     scope_version_id: int,
+    llm_tuple_id: int | None,
 ) -> bool:
     """Record `slot` as `skipped_overlap`; false when the slot already has a row (a writer was first)."""
     try:
@@ -189,6 +202,7 @@ async def _insert_skipped_overlap(
                     "include_paid": include_paid,
                     "settings_version_id": settings_version_id,
                     "scope_version_id": scope_version_id,
+                    "llm_tuple_id": llm_tuple_id,
                 },
             )
     except IntegrityError as exc:
@@ -235,6 +249,7 @@ async def run_tick(conn: AsyncConnection, *, now: datetime, defer: Deferrer) -> 
     versions = {
         "settings_version_id": config.settings_version_id,
         "scope_version_id": config.scope_version_id,
+        "llm_tuple_id": config.llm_tuple_id,
     }
 
     *earlier, latest = slots

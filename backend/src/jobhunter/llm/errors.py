@@ -1,9 +1,9 @@
 """The LLM layer's domain errors (spec §6.9.1, §10.4, §10.5).
 
 `BudgetExhausted` is the spend ledger's (a reservation the monthly cap refuses); the others are the gateway's
-outcomes of a call (Task 5). Like every `DomainError` they carry codes, statuses, model ids and amounts only,
-never a prompt, a response or any CV or profile text, so their messages are safe to log and to put into a
-checkpoint.
+outcomes of a call (Task 5), `LLMNotConfigured` that of a gateway without a key (Task 23). Like every
+`DomainError` they carry codes, statuses, model ids and amounts only, never a prompt, a response or any CV or
+profile text, so their messages are safe to log and to put into a checkpoint.
 """
 
 from decimal import Decimal
@@ -24,6 +24,15 @@ class BudgetExhausted(LLMError):
         super().__init__(f"LLM budget exhausted for {purpose_class} calls (headroom ${headroom_usd})")
         self.purpose_class: PurposeClass = purpose_class
         self.headroom_usd = headroom_usd
+
+
+class LLMNotConfigured(LLMError):
+    """The gateway can make no call: the worker has neither the `anthropic_key` secret nor the fake LLM (plan
+    Task 23). Raised by every call before anything is reserved, counted or sent; not retryable until a key is
+    mounted and the worker restarted."""
+
+    def __init__(self) -> None:
+        super().__init__("the LLM gateway is not configured: the worker has no anthropic_key secret")
 
 
 class LLMTransient(LLMError):

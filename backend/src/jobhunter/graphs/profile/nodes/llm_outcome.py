@@ -22,9 +22,10 @@ completed call without an output carries its code): `InvariantViolation`.
 **The error mapping** (`after_error`) of the gateway's exceptions, for the logical call that raised:
 `InvalidOutput("structural")` is repaired once (`Call(2)`), a second one is `Fail('invalid_output')`;
 `InvalidOutput("unexpected_stop_reason")`, `Refused`, `BudgetExhausted`, `InputUnbounded` (every reason,
-`unencodable` included), `LLMRequestError(s)`, `ModelMismatch` and `MaxTokensExhausted` fail with
-`unexpected_stop_reason`, `refused`, `budget_exhausted`, `input_unbounded`, `llm_request_<s>`,
-`model_mismatch` and `max_tokens`; `LLMTransient` and `DeadlineExhausted` requeue the operation
+`unencodable` included), `LLMRequestError(s)`, `ModelMismatch`, `MaxTokensExhausted` and `LLMNotConfigured`
+(Task 23: a worker without a key, nothing reserved or sent) fail with `unexpected_stop_reason`, `refused`,
+`budget_exhausted`, `input_unbounded`, `llm_request_<s>`, `model_mismatch`, `max_tokens` and
+`llm_not_configured`; `LLMTransient` and `DeadlineExhausted` requeue the operation
 (`Requeue('llm_transient')`, `REQUEUE_AFTER` from now), whose attempt limit and failure hook then end the row.
 
 **An invalid output** (`after_invalid`), whatever found it, is the one repair after call 1 (`Call(2)`) and
@@ -51,6 +52,7 @@ from jobhunter.llm.errors import (
     InputUnbounded,
     InvalidOutput,
     LLMError,
+    LLMNotConfigured,
     LLMRequestError,
     LLMTransient,
     MaxTokensExhausted,
@@ -73,6 +75,7 @@ REPAIR_CALL: Final = 2
 TERMINAL_CODES: Final = frozenset({REFUSED, MODEL_MISMATCH, MAX_TOKENS, UNEXPECTED_STOP_REASON})
 BUDGET_EXHAUSTED: Final = "budget_exhausted"
 INPUT_UNBOUNDED: Final = "input_unbounded"
+LLM_NOT_CONFIGURED: Final = "llm_not_configured"
 LLM_TRANSIENT: Final = "llm_transient"
 # How long a requeued operation waits after a transient failure (§10.4: the gateway's own retries are spent).
 REQUEUE_AFTER: Final = timedelta(minutes=5)
@@ -161,6 +164,7 @@ _FAILURES: Final[tuple[tuple[type[LLMError], str], ...]] = (
     (InputUnbounded, INPUT_UNBOUNDED),
     (ModelMismatch, MODEL_MISMATCH),
     (MaxTokensExhausted, MAX_TOKENS),
+    (LLMNotConfigured, LLM_NOT_CONFIGURED),
 )
 
 

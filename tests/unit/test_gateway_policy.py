@@ -186,3 +186,68 @@ async def test_the_input_bound_raises_unencodable_without_the_encoding_error(tmp
             await gw._input_bound(GATEWAY_NODE, gateway_prompt("half a pair: \ud800"), ctx)
     assert refused.value.reason == "unencodable"
     assert refused.value.__cause__ is None and refused.value.__context__ is None
+
+
+# --- Task 23: a worker without the `anthropic_key` secret and not in fake mode ------------------------------
+
+
+def _keyless_config(tmp_path: Path, secrets: dict[str, bytes] | None = None) -> Any:
+    from jobhunter.config import load_config
+
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    for name, value in (secrets or {}).items():
+        (secrets_dir / name).write_bytes(value)
+        (secrets_dir / name).chmod(0o440)
+    env = {"JOBHUNTER_ENV": "test", "JOBHUNTER_DB_NAME": "jobhunter"}  # no JOBHUNTER_FAKE_LLM
+    return load_config("worker", env, secrets_dir)
+
+
+def _sends_nothing(request: Any) -> Any:
+    raise AssertionError(f"the gateway sent a request to {request.url}")
+
+
+@pytest.mark.parametrize(
+    "secrets", [None, {"anthropic_key": b""}, {"anthropic_key": b" \n"}], ids=["absent", "empty", "blank"]
+)
+@pytest.mark.parametrize("native_pdf", [False, True], ids=["text", "native_pdf"])
+async def test_a_gateway_without_a_key_raises_not_configured_before_any_reservation(
+    tmp_path: Path, secrets: dict[str, bytes] | None, native_pdf: bool
+) -> None:
+    """It is built (a worker without a key starts), and every call raises `LLMNotConfigured` first: before
+    the input bound (a native PDF's `count_tokens` included), any transaction or any request."""
+    import httpx2
+    from jobhunter.llm.errors import LLMNotConfigured
+
+    cfg = _keyless_config(tmp_path, secrets)
+    assert not cfg.fake_llm and not cfg.secrets.get("anthropic_key", b"").strip()
+    async with make_http_client(cfg, mount=httpx2.MockTransport(_sends_nothing)) as client:
+        gw = LLMGateway(cast(AsyncEngine, _NoEngine()), cfg, http_client=client, cache=CacheMonitor())
+        assert gw.configured is False
+        ctx = gateway.CallContext(
+            owner=EvalRunOwner(1),
+            purpose_class="nonscoring",
+            execution_config_id=1,
+            deadline=time.monotonic() + 900,
+            eval_run_id=1,
+            native_pdf=native_pdf,
+        )
+        with pytest.raises(LLMNotConfigured) as refused:
+            await gw.call(GATEWAY_NODE, gateway_prompt(), ctx)
+        with pytest.raises(LLMNotConfigured):
+            await gw.count_tokens(GATEWAY_NODE.model, {"messages": []})
+        with pytest.raises(LLMNotConfigured):
+            gw.count_body(GATEWAY_NODE, gateway_prompt())
+    assert str(refused.value) == "the LLM gateway is not configured: the worker has no anthropic_key secret"
+
+
+async def test_a_gateway_with_the_key_or_in_fake_mode_is_configured(tmp_path: Path) -> None:
+    import httpx2
+
+    (tmp_path / "keyed").mkdir()
+    keyed = _keyless_config(tmp_path / "keyed", {"anthropic_key": b"unit-test-key-never-sent\n"})
+    fake_cfg = fake_llm_config(FAKE_LLM_DIR, tmp_path / "no-secrets")
+    for cfg in (keyed, fake_cfg):
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(_sends_nothing)) as client:
+            gw = LLMGateway(cast(AsyncEngine, _NoEngine()), cfg, http_client=client, cache=CacheMonitor())
+            assert gw.configured is True

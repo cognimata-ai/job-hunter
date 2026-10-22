@@ -90,7 +90,7 @@ def test_a_lock_timeout_is_recognised_through_sqlalchemy_and_through_procrastina
 class World:
     """Fakes for every collaborator of `worker_main` that does I/O; `events` records what they did."""
 
-    def __init__(self, monkeypatch, tmp_path) -> None:
+    def __init__(self, monkeypatch, tmp_path, *, fake_llm: bool = True) -> None:
         from contextlib import asynccontextmanager
 
         from jobhunter.config import load_config
@@ -269,15 +269,16 @@ class World:
             (secrets / name).write_text(value)
             (secrets / name).chmod(0o440)
         # Task 11: the gateway is on the fake LLM transport (this worker has no `anthropic_key`), and the
-        # parse root and the CV store are the test's own
+        # parse root and the CV store are the test's own. Task 23: without `fake_llm`, a worker with neither
+        # the key nor the fake (its gateway is not configured).
         self.parse_root = tmp_path / "parse"
         self.parse_root.mkdir()
+        fake_env = {"JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": str(tmp_path / "anthropic")}
         env = {
             "JOBHUNTER_ENV": "test",
             "JOBHUNTER_DB_NAME": "jobhunter",
             "JOBHUNTER_DB_HOST": "unused",
-            "JOBHUNTER_FAKE_LLM": "1",
-            "JOBHUNTER_FAKE_LLM_DIR": str(tmp_path / "anthropic"),
+            **(fake_env if fake_llm else {}),
             "JOBHUNTER_PARSE_JOBS_DIR": str(self.parse_root),
             "JOBHUNTER_CV_STORE_DIR": str(tmp_path / "cv"),
         }
@@ -505,6 +506,40 @@ async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_p
         runtime.embedder,
     )
     assert runtime.gateway.http_client.is_closed  # the teardown's `llm` step
+    assert runtime.gateway.configured and logged(caplog, "llm_not_configured") == []
+
+
+async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_not_configured(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Task 23: a worker with neither the `anthropic_key` secret nor the fake LLM starts as any other (its
+    loops run, the teardown closes the gateway's client); its gateway is not configured, so every LLM call
+    fails `llm_not_configured`, and it says so once at start, at `warning`."""
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path, fake_llm=False)
+    assert not world.cfg.fake_llm and "anthropic_key" not in world.cfg.secrets
+    assert await worker_main(world.cfg) == 0
+    assert world.events == [
+        "lock_connect",
+        "lock_acquire",
+        "claim",
+        "watchdog_start",
+        "queue_open",
+        "saver_open",
+        "http_configure",
+        "make_clients",
+        "sync_instances",
+        "reconcile_start",
+        *TEARDOWN,
+    ]
+    runtime = world.runtimes[0]
+    assert isinstance(runtime, WorkerRuntime) and runtime.gateway.configured is False
+    assert runtime.operation_deps.gateway is runtime.gateway
+    [event] = logged(caplog, "llm_not_configured")
+    assert event["level"] == "warning"
+    assert runtime.gateway.http_client.is_closed
 
 
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(

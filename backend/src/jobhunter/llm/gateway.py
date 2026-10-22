@@ -26,6 +26,13 @@ The fault points `gateway.after_reserve` and `gateway.after_dispatch` mark the w
 crash or cancellation between them leaves the try to `llm_ledger_unsettled`: `reserved` → released once its
 owner no longer holds, `dispatched` → `ambiguous` (§17.4).
 
+**Not configured** (plan Task 23). A worker with neither the `anthropic_key` secret nor the fake LLM still
+starts: its gateway is built without a key (`configured` is false; `worker.main` logs `llm_not_configured`
+once), and every `call`, `count_body` and `count_tokens` raises `LLMNotConfigured` as its first step, before
+the input bound, any transaction (no reservation, no ledger row, no call row) and any request. The LLM nodes
+end their row `failed('llm_not_configured')` (`graphs.profile.nodes.llm_outcome`). The fake and the keyed
+gateway are unchanged.
+
 Before the loop: the input bound. A text request is `bounds.text_input_bound` of `RenderedPrompt.as_request`;
 a native PDF (`CallContext.native_pdf`) is `count_tokens` on the exact request and `bounds.native_pdf_bound`,
 and its tries reserve with `native_pdf_extra=True`. A failed count, a count above the context window, or a
@@ -113,6 +120,7 @@ from jobhunter.llm.errors import (
     DeadlineExhausted,
     InputUnbounded,
     InvalidOutput,
+    LLMNotConfigured,
     LLMRequestError,
     LLMTransient,
     MaxTokensExhausted,
@@ -640,13 +648,13 @@ class _Next:
     result: GatewayResult | None = None
 
 
-def _api_key(cfg: AppConfig) -> SecretStr:
+def _api_key(cfg: AppConfig) -> SecretStr | None:
+    """The key every request sends (G1): the worker's `anthropic_key` secret, or in fake LLM mode a
+    placeholder; `None` without either (the gateway is not configured, module docstring)."""
     if cfg.fake_llm:
         return SecretStr(_FAKE_API_KEY)  # the fake ignores the key; a real one is never sent there
-    secret = cfg.secrets.get("anthropic_key")
-    if not secret:
-        raise ValueError("the gateway needs the worker's anthropic_key secret (G1)")
-    return SecretStr(secret.decode("utf-8").strip())
+    key = cfg.secrets.get("anthropic_key", b"").decode("utf-8").strip()
+    return SecretStr(key) if key else None
 
 
 class LLMGateway:
@@ -673,6 +681,19 @@ class LLMGateway:
         self._key = _api_key(cfg)
 
     @property
+    def configured(self) -> bool:
+        """Whether this gateway can make calls: it has the key, or it is on the fake LLM (module
+        docstring)."""
+        return self._key is not None
+
+    def _configured_key(self) -> SecretStr:
+        """The key of a configured gateway; `LLMNotConfigured` otherwise, before anything is reserved or
+        sent."""
+        if self._key is None:
+            raise LLMNotConfigured()
+        return self._key
+
+    @property
     def http_client(self) -> httpx2.AsyncClient:
         """The `httpx2` client every try and every token count is sent on (the schema dry-run reads what it
         sent there, through a request hook)."""
@@ -684,7 +705,9 @@ class LLMGateway:
         return self._monotonic
 
     async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult:
-        """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries)."""
+        """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries); a
+        gateway without a key raises `LLMNotConfigured` first."""
+        api_key = self._configured_key()
         messages = to_messages(prompt)  # the last is a user turn: never a prefill (RenderedPrompt)
         hashes = _hashes(prompt)
         if hashes is None:  # raised outside the handler: the encoding error holds the whole prompt
@@ -707,7 +730,7 @@ class LLMGateway:
                     node.effort,
                     max_tokens,
                     node.schema,
-                    api_key=self._key,
+                    api_key=api_key,
                     http_client=self._http,
                     purpose=node.purpose,
                     receipt=receipt,
@@ -731,7 +754,8 @@ class LLMGateway:
     def count_body(self, node: NodeConfig, prompt: RenderedPrompt) -> dict[str, Any]:
         """The `messages.count_tokens` body of the exact request a try of `node` sends: langchain's payload of
         the send without `max_tokens` (and `stream`, which it adds when it streams)."""
-        llm = _chat_model(node.model, node.effort, node.max_tokens, api_key=self._key, http_client=self._http)
+        api_key = self._configured_key()
+        llm = _chat_model(node.model, node.effort, node.max_tokens, api_key=api_key, http_client=self._http)
         output_config = {"format": {"type": "json_schema", "schema": output_schema(node.schema)}}
         payload: dict[str, Any] = llm._get_request_payload(to_messages(prompt), output_config=output_config)
         if extra := set(payload) - _COUNT_KEYS - {"max_tokens"}:
@@ -740,8 +764,8 @@ class LLMGateway:
 
     async def count_tokens(self, model: Model, body: Mapping[str, Any]) -> int:
         """`POST /v1/messages/count_tokens` for `body` on `model` (free; native PDF and V19). The SDK's
-        `APIError` propagates."""
-        client = _sdk_client(self._key, self._http, self._http.timeout, {})
+        `APIError` propagates; a gateway without a key raises `LLMNotConfigured` and sends nothing."""
+        client = _sdk_client(self._configured_key(), self._http, self._http.timeout, {})
         counted = await client.messages.count_tokens(**{**body, "model": model})
         return int(counted.input_tokens)
 

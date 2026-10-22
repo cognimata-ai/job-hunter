@@ -25,6 +25,7 @@ from jobhunter.llm.errors import (
     InputUnbounded,
     InvalidOutput,
     LLMError,
+    LLMNotConfigured,
     LLMRequestError,
     LLMTransient,
     MaxTokensExhausted,
@@ -127,6 +128,7 @@ def test_an_unknown_invalid_output_code_is_a_bug() -> None:
         (LLMRequestError(401), "llm_request_401"),
         (ModelMismatch("claude-opus-5-5", "claude-sonnet-5-5"), "model_mismatch"),
         (MaxTokensExhausted("enlarged stage too"), "max_tokens"),
+        (LLMNotConfigured(), "llm_not_configured"),  # Task 23: a worker without a key
     ],
     ids=lambda v: type(v).__name__ if isinstance(v, LLMError) else v,
 )

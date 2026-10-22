@@ -14,7 +14,9 @@
 7. the task app opened, the checkpointer, the M2 operation dependencies (Task 11), the collection graph on
    its `CollectDeps` and the `WorkerRuntime` with a fresh `ShutdownState`. The operation dependencies, after
    the checkpointer: the LLM gateway on its `httpx2` client (`llm.transport.make_http_client`: in fake LLM
-   mode the recorded transport, else the `anthropic_key` secret), the docparse client on
+   mode the recorded transport, else the `anthropic_key` secret; with neither, a gateway that is not
+   configured, whose every call fails `llm_not_configured`, logged once here: the worker still starts, plan
+   Task 23), the docparse client on
    `cfg.parse_jobs_dir` (every leftover a crashed worker left there removed first, §12.2), the CV store on
    `cfg.cv_store_dir`, the profile graphs on their process-wide `ProfileDeps`, and `OperationDeps` over
    them, the embedder and the clock, which `run_operation` hands to every execution. The collection deps:
@@ -254,6 +256,8 @@ class _WorkerProcess:
         saver = await self.saver_scope.enter_async_context(open_saver(dsn))
         llm_http = self.llm_http = llm_transport.make_http_client(cfg)
         gateway = LLMGateway(engine, cfg, http_client=llm_http, cache=CacheMonitor())
+        if not gateway.configured:
+            log.warning("llm_not_configured")  # neither the key nor the fake: every LLM call fails with it
         parse_client = ParseClient(cfg.parse_jobs_dir)
         parse_client.cleanup_leftovers()  # before any job: what a crashed worker left (§12.2)
         cv_store = CvStore(cfg.cv_store_dir)

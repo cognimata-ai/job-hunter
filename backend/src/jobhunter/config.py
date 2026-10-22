@@ -6,6 +6,11 @@ then checks the loaded configuration in the order of §16.8 and raises `StartupC
 the first check that fails. A failure names a check, and a secret file when one is to blame. It
 never contains a secret value. `startup_or_exit` is the process entry point: it logs the failing
 check and exits with code 78.
+
+An optional secret of the role whose file is empty reads as absent (plan Task 23): compose needs a mounted
+secret's file to exist, so the dev stack mounts an empty `anthropic_key` when no key was given. Its mode is
+still checked (it is mounted); an empty required secret counts as missing, and an empty secret of another role
+is still foreign.
 """
 
 import base64
@@ -239,6 +244,8 @@ def load_config(
     if secrets_dir is None:
         secrets_dir = Path(env.get("JOBHUNTER_SECRETS_DIR") or DEFAULT_SECRETS_DIR)
     contents, modes, unreadable = _read_secret_files(secrets_dir)
+    optional = ROLE_SECRETS[role].optional
+    contents = {name: value for name, value in contents.items() if value or name not in optional}
 
     return AppConfig(
         role=role,

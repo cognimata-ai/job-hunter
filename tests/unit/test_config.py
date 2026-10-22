@@ -300,6 +300,25 @@ def test_an_empty_required_secret_counts_as_missing(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("content", [b"", b"\n"])
+def test_an_empty_optional_secret_reads_as_absent(tmp_path: Path, content: bytes) -> None:
+    """Task 23: compose needs a mounted secret's file to exist, so the dev stack mounts an empty
+    `anthropic_key` when no key was given; the worker then has no key, and passes its startup assertions."""
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS, anthropic_key=content, rapidapi_key=content)
+    cfg = load_config("worker", BASE_ENV, d)
+    assert "anthropic_key" not in cfg.secrets and "rapidapi_key" not in cfg.secrets
+    assert set(cfg.secrets) == set(WORKER_SECRETS)
+    run_startup_assertions(cfg)
+    # the file is still mounted: its mode is checked as every mounted secret's is
+    (d / "anthropic_key").chmod(0o444)
+    assert check_of("worker", BASE_ENV, d) == "secrets_not_world_readable"
+
+
+def test_an_empty_secret_of_another_role_is_still_foreign(tmp_path: Path) -> None:
+    d = write_secrets(tmp_path / "s", **API_SECRETS, anthropic_key=b"")
+    assert check_of("api", BASE_ENV, d) == "foreign_secret_mounted"
+
+
 @pytest.mark.parametrize(
     "tracing_var", ["LANGSMITH_TRACING", "LANGSMITH_TRACING_V2", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"]
 )

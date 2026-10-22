@@ -229,7 +229,9 @@ _COMPLETION = q(
     "ON a.run_id = r.id AND a.attempt_no = r.attempt_no WHERE r.id = :i AND r.attempt_no = :a "
     "AND r.status = ANY(:final) AND a.end_reason = 'completed'"
 )
-_ACTIVE_CONFIG = q("SELECT settings_version_id, scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
+_ACTIVE_CONFIG = q(
+    "SELECT settings_version_id, scope_version_id, llm_tuple_id FROM active_config WHERE id = 1 FOR SHARE"
+)
 _ACTIVE_RUN = q(
     "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
     "finished_at, status_reason FROM runs WHERE kind = 'collect' AND status IN ('queued', 'running')"
@@ -492,10 +494,10 @@ async def request_manual_run(
     """The active collection, or a new `manual` one: `(row, created)`, in the caller's transaction.
 
     Holds `active_config` `FOR SHARE` (the first lock of the global order) for the settings and scope
-    versions. A `queued` or `running` collection is returned as it is (`created=False`). Otherwise the run is
-    inserted through `tick.insert_active_collect` and its job deferred in the same transaction. When that
-    insert meets a collection another transaction committed after the check (`active_conflict`, logged by the
-    helper), that collection is read again and returned.
+    versions and the LLM tuple (Task 23). A `queued` or `running` collection is returned as it is
+    (`created=False`). Otherwise the run is inserted through `tick.insert_active_collect` and its job
+    deferred in the same transaction. When that insert meets a collection another transaction committed after
+    the check (`active_conflict`, logged by the helper), that collection is read again and returned.
     """
     config = (await conn.execute(_ACTIVE_CONFIG)).one()
     for _ in range(_REQUEST_TRIES):
@@ -509,6 +511,7 @@ async def request_manual_run(
             include_paid=include_paid,
             settings_version_id=config.settings_version_id,
             scope_version_id=config.scope_version_id,
+            llm_tuple_id=config.llm_tuple_id,
             path="manual",
         )
         if isinstance(outcome, int):
