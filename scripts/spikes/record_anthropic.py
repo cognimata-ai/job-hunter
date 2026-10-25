@@ -1,6 +1,6 @@
 """The budgeted recorder of the paid Anthropic spikes (plan Task 4; plan Global Constraints, "Paid API").
 
-    uv run python scripts/spikes/record_anthropic.py --spike {v13,v4,v19} --dry-run|--live
+    uv run python scripts/spikes/record_anthropic.py --spike {v13,v4,v19,v2probe} --dry-run|--live
 
 It is the only way a spike sends a paid message, and the only place that maps `JOBHUNTER_ANTHROPIC_API_KEY`
 to a secret: the key is written to a temporary `anthropic_key` file, read into a worker `AppConfig` as every
@@ -12,16 +12,29 @@ The calls go through the production code: `gateway._chat` on `transport.make_htt
 where the mount is a capturing transport over the network (a direct connection; it asks for an identity
 encoding, so the captured stream is the bytes the SDK parsed).
 
-**Budget.** For all of M2: at most `MAX_MESSAGES` (8) paid messages and a running sum of worst-case
-reservations of at most `MAX_WORST_CASE_USD` ($0.80), each the exact `pricing.worst_case_usd` of the request
-about to be sent (its `extra_usd` included), plus each spike's own call count (`SPIKE_CALLS`). The whole
-invocation holds an exclusive `flock` on `.fixtures-raw/anthropic-budget.lock` (a second invocation fails at
-once). Before every send, `.fixtures-raw/anthropic-budget.json` (`{"entries": [...], "sent", "worst_case_usd",
-"settled_usd", "limits"}`) is rewritten by atomic rename with the message counted (`"state": "sending"`) and
-its worst case added; only then is a transport created. A crash after that line leaves the message counted.
-After the response the entry is `done` with its status and its settled cost: from the recorded usage when the
-stream completed, $0 for an error response (no content), its worst case when the outcome is unknown. A case
-that has an entry is never sent again, and the first unexpected outcome stops the spike.
+**Budget.** One budget covers every Anthropic spike, M2's included: `MAX_ACTUAL_USD` ($10.00) of actual
+spend in total, set by the user for M3. Before every send the recorder adds three amounts:
+- the settled cost of every `done` entry;
+- the worst case of every entry that is not `done`, because its outcome is unknown. An entry without a
+  settled cost also counts at its worst case.
+- the worst case of the call about to be sent: the exact `pricing.worst_case_usd` of its request, its
+  `extra_usd` included.
+
+The recorder refuses the send when that sum is above `MAX_ACTUAL_USD` (`Budget.refusal`), and also when the
+spike has sent all of its own calls (`SPIKE_CALLS`). There is no message count and no cap on the sum of worst
+cases: those were M2's limits (8 messages, $0.80).
+
+The whole invocation holds an exclusive `flock` on `.fixtures-raw/anthropic-budget.lock`, so a second
+invocation fails at once. Before every send, `.fixtures-raw/anthropic-budget.json` (`{"entries": [...],
+"sent", "worst_case_usd", "settled_usd", "limits"}`) is rewritten by atomic rename with the message counted
+(`"state": "sending"`) and its worst case recorded. Only then is a transport created, so a crash after that
+line leaves the message counted at its worst case. After the response the entry is `done` with its status
+and its settled cost:
+- from the recorded usage when the stream completed;
+- $0 for an error response (no content);
+- its worst case when the outcome is unknown.
+
+A case that has an entry is never sent again, and the first unexpected outcome stops the spike.
 
 **Files.**
 - `.fixtures-raw/anthropic/<spike>/<case>.request.json` (the sent request without its key),
@@ -43,6 +56,10 @@ that has an entry is never sent again, and the first unexpected outcome stops th
   still counts every send first and never sends a case twice. `--commit-recorded` writes that committed error
   answer from the raw capture of a counted case (one answered before its spike recorded every answer); it
   sends nothing and needs no key.
+- A spike whose module sets `RAW_ONLY = True` (v2probe) commits nothing. Each answer goes to the spike's
+  check: a completed stream whatever its stop reason, or an error response. The check's `expected` flag
+  decides whether the spike goes on, and the raw files stay in `.fixtures-raw`. Any other outcome, such as
+  a failed transport or a cut stream, stops the spike.
 
 **Spikes.** A spike is a module next to this one (`SPIKE_MODULES`) that sends nothing itself: `calls()` gives
 its calls in order, as dicts with `case`, `purpose`, `model`, `effort`, `max_tokens`, `system` (a list of
@@ -51,13 +68,18 @@ texts), `user` (the one user message: a text, or a list of content blocks with a
 gateway passes its node's: langchain needs a `title` on a dict schema, which is then sent too) and optionally
 `extra_usd` (a decimal string), `input_tokens_bound` and `native_pdf_count_tokens` (the call's `count_tokens`:
 its bound is `bounds.native_pdf_bound` of it); `check(observation)` returns the spike's verdict of one call
-(field paths, never content). V13 is `v13_structured_stream.py`, V4 `v4_schema_dry_run.py` and V19
-`v19_token_bound.py`. `counting_gateway(key)` gives the spikes a gateway for the free
-`messages.count_tokens` endpoint, with the key mapped as a live run maps it.
+(field paths, never content). A module may also define `wanted(case, verdicts)`, its own ladder. Before each
+send the recorder asks it whether the case is still needed, given the `verdict` of each counted case whose
+check has run (read from `<case>.check.json`). A case that is not wanted is neither counted nor sent. V13 is
+`v13_structured_stream.py`, V4 `v4_schema_dry_run.py`, V19 `v19_token_bound.py` and v2probe (V4b, the
+generator schema candidates of prompt-schema version 2) `v4b_generator_v2_probe.py`.
+`counting_gateway(key)` gives the spikes a gateway for the free `messages.count_tokens` endpoint, with the
+key mapped as a live run maps it.
 
 `--dry-run` sends nothing, needs no key and writes nothing: it prints the plan, each call's input bound and
 worst case, the budget the live run would meet, and the request each call would send, built by the same code
-on a transport that answers locally.
+on a transport that answers locally. For a spike with a ladder, its budget line assumes that every case is
+sent.
 
 **LangSmith.** langchain traces a call to LangSmith (its prompt and output included) when tracing is on in
 the environment, which the SDK's own telemetry switch does not cover. So with any of `TRACING_VARS` set, every
@@ -122,10 +144,20 @@ TRACING_VARS: Final = (
     "LANGCHAIN_API_KEY",
 )
 
-MAX_MESSAGES: Final = 8
-MAX_WORST_CASE_USD: Final = Decimal("0.80")
-SPIKE_CALLS: Final = {"v13": 2, "v4": 4, "v19": 1}  # V4: the 4 gating cases, no probe message (R7-2)
-SPIKE_MODULES: Final = {"v13": "v13_structured_stream", "v4": "v4_schema_dry_run", "v19": "v19_token_bound"}
+# Every Anthropic spike, M2's included: settled + the worst case of what is not settled + the next call's.
+MAX_ACTUAL_USD: Final = Decimal("10.00")
+BUDGET_RULE: Final = (
+    "refuse a send when settled_usd of the done entries + worst_case_usd of every other entry + the next "
+    "call's worst_case_usd > actual_usd"
+)
+# V4: the 4 gating cases, no probe message (R7-2). v2probe: the ladder A, B, C, at most 3 sends.
+SPIKE_CALLS: Final = {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3}
+SPIKE_MODULES: Final = {
+    "v13": "v13_structured_stream",
+    "v4": "v4_schema_dry_run",
+    "v19": "v19_token_bound",
+    "v2probe": "v4b_generator_v2_probe",
+}
 BANNED_REQUEST_KEYS: Final = ("tool_choice", "tools", "temperature", "top_p", "top_k", "betas", "fallbacks")
 # The response headers a committed recording keeps; every other one (request-id, anthropic-organization-id,
 # cf-ray, the rate-limit counters of the account) is removed.
@@ -311,6 +343,29 @@ class Budget:
     def settled_sum(self) -> Decimal:
         return sum((Decimal(str(e["settled_usd"])) for e in self.entries if e.get("settled_usd")), Decimal(0))
 
+    @staticmethod
+    def _settled(entry: Mapping[str, Any]) -> bool:
+        return entry.get("state") == "done" and entry.get("settled_usd") is not None
+
+    def settled_done_usd(self) -> Decimal:
+        """The settled cost of the `done` entries."""
+        return sum(
+            (Decimal(str(e["settled_usd"])) for e in self.entries if self._settled(e)),
+            Decimal(0),
+        )
+
+    def unsettled_worst_case_usd(self) -> Decimal:
+        """The worst case of every entry that is not `done` with a settled cost (its outcome is unknown)."""
+        return sum(
+            (Decimal(str(e["worst_case_usd"])) for e in self.entries if not self._settled(e)),
+            Decimal(0),
+        )
+
+    def committed_usd(self) -> Decimal:
+        """What the budget already holds: the settled cost of the done entries plus the worst case of the
+        others."""
+        return self.settled_done_usd() + self.unsettled_worst_case_usd()
+
     def has(self, call: PlannedCall) -> bool:
         return self.entry(call) is not None
 
@@ -324,12 +379,12 @@ class Budget:
         spike_sent = sum(1 for e in self.entries if e.get("spike") == call.spike)
         if spike_sent + 1 > SPIKE_CALLS[call.spike]:
             return f"{call.spike} has sent {spike_sent} of its {SPIKE_CALLS[call.spike]} calls"
-        if self.sent() + 1 > MAX_MESSAGES:
-            return f"{self.sent()} of the {MAX_MESSAGES} paid messages of M2 are counted"
-        if self.worst_case_sum() + worst_case > MAX_WORST_CASE_USD:
+        settled, unsettled = self.settled_done_usd(), self.unsettled_worst_case_usd()
+        if settled + unsettled + worst_case > MAX_ACTUAL_USD:
             return (
-                f"the worst-case sum would be {self.worst_case_sum() + worst_case} "
-                f"(${self.worst_case_sum()} counted + ${worst_case}), above ${MAX_WORST_CASE_USD}"
+                f"the budget would hold ${settled + unsettled + worst_case} (${settled} settled + "
+                f"${unsettled} worst case not settled + ${worst_case} this call's worst case), "
+                f"above ${MAX_ACTUAL_USD}"
             )
         return None
 
@@ -360,8 +415,8 @@ class Budget:
     def save(self) -> None:
         doc = {
             "limits": {
-                "messages": MAX_MESSAGES,
-                "worst_case_usd": str(MAX_WORST_CASE_USD),
+                "actual_usd": str(MAX_ACTUAL_USD),
+                "rule": BUDGET_RULE,
                 "spikes": SPIKE_CALLS,
             },
             "sent": self.sent(),
@@ -374,8 +429,8 @@ class Budget:
         )
 
     def left(self) -> str:
-        left_usd = MAX_WORST_CASE_USD - self.worst_case_sum()
-        return f"messages_left={MAX_MESSAGES - self.sent()} worst_case_left={left_usd}"
+        committed = self.committed_usd()
+        return f"committed_usd={committed} left_usd={MAX_ACTUAL_USD - committed}"
 
 
 @contextmanager
@@ -648,6 +703,10 @@ class Recorder:
                 f"input_tokens_bound={call.input_tokens_bound()} worst_case_usd={worst} "
                 f"schema12={fake.schema12(call.transformed_schema)}"
             )
+            if self.ladder is not None and not budget.has(call) and not self._wanted(call, budget):
+                self.say(
+                    f"{call.spike} {call.case} waits for the ladder: sent only when earlier verdicts ask"
+                )
             if budget.has(call):
                 self.say(f"{call.spike} {call.case} already counted: a live run skips it")
             elif (why := budget.refusal(call, worst)) is not None:
@@ -662,10 +721,32 @@ class Recorder:
             if problems:
                 code = STOPPED
         self.say(
-            f"budget after a live run: sent={budget.sent()}/{MAX_MESSAGES} "
-            f"worst_case_usd={budget.worst_case_sum()}"
+            f"budget after a live run that sent every case: sent={budget.sent()} "
+            f"committed_usd={budget.committed_usd()} of {MAX_ACTUAL_USD}"
         )
         return code
+
+    @property
+    def ladder(self) -> Callable[[str, Mapping[str, str]], bool] | None:
+        """The spike's `wanted(case, verdicts)`, if it has one."""
+        hook = getattr(self.module, "wanted", None)
+        return hook if callable(hook) else None
+
+    def verdicts(self, budget: Budget) -> dict[str, str]:
+        """The `verdict` of each counted case of the spike whose check has run, from its raw
+        `<case>.check.json`."""
+        found: dict[str, str] = {}
+        for call in self.calls:
+            path = self.root / "anthropic" / call.spike / f"{call.case}.check.json"
+            if budget.has(call) and path.is_file():
+                verdict = json.loads(path.read_text("utf-8")).get("verdict")
+                if isinstance(verdict, str):
+                    found[call.case] = verdict
+        return found
+
+    def _wanted(self, call: PlannedCall, budget: Budget) -> bool:
+        ladder = self.ladder
+        return ladder is None or bool(ladder(call.case, self.verdicts(budget)))
 
     async def live(self, key: str) -> int:
         with exclusive(self.root) as held:
@@ -689,6 +770,9 @@ class Recorder:
                 self.say(f"{self.spike}: FAILED, the anthropic_key secret did not load; nothing sent")
                 return FAILED
             for call in pending:
+                if not self._wanted(call, budget):
+                    self.say(f"{call.spike} {call.case} not wanted by the spike's ladder; not sent")
+                    continue
                 worst = call.worst_case_usd()
                 if (why := budget.refusal(call, worst)) is not None:
                     self.say(f"{call.spike} {call.case} REFUSED: {why}; nothing sent")
@@ -698,6 +782,9 @@ class Recorder:
                 if not self._finish(call, entry, budget, outcome, key):
                     self.say(f"{call.spike} {call.case} STOP: unexpected outcome; nothing more sent")
                     return STOPPED
+            if self.ladder is not None:
+                verdicts = self.verdicts(budget)
+                self.say(f"{self.spike} verdicts: {', '.join(f'{c}={v}' for c, v in verdicts.items())}")
             return OK
 
     def _finish(
@@ -760,6 +847,8 @@ class Recorder:
             f"error={outcome.error} worst_case_usd={entry['worst_case_usd']} settled_usd={settled} "
             f"{budget.left()}"
         )
+        if self.records_raw_only:
+            return self._check_only(call, events, capture, outcome, complete=complete, key=key)
         if error_answer and status is not None and capture.request is not None:
             # The spike records every answer (V4): this error is the case's live result; the spike goes on.
             self._record_error(
@@ -787,6 +876,39 @@ class Recorder:
     @property
     def records_every_answer(self) -> bool:
         return getattr(self.module, "RECORD_EVERY_ANSWER", False) is True
+
+    @property
+    def records_raw_only(self) -> bool:
+        return getattr(self.module, "RAW_ONLY", False) is True
+
+    def _check_only(
+        self,
+        call: PlannedCall,
+        events: list[fake.SSEEvent],
+        capture: Capture,
+        outcome: Outcome,
+        *,
+        complete: bool,
+        key: str,
+    ) -> bool:
+        """A `RAW_ONLY` spike's answer: the spike checks a completed stream, whatever its stop reason, or an
+        error response. Its `expected` flag says whether the spike goes on. Nothing is committed."""
+        status = capture.status
+        if complete:
+            observation = self._observation(call, events, capture, outcome)
+        elif status is not None and status >= 400 and capture.request is not None:
+            observation = self._error_observation(call, capture.request["body"], status, bytes(capture.body))
+        else:
+            self.say(f"{call.spike} {call.case} no answer to check")
+            return False
+        report = self.module.check(observation)
+        path = self.root / "anthropic" / call.spike / f"{call.case}.check.json"
+        _atomic_write(Tree.raw(self.root), path, _json(report, key))
+        self.say(
+            f"{call.spike} {call.case} verdict={report.get('verdict')} missing={report.get('missing')} "
+            "(raw only: nothing committed)"
+        )
+        return report.get("expected") is True
 
     def _record_error(
         self,
@@ -922,6 +1044,7 @@ class Recorder:
             "requested_model": call.model,
             "transformed_schema": call.transformed_schema,
             "request": capture.request["body"] if capture.request else {},
+            "status": capture.status,
             "events": [{"name": e.name, "data": e.data} for e in events],
             "response_metadata": dict(raw.response_metadata) if isinstance(raw, AIMessage) else {},
             "usage_metadata": dict(raw.usage_metadata or {}) if isinstance(raw, AIMessage) else {},
