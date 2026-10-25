@@ -78,6 +78,51 @@ DEDUP_GROUP_REPAIRS = Counter(
 )
 
 
+# The LLM spend of the month (§17.5), set from a settlement's `spend_ledger.SettleFigures` once its
+# transaction has committed: `state` is `counted` (the month row's counter), `billed`, `ambiguous` or
+# `reserved` (in flight).
+LLM_SPEND_USD = Gauge(
+    "jobhunter_llm_spend_usd", "LLM spend of the month by ledger state, in USD.", ["state"], registry=REGISTRY
+)
+LLM_BUCKET_USD = Gauge(
+    "jobhunter_llm_bucket_usd", "The USD bucket that paces scoring (spec 6.9.2), in USD.", registry=REGISTRY
+)
+LLM_HEADROOM_USD = Gauge(
+    "jobhunter_llm_headroom_usd", "Scoring headroom under the monthly LLM cap, in USD.", registry=REGISTRY
+)
+# Settled cost / reservation of each settled try, by purpose: about 0.1-0.5 for text, 1.0 for an ambiguous try
+# (it keeps its reservation), above 1.0 only for a bound violation (§10.7).
+RESERVATION_RATIO_BUCKETS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5, 2.0)
+LLM_RESERVATION_RATIO = Histogram(
+    "jobhunter_llm_reservation_ratio",
+    "Settled cost divided by the reservation of an LLM try, by purpose.",
+    ["purpose"],
+    buckets=RESERVATION_RATIO_BUCKETS,
+    registry=REGISTRY,
+)
+
+
+# Every HTTP try of the gateway (§17.5), counted once its settlement has committed. `model` is the requested
+# model, `purpose` the node; `outcome` is `ok` or the try's `llm_calls.error_code`: `invalid_output`,
+# `refused`, `max_tokens_first_stage`, `max_tokens`, `unexpected_stop_reason`, `model_mismatch`,
+# `http_<status>`, `connect_failed`, `stream_interrupted`, `deadline` or `cancelled`. A try fenced before its
+# dispatch marker sent nothing and is not counted.
+LLM_CALLS = Counter(
+    "jobhunter_llm_calls",
+    "HTTP tries of LLM calls, by model, effort, purpose and outcome.",
+    ["model", "effort", "purpose", "outcome"],
+    registry=REGISTRY,
+)
+# The prompt-cache read share of the completed calls of the last hour (§10.8): cache_read / (input +
+# cache_read + cache_write), by served model, effort and role (the call's purpose); set by `CacheMonitor`.
+LLM_CACHE_READ_RATIO = Gauge(
+    "jobhunter_llm_cache_read_ratio",
+    "Share of prompt tokens read from the cache over a rolling hour, by model, effort and role.",
+    ["model", "effort", "role"],
+    registry=REGISTRY,
+)
+
+
 def start_metrics_server(port: int) -> None:
     """Serve `REGISTRY` over HTTP on `port` from a daemon thread."""
     start_http_server(port, registry=REGISTRY)

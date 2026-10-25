@@ -9,7 +9,9 @@ from jobhunter.db.seed import (
     local_anchor_to_utc,
     scope_payload,
 )
+from jobhunter.settings.model import Settings
 from jobhunter.types import get_bool, get_str
+from pydantic import BaseModel
 
 SPEC_FIELDS = [
     "schedule.enabled",
@@ -83,6 +85,24 @@ def test_settings_v1_has_every_spec_field() -> None:
         "hybrid",
         "onsite",
     ]
+
+
+def _model_fields(model: type[BaseModel]) -> set[str]:
+    """The dotted §13.1 field names of the settings model: a group's fields, a top-level list as itself."""
+    names = set()
+    for name, field in model.model_fields.items():
+        group = field.annotation
+        if isinstance(group, type) and issubclass(group, BaseModel):
+            names |= {f"{name}.{inner}" for inner in group.model_fields}
+        else:
+            names.add(name)
+    return names
+
+
+def test_the_settings_model_has_exactly_the_spec_fields() -> None:
+    # Every §13.1 field is a field of the model (Task 15), and the model has no field §13.1 lacks.
+    assert _model_fields(Settings) == set(SPEC_FIELDS)
+    assert len(SPEC_FIELDS) == len(set(SPEC_FIELDS))
 
 
 def test_anchor_summer_and_winter() -> None:

@@ -28,8 +28,9 @@ it: a revival that the run sighted, an absence from one of the run's snapshots (
   per-run cap they were admitted under (`ledger.admitted_run_cap`, §6.4: the cap each reservation recorded,
   never the one of the window as it is now, which a later refinement changes; final review F3);
 - I4: every `linked` raw item of the run has an observation whose posting has a job;
-- I5: vacuous while `active_config.llm_tuple_id` is NULL (plan Deviation 11); with a tuple it fails, since
-  M1 creates no targets;
+- I5: vacuous while `active_config.llm_tuple_id` is NULL (M1 Deviation 11); with a tuple it passes while
+  `enqueue_targets.SCORE_TARGETS_ENABLED` is false, recording `"targets": "m3"` (M2 plan Deviation 10: M2
+  activates a tuple and creates no targets), and fails with the switch on until M3 checks the run's targets;
 - I6: the run's revisions still `awaiting_embedding`, counted (`{"awaiting": n}`): never a failure, the
   partial cause `awaiting_embedding`;
 - I7: the outcome reducer saw no conflict. A conflict raises outside any node and never reaches this node
@@ -83,6 +84,7 @@ from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
+from jobhunter.graphs.collect.nodes.enqueue_targets import SCORE_TARGETS_ENABLED
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate
 from jobhunter.observability.alerts import raise_alert, resolve_alert, resolve_alerts
 from jobhunter.observability.logging import get_logger
@@ -266,9 +268,12 @@ async def _i4(conn: AsyncConnection, run_id: int) -> InvariantResult:
 
 async def _i5(conn: AsyncConnection) -> InvariantResult:
     tuple_id = (await conn.execute(_ACTIVE_TUPLE)).scalar_one()
-    return InvariantResult(
-        "I5", tuple_id is None, {"llm_tuple_id": None if tuple_id is None else int(tuple_id)}
-    )
+    if tuple_id is None:
+        return InvariantResult("I5", True, {"llm_tuple_id": None})
+    detail: dict[str, JSONValue] = {"llm_tuple_id": int(tuple_id)}
+    if not SCORE_TARGETS_ENABLED:
+        detail["targets"] = "m3"
+    return InvariantResult("I5", not SCORE_TARGETS_ENABLED, detail)
 
 
 async def check_invariants(
@@ -672,7 +677,10 @@ async def finalize_from_graph(deps: CollectDeps, owner: RunOwner, state: Collect
         await ledger.lock_run_owner(conn, owner)
         run = (await conn.execute(_RUN, {"run": owner.run_id})).one()
         settings = await load_run_settings(conn, int(run.settings_version_id))
-        if settings.scope.max_ad_age_days is None:  # `load_run_settings` refuses such a version
+        # Narrows the type only: `RunSettings.from_settings` always sets `max_ad_age_days` (a settings payload
+        # without it takes the default 30, `settings.model.Scope`); the field is `None` only in a scope read
+        # from a `scope_versions` payload, which no run settings hold.
+        if settings.scope.max_ad_age_days is None:
             raise InvariantViolation(
                 f"settings version {settings.settings_version_id} has no max_ad_age_days"
             )

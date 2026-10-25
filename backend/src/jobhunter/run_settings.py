@@ -1,22 +1,27 @@
 """The typed view of a settings version that a collection run reads (spec §13.1).
 
-M1 reads the stored payload field by field (a malformed one raises `KeyError`, `TypeError` or `ValueError`);
-M2's Pydantic settings model replaces `load_run_settings`. A scope location's `key` is the slug of its label
-(`slug`): the `coverage_cells.location_key` of its cells. `scope_from_payload` reads the `scope` object of a
-settings payload, and also a `scope_versions.payload`, which M0 stores without `max_ad_age_days`
-(`seed.scope_payload`): its `max_ad_age_days` is then `None`.
+The frozen dataclasses are the collection pipeline's view, unchanged since M1. They are built from the
+Pydantic settings model (`settings.model.Settings`, M1 Carry-forward 1): `load_run_settings` validates the
+stored payload with it (a malformed one raises `pydantic.ValidationError`, a `ValueError`), and
+`RunSettings.from_settings` takes the view. The model checks each field alone; the rules across fields are the
+save's (`settings.validate.validate_fields`), so any stored version loads.
+
+A scope location's `key` is the slug of its label (`slug`): the `coverage_cells.location_key` of its cells.
+`scope_from_payload` reads the `scope` object of a settings payload, and also a `scope_versions.payload`,
+which M0 stores without `max_ad_age_days` (`seed.scope_payload`): its `max_ad_age_days` is then `None`.
 """
 
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Final, Literal, cast
+from typing import Final, Literal, Self
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.normalize.text import fold
-from jobhunter.types import JSONValue, get_bool, get_int, get_list, get_object, get_str, json_get
+from jobhunter.settings import model
+from jobhunter.types import JSONValue
 
 _NOT_ALPHANUMERIC: Final = re.compile(r"[\W_]+")
 
@@ -62,6 +67,40 @@ class ScopeSettings:
     exclude_keywords_in_description: bool
     max_ad_age_days: int | None  # None for a scope built from a `scope_versions.payload`
 
+    @classmethod
+    def from_model(cls, scope: model.ScopeVersionPayload) -> Self:
+        """The view of a validated scope; `max_ad_age_days` is `None` unless `scope` is a `model.Scope`."""
+        seniority = scope.seniority_range
+        return cls(
+            locations=tuple(
+                ScopeLocation(
+                    label=location.label,
+                    gazetteer_id=location.gazetteer_id,
+                    lat=location.lat,
+                    lon=location.lon,
+                    radius_km=location.radius_km,
+                    key=slug(location.label),
+                )
+                for location in scope.locations
+            ),
+            remote_within_germany=scope.remote_within_germany,
+            work_modes=frozenset(scope.work_modes),
+            employment_types=frozenset(scope.employment_types),
+            seniority_range=SeniorityRange(
+                mode=seniority.mode,
+                below=seniority.below,
+                above=seniority.above,
+                min=seniority.min,
+                max=seniority.max,
+            ),
+            industries_exclude=frozenset(fold(industry) for industry in scope.industries_exclude),
+            accepted_ad_languages=frozenset(scope.accepted_ad_languages),
+            excluded_companies=frozenset(scope.excluded_companies),
+            excluded_keywords=tuple(scope.excluded_keywords),
+            exclude_keywords_in_description=scope.exclude_keywords_in_description,
+            max_ad_age_days=scope.max_ad_age_days if isinstance(scope, model.Scope) else None,
+        )
+
 
 @dataclass(frozen=True)
 class SourcesEnabled:
@@ -98,73 +137,52 @@ class RunSettings:
     interval_s: int
     schedule_include_paid: bool
 
-
-def _strings(doc: JSONValue, path: str) -> list[str]:
-    return [get_str(item, "") for item in get_list(doc, path)]
-
-
-def _optional_str(doc: JSONValue, path: str) -> str | None:
-    return None if json_get(doc, path) is None else get_str(doc, path)
-
-
-def _number(doc: JSONValue, path: str) -> float:
-    value = json_get(doc, path)
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise TypeError(f"{path}: expected number, got {type(value).__name__}")
-    return float(value)
-
-
-def _location(doc: JSONValue) -> ScopeLocation:
-    label = get_str(doc, "label")
-    return ScopeLocation(
-        label=label,
-        gazetteer_id=get_str(doc, "gazetteer_id"),
-        lat=_number(doc, "lat"),
-        lon=_number(doc, "lon"),
-        radius_km=get_int(doc, "radius_km"),
-        key=slug(label),
-    )
-
-
-def _seniority(doc: JSONValue) -> SeniorityRange:
-    mode = get_str(doc, "mode")
-    if mode not in ("profile_relative", "explicit"):
-        raise ValueError(f"seniority_range.mode: unknown mode {mode!r}")
-    return SeniorityRange(
-        mode=cast(Literal["profile_relative", "explicit"], mode),
-        below=get_int(doc, "below"),
-        above=get_int(doc, "above"),
-        min=_optional_str(doc, "min"),
-        max=_optional_str(doc, "max"),
-    )
+    @classmethod
+    def from_settings(
+        cls, settings: model.Settings, *, settings_version_id: int, scope_version_id: int, interval_s: int
+    ) -> Self:
+        """The run's view of validated `settings`; `interval_s` is the schedule's (§3.4), and `stale_ttl_days`
+        is `collection.stale_ttl_days`, or `scope.max_ad_age_days` when that is `null` (§13.1)."""
+        enabled = settings.sources.enabled
+        quota = settings.quota
+        stale_ttl = settings.collection.stale_ttl_days
+        return cls(
+            settings_version_id=settings_version_id,
+            scope_version_id=scope_version_id,
+            scope=ScopeSettings.from_model(settings.scope),
+            sources=SourcesEnabled(
+                jsearch=enabled.jsearch,
+                serpapi=enabled.serpapi,
+                adzuna=enabled.adzuna,
+                arbeitnow=enabled.arbeitnow,
+                ats=enabled.ats,
+            ),
+            quota=QuotaSettings(
+                jsearch_monthly_limit=quota.jsearch_monthly_limit,
+                serpapi_monthly_limit=quota.serpapi_monthly_limit,
+                reserve_pct=quota.reserve_pct,
+                serpapi_hourly_cap=quota.serpapi_hourly_cap,
+                adzuna_cap_minute=quota.adzuna_cap_minute,
+                adzuna_cap_day=quota.adzuna_cap_day,
+                adzuna_cap_week=quota.adzuna_cap_week,
+                adzuna_cap_month=quota.adzuna_cap_month,
+                paid_max_requests_per_run=quota.paid_max_requests_per_run,
+            ),
+            queries={entry.query_id: entry.enabled for entry in settings.queries},
+            watchlist={entry.watchlist_company_id: entry.enabled for entry in settings.watchlist},
+            stale_ttl_days=settings.scope.max_ad_age_days if stale_ttl is None else stale_ttl,
+            interval_s=interval_s,
+            schedule_include_paid=settings.schedule.include_paid,
+        )
 
 
 def scope_from_payload(payload: Mapping[str, JSONValue]) -> ScopeSettings:
-    """The scope of a settings payload's `scope` object, or of a `scope_versions.payload`."""
-    doc: JSONValue = dict(payload)
-    return ScopeSettings(
-        locations=tuple(_location(item) for item in get_list(doc, "locations")),
-        remote_within_germany=get_bool(doc, "remote_within_germany"),
-        work_modes=frozenset(_strings(doc, "work_modes")),
-        employment_types=frozenset(_strings(doc, "employment_types")),
-        seniority_range=_seniority(get_object(doc, "seniority_range")),
-        industries_exclude=frozenset(fold(industry) for industry in _strings(doc, "industries_exclude")),
-        accepted_ad_languages=frozenset(_strings(doc, "accepted_ad_languages")),
-        excluded_companies=frozenset(_strings(doc, "excluded_companies")),
-        excluded_keywords=tuple(_strings(doc, "excluded_keywords")),
-        exclude_keywords_in_description=get_bool(doc, "exclude_keywords_in_description"),
-        max_ad_age_days=None if payload.get("max_ad_age_days") is None else get_int(doc, "max_ad_age_days"),
-    )
-
-
-def _enabled(doc: JSONValue, path: str, id_key: str) -> dict[int, bool]:
-    return {get_int(entry, id_key): get_bool(entry, "enabled") for entry in get_list(doc, path)}
-
-
-def _paid_max(doc: JSONValue) -> int | Literal["auto"]:
-    if json_get(doc, "quota.paid_max_requests_per_run") == "auto":
-        return "auto"
-    return get_int(doc, "quota.paid_max_requests_per_run")
+    """The scope of a settings payload's `scope` object, or of a `scope_versions.payload` (which has no
+    `max_ad_age_days`)."""
+    doc = dict(payload)
+    if "max_ad_age_days" in doc:
+        return ScopeSettings.from_model(model.Scope.model_validate(doc))
+    return ScopeSettings.from_model(model.ScopeVersionPayload.model_validate(doc))
 
 
 _VERSION = q(
@@ -174,45 +192,14 @@ _VERSION = q(
 
 
 async def load_run_settings(conn: AsyncConnection, settings_version_id: int) -> RunSettings:
-    """The run's view of settings version `settings_version_id`; `interval_s` is the schedule's (§3.4).
-
-    `stale_ttl_days` is `collection.stale_ttl_days`, or `scope.max_ad_age_days` when that is `null` (§13.1).
-    """
+    """The run's view of settings version `settings_version_id` (`RunSettings.from_settings`); `interval_s` is
+    the schedule's (§3.4)."""
     row = (await conn.execute(_VERSION, {"id": settings_version_id})).first()
     if row is None:
         raise LookupError(f"settings version {settings_version_id} (or the schedule) does not exist")
-    doc: JSONValue = row.payload
-    scope = scope_from_payload(get_object(doc, "scope"))
-    if scope.max_ad_age_days is None:
-        raise KeyError("scope.max_ad_age_days")
-    stale_ttl = json_get(doc, "collection.stale_ttl_days")
-    return RunSettings(
+    return RunSettings.from_settings(
+        model.Settings.model_validate(row.payload),
         settings_version_id=settings_version_id,
         scope_version_id=int(row.scope_version_id),
-        scope=scope,
-        sources=SourcesEnabled(
-            jsearch=get_bool(doc, "sources.enabled.jsearch"),
-            serpapi=get_bool(doc, "sources.enabled.serpapi"),
-            adzuna=get_bool(doc, "sources.enabled.adzuna"),
-            arbeitnow=get_bool(doc, "sources.enabled.arbeitnow"),
-            ats=get_bool(doc, "sources.enabled.ats"),
-        ),
-        quota=QuotaSettings(
-            jsearch_monthly_limit=get_int(doc, "quota.jsearch_monthly_limit"),
-            serpapi_monthly_limit=get_int(doc, "quota.serpapi_monthly_limit"),
-            reserve_pct=get_int(doc, "quota.reserve_pct"),
-            serpapi_hourly_cap=get_int(doc, "quota.serpapi_hourly_cap"),
-            adzuna_cap_minute=get_int(doc, "quota.adzuna_cap_minute"),
-            adzuna_cap_day=get_int(doc, "quota.adzuna_cap_day"),
-            adzuna_cap_week=get_int(doc, "quota.adzuna_cap_week"),
-            adzuna_cap_month=get_int(doc, "quota.adzuna_cap_month"),
-            paid_max_requests_per_run=_paid_max(doc),
-        ),
-        queries=_enabled(doc, "queries", "query_id"),
-        watchlist=_enabled(doc, "watchlist", "watchlist_company_id"),
-        stale_ttl_days=scope.max_ad_age_days
-        if stale_ttl is None
-        else get_int(doc, "collection.stale_ttl_days"),
         interval_s=int(row.interval_s),
-        schedule_include_paid=get_bool(doc, "schedule.include_paid"),
     )

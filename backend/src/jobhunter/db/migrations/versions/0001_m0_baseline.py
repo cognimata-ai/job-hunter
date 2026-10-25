@@ -24,8 +24,8 @@ These are the ONLY differences from the spec text. Each one carries a SQL commen
 (plan Deviations 1 and 2):
 
   1. active_config.rubric_version_id and active_config.prompt_schema_version_id are nullable (the spec says
-     NOT NULL; the foreign keys to rubric_versions and prompt_schema_versions stay). M2 seeds the rows and
-     restores NOT NULL.
+     NOT NULL; the foreign keys to rubric_versions and prompt_schema_versions stay). M2 seeds the rows and sets
+     the pointers (the seed step of `migrate`), and M3's first migration restores NOT NULL (M2 plan Deviation 32).
   2. These foreign keys are not created, because their target tables do not exist yet; the columns keep their
      type and their CHECK constraints. M2 adds them with ALTER TABLE ... ADD FOREIGN KEY:
        active_config.profile_version_id -> profile_versions

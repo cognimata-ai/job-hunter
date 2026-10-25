@@ -34,6 +34,15 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_user_commands(commands)
     _add_sessions_commands(commands)
     _add_fixtures_commands(commands)
+    dry_run = commands.add_parser(
+        "schema-dry-run",
+        help="send one minimal request per structured-output schema and model, record an eval run (§10.11)",
+    )
+    dry_run.add_argument(
+        "--live",
+        action="store_true",
+        help="send to the Anthropic API with the worker's anthropic_key (default: the recorded-SSE fake)",
+    )
     return parser
 
 
@@ -174,6 +183,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.cli_sessions import run_sessions_command
 
         return run_sessions_command(args)
+    if args.command == "schema-dry-run":
+        # Imported here: the dry-run needs the gateway, the SDK and the database layer.
+        from jobhunter.cli_schema_dry_run import run_schema_dry_run
+
+        return run_schema_dry_run(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.
         from jobhunter.cli_fixtures import run_fixtures_command

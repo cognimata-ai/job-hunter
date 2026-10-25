@@ -11,6 +11,7 @@ import httpx
 import procrastinate
 import psycopg
 import pytest
+import sqlalchemy as sa
 import structlog
 from jobhunter.api.app import JobHunterApp, create_app
 from jobhunter.auth import users
@@ -19,6 +20,7 @@ from jobhunter.config import AppConfig, Role
 from jobhunter.db.migrate import run_migrate
 from jobhunter.db.seed import DEFAULT_INSTANCES_SQL, anchor_utc_for, latest_slot_at_or_before
 from jobhunter.db.session import make_engine
+from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
 from jobhunter.observability import redact
 from jobhunter.observability.logging import configure_logging
 from jobhunter.types import get_int, get_str
@@ -31,6 +33,16 @@ from tests.support.pg import PgServer, config_for, pg_one, process_env, remove_p
 from tests.support.procs import ProcessGroup, wait_until
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
+# `configure_logging` also holds these (`observability/logging._CONTENT_LOGGERS`, `_BODY_QUOTING_LOGGERS`,
+# `_ERROR_QUOTING_LOGGERS`).
+_LIBRARY_LOGGERS = (
+    *_QUIET_LOGGERS,
+    "anthropic",
+    "httpx2",
+    "httpcore2",
+    "python_multipart",
+    "langgraph.pregel._retry",
+)
 # Every table a test can write to (the migrator owns them, so only the migrator may truncate). The seeded
 # configuration chain, `active_config`, `ranking_state` and `sources` are kept (`reset_database` restores the
 # first three to their seeded state), `schedule_state` is reset (below), and so is `checkpoint_migrations`:
@@ -55,14 +67,17 @@ def _restore_logging_state() -> Iterator[None]:
     """`configure_logging` changes process-wide state; give every test the state it found."""
     root = logging.getLogger()
     handlers, level = list(root.handlers), root.level
-    quiet_levels = {name: logging.getLogger(name).level for name in _QUIET_LOGGERS}
+    libraries = {name: logging.getLogger(name) for name in _LIBRARY_LOGGERS}
+    library_state = {name: (lg.level, list(lg.handlers), lg.propagate) for name, lg in libraries.items()}
     structlog_config = structlog.get_config()
     bound_context = structlog.contextvars.get_contextvars()
     yield
     root.handlers[:] = handlers
     root.setLevel(level)
-    for name, quiet_level in quiet_levels.items():
-        logging.getLogger(name).setLevel(quiet_level)
+    for name, (library_level, library_handlers, propagate) in library_state.items():
+        libraries[name].setLevel(library_level)
+        libraries[name].handlers[:] = library_handlers
+        libraries[name].propagate = propagate
     structlog.configure(**structlog_config)
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(**bound_context)
@@ -146,35 +161,86 @@ ON CONFLICT (id) DO UPDATE SET
   anchor_utc = EXCLUDED.anchor_utc, interval_s = EXCLUDED.interval_s, enabled = true,
   last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
   updated_at = now()"""
-# Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds and the
-# pointers M2 sets left NULL (the pending scope, the profile, the rubric, the prompt schema and the tuple).
+# Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds, the seeded
+# rubric v1 and prompt-schema version (M2 Task 6; `_SEEDED_POINTERS` fails the reset when one is missing),
+# and the pointers a profile or a scope apply sets left NULL (the pending scope, the profile and the tuple).
 _ACTIVE_CONFIG_RESET: Final = """\
 UPDATE active_config SET settings_version_id = v.id, scope_version_id = v.scope_version_id,
   model_policy_id = v.model_policy_id, execution_config_id = v.execution_config_id,
   evaluation_policy_id = v.evaluation_policy_id, pending_scope_version_id = NULL, profile_version_id = NULL,
-  rubric_version_id = NULL, prompt_schema_version_id = NULL, llm_tuple_id = NULL, updated_at = now()
+  rubric_version_id = (SELECT r.id FROM rubric_versions r WHERE r.version = 'v1'),
+  prompt_schema_version_id = (SELECT p.id FROM prompt_schema_versions p
+    WHERE p.prompt_schema_hash = %(prompt_schema_hash)s),
+  llm_tuple_id = NULL, updated_at = now()
   FROM settings_versions v WHERE v.version_no = 1"""
+# The hash of the prompt-schema version `seed_defaults` points at: this code's templates and schemas.
+_SEEDED_PROMPT_SCHEMA_HASH: Final = prompt_schema_hash(*prompt_schema_v1())
+# The columns are nullable in M2 (NOT NULL is M3's, plan Deviation 32), so a seeded row that is missing would
+# leave a NULL pointer behind silently: the reset checks for it.
+_SEEDED_POINTERS: Final = (
+    "SELECT rubric_version_id IS NOT NULL AND prompt_schema_version_id IS NOT NULL "
+    "FROM active_config WHERE id = 1"
+)
+# The M2 tables are emptied with DELETE, never by `_TRUNCATE`: `TRUNCATE ... CASCADE` of a table that
+# `active_config` reaches through its foreign keys (`cv_files` -> `profile_drafts` -> `profile_versions`,
+# `llm_calls`, `eval_runs`, `llm_tuples`) would truncate `active_config` itself. Run after
+# `_ACTIVE_CONFIG_RESET` (nothing points at them any more) and after the M1 `_TRUNCATE` (it emptied `runs`,
+# which references `llm_tuples`), in this order: every child before its parent under the immediate foreign
+# keys. Only the pair `profile_drafts` <-> `profile_versions` is deferrable, so those two go in any order.
+_M2_DELETE: Final = (
+    "SET CONSTRAINTS ALL DEFERRED",
+    "UPDATE profile_drafts SET llm_call_id = NULL",
+    "UPDATE query_proposals SET llm_call_id = NULL",
+    "DELETE FROM profile_vectors",
+    "DELETE FROM llm_calls",  # it references llm_spend_ledger, profile_drafts and eval_runs
+    "DELETE FROM llm_spend_ledger",  # it references llm_budget
+    "DELETE FROM query_proposals",
+    "DELETE FROM eval_runs",
+    "DELETE FROM llm_tuples",
+    "DELETE FROM profile_drafts",
+    "DELETE FROM profile_versions",
+    "DELETE FROM cv_files",
+    "DELETE FROM llm_budget",
+)
 # Run after every row that references a newer version points at version 1 again (`schedule_state`'s FK is
-# immediate), in this order.
+# immediate) and after `_M2_DELETE` (tuples and eval runs reference the configuration rows), in this order.
+# The last five statements delete the rows nothing names any more: the seeded ones stay, because version 1
+# and `active_config` name them, and the others were made by a settings save or by a test. They use NOT
+# EXISTS, the form that stays right when a pointer is NULL (`NOT IN` over a NULL deletes no row at all).
 _CONFIGURATION_RESET: Final = (
     "DELETE FROM settings_versions WHERE version_no > 1",
     "DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)",
+    "DELETE FROM model_policies m WHERE NOT EXISTS (SELECT 1 FROM settings_versions s "
+    "WHERE s.model_policy_id = m.id) AND NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.model_policy_id = m.id)",
+    "DELETE FROM execution_configs e WHERE NOT EXISTS (SELECT 1 FROM settings_versions s "
+    "WHERE s.execution_config_id = e.id) AND NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.execution_config_id = e.id)",
+    "DELETE FROM evaluation_policies p WHERE NOT EXISTS (SELECT 1 FROM settings_versions s "
+    "WHERE s.evaluation_policy_id = p.id) AND NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.evaluation_policy_id = p.id)",
+    "DELETE FROM rubric_versions r WHERE NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.rubric_version_id = r.id)",
+    "DELETE FROM prompt_schema_versions p WHERE NOT EXISTS (SELECT 1 FROM active_config a "
+    "WHERE a.prompt_schema_version_id = p.id)",
     "UPDATE ranking_state SET generation = 0, updated_at = now()",
 )
 
 
 def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> None:
-    """Empty the tables of `_TRUNCATE` and restore the seeded configuration, in one transaction.
+    """Empty the tables of `_TRUNCATE` and `_M2_DELETE`, restore the seeded configuration, in one transaction.
 
     The TRUNCATE waits for the locks of any transaction a test leaked; after `lock_timeout` it fails with
     SQLSTATE 55P03 instead of hanging the suite.
 
     In this order: the TRUNCATE; the `default` source instances inserted again with the seed's own statement
     (their ids change with every reset, so tests look them up by `(source_id, instance_key)`); `active_config`
-    as the seed wrote it (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, every M2 pointer NULL);
-    the schedule reset; then
-    the settings versions after 1 and the scope versions no settings version uses deleted, and the ranking
-    generation set to 0.
+    as the seed wrote it (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, the seeded rubric and
+    prompt-schema version, and the profile, tuple and pending-scope pointers NULL);
+    the M2 tables deleted (`_M2_DELETE`); the schedule reset; then the settings versions after 1, the scope
+    versions no settings version uses, the model policies, execution configs and evaluation policies that no
+    settings version or `active_config` names, and the rubric and prompt-schema rows `active_config` does not
+    name deleted, and the ranking generation set to 0.
 
     The schedule keeps the interval and the anchor that `migrate` seeded: both come from the stored settings
     version 1 (the anchor on the day that version was created, as the seed computes it), not from constants
@@ -186,7 +252,13 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         conn.execute("SELECT set_config('lock_timeout', %s, true)", (lock_timeout,))
         conn.execute(_TRUNCATE)
         conn.execute(DEFAULT_INSTANCES_SQL)
-        conn.execute(_ACTIVE_CONFIG_RESET)
+        conn.execute(_ACTIVE_CONFIG_RESET, {"prompt_schema_hash": _SEEDED_PROMPT_SCHEMA_HASH})
+        if conn.execute(_SEEDED_POINTERS).fetchone() != (True,):
+            raise LookupError(
+                "active_config or a seeded rubric or prompt-schema row is missing: `migrated` seeds them"
+            )
+        for statement in _M2_DELETE:
+            conn.execute(statement)
         stored = conn.execute(
             "SELECT payload, created_at FROM settings_versions WHERE version_no = 1"
         ).fetchone()
@@ -319,14 +391,33 @@ async def queue_app(migrated: PgServer, make_config: ConfigFactory) -> AsyncIter
 
 
 @pytest.fixture
-def api_app(engine: AsyncEngine, make_config: ConfigFactory) -> JobHunterApp:
+def cv_store_dir(tmp_path: Path) -> Path:
+    """The `cv_store` of the test's api (`JOBHUNTER_CV_STORE_DIR`): an empty directory of mode 0700."""
+    root = tmp_path / "cv_store"
+    root.mkdir(mode=0o700)
+    return root
+
+
+@pytest.fixture
+def api_app(engine: AsyncEngine, make_config: ConfigFactory, cv_store_dir: Path) -> JobHunterApp:
     """The whole api (edge included) on the shared database; `api_client` and `logged_in_client` share it.
 
-    The app gets its config and engine injected, so no lifespan runs.
+    The app gets its config and engine injected, so no lifespan runs. Its CV files go to `cv_store_dir`.
     """
     # Its `make_queue_app` may be the process's first (first call wins: which DSN registers depends on test
     # order), but deferring never uses the task app's DSN, only its registry.
-    return create_app(cfg=make_config("api"), engine=engine)
+    cfg = make_config("api", JOBHUNTER_CV_STORE_DIR=str(cv_store_dir))
+    return create_app(cfg=cfg, engine=engine)
+
+
+async def count_rows(engine: AsyncEngine, table: str, **filters: object) -> int:
+    """How many rows of `table` match every filter: `column = value`, or `column IN value` for a tuple."""
+    query = sa.select(sa.func.count()).select_from(sa.table(table))
+    for name, value in filters.items():
+        column: sa.ColumnClause[Any] = sa.column(name)
+        query = query.where(column.in_(value) if isinstance(value, tuple) else column == value)
+    async with engine.connect() as conn:
+        return int((await conn.execute(query)).scalar_one())
 
 
 def _app_client(app: JobHunterApp, client: tuple[str, int], headers: dict[str, str]) -> httpx.AsyncClient:

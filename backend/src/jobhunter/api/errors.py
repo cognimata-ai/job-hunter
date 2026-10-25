@@ -54,6 +54,7 @@ ProblemCode = Literal[
     "idempotency_key_reused",
     "idempotency_in_progress",
     "eval_gate_failed",
+    "profile_purge_in_progress",
     "internal",
 ]
 

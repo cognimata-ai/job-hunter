@@ -4,6 +4,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.db.sql import CHECK_VIOLATION, UNIQUE_VIOLATION, PgErrorInfo, pg_error
 from jobhunter.db.transitions import CLEAR_REASON, transition
+from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
 
 from tests.support.fixtures import reset_database
 from tests.support.pg import MANUAL_RUN_SQL
@@ -48,7 +49,7 @@ async def test_tables_seeds_and_default_instances(engine) -> None:
     async with engine.connect() as c:
         tables = sa.text("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
         names = set((await c.execute(tables)).scalars())
-        assert M1_TABLES <= names and "profile_vectors" not in names
+        assert M1_TABLES <= names
         rows = (
             await c.execute(
                 sa.text(
@@ -271,13 +272,21 @@ ACTIVE_CONFIG = (
     "rubric_version_id, prompt_schema_version_id, model_policy_id, execution_config_id, "
     "evaluation_policy_id, llm_tuple_id FROM active_config WHERE id = 1"
 )
+# The rubric and prompt-schema pointers name the rows the migrate seed inserted (M2): rubric `v1` and the
+# prompt-schema version of this code's templates and schemas.
 SEEDED_CONFIG = (
-    "SELECT id, scope_version_id, NULL::bigint, NULL::bigint, NULL::bigint, NULL::bigint, model_policy_id, "
-    "execution_config_id, evaluation_policy_id, NULL::bigint FROM settings_versions WHERE version_no = 1"
+    "SELECT id, scope_version_id, NULL::bigint, NULL::bigint, "
+    "(SELECT r.id FROM rubric_versions r WHERE r.version = 'v1'), "
+    "(SELECT p.id FROM prompt_schema_versions p WHERE p.prompt_schema_hash = :prompt_schema_hash), "
+    "model_policy_id, execution_config_id, evaluation_policy_id, NULL::bigint "
+    "FROM settings_versions WHERE version_no = 1"
 )
+SEEDED_PARAMS = {"prompt_schema_hash": prompt_schema_hash(*prompt_schema_v1())}
 # Every pointer of the row moved off the seed: a second scope (active) with the seeded one pending, a profile
 # and a tuple (they are NULL together), a rubric, a prompt schema, and a second model policy, execution config
-# and evaluation policy. `reset_database` keeps those last five tables, so the test deletes its rows again.
+# and evaluation policy. The profile and the tuple are a real chain (a CV file, a draft confirmed into a
+# version, a tuple over it): the foreign keys of `active_config` refuse an id that names no row.
+# `reset_database` deletes the chain (`_M2_DELETE`) and, once nothing names them, the five configuration rows.
 DIRTY_CONFIG = (
     "INSERT INTO scope_versions (scope_hash, payload) VALUES ('\\x5eed', '{}')",
     "INSERT INTO model_policies (policy_hash, payload) VALUES ('\\x5eed', '{}')",
@@ -288,9 +297,20 @@ DIRTY_CONFIG = (
     "VALUES ('test', '\\x5eed', '{}', '{}')",
     "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
     "VALUES ('\\x5eed', '{}', '{}')",
+    "INSERT INTO cv_files (sha256, mime, size_bytes) VALUES ('\\x5eed', 'text/plain', 1)",
+    "INSERT INTO profile_drafts (cv_file_id, status, reviewed_text_sha256, draft_json) "
+    "SELECT id, 'ready', '\\x5eed', '{}' FROM cv_files",
+    "INSERT INTO profile_versions (version_no, draft_id, cv_file_id, profile_json, profile_hash) "
+    "SELECT 1, id, cv_file_id, '{}', '\\x5eed' FROM profile_drafts",
+    "UPDATE profile_drafts SET status = 'confirmed', confirm_response = '{}', "
+    "confirmed_profile_version_id = (SELECT id FROM profile_versions)",
+    "INSERT INTO llm_tuples (profile_version_id, rubric_version_id, prompt_schema_version_id, "
+    "model_policy_id) SELECT v.id, r.id, p.id, m.id FROM profile_versions v, rubric_versions r, "
+    "prompt_schema_versions p, model_policies m WHERE r.content_hash = '\\x5eed' "
+    "AND p.prompt_schema_hash = '\\x5eed' AND m.policy_hash = '\\x5eed'",
     "UPDATE active_config SET pending_scope_version_id = scope_version_id, "
     "scope_version_id = (SELECT id FROM scope_versions WHERE scope_hash = '\\x5eed'), "
-    "profile_version_id = 1, llm_tuple_id = 1, "
+    "profile_version_id = (SELECT id FROM profile_versions), llm_tuple_id = (SELECT id FROM llm_tuples), "
     "rubric_version_id = (SELECT id FROM rubric_versions WHERE content_hash = '\\x5eed'), "
     "prompt_schema_version_id = "
     "(SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = '\\x5eed'), "
@@ -298,19 +318,24 @@ DIRTY_CONFIG = (
     "execution_config_id = (SELECT id FROM execution_configs WHERE config_hash = '\\x5eed'), "
     "evaluation_policy_id = (SELECT id FROM evaluation_policies WHERE policy_hash = '\\x5eed')",
 )
-DIRTY_ROWS_DELETE = (
-    "DELETE FROM model_policies WHERE policy_hash = '\\x5eed'",
-    "DELETE FROM execution_configs WHERE config_hash = '\\x5eed'",
-    "DELETE FROM evaluation_policies WHERE policy_hash = '\\x5eed'",
-    "DELETE FROM rubric_versions WHERE content_hash = '\\x5eed'",
-    "DELETE FROM prompt_schema_versions WHERE prompt_schema_hash = '\\x5eed'",
+# What the dirty configuration left, by table: the rows of the test (0 after a reset) and of the M2 chain.
+DIRTY_ROWS = (
+    "SELECT (SELECT count(*) FROM scope_versions WHERE scope_hash = '\\x5eed'), "
+    "(SELECT count(*) FROM model_policies WHERE policy_hash = '\\x5eed'), "
+    "(SELECT count(*) FROM execution_configs WHERE config_hash = '\\x5eed'), "
+    "(SELECT count(*) FROM evaluation_policies WHERE policy_hash = '\\x5eed'), "
+    "(SELECT count(*) FROM rubric_versions WHERE content_hash = '\\x5eed'), "
+    "(SELECT count(*) FROM prompt_schema_versions WHERE prompt_schema_hash = '\\x5eed'), "
+    "(SELECT count(*) FROM cv_files), (SELECT count(*) FROM profile_drafts), "
+    "(SELECT count(*) FROM profile_versions), (SELECT count(*) FROM llm_tuples)"
 )
 
 
 async def test_reset_reseeds_the_default_instances_and_the_configuration(engine, migrated) -> None:
     try:
         async with engine.connect() as c:
-            seeded = tuple((await c.execute(sa.text(SEEDED_CONFIG))).one())
+            seeded = tuple((await c.execute(sa.text(SEEDED_CONFIG), SEEDED_PARAMS)).one())
+            assert None not in seeded[4:6]  # both seeded rows exist
             assert tuple((await c.execute(sa.text(ACTIVE_CONFIG))).one()) == seeded  # as `migrate` left it
         async with engine.begin() as c:
             await c.execute(
@@ -327,6 +352,7 @@ async def test_reset_reseeds_the_default_instances_and_the_configuration(engine,
             for statement in DIRTY_CONFIG:  # ledger L27: every other pointer of the row moved as well
                 await c.execute(sa.text(statement))
             assert tuple((await c.execute(sa.text(ACTIVE_CONFIG))).one()) != seeded
+            assert tuple((await c.execute(sa.text(DIRTY_ROWS))).one()) == (1,) * 10
         # Must not fail on schedule_state's FK: the schedule is re-pointed before version 2 is deleted.
         reset_database(migrated)
         async with engine.connect() as c:
@@ -350,12 +376,9 @@ async def test_reset_reseeds_the_default_instances_and_the_configuration(engine,
             assert schedule == v1 == active
             # every column of the row is the seed's again, and the scope no settings version uses is deleted
             assert tuple((await c.execute(sa.text(ACTIVE_CONFIG))).one()) == seeded
-            scopes = sa.text("SELECT count(*) FROM scope_versions WHERE scope_hash = '\\x5eed'")
-            assert (await c.execute(scopes)).scalar_one() == 0
+            # the scope, the five configuration rows and the whole M2 chain of the test are gone too
+            assert tuple((await c.execute(sa.text(DIRTY_ROWS))).one()) == (0,) * 10
             assert (await c.execute(sa.text("SELECT generation FROM ranking_state"))).scalar_one() == 0
             assert (await c.execute(sa.text("SELECT count(*) FROM watchlist_companies"))).scalar_one() == 0
     finally:
-        reset_database(migrated)  # nothing points at the test's rows any more
-        async with engine.begin() as c:
-            for statement in DIRTY_ROWS_DELETE:
-                await c.execute(sa.text(statement))
+        reset_database(migrated)  # also after a failure: nothing points at the test's rows any more

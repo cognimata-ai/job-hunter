@@ -6,6 +6,11 @@ then checks the loaded configuration in the order of §16.8 and raises `StartupC
 the first check that fails. A failure names a check, and a secret file when one is to blame. It
 never contains a secret value. `startup_or_exit` is the process entry point: it logs the failing
 check and exits with code 78.
+
+An optional secret of the role whose file is empty reads as absent (plan Task 23): compose needs a mounted
+secret's file to exist, so the dev stack mounts an empty `anthropic_key` when no key was given. Its mode is
+still checked (it is mounted); an empty required secret counts as missing, and an empty secret of another role
+is still foreign.
 """
 
 import base64
@@ -36,6 +41,13 @@ LANGSMITH_EU_ENDPOINT: Final = "https://eu.api.smith.langchain.com"
 DEFAULT_FIXTURES_DIR: Final = Path("tests/contract/fixtures")
 DEFAULT_EMBEDDER_URL: Final = "http://embedder:8080"
 DEFAULT_HTTP_USER_AGENT: Final = "JobHunter/1.0 (personal job search)"
+# M2 (plan Task 4): the recorded Anthropic streams served in fake LLM mode.
+DEFAULT_FAKE_LLM_DIR: Final = Path("tests/contract/fixtures/anthropic")
+# M2 (plan Task 9): the `cv_store` volume of the encrypted CV files (§12.1), on the api and the worker.
+DEFAULT_CV_STORE_DIR: Final = Path("/data/cv")
+# M2 (plan Task 11): the `parse_jobs` tmpfs the worker shares with docparse (§12.2); docparse's own
+# `docparse.worker.main` reads the same variable.
+DEFAULT_PARSE_JOBS_DIR: Final = Path("/data/parse")
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
@@ -47,6 +59,11 @@ _TRACING_VARS: Final = (
 )
 _FAKE_MODE_VARS: Final = ("JOBHUNTER_FAKE_SOURCES", "JOBHUNTER_FAKE_LLM", "JOBHUNTER_FAULT")
 _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_API_KEY")
+# The values with which the Anthropic SDK configures its own logging at its import, and at `debug` logs each
+# request's options, the prompt included (anthropic 1.15.0 `_utils/_logs.py`). The SDK compares exactly; the
+# check is case- and space-insensitive, so no near miss passes. Outside prod `configure_logging` holds the
+# SDK's loggers at WARNING anyway (`observability/logging.quiet_library_loggers`).
+_ANTHROPIC_LOG_VALUES: Final = ("debug", "info")
 _WORLD_READABLE: Final = 0o004
 # The levels `configure_logging` accepts (`JOBHUNTER_LOG_LEVEL`, compared upper-cased).
 LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -125,8 +142,16 @@ class AppConfig:
     # `fixtures_dir` (dev and test only; `fake_mode_in_prod` refuses it in prod).
     fake_sources: bool
     fixtures_dir: Path
+    # `JOBHUNTER_FAKE_LLM` set to anything (the empty string included): every Claude call is served by the
+    # recorded-SSE fake transport from `fake_llm_dir` (`llm/fake.py`; dev and test only, refused in prod).
+    fake_llm: bool
+    fake_llm_dir: Path
     embedder_url: str
     http_user_agent: str
+    # `JOBHUNTER_CV_STORE_DIR`: where `profile.storage.CvStore` keeps the encrypted CV files.
+    cv_store_dir: Path
+    # `JOBHUNTER_PARSE_JOBS_DIR`: the root of the docparse jobs (`profile.parse_client.ParseClient`).
+    parse_jobs_dir: Path
     # Neither mapping appears in repr(): a config that is logged or shown in a traceback must not leak.
     secrets: Mapping[str, bytes] = field(repr=False)
     environ: Mapping[str, str] = field(repr=False)
@@ -219,6 +244,8 @@ def load_config(
     if secrets_dir is None:
         secrets_dir = Path(env.get("JOBHUNTER_SECRETS_DIR") or DEFAULT_SECRETS_DIR)
     contents, modes, unreadable = _read_secret_files(secrets_dir)
+    optional = ROLE_SECRETS[role].optional
+    contents = {name: value for name, value in contents.items() if value or name not in optional}
 
     return AppConfig(
         role=role,
@@ -230,8 +257,12 @@ def load_config(
         fake_sources="JOBHUNTER_FAKE_SOURCES" in env,
         # A relative directory (the default included) is resolved from the current directory.
         fixtures_dir=Path(env.get("JOBHUNTER_FIXTURES_DIR") or DEFAULT_FIXTURES_DIR).resolve(),
+        fake_llm="JOBHUNTER_FAKE_LLM" in env,
+        fake_llm_dir=Path(env.get("JOBHUNTER_FAKE_LLM_DIR") or DEFAULT_FAKE_LLM_DIR).resolve(),
         embedder_url=env.get("JOBHUNTER_EMBEDDER_URL") or DEFAULT_EMBEDDER_URL,
         http_user_agent=env.get("JOBHUNTER_HTTP_USER_AGENT") or DEFAULT_HTTP_USER_AGENT,
+        cv_store_dir=Path(env.get("JOBHUNTER_CV_STORE_DIR") or DEFAULT_CV_STORE_DIR),
+        parse_jobs_dir=Path(env.get("JOBHUNTER_PARSE_JOBS_DIR") or DEFAULT_PARSE_JOBS_DIR),
         secrets=MappingProxyType(contents),
         environ=MappingProxyType(env),
         secrets_dir=secrets_dir,
@@ -382,6 +413,11 @@ def run_startup_assertions(cfg: AppConfig) -> None:
 
     if cfg.env == "prod" and (anthropic := [name for name in _ANTHROPIC_ENV_VARS if name in env]):
         raise StartupCheckFailed("anthropic_env_in_prod", f"{', '.join(anthropic)} must not be set in prod")
+
+    # The privacy rule (CV text and LLM output never reach a log): fail fast rather than rely on the logging
+    # setup alone.
+    if cfg.env == "prod" and env.get("ANTHROPIC_LOG", "").strip().lower() in _ANTHROPIC_LOG_VALUES:
+        raise StartupCheckFailed("anthropic_log_in_prod", "ANTHROPIC_LOG must not be debug or info in prod")
 
     # After the §16.8 checks (ruling T13-a): the process applies this level when it configures its logging.
     if cfg.log_level not in LOG_LEVELS:

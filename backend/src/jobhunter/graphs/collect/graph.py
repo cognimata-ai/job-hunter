@@ -45,13 +45,13 @@ from types import MappingProxyType
 from typing import Final, Protocol
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import RetryPolicy, TimeoutPolicy
-from sqlalchemy.exc import DBAPIError
+from langgraph.types import TimeoutPolicy
 
-from jobhunter.db.sql import is_serialization_failure
 from jobhunter.embeddings import EmbedderError
+from jobhunter.errors import DomainError
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
@@ -76,6 +76,9 @@ from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identit
 from jobhunter.graphs.collect.state import CollectState as CollectState
 from jobhunter.graphs.collect.state import CollectUpdate as CollectUpdate
 from jobhunter.graphs.collect.state import FetchCellInput, FetchOutcome
+from jobhunter.graphs.sanitize import DB_RETRY as DB_RETRY
+from jobhunter.graphs.sanitize import is_retryable_db_error as is_retryable_db_error
+from jobhunter.graphs.sanitize import sanitized
 from jobhunter.observability.logging import get_logger
 from jobhunter.sources.base import SourceError
 
@@ -107,14 +110,12 @@ IO_NODES: Final = frozenset({"fetch_primary", "fetch_cell", "fetch_fallback", "e
 log = get_logger("jobhunter.graphs.collect")
 
 
-def is_retryable_db_error(exc: BaseException) -> bool:
-    """A serialization failure (40001), a deadlock (40P01) or a lost connection: the non-I/O retry (§9.1)."""
-    return is_serialization_failure(exc) or (isinstance(exc, DBAPIError) and exc.connection_invalidated)
-
-
-DB_RETRY: Final = RetryPolicy(
-    max_attempts=3, initial_interval=0.5, backoff_factor=2, jitter=True, retry_on=is_retryable_db_error
-)
+# The errors of a collection node that reach LangGraph unchanged (`guarded`): their text is a code or ids.
+# Every `DomainError` (`FencedOut`, which ends the attempt `lost`; `OutcomeConflict`, which `execute_run` ends
+# `failed_invariant('I7')`; `InvariantViolation`, `TransitionConflict`), LangGraph's own control flow, and a
+# fetch traversal's `TimeoutError` (§9.2's timeout, raised by the node itself). `asyncio.CancelledError` is
+# no `Exception`, so it is never caught.
+PASS_THROUGH: Final = (DomainError, GraphBubbleUp, TimeoutError)
 
 
 class _Node[S](Protocol):
@@ -162,6 +163,15 @@ def timed[S: Mapping[str, object]](
     return measured
 
 
+def guarded[S: Mapping[str, object]](name: str, node: _Node[S]) -> _Node[S]:
+    """`node` behind the content-free stand-in of its errors (`graphs.sanitize.sanitized`, final review
+    FR-12): outside `error_handled`, so a typed error still becomes its persisted outcome first, and an error
+    outside `PASS_THROUGH` reaches LangGraph, and so `checkpoint_writes`, as `NodeFailed` (logged
+    `collect_node_failed` with its class). `DB_RETRY` retries the stand-in of a retryable database error as
+    it did the original; the run ends as it did (`failed('bug')`)."""
+    return sanitized(name, node, passing=PASS_THROUGH, log=log, event="collect_node_failed")
+
+
 async def start(state: CollectState) -> CollectUpdate:
     return {"steps": ["start"]}
 
@@ -193,14 +203,14 @@ def build_collect_graph(
     for name, node in nodes.items():
         graph.add_node(
             name,
-            timed(name, error_handled(name, node), clock=timer),
+            guarded(name, timed(name, error_handled(name, node), clock=timer)),
             timeout=TimeoutPolicy(run_timeout=TIMEOUTS[name]),
             retry_policy=None if name in IO_NODES else DB_RETRY,
         )
     cell = make_fetch_cell(deps, cell_timeout=TIMEOUTS["fetch_cell"])  # its own, from its semaphore on
     graph.add_node(  # so no TimeoutPolicy: it would time the wait for the semaphore too
         "fetch_cell",
-        timed("fetch_cell", error_handled("fetch_cell", cell), clock=timer),
+        guarded("fetch_cell", timed("fetch_cell", error_handled("fetch_cell", cell), clock=timer)),
         input_schema=FetchCellInput,
     )
     graph.add_edge(START, "plan")

@@ -47,13 +47,18 @@ from starlette.responses import Response
 from jobhunter.api.argon2_gate import Argon2Gate, GateFull
 from jobhunter.api.deps import get_argon2_gate, get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
-from jobhunter.api.openapi import CSRF_RESPONSES, LOGIN_CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import (
+    BODY_LIMIT_RESPONSES,
+    CSRF_RESPONSES,
+    LOGIN_CSRF_RESPONSES,
+    SESSION_RESPONSES,
+)
 from jobhunter.auth import sessions, throttle, totp, users
 from jobhunter.auth.passwords import check_password, dummy_verify, hash_password
 from jobhunter.auth.sessions import SessionInfo
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.crypto import DecryptError
+from jobhunter.crypto import DecryptError, data_keys
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 
@@ -170,14 +175,6 @@ def client_ip(request: Request) -> str:
     return str(address)
 
 
-def _data_keys(cfg: AppConfig) -> list[bytes]:
-    """The data key, and the previous one during a rotation: the keys a TOTP secret may be sealed with."""
-    keys = [cfg.secret_b64("data_key")]
-    if "data_key_previous" in cfg.secrets:
-        keys.append(cfg.secret_b64("data_key_previous"))
-    return keys
-
-
 @dataclass(frozen=True)
 class _Verified:
     ok: bool
@@ -204,7 +201,7 @@ async def _verify_credentials(
     secret, key_mismatch = None, False
     if user.totp_enabled:
         try:
-            secret = users.totp_secret(user, keys=_data_keys(cfg))
+            secret = users.totp_secret(user, keys=data_keys(cfg))
         except DecryptError as exc:
             log.error("totp_secret_unreadable", error_class=type(exc).__name__)
             key_mismatch = True
@@ -258,6 +255,7 @@ async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) 
         401: {"description": "Invalid credentials (`unauthenticated`)"},
         429: {"description": "Locked out, or too many logins at once (`throttled`, `retry_after_s`)"},
         **LOGIN_CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def login(

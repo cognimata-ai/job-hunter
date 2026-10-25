@@ -4,11 +4,15 @@ from typing import Any
 
 import pytest
 from jobhunter.geo.gazetteer import distance_km
+from jobhunter.normalize.companies import company_key
+from jobhunter.normalize.text import fold
 from jobhunter.normalize.titles import SENIORITY_LADDER, normalize_title
 from jobhunter.run_settings import ScopeLocation, SeniorityRange
 from jobhunter.scoring.filters import STRUCTURED_LEVELS, DetFacts, det_facts_hash, evaluate
+from jobhunter.settings.model import CompanyKey, Industry
 from jobhunter.sources.parsing.locations import Candidate, Location
 from jobhunter.sources.parsing.salary import Salary
+from pydantic import TypeAdapter
 
 from tests.support.facts import (
     AMBIGUOUS_WITH_ONE_DE_CANDIDATE,
@@ -169,6 +173,28 @@ def test_structured_only_filters_and_keywords() -> None:
     assert evaluate(
         facts(industry_structured="gaming"), "", scope(industries_exclude=frozenset({"gaming"}))
     ).reasons == ("excluded_industry",)
+
+
+def test_the_job_side_meets_a_stored_exclusion_in_its_fixed_point() -> None:
+    """Final review FR-9: `company_key` and `fold` are not idempotent on a few inputs. The settings store an
+    exclusion as its fixed point (`settings.model`), while a job is keyed in one pass, so the filter compares
+    the fixed point of the job's key, and of its industry, with the stored values. No key is rekeyed: the
+    job's `company_key` stays what identity stored."""
+    name = "Muster Germany Deutschland"  # two trailing country words: one pass drops one of them
+    stored = TypeAdapter(CompanyKey).validate_python(name)
+    job_key = company_key(name)
+    assert (stored, job_key) == ("muster", "muster germany")
+    job = facts(company_key=job_key)
+    assert evaluate(job, "", scope(excluded_companies=frozenset({stored}))).reasons == ("excluded_company",)
+    assert job.company_key == "muster germany"
+    industry = "Gaming\u00b4"  # a spacing acute accent: one fold leaves a trailing space
+    stored_industry = TypeAdapter(Industry).validate_python(industry)
+    assert (stored_industry, fold(industry)) == ("gaming", "gaming ")
+    assert evaluate(
+        facts(industry_structured=industry), "", scope(industries_exclude=frozenset({stored_industry}))
+    ).reasons == ("excluded_industry",)
+    # another company is no match, whatever its key's fixed point
+    assert evaluate(job, "", scope(excluded_companies=frozenset({"musterfirma"}))).passed
 
 
 def test_structured_values_that_say_nothing_are_unknown() -> None:

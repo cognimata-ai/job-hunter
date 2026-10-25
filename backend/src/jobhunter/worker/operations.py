@@ -18,6 +18,24 @@ A requeue or reclaim that reaches `MAX_OPERATION_ATTEMPTS` ends the row `failed(
 instead. Every permanent failure (a `failed` finish, or exhaustion) raises the `operation.failed` alert (warn,
 subject `operation:<id>`) exactly once, in the transaction that ends the row (§7.3; ruling T10-g).
 
+**Failure hooks** (M2 plan Deviation 13). `register_operation_handler(kind, on_failed=hook)` registers a
+kind's hook in `FAILURE_HOOKS` (`HANDLERS` keeps the handlers only). Every permanent failure runs it right
+after the `failed` transition, in the same transaction: a `failed` finish with its error code, and an
+exhaustion by a requeue (the requeue's code), by the stale reclaim or by the takeover sweep (`None`). So a
+domain row the operation drives (a profile draft, a query proposal) never outlives its operation in a live
+state. A hook may lock only rows after the owner row in the §9.1 order, and it moves its domain row only while
+that row is still live: a row the handler's own write already ended in the same transaction is left as it is.
+
+**Handler-side ends** (M2 Task 11). A handler, or a graph node it runs, ends its operation inside its own
+transaction with `OperationContext.finish_in` or `requeue_in`, so the last domain write and the operation's
+end commit together. Either records the end in the context's outcome holder, and `execute_operation`, which
+reads it once the handler has returned, then writes nothing more for that execution. Such a call must be
+part of a transaction that commits before the handler returns (an exception that rolls it back propagates,
+and the execution is then requeued as `bug` like any other raise). The context also carries the worker's
+`OperationDeps` (`deps`), which the M2 handlers need; an M1 handler runs with `deps=None`. A handler records
+its progress (`operations.progress`, which the API polls) with `set_progress`, under the claim predicate like
+every owner write (M2 Task 18).
+
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
 the one ownership-loss protocol shared with runs. A claim that the epoch fence refuses (a superseded worker,
 `FencedOut`) re-defers the operation's job under its queueing lock `op:<id>` instead of consuming it (M0
@@ -31,9 +49,9 @@ reports an unexpected handler error as an outcome, which `execute_operation` per
 """
 
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
@@ -48,9 +66,19 @@ from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch, register_takeover_sweep
-from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, run_owned
+from jobhunter.worker.executions import EXECUTIONS, AlreadyExecuting, ExecKey, ExecutionRegistry, run_owned
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer, defer_in_tx, job_task_name
+
+if TYPE_CHECKING:
+    # Only for the annotations of `OperationDeps`: the gateway, the profile graphs and the embedder pull in
+    # the SDK, langgraph and modules that import this one; the api, which creates operations, needs none.
+    from jobhunter.config import AppConfig
+    from jobhunter.embeddings import EmbedderClient
+    from jobhunter.graphs.profile.graph import ProfileGraphs
+    from jobhunter.llm.gateway import LLMGateway
+    from jobhunter.profile.parse_client import ParseClient
+    from jobhunter.profile.storage import CvStore
 
 OperationKind = Literal[
     "extract_profile_text",
@@ -82,6 +110,8 @@ REDEFER_BATCH: Final = 100
 RETRY_DELAY: Final = timedelta(minutes=1)
 
 FAILED_ALERT_CODE: Final = "operation.failed"
+# The error code of an operation that a requeue or reclaim took past its last attempt.
+ATTEMPTS_EXHAUSTED: Final = "attempts_exhausted"
 _TABLE: Final = "operations"
 # How often `create_operation` retries when the live row it conflicted with ended before it could be read.
 _CREATE_TRIES: Final = 3
@@ -91,35 +121,127 @@ log = get_logger("jobhunter.worker.operations")
 
 @dataclass(frozen=True)
 class OperationClaim:
+    """One execution's claim of an operation. `attempts` is the row's count when it was claimed (the
+    failed tries before this one), constant for the claim: the M2 threads are named by it (Deviation 27)."""
+
     operation_id: int
     claim_id: UUID
     kind: OperationKind
     payload: Mapping[str, JSONValue]
+    attempts: int
+
+
+@dataclass(frozen=True)
+class OperationDeps:
+    """What the M2 handlers need from the worker process, built once in `worker.main` (Task 11).
+
+    `embedder` is `None` when the worker has none, as for `WorkerRuntime.embedder`; `clock` is the injected
+    clock of the handlers' times.
+    """
+
+    cfg: "AppConfig"
+    gateway: "LLMGateway"
+    parse_client: "ParseClient"
+    cv_store: "CvStore"
+    profile_graphs: "ProfileGraphs"
+    embedder: "EmbedderClient | None"
+    clock: Callable[[], datetime]
+
+
+@dataclass(frozen=True)
+class OperationEnd:
+    """How a handler ended its operation in its own transaction: `finished` (`succeeded` or `failed`) or
+    `requeued` (`pending`, or `failed` when that was its last attempt)."""
+
+    kind: Literal["finished", "requeued"]
+    status: Literal["succeeded", "failed", "pending"]
+    error_code: str | None
+
+
+@dataclass
+class _Outcome:
+    """The context's mutable outcome holder (the context itself is frozen)."""
+
+    end: OperationEnd | None = None
 
 
 @dataclass(frozen=True)
 class OperationContext:
+    """What a handler runs with: its claim, the engine, and the worker's `deps` (`None` for M1 handlers)."""
+
     claim: OperationClaim
     engine: AsyncEngine
+    deps: OperationDeps | None = None
+    _outcome: _Outcome = field(default_factory=_Outcome, init=False, repr=False, compare=False)
+
+    @property
+    def ended(self) -> OperationEnd | None:
+        """The end a handler-side `finish_in` or `requeue_in` recorded, or `None`."""
+        return self._outcome.end
+
+    async def finish_in(
+        self,
+        conn: AsyncConnection,
+        *,
+        status: Literal["succeeded", "failed"],
+        error_code: str | None = None,
+    ) -> None:
+        """End the claimed operation `succeeded` or `failed(error_code)` in the caller's transaction (with its
+        alert and failure hook, `finish_operation`), so the caller's last domain write and the operation's
+        end commit together; `execute_operation` writes nothing more for this execution."""
+        await finish_operation(conn, self.claim, status=status, error_code=error_code)
+        self._outcome.end = OperationEnd("finished", status, error_code)
+
+    async def requeue_in(self, conn: AsyncConnection, *, error_code: str, not_before: datetime) -> None:
+        """Give the claimed operation back for a retry after `not_before` in the caller's transaction, under
+        the attempt limit and the failure hook of `requeue_operation`; `execute_operation` writes nothing
+        more."""
+        status = await requeue_operation(conn, self.claim, error_code=error_code, not_before=not_before)
+        self._outcome.end = OperationEnd("requeued", status, error_code)
 
 
 OperationHandler = Callable[[OperationContext], Awaitable[None]]
+# Called with the operation's id, its payload and the last error code (a `failed` finish's, a requeue's, or
+# `None` after a reclaim or the takeover sweep), in the transaction that ended the operation `failed`.
+type FailureHook = Callable[[AsyncConnection, int, Mapping[str, JSONValue], str | None], Awaitable[None]]
 
 # The handler of each kind; the modules that own a kind register it (none in M0).
 HANDLERS: dict[OperationKind, OperationHandler] = {}
+# The failure hook of a kind that has one (M2 plan Deviation 13).
+FAILURE_HOOKS: dict[OperationKind, FailureHook] = {}
 
 
-def register_operation_handler(kind: OperationKind) -> Callable[[OperationHandler], OperationHandler]:
-    """Decorator: run the function for every operation of `kind`."""
+def register_operation_handler(
+    kind: OperationKind, *, on_failed: FailureHook | None = None
+) -> Callable[[OperationHandler], OperationHandler]:
+    """Decorator: run the function for every operation of `kind`, and `on_failed` (when given) in every
+    transaction that ends one `failed` (module docstring)."""
 
     def register(handler: OperationHandler) -> OperationHandler:
         registered = HANDLERS.get(kind)
         if registered is not None and registered is not handler:
             raise ValueError(f"another handler is already registered for operation kind {kind!r}")
+        if on_failed is not None:
+            hook = FAILURE_HOOKS.get(kind)
+            if hook is not None and hook is not on_failed:
+                raise ValueError(f"another failure hook is already registered for operation kind {kind!r}")
+            FAILURE_HOOKS[kind] = on_failed
         HANDLERS[kind] = handler
         return handler
 
     return register
+
+
+async def _run_failure_hook(
+    conn: AsyncConnection,
+    kind: OperationKind,
+    operation_id: int,
+    payload: Mapping[str, JSONValue],
+    error_code: str | None,
+) -> None:
+    hook = FAILURE_HOOKS.get(kind)
+    if hook is not None:
+        await hook(conn, operation_id, payload, error_code)
 
 
 # The conflict target repeats the index `operations_live_dedup` of §7.3 exactly:
@@ -135,7 +257,7 @@ _LIVE_ID = q(
     "WHERE kind = :kind AND dedup_key = :dedup_key AND status IN ('pending','running')"
 )
 _CLAIMABLE = q(
-    "SELECT kind, payload FROM operations "
+    "SELECT kind, payload, attempts FROM operations "
     "WHERE id = :i AND status = 'pending' AND (not_before IS NULL OR not_before <= now()) FOR UPDATE"
 )
 _HEARTBEAT = q(
@@ -143,19 +265,26 @@ _HEARTBEAT = q(
     "WHERE id = :i AND claim_id = :c AND status = 'running' RETURNING id"
 )
 _LOCK_OWNER = q("SELECT id FROM operations WHERE id = :i AND claim_id = :c AND status = 'running' FOR SHARE")
+_SET_PROGRESS = q(
+    "UPDATE operations SET progress = :progress "
+    "WHERE id = :i AND claim_id = :c AND status = 'running' RETURNING id",
+    jsonb=["progress"],
+)
+# The three reads that lead to `_release` also read the kind and the payload: its failure hook needs both.
 _OWNED_ATTEMPTS = q(
-    "SELECT attempts FROM operations WHERE id = :i AND claim_id = :c AND status = 'running' FOR UPDATE"
+    "SELECT attempts, kind, payload FROM operations "
+    "WHERE id = :i AND claim_id = :c AND status = 'running' FOR UPDATE"
 )
 _STALE = q(
-    "SELECT id, claim_id, attempts FROM operations WHERE status = 'running' AND heartbeat_at < :cutoff "
-    "ORDER BY id FOR UPDATE SKIP LOCKED"
+    "SELECT id, claim_id, attempts, kind, payload FROM operations "
+    "WHERE status = 'running' AND heartbeat_at < :cutoff ORDER BY id FOR UPDATE SKIP LOCKED"
 )
 # Not SKIP LOCKED, unlike `_STALE`: the takeover must take back every operation of an older epoch (§3.3.1
 # step 5), so it waits for an old owner's row lock (a heartbeat, `lock_operation_owner`) instead of leaving
 # that claim valid. The takeover's `lock_timeout` bounds the wait, as for the `runs` sweep.
 _OLDER_EPOCH = q(
-    "SELECT id, claim_id, attempts FROM operations WHERE status = 'running' AND worker_epoch < :epoch "
-    "ORDER BY id FOR UPDATE"
+    "SELECT id, claim_id, attempts, kind, payload FROM operations "
+    "WHERE status = 'running' AND worker_epoch < :epoch ORDER BY id FOR UPDATE"
 )
 # Due `pending` operations without a live job (the predicate of `tasks.live_job_exists`, inline so that
 # only real candidates are locked and the batch is never filled by rows that still have their job).
@@ -229,7 +358,13 @@ async def claim_operation(conn: AsyncConnection, operation_id: int, *, epoch: in
         )
     except TransitionConflict:
         return None
-    return OperationClaim(operation_id=operation_id, claim_id=claim_id, kind=row.kind, payload=row.payload)
+    return OperationClaim(
+        operation_id=operation_id,
+        claim_id=claim_id,
+        kind=row.kind,
+        payload=row.payload,
+        attempts=int(row.attempts),
+    )
 
 
 def _owner(claim: OperationClaim) -> dict[str, object]:
@@ -250,6 +385,20 @@ async def lock_operation_owner(conn: AsyncConnection, claim: OperationClaim) -> 
         raise FencedOut("operation")
 
 
+async def set_progress(
+    conn: AsyncConnection, claim: OperationClaim, progress: Mapping[str, JSONValue]
+) -> None:
+    """Replace the claimed operation's `progress` (counts and flags only, never content; the API polls it),
+    in the caller's transaction; `FencedOut`, having written nothing, when `claim` lost the row (M2 Task 18).
+
+    It updates the owner row, so a transaction that waits on that row's update (an `INSERT … ON CONFLICT` on
+    `operations_live_dedup` that meets this live row) waits until the caller commits: a caller that holds a
+    long transaction makes it the last statement (the scope apply's chunk does).
+    """
+    if (await conn.execute(_SET_PROGRESS, {**_owner(claim), "progress": dict(progress)})).first() is None:
+        raise FencedOut("operation")
+
+
 async def finish_operation(
     conn: AsyncConnection,
     claim: OperationClaim,
@@ -259,8 +408,9 @@ async def finish_operation(
 ) -> None:
     """End the claimed operation `succeeded` or `failed(error_code)`; `FencedOut` when `claim` lost the row.
 
-    A `failed` end needs an `error_code`, and raises the `operation.failed` alert in the same transaction
-    (ruling T10-g), so no caller can forget it; a fenced finish raises neither.
+    A `failed` end needs an `error_code`, and raises the `operation.failed` alert and runs the kind's failure
+    hook (with `error_code`) in the same transaction (ruling T10-g, Deviation 13), so no caller can forget
+    them; a fenced finish runs neither.
     """
     if status == "failed" and error_code is None:
         raise ValueError("a failed operation needs an error code")
@@ -278,6 +428,7 @@ async def finish_operation(
         raise FencedOut("operation") from exc
     if status == "failed":
         await _raise_failed_alert(conn, claim.operation_id)
+        await _run_failure_hook(conn, claim.kind, claim.operation_id, claim.payload, error_code)
 
 
 async def _raise_failed_alert(conn: AsyncConnection, operation_id: int) -> None:
@@ -296,13 +447,17 @@ async def _release(
     claim_id: UUID,
     attempts: int,
     *,
+    kind: OperationKind,
+    payload: Mapping[str, JSONValue],
     reason: str | None,
     not_before: datetime | None,
 ) -> Literal["pending", "failed"]:
     """Take the row from the execution `claim_id`: back to `pending` with one more attempt, or `failed`.
 
-    The one copy of the attempts rule, for the owner's requeue, the stale reclaim and the takeover sweep.
-    `TransitionConflict` propagates when `claim_id` no longer owns the row.
+    The one copy of the attempts rule, for the owner's requeue, the stale reclaim and the takeover sweep. An
+    exhaustion raises the alert and runs the failure hook of `kind` with `payload` and `reason` (the
+    requeue's code, `None` for a reclaim) in the caller's transaction. `TransitionConflict` propagates when
+    `claim_id` no longer owns the row.
     """
     owner = {"claim_id": claim_id}
     attempts_after = attempts + 1
@@ -313,11 +468,12 @@ async def _release(
             operation_id,
             ["running"],
             "failed",
-            reason="attempts_exhausted",
+            reason=ATTEMPTS_EXHAUSTED,
             owner=owner,
             set_={"attempts": MAX_OPERATION_ATTEMPTS},
         )
         await _raise_failed_alert(conn, operation_id)
+        await _run_failure_hook(conn, kind, operation_id, payload, reason)
         log.warning("operation_attempts_exhausted", operation_id=operation_id)
         return "failed"
     await transition(
@@ -338,8 +494,9 @@ async def requeue_operation(
 ) -> Literal["pending", "failed"]:
     """Give the claimed operation back for a retry after `not_before`, recording `error_code`.
 
-    Returns the new status: `failed` (and the `operation.failed` alert) when this was the last attempt.
-    Raises `FencedOut`, having written nothing, when `claim` no longer owns the row.
+    Returns the new status: `failed` (with the `operation.failed` alert and the kind's failure hook, given
+    `error_code`) when this was the last attempt. Raises `FencedOut`, having written nothing, when `claim` no
+    longer owns the row.
     """
     row = (await conn.execute(_OWNED_ATTEMPTS, _owner(claim))).first()
     if row is None:
@@ -350,6 +507,8 @@ async def requeue_operation(
             claim.operation_id,
             claim.claim_id,
             int(row.attempts),
+            kind=row.kind,
+            payload=row.payload,
             reason=error_code,
             not_before=not_before,
         )
@@ -383,7 +542,16 @@ async def _reclaim_stale(conn: AsyncConnection, *, now: datetime) -> list[tuple[
     """`reclaim_stale_operations`, returning each id with the claim it was taken from."""
     rows = (await conn.execute(_STALE, {"cutoff": now - OPERATION_STALE})).all()
     for row in rows:
-        await _release(conn, row.id, row.claim_id, int(row.attempts), reason=None, not_before=None)
+        await _release(
+            conn,
+            row.id,
+            row.claim_id,
+            int(row.attempts),
+            kind=row.kind,
+            payload=row.payload,
+            reason=None,
+            not_before=None,
+        )
     return [(int(row.id), row.claim_id) for row in rows]
 
 
@@ -396,7 +564,16 @@ async def sweep_older_epoch_operations(conn: AsyncConnection, epoch: int) -> int
     """
     rows = (await conn.execute(_OLDER_EPOCH, {"epoch": epoch})).all()
     for row in rows:
-        await _release(conn, row.id, row.claim_id, int(row.attempts), reason=None, not_before=None)
+        await _release(
+            conn,
+            row.id,
+            row.claim_id,
+            int(row.attempts),
+            kind=row.kind,
+            payload=row.payload,
+            reason=None,
+            not_before=None,
+        )
     return len(rows)
 
 
@@ -475,11 +652,25 @@ async def _invoke(handler: OperationHandler, ctx: OperationContext) -> None:
     await handler(ctx)
 
 
+def _log_handler_end(operation_id: int, end: OperationEnd) -> None:
+    """The log line of an end the handler wrote itself (`finish_in`, `requeue_in`), once it has returned."""
+    if end.kind == "finished":
+        log.info(
+            "operation_finished", operation_id=operation_id, status=end.status, error_code=end.error_code
+        )
+    else:
+        log.info(
+            "operation_requeued", operation_id=operation_id, error_code=end.error_code, status=end.status
+        )
+
+
 async def execute_operation(
     engine: AsyncEngine,
     operation_id: int,
     *,
     epoch: int,
+    deps: OperationDeps | None = None,
+    registry: ExecutionRegistry = EXECUTIONS,
     heartbeat_period_s: float = 30.0,
     on_superseded: Callable[[], None] = lambda: None,
 ) -> None:
@@ -491,14 +682,19 @@ async def execute_operation(
        requests the runtime's shutdown), then the job is deferred again, `run_operation(operation_id)` under
        `op:<id>` in a transaction of its own (deduplicated by that queueing lock while one waits): the
        current worker claims it, the stopping one fetches no more. A kind without a handler ends
-       `failed('no_handler')` with the `operation.failed` alert (raised by `finish_operation`).
-    2. Run the handler through `run_owned(("operation", id), claim_id, …)`: the registry's task for the
-       operation, next to the heartbeat task `heartbeat:operation:<id>` whose loss cancels it.
+       `failed('no_handler')` with the `operation.failed` alert and the kind's failure hook (both run by
+       `finish_operation`).
+    2. Run the handler through `run_owned(("operation", id), claim_id, …)` with `OperationContext(claim,
+       engine, deps)`: the registry's task for the operation, next to the heartbeat task
+       `heartbeat:operation:<id>` whose loss cancels it. `registry` is the process's `EXECUTIONS` (its local
+       exclusion: `AlreadyExecuting`, and the one the `operations` reconciler cancels in); a test that plays
+       a second process's execution passes one of its own (C35).
     3. By outcome: `lost` (a refused or failed heartbeat, a reconciler's or the shutdown's cancel, even one
        the handler swallowed, or `FencedOut`) returns with no further owner write; `raised` requeues with
-       `error_code='bug'` and `not_before = now + RETRY_DELAY`; `returned` finishes `succeeded`. A local
-       execution that is still live for the operation (`AlreadyExecuting`) requeues the new claim as
-       `already_executing`.
+       `error_code='bug'` and `not_before = now + RETRY_DELAY`; `returned` finishes `succeeded`, unless the
+       handler already ended the operation itself (`finish_in`, `requeue_in`: the context's outcome holder),
+       which is then only logged, with no further write. A local execution that is still live for the
+       operation (`AlreadyExecuting`) requeues the new claim as `already_executing`.
 
     Finish and requeue each run in a transaction of their own; their `FencedOut` is caught outside it, and the
     fenced transaction wrote nothing, because its `transition()` is its first write. The caller's own
@@ -530,13 +726,15 @@ async def execute_operation(
         async with engine.begin() as conn:
             return await heartbeat_operation(conn, claim)
 
+    ctx = OperationContext(claim=claim, engine=engine, deps=deps)
     try:
         outcome = await run_owned(
             ("operation", operation_id),
             claim.claim_id,
-            _invoke(handler, OperationContext(claim=claim, engine=engine)),
+            _invoke(handler, ctx),
             beat=beat,
             period_s=heartbeat_period_s,
+            registry=registry,
         )
     except AlreadyExecuting:
         log.warning("operation_already_executing", operation_id=operation_id)
@@ -555,4 +753,7 @@ async def execute_operation(
             )
             await _requeue(engine, claim, error_code="bug")
         case "returned":
+            if ctx.ended is not None:  # the handler's own transaction ended it
+                _log_handler_end(operation_id, ctx.ended)
+                return
             await _finish(engine, claim, status="succeeded")

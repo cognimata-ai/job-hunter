@@ -13,8 +13,10 @@ generated document says so:
 
 What a route does not raise itself but its guards do is declared by the route's `responses=`:
 `SESSION_RESPONSES` for what `deps.require_session` raises, `CSRF_RESPONSES` for the edge's CSRF check on a
-state-changing method (`edge.csrf_failure`), and `LOGIN_CSRF_RESPONSES` for the login's, which checks `Origin`
-only. A unit test checks that every `/api` route documents them.
+state-changing method (`edge.csrf_failure`), `LOGIN_CSRF_RESPONSES` for the login's, which checks `Origin`
+only, and `BODY_LIMIT_RESPONSES` for the edge's body ceiling on a route with a request body
+(`edge.MAX_BODY_BYTES`; the CV upload and the paste document their own 413). Unit tests check that every
+`/api` route documents them.
 """
 
 from typing import Any, Final
@@ -37,6 +39,10 @@ SESSION_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 }
 CSRF_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
     403: {"description": "Origin or `X-JH-Request` check failed (`csrf_failed`)"},
+}
+# The edge's body ceiling (`edge.MAX_BODY_BYTES`, final review FR-4) on a route with a request body.
+BODY_LIMIT_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    413: {"description": "The request body is larger than 1 MiB (`upload_rejected`, `too_large`)"},
 }
 # The login has no session yet and is checked for `Origin` only (§16.5, `edge.LOGIN_PATH`).
 LOGIN_CSRF_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {

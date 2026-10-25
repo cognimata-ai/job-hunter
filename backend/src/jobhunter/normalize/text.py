@@ -1,4 +1,6 @@
-"""Text primitives (spec §8.1): `norm_text`, `unaccent` and `fold`.
+"""Text primitives (spec §8.1): `norm_text`, `unaccent` and `fold`, and `fixed_point`, a normaliser applied
+until the value no longer changes (`fold` and `normalize.companies.company_key` are idempotent on ordinary
+text, but not on a few inputs: a spacing diacritic, a name ending in two country words).
 
 `fold(s)` is defined in the specification as `immutable_unaccent(norm_text(s)).casefold()`. The database
 computes `immutable_unaccent`; this module computes the same function in Python for text that never reaches
@@ -18,6 +20,7 @@ change the test.
 import functools
 import re
 import unicodedata
+from collections.abc import Callable
 from typing import Final
 
 # Spec §8.1 step 2: soft hyphen, zero-width space, non-joiner, joiner and the byte order mark are removed.
@@ -156,3 +159,17 @@ def unaccent(s: str) -> str:
 def fold(s: str) -> str:
     """`unaccent(norm_text(s)).casefold()`: the comparison form of a string (`ß` becomes `ss`)."""
     return unaccent(norm_text(s)).casefold()
+
+
+FIXED_POINT_ROUNDS: Final = 8
+
+
+def fixed_point(normalize: Callable[[str], str], value: str) -> str | None:
+    """`normalize` applied to `value` until the result no longer changes, at most `FIXED_POINT_ROUNDS` times;
+    `None` when it still changes after that (no stable normal form)."""
+    for _ in range(FIXED_POINT_ROUNDS):
+        again = normalize(value)
+        if again == value:
+            return value
+        value = again
+    return None

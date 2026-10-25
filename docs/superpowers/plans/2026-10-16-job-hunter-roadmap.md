@@ -60,7 +60,7 @@ Each spike records its result in `docs/spikes/V<n>.md`.
 |---|---|---|
 | M0 | [`2026-10-16-m0-foundation.md`](2026-10-16-m0-foundation.md) | complete |
 | M1 | [`2026-10-17-m1-collection-pipeline.md`](2026-10-17-m1-collection-pipeline.md) | complete |
-| M2 | written after M1 lands | — |
+| M2 | [`2026-10-20-m2-llm-profile-settings.md`](2026-10-20-m2-llm-profile-settings.md) | complete |
 | M3 | written after M2 lands | — |
 | M4 | written after M3 lands | — |
 | M5 | written after M4 lands | — |

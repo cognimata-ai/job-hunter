@@ -29,6 +29,8 @@ from jobhunter.worker.shutdown import coordinate
 from jobhunter.worker.tasks import defer_in_tx, defer_run_attempt, job_task_name, live_job_exists
 
 from tests.support.collect import manual_run_id
+from tests.support.llm import FAKE_LLM_DIR
+from tests.support.profile import operation_deps
 
 pytestmark = pytest.mark.integration
 
@@ -176,7 +178,7 @@ JOBS = sa.text("SELECT status, args FROM procrastinate_jobs WHERE task_name = :t
 
 
 async def test_a_superseded_workers_collect_loop_stops_and_leaves_the_redeferred_job_to_the_current_worker(
-    engine, queue_app, current_epoch, migrated, worker_lock, make_config, log_events
+    engine, queue_app, current_epoch, migrated, worker_lock, make_config, log_events, tmp_path
 ) -> None:
     """Ruling T24-a through the real procrastinate loop of the `collect` queue and the real coordinator: the
     zombie (epoch 1) takes the delivered `run_collect`, its admission is refused, the job is re-deferred and
@@ -187,9 +189,16 @@ async def test_a_superseded_workers_collect_loop_stops_and_leaves_the_redeferred
         await defer_run_attempt(c, defer_in_tx, run_id, 1)  # the delivery the zombie will take
     await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))
     assert job_task_name("run_collect") in queue_app.tasks  # the process's task app, with the blueprint
-    async with open_saver(migrated.dsn("app")) as saver:
+    cfg = make_config(
+        "worker",
+        JOBHUNTER_FAKE_LLM="1",
+        JOBHUNTER_FAKE_LLM_DIR=str(FAKE_LLM_DIR),
+        JOBHUNTER_PARSE_JOBS_DIR=str(tmp_path / "parse"),
+        JOBHUNTER_CV_STORE_DIR=str(tmp_path / "cv"),
+    )
+    async with open_saver(migrated.dsn("app")) as saver, operation_deps(engine, cfg) as deps:
         runtime = WorkerRuntime(
-            cfg=make_config("worker"),
+            cfg=cfg,
             engine=engine,
             queue=queue_app,
             saver=saver,
@@ -197,6 +206,11 @@ async def test_a_superseded_workers_collect_loop_stops_and_leaves_the_redeferred
             epoch=1,
             shutdown=ShutdownState(),
             embedder=None,
+            gateway=deps.gateway,
+            parse_client=deps.parse_client,
+            cv_store=deps.cv_store,
+            profile_graphs=deps.profile_graphs,
+            operation_deps=deps,
         )
         loop = asyncio.create_task(
             queue_app.run_worker_async(

@@ -1,7 +1,7 @@
 """Domain errors (spec §17.1): outcomes a caller handles, as opposed to bugs.
 
 None of them carries content: they name tables, ids, states and owners only, so their messages are safe to
-log.
+log. `NodeFailed`, the one bug here, is the content-free stand-in for an unclassified error of a graph node.
 """
 
 from typing import Final
@@ -48,3 +48,23 @@ class FencedOut(DomainError):
 
 class InvariantViolation(DomainError):
     """A cross-table invariant (§7.17) does not hold."""
+
+
+class NodeFailed(Exception):
+    """The content-free stand-in for an unclassified error (a §17.1 `Bug`) that escaped a graph node.
+
+    LangGraph stores the exception that escapes a node in `checkpoint_writes` (its `repr`), and an SQLAlchemy
+    or Pydantic error can quote bound values, CV text among them, in its message. A node wrapper
+    (`graphs.profile.graph.sanitized`, plan Deviation 25) logs the original's class and raises this instead,
+    outside the handler that caught it, so neither `__cause__` nor `__context__` refers to the original.
+
+    `retryable_db_error` says the original was a serialization failure, a deadlock or a lost connection:
+    `graphs.collect.graph.is_retryable_db_error` then retries the stand-in, so `DB_RETRY` still applies to a
+    wrapped node. Not a `DomainError`: it is a bug, which no caller handles as an outcome.
+    """
+
+    def __init__(self, node: str, error_class: str, *, retryable_db_error: bool = False) -> None:
+        super().__init__(f"node {node} failed: {error_class}")
+        self.node = node
+        self.error_class = error_class
+        self.retryable_db_error = retryable_db_error

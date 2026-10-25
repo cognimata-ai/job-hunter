@@ -25,7 +25,13 @@ from jobhunter.embeddings import EmbedderClient
 from jobhunter.observability.logging import get_logger
 
 if TYPE_CHECKING:
-    # Only for the annotation: `shutdown` imports this module.
+    # Only for the annotations: `shutdown` imports this module, and the M2 dependencies (Task 11) pull in the
+    # SDK and modules that import the task blueprint, which imports this one.
+    from jobhunter.graphs.profile.graph import ProfileGraphs
+    from jobhunter.llm.gateway import LLMGateway
+    from jobhunter.profile.parse_client import ParseClient
+    from jobhunter.profile.storage import CvStore
+    from jobhunter.worker.operations import OperationDeps
     from jobhunter.worker.shutdown import StopDeadline
 
 
@@ -75,4 +81,13 @@ class WorkerRuntime:
     collect_graph: CompiledStateGraph[Any, Any, Any, Any]
     epoch: int
     shutdown: ShutdownState
-    embedder: EmbedderClient | None  # the process's client (the `embed` node and the reconciler share it)
+    # the process's client, shared by the `embed` node, the `awaiting_embedding` and `profile_vectors`
+    # reconcilers and the `embed_profile` handler (through `operation_deps`)
+    embedder: EmbedderClient | None
+    # M2 (Task 11): the process's gateway, docparse client, CV store and profile graphs, and the operation
+    # dependencies `run_operation` hands to every execution (the same objects).
+    gateway: "LLMGateway"
+    parse_client: "ParseClient"
+    cv_store: "CvStore"
+    profile_graphs: "ProfileGraphs"
+    operation_deps: "OperationDeps"

@@ -1,4 +1,8 @@
-"""Shared type aliases and typed accessors for JSON documents."""
+"""Shared type aliases and typed accessors for JSON documents, and the strings a JSON document can hold that
+PostgreSQL or UTF-8 cannot (`unstorable`, `json_strings`)."""
+
+from collections.abc import Iterator
+from typing import Final
 
 type JSONValue = bool | int | float | str | list[JSONValue] | dict[str, JSONValue] | None
 
@@ -60,3 +64,33 @@ def get_int(doc: JSONValue, path: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(_mismatch(path, "int", value))
     return value
+
+
+NUL_MESSAGE: Final = "must not contain a NUL character"
+SURROGATE_MESSAGE: Final = "must be valid Unicode text"
+
+
+def unstorable(text: str) -> str | None:
+    """Why `text` cannot be stored, or `None`: a NUL character (U+0000), which neither a `text` nor a `jsonb`
+    value of PostgreSQL holds, or a lone UTF-16 surrogate, which a JSON escape (`"\\ud800"`) can carry and no
+    UTF-8 encodes. The message never repeats the text."""
+    if "\x00" in text:
+        return NUL_MESSAGE
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return SURROGATE_MESSAGE
+    return None
+
+
+def json_strings(value: JSONValue, path: str) -> Iterator[tuple[str, str]]:
+    """Every string value in `value` with its path from `path` (`.` between names, `[i]` after a list), in
+    document order; keys are not visited."""
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from json_strings(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from json_strings(item, f"{path}[{index}]")

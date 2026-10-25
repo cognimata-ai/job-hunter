@@ -1,6 +1,9 @@
 """`scripts/dev-secrets.sh` (Task 18) without root: PATH shims stand in for `chgrp` and, for a race, `ln`.
 
-The stack test checks the real group 10010 and the modes as root; these check the script's own logic.
+The stack test checks the real group 10010 and the modes as root; these check the script's own logic. M2
+Task 23 adds the worker's `anthropic_key`: the value of `JOBHUNTER_ANTHROPIC_API_KEY`, else an empty file.
+Every run sets that variable for the script alone, to a dummy that is no key, or removes it, so no key of the
+test's environment ever reaches a file.
 """
 
 import base64
@@ -13,7 +16,9 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "dev-secrets.sh"
 B64_SECRETS = ("session_secret", "data_key")
 PASSWORDS = ("pg_bootstrap", "db_app", "db_migrator", "db_backup", "db_restore")
-NAMES = B64_SECRETS + PASSWORDS
+NAMES = (*B64_SECRETS, *PASSWORDS, "anthropic_key")
+KEY_VARIABLE = "JOBHUNTER_ANTHROPIC_API_KEY"
+DUMMY_KEY = "dummy-not-a-key"
 
 # A chgrp 10010 that succeeds, as it does for root.
 CHGRP_OK = "#!/bin/sh\nexit 0\n"
@@ -32,13 +37,20 @@ SUDO_HINT = (
 )
 
 
-def run_script(tmp_path: Path, shims: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_script(
+    tmp_path: Path, shims: dict[str, str], *, key: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """The script on `tmp_path / "dev"` with `shims` first on PATH, `JOBHUNTER_ANTHROPIC_API_KEY` set to
+    `key` for it alone (removed when `None`)."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     for name, body in shims.items():
         (bin_dir / name).write_text(body)
         (bin_dir / name).chmod(0o755)
-    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    inherited = {name: value for name, value in os.environ.items() if name != KEY_VARIABLE}
+    env = {**inherited, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    if key is not None:
+        env[KEY_VARIABLE] = key
     return subprocess.run(
         [str(SCRIPT), str(tmp_path / "dev")], env=env, capture_output=True, text=True, timeout=60, check=False
     )
@@ -54,13 +66,40 @@ def test_each_secret_is_created_once_as_0440_and_only_its_name_is_printed(tmp_pa
     values = {name: (secrets_dir / name).read_text() for name in NAMES}
     for name, value in values.items():
         assert (secrets_dir / name).stat().st_mode & 0o777 == 0o440
-        assert value.strip() not in first.stdout
+        assert not value or value.strip() not in first.stdout
     assert all(len(base64.b64decode(values[name].strip(), validate=True)) == 32 for name in B64_SECRETS)
     assert all(len(values[name].strip()) == 48 and int(values[name], 16) >= 0 for name in PASSWORDS)
+    assert values["anthropic_key"] == ""  # no key given: an empty file, which the worker reads as none
 
     second = run_script(tmp_path, {"chgrp": CHGRP_OK})
     assert (second.returncode, second.stdout, second.stderr) == (0, "", "")
     assert {name: (secrets_dir / name).read_text() for name in NAMES} == values
+
+
+def test_a_key_given_once_the_file_exists_is_not_written_and_says_how_to_set_it(tmp_path: Path) -> None:
+    """Fix round 1, Minor 3: the existing (here empty) `anthropic_key` is kept, never overwritten, and the run
+    says that removing it sets the key; the key itself is never printed."""
+    assert run_script(tmp_path, {"chgrp": CHGRP_OK}).returncode == 0
+    key_file = tmp_path / "dev" / "anthropic_key"
+    before = key_file.stat()
+    later = run_script(tmp_path, {"chgrp": CHGRP_OK}, key=DUMMY_KEY)
+    assert (later.returncode, later.stderr) == (0, "")
+    assert later.stdout == "dev-secrets: kept anthropic_key (remove it to set a key)\n"
+    assert DUMMY_KEY not in later.stdout and key_file.read_text() == ""
+    assert (key_file.stat().st_ino, key_file.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    key_file.unlink()  # as the message says
+    again = run_script(tmp_path, {"chgrp": CHGRP_OK}, key=DUMMY_KEY)
+    assert again.stdout == "dev-secrets: created anthropic_key\n" and key_file.read_text() == DUMMY_KEY
+
+
+def test_the_anthropic_key_is_the_variables_value_and_is_never_printed(tmp_path: Path) -> None:
+    done = run_script(tmp_path, {"chgrp": CHGRP_OK}, key=DUMMY_KEY)
+    assert (done.returncode, done.stderr) == (0, "")
+    assert "dev-secrets: created anthropic_key" in done.stdout.splitlines()
+    assert DUMMY_KEY not in done.stdout
+    key_file = tmp_path / "dev" / "anthropic_key"
+    assert key_file.read_text() == DUMMY_KEY  # exactly the value: no newline added
+    assert key_file.stat().st_mode & 0o777 == 0o440
 
 
 def test_a_secret_created_meanwhile_is_kept_and_never_reported_as_created(tmp_path: Path) -> None:

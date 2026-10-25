@@ -10,8 +10,17 @@ itself. For each HTTP request it:
 2. sets `X-Request-Id` and `SECURITY_HEADERS` on every `http.response.start`;
 3. refuses a state-changing `/api` request that fails the CSRF check (§14.1, §16.5) with its own 403
    `csrf_failed` problem, before the app sees it (`csrf_failure`);
-4. counts `HTTP_REQUESTS` by route template (or `"unmatched"`, never the raw path; ruling T14-c) and status;
-5. renders a 500 `internal` problem when the inner app raises before a response started, then persists the
+4. bounds the request body at `MAX_BODY_BYTES` (1 MiB) before the app sees it, so no JSON is parsed past
+   it (final review FR-4): a declared `Content-Length` over the limit is refused before any byte is read, and
+   a body without a trustworthy one (chunked, or not a number) is counted as it streams and refused as soon as
+   it passes the limit, without reading further. Either is a 413 `upload_rejected` with `too_large` on `body`
+   (the upload routes' code for a body that is too large), logged `request_body_too_large` at info, and no
+   alert. A body within the limit is held (at most 1 MiB) and given to the app in the messages it came in.
+   The routes in `OWN_BODY_LIMITS` read their bodies themselves under their own limits (`profile.upload`:
+   the multipart CV upload up to 10 MiB while it streams, the paste under its own 1 MiB cap with its own
+   field), so the edge reads nothing of theirs;
+5. counts `HTTP_REQUESTS` by route template (or `"unmatched"`, never the raw path; ruling T14-c) and status;
+6. renders a 500 `internal` problem when the inner app raises before a response started, then persists the
    `api.unhandled_exception` alert. When a response has already started, the inner handler rendered it and
    persisted the alert (or a body failed mid-stream), so the edge only logs.
 
@@ -29,6 +38,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from jobhunter.api.errors import (
+    FieldError,
     Problem,
     internal_problem,
     persist_unhandled_alert,
@@ -65,6 +75,10 @@ STATE_CHANGING_METHODS: Final = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 CSRF_HEADER: Final = "X-JH-Request"
 LOGIN_PATH: Final = "/api/auth/login"
 CsrfFailure = Literal["origin_missing", "origin_mismatch", "header_missing"]
+# The body ceiling of every request (module docstring, step 4), and the routes that read their own bodies
+# under their own limits (`profile.upload.MAX_UPLOAD_BYTES` and `PASTE_BODY_MAX_BYTES`).
+MAX_BODY_BYTES: Final = 2**20
+OWN_BODY_LIMITS: Final = frozenset({("POST", "/api/profile/cv"), ("POST", "/api/profile/cv-text")})
 
 log = get_logger("jobhunter.api.edge")
 
@@ -113,6 +127,51 @@ def _csrf_problem() -> Problem:
     return Problem(403, "csrf_failed", "Cross-site request refused")
 
 
+def _too_large_problem() -> Problem:
+    message = f"The request body is larger than {MAX_BODY_BYTES} bytes"
+    return Problem(
+        413,
+        "upload_rejected",
+        "Request body too large",
+        errors=[FieldError(field="body", code="too_large", message=message)],
+    )
+
+
+def _declared_length(scope: Scope) -> int | None:
+    """The request's `Content-Length` when it is one decimal number, else `None` (none, or not a number)."""
+    values = _header_values(scope, b"content-length")
+    if len(values) != 1 or not values[0].isascii() or not values[0].isdigit():
+        return None
+    return int(values[0])
+
+
+async def bounded_body(scope: Scope, receive: Receive) -> Receive | None:
+    """The request's body read to its end within `MAX_BODY_BYTES`, as a `receive` that gives its messages
+    again and then the server's own; `None` when the body is over the limit (module docstring, step 4). A
+    disconnect ends the reading and is given on as it came."""
+    declared = _declared_length(scope)
+    if declared is not None and declared > MAX_BODY_BYTES:
+        return None
+    messages: list[Message] = []
+    received = 0
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message["type"] != "http.request":
+            break
+        received += len(message.get("body", b""))
+        if received > MAX_BODY_BYTES:
+            return None
+        if not message.get("more_body", False):
+            break
+    pending = iter(messages)
+
+    async def replay() -> Message:
+        return next(pending, None) or await receive()
+
+    return replay
+
+
 class EdgeMiddleware:
     def __init__(
         self,
@@ -152,12 +211,20 @@ class EdgeMiddleware:
             try:
                 cfg = self._config()
                 failure = csrf_failure(scope, None if cfg is None else cfg.public_origin)
-                if failure is None:
-                    await self.app(scope, receive, send_with_edge_headers)
-                else:
+                if failure is not None:
                     log.warning("csrf_rejected", reason=failure)
                     response = problem_response(
                         _csrf_problem(), instance=request_instance(scope), request_id=request_id
+                    )
+                    await response(scope, receive, send_with_edge_headers)
+                elif (scope.get("method"), scope.get("path")) in OWN_BODY_LIMITS:
+                    await self.app(scope, receive, send_with_edge_headers)
+                elif (bounded := await bounded_body(scope, receive)) is not None:
+                    await self.app(scope, bounded, send_with_edge_headers)
+                else:
+                    log.info("request_body_too_large", method=scope.get("method"), limit_bytes=MAX_BODY_BYTES)
+                    response = problem_response(
+                        _too_large_problem(), instance=request_instance(scope), request_id=request_id
                     )
                     await response(scope, receive, send_with_edge_headers)
             except Exception as exc:

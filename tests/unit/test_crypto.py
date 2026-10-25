@@ -1,8 +1,11 @@
+import base64
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
-from jobhunter.crypto import DecryptError, decrypt, encrypt, hkdf_sha256, key_id
+from jobhunter.config import AppConfig, load_config
+from jobhunter.crypto import DecryptError, data_keys, decrypt, encrypt, hkdf_sha256, key_id
 
 
 def test_roundtrip_key_id_and_rotation() -> None:
@@ -75,3 +78,19 @@ def test_decrypt_with_no_keys_fails_and_a_malformed_key_is_a_bug() -> None:
         decrypt([], blob, aad=b"a")
     with pytest.raises(ValueError, match="32 bytes"):
         decrypt([key[:16]], blob, aad=b"a")
+
+
+def test_data_keys_are_the_data_key_then_the_previous_one(tmp_path: Path) -> None:
+    """`crypto.data_keys(cfg)`: what seals with the first key and opens with either during a rotation."""
+    current, previous = os.urandom(32), os.urandom(32)
+    env = {"JOBHUNTER_ENV": "test", "JOBHUNTER_DB_NAME": "jobhunter"}
+
+    def config(**files: bytes) -> AppConfig:
+        secrets = tmp_path / f"s{len(files)}"
+        secrets.mkdir()
+        for name, value in files.items():
+            (secrets / name).write_bytes(base64.b64encode(value))
+        return load_config("worker", env, secrets)
+
+    assert data_keys(config(data_key=current)) == [current]
+    assert data_keys(config(data_key=current, data_key_previous=previous)) == [current, previous]

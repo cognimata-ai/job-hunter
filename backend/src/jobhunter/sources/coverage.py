@@ -80,6 +80,12 @@ BUCKETS: Final[Mapping[Bucket, timedelta]] = MappingProxyType(
 PROVIDER_SPAN: Final = BUCKETS["month"]  # the longest span a search provider serves (JSearch: 720 h)
 DATE_SLACK: Final = timedelta(hours=24)  # provider dates are truncated to the day
 _DAY: Final = timedelta(days=1)
+# How long after it was handed out a JSearch cursor may start a later run's traversal (§5.3.1; read by the
+# planner's cursor reuse, M1 Carry-forward 13: here, so `quota/` imports no adapter module). It is the longest
+# interval at which reuse was observed to work, never an extrapolation: the 24.04 h old page-1 cursor still
+# returned page 2 of the query (V10 phase 3, `docs/spikes/V10.md`: 6 of its 8 `job_uid`s are those of
+# `search_v2_page2`), after 2.01 h had worked in V9 phase 2.
+CURSOR_REUSE_TTL: Final[timedelta] = timedelta(hours=24)
 
 
 def freshness_bucket(

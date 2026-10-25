@@ -1,0 +1,124 @@
+# Rubric v1 (spec §11.2 and §11.3). Immutable once shipped: a change is a new version (v2.yaml), activated
+# through Settings (§13.3), never an edit of this file. `scoring/rubric/__init__.py` loads and validates it:
+# exactly the eight §11.2 keys, integer weights summing to 100, and the anchors of the six LLM criteria.
+#
+# The anchors are the §11.3 text verbatim, sentence by sentence: the level anchors, the two
+# `experience_seniority` sub-rating tables, and the `unknown` / `unconstrained` rules. They are rendered into
+# the shared rubric block of the score prompts (§10.6, M3).
+version: v1
+weights:
+  role_fit: 20
+  skills: 25
+  experience_seniority: 15
+  domain: 10
+  languages: 10
+  education_certifications: 5
+  location_work_mode: 10
+  employment_salary: 5
+anchors:
+  general:
+    - "The levels are integers 0–4, or `null` when unknown."
+    - "\"Profile\" means the confirmed profile only."
+  role_fit:
+    criterion: "the job's function and responsibilities against the candidate's demonstrated roles and confirmed target titles."
+    levels:
+      - level: 0
+        anchor: "A different function with no demonstrated overlap (e.g. sales manager for a backend engineer)."
+      - level: 1
+        anchor: "A distant adjacency: the same broad field, but the core responsibilities differ (e.g. IT support for a software engineer)."
+      - level: 2
+        anchor: "An adjacent role: at least half of the listed responsibilities match demonstrated work, but the core differs (e.g. data engineer for a backend developer)."
+      - level: 3
+        anchor: "The same role family, and most responsibilities match, but the scope or focus differs (e.g. platform vs product backend)."
+      - level: 4
+        anchor: "The same role family and scope as a demonstrated role or a confirmed target title, and the responsibilities match."
+    unknown: "`unknown` applies when the ad states no responsibilities and the title alone is ambiguous."
+  skills:
+    criterion: "must-haves weigh most and nice-to-haves refine. If the ad lists skills without a must/nice split, all of them count as must-haves."
+    levels:
+      - level: 0
+        anchor: "None of the must-haves is evidenced in the profile."
+      - level: 1
+        anchor: "Under 40% of must-haves are evidenced, or a central must-have is missing with no equivalent."
+      - level: 2
+        anchor: "40–69% of must-haves are evidenced, or close equivalents exist."
+      - level: 3
+        anchor: "At least 70% of must-haves are evidenced, the missing ones are minor or have close equivalents, and nice-to-haves are partly evidenced."
+      - level: 4
+        anchor: "All must-haves are evidenced at the required depth (or with an accepted equivalent), and most nice-to-haves are too."
+    unknown: "`unknown` applies when the ad lists no skills or technologies at all, e.g. a 500-character snippet."
+  experience_seniority:
+    criterion: "required level and years against the profile, in both directions. Being more senior is not automatically better. The rating is the **minimum of two mutually exclusive sub-ratings**; a sub-rating whose inputs are unknown is skipped."
+    level_sub_rating:
+      rule: "Ordinal scale: intern, working student, apprentice = 0; junior = 1; mid = 2; senior = 3; lead, principal = 4; head = 5. `g = profile level − ad level`:"
+      table:
+        - g: "0"
+          sub_rating: 4
+        - g: "+1 (one level above)"
+          sub_rating: 3
+        - g: "−1 (one level below)"
+          sub_rating: 2
+        - g: "+2"
+          sub_rating: 1
+        - g: "≤ −2, or ≥ +3"
+          sub_rating: 0
+    years_sub_rating:
+      rule: "`y = profile total years − required minimum years`:"
+      table:
+        - y: "`y ≥ 0`"
+          sub_rating: 4
+        - y: "`−1 ≤ y < 0`"
+          sub_rating: 3
+        - y: "`−2 ≤ y < −1`"
+          sub_rating: 2
+        - y: "`−5 < y < −2`"
+          sub_rating: 1
+        - y: "`y ≤ −5`"
+          sub_rating: 0
+    unknown: "`unknown` applies when both sub-ratings are unknown: the ad states neither a level nor years, and the title has no seniority token."
+    recomputed: "The validator recomputes this rating from the `seniority` and `min_years_experience` facts and the profile, and a different LLM level is a V4 issue (§11.6)."
+    examples: "*Examples*: a senior profile (3) with 6 years for a mid role (2) requiring 3 years → level 3, years 4 → **3**. A junior profile (1) with 2 years for a senior role (3) requiring 5 years → level 0, years 1 → **0**."
+  domain:
+    criterion: "the ad's industry and problem domain against the profile's domains and role history."
+    levels:
+      - level: 0
+        anchor: "No overlap."
+      - level: 1
+        anchor: "Only generic, transferable overlap."
+      - level: 2
+        anchor: "A related domain (an adjacent industry or a similar product type)."
+      - level: 3
+        anchor: "The same industry or the same problem domain, but not both."
+      - level: 4
+        anchor: "The same industry and the same problem domain, both demonstrated."
+    unconstrained: "`unconstrained` applies when the ad explicitly states that no domain experience is required (quote required)."
+  languages:
+    criterion: "required working languages against profile CEFR levels. `native` counts as above C2."
+    levels:
+      - level: 0
+        anchor: "A mandatory working language is absent from the profile, or the profile is at least 2 CEFR levels short."
+      - level: 1
+        anchor: "A mandatory language is exactly one CEFR level short."
+      - level: 2
+        anchor: "All mandatory languages are met; a preferred language is missing or at least 2 levels short."
+      - level: 3
+        anchor: "All mandatory languages are met; a preferred language is 1 level short."
+      - level: 4
+        anchor: "Every stated language requirement is met."
+    unknown: "`unknown` applies when the ad states no language requirement. **The ad's own language is not evidence of a requirement.**"
+    unconstrained: "`unconstrained` applies when the ad explicitly states that no particular language is required (quote)."
+    unspecified_level: "A mandatory language with an `unspecified` level is *provably unmet* only when the language is absent from the profile; when the profile has it at any level, the rating follows the evidence and the knockout comparison is `uncomparable` (§11.4)."
+  education_certifications:
+    levels:
+      - level: 0
+        anchor: "A mandatory degree level or certification is not met, and no equivalent is accepted."
+      - level: 1
+        anchor: "A mandatory requirement is met only through an accepted equivalent (\"or equivalent experience\") that is weakly evidenced, or the field of study is unrelated."
+      - level: 2
+        anchor: "Mandatory requirements are met; preferred ones are missing."
+      - level: 3
+        anchor: "Mandatory requirements are met, and most preferred ones are too."
+      - level: 4
+        anchor: "Every stated education and certification requirement is met."
+    unknown: "`unknown` applies when nothing is stated."
+    unconstrained: "`unconstrained` applies to \"no degree required\" / \"kein Studium erforderlich\" (quote)."

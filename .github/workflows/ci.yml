@@ -1,4 +1,5 @@
-# CI for Job Hunter (spec §18.8, the M0 and M1 subset): lint, unit, integration, contract, frontend and audit.
+# CI for Job Hunter (spec §18.8, the M0 to M2 subset): lint, unit, integration, contract, payload, docparse,
+# frontend and audit.
 # The live smoke of the free sources is the separate, manual and weekly smoke-free-sources.yml; no job here calls
 # a provider.
 #
@@ -32,10 +33,14 @@ jobs:
           version: "0.13.1"
       # `uv sync --frozen` installs uv.lock as it is; this fails when pyproject.toml and uv.lock disagree.
       - run: uv lock --check
-      - run: uv sync --frozen
+      # With the docparse group: mypy checks docparse/ against the types pypdf, pdfplumber and python-docx ship.
+      - run: uv sync --frozen --group docparse
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy
+      # The AST half of the LLM boundary (spec §10.1): no tools, tool_choice or sampling parameters, structured
+      # output only as json_schema, no assistant prefill; ruff's TID251 is the import half.
+      - run: uv run python scripts/check_llm_boundary.py
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "22.22.3"
@@ -79,7 +84,9 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: "0.13.1"
-      - run: uv sync --frozen
+      # The docparse group: tests/integration/test_parse_client.py, and Task 11's op_runner, serve parse jobs
+      # with an in-process `docparse.worker` loop.
+      - run: uv sync --frozen --group docparse
       # The harness (tests/support/pg.py) runs this image and is the only test code that needs Docker.
       - run: docker pull "$(grep ^pgvector= deploy/images.lock | cut -d= -f2)"
       - run: uv run pytest -W error tests/integration tests/crash -q
@@ -98,6 +105,43 @@ jobs:
           version: "0.13.1"
       - run: uv sync --frozen
       - run: uv run pytest -W error tests/contract -q
+
+  # The LLM payload contract tests (spec §10.9, §18.5; M0 Deviation 15): the request bodies of the gateway
+  # against the policy, offline, no database and no provider key.
+  payload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      - run: uv run pytest -W error tests/payload -q
+
+  # The docparse extractor and its job runner (spec §12.2): the `docparse` group in process (`-m docparse`,
+  # which the default run deselects), then the image, built from the digest-pinned bases of deploy/images.lock.
+  # Its no-network test (N1's docparse half) runs on the compose stack (tests/stack, `-m stack`).
+  docparse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen --group docparse
+      - run: uv run pytest -W error -m docparse tests/docparse -q
+      - name: docparse image
+        run: >-
+          docker build -f docparse/Dockerfile
+          --build-arg PYTHON_IMAGE="$(grep ^python= deploy/images.lock | cut -d= -f2)"
+          --build-arg UV_IMAGE="$(grep ^uv= deploy/images.lock | cut -d= -f2)"
+          -t jobhunter-docparse:ci .
 
   frontend:
     runs-on: ubuntu-24.04
@@ -131,8 +175,10 @@ jobs:
         with:
           version: "0.13.1"
       # Without the project itself: it is installed editable and is not on PyPI, so `pip-audit --strict` cannot
-      # audit it and fails the run. `--no-sync` keeps `uv run` from installing it again.
-      - run: uv sync --frozen --no-install-project
+      # audit it and fails the run. `--no-sync` keeps `uv run` from installing it again. With the docparse
+      # group (its parsers read untrusted files, §12.2) and the embedder group (the embedder image's runtime,
+      # final review FR-15), so every deployed dependency is audited.
+      - run: uv sync --frozen --no-install-project --group docparse --group embedder
       - run: uv run --no-sync pip-audit --strict
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:

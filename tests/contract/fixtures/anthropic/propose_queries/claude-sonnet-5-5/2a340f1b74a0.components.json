@@ -1,0 +1,24 @@
+{
+  "case": "sonnet",
+  "component_bytes": {
+    "messages": [
+      469
+    ],
+    "schema": 439,
+    "system": [
+      427
+    ]
+  },
+  "effort": "low",
+  "max_tokens": 1024,
+  "model": "claude-sonnet-5-5",
+  "purpose": "propose_queries",
+  "source": "recorded",
+  "spike": "v13",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "input_tokens": 741,
+    "output_tokens": 409
+  }
+}

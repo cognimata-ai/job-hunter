@@ -14,7 +14,8 @@ expiry).
   and every job location lies beyond twice the radius of *each* scope location (a location is *beyond* only
   when it is resolved and all its candidates are; candidates in different bands make the band unknown, §8.12).
 - `work_mode_excluded`, `employment_type_excluded`, `excluded_industry`: structured values only; an empty
-  structured set says nothing.
+  structured set says nothing. The structured industry is compared as the fixed point of `fold`, the form the
+  scope stores its industries in (FR-9).
 - `seniority_out_of_range`: only for `seniority_range.mode == "explicit"` (a `profile_relative` range is
   unknown in M1, plan Deviation 8). The title's tokens and the structured level map onto `SENIORITY_LADDER`;
   the job fails when it has such evidence and every level of it lies outside `[min, max]`. A bound that is
@@ -22,7 +23,10 @@ expiry).
   level is the value a provider wrote (`STRUCTURED_LEVELS`: SmartRecruiters' `experienceLevel.id`, Personio's
   `seniority`) or a ladder level; it stands for every level it may cover (`mid_senior_level` for mid to
   principal), and a value that is not known says nothing.
-- `excluded_company`: the company key is one of the scope's.
+- `excluded_company`: the company key is one of the scope's. The scope stores an exclusion as the fixed point
+  of `company_key` (`settings.model`), while identity keys a job in one pass (`jobs.company_key`, which stays
+  as it is), so the job's key is compared as its fixed point (`normalize.text.fixed_point`; final review
+  FR-9); a key with no stable form matches nothing.
 - `excluded_keyword`: a whole-word match in the title (and in the description when the scope says so). Text
   and keywords go through the normalisation of `title_norm` (`normalize_title`: separators, `Sr.`, accents,
   case) before the match, so `Front-End` and a title normalised to `front end` meet.
@@ -41,6 +45,9 @@ refilters up to `BATCH` of them. The heavy reconciler `hard_filter_completeness`
 (`active_scopes`), then the batch's job rows `FOR SHARE` in ascending id and in one statement (a job merged or
 deleted meanwhile is skipped), then the caller's `guard` (the owner or epoch fence), then the writes. The
 unpublished targets of a job whose result changed are refiltered once `score_targets` exists (M3).
+`STALE_PREDICATE` is that stale-result condition as one SQL fragment, which the scope apply's final
+completeness check (`settings.scope_apply.incomplete_jobs`, M2 Task 18) counts with; the apply's precompute
+calls `recompute_stale` for its pending scope alone and outside any `active_config` lock (§13.4 step 2).
 """
 
 import re
@@ -59,7 +66,8 @@ from jobhunter.db.seed import canonical_json, content_hash
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.geo.gazetteer import distance_km
-from jobhunter.normalize.text import fold
+from jobhunter.normalize.companies import company_key
+from jobhunter.normalize.text import fixed_point, fold
 from jobhunter.normalize.titles import SENIORITY_LADDER, normalize_title
 from jobhunter.run_settings import ScopeLocation, ScopeSettings, scope_from_payload
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
@@ -294,13 +302,14 @@ def _evaluate(facts: DetFacts, description: _Description, scope: ScopeSettings) 
         reasons.append("employment_type_excluded")
     if _seniority_out_of_range(facts, scope):
         reasons.append("seniority_out_of_range")
-    if facts.company_key in scope.excluded_companies:
+    if fixed_point(company_key, facts.company_key) in scope.excluded_companies:
         reasons.append("excluded_company")
     if _excluded_keyword(facts, description, scope):
         reasons.append("excluded_keyword")
     if facts.ad_language != "unknown" and facts.ad_language not in scope.accepted_ad_languages:
         reasons.append("ad_language_excluded")
-    if facts.industry_structured is not None and fold(facts.industry_structured) in scope.industries_exclude:
+    industry = facts.industry_structured
+    if industry is not None and fixed_point(fold, industry) in scope.industries_exclude:
         reasons.append("excluded_industry")
     return HardFilterResult(not reasons, tuple(reasons))
 
@@ -364,11 +373,14 @@ _WRITE: Final = q(
     "det_algorithm_version = EXCLUDED.det_algorithm_version, computed_at = EXCLUDED.computed_at"
 )
 # The scopes whose results are required: the active one and, while a flip is being prepared, the pending
-# one, with `active_config` held `FOR SHARE` (§9.1 lock order: the first lock).
-_ACTIVE_SCOPES: Final = q(
-    "SELECT s.id, s.payload FROM active_config a "
-    "JOIN scope_versions s ON s.id IN (a.scope_version_id, a.pending_scope_version_id) "
-    "WHERE a.id = 1 ORDER BY s.id FOR SHARE OF a"
+# one, with `active_config` held `FOR SHARE` (§9.1 lock order: the first lock). The scope rows are read by a
+# statement of their own: joined to the lock, a statement that waited behind a settings save would look for
+# the save's new pending scope in the snapshot of its own start, which lacks it (`settings/active.py`).
+_LOCK_SCOPE_POINTERS: Final = q(
+    "SELECT scope_version_id, pending_scope_version_id FROM active_config WHERE id = 1 FOR SHARE"
+)
+_SCOPES: Final = q(
+    "SELECT id, payload FROM scope_versions WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id"
 )
 
 
@@ -401,9 +413,13 @@ async def active_scopes(conn: AsyncConnection) -> dict[int, ScopeSettings]:
     Takes `active_config` `FOR SHARE`: the rows of these scopes are written under that lock until the
     transaction ends, so no scope flip commits between the facts read and the results written.
     """
-    rows = (await conn.execute(_ACTIVE_SCOPES)).all()
-    if not rows:
+    pointers = (await conn.execute(_LOCK_SCOPE_POINTERS)).first()
+    if pointers is None:
         raise LookupError("there is no active configuration")
+    ids = [pointers.scope_version_id] + (
+        [] if pointers.pending_scope_version_id is None else [pointers.pending_scope_version_id]
+    )
+    rows = (await conn.execute(_SCOPES, {"ids": ids})).all()
     return {int(row.id): scope_from_payload(get_object(row.payload, "")) for row in rows}
 
 
@@ -428,14 +444,21 @@ async def refilter_job(
 
 # -- completeness --------------------------------------------------------------------------------------------
 
+# The stale-result condition of the job `j` (M2 Task 18: written once, shared with
+# `scope_apply.incomplete_jobs`): for a scope of `:scopes` (bigint[] of scope version ids) the job has no
+# `hard_filter_results` row, or its row has an `inputs_hash` other than `jobs.det_facts_hash` or an algorithm
+# version other than `:version` (`DET_ALGORITHM_VERSION`).
+STALE_PREDICATE: Final = (
+    "EXISTS (SELECT 1 FROM unnest(CAST(:scopes AS bigint[])) AS s(id) "
+    "LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = s.id "
+    "WHERE h.job_id IS NULL OR h.inputs_hash <> j.det_facts_hash OR h.det_algorithm_version <> :version)"
+)
 # The unmerged jobs (touched since `since`, when given) that lack a row for a scope, or whose row is stale,
 # in id order, locked `FOR SHARE` as they are returned: a job merged or deleted since the scan is skipped.
 _STALE: Final = q(
-    "SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL "
+    "SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL "  # noqa: S608 (constants only)
     "AND (CAST(:since AS timestamptz) IS NULL OR j.updated_at >= :since) "
-    "AND EXISTS (SELECT 1 FROM unnest(CAST(:scopes AS bigint[])) AS s(id) "
-    "LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = s.id "
-    "WHERE h.job_id IS NULL OR h.inputs_hash <> j.det_facts_hash OR h.det_algorithm_version <> :version) "
+    f"AND {STALE_PREDICATE} "
     "ORDER BY j.id LIMIT :limit FOR SHARE OF j"
 )
 
@@ -452,10 +475,11 @@ async def recompute_stale(
     jobs updated at or after `since` when it is given. Returns how many jobs it recomputed (a pass that
     returns `BATCH` may have left more).
 
-    In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `active_scopes`): the batch's
-    job rows `FOR SHARE` in one statement, then `await guard(conn)`, which proves the caller still owns the
-    work (the owner row of the run, or the worker epoch) and raises `FencedOut`, having written nothing, when
-    it does not; then the results are written.
+    In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `active_scopes`, except the
+    scope apply's precompute, which runs outside any `active_config` lock, §13.4 step 2): the batch's job
+    rows `FOR SHARE` in one statement, then `await guard(conn)`, which proves the caller still owns the work
+    (the owner row of the run or operation, or the worker epoch) and raises `FencedOut`, having written
+    nothing, when it does not; then the results are written.
     """
     if not scopes:
         return 0

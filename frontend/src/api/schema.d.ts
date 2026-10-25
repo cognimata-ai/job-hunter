@@ -64,6 +64,312 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/geo/places": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search Places
+         * @description Search places by name, other spelling or postal code (200), the most populous first.
+         */
+        get: operations["search_places_api_geo_places_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Profile
+         * @description The active profile version and every version, newest first (empty until a draft is confirmed).
+         */
+        get: operations["get_profile_api_profile_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/cv": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload Cv
+         * @description Upload a CV file: 202 with the new draft, whose text extraction (or native extraction) is queued.
+         */
+        post: operations["upload_cv_api_profile_cv_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/cv-text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Paste Cv
+         * @description Paste a CV's text: 202 with the new draft; the text is stored sealed in its row, never as a file.
+         */
+        post: operations["paste_cv_api_profile_cv_text_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Draft
+         * @description The draft's status, its profile and issues, its stripped text with the edit set and the review map,
+         *     and the repairs of a failed draft.
+         */
+        get: operations["get_draft_api_profile_drafts__draft_id__get"];
+        /**
+         * Save Draft
+         * @description Save the edited profile of a `ready` draft: validated again and stored repaired, with its issues.
+         */
+        put: operations["save_draft_api_profile_drafts__draft_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm Draft
+         * @description Confirm a ready draft and activate its profile (201); a repeat returns the original outcome.
+         */
+        post: operations["confirm_draft_api_profile_drafts__draft_id__confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/discard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discard Draft
+         * @description Discard a draft in text review, ready or failed.
+         */
+        post: operations["discard_draft_api_profile_drafts__draft_id__discard_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/rescore-estimate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Rescore Estimate
+         * @description What confirming a draft would re-score and cost (§12.6 step 2, §21.4).
+         */
+        get: operations["get_rescore_estimate_api_profile_drafts__draft_id__rescore_estimate_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Draft
+         * @description Repair a failed draft (§12.7): extract again from the same input (`llm`) or from the original PDF
+         *     (`native_pdf`, with the disclosure acknowledged).
+         */
+        post: operations["retry_draft_api_profile_drafts__draft_id__retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Edit Text
+         * @description Replace the draft's edit set and rebuild its stripped text; from `ready`, back to `text_review`.
+         */
+        put: operations["edit_text_api_profile_drafts__draft_id__text_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/drafts/{draft_id}/text-review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve Text
+         * @description Approve the reviewed text: it is stored with its sha256 and the profile extraction starts (§12.3).
+         */
+        post: operations["approve_text_api_profile_drafts__draft_id__text_review_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/query-proposals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request Query Proposal
+         * @description Ask the LLM to propose search queries for the active profile (202); a running proposal is returned.
+         */
+        post: operations["request_query_proposal_api_profile_query_proposals_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/profile/query-proposals/{proposal_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Query Proposal
+         * @description A query proposal's status and, once ready, its queries.
+         */
+        get: operations["get_query_proposal_api_profile_query_proposals__proposal_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/queries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add Query
+         * @description Add a query (201); it is not enabled until a settings save lists it.
+         */
+        post: operations["add_query_api_queries_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/queries/{query_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Edit Query
+         * @description Edit a query: the row is retired and the new one answered (200).
+         */
+        patch: operations["edit_query_api_queries__query_id__patch"];
+        trace?: never;
+    };
     "/api/runs": {
         parameters: {
             query?: never;
@@ -78,6 +384,110 @@ export interface paths {
          * @description 202 with the active collection (`created=false`) or a new manual one (`created=true`).
          */
         post: operations["run_now_api_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Settings
+         * @description The active settings version, its document and the scope being applied, if any.
+         */
+        get: operations["get_settings_api_settings_get"];
+        put?: never;
+        /**
+         * Save Settings Version
+         * @description Save the document as a new settings version and activate it (201).
+         */
+        post: operations["save_settings_version_api_settings_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/dry-run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Settings Dry Run
+         * @description Validate and preview a proposed settings document: its errors, warnings, projections and effects.
+         */
+        post: operations["settings_dry_run_api_settings_dry_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/scope/retry-apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Scope Apply
+         * @description Apply the active settings version's scope again, after its apply failed for good (202).
+         */
+        post: operations["retry_scope_apply_api_settings_scope_retry_apply_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Versions
+         * @description The settings versions, newest first, keyset-paged (§14.3).
+         */
+        get: operations["list_versions_api_settings_versions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/versions/{version_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Version
+         * @description A settings version, its document and its diff against the previous version.
+         */
+        get: operations["get_version_api_settings_versions__version_id__get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -100,6 +510,88 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/spend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Spend
+         * @description The LLM spend of the current month: counted, billed, ambiguous and in flight, the cap and headroom,
+         *     the USD bucket, `ĉ`, the projected critic rate, and the spend per model, effort and role.
+         */
+        get: operations["get_spend_api_system_spend_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/watchlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add Company
+         * @description Add a board (201): company, instance, validation and settings version in one transaction.
+         */
+        post: operations["add_company_api_watchlist_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/watchlist/parse-url": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Parse Url
+         * @description Read a careers URL by pattern (200): the board it names, or why it names none. Never fetches it.
+         */
+        post: operations["parse_url_api_watchlist_parse_url_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/watchlist/{company_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove Company
+         * @description Remove a board (204): its settings entry goes in a new version, the company row is deleted, and the
+         *     board's instance and postings stay.
+         */
+        delete: operations["remove_company_api_watchlist__company_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -159,6 +651,95 @@ export interface components {
             /** Warn */
             warn: number;
         };
+        /** BucketOut */
+        BucketOut: {
+            /** Capacity */
+            capacity: string;
+            /** Rate Per H */
+            rate_per_h: string;
+            /** Usd */
+            usd: string;
+        };
+        /** Certification */
+        Certification: {
+            /** Issuer */
+            issuer: string | null;
+            /** Name */
+            name: string;
+            /** Year */
+            year: number | null;
+        };
+        /**
+         * ConfirmIn
+         * @description `expected_rescore_ack` acknowledges the re-score estimate; it is required when retained ads exist.
+         */
+        ConfirmIn: {
+            /**
+             * Expected Rescore Ack
+             * @default false
+             */
+            expected_rescore_ack: boolean;
+        };
+        /**
+         * ConfirmOut
+         * @description §14.2's 201 of a confirm: the activated version, the re-score count, its online cost and the bulk
+         *     budget (§6.9.3). A repeat returns the original body.
+         */
+        ConfirmOut: {
+            /** Bulk Budget Usd */
+            bulk_budget_usd: string;
+            /** Est Usd */
+            est_usd: string;
+            /** Profile Version Id */
+            profile_version_id: number;
+            /** Targets To Create */
+            targets_to_create: number;
+        };
+        /**
+         * ConfirmedProfile
+         * @description `profile_versions.profile_json` and a draft's `draft_json`: the extraction plus `user_entered`.
+         */
+        ConfirmedProfile: {
+            /** Certifications */
+            certifications: components["schemas"]["Certification"][];
+            /** Domains */
+            domains: string[];
+            /** Education */
+            education: components["schemas"]["Education"][];
+            /** Languages */
+            languages: components["schemas"]["Language"][];
+            /** Roles */
+            roles: components["schemas"]["Role"][];
+            /**
+             * Seniority
+             * @enum {string}
+             */
+            seniority: "intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head";
+            /** Skills */
+            skills: components["schemas"]["Skill"][];
+            /** Summary */
+            summary: string;
+            /** Target Titles */
+            target_titles: components["schemas"]["TargetTitle"][];
+            /** Total Years Experience */
+            total_years_experience: number | null;
+            user_entered?: components["schemas"]["UserEntered"];
+        };
+        /** CvTextIn */
+        CvTextIn: {
+            /** Text */
+            text: string;
+        };
+        /**
+         * DiffEntryOut
+         * @description One changed leaf at its path (`payload.…`); `before` or `after` is null where the value is absent.
+         */
+        DiffEntryOut: {
+            after: components["schemas"]["JsonValue"];
+            before: components["schemas"]["JsonValue"];
+            /** Path */
+            path: string;
+        };
         /** DiskUsage */
         DiskUsage: {
             /** Free Bytes */
@@ -167,6 +748,80 @@ export interface components {
             path: string;
             /** Total Bytes */
             total_bytes: number;
+        };
+        /** DraftCreatedOut */
+        DraftCreatedOut: {
+            /** Draft Id */
+            draft_id: number;
+        };
+        /** DraftIn */
+        DraftIn: {
+            draft: components["schemas"]["ConfirmedProfile"];
+        };
+        /** DraftOut */
+        DraftOut: {
+            draft: components["schemas"]["ConfirmedProfile"] | null;
+            edits: components["schemas"]["TextEditsOut"];
+            /** Failure Code */
+            failure_code: string | null;
+            /** Recomputed Total Years */
+            recomputed_total_years: number | null;
+            /** Repairs */
+            repairs: ("paste_text" | "native_pdf" | "retry_llm")[];
+            /** Reviewed Text Sha256 */
+            reviewed_text_sha256: string | null;
+            /** Segments */
+            segments: components["schemas"]["SegmentOut"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "uploaded" | "extracting_text" | "text_review" | "extracting_profile" | "ready" | "failed" | "confirmed" | "discarded";
+            /** Strip Report */
+            strip_report: {
+                [key: string]: number;
+            } | null;
+            /**
+             * Stripped Text Preview
+             * @description The contact-stripped text, never the raw text; `segments` index it. Offsets are Unicode code points, not UTF-16 code units: a JavaScript client must convert them, for example with Array.from(text).
+             */
+            stripped_text_preview: string | null;
+            /** Validation Issues */
+            validation_issues: components["schemas"]["ValidationIssueOut"][];
+        };
+        /** DryRunIn */
+        DryRunIn: {
+            payload: components["schemas"]["JsonValue"];
+        };
+        /** DryRunOut */
+        DryRunOut: {
+            /** Effects */
+            effects: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
+            /** Errors */
+            errors: components["schemas"]["FieldIssueOut"][];
+            /**
+             * Projections
+             * @description The preview by part (§13.5). In `adzuna`, `cadence_days` is days or null; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed.
+             */
+            projections: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /** Warnings */
+            warnings: components["schemas"]["WarningOut"][];
+        };
+        /** Education */
+        Education: {
+            /** Field */
+            field: string;
+            /** Institution */
+            institution: string | null;
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "vocational" | "bachelor" | "master" | "phd" | "other";
+            /** Year */
+            year: number | null;
         };
         /**
          * EmbedderOut
@@ -180,6 +835,14 @@ export interface components {
             model_id: string | null;
             /** Ok */
             ok: boolean;
+        };
+        /** ExtractingOut */
+        ExtractingOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "extracting_profile";
         };
         /**
          * FieldError
@@ -195,6 +858,22 @@ export interface components {
             /** Message */
             message: string;
         };
+        /**
+         * FieldIssueOut
+         * @description A refused field (`settings.validate.FieldIssue`): its path from `payload`, a code and a message that
+         *     never repeats the value.
+         */
+        FieldIssueOut: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "out_of_range" | "invalid" | "required" | "conflict" | "unsupported";
+            /** Field */
+            field: string;
+            /** Message */
+            message: string;
+        };
         /** HealthOut */
         HealthOut: {
             /**
@@ -202,6 +881,47 @@ export interface components {
              * @constant
              */
             status: "ok";
+        };
+        /** @enum {string} */
+        IssueCode: "limit" | "date_invalid" | "date_order" | "years_mismatch" | "contact_removed" | "ungrounded" | "language_without_evidence" | "code_other" | "unverifiable";
+        JsonValue: unknown;
+        /** Language */
+        Language: {
+            /**
+             * Cefr
+             * @enum {string}
+             */
+            cefr: "A1" | "A2" | "B1" | "B2" | "C1" | "C2" | "native" | "unspecified";
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "de" | "en" | "fr" | "es" | "it" | "nl" | "pl" | "pt" | "other";
+            /** Code Other */
+            code_other: string | null;
+            /** Evidence */
+            evidence: string;
+        };
+        /**
+         * LlmSpendOut
+         * @description The month's LLM spend (§17.5 "LLM spend", M0 Deviation 6): the counted spend, the cap, the scoring
+         *     headroom (§6.9.4) and the USD bucket accrued to now, from the month row as `read_month` gives it; a month
+         *     without a row is the one a reservation would create, with the settings' cap and nothing counted.
+         */
+        LlmSpendOut: {
+            /** Bucket Usd */
+            bucket_usd: string;
+            /** Cap */
+            cap: string;
+            /** Counted */
+            counted: string;
+            /** Headroom */
+            headroom: string;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
         };
         /** LoginIn */
         LoginIn: {
@@ -217,6 +937,51 @@ export interface components {
             /** Failing */
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
         };
+        /** ParseUrlIn */
+        ParseUrlIn: {
+            /** Url */
+            url: string;
+        };
+        /**
+         * ParsedUrlOut
+         * @description The board a careers URL names; `region` is Lever's and `null` for every other ATS.
+         */
+        ParsedUrlOut: {
+            /**
+             * Ats
+             * @enum {string}
+             */
+            ats: "greenhouse" | "lever" | "ashby" | "personio" | "recruitee" | "smartrecruiters";
+            /** Region */
+            region: ("global" | "eu") | null;
+            /** Slug */
+            slug: string;
+        };
+        /**
+         * PendingScopeOut
+         * @description The scope being applied (§13.4) and its live apply's progress; `progress` is `null` while no apply is
+         *     live (one that failed for good, until the pointer is cleared).
+         */
+        PendingScopeOut: {
+            progress: components["schemas"]["ProgressOut"] | null;
+            /** Version Id */
+            version_id: number;
+        };
+        /** PlaceOut */
+        PlaceOut: {
+            /** Gazetteer Id */
+            gazetteer_id: string;
+            /** Label */
+            label: string;
+            /** Lat */
+            lat: number;
+            /** Lon */
+            lon: number;
+            /** Population */
+            population: number;
+            /** Postal Codes */
+            postal_codes: string[];
+        };
         /**
          * Problem
          * @description The `application/problem+json` document of every error response (RFC 9457, §14.4).
@@ -230,7 +995,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "unauthenticated" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "internal";
+            code: "unauthenticated" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
             /**
              * Detail
              * @default null
@@ -253,6 +1018,122 @@ export interface components {
             type: string;
         } & {
             [key: string]: unknown;
+        };
+        /** ProfileListOut */
+        ProfileListOut: {
+            active: components["schemas"]["ProfileVersionOut"] | null;
+            /** Versions */
+            versions: components["schemas"]["ProfileVersionOut"][];
+        };
+        /** ProfileVersionOut */
+        ProfileVersionOut: {
+            /**
+             * Confirmed At
+             * Format: date-time
+             */
+            confirmed_at: string;
+            /** Id */
+            id: number;
+            profile: components["schemas"]["ConfirmedProfile"] | null;
+            /** Purged */
+            purged: boolean;
+            /** Version No */
+            version_no: number;
+        };
+        /** ProgressOut */
+        ProgressOut: {
+            /** Done */
+            done: number;
+            /** Total */
+            total: number;
+        };
+        /** ProposalCreatedOut */
+        ProposalCreatedOut: {
+            /** Proposal Id */
+            proposal_id: number;
+        };
+        /**
+         * ProposalOut
+         * @description A proposal's status and, once `ready`, its kept queries; `items` is `null` in every other status.
+         */
+        ProposalOut: {
+            /** Items */
+            items: components["schemas"]["ProposedQueryOut"][] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "ready" | "failed" | "purged";
+        };
+        /**
+         * ProposedQueryOut
+         * @description A kept item of a proposal (§11.12), as `POST /api/queries` accepts it.
+         */
+        ProposedQueryOut: {
+            /** Exploration */
+            exploration: boolean;
+            /**
+             * Lang
+             * @enum {string}
+             */
+            lang: "de" | "en";
+            /** Rationale */
+            rationale: string;
+            /** Target Title */
+            target_title: string;
+            /** Text */
+            text: string;
+        };
+        /**
+         * QueryEditIn
+         * @description An absent member keeps the query's value.
+         */
+        QueryEditIn: {
+            /** Lang */
+            lang?: ("de" | "en") | null;
+            /** Text */
+            text?: string | null;
+        };
+        /** QueryIn */
+        QueryIn: {
+            /**
+             * Exploration
+             * @default false
+             */
+            exploration: boolean;
+            /**
+             * Lang
+             * @enum {string}
+             */
+            lang: "de" | "en";
+            /**
+             * Proposal Id
+             * @description The ready proposal whose item this query accepts
+             */
+            proposal_id?: number | null;
+            /** Text */
+            text: string;
+        };
+        /** QueryOut */
+        QueryOut: {
+            /** Exploration */
+            exploration: boolean;
+            /** Id */
+            id: number;
+            /**
+             * Lang
+             * @enum {string}
+             */
+            lang: "de" | "en";
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "llm_proposal" | "user";
+            /** Proposal Id */
+            proposal_id: number | null;
+            /** Text */
+            text: string;
         };
         /**
          * QuotaOut
@@ -295,7 +1176,68 @@ export interface components {
             /** Ok */
             ok: boolean;
         };
-        /** RunNowIn */
+        /**
+         * RescoreEstimateOut
+         * @description The re-score preview (§12.6 step 2, §21.4): the retained ads to score again, their cost online and in
+         *     Batches, the month's counted spend and its cap.
+         */
+        RescoreEstimateOut: {
+            /** Cap */
+            cap: string;
+            /** Est Usd Batch */
+            est_usd_batch: string;
+            /** Est Usd Online */
+            est_usd_online: string;
+            /** Month Spend */
+            month_spend: string;
+            /** Targets */
+            targets: number;
+        };
+        /** RetryApplyOut */
+        RetryApplyOut: {
+            /**
+             * Operation Id
+             * @description The new `apply_scope` operation of the active version's scope
+             */
+            operation_id: number;
+        };
+        /** RetryIn */
+        RetryIn: {
+            /**
+             * Ack Native Pdf
+             * @default false
+             */
+            ack_native_pdf: boolean;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "llm" | "native_pdf";
+        };
+        /** Role */
+        Role: {
+            /** Domain */
+            domain: string | null;
+            /** Employer */
+            employer: string | null;
+            /** End */
+            end: string | "present" | null;
+            /** Highlights */
+            highlights: string[];
+            /**
+             * Seniority
+             * @enum {string}
+             */
+            seniority: "intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head" | "unspecified";
+            /** Start */
+            start: string | null;
+            /** Title */
+            title: string;
+        };
+        /**
+         * RunNowIn
+         * @description `include_paid` only: an unknown member is refused (422 `validation_failed`), as by every other body.
+         */
         RunNowIn: {
             /** Include Paid */
             include_paid: boolean;
@@ -335,6 +1277,77 @@ export interface components {
             /** Trigger */
             trigger: string;
         };
+        /**
+         * SaveIn
+         * @description A save (§13.2): `acknowledged_warnings` must cover every warning code the dry-run of `payload` gives;
+         *     `eval_override_ack` acknowledges a failed eval gate (§11.13).
+         */
+        SaveIn: {
+            /** Acknowledged Warnings */
+            acknowledged_warnings: string[];
+            /** Base Version Id */
+            base_version_id: number;
+            /**
+             * Eval Override Ack
+             * @default false
+             */
+            eval_override_ack: boolean;
+            payload: components["schemas"]["JsonValue"];
+        };
+        /** SaveOut */
+        SaveOut: {
+            /**
+             * Apply Scope Operation Id
+             * @description The `apply_scope` operation the version's scope needs (§13.4), or null when none does
+             */
+            apply_scope_operation_id: number | null;
+            version: components["schemas"]["SavedVersionOut"];
+        };
+        /** SavedVersionOut */
+        SavedVersionOut: {
+            /** Effect Classes */
+            effect_classes: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
+            /** Id */
+            id: number;
+            /** Version No */
+            version_no: number;
+        };
+        /** SecurityClearance */
+        SecurityClearance: {
+            /** Level */
+            level: string | null;
+            /** Name */
+            name: string;
+        };
+        /**
+         * SegmentOut
+         * @description One run of `stripped_text_preview` and the raw span it stands for (ruling R14-2): `text` (the same
+         *     characters), `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact
+         *     inside a restored personal span, which is restored by its span; `restorable` false for one that the edit
+         *     set cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript
+         *     client must convert them, for example with `Array.from(text)`.
+         */
+        SegmentOut: {
+            /** Category */
+            category: ("email" | "phone" | "url" | "address" | "personal" | "name") | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "text" | "replacement" | "removed";
+            /** Raw End */
+            raw_end: number;
+            /** Raw Start */
+            raw_start: number;
+            /** Replacement Index */
+            replacement_index: number | null;
+            /** Restorable */
+            restorable: boolean;
+            /** Stripped End */
+            stripped_end: number;
+            /** Stripped Start */
+            stripped_start: number;
+        };
         /** SessionOut */
         SessionOut: {
             /**
@@ -352,6 +1365,126 @@ export interface components {
             /** Username */
             username: string;
         };
+        /** SettingsOut */
+        SettingsOut: {
+            /** Payload */
+            payload: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            pending_scope: components["schemas"]["PendingScopeOut"] | null;
+            version: components["schemas"]["VersionOut"];
+        };
+        /** Skill */
+        Skill: {
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "programming_language" | "framework" | "tool" | "platform" | "method" | "domain_knowledge" | "soft_skill" | "other";
+            /** Evidence */
+            evidence: string;
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "basic" | "intermediate" | "advanced" | "expert";
+            /** Name */
+            name: string;
+            /** Years */
+            years: number | null;
+        };
+        /**
+         * SpanEditIn
+         * @description One edit of the set: `remove` with `start` and `end`, or `restore` with `replacement_index` (into the
+         *     fresh strip) or with the replacement's `start` and `end`, offsets into the raw text. Offsets are Unicode
+         *     code points, not UTF-16 code units: a JavaScript client must convert them, for example with
+         *     `Array.from(text)`.
+         */
+        SpanEditIn: {
+            /** End */
+            end?: number | null;
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "remove" | "restore";
+            /** Replacement Index */
+            replacement_index?: number | null;
+            /** Start */
+            start?: number | null;
+        };
+        /**
+         * SpanOut
+         * @description A span of the raw text: `start` and `end` are offsets into it. Offsets are Unicode code points, not
+         *     UTF-16 code units: a JavaScript client must convert them, for example with `Array.from(text)`.
+         */
+        SpanOut: {
+            /** End */
+            end: number;
+            /** Start */
+            start: number;
+        };
+        /**
+         * SpendGroupOut
+         * @description The month's tries of one model, effort and role (`effort` is `null` for a try whose call row was
+         *     purged), and what they count.
+         */
+        SpendGroupOut: {
+            /** Calls */
+            calls: number;
+            /** Counted */
+            counted: string;
+            /** Effort */
+            effort: string | null;
+            /** Model */
+            model: string;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "generate" | "revise" | "critic" | "extract_profile" | "propose_queries" | "schema_dry_run";
+        };
+        /** SpendOut */
+        SpendOut: {
+            /** Ambiguous */
+            ambiguous: string;
+            /** Billed */
+            billed: string;
+            bucket: components["schemas"]["BucketOut"];
+            /** Bulk Operation */
+            bulk_operation: null;
+            /** By Model Effort Role */
+            by_model_effort_role: components["schemas"]["SpendGroupOut"][];
+            /** C Hat */
+            c_hat: string;
+            /** Cap */
+            cap: string;
+            /** Counted */
+            counted: string;
+            /** Critic Rate 7D */
+            critic_rate_7d: string | null;
+            /** Headroom */
+            headroom: string;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+            /** Projected Critic Rate */
+            projected_critic_rate: string;
+            /** Quarantined Batch Usd */
+            quarantined_batch_usd: string;
+            /** Reserved */
+            reserved: string;
+        };
+        /** StrippedTextOut */
+        StrippedTextOut: {
+            /**
+             * Stripped Text Preview
+             * @description The rebuilt contact-stripped text, never the raw text. Offsets are Unicode code points, not UTF-16 code units: a JavaScript client must convert them, for example with Array.from(text).
+             */
+            stripped_text_preview: string;
+        };
         /**
          * SystemHealthOut
          * @description The detailed health (§17.5). Ages are seconds at the caller's `now`.
@@ -362,6 +1495,7 @@ export interface components {
          *     - `run_age_state`: see `run_age_state`.
          *     - `queue_depths`: procrastinate jobs by queue and status.
          *     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
+         *     - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
          *     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
          *     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
          */
@@ -378,6 +1512,7 @@ export interface components {
             last_run_age_s: number | null;
             /** Last Successful Run Age S */
             last_successful_run_age_s: number | null;
+            llm: components["schemas"]["LlmSpendOut"] | null;
             /** Queue Depths */
             queue_depths: {
                 [key: string]: {
@@ -400,6 +1535,104 @@ export interface components {
             };
             versions: components["schemas"]["Versions"];
         };
+        /** TargetTitle */
+        TargetTitle: {
+            /**
+             * Lang
+             * @enum {string}
+             */
+            lang: "de" | "en";
+            /** Title */
+            title: string;
+        };
+        /**
+         * TextEditsIn
+         * @description The draft's complete edit set, never a delta (plan Deviation 29): an edit left out is undone.
+         */
+        TextEditsIn: {
+            /** Span Edits */
+            span_edits: components["schemas"]["SpanEditIn"][];
+        };
+        /**
+         * TextEditsOut
+         * @description The draft's stored edit set (ruling R14-1): the replacements put back and the spans removed, as spans
+         *     of the raw text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it.
+         */
+        TextEditsOut: {
+            /** Removed */
+            removed: components["schemas"]["SpanOut"][];
+            /** Restored */
+            restored: components["schemas"]["SpanOut"][];
+        };
+        /** UnsupportedUrlOut */
+        UnsupportedUrlOut: {
+            /**
+             * Unsupported
+             * @enum {string}
+             */
+            unsupported: "workable" | "unsupported_pattern" | "bad_slug" | "not_a_url";
+        };
+        /**
+         * UserEntered
+         * @description Entered by the user in the review form, never by the LLM (§12.4, §12.5).
+         */
+        UserEntered: {
+            /** Security Clearances */
+            security_clearances?: components["schemas"]["SecurityClearance"][];
+            /**
+             * Work Authorization De
+             * @default unspecified
+             * @enum {string}
+             */
+            work_authorization_de: "authorized" | "requires_sponsorship" | "unspecified";
+        };
+        /**
+         * ValidationIssueOut
+         * @description An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal. The
+         *     code `schema_mismatch` (path `""`, no proposal) says that the stored profile no longer matches the profile
+         *     schema and is not shown.
+         */
+        ValidationIssueOut: {
+            /** Code */
+            code: components["schemas"]["IssueCode"] | "schema_mismatch";
+            /** Message */
+            message: string;
+            /** Path */
+            path: string;
+            proposal?: components["schemas"]["JsonValue"];
+        };
+        /** ValidationIssuesOut */
+        ValidationIssuesOut: {
+            /** Validation Issues */
+            validation_issues: components["schemas"]["ValidationIssueOut"][];
+        };
+        /** VersionDetailOut */
+        VersionDetailOut: {
+            /** Diff */
+            diff: components["schemas"]["DiffEntryOut"][];
+            /** Payload */
+            payload: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            version: components["schemas"]["VersionOut"];
+        };
+        /**
+         * VersionOut
+         * @description A settings version as the lists show it; `created_at` in UTC, `effect_classes` sorted.
+         */
+        VersionOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Effect Classes */
+            effect_classes: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
+            /** Id */
+            id: number;
+            /** Version No */
+            version_no: number;
+        };
         /** Versions */
         Versions: {
             /** App */
@@ -416,6 +1649,60 @@ export interface components {
             python: string;
             /** Sqlalchemy */
             sqlalchemy: string;
+        };
+        /** VersionsPageOut */
+        VersionsPageOut: {
+            /** Items */
+            items: components["schemas"]["VersionOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
+         * WarningOut
+         * @description A warning a save must acknowledge by its `code` (§13.2), with its details.
+         */
+        WarningOut: {
+            /** Code */
+            code: string;
+            /**
+             * Detail
+             * @description The warning's details. In `adzuna_rotation`, `cadence_days` is days or null; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed.
+             */
+            detail: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+        };
+        /** WatchlistCreatedOut */
+        WatchlistCreatedOut: {
+            /** Id */
+            id: number;
+            /**
+             * Validation Status
+             * @constant
+             */
+            validation_status: "unvalidated";
+        };
+        /** WatchlistIn */
+        WatchlistIn: {
+            /**
+             * Ats Type
+             * @enum {string}
+             */
+            ats_type: "greenhouse" | "lever" | "ashby" | "personio" | "recruitee" | "smartrecruiters";
+            /**
+             * Board Slug
+             * @description Letters, digits, `.`, `_` and `-`, 1 to 100 characters, starting with a letter or digit, taken as written
+             */
+            board_slug: string;
+            /** Display Name */
+            display_name: string;
+            /** Input Url */
+            input_url?: string | null;
+            /**
+             * Lever Region
+             * @description Required for Lever, refused otherwise
+             */
+            lever_region?: ("global" | "eu") | null;
         };
     };
     responses: never;
@@ -457,6 +1744,15 @@ export interface operations {
             };
             /** @description Origin check failed (`csrf_failed`) */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -567,6 +1863,1228 @@ export interface operations {
             };
         };
     };
+    search_places_api_geo_places_get: {
+        parameters: {
+            query?: {
+                /** @description A place name or a postal code; empty lists the largest */
+                q?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaceOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `q` over 100 characters or with a NUL, or a `limit` outside 1 to 25 */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_profile_api_profile_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProfileListOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    upload_cv_api_profile_cv_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /**
+                     * Format: binary
+                     * @description A PDF or DOCX, ≤ 10 MiB
+                     */
+                    file: string;
+                    /**
+                     * @description Send the original PDF to the model instead of its text (§12.7)
+                     * @default false
+                     */
+                    native_pdf_opt_in?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DraftCreatedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A draft is being extracted (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The file is larger than 10 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A malformed form (`validation_failed`) or a refused file (`upload_rejected`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    paste_cv_api_profile_cv_text_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CvTextIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DraftCreatedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A draft is being extracted (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description An invalid body (`validation_failed`) or a refused text (`upload_rejected`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_draft_api_profile_drafts__draft_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DraftOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    save_draft_api_profile_drafts__draft_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DraftIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ValidationIssuesOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not ready (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    confirm_draft_api_profile_drafts__draft_id__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfirmIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfirmOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not ready or its stored profile no longer fits the schema (`conflict_state`), an identical profile version is being purged (`profile_purge_in_progress`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, a blocking validation issue, a contact in the user-entered values or the re-score not acknowledged (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    discard_draft_api_profile_drafts__draft_id__discard_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not in text review, ready or failed (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_rescore_estimate_api_profile_drafts__draft_id__rescore_estimate_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RescoreEstimateOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    retry_draft_api_profile_drafts__draft_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetryIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractingOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not failed, the mode is not admitted for it or its input was purged (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    edit_text_api_profile_drafts__draft_id__text_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TextEditsIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StrippedTextOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not in text review or ready, or has no text (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body or edit set (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    approve_text_api_profile_drafts__draft_id__text_review_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a profile draft */
+                draft_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractingOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such draft (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The draft is not in text review (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    request_query_proposal_api_profile_query_proposals_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProposalCreatedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No active profile (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_query_proposal_api_profile_query_proposals__proposal_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a query proposal */
+                proposal_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProposalOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such proposal (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    add_query_api_queries_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A live query has this text (`conflict_state`, with its `query_id`), or the proposal is not ready (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, text or proposal (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    edit_query_api_queries__query_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a live query */
+                query_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryEditIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such live query (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A live query has the new text (`conflict_state`, with its `query_id`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body or text, or settings the swap cannot save (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     run_now_api_runs_post: {
         parameters: {
             query?: never;
@@ -627,7 +3145,387 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body, or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_settings_api_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    save_settings_version_api_settings_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SaveOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The base is not the active version (`stale_base_version`), the eval gate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body or settings, an unacknowledged warning (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    settings_dry_run_api_settings_dry_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DryRunIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DryRunOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    retry_scope_apply_api_settings_scope_retry_apply_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryApplyOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The active settings version's scope is already the active scope, or an `apply_scope` operation is live (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_versions_api_settings_versions_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_version_api_settings_versions__version_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a settings version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionDetailOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such settings version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -667,6 +3565,257 @@ export interface operations {
             };
             /** @description No valid session (`unauthenticated`) */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_spend_api_system_spend_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    add_company_api_watchlist_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WatchlistIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchlistCreatedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The board is already on the watchlist (`conflict_state`, with the company's `watchlist_company_id`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, or settings the new entry cannot be saved in (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    parse_url_api_watchlist_parse_url_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ParseUrlIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ParsedUrlOut"] | components["schemas"]["UnsupportedUrlOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    remove_company_api_watchlist__company_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a watchlist company */
+                company_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such watchlist company (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid id (`validation_failed`) */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

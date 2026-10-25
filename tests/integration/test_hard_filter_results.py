@@ -16,6 +16,7 @@ from jobhunter.run_settings import ScopeSettings, SeniorityRange
 from jobhunter.scoring import filters
 from jobhunter.scoring.filters import DetFacts, HardFilterResult
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
+from jobhunter.settings import scope_apply
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.worker import main as worker_main
@@ -27,6 +28,7 @@ from tests.support.facts import BERLIN, HAMBURG, facts, load_facts, scope
 from tests.support.procs import await_until
 from tests.support.quota import seeded_payload
 from tests.support.reconcile import assert_fence_rule
+from tests.support.settings import berlin, held_save, pending_scope_id
 
 pytestmark = pytest.mark.integration
 
@@ -101,6 +103,30 @@ async def add_pending_scope(engine: AsyncEngine, **changes: Any) -> int:
     return pending
 
 
+async def test_a_result_written_under_algorithm_version_1_is_stale(
+    engine, current_epoch, queue_app, job_factory
+) -> None:
+    """Final review FR-16: the job side's fixed-point company key and industry (FR-9) changed the hard
+    filter's result function, so `DET_ALGORITHM_VERSION` is "2" (§11.11). A row written under "1" is stale:
+    the scope apply counts its job incomplete, and the completeness reconciler recomputes it."""
+    assert DET_ALGORITHM_VERSION == "2"
+    job = (await job_factory(native_id="v1")).job_id
+    scope_id = await active_scope_id(engine)
+    async with engine.begin() as conn:
+        await filters.write_result(
+            conn, job, scope_id, HardFilterResult(True, ()), inputs_hash=await job_hash(engine, job)
+        )
+        await conn.execute(sa.text("UPDATE hard_filter_results SET det_algorithm_version = '1'"))
+    async with engine.connect() as conn:
+        assert await scope_apply.incomplete_jobs(conn, scope_id) == 1
+    reconcile = r.REGISTRY["hard_filter_completeness"][1]
+    assert await reconcile(ctx(engine, queue_app)) == 1
+    assert (await row(engine, job, scope_id)).det_algorithm_version == "2"
+    async with engine.connect() as conn:
+        assert await scope_apply.incomplete_jobs(conn, scope_id) == 0
+    assert await reconcile(ctx(engine, queue_app)) == 0
+
+
 async def test_write_recompute_and_reconciler(engine, current_epoch, queue_app, job_factory) -> None:
     job = (await job_factory(native_id="a")).job_id
     scope_id = await active_scope_id(engine)
@@ -112,7 +138,7 @@ async def test_write_recompute_and_reconciler(engine, current_epoch, queue_app, 
         True,
         [],
         h1,
-        "1",
+        "2",
     )
 
     # The job's det facts change (its hash moves): the reconciler recomputes the row from the facts now.
@@ -202,6 +228,47 @@ async def test_active_scopes_reads_the_active_and_the_pending_scope_under_share(
             await other.execute(
                 sa.text("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE NOWAIT")
             )  # a reader can
+
+
+async def test_active_scopes_queued_behind_a_settings_save_reads_the_pending_scope_it_sets(
+    engine, logged_in_client, current_epoch, job_factory
+) -> None:
+    """Task 22 fix round 2: the statement waits at `active_config` while a save is open. Joined to the lock,
+    it kept only the scope rows its own snapshot could see and returned the active scope alone, so the new
+    pending scope's results were not written; now the pointers are read after the wait and the scopes by
+    their ids."""
+    job = (await job_factory(native_id="a")).job_id
+    active = await active_scope_id(engine)
+
+    def another_scope(payload: dict[str, Any]) -> None:
+        payload["scope"]["locations"] = [berlin(30)]
+
+    async def allow(conn: AsyncConnection) -> None:
+        return None
+
+    async def recompute() -> dict[int, ScopeSettings]:
+        async with engine.begin() as conn:
+            scopes = await filters.active_scopes(conn)
+            await filters.recompute_stale(conn, scopes, guard=allow)
+            return scopes
+
+    async with held_save(engine, logged_in_client, another_scope) as held:
+        task = asyncio.create_task(recompute())
+        await asyncio.sleep(0.4)
+        assert not task.done()
+        await held.commit()
+    scopes = await asyncio.wait_for(task, 10)
+    pending = await pending_scope_id(engine)
+    assert pending is not None and pending != active
+    assert sorted(scopes) == sorted([active, pending])
+    async with engine.connect() as conn:
+        written = (
+            await conn.execute(
+                sa.text("SELECT scope_version_id FROM hard_filter_results WHERE job_id = :j ORDER BY 1"),
+                {"j": job},
+            )
+        ).scalars()
+        assert sorted(written) == sorted([active, pending])  # the pending scope's result is written
 
 
 async def set_description(engine: AsyncEngine, job: int, text: str) -> None:

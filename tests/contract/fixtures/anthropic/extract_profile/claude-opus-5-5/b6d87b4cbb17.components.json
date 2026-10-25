@@ -1,0 +1,12 @@
+{
+  "case": "task13_synthetic_cv",
+  "model": "claude-opus-5-5",
+  "purpose": "extract_profile",
+  "source": "synthetic",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "input_tokens": 2600,
+    "output_tokens": 900
+  }
+}

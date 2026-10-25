@@ -157,3 +157,104 @@ def test_registry_imports_without_a_managed_settable_clash() -> None:
             frozenset({("pending", "linked")}),
             settable=frozenset({"disposed_at"}),
         )
+
+
+def test_m2_machines() -> None:
+    # §7.16.8, verbatim; the draft's owner columns are the two the extraction result is guarded by (Task 13)
+    drafts = TRANSITIONS["profile_drafts"]
+    assert drafts.allowed == {
+        ("uploaded", "extracting_text"),
+        ("uploaded", "extracting_profile"),
+        ("extracting_text", "text_review"),
+        ("extracting_text", "failed"),
+        ("text_review", "extracting_profile"),
+        ("extracting_profile", "ready"),
+        ("extracting_profile", "failed"),
+        ("ready", "text_review"),
+        ("ready", "confirmed"),
+        ("text_review", "discarded"),
+        ("ready", "discarded"),
+        ("failed", "discarded"),
+        ("failed", "extracting_profile"),
+    }
+    assert ("ready", "ready") not in drafts.allowed  # field edits are a plain UPDATE, not a transition
+    assert (drafts.state_col, drafts.reason_col) == ("status", "status_reason")
+    assert drafts.changed_at == dict.fromkeys(
+        ("extracting_text", "text_review", "extracting_profile", "ready", "failed", "confirmed", "discarded"),
+        "status_changed_at",
+    )
+    assert drafts.owner_cols == {"reviewed_text_sha256", "native_pdf"}
+    assert drafts.settable == {
+        "reviewed_text",
+        "reviewed_text_sha256",
+        "native_pdf",
+        "transmitted_text_sha256",
+        "draft_json",
+        "validation_issues",
+        "failure_code",
+        "llm_call_id",
+        "confirmed_profile_version_id",
+        "confirm_response",
+        "content_purged_at",
+        "updated_at",
+    }
+
+    # §7.16.7, plus the two edges out of `ambiguous` that a late online settlement uses (Deviation 24)
+    ledger = TRANSITIONS["llm_spend_ledger"]
+    assert ledger.allowed == {
+        ("reserved", "dispatched"),
+        ("reserved", "not_billed"),
+        ("dispatched", "billed"),
+        ("dispatched", "not_billed"),
+        ("dispatched", "ambiguous"),
+        ("ambiguous", "billed"),
+        ("ambiguous", "not_billed"),
+    }
+    assert (ledger.state_col, ledger.reason_col) == ("state", "evidence")
+    assert ledger.changed_at == {
+        "dispatched": "dispatched_at",
+        "billed": "settled_at",
+        "not_billed": "settled_at",
+        "ambiguous": "settled_at",
+    }
+    assert ledger.settable == {"settled_usd"}
+
+    # §7.16 has no `llm_calls` machine: the call follows its ledger entry
+    calls = TRANSITIONS["llm_calls"]
+    assert calls.allowed == {
+        ("reserved", "dispatched"),
+        ("reserved", "cancelled"),
+        ("dispatched", "completed"),
+        ("dispatched", "error"),
+        ("dispatched", "ambiguous"),
+        ("ambiguous", "completed"),
+        ("ambiguous", "error"),
+    }
+    assert calls.state_col == "status"
+    assert calls.settable == {
+        "model_served",
+        "http_status",
+        "error_code",
+        "stop_reason",
+        "refusal_category",
+        "provider_request_id",
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+        "cost_usd",
+        "output_json",
+        "first_event_at",
+        "ended_at",
+    }
+
+    proposals = TRANSITIONS["query_proposals"]
+    assert proposals.allowed == {("running", "ready"), ("running", "failed")}
+    assert proposals.state_col == "status"
+    assert proposals.settable == {"items", "llm_call_id"}
+
+    runs = TRANSITIONS["eval_runs"]
+    assert runs.allowed == {("running", "completed"), ("running", "failed")}
+    assert runs.state_col == "status"
+    assert runs.changed_at == {"completed": "finished_at", "failed": "finished_at"}
+    assert runs.settable == {"passed", "metrics", "cost_usd"}

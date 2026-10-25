@@ -4,15 +4,31 @@ A reconciler fenced out by the worker's own fence lets it propagate: `run_reconc
 that reconciler (no count, no `reconciler.failed` resolve, no later reconciler) and the superseded worker
 requests its stop. A `FencedOut` of another owner keeps the reconciler's own handling (here: its pass ends
 with 0).
+
+M2 Task 18 adds `run_reconciler(name, engine, *, now, epoch)`: one pass of the registered reconciler `name`
+(its module must be imported), with a context of `engine`, the process's task app (`tasks.task_app()`, not
+opened: enough for `defer_in_tx`; a reconciler that queries the job manager, `stalled_jobs`, needs the open
+app of the `queue_app` fixture) and the given clock and epoch. It returns the pass's count.
 """
 
 import dataclasses
+from datetime import datetime
 from types import ModuleType
 
 import pytest
 from jobhunter.errors import FencedOut
 from jobhunter.worker import reconcilers
 from jobhunter.worker.reconcilers import Cadence, ReconcileContext
+from jobhunter.worker.tasks import defer_in_tx, task_app
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+async def run_reconciler(name: str, engine: AsyncEngine, *, now: datetime, epoch: int) -> int:
+    """One pass of the registered reconciler `name` at `now` as worker `epoch` (module docstring)."""
+    _, fn = reconcilers.REGISTRY[name]
+    return await fn(
+        ReconcileContext(engine=engine, queue=task_app(), defer=defer_in_tx, now=now, epoch=epoch)
+    )
 
 
 async def assert_fence_rule(

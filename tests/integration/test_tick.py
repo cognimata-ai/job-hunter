@@ -84,6 +84,60 @@ async def test_overlap_records_skipped_overlap(engine, queue_app) -> None:
     ]
 
 
+_RUN_VERSIONS = sa.text(
+    "SELECT r.status, r.trigger, r.settings_version_id = a.settings_version_id "
+    "AND r.scope_version_id = a.scope_version_id AS same_versions, r.llm_tuple_id "
+    "FROM runs r, active_config a ORDER BY r.id"
+)
+
+
+async def run_versions(engine) -> list[tuple[object, ...]]:
+    async with engine.connect() as c:
+        return [tuple(r) for r in await c.execute(_RUN_VERSIONS)]
+
+
+async def test_every_run_a_tick_records_carries_the_active_llm_tuple(engine, queue_app) -> None:
+    """Task 23: a run records the LLM tuple active at its insert (node 9 reads the run's column), with the
+    settings and scope versions of the same `active_config` read: the missed, the queued and the
+    skipped-overlap rows alike. Before any profile is active, the tuple is NULL."""
+    from tests.support.settings import activate_profile
+
+    await schedule(engine, interval=21600, cursor=A)
+    await tick(engine, A + timedelta(hours=6))
+    assert await run_versions(engine) == [("queued", "schedule", True, None)]
+    async with engine.begin() as c:
+        await c.execute(sa.text("UPDATE runs SET status = 'cancelled', finished_at = now()"))
+    _, tuple_id = await activate_profile(engine)
+    await tick(engine, A + timedelta(hours=18, minutes=1))  # one slot missed, the latest queued
+    await tick(engine, A + timedelta(hours=24))  # overlaps the queued run
+    assert await run_versions(engine) == [
+        ("cancelled", "schedule", True, None),
+        ("missed", "schedule", True, tuple_id),
+        ("queued", "schedule", True, tuple_id),
+        ("skipped_overlap", "schedule", True, tuple_id),
+    ]
+
+
+async def test_a_manual_run_carries_the_active_llm_tuple(engine, queue_app) -> None:
+    """Task 23: `request_manual_run` inserts through `insert_active_collect` with the tuple of its own
+    `active_config` read."""
+    from jobhunter.worker import runs as runs_module
+
+    from tests.support.settings import activate_profile
+
+    _, tuple_id = await activate_profile(engine)
+    async with engine.begin() as c:
+        row, created = await runs_module.request_manual_run(c, include_paid=False, defer=defer_in_tx)
+    assert created
+    assert await run_versions(engine) == [("queued", "manual", True, tuple_id)]
+    assert row.id == (await runs_ids(engine))[0]
+
+
+async def runs_ids(engine) -> list[int]:
+    async with engine.connect() as c:
+        return [int(i) for i in (await c.execute(sa.text("SELECT id FROM runs ORDER BY id"))).scalars()]
+
+
 async def test_downtime_records_missed_and_catch_up(engine, queue_app) -> None:
     await schedule(engine, interval=21600, cursor=A)
     assert (await tick(engine, A + timedelta(hours=18, minutes=30))).missed == 2
@@ -214,7 +268,12 @@ async def test_insert_active_collect_classifies_each_conflict(engine, queue_app,
         settings_id, scope_id = (
             await c.execute(sa.text("SELECT settings_version_id, scope_version_id FROM active_config"))
         ).one()
-        ids = {"include_paid": True, "settings_version_id": settings_id, "scope_version_id": scope_id}
+        ids = {
+            "include_paid": True,
+            "settings_version_id": settings_id,
+            "scope_version_id": scope_id,
+            "llm_tuple_id": None,
+        }
         await c.execute(
             sa.text(
                 "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, "
@@ -346,8 +405,9 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     order: list[str] = []
     seen: list[reconcilers.ReconcileContext] = []
 
-    async def retention_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def retention_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append(f"retention@{epoch}")
+        assert cv_store is runtime.cv_store  # M2 Task 23: the worker's CV store, whose files two rules delete
 
     async def probe(ctx: reconcilers.ReconcileContext) -> int:
         order.append("daily")
@@ -359,7 +419,13 @@ async def test_the_retention_daily_task_runs_the_daily_reconcilers_after_retenti
     monkeypatch.setattr(retention, "run_retention_daily", retention_pass)
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        saver=object(),
+        cv_store=object(),
+        epoch=3,
+        embedder=None,
+        shutdown=ShutdownState(),
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)
@@ -377,7 +443,7 @@ async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconciler
 
     order: list[str] = []
 
-    async def fenced_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def fenced_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append("retention")
         raise FencedOut(owner="worker_epoch")
 
@@ -389,7 +455,13 @@ async def test_a_fenced_retention_pass_ends_the_daily_task_before_its_reconciler
     reconcilers.reconciler("probe", "daily")(probe)
     monkeypatch.setattr(retention, "run_retention_daily", fenced_pass)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, saver=object(), epoch=3, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        saver=object(),
+        cv_store=object(),
+        epoch=3,
+        embedder=None,
+        shutdown=ShutdownState(),
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.retention_daily(context, timestamp=0)  # returns: the job ends quietly
@@ -407,7 +479,7 @@ async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops
 
     order: list[str] = []
 
-    async def fenced_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def fenced_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append("retention")
         raise FencedOut(owner="purge_fence")
 
@@ -422,6 +494,7 @@ async def test_a_fence_of_another_owner_fails_the_retention_pass_and_never_stops
         engine=engine,
         queue=queue_app,
         saver=object(),
+        cv_store=object(),
         epoch=current_epoch,  # the daily cadence's own fence admits it
         embedder=None,
         shutdown=ShutdownState(),
@@ -464,7 +537,7 @@ async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
 
     order: list[str] = []
 
-    async def failing_pass(engine_, queue, saver, *, now: datetime, epoch: int) -> None:
+    async def failing_pass(engine_, queue, saver, *, cv_store, now: datetime, epoch: int) -> None:
         order.append("retention")
         raise RuntimeError("a detail that must not be logged")
 
@@ -479,6 +552,7 @@ async def test_a_retention_pass_that_raises_still_runs_the_daily_reconcilers(
         engine=engine,
         queue=queue_app,
         saver=object(),
+        cv_store=object(),
         epoch=current_epoch,
         embedder=None,
         shutdown=ShutdownState(),

@@ -1,0 +1,111 @@
+# The live schema dry-run (spec §10.11; plan Task 7): one minimal request per structured-output schema and
+# configured model of the seeded settings, through the real gateway, recorded as an eval_runs row of a throwaway
+# database. Manual only: it spends a few cents of Anthropic credit (spike V4's four messages settled $0.049816);
+# the informational `minimum` probe goes to the free counting endpoint. For prompt-schema version 1 it ends
+# red: the API rejects the §11.5 generator schema (docs/spikes/V4.md, plan Deviation 33), and the command exits
+# non-zero while a gating case fails.
+#
+# Cost note. The worst case is $1.522200, the gateway's own reservations (llm/pricing.py, 2,000 output tokens,
+# PROMPT_OVERHEAD_TOKENS = 2,640): one try reserves $0.045955 (generator on claude-sonnet-5-5), $0.071305
+# (critic), $0.072670 (profile) and $0.063770 (queries, the three on claude-opus-5-5), $0.253700 for one try
+# per case, and a case is at most 6 paid tries: 3 transport tries in each of 2 max_tokens stages. Both stages
+# are 2,000 tokens (max_tokens_retry = max_tokens), so a first-stage max_tokens stop sends a second, identical
+# paid try rather than a larger one (llm/schema_dry_run.py). tests/unit/test_cli_schema_dry_run.py recomputes
+# these figures from pricing and fails when this note is stale.
+#
+# The job starts PostgreSQL from the digest in deploy/images.lock with the repository's init script and
+# throwaway role passwords, runs `jobhunter migrate`, writes the repository secret
+# ANTHROPIC_API_KEY_SCHEMA_DRY_RUN to the worker's `anthropic_key` secret file and runs
+# `jobhunter schema-dry-run --live`. Its output is the case table only: the migration's output and the logs are
+# not printed, and the command never prints content or the key. The secret files and the database are removed
+# at the end, whatever the outcome.
+#
+# Supply chain as in ci.yml: actions pinned to full commit SHAs (the release tag is the trailing comment), uv to
+# an exact version; the token is read-only and the checkout does not keep it.
+name: Schema dry-run (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schema-dry-run
+  cancel-in-progress: false
+
+jobs:
+  schema-dry-run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      JOBHUNTER_ENV: dev
+      JOBHUNTER_DB_HOST: 127.0.0.1
+      JOBHUNTER_DB_PORT: "5432"
+      JOBHUNTER_DB_NAME: jobhunter
+      JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      # Throwaway values: the role passwords exist only for this job's database. The server's copies are
+      # readable by the image's postgres user; each application role gets its own directory with exactly its
+      # secrets, not readable by others (the startup assertions refuse anything else).
+      - name: Secret files
+        run: |
+          umask 077
+          dir="$RUNNER_TEMP/secrets"
+          mkdir -p "$dir/server" "$dir/migrate" "$dir/worker"
+          for name in pg_bootstrap db_app db_migrator db_backup db_restore; do
+            openssl rand -hex 24 > "$dir/server/$name"
+          done
+          chmod 0755 "$dir" "$dir/server"
+          chmod 0444 "$dir"/server/*
+          cp "$dir/server/db_migrator" "$dir/migrate/db_migrator"
+          cp "$dir/server/db_app" "$dir/worker/db_app"
+          openssl rand -base64 32 > "$dir/worker/data_key"
+          chmod 0600 "$dir"/migrate/* "$dir"/worker/*
+      - name: Throwaway PostgreSQL
+        run: |
+          docker run -d --name jh-schema-dry-run-pg -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_USER=jobhunter_bootstrap -e POSTGRES_DB=jobhunter \
+            -e POSTGRES_PASSWORD_FILE=/run/secrets/pg_bootstrap \
+            -v "$RUNNER_TEMP/secrets/server:/run/secrets:ro" \
+            -v "$PWD/deploy/postgres/init:/docker-entrypoint-initdb.d:ro" \
+            "$(grep ^pgvector= deploy/images.lock | cut -d= -f2)" > /dev/null
+          # Over TCP: the init phase's temporary server listens on the Unix socket only, so this answers once
+          # the init scripts have run and the final server is up.
+          for _ in $(seq 1 90); do
+            if docker exec jh-schema-dry-run-pg pg_isready -q -h 127.0.0.1 -U jobhunter_bootstrap -d jobhunter; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+      - name: Migrate
+        env:
+          JOBHUNTER_SECRETS_DIR: ${{ runner.temp }}/secrets/migrate
+        run: uv run jobhunter migrate > /dev/null 2>&1
+      - name: Schema dry-run (live)
+        env:
+          JOBHUNTER_SECRETS_DIR: ${{ runner.temp }}/secrets/worker
+          SCHEMA_DRY_RUN_KEY: ${{ secrets.ANTHROPIC_API_KEY_SCHEMA_DRY_RUN }}
+        run: |
+          umask 077
+          if [ -z "$SCHEMA_DRY_RUN_KEY" ]; then
+            echo "the repository secret ANTHROPIC_API_KEY_SCHEMA_DRY_RUN is not set" >&2
+            exit 2
+          fi
+          printf '%s' "$SCHEMA_DRY_RUN_KEY" > "$JOBHUNTER_SECRETS_DIR/anthropic_key"
+          unset SCHEMA_DRY_RUN_KEY
+          uv run jobhunter schema-dry-run --live 2> /dev/null
+      - name: Remove the secret files and the database
+        if: always()
+        run: |
+          docker rm -f -v jh-schema-dry-run-pg > /dev/null 2>&1 || true
+          rm -rf "$RUNNER_TEMP/secrets"

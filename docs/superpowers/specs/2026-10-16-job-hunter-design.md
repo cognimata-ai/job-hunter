@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Approved** — revision 3.3. Approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Audit trail: `docs/council/` |
+| Status | **Approved** — revision 3.4. Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Revision 3.4 (2026-10-21, the user's decision after spike V19): the default `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured prompt overhead (§6.9.1). Audit trail: `docs/council/` |
 | Date | 2026-10-16 |
 | Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, the user's cost decision of revision 2 (§2.1 U14), and the chair's decisions of revision 3 (§2.4) |
 | Scope | One deployment for one user, German job market |
@@ -1153,7 +1153,7 @@ Paid LLM spend uses the same reserve-before-every-attempt discipline as the quot
   | `ambiguous → not_billed(batch_item_errored \| canceled \| expired)` (an item of a batch that was found, provider evidence) | `− r` | `+ r` |
 
   The heavy reconciler (§17.4) recomputes the counters from the ledger every 10 min. Any difference raises the critical alert `llm.budget_counter_drift` and the counters are corrected from the ledger under the lock.
-- **Overrun buffer** (chair decision C1, §2.4). `overrun_buffer_usd` (settings `llm.overrun_buffer_usd`, default $2.00) is part of the cap that is **never admitted for spending**. It absorbs the residual estimation error of the input bound (§10.7). Settings validation requires `overrun_buffer_usd ≥ max_concurrent_llm_calls × PROMPT_OVERHEAD_TOKENS × the highest input price per token`, where `max_concurrent_llm_calls` is 3 score calls + 2 auxiliary calls + `batch_max_items` batch items (at batch prices). With 1,000 batch items and a measured overhead of 1,000 tokens that is about $1.28, so the $2.00 default holds; spike V19 sets the real overhead.
+- **Overrun buffer** (chair decision C1, §2.4). `overrun_buffer_usd` (settings `llm.overrun_buffer_usd`, default $2.00) is part of the cap that is **never admitted for spending**. It absorbs the residual estimation error of the input bound (§10.7). Settings validation requires `overrun_buffer_usd ≥ max_concurrent_llm_calls × PROMPT_OVERHEAD_TOKENS × the highest input price per token`, where `max_concurrent_llm_calls` is 3 score calls + 2 auxiliary calls + `batch_max_items` batch items (at batch prices). Spike V19 measured the overhead at 2,640 tokens per request (`docs/spikes/V19.md`). With the default 500 batch items that is about $1.72 (5 online slots × 2,640 × $5.00 + 500 × 2,640 × $1.25, per MTok), so the $2.00 default holds; with 1,000 items it would be about $3.37 (revision 3.4).
 - **Admission against the hard cap.** With `A = cap_usd − overrun_buffer_usd` (the admissible budget) and `reserve_frac = nonscoring_reserve_pct / 100` (default 0.05):
   - a non-scoring reservation is admitted iff `counted_usd + r ≤ A`;
   - a scoring reservation (including batches and follow-ups) is admitted iff `counted_usd + r ≤ A − max(0, A × reserve_frac − nonscoring_counted_usd)`. Scoring can never use the unspent part of the non-scoring reserve.
@@ -3940,7 +3940,7 @@ The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_
 
 **Size, budget and order.**
 - Order: availability `active` first, then the previous tuple's `score_mid` descending, then similarity descending.
-- The batch is cut to at most `batch_max_items` (1,000, settings) and then to the largest `n` whose worst-case reservation **plus its expected follow-up allocation** fits the remaining batch allocation (§6.9.3). The allocation (40% by default) bounds the batch items and their expected follow-ups; it is not a limit on everything the re-score spends.
+- The batch is cut to at most `batch_max_items` (500, settings) and then to the largest `n` whose worst-case reservation **plus its expected follow-up allocation** fits the remaining batch allocation (§6.9.3). The allocation (40% by default) bounds the batch items and their expected follow-ups; it is not a limit on everything the re-score spends.
 - If fewer than `batch_min_targets` (200, settings) targets remain after pruning, no batch is submitted. The targets stay `pending` and are scored by online admission at the monthly pace.
 - **Follow-on submissions.** When a submission ends (`reconciled`, `released`, `submit_rejected` or `abandoned`), the worker inserts the next `batch_submit` operation for the active bulk operation. A released submission triggers its follow-on at the release, never again when it is later reconciled. It is sized again from the remaining allocation, so repeated submissions never exceed it in total (§6.9.3).
 
@@ -4860,7 +4860,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `scoring.min_cycle_targets` | int, 1–100 | `10` | budget |
 | | `scoring.batch_bulk_rescore` | bool | `true` | budget |
 | | `scoring.batch_min_targets` | int, 200–100,000 | `200` | budget |
-| | `scoring.batch_max_items` | int, 200–10,000 | `1,000` | budget |
+| | `scoring.batch_max_items` | int, 200–10,000 | `500` | budget |
 | | `scoring.bulk_rescore_max_budget_share` | decimal, 0.1–1.0 | `0.4` | budget |
 | Retention | `retention.score_history_months` | int, 1–36 | `12` | none |
 | Notifications | `notifications.push_min_severity` | `warn \| critical` | `warn` | none |

@@ -1,8 +1,17 @@
 import psycopg
 import pytest
+import sqlalchemy as sa
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE
 
 from tests.support.fixtures import reset_database
+from tests.support.m2 import (
+    digest,
+    insert_eval_run,
+    insert_llm_call,
+    insert_profile_chain,
+    insert_proposal,
+    insert_vector,
+)
 from tests.support.pg import MANUAL_RUN_SQL, pg_one, pg_rows
 
 pytestmark = pytest.mark.integration
@@ -76,3 +85,59 @@ def test_a_leaked_lock_fails_the_reset_instead_of_hanging_it(migrated) -> None:
             )  # short only to fail fast; the lock is never released
         assert blocked.value.sqlstate == LOCK_NOT_AVAILABLE
     reset_database(migrated)  # the lock is gone: the reset works again
+
+
+# Every column of the one `active_config` row.
+ACTIVE_CONFIG = (
+    "SELECT id, settings_version_id, scope_version_id, pending_scope_version_id, profile_version_id, "
+    "rubric_version_id, prompt_schema_version_id, model_policy_id, execution_config_id, "
+    "evaluation_policy_id, llm_tuple_id FROM active_config"
+)
+M2_COUNTS = (
+    "SELECT (SELECT count(*) FROM cv_files), (SELECT count(*) FROM profile_drafts), "
+    "(SELECT count(*) FROM profile_versions), (SELECT count(*) FROM llm_tuples), "
+    "(SELECT count(*) FROM query_proposals), (SELECT count(*) FROM profile_vectors), "
+    "(SELECT count(*) FROM llm_budget), (SELECT count(*) FROM llm_spend_ledger), "
+    "(SELECT count(*) FROM llm_calls), (SELECT count(*) FROM eval_runs)"
+)
+TEST_ROWS = (
+    "SELECT (SELECT count(*) FROM rubric_versions WHERE content_hash = %s), "
+    "(SELECT count(*) FROM prompt_schema_versions WHERE prompt_schema_hash = %s)"
+)
+
+
+async def test_two_resets_keep_active_config(engine, migrated) -> None:
+    """`TRUNCATE ... CASCADE` of a table `active_config` reaches through its foreign keys would empty
+    `active_config` itself: the M2 tables are deleted instead, and the pointers are restored first."""
+    seeded = pg_one(migrated, "migrator", ACTIVE_CONFIG)
+    assert seeded is not None and pg_one(migrated, "migrator", M2_COUNTS) == (0,) * 10
+    async with engine.begin() as c:
+        chain = await insert_profile_chain(c)
+        eval_run = await insert_eval_run(c)
+        _, call = await insert_llm_call(c, draft_id=chain.draft_id, eval_run_id=eval_run)
+        proposal = await insert_proposal(c, chain.profile_version_id)
+        await insert_vector(c, chain.profile_version_id)
+        await c.execute(sa.text("UPDATE profile_drafts SET llm_call_id = :c"), {"c": call})
+        await c.execute(
+            sa.text("UPDATE query_proposals SET llm_call_id = :c WHERE id = :p"), {"c": call, "p": proposal}
+        )
+        await c.execute(
+            sa.text(
+                "UPDATE active_config SET profile_version_id = :p, llm_tuple_id = :t, "
+                "rubric_version_id = :r, prompt_schema_version_id = :s"
+            ),
+            {
+                "p": chain.profile_version_id,
+                "t": chain.llm_tuple_id,
+                "r": chain.rubric_version_id,
+                "s": chain.prompt_schema_version_id,
+            },
+        )
+    assert pg_one(migrated, "migrator", M2_COUNTS) == (1,) * 10
+    assert pg_one(migrated, "migrator", ACTIVE_CONFIG) != seeded
+
+    for _ in range(2):  # the second reset meets the state the first one left
+        reset_database(migrated)
+        assert pg_rows(migrated, "migrator", ACTIVE_CONFIG) == [seeded]
+        assert pg_one(migrated, "migrator", M2_COUNTS) == (0,) * 10
+        assert pg_one(migrated, "migrator", TEST_ROWS, digest(1), digest(1)) == (0, 0)

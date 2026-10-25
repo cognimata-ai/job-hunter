@@ -1,5 +1,6 @@
 """FastAPI dependencies that read the app state and the request state the edge set."""
 
+import asyncio
 from time import monotonic
 from typing import Protocol, runtime_checkable
 
@@ -12,7 +13,9 @@ from jobhunter.auth import sessions
 from jobhunter.auth.sessions import SessionInfo
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
+from jobhunter.crypto import data_keys
 from jobhunter.embeddings import EmbedderClient
+from jobhunter.geo.gazetteer import Gazetteer
 
 
 @runtime_checkable
@@ -38,6 +41,11 @@ def get_config(request: Request) -> AppConfig:
     return cfg
 
 
+def get_data_keys(request: Request) -> list[bytes]:
+    """The data keys of the app's config (`crypto.data_keys`): the sealing one first, then a previous one."""
+    return data_keys(get_config(request))
+
+
 def get_code_head(request: Request) -> str:
     """The head revision of the migrations shipped with this code (computed once, at start)."""
     head = getattr(request.app.state, "code_head", None)
@@ -52,6 +60,28 @@ def get_embedder(request: Request) -> EmbedderClient:
     if not isinstance(embedder, EmbedderClient):
         raise RuntimeError("the api state has no embedder client: the lifespan has not run")
     return embedder
+
+
+async def get_gazetteer(request: Request) -> Gazetteer:
+    """The packaged gazetteer, loaded on first use and kept on the app state (M2 Task 22).
+
+    The first load reads the data files (about 0.1 s), so it runs in a worker thread, never on the event
+    loop; the app's lock makes requests that arrive together share that one load.
+    """
+    state = request.app.state
+    loaded = getattr(state, "gazetteer", None)
+    if isinstance(loaded, Gazetteer):
+        return loaded
+    lock = getattr(state, "gazetteer_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        raise RuntimeError("the api state has no gazetteer lock: it was not built by create_app")
+    async with lock:
+        loaded = getattr(state, "gazetteer", None)  # a request that waited here finds it loaded
+        if isinstance(loaded, Gazetteer):
+            return loaded
+        gazetteer = await asyncio.to_thread(Gazetteer.load)
+        state.gazetteer = gazetteer
+        return gazetteer
 
 
 def get_rate_limiter(request: Request) -> RateLimiter:

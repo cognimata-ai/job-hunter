@@ -1,0 +1,12 @@
+{
+  "case": "task20_synthetic_profile",
+  "model": "claude-opus-5-5",
+  "purpose": "propose_queries",
+  "source": "synthetic",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "input_tokens": 1900,
+    "output_tokens": 700
+  }
+}

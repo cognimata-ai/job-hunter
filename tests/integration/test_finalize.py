@@ -49,6 +49,7 @@ from tests.support.collect import (
     source_cell,
     supersede,
 )
+from tests.support.m2 import insert_profile_chain
 from tests.support.pg import pg_rows
 from tests.support.quota import insert_window, jsearch_window, seeded_run_settings
 
@@ -386,6 +387,32 @@ async def test_a_superseded_finalize_writes_nothing(
         assert (await c.execute(sa.text("SELECT count(*) FROM alerts"))).scalar_one() == alerts
         assert tuple((await c.execute(RUN_END, {"i": owner.run_id})).one()) == ("running", None, None)
     assert newer.attempt_no == owner.attempt_no + 1
+
+
+async def test_i5_passes_with_a_tuple_until_m3_switches_the_score_targets_on(
+    engine, current_epoch, monkeypatch
+) -> None:
+    """M2 plan Deviation 10: M2's confirm activates a tuple and creates no target, so I5 passes with the tuple
+    and records `"targets": "m3"`; with the switch on and no target check (M3's), it fails."""
+    owner = await queued_run(engine)
+    async with engine.begin() as c:
+        chain = await insert_profile_chain(c)
+        await c.execute(
+            sa.text("UPDATE active_config SET profile_version_id = :v, llm_tuple_id = :t WHERE id = 1"),
+            {"v": chain.profile_version_id, "t": chain.llm_tuple_id},
+        )
+    async with engine.connect() as c:
+        revisions = await run_revisions(c, owner.run_id)
+
+        async def i5() -> InvariantResult:
+            results = await check_invariants(c, owner.run_id, outcome_conflicts=0, revisions=revisions)
+            return {r.code: r for r in results}["I5"]
+
+        assert await i5() == InvariantResult(
+            "I5", True, {"llm_tuple_id": chain.llm_tuple_id, "targets": "m3"}
+        )
+        monkeypatch.setattr(finalize_module, "SCORE_TARGETS_ENABLED", True)
+        assert await i5() == InvariantResult("I5", False, {"llm_tuple_id": chain.llm_tuple_id})
 
 
 async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, current_epoch) -> None:

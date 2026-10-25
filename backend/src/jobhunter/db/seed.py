@@ -5,7 +5,11 @@ policy, execution config, evaluation policy) are immutable and deduplicated by t
 JSON of the payload as stored (§13.2), so a second `seed_defaults` finds the rows of the first.
 
 The `sources` rows (`SOURCES`) and the `default` instance of each non-ATS source (`DEFAULT_INSTANCES`) are
-inserted when absent and never updated.
+inserted when absent and never updated. So are rubric v1 (found by its version) and the prompt-schema version
+of this code's templates and schemas (found by its hash), §19.3 step 6: no migration inserts them (§19.3
+step 2; plan Deviation 32). `active_config` points at both: a fresh row from its insert, and a row an M1
+install left with NULL pointers from the update after it. The two columns stay nullable in M2; M3's first
+migration restores their NOT NULL (expand/contract).
 
 The transition matrix is different: it is derived from code, so `sync_transition_matrix` replaces its rows on
 every run instead of freezing them.
@@ -33,7 +37,8 @@ SETTINGS_SCHEMA_VERSION: Final = 1
 # The §21.2 central estimate of the share of drafts that need a critic; the policy row of a first installation
 # has no history to replay (§11.7.4).
 DEFAULT_PROJECTED_CRITIC_RATE: Final = Decimal("0.450")
-_ANCHOR_LOCAL: Final = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
+# `schedule.anchor_local`, "HH:MM" (§13.1); the settings model checks it with this pattern too
+ANCHOR_LOCAL: Final = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
 _SECONDS_PER_HOUR: Final = 3600
 _HASH_COLUMN: Final = {
     "scope_versions": "scope_hash",
@@ -71,7 +76,7 @@ _INSERT_SOURCES: Final = (
 )
 _DEFAULT_INSTANCE_IDS: Final = ", ".join(f"'{source_id}'" for source_id in DEFAULT_INSTANCES)
 # Static SQL over the constants above, never input: the test reset runs it on a plain psycopg connection, so
-# it has no parameters. Looking first keeps a re-run from burning identity values, as `_ensure_id` does.
+# it has no parameters. Looking first keeps a re-run from burning identity values, as `ensure_id` does.
 DEFAULT_INSTANCES_SQL: Final = (
     "INSERT INTO source_instances (source_id, instance_key) "  # noqa: S608
     f"SELECT d.id, 'default' FROM unnest(ARRAY[{_DEFAULT_INSTANCE_IDS}]) AS d(id) "
@@ -103,12 +108,44 @@ def scope_payload(settings: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
 
 
 def local_anchor_to_utc(day: date, hhmm: str, tz: str) -> datetime:
-    """`hhmm` ("HH:MM") on `day` in the IANA zone `tz`, as an aware UTC datetime."""
-    match = _ANCHOR_LOCAL.fullmatch(hhmm)
+    """`hhmm` ("HH:MM") on `day` in the IANA zone `tz`, as an aware UTC datetime.
+
+    The DST rule (M0 Carry-forward 1): a wall time the zone skips (the spring-forward gap) maps to the first
+    valid instant after the gap, the transition itself, so 02:30 on 2026-03-29 in Europe/Berlin is 03:00 CEST,
+    01:00 UTC. A wall time the zone repeats (the autumn fold) maps to its first occurrence (`fold=0`), so
+    02:30 on 2026-10-25 is 02:30 CEST, 00:30 UTC.
+    """
+    match = ANCHOR_LOCAL.fullmatch(hhmm)
     if match is None:
         raise ValueError(f"anchor time must be HH:MM, got {hhmm!r}")
-    local = datetime.combine(day, time(int(match[1]), int(match[2])), tzinfo=ZoneInfo(tz))
-    return local.astimezone(UTC)
+    zone = ZoneInfo(tz)
+    local = datetime.combine(day, time(int(match[1]), int(match[2])), tzinfo=zone)  # fold=0: first occurrence
+    instant = local.astimezone(UTC)  # a wall time that does not round-trip lies in a gap
+    if instant.astimezone(zone).replace(tzinfo=None) == local.replace(tzinfo=None):
+        return instant
+    return _end_of_gap(local, zone)
+
+
+def _end_of_gap(local: datetime, zone: ZoneInfo) -> datetime:
+    """The UTC instant at which the gap that skips the wall time `local` ends: its transition.
+
+    In a gap, `fold=0` reads `local` with the offset before the transition and `fold=1` with the one after it
+    (PEP 495), so `local - after` lies before the transition and `local - before` at or after it. The
+    transition is the first whole second between the two whose offset is no longer `before`.
+    """
+    before, after = local.utcoffset(), local.replace(fold=1).utcoffset()
+    if before is None or after is None or after <= before:
+        raise ValueError(f"{local.isoformat()} is in no gap of {zone.key}")
+    wall = local.replace(tzinfo=None)
+    start = (wall - after).replace(tzinfo=UTC)
+    low, high = 0, int(((wall - before) - (wall - after)).total_seconds())
+    while high - low > 1:  # the offset at start + low is `before`, at start + high it is not
+        middle = (low + high) // 2
+        if (start + timedelta(seconds=middle)).astimezone(zone).utcoffset() == before:
+            low = middle
+        else:
+            high = middle
+    return start + timedelta(seconds=high)
 
 
 def anchor_utc_for(now: datetime, hhmm: str, tz: str) -> datetime:
@@ -124,7 +161,7 @@ def latest_slot_at_or_before(anchor: datetime, interval_s: int, t: datetime) -> 
     return anchor + ((t - anchor) // step) * step
 
 
-async def _ensure_id(
+async def ensure_id(
     conn: AsyncConnection,
     select: TextClause,
     insert: TextClause,
@@ -145,7 +182,7 @@ async def _ensure_id(
     return int(found)
 
 
-async def _ensure_hashed(
+async def ensure_hashed(
     conn: AsyncConnection,
     table: Literal["scope_versions", "model_policies", "execution_configs"],
     payload: dict[str, JSONValue],
@@ -159,7 +196,78 @@ async def _ensure_hashed(
         jsonb=["payload"],
     )
     digest = content_hash(payload)
-    return await _ensure_id(conn, select, insert, {"hash": digest}, {"hash": digest, "payload": payload})
+    return await ensure_id(conn, select, insert, {"hash": digest}, {"hash": digest, "payload": payload})
+
+
+_EVALUATION_POLICY = q("SELECT id FROM evaluation_policies WHERE policy_hash = :hash")
+_INSERT_EVALUATION_POLICY = q(
+    "INSERT INTO evaluation_policies (version_no, policy_hash, payload, projected_critic_rate) "
+    "SELECT coalesce(max(version_no), 0) + 1, :hash, :payload, :rate FROM evaluation_policies "
+    "ON CONFLICT DO NOTHING RETURNING id",
+    jsonb=["payload"],
+)
+
+
+async def ensure_evaluation_policy(conn: AsyncConnection, payload: dict[str, JSONValue]) -> int:
+    """The id of the `evaluation_policies` row whose hash is the content hash of `payload`, created when
+    absent with `version_no = max + 1` and `DEFAULT_PROJECTED_CRITIC_RATE` (§11.7.4: no history to replay
+    before M3).
+
+    Two writers that create different policies at once would race for one `version_no`: the loser's insert
+    does nothing and its read finds no row (`NoResultFound`). The writers are serialised instead: a settings
+    save holds `active_config` `FOR UPDATE` (§13.3), and the seed runs under the `migrate` lock.
+    """
+    digest = content_hash(payload)
+    return await ensure_id(
+        conn,
+        _EVALUATION_POLICY,
+        _INSERT_EVALUATION_POLICY,
+        {"hash": digest},
+        {"hash": digest, "payload": payload, "rate": DEFAULT_PROJECTED_CRITIC_RATE},
+    )
+
+
+async def _shipped_rubric_and_prompt_schema(conn: AsyncConnection) -> tuple[int, int]:
+    """The ids of rubric v1 and of the prompt-schema version this code renders, each inserted when absent.
+
+    A release whose templates or schemas differ ships a new prompt-schema version this way; it never activates
+    itself (§13.3). Imported here, not at the top: the rubric loader and the renderer import this module's
+    `content_hash` and `canonical_json`.
+    """
+    from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
+    from jobhunter.scoring.rubric import RUBRIC_V1, load_rubric
+
+    rubric = load_rubric(RUBRIC_V1)
+    rubric_id = await ensure_id(
+        conn,
+        q("SELECT id FROM rubric_versions WHERE version = :version"),
+        q(
+            "INSERT INTO rubric_versions (version, content_hash, weights, anchors) "
+            "VALUES (:version, :hash, :weights, :anchors) ON CONFLICT DO NOTHING RETURNING id",
+            jsonb=["weights", "anchors"],
+        ),
+        {"version": RUBRIC_V1},
+        {
+            "version": RUBRIC_V1,
+            "hash": rubric.content_hash,
+            "weights": dict(rubric.weights),
+            "anchors": dict(rubric.anchors),
+        },
+    )
+    templates, schemas = prompt_schema_v1()
+    digest = prompt_schema_hash(templates, schemas)
+    prompt_schema_id = await ensure_id(
+        conn,
+        q("SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = :hash"),
+        q(
+            "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
+            "VALUES (:hash, :templates, :schemas) ON CONFLICT DO NOTHING RETURNING id",
+            jsonb=["templates", "schemas"],
+        ),
+        {"hash": digest},
+        {"hash": digest, "templates": templates, "schemas": schemas},
+    )
+    return rubric_id, prompt_schema_id
 
 
 _STORED_SETTINGS_V1 = q("SELECT id, payload FROM settings_versions WHERE version_no = 1")
@@ -173,23 +281,11 @@ async def _insert_settings_v1(conn: AsyncConnection) -> None:
     """Derive the rows of the packaged defaults and insert settings version 1 over them."""
     settings = load_settings_v1()
 
-    scope_id = await _ensure_hashed(conn, "scope_versions", scope_payload(settings))
-    model_id = await _ensure_hashed(conn, "model_policies", get_object(settings, "scoring.model_policy"))
-    execution_id = await _ensure_hashed(conn, "execution_configs", get_object(settings, "scoring.execution"))
+    scope_id = await ensure_hashed(conn, "scope_versions", scope_payload(settings))
+    model_id = await ensure_hashed(conn, "model_policies", get_object(settings, "scoring.model_policy"))
+    execution_id = await ensure_hashed(conn, "execution_configs", get_object(settings, "scoring.execution"))
 
-    evaluation = get_object(settings, "evaluation")
-    evaluation_digest = content_hash(evaluation)
-    evaluation_id = await _ensure_id(
-        conn,
-        q("SELECT id FROM evaluation_policies WHERE policy_hash = :hash"),
-        q(
-            "INSERT INTO evaluation_policies (version_no, policy_hash, payload, projected_critic_rate) "
-            "VALUES (1, :hash, :payload, :rate) ON CONFLICT DO NOTHING RETURNING id",
-            jsonb=["payload"],
-        ),
-        {"hash": evaluation_digest},
-        {"hash": evaluation_digest, "payload": evaluation, "rate": DEFAULT_PROJECTED_CRITIC_RATE},
-    )
+    evaluation_id = await ensure_evaluation_policy(conn, get_object(settings, "evaluation"))
 
     await conn.execute(
         q(
@@ -235,9 +331,12 @@ async def sync_transition_matrix(conn: AsyncConnection) -> int:
 
 
 async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
-    """Write the default settings chain, the three single rows, `sources` and the default source instances.
+    """Write the default settings chain, rubric v1 and the prompt-schema version, the three single rows,
+    `sources` and the default source instances.
 
-    Idempotent and never an overwrite. Settings version 1 is frozen once stored: the derived rows (scope,
+    Idempotent and never an overwrite: a NULL rubric or prompt-schema pointer is set, a set one is never
+    changed (a shipped version activates through Settings only, §13.3). Settings version 1 is frozen once
+    stored: the derived rows (scope,
     model policy, execution config, evaluation policy) and the version are created from the packaged
     defaults only when version 1 does not exist yet. Afterwards a release that edits `settings_v1.json`
     changes nothing here, and the three single rows below are created, when absent, from the STORED version 1
@@ -258,16 +357,29 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     settings_id = int(stored["id"])
     settings = get_object(stored["payload"], "")
 
-    # The active pointers are those of the settings version they activate, so the two cannot disagree.
-    # The profile, tuple, rubric and prompt-schema pointers stay NULL until M2.
+    # The active pointers are those of the settings version they activate, so the two cannot disagree, plus
+    # rubric v1 and the prompt-schema version. The profile and tuple pointers stay NULL until a profile is
+    # confirmed (§12.6).
+    rubric_id, prompt_schema_id = await _shipped_rubric_and_prompt_schema(conn)
     await conn.execute(
         q(
             "INSERT INTO active_config (id, settings_version_id, scope_version_id, model_policy_id, "
-            "execution_config_id, evaluation_policy_id) "
-            "SELECT 1, id, scope_version_id, model_policy_id, execution_config_id, evaluation_policy_id "
-            "FROM settings_versions WHERE id = :settings_id ON CONFLICT DO NOTHING"
+            "execution_config_id, evaluation_policy_id, rubric_version_id, prompt_schema_version_id) "
+            "SELECT 1, id, scope_version_id, model_policy_id, execution_config_id, evaluation_policy_id, "
+            ":rubric_id, :prompt_schema_id FROM settings_versions WHERE id = :settings_id "
+            "ON CONFLICT DO NOTHING"
         ),
-        {"settings_id": settings_id},
+        {"settings_id": settings_id, "rubric_id": rubric_id, "prompt_schema_id": prompt_schema_id},
+    )
+    # An install upgraded from M1 has the row with both pointers NULL: they are set here, and only where NULL.
+    await conn.execute(
+        q(
+            "UPDATE active_config SET rubric_version_id = coalesce(rubric_version_id, :rubric_id), "
+            "prompt_schema_version_id = coalesce(prompt_schema_version_id, :prompt_schema_id), "
+            "updated_at = now() "
+            "WHERE id = 1 AND (rubric_version_id IS NULL OR prompt_schema_version_id IS NULL)"
+        ),
+        {"rubric_id": rubric_id, "prompt_schema_id": prompt_schema_id},
     )
 
     interval_s = get_int(settings, "schedule.interval_hours") * _SECONDS_PER_HOUR

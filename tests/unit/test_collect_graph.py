@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import json
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, cast
@@ -20,6 +21,7 @@ from jobhunter.graphs.collect.graph import (
     is_retryable_db_error,
     timed,
 )
+from jobhunter.graphs.collect.nodes import enqueue_targets
 from jobhunter.graphs.collect.nodes.enqueue_targets import make_enqueue_targets
 from jobhunter.graphs.collect.nodes.finalize import WARNING_COUNTERS
 from jobhunter.graphs.collect.nodes.plan_fallback import ACCOUNT_READ_TIMEOUT_S, route, serpapi_account
@@ -105,6 +107,35 @@ def test_only_database_errors_that_may_run_again_are_retried() -> None:
     assert not is_retryable_db_error(other)
     assert not is_retryable_db_error(RuntimeError("40001"))
     assert not is_retryable_db_error(SourceError("transient", code="http_503", status=503))
+
+
+async def test_a_retried_database_error_of_a_collect_node_logs_no_bound_value(log_events) -> None:
+    """M2 Task 11 fix round 1: LangGraph logs a retry with the error's text, which quotes the statement's
+    bound values (posting content). Its retry logger is held at WARNING (`quiet_library_loggers`)."""
+    from jobhunter.graphs.collect.graph import DB_RETRY
+    from langgraph.graph import END, START, StateGraph
+
+    marker = "Quastenflosser-Stellenanzeige"
+    calls: list[int] = []
+
+    async def flaky(state: CollectState) -> CollectUpdate:
+        calls.append(1)
+        if len(calls) == 1:  # a lost connection: retried
+            raise sa.exc.DBAPIError(
+                "UPDATE raw_items SET normalized = %(n)s",
+                {"n": marker},
+                ConnectionError("reset"),
+                connection_invalidated=True,
+            )
+        return {"steps": ["flaky"]}
+
+    graph = StateGraph(CollectState)
+    graph.add_node("flaky", timed("flaky", error_handled("flaky", flaky)), retry_policy=DB_RETRY)
+    graph.add_edge(START, "flaky")
+    graph.add_edge("flaky", END)
+    out = await graph.compile().ainvoke(initial_state(7, 1))
+    assert len(calls) == 2 and out["steps"] == ["flaky"]  # the retry ran
+    assert marker not in json.dumps(log_events(), ensure_ascii=False)
 
 
 SERPAPI = InstanceRow(
@@ -231,7 +262,19 @@ async def test_a_timed_node_lets_its_error_propagate() -> None:
         await timed("finalize", node)(initial_state(1, 1))
 
 
-async def test_enqueue_targets_records_its_step_and_refuses_a_tuple_until_m3() -> None:
+async def test_enqueue_targets_records_its_step_and_is_a_no_op_with_a_tuple_until_m3() -> None:
+    """Plan Deviation 10: while `SCORE_TARGETS_ENABLED` is false, a run with a tuple creates no target."""
+    assert enqueue_targets.SCORE_TARGETS_ENABLED is False
+    node = make_enqueue_targets(cast(CollectDeps, None))
+    assert await node(initial_state(1, 1)) == {"steps": ["enqueue_targets"]}
+    assert await node({**initial_state(1, 1), "llm_tuple_id": 4}) == {"steps": ["enqueue_targets"]}
+
+
+async def test_enqueue_targets_refuses_a_tuple_when_switched_on_without_the_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The switch alone, before M3 fills the node, would silently create no target: a bug."""
+    monkeypatch.setattr(enqueue_targets, "SCORE_TARGETS_ENABLED", True)
     node = make_enqueue_targets(cast(CollectDeps, None))
     assert await node(initial_state(1, 1)) == {"steps": ["enqueue_targets"]}
     with pytest.raises(NotImplementedError, match="M3"):

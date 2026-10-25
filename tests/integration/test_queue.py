@@ -56,9 +56,33 @@ async def test_delete_finished_jobs_keeps_recent(engine, queue_app) -> None:
                 "WHERE job_id = (SELECT min(id) FROM procrastinate_jobs)"
             )
         )
-    await delete_finished_jobs(queue_app, older_than_hours=168)
+    assert await delete_finished_jobs(queue_app, older_than_hours=168, limit=1000) == 1
     async with engine.connect() as c:
         assert (await c.execute(sa.text("SELECT count(*) FROM procrastinate_jobs"))).scalar_one() == 1
+
+
+async def test_delete_finished_jobs_deletes_at_most_its_limit(engine, queue_app) -> None:
+    """M1 Carry-forward 17: retention deletes in batches, so a call deletes at most `limit` jobs, oldest ids
+    first, and says how many; a job still to do is never one of them."""
+    async with engine.begin() as c:
+        for timestamp in range(1, 5):
+            await defer_in_tx(c, "retention_daily", timestamp=timestamp)
+        await c.execute(
+            sa.text(
+                "UPDATE procrastinate_jobs SET status='doing' "
+                "WHERE id < (SELECT max(id) FROM procrastinate_jobs)"
+            )
+        )
+        await c.execute(sa.text("UPDATE procrastinate_jobs SET status='succeeded' WHERE status = 'doing'"))
+        await c.execute(sa.text("UPDATE procrastinate_events SET at = now() - interval '8 days'"))
+    ids = sa.text("SELECT id FROM procrastinate_jobs ORDER BY id")
+    async with engine.connect() as c:
+        jobs = list((await c.execute(ids)).scalars())
+    assert await delete_finished_jobs(queue_app, older_than_hours=168, limit=2) == 2
+    assert await delete_finished_jobs(queue_app, older_than_hours=168, limit=2) == 1
+    assert await delete_finished_jobs(queue_app, older_than_hours=168, limit=2) == 0
+    async with engine.connect() as c:
+        assert list((await c.execute(ids)).scalars()) == jobs[-1:]  # the job to do stays
 
 
 async def test_defer_in_tx_needs_no_open_app(engine, make_config) -> None:

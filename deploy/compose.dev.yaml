@@ -1,13 +1,22 @@
 # The dev stack (spec §19.1, §19.2; Task 18). Every call passes the digest lock as its env file:
 #
-#   scripts/dev-secrets.sh            # once; as root (sudo), it sets group 10010 on the secret files
+#   scripts/dev-secrets.sh            # as root (sudo), it sets group 10010 on the secret files
 #   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml up -d --build --wait
+#
+# Run dev-secrets.sh again after a change that adds a secret file: it creates the missing ones and keeps the
+# others. M2 Task 23 added the worker's anthropic_key, so a stack set up before it does not start until then.
+#
+# The worker's anthropic_key is the JOBHUNTER_ANTHROPIC_API_KEY that dev-secrets.sh was run with (`sudo
+# --preserve-env=JOBHUNTER_ANTHROPIC_API_KEY`), or an empty file: the worker then starts without a key and every
+# LLM call fails llm_not_configured (M2 Task 23). deploy/compose.fakellm.yaml serves every Claude call from the
+# recorded fixtures instead.
 #
 # Images come from deploy/images.lock only: `${name:?}` fails loudly when a digest line is missing. The one dev
 # origin is http://localhost:8080, served by devproxy on the host's loopback only. The api has no route out
 # (its networks `proxy` and `internal` are both internal); only the worker reaches `egress`. The embedder
 # (Task 22) is on `internal` only: its model is baked into its image, checked against embedder/model.lock at
-# every start (§16.8), and the worker starts once it is healthy.
+# every start (§16.8), and the worker starts once it is healthy. docparse (M2 Task 8) has no network at all: it
+# exchanges files with the worker on the `parse_jobs` tmpfs only (§12.2).
 name: jobhunter-dev
 
 x-app-build: &app-build
@@ -95,6 +104,7 @@ services:
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
       JOBHUNTER_EMBEDDER_URL: http://embedder:8080 # readiness and system health probe it
     secrets: [session_secret, data_key, db_app]
+    volumes: [cv_store:/data/cv] # the encrypted CV uploads (§12.1)
     networks: [proxy, internal] # both internal: no route to the internet
     healthcheck:
       test: ["CMD", "jobhunter", "http-check", "http://localhost:8000/healthz"]
@@ -113,7 +123,11 @@ services:
       <<: *app-env
       JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
       JOBHUNTER_EMBEDDER_URL: http://embedder:8080
-    secrets: [data_key, db_app]
+    secrets: [data_key, db_app, anthropic_key] # anthropic_key may be empty: no key (M2 Task 23)
+    volumes: [cv_store:/data/cv, parse_jobs:/data/parse]
+    # A service-level group_add replaces the x-app list: the secrets group again, and jobhunter-parse, the
+    # group of the parse_jobs tmpfs it shares with docparse (§19.1).
+    group_add: ["10010", "10011"]
     networks: [internal, egress]
     healthcheck:
       test: ["CMD", "jobhunter", "worker-health"]
@@ -152,6 +166,33 @@ services:
     cpus: 3
     restart: unless-stopped
 
+  docparse:
+    image: jobhunter-docparse:dev
+    build:
+      context: ..
+      dockerfile: docparse/Dockerfile
+      args:
+        PYTHON_IMAGE: "${python:?}"
+        UV_IMAGE: "${uv:?}"
+      secrets: [build_ca] # the optional CA bundle of the build's downloads, as for the app image
+    # No network at all (§12.2): the worker hands it files on the parse_jobs tmpfs, group 10011 for both.
+    # Never in the secrets group, given no secret; it writes only the job files there and its own /tmp.
+    network_mode: none
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: "10002:10002"
+    group_add: ["10011"]
+    volumes: [parse_jobs:/data/parse]
+    logging: { driver: local, options: { max-size: 20m, max-file: "10" } }
+    mem_limit: 1g # one job at a time: a child of at most 768 MiB (RLIMIT_AS)
+    # The loop, its resource tracker and one parse child (which starts no process: RLIMIT_NPROC 0), with room
+    # for an operator's `exec`. Past it, a parse that escaped its limits can fork nothing more (final review
+    # FR-11). A failed leftover sweep exits 70 and the restart ends every process in the container.
+    pids_limit: 16
+    restart: unless-stopped
+
   devproxy:
     image: "${caddy:?}"
     # Not in the secrets group and given no secret (§19.2). The image's caddy binary carries the file capability
@@ -185,6 +226,12 @@ networks:
 
 volumes:
   pgdata: {}
+  cv_store: {} # the encrypted CV files (§12.1); the app image's /data/cv gives it 10001:10001, mode 0700
+  # RAM only, so a decrypted CV never reaches a disk (§12.2); the setgid root (2770, group 10011) gives every
+  # per-job directory the group that both the worker and docparse hold.
+  parse_jobs:
+    driver: local
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=256m,uid=0,gid=10011,mode=2770" } # as §19.1
 
 # The files of scripts/dev-secrets.sh: group 10010, mode 0440, in a 0750 directory (§19.2).
 secrets:
@@ -195,4 +242,5 @@ secrets:
   db_backup: { file: ../.secrets/dev/db_backup }
   db_restore: { file: ../.secrets/dev/db_restore }
   pg_bootstrap: { file: ../.secrets/dev/pg_bootstrap }
+  anthropic_key: { file: ../.secrets/dev/anthropic_key }
   build_ca: { file: "${SSL_CERT_FILE:-/dev/null}" }

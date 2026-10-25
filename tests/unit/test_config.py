@@ -300,6 +300,25 @@ def test_an_empty_required_secret_counts_as_missing(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("content", [b"", b"\n"])
+def test_an_empty_optional_secret_reads_as_absent(tmp_path: Path, content: bytes) -> None:
+    """Task 23: compose needs a mounted secret's file to exist, so the dev stack mounts an empty
+    `anthropic_key` when no key was given; the worker then has no key, and passes its startup assertions."""
+    d = write_secrets(tmp_path / "s", **WORKER_SECRETS, anthropic_key=content, rapidapi_key=content)
+    cfg = load_config("worker", BASE_ENV, d)
+    assert "anthropic_key" not in cfg.secrets and "rapidapi_key" not in cfg.secrets
+    assert set(cfg.secrets) == set(WORKER_SECRETS)
+    run_startup_assertions(cfg)
+    # the file is still mounted: its mode is checked as every mounted secret's is
+    (d / "anthropic_key").chmod(0o444)
+    assert check_of("worker", BASE_ENV, d) == "secrets_not_world_readable"
+
+
+def test_an_empty_secret_of_another_role_is_still_foreign(tmp_path: Path) -> None:
+    d = write_secrets(tmp_path / "s", **API_SECRETS, anthropic_key=b"")
+    assert check_of("api", BASE_ENV, d) == "foreign_secret_mounted"
+
+
 @pytest.mark.parametrize(
     "tracing_var", ["LANGSMITH_TRACING", "LANGSMITH_TRACING_V2", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"]
 )
@@ -638,3 +657,70 @@ def test_fake_sources_are_still_refused_in_prod(tmp_path: Path) -> None:
         "fake_mode_in_prod",
         "JOBHUNTER_FAKE_SOURCES must not be set in prod",
     )
+
+
+# --- M2 Task 4: the recorded-SSE fake LLM (`JOBHUNTER_FAKE_LLM`, `JOBHUNTER_FAKE_LLM_DIR`) ------------------
+
+
+@pytest.mark.parametrize("value", ["1", "yes", ""])  # set to anything, the empty string included
+def test_fake_llm_is_set_by_the_variable_being_present(tmp_path: Path, value: str) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_FAKE_LLM": value}
+    assert load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS)).fake_llm is True
+
+
+def test_fake_llm_defaults_to_off_and_the_recorded_anthropic_fixtures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg = load_config("worker", BASE_ENV, write_secrets(tmp_path / "s", **WORKER_SECRETS))
+    assert cfg.fake_llm is False
+    assert cfg.fake_llm_dir == (tmp_path / "tests/contract/fixtures/anthropic").resolve()
+    assert cfg.fake_llm_dir.is_absolute()
+
+
+def test_fake_llm_dir_from_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    env = {**BASE_ENV, "JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": "llm-fx"}
+    cfg = load_config("worker", env, write_secrets(tmp_path / "s", **WORKER_SECRETS))
+    assert (cfg.fake_llm, cfg.fake_llm_dir) == (True, (tmp_path / "llm-fx").resolve())
+
+
+# --- M2 Task 9: the encrypted CV files' volume (`JOBHUNTER_CV_STORE_DIR`) ---------------------------------
+
+
+def test_cv_store_dir_defaults_to_the_volume_and_follows_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **API_SECRETS)
+    assert load_config("api", BASE_ENV, secrets).cv_store_dir == Path("/data/cv")
+    env = {**BASE_ENV, "JOBHUNTER_CV_STORE_DIR": str(tmp_path / "cv")}
+    assert load_config("api", env, secrets).cv_store_dir == tmp_path / "cv"
+
+
+# --- M2 Task 11: the docparse jobs' tmpfs (`JOBHUNTER_PARSE_JOBS_DIR`) -------------------------------------
+
+
+def test_parse_jobs_dir_defaults_to_the_tmpfs_and_follows_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **WORKER_SECRETS)
+    assert load_config("worker", BASE_ENV, secrets).parse_jobs_dir == Path("/data/parse")
+    env = {**BASE_ENV, "JOBHUNTER_PARSE_JOBS_DIR": str(tmp_path / "parse")}
+    assert load_config("worker", env, secrets).parse_jobs_dir == tmp_path / "parse"
+
+
+# --- M2 Task 4 (fix round 1): `ANTHROPIC_LOG` makes the Anthropic SDK log request content ------------------
+
+
+@pytest.mark.parametrize("value", ["debug", "info", "DEBUG", " info "])
+def test_anthropic_log_debug_or_info_is_refused_in_prod(tmp_path: Path, value: str) -> None:
+    env = {**BASE_ENV, "JOBHUNTER_ENV": "prod", "ANTHROPIC_LOG": value}
+    with pytest.raises(StartupCheckFailed) as exc:
+        run_startup_assertions(load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS)))
+    assert (exc.value.check, exc.value.detail) == (
+        "anthropic_log_in_prod",
+        "ANTHROPIC_LOG must not be debug or info in prod",
+    )
+
+
+@pytest.mark.parametrize(("env_name", "value"), [("prod", "warning"), ("prod", ""), ("dev", "debug")])
+def test_anthropic_log_otherwise_passes(tmp_path: Path, env_name: str, value: str) -> None:
+    # outside prod the app's logging setup holds the SDK's loggers at WARNING (tests/unit/test_redact.py)
+    env = {**BASE_ENV, "JOBHUNTER_ENV": env_name, "ANTHROPIC_LOG": value}
+    run_startup_assertions(load_config("api", env, write_secrets(tmp_path / "s", **API_SECRETS)))

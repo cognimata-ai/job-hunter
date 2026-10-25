@@ -12,7 +12,7 @@ query (`TEST_QUERY`) and a location key, created when absent, and `jsearch_cell`
 cell; `page1_spec` the JSearch page-1 spec of a cell (bucket `week`), its instance read from the cell row;
 `supersede` gives a run its next attempt, as a takeover does.
 
-Task 13: `DEFAULT_CELL` is every `planner.CellRow` field of a never-attempted JSearch `remote-de` cell, as a
+Task 13: `DEFAULT_CELL` is every `cells.CellRow` field of a never-attempted JSearch `remote-de` cell, as a
 dict; `seed_inputs` writes the queries and the watchlist companies (with their board instances) of a test and
 a new settings version that enables them (and, with `enabled`, exactly those sources), pointed at by
 `active_config`, so a run queued afterwards plans them (plan Deviation 3).
@@ -61,6 +61,10 @@ embedder; `manual_run_id` inserts a queued manual run (not admitted: `execute_ru
 collection graph (or `graph`, built over `saver`, an `InMemorySaver` unless given), and returns the run id;
 `conflicting_graph` is the real graph whose `fetch_cell` adds an outcome of its own for one shared work id
 (`CONFLICT_WORK_ID`) to every update, so two Sends of one step give the reducer two differing outcomes.
+
+M2 Task 18: `job_factory.many(n)` (`insert_jobs`) inserts `n` unmerged jobs in one statement, each with a
+`det_facts_hash` of its own and no posting, and writes the active scope's hard-filter results for them, so the
+scope apply has retained jobs to precompute and the active scope's view is complete.
 """
 
 import asyncio
@@ -96,6 +100,8 @@ from jobhunter.normalize.keys import AdKey, keys_from_link
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.normalize.urls import canonical_url
 from jobhunter.quota.windows import Provider
+from jobhunter.run_settings import scope_from_payload
+from jobhunter.scoring.filters import BATCH, recompute_stale
 from jobhunter.sources import items, receipts
 from jobhunter.sources.acquire import AcquireContext
 from jobhunter.sources.base import (
@@ -350,7 +356,7 @@ def ctx(
     )
 
 
-# Every `planner.CellRow` field of a never-attempted JSearch `remote-de` cell, with the column defaults of
+# Every `cells.CellRow` field of a never-attempted JSearch `remote-de` cell, with the column defaults of
 # `coverage_cells` (`yield_ema` 0.5, no streaks).
 DEFAULT_CELL: Final[Mapping[str, object]] = MappingProxyType(
     {
@@ -514,6 +520,8 @@ class JobFactory(Protocol):
         structured_seniority: str | None = None,
     ) -> Awaitable[MadeJob]: ...
 
+    def many(self, n: int) -> Awaitable[list[int]]: ...
+
 
 _JOB: Final = q(
     "INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, work_mode_possible, "
@@ -602,13 +610,49 @@ async def insert_job(
     return MadeJob(job, posting, tuple(made))
 
 
-@pytest.fixture
-def job_factory(engine: AsyncEngine) -> JobFactory:
-    """`await job_factory(native_id=…, observations=[(observed_at, raw_item_id), …])`: a job with one posting
-    of `(source_id, instance_key)` and one observation per entry (a `raw_item_id`, when given, is a `linked`
-    raw item that the observation came from), inserted directly; one observation now without any."""
+# Task 18: `many` inserts unmerged jobs in bulk, each with det-facts of its own (no posting: the hard filters
+# and the completeness checks read the `jobs` row alone), and writes the active scope's results for them.
+_MANY_JOBS: Final = q(
+    "INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, work_mode_possible, "
+    "work_mode_source, employment_source, ad_language, completeness, posted_precision, first_seen_at, "
+    "last_seen_at, availability, availability_changed_at, source_ids, field_provenance, det_facts_hash) "
+    "SELECT 'musterfirma ' || g, 'Musterfirma ' || g, 'Python Developer', 'python developer', "
+    "'unknown', ARRAY['remote','hybrid','onsite'], 'none', 'none', 'unknown', 'full', 'unknown', now(), "
+    "now(), 'active', now(), ARRAY['jsearch'], '{}', sha256(convert_to(:tag || ':' || g, 'UTF8')) "
+    "FROM generate_series(1, :n) AS g ORDER BY g RETURNING id"
+)
+_ACTIVE_SCOPE: Final = q(
+    "SELECT s.id, s.payload FROM active_config a JOIN scope_versions s ON s.id = a.scope_version_id "
+    "WHERE a.id = 1 FOR SHARE OF a"
+)
 
-    async def make(
+
+async def _unguarded(conn: AsyncConnection) -> None:
+    """The guard of a test's own recompute: no owner to prove."""
+
+
+async def insert_jobs(engine: AsyncEngine, n: int) -> list[int]:
+    """`n` unmerged jobs inserted in one statement, each with a `det_facts_hash` of its own, and the active
+    scope's `hard_filter_results` for them (`filters.recompute_stale` over that scope alone, as a collection
+    transaction writes them): the view of the active scope is complete. Returns the job ids, ascending."""
+    async with engine.begin() as conn:
+        tag = uuid.uuid4().hex
+        job_ids = [int(job_id) for job_id in (await conn.execute(_MANY_JOBS, {"n": n, "tag": tag})).scalars()]
+        row = (await conn.execute(_ACTIVE_SCOPE)).one()
+        scopes = {int(row.id): scope_from_payload(get_object(row.payload, ""))}
+        while await recompute_stale(conn, scopes, guard=_unguarded) == BATCH:
+            pass
+    return job_ids
+
+
+@dataclass(frozen=True)
+class _JobFactory:
+    """The `job_factory` fixture's factory: one job a call (`insert_job`), many at once (`insert_jobs`)."""
+
+    engine: AsyncEngine
+
+    async def __call__(
+        self,
         *,
         native_id: str,
         source_id: str = "jsearch",
@@ -620,7 +664,7 @@ def job_factory(engine: AsyncEngine) -> JobFactory:
         structured_seniority: str | None = None,
     ) -> MadeJob:
         return await insert_job(
-            engine,
+            self.engine,
             native_id=native_id,
             source_id=source_id,
             instance_key=instance_key,
@@ -631,7 +675,18 @@ def job_factory(engine: AsyncEngine) -> JobFactory:
             structured_seniority=structured_seniority,
         )
 
-    return make
+    async def many(self, n: int) -> list[int]:
+        return await insert_jobs(self.engine, n)
+
+
+@pytest.fixture
+def job_factory(engine: AsyncEngine) -> JobFactory:
+    """`await job_factory(native_id=…, observations=[(observed_at, raw_item_id), …])`: a job with one posting
+    of `(source_id, instance_key)` and one observation per entry (a `raw_item_id`, when given, is a `linked`
+    raw item that the observation came from), inserted directly; one observation now without any.
+    `await job_factory.many(n)` (Task 18): `n` unmerged jobs with det-facts and the active scope's hard-filter
+    results (`insert_jobs`); their ids."""
+    return _JobFactory(engine)
 
 
 # ---- Task 16 ----------------------------------------------------------------------------------------------

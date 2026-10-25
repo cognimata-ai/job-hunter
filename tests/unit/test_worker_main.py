@@ -90,7 +90,7 @@ def test_a_lock_timeout_is_recognised_through_sqlalchemy_and_through_procrastina
 class World:
     """Fakes for every collaborator of `worker_main` that does I/O; `events` records what they did."""
 
-    def __init__(self, monkeypatch, tmp_path) -> None:
+    def __init__(self, monkeypatch, tmp_path, *, fake_llm: bool = True) -> None:
         from contextlib import asynccontextmanager
 
         from jobhunter.config import load_config
@@ -110,6 +110,8 @@ class World:
         self.runtimes: list[object] = []
         self.contexts: list[object] = []
         self.deps: list[object] = []
+        self.profile_deps: list[object] = []  # Task 11: what the profile graphs were built with
+        self.profile_graphs = object()
         world = self
 
         class FakeLockSession:
@@ -194,6 +196,10 @@ class World:
             world.deps.append(deps)
             return object()
 
+        def fake_build_profile_graphs(saver: object, deps: object) -> object:
+            world.profile_deps.append(deps)
+            return world.profile_graphs
+
         async def fake_reconcilers(ctx: Any, cadence: str) -> dict[str, int]:
             events.append(f"reconcile_{cadence}")
             world.contexts.append(ctx)
@@ -249,6 +255,7 @@ class World:
             "Watchdog": FakeWatchdog,
             "open_saver": fake_open_saver,
             "build_collect_graph": fake_build_collect_graph,
+            "build_profile_graphs": fake_build_profile_graphs,
             "run_reconcilers": fake_reconcilers,
             "EXECUTIONS": FakeExecutions(),
             "make_clients": recording_make_clients,
@@ -261,7 +268,20 @@ class World:
         for name, value in (("db_app", "pw"), ("data_key", "a" * 43 + "=")):
             (secrets / name).write_text(value)
             (secrets / name).chmod(0o440)
-        env = {"JOBHUNTER_ENV": "test", "JOBHUNTER_DB_NAME": "jobhunter", "JOBHUNTER_DB_HOST": "unused"}
+        # Task 11: the gateway is on the fake LLM transport (this worker has no `anthropic_key`), and the
+        # parse root and the CV store are the test's own. Task 23: without `fake_llm`, a worker with neither
+        # the key nor the fake (its gateway is not configured).
+        self.parse_root = tmp_path / "parse"
+        self.parse_root.mkdir()
+        fake_env = {"JOBHUNTER_FAKE_LLM": "1", "JOBHUNTER_FAKE_LLM_DIR": str(tmp_path / "anthropic")}
+        env = {
+            "JOBHUNTER_ENV": "test",
+            "JOBHUNTER_DB_NAME": "jobhunter",
+            "JOBHUNTER_DB_HOST": "unused",
+            **(fake_env if fake_llm else {}),
+            "JOBHUNTER_PARSE_JOBS_DIR": str(self.parse_root),
+            "JOBHUNTER_CV_STORE_DIR": str(tmp_path / "cv"),
+        }
         self.cfg = load_config("worker", env, secrets)
 
 
@@ -444,6 +464,84 @@ async def test_the_worker_shares_one_embedder_client_on_its_configured_url(monke
     assert embedder.http.is_closed  # the teardown's `embedder` step
 
 
+async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_path, caplog) -> None:
+    """Task 11: after the saver, the gateway (on the fake LLM here), the parse client on `cfg.parse_jobs_dir`
+    (its leftovers removed at the start), the CV store on `cfg.cv_store_dir` and the profile graphs on
+    their process-wide deps; `operation_deps` holds the same objects and the shared embedder, and the
+    gateway's HTTP client is closed at teardown."""
+    from jobhunter.graphs.profile.deps import ProfileDeps
+    from jobhunter.llm.gateway import LLMGateway
+    from jobhunter.profile.parse_client import ParseClient
+    from jobhunter.profile.storage import CvStore
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.operations import OperationDeps
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path)
+    leftover = world.parse_root / "a-crashed-job"
+    leftover.mkdir()
+    (leftover / "input.pdf").write_bytes(b"%PDF-")
+    assert await worker_main(world.cfg) == 0
+    assert not leftover.exists()
+    assert [e["count"] for e in logged(caplog, "parse_leftovers_removed")] == [1]
+    runtime = world.runtimes[0]
+    assert isinstance(runtime, WorkerRuntime)
+    assert isinstance(runtime.gateway, LLMGateway)
+    assert (
+        isinstance(runtime.parse_client, ParseClient)
+        and runtime.parse_client.root == world.cfg.parse_jobs_dir
+    )
+    assert isinstance(runtime.cv_store, CvStore) and runtime.cv_store.root == world.cfg.cv_store_dir
+    assert runtime.profile_graphs is world.profile_graphs
+    [profile_deps] = world.profile_deps
+    assert isinstance(profile_deps, ProfileDeps) and profile_deps.engine is runtime.engine
+    deps = runtime.operation_deps
+    assert isinstance(deps, OperationDeps)
+    assert (deps.cfg, deps.gateway, deps.parse_client, deps.cv_store, deps.profile_graphs, deps.embedder) == (
+        world.cfg,
+        runtime.gateway,
+        runtime.parse_client,
+        runtime.cv_store,
+        runtime.profile_graphs,
+        runtime.embedder,
+    )
+    assert runtime.gateway.http_client.is_closed  # the teardown's `llm` step
+    assert runtime.gateway.configured and logged(caplog, "llm_not_configured") == []
+
+
+async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_not_configured(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Task 23: a worker with neither the `anthropic_key` secret nor the fake LLM starts as any other (its
+    loops run, the teardown closes the gateway's client); its gateway is not configured, so every LLM call
+    fails `llm_not_configured`, and it says so once at start, at `warning`."""
+    from jobhunter.worker.main import worker_main
+    from jobhunter.worker.runtime import WorkerRuntime
+
+    world = World(monkeypatch, tmp_path, fake_llm=False)
+    assert not world.cfg.fake_llm and "anthropic_key" not in world.cfg.secrets
+    assert await worker_main(world.cfg) == 0
+    assert world.events == [
+        "lock_connect",
+        "lock_acquire",
+        "claim",
+        "watchdog_start",
+        "queue_open",
+        "saver_open",
+        "http_configure",
+        "make_clients",
+        "sync_instances",
+        "reconcile_start",
+        *TEARDOWN,
+    ]
+    runtime = world.runtimes[0]
+    assert isinstance(runtime, WorkerRuntime) and runtime.gateway.configured is False
+    assert runtime.operation_deps.gateway is runtime.gateway
+    [event] = logged(caplog, "llm_not_configured")
+    assert event["level"] == "warning"
+    assert runtime.gateway.http_client.is_closed
+
+
 async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_the_lock(
     monkeypatch, tmp_path, caplog
 ) -> None:
@@ -527,6 +625,16 @@ M1_RECONCILERS = {
     "group_representatives": ["heavy"],
     "awaiting_embedding": ["heavy"],
 }
+# The reconcilers M2 adds, by task: the spend ledger's two (Task 3), the gateway's refusal rate (Task 5), the
+# scope apply's permanent-failure recovery (Task 18) and the profile vectors' (Task 19, registered through
+# `profile.operations` -> `profile.vectors`).
+M2_RECONCILERS = {
+    "llm_ledger_unsettled": ["tick"],
+    "budget_counters": ["heavy"],
+    "llm_refusal_rate": ["heavy"],
+    "scope_apply_failed": ["tick"],
+    "profile_vectors": ["heavy"],
+}
 # Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
 # from `sys.modules` (each registry module is imported by the modules that register into it).
 _REGISTRY_SCRIPT = """\
@@ -540,6 +648,7 @@ print(json.dumps({
     },
     "sweeps": sorted(sys.modules["jobhunter.worker.epoch"]._SWEEPS),
     "handlers": sorted(sys.modules["jobhunter.worker.operations"].HANDLERS),
+    "failure_hooks": sorted(sys.modules["jobhunter.worker.operations"].FAILURE_HOOKS),
     "main_imported": "jobhunter.worker.main" in sys.modules,
 }))
 """
@@ -565,13 +674,25 @@ def registered_by(modules: tuple[str, ...]) -> dict[str, object]:
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
     """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
     (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
-    anyway), the registries hold exactly the M1 reconcilers with their cadences, the two takeover sweeps and
-    the `watchlist_validate` handler."""
+    anyway), the registries hold exactly the M1 and M2 reconcilers with their cadences, the two takeover
+    sweeps, the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
+    `propose_queries` (Task 20), `apply_scope` (Task 18) and `watchlist_validate` handlers, and the failure
+    hooks of the two profile phases and of the query proposal (`embed_profile` has none: it drives no domain
+    row). `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with
+    `profile.operations`, which imports `profile.vectors`; `worker.main` lists neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
-        "reconcilers": M1_RECONCILERS,
+        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS},
         "sweeps": ["operations", "runs"],
-        "handlers": ["watchlist_validate"],
+        "handlers": [
+            "apply_scope",
+            "embed_profile",
+            "extract_profile",
+            "extract_profile_text",
+            "propose_queries",
+            "watchlist_validate",
+        ],
+        "failure_hooks": ["extract_profile", "extract_profile_text", "propose_queries"],
         "main_imported": False,
     }

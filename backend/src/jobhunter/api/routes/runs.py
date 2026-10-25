@@ -11,12 +11,12 @@ second paid run. `request_manual_run` takes the same shared lock again, which is
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_engine, require_session
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
     StoredResponse,
@@ -38,6 +38,10 @@ _LOCK_ACTIVE_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR SHA
 
 
 class RunNowIn(BaseModel):
+    """`include_paid` only: an unknown member is refused (422 `validation_failed`), as by every other body."""
+
+    model_config = ConfigDict(extra="forbid")
+
     include_paid: bool
 
 
@@ -57,6 +61,7 @@ class RunNowOut(BaseModel):
             "description": "Invalid body, or the key was used for another request (`idempotency_key_reused`)"
         },
         **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
     },
 )
 async def run_now(

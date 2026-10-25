@@ -16,13 +16,19 @@ from jobhunter.cli_fixtures import (
     valid_url,
     validate_identifier,
 )
+from jobhunter.llm import fake
 from jobhunter.observability.redact import EMAIL, KEY, PHONE
 from jobhunter.types import JSONValue
 
 ROOT = Path("tests/contract/fixtures")
 # bodies, headers, meta and the label file; `.html` and `.txt` hold the bodies that are not JSON (the derived
-# HTML error page and the truncated feed page), so they are scanned like every other body
-FILES = sorted(p for p in ROOT.rglob("*") if p.suffix in (".json", ".xml", ".tsv", ".html", ".txt"))
+# HTML error page and the truncated feed page), so they are scanned like every other body; `.sse` holds the
+# recorded and hand-authored Anthropic streams under `anthropic/` (M2 Task 4)
+FILES = sorted(p for p in ROOT.rglob("*") if p.suffix in (".json", ".xml", ".tsv", ".html", ".txt", ".sse"))
+# M2 Task 4: every file under `anthropic/` is scanned, whatever its suffix (a stream, a header or a sidecar)
+ANTHROPIC_FILES = sorted(p for p in (ROOT / "anthropic").rglob("*") if p.is_file())
+# The response headers a committed Anthropic recording never keeps (spec §18.4; plan Task 4)
+ANTHROPIC_DROPPED_HEADERS = frozenset({"request-id", "anthropic-organization-id", "cf-ray", "set-cookie"})
 # Ruling T6-b: the plan's `\\s` (in a raw string: a backslash and an `s`) let `utm_source=s…` through.
 UTM = re.compile(r"utm_source=([^&\"'\s]+)")
 PHONE_DE = re.compile(
@@ -52,7 +58,13 @@ def outside_links(
     return URL_IN_TEXT.sub(lambda m: "" if valid_url(m.group(0)) else m.group(0), text)
 
 
-SECRET_VARS = ("RAPIDAPI_KEY", "SERPAPI_API_KEY", "ADZUNA_APP_ID", "ADZUNA_APP_KEY")
+SECRET_VARS = (
+    "RAPIDAPI_KEY",
+    "SERPAPI_API_KEY",
+    "ADZUNA_APP_ID",
+    "ADZUNA_APP_KEY",
+    "JOBHUNTER_ANTHROPIC_API_KEY",
+)
 
 
 def strings(
@@ -94,8 +106,11 @@ def test_fixture_has_no_pii_secret_or_key_shaped_value(path) -> None:
             "set-cookie",
             "authorization",
             "x-rapidapi-key",
+            "x-api-key",
             "cookie",
         }
+        if source == "anthropic":
+            assert not {k.lower() for k in doc["headers"]} & ANTHROPIC_DROPPED_HEADERS
     # each JSON string decoded, as the scrubber reads it: line breaks are real, and a contact window never
     # reaches into the next field
     named = [p for p, v in strings(doc) if role_names(v) or contact_names(v)]
@@ -121,6 +136,28 @@ def test_fixture_tree_is_not_empty() -> None:
         and (ROOT / "jsearch/search_v2_page1.json").exists()
         and (ROOT / "location_labels.tsv").exists()
     )
+
+
+def test_every_anthropic_fixture_is_scanned() -> None:
+    """The scan gates `anthropic/**` whole (M2 Task 4): no file there escapes it by its suffix, and the tree
+    holds at least the two V13 recordings with their sidecars."""
+    assert set(ANTHROPIC_FILES) <= set(FILES)
+    assert sum(1 for p in ANTHROPIC_FILES if p.suffix == ".sse") >= 2
+
+
+@pytest.mark.parametrize(
+    "path",
+    [p for p in ANTHROPIC_FILES if p.suffix == ".sse"],
+    ids=[str(p.relative_to(ROOT)) for p in ANTHROPIC_FILES if p.suffix == ".sse"],
+)
+def test_a_committed_anthropic_stream_stores_no_thinking_and_no_signature(path: Path) -> None:
+    """Thinking content is never stored (G6): a committed stream keeps the thinking events' shape only."""
+    for event in fake.parse_sse(path.read_bytes()):
+        for key_path, value in strings(event.data):
+            if key_path and key_path[-1] == "thinking":
+                assert value in ("", fake.THINKING_OMITTED), f"thinking text at {key_path}"
+            if key_path and key_path[-1] in ("signature", "data"):
+                assert value == fake.SIGNATURE_OMITTED, f"a thinking signature at {key_path}"
 
 
 # The scan's own patterns, proved on known values (6a review, findings 2 and 3).

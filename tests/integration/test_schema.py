@@ -29,7 +29,7 @@ M0_TABLES = {
     "purge_fences",
     "alembic_version",
 }
-LATER = {"llm_tuples", "profile_versions", "score_cycles", "deletion_manifests"}  # sources, postings: M1
+LATER = {"score_cycles", "deletion_manifests"}  # sources, postings: M1; llm_tuples, profile_versions: M2
 
 
 def rows(server: PgServer, statement: str, role: PgRole = "migrator") -> list[tuple[object, ...]]:
@@ -42,12 +42,19 @@ def test_tables(migrated: PgServer) -> None:
 
 
 def test_active_config_m2_columns_nullable(migrated: PgServer) -> None:
+    """The rubric and prompt-schema pointers stay nullable through M2: the seed sets both (M2 Task 6), and
+    M3's first migration restores the spec's NOT NULL (M0 Deviation 1, M2 plan Deviation 32)."""
     assert rows(
         migrated,
         "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name='active_config' "
         "AND column_name IN ('rubric_version_id','prompt_schema_version_id','settings_version_id') "
         "ORDER BY 1",
     ) == [("prompt_schema_version_id", "YES"), ("rubric_version_id", "YES"), ("settings_version_id", "NO")]
+    # Nullable, but set: the migrate seed points both at the seeded rows (tests/integration/test_seed_m2.py).
+    assert rows(
+        migrated,
+        "SELECT rubric_version_id IS NOT NULL, prompt_schema_version_id IS NOT NULL FROM active_config",
+    ) == [(True, True)]
 
 
 def test_text_search_and_unaccent(migrated: PgServer) -> None:

@@ -15,6 +15,8 @@ dependencies = [
     "langgraph==1.2.15",
     "langgraph-checkpoint-postgres==3.2.0",
     "langchain-core==1.6.11",
+    "anthropic==1.15.0",
+    "langchain-anthropic==1.7.6",
     "argon2-cffi==25.1.0",
     "pyotp==2.10.0",
     "cryptography==50.0.2",
@@ -25,6 +27,8 @@ dependencies = [
     "httpx==0.28.1",
     "defusedxml==0.7.1",
     "zstandard==0.25.0",
+    "pyyaml==6.0.3",
+    "python-multipart==0.0.32",
 ]
 
 [dependency-groups]
@@ -36,6 +40,7 @@ dev = [
     "mypy==2.4.0",
     "respx==0.23.1",
     "pip-audit==2.10.1",
+    "types-PyYAML==6.0.12.20260906",
 ]
 # The embedder image only (embedder/Dockerfile: `uv sync --only-group embedder`); never in the app image. The
 # base environment runs tests/embedder without it: embedder/app.py imports onnxruntime, tokenizers and numpy
@@ -47,6 +52,16 @@ embedder = [
     "onnxruntime==1.31.0",
     "tokenizers==0.23.3",
     "numpy==2.5.4",
+]
+# The docparse image only (docparse/Dockerfile: `uv sync --only-group docparse`); never in the app image: the
+# worker hands files to docparse over the parse_jobs volume (profile/parse_client.py) and imports none of it.
+# docparse/extract.py imports these inside its functions, so the base environment imports docparse.worker. Runs
+# that extract add `--group docparse`: `-m docparse tests/docparse`, and the integration tests that serve a
+# `docparse.worker` loop in process (tests/integration/test_parse_client.py, Task 11's op_runner).
+docparse = [
+    "pypdf==6.21.1",
+    "pdfplumber==0.11.10",
+    "python-docx==1.2.0",
 ]
 
 [project.scripts]
@@ -72,5 +87,7 @@ markers = [
     "contract: runs an adapter or the fixture scan on the scrubbed fixtures (tests/contract, spec §18.4)",
     "live: calls a real provider; never run in CI and deselected by default",
     "embedder_model: the real model in .model-cache/arctic; run with `uv run --group embedder pytest -m embedder_model`",
+    "payload: an LLM payload contract test (tests/payload, spec §10.9): offline, no database",
+    "docparse: the docparse extractor in process (tests/docparse); run with `uv run --group docparse pytest -m docparse tests/docparse`",
 ]
-addopts = "-m 'not stack and not perf and not live and not embedder_model'"
+addopts = "-m 'not stack and not perf and not live and not embedder_model and not docparse'"

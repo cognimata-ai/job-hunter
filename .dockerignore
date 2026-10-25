@@ -1,6 +1,6 @@
 # The build context is the repository root; the Dockerfiles copy only pyproject.toml, uv.lock,
-# .python-version and backend/ (Dockerfile) or embedder/ (embedder/Dockerfile). Secrets, the local virtualenv,
-# git metadata and caches never enter it.
+# .python-version and backend/ (Dockerfile), embedder/ (embedder/Dockerfile) or docparse/ (docparse/Dockerfile).
+# Secrets, the local virtualenv, git metadata and caches never enter it.
 .git
 .venv
 .secrets
@@ -15,3 +15,6 @@ frontend/dist
 .fixtures-raw
 # Local model downloads (embedder/download_model.sh, spike V7): the embedder image downloads its own at build.
 .model-cache
+# docparse/Dockerfile copies the docparse/ package whole; its build file is not part of the package. (Docker
+# still reads it: an ignored Dockerfile is only kept out of COPY.)
+docparse/Dockerfile

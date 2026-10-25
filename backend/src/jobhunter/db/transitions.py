@@ -289,6 +289,153 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
             allowed=frozenset({("open", "closed"), ("open", "abandoned")}),
             settable=frozenset({"gap_cursor"}),
         ),
+        # §7.16.8. `ready -> ready` (field edits) is a plain UPDATE of `draft_json`, not a transition. The two
+        # owner columns guard the extraction result: the `draft` node writes it only for the text (or the
+        # native-PDF choice) it started with (`transition(owner={...})`, Task 13).
+        "profile_drafts": TransitionSpec(
+            table="profile_drafts",
+            state_col="status",
+            reason_col="status_reason",
+            changed_at=MappingProxyType(
+                dict.fromkeys(
+                    (
+                        "extracting_text",
+                        "text_review",
+                        "extracting_profile",
+                        "ready",
+                        "failed",
+                        "confirmed",
+                        "discarded",
+                    ),
+                    "status_changed_at",
+                )
+            ),
+            owner_cols=frozenset({"reviewed_text_sha256", "native_pdf"}),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("uploaded", "extracting_text"),
+                    ("uploaded", "extracting_profile"),
+                    ("extracting_text", "text_review"),
+                    ("extracting_text", "failed"),
+                    ("text_review", "extracting_profile"),
+                    ("extracting_profile", "ready"),
+                    ("extracting_profile", "failed"),
+                    ("ready", "text_review"),
+                    ("ready", "confirmed"),
+                    ("text_review", "discarded"),
+                    ("ready", "discarded"),
+                    ("failed", "discarded"),
+                    ("failed", "extracting_profile"),
+                }
+            ),
+            settable=frozenset(
+                {
+                    "reviewed_text",
+                    "reviewed_text_sha256",
+                    "native_pdf",
+                    "transmitted_text_sha256",
+                    "draft_json",
+                    "validation_issues",
+                    "failure_code",
+                    "llm_call_id",
+                    "confirmed_profile_version_id",
+                    "confirm_response",
+                    "content_purged_at",
+                    "updated_at",
+                }
+            ),
+        ),
+        # §7.16.7, LLM entries: `billed` and `not_billed` are terminal. The two edges out of `ambiguous` are
+        # M3's batch items found later and M2's late online settlement (plan Deviation 24).
+        "llm_spend_ledger": TransitionSpec(
+            table="llm_spend_ledger",
+            state_col="state",
+            reason_col="evidence",
+            changed_at=MappingProxyType(
+                {
+                    "dispatched": "dispatched_at",
+                    **dict.fromkeys(("billed", "not_billed", "ambiguous"), "settled_at"),
+                }
+            ),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("reserved", "dispatched"),
+                    ("reserved", "not_billed"),
+                    ("dispatched", "billed"),
+                    ("dispatched", "not_billed"),
+                    ("dispatched", "ambiguous"),
+                    ("ambiguous", "billed"),
+                    ("ambiguous", "not_billed"),
+                }
+            ),
+            settable=frozenset({"settled_usd"}),
+        ),
+        # §7.11. §7.16 has no `llm_calls` machine: a call follows its ledger entry. No reason column
+        # (`error_code` and `refusal_category` are response columns) and no changed-at column:
+        # `first_event_at` and `ended_at` are settable like the rest of the response.
+        # `ambiguous -> completed | error` is a late online settlement (plan Deviation 24).
+        "llm_calls": TransitionSpec(
+            table="llm_calls",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType({}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("reserved", "dispatched"),
+                    ("reserved", "cancelled"),
+                    ("dispatched", "completed"),
+                    ("dispatched", "error"),
+                    ("dispatched", "ambiguous"),
+                    ("ambiguous", "completed"),
+                    ("ambiguous", "error"),
+                }
+            ),
+            settable=frozenset(
+                {
+                    "model_served",
+                    "http_status",
+                    "error_code",
+                    "stop_reason",
+                    "refusal_category",
+                    "provider_request_id",
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                    "output_tokens",
+                    "cost_usd",
+                    "output_json",
+                    "first_event_at",
+                    "ended_at",
+                }
+            ),
+        ),
+        # §7.5. The `purged` status (items removed, §20.2) has no edge in this milestone.
+        "query_proposals": TransitionSpec(
+            table="query_proposals",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType({}),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("running", "ready"), ("running", "failed")}),
+            settable=frozenset({"items", "llm_call_id"}),
+        ),
+        # §7.13. §7.16 has no `eval_runs` machine either: a run is `running` until it finishes or fails.
+        "eval_runs": TransitionSpec(
+            table="eval_runs",
+            state_col="status",
+            reason_col=None,
+            changed_at=MappingProxyType(dict.fromkeys(("completed", "failed"), "finished_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("running", "completed"), ("running", "failed")}),
+            settable=frozenset({"passed", "metrics", "cost_usd"}),
+        ),
         # §7.16.8. Keyed by `(provider, window_start)` and without an `id`, so `transition()` cannot update
         # it: `windows.save_window` checks its edge against this entry, and the trigger checks it again. A
         # closed window never changes state again.

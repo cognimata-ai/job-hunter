@@ -52,7 +52,8 @@ log = get_logger("jobhunter.worker.reconcilers")
 @dataclass(frozen=True)
 class ReconcileContext:
     """What a reconciler gets: the engine, the task app and its deferrer, the cadence's `now`, the worker
-    epoch, and the process's embedder client (`awaiting_embedding` needs it; `None` where there is none).
+    epoch, and the process's embedder client (`awaiting_embedding` and `profile_vectors` need it; `None` where
+    there is none).
 
     `on_superseded` is what `run_reconcilers` calls once a fence refused `epoch`: the worker requests its own
     graceful stop there (Ruling T24-a; the task bodies and the start pass it, `None` does nothing)."""

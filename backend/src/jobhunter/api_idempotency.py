@@ -19,6 +19,7 @@ its stored (JSONB-decoded) form too, so it renders byte for byte like every repl
 """
 
 import hashlib
+import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -30,7 +31,6 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import TextClause
 
 from jobhunter.api.errors import Problem
-from jobhunter.db.seed import canonical_json
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error, q
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue, get_object
@@ -67,8 +67,18 @@ _COMPLETE: Final = q(
 
 
 def request_fingerprint(body: JSONValue, path_params: Mapping[str, JSONValue]) -> bytes:
-    """The SHA-256 of the request: its parsed JSON body and its path parameters, as canonical JSON."""
-    return hashlib.sha256(canonical_json({"body": body, "path": dict(path_params)})).digest()
+    """The SHA-256 of the request: its parsed JSON body and its path parameters, as canonical JSON.
+
+    The canonical JSON of `db.seed.canonical_json` (sorted keys, no whitespace, UTF-8), except that a lone
+    UTF-16 surrogate, which a JSON body may carry as an escape (`"\\ud800"`), is encoded as its own bytes
+    (`surrogatepass`) instead of raising: the request then reaches the validation that refuses it (a 4xx)
+    instead of failing here with a 500. Any other text gives the bytes of `canonical_json`, so the fingerprint
+    of a valid request is unchanged. `canonical_json` itself stays strict: it feeds the content hashes.
+    """
+    text = json.dumps(
+        {"body": body, "path": dict(path_params)}, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest()
 
 
 @dataclass(frozen=True)
