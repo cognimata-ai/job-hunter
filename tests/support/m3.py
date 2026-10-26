@@ -11,6 +11,10 @@ so a test names only what it is about.
 the target in its final state needs no transition (the `score_targets` trigger checks UPDATEs only), so the
 result id is taken from the identity sequence first and the result is inserted with it
 (`OVERRIDING SYSTEM VALUE`).
+
+`insert_m1_configuration` and `insert_m2_seed_rows` put an older install's state in place by direct SQL, for
+the upgrade tests of migration 0008: no seed of this code runs against an older schema, because this code's
+seed writes columns that schema does not have yet (ruling T1-b).
 """
 
 from collections.abc import Mapping, Sequence
@@ -19,9 +23,16 @@ from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
 
+import psycopg
+from jobhunter.db.seed import SETTINGS_SCHEMA_VERSION, load_settings_v1
 from jobhunter.db.sql import q
+from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
+from jobhunter.scoring.rubric import RUBRIC_V1, load_rubric
+from psycopg.types.json import Jsonb
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import TextClause
+
+from tests.support.pg import PgServer
 
 NOW: Final = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 _BUDGET_MONTH: Final = date(2026, 10, 1)
@@ -439,3 +450,56 @@ async def insert_golden_case(c: AsyncConnection, job: Job, profile_version_id: i
         **columns,
     }
     return await insert_id(c, "golden_cases", values)
+
+
+_M1_CONFIGURATION: Final = (
+    "INSERT INTO scope_versions (scope_hash, payload) VALUES ('\\x01', '{}')",
+    "INSERT INTO model_policies (policy_hash, payload) VALUES ('\\x01', '{}')",
+    "INSERT INTO execution_configs (config_hash, payload) VALUES ('\\x01', '{}')",
+    "INSERT INTO evaluation_policies (version_no, policy_hash, payload, projected_critic_rate) "
+    "VALUES (1, '\\x01', '{}', 0.3)",
+    "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, "
+    "execution_config_id, evaluation_policy_id, effect_classes) "
+    "SELECT 1, %(schema_version)s, %(payload)s, s.id, m.id, e.id, p.id, '{none}' "
+    "FROM scope_versions s, model_policies m, execution_configs e, evaluation_policies p",
+    # M1's `active_config`: the four pointers of settings version 1, the rubric and prompt-schema ones NULL
+    "INSERT INTO active_config (id, settings_version_id, scope_version_id, model_policy_id, "
+    "execution_config_id, evaluation_policy_id) SELECT 1, id, scope_version_id, model_policy_id, "
+    "execution_config_id, evaluation_policy_id FROM settings_versions WHERE version_no = 1",
+)
+
+
+def insert_m1_configuration(server: PgServer) -> None:
+    """The configuration an M1 `migrate` leaves, on an empty database at 0006 or 0007: settings version 1 (the
+    packaged payload, whose schedule the next seed reads) over one row of each derived table, and the
+    `active_config` row naming them, with NULL rubric and prompt-schema pointers and no rows behind them."""
+    params = {"schema_version": SETTINGS_SCHEMA_VERSION, "payload": Jsonb(load_settings_v1())}
+    with psycopg.connect(server.dsn("migrator")) as conn:
+        for statement in _M1_CONFIGURATION:
+            conn.execute(statement, params if "%(" in statement else None)
+
+
+def insert_m2_seed_rows(server: PgServer, *, point: bool) -> tuple[int, int]:
+    """Rubric v1 and prompt-schema version 1 as M2's `migrate` seeded them, on a database at 0007; with
+    `point`, `active_config` names them as that seed left it. Returns `(rubric_id, prompt_schema_id)`."""
+    rubric = load_rubric(RUBRIC_V1)
+    templates, schemas = prompt_schema_v1()
+    with psycopg.connect(server.dsn("migrator")) as conn:
+        rubric_row = conn.execute(
+            "INSERT INTO rubric_versions (version, content_hash, weights, anchors) VALUES (%s, %s, %s, %s) "
+            "RETURNING id",
+            (RUBRIC_V1, rubric.content_hash, Jsonb(dict(rubric.weights)), Jsonb(dict(rubric.anchors))),
+        ).fetchone()
+        prompt_row = conn.execute(
+            "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) VALUES (%s, %s, %s) "
+            "RETURNING id",
+            (prompt_schema_hash(templates, schemas), Jsonb(templates), Jsonb(schemas)),
+        ).fetchone()
+        if rubric_row is None or prompt_row is None:
+            raise LookupError("an INSERT ... RETURNING returned no row")
+        if point:
+            conn.execute(
+                "UPDATE active_config SET rubric_version_id = %s, prompt_schema_version_id = %s",
+                (rubric_row[0], prompt_row[0]),
+            )
+    return int(rubric_row[0]), int(prompt_row[0])

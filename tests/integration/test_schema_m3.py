@@ -12,8 +12,6 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from jobhunter.db.alembic_runner import alembic_config, code_head
-from jobhunter.db.seed import seed_defaults
-from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import UNIQUE_VIOLATION, PgErrorInfo, pg_error
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -28,6 +26,8 @@ from tests.support.m3 import (
     insert_draft,
     insert_golden_case,
     insert_job,
+    insert_m1_configuration,
+    insert_m2_seed_rows,
     insert_published,
     insert_scoring_call,
     insert_submission,
@@ -208,23 +208,6 @@ async def _scaffold(c: AsyncConnection) -> tuple[ProfileChain, Job]:
     return await insert_profile_chain(c), await insert_job(c)
 
 
-TARGET = (
-    "INSERT INTO score_targets (job_revision_id, llm_tuple_id, job_id, state, state_reason, override, "
-    "override_at, claim_id, claim_epoch, claim_heartbeat_at, refusal_category, transient_failures) "
-    "VALUES (:revision, :tuple, :job, :state, :reason, :override, :override_at, :claim, :epoch, :heartbeat, "
-    ":category, :transient)"
-)
-TARGET_BASE = {
-    "state": "pending",
-    "reason": None,
-    "override": "none",
-    "override_at": None,
-    "claim": None,
-    "epoch": None,
-    "heartbeat": None,
-    "category": None,
-    "transient": 0,
-}
 SUBMISSION = (
     "INSERT INTO batch_submissions (state, llm_tuple_id, bulk_operation_id, request_count, request_hash, "
     "reserved_usd, followup_held_usd, provider_batch_id, submit_started_at, released_at) "
@@ -308,6 +291,7 @@ CLAIMED = {"state": "in_progress", "claim": uuid.uuid4(), "epoch": 1, "heartbeat
 @pytest.mark.parametrize(
     ("overrides", "fragments"),
     [
+        ({**CLAIMED, "claim": None}, ("claim_id", "claim_epoch", "claim_heartbeat_at")),
         ({**CLAIMED, "epoch": None}, ("claim_id", "claim_epoch", "claim_heartbeat_at")),
         ({**CLAIMED, "heartbeat": None}, ("claim_id", "claim_epoch", "claim_heartbeat_at")),
         ({"override": "score_now"}, ("override", "override_at")),
@@ -316,6 +300,7 @@ CLAIMED = {"state": "in_progress", "claim": uuid.uuid4(), "epoch": 1, "heartbeat
         ({"transient": -1}, ("transient_failures >= 0",)),  # A1 issue 4 (Deviation 2)
     ],
     ids=[
+        "in_progress_without_claim_id",
         "in_progress_without_epoch",
         "in_progress_without_heartbeat",
         "score_now_without_override_at",
@@ -637,35 +622,26 @@ async def test_the_trigger_refuses_a_disallowed_update(engine, table, make, upda
 async def test_the_guard_refuses_null_pointers_and_names_the_remedy(fresh_pg_server) -> None:
     """0008 opens with a guard: an install whose `active_config` row has a NULL rubric or prompt-schema
     pointer (one that never ran M2's `migrate`) gets a clear error instead of a bare NOT NULL violation, and
-    stays at 0007. Once the pointers are set, the upgrade passes; the migration inserts no row."""
+    stays at 0007. Once both pointers are set, the upgrade passes; the migration inserts no row. The state at
+    0007 is put in place by direct SQL (ruling T1-b): M2's seeded rows, with the pointers still NULL."""
     dsn = fresh_pg_server.dsn("migrator", driver="sqlalchemy")
     await asyncio.to_thread(command.upgrade, alembic_config(dsn), M2_HEAD)
-    engine = make_null_engine(dsn)
-    try:
-        async with engine.begin() as conn:
-            await seed_defaults(conn, now=NOW)  # M2's migrate: the row with both pointers set
-    finally:
-        await engine.dispose()
-    pointers = "SELECT rubric_version_id, prompt_schema_version_id FROM active_config"
-    seeded = pg_one(fresh_pg_server, "migrator", pointers)
-    assert seeded is not None and None not in seeded
-    for column in ("rubric_version_id", "prompt_schema_version_id"):
-        pg_one(fresh_pg_server, "migrator", f"UPDATE active_config SET {column} = NULL")  # noqa: S608
+    insert_m1_configuration(fresh_pg_server)
+    rubric, prompt_schema = insert_m2_seed_rows(fresh_pg_server, point=False)
+    point = "UPDATE active_config SET rubric_version_id = %s, prompt_schema_version_id = %s"
+    for pointers in ((None, None), (rubric, None), (None, prompt_schema)):
+        pg_one(fresh_pg_server, "migrator", point, *pointers)
         with pytest.raises(sa.exc.DBAPIError, match=r"run the M2 release's `migrate` first") as refusal:
             await asyncio.to_thread(command.upgrade, alembic_config(dsn), "head")
-        assert pg_error(refusal.value).sqlstate == "55000"  # object_not_in_prerequisite_state
+        assert pg_error(refusal.value).sqlstate == "55000", pointers  # object_not_in_prerequisite_state
         assert pg_one(fresh_pg_server, "migrator", "SELECT version_num FROM alembic_version") == (M2_HEAD,)
         assert pg_one(fresh_pg_server, "migrator", "SELECT to_regclass('score_targets')") == (None,)
-        pg_one(
-            fresh_pg_server,
-            "migrator",
-            "UPDATE active_config SET rubric_version_id = %s, prompt_schema_version_id = %s",
-            *seeded,
-        )
 
+    pg_one(fresh_pg_server, "migrator", point, rubric, prompt_schema)
     await asyncio.to_thread(command.upgrade, alembic_config(dsn), "head")
     assert pg_one(fresh_pg_server, "migrator", "SELECT version_num FROM alembic_version") == (code_head(),)
-    assert pg_one(fresh_pg_server, "migrator", pointers) == seeded
+    stored = "SELECT rubric_version_id, prompt_schema_version_id FROM active_config"
+    assert pg_one(fresh_pg_server, "migrator", stored) == (rubric, prompt_schema)
     counts = " UNION ALL ".join(f"SELECT count(*) FROM {table}" for table in sorted(M3_TABLES))  # noqa: S608
     assert pg_rows(fresh_pg_server, "migrator", counts) == [(0,)] * len(M3_TABLES)  # no INSERT (§19.3 step 2)
 

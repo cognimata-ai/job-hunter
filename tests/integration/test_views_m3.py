@@ -13,6 +13,7 @@ from decimal import Decimal
 import psycopg
 import pytest
 import sqlalchemy as sa
+from jobhunter.db.migrate import run_migrate_async
 from jobhunter.db.session import make_null_engine
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -186,13 +187,16 @@ _ROUND = sa.text(
 SUPERSEDED_ROUNDS = 150  # the planner prefers det_results_current from about 60 on (PG17)
 
 
-async def test_one_jobs_current_score_is_read_through_the_two_indexes(migrated: PgServer) -> None:
+async def test_one_jobs_current_score_is_read_through_the_two_indexes(fresh_pg_server, make_config) -> None:
     """The lookup of one job's current score finds the target by its unique key and the instance by the
     partial `det_results_current`, so it stays one index probe however many superseded instances a result
     collects (`det_results_result`, the Deviation 2 index of the cascade, would read them all). 30 scored jobs
-    whose results have 150 superseded instances and current ones under 21 scopes each, analysed; as the
-    migrator (the owner may ANALYZE), in a transaction that is rolled back."""
-    engine = make_null_engine(migrated.dsn("migrator", driver="sqlalchemy"))
+    whose results have 150 superseded instances and current ones under 21 scopes each, analysed as the
+    migrator (the owner may ANALYZE). On a server of its own: ANALYZE writes `pg_class` statistics in
+    place, which no rollback takes back, and the rows leave heap pages, so the shared server's planner
+    estimates would change for every later test."""
+    await run_migrate_async(make_config("migrate", fresh_pg_server))
+    engine = make_null_engine(fresh_pg_server.dsn("migrator", driver="sqlalchemy"))
     try:
         async with engine.connect() as c:
             chain = await activate(c)
@@ -208,7 +212,6 @@ async def test_one_jobs_current_score_is_read_through_the_two_indexes(migrated: 
             await c.execute(sa.text("SET LOCAL enable_seqscan = off"))  # 30 targets fit one page
             explain = sa.text("EXPLAIN SELECT * FROM current_scores WHERE job_id = :j")
             plan = "\n".join((await c.execute(explain, {"j": jobs[15].job_id})).scalars())
-            await c.rollback()
     finally:
         await engine.dispose()
     assert "score_targets_job_revision_id_llm_tuple_id_key" in plan, plan

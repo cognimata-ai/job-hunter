@@ -359,4 +359,6 @@ def test_reset_truncates_no_configuration_path(migrated) -> None:
         frontier = {str(child) for child, parent in edges if parent in frontier} - closure
         closure |= frontier
     assert sorted(closure & KEPT) == []
-    assert not {"jobs", "job_revisions", "duplicate_groups", "operations", "score_targets"} & closure
+    removed = {"jobs", "job_revisions", "duplicate_groups", "operations", "embeddings", "job_tombstones"}
+    assert sorted(removed & closure) == []  # the six tables `_TRUNCATE` no longer names
+    assert "score_targets" not in closure

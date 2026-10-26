@@ -14,11 +14,10 @@ import pytest
 from alembic import command
 from jobhunter.db.alembic_runner import alembic_config, code_head
 from jobhunter.db.migrate import run_migrate_async
-from jobhunter.db.seed import seed_defaults
-from jobhunter.db.session import make_null_engine
 from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
 from jobhunter.scoring.rubric import load_rubric
 
+from tests.support.m3 import insert_m1_configuration, insert_m2_seed_rows
 from tests.support.pg import PgServer, pg_one, pg_rows
 
 pytestmark = pytest.mark.integration
@@ -99,44 +98,31 @@ async def test_an_upgrade_from_0006_with_an_active_config_row_gets_its_pointers_
     fresh_pg_server, make_config
 ) -> None:
     """An install M1 left (NULL pointers, no rubric or prompt-schema row) passes through M2's `migrate`, whose
-    seed sets both pointers, before M3's: 0008 then restores NOT NULL over them (plan Deviation 5)."""
+    seed set both pointers, before M3's: 0008 then restores NOT NULL over them (plan Deviation 5), and M3's
+    seed changes neither them nor the other pointers. Both older states are put in place by direct SQL, so no
+    seed of this code runs against an older schema (ruling T1-b)."""
     dsn = fresh_pg_server.dsn("migrator", driver="sqlalchemy")
     await asyncio.to_thread(command.upgrade, alembic_config(dsn), M2_SCHEMA)
-    # A database as M1 left it: settings version 1 and an `active_config` row with NULL rubric and prompt
-    # pointers, and both tables empty (the seed of this code writes them, so they are taken back out).
-    engine = make_null_engine(dsn)
-    try:
-        async with engine.begin() as conn:
-            await seed_defaults(conn, now=NOW)
-        one(
-            fresh_pg_server,
-            "UPDATE active_config SET rubric_version_id = NULL, prompt_schema_version_id = NULL",
-        )
-        one(fresh_pg_server, "DELETE FROM rubric_versions")
-        one(fresh_pg_server, "DELETE FROM prompt_schema_versions")
-        assert one(
-            fresh_pg_server, "SELECT rubric_version_id, prompt_schema_version_id FROM active_config"
-        ) == (
-            None,
-            None,
-        )
-        others = one(fresh_pg_server, OTHER_POINTERS)
+    insert_m1_configuration(fresh_pg_server)  # a database as M1 left it
+    assert one(fresh_pg_server, "SELECT rubric_version_id, prompt_schema_version_id FROM active_config") == (
+        None,
+        None,
+    )
+    assert one(fresh_pg_server, COUNTS) == (0, 0)
+    others = one(fresh_pg_server, OTHER_POINTERS)
 
-        # M2's `migrate`: its migrations, then its seed
-        await asyncio.to_thread(command.upgrade, alembic_config(dsn), M2_HEAD)
-        async with engine.begin() as conn:
-            await seed_defaults(conn, now=NOW + timedelta(days=1))
-    finally:
-        await engine.dispose()
-    assert one(
-        fresh_pg_server,
-        "SELECT rubric_version_id IS NULL, prompt_schema_version_id IS NULL FROM active_config",
-    ) == (False, False)
+    # M2's `migrate`: its migrations, then its seed's rubric and prompt-schema rows and the two pointers
+    await asyncio.to_thread(command.upgrade, alembic_config(dsn), M2_HEAD)
+    seeded = insert_m2_seed_rows(fresh_pg_server, point=True)
 
-    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW + timedelta(days=2))
+    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW)
     assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (code_head(),)
     assert_points_at_v1(fresh_pg_server)
-    assert one(fresh_pg_server, OTHER_POINTERS) == others  # only the two pointers moved
+    assert (
+        one(fresh_pg_server, "SELECT rubric_version_id, prompt_schema_version_id FROM active_config")
+        == seeded
+    )
+    assert one(fresh_pg_server, OTHER_POINTERS) == others  # the seed moved no pointer
 
 
 async def test_every_migrate_leaves_both_pointers_set(migrated, make_config) -> None:
