@@ -4,20 +4,25 @@ never ad text).
 
 **Stage 1** (`parse_generator`) is the structural parse with the version's stored parser family (Task 4):
 `GeneratorWire` checks types, enums, required keys and that no key is extra, with no length or count limit;
-its failure (`StructuralFailure`) is the only fatal outcome (§9.4.2: one structural repair per attempt). A
-`generator_v1` version raises `PromptVersionUnscorable` before the output is read. The normaliser then builds
-the internal draft (`GeneratorDraft`, v1's shape) and returns what it found as a `Normalisation`, which Task 9
-stores beside the draft and merges into every later stage 2:
-- a single-valued code counts once (the first item; a later one is the repair `duplicate_fact`);
-  `remote_country` items are `remote_region.countries`, a `degree_or_equivalent` item sets `or_equivalent`,
-  `employment_type` items are `employment_types.values`, and their quotes join the fact's evidence;
+its failure (`StructuralFailure`) is the only fatal outcome (§9.4.2: one structural repair per attempt), and
+its path names schema keys and indices only (an unknown key is `<extra>`: never text the model wrote;
+Controller Ruling T5-g). A `generator_v1` version raises `PromptVersionUnscorable` before the output is read.
+The normaliser then builds the internal draft (`GeneratorDraft`, v1's shape) and returns what it found as a
+`Normalisation`, which Task 9 stores beside the draft and merges into every later stage 2:
+- a single-valued code counts once (the first item; a later one is the repair `duplicate_fact`). An
+  `onsite_only` item asserts on-site work by its presence, as a `degree_or_equivalent` item sets
+  `or_equivalent` (the rubric fixes `required: true` for it; Controller Ruling T5-f);
+- items that merge into one fact (`remote_region` with its `remote_country` items, `degree` with
+  `degree_or_equivalent`, the `employment_type` items) give that fact the first 2 distinct quotes in item
+  order: the cut is part of C's shape, no limit issue and no shortening (Controller Ruling T5-d);
 - `required_language` values are a language code or `other:<name>`, the qualifier a CEFR level (an invalid
   level is `unspecified` with the issue `qualifier_invalid`); `min_years_experience` is a whole number from
   0 to 40, else `null` with the repair and the issue `out_of_range` (L4390, L4347);
 - a value outside its code's vocabulary is `unspecified` (a single-valued code) or dropped (a list item) with
-  the issue `value_invalid`, as is a certification without a name (its fact id would be empty);
-- more than 2 quotes on one fact item is the V1 issue `too_many_quotes` (a merged fact's evidence may hold
-  more: the limit is per item, as C states facts);
+  the issue `value_invalid`, as is a certification or an `other:` language whose name gives an empty fact-id
+  subject (`facts.name_subject`);
+- more than 2 quotes on one fact item is the V1 issue `too_many_quotes` (the limit is per item, as C states
+  facts);
 - `criteria` are keyed by `criterion`, in §11.2's order: a missing key is `unknown`/`null` with the
   deterministic failure `criterion_missing` (A3 G3: never a parse failure), a duplicate keeps the first (the
   repair `duplicate_criterion`), and either is the V1 issue `criterion_count` ("exactly one item per
@@ -31,43 +36,50 @@ stores beside the draft and merges into every later stage 2:
    `unspecified` when there are several (`work_mode_structured`), and a `remote_region` value that
    contradicts its countries (L4370) becomes `unspecified` (`remote_region_contradiction`);
 2. V3 over the facts' quotes; then V4's deterministic `experience_seniority` (`det_criteria.seniority_level`
-   over the facts whose quotes ground, and the title's seniority tokens): a different level is replaced
-   (`seniority_recomputed`), with basis `observed` and the grounded fact quotes as its ad evidence (its own
-   when the facts give none), or `unknown`/`null` with no evidence when both sub-ratings are unknown (A3 G13).
-   A draft that says it is no job ad is never rated;
+   over the facts whose quotes ground, and the title's seniority tokens). `experience_seniority` is then
+   always the deterministic rating: a known level with basis `observed`, or `unknown`/`null` with no
+   evidence when both sub-ratings are unknown (A3 G13); a criterion that differs is replaced
+   (`seniority_recomputed`). The replacement's ad evidence is the first grounded quote of each fact used,
+   then the facts' further grounded quotes up to 2; its profile references and its rationale stay the
+   generator's (the "corrected" marker covers them; Controller Ruling T5-c). A known deterministic level is
+   exempt from V2's evidence rules and V1's evidence counts (the repair records the exempt codes), so the
+   correction never raises an issue or a failure, here or when a revision carries it. A draft that says it
+   is no job ad is never rated;
 3. V3 over the criteria's quotes. A quote grounds in one segment of the rendered `<job_ad>` (`ground_quote`:
    fold on both sides, a structured field's line or a description part, never a `marker` segment, so never
    across the truncation marker or from a field into the description); a description match maps back to its
    span in `job_revisions.description_text`. A profile quote grounds in the canonical serialisation of its
-   named section (`profile_sections`). A quote with an ellipsis, under 4 or over 300 characters, or with
-   fewer than 3 letters or digits fails (`quote_defect`, L4337, L4387), as does an unknown section
-   (`profile_section_unknown`). A failing quote is a `Failure` of its criterion or fact and an `Issue` at its
-   path; it stays in the draft (so a re-validation finds it again) and `repair_for_publication` drops it;
+   named section (`profile_sections`, the `<candidate_profile>` text). A quote with an ellipsis, under 4 or
+   over 300 characters, or with fewer than 3 letters or digits fails (`quote_defect`, L4337, L4387), as does
+   an unknown section (`profile_section_unknown`). A failing quote is a `Failure` of its criterion or fact
+   and an `Issue` at its path; it stays in the draft (so a re-validation finds it again) and
+   `repair_for_publication` drops it;
 4. V2: `unknown ⇔ level = null`, `unconstrained ⇒ level = 4` with an ad quote, `observed ⇒` a level and an
    ad quote (and a profile reference from level 1), every asserted fact with a quote;
 5. V4's consistency failures (L4373-4378): `languages_vs_unmet`, `languages_vs_met` (with at least one
    mandatory language), `skills_vs_must_have` (the overlap coefficient below 0.5 against every profile
    skill, Controller Ruling T3-b), `languages_unconstrained_with_requirements`, and one
    `not_a_job_ad_with_levels` per rated criterion of a draft that says it is no job ad;
-6. V1, the §11.5 limits of the draft (each an `Issue`, never a failure);
-7. V5 (`injection.detect` over the rendered block, so the title too) and V6 (`not_a_job_ad` adds the review
-   `not_a_job_ad:ad`), each an issue.
+6. V1, the §11.5 limits of the draft (`LIMITS`, each an `Issue`, never a failure);
+7. V5 (`injection.detect` over each part of the block that holds ad text) and V6 (`not_a_job_ad` adds the
+   review `not_a_job_ad:ad`), each an issue.
 The stage-1 normalisation merges first: its issues before V1's, its failures before V2's, its repairs before
 V4's. `DraftValidation.t1` is T1's condition (a limit issue or any failure; a repair is none).
 
 **Keys.** A failure names a criterion key, a fact id (`facts.derive_fact_ids`: the binding facts), or the
 pseudo key of an id-less fact (A3 G12): its C code (`work_mode`, `remote_region`, `employment_type`, …), or
-`<code>:<n>` for the `n`-th item (0-based) of `must_haves`, `nice_to_haves`, `required_languages` and
-`certifications` (`must_have:0`, `required_language:2`). A pseudo key is no `render.Issue` target.
+`<code>:<n>` for the `n`-th item (0-based) of `must_haves` (`must_have:<n>`), `nice_to_haves`,
+`required_languages` (`required_language:<n>`) and `certifications` (`certification_item:<n>`, which no fact
+id can equal). A pseudo key is no `render.Issue` target.
 
 **History.** `CorrectionHistory` is the normalisation and the first validation's corrections, immutable: a
 later validation of the stored (corrected) draft repairs nothing, so the caller passes the stored history
 and it is carried into publication (Codex r3 B10).
 
-**Publication** (`repair_for_publication`, L4380-4392): every length-limited string cut at its limit ending
-in `[…]`, every count-limited list cut to its first N, a number out of range `null`, every failing quote and
-invalid country code dropped and each evidence list cut to its first 2 remaining quotes; `truncated_fields`
-lists the history's repairs, then what publication cut.
+**Publication** (`repair_for_publication`, L4380-4392), from the one table `LIMITS` that V1 also reads: every
+length-limited string cut at its limit ending in `[…]`, every count-limited list cut to its first N, a number
+out of range `null`, every failing quote and invalid country code dropped and each evidence list cut to its
+first 2 remaining quotes; `truncated_fields` lists the history's repairs, then what publication cut.
 
 **The critic** (`validate_review`, §11.7.2): a target is an LLM criterion key with a criterion assessment,
 or a required fact id with a `fact_*` assessment; a review needs a grounded ad quote (the first 2 grounded
@@ -84,8 +96,14 @@ from typing import Final, Literal, Self, get_args, get_origin
 from pydantic import BaseModel, ValidationError
 
 from jobhunter.db.seed import canonical_json
-from jobhunter.llm.prompts.render import JobAdBlock, PromptVersionUnscorable, Segment
-from jobhunter.llm.schemas import ParserFamily, mirror_for
+from jobhunter.llm.prompts.render import (
+    JobAdBlock,
+    PromptVersionUnscorable,
+    Segment,
+    neutralise_block_tags,
+    profile_document,
+)
+from jobhunter.llm.schemas import ParserFamily, json_schema, mirror_for
 from jobhunter.llm.schemas.critic import CriticOut, Review
 from jobhunter.llm.schemas.generator import (
     Certification,
@@ -102,7 +120,6 @@ from jobhunter.llm.schemas.generator import (
     MinYearsExperience,
     OnsiteOnly,
     ProfileRef,
-    ProfileRefWire,
     RemoteRegion,
     RequiredLanguage,
     Requirement,
@@ -112,10 +129,17 @@ from jobhunter.llm.schemas.generator import (
     WorkPermit,
 )
 from jobhunter.llm.schemas.profile import ConfirmedProfile
-from jobhunter.normalize.text import fold, fold_with_offsets
+from jobhunter.normalize.text import REMOVED_CHARS, fold, fold_with_offsets
 from jobhunter.scoring import injection
-from jobhunter.scoring.det_criteria import MIN_YEARS_RANGE, seniority_level
-from jobhunter.scoring.facts import NOT_A_JOB_AD, FactRef, binding_facts, derive_fact_ids, fact_id
+from jobhunter.scoring.det_criteria import MIN_YEARS_RANGE, min_years_in_range, seniority_level
+from jobhunter.scoring.facts import (
+    NOT_A_JOB_AD,
+    FactRef,
+    binding_facts,
+    derive_fact_ids,
+    fact_id,
+    name_subject,
+)
 from jobhunter.scoring.filters import DetFacts
 from jobhunter.scoring.knockouts import Confirmation, compare_language, token_set_similarity
 from jobhunter.scoring.rubric import LLM_CRITERIA
@@ -173,6 +197,8 @@ QUOTE_FAILURE_CODES: Final = frozenset(
         "profile_section_unknown",
     }
 )
+# What a known deterministic `experience_seniority` is exempt from: V2's evidence rules and V1's counts.
+SENIORITY_EXEMPT: Final = ("ad_evidence_missing", "profile_evidence_missing", "too_many_quotes")
 PROFILE_SECTIONS: Final[tuple[str, ...]] = get_args(ProfileRef.model_fields["section"].annotation)
 CRITERION_ASSESSMENTS: Final = frozenset(
     {
@@ -185,6 +211,63 @@ CRITERION_ASSESSMENTS: Final = frozenset(
     }
 )
 FACT_ASSESSMENTS: Final = frozenset({"fact_confirmed", "fact_rejected", "fact_uncertain"})
+
+
+@dataclass(frozen=True)
+class Limit:
+    """One limited place of the draft (`pattern`: dotted keys, `*` for every criterion, `name[]` for every
+    item of a list) and its §11.5 limit: a `text` of at most `limit` characters (and `words`), a list of at
+    most `limit` `items` (`countries`: ISO codes), a list of at most `limit` `quotes`, or the `years` range.
+    `checked` is false for the fact quotes, which stage 1 checks per C item."""
+
+    pattern: str
+    kind: Literal["text", "items", "countries", "quotes", "years"]
+    limit: int = 0
+    words: int | None = None
+    checked: bool = True
+
+
+_FACT_EVIDENCE: Final = (
+    "work_mode",
+    "onsite_only",
+    "remote_region",
+    "required_languages[]",
+    "must_haves[]",
+    "nice_to_haves[]",
+    "seniority",
+    "min_years_experience",
+    "industry",
+    "employment_types",
+    "degree",
+    "certifications[]",
+    "security_clearance",
+    "work_permit",
+)
+# In the order publication applies them (and records what it cut): a list is cut before its items' texts.
+LIMITS: Final[tuple[Limit, ...]] = (
+    Limit("summary_en", "text", SUMMARY_MAX_CHARS, SUMMARY_MAX_WORDS),
+    Limit("summary_de", "text", SUMMARY_MAX_CHARS, SUMMARY_MAX_WORDS),
+    Limit("criteria.*.rationale", "text", RATIONALE_MAX_CHARS, RATIONALE_MAX_WORDS),
+    Limit("criteria.*.ad_evidence", "quotes", QUOTES_PER_CRITERION),
+    Limit("criteria.*.profile_evidence", "quotes", QUOTES_PER_CRITERION),
+    Limit("job_facts.remote_region.countries", "countries", COUNTRIES_MAX),
+    Limit("job_facts.required_languages", "items", LANGUAGES_MAX),
+    Limit("job_facts.must_haves", "items", REQUIREMENTS_MAX),
+    Limit("job_facts.nice_to_haves", "items", REQUIREMENTS_MAX),
+    Limit("job_facts.certifications", "items", CERTIFICATIONS_MAX),
+    Limit("job_facts.min_years_experience.value", "years"),
+    Limit("job_facts.required_languages[].language_other", "text", LANGUAGE_OTHER_MAX_CHARS),
+    Limit("job_facts.must_haves[].text", "text", REQUIREMENT_MAX_CHARS),
+    Limit("job_facts.nice_to_haves[].text", "text", REQUIREMENT_MAX_CHARS),
+    Limit("job_facts.industry.value", "text", NAME_MAX_CHARS),
+    Limit("job_facts.degree.field", "text", NAME_MAX_CHARS),
+    Limit("job_facts.certifications[].name", "text", NAME_MAX_CHARS),
+    Limit("job_facts.security_clearance.level", "text", CLEARANCE_LEVEL_MAX_CHARS),
+    *(
+        Limit(f"job_facts.{fact}.evidence", "quotes", QUOTES_PER_FACT, checked=False)
+        for fact in _FACT_EVIDENCE
+    ),
+)
 
 
 # ---- the records -------------------------------------------------------------------------------------------
@@ -213,11 +296,13 @@ class Failure:
 @dataclass(frozen=True)
 class Repair:
     """A correction (the normaliser's, or V4's repairable ones), with the value it replaced when that is a
-    code or a number (`None` otherwise: never ad text)."""
+    code or a number (`None` otherwise: never ad text), and the failure and issue codes the corrected value is
+    exempt from (`SENIORITY_EXEMPT` for a deterministic seniority)."""
 
     path: str
     code: str
     replaced: JSONValue = None
+    exempt: tuple[str, ...] = ()
 
 
 def _issue_json(issue: Issue) -> dict[str, JSONValue]:
@@ -229,7 +314,8 @@ def _failure_json(failure: Failure) -> dict[str, JSONValue]:
 
 
 def _repair_json(repair: Repair) -> dict[str, JSONValue]:
-    return {"path": repair.path, "code": repair.code, "replaced": repair.replaced}
+    exempt: list[JSONValue] = list(repair.exempt)
+    return {"path": repair.path, "code": repair.code, "replaced": repair.replaced, "exempt": exempt}
 
 
 def _issue_of(doc: JSONValue) -> Issue:
@@ -241,8 +327,12 @@ def _failure_of(doc: JSONValue) -> Failure:
 
 
 def _repair_of(doc: JSONValue) -> Repair:
-    replaced = get_object(doc, "").get("replaced")
-    return Repair(get_str(doc, "path"), get_str(doc, "code"), replaced)
+    fields = get_object(doc, "")
+    exempt = fields.get("exempt", [])
+    if not isinstance(exempt, list) or not all(isinstance(code, str) for code in exempt):
+        raise TypeError("exempt: expected a list of codes")
+    codes = tuple(code for code in exempt if isinstance(code, str))
+    return Repair(get_str(doc, "path"), get_str(doc, "code"), fields.get("replaced"), codes)
 
 
 @dataclass(frozen=True)
@@ -299,7 +389,8 @@ class CorrectionHistory:
 
 @dataclass(frozen=True)
 class StructuralFailure:
-    """The structural parse failed: pydantic's error type and the dotted path of the first error."""
+    """The structural parse failed: pydantic's error type and the dotted path of the first error, of schema
+    keys and indices only (an unknown key is `<extra>`)."""
 
     error_class: str
     path: str
@@ -390,16 +481,39 @@ class CriticValidation:
 # ---- stage 1 -----------------------------------------------------------------------------------------------
 
 
-def _structural(error: ValidationError) -> StructuralFailure:
+@functools.cache
+def _schema_keys(model: type[BaseModel]) -> frozenset[str]:
+    """Every property name of `model`'s JSON schema, its `$defs` included."""
+    keys: set[str] = set()
+
+    def walk(node: JSONValue) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                keys.update(properties)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(json_schema(model))
+    return frozenset(keys)
+
+
+def _structural(error: ValidationError, model: type[BaseModel]) -> StructuralFailure:
+    """The first error, with a path of schema keys and indices only (Controller Ruling T5-g)."""
     first = error.errors()[0]
-    return StructuralFailure(first["type"], ".".join(str(step) for step in first["loc"]))
+    keys = _schema_keys(model)
+    steps = [str(s) if isinstance(s, int) or s in keys else "<extra>" for s in first["loc"]]
+    return StructuralFailure(first["type"], ".".join(steps))
 
 
 def _model(wire: JSONValue, model: type[BaseModel]) -> BaseModel | StructuralFailure:
     try:
         return model.model_validate(wire)
     except ValidationError as error:
-        return _structural(error)
+        return _structural(error, model)
 
 
 def parse_generator(wire: JSONValue, *, family: ParserFamily) -> ParsedGenerator | StructuralFailure:
@@ -426,20 +540,7 @@ def parse_critic(wire: JSONValue) -> CriticOut | StructuralFailure:
     raise TypeError("the critic mirror returned another model")  # pragma: no cover
 
 
-_SINGLE_CODES: Final = frozenset(
-    {
-        "work_mode",
-        "onsite_only",
-        "remote_region",
-        "seniority",
-        "min_years_experience",
-        "industry",
-        "degree",
-        "degree_or_equivalent",
-        "security_clearance",
-        "work_permit",
-    }
-)
+# The single-valued codes and the draft fact each fills.
 _CODE_PATH: Final = {
     "work_mode": "job_facts.work_mode",
     "onsite_only": "job_facts.onsite_only",
@@ -452,6 +553,7 @@ _CODE_PATH: Final = {
     "security_clearance": "job_facts.security_clearance",
     "work_permit": "job_facts.work_permit",
 }
+_SINGLE_CODES: Final = frozenset(_CODE_PATH)
 
 
 def _vocabulary(model: type[BaseModel], name: str) -> dict[str, str]:
@@ -479,6 +581,15 @@ def _blank_to_none(text: str) -> str | None:
     return text if text.strip() else None
 
 
+def _merged(quotes: Sequence[Sequence[str]]) -> list[str]:
+    """The evidence of one fact from its items' quotes: one item's as they are; several items' merged, the
+    first `QUOTES_PER_FACT` distinct quotes in item order (part of C's shape, no shortening)."""
+    if len(quotes) <= 1:
+        return [quote for item in quotes for quote in item]
+    distinct = dict.fromkeys(quote for item in quotes for quote in item)
+    return list(distinct)[:QUOTES_PER_FACT]
+
+
 class _Normaliser:
     """The state of one normalisation: the draft's facts as they are built, and what was found."""
 
@@ -493,7 +604,7 @@ class _Normaliser:
         self.languages: list[RequiredLanguage] = []
         self.must_haves: list[Requirement] = []
         self.nice_to_haves: list[Requirement] = []
-        self.employment: list[FactItem] = []
+        self.employment: list[FactItem] = []  # the items of a valid employment type
         self.employment_values: list[str] = []
         self.certifications: list[Certification] = []
 
@@ -523,15 +634,16 @@ class _Normaliser:
             self.quotes(item, f"job_facts.{code}s[{len(target)}]")
             target.append(Requirement(text=item.value, evidence=list(item.evidence)))
         elif code == "employment_type":
-            self.employment.append(item)
             self.quotes(item, "job_facts.employment_types")
             value = _EMPLOYMENT_TYPES.get(item.value.strip().lower())
             if value is None:
                 self.invalid("job_facts.employment_types.values", code)
-            elif value not in self.employment_values:
+                return
+            self.employment.append(item)
+            if value not in self.employment_values:
                 self.employment_values.append(value)
         elif code == "certification":
-            if not fold(item.value):
+            if not name_subject(item.value):
                 self.invalid("job_facts.certifications", code)
                 return
             self.quotes(item, f"job_facts.certifications[{len(self.certifications)}]")
@@ -546,7 +658,7 @@ class _Normaliser:
         other: str | None = None
         if text.lower().startswith(_OTHER_PREFIX):
             other = text[len(_OTHER_PREFIX) :].strip()
-            code = "other" if fold(other) else ""
+            code = "other" if name_subject(other) else ""
         else:
             code = text.lower() if text.lower() in _LANGUAGES else ""
         if not code:
@@ -574,10 +686,10 @@ class _Normaliser:
         order): a vocabulary value, or the minimum years."""
         if code == "min_years_experience":
             text = item.value.strip()
-            low, high = MIN_YEARS_RANGE
-            if _WHOLE_NUMBER.fullmatch(text) and low <= (years := int(text)) <= high:
+            if _WHOLE_NUMBER.fullmatch(text) and min_years_in_range(years := int(text)):
                 self.years = years
                 return
+            low, high = MIN_YEARS_RANGE
             path = "job_facts.min_years_experience.value"
             self.repairs.append(Repair(path, "out_of_range"))
             self.issues.append(Issue("out_of_range", path, {"min": low, "max": high}))
@@ -591,76 +703,66 @@ class _Normaliser:
             self.invalid(f"{_CODE_PATH[code]}.{field_name}", code)
         self.read[code] = value or "unspecified"
 
-    def evidence(self, code: str) -> list[str]:
-        item = self.single.get(code)
-        return [] if item is None else list(item.evidence)
+    def evidence(self, *codes: str) -> list[str]:
+        """The evidence of the fact the single-valued `codes` fill (`_merged`)."""
+        return _merged([self.single[code].evidence for code in codes if code in self.single])
 
     def job_facts(self) -> JobFacts:
         single = self.single
-        work_mode = self.read.get("work_mode", "unspecified")
-        region = self.read.get("remote_region", "unspecified")
-        seniority = self.read.get("seniority", "unspecified")
-        degree_level = self.read.get("degree", "unspecified")
         degree = single.get("degree")
-        equivalent = single.get("degree_or_equivalent")
         clearance = single.get("security_clearance")
         industry = single.get("industry")
-        return JobFacts.model_validate(
-            {
-                "work_mode": WorkMode.model_validate(
-                    {"value": work_mode, "evidence": self.evidence("work_mode")}
-                ),
-                "onsite_only": OnsiteOnly(
-                    asserted=single["onsite_only"].required if "onsite_only" in single else False,
-                    evidence=self.evidence("onsite_only"),
-                ),
-                "remote_region": RemoteRegion.model_validate(
-                    {
-                        "value": region,
-                        "countries": [item.value.strip().upper() for item in self.countries],
-                        "evidence": self.evidence("remote_region")
-                        + [quote for item in self.countries for quote in item.evidence],
-                    }
-                ),
-                "required_languages": self.languages,
-                "must_haves": self.must_haves,
-                "nice_to_haves": self.nice_to_haves,
-                "seniority": Seniority.model_validate(
-                    {"value": seniority, "evidence": self.evidence("seniority")}
-                ),
-                "min_years_experience": MinYearsExperience(
-                    value=self.years, evidence=self.evidence("min_years_experience")
-                ),
-                "industry": Industry(
-                    value=None if industry is None else _blank_to_none(industry.value),
-                    evidence=self.evidence("industry"),
-                ),
-                "employment_types": EmploymentTypes.model_validate(
-                    {
-                        "values": self.employment_values,
-                        "evidence": [quote for item in self.employment for quote in item.evidence],
-                    }
-                ),
-                "degree": Degree.model_validate(
-                    {
-                        "level": degree_level,
-                        "mandatory": degree.required if degree is not None else False,
-                        "or_equivalent": equivalent is not None,
-                        "field": None if degree is None else _blank_to_none(degree.qualifier),
-                        "evidence": self.evidence("degree") + self.evidence("degree_or_equivalent"),
-                    }
-                ),
-                "certifications": self.certifications,
-                "security_clearance": SecurityClearance(
-                    required=clearance.required if clearance is not None else False,
-                    level=None if clearance is None else _blank_to_none(clearance.qualifier),
-                    evidence=self.evidence("security_clearance"),
-                ),
-                "work_permit": WorkPermit(
-                    required=single["work_permit"].required if "work_permit" in single else False,
-                    evidence=self.evidence("work_permit"),
-                ),
-            }
+        region_items = [single["remote_region"]] if "remote_region" in single else []
+        return JobFacts(
+            work_mode=WorkMode.model_validate(
+                {"value": self.read.get("work_mode", "unspecified"), "evidence": self.evidence("work_mode")}
+            ),
+            onsite_only=OnsiteOnly(asserted="onsite_only" in single, evidence=self.evidence("onsite_only")),
+            remote_region=RemoteRegion.model_validate(
+                {
+                    "value": self.read.get("remote_region", "unspecified"),
+                    "countries": [item.value.strip().upper() for item in self.countries],
+                    "evidence": _merged([item.evidence for item in (*region_items, *self.countries)]),
+                }
+            ),
+            required_languages=self.languages,
+            must_haves=self.must_haves,
+            nice_to_haves=self.nice_to_haves,
+            seniority=Seniority.model_validate(
+                {"value": self.read.get("seniority", "unspecified"), "evidence": self.evidence("seniority")}
+            ),
+            min_years_experience=MinYearsExperience(
+                value=self.years, evidence=self.evidence("min_years_experience")
+            ),
+            industry=Industry(
+                value=None if industry is None else _blank_to_none(industry.value),
+                evidence=self.evidence("industry"),
+            ),
+            employment_types=EmploymentTypes.model_validate(
+                {
+                    "values": self.employment_values,
+                    "evidence": _merged([item.evidence for item in self.employment]),
+                }
+            ),
+            degree=Degree.model_validate(
+                {
+                    "level": self.read.get("degree", "unspecified"),
+                    "mandatory": degree.required if degree is not None else False,
+                    "or_equivalent": "degree_or_equivalent" in single,
+                    "field": None if degree is None else _blank_to_none(degree.qualifier),
+                    "evidence": self.evidence("degree", "degree_or_equivalent"),
+                }
+            ),
+            certifications=self.certifications,
+            security_clearance=SecurityClearance(
+                required=clearance.required if clearance is not None else False,
+                level=None if clearance is None else _blank_to_none(clearance.qualifier),
+                evidence=self.evidence("security_clearance"),
+            ),
+            work_permit=WorkPermit(
+                required=single["work_permit"].required if "work_permit" in single else False,
+                evidence=self.evidence("work_permit"),
+            ),
         )
 
     def criteria(self, items: Sequence[CriterionItem]) -> DraftCriteria:
@@ -712,11 +814,6 @@ def _normalise(wire: GeneratorWire) -> ParsedGenerator:
 
 # ---- grounding (V3) ----------------------------------------------------------------------------------------
 
-_INVISIBLE: Final = frozenset(
-    "\N{SOFT HYPHEN}\N{ZERO WIDTH SPACE}\N{ZERO WIDTH NON-JOINER}\N{ZERO WIDTH JOINER}"
-    "\N{ZERO WIDTH NO-BREAK SPACE}"
-)  # removed by `fold`
-
 
 def quote_defect(quote: str) -> str | None:
     """Why `quote` can never ground (L4337, L4387), or `None`: `quote_ellipsis` (`…` or `...`),
@@ -761,7 +858,9 @@ def _span(part: _FoldedSegment, at: int, length: int) -> tuple[int, int]:
     start = part.offsets[at]
     end = part.offsets[last + 1] if last + 1 < len(part.offsets) else len(part.text)
     end = max(end, part.offsets[last] + 1)  # a match ending inside one character's folded form takes it all
-    while end > part.offsets[last] + 1 and (part.text[end - 1].isspace() or part.text[end - 1] in _INVISIBLE):
+    while end > part.offsets[last] + 1 and (
+        part.text[end - 1].isspace() or part.text[end - 1] in REMOVED_CHARS
+    ):
         end -= 1
     return start, end
 
@@ -780,31 +879,67 @@ def _ground_ad(folded_quote: str, ad: JobAdBlock) -> Grounding | None:
     return None
 
 
+def _grounding(
+    quote: str, ad: JobAdBlock, profile_sections: Mapping[str, str], section: str | None
+) -> Grounding | str:
+    """Where `quote` grounds, or the V3 failure code why it does not (the one check every caller uses)."""
+    if section is not None and section not in profile_sections:
+        return "profile_section_unknown"
+    defect = quote_defect(quote)
+    if defect is not None:
+        return defect
+    folded = fold(quote)
+    if section is None:
+        found = _ground_ad(folded, ad)
+    else:
+        found = (
+            Grounding("profile", section, None, None) if folded in fold(profile_sections[section]) else None
+        )
+    return "quote_ungrounded" if found is None else found
+
+
 def ground_quote(
     quote: str, ad: JobAdBlock, profile_sections: Mapping[str, str], *, section: str | None = None
 ) -> Grounding | None:
     """Where `quote` grounds (module docstring, stage 2 step 3): in the `<job_ad>` block, or with `section`
     in that profile section's canonical serialisation; `None` when it does not, or cannot (`quote_defect`,
     an unknown section)."""
-    if quote_defect(quote) is not None:
-        return None
-    folded = fold(quote)
-    if section is None:
-        return _ground_ad(folded, ad)
-    text = profile_sections.get(section)
-    if text is None or folded not in fold(text):
-        return None
-    return Grounding("profile", section, None, None)
+    found = _grounding(quote, ad, profile_sections, section)
+    return found if isinstance(found, Grounding) else None
 
 
 def profile_sections(profile: ConfirmedProfile) -> dict[str, str]:
-    """The canonical serialisation (`db.seed.canonical_json`, as `<candidate_profile>` holds the profile) of
-    each section a profile reference can name, in the schema's order."""
-    doc = profile.model_dump(mode="json", exclude={"user_entered"})
-    return {name: canonical_json(doc[name]).decode("utf-8") for name in PROFILE_SECTIONS}
+    """The canonical serialisation of each section a profile reference can name, in the schema's order: each
+    section's part of the `<candidate_profile>` block (`render.profile_document`, block tags neutralised)."""
+    doc = profile_document(profile)
+    return {
+        name: neutralise_block_tags(canonical_json(doc[name]).decode("utf-8")) for name in PROFILE_SECTIONS
+    }
 
 
-# ---- stage 2 -----------------------------------------------------------------------------------------------
+# ---- the limits table over a draft document ----------------------------------------------------------------
+
+
+def _places(
+    node: JSONValue, steps: Sequence[str], prefix: str
+) -> Iterator[tuple[str, dict[str, JSONValue], str]]:
+    """Every place a `Limit` pattern names in a draft document: its path, its object and its key."""
+    if not isinstance(node, dict) or not steps:
+        return
+    step, rest = steps[0], steps[1:]
+    for key in list(node) if step == "*" else [step.removesuffix("[]")]:
+        if key not in node:
+            continue
+        path = f"{prefix}.{key}" if prefix else key
+        value = node[key]
+        if step.endswith("[]"):
+            if isinstance(value, list):
+                for i, item in enumerate(value):
+                    yield from _places(item, rest, f"{path}[{i}]")
+        elif rest:
+            yield from _places(value, rest, path)
+        else:
+            yield path, node, key
 
 
 def _words(text: str) -> int:
@@ -817,6 +952,50 @@ def _iso_countries() -> frozenset[str]:
     text = resources.files("jobhunter.geo").joinpath("data", "country_names_de.tsv").read_text("utf-8")
     codes = {line.split("\t", 1)[0] for line in text.splitlines() if line and not line.startswith("#")}
     return frozenset(codes | {"DE"})
+
+
+def _valid_country(code: JSONValue) -> bool:
+    return isinstance(code, str) and code.strip().upper() in _iso_countries()
+
+
+def _text_issues(path: str, text: str, max_chars: int, max_words: int | None) -> Iterator[Issue]:
+    if max_words is not None and _words(text) > max_words:
+        yield Issue("too_many_words", path, {"max_words": max_words})
+    if len(text) > max_chars:
+        yield Issue("too_many_chars", path, {"max_chars": max_chars})
+
+
+def _limits(draft: GeneratorDraft, exempt: frozenset[str]) -> Iterator[Issue]:
+    """V1 over the draft (`LIMITS`; the quotes per fact item are stage 1's); a path in `exempt` is not
+    counted (the evidence of a deterministic seniority)."""
+    doc: JSONValue = draft.model_dump(mode="json")
+    for limit in LIMITS:
+        if not limit.checked:
+            continue
+        for path, node, key in _places(doc, limit.pattern.split("."), ""):
+            value = node[key]
+            if limit.kind == "text" and isinstance(value, str):
+                yield from _text_issues(path, value, limit.limit, limit.words)
+            elif limit.kind in ("items", "countries", "quotes") and isinstance(value, list):
+                if path in exempt:
+                    continue
+                if len(value) > limit.limit:
+                    code, name = (
+                        ("too_many_quotes", "max_quotes")
+                        if limit.kind == "quotes"
+                        else ("too_many_items", "max_items")
+                    )
+                    yield Issue(code, path, {name: limit.limit})
+                if limit.kind == "countries":
+                    for i, country in enumerate(value):
+                        if not _valid_country(country):
+                            yield Issue("country_invalid", f"{path}[{i}]", {})
+            elif limit.kind == "years" and isinstance(value, int) and not min_years_in_range(value):
+                low, high = MIN_YEARS_RANGE
+                yield Issue("out_of_range", path, {"min": low, "max": high})
+
+
+# ---- stage 2 -----------------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -866,7 +1045,7 @@ def _facts(facts: JobFacts) -> Iterator[_Fact]:
     )
     yield fact(("degree",), "degree", degree.evidence, asserted)
     for i, certification in enumerate(facts.certifications):
-        yield fact(("certifications", i), f"certification:{i}", certification.evidence, True)
+        yield fact(("certifications", i), f"certification_item:{i}", certification.evidence, True)
     clearance = facts.security_clearance
     asserted = clearance.required or stated(clearance.level)
     yield fact(("security_clearance",), "security_clearance", clearance.evidence, asserted)
@@ -884,38 +1063,23 @@ class _Validation:
         self.groundings: dict[str, list[Grounding]] = {}
         self.grounded: dict[str, list[str]] = {}  # the grounded quotes of each evidence list
 
-    def fail_quote(self, key: str, path: str, code: str) -> None:
-        self.quote_issues.append(Issue(code, path, {"key": key}))
-        if Failure(key, code) not in self.quote_failures:
-            self.quote_failures.append(Failure(key, code))
-
-    def ground(self, key: str, path: str, quotes: Sequence[str]) -> None:
-        """V3 over the ad quotes of one evidence list."""
+    def ground(self, key: str, path: str, quotes: Sequence[str], sections: Sequence[str | None]) -> None:
+        """V3 over one evidence list: each quote, with its profile section (`None` for an ad quote)."""
         groundings = self.groundings.setdefault(path, [])
         grounded = self.grounded.setdefault(path, [])
-        for i, quote in enumerate(quotes):
-            defect = quote_defect(quote)
-            found = None if defect else ground_quote(quote, self.ctx.ad, self.ctx.profile_sections)
-            if found is None:
-                self.fail_quote(key, f"{path}[{i}]", defect or "quote_ungrounded")
-            else:
+        for i, (quote, section) in enumerate(zip(quotes, sections, strict=True)):
+            found = _grounding(quote, self.ctx.ad, self.ctx.profile_sections, section)
+            if isinstance(found, Grounding):
                 groundings.append(found)
                 grounded.append(quote)
-
-    def ground_profile(self, key: str, path: str, refs: Sequence[ProfileRefWire]) -> None:
-        """V3 over the profile references of one criterion."""
-        groundings = self.groundings.setdefault(path, [])
-        for i, ref in enumerate(refs):
-            if ref.section not in self.ctx.profile_sections:
-                self.fail_quote(key, f"{path}[{i}]", "profile_section_unknown")
                 continue
-            defect = quote_defect(ref.quote)
-            sections = self.ctx.profile_sections
-            found = None if defect else ground_quote(ref.quote, self.ctx.ad, sections, section=ref.section)
-            if found is None:
-                self.fail_quote(key, f"{path}[{i}]", defect or "quote_ungrounded")
-            else:
-                groundings.append(found)
+            self.quote_issues.append(Issue(found, f"{path}[{i}]", {"key": key}))
+            if Failure(key, found) not in self.quote_failures:
+                self.quote_failures.append(Failure(key, found))
+
+
+def _ad_quotes(key: str, path: str, quotes: Sequence[str], run: _Validation) -> None:
+    run.ground(key, path, quotes, [None] * len(quotes))
 
 
 def _dedupe_fact_ids(facts: JobFacts, run: _Validation) -> JobFacts:
@@ -944,12 +1108,12 @@ def _dedupe_fact_ids(facts: JobFacts, run: _Validation) -> JobFacts:
     )
 
 
-_REMOTE_MODES: Final = ("remote", "hybrid", "onsite")
+_WORK_MODES: Final = ("remote", "hybrid", "onsite")
 
 
 def _work_mode(facts: JobFacts, run: _Validation) -> JobFacts:
     """V4: a work mode the structured work modes do not include becomes the structured one (L4369)."""
-    structured = [mode for mode in dict.fromkeys(run.ctx.structured_work_modes) if mode in _REMOTE_MODES]
+    structured = [mode for mode in dict.fromkeys(run.ctx.structured_work_modes) if mode in _WORK_MODES]
     value = facts.work_mode.value
     if not structured or value == "unspecified" or value in structured:
         return facts
@@ -973,18 +1137,26 @@ def _remote_region(facts: JobFacts, run: _Validation) -> JobFacts:
     return facts.model_copy(update={"remote_region": region.model_copy(update={"value": "unspecified"})})
 
 
-def _seniority(draft: GeneratorDraft, facts: JobFacts, run: _Validation) -> DraftCriteria:
-    """V4: the deterministic `experience_seniority` replaces a different level (module docstring, step 2)."""
+def _capped(*quote_lists: Sequence[str]) -> list[str]:
+    """The first quote of each list, then the lists' further quotes in order, distinct, at most
+    `QUOTES_PER_CRITERION`."""
+    firsts = [quotes[0] for quotes in quote_lists if quotes]
+    rest = [quote for quotes in quote_lists for quote in quotes[1:]]
+    return list(dict.fromkeys([*firsts, *rest]))[:QUOTES_PER_CRITERION]
+
+
+def _seniority(draft: GeneratorDraft, facts: JobFacts, run: _Validation) -> tuple[DraftCriteria, bool]:
+    """V4: `experience_seniority` becomes the deterministic rating (module docstring, step 2); with whether
+    it is a known deterministic level (exempt from V2's evidence rules and V1's evidence counts)."""
     criteria = draft.criteria
     if draft.not_a_job_ad:
-        return criteria
+        return criteria, False
     seniority = facts.seniority
     seniority_quotes = run.grounded.get("job_facts.seniority.evidence", [])
     years = facts.min_years_experience
     years_quotes = run.grounded.get("job_facts.min_years_experience.evidence", [])
     use_seniority = seniority.value != "unspecified" and bool(seniority_quotes)
-    low, high = MIN_YEARS_RANGE
-    use_years = years.value is not None and low <= years.value <= high and bool(years_quotes)
+    use_years = years.value is not None and min_years_in_range(years.value) and bool(years_quotes)
     level = seniority_level(
         run.ctx.profile,
         seniority if use_seniority else None,
@@ -992,18 +1164,21 @@ def _seniority(draft: GeneratorDraft, facts: JobFacts, run: _Validation) -> Draf
         run.ctx.det.seniority_tokens,
     )
     current = criteria.experience_seniority
-    if level == current.level:
-        return criteria
-    run.repairs.append(Repair("criteria.experience_seniority.level", "seniority_recomputed", current.level))
+    path = "criteria.experience_seniority.level"
     if level is None:
+        if current.level is None and current.basis == "unknown":
+            return criteria, False
+        run.repairs.append(Repair(path, "seniority_recomputed", current.level))
         replaced = DraftCriterion(
             level=None, basis="unknown", ad_evidence=[], profile_evidence=[], rationale=current.rationale
         )
-    else:
-        quotes = (seniority_quotes if use_seniority else []) + (years_quotes if use_years else [])
-        evidence = list(dict.fromkeys(quotes)) or list(current.ad_evidence)
-        replaced = current.model_copy(update={"level": level, "basis": "observed", "ad_evidence": evidence})
-    return criteria.model_copy(update={"experience_seniority": replaced})
+        return criteria.model_copy(update={"experience_seniority": replaced}), False
+    if current.level == level and current.basis == "observed":
+        return criteria, True  # the generator's rating is the deterministic one
+    run.repairs.append(Repair(path, "seniority_recomputed", current.level, SENIORITY_EXEMPT))
+    evidence = _capped(seniority_quotes if use_seniority else [], years_quotes if use_years else [])
+    replaced = current.model_copy(update={"level": level, "basis": "observed", "ad_evidence": evidence})
+    return criteria.model_copy(update={"experience_seniority": replaced}), True
 
 
 def _criteria(criteria: DraftCriteria) -> Iterator[tuple[str, DraftCriterion]]:
@@ -1011,8 +1186,9 @@ def _criteria(criteria: DraftCriteria) -> Iterator[tuple[str, DraftCriterion]]:
         yield key, getattr(criteria, key)
 
 
-def _level_basis(criteria: DraftCriteria) -> Iterator[Failure]:
-    """V2 over the criteria (L4361)."""
+def _level_basis(criteria: DraftCriteria, exempt: str | None) -> Iterator[Failure]:
+    """V2 over the criteria (L4361); the criterion `exempt` (a deterministic seniority) has no evidence
+    rules."""
     for key, c in _criteria(criteria):
         if c.basis == "unknown":
             if c.level is not None:
@@ -1022,6 +1198,8 @@ def _level_basis(criteria: DraftCriteria) -> Iterator[Failure]:
             yield Failure(key, "level_missing")
         elif c.basis == "unconstrained" and c.level != 4:
             yield Failure(key, "unconstrained_not_4")
+        if key == exempt:
+            continue
         if not c.ad_evidence:
             yield Failure(key, "ad_evidence_missing")
         if c.basis == "observed" and c.level is not None and c.level >= 1 and not c.profile_evidence:
@@ -1051,55 +1229,10 @@ def _consistency(draft: GeneratorDraft, ctx: ValidationContext) -> Iterator[Fail
                 yield Failure(key, "not_a_job_ad_with_levels")
 
 
-def _text_limit(path: str, text: str | None, max_chars: int, max_words: int | None = None) -> Iterator[Issue]:
-    if text is None:
-        return
-    if max_words is not None and _words(text) > max_words:
-        yield Issue("too_many_words", path, {"max_words": max_words})
-    if len(text) > max_chars:
-        yield Issue("too_many_chars", path, {"max_chars": max_chars})
-
-
-def _count_limit(path: str, items: Sequence[object], max_items: int) -> Iterator[Issue]:
-    if len(items) > max_items:
-        yield Issue("too_many_items", path, {"max_items": max_items})
-
-
-def _limits(draft: GeneratorDraft) -> Iterator[Issue]:
-    """V1 over the draft (§11.5 L4330-4347; the quotes per fact item are stage 1's)."""
-    yield from _text_limit("summary_en", draft.summary_en, SUMMARY_MAX_CHARS, SUMMARY_MAX_WORDS)
-    yield from _text_limit("summary_de", draft.summary_de, SUMMARY_MAX_CHARS, SUMMARY_MAX_WORDS)
-    for key, c in _criteria(draft.criteria):
-        path = f"criteria.{key}"
-        yield from _text_limit(f"{path}.rationale", c.rationale, RATIONALE_MAX_CHARS, RATIONALE_MAX_WORDS)
-        for name, items in (("ad_evidence", c.ad_evidence), ("profile_evidence", c.profile_evidence)):
-            if len(items) > QUOTES_PER_CRITERION:
-                yield Issue("too_many_quotes", f"{path}.{name}", {"max_quotes": QUOTES_PER_CRITERION})
-    facts = draft.job_facts
-    region = facts.remote_region
-    yield from _count_limit("job_facts.remote_region.countries", region.countries, COUNTRIES_MAX)
-    for i, country in enumerate(region.countries):
-        if country.strip().upper() not in _iso_countries():
-            yield Issue("country_invalid", f"job_facts.remote_region.countries[{i}]", {})
-    yield from _count_limit("job_facts.required_languages", facts.required_languages, LANGUAGES_MAX)
-    for i, language in enumerate(facts.required_languages):
-        path = f"job_facts.required_languages[{i}].language_other"
-        yield from _text_limit(path, language.language_other, LANGUAGE_OTHER_MAX_CHARS)
-    for name, requirements in (("must_haves", facts.must_haves), ("nice_to_haves", facts.nice_to_haves)):
-        yield from _count_limit(f"job_facts.{name}", requirements, REQUIREMENTS_MAX)
-        for i, requirement in enumerate(requirements):
-            yield from _text_limit(f"job_facts.{name}[{i}].text", requirement.text, REQUIREMENT_MAX_CHARS)
-    years = facts.min_years_experience.value
-    low, high = MIN_YEARS_RANGE
-    if years is not None and not low <= years <= high:
-        yield Issue("out_of_range", "job_facts.min_years_experience.value", {"min": low, "max": high})
-    yield from _text_limit("job_facts.industry.value", facts.industry.value, NAME_MAX_CHARS)
-    yield from _text_limit("job_facts.degree.field", facts.degree.field, NAME_MAX_CHARS)
-    yield from _count_limit("job_facts.certifications", facts.certifications, CERTIFICATIONS_MAX)
-    for i, certification in enumerate(facts.certifications):
-        yield from _text_limit(f"job_facts.certifications[{i}].name", certification.name, NAME_MAX_CHARS)
-    level = facts.security_clearance.level
-    yield from _text_limit("job_facts.security_clearance.level", level, CLEARANCE_LEVEL_MAX_CHARS)
+def _injection_patterns(ad: JobAdBlock) -> list[JSONValue]:
+    """The names of the V5 patterns that hit a part of the block holding ad text (never its frame)."""
+    texts = (ad.text[s.block_start : s.block_end] for s in ad.segments if s.kind != "marker")
+    return [name for name in sorted({hit.name for text in texts for hit in injection.detect(text)})]
 
 
 def validate_draft(
@@ -1116,42 +1249,45 @@ def validate_draft(
     facts = _remote_region(_work_mode(_dedupe_fact_ids(draft.job_facts, run), run), run)
     fact_list = list(_facts(facts))
     for fact in fact_list:
-        run.ground(fact.key, fact.path, fact.evidence)
-    criteria = _seniority(draft.model_copy(update={"job_facts": facts}), facts, run)
+        _ad_quotes(fact.key, fact.path, fact.evidence, run)
+    criteria, deterministic = _seniority(draft.model_copy(update={"job_facts": facts}), facts, run)
     corrected = draft.model_copy(update={"job_facts": facts, "criteria": criteria})
     for key, c in _criteria(criteria):
-        run.ground(key, f"criteria.{key}.ad_evidence", c.ad_evidence)
-        run.ground_profile(key, f"criteria.{key}.profile_evidence", c.profile_evidence)
+        _ad_quotes(key, f"criteria.{key}.ad_evidence", c.ad_evidence, run)
+        refs = c.profile_evidence
+        run.ground(
+            key, f"criteria.{key}.profile_evidence", [r.quote for r in refs], [r.section for r in refs]
+        )
+    exempt = "experience_seniority" if deterministic else None
     failures = [
         *normalisation.failures,
-        *_level_basis(criteria),
-        *(
-            Failure(fact.key, "fact_evidence_missing")
-            for fact in fact_list
-            if fact.asserted and not fact.evidence
-        ),
+        *_level_basis(criteria, exempt),
+        *(Failure(f.key, "fact_evidence_missing") for f in fact_list if f.asserted and not f.evidence),
         *run.quote_failures,
         *_consistency(corrected, ctx),
     ]
-    issues = [*normalisation.issues, *_limits(corrected), *run.quote_issues]
-    hits = injection.detect(ctx.ad.text)
-    suspected = bool(hits) or draft.injection_observed
+    exempt_paths = (
+        frozenset(f"criteria.experience_seniority.{name}" for name in ("ad_evidence", "profile_evidence"))
+        if deterministic
+        else frozenset()
+    )
+    issues = [*normalisation.issues, *_limits(corrected, exempt_paths), *run.quote_issues]
+    patterns = _injection_patterns(ctx.ad)
+    suspected = bool(patterns) or draft.injection_observed
     if suspected:
-        names: list[JSONValue] = [name for name in sorted({hit.name for hit in hits})]
-        path = "job_ad" if hits else "injection_observed"
+        path = "job_ad" if patterns else "injection_observed"
         issues.append(
-            Issue("injection_suspected", path, {"patterns": names, "observed": draft.injection_observed})
+            Issue("injection_suspected", path, {"patterns": patterns, "observed": draft.injection_observed})
         )
     fact_ids = derive_fact_ids(facts)
     if draft.not_a_job_ad:
         issues.append(Issue("not_a_job_ad", "not_a_job_ad", {"required_review": NOT_A_JOB_AD.fact_id}))
         fact_ids[NOT_A_JOB_AD.fact_id] = NOT_A_JOB_AD
-    repairs = [*normalisation.repairs, *run.repairs]
     return DraftValidation(
         draft=corrected,
         issues=issues,
         failures=failures,
-        repairs=repairs,
+        repairs=[*normalisation.repairs, *run.repairs],
         groundings=run.groundings,
         fact_ids=fact_ids,
         injection_suspected=suspected,
@@ -1179,118 +1315,22 @@ def cut_text(text: str, *, max_chars: int, max_words: int | None = None) -> str 
     return f"{prefix} {TRUNCATION_MARK}" if prefix else TRUNCATION_MARK
 
 
-class _Publication:
-    """The state of one `repair_for_publication`: the quote paths to drop and the paths it cut."""
-
-    def __init__(self, validation: DraftValidation) -> None:
-        self.dropped = {issue.path for issue in validation.issues if issue.code in QUOTE_FAILURE_CODES}
-        self.cut: list[str] = []
-
-    def text(self, path: str, text: str, max_chars: int, max_words: int | None = None) -> str:
-        repaired = cut_text(text, max_chars=max_chars, max_words=max_words)
-        if repaired is None:
-            return text
-        self.cut.append(path)
-        return repaired
-
-    def optional(self, path: str, text: str | None, max_chars: int) -> str | None:
-        return None if text is None else self.text(path, text, max_chars)
-
-    def items[T](self, path: str, items: Sequence[T], max_items: int) -> list[T]:
-        kept = [x for i, x in enumerate(items) if f"{path}[{i}]" not in self.dropped]
-        if len(kept) > max_items:
-            kept = kept[:max_items]
-        if len(kept) != len(items):
-            self.cut.append(path)
-        return kept
-
-
-def _publish_facts(facts: JobFacts, run: _Publication) -> JobFacts:
-    def evidence(path: str, quotes: Sequence[str]) -> list[str]:
-        return run.items(f"{path}.evidence", quotes, QUOTES_PER_FACT)
-
-    region = facts.remote_region
-    countries = [c for c in region.countries if c.strip().upper() in _iso_countries()][:COUNTRIES_MAX]
-    if len(countries) != len(region.countries):  # an invalid code dropped, or the list cut (L4389)
-        run.cut.append("job_facts.remote_region.countries")
-    languages = []
-    for i, x in enumerate(run.items("job_facts.required_languages", facts.required_languages, LANGUAGES_MAX)):
-        path = f"job_facts.required_languages[{i}]"
-        other = run.optional(f"{path}.language_other", x.language_other, LANGUAGE_OTHER_MAX_CHARS)
-        languages.append(
-            x.model_copy(update={"language_other": other, "evidence": evidence(path, x.evidence)})
-        )
-    requirements: dict[str, list[Requirement]] = {}
-    for name in ("must_haves", "nice_to_haves"):
-        kept = run.items(f"job_facts.{name}", getattr(facts, name), REQUIREMENTS_MAX)
-        requirements[name] = [
-            Requirement(
-                text=run.text(f"job_facts.{name}[{i}].text", x.text, REQUIREMENT_MAX_CHARS),
-                evidence=evidence(f"job_facts.{name}[{i}]", x.evidence),
-            )
-            for i, x in enumerate(kept)
-        ]
-    years = facts.min_years_experience
-    low, high = MIN_YEARS_RANGE
-    years_value = years.value
-    if years_value is not None and not low <= years_value <= high:
-        run.cut.append("job_facts.min_years_experience.value")
-        years_value = None
-    certifications = [
-        x.model_copy(
-            update={
-                "name": run.text(f"job_facts.certifications[{i}].name", x.name, NAME_MAX_CHARS),
-                "evidence": evidence(f"job_facts.certifications[{i}]", x.evidence),
-            }
-        )
-        for i, x in enumerate(run.items("job_facts.certifications", facts.certifications, CERTIFICATIONS_MAX))
-    ]
-    clearance = facts.security_clearance
-    return JobFacts(
-        work_mode=facts.work_mode.model_copy(
-            update={"evidence": evidence("job_facts.work_mode", facts.work_mode.evidence)}
-        ),
-        onsite_only=facts.onsite_only.model_copy(
-            update={"evidence": evidence("job_facts.onsite_only", facts.onsite_only.evidence)}
-        ),
-        remote_region=region.model_copy(
-            update={"countries": countries, "evidence": evidence("job_facts.remote_region", region.evidence)}
-        ),
-        required_languages=languages,
-        must_haves=requirements["must_haves"],
-        nice_to_haves=requirements["nice_to_haves"],
-        seniority=facts.seniority.model_copy(
-            update={"evidence": evidence("job_facts.seniority", facts.seniority.evidence)}
-        ),
-        min_years_experience=MinYearsExperience(
-            value=years_value, evidence=evidence("job_facts.min_years_experience", years.evidence)
-        ),
-        industry=Industry(
-            value=run.optional("job_facts.industry.value", facts.industry.value, NAME_MAX_CHARS),
-            evidence=evidence("job_facts.industry", facts.industry.evidence),
-        ),
-        employment_types=facts.employment_types.model_copy(
-            update={"evidence": evidence("job_facts.employment_types", facts.employment_types.evidence)}
-        ),
-        degree=facts.degree.model_copy(
-            update={
-                "field": run.optional("job_facts.degree.field", facts.degree.field, NAME_MAX_CHARS),
-                "evidence": evidence("job_facts.degree", facts.degree.evidence),
-            }
-        ),
-        certifications=certifications,
-        security_clearance=clearance.model_copy(
-            update={
-                "level": run.optional(
-                    "job_facts.security_clearance.level", clearance.level, CLEARANCE_LEVEL_MAX_CHARS
-                ),
-                "evidence": evidence("job_facts.security_clearance", clearance.evidence),
-            }
-        ),
-        work_permit=facts.work_permit.model_copy(
-            update={"evidence": evidence("job_facts.work_permit", facts.work_permit.evidence)}
-        ),
-    )
+def _publish(limit: Limit, path: str, value: JSONValue, dropped: set[str]) -> JSONValue:
+    """`value` repaired by `limit` (it is the value itself when nothing is to repair)."""
+    if limit.kind == "text":
+        if not isinstance(value, str):
+            return value
+        repaired = cut_text(value, max_chars=limit.limit, max_words=limit.words)
+        return value if repaired is None else repaired
+    if limit.kind == "years":
+        return None if isinstance(value, int) and not min_years_in_range(value) else value
+    if not isinstance(value, list):
+        return value
+    if limit.kind == "countries":
+        return [code for code in value if _valid_country(code)][: limit.limit]
+    if limit.kind == "quotes":
+        return [x for i, x in enumerate(value) if f"{path}[{i}]" not in dropped][: limit.limit]
+    return value[: limit.limit]
 
 
 def repair_for_publication(
@@ -1299,30 +1339,18 @@ def repair_for_publication(
     """The publication repairs of `draft` (module docstring, Publication; `validation` is its last
     validation): the repaired draft and `truncated_fields`, the history's repair paths, then each path that
     publication cut, once each."""
-    run = _Publication(validation)
-    summary_en = run.text("summary_en", draft.summary_en, SUMMARY_MAX_CHARS, SUMMARY_MAX_WORDS)
-    summary_de = run.text("summary_de", draft.summary_de, SUMMARY_MAX_CHARS, SUMMARY_MAX_WORDS)
-    criteria: dict[str, DraftCriterion] = {}
-    for key, c in _criteria(draft.criteria):
-        path = f"criteria.{key}"
-        criteria[key] = DraftCriterion(
-            level=c.level,
-            basis=c.basis,
-            rationale=run.text(f"{path}.rationale", c.rationale, RATIONALE_MAX_CHARS, RATIONALE_MAX_WORDS),
-            ad_evidence=run.items(f"{path}.ad_evidence", c.ad_evidence, QUOTES_PER_CRITERION),
-            profile_evidence=run.items(f"{path}.profile_evidence", c.profile_evidence, QUOTES_PER_CRITERION),
-        )
-    repaired = draft.model_copy(
-        update={
-            "summary_en": summary_en,
-            "summary_de": summary_de,
-            "criteria": DraftCriteria.model_validate(criteria),
-            "job_facts": _publish_facts(draft.job_facts, run),
-        }
-    )
+    dropped = {issue.path for issue in validation.issues if issue.code in QUOTE_FAILURE_CODES}
+    doc: JSONValue = draft.model_dump(mode="json")
+    cut: list[str] = []
+    for limit in LIMITS:
+        for path, node, key in list(_places(doc, limit.pattern.split("."), "")):
+            repaired = _publish(limit, path, node[key], dropped)
+            if repaired != node[key]:
+                node[key] = repaired
+                cut.append(path)
     history = validation.history
-    paths = [r.path for r in (*history.normalisation.repairs, *history.corrections)] + run.cut
-    return repaired, list(dict.fromkeys(paths))
+    paths = [r.path for r in (*history.normalisation.repairs, *history.corrections)] + cut
+    return GeneratorDraft.model_validate(doc), list(dict.fromkeys(paths))
 
 
 # ---- the critic (§11.7.2, §11.7.3) -------------------------------------------------------------------------
@@ -1336,7 +1364,7 @@ _DECIDED: Final = frozenset({"critic_confirmed", "critic_rejected"})
 
 def _review_limits(i: int, review: Review) -> Iterator[Issue]:
     path = f"reviews[{i}]"
-    yield from _text_limit(
+    yield from _text_issues(
         f"{path}.explanation", review.explanation, EXPLANATION_MAX_CHARS, EXPLANATION_MAX_WORDS
     )
     if len(review.ad_evidence) > QUOTES_PER_REVIEW:
@@ -1349,10 +1377,9 @@ def _review_groundings(
     """The groundings of a review's first `QUOTES_PER_REVIEW` grounded quotes; each failing quote an issue."""
     found: list[Grounding] = []
     for j, quote in enumerate(review.ad_evidence):
-        defect = quote_defect(quote)
-        grounding = None if defect else ground_quote(quote, ctx.ad, ctx.profile_sections)
-        if grounding is None:
-            issues.append(Issue(defect or "quote_ungrounded", f"reviews[{i}].ad_evidence[{j}]", {}))
+        grounding = _grounding(quote, ctx.ad, ctx.profile_sections, None)
+        if not isinstance(grounding, Grounding):
+            issues.append(Issue(grounding, f"reviews[{i}].ad_evidence[{j}]", {}))
         elif len(found) < QUOTES_PER_REVIEW:
             found.append(grounding)
     return found
@@ -1361,15 +1388,15 @@ def _review_groundings(
 def validate_review(
     review: CriticOut,
     *,
-    draft: GeneratorDraft,
+    validation: DraftValidation,
     required: Sequence[FactRef],
     ctx: ValidationContext,
-    draft_failures: Sequence[Failure],
 ) -> CriticValidation:
-    """The critic review of `draft` validated, with its derived outcome (§11.7.2; module docstring).
+    """The critic review of a validated draft (`validation`: its corrected draft and its unresolved
+    failures, the stored normalisation's included), with its derived outcome (§11.7.2; module docstring).
     `required` are the facts the critic had to review (`knockouts.required_facts`; `not_a_job_ad:ad` is
-    required whenever the draft says it is no job ad), `draft_failures` the draft's unresolved failures
-    (`DraftValidation.failures`, the stored normalisation's included)."""
+    required whenever the draft says it is no job ad)."""
+    draft = validation.draft
     required_ids = list(dict.fromkeys(ref.fact_id for ref in required))
     if draft.not_a_job_ad and NOT_A_JOB_AD.fact_id not in required_ids:
         required_ids.append(NOT_A_JOB_AD.fact_id)
@@ -1431,7 +1458,7 @@ def validate_review(
         and all(status in _DECIDED for status in ordered.values())
         and not disputes
         and review.injection != "present_influenced"
-        and not draft_failures
+        and not validation.failures
     ):
         outcome = "accept"
     else:

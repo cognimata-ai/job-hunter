@@ -33,11 +33,12 @@ helpers are shared with the `onsite_required` knockout (`scoring.knockouts`).
 **The deterministic `experience_seniority` rating** (§11.3 L4085-4103), which the validator puts in place of
 the generator's level (V4, §11.6): `seniority_level` is the minimum of the two sub-ratings whose inputs are
 known, `None` when neither is.
-- *Level.* The ladder `SENIORITY_LADDER` (intern, working student, apprentice 0; junior 1; mid 2; senior 3;
-  lead, principal 4; head 5) and `g = profile level - ad level`: 0 is 4, +1 is 3, -1 is 2, +2 is 1, and
-  ≤ -2 or ≥ +3 is 0. The ad's level is the `seniority` fact's value; when the ad states none (`unspecified`,
-  or the caller passes no fact), the title's seniority tokens give it when they name one ladder level (a
-  title with tokens of two levels, `Junior/Senior`, says nothing).
+- *Level.* The ordinal scale `SENIORITY_ORDINAL` (intern, working student, apprentice 0; junior 1; mid 2;
+  senior 3; lead, principal 4; head 5; not `normalize.titles.SENIORITY_LADDER`, the order of the levels) and
+  `g = profile level - ad level`: 0 is 4, +1 is 3, -1 is 2, +2 is 1, and ≤ -2 or ≥ +3 is 0. The ad's level
+  is the `seniority` fact's value; when the ad states none (`unspecified`, or the caller passes no fact), the
+  title's seniority tokens give it when they name one ordinal level (a title with tokens of two levels,
+  `Junior/Senior`, says nothing).
 - *Years.* `y = profile total years - the ad's minimum years`: `y ≥ 0` is 4, `-1 ≤ y < 0` is 3,
   `-2 ≤ y < -1` is 2, `-5 < y < -2` is 1, `y ≤ -5` is 0. A minimum outside 0-40 is unknown (§11.6 L4390).
 The caller passes a fact only when its evidence is grounded (V3), else `None`, as for `location_work_mode`.
@@ -199,7 +200,7 @@ def employment_salary(det: DetFacts, scope: ScopeSettings) -> DetCriterion:
 
 # ---- experience_seniority (§11.3) -------------------------------------------------------------------------
 
-SENIORITY_LADDER: Final = {
+SENIORITY_ORDINAL: Final = {
     "intern": 0,
     "working_student": 0,
     "apprentice": 0,
@@ -230,10 +231,16 @@ def years_sub_rating(y: float) -> int:
     return 1 if y > -5 else 0
 
 
+def min_years_in_range(years: int) -> bool:
+    """Whether a minimum of years is within `MIN_YEARS_RANGE` (0-40, §11.5); outside it, it is unknown."""
+    low, high = MIN_YEARS_RANGE
+    return low <= years <= high
+
+
 def _ad_level(seniority_fact: Seniority | None, title_tokens: Iterable[str]) -> int | None:
     if seniority_fact is not None and seniority_fact.value != "unspecified":
-        return SENIORITY_LADDER[seniority_fact.value]
-    levels = {SENIORITY_LADDER[token] for token in title_tokens if token in SENIORITY_LADDER}
+        return SENIORITY_ORDINAL[seniority_fact.value]
+    levels = {SENIORITY_ORDINAL[token] for token in title_tokens if token in SENIORITY_ORDINAL}
     return levels.pop() if len(levels) == 1 else None
 
 
@@ -247,9 +254,8 @@ def seniority_level(
     ratings: list[int] = []
     ad_level = _ad_level(seniority_fact, title_tokens)
     if ad_level is not None:
-        ratings.append(level_sub_rating(SENIORITY_LADDER[profile.seniority] - ad_level))
-    low, high = MIN_YEARS_RANGE
+        ratings.append(level_sub_rating(SENIORITY_ORDINAL[profile.seniority] - ad_level))
     years = None if min_years_fact is None else min_years_fact.value
-    if years is not None and low <= years <= high and profile.total_years_experience is not None:
+    if years is not None and min_years_in_range(years) and profile.total_years_experience is not None:
         ratings.append(years_sub_rating(profile.total_years_experience - years))
     return min(ratings, default=None)

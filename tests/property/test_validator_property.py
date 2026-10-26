@@ -4,7 +4,11 @@ failures, never exceptions"; M3 Task 5). For random drafts and contexts:
 - `validate_draft` never raises;
 - every `Failure.key` is a criterion key, a fact id `derive_fact_ids` gives for the corrected draft (or
   `not_a_job_ad:ad`), or the pseudo key of an id-less fact: its code, or `<code>:<n>` for a list item;
-- the corrected draft is a fixed point: validating it again repairs nothing and changes nothing;
+- the corrected draft is a fixed point: validating it again (with its stored history) repairs nothing and
+  changes nothing;
+- a deterministic `experience_seniority` (Controller Ruling T5-c) raises no issue or failure of its own: no
+  level, basis or evidence failure, no quote count, and a failing quote only where the generator's own
+  profile reference stands; a recomputed one carries at most 2 ad quotes, every one grounded;
 - `repair_for_publication` never raises on it.
 
 The `PublishedResult` clause is Task 6's property test. Every datum is generated or invented.
@@ -12,11 +16,12 @@ The `PublishedResult` clause is Task 6's property test. Every datum is generated
 
 from typing import Any, get_args
 
-from hypothesis import given, settings
+from hypothesis import event, given, settings
 from hypothesis import strategies as st
 from jobhunter.llm.schemas.generator import Cefr, GeneratorDraft, LangCode
 from jobhunter.scoring.facts import NOT_A_JOB_AD, derive_fact_ids
 from jobhunter.scoring.validator import (
+    DraftValidation,
     Normalisation,
     ValidationContext,
     repair_for_publication,
@@ -45,7 +50,7 @@ LISTS = (
     ("must_haves", "must_have"),
     ("nice_to_haves", "nice_to_have"),
     ("required_languages", "required_language"),
-    ("certifications", "certification"),
+    ("certifications", "certification_item"),
 )
 QUOTES = (
     "Python, PostgreSQL",
@@ -192,8 +197,49 @@ def test_validate_draft_never_raises_and_names_only_the_drafts_keys(
     v = validate_draft(draft, ctx, normalisation=Normalisation())
     keys = allowed_keys(v.draft)
     assert {f.key for f in v.failures} <= keys
-    again = validate_draft(v.draft, ctx, normalisation=Normalisation())
+    again = validate_draft(v.draft, ctx, normalisation=Normalisation(), history=v.history)
     assert again.repairs == []
     assert again.draft == v.draft
-    assert again.failures == v.failures
+    assert again.failures == v.failures and again.issues == v.issues
+    assert again.history == v.history
+    assert_the_seniority_correction_raises_nothing(draft, v)
     repair_for_publication(v.draft, v)
+
+
+SENIORITY = "experience_seniority"
+_LEVEL_AND_EVIDENCE = frozenset(
+    {
+        "unknown_with_level",
+        "level_missing",
+        "unconstrained_not_4",
+        "ad_evidence_missing",
+        "profile_evidence_missing",
+    }
+)
+
+
+def assert_the_seniority_correction_raises_nothing(draft: GeneratorDraft, v: DraftValidation) -> None:
+    repair = next((r for r in v.repairs if r.code == "seniority_recomputed"), None)
+    corrected = v.draft.criteria.experience_seniority
+    event("seniority: " + ("none" if repair is None else "unknown" if corrected.level is None else "rated"))
+    if repair is None:
+        return
+    original = draft.criteria.experience_seniority
+    assert not [f for f in v.failures if f.key == SENIORITY and f.code in _LEVEL_AND_EVIDENCE]
+    path = f"criteria.{SENIORITY}"
+    assert not [i for i in v.issues if i.path.startswith(f"{path}.") and i.code == "too_many_quotes"]
+    assert not [i for i in v.issues if i.path.startswith(f"{path}.ad_evidence")]  # its ad quotes all ground
+    for issue in v.issues:
+        if issue.path.startswith(f"{path}.profile_evidence["):  # only the generator's own reference fails
+            index = int(issue.path.removeprefix(f"{path}.profile_evidence[").rstrip("]"))
+            assert corrected.profile_evidence[index] in original.profile_evidence
+    if corrected.level is None:
+        assert (corrected.basis, corrected.ad_evidence, corrected.profile_evidence, repair.exempt) == (
+            "unknown",
+            [],
+            [],
+            (),
+        )
+    else:
+        assert corrected.basis == "observed" and len(corrected.ad_evidence) <= 2
+        assert set(repair.exempt) == {"ad_evidence_missing", "profile_evidence_missing", "too_many_quotes"}

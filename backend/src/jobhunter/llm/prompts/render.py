@@ -42,6 +42,14 @@ version of family `generator_v1` cannot score (`PromptVersionUnscorable`).
 - `input_refs` holds `prompt_schema_version_id` and `truncated`; the caller adds `job_revision_id`,
   `profile_version_id` and `rubric_version_id`.
 
+**Untrusted text never closes a block** (Controller Ruling T5-a). Every interpolated content (the `<job_ad>`
+fields and description, the profile JSON, the critic's and the reviser's blocks, the search locations) has
+each literal opening or closing tag of the prompt's own blocks (`BLOCK_NAMES`, any case, `</?name>` with
+optional inner whitespace and, for an opening tag, attributes) neutralised by `neutralise_block_tags`: its
+`<` and `>` become U+FF1C and U+FF1E, one code point for one, so every offset of the rendered text is the
+source's and `fold` (NFKC) still reads the quote it was. The reviewed CV text inside `<cv_text>` is left
+exactly as it is (its sha256 is the draft's `transmitted_text_sha256`, §9.5).
+
 **The `<job_ad>` block** holds the structured fields (title, company, locations, the work modes and the
 employment types each with its source, the completeness flag) and the description, cut to its first
 `DESCRIPTION_HEAD` and last `DESCRIPTION_TAIL` characters with `TRUNCATION_MARKER` between them when it is
@@ -146,18 +154,46 @@ def extract_profile_native_pdf_prompt(pdf: bytes) -> RenderedPrompt:
     return _single_call("profile_extract", message)
 
 
+# The prompt's own block tags: those of the score prompts' user turn and system blocks, and the single calls'.
+BLOCK_NAMES: Final = (
+    "job_ad",
+    "candidate_profile",
+    "draft",
+    "required_facts",
+    "validator_issues",
+    "previous_draft",
+    "issues",
+    "cv_text",
+    "search_locations",
+)
+_BLOCK_TAG: Final = re.compile(rf"<(\s*/?\s*(?:{'|'.join(BLOCK_NAMES)})(?:\s+[^<>]*)?\s*)>", re.IGNORECASE)
+
+
+def neutralise_block_tags(text: str) -> str:
+    """`text` with the `<` and `>` of every literal block tag of the prompt (`BLOCK_NAMES`) replaced by
+    U+FF1C and U+FF1E (module docstring): the same length, the same offsets."""
+    return _BLOCK_TAG.sub(
+        lambda tag: f"\N{FULLWIDTH LESS-THAN SIGN}{tag[1]}\N{FULLWIDTH GREATER-THAN SIGN}", text
+    )
+
+
+def profile_document(profile: ConfirmedProfile) -> dict[str, JSONValue]:
+    """The profile as the model reads it: its JSON document without `user_entered` (the model never needs the
+    work authorisation or a clearance, and the profile holds no id or timestamp)."""
+    return cast(dict[str, JSONValue], profile.model_dump(mode="json", exclude={"user_entered"}))
+
+
 def candidate_profile_block(profile: ConfirmedProfile) -> str:
-    """`<candidate_profile>` + the profile as canonical JSON (sorted keys, no `user_entered`: the model never
-    needs the work authorisation or a clearance, and the profile holds no id or timestamp) +
-    `</candidate_profile>`; the same bytes for the same profile version (L3865)."""
-    profile_json = canonical_json(profile.model_dump(mode="json", exclude={"user_entered"})).decode("utf-8")
-    return f"<candidate_profile>{profile_json}</candidate_profile>"
+    """`<candidate_profile>` + the profile document (`profile_document`) as canonical JSON (sorted keys), its
+    block tags neutralised, + `</candidate_profile>`; the same bytes for the same profile version (L3865)."""
+    profile_json = canonical_json(profile_document(profile)).decode("utf-8")
+    return f"<candidate_profile>{neutralise_block_tags(profile_json)}</candidate_profile>"
 
 
 def propose_queries_prompt(profile: ConfirmedProfile, locations: Sequence[str]) -> RenderedPrompt:
     """The `propose_queries` request: the profile (`candidate_profile_block`), then the search locations as a
     JSON list inside `<search_locations>`."""
-    locations_json = json.dumps(list(locations), ensure_ascii=False)
+    locations_json = neutralise_block_tags(json.dumps(list(locations), ensure_ascii=False))
     text = f"{candidate_profile_block(profile)}\n<search_locations>{locations_json}</search_locations>"
     return _single_call("propose_queries", HumanMessage(text))
 
@@ -330,8 +366,9 @@ def job_ad_block(
     completeness: str,
     description_text: str,
 ) -> JobAdBlock:
-    """The `<job_ad untrusted="true">` block of a job revision (§10.6 L3869-3872; module docstring).
-    `work_modes` and `employment_types` are `(value, source)` pairs."""
+    """The `<job_ad untrusted="true">` block of a job revision (§10.6 L3869-3872; module docstring), every
+    field and the description with their block tags neutralised. `work_modes` and `employment_types` are
+    `(value, source)` pairs."""
     fields = (
         ("title", "Title", title),
         ("company", "Company", company or ""),
@@ -343,11 +380,12 @@ def job_ad_block(
     parts: list[tuple[SegmentKind, str | None, str, int | None]] = [
         ("marker", None, '<job_ad untrusted="true">\n', None),
         *(
-            ("structured_field", name, f"{label}: {value or _NOT_STATED}\n", None)
+            ("structured_field", name, f"{label}: {neutralise_block_tags(value) or _NOT_STATED}\n", None)
             for name, label, value in fields
         ),
         ("marker", None, "Description:\n", None),
     ]
+    description_text = neutralise_block_tags(description_text)  # one code point for one: the same offsets
     size = len(description_text)
     truncated = size > DESCRIPTION_HEAD + DESCRIPTION_TAIL
     if truncated:
@@ -593,7 +631,8 @@ def score_prompt(
     }
     if {name for name, block in given.items() if block is not None} != set(wanted):
         raise ValueError(f"the {role} prompt takes exactly the blocks {list(wanted)}")
-    text = ad.text + "".join(f"\n<{name}>{given[name]}</{name}>" for name in wanted)
+    blocks = (f"\n<{name}>{neutralise_block_tags(given[name] or '')}</{name}>" for name in wanted)
+    text = ad.text + "".join(blocks)
     return RenderedPrompt(
         system=(
             SystemBlock(rubric_block(_template(version, "shared_rubric"), rubric)),

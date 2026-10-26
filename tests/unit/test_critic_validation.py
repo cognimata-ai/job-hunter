@@ -17,22 +17,23 @@ Every datum is invented.
 from typing import Any
 
 from jobhunter.llm.schemas.critic import CriticOut, Review
-from jobhunter.llm.schemas.generator import GeneratorDraft
 from jobhunter.scoring.facts import NOT_A_JOB_AD, FactRef, fact_ref
 from jobhunter.scoring.knockouts import Confirmation
 from jobhunter.scoring.validator import (
     CriticValidation,
     Dispute,
+    DraftValidation,
     Failure,
     Grounding,
     Issue,
     ParsedGenerator,
     apply_fact_confirmations,
     parse_generator,
+    validate_draft,
     validate_review,
 )
 
-from tests.support.validation import CRITERIA, ctx_for, synthetic_ad, synthetic_wire_c
+from tests.support.validation import CRITERIA, criterion_item, ctx_for, synthetic_ad, synthetic_wire_c
 
 GROUNDED = "Python, PostgreSQL"
 FRENCH: FactRef = fact_ref("mandatory_language", "fr")
@@ -40,10 +41,24 @@ PERMIT: FactRef = fact_ref("work_permit", "work_permit")
 CTX = ctx_for(synthetic_ad())
 
 
-def draft(*, not_a_job_ad: bool = False) -> GeneratorDraft:
-    parsed = parse_generator(synthetic_wire_c(not_a_job_ad=not_a_job_ad), family="generator_v2_items")
+def validated_draft(*, not_a_job_ad: bool = False, ungrounded: bool = False) -> DraftValidation:
+    """The synthetic draft validated against `CTX`: clean; or no job ad (no fact, every criterion unknown); or
+    with an ungrounded skills quote, a real unresolved V3 failure."""
+    if not_a_job_ad:
+        unknown = [
+            criterion_item(key, level=None, basis="unknown", ad_evidence=(), profile_evidence=())
+            for key in CRITERIA
+        ]
+        wire = synthetic_wire_c(not_a_job_ad=True, facts=[], criteria=unknown)
+    elif ungrounded:
+        items = [criterion_item(key, level=4) for key in CRITERIA]
+        items[1] = criterion_item("skills", level=4, ad_evidence=("Java und Kotlin",))
+        wire = synthetic_wire_c(criteria=items)
+    else:
+        wire = synthetic_wire_c()
+    parsed = parse_generator(wire, family="generator_v2_items")
     assert isinstance(parsed, ParsedGenerator)
-    return parsed.draft
+    return validate_draft(parsed.draft, CTX, normalisation=parsed.normalisation)
 
 
 def review(
@@ -74,15 +89,14 @@ def validate(
     out: CriticOut,
     *,
     required: list[FactRef] | None = None,
-    failures: list[Failure] | None = None,
+    ungrounded: bool = False,
     not_a_job_ad: bool = False,
 ) -> CriticValidation:
     return validate_review(
         out,
-        draft=draft(not_a_job_ad=not_a_job_ad),
+        validation=validated_draft(not_a_job_ad=not_a_job_ad, ungrounded=ungrounded),
         required=[FRENCH, PERMIT] if required is None else required,
         ctx=CTX,
-        draft_failures=failures or [],
     )
 
 
@@ -144,7 +158,9 @@ def test_condition_4_an_influencing_injection_is_revise() -> None:
 
 
 def test_condition_5_an_unresolved_draft_failure_is_revise() -> None:
-    v = validate(critic(CONFIRM_FRENCH, REJECT_PERMIT), failures=[Failure("skills", "quote_ungrounded")])
+    assert validated_draft(ungrounded=True).failures == [Failure("skills", "quote_ungrounded")]
+    assert validated_draft().failures == [] and validated_draft(not_a_job_ad=True).failures == []
+    v = validate(critic(CONFIRM_FRENCH, REJECT_PERMIT), ungrounded=True)
     assert v.derived_outcome == "revise" and v.complete is True
 
 

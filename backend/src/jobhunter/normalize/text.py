@@ -35,12 +35,10 @@ from collections.abc import Callable
 from typing import Final
 
 # Spec §8.1 step 2: soft hyphen, zero-width space, non-joiner, joiner and the byte order mark are removed.
-_REMOVED: Final = dict.fromkeys(
-    map(
-        ord,
-        "\xad\N{ZERO WIDTH SPACE}\N{ZERO WIDTH NON-JOINER}\N{ZERO WIDTH JOINER}\N{ZERO WIDTH NO-BREAK SPACE}",
-    )
+REMOVED_CHARS: Final = (
+    "\xad\N{ZERO WIDTH SPACE}\N{ZERO WIDTH NON-JOINER}\N{ZERO WIDTH JOINER}\N{ZERO WIDTH NO-BREAK SPACE}"
 )
+_REMOVED: Final = dict.fromkeys(map(ord, REMOVED_CHARS))
 _WHITESPACE: Final = re.compile(r"\s+")
 _NO_BREAK_SPACES: Final = frozenset("\xa0\N{NARROW NO-BREAK SPACE}")
 

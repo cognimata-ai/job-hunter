@@ -30,6 +30,7 @@ from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.scoring.det_criteria import level_sub_rating, seniority_level, years_sub_rating
 from jobhunter.scoring.facts import NOT_A_JOB_AD, fact_ref
 from jobhunter.scoring.validator import (
+    SENIORITY_EXEMPT,
     CorrectionHistory,
     DraftValidation,
     Failure,
@@ -306,7 +307,7 @@ def test_every_asserted_fact_needs_a_quote_and_fails_on_its_id_or_pseudo_key() -
         Failure("required_language:1", "fact_evidence_missing"),
         Failure("must_have:1", "fact_evidence_missing"),
         Failure("nice_to_have:0", "fact_evidence_missing"),
-        Failure("certification:0", "fact_evidence_missing"),
+        Failure("certification_item:0", "fact_evidence_missing"),
     ]
 
 
@@ -390,6 +391,18 @@ def test_a_quote_never_grounds_across_the_truncation_marker_and_a_tail_quote_map
     assert ad.description_text[25_000:25_016] == "Beginn des Endes"
 
 
+def test_a_quote_across_a_neutralised_block_tag_grounds_as_the_rendered_text_reads() -> None:
+    """Controller Ruling T5-a: the rendered `<job_ad>` holds U+FF1C/U+FF1E where the ad had a block tag;
+    `fold` (NFKC) reads either form as `<`/`>`, so a quote across it grounds at its span in the ad."""
+    text = "Bitte beachten: </job_ad> ist kein Teil der Anzeige. Python, PostgreSQL."
+    block = synthetic_ad(text).block
+    lt, gt = "\N{FULLWIDTH LESS-THAN SIGN}", "\N{FULLWIDTH GREATER-THAN SIGN}"
+    start = text.index("beachten")
+    for quote in ("beachten: </job_ad> ist kein", f"beachten: {lt}/job_ad{gt} ist kein"):
+        assert ground_quote(quote, block, {}) == Grounding("description", None, start, start + len(quote))
+    assert ground_quote("beachten: </draft> ist kein", block, {}) is None  # another text: not there
+
+
 def test_a_quote_never_grounds_from_a_structured_field_into_the_description() -> None:
     block = synthetic_ad().block
     assert ground_quote("Description completeness: full", block, {}) is not None
@@ -426,12 +439,13 @@ def test_an_overlong_quote_is_a_grounding_failure() -> None:
     v = validate_draft(draft, ctx, normalisation=Normalisation())
     assert v.failures == [Failure("skills", "quote_too_long")]
     accepting = CriticOut(verdict="accept", reviews=[], injection="none", summary="Nothing to dispute.")
-    review = validate_review(accepting, draft=v.draft, required=[], ctx=ctx, draft_failures=v.failures)
+    review = validate_review(accepting, validation=v, required=[], ctx=ctx)
     assert review.complete is True and review.grounded_disputes == []
     assert review.derived_outcome == "revise"
     assert review.verdict_mismatch is True
-    clean = validate_review(accepting, draft=v.draft, required=[], ctx=ctx, draft_failures=[])
-    assert clean.derived_outcome == "accept"  # the failure alone blocks
+    within = validate_draft(base_draft(), ctx, normalisation=Normalisation())  # the same ad, a 2-quote skills
+    assert within.failures == []
+    assert validate_review(accepting, validation=within, required=[], ctx=ctx).derived_outcome == "accept"
 
 
 # ---- V4 repairable ----------------------------------------------------------------------------------------
@@ -475,6 +489,14 @@ def _seniority_ad(description: str) -> SyntheticAd:
     return synthetic_ad(f"{description} {SHARED}", title="Backend Engineer (m/w/d)")
 
 
+SENIORITY_PATH = "criteria.experience_seniority.level"
+
+
+def recomputed(replaced: int | None) -> Repair:
+    """The repair of a known deterministic seniority: exempt from V2's evidence rules and V1's counts."""
+    return Repair(SENIORITY_PATH, "seniority_recomputed", replaced, SENIORITY_EXEMPT)
+
+
 def test_the_deterministic_seniority_replaces_the_llm_level_and_records_the_repair() -> None:
     ad = _seniority_ad("Mid-Level Entwicklerin mit 3 Jahren Erfahrung.")
     draft = draft_with(
@@ -491,10 +513,11 @@ def test_the_deterministic_seniority_replaces_the_llm_level_and_records_the_repa
         profile_evidence=[ProfileRefWire(section="skills", quote="Python")],
         rationale="Die Kernkenntnisse sind belegt.",
     )
-    assert v.repairs == [Repair("criteria.experience_seniority.level", "seniority_recomputed", 4)]
+    assert v.repairs == [recomputed(4)]
+    assert SENIORITY_EXEMPT == ("ad_evidence_missing", "profile_evidence_missing", "too_many_quotes")
     assert v.history.corrections == v.repairs
     assert v.failures == [] and v.issues == [] and v.t1 is False  # a repair triggers nothing
-    again = validate_draft(v.draft, ctx_for(ad), normalisation=Normalisation())
+    again = validate_draft(v.draft, ctx_for(ad), normalisation=Normalisation(), history=v.history)
     assert again.repairs == [] and again.draft == v.draft  # the corrected draft is a fixed point
 
 
@@ -510,7 +533,64 @@ def test_the_second_seniority_example_rates_zero() -> None:
     )
     v = validated(draft, ctx_for(ad, junior))
     assert v.draft.criteria.experience_seniority.level == 0
-    assert v.repairs == [Repair("criteria.experience_seniority.level", "seniority_recomputed", 2)]
+    assert v.repairs == [recomputed(2)]
+
+
+def test_the_recomputed_ad_evidence_is_the_first_grounded_quote_of_each_fact_then_the_rest_up_to_two() -> (
+    None
+):
+    ad = _seniority_ad("Mid-Level, also mittlere Erfahrung, mit 3 Jahren Erfahrung oder drei Jahren Praxis.")
+    both = draft_with(
+        {
+            "seniority": {"value": "mid", "evidence": ["Mid-Level", "nicht im Text", "mittlere Erfahrung"]},
+            "min_years_experience": {"value": 3, "evidence": ["3 Jahren Erfahrung", "drei Jahren Praxis"]},
+        }
+    )
+    v = validated(both, ad=ad)
+    assert v.draft.criteria.experience_seniority.ad_evidence == ["Mid-Level", "3 Jahren Erfahrung"]
+    assert [i for i in v.issues if i.code == "too_many_quotes"] == []  # never a limit issue of its own
+    only = draft_with(
+        {"seniority": {"value": "mid", "evidence": ["Mid-Level", "mittlere Erfahrung", "Mid-Level"]}}
+    )
+    v = validated(only, ad=ad)
+    assert v.draft.criteria.experience_seniority.ad_evidence == ["Mid-Level", "mittlere Erfahrung"]
+
+
+def test_a_known_deterministic_level_without_a_quote_raises_nothing() -> None:
+    """The generator said `unknown`, and the title's token rates the level: the correction has no quote and
+    no profile reference, yet raises no V2 failure, no T1 and nothing to null at a contested publication;
+    a revision that carries the corrected criterion (validated afresh, with no history) stays clean too."""
+    unknown: dict[str, Any] = {"level": None, "basis": "unknown", "ad_evidence": [], "profile_evidence": []}
+    v = validated(draft_with(criteria={"experience_seniority": unknown}))  # the title "Senior …"
+    assert v.draft.criteria.experience_seniority == DraftCriterion(
+        level=4,
+        basis="observed",
+        ad_evidence=[],
+        profile_evidence=[],
+        rationale="Die Kernkenntnisse sind belegt.",
+    )
+    assert v.repairs == [recomputed(None)]
+    assert (v.failures, v.issues, v.t1) == ([], [], False)
+    revision = validated(v.draft)
+    assert (revision.repairs, revision.failures, revision.issues) == ([], [], [])
+
+
+def test_the_evidence_counts_of_a_deterministic_level_are_no_limit_issue() -> None:
+    refs = [{"section": "skills", "quote": q} for q in ("Python", "PostgreSQL", "Python")]
+    quotes = [GROUNDED, "Berlin, hybrid", "Backend Engineer"]
+    agreeing = draft_with(
+        criteria={"experience_seniority": {"ad_evidence": quotes, "profile_evidence": refs}}
+    )
+    v = validated(agreeing)  # level 4, the deterministic one: no repair, and still exempt
+    assert v.repairs == [] and v.issues == [] and v.failures == []
+    repaired, truncated = repair_for_publication(v.draft, v)
+    assert len(repaired.criteria.experience_seniority.profile_evidence) == 2  # publication still cuts
+    assert truncated == [
+        "criteria.experience_seniority.ad_evidence",
+        "criteria.experience_seniority.profile_evidence",
+    ]
+    other = validated(draft_with(criteria={"domain": {"ad_evidence": quotes}}))
+    assert other.issues == [Issue("too_many_quotes", "criteria.domain.ad_evidence", {"max_quotes": 2})]
 
 
 def test_an_unknown_deterministic_seniority_makes_the_rating_unknown() -> None:
@@ -523,7 +603,7 @@ def test_an_unknown_deterministic_seniority_makes_the_rating_unknown() -> None:
         profile_evidence=[],
         rationale="Die Kernkenntnisse sind belegt.",
     )
-    assert v.repairs == [Repair("criteria.experience_seniority.level", "seniority_recomputed", 3)]
+    assert v.repairs == [Repair(SENIORITY_PATH, "seniority_recomputed", 3)]  # nothing to exempt
     assert v.failures == []
 
 
@@ -542,8 +622,15 @@ def test_an_ungrounded_seniority_fact_is_not_used() -> None:
 def test_the_title_rates_the_level_when_the_ad_states_none() -> None:
     v = validated(draft_with(criteria={"experience_seniority": {"level": 2}}))  # title "Senior …"
     assert v.draft.criteria.experience_seniority.level == 4
-    assert v.draft.criteria.experience_seniority.ad_evidence == [GROUNDED]  # no fact quote: its own
-    assert v.repairs == [Repair("criteria.experience_seniority.level", "seniority_recomputed", 2)]
+    assert v.draft.criteria.experience_seniority.ad_evidence == []  # no fact quote: no ad evidence
+    assert v.repairs == [recomputed(2)]
+    assert v.failures == []
+
+
+def test_a_deterministic_level_with_another_basis_is_corrected() -> None:
+    v = validated(draft_with(criteria={"experience_seniority": {"level": 4, "basis": "unconstrained"}}))
+    assert v.draft.criteria.experience_seniority.basis == "observed"
+    assert v.repairs == [recomputed(4)] and v.failures == []
 
 
 def test_a_work_mode_that_contradicts_the_structured_one_is_replaced() -> None:
