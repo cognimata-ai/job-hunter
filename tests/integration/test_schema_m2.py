@@ -1,4 +1,8 @@
-"""The M2 schema (migration 0006): tables, staged foreign keys, CHECKs, indexes and the five new machines."""
+"""The M2 schema (migration 0006): tables, foreign keys, CHECKs, indexes and the five new machines.
+
+The five foreign keys M2 staged (Deviation 1) are closed by M3's migration 0008; the cases that write those
+columns name real M3 rows.
+"""
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -19,6 +23,8 @@ from tests.support.m2 import (
     insert_proposal,
     insert_vector,
 )
+from tests.support.m3 import insert_attempt, insert_bulk_operation, insert_job, insert_target
+from tests.support.schema import FOREIGN_KEY_COLUMNS, refused, refused_check
 
 pytestmark = pytest.mark.integration
 M2_TABLES = {
@@ -35,50 +41,16 @@ M2_TABLES = {
 }
 
 
-async def refused(c: AsyncConnection, statement: str, params: dict[str, object] | None = None) -> PgErrorInfo:
-    """Run `statement` in a savepoint that the database must refuse; return the SQLSTATE and constraint."""
-    with pytest.raises(sa.exc.IntegrityError) as bad:
-        async with c.begin_nested():
-            await c.execute(sa.text(statement), params or {})
-    return pg_error(bad.value)
-
-
-async def refused_check(
-    c: AsyncConnection, table: str, statement: str, params: dict[str, object], *fragments: str
-) -> None:
-    """`statement` violates a CHECK of `table` whose definition holds every one of `fragments`.
-
-    The spec leaves its CHECKs unnamed, so the constraint that fired is identified by what it says, which
-    shows that the intended CHECK refused the row and not another one.
-    """
-    info = await refused(c, statement, params)
-    assert info.sqlstate == CHECK_VIOLATION
-    definition = (
-        await c.execute(
-            sa.text(
-                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                "WHERE conrelid = CAST(:t AS regclass) AND conname = :n"
-            ),
-            {"t": table, "n": info.constraint},
-        )
-    ).scalar_one()
-    for fragment in fragments:
-        assert fragment in definition, f"{info.constraint}: {definition}"
-
-
-# Every foreign key column with its ON DELETE action: 'a' NO ACTION, 'n' SET NULL, 'c' CASCADE.
-FOREIGN_KEY_COLUMNS = (
-    "SELECT CAST(c.conrelid AS regclass) || '.' || a.attname, c.confdeltype FROM pg_constraint c "
-    "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey) WHERE c.contype = 'f'"
-)
-# Deviation 1: the tables these five columns reference are M3's, so the columns have no foreign key yet.
-STAGED_FOREIGN_KEYS = {
-    "llm_calls.attempt_id",
-    "llm_calls.target_id",
-    "llm_calls.golden_case_id",
-    "llm_calls.batch_item_id",
-    "llm_spend_ledger.bulk_operation_id",
+# M2 Deviation 1: the five columns whose referenced table is M3's, with the spec's delete action ('a' NO
+# ACTION, 'n' SET NULL, 'c' CASCADE). Migration 0008 added each foreign key, so none is staged any more.
+DEVIATION_1_FOREIGN_KEYS = {
+    "llm_calls.attempt_id": "a",
+    "llm_calls.target_id": "a",
+    "llm_calls.golden_case_id": "c",
+    "llm_calls.batch_item_id": "a",
+    "llm_spend_ledger.bulk_operation_id": "n",
 }
+STAGED_FOREIGN_KEYS: set[str] = set()
 
 
 async def test_m2_tables_and_staged_fks(engine) -> None:
@@ -86,7 +58,7 @@ async def test_m2_tables_and_staged_fks(engine) -> None:
         tables = sa.text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
         names = set((await conn.execute(tables)).scalars())
         assert M2_TABLES <= names
-        assert not {"score_targets", "score_attempts", "bulk_operations", "golden_cases"} & names
+        assert {"score_targets", "score_attempts", "bulk_operations", "golden_cases", "batch_items"} <= names
         fks = {name for name, _ in await conn.execute(sa.text(FOREIGN_KEY_COLUMNS))}
         assert {
             "active_config.profile_version_id",
@@ -97,7 +69,7 @@ async def test_m2_tables_and_staged_fks(engine) -> None:
             "query_proposals.llm_call_id",
             "llm_calls.eval_run_id",
         } <= fks
-        assert not STAGED_FOREIGN_KEYS & fks
+        assert {name for name in DEVIATION_1_FOREIGN_KEYS if name not in fks} == STAGED_FOREIGN_KEYS
 
 
 async def test_staged_foreign_keys_have_the_spec_delete_actions(engine) -> None:
@@ -112,6 +84,7 @@ async def test_staged_foreign_keys_have_the_spec_delete_actions(engine) -> None:
         "llm_calls.profile_draft_id": "n",
         "profile_vectors.profile_version_id": "c",
         "profile_versions.cv_file_id": "n",
+        **DEVIATION_1_FOREIGN_KEYS,
     }
     async with engine.connect() as conn:
         actions = {name: action for name, action in await conn.execute(sa.text(FOREIGN_KEY_COLUMNS))}
@@ -157,6 +130,16 @@ BUDGET_ROW = (
     "INSERT INTO llm_budget (month, cap_usd, overrun_buffer_usd, bucket_usd, bucket_at) "
     "VALUES ('2026-10-01', 100, 2, 1, now())"
 )
+# A case's `bulk` that stands for a real `bulk_operations` row, inserted by `real_bulk` (M3 closed the FK).
+BULK = object()
+
+
+async def real_bulk(c: AsyncConnection, overrides: dict[str, object]) -> dict[str, object]:
+    """`overrides` with a `BULK` placeholder replaced by the id of a fresh active bulk operation."""
+    if overrides.get("bulk") is not BULK:
+        return overrides
+    bulk = await insert_bulk_operation(c, (await insert_profile_chain(c)).llm_tuple_id)
+    return {**overrides, "bulk": bulk}
 
 
 @pytest.mark.parametrize(
@@ -170,8 +153,8 @@ BUDGET_ROW = (
         {"state": "ambiguous"},
         # a billed row above its reservation is allowed only with the violation's own evidence
         {"state": "billed", "settled": 2, "evidence": "reservation_bound_violated"},
-        # Deviation 1: bulk_operation_id has no foreign key until M3 creates bulk_operations
-        {"purpose": "generate", "cls": "scoring", "bulk": 7},
+        # a scoring row of a bulk operation (the foreign key M3 closed names a real row)
+        {"purpose": "generate", "cls": "scoring", "bulk": BULK},
         {"kind": "adjustment", "state": None},
     ],
     ids=[
@@ -181,14 +164,14 @@ BUDGET_ROW = (
         "billed_at_reservation",
         "ambiguous",
         "bound_violated",
-        "bulk_without_fk",
+        "bulk_operation",
         "adjustment",
     ],
 )
 async def test_ledger_rows_the_spec_allows(engine, overrides) -> None:
     async with engine.connect() as c:
         await c.execute(sa.text(BUDGET_ROW))
-        await c.execute(sa.text(LEDGER), {**LEDGER_BASE, **overrides})
+        await c.execute(sa.text(LEDGER), {**LEDGER_BASE, **await real_bulk(c, overrides)})
 
 
 @pytest.mark.parametrize(
@@ -216,7 +199,7 @@ async def test_ledger_rows_the_spec_allows(engine, overrides) -> None:
         # purpose 'extract_profile' cannot be booked as scoring
         ({"cls": "scoring"}, ("'critic'", "purpose_class")),
         ({"purpose": "generate", "cls": "scoring", "eval_run": True}, ("eval_run", "purpose_class")),
-        ({"bulk": 7}, ("bulk_operation_id IS NULL",)),
+        ({"bulk": BULK}, ("bulk_operation_id IS NULL",)),
         ({"state": None}, ("kind", "state IS NOT NULL")),
         ({"kind": "adjustment"}, ("kind", "state IS NOT NULL")),
     ],
@@ -238,7 +221,8 @@ async def test_ledger_checks(engine, overrides, fragments) -> None:
     async with engine.connect() as c:
         await c.execute(sa.text(BUDGET_ROW))
         await c.execute(sa.text(LEDGER), LEDGER_BASE)  # the base row is valid: only the override is refused
-        await refused_check(c, "llm_spend_ledger", LEDGER, {**LEDGER_BASE, **overrides}, *fragments)
+        refusal = {**LEDGER_BASE, **await real_bulk(c, overrides)}
+        await refused_check(c, "llm_spend_ledger", LEDGER, refusal, *fragments)
 
 
 BUDGET = (
@@ -305,13 +289,15 @@ async def new_ledger(c: AsyncConnection, purpose: str = "extract_profile") -> in
 async def test_llm_call_rows_the_spec_allows(engine) -> None:
     async with engine.connect() as c:
         eval_run = await insert_eval_run(c)
+        target = await insert_target(c, await insert_job(c), (await insert_profile_chain(c)).llm_tuple_id)
+        attempt = await insert_attempt(c, target)
         for overrides in (
             {},
             {"status": "completed", "stop": "end_turn", "out": 12},
             # an eval run owns its calls (no attempt, no target)
             {"purpose": "critic", "eval_run": eval_run},
-            # Deviation 1: attempt_id and target_id have no foreign key until M3
-            {"purpose": "generate", "attempt": 77, "target": 88, "logical": 1},
+            # a scoring call of its attempt and target (the foreign keys M3 closed name real rows)
+            {"purpose": "generate", "attempt": attempt, "target": target, "logical": 1},
         ):
             params = {**CALL_BASE, **overrides, "ledger": await new_ledger(c)}
             await c.execute(sa.text(CALL), params)
@@ -321,6 +307,7 @@ async def test_llm_call_rows_the_spec_allows(engine) -> None:
     ("overrides", "fragments"),
     [
         ({"purpose": "generate"}, ("eval_run_id", "attempt_id", "target_id")),
+        # the CHECK refuses the row before its foreign keys are checked (they run after the insert)
         ({"purpose": "generate", "attempt": 77, "target": 88}, ("logical_call_no", "transport")),
         ({"status": "completed", "out": 12}, ("stop_reason", "output_tokens")),
         ({"status": "completed", "stop": "end_turn"}, ("stop_reason", "output_tokens")),

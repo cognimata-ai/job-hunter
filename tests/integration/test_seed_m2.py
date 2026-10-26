@@ -3,7 +3,8 @@
 No migration inserts them (§19.3 step 2). The seed step of `migrate` (§19.3 step 6) inserts both rows when
 absent and points `active_config` at them: a fresh row through its insert, and a row an M1 install left with
 NULL pointers through the update after it. Every path ends with exactly one row each, stored as the pure
-functions give them. The two columns stay nullable in M2; M3's first migration restores NOT NULL.
+functions give them. The two columns were nullable in M2; M3's first migration (0008) restored NOT NULL, so
+an M1 install passes through M2's `migrate` before M3's (plan Deviation 5).
 """
 
 import asyncio
@@ -70,18 +71,18 @@ def one(server: PgServer, statement: str) -> tuple[object, ...] | None:
 
 def assert_points_at_v1(server: PgServer) -> None:
     """`active_config` names rubric v1 and prompt-schema version 1, the only rows of their tables, and the two
-    columns are still nullable (M2)."""
+    columns are NOT NULL (M3, migration 0008)."""
     assert one(server, POINTED) == expected_rows()
     assert one(server, COUNTS) == (1, 1)
     assert pg_rows(server, "migrator", NULLABLE) == [
-        ("prompt_schema_version_id", "YES"),
-        ("rubric_version_id", "YES"),
+        ("prompt_schema_version_id", "NO"),
+        ("rubric_version_id", "NO"),
     ]
 
 
 async def test_after_migrate_active_config_points_at_the_v1_rows(fresh_pg_server, make_config) -> None:
     await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW)
-    assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (M2_HEAD,) == (code_head(),)
+    assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (code_head(),)
     assert_points_at_v1(fresh_pg_server)
 
 
@@ -97,6 +98,8 @@ async def test_a_second_migrate_is_a_noop(fresh_pg_server, make_config) -> None:
 async def test_an_upgrade_from_0006_with_an_active_config_row_gets_its_pointers_from_the_seed(
     fresh_pg_server, make_config
 ) -> None:
+    """An install M1 left (NULL pointers, no rubric or prompt-schema row) passes through M2's `migrate`, whose
+    seed sets both pointers, before M3's: 0008 then restores NOT NULL over them (plan Deviation 5)."""
     dsn = fresh_pg_server.dsn("migrator", driver="sqlalchemy")
     await asyncio.to_thread(command.upgrade, alembic_config(dsn), M2_SCHEMA)
     # A database as M1 left it: settings version 1 and an `active_config` row with NULL rubric and prompt
@@ -105,45 +108,42 @@ async def test_an_upgrade_from_0006_with_an_active_config_row_gets_its_pointers_
     try:
         async with engine.begin() as conn:
             await seed_defaults(conn, now=NOW)
+        one(
+            fresh_pg_server,
+            "UPDATE active_config SET rubric_version_id = NULL, prompt_schema_version_id = NULL",
+        )
+        one(fresh_pg_server, "DELETE FROM rubric_versions")
+        one(fresh_pg_server, "DELETE FROM prompt_schema_versions")
+        assert one(
+            fresh_pg_server, "SELECT rubric_version_id, prompt_schema_version_id FROM active_config"
+        ) == (
+            None,
+            None,
+        )
+        others = one(fresh_pg_server, OTHER_POINTERS)
+
+        # M2's `migrate`: its migrations, then its seed
+        await asyncio.to_thread(command.upgrade, alembic_config(dsn), M2_HEAD)
+        async with engine.begin() as conn:
+            await seed_defaults(conn, now=NOW + timedelta(days=1))
     finally:
         await engine.dispose()
-    one(fresh_pg_server, "UPDATE active_config SET rubric_version_id = NULL, prompt_schema_version_id = NULL")
-    one(fresh_pg_server, "DELETE FROM rubric_versions")
-    one(fresh_pg_server, "DELETE FROM prompt_schema_versions")
-    assert one(fresh_pg_server, "SELECT rubric_version_id, prompt_schema_version_id FROM active_config") == (
-        None,
-        None,
-    )
-    others = one(fresh_pg_server, OTHER_POINTERS)
+    assert one(
+        fresh_pg_server,
+        "SELECT rubric_version_id IS NULL, prompt_schema_version_id IS NULL FROM active_config",
+    ) == (False, False)
 
-    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW + timedelta(days=1))
+    await run_migrate_async(make_config("migrate", fresh_pg_server), now=NOW + timedelta(days=2))
+    assert one(fresh_pg_server, "SELECT version_num FROM alembic_version") == (code_head(),)
     assert_points_at_v1(fresh_pg_server)
     assert one(fresh_pg_server, OTHER_POINTERS) == others  # only the two pointers moved
 
 
-@pytest.mark.parametrize(
-    "damage",
-    [
-        pytest.param(("UPDATE active_config SET rubric_version_id = NULL",), id="rubric-pointer-null"),
-        pytest.param(
-            ("UPDATE active_config SET prompt_schema_version_id = NULL",), id="prompt-schema-pointer-null"
-        ),
-        pytest.param(
-            (
-                "UPDATE active_config SET rubric_version_id = NULL, prompt_schema_version_id = NULL",
-                "DELETE FROM rubric_versions",
-                "DELETE FROM prompt_schema_versions",
-            ),
-            id="both-null-rows-gone",
-        ),
-        pytest.param(("DELETE FROM active_config",), id="active-config-gone"),
-    ],
-)
-async def test_every_migrate_leaves_both_pointers_set(migrated, make_config, damage: tuple[str, ...]) -> None:
-    """The columns are nullable in M2, so the seed is what keeps the pointers set: whatever a migrate starts
-    from, it ends with both naming the seeded rows. (The autouse reset restores the shared database after.)"""
-    for statement in damage:
-        one(migrated, statement)
+async def test_every_migrate_leaves_both_pointers_set(migrated, make_config) -> None:
+    """Whatever a migrate starts from, it ends with both pointers naming the seeded rows. Since 0008 the
+    columns refuse NULL, so the damage left to repair is a missing `active_config` row, which the seed inserts
+    with both pointers set. (The autouse reset restores the shared database after.)"""
+    one(migrated, "DELETE FROM active_config")
     await run_migrate_async(make_config("migrate"), now=NOW)
     assert one(
         migrated, "SELECT rubric_version_id IS NULL, prompt_schema_version_id IS NULL FROM active_config"
