@@ -27,7 +27,7 @@ Each candidate goes through three layers (L4176-4180):
      (an empty education list is `none`); `uncomparable` when the level is `unspecified`, or the education
      holds only `other` levels (A3 G10);
    - `certification` (mandatory): `unmet` when no profile certification has a folded token-set similarity of
-     at least 0.8;
+     at least 0.8 (`token_set_similarity`, the overlap coefficient; Controller Ruling T3-b);
    - `contract_type` (the structured employment types): `unmet` when all lie outside the scope, the
      `employment_type_excluded` filter's domain.
 3. **Review need**: a text requirement that is `unmet` or `uncomparable` is **binding-capable** (it triggers
@@ -39,8 +39,14 @@ The severity is `scope.knockout_severity[code]`, and for a language
 comparison whose fact is structured or critic-confirmed caps or penalises; `uncomparable` never does.
 
 `inputs` holds the compared values, ids and enums, never ad text; an unknown input is `null`, so an `unmet`
-candidate's inputs hold no `null`. The token-set similarity of two names is the Jaccard index of their sets of
-folded words (the `\\w+` runs of `fold`).
+candidate's inputs hold no `null`.
+
+The token-set similarity of two names is the subset-tolerant overlap coefficient of their sets of folded
+words (the `\\w+` runs of `fold`), `|A ∩ B| / min(|A|, |B|)`, not the Jaccard index (Controller Ruling T3-b):
+`unmet` must be a provable incompatibility, and a name whose words all appear in the other's may well be the
+same certificate, so it errs toward `met`. "Kubernetes Administrator" against "Certified Kubernetes
+Administrator" is 1.0 (Jaccard 0.67, a false `unmet` that would bind a soft penalty), while "AWS Solutions
+Architect Associate" against "AWS Solutions Architect Professional" is 0.75 and stays `unmet`.
 """
 
 import re
@@ -89,10 +95,12 @@ class KnockoutCandidate:
 
 
 def token_set_similarity(a: str, b: str) -> float:
-    """The Jaccard index of the folded word sets of `a` and `b`; 0.0 when both have no word."""
+    """The overlap coefficient `|A ∩ B| / min(|A|, |B|)` of the folded word sets of `a` and `b` (see the
+    module docstring); 0.0 when either has no word. Symmetric. Task 5's V4 skills check uses it too."""
     left, right = set(_WORD.findall(fold(a))), set(_WORD.findall(fold(b)))
-    union = left | right
-    return len(left & right) / len(union) if union else 0.0
+    if not left or not right:
+        return 0.0
+    return len(left & right) / min(len(left), len(right))
 
 
 # -- the comparisons -----------------------------------------------------------------------------------------

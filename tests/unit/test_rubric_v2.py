@@ -48,7 +48,7 @@ def test_only_the_unspecified_level_sentence_of_languages_changes() -> None:
     changed = {path for path in v1 if v1[path] != v2[path]}
     assert changed == {".languages.unspecified_level"}
     assert v2[".languages.unspecified_level"] == V2_SENTENCE
-    assert "B2 or higher, the knockout comparison is `met`" in V2_SENTENCE
+    assert "B2 or higher, the knockout comparison is `met`" in v2[".languages.unspecified_level"]
     assert "at any level" in v1[".languages.unspecified_level"]  # v1 is unchanged
 
 

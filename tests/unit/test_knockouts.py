@@ -302,13 +302,24 @@ def test_a_degree_with_an_equivalent_or_none_required_or_preferred_is_no_require
     assert candidates(degree("master", mandatory=False)) == []
 
 
-def test_token_set_similarity_is_the_jaccard_index_of_the_folded_word_sets() -> None:
-    assert (
-        token_set_similarity("AWS Certified Solutions Architect", "aws  certified solutions ARCHITECT") == 1.0
-    )
-    assert token_set_similarity("Zertifizierter Scrum-Master", "zertifizierter scrum master") == 1.0
-    assert token_set_similarity("AWS Solutions Architect", "AWS Certified Solutions Architect") == 0.75
-    assert token_set_similarity("", "") == 0.0
+PAIRS = [  # (a, b, the overlap coefficient of their folded word sets)
+    ("AWS Certified Solutions Architect", "aws  certified solutions ARCHITECT", 1.0),
+    ("Zertifizierter Scrum-Master", "zertifizierter scrum master", 1.0),
+    ("Kubernetes Administrator", "Certified Kubernetes Administrator", 1.0),  # Jaccard: 0.67
+    ("AWS Solutions Architect", "AWS Certified Solutions Architect \N{EN DASH} Professional", 1.0),  # 0.6
+    ("AWS Solutions Architect Associate", "AWS Solutions Architect Professional", 0.75),
+    ("ITIL Foundation", "Certified Kubernetes Administrator", 0.0),
+    ("", "ITIL Foundation", 0.0),  # a name without a word matches nothing
+    ("", "", 0.0),
+]
+
+
+@pytest.mark.parametrize(("a", "b", "expected"), PAIRS)
+def test_token_set_similarity_is_the_overlap_coefficient_of_the_folded_word_sets(
+    a: str, b: str, expected: float
+) -> None:  # Controller Ruling T3-b
+    assert token_set_similarity(a, b) == expected
+    assert token_set_similarity(b, a) == expected  # symmetric
 
 
 def test_certification() -> None:
@@ -318,19 +329,32 @@ def test_certification() -> None:
                 name="AWS Certified Solutions Architect Associate", mandatory=True, evidence=["AWS"]
             ),
             Certification(name="Certified Kubernetes Administrator", mandatory=True, evidence=["CKA"]),
+            Certification(name="AWS Solutions Architect Professional", mandatory=True, evidence=["AWS Pro"]),
             Certification(name="ITIL Foundation", mandatory=False, evidence=["ITIL"]),
         ]
     )
     person = profile(
         certifications=[
             {"name": "AWS Certified Solutions Architect \N{EN DASH} Associate", "issuer": None, "year": 2024},
-            {"name": "Kubernetes Administrator", "issuer": None, "year": 2023},  # 2 of 3 words: 0.67
+            {"name": "Kubernetes Administrator", "issuer": None, "year": 2023},  # a subset of the ad's words
         ]
     )
     assert [(c.subject, c.comparison, c.severity) for c in candidates(job, person=person)] == [
         ("aws certified solutions architect associate", "met", "soft"),
-        ("certified kubernetes administrator", "unmet", "soft"),
+        ("certified kubernetes administrator", "met", "soft"),
+        ("aws solutions architect professional", "unmet", "soft"),  # 0.75 against the Associate
     ]
+    named_subset = profile(certifications=[{"name": "AWS Solutions Architect", "issuer": None, "year": None}])
+    professional = job_facts(
+        certifications=[
+            Certification(
+                name="AWS Certified Solutions Architect \N{EN DASH} Professional",
+                mandatory=True,
+                evidence=["x"],
+            )
+        ]
+    )
+    assert only(candidates(professional, person=named_subset)).comparison == "met"
 
 
 def test_contract_type_is_the_filters_domain_and_never_binding_capable() -> None:

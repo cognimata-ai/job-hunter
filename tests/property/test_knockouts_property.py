@@ -213,9 +213,10 @@ def provably_incompatible(
             return job.degree.level in DEGREES and DEGREES[job.degree.level] > max(ordered, default=0)
         case "certification":
             required = words(candidate.subject)
-            return all(
-                not (required | words(x.name))
-                or len(required & words(x.name)) / len(required | words(x.name)) < 0.8
+            return all(  # the overlap coefficient of the word sets (Controller Ruling T3-b)
+                not required
+                or not words(x.name)
+                or len(required & words(x.name)) / min(len(required), len(words(x.name))) < 0.8
                 for x in person.certifications
             )
         case "contract_type":
