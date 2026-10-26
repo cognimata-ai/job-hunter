@@ -12,6 +12,9 @@ the target in its final state needs no transition (the `score_targets` trigger c
 result id is taken from the identity sequence first and the result is inserted with it
 (`OVERRIDING SYSTEM VALUE`).
 
+`CLAIM_WHERE`, `CLAIM_FROM`, `CLAIM_SET_SQL` and `CLAIM_RETURNING` are the atomic claim's arguments to
+`transition_where`, for the tests of the set-based helper.
+
 `insert_m1_configuration` and `insert_m2_seed_rows` put an older install's state in place by direct SQL, for
 the upgrade tests of migration 0008: no seed of this code runs against an older schema, because this code's
 seed writes columns that schema does not have yet (ruling T1-b).
@@ -36,6 +39,29 @@ from tests.support.pg import PgServer
 
 NOW: Final = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 _BUDGET_MONTH: Final = date(2026, 10, 1)
+
+# The atomic claim (§9.4, L3477-3488) as `transition_where` runs it, `pending -> in_progress`: the caller's
+# `FOR UPDATE SKIP LOCKED` subquery in `where`, the admitted ids with their lanes and always-include reasons
+# as the source relation `a`, and the claim columns as SQL over `t` and `a`. Its binds: `ids`, `lanes`,
+# `reasons`, `epoch` and `max_attempts`.
+CLAIM_WHERE: Final = (
+    "t.id = a.id AND t.id IN (SELECT id FROM score_targets WHERE id = ANY(CAST(:ids AS bigint[])) "
+    "AND state = 'pending' AND (not_before IS NULL OR not_before <= now()) "
+    "AND charged_attempts < :max_attempts AND NOT is_fenced(job_id, llm_tuple_id) FOR UPDATE SKIP LOCKED)"
+)
+CLAIM_FROM: Final = (
+    "unnest(CAST(:ids AS bigint[]), CAST(:lanes AS text[]), CAST(:reasons AS text[])) AS a(id, lane, reason)"
+)
+CLAIM_SET_SQL: Final = {
+    "claim_id": "gen_random_uuid()",
+    "claim_epoch": ":epoch",
+    "claimed_at": "now()",
+    "claim_heartbeat_at": "now()",
+    "attempt_no": "t.attempt_no + 1",
+    "lane": "a.lane",
+    "always_include_reason": "a.reason",
+}
+CLAIM_RETURNING: Final = ("id", "claim_id", "attempt_no")
 
 
 def _insert(table: str, values: Mapping[str, object], *, returning: bool, overriding: bool) -> TextClause:

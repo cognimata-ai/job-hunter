@@ -4,16 +4,23 @@
 call against it and runs a single CAS `UPDATE`: the new state, the reason, the changed-at column and the
 cleared ownership columns are all part of that statement, so a row never leaves `running` still owned.
 
-The statement is built with SQLAlchemy Core over a table object made from the registry. Every identifier in
-it (table, state, reason, changed-at, owner, cleared and settable columns) comes from the registry, never from
-a caller string: a caller's table, states, owner keys and `set_` keys are looked up in the registry and
-refused when they are not there. Caller values are always bound parameters.
+The statement is built with SQLAlchemy Core over a table object made from the registry, aliased `t`. Every
+identifier in it (table, state, reason, changed-at, owner, cleared and settable columns) comes from the
+registry, never from a caller string: a caller's table, states, owner keys and `set_` keys are looked up in
+the registry and refused when they are not there. Caller values are always bound parameters.
+
+`transition_where()` is the set-based form over the same registry and the same assignments (`_assignments`):
+one `UPDATE ... AS t` moves every row of the from-states that a caller's `where` selects. Its `where`, its
+source relation (`from_sql`) and its SQL assignments (`set_sql`) are static SQL of the caller's module, never
+input, with `:name` binds from `params`; every other identifier still comes from the registry.
+`transition_set_clause()` renders the same assignments as the `SET` list of an upsert.
 
 The database holds the same edges in `transition_matrix` (written by `seed.sync_transition_matrix` from this
-registry), where the `assert_transition` trigger checks them as defence in depth.
+registry), where the `assert_transition` trigger checks them, row by row, as defence in depth.
 """
 
 import enum
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
@@ -22,6 +29,9 @@ from typing import Final
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql.base import PGDialect
+from sqlalchemy.engine import RowMapping
+from sqlalchemy.engine.interfaces import BindTyping
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.errors import TransitionConflict
@@ -78,6 +88,92 @@ class _Clear(enum.Enum):
 CLEAR_REASON: Final = _Clear.CLEAR_REASON
 
 _RUN_TERMINAL: Final = ("succeeded", "partial", "failed_invariant", "failed", "cancelled")
+
+# §7.16.3: the states a user "Retry" returns to `pending` (`refused`, `failed_*`), and those a supersession,
+# a merge or a purge cancels outside `in_progress` and `in_batch`.
+_TARGET_RETRYABLE: Final = (
+    "refused",
+    "failed_max_tokens",
+    "failed_invalid_output",
+    "failed_request",
+    "failed_transient",
+    "failed_attempts_exhausted",
+)
+_TARGET_CANCELLABLE: Final = (
+    "pending",
+    "budget_deferred",
+    "deferred_duplicate",
+    "filtered_out",
+    "expired_unscored",
+    *_TARGET_RETRYABLE,
+)
+# The 49 edges of §7.16.3 (L2865-2903, A1 §3.1's table), then the two of plan Deviation 7.
+_TARGET_EDGES: Final = frozenset(
+    {
+        ("pending", "in_progress"),  # admitted + the atomic claim
+        ("pending", "in_batch"),  # prepared into a bulk batch (§10.10)
+        *((f, "expired_unscored") for f in ("pending", "budget_deferred")),  # expiry (§9.6.3)
+        *((f, "filtered_out") for f in ("pending", "budget_deferred", "deferred_duplicate")),  # refilter
+        *((f, "deferred_duplicate") for f in ("pending", "budget_deferred")),  # regroup
+        ("filtered_out", "pending"),  # scope flip; "Score anyway"
+        ("deferred_duplicate", "pending"),  # split, dissolved, elected; "Score individually"; "Score now"
+        ("pending", "pending"),  # "Score now" (L2879)
+        ("budget_deferred", "pending"),  # "Score now"; headroom returns (§6.9.4)
+        ("expired_unscored", "pending"),  # "Score now"; the expiry condition no longer holds
+        *((f, "pending") for f in _TARGET_RETRYABLE),  # "Retry"
+        *(
+            ("in_progress", t)
+            for t in (
+                "budget_deferred",
+                "published_accepted",
+                "published_contested",
+                "refused",
+                "failed_max_tokens",
+                "failed_invalid_output",
+                "failed_request",
+                "pending",
+                "failed_transient",
+                "failed_attempts_exhausted",
+                "cancelled",
+            )
+        ),
+        *(
+            ("in_batch", t)
+            for t in (
+                "published_accepted",
+                "pending",
+                "refused",
+                "failed_request",
+                "failed_invalid_output",
+                "cancelled",
+            )
+        ),
+        *((f, "cancelled") for f in _TARGET_CANCELLABLE),  # superseded, merged, purged
+        ("cancelled", "pending"),  # the revival (§9.7)
+        # Deviation 7 (Codex r1 #21): `charged_attempts` reached `max_score_attempts` outside `in_progress`
+        # (R6 charges at `submit_started`, so after a rejected or ambiguous batch, or a budget denial inside
+        # a fourth attempt); the exhaustion sweep (Task 13) moves it, reason `attempts_exhausted`.
+        *((f, "failed_attempts_exhausted") for f in ("pending", "budget_deferred")),
+    }
+)
+# §7.11: every outcome but `running` ends an attempt.
+_ATTEMPT_OUTCOMES: Final = (
+    "published_accepted",
+    "published_contested",
+    "refused",
+    "failed_max_tokens",
+    "failed_invalid_output",
+    "failed_request",
+    "transient_error",
+    "budget_exhausted",
+    "claim_lost",
+    "cancelled",
+    "batch_draft_ready",
+    "submit_rejected",
+    "released",
+)
+# §7.12: the provider's per-item result types.
+_ITEM_RESULTS: Final = ("succeeded", "errored", "canceled", "expired", "missing")
 
 TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
     {
@@ -455,6 +551,151 @@ TRANSITIONS: Final[Mapping[str, TransitionSpec]] = MappingProxyType(
                 }
             ),
         ),
+        # §7.16.3. Every exit clears what only its state may hold (the §7.11 CHECKs pair each with its
+        # state); `claimed_at` is kept as history (R8). Every edge that sets `override` sets `override_at` in
+        # the same `set_` (`CHECK ((override = 'none') = (override_at IS NULL))`), and the revival sets both
+        # back to `'none'` / `NULL`.
+        "score_targets": TransitionSpec(
+            table="score_targets",
+            state_col="state",
+            reason_col="state_reason",
+            changed_at=MappingProxyType(
+                dict.fromkeys(sorted({to for _, to in _TARGET_EDGES}), "state_changed_at")
+            ),
+            owner_cols=frozenset({"claim_id", "attempt_no", "batch_submission_id"}),
+            clear_on_exit=MappingProxyType(
+                {
+                    "in_progress": ("claim_id", "claim_epoch", "claim_heartbeat_at"),
+                    "in_batch": ("batch_submission_id",),
+                    "deferred_duplicate": ("deferred_group_id",),
+                    "filtered_out": ("filter_scope_version_id",),
+                }
+            ),
+            allowed=_TARGET_EDGES,
+            settable=frozenset(
+                {
+                    "claim_id",
+                    "claim_epoch",
+                    "claimed_at",
+                    "claim_heartbeat_at",
+                    "attempt_no",
+                    "lane",
+                    "always_include_reason",
+                    "batch_submission_id",
+                    "filter_scope_version_id",
+                    "deferred_group_id",
+                    "override",
+                    "override_at",
+                    "charged_attempts",
+                    "not_before",
+                    "transient_failures",
+                    "refusal_category",
+                    "published_result_id",
+                    "resume_draft_id",
+                    "bulk_operation_id",
+                    "updated_at",
+                }
+            ),
+        ),
+        # §7.11. §7.16 has no attempt machine, as it has none for `llm_calls` (A1 issue 15, plan Deviation
+        # 12): an attempt is `running` until it ends in one of its outcomes.
+        "score_attempts": TransitionSpec(
+            table="score_attempts",
+            state_col="outcome",
+            reason_col="outcome_detail",
+            changed_at=MappingProxyType(dict.fromkeys(_ATTEMPT_OUTCOMES, "ended_at")),
+            owner_cols=frozenset({"claim_id"}),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(("running", outcome) for outcome in _ATTEMPT_OUTCOMES),
+            settable=frozenset(
+                {"logical_calls", "http_calls", "charged", "cost_usd", "claim_id", "claim_epoch"}
+            ),
+        ),
+        # §7.16.8 (L3001). A cycle's owner is its worker epoch.
+        "score_cycles": TransitionSpec(
+            table="score_cycles",
+            state_col="status",
+            reason_col="status_reason",
+            changed_at=MappingProxyType(dict.fromkeys(("completed", "failed"), "finished_at")),
+            owner_cols=frozenset({"worker_epoch"}),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("running", "completed"), ("running", "failed")}),
+            settable=frozenset(
+                {"admission_size", "admitted", "c_hat_usd", "spent_usd", "report", "heartbeat_at"}
+            ),
+        ),
+        # §7.16.8 (L3002).
+        "bulk_operations": TransitionSpec(
+            table="bulk_operations",
+            state_col="state",
+            reason_col=None,
+            changed_at=MappingProxyType(dict.fromkeys(("completed", "cancelled"), "finished_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset({("active", "completed"), ("active", "cancelled")}),
+            settable=frozenset({"spent_usd", "followup_held_usd"}),
+        ),
+        # §7.16.6 (L2948-2962). The CAS on `state` is the ownership predicate (L303), so there are no owner
+        # columns. No reason column: `reconcile_report` is jsonb and written by `set_` (A1 issue 14).
+        # `submit_rejected`, `submit_ambiguous` and `abandoned` record no time. The self-loops of L2955 and
+        # L2958 are plain UPDATEs of `last_reconcile_at` and `reconcile_report`, not transitions.
+        "batch_submissions": TransitionSpec(
+            table="batch_submissions",
+            state_col="state",
+            reason_col=None,
+            changed_at=MappingProxyType(
+                {
+                    "submit_started": "submit_started_at",
+                    "submitted": "submitted_at",
+                    "ended": "ended_at",
+                    "reconciled": "reconciled_at",
+                    "released": "released_at",
+                }
+            ),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(
+                {
+                    ("preparing", "submit_started"),
+                    ("preparing", "abandoned"),
+                    ("submit_started", "submitted"),
+                    ("submit_started", "submit_rejected"),
+                    ("submit_started", "submit_ambiguous"),
+                    ("submit_started", "released"),
+                    ("submit_ambiguous", "ended"),
+                    ("submit_ambiguous", "released"),
+                    ("released", "ended"),
+                    ("submitted", "ended"),
+                    ("ended", "reconciled"),
+                }
+            ),
+            settable=frozenset(
+                {
+                    "provider_batch_id",
+                    "expires_at",
+                    "cancel_requested_at",
+                    "results_complete_at",
+                    "last_reconcile_at",
+                    "reconcile_report",
+                    "request_hash",
+                    "request_count",
+                    "reserved_usd",
+                    "followup_held_usd",
+                }
+            ),
+        ),
+        # §7.12. The decision is the reason, and every edge passes one: the CHECK
+        # `(processed_at IS NULL) = (decision IS NULL)` pairs it with the changed-at column.
+        "batch_items": TransitionSpec(
+            table="batch_items",
+            state_col="result_type",
+            reason_col="decision",
+            changed_at=MappingProxyType(dict.fromkeys(_ITEM_RESULTS, "processed_at")),
+            owner_cols=frozenset(),
+            clear_on_exit=MappingProxyType({}),
+            allowed=frozenset(("awaiting", result) for result in _ITEM_RESULTS),
+            settable=frozenset({"llm_call_id", "stop_reason"}),
+        ),
     }
 )
 
@@ -466,14 +707,29 @@ _WRITTEN_ELSEWHERE: Final[Mapping[str, str]] = MappingProxyType(
 
 
 @cache
-def _table(name: str) -> sa.TableClause:
-    """A lightweight table object over the registry columns of `name` (only registered names get here)."""
+def _table(name: str) -> sa.Alias:
+    """A lightweight table object over the registry columns of `name`, aliased `t` as every statement of this
+    module names it (only registered names get here)."""
     spec = TRANSITIONS[name]
     columns = (
         sa.column(column, sa.BigInteger) if column == "id" else sa.column(column)
         for column in sorted(spec.columns)
     )
-    return sa.table(spec.table, *columns)
+    # `sa.alias` is typed as returning a `NamedFromClause`; a table's alias is an `Alias`, which `sa.update`
+    # takes.
+    return sa.alias(sa.table(spec.table, *columns), "t")  # type: ignore[return-value]
+
+
+def _spec(table: str) -> TransitionSpec:
+    """The registry entry of `table`, whose rows this module updates by `id`; else `ValueError`."""
+    spec = TRANSITIONS.get(table)
+    if spec is None:
+        raise ValueError(f"unknown table {table!r}: it has no state machine")
+    if (writer := _WRITTEN_ELSEWHERE.get(table)) is not None:
+        raise ValueError(
+            f"{table} has no id, so transition() cannot update it: its state is written by {writer}"
+        )
+    return spec
 
 
 def _bound(value: object) -> object:
@@ -519,51 +775,26 @@ def _validate(
     return cleared
 
 
-async def transition(
-    conn: AsyncConnection,
-    table: str,
-    row_id: int,
+def _assignments(
+    spec: TransitionSpec,
     from_states: Sequence[str],
     to_state: str,
-    *,
-    reason: str | _Clear | None = None,
-    owner: Mapping[str, object] | None = None,
-    set_: Mapping[str, object] | None = None,
-) -> None:
-    """Move row `row_id` of `table` from one of `from_states` to `to_state`, or raise.
-
-    One `UPDATE ... WHERE id = :id AND <state> = ANY(:from) [AND <owner col> = :owner ...] RETURNING id`:
+    reason: str | _Clear | None,
+    cleared: frozenset[str],
+    set_: Mapping[str, object],
+) -> dict[str, object]:
+    """The SET clause of an edge that `_validate` accepted, column by column, over `_table(spec.table)`.
 
     - The new state, and the reason when `reason` is given: a text, or `CLEAR_REASON` for `NULL`. Without one
       (`None`) the reason column keeps whatever it held.
     - The changed-at column of `to_state`, unless the row is already in `to_state` (a self-edge keeps the
       time of the first entry).
-    - `NULL` for the ownership columns that `clear_on_exit` lists for every state of `from_states` other
-      than `to_state`.
+    - `NULL` for the `cleared` columns.
     - The `set_` columns. A value that is a SQL expression is rendered as it is, a mapping or a list is bound
       as JSONB, anything else as an ordinary parameter.
 
-    A self-edge (for example `running -> running`) is exclusive only when `owner` is given: without an owner
-    predicate, two callers that both name `running` as the from-state both match, and the last one wins. A
-    caller that needs exclusivity (a takeover that must beat its rival) passes the owner.
-
-    Raises `ValueError`, before touching the database, for a table or an edge the registry does not know, a
-    table whose rows have no `id` (`quota_windows`: `windows.save_window` writes its state), an owner key that
-    is not an ownership column, and a `set_` key that is not settable or that the transition clears. Raises
-    `TransitionConflict` when no row matched: it is absent, in another state, or owned by another attempt or
-    claim. The caller decides what that means.
+    A plain value is bound under the name of its column when the statement is compiled.
     """
-    spec = TRANSITIONS.get(table)
-    if spec is None:
-        raise ValueError(f"unknown table {table!r}: it has no state machine")
-    if (writer := _WRITTEN_ELSEWHERE.get(table)) is not None:
-        raise ValueError(
-            f"{table} has no id, so transition() cannot update it: its state is written by {writer}"
-        )
-    owner = owner or {}
-    set_ = set_ or {}
-    cleared = _validate(spec, from_states, to_state, reason, owner, set_)
-
     target = _table(spec.table)
     state = target.c[spec.state_col]
     assignments: dict[str, object] = {spec.state_col: to_state}
@@ -578,20 +809,214 @@ async def transition(
         )
     assignments.update(dict.fromkeys(sorted(cleared), sa.null()))
     assignments.update({column: _bound(value) for column, value in set_.items()})
+    return assignments
 
+
+async def transition(
+    conn: AsyncConnection,
+    table: str,
+    row_id: int,
+    from_states: Sequence[str],
+    to_state: str,
+    *,
+    reason: str | _Clear | None = None,
+    owner: Mapping[str, object] | None = None,
+    set_: Mapping[str, object] | None = None,
+) -> None:
+    """Move row `row_id` of `table` from one of `from_states` to `to_state`, or raise.
+
+    One `UPDATE <table> AS t SET <assignments> WHERE t.id = :id AND t.<state> = ANY(:from)
+    [AND t.<owner col> = :owner ...] RETURNING t.id`, with the assignments of `_assignments`: the new state,
+    the reason when one is given, the changed-at column of `to_state` (kept on a self-edge), `NULL` for the
+    ownership columns that `clear_on_exit` lists for every state of `from_states` other than `to_state`, and
+    the `set_` columns.
+
+    A self-edge (for example `running -> running`) is exclusive only when `owner` is given: without an owner
+    predicate, two callers that both name `running` as the from-state both match, and the last one wins. A
+    caller that needs exclusivity (a takeover that must beat its rival) passes the owner.
+
+    Raises `ValueError`, before touching the database, for a table or an edge the registry does not know, a
+    table whose rows have no `id` (`quota_windows`: `windows.save_window` writes its state), an owner key that
+    is not an ownership column, and a `set_` key that is not settable or that the transition clears. Raises
+    `TransitionConflict` when no row matched: it is absent, in another state, or owned by another attempt or
+    claim. The caller decides what that means.
+    """
+    spec = _spec(table)
+    owner = owner or {}
+    set_ = set_ or {}
+    cleared = _validate(spec, from_states, to_state, reason, owner, set_)
+
+    target = _table(spec.table)
     statement = (
         sa.update(target)
         .where(
             target.c.id == row_id,
-            state == sa.any_(sa.literal(list(from_states), ARRAY(sa.Text))),
+            target.c[spec.state_col] == sa.any_(sa.literal(list(from_states), ARRAY(sa.Text))),
             # The owner value keeps no type of its own, so the database reads it as the column's type.
             *(
                 target.c[column] == sa.bindparam(None, value, type_=sa.types.NullType())
                 for column, value in owner.items()
             ),
         )
-        .values(assignments)
+        .values(_assignments(spec, from_states, to_state, reason, cleared, set_))
         .returning(target.c.id)
     )
     if (await conn.execute(statement)).first() is None:
         raise TransitionConflict(table, row_id, to_state)
+
+
+class _TextDialect(PGDialect):
+    """PostgreSQL rendering with no bind casts, for SQL that is read back by `sa.text`.
+
+    `sa.text` does not recognise `:name::type` as a bind (`db/sql.py`), and the PostgreSQL compiler writes a
+    JSONB bind as `:name::JSONB`; without the casts every bind is a plain `:name`. The types stay on the
+    bind parameters, so the executing dialect still processes each value as its type.
+    """
+
+    bind_typing = BindTyping.NONE
+
+
+_TEXT_DIALECT: Final = _TextDialect(paramstyle="named")  # type: ignore[no-untyped-call]  # PGDialect.__init__
+# A `:name` that `sa.text` reads as a bind: not after a colon, a word character or a backslash. Unlike the
+# pattern of `sa.text`, it also matches a name followed by `:`, which is how `:name::type` is found.
+_BIND: Final = re.compile(r"(?<![:\w\\]):(\w+)")
+_IDENTIFIER: Final = re.compile(r"[a-z_][a-z0-9_]*")
+# The bind of the from-states in `transition_where`'s WHERE clause.
+_FROM_BIND: Final = "from"
+
+
+def _sql_binds(table: str, fragments: Sequence[str]) -> set[str]:
+    """The `:name` binds of the static SQL `fragments`; `ValueError` for a `:name::type` cast."""
+    names: set[str] = set()
+    for fragment in fragments:
+        for match in _BIND.finditer(fragment):
+            name = match.group(1)
+            if fragment.startswith(":", match.end()):
+                raise ValueError(
+                    f"{table}: write CAST(:{name} AS type), not :{name}::type, which sa.text does not bind"
+                )
+            names.add(name)
+    return names
+
+
+def _set_list(
+    spec: TransitionSpec, assignments: Mapping[str, object], set_sql: Mapping[str, str]
+) -> tuple[str, list[sa.BindParameter[object]]]:
+    """The SET list (`column=<expression>, ...`) of `assignments` and then of the static `set_sql`, in that
+    order, as SQL for `sa.text`, and the bind parameters it names, each under the name it is rendered with."""
+    values = {**assignments, **{column: sa.literal_column(sql) for column, sql in set_sql.items()}}
+    update = sa.update(_table(spec.table)).ordered_values(*values.items())
+    compiled = update.compile(dialect=_TEXT_DIALECT)
+    binds = [
+        sa.bindparam(name, compiled.params[name], type_=bind.type)
+        for bind, name in compiled.bind_names.items()
+    ]
+    # `UPDATE <table> AS t SET <list>`: the list is what follows the first " SET ".
+    return str(compiled).partition(" SET ")[2], binds
+
+
+async def transition_where(
+    conn: AsyncConnection,
+    table: str,
+    from_states: Sequence[str],
+    to_state: str,
+    *,
+    where: str,
+    params: Mapping[str, object],
+    reason: str | _Clear | None = None,
+    set_: Mapping[str, object] | None = None,
+    set_sql: Mapping[str, str] | None = None,
+    from_sql: str | None = None,
+    returning: Sequence[str] = ("id",),
+) -> list[RowMapping]:
+    """Move every row of `table` in one of `from_states` that `where` selects to `to_state`; return them.
+
+    The set-based form of `transition()` over the same registry and the same assignments (plan R3):
+
+        UPDATE <table> AS t SET <assignments>, <set_sql> [FROM <from_sql>]
+         WHERE t.<state> = ANY(:from) AND (<where>) RETURNING t.<returning>, ...
+
+    - `where` is static SQL of the caller's module (never input) over `t`, with `:name` binds from `params`.
+      A row lock is the caller's to write, as a subquery in `where`:
+      `t.id IN (SELECT id FROM <table> WHERE ... FOR UPDATE SKIP LOCKED)` (the atomic claim, §9.4).
+    - `from_sql` is a static source relation with its own alias, for example
+      `unnest(CAST(:ids AS bigint[]), CAST(:lanes AS text[])) AS a(id, lane)`; its binds come from `params`.
+    - `set_sql` maps a settable column to a static SQL expression over `t` and the source
+      (`gen_random_uuid()`, `t.attempt_no + 1`, `a.lane`, `:epoch`); `set_` maps one to a value, as in
+      `transition()`.
+    - `returning` names columns of `t`.
+
+    A cast is written `CAST(:name AS type)`: `sa.text` does not recognise `:name::type` as a bind. The
+    assignments bind the to-state, a text reason and the `set_` values under their column names, and the
+    from-states as `:from`; a key of `params` may not take one of those names.
+
+    Raises `ValueError`, before touching the database, for everything `transition()` refuses (an unknown
+    table or edge, a reason without a reason column, a column that is not settable or that the transition
+    clears, whether in `set_` or in `set_sql`), a column in both `set_` and `set_sql`, an empty `where`, a
+    `:name` of `where`, `from_sql` or `set_sql` that `params` does not give and a key of `params` that none of
+    them binds, a `:name::type` cast, a bind name that collides with the assignments', and a `returning` name
+    that is not a column name. Zero rows is not an error: the caller reads the list. The `assert_transition`
+    trigger still checks every row.
+    """
+    spec = _spec(table)
+    set_ = set_ or {}
+    set_sql = set_sql or {}
+    if both := set(set_) & set(set_sql):
+        raise ValueError(f"{table}: {sorted(both)} are assigned by both set_ and set_sql")
+    cleared = _validate(spec, from_states, to_state, reason, {}, {**set_, **set_sql})
+    if not where.strip():
+        raise ValueError(f"{table}: where is empty (a predicate that selects every row is written `true`)")
+    if not returning:
+        raise ValueError(f"{table}: returning is empty")
+    if odd := [name for name in returning if not _IDENTIFIER.fullmatch(name)]:
+        raise ValueError(f"{table}: {odd} in returning are not a column name")
+    fragments = [where, *([from_sql] if from_sql is not None else []), *set_sql.values()]
+    named = _sql_binds(table, fragments)
+    if missing := named - set(params):
+        raise ValueError(f"{table}: {sorted(missing)} have no value in params")
+    if spare := set(params) - named:
+        raise ValueError(f"{table}: {sorted(spare)} are bound by no :name of where, from_sql or set_sql")
+
+    assignments = _assignments(spec, from_states, to_state, reason, cleared, set_)
+    set_list, emitted = _set_list(spec, assignments, set_sql)
+    if collide := set(params) & {_FROM_BIND, *(bind.key for bind in emitted)}:
+        raise ValueError(f"{table}: {sorted(collide)} collide with the binds of the transition")
+    source = f" FROM {from_sql}" if from_sql is not None else ""
+    columns = ", ".join(f"t.{name}" for name in returning)
+    predicate = f"t.{spec.state_col} = ANY(:{_FROM_BIND}) AND ({where})"
+    # The registry's identifiers and the caller's static SQL, checked above; every value is a bind.
+    statement = sa.text(
+        f"UPDATE {spec.table} AS t SET {set_list}{source} WHERE {predicate} RETURNING {columns}"  # noqa: S608
+    ).bindparams(
+        *emitted,
+        sa.bindparam(_FROM_BIND, list(from_states), type_=ARRAY(sa.Text)),
+        **params,
+    )
+    return list((await conn.execute(statement)).mappings())
+
+
+def transition_set_clause(
+    table: str, to_state: str, *, reason: str | _Clear | None, set_sql: Mapping[str, str]
+) -> str:
+    """The `SET` list of an edge into `to_state`, for the `ON CONFLICT ... DO UPDATE` of an upsert (§9.7).
+
+    The same assignments as `transition()` and `transition_where()` (the new state, the reason when one is
+    given, the changed-at column of `to_state`), then `set_sql`, static SQL as in `transition_where()`. The
+    from-state is the upsert's own `WHERE` (the revival names `cancelled`), so nothing is cleared here and the
+    changed-at column is always set. Named binds, as `transition()` names them: the statement binds
+    `:<state column>` to `to_state`, and `:<reason column>` to a text `reason`; `set_sql` brings its own.
+
+    Raises `ValueError` for an unknown table, a to-state no edge enters, a reason without a reason column, a
+    `set_sql` column that is not settable, and a `:name::type` cast.
+    """
+    spec = _spec(table)
+    if not any(to == to_state for _, to in spec.allowed):
+        raise ValueError(f"no transition of {table} enters {to_state}")
+    if reason is not None and spec.reason_col is None:
+        raise ValueError(f"{table} has no reason column")
+    if unsettable := set(set_sql) - spec.settable:
+        raise ValueError(f"{table}: {sorted(unsettable)} cannot be set by a transition")
+    _sql_binds(table, list(set_sql.values()))
+    assignments = _assignments(spec, (), to_state, reason, frozenset(), {})
+    set_list, _ = _set_list(spec, assignments, set_sql)
+    return set_list
