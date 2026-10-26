@@ -15,6 +15,8 @@ or person.
 - `CENTRE` is a scope location (Berlin's centre, radius 20 km) and `km_east(*km)` a resolved location with one
   candidate that many kilometres east of it for each distance (`ambiguous` when there are several), so a
   test sets `x = d / r` directly: `km_east(28)` lies at 1.4 times the radius;
+- `rating(level)` is a draft criterion rated `level` (`observed`, or `unknown` for `None`) with no evidence,
+  as the aggregation reads it;
 - `evaluation_policy(**overrides)` is the seeded evaluation policy (`settings_v1.json`'s `evaluation` block)
   with `t8_sample_pct = 0` unless overridden, so no test's triggers depend on its ids (Controller Ruling
   P48): a test that exercises T8 sets the rate itself.
@@ -25,7 +27,7 @@ from collections.abc import Sequence
 from typing import Any, Final
 
 from jobhunter.db.seed import load_settings_v1
-from jobhunter.llm.schemas.generator import JobFacts, RequiredLanguage
+from jobhunter.llm.schemas.generator import DraftCriterion, JobFacts, RequiredLanguage
 from jobhunter.llm.schemas.profile import ConfirmedProfile, Language
 from jobhunter.run_settings import ScopeLocation
 from jobhunter.scoring.evaluation_policy import EvaluationPolicy
@@ -135,3 +137,11 @@ def evaluation_policy(**overrides: JSONValue) -> EvaluationPolicy:
     """The seeded evaluation policy with `t8_sample_pct = 0` and the given payload fields replaced."""
     seeded = get_object(load_settings_v1(), "evaluation")
     return EvaluationPolicy.from_payload({**seeded, "t8_sample_pct": 0, **overrides})
+
+
+def rating(level: int | None) -> DraftCriterion:
+    """A criterion rated `level`, `observed` (or `unknown` for `None`), with no evidence."""
+    basis = "unknown" if level is None else "observed"
+    return DraftCriterion.model_validate(
+        {"level": level, "basis": basis, "ad_evidence": [], "profile_evidence": [], "rationale": ""}
+    )

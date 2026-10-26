@@ -18,7 +18,7 @@ from typing import Any, Final, get_args
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from jobhunter.llm.schemas.generator import DraftCriterion, GeneratorDraft
+from jobhunter.llm.schemas.generator import GeneratorDraft
 from jobhunter.llm.schemas.published import PublishedResult
 from jobhunter.scoring.aggregate import (
     HARD_CAP,
@@ -41,6 +41,7 @@ from jobhunter.scoring.validator import (
 )
 
 from tests.property.test_validator_property import CONTEXTS, drafts
+from tests.support.scoring import rating
 from tests.support.validation import publication_doc
 
 CENT: Final = Decimal("0.01")
@@ -103,18 +104,29 @@ def test_the_interval_and_its_caps_stay_ordered(
     assert [cap.code for cap in capped.applied] == [*dict.fromkeys(soft), *dict.fromkeys(hard)]
 
 
+@settings(max_examples=400, deadline=None)
+@given(
+    ends=st.lists(st.decimals(min_value=0, max_value=100, places=3), min_size=2, max_size=2).map(sorted),
+    soft=codes,
+    hard=codes,
+)
+def test_caps_of_any_interval_meet_the_det_results_check(
+    ends: list[Decimal], soft: list[str], hard: list[str]
+) -> None:
+    """`caps` is public: for an interval of any precision, its stored endpoints and midpoint still satisfy
+    `score_mid = round((score_low + score_high) / 2, 2)`."""
+    low, high = ends
+    capped = caps(Interval(low, high, Decimal(0)), soft_codes=soft, hard_codes=hard)
+    assert all(representable(x, "0.01") for x in (capped.low, capped.mid, capped.high))
+    assert 0 <= capped.low <= capped.mid <= capped.high <= 100
+    assert capped.mid == half_up_mid(capped.low, capped.high)
+
+
 def test_interval_is_exact_for_the_v2_weights() -> None:
     span = interval(dict.fromkeys(RUBRIC_KEYS, 1), load_rubric("v2").weights)
     assert (span.low, span.high, span.coverage) == (Decimal(25), Decimal(25), Decimal(1))
     assert (
         caps(Interval(Decimal(0), Decimal("0.25"), Decimal(0)), soft_codes=(), hard_codes=()).mid == CENT * 13
-    )
-
-
-def rating(level: int | None) -> DraftCriterion:
-    basis = "unknown" if level is None else "observed"
-    return DraftCriterion.model_validate(
-        {"level": level, "basis": basis, "ad_evidence": [], "profile_evidence": [], "rationale": ""}
     )
 
 

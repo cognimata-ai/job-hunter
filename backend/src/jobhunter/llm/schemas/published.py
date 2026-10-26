@@ -10,7 +10,8 @@ the validator's constants (`scoring.validator`, the `LIMITS` table's values), an
   certification name, `industry.value` and `degree.field` 120, `language_other` 40, a clearance level 60;
 - the lists: at most 2 ad quotes and 2 profile references per criterion and 2 quotes per fact, 25
   must-haves and 25 nice-to-haves, 6 required languages, 10 certifications, 30 countries, each an ISO code
-  (`validator.valid_country`); `min_years_experience` 0 to 40 or `null`;
+  (`validator.valid_country`) in its canonical form, two upper-case ASCII letters (as stage 1 and the
+  publication repair write it); `min_years_experience` 0 to 40 or `null`;
 - the quote rules: every quote passes `validator.quote_defect` (4 to 300 characters, no ellipsis, at least 3
   letters or digits); a profile reference names a section of the strict enum (`generator.ProfileRef`, which
   the draft's `ProfileRefWire` leaves open for V3);
@@ -19,7 +20,8 @@ the validator's constants (`scoring.validator`, the `LIMITS` table's values), an
   `not_a_job_ad`, `critic_outcome` and `revisions_used` (0 to 2);
 - the `llm_results` CHECKs it mirrors, and the null-out's and V6's shape: only a contested result nulls
   criteria, each at most once and each `null`/`unknown`; the critic's outcome is `contested` exactly when the
-  status is; a result that is no job ad (verified, V6) has every criterion `null`.
+  status is; a result that is no job ad (verified, V6) has every criterion `null` and a critic outcome other
+  than `not_run` (only a critic review verifies the flag).
 
 It does not check V2's level and basis rules or grounding: those are the validator's, before publication.
 
@@ -28,7 +30,8 @@ A failure to validate is a `Bug` (`failed_invalid_output('publication_invalid')`
 only its error types and paths of field names may be logged.
 """
 
-from typing import Annotated, Literal, Self
+import re
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
@@ -74,6 +77,8 @@ from jobhunter.scoring.validator import (
 )
 from jobhunter.types import JSONValue
 
+_CANONICAL_COUNTRY: Final = re.compile(r"[A-Z]{2}")  # a code as stage 1 writes it: trimmed, upper case
+
 # The §11.4 knockout codes (`knockouts.derive_knockouts`).
 KnockoutCode = Literal[
     "onsite_required",
@@ -100,8 +105,8 @@ def _profile_quotes(refs: list[ProfileRef]) -> list[ProfileRef]:
 
 
 def _country(code: str) -> str:
-    if not valid_country(code):
-        raise ValueError("not an ISO 3166-1 alpha-2 country code")
+    if not valid_country(code) or _CANONICAL_COUNTRY.fullmatch(code) is None:
+        raise ValueError("not a canonical ISO 3166-1 alpha-2 country code")
     return code
 
 
@@ -293,4 +298,6 @@ class PublishedResult(_Strict):
             raise ValueError("a nulled criterion is null and unknown")
         if self.not_a_job_ad and any(c.level is not None for c in criteria.values()):
             raise ValueError("a result that is no job ad has every criterion null")
+        if self.not_a_job_ad and self.critic_outcome == "not_run":
+            raise ValueError("only a critic review verifies that a result is no job ad")
         return self

@@ -25,16 +25,20 @@ the format `golden_cases.det_inputs_snapshot` reuses (L2614-2615).
 no-op (`None`); otherwise the current instance is superseded **first** (`is_current = false, superseded_at =
 now()`) and the new one inserted **second**, so the immediate partial unique index `det_results_current` is
 never violated. A failure rolls both back with the caller's transaction. An instance's scores are never
-updated.
+updated. **Precondition:** the caller already holds the job row `FOR SHARE` (step 4 of the lock
+schedule), because the insert's immediate foreign key `det_results.job_id -> jobs(id)` takes `FOR KEY SHARE`
+on that row, which would otherwise be a step-4 lock taken after the step-10 result lock (the callers of
+Tasks 10, 15 and 18 list it in their lock steps).
 
 **Recomputing** (`compute_and_write`): under the same lock, the aggregation is rebuilt from the stored result
 alone: its `criteria` (levels after any null-out), `job_facts`, `fact_confirmations`, `status`,
 `injection_suspected`, `critic_injection` (so the confidence of a scope-only recomputation is the
 published one; Codex r1 #11) and `not_a_job_ad` (true only when verified, Task 10), the result's rubric
-weights, its profile version (for the knockouts) and its revision's description completeness. The knockouts
-are derived under `scope`; the remote-region and industry facts count only with evidence, which in a stored
-result is grounded (publication dropped every failing quote, §11.6). The description's quality is not stored
-past the revision, and a `garbage` description is always `partial` (§8.9), so the completeness carries it.
+weights, its profile version (for the knockouts) and its revision's description completeness; the given
+job must be the revision's job. The knockouts are derived under `scope`; the remote-region and industry facts
+count only with evidence, which in a stored result is grounded (publication dropped every failing quote,
+§11.6). The description's quality is not stored past the revision, and a `garbage` description is always
+`partial` (§8.9), so the completeness carries it.
 
 `ScopeRow` is a scope version (its id and its scope) and `JobRow` the job the instance belongs to (its id,
 `det_results.job_id`).
@@ -189,7 +193,10 @@ async def write_instance(
     algorithm_version: str = DET_ALGORITHM_VERSION,
 ) -> int | None:
     """Write the instance of `aggregation` (module docstring, Writing): the new id, or `None` when the current
-    instance has the same hash and algorithm version. `LookupError` for a result that does not exist."""
+    instance has the same hash and algorithm version. `LookupError` for a result that does not exist.
+
+    The caller holds the job row of `job_id` `FOR SHARE` (lock-schedule step 4) before this call takes the
+    result's row (step 10): the insert's foreign key to `jobs` key-shares that row."""
     if (await conn.execute(_LOCK_RESULT, {"id": llm_result_id})).first() is None:
         raise LookupError(f"llm result {llm_result_id} does not exist")
     current = (await conn.execute(_CURRENT, {"result": llm_result_id, "scope": scope_version_id})).first()
@@ -245,7 +252,7 @@ class _Rating:
 
 _STORED: Final = q(
     "SELECT r.criteria, r.job_facts, r.fact_confirmations, r.status, r.injection_suspected, "
-    "r.critic_injection, r.not_a_job_ad, v.profile_json, w.weights, jr.description_completeness "
+    "r.critic_injection, r.not_a_job_ad, v.profile_json, w.weights, jr.description_completeness, jr.job_id "
     "FROM llm_results r JOIN profile_versions v ON v.id = r.profile_version_id "
     "JOIN rubric_versions w ON w.id = r.rubric_version_id "
     "JOIN job_revisions jr ON jr.id = r.job_revision_id "
@@ -300,10 +307,16 @@ async def compute_and_write(
 ) -> int | None:
     """Recompute and write the result's instance under `scope` (module docstring, Recomputing) with the job's
     current `det` facts and their `sources`: `write_instance`'s result. `LookupError` for a result that does
-    not exist, or whose profile version is purged (its knockouts cannot be derived)."""
+    not exist, or whose profile version is purged (its knockouts cannot be derived); `ValueError` when `job`
+    is not the job of the result's revision.
+
+    The caller holds `job`'s row `FOR SHARE` (lock-schedule step 4) before this call takes the result's row
+    (step 10), as `write_instance` requires."""
     row = (await conn.execute(_STORED, {"id": llm_result_id})).first()
     if row is None:
         raise LookupError(f"llm result {llm_result_id} does not exist")
+    if int(row.job_id) != job.id:
+        raise ValueError(f"llm result {llm_result_id} scores job {row.job_id}, not job {job.id}")
     if row.profile_json is None:
         raise LookupError(f"the profile version of llm result {llm_result_id} is purged")
     facts = JobFacts.model_validate(row.job_facts)

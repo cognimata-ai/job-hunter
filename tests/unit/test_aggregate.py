@@ -4,11 +4,11 @@ table, and `aggregate`, which applies only binding knockouts and nulls everythin
 not-a-job-ad. Every datum is invented.
 """
 
-from decimal import Decimal
+from dataclasses import replace
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final
 
 import pytest
-from jobhunter.llm.schemas.generator import DraftCriterion
 from jobhunter.scoring.aggregate import (
     HARD_CAP,
     SOFT_PENALTY,
@@ -26,15 +26,9 @@ from jobhunter.scoring.knockouts import Comparison, Confirmation, KnockoutCandid
 from jobhunter.scoring.rubric import LLM_CRITERIA, load_rubric
 
 from tests.support.facts import facts, scope
+from tests.support.scoring import rating
 
 WEIGHTS_V2: Final = load_rubric("v2").weights
-
-
-def rating(level: int | None) -> DraftCriterion:
-    basis = "unknown" if level is None else "observed"
-    return DraftCriterion.model_validate(
-        {"level": level, "basis": basis, "ad_evidence": [], "profile_evidence": [], "rationale": ""}
-    )
 
 
 def det(level: int | None) -> DetCriterion:
@@ -186,6 +180,14 @@ def test_the_midpoint_rounds_half_up_to_two_places() -> None:
     assert capped.mid == Decimal("0.13")  # 0.125: PostgreSQL's round(numeric, 2) gives 0.13 too
     capped = caps(Interval(Decimal("61.25"), Decimal("71.50"), Decimal(1)), soft_codes=(), hard_codes=())
     assert capped.mid == Decimal("66.38")  # 66.375
+
+
+def test_the_midpoint_is_of_the_rounded_endpoints() -> None:
+    # an interval of three places: L and U round half up to their numeric(5,2) values first, and M is the
+    # rounded midpoint of those (15.005 -> 15.01); of the unrounded ones it would be 15.0045 -> 15.00
+    capped = caps(Interval(Decimal("10.005"), Decimal("20.004"), Decimal(1)), soft_codes=(), hard_codes=())
+    assert (capped.low, capped.mid, capped.high) == (Decimal("10.01"), Decimal("15.01"), Decimal("20.00"))
+    assert capped.mid == ((capped.low + capped.high) / 2).quantize(Decimal("0.01"), ROUND_HALF_UP)
 
 
 def test_no_cap_keeps_the_interval() -> None:
@@ -412,6 +414,15 @@ def test_a_verified_not_a_job_ad_has_no_score_and_no_criterion() -> None:
         "location_work_mode": {"level": None, "basis": "unknown", "inputs": {"et": 4, "sal": 4}},
         "employment_salary": {"level": None, "basis": "unknown", "inputs": {"et": None, "sal": 4}},
     }
+
+
+def test_a_binding_knockout_without_a_severity_is_refused() -> None:
+    unsevered = replace(candidate("contract_type", "employment_types", source="structured"), severity=None)
+    with pytest.raises(ValueError, match="no severity"):
+        run(knockouts=[unsevered])
+    # a candidate that does not bind needs none
+    met = replace(candidate("degree", "degree", comparison="met"), severity=None)
+    assert run(knockouts=[met]).knockouts[0]["severity"] is None
 
 
 def test_aggregate_needs_every_llm_criterion() -> None:

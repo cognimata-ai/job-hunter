@@ -5,11 +5,12 @@ midpoint and its confidence. Pure functions: no connection, no clock. Scores are
   `L₀ = Σ_{i∈K} w_i · level_i / 4`, `U₀ = L₀ + Σ_{i∈Q} w_i`, `coverage = Σ_{i∈K} w_i / 100`. The weights are
   integers, so every endpoint is a multiple of 0.25 and exact at two places.
 - **Caps** (`caps`, L4520-4523), on both endpoints, in this order: each distinct soft code once,
-  `x := max(0, x - SOFT_PENALTY)`; then each distinct hard code, `x := min(x, HARD_CAP)`; then
-  `M = round((L + U) / 2, 2)`, half up (PostgreSQL's `round` of a non-negative numeric, so the `det_results`
-  CHECK holds). Every step is monotone and applied to both endpoints, so `0 ≤ L ≤ M ≤ U ≤ 100`. The Codex #30
-  example: `[20, 80]` with one binding hard knockout is `[20, 25]`, `M = 22.5`. `applied` records each code
-  once, the soft ones first (`det_results.caps_applied`).
+  `x := max(0, x - SOFT_PENALTY)`; then each distinct hard code, `x := min(x, HARD_CAP)`; then `L` and `U`
+  rounded half up to two places (`numeric(5,2)`, as PostgreSQL rounds a non-negative numeric) and
+  `M = round((L + U) / 2, 2)` of the rounded endpoints, so the `det_results` CHECK holds for any interval.
+  Every step is monotone and applied to both endpoints, so `0 ≤ L ≤ M ≤ U ≤ 100`. The Codex #30 example:
+  `[20, 80]` with one binding hard knockout is `[20, 25]`, `M = 22.5`. `applied` records each code once, the
+  soft ones first (`det_results.caps_applied`).
 - **Industry preference** (`industry_match`, L4521; §13.1 `industries_include`/`industries_exclude`, stored
   case-folded): `unknown` without an LLM industry fact (or a blank one, or one whose `fold` has no fixed
   point); `excluded` when the fact's folded fixed point is excluded (the hard filter's comparison, M2
@@ -28,7 +29,8 @@ midpoint and its confidence. Pure functions: no connection, no clock. Scores are
   structured or critic-confirmed; L4192) by their severity, and the industry penalty. Each knockout's record
   is its code, fact id, comparison, severity, binding status and `source`, the confirmation it was bound by
   (`structured` for a structured requirement, else the fact's confirmation, `unconfirmed` when it has none);
-  a critic-rejected fact's knockout is dropped (§11.4). A verified not-a-job-ad (`not_a_job_ad_verified`,
+  a critic-rejected fact's knockout is dropped (§11.4), and a binding one without a severity is a
+  `ValueError` (`derive_knockouts` always sets one). A verified not-a-job-ad (`not_a_job_ad_verified`,
   V6: a confirmed review with a grounded quote, never the draft's flag alone; Codex r1 #10) has every
   criterion `null`, no cap, no score and no confidence, as the `det_results` CHECKs require.
 """
@@ -145,8 +147,9 @@ def caps(interval: Interval, *, soft_codes: Collection[str], hard_codes: Collect
     for code in dict.fromkeys(hard_codes):
         low, high = min(low, Decimal(HARD_CAP)), min(high, Decimal(HARD_CAP))
         applied.append(Cap(code, "hard"))
-    mid = ((low + high) / 2).quantize(_CENT, ROUND_HALF_UP)
-    return Capped(low.quantize(_CENT), mid, high.quantize(_CENT), applied)
+    low, high = low.quantize(_CENT, ROUND_HALF_UP), high.quantize(_CENT, ROUND_HALF_UP)
+    mid = ((low + high) / 2).quantize(_CENT, ROUND_HALF_UP)  # of the stored endpoints, as the CHECK reads it
+    return Capped(low, mid, high, applied)
 
 
 def industry_match(industry_fact: str | None, det: DetFacts, scope: ScopeSettings) -> IndustryMatch:
@@ -222,7 +225,8 @@ def aggregate(
 ) -> Aggregation:
     """The aggregation of a result (module docstring): `criteria` holds the six LLM criteria (after any
     null-out), `knockouts` the candidates derived under the scope, `confirmations` the facts' confirmations.
-    `ValueError` when an LLM criterion is missing or the weights name other criteria."""
+    `ValueError` when an LLM criterion is missing, the weights name other criteria, or a binding knockout has
+    no severity."""
     missing = [key for key in LLM_CRITERIA if key not in criteria]
     if missing:
         raise ValueError(f"the LLM criteria {missing} are missing")
@@ -245,6 +249,8 @@ def aggregate(
             }
         )
         if binds:
+            if candidate.severity is None:
+                raise ValueError(f"the binding knockout {candidate.fact_id!r} has no severity")
             (hard if candidate.severity == "hard" else soft).append(candidate.code)
     if industry in _PENALISED:
         soft.append(INDUSTRY_CODE)

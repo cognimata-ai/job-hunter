@@ -8,7 +8,8 @@
 - `compute_and_write` rebuilds the aggregation from the stored result with no LLM call and derives the
   knockouts under the given scope, so a scope that makes a confirmed on-site requirement unmet caps the
   instance, and the confidence of a scope-only recomputation reads the stored `critic_injection`
-  (`test_scope_only_recompute_keeps_confidence`, Codex r1 #11).
+  (`test_scope_only_recompute_keeps_confidence`, Codex r1 #11). A job other than the result's revision's is
+  refused before anything is written.
 
 Every datum is invented.
 """
@@ -337,6 +338,23 @@ async def test_a_contested_partial_result_keeps_its_downgrade(engine: AsyncEngin
         (row,) = [r for r in await instances(c, stored.result_id) if r.id == written]
         # coverage 0.65 is medium; contested downgrades it once
         assert (row.coverage, row.confidence) == (Decimal("0.650"), "low")
+        await c.rollback()
+
+
+async def test_compute_and_write_refuses_another_job(engine: AsyncEngine) -> None:
+    async with engine.connect() as c:
+        stored = await stored_result(c)
+        other = await insert_job(c)
+        with pytest.raises(ValueError, match="scores job"):
+            await compute_and_write(
+                c,
+                llm_result_id=stored.result_id,
+                scope=stored.scope,
+                det=facts(),
+                sources={},
+                job=JobRow(other.job_id),
+            )
+        assert await instances(c, stored.result_id) == []
         await c.rollback()
 
 

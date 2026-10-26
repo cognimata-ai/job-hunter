@@ -18,6 +18,7 @@ from jobhunter.llm.schemas.published import (
 )
 from jobhunter.scoring.facts import FACT_ID_CODES, NOT_A_JOB_AD
 from jobhunter.scoring.validator import (
+    DraftValidation,
     ParsedGenerator,
     parse_generator,
     repair_for_publication,
@@ -31,12 +32,19 @@ from tests.support.validation import ctx_for, publication_doc, synthetic_ad, syn
 Doc = dict[str, Any]
 
 
-def clean_draft() -> GeneratorDraft:
+def clean_validation() -> DraftValidation:
     parsed = parse_generator(synthetic_wire_c(), family="generator_v2_items")
     assert isinstance(parsed, ParsedGenerator)
     validation = validate_draft(parsed.draft, ctx_for(synthetic_ad()), normalisation=parsed.normalisation)
     assert not validation.t1
-    repaired, truncated = repair_for_publication(validation.draft, validation)
+    return validation
+
+
+VALIDATION: Final = clean_validation()
+
+
+def clean_draft() -> GeneratorDraft:
+    repaired, truncated = repair_for_publication(VALIDATION.draft, VALIDATION)
     assert truncated == []
     return repaired
 
@@ -131,6 +139,26 @@ def test_the_published_shape_is_the_drafts() -> None:
     assert set(PublishedCriteria.model_fields) == set(DraftCriteria.model_fields)
 
 
+def with_countries(*countries: str) -> tuple[GeneratorDraft, list[str]]:
+    """The clean validated draft with these remote-region countries, repaired for publication."""
+    facts = VALIDATION.draft.job_facts
+    region_ = facts.remote_region.model_copy(update={"countries": list(countries)})
+    draft = VALIDATION.draft.model_copy(
+        update={"job_facts": facts.model_copy(update={"remote_region": region_})}
+    )
+    return repair_for_publication(draft, VALIDATION)
+
+
+def test_publication_writes_canonical_country_codes() -> None:
+    repaired, truncated = with_countries("de", " at ")
+    assert (repaired.job_facts.remote_region.countries, truncated) == (["DE", "AT"], [])  # a case fix: no cut
+    PublishedResult.model_validate(publication_doc(repaired, truncated_fields=truncated))
+    repaired, truncated = with_countries("de", "XX")
+    countries = repaired.job_facts.remote_region.countries
+    assert (countries, truncated) == (["DE"], ["job_facts.remote_region.countries"])  # a dropped code: a cut
+    PublishedResult.model_validate(publication_doc(repaired, truncated_fields=truncated))
+
+
 def test_the_knockout_codes_are_the_knockout_tables() -> None:
     codes = set(get_args(KnockoutCode))
     assert codes == (set(FACT_ID_CODES) - {NOT_A_JOB_AD.code}) | {"contract_type"}
@@ -144,7 +172,7 @@ def test_the_knockout_codes_are_the_knockout_tables() -> None:
         doc(summary_de="x" * 450),
         with_skills(rationale="w " * 24 + "w", ad_evidence=[QUOTE, "Berlin, hybrid"]),
         with_facts(remote_region=region(*["DE"] * 30)),
-        with_facts(remote_region=region("de", " at ")),  # the validator's country check: trimmed, any case
+        with_facts(remote_region=region("DE", "AT")),
         with_facts(must_haves=[requirement("x" * 200)] * 25),
         with_facts(required_languages=[language("x" * 40)] + [language()] * 5),
         with_facts(certifications=[certification("x" * 120)] * 10),
@@ -192,6 +220,16 @@ OVER_THE_LIMIT: Final[list[tuple[str, str, Callable[[], Doc]]]] = [
     ("a level", "criteria.skills.level", lambda: with_skills(level=5)),
     ("a boolean level", "criteria.skills.level", lambda: with_skills(level=True)),
     ("a country", "job_facts.remote_region.countries.0", lambda: with_facts(remote_region=region("XX"))),
+    (
+        "a lower-case country",
+        "job_facts.remote_region.countries.0",
+        lambda: with_facts(remote_region=region("de")),
+    ),
+    (
+        "a padded country",
+        "job_facts.remote_region.countries.0",
+        lambda: with_facts(remote_region=region(" at ")),
+    ),
     (
         "countries",
         "job_facts.remote_region.countries",
@@ -282,6 +320,11 @@ OVER_THE_LIMIT: Final[list[tuple[str, str, Callable[[], Doc]]]] = [
         lambda: doc(status="contested", critic_outcome="contested", nulled_criteria=["salary"]),
     ),
     ("not a job ad with a level", "", lambda: doc(not_a_job_ad=True)),
+    (
+        "not a job ad without the critic",
+        "",
+        lambda: every_criterion_null(doc(not_a_job_ad=True, critic_outcome="not_run")),
+    ),
     ("revisions", "revisions_used", lambda: doc(revisions_used=3)),
     (
         "a confirmation",

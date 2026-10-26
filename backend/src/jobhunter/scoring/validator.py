@@ -78,8 +78,10 @@ and it is carried into publication (Codex r3 B10).
 
 **Publication** (`repair_for_publication`, L4380-4392), from the one table `LIMITS` that V1 also reads: every
 length-limited string cut at its limit ending in `[…]`, every count-limited list cut to its first N, a number
-out of range `null`, every failing quote and invalid country code dropped and each evidence list cut to its
-first 2 remaining quotes; `truncated_fields` lists the history's repairs, then what publication cut.
+out of range `null`, every failing quote and invalid country code dropped (a kept code is published in its
+canonical form, trimmed and upper case, as stage 1 writes it; a case fix alone is no cut) and each evidence
+list cut to its first 2 remaining quotes; `truncated_fields` lists the history's repairs, then what
+publication cut.
 
 **The critic** (`validate_review`, §11.7.2): a target is an LLM criterion key with a criterion assessment,
 or a required fact id with a `fact_*` assessment; a review needs a grounded ad quote (the first 2 grounded
@@ -1329,10 +1331,21 @@ def _publish(limit: Limit, path: str, value: JSONValue, dropped: set[str]) -> JS
     if not isinstance(value, list):
         return value
     if limit.kind == "countries":
-        return [code for code in value if valid_country(code)][: limit.limit]
+        codes: list[JSONValue] = [
+            code.strip().upper() for code in value if isinstance(code, str) and valid_country(code)
+        ]
+        return codes[: limit.limit]
     if limit.kind == "quotes":
         return [x for i, x in enumerate(value) if f"{path}[{i}]" not in dropped][: limit.limit]
     return value[: limit.limit]
+
+
+def _cut(limit: Limit, before: JSONValue, after: JSONValue) -> bool:
+    """Whether a repair cut something: every one does, but a country list that only took the canonical
+    form of its codes."""
+    if limit.kind != "countries" or not isinstance(before, list) or not isinstance(after, list):
+        return True
+    return len(after) < len(before)
 
 
 def repair_for_publication(
@@ -1348,8 +1361,9 @@ def repair_for_publication(
         for path, node, key in list(_places(doc, limit.pattern.split("."), "")):
             repaired = _publish(limit, path, node[key], dropped)
             if repaired != node[key]:
+                if _cut(limit, node[key], repaired):
+                    cut.append(path)
                 node[key] = repaired
-                cut.append(path)
     history = validation.history
     paths = [r.path for r in (*history.normalisation.repairs, *history.corrections)] + cut
     return GeneratorDraft.model_validate(doc), list(dict.fromkeys(paths))
