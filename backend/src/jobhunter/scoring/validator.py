@@ -954,7 +954,9 @@ def _iso_countries() -> frozenset[str]:
     return frozenset(codes | {"DE"})
 
 
-def _valid_country(code: JSONValue) -> bool:
+def valid_country(code: JSONValue) -> bool:
+    """Whether `code` is an ISO 3166-1 alpha-2 code, trimmed and in any case: what V1 and the publication
+    repair keep in `countries`, and what the strict publication model admits (`schemas.published`)."""
     return isinstance(code, str) and code.strip().upper() in _iso_countries()
 
 
@@ -988,7 +990,7 @@ def _limits(draft: GeneratorDraft, exempt: frozenset[str]) -> Iterator[Issue]:
                     yield Issue(code, path, {name: limit.limit})
                 if limit.kind == "countries":
                     for i, country in enumerate(value):
-                        if not _valid_country(country):
+                        if not valid_country(country):
                             yield Issue("country_invalid", f"{path}[{i}]", {})
             elif limit.kind == "years" and isinstance(value, int) and not min_years_in_range(value):
                 low, high = MIN_YEARS_RANGE
@@ -1327,7 +1329,7 @@ def _publish(limit: Limit, path: str, value: JSONValue, dropped: set[str]) -> JS
     if not isinstance(value, list):
         return value
     if limit.kind == "countries":
-        return [code for code in value if _valid_country(code)][: limit.limit]
+        return [code for code in value if valid_country(code)][: limit.limit]
     if limit.kind == "quotes":
         return [x for i, x in enumerate(value) if f"{path}[{i}]" not in dropped][: limit.limit]
     return value[: limit.limit]

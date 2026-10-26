@@ -15,12 +15,16 @@ value is invented: no real ad, company or person.
   must-haves and full-time employment. With the default ad and profile it validates with nothing to report.
   A test replaces the facts or the criteria it is about.
 - `fact_item(code, value, quote, …)` and `criterion_item(key, …)` are one item of each list.
+- `publication_doc(draft, **fields)` is the publication object (`PublishedResult`, Task 6) of a draft as an
+  `accepted` result with the critic not run, no confirmation, knockout or truncation, and `not_a_job_ad`
+  false (§11.10 3a: an unverified flag is never published), with the given fields replaced.
 """
 
 from dataclasses import dataclass
 from typing import Any, Final
 
 from jobhunter.llm.prompts.render import JobAdBlock, job_ad_block
+from jobhunter.llm.schemas.generator import GeneratorDraft
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.scoring.validator import ValidationContext, profile_sections
@@ -154,4 +158,21 @@ def synthetic_wire_c(
         ),
         "summary_en": "A good fit for the backend role.",
         "summary_de": "Eine gute Passung für die Backend-Rolle.",
+    }
+
+
+def publication_doc(draft: GeneratorDraft, **fields: Any) -> dict[str, Any]:
+    doc = draft.model_dump(mode="json", exclude={"injection_observed"})
+    return {
+        **doc,
+        "status": "accepted",
+        "not_a_job_ad": False,
+        "injection_suspected": False,
+        "nulled_criteria": [],
+        "truncated_fields": [],
+        "fact_confirmations": {},
+        "knockout_candidates": [],
+        "critic_outcome": "not_run",
+        "revisions_used": 0,
+        **fields,
     }

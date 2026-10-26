@@ -1,5 +1,6 @@
-"""Scoring test data (M3 Task 3): generator job facts and confirmed profiles for the fact-id, knockout and
-deterministic-criteria tests. Every value is invented: no real ad, company or person.
+"""Scoring test data (M3 Tasks 3 and 6): generator job facts, confirmed profiles and evaluation policies for
+the fact-id, knockout, deterministic-criteria and trigger tests. Every value is invented: no real ad, company
+or person.
 
 - `job_facts(**overrides)` is a `JobFacts` that asserts nothing (no work mode, no language, no degree, no
   certification, no clearance, no work permit), with the given fields replaced, so a test names only the
@@ -13,17 +14,23 @@ deterministic-criteria tests. Every value is invented: no real ad, company or pe
   `code` is English) and not `code`;
 - `CENTRE` is a scope location (Berlin's centre, radius 20 km) and `km_east(*km)` a resolved location with one
   candidate that many kilometres east of it for each distance (`ambiguous` when there are several), so a
-  test sets `x = d / r` directly: `km_east(28)` lies at 1.4 times the radius.
+  test sets `x = d / r` directly: `km_east(28)` lies at 1.4 times the radius;
+- `evaluation_policy(**overrides)` is the seeded evaluation policy (`settings_v1.json`'s `evaluation` block)
+  with `t8_sample_pct = 0` unless overridden, so no test's triggers depend on its ids (Controller Ruling
+  P48): a test that exercises T8 sets the rate itself.
 """
 
 import math
 from collections.abc import Sequence
 from typing import Any, Final
 
+from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm.schemas.generator import JobFacts, RequiredLanguage
 from jobhunter.llm.schemas.profile import ConfirmedProfile, Language
 from jobhunter.run_settings import ScopeLocation
+from jobhunter.scoring.evaluation_policy import EvaluationPolicy
 from jobhunter.sources.parsing.locations import Candidate, Location
+from jobhunter.types import JSONValue, get_object
 
 _NOTHING_ASSERTED: Final[dict[str, Any]] = {
     "work_mode": {"value": "unspecified", "evidence": []},
@@ -122,3 +129,9 @@ def km_east(*km: float) -> Location:
         postal_code=None,
         source="test",
     )
+
+
+def evaluation_policy(**overrides: JSONValue) -> EvaluationPolicy:
+    """The seeded evaluation policy with `t8_sample_pct = 0` and the given payload fields replaced."""
+    seeded = get_object(load_settings_v1(), "evaluation")
+    return EvaluationPolicy.from_payload({**seeded, "t8_sample_pct": 0, **overrides})
