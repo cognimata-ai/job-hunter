@@ -117,7 +117,7 @@ def test_the_workflow_states_the_worst_case_from_pricing() -> None:
     policy = get_object(load_settings_v1(), "scoring.model_policy")
     version = v2_version()
     per_try: list[Decimal] = []
-    for case in schema_dry_run.cases(version=version, model_policy=policy):
+    for case in schema_dry_run.cases(policy):
         if case.probe:
             continue  # the free counting endpoint
         node = schema_dry_run.node_for(case, version)
@@ -127,7 +127,7 @@ def test_the_workflow_states_the_worst_case_from_pricing() -> None:
             pricing.worst_case_usd(case.model, input_tokens_bound=bound, max_tokens=node.max_tokens)
         )
     assert len(per_try) == 4
-    models = {c.model for c in schema_dry_run.cases(version=version, model_policy=policy)}
+    models = {c.model for c in schema_dry_run.cases(policy)}
     assert {PROMPT_OVERHEAD_TOKENS[model] for model in models} == {1_878}
     assert "PROMPT_OVERHEAD_TOKENS = 1,878" in note
     for usd in per_try:

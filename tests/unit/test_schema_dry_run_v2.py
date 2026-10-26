@@ -50,7 +50,7 @@ def policy(**models: str) -> dict[str, JSONValue]:
 
 
 def test_the_cases_of_version_2_on_the_seeded_policy() -> None:
-    assert schema_dry_run.cases(version=V2, model_policy=SEEDED_POLICY) == [
+    assert schema_dry_run.cases(SEEDED_POLICY) == [
         DryRunCase("generator", SONNET),
         DryRunCase("critic", OPUS),
         DryRunCase("profile", OPUS),
@@ -60,7 +60,7 @@ def test_the_cases_of_version_2_on_the_seeded_policy() -> None:
 
 
 def test_a_reviser_on_another_model_is_a_second_generator_case() -> None:
-    assert schema_dry_run.cases(version=V2, model_policy=policy(revise=HAIKU)) == [
+    assert schema_dry_run.cases(policy(revise=HAIKU)) == [
         DryRunCase("generator", SONNET),
         DryRunCase("generator", HAIKU),
         DryRunCase("critic", OPUS),
@@ -77,7 +77,7 @@ def test_each_case_sends_the_versions_stored_schema_and_parses_with_its_mirror()
         "profile": ProfileOut,
         "queries": QueryProposalOut,
     }
-    for case in schema_dry_run.cases(version=V2, model_policy=SEEDED_POLICY):
+    for case in schema_dry_run.cases(SEEDED_POLICY):
         node = node_for(case, V2)
         assert node.schema.json == V2.schemas[case.schema_name]
         assert node.schema.model is mirrors[case.schema_name]

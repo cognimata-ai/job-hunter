@@ -9,9 +9,9 @@ these tests pin what it concludes from the counts, offline:
   components) of that model's requests, never below the 1,000-token floor;
 - the native-PDF check (`usage <= 1.25 x count_tokens`), the recorded-usage check against the bound, the
   §6.9.1 overrun-buffer bound of the seeded settings, and the rewrite of the generated block of `bounds.py`;
-- the corpus's generator and critic requests are the score prompts of prompt-schema version 2, rendered by
-  `render.score_prompt` with candidate C as the generator's schema (M3 Task 4, R12), so the M3 re-count
-  measures the framing of the requests M3 sends.
+- the corpus's generator, critic and reviser requests are the score prompts of prompt-schema version 2,
+  rendered by `render.score_prompt` with candidate C as the generator's and the reviser's schema (M3 Task 4,
+  R12), so the M3 re-count measures the framing of the requests M3 sends.
 """
 
 import ast
@@ -197,14 +197,21 @@ def test_the_score_requests_of_the_corpus_are_version_2s_score_prompts() -> None
     assert v2.parser_family == "generator_v2_items" and dict(v2.schemas) == schemas
     assert dict(v2.templates) == templates
     rubric = render.rubric_block(v2.templates["shared_rubric"], load_rubric(RUBRIC_V2))
-    kinds = {"profile": 0, "queries": 0, "generator": 0, "critic": 0}
+    kinds = dict.fromkeys(V19.KINDS, 0)
+    roles = {"generator": "generate", "critic": "critic", "revise": "revise"}
+    blocks = {
+        "generate": (),
+        "critic": ("<draft>", "<required_facts>", "<validator_issues>"),
+        "revise": ("<previous_draft>", "<issues>"),
+    }
     for request in V19.corpus(SONNET):
         kinds[request.kind] += 1
         if request.kind in ("profile", "queries"):
             name = request.kind
             assert request.node.schema.json == transformed(SCHEMAS_V1[name])
             continue
-        role = "generate" if request.kind == "generator" else "critic"
+        role = roles[request.kind]
+        assert request.node.purpose == role
         system = request.prompt.system
         # §10.6: the rubric block, the cached profile block, the role template
         assert [block.cache for block in system] == [False, True, False]
@@ -214,13 +221,15 @@ def test_the_score_requests_of_the_corpus_are_version_2s_score_prompts() -> None
         assert request.prompt.template_version == f"{role}@{v2.id}"
         (message,) = request.prompt.messages
         assert isinstance(message.content, str) and message.content.startswith('<job_ad untrusted="true">')
+        for tag in ("<draft>", "<required_facts>", "<validator_issues>", "<previous_draft>", "<issues>"):
+            assert (tag in message.content) == (tag in blocks[role]), (role, tag)
         if role == "critic":
-            for tag in ("<draft>", "<required_facts>", "<validator_issues>"):
-                assert tag in message.content
             assert (
                 request.node.schema.json == transformed(CriticOut) and request.node.schema.model is CriticOut
             )
         else:
             assert request.node.schema.json == transformed(GeneratorWire)  # candidate C
             assert request.node.schema.model is GeneratorWire
-    assert kinds == {"profile": 8, "queries": 8, "generator": 8, "critic": 8}
+    # the three score roles of the brief (R12), next to the two single calls
+    assert V19.KINDS == ("profile", "queries", "generator", "critic", "revise")
+    assert kinds == dict.fromkeys(V19.KINDS, 8)

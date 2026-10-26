@@ -6,24 +6,33 @@
 - The seed writes `generator_v2_items` on the shipped M3 version and `generator_v1` on M2's; nothing derives
   the family from the schema, and a `generator_v1` version cannot score.
 - `schemas.PARSER_FAMILIES` is the member list of the column's CHECK.
+- The stored schemas keep their key order through the database (`schemas` is `json`, Ruling T4-a), so what a
+  score render and the dry-run send is candidate C in the order V4b sent it; a stored schema the SDK's
+  transform would change is refused at load, and a load hands out its own copy.
 """
 
 import copy
 import hashlib
+import importlib.util
 import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Final
+from types import ModuleType
+from typing import Any, Final, cast
 
+import anthropic
 import pytest
 import sqlalchemy as sa
+from jobhunter.db.seed import load_settings_v1
 from jobhunter.db.sql import CHECK_VIOLATION
+from jobhunter.llm import schema_dry_run
 from jobhunter.llm.cache_monitor import CacheMonitor
-from jobhunter.llm.gateway import CallContext, LLMGateway, NodeConfig
+from jobhunter.llm.gateway import CallContext, LLMGateway, NodeConfig, node_config
 from jobhunter.llm.prompts.render import (
     PromptVersion,
     PromptVersionUnscorable,
+    ScoreRole,
     job_ad_block,
     load_prompt_version,
     prompt_schema_hash,
@@ -32,15 +41,19 @@ from jobhunter.llm.prompts.render import (
     score_prompt,
     score_schema,
 )
-from jobhunter.llm.schemas import PARSER_FAMILIES, mirror_for
+from jobhunter.llm.schemas import PARSER_FAMILIES, mirror_for, transformed
+from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.spend_ledger import EvalRunOwner
 from jobhunter.llm.transport import make_http_client
 from jobhunter.scoring.rubric import RUBRIC_V2, load_rubric
+from jobhunter.types import get_object
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.llm import (
     CapturingTransport,
     active_execution_config,
+    capture_request,
+    critic_body,
     fake_llm_config,
     generator_wire_body,
     score_profile,
@@ -53,7 +66,7 @@ pytestmark = pytest.mark.integration
 SONNET: Final = "claude-sonnet-5-5"
 _INSERT = sa.text(
     "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas, parser_family) "
-    "VALUES (:hash, CAST(:templates AS jsonb), CAST(:schemas AS jsonb), :family) RETURNING id"
+    "VALUES (:hash, CAST(:templates AS jsonb), CAST(:schemas AS json), :family) RETURNING id"
 )
 _FAMILY_OF = sa.text("SELECT parser_family FROM prompt_schema_versions WHERE prompt_schema_hash = :hash")
 _FAMILY_CHECK = sa.text(
@@ -220,3 +233,134 @@ async def test_parser_families_pin_the_check(engine: AsyncEngine) -> None:
         definition = (await conn.execute(_FAMILY_CHECK)).scalar_one()
     assert tuple(sorted(re.findall(r"'([^']*)'::text", definition))) == tuple(sorted(PARSER_FAMILIES))
     assert len(PARSER_FAMILIES) == len(set(PARSER_FAMILIES)) == 2
+
+
+# ---- the key order through the database (Ruling T4-a) ----------------------------------------------------
+
+REPO: Final = Path(__file__).resolve().parents[2]
+_ID_OF: Final = sa.text("SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = :hash")
+
+
+def _load_spike(name: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, REPO / "scripts/spikes" / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+candidate_c = _load_spike("generator_v2_candidates").candidate_c
+
+
+def key_order(value: Any) -> Any:
+    """Every object's keys in their order, at every level (lists keep theirs)."""
+    if isinstance(value, dict):
+        return [(key, key_order(item)) for key, item in value.items()]
+    if isinstance(value, list):
+        return [key_order(item) for item in value]
+    return None
+
+
+def property_orders(value: Any, path: str = "$") -> dict[str, list[str]]:
+    """The key order of every `properties` and `$defs` object: the order a structured output follows."""
+    found: dict[str, list[str]] = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("properties", "$defs") and isinstance(item, dict):
+                found[f"{path}.{key}"] = list(item)
+            found.update(property_orders(item, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            found.update(property_orders(item, f"{path}[{i}]"))
+    return found
+
+
+async def seeded(engine: AsyncEngine, content: tuple[dict[str, Any], dict[str, Any]]) -> PromptVersion:
+    async with engine.connect() as conn:
+        version_id = (await conn.execute(_ID_OF, {"hash": prompt_schema_hash(*content)})).scalar_one()
+    return await load(engine, int(version_id))
+
+
+async def test_the_stored_schemas_keep_their_key_order_through_the_database(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """After seed and load, the generator schema a score render and the dry-run send is candidate C with its
+    properties and `$defs` in the order A3 printed them (the flags first, a criterion's level before its
+    evidence), and every key where the V4b probe sent it: the SDK's transform, which every request applies,
+    orders the keywords of a node and keeps the order of its properties. The critic's is the code's, and
+    version 1's are `prompt_schema_v1()`'s."""
+    v2 = await seeded(engine, prompt_schema_v2())
+    probed = anthropic.transform_schema(copy.deepcopy(candidate_c()))  # what V4b sent
+    _, code_v2 = prompt_schema_v2()
+    assert key_order(v2.schemas["generator"]) == key_order(code_v2["generator"]) == key_order(probed)
+    assert property_orders(v2.schemas["generator"]) == property_orders(candidate_c())
+    assert list(cast(dict[str, Any], v2.schemas["generator"])["properties"]) == [
+        "not_a_job_ad",
+        "injection_observed",
+        "facts",
+        "criteria",
+        "summary_en",
+        "summary_de",
+    ]
+    for name in ("critic", "profile", "queries"):
+        assert key_order(v2.schemas[name]) == key_order(code_v2[name]), name
+    assert key_order(v2.schemas["critic"]) == key_order(transformed(CriticOut))
+    # what the score nodes and the dry-run hand the gateway
+    assert key_order(score_schema("generate", v2).json) == key_order(probed)
+    assert key_order(score_schema("critic", v2).json) == key_order(transformed(CriticOut))
+    policy = get_object(load_settings_v1(), "scoring.model_policy")
+    execution = get_object(load_settings_v1(), "scoring.execution")
+    for case in schema_dry_run.cases(policy):
+        if not case.probe:
+            sent = schema_dry_run.node_for(case, v2).schema.json
+            assert key_order(sent) == key_order(code_v2[case.schema_name]), case.label
+    # and what reaches the wire, as the request body serialises it (the schema is the node's; the prompt is
+    # the generator's for both, which the schema does not depend on)
+    cfg = fake_llm_config(tmp_path / "unused", tmp_path / "no-secrets")
+    roles: tuple[tuple[ScoreRole, dict[str, Any], Any], ...] = (
+        ("generate", generator_wire_body(), probed),
+        ("critic", critic_body(), transformed(CriticOut)),
+    )
+    for role, answer, expected in roles:
+        node = node_config(role, model_policy=policy, execution=execution, schema=score_schema(role, v2))
+        prompt = score_prompt(
+            "generate",
+            version=v2,
+            rubric=load_rubric(RUBRIC_V2),
+            profile=score_profile(),
+            ad=AD,
+        )
+        request = await capture_request(cfg, node, prompt, answer)
+        wire = request.body["output_config"]["format"]["schema"]
+        assert json.dumps(wire) == json.dumps(expected), role
+    # version 1, as the M2 code gives it
+    v1 = await seeded(engine, prompt_schema_v1())
+    _, code_v1 = prompt_schema_v1()
+    assert {name: key_order(schema) for name, schema in v1.schemas.items()} == {
+        name: key_order(schema) for name, schema in code_v1.items()
+    }
+
+
+async def test_a_stored_schema_the_sdk_would_change_is_refused_at_load(engine: AsyncEngine) -> None:
+    """Every reader of a stored schema (`output_schema`, `count_body`, the byte bound) reads what the request
+    sends only when the SDK's transform leaves it unchanged; a row that it would change is refused."""
+    templates, schemas = v2_content()
+    schemas["critic"]["properties"]["count"] = {"type": "integer", "minimum": 0}  # moved into a description
+    with pytest.raises(ValueError, match="'critic' schema"):
+        await load(engine, await insert_version(engine, templates, schemas, family="generator_v2_items"))
+    templates, schemas = v2_content()
+    schemas["profile"] = ["no", "schema"]
+    with pytest.raises(ValueError, match="'profile' schema"):
+        await load(engine, await insert_version(engine, templates, schemas, family="generator_v2_items"))
+
+
+async def test_a_loaded_version_is_the_callers_own_copy(engine: AsyncEngine) -> None:
+    """The cache is never shared out: what one caller does to its version or a render's schema never reaches
+    a later load or render."""
+    _, code_v2 = prompt_schema_v2()
+    first = await seeded(engine, prompt_schema_v2())
+    cast(dict[str, Any], first.schemas["generator"])["properties"].clear()
+    cast(dict[str, Any], score_schema("critic", first).json)["$defs"].clear()
+    again = await seeded(engine, prompt_schema_v2())
+    assert dict(again.schemas) == code_v2 and again is not first
+    assert score_schema("generate", again).json == code_v2["generator"]

@@ -233,8 +233,10 @@ async def _shipped_rubric_and_prompt_schema(conn: AsyncConnection) -> tuple[int,
     v1 and v2 are each inserted when absent, found by their version; prompt-schema versions 1 (M2's) and 2
     (M3's) each by its hash, with the parser family that reads its generator outputs (`generator_v1`,
     `generator_v2_items`): the seed is the one writer of version rows and of the family, a stored constant
-    (plan Deviation 40). An install M2 left keeps its version 1 row as it is (its family is the column's
-    default, `generator_v1`).
+    (plan Deviation 40). The schemas are written as `json` in the order `prompt_schema_v1()` and
+    `prompt_schema_v2()` give them, which a structured output follows (Ruling T4-a; the hash is over sorted
+    canonical JSON, so the order does not change it). An install M2 left keeps its version 1 row as it is (its
+    family is the column's default, `generator_v1`).
 
     A release whose templates or schemas differ ships a new prompt-schema version this way; it never activates
     itself (§13.3). Imported here, not at the top: the rubric loader and the renderer import this module's
@@ -276,7 +278,9 @@ async def _shipped_rubric_and_prompt_schema(conn: AsyncConnection) -> tuple[int,
                     "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas, "
                     "parser_family) VALUES (:hash, :templates, :schemas, :family) "
                     "ON CONFLICT DO NOTHING RETURNING id",
-                    jsonb=["templates", "schemas"],
+                    jsonb=["templates"],
+                    # `json`, in the code's key order: a structured output follows it (Ruling T4-a)
+                    json=["schemas"],
                 ),
                 {"hash": digest},
                 {"hash": digest, "templates": templates, "schemas": schemas, "family": family},

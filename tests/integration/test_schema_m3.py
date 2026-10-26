@@ -147,6 +147,8 @@ COLUMNS = (
         ("profile_versions", "synthetic_eval", ("boolean", None, None, "NO", "false")),
         # Deviation 40: the explicit parser family of the version's generator schema
         ("prompt_schema_versions", "parser_family", ("text", None, None, "NO", "'generator_v1'::text")),
+        # Ruling T4-a: `json`, not the spec's `jsonb`, so the stored schemas keep their key order
+        ("prompt_schema_versions", "schemas", ("json", None, None, "NO", None)),
         # Deviation 27: the item's follow-up hold and its once-only release
         ("batch_items", "hold_usd", ("numeric", 12, 6, "NO", "0")),
         ("batch_items", "hold_released_at", ("timestamp with time zone", None, None, "YES", None)),

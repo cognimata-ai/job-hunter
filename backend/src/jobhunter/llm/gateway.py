@@ -88,8 +88,9 @@ prompt).
 **The schema** of a node is a `WireSchema`, two inputs and never one (plan Deviation 40): `json`, the stored
 wire schema the request sends (`output_config.format.schema`: `output_schema`, `count_body` and the byte bound
 read it as it is, and the try binds `anthropic.transform_schema` of it as langchain's json_schema method does,
-which leaves every stored schema unchanged, a fixed point the schema tests pin), and `model`, the structural
-mirror the parsed JSON is validated against (`model.model_validate`, then `storable`).
+which leaves every stored schema unchanged: `prompts.render.load_prompt_version` refuses a row whose schema
+it would change), and `model`, the structural mirror the parsed JSON is validated against
+(`model.model_validate`, then `storable`).
 `WireSchema.from_model(cls)` (`json = schemas.transformed(cls)`) is the schema of a mirror as M2 sent it; a
 score node takes its version's stored schema and its family's mirror (`prompts.render.score_schema`). A stored
 schema that does not fit its mirror is a structural failure at the first call, the case the live schema

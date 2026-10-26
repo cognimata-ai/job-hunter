@@ -24,11 +24,12 @@ per-request overhead, measured with the free `messages.count_tokens`, plus one p
 
 **The corpus**: at least `MIN_REQUESTS_PER_MODEL` (30) synthetic requests per model of `pricing.MODELS`, in
 German and English with umlauts, `ß`, typographic quotes, en dashes and ellipses: the profile-extraction
-and query-proposal requests as `prompts.render` renders them, and the generator and critic requests as
-`render.score_prompt` renders them from prompt-schema version 2 (M3 Task 4, R12): the shared rubric block of
-rubric v2, the cached `<candidate_profile>` block, the role template, then the `<job_ad>` block, the critic's
-with its `<draft>`, `<required_facts>` and `<validator_issues>`; the generator's schema is candidate C and the
-critic's the §11.7.3 one (`render.score_schema`). They carry no person's name and no contact data.
+and query-proposal requests as `prompts.render` renders them, and the generator, critic and reviser requests
+as `render.score_prompt` renders them from prompt-schema version 2 (M3 Task 4, R12): the shared rubric block
+of rubric v2, the cached `<candidate_profile>` block, the role template, then the `<job_ad>` block, the
+critic's with its `<draft>`, `<required_facts>` and `<validator_issues>`, the reviser's with its
+`<previous_draft>` and `<issues>`; the generator's and the reviser's schema is candidate C and the critic's
+the §11.7.3 one (`render.score_schema`). They carry no person's name and no contact data.
 
 **The analysis** (pure; `tests/unit/test_v19_analysis.py`):
 - every component must have tokens <= UTF-8 bytes (§1.5 S3). Otherwise the §10.7 factor is
@@ -460,25 +461,26 @@ class Request:
         return [*named, ("schema", rendered.schema_json)]
 
 
+# The corpus's kinds, in their order: the two single calls, then the three score roles.
+KINDS: Final = ("profile", "queries", "generator", "critic", "revise")
 _KIND_PURPOSE: Final = {
     "profile": "extract_profile",
     "queries": "propose_queries",
     "generator": "generate",
     "critic": "critic",
+    "revise": "revise",
 }
-_KIND_SCHEMA: Final = {
-    "profile": "profile",
-    "queries": "queries",
-    "generator": "generator",
+_KIND_SCHEMA: Final = {"profile": "profile", "queries": "queries"}
+_SCORE_ROLE: Final[Mapping[str, render.ScoreRole]] = {
+    "generator": "generate",
     "critic": "critic",
+    "revise": "revise",
 }
 
 
 def _schema(kind: str) -> WireSchema:
-    if kind == "generator":
-        return render.score_schema("generate", V2)
-    if kind == "critic":
-        return render.score_schema("critic", V2)
+    if kind in _SCORE_ROLE:
+        return render.score_schema(_SCORE_ROLE[kind], V2)
     return WireSchema.from_model(SCHEMAS_V1[_KIND_SCHEMA[kind]])
 
 
@@ -520,20 +522,32 @@ def _prompt(kind: str, lang: str, size: int) -> RenderedPrompt:
     draft = _draft(lang)
     facts = derive_fact_ids(draft.job_facts)
     issues = [render.Issue("v1_limit", "skills"), render.Issue("ungrounded_quote", "languages", ("C1",))]
+    if kind == "critic":
+        return render.score_prompt(
+            "critic",
+            **common,
+            draft=render.draft_block(draft, facts),
+            required_facts=render.required_facts_block(list(facts.values())),
+            validator_issues=render.issues_block(issues),
+        )
+    # the reviser's issues: the validator's, a grounded critic dispute and an unconfirmed required fact
+    issues += [
+        render.Issue("level_too_high", "languages", ("C1",), suggested_level=2),
+        render.Issue("fact_uncertain", "mandatory_language:de"),
+    ]
     return render.score_prompt(
-        "critic",
+        "revise",
         **common,
-        draft=render.draft_block(draft, facts),
-        required_facts=render.required_facts_block(list(facts.values())),
-        validator_issues=render.issues_block(issues),
+        previous_draft=render.draft_block(draft, facts),
+        issues=render.issues_block(issues),
     )
 
 
 def corpus(model: Model) -> list[Request]:
-    """The model's synthetic requests: every kind in German and English at every size (4 x 2 x 4 = 32)."""
+    """The model's synthetic requests: every kind in German and English at every size (5 x 2 x 4 = 40)."""
     return [
         Request(kind, lang, size, _node(kind, model), _prompt(kind, lang, size))
-        for kind in ("profile", "queries", "generator", "critic")
+        for kind in KINDS
         for lang in ("de", "en")
         for size in _SIZES
     ]
@@ -858,7 +872,7 @@ def analyse_all(out: Any, *, constants_only: bool = False) -> int:
             max(Fraction(m.whole, m.bytes) for m in mine)
         )
         by_kind = {}
-        for kind in ("profile", "queries", "generator", "critic"):
+        for kind in KINDS:
             framings = [m.framing for m in mine if m.kind == kind]
             by_kind[kind] = [min(framings), max(framings)]
         summary.setdefault("framing_by_kind", {})[model] = by_kind

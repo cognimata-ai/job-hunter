@@ -4,7 +4,8 @@ their JSON-schema export (`_base` holds the exporter).
 - `json_schema(model)` is the spec's JSON schema of a mirror; a test pins each to the spec text.
 - `transformed(model)` is `anthropic.transform_schema(json_schema(model))`: the `output_config.format.schema`
   a request of that schema sends, and so the schema part of its byte bound (§10.7) and of its fake-transport
-  recording key.
+  recording key. `is_transform_fixed_point(schema)` says whether a stored schema is sent as it is (the
+  gateway applies the transform to every one); every schema a version stores must be.
 - `SCHEMAS_V1` and `SCHEMAS_V2` name the four schemas of prompt-schema versions 1 and 2, as each stores them
   (`prompts/render.prompt_schema_v1` and `prompt_schema_v2`). Both are frozen constants that nothing adds to:
   version 2 differs in the generator only (`GeneratorWire`, candidate C), and a release that changes a schema
@@ -15,6 +16,7 @@ their JSON-schema export (`_base` holds the exporter).
   `mirror_for(family)` is the structural mirror its outputs are validated against.
 """
 
+import copy
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final, Literal, cast
@@ -34,6 +36,7 @@ __all__ = [
     "SCHEMAS_V1",
     "SCHEMAS_V2",
     "ParserFamily",
+    "is_transform_fixed_point",
     "json_schema",
     "mirror_for",
     "transformed",
@@ -65,3 +68,12 @@ def mirror_for(family: ParserFamily) -> type[BaseModel]:
 def transformed(model: type[BaseModel]) -> dict[str, JSONValue]:
     """The schema a request of `model` sends: `anthropic.transform_schema(json_schema(model))`."""
     return cast(dict[str, JSONValue], anthropic.transform_schema(json_schema(model)))
+
+
+def is_transform_fixed_point(schema: Mapping[str, JSONValue]) -> bool:
+    """Whether `anthropic.transform_schema` leaves `schema` unchanged (as data): a request then sends exactly
+    the stored schema, whatever reads it."""
+    try:
+        return anthropic.transform_schema(copy.deepcopy(dict(schema))) == schema
+    except (ValueError, TypeError, AttributeError, KeyError):  # not a JSON schema the SDK can transform
+        return False

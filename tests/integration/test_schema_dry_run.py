@@ -36,7 +36,12 @@ from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import fake, schema_dry_run
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
-from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1, prompt_schema_v2
+from jobhunter.llm.prompts.render import (
+    load_prompt_version,
+    prompt_schema_hash,
+    prompt_schema_v1,
+    prompt_schema_v2,
+)
 from jobhunter.llm.schema_dry_run import PROBE_ONLY_SCHEMA, DryRunCase
 from jobhunter.llm.schemas import SCHEMAS_V1, SCHEMAS_V2, transformed
 from jobhunter.llm.schemas.generator import GeneratorOut
@@ -177,7 +182,7 @@ def test_the_dry_run_constants() -> None:
 
 
 def test_the_default_policy_yields_the_four_gating_schemas_and_the_probe() -> None:
-    assert schema_dry_run.cases(version=V1, model_policy=SEEDED_POLICY) == [
+    assert schema_dry_run.cases(SEEDED_POLICY) == [
         DryRunCase("generator", SONNET),
         DryRunCase("critic", OPUS),
         DryRunCase("profile", OPUS),
@@ -198,7 +203,7 @@ def test_each_distinct_model_of_a_schema_is_one_case() -> None:
     # the generator schema serves `generate` and `revise`: two models are two cases; the probe stays on the
     # `generate` model
     policy = _policy(revise=OPUS, critic=HAIKU)
-    assert schema_dry_run.cases(version=V1, model_policy=policy) == [
+    assert schema_dry_run.cases(policy) == [
         DryRunCase("generator", SONNET),
         DryRunCase("generator", OPUS),
         DryRunCase("critic", HAIKU),
@@ -207,7 +212,7 @@ def test_each_distinct_model_of_a_schema_is_one_case() -> None:
         DryRunCase("generator", SONNET, probe=True),
     ]
     with pytest.raises(ValueError, match="model"):
-        schema_dry_run.cases(version=V1, model_policy=_policy(critic="claude-unknown"))
+        schema_dry_run.cases(_policy(critic="claude-unknown"))
 
 
 def test_the_probe_schema_is_the_generator_schema_with_one_added_minimum() -> None:
@@ -471,6 +476,9 @@ async def test_a_sent_schema_one_byte_off_fails_its_case(
     recorded = fake.recording_path(root, "schema_dry_run", OPUS, critic)
     shutil.copy(recorded, fake.recording_path(root, "schema_dry_run", OPUS, changed))
     ids = await active_ids(engine)  # before the patch: version 1's hash is computed with the real transform
+    # and the version loaded, which checks its stored schemas against the real transform too
+    async with engine.connect() as conn:
+        await load_prompt_version(conn, ids["prompt_schema_version_id"])
     original: Callable[..., dict[str, Any]] = anthropic.transform_schema
 
     def transform(schema: Any) -> dict[str, Any]:
@@ -507,7 +515,7 @@ async def test_a_prompt_schema_version_is_dry_run_with_the_schema_it_stores(
             await conn.execute(
                 sa.text(
                     "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
-                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS jsonb)) RETURNING id"
+                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS json)) RETURNING id"
                 ),
                 {"hash": b"\x07" * 32, "t": json.dumps(templates), "s": json.dumps(schemas)},
             )
@@ -615,7 +623,7 @@ async def test_a_schema_the_version_lacks_fails_its_case_without_a_call(
             await conn.execute(
                 sa.text(
                     "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
-                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS jsonb)) RETURNING id"
+                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS json)) RETURNING id"
                 ),
                 {"hash": b"\x08" * 32, "t": json.dumps(templates), "s": json.dumps(schemas)},
             )

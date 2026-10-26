@@ -54,14 +54,15 @@ length.
 """
 
 import base64
+import copy
 import hashlib
 import json
 import re
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
 from types import MappingProxyType
-from typing import Final, Literal, cast, get_args
+from typing import Any, Final, Literal, cast, get_args
 
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
@@ -76,14 +77,14 @@ from jobhunter.llm.schemas import (
     SCHEMAS_V1,
     SCHEMAS_V2,
     ParserFamily,
+    is_transform_fixed_point,
     mirror_for,
     transformed,
 )
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.generator import GeneratorDraft
 from jobhunter.llm.schemas.profile import ConfirmedProfile
-from jobhunter.normalize.text import fold
-from jobhunter.scoring.facts import NOT_A_JOB_AD, FactRef, fact_id, language_subject
+from jobhunter.scoring.facts import FACT_ID_CODES, NOT_A_JOB_AD, FactRef, binding_facts, fact_id
 from jobhunter.scoring.rubric import LLM_CRITERIA, Rubric
 from jobhunter.types import JSONValue
 
@@ -190,8 +191,8 @@ def prompt_schema_hash(templates: Mapping[str, JSONValue], schemas: Mapping[str,
 @dataclass(frozen=True)
 class PromptVersion:
     """A stored prompt-schema version as it renders: its id and hash, its templates and schemas by name, and
-    the parser family its writer named. Never mutated: `load_prompt_version` shares one per row, read-only at
-    the top level, and every request takes a copy of a schema (`gateway._chat`, `output_schema`)."""
+    the parser family its writer named. `load_prompt_version` hands each caller its own copy of the schemas
+    (read-only at the top level), and `score_schema` a copy again, so no caller's change reaches another."""
 
     id: int
     prompt_schema_hash: bytes
@@ -225,10 +226,19 @@ _LOADED: Final[dict[tuple[int, bytes], PromptVersion]] = {}
 def _version(
     version_id: int, digest: bytes, templates: object, schemas: object, parser_family: object
 ) -> PromptVersion:
+    """A loaded row, checked: its templates are texts, its family is known, and each schema is an object that
+    `anthropic.transform_schema` leaves unchanged, so what a request sends (`gateway._chat` transforms it) is
+    what `output_schema`, `count_body` and the byte bound read (`schemas.is_transform_fixed_point`)."""
     if not isinstance(templates, dict) or not all(isinstance(t, str) for t in templates.values()):
         raise ValueError(f"prompt-schema version {version_id}: its templates are no mapping of texts")
     if not isinstance(schemas, dict):
         raise ValueError(f"prompt-schema version {version_id}: its schemas are no mapping")
+    for name, schema in schemas.items():
+        if not isinstance(schema, dict) or not is_transform_fixed_point(schema):
+            raise ValueError(
+                f"prompt-schema version {version_id}: its {name!r} schema is not one a request sends as it "
+                "is (no JSON-schema object, or one that anthropic.transform_schema changes)"
+            )
     if parser_family not in PARSER_FAMILIES:
         raise ValueError(f"prompt-schema version {version_id}: an unknown parser family")
     return PromptVersion(
@@ -240,21 +250,27 @@ def _version(
     )
 
 
+def _copy(version: PromptVersion) -> PromptVersion:
+    """`version` with its own copy of every schema: what one caller does to a schema it was given never
+    reaches the cache or another caller (the templates are texts)."""
+    return replace(version, schemas=MappingProxyType(copy.deepcopy(dict(version.schemas))))
+
+
 async def load_prompt_version(conn: AsyncConnection, version_id: int) -> PromptVersion:
     """The stored version `version_id` (its `templates`, `schemas` and `parser_family`), read once per process
-    and `(id, hash)`; `LookupError` when there is none."""
+    and `(id, hash)` and handed out as a copy; `LookupError` when there is none, `ValueError` for a row that
+    fails `_version`'s checks. The schemas keep the key order the row stores (`schemas` is a `json` column,
+    Ruling T4-a), which a structured output follows."""
     digest = (await conn.execute(_HASH_OF, {"id": version_id})).scalar_one_or_none()
     if digest is None:
         raise LookupError(f"no prompt-schema version {version_id}")
     key = (version_id, bytes(digest))
-    if (cached := _LOADED.get(key)) is not None:
-        return cached
-    row = (await conn.execute(_VERSION_ROW, {"id": version_id, "hash": key[1]})).one_or_none()
-    if row is None:
-        raise LookupError(f"no prompt-schema version {version_id}")
-    version = _version(version_id, key[1], row.templates, row.schemas, row.parser_family)
-    _LOADED[key] = version
-    return version
+    if (cached := _LOADED.get(key)) is None:
+        row = (await conn.execute(_VERSION_ROW, {"id": version_id, "hash": key[1]})).one_or_none()
+        if row is None:
+            raise LookupError(f"no prompt-schema version {version_id}")
+        cached = _LOADED[key] = _version(version_id, key[1], row.templates, row.schemas, row.parser_family)
+    return _copy(cached)
 
 
 def _scorable(version: PromptVersion) -> None:
@@ -439,13 +455,17 @@ def rubric_block(template: str, rubric: Rubric) -> str:
 # ---- the role blocks of the user turn ----------------------------------------------------------------------
 
 _CODE: Final = re.compile(r"[a-z][a-z0-9_]*")
+# A fact id `code:subject` (`scoring.facts`): a draft's fact-id code, then a subject of one line, no control
+# character, at most 160 characters (a folded certification name of up to 120, or `other:<name>`).
+_FACT_ID: Final = re.compile(rf"(?:{'|'.join(FACT_ID_CODES)}):[^\x00-\x1f\x7f]{{1,160}}")
 
 
 @dataclass(frozen=True)
 class Issue:
     """One issue as a score prompt states it in `<validator_issues>` or `<issues>`: a code, the criterion key
     or fact id it concerns, the quotes the validator already grounded, and a critic dispute's suggested level.
-    Never free text: the code is an identifier, and no other text of the ad than those quotes."""
+    Never free text: the code is an identifier, the target one of the six LLM criterion keys or a fact id
+    `code:subject`, and no other text of the ad than those quotes."""
 
     code: str
     target: str | None = None
@@ -455,6 +475,12 @@ class Issue:
     def __post_init__(self) -> None:
         if not _CODE.fullmatch(self.code):
             raise ValueError("an issue code is an identifier ([a-z][a-z0-9_]*)")
+        if (
+            self.target is not None
+            and self.target not in LLM_CRITERIA
+            and not _FACT_ID.fullmatch(self.target)
+        ):
+            raise ValueError("an issue target is an LLM criterion key or a fact id `code:subject`")
         if self.suggested_level is not None and self.suggested_level not in range(5):
             raise ValueError("a suggested level is 0 to 4")
 
@@ -490,32 +516,19 @@ def draft_block(draft: GeneratorDraft, fact_ids: Mapping[str, FactRef]) -> str:
     critic's targets are fact ids (§11.7.2). The first fact of an id carries it (L4174). A text fact id that
     names no fact of the draft is a `ValueError`; a structured one (a provider field) is in no draft."""
     doc = cast(dict[str, JSONValue], draft.model_dump(mode="json"))
-    facts = cast(dict[str, dict[str, JSONValue]], doc["job_facts"])
     tagged: set[str] = set()
 
-    def tag(node: dict[str, JSONValue], key: str, code: str, subject: str) -> None:
+    def tag(node: Any, key: str, code: str, subject: str) -> None:
         name = fact_id(code, subject)
         if name in fact_ids and name not in tagged:
             node[key] = name
             tagged.add(name)
 
-    jf = draft.job_facts
-    if jf.onsite_only.asserted:
-        tag(facts["onsite_only"], "fact_id", "onsite_required", "onsite")
-    languages = cast(list[dict[str, JSONValue]], facts["required_languages"])
-    for node, language in zip(languages, jf.required_languages, strict=True):
-        if language.mandatory:
-            tag(node, "fact_id", "mandatory_language", language_subject(language))
-    if jf.degree.mandatory:
-        tag(facts["degree"], "fact_id", "degree", "degree")
-    certifications = cast(list[dict[str, JSONValue]], facts["certifications"])
-    for node, certification in zip(certifications, jf.certifications, strict=True):
-        if certification.mandatory:
-            tag(node, "fact_id", "certification", fold(certification.name))
-    if jf.security_clearance.required:
-        tag(facts["security_clearance"], "fact_id", "security_clearance", "clearance")
-    if jf.work_permit.required:
-        tag(facts["work_permit"], "fact_id", "work_permit", "work_permit")
+    for fact in binding_facts(draft.job_facts):  # the walk `derive_fact_ids` takes
+        node: Any = doc["job_facts"]
+        for step in fact.path:
+            node = node[step]
+        tag(node, "fact_id", fact.code, fact.subject)
     if draft.not_a_job_ad:
         tag(doc, "not_a_job_ad_fact_id", NOT_A_JOB_AD.code, NOT_A_JOB_AD.subject)
     if stray := sorted(k for k, ref in fact_ids.items() if ref.source == "text" and k not in tagged):
@@ -537,14 +550,15 @@ _ROLE_BLOCKS: Final[Mapping[str, tuple[str, ...]]] = {
 def score_schema(role: ScoreRole, version: PromptVersion) -> WireSchema:
     """The schema of a score node of `role` rendered from `version`: the stored `generator` schema with the
     mirror of the version's family for `generate` and `revise`, the stored `critic` schema with `CriticOut`
-    for `critic`. A version that cannot score raises `PromptVersionUnscorable`."""
+    for `critic`, each a copy of the version's. A version that cannot score raises
+    `PromptVersionUnscorable`."""
     _scorable(version)
     name = "critic" if role == "critic" else "generator"
     stored = version.schemas.get(name)
     if not isinstance(stored, dict):
         raise ValueError(f"prompt-schema version {version.id} has no {name} schema")
     model: type[BaseModel] = CriticOut if role == "critic" else mirror_for(version.parser_family)
-    return WireSchema(json=stored, model=model)
+    return WireSchema(json=copy.deepcopy(stored), model=model)  # a copy: the node never shares the version's
 
 
 def score_prompt(

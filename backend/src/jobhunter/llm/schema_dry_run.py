@@ -5,11 +5,11 @@ informational keyword probe, recorded as an `eval_runs(kind='schema_dry_run')` r
 `schema-dry-run-manual.yml`; activating a new prompt-schema version (M3) requires a passing record, per
 version and per model (the `(schema, model, passed)` of each case).
 
-**The cases** (`cases(version=…, model_policy=…)`): the generator schema for each distinct model of the
-`generate` and `revise` nodes, the critic schema for `critic`'s, the profile schema for `extract_profile`'s
-and the queries schema for `propose_queries`'s, then the probe on `generate`'s model. Each case sends the
-schema the loaded version stores and validates the output against its structural mirror (`node_for(case,
-version)`: the generator's is `schemas.mirror_for` of the version's stored parser family). Each request is
+**The cases** (`cases(model_policy)`): the generator schema for each distinct model of the `generate` and
+`revise` nodes, the critic schema for `critic`'s, the profile schema for `extract_profile`'s and the queries
+schema for `propose_queries`'s, then the probe on `generate`'s model. Each case sends the schema the loaded
+version stores and validates the output against its structural mirror (`node_for(case, version)`: the
+generator's is `schemas.mirror_for` of the version's stored parser family). Each request is
 the static `SYSTEM_TEXT` block and one user turn with a synthetic profile, ad or CV (`prompt_for`), at effort
 `DRY_RUN_EFFORT`, with `DRY_RUN_MAX_TOKENS` in both `max_tokens` stages and a `DRY_RUN_DEADLINE_S` node
 deadline, purpose `schema_dry_run` (non-scoring), owned by the run's `eval_runs` row (`EvalRunOwner`: it must
@@ -159,12 +159,11 @@ def _node_model(model_policy: Mapping[str, JSONValue], node: str) -> Model:
     return model
 
 
-def cases(*, version: PromptVersion, model_policy: Mapping[str, JSONValue]) -> list[DryRunCase]:
-    """The cases of `version` on a model policy payload: one per schema and distinct model of its nodes, in
-    node order (the generator on `generate`'s model and, when `revise` runs on another, on that one too), then
-    the probe on the `generate` model. The list is the policy's; each case sends what `version` stores for
-    its schema (`node_for(case, version)`), and a schema the version lacks ends its case
-    `schema_not_in_version`."""
+def cases(model_policy: Mapping[str, JSONValue]) -> list[DryRunCase]:
+    """The cases of a model policy payload: one per schema and distinct model of its nodes, in node order
+    (the generator on `generate`'s model and, when `revise` runs on another, on that one too), then the probe
+    on the `generate` model. A case names a schema, not its bytes: `node_for(case, version)` binds it to what
+    a version stores, and a schema the version lacks ends its case `schema_not_in_version`."""
     planned: list[DryRunCase] = []
     for schema_name, nodes in _SCHEMA_NODES:
         models: list[Model] = []
@@ -785,7 +784,7 @@ async def run(
             or (await conn.execute(_EXECUTION, {"id": execution_config_id})).first() is None
         ):
             raise ValueError(missing)
-        planned = cases(version=version, model_policy=policy)
+        planned = cases(policy)
         eval_run_id = int(
             (
                 await conn.execute(

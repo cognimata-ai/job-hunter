@@ -17,8 +17,14 @@ Names are folded with `normalize.text.fold` (A3 G11): NFKD with the marks remove
 `franzosisch`. Two facts with one id are a V4 issue, and the first is kept (L4174). `not_a_job_ad` is not a
 `JobFacts` field: it is the draft's top-level flag, so its id is a constant the callers add
 (`knockouts.required_facts`).
+
+`binding_facts(facts)` is the one walk of the asserted facts: each one's code, subject and path in the
+`job_facts` document (the field name, and the index in a list), so `derive_fact_ids` and the critic's
+rendering of a draft (`prompts.render.draft_block`) name the same facts. `FACT_ID_CODES` are the codes a fact
+id of a draft can have.
 """
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -76,18 +82,52 @@ def language_subject(language: RequiredLanguage) -> str:
     return language.language
 
 
+# The codes of the fact ids a draft can give: those of `binding_facts`, then the top-level flag's.
+FACT_ID_CODES: Final = (
+    "onsite_required",
+    "mandatory_language",
+    "degree",
+    "certification",
+    "security_clearance",
+    "work_permit",
+    NOT_A_JOB_AD.code,
+)
+
+
+@dataclass(frozen=True)
+class BindingFact:
+    """An asserted fact that binds: its fact-id code and subject, and its path in the `job_facts` document
+    (`("onsite_only",)`, `("required_languages", 2)`, …)."""
+
+    code: str
+    subject: str
+    path: tuple[str | int, ...]
+
+
+def binding_facts(facts: JobFacts) -> Iterator[BindingFact]:
+    """Every asserted fact that binds, in the fact table's order (a fact id may repeat; callers keep the
+    first): an asserted `onsite_only`, a mandatory language, a mandatory degree, a mandatory certification, a
+    required clearance, a required work permit."""
+    if facts.onsite_only.asserted:
+        yield BindingFact("onsite_required", "onsite", ("onsite_only",))
+    for i, language in enumerate(facts.required_languages):
+        if language.mandatory:
+            yield BindingFact("mandatory_language", language_subject(language), ("required_languages", i))
+    if facts.degree.mandatory:
+        yield BindingFact("degree", "degree", ("degree",))
+    for i, certification in enumerate(facts.certifications):
+        if certification.mandatory:
+            yield BindingFact("certification", fold(certification.name), ("certifications", i))
+    if facts.security_clearance.required:
+        yield BindingFact("security_clearance", "clearance", ("security_clearance",))
+    if facts.work_permit.required:
+        yield BindingFact("work_permit", "work_permit", ("work_permit",))
+
+
 def derive_fact_ids(facts: JobFacts) -> dict[str, FactRef]:
     """The ids of every asserted fact that binds, in the fact table's order; the first of an id is kept."""
-    found = [
-        *([("onsite_required", "onsite")] if facts.onsite_only.asserted else []),
-        *(("mandatory_language", language_subject(x)) for x in facts.required_languages if x.mandatory),
-        *([("degree", "degree")] if facts.degree.mandatory else []),
-        *(("certification", fold(x.name)) for x in facts.certifications if x.mandatory),
-        *([("security_clearance", "clearance")] if facts.security_clearance.required else []),
-        *([("work_permit", "work_permit")] if facts.work_permit.required else []),
-    ]
     refs: dict[str, FactRef] = {}
-    for code, subject in found:
-        ref = fact_ref(code, subject)
+    for fact in binding_facts(facts):
+        ref = fact_ref(fact.code, fact.subject)
         refs.setdefault(ref.fact_id, ref)
     return refs

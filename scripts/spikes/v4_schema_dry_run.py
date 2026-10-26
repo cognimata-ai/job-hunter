@@ -75,7 +75,7 @@ def _file_name(label: str) -> str:
 
 def calls() -> list[dict[str, Any]]:
     planned: list[dict[str, Any]] = []
-    for case in schema_dry_run.cases(version=V1, model_policy=_policy()):
+    for case in schema_dry_run.cases(_policy()):
         if case.probe:  # answered by the free counting endpoint, never as a message (R7-2)
             continue
         prompt = schema_dry_run.prompt_for(case)
@@ -159,7 +159,7 @@ async def record_probe_count(key: str, *, fixtures: Path, raw: Path) -> str:
     """Send the probe's count body to `messages.count_tokens` and commit its answer for the fake; the line
     printed names the status and the API's message only."""
     recorder = _recorder()
-    case = next(c for c in schema_dry_run.cases(version=V1, model_policy=_policy()) if c.probe)
+    case = next(c for c in schema_dry_run.cases(_policy()) if c.probe)
     async with recorder.counting_gateway(key) as gateway:
         body = schema_dry_run.probe_count_body(gateway, case, V1)
         try:

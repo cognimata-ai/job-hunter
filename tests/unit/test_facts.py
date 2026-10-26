@@ -6,7 +6,7 @@ clearance and a required work permit. Names are folded with `normalize.text.fold
 removed, so `ö` is `o`, never `oe`). Two facts with the same id keep the first.
 """
 
-from typing import get_args
+from typing import Any, get_args
 
 from jobhunter.llm.schemas.generator import (
     Certification,
@@ -16,7 +16,15 @@ from jobhunter.llm.schemas.generator import (
     SecurityClearance,
     WorkPermit,
 )
-from jobhunter.scoring.facts import FactCode, FactRef, derive_fact_ids, fact_id
+from jobhunter.scoring.facts import (
+    FACT_ID_CODES,
+    NOT_A_JOB_AD,
+    FactCode,
+    FactRef,
+    binding_facts,
+    derive_fact_ids,
+    fact_id,
+)
 
 from tests.support.scoring import job_facts, required_language
 
@@ -114,3 +122,27 @@ def test_two_facts_with_one_id_keep_the_first() -> None:
         "mandatory_language:other:franzosisch",
         "certification:scrum master",
     ]
+
+
+def test_the_binding_facts_walk_names_each_fact_and_where_it_is() -> None:
+    """`binding_facts` is the one walk both `derive_fact_ids` and the critic's draft block take: each fact's
+    code, subject and path in the `job_facts` document, in the table's order."""
+    facts = every_fact_asserted()
+    walked = list(binding_facts(facts))
+    assert [(f.code, f.subject, f.path) for f in walked] == [
+        ("onsite_required", "onsite", ("onsite_only",)),
+        ("mandatory_language", "de", ("required_languages", 0)),
+        ("mandatory_language", "other:franzosisch", ("required_languages", 1)),
+        ("degree", "degree", ("degree",)),
+        ("certification", "zertifizierter scrum master", ("certifications", 0)),
+        ("security_clearance", "clearance", ("security_clearance",)),
+        ("work_permit", "work_permit", ("work_permit",)),
+    ]
+    assert list(derive_fact_ids(facts)) == [fact_id(f.code, f.subject) for f in walked]
+    doc = facts.model_dump(mode="json")
+    for fact in walked:  # every path names an object of the document
+        node: Any = doc
+        for step in fact.path:
+            node = node[step]
+        assert isinstance(node, dict) and "evidence" in node
+    assert {f.code for f in walked} | {NOT_A_JOB_AD.code} == set(FACT_ID_CODES)

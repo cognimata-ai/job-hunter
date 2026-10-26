@@ -73,6 +73,12 @@ These are the ONLY differences from the spec text. Each one carries a SQL commen
        item's follow-up hold and its once-only release (Codex r1 #27, plan Deviation 27).
   4. Indexes beyond the DDL (plan Deviation 2, M1's note 9 precedent): one on each foreign key column that a
      retention or purge delete reaches through its referencing side (the block before the views).
+  5. prompt_schema_versions.schemas is `json`, not the spec's `jsonb` (§7.3; controller Ruling T4-a, Task 4,
+     a deviation for Task 25 to write into the spec): a structured output follows the property order of
+     its schema, and `jsonb` does not keep key order, so the stored schemas would come back reordered (the
+     generator's flags last, a criterion's level before its evidence). `json` keeps the text the seed wrote,
+     in the code's order. The content hash is unaffected: it is taken over sorted canonical JSON. The rows
+     an M2 install already holds keep the order `jsonb` gave them.
 
 The migration imports no application code and inserts no row (§19.3 step 2). Migrations are expand/contract:
 there is no downgrade.
@@ -141,6 +147,9 @@ $$;""")
 ALTER TABLE prompt_schema_versions ADD COLUMN parser_family text NOT NULL DEFAULT 'generator_v1'
   -- the member list is pinned by schemas.PARSER_FAMILIES (Task 4); the seed writes it (plan Deviation 40)
   CHECK (parser_family IN ('generator_v1', 'generator_v2_items'));""")
+    op.execute(
+        "ALTER TABLE prompt_schema_versions ALTER COLUMN schemas TYPE json USING schemas::json;   -- structured outputs follow a schema's property order and jsonb does not keep it (Ruling T4-a, Task 4; difference 5)"
+    )
 
     # §7.6 Score cycles
     op.execute("""\
