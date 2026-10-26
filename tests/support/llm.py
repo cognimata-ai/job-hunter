@@ -15,6 +15,12 @@ try on it, no database, no network) and `assert_single_call_payload`.
 Task 13 adds `write_synthetic_recording`, the builder of a hand-authored synthetic stream and its sidecars
 (the committed `extract_profile` fixture; Task 20's `propose_queries` one).
 
+M3 Task 4 adds the score side: the score purposes in `GATEWAY_PURPOSES`, synthetic bodies of version 2's
+generator (C-shaped, `generator_wire_body`) and of the critic (`critic_body`) with their streams
+(`synthetic_generator_sse`, `synthetic_critic_sse`), the internal draft (`generator_draft_body`), a synthetic
+confirmed profile (`score_profile`), and the two shipped prompt-schema versions built offline (`v1_version`,
+`v2_version`).
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
@@ -22,7 +28,7 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -47,11 +53,14 @@ from jobhunter.llm.gateway import (
     NodeConfig,
     RenderedPrompt,
     SystemBlock,
+    WireSchema,
     _chat,
     to_messages,
 )
 from jobhunter.llm.pricing import MODELS, Usage
-from jobhunter.llm.schemas import transformed
+from jobhunter.llm.prompts.render import PromptVersion, prompt_schema_hash, prompt_schema_v1, prompt_schema_v2
+from jobhunter.llm.schemas import ParserFamily
+from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import (
     CallOutcome,
     EvalRunOwner,
@@ -661,7 +670,14 @@ class GatewayOut(BaseModel):
 
 GATEWAY_BODY: Final[dict[str, JSONValue]] = {"answer": "a synthetic answer", "score": 3}
 # The purposes the `fake_llm` fixture records `GatewayOut` for, on every model.
-GATEWAY_PURPOSES: Final = ("extract_profile", "propose_queries", "schema_dry_run")
+GATEWAY_PURPOSES: Final = (
+    "extract_profile",
+    "propose_queries",
+    "schema_dry_run",
+    "generate",
+    "revise",
+    "critic",
+)
 # A non-scoring node of an operation: `extract_profile`'s purpose with small stages and its 900 s deadline.
 GATEWAY_NODE: Final = NodeConfig(
     purpose="extract_profile",
@@ -670,7 +686,7 @@ GATEWAY_NODE: Final = NodeConfig(
     max_tokens=1000,
     max_tokens_retry=2000,
     deadline_s=900,
-    schema=GatewayOut,
+    schema=WireSchema.from_model(GatewayOut),
 )
 
 
@@ -712,11 +728,13 @@ class FakeLLM(FakeAnthropic):
         model: str,
         body: Any = GATEWAY_BODY,
         *,
-        schema: type[BaseModel] = GatewayOut,
+        schema: type[BaseModel] | Mapping[str, Any] = GatewayOut,
         **sse: Any,
     ) -> Path:
-        """Write the stream the fake serves for `(purpose, model, schema)`: `synthetic_sse(body, **sse)`."""
-        path = fake.recording_path(self.root, purpose, model, anthropic.transform_schema(schema))
+        """Write the stream the fake serves for `(purpose, model, schema)`: `synthetic_sse(body, **sse)`.
+        `schema` is a mirror (its `WireSchema.from_model` wire schema) or a stored wire schema."""
+        sent = WireSchema.from_model(schema).json if isinstance(schema, type) else schema
+        path = fake.recording_path(self.root, purpose, model, sent)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(synthetic_sse(body, model=model, **sse))
         return path
@@ -921,22 +939,23 @@ async def capture_request(
     cfg: AppConfig, node: NodeConfig, prompt: RenderedPrompt, answer: Any
 ) -> CapturedRequest:
     """The request one `gateway._chat` try sends for `node` (its model, effort, first `max_tokens` stage and
-    schema) with `prompt`, on a capturing transport that answers with `answer` as the structured output. The
-    answer must parse as `node.schema`, so the whole try ran. No database and no network: the `payload` CI
-    job has neither."""
+    wire schema) with `prompt`, on a capturing transport that answers with `answer` as the structured output.
+    The answer must validate as the node's mirror (`node.schema.model`), as the gateway checks it, so the
+    whole try ran. No database and no network: the `payload` CI job has neither."""
     transport = CapturingTransport(synthetic_sse(answer, model=node.model))
     async with make_http_client(cfg, mount=transport) as client:
         runnable = _chat(
             node.model,
             node.effort,
             node.max_tokens,
-            node.schema,
+            node.schema.json,
             api_key=PAYLOAD_KEY,
             http_client=client,
             purpose=node.purpose,
         )
         out = await runnable.ainvoke(to_messages(prompt))
-    assert out["parsing_error"] is None and isinstance(out["parsed"], node.schema)
+    assert out["parsing_error"] is None
+    node.schema.model.model_validate(out["parsed"])
     (request,) = transport.requests
     return request
 
@@ -963,7 +982,7 @@ def assert_single_call_payload(
     execution: dict[str, JSONValue],
 ) -> None:
     """The §10.9 assertions for a single (uncached) call of `node`, against the stored policy and execution
-    config it was configured from: the API host, the json_schema output format with exactly the transformed
+    config it was configured from: the API host, the json_schema output format with exactly the node's wire
     schema, the policy's model and effort, the execution config's first `max_tokens` stage, `stream`, none
     of the banned keys, a user turn last, and no `cache_control` anywhere (§10.6: a single call)."""
     policy_node = get_object(model_policy, f"nodes.{node.purpose}")
@@ -978,7 +997,7 @@ def assert_single_call_payload(
     assert "anthropic-beta" not in request.headers  # no betas (G6)
     body = request.body
     assert body["model"] == policy_node["model"] == node.model
-    assert body["output_config"]["format"] == {"type": "json_schema", "schema": transformed(node.schema)}
+    assert body["output_config"]["format"] == {"type": "json_schema", "schema": dict(node.schema.json)}
     assert body["output_config"]["effort"] == policy_node["effort"]
     assert body["max_tokens"] == stages["max_tokens"]
     assert body["stream"] is True
@@ -987,3 +1006,206 @@ def assert_single_call_payload(
     assert body["messages"] and body["messages"][-1]["role"] == "user"
     assert {message["role"] for message in body["messages"]} == {"user"}  # never an assistant prefill
     assert cache_control_paths(body) == []
+
+
+# --- M3 Task 4: the score side -----------------------------------------------------------------------------
+
+_CRITERIA: Final = (
+    "role_fit",
+    "skills",
+    "experience_seniority",
+    "domain",
+    "languages",
+    "education_certifications",
+)
+
+
+def generator_wire_body() -> dict[str, Any]:
+    """A synthetic generator answer of prompt-schema version 2 (candidate C): a few facts, each criterion
+    once."""
+
+    def fact(
+        code: str, value: str, quote: str, *, qualifier: str = "", required: bool = False
+    ) -> dict[str, Any]:
+        return {
+            "code": code,
+            "value": value,
+            "qualifier": qualifier,
+            "required": required,
+            "evidence": [quote],
+        }
+
+    criterion = {
+        "level": 3,
+        "basis": "observed",
+        "ad_evidence": ["Services in Python und PostgreSQL"],
+        "profile_evidence": [{"section": "skills", "quote": "Python"}],
+        "rationale": "Die geforderten Kernkenntnisse sind belegt.",
+    }
+    return {
+        "not_a_job_ad": False,
+        "injection_observed": False,
+        "facts": [
+            fact("work_mode", "hybrid", "hybrid (structured)"),
+            fact("required_language", "de", "sehr gute Deutschkenntnisse", qualifier="B2", required=True),
+            fact("must_have", "Python", "Services in Python"),
+            fact("employment_type", "full_time", "full_time (structured)"),
+        ],
+        "criteria": [{"criterion": key, **criterion} for key in _CRITERIA],
+        "summary_en": "A good fit for the backend role.",
+        "summary_de": "Eine gute Passung für die Backend-Rolle.",
+    }
+
+
+def critic_body() -> dict[str, Any]:
+    """A synthetic critic answer (§11.7.3): one criterion dispute with its quote."""
+    return {
+        "verdict": "revise",
+        "reviews": [
+            {
+                "target": "languages",
+                "assessment": "level_too_high",
+                "suggested_level": 2,
+                "ad_evidence": ["sehr gute Deutschkenntnisse"],
+                "explanation": "The German requirement is not fully evidenced.",
+            }
+        ],
+        "injection": "none",
+        "summary": "One dispute on the languages criterion.",
+    }
+
+
+def synthetic_generator_sse(body: Any = None, *, model: str, **sse: Any) -> bytes:
+    """A C-shaped generator stream (`generator_wire_body` unless `body` is given), as `synthetic_sse`."""
+    return synthetic_sse(generator_wire_body() if body is None else body, model=model, **sse)
+
+
+def synthetic_critic_sse(body: Any = None, *, model: str, **sse: Any) -> bytes:
+    """A critic-shaped stream (`critic_body` unless `body` is given), as `synthetic_sse`."""
+    return synthetic_sse(critic_body() if body is None else body, model=model, **sse)
+
+
+def generator_draft_body(*, not_a_job_ad: bool = False) -> dict[str, Any]:
+    """A synthetic internal draft (`GeneratorDraft`, v1's shape) in which every kind of binding fact is
+    asserted: on-site only, two mandatory languages and a preferred one, a mandatory degree and certification,
+    a required clearance and work permit."""
+    quoted: dict[str, Any] = {"evidence": ["Python und PostgreSQL"]}
+    criterion = {
+        "level": 3,
+        "basis": "observed",
+        "ad_evidence": ["Python und PostgreSQL"],
+        "profile_evidence": [{"section": "skills", "quote": "Python"}],
+        "rationale": "Die Kernkenntnisse sind belegt.",
+    }
+
+    def language(code: str, level: str, *, mandatory: bool, other: str | None = None) -> dict[str, Any]:
+        return {"language": code, "language_other": other, "level": level, "mandatory": mandatory, **quoted}
+
+    return {
+        "not_a_job_ad": not_a_job_ad,
+        "injection_observed": False,
+        "job_facts": {
+            "work_mode": {"value": "hybrid", **quoted},
+            "onsite_only": {"asserted": True, **quoted},
+            "remote_region": {"value": "unspecified", "countries": [], **quoted},
+            "required_languages": [
+                language("de", "B2", mandatory=True),
+                language("en", "B1", mandatory=False),
+                language("other", "A2", mandatory=True, other="Dänisch"),
+            ],
+            "must_haves": [{"text": "Python", **quoted}],
+            "nice_to_haves": [],
+            "seniority": {"value": "senior", **quoted},
+            "min_years_experience": {"value": 4, **quoted},
+            "industry": {"value": "Logistik", **quoted},
+            "employment_types": {"values": ["full_time"], **quoted},
+            "degree": {
+                "level": "bachelor",
+                "mandatory": True,
+                "or_equivalent": False,
+                "field": "Informatik",
+                **quoted,
+            },
+            "certifications": [{"name": "AWS Solutions Architect", "mandatory": True, **quoted}],
+            "security_clearance": {"required": True, "level": "Ü1", **quoted},
+            "work_permit": {"required": True, **quoted},
+        },
+        "criteria": {key: criterion for key in _CRITERIA},
+        "summary_en": "A good fit.",
+        "summary_de": "Eine gute Passung.",
+    }
+
+
+def score_profile() -> ConfirmedProfile:
+    """A synthetic confirmed profile (an invented candidate) with a user-entered block."""
+    return ConfirmedProfile.model_validate(
+        {
+            "summary": "Backend-Entwickler mit sechs Jahren Erfahrung in Python und PostgreSQL.",
+            "target_titles": [
+                {"title": "Backend Engineer", "lang": "en"},
+                {"title": "Backend-Entwickler", "lang": "de"},
+            ],
+            "seniority": "senior",
+            "total_years_experience": 6,
+            "roles": [
+                {
+                    "title": "Backend Engineer",
+                    "employer": "Beispiel Logistik GmbH",
+                    "start": "2019-03-01",
+                    "end": "present",
+                    "seniority": "senior",
+                    "domain": "Logistik",
+                    "highlights": ["Sendungsverfolgung mit Python und PostgreSQL entwickelt"],
+                }
+            ],
+            "skills": [
+                {
+                    "name": "Python",
+                    "category": "programming_language",
+                    "level": "expert",
+                    "years": 6,
+                    "evidence": "Python",
+                },
+                {
+                    "name": "PostgreSQL",
+                    "category": "tool",
+                    "level": "advanced",
+                    "years": 5,
+                    "evidence": "PostgreSQL",
+                },
+            ],
+            "languages": [
+                {"code": "de", "code_other": None, "cefr": "native", "evidence": "Deutsch (Muttersprache)"},
+                {"code": "en", "code_other": None, "cefr": "C1", "evidence": "Englisch (C1)"},
+            ],
+            "education": [{"level": "bachelor", "field": "Informatik", "institution": None, "year": 2016}],
+            "certifications": [],
+            "domains": ["Logistik"],
+            "user_entered": {"work_authorization_de": "authorized", "security_clearances": []},
+        }
+    )
+
+
+def _packaged_version(
+    version_id: int,
+    content: tuple[dict[str, JSONValue], dict[str, JSONValue]],
+    family: ParserFamily,
+) -> PromptVersion:
+    templates, schemas = content
+    return PromptVersion(
+        id=version_id,
+        prompt_schema_hash=prompt_schema_hash(templates, schemas),
+        templates={name: str(text) for name, text in templates.items()},
+        schemas=schemas,
+        parser_family=family,
+    )
+
+
+def v2_version(version_id: int = 2) -> PromptVersion:
+    """Prompt-schema version 2 as the seed stores it, built offline under the id `version_id`."""
+    return _packaged_version(version_id, prompt_schema_v2(), "generator_v2_items")
+
+
+def v1_version(version_id: int = 1) -> PromptVersion:
+    """Prompt-schema version 1 as the M2 seed stored it, built offline under the id `version_id`."""
+    return _packaged_version(version_id, prompt_schema_v1(), "generator_v1")

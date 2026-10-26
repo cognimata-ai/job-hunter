@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 from jobhunter.llm.schema_dry_run import schema_violations
-from jobhunter.llm.schemas import SCHEMAS, transformed
+from jobhunter.llm.schemas import SCHEMAS_V1, transformed
 
-CRITIC = transformed(SCHEMAS["critic"])
+CRITIC = transformed(SCHEMAS_V1["critic"])
 
 
 def valid() -> dict[str, Any]:

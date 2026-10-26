@@ -3,10 +3,10 @@ with `FieldIssue(field, code, message)`, paths such as `payload.scope.locations[
 `out_of_range`, `invalid`, `required`, `conflict` and `unsupported`.
 
 One table covers every §13.1 range at its edges and one past them, the cross-field rules, model and effort
-support, the execution ranges and the §6.9.1 overrun-buffer bound. The bound figures are those of spec
-revision 3.4 (Ruling R15-1): $1.72 at the defaults (500 batch items, V19's 2,640-token overhead) and $33.07 at
-10,000 batch items; a test derives both from `bounds` and `pricing`, so a change of either constant fails
-loudly.
+support, the execution ranges and the §6.9.1 overrun-buffer bound. The bound figures follow the overhead
+V19 re-measured in M3 Task 4 (1,878 tokens, `docs/spikes/V19.md`, "M3 re-count"): $1.23 at the defaults (500
+batch items) and $23.53 at 10,000 batch items (spec revision 3.4, Ruling R15-1, had $1.72 and $33.07 at
+2,640); a test derives both from `bounds` and `pricing`, so a change of either constant fails loudly.
 Warnings (`eval_uncalibrated`, `serpapi_disabled_no_fallback`) are `warnings_only`'s (Ruling R15-2).
 """
 
@@ -110,13 +110,13 @@ INT_RANGES: list[tuple[str, int, int, dict[str, Any]]] = [
     ("scoring.max_targets_per_cycle", 1, 500, {}),
     ("scoring.min_cycle_targets", 1, 100, {}),
     ("scoring.batch_min_targets", 200, 100_000, {}),
-    ("scoring.batch_max_items", 200, 10_000, {"llm.overrun_buffer_usd": "33.07"}),
+    ("scoring.batch_max_items", 200, 10_000, {"llm.overrun_buffer_usd": "23.53"}),
     ("retention.score_history_months", 1, 36, {}),
 ]
 # (path, lowest, just below, highest, just above, the other fields an edge needs to be valid)
 DECIMAL_RANGES: list[tuple[str, str, str, str, str, dict[str, Any]]] = [
     ("llm.cap_usd", "1.00", "0.99", "10000.00", "10000.01", {}),
-    # $0.50 is valid only where the §6.9.1 bound is lower: Haiku everywhere and 200 batch items give $0.18
+    # $0.50 is valid only where the §6.9.1 bound is lower: Haiku everywhere and 200 batch items give $0.13
     (
         "llm.overrun_buffer_usd",
         "0.50",
@@ -474,16 +474,16 @@ CASES: list[Any] = [
         bad("scoring.execution.revise.deadline_s", "required"),
         id="execution without deadline",
     ),
-    # the §6.9.1 overrun-buffer bound: $1.72 at the defaults, $33.07 at 10,000 batch items
-    C({"llm.overrun_buffer_usd": "1.72"}, OK, id="buffer at the default bound"),
-    C({"llm.overrun_buffer_usd": "1.71"}, out("llm.overrun_buffer_usd"), id="buffer below the default bound"),
+    # the §6.9.1 overrun-buffer bound: $1.23 at the defaults, $23.53 at 10,000 batch items
+    C({"llm.overrun_buffer_usd": "1.23"}, OK, id="buffer at the default bound"),
+    C({"llm.overrun_buffer_usd": "1.22"}, out("llm.overrun_buffer_usd"), id="buffer below the default bound"),
     C({"scoring.batch_max_items": 10_000}, out("llm.overrun_buffer_usd"), id="10000 items, $2.00 buffer"),
     C(
-        {"scoring.batch_max_items": 10_000, "llm.overrun_buffer_usd": "33.06"},
+        {"scoring.batch_max_items": 10_000, "llm.overrun_buffer_usd": "23.52"},
         out("llm.overrun_buffer_usd"),
-        id="10000 items, $33.06 buffer",
+        id="10000 items, $23.52 buffer",
     ),
-    C({"scoring.batch_max_items": 10_000, "llm.overrun_buffer_usd": "33.07"}, OK, id="10000 items, $33.07"),
+    C({"scoring.batch_max_items": 10_000, "llm.overrun_buffer_usd": "23.53"}, OK, id="10000 items, $23.53"),
     # decimals are strings with at most two places for USD
     C({"llm.cap_usd": "250"}, OK, id="cap without places"),
     C({"llm.cap_usd": "100.005"}, bad("llm.cap_usd"), id="cap with three places"),
@@ -614,7 +614,7 @@ def test_independent_issues_are_all_reported() -> None:
 
 def test_the_buffer_issue_names_the_bound() -> None:
     _, issues = validate_fields(apply({"scoring.batch_max_items": 10_000}))
-    assert len(issues) == 1 and "33.07" in issues[0].message
+    assert len(issues) == 1 and "23.53" in issues[0].message
 
 
 def test_an_effort_the_model_does_not_support(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -687,10 +687,10 @@ def at_items(items: int, buffer: str = "50.00") -> Settings:
 
 
 def test_the_overrun_buffer_bound_figures() -> None:
-    # Ruling R15-1 (spec revision 3.4): 5 x 2,640 x $5.00 + 500 x 2,640 x $1.25 = $1.716, rounded up to $1.72;
-    # 5 x 2,640 x $5.00 + 10,000 x 2,640 x $1.25 = $33.066, rounded up to $33.07
-    assert overrun_buffer_bound(Settings()) == Decimal("1.72")
-    assert overrun_buffer_bound(at_items(10_000)) == Decimal("33.07")
+    # The M3 re-count (V19, 1,878 tokens): 5 x 1,878 x $5.00 + 500 x 1,878 x $1.25 = $1.2207, rounded up to
+    # $1.23; 5 x 1,878 x $5.00 + 10,000 x 1,878 x $1.25 = $23.52195, rounded up to $23.53
+    assert overrun_buffer_bound(Settings()) == Decimal("1.23")
+    assert overrun_buffer_bound(at_items(10_000)) == Decimal("23.53")
 
 
 def test_the_bound_figures_follow_the_overhead_and_the_prices() -> None:
@@ -700,9 +700,9 @@ def test_the_bound_figures_follow_the_overhead_and_the_prices() -> None:
     online = pricing.bound_input_price(OPUS, batch=False)
     batch = pricing.bound_input_price(SONNET, batch=True)
     assert (overhead[OPUS], online, overhead[SONNET], batch) == (
-        2_640,
+        1_878,
         Decimal("5.00"),
-        2_640,
+        1_878,
         Decimal("1.25"),
     )
 
@@ -710,7 +710,7 @@ def test_the_bound_figures_follow_the_overhead_and_the_prices() -> None:
         total = 5 * overhead[OPUS] * online + items * overhead[SONNET] * batch
         return (total / 1_000_000).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
 
-    assert (bound(500), bound(10_000)) == (Decimal("1.72"), Decimal("33.07"))
+    assert (bound(500), bound(10_000)) == (Decimal("1.23"), Decimal("23.53"))
     assert (overrun_buffer_bound(Settings()), overrun_buffer_bound(at_items(10_000))) == (
         bound(500),
         bound(10_000),
@@ -718,18 +718,18 @@ def test_the_bound_figures_follow_the_overhead_and_the_prices() -> None:
 
 
 def test_the_bound_takes_the_costliest_online_model_and_the_generators_batch_price() -> None:
-    # Fable as the critic: 5 online slots at 2,640 x $12.50, the batch items still at Sonnet's $1.25:
-    # (165,000 + 1,650,000) / 1e6 = 1.815 -> $1.82
+    # Fable as the critic: 5 online slots at 1,878 x $12.50, the batch items still at Sonnet's $1.25:
+    # (117,375 + 1,173,750) / 1e6 = 1.291125 -> $1.30
     fable_critic = apply({"scoring.model_policy.nodes.critic": {"model": FABLE, "effort": "medium"}})
-    assert overrun_buffer_bound(Settings.model_validate(fable_critic)) == Decimal("1.82")
+    assert overrun_buffer_bound(Settings.model_validate(fable_critic)) == Decimal("1.30")
     # Haiku as the generator: batch items at Haiku's top-tier batch price $0.3125, the online slots at Opus:
-    # (66,000 + 500 x 2,640 x 0.3125) / 1e6 = 0.4785 -> $0.48
+    # (46,950 + 500 x 1,878 x 0.3125) / 1e6 = 0.3403875 -> $0.35
     haiku_generator = apply({"scoring.model_policy.nodes.generate": {"model": HAIKU, "effort": "medium"}})
-    assert overrun_buffer_bound(Settings.model_validate(haiku_generator)) == Decimal("0.48")
+    assert overrun_buffer_bound(Settings.model_validate(haiku_generator)) == Decimal("0.35")
     # rounded up to the cent, never to the nearest: Haiku everywhere and 200 batch items give
-    # (5 x 2,640 x $0.625 + 200 x 2,640 x $0.3125) / 1e6 = 0.17325 -> $0.18
+    # (5 x 1,878 x $0.625 + 200 x 1,878 x $0.3125) / 1e6 = 0.12324375 -> $0.13
     haiku = apply({"scoring.model_policy.nodes": HAIKU_NODES, "scoring.batch_max_items": 200})
-    assert overrun_buffer_bound(Settings.model_validate(haiku)) == Decimal("0.18")
+    assert overrun_buffer_bound(Settings.model_validate(haiku)) == Decimal("0.13")
     # the overhead constants may be given (the V19 spike passes its own); 1,000 tokens everywhere and 1,000
     # items is §6.9.1's former example: 5 x 1,000 x $5.00 + 1,000 x 1,000 x $1.25 -> $1.28
     floor = dict.fromkeys(pricing.MODELS, 1_000)

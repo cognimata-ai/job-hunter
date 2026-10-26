@@ -15,7 +15,7 @@ from typing import Any
 import anthropic
 import pytest
 from jobhunter.llm import fake
-from jobhunter.llm.schemas import SCHEMAS, transformed
+from jobhunter.llm.schemas import SCHEMAS_V1, transformed
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -125,13 +125,13 @@ def test_each_schema_has_a3s_structural_counts(name: str) -> None:
 
 @pytest.mark.parametrize("name", list(A3_ACCEPTED))
 def test_the_walk_reproduces_a3s_rows_of_the_accepted_v1_schemas(name: str) -> None:
-    c = CANDIDATES.counts(transformed(SCHEMAS[name]))
+    c = CANDIDATES.counts(transformed(SCHEMAS_V1[name]))
     got = (c.canonical_bytes, c.expanded_bytes, c.objects, c.properties, c.arrays, c.enums, c.unions)
     assert got == A3_ACCEPTED[name]
 
 
 def test_v1_is_the_schema_the_gateway_sends_for_the_generator() -> None:
-    assert CANDIDATES.v1() == transformed(SCHEMAS["generator"])
+    assert CANDIDATES.v1() == transformed(SCHEMAS_V1["generator"])
 
 
 @pytest.mark.parametrize("name", ["v1", "a", "b", "c"])

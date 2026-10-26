@@ -4,8 +4,8 @@
   document gives it back, byte-equal under `canonical_json` (decimals as strings).
 - `extra="forbid"` at every level, strict JSON types, set-valued lists in their declared order.
 - `test_seed_defaults_validate` is the standing guard of the seeded overrun buffer (pre-flight F30): the
-  seeded settings validate with no issue under the constants of `llm/bounds.py` (V19's 2,640-token overhead
-  and the 500 batch items of spec revision 3.4).
+  seeded settings validate with no issue under the constants of `llm/bounds.py` (V19's overhead, 1,878 tokens
+  since the M3 re-count, and the 500 batch items of spec revision 3.4).
 """
 
 import copy
@@ -272,12 +272,13 @@ def test_an_extra_key_in_a_location_is_rejected() -> None:
 
 def test_seed_defaults_validate() -> None:
     # The standing guard (pre-flight F30): with the constants of `bounds.py`, the seeded settings need no
-    # more than their own $2.00 overrun buffer. 5 x 2,640 x $5.00 + 500 x 2,640 x $1.25 = $1.716 -> $1.72.
-    assert set(bounds.PROMPT_OVERHEAD_TOKENS.values()) == {2_640}
+    # more than their own $2.00 overrun buffer. With V19's M3 re-count (1,878 tokens):
+    # 5 x 1,878 x $5.00 + 500 x 1,878 x $1.25 = $1.2207 -> $1.23.
+    assert set(bounds.PROMPT_OVERHEAD_TOKENS.values()) == {1_878}
     settings, issues = validate_fields(load_settings_v1())
     assert issues == []
     assert settings == Settings()
-    assert overrun_buffer_bound(settings) == Decimal("1.72") <= settings.llm.overrun_buffer_usd
+    assert overrun_buffer_bound(settings) == Decimal("1.23") <= settings.llm.overrun_buffer_usd
 
 
 def test_json_types_are_strict() -> None:

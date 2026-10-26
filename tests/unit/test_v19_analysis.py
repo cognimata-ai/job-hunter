@@ -8,7 +8,10 @@ these tests pin what it concludes from the counts, offline:
 - `PROMPT_OVERHEAD_TOKENS[model]` is twice the largest framing overhead (whole minus the sum of the
   components) of that model's requests, never below the 1,000-token floor;
 - the native-PDF check (`usage <= 1.25 x count_tokens`), the recorded-usage check against the bound, the
-  §6.9.1 overrun-buffer bound of the seeded settings, and the rewrite of the generated block of `bounds.py`.
+  §6.9.1 overrun-buffer bound of the seeded settings, and the rewrite of the generated block of `bounds.py`;
+- the corpus's generator and critic requests are the score prompts of prompt-schema version 2, rendered by
+  `render.score_prompt` with candidate C as the generator's schema (M3 Task 4, R12), so the M3 re-count
+  measures the framing of the requests M3 sends.
 """
 
 import ast
@@ -23,6 +26,11 @@ import pytest
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import bounds
 from jobhunter.llm.pricing import MODELS
+from jobhunter.llm.prompts import render
+from jobhunter.llm.schemas import SCHEMAS_V1, transformed
+from jobhunter.llm.schemas.critic import CriticOut
+from jobhunter.llm.schemas.generator import GeneratorWire
+from jobhunter.scoring.rubric import RUBRIC_V2, load_rubric
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -151,6 +159,10 @@ def test_the_overrun_buffer_bound_arithmetic() -> None:
     measured: dict[str, int] = dict.fromkeys(MODELS, 2_640)
     assert V19.overrun_buffer_bound(thousand, measured) == Decimal("3.37")
     assert V19.overrun_buffer_bound(_with_batch_items(thousand, 500), measured) == Decimal("1.72")  # 1.716
+    # The M3 re-count (docs/spikes/V19.md): 1,878 tokens everywhere at the seeded 500 items,
+    # (5 x 1,878 x $5.00 + 500 x 1,878 x $1.25) / 1e6 = 1.2207 -> $1.23, within the $2.00 default
+    m3: dict[str, int] = dict.fromkeys(MODELS, 1_878)
+    assert V19.overrun_buffer_bound(load_settings_v1(), m3) == Decimal("1.23")
     # The seeded settings with the constants `bounds.py` holds are guarded by Task 15's
     # `test_seed_defaults_validate` (tests/unit/test_settings_model.py), the settings validation's own check.
 
@@ -177,3 +189,38 @@ def test_the_rewrite_replaces_only_the_generated_block_of_bounds_py() -> None:
     assert ast.literal_eval(assigned["NATIVE_PDF_ENABLED"]) is True
     with pytest.raises(ValueError, match="floor"):
         V19.rewrite_bounds(source, {**constants, OPUS: 999}, native_pdf_enabled=False)
+
+
+def test_the_score_requests_of_the_corpus_are_version_2s_score_prompts() -> None:
+    v2 = V19.V2
+    templates, schemas = render.prompt_schema_v2()
+    assert v2.parser_family == "generator_v2_items" and dict(v2.schemas) == schemas
+    assert dict(v2.templates) == templates
+    rubric = render.rubric_block(v2.templates["shared_rubric"], load_rubric(RUBRIC_V2))
+    kinds = {"profile": 0, "queries": 0, "generator": 0, "critic": 0}
+    for request in V19.corpus(SONNET):
+        kinds[request.kind] += 1
+        if request.kind in ("profile", "queries"):
+            name = request.kind
+            assert request.node.schema.json == transformed(SCHEMAS_V1[name])
+            continue
+        role = "generate" if request.kind == "generator" else "critic"
+        system = request.prompt.system
+        # §10.6: the rubric block, the cached profile block, the role template
+        assert [block.cache for block in system] == [False, True, False]
+        assert system[0].text == rubric
+        assert system[1].text.startswith("<candidate_profile>")
+        assert system[2].text == v2.templates[f"role_{role}"]
+        assert request.prompt.template_version == f"{role}@{v2.id}"
+        (message,) = request.prompt.messages
+        assert isinstance(message.content, str) and message.content.startswith('<job_ad untrusted="true">')
+        if role == "critic":
+            for tag in ("<draft>", "<required_facts>", "<validator_issues>"):
+                assert tag in message.content
+            assert (
+                request.node.schema.json == transformed(CriticOut) and request.node.schema.model is CriticOut
+            )
+        else:
+            assert request.node.schema.json == transformed(GeneratorWire)  # candidate C
+            assert request.node.schema.model is GeneratorWire
+    assert kinds == {"profile": 8, "queries": 8, "generator": 8, "critic": 8}

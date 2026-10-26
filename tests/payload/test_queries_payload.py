@@ -11,7 +11,7 @@ from jobhunter.config import AppConfig
 from jobhunter.db.seed import canonical_json, load_settings_v1
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS, text_input_bound
 from jobhunter.llm.fake import canonical_schema_json
-from jobhunter.llm.gateway import node_config
+from jobhunter.llm.gateway import WireSchema, node_config
 from jobhunter.llm.prompts.render import propose_queries_prompt
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.schemas.queries import QueryProposalOut
@@ -22,7 +22,12 @@ from tests.support.llm import assert_single_call_payload, capture_request
 SETTINGS = load_settings_v1()
 MODEL_POLICY = get_object(SETTINGS, "scoring.model_policy")
 EXECUTION = get_object(SETTINGS, "scoring.execution")
-NODE = node_config("propose_queries", model_policy=MODEL_POLICY, execution=EXECUTION, schema=QueryProposalOut)
+NODE = node_config(
+    "propose_queries",
+    model_policy=MODEL_POLICY,
+    execution=EXECUTION,
+    schema=WireSchema.from_model(QueryProposalOut),
+)
 
 PROFILE = ConfirmedProfile.model_validate(
     {

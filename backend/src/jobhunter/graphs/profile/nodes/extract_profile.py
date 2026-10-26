@@ -60,7 +60,7 @@ from jobhunter.graphs.profile.nodes.llm_outcome import Call, Fail, Requeue, Use
 from jobhunter.graphs.profile.state import FAILED, REQUEUED, ProfileState, ProfileUpdate
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.errors import LLMError
-from jobhunter.llm.gateway import CallContext, NodeConfig, RenderedPrompt, active_node_config
+from jobhunter.llm.gateway import CallContext, NodeConfig, RenderedPrompt, WireSchema, active_node_config
 from jobhunter.llm.prompts.render import extract_profile_native_pdf_prompt, extract_profile_prompt
 from jobhunter.llm.schemas.profile import ProfileOut
 from jobhunter.llm.spend_ledger import OperationOwner, Receipt
@@ -202,7 +202,9 @@ def make_extract_profile(deps: ProfileDeps) -> Node:
             if isinstance(request, str):
                 step = Fail(request)
             else:
-                node, execution_config_id = await active_node_config(deps.engine, PURPOSE, ProfileOut)
+                node, execution_config_id = await active_node_config(
+                    deps.engine, PURPOSE, WireSchema.from_model(ProfileOut)
+                )
                 call = _caller(
                     op, od, node, request, execution_config_id, draft_id, native_pdf=draft.native_pdf
                 )

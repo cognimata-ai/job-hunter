@@ -57,7 +57,7 @@ from jobhunter.graphs.profile.nodes.llm_outcome import Call, Fail, Requeue, Use
 from jobhunter.graphs.profile.state import FAILED, OBSOLETE, READY, REQUEUED, ProposalState, ProposalUpdate
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.errors import LLMError
-from jobhunter.llm.gateway import CallContext, NodeConfig, RenderedPrompt, active_node_config
+from jobhunter.llm.gateway import CallContext, NodeConfig, RenderedPrompt, WireSchema, active_node_config
 from jobhunter.llm.prompts.render import propose_queries_prompt
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.schemas.queries import QueryProposalOut
@@ -281,7 +281,9 @@ def make_propose_queries(deps: ProfileDeps) -> ProposalNode:
             if prompt is None:
                 step = Fail(PROFILE_UNAVAILABLE)
             else:
-                node, execution_config_id = await active_node_config(deps.engine, PURPOSE, QueryProposalOut)
+                node, execution_config_id = await active_node_config(
+                    deps.engine, PURPOSE, WireSchema.from_model(QueryProposalOut)
+                )
                 call = _caller(op, od, node, prompt, execution_config_id, proposal_id, checker)
 
                 def usable(use: Use) -> bool:

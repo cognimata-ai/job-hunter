@@ -1,15 +1,19 @@
-"""The schema dry-run (spec §10.11; plan Task 7): one minimal synthetic request through the gateway for each
-structured-output schema and each model configured for it, plus an informational keyword probe, recorded as
-an `eval_runs(kind='schema_dry_run')` row. `jobhunter schema-dry-run [--live]` runs it
-(`cli_schema_dry_run`), and so does the manual workflow `schema-dry-run-manual.yml`; activating a new
-prompt-schema version (M3) requires a passing record.
+"""The schema dry-run (spec §10.11; M2 plan Task 7, M3 Task 4): one minimal synthetic request through the
+gateway for each structured-output schema of a prompt-schema version and each model configured for it, plus an
+informational keyword probe, recorded as an `eval_runs(kind='schema_dry_run')` row. `jobhunter schema-dry-run
+[--live] [--version <id>]` runs it (`cli_schema_dry_run`), and so does the manual workflow
+`schema-dry-run-manual.yml`; activating a new prompt-schema version (M3) requires a passing record, per
+version and per model (the `(schema, model, passed)` of each case).
 
-**The cases** (`cases(model_policy)`): the generator schema for each distinct model of the `generate` and
-`revise` nodes, the critic schema for `critic`'s, the profile schema for `extract_profile`'s and the queries
-schema for `propose_queries`'s, then the probe on `generate`'s model. Each request is the static `SYSTEM_TEXT`
-block and one user turn with a synthetic profile, ad or CV (`prompt_for`), at effort `DRY_RUN_EFFORT`, with
-`DRY_RUN_MAX_TOKENS` in both `max_tokens` stages and a `DRY_RUN_DEADLINE_S` node deadline, purpose
-`schema_dry_run` (non-scoring), owned by the run's `eval_runs` row (`EvalRunOwner`: it must be `running`).
+**The cases** (`cases(version=…, model_policy=…)`): the generator schema for each distinct model of the
+`generate` and `revise` nodes, the critic schema for `critic`'s, the profile schema for `extract_profile`'s
+and the queries schema for `propose_queries`'s, then the probe on `generate`'s model. Each case sends the
+schema the loaded version stores and validates the output against its structural mirror (`node_for(case,
+version)`: the generator's is `schemas.mirror_for` of the version's stored parser family). Each request is
+the static `SYSTEM_TEXT` block and one user turn with a synthetic profile, ad or CV (`prompt_for`), at effort
+`DRY_RUN_EFFORT`, with `DRY_RUN_MAX_TOKENS` in both `max_tokens` stages and a `DRY_RUN_DEADLINE_S` node
+deadline, purpose `schema_dry_run` (non-scoring), owned by the run's `eval_runs` row (`EvalRunOwner`: it must
+be `running`).
 The deadline is taken from the gateway's own clock (`LLMGateway.monotonic`), which its loop compares it to.
 Both stages being `DRY_RUN_MAX_TOKENS` is deliberate: a first-stage `max_tokens` stop makes the gateway send a
 second, identical paid try (2,000 tokens again), not a larger one, so a case that cannot finish within 2,000
@@ -21,7 +25,7 @@ most 6 paid HTTP tries; the manual workflow's cost note states the resulting wor
 - `structural`: the output validates against the structural mirror (the gateway's parse, done again);
 - `schema_bytes_equal`: the `output_config.format.schema` of every try that reached the wire, read from the
   request the http client sent (`_record_sent`, an `httpx2` request hook), is byte-equal as canonical JSON to
-  the schema the prompt-schema version stores, which for version 1 is `schemas.transformed` of the mirror;
+  the schema the prompt-schema version stores (for the shipped versions, `schemas.transformed` of the mirror);
 - `enums_allowed`: every value of the output is allowed by that stored schema, every enum-constrained one
   among them, so a stripped `enum`, `anyOf` or `$ref` cannot pass (`schema_violations`).
 A gateway error ends the case with its code (`invalid_output`, `refused`, `max_tokens`, `model_mismatch`,
@@ -29,24 +33,29 @@ A gateway error ends the case with its code (`invalid_output`, `refused`, `max_t
 `http_status`, `stop_reason`, `invalid_output`, `schema_mismatch` (or `no_request_captured`) or
 `enum_violation`.
 
-**The probe** asks whether the API accepts the generator schema with one added `"minimum": 0`
-(`probe_schema`), a keyword the schemas never rely on (all ranges are the semantic validator's, §11.6). It is
-sent to the free `messages.count_tokens` endpoint, never as a message (controller ruling R7-2): the generator
-case's exact count body with the probe schema in place of its own (`probe_count_body`; the SDK's
-`transform_schema` would move the keyword into a description, so it goes in after langchain built the body).
+**The probe** asks whether the API accepts the keyword `"minimum": 0` (`probe_schema`), which the schemas
+never rely on (all ranges are the semantic validator's, §11.6): on the version's generator schema with the
+keyword on its first plain integer node (version 1), or, for a generator schema without one (version 2, whose
+one integer is the `level` enum), on `PROBE_ONLY_SCHEMA`, since whether the API rejects the keyword does not
+depend on the generator schema (M2 Deviation 33). It is sent to the free `messages.count_tokens` endpoint,
+never as a message (controller ruling R7-2): the generator case's exact count body with the probe schema in
+place of its own (`probe_count_body`; the SDK's `transform_schema` would move the keyword into a description,
+so it goes in after langchain built the body).
 The counting endpoint validates the schema's keywords. The probe records `rejected` (HTTP 400), `accepted`,
 or `error:<code>`, and whether the keyword reached the wire; it reserves nothing and never decides the run.
 
-**The record.** The run inserts its `eval_runs` row `running` (`route='production'`, the three config ids),
-runs the cases one by one, and ends it through `transition()`: `completed` once every case has an outcome,
-with `passed` true exactly when every schema case passed; `failed` when the run stops early (an exception
-other than a gateway outcome, re-raised), with `passed` false and the cases it ran. `metrics` holds the
-transport (`fake` or `live`, as the caller names it) and the case table (schemas, models, outcomes, checks,
-violation paths, call ids), never content; `cost_usd` is what the ledger counts for the run's calls (billed
-at their cost, ambiguous at their reservation), at the column's 4 decimals. For prompt-schema version 1 that
-record is `completed` and not passed: the API rejects the §11.5 generator schema ("The compiled grammar is
-too large", spike V4, `docs/spikes/V4.md`), and making it compilable is a spec change for M3 (controller
-ruling R7-1).
+**The record.** The run loads the version (`prompts.render.load_prompt_version`), inserts its `eval_runs` row
+`running` (`route='production'`, the three config ids), runs the cases one by one, and ends it through
+`transition()`: `completed` once every case has an outcome, with `passed` true exactly when every schema case
+passed; `failed` when the run stops early (an exception other than a gateway outcome, re-raised), with
+`passed` false and the cases it ran. `metrics` holds the transport (`fake` or `live`, as the caller names it)
+and the case table (each case's `name`, schema, model, `passed`, outcome, checks, violation paths and call
+id), never content; `cost_usd` is what the ledger counts for the run's calls (billed at their cost, ambiguous
+at their reservation), at the column's 4 decimals. For prompt-schema version 1 that record is `completed` and
+not passed: the API rejects the §11.5 generator schema ("The compiled grammar is too large", spike V4,
+`docs/spikes/V4.md`; controller ruling R7-1). Version 2's generator schema is candidate C, which the pre-plan
+probe V4b saw compile on `claude-sonnet-5-5` (`docs/spikes/V4b-generator-v2.md`); its live dry-run is M3
+Task 26's.
 """
 
 import copy
@@ -89,9 +98,14 @@ from jobhunter.llm.gateway import (
     NodeConfig,
     RenderedPrompt,
     SystemBlock,
+    WireSchema,
 )
 from jobhunter.llm.pricing import MODELS, Effort, Model
-from jobhunter.llm.schemas import SCHEMAS, transformed
+from jobhunter.llm.prompts.render import PromptVersion, load_prompt_version
+from jobhunter.llm.schemas import mirror_for
+from jobhunter.llm.schemas.critic import CriticOut
+from jobhunter.llm.schemas.profile import ProfileOut
+from jobhunter.llm.schemas.queries import QueryProposalOut
 from jobhunter.llm.spend_ledger import EvalRunOwner
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue, get_object, get_str
@@ -115,6 +129,12 @@ _SCHEMA_NODES: Final[tuple[tuple[SchemaName, tuple[str, ...]], ...]] = (
     ("queries", ("propose_queries",)),
 )
 _PROBE_NODE: Final = "generate"
+# The structural mirrors of the schemas whose mirror no parser family names.
+_MIRRORS: Final[Mapping[str, type[BaseModel]]] = {
+    "critic": CriticOut,
+    "profile": ProfileOut,
+    "queries": QueryProposalOut,
+}
 
 log = get_logger("jobhunter.llm.schema_dry_run")
 
@@ -139,9 +159,12 @@ def _node_model(model_policy: Mapping[str, JSONValue], node: str) -> Model:
     return model
 
 
-def cases(model_policy: Mapping[str, JSONValue]) -> list[DryRunCase]:
-    """The cases of a model policy payload: one per schema and distinct model of its nodes, in node order,
-    then the probe on the `generate` model."""
+def cases(*, version: PromptVersion, model_policy: Mapping[str, JSONValue]) -> list[DryRunCase]:
+    """The cases of `version` on a model policy payload: one per schema and distinct model of its nodes, in
+    node order (the generator on `generate`'s model and, when `revise` runs on another, on that one too), then
+    the probe on the `generate` model. The list is the policy's; each case sends what `version` stores for
+    its schema (`node_for(case, version)`), and a schema the version lacks ends its case
+    `schema_not_in_version`."""
     planned: list[DryRunCase] = []
     for schema_name, nodes in _SCHEMA_NODES:
         models: list[Model] = []
@@ -171,16 +194,23 @@ def _first_plain_integer(node: Any) -> dict[str, Any] | None:
     return None
 
 
-def probe_schema(generator_schema: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """The generator schema (by default `transformed(GeneratorOut)`) with one added `"minimum": 0`, on its
-    first integer node without an enum (version 1: the integer branch of `$defs.nullable_int`). A new copy
-    each call."""
-    schema = copy.deepcopy(
-        dict(transformed(SCHEMAS["generator"]) if generator_schema is None else generator_schema)
-    )
+# The probe of a generator schema without a plain integer node (module docstring).
+PROBE_ONLY_SCHEMA: Final[dict[str, Any]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["n"],
+    "properties": {"n": {"type": "integer", PROBE_KEYWORD: 0}},
+}
+
+
+def probe_schema(generator_schema: Mapping[str, Any]) -> dict[str, Any]:
+    """The generator schema with one added `"minimum": 0` on its first integer node without an enum (version
+    1: the integer branch of `$defs.nullable_int`), or `PROBE_ONLY_SCHEMA` when it has none (version 2). A new
+    copy each call."""
+    schema = copy.deepcopy(dict(generator_schema))
     target = _first_plain_integer(schema)
     if target is None:
-        raise ValueError("the generator schema has no integer field for the minimum probe")
+        return copy.deepcopy(PROBE_ONLY_SCHEMA)
     target[PROBE_KEYWORD] = 0
     return schema
 
@@ -309,13 +339,23 @@ def prompt_for(case: DryRunCase) -> RenderedPrompt:
     )
 
 
-def node_for(case: DryRunCase) -> NodeConfig:
+def _stored(version: PromptVersion, schema_name: SchemaName) -> dict[str, JSONValue]:
+    stored = version.schemas.get(schema_name)
+    if not isinstance(stored, dict):
+        raise ValueError(f"prompt-schema version {version.id} stores no {schema_name} schema")
+    return stored
+
+
+def node_for(case: DryRunCase, version: PromptVersion) -> NodeConfig:
     """The case's node: purpose `schema_dry_run`, the case's model at `DRY_RUN_EFFORT`, `DRY_RUN_MAX_TOKENS`
-    in both stages and `DRY_RUN_DEADLINE_S` (the probe's is the generator's).
+    in both stages and `DRY_RUN_DEADLINE_S` (the probe's is the generator's), and the schema `version` stores
+    with its structural mirror (the generator's: `mirror_for(version.parser_family)`).
 
     `max_tokens_retry == max_tokens` on purpose: a first-stage `max_tokens` stop triggers a second paid try
     identical to the first (same 2,000-token cap), never a larger one. A case is thus at most 2 stages x 3
     transport tries = 6 paid HTTP tries, which the workflow's worst-case cost note counts."""
+    name = case.schema_name
+    mirror = mirror_for(version.parser_family) if name == "generator" else _MIRRORS[name]
     return NodeConfig(
         purpose="schema_dry_run",
         model=case.model,
@@ -323,18 +363,17 @@ def node_for(case: DryRunCase) -> NodeConfig:
         max_tokens=DRY_RUN_MAX_TOKENS,
         max_tokens_retry=DRY_RUN_MAX_TOKENS,
         deadline_s=DRY_RUN_DEADLINE_S,
-        schema=SCHEMAS[case.schema_name],
+        schema=WireSchema(json=_stored(version, name), model=mirror),
     )
 
 
-def probe_count_body(
-    gateway: LLMGateway, case: DryRunCase, generator_schema: Mapping[str, Any] | None = None
-) -> dict[str, Any]:
+def probe_count_body(gateway: LLMGateway, case: DryRunCase, version: PromptVersion) -> dict[str, Any]:
     """The probe's `messages.count_tokens` body: the generator case's exact count body (`count_body`), with
-    `probe_schema(generator_schema)` as its `output_config.format.schema`."""
-    body = gateway.count_body(node_for(case), prompt_for(case))
+    `probe_schema` of the version's generator schema as its `output_config.format.schema`."""
+    body = gateway.count_body(node_for(case, version), prompt_for(case))
     output_config = dict(body["output_config"])
-    output_config["format"] = {**output_config["format"], "schema": probe_schema(generator_schema)}
+    probe = probe_schema(_stored(version, "generator"))
+    output_config["format"] = {**output_config["format"], "schema": probe}
     return {**body, "output_config": output_config}
 
 
@@ -500,7 +539,6 @@ class DryRunReport:
 
 _POLICY: Final = q("SELECT payload FROM model_policies WHERE id = :id")
 _EXECUTION: Final = q("SELECT 1 FROM execution_configs WHERE id = :id")
-_VERSION: Final = q("SELECT schemas FROM prompt_schema_versions WHERE id = :id")
 _INSERT_RUN: Final = q(
     "INSERT INTO eval_runs (kind, route, prompt_schema_version_id, model_policy_id, execution_config_id, "
     "status, started_at) VALUES ('schema_dry_run', 'production', :prompt_schema_version_id, "
@@ -576,16 +614,16 @@ class _Run:
     gateway: LLMGateway
     eval_run_id: int
     execution_config_id: int
-    schemas: Mapping[str, Any]
+    version: PromptVersion
     transport: Transport
 
     async def case(self, case: DryRunCase) -> CaseResult:
-        expected = self.schemas.get(case.schema_name)
+        expected = self.version.schemas.get(case.schema_name)
         if not isinstance(expected, Mapping):
             return CaseResult(case, "schema_not_in_version", None if case.probe else False, None, None)
         if case.probe:
             return await self._probe(case, expected)
-        node = node_for(case)
+        node = node_for(case, self.version)
         ctx = CallContext(
             owner=EvalRunOwner(self.eval_run_id),
             purpose_class="nonscoring",
@@ -613,7 +651,7 @@ class _Run:
         checks = {
             "http_200": http_status == 200,
             "end_turn": row is not None and row.stop_reason == "end_turn",
-            "structural": result is not None and _structural(node.schema, result),
+            "structural": result is not None and _structural(node.schema.model, result),
             "schema_bytes_equal": _all_sent_as(sent, expected),
             "enums_allowed": False,
         }
@@ -638,9 +676,7 @@ class _Run:
         token = _SENT.set(sent)
         http_status: int | None
         try:
-            await self.gateway.count_tokens(
-                case.model, probe_count_body(self.gateway, case, generator_schema)
-            )
+            await self.gateway.count_tokens(case.model, probe_count_body(self.gateway, case, self.version))
             outcome, http_status = "accepted", 200
         except anthropic.APIStatusError as exc:
             http_status = exc.status_code
@@ -699,8 +735,10 @@ def metrics(results: Sequence[CaseResult], *, transport: Transport) -> dict[str,
             }
             continue
         entry: dict[str, JSONValue] = {
+            "name": r.case.label,
             "schema": r.case.schema_name,
             "model": r.case.model,
+            "passed": r.passed,
             "outcome": r.outcome,
             "llm_call_id": r.llm_call_id,
             "http_status": r.http_status,
@@ -734,18 +772,20 @@ async def run(
     before the run's row exists."""
     if transport not in TRANSPORTS:
         raise ValueError(f"the dry-run transport must be one of {TRANSPORTS}, not {transport!r}")
+    missing = "the dry-run needs an existing prompt-schema version, model policy and execution config"
     async with engine.begin() as conn:
         policy = (await conn.execute(_POLICY, {"id": model_policy_id})).scalar_one_or_none()
-        schemas = (await conn.execute(_VERSION, {"id": prompt_schema_version_id})).scalar_one_or_none()
+        try:
+            version = await load_prompt_version(conn, prompt_schema_version_id)
+        except LookupError:
+            version = None
         if (
             policy is None
-            or schemas is None
+            or version is None
             or (await conn.execute(_EXECUTION, {"id": execution_config_id})).first() is None
         ):
-            raise ValueError(
-                "the dry-run needs an existing prompt-schema version, model policy and execution config"
-            )
-        planned = cases(policy)
+            raise ValueError(missing)
+        planned = cases(version=version, model_policy=policy)
         eval_run_id = int(
             (
                 await conn.execute(
@@ -760,7 +800,7 @@ async def run(
             ).scalar_one()
         )
     _install_capture(gateway.http_client)
-    dry_run = _Run(engine, gateway, eval_run_id, execution_config_id, schemas, transport)
+    dry_run = _Run(engine, gateway, eval_run_id, execution_config_id, version, transport)
     results: list[CaseResult] = []
     try:
         for case in planned:

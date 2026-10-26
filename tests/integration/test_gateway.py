@@ -121,7 +121,7 @@ async def test_ok_is_one_billed_try_with_every_response_field(engine, fake_llm: 
         1,
         1,
     )
-    bound = text_input_bound(MODEL, gateway_prompt().as_request(GatewayOut))
+    bound = text_input_bound(MODEL, gateway_prompt().as_request(GATEWAY_NODE.schema))
     assert row.input_tokens_bound == bound
     assert row.reserved_usd == worst_case_usd(MODEL, input_tokens_bound=bound, max_tokens=1000)
     assert (result.llm_call_id, result.usage, result.model_served) == (row.call_id, SYNTHETIC_USAGE, MODEL)
@@ -227,7 +227,7 @@ async def test_a_call_resumed_at_the_enlarged_stage_never_sends_the_first_stage(
         1,
         None,
     )
-    bound = text_input_bound(MODEL, gateway_prompt().as_request(GatewayOut))
+    bound = text_input_bound(MODEL, gateway_prompt().as_request(GATEWAY_NODE.schema))
     assert row.reserved_usd == worst_case_usd(MODEL, input_tokens_bound=bound, max_tokens=2000)
     assert (result.llm_call_id, result.cost_usd) == (row.call_id, row.settled_usd)
     assert await no_drift(engine, [row])

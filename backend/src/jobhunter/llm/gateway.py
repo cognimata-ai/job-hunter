@@ -85,6 +85,16 @@ raised after the handler that classified its cause has ended, so neither its `__
 `__context__` refers to a provider error (which holds the request) or to an encoding error (which holds the
 prompt).
 
+**The schema** of a node is a `WireSchema`, two inputs and never one (plan Deviation 40): `json`, the stored
+wire schema the request sends (`output_config.format.schema`: `output_schema`, `count_body` and the byte bound
+read it as it is, and the try binds `anthropic.transform_schema` of it as langchain's json_schema method does,
+which leaves every stored schema unchanged, a fixed point the schema tests pin), and `model`, the structural
+mirror the parsed JSON is validated against (`model.model_validate`, then `storable`).
+`WireSchema.from_model(cls)` (`json = schemas.transformed(cls)`) is the schema of a mirror as M2 sent it; a
+score node takes its version's stored schema and its family's mirror (`prompts.render.score_schema`). A stored
+schema that does not fit its mirror is a structural failure at the first call, the case the live schema
+dry-run catches before such a version is activated.
+
 **The reconciler** `llm_refusal_rate` (heavy, §17.6): more than 5% refusals among the completed calls of the
 last 24 h, with at least 20 of them, opens `llm.refusal_rate` (warn); a rate of 5% or less resolves it (a
 window without calls is 0%), and too few calls at a rate above 5% leave it as it is.
@@ -92,6 +102,7 @@ window without calls is 0%), and too few calls at a rate above 5% leave it as it
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import math
@@ -103,6 +114,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from functools import cached_property
+from operator import itemgetter
 from typing import Any, Final, Literal, cast
 
 import anthropic
@@ -110,8 +122,9 @@ import httpx2
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import Runnable
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.runnables import Runnable, RunnableMap, RunnablePassthrough
+from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -137,6 +150,7 @@ from jobhunter.llm.errors import (
 )
 from jobhunter.llm.fake import PURPOSE_HEADER, canonical_schema_json
 from jobhunter.llm.pricing import CONTEXT_WINDOW, MODELS, SUPPORTED_EFFORTS, Effort, Model, Usage
+from jobhunter.llm.schemas import transformed
 from jobhunter.llm.spend_ledger import CallOutcome, Reservation, SettleFigures, SpendOwner
 from jobhunter.llm.transport import ANTHROPIC_BASE_URL, TIMEOUT
 from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert
@@ -332,7 +346,7 @@ def _chat(
     model: Model,
     effort: Effort,
     max_tokens: int,
-    schema: type[BaseModel] | dict[str, Any],
+    schema: type[BaseModel] | Mapping[str, Any],
     *,
     api_key: SecretStr,
     http_client: httpx2.AsyncClient,
@@ -340,7 +354,14 @@ def _chat(
     receipt: TryReceipt | None = None,
 ) -> StructuredChat:
     """The §10.2 runnable of one try: `ainvoke(messages)` streams once and returns `{"raw", "parsed",
-    "parsing_error"}` (`with_structured_output(…, method="json_schema", include_raw=True)`).
+    "parsing_error"}`, as `with_structured_output(…, method="json_schema", include_raw=True)` does.
+
+    The gateway passes a node's stored wire schema (`WireSchema.json`): it is bound as that method binds a
+    schema (`output_config.format` with `anthropic.transform_schema` of it, which leaves every stored schema
+    unchanged), `parsed` is the JSON object and the gateway validates it against the mirror. The method
+    itself is not used for it, because its tracing metadata (`convert_to_openai_tool`) needs a top-level
+    `title`, which a wire schema never has (candidate C is sent without one). A spike may pass a mirror
+    class, for which langchain's method parses into the class.
 
     The request carries `output_config.format` (`anthropic.transform_schema(schema)`) and
     `output_config.effort`, `stream: true` and exactly `max_tokens`; no tools, `tool_choice`, sampling
@@ -350,13 +371,51 @@ def _chat(
     llm = _chat_model(
         model, effort, max_tokens, api_key=api_key, http_client=http_client, purpose=purpose, receipt=receipt
     )
-    # `include_raw=True`: the output is always the `{"raw", "parsed", "parsing_error"}` dict.
-    return cast(StructuredChat, llm.with_structured_output(schema, method="json_schema", include_raw=True))
+    if isinstance(schema, type):
+        # `include_raw=True`: the output is always the `{"raw", "parsed", "parsing_error"}` dict.
+        return cast(
+            StructuredChat, llm.with_structured_output(schema, method="json_schema", include_raw=True)
+        )
+    # A copy, so no caller's stored schema is ever shared with the request.
+    sent = anthropic.transform_schema(copy.deepcopy(dict(schema)))
+    bound = llm.bind(output_config={"format": {"type": "json_schema", "schema": sent}})
+    parse = RunnablePassthrough.assign(
+        parsed=itemgetter("raw") | JsonOutputParser(), parsing_error=lambda _: None
+    )
+    unparsed = RunnablePassthrough.assign(parsed=lambda _: None)
+    chain = RunnableMap(raw=bound) | parse.with_fallbacks([unparsed], exception_key="parsing_error")
+    return cast(StructuredChat, chain)
 
 
-def output_schema(schema: type[BaseModel]) -> dict[str, Any]:
-    """The `output_config.format.schema` a request of `schema` sends (G2)."""
-    return anthropic.transform_schema(schema)
+@dataclass(frozen=True)
+class WireSchema:
+    """A node's schema (module docstring): `json`, the stored wire schema a request sends, and `model`, the
+    structural mirror its parsed output is validated against."""
+
+    json: Mapping[str, JSONValue]
+    model: type[BaseModel]
+
+    @classmethod
+    def from_model(cls, model: type[BaseModel]) -> "WireSchema":
+        """The wire schema of the mirror `model` as M2 sends it: `schemas.transformed(model)`, parsed as
+        `model` (the profile and queries nodes, version 1, the tests' own schemas)."""
+        return cls(json=transformed(model), model=model)
+
+
+def output_schema(schema: WireSchema) -> dict[str, Any]:
+    """The `output_config.format.schema` a request of `schema` sends (G2): its stored `json`, as it is (a
+    copy)."""
+    return copy.deepcopy(dict(schema.json))
+
+
+def _structural(model: type[BaseModel], parsed: object) -> BaseModel | None:
+    """`parsed` validated against the structural mirror `model`, or `None`. The validation error quotes the
+    output, so it is dropped here and never raised or kept."""
+    try:
+        return model.model_validate(parsed)
+    except ValidationError:
+        pass
+    return None
 
 
 # ---- nodes and prompts -------------------------------------------------------------------------------------
@@ -365,7 +424,8 @@ def output_schema(schema: type[BaseModel]) -> dict[str, Any]:
 @dataclass(frozen=True)
 class NodeConfig:
     """One node's call: model and effort (the model policy), the two `max_tokens` stages and the deadline (the
-    execution config), and its structured-output schema (§10.3)."""
+    execution config), and its structured-output schema (§10.3): the wire schema and the mirror
+    (`WireSchema`)."""
 
     purpose: NodePurpose
     model: Model
@@ -373,7 +433,7 @@ class NodeConfig:
     max_tokens: int
     max_tokens_retry: int
     deadline_s: int
-    schema: type[BaseModel]
+    schema: WireSchema
 
 
 def node_config(
@@ -381,7 +441,7 @@ def node_config(
     *,
     model_policy: Mapping[str, JSONValue],
     execution: Mapping[str, JSONValue],
-    schema: type[BaseModel],
+    schema: WireSchema,
 ) -> NodeConfig:
     """The node of `purpose` from the stored payloads: `nodes.<purpose>` of the model policy (its model and
     effort; a missing or unsupported effort is a `ValueError`, G5) and `<purpose>` of the execution config."""
@@ -415,7 +475,7 @@ _ACTIVE_LLM_CONFIG: Final = q(
 
 
 async def active_node_config(
-    engine: AsyncEngine, purpose: NodePurpose, schema: type[BaseModel]
+    engine: AsyncEngine, purpose: NodePurpose, schema: WireSchema
 ) -> tuple[NodeConfig, int]:
     """The node of `purpose` from the active model policy and execution config, read without a lock, and the
     execution config's id (the profile graphs' LLM nodes, Tasks 13 and 20)."""
@@ -488,12 +548,12 @@ class RenderedPrompt:
             return None
         return hashlib.sha256(_canonical([b.text for b in self.system[: marked[-1] + 1]])).digest()
 
-    def as_request(self, schema: type[BaseModel]) -> RenderedRequest:
+    def as_request(self, schema: WireSchema) -> RenderedRequest:
         """Every byte-bounded component: the system texts, the message texts and the sent schema."""
         return RenderedRequest(
             system=tuple(block.text for block in self.system),
             messages=tuple(_message_text(m) for m in self.messages),
-            schema_json=canonical_schema_json(output_schema(schema)),
+            schema_json=canonical_schema_json(schema.json),
         )
 
 
@@ -766,7 +826,7 @@ class LLMGateway:
                     node.model,
                     node.effort,
                     max_tokens,
-                    node.schema,
+                    node.schema.json,
                     api_key=api_key,
                     http_client=self._http,
                     purpose=node.purpose,
@@ -968,7 +1028,7 @@ class LLMGateway:
         if not isinstance(served, str):
             return await self._lost(t, receipt)
         usage = usage_of(cast(Mapping[str, Any], raw.usage_metadata))
-        parsed = out.get("parsed")
+        output: BaseModel | None = None  # the validated output, exactly when the try succeeded
         details = meta.get("stop_details")  # present only when not null (V13)
         category = details.get("category") if isinstance(details, dict) else None
         if not isinstance(category, str) or not category:
@@ -981,8 +1041,13 @@ class LLMGateway:
         elif stop_reason == "refusal":
             code = REFUSED
         elif stop_reason == "end_turn":
-            ok = isinstance(parsed, t.node.schema) and out.get("parsing_error") is None and storable(parsed)
-            code = None if ok else INVALID_OUTPUT
+            parsed = (
+                None
+                if out.get("parsing_error") is not None
+                else _structural(t.node.schema.model, out.get("parsed"))
+            )
+            output = parsed if parsed is not None and storable(parsed) else None
+            code = None if output is not None else INVALID_OUTPUT
         else:
             code = UNEXPECTED_STOP_REASON
         call = CallOutcome(
@@ -993,7 +1058,7 @@ class LLMGateway:
             stop_reason=stop_reason,
             refusal_category=category if code == REFUSED else None,
             provider_request_id=receipt.request_id,
-            output_json=cast(BaseModel, parsed).model_dump(mode="json") if code is None else None,
+            output_json=None if output is None else output.model_dump(mode="json"),
             first_event_at=receipt.responded_at,
         )
         async with self._engine.begin() as conn:
@@ -1021,17 +1086,17 @@ class LLMGateway:
                 )
         self._committed(t, receipt, "billed", figures, code)
         await self._observe_cache(t, served, prefix, usage)
+        if output is not None:
+            result = GatewayResult(
+                parsed=output,
+                llm_call_id=t.res.llm_call_id,
+                usage=usage,
+                model_served=served,
+                stop_reason=stop_reason,
+                cost_usd=counted + figures.settled_usd,
+            )
+            return _Next("return", figures.settled_usd, result=result)
         match code:
-            case None:
-                result = GatewayResult(
-                    parsed=cast(BaseModel, parsed),
-                    llm_call_id=t.res.llm_call_id,
-                    usage=usage,
-                    model_served=served,
-                    stop_reason=stop_reason,
-                    cost_usd=counted + figures.settled_usd,
-                )
-                return _Next("return", figures.settled_usd, result=result)
             case "max_tokens_first_stage":
                 return _Next("enlarge", figures.settled_usd)
             case "max_tokens":

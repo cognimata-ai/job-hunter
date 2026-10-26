@@ -5,12 +5,12 @@ policy, execution config, evaluation policy) are immutable and deduplicated by t
 JSON of the payload as stored (§13.2), so a second `seed_defaults` finds the rows of the first.
 
 The `sources` rows (`SOURCES`) and the `default` instance of each non-ATS source (`DEFAULT_INSTANCES`) are
-inserted when absent and never updated. So are rubric v1 and v2 (each found by its version) and the
-prompt-schema version of this code's templates and schemas (found by its hash), §19.3 step 6: no migration
-inserts them (§19.3 step 2; plan Deviation 32). `active_config` points at the shipped rubric (v2, M3 R13) and
-that prompt-schema version: a fresh row from its insert, and a NULL pointer from the update after it. A
-pointer already set is never changed, so an install M2 seeded keeps rubric v1 until Settings activates v2
-(§13.3). M3's first migration restored the two columns' NOT NULL (expand/contract).
+inserted when absent and never updated. So are rubric v1 and v2 (each found by its version) and prompt-schema
+versions 1 and 2 (each found by its hash, with its parser family), §19.3 step 6: no migration inserts them
+(§19.3 step 2; plan Deviation 32). `active_config` points at the shipped rubric (v2, M3 R13) and prompt-schema
+version 2: a fresh row from its insert, and a NULL pointer from the update after it. A pointer already set is
+never changed, so an install M2 seeded keeps rubric v1 and prompt-schema version 1 until Settings activates
+the new ones (§13.3). M3's first migration restored the two columns' NOT NULL (expand/contract).
 
 The transition matrix is different: it is derived from code, so `sync_transition_matrix` replaces its rows on
 every run instead of freezing them.
@@ -229,15 +229,18 @@ async def ensure_evaluation_policy(conn: AsyncConnection, payload: dict[str, JSO
 
 
 async def _shipped_rubric_and_prompt_schema(conn: AsyncConnection) -> tuple[int, int]:
-    """The ids of the shipped rubric (`RUBRIC_SHIPPED`, v2) and of the prompt-schema version this code
-    renders. Rubric v1 and v2 are each inserted when absent, found by their version; the prompt-schema version
-    by its hash.
+    """The ids of the shipped rubric (`RUBRIC_SHIPPED`, v2) and of the shipped prompt-schema version 2. Rubric
+    v1 and v2 are each inserted when absent, found by their version; prompt-schema versions 1 (M2's) and 2
+    (M3's) each by its hash, with the parser family that reads its generator outputs (`generator_v1`,
+    `generator_v2_items`): the seed is the one writer of version rows and of the family, a stored constant
+    (plan Deviation 40). An install M2 left keeps its version 1 row as it is (its family is the column's
+    default, `generator_v1`).
 
     A release whose templates or schemas differ ships a new prompt-schema version this way; it never activates
     itself (§13.3). Imported here, not at the top: the rubric loader and the renderer import this module's
     `content_hash` and `canonical_json`.
     """
-    from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
+    from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1, prompt_schema_v2
     from jobhunter.scoring.rubric import RUBRIC_SHIPPED, RUBRIC_V1, RUBRIC_V2, load_rubric
 
     rubric_ids: dict[str, int] = {}
@@ -259,20 +262,27 @@ async def _shipped_rubric_and_prompt_schema(conn: AsyncConnection) -> tuple[int,
                 "anchors": dict(rubric.anchors),
             },
         )
-    templates, schemas = prompt_schema_v1()
-    digest = prompt_schema_hash(templates, schemas)
-    prompt_schema_id = await ensure_id(
-        conn,
-        q("SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = :hash"),
-        q(
-            "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
-            "VALUES (:hash, :templates, :schemas) ON CONFLICT DO NOTHING RETURNING id",
-            jsonb=["templates", "schemas"],
-        ),
-        {"hash": digest},
-        {"hash": digest, "templates": templates, "schemas": schemas},
-    )
-    return rubric_ids[RUBRIC_SHIPPED], prompt_schema_id
+    prompt_schema_ids: list[int] = []
+    for (templates, schemas), family in (
+        (prompt_schema_v1(), "generator_v1"),
+        (prompt_schema_v2(), "generator_v2_items"),
+    ):
+        digest = prompt_schema_hash(templates, schemas)
+        prompt_schema_ids.append(
+            await ensure_id(
+                conn,
+                q("SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = :hash"),
+                q(
+                    "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas, "
+                    "parser_family) VALUES (:hash, :templates, :schemas, :family) "
+                    "ON CONFLICT DO NOTHING RETURNING id",
+                    jsonb=["templates", "schemas"],
+                ),
+                {"hash": digest},
+                {"hash": digest, "templates": templates, "schemas": schemas, "family": family},
+            )
+        )
+    return rubric_ids[RUBRIC_SHIPPED], prompt_schema_ids[-1]
 
 
 _STORED_SETTINGS_V1 = q("SELECT id, payload FROM settings_versions WHERE version_no = 1")
@@ -336,11 +346,12 @@ async def sync_transition_matrix(conn: AsyncConnection) -> int:
 
 
 async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
-    """Write the default settings chain, rubric v1 and v2 and the prompt-schema version, the three single
+    """Write the default settings chain, rubric v1 and v2 and prompt-schema versions 1 and 2, the three single
     rows, `sources` and the default source instances.
 
-    Idempotent and never an overwrite: a NULL rubric or prompt-schema pointer is set (the rubric one to the
-    shipped v2), a set one is never changed (a shipped version activates through Settings only, §13.3).
+    Idempotent and never an overwrite: a NULL rubric or prompt-schema pointer is set (to the shipped rubric v2
+    and prompt-schema version 2), a set one is never changed (a shipped version activates through Settings
+    only, §13.3).
     Settings version 1 is frozen once stored: the derived rows (scope, model policy, execution config,
     evaluation policy) and the version are created from the packaged defaults only when version 1 does not
     exist yet. Afterwards a release that edits `settings_v1.json`
@@ -363,7 +374,7 @@ async def seed_defaults(conn: AsyncConnection, *, now: datetime) -> None:
     settings = get_object(stored["payload"], "")
 
     # The active pointers are those of the settings version they activate, so the two cannot disagree, plus
-    # the shipped rubric (v2) and the prompt-schema version. The profile and tuple pointers stay NULL until a
+    # the shipped rubric (v2) and prompt-schema version (2). The profile and tuple pointers stay NULL until a
     # profile is confirmed (§12.6).
     rubric_id, prompt_schema_id = await _shipped_rubric_and_prompt_schema(conn)
     await conn.execute(

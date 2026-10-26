@@ -24,7 +24,7 @@ from jobhunter.llm.prompts.render import (
     propose_queries_prompt,
     template_version,
 )
-from jobhunter.llm.schemas import SCHEMAS, transformed
+from jobhunter.llm.schemas import SCHEMAS_V1, transformed
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from langchain_core.messages import HumanMessage
 
@@ -140,7 +140,7 @@ def test_prompt_schema_v1_holds_the_two_templates_and_the_four_transformed_schem
         "profile_extract": template("profile_extract"),
         "propose_queries": template("propose_queries"),
     }
-    assert schemas == {name: transformed(model) for name, model in SCHEMAS.items()}
+    assert schemas == {name: transformed(model) for name, model in SCHEMAS_V1.items()}
     assert set(schemas) == {"generator", "critic", "profile", "queries"}
 
 
@@ -192,6 +192,6 @@ def test_the_queries_template_states_the_proposal_rules() -> None:
 
 def test_the_templates_name_no_real_person() -> None:
     """A template is code, not data: no person, no contact value, no URL."""
-    for name in render.TEMPLATE_NAMES:
+    for name in render.TEMPLATE_NAMES_V2:
         text = template(name)
         assert not re.search(r"[\w.+-]+@[\w-]+\.\w+|https?://|www\.|\+\d{2}\s?\d", text), name

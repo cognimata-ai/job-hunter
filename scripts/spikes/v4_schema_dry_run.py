@@ -4,11 +4,12 @@ recorder.
     uv run python scripts/spikes/record_anthropic.py --spike v4 --dry-run|--live|--commit-recorded
     uv run python scripts/spikes/v4_schema_dry_run.py --record-probe-count
 
-`calls()` gives the gating cases `llm.schema_dry_run.cases` makes of the seeded model policy
-(`settings_v1.json`): the generator schema on Sonnet, then the critic, profile and queries schemas on Opus.
-Each is the request the gateway sends for that case (`schema_dry_run.prompt_for` and `node_for`): the
-dry-run's static system block and synthetic user turn, effort `low`, `max_tokens` 2,000, purpose
-`schema_dry_run`, and the mirror as its schema, as the gateway passes it.
+`calls()` gives the gating cases `llm.schema_dry_run.cases` makes of prompt-schema version 1 (built offline:
+`V1`; M2's version) and the seeded model policy (`settings_v1.json`): the generator schema on Sonnet, then the
+critic, profile and queries schemas on Opus. Each is the request the gateway sends for that case
+(`schema_dry_run.prompt_for` and `node_for`): the dry-run's static system block and synthetic user turn,
+effort `low`, `max_tokens` 2,000, purpose `schema_dry_run`, and the version's stored wire schema, as the
+gateway passes it.
 
 `RECORD_EVERY_ANSWER`: the recorder commits each case's live answer, a stream or an error response, as the
 fake's answer and goes on to the next case (controller rulings R7-2, R7-3), so the dry-run on the fake replays
@@ -39,7 +40,8 @@ from typing import Any, Final
 import anthropic
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import fake, schema_dry_run
-from jobhunter.llm.schemas import SCHEMAS, transformed
+from jobhunter.llm.prompts import render
+from jobhunter.llm.schemas import SCHEMAS_V1, transformed
 from jobhunter.types import get_object
 
 RECORD_EVERY_ANSWER: Final = True
@@ -52,17 +54,32 @@ def _policy() -> dict[str, Any]:
     return get_object(load_settings_v1(), "scoring.model_policy")
 
 
+def _v1() -> render.PromptVersion:
+    """Prompt-schema version 1 as the M2 seed stored it (the id is never sent)."""
+    templates, schemas = render.prompt_schema_v1()
+    return render.PromptVersion(
+        id=1,
+        prompt_schema_hash=render.prompt_schema_hash(templates, schemas),
+        templates={name: str(text) for name, text in templates.items()},
+        schemas=schemas,
+        parser_family="generator_v1",
+    )
+
+
+V1: Final = _v1()
+
+
 def _file_name(label: str) -> str:
     return label.replace("/", "-").replace(":", "-")
 
 
 def calls() -> list[dict[str, Any]]:
     planned: list[dict[str, Any]] = []
-    for case in schema_dry_run.cases(_policy()):
+    for case in schema_dry_run.cases(version=V1, model_policy=_policy()):
         if case.probe:  # answered by the free counting endpoint, never as a message (R7-2)
             continue
         prompt = schema_dry_run.prompt_for(case)
-        node = schema_dry_run.node_for(case)
+        node = schema_dry_run.node_for(case, V1)
         (message,) = prompt.messages
         planned.append(
             {
@@ -73,7 +90,7 @@ def calls() -> list[dict[str, Any]]:
                 "max_tokens": node.max_tokens,
                 "system": [block.text for block in prompt.system],
                 "user": message.content,
-                "schema": node.schema,  # the mirror, as the gateway passes it: no title is added
+                "schema": dict(node.schema.json),  # the stored wire schema, as the gateway passes it
             }
         )
     return planned
@@ -84,8 +101,8 @@ def _canonical(schema: Any) -> str:
 
 
 def _schema_name(sent: Any) -> str | None:
-    """Which of `SCHEMAS` a request sent."""
-    return next((n for n, m in SCHEMAS.items() if _canonical(sent) == _canonical(transformed(m))), None)
+    """Which of `SCHEMAS_V1` a request sent."""
+    return next((n for n, m in SCHEMAS_V1.items() if _canonical(sent) == _canonical(transformed(m))), None)
 
 
 def check(observation: dict[str, Any]) -> dict[str, Any]:
@@ -107,7 +124,7 @@ def check(observation: dict[str, Any]) -> dict[str, Any]:
         output = json.loads(fake.text_of(events))
     except ValueError:
         output = None
-    violations = schema_dry_run.schema_violations(transformed(SCHEMAS[name]), output) if name else ["$"]
+    violations = schema_dry_run.schema_violations(transformed(SCHEMAS_V1[name]), output) if name else ["$"]
     checks = {
         "end_turn": meta.get("stop_reason") == "end_turn",
         "model_served": meta.get("model_name") == observation["requested_model"],
@@ -142,9 +159,9 @@ async def record_probe_count(key: str, *, fixtures: Path, raw: Path) -> str:
     """Send the probe's count body to `messages.count_tokens` and commit its answer for the fake; the line
     printed names the status and the API's message only."""
     recorder = _recorder()
-    case = next(c for c in schema_dry_run.cases(_policy()) if c.probe)
+    case = next(c for c in schema_dry_run.cases(version=V1, model_policy=_policy()) if c.probe)
     async with recorder.counting_gateway(key) as gateway:
-        body = schema_dry_run.probe_count_body(gateway, case)
+        body = schema_dry_run.probe_count_body(gateway, case, V1)
         try:
             counted = await gateway.count_tokens(case.model, body)
             status, answer = 200, {"input_tokens": counted}

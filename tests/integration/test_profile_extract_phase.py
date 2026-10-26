@@ -21,7 +21,7 @@ from jobhunter.db.transitions import transition
 from jobhunter.graphs.profile.graph import thread_id
 from jobhunter.llm import bounds, fake
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS
-from jobhunter.llm.gateway import NodeConfig
+from jobhunter.llm.gateway import NodeConfig, WireSchema
 from jobhunter.llm.pricing import CONTEXT_WINDOW, Usage, settled_usd, worst_case_usd
 from jobhunter.llm.prompts.render import extract_profile_native_pdf_prompt
 from jobhunter.llm.schemas.profile import ProfileOut
@@ -66,7 +66,7 @@ NODE = NodeConfig(
     max_tokens=16000,
     max_tokens_retry=32000,
     deadline_s=900,
-    schema=ProfileOut,
+    schema=WireSchema.from_model(ProfileOut),
 )
 
 

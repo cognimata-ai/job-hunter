@@ -1,6 +1,7 @@
 """`schema-dry-run` start refusals (spec §10.11; plan Task 7, review fix 7): which configurations the command
 refuses before anything runs, prod without `--live` among them (the fake transport is never used in prod).
-And the manual workflow's cost note (review fix 5), recomputed from pricing."""
+And the manual workflow's cost note (review fix 5), recomputed from pricing for prompt-schema version 2, the
+version a fresh database (the workflow's) runs on (M3 Task 4)."""
 
 import argparse
 import dataclasses
@@ -17,6 +18,8 @@ from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import pricing, schema_dry_run
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS, text_input_bound
 from jobhunter.types import get_object
+
+from tests.support.llm import v2_version
 
 PROD_WITHOUT_LIVE = "without --live the dry-run runs on the fake transport, which prod refuses"
 WORKFLOW = Path(__file__).parents[2] / ".github/workflows/schema-dry-run-manual.yml"
@@ -112,22 +115,24 @@ def test_the_workflow_states_the_worst_case_from_pricing() -> None:
     # both max_tokens stages are DRY_RUN_MAX_TOKENS: the run's worst case is 6 x the sum over its cases.
     note = " ".join(line.lstrip("# ") for line in WORKFLOW.read_text("utf-8").splitlines()[:20])
     policy = get_object(load_settings_v1(), "scoring.model_policy")
+    version = v2_version()
     per_try: list[Decimal] = []
-    for case in schema_dry_run.cases(policy):
+    for case in schema_dry_run.cases(version=version, model_policy=policy):
         if case.probe:
             continue  # the free counting endpoint
-        node = schema_dry_run.node_for(case)
+        node = schema_dry_run.node_for(case, version)
         assert node.max_tokens_retry == node.max_tokens == schema_dry_run.DRY_RUN_MAX_TOKENS
         bound = text_input_bound(case.model, schema_dry_run.prompt_for(case).as_request(node.schema))
         per_try.append(
             pricing.worst_case_usd(case.model, input_tokens_bound=bound, max_tokens=node.max_tokens)
         )
     assert len(per_try) == 4
-    assert {PROMPT_OVERHEAD_TOKENS[c.model] for c in schema_dry_run.cases(policy)} == {2_640}
-    assert "PROMPT_OVERHEAD_TOKENS = 2,640" in note
+    models = {c.model for c in schema_dry_run.cases(version=version, model_policy=policy)}
+    assert {PROMPT_OVERHEAD_TOKENS[model] for model in models} == {1_878}
+    assert "PROMPT_OVERHEAD_TOKENS = 1,878" in note
     for usd in per_try:
         assert f"${usd}" in note
     assert f"${sum(per_try)} for one try" in note
-    assert sum(per_try) * TRIES_PER_CASE == Decimal("1.522200")
-    assert "The worst case is $1.522200" in note
+    assert sum(per_try) * TRIES_PER_CASE == Decimal("1.383570")
+    assert "The worst case is $1.383570" in note
     assert "at most 6 paid tries" in note

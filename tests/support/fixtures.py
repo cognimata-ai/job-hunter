@@ -20,7 +20,7 @@ from jobhunter.config import AppConfig, Role
 from jobhunter.db.migrate import run_migrate
 from jobhunter.db.seed import DEFAULT_INSTANCES_SQL, anchor_utc_for, latest_slot_at_or_before
 from jobhunter.db.session import make_engine
-from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
+from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v2
 from jobhunter.observability import redact
 from jobhunter.observability.logging import configure_logging
 from jobhunter.types import get_int, get_str
@@ -203,27 +203,33 @@ ON CONFLICT (id) DO UPDATE SET
   last_evaluated_slot = EXCLUDED.last_evaluated_slot, settings_version_id = EXCLUDED.settings_version_id,
   updated_at = now()"""
 # Every column of the row as `seed_defaults` wrote it: the four pointers settings version 1 holds, the shipped
-# rubric v2 (M3 Task 3) and the seeded prompt-schema version (M2 Task 6; `_SEEDED_ROWS` fails the reset when
-# one is missing), and the pointers a profile or a scope apply sets left NULL (the pending scope, the profile
-# and the tuple).
+# rubric v2 (M3 Task 3) and the shipped prompt-schema version 2 (M3 Task 4; `_SEEDED_ROWS` fails the reset
+# when one is missing), and the pointers a profile or a scope apply sets left NULL (the pending scope, the
+# profile and the tuple).
 _ACTIVE_CONFIG_RESET: Final = """\
 UPDATE active_config SET settings_version_id = v.id, scope_version_id = v.scope_version_id,
   model_policy_id = v.model_policy_id, execution_config_id = v.execution_config_id,
   evaluation_policy_id = v.evaluation_policy_id, pending_scope_version_id = NULL, profile_version_id = NULL,
   rubric_version_id = (SELECT r.id FROM rubric_versions r WHERE r.version = 'v2'),
-  prompt_schema_version_id = (SELECT p.id FROM prompt_schema_versions p
-    WHERE p.prompt_schema_hash = %(prompt_schema_hash)s),
+  prompt_schema_version_id = (SELECT p.id FROM prompt_schema_versions p WHERE p.prompt_schema_hash = %(v2)s),
   llm_tuple_id = NULL, updated_at = now()
   FROM settings_versions v WHERE v.version_no = 1"""
-# The hash of the prompt-schema version `seed_defaults` points at: this code's templates and schemas.
-_SEEDED_PROMPT_SCHEMA_HASH: Final = prompt_schema_hash(*prompt_schema_v1())
+# The two shipped prompt-schema versions the seed inserts, found by their hashes. Version 1's is a pinned
+# literal, the hash the M2 seed wrote (`prompt_schema_v1()` must keep giving it:
+# `test_v1_hash_is_the_m2_literal_and_v2_keeps_the_m2_templates`); version 2's is this code's.
+_SEEDED_PROMPT_SCHEMA_HASH_V1: Final = bytes.fromhex(
+    "cf66004fe81e954d08848d6b6e7e3de0a8c7d1dab3ca6a9c7f4efbaa527e801c"
+)
+_SEEDED_PROMPT_SCHEMA_HASH_V2: Final = prompt_schema_hash(*prompt_schema_v2())
+_SEEDED_HASHES: Final = {"v1": _SEEDED_PROMPT_SCHEMA_HASH_V1, "v2": _SEEDED_PROMPT_SCHEMA_HASH_V2}
 # The rows `_ACTIVE_CONFIG_RESET` needs, checked before it runs: without the `active_config` row it would
 # change nothing, and without a seeded rubric or prompt-schema row it would fail on the NOT NULL of that
 # pointer (migration 0008) with an error that does not name the cause.
 _SEEDED_ROWS: Final = (
     "SELECT EXISTS (SELECT 1 FROM active_config WHERE id = 1) "
     "AND EXISTS (SELECT 1 FROM rubric_versions WHERE version = 'v2') "
-    "AND EXISTS (SELECT 1 FROM prompt_schema_versions WHERE prompt_schema_hash = %(prompt_schema_hash)s)"
+    "AND EXISTS (SELECT 1 FROM prompt_schema_versions WHERE prompt_schema_hash = %(v1)s) "
+    "AND EXISTS (SELECT 1 FROM prompt_schema_versions WHERE prompt_schema_hash = %(v2)s)"
 )
 # The M3 tables, and the M1 tables they reference that `_TRUNCATE` cannot name (above), emptied with DELETE.
 # Run after `_TRUNCATE` (it emptied every other table that references `jobs`) and before
@@ -288,7 +294,8 @@ _M2_DELETE: Final = (
 # and `active_config` name them, and the others were made by a settings save or by a test. They use NOT
 # EXISTS, the form that stays right when a pointer is NULL (`NOT IN` over a NULL deletes no row at all). The
 # seed inserts rubric v1 and v2 and points at v2 only, so the rubric delete also keeps both shipped versions
-# by name: a reset leaves what `migrate` wrote (M3 Task 3).
+# by name: a reset leaves what `migrate` wrote (M3 Task 3). It inserts prompt-schema versions 1 and 2 and
+# points at version 2, so the prompt-schema delete keeps both shipped rows by their hashes (M3 Task 4).
 _CONFIGURATION_RESET: Final = (
     "DELETE FROM settings_versions WHERE version_no > 1",
     "DELETE FROM scope_versions WHERE id NOT IN (SELECT scope_version_id FROM settings_versions)",
@@ -304,7 +311,7 @@ _CONFIGURATION_RESET: Final = (
     "DELETE FROM rubric_versions r WHERE NOT EXISTS (SELECT 1 FROM active_config a "
     "WHERE a.rubric_version_id = r.id) AND r.version NOT IN ('v1', 'v2')",
     "DELETE FROM prompt_schema_versions p WHERE NOT EXISTS (SELECT 1 FROM active_config a "
-    "WHERE a.prompt_schema_version_id = p.id)",
+    "WHERE a.prompt_schema_version_id = p.id) AND p.prompt_schema_hash NOT IN (%(v1)s, %(v2)s)",
     "UPDATE ranking_state SET generation = 0, updated_at = now()",
 )
 
@@ -319,12 +326,13 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
     In this order: the TRUNCATE; the `default` source instances inserted again with the seed's own statement
     (their ids change with every reset, so tests look them up by `(source_id, instance_key)`); the M3 tables
     and the M1 tables they reference deleted (`_M3_DELETE`); `active_config` as the seed wrote it
-    (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, the shipped rubric v2 and the seeded
-    prompt-schema version, and the profile, tuple and pending-scope pointers NULL); the M2 tables deleted
+    (`_ACTIVE_CONFIG_RESET`: the pointers of settings version 1, the shipped rubric v2 and the shipped
+    prompt-schema version 2, and the profile, tuple and pending-scope pointers NULL); the M2 tables deleted
     (`_M2_DELETE`); the schedule reset; then the settings versions after 1, the scope versions no settings
     version uses, the model policies, execution configs and evaluation policies that no settings version or
-    `active_config` names, the rubric rows other than the shipped v1 and v2 and the prompt-schema rows
-    `active_config` does not name deleted, and the ranking generation set to 0.
+    `active_config` names, the rubric rows other than the shipped v1 and v2 and the prompt-schema rows other
+    than the two shipped versions that `active_config` does not name deleted, and the ranking generation set
+    to 0.
 
     The schedule keeps the interval and the anchor that `migrate` seeded: both come from the stored settings
     version 1 (the anchor on the day that version was created, as the seed computes it), not from constants
@@ -338,7 +346,7 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         conn.execute(DEFAULT_INSTANCES_SQL)
         for statement in _M3_DELETE:
             conn.execute(statement)
-        seeded = {"prompt_schema_hash": _SEEDED_PROMPT_SCHEMA_HASH}
+        seeded = _SEEDED_HASHES
         if conn.execute(_SEEDED_ROWS, seeded).fetchone() != (True,):
             raise LookupError(
                 "active_config or a seeded rubric or prompt-schema row is missing: `migrated` seeds them"
@@ -360,7 +368,7 @@ def reset_database(server: PgServer, *, lock_timeout: str = LOCK_TIMEOUT) -> Non
         slot = latest_slot_at_or_before(anchor, interval_s, db_now[0])
         conn.execute(_SCHEDULE_RESET, {"anchor": anchor, "interval_s": interval_s, "slot": slot})
         for statement in _CONFIGURATION_RESET:
-            conn.execute(statement)
+            conn.execute(statement, seeded if "%(" in statement else None)
 
 
 @pytest.fixture

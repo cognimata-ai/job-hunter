@@ -1,8 +1,10 @@
-"""The `schema-dry-run [--live]` command (spec §10.11; plan Task 7).
+"""The `schema-dry-run [--live] [--version <id>]` command (spec §10.11; M2 plan Task 7, M3 Task 4).
 
 `cli.main` imports this module only when the command runs. It starts like the worker (the worker-role config
 and its startup assertions), reads the active prompt-schema version, model policy and execution config from
-`active_config`, and runs `llm.schema_dry_run.run` on a gateway of its own:
+`active_config`, and runs `llm.schema_dry_run.run` on a gateway of its own, for the prompt-schema version
+`--version` names (by default the active one), so an upgraded install can dry-run version 2 before it is
+active:
 - without `--live` on the recorded-SSE fake (`JOBHUNTER_FAKE_LLM_DIR`, by default the committed recordings),
   which prod refuses, as it refuses `JOBHUNTER_FAKE_LLM`;
 - with `--live` on the Anthropic API, which needs the worker's `anthropic_key` secret (not blank) and refuses
@@ -75,8 +77,11 @@ def case_table(report: DryRunReport, *, transport: str) -> list[str]:
     return lines
 
 
-async def _dry_run(cfg: AppConfig, *, transport: schema_dry_run.Transport) -> DryRunReport:
-    """The run on `cfg`'s client, recorded with `transport`, which must be the one `cfg` sends to."""
+async def _dry_run(
+    cfg: AppConfig, *, transport: schema_dry_run.Transport, version_id: int | None = None
+) -> DryRunReport:
+    """The run on `cfg`'s client, recorded with `transport`, which must be the one `cfg` sends to, of the
+    prompt-schema version `version_id` (the active one when `None`)."""
     if (transport == "fake") != cfg.fake_llm:
         raise ValueError(f"transport {transport!r} does not match the config's fake_llm={cfg.fake_llm}")
     engine = make_engine(cfg, pool_size=2)
@@ -88,7 +93,9 @@ async def _dry_run(cfg: AppConfig, *, transport: schema_dry_run.Transport) -> Dr
             return await schema_dry_run.run(
                 engine,
                 gateway,
-                prompt_schema_version_id=int(ids.prompt_schema_version_id),
+                prompt_schema_version_id=int(ids.prompt_schema_version_id)
+                if version_id is None
+                else version_id,
                 model_policy_id=int(ids.model_policy_id),
                 execution_config_id=int(ids.execution_config_id),
                 transport=transport,
@@ -99,8 +106,9 @@ async def _dry_run(cfg: AppConfig, *, transport: schema_dry_run.Transport) -> Dr
 
 
 def run_schema_dry_run(args: argparse.Namespace) -> int:
-    """`schema-dry-run [--live]`; the exit status is the outcome (module docstring). An error prints its class
-    only: SQLAlchemy puts bound parameters into its messages, and an SDK error holds its request."""
+    """`schema-dry-run [--live] [--version <id>]`; the exit status is the outcome (module docstring). An error
+    prints its class only: SQLAlchemy puts bound parameters into its messages, and an SDK error holds its
+    request. A version that does not exist ends it with a `ValueError` before anything is sent."""
     cfg = startup_or_exit("worker")
     configure_logging(cfg.log_level, stream=sys.stderr)  # stdout carries the table only
     live = bool(args.live)
@@ -111,7 +119,7 @@ def run_schema_dry_run(args: argparse.Namespace) -> int:
     if not live:
         cfg = dataclasses.replace(cfg, fake_llm=True)
     try:
-        report = asyncio.run(_dry_run(cfg, transport=transport))
+        report = asyncio.run(_dry_run(cfg, transport=transport, version_id=args.version))
     except SQLAlchemyError as exc:
         print(f"schema-dry-run: database error ({type(exc).__name__})", file=sys.stderr)
         return NOT_PASSED

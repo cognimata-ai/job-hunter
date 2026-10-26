@@ -11,6 +11,13 @@ measurements (`docs/spikes/V19.md`):
   counts, each counted on its own), and never below `PROMPT_OVERHEAD_FLOOR`;
 - `NATIVE_PDF_ENABLED` is whether §12.7's native-PDF path may run: V19's one native-PDF extraction used at
   most 1.25 x its `count_tokens`. While it is false, no native-PDF request is admitted (plan Deviation 9).
+
+V19 first measured 2,640 tokens (2 x 1,320, the framing of a request with the §11.5 generator schema, which
+the API rejects). M3 Task 4 re-counted on 2026-10-26 (`--count`, `--constants`, `--analyse`; no message
+sent), with the generator and critic requests rendered by `prompts.render.score_prompt` from prompt-schema
+version 2 (the generator's schema is candidate C): the largest framing is now the profile extraction's 939
+tokens, so the block holds 1,878 (2 x 939) for every model, and the §6.9.1 overrun-buffer bound of the seeded
+settings is $1.23 against their $2.00 buffer (`docs/spikes/V19.md`, "M3 re-count").
 """
 
 import math
@@ -29,10 +36,10 @@ PROMPT_OVERHEAD_FLOOR: Final = 1_000
 # --- spike V19: scripts/spikes/v19_token_bound.py writes this block (docs/spikes/V19.md) ---
 PROMPT_OVERHEAD_TOKENS: Final[Mapping[Model, int]] = MappingProxyType(
     {
-        "claude-opus-5-5": 2_640,
-        "claude-sonnet-5-5": 2_640,
-        "claude-haiku-5-5": 2_640,
-        "claude-fable-5-1": 2_640,
+        "claude-opus-5-5": 1_878,
+        "claude-sonnet-5-5": 1_878,
+        "claude-haiku-5-5": 1_878,
+        "claude-fable-5-1": 1_878,
     }
 )
 NATIVE_PDF_ENABLED: Final[bool] = True

@@ -43,6 +43,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="send to the Anthropic API with the worker's anthropic_key (default: the recorded-SSE fake)",
     )
+    dry_run.add_argument(
+        "--version",
+        type=int,
+        metavar="ID",
+        help="the prompt-schema version to dry-run (default: the active one)",
+    )
     return parser
 
 
