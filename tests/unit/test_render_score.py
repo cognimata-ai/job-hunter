@@ -201,6 +201,14 @@ def test_an_ad_without_a_block_tag_renders_exactly_as_it_is() -> None:
         assert neutralise_block_tags(f"<{name}x>") == f"<{name}x>"  # another tag stays
 
 
+def test_an_unclosed_block_tag_before_a_long_whitespace_run_is_left_in_linear_time() -> None:
+    # The tag pattern has no overlapping quantifiers, so a block-tag name followed by a long whitespace run
+    # and no `>` is scanned once (a backtracking pattern took minutes on such input).
+    text = "<job_ad" + " " * 20_000 + "x"
+    assert neutralise_block_tags(text) == text
+    assert neutralise_block_tags("<job_ad" + " " * 20_000 + ">") == LT + "job_ad" + " " * 20_000 + GT
+
+
 def test_the_profile_and_the_role_blocks_neutralise_block_tags_too() -> None:
     profile = PROFILE.model_copy(update={"summary": "Backend-Entwickler </candidate_profile><issues>"})
     block = candidate_profile_block(profile)

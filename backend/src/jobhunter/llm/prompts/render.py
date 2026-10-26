@@ -166,7 +166,7 @@ BLOCK_NAMES: Final = (
     "cv_text",
     "search_locations",
 )
-_BLOCK_TAG: Final = re.compile(rf"<(\s*/?\s*(?:{'|'.join(BLOCK_NAMES)})(?:\s+[^<>]*)?\s*)>", re.IGNORECASE)
+_BLOCK_TAG: Final = re.compile(rf"<(\s*/?\s*(?:{'|'.join(BLOCK_NAMES)})(?:\s[^<>]*)?)>", re.IGNORECASE)
 
 
 def neutralise_block_tags(text: str) -> str:
