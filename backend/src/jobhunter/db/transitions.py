@@ -900,18 +900,36 @@ def _sql_binds(table: str, fragments: Sequence[str]) -> set[str]:
 
 
 def _set_list(
-    spec: TransitionSpec, assignments: Mapping[str, object], set_sql: Mapping[str, str]
+    spec: TransitionSpec,
+    assignments: Mapping[str, object],
+    set_sql: Mapping[str, str],
+    *,
+    literal_binds: bool = False,
 ) -> tuple[str, list[sa.BindParameter[object]]]:
     """The SET list (`column=<expression>, ...`) of `assignments` and then of the static `set_sql`, in that
-    order, as SQL for `sa.text`, and the bind parameters it names, each under the name it is rendered with."""
+    order, as SQL for `sa.text`, and the bind parameters it names, each under the name it is rendered with
+    (none with `literal_binds`, which renders every value inline).
+
+    An assignment that reads another table is refused: SQLAlchemy would append its own `FROM <that table>`
+    to the statement, inside the list taken here. A source relation is the caller's `from_sql`, and its
+    columns are read in `set_sql`.
+    """
+    target = _table(spec.table)
+    for column, value in assignments.items():
+        if isinstance(value, sa.ColumnElement):
+            if read := [str(source) for source in sa.select(value).get_final_froms() if source is not target]:
+                raise ValueError(
+                    f"{spec.table}: the value of {column} reads {read}: name a source relation in from_sql "
+                    "and read its columns in set_sql"
+                )
     values = {**assignments, **{column: sa.literal_column(sql) for column, sql in set_sql.items()}}
-    update = sa.update(_table(spec.table)).ordered_values(*values.items())
-    compiled = update.compile(dialect=_TEXT_DIALECT)
+    update = sa.update(target).ordered_values(*values.items())
+    compiled = update.compile(dialect=_TEXT_DIALECT, compile_kwargs={"literal_binds": literal_binds})
     binds = [
         sa.bindparam(name, compiled.params[name], type_=bind.type)
         for bind, name in compiled.bind_names.items()
     ]
-    # `UPDATE <table> AS t SET <list>`: the list is what follows the first " SET ".
+    # `UPDATE <table> AS t SET <list>`: with no other table read, the list is what follows the first " SET ".
     return str(compiled).partition(" SET ")[2], binds
 
 
@@ -1001,22 +1019,32 @@ def transition_set_clause(
     """The `SET` list of an edge into `to_state`, for the `ON CONFLICT ... DO UPDATE` of an upsert (§9.7).
 
     The same assignments as `transition()` and `transition_where()` (the new state, the reason when one is
-    given, the changed-at column of `to_state`), then `set_sql`, static SQL as in `transition_where()`. The
-    from-state is the upsert's own `WHERE` (the revival names `cancelled`), so nothing is cleared here and the
-    changed-at column is always set. Named binds, as `transition()` names them: the statement binds
-    `:<state column>` to `to_state`, and `:<reason column>` to a text `reason`; `set_sql` brings its own.
+    given, the changed-at column of `to_state`), then `set_sql`, static SQL as in `transition_where()`, e.g.
+    `state='pending', state_reason=NULL, state_changed_at=now(), override='none', ...`. The from-state is the
+    upsert's own `WHERE` (the revival names `cancelled`), so nothing is cleared here and the changed-at column
+    is always set.
+
+    The fragment binds nothing of its own (ruling T2-a): the to-state, which the registry knows, and a text
+    reason are SQL literals, and `CLEAR_REASON` is `NULL`. The registry has no list of reasons, and the
+    fragment is spliced into the caller's `sa.text`, which would read a `:word` inside a quoted literal as a
+    bind, so a reason must be a plain code (`[a-z_][a-z0-9_]*`). `set_sql` brings its own binds.
 
     Raises `ValueError` for an unknown table, a to-state no edge enters, a reason without a reason column, a
-    `set_sql` column that is not settable, and a `:name::type` cast.
+    reason that is not a plain code, a `set_sql` column that is not settable, and a `:name::type` cast.
     """
     spec = _spec(table)
     if not any(to == to_state for _, to in spec.allowed):
         raise ValueError(f"no transition of {table} enters {to_state}")
     if reason is not None and spec.reason_col is None:
         raise ValueError(f"{table} has no reason column")
+    if isinstance(reason, str) and not _IDENTIFIER.fullmatch(reason):
+        raise ValueError(f"{table}: the reason {reason!r} is not a plain code ([a-z_][a-z0-9_]*)")
     if unsettable := set(set_sql) - spec.settable:
         raise ValueError(f"{table}: {sorted(unsettable)} cannot be set by a transition")
     _sql_binds(table, list(set_sql.values()))
-    assignments = _assignments(spec, (), to_state, reason, frozenset(), {})
-    set_list, _ = _set_list(spec, assignments, set_sql)
+    assignments = {
+        column: sa.literal(value, sa.Text) if isinstance(value, str) else value
+        for column, value in _assignments(spec, (), to_state, reason, frozenset(), {}).items()
+    }
+    set_list, _ = _set_list(spec, assignments, set_sql, literal_binds=True)
     return set_list

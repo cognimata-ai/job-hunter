@@ -5,12 +5,13 @@ content.
 JSONB, a list as an array). The named helpers fill every NOT NULL column of their table with a valid value,
 so a test names only what it is about.
 
-`insert_published` builds a target the way publication leaves it: the target in `published_accepted` (or
-`published_contested`) naming its result, the attempt, the attempt's scoring call, the final draft and the
-`llm_results` row. The target and its result name each other through deferrable foreign keys, and inserting
-the target in its final state needs no transition (the `score_targets` trigger checks UPDATEs only), so the
-result id is taken from the identity sequence first and the result is inserted with it
-(`OVERRIDING SYSTEM VALUE`).
+`insert_claimed` builds a target the way the claim leaves it, with its running attempt, for a scoring call
+to name. `insert_published` builds a target the way publication leaves it: the target in
+`published_accepted` (or `published_contested`) naming its result, the attempt, the attempt's scoring call,
+the final draft and the `llm_results` row. The target and its result name each other through deferrable
+foreign keys, and inserting the target in its final state needs no transition (the `score_targets` trigger
+checks UPDATEs only), so the result id is taken from the identity sequence first and the result is inserted
+with it (`OVERRIDING SYSTEM VALUE`).
 
 `CLAIM_WHERE`, `CLAIM_FROM`, `CLAIM_SET_SQL` and `CLAIM_RETURNING` are the atomic claim's arguments to
 `transition_where`, for the tests of the set-based helper.
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
+from uuid import uuid4
 
 import psycopg
 from jobhunter.db.seed import SETTINGS_SCHEMA_VERSION, load_settings_v1
@@ -233,6 +235,34 @@ async def insert_attempt(c: AsyncConnection, target_id: int, **columns: object) 
     if values["outcome"] != "running":
         values.setdefault("ended_at", NOW)
     return await insert_id(c, "score_attempts", values)
+
+
+@dataclass(frozen=True)
+class Claimed:
+    """An `in_progress` target and its `running` attempt: the owners a scoring call names."""
+
+    target_id: int
+    attempt_id: int
+
+
+async def insert_claimed(c: AsyncConnection, llm_tuple_id: int) -> Claimed:
+    """A target of a new job for the tuple, claimed (epoch 1, attempt 1, lane `similarity`), with its
+    `running` online attempt under the same claim."""
+    claim = uuid4()
+    target = await insert_target(
+        c,
+        await insert_job(c),
+        llm_tuple_id,
+        state="in_progress",
+        claim_id=claim,
+        claim_epoch=1,
+        claimed_at=NOW,
+        claim_heartbeat_at=NOW,
+        attempt_no=1,
+        lane="similarity",
+    )
+    attempt = await insert_attempt(c, target, claim_id=claim, claim_epoch=1, lane="similarity")
+    return Claimed(target, attempt)
 
 
 _BUDGET: Final = q(

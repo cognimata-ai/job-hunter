@@ -636,6 +636,24 @@ WHERE_ID = {"where": "t.id = :id", "params": {"id": 1}}
             "not a column name",
         ),
         ("score_targets", ["pending"], "pending", {**WHERE_ID, "returning": ()}, "returning is empty"),
+        # an expression over another table would make SQLAlchemy append its own FROM inside the SET list
+        (
+            "score_targets",
+            ["pending"],
+            "pending",
+            {**WHERE_ID, "set_": {"lane": sa.table("lanes", sa.column("name")).c.name}},
+            r"the value of lane reads \['lanes'\]: name a source relation in from_sql",
+        ),
+        (
+            "score_targets",
+            ["pending"],
+            "pending",
+            {
+                **WHERE_ID,
+                "set_": {"attempt_no": sa.table("score_targets", sa.column("attempt_no")).c.attempt_no},
+            },
+            r"the value of attempt_no reads \['score_targets'\]",
+        ),
     ],
 )
 async def test_transition_where_calls_the_registry_refuses_never_reach_the_database(
@@ -654,19 +672,26 @@ REVIVE_SET_SQL = {
 }
 
 
-def test_transition_set_clause_renders_the_assignments_with_named_binds() -> None:
-    # §9.7's revive: the to-state, the reason, the changed-at column, then the caller's SQL
+def test_transition_set_clause_renders_the_assignments_inline() -> None:
+    # §9.7's revive: the to-state, the reason, the changed-at column, then the caller's SQL; no bind of
+    # its own
     clause = transitions.transition_set_clause(
         "score_targets", "pending", reason=CLEAR_REASON, set_sql=REVIVE_SET_SQL
     )
     assert clause == (
-        "state=:state, state_reason=NULL, state_changed_at=now(), override='none', override_at=NULL, "
+        "state='pending', state_reason=NULL, state_changed_at=now(), override='none', override_at=NULL, "
         "lane=NULL, bulk_operation_id=EXCLUDED.bulk_operation_id, updated_at=now()"
     )
     with_reason = transitions.transition_set_clause(
         "batch_items", "missing", reason="ignored_fenced", set_sql={}
     )
-    assert with_reason == "result_type=:result_type, decision=:decision, processed_at=now()"
+    assert with_reason == "result_type='missing', decision='ignored_fenced', processed_at=now()"
+    # no reason keeps the reason column out of the list; set_sql keeps its own binds
+    kept = transitions.transition_set_clause(
+        "score_targets", "pending", reason=None, set_sql={"lane": ":lane"}
+    )
+    assert kept == "state='pending', state_changed_at=now(), lane=:lane"
+    assert set(sa.text(f"UPDATE score_targets SET {clause}").compile().params) == set()  # noqa: S608
 
 
 @pytest.mark.parametrize(
@@ -679,6 +704,10 @@ def test_transition_set_clause_renders_the_assignments_with_named_binds() -> Non
         ("score_targets", "pending", {"set_sql": {"job_id": "1"}}, "cannot be set"),
         ("score_targets", "pending", {"set_sql": {"state_reason": "NULL"}}, "cannot be set"),
         ("score_targets", "pending", {"set_sql": {"not_before": ":at::timestamptz"}}, r"CAST\(:at AS type\)"),
+        # the reason is inlined: a quote would end the literal, and `sa.text` would read `:x` as a bind
+        ("score_targets", "cancelled", {"reason": "it's"}, "is not a plain code"),
+        ("score_targets", "cancelled", {"reason": "see :x"}, "is not a plain code"),
+        ("score_targets", "cancelled", {"reason": "Purged"}, "is not a plain code"),
     ],
 )
 def test_transition_set_clause_refuses_what_the_registry_refuses(table, to, kwargs, message) -> None:

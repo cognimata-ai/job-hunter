@@ -1,3 +1,4 @@
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -21,6 +22,7 @@ from tests.support.m3 import (
     CLAIM_SET_SQL,
     CLAIM_WHERE,
     NOW,
+    insert_cycle,
     insert_job,
     insert_published,
     insert_target,
@@ -374,7 +376,7 @@ async def test_transition_where_moves_only_matching_rows_and_the_trigger_checks_
 
 REVIVE = (
     "INSERT INTO score_targets (job_revision_id, llm_tuple_id, job_id, state) "
-    "VALUES (:revision, :tuple, :job, :state) "
+    "VALUES (:revision, :tuple, :job, 'pending') "
     "ON CONFLICT (job_revision_id, llm_tuple_id) DO UPDATE SET {clause} "
     "WHERE score_targets.state = 'cancelled' "
     "AND score_targets.state_reason IN ('tuple_superseded', 'revision_superseded', 'job_merged') RETURNING id"
@@ -406,8 +408,11 @@ async def test_the_revive_upsert_moves_a_cancelled_target_through_the_set_clause
             override_at=NOW,
             lane="score_now",
         )
-        params = {"revision": job.revision_id, "tuple": tuple_id, "job": job.job_id, "state": "pending"}
-        revived = await c.execute(sa.text(REVIVE.format(clause=clause)), params)
+        # The fragment binds nothing of its own: the statement's binds are the INSERT's alone.
+        statement = sa.text(REVIVE.format(clause=clause))
+        assert set(statement.compile().params) == {"revision", "tuple", "job"}
+        params = {"revision": job.revision_id, "tuple": tuple_id, "job": job.job_id}
+        revived = await c.execute(statement, params)
         assert revived.scalar_one() == target
         assert tuple((await c.execute(REVIVED, {"id": target})).one()) == (
             "pending",
@@ -417,4 +422,35 @@ async def test_the_revive_upsert_moves_a_cancelled_target_through_the_set_clause
             None,
             True,
         )
+        await c.rollback()
+
+
+CYCLE = sa.text(
+    "SELECT status, report, admitted, jsonb_typeof(report), jsonb_typeof(admitted), spent_usd, "
+    "finished_at = now() FROM score_cycles WHERE id = :id"
+)
+
+
+async def test_transition_where_binds_json_values_as_jsonb(engine) -> None:
+    report = {
+        "outcomes": {"published_accepted": 2, "refused": 0},
+        "lanes": ["similarity", "oldest"],
+        "ü": None,
+    }
+    admitted = {"similarity": 2, "oldest": 1}
+    async with engine.connect() as c:
+        cycle = await insert_cycle(c, (await insert_profile_chain(c)).llm_tuple_id)
+        rows = await transition_where(
+            c,
+            "score_cycles",
+            ["running"],
+            "completed",
+            where="t.id = :id AND t.worker_epoch = :epoch",
+            params={"id": cycle, "epoch": 1},
+            set_={"report": report, "admitted": admitted, "spent_usd": Decimal("0.104")},
+            returning=("id", "report", "admitted"),
+        )
+        assert [dict(row) for row in rows] == [{"id": cycle, "report": report, "admitted": admitted}]
+        stored = tuple((await c.execute(CYCLE, {"id": cycle})).one())
+        assert stored == ("completed", report, admitted, "object", "object", Decimal("0.104000"), True)
         await c.rollback()

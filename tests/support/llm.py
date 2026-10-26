@@ -199,16 +199,24 @@ def reserve_kw(
 
 
 def scoring_kw(
-    owner: SpendOwner, *, now: datetime, bound: int, max_tokens: int, **overrides: Any
+    owner: SpendOwner,
+    *,
+    now: datetime,
+    bound: int,
+    max_tokens: int,
+    target_id: int,
+    attempt_id: int,
+    **overrides: Any,
 ) -> dict[str, Any]:
-    """`reserve_kw` for a scoring `generate` call. M2 has no score attempts, so the attempt and target ids
-    are made up (their FKs are M3's, plan Deviation 1): only the arithmetic of the scoring class is tested."""
+    """`reserve_kw` for a scoring `generate` call of attempt `attempt_id` of target `target_id`. Migration
+    0008 closed the two foreign keys M2 staged (`llm_calls.attempt_id` and `llm_calls.target_id`), so both
+    name real rows: `tests.support.m3.insert_claimed` makes a pair."""
     values: dict[str, Any] = {
         "purpose": "generate",
         "purpose_class": "scoring",
         "deadline_s": 600,
-        "attempt_id": 1,
-        "target_id": 1,
+        "attempt_id": attempt_id,
+        "target_id": target_id,
         **overrides,
     }
     return reserve_kw(owner, now=now, bound=bound, max_tokens=max_tokens, **values)

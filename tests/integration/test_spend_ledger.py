@@ -51,6 +51,8 @@ from tests.support.llm import (
     scoring_kw,
 )
 from tests.support.logs import logged
+from tests.support.m2 import insert_profile_chain
+from tests.support.m3 import insert_claimed
 from tests.support.pg import PgServer, blocked_or_done, lock_waits
 from tests.support.procs import await_until
 from tests.support.reconcile import assert_fence_rule
@@ -124,22 +126,37 @@ async def test_eight_concurrent_sessions_never_exceed_the_cap(engine, op_owner, 
         min_bucket_capacity_usd=Decimal("1.00"),
         collection_interval_s=6 * 3600,
     )
+    kinds = ["nonscoring", "scoring", "nonscoring", "cap", "scoring", "nonscoring", "scoring", "nonscoring"]
     async with engine.begin() as conn:
         await ensure_month(conn, month, small, now)  # A = $0.90 (the settings' 5 % reserve applies)
+        # A scoring call names its target and attempt (the foreign keys of migration 0008): one each.
+        llm_tuple_id = (await insert_profile_chain(conn)).llm_tuple_id
+        claims = {
+            n: await insert_claimed(conn, llm_tuple_id) for n, kind in enumerate(kinds) if kind == "scoring"
+        }
     # each try reserves $0.25: 10,000 x $5 (the cache-write price bounds input) + 10,000 x $20 per MTok
     assert worst_case_usd("claude-opus-5-5", input_tokens_bound=10_000, max_tokens=10_000) == Decimal("0.25")
-    kinds = ["nonscoring", "scoring", "nonscoring", "cap", "scoring", "nonscoring", "scoring", "nonscoring"]
 
-    async def session(kind: str) -> Reservation | BudgetExhausted | None:
+    async def session(n: int, kind: str) -> Reservation | BudgetExhausted | None:
         async with engine.begin() as conn:
             if kind == "cap":  # a save lowers the cap to $0.60 (A = $0.50) under the same lock
                 await change_cap(
                     conn, month=month, cap_usd=Decimal("0.60"), overrun_buffer_usd=Decimal("0.10"), now=now
                 )
                 return None
-            make = scoring_kw if kind == "scoring" else reserve_kw
+            if kind == "scoring":
+                kw = scoring_kw(
+                    op_owner,
+                    now=now,
+                    bound=10_000,
+                    max_tokens=10_000,
+                    target_id=claims[n].target_id,
+                    attempt_id=claims[n].attempt_id,
+                )
+            else:
+                kw = reserve_kw(op_owner, now=now, bound=10_000, max_tokens=10_000)
             try:
-                return await reserve(conn, **make(op_owner, now=now, bound=10_000, max_tokens=10_000))
+                return await reserve(conn, **kw)
             except BudgetExhausted as exc:
                 return exc
 
@@ -147,7 +164,7 @@ async def test_eight_concurrent_sessions_never_exceed_the_cap(engine, op_owner, 
     async with engine.connect() as blocker:
         await blocker.begin()
         await blocker.execute(LOCK_MONTH, {"m": month})
-        tasks = [asyncio.create_task(session(kind)) for kind in kinds]
+        tasks = [asyncio.create_task(session(n, kind)) for n, kind in enumerate(kinds)]
 
         async def all_waiting() -> bool:
             return lock_waits(migrated) >= len(kinds) or any(t.done() for t in tasks)

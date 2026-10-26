@@ -58,22 +58,34 @@ _TIMES = st.datetimes(
     timezones=st.just(UTC),
 )
 _TEXT = st.text(alphabet="abcdefghij_", min_size=1, max_size=8)
-# The settable columns with no foreign key and no CHECK that ties them to the state. `claim_id` is not one:
-# with `claim_epoch` and `claim_heartbeat_at` it would make a target outside `in_progress` look claimed.
-FREE: Final[Mapping[str, st.SearchStrategy[object]]] = {
+_LANE = st.sampled_from(LANES)
+_ALWAYS_INCLUDE = st.sampled_from(("watchlist", "title_match", "full_text_twin", "batch_followup"))
+# The settable columns with no foreign key and no CHECK that ties them to the state, each with a value that is
+# neither NULL nor the column's default: every seeded row holds one in each, so an edge that wrongly clears,
+# zeroes or resets a column it should keep shows. `claim_id` is not one of them: with `claim_epoch` and
+# `claim_heartbeat_at` it would make a target outside `in_progress` look claimed.
+SEEDED_VALUES: Final[Mapping[str, st.SearchStrategy[object]]] = {
     "claimed_at": _TIMES,
     "claim_epoch": st.integers(1, 10**6),
     "claim_heartbeat_at": _TIMES,
+    "attempt_no": st.integers(1, 50),
+    "lane": _LANE,
+    "always_include_reason": _ALWAYS_INCLUDE,
+    "charged_attempts": st.integers(1, 4),
+    "not_before": _TIMES,
+    "transient_failures": st.integers(1, 50),
+    "refusal_category": _TEXT,
+    "updated_at": _TIMES,
+}
+# The same columns as an edge may set them, NULL and the defaults included.
+FREE: Final[Mapping[str, st.SearchStrategy[object]]] = {
+    **SEEDED_VALUES,
     "attempt_no": st.integers(0, 50),
-    "lane": st.sampled_from((None, *LANES)),
-    "always_include_reason": st.sampled_from(
-        (None, "watchlist", "title_match", "full_text_twin", "batch_followup")
-    ),
+    "lane": st.one_of(st.none(), _LANE),
+    "always_include_reason": st.one_of(st.none(), _ALWAYS_INCLUDE),
     "charged_attempts": st.integers(0, 4),
     "not_before": st.one_of(st.none(), _TIMES),
     "transient_failures": st.integers(0, 50),
-    "refusal_category": _TEXT,
-    "updated_at": _TIMES,
 }
 # Columns given as SQL over `t`, with the value each yields for a row (`:bump` is a caller bind).
 EXPRESSIONS: Final = {
@@ -96,8 +108,7 @@ _REQUIRED_KEYS: Final = {
 class Row:
     state: str
     selected: bool
-    attempt_no: int
-    transient_failures: int
+    columns: Mapping[str, object]  # a value of every `SEEDED_VALUES` column
     override: bool
 
 
@@ -139,8 +150,7 @@ def cases(draw: st.DrawFn) -> Case:
         Row,
         state=st.one_of(st.sampled_from(froms), st.sampled_from(STATES)),
         selected=st.booleans(),
-        attempt_no=st.integers(0, 50),
-        transient_failures=st.integers(0, 50),
+        columns=st.fixed_dictionaries(SEEDED_VALUES),
         override=st.booleans(),
     )
     return Case(
@@ -158,9 +168,11 @@ def cases(draw: st.DrawFn) -> Case:
 
 @dataclass(frozen=True)
 class Scaffold:
-    """The rows a target's state may name: a batch submission, a duplicate group and a scope version."""
+    """The rows a target may name: a bulk operation, a batch submission, a duplicate group and a scope
+    version."""
 
     llm_tuple_id: int
+    bulk: int
     submission: int
     group: int
     scope: int
@@ -176,37 +188,31 @@ async def scaffold(c: AsyncConnection) -> Scaffold:
         "duplicate_groups",
         {"representative_job_id": representative.job_id, "status": "active", "election_reason": "initial"},
     )
-    return Scaffold(tuple_id, submission, group, (await active_ids(c)).scope_version_id)
+    return Scaffold(tuple_id, bulk, submission, group, (await active_ids(c)).scope_version_id)
 
 
 def _seeded(row: Row, n: int, ids: Scaffold) -> dict[str, object]:
-    """The columns of a target seeded in `row.state`, with what that state's CHECKs require."""
+    """The columns of a target seeded in `row.state`: a value in every free settable column and in
+    `bulk_operation_id`, and what the state's CHECKs require."""
     values: dict[str, object] = {
+        **row.columns,
         "state": row.state,
         "state_changed_at": SEEDED_AT,
-        "attempt_no": row.attempt_no,
-        "transient_failures": row.transient_failures,
+        "bulk_operation_id": ids.bulk,
     }
     if row.override:
         values |= {"override": "score_now", "override_at": SEEDED_AT}
     if row.state in NEEDS_REASON:
         values["state_reason"] = "seeded"
     match row.state:
-        case "in_progress":
-            values |= {
-                "claim_id": UUID(int=n + 1),
-                "claim_epoch": 1,
-                "claimed_at": SEEDED_AT,
-                "claim_heartbeat_at": SEEDED_AT,
-            }
+        case "in_progress":  # with the row's `claim_epoch` and `claim_heartbeat_at`
+            values["claim_id"] = UUID(int=n + 1)
         case "in_batch":
             values["batch_submission_id"] = ids.submission
         case "deferred_duplicate":
             values["deferred_group_id"] = ids.group
         case "filtered_out":
             values["filter_scope_version_id"] = ids.scope
-        case "refused":
-            values["refusal_category"] = "seeded"
         case "published_accepted" | "published_contested":
             values["published_result_id"] = PUBLISHED_OFFSET // 2 + n
     return values
