@@ -203,10 +203,12 @@ class PromptVersion:
 
 class PromptVersionUnscorable(DomainError):
     """A version whose parser family cannot score: `generator_v1`, whose generator schema the API rejects (M2
-    Deviation 33). The score subgraph ends the attempt `transient_error` without a charge."""
+    Deviation 33). The score subgraph ends the attempt `transient_error` without a charge. `version_id` is
+    `None` where only the family is known (`scoring.validator.parse_generator`)."""
 
-    def __init__(self, version_id: int, parser_family: str) -> None:
-        super().__init__(f"prompt-schema version {version_id} of family {parser_family} cannot score")
+    def __init__(self, version_id: int | None, parser_family: str) -> None:
+        which = "a prompt-schema version" if version_id is None else f"prompt-schema version {version_id}"
+        super().__init__(f"{which} of family {parser_family} cannot score")
         self.version_id = version_id
         self.parser_family = parser_family
 

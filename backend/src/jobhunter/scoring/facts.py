@@ -14,9 +14,13 @@ review, a confirmation and a cap all name the same item:
 - the generator's top-level `not_a_job_ad`: `not_a_job_ad:ad` (`NOT_A_JOB_AD`).
 
 Names are folded with `normalize.text.fold` (A3 G11): NFKD with the marks removed, so `Französisch` is
-`franzosisch`. Two facts with one id are a V4 issue, and the first is kept (L4174). `not_a_job_ad` is not a
-`JobFacts` field: it is the draft's top-level flag, so its id is a constant the callers add
-(`knockouts.required_facts`).
+`franzosisch`. A name's subject (`name_subject`) is that folded form without control characters, cut to
+`NAME_SUBJECT_MAX` characters (the §11.5 limit of a certification name), so a fact id is always one line of
+at most 160 characters, as a prompt's issue target must be (`prompts.render.Issue`; Controller carry T4-d):
+a name beyond its V1 limit is an issue, and its id is the cut name's. Every derivation of a name's id
+(`binding_facts`, `knockouts.derive_knockouts`) goes through `name_subject`. Two facts with one id are a V4
+issue, and the first is kept (L4174). `not_a_job_ad` is not a `JobFacts` field: it is the draft's top-level
+flag, so its id is a constant the callers add (`knockouts.required_facts`).
 
 `binding_facts(facts)` is the one walk of the asserted facts: each one's code, subject and path in the
 `job_facts` document (the field name, and the index in a list), so `derive_fact_ids` and the critic's
@@ -24,6 +28,7 @@ rendering of a draft (`prompts.render.draft_block`) name the same facts. `FACT_I
 id of a draft can have.
 """
 
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Final, Literal
@@ -75,10 +80,21 @@ def fact_ref(code: str, subject: str, source: FactSource = "text") -> FactRef:
 NOT_A_JOB_AD: Final = fact_ref("not_a_job_ad", "ad")
 
 
+# The folded name of a subject is cut to this many characters (§11.5: a certification name is at most 120).
+NAME_SUBJECT_MAX: Final = 120
+_CONTROL: Final = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def name_subject(name: str) -> str:
+    """The subject a name gives a fact id: `fold(name)` without control characters, cut to
+    `NAME_SUBJECT_MAX` characters (and trimmed again after the cut)."""
+    return _CONTROL.sub("", fold(name))[:NAME_SUBJECT_MAX].rstrip()
+
+
 def language_subject(language: RequiredLanguage) -> str:
-    """`<code>`, or `other:<fold(name)>` for the code `other`."""
+    """`<code>`, or `other:<name_subject(name)>` for the code `other`."""
     if language.language == "other":
-        return f"other:{fold(language.language_other or '')}"
+        return f"other:{name_subject(language.language_other or '')}"
     return language.language
 
 
@@ -117,7 +133,7 @@ def binding_facts(facts: JobFacts) -> Iterator[BindingFact]:
         yield BindingFact("degree", "degree", ("degree",))
     for i, certification in enumerate(facts.certifications):
         if certification.mandatory:
-            yield BindingFact("certification", fold(certification.name), ("certifications", i))
+            yield BindingFact("certification", name_subject(certification.name), ("certifications", i))
     if facts.security_clearance.required:
         yield BindingFact("security_clearance", "clearance", ("security_clearance",))
     if facts.work_permit.required:

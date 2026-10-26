@@ -29,14 +29,27 @@ is `null`, else `min(et, sal)`.
 
 `inputs` holds the compared values (bands, sub-ratings, compat by mode), never ad text. The on-site band
 helpers are shared with the `onsite_required` knockout (`scoring.knockouts`).
+
+**The deterministic `experience_seniority` rating** (§11.3 L4085-4103), which the validator puts in place of
+the generator's level (V4, §11.6): `seniority_level` is the minimum of the two sub-ratings whose inputs are
+known, `None` when neither is.
+- *Level.* The ladder `SENIORITY_LADDER` (intern, working student, apprentice 0; junior 1; mid 2; senior 3;
+  lead, principal 4; head 5) and `g = profile level - ad level`: 0 is 4, +1 is 3, -1 is 2, +2 is 1, and
+  ≤ -2 or ≥ +3 is 0. The ad's level is the `seniority` fact's value; when the ad states none (`unspecified`,
+  or the caller passes no fact), the title's seniority tokens give it when they name one ladder level (a
+  title with tokens of two levels, `Junior/Senior`, says nothing).
+- *Years.* `y = profile total years - the ad's minimum years`: `y ≥ 0` is 4, `-1 ≤ y < 0` is 3,
+  `-2 ≤ y < -1` is 2, `-5 < y < -2` is 1, `y ≤ -5` is 0. A minimum outside 0-40 is unknown (§11.6 L4390).
+The caller passes a fact only when its evidence is grounded (V3), else `None`, as for `location_work_mode`.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, get_args
 
 from jobhunter.geo import gazetteer
-from jobhunter.llm.schemas.generator import RemoteRegion
+from jobhunter.llm.schemas.generator import MinYearsExperience, RemoteRegion, Seniority
+from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.run_settings import ScopeLocation, ScopeSettings
 from jobhunter.scoring.filters import DetFacts
 from jobhunter.settings.model import EmploymentType
@@ -182,3 +195,61 @@ def employment_salary(det: DetFacts, scope: ScopeSettings) -> DetCriterion:
     else:
         level = min(et, sal)
     return _criterion(level, {"et": et, "sal": sal})
+
+
+# ---- experience_seniority (§11.3) -------------------------------------------------------------------------
+
+SENIORITY_LADDER: Final = {
+    "intern": 0,
+    "working_student": 0,
+    "apprentice": 0,
+    "junior": 1,
+    "mid": 2,
+    "senior": 3,
+    "lead": 4,
+    "principal": 4,
+    "head": 5,
+}
+MIN_YEARS_RANGE: Final = (0, 40)
+_LEVEL_SUB_RATING: Final = {0: 4, 1: 3, -1: 2, 2: 1}  # every other g is 0
+
+
+def level_sub_rating(g: int) -> int:
+    """The level sub-rating of `g = profile level - ad level`."""
+    return _LEVEL_SUB_RATING.get(g, 0)
+
+
+def years_sub_rating(y: float) -> int:
+    """The years sub-rating of `y = profile total years - required minimum years`."""
+    if y >= 0:
+        return 4
+    if y >= -1:
+        return 3
+    if y >= -2:
+        return 2
+    return 1 if y > -5 else 0
+
+
+def _ad_level(seniority_fact: Seniority | None, title_tokens: Iterable[str]) -> int | None:
+    if seniority_fact is not None and seniority_fact.value != "unspecified":
+        return SENIORITY_LADDER[seniority_fact.value]
+    levels = {SENIORITY_LADDER[token] for token in title_tokens if token in SENIORITY_LADDER}
+    return levels.pop() if len(levels) == 1 else None
+
+
+def seniority_level(
+    profile: ConfirmedProfile,
+    seniority_fact: Seniority | None,
+    min_years_fact: MinYearsExperience | None,
+    title_tokens: Iterable[str],
+) -> int | None:
+    """The deterministic `experience_seniority` level (see the module docstring)."""
+    ratings: list[int] = []
+    ad_level = _ad_level(seniority_fact, title_tokens)
+    if ad_level is not None:
+        ratings.append(level_sub_rating(SENIORITY_LADDER[profile.seniority] - ad_level))
+    low, high = MIN_YEARS_RANGE
+    years = None if min_years_fact is None else min_years_fact.value
+    if years is not None and low <= years <= high and profile.total_years_experience is not None:
+        ratings.append(years_sub_rating(profile.total_years_experience - years))
+    return min(ratings, default=None)

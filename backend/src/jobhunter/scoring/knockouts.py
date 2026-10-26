@@ -60,7 +60,14 @@ from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.normalize.text import fold
 from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring.det_criteria import ONSITE_BOUNDS, location_band
-from jobhunter.scoring.facts import NOT_A_JOB_AD, FactRef, derive_fact_ids, fact_id, language_subject
+from jobhunter.scoring.facts import (
+    NOT_A_JOB_AD,
+    FactRef,
+    derive_fact_ids,
+    fact_id,
+    language_subject,
+    name_subject,
+)
 from jobhunter.scoring.filters import DetFacts
 from jobhunter.types import JSONValue
 
@@ -125,7 +132,9 @@ def _onsite(det: DetFacts, scope: ScopeSettings) -> _Outcome:
     return ("unmet" if all(band == 0 for band in bands) else "met"), inputs
 
 
-def _language(required: RequiredLanguage, profile: ConfirmedProfile) -> _Outcome:
+def compare_language(required: RequiredLanguage, profile: ConfirmedProfile) -> _Outcome:
+    """The `mandatory_language` comparison of one required language against the profile (the table's row),
+    with its inputs; the validator's V4 language checks (§11.6) read the same comparison."""
     if required.language == "other":
         name = fold(required.language_other or "")
         entries = [
@@ -227,7 +236,7 @@ def _requirements(
         source: RequirementSource = "structured" if structured_onsite else "text"
         found.append(_Requirement("onsite_required", "onsite", source, _onsite(det, scope)))
     found += [
-        _Requirement("mandatory_language", language_subject(x), "text", _language(x, profile))
+        _Requirement("mandatory_language", language_subject(x), "text", compare_language(x, profile))
         for x in facts.required_languages
         if x.mandatory
     ]
@@ -239,7 +248,7 @@ def _requirements(
     if degree.mandatory and not degree.or_equivalent and degree.level != "none_required":
         found.append(_Requirement("degree", "degree", "text", _degree(facts, profile)))
     found += [
-        _Requirement("certification", fold(x.name), "text", _certification(x.name, profile))
+        _Requirement("certification", name_subject(x.name), "text", _certification(x.name, profile))
         for x in facts.certifications
         if x.mandatory
     ]

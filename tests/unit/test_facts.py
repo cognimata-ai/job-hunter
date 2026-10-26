@@ -146,3 +146,34 @@ def test_the_binding_facts_walk_names_each_fact_and_where_it_is() -> None:
             node = node[step]
         assert isinstance(node, dict) and "evidence" in node
     assert {f.code for f in walked} | {NOT_A_JOB_AD.code} == set(FACT_ID_CODES)
+
+
+def test_a_name_subject_is_capped_and_one_line_so_every_fact_id_is_an_issue_target() -> None:
+    """Controller carry T4-d: a certification or `other:<name>` subject is the folded name without control
+    characters, cut to `NAME_SUBJECT_MAX` (120) characters, so a fact id always fits `render.Issue.target`
+    (at most 160 characters on one line), and every derivation (the walk, the knockouts) cuts it alike."""
+    from jobhunter.llm.prompts.render import Issue
+    from jobhunter.llm.schemas.profile import ConfirmedProfile
+    from jobhunter.scoring.facts import NAME_SUBJECT_MAX, name_subject
+    from jobhunter.scoring.knockouts import derive_knockouts
+
+    from tests.support.facts import facts as det_facts
+    from tests.support.facts import seeded_scope
+    from tests.support.scoring import profile
+
+    long_name = "Zertifizierter Größen\x07Spezialist " * 12
+    assert NAME_SUBJECT_MAX == 120
+    subject = name_subject(long_name)
+    assert len(subject) == NAME_SUBJECT_MAX and "\x07" not in subject and subject == subject.strip()
+    assert subject.startswith("zertifizierter grossenspezialist")
+    job = job_facts(
+        required_languages=[required_language("other", level="B2", other=long_name)],
+        certifications=[Certification(name=long_name, mandatory=True, evidence=["Zertifikat"])],
+    )
+    refs = derive_fact_ids(job)
+    assert list(refs) == [f"mandatory_language:other:{subject}", f"certification:{subject}"]
+    for key in refs:
+        assert Issue("quote_ungrounded", target=key).target == key
+    person: ConfirmedProfile = profile()
+    knockouts = derive_knockouts(job, det_facts(), person, seeded_scope())
+    assert [k.fact_id for k in knockouts] == list(refs)  # the knockouts derive the same ids
