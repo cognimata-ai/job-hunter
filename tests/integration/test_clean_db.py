@@ -127,6 +127,7 @@ TEST_ROWS = (
     "SELECT (SELECT count(*) FROM rubric_versions WHERE content_hash = %s), "
     "(SELECT count(*) FROM prompt_schema_versions WHERE prompt_schema_hash = %s)"
 )
+SHIPPED_RUBRICS = "SELECT version FROM rubric_versions ORDER BY version"
 
 
 # The M3 tables, and the M1 tables `_M3_DELETE` empties because a TRUNCATE of them would cascade into them.
@@ -315,6 +316,8 @@ async def test_two_resets_keep_active_config(engine, migrated) -> None:
         assert pg_one(migrated, "migrator", M2_COUNTS) == (0,) * 10
         assert [table for table, count in pg_rows(migrated, "migrator", M3_COUNTS) if count != 0] == []
         assert pg_one(migrated, "migrator", TEST_ROWS, digest(1), digest(1)) == (0, 0)
+        # the seed's two rubric rows stay, v1 too, which nothing points at (M3 Task 3)
+        assert pg_rows(migrated, "migrator", SHIPPED_RUBRICS) == [("v1",), ("v2",)]
 
 
 # Every foreign key as (referencing table, referenced table).

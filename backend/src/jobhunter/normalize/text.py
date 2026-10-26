@@ -2,6 +2,17 @@
 until the value no longer changes (`fold` and `normalize.companies.company_key` are idempotent on ordinary
 text, but not on a few inputs: a spacing diacritic, a name ending in two country words).
 
+`fold_with_offsets(s)` is `fold(s)` with its offset map (the V3 grounding, §11.6): for each folded character,
+the index in `s` of the original character it came from. NFKC is the one step that reaches across
+characters (a letter composes with its marks, Hangul jamo into a syllable), so `s` is cut into pieces whose
+NFKC forms concatenate to `NFKC(s)`: a piece starts at each character of combining class 0, unless NFKC joins
+it to the piece before (the two are then one piece). Every character a piece produces points at the piece's
+first character. The concatenation is checked against `NFKC(s)`; if it ever differs, the pieces are cut
+before ASCII characters only (no NFKC composition or reordering crosses one), and failing that `s` is one
+piece. The other steps are per character (the removals, the no-break spaces, `unaccent`, `casefold`) or the
+whitespace collapse and trim, applied to the characters with their indices, so the text is `fold(s)`
+exactly.
+
 `fold(s)` is defined in the specification as `immutable_unaccent(norm_text(s)).casefold()`. The database
 computes `immutable_unaccent`; this module computes the same function in Python for text that never reaches
 the database (title and company keys, description shingles). `unaccent` is NFKD with the combining marks
@@ -31,6 +42,7 @@ _REMOVED: Final = dict.fromkeys(
     )
 )
 _WHITESPACE: Final = re.compile(r"\s+")
+_NO_BREAK_SPACES: Final = frozenset("\xa0\N{NARROW NO-BREAK SPACE}")
 
 
 def norm_text(s: str) -> str:
@@ -173,3 +185,79 @@ def fixed_point(normalize: Callable[[str], str], value: str) -> str | None:
             return value
         value = again
     return None
+
+
+def _nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", s)
+
+
+def _cut(s: str, starts: list[int]) -> list[tuple[int, str]]:
+    """`s` cut at `starts` (ascending, the first 0), as (start, text)."""
+    return [(start, s[start:end]) for start, end in zip(starts, [*starts[1:], len(s)], strict=False)]
+
+
+def _segments(s: str) -> list[tuple[int, str]]:
+    """`s` cut before every character of canonical combining class 0."""
+    return _cut(s, [i for i, char in enumerate(s) if i == 0 or unicodedata.combining(char) == 0])
+
+
+def _independent_pieces(s: str) -> list[tuple[int, str]]:
+    """The segments of `s`, each joined to the piece before it when NFKC of the two is not the two NFKCs (an
+    ASCII segment never is: no composition or reordering crosses an ASCII character)."""
+    pieces: list[tuple[int, str]] = []
+    for start, text in _segments(s):
+        if pieces and not text[0].isascii():
+            first, before = pieces[-1]
+            if _nfkc(before + text) != _nfkc(before) + _nfkc(text):
+                pieces[-1] = (first, before + text)
+                continue
+        pieces.append((start, text))
+    return pieces
+
+
+def _ascii_pieces(s: str) -> list[tuple[int, str]]:
+    """`s` cut before every ASCII character."""
+    return _cut(s, [i for i, char in enumerate(s) if i == 0 or char.isascii()])
+
+
+def _normalized_pieces(s: str) -> list[tuple[int, str]]:
+    """`(start, NFKC of the piece)` for pieces of `s` whose NFKC forms concatenate to `NFKC(s)`."""
+    whole = _nfkc(s)
+    for cut in (_independent_pieces, _ascii_pieces):
+        normalized = [(start, _nfkc(text)) for start, text in cut(s)]
+        if "".join(text for _, text in normalized) == whole:
+            return normalized
+    return [(0, whole)]
+
+
+def fold_with_offsets(s: str) -> tuple[str, list[int]]:
+    """`fold(s)` and, for each of its characters, the index in `s` of the original character it came from
+    (see the module docstring); the indices never decrease."""
+    chars: list[str] = []
+    offsets: list[int] = []
+    for start, text in _normalized_pieces(s):  # norm_text: NFKC, then the removals and the no-break spaces
+        for char in text:
+            if ord(char) in _REMOVED:
+                continue
+            chars.append(" " if char in _NO_BREAK_SPACES else char)
+            offsets.append(start)
+    normalized = "".join(chars)
+    collapsed: list[tuple[str, int]] = []  # norm_text: every run of whitespace becomes one space
+    position = 0
+    for run in _WHITESPACE.finditer(normalized):
+        collapsed += zip(normalized[position : run.start()], offsets[position : run.start()], strict=True)
+        collapsed.append((" ", offsets[run.start()]))
+        position = run.end()
+    collapsed += zip(normalized[position:], offsets[position:], strict=True)
+    first, last = 0, len(collapsed)  # norm_text: trimmed as `str.strip` trims
+    while first < last and collapsed[first][0].isspace():
+        first += 1
+    while last > first and collapsed[last - 1][0].isspace():
+        last -= 1
+    folded: list[str] = []
+    folded_offsets: list[int] = []
+    for char, offset in collapsed[first:last]:  # unaccent and casefold, character by character
+        for out in _unaccent_char(char).casefold():
+            folded.append(out)
+            folded_offsets.append(offset)
+    return "".join(folded), folded_offsets

@@ -6,6 +6,12 @@ stored payload with it (a malformed one raises `pydantic.ValidationError`, a `Va
 `RunSettings.from_settings` takes the view. The model checks each field alone; the rules across fields are the
 save's (`settings.validate.validate_fields`), so any stored version loads.
 
+`ScopeSettings` is also the scoring's one view of a scope (M3): beside the fields of the hard filters it holds
+the scoring policies of the payload, `industries_include` (case-folded, like `industries_exclude`),
+`language_policy_default`, `language_policy`, `min_salary_eur_year` and `knockout_severity` (the
+`KnockoutSeverity` fields by knockout code), so the hard filters, the knockouts and the deterministic criteria
+read the same values.
+
 A scope location's `key` is the slug of its label (`slug`): the `coverage_cells.location_key` of its cells.
 `scope_from_payload` reads the `scope` object of a settings payload, and also a `scope_versions.payload`,
 which M0 stores without `max_ad_age_days` (`seed.scope_payload`): its `max_ad_age_days` is then `None`.
@@ -14,6 +20,7 @@ which M0 stores without `max_ad_age_days` (`seed.scope_payload`): its `max_ad_ag
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final, Literal, Self
 
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -60,17 +67,25 @@ class ScopeSettings:
     work_modes: frozenset[str]
     employment_types: frozenset[str]
     seniority_range: SeniorityRange
+    industries_include: frozenset[str]  # case-folded
     industries_exclude: frozenset[str]  # case-folded
     accepted_ad_languages: frozenset[str]
+    language_policy_default: model.Severity
+    language_policy: Mapping[str, model.Severity]  # by language code
     excluded_companies: frozenset[str]  # company keys
     excluded_keywords: tuple[str, ...]
     exclude_keywords_in_description: bool
+    min_salary_eur_year: int | None
+    knockout_severity: Mapping[str, model.Severity]  # by knockout code (§11.4)
     max_ad_age_days: int | None  # None for a scope built from a `scope_versions.payload`
 
     @classmethod
     def from_model(cls, scope: model.ScopeVersionPayload) -> Self:
         """The view of a validated scope; `max_ad_age_days` is `None` unless `scope` is a `model.Scope`."""
         seniority = scope.seniority_range
+        language_policy: dict[str, model.Severity] = {
+            code: severity for code, severity in scope.language_policy.items()
+        }
         return cls(
             locations=tuple(
                 ScopeLocation(
@@ -93,11 +108,16 @@ class ScopeSettings:
                 min=seniority.min,
                 max=seniority.max,
             ),
+            industries_include=frozenset(fold(industry) for industry in scope.industries_include),
             industries_exclude=frozenset(fold(industry) for industry in scope.industries_exclude),
             accepted_ad_languages=frozenset(scope.accepted_ad_languages),
+            language_policy_default=scope.language_policy_default,
+            language_policy=MappingProxyType(language_policy),
             excluded_companies=frozenset(scope.excluded_companies),
             excluded_keywords=tuple(scope.excluded_keywords),
             exclude_keywords_in_description=scope.exclude_keywords_in_description,
+            min_salary_eur_year=scope.min_salary_eur_year,
+            knockout_severity=MappingProxyType(dict(scope.knockout_severity)),
             max_ad_age_days=scope.max_ad_age_days if isinstance(scope, model.Scope) else None,
         )
 
