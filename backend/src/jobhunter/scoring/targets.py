@@ -469,7 +469,7 @@ async def release_deferred(conn: AsyncConnection, *, now: datetime) -> int:
     released: list[RowMapping] = []
     tuple_id = config.active.llm_tuple_id
     if tuple_id is not None:
-        oldest = await _ids(conn, _OLDEST_DEFERRED, {"tuple": tuple_id, "k": k})  # step 10, skipping held rows
+        oldest = await _ids(conn, _OLDEST_DEFERRED, {"tuple": tuple_id, "k": k})  # step 10, held rows skipped
         released = await transition_where(
             conn,
             "score_targets",
