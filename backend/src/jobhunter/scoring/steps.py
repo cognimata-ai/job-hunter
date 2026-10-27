@@ -25,13 +25,16 @@ them: `validate_step` takes it from its caller, which reads it under `active_con
   (`required_facts`); the provisional aggregation under that scope with the fact confirmations and the
   injection assessment and the `not_a_job_ad_verified` of the last critic note; the triggers under
   the policy (`triggers.evaluate`). It stores the corrected draft with its validation, failures, provisional
-  aggregation and triggers (`DraftStore.save_validation`, `ValidationRecord`).
+  aggregation and triggers (`DraftStore.save_validation`, `ValidationRecord`). When that note reviewed this
+  very draft (a resumed attempt), `Validated` carries the note's derived outcome and the failures without
+  those of the facts it rejected (`unresolved_failures`), so the routing goes where the live critic round
+  went (Codex r2 B23).
 - `critic_step`: the stored draft validated again (pure: the same result as the stored one), the round's
   effort (`critic_effort`), the critic call with `<draft>`, `<required_facts>` and `<validator_issues>`
   (`llm_calls.round` is the critic round, 1-3), `parse_critic`, `validate_review`, the fact confirmations of
   this round over the last note's (`apply_fact_confirmations`), and the note stored (`DraftStore.add_note`).
   `Reviewed.det_failures` are the draft's failure keys without those of the facts the review rejected (a
-  rejected fact is dropped, L4555). An invalid output is `Reviewed` without a note.
+  rejected fact is dropped, L4555; `unresolved_failures`). An invalid output is `Reviewed` without a note.
 - `revise_step`: the reviser call (`round` the new draft's, 1-2) with `<previous_draft>` (the validated
   draft) and `<issues>` (L4544: the validator's failures and issues, the critic's grounded disputes with
   their suggested levels and quotes, the `fact_rejected`, `fact_uncertain` and unreviewed required facts, and
@@ -217,6 +220,14 @@ class StoredNote:
     def not_a_job_ad_verified(self) -> bool:
         return self.validation.get("not_a_job_ad_verified") is True
 
+    @property
+    def fact_reviews(self) -> dict[str, JSONValue]:
+        """Each required fact's review in this round (`critic_confirmed`, `critic_rejected`, `uncertain`)."""
+        stored = self.validation.get("fact_reviews")
+        if not isinstance(stored, dict):
+            raise ValueError(f"critic note {self.id}: no stored fact reviews")
+        return dict(stored)
+
 
 class DraftStore(Protocol):
     """Where the steps keep the drafts and notes of one scoring."""
@@ -263,10 +274,16 @@ class Drafted:
 
 @dataclass(frozen=True)
 class Validated:
-    """The result of `validate_step`: the triggers and the draft's failure keys."""
+    """The result of `validate_step`: the triggers and the draft's failure keys (`failures`, as its row
+    stores them), and, when the attempt's last critic note reviewed this very draft (a resumed attempt),
+    that note's derived outcome (`review`, else `None`). `det_failures` are the failures the routing and
+    the state go by: the draft's, without those of the facts that review rejected (`unresolved_failures`,
+    as after a live critic round)."""
 
     triggers: list[Trigger]
     failures: list[str] = field(repr=False)
+    det_failures: list[str] = field(repr=False)
+    review: DerivedOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -325,6 +342,14 @@ def failure_keys(validation: DraftValidation) -> list[str]:
     """The keys of the draft's deterministic failures, in order, distinct (`score_drafts`'
     `deterministic_failures`)."""
     return list(dict.fromkeys(failure.key for failure in validation.failures))
+
+
+def unresolved_failures(failures: Sequence[str], fact_reviews: Mapping[str, object]) -> list[str]:
+    """`failures` without the keys of the facts a critic review rejected (`fact_reviews`: fact id to its
+    review): a rejected fact is dropped with its failures (L4555). The one rule of the live critic round
+    (`critic_step`) and of a resumed draft routed by its restored review (`validate_step`)."""
+    rejected = {name for name, status in fact_reviews.items() if status == "critic_rejected"}
+    return [key for key in failures if key not in rejected]
 
 
 def _decimal(value: object) -> JSONValue:
@@ -422,7 +447,11 @@ async def validate_step(
         triggers=list(triggers),
     )
     await store.save_validation(draft_id, record)
-    return Validated(triggers, failures)
+    if note is not None and note.draft_id == draft_id:  # the draft has its review already (a resume)
+        return Validated(
+            triggers, failures, unresolved_failures(failures, note.fact_reviews), note.derived_outcome
+        )
+    return Validated(triggers, failures, failures)
 
 
 def _target(key: object, validation: DraftValidation) -> str | None:
@@ -551,7 +580,6 @@ async def critic_step(
             validation=_note_validation(review, checked, required, confirmations, inputs),
         )
     )
-    rejected = {name for name, status in checked.fact_reviews.items() if status == "critic_rejected"}
     return Reviewed(
         effort=effort,
         note_id=note_id,
@@ -559,7 +587,7 @@ async def critic_step(
         derived_outcome=checked.derived_outcome,
         verdict_mismatch=checked.verdict_mismatch,
         not_a_job_ad_verified=checked.not_a_job_ad_verified,
-        det_failures=[key for key in failure_keys(validation) if key not in rejected],
+        det_failures=unresolved_failures(failure_keys(validation), checked.fact_reviews),
     )
 
 

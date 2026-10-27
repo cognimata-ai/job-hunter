@@ -42,8 +42,9 @@ M3 Task 9 adds the `score_target` subgraph's side:
   senior title for `score_profile`), and `synthetic_review(*reviews, verdict=…, injection=…)` with
   `review_item(target, assessment, *quotes, suggested_level=None)` a critic answer;
 - `Walk`, `Trace` and `route(walk)` walk the routing of §9.4.2 (`scoring.routing`) with scripted step
-  outcomes and count the logical calls and HTTP tries a real attempt would count (a step denied before its
-  dispatch, by the budget or a lost claim, counts neither, L3567).
+  outcomes, from a fresh start or a resumed one (`Resume`), and count the logical calls and HTTP tries a real
+  attempt would count (a step denied before its dispatch, by the budget or a lost claim, counts neither,
+  L3567).
 """
 
 import asyncio
@@ -597,12 +598,24 @@ _MAX_STEPS: Final = 50
 
 
 @dataclass(frozen=True)
+class Resume:
+    """Where a resumed attempt starts (`load_context` restored it): the current draft's `round`, the chain's
+    `critic_rounds`, and the derived outcome of the current draft's own review (`None`: none reviewed
+    it)."""
+
+    round: int
+    critic_rounds: int
+    review: DerivedOutcome | None = None
+
+
+@dataclass(frozen=True)
 class Walk:
     """The scripted outcomes of one attempt. `generate` is its calls' outcomes, a tuple or one string of
     them joined by `_then_` (`"invalid_then_ok"`); `critic` one per critic call (`accept`, `revise`,
     `incomplete`, `invalid` or an error code), `revise` one per reviser call (`ok`, `invalid` or an error
     code); `triggers` and `failures` are each validated draft's, in order (the last repeats); `tries` the
-    HTTP tries of each dispatched logical call, in order (the last repeats)."""
+    HTTP tries of each dispatched logical call, in order (the last repeats); `resume` a resumed start (the
+    restored draft is the first validated one)."""
 
     generate: str | tuple[str, ...] = "ok"
     critic: tuple[str, ...] = ()
@@ -610,12 +623,15 @@ class Walk:
     triggers: tuple[tuple[str, ...], ...] = (("T5",), ())
     failures: tuple[tuple[str, ...], ...] = ((),)
     tries: tuple[int, ...] = (1,)
+    resume: Resume | None = None
 
 
 @dataclass(frozen=True)
 class Trace:
     """The steps of a walk (a repair named `repair`, the end `publish` or `fail`), the logical calls and HTTP
-    tries it made, how it ended (`publish(<mode>)`, `fail(<code>)` or `end`), its rounds and critic rounds."""
+    tries it made, how it ended (`publish(<mode>)`, `fail(<code>)` or `end`), its rounds and critic rounds,
+    and the last review the routing went by (a critic round's or the restored one), with the failures of the
+    draft it reviewed."""
 
     steps: tuple[str, ...]
     logical_calls: int
@@ -623,6 +639,8 @@ class Trace:
     ends_with: str
     round: int
     critic_rounds: int
+    last_review: DerivedOutcome | None = None
+    reviewed_failures: tuple[str, ...] = ()
 
 
 def _nth[T](items: Sequence[T], n: int) -> T:
@@ -630,14 +648,20 @@ def _nth[T](items: Sequence[T], n: int) -> T:
 
 
 def route(walk: Walk) -> Trace:
-    """Walk `walk` through `scoring.routing` from a fresh `load_context` (module notes)."""
+    """Walk `walk` through `scoring.routing` from `load_context`, fresh or resumed (module notes)."""
     generate = walk.generate.split("_then_") if isinstance(walk.generate, str) else list(walk.generate)
     scripts = {"generate": list(generate), "critic": list(walk.critic), "revise": list(walk.revise)}
     steps: list[str] = []
     logical = http = drafts = round = critic_rounds = 0
+    restored: DerivedOutcome | None = None
+    if walk.resume is not None:  # the restored draft is the first one validated
+        drafts, round, critic_rounds = 1, walk.resume.round, walk.resume.critic_rounds
+        restored = walk.resume.review
+    last_review: DerivedOutcome | None = None
+    reviewed_failures: tuple[str, ...] = ()
     repair_used = False
     failures: tuple[str, ...] = ()
-    step = routing.after_load_context(outcome=None, error_code=None, resumed=False)
+    step = routing.after_load_context(outcome=None, error_code=None, resumed=walk.resume is not None)
     while step.route not in ("publish", "fail", routing.END):
         if len(steps) > _MAX_STEPS:
             raise AssertionError(f"the routing does not end: {steps}")
@@ -646,13 +670,16 @@ def route(walk: Walk) -> Trace:
         repair_used = repair_used or step.repair
         if name == "validate":
             failures = _nth(walk.failures, drafts - 1)
+            if restored is not None:
+                last_review, reviewed_failures = restored, failures
             step = routing.after_validate(
                 triggers=_nth(walk.triggers, drafts - 1),
                 det_failures=failures,
                 critic_rounds=critic_rounds,
                 round=round,
-                review=None,
+                review=restored,
             )
+            restored = None  # only the restored draft has its review already
             continue
         if not scripts[name]:
             raise AssertionError(f"the walk scripts no outcome for {name} call {len(steps)}")
@@ -663,6 +690,8 @@ def route(walk: Walk) -> Trace:
         if name == "critic" and (outcome in _REVIEWS or outcome == "invalid"):
             review = _REVIEWS.get(outcome)
             critic_rounds += review is not None
+            if review is not None:
+                last_review, reviewed_failures = review, failures
             step = routing.after_critic(
                 review=review,
                 det_failures=failures,
@@ -684,4 +713,4 @@ def route(walk: Walk) -> Trace:
         ends_with = f"fail({step.error_code})"
     else:
         ends_with = "end"
-    return Trace(tuple(steps), logical, http, ends_with, round, critic_rounds)
+    return Trace(tuple(steps), logical, http, ends_with, round, critic_rounds, last_review, reviewed_failures)

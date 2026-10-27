@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
+from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.errors import NodeFailed
 from jobhunter.graphs.score import nodes as score_nodes
@@ -27,7 +28,7 @@ from jobhunter.scoring.validator import ParsedGenerator, parse_generator
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import SimulatedCrash, no_fault, raising_at
-from tests.support.llm import FakeLLM
+from tests.support.llm import FakeLLM, save_budget
 from tests.support.m3 import (
     NOW,
     Job,
@@ -41,6 +42,7 @@ from tests.support.m3 import (
 )
 from tests.support.m3 import insert_submission as insert_batch_submission
 from tests.support.scoring import (
+    ClaimedTarget,
     activate_test_policy,
     attempt_of,
     claim_again,
@@ -620,3 +622,201 @@ async def test_a_previous_max_tokens_stop_starts_the_next_attempt_enlarged(
         (claimed.attempt_id, "enlarged", 12000, "max_tokens"),
         (again.attempt_id, "enlarged", 12000, None),
     ]
+
+
+def record_scoring(fake_llm: FakeLLM) -> None:
+    """Recordings of the score purposes on the stored version-2 schemas, from which the fake makes the keyed
+    scenarios that need a stored stream (`refusal`, `max_tokens`)."""
+    _, schemas = prompt_schema_v2()
+    generator, critic = schemas["generator"], schemas["critic"]
+    assert isinstance(generator, dict) and isinstance(critic, dict)
+    for purpose in ("generate", "revise"):
+        fake_llm.record(purpose, "claude-sonnet-5-5", synthetic_c_draft(), schema=generator)
+    fake_llm.record("critic", "claude-opus-5-5", synthetic_review(), schema=critic)
+
+
+def answer_scenario(purpose: str, revision: int, round: int, scenario: fake.Scenario) -> None:
+    """The keyed scenario of every try of `purpose`'s call of `round` for the revision."""
+    fake.answer(fake.answer_key(purpose, {"job_revision_id": revision}, round), scenario)
+
+
+# A mandatory certification whose quote does not ground (a V3 failure of its fact id), which the critic
+# rejects with a grounded quote and an `accept` verdict.
+UNGROUNDED_CERTIFICATE = fact_item(
+    "certification",
+    "AWS Solutions Architect",
+    "AWS Certified Solutions Architect Professional",
+    required=True,
+)
+REJECTED = review_item(CERTIFICATION, "fact_rejected", "Python, PostgreSQL")
+
+
+async def rejected_certificate(engine: AsyncEngine, fake_llm: FakeLLM) -> ClaimedTarget:
+    """A claimed target of the scenario above, whose reviser refuses."""
+    claimed = await claimed_target(engine, ad=CERTIFIED_AD)
+    revision = claimed.job_revision_id
+    fake_llm.answer("generate", revision, synthetic_c_draft(facts=[*FACTS, UNGROUNDED_CERTIFICATE]))
+    fake_llm.answer("critic", revision, synthetic_review(REJECTED), round=1, schema=CriticOut)
+    answer_scenario("revise", revision, 1, "refusal")
+    return claimed
+
+
+async def test_a_resumed_review_drops_the_rejected_facts_failures_as_the_live_critic_does(
+    engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record_scoring(fake_llm)
+    live = await rejected_certificate(engine, fake_llm)
+    live_final = await invoke_subgraph(deps, live)
+    # the same scenario dies after the critic's note has committed, at its reviser's reservation
+    crashed = await rejected_certificate(engine, fake_llm)
+    monkeypatch.setattr(gateway_module, "afault_point", crash_at_arrival("gateway.after_reserve", 3))
+    with pytest.raises(NodeFailed):
+        await invoke_subgraph(deps, crashed)
+    monkeypatch.setattr(gateway_module, "afault_point", no_fault)
+    await reclaim_now(engine, crashed.target_id)
+    again = await claim_again(engine, crashed.target_id)
+    resumed_final = await invoke_subgraph(deps, again)
+    for final in (live_final, resumed_final):
+        # derived `revise` (the draft has a failure, `validate_review`); the rejected fact's failure is gone
+        assert (final["outcome"], final["last_critic_outcome"], final["det_failures"]) == (
+            "fail(refused)",
+            "revise",
+            [],
+        )
+    assert resumed_final["resumed"] is True
+    for target in (live, crashed):
+        (draft,) = await rows(engine, _DRAFTS, target.target_id)
+        assert draft.deterministic_failures == [CERTIFICATION]  # the draft's exact key stays on its row
+        (note,) = await rows(engine, _NOTES, target.target_id)
+        assert (note.verdict_returned, note.derived_outcome) == ("accept", "revise")
+    live_calls = await rows(engine, _CALLS, live.target_id)
+    assert [(c.purpose, c.round) for c in live_calls] == [("generate", 0), ("critic", 1), ("revise", 1)]
+    resumed_calls = [
+        c for c in await rows(engine, _CALLS, crashed.target_id) if c.attempt_id == again.attempt_id
+    ]
+    # the resumed attempt went where the live critic went, with no second critic call
+    assert [(c.purpose, c.round, c.logical_call_no) for c in resumed_calls] == [("revise", 1, 1)]
+
+
+async def test_a_budget_denial_before_the_first_dispatch_fails_the_attempt_cleanly(
+    engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM
+) -> None:
+    claimed = await claimed_target(engine)
+    fake_llm.answer("generate", claimed.job_revision_id, synthetic_c_draft())
+    await save_budget(engine, now=utcnow(), cap_usd="2.01")  # A = $0.01: below any worst case
+    final = await invoke_subgraph(deps, claimed)
+    assert (final["outcome"], final["error_code"]) == ("fail(budget_exhausted)", "budget_exhausted")
+    attempt = await attempt_of(engine, claimed.attempt_id)
+    assert (attempt.logical_calls, attempt.http_calls, attempt.charged) == (0, 0, False)
+    assert fake_llm.requests == []  # no HTTP try
+    async with engine.connect() as conn:
+        calls = (
+            await conn.execute(
+                sa.text("SELECT count(*) FROM llm_calls WHERE target_id = :t"), {"t": claimed.target_id}
+            )
+        ).scalar_one()
+    assert calls == 0 and (await rows(engine, _DRAFTS, claimed.target_id)) == []
+
+
+@pytest.mark.parametrize("step", ["critic", "revise"])
+@pytest.mark.parametrize(
+    ("scenario", "code", "tries", "last"),
+    [
+        ("refusal", "refused", 1, ("completed", "refused")),
+        ("overloaded_529", "llm_transient", 3, ("error", "http_529")),  # the gateway's tries are spent
+    ],
+    ids=["refusal", "transient"],
+)
+async def test_a_refusal_or_a_transient_failure_of_the_critic_or_the_reviser_fails_the_attempt(
+    engine: AsyncEngine,
+    deps: ScoreDeps,
+    fake_llm: FakeLLM,
+    step: str,
+    scenario: fake.Scenario,
+    code: str,
+    tries: int,
+    last: tuple[str, str],
+) -> None:
+    record_scoring(fake_llm)
+    claimed = await claimed_target(engine)
+    revision = claimed.job_revision_id
+    fake_llm.answer("generate", revision, synthetic_c_draft(levels=T2_LEVELS))
+    if step == "revise":
+        dispute = review_item("role_fit", "level_too_low", "Backend Engineer (m/w/d)", suggested_level=3)
+        fake_llm.answer(
+            "critic", revision, synthetic_review(dispute, verdict="revise"), round=1, schema=CriticOut
+        )
+    answer_scenario(step, revision, 1, scenario)
+    final = await invoke_subgraph(deps, claimed)  # an outcome of the step, never a NodeFailed
+    assert (final["outcome"], final["error_code"]) == (f"fail({code})", code)
+    drafts = await rows(engine, _DRAFTS, claimed.target_id)
+    assert [d.round for d in drafts] == [0] and final["current_draft_id"] == drafts[0].id
+    notes = await rows(engine, _NOTES, claimed.target_id)
+    assert [(n.round, n.derived_outcome) for n in notes] == ([] if step == "critic" else [(1, "revise")])
+    logical_call_no = 2 if step == "critic" else 3
+    failed = [c for c in await rows(engine, _CALLS, claimed.target_id) if c.purpose == step]
+    assert [(c.round, c.logical_call_no) for c in failed] == [(1, logical_call_no)] * tries
+    assert (failed[-1].status, failed[-1].error_code) == last
+    attempt = await attempt_of(engine, claimed.attempt_id)
+    assert (attempt.logical_calls, attempt.http_calls) == (logical_call_no, logical_call_no - 1 + tries)
+
+
+@pytest.mark.parametrize(
+    ("mode", "previous", "state_reason", "stage"),
+    [
+        # a crash between the stages of the previous attempt's call: its newest call stopped at the first
+        ("online", ("max_tokens_first_stage", 6000), None, "enlarged"),
+        # it stopped at a first stage smaller than the one this attempt pinned: the first stage is new
+        ("online", ("max_tokens", 4000), None, "first"),
+        # a batch item stopped at max_tokens (A2 T17), its batch call at the first stage's 6,000
+        ("batch", None, "batch_max_tokens", "enlarged"),
+    ],
+    ids=["first_stage_stop", "smaller_stage", "batch_max_tokens"],
+)
+async def test_the_start_stage_follows_how_the_previous_attempt_stopped(
+    engine: AsyncEngine,
+    deps: ScoreDeps,
+    fake_llm: FakeLLM,
+    mode: str,
+    previous: tuple[str, int] | None,
+    state_reason: str | None,
+    stage: str,
+) -> None:
+    pending = await insert_target(engine)
+    target = pending.target_id
+    async with engine.begin() as conn:  # the previous attempt and its newest generator call
+        await conn.execute(
+            sa.text("UPDATE score_targets SET attempt_no = 1, state_reason = :reason WHERE id = :t"),
+            {"reason": state_reason, "t": target},
+        )
+        lane = "similarity" if mode == "online" else "batch"
+        attempt = await insert_attempt(conn, target, mode=mode, outcome="transient_error", lane=lane)
+        _, call = await insert_scoring_call(
+            conn, attempt_id=attempt, target_id=target, transport="stream" if mode == "online" else "batch"
+        )
+        if previous is not None:  # the call went reserved -> dispatched -> completed
+            code, max_tokens = previous
+            await conn.execute(
+                sa.text("UPDATE llm_calls SET status = 'dispatched' WHERE id = :c"), {"c": call}
+            )
+            await conn.execute(
+                sa.text(
+                    "UPDATE llm_calls SET status = 'completed', error_code = :code, max_tokens = :m, "
+                    "stop_reason = 'max_tokens', output_tokens = :m WHERE id = :c"
+                ),
+                {"code": code, "m": max_tokens, "c": call},
+            )
+    claimed = await claim_again(engine, target)
+    fake_llm.answer("generate", claimed.job_revision_id, synthetic_c_draft())
+    final = await invoke_subgraph(deps, claimed)
+    assert final["outcome"] == "publish(accepted)" and final["start_stage"] == stage
+    (made,) = [c for c in await rows(engine, _CALLS, target) if c.attempt_id == claimed.attempt_id]
+    async with engine.connect() as conn:
+        sent = (
+            await conn.execute(
+                sa.text("SELECT max_tokens_stage, max_tokens FROM llm_calls WHERE attempt_id = :a"),
+                {"a": claimed.attempt_id},
+            )
+        ).one()
+    assert (made.purpose, made.logical_call_no) == ("generate", 1)
+    assert tuple(sent) == ((stage, 12000) if stage == "enlarged" else (stage, 6000))

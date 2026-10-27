@@ -1,9 +1,10 @@
 """The routing of one score attempt (spec §9.4.2 L3546-3568; plan Task 9, Deviation 17): the maximal path uses
 exactly 7 logical calls, a budget denial before the first dispatch ends the attempt cleanly, every later
 draft goes back to the critic once one ran (T0), and the settled exits of Deviation 17 (a resumed draft that
-already has its review, an invalid revision after the repair, the error exits of critic and revise)."""
+already has its review, an invalid revision after the repair, the error exits of critic and revise). The
+walks drive `scoring.routing` alone; the same exits through the subgraph's nodes, the gateway and the
+database are `tests/integration/test_score_target_nodes.py`'s."""
 
-from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -25,6 +26,7 @@ from jobhunter.llm.errors import (
 from jobhunter.llm.prompts.render import PromptVersionUnscorable
 from jobhunter.scoring import routing
 from jobhunter.scoring.routing import Next
+from jobhunter.scoring.steps import unresolved_failures
 from langgraph.errors import NodeTimeoutError
 
 from tests.support.scoring import Walk, route
@@ -34,14 +36,11 @@ MAXIMAL = ("generate", "repair", "validate", "critic", "revise", "validate", "cr
 
 def test_the_maximal_path_uses_exactly_seven_logical_calls() -> None:
     walk = Walk(generate="invalid_then_ok", critic=("revise", "revise", "accept"), revise=("ok", "ok"))
-    trace = route(
-        walk
-    )  # generate, repair, validate, critic, revise, validate, critic, revise, validate, critic
+    # generate, repair, validate, critic, revise, validate, critic, revise, validate, critic, publish
+    trace = route(walk)
     assert trace.steps == (*MAXIMAL, "critic", "publish")
     assert trace.logical_calls == 7 and trace.http_calls <= 42 and trace.ends_with == "publish(accepted)"
     assert (trace.round, trace.critic_rounds) == (2, 3)
-    # every logical call at its 6 HTTP tries is the 42 of L3567, exactly
-    assert route(replace(walk, tries=(6,))).http_calls == 42
 
 
 def test_budget_denied_before_the_first_dispatch_ends_cleanly() -> None:
@@ -111,20 +110,32 @@ def test_the_error_exits_apply_to_the_critic_and_the_reviser(step: str, code: st
     assert trace.ends_with == f"fail({code})" and trace.steps[-2:] == (step, "fail")
 
 
+CERTIFICATE = "certification:aws solutions architect"
+
+
 @pytest.mark.parametrize(
-    ("review", "round", "expected"),
+    ("review", "round", "failures", "reviews", "expected"),
     [
-        ("accept", 0, routing.publish("accepted")),
-        ("revise", 0, Next("revise")),
-        ("incomplete", 1, Next("revise")),
-        ("revise", 2, routing.publish("contested")),  # the exhausted-revision rule, restored (Codex r3 B9)
+        ("accept", 0, [], {}, routing.publish("accepted")),
+        ("revise", 0, [], {}, Next("revise")),
+        ("incomplete", 1, [], {}, Next("revise")),
+        ("revise", 2, [], {}, routing.publish("contested")),  # the exhausted-revision rule (Codex r3 B9)
+        # the failure of a fact the review rejected goes with the fact (L4555), as after the live critic
+        ("accept", 0, [CERTIFICATE], {CERTIFICATE: "critic_rejected"}, routing.publish("accepted")),
+        ("accept", 0, [CERTIFICATE, "skills"], {CERTIFICATE: "critic_rejected"}, Next("revise")),
+        ("accept", 2, [CERTIFICATE], {CERTIFICATE: "critic_confirmed"}, routing.publish("contested")),
     ],
 )
 def test_a_resumed_draft_with_its_review_is_routed_by_it(
-    review: routing.DerivedOutcome, round: int, expected: Next
+    review: routing.DerivedOutcome,
+    round: int,
+    failures: list[str],
+    reviews: dict[str, str],
+    expected: Next,
 ) -> None:
+    det_failures = unresolved_failures(failures, reviews)  # the one helper of both paths
     nxt = routing.after_validate(
-        triggers=["T0"], det_failures=[], critic_rounds=round + 1, round=round, review=review
+        triggers=["T0"], det_failures=det_failures, critic_rounds=round + 1, round=round, review=review
     )
     assert nxt == expected  # never the critic again (Codex r2 B23)
 

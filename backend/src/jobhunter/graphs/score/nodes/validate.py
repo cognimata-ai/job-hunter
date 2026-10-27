@@ -10,9 +10,10 @@ corrected draft as `output_json`, so the critic, the reviser, the publish and a 
 triggers. The provisional aggregation reads the confirmations, the injection assessment and the
 `not_a_job_ad_verified` of the attempt's last critic note (`last_critic_note_id`).
 
-The state takes the triggers and the failure keys (`state.state_failure_keys`); the routing
+The state takes the triggers and the unresolved failure keys (`state.state_failure_keys`); the routing
 (`routing.after_validate`) goes to `publish`, `critic` or, for a resumed draft that already has its review
-(`last_critic_draft_id` is the current draft), where that review routes (`revise` or `publish`).
+(the last note reviewed the current draft), where that review routes (`revise` or `publish`), with the
+failures of the facts it rejected dropped as after the live critic round (`steps.unresolved_failures`).
 """
 
 from typing import Final
@@ -69,7 +70,6 @@ def make_validate(deps: ScoreDeps) -> Node:
                 )
         except FencedOut as error:
             return failure(error, state, NAME)
-        reviewed = state["last_critic_draft_id"] == draft_id
         log.info(
             "score_draft_validated",
             target_id=state["target_id"],
@@ -78,16 +78,17 @@ def make_validate(deps: ScoreDeps) -> Node:
             scope_version_id=scope_version_id,
             triggers=validated.triggers,
             failures=len(validated.failures),
-            reviewed=reviewed,
+            unresolved=len(validated.det_failures),
+            review=validated.review,
         )
         nxt = routing.after_validate(
             triggers=validated.triggers,
-            det_failures=validated.failures,
+            det_failures=validated.det_failures,
             critic_rounds=state["critic_rounds"],
             round=state["round"],
-            review=state["last_critic_outcome"] if reviewed else None,
+            review=validated.review,
         )
         triggers: list[str] = list(validated.triggers)
-        return goto(nxt, {"triggers": triggers, "det_failures": state_failure_keys(validated.failures)})
+        return goto(nxt, {"triggers": triggers, "det_failures": state_failure_keys(validated.det_failures)})
 
     return validate
