@@ -600,6 +600,31 @@ async def test_settlement_figures_and_the_counter_table(engine, op_owner) -> Non
             )
 
 
+async def test_unstorable_provider_metadata_is_replaced_and_the_settlement_commits(
+    engine, op_owner, caplog
+) -> None:
+    """M2 Carry-forward J1: a NUL or a lone surrogate in the provider metadata a settlement writes is replaced
+    by `?` (no `text` column holds a NUL, no UTF-8 a lone surrogate), so the billed settlement never rolls
+    back; the event names the fields only."""
+    t = utcnow()
+    res = await dispatched(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))
+    call = completed_call(
+        model_served="claude-opus-5-5\x00", stop_reason="end_turn\ud800", provider_request_id="req_\x00\udfff"
+    )
+    async with engine.begin() as conn:
+        await settle(conn, res, outcome="billed", evidence=None, usage=USAGE, call=call, now=t)
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.text("SELECT model_served, stop_reason, provider_request_id, status FROM llm_calls"),
+            )
+        ).one()
+    assert tuple(row) == ("claude-opus-5-5?", "end_turn?", "req_??", "completed")
+    assert (await ledger_row(engine, res.ledger_id)).state == "billed"
+    (event,) = logged(caplog, "llm_provider_metadata_unstorable")
+    assert event["fields"] == ["model_served", "stop_reason", "provider_request_id"]
+
+
 async def test_the_call_records_its_owner_and_deadline(engine, op_owner) -> None:
     t = utcnow()
     res = await reserved(
@@ -679,8 +704,8 @@ async def test_owner_holds_tests_the_recorded_owner(engine, op_owner, eval_owner
         assert not await owner_holds(conn, stale, now=utcnow())
         assert not await owner_holds(conn, {"kind": "operation", "id": 10**9, "claim_id": "x"}, now=utcnow())
         assert not await owner_holds(conn, {"kind": "eval_run", "id": 10**9}, now=utcnow())
-        with pytest.raises(ValueError, match="owner"):
-            await owner_holds(conn, {"kind": "target", "id": 1}, now=utcnow())
+        with pytest.raises(ValueError, match="owner"):  # a writer this function does not know
+            await owner_holds(conn, {"kind": "run", "id": 1}, now=utcnow())
 
 
 # ---- the reconcilers (§17.4) ------------------------------------------------------------------------------

@@ -6,17 +6,21 @@ from decimal import Decimal
 from importlib import resources
 
 import pytest
-from jobhunter.llm import budget
+from jobhunter.errors import FencedOut
+from jobhunter.llm import bounds, budget
 from jobhunter.llm.budget import BudgetParams, admissible, admits, bucket_capacity, month_of, rate_per_s
 from jobhunter.llm.errors import (
     BudgetExhausted,
+    ClaimLost,
     InvalidOutput,
     LLMError,
     LLMRequestError,
     ModelMismatch,
     Refused,
 )
+from jobhunter.llm.pricing import MODELS
 from jobhunter.observability import metrics
+from jobhunter.settings.model import ExecutionConfig, ExecutionNode, ModelPolicy, ModelPolicyNodes, NodeChoice
 from prometheus_client import generate_latest
 
 P = BudgetParams(
@@ -200,6 +204,49 @@ def test_errors_carry_codes_and_amounts_only() -> None:
     assert Refused("cyber").category == "cyber"
     mismatch = ModelMismatch("claude-opus-5-5", "claude-sonnet-5-5")
     assert (mismatch.requested, mismatch.served) == ("claude-opus-5-5", "claude-sonnet-5-5")
+    # §17.1 `claim_lost`: a score target's lost claim is a fence of that one owner, never the worker's own
+    lost = ClaimLost()
+    assert isinstance(lost, FencedOut) and lost.owner == "score_target" and not lost.worker_superseded
+    assert str(lost) == "fenced out: score_target"
+
+
+def test_r_first_is_the_generate_nodes_first_stage_worst_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    """§6.9.4: the worst-case reservation of a first generator call, on the policy's generate model and the
+    execution config's first stage, over the §21.4 input bound at the measured overhead."""
+    # the measured overhead (1,878): (1,878 + 36,800 - 1,000) = 37,678 x $2.50 + 6,000 x $10 per MTok
+    assert bounds.PROMPT_OVERHEAD_TOKENS["claude-sonnet-5-5"] == 1_878
+    assert budget.r_first(ModelPolicy(), ExecutionConfig()) == Decimal("0.154195")
+    monkeypatch.setattr(bounds, "PROMPT_OVERHEAD_TOKENS", dict.fromkeys(MODELS, 2_640))
+    # a Haiku generator (policy C): 38,440 x $0.125 + 6,000 x $0.50 per MTok = $0.004805 + $0.003000
+    haiku = ModelPolicy(
+        nodes=ModelPolicyNodes(generate=NodeChoice(model="claude-haiku-5-5", effort="medium"))
+    )
+    assert budget.r_first(haiku, ExecutionConfig()) == Decimal("0.007805")
+    # a larger first stage: 38,440 x $2.50 + 8,000 x $10 per MTok = $0.096100 + $0.080000
+    larger = ExecutionConfig(
+        generate=ExecutionNode(max_tokens=8_000, max_tokens_retry=16_000, deadline_s=600)
+    )
+    assert budget.r_first(ModelPolicy(), larger) == Decimal("0.176100")
+
+
+def test_c_hat_followup_follows_the_policys_funnel() -> None:
+    """§6.9.3: the expected online critic-plus-revise cost of a triggered draft; a Haiku generator (policy C)
+    triggers more follow-ups per reviewed draft (§21.2: q1 = 0.45, q2 = 0.35) on its Sonnet critic."""
+    policy_c = ModelPolicy(
+        preset="C",
+        nodes=ModelPolicyNodes(
+            generate=NodeChoice(model="claude-haiku-5-5", effort="medium"),
+            revise=NodeChoice(model="claude-haiku-5-5", effort="medium"),
+            critic=NodeChoice(model="claude-sonnet-5-5", effort="medium"),
+        ),
+    )
+    # full critic (Sonnet): 3,400 x 2 + 4,500 x 0.20 + 1,300 x 10 = 20,700 → $0.020700;
+    # light critic (Sonnet, low): 3,400 x 2 + 4,500 x 0.20 + 800 x 10 = 15,700 → $0.015700;
+    # revision (Haiku, 1.3 x the tokens): 1.3 x (3,700 x 0.10 + 4,500 x 0.01 + 1,700 x 0.50) = 1,644.5
+    # → $0.0016445; follow-ups 0.45 + 0.45 x 0.35 = 0.6075; first round 0.35 x 0.0157 + 0.65 x 0.0207
+    # = $0.01895; ĉ_followup = 0.01895 + 0.6075 x 0.0207 + 0.6075 x 0.0016445
+    # = 0.01895 + 0.01257525 + 0.00099903375 = 0.03252428375 → $0.032524 (half-up)
+    assert budget.c_hat_followup(policy_c) == Decimal("0.032524")
 
 
 def test_the_spend_series_have_their_17_5_names() -> None:

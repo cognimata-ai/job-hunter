@@ -26,15 +26,24 @@ and, late, from `ambiguous` alike.
 **Cap edits.** Raising the cap takes effect at once. Lowering it below `counted_usd` records `cap_lowered_at`
 and `counted_at_cap_change_usd`, so the cap invariant of §7.17 #6 is `counted_usd ≤ max(cap_usd,
 counted_at_cap_change_usd)` (`cap_holds`).
+
+**Scoring estimates** (M3). `r_first` is §6.9.4's worst-case reservation of a first generator call, the unit
+of the headroom that returns `budget_deferred` targets; `c_hat_followup` is §6.9.3's `ĉ_followup`, the
+expected online critic-plus-revise cost of a triggered draft, which a batch submission holds per item.
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-from decimal import ROUND_FLOOR, Decimal, InvalidOperation
-from typing import Final, Literal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Final, Literal
 
+from jobhunter.llm import bounds
+from jobhunter.llm.pricing import worst_case_usd
 from jobhunter.types import JSONValue, get_int, json_get
+
+if TYPE_CHECKING:
+    from jobhunter.settings.model import ExecutionConfig, ModelPolicy
 
 Purpose = Literal["generate", "revise", "critic", "extract_profile", "propose_queries", "schema_dry_run"]
 PurposeClass = Literal["scoring", "nonscoring"]
@@ -45,6 +54,10 @@ SCORING_PURPOSES: Final[frozenset[Purpose]] = frozenset({"generate", "revise", "
 USD_QUANTUM: Final = Decimal("0.000001")
 # `llm.cap_80pct` (§17.6): counted spend at or above this share of the cap.
 CAP_ALERT_SHARE: Final = Decimal("0.8")
+# §21.4 L6624: the input bound of a score request from its assumed component sizes (rubric 9.0 KB, profile
+# 9.5 KB, role 1.3 KB, ad 8.0 KB, output schema 8.0 KB) plus the 1,000-token overhead floor (plan Deviation
+# 22: `r_first` re-derives it at the measured overhead).
+SIZING_INPUT_BOUND_TOKENS: Final = 36_800
 _ZERO: Final = Decimal(0)
 
 
@@ -263,3 +276,27 @@ def cap_holds(row: BudgetRow) -> bool:
 def cap_share_reached(row: BudgetRow) -> bool:
     """`llm.cap_80pct` (§17.6): counted spend at or above 80% of a non-zero cap."""
     return row.cap_usd > 0 and row.counted_usd >= CAP_ALERT_SHARE * row.cap_usd
+
+
+def r_first(model_policy: "ModelPolicy", execution: "ExecutionConfig") -> Decimal:
+    """§6.9.4's `r_first`: the worst-case reservation of a first generator call, on the policy's generate
+    model at the execution config's first stage, over the §21.4 input bound re-derived from the current
+    overhead,
+    `PROMPT_OVERHEAD_TOKENS[model] + 36,800 - 1,000` (plan Deviation 22): the component sizes of L6624 with
+    the measured overhead in place of the floor they were sized with."""
+    model = model_policy.nodes.generate.model
+    bound = bounds.PROMPT_OVERHEAD_TOKENS[model] + SIZING_INPUT_BOUND_TOKENS - bounds.PROMPT_OVERHEAD_FLOOR
+    return worst_case_usd(model, input_tokens_bound=bound, max_tokens=execution.generate.max_tokens)
+
+
+def c_hat_followup(model_policy: "ModelPolicy") -> Decimal:
+    """§6.9.3's `ĉ_followup`: the expected online critic-plus-revise cost of a triggered draft under
+    `model_policy`, `(first_round + follow_ups x full_critic) + follow_ups x revision`, that is the critic and
+    revise parts of `llm_projection.target_cost` divided by the funnel's `first_round_rate`, rounded half-up
+    to $0.000001 ($0.066939 for policy B, the §21.4 figure)."""
+    # Imported here: the projection imports this module (its bucket and admission).
+    from jobhunter.settings import llm_projection
+
+    cost = llm_projection.target_cost(model_policy)
+    rate = llm_projection.funnel(model_policy).first_round_rate
+    return ((cost.critic + cost.revise) / rate).quantize(USD_QUANTUM, rounding=ROUND_HALF_UP)

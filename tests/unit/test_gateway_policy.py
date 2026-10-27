@@ -207,11 +207,8 @@ async def test_the_input_bound_raises_unencodable_without_the_encoding_error(tmp
     cfg = fake_llm_config(FAKE_LLM_DIR, tmp_path / "no-secrets")
     async with make_http_client(cfg) as client:
         gw = LLMGateway(cast(AsyncEngine, _NoEngine()), cfg, http_client=client, cache=CacheMonitor())
-        ctx = gateway.CallContext(
-            owner=EvalRunOwner(1), purpose_class="nonscoring", execution_config_id=1, deadline=0.0
-        )
         with pytest.raises(InputUnbounded) as refused:
-            await gw._input_bound(GATEWAY_NODE, gateway_prompt("half a pair: \ud800"), ctx)
+            await gw._input_bound(GATEWAY_NODE, gateway_prompt("half a pair: \ud800"), native_pdf=False)
     assert refused.value.reason == "unencodable"
     assert refused.value.__cause__ is None and refused.value.__context__ is None
 

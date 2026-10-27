@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 from jobhunter.db.seed import SETTINGS_SCHEMA_VERSION, load_settings_v1
@@ -239,16 +239,23 @@ async def insert_attempt(c: AsyncConnection, target_id: int, **columns: object) 
 
 @dataclass(frozen=True)
 class Claimed:
-    """An `in_progress` target and its `running` attempt: the owners a scoring call names."""
+    """An `in_progress` target and its `running` attempt: the owners a scoring call names, with the claim
+    (`claim_id`, `attempt_no`) the target's ownership predicate tests."""
 
     target_id: int
     attempt_id: int
+    claim_id: UUID
+    attempt_no: int
 
 
-async def insert_claimed(c: AsyncConnection, llm_tuple_id: int) -> Claimed:
-    """A target of a new job for the tuple, claimed (epoch 1, attempt 1, lane `similarity`), with its
-    `running` online attempt under the same claim."""
+async def insert_claimed(
+    c: AsyncConnection, llm_tuple_id: int, *, attempt_no: int = 1, **target_columns: object
+) -> Claimed:
+    """A target of a new job for the tuple, claimed (epoch 1, attempt `attempt_no`), with its `running` online
+    attempt under the same claim, both in lane `similarity` unless `target_columns` names another;
+    `target_columns` add to the target's columns (a `bulk_operation_id`)."""
     claim = uuid4()
+    lane = target_columns.pop("lane", "similarity")
     target = await insert_target(
         c,
         await insert_job(c),
@@ -258,11 +265,12 @@ async def insert_claimed(c: AsyncConnection, llm_tuple_id: int) -> Claimed:
         claim_epoch=1,
         claimed_at=NOW,
         claim_heartbeat_at=NOW,
-        attempt_no=1,
-        lane="similarity",
+        attempt_no=attempt_no,
+        lane=lane,
+        **target_columns,
     )
-    attempt = await insert_attempt(c, target, claim_id=claim, claim_epoch=1, lane="similarity")
-    return Claimed(target, attempt)
+    attempt = await insert_attempt(c, target, attempt_no=attempt_no, claim_id=claim, claim_epoch=1, lane=lane)
+    return Claimed(target, attempt, claim, attempt_no)
 
 
 _BUDGET: Final = q(

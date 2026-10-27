@@ -21,6 +21,12 @@ generator (C-shaped, `generator_wire_body`) and of the critic (`critic_body`) wi
 confirmed profile (`score_profile`), and the two shipped prompt-schema versions built offline (`v1_version`,
 `v2_version`).
 
+M3 Task 7 adds the score spend owners: `new_target_owner` (a claimed target and its running attempt, built on
+`tests.support.m3.insert_claimed`) with the `target_owner` fixture, `new_submission_owner` (a batch submission
+of `in_batch` targets with their batch attempts and items) with the `submission_owner` fixture, `scoring_kw`
+naming the owner's real target and attempt, `batch_kw` (one batch item's reservation), `attempt_and_target`
+(the attempt and target counters) and `reclaim_target` (the claim's reclaim and a new claim).
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
@@ -44,6 +50,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, load_config
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import transition
 from jobhunter.llm import fake
 from jobhunter.llm.budget import BudgetParams, BudgetRow, month_of
 from jobhunter.llm.cache_monitor import CacheMonitor
@@ -62,10 +69,13 @@ from jobhunter.llm.prompts.render import PromptVersion, prompt_schema_hash, prom
 from jobhunter.llm.schemas import ParserFamily
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import (
+    BatchState,
+    BatchSubmissionOwner,
     CallOutcome,
     EvalRunOwner,
     OperationOwner,
     SpendOwner,
+    TargetAttemptOwner,
     change_cap,
     ensure_month,
 )
@@ -74,9 +84,19 @@ from jobhunter.types import JSONValue, get_object
 from jobhunter.worker import operations as ops
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, SecretStr
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from tests.support.m2 import insert_eval_run
+from tests.support.m2 import insert_eval_run, insert_profile_chain
+from tests.support.m3 import (
+    NOW,
+    insert_attempt,
+    insert_batch_item,
+    insert_bulk_operation,
+    insert_claimed,
+    insert_job,
+    insert_submission,
+    insert_target,
+)
 from tests.support.pg import PgServer, pg_one
 
 _ACTIVE_EXECUTION_CONFIG: Final = "SELECT execution_config_id FROM active_config WHERE id = 1"
@@ -213,13 +233,19 @@ def scoring_kw(
     now: datetime,
     bound: int,
     max_tokens: int,
-    target_id: int,
-    attempt_id: int,
+    target_id: int | None = None,
+    attempt_id: int | None = None,
     **overrides: Any,
 ) -> dict[str, Any]:
-    """`reserve_kw` for a scoring `generate` call of attempt `attempt_id` of target `target_id`. Migration
-    0008 closed the two foreign keys M2 staged (`llm_calls.attempt_id` and `llm_calls.target_id`), so both
-    name real rows: `tests.support.m3.insert_claimed` makes a pair."""
+    """`reserve_kw` for a scoring `generate` call (600 s) of attempt `attempt_id` of target `target_id`, which
+    a `TargetAttemptOwner` names itself. Migration 0008 closed the two foreign keys M2 staged
+    (`llm_calls.attempt_id` and `llm_calls.target_id`), so both name real rows: `new_target_owner` makes an
+    owner over a pair, `tests.support.m3.insert_claimed` a pair for another owner."""
+    if isinstance(owner, TargetAttemptOwner):
+        target_id = owner.target_id if target_id is None else target_id
+        attempt_id = owner.attempt_id if attempt_id is None else attempt_id
+    if target_id is None or attempt_id is None:
+        raise ValueError("a scoring call names its real target and attempt")
     values: dict[str, Any] = {
         "purpose": "generate",
         "purpose_class": "scoring",
@@ -229,6 +255,210 @@ def scoring_kw(
         **overrides,
     }
     return reserve_kw(owner, now=now, bound=bound, max_tokens=max_tokens, **values)
+
+
+@dataclass(frozen=True)
+class BatchItemRef:
+    """One item of a test batch submission: its `in_batch` target, the target's batch attempt and the
+    `batch_items` row."""
+
+    target_id: int
+    attempt_id: int
+    item_id: int
+
+
+@dataclass(frozen=True)
+class BatchSubmission:
+    """A test batch submission as its spend owner (`owner`, expecting the state it was made in), the tuple and
+    bulk operation it belongs to, and its items."""
+
+    owner: BatchSubmissionOwner
+    llm_tuple_id: int
+    bulk_operation_id: int
+    items: tuple[BatchItemRef, ...]
+
+
+def batch_kw(
+    sub: BatchSubmission,
+    item: BatchItemRef,
+    *,
+    now: datetime,
+    bound: int,
+    max_tokens: int = 6000,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """`scoring_kw` for `item`'s generator request of `sub` (§10.10): on `claude-sonnet-5-5`, `transport =
+    'batch'`, its single submission attempt (`transport_try` 1), no logical call number and no deadline,
+    naming the item and the submission's bulk operation."""
+    values: dict[str, Any] = {
+        "model": "claude-sonnet-5-5",
+        "transport": "batch",
+        "logical_call_no": None,
+        "deadline_s": None,
+        "batch_item_id": item.item_id,
+        "bulk_operation_id": sub.bulk_operation_id,
+        **overrides,
+    }
+    return scoring_kw(
+        sub.owner,
+        now=now,
+        bound=bound,
+        max_tokens=max_tokens,
+        target_id=item.target_id,
+        attempt_id=item.attempt_id,
+        **values,
+    )
+
+
+# A test chain's tuple, made by `insert_profile_chain` (its rubric version is `test-<n>`).
+_TEST_TUPLE: Final = q(
+    "SELECT t.id FROM llm_tuples t JOIN rubric_versions r ON r.id = t.rubric_version_id "
+    "WHERE r.version LIKE 'test-%' ORDER BY t.id LIMIT 1"
+)
+_SCORE_CHAIN: Final = 70  # the chain number `score_tuple` creates; a test's own chains count from 1
+
+
+async def score_tuple(conn: AsyncConnection) -> int:
+    """The tuple the score owners belong to: the first test chain's, else a new one (chain 70)."""
+    found = (await conn.execute(_TEST_TUPLE)).scalar_one_or_none()
+    if found is not None:
+        return int(found)
+    return (await insert_profile_chain(conn, _SCORE_CHAIN)).llm_tuple_id
+
+
+async def new_target_owner(
+    engine: AsyncEngine, *, llm_tuple_id: int | None = None, attempt_no: int = 1, **target_columns: object
+) -> TargetAttemptOwner:
+    """A claimed (`in_progress`) target of a new job and its `running` attempt `attempt_no`, as a spend owner
+    (§3.3.3 score-attempt predicate); `target_columns` add to the target's columns (`bulk_operation_id`)."""
+    async with engine.begin() as conn:
+        tuple_id = await score_tuple(conn) if llm_tuple_id is None else llm_tuple_id
+        claimed = await insert_claimed(conn, tuple_id, attempt_no=attempt_no, **target_columns)
+    return TargetAttemptOwner(
+        target_id=claimed.target_id,
+        claim_id=claimed.claim_id,
+        attempt_no=claimed.attempt_no,
+        attempt_id=claimed.attempt_id,
+    )
+
+
+@pytest.fixture
+async def target_owner(engine: AsyncEngine, clean_db: None, migrated: PgServer) -> TargetAttemptOwner:
+    """The spend owner of a claimed target's running attempt."""
+    _seeded_execution_config(migrated)
+    return await new_target_owner(engine)
+
+
+# The columns the `batch_submissions` CHECKs require of a submission in each state.
+_SUBMISSION_COLUMNS: Final[Mapping[str, Mapping[str, object]]] = {
+    "preparing": {},
+    "abandoned": {},
+    "submit_started": {"submit_started_at": NOW},
+    "submit_rejected": {"submit_started_at": NOW},
+    "submit_ambiguous": {"submit_started_at": NOW},
+    "submitted": {"submit_started_at": NOW, "provider_batch_id": "msgbatch_test"},
+    "ended": {"submit_started_at": NOW, "provider_batch_id": "msgbatch_test", "ended_at": NOW},
+    "released": {"submit_started_at": NOW, "released_at": NOW},
+    "reconciled": {
+        "submit_started_at": NOW,
+        "provider_batch_id": "msgbatch_test",
+        "results_complete_at": NOW,
+        "reconciled_at": NOW,
+    },
+}
+
+
+async def new_submission_owner(
+    engine: AsyncEngine,
+    *,
+    items: int = 1,
+    state: BatchState = "preparing",
+    bulk_operation_id: int | None = None,
+    budget_usd: Decimal = Decimal(5),
+) -> BatchSubmission:
+    """A batch submission in `state` of `items` `in_batch` targets (new jobs of the score tuple), each with
+    its `running` batch attempt 1 and its `awaiting` item, in a new active bulk operation of `budget_usd`
+    unless `bulk_operation_id` names one; its owner expects `state`. One submission at most is in flight
+    (`batch_one_in_flight`) and one bulk operation active (`bulk_operations_one_active`)."""
+    async with engine.begin() as conn:
+        tuple_id = await score_tuple(conn)
+        bulk = (
+            await insert_bulk_operation(conn, tuple_id, budget_usd=budget_usd)
+            if bulk_operation_id is None
+            else bulk_operation_id
+        )
+        submission = await insert_submission(
+            conn, tuple_id, bulk, state=state, request_count=items, **_SUBMISSION_COLUMNS[state]
+        )
+        refs: list[BatchItemRef] = []
+        for _ in range(items):
+            target = await insert_target(
+                conn,
+                await insert_job(conn),
+                tuple_id,
+                state="in_batch",
+                batch_submission_id=submission,
+                attempt_no=1,
+                lane="batch",
+                bulk_operation_id=bulk,
+            )
+            attempt = await insert_attempt(conn, target, mode="batch", lane="batch")
+            refs.append(BatchItemRef(target, attempt, await insert_batch_item(conn, submission, target)))
+    return BatchSubmission(BatchSubmissionOwner(submission, state), tuple_id, bulk, tuple(refs))
+
+
+@pytest.fixture
+async def submission_owner(engine: AsyncEngine, clean_db: None, migrated: PgServer) -> BatchSubmission:
+    """A `preparing` batch submission of two items, owned while it is `preparing`."""
+    _seeded_execution_config(migrated)
+    return await new_submission_owner(engine, items=2)
+
+
+_ATTEMPT: Final = q(
+    "SELECT logical_calls, http_calls, charged, cost_usd, outcome FROM score_attempts WHERE id = :a"
+)
+_TARGET: Final = q("SELECT charged_attempts, state, attempt_no FROM score_targets WHERE id = :t")
+
+
+async def attempt_and_target(
+    engine: AsyncEngine, owner: TargetAttemptOwner | BatchItemRef
+) -> tuple[Any, Any]:
+    """The counters of the owner's attempt (`logical_calls`, `http_calls`, `charged`, `cost_usd`, `outcome`)
+    and of its target (`charged_attempts`, `state`, `attempt_no`)."""
+    async with engine.connect() as conn:
+        attempt = (await conn.execute(_ATTEMPT, {"a": owner.attempt_id})).one()
+        target = (await conn.execute(_TARGET, {"t": owner.target_id})).one()
+    return attempt, target
+
+
+async def reclaim_target(engine: AsyncEngine, owner: TargetAttemptOwner) -> TargetAttemptOwner:
+    """A reclaim of `owner`'s claim (§9.4.3: the target back to `pending`, the attempt `claim_lost`), then
+    a new claim of the target with a new `claim_id` and the next attempt; returns the new owner."""
+    async with engine.begin() as conn:
+        await transition(conn, "score_targets", owner.target_id, ["in_progress"], "pending")
+        await transition(
+            conn, "score_attempts", owner.attempt_id, ["running"], "claim_lost", reason="stale_heartbeat"
+        )
+        claim = uuid.uuid4()
+        attempt_no = owner.attempt_no + 1
+        await transition(
+            conn,
+            "score_targets",
+            owner.target_id,
+            ["pending"],
+            "in_progress",
+            set_={
+                "claim_id": claim,
+                "claim_epoch": 1,
+                "claimed_at": NOW,
+                "claim_heartbeat_at": NOW,
+                "attempt_no": attempt_no,
+            },
+        )
+        attempt = await insert_attempt(
+            conn, owner.target_id, attempt_no=attempt_no, claim_id=claim, claim_epoch=1, lane="similarity"
+        )
+    return TargetAttemptOwner(owner.target_id, claim, attempt_no, attempt)
 
 
 def completed_call(**overrides: Any) -> CallOutcome:
