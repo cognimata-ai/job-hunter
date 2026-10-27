@@ -709,9 +709,8 @@ async def _entry(conn: AsyncConnection, ledger_id: int) -> _Entry | None:
 
 async def _fund(conn: AsyncConnection, bulk_operation_id: int, r: Decimal) -> int | None:
     """The bulk row `FOR NO KEY UPDATE` (§6.9.3); `bulk_operation_id` when the operation is `active` and `r`
-    fits its
-    allocation (`spent_usd + r ≤ budget_usd`, L1191), else `None`: a finished operation is refused as a full
-    one is, and the reservation is charged to the bucket like any other online work."""
+    fits its allocation (`spent_usd + r ≤ budget_usd`, L1191), else `None`: a finished operation is refused
+    as a full one is, and the reservation is charged to the bucket like any other online work."""
     row = (await conn.execute(_LOCK_BULK, {"id": bulk_operation_id})).first()
     if row is not None and row.state == "active" and row.spent_usd + r <= row.budget_usd:
         return bulk_operation_id
@@ -726,8 +725,7 @@ async def _fund(conn: AsyncConnection, bulk_operation_id: int, r: Decimal) -> in
 
 async def _lock_bulk(conn: AsyncConnection, bulk_operation_id: int) -> None:
     """The funded entry's bulk row `FOR NO KEY UPDATE`, before its ledger rows (an entry keeps the id only of
-    a row
-    that existed when it was funded; `ON DELETE SET NULL` clears it with the row)."""
+    a row that existed when it was funded; `ON DELETE SET NULL` clears it with the row)."""
     await conn.execute(_LOCK_BULK, {"id": bulk_operation_id})
 
 
@@ -1003,8 +1001,6 @@ async def mark_batch_dispatched(
     back). `entries` must be every entry the submission still has `reserved`: one left out would stay
     `reserved` on a submitted batch, which no reconciler ages (L2979), so that is a `ValueError`. `now` is
     the caller's clock, as in `mark_dispatched`."""
-    if not entries:
-        return
     ledger_ids = sorted(res.ledger_id for res in entries)
     if len(set(ledger_ids)) != len(ledger_ids):
         raise ValueError("a batch dispatch marker names each entry once")

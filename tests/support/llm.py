@@ -134,6 +134,13 @@ def _seeded_execution_config(server: PgServer) -> int:
     return _execution_config_id
 
 
+async def _read_execution_config(conn: AsyncConnection) -> None:
+    """`_seeded_execution_config` for the owner helpers that hold an engine, not a server."""
+    global _execution_config_id
+    if _execution_config_id is None:
+        _execution_config_id = int((await conn.execute(sa.text(_ACTIVE_EXECUTION_CONFIG))).scalar_one())
+
+
 async def new_operation_owner(
     engine: AsyncEngine, *, epoch: int = 1, key: str | None = None
 ) -> OperationOwner:
@@ -332,6 +339,7 @@ async def new_target_owner(
     """A claimed (`in_progress`) target of a new job and its `running` attempt `attempt_no`, as a spend owner
     (§3.3.3 score-attempt predicate); `target_columns` add to the target's columns (`bulk_operation_id`)."""
     async with engine.begin() as conn:
+        await _read_execution_config(conn)
         tuple_id = await score_tuple(conn) if llm_tuple_id is None else llm_tuple_id
         claimed = await insert_claimed(conn, tuple_id, attempt_no=attempt_no, **target_columns)
     return TargetAttemptOwner(
@@ -381,6 +389,7 @@ async def new_submission_owner(
     unless `bulk_operation_id` names one; its owner expects `state`. One submission at most is in flight
     (`batch_one_in_flight`) and one bulk operation active (`bulk_operations_one_active`)."""
     async with engine.begin() as conn:
+        await _read_execution_config(conn)
         tuple_id = await score_tuple(conn)
         bulk = (
             await insert_bulk_operation(conn, tuple_id, budget_usd=budget_usd)
