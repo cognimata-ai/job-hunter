@@ -74,6 +74,23 @@ M3 Task 12 adds the admission's side:
 - `list_on_watchlist(conn, entries)`: a new settings version, copied from the active one and made active,
   whose `watchlist[]` names each company id of `entries` with its `enabled` (Controller Ruling T12-b: a
   watched company is enabled in the table and in the settings).
+
+M3 Task 13 adds the sweeps' and the override moves' side:
+- `aged_job(conn, *, now, first_seen_days=0, posted_days=None, availability="active")`: a job
+  (`tests.support.m3.insert_job`) first seen that many days before `now`, posted that many days before it
+  (`None`: unknown), with that availability;
+- `state_target(conn, job, llm_tuple_id, state, *, override="none", **columns)`: a target of `job`'s current
+  revision in `state`, with the reason or refusal category the state's CHECK needs (`REASON_OF`) and, for an
+  override, its `override_at`; `columns` add to or replace its columns (`deferred_group_id`,
+  `filter_scope_version_id`, `charged_attempts`);
+- `member_group(conn, representative, members)`: an active duplicate group of the jobs
+  (`tests.support.m3.insert_group`) with a `duplicate_group_members` row for each;
+- `filter_result(conn, job, scope_version_id, *, passed)`: the job's `hard_filter_results` row for the scope;
+- `followup_hold(conn, llm_tuple_id, target_id, *, hold)`: an active bulk operation holding `hold` for the
+  target's processed `followup` item of a reconciled submission; `(bulk_operation_id, item_id)`;
+- `swept_of(engine, target_id)`: the target's state, reason, override, lane, group and filter columns,
+  charges and backoff; `hold_of(engine, bulk_operation_id, item_id)`: the operation's `followup_held_usd` and
+  the item's `hold_released_at`.
 """
 
 import asyncio
@@ -82,7 +99,7 @@ import hashlib
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final, cast
 
@@ -117,7 +134,21 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.llm import score_profile
 from tests.support.m2 import insert_profile_chain
-from tests.support.m3 import CLAIM_FROM, CLAIM_RETURNING, CLAIM_SET_SQL, CLAIM_WHERE, Job
+from tests.support.m3 import (
+    CLAIM_FROM,
+    CLAIM_RETURNING,
+    CLAIM_SET_SQL,
+    CLAIM_WHERE,
+    NOW,
+    Job,
+    insert_batch_item,
+    insert_bulk_operation,
+    insert_group,
+    insert_job,
+    insert_row,
+    insert_submission,
+)
+from tests.support.m3 import insert_target as insert_target_row
 from tests.support.validation import SyntheticAd, criterion_item, synthetic_ad, synthetic_wire_c
 
 _NOTHING_ASSERTED: Final[dict[str, Any]] = {
@@ -1009,3 +1040,143 @@ async def list_on_watchlist(conn: AsyncConnection, entries: Mapping[int, bool]) 
     payload["watchlist"] = list(listed.values())
     version = int((await conn.execute(_SETTINGS_VERSION, {"payload": payload})).scalar_one())
     await conn.execute(_ACTIVATE_SETTINGS, {"v": version})
+
+
+# ---- M3 Task 13: the sweeps and the override moves -------------------------------------------------------
+
+_AGE_JOB: Final = q(
+    "UPDATE jobs SET first_seen_at = :first_seen, posted_at_effective = CAST(:posted AS timestamptz), "
+    "posted_precision = CASE WHEN CAST(:posted AS timestamptz) IS NULL THEN 'unknown' ELSE 'day' END, "
+    "availability = :availability WHERE id = :j"
+)
+# The reason (or refusal category) each state's CHECK needs (§7.11).
+REASON_OF: Final[Mapping[str, str]] = {
+    "budget_deferred": "budget_exhausted",
+    "expired_unscored": "too_old",
+    "cancelled": "purged",
+    "failed_max_tokens": "max_tokens",
+    "failed_invalid_output": "bug",
+    "failed_request": "http_400",
+    "failed_transient": "stream_interrupted",
+    "failed_attempts_exhausted": "attempts_exhausted",
+}
+
+
+async def aged_job(
+    conn: AsyncConnection,
+    *,
+    now: datetime = NOW,
+    first_seen_days: int = 0,
+    posted_days: int | None = None,
+    availability: str = "active",
+) -> Job:
+    """A job first seen `first_seen_days` before `now`, posted `posted_days` before it (`None`: unknown),
+    with `availability` (module notes)."""
+    job = await insert_job(conn)
+    params = {
+        "first_seen": now - timedelta(days=first_seen_days),
+        "posted": None if posted_days is None else now - timedelta(days=posted_days),
+        "availability": availability,
+        "j": job.job_id,
+    }
+    await conn.execute(_AGE_JOB, params)
+    return job
+
+
+async def state_target(
+    conn: AsyncConnection,
+    job: Job,
+    llm_tuple_id: int,
+    state: str,
+    *,
+    override: str = "none",
+    **columns: object,
+) -> int:
+    """A target of `job` in `state` (module notes); its id."""
+    values: dict[str, object] = {"state": state}
+    if state in REASON_OF:
+        values["state_reason"] = REASON_OF[state]
+    if state == "refused":
+        values["refusal_category"] = "general_harms"
+    if override != "none":
+        values.update(override=override, override_at=NOW)
+    return await insert_target_row(conn, job, llm_tuple_id, **{**values, **columns})
+
+
+async def member_group(conn: AsyncConnection, representative: Job, members: Sequence[Job]) -> int:
+    """An active duplicate group of `representative` and `members`, each with its membership row."""
+    group = await insert_group(conn, representative, members)
+    for job in (representative, *members):
+        await insert_row(
+            conn, "duplicate_group_members", {"group_id": group, "job_id": job.job_id, "evidence": {}}
+        )
+    return group
+
+
+async def filter_result(conn: AsyncConnection, job: Job, scope_version_id: int, *, passed: bool) -> None:
+    """The job's `hard_filter_results` row for the scope: passed, or failed on its location."""
+    await insert_row(
+        conn,
+        "hard_filter_results",
+        {
+            "job_id": job.job_id,
+            "scope_version_id": scope_version_id,
+            "passed": passed,
+            "reasons": [] if passed else ["location"],
+            "inputs_hash": b"\x00",
+            "det_algorithm_version": "det-test",
+        },
+    )
+
+
+_HOLD: Final = q("UPDATE bulk_operations SET followup_held_usd = followup_held_usd + :h WHERE id = :b")
+
+
+async def followup_hold(
+    conn: AsyncConnection, llm_tuple_id: int, target_id: int, *, hold: Decimal
+) -> tuple[int, int]:
+    """An active bulk operation holding `hold` for the target's processed `followup` item (module notes)."""
+    operation = await insert_bulk_operation(conn, llm_tuple_id)
+    await conn.execute(_HOLD, {"h": hold, "b": operation})
+    submission = await insert_submission(
+        conn,
+        llm_tuple_id,
+        operation,
+        state="reconciled",
+        submit_started_at=NOW,
+        provider_batch_id=f"msgbatch_t13_{target_id}",
+        results_complete_at=NOW,
+        reconciled_at=NOW,
+    )
+    item = await insert_batch_item(
+        conn,
+        submission,
+        target_id,
+        result_type="succeeded",
+        processed_at=NOW,
+        decision="followup",
+        hold_usd=hold,
+    )
+    return operation, item
+
+
+_SWEPT_ROW: Final = q(
+    "SELECT state, state_reason, override, override_at, lane, filter_scope_version_id, deferred_group_id, "
+    "charged_attempts, not_before, transient_failures FROM score_targets WHERE id = :t"
+)
+_HOLD_ROW: Final = q(
+    "SELECT b.followup_held_usd, i.hold_released_at FROM bulk_operations b, batch_items i "
+    "WHERE b.id = :b AND i.id = :i"
+)
+
+
+async def swept_of(engine: AsyncEngine, target_id: int) -> Row[Any]:
+    """The target's state, reason, override, lane, group and filter columns, charges and backoff."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_SWEPT_ROW, {"t": target_id})).one()
+
+
+async def hold_of(engine: AsyncEngine, bulk_operation_id: int, item_id: int) -> Row[Any]:
+    """The operation's `followup_held_usd` and the item's `hold_released_at`."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_HOLD_ROW, {"b": bulk_operation_id, "i": item_id})).one()

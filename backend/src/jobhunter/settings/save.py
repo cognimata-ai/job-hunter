@@ -37,11 +37,13 @@
      `enabled`, the cursor at the latest slot at or before `now`, and the version;
    - `collection`: the instance of every `watchlist[]` board (`instance_for_company`), then the cells of the
      new version (`ensure_cells`; new cells start never covered);
-   - `admission`: the flip only (the `max_ad_age_days` expiry sweep needs targets, M3);
+   - `admission`: the flip and, when `scope.max_ad_age_days` changed, the expiry sweep of the active tuple in
+     both directions (`scoring.targets.expiry_sweep`, M3 Task 13: the bulk rows, then the target rows);
    - `execution`: `execution_config_id := new`;
    - `evaluation_policy`: `evaluation_policy_id := new` (the row is step 4's).
-   After every action, when the tuple pointer changed, `ranking.bump` runs once: `ranking_state` is the
-   last lock of §3.3.3, after the `budget` action's month row.
+   After every action, when the tuple pointer changed or the `admission` action's sweep moved a target,
+   `ranking.bump` runs once: `ranking_state` is the last lock of §3.3.3, after the `budget` action's month
+   row.
 7. `settings_version_id := new` and `updated_at`, in the statement that flips the pointers of step 6.
    `active_config` is locked since step 1, so this takes no new lock after `ranking_state`.
 
@@ -72,6 +74,7 @@ from jobhunter.llm import budget, spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.quota.cells import ensure_cells
 from jobhunter.run_settings import load_run_settings
+from jobhunter.scoring import targets
 from jobhunter.settings import scope_apply
 from jobhunter.settings.derive import DerivedIds, active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import dry_run
@@ -185,6 +188,7 @@ class _Activation:
     version_id: int
     flips: dict[str, int] = field(default_factory=dict)
     tuple_flipped: bool = False
+    targets_moved: bool = False  # the `admission` action's expiry sweep moved a target
     apply_scope_operation_id: int | None = None
     scope_is_active: bool = False  # the `scope` action's desired scope is the active one
 
@@ -267,7 +271,18 @@ async def _apply_collection(a: _Activation) -> None:
 
 
 async def _apply_admission(a: _Activation) -> None:
-    """The flip only (step 7); the expiry sweep of `max_ad_age_days` needs targets (M3, Deviation 10)."""
+    """The flip (step 7) and, when `scope.max_ad_age_days` changed, the expiry sweep of the tuple active after
+    this save in both directions, under the `active_config` lock the save holds (L4893; M3 Task 13, A2 A5,
+    Deviation 24): the candidates' bulk rows, then their target rows (other domain rows), after the `budget`
+    action's month row. A sweep that moved a target bumps the ranking (step 6)."""
+    max_age = a.proposed.scope.max_ad_age_days
+    if max_age == a.before.scope.max_ad_age_days:
+        return
+    tuple_id = a.flips.get("llm_tuple_id", a.active.llm_tuple_id)
+    if not isinstance(tuple_id, int):
+        return
+    swept = await targets.expiry_sweep(a.conn, llm_tuple_id=tuple_id, max_ad_age_days=max_age, now=a.now)
+    a.targets_moved = a.targets_moved or swept.moved > 0
 
 
 async def _apply_execution(a: _Activation) -> None:
@@ -376,7 +391,7 @@ async def save_settings(
             await afault_point(AFTER_LLM_TUPLE_POINT)
     if a.scope_is_active:  # other domain rows: after the month row, before `ranking_state` (step 6)
         await scope_apply.resolve_apply_failed(conn)
-    if a.tuple_flipped:
+    if a.tuple_flipped or a.targets_moved:
         await ranking.bump(conn)
     await conn.execute(
         _FLIP,

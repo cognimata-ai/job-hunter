@@ -160,6 +160,7 @@ _REGISTERING_MODULES: Final = (
     # the takeover sweeps `score_targets` and `score_cycles` and `orphaned_cycles` (M3 Task 11; Task 27 adds
     # the remaining M3 modules)
     "jobhunter.scoring.cycles",
+    "jobhunter.scoring.targets",  # `expiry_sweep` and `budget_release` (M3 Task 13)
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

@@ -39,6 +39,7 @@ from tests.support.fixtures import count_rows
 from tests.support.pg import PgServer, blocked_or_done
 from tests.support.procs import await_until
 from tests.support.profile import idem
+from tests.support.scoring import activate_score_tuple, aged_job, state_target, swept_of
 from tests.support.settings import (
     SETTINGS_URL,
     activate_profile,
@@ -587,6 +588,39 @@ async def test_a_buffer_only_edit_writes_the_buffer_and_keeps_the_lowering(
 
 
 # --- execution and evaluation policy ------------------------------------------------------------------------
+
+
+async def test_an_admission_save_sweeps_the_expiry_at_once_in_both_directions(
+    logged_in_client, engine, clock
+) -> None:
+    """M3 Task 13 (L4893, A2 A5, Deviation 24): a changed `max_ad_age_days` runs the expiry sweep of the
+    active tuple in the save's transaction: raised, a target the old age expired returns `pending` with its
+    reason cleared; lowered, a pending one of that age expires; the ranking is bumped each time."""
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+        returning = await state_target(
+            conn, await aged_job(conn, now=NOW, first_seen_days=40), tuple_id, "expired_unscored"
+        )
+        older = await state_target(
+            conn, await aged_job(conn, now=NOW, first_seen_days=70), tuple_id, "expired_unscored"
+        )
+    before = await generation(engine)
+    payload = await active_payload(logged_in_client)
+    payload["scope"]["max_ad_age_days"] = 60
+    body = await save(logged_in_client, payload)
+    assert "admission" in body["version"]["effect_classes"]
+    back = await swept_of(engine, returning)
+    assert (back.state, back.state_reason) == ("pending", None)
+    assert (await swept_of(engine, older)).state == "expired_unscored"  # past the raised age as well
+    assert await generation(engine) == before + 1
+    payload["scope"]["max_ad_age_days"] = 30
+    await save(logged_in_client, payload)
+    again = await swept_of(engine, returning)
+    assert (again.state, again.state_reason) == ("expired_unscored", "too_old")
+    assert await generation(engine) == before + 2
+    payload["display"]["ui_language"] = "de"  # no admission change: no sweep, no bump
+    await save(logged_in_client, payload)
+    assert await generation(engine) == before + 2
 
 
 async def test_execution_and_evaluation_policy_flip_their_pointers(logged_in_client, engine) -> None:

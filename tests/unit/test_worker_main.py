@@ -656,8 +656,9 @@ M2_RECONCILERS = {
     "profile_vectors": ["heavy"],
 }
 # The M3 reconcilers so far: `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
-# `score_targets` and `score_cycles`; Ruling P44).
-M3_RECONCILERS = {"orphaned_cycles": ["tick"]}
+# `score_targets` and `score_cycles`; Ruling P44), and `expiry_sweep` and `budget_release` (Task 13,
+# `scoring.targets`).
+M3_RECONCILERS = {"orphaned_cycles": ["tick"], "expiry_sweep": ["heavy"], "budget_release": ["tick"]}
 # Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
 # from `sys.modules` (each registry module is imported by the modules that register into it).
 _REGISTRY_SCRIPT = """\

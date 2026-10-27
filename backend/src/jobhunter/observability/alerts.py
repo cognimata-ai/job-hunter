@@ -7,11 +7,16 @@ index `alerts_open_dedup` makes that atomic, so concurrent raisers never create 
 `open_alert` opens one only when none is open, and counts no occurrence of an open one: for a state that a
 later check finds still true, not a new occurrence of it (a start that finds a key still missing).
 
-All five functions run on the caller's connection and leave the transaction to the caller: an alert is
+`acknowledge_alert` (M3 Task 13) stamps `acknowledged_at` on an open alert, once: the alert stays open, and an
+acknowledgement ends the score lane's pause on an unacknowledged `llm.reservation_bound_violated` or
+`llm.auth_failed` (`scoring.cycles.pause_reason`, Deviation 19).
+
+All six functions run on the caller's connection and leave the transaction to the caller: an alert is
 written in the transaction that decides to raise it, and persists only if that transaction commits.
 """
 
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -49,6 +54,11 @@ _RESOLVE_CODE = q(
 _RESOLVE_CODE_BEFORE = q(
     "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL "
     'AND dedup_key COLLATE "C" < :before_key RETURNING id'
+)
+# The first acknowledgement's time is kept: a repeated one changes nothing.
+_ACKNOWLEDGE = q(
+    "UPDATE alerts SET acknowledged_at = coalesce(acknowledged_at, :now) "
+    "WHERE id = :id AND resolved_at IS NULL RETURNING id"
 )
 _OPEN_BY_SEVERITY = q(
     "SELECT severity, count(*) AS n FROM alerts WHERE resolved_at IS NULL GROUP BY severity"
@@ -126,6 +136,12 @@ async def resolve_alerts(conn: AsyncConnection, *, code: str, subject_before: st
         return len((await conn.execute(_RESOLVE_CODE, {"code": code})).all())
     params = {"code": code, "before_key": _dedup_key(code, subject_before)}
     return len((await conn.execute(_RESOLVE_CODE_BEFORE, params)).all())
+
+
+async def acknowledge_alert(conn: AsyncConnection, alert_id: int, *, now: datetime) -> bool:
+    """Acknowledge the open alert `alert_id` at `now` (module docstring); `False` when no open alert has that
+    id (it does not exist or is resolved). An alert acknowledged before keeps its first `acknowledged_at`."""
+    return (await conn.execute(_ACKNOWLEDGE, {"id": alert_id, "now": now})).first() is not None
 
 
 async def refresh_alert_gauge(conn: AsyncConnection) -> dict[Severity, int]:

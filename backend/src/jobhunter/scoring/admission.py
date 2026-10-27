@@ -69,7 +69,9 @@ Null-similarity targets (awaiting their embedding) are candidates of oldest, exp
 **The two calls** (Ruling P12; the `admit` node's transaction, which holds `active_config FOR SHARE` and the
 cycle `FOR SHARE` under its owner predicate):
 - `admit(conn, cycle, *, now, sweeps)`, a cycle's first round: the sweeps `expiry`, `refilter`, `regroup` and
-  `exhaustion` in that order (Task 13's, injected: `Sweeps`; the node passes `CYCLE_SWEEPS`); the Score now
+  `exhaustion` in that order (injected: `Sweeps`; the node passes `CYCLE_SWEEPS`, Task 13's sweeps of
+  `scoring.targets` for the cycle's tuple and scope, the expiry with the active `max_ad_age_days`, whose
+  adapter first locks the bulk rows of both hold-releasing sweeps' candidates: Ruling P52); the Score now
   targets (lane `score_now`, id order) and the candidates; `LaneCredits.lock`; `allocate(credits, S)` with
   `S = cycle.admission_size`; `select`; the debited credits saved; `admitted` written; and, when a sweep moved
   a target, `ranking.bump` as the last statement. The picks in admission order.
@@ -547,14 +549,51 @@ class Sweeps:
     exhaustion: Sweep
 
 
-async def _moves_nothing(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
-    return 0
+# The adapters of `CYCLE_SWEEPS` onto `targets`' sweeps (Task 13), for the cycle's tuple and scope, in the
+# `admit` node's transaction (`active_config FOR SHARE` held). `targets` imports this module
+# (`MAX_SCORE_ATTEMPTS`), so each adapter imports it when it runs.
 
 
-# The sweeps the `admit` node runs. Task 13 wires its expiry, refilter, regroup and exhaustion sweeps here.
-CYCLE_SWEEPS: Final = Sweeps(
-    expiry=_moves_nothing, refilter=_moves_nothing, regroup=_moves_nothing, exhaustion=_moves_nothing
-)
+async def _expiry(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
+    """The pre-lock phase, then the expiry sweep with the active `max_ad_age_days` (read under the
+    `active_config` lock the `admit` node holds). The pre-lock takes the bulk rows of the expiry and the
+    exhaustion candidates' follow-up holds before the first target row any of the four sweeps locks (Ruling
+    P52, Controller carry T12-c: the exhaustion sweep runs fourth)."""
+    from jobhunter.scoring import targets
+
+    max_age = await targets.active_max_ad_age_days(conn)
+    await targets.lock_hold_candidates(
+        conn, llm_tuple_id=cycle.llm_tuple_id, max_ad_age_days=max_age, now=now
+    )
+    swept = await targets.expiry_sweep(
+        conn, llm_tuple_id=cycle.llm_tuple_id, max_ad_age_days=max_age, now=now
+    )
+    return swept.moved
+
+
+async def _refilter(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
+    from jobhunter.scoring import targets
+
+    swept = await targets.refilter_sweep(
+        conn, llm_tuple_id=cycle.llm_tuple_id, scope_version_id=cycle.scope_version_id
+    )
+    return swept.moved
+
+
+async def _regroup(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
+    from jobhunter.scoring import targets
+
+    return (await targets.regroup_sweep(conn, llm_tuple_id=cycle.llm_tuple_id)).moved
+
+
+async def _exhaustion(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
+    from jobhunter.scoring import targets
+
+    return await targets.exhaustion_sweep(conn, llm_tuple_id=cycle.llm_tuple_id)
+
+
+# The sweeps the `admit` node runs (Task 13's, L3610-3612 and Deviation 7).
+CYCLE_SWEEPS: Final = Sweeps(expiry=_expiry, refilter=_refilter, regroup=_regroup, exhaustion=_exhaustion)
 
 _ADMITTED: Final = q(
     "UPDATE score_cycles SET admitted = :admitted WHERE id = :c AND worker_epoch = :e AND status = 'running'",
