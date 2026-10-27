@@ -229,8 +229,7 @@ def test_eligibility_reads_the_active_tuple_target() -> None:
 
 def test_the_unscorable_reason_of_a_group_without_an_eligible_member() -> None:
     """L3259: `all_failed` when every member's target failed, was refused or expired; `all_filtered` when
-    every one was filtered out; `no_active_member` otherwise (a mix, a member without a target, no active
-    tuple)."""
+    every one was filtered out; `no_active_member` otherwise (a mix, no active tuple)."""
     failed = [
         member(1, eligible=False, target_state="failed_request"),
         member(2, eligible=False, target_state="refused"),
