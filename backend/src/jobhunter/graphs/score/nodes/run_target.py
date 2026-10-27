@@ -29,7 +29,8 @@ the subgraph becomes the claim's outcome, never the cycle's failure):
 - (a) a node's `NodeTimeoutError` (a deterministic node's: an LLM node maps its own to `fail`), and a
   retryable database error that outlasted its node's retries (`graphs.sanitize.is_retryable_db_error`: a
   `NodeFailed` with `retryable_db_error`, a deterministic node's after `DB_RETRY`'s three tries or an LLM
-  node's, which takes no `RetryPolicy`, or a raw one of the checkpointer; Ruling T11-g), take `fail`'s
+  node's, which takes no `RetryPolicy`; and `escaped_db_transient`'s raw psycopg errors, the checkpointer's,
+  whose saver runs on a psycopg pool outside SQLAlchemy; Ruling T11-g), take `fail`'s
   transient path with the code `node_timeout` or `db_transient`: the target back to `pending` with
   `not_before = now + min(6 h, 15 min x 2^transient_failures)` and `transient_failures + 1`, or
   `failed_transient(<code>)` once its charged attempts are spent; the attempt `transient_error(<code>)`;
@@ -67,6 +68,7 @@ import asyncio
 import random
 from typing import Final
 
+import psycopg
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import NodeTimeoutError
 from langgraph.types import Command
@@ -95,6 +97,25 @@ from jobhunter.scoring.routing import CLAIM_LOST, Route
 NAME: Final = "score_target"
 # Below the worker's own bound on the cycle's task (`worker.main.EXECUTIONS_CANCEL_S`, 30 s).
 CANCEL_TIMEOUT_S: Final = 20.0
+
+# The checkpointer's raw psycopg errors a retry may outlast, by SQLSTATE: a serialization failure, a deadlock.
+_RAW_TRANSIENT_SQLSTATES: Final = frozenset({"40001", "40P01"})
+
+
+def escaped_db_transient(error: BaseException) -> bool:
+    """Whether `error`, escaping a score attempt, is a transient database error (Ruling T11-g): one
+    `is_retryable_db_error` knows (SQLAlchemy's, or the content-free `NodeFailed` stand-in), or a raw psycopg
+    one of the checkpointer, whose saver runs on a psycopg pool and never passes through SQLAlchemy: a
+    serialization failure or a deadlock by its `sqlstate`, or a lost connection (`OperationalError` with no
+    SQLSTATE)."""
+    if is_retryable_db_error(error):
+        return True
+    if not isinstance(error, psycopg.Error):
+        return False
+    if error.sqlstate in _RAW_TRANSIENT_SQLSTATES:
+        return True
+    return isinstance(error, psycopg.OperationalError) and error.sqlstate is None
+
 
 _ATTEMPT_ID: Final = q("SELECT id FROM score_attempts WHERE target_id = :t AND attempt_no = :a")
 _PROJECTION: Final = q(
@@ -226,7 +247,7 @@ def make_run_target(deps: ScoreDeps, subgraph: ScoreTargetGraph) -> TargetNode:
                     timeout_s=error.timeout,
                 )
                 return await failed(ref, attempt_id, NODE_TIMEOUT, config)
-            if is_retryable_db_error(error):  # (a), Ruling T11-g
+            if escaped_db_transient(error):  # (a), Ruling T11-g
                 log.warning(
                     "score_target_db_transient",
                     target_id=ref["target_id"],
