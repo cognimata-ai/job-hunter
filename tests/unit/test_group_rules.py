@@ -197,9 +197,10 @@ def test_the_representative_order() -> None:
 
 
 def test_eligibility_reads_the_active_tuple_target() -> None:
-    """§8.7 (L3251, M1 Deviation 9 closed): without an active tuple M1's rule (unmerged, not closed); with
-    one, the member's active-tuple target must also be live or published: no target, or one that failed, was
-    refused, expired, was filtered out or cancelled, is not eligible."""
+    """§8.7 (L3251, M1 Deviation 9 closed; Ruling T15-a): without an active tuple M1's rule (unmerged, not
+    closed); with one, the member's active-tuple target must also be live or published, or not exist yet (node
+    9 creates it after node 6 grouped the job): one that failed, was refused, expired, was filtered out or
+    cancelled is not eligible."""
     assert eligible("active", False, None, has_tuple=False) and eligible(
         "stale", False, None, has_tuple=False
     )
@@ -218,7 +219,8 @@ def test_eligibility_reads_the_active_tuple_target() -> None:
         assert eligible("unknown", False, state, has_tuple=True), state
         assert not eligible("closed", False, state, has_tuple=True), state
         assert not eligible("active", True, state, has_tuple=True), state
-    assert not eligible("active", False, None, has_tuple=True)  # no target of the active tuple
+    assert eligible("active", False, None, has_tuple=True)  # no target of the active tuple yet (T15-a)
+    assert not eligible("closed", False, None, has_tuple=True)
     for state in ("failed_request", "failed_attempts_exhausted", "refused", "expired_unscored"):
         assert not eligible("active", False, state, has_tuple=True), state
     assert not eligible("active", False, "filtered_out", has_tuple=True)
@@ -243,7 +245,8 @@ def test_the_unscorable_reason_of_a_group_without_an_eligible_member() -> None:
     ]
     assert unscorable_reason(filtered) == ALL_FILTERED
     assert unscorable_reason([failed[0], filtered[1]]) == NO_ACTIVE_MEMBER  # a mix
-    assert unscorable_reason([failed[0], member(2, eligible=False)]) == NO_ACTIVE_MEMBER  # one has no target
+    # a closed member without a target (one without a target is otherwise eligible: Ruling T15-a)
+    assert unscorable_reason([failed[0], member(2, eligible=False)]) == NO_ACTIVE_MEMBER
     closed = member(2, availability="closed", eligible=False, target_state="pending")
     assert unscorable_reason([failed[0], closed]) == NO_ACTIVE_MEMBER  # a closed job's live target
     assert unscorable_reason([member(1, eligible=False), member(2, eligible=False)]) == NO_ACTIVE_MEMBER

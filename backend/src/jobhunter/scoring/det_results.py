@@ -51,13 +51,16 @@ those of several jobs in one statement.
 `job_id`). `count_published(conn, llm_tuple_id=…)` counts them; `published_page(conn, …, after, limit)`
 lists them by id after `after` with their current instance for a scope (its hash and algorithm version,
 `None` without one); `stale_of(conn, page, scope)` keeps those of a page that lack a current instance whose
-`det_inputs_hash` is that of the job's current det-facts and sources under the scope (`det_inputs`, read in
-one statement each while the caller holds the job rows) and whose algorithm version is current: what a
-recompute would change. `recompute_instance` is `compute_and_write` whose content-carrying validation error
-becomes `StoredResultInvalid`, which names the result and pydantic's error types only (carry T6-g), raised
-outside the handler; `recompute_job_instances(conn, job_id=…, llm_tuple_id=…, scopes=…)` recomputes every
-published result of the tuple of the job's revisions under each scope, the live hook's half (the caller holds
-the job row; the results are locked in id order).
+`det_inputs_hash` is that of the job's current det-facts and sources under the scope (`det_inputs_hash`, the
+scope's part computed once per call or passed in; the facts and sources read in one statement each while the
+caller holds the job rows, and returned with the results, `Stale`, so a recompute writes with them) and whose
+algorithm version is current: what a recompute would change. `recompute_instance` is `compute_and_write`
+whose content-carrying validation error becomes `StoredResultInvalid`, which names the result and pydantic's
+error types only (carry T6-g), raised outside the handler; `recompute_job_instances(conn, job_id=…,
+llm_tuple_id=…, scopes=…)` recomputes every published result of the tuple of the job's revisions under each
+scope, the live hook's half (the caller holds the job row): only the (result, scope) pairs `stale_of` finds
+stale reach `compute_and_write`, in result id order, so a re-sighting with unchanged det-facts takes no
+`llm_results` lock (Review Minor 5).
 """
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -65,6 +68,7 @@ from dataclasses import dataclass
 from typing import Final, get_args
 
 from pydantic import ValidationError
+from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.seed import canonical_json, content_hash
@@ -75,7 +79,7 @@ from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring.aggregate import Aggregation, aggregate, industry_match
 from jobhunter.scoring.det_criteria import employment_salary, location_work_mode
-from jobhunter.scoring.filters import DetFacts, read_det_facts, read_det_facts_of
+from jobhunter.scoring.filters import DetFacts, read_det_facts_of
 from jobhunter.scoring.knockouts import Confirmation, derive_knockouts
 from jobhunter.scoring.rubric import LLM_CRITERIA
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
@@ -179,6 +183,14 @@ def det_inputs(
     """The `det_inputs` document of an instance and its `det_inputs_hash` (module docstring)."""
     document = DetInputs(job_inputs(det, sources), scope_inputs(scope)).to_json()
     return document, content_hash(document)
+
+
+def det_inputs_hash(
+    det: DetFacts, sources: Mapping[str, Sequence[str]], scope_part: dict[str, JSONValue]
+) -> bytes:
+    """`det_inputs`' hash with the scope's part (`scope_inputs`) computed once by the caller: the staleness
+    check of many results under one scope (Review Minor 4)."""
+    return content_hash(DetInputs(job_inputs(det, sources), scope_part).to_json())
 
 
 # The source of each field an instance reads: the `source_id` of the source instance its provenance names (a
@@ -406,15 +418,14 @@ _PUBLISHED_WHERE: Final = "t.llm_tuple_id = :tuple"
 _COUNT_PUBLISHED: Final = q(
     f"SELECT count(*) FROM {_PUBLISHED_FROM} WHERE {_PUBLISHED_WHERE}"  # noqa: S608 (the module's constants)
 )
-_PUBLISHED_PAGE: Final = q(
+# ... each with its current instance for scope `:scope` (NULL columns without one).
+_WITH_INSTANCE: Final = (
     "SELECT r.id, jr.job_id, d.det_inputs_hash, d.det_algorithm_version "  # noqa: S608
     f"FROM {_PUBLISHED_FROM} LEFT JOIN det_results d ON d.llm_result_id = r.id "
-    f"AND d.scope_version_id = :scope AND d.is_current WHERE {_PUBLISHED_WHERE} AND r.id > :after "
-    "ORDER BY r.id LIMIT :limit"
+    f"AND d.scope_version_id = :scope AND d.is_current WHERE {_PUBLISHED_WHERE}"
 )
-_OF_JOB: Final = q(
-    f"SELECT r.id FROM {_PUBLISHED_FROM} WHERE {_PUBLISHED_WHERE} AND jr.job_id = :job ORDER BY r.id"  # noqa: S608
-)
+_PUBLISHED_PAGE: Final = q(f"{_WITH_INSTANCE} AND r.id > :after ORDER BY r.id LIMIT :limit")
+_OF_JOB: Final = q(f"{_WITH_INSTANCE} AND jr.job_id = :job ORDER BY r.id")
 
 
 @dataclass(frozen=True)
@@ -444,12 +455,7 @@ async def count_published(conn: AsyncConnection, *, llm_tuple_id: int) -> int:
     return int((await conn.execute(_COUNT_PUBLISHED, {"tuple": llm_tuple_id})).scalar_one())
 
 
-async def published_page(
-    conn: AsyncConnection, *, llm_tuple_id: int, scope_version_id: int, after: int, limit: int
-) -> list[PublishedInstance]:
-    """Up to `limit` published results of the tuple with an id above `after`, in id order, each with its
-    current instance for the scope (module docstring), read without a lock."""
-    params = {"tuple": llm_tuple_id, "scope": scope_version_id, "after": after, "limit": limit}
+def _instances(rows: Iterable[Row[tuple[object, ...]]]) -> list[PublishedInstance]:
     return [
         PublishedInstance(
             llm_result_id=int(row.id),
@@ -457,34 +463,57 @@ async def published_page(
             det_inputs_hash=None if row.det_inputs_hash is None else bytes(row.det_inputs_hash),
             det_algorithm_version=row.det_algorithm_version,
         )
-        for row in await conn.execute(_PUBLISHED_PAGE, params)
+        for row in rows
     ]
+
+
+async def published_page(
+    conn: AsyncConnection, *, llm_tuple_id: int, scope_version_id: int, after: int, limit: int
+) -> list[PublishedInstance]:
+    """Up to `limit` published results of the tuple with an id above `after`, in id order, each with its
+    current instance for the scope (module docstring), read without a lock."""
+    params = {"tuple": llm_tuple_id, "scope": scope_version_id, "after": after, "limit": limit}
+    return _instances(await conn.execute(_PUBLISHED_PAGE, params))
+
+
+@dataclass(frozen=True)
+class Stale:
+    """What `stale_of` found in a page: the results whose recompute would write an instance, and the committed
+    det-facts and sources of the page's jobs it read to decide (a recompute writes with these)."""
+
+    results: list[PublishedInstance]
+    facts: dict[int, DetFacts]
+    sources: dict[int, dict[str, list[str]]]
 
 
 async def stale_of(
-    conn: AsyncConnection, page: Sequence[PublishedInstance], scope: ScopeRow
-) -> list[PublishedInstance]:
+    conn: AsyncConnection,
+    page: Sequence[PublishedInstance],
+    scope: ScopeRow,
+    *,
+    scope_part: dict[str, JSONValue] | None = None,
+) -> Stale:
     """The results of `page` (read for `scope`) whose recompute would write an instance (module docstring):
     no current instance, another algorithm version, or a `det_inputs_hash` other than the job's current
-    one. The caller holds the jobs' rows, so the facts and sources read here are the committed ones."""
-    checked = [
-        item
-        for item in page
-        if item.det_inputs_hash is not None and item.det_algorithm_version == DET_ALGORITHM_VERSION
-    ]
-    jobs = sorted({item.job_id for item in checked})
+    one, with the facts and sources of the page's jobs (one statement each). `scope_part` is
+    `scope_inputs(scope.settings)` when the caller computed it once for several pages. The caller holds the
+    jobs' rows, so the facts and sources read here are the committed ones; a job deleted meanwhile has
+    none."""
+    jobs = sorted({item.job_id for item in page})
     facts = await read_det_facts_of(conn, jobs)
     sources = await jobs_sources(conn, jobs)
+    part = scope_inputs(scope.settings) if scope_part is None else scope_part
     current: dict[int, bytes] = {
-        job_id: det_inputs(det, sources[job_id], scope.settings)[1] for job_id, det in facts.items()
+        job_id: det_inputs_hash(det, sources[job_id], part) for job_id, det in facts.items()
     }
-    return [
+    results = [
         item
         for item in page
         if item.det_inputs_hash is None
         or item.det_algorithm_version != DET_ALGORITHM_VERSION
         or current.get(item.job_id) != item.det_inputs_hash
     ]
+    return Stale(results, facts, sources)
 
 
 async def recompute_instance(
@@ -514,20 +543,32 @@ async def recompute_job_instances(
 ) -> list[int]:
     """A current instance under each of `scopes` of every published result of the tuple of the job's
     revisions (module docstring), with the job's committed det-facts and sources; the ids of the instances
-    written (none for an unchanged hash). The caller holds the job row (lock-schedule step 4)."""
-    results = [
-        int(i) for i in (await conn.execute(_OF_JOB, {"tuple": llm_tuple_id, "job": job_id})).scalars()
-    ]
-    if not results:
+    written. Only the (result, scope) pairs `stale_of` finds stale reach `compute_and_write` and its
+    `llm_results FOR UPDATE`, in result id order (Review Minor 5): an unchanged hash takes no result lock.
+    The caller holds the job row (lock-schedule step 4)."""
+    pending: list[tuple[int, ScopeRow]] = []
+    facts: dict[int, DetFacts] = {}
+    sources: dict[int, dict[str, list[str]]] = {}
+    for scope in scopes:
+        params = {"tuple": llm_tuple_id, "job": job_id, "scope": scope.id}
+        page = _instances(await conn.execute(_OF_JOB, params))
+        if not page:
+            return []  # the job has no published result of the tuple
+        stale = await stale_of(conn, page, scope)
+        facts, sources = stale.facts, stale.sources
+        pending += [(item.llm_result_id, scope) for item in stale.results]
+    if job_id not in facts:
         return []
-    det = await read_det_facts(conn, job_id)
-    sources = await job_sources(conn, job_id)
     written: list[int] = []
-    for result_id in results:
-        for scope in scopes:
-            instance = await recompute_instance(
-                conn, llm_result_id=result_id, scope=scope, det=det, sources=sources, job=JobRow(job_id)
-            )
-            if instance is not None:
-                written.append(instance)
+    for result_id, scope in sorted(pending, key=lambda pair: (pair[0], pair[1].id)):
+        instance = await recompute_instance(
+            conn,
+            llm_result_id=result_id,
+            scope=scope,
+            det=facts[job_id],
+            sources=sources[job_id],
+            job=JobRow(job_id),
+        )
+        if instance is not None:
+            written.append(instance)
     return written

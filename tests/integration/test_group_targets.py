@@ -1,9 +1,10 @@
 """Duplicate groups with score targets (spec §8.7 L3251-3267, §7.17 #4; plan M3 Task 15, M1 Deviation 9, Codex
 r1 #36, r3 B14, A1 issue 27).
 
-- **Eligibility**: with an active tuple a member is eligible only while its active-tuple target is `pending`,
-  `budget_deferred`, `in_progress`, `in_batch`, `deferred_duplicate` or published (`ELIGIBLE_SQL` and
-  `representative.eligible` agree); without one M1's rule holds. A group with no eligible member records
+- **Eligibility**: with an active tuple a member is eligible only while its active-tuple target does not
+  exist yet or is `pending`, `budget_deferred`, `in_progress`, `in_batch`, `deferred_duplicate` or published
+  (`ELIGIBLE_SQL` and `representative.eligible` agree; Ruling T15-a: node 6 groups before node 9 creates the
+  targets); without one M1's rule holds. A group with no eligible member records
   `all_failed`, `all_filtered` or `no_active_member`, and becomes scorable again (`eligible_again`) once a
   member is eligible.
 - **Deferral**: `groups.deferrable` (entering deferral: not the representative, `override = 'none'`, not
@@ -11,7 +12,9 @@ r1 #36, r3 B14, A1 issue 27).
   `groups.deferral_eligible` (staying deferred) agree with the regroup sweep's SQL.
 - **Group events**: a split member's deferred target returns to `pending`; a representative change keeps a
   deferred member deferred while `deferral_eligible` holds against the new representative and returns it to
-  `pending` otherwise; a full-text twin is elected and is an always-include candidate.
+  `pending` otherwise; a full-text twin is elected (also one without a target yet) and is an always-include
+  candidate; a representative whose new revision has no target yet is not re-elected; a member that leaves on
+  a revalidation, or is merged away (merge step 5), has its deferred target returned to `pending`.
 
 Groups of canonical jobs (`tests.support.groups.canonical_job`) pass G1-G5 with one another; the others are
 `tests.support.m3` jobs with membership rows written directly. Every datum is invented.
@@ -26,7 +29,7 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
-from jobhunter.dedup import groups, representative
+from jobhunter.dedup import groups, merge, representative
 from jobhunter.dedup.groups import MemberRow, TargetRow, deferrable, deferral_eligible
 from jobhunter.dedup.representative import ELIGIBLE_SQL
 from jobhunter.scoring import admission, targets
@@ -138,12 +141,19 @@ async def test_a_member_whose_target_failed_is_not_eligible_and_without_a_tuple_
     async with engine.begin() as conn:
         tuple_id = await activate_score_tuple(conn)
         await state_target(conn, a, tuple_id, "failed_request")
-    assert await reelect(engine, group, [a.job_id, b.job_id]) is None  # b has no active-tuple target either
-    assert await group_row(engine, group) == ("active", None, "no_active_member", "reconciler_repair")
-    async with engine.begin() as conn:
-        await state_target(conn, b, tuple_id, "pending")
+    # b has no active-tuple target yet: eligible (Ruling T15-a); a's failed one is not
     assert await reelect(engine, group, [a.job_id, b.job_id]) == b.job_id
     assert await group_row(engine, group) == ("active", b.job_id, None, "reconciler_repair")
+    async with engine.begin() as conn:
+        b_target = await state_target(conn, b, tuple_id, "refused")
+    assert await reelect(engine, group, [a.job_id, b.job_id]) is None
+    assert await group_row(engine, group) == ("active", None, "all_failed", "reconciler_repair")
+    async with engine.begin() as conn:  # the user's Retry
+        await conn.execute(
+            sa.text("UPDATE score_targets SET state = 'pending', state_reason = NULL WHERE id = :t"),
+            {"t": b_target},
+        )
+    assert await reelect(engine, group, [a.job_id, b.job_id]) == b.job_id
 
 
 @pytest.mark.parametrize("tuple_active", [False, True], ids=["no_tuple", "active_tuple"])
@@ -181,12 +191,12 @@ async def test_eligible_sql_and_the_member_views_agree(engine, tuple_active: boo
         selected = [int(i) for i in (await conn.execute(_ELIGIBLE, {"ids": ids})).scalars()]
         views = await representative.member_views(conn, group)
     assert [v.job_id for v in views if v.eligible] == selected
-    if tuple_active:
+    if tuple_active:  # no target yet, or a live or published one (Ruling T15-a)
         live = {"pending", "budget_deferred", "in_progress", "in_batch", "deferred_duplicate"}
         expected = [
             job.job_id
             for job, s in zip(jobs, states, strict=True)
-            if s in live or str(s).startswith("published")
+            if s is None or s in live or str(s).startswith("published")
         ]
     else:
         expected = [job.job_id for job in jobs]  # M1: every unmerged, not closed member
@@ -272,9 +282,9 @@ async def test_a_group_whose_members_all_failed_or_were_all_filtered_records_why
 async def test_formation_and_a_representative_s_own_regroup_read_the_targets(
     engine, current_epoch, job_with_postings, queue_app
 ) -> None:
-    """A group formed of two members whose targets failed records `all_failed` (`initial`); one formed before
-    its members have targets (node 6 groups before node 9 creates them) records `no_active_member` until a
-    member is eligible, when the reconciler elects it (`eligible_again`); a representative whose own regroup
+    """A group formed of two members whose targets failed records `all_failed` (`initial`) and is scorable
+    again once one is retried (`eligible_again`); one formed before its members have targets (node 6 groups
+    before node 9 creates them) elects the first by order (Ruling T15-a); a representative whose own regroup
     finds its target failed re-elects (`rep_inactive`)."""
     make = jobs_maker(engine, job_with_postings)
     failed = [await make("jsearch", description_text=FULL_TEXT, company_raw="Umbrella") for _ in "xy"]
@@ -282,8 +292,10 @@ async def test_formation_and_a_representative_s_own_regroup_read_the_targets(
     live = [await make("jsearch", description_text=FULL_TEXT, company_raw="Globex") for _ in "uvw"]
     async with engine.begin() as conn:
         tuple_id = await activate_score_tuple(conn)
-        for job_id in failed:
+        failed_targets = [
             await state_target(conn, await job_ref(conn, job_id), tuple_id, "failed_request")
+            for job_id in failed
+        ]
         made = {
             job_id: await state_target(conn, await job_ref(conn, job_id), tuple_id, "pending")
             for job_id in live
@@ -291,13 +303,17 @@ async def test_formation_and_a_representative_s_own_regroup_read_the_targets(
     formed = await regroup(engine, failed[0])
     assert formed.created and formed.group_id is not None
     assert await group_row(engine, formed.group_id) == ("active", None, "all_failed", "initial")
+    async with engine.begin() as conn:  # the user's Retry of the second member
+        await conn.execute(
+            sa.text("UPDATE score_targets SET state = 'pending', state_reason = NULL WHERE id = :t"),
+            {"t": failed_targets[1]},
+        )
+    assert await repair(engine, queue_app) == 1
+    assert await group_row(engine, formed.group_id) == ("active", failed[1], None, "eligible_again")
     unscored = await regroup(engine, fresh[0])
     assert unscored.created and unscored.group_id is not None
-    assert await group_row(engine, unscored.group_id) == ("active", None, "no_active_member", "initial")
-    async with engine.begin() as conn:
-        await state_target(conn, await job_ref(conn, fresh[1]), tuple_id, "pending")
-    assert await repair(engine, queue_app) == 1
-    assert await group_row(engine, unscored.group_id) == ("active", fresh[1], None, "eligible_again")
+    assert await group_row(engine, unscored.group_id) == ("active", fresh[0], None, "initial")
+    assert await repair(engine, queue_app) == 0  # no violation: a member without a target is eligible
     group = (await regroup(engine, live[0])).group_id
     assert group is not None and (await regroup(engine, live[2])).joined
     assert (await group_row(engine, group))[1] == live[0]
@@ -306,6 +322,86 @@ async def test_formation_and_a_representative_s_own_regroup_read_the_targets(
             await conn.execute(step, {"t": made[live[0]]})
     effect = await regroup(engine, live[0])
     assert effect.reelected and await group_row(engine, group) == ("active", live[1], None, "rep_inactive")
+
+
+async def test_a_full_text_twin_without_a_target_yet_is_appointed_and_created_pending(
+    engine, job_with_postings
+) -> None:
+    """Ruling T15-a: the full twin joins (node 6) before node 9 creates its target, so it has none: it is
+    eligible and elected; node 9 then creates it `pending`, and the partial former representative's target
+    `deferred_duplicate` (never the twin behind the partial ad)."""
+    make = jobs_maker(engine, job_with_postings)
+    p = await make("adzuna", description_text=PARTIAL, description_completeness="partial")
+    await make("adzuna", description_text=PARTIAL, description_completeness="partial")
+    f = await make("greenhouse", description_text=FULL_TEXT)
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+    group = (await regroup(engine, p)).group_id
+    assert group is not None and (await group_row(engine, group))[1] == p
+    effect = await regroup(engine, f)
+    assert effect.joined and effect.reelected
+    assert await group_row(engine, group) == ("active", f, None, "fuller_member_joined")
+    states: dict[int, str] = {}
+    async with engine.begin() as conn:
+        active = await active_ids(conn)
+        profile = int(
+            (await conn.execute(sa.text("SELECT profile_version_id FROM active_config"))).scalar_one()
+        )
+        for job_id in (f, p):  # node 9, after the grouping
+            ref = await job_ref(conn, job_id)
+            made = await targets.create_or_revive(
+                conn,
+                job_id=job_id,
+                job_revision_id=ref.revision_id,
+                llm_tuple_id=tuple_id,
+                profile_version_id=profile,
+                scope_version_id=active.scope_version_id,
+                bulk_operation_id=None,
+                now=utcnow(),
+            )
+            assert isinstance(made, targets.Created)
+            states[job_id] = made.state
+    assert states == {f: "pending", p: "deferred_duplicate"}
+
+
+_NEW_REVISION: Final = sa.text(
+    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, description_text, "
+    "description_completeness, ad_language, embedding_status) SELECT job_id, revision_no + 1, "
+    "sha256(material_hash), llm_input, description_text, description_completeness, ad_language, "
+    "'awaiting_embedding' FROM job_revisions WHERE id = (SELECT current_revision_id FROM jobs WHERE id = :j) "
+    "RETURNING id"
+)
+
+
+async def test_a_representative_with_a_new_revision_and_no_target_yet_is_not_re_elected(
+    engine, current_epoch, job_with_postings, queue_app
+) -> None:
+    """Ruling T15-a: the representative's ad gets a new current revision, which node 6 regroups before node 9
+    creates its target: the representative has no active-tuple target then and stays eligible, so its own
+    regroup re-elects nothing (no `rep_inactive`), the reconciler finds no violation, and its deferred
+    member stays deferred."""
+    make = jobs_maker(engine, job_with_postings)
+    u, v = [await make("jsearch", description_text=FULL_TEXT) for _ in "uv"]
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+        made = {
+            job_id: await state_target(conn, await job_ref(conn, job_id), tuple_id, "pending")
+            for job_id in (u, v)
+        }
+    group = (await regroup(engine, u)).group_id
+    assert group is not None and await group_row(engine, group) == ("active", u, None, "initial")
+    async with engine.begin() as conn:
+        assert (await targets.regroup_sweep(conn, llm_tuple_id=tuple_id)).deferred == 1
+        revision = int((await conn.execute(_NEW_REVISION, {"j": u})).scalar_one())
+        await conn.execute(
+            sa.text("UPDATE jobs SET current_revision_id = :r WHERE id = :j"), {"r": revision, "j": u}
+        )
+    effect = await regroup(engine, u)  # node 6: the representative's revision changed
+    assert not effect.reelected and effect.left == ()
+    assert await group_row(engine, group) == ("active", u, None, "initial")
+    assert await repair(engine, queue_app) == 0  # `_VIOLATIONS` flags nothing
+    deferred = await swept_of(engine, made[v])
+    assert (deferred.state, deferred.deferred_group_id) == ("deferred_duplicate", group)
 
 
 # ---- deferral ----------------------------------------------------------------------------------------------
@@ -549,6 +645,60 @@ async def test_a_representative_change_keeps_an_eligible_member_deferred(
     assert (states[b].state, states[b].deferred_group_id) == ("pending", None)  # the new representative
     assert (states[c].state, states[c].deferred_group_id) == ("deferred_duplicate", group)  # kept deferred
     assert (states[d].state, states[d].deferred_group_id) == ("pending", None)  # conflicts with b
+
+
+async def deferred_group(
+    engine: AsyncEngine, job_with_postings: Any, company: str
+) -> tuple[int, dict[int, int]]:
+    """Three canonical jobs u, v, w of `company` with pending targets of the active score tuple, grouped with
+    u as the representative, v and w deferred by the regroup sweep; the group and the targets by job."""
+    make = jobs_maker(engine, job_with_postings)
+    jobs = [await make("jsearch", description_text=FULL_TEXT, company_raw=company) for _ in "uvw"]
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+        made = {j: await state_target(conn, await job_ref(conn, j), tuple_id, "pending") for j in jobs}
+    group = (await regroup(engine, jobs[0])).group_id
+    assert group is not None and (await regroup(engine, jobs[2])).joined
+    async with engine.begin() as conn:
+        assert (await targets.regroup_sweep(conn, llm_tuple_id=tuple_id)).deferred == 2
+    return group, made
+
+
+async def test_a_member_that_leaves_on_a_revalidation_has_its_deferred_target_returned(
+    engine, current_epoch, job_with_postings
+) -> None:
+    """The representative's own regroup revalidates its members: one whose seniority tokens no longer match
+    (G3) leaves, and its deferred target returns to `pending`; the other stays deferred."""
+    group, made = await deferred_group(engine, job_with_postings, "Initech")
+    u, v, w = sorted(made)
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE jobs SET seniority_tokens = ARRAY['junior'] WHERE id = :j"), {"j": w}
+        )
+    effect = await regroup(engine, u)  # node 6: the representative changed
+    assert effect.left == (w,) and not effect.reelected
+    left = await swept_of(engine, made[w])
+    assert (left.state, left.deferred_group_id) == ("pending", None)
+    stays = await swept_of(engine, made[v])
+    assert (stays.state, stays.deferred_group_id) == ("deferred_duplicate", group)
+
+
+async def test_a_member_merged_away_has_its_deferred_target_returned(
+    engine, current_epoch, job_with_postings
+) -> None:
+    """Merge step 5 (`leave_group`): the merged member leaves its group, and its deferred target returns to
+    `pending` in the merge's transaction; the other member stays deferred."""
+    group, made = await deferred_group(engine, job_with_postings, "Vandelay")
+    _, v, w = sorted(made)
+    other = await jobs_maker(engine, job_with_postings)("adzuna", description_text=varied(80, 200))
+    async with engine.begin() as conn:
+        await merge.merge_jobs(
+            conn, from_job_id=w, into_job_id=other, kind="user_confirmed_merge", evidence={"rule": "test"}
+        )
+    merged = await swept_of(engine, made[w])
+    assert (merged.state, merged.deferred_group_id) == ("pending", None)
+    stays = await swept_of(engine, made[v])
+    assert (stays.state, stays.deferred_group_id) == ("deferred_duplicate", group)
 
 
 async def test_a_full_text_twin_is_elected_and_always_included(engine, job_with_postings) -> None:

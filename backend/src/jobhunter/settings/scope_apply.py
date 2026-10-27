@@ -66,9 +66,11 @@ incomplete_results`); `progress` is `{"done", "total", "det_done", "det_total"}`
    - `incomplete_jobs(conn, sid) > 0`, or, with an active tuple, `incomplete_results(conn, …) > 0` (a
      published result of the **currently** active tuple without a current instance for the pending scope
      whose hash and algorithm version are current, L4915): the transaction rolls back and the precompute
-     runs again, at most `FINAL_CHECK_ROUNDS` times; a check that fails after the last re-run requeues the
-     operation in a transaction of its own (`requeue_in`, `scope_incomplete`, `not_before = now +
-     INCOMPLETE_RETRY_AFTER`);
+     runs again, at most `FINAL_CHECK_ROUNDS` times (the result half is O(N) in the tuple's published
+     results: their pages, their jobs' facts and sources and a hash each, measured at about 0.7-1 s per
+     10,000 results under this `FOR UPDATE`, Ruling T15-b; no stored hash column); a check that fails after
+     the last re-run requeues the operation in a transaction of its own (`requeue_in`, `scope_incomplete`,
+     `not_before = now + INCOMPLETE_RETRY_AFTER`);
    - otherwise the flip (`scope_version_id := pending`, `pending := NULL`, `updated_at := now`), then the
      operation `succeeded` (`finish_in`, the owner row), every open `scope.apply_failed` resolved (other
      domain rows), the active tuple's unpublished targets moved `filtered_out ⇄ pending` by the new filters
@@ -118,7 +120,7 @@ from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import ScopeSettings, scope_from_payload
 from jobhunter.scoring import det_results, targets
 from jobhunter.scoring.det_results import JobRow, ScopeRow
-from jobhunter.scoring.filters import BATCH, STALE_PREDICATE, read_det_facts_of, recompute_stale
+from jobhunter.scoring.filters import BATCH, STALE_PREDICATE, recompute_stale
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
 from jobhunter.types import JSONValue, get_int, get_object
 from jobhunter.worker.epoch import fence_epoch
@@ -229,12 +231,13 @@ async def incomplete_results(conn: AsyncConnection, *, scope_version_id: int, ll
     `det_inputs_hash` is that of their job's current det-facts and whose algorithm version is current
     (`det_results.stale_of`, page by page of `DET_BATCH`): no limit, no lock."""
     scope = await _scope_row(conn, scope_version_id)
+    scope_part = det_results.scope_inputs(scope.settings)  # once per check (Review Minor 4)
     stale, after = 0, 0
     while True:
         page = await det_results.published_page(
             conn, llm_tuple_id=llm_tuple_id, scope_version_id=scope_version_id, after=after, limit=DET_BATCH
         )
-        stale += len(await det_results.stale_of(conn, page, scope))
+        stale += len((await det_results.stale_of(conn, page, scope, scope_part=scope_part)).results)
         if len(page) < DET_BATCH:
             return stale
         after = page[-1].llm_result_id
@@ -316,6 +319,7 @@ async def _det_chunks(ctx: OperationContext, sid: int, scope: ScopeSettings, pro
     chunks."""
     claim = ctx.claim
     row = ScopeRow(sid, scope)
+    scope_part = det_results.scope_inputs(scope)
     after, seen = 0, None
     while True:
         async with ctx.engine.begin() as conn:
@@ -332,20 +336,18 @@ async def _det_chunks(ctx: OperationContext, sid: int, scope: ScopeSettings, pro
                 return
             await targets.lock_jobs(conn, [item.job_id for item in page])  # step 4, before the results
             await lock_operation_owner(conn, claim)  # step 5
-            stale = await det_results.stale_of(conn, page, row)
-            facts = await read_det_facts_of(conn, [item.job_id for item in stale])
-            sources = await det_results.jobs_sources(conn, [item.job_id for item in stale])
+            stale = await det_results.stale_of(conn, page, row, scope_part=scope_part)
             recomputed = 0
-            for item in stale:  # step 10: the results in id order, each with its instances
-                if item.job_id not in facts:
+            for item in stale.results:  # step 10: the results in id order, with the facts `stale_of` read
+                if item.job_id not in stale.facts:
                     continue  # deleted since the page was read: its results went with it
                 recomputed += 1
                 await det_results.recompute_instance(
                     conn,
                     llm_result_id=item.llm_result_id,
                     scope=row,
-                    det=facts[item.job_id],
-                    sources=sources[item.job_id],
+                    det=stale.facts[item.job_id],
+                    sources=stale.sources[item.job_id],
                     job=JobRow(item.job_id),
                 )
             await set_progress(conn, claim, progress.add_det(recomputed))  # the last statement

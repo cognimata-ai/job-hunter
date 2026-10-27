@@ -1,12 +1,15 @@
 """The representative of a duplicate group (spec §8.7, §7.17 #4): eligibility, the election order, elections
 and dissolution.
 
-**Eligibility** (§8.7 L3251; M3 Task 15 closes M1 Deviation 9): a member is eligible when its job is
-unmerged and not `closed` and, while a tuple is active, its active-tuple target (the target of its current
-revision for `active_config.llm_tuple_id`) is in `ELIGIBLE_TARGET_STATES`: `pending`, `budget_deferred`,
-`in_progress`, `in_batch`, `deferred_duplicate` or published. A member without such a target, or whose
-target failed, was refused, expired, was filtered out or cancelled, is not eligible; with no active tuple M1's
-rule holds. §7.17 #4 is read with this list (A1 issue 27). `ELIGIBLE_SQL` is the same predicate over a `jobs`
+**Eligibility** (§8.7 L3251; M3 Task 15 closes M1 Deviation 9, Ruling T15-a): a member is eligible when its
+job is unmerged and not `closed` and, while a tuple is active, its active-tuple target (the target of its
+current revision for `active_config.llm_tuple_id`) does not exist yet or is in `ELIGIBLE_TARGET_STATES`:
+`pending`, `budget_deferred`, `in_progress`, `in_batch`, `deferred_duplicate` or published. A member whose
+target failed, was refused, expired, was filtered out or cancelled is not eligible; with no active tuple M1's
+rule holds. A member without a target counts because node 6 groups a job (and a representative's new current
+revision) before node 9 creates its target: a fresh group elects at once, a full-text twin is appointed when
+it joins, and a representative is not re-elected for a revision whose target is still to come. §7.17 #4 is
+read with this list (A1 issue 27). `ELIGIBLE_SQL` is the same predicate over a `jobs`
 row aliased `j` and the `active_config` row aliased `ac`, which every statement that selects by it joins; the
 two change together (`eligible(availability, merged, target_state, has_tuple=…)`).
 
@@ -68,11 +71,13 @@ ELIGIBLE_TARGET_STATES: Final = (
 )
 # The target states of `all_failed` (L3259: every target failed, refused or expired), besides `failed_*`.
 _FAILED_STATES: Final = frozenset({"refused", "expired_unscored"})
-# `eligible` over `jobs j` and `active_config ac` (module docstring; the plan's text, verbatim).
+# `eligible` over `jobs j` and `active_config ac` (module docstring, Ruling T15-a): no active tuple, no
+# active-tuple target of the current revision yet, or one in `ELIGIBLE_TARGET_STATES`. `(job_revision_id,
+# llm_tuple_id)` is UNIQUE, so "no target in another state" is exact.
 ELIGIBLE_SQL: Final = (
-    "(j.merged_into_job_id IS NULL AND j.availability <> 'closed' AND (ac.llm_tuple_id IS NULL OR EXISTS "
+    "(j.merged_into_job_id IS NULL AND j.availability <> 'closed' AND (ac.llm_tuple_id IS NULL OR NOT EXISTS "
     "(SELECT 1 FROM score_targets t WHERE t.job_revision_id = j.current_revision_id AND t.llm_tuple_id = "
-    "ac.llm_tuple_id AND t.state IN ('pending', 'budget_deferred', 'in_progress', 'in_batch', "
+    "ac.llm_tuple_id AND t.state NOT IN ('pending', 'budget_deferred', 'in_progress', 'in_batch', "
     "'deferred_duplicate', 'published_accepted', 'published_contested'))))"
 )
 # A job's active-tuple target state (`target_state`, NULL without one) and whether a tuple is active, over
@@ -123,10 +128,11 @@ class MemberView:
 
 def eligible(availability: str, merged: bool, target_state: str | None, *, has_tuple: bool) -> bool:
     """§8.7's eligibility (module docstring): the job is unmerged and not `closed`, and, while a tuple is
-    active (`has_tuple`), its active-tuple target is in `ELIGIBLE_TARGET_STATES`."""
+    active (`has_tuple`), it has no active-tuple target yet or one in `ELIGIBLE_TARGET_STATES` (Ruling
+    T15-a)."""
     if merged or availability == "closed":
         return False
-    return not has_tuple or target_state in ELIGIBLE_TARGET_STATES
+    return not has_tuple or target_state is None or target_state in ELIGIBLE_TARGET_STATES
 
 
 def _failed(state: str | None) -> bool:

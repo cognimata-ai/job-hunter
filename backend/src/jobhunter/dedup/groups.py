@@ -16,9 +16,11 @@ qualifying (`_end_ambiguity`). Otherwise the ungrouped candidate with the best p
 then lowest id) forms a new group with it, its representative elected by §8.7's order (`initial`; none
 eligible: the group records why, `representative.unscorable_reason`). Groups are never merged together.
 
-**Eligibility** reads the members' active-tuple targets (`representative.eligible`, M3 Task 15): the
-`JobView`s carry their `target_state` and whether a tuple is active, and the reconciler's violations join
-`active_config` for `ELIGIBLE_SQL`.
+**Eligibility** reads the members' active-tuple targets (`representative.eligible`, M3 Task 15, Ruling
+T15-a: no target yet, or a live or published one): the `JobView`s carry their `target_state` and whether a
+tuple is active, and the reconciler's violations join `active_config` for `ELIGIBLE_SQL`. Node 6 groups
+before node 9 creates the targets, so a fresh group elects at once and a full-text twin is appointed when it
+joins; node 9 then creates the representative `pending` and the others deferred.
 
 **Deferral and the group events** (§8.7 L3261-3267, M3 Task 15). `deferrable(member, representative,
 target)` is L3261's predicate for entering deferral (not the representative, `override = 'none'`, not
