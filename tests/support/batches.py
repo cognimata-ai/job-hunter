@@ -27,7 +27,8 @@ __all__ = ["BatchScript", "ItemOutcome", "StoredBatch", "scripted_batches", "syn
 def scripted_batches(script: BatchScript | None = None, /, **fields: Any) -> dict[str, StoredBatch]:
     """Register `script` (else `BatchScript(**fields)`) as the test's batch script and return the batches
     the fake stores (the live mapping, by batch id, in creation order). A later call replaces the script for
-    every later call of the API; a stored batch keeps the items and polls it was created under."""
+    every later call of the API, stored batches included: a batch's item outcomes are decided, and then
+    frozen, at its cancel or when it is first observed as ended (`jobhunter.llm.fake`)."""
     if script is not None and fields:
         raise ValueError("pass a BatchScript or its fields, not both")
     return fake.batches(BatchScript(**fields) if script is None else script).batches

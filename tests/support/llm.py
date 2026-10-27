@@ -28,8 +28,9 @@ naming the owner's real target and attempt, `batch_kw` (one batch item's reserva
 (the attempt and target counters) and `reclaim_target` (the claim's reclaim and a new claim).
 
 M3 Task 8 adds the keyed answers and the batch side: `FakeLLM.answer` (a stream for one job revision's key,
-by default a valid C draft) and `synthetic_message_json` (a non-streamed message, the shape of a batch item's
-`succeeded` result); `tests/support/batches.py` holds the batch script builders.
+by default a valid C draft), `FakeAnthropic.batches` (the batch script) and `synthetic_message_json` (a
+non-streamed message, the shape of a batch item's `succeeded` result); `tests/support/batches.py` holds the
+batch script builders.
 
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
@@ -643,6 +644,11 @@ class FakeAnthropic:
 
     def scenario(self, *names: fake.Scenario) -> None:
         fake.scenario(*names)
+
+    def batches(self, script: fake.BatchScript) -> dict[str, fake.StoredBatch]:
+        """Register `script` as the test's batch script (`fake.batches`) and return the batches the fake
+        stores (the live mapping, by batch id)."""
+        return fake.batches(script).batches
 
     def count_tokens(self, result: int | Literal["error"]) -> None:
         fake.count_tokens(result)

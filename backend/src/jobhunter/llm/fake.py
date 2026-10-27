@@ -48,43 +48,55 @@ key in the current state. A message try is answered by, in this order:
 2. the scenario script (the next name per try, in arrival order, as above);
 3. the recording `root/<purpose>/<model>/<schema12>.sse`.
 
-**The Message Batches API**, on the same mount (`BATCHES_PATH`), answered from the state's `BatchScript`
-(`batches(script)`; with none registered, `BatchScript()`, so a dev worker in fake mode answers batches too):
+**The Message Batches API**, on the same mount (`BATCHES_PATH`), answered from the state's current
+`BatchScript` (`batches(script)`; with none registered, `BatchScript()`, so a dev worker in fake mode answers
+batches too). Every script field is read from the script current when it is needed (Ruling T8-d), so a test
+may register a batch's item outcomes after the batch exists:
 - `POST /v1/messages/batches` (create) validates the requests (non-empty, each `custom_id` matching
   `^[a-zA-Z0-9_-]{1,64}$` and unique, params with a model and a positive `max_tokens` and no `stream`; else
   400 `invalid_request_error`), then follows `script.create`: `ok` stores the batch (`msgbatch_<n>`) and
-  answers it, `in_progress` (`ended` when `polls_until_ended` is 0); `ambiguous_created` stores it, then
-  drops the connection (`httpx2.RemoteProtocolError`); `ambiguous_not_created` drops it without storing;
-  `reject_400` is a 400 `invalid_request_error`, `error_500` a 500 `api_error`, `timeout` an
-  `httpx2.ReadTimeout`. Its `X-JH-Fake-Key` header, when sent (fake mode only), is a JSON object of
-  `custom_id` to answer key (`batch_keys`), for the items' bodies;
-- `GET /v1/messages/batches/{id}` (retrieve) counts a retrieval: `in_progress` for the script's
-  `polls_until_ended` retrievals, `ended` from the next one on (from creation when it is 0), and `ended` at
-  the first retrieval after a cancel. `request_counts` holds every item as `processing` until the batch ends,
-  then its tallies (a `missing` item counts as `succeeded`: the provider processed it, its result is lost);
+  answers it, `in_progress`, or `ended` when `polls_until_ended` is 0; `ambiguous_created` stores it, then
+  drops the connection (`httpx2.RemoteProtocolError`; nothing has observed it); `ambiguous_not_created`
+  drops it without storing; `reject_400` is a 400 `invalid_request_error`, `error_500` a 500 `api_error`,
+  `timeout` an `httpx2.ReadTimeout`. Its `X-JH-Fake-Key` header, when sent (fake mode only), is a JSON object
+  of `custom_id` to answer key (`batch_keys`), for the items' bodies; a batch item's key may have no scenario
+  answer registered (a 400 `invalid_request_error`), as batch items take bodies only;
+- a batch is `ended` once its retrievals reach the current script's `polls_until_ended` (a retrieval reports
+  what the batch is before it counts itself: `in_progress` for `polls_until_ended` retrievals, then
+  `ended`), at the first observation after an accepted cancel, or, while neither holds, when it is observed
+  at or after its `expires_at` (`created_at` + 24 h on `FakeLLMState.clock`), then with every undecided item
+  `expired`, as the API expires the unprocessed requests. An observation is a create answered, a retrieval,
+  the listing of the batch, a results read or a cancel. Each item's outcome is decided once and then frozen:
+  at an accepted cancel (the items the current script names in `items` were processed and keep their
+  outcomes, every other item is `canceled`), else at the first observation of the batch as ended, from the
+  script current then (`items`, else `default_item`), so results are stable across reads;
+- `GET /v1/messages/batches/{id}` (retrieve): the batch, then one retrieval more. `request_counts` holds every
+  item as `processing` until the batch ends, then its tallies (a `missing` item counts as `succeeded`: the
+  provider processed it, its result is lost);
 - `GET /v1/messages/batches/{id}/results` (JSONL, once ended; a 400 before) has one line per item that is not
   `missing`, ordered by the SHA-256 of `<batch id>:<custom_id>` and never in submission order (two or more
   lines). `script.stream_cut_after = k` serves `k` lines, then drops the connection
   (`httpx2.RemoteProtocolError`; the SDK's reader, which reads 64-byte chunks, may lose the tail it held
   before the drop);
-- `POST /v1/messages/batches/{id}/cancel`: `canceling` (an ended batch is left as it is); the items the
-  batch's script names in `items` were processed before the cancel and keep their outcomes, every other item
-  ends `canceled`. `script.cancel = "error_500"` is a 500 and changes nothing;
-- `GET /v1/messages/batches` (the listing): every stored batch, newest first, as `retrieve` last left it
-  (no retrieval counted), with `limit` (1-1000, default 20) and `after_id` paging; `script.listing = "empty"`
-  lists nothing and `"error_500"` fails every listing until the script changes (C22).
-A batch keeps the script it was created under for its items and polls (`items`, `default_item`,
-`polls_until_ended`); `create`, `listing`, `stream_cut_after` and `cancel` are read from the current script
-at each call. When a batch ends its items are decided once: a `succeeded*` item's message is made from its
-keyed answer (a body, by the create's key for it) or else the `generate` recording of its params' model and
-schema (none: the item is `errored` with `not_found_error`), as JSON with the four token counts, the model,
-the stop reason, `stop_details` (a refusal) and the id, and no thinking block; `succeeded:max_tokens` is cut
-to half its text with `output_tokens` the params' `max_tokens`, `succeeded:refusal` has no content,
-`succeeded:unexpected_stop` stops at `tool_use` and `succeeded:invalid` is text that is no JSON.
+- `POST /v1/messages/batches/{id}/cancel`: `canceling`, then `ended` at the next observation (an ended batch
+  is left as it is); `script.cancel = "error_500"` is a 500 and changes nothing;
+- `GET /v1/messages/batches` (the listing): the stored batches, newest first, each as a retrieval would
+  report it at that moment (no retrieval counted), with `limit` (1-1000, default 20) and `after_id` paging
+  (an unknown `after_id`, and `before_id`, which the fake does not page by, are a 400); `script.listing =
+  "empty"` lists nothing and `"error_500"` fails every listing until the script changes (C22).
+A `succeeded*` item's message is made from its keyed answer (the first body registered for its create key,
+skipping any scenario) or else the `generate` recording of its params' model and schema, as JSON with the
+four token counts, the model, the stop reason, `stop_details` (a refusal) and the id, and no thinking block;
+`succeeded:max_tokens` is cut to half its text with `output_tokens` the params' `max_tokens`,
+`succeeded:refusal` has no content, `succeeded:unexpected_stop` stops at `tool_use` and `succeeded:invalid`
+is text that is no JSON. With neither an answer nor a recording the item is `errored` (`not_found_error`), its
+outcome `errored:not_found`, and `FakeLLMState.batch_recording_misses` counts it.
 `FakeLLMState.batches` keeps every stored batch (`StoredBatch`: the requests by `custom_id`, the keys, the
-retrievals, the results reads, the cancel), and `FakeLLMState.clock` stamps their times. Until V12's recorded
-bodies are committed (`tests/contract/fixtures/anthropic/batches/`, plan Task 26), the fake generates every
-batch body.
+retrievals, the results reads, the cancel, the outcomes). The process-wide state of a dev worker keeps the
+full params of its `PROCESS_BATCHES_KEPT` (50) newest batches only: an older batch keeps each item's model,
+`max_tokens` and output schema (`KEPT_PARAMS`), so it stays answerable without holding ad or profile text.
+Until V12's recorded bodies are committed (`tests/contract/fixtures/anthropic/batches/`, plan Task 26), the
+fake generates every batch body.
 
 The state of a test (its scenario, the count answer, the keyed answers, the batch script and batches, the
 requests served) lives in a context variable; `fresh_state()` gives a block its own. Outside any (a dev worker
@@ -169,7 +181,12 @@ ITEM_ERRORS: Final[Mapping[str, tuple[str, str]]] = {
     "errored:invalid_request": ("invalid_request_error", "fake: the batch request is invalid"),
     "errored:other": ("api_error", "fake: the batch request failed"),
 }
+# An item's decided outcome: its scripted one, or `errored:not_found` for a `succeeded*` item without a keyed
+# answer or a recording.
+BatchItemResult = ItemOutcome | Literal["errored:not_found"]
 BatchStatus = Literal["in_progress", "canceling", "ended"]
+PROCESS_BATCHES_KEPT: Final = 50  # the dev worker's batches whose full params are kept
+KEPT_PARAMS: Final = ("model", "max_tokens", "output_config")  # what an older batch keeps of each item
 
 
 @dataclass(frozen=True)
@@ -205,15 +222,15 @@ class BatchScript:
 
 @dataclass(eq=False)
 class StoredBatch:
-    """One batch the fake created: its id and creation order, its creation time, the script it was created
-    under, the purpose of its recordings, its requests (each `custom_id`'s params, in submission order) and
-    answer keys; what was asked of it (retrievals, results reads, an accepted cancel); and, once it ended,
-    each item's outcome and its result line (none for a `missing` item)."""
+    """One batch the fake created: its id and creation order, its creation time, the purpose of its
+    recordings, its requests (each `custom_id`'s params, in submission order) and answer keys; what was asked
+    of it (retrievals, results reads, an accepted cancel); each item's outcome once decided (at an accepted
+    cancel, or when the batch is first observed as ended) and, once it ended, its result line (none for a
+    `missing` item)."""
 
     id: str
     seq: int
     created_at: datetime
-    script: BatchScript
     purpose: str
     requests: dict[str, Mapping[str, Any]] = field(repr=False)
     keys: dict[str, str]
@@ -222,7 +239,7 @@ class StoredBatch:
     cancel_requested: bool = False
     cancel_initiated_at: datetime | None = None
     ended_at: datetime | None = None
-    outcomes: dict[str, ItemOutcome] = field(default_factory=dict)
+    outcomes: dict[str, BatchItemResult] = field(default_factory=dict)
     lines: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
 
     @property
@@ -433,6 +450,7 @@ class FakeLLMState:
     batch_script: BatchScript | None = None  # None: `BatchScript()`
     batches: dict[str, StoredBatch] = field(default_factory=dict)
     batch_seq: int = 0  # the number of the last batch id given
+    batch_recording_misses: int = 0  # `succeeded*` batch items without a keyed answer or a recording
     clock: Callable[[], datetime] = utcnow
 
     def take(self) -> Scenario:
@@ -443,16 +461,25 @@ class FakeLLMState:
 
     def take_answer(self, key: str | None, *, body_only: bool = False) -> bytes | Scenario | None:
         """The keyed answer that answers `key` now (module docstring), a one-shot one removed as it is
-        taken; `None` when there is none, or with `body_only` when it is a scenario (left in place)."""
+        taken; `None` when there is none. With `body_only` (a batch item) the first body: a scenario entry is
+        skipped and left in place."""
         if key is None:
             return None
-        once = self.answers_once.get(key)
-        found = once[0] if once else self.answers.get(key)
-        if found is None or (body_only and not isinstance(found, bytes)):
+        once = self.answers_once.get(key, [])
+        for i, found in enumerate(once):
+            if not body_only or isinstance(found, bytes):
+                return once.pop(i)
+        standing = self.answers.get(key)
+        if standing is None or (body_only and not isinstance(standing, bytes)):
             return None
-        if once:
-            once.pop(0)
-        return found
+        return standing
+
+    def has_scenario_answer(self, key: str) -> bool:
+        """Whether a scenario (a standing or one-shot answer) is registered for `key`."""
+        standing = self.answers.get(key)
+        if standing is not None and not isinstance(standing, bytes):
+            return True
+        return any(not isinstance(found, bytes) for found in self.answers_once.get(key, []))
 
     @property
     def current_batch_script(self) -> BatchScript:
@@ -503,12 +530,20 @@ def count_tokens(result: int | Literal["error"]) -> FakeLLMState:
 def answer(key: str, body: bytes | Scenario, *, consume: bool = False) -> FakeLLMState:
     """Register `body` (an SSE stream, or a scenario name) for the tries sent with `key` in the current state:
     a one-shot answer with `consume` (served once, after the key's earlier one-shot answers), else the key's
-    standing answer (replacing any). A key without an answer left falls back (module docstring)."""
+    standing answer (replacing any). A key without an answer left falls back (module docstring). A scenario is
+    refused for a key that an item of a batch not yet ended answers with (batch items take bodies only)."""
     if not isinstance(key, str) or not key:
         raise ValueError("a keyed answer needs a non-empty key")
     if not isinstance(body, bytes) and body not in SCENARIOS:
         raise ValueError(f"a keyed answer is SSE bytes or a fake LLM scenario; known: {', '.join(SCENARIOS)}")
     current = state()
+    if not isinstance(body, bytes):
+        pending = [b.id for b in current.batches.values() if b.ended_at is None and key in b.keys.values()]
+        if pending:
+            raise ValueError(
+                f"key {key!r} answers an item of batch {pending[0]}, which takes bodies only: register the "
+                "scenario after the batch has ended"
+            )
     if consume:
         current.answers_once.setdefault(key, []).append(body)
     else:
@@ -682,6 +717,15 @@ class RecordedSSETransport(httpx2.AsyncBaseTransport):
             )
         except _NoRecording as exc:
             return _error(404, "not_found_error", f"fake: {exc}", request_id)
+
+    def recorded_stream(self, purpose: str, model: object, body: Mapping[str, Any]) -> bytes | None:
+        """The stored stream that answers a request of `purpose` with `body` (its model and output schema),
+        or `None` without one (a batch item's fallback)."""
+        try:
+            path, _ = self._locate(purpose, model, body)
+        except _NoRecording:
+            return None
+        return path.read_bytes()
 
     def _locate(self, purpose: str | None, model: object, body: Mapping[str, Any]) -> tuple[Path, Any]:
         schema = body.get("output_config", {}).get("format", {}).get("schema")
@@ -932,6 +976,10 @@ class _FakeBatches:
         parsed = _batch_requests(content, request.headers.get(KEY_HEADER))
         if isinstance(parsed, str):
             return _error(400, "invalid_request_error", f"fake: {parsed}", "req_fake")
+        requests, keys = parsed
+        if any(self._state.has_scenario_answer(key) for key in set(keys.values())):
+            message = "fake: a batch item's key has a scenario answer; batch items take bodies only"
+            return _error(400, "invalid_request_error", message, "req_fake")
         if script.create == "reject_400":
             return _error(400, "invalid_request_error", "fake: the batch was rejected", "req_fake")
         if script.create == "error_500":
@@ -940,42 +988,64 @@ class _FakeBatches:
             raise httpx2.ReadTimeout("fake: no response within the read timeout", request=request)
         if script.create == "ambiguous_not_created":
             raise httpx2.RemoteProtocolError("fake: the connection dropped before the batch", request=request)
-        requests, keys = parsed
-        purpose = request.headers.get(PURPOSE_HEADER) or "generate"
         self._state.batch_seq += 1
         batch = StoredBatch(
             id=f"msgbatch_{self._state.batch_seq}",
             seq=self._state.batch_seq,
             created_at=self._state.clock(),
-            script=script,
-            purpose=purpose,
+            purpose=request.headers.get(PURPOSE_HEADER) or "generate",
             requests=requests,
             keys=keys,
         )
         self._state.batches[batch.id] = batch
-        if script.polls_until_ended == 0:
-            self._end(batch, at=batch.created_at)
-        if script.create == "ambiguous_created":
+        self._release_old_params()
+        if script.create == "ambiguous_created":  # the answer never arrives: nothing observed the batch
             raise httpx2.RemoteProtocolError("fake: the connection dropped after the batch", request=request)
+        self._observe(batch, now=batch.created_at)
         return self._json(_batch_json(batch, request.url))
 
+    def _release_old_params(self) -> None:
+        """In the process-wide state (a dev worker), each batch older than the `PROCESS_BATCHES_KEPT` newest
+        keeps only the `KEPT_PARAMS` of its items (module docstring)."""
+        if self._state.record:
+            return
+        newest = sorted(self._state.batches.values(), key=lambda b: b.seq, reverse=True)
+        for batch in newest[PROCESS_BATCHES_KEPT:]:
+            batch.requests = {
+                cid: {key: params[key] for key in KEPT_PARAMS if key in params}
+                for cid, params in batch.requests.items()
+            }
+
+    def _observe(self, batch: StoredBatch, *, now: datetime) -> None:
+        """End `batch` if it has ended by `now` under the current script (module docstring)."""
+        if batch.ended_at is not None:
+            return
+        script = self._state.current_batch_script
+        if batch.cancel_initiated_at is not None or batch.retrievals >= script.polls_until_ended:
+            self._end(batch, script, at=min(now, batch.expires_at))
+        elif now >= batch.expires_at:
+            self._end(batch, script, at=batch.expires_at, expired=True)
+
     def _retrieve(self, batch: StoredBatch, request: httpx2.Request) -> httpx2.Response:
+        self._observe(batch, now=self._state.clock())
         batch.retrievals += 1
-        if batch.ended_at is None and (
-            batch.cancel_initiated_at is not None or batch.retrievals > batch.script.polls_until_ended
-        ):
-            self._end(batch, at=self._state.clock())
         return self._json(_batch_json(batch, request.url))
 
     def _cancel(self, batch: StoredBatch, request: httpx2.Request) -> httpx2.Response:
-        if self._state.current_batch_script.cancel == "error_500":
+        script = self._state.current_batch_script
+        if script.cancel == "error_500":
             return _error(500, "api_error", "fake: the batch cancel failed", "req_fake")
+        now = self._state.clock()
+        self._observe(batch, now=now)
         batch.cancel_requested = True
         if batch.ended_at is None and batch.cancel_initiated_at is None:
-            batch.cancel_initiated_at = self._state.clock()
+            batch.cancel_initiated_at = now
+            for custom_id in batch.requests:  # processed before the cancel, or not
+                batch.outcomes[custom_id] = script.items.get(custom_id, "canceled")
         return self._json(_batch_json(batch, request.url))
 
     def _results(self, batch: StoredBatch, request: httpx2.Request) -> httpx2.Response:
+        self._observe(batch, now=self._state.clock())
         if batch.ended_at is None:
             return _error(400, "invalid_request_error", "fake: the batch has not ended", "req_fake")
         batch.results_read += 1
@@ -994,18 +1064,30 @@ class _FakeBatches:
         script = self._state.current_batch_script
         if script.listing == "error_500":
             return _error(500, "api_error", "fake: the batch listing failed", "req_fake")
+        params = request.url.params
         try:
-            limit = int(request.url.params.get("limit", _LISTING_DEFAULT))
+            limit = int(params.get("limit", _LISTING_DEFAULT))
         except ValueError:
             limit = 0
         if not _LISTING_LIMIT[0] <= limit <= _LISTING_LIMIT[1]:
             return _error(400, "invalid_request_error", "fake: limit must be 1 to 1000", "req_fake")
-        newest = sorted(self._state.batches.values(), key=lambda b: b.seq, reverse=True)
-        if script.listing == "empty":
-            newest = []
-        if (after := request.url.params.get("after_id")) is not None:
+        if params.get("before_id") is not None:
+            return _error(
+                400, "invalid_request_error", "fake: the listing pages by after_id only", "req_fake"
+            )
+        newest = (
+            [] if script.listing == "empty" else sorted(self._state.batches.values(), key=lambda b: -b.seq)
+        )
+        if (after := params.get("after_id")) is not None:
             ids = [b.id for b in newest]
-            newest = newest[ids.index(after) + 1 :] if after in ids else []
+            if after not in ids:
+                return _error(
+                    400, "invalid_request_error", "fake: after_id names no listed batch", "req_fake"
+                )
+            newest = newest[ids.index(after) + 1 :]
+        now = self._state.clock()
+        for batch in newest[:limit]:
+            self._observe(batch, now=now)
         data = [_batch_json(b, request.url) for b in newest[:limit]]
         return self._json(
             {
@@ -1016,35 +1098,42 @@ class _FakeBatches:
             }
         )
 
-    def _end(self, batch: StoredBatch, *, at: datetime) -> None:
-        """End `batch` at `at`: decide each item's outcome (a cancelled batch's unnamed items are `canceled`)
-        and its result line, once."""
-        batch.ended_at = at
+    def _end(self, batch: StoredBatch, script: BatchScript, *, at: datetime, expired: bool = False) -> None:
+        """End `batch` at `at`: each undecided item takes its outcome from `script` (`expired` when the batch
+        expired), then every item gets its result line, once (module docstring)."""
         for custom_id, params in batch.requests.items():
-            outcome = batch.script.items.get(custom_id, batch.script.default_item)
-            if batch.cancel_initiated_at is not None and custom_id not in batch.script.items:
-                outcome = "canceled"
+            outcome = batch.outcomes.get(custom_id)
+            if outcome is None:
+                outcome = "expired" if expired else script.items.get(custom_id, script.default_item)
+            outcome, result = self._result(batch, custom_id, params, outcome)
             batch.outcomes[custom_id] = outcome
-            result = self._result(batch, custom_id, params, outcome)
             if result is not None:
                 batch.lines[custom_id] = {"custom_id": custom_id, "result": result}
+        batch.ended_at = at
 
     def _result(
-        self, batch: StoredBatch, custom_id: str, params: Mapping[str, Any], outcome: ItemOutcome
-    ) -> dict[str, Any] | None:
+        self, batch: StoredBatch, custom_id: str, params: Mapping[str, Any], outcome: BatchItemResult
+    ) -> tuple[BatchItemResult, dict[str, Any] | None]:
+        """The item's actual outcome and its result (none for a `missing` item)."""
         if outcome == "missing":
-            return None
+            return outcome, None
         if outcome in ("canceled", "expired"):
-            return {"type": outcome}
+            return outcome, {"type": outcome}
         if outcome in ITEM_ERRORS:
-            return _errored(*ITEM_ERRORS[outcome])
+            return outcome, _errored(*ITEM_ERRORS[outcome])
         answered = self._state.take_answer(batch.keys.get(custom_id), body_only=True)
-        try:
-            if isinstance(answered, bytes):
-                stream = answered
-            else:
-                path, _ = self._transport._locate(batch.purpose, params.get("model"), params)
-                stream = path.read_bytes()
-            return {"type": "succeeded", "message": _item_message(outcome, parse_sse(stream), params)}
-        except _NoRecording:
-            return _errored("not_found_error", "fake: no keyed answer or recording for the item")
+        stream = answered if isinstance(answered, bytes) else None
+        if stream is None:
+            stream = self._transport.recorded_stream(batch.purpose, params.get("model"), params)
+        if stream is not None and outcome != "errored:not_found":
+            try:
+                return outcome, {
+                    "type": "succeeded",
+                    "message": _item_message(outcome, parse_sse(stream), params),
+                }
+            except _NoRecording:
+                pass
+        self._state.batch_recording_misses += 1
+        return "errored:not_found", _errored(
+            "not_found_error", "fake: no keyed answer or recording for the item"
+        )
