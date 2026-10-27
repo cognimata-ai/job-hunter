@@ -65,7 +65,6 @@ One lost or failed claim never aborts its siblings or the cycle.
 """
 
 import asyncio
-import random
 from typing import Final
 
 import psycopg
@@ -75,7 +74,7 @@ from langgraph.types import Command
 
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
-from jobhunter.graphs.sanitize import DB_RETRY, is_retryable_db_error
+from jobhunter.graphs.sanitize import DB_RETRY, db_retry_interval, is_retryable_db_error
 from jobhunter.graphs.score import subgraph as target_graph
 from jobhunter.graphs.score.context import execution
 from jobhunter.graphs.score.deps import ScoreDeps
@@ -147,12 +146,6 @@ def _retrieved(child: "asyncio.Task[object]") -> None:
         log.warning("score_target_failed_while_cancelled", error_class=type(error).__name__)
 
 
-def _retry_interval(tries: int) -> float:
-    """`DB_RETRY`'s wait after the `tries`-th failed try (LangGraph's own formula, jitter included)."""
-    interval = min(DB_RETRY.max_interval, DB_RETRY.initial_interval * DB_RETRY.backoff_factor ** (tries - 1))
-    return interval + random.uniform(0, 1) if DB_RETRY.jitter else interval  # noqa: S311 - jitter, no secret
-
-
 def _cancelling() -> bool:
     """Whether this node's own task is being cancelled (case (c))."""
     task = asyncio.current_task()
@@ -184,7 +177,7 @@ def make_run_target(deps: ScoreDeps, subgraph: ScoreTargetGraph) -> TargetNode:
                     tries=tries,
                     error_class=type(exc).__name__,
                 )
-            await asyncio.sleep(_retry_interval(tries))
+            await asyncio.sleep(db_retry_interval(tries))
 
     async def failed(ref: ClaimRef, attempt_id: int, code: str, config: RunnableConfig) -> CycleUpdate:
         """`fail`'s path for `code` (cases (a) and (d)); the claim's outcome."""

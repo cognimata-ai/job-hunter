@@ -1,10 +1,11 @@
 """The batch preparation (spec §10.10 L3939-3951, §6.9.3 L1188-1190, §18.2 L5709, L5727; plan Task 16,
-Deviations 27 and 38, Codex r1 #18, #22, #23, r2 B8-B12, r3 B1-B3, B19, B20, r4 B9, r5 B1): the eligibility
-of each candidate, the order, the cuts to `batch_max_items`, to the byte cap and to the allocation, the
-minimum before and after the CAS, a claim between the candidates and the CAS, a second submission in flight,
-the follow-up holds, `reserve_batch` on the migrated database, `abandon`, the lock schedule against funded
-reservations and a cap edit, a reclaimed execution, the recovery of a lost one whatever the sweep order, and
-the batch lock of a re-deferred job.
+Deviations 27 and 38, Rulings T16-c, T16-d, Codex r1 #18, #22, #23, r2 B8-B12, r3 B1-B3, B19, B20, r4 B9, r5
+B1): the eligibility of each candidate, the order, the cuts to `batch_max_items`, to the byte cap, to the
+allocation and to the hard cap's headroom, the render before the month row, the minimum before and after the
+CAS, a claim between the candidates and the CAS, a second submission in flight, the follow-up holds,
+`reserve_batch` on the migrated database, `abandon`, the lock schedule against funded reservations, a cap edit
+and node 9's cancel, a reclaimed execution, the recovery of a lost one whatever the sweep order, and the batch
+lock of a re-deferred job.
 
 `prepare` runs directly (`tests.support.batches.prepared_submission`) with a copy of the active settings
 whose `scoring` fields a test may take below the settings model's floors (`batch_min_targets` 200), or through
@@ -18,6 +19,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
 
 import procrastinate
+import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
@@ -27,6 +29,7 @@ from jobhunter.errors import NodeFailed
 from jobhunter.graphs.score import nodes as score_nodes
 from jobhunter.graphs.score.state import TargetState
 from jobhunter.llm import budget, bulk, spend_ledger
+from jobhunter.llm.batches import BatchRequest, Rejected
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_FLOOR, PROMPT_OVERHEAD_TOKENS
 from jobhunter.llm.budget import SIZING_INPUT_BOUND_TOKENS, month_of
 from jobhunter.llm.errors import BudgetExhausted, BulkAllocationExceeded
@@ -44,7 +47,8 @@ from jobhunter.llm.spend_ledger import (
     reserve_batch,
 )
 from jobhunter.scoring import batches as batches_mod
-from jobhunter.scoring import steps
+from jobhunter.scoring import cycles, steps
+from jobhunter.scoring import targets as targets_mod
 from jobhunter.scoring.batches import ELIGIBLE_SQL, NotPrepared, Prepared
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.settings.model import ModelPolicy, Settings
@@ -101,6 +105,10 @@ _BATCH_ROWS = sa.text(
     "(SELECT count(*) FROM score_attempts WHERE mode = 'batch') AS attempts, "
     "(SELECT count(*) FROM batch_items) AS items, "
     "(SELECT count(*) FROM llm_spend_ledger) AS entries"
+)
+_ITEM_TEMPLATE = sa.text(
+    "SELECT c.prompt_template_version FROM batch_items i JOIN llm_calls c ON c.id = i.llm_call_id "
+    "WHERE i.target_id = :t"
 )
 _RESERVED = sa.text(
     "SELECT l.reserved_usd FROM batch_items i JOIN llm_calls c ON c.id = i.llm_call_id "
@@ -372,15 +380,115 @@ async def test_the_cut_to_the_allocation(engine: AsyncEngine, gateway: LLMGatewa
     assert (account.spent_usd, account.followup_held_usd) == (sum(reserved[:3]), 3 * dry.hold_usd)
 
 
+async def set_scoring_headroom(engine: AsyncEngine, usd: Decimal) -> None:
+    """This month's scoring headroom set to `usd`: spend counted outside any entry (the counters alone, the
+    scoring part with the total, so the non-scoring reserve is unchanged)."""
+    now = utcnow()
+    month = month_of(now)
+    async with engine.begin() as conn:
+        p = await spend_ledger.current_params(conn)
+        await ensure_month(conn, month, p, now)
+        row = await spend_ledger.read_month(conn, month, p, now=now)
+        assert row is not None
+        await conn.execute(
+            sa.text(
+                "UPDATE llm_budget SET counted_usd = counted_usd + :d, "
+                "scoring_counted_usd = scoring_counted_usd + :d WHERE month = :m"
+            ),
+            {"d": budget.headroom(row, "scoring", p) - usd, "m": month},
+        )
+
+
+async def test_the_cut_to_the_hard_cap_headroom(engine: AsyncEngine, gateway: LLMGateway) -> None:
+    """Ruling T16-d: the cut is also the largest prefix whose worst cases fit the month's scoring headroom
+    (each item's admission, L1159), so a headroom of three items and a half prepares three."""
+    setup = await bulk_with_targets(engine, 5)
+    settings = await settings_with(engine, batch_min_targets=1)
+    dry, reserved = await dry_prepare(engine, gateway, setup, settings)
+    await set_scoring_headroom(engine, sum(reserved[:3]) + reserved[3] / 2)
+    result, _ = await prepared_submission(engine, gateway, setup, settings=settings)
+    assert isinstance(result, Prepared) and result.request_count == 3
+    assert item_targets(result) == item_targets(dry)[:3] and result.reserved_usd == sum(reserved[:3])
+    assert await count_rows(engine, "score_targets", state="pending") == 2
+
+
+async def test_no_item_within_the_headroom_is_budget_exhausted(
+    engine: AsyncEngine, gateway: LLMGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling T16-d: only when no item fits the headroom read under the month row (here below the first
+    one's worst case: the pause check, made on an unlocked read, passed) is nothing prepared, as
+    `budget_exhausted`, with nothing written."""
+    setup = await bulk_with_targets(engine, 3)
+    settings = await settings_with(engine, batch_min_targets=1)
+    _, reserved = await dry_prepare(engine, gateway, setup, settings)
+    await set_scoring_headroom(engine, reserved[0] / 2)
+
+    async def unpaused(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(cycles, "pause_reason", unpaused)
+    result, _ = await prepared_submission(engine, gateway, setup, settings=settings)
+    assert result == NotPrepared("budget_exhausted")
+    assert await batch_rows(engine) == (0, 0, 0, 0)
+    assert await count_rows(engine, "score_targets", state="pending") == 3
+
+
+_PROBE_MONTH = "SELECT 1 FROM llm_budget WHERE month = %s FOR UPDATE NOWAIT"
+
+
+def month_row_free(server: PgServer, month: object) -> bool:
+    """Whether no transaction holds the month row (a `NOWAIT` lock of it, taken and given back)."""
+    try:
+        pg_one(server, "superuser", _PROBE_MONTH, month)
+    except psycopg.Error as exc:
+        if exc.sqlstate != LOCK_NOT_AVAILABLE:
+            raise
+        return False
+    return True
+
+
+async def test_the_prompts_are_rendered_and_sized_before_the_month_row(
+    engine: AsyncEngine, gateway: LLMGateway, migrated: PgServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task review Minor 7: the render, its bound, hashes and size run before the month row is locked; only
+    the cut and the writes hold it (the CAS re-checks every candidate)."""
+    setup = await bulk_with_targets(engine, 3)
+    month = month_of(utcnow())
+    async with engine.begin() as conn:  # the row exists: a lock of it is the row's
+        await ensure_month(conn, month, await spend_ledger.current_params(conn), utcnow())
+    rendered: list[bool] = []
+    sized: list[bool] = []
+    render, size = steps.role_prompt, batches_mod.request_bytes
+
+    def probed_render(*args: Any, **kwargs: Any) -> RenderedPrompt:
+        rendered.append(month_row_free(migrated, month))
+        return render(*args, **kwargs)
+
+    def probed_size(request: BatchRequest) -> int:
+        sized.append(month_row_free(migrated, month))
+        return size(request)
+
+    monkeypatch.setattr(steps, "role_prompt", probed_render)
+    monkeypatch.setattr(batches_mod, "request_bytes", probed_size)
+    result, _ = await prepared_submission(
+        engine, gateway, setup, settings=await settings_with(engine, batch_min_targets=1)
+    )
+    assert isinstance(result, Prepared) and result.request_count == 3
+    assert rendered == [True] * 3 and sized == [True] * 3
+
+
 async def test_fits_with_the_section_21_4_figures(engine: AsyncEngine, current_epoch: int) -> None:
-    """§21.4 at the measured overhead: a $37.24 allocation (40 % of $93.10) holds about 344 items of the
-    sized request, each with its follow-up hold at the central critic rate."""
+    """§21.4 at the measured overhead: a $37.24 allocation (40 % of $93.10) holds 347 items of the sized
+    request (37,678 input tokens, 6,000 output), each with its follow-up hold at the central critic rate."""
     setup = await bulk_with_targets(engine, 0, budget_usd=Decimal("37.24"), operation=False)
     bound = PROMPT_OVERHEAD_TOKENS["claude-sonnet-5-5"] + SIZING_INPUT_BOUND_TOKENS - PROMPT_OVERHEAD_FLOOR
     worst = worst_case_usd("claude-sonnet-5-5", input_tokens_bound=bound, max_tokens=6000, batch=True)
     hold = (Decimal("0.450") * budget.c_hat_followup(ModelPolicy())).quantize(Q, ROUND_HALF_UP)
-    n = int(Decimal("37.24") / (worst + hold))
-    assert 340 <= n <= 350
+    # By hand: 37,678 x $1.25/M + 6,000 x $5/M = $0.0770975, rounded up to $0.077098; 0.45 x $0.066939 =
+    # $0.03012255, half-up $0.030123; an item and its hold $0.107221, and 347 x 0.107221 = $37.205687 fits
+    # $37.24 while 348 x 0.107221 = $37.312908 does not.
+    assert (worst, hold) == (Decimal("0.077098"), Decimal("0.030123"))
+    n = 347
     async with engine.begin() as conn:
         b = setup.bulk_operation_id
         assert await bulk.fits(conn, bulk_operation_id=b, worst_case_usd=n * worst, hold_usd=n * hold)
@@ -913,7 +1021,8 @@ async def test_prepared_items_carry_the_online_generators_params(
     engine: AsyncEngine, gateway: LLMGateway
 ) -> None:
     """L3932: each item's params are `batch_request_body` of the generator request the online attempt would
-    send for its target (`load_inputs`, `generate_step`'s prompt), at the pinned first stage."""
+    send for its target (`load_inputs`, `generate_step`'s prompt), at the pinned first stage, and its call
+    the rendered prompt's `template_version`."""
     setup = await bulk_with_targets(engine, 2)
     result, _ = await prepared_submission(
         engine, gateway, setup, settings=await settings_with(engine, batch_min_targets=1)
@@ -951,6 +1060,74 @@ async def test_prepared_items_carry_the_online_generators_params(
             expected = gateway.batch_request_body(node, prompts[0], max_tokens=node.max_tokens)
             assert dict(by_target[target.target_id].params) == expected
             assert by_target[target.target_id].input_refs == prompts[0].input_refs
+            template = (await conn.execute(_ITEM_TEMPLATE, {"t": target.target_id})).scalar_one()
+            assert template == prompts[0].template_version  # the rendered prompt's own (review Minor 5)
+
+
+# ---- the recordings against node 9's cancel (Ruling T16-c) -----------------------------------------------
+
+
+@pytest.mark.parametrize("recording", ["submit_start", "record_rejected", "abandon"])
+async def test_a_recording_waits_for_a_node_9_cancel_at_the_target_row(
+    engine: AsyncEngine, gateway: LLMGateway, migrated: PgServer, recording: str
+) -> None:
+    """Ruling T16-c: node 9's cancel (`targets.cancel_targets`, `_cancel`) locks a target row, then ends its
+    attempt. The recordings that move a submission's targets and attempts (the dispatch marker's counters of
+    `submit_start`, `record_rejected`, `abandon`) take the target rows before the attempt rows too: with the
+    cancel held mid-transaction, the recording waits at that target row having written no attempt, so no
+    lock cycle can form; both commit, and the cancelled target stays cancelled."""
+    setup = await bulk_with_targets(engine, 3)
+    result, claim = await prepared_submission(
+        engine, gateway, setup, settings=await settings_with(engine, batch_min_targets=1)
+    )
+    assert isinstance(result, Prepared)
+    s = result.submission_id
+    if recording == "record_rejected":
+        async with engine.begin() as conn:
+            assert await batches_mod.submit_start(conn, s, operation=claim, now=utcnow()) == "submit_started"
+    cancelled = setup.targets[1]
+
+    async def record() -> object:
+        async with engine.begin() as conn:
+            if recording == "submit_start":
+                return await batches_mod.submit_start(conn, s, operation=claim, now=utcnow())
+            if recording == "record_rejected":
+                rejected = Rejected(400, "invalid_request_error", "test: refused")
+                await batches_mod.record_rejected(conn, s, rejected, operation=claim, now=utcnow())
+                return None
+            return await batches_mod.abandon(conn, s, now=utcnow())
+
+    async with engine.connect() as holder:  # node 9's cancel of one of the batch's targets, uncommitted
+        await holder.begin()
+        done = await targets_mod.cancel_targets(
+            holder,
+            llm_tuple_id=setup.llm_tuple_id,
+            revision_ids=[cancelled.job_revision_id],
+            reason="revision_superseded",
+            now=utcnow(),
+        )
+        assert (done.targets, done.attempts) == (1, 1)
+        task = asyncio.create_task(record())
+
+        async def waiting() -> bool:
+            return bool(lock_wait_details(migrated)) or task.done()
+
+        await await_until(waiting, 20, 0.02)
+        assert not task.done()
+        (wait,) = lock_wait_details(migrated)
+        assert wait.relation == "score_targets", wait
+        assert not inserted_into(migrated, wait.pid, "score_attempts")  # no attempt row written yet
+        await holder.commit()
+    await asyncio.wait_for(task, 30)
+    expected = {
+        "submit_start": "submit_started",
+        "record_rejected": "submit_rejected",
+        "abandon": "abandoned",
+    }
+    assert (await submission_rows(engine))[0].state == expected[recording]
+    assert (await target_of(engine, cancelled.target_id)).state == "cancelled"
+    others = {"submit_start": "in_batch", "record_rejected": "pending", "abandon": "pending"}
+    assert await count_rows(engine, "score_targets", state=others[recording]) == 2
 
 
 # ---- abandon, a reclaimed execution, the recovery (Codex r1 #23, r2 B11, B12, r3 B2, B3, B20) --------------

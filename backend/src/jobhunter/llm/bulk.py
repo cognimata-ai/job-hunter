@@ -23,7 +23,10 @@ singleton holds at most one `active` row):
   its reservation is refused the finished operation's allocation and debits the bucket (Task 7);
 - the heavy reconciler `bulk_operations` (§17.4, L5508): `fence_epoch`, `active_config FOR SHARE` (step 2,
   so it never completes an operation while an activation is under way), then `complete_if_done` of the
-  active operation.
+  active operation and, when it is not done, each step registered with `register_active_step` in the same
+  transaction (`scoring.batches.rerequest`, Ruling T16-d: the operation's batch requested again after a
+  skipped prepare; `llm` imports nothing of `scoring`, so the step registers itself). The pass counts a
+  completion, or each step that repaired something.
 
 **The follow-up hold** (§6.9.3 L1188-1190). A submission adds `n * p_followup * ĉ_followup` to its operation's
 `followup_held_usd`, each item holding its share (`batch_items.hold_usd`). An item gives its share back once:
@@ -72,7 +75,7 @@ which `llm.cap_reached` names (`fail`, Task 10) and Task 17's `batches.quarantin
 Nothing here logs content: ids and amounts only.
 """
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -200,10 +203,24 @@ async def complete_if_done(conn: AsyncConnection, bulk_operation_id: int, *, now
     return True
 
 
+type ActiveStep = Callable[[AsyncConnection, int, ReconcileContext], Awaitable[bool]]
+# The steps the reconciler runs for an active operation it did not complete, by qualified name (module
+# docstring); insertion ordered.
+_ACTIVE_STEPS: dict[str, ActiveStep] = {}
+
+
+def register_active_step(step: ActiveStep) -> ActiveStep:
+    """Decorator: run `step(conn, bulk_operation_id, ctx)` in the `bulk_operations` reconciler's transaction
+    for the active operation it did not complete (module docstring); its `True` counts as a repair."""
+    _ACTIVE_STEPS[f"{step.__module__}.{step.__qualname__}"] = step
+    return step
+
+
 @reconciler("bulk_operations", "heavy")
 async def reconcile_bulk_operations(ctx: ReconcileContext) -> int:
-    """`complete_if_done` of the active bulk operation at `ctx.now` (module docstring); 1 when it completed.
-    The worker's own `FencedOut` propagates (Ruling FR-w); another owner's ends the pass with 0."""
+    """`complete_if_done` of the active bulk operation at `ctx.now`, else its registered steps (module
+    docstring); 1 when it completed, else how many steps repaired something. The worker's own `FencedOut`
+    propagates (Ruling FR-w); another owner's ends the pass with 0."""
     try:
         async with ctx.engine.begin() as conn:
             await fence_epoch(conn, ctx.epoch)
@@ -211,7 +228,9 @@ async def reconcile_bulk_operations(ctx: ReconcileContext) -> int:
             active = await active_operation(conn)
             if active is None:
                 return 0
-            return int(await complete_if_done(conn, active, now=ctx.now))
+            if await complete_if_done(conn, active, now=ctx.now):
+                return 1
+            return sum([int(await step(conn, active, ctx)) for step in _ACTIVE_STEPS.values()])
     except FencedOut as fenced:
         if fenced.worker_superseded:
             raise
@@ -236,10 +255,6 @@ async def release_item_hold(conn: AsyncConnection, *, item_id: int) -> Decimal:
     return released
 
 
-_ACCOUNTS: Final = q(
-    "SELECT state, budget_usd, spent_usd, followup_held_usd FROM bulk_operations WHERE id = :b "
-    "FOR NO KEY UPDATE"
-)
 _ADD_HOLD: Final = q("UPDATE bulk_operations SET followup_held_usd = followup_held_usd + :usd WHERE id = :b")
 _RELEASE_HOLD: Final = q(
     "UPDATE bulk_operations SET followup_held_usd = followup_held_usd - least(followup_held_usd, :usd) "
@@ -279,7 +294,7 @@ class Accounts:
 async def lock_accounts(conn: AsyncConnection, bulk_operation_id: int) -> Accounts:
     """The operation's accounts under its row's lock (`FOR NO KEY UPDATE`, step 7); `LookupError` for an
     operation that does not exist."""
-    row = (await conn.execute(_ACCOUNTS, {"b": bulk_operation_id})).first()
+    row = (await conn.execute(spend_ledger.LOCK_BULK_ACCOUNTS, {"b": bulk_operation_id})).first()
     if row is None:
         raise LookupError(f"bulk operation {bulk_operation_id} does not exist")
     return Accounts(row.state, row.budget_usd, row.spent_usd, row.followup_held_usd)

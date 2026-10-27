@@ -37,7 +37,8 @@ admitted against the hard cap as any other reservation.
 **The dispatch marker** (`mark_dispatched`) commits `reserved → dispatched` on both rows under the owner lock;
 for a score attempt it also counts the try (`http_calls`, `logical_calls` on a logical call's first try) and
 charges the attempt and, the first time, its target (§9.4.2, L2863). `mark_batch_dispatched` does the same for
-every item of a submission at `submit_started` (R6, plan Deviation 13). A lost owner is `FencedOut` and the
+every item of a submission at `submit_started` (R6, plan Deviation 13), its target rows locked before its
+attempt rows (Ruling T16-c: the order of a cancel, `targets._cancel`). A lost owner is `FencedOut` and the
 caller must release the try (`release_never_dispatched`) without sending.
 
 **Settlement** (`settle`) applies the §6.9.1 counter table under the month lock of the reservation's own
@@ -85,6 +86,7 @@ from uuid import UUID
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition, transition_where
 from jobhunter.errors import FencedOut, TransitionConflict
@@ -128,9 +130,16 @@ UNSETTLED_CODE: Final = "unsettled"
 # have their own; a batch item's come from its provider result (§6.9.1, M3).
 ONLINE_REFUND_EVIDENCE: Final = frozenset({"error_response_no_content", "connect_failed_before_send"})
 # `batch_submit_rejected` (L2335): the provider refused the whole submission, so none of its items ran; the
-# call row ends `error` with that code and the rejection's `http_status`.
+# call row ends `error` with that code and the rejection's `http_status`. `connect_failed_before_send`
+# (Ruling T16-a): the create's connection failed before any byte left, on each of its tries; no batch exists.
 BATCH_REFUND_EVIDENCE: Final = frozenset(
-    {"batch_submit_rejected", "batch_item_errored", "batch_item_canceled", "batch_item_expired"}
+    {
+        "batch_submit_rejected",
+        "connect_failed_before_send",
+        "batch_item_errored",
+        "batch_item_canceled",
+        "batch_item_expired",
+    }
 )
 # The `input_refs` keys `reserve` writes itself.
 _RESERVED_REFS: Final = frozenset({"owner", "deadline_s"})
@@ -173,7 +182,6 @@ _LOCK_TARGET = q(
     "AND state = 'in_progress' FOR SHARE"
 )
 _LOCK_SUBMISSION = q("SELECT 1 FROM batch_submissions WHERE id = :s AND state = :expected FOR SHARE")
-_GLOBAL_FENCE = q("SELECT EXISTS (SELECT 1 FROM purge_fences WHERE kind = 'global' AND released_at IS NULL)")
 _OPERATION_OWNER = q("SELECT status, claim_id FROM operations WHERE id = :id FOR UPDATE")
 _EVAL_RUN_OWNER = q("SELECT status FROM eval_runs WHERE id = :id FOR UPDATE")
 # The M3 owner rows are referenced by foreign keys (`llm_calls`, `batch_items`, `score_attempts`), so recovery
@@ -277,7 +285,7 @@ async def _lock_owner(conn: AsyncConnection, owner: SpendOwner) -> None:
     """The owner lock, then no active `global` purge fence (§20.2) unless the owner is the purge itself."""
     await owner.lock(conn)
     exempt = isinstance(owner, OperationOwner) and owner.claim.kind == "purge"
-    if not exempt and (await conn.execute(_GLOBAL_FENCE)).scalar_one():
+    if not exempt and await global_fence_active(conn):
         raise FencedOut("purge_fence")
 
 
@@ -590,6 +598,11 @@ _LOCK_ATTEMPTS = q(
 _COUNT_TRIES = q(
     "UPDATE score_attempts SET http_calls = http_calls + 1, logical_calls = logical_calls + :l, "
     "charged = true WHERE id = ANY(CAST(:ids AS bigint[]))"
+)
+# Ruling T16-c: a batch marker's targets before its attempts, the order of a cancel (`targets._cancel`).
+_LOCK_TARGETS_OF_ATTEMPTS = q(
+    "SELECT id FROM score_targets WHERE id IN (SELECT target_id FROM score_attempts "
+    "WHERE id = ANY(CAST(:ids AS bigint[]))) ORDER BY id FOR NO KEY UPDATE"
 )
 _CHARGE_TARGETS = q(
     "UPDATE score_targets SET charged_attempts = charged_attempts + 1 WHERE id IN "
@@ -940,9 +953,9 @@ async def reserve(
 
 
 # A batch preparation's bulk row (§6.9.3 L1189): the accounts its allocation check reads, under the lock of
-# step 7 every writer of them takes.
-_LOCK_BULK_ACCOUNTS = q(
-    "SELECT state, budget_usd, spent_usd, followup_held_usd FROM bulk_operations WHERE id = :id "
+# step 7 every writer of them takes (`bulk.lock_accounts` reads them with it too).
+LOCK_BULK_ACCOUNTS: Final = q(
+    "SELECT state, budget_usd, spent_usd, followup_held_usd FROM bulk_operations WHERE id = :b "
     "FOR NO KEY UPDATE"
 )
 
@@ -1003,7 +1016,7 @@ async def reserve_batch(
     month = budget.month_of(now)
     await ensure_month(conn, month, p, now)
     row = await lock_month(conn, month, p, now=now)  # 2. llm_budget FOR UPDATE, accrued
-    bulk = (await conn.execute(_LOCK_BULK_ACCOUNTS, {"id": bulk_operation_id})).one()  # 3. step 7
+    bulk = (await conn.execute(LOCK_BULK_ACCOUNTS, {"b": bulk_operation_id})).one()  # 3. step 7
     worst = [
         worst_case_usd(model, input_tokens_bound=item.input_tokens_bound, max_tokens=max_tokens, batch=True)
         for item in items
@@ -1172,9 +1185,10 @@ async def mark_batch_dispatched(
     with its call, and each item's attempt and target counted and charged as `mark_dispatched` does (the
     item is its attempt's first logical call, one try). An entry of another submission, an online entry, or
     one no longer `reserved` is `FencedOut` (nothing of the marker may commit: the caller's transaction rolls
-    back). `entries` must be every entry the submission still has `reserved`: one left out would stay
-    `reserved` on a submitted batch, which no reconciler ages (L2979), so that is a `ValueError`. `now` is
-    the caller's clock, as in `mark_dispatched`."""
+    back). The items' target rows are locked before their attempt rows (Ruling T16-c). `entries` must be
+    every entry the submission still has `reserved`: one left out would stay `reserved` on a submitted
+    batch, which no reconciler ages (L2979), so that is a `ValueError`. `now` is the caller's clock, as in
+    `mark_dispatched`."""
     ledger_ids = sorted(res.ledger_id for res in entries)
     if len(set(ledger_ids)) != len(ledger_ids):
         raise ValueError("a batch dispatch marker names each entry once")
@@ -1203,9 +1217,10 @@ async def mark_batch_dispatched(
     )
     if len(moved) != len(ledger_ids) or len(moved_calls) != len(call_ids):
         raise FencedOut("llm_spend_ledger")
-    await _count_tries(
-        conn, [int(row.attempt_id) for row in rows if row.attempt_id is not None], logical=True
-    )
+    attempt_ids = sorted({int(row.attempt_id) for row in rows if row.attempt_id is not None})
+    # the target rows first (Ruling T16-c): `_count_tries` then locks the attempts and re-takes these
+    await conn.execute(_LOCK_TARGETS_OF_ATTEMPTS, {"ids": attempt_ids})
+    await _count_tries(conn, attempt_ids, logical=True)
 
 
 async def _release(conn: AsyncConnection, entry: _Entry, row: BudgetRow, *, now: datetime) -> bool:

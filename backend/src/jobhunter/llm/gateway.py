@@ -198,6 +198,7 @@ BACKOFF_S: Final = (2.0, 8.0)  # after the first and the second try
 JITTER: Final = 0.25
 
 AUTH_FAILED_ALERT: Final = "llm.auth_failed"
+AUTH_FAILED_STATUSES: Final = frozenset({401, 403})  # the key was refused
 MODEL_MISMATCH_ALERT: Final = "llm.model_mismatch"
 UNEXPECTED_STOP_ALERT: Final = "llm.unexpected_stop_reason"  # plan Deviation 6
 REFUSAL_RATE_ALERT: Final = "llm.refusal_rate"
@@ -709,6 +710,20 @@ class GatewayResult:
 # ---- retry policy (§10.4) ----------------------------------------------------------------------------------
 
 
+async def raise_auth_failed(conn: AsyncConnection, *, http_status: int) -> None:
+    """Raise the critical `llm.auth_failed` alert in `conn`'s transaction: the Anthropic API refused the key
+    (`http_status` 401 or 403). It pauses scoring (`cycles.pause_reason`) until it is acknowledged or a call
+    succeeds again."""
+    await raise_alert(
+        conn,
+        code=AUTH_FAILED_ALERT,
+        severity="critical",
+        subject=_AUTH_SUBJECT,
+        message="the Anthropic API refused the key; LLM calls fail until it is fixed",
+        context={"http_status": http_status},
+    )
+
+
 def is_retryable_status(status: int) -> bool:
     """408, 409, 429, 500, 502, 503, 504 and 529; every other status is a non-retryable request error."""
     return status in RETRYABLE_STATUSES
@@ -883,6 +898,12 @@ class LLMGateway:
     def monotonic(self) -> Callable[[], float]:
         """The clock the loop compares `CallContext.deadline` with: a caller builds its deadline from it."""
         return self._monotonic
+
+    @property
+    def sleep(self) -> Callable[[float], Awaitable[object]]:
+        """What the loop waits out its backoff with: a caller that retries a call of its own (the batch
+        create, `llm.batches`) waits with it too."""
+        return self._sleep
 
     async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult:
         """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries) from
@@ -1277,15 +1298,8 @@ class LLMGateway:
                 call=call,
                 now=self._clock(),
             )
-            if status in (401, 403):
-                await raise_alert(
-                    conn,
-                    code=AUTH_FAILED_ALERT,
-                    severity="critical",
-                    subject=_AUTH_SUBJECT,
-                    message="the Anthropic API refused the key; LLM calls fail until it is fixed",
-                    context={"http_status": status},
-                )
+            if status in AUTH_FAILED_STATUSES:
+                await raise_auth_failed(conn, http_status=status)
         self._committed(t, receipt, "not_billed", figures, code)
         if not is_retryable_status(status):
             raise LLMRequestError(status)

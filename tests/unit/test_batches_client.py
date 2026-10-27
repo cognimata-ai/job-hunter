@@ -14,7 +14,7 @@ import json
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Final
 
 import httpx2
 import pytest
@@ -31,9 +31,10 @@ from jobhunter.llm.batches import (
 )
 from jobhunter.llm.errors import LLMNotConfigured
 from jobhunter.llm.fake import BatchScript
+from jobhunter.llm.gateway import TRANSPORT_TRIES
 from jobhunter.llm.transport import make_http_client
 
-from tests.support.llm import GATEWAY_BODY, FakeLLM, GatewayOut
+from tests.support.llm import GATEWAY_BODY, FakeLLM, GatewayOut, Sleeps
 
 MODEL = "claude-sonnet-5-5"
 
@@ -70,20 +71,49 @@ def client(fake_llm: FakeLLM, http: httpx2.AsyncClient) -> BatchesClient:
     return BatchesClient(fake_llm.cfg, http_client=http)
 
 
-class Answering(httpx2.AsyncBaseTransport):
-    """The API origin's transport: every request kept (with its timeout extension), each answered by `answer`
-    (a status and a JSON body), or never answered (`None`)."""
+Answer = tuple[int, dict[str, Any]] | str | None
 
-    def __init__(self, answer: tuple[int, dict[str, Any]] | None) -> None:
-        self.answer = answer
+
+class Answering(httpx2.AsyncBaseTransport):
+    """The API origin's transport: every request kept (with its timeout extension), the n-th answered by the
+    n-th of `answers` (the last one repeats): a status and a JSON body, `"connect"` (a connect failure before
+    any byte was sent), `"read_timeout"` (the answer never read), or `None` (never answered)."""
+
+    def __init__(self, *answers: Answer) -> None:
+        self.answers = answers
         self.seen: list[httpx2.Request] = []
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        answer = self.answers[min(len(self.seen), len(self.answers) - 1)]
         self.seen.append(request)
-        if self.answer is None:
+        if answer is None:
             await asyncio.Event().wait()
-        status, body = self.answer  # type: ignore[misc]
-        return httpx2.Response(status, headers={"request-id": "req_test"}, json=body)
+        if answer == "connect":
+            raise httpx2.ConnectError("test: connection refused", request=request)
+        if answer == "read_timeout":
+            raise httpx2.ReadTimeout("test: no answer", request=request)
+        assert isinstance(answer, tuple)
+        status, body = answer
+        return httpx2.Response(
+            status, headers={"request-id": "req_test", **_HEADERS.get(status, {})}, json=body
+        )
+
+
+# A 429's own wait, which the retry honours (gateway.retry_wait); the other errors wait the jittered backoff.
+_HEADERS: dict[int, dict[str, str]] = {429: {"retry-after": "7"}}
+BATCH: dict[str, Any] = {
+    "id": "msgbatch_t",
+    "type": "message_batch",
+    "processing_status": "in_progress",
+    "request_counts": {"processing": 1, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0},
+    "ended_at": None,
+    "created_at": "2026-10-26T12:00:00Z",
+    "expires_at": "2026-10-27T12:00:00Z",
+    "archived_at": None,
+    "cancel_initiated_at": None,
+    "results_url": None,
+}
+OK: Final = (200, BATCH)
 
 
 def error_body(kind: str) -> dict[str, Any]:
@@ -140,26 +170,108 @@ async def test_a_5xx_a_timeout_or_a_connection_loss_is_ambiguous(
 
 
 @pytest.mark.parametrize(
-    ("status", "kind", "expected"),
+    ("status", "kind"),
     [
-        (529, "overloaded_error", Ambiguous("OverloadedError")),
-        (503, "api_error", Ambiguous("InternalServerError")),
-        (408, "timeout_error", Ambiguous("APIStatusError")),  # the server's timeout proves nothing either
-        (429, "rate_limit_error", None),
-        (413, "request_too_large", None),
+        (400, "invalid_request_error"),
+        (401, "authentication_error"),
+        (403, "permission_error"),
+        (404, "not_found_error"),
+        (413, "request_too_large"),
+        (422, "invalid_request_error"),
     ],
 )
-async def test_the_status_decides_rejected_or_ambiguous(
-    fake_llm: FakeLLM, status: int, kind: str, expected: Ambiguous | None
-) -> None:
+async def test_a_definitive_4xx_is_rejected_at_once(fake_llm: FakeLLM, status: int, kind: str) -> None:
+    """Ruling T16-a: a 4xx that `gateway.is_retryable_status` does not retry is definitive (§10.10 4b)."""
     transport = Answering((status, error_body(kind)))
+    sleeps = Sleeps()
     async with on(fake_llm.cfg, transport) as http:
-        outcome = await BatchesClient(fake_llm.cfg, http_client=http).create(requests("t1_a1"))
-    if expected is None:
-        assert outcome == Rejected(status, kind, "test: refused")
+        outcome = await BatchesClient(fake_llm.cfg, http_client=http, sleep=sleeps).create(requests("t1_a1"))
+    assert outcome == Rejected(status, kind, "test: refused")
+    assert isinstance(outcome, Rejected) and outcome.evidence == "batch_submit_rejected"
+    assert (len(transport.seen), sleeps.waits) == (1, [])  # no SDK retry (max_retries=0), none of ours
+
+
+@pytest.mark.parametrize(
+    ("answer", "error_class"),
+    [
+        ((408, error_body("timeout_error")), "APIStatusError"),  # the server's timeout proves nothing
+        ((500, error_body("api_error")), "InternalServerError"),
+        ((503, error_body("api_error")), "InternalServerError"),
+        ((529, error_body("overloaded_error")), "OverloadedError"),
+        ("read_timeout", "APITimeoutError"),
+    ],
+)
+async def test_a_408_a_5xx_or_a_lost_answer_is_ambiguous_and_never_retried(
+    fake_llm: FakeLLM, answer: Answer, error_class: str
+) -> None:
+    """§10.10 4c: once the request may have been received, the create is never sent again."""
+    transport = Answering(answer, OK)
+    sleeps = Sleeps()
+    async with on(fake_llm.cfg, transport) as http:
+        outcome = await BatchesClient(fake_llm.cfg, http_client=http, sleep=sleeps).create(requests("t1_a1"))
+    assert outcome == Ambiguous(error_class)
+    assert (len(transport.seen), sleeps.waits) == (1, [])
+
+
+@pytest.mark.parametrize(
+    ("first", "waits"),
+    [
+        ((409, error_body("conflict_error")), None),
+        ((429, error_body("rate_limit_error")), [7.0]),  # its Retry-After
+        ("connect", None),  # nothing left the process
+    ],
+)
+async def test_a_create_that_was_not_sent_is_retried_in_the_same_call(
+    fake_llm: FakeLLM, first: Answer, waits: list[float] | None
+) -> None:
+    """Ruling T16-a: a 409, a 429 or a connect failure before any byte left made no batch, so the create is
+    sent again within the call, after the gateway's wait (`Retry-After` first); one batch is created."""
+    transport = Answering(first, OK)
+    sleeps = Sleeps()
+    async with on(fake_llm.cfg, transport) as http:
+        outcome = await BatchesClient(fake_llm.cfg, http_client=http, sleep=sleeps).create(requests("t1_a1"))
+    assert isinstance(outcome, Created) and outcome.provider_batch_id == "msgbatch_t"
+    assert len(transport.seen) == 2 and len(sleeps.waits) == 1
+    if waits is None:  # the jittered backoff after the first try: 2 s ± 25 %
+        assert 1.5 <= sleeps.waits[0] <= 2.5
     else:
-        assert isinstance(outcome, Ambiguous) and outcome.error_class == expected.error_class
-    assert len(transport.seen) == 1  # no SDK retry (max_retries=0)
+        assert sleeps.waits == waits
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ((429, error_body("rate_limit_error")), Rejected(429, "rate_limit_error", "test: refused")),
+        (
+            "connect",
+            Rejected(None, "connect_failed", "", evidence="connect_failed_before_send"),
+        ),
+    ],
+)
+async def test_a_create_never_sent_after_the_bound_is_rejected(
+    fake_llm: FakeLLM, answer: Answer, expected: Rejected
+) -> None:
+    """Ruling T16-a: after the gateway's three tries the not-sent create is `Rejected` (§10.10 4b): no batch
+    can exist; a connect failure carries the evidence `connect_failed_before_send`."""
+    transport = Answering(answer)
+    sleeps = Sleeps()
+    async with on(fake_llm.cfg, transport) as http:
+        outcome = await BatchesClient(fake_llm.cfg, http_client=http, sleep=sleeps).create(requests("t1_a1"))
+    assert isinstance(outcome, Rejected) and (outcome, outcome.evidence) == (expected, expected.evidence)
+    assert len(transport.seen) == TRANSPORT_TRIES == 3 and len(sleeps.waits) == 2
+
+
+async def test_the_retries_stop_at_the_creates_deadline(
+    fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wait that would pass `CREATE_DEADLINE_S` is not waited: the not-sent create is rejected there."""
+    monkeypatch.setattr(batches_mod, "CREATE_DEADLINE_S", 5)  # less than the 429's 7 s
+    transport = Answering((429, error_body("rate_limit_error")))
+    sleeps = Sleeps()
+    async with on(fake_llm.cfg, transport) as http:
+        outcome = await BatchesClient(fake_llm.cfg, http_client=http, sleep=sleeps).create(requests("t1_a1"))
+    assert outcome == Rejected(429, "rate_limit_error", "test: refused")
+    assert (len(transport.seen), sleeps.waits) == (1, [])
 
 
 async def test_create_runs_under_the_ten_minute_deadline(
@@ -175,19 +287,7 @@ async def test_create_runs_under_the_ten_minute_deadline(
 
 async def test_every_request_carries_the_batches_timeout(fake_llm: FakeLLM) -> None:
     """L3937: `write=60` for the upload (the online timeout's is 30), on the shared client's every request."""
-    batch = {
-        "id": "msgbatch_t",
-        "type": "message_batch",
-        "processing_status": "in_progress",
-        "request_counts": {"processing": 1, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0},
-        "ended_at": None,
-        "created_at": "2026-10-26T12:00:00Z",
-        "expires_at": "2026-10-27T12:00:00Z",
-        "archived_at": None,
-        "cancel_initiated_at": None,
-        "results_url": None,
-    }
-    transport = Answering((200, batch))
+    transport = Answering(OK)
     async with on(fake_llm.cfg, transport) as http:
         client = BatchesClient(fake_llm.cfg, http_client=http)
         await client.create(requests("t1_a1"))
@@ -301,3 +401,50 @@ async def test_a_cut_results_stream_is_never_complete(fake_llm: FakeLLM, client:
             read.append(item.custom_id)
     assert cut.value.operation == "results" and cut.value.status is None
     assert not stream.complete and len(read) <= 1
+
+
+class ResultsLines(httpx2.AsyncBaseTransport):
+    """An ended batch whose results file holds `lines` (raw JSONL)."""
+
+    def __init__(self, lines: bytes) -> None:
+        self.lines = lines
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("/results"):
+            return httpx2.Response(200, headers={"request-id": "req_test"}, content=self.lines)
+        url = str(request.url.copy_with(path="/v1/messages/batches/msgbatch_t/results", query=None))
+        ended = {
+            **BATCH,
+            "processing_status": "ended",
+            "ended_at": "2026-10-26T13:00:00Z",
+            "results_url": url,
+        }
+        return httpx2.Response(200, headers={"request-id": "req_test"}, json=ended)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        b"this line is no JSON, it quotes model output\n",
+        b'{"custom_id": "t2_a1", "result": {"type": "weird"}}\n',
+        b'{"custom_id": "t2_a1", "result": {"type": "errored"}}\n',
+        b'{"custom_id": "t2_a1"}\n',
+    ],
+)
+async def test_an_unreadable_result_line_ends_the_stream_with_its_class_only(
+    fake_llm: FakeLLM, bad: bytes
+) -> None:
+    """Fix round 1 (Minor 8): a line that is no JSON, or no valid result, is a `BatchApiError` carrying the
+    error's class only (its message could quote the line), and the stream is not complete."""
+    good = b'{"custom_id": "t1_a1", "result": {"type": "expired"}}\n'
+    async with make_http_client(fake_llm.cfg, mount=ResultsLines(good + bad)) as http:
+        stream = await BatchesClient(fake_llm.cfg, http_client=http).results("msgbatch_t")
+        read: list[str] = []
+        with pytest.raises(BatchApiError) as unreadable:
+            async for item in stream:
+                read.append(item.custom_id)
+    assert read == ["t1_a1"] and not stream.complete
+    failure = unreadable.value
+    assert (failure.operation, failure.status) == ("results", None)
+    assert failure.error_class in ("JSONDecodeError", "ValidationError")
+    assert "model output" not in str(failure) and failure.__cause__ is None and failure.__suppress_context__

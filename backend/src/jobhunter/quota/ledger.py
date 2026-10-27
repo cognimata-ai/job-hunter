@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut, TransitionConflict
@@ -171,7 +172,6 @@ class _Entry:
 
 
 _OWNER = q("SELECT 1 FROM runs WHERE id = :run AND attempt_no = :attempt AND status = 'running' FOR SHARE")
-_GLOBAL_FENCE = q("SELECT EXISTS (SELECT 1 FROM purge_fences WHERE kind = 'global' AND released_at IS NULL)")
 _ENTRY = q(
     "SELECT provider, window_start, request_class, units, state, run_id, run_attempt_no, fetch_request_id, "
     "created_at, dispatched_at FROM quota_ledger WHERE id = :id AND kind = 'request'"
@@ -518,7 +518,7 @@ async def lock_run_owner(conn: AsyncConnection, owner: "RunOwner") -> None:
     purge fence (§20.2), else `FencedOut("purge_fence")`. The first statement of every owner transaction."""
     if (await conn.execute(_OWNER, {"run": owner.run_id, "attempt": owner.attempt_no})).first() is None:
         raise FencedOut("run")
-    if (await conn.execute(_GLOBAL_FENCE)).scalar_one():
+    if await global_fence_active(conn):
         raise FencedOut("purge_fence")
 
 

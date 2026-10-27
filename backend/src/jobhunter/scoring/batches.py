@@ -1,5 +1,6 @@
 """The score lane's batch submissions (spec §10.10, §7.12, §6.9.3, §12.6 (e); plan Tasks 14 and 16, Rulings
-P14, P16, P52, T7-c, T7-d, Codex r1 #18, #22-#25, r2 B7-B15, r3 B1-B3, r4 B1, B8, B9, r5 B1, A1 issue 17,
+P14, P16, P52, T7-c, T7-d, T16-a, T16-c, T16-d, Codex r1 #18, #22-#25, r2 B7-B15, r3 B1-B3, r4 B1, B8, B9,
+r5 B1, A1 issue 17,
 A2 B10, B13, B14, Deviations 12, 13, 27 and 38): Task 14 records the cancellation a tuple supersession asks
 for; Task 16 adds the submission lifecycle up to the provider's answer (Task 17 polls, decides the items,
 adopts an ambiguous submission and releases a quarantined one).
@@ -40,17 +41,21 @@ inside a savepoint that a `NotPrepared` rolls back, so nothing of a batch that i
 4. the preconditions: `scoring.batch_bulk_rescore` (`batches_disabled`) and no submission in flight
    (`ambiguous` for a `submit_ambiguous` one, `in_flight` for the others; the `batch_one_in_flight` index has
    the last word: a unique violation of it at the insert below is `in_flight` too);
-5. `ensure_month`, the month row (`lock_month`, step 6) and the bulk row `FOR NO KEY UPDATE` (step 7),
+5. without a lock, the candidates (`ELIGIBLE_SQL`, in order, at most `batch_max_items`), each rendered as the
+   online generator request of its target (`steps.role_prompt`, `revision_ad`, `score_refs`: the attempt's
+   pinned `generate` node, `gateway.batch_request_body` at its first stage, the prefix's cache marker kept,
+   L6622) with its input bound, hashes, worst case and size: the expensive part of the preparation holds no
+   lock (the CAS re-checks every candidate); fewer than `batch_min_targets` is `below_minimum`;
+6. `ensure_month`, the month row (`lock_month`, step 6) and the bulk row `FOR NO KEY UPDATE` (step 7),
    **before** the submission row exists: its immediate foreign key takes `FOR KEY SHARE` on the bulk row,
-   which would otherwise come before the month row (Codex r3 B1);
-6. the submission inserted `preparing` with its operation and claim (placeholders for the rest); then, under
-   the month and bulk locks, the candidates (`ELIGIBLE_SQL`, in order, at most `batch_max_items`), each
-   rendered as the online generator request of its target (`steps.role_prompt`, `revision_ad`,
-   `score_refs`: the attempt's pinned `generate` node, `gateway.batch_request_body` at its first stage, the
-   prefix's cache marker kept, L6622) with its input bound; the fault point `batch.after_candidates`; cut to
-   `BATCH_MAX_BYTES` of requests and to the largest `n` whose worst cases (each its own bound's, at batch
-   prices) plus `n x hold` fit the allocation (`bulk.Accounts.fits`, L1189): no fit is `no_allocation`,
-   fewer than `batch_min_targets` is `below_minimum`;
+   which would otherwise come before the month row (Codex r3 B1); then the submission inserted `preparing`
+   with its operation and claim (placeholders for the rest), and the fault point `batch.after_candidates`.
+   Under the month and bulk locks, the cut: to `BATCH_MAX_BYTES` of requests, then to the largest prefix
+   whose worst cases (each its own bound's, at batch prices) plus `n x hold` fit the allocation
+   (`bulk.Accounts.fits`, L1189) **and** whose worst cases fit the month's scoring headroom
+   (`budget.headroom` of the locked row: each item is admitted against the hard cap, L1159, Ruling T16-d).
+   No fit is `no_allocation`, or `budget_exhausted` when the headroom stopped it (the pause check's read was
+   unlocked); fewer than `batch_min_targets` is `below_minimum`;
 7. the CAS `pending → in_batch` of those targets (`transition_where`, `ELIGIBLE_SQL` again over each row,
    `FOR UPDATE SKIP LOCKED`, `attempt_no + 1`, lane `batch`, the submission): the rows are locked and their
    attempt numbers advanced before any dependent row exists, and the statement never waits for a target row
@@ -58,12 +63,13 @@ inside a savepoint that a `NotPrepared` rolls back, so nothing of a batch that i
 8. the survivors `m`: fewer than `batch_min_targets` (none included) is `below_minimum` (Codex r2 B9);
 9. per survivor a `score_attempts` row (`mode = 'batch'`, the active execution config and evaluation policy,
    lane `batch`) and a `batch_items` row (`custom_id = 't<target>_a<attempt>'`, its hold); then
-   `spend_ledger.reserve_batch` (its allocation check again under the same locks; `BudgetExhausted` on any
-   item aborts the whole preparation), each item's `llm_call_id`, and the submission's `request_count`,
-   `request_hash` (SHA-256 over its items sorted by `custom_id`, each `custom_id ‖ SHA-256(canonical
-   params)`), `reserved_usd` and `followup_held_usd = m x hold`;
+   `spend_ledger.reserve_batch` (its allocation and hard-cap checks again under the same locks, so they pass:
+   a `BudgetExhausted` there is a bug and fails the operation), each item's `llm_call_id`, and the
+   submission's `request_count`, `request_hash` (SHA-256 over its items sorted by `custom_id`, each
+   `custom_id ‖ SHA-256(canonical params)`), `reserved_usd` and `followup_held_usd = m x hold`;
 10. `bulk.add_hold(m x hold)`; 11. `ranking.bump`.
-`hold` is `bulk.hold_per_item` of the active evaluation policy and model policy.
+`hold` is `bulk.hold_per_item` of the active evaluation policy and model policy; the ledger's
+`prompt_template_version` is the rendered prompt's own.
 
 **Submit-start** (`submit_start`, step 2, Ruling T7-c): `active_config FOR SHARE`, the operation owner, the
 submission `FOR UPDATE` under `state = 'preparing'` and its claim (else `FencedOut`); a submission whose tuple
@@ -71,21 +77,29 @@ is no longer active, whose bulk operation is no longer `active`, whose cancel wa
 active global purge fence (L6365) is abandoned instead (nothing obsolete is dispatched, Codex r1 #24);
 otherwise the fault point `batch.before_submit_start`, `preparing → submit_started` and the batch dispatch
 marker in the same transaction (`spend_ledger.mark_batch_dispatched`: every entry dispatched, every attempt
-charged and its target's `charged_attempts + 1`, R6, Deviation 13).
+charged and its target's `charged_attempts + 1`, R6, Deviation 13; the target rows before the attempt rows).
 
 **The recording transactions** (steps 4a-4c) share one shape in the schedule's order (Codex r2 B7, B13):
 `active_config FOR SHARE`, the operation owner, the submission `FOR UPDATE` under `state = 'submit_started'`
-and its claim, then the month row and the ledger entries, the bulk row, the attempts and targets, and
-`ranking_state`. Attempts move only while `running` (`transition_where`, zero rows is fine), so an attempt a
-supersession ended keeps its outcome and no accounting of an item depends on it:
+and its claim, then the month row and the ledger entries, the bulk row, the targets, then the attempts (the
+order of node 9's cancel, `targets._cancel`: no lock cycle with it, Ruling T16-c), and `ranking_state`.
+Attempts move only while `running` (`transition_where`, zero rows is fine), so an attempt a supersession ended
+keeps its outcome and no accounting of an item depends on it. The handler runs the recording in a transaction
+of its own, retried on a retryable database error (`graphs.sanitize.is_retryable_db_error`: a deadlock, a
+serialization failure, a lost connection) up to `DB_RETRY.max_attempts` tries with its interval; the owner
+predicate makes each try the same recording, and a row whose tries ran out stays `submit_started`, the
+recovery's:
 - `record_created`: `submit_started → submitted` with `provider_batch_id` and `expires_at = created_at + 24
   h` (L3954); whether a cancel was requested meanwhile (the worker then calls `messages.batches.cancel` after
   the commit; `batch_poll` retries it, Task 17);
-- `record_rejected`: `submit_started → submit_rejected`; every item's entry settled `not_billed`
-  (`batch_submit_rejected`, the call `error` with the rejection's status); every item's hold released
-  (`bulk.release_item_hold`); the attempts still `running` → `submit_rejected`; the submission's `in_batch`
-  targets → `pending` (the batch pin `batch_submission_id = :s AND attempt_no = :a`; a cancelled target is
-  left as it is), their bulk rows first (P52); the follow-on. The attempts stay charged (Ruling T7-d,
+- `record_rejected`: `submit_started → submit_rejected`; every item's entry settled `not_billed` on the
+  rejection's evidence (`batch_submit_rejected`, the call `error` with that code and the rejection's status;
+  `connect_failed_before_send` for a create never sent, the call `connect_failed` without a status, Ruling
+  T16-a); every item's hold released (`bulk.release_item_hold`); the submission's `in_batch` targets →
+  `pending` (the batch pin `batch_submission_id = :s AND attempt_no = :a`; a cancelled target is left as it
+  is), their bulk rows first (P52); the attempts still `running` → `submit_rejected`; for a 401 or 403 the
+  critical `llm.auth_failed`, raised as the gateway raises it (`gateway.raise_auth_failed`), so the next
+  prepare is paused (`cycles.pause_reason`); the follow-on. The attempts stay charged (Ruling T7-d,
   Deviation 13): a request the provider always rejects exhausts its targets instead of resubmitting forever;
 - `record_ambiguous`: `submit_started → submit_ambiguous` with `reconcile_report = {"error_class": …}`;
   nothing else moves (L3956): the targets stay `in_batch`, the spend reserved and counted. The release of a
@@ -95,8 +109,9 @@ supersession ended keeps its outcome and no accounting of an item depends on it:
 **Abandon** (`abandon`, step 4d), in the recording shape under `state = 'preparing'` (no operation lock: its
 callers are the recovery of a lost execution and `submit_start`, which holds it): `preparing → abandoned`;
 each entry released (`release_never_dispatched`: the calls `cancelled`, the counters and the bulk debit
-credited); the items' holds released; the attempts still `running` → `cancelled('batch_abandoned')` (A2 B10,
-Deviation 12); the submission's `in_batch` targets → `pending`; the follow-on; `ranking.bump`.
+credited); the items' holds released; the submission's `in_batch` targets → `pending`; the attempts still
+`running` → `cancelled('batch_abandoned')` (A2 B10, Deviation 12; the targets first, T16-c); the follow-on;
+`ranking.bump`.
 
 **The recovery of a lost execution** (`recover_lost`, Codex r1 #23, r2 B12, r3 B2, B3): every `preparing` or
 `submit_started` submission (of `operation_id`, when given) whose operation is not `running` under the claim
@@ -117,21 +132,34 @@ it ends `submit_rejected`, `abandoned` or `reconciled` unreleased, or at the rel
 `active` the next `batch_submit` is recorded (`{"bulk_operation_id", "llm_tuple_id", "after_submission_id"}`,
 dedup key `batch_submit:<bulk>:after:<s>`, its job under the `batch` lock, `OPERATION_LOCKS`).
 
+**The request again** (`rerequest`, Ruling T16-d): a prepare that skipped (`paused`, `budget_exhausted`, ...)
+ends its operation and requests no follow-on, so the `bulk_operations` reconciler (`bulk.reconcile_bulk_
+operations`, through `bulk.register_active_step`) asks for the batch again on each heavy pass, in its
+transaction (`fence_epoch`, `active_config FOR SHARE`), for the `active` bulk operation that it did not
+complete: when batches are enabled, the lane is not paused (`cycles.pause_reason`; its schema check is the
+prepare's, the reconciler knowing no transport), no submission is in flight (`IN_FLIGHT`, unreleased), no
+`batch_submit` of the operation is `pending` or `running`, and at least `batch_min_targets` of its targets
+are eligible, it records `{"bulk_operation_id", "llm_tuple_id"}` under the dedup key
+`batch_submit:<bulk>:resume` (`create_operation`: one live request at most). The prepare re-checks every
+gate.
+
 **The `batch_submit` handler**, payload `{"bulk_operation_id", "llm_tuple_id"}`: (1) `recover_lost` of its own
 operation, (2) the four sweeps of the tuple (expiry, refilter, regroup and exhaustion, L3939, Deviation 7) in
 a transaction of their own, (3) `prepare` (a `NotPrepared` ends the operation `succeeded` with `progress =
-{"skipped": reason}`, and so does a `BudgetExhausted` with `budget_exhausted`), the fault point
+{"skipped": reason}`), the fault point
 `batch.after_prepare_commit`, (4) `submit_start` (an abandoned submission ends the operation), the fault
 point `batch.after_submit_start`, (5) the owner and the `submit_started` row checked again (a reclaimed
 execution sends nothing), (6) `BatchesClient.create` outside any transaction, the fault point
-`batch.after_create`, (7) `record_created | record_rejected | record_ambiguous`, then the carried cancel, and
-(8) `finish_in(succeeded)` with `progress = {"submission_id", "state", "request_count"}`. The client is built
-from today's `OperationDeps` fields (`cfg`, `gateway.http_client`, `clock`; Task 27 moves it into
+`batch.after_create`, (7) `record_created | record_rejected | record_ambiguous` (retried, above), then the
+carried cancel, and (8) `finish_in(succeeded)` with `progress = {"submission_id", "state", "request_count"}`.
+The client is built from today's `OperationDeps` fields (`cfg`, `gateway.http_client`, `clock`, and the
+gateway's `monotonic` and `sleep` for the create's own retries; Task 27 moves it into
 `OperationDeps.batches_client`).
 
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
@@ -146,12 +174,16 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
+from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import is_unique_violation, q
 from jobhunter.db.transitions import transition, transition_where
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
+from jobhunter.graphs.sanitize import DB_RETRY, db_retry_interval, is_retryable_db_error
 from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.batches import (
+    CONNECT_FAILED_BEFORE_SEND,
+    SUBMIT_REJECTED,
     Ambiguous,
     BatchApiError,
     BatchesClient,
@@ -161,10 +193,16 @@ from jobhunter.llm.batches import (
     Rejected,
 )
 from jobhunter.llm.bounds import text_input_bound
-from jobhunter.llm.errors import BudgetExhausted
-from jobhunter.llm.gateway import LLMGateway, NodeConfig, pinned_node_config
+from jobhunter.llm.gateway import (
+    AUTH_FAILED_STATUSES,
+    CONNECT_FAILED,
+    LLMGateway,
+    NodeConfig,
+    pinned_node_config,
+    raise_auth_failed,
+)
 from jobhunter.llm.pricing import worst_case_usd
-from jobhunter.llm.prompts.render import load_prompt_version, score_schema
+from jobhunter.llm.prompts.render import PromptVersion, load_prompt_version, score_schema
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import BatchItemReservation, BatchSubmissionOwner, CallOutcome, Reservation
 from jobhunter.observability.logging import get_logger
@@ -201,7 +239,6 @@ AFTER_CREATE: Final = "batch.after_create"
 # The codes this module records.
 EXECUTION_LOST: Final = "execution_lost"
 ABANDONED_DETAIL: Final = "batch_abandoned"
-SUBMIT_REJECTED: Final = "batch_submit_rejected"
 _ONLINE_RETRY_REASONS: Final = (
     "batch_max_tokens",
     "batch_invalid_output",
@@ -220,6 +257,7 @@ NotPreparedReason = Literal[
     "ambiguous",
     "below_minimum",
     "no_allocation",
+    "budget_exhausted",
     "tuple_superseded",
 ]
 
@@ -262,8 +300,7 @@ _TUPLE_INPUTS: Final = q(
 )
 _BULK_OF: Final = q("SELECT state, llm_tuple_id FROM bulk_operations WHERE id = :b")
 _IN_FLIGHT_STATES: Final = q(
-    "SELECT state FROM batch_submissions WHERE state IN "
-    "('preparing', 'submit_started', 'submitted', 'submit_ambiguous', 'ended') AND released_at IS NULL"
+    "SELECT state FROM batch_submissions WHERE state = ANY(CAST(:states AS text[])) AND released_at IS NULL"
 )
 _INSERT_SUBMISSION: Final = q(
     "INSERT INTO batch_submissions (state, llm_tuple_id, bulk_operation_id, operation_id, "
@@ -304,9 +341,6 @@ _LOCK_STARTED: Final = q(
 _LOCK_IN_STATE: Final = q(
     "SELECT bulk_operation_id FROM batch_submissions WHERE id = :s AND state = :state FOR UPDATE"
 )
-_GLOBAL_FENCE: Final = q(
-    "SELECT EXISTS (SELECT 1 FROM purge_fences WHERE kind = 'global' AND released_at IS NULL)"
-)
 # A submission's items with their entries (an item reserves exactly one), in id order.
 _ITEMS: Final = q(
     "SELECT i.id, i.target_id, i.attempt_no, c.id AS call_id, l.id AS ledger_id, l.budget_month, "
@@ -323,18 +357,19 @@ _TARGETS_OF_ITEMS: Final = (
     "(SELECT * FROM unnest(CAST(:targets AS bigint[]), CAST(:numbers AS integer[]))) "
     "ORDER BY s.id FOR UPDATE)"
 )
-# The lost executions' submissions (module docstring), locked in id order.
+# The lost executions' submissions (module docstring): the predicate, the rows locked in id order, and the
+# lock-free probe of the tick reconciler.
+_LOST_WHERE: Final = (
+    "s.state IN ('preparing', 'submit_started') AND NOT EXISTS (SELECT 1 FROM operations o "
+    "WHERE o.id = s.operation_id AND o.status = 'running' AND o.claim_id = s.operation_claim_id "
+    "AND o.worker_epoch >= :epoch)"
+)
 _LOST: Final = q(
-    "SELECT s.id, s.state FROM batch_submissions s WHERE s.state IN ('preparing', 'submit_started') "
+    f"SELECT s.id, s.state FROM batch_submissions s WHERE {_LOST_WHERE} "  # noqa: S608
     "AND (CAST(:operation AS bigint) IS NULL OR s.operation_id = CAST(:operation AS bigint)) "
-    "AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.id = s.operation_id AND o.status = 'running' "
-    "AND o.claim_id = s.operation_claim_id AND o.worker_epoch >= :epoch) ORDER BY s.id FOR UPDATE OF s"
+    "ORDER BY s.id FOR UPDATE OF s"
 )
-_ANY_LOST: Final = q(
-    "SELECT 1 FROM batch_submissions s WHERE s.state IN ('preparing', 'submit_started') "
-    "AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.id = s.operation_id AND o.status = 'running' "
-    "AND o.claim_id = s.operation_claim_id AND o.worker_epoch >= :epoch) LIMIT 1"
-)
+_ANY_LOST: Final = q(f"SELECT 1 FROM batch_submissions s WHERE {_LOST_WHERE} LIMIT 1")  # noqa: S608
 _FOLLOW_ON_OF: Final = q(
     "SELECT state, released_at, bulk_operation_id, llm_tuple_id FROM batch_submissions WHERE id = :s"
 )
@@ -349,6 +384,14 @@ _RECORD: Final = q(
     "WHERE llm_tuple_id = :tuple AND state = ANY(CAST(:states AS text[])) RETURNING id"
 )
 _FOLLOW_ON_STATES: Final = frozenset({"submit_rejected", "abandoned", "reconciled"})
+# Ruling T16-d: a live `batch_submit` of the bulk operation, and whether `:n` of its targets are eligible.
+_LIVE_SUBMIT: Final = q(
+    "SELECT EXISTS (SELECT 1 FROM operations WHERE kind = 'batch_submit' "
+    "AND status IN ('pending', 'running') AND payload ->> 'bulk_operation_id' = CAST(:b AS text))"
+)
+_ELIGIBLE_COUNT: Final = q(
+    f"SELECT count(*) FROM (SELECT 1 FROM score_targets t WHERE {ELIGIBLE_SQL} LIMIT :n) e"  # noqa: S608
+)
 
 log = get_logger("jobhunter.scoring.batches")
 
@@ -414,8 +457,10 @@ class _Candidate:
     attempt_no: int
     params: Mapping[str, JSONValue]
     input_refs: Mapping[str, JSONValue]
+    template_version: str
     bound: int
     worst_usd: Decimal
+    size: int  # `request_bytes` of its request
     rendered_sha256: bytes
     prefix_sha256: bytes | None
 
@@ -445,7 +490,7 @@ def _custom_id(target_id: int, attempt_no: int) -> str:
 
 async def _in_flight(conn: AsyncConnection) -> Literal["in_flight", "ambiguous"] | None:
     """Why the singleton is occupied: a `submit_ambiguous` submission, or another in flight; `None`."""
-    found = set((await conn.execute(_IN_FLIGHT_STATES)).scalars())
+    found = set((await conn.execute(_IN_FLIGHT_STATES, {"states": list(IN_FLIGHT)})).scalars())
     if "submit_ambiguous" in found:
         return "ambiguous"
     return "in_flight" if found else None
@@ -518,12 +563,38 @@ async def _prepare(
         return NotPrepared("batches_disabled")
     if (occupied := await _in_flight(conn)) is not None:
         return NotPrepared(occupied)
-    p = config.settings.budget  # 5. the month row, then the bulk row, before the submission row
+    tuple_row = (await conn.execute(_TUPLE_INPUTS, {"tuple": llm_tuple_id})).one()  # 5. no lock held
+    if tuple_row.profile_json is None:
+        raise LookupError(f"the profile version of tuple {llm_tuple_id} is purged")
+    version = await load_prompt_version(conn, int(tuple_row.prompt_schema_version_id))
+    node = await pinned_node_config(
+        conn,
+        "generate",
+        model_policy_id=int(tuple_row.model_policy_id),
+        execution_config_id=active.execution_config_id,
+        schema=score_schema("generate", version),
+    )
+    hold = await bulk.hold_per_item(
+        conn, evaluation_policy_id=active.evaluation_policy_id, model_policy=config.model_policy
+    )
+    candidates = await _rendered(
+        conn,
+        tuple_row,
+        version=version,
+        node=node,
+        gateway=gateway,
+        bulk_operation_id=bulk_operation_id,
+        evaluation_policy_id=active.evaluation_policy_id,
+        limit=scoring.batch_max_items,
+    )
+    if len(candidates) < scoring.batch_min_targets:
+        return NotPrepared("below_minimum")
+    p = config.settings.budget  # 6. the month row, then the bulk row, before the submission row
     month = budget.month_of(now)
     await spend_ledger.ensure_month(conn, month, p, now)
-    await spend_ledger.lock_month(conn, month, p, now=now)
+    row = await spend_ledger.lock_month(conn, month, p, now=now)
     account = await bulk.lock_accounts(conn, bulk_operation_id)
-    try:  # 6. the owner row: new and uncommitted, its key-share on the bulk row this transaction's own
+    try:  # the owner row: new and uncommitted, its key-share on the bulk row this transaction's own
         async with conn.begin_nested():
             submission_id = int(
                 (
@@ -543,72 +614,10 @@ async def _prepare(
         if not is_unique_violation(exc, _ONE_IN_FLIGHT):
             raise
         return NotPrepared("in_flight")
-    tuple_row = (await conn.execute(_TUPLE_INPUTS, {"tuple": llm_tuple_id})).one()
-    if tuple_row.profile_json is None:
-        raise LookupError(f"the profile version of tuple {llm_tuple_id} is purged")
-    version = await load_prompt_version(conn, int(tuple_row.prompt_schema_version_id))
-    node = await pinned_node_config(
-        conn,
-        "generate",
-        model_policy_id=int(tuple_row.model_policy_id),
-        execution_config_id=active.execution_config_id,
-        schema=score_schema("generate", version),
-    )
-    hold = await bulk.hold_per_item(
-        conn, evaluation_policy_id=active.evaluation_policy_id, model_policy=config.model_policy
-    )
-    rubric = steps.rubric_of(tuple_row.weights, tuple_row.anchors)
-    profile = ConfirmedProfile.model_validate(tuple_row.profile_json)
-    rows = (
-        await conn.execute(
-            _CANDIDATES,
-            {"b": bulk_operation_id, "policy": active.evaluation_policy_id, "limit": scoring.batch_max_items},
-        )
-    ).all()
-    candidates: list[_Candidate] = []
-    for row in rows:
-        prompt = steps.role_prompt(
-            "generate",
-            version=version,
-            rubric=rubric,
-            profile=profile,
-            ad=steps.revision_ad(
-                row.llm_input,
-                completeness=row.description_completeness,
-                description_text=row.description_text,
-            ),
-            refs=steps.score_refs(
-                job_revision_id=int(row.job_revision_id),
-                profile_version_id=int(tuple_row.profile_version_id),
-                rubric_version_id=int(tuple_row.rubric_version_id),
-            ),
-        )
-        try:
-            bound = text_input_bound(node.model, prompt.as_request(node.schema))
-            rendered, prefix = prompt.rendered_sha256(), prompt.prefix_sha256()
-        except UnicodeEncodeError:  # never logged: the error quotes the prompt
-            log.warning("batch_candidate_unencodable", target_id=int(row.id))
-            continue
-        candidates.append(
-            _Candidate(
-                target_id=int(row.id),
-                attempt_no=int(row.attempt_no) + 1,
-                params=gateway.batch_request_body(node, prompt, max_tokens=node.max_tokens),
-                input_refs=prompt.input_refs,
-                bound=bound,
-                worst_usd=worst_case_usd(
-                    node.model, input_tokens_bound=bound, max_tokens=node.max_tokens, batch=True
-                ),
-                rendered_sha256=rendered,
-                prefix_sha256=prefix,
-            )
-        )
     await afault_point(AFTER_CANDIDATES)
-    if len(candidates) < scoring.batch_min_targets:
-        return NotPrepared("below_minimum")
-    chosen = _cut(candidates, account, hold)
+    chosen, stop = _cut(candidates, account, hold, headroom=budget.headroom(row, "scoring", p))
     if not chosen:
-        return NotPrepared("no_allocation")
+        return NotPrepared("budget_exhausted" if stop == "headroom" else "no_allocation")
     if len(chosen) < scoring.batch_min_targets:
         return NotPrepared("below_minimum")
     moved = await transition_where(  # 7. the CAS
@@ -639,27 +648,96 @@ async def _prepare(
         node=node,
         execution_config_id=active.execution_config_id,
         evaluation_policy_id=active.evaluation_policy_id,
-        template_version=f"generate@{version.id}",
         hold=hold,
         now=now,
     )
 
 
-def _cut(candidates: Sequence[_Candidate], account: bulk.Accounts, hold: Decimal) -> list[_Candidate]:
+async def _rendered(
+    conn: AsyncConnection,
+    tuple_row: Row[tuple[object, ...]],
+    *,
+    version: PromptVersion,
+    node: NodeConfig,
+    gateway: LLMGateway,
+    bulk_operation_id: int,
+    evaluation_policy_id: int,
+    limit: int,
+) -> list[_Candidate]:
+    """Step 5: the candidates in order, each rendered, bounded, hashed, priced and sized, without a lock (a
+    candidate whose prompt does not encode is skipped, never logged: the error quotes it)."""
+    rubric = steps.rubric_of(tuple_row.weights, tuple_row.anchors)
+    profile = ConfirmedProfile.model_validate(tuple_row.profile_json)
+    rows = (
+        await conn.execute(
+            _CANDIDATES, {"b": bulk_operation_id, "policy": evaluation_policy_id, "limit": limit}
+        )
+    ).all()
+    candidates: list[_Candidate] = []
+    for row in rows:
+        prompt = steps.role_prompt(
+            "generate",
+            version=version,
+            rubric=rubric,
+            profile=profile,
+            ad=steps.revision_ad(
+                row.llm_input,
+                completeness=row.description_completeness,
+                description_text=row.description_text,
+            ),
+            refs=steps.score_refs(
+                job_revision_id=int(row.job_revision_id),
+                profile_version_id=int(tuple_row.profile_version_id),
+                rubric_version_id=int(tuple_row.rubric_version_id),
+            ),
+        )
+        target_id, attempt_no = int(row.id), int(row.attempt_no) + 1
+        try:
+            bound = text_input_bound(node.model, prompt.as_request(node.schema))
+            rendered, prefix = prompt.rendered_sha256(), prompt.prefix_sha256()
+        except UnicodeEncodeError:  # never logged: the error quotes the prompt
+            log.warning("batch_candidate_unencodable", target_id=target_id)
+            continue
+        params = gateway.batch_request_body(node, prompt, max_tokens=node.max_tokens)
+        candidates.append(
+            _Candidate(
+                target_id=target_id,
+                attempt_no=attempt_no,
+                params=params,
+                input_refs=prompt.input_refs,
+                template_version=prompt.template_version,
+                bound=bound,
+                worst_usd=worst_case_usd(
+                    node.model, input_tokens_bound=bound, max_tokens=node.max_tokens, batch=True
+                ),
+                size=request_bytes(BatchRequest(_custom_id(target_id, attempt_no), params)),
+                rendered_sha256=rendered,
+                prefix_sha256=prefix,
+            )
+        )
+    return candidates
+
+
+def _cut(
+    candidates: Sequence[_Candidate], account: bulk.Accounts, hold: Decimal, *, headroom: Decimal
+) -> tuple[list[_Candidate], Literal["bytes", "allocation", "headroom"] | None]:
     """The candidates cut to `BATCH_MAX_BYTES` of requests, then to the largest prefix whose worst cases plus
-    its holds fit the allocation (L1189)."""
+    its holds fit the allocation (L1189) and whose worst cases fit the month's scoring `headroom` (L1159,
+    Ruling T16-d); with what stopped the cut (`None`: every candidate fits)."""
     chosen: list[_Candidate] = []
     worst = Decimal(0)
     bytes_used = 0
     for c in candidates:
-        bytes_used += request_bytes(BatchRequest(_custom_id(c.target_id, c.attempt_no), c.params))
+        bytes_used += c.size
         if bytes_used > BATCH_MAX_BYTES:
-            break
+            return chosen, "bytes"
         if not account.fits(worst_case_usd=worst + c.worst_usd, hold_usd=(len(chosen) + 1) * hold):
-            break
+            return chosen, "allocation"
+        if worst + c.worst_usd > headroom:
+            return chosen, "headroom"
         chosen.append(c)
         worst += c.worst_usd
-    return chosen
+    return chosen, None
 
 
 async def _fill(
@@ -672,7 +750,6 @@ async def _fill(
     node: NodeConfig,
     execution_config_id: int,
     evaluation_policy_id: int,
-    template_version: str,
     hold: Decimal,
     now: datetime,
 ) -> Prepared:
@@ -709,7 +786,7 @@ async def _fill(
         effort=node.effort,
         max_tokens=node.max_tokens,
         execution_config_id=execution_config_id,
-        prompt_template_version=template_version,
+        prompt_template_version=survivors[0].template_version,  # the rendered prompts' one version
         bulk_operation_id=bulk_operation_id,
         hold_usd=hold,
         now=now,
@@ -850,7 +927,7 @@ async def submit_start(
     if row is None:
         raise FencedOut(spend_ledger.SUBMISSION_OWNER)
     operation_state = (await conn.execute(_BULK_OF, {"b": row.bulk_operation_id})).one().state
-    fenced = bool((await conn.execute(_GLOBAL_FENCE)).scalar_one())
+    fenced = await global_fence_active(conn)
     if (
         row.cancel_requested_at is not None
         or active.llm_tuple_id != row.llm_tuple_id
@@ -925,21 +1002,26 @@ async def record_rejected(
     await _locked_started(conn, submission_id, operation)
     await transition(conn, _SUBMISSIONS, submission_id, ["submit_started"], "submit_rejected")
     items = await _items(conn, submission_id)
-    call = CallOutcome("error", http_status=rejected.status, error_code=SUBMIT_REJECTED)
+    never_sent = rejected.evidence == CONNECT_FAILED_BEFORE_SEND
+    call = CallOutcome(
+        "error", http_status=rejected.status, error_code=CONNECT_FAILED if never_sent else SUBMIT_REJECTED
+    )
     for item in items:  # the month row and the ledger entries (the bulk row of each funded one between)
         await spend_ledger.settle(
             conn,
             item.reservation,
             outcome="not_billed",
-            evidence=SUBMIT_REJECTED,
+            evidence=rejected.evidence,
             usage=None,
             call=call,
             now=now,
         )
     for item in items:  # the bulk row, then each item
         await bulk.release_item_hold(conn, item_id=item.id)
+    moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
     ended = await _end_attempts(conn, items, "submit_rejected", None)
-    moved = await _release_targets(conn, submission_id, items)
+    if rejected.status in AUTH_FAILED_STATUSES:  # the key was refused: the lane pauses on it
+        await raise_auth_failed(conn, http_status=rejected.status)
     requested = await follow_on(conn, submission_id=submission_id, defer=defer)
     await ranking.bump(conn)  # step 11, last
     log.warning(
@@ -947,6 +1029,7 @@ async def record_rejected(
         submission_id=submission_id,
         http_status=rejected.status,
         error_type=rejected.error_type,
+        evidence=rejected.evidence,
         items=len(items),
         attempts=ended,
         targets=moved,
@@ -995,8 +1078,8 @@ async def abandon(
         await spend_ledger.release_never_dispatched(conn, item.reservation, now=now)
     for item in items:
         await bulk.release_item_hold(conn, item_id=item.id)
+    moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
     ended = await _end_attempts(conn, items, "cancelled", ABANDONED_DETAIL)
-    moved = await _release_targets(conn, submission_id, items)
     requested = await follow_on(conn, submission_id=submission_id, defer=defer)
     await ranking.bump(conn)  # step 11, last
     log.warning(
@@ -1082,6 +1165,47 @@ async def follow_on(conn: AsyncConnection, *, submission_id: int, defer: Deferre
     return True
 
 
+@bulk.register_active_step
+async def rerequest(conn: AsyncConnection, bulk_operation_id: int, ctx: ReconcileContext) -> bool:
+    """Ruling T16-d (module docstring): the batch of the `active` bulk operation requested again, in the
+    `bulk_operations` reconciler's transaction (`fence_epoch` and `active_config FOR SHARE` held); whether a
+    request was recorded now."""
+    row = (await conn.execute(_BULK_OF, {"b": bulk_operation_id})).first()
+    if row is None or row.state != "active":
+        return False
+    scoring = (await active_settings(conn)).scoring
+    if not scoring.batch_bulk_rescore:
+        return False
+    config = await cycles.scoring_config(conn)
+    if config.active.llm_tuple_id != row.llm_tuple_id:
+        return False
+    # the schema check is the prepare's (`fake_llm` is the transport's, which the reconciler does not know)
+    if await cycles.pause_reason(conn, fake_llm=True, now=ctx.now, config=config) is not None:
+        return False
+    if await _in_flight(conn) is not None:
+        return False
+    if (await conn.execute(_LIVE_SUBMIT, {"b": bulk_operation_id})).scalar_one():
+        return False
+    params = {
+        "b": bulk_operation_id,
+        "policy": config.active.evaluation_policy_id,
+        "n": scoring.batch_min_targets,
+    }
+    if int((await conn.execute(_ELIGIBLE_COUNT, params)).scalar_one()) < scoring.batch_min_targets:
+        return False
+    llm_tuple_id = int(row.llm_tuple_id)
+    operation_id, created = await create_operation(
+        conn,
+        kind=KIND,
+        payload={"bulk_operation_id": bulk_operation_id, "llm_tuple_id": llm_tuple_id},
+        dedup_key=f"{KIND}:{bulk_operation_id}:resume",
+        defer=ctx.defer,
+    )
+    if created:
+        log.info("batch_rerequested", bulk_operation_id=bulk_operation_id, operation_id=operation_id)
+    return created
+
+
 @register_takeover_sweep("batch_submissions")
 async def sweep_lost_submissions(conn: AsyncConnection, epoch: int) -> int:
     """At takeover: the submissions of every lost execution recovered (module docstring), after
@@ -1155,7 +1279,13 @@ async def batch_submit(ctx: OperationContext) -> None:
     bulk_operation_id = get_int(payload, "bulk_operation_id")
     llm_tuple_id = get_int(payload, "llm_tuple_id")
     clock = deps.clock
-    client = BatchesClient(deps.cfg, http_client=deps.gateway.http_client, clock=clock)
+    client = BatchesClient(
+        deps.cfg,
+        http_client=deps.gateway.http_client,
+        clock=clock,
+        monotonic=deps.gateway.monotonic,
+        sleep=deps.gateway.sleep,
+    )
     async with ctx.engine.begin() as conn:  # 1. this operation's lost executions
         epoch = (
             await conn.execute(_OWN_EPOCH, {"i": ctx.claim.operation_id, "c": ctx.claim.claim_id})
@@ -1173,26 +1303,21 @@ async def batch_submit(ctx: OperationContext) -> None:
         return
     async with ctx.engine.begin() as conn:  # 2. the sweeps
         await _sweep(conn, llm_tuple_id=llm_tuple_id, now=clock())
-    try:
-        async with ctx.engine.begin() as conn:  # 3. the preparation
-            await cycles.lock_active_scoring(conn)
-            prepared = await prepare(
-                conn,
-                bulk_operation_id=bulk_operation_id,
-                llm_tuple_id=llm_tuple_id,
-                operation=ctx.claim,
-                settings=await active_settings(conn),
-                fake_llm=deps.cfg.fake_llm,
-                gateway=deps.gateway,
-                now=clock(),
-            )
-            if isinstance(prepared, NotPrepared):
-                await _end(ctx, conn, {"skipped": prepared.reason})
-                return
-    except BudgetExhausted:
-        async with ctx.engine.begin() as conn:
-            await _end(ctx, conn, {"skipped": "budget_exhausted"})
-        return
+    async with ctx.engine.begin() as conn:  # 3. the preparation
+        await cycles.lock_active_scoring(conn)
+        prepared = await prepare(
+            conn,
+            bulk_operation_id=bulk_operation_id,
+            llm_tuple_id=llm_tuple_id,
+            operation=ctx.claim,
+            settings=await active_settings(conn),
+            fake_llm=deps.cfg.fake_llm,
+            gateway=deps.gateway,
+            now=clock(),
+        )
+        if isinstance(prepared, NotPrepared):
+            await _end(ctx, conn, {"skipped": prepared.reason})
+            return
     s = prepared.submission_id
     await afault_point(AFTER_PREPARE_COMMIT)
     async with ctx.engine.begin() as conn:  # 4. submit-start
@@ -1221,8 +1346,28 @@ async def batch_submit(ctx: OperationContext) -> None:
 async def _record(
     ctx: OperationContext, submission_id: int, outcome: CreateOutcome, *, now: datetime
 ) -> tuple[str, bool]:
-    """The recording transaction of the create's outcome; the submission's state and whether a cancel is
-    due."""
+    """The recording transaction of the create's outcome, retried on a retryable database error (module
+    docstring); the submission's state and whether a cancel is due."""
+    tries = 0
+    while True:
+        tries += 1
+        try:
+            return await _record_once(ctx, submission_id, outcome, now=now)
+        except sa.exc.DBAPIError as exc:
+            if tries >= DB_RETRY.max_attempts or not is_retryable_db_error(exc):
+                raise
+            log.warning(
+                "batch_record_retried",
+                submission_id=submission_id,
+                tries=tries,
+                error_class=type(exc).__name__,
+            )
+        await asyncio.sleep(db_retry_interval(tries))
+
+
+async def _record_once(
+    ctx: OperationContext, submission_id: int, outcome: CreateOutcome, *, now: datetime
+) -> tuple[str, bool]:
     async with ctx.engine.begin() as conn:
         match outcome:
             case Created():

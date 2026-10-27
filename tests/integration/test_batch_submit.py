@@ -1,8 +1,10 @@
 """The `batch_submit` operation end to end on the fake Batches API (spec §10.10 lifecycle steps 1-4d, §7.12,
-§6.9.3; plan Task 16, Deviation 13, Rulings T7-c, T7-d, P16, Carries T8-a, T8-f, Codex r1 #23, #24, r2 B12,
-B15): prepare, submit-start and the create, a definitive 4xx and its follow-on, the always-rejected batch that
-exhausts its targets, an ambiguous create, a crash on either side of `submit_started` and its recovery at the
-takeover, a cancel requested during the send, and a tuple superseded before the send.
+§6.9.3; plan Task 16, Deviation 13, Rulings T7-c, T7-d, T16-a, T16-c, T16-d, P16, Carries T8-a, T8-f, Codex
+r1 #23, #24, r2 B12, B15): prepare, submit-start and the create, a definitive 4xx and its follow-on, the
+always-rejected batch that exhausts its targets, an ambiguous create, a crash on either side of
+`submit_started` and its recovery at the takeover, a cancel requested during the send, a tuple superseded or a
+global fence before the send, the hard cap's cut, a refused key and its alert, a create never sent, a
+deadlocked recording, and the `bulk_operations` reconciler's request of a batch a paused prepare skipped.
 
 The operations run in process (`op_runner`) with the fake LLM; the targets are 250 synthetic ads of the score
 tuple in one bulk operation (`tests.support.batches.bulk_with_targets`). A test that crashes or takes over
@@ -13,18 +15,23 @@ import asyncio
 import uuid
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 
 import procrastinate
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.sql import DEADLOCK_DETECTED
+from jobhunter.graphs.sanitize import DB_RETRY
 from jobhunter.llm import budget, bulk, spend_ledger
+from jobhunter.llm.batches import BatchesClient, Rejected
 from jobhunter.llm.fake import BatchScript
+from jobhunter.observability.alerts import resolve_alert
 from jobhunter.scoring import batches as batches_mod
 from jobhunter.settings.model import ModelPolicy
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.lock import LockSession
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.batches import (
     BulkTargets,
@@ -38,8 +45,9 @@ from tests.support.batches import (
 )
 from tests.support.faults import PausePoint, no_fault, raising_at
 from tests.support.fixtures import count_rows
-from tests.support.llm import FakeLLM
+from tests.support.llm import FakeLLM, open_alerts
 from tests.support.profile import OpRunner
+from tests.support.reconcile import run_reconciler
 from tests.support.scoring import attempt_outcomes, operations_of, targets_by_state
 
 pytestmark = pytest.mark.integration
@@ -53,6 +61,8 @@ _LEDGER_SUM = sa.text(
     "WHERE c.transport = 'batch'"
 )
 _ATTEMPT_DETAILS = sa.text("SELECT DISTINCT outcome, outcome_detail FROM score_attempts WHERE mode = 'batch'")
+_CALL_ERRORS = sa.text("SELECT DISTINCT http_status, error_code FROM llm_calls WHERE transport = 'batch'")
+_RAISE = "DO $$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE = '{}'; END $$"
 
 
 @pytest.fixture
@@ -73,6 +83,16 @@ async def ledger_sum(engine: AsyncEngine) -> Decimal:
 async def batch_attempt_details(engine: AsyncEngine) -> set[tuple[str, str | None]]:
     async with engine.connect() as conn:
         return {(str(r.outcome), r.outcome_detail) for r in await conn.execute(_ATTEMPT_DETAILS)}
+
+
+async def call_errors(engine: AsyncEngine) -> set[tuple[int | None, str | None]]:
+    async with engine.connect() as conn:
+        return {(r.http_status, r.error_code) for r in await conn.execute(_CALL_ERRORS)}
+
+
+async def reconcile(engine: AsyncEngine, epoch: int) -> int:
+    """One pass of the `bulk_operations` reconciler (its completion and its batch request)."""
+    return await run_reconciler("bulk_operations", engine, now=utcnow(), epoch=epoch)
 
 
 def states(ledger: list[tuple[str, str | None]]) -> list[str]:
@@ -270,10 +290,12 @@ async def test_a_tuple_superseded_before_submit_start_abandons_and_sends_nothing
 
 
 async def test_a_global_purge_fence_before_submit_start_abandons_and_sends_nothing(
-    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, setup: BulkTargets
+    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, setup: BulkTargets, current_epoch: int
 ) -> None:
     """L6365: the global purge fence refuses the submit before `submit_start`; the prepared submission is
-    abandoned (its entries released, its targets pending) and its follow-on waits for the fence to go."""
+    abandoned (its entries released, its targets pending). Its follow-on, run while the fence stands, ends
+    `skipped: paused` and prepares nothing; once the fence is released, the `bulk_operations` reconciler
+    requests the batch again (Ruling T16-d), once, and it is submitted."""
     fake_llm.batches(BatchScript(create="ok"))
     pause = PausePoint(batches_mod.AFTER_PREPARE_COMMIT)
     assert setup.operation_id is not None
@@ -293,14 +315,28 @@ async def test_a_global_purge_fence_before_submit_start_abandons_and_sends_nothi
     await op_runner.run_one(follow_on.id)  # paused by the fence (`pause_reason`): nothing prepared
     assert (await operations_of(engine, "batch_submit"))[-1].progress == {"skipped": "paused"}
     assert await count_rows(engine, "batch_submissions") == 1
+    assert await reconcile(engine, current_epoch) == 0  # the fence stands: no request
+    async with engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE purge_fences SET released_at = now() WHERE kind = 'global'"))
+    assert await reconcile(engine, current_epoch) == 1
+    assert await reconcile(engine, current_epoch) == 0  # once: its request is pending
+    resumed = (await operations_of(engine, "batch_submit"))[-1]
+    assert (resumed.status, resumed.payload) == (
+        "pending",
+        {"bulk_operation_id": setup.bulk_operation_id, "llm_tuple_id": setup.llm_tuple_id},
+    )
+    assert await op_runner.run_pending() == [resumed.id]
+    assert [row.state for row in await submission_rows(engine)] == ["abandoned", "submitted"]
+    assert await reconcile(engine, current_epoch) == 0  # a submission in flight: no request
 
 
-async def test_a_hard_cap_below_the_batch_aborts_the_whole_preparation(
+async def test_a_hard_cap_below_the_minimum_batch_prepares_nothing(
     engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, setup: BulkTargets
 ) -> None:
-    """L1159 ("including batches"): every item is admitted against the hard cap; a refusal of any item rolls
-    the whole preparation back, and the operation ends `skipped: budget_exhausted` with nothing written. The
-    headroom still admits a first generator call (`r_first`), so the lane is not paused."""
+    """L1159 ("including batches"), Ruling T16-d: every item is admitted against the hard cap, so the cut
+    stops at the month's scoring headroom; two items fit it here, below `batch_min_targets`, so the operation
+    ends `skipped: below_minimum` with nothing written. The headroom still admits a first generator call
+    (`r_first`), so the lane is not paused."""
     month = budget.month_of(utcnow())
     async with engine.begin() as conn:
         p = await spend_ledger.current_params(conn)
@@ -311,7 +347,7 @@ async def test_a_hard_cap_below_the_batch_aborts_the_whole_preparation(
     fake_llm.batches(BatchScript(create="ok"))
     assert await op_runner.run_pending() == [setup.operation_id]
     (op,) = await operations_of(engine, "batch_submit")
-    assert (op.status, op.progress) == ("succeeded", {"skipped": "budget_exhausted"})
+    assert (op.status, op.progress) == ("succeeded", {"skipped": "below_minimum"})
     assert (
         await count_rows(engine, "batch_submissions") == 0
         and await count_rows(engine, "llm_spend_ledger") == 0
@@ -319,3 +355,114 @@ async def test_a_hard_cap_below_the_batch_aborts_the_whole_preparation(
     assert await targets_by_state(engine, setup.llm_tuple_id) == {"pending": N}
     assert (await bulk_row(engine, setup.bulk_operation_id)).spent_usd == 0
     assert fake_llm.state.batches == {}
+
+
+async def refused(status: int | None, error_type: str, **evidence: str) -> Rejected:
+    return Rejected(status, error_type, "test: refused", **evidence)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_refused_key_rejects_alerts_and_pauses_the_follow_on_until_the_alert_clears(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    current_epoch: int,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    """Ruling T16-a: a 401 or 403 is a definitive 4xx (4b) that also raises the critical `llm.auth_failed`,
+    as the gateway raises it, in the recording's transaction; the follow-on prepare is paused by it
+    (`pause_reason`), and once it is resolved the `bulk_operations` reconciler requests the batch again
+    (Ruling T16-d)."""
+    fake_llm.batches(BatchScript(create="ok"))
+    rejected = await refused(status, "authentication_error")
+    sends = BatchesClient.create
+
+    async def create(self: BatchesClient, requests: object) -> Rejected:
+        return rejected
+
+    monkeypatch.setattr(BatchesClient, "create", create)
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    (sub,) = await submission_rows(engine)
+    assert sub.state == "submit_rejected"
+    assert set(await batch_ledger(engine)) == {("not_billed", "batch_submit_rejected")}
+    assert await open_alerts(engine, "llm.auth_failed") == [("llm.auth_failed:anthropic", "critical", 1)]
+    follow_on = (await operations_of(engine, "batch_submit"))[-1]
+    await op_runner.run_one(follow_on.id)
+    assert (await operations_of(engine, "batch_submit"))[-1].progress == {"skipped": "paused"}
+    assert await reconcile(engine, current_epoch) == 0  # paused still: no request
+    async with engine.begin() as conn:
+        assert await resolve_alert(conn, code="llm.auth_failed", subject="anthropic")
+    assert await reconcile(engine, current_epoch) == 1
+    monkeypatch.setattr(BatchesClient, "create", sends)  # the key works again
+    executed = await op_runner.run_pending()
+    assert len(executed) == 1
+    assert [row.state for row in await submission_rows(engine)] == ["submit_rejected", "submitted"]
+
+
+async def test_a_create_never_sent_refunds_with_the_connect_evidence(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling T16-a: a create whose connection failed before any byte left, on every try, made no batch; it is
+    rejected (4b) with the items refunded on `connect_failed_before_send` (their calls `connect_failed`, no
+    status), and the rejected attempts stay charged (T7-d)."""
+    fake_llm.batches(BatchScript(create="ok"))
+    rejected = await refused(None, "connect_failed", evidence="connect_failed_before_send")
+
+    async def create(self: BatchesClient, requests: object) -> Rejected:
+        return rejected
+
+    monkeypatch.setattr(BatchesClient, "create", create)
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    (sub,) = await submission_rows(engine)
+    assert sub.state == "submit_rejected" and fake_llm.state.batches == {}
+    assert set(await batch_ledger(engine)) == {("not_billed", "connect_failed_before_send")}
+    assert await call_errors(engine) == {(None, "connect_failed")}
+    assert await attempt_outcomes(engine, setup.llm_tuple_id) == {"submit_rejected": N}
+    assert await charged_attempts(engine, setup.llm_tuple_id) == N
+    assert await targets_by_state(engine, setup.llm_tuple_id) == {"pending": N}
+    assert await open_alerts(engine, "llm.auth_failed") == []
+
+
+@pytest.mark.parametrize("deadlocks", [1, DB_RETRY.max_attempts])
+async def test_a_deadlocked_recording_is_retried_within_its_bound(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    monkeypatch: pytest.MonkeyPatch,
+    deadlocks: int,
+) -> None:
+    """Ruling T16-c: the recording transaction is retried on a retryable database error (PostgreSQL aborts
+    one side of a lock cycle with 40P01), up to `DB_RETRY.max_attempts` tries; the owner predicate makes each
+    try the same recording. A deadlock on every try leaves the row `submit_started`, the recovery's."""
+    fake_llm.batches(BatchScript(create="ok"))
+    real = batches_mod.record_created
+    tries: list[int] = []
+
+    async def deadlocking(conn: AsyncConnection, *args: Any, **kwargs: Any) -> bool:
+        tries.append(1)
+        cancel_due = await real(conn, *args, **kwargs)
+        if len(tries) <= deadlocks:  # its writes, then the abort: the whole transaction rolls back
+            await conn.execute(sa.text(_RAISE.format(DEADLOCK_DETECTED)))
+        return cancel_due
+
+    monkeypatch.setattr(batches_mod, "record_created", deadlocking)
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    (sub,) = await submission_rows(engine)
+    (op,) = await operations_of(engine, "batch_submit")
+    if deadlocks < DB_RETRY.max_attempts:
+        assert len(tries) == deadlocks + 1
+        assert sub.state == "submitted" and op.status == "succeeded"
+    else:
+        assert len(tries) == DB_RETRY.max_attempts
+        assert sub.state == "submit_started" and op.status != "succeeded"
+    assert len(fake_llm.state.batches) == 1  # sent once, whatever the recording's tries

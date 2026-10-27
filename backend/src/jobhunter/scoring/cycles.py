@@ -74,6 +74,7 @@ from typing import Final, Literal, get_args
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition, transition_where
 from jobhunter.errors import FencedOut, TransitionConflict
@@ -220,9 +221,6 @@ _UNACKNOWLEDGED: Final = q(
     "SELECT EXISTS (SELECT 1 FROM alerts WHERE code = :code AND resolved_at IS NULL "
     "AND acknowledged_at IS NULL)"
 )
-_GLOBAL_FENCE: Final = q(
-    "SELECT EXISTS (SELECT 1 FROM purge_fences WHERE kind = 'global' AND released_at IS NULL)"
-)
 
 
 async def _unacknowledged(conn: AsyncConnection, code: str) -> bool:
@@ -244,7 +242,7 @@ async def pause_reason(
     row = await spend_ledger.read_month_or_new(conn, budget.month_of(now), p, now=now)
     if budget.headroom(row, "scoring", p) < budget.r_first(read.model_policy, read.execution):
         return "cap_reached"
-    if (await conn.execute(_GLOBAL_FENCE)).scalar_one():
+    if await global_fence_active(conn):
         return "global_fence"
     if not fake_llm and not await validate.schema_verified(
         conn,
