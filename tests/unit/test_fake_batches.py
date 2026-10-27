@@ -679,11 +679,14 @@ def test_a_batch_item_takes_the_first_body_and_skips_scenario_entries() -> None:
 async def test_the_process_state_keeps_the_full_params_of_its_newest_batches_only(api: Batches) -> None:
     state = fake.state()
     state.record = False  # as the process-wide state of a dev worker
-    scripted_batches(polls_until_ended=0)
+    scripted_batches(polls_until_ended=1)  # the oldest is still in progress when its params are trimmed
     ids = [(await api.create([f"t{n}_a1"])).id for n in range(fake.PROCESS_BATCHES_KEPT + 1)]
     oldest = state.batches[ids[0]]
-    assert oldest.requests == {"t0_a1": {key: params()[key] for key in fake.KEPT_PARAMS}}
+    kept = ("model", "max_tokens", "output_config")
+    assert oldest.requests == {"t0_a1": {key: params()[key] for key in kept}}
     assert all(state.batches[i].requests[f"t{n}_a1"] == params() for n, i in enumerate(ids) if n > 0)
+    assert (await api.raw("GET", f"/{ids[0]}")).processing_status == "in_progress"
+    assert (await api.raw("GET", f"/{ids[0]}")).processing_status == "ended"  # decided, from trimmed params
     (line,) = await api.raw_results(ids[0])  # it stays answerable
     assert line["result"]["type"] == "succeeded"
 
