@@ -53,9 +53,15 @@ r2 B7).
    save's last statement: `ranking_state` is the last lock of §3.3.3, after the month row of the `budget`
    action and of the activation (Codex r2 B7).
 
-Every write of the class actions that takes a row lock follows that order. The rows inserted before the month
-row (the derived rows, the version, the tuple) are new rows of tables that only writers holding
-`active_config` `FOR UPDATE` insert into, so no other transaction can hold or wait for them.
+The class actions do not keep the schedule's order among themselves, and this is what actually happens. The
+derived rows, the version and the tuple are new rows of tables that only writers holding `active_config` `FOR
+UPDATE` insert into, so no other transaction can hold or wait for them. With `budget` the month row comes
+before every other domain row of the actions. With `admission` the expiry sweep's bulk rows and target rows
+and `resolve_apply_failed`'s alerts come before the activation's month row of step 8 whenever the month row
+was not taken by `budget` already. That is safe because `active_config FOR UPDATE`, held from step 1,
+serialises the save with every score-lane transaction (each takes `active_config` first, step 2), the only
+transactions that take a month row together with bulk or target rows; and none of them, nor any other
+month-row writer, waits for a `scope.apply_failed` alert. `ranking_state` is always the last lock.
 
 `ensure_tuple` is the one select-or-insert of an `llm_tuples` row (Task 21's confirm reuses it). Neither this
 module nor `scope_apply` logs: the caller logs ids and codes after its commit. (`spend_ledger.change_cap` and

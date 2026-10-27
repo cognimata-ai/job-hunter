@@ -20,15 +20,21 @@ projection admitted: a request that was not skipped), `used` (counted units) and
 `used`, `cells` dispatched and the `reason` (the most common §6.6 outcome of the JSearch cells it serves).
 `revisions`: `created`, `embedded` and `awaiting` (the run's revisions by embedding status,
 `finalize.run_revisions`) and `targets`, what node 9 did for the run's tuple (`targets_section`): `{"created",
-"revived", "cancelled", "skipped": {<reason>: n}}`, the skip reasons of `targets.create_or_revive` (`fenced`,
-`merged`, `not_current`, `tuple_inactive`) and `tuple_superseded` (the run's revisions left without a target
-of the run's tuple because a confirm or a save made another tuple active during the run: the activation's
-`create_targets_for_tuple` owns those). Unlike the other sections these are the node's own counts (`targets_*`
-of `CollectState.counters`): no row records whether a target was created or revived by this run, so an attempt
-resumed after node 9 counts only what its own node 9 did; I5 checks the durable outcome, every revision of the
-run with its target. `execution`: node durations, the invariant results, the partial causes, the alerts raised
-(`alerts_raised`), the warnings of the error handler's counters (`WARNING_COUNTERS`) and the attempt's
-counters, informational.
+"revived", "cancelled", "skipped": {<reason>: n}, "by_state": {<state>: n}}`, the skip reasons of
+`targets.create_or_revive` (`fenced`, `merged`, `not_current`, `tuple_inactive`) and `tuple_superseded` (the
+run's revisions left without a target of the run's tuple because a confirm or a save made another tuple active
+during the run: the activation's `create_targets_for_tuple` owns those), and `by_state`, the state each
+created or revived target was left in (`pending`, `filtered_out`, `deferred_duplicate`), §17.3's "targets
+created by state" (Ruling T14-a). Unlike the other sections these are node 9's own counts (`targets_*` of
+`CollectState.counters`): no row records whether a target was created or revived by this run. So they
+undercount: an attempt resumed after node 9 counts only what its own node 9 did, and a database retry of node
+9 within one attempt (`DB_RETRY`) counts only its last pass, to which the chunks the failed pass committed
+come back `Unchanged`. And `skipped.tuple_superseded` can count a job that `created` counts too: a revision
+node 9 gave a target of the run's tuple in an early chunk, which the activation that superseded the tuple then
+cancelled, is still one without a live target of it when a later chunk finds the tuple superseded. I5 checks
+the durable outcome, every revision of the run with its target. `execution`: node durations, the invariant
+results, the partial causes, the alerts raised (`alerts_raised`), the warnings of the error handler's counters
+(`WARNING_COUNTERS`) and the attempt's counters, informational.
 """
 
 from collections import Counter
@@ -42,8 +48,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import TRANSITIONS
+from jobhunter.graphs.collect.nodes import run_started_at
 from jobhunter.graphs.collect.nodes.enqueue_targets import (
     SKIPPED_PREFIX,
+    STATE_PREFIX,
     TARGETS_CANCELLED,
     TARGETS_CREATED,
     TARGETS_REVIVED,
@@ -65,7 +73,6 @@ ALERT_DOMAINS: Final = ("run", "source", "quota", "coverage", "embedder", "ats",
 # A fetch request not yet terminal (I2 counts them; the fallback's reason reads only terminal ones).
 OPEN_REQUEST: Final = ("planned", "reserved", "dispatched")
 _UNIT_STATES: Final = ("billed", "ambiguous", "not_billed")
-_STARTED: Final = q("SELECT started_at FROM runs WHERE id = :run")
 
 _INSTANCES = q(
     "SELECT id, source_id, instance_key, health FROM source_instances WHERE id IN "
@@ -306,18 +313,20 @@ async def _quota(conn: AsyncConnection, run_id: int, fallback: FallbackRequests)
     return quota
 
 
+def _prefixed(counters: Mapping[str, int], prefix: str) -> dict[str, JSONValue]:
+    return {
+        name.removeprefix(prefix): n for name, n in sorted(counters.items()) if name.startswith(prefix) and n
+    }
+
+
 def targets_section(counters: Mapping[str, int]) -> dict[str, JSONValue]:
     """The report's `revisions.targets` from node 9's counters (module docstring)."""
-    skipped: dict[str, JSONValue] = {
-        name.removeprefix(SKIPPED_PREFIX): n
-        for name, n in sorted(counters.items())
-        if name.startswith(SKIPPED_PREFIX) and n
-    }
     return {
         "created": counters.get(TARGETS_CREATED, 0),
         "revived": counters.get(TARGETS_REVIVED, 0),
         "cancelled": counters.get(TARGETS_CANCELLED, 0),
-        "skipped": skipped,
+        "skipped": _prefixed(counters, SKIPPED_PREFIX),
+        "by_state": _prefixed(counters, STATE_PREFIX),
     }
 
 
@@ -335,7 +344,7 @@ async def build_report(
 ) -> dict[str, JSONValue]:
     """The §17.3 run report of run `run_id` (module docstring): `sources`, `identity`, `revisions`, `quota`
     and `execution`. `node_durations` and `counters` are the attempt's own (informational)."""
-    started: datetime = (await conn.execute(_STARTED, {"run": run_id})).scalar_one()
+    started = await run_started_at(conn, run_id)
     warnings: list[JSONValue] = [
         {"code": name, "count": counters[name]} for name in WARNING_COUNTERS if counters.get(name, 0)
     ]

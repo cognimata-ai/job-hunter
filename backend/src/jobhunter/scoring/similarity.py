@@ -7,15 +7,16 @@ title as `query:` texts), `max(1 - (e.vector <=> v.vector))` with pgvector's cos
 `[-1, 1]` (the column's CHECK: two `halfvec` unit vectors can round a hair past it). It is `None` while the
 revision awaits its embedding and while the profile has no vectors (the embedder was down at its confirm).
 
-`fill_missing_similarity(conn, *, llm_tuple_id, limit=500) -> int` sets `similarity` on up to `limit` of the
-tuple's unpublished, uncancelled targets that have none, once their revision is embedded and the tuple's
-profile has vectors; how many it set. The rows are taken in id order `FOR UPDATE SKIP LOCKED` (other domain
-rows: a target another transaction holds is left for the next pass), in the caller's transaction. The
-`awaiting_embedding` reconciler calls it (Task 15).
+`fill_missing_similarity(conn, *, llm_tuple_id, now, limit=500) -> int` sets `similarity` (and `updated_at` to
+the caller's `now`) on up to `limit` of the tuple's unpublished, uncancelled targets that have none, once
+their revision is embedded and the tuple's profile has vectors; how many it set. The rows are taken in id
+order `FOR UPDATE SKIP LOCKED` (other domain rows: a target another transaction holds is left for the next
+pass), in the caller's transaction. The `awaiting_embedding` reconciler calls it (Task 15).
 
 Both read vectors only; nothing here logs.
 """
 
+from datetime import datetime
 from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -39,7 +40,7 @@ _PROFILE_HAS_VECTORS: Final = q(
 _FILL: Final = q(
     "UPDATE score_targets t SET similarity = "  # noqa: S608 (the module's constant)
     + SIMILARITY_SQL.format(profile=":profile", revision="t.job_revision_id")
-    + ", updated_at = now() WHERE t.id IN (SELECT s.id FROM score_targets s "
+    + ", updated_at = :now WHERE t.id IN (SELECT s.id FROM score_targets s "
     "JOIN job_revisions r ON r.id = s.job_revision_id WHERE s.llm_tuple_id = :tuple AND s.similarity IS NULL "
     "AND r.embedding_id IS NOT NULL "
     "AND s.state NOT IN ('published_accepted', 'published_contested', 'cancelled') "
@@ -58,11 +59,13 @@ async def similarity_for(
     return None if found is None else float(found)
 
 
-async def fill_missing_similarity(conn: AsyncConnection, *, llm_tuple_id: int, limit: int = 500) -> int:
+async def fill_missing_similarity(
+    conn: AsyncConnection, *, llm_tuple_id: int, now: datetime, limit: int = 500
+) -> int:
     """Set the missing similarity of up to `limit` targets of the tuple whose revision is embedded (module
     docstring); how many it set (0 while the tuple's profile has no vectors)."""
     profile = (await conn.execute(_PROFILE_HAS_VECTORS, {"tuple": llm_tuple_id})).scalar_one_or_none()
     if profile is None:
         return 0
-    params = {"profile": int(profile), "tuple": llm_tuple_id, "limit": limit}
+    params = {"profile": int(profile), "tuple": llm_tuple_id, "limit": limit, "now": now}
     return len((await conn.execute(_FILL, params)).all())

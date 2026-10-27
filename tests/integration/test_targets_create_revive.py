@@ -28,6 +28,7 @@ from jobhunter.scoring.targets import Cancelled, Created, Revived, Skipped, Unch
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.m3 import (
+    NOW,
     Job,
     insert_attempt,
     insert_batch_item,
@@ -248,6 +249,10 @@ async def test_a_superseded_or_merged_target_revives_into_a_fresh_life(
     job = await a_job(engine)
     async with engine.begin() as conn:
         await filter_result(conn, job, scope, passed=True)
+        # the similarity is computed again on revival: the old life's value (0.1) gives way to the vectors'
+        profile = await profile_of_tuple(conn, tuple_id)
+        await profile_vector_at(conn, profile, "summary", (1023, 1.0))
+        await embed_revision(conn, job.revision_id, await embedding_at(conn, "rev", (0, 0.6), (1023, 0.8)))
         old_bulk = await insert_bulk_operation(conn, tuple_id, state="cancelled")
         new_bulk = await insert_bulk_operation(conn, tuple_id)
         target = await state_target(
@@ -264,6 +269,7 @@ async def test_a_superseded_or_merged_target_revives_into_a_fresh_life(
             refusal_category="general_harms",
             lane="similarity",
             bulk_operation_id=old_bulk,
+            similarity=0.1,
         )
         attempt = await insert_attempt(conn, target, attempt_no=2, outcome="cancelled", outcome_detail=reason)
         _, call = await insert_scoring_call(conn, attempt_id=attempt, target_id=target)
@@ -284,6 +290,7 @@ async def test_a_superseded_or_merged_target_revives_into_a_fresh_life(
     assert (row.charged_attempts, row.transient_failures, row.not_before) == (0, 0, None)
     assert (row.resume_draft_id, row.refusal_category, row.bulk_operation_id) == (None, None, new_bulk)
     assert row.attempt_no == 2  # never reset
+    assert row.similarity == pytest.approx(0.8, abs=2e-3)
 
 
 async def test_a_revival_is_corrected_by_the_creation_rules(
@@ -403,12 +410,20 @@ async def test_fill_missing_similarity_sets_it_once_the_embedding_exists(
                 conn, job.revision_id, await embedding_at(conn, f"rev{n}", (1022, 0.6), (1023, 0.8))
             )
     async with engine.begin() as conn:
-        assert await similarity.fill_missing_similarity(conn, llm_tuple_id=tuple_id, limit=1) == 1
+        assert await similarity.fill_missing_similarity(conn, llm_tuple_id=tuple_id, now=NOW, limit=1) == 1
     async with engine.begin() as conn:
-        assert await similarity.fill_missing_similarity(conn, llm_tuple_id=tuple_id) == 1
-        assert await similarity.fill_missing_similarity(conn, llm_tuple_id=tuple_id) == 0  # the third awaits
+        assert await similarity.fill_missing_similarity(conn, llm_tuple_id=tuple_id, now=NOW) == 1
+        assert (
+            await similarity.fill_missing_similarity(conn, llm_tuple_id=tuple_id, now=NOW) == 0
+        )  # 3rd awaits
     values = [(await target_row(engine, m.target_id)).similarity for m in made if isinstance(m, Created)]
     assert values[:2] == [pytest.approx(0.8, abs=2e-3)] * 2 and values[2] is None
+    stamped = [
+        await scalar(engine, "SELECT updated_at FROM score_targets WHERE id = :t", t=m.target_id)
+        for m in made
+        if isinstance(m, Created)
+    ]
+    assert stamped[:2] == [NOW, NOW] and stamped[2] != NOW  # the caller's clock, on the rows it set
 
 
 # ---- cancellation ------------------------------------------------------------------------------------------

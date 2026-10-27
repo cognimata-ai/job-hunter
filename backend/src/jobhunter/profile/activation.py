@@ -65,15 +65,19 @@ The body (`ConfirmOutcome`, §14.2's 201) holds ids and decimal strings only: th
 Deviation 42),
 `est_usd` (`est_usd_online`, the quantity §6.8 calls `est_usd`; R21-2) and `bulk_budget_usd`.
 
-**Lock order** (§9.1: `active_config` → owner row → `llm_budget` → … → other domain rows →
-`ranking_state`): `active_config` first; no owner row is locked; the estimate only reads the month row, the
-activation of step 8 locks it, then the bulk rows, then the old tuple's targets (the other score-lane
-transactions all start with `active_config`, which this one holds `FOR UPDATE`, so none of them interleaves);
-the other domain rows: the draft, a reused version (`FOR KEY SHARE`, then `FOR NO KEY UPDATE` in
-`request_proposal`, which a key share never blocks), and the rows this transaction inserts (version, tuple,
-derived scope, operations, proposal), then the alerts and `ranking_state`. The embedding is requested before
-the proposal: a running `embed_profile` write holds the version `FOR SHARE`, which a key share lets through
-and `FOR NO KEY UPDATE` waits for. A live operation of a dedup key is reused, never locked.
+**Lock order** (§9.1: `active_config` → owner row → `llm_budget` → … → other domain rows → `ranking_state`).
+What actually happens, in order: `active_config FOR UPDATE` first; no owner row is locked; then the draft
+(step 1, an other domain row), a reused version (`FOR KEY SHARE`) and the version and tuple rows this
+transaction inserts; then the activation of step 8: the month row (the estimate only read it), the bulk rows,
+the old tuple's targets, attempts, items and submissions; then the derived scope, the operations and the
+proposal (a reused version's `FOR NO KEY UPDATE` in `request_proposal`, which a key share never blocks), the
+alerts and `ranking_state` last. So the draft and the version precede the month row, against the schedule's
+order. That is safe because `active_config FOR UPDATE` serialises the confirm with every score-lane
+transaction (each takes `active_config` first, step 2), the only transactions that take a month row together
+with bulk or target rows; and no month-row writer ever waits for a draft or a profile version. The embedding
+is requested before the proposal: a running `embed_profile` write holds the version `FOR SHARE`, which a key
+share lets through and `FOR NO KEY UPDATE` waits for. A live operation of a dedup key is reused, never locked
+(a superseded `create_targets_for_tuple` excepted, which the activation cancels).
 
 The module does not log: the route logs the ids that `activated` collects, after its commit. `afault_point`
 is a name of this module, so a test replaces it.
@@ -164,8 +168,9 @@ class ConfirmOutcome:
 
 
 @dataclass(frozen=True)
-class Activated:
-    """The ids of one activation, for the caller's log line after its commit."""
+class ProfileActivated:
+    """The ids of one profile activation, for the caller's log line after its commit (the tuple activation's
+    own result is `scoring.targets.Activated`)."""
 
     draft_id: int
     version_id: int
@@ -278,7 +283,7 @@ async def confirm_draft(
     expected_rescore_ack: bool,
     now: datetime,
     defer: Deferrer,
-    activated: list[Activated] | None = None,
+    activated: list[ProfileActivated] | None = None,
 ) -> tuple[int, dict[str, JSONValue]]:
     """Confirm draft `draft_id` and activate its profile in the caller's transaction (module docstring); the
     response `(status, body)`. An activation's ids are appended to `activated` when it is given."""
@@ -353,7 +358,7 @@ async def confirm_draft(
     await afault_point(BEFORE_COMMIT_POINT)
     if activated is not None:
         activated.append(
-            Activated(
+            ProfileActivated(
                 draft_id=draft_id,
                 version_id=version_id,
                 version_created=version_created,

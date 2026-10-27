@@ -144,7 +144,7 @@ async def test_happy_run_succeeds_with_a_full_report(
     revisions = report["revisions"]
     assert revisions["created"] == revisions["embedded"] > 0 and revisions["awaiting"] == 0
     # no tuple was active: node 9 made nothing (M3 Task 14's shape of the section)
-    assert revisions["targets"] == {"created": 0, "revived": 0, "cancelled": 0, "skipped": {}}
+    assert revisions["targets"] == {"created": 0, "revived": 0, "cancelled": 0, "skipped": {}, "by_state": {}}
     assert report["quota"]["fallback"]["used"] is False
     assert report["execution"]["warnings"] == [] and report["execution"]["partial"] == []
     # no ad text anywhere: no title, no 40-character slice of any description of the run, is in the report

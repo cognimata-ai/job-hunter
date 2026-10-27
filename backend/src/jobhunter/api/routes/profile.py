@@ -512,7 +512,7 @@ async def confirm_draft(
     """Confirm a ready draft and activate its profile (201); a repeat returns the original outcome."""
     key = check_idempotency_key(idempotency_key)  # a malformed key costs no database round trip
     now = utcnow()
-    activated: list[activation.Activated] = []  # the handler's activation; empty on any replay
+    activated: list[activation.ProfileActivated] = []  # the handler's activation; empty on any replay
     replayed: list[JSONValue] = []  # the version of a confirmed draft's stored body, under a new key
 
     async def handler(conn: AsyncConnection) -> StoredResponse:

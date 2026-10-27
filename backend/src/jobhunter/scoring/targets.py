@@ -150,20 +150,22 @@ the worker calls `messages.batches.cancel` after the commit, A1 issue 17); the f
 earlier activation of the same tuple names a bulk operation cancelled since: it is cancelled (`superseded`)
 and a new one recorded.
 
-**`create_targets_for_tuple`** (§12.6 step 4, Codex r1 #32, A2 R4), payload `{"llm_tuple_id",
-"bulk_operation_id"}`: the current revisions of retained jobs that need a target of the tuple, in chunks of
-`CHUNK` ordered `availability = 'active'` first, then jobs saved or applied (`user_job_actions`), then the
-rest, each by job id (a keyset over that order, so every chunk moves on). Each chunk is one transaction:
-`active_config FOR SHARE` (a tuple no longer active ends the operation `succeeded` with `progress =
-{"skipped": "tuple_superseded"}`), the chunk's job rows `FOR SHARE` in id order, the owner row
-(`lock_operation_owner`), `create_or_revive` per job into the operation's bulk operation,
-`set_progress({"done", "total"})` (the retained current revisions with a target of the tuple, of all of them),
+**`create_targets_for_tuple`** (§12.6 step 4, Codex r1 #32, A2 R4), payload
+`{"llm_tuple_id", "bulk_operation_id"}`: the current revisions of retained jobs that need a target of the
+tuple, in chunks of `CHUNK`, the jobs of `availability = 'active'` first, then those saved or applied
+(`user_job_actions`), then the rest (`CREATION_ORDER`), each group walked by job id (a keyset, so every chunk
+moves on and none sorts every retained job). Each chunk is one transaction: `active_config FOR SHARE` (a tuple
+no longer active ends the operation `succeeded` with `progress = {"skipped": "tuple_superseded"}`), the
+chunk's job rows `FOR SHARE` in id order, the owner row (`lock_operation_owner`), `create_or_revive` per job
+into the operation's bulk operation (`create_chunk`, in job id order), `set_progress({"done", "total"})`,
 `ranking.bump` when it created or revived one; then the fault point `create_targets.after_chunk`, after the
-commit, so a crash resumes from what is durable. When every chunk is done, with `scoring.batch_bulk_rescore`
-on and at least `batch_min_targets` targets of the bulk operation `pending` with `override = 'none'` (L3708's
-"≥ 200"), the `batch_submit` operation `{"bulk_operation_id", "llm_tuple_id"}` is recorded (dedup key
-`batch_submit:<bulk>:1`; its job takes the `batch` lock, `operations.OPERATION_LOCKS`), and the operation ends
-`succeeded` in that transaction.
+commit, so a crash resumes from what is durable. `total` (the retained current revisions) and the `done` it
+starts from (those with a live target of the tuple already) are counted once per execution, in its first
+transaction, and `done` then moves on by each chunk's creations and revivals. When every chunk is done, with
+`scoring.batch_bulk_rescore` on and at least `batch_min_targets` targets of the bulk operation `pending` with
+`override = 'none'` (L3708's "≥ 200"), the `batch_submit` operation `{"bulk_operation_id", "llm_tuple_id"}` is
+recorded (dedup key `batch_submit:<bulk>:1`; its job takes the `batch` lock, `operations.OPERATION_LOCKS`),
+and the operation ends `succeeded` in that transaction.
 
 **`missing_targets`** (heavy, §17.4, §7.17 #2, L3718): `fence_epoch`, `active_config FOR SHARE`, then the
 current revisions of retained jobs that need a target of the active tuple, by job id in chunks of `CHUNK`,
@@ -188,7 +190,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import CLEAR_REASON, transition, transition_set_clause, transition_where
+from jobhunter.db.transitions import (
+    CLEAR_REASON,
+    TRANSITIONS,
+    transition,
+    transition_set_clause,
+    transition_where,
+)
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, bulk, spend_ledger
@@ -449,10 +457,19 @@ async def _move(
     return [*denied, *kept]
 
 
-async def _release_holds(conn: AsyncConnection, moved: list[RowMapping]) -> None:
-    """The follow-up hold of every target a terminal sweep moved (the bulk rows are held: P52)."""
-    for row in moved:
-        await bulk.release_target_hold(conn, int(row["id"]))
+# The targets of `:ids` with an unreleased follow-up item: the only ones a release changes.
+_HOLDING: Final = q(
+    "SELECT DISTINCT target_id FROM batch_items WHERE target_id = ANY(CAST(:ids AS bigint[])) "
+    "AND decision = 'followup' AND hold_released_at IS NULL ORDER BY target_id"
+)
+
+
+async def _release_holds(conn: AsyncConnection, moved: Sequence[RowMapping]) -> None:
+    """The follow-up hold of every target a terminal move (a sweep, a cancellation) moved, once each
+    (`bulk.release_target_hold`, Ruling P9); the bulk rows are held already (P52)."""
+    held = await _ids(conn, _HOLDING, {"ids": sorted(int(row["id"]) for row in moved)})
+    for target_id in held:
+        await bulk.release_target_hold(conn, target_id)
 
 
 async def lock_hold_candidates(
@@ -829,14 +846,14 @@ TUPLE_SUPERSEDED: Final = "tuple_superseded"
 REVISION_SUPERSEDED: Final = "revision_superseded"
 # The reasons a cancelled target revives from (§7.16.3); `purged` never does (L2905).
 REVIVABLE: Final = ("tuple_superseded", "revision_superseded", "job_merged")
-# The states a supersession, a merge or a purge cancels besides `in_progress` and `in_batch` (§7.16.3).
-CANCELLABLE: Final = (
-    "pending",
-    "budget_deferred",
-    "deferred_duplicate",
-    "filtered_out",
-    "expired_unscored",
-    *RETRYABLE_STATES,
+# The states a supersession, a merge or a purge cancels besides `in_progress` and `in_batch` (§7.16.3): the
+# registry's edges into `cancelled`.
+CANCELLABLE: Final = tuple(
+    sorted(
+        source
+        for source, to in TRANSITIONS["score_targets"].allowed
+        if to == "cancelled" and source not in ("in_progress", "in_batch")
+    )
 )
 CHUNK: Final = 500  # revisions per transaction of node 9, `create_targets_for_tuple` and `missing_targets`
 AFTER_CANCEL_POINT: Final = "activation.after_cancel"
@@ -1052,10 +1069,6 @@ _ATTEMPTS_OF: Final = (
     "(t.target_id, t.attempt_no) IN (SELECT * FROM unnest(CAST(:targets AS bigint[]), "
     "CAST(:numbers AS integer[])))"
 )
-_HOLDING: Final = q(
-    "SELECT DISTINCT target_id FROM batch_items WHERE target_id = ANY(CAST(:ids AS bigint[])) "
-    "AND decision = 'followup' AND hold_released_at IS NULL ORDER BY target_id"
-)
 
 
 async def _cancel(
@@ -1065,7 +1078,14 @@ async def _cancel(
     reason: CancelReason,
 ) -> Cancelled:
     """Cancel the targets of `match` (each bind's filter fragment and value) in `states` (module
-    docstring)."""
+    docstring).
+
+    The waiting `FOR UPDATE` of the target rows after their bulk rows (P52) meets the owner of an
+    `in_progress` follow-up target in the other order: its publish or fail takes the target row (step 5) and
+    then its bulk row (step 7). Under `active_config FOR UPDATE` (an activation) no owner transaction runs,
+    since each takes `active_config` first; under `FOR SHARE` (node 9) the pair can deadlock. PostgreSQL then
+    aborts one of them: node 9 retries it (`DB_RETRY`), the owner's attempt retries its `db_transient`
+    (`escaped_db_transient`), and the outcome is that of the two in either serial order."""
     predicate = " AND ".join(fragment for fragment, _ in match.values())
     params: dict[str, object] = {name: value for name, (_, value) in match.items()}
     candidates = await _ids(
@@ -1101,8 +1121,7 @@ async def _cancel(
             "numbers": [int(row["attempt_no"]) for row in moved],
         },
     )
-    for target_id in await _ids(conn, _HOLDING, {"ids": moved_ids}):  # the bulk rows are held (P52)
-        await bulk.release_target_hold(conn, target_id)
+    await _release_holds(conn, moved)  # the bulk rows are held (P52)
     log.info(
         "score_targets_cancelled",
         reason=reason,
@@ -1220,15 +1239,25 @@ async def activate_tuple(
 
 # ---- create_targets_for_tuple (§12.6 step 4) and missing_targets (§17.4) -----------------------------------
 
-# The jobs that need a target of `:tuple`, in the operation's order (module docstring), after the keyset
-# `(:rank, :after)`.
-_CREATION_PAGE: Final = q(
-    "SELECT c.id, c.current_revision_id, c.rank FROM (SELECT j.id, j.current_revision_id, "  # noqa: S608
-    "CASE WHEN j.availability = 'active' THEN 0 WHEN EXISTS (SELECT 1 FROM user_job_actions u "
-    "WHERE u.job_id = j.id AND (u.saved_at IS NOT NULL OR u.applied_at IS NOT NULL)) THEN 1 ELSE 2 END "
-    "AS rank "
-    f"FROM jobs j WHERE {RETAINED_JOB_SQL} AND {NEEDS_TARGET_SQL}) c "
-    "WHERE (c.rank, c.id) > (:rank, :after) ORDER BY c.rank, c.id LIMIT :limit"
+# The operation's order (module docstring): one predicate over `jobs j` per group, each walked by job id, so a
+# page scans from its keyset on and stops at its limit (no sort of every retained job per chunk).
+_SAVED_OR_APPLIED: Final = (
+    "EXISTS (SELECT 1 FROM user_job_actions u WHERE u.job_id = j.id "
+    "AND (u.saved_at IS NOT NULL OR u.applied_at IS NOT NULL))"
+)
+CREATION_ORDER: Final = (
+    "j.availability = 'active'",
+    f"j.availability <> 'active' AND {_SAVED_OR_APPLIED}",
+    f"j.availability <> 'active' AND NOT {_SAVED_OR_APPLIED}",
+)
+# The jobs of group `group` that need a target of `:tuple`, after job `:after`.
+_CREATION_PAGES: Final = tuple(
+    q(
+        "SELECT j.id, j.current_revision_id FROM jobs j "  # noqa: S608 (the constants above)
+        f"WHERE {group} AND {RETAINED_JOB_SQL} AND {NEEDS_TARGET_SQL} AND j.id > :after "
+        "ORDER BY j.id LIMIT :limit"
+    )
+    for group in CREATION_ORDER
 )
 _MISSING_PAGE: Final = q(
     "SELECT j.id, j.current_revision_id FROM jobs j "  # noqa: S608
@@ -1259,11 +1288,13 @@ async def create_chunk(
     bulk_operation_id: int | None,
     now: datetime,
 ) -> Counter[str]:
-    """`create_or_revive` of each `(job_id, revision_id)` of `jobs` (the caller locked their job rows); the
-    results counted by kind (`created`, `revived`, `unchanged`) and skip reason (`skipped_<reason>`)."""
+    """`create_or_revive` of each `(job_id, revision_id)` of `jobs` in job id order, whatever the caller's
+    (the caller locked their job rows): two chunks that overlap then meet each other's unique keys in one
+    order. The results counted: `created`, `revived`, `unchanged`, `skipped_<reason>`, and `state_<state>`
+    for the state of each created or revived target (Ruling T14-a)."""
     profile = int((await conn.execute(_PROFILE_OF, {"tuple": llm_tuple_id})).scalar_one())
     counts: Counter[str] = Counter()
-    for job_id, revision_id in jobs:
+    for job_id, revision_id in sorted(jobs):
         made = await create_or_revive(
             conn,
             job_id=job_id,
@@ -1274,7 +1305,17 @@ async def create_chunk(
             bulk_operation_id=bulk_operation_id,
             now=now,
         )
-        counts[f"skipped_{made.reason}" if isinstance(made, Skipped) else type(made).__name__.lower()] += 1
+        match made:
+            case Created(state=state):
+                counts["created"] += 1
+                counts[f"state_{state}"] += 1
+            case Revived(state=state):
+                counts["revived"] += 1
+                counts[f"state_{state}"] += 1
+            case Unchanged():
+                counts["unchanged"] += 1
+            case Skipped(reason=reason):
+                counts[f"skipped_{reason}"] += 1
     return counts
 
 
@@ -1313,47 +1354,67 @@ async def _request_batch(conn: AsyncConnection, *, llm_tuple_id: int, bulk_opera
     return operation_id
 
 
+@dataclass
+class _Progress:
+    """The operation's `{"done", "total"}`: counted once when an execution starts (the retained current
+    revisions, and those of them with a live target of the tuple), then moved on by each chunk's creations."""
+
+    done: int
+    total: int
+
+    def as_json(self) -> dict[str, JSONValue]:
+        return {"done": self.done, "total": self.total}
+
+
 @register_operation_handler(CREATE_TARGETS)
 async def create_targets_for_tuple(ctx: OperationContext) -> None:
     """The `create_targets_for_tuple` operation (module docstring)."""
     tuple_id = get_int(dict(ctx.claim.payload), "llm_tuple_id")
     bulk_operation_id = get_int(dict(ctx.claim.payload), "bulk_operation_id")
-    cursor = (-1, 0)
+    progress: _Progress | None = None
     totals: Counter[str] = Counter()
-    while True:
-        async with ctx.engine.begin() as conn:
-            active = await cycles.lock_active_scoring(conn)  # step 2
-            if active.llm_tuple_id != tuple_id:
-                await _end_obsolete(conn, ctx, tuple_id)
-                return
-            params = {"tuple": tuple_id, "rank": cursor[0], "after": cursor[1], "limit": CHUNK}
-            page = (await conn.execute(_CREATION_PAGE, params)).all()
-            await lock_jobs(conn, [int(row.id) for row in page])
-            await lock_operation_owner(conn, ctx.claim)  # step 5
-            counts = await create_chunk(
-                conn,
-                [(int(row.id), int(row.current_revision_id)) for row in page],
-                llm_tuple_id=tuple_id,
-                scope_version_id=active.scope_version_id,
-                bulk_operation_id=bulk_operation_id,
-                now=_clock(ctx),
-            )
-            progress = (await conn.execute(_PROGRESS, {"tuple": tuple_id})).one()
-            await set_progress(conn, ctx.claim, {"done": int(progress.done), "total": int(progress.total)})
-            if moved(counts):
-                await ranking.bump(conn)  # step 11, last
-        totals.update(counts)
-        if page:
+    for page_of_group in _CREATION_PAGES:
+        after = 0
+        while True:
+            async with ctx.engine.begin() as conn:
+                active = await cycles.lock_active_scoring(conn)  # step 2
+                if active.llm_tuple_id != tuple_id:
+                    await _end_obsolete(conn, ctx, tuple_id)
+                    return
+                if progress is None:
+                    counted = (await conn.execute(_PROGRESS, {"tuple": tuple_id})).one()
+                    progress = _Progress(done=int(counted.done), total=int(counted.total))
+                params = {"tuple": tuple_id, "after": after, "limit": CHUNK}
+                page = (await conn.execute(page_of_group, params)).all()
+                if not page:
+                    break
+                await lock_jobs(conn, [int(row.id) for row in page])  # step 4
+                await lock_operation_owner(conn, ctx.claim)  # step 5
+                counts = await create_chunk(
+                    conn,
+                    [(int(row.id), int(row.current_revision_id)) for row in page],
+                    llm_tuple_id=tuple_id,
+                    scope_version_id=active.scope_version_id,
+                    bulk_operation_id=bulk_operation_id,
+                    now=_clock(ctx),
+                )
+                progress.done = min(progress.total, progress.done + counts["created"] + counts["revived"])
+                await set_progress(conn, ctx.claim, progress.as_json())
+                if moved(counts):
+                    await ranking.bump(conn)  # step 11, last
+            totals.update(counts)
             await afault_point(AFTER_CHUNK_POINT)
-            cursor = (int(page[-1].rank), int(page[-1].id))
-        if len(page) < CHUNK:
-            break
+            if len(page) < CHUNK:
+                break
+            after = int(page[-1].id)
     async with ctx.engine.begin() as conn:
         active = await cycles.lock_active_scoring(conn)
         if active.llm_tuple_id != tuple_id:
             await _end_obsolete(conn, ctx, tuple_id)
             return
         await lock_operation_owner(conn, ctx.claim)
+        if progress is not None and not totals:  # no chunk had a job to create a target for
+            await set_progress(conn, ctx.claim, progress.as_json())
         batch = await _request_batch(conn, llm_tuple_id=tuple_id, bulk_operation_id=bulk_operation_id)
         await ctx.finish_in(conn, status="succeeded")
     log.info(

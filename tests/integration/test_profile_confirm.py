@@ -670,11 +670,20 @@ async def test_after_confirm_a_collect_run_creates_its_targets_and_i5_holds(
         "ok": True,
         "detail": {"llm_tuple_id": tuple_id, "revisions": made.n, "missing": 0},
     }
+    by_state = {
+        str(r.state): int(r.n)
+        for r in await rows(
+            engine,
+            "SELECT state, count(*) AS n FROM score_targets WHERE llm_tuple_id = :t GROUP BY state",
+            t=tuple_id,
+        )
+    }
     assert run.report["revisions"]["targets"] == {
         "created": made.n,
         "revived": 0,
         "cancelled": 0,
         "skipped": {},
+        "by_state": by_state,  # Ruling T14-a
     }
     assert ENQUEUE_TARGETS in run.report["execution"]["nodes"]
 

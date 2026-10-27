@@ -309,7 +309,19 @@ async def test_a_stale_live_creation_of_the_tuple_is_superseded_by_the_new_activ
     }
 
 
-async def _settings(conn: Any) -> Any:
-    from jobhunter.settings.dryrun import active_settings
-
-    return await active_settings(conn)
+async def test_activating_the_active_tuple_again_is_refused(engine: AsyncEngine) -> None:
+    # L4786: the callers skip an unchanged tuple; a call for one is a bug, refused before anything is written
+    async with engine.begin() as conn:
+        tuple_a = await activate_score_tuple(conn)
+    async with engine.begin() as conn:
+        with pytest.raises(ValueError, match="active one already"):
+            await targets.activate_tuple(
+                conn,
+                old_tuple_id=tuple_a,
+                new_tuple_id=tuple_a,
+                settings=await active_settings(conn),
+                now=utcnow(),
+                defer=None,
+            )
+    assert await scalar(engine, "SELECT count(*) FROM bulk_operations") == 0
+    assert await operations_of(engine, "create_targets_for_tuple") == []

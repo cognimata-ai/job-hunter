@@ -91,7 +91,7 @@ async def creation_order(engine: AsyncEngine, tuple_id: int) -> list[int]:
 
 
 async def test_active_jobs_come_first_then_the_saved_or_applied_then_the_rest(
-    engine: AsyncEngine, current_epoch: int, tuple_id: int, bulk_id: int
+    engine: AsyncEngine, current_epoch: int, tuple_id: int, bulk_id: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with engine.begin() as conn:
         made = {}
@@ -123,10 +123,23 @@ async def test_active_jobs_come_first_then_the_saved_or_applied_then_the_rest(
         )
         synthetic = await insert_job(conn, synthetic_eval=True)  # an adversarial golden case: never a target
         merged = await insert_job(conn, merged_into_job_id=made["rest_b"])
+    # chunks of two, so each chunk's jobs are what the order puts first among those left (within a chunk the
+    # targets are created in job id order)
+    chunks: list[set[int]] = []
+
+    async def after_chunk(name: str) -> None:
+        if name == AFTER_CHUNK:  # after the chunk's commit: what has a target now that had none before
+            chunks.append(set(await creation_order(engine, tuple_id)).difference(*chunks))
+
+    monkeypatch.setattr(targets, "CHUNK", 2)
+    monkeypatch.setattr(targets, "afault_point", after_chunk)
     ended = await run(engine, await request(engine, tuple_id, bulk_id), current_epoch)
     assert ended.status == "succeeded"
-    names = ["active_a", "active_b", "saved", "applied", "rest_a", "rest_b"]
-    assert await creation_order(engine, tuple_id) == [made[name] for name in names]
+    assert chunks == [
+        {made["active_a"], made["active_b"]},
+        {made["saved"], made["applied"]},
+        {made["rest_a"], made["rest_b"]},
+    ]
     assert {synthetic.job_id, merged.job_id}.isdisjoint(await creation_order(engine, tuple_id))
     assert ended.progress == {"done": 6, "total": 6}
     async with engine.connect() as conn:
