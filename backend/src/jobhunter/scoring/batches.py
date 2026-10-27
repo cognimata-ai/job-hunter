@@ -1,9 +1,11 @@
 """The score lane's batch submissions (spec §10.10, §7.12, §6.9.3, §12.6 (e); plan Tasks 14 and 16, Rulings
-P14, P16, P52, T7-c, T7-d, T16-a, T16-c, T16-d, Codex r1 #18, #22-#25, r2 B7-B15, r3 B1-B3, r4 B1, B8, B9,
-r5 B1, A1 issue 17,
+P14, P16, P52, T7-c, T7-d, T16-a, T16-c, T16-d, T16-e, Codex r1 #18, #22-#25, r2 B7-B15, r3 B1-B3, r4 B1, B8,
+B9, r5 B1, A1 issue 17,
 A2 B10, B13, B14, Deviations 12, 13, 27 and 38): Task 14 records the cancellation a tuple supersession asks
 for; Task 16 adds the submission lifecycle up to the provider's answer (Task 17 polls, decides the items,
-adopts an ambiguous submission and releases a quarantined one).
+adopts an ambiguous submission and releases a quarantined one). This module is the submission state machine;
+its worker side (the `batch_submit` handler, the takeover sweep and the tick reconciler) is
+`scoring.batch_operations` (Ruling T16-e).
 
 **The cancellation** (Task 14). `request_cancel(conn, *, llm_tuple_id, now) -> RequestedCancel`, in the
 caller's transaction (the tuple activation's, which holds `active_config FOR UPDATE` and has already taken the
@@ -122,11 +124,11 @@ s.operation_claim_id AND o.worker_epoch >= :epoch`), locked `FOR UPDATE`: a `pre
 `submit_started` one becomes `submit_ambiguous` with `{"error_class": "execution_lost"}` and is **never
 resent**, whether the execution died before or after the HTTP send (the ambiguous reconciler of Task 17 finds
 the batch if it was created, or the user releases it). The caller holds `fence_epoch` and `active_config FOR
-SHARE` first. It runs in the takeover sweep `batch_submissions` (today in the takeover's transaction; Task 27
-gives each sweep its own), in the `batch_submit` handler's first transaction (its own operation's rows), and
-in the tick reconciler `batch_submissions`, which takes no lock on a pass whose lock-free read finds no
-candidate. An operation's failure hook cannot do it (the hook runs after the operation row, and
-`active_config` comes first), so a row left by an operation that ended `failed` waits for the next tick.
+SHARE` first. It runs in the takeover sweep `batch_submissions`, in the `batch_submit` handler's first
+transaction (its own operation's rows), and in the tick reconciler `batch_submissions`, all three
+`scoring.batch_operations`'; `any_lost` is the reconciler's lock-free probe. An operation's failure hook
+cannot do it (the hook runs after the operation row, and `active_config` comes first), so a row left by an
+operation that ended `failed` waits for the next tick.
 
 **The follow-on** (`follow_on`, L3945, Codex r2 B15, A2 B13): keyed by the originating submission, once, when
 it ends `submit_rejected`, `abandoned` or `reconciled` unreleased, or at the release of a `released` one
@@ -149,25 +151,12 @@ once every chunk is done), and at least `batch_min_targets` of its targets are e
 `{"bulk_operation_id", "llm_tuple_id"}` under the dedup key `batch_submit:<bulk>:resume` (`create_operation`:
 one live request at most). The prepare re-checks every gate.
 
-**The `batch_submit` handler**, payload `{"bulk_operation_id", "llm_tuple_id"}`: (1) `recover_lost` of its own
-operation, (2) the four sweeps of the tuple (expiry, refilter, regroup and exhaustion, L3939, Deviation 7) in
-a transaction of their own, (3) `prepare` (a `NotPrepared` ends the operation `succeeded` with `progress =
-{"skipped": reason}`), the fault point
-`batch.after_prepare_commit`, (4) `submit_start` (an abandoned submission ends the operation), the fault
-point `batch.after_submit_start`, (5) the owner and the `submit_started` row checked again (a reclaimed
-execution sends nothing), (6) `BatchesClient.create` outside any transaction, the fault point
-`batch.after_create`, (7) `record_created | record_rejected | record_ambiguous` (retried, above), then the
-carried cancel, and (8) `finish_in(succeeded)` with `progress = {"submission_id", "state", "request_count"}`.
-The client is built from today's `OperationDeps` fields (`cfg`, `gateway.http_client`, `clock`, and the
-gateway's `monotonic` and `sleep` for the create's own retries; Task 27 moves it into
-`OperationDeps.batches_client`).
-
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -177,24 +166,19 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.clock import utcnow
 from jobhunter.db import ranking
 from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import is_unique_violation, q
 from jobhunter.db.transitions import transition, transition_where
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
-from jobhunter.graphs.sanitize import DB_RETRY, db_retry_interval, is_retryable_db_error
 from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.batches import (
     CONNECT_FAILED_BEFORE_SEND,
     SUBMIT_REJECTED,
     Ambiguous,
-    BatchApiError,
-    BatchesClient,
     BatchRequest,
     Created,
-    CreateOutcome,
     Rejected,
 )
 from jobhunter.llm.bounds import text_input_bound
@@ -215,18 +199,14 @@ from jobhunter.scoring import cycles, steps, targets
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.settings.model import Settings
-from jobhunter.types import JSONValue, get_int
-from jobhunter.worker.epoch import fence_epoch, register_takeover_sweep
+from jobhunter.types import JSONValue
 from jobhunter.worker.operations import (
     OperationClaim,
-    OperationContext,
     create_operation,
     lock_operation_owner,
-    register_operation_handler,
-    set_progress,
 )
-from jobhunter.worker.reconcilers import ReconcileContext, reconciler
-from jobhunter.worker.tasks import Deferrer, defer_in_tx
+from jobhunter.worker.reconcilers import ReconcileContext
+from jobhunter.worker.tasks import Deferrer
 
 # The submissions of a tuple that are not terminal (§7.16.6): `bulk.BATCH_IN_FLIGHT`, defined once in `llm`.
 IN_FLIGHT: Final = bulk.BATCH_IN_FLIGHT
@@ -234,13 +214,10 @@ KIND: Final = "batch_submit"
 # Deviation 27, A2 B14: the rendered requests of one submission, below the provider's 256 MB.
 BATCH_MAX_BYTES: Final = 200 * 1024 * 1024
 BATCH_TTL: Final = timedelta(hours=24)  # L3954: `expires_at = created_at + 24 h`
-# The fault points of the lifecycle (module docstring).
+# The fault points of the state machine (the handler's are `scoring.batch_operations`').
 BEFORE_OWNER_LOCK: Final = "batch.before_owner_lock"
 AFTER_CANDIDATES: Final = "batch.after_candidates"
-AFTER_PREPARE_COMMIT: Final = "batch.after_prepare_commit"
 BEFORE_SUBMIT_START: Final = "batch.before_submit_start"
-AFTER_SUBMIT_START: Final = "batch.after_submit_start"
-AFTER_CREATE: Final = "batch.after_create"
 # The codes this module records.
 EXECUTION_LOST: Final = "execution_lost"
 ABANDONED_DETAIL: Final = "batch_abandoned"
@@ -380,9 +357,6 @@ _FOLLOW_ON_OF: Final = q(
 )
 _MARK_FOLLOW_ON: Final = q(
     "UPDATE batch_submissions SET follow_on_at = now() WHERE id = :s AND follow_on_at IS NULL RETURNING id"
-)
-_OWN_EPOCH: Final = q(
-    "SELECT worker_epoch FROM operations WHERE id = :i AND claim_id = :c AND status = 'running'"
 )
 _RECORD: Final = q(
     "UPDATE batch_submissions SET cancel_requested_at = coalesce(cancel_requested_at, :now) "
@@ -1225,184 +1199,7 @@ async def rerequest(conn: AsyncConnection, bulk_operation_id: int, ctx: Reconcil
     return created
 
 
-@register_takeover_sweep("batch_submissions")
-async def sweep_lost_submissions(conn: AsyncConnection, epoch: int) -> int:
-    """At takeover: the submissions of every lost execution recovered (module docstring), after
-    `fence_epoch` and `active_config FOR SHARE`; how many."""
-    await fence_epoch(conn, epoch)
-    await cycles.lock_active_scoring(conn)
-    recovered = await recover_lost(conn, epoch=epoch, now=utcnow(), defer=defer_in_tx)
-    return recovered.abandoned + recovered.ambiguous
-
-
-@reconciler("batch_submissions", "tick")
-async def reconcile_batch_submissions(ctx: ReconcileContext) -> int:
-    """The tick's recovery of lost executions (module docstring): a lock-free read first, then, only when it
-    finds a candidate, `fence_epoch`, `active_config FOR SHARE` and `recover_lost`; how many it moved. The
-    worker's own `FencedOut` propagates (Ruling FR-w), another owner's ends the pass with 0."""
-    try:
-        async with ctx.engine.connect() as conn:
-            if (await conn.execute(_ANY_LOST, {"epoch": ctx.epoch})).first() is None:
-                return 0
-        async with ctx.engine.begin() as conn:
-            await fence_epoch(conn, ctx.epoch)
-            await cycles.lock_active_scoring(conn)
-            recovered = await recover_lost(conn, epoch=ctx.epoch, now=ctx.now, defer=ctx.defer)
-    except FencedOut as fenced:
-        if fenced.worker_superseded:
-            raise
-        return 0
-    return recovered.abandoned + recovered.ambiguous
-
-
-# ---- the batch_submit handler ------------------------------------------------------------------------------
-
-
-async def _sweep(conn: AsyncConnection, *, llm_tuple_id: int, now: datetime) -> None:
-    """The four sweeps of the tuple, as online admission runs them (`admission.admit`'s pre-lock first)."""
-    active = await cycles.lock_active_scoring(conn)
-    if active.llm_tuple_id != llm_tuple_id:
-        return  # the preparation ends tuple_superseded
-    max_age = await targets.active_max_ad_age_days(conn)
-    held = await targets.lock_hold_candidates(
-        conn, llm_tuple_id=llm_tuple_id, max_ad_age_days=max_age, now=now
-    )
-    moved = (
-        await targets.expiry_sweep(
-            conn, llm_tuple_id=llm_tuple_id, max_ad_age_days=max_age, now=now, held=held
-        )
-    ).moved
-    moved += (
-        await targets.refilter_sweep(
-            conn, llm_tuple_id=llm_tuple_id, scope_version_id=active.scope_version_id
-        )
-    ).moved
-    moved += (await targets.regroup_sweep(conn, llm_tuple_id=llm_tuple_id)).moved
-    moved += await targets.exhaustion_sweep(conn, llm_tuple_id=llm_tuple_id, held=held)
-    if moved:
-        await ranking.bump(conn)  # step 11, last
-
-
-async def _end(ctx: OperationContext, conn: AsyncConnection, progress: Mapping[str, JSONValue]) -> None:
-    await set_progress(conn, ctx.claim, progress)
-    await ctx.finish_in(conn, status="succeeded")
-
-
-@register_operation_handler(KIND)
-async def batch_submit(ctx: OperationContext) -> None:
-    """The `batch_submit` operation (module docstring)."""
-    deps = ctx.deps
-    if deps is None:
-        raise RuntimeError("batch_submit needs the worker's operation dependencies")
-    payload = dict(ctx.claim.payload)
-    bulk_operation_id = get_int(payload, "bulk_operation_id")
-    llm_tuple_id = get_int(payload, "llm_tuple_id")
-    clock = deps.clock
-    client = BatchesClient(
-        deps.cfg,
-        http_client=deps.gateway.http_client,
-        clock=clock,
-        monotonic=deps.gateway.monotonic,
-        sleep=deps.gateway.sleep,
-    )
-    async with ctx.engine.begin() as conn:  # 1. this operation's lost executions
-        epoch = (
-            await conn.execute(_OWN_EPOCH, {"i": ctx.claim.operation_id, "c": ctx.claim.claim_id})
-        ).scalar_one_or_none()
-        if epoch is None:
-            raise FencedOut("operation")
-        await fence_epoch(conn, int(epoch))
-        await cycles.lock_active_scoring(conn)
-        await recover_lost(
-            conn, epoch=int(epoch), operation_id=ctx.claim.operation_id, now=clock(), defer=defer_in_tx
-        )
-    if not client.configured:
-        async with ctx.engine.begin() as conn:
-            await ctx.finish_in(conn, status="failed", error_code="llm_not_configured")
-        return
-    async with ctx.engine.begin() as conn:  # 2. the sweeps
-        await _sweep(conn, llm_tuple_id=llm_tuple_id, now=clock())
-    async with ctx.engine.begin() as conn:  # 3. the preparation
-        await cycles.lock_active_scoring(conn)
-        prepared = await prepare(
-            conn,
-            bulk_operation_id=bulk_operation_id,
-            llm_tuple_id=llm_tuple_id,
-            operation=ctx.claim,
-            settings=await active_settings(conn),
-            fake_llm=deps.cfg.fake_llm,
-            gateway=deps.gateway,
-            now=clock(),
-        )
-        if isinstance(prepared, NotPrepared):
-            await _end(ctx, conn, {"skipped": prepared.reason})
-            return
-    s = prepared.submission_id
-    await afault_point(AFTER_PREPARE_COMMIT)
-    async with ctx.engine.begin() as conn:  # 4. submit-start
-        started = await submit_start(conn, s, operation=ctx.claim, now=clock(), defer=defer_in_tx)
-    if started == "abandoned":
-        async with ctx.engine.begin() as conn:
-            await _end(ctx, conn, {"submission_id": s, "state": "abandoned"})
-        return
-    await afault_point(AFTER_SUBMIT_START)
-    async with ctx.engine.begin() as conn:  # 5. still this execution's to send
-        await check_sendable(conn, s, operation=ctx.claim)
-    outcome = await client.create(prepared.requests)  # 6. outside any transaction
-    await afault_point(AFTER_CREATE)
-    state, cancel_due = await _record(ctx, s, outcome, now=clock(), sleep=deps.gateway.sleep)  # 7.
-    if cancel_due and isinstance(outcome, Created):
-        try:
-            await client.cancel(outcome.provider_batch_id)
-        except BatchApiError as failure:  # batch_poll sends it again (Task 17)
-            log.warning(
-                "batch_cancel_failed", submission_id=s, error_class=failure.error_class, status=failure.status
-            )
-    async with ctx.engine.begin() as conn:  # 8.
-        await _end(ctx, conn, {"submission_id": s, "state": state, "request_count": prepared.request_count})
-
-
-async def _record(
-    ctx: OperationContext,
-    submission_id: int,
-    outcome: CreateOutcome,
-    *,
-    now: datetime,
-    sleep: Callable[[float], Awaitable[object]],
-) -> tuple[str, bool]:
-    """The recording transaction of the create's outcome, retried on a retryable database error (module
-    docstring), `sleep` waiting out `DB_RETRY`'s interval; the submission's state and whether a cancel is
-    due."""
-    tries = 0
-    while True:
-        tries += 1
-        try:
-            return await _record_once(ctx, submission_id, outcome, now=now)
-        except sa.exc.DBAPIError as exc:
-            if tries >= DB_RETRY.max_attempts or not is_retryable_db_error(exc):
-                raise
-            log.warning(
-                "batch_record_retried",
-                submission_id=submission_id,
-                tries=tries,
-                error_class=type(exc).__name__,
-            )
-        await sleep(db_retry_interval(tries))
-
-
-async def _record_once(
-    ctx: OperationContext, submission_id: int, outcome: CreateOutcome, *, now: datetime
-) -> tuple[str, bool]:
-    async with ctx.engine.begin() as conn:
-        match outcome:
-            case Created():
-                due = await record_created(conn, submission_id, outcome, operation=ctx.claim, now=now)
-                return "submitted", due
-            case Rejected():
-                await record_rejected(
-                    conn, submission_id, outcome, operation=ctx.claim, now=now, defer=defer_in_tx
-                )
-                return "submit_rejected", False
-            case Ambiguous():
-                await record_ambiguous(conn, submission_id, outcome, operation=ctx.claim, now=now)
-                return "submit_ambiguous", False
+async def any_lost(conn: AsyncConnection, *, epoch: int) -> bool:
+    """Whether a submission of a lost execution exists (`recover_lost`'s predicate), read without a lock: the
+    tick reconciler's probe (`scoring.batch_operations`)."""
+    return (await conn.execute(_ANY_LOST, {"epoch": epoch})).first() is not None

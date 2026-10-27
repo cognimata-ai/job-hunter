@@ -27,6 +27,7 @@ from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.batches import BatchesClient, Rejected
 from jobhunter.llm.fake import BatchScript
 from jobhunter.observability.alerts import resolve_alert
+from jobhunter.scoring import batch_operations as batch_ops
 from jobhunter.scoring import batches as batches_mod
 from jobhunter.settings.model import ModelPolicy
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
@@ -150,7 +151,7 @@ async def test_c19_crash_before_submit_start_abandons(
     assert [op.payload["after_submission_id"] for op in follow_on] == [sub.id]  # the follow-on of 4d
 
 
-@pytest.mark.parametrize("point", [batches_mod.AFTER_SUBMIT_START, batches_mod.AFTER_CREATE])
+@pytest.mark.parametrize("point", [batch_ops.AFTER_SUBMIT_START, batch_ops.AFTER_CREATE])
 async def test_a_lost_execution_after_submit_started_becomes_ambiguous_and_is_never_resent(
     engine: AsyncEngine,
     op_runner: OpRunner,
@@ -162,7 +163,7 @@ async def test_a_lost_execution_after_submit_started_becomes_ambiguous_and_is_ne
 ) -> None:
     """Codex r1 #23 (both sides of the send), Ruling P16: the adoption half is Task 17's."""
     fake_llm.batches(BatchScript(create="ok", polls_until_ended=0))  # ended, a line per custom_id, if created
-    monkeypatch.setattr(batches_mod, "afault_point", raising_at(point))
+    monkeypatch.setattr(batch_ops, "afault_point", raising_at(point))
     await op_runner.run_pending()  # the execution dies with the row submit_started
     (sub,) = await submission_rows(engine)
     assert sub.state == "submit_started"
@@ -170,13 +171,13 @@ async def test_a_lost_execution_after_submit_started_becomes_ambiguous_and_is_ne
     (sub,) = await submission_rows(engine)
     assert (sub.state, sub.reconcile_report) == ("submit_ambiguous", {"error_class": "execution_lost"})
     assert states(await batch_ledger(engine)) == ["dispatched"] * N
-    monkeypatch.setattr(batches_mod, "afault_point", no_fault)
+    monkeypatch.setattr(batch_ops, "afault_point", no_fault)
     op_runner.epoch = 2
     await make_due(engine)
     await op_runner.run_pending()  # the operation recovers, never resends
     (sub,) = await submission_rows(engine)
     assert sub.state == "submit_ambiguous" and states(await batch_ledger(engine)) == ["dispatched"] * N
-    assert len(fake_llm.state.batches) == (1 if point == batches_mod.AFTER_CREATE else 0)
+    assert len(fake_llm.state.batches) == (1 if point == batch_ops.AFTER_CREATE else 0)
     assert await count_rows(engine, "score_targets", state="in_batch") == N  # quarantined, not released
     (op,) = await operations_of(engine, "batch_submit")
     assert (op.status, op.progress) == ("succeeded", {"skipped": "ambiguous"})
@@ -251,7 +252,7 @@ async def test_a_cancel_requested_during_the_send_reaches_the_provider(
     """Codex r1 #24: a confirm during the send records the request; `record_created` carries it and the
     worker calls `messages.batches.cancel` right after the commit."""
     fake_llm.batches(BatchScript(create="ok", polls_until_ended=5))
-    pause = PausePoint(batches_mod.AFTER_SUBMIT_START)
+    pause = PausePoint(batch_ops.AFTER_SUBMIT_START)
     assert setup.operation_id is not None
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 60)
@@ -272,7 +273,7 @@ async def test_a_tuple_superseded_before_submit_start_abandons_and_sends_nothing
     cancel was requested since the prepare; nothing obsolete is dispatched, and its bulk operation, cancelled,
     requests no follow-on."""
     fake_llm.batches(BatchScript(create="ok"))
-    pause = PausePoint(batches_mod.AFTER_PREPARE_COMMIT)
+    pause = PausePoint(batch_ops.AFTER_PREPARE_COMMIT)
     assert setup.operation_id is not None
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 60)
@@ -298,7 +299,7 @@ async def test_a_global_purge_fence_before_submit_start_abandons_and_sends_nothi
     `skipped: paused` and prepares nothing; once the fence is released, the `bulk_operations` reconciler
     requests the batch again (Ruling T16-d), once, and it is submitted."""
     fake_llm.batches(BatchScript(create="ok"))
-    pause = PausePoint(batches_mod.AFTER_PREPARE_COMMIT)
+    pause = PausePoint(batch_ops.AFTER_PREPARE_COMMIT)
     assert setup.operation_id is not None
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 60)

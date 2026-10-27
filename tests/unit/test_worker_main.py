@@ -660,7 +660,8 @@ M2_RECONCILERS = {
 # The M3 reconcilers so far: `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
 # `score_targets` and `score_cycles`; Ruling P44), `expiry_sweep` and `budget_release` (Task 13,
 # `scoring.targets`), `bulk_operations` (Task 14, `llm.bulk`, through `scoring.cycles`) and
-# `missing_targets` (Task 14, `scoring.targets`), and `batch_submissions` (Task 16, `scoring.batches`).
+# `missing_targets` (Task 14, `scoring.targets`), and `batch_submissions` (Task 16, `scoring.batch_operations`
+# since Ruling T16-e).
 M3_RECONCILERS = {
     "orphaned_cycles": ["tick"],
     "expiry_sweep": ["heavy"],
@@ -678,7 +679,8 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, and Task 16's
     `batch_submissions`), the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile`
     (Task 19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, M3 Task 14's
-    `create_targets_for_tuple` (`scoring.targets`) and Task 16's `batch_submit` (`scoring.batches`) handlers,
+    `create_targets_for_tuple` (`scoring.targets`) and Task 16's `batch_submit` (`scoring.batch_operations`,
+    Ruling T16-e) handlers,
     and the failure hooks of the two profile phases and of the query proposal (`embed_profile` has none: it
     drives no domain row), and the `bulk_operations` reconciler's one active step, Task 16's `rerequest`
     (Ruling T16-d, `bulk.register_active_step`). `embed_profile`, `propose_queries` and the `profile_vectors`

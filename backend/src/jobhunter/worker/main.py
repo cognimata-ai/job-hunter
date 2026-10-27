@@ -164,8 +164,11 @@ _REGISTERING_MODULES: Final = (
     # `expiry_sweep` and `budget_release` (M3 Task 13), `missing_targets` and the `create_targets_for_tuple`
     # handler (Task 14); `llm.bulk`'s `bulk_operations` comes with `scoring.cycles`
     "jobhunter.scoring.targets",
-    # the `batch_submit` handler, the `batch_submissions` takeover sweep and tick reconciler (Task 16)
+    # the `bulk_operations` reconciler's active step `rerequest` (Task 16)
     "jobhunter.scoring.batches",
+    # the `batch_submit` handler, the `batch_submissions` takeover sweep and tick reconciler (Task 16, Ruling
+    # T16-e: the submission state machine's worker side)
+    "jobhunter.scoring.batch_operations",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

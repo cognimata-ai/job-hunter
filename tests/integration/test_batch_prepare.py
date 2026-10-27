@@ -46,6 +46,7 @@ from jobhunter.llm.spend_ledger import (
     reserve,
     reserve_batch,
 )
+from jobhunter.scoring import batch_operations as batch_ops
 from jobhunter.scoring import batches as batches_mod
 from jobhunter.scoring import cycles, steps
 from jobhunter.scoring import targets as targets_mod
@@ -1185,7 +1186,7 @@ async def test_a_reclaimed_execution_cannot_prepare_or_send(
     await asyncio.wait_for(running, 60)  # FencedOut at lock_operation_owner: lost, nothing written
     assert await batch_rows(engine) == (0, 0, 0, 0)
 
-    old = PausePoint(batches_mod.AFTER_SUBMIT_START)  # the next execution, paused after its submit-start
+    old = PausePoint(batch_ops.AFTER_SUBMIT_START)  # the next execution, paused after its submit-start
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=old))
     await asyncio.wait_for(old.reached.wait(), 120)
     (sub,) = await submission_rows(engine)
@@ -1227,7 +1228,7 @@ async def test_recovery_is_independent_of_the_sweep_order(
     else:
         sweeps = {**sweeps, "batch_submissions": batch_sweep}
     monkeypatch.setattr(epoch_module, "_SWEEPS", sweeps)
-    pause = PausePoint(batches_mod.AFTER_SUBMIT_START)
+    pause = PausePoint(batch_ops.AFTER_SUBMIT_START)
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 120)
     epoch, counts = await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))
@@ -1249,7 +1250,7 @@ async def test_the_tick_reconciler_recovers_a_row_a_failed_operation_left(
     fake_llm.batches(BatchScript(create="ok"))
     setup = await bulk_with_targets(engine, 200)
     assert setup.operation_id is not None
-    pause = PausePoint(batches_mod.AFTER_PREPARE_COMMIT)
+    pause = PausePoint(batch_ops.AFTER_PREPARE_COMMIT)
     running = asyncio.create_task(op_runner.run_one(setup.operation_id, pause=pause))
     await asyncio.wait_for(pause.reached.wait(), 120)
     assert await run_reconciler("batch_submissions", engine, now=utcnow(), epoch=1) == 0  # its owner lives
