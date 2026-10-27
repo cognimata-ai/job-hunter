@@ -216,7 +216,11 @@ async def test_a_confirmed_profiles_proposal_reaches_ready(engine, op_runner, lo
     version_id, proposal_id, op_id = await proposed(engine, logged_in_client)
     running = await logged_in_client.get(f"{URL}/{proposal_id}")
     assert running.json() == {"status": "running", "items": None}
-    assert await op_runner.run_pending() == [op_id]
+    async with engine.connect() as conn:  # the activation's own operation (M3 Task 14) runs first
+        creation = (
+            await conn.execute(sa.text("SELECT id FROM operations WHERE kind = 'create_targets_for_tuple'"))
+        ).scalar_one()
+    assert await op_runner.run_pending() == [creation, op_id]
     proposal, op = await proposal_row(engine, proposal_id), await operation_of(engine, proposal_id)
     assert proposal.status == "ready" and 6 <= len(proposal.items["queries"]) <= 16
     assert proposal.items == {"queries": QUERIES}  # every item of the synthetic set is valid

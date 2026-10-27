@@ -868,7 +868,11 @@ async def test_a_fault_between_llm_tuple_and_scope_rolls_both_back(
     assert r.status_code == 500 and r.json()["code"] == "internal"
     assert await active_row(engine) == before and await generation(engine) == generation_before
     assert await count_rows(engine, "llm_tuples") == 1  # the active profile's own tuple only
-    assert await count_rows(engine, "settings_versions") == 1 and await count_rows(engine, "operations") == 0
+    assert await count_rows(engine, "settings_versions") == 1
+    # the active profile's activation recorded its create_targets_for_tuple and bulk operation (M3 Task 14)
+    assert await count_rows(engine, "operations", kind=("apply_scope",)) == 0
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 1
+    assert await count_rows(engine, "bulk_operations") == 1
     assert await count_rows(engine, "api_idempotency") == 0  # the key's claim rolled back with the rest
     monkeypatch.setattr(save_module, "afault_point", no_fault)
     r = await post(logged_in_client, request, key="fault-key-000000001")  # the client's retry
@@ -878,6 +882,10 @@ async def test_a_fault_between_llm_tuple_and_scope_rolls_both_back(
     assert after.llm_tuple_id != before.llm_tuple_id and after.pending_scope_version_id is not None
     assert await count_rows(engine, "llm_tuples") == 2 and await generation(engine) == generation_before + 1
     assert [op[0] for op in await apply_scope_operations(engine)] == ["pending"]
+    # the new tuple's activation (M3 Task 14): the old bulk operation cancelled, a new one and its creation
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 2
+    assert await count_rows(engine, "bulk_operations", state=("cancelled",)) == 1
+    assert await count_rows(engine, "bulk_operations", state=("active",)) == 1
 
 
 async def test_llm_tuple_and_scope_commit_together(logged_in_client, engine, monkeypatch) -> None:
@@ -890,11 +898,16 @@ async def test_llm_tuple_and_scope_commit_together(logged_in_client, engine, mon
     task = asyncio.create_task(post(logged_in_client, request))
     await asyncio.wait_for(pause.reached.wait(), 10)
     # the tuple row and the model-policy flip are written, uncommitted: another connection sees neither
-    assert await count_rows(engine, "llm_tuples") == 1 and await count_rows(engine, "operations") == 0
+    assert await count_rows(engine, "llm_tuples") == 1
+    assert await count_rows(engine, "operations", kind=("apply_scope",)) == 0
+    # the active profile's own activation recorded one create_targets_for_tuple (M3 Task 14)
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 1
     pause.resume()
     r = await task
     assert r.status_code == 201, r.text
-    assert await count_rows(engine, "llm_tuples") == 2 and await count_rows(engine, "operations") == 1
+    assert await count_rows(engine, "llm_tuples") == 2
+    assert await count_rows(engine, "operations", kind=("apply_scope",)) == 1
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 2
 
 
 async def test_llm_tuple_and_budget_bump_once_after_the_budget_action(

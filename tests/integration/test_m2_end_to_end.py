@@ -199,7 +199,8 @@ async def test_profile_and_settings_flow_on_the_fake_llm(
     )
     assert apply_op.status == "succeeded"
 
-    # 7. A manual collect run on the fake sources succeeds, with I5 on the active tuple.
+    # 7. A manual collect run on the fake sources succeeds, its targets created by node 9 for the active
+    # tuple, and I5 holds on them (M3 Task 14).
     r = await client.post("/api/runs", json={"include_paid": False}, headers=idem(fresh_key("run-now")))
     assert r.status_code == 202 and r.json()["created"] is True, (r.status_code, r.text)
     run_id = int(r.json()["run"]["id"])
@@ -207,9 +208,13 @@ async def test_profile_and_settings_flow_on_the_fake_llm(
     assert await runs.execute_run(engine, compiled, run_id, 1, epoch=current_epoch) == "started"
     (run,) = await rows(engine, "SELECT status, status_reason, report FROM runs WHERE id = :r", r=run_id)
     assert (run.status, run.status_reason) == ("succeeded", None)
+    (made,) = await rows(
+        engine, "SELECT count(*) AS n FROM score_targets WHERE llm_tuple_id = :t", t=tuple_id
+    )
+    assert made.n > 0
     assert run.report["execution"]["invariants"]["I5"] == {
         "ok": True,
-        "detail": {"llm_tuple_id": tuple_id, "targets": "m3"},
+        "detail": {"llm_tuple_id": tuple_id, "revisions": made.n, "missing": 0},
     }
     assert all(v["ok"] for v in run.report["execution"]["invariants"].values())
     fetched = await rows(

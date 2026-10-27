@@ -15,6 +15,13 @@
   llm_tuple_id)`;
 - `active_row(engine)` and `generation(engine)`: the `active_config` row and the ranking generation.
 
+M3 Task 14: `activate_profile` runs the tuple activation as the confirm does (`targets.activate_tuple`: the
+old tuple's work cancelled, the bulk operation opened and `create_targets_for_tuple` recorded, its job left to
+the `operations` reconciler); `confirm_new_profile(engine, seniority=…)` confirms a ready draft of the
+synthetic profile at that seniority through `activation.confirm_draft` itself, in a transaction of its own
+holding `active_config FOR UPDATE` as the route does (its jobs deferred through the process's task app), and
+returns `(profile_version_id, llm_tuple_id)`.
+
 Task 18 adds the scope apply's side:
 - `active_scope_id(engine)`, `pending_scope_id(engine)`: the two scope pointers of `active_config`;
 - `scope_ids_of(engine, *saved)`: the scope version of each saved version (a save's 201 body), in order;
@@ -60,8 +67,10 @@ from jobhunter.clock import utcnow
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.transitions import transition
 from jobhunter.llm.schemas.profile import ConfirmedProfile
+from jobhunter.profile import activation
+from jobhunter.scoring import targets
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
-from jobhunter.settings.dryrun import dry_run
+from jobhunter.settings.dryrun import active_settings, dry_run
 from jobhunter.settings.model import Settings
 from jobhunter.settings.save import SaveRequest, ensure_tuple, save_settings
 from jobhunter.worker.tasks import defer_in_tx, job_task_name, make_queue_app
@@ -236,9 +245,42 @@ async def activate_profile(engine: AsyncEngine, *, seniority: str = "senior") ->
                 "confirm_response": {"profile_version_id": version},
             },
         )
-        model_policy_id = int((await conn.execute(_ACTIVE)).one().model_policy_id)
-        tuple_id = await ensure_tuple(conn, profile_version_id=version, model_policy_id=model_policy_id)
+        active = (await conn.execute(_ACTIVE)).one()
+        tuple_id = await ensure_tuple(
+            conn, profile_version_id=version, model_policy_id=int(active.model_policy_id)
+        )
         await conn.execute(_ACTIVATE, {"pv": version, "t": tuple_id})
+        if tuple_id != active.llm_tuple_id:
+            await targets.activate_tuple(
+                conn,
+                old_tuple_id=active.llm_tuple_id,
+                new_tuple_id=tuple_id,
+                settings=await active_settings(conn),
+                now=utcnow(),
+                defer=None,
+            )
+    return version, tuple_id
+
+
+async def confirm_new_profile(engine: AsyncEngine, *, seniority: str = "lead") -> tuple[int, int]:
+    """A ready draft of the synthetic profile at `seniority`, confirmed through `confirm_draft` (module
+    docstring); `(profile_version_id, llm_tuple_id)`."""
+    profile_json = ConfirmedProfile.model_validate(
+        {**SYNTHETIC_PROFILE, "seniority": seniority}
+    ).model_dump_json()
+    digest = hashlib.sha256(profile_json.encode("utf-8")).digest()
+    async with engine.begin() as conn:
+        cv = (await conn.execute(_CV_FILE, {"h": digest})).scalar_one()
+        draft = (await conn.execute(_DRAFT, {"cv": cv, "h": digest, "profile": profile_json})).scalar_one()
+    async with engine.begin() as conn:
+        await conn.execute(_LOCK_ACTIVE)  # the route's first lock (§9.1)
+        status, body = await activation.confirm_draft(
+            conn, int(draft), expected_rescore_ack=True, now=utcnow(), defer=defer_in_tx
+        )
+        assert status == 201, body
+        tuple_id = int((await conn.execute(_ACTIVE)).one().llm_tuple_id)
+    version = body["profile_version_id"]
+    assert isinstance(version, int)
     return version, tuple_id
 
 

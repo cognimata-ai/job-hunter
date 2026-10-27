@@ -89,6 +89,7 @@ async def test_a_proposal_without_a_key_fails_llm_not_configured(
     engine: AsyncEngine, logged_in_client: httpx.AsyncClient, keyless: OpRunner
 ) -> None:
     await activate_profile(engine)
+    months = await count_rows(engine, "llm_budget")  # the activation's bulk operation opened the month's row
     r = await logged_in_client.post("/api/profile/query-proposals", headers=idem(fresh_key("proposal")))
     assert r.status_code == 202, r.text
     proposal_id = int(r.json()["proposal_id"])
@@ -101,4 +102,4 @@ async def test_a_proposal_without_a_key_fails_llm_not_configured(
     op = await operation(engine, "propose_queries")
     assert (op.status, op.last_error_code, op.attempts) == ("failed", LLM_NOT_CONFIGURED, 0)
     assert await llm_rows(engine, "propose_queries") == (0, 0)
-    assert await count_rows(engine, "llm_budget") == 0
+    assert await count_rows(engine, "llm_budget") == months  # the refused proposal wrote none

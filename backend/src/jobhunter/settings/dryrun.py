@@ -86,9 +86,11 @@ _ACTIVE_PAYLOAD: Final = q(
     "WHERE a.id = 1"
 )
 # Retained jobs (tombstones are M5's) that a re-score would create targets for: unmerged, with a current
-# revision (§12.6, `create_targets_for_tuple`).
+# revision, not an adversarial golden case (§12.6, `create_targets_for_tuple`'s `targets.RETAINED_JOB_SQL`,
+# Codex r1 #32).
 _RETAINED_CURRENT_REVISIONS: Final = q(
-    "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND current_revision_id IS NOT NULL"
+    "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND current_revision_id IS NOT NULL "
+    "AND NOT synthetic_eval"
 )
 _EVALUATION_POLICY_RATE: Final = q(
     "SELECT projected_critic_rate FROM evaluation_policies WHERE policy_hash = :h"
@@ -143,8 +145,8 @@ async def unknown_references(conn: AsyncConnection, settings: Settings) -> list[
 
 
 async def count_retained_current_revisions(conn: AsyncConnection) -> int:
-    """The current revisions of retained jobs: unmerged jobs with a current revision (the targets of a
-    re-score)."""
+    """The current revisions of retained jobs: unmerged, non-synthetic jobs with a current revision (the
+    targets of a re-score)."""
     return int((await conn.execute(_RETAINED_CURRENT_REVISIONS)).scalar_one())
 
 

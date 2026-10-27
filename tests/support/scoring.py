@@ -91,6 +91,21 @@ M3 Task 13 adds the sweeps' and the override moves' side:
 - `swept_of(engine, target_id)`: the target's state, reason, override, lane, group and filter columns,
   charges and backoff; `hold_of(engine, bulk_operation_id, item_id)`: the operation's `followup_held_usd` and
   the item's `hold_released_at`.
+
+M3 Task 14 adds the creation's and the activation's side:
+- `unit_vector(*components)`, `embedding_at(conn, label, *components)`, `profile_vector_at(conn, version,
+  kind, *components)` and `embed_revision(conn, revision_id, embedding_id)`: vectors with the given `(index,
+  value)` components, as an `embeddings` row, a profile's vector, and a revision's embedding, so a test sets a
+  cosine directly; `profile_of_tuple(conn, tuple_id)`;
+- `fence_jobs(conn, *job_ids)`: an active `jobs` purge fence over them;
+- `revisioned_jobs(engine, n, *, availability)`: `n` unmerged jobs with one current revision each, inserted in
+  two statements (the chunk tests);
+- `target_row(engine, target_id)`, `targets_by_state(engine, tuple_id)`, `attempt_outcomes(engine,
+  tuple_id)`, `bulk_states(engine)`, `operations_of(engine, kind)` and
+  `count_retained_current_revisions(engine)`: the rows the creation, the cancellation and the activation
+  write, read by statements of the test's own;
+- `activate_scoring_settings(conn, **scoring)`: a new settings version with those `scoring` fields, made
+  active.
 """
 
 import asyncio
@@ -1180,3 +1195,155 @@ async def hold_of(engine: AsyncEngine, bulk_operation_id: int, item_id: int) -> 
     """The operation's `followup_held_usd` and the item's `hold_released_at`."""
     async with engine.connect() as conn:
         return (await conn.execute(_HOLD_ROW, {"b": bulk_operation_id, "i": item_id})).one()
+
+
+# ---- M3 Task 14: target creation and revival, the cancellations and the bulk operations ------------------
+
+_FULL_TARGET_ROW: Final = q(
+    "SELECT id, job_id, job_revision_id, llm_tuple_id, state, state_reason, override, override_at, lane, "
+    "similarity, attempt_no, charged_attempts, transient_failures, not_before, resume_draft_id, "
+    "refusal_category, bulk_operation_id, filter_scope_version_id, deferred_group_id, claim_id, "
+    "batch_submission_id FROM score_targets WHERE id = :t"
+)
+_STATES_OF_TUPLE: Final = q(
+    "SELECT state, count(*) AS n FROM score_targets WHERE llm_tuple_id = :t GROUP BY state"
+)
+_OUTCOMES_OF_TUPLE: Final = q(
+    "SELECT a.outcome, count(*) AS n FROM score_attempts a JOIN score_targets t ON t.id = a.target_id "
+    "WHERE t.llm_tuple_id = :t GROUP BY a.outcome"
+)
+_PROFILE_OF_TUPLE: Final = q("SELECT profile_version_id FROM llm_tuples WHERE id = :t")
+_EMBEDDING_AT: Final = q(
+    "INSERT INTO embeddings (embedding_model_id, text_sha256, input_kind, vector) "
+    "VALUES ('t14-test', :h, :kind, CAST(:vector AS halfvec)) RETURNING id"
+)
+_PROFILE_VECTOR: Final = q(
+    "INSERT INTO profile_vectors (profile_version_id, kind, embedding_id) VALUES (:pv, :kind, :e)"
+)
+_EMBED_REVISION: Final = q(
+    "UPDATE job_revisions SET embedding_status = 'embedded', embedding_id = :e WHERE id = :r"
+)
+_FENCE_JOBS: Final = q(
+    "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), 1) "
+    "RETURNING id"
+)
+_MANY_REVISIONED_JOBS: Final = q(
+    "WITH j AS (INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, "
+    "work_mode_possible, work_mode_source, employment_source, ad_language, completeness, posted_precision, "
+    "first_seen_at, last_seen_at, availability, availability_changed_at, source_ids, field_provenance, "
+    "det_facts_hash) SELECT 'musterfirma ' || g, 'Musterfirma ' || g, 'Testrolle', 'testrolle', "
+    "'unknown', ARRAY['remote','hybrid','onsite'], 'none', 'none', 'de', 'full', 'unknown', now(), now(), "
+    ":availability, now(), ARRAY['jsearch'], '{}', '\\x00' FROM generate_series(1, :n) AS g ORDER BY g "
+    "RETURNING id) "
+    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, description_text, "
+    "description_completeness, ad_language, embedding_status) SELECT id, 1, '\\x00', '{}', "
+    "'Erfundene Testanzeige.', 'full', 'de', 'awaiting_embedding' FROM j ORDER BY id RETURNING job_id, id"
+)
+_POINT_CURRENT: Final = q(
+    "UPDATE jobs SET current_revision_id = r.id FROM job_revisions r "
+    "WHERE r.job_id = jobs.id AND jobs.id = ANY(CAST(:jobs AS bigint[]))"
+)
+_RETAINED_CURRENT: Final = q(
+    "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND current_revision_id IS NOT NULL "
+    "AND NOT synthetic_eval"
+)
+_BULK_STATES: Final = q("SELECT llm_tuple_id, state FROM bulk_operations ORDER BY id")
+_OPERATIONS_OF: Final = q(
+    "SELECT id, status, payload, progress, last_error_code FROM operations WHERE kind = :k ORDER BY id"
+)
+
+
+def unit_vector(*components: tuple[int, float]) -> str:
+    """A 1024-dimensional `halfvec` literal with the given `(index, value)` components, the rest zero."""
+    values = ["0"] * 1024
+    for index, value in components:
+        values[index] = repr(value)
+    return "[" + ",".join(values) + "]"
+
+
+async def embedding_at(
+    conn: AsyncConnection, label: str, *components: tuple[int, float], kind: str = "passage"
+) -> int:
+    """An `embeddings` row of the vector with those components (`unit_vector`), its text hash that of
+    `label`; its id."""
+    params = {"h": hashlib.sha256(label.encode()).digest(), "kind": kind, "vector": unit_vector(*components)}
+    return int((await conn.execute(_EMBEDDING_AT, params)).scalar_one())
+
+
+async def profile_vector_at(
+    conn: AsyncConnection, profile_version_id: int, kind: str, *components: tuple[int, float]
+) -> int:
+    """A `profile_vectors` row of the version over a fresh embedding with those components; its id."""
+    embedding = await embedding_at(conn, f"{profile_version_id}:{kind}", *components, kind="query")
+    await conn.execute(_PROFILE_VECTOR, {"pv": profile_version_id, "kind": kind, "e": embedding})
+    return embedding
+
+
+async def embed_revision(conn: AsyncConnection, revision_id: int, embedding_id: int) -> None:
+    """The revision `embedded` with that embedding."""
+    await conn.execute(_EMBED_REVISION, {"e": embedding_id, "r": revision_id})
+
+
+async def profile_of_tuple(conn: AsyncConnection, llm_tuple_id: int) -> int:
+    return int((await conn.execute(_PROFILE_OF_TUPLE, {"t": llm_tuple_id})).scalar_one())
+
+
+async def fence_jobs(conn: AsyncConnection, *job_ids: int) -> int:
+    """An active purge fence of kind `jobs` over `job_ids`; its id."""
+    return int((await conn.execute(_FENCE_JOBS, {"jobs": list(job_ids)})).scalar_one())
+
+
+async def revisioned_jobs(engine: AsyncEngine, n: int, *, availability: str = "active") -> list[Job]:
+    """`n` unmerged jobs, each with one revision (awaiting embedding), its current one, inserted in two
+    statements; in id order."""
+    async with engine.begin() as conn:
+        rows = (await conn.execute(_MANY_REVISIONED_JOBS, {"n": n, "availability": availability})).all()
+        made = sorted((Job(int(r.job_id), int(r.id)) for r in rows), key=lambda job: job.job_id)
+        await conn.execute(_POINT_CURRENT, {"jobs": [job.job_id for job in made]})
+    return made
+
+
+async def target_row(engine: AsyncEngine, target_id: int) -> Row[Any]:
+    """Every column of the target a creation, a revival or a cancellation sets."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_FULL_TARGET_ROW, {"t": target_id})).one()
+
+
+async def targets_by_state(engine: AsyncEngine, llm_tuple_id: int) -> dict[str, int]:
+    """The tuple's targets counted by state."""
+    async with engine.connect() as conn:
+        return {str(r.state): int(r.n) for r in await conn.execute(_STATES_OF_TUPLE, {"t": llm_tuple_id})}
+
+
+async def attempt_outcomes(engine: AsyncEngine, llm_tuple_id: int) -> dict[str, int]:
+    """The attempts of the tuple's targets counted by outcome."""
+    async with engine.connect() as conn:
+        return {str(r.outcome): int(r.n) for r in await conn.execute(_OUTCOMES_OF_TUPLE, {"t": llm_tuple_id})}
+
+
+async def count_retained_current_revisions(engine: AsyncEngine) -> int:
+    """The current revisions of retained, unmerged, non-synthetic jobs: what `create_targets_for_tuple`
+    covers (counted by a statement of the test's own)."""
+    async with engine.connect() as conn:
+        return int((await conn.execute(_RETAINED_CURRENT)).scalar_one())
+
+
+async def bulk_states(engine: AsyncEngine) -> dict[int, str]:
+    """Each bulk operation's state by its tuple (a tuple with several: the latest)."""
+    async with engine.connect() as conn:
+        return {int(r.llm_tuple_id): str(r.state) for r in await conn.execute(_BULK_STATES)}
+
+
+async def operations_of(engine: AsyncEngine, kind: str) -> list[Row[Any]]:
+    """The operations of `kind`, oldest first: id, status, payload, progress and error code."""
+    async with engine.connect() as conn:
+        return list((await conn.execute(_OPERATIONS_OF, {"k": kind})).all())
+
+
+async def activate_scoring_settings(conn: AsyncConnection, **scoring: JSONValue) -> None:
+    """A new settings version, copied from the active one with the given `scoring` fields replaced, made
+    active (a test's own copy of the save's flip: no class action runs)."""
+    payload = dict(get_object((await conn.execute(_ACTIVE_SETTINGS)).scalar_one(), ""))
+    payload["scoring"] = {**get_object(payload, "scoring"), **scoring}
+    version = int((await conn.execute(_SETTINGS_VERSION, {"payload": payload})).scalar_one())
+    await conn.execute(_ACTIVATE_SETTINGS, {"v": version})

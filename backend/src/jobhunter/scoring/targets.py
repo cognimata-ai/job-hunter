@@ -1,8 +1,9 @@
-"""Score targets (spec §6.9.4, §7.11, §7.16.3, §8.7, §9.4, §9.6.3, §9.6.4; plan Tasks 9 and 13, Deviations 7
-and 24, Codex r1 #19-#21, #36, r4 B8, r5 B4, Rulings P8, P9, P28, P47, P52, Controller rulings and carries
-T10-f, T11-c, T12-a, T12-c, T13-a, T13-b, T13-c): the SQL that more than one module of the score lane shares,
-the sweeps that move targets without a user, the moves a user asks for, and `budget_release`. Task 14 adds
-creation and revival.
+"""Score targets (spec §6.9.4, §7.11, §7.16.3, §8.7, §9.4, §9.6.3, §9.6.4, §9.7, §12.6, §13.3; plan Tasks 9,
+13 and 14, Deviations 7, 24 and 38, R4, R5, R9, Codex r1 #19-#21, #24, #32, #35, #36, r2 B7, r4 B8, r5 B4,
+Rulings P8, P9, P14, P28, P47, P52, Controller rulings and carries T10-f, T11-c, T12-a, T12-c, T13-a, T13-b,
+T13-c): the SQL that more than one module of the score lane shares, the sweeps that move targets without a
+user, the moves a user asks for, `budget_release`, and (Task 14) the creation, revival and cancellation of
+targets, the tuple activation, the `create_targets_for_tuple` operation and the `missing_targets` reconciler.
 
 `RESUMABLE_DRAFT_SQL` (Codex r2 B23, r4 B9, r5 B1) is the one predicate of "this target has a draft to resume
 from": a `score_drafts` row on any attempt of the target under the evaluation policy `:policy`, whatever the
@@ -101,10 +102,80 @@ with at most the first `LOGGED_IDS` ids.
 **`expiry_sweep`** (heavy, L5513): `fence_epoch`, `active_config FOR SHARE`, the expiry sweep of the active
 tuple with the active `max_ad_age_days`, and `ranking.bump` when it moved a target.
 
+**Creation and revival** (§9.7, §7.16.3; Task 14). `create_or_revive(conn, *, job_id, job_revision_id,
+llm_tuple_id, profile_version_id, scope_version_id, bulk_operation_id, now)`, in the caller's transaction,
+which holds `active_config FOR SHARE` (or `FOR UPDATE`) and passes the active tuple, scope and profile:
+1. the job row `FOR SHARE` (step 4) with `is_fenced(job_id, llm_tuple_id)`: `Skipped("tuple_inactive")` when
+   the tuple is not the active one, `Skipped("fenced")` under a purge fence (L6358), `Skipped("merged")` for a
+   merged job, `Skipped("not_current")` when the revision is not the job's current one (or the job is gone);
+2. the upsert of L3694-3702 (`UNIQUE (job_revision_id, llm_tuple_id)`), `similarity` from
+   `similarity.similarity_for`: a new row is `pending`; a conflicting row is revived only from `cancelled`
+   with a reason of `REVIVABLE` (`tuple_superseded`, `revision_superseded`, `job_merged`), its `DO UPDATE
+   SET` the edge's `transition_set_clause` with the fresh-life resets of R4 (Deviation 7: `charged_attempts`,
+   `transient_failures`, `not_before`, `resume_draft_id`, `refusal_category`, the reason, `lane`,
+   `override`) and the new `bulk_operation_id` and similarity; `attempt_no` is kept (the CAS counter). Any
+   other existing row is `Unchanged` (`cancelled('purged')` never revives, L2905; a published target is
+   terminal);
+3. the initial-state correction of a created or revived row (L3704, L2867-2869): `filtered_out` with
+   `filter_scope_version_id` when the job's `hard_filter_results` row of the scope failed (computed inline by
+   `filters.refilter_job` when the row is missing, A1 issue 21), else `deferred_duplicate` with the group when
+   §8.7's deferral predicate holds (`DEFERRAL_ELIGIBLE_SQL`, Task 13's form until Task 15: a member flagged
+   `score_individually` is created `pending`, L2906), else `pending`.
+`ranking.bump` is the caller's, once, last. `RETAINED_JOB_SQL` (a current revision of an unmerged,
+non-synthetic job, Codex r1 #32) and `NEEDS_TARGET_SQL` (no target of `:tuple` for it but a revivable one) are
+the predicates over `jobs j` the creators share with node 9 and I5.
+
+**Cancellation** (§7.16.3, Rulings P9, P52, T10-f). `cancel_targets(conn, *, llm_tuple_id=None, job_ids=None,
+revision_ids=None, reason, now) -> Cancelled(targets, attempts)` moves every target the filters match (all of
+them that are given) in `CANCELLABLE` or `in_progress` to `cancelled(reason)` (the claim, group and filter
+columns cleared), ends their running attempts `cancelled` with `outcome_detail = reason` (a non-owner writes
+no other outcome), and releases the follow-up hold of each (`bulk.release_target_hold`). An `in_batch` target
+is the batch cancel's on a tuple supersession (`batches.request_cancel`, below) and cancelled individually
+for a revision supersession, a merge or a purge (L3979). Never the targets' owner: the candidates are read
+without a lock, their bulk rows locked (`bulk.lock_for_targets`, step 7), then the target rows `FOR UPDATE`
+in id order (step 10), the attempts and the items after. `cancel_batched(conn, *, submission_ids, reason)` is
+the same move for the `in_batch` targets of the given submissions.
+
+**The tuple activation** (§12.6 (d)-(f) and (h), §13.3 `llm_tuple`; Deviation 38, Codex r1 #24, #35).
+`activate_tuple(conn, *, old_tuple_id, new_tuple_id, settings, now, defer) -> Activated(bulk_operation_id,
+create_operation_id, cancelled)` runs in the confirm's transaction after `_ACTIVATE`, and in the save's after
+`_FLIP`, both holding `active_config FOR UPDATE` with the pointer already on the new tuple; a caller whose
+tuple is unchanged (the same profile and policy, L4786) does not call it (every target exists). In the
+schedule's order: (f) `ensure_month` and the month row (step 6), the active bulk operation cancelled (the old
+tuple's; the singleton holds one) and the new tuple's opened (`bulk.open`, step 7); (d) `cancel_targets` of
+the old tuple, reason `tuple_superseded`; (e) `batches.request_cancel` of the old tuple (the recorded request:
+the worker calls `messages.batches.cancel` after the commit, A1 issue 17); the fault point
+`activation.after_cancel`; (h) `create_operation(create_targets_for_tuple, {"llm_tuple_id",
+"bulk_operation_id"}, dedup_key create_targets_for_tuple:<tuple>)`. A live operation of that key from an
+earlier activation of the same tuple names a bulk operation cancelled since: it is cancelled (`superseded`)
+and a new one recorded.
+
+**`create_targets_for_tuple`** (§12.6 step 4, Codex r1 #32, A2 R4), payload `{"llm_tuple_id",
+"bulk_operation_id"}`: the current revisions of retained jobs that need a target of the tuple, in chunks of
+`CHUNK` ordered `availability = 'active'` first, then jobs saved or applied (`user_job_actions`), then the
+rest, each by job id (a keyset over that order, so every chunk moves on). Each chunk is one transaction:
+`active_config FOR SHARE` (a tuple no longer active ends the operation `succeeded` with `progress =
+{"skipped": "tuple_superseded"}`), the chunk's job rows `FOR SHARE` in id order, the owner row
+(`lock_operation_owner`), `create_or_revive` per job into the operation's bulk operation,
+`set_progress({"done", "total"})` (the retained current revisions with a target of the tuple, of all of them),
+`ranking.bump` when it created or revived one; then the fault point `create_targets.after_chunk`, after the
+commit, so a crash resumes from what is durable. When every chunk is done, with `scoring.batch_bulk_rescore`
+on and at least `batch_min_targets` targets of the bulk operation `pending` with `override = 'none'` (L3708's
+"≥ 200"), the `batch_submit` operation `{"bulk_operation_id", "llm_tuple_id"}` is recorded (dedup key
+`batch_submit:<bulk>:1`; its job takes the `batch` lock, `operations.OPERATION_LOCKS`), and the operation ends
+`succeeded` in that transaction.
+
+**`missing_targets`** (heavy, §17.4, §7.17 #2, L3718): `fence_epoch`, `active_config FOR SHARE`, then the
+current revisions of retained jobs that need a target of the active tuple, by job id in chunks of `CHUNK`,
+each chunk one transaction with its job rows `FOR SHARE` (a purge chunk holds a job `FOR UPDATE`, so it waits
+and then sees the fence or the deleted job, C36), `create_or_revive` without a bulk operation and
+`ranking.bump`. While the tuple's `create_targets_for_tuple` operation is live it leaves the creation to it.
+
 Ids, counts, codes and amounts only reach a log line.
 """
 
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR
@@ -114,19 +185,31 @@ from sqlalchemy import TextClause
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.clock import utcnow
 from jobhunter.db import ranking
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import CLEAR_REASON, transition, transition_where
+from jobhunter.db.transitions import CLEAR_REASON, transition, transition_set_clause, transition_where
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, bulk, spend_ledger
+from jobhunter.llm.budget import BudgetParams
 from jobhunter.observability.logging import get_logger
-from jobhunter.scoring import cycles
+from jobhunter.run_settings import scope_from_payload
+from jobhunter.scoring import cycles, filters, similarity
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
-from jobhunter.types import JSONValue, get_int
+from jobhunter.settings.model import Settings
+from jobhunter.types import JSONValue, get_bool, get_int, get_object
 from jobhunter.worker.epoch import fence_epoch
+from jobhunter.worker.operations import (
+    OperationContext,
+    cancel_operation,
+    create_operation,
+    lock_operation_owner,
+    register_operation_handler,
+    set_progress,
+)
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
-from jobhunter.worker.tasks import Deferrer
+from jobhunter.worker.tasks import Deferrer, defer_in_tx
 
 RESUMABLE_DRAFT_SQL: Final = (
     "EXISTS (SELECT 1 FROM score_attempts a JOIN score_drafts d ON d.attempt_id = a.id "
@@ -735,3 +818,595 @@ async def score_individually(
     await ranking.bump(conn)  # step 11, last
     log.info("score_target_action", action="score_individually", target_id=target_id, from_state=row.state)
     return IndividualMember(group_id, job_id, target_id, "pending")
+
+
+# ---- creation and revival (§9.7, §7.16.3) ------------------------------------------------------------------
+
+SkipReason = Literal["fenced", "merged", "not_current", "tuple_inactive"]
+CancelReason = Literal["tuple_superseded", "revision_superseded", "job_merged", "purged"]
+
+TUPLE_SUPERSEDED: Final = "tuple_superseded"
+REVISION_SUPERSEDED: Final = "revision_superseded"
+# The reasons a cancelled target revives from (§7.16.3); `purged` never does (L2905).
+REVIVABLE: Final = ("tuple_superseded", "revision_superseded", "job_merged")
+# The states a supersession, a merge or a purge cancels besides `in_progress` and `in_batch` (§7.16.3).
+CANCELLABLE: Final = (
+    "pending",
+    "budget_deferred",
+    "deferred_duplicate",
+    "filtered_out",
+    "expired_unscored",
+    *RETRYABLE_STATES,
+)
+CHUNK: Final = 500  # revisions per transaction of node 9, `create_targets_for_tuple` and `missing_targets`
+AFTER_CANCEL_POINT: Final = "activation.after_cancel"
+AFTER_CHUNK_POINT: Final = "create_targets.after_chunk"
+CREATE_TARGETS: Final = "create_targets_for_tuple"
+_SUPERSEDED_OPERATION: Final = "superseded"
+
+_REVIVABLE_SQL: Final = "(" + ", ".join(f"'{reason}'" for reason in REVIVABLE) + ")"
+# A current revision of a retained job (`jobs j`): unmerged, not an adversarial golden case (Codex r1 #32).
+RETAINED_JOB_SQL: Final = (
+    "j.merged_into_job_id IS NULL AND j.current_revision_id IS NOT NULL AND NOT j.synthetic_eval"
+)
+# `jobs j`'s current revision has no target of `:tuple`, or only one a creation revives.
+NEEDS_TARGET_SQL: Final = (
+    "NOT EXISTS (SELECT 1 FROM score_targets n WHERE n.job_revision_id = j.current_revision_id "  # noqa: S608
+    f"AND n.llm_tuple_id = :tuple AND NOT (n.state = 'cancelled' AND n.state_reason IN {_REVIVABLE_SQL}))"
+)
+
+
+@dataclass(frozen=True)
+class Created:
+    """A new target, in its initial state."""
+
+    target_id: int
+    state: str
+
+
+@dataclass(frozen=True)
+class Revived:
+    """A cancelled target given a fresh life, in its corrected state."""
+
+    target_id: int
+    state: str
+
+
+@dataclass(frozen=True)
+class Unchanged:
+    """An existing target the creation left as it is (live, published, or purged)."""
+
+    target_id: int
+    state: str
+
+
+@dataclass(frozen=True)
+class Skipped:
+    """No target touched: the job is fenced or merged, the revision is not its current one, or the tuple is
+    not the active one."""
+
+    reason: SkipReason
+
+
+Creation = Created | Revived | Unchanged | Skipped
+
+
+@dataclass(frozen=True)
+class Cancelled:
+    """What a cancellation moved: targets, and the running attempts it ended."""
+
+    targets: int
+    attempts: int
+
+
+@dataclass(frozen=True)
+class Activated:
+    """A tuple activation: the new bulk operation, the `create_targets_for_tuple` operation and how many
+    targets of the old tuple it cancelled."""
+
+    bulk_operation_id: int
+    create_operation_id: int
+    cancelled: int
+
+
+_LOCK_JOB: Final = q(
+    "SELECT j.merged_into_job_id, j.current_revision_id, is_fenced(j.id, :tuple) AS fenced, "
+    "(SELECT a.llm_tuple_id FROM active_config a WHERE a.id = 1) IS NOT DISTINCT FROM :tuple AS active "
+    "FROM jobs j WHERE j.id = :job FOR SHARE OF j"
+)
+_REVIVE_SET: Final = transition_set_clause(
+    "score_targets",
+    "pending",
+    reason=CLEAR_REASON,
+    set_sql={
+        "charged_attempts": "0",
+        "transient_failures": "0",
+        "not_before": "NULL",
+        "resume_draft_id": "NULL",
+        "refusal_category": "NULL",
+        "lane": "NULL",
+        "override": "'none'",
+        "override_at": "NULL",
+        "bulk_operation_id": "EXCLUDED.bulk_operation_id",
+        "updated_at": "EXCLUDED.updated_at",
+    },
+)
+# `similarity` is no column of the edge (`transition_set_clause` sets only settable ones): its new value
+# follows the edge's list. `xmax = 0` holds for the row the statement inserted, not for the one it updated.
+_UPSERT: Final = q(
+    "INSERT INTO score_targets AS t (job_revision_id, llm_tuple_id, job_id, state, similarity, "  # noqa: S608
+    "bulk_operation_id, updated_at) VALUES (:revision, :tuple, :job, 'pending', :similarity, :bulk, :now) "
+    f"ON CONFLICT (job_revision_id, llm_tuple_id) DO UPDATE SET {_REVIVE_SET}, "
+    "similarity = EXCLUDED.similarity "
+    f"WHERE t.state = 'cancelled' AND t.state_reason IN {_REVIVABLE_SQL} "
+    "RETURNING t.id, t.xmax = 0 AS inserted"
+)
+_EXISTING: Final = q(
+    "SELECT id, state FROM score_targets WHERE job_revision_id = :revision AND llm_tuple_id = :tuple"
+)
+_FILTER_RESULT: Final = q(
+    "SELECT passed FROM hard_filter_results WHERE job_id = :job AND scope_version_id = :scope"
+)
+_SCOPE_PAYLOAD: Final = q("SELECT payload FROM scope_versions WHERE id = :scope")
+_DEFER_ONE: Final = (
+    "t.id = :target AND m.job_id = t.job_id AND EXISTS (SELECT 1 FROM score_targets s "  # noqa: S608
+    f"WHERE s.id = t.id AND {DEFERRAL_ELIGIBLE_SQL})"
+)
+
+
+async def _filter_passed(conn: AsyncConnection, *, job_id: int, scope_version_id: int) -> bool:
+    """Whether the job passes the scope's hard filters: its stored result, else computed and written now
+    (`filters.refilter_job`, the job row held `FOR SHARE`; A1 issue 21)."""
+    found = (
+        await conn.execute(_FILTER_RESULT, {"job": job_id, "scope": scope_version_id})
+    ).scalar_one_or_none()
+    if found is not None:
+        return bool(found)
+    payload: JSONValue = (await conn.execute(_SCOPE_PAYLOAD, {"scope": scope_version_id})).scalar_one()
+    scope = scope_from_payload(get_object(payload, ""))
+    return (await filters.refilter_job(conn, job_id, {scope_version_id: scope}))[scope_version_id].passed
+
+
+async def _corrected(conn: AsyncConnection, target_id: int, *, job_id: int, scope_version_id: int) -> str:
+    """The initial state of a target just made `pending` (module docstring); the state it is left in."""
+    if not await _filter_passed(conn, job_id=job_id, scope_version_id=scope_version_id):
+        await transition(
+            conn,
+            "score_targets",
+            target_id,
+            ["pending"],
+            "filtered_out",
+            set_={"filter_scope_version_id": scope_version_id},
+        )
+        return "filtered_out"
+    deferred = await transition_where(
+        conn,
+        "score_targets",
+        ["pending"],
+        "deferred_duplicate",
+        where=_DEFER_ONE,
+        params={"target": target_id},
+        from_sql="duplicate_group_members m",
+        set_sql={"deferred_group_id": "m.group_id"},
+    )
+    return "deferred_duplicate" if deferred else "pending"
+
+
+async def create_or_revive(
+    conn: AsyncConnection,
+    *,
+    job_id: int,
+    job_revision_id: int,
+    llm_tuple_id: int,
+    profile_version_id: int,
+    scope_version_id: int,
+    bulk_operation_id: int | None,
+    now: datetime,
+) -> Creation:
+    """The target of `(job_revision_id, llm_tuple_id)` created, revived or left as it is (module docstring),
+    in the caller's transaction."""
+    job = (await conn.execute(_LOCK_JOB, {"job": job_id, "tuple": llm_tuple_id})).first()  # step 4
+    if job is None:
+        return Skipped("not_current")  # deleted since it was read
+    if not job.active:
+        return Skipped("tuple_inactive")
+    if job.fenced:
+        return Skipped("fenced")
+    if job.merged_into_job_id is not None:
+        return Skipped("merged")
+    if job.current_revision_id != job_revision_id:
+        return Skipped("not_current")
+    params = {
+        "revision": job_revision_id,
+        "tuple": llm_tuple_id,
+        "job": job_id,
+        "similarity": await similarity.similarity_for(
+            conn, job_revision_id=job_revision_id, profile_version_id=profile_version_id
+        ),
+        "bulk": bulk_operation_id,
+        "now": now,
+    }
+    upserted = (await conn.execute(_UPSERT, params)).first()
+    if upserted is None:
+        existing = (await conn.execute(_EXISTING, {"revision": job_revision_id, "tuple": llm_tuple_id})).one()
+        return Unchanged(int(existing.id), str(existing.state))
+    target_id = int(upserted.id)
+    state = await _corrected(conn, target_id, job_id=job_id, scope_version_id=scope_version_id)
+    return Created(target_id, state) if upserted.inserted else Revived(target_id, state)
+
+
+# ---- cancellation (§7.16.3, Rulings P9, P52) ---------------------------------------------------------------
+
+_MATCH: Final = {
+    "llm_tuple_id": "s.llm_tuple_id = :tuple",
+    "job_ids": "s.job_id = ANY(CAST(:jobs AS bigint[]))",
+    "revision_ids": "s.job_revision_id = ANY(CAST(:revisions AS bigint[]))",
+    "submission_ids": "s.batch_submission_id = ANY(CAST(:submissions AS bigint[]))",
+}
+_IN_STATES: Final = "s.state = ANY(CAST(:states AS text[]))"
+_LOCKED_IDS: Final = (
+    "t.id IN (SELECT s.id FROM score_targets s WHERE s.id = ANY(CAST(:ids AS bigint[])) "  # noqa: S608
+    f"AND {_IN_STATES} ORDER BY s.id FOR UPDATE)"
+)
+_ATTEMPTS_OF: Final = (
+    "(t.target_id, t.attempt_no) IN (SELECT * FROM unnest(CAST(:targets AS bigint[]), "
+    "CAST(:numbers AS integer[])))"
+)
+_HOLDING: Final = q(
+    "SELECT DISTINCT target_id FROM batch_items WHERE target_id = ANY(CAST(:ids AS bigint[])) "
+    "AND decision = 'followup' AND hold_released_at IS NULL ORDER BY target_id"
+)
+
+
+async def _cancel(
+    conn: AsyncConnection,
+    match: Mapping[str, tuple[str, object]],
+    states: Sequence[str],
+    reason: CancelReason,
+) -> Cancelled:
+    """Cancel the targets of `match` (each bind's filter fragment and value) in `states` (module
+    docstring)."""
+    predicate = " AND ".join(fragment for fragment, _ in match.values())
+    params: dict[str, object] = {name: value for name, (_, value) in match.items()}
+    candidates = await _ids(
+        conn,
+        q(f"SELECT s.id FROM score_targets s WHERE {predicate} AND {_IN_STATES} ORDER BY s.id"),  # noqa: S608
+        {**params, "states": list(states)},
+    )
+    if not candidates:
+        return Cancelled(0, 0)
+    await bulk.lock_for_targets(conn, candidates)  # step 7, before the first target row (P52)
+    moved = await transition_where(
+        conn,
+        "score_targets",
+        states,
+        "cancelled",
+        reason=reason,
+        where=_LOCKED_IDS,
+        params={"ids": candidates, "states": list(states)},
+        returning=("id", "attempt_no"),
+    )
+    if not moved:
+        return Cancelled(0, 0)
+    moved_ids = sorted(int(row["id"]) for row in moved)
+    ended = await transition_where(
+        conn,
+        "score_attempts",
+        ["running"],
+        "cancelled",
+        reason=reason,
+        where=_ATTEMPTS_OF,
+        params={
+            "targets": [int(row["id"]) for row in moved],
+            "numbers": [int(row["attempt_no"]) for row in moved],
+        },
+    )
+    for target_id in await _ids(conn, _HOLDING, {"ids": moved_ids}):  # the bulk rows are held (P52)
+        await bulk.release_target_hold(conn, target_id)
+    log.info(
+        "score_targets_cancelled",
+        reason=reason,
+        targets=len(moved),
+        attempts=len(ended),
+        target_ids=moved_ids[:LOGGED_IDS],
+    )
+    return Cancelled(len(moved), len(ended))
+
+
+async def cancel_targets(
+    conn: AsyncConnection,
+    *,
+    llm_tuple_id: int | None = None,
+    job_ids: Sequence[int] | None = None,
+    revision_ids: Sequence[int] | None = None,
+    reason: CancelReason,
+    now: datetime,
+) -> Cancelled:
+    """Cancel every non-published, non-cancelled target that all the given filters match (module
+    docstring), in the caller's transaction; `ValueError` when none is given (it would match every target).
+    `now` is the caller's clock (the transitions stamp the database's)."""
+    match: dict[str, tuple[str, object]] = {}
+    if llm_tuple_id is not None:
+        match["tuple"] = (_MATCH["llm_tuple_id"], llm_tuple_id)
+    if job_ids is not None:
+        match["jobs"] = (_MATCH["job_ids"], list(job_ids))
+    if revision_ids is not None:
+        match["revisions"] = (_MATCH["revision_ids"], list(revision_ids))
+    if not match:
+        raise ValueError("cancel_targets: no filter given; it matches every target")
+    # an in_batch target of a tuple supersession is the batch cancel's (`batches.request_cancel`)
+    states = [*CANCELLABLE, "in_progress", *(() if reason == TUPLE_SUPERSEDED else ("in_batch",))]
+    del now
+    return await _cancel(conn, match, states, reason)
+
+
+async def cancel_batched(
+    conn: AsyncConnection, *, submission_ids: Sequence[int], reason: CancelReason
+) -> Cancelled:
+    """Cancel the `in_batch` targets of the submissions (`batches.request_cancel`), as `cancel_targets`
+    cancels: their attempts ended, their holds released, the bulk rows first."""
+    match = {"submissions": (_MATCH["submission_ids"], list(submission_ids))}
+    return await _cancel(conn, match, ["in_batch"], reason)
+
+
+# ---- the tuple activation (§12.6 (d)-(f) and (h), §13.3) --------------------------------------------------
+
+
+async def _request_creation(
+    conn: AsyncConnection, *, llm_tuple_id: int, bulk_operation_id: int, defer: Deferrer | None
+) -> int:
+    """(h): `create_targets_for_tuple` of the tuple into the new bulk operation (module docstring); its id."""
+    kwargs: dict[str, Any] = {
+        "kind": CREATE_TARGETS,
+        "payload": {"llm_tuple_id": llm_tuple_id, "bulk_operation_id": bulk_operation_id},
+        "dedup_key": f"{CREATE_TARGETS}:{llm_tuple_id}",
+        "defer": defer,
+    }
+    operation_id, created = await create_operation(conn, **kwargs)
+    if created:
+        return operation_id
+    # a live one of an earlier activation of this tuple names a bulk operation cancelled since
+    await cancel_operation(conn, operation_id, reason=_SUPERSEDED_OPERATION)
+    log.info("create_targets_superseded", operation_id=operation_id, llm_tuple_id=llm_tuple_id)
+    operation_id, _ = await create_operation(conn, **kwargs)
+    return operation_id
+
+
+async def activate_tuple(
+    conn: AsyncConnection,
+    *,
+    old_tuple_id: int | None,
+    new_tuple_id: int,
+    settings: Settings,
+    now: datetime,
+    defer: Deferrer | None,
+) -> Activated:
+    """§12.6 (f), (d), (e) and (h) for a changed tuple, in the caller's transaction (module docstring);
+    `ValueError` for an unchanged one."""
+    # Imported here: `batches` imports this module (`cancel_batched`).
+    from jobhunter.scoring import batches
+
+    if old_tuple_id == new_tuple_id:
+        raise ValueError(f"tuple {new_tuple_id} is the active one already: nothing to activate")
+    p = BudgetParams.from_payload(settings.to_payload())
+    month = budget.month_of(now)
+    await spend_ledger.ensure_month(conn, month, p, now)
+    await spend_ledger.lock_month(conn, month, p, now=now)  # step 6: (f) under the month row
+    superseded = await bulk.active_operation(conn)
+    if superseded is not None:
+        await bulk.cancel(conn, superseded, now=now)
+    bulk_operation_id = await bulk.open(conn, llm_tuple_id=new_tuple_id, settings=settings, now=now)
+    cancelled = 0
+    if old_tuple_id is not None:
+        cancelled += (
+            await cancel_targets(conn, llm_tuple_id=old_tuple_id, reason=TUPLE_SUPERSEDED, now=now)
+        ).targets
+        cancelled += (await batches.request_cancel(conn, llm_tuple_id=old_tuple_id, now=now)).targets
+    await afault_point(AFTER_CANCEL_POINT)
+    operation_id = await _request_creation(
+        conn, llm_tuple_id=new_tuple_id, bulk_operation_id=bulk_operation_id, defer=defer
+    )
+    log.info(
+        "llm_tuple_activated",
+        old_tuple_id=old_tuple_id,
+        llm_tuple_id=new_tuple_id,
+        bulk_operation_id=bulk_operation_id,
+        superseded_bulk_operation_id=superseded,
+        create_operation_id=operation_id,
+        cancelled=cancelled,
+    )
+    return Activated(bulk_operation_id, operation_id, cancelled)
+
+
+# ---- create_targets_for_tuple (§12.6 step 4) and missing_targets (§17.4) -----------------------------------
+
+# The jobs that need a target of `:tuple`, in the operation's order (module docstring), after the keyset
+# `(:rank, :after)`.
+_CREATION_PAGE: Final = q(
+    "SELECT c.id, c.current_revision_id, c.rank FROM (SELECT j.id, j.current_revision_id, "  # noqa: S608
+    "CASE WHEN j.availability = 'active' THEN 0 WHEN EXISTS (SELECT 1 FROM user_job_actions u "
+    "WHERE u.job_id = j.id AND (u.saved_at IS NOT NULL OR u.applied_at IS NOT NULL)) THEN 1 ELSE 2 END "
+    "AS rank "
+    f"FROM jobs j WHERE {RETAINED_JOB_SQL} AND {NEEDS_TARGET_SQL}) c "
+    "WHERE (c.rank, c.id) > (:rank, :after) ORDER BY c.rank, c.id LIMIT :limit"
+)
+_MISSING_PAGE: Final = q(
+    "SELECT j.id, j.current_revision_id FROM jobs j "  # noqa: S608
+    f"WHERE {RETAINED_JOB_SQL} AND {NEEDS_TARGET_SQL} AND j.id > :after ORDER BY j.id LIMIT :limit"
+)
+_PROGRESS: Final = q(
+    f"SELECT count(*) AS total, count(*) FILTER (WHERE NOT {NEEDS_TARGET_SQL}) AS done "  # noqa: S608
+    f"FROM jobs j WHERE {RETAINED_JOB_SQL}"
+)
+_LOCK_JOBS: Final = q("SELECT id FROM jobs WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR SHARE")
+_PROFILE_OF: Final = q("SELECT profile_version_id FROM llm_tuples WHERE id = :tuple")
+_BULK_PENDING: Final = q(
+    "SELECT count(*) FROM score_targets WHERE bulk_operation_id = :bulk AND state = 'pending' "
+    "AND override = 'none'"
+)
+_CREATION_LIVE: Final = q(
+    "SELECT EXISTS (SELECT 1 FROM operations WHERE kind = 'create_targets_for_tuple' "
+    "AND payload ->> 'llm_tuple_id' = CAST(:tuple AS text) AND status IN ('pending', 'running'))"
+)
+
+
+async def create_chunk(
+    conn: AsyncConnection,
+    jobs: Sequence[tuple[int, int]],
+    *,
+    llm_tuple_id: int,
+    scope_version_id: int,
+    bulk_operation_id: int | None,
+    now: datetime,
+) -> Counter[str]:
+    """`create_or_revive` of each `(job_id, revision_id)` of `jobs` (the caller locked their job rows); the
+    results counted by kind (`created`, `revived`, `unchanged`) and skip reason (`skipped_<reason>`)."""
+    profile = int((await conn.execute(_PROFILE_OF, {"tuple": llm_tuple_id})).scalar_one())
+    counts: Counter[str] = Counter()
+    for job_id, revision_id in jobs:
+        made = await create_or_revive(
+            conn,
+            job_id=job_id,
+            job_revision_id=revision_id,
+            llm_tuple_id=llm_tuple_id,
+            profile_version_id=profile,
+            scope_version_id=scope_version_id,
+            bulk_operation_id=bulk_operation_id,
+            now=now,
+        )
+        counts[f"skipped_{made.reason}" if isinstance(made, Skipped) else type(made).__name__.lower()] += 1
+    return counts
+
+
+async def lock_jobs(conn: AsyncConnection, job_ids: Sequence[int]) -> None:
+    """The job rows `FOR SHARE` in id order, in one statement (step 4); a deleted one is simply absent."""
+    if job_ids:
+        await conn.execute(_LOCK_JOBS, {"ids": sorted(job_ids)})
+
+
+def moved(counts: Counter[str]) -> bool:
+    """Whether a chunk created or revived a target (its ranking bump)."""
+    return counts["created"] + counts["revived"] > 0
+
+
+async def _end_obsolete(conn: AsyncConnection, ctx: OperationContext, llm_tuple_id: int) -> None:
+    await set_progress(conn, ctx.claim, {"skipped": TUPLE_SUPERSEDED})
+    await ctx.finish_in(conn, status="succeeded")
+    log.info("create_targets_obsolete", operation_id=ctx.claim.operation_id, llm_tuple_id=llm_tuple_id)
+
+
+async def _request_batch(conn: AsyncConnection, *, llm_tuple_id: int, bulk_operation_id: int) -> int | None:
+    """The `batch_submit` operation once every chunk is done (module docstring); its id, or `None`."""
+    payload: JSONValue = (await conn.execute(_ACTIVE_SETTINGS)).scalar_one()
+    if not get_bool(payload, "scoring.batch_bulk_rescore"):
+        return None
+    pending = int((await conn.execute(_BULK_PENDING, {"bulk": bulk_operation_id})).scalar_one())
+    if pending < get_int(payload, "scoring.batch_min_targets"):
+        return None
+    operation_id, _ = await create_operation(
+        conn,
+        kind="batch_submit",
+        payload={"bulk_operation_id": bulk_operation_id, "llm_tuple_id": llm_tuple_id},
+        dedup_key=f"batch_submit:{bulk_operation_id}:1",
+        defer=defer_in_tx,
+    )
+    return operation_id
+
+
+@register_operation_handler(CREATE_TARGETS)
+async def create_targets_for_tuple(ctx: OperationContext) -> None:
+    """The `create_targets_for_tuple` operation (module docstring)."""
+    tuple_id = get_int(dict(ctx.claim.payload), "llm_tuple_id")
+    bulk_operation_id = get_int(dict(ctx.claim.payload), "bulk_operation_id")
+    cursor = (-1, 0)
+    totals: Counter[str] = Counter()
+    while True:
+        async with ctx.engine.begin() as conn:
+            active = await cycles.lock_active_scoring(conn)  # step 2
+            if active.llm_tuple_id != tuple_id:
+                await _end_obsolete(conn, ctx, tuple_id)
+                return
+            params = {"tuple": tuple_id, "rank": cursor[0], "after": cursor[1], "limit": CHUNK}
+            page = (await conn.execute(_CREATION_PAGE, params)).all()
+            await lock_jobs(conn, [int(row.id) for row in page])
+            await lock_operation_owner(conn, ctx.claim)  # step 5
+            counts = await create_chunk(
+                conn,
+                [(int(row.id), int(row.current_revision_id)) for row in page],
+                llm_tuple_id=tuple_id,
+                scope_version_id=active.scope_version_id,
+                bulk_operation_id=bulk_operation_id,
+                now=_clock(ctx),
+            )
+            progress = (await conn.execute(_PROGRESS, {"tuple": tuple_id})).one()
+            await set_progress(conn, ctx.claim, {"done": int(progress.done), "total": int(progress.total)})
+            if moved(counts):
+                await ranking.bump(conn)  # step 11, last
+        totals.update(counts)
+        if page:
+            await afault_point(AFTER_CHUNK_POINT)
+            cursor = (int(page[-1].rank), int(page[-1].id))
+        if len(page) < CHUNK:
+            break
+    async with ctx.engine.begin() as conn:
+        active = await cycles.lock_active_scoring(conn)
+        if active.llm_tuple_id != tuple_id:
+            await _end_obsolete(conn, ctx, tuple_id)
+            return
+        await lock_operation_owner(conn, ctx.claim)
+        batch = await _request_batch(conn, llm_tuple_id=tuple_id, bulk_operation_id=bulk_operation_id)
+        await ctx.finish_in(conn, status="succeeded")
+    log.info(
+        "create_targets_done",
+        operation_id=ctx.claim.operation_id,
+        llm_tuple_id=tuple_id,
+        bulk_operation_id=bulk_operation_id,
+        batch_submit_operation_id=batch,
+        **dict(sorted(totals.items())),
+    )
+
+
+def _clock(ctx: OperationContext) -> datetime:
+    """The handler's clock: the worker's injected one, `utcnow` for an execution without deps."""
+    return utcnow() if ctx.deps is None else ctx.deps.clock()
+
+
+@reconciler("missing_targets", "heavy")
+async def reconcile_missing_targets(ctx: ReconcileContext) -> int:
+    """The missing targets of the active tuple, created or revived (module docstring); how many. The
+    worker's own `FencedOut` propagates (Ruling FR-w), another owner's ends the pass."""
+    after = 0
+    totals: Counter[str] = Counter()
+    try:
+        while True:
+            async with ctx.engine.begin() as conn:
+                await fence_epoch(conn, ctx.epoch)
+                active = await cycles.lock_active_scoring(conn)  # step 2
+                tuple_id = active.llm_tuple_id
+                if tuple_id is None or (await conn.execute(_CREATION_LIVE, {"tuple": tuple_id})).scalar_one():
+                    break
+                params = {"tuple": tuple_id, "after": after, "limit": CHUNK}
+                page = (await conn.execute(_MISSING_PAGE, params)).all()
+                await lock_jobs(conn, [int(row.id) for row in page])
+                counts = await create_chunk(
+                    conn,
+                    [(int(row.id), int(row.current_revision_id)) for row in page],
+                    llm_tuple_id=tuple_id,
+                    scope_version_id=active.scope_version_id,
+                    bulk_operation_id=None,
+                    now=ctx.now,
+                )
+                if moved(counts):
+                    await ranking.bump(conn)  # step 11, last
+            totals.update(counts)
+            if len(page) < CHUNK:
+                break
+            after = int(page[-1].id)
+    except FencedOut as fenced:
+        if fenced.worker_superseded:
+            raise
+        return 0
+    made = totals["created"] + totals["revived"]
+    if made or any(key.startswith("skipped_") for key in totals):
+        log.info("missing_targets_created", **dict(sorted(totals.items())))
+    return made

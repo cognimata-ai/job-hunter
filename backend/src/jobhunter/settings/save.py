@@ -1,4 +1,5 @@
-"""The settings save (spec §13.2, §13.3; plan Task 17, Deviations 10, 14 and 15).
+"""The settings save (spec §13.2, §13.3; plan Task 17, Deviations 10, 14 and 15; M3 Task 14, Codex r1 #35,
+r2 B7).
 
 `save_settings` writes a new immutable `settings_versions` row and activates it, in the caller's transaction:
 
@@ -24,7 +25,7 @@
    after `schedule`, since `load_run_settings` joins `schedule_state`. The fault point
    `settings.after_llm_tuple` lies between `llm_tuple` and `scope`.
    - `llm_tuple`: `model_policy_id := new`, and with an active profile the tuple (`ensure_tuple`) and
-     `llm_tuple_id := it`. §12.6 (d) to (f) and `create_targets_for_tuple` are M3's (Deviation 10);
+     `llm_tuple_id := it` (flipped in step 7; §12.6 (d) to (h) are step 8's);
    - `scope`: `scope_apply.set_desired_scope` with the derived scope. When that is the active scope (a
      revert, §13.4 step 5's second remedy), nothing is left unapplied: after every action, so after the
      `budget` action's month row, every open `scope.apply_failed` is resolved
@@ -41,11 +42,16 @@
      both directions (`scoring.targets.expiry_sweep`, M3 Task 13: the bulk rows, then the target rows);
    - `execution`: `execution_config_id := new`;
    - `evaluation_policy`: `evaluation_policy_id := new` (the row is step 4's).
-   After every action, when the tuple pointer changed or the `admission` action's sweep moved a target,
-   `ranking.bump` runs once: `ranking_state` is the last lock of §3.3.3, after the `budget` action's month
-   row.
-7. `settings_version_id := new` and `updated_at`, in the statement that flips the pointers of step 6.
-   `active_config` is locked since step 1, so this takes no new lock after `ranking_state`.
+7. `settings_version_id := new` and `updated_at`, in the statement that flips the pointers of step 6
+   (`_FLIP`). `active_config` is locked since step 1, so this takes no new lock.
+8. When the tuple pointer changed, the tuple activation (`scoring.targets.activate_tuple`, §12.6 (d) to (f)
+   and (h), §13.3 `llm_tuple`; M3 Task 14, Codex r1 #35): the month row, the old tuple's bulk operation
+   cancelled and the new one opened under the new settings, the old tuple's unpublished targets and in-flight
+   submissions cancelled, and `create_targets_for_tuple` recorded. It runs after `_FLIP` because it needs the
+   flipped pointer.
+9. When the tuple pointer changed or the `admission` action's sweep moved a target, `ranking.bump` once, the
+   save's last statement: `ranking_state` is the last lock of §3.3.3, after the month row of the `budget`
+   action and of the activation (Codex r2 B7).
 
 Every write of the class actions that takes a row lock follows that order. The rows inserted before the month
 row (the derived rows, the version, the tuple) are new rows of tables that only writers holding
@@ -391,8 +397,6 @@ async def save_settings(
             await afault_point(AFTER_LLM_TUPLE_POINT)
     if a.scope_is_active:  # other domain rows: after the month row, before `ranking_state` (step 6)
         await scope_apply.resolve_apply_failed(conn)
-    if a.tuple_flipped or a.targets_moved:
-        await ranking.bump(conn)
     await conn.execute(
         _FLIP,
         {
@@ -401,6 +405,18 @@ async def save_settings(
             "now": now,
         },
     )
+    if a.tuple_flipped:  # step 8, on the flipped pointer
+        old_tuple_id = a.active.llm_tuple_id
+        await targets.activate_tuple(
+            conn,
+            old_tuple_id=old_tuple_id if isinstance(old_tuple_id, int) else None,
+            new_tuple_id=a.flips["llm_tuple_id"],
+            settings=proposed,
+            now=now,
+            defer=defer,
+        )
+    if a.tuple_flipped or a.targets_moved:  # step 9, last
+        await ranking.bump(conn)
     return SaveOutcome(
         version_id=a.version_id,
         version_no=int(version.version_no),

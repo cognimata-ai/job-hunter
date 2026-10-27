@@ -648,27 +648,33 @@ async def activate_explicit_scope(client: httpx.AsyncClient, op_runner: OpRunner
     await op_runner.run_one(saved["apply_scope_operation_id"])
 
 
-# --- Deviation 10: the collection with a tuple --------------------------------------------------------------
+# --- M3 Task 14 (Deviation 10's switch flipped): the collection with a tuple -------------------------------
 
 
-async def test_after_confirm_a_collect_run_succeeds_with_node_9_a_no_op_and_i5_ok(
+async def test_after_confirm_a_collect_run_creates_its_targets_and_i5_holds(
     logged_in_client, engine, ready_draft, current_epoch, fake_http, fake_embedder, collect_deps
 ) -> None:
     await confirmed(logged_in_client, ready_draft)
     _, tuple_id = await active_profile(engine)
     await seed_inputs(engine, companies=(("greenhouse", "getyourguide"),), enabled=("arbeitnow", "ats"))
-    run_id = await manual_run_id(engine)
-    async with engine.begin() as conn:  # the run carries the active tuple, as M3's run creation records it
-        await conn.execute(
-            sa.text("UPDATE runs SET llm_tuple_id = :t WHERE id = :r"), {"t": tuple_id, "r": run_id}
-        )
+    run_id = await manual_run_id(engine)  # the run records the active tuple, as the run creation does
     compiled = build_collect_graph(InMemorySaver(), collect_deps)
     assert await runs.execute_run(engine, compiled, run_id, 1, epoch=1) == "started"
     (run,) = await rows(engine, "SELECT status, status_reason, report FROM runs WHERE id = :r", r=run_id)
     assert (run.status, run.status_reason) == ("succeeded", None)
+    (made,) = await rows(
+        engine, "SELECT count(*) AS n FROM score_targets WHERE llm_tuple_id = :t", t=tuple_id
+    )
+    assert made.n > 0  # node 9 gave the run's revisions their targets of the confirmed tuple
     assert run.report["execution"]["invariants"]["I5"] == {
         "ok": True,
-        "detail": {"llm_tuple_id": tuple_id, "targets": "m3"},
+        "detail": {"llm_tuple_id": tuple_id, "revisions": made.n, "missing": 0},
+    }
+    assert run.report["revisions"]["targets"] == {
+        "created": made.n,
+        "revived": 0,
+        "cancelled": 0,
+        "skipped": {},
     }
     assert ENQUEUE_TARGETS in run.report["execution"]["nodes"]
 

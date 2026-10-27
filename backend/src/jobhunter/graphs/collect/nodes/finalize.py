@@ -10,14 +10,15 @@ propagates having written nothing: the attempt is lost and the run's next owner 
 the end is observed (`runs.observe_graph_end` with `finalize_run`'s duration, ruling T12-e) and logged
 `run_finished`. The dead-man ping of §17.7 arrives in M5 (plan Deviation 12).
 
-**Durable rows only** (Task 23, carry 1). Every invariant, partial cause and report section is counted from
-the tables, never from the state's per-attempt counters, which undercount after a resume or a node's
-database retry; those counters appear as they are, informational, under `execution.counters`. A row is "of
-the run" by its run column (fetch requests, their responses and raw items, ledger entries, recorded gaps),
-or, in the tables without one, by a time at or after the run's `started_at` (its first attempt's start;
-one collection runs at a time): revisions, jobs (their revision 1), merges, identity conflicts, duplicate
-groups, alerts and gaps closed or abandoned. A posting's availability change is the run's when the run made
-it: a revival that the run sighted, an absence from one of the run's snapshots (below).
+**Durable rows only** (Task 23, carry 1). Every invariant, partial cause and report section (but the report's
+`revisions.targets`, node 9's own counts, `report.targets_section`) is counted from the tables, never from the
+state's per-attempt counters, which undercount after a resume or a node's database retry; those counters
+appear as they are, informational, under `execution.counters`. A row is "of the run" by its run column (fetch
+requests, their responses and raw items, ledger entries, recorded gaps), or, in the tables without one, by a
+time at or after the run's `started_at` (its first attempt's start; one collection runs at a time): revisions,
+jobs (their revision 1), merges, identity conflicts, duplicate groups, alerts and gaps closed or abandoned. A
+posting's availability change is the run's when the run made it: a revival that the run sighted, an absence
+from one of the run's snapshots (below).
 
 **Invariants** (§17.2, `check_invariants`, in order):
 - I1: every `raw_response` of the run has as many raw items as its `item_count` (each item has one
@@ -28,9 +29,12 @@ it: a revival that the run sighted, an absence from one of the run's snapshots (
   per-run cap they were admitted under (`ledger.admitted_run_cap`, §6.4: the cap each reservation recorded,
   never the one of the window as it is now, which a later refinement changes; final review F3);
 - I4: every `linked` raw item of the run has an observation whose posting has a job;
-- I5: vacuous while `active_config.llm_tuple_id` is NULL (M1 Deviation 11); with a tuple it passes while
-  `enqueue_targets.SCORE_TARGETS_ENABLED` is false, recording `"targets": "m3"` (M2 plan Deviation 10: M2
-  activates a tuple and creates no targets), and fails with the switch on until M3 checks the run's targets;
+- I5 (M3 Task 14, R9), against **the run's tuple** (`runs.llm_tuple_id`): vacuous without one (no profile was
+  active, M1 Deviation 11); when the run's tuple is no longer the active one at finalize (a confirm or a save
+  activated another during the run), it passes with `{"llm_tuple_id": t, "targets": "tuple_superseded"}` (the
+  activation's `create_targets_for_tuple` owns the new tuple); otherwise every current revision of the run's
+  jobs (`enqueue_targets.RUN_JOB_SQL`) that is retained and unfenced has a live target of the tuple
+  (`targets.NEEDS_TARGET_SQL` is false), detail `{"llm_tuple_id", "revisions", "missing"}`;
 - I6: the run's revisions still `awaiting_embedding`, counted (`{"awaiting": n}`): never a failure, the
   partial cause `awaiting_embedding`;
 - I7: the outcome reducer saw no conflict. A conflict raises outside any node and never reaches this node
@@ -51,50 +55,38 @@ status); every open `run.failed` and `run.orphaned_queue` resolved by a `succeed
 success", Task 24); `quota.fallback_active` resolved when the
 run dispatched no fallback request; `coverage.gap_abandoned` by `abandon_old_gaps`.
 
-**Report** (§17.3, `build_report`, `runs.report`): `sources`, `identity`, `revisions`, `quota` and
-`execution`, ids, counts and codes only, never ad text or a company name (carry 7): a board's key is
-`<ats>/instance:<id>`, never its slug. Per source instance of the run (`<source_id>/<instance_key>`):
-`requests` by status, `units` billed, ambiguous and not billed, `items` by disposition and
-`items_out_of_scope` by reason (carry 3: SmartRecruiters' in-scope list items are `detail_call`), `postings`
-`new` (first seen through the run, `fetch_requests.new_postings` as `finalize_cells` wrote it) and `updated`
-(seen before the run, and observed by it with another content than the posting's latest observation from
-outside it: a posting the run only sighted again is not updated, ledger L372), `availability` changes by
-`<from>→<to>` (the from-state is not stored: where §7.16.2 has several edges into the state, the key names
-them all, `active|unknown→closed`) that the run made, each by its own evidence (ledger L372): a revival
-(`→ active`) of a posting the run sighted (an observation of one of its raw items, or a member of one of its
-snapshots), an `unknown` or `closed` posting absent from an applied snapshot of the run on its board, and
-never `→ stale`, which only the stale sweep (a reconciler) makes; `gaps` opened (and not abandoned at once),
-closed and abandoned, and the `health` at the end. `quota` per provider of the run: `projected` (its cells the
-projection admitted: a request that was not skipped), `used` (counted units) and `window_start`; `fallback`:
-`used`, `cells` dispatched and the `reason` (the most common §6.6 outcome of the JSearch cells it serves).
+**Report** (§17.3): `graphs.collect.report.build_report` (M1 Carry-forward 16, M3 Task 14), from the rows
+this transaction reads and writes.
 """
 
-from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Final, Literal, cast, get_args
+from dataclasses import dataclass
+from typing import Final, Literal, cast, get_args
 
-from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import TRANSITIONS
 from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
 from jobhunter.graphs.collect.nodes import Node
-from jobhunter.graphs.collect.nodes.enqueue_targets import SCORE_TARGETS_ENABLED
+from jobhunter.graphs.collect.nodes.enqueue_targets import RUN_JOB_SQL
+from jobhunter.graphs.collect.report import (
+    OPEN_REQUEST,
+    FallbackRequests,
+    alerts_raised,
+    build_report,
+    fallback_requests,
+)
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate
 from jobhunter.observability.alerts import raise_alert, resolve_alert, resolve_alerts
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
-from jobhunter.quota.fallback import cell_outcome
 from jobhunter.quota.planner import FALLBACK_ACTIVE_ALERT
 from jobhunter.quota.windows import Provider
 from jobhunter.run_settings import load_run_settings
+from jobhunter.scoring.targets import NEEDS_TARGET_SQL, RETAINED_JOB_SQL, TUPLE_SUPERSEDED
 from jobhunter.sources.coverage import abandon_old_gaps, finalize_cells
-from jobhunter.sources.watchlist_patterns import ATS_TYPES
 from jobhunter.types import JSONValue, get_list, get_str
 from jobhunter.worker.runs import (
     FAILED_ALERT,
@@ -133,16 +125,9 @@ _HEALTH_CAUSES: Final[Mapping[str, PartialCause]] = {
 }
 # The providers whose normal units a run may spend up to the per-run cap (§6.4: the paid ones).
 PER_RUN_CAPPED: Final[frozenset[Provider]] = frozenset({"jsearch", "serpapi"})
-# The counters of `graph.error_handled` (`SOURCE_ERRORS`, `EMBEDDER_ERRORS`): a warning when not zero
-# (carry 4).
-WARNING_COUNTERS: Final = ("source_errors", "embedder_errors")
-# The alert domains of a collection run: `execution.alerts` lists theirs, raised while the run ran.
-ALERT_DOMAINS: Final = ("run", "source", "quota", "coverage", "embedder", "ats", "dedup")
 PARTIAL_ALERT: Final = "run.partial"
 LIMIT_BREACH_ALERT: Final = "quota.limit_breach"
 _SERPAPI_SUBJECT: Final = "provider:serpapi"
-_UNIT_STATES: Final = ("billed", "ambiguous", "not_billed")
-_OPEN_REQUEST: Final = ("planned", "reserved", "dispatched")
 
 log = get_logger("jobhunter.graphs.collect.finalize")
 
@@ -180,7 +165,14 @@ _I4 = q(
     "LEFT JOIN posting_observations o ON o.id = i.observation_id LEFT JOIN postings p ON p.id = o.posting_id "
     "LEFT JOIN jobs j ON j.id = p.job_id WHERE f.run_id = :run AND i.disposition = 'linked'"
 )
-_ACTIVE_TUPLE = q("SELECT llm_tuple_id FROM active_config WHERE id = 1")
+_RUN_TUPLE = q(
+    "SELECT r.llm_tuple_id, r.started_at, "
+    "(SELECT a.llm_tuple_id FROM active_config a WHERE a.id = 1) AS active FROM runs r WHERE r.id = :run"
+)
+_I5 = q(
+    f"SELECT count(*) AS revisions, count(*) FILTER (WHERE {NEEDS_TARGET_SQL}) AS missing "  # noqa: S608
+    f"FROM jobs j WHERE {RETAINED_JOB_SQL} AND {RUN_JOB_SQL} AND NOT is_fenced(j.id, :tuple)"
+)
 _REVISIONS = q(
     "SELECT count(*) AS created, count(*) FILTER (WHERE embedding_status = 'embedded') AS embedded, "
     "count(*) FILTER (WHERE embedding_status = 'awaiting_embedding') AS awaiting FROM job_revisions "
@@ -225,7 +217,7 @@ async def _i1(conn: AsyncConnection, run_id: int) -> InvariantResult:
 
 
 async def _i2(conn: AsyncConnection, run_id: int) -> InvariantResult:
-    row = (await conn.execute(_I2, {"run": run_id, "open": list(_OPEN_REQUEST)})).one()
+    row = (await conn.execute(_I2, {"run": run_id, "open": list(OPEN_REQUEST)})).one()
     open_requests = int(row.non_terminal)
     detail: dict[str, JSONValue] = {"requests": int(row.requests), "non_terminal": open_requests}
     return InvariantResult("I2", open_requests == 0, detail)
@@ -266,14 +258,21 @@ async def _i4(conn: AsyncConnection, run_id: int) -> InvariantResult:
     return InvariantResult("I4", orphaned == 0, {"linked": int(row.linked), "orphaned": orphaned})
 
 
-async def _i5(conn: AsyncConnection) -> InvariantResult:
-    tuple_id = (await conn.execute(_ACTIVE_TUPLE)).scalar_one()
-    if tuple_id is None:
+async def _i5(conn: AsyncConnection, run_id: int) -> InvariantResult:
+    run = (await conn.execute(_RUN_TUPLE, {"run": run_id})).one()
+    if run.llm_tuple_id is None:
         return InvariantResult("I5", True, {"llm_tuple_id": None})
-    detail: dict[str, JSONValue] = {"llm_tuple_id": int(tuple_id)}
-    if not SCORE_TARGETS_ENABLED:
-        detail["targets"] = "m3"
-    return InvariantResult("I5", not SCORE_TARGETS_ENABLED, detail)
+    tuple_id = int(run.llm_tuple_id)
+    if run.active != tuple_id:  # R9: superseded during the run
+        return InvariantResult("I5", True, {"llm_tuple_id": tuple_id, "targets": TUPLE_SUPERSEDED})
+    found = (await conn.execute(_I5, {"tuple": tuple_id, "started": run.started_at})).one()
+    missing = int(found.missing)
+    detail: dict[str, JSONValue] = {
+        "llm_tuple_id": tuple_id,
+        "revisions": int(found.revisions),
+        "missing": missing,
+    }
+    return InvariantResult("I5", missing == 0, detail)
 
 
 async def check_invariants(
@@ -286,7 +285,7 @@ async def check_invariants(
         await _i2(conn, run_id),
         await _i3(conn, run_id),
         await _i4(conn, run_id),
-        await _i5(conn),
+        await _i5(conn, run_id),
         InvariantResult("I6", revisions.awaiting == 0, {"awaiting": revisions.awaiting}),
         InvariantResult("I7", outcome_conflicts == 0, {"conflicts": outcome_conflicts}),
     ]
@@ -321,296 +320,6 @@ def decide_status(
     if partial:
         return "partial", partial[0]
     return "succeeded", None
-
-
-# ---- the report (§17.3) -----------------------------------------------------------------------------------
-
-_INSTANCES = q(
-    "SELECT id, source_id, instance_key, health FROM source_instances WHERE id IN "
-    "(SELECT source_instance_id FROM fetch_requests WHERE run_id = :run) ORDER BY id"
-)
-_REQUESTS = q(
-    "SELECT source_instance_id, status, count(*) AS n FROM fetch_requests WHERE run_id = :run GROUP BY 1, 2"
-)
-_UNITS = q(
-    "SELECT f.source_instance_id, l.state, sum(l.units) AS units FROM fetch_requests f "
-    "JOIN quota_ledger l ON l.id = f.quota_ledger_id WHERE f.run_id = :run AND l.state = ANY(:states) "
-    "GROUP BY 1, 2"
-)
-_ITEMS = q(
-    "SELECT f.source_instance_id, i.disposition, i.reason_code, count(*) AS n FROM raw_items i "
-    "JOIN raw_responses r ON r.id = i.raw_response_id JOIN fetch_requests f ON f.id = r.fetch_request_id "
-    "WHERE f.run_id = :run GROUP BY 1, 2, 3"
-)
-# `new_postings` is written by `finalize_cells` (earlier in this transaction) for every succeeded request.
-_NEW_POSTINGS = q(
-    "SELECT source_instance_id, coalesce(sum(new_postings), 0) AS n FROM fetch_requests "
-    "WHERE run_id = :run GROUP BY 1"
-)
-# The postings the run observed with another content (`content_hash`) than the posting's latest observation
-# from outside the run: the updated postings. One the run first saw has no such observation.
-_UPDATED_POSTINGS = q(
-    "SELECT f.source_instance_id, count(DISTINCT o.posting_id) AS n FROM raw_items i "
-    "JOIN raw_responses r ON r.id = i.raw_response_id JOIN fetch_requests f ON f.id = r.fetch_request_id "
-    "JOIN posting_observations o ON o.id = i.observation_id "
-    "JOIN LATERAL (SELECT b.content_hash FROM posting_observations b WHERE b.posting_id = o.posting_id "
-    "AND NOT EXISTS (SELECT 1 FROM raw_items bi JOIN raw_responses br ON br.id = bi.raw_response_id "
-    "JOIN fetch_requests bf ON bf.id = br.fetch_request_id WHERE bi.id = b.raw_item_id AND bf.run_id = :run) "
-    "ORDER BY b.observed_at DESC, b.id DESC LIMIT 1) prior ON true "
-    "WHERE f.run_id = :run AND o.content_hash <> prior.content_hash GROUP BY 1"
-)
-# The availability changes the run made (module docstring) among the postings of its instances that changed
-# while it ran, but those it first saw: `→ active` sighted by the run (an observation of one of its raw items,
-# or a member of one of its snapshots), `unknown` or `closed` absent from an applied snapshot of the run on
-# the posting's instance, and never `→ stale` (the stale sweep's alone).
-_AVAILABILITY = q(
-    "SELECT p.source_instance_id, p.availability, p.availability_reason, count(*) AS n FROM postings p "
-    "WHERE p.source_instance_id IN (SELECT source_instance_id FROM fetch_requests WHERE run_id = :run) "
-    "AND p.availability_changed_at >= :started AND p.first_seen_at < :started AND CASE p.availability "
-    "WHEN 'active' THEN EXISTS (SELECT 1 FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
-    "JOIN fetch_requests f ON f.id = r.fetch_request_id JOIN posting_observations o "
-    "ON o.id = i.observation_id WHERE o.posting_id = p.id AND f.run_id = :run) "
-    "OR EXISTS (SELECT 1 FROM ats_snapshots s JOIN ats_snapshot_members m ON m.snapshot_id = s.id "
-    "WHERE s.run_id = :run AND s.source_instance_id = p.source_instance_id AND m.native_id = p.native_id) "
-    "WHEN 'stale' THEN false "
-    "ELSE EXISTS (SELECT 1 FROM ats_snapshots s WHERE s.run_id = :run "
-    "AND s.source_instance_id = p.source_instance_id AND s.applied_at IS NOT NULL AND NOT EXISTS "
-    "(SELECT 1 FROM ats_snapshot_members m WHERE m.snapshot_id = s.id AND m.native_id = p.native_id)) END "
-    "GROUP BY 1, 2, 3"
-)
-# A gap the run recorded already abandoned (`beyond_provider_window`, or an Arbeitnow gap concluded so) was
-# closed in its own insert: `closed_at = created_at`.
-_GAPS = q(
-    "SELECT c.source_instance_id, count(*) FILTER (WHERE g.run_id = :run "
-    "AND NOT (g.gap_status = 'abandoned' AND g.closed_at = g.created_at)) AS opened, "
-    "count(*) FILTER (WHERE g.gap_status = 'closed' AND g.closed_at >= :started) AS closed, "
-    "count(*) FILTER (WHERE g.gap_status = 'abandoned' AND g.closed_at >= :started) AS abandoned "
-    "FROM coverage_intervals g JOIN coverage_cells c ON c.id = g.cell_id WHERE g.kind = 'gap' "
-    "AND c.source_instance_id IN (SELECT source_instance_id FROM fetch_requests WHERE run_id = :run) "
-    "AND (g.run_id = :run OR g.closed_at >= :started) GROUP BY 1"
-)
-_IDENTITY = q(
-    "SELECT (SELECT count(*) FROM job_revisions WHERE revision_no = 1 AND created_at >= :started) "
-    "AS jobs_created, (SELECT count(*) FROM merge_events WHERE kind = 'strong_key_merge' "
-    "AND created_at >= :started) AS merges, "
-    "(SELECT count(*) FROM identity_conflicts WHERE created_at >= :started) AS conflicts, "
-    "(SELECT count(*) FROM duplicate_groups WHERE created_at >= :started) AS groups_formed, "
-    "(SELECT count(*) FROM duplicate_groups g WHERE g.created_at < :started AND (g.updated_at >= :started "
-    "OR EXISTS (SELECT 1 FROM duplicate_group_members m WHERE m.group_id = g.id "
-    "AND m.joined_at >= :started))) AS groups_changed, (SELECT count(*) FROM duplicate_groups "
-    "WHERE elected_at >= :started "
-    "AND election_reason <> 'initial') AS elections"
-)
-_QUOTA = q(
-    "SELECT p.provider, (SELECT count(DISTINCT f.cell_id) FROM fetch_requests f JOIN source_instances i "
-    "ON i.id = f.source_instance_id WHERE f.run_id = :run AND i.source_id = p.provider "
-    "AND f.status <> 'skipped') AS projected, (SELECT coalesce(sum(l.units), 0) FROM quota_ledger l "
-    "WHERE l.run_id = :run AND l.provider = p.provider AND l.state = ANY(:counted)) AS used, "
-    "coalesce((SELECT max(l.window_start) FROM quota_ledger l WHERE l.run_id = :run "
-    "AND l.provider = p.provider), (SELECT w.window_start FROM quota_windows w "
-    "WHERE w.provider = p.provider AND w.is_current)) AS window_start "
-    "FROM (SELECT DISTINCT i.source_id AS provider FROM fetch_requests f JOIN source_instances i "
-    "ON i.id = f.source_instance_id WHERE f.run_id = :run AND i.source_id = ANY(:providers)) p ORDER BY 1"
-)
-_FALLBACK = q(
-    "SELECT count(*) AS planned, count(DISTINCT cell_id) FILTER (WHERE status IN "
-    "('dispatched', 'succeeded', 'failed', 'ambiguous')) AS served FROM fetch_requests "
-    "WHERE run_id = :run AND phase = 'fallback'"
-)
-# The JSearch cells of the run whose SerpApi counterpart (the same query and location) the fallback planned,
-# with every request of the run terminal (`cell_outcome` reads only a terminal one; I2 reports the others).
-_FALLBACK_SOURCES = q(
-    "SELECT DISTINCT j.id FROM fetch_requests f JOIN coverage_cells s ON s.id = f.cell_id "
-    "JOIN coverage_cells j ON j.query_id IS NOT DISTINCT FROM s.query_id "
-    "AND j.location_key IS NOT DISTINCT FROM s.location_key "
-    "JOIN source_instances ji ON ji.id = j.source_instance_id AND ji.source_id = 'jsearch' "
-    "WHERE f.run_id = :run AND f.phase = 'fallback' "
-    "AND EXISTS (SELECT 1 FROM fetch_requests g WHERE g.run_id = :run AND g.cell_id = j.id) "
-    "AND NOT EXISTS (SELECT 1 FROM fetch_requests g WHERE g.run_id = :run AND g.cell_id = j.id "
-    "AND g.status = ANY(:open)) ORDER BY j.id"
-)
-_ALERTS = q(
-    "SELECT DISTINCT dedup_key FROM alerts WHERE last_at >= (SELECT started_at FROM runs WHERE id = :run) "
-    "AND split_part(code, '.', 1) = ANY(:domains) ORDER BY dedup_key"
-)
-
-
-def _counts(counter: Mapping[str, int]) -> dict[str, JSONValue]:
-    return {name: n for name, n in sorted(counter.items()) if n}
-
-
-def _source_key(source_id: str, instance_key: str, instance_id: int) -> str:
-    """`<source_id>/<instance_key>`; a board's key is its instance id, never its slug (a company's name)."""
-    if source_id in ATS_TYPES:
-        return f"{source_id}/instance:{instance_id}"
-    return f"{source_id}/{instance_key}"
-
-
-_POSTING_EDGES: Final = TRANSITIONS["postings"].allowed
-
-
-def _availability_key(to_state: str, reason: str | None) -> str:
-    """The `<from>→<to>` key of a posting found in `to_state` with `reason`: the §7.16.2 edges into the state
-    name the from-state, all of them when there are several (the from-state is not stored); a confirmed mass
-    disappearance closes only `unknown` postings."""
-    if to_state == "closed" and reason == "mass_disappearance_confirmed":
-        return "unknown→closed"
-    sources = sorted(source for source, target in _POSTING_EDGES if target == to_state)
-    return f"{'|'.join(sources)}→{to_state}"
-
-
-@dataclass
-class _Source:
-    """One source instance's part of the run (`build_report`'s `sources` entry)."""
-
-    health: str
-    requests: Counter[str] = field(default_factory=Counter)
-    units: Counter[str] = field(default_factory=Counter)
-    items: Counter[str] = field(default_factory=Counter)
-    out_of_scope: Counter[str] = field(default_factory=Counter)
-    new: int = 0
-    updated: int = 0
-    availability: Counter[str] = field(default_factory=Counter)
-    gaps: Counter[str] = field(default_factory=Counter)
-
-    def as_json(self) -> dict[str, JSONValue]:
-        return {
-            "requests": _counts(self.requests),
-            "units": {state: self.units[state] for state in _UNIT_STATES},
-            "items": _counts(self.items),
-            "items_out_of_scope": _counts(self.out_of_scope),
-            "postings": {"new": self.new, "updated": self.updated},
-            "availability": _counts(self.availability),
-            "gaps": {kind: self.gaps[kind] for kind in ("opened", "closed", "abandoned")},
-            "health": self.health,
-        }
-
-
-async def _rows(conn: AsyncConnection, statement: Any, **params: object) -> Sequence[Row[Any]]:
-    return (await conn.execute(statement, params)).all()
-
-
-async def _sources(conn: AsyncConnection, run_id: int, started: datetime) -> dict[str, JSONValue]:
-    by_id: dict[int, _Source] = {}
-    keys: dict[int, str] = {}
-    for row in await _rows(conn, _INSTANCES, run=run_id):
-        by_id[int(row.id)] = _Source(health=row.health)
-        keys[int(row.id)] = _source_key(row.source_id, row.instance_key, int(row.id))
-    for row in await _rows(conn, _REQUESTS, run=run_id):
-        by_id[int(row.source_instance_id)].requests[row.status] += int(row.n)
-    for row in await _rows(conn, _UNITS, run=run_id, states=list(_UNIT_STATES)):
-        by_id[int(row.source_instance_id)].units[row.state] += int(row.units)
-    for row in await _rows(conn, _ITEMS, run=run_id):
-        source = by_id[int(row.source_instance_id)]
-        source.items[row.disposition] += int(row.n)
-        if row.disposition == "out_of_scope":
-            source.out_of_scope[row.reason_code] += int(row.n)
-    for row in await _rows(conn, _NEW_POSTINGS, run=run_id):
-        by_id[int(row.source_instance_id)].new = int(row.n)
-    for row in await _rows(conn, _UPDATED_POSTINGS, run=run_id):
-        by_id[int(row.source_instance_id)].updated = int(row.n)
-    for row in await _rows(conn, _AVAILABILITY, run=run_id, started=started):
-        key = _availability_key(row.availability, row.availability_reason)
-        by_id[int(row.source_instance_id)].availability[key] += int(row.n)
-    for row in await _rows(conn, _GAPS, run=run_id, started=started):
-        by_id[int(row.source_instance_id)].gaps.update(
-            opened=int(row.opened), closed=int(row.closed), abandoned=int(row.abandoned)
-        )
-    return {keys[instance_id]: source.as_json() for instance_id, source in by_id.items()}
-
-
-async def _identity(conn: AsyncConnection, started: datetime) -> dict[str, JSONValue]:
-    row = (await conn.execute(_IDENTITY, {"started": started})).one()
-    names = ("jobs_created", "merges", "conflicts", "groups_formed", "groups_changed", "elections")
-    return {name: int(getattr(row, name)) for name in names}
-
-
-@dataclass(frozen=True)
-class FallbackRequests:
-    """The run's SerpApi fallback requests (`phase = 'fallback'`): how many it planned and how many cells a
-    dispatched one served. Read once by the run end, for the report's `quota.fallback` and the alert."""
-
-    planned: int
-    served: int
-
-
-async def fallback_requests(conn: AsyncConnection, run_id: int) -> FallbackRequests:
-    """Run `run_id`'s fallback requests, planned and served (`FallbackRequests`)."""
-    row = (await conn.execute(_FALLBACK, {"run": run_id})).one()
-    return FallbackRequests(planned=int(row.planned), served=int(row.served))
-
-
-async def _fallback(conn: AsyncConnection, run_id: int, requests: FallbackRequests) -> dict[str, JSONValue]:
-    reasons: Counter[str] = Counter()
-    if requests.planned:
-        cells = (
-            await conn.execute(_FALLBACK_SOURCES, {"run": run_id, "open": list(_OPEN_REQUEST)})
-        ).scalars()
-        for cell_id in cells.all():
-            reasons[await cell_outcome(conn, run_id, int(cell_id))] += 1
-    reason = min(reasons, key=lambda outcome: (-reasons[outcome], outcome)) if reasons else None
-    return {"used": requests.served > 0, "reason": reason, "cells": requests.served}
-
-
-async def _quota(conn: AsyncConnection, run_id: int, fallback: FallbackRequests) -> dict[str, JSONValue]:
-    params = {"run": run_id, "counted": list(ledger.COUNTED), "providers": ["jsearch", "serpapi", "adzuna"]}
-    quota: dict[str, JSONValue] = {}
-    for row in (await conn.execute(_QUOTA, params)).all():
-        window_start = None if row.window_start is None else row.window_start.isoformat()
-        quota[row.provider] = {
-            "projected": int(row.projected),
-            "used": int(row.used),
-            "window_start": window_start,
-        }
-    quota["fallback"] = await _fallback(conn, run_id, fallback)
-    return quota
-
-
-async def build_report(
-    conn: AsyncConnection,
-    run_id: int,
-    *,
-    invariants: Sequence[InvariantResult],
-    partial: Sequence[PartialCause],
-    revisions: RunRevisions,
-    fallback: FallbackRequests,
-    node_durations: Mapping[str, float],
-    counters: Mapping[str, int],
-    alerts_raised: Sequence[str],
-) -> dict[str, JSONValue]:
-    """The §17.3 run report of run `run_id` (module docstring): `sources`, `identity`, `revisions`, `quota`
-    and `execution`. `node_durations` and `counters` are the attempt's own (informational)."""
-    started: datetime = (await conn.execute(_RUN, {"run": run_id})).one().started_at
-    warnings: list[JSONValue] = [
-        {"code": name, "count": counters[name]} for name in WARNING_COUNTERS if counters.get(name, 0)
-    ]
-    execution: dict[str, JSONValue] = {
-        "nodes": {name: round(seconds, 3) for name, seconds in sorted(node_durations.items())},
-        "invariants": {r.code: {"ok": r.ok, "detail": r.detail} for r in invariants},
-        "partial": [*partial],
-        "alerts": [*sorted(alerts_raised)],
-        "warnings": warnings,
-        "counters": {name: n for name, n in sorted(counters.items())},
-    }
-    return {
-        "sources": await _sources(conn, run_id, started),
-        "identity": await _identity(conn, started),
-        "revisions": {
-            "created": revisions.created,
-            "embedded": revisions.embedded,
-            "awaiting": revisions.awaiting,
-            "targets": {},  # M3 creates them (plan Deviation 11)
-        },
-        "quota": await _quota(conn, run_id, fallback),
-        "execution": execution,
-    }
-
-
-async def alerts_raised(conn: AsyncConnection, run_id: int) -> list[str]:
-    """The `<code>:<subject>` keys of the collection's alerts raised (or raised again) since the run
-    started."""
-    params = {"run": run_id, "domains": list(ALERT_DOMAINS)}
-    return [str(key) for key in (await conn.execute(_ALERTS, params)).scalars()]
 
 
 # ---- the run end ------------------------------------------------------------------------------------------

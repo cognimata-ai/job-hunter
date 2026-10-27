@@ -65,6 +65,9 @@ collection graph (or `graph`, built over `saver`, an `InMemorySaver` unless give
 M2 Task 18: `job_factory.many(n)` (`insert_jobs`) inserts `n` unmerged jobs in one statement, each with a
 `det_facts_hash` of its own and no posting, and writes the active scope's hard-filter results for them, so the
 scope apply has retained jobs to precompute and the active scope's view is complete.
+
+M3 Task 14: `queued_run` and `manual_run_id` record the active tuple on the run, as the run creation does
+(node 9 and I5 read the run's tuple).
 """
 
 import asyncio
@@ -133,10 +136,12 @@ from tests.support.observations import normalized
 from tests.support.pg import PgServer, config_for
 from tests.support.quota import seeded_run_settings
 
+# The run records the active tuple, as the run creation does (`runs.request_manual_run`, `tick`): node 9 and
+# I5 read it (M3 Task 14).
 _QUEUED_RUN: Final = q(
-    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id) "
-    "SELECT 'manual', NULL, 'queued', :include_paid, settings_version_id, scope_version_id "
-    "FROM active_config RETURNING id"
+    "INSERT INTO runs (trigger, scheduled_slot, status, include_paid, settings_version_id, scope_version_id, "
+    "llm_tuple_id) SELECT 'manual', NULL, 'queued', :include_paid, settings_version_id, scope_version_id, "
+    "llm_tuple_id FROM active_config RETURNING id"
 )
 _INSTANCE: Final = q("SELECT id FROM source_instances WHERE source_id = :s AND instance_key = :k")
 _CELL: Final = q(

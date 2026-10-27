@@ -3,12 +3,15 @@
 In process: an injected exception inside the confirm's transaction (`raising_at`, a `SimulatedCrash` at one of
 `profile.activation`'s fault points) rolls the transaction back, as a killed process would. The SPA sees the
 M0 500 `internal`; the client's retry is the test's own. The draft is the synthetic CV through the real
-pipeline (`ready_draft`); no real CV and no paid call.
+pipeline (`ready_draft`); no real CV and no paid call. Since M3 Task 14 the confirm also opens the new tuple's
+bulk operation and records its `create_targets_for_tuple` (`targets.activate_tuple`, with its own fault point
+`activation.after_cancel`): both are part of the one transaction.
 """
 
 import pytest
 import sqlalchemy as sa
 from jobhunter.profile import activation as activation_module
+from jobhunter.scoring import targets as targets_module
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import no_fault, raising_at
@@ -24,14 +27,22 @@ async def only_tuple_id(engine: AsyncEngine) -> int:
         return int((await conn.execute(sa.text("SELECT id FROM llm_tuples"))).scalar_one())
 
 
-@pytest.mark.parametrize("point", ["confirm.after_version", "confirm.after_flip", "confirm.before_commit"])
+@pytest.mark.parametrize(
+    ("module", "point"),
+    [
+        (activation_module, "confirm.after_version"),
+        (activation_module, "confirm.after_flip"),
+        (targets_module, "activation.after_cancel"),
+        (activation_module, "confirm.before_commit"),
+    ],
+)
 async def test_c24_crash_inside_activation_is_all_or_nothing(
-    logged_in_client, engine, ready_draft, point, monkeypatch
+    logged_in_client, engine, ready_draft, module, point, monkeypatch
 ) -> None:
     generation_before = await ranking_generation(engine)
     jobs_before = await count_rows(engine, "procrastinate_jobs")
     scopes_before, pending_before = await count_rows(engine, "scope_versions"), await pending_scope_id(engine)
-    monkeypatch.setattr(activation_module, "afault_point", raising_at(point))  # SimulatedCrash at the point
+    monkeypatch.setattr(module, "afault_point", raising_at(point))  # SimulatedCrash at the point
     r = await logged_in_client.post(
         f"/api/profile/drafts/{ready_draft}/confirm",
         json={"expected_rescore_ack": True},
@@ -40,9 +51,9 @@ async def test_c24_crash_inside_activation_is_all_or_nothing(
     assert r.status_code == 500 and r.json()["code"] == "internal"
     assert await active_profile(engine) == (None, None)  # profile_version_id, llm_tuple_id
     assert await count_rows(engine, "profile_versions") == 0 and await count_rows(engine, "llm_tuples") == 0
-    assert (
-        await count_rows(engine, "operations", kind=("embed_profile", "propose_queries", "apply_scope")) == 0
-    )
+    kinds = ("embed_profile", "propose_queries", "apply_scope", "create_targets_for_tuple")
+    assert await count_rows(engine, "operations", kind=kinds) == 0
+    assert await count_rows(engine, "bulk_operations") == 0  # the new tuple's bulk operation rolled back too
     assert await count_rows(engine, "query_proposals") == 0
     assert await count_rows(engine, "api_idempotency", route="profile.confirm") == 0
     assert await ranking_generation(engine) == generation_before
@@ -74,4 +85,7 @@ async def test_c34_retry_with_the_same_key_activates_once(
     assert await ranking_generation(engine) == generation_before + 1
     assert await count_rows(engine, "operations", kind=("embed_profile",)) == 1
     assert await count_rows(engine, "operations", kind=("propose_queries",)) == 1
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 1
+    assert await count_rows(engine, "bulk_operations", state=("active",)) == 1
+    assert await count_rows(engine, "bulk_operations") == 1  # one activation: the replays opened none
     assert await active_profile(engine) == (first.json()["profile_version_id"], await only_tuple_id(engine))

@@ -36,6 +36,11 @@ and the execution is then requeued as `bug` like any other raise). The context a
 its progress (`operations.progress`, which the API polls) with `set_progress`, under the claim predicate like
 every owner write (M2 Task 18).
 
+**Execution locks** (M3 Task 14, Codex r3 B20). A kind of `OPERATION_LOCKS` runs its jobs under that
+procrastinate lock (`batch_submit`: `batch`, one submission at a time, worker-side): `defer_operation_job`
+reads the row's kind and passes the lock on every enqueue, the first one (`create_operation`), the
+`operations` reconciler's re-enqueue of a lost job and a fenced delivery's re-defer alike.
+
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
 the one ownership-loss protocol shared with runs. A claim that the epoch fence refuses (a superseded worker,
 `FencedOut`) re-defers the operation's job under its queueing lock `op:<id>` instead of consuming it (M0
@@ -51,6 +56,7 @@ reports an unexpected handler error as an outcome, which `execute_operation` per
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal
 from uuid import UUID, uuid4
 
@@ -94,6 +100,9 @@ OperationKind = Literal[
     "watchlist_validate",
 ]
 
+# The procrastinate execution lock of a kind's `run_operation` job, applied at every enqueue
+# (`defer_operation_job`): the batch submissions run one at a time, worker-side (M3 Task 14, L284, A2 R4).
+OPERATION_LOCKS: Final[Mapping[OperationKind, str | None]] = MappingProxyType({"batch_submit": "batch"})
 MAX_OPERATION_ATTEMPTS: Final = 10
 # These thresholds compare times the database wrote (`heartbeat_at`, `created_at`: its `now()`) with the
 # caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
@@ -252,6 +261,7 @@ _INSERT = q(
     "ON CONFLICT (kind, dedup_key) WHERE status IN ('pending','running') DO NOTHING RETURNING id",
     jsonb=["payload"],
 )
+_KIND = q("SELECT kind FROM operations WHERE id = :i")
 _LIVE_ID = q(
     "SELECT id FROM operations "
     "WHERE kind = :kind AND dedup_key = :dedup_key AND status IN ('pending','running')"
@@ -328,9 +338,15 @@ async def create_operation(
 
 
 async def defer_operation_job(conn: AsyncConnection, defer: Deferrer, operation_id: int) -> int | None:
-    """Defer `run_operation(operation_id)` with `defer` under the queueing lock `op:<id>`, in the caller's
-    transaction: the job id, or `None` when that operation's job already waits."""
-    return await defer(conn, "run_operation", queueing_lock=f"op:{operation_id}", operation_id=operation_id)
+    """Defer `run_operation(operation_id)` with `defer` under the queueing lock `op:<id>` and the execution
+    lock of the operation's kind (`OPERATION_LOCKS`, read from its row), in the caller's transaction: the job
+    id, or `None` when that operation's job already waits. Every enqueue goes through here: the first one,
+    `_redefer_lost_jobs`' and a fenced delivery's re-defer (M3 Task 14, Codex r3 B20)."""
+    kind = (await conn.execute(_KIND, {"i": operation_id})).scalar_one_or_none()
+    lock = None if kind is None else OPERATION_LOCKS.get(kind)
+    return await defer(
+        conn, "run_operation", lock=lock, queueing_lock=f"op:{operation_id}", operation_id=operation_id
+    )
 
 
 async def claim_operation(conn: AsyncConnection, operation_id: int, *, epoch: int) -> OperationClaim | None:

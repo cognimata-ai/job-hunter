@@ -656,9 +656,16 @@ M2_RECONCILERS = {
     "profile_vectors": ["heavy"],
 }
 # The M3 reconcilers so far: `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
-# `score_targets` and `score_cycles`; Ruling P44), and `expiry_sweep` and `budget_release` (Task 13,
-# `scoring.targets`).
-M3_RECONCILERS = {"orphaned_cycles": ["tick"], "expiry_sweep": ["heavy"], "budget_release": ["tick"]}
+# `score_targets` and `score_cycles`; Ruling P44), `expiry_sweep` and `budget_release` (Task 13,
+# `scoring.targets`), and `bulk_operations` (Task 14, `llm.bulk`, through `scoring.cycles`) and
+# `missing_targets` (Task 14, `scoring.targets`).
+M3_RECONCILERS = {
+    "orphaned_cycles": ["tick"],
+    "expiry_sweep": ["heavy"],
+    "budget_release": ["tick"],
+    "bulk_operations": ["heavy"],
+    "missing_targets": ["heavy"],
+}
 # Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
 # from `sys.modules` (each registry module is imported by the modules that register into it).
 _REGISTRY_SCRIPT = """\
@@ -701,7 +708,8 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     anyway), the registries hold exactly the M1, M2 and M3 (so far) reconcilers with their cadences, the four
     takeover sweeps (`operations`, `runs`, and M3 Task 11's `score_targets` and `score_cycles`), the
     `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
-    `propose_queries` (Task 20), `apply_scope` (Task 18) and `watchlist_validate` handlers, and the failure
+    `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate` and M3 Task 14's
+    `create_targets_for_tuple` (`scoring.targets`) handlers, and the failure
     hooks of the two profile phases and of the query proposal (`embed_profile` has none: it drives no domain
     row). `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with
     `profile.operations`, which imports `profile.vectors`; `worker.main` lists neither."""
@@ -712,6 +720,7 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
         "sweeps": ["operations", "runs", "score_cycles", "score_targets"],
         "handlers": [
             "apply_scope",
+            "create_targets_for_tuple",
             "embed_profile",
             "extract_profile",
             "extract_profile_text",
