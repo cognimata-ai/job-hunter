@@ -47,11 +47,13 @@ from tests.support.collect import ctx
 from tests.support.llm import (
     USAGE,
     attempt_and_target,
+    batch_kw,
     budget_rows,
     claim_owner,
     completed_call,
     count_rows,
     ledger_row,
+    new_submission_owner,
     new_target_owner,
     open_alerts,
     reclaim,
@@ -63,17 +65,19 @@ from tests.support.llm import (
 )
 from tests.support.m2 import insert_eval_run
 from tests.support.m3 import NOW, insert_batch_item, insert_bulk_operation, insert_submission
-from tests.support.pg import PgServer, lock_wait_details
+from tests.support.pg import PgServer, lock_wait_details, relation_locks
 from tests.support.procs import await_until
 
 pytestmark = pytest.mark.integration
 MINUTE = timedelta(minutes=1)
 # claude-opus-5-5, 4,000 input tokens at the cache-write $5 and 1,000 output tokens at $20 per MTok
 R = Decimal("0.04")
-LOCK_MONTH = sa.text("SELECT 1 FROM llm_budget WHERE month = :m FOR UPDATE")
-LOCK_BULK = sa.text("SELECT 1 FROM bulk_operations WHERE id = :id FOR UPDATE")
-LOCK_TARGET = sa.text("SELECT 1 FROM score_targets WHERE id = :id FOR UPDATE")
+LOCK_MONTH = sa.text("SELECT 1 FROM llm_budget WHERE month = :key FOR UPDATE")
+LOCK_BULK = sa.text("SELECT 1 FROM bulk_operations WHERE id = :key FOR UPDATE")
+LOCK_TARGET = sa.text("SELECT 1 FROM score_targets WHERE id = :key FOR UPDATE")
+LOCK_ACTIVE_CONFIG = sa.text("SELECT 1 FROM active_config WHERE id = :key FOR UPDATE")
 NOWAIT = {
+    "active_config": sa.text("SELECT 1 FROM active_config WHERE id = :key FOR UPDATE NOWAIT"),
     "month": sa.text("SELECT 1 FROM llm_budget WHERE month = :key FOR UPDATE NOWAIT"),
     "bulk": sa.text("SELECT 1 FROM bulk_operations WHERE id = :key FOR UPDATE NOWAIT"),
     "target": sa.text("SELECT 1 FROM score_targets WHERE id = :key FOR UPDATE NOWAIT"),
@@ -204,7 +208,7 @@ async def test_eight_concurrent_reservations_never_admit_past_the_allocation(
 
     async with engine.connect() as blocker:  # the barrier: all 8 wait for the month row at once
         await blocker.begin()
-        await blocker.execute(LOCK_MONTH, {"m": month})
+        await blocker.execute(LOCK_MONTH, {"key": month})
         tasks = [asyncio.create_task(session(owner)) for owner in owners]
 
         async def all_waiting() -> bool:
@@ -272,6 +276,29 @@ async def test_a_finished_bulk_operation_funds_nothing(engine, clean_db, migrate
     assert (await bulk_row(engine, bulk)).spent_usd == 0
     (after,) = await budget_rows(engine, month)
     assert after.bucket_usd == before.bucket_usd - R
+
+
+async def test_an_owner_is_funded_by_its_own_bulk_operation_only(
+    engine, clean_db, migrated: PgServer
+) -> None:
+    """A score attempt names its target's bulk operation and a batch submission its own; any other is refused
+    under the owner lock, before anything is written."""
+    t = utcnow()
+    bulk = await new_bulk(engine, budget_usd=Decimal(5))
+    other = await new_bulk(engine, budget_usd=Decimal(5), state="completed")
+    unfunded = await new_target_owner(engine)  # a target of no bulk operation
+    funded = await new_target_owner(engine, bulk_operation_id=bulk)
+    for owner, named in ((unfunded, bulk), (funded, other)):
+        with pytest.raises(ValueError, match="own bulk operation"):
+            await reserved(engine, funded_kw(owner, named, t))
+    sub = await new_submission_owner(engine, items=1, bulk_operation_id=bulk)
+    with pytest.raises(ValueError, match="own bulk operation"):
+        await reserved(engine, batch_kw(sub, sub.items[0], now=t, bound=4000, bulk_operation_id=other))
+    assert await count_rows(engine, "llm_spend_ledger") == 0
+    assert await count_rows(engine, "llm_budget") == 0  # refused before the month row was created
+    assert (await bulk_row(engine, bulk)).spent_usd == 0
+    res = await reserved(engine, funded_kw(funded, bulk, t))  # its own one funds it
+    assert await entry_bulk_id(engine, res) == bulk
 
 
 async def test_a_nonscoring_reservation_never_names_a_bulk_operation(engine, op_owner, clean_db) -> None:
@@ -552,24 +579,31 @@ async def nowait_refused(engine: AsyncEngine, which: str, key: object) -> bool:
 
 async def test_lock_order_owner_month_bulk(engine, clean_db, migrated: PgServer) -> None:
     """`reserve` takes `active_config` → the owner row → the month row → the bulk row → the ledger rows: held
-    at each step in turn, it waits on that row (`lock_wait_details`) holding every earlier one and none of
-    the later ones."""
+    at each step in turn, it waits on that row (`lock_wait_details`), holding every earlier one and none of
+    the later ones (the row locks by `NOWAIT`, the tables it has touched by its relation locks): at the bulk
+    step it has not touched `llm_spend_ledger` or `llm_calls` yet."""
     t = utcnow()
     month = await month_ready(engine, t)
     bulk = await new_bulk(engine, budget_usd=Decimal(5))
     owner = await new_target_owner(engine, bulk_operation_id=bulk)
-    steps = [
-        ("bulk", LOCK_BULK, {"id": bulk}, "bulk_operations", str(bulk)),
-        ("month", LOCK_MONTH, {"m": month}, "llm_budget", month.isoformat()),
-        ("target", LOCK_TARGET, {"id": owner.target_id}, "score_targets", str(owner.target_id)),
-    ]
-    keys = {"bulk": bulk, "month": month, "target": owner.target_id}
-    order = ["target", "month", "bulk"]  # the steps after active_config, as reserve takes them
-    done = 0
-    for name, statement, params, relation, key in steps:
+    order = ["active_config", "target", "month", "bulk"]  # as reserve takes them
+    tables = {
+        "active_config": "active_config",
+        "target": "score_targets",
+        "month": "llm_budget",
+        "bulk": "bulk_operations",
+    }
+    keys: dict[str, object] = {"active_config": 1, "target": owner.target_id, "month": month, "bulk": bulk}
+    locks = {
+        "active_config": LOCK_ACTIVE_CONFIG,
+        "target": LOCK_TARGET,
+        "month": LOCK_MONTH,
+        "bulk": LOCK_BULK,
+    }
+    for step, name in enumerate(order):
         async with engine.connect() as blocker:
             await blocker.begin()
-            await blocker.execute(statement, params)
+            await blocker.execute(locks[name], {"key": keys[name]})
             pid = await backend_pid(blocker)
             task = asyncio.create_task(reserved(engine, funded_kw(owner, bulk, t)))
 
@@ -579,15 +613,16 @@ async def test_lock_order_owner_month_bulk(engine, clean_db, migrated: PgServer)
             await await_until(waiting, 10, 0.02)
             assert not task.done()
             (wait,) = lock_wait_details(migrated)
-            assert (wait.relation, wait.key, wait.blocking_pids) == (relation, key, (pid,))
-            held = order[: order.index(name)]
-            for earlier in held:  # every earlier lock is held by the waiting reservation
+            assert (wait.relation, wait.key, wait.blocking_pids) == (tables[name], str(keys[name]), (pid,))
+            touched = relation_locks(migrated, wait.pid)
+            for earlier in order[:step]:  # every earlier row is held by the waiting reservation
+                assert tables[earlier] in touched, earlier
                 assert await nowait_refused(engine, earlier, keys[earlier]), earlier
-            for later in order[order.index(name) + 1 :]:  # no later one is taken yet
+            for later in order[step + 1 :]:  # no later one is taken, nor its table touched
+                assert tables[later] not in touched, later
                 assert not await nowait_refused(engine, later, keys[later]), later
-            assert await count_rows(engine, "llm_spend_ledger") == done  # no ledger row before the bulk row
+            assert not touched & {"llm_spend_ledger", "llm_calls"}, step  # no ledger row before the bulk row
             await blocker.rollback()
         res = await asyncio.wait_for(task, 10)
-        done += 1
         async with engine.begin() as conn:  # the allocation is free again for the next step
             await release_never_dispatched(conn, res, now=t)

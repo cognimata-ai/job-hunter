@@ -18,7 +18,13 @@ import pytest
 from jobhunter.llm import gateway, spend_ledger
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import CallContext, LLMGateway, NodeConfig, WireSchema, pinned_node_config
-from jobhunter.llm.spend_ledger import CallOutcome, Reservation, TargetAttemptOwner, storable_outcome
+from jobhunter.llm.spend_ledger import (
+    CallOutcome,
+    EvalRunOwner,
+    Reservation,
+    TargetAttemptOwner,
+    storable_outcome,
+)
 from jobhunter.llm.transport import make_http_client
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -114,6 +120,7 @@ def test_the_score_context_defaults_to_no_score_ids() -> None:
         ),
         (  # a golden case's critic call of an eval run: no attempt, its case and run (§11.13)
             {
+                "owner": EvalRunOwner(22),
                 "attempt_id": None,
                 "target_id": None,
                 "round": 0,
@@ -157,7 +164,7 @@ async def test_reserve_passes_the_score_ids_and_the_round(
         600,
     )
     assert (seen["owner"], seen["purpose_class"], seen["execution_config_id"]) == (
-        OWNER,
+        ctx.owner,
         ctx.purpose_class,
         3,
     )

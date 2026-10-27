@@ -1,7 +1,13 @@
 import pytest
 import sqlalchemy as sa
 from jobhunter.errors import FencedOut
-from jobhunter.observability.alerts import open_alert, raise_alert, refresh_alert_gauge, resolve_alert
+from jobhunter.observability.alerts import (
+    open_alert,
+    raise_alert,
+    refresh_alert_gauge,
+    resolve_alert,
+    resolve_alerts,
+)
 from jobhunter.observability.metrics import REGISTRY
 from jobhunter.worker.epoch import fence_epoch
 
@@ -49,6 +55,28 @@ async def test_gauge_is_set_for_every_severity_and_resolving_nothing_is_false(en
         assert await resolve_alert(c, code="a.unknown", subject="x") is False
         assert await refresh_alert_gauge(c) == {"info": 2, "warn": 0, "critical": 1}
         assert REGISTRY.get_sample_value("jobhunter_alerts_open", {"severity": "critical"}) == 1
+
+
+async def test_resolve_alerts_before_a_subject_resolves_the_earlier_subjects_of_its_code(
+    engine, clean_db
+) -> None:
+    """M3 Task 7: `subject_before` resolves the open alerts of one code whose subject orders before it, and
+    leaves the equal and later subjects and every other code open."""
+    async with engine.begin() as c:
+        for subject in ("2026-09-01", "2026-10-01", "2026-11-01", "2026-12-01"):
+            await raise_alert(c, code="a.monthly", severity="critical", subject=subject, message="m")
+        await raise_alert(c, code="a.monthly_other", severity="warn", subject="2026-01-01", message="m")
+        assert await resolve_alerts(c, code="a.monthly", subject_before="2026-11-01") == 2
+        assert await resolve_alerts(c, code="a.monthly", subject_before="2026-11-01") == 0
+        open_keys = await c.execute(
+            sa.text("SELECT dedup_key FROM alerts WHERE resolved_at IS NULL ORDER BY dedup_key")
+        )
+        assert open_keys.scalars().all() == [
+            "a.monthly:2026-11-01",
+            "a.monthly:2026-12-01",
+            "a.monthly_other:2026-01-01",
+        ]
+        assert await resolve_alerts(c, code="a.monthly") == 2  # no subject: all of the code
 
 
 # --- `open_alert` (F6 review, Minor 2; fix wave F7) ---------------------------------------------------------

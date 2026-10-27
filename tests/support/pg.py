@@ -544,6 +544,19 @@ def lock_wait_details(server: PgServer) -> list[LockWait]:
     return waits
 
 
+_RELATION_LOCKS: Final = (
+    "SELECT DISTINCT CAST(relation AS regclass)::text FROM pg_locks WHERE pid = %s AND locktype = 'relation' "
+    "AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
+def relation_locks(server: PgServer, pid: int) -> frozenset[str]:
+    """The relations of this database (tables and indexes) on which backend `pid` holds a lock. A transaction
+    keeps each relation lock to its end, so a table missing here is one the transaction has not touched yet:
+    a lock-order test reads which steps a waiting transaction has taken and which it has not."""
+    return frozenset(str(row[0]) for row in pg_rows(server, "superuser", _RELATION_LOCKS, pid))
+
+
 async def blocked_or_done(server: PgServer, task: asyncio.Task[Any]) -> bool:
     """Whether `task` has ended or some statement waits for a lock: what `await_until` polls at a barrier."""
     return task.done() or lock_waits(server) > 0

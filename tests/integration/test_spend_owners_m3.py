@@ -163,6 +163,35 @@ async def test_a_target_owner_reserves_only_for_its_own_attempt(engine, target_o
     assert await count_rows(engine, "llm_spend_ledger") == 0
 
 
+async def test_each_owner_reserves_on_its_own_transport_only(
+    engine, target_owner, submission_owner: BatchSubmission
+) -> None:
+    """A score attempt's own calls are online; a batch submission reserves its batch items only."""
+    t = utcnow()
+    with pytest.raises(ValueError, match="online"):
+        await reserved(
+            engine,
+            scoring_kw(
+                target_owner,
+                now=t,
+                bound=4000,
+                max_tokens=6000,
+                transport="batch",
+                logical_call_no=None,
+                deadline_s=None,
+            ),
+        )
+    sub = submission_owner
+    with pytest.raises(ValueError, match="batch items only"):
+        await reserved(
+            engine,
+            batch_kw(
+                sub, sub.items[0], now=t, bound=4000, transport="stream", logical_call_no=1, deadline_s=600
+            ),
+        )
+    assert await count_rows(engine, "llm_spend_ledger") == 0
+
+
 async def test_a_reclaimed_target_owner_is_fenced_at_the_dispatch_marker(engine, target_owner) -> None:
     """C28's in-process shape: the claim is lost between the reservation and the dispatch marker."""
     t = utcnow()
@@ -301,6 +330,27 @@ async def test_the_batch_dispatch_marker_moves_every_item_and_charges_each_attem
     assert (attempt.http_calls, target.charged_attempts) == (1, 1)
 
 
+async def test_the_batch_dispatch_marker_names_every_reserved_item_of_its_submission(
+    engine, clean_db
+) -> None:
+    """An item left out of the marker would stay `reserved` on a submitted batch, never aged (L2979): the
+    marker is refused and writes nothing."""
+    t = utcnow()
+    sub = await new_submission_owner(engine, items=2)
+    entries = [await reserved(engine, batch_kw(sub, item, now=t, bound=4000)) for item in sub.items]
+    started = await move_submission(engine, sub, "submit_started")
+    with pytest.raises(ValueError, match="every reserved item"):
+        async with engine.begin() as conn:
+            await mark_batch_dispatched(conn, started, entries[:1], now=t)
+    assert [(await ledger_row(engine, r.ledger_id)).state for r in entries] == ["reserved", "reserved"]
+    for item in sub.items:
+        attempt, target = await attempt_and_target(engine, item)
+        assert (attempt.http_calls, attempt.charged, target.charged_attempts) == (0, False, 0)
+    async with engine.begin() as conn:  # the whole set dispatches
+        await mark_batch_dispatched(conn, started, entries, now=t)
+    assert [(await ledger_row(engine, r.ledger_id)).state for r in entries] == ["dispatched", "dispatched"]
+
+
 async def test_the_batch_dispatch_marker_refuses_another_owners_entry(engine, clean_db) -> None:
     t = utcnow()
     sub = await new_submission_owner(engine, items=1)
@@ -409,7 +459,7 @@ async def test_batch_entries_are_never_aged_by_the_reconciler(engine, queue_app,
     assert await unsettled_pass(engine, queue_app, t + 30 * 60 * MINUTE) == 0  # never, however old
 
 
-async def test_a_live_target_owners_reserved_entry_is_kept_and_its_lost_successor_released(
+async def test_a_target_owners_reserved_entry_is_kept_while_its_claim_holds_and_released_after_the_reclaim(
     engine, queue_app, current_epoch, target_owner
 ) -> None:
     t = utcnow()

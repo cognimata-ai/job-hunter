@@ -44,6 +44,12 @@ _RESOLVE = q(
 _RESOLVE_CODE = q(
     "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL RETURNING id"
 )
+# The open alerts of one code whose subject orders before a given one: every key of one code shares the
+# `<code>:` prefix, so its keys order as its subjects do, byte by byte (`COLLATE "C"`).
+_RESOLVE_CODE_BEFORE = q(
+    "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL "
+    'AND dedup_key COLLATE "C" < :before_key RETURNING id'
+)
 _OPEN_BY_SEVERITY = q(
     "SELECT severity, count(*) AS n FROM alerts WHERE resolved_at IS NULL GROUP BY severity"
 )
@@ -111,10 +117,15 @@ async def resolve_alert(conn: AsyncConnection, *, code: str, subject: str) -> bo
     return result.first() is not None
 
 
-async def resolve_alerts(conn: AsyncConnection, *, code: str) -> int:
+async def resolve_alerts(conn: AsyncConnection, *, code: str, subject_before: str | None = None) -> int:
     """Resolve every open alert `code`, whatever its subject (`run.failed` is raised per run and resolved by
-    the next succeeded one); the number resolved."""
-    return len((await conn.execute(_RESOLVE_CODE, {"code": code})).all())
+    the next succeeded one); with `subject_before`, only those whose subject orders before it, byte by byte
+    (`llm.cap_reached` of the months before the current one, its subject the month's ISO date). The number
+    resolved."""
+    if subject_before is None:
+        return len((await conn.execute(_RESOLVE_CODE, {"code": code})).all())
+    params = {"code": code, "before_key": _dedup_key(code, subject_before)}
+    return len((await conn.execute(_RESOLVE_CODE_BEFORE, params)).all())
 
 
 async def refresh_alert_gauge(conn: AsyncConnection) -> dict[Severity, int]:

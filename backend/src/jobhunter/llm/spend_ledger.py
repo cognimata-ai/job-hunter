@@ -3,13 +3,13 @@ and one `llm_calls` row per HTTP try, reserved before the try under the serialis
 until positive evidence says it was not charged. Every function runs in the caller's transaction (`conn`).
 
 **Lock order** (§3.3.3, §9.1): `active_config` (`current_params`, `FOR SHARE`) → the owner row (`FOR SHARE`
-with its predicate; `FOR UPDATE` in recovery) → the `llm_budget` month row (`FOR UPDATE`) → the
-`bulk_operations` row of a funded entry (`FOR UPDATE`) → ledger rows → other domain rows (`score_attempts`,
-and `score_targets` not as the owner). Every reservation, settlement, release, cap or buffer edit and accrual
-takes the month row; the dispatch marker takes the owner row and then moves the attempt's counters. So a
-caller that holds the owner row must not call `settle` or `release_never_dispatched` afterwards in the same
-transaction unless it already holds `active_config`: both read `active_config` first (every M3 caller holds
-it, its step 2).
+with its predicate; in recovery `FOR UPDATE`, or `FOR NO KEY UPDATE` for the M3 owners) → the `llm_budget`
+month row (`FOR UPDATE`) → the `bulk_operations` row of a funded entry (`FOR NO KEY UPDATE`) → ledger rows →
+other domain rows (`score_attempts`, and `score_targets` not as the owner). Every reservation, settlement,
+release, cap or buffer edit and accrual takes the month row; the dispatch marker takes the owner row and then
+moves the attempt's counters. So a caller that holds the owner row must not call `settle` or
+`release_never_dispatched` afterwards in the same transaction unless it already holds `active_config`: both
+read `active_config` first (every M3 caller holds it, its step 2).
 
 **Spend owners** (§3.3.3): an operation's execution (`OperationOwner`), an eval run (`EvalRunOwner`, under
 its operation's claim when an `eval_run` operation executes it), a score attempt (`TargetAttemptOwner`: its
@@ -172,8 +172,11 @@ _LOCK_SUBMISSION = q("SELECT 1 FROM batch_submissions WHERE id = :s AND state = 
 _GLOBAL_FENCE = q("SELECT EXISTS (SELECT 1 FROM purge_fences WHERE kind = 'global' AND released_at IS NULL)")
 _OPERATION_OWNER = q("SELECT status, claim_id FROM operations WHERE id = :id FOR UPDATE")
 _EVAL_RUN_OWNER = q("SELECT status FROM eval_runs WHERE id = :id FOR UPDATE")
-_TARGET_OWNER = q("SELECT state, claim_id, attempt_no FROM score_targets WHERE id = :id FOR UPDATE")
-_SUBMISSION_STATE = q("SELECT state FROM batch_submissions WHERE id = :id FOR UPDATE")
+# The M3 owner rows are referenced by foreign keys (`llm_calls`, `batch_items`, `score_attempts`), so recovery
+# locks them `FOR NO KEY UPDATE`: it conflicts with the owner's `FOR SHARE` and never with an FK check's
+# `FOR KEY SHARE`.
+_TARGET_OWNER = q("SELECT state, claim_id, attempt_no FROM score_targets WHERE id = :id FOR NO KEY UPDATE")
+_SUBMISSION_STATE = q("SELECT state FROM batch_submissions WHERE id = :id FOR NO KEY UPDATE")
 
 
 @dataclass(frozen=True)
@@ -285,7 +288,8 @@ async def _operation_holds(conn: AsyncConnection, operation_id: int, claim_id: J
 
 
 async def owner_holds(conn: AsyncConnection, ref: Mapping[str, JSONValue], *, now: datetime) -> bool:
-    """Lock the recorded owner's row `FOR UPDATE` and test its predicate: an operation that is `running` under
+    """Lock the recorded owner's row (`FOR UPDATE`; `FOR NO KEY UPDATE` for a target or a submission, rows
+    other rows reference by foreign key) and test its predicate: an operation that is `running` under
     the recorded `claim_id`; a `running` eval run, and its operation under the recorded claim when it has one
     (the operation's row first, as `EvalRunOwner.lock` takes them); a target `in_progress` under the recorded
     `claim_id` and `attempt_no`; a batch submission in the recorded state. A missing row never holds; an
@@ -494,15 +498,10 @@ async def change_buffer(
 _MARK_CAP_REACHED = q(
     "UPDATE llm_budget SET cap_reached_alerted_at = :now, updated_at = :now WHERE month = :month"
 )
-# An open `llm.cap_reached` of a month before `current`: its subject is the month's ISO date, so its dedup key
-# (`<code>:<subject>`, `observability.alerts`) orders as the month does.
-_RESOLVE_STALE_CAP_ALERTS = q(
-    "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL "
-    "AND dedup_key < :current_key RETURNING id"
-)
 
 
 def _cap_reached_subject(month: date) -> str:
+    """The month's ISO date: the subjects of two months order as the months do."""
     return month.isoformat()
 
 
@@ -542,9 +541,7 @@ async def resolve_cap_reached(conn: AsyncConnection, month: date) -> bool:
 async def resolve_stale_cap_alerts(conn: AsyncConnection, *, current: date) -> int:
     """Resolve every open `llm.cap_reached` of a month before `current` (`budget_release`'s every tick, so an
     alert of one month never outlives the first tick of the next); the number resolved."""
-    key = f"{CAP_REACHED_ALERT}:{_cap_reached_subject(current)}"
-    rows = await conn.execute(_RESOLVE_STALE_CAP_ALERTS, {"code": CAP_REACHED_ALERT, "current_key": key})
-    return len(rows.all())
+    return await resolve_alerts(conn, code=CAP_REACHED_ALERT, subject_before=_cap_reached_subject(current))
 
 
 # ---- reservation and dispatch (§6.9.1, §10.7, §7.16.7) ----------------------------------------------------
@@ -574,14 +571,17 @@ _ENTRY = q(
     "JOIN llm_calls c ON c.spend_ledger_id = l.id WHERE l.id = :id AND l.kind = 'request'"
 )
 # The bulk operation's allocation (§6.9.3), step 7 of the schedule: locked after the month row, before the
-# ledger rows.
-_LOCK_BULK = q("SELECT state, budget_usd, spent_usd FROM bulk_operations WHERE id = :id FOR UPDATE")
+# ledger rows. `FOR NO KEY UPDATE`, the lock its `spent_usd` update takes: it serialises the allocation's
+# writers and leaves the FK checks of the rows that reference the operation (targets, submissions, ledger
+# entries; `FOR KEY SHARE`) unblocked.
+_LOCK_BULK = q("SELECT state, budget_usd, spent_usd FROM bulk_operations WHERE id = :id FOR NO KEY UPDATE")
 _BULK_SPENT = q("UPDATE bulk_operations SET spent_usd = spent_usd + :delta WHERE id = :id")
 # §9.4.2 L3567, L2224, L2863: the dispatch marker counts the try on its attempt and charges the attempt and,
-# the first time, its target. The rows are locked in id order (the schedule's step 10).
+# the first time, its target. The rows are locked in id order (the schedule's step 10), `FOR NO KEY UPDATE`
+# (the lock of the counter updates themselves: an FK check of a row that references them is not blocked).
 _LOCK_ATTEMPTS = q(
     "SELECT id, target_id, charged FROM score_attempts WHERE id = ANY(CAST(:ids AS bigint[])) "
-    "ORDER BY id FOR UPDATE"
+    "ORDER BY id FOR NO KEY UPDATE"
 )
 _COUNT_TRIES = q(
     "UPDATE score_attempts SET http_calls = http_calls + 1, logical_calls = logical_calls + :l, "
@@ -589,7 +589,7 @@ _COUNT_TRIES = q(
 )
 _CHARGE_TARGETS = q(
     "UPDATE score_targets SET charged_attempts = charged_attempts + 1 WHERE id IN "
-    "(SELECT id FROM score_targets WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR UPDATE)"
+    "(SELECT id FROM score_targets WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id FOR NO KEY UPDATE)"
 )
 # L3911: what an attempt's tries count at (billed their cost, ambiguous their reservation).
 _ATTEMPT_COST = q("UPDATE score_attempts SET cost_usd = cost_usd + :delta WHERE id = :id")
@@ -599,6 +599,15 @@ _BATCH_ENTRIES = q(
     "FROM llm_spend_ledger l JOIN llm_calls c ON c.spend_ledger_id = l.id "
     "WHERE l.id = ANY(CAST(:ids AS bigint[])) AND l.kind = 'request' ORDER BY l.id"
 )
+# Every entry a submission still has `reserved`: its owner is the submission, by kind and id.
+_SUBMISSION_RESERVED = q(
+    "SELECT l.id FROM llm_spend_ledger l JOIN llm_calls c ON c.spend_ledger_id = l.id "
+    "WHERE l.state = 'reserved' AND l.kind = 'request' AND c.input_refs -> 'owner' @> "
+    "jsonb_build_object('kind', 'batch_submission', 'id', CAST(:submission_id AS bigint)) ORDER BY l.id"
+)
+# The bulk operation a score target or a batch submission belongs to, read under its owner lock.
+_TARGET_BULK = q("SELECT bulk_operation_id FROM score_targets WHERE id = :id")
+_SUBMISSION_BULK = q("SELECT bulk_operation_id FROM batch_submissions WHERE id = :id")
 # Codex r1 #27: a target's online attempt is a funded follow-up iff it has an unreleased `followup` item.
 _FUNDED_FOLLOW_UP = q(
     "SELECT t.bulk_operation_id FROM score_targets t WHERE t.id = :t AND t.bulk_operation_id IS NOT NULL "
@@ -699,7 +708,8 @@ async def _entry(conn: AsyncConnection, ledger_id: int) -> _Entry | None:
 
 
 async def _fund(conn: AsyncConnection, bulk_operation_id: int, r: Decimal) -> int | None:
-    """The bulk row `FOR UPDATE` (§6.9.3); `bulk_operation_id` when the operation is `active` and `r` fits its
+    """The bulk row `FOR NO KEY UPDATE` (§6.9.3); `bulk_operation_id` when the operation is `active` and `r`
+    fits its
     allocation (`spent_usd + r ≤ budget_usd`, L1191), else `None`: a finished operation is refused as a full
     one is, and the reservation is charged to the bucket like any other online work."""
     row = (await conn.execute(_LOCK_BULK, {"id": bulk_operation_id})).first()
@@ -715,7 +725,8 @@ async def _fund(conn: AsyncConnection, bulk_operation_id: int, r: Decimal) -> in
 
 
 async def _lock_bulk(conn: AsyncConnection, bulk_operation_id: int) -> None:
-    """The funded entry's bulk row `FOR UPDATE`, before its ledger rows (an entry keeps the id only of a row
+    """The funded entry's bulk row `FOR NO KEY UPDATE`, before its ledger rows (an entry keeps the id only of
+    a row
     that existed when it was funded; `ON DELETE SET NULL` clears it with the row)."""
     await conn.execute(_LOCK_BULK, {"id": bulk_operation_id})
 
@@ -731,6 +742,19 @@ async def _attempt_cost(conn: AsyncConnection, attempt_id: int | None, delta: De
     """The attempt's `cost_usd` moves by `delta` (L3911), for a score call's entry."""
     if attempt_id is not None and delta != 0:
         await conn.execute(_ATTEMPT_COST, {"id": attempt_id, "delta": delta})
+
+
+async def _check_own_bulk(conn: AsyncConnection, owner: SpendOwner, bulk_operation_id: int) -> None:
+    """A score attempt or a batch submission is funded by its own bulk operation only (its row's
+    `bulk_operation_id`, read under the owner lock the caller holds); any other is a `ValueError`."""
+    if isinstance(owner, TargetAttemptOwner):
+        own = (await conn.execute(_TARGET_BULK, {"id": owner.target_id})).scalar_one_or_none()
+    elif isinstance(owner, BatchSubmissionOwner):
+        own = (await conn.execute(_SUBMISSION_BULK, {"id": owner.submission_id})).scalar_one_or_none()
+    else:
+        return
+    if own != bulk_operation_id:
+        raise ValueError(f"bulk operation {bulk_operation_id} is not the owner's own bulk operation")
 
 
 async def funded_bulk_operation_id(conn: AsyncConnection, *, target_id: int) -> int | None:
@@ -788,6 +812,12 @@ async def reserve(
     be non-scoring. `bulk_operation_id` is the funding operation of a scoring reservation (step 6): a batched
     target's item or its funded follow-up (`funded_bulk_operation_id`); it is kept on the entry only while
     the operation is active and the reservation fits its allocation.
+
+    `ValueError`, before anything is written, for an inconsistent call: a non-scoring one with a bulk
+    operation; a score attempt's call for another attempt or target, or not online; a batch submission's
+    reservation that is not a batch item; a bulk operation that is not the target's or the submission's own
+    (its row's `bulk_operation_id`, read under the owner lock); an online try without its logical call and
+    deadline; `input_refs` that set the owner or the deadline.
     """
     if purpose not in budget.SCORING_PURPOSES and purpose_class != "nonscoring":
         raise ValueError(f"purpose {purpose} is non-scoring")
@@ -800,6 +830,10 @@ async def reserve(
         owner.target_id,
     ):
         raise ValueError("a score attempt's call carries its own attempt_id and target_id")
+    if isinstance(owner, TargetAttemptOwner) and transport != "stream":
+        raise ValueError("a score attempt's own calls are online; a batch item is its submission's")
+    if isinstance(owner, BatchSubmissionOwner) and transport != "batch":
+        raise ValueError("a batch submission reserves batch items only (transport='batch')")
     if transport == "stream" and (logical_call_no is None or deadline_s is None):
         raise ValueError("an online try names its logical call and its deadline")
     if reserved_keys := _RESERVED_REFS & set(input_refs):
@@ -808,6 +842,8 @@ async def reserve(
         )
     p = await current_params(conn)  # 0. active_config FOR SHARE
     await _lock_owner(conn, owner)  # 1. the owner row FOR SHARE
+    if bulk_operation_id is not None:  # under the owner lock: nothing is written before the refusal
+        await _check_own_bulk(conn, owner, bulk_operation_id)
     month = budget.month_of(now)
     await ensure_month(conn, month, p, now)  # 2. a new month from the current settings
     row = await lock_month(conn, month, p, now=now)  # 3. llm_budget FOR UPDATE, accrued
@@ -828,7 +864,7 @@ async def reserve(
             headroom_usd=str(room),
         )
         raise BudgetExhausted(purpose_class, room)
-    # 6. the bulk row FOR UPDATE: the allocation funds the reservation while it fits (L1191)
+    # 6. the bulk row FOR NO KEY UPDATE: the allocation funds the reservation while it fits (L1191)
     funded = None if bulk_operation_id is None else await _fund(conn, bulk_operation_id, r)
     ledger_id = (  # 7.
         await conn.execute(
@@ -964,7 +1000,9 @@ async def mark_batch_dispatched(
     with its call, and each item's attempt and target counted and charged as `mark_dispatched` does (the
     item is its attempt's first logical call, one try). An entry of another submission, an online entry, or
     one no longer `reserved` is `FencedOut` (nothing of the marker may commit: the caller's transaction rolls
-    back). `now` is the caller's clock, as in `mark_dispatched`."""
+    back). `entries` must be every entry the submission still has `reserved`: one left out would stay
+    `reserved` on a submitted batch, which no reconciler ages (L2979), so that is a `ValueError`. `now` is
+    the caller's clock, as in `mark_dispatched`."""
     if not entries:
         return
     ledger_ids = sorted(res.ledger_id for res in entries)
@@ -977,6 +1015,14 @@ async def mark_batch_dispatched(
         row.call_id != calls[row.id] or not row.batch or not _of_submission(row.owner, owner) for row in rows
     ):
         raise FencedOut("llm_spend_ledger")
+    params = {"submission_id": owner.submission_id}
+    reserved = {int(i) for i in (await conn.execute(_SUBMISSION_RESERVED, params)).scalars()}
+    if not reserved >= set(ledger_ids):  # one of them was dispatched or released meanwhile
+        raise FencedOut("llm_spend_ledger")
+    if omitted := sorted(reserved - set(ledger_ids)):
+        raise ValueError(
+            f"the batch dispatch marker names every reserved item of its submission: {omitted} are missing"
+        )
     where = "t.id = ANY(CAST(:ids AS bigint[]))"
     moved = await transition_where(
         conn, "llm_spend_ledger", ["reserved"], "dispatched", where=where, params={"ids": ledger_ids}
