@@ -423,10 +423,6 @@ _LOCK_CYCLE: Final = q(
     "admitted, c_hat_usd FROM score_cycles WHERE id = :c AND worker_epoch = :e AND status = 'running' "
     "FOR SHARE"
 )
-_ADMITTED: Final = q(
-    "UPDATE score_cycles SET admitted = :admitted WHERE id = :c AND worker_epoch = :e AND status = 'running'",
-    jsonb=["admitted"],
-)
 
 
 @dataclass(frozen=True)
@@ -462,17 +458,6 @@ async def lock_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int) -> Cyc
         admitted={str(lane): int(n) for lane, n in stored.items()},
         c_hat_usd=Decimal(row.c_hat_usd),
     )
-
-
-async def record_admitted(
-    conn: AsyncConnection, cycle: CycleRow, counts: Mapping[str, int]
-) -> dict[str, int]:
-    """Add a round's admissions per lane to the cycle's `admitted`, under the owner predicate; the sum."""
-    total = dict(cycle.admitted)
-    for lane, n in counts.items():
-        total[lane] = total.get(lane, 0) + n
-    await conn.execute(_ADMITTED, {"admitted": total, "c": cycle.id, "e": cycle.worker_epoch})
-    return total
 
 
 # ---- the reclaim (§9.4.3) ----------------------------------------------------------------------------------

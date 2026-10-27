@@ -64,6 +64,13 @@ M3 Task 11 adds the cycle's side:
   fake LLM mode) and `run(cycle_id)` (`graph.invoke_cycle` with a fresh `ClaimHeartbeats` on the injected
   `sleep`, kept as `claims`), so a test drives the claim beats with a `ManualSleep`;
 - `cycle_of(engine, cycle_id)`: a cycle's status, reason, trigger, admission, `ĉ`, bucket, spend and report.
+
+M3 Task 12 adds the admission's side:
+- `candidate_targets(engine, *specs)`: one pending target of a new job per `TargetSpec` (its similarity, the
+  job's title, the completeness of the job and of its revision, the lane, the charged attempts, the backoff
+  and the creation time) over the score tuple made active, in order; a spec's default title matches none of
+  `score_profile`'s target titles, so a target is always-include only when a test makes it so;
+- `lane_credits(engine, llm_tuple_id)`: the stored `admission_lane_credits` of the tuple, by lane.
 """
 
 import asyncio
@@ -73,6 +80,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Final, cast
 
 import pytest
@@ -886,3 +894,86 @@ async def cycle_of(engine: AsyncEngine, cycle_id: int) -> Row[Any]:
     spend, report and end."""
     async with engine.connect() as conn:
         return (await conn.execute(_CYCLE_ROW, {"c": cycle_id})).one()
+
+
+# ---- M3 Task 12: the admission ---------------------------------------------------------------------------
+
+# A title that shares too few trigrams with `score_profile`'s target titles ("Backend Engineer",
+# "Backend-Entwickler") to be a title match (`admission.TITLE_MATCH_MIN`).
+UNMATCHED_TITLE: Final = "Lagerlogistik Koordinator (m/w/d)"
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """One candidate target of `candidate_targets` (module notes); `created_at` `None` is the database's
+    `now()`."""
+
+    similarity: float | None = None
+    title: str = UNMATCHED_TITLE
+    completeness: str = "full"
+    lane: str | None = None
+    charged_attempts: int = 0
+    not_before: datetime | None = None
+    created_at: datetime | None = None
+
+
+_CANDIDATE_JOB: Final = q(
+    "INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, work_mode_possible, "
+    "work_mode_source, employment_source, ad_language, completeness, posted_precision, first_seen_at, "
+    "last_seen_at, availability, availability_changed_at, source_ids, field_provenance, det_facts_hash) "
+    "VALUES ('musterfirma', 'Musterfirma', :title, :title_norm, 'unknown', "
+    "ARRAY['remote','hybrid','onsite'], 'none', 'none', 'de', :completeness, 'unknown', now(), now(), "
+    "'active', now(), ARRAY['jsearch'], '{}', '\\x00') RETURNING id"
+)
+_CANDIDATE_REVISION: Final = q(
+    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, description_text, "
+    "description_completeness, ad_language, embedding_status) VALUES (:job, 1, '\\x00', '{}', "
+    "'Erfundene Testanzeige.', :completeness, 'de', 'awaiting_embedding') RETURNING id"
+)
+_CANDIDATE_TARGET: Final = q(
+    "INSERT INTO score_targets (job_revision_id, llm_tuple_id, job_id, state, similarity, lane, "
+    "charged_attempts, not_before, created_at) VALUES (:r, :tuple, :j, 'pending', :similarity, :lane, "
+    ":charged, :not_before, coalesce(CAST(:created_at AS timestamptz), now())) RETURNING id"
+)
+
+
+async def candidate_targets(engine: AsyncEngine, *specs: TargetSpec) -> list[PendingTarget]:
+    """One pending target per spec, in order (module notes)."""
+    made: list[PendingTarget] = []
+    async with engine.begin() as conn:
+        await activate_test_policy(conn)
+        tuple_id = await activate_score_tuple(conn)
+        for spec in specs:
+            title = normalize_title(spec.title)
+            job_params = {
+                "title": title.title,
+                "title_norm": title.title_norm,
+                "completeness": spec.completeness,
+            }
+            job = int((await conn.execute(_CANDIDATE_JOB, job_params)).scalar_one())
+            revision_params = {"job": job, "completeness": spec.completeness}
+            revision = int((await conn.execute(_CANDIDATE_REVISION, revision_params)).scalar_one())
+            await conn.execute(_CURRENT, {"r": revision, "j": job})
+            params = {
+                "r": revision,
+                "tuple": tuple_id,
+                "j": job,
+                "similarity": spec.similarity,
+                "lane": spec.lane,
+                "charged": spec.charged_attempts,
+                "not_before": spec.not_before,
+                "created_at": spec.created_at,
+            }
+            target = int((await conn.execute(_CANDIDATE_TARGET, params)).scalar_one())
+            made.append(PendingTarget(target, job, revision, tuple_id))
+    return made
+
+
+_LANE_CREDITS: Final = q("SELECT lane, credit FROM admission_lane_credits WHERE llm_tuple_id = :t")
+
+
+async def lane_credits(engine: AsyncEngine, llm_tuple_id: int) -> dict[str, Decimal]:
+    """The stored lane credits of the tuple, by lane (none before its first admission)."""
+    async with engine.connect() as conn:
+        rows = await conn.execute(_LANE_CREDITS, {"t": llm_tuple_id})
+        return {str(row.lane): Decimal(row.credit) for row in rows}

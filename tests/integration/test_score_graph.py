@@ -189,13 +189,15 @@ async def test_a_cycle_claims_three_scores_them_together_and_completes_with_its_
     costs = await attempt_costs(engine, cycle_id)
     assert set(costs) == {t.target_id for t in targets} and all(cost > 0 for cost in costs.values())
     spent = sum(costs.values(), Decimal(0))
-    assert (row.status, row.status_reason, row.admitted) == ("completed", None, {"similarity": 3})
+    # the synthetic ad's title is a title match of `score_profile`'s target titles: with S >= 6,
+    # always-include takes all three (at most S // 2 of the similarity slots, Task 12)
+    assert (row.status, row.status_reason, row.admitted) == ("completed", None, {"always_include": 3})
     assert row.spent_usd == spent
     report = row.report
     assert report["outcomes"] == {"published_accepted": 3}
-    assert report["lanes"] == {"similarity": 3}
+    assert report["lanes"] == {"always_include": 3}
     assert Decimal(report["spent_usd"]) == spent
-    assert report["c_hat"] == str(row.c_hat_usd) and report["admission_size"] == row.admission_size >= 3
+    assert report["c_hat"] == str(row.c_hat_usd) and report["admission_size"] == row.admission_size >= 6
     assert report["claim_rounds"] == 1 and final["claim_rounds"] == 1
     assert set(report["cache"]) == {"reads", "writes", "hit_ratio"}
     # Codex r1 #13: one TargetOutcome per work id, projected from the final state and the attempt row
@@ -205,7 +207,7 @@ async def test_a_cycle_claims_three_scores_them_together_and_completes_with_its_
             "attempt_no": 1,
             "outcome": "published_accepted",
             "state": "published_accepted",
-            "lane": "similarity",
+            "lane": "always_include",
             "cost_usd": str(costs[t.target_id]),
         }
         for t in targets
@@ -282,8 +284,8 @@ async def test_a_score_now_trigger_during_a_cycle_is_admitted_in_the_next_claim_
         counts = {int(r[0]): int(r[1]) for r in await conn.execute(attempts)}
     assert counts == {t.target_id: 1 for t in (*targets, late)}  # the first round's three claimed once
     row = await cycle_of(engine, cycle_id)
-    assert row.admitted == {"similarity": 3, "score_now": 1}
-    assert (row.report["claim_rounds"], row.report["lanes"]) == (2, {"similarity": 3, "score_now": 1})
+    assert row.admitted == {"always_include": 3, "score_now": 1}  # the title matches, as above
+    assert (row.report["claim_rounds"], row.report["lanes"]) == (2, {"always_include": 3, "score_now": 1})
     assert (await target_of(engine, late.target_id)).state == "published_accepted"
 
 
