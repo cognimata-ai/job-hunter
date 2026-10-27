@@ -958,7 +958,8 @@ def _iso_countries() -> frozenset[str]:
 
 def valid_country(code: JSONValue) -> bool:
     """Whether `code` is an ISO 3166-1 alpha-2 code, trimmed and in any case: what V1 and the publication
-    repair keep in `countries`, and what the strict publication model admits (`schemas.published`)."""
+    repair keep in `countries` (the repair writes it trimmed and upper case; the strict publication model,
+    `schemas.published`, admits only that canonical form)."""
     return isinstance(code, str) and code.strip().upper() in _iso_countries()
 
 
