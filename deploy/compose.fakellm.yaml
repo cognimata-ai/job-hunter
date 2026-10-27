@@ -5,6 +5,11 @@
 #   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fakellm.yaml \
 #     up -d --build --wait
 #
+# The same mount serves the Message Batches API (M3 Task 8): with no test to register a script, the fake
+# answers every batch as `BatchScript()` does (one in-progress poll, then every item succeeded), each item's
+# message made from the committed `generate` recording of its model and schema (an item without one is
+# errored). Batches live in the worker's memory only, and its batch ids never repeat across restarts.
+#
 # Never in prod: the startup assertion `fake_mode_in_prod` refuses JOBHUNTER_FAKE_LLM there (exit 78).
 services:
   worker:

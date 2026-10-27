@@ -9,7 +9,9 @@ the `httpx2` client the SDK sends through.
   because the SDK sends its own `timeout` with each request and that wins over the http client's (spike V5,
   `docs/spikes/V5.md`). So the client object carries the one timeout of every request.
 - In fake LLM mode (`AppConfig.fake_llm`) the client sends every request for the API origin to
-  `fake.RecordedSSETransport(cfg.fake_llm_dir)`, and nothing else is reachable.
+  `fake.RecordedSSETransport(cfg.fake_llm_dir)`, and nothing else is reachable. The one mount covers every
+  route of the origin: the Messages API, `count_tokens` and the Message Batches API (`fake.BATCHES_PATH`, M3
+  Task 8), which the fake answers from the state's batch script.
 
 `httpx2` is the SDK's transport (`anthropic` 1.x). It is not `httpx`, the adapters' transport, and an object
 of one is never passed to the other.

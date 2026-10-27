@@ -27,6 +27,10 @@ of `in_batch` targets with their batch attempts and items) with the `submission_
 naming the owner's real target and attempt, `batch_kw` (one batch item's reservation), `attempt_and_target`
 (the attempt and target counters) and `reclaim_target` (the claim's reclaim and a new claim).
 
+M3 Task 8 adds the keyed answers and the batch side: `FakeLLM.answer` (a stream for one job revision's key,
+by default a valid C draft) and `synthetic_message_json` (a non-streamed message, the shape of a batch item's
+`succeeded` result); `tests/support/batches.py` holds the batch script builders.
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
@@ -67,6 +71,8 @@ from jobhunter.llm.gateway import (
 from jobhunter.llm.pricing import MODELS, Usage
 from jobhunter.llm.prompts.render import PromptVersion, prompt_schema_hash, prompt_schema_v1, prompt_schema_v2
 from jobhunter.llm.schemas import ParserFamily
+from jobhunter.llm.schemas.critic import CriticOut
+from jobhunter.llm.schemas.generator import GeneratorWire
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import (
     BatchState,
@@ -98,6 +104,7 @@ from tests.support.m3 import (
     insert_target,
 )
 from tests.support.pg import PgServer, pg_one
+from tests.support.quota import seeded_payload
 
 _ACTIVE_EXECUTION_CONFIG: Final = "SELECT execution_config_id FROM active_config WHERE id = 1"
 _MONTH: Final = q(
@@ -737,6 +744,37 @@ def synthetic_sse(
     return fake.render_sse(events)
 
 
+def synthetic_message_json(
+    body: Any,
+    *,
+    model: str,
+    stop_reason: str = "end_turn",
+    usage: dict[str, int] | None = None,
+    stop_details: dict[str, Any] | None = None,
+    message_id: str = "msg_0123456789synthetic",
+) -> dict[str, Any]:
+    """A non-streamed Messages answer whose text is `body` (a JSON value, a string sent as it is, or `None`
+    for no content, a refusal's), as a batch item's `succeeded` result carries it (M3 Task 8): one text
+    block, the stop reason and `stop_details`, and `usage` with the four token counts of `synthetic_sse`'s
+    defaults updated by `usage`. No thinking block. Every value is synthetic."""
+    content: list[dict[str, Any]] = []
+    if body is not None:
+        text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+        content = [{"type": "text", "text": text}]
+    return {
+        "model": model,
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "container": None,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "stop_details": stop_details,
+        "usage": {**_SYNTHETIC_USAGE, **(usage or {})},
+    }
+
+
 # The one response header a hand-authored stream keeps: the fixture PII gate allows it, the fake serves it.
 SYNTHETIC_HEADERS: Final = {"content-type": "text/event-stream; charset=utf-8"}
 
@@ -977,6 +1015,33 @@ class FakeLLM(FakeAnthropic):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(synthetic_sse(body, model=model, **sse))
         return path
+
+    def answer(
+        self,
+        purpose: str,
+        job_revision_id: int,
+        body: Any = None,
+        *,
+        round: int = 0,
+        schema: type[BaseModel] = GeneratorWire,
+        model: str | None = None,
+        consume: bool = False,
+        **sse: Any,
+    ) -> str:
+        """Register `synthetic_sse(body, model=model, **sse)` for the key of `purpose`, `job_revision_id` and
+        `round` (`fake.answer_key`, as the gateway sends it in fake mode) and return the key, so each target
+        of a test gets its own answer. Without a `body`, the valid synthetic body of `schema`: a C draft
+        (`generator_wire_body`) for `GeneratorWire`, the critic's (`critic_body`) for `CriticOut`. `model`
+        is the served model, by default the seeded policy's model of `purpose`. `consume` makes it a one-shot
+        answer (`fake.answer`)."""
+        key = fake.answer_key(purpose, {"job_revision_id": job_revision_id}, round)
+        if body is None:
+            if schema not in _DEFAULT_BODIES:
+                raise ValueError(f"no default body for {schema.__name__}: pass a body")
+            body = _DEFAULT_BODIES[schema]()
+        served = model if model is not None else _policy_model(purpose)
+        fake.answer(key, synthetic_sse(body, model=served, **sse), consume=consume)
+        return key
 
     def gateway(
         self,
@@ -1322,6 +1387,21 @@ def synthetic_generator_sse(body: Any = None, *, model: str, **sse: Any) -> byte
 def synthetic_critic_sse(body: Any = None, *, model: str, **sse: Any) -> bytes:
     """A critic-shaped stream (`critic_body` unless `body` is given), as `synthetic_sse`."""
     return synthetic_sse(critic_body() if body is None else body, model=model, **sse)
+
+
+# The valid synthetic body of a mirror, `FakeLLM.answer`'s default (M3 Task 8).
+_DEFAULT_BODIES: Final[Mapping[type[BaseModel], Callable[[], dict[str, Any]]]] = {
+    GeneratorWire: generator_wire_body,
+    CriticOut: critic_body,
+}
+
+
+def _policy_model(purpose: str) -> str:
+    """The model the seeded model policy (`settings_v1.json`) gives `purpose`'s node."""
+    nodes = seeded_payload()["scoring"]["model_policy"]["nodes"]
+    if purpose not in nodes:
+        raise ValueError(f"the seeded policy has no node {purpose!r}: pass a model")
+    return str(nodes[purpose]["model"])
 
 
 def generator_draft_body(*, not_a_job_ad: bool = False) -> dict[str, Any]:

@@ -94,6 +94,10 @@ critic's per-round effort; `reservation_for` states the worst case `call()` rese
 and `batch_request_body` the batch params of a request (the online body with `max_tokens`, without `stream`,
 L3932). Alerts and errors quote provider metadata only as it is stored (`spend_ledger.storable_text`).
 
+**The fake's key** (M3 Task 8). In fake LLM mode (`AppConfig.fake_llm`) every try also sends `X-JH-Fake-Key`,
+`fake.answer_key(purpose, input_refs, round)` of the node, the prompt's `input_refs` and `CallContext.round`,
+by which a test gives each target its own answer (`llm/fake.py`); outside fake mode no request carries it.
+
 **The schema** of a node is a `WireSchema`, two inputs and never one (plan Deviation 40): `json`, the stored
 wire schema the request sends (`output_config.format.schema`: `output_schema`, `count_body` and the byte bound
 read it as it is, and the try binds `anthropic.transform_schema` of it as langchain's json_schema method does,
@@ -159,7 +163,7 @@ from jobhunter.llm.errors import (
     ModelMismatch,
     Refused,
 )
-from jobhunter.llm.fake import PURPOSE_HEADER, canonical_schema_json
+from jobhunter.llm.fake import KEY_HEADER, PURPOSE_HEADER, answer_key, canonical_schema_json
 from jobhunter.llm.pricing import (
     CONTEXT_WINDOW,
     MODELS,
@@ -339,6 +343,7 @@ def _chat_model(
     http_client: httpx2.AsyncClient,
     purpose: Purpose | None = None,
     receipt: TryReceipt | None = None,
+    fake_key: str | None = None,
 ) -> GatewayChatAnthropic:
     if not api_key.get_secret_value():
         raise ValueError("an empty api_key: the gateway passes the anthropic_key secret explicitly (G1)")
@@ -346,6 +351,10 @@ def _chat_model(
         raise ValueError("max_tokens must be positive (G4)")
     if effort not in SUPPORTED_EFFORTS[model]:
         raise ValueError(f"{model} does not support effort {effort!r} (G5)")
+    headers = {
+        **({PURPOSE_HEADER: purpose} if purpose is not None else {}),
+        **({KEY_HEADER: fake_key} if fake_key is not None else {}),
+    }
     return GatewayChatAnthropic(
         model=model,
         base_url=ANTHROPIC_BASE_URL,
@@ -356,7 +365,7 @@ def _chat_model(
         max_retries=0,
         timeout=http_client.timeout,
         http_client=http_client,
-        default_headers={PURPOSE_HEADER: purpose} if purpose is not None else None,
+        default_headers=headers or None,
         receipt=receipt,
     )
 
@@ -371,6 +380,7 @@ def _chat(
     http_client: httpx2.AsyncClient,
     purpose: Purpose | None = None,
     receipt: TryReceipt | None = None,
+    fake_key: str | None = None,
 ) -> StructuredChat:
     """The §10.2 runnable of one try: `ainvoke(messages)` streams once and returns `{"raw", "parsed",
     "parsing_error"}`, as `with_structured_output(…, method="json_schema", include_raw=True)` does.
@@ -385,10 +395,19 @@ def _chat(
     The request carries `output_config.format` (`anthropic.transform_schema(schema)`) and
     `output_config.effort`, `stream: true` and exactly `max_tokens`; no tools, `tool_choice`, sampling
     parameters, betas or fallbacks (G2, G4, G6). `purpose` is sent as `X-JH-Purpose`, by which the fake
-    transport chooses its recording; the API ignores the header. `receipt` keeps the HTTP response.
+    transport chooses its recording; the API ignores the header. `fake_key` is sent as `X-JH-Fake-Key`, by
+    which the fake chooses a keyed answer (M3 Task 8): the gateway passes it in fake mode only, so no request
+    to the API carries it. `receipt` keeps the HTTP response.
     """
     llm = _chat_model(
-        model, effort, max_tokens, api_key=api_key, http_client=http_client, purpose=purpose, receipt=receipt
+        model,
+        effort,
+        max_tokens,
+        api_key=api_key,
+        http_client=http_client,
+        purpose=purpose,
+        receipt=receipt,
+        fake_key=fake_key,
     )
     if isinstance(schema, type):
         # `include_raw=True`: the output is always the `{"raw", "parsed", "parsing_error"}` dict.
@@ -839,6 +858,7 @@ class LLMGateway:
         self._sleep = sleep
         self._cache = cache
         self._key = _api_key(cfg)
+        self._fake_llm = cfg.fake_llm  # only the fake is sent `X-JH-Fake-Key`
 
     @property
     def configured(self) -> bool:
@@ -874,6 +894,7 @@ class LLMGateway:
             raise InputUnbounded("unencodable")
         rendered, prefix = hashes
         bound = await self._input_bound(node, prompt, native_pdf=ctx.native_pdf)
+        fake_key = answer_key(node.purpose, prompt.input_refs, ctx.round) if self._fake_llm else None
         counted = Decimal(0)
         stages: tuple[tuple[Stage, int], ...] = (
             ("first", node.max_tokens),
@@ -897,6 +918,7 @@ class LLMGateway:
                     http_client=self._http,
                     purpose=node.purpose,
                     receipt=receipt,
+                    fake_key=fake_key,
                 )
                 res = await self._reserve(
                     node, prompt, ctx, stage, transport_try, max_tokens, bound, rendered, prefix
