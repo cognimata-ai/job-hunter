@@ -205,7 +205,9 @@ class RecordingSweeps:
         self._moved = moved
 
     def sweep(self, name: str) -> admission.Sweep:
-        async def run(conn: AsyncConnection, cycle: CycleRow, /, *, now: datetime) -> int:
+        async def run(
+            conn: AsyncConnection, cycle: CycleRow, /, *, now: datetime, held: frozenset[int]
+        ) -> int:
             self.calls.append((name, cycle.id, now))
             if name == "expiry" and self._on_expiry is not None:
                 await conn.execute(self._on_expiry)

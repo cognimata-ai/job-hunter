@@ -13,6 +13,8 @@ Every datum is invented.
 """
 
 import asyncio
+import dataclasses
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -21,11 +23,14 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import transition
+from jobhunter.llm import bulk
 from jobhunter.scoring import admission, cycles, targets
 from jobhunter.scoring.cycles import CycleRow
 from jobhunter.scoring.targets import ExpirySwept, RefilterSwept, RegroupSwept
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.tasks import defer_in_tx, task_app
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.m3 import insert_cycle
@@ -174,6 +179,38 @@ async def test_stale_and_unknown_availability_never_expire(
     assert await state(engine, expired) == ("pending", None)
 
 
+async def test_a_stale_job_past_the_age_expires_too_old(
+    engine: AsyncEngine, tuple_id: int, now: datetime
+) -> None:
+    async with engine.begin() as conn:
+        old = await aged_job(conn, now=now, first_seen_days=31, availability="stale")
+        target = await state_target(conn, old, tuple_id, "pending")
+    assert await expire(engine, tuple_id, now) == ExpirySwept(expired=1, revived=0)
+    assert await state(engine, target) == ("expired_unscored", "too_old")
+
+
+async def test_the_posted_date_decides_before_the_first_sighting(
+    engine: AsyncEngine, tuple_id: int, now: datetime
+) -> None:
+    # `coalesce(posted_at_effective, first_seen_at)`: a posted date past the cutoff expires a job first seen
+    # within it, and the first sighting decides only without a posted date. The opposite case, first seen
+    # long ago but posted recently, cannot exist: §7.9's CHECK keeps the posted date at or before the
+    # first sighting.
+    async with engine.begin() as conn:
+        posted_old = await state_target(
+            conn, await aged_job(conn, now=now, first_seen_days=1, posted_days=31), tuple_id, "pending"
+        )
+        unposted = await state_target(
+            conn, await aged_job(conn, now=now, first_seen_days=29), tuple_id, "pending"
+        )
+    assert await expire(engine, tuple_id, now) == ExpirySwept(expired=1, revived=0)
+    assert await state(engine, posted_old) == ("expired_unscored", "too_old")
+    assert await state(engine, unposted) == ("pending", None)
+    with pytest.raises(IntegrityError, match="jobs_check"):
+        async with engine.begin() as conn:
+            await aged_job(conn, now=now, first_seen_days=45, posted_days=10)
+
+
 async def test_an_expired_followup_target_releases_its_hold_once(
     engine: AsyncEngine, tuple_id: int, now: datetime
 ) -> None:
@@ -209,7 +246,9 @@ async def test_refilter_moves_failing_targets_out_and_passing_ones_back(
         unchecked = await aged_job(conn, now=now)  # no result for the scope: no positive evidence
         group = await member_group(conn, passing[2], [failing[2]])
         made = {
-            "pending": await state_target(conn, failing[0], tuple_id, "pending"),
+            "pending": await state_target(
+                conn, failing[0], tuple_id, "pending", state_reason="batch_expired"
+            ),
             "deferred": await state_target(conn, failing[1], tuple_id, "budget_deferred"),
             "duplicate": await state_target(
                 conn, failing[2], tuple_id, "deferred_duplicate", deferred_group_id=group
@@ -237,7 +276,9 @@ async def test_refilter_moves_failing_targets_out_and_passing_ones_back(
             scope,
             None,
         )
-    assert (await swept_of(engine, made["deferred"])).state_reason == "budget_exhausted"  # the reason is kept
+    # Controller ruling T13-c: the denial's reason belongs to `budget_deferred`; any other reason is kept
+    assert (await swept_of(engine, made["deferred"])).state_reason is None
+    assert (await swept_of(engine, made["pending"])).state_reason == "batch_expired"
     assert (await swept_of(engine, made["guarded_out"])).state == "pending"
     assert (await swept_of(engine, made["outside"])).state == "failed_request"
     back = await swept_of(engine, made["back"])
@@ -273,7 +314,7 @@ async def test_regroup_defers_deferrable_members_and_returns_the_others(
     assert (deferred.state, deferred.deferred_group_id, deferred.state_reason) == (
         "deferred_duplicate",
         group,
-        "budget_exhausted",
+        None,  # Controller ruling T13-c
     )
     for name in ("representative", "individual", "guarded"):
         assert (await swept_of(engine, made[name])).state == "pending", name
@@ -464,6 +505,56 @@ async def test_admit_locks_the_bulk_rows_before_its_first_target_row(
     assert await state(engine, spent) == ("failed_attempts_exhausted", "attempts_exhausted")
     held = await hold_of(engine, operation, item)
     assert held.followup_held_usd == Decimal("0.000000") and held.hold_released_at is not None
+
+
+async def test_a_candidate_exhausted_after_the_pre_lock_waits_for_the_next_cycle(
+    engine: AsyncEngine, tuple_id: int, now: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Controller carry T13-a: the exhaustion move is restricted to the ids the pre-lock covered, so no bulk
+    # row is taken after `admit`'s target rows, and the bulk rows are locked once per transaction, in id order
+    async with engine.begin() as conn:
+        spent = await state_target(
+            conn, await aged_job(conn, now=now), tuple_id, "pending", charged_attempts=4
+        )
+        late = await state_target(
+            conn, await aged_job(conn, now=now), tuple_id, "pending", charged_attempts=3
+        )
+        operation, item = await followup_hold(conn, tuple_id, late, hold=Decimal("0.100000"))
+        cycle_id = await insert_cycle(conn, tuple_id)
+    calls: list[list[int]] = []
+    lock_for_targets = bulk.lock_for_targets
+
+    async def recorded(conn: AsyncConnection, target_ids: Sequence[int]) -> None:
+        calls.append(list(target_ids))
+        await lock_for_targets(conn, target_ids)
+
+    monkeypatch.setattr(bulk, "lock_for_targets", recorded)
+
+    async def charge_late(
+        conn: AsyncConnection, cycle: CycleRow, /, *, now: datetime, held: frozenset[int]
+    ) -> int:
+        # `late` reaches its fourth charge after the pre-lock (a batch item's decision committing meanwhile)
+        await conn.execute(
+            sa.text("UPDATE score_targets SET charged_attempts = 4 WHERE id = :t"), {"t": late}
+        )
+        return 0
+
+    sweeps = dataclasses.replace(admission.CYCLE_SWEEPS, regroup=charge_late)
+    async with engine.begin() as conn:
+        await admission.admit(conn, await owned(conn, cycle_id), now=now, sweeps=sweeps)
+    assert calls == [[spent]]  # one pre-lock, before the sweeps; `late` was no candidate then
+    assert await state(engine, spent) == ("failed_attempts_exhausted", "attempts_exhausted")
+    assert await state(engine, late) == ("pending", None)  # left for the next cycle
+    assert (await hold_of(engine, operation, item)).hold_released_at is None
+    calls.clear()
+    async with engine.begin() as conn:
+        await transition(conn, "score_cycles", cycle_id, ["running"], "completed")
+        next_cycle = await insert_cycle(conn, tuple_id)
+    async with engine.begin() as conn:
+        await admission.admit(conn, await owned(conn, next_cycle), now=now, sweeps=admission.CYCLE_SWEEPS)
+    assert calls == [[late]]
+    assert await state(engine, late) == ("failed_attempts_exhausted", "attempts_exhausted")
+    assert (await hold_of(engine, operation, item)).hold_released_at is not None
 
 
 # ---- the `expiry_sweep` reconciler (L5513) -----------------------------------------------------------

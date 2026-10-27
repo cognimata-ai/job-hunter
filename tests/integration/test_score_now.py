@@ -11,13 +11,16 @@ writing it. `budget_release` creates a fresh month's row and releases against it
 month's cap alert at the first tick of the next, and resolves the current one when headroom returns, so a
 second denial in a month pauses without a second alert. A `budget_release` holding the month row and a
 `score_now` on a `budget_deferred` target never wait on each other on the month row, in either order.
-`retry` resets the charged attempts; `score_individually` sets the membership flag and the override;
-`acknowledge_alert` lifts the bound pause.
+`budget_release` leaves another tuple's targets alone, keeps the reconcilers' fence rule and logs bounded ids.
+`retry` resets the charged attempts; `score_individually` sets the membership flag (with or without a target)
+and the override and leaves the member to normal admission (Controller ruling T13-b); a move clears a
+carried `budget_exhausted` reason (T13-c); `acknowledge_alert` lifts the bound pause.
 
 Every datum is invented.
 """
 
 import asyncio
+import logging
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from typing import Any
@@ -33,16 +36,19 @@ from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT, CAP_REACHED_ALERT, 
 from jobhunter.observability.alerts import acknowledge_alert, raise_alert
 from jobhunter.scoring import cycles, targets
 from jobhunter.scoring.targets import ScoreNow, ScoreNowRefused
-from jobhunter.worker.tasks import defer_in_tx, job_task_name
+from jobhunter.worker.reconcilers import ReconcileContext
+from jobhunter.worker.tasks import defer_in_tx, job_task_name, task_app
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import PausePoint
 from tests.support.fixtures import count_rows
 from tests.support.llm import budget_rows, open_alerts, save_budget, scoring_kw
+from tests.support.logs import logged
+from tests.support.m2 import insert_profile_chain
 from tests.support.m3 import Job, insert_claimed, insert_published
 from tests.support.pg import PgServer, lock_wait_details
 from tests.support.procs import await_until
-from tests.support.reconcile import run_reconciler
+from tests.support.reconcile import assert_fence_rule, run_reconciler
 from tests.support.scoring import (
     activate_score_tuple,
     aged_job,
@@ -97,6 +103,11 @@ async def queued(engine: AsyncEngine) -> list[tuple[str | None, str]]:
             {"t": SCORE_CYCLE},
         )
         return [(r.queueing_lock, r.status) for r in rows]
+
+
+async def state_of(engine: AsyncEngine, target_id: int) -> tuple[str, str | None]:
+    row = await swept_of(engine, target_id)
+    return row.state, row.state_reason
 
 
 async def target_job(engine: AsyncEngine, tuple_id: int, state: str, **columns: Any) -> tuple[Job, int]:
@@ -240,6 +251,24 @@ async def test_score_now_on_a_fresh_month_needs_no_row(
     assert await count_rows(engine, "llm_budget") == 0
 
 
+@pytest.mark.parametrize("state", ["pending", "deferred_duplicate", "filtered_out"])
+async def test_a_carried_budget_reason_is_cleared_by_score_now(
+    engine: AsyncEngine, queue_app: procrastinate.App, tuple_id: int, scope: int, now: datetime, state: str
+) -> None:
+    # Controller ruling T13-c: `budget_exhausted` belongs to `budget_deferred`; a move of a target that still
+    # carries it clears it (a row written before the ruling, or carried by an earlier move)
+    columns: dict[str, Any] = {"state_reason": "budget_exhausted"}
+    async with engine.begin() as conn:
+        job = await aged_job(conn)
+        if state == "deferred_duplicate":
+            columns["deferred_group_id"] = await member_group(conn, await aged_job(conn), [job])
+        if state == "filtered_out":
+            columns["filter_scope_version_id"] = scope
+        target = await state_target(conn, job, tuple_id, state, **columns)
+    assert await act(engine, job.job_id, now, force=True) == ScoreNow(target, "pending")
+    assert (await swept_of(engine, target)).state_reason is None
+
+
 # ---- budget_release (§6.9.4, L1201, L5506) ---------------------------------------------------------------
 
 
@@ -276,6 +305,65 @@ async def test_budget_release_returns_the_k_oldest_deferred_targets(
     assert await run_reconciler("budget_release", engine, now=now, epoch=current_epoch) == 2
     states = [(await swept_of(engine, t)).state for t in deferred]
     assert states == ["pending", "budget_deferred", "pending"]
+
+
+async def test_budget_release_leaves_another_tuples_deferred_targets_alone(
+    engine: AsyncEngine, queue_app: procrastinate.App, current_epoch: int, tuple_id: int, now: datetime
+) -> None:
+    _, ours = await target_job(engine, tuple_id, "budget_deferred")
+    async with engine.begin() as conn:
+        other_tuple = (await insert_profile_chain(conn, 77)).llm_tuple_id
+        theirs = await state_target(conn, await aged_job(conn), other_tuple, "budget_deferred")
+    assert await run_reconciler("budget_release", engine, now=now, epoch=current_epoch) == 1
+    assert (await swept_of(engine, ours)).state == "pending"
+    assert await state_of(engine, theirs) == ("budget_deferred", "budget_exhausted")
+
+
+async def test_budget_release_keeps_the_fence_rule(
+    engine: AsyncEngine, queue_app: procrastinate.App, current_epoch: int, tuple_id: int, now: datetime
+) -> None:
+    _, target = await target_job(engine, tuple_id, "budget_deferred")  # what a pass that ran would release
+    before = await generation(engine)
+    await assert_fence_rule(
+        "budget_release",
+        "tick",
+        ReconcileContext(
+            engine=engine, queue=task_app(), defer=defer_in_tx, now=now, epoch=current_epoch + 1
+        ),
+        ReconcileContext(engine=engine, queue=task_app(), defer=defer_in_tx, now=now, epoch=current_epoch),
+        targets,
+    )
+    assert await state_of(engine, target) == ("budget_deferred", "budget_exhausted")  # nothing written
+    assert await count_rows(engine, "llm_budget") == 0 and await generation(engine) == before
+
+
+async def test_budget_release_logs_a_stale_alert_without_headroom_and_bounds_its_ids(
+    engine: AsyncEngine,
+    queue_app: procrastinate.App,
+    current_epoch: int,
+    tuple_id: int,
+    now: datetime,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    september = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+    async with engine.begin() as conn:
+        await spend_ledger.ensure_month(
+            conn, date(2026, 9, 1), await spend_ledger.current_params(conn), september
+        )
+        await spend_ledger.raise_cap_reached(
+            conn, date(2026, 9, 1), quarantined_usd=Decimal(0), now=september
+        )
+    await save_budget(engine, now=now, cap_usd="2.10")  # a scoring share of $0.095 < r_first: k = 0
+    assert await run_reconciler("budget_release", engine, now=now, epoch=current_epoch) == 0
+    (quiet,) = logged(caplog, "score_budget_released")
+    assert (quiet["k"], quiet["released"], quiet["stale_cap_alerts_resolved"]) == (0, 0, 1)
+    caplog.clear()
+    deferred = [(await target_job(engine, tuple_id, "budget_deferred"))[1] for _ in range(23)]
+    await save_budget(engine, now=now, cap_usd="100.00")
+    assert await run_reconciler("budget_release", engine, now=now, epoch=current_epoch) == 23
+    (event,) = logged(caplog, "score_budget_released")
+    assert event["released"] == 23 and event["target_ids"] == sorted(deferred)[:20]  # bounded: the first 20
 
 
 async def test_a_previous_months_cap_alert_does_not_pause_the_new_month(
@@ -438,39 +526,79 @@ async def test_retry_resets_the_charged_attempts_and_requests_a_score_now_cycle(
         )
 
 
-async def test_score_individually_sets_the_membership_flag_and_the_override(
+async def flag_of(engine: AsyncEngine, job: Job) -> bool:
+    async with engine.connect() as conn:
+        found = await conn.execute(
+            sa.text("SELECT score_individually FROM duplicate_group_members WHERE job_id = :j"),
+            {"j": job.job_id},
+        )
+        return bool(found.scalar_one())
+
+
+async def test_score_individually_leaves_the_member_to_normal_admission(
     engine: AsyncEngine, queue_app: procrastinate.App, tuple_id: int, now: datetime
 ) -> None:
+    # Controller ruling T13-b (S:L2878, L3599, L4983, L5241): the flag and the override, the member leaves its
+    # deferral and waits in normal admission: its lane is left alone and no cycle is requested
     async with engine.begin() as conn:
         representative, member, outsider = await aged_job(conn), await aged_job(conn), await aged_job(conn)
         group = await member_group(conn, representative, [member])
-        target = await state_target(conn, member, tuple_id, "deferred_duplicate", deferred_group_id=group)
-        await state_target(conn, outsider, tuple_id, "pending")
-    async with engine.begin() as conn:
-        moved = await targets.score_individually(
-            conn, group_id=group, job_id=member.job_id, now=now, defer=defer_in_tx
+        target = await state_target(
+            conn, member, tuple_id, "deferred_duplicate", deferred_group_id=group, lane="oldest"
         )
-    assert moved == ScoreNow(target, "pending")
+        await state_target(conn, outsider, tuple_id, "pending")
+    before = await generation(engine)
+    async with engine.begin() as conn:
+        moved = await targets.score_individually(conn, group_id=group, job_id=member.job_id, now=now)
+    assert moved == targets.IndividualMember(group, member.job_id, target, "pending")
     row = await swept_of(engine, target)
     assert (row.state, row.deferred_group_id, row.override, row.override_at, row.lane) == (
         "pending",
         None,
         "individual",
         now,
-        "score_now",
+        "oldest",
     )
-    async with engine.connect() as conn:
-        flag = await conn.execute(
-            sa.text("SELECT score_individually FROM duplicate_group_members WHERE job_id = :j"),
-            {"j": member.job_id},
-        )
-        assert flag.scalar_one() is True
-    assert await queued(engine) == [("score_cycle:score_now", "todo")]
+    assert await flag_of(engine, member) is True
+    assert await queued(engine) == []  # no Score now cycle: normal admission takes it
+    assert await generation(engine) == before + 1
     async with engine.begin() as conn:  # the regroup sweep leaves it alone from now on
         assert await targets.regroup_sweep(conn, llm_tuple_id=tuple_id) == targets.RegroupSwept(0, 0)
         assert await targets.score_individually(
-            conn, group_id=group, job_id=outsider.job_id, now=now, defer=defer_in_tx
+            conn, group_id=group, job_id=outsider.job_id, now=now
         ) == ScoreNowRefused("not_found")
+
+
+_LATER_REVISION = sa.text(
+    "INSERT INTO job_revisions (job_id, revision_no, material_hash, llm_input, description_text, "
+    "description_completeness, ad_language, embedding_status) VALUES (:j, 2, '\\x01', '{}', "
+    "'Erfundene Testanzeige, neu.', 'full', 'de', 'awaiting_embedding') RETURNING id"
+)
+
+
+async def test_score_individually_sets_the_flag_of_a_member_without_a_target(
+    engine: AsyncEngine, queue_app: procrastinate.App, tuple_id: int, now: datetime
+) -> None:
+    # S:L3271: the flag survives into the member's later revisions, so it is set without a target too
+    async with engine.begin() as conn:
+        representative, member, other = await aged_job(conn), await aged_job(conn), await aged_job(conn)
+        group = await member_group(conn, representative, [member, other])
+    async with engine.begin() as conn:
+        done = await targets.score_individually(conn, group_id=group, job_id=member.job_id, now=now)
+    assert done == targets.IndividualMember(group, member.job_id, None, None)
+    assert await flag_of(engine, member) is True and await queued(engine) == []
+    async with engine.begin() as conn:  # a later revision of each member, each with its pending target
+        later: dict[str, int] = {}
+        for name, job in (("member", member), ("other", other)):
+            revision = int((await conn.execute(_LATER_REVISION, {"j": job.job_id})).scalar_one())
+            await conn.execute(
+                sa.text("UPDATE jobs SET current_revision_id = :r WHERE id = :j"),
+                {"r": revision, "j": job.job_id},
+            )
+            later[name] = await state_target(conn, Job(job.job_id, revision), tuple_id, "pending")
+        assert await targets.regroup_sweep(conn, llm_tuple_id=tuple_id) == targets.RegroupSwept(1, 0)
+    assert (await swept_of(engine, later["member"])).state == "pending"  # the flag keeps it out of deferral
+    assert (await swept_of(engine, later["other"])).state == "deferred_duplicate"
 
 
 async def test_acknowledge_alert_lifts_the_pause_and_keeps_the_alert_open(

@@ -68,11 +68,12 @@ Null-similarity targets (awaiting their embedding) are candidates of oldest, exp
 
 **The two calls** (Ruling P12; the `admit` node's transaction, which holds `active_config FOR SHARE` and the
 cycle `FOR SHARE` under its owner predicate):
-- `admit(conn, cycle, *, now, sweeps)`, a cycle's first round: the sweeps `expiry`, `refilter`, `regroup` and
-  `exhaustion` in that order (injected: `Sweeps`; the node passes `CYCLE_SWEEPS`, Task 13's sweeps of
-  `scoring.targets` for the cycle's tuple and scope, the expiry with the active `max_ad_age_days`, whose
-  adapter first locks the bulk rows of both hold-releasing sweeps' candidates: Ruling P52); the Score now
-  targets (lane `score_now`, id order) and the candidates; `LaneCredits.lock`; `allocate(credits, S)` with
+- `admit(conn, cycle, *, now, sweeps)`, a cycle's first round: the pre-lock phase, then the sweeps `expiry`,
+  `refilter`, `regroup` and `exhaustion` in that order (injected: `Sweeps`; the node passes `CYCLE_SWEEPS`,
+  Task 13's sweeps of `scoring.targets` for the cycle's tuple and scope, the expiry with the active
+  `max_ad_age_days`; the pre-lock locks the bulk rows of both hold-releasing sweeps' candidates once, and
+  those two sweeps move only the candidates it covered, `held`: Ruling P52, carries T12-c, T13-a); the Score
+  now targets (lane `score_now`, id order) and the candidates; `LaneCredits.lock`; `allocate(credits, S)` with
   `S = cycle.admission_size`; `select`; the debited credits saved; `admitted` written; and, when a sweep moved
   a target, `ranking.bump` as the last statement. The picks in admission order.
 - `admit_urgent(conn, cycle, *, now, slots_left)`, a later claim round (Codex r1 #14): no sweep, no credit;
@@ -534,44 +535,69 @@ class LaneCredits:
 
 
 class Sweep(Protocol):
-    """One of the sweeps `admit` runs first (Task 13's), in the caller's transaction: the targets it moved."""
+    """One of the sweeps `admit` runs first (Task 13's), in the caller's transaction: the targets it moved.
+    `held` are the targets whose bulk rows the round's pre-lock locked (`Sweeps.prelock`)."""
 
-    async def __call__(self, conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int: ...
+    async def __call__(
+        self, conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime, held: frozenset[int]
+    ) -> int: ...
+
+
+class PreLock(Protocol):
+    """The pre-lock phase `admit` runs before its sweeps: the targets whose bulk rows it locked."""
+
+    async def __call__(
+        self, conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime
+    ) -> frozenset[int]: ...
+
+
+async def _locks_nothing(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> frozenset[int]:
+    return frozenset()
 
 
 @dataclass(frozen=True)
 class Sweeps:
-    """The sweeps of a cycle's first round, run in this order (L3610-3612, and the exhaustion sweep)."""
+    """The sweeps of a cycle's first round, run in this order (L3610-3612, and the exhaustion sweep), after
+    the pre-lock phase (`prelock`, none by default)."""
 
     expiry: Sweep
     refilter: Sweep
     regroup: Sweep
     exhaustion: Sweep
+    prelock: PreLock = _locks_nothing
 
 
 # The adapters of `CYCLE_SWEEPS` onto `targets`' sweeps (Task 13), for the cycle's tuple and scope, in the
-# `admit` node's transaction (`active_config FOR SHARE` held). `targets` imports this module
-# (`MAX_SCORE_ATTEMPTS`), so each adapter imports it when it runs.
+# `admit` node's transaction (`active_config FOR SHARE` held, so the active `max_ad_age_days` is read without
+# a lock). `targets` imports this module (`MAX_SCORE_ATTEMPTS`), so each adapter imports it when it runs.
 
 
-async def _expiry(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
-    """The pre-lock phase, then the expiry sweep with the active `max_ad_age_days` (read under the
-    `active_config` lock the `admit` node holds). The pre-lock takes the bulk rows of the expiry and the
-    exhaustion candidates' follow-up holds before the first target row any of the four sweeps locks (Ruling
-    P52, Controller carry T12-c: the exhaustion sweep runs fourth)."""
+async def _prelock(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> frozenset[int]:
+    """The bulk rows of the expiry and exhaustion candidates' follow-up holds, locked once, in id order,
+    before the first target row any of the four sweeps locks (Ruling P52, Controller carries T12-c and
+    T13-a: the exhaustion sweep runs fourth); the candidates it covered, which those two sweeps then move
+    and no other."""
     from jobhunter.scoring import targets
 
     max_age = await targets.active_max_ad_age_days(conn)
-    await targets.lock_hold_candidates(
+    return await targets.lock_hold_candidates(
         conn, llm_tuple_id=cycle.llm_tuple_id, max_ad_age_days=max_age, now=now
     )
+
+
+async def _expiry(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime, held: frozenset[int]) -> int:
+    from jobhunter.scoring import targets
+
+    max_age = await targets.active_max_ad_age_days(conn)
     swept = await targets.expiry_sweep(
-        conn, llm_tuple_id=cycle.llm_tuple_id, max_ad_age_days=max_age, now=now
+        conn, llm_tuple_id=cycle.llm_tuple_id, max_ad_age_days=max_age, now=now, held=held
     )
     return swept.moved
 
 
-async def _refilter(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
+async def _refilter(
+    conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime, held: frozenset[int]
+) -> int:
     from jobhunter.scoring import targets
 
     swept = await targets.refilter_sweep(
@@ -580,20 +606,26 @@ async def _refilter(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetim
     return swept.moved
 
 
-async def _regroup(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
+async def _regroup(
+    conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime, held: frozenset[int]
+) -> int:
     from jobhunter.scoring import targets
 
     return (await targets.regroup_sweep(conn, llm_tuple_id=cycle.llm_tuple_id)).moved
 
 
-async def _exhaustion(conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime) -> int:
+async def _exhaustion(
+    conn: AsyncConnection, cycle: "CycleRow", /, *, now: datetime, held: frozenset[int]
+) -> int:
     from jobhunter.scoring import targets
 
-    return await targets.exhaustion_sweep(conn, llm_tuple_id=cycle.llm_tuple_id)
+    return await targets.exhaustion_sweep(conn, llm_tuple_id=cycle.llm_tuple_id, held=held)
 
 
 # The sweeps the `admit` node runs (Task 13's, L3610-3612 and Deviation 7).
-CYCLE_SWEEPS: Final = Sweeps(expiry=_expiry, refilter=_refilter, regroup=_regroup, exhaustion=_exhaustion)
+CYCLE_SWEEPS: Final = Sweeps(
+    expiry=_expiry, refilter=_refilter, regroup=_regroup, exhaustion=_exhaustion, prelock=_prelock
+)
 
 _ADMITTED: Final = q(
     "UPDATE score_cycles SET admitted = :admitted WHERE id = :c AND worker_epoch = :e AND status = 'running'",
@@ -617,11 +649,12 @@ async def record_admitted(
 
 async def admit(conn: AsyncConnection, cycle: "CycleRow", *, now: datetime, sweeps: Sweeps) -> list[Picked]:
     """A cycle's first round of admission (module docstring); the picks in admission order."""
+    held = await sweeps.prelock(conn, cycle, now=now)  # step 7, before the sweeps' first target row (P52)
     moved = {
-        "expiry": await sweeps.expiry(conn, cycle, now=now),
-        "refilter": await sweeps.refilter(conn, cycle, now=now),
-        "regroup": await sweeps.regroup(conn, cycle, now=now),
-        "exhaustion": await sweeps.exhaustion(conn, cycle, now=now),
+        "expiry": await sweeps.expiry(conn, cycle, now=now, held=held),
+        "refilter": await sweeps.refilter(conn, cycle, now=now, held=held),
+        "regroup": await sweeps.regroup(conn, cycle, now=now, held=held),
+        "exhaustion": await sweeps.exhaustion(conn, cycle, now=now, held=held),
     }
     size = cycle.admission_size
     score_now = await _ids(conn, _SCORE_NOW_TARGETS, _admissible(cycle.llm_tuple_id, now))
