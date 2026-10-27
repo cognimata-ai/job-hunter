@@ -294,6 +294,37 @@ async def test_the_fourth_raising_beat_in_a_row_loses_the_claim(
     await claims.stop_all()
 
 
+async def test_a_beat_that_waits_past_its_bound_is_a_tolerated_failure(
+    engine: AsyncEngine, deps: ScoreDeps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A beat that cannot get its row (a held lock, a full pool) raises `TimeoutError` after `BEAT_TIMEOUT_S`,
+    # so four failures in a row stay inside the 3-minute reclaim window
+    monkeypatch.setattr(claims_mod, "BEAT_TIMEOUT_S", 0.3)
+    claimed = await claimed_target(engine)
+    sleep = ManualSleep()
+    claims = heartbeats(engine, sleep)
+    child: asyncio.Task[Any] = asyncio.create_task(asyncio.sleep(3600))
+    await backdate(engine, claimed.target_id)
+    claims.start(claimed.ref)
+    claims.attach(claimed.ref, child)
+    async with engine.connect() as blocker:
+        await blocker.execute(
+            sa.text("SELECT 1 FROM score_targets WHERE id = :t FOR UPDATE"), {"t": claimed.target_id}
+        )
+        await sleep.release()
+        await sleep.until(2)  # the bounded beat gave up and the loop sleeps again
+        await blocker.rollback()
+    assert not claims.lost(claimed.ref) and not child.done()
+    assert [(f["error_class"], f["consecutive"]) for f in logged(caplog, "heartbeat_failed")] == [
+        ("TimeoutError", 1)
+    ]
+    await sleep.release()
+    await sleep.until(3)
+    assert await fresh(engine, claimed.target_id)  # the next beat updates the row
+    child.cancel()
+    await claims.stop_all()
+
+
 async def test_stop_and_stop_all_cancel_and_await_the_beats(engine: AsyncEngine, deps: ScoreDeps) -> None:
     first, second, third = [await claimed_target(engine) for _ in range(3)]
     sleep = ManualSleep()

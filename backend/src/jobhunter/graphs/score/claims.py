@@ -22,9 +22,11 @@ clock (`score_claim_heartbeat_lost`; ids only).
 
 **A beat that raises** (a database blip) changes nothing on the claim's row, and the spec counts only "0 rows
 updated" as lost: up to `TOLERATED_FAILURES` (3) raising beats in a row are each logged with the error's class
-only (`heartbeat_failed`, the loop's) and the beat goes on; the fourth in a row is the loss. That fourth
-beat comes 120 s after the last good one, inside the 3-minute reclaim window (about 5 beats), so a claim this
-tolerates has not become reclaimable meanwhile.
+only (`heartbeat_failed`, the loop's) and the beat goes on; the fourth in a row is the loss. A beat's database
+work is bounded by `BEAT_TIMEOUT_S` (10 s; a beat waiting out a full connection pool raises `TimeoutError`, a
+failure like any other), so the fourth failure comes at most 4 * (30 + 10) = 160 s after the last good beat,
+inside the 3-minute reclaim window, and a claim this tolerates has not become reclaimable meanwhile. The fault
+point runs before that bound, so `claims.beat:sleep=…` still stalls the beat itself (C14).
 
 **The owner's own end** is no loss. A beat that waits on the target row while the owner's `publish` or `fail`
 holds it `FOR UPDATE` finds no `in_progress` row once they commit. On 0 rows the beat reads the claim's
@@ -51,6 +53,7 @@ BEAT_POINT: Final = "claims.beat"
 PERIOD_S: Final = 30.0
 CANCEL_TIMEOUT_S: Final = 30.0
 TOLERATED_FAILURES: Final = 3
+BEAT_TIMEOUT_S: Final = 10.0
 
 _BEAT: Final = q(
     "UPDATE score_targets SET claim_heartbeat_at = now() "
@@ -168,7 +171,7 @@ class ClaimHeartbeats:
         ref = claim.ref
         params = {"t": ref["target_id"], "c": ref["claim_id"]}
         outcome = None
-        async with self._engine.begin() as conn:
+        async with asyncio.timeout(BEAT_TIMEOUT_S), self._engine.begin() as conn:
             updated = (await conn.execute(_BEAT, params)).rowcount
             if updated != 1:  # a statement of its own: its snapshot sees what the blocking owner committed
                 found = await conn.execute(_ATTEMPT_OUTCOME, {"t": ref["target_id"], "a": ref["attempt_no"]})
