@@ -58,6 +58,7 @@ from tests.support.scoring import (
     TargetSpec,
     candidate_targets,
     lane_credits,
+    list_on_watchlist,
 )
 
 pytestmark = pytest.mark.integration
@@ -127,9 +128,13 @@ async def group(
     return group_id
 
 
-async def on_watchlist(engine: AsyncEngine, *targets: PendingTarget) -> None:
-    """Each target's job gets a posting from the board instance of a new watchlist company."""
+async def on_watchlist(
+    engine: AsyncEngine, *targets: PendingTarget, enabled: bool = True, listed: bool | None = True
+) -> None:
+    """Each target's job gets a posting from the board instance of a new watchlist company (`enabled` in
+    `watchlist_companies`), listed in the active settings' `watchlist[]` as `listed` (`None`: not listed)."""
     async with engine.begin() as conn:
+        companies: dict[int, bool] = {}
         for n, target in enumerate(targets):
             company = await insert_id(
                 conn,
@@ -140,14 +145,24 @@ async def on_watchlist(engine: AsyncEngine, *targets: PendingTarget) -> None:
                     "ats_type": "greenhouse",
                     "board_slug": f"beispiel-{target.target_id}",
                     "detection": "manual",
+                    "enabled": enabled,
                 },
             )
             instance = await instance_for_company(conn, company)
             await conn.execute(_POSTING, {"instance": instance, "native": f"n{n}", "job": target.job_id})
+            if listed is not None:
+                companies[company] = listed
+        await list_on_watchlist(conn, companies)
 
 
 async def candidate_sets(
-    engine: AsyncEngine, tuple_id: int, *, cycle_id: int = 1, now: datetime | None = None
+    engine: AsyncEngine,
+    tuple_id: int,
+    *,
+    cycle_id: int = 1,
+    now: datetime | None = None,
+    limit: int | None = None,
+    always_limit: int | None = None,
 ) -> CandidateSets:
     async with engine.connect() as conn:
         profile_version = int((await conn.execute(_PROFILE_VERSION, {"t": tuple_id})).scalar_one())
@@ -157,6 +172,8 @@ async def candidate_sets(
             cycle_id=cycle_id,
             profile_version_id=profile_version,
             now=utcnow() if now is None else now,
+            limit=limit,
+            always_limit=always_limit,
         )
 
 
@@ -305,6 +322,50 @@ async def test_the_four_always_include_reasons_are_found_and_ordered_by_similari
         (title.target_id, "title_match"),
     ]
     assert plain.target_id in sets.similarity and title.target_id in sets.oldest
+
+
+async def test_only_an_enabled_watchlist_company_is_watched(engine: AsyncEngine) -> None:
+    # Controller Ruling T12-b: enabled in `watchlist_companies` and in the active settings' `watchlist[]`
+    watched, disabled, disabled_in_settings, not_listed = await candidate_targets(
+        engine, *(TargetSpec(similarity=0.5) for _ in range(4))
+    )
+    await on_watchlist(engine, watched)
+    await on_watchlist(engine, disabled, enabled=False)
+    await on_watchlist(engine, disabled_in_settings, listed=False)
+    await on_watchlist(engine, not_listed, listed=None)
+    sets = await candidate_sets(engine, watched.llm_tuple_id)
+    assert sets.always_include == [(watched.target_id, "watchlist")]
+    async with engine.begin() as conn:  # the user disables the watched company in the settings
+        company = (
+            await conn.execute(
+                sa.text(
+                    "SELECT s.watchlist_company_id FROM postings p JOIN source_instances s "
+                    "ON s.id = p.source_instance_id WHERE p.job_id = :j"
+                ),
+                {"j": watched.job_id},
+            )
+        ).scalar_one()
+        await list_on_watchlist(conn, {int(company): False})
+    assert (await candidate_sets(engine, watched.llm_tuple_id)).always_include == []
+
+
+async def test_the_always_include_read_stops_at_its_limit_and_the_lane_lists_flag_the_followups(
+    engine: AsyncEngine,
+) -> None:
+    deep, top, second, plain = await candidate_targets(
+        engine,
+        TargetSpec(lane="batch_followup", similarity=0.1),
+        TargetSpec(similarity=0.9, title=MATCHED_TITLE),
+        TargetSpec(similarity=0.8, title=MATCHED_TITLE),
+        TargetSpec(similarity=0.7),
+    )
+    sets = await candidate_sets(engine, deep.llm_tuple_id, limit=2, always_limit=2)
+    assert sets.always_include == [(top.target_id, "title_match"), (second.target_id, "title_match")]
+    assert sets.oldest == ids([deep, top])
+    assert sets.followups == {deep.target_id}  # flagged by the oldest list it is in
+    whole = await candidate_sets(engine, deep.llm_tuple_id)
+    assert whole.always_include[-1] == (deep.target_id, "batch_followup")
+    assert whole.followups == {deep.target_id} and plain.target_id in whole.similarity
 
 
 async def test_an_exhausted_backed_off_or_fenced_target_is_in_no_candidate_set(engine: AsyncEngine) -> None:

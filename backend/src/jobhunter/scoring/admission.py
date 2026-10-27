@@ -36,11 +36,15 @@ the always-include limit), so the claim keeps its lane, later rounds (`admit_urg
 still debited to its lane. The bulk accounting identifies batched targets through `batch_items`, never through
 the lane (Deviation 24).
 
-**The candidates** (`candidates(conn, *, llm_tuple_id, cycle_id, profile_version_id, now, limit)`, without a
-lock: the claim re-checks every condition under its own `FOR UPDATE SKIP LOCKED`), every lane among the
-admissible targets in lane order. `limit` cuts the similarity, oldest and exploration lists (`admit` reads
-`len(score_now) + S` of each: a lane's takes and the ids picked before it never reach further down its list);
-the always-include list is whole, because `select` recognises a follow-up through it wherever it is taken:
+**The candidates** (`candidates(conn, *, llm_tuple_id, cycle_id, profile_version_id, now, limit,
+always_limit)`, without a lock: the claim re-checks every condition under its own `FOR UPDATE SKIP LOCKED`),
+every lane among the admissible targets in lane order, each cut short: `admit` reads `len(score_now) + S`
+ids of the similarity, oldest and exploration lists (`limit`: a lane's takes and the ids picked before it
+never reach further down its list) and `len(score_now) + S // 2` of always-include (`always_limit`: the
+always-include phase comes right after Score now and takes at most `ALWAYS_INCLUDE_LIMIT <= S // 2`), so the
+always-include query walks `score_targets_admission` in similarity order and stops early. The lane queries
+flag their follow-ups (`CandidateSets.followups`), so `select` knows a follow-up that the always-include cut
+left out:
 - `similarity`: `similarity IS NOT NULL`, by similarity descending (`score_targets_admission`), **excluding**
   targets whose revision is `partial` and the non-representative members of an active duplicate group (U14):
   those reach the LLM through the oldest and exploration lanes, or through always-include;
@@ -51,8 +55,9 @@ the always-include list is whole, because `select` recognises a follow-up throug
   (`batch_followup`, whatever else it qualifies for); a full-text twin (`full_text_twin`: a `full` job of an
   active group whose representative is `partial`, or the `full` representative of an active group with a
   `partial` member, which §8.7's re-election makes of the twin that joined a partial representative,
-  `fuller_member_joined`); a watchlist company's job (`watchlist`: a posting from a `source_instances` row of
-  a watchlist company); a title match (`title_match`: `similarity(jobs.title_norm, t) >= TITLE_MATCH_MIN`
+  `fuller_member_joined`); a watched company's job (`watchlist`: a posting from the `source_instances` row of
+  a watchlist company enabled in `watchlist_companies` and in the active settings' `watchlist[]`, Controller
+  Ruling T12-b); a title match (`title_match`: `similarity(jobs.title_norm, t) >= TITLE_MATCH_MIN`
   for a target title `t` of the tuple's confirmed profile, `profile_json -> 'target_titles'`, normalised by
   `normalize.titles.normalize_title`), in that order.
 Null-similarity targets (awaiting their embedding) are candidates of oldest, exploration and always-include.
@@ -74,7 +79,7 @@ cycle `FOR SHARE` under its owner predicate):
   orders them; `admitted` gains the round's counts.
 Both write `admitted` (`record_admitted`: the cycle's counts plus the round's) under the cycle's owner
 predicate, `id`, `worker_epoch` and `status = 'running'`; a cycle that is no longer its owner's raises
-`FencedOut("score_cycle")` and the caller's transaction writes nothing. The lane and the always-include reason
+`FencedOut(CYCLE_OWNER)` and the caller's transaction writes nothing. The lane and the always-include reason
 reach the target through the claim (`lane = a.lane`, `always_include_reason = a.reason`).
 
 Ids, counts and lanes only reach a log line; the profile's titles never do.
@@ -138,11 +143,13 @@ TIE_ORDER: Final[Mapping[CreditedLane, int]] = MappingProxyType(
 SPILL_ORDER: Final[tuple[CreditedLane, ...]] = ("oldest", "exploration", "similarity")
 TITLE_MATCH_MIN: Final = 0.6  # pg_trgm `similarity` against a confirmed target title (L3633)
 CREDIT_QUANTUM: Final = 10_000  # `numeric(10,4)`
+# The owner a lost cycle predicate fences out (`FencedOut(CYCLE_OWNER)`): one piece of work lost. `cycles`
+# re-exports it (it imports this module, never the other way round).
+CYCLE_OWNER: Final = "score_cycle"
 
 _SCORE_NOW: Final[Lane] = "score_now"
 _BATCH_FOLLOWUP: Final[Lane] = "batch_followup"
 _ALWAYS_INCLUDE: Final[Lane] = "always_include"
-_CYCLE_OWNER: Final = "score_cycle"  # `cycles.CYCLE_OWNER` (`cycles` imports this module)
 
 _LANES: Final[dict[str, Lane]] = {lane: lane for lane in LANE_VALUES}
 _CREDITED: Final[dict[str, CreditedLane]] = {lane: lane for lane, _ in LANES}
@@ -224,22 +231,26 @@ def allocate(credits: Mapping[CreditedLane, Fraction], S: int) -> Allocation:
 
 @dataclass(frozen=True)
 class CandidateSets:
-    """The candidates of each lane in lane order (module docstring); a target may be in several. A follow-up
-    is one of `always_include` with the reason `batch_followup`."""
+    """The candidates of each lane in lane order (module docstring); a target may be in several. The
+    follow-ups are those of `followups` (the lane lists' follow-ups, which `candidates` flags) and those of
+    `always_include` with the reason `batch_followup`."""
 
     similarity: list[int]
     oldest: list[int]
     exploration: list[int]
     always_include: list[tuple[int, AlwaysIncludeReason]]
+    followups: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
 class Selection:
-    """A cycle's picks in admission order, the slot-backed takes per lane (the debit) and the spill."""
+    """A cycle's picks in admission order, the slot-backed takes per lane (the debit), the spill, and how many
+    the always-include phase took (follow-ups included: at most `ALWAYS_INCLUDE_LIMIT`)."""
 
     picked: list[Picked]
     taken: dict[CreditedLane, int]
     spilled: dict[CreditedLane, int]
+    always_included: int
 
 
 def select(
@@ -250,7 +261,9 @@ def select(
     score_now: Sequence[int],
 ) -> Selection:
     """§9.6.2's selection (module docstring), L3614-3651."""
-    followups = {target for target, reason in sets.always_include if reason == "batch_followup"}
+    followups = sets.followups | {
+        target for target, reason in sets.always_include if reason == "batch_followup"
+    }
     lists: Mapping[CreditedLane, list[int]] = {
         "similarity": sets.similarity,
         "oldest": sets.oldest,
@@ -298,7 +311,7 @@ def select(
         extra = take(lists[lane], remaining)
         admit_as(lane, extra)
         spilled[lane], remaining = len(extra), remaining - len(extra)
-    return Selection(picked=picked, taken=taken, spilled=spilled)
+    return Selection(picked=picked, taken=taken, spilled=spilled, always_included=len(always))
 
 
 def debit(
@@ -323,17 +336,20 @@ _GROUPED_UNDER_ANOTHER: Final = (
     "EXISTS (SELECT 1 FROM duplicate_group_members m JOIN duplicate_groups g ON g.id = m.group_id "
     "WHERE m.job_id = t.job_id AND g.status = 'active' AND g.representative_job_id IS DISTINCT FROM t.job_id)"
 )
+# A lane list's row: the target, and whether it is a batch follow-up (`select` admits one as lane
+# `batch_followup`).
+_LANE_ROW: Final = "t.id, t.lane IS NOT DISTINCT FROM 'batch_followup' AS followup"
 _SIMILARITY: Final = q(
-    "SELECT t.id FROM score_targets t JOIN job_revisions r ON r.id = t.job_revision_id "  # noqa: S608
+    f"SELECT {_LANE_ROW} FROM score_targets t JOIN job_revisions r ON r.id = t.job_revision_id "  # noqa: S608
     f"WHERE {_ADMISSIBLE_WHERE} AND t.similarity IS NOT NULL AND r.description_completeness <> 'partial' "
     f"AND NOT {_GROUPED_UNDER_ANOTHER} ORDER BY t.similarity DESC NULLS LAST, t.id LIMIT :limit"
 )
 _OLDEST: Final = q(
-    f"SELECT t.id FROM score_targets t WHERE {_ADMISSIBLE_WHERE} "  # noqa: S608
+    f"SELECT {_LANE_ROW} FROM score_targets t WHERE {_ADMISSIBLE_WHERE} "  # noqa: S608
     "ORDER BY t.created_at, t.id LIMIT :limit"
 )
 _EXPLORATION: Final = q(
-    f"SELECT t.id FROM score_targets t WHERE {_ADMISSIBLE_WHERE} "  # noqa: S608
+    f"SELECT {_LANE_ROW} FROM score_targets t WHERE {_ADMISSIBLE_WHERE} "  # noqa: S608
     "ORDER BY md5(CAST(:cycle AS text) || ':' || CAST(t.id AS text)) COLLATE \"C\", t.id LIMIT :limit"
 )
 _FULL_TEXT_TWIN: Final = (
@@ -346,7 +362,8 @@ _FULL_TEXT_TWIN: Final = (
 )
 _WATCHLIST: Final = (
     "EXISTS (SELECT 1 FROM postings p JOIN source_instances s ON s.id = p.source_instance_id "
-    "WHERE p.job_id = t.job_id AND s.watchlist_company_id IS NOT NULL)"
+    "JOIN watchlist_companies w ON w.id = s.watchlist_company_id WHERE p.job_id = t.job_id AND w.enabled "
+    "AND w.id = ANY(CAST(:watched AS bigint[])))"
 )
 _TITLE_MATCH: Final = (
     "EXISTS (SELECT 1 FROM unnest(CAST(:titles AS text[])) AS x(title) "
@@ -357,7 +374,7 @@ _ALWAYS: Final = q(
     f"WHEN t.lane = 'batch_followup' THEN 'batch_followup' WHEN {_FULL_TEXT_TWIN} THEN 'full_text_twin' "
     f"WHEN {_WATCHLIST} THEN 'watchlist' WHEN {_TITLE_MATCH} THEN 'title_match' END AS reason "
     f"FROM score_targets t JOIN jobs j ON j.id = t.job_id WHERE {_ADMISSIBLE_WHERE}) c "
-    "WHERE c.reason IS NOT NULL ORDER BY c.similarity DESC NULLS LAST, c.id"
+    "WHERE c.reason IS NOT NULL ORDER BY c.similarity DESC NULLS LAST, c.id LIMIT :limit"
 )
 _OF_LANE: Final = q(
     f"SELECT t.id FROM score_targets t WHERE {_ADMISSIBLE_WHERE} AND t.lane = :lane "  # noqa: S608
@@ -371,6 +388,10 @@ _TARGET_TITLES: Final = q(
     "SELECT profile_json -> 'target_titles' AS titles FROM profile_versions WHERE id = :pv"
 )
 _PROFILE_VERSION: Final = q("SELECT profile_version_id FROM llm_tuples WHERE id = :tuple")
+_WATCHLIST_SETTINGS: Final = q(
+    "SELECT v.payload -> 'watchlist' FROM active_config a JOIN settings_versions v "
+    "ON v.id = a.settings_version_id WHERE a.id = 1"
+)
 
 
 def _admissible(llm_tuple_id: int, now: datetime) -> dict[str, object]:
@@ -398,8 +419,34 @@ async def target_titles(conn: AsyncConnection, profile_version_id: int) -> list[
     return titles
 
 
+async def watched_companies(conn: AsyncConnection) -> list[int]:
+    """The watchlist companies the active settings enable (`watchlist[].enabled`, Controller Ruling
+    T12-b); the query also asks `watchlist_companies.enabled`."""
+    stored: JSONValue = (await conn.execute(_WATCHLIST_SETTINGS)).scalar_one_or_none()
+    watched: list[int] = []
+    for entry in stored if isinstance(stored, list) else []:
+        if not isinstance(entry, dict) or entry.get("enabled") is not True:
+            continue
+        company = entry.get("watchlist_company_id")
+        if isinstance(company, int):
+            watched.append(company)
+    return watched
+
+
 async def _ids(conn: AsyncConnection, statement: TextClause, params: Mapping[str, object]) -> list[int]:
     return [int(row.id) for row in await conn.execute(statement, params)]
+
+
+async def _lane(
+    conn: AsyncConnection, statement: TextClause, params: Mapping[str, object], followups: set[int]
+) -> list[int]:
+    """A lane list's ids, its follow-ups added to `followups`."""
+    ids: list[int] = []
+    for row in await conn.execute(statement, params):
+        ids.append(int(row.id))
+        if row.followup:
+            followups.add(int(row.id))
+    return ids
 
 
 async def candidates(
@@ -410,18 +457,26 @@ async def candidates(
     profile_version_id: int,
     now: datetime,
     limit: int | None = None,
+    always_limit: int | None = None,
 ) -> CandidateSets:
-    """The candidates of every lane (module docstring); the similarity, oldest and exploration lists at most
-    `limit` long (`None`: whole)."""
+    """The candidates of every lane (module docstring): the similarity, oldest and exploration lists at most
+    `limit` long, always-include at most `always_limit` (`None`: whole), and the lane lists' follow-ups."""
     params = {**_admissible(llm_tuple_id, now), "limit": limit}
-    titles = await target_titles(conn, profile_version_id)
-    always_params = {**_admissible(llm_tuple_id, now), "titles": titles, "title_min": TITLE_MATCH_MIN}
+    always_params = {
+        **_admissible(llm_tuple_id, now),
+        "limit": always_limit,
+        "titles": await target_titles(conn, profile_version_id),
+        "title_min": TITLE_MATCH_MIN,
+        "watched": await watched_companies(conn),
+    }
     always = await conn.execute(_ALWAYS, always_params)
+    followups: set[int] = set()
     return CandidateSets(
-        similarity=await _ids(conn, _SIMILARITY, params),
-        oldest=await _ids(conn, _OLDEST, params),
-        exploration=await _ids(conn, _EXPLORATION, {**params, "cycle": cycle_id}),
+        similarity=await _lane(conn, _SIMILARITY, params, followups),
+        oldest=await _lane(conn, _OLDEST, params, followups),
+        exploration=await _lane(conn, _EXPLORATION, {**params, "cycle": cycle_id}, followups),
         always_include=[(int(row.id), _reason(str(row.reason))) for row in always],
+        followups=frozenset(followups),
     )
 
 
@@ -517,7 +572,7 @@ async def record_admitted(
         total[lane] = total.get(lane, 0) + n
     written = await conn.execute(_ADMITTED, {"admitted": total, "c": cycle.id, "e": cycle.worker_epoch})
     if written.rowcount != 1:
-        raise FencedOut(_CYCLE_OWNER)
+        raise FencedOut(CYCLE_OWNER)
     return total
 
 
@@ -539,6 +594,7 @@ async def admit(conn: AsyncConnection, cycle: "CycleRow", *, now: datetime, swee
         profile_version_id=int(profile_version),
         now=now,
         limit=len(score_now) + size,
+        always_limit=len(score_now) + size // 2,  # ALWAYS_INCLUDE_LIMIT is at most S // 2, whatever the slots
     )
     credits = await LaneCredits.lock(conn, cycle.llm_tuple_id)  # step 10
     allocation = allocate(credits.credits, size)

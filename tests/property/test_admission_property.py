@@ -6,14 +6,16 @@ Deviation 24): `admission.allocate`, `select` and `debit` as `admit` chains them
   included), the oldest lane and the exploration lane exactly 7, 2 and 1 slots per unit of `S` (at `S = 1`:
   7, 2 and 1), always-include takes `min(similarity slots, S // 2)` and never a safeguard slot.
 - **Changing conditions.** Over random sequences of cycles in which `S` changes (1 to 30) and each lane's
-  candidates vary independently (overlapping lanes, empty ones, Score now targets): the slots sum to exactly
-  `S` before selection, the admissions outside Score now never exceed `S`, the spill is never asked for a
-  negative count (no lane takes more than its slots, the slot-backed takes never exceed `S`), always-include
-  stays within `S // 2` and the similarity slots, credits stay within `[-1, share x S + 1]`, and afterwards a
-  permanent backlog at any `S` returns to exact 7 / 2 / 1 windows.
+  candidates vary independently (overlapping lanes, empty ones, follow-ups, Score now targets): the slots sum
+  to exactly `S` before selection, the admissions outside Score now never exceed `S`, the spill is never
+  asked for a negative count (no lane takes more than its slots, the slot-backed takes never exceed `S`),
+  the always-include phase (`Selection.always_included`, follow-ups included) stays within `S // 2` and the
+  similarity slots, credits stay within `[-1, share x S + 1]`, and afterwards a permanent backlog at any `S`
+  returns to exact 7 / 2 / 1 windows.
 - **Bounded reads.** `select` picks the same, follow-ups' lanes included, from similarity, oldest and
-  exploration lists cut to their first `len(score_now) + S` ids as from the whole lists (always-include
-  whole, as `candidates` reads it), so `admit` reads no more of them than that.
+  exploration lists cut to their first `len(score_now) + S` ids, always-include cut to `len(score_now) +
+  ALWAYS_INCLUDE_LIMIT` and the follow-ups known from the cut lane lists' flags, as from the whole lists, so
+  `admit` reads no more than that.
 
 Every datum is generated.
 """
@@ -25,6 +27,7 @@ from itertools import count
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from jobhunter.scoring.admission import (
+    ALWAYS_INCLUDE_LIMIT,
     LANES,
     SHARE,
     AlwaysIncludeReason,
@@ -40,10 +43,7 @@ WARM_UP = 20  # cycles at a new S before the windows are exact again (14 at most
 WINDOW = 10
 EXACT = {"similarity": 7, "oldest": 2, "exploration": 1}
 ZERO: dict[CreditedLane, Fraction] = {lane: Fraction(0) for lane, _ in LANES}
-REASONS: tuple[AlwaysIncludeReason, ...] = ("watchlist", "title_match", "full_text_twin")
-# The invariants count always-include through its lane, so the cycles there have no follow-up (a follow-up is
-# lane `batch_followup` whichever slot it takes); the bounded reads have them.
-WITH_FOLLOWUPS: tuple[AlwaysIncludeReason, ...] = (*REASONS, "batch_followup")
+REASONS: tuple[AlwaysIncludeReason, ...] = ("watchlist", "title_match", "full_text_twin", "batch_followup")
 # One cycle: S, the similarity, oldest, exploration and always-include candidates, and the Score now targets.
 type Cycle = tuple[int, list[int], list[int], list[int], list[tuple[int, AlwaysIncludeReason]], list[int]]
 
@@ -68,8 +68,8 @@ def backlog_cycles(
         allocation = allocate(credits, s)
         sel = select(backlog(ids, s), allocation.slots, s, score_now=[])
         assert sel.taken == allocation.slots  # a backlog fills every slot by itself, nothing spills
-        always = sum(p.lane == "always_include" for p in sel.picked)
-        assert always == min(allocation.slots["similarity"], s // 2)
+        assert sel.always_included == min(allocation.slots["similarity"], s // 2)
+        assert sum(p.lane == "always_include" for p in sel.picked) == sel.always_included
         taken.append(sel.taken)
         credits = debit(allocation.credits, sel.taken)
     return taken, credits
@@ -117,8 +117,9 @@ def check_cycle(sel: Selection, slots: dict[CreditedLane, int], s: int, sets: Ca
     assert all(0 <= sel.taken[lane] <= slots[lane] for lane, _ in LANES)
     assert sum(sel.taken.values()) <= s  # so the spill's ask, S - taken, is never negative
     assert all(n >= 0 for n in sel.spilled.values())
-    always = sum(p.lane == "always_include" for p in sel.picked)
-    assert always <= min(s // 2, slots["similarity"])
+    # follow-ups included: one the always-include phase took counts, whatever its lane label
+    assert sel.always_included <= min(s // 2, slots["similarity"])
+    assert sum(p.lane == "always_include" for p in sel.picked) <= sel.always_included
     ids = [p.target_id for p in sel.picked]
     assert len(ids) == len(set(ids))
     # never a safeguard slot: a safeguard lane fills its slots from whatever of its candidates are left
@@ -154,14 +155,19 @@ def test_slots_sum_to_s_and_credits_stay_bounded_under_changing_conditions(
 
 
 @settings(max_examples=300, deadline=None)
-@given(cycles_of(WITH_FOLLOWUPS))
+@given(cycles_of(REASONS))
 def test_select_reads_no_more_than_score_now_plus_s_ids_of_a_lane(sequence: list[Cycle]) -> None:
     credits = dict(ZERO)
     for s, similarity, oldest, exploration, always, score_now in sequence:
         allocation = allocate(credits, s)
         bound = len(score_now) + s
-        whole = CandidateSets(similarity, oldest, exploration, always)
-        cut = CandidateSets(similarity[:bound], oldest[:bound], exploration[:bound], always)
+        always_bound = len(score_now) + ALWAYS_INCLUDE_LIMIT(s, allocation.slots)  # admit reads S // 2 >= it
+        followups = frozenset(t for t, reason in always if reason == "batch_followup")  # every follow-up
+        lanes = (similarity[:bound], oldest[:bound], exploration[:bound])
+        whole = CandidateSets(similarity, oldest, exploration, always, followups=followups)
+        # what `candidates` reads: the lists cut, the follow-ups as the cut lane lists flag them
+        flagged = followups & {t for listed in lanes for t in listed}
+        cut = CandidateSets(*lanes, always[:always_bound], followups=flagged)
         sel = select(whole, allocation.slots, s, score_now=score_now)
         assert select(cut, allocation.slots, s, score_now=score_now) == sel
         credits = debit(allocation.credits, sel.taken)

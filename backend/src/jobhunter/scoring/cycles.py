@@ -83,6 +83,7 @@ from jobhunter.llm.gateway import AUTH_FAILED_ALERT
 from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
+from jobhunter.scoring.admission import CYCLE_OWNER as CYCLE_OWNER
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS, Lane, any_admissible
 from jobhunter.settings import validate
 from jobhunter.settings.llm_projection import central_cost_per_target
@@ -100,8 +101,6 @@ PauseReason = Literal[
 ]
 ReclaimKind = Literal["older_epoch", "cycle"]
 
-# The owner a lost cycle predicate fences out (`FencedOut(CYCLE_OWNER)`): one piece of work lost.
-CYCLE_OWNER: Final = "score_cycle"
 ORPHANED_ALERT: Final = "score_cycle.orphaned"
 FAILED_ALERT: Final = "score_cycle.failed"
 ORPHANED_AFTER: Final = timedelta(minutes=3)

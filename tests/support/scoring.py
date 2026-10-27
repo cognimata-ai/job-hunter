@@ -70,7 +70,10 @@ M3 Task 12 adds the admission's side:
   job's title, the completeness of the job and of its revision, the lane, the charged attempts, the backoff
   and the creation time) over the score tuple made active, in order; a spec's default title matches none of
   `score_profile`'s target titles, so a target is always-include only when a test makes it so;
-- `lane_credits(engine, llm_tuple_id)`: the stored `admission_lane_credits` of the tuple, by lane.
+- `lane_credits(engine, llm_tuple_id)`: the stored `admission_lane_credits` of the tuple, by lane;
+- `list_on_watchlist(conn, entries)`: a new settings version, copied from the active one and made active,
+  whose `watchlist[]` names each company id of `entries` with its `enabled` (Controller Ruling T12-b: a
+  watched company is enabled in the table and in the settings).
 """
 
 import asyncio
@@ -105,7 +108,7 @@ from jobhunter.scoring.cycles import CycleTrigger
 from jobhunter.scoring.evaluation_policy import EvaluationPolicy
 from jobhunter.scoring.routing import DerivedOutcome, Route
 from jobhunter.sources.parsing.locations import Candidate, Location
-from jobhunter.types import JSONValue, get_object
+from jobhunter.types import JSONValue, get_list, get_object
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
@@ -977,3 +980,32 @@ async def lane_credits(engine: AsyncEngine, llm_tuple_id: int) -> dict[str, Deci
     async with engine.connect() as conn:
         rows = await conn.execute(_LANE_CREDITS, {"t": llm_tuple_id})
         return {str(row.lane): Decimal(row.credit) for row in rows}
+
+
+_ACTIVE_SETTINGS: Final = q(
+    "SELECT v.payload FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
+    "WHERE a.id = 1 FOR UPDATE OF a"
+)
+_SETTINGS_VERSION: Final = q(
+    "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, "
+    "execution_config_id, evaluation_policy_id, effect_classes) "
+    "SELECT (SELECT max(version_no) + 1 FROM settings_versions), v.schema_version, :payload, "
+    "v.scope_version_id, v.model_policy_id, v.execution_config_id, v.evaluation_policy_id, '{collection}' "
+    "FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id WHERE a.id = 1 "
+    "RETURNING id",
+    jsonb=["payload"],
+)
+_ACTIVATE_SETTINGS: Final = q("UPDATE active_config SET settings_version_id = :v WHERE id = 1")
+
+
+async def list_on_watchlist(conn: AsyncConnection, entries: Mapping[int, bool]) -> None:
+    """The active settings' `watchlist[]` with each company id of `entries` listed as given (module notes)."""
+    payload = dict(get_object((await conn.execute(_ACTIVE_SETTINGS)).scalar_one(), ""))
+    listed: dict[str, JSONValue] = {}
+    for entry in get_list(payload["watchlist"], ""):
+        listed[str(get_object(entry, "")["watchlist_company_id"])] = entry
+    for company, enabled in entries.items():
+        listed[str(company)] = {"watchlist_company_id": company, "enabled": enabled}
+    payload["watchlist"] = list(listed.values())
+    version = int((await conn.execute(_SETTINGS_VERSION, {"payload": payload})).scalar_one())
+    await conn.execute(_ACTIVATE_SETTINGS, {"v": version})

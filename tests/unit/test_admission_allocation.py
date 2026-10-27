@@ -15,6 +15,7 @@ from decimal import Decimal
 from fractions import Fraction as F
 
 import pytest
+from jobhunter.scoring import admission, cycles
 from jobhunter.scoring.admission import (
     ALWAYS_INCLUDE_LIMIT,
     LANES,
@@ -91,6 +92,7 @@ def test_always_include_never_exceeds_half_of_s_and_never_a_safeguard_slot() -> 
     ]
     assert [p.target_id for p in sel.picked if p.lane == "similarity"] == [100, 101]
     assert sel.taken == {"similarity": 7, "oldest": 2, "exploration": 1}
+    assert sel.always_included == 5
     assert (
         select(
             CandidateSets([], [], [], [(1, "watchlist")]),
@@ -219,3 +221,23 @@ def test_a_batch_followup_keeps_its_lane_whichever_slot_it_takes() -> None:
         Picked(10, "oldest"),
     ]
     assert sel.taken == {"similarity": 1, "oldest": 2, "exploration": 0}
+    assert sel.always_included == 1  # the follow-up of the always-include phase, counted against S // 2
+
+
+def test_a_followup_known_from_the_lane_lists_keeps_its_lane() -> None:
+    # `candidates` cuts always-include short, so a follow-up deep in it is known from the lane lists' flags
+    sel = select(
+        CandidateSets([], [9, 10], [], [(4, "watchlist")], followups=frozenset({9})),
+        {"similarity": 1, "oldest": 1, "exploration": 0},
+        2,
+        score_now=[],
+    )
+    assert sel.picked == [
+        Picked(4, "always_include", "watchlist"),
+        Picked(9, "batch_followup", "batch_followup"),
+    ]
+    assert (sel.taken, sel.always_included) == ({"similarity": 1, "oldest": 1, "exploration": 0}, 1)
+
+
+def test_the_cycle_owner_is_one_constant() -> None:
+    assert cycles.CYCLE_OWNER is admission.CYCLE_OWNER == "score_cycle"
