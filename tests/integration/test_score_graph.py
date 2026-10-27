@@ -1,38 +1,45 @@
 """`score_graph` on PostgreSQL with the fake LLM and keyed answers (spec §9.3, §9.4.3; plan Task 11, Review
-Focus 1 and 5, Codex r1 #12-#14, r2 B5, B6, Rulings P10, P34, Controller carries T9-b, T9-c): three pending
-targets of different jobs scored by one cycle.
+Focus 1 and 5, Codex r1 #12-#14, r2 B5, B6, Rulings P10, P34, T11-a, T11-f, Controller carries T9-b, T9-c):
+pending targets of different jobs scored by one cycle.
 
 A cycle claims three, scores them concurrently and completes with a report whose lane and outcome counts
 match, one `TargetOutcome` per work id and `spent_usd` the attempts' cost; a budget denial ends one target
 `budget_deferred` and the cycle still completes; a Score now that arrives during the fan-out is admitted in
 the next claim round. The three graph-level heartbeat cases (Ruling P10): a heartbeat loss during a blocked
 stream cancels that call alone, queued claims are beaten before they run, and a cancelled cycle cancels its
-children and stops every beat. A child's failure becomes its outcome (the attempt reclaimed); the cycle task
-(`graph.execute_cycle`) runs one cycle under its heartbeat, fails it for a bug with its claims reclaimed,
-stops when its beat is refused, and starts nothing while admission is stopped.
+children and stops every beat, with a claim still queued for a slot too. A child's end is classified (Ruling
+T11-a): a node's timeout backs its target off (`failed_transient` at the attempt limit), an unclassified
+failure ends it `failed_invalid_output('bug')` for good, and the claim's own fence is `claim_lost` without an
+error; an `attach` that raises leaves no attempt running. The cycle task (`graph.execute_cycle`) runs one
+cycle under its heartbeat, fails it for a bug with its claims reclaimed, stops when its beat is refused, and
+starts nothing while admission is stopped.
 
 Every datum is invented.
 """
 
 import asyncio
+import gc
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from decimal import ROUND_CEILING, Decimal
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.errors import NodeFailed
 from jobhunter.graphs.score import graph as graph_mod
 from jobhunter.graphs.score import nodes as nodes_mod
 from jobhunter.graphs.score import subgraph as subgraph_mod
+from jobhunter.graphs.score.claims import ClaimHeartbeats
 from jobhunter.graphs.score.nodes import claim as claim_node
-from jobhunter.graphs.score.nodes.load_context import make_load_context as real_make_load_context
 from jobhunter.graphs.score.state import TargetState, work_id
 from jobhunter.llm import fake
 from jobhunter.llm import gateway as gateway_mod
 from jobhunter.llm.budget import month_of
+from jobhunter.llm.errors import ClaimLost
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.llm.prompts.render import prompt_schema_v2
 from jobhunter.llm.spend_ledger import CAP_REACHED_ALERT
@@ -50,6 +57,7 @@ from tests.support.llm import FakeLLM, open_alerts, save_budget, tries
 from tests.support.logs import logged
 from tests.support.procs import await_until
 from tests.support.scoring import (
+    ClaimedTarget,
     CycleRunner,
     PendingTarget,
     claim_again,
@@ -388,50 +396,218 @@ async def test_a_cancelled_cycle_cancels_its_children_and_stops_every_beat(
         assert (await target_of(engine, target.target_id)).state == "in_progress"
 
 
-# ---- a child's failure (Controller carries T9-b, T9-c) ----------------------------------------------------
+# ---- a child's failure (Rulings T11-a, T11-f; Controller carries T9-b, T9-c) ----------------------------
 
 
-async def test_a_child_failure_becomes_its_outcome_and_the_cycle_goes_on(
+def before_node(
+    monkeypatch: pytest.MonkeyPatch, name: str, step: Callable[[TargetState], Awaitable[None]]
+) -> None:
+    """The subgraph's node `name` (built by its `make_<name>`) awaits `step(state)` first, in the graphs a
+    `cycle_runner` builds after this."""
+    maker = f"make_{name}"
+    real = getattr(subgraph_mod, maker)
+
+    def make(deps: Any) -> Any:
+        node = real(deps)
+
+        async def wrapped(state: TargetState, config: RunnableConfig) -> Any:
+            await step(state)
+            return await node(state, config)
+
+        return wrapped
+
+    monkeypatch.setattr(subgraph_mod, maker, make)
+
+
+def child_tasks() -> list[asyncio.Task[Any]]:
+    return [t for t in asyncio.all_tasks() if t.get_name().startswith("score_target:") and not t.done()]
+
+
+async def attempts_of(engine: AsyncEngine, target_id: int) -> list[tuple[Any, ...]]:
+    rows = sa.text(
+        "SELECT attempt_no, outcome, outcome_detail FROM score_attempts WHERE target_id = :t ORDER BY id"
+    )
+    async with engine.connect() as conn:
+        return [tuple(r) for r in await conn.execute(rows, {"t": target_id})]
+
+
+async def test_a_node_timeout_backs_the_target_off_and_fails_it_transient_at_the_attempt_limit(
     engine: AsyncEngine,
     gateway: LLMGateway,
     fake_llm: FakeLLM,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    failing, *siblings = await insert_targets(engine, 3)
-    answer_all(fake_llm, siblings)
-    real = real_make_load_context
+    # Ruling T11-a (a): a deterministic node's `NodeTimeoutError` (`validate`, after the generator call that
+    # charged the attempt) takes the transient path of `fail` with the code `node_timeout`
+    backed_off, spent, sibling = await insert_targets(engine, 3)
+    answer_all(fake_llm, [backed_off, spent, sibling])
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE score_targets SET transient_failures = 2 WHERE id = :t"),
+            {"t": backed_off.target_id},
+        )
+        await conn.execute(
+            sa.text("UPDATE score_targets SET charged_attempts = 3 WHERE id = :t"), {"t": spent.target_id}
+        )
+    stalled = {backed_off.target_id, spent.target_id}
 
-    def make_load_context(deps: Any) -> Any:
-        node = real(deps)
+    async def stalls(state: TargetState) -> None:
+        if state["target_id"] in stalled:
+            await asyncio.sleep(60)  # past the node's run timeout below
 
-        async def load_context(state: TargetState, config: RunnableConfig) -> Any:
-            if state["target_id"] == failing.target_id:  # a deterministic node's unmapped error
-                raise RuntimeError("synthetic failure 4111-1111-1111-1111")
-            return await node(state, config)
-
-        return load_context
-
-    monkeypatch.setattr(subgraph_mod, "make_load_context", make_load_context)
-    runner = await cycle_runner(engine, gateway)  # the graphs built with the failing node
+    timeouts = {**subgraph_mod.NODE_TIMEOUTS, "validate": timedelta(seconds=2)}
+    monkeypatch.setattr(subgraph_mod, "NODE_TIMEOUTS", MappingProxyType(timeouts))
+    before_node(monkeypatch, "validate", stalls)
+    runner = await cycle_runner(engine, gateway)
     cycle_id = await runner.start("manual")
+    started = utcnow()
     final = await runner.run(cycle_id)
-    outcome = final["results"][work_id(failing.target_id, 1)]
-    assert (outcome["outcome"], outcome["state"]) == ("claim_lost", "pending")  # reclaimed for a new attempt
+    ended = utcnow()
+    first = await target_of(engine, backed_off.target_id)
+    assert (first.state, first.state_reason, first.claim_id) == ("pending", None, None)
+    assert (first.transient_failures, first.charged_attempts) == (3, 1)
+    assert started + timedelta(hours=1) <= first.not_before <= ended + timedelta(hours=1)  # 15 min x 2^2
+    last = await target_of(engine, spent.target_id)
+    assert (last.state, last.state_reason, last.claim_id) == ("failed_transient", "node_timeout", None)
+    assert (last.transient_failures, last.charged_attempts) == (0, 4)
+    for target in (backed_off, spent):
+        assert await attempts_of(engine, target.target_id) == [(1, "transient_error", "node_timeout")]
+    assert [
+        (
+            final["results"][work_id(t.target_id, 1)]["outcome"],
+            final["results"][work_id(t.target_id, 1)]["state"],
+        )
+        for t in (backed_off, spent, sibling)
+    ] == [
+        ("transient_error", "pending"),
+        ("transient_error", "failed_transient"),
+        ("published_accepted", "published_accepted"),
+    ]
     row = await cycle_of(engine, cycle_id)
     assert row.status == "completed"
-    assert row.report["outcomes"] == {"claim_lost": 1, "published_accepted": 2}
+    assert row.report["outcomes"] == {"transient_error": 2, "published_accepted": 1}
+    assert logged(caplog, "score_target_failed") == []  # a timeout is no bug
+
+
+async def test_an_unclassified_failure_ends_the_target_failed_invalid_output_for_a_bug(
+    engine: AsyncEngine,
+    gateway: LLMGateway,
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Rulings T11-a (d), T11-f: a code fault is terminal, `failed_invalid_output('bug')`, so a later claim
+    # round does not admit it again, even in lane `score_now`
+    (failing,) = await insert_targets(engine, 1, lane="score_now")
+    (sibling,) = await insert_targets(engine, 1)
+    answer_all(fake_llm, [sibling])
+
+    async def raises(state: TargetState) -> None:
+        if state["target_id"] == failing.target_id:  # a deterministic node's unmapped error
+            raise RuntimeError("synthetic failure 4111-1111-1111-1111")
+
+    before_node(monkeypatch, "load_context", raises)
+    runner = await cycle_runner(engine, gateway)
+    cycle_id = await runner.start("manual")
+    final = await runner.run(cycle_id)
+    assert final["claim_rounds"] == 1 and len(final["results"]) == 2
+    outcome = final["results"][work_id(failing.target_id, 1)]
+    assert (outcome["outcome"], outcome["state"]) == ("failed_invalid_output", "failed_invalid_output")
     target = await target_of(engine, failing.target_id)
-    assert (target.state, target.claim_id, target.charged_attempts) == ("pending", None, 0)
-    attempt = sa.text("SELECT outcome, outcome_detail FROM score_attempts WHERE target_id = :t")
-    async with engine.connect() as conn:
-        assert tuple((await conn.execute(attempt, {"t": failing.target_id})).one()) == (
-            "claim_lost",
-            "subgraph_failed",
-        )
+    assert (target.state, target.state_reason, target.claim_id) == ("failed_invalid_output", "bug", None)
+    assert await attempts_of(engine, failing.target_id) == [(1, "failed_invalid_output", "bug")]
+    row = await cycle_of(engine, cycle_id)
+    assert row.status == "completed"
+    assert row.report["outcomes"] == {"failed_invalid_output": 1, "published_accepted": 1}
     [failed] = logged(caplog, "score_target_failed")
     assert (failed["target_id"], failed["error_class"]) == (failing.target_id, "NodeFailed")
     assert "4111" not in caplog.text
+
+
+async def test_the_claim_s_own_fence_inside_the_attempt_is_claim_lost_and_no_error(
+    engine: AsyncEngine,
+    gateway: LLMGateway,
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Ruling T11-a (b): `ClaimLost` (the claim predicate failed under an owner lock) is ownership loss: the
+    # rival that reclaimed the target ended the attempt, and the target is the rival's now
+    lost, sibling = await insert_targets(engine, 2)
+    answer_all(fake_llm, [sibling])
+    rival: list[ClaimedTarget] = []
+
+    async def fenced(state: TargetState) -> None:
+        if state["target_id"] == lost.target_id:
+            await reclaim_now(engine, lost.target_id)
+            rival.append(await claim_again(engine, lost.target_id))
+            raise ClaimLost()
+
+    before_node(monkeypatch, "load_context", fenced)
+    runner = await cycle_runner(engine, gateway)
+    cycle_id = await runner.start("manual")
+    final = await runner.run(cycle_id)
+    outcome = final["results"][work_id(lost.target_id, 1)]
+    assert (outcome["outcome"], outcome["state"]) == ("claim_lost", "in_progress")
+    target = await target_of(engine, lost.target_id)
+    assert (target.state, str(target.claim_id), target.attempt_no) == ("in_progress", rival[0].claim_id, 2)
+    assert await attempts_of(engine, lost.target_id) == [
+        (1, "claim_lost", "stale_heartbeat"),
+        (2, "running", None),
+    ]
+    row = await cycle_of(engine, cycle_id)
+    assert row.status == "completed"
+    assert row.report["outcomes"] == {"claim_lost": 1, "published_accepted": 1}
+    assert logged(caplog, "score_target_failed") == []
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+async def test_an_attach_that_raises_leaves_no_attempt_running(
+    engine: AsyncEngine, gateway: LLMGateway, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    targets = await insert_targets(engine, 1)
+    stall(fake_llm, *targets)
+
+    def attach(self: ClaimHeartbeats, ref: Any, child: Any) -> None:
+        raise ValueError("synthetic attach failure")
+
+    monkeypatch.setattr(ClaimHeartbeats, "attach", attach)
+    runner = await cycle_runner(engine, gateway)
+    cycle_id = await runner.start("manual")
+    with pytest.raises(NodeFailed, match="score_target failed: ValueError"):
+        await runner.run(cycle_id)
+    assert child_tasks() == [] and beat_tasks() == []
+    assert int(await scalar(engine, "SELECT count(*) FROM llm_calls")) == 0  # the attempt never ran
+
+
+@pytest.mark.filterwarnings("ignore:coroutine 'arun_with_retry' was never awaited:RuntimeWarning")
+async def test_a_cancelled_cycle_with_queued_claims_leaves_no_child_and_no_beat(
+    engine: AsyncEngine, gateway: LLMGateway, fake_llm: FakeLLM
+) -> None:
+    # Ruling P10: four claims, three running (`MAX_CONCURRENCY`) and one waiting for a slot, when the worker
+    # shuts down; LangGraph drops the waiting task's coroutine unawaited (the filter above)
+    sleep = ManualSleep()
+    runner = await cycle_runner(engine, gateway, sleep=sleep)
+    targets = await insert_targets(engine, 4)
+    stall(fake_llm, *targets)
+    cycle_id = await runner.start("manual")
+    run = asyncio.create_task(runner.run(cycle_id))
+
+    async def three_open() -> bool:
+        return int(await scalar(engine, "SELECT count(*) FROM llm_calls WHERE status = 'dispatched'")) == 3
+
+    await until(three_open)
+    assert len(beat_tasks()) == 4 and len(child_tasks()) == 3
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, 30)
+    assert child_tasks() == [] and beat_tasks() == []
+    await settled_ambiguous(engine, 3)
+    gc.collect()  # the dropped coroutine is collected here, under this test's filter
+    assert (await cycle_of(engine, cycle_id)).status == "running"
+    for target in targets:
+        assert (await target_of(engine, target.target_id)).state == "in_progress"
 
 
 # ---- the cycle task (`execute_cycle`) ------------------------------------------------------------------

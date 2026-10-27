@@ -27,6 +27,11 @@ The exceptions, each with its `error_code`, the attempt's outcome and the target
 - `BudgetExhausted`: `budget_exhausted`, `budget_exhausted`, `budget_deferred('budget_exhausted')`;
 - `ClaimLost` and any other `FencedOut`: `claim_lost`, `claim_lost`, the target untouched (`None`).
 
+Two codes no step gives: they are `run_target`'s, for what escapes the subgraph (Rulings T11-a, T11-f):
+- `node_timeout`, a deterministic node's `NodeTimeoutError`: `transient_error`, `pending` with backoff;
+- `bug`, an unclassified exception: `failed_invalid_output`, `failed_invalid_output('bug')`, terminal (the
+  reason tells a code fault from a model's invalid output).
+
 A transient target backs off (`pending(not_before)`) while `charged_attempts < max_score_attempts`, and is
 `failed_transient` once they are spent: `fail` decides it from the target row (§9.6, L2863). The last three
 transient rows make no call (a gateway without a key raises before anything is reserved; an unscorable
@@ -64,6 +69,8 @@ LLM_NOT_CONFIGURED: Final = "llm_not_configured"
 PROMPT_VERSION_UNSCORABLE: Final = "prompt_version_unscorable"
 BUDGET_EXHAUSTED: Final = "budget_exhausted"
 INPUT_UNBOUNDED: Final = "input_unbounded"
+NODE_TIMEOUT: Final = "node_timeout"
+BUG: Final = "bug"
 REQUEST_PREFIX: Final = "llm_request_"
 UNSPECIFIED_CATEGORY: Final = "unspecified"
 _STRUCTURAL: Final = "structural"
@@ -99,6 +106,8 @@ _FIXED: Final[dict[str, StepOutcome]] = {
         (LLM_NOT_CONFIGURED, "transient_error", "pending", LLM_NOT_CONFIGURED, True),
         (PROMPT_VERSION_UNSCORABLE, "transient_error", "pending", PROMPT_VERSION_UNSCORABLE, True),
         (BUDGET_EXHAUSTED, "budget_exhausted", "budget_deferred", BUDGET_EXHAUSTED, False),
+        (NODE_TIMEOUT, "transient_error", "pending", NODE_TIMEOUT, True),
+        (BUG, "failed_invalid_output", "failed_invalid_output", BUG, False),
         (CLAIM_LOST, CLAIM_LOST, None, None, False),
     )
 }

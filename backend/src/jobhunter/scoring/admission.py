@@ -10,16 +10,21 @@ preparation's `'batch'` are typed by it.
 `MAX_SCORE_ATTEMPTS` is §7.16.3's `max_score_attempts` (L2863), against `score_targets.charged_attempts`: the
 admission, the claim and `fail` count to it.
 
+**The admissible targets** of a tuple, one predicate (`_ADMISSIBLE_WHERE`): the due (`not_before` passed),
+unfenced (`NOT is_fenced(job_id, llm_tuple_id)`) `pending` targets with `charged_attempts <
+MAX_SCORE_ATTEMPTS`. `any_admissible(conn, llm_tuple_id, *, lane, now)` is the cycle start's gate on it
+(`cycles.start_cycle`, `cycles.periodic_gate`), so a target no round could admit (fenced, or its attempts
+spent) starts no cycle.
+
 **The two calls, stubs until Task 12** (Ruling P12; Task 12 replaces both bodies, adds the lane allocation of
 §9.6.2 behind `admit` and gives it its `sweeps` argument):
-- `admit(conn, cycle, *, now)`, a cycle's first round: the due (`not_before` passed), unfenced
-  (`NOT is_fenced(job_id, llm_tuple_id)`) `pending` targets of the cycle's tuple with `charged_attempts <
-  MAX_SCORE_ATTEMPTS`; those of lane `score_now` first (lane `score_now`, outside `S`, as everywhere), then
-  the others in id order as lane `similarity`, at most the cycle's `admission_size` (`S`) of them;
-- `admit_urgent(conn, cycle, *, now, slots_left)`, a later claim round: the same targets of lane `score_now`
-  (outside `S`), then those of lane `batch_followup` (lane `batch_followup`) up to `slots_left`, the slots of
-  `S` the earlier rounds left.
-Both read without a lock: the claim re-checks every condition under its own `FOR UPDATE SKIP LOCKED`.
+- `admit(conn, cycle, *, now)`, a cycle's first round: the admissible targets of the cycle's tuple; those of
+  lane `score_now` first (lane `score_now`, outside `S`, as everywhere), then the others in id order as lane
+  `similarity`, at most the cycle's `admission_size` (`S`) of them;
+- `admit_urgent(conn, cycle, *, now, slots_left)`, a later claim round: the admissible targets of lane
+  `score_now` (outside `S`), then those of lane `batch_followup` (lane `batch_followup`) up to `slots_left`,
+  the slots of `S` the earlier rounds left.
+All three read without a lock: the claim re-checks every condition under its own `FOR UPDATE SKIP LOCKED`.
 """
 
 from dataclasses import dataclass
@@ -69,17 +74,30 @@ class Picked:
     always_include_reason: str | None = None
 
 
-# The admissible targets of a tuple (module docstring): the first round's, Score now first, then by id; and
-# those of one lane by id, at most `:limit` (NULL: all).
-_ADMISSIBLE: Final = (
-    "SELECT t.id, t.lane FROM score_targets t WHERE t.llm_tuple_id = :tuple AND t.state = 'pending' "
-    "AND (t.not_before IS NULL OR t.not_before <= :now) AND t.charged_attempts < :max_attempts "
-    "AND NOT is_fenced(t.job_id, t.llm_tuple_id)"
+# The admissible targets of a tuple (module docstring), over `score_targets t`: whether one exists (of
+# `:lane`, when not NULL); the first round's, Score now first, then by id; and those of one lane by id, at
+# most `:limit` (NULL: all).
+_ADMISSIBLE_WHERE: Final = (
+    "t.llm_tuple_id = :tuple AND t.state = 'pending' AND (t.not_before IS NULL OR t.not_before <= :now) "
+    "AND t.charged_attempts < :max_attempts AND NOT is_fenced(t.job_id, t.llm_tuple_id)"
 )
+_ANY: Final = q(
+    f"SELECT EXISTS (SELECT 1 FROM score_targets t WHERE {_ADMISSIBLE_WHERE} "  # noqa: S608 (the constant above)
+    "AND (CAST(:lane AS text) IS NULL OR t.lane = :lane))"
+)
+_ADMISSIBLE: Final = f"SELECT t.id, t.lane FROM score_targets t WHERE {_ADMISSIBLE_WHERE}"  # noqa: S608
 _FIRST_ROUND: Final = q(f"{_ADMISSIBLE} ORDER BY (t.lane IS NOT DISTINCT FROM 'score_now') DESC, t.id")
 _OF_LANE: Final = q(f"{_ADMISSIBLE} AND t.lane = :lane ORDER BY t.id LIMIT :limit")
 _SCORE_NOW: Final[Lane] = "score_now"
 _BATCH_FOLLOWUP: Final[Lane] = "batch_followup"
+
+
+async def any_admissible(
+    conn: AsyncConnection, llm_tuple_id: int, *, lane: Lane | None, now: datetime
+) -> bool:
+    """Whether the tuple has an admissible target (of `lane`, when given) at `now` (module docstring)."""
+    params = {"tuple": llm_tuple_id, "now": now, "max_attempts": MAX_SCORE_ATTEMPTS, "lane": lane}
+    return bool((await conn.execute(_ANY, params)).scalar_one())
 
 
 async def admit(conn: AsyncConnection, cycle: "CycleRow", *, now: datetime) -> list[Picked]:

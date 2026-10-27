@@ -7,15 +7,17 @@ B8, r5 B4, r7 B5, Rulings P11, P13, P47, Deviations 5, 19, 20, 39): `scoring.cyc
 first cycle of a month creating its row), records `S`, `ĉ` and the bucket, leaves its transaction usable when
 a cycle still runs, and starts a `score_now` cycle outside the bucket without the month lock; every pause
 reason blocks it, an acknowledgement lifts the auth and bound pauses, and the cap pause reads the headroom,
-never the alert; `ĉ` uses its history only from 20 qualifying attempts; `schema_verified` needs a passed live
-case for every (schema, model) pair of the policy; and a lone stalled `score_cycle` job is failed, never
-retried.
+never the alert; a lone fenced or exhausted pending target starts no cycle (the start's gate is the
+admission's predicate), and a start reads the active configuration once; `ĉ` uses its history only from 20
+qualifying attempts; `schema_verified` needs a passed live case for every (schema, model) pair of the policy;
+and a lone stalled `score_cycle` job is failed, never retried.
 
 Every datum is invented.
 """
 
 import asyncio
 import hashlib
+import inspect
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -230,6 +232,63 @@ async def test_a_batch_followup_start_needs_a_followup_target_and_the_bucket(
     assert await start(engine, "batch_followup", now) is None  # gated like periodic
     await set_bucket(engine, "1.000000", now)
     assert await start(engine, "batch_followup", now) is not None
+
+
+@pytest.mark.parametrize("unscorable", ["fenced", "exhausted"])
+@pytest.mark.parametrize("trigger", TRIGGERS)
+async def test_a_lone_fenced_or_exhausted_pending_target_starts_no_cycle(
+    engine: AsyncEngine,
+    current_epoch: int,
+    now: datetime,
+    trigger: CycleTrigger,
+    unscorable: str,
+) -> None:
+    # The start's gate is the admission's predicate (`admission.any_admissible`): a target no round could
+    # admit starts nothing, and the tick requests nothing for it
+    lane = trigger if trigger in ("score_now", "batch_followup") else None
+    (pending,) = await insert_targets(engine, 1, lane=lane)
+    await set_bucket(engine, "1.400000", now)
+    if unscorable == "fenced":  # a jobs purge fence over the target's job
+        await execute(
+            engine,
+            "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', ARRAY[:j]::bigint[], 1)",
+            j=pending.job_id,
+        )
+    else:  # every charged attempt spent
+        await execute(
+            engine, "UPDATE score_targets SET charged_attempts = 4 WHERE id = :t", t=pending.target_id
+        )
+    assert await start(engine, trigger, now) is None
+    async with engine.begin() as conn:
+        assert await cycles.periodic_gate(conn, await cycles.scoring_config(conn), now=now) is False
+    if unscorable == "fenced":
+        await execute(engine, "UPDATE purge_fences SET released_at = now()")
+    else:
+        await execute(
+            engine, "UPDATE score_targets SET charged_attempts = 3 WHERE id = :t", t=pending.target_id
+        )
+    assert await start(engine, trigger, now) is not None  # admissible again: the cycle starts
+
+
+async def test_a_start_reads_the_active_configuration_once(
+    engine: AsyncEngine, current_epoch: int, now: datetime
+) -> None:
+    # The pointers, the policies and the settings, read once for the guard, the gate and the row
+    await insert_targets(engine, 1)
+    await set_bucket(engine, "1.400000", now)
+    statements: list[str] = []
+
+    def seen(*args: Any) -> None:
+        statements.append(str(args[2]))  # (conn, cursor, statement, parameters, context, executemany)
+
+    sa.event.listen(engine.sync_engine, "before_cursor_execute", seen)
+    try:
+        assert await start(engine, "manual", now) is not None
+    finally:
+        sa.event.remove(engine.sync_engine, "before_cursor_execute", seen)
+    for table in ("active_config", "model_policies", "settings_versions"):
+        assert sum(table in statement for statement in statements) == 1, table
+    assert inspect.signature(cycles.pause_reason).parameters["now"].default is inspect.Parameter.empty
 
 
 @pytest.mark.parametrize("where", ["start_cycle", "tick_score"])

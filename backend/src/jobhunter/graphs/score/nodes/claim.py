@@ -2,9 +2,9 @@
 r2 B5, r3 B8, B15, r4 B2, Controller carry T9-d): the atomic claim of a round's admissions.
 
 **The transaction** (`claim_round`), in the lock schedule's order: `fence_epoch` (the claim stamps
-`claim_epoch`), `active_config FOR SHARE` for the **active** execution config and evaluation policy (L3491:
-the attempt pins them and uses them throughout), the cycle under its owner predicate (`cycles.lock_cycle`,
-step 5; a lost cycle is `FencedOut(cycles.CYCLE_OWNER)`), then:
+`claim_epoch`), `active_config FOR SHARE` (`cycles.lock_active_scoring`) for the **active** execution config
+and evaluation policy (L3491: the attempt pins them and uses them throughout), the cycle under its owner
+predicate (`cycles.lock_cycle`, step 5; a lost cycle is `FencedOut(cycles.CYCLE_OWNER)`), then:
 1. The atomic claim (L3477-3488) over the round's admissions, through `transition_where` `pending →
    in_progress` with the caller's `FOR UPDATE SKIP LOCKED` subquery (`CLAIM_WHERE`: still pending, due,
    `charged_attempts < MAX_SCORE_ATTEMPTS`, not purge-fenced), the admissions as the source relation `a`
@@ -67,9 +67,6 @@ CLAIM_SET_SQL: Final = {
 }
 CLAIM_RETURNING: Final = ("id", "claim_id", "attempt_no", "resume_draft_id")
 
-_ACTIVE: Final = q(
-    "SELECT execution_config_id, evaluation_policy_id FROM active_config WHERE id = 1 FOR SHARE"
-)
 # The resumed attempt: the newest earlier attempt of the target under the policy, when it has a draft to
 # resume from (`RESUMABLE_DRAFT_SQL`, correlated to `t`).
 _RESUMED_FROM: Final = (
@@ -172,7 +169,7 @@ def make_claim(deps: ScoreDeps) -> CycleNode:
         ]
         async with deps.engine.begin() as conn:
             await fence_epoch(conn, ctx.worker_epoch)  # step 1: the claim stamps `claim_epoch`
-            active = (await conn.execute(_ACTIVE)).one()  # step 2
+            active = await cycles.lock_active_scoring(conn)  # step 2
             if await cycles.lock_cycle(conn, ctx.cycle_id, epoch=ctx.worker_epoch) is None:  # step 5
                 raise FencedOut(cycles.CYCLE_OWNER)
             claimed = await claim_round(
@@ -180,8 +177,8 @@ def make_claim(deps: ScoreDeps) -> CycleNode:
                 picked,
                 epoch=ctx.worker_epoch,
                 cycle_id=ctx.cycle_id,
-                execution_config_id=int(active.execution_config_id),
-                evaluation_policy_id=int(active.evaluation_policy_id),
+                execution_config_id=active.execution_config_id,
+                evaluation_policy_id=active.evaluation_policy_id,
             )
             if claimed:
                 await ranking.bump(conn)  # step 11, last

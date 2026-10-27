@@ -21,7 +21,8 @@ LangGraph's `NodeTimeoutError`, outside the node (LangGraph cancels the node's t
 the gateway settles `ambiguous`, M2 V11), so the node cannot map it itself. Each LLM node has an error handler
 (`on_timeout`) that routes it to `fail` with its `llm_step` code (`llm_transient`: the target backs off, C16);
 every other error of the node fails the run as it would without the handler (re-raised as it came). The
-deterministic nodes' timeouts (a stalled database) are not mapped: the run fails and the claim is reclaimed.
+deterministic nodes' timeouts (a stalled database) are not mapped here: their `NodeTimeoutError` escapes the
+run, and `run_target` takes `fail`'s transient path for it (code `node_timeout`, Ruling T11-a).
 
 The graph is compiled once per process with `checkpointer=None` (L3376): as the cycle graph's subgraph it
 inherits that graph's checkpointer (Task 11).

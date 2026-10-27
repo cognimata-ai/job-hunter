@@ -23,16 +23,17 @@ never started.
 
 **The score-cycle trigger** (§3.4 step 6; M3 Task 11). `run_tick` is unchanged; the tick task then runs
 `tick_score(engine, *, now, epoch, defer, fake_llm)` in a transaction of its own: `fence_epoch`,
-`active_config FOR SHARE`, the score lane's pause guard (`cycles.pause_reason`), no running cycle, and the
-periodic gate (a due pending target of the active tuple, and the bucket under the month lock after
-`ensure_month`, Codex r4 B8) before `cycles.request_cycle("periodic")`. The `score_cycle` task checks
-everything again under its own locks, so a stale request costs nothing. `TickScoreReport` says whether it
-requested a cycle and why the lane is paused, if it is.
+`active_config FOR SHARE` with what it names, read once (`cycles.scoring_config`), the score lane's pause
+guard (`cycles.pause_reason`), no running cycle, and the periodic gate (an admissible target of the active
+tuple, and the bucket under the month lock after `ensure_month`, Codex r4 B8) before
+`cycles.request_cycle("periodic")`. The `score_cycle` task checks everything again under its own locks, so a
+stale request costs nothing. `TickScoreReport` says whether it requested a cycle and why the lane is paused
+(a `cycles.PauseReason`), if it is.
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -44,6 +45,10 @@ from jobhunter.observability.metrics import RUNS
 from jobhunter.types import get_bool
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, defer_run_attempt
+
+if TYPE_CHECKING:
+    # Only for the annotation: `cycles` imports the worker's task modules, which import this one.
+    from jobhunter.scoring.cycles import PauseReason
 
 CATCH_UP_AFTER: Final = timedelta(minutes=5)
 
@@ -308,7 +313,7 @@ class TickScoreReport:
     (`None` when it is not paused)."""
 
     requested: bool
-    pause_reason: str | None
+    pause_reason: "PauseReason | None"
 
 
 async def tick_score(
@@ -321,14 +326,14 @@ async def tick_score(
 
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
-        active = await cycles.lock_active_scoring(conn)
-        if active.llm_tuple_id is None:
+        config = await cycles.scoring_config(conn)
+        if config.active.llm_tuple_id is None:
             return TickScoreReport(requested=False, pause_reason=None)
-        reason = await cycles.pause_reason(conn, fake_llm=fake_llm, now=now)
+        reason = await cycles.pause_reason(conn, fake_llm=fake_llm, now=now, config=config)
         if reason is not None:
             log.info("tick_score_paused", pause_reason=reason)
             return TickScoreReport(requested=False, pause_reason=reason)
-        if await cycles.cycle_running(conn) or not await cycles.periodic_gate(conn, active, now=now):
+        if await cycles.cycle_running(conn) or not await cycles.periodic_gate(conn, config, now=now):
             return TickScoreReport(requested=False, pause_reason=None)
         requested = await cycles.request_cycle(conn, trigger="periodic", defer=defer)
     return TickScoreReport(requested=requested, pause_reason=None)

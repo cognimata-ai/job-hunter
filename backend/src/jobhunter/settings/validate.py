@@ -343,12 +343,12 @@ _PASSED_LIVE: Final = q(
 
 def schema_pairs(model_policy: ModelPolicy) -> frozenset[tuple[str, str]]:
     """The (schema, model) pairs `model_policy`'s nodes need, by the dry-run's own mapping of each schema to
-    its nodes (`schema_dry_run._SCHEMA_NODES`): the generator schema on the `generate` and `revise` models,
+    its nodes (`schema_dry_run.SCHEMA_NODES`): the generator schema on the `generate` and `revise` models,
     the critic schema on the `critic` model, the profile schema on the `extract_profile` model and the
     queries schema on the `propose_queries` model."""
     models: dict[str, str] = {node: choice.model for node, choice in model_policy.nodes.by_node().items()}
     return frozenset(
-        (schema, models[node]) for schema, nodes in schema_dry_run._SCHEMA_NODES for node in nodes
+        (schema, models[node]) for schema, nodes in schema_dry_run.SCHEMA_NODES for node in nodes
     )
 
 

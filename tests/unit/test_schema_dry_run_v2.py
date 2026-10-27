@@ -21,6 +21,8 @@ from jobhunter.llm.schemas.generator import GeneratorOut, GeneratorWire
 from jobhunter.llm.schemas.profile import ProfileOut
 from jobhunter.llm.schemas.queries import QueryProposalOut
 from jobhunter.llm.transport import make_http_client
+from jobhunter.settings import validate
+from jobhunter.settings.model import ModelPolicy
 from jobhunter.types import JSONValue, get_object
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -57,6 +59,22 @@ def test_the_cases_of_version_2_on_the_seeded_policy() -> None:
         DryRunCase("queries", OPUS),
         DryRunCase("generator", SONNET, probe=True),
     ]
+
+
+def test_each_schema_serves_its_nodes_and_the_score_lane_s_verification_pairs_them() -> None:
+    # The one mapping (`SCHEMA_NODES`), which `settings.validate.schema_pairs` reads as well
+    assert schema_dry_run.SCHEMA_NODES == (
+        ("generator", ("generate", "revise")),
+        ("critic", ("critic",)),
+        ("profile", ("extract_profile",)),
+        ("queries", ("propose_queries",)),
+    )
+    assert validate.schema_pairs(ModelPolicy.model_validate(SEEDED_POLICY)) == {
+        ("generator", SONNET),
+        ("critic", OPUS),
+        ("profile", OPUS),
+        ("queries", OPUS),
+    }
 
 
 def test_a_reviser_on_another_model_is_a_second_generator_case() -> None:

@@ -29,9 +29,11 @@ from jobhunter.graphs.score.graph import (
     more,
     thread_id,
 )
+from jobhunter.graphs.score.nodes import run_target
 from jobhunter.graphs.score.state import ClaimRef, CycleState, TargetOutcome
 from jobhunter.graphs.score.subgraph import NODE_TIMEOUTS as TARGET_NODE_TIMEOUTS
 from jobhunter.llm.gateway import LLMGateway
+from jobhunter.worker.main import EXECUTIONS_CANCEL_S
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START
 from langgraph.types import Send, TimeoutPolicy
@@ -101,6 +103,8 @@ def test_the_cycle_nodes_have_their_timeouts_and_retries() -> None:
     wrapper = nodes["score_target"]
     assert wrapper.retry_policy is None and wrapper.timeout is None
     assert wrapper.input_schema is ClaimRef
+    # A cancelled wrapper waits for its child for less than the worker waits for the cycle's task
+    assert run_target.CANCEL_TIMEOUT_S == 20.0 < EXECUTIONS_CANCEL_S
 
 
 def test_the_subgraph_is_compiled_once_and_is_no_node_of_the_cycle_graph() -> None:

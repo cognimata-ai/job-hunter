@@ -121,8 +121,9 @@ Transport = Literal["fake", "live"]
 TRANSPORTS: Final[tuple[Transport, ...]] = ("fake", "live")
 
 SchemaName = Literal["generator", "critic", "profile", "queries"]
-# Each schema and the model-policy nodes it serves (§10.3, §10.11).
-_SCHEMA_NODES: Final[tuple[tuple[SchemaName, tuple[str, ...]], ...]] = (
+# Each schema and the model-policy nodes it serves (§10.3, §10.11): the one mapping, which
+# `settings.validate.schema_pairs` reads too.
+SCHEMA_NODES: Final[tuple[tuple[SchemaName, tuple[str, ...]], ...]] = (
     ("generator", ("generate", "revise")),
     ("critic", ("critic",)),
     ("profile", ("extract_profile",)),
@@ -165,7 +166,7 @@ def cases(model_policy: Mapping[str, JSONValue]) -> list[DryRunCase]:
     on the `generate` model. A case names a schema, not its bytes: `node_for(case, version)` binds it to what
     a version stores, and a schema the version lacks ends its case `schema_not_in_version`."""
     planned: list[DryRunCase] = []
-    for schema_name, nodes in _SCHEMA_NODES:
+    for schema_name, nodes in SCHEMA_NODES:
         models: list[Model] = []
         for node in nodes:
             if (model := _node_model(model_policy, node)) not in models:

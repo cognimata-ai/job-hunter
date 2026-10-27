@@ -3,16 +3,20 @@ L5596; plan Task 11, Codex r1 #16, #19, #20, #25, r4 B1, B8, r5 B4, r7 B5, Devia
 score lane's admission guard, the trigger, the start of a cycle, the reclaim of claims, and the two ends of an
 orphaned cycle (the takeover sweeps and the `orphaned_cycles` reconciler).
 
-**`pause_reason(conn, *, fake_llm, now)`**, the one admission guard of the score lane, which `start_cycle` and
-Task 16's batch preparation consult alike: `reservation_bound_violated` while an unacknowledged open
-`llm.reservation_bound_violated` exists, `auth_failed` likewise for `llm.auth_failed` (an acknowledgement
-lifts either while the alert stays open, Deviation 19), `cap_reached` while the current UTC month's scoring
-headroom (`spend_ledger.read_month_or_new`, no lock) is below `r_first` (the ledger decides, never
-`llm.cap_reached`: a previous month's open alert cannot pause a new month, a second denial in a month still
-pauses, and the pause lifts by itself when headroom returns), `global_fence` while a global purge fence is
-active, and `schema_unverified` while `validate.schema_verified` of the active prompt-schema version and model
-policy is false outside fake LLM mode; `None` otherwise, in that order. Scoring pauses at admission, never
-inside a running cycle.
+**The active configuration** (`scoring_config`): `active_config FOR SHARE` (`lock_active_scoring`, step 2 of
+the lock schedule) and what its pointers name (the model policy, the execution config, the settings' budget
+and cycle sizes), read once per transaction and passed on to the guard and the gates.
+
+**`pause_reason(conn, *, fake_llm, now, config=None)`**, the one admission guard of the score lane, which
+`start_cycle` and Task 16's batch preparation consult alike: `reservation_bound_violated` while an
+unacknowledged open `llm.reservation_bound_violated` exists, `auth_failed` likewise for `llm.auth_failed` (an
+acknowledgement lifts either while the alert stays open, Deviation 19), `cap_reached` while the scoring
+headroom of `now`'s UTC month (`spend_ledger.read_month_or_new`, no lock) is below `r_first` (the ledger
+decides, never `llm.cap_reached`: a previous month's open alert cannot pause a new month, a second denial in
+a month still pauses, and the pause lifts by itself when headroom returns), `global_fence` while a global
+purge fence is active, and `schema_unverified` while `validate.schema_verified` of the active prompt-schema
+version and model policy is false outside fake LLM mode; `None` otherwise, in that order. Scoring pauses at
+admission, never inside a running cycle.
 
 **`request_cycle(conn, *, trigger, defer)`** defers `score_cycle(trigger)` under the lock `score` and the
 queueing lock `score_cycle:<trigger>` in the caller's transaction (the API's routes, the tick, `batch_poll`),
@@ -20,13 +24,14 @@ queueing lock `score_cycle:<trigger>` in the caller's transaction (the API's rou
 request. It takes no lock and stamps no epoch; the cycle row is the worker's.
 
 **`start_cycle(conn, *, trigger, now, epoch, fake_llm)`**, the `score_cycle` task's first transaction, in the
-lock schedule's order: `fence_epoch`; `active_config FOR SHARE` (the tuple, the scope, the evaluation policy;
-no tuple, no cycle); `pause_reason`; then by trigger:
-- `periodic` and `manual`: a due `pending` target of the tuple (`not_before` passed) and, under the month
-  row's lock (`ensure_month` first, so the first cycle of a fresh UTC month creates the row it gates on),
-  `bucket_usd ≥ min(min_cycle_targets x ĉ, B_max)`;
-- `batch_followup`: the same, for a due pending target of lane `batch_followup`;
-- `score_now`: a due pending target of lane `score_now`, and no month lock (nothing of it is bucket-gated; the
+lock schedule's order: `fence_epoch`; `scoring_config` (the tuple, the scope, the evaluation policy; no tuple,
+no cycle); `pause_reason`; then by trigger:
+- `periodic` and `manual`: an admissible target of the tuple (`admission.any_admissible`, the rounds' own
+  predicate: `pending`, due, unfenced, charged attempts left) and, under the month row's lock (`ensure_month`
+  first, so the first cycle of a fresh UTC month creates the row it gates on), `bucket_usd ≥
+  min(min_cycle_targets x ĉ, B_max)`;
+- `batch_followup`: the same, for an admissible target of lane `batch_followup`;
+- `score_now`: an admissible target of lane `score_now`, and no month lock (nothing of it is bucket-gated; the
   bucket is read without a lock for the record).
 `S = max(0, min(max_targets_per_cycle, floor(bucket_usd / ĉ)))`, `0` for `score_now`; the row is inserted
 `running` with `ON CONFLICT DO NOTHING` (the partial unique index `score_cycles_one_running` arbitrates, no
@@ -38,12 +43,12 @@ under the evaluation policy, from 20 of them on; else the §21.2 central estimat
 **The reclaim** (`reclaim`, §9.4.3): the `in_progress` targets a predicate selects, locked `FOR UPDATE` in id
 order, go to `pending` while charged attempts are left (`charged_attempts < MAX_SCORE_ATTEMPTS`), else to
 `failed_attempts_exhausted('attempts_exhausted')` with their follow-up hold released (a terminal move,
-`bulk.release_target_hold`); their running attempts end `claim_lost` with the reclaim's detail. A non-owner
-reclaim (a sweep, the reconciler, a failed cycle) locks the candidates' bulk rows first
-(`bulk.lock_for_targets`, Ruling P52: the bulk row, step 7, before the target rows, step 10); the claim's own
-owner (`run_target`, kind `claim`) holds its target row first (step 5) and releases the hold after it. The
-predicates are this module's: `older_epoch` (`claim_epoch < :epoch`), `cycle` (the target's current attempt
-belongs to `:cycle`) and `claim` (the one claim `:target`, `:claim`, `:attempt_no`).
+`bulk.release_target_hold`); their running attempts end `claim_lost` with the reclaim's detail. A reclaim is
+never the claim's owner (a sweep, the reconciler, a failed cycle), so it locks the candidates' bulk rows
+first (`bulk.lock_for_targets`, Ruling P52: the bulk row, step 7, before the target rows, step 10). The
+predicates are this module's: `older_epoch` (`claim_epoch < :epoch`) and `cycle` (the target's current
+attempt belongs to `:cycle`). An attempt's own failure is never a reclaim: `run_target` ends it through
+`fail` (Ruling T11-a).
 
 **An orphaned cycle** is failed `orphaned` with the report closed `{"reason": "orphaned"}`, its claims
 reclaimed, and the warn alert `score_cycle.orphaned` raised (subject `cycle:<id>`), which the next completed
@@ -69,7 +74,6 @@ from typing import Final, Literal, get_args
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition, transition_where
 from jobhunter.errors import FencedOut, TransitionConflict
@@ -79,9 +83,8 @@ from jobhunter.llm.gateway import AUTH_FAILED_ALERT
 from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
-from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
+from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS, Lane, any_admissible
 from jobhunter.settings import validate
-from jobhunter.settings.active import lock_active
 from jobhunter.settings.llm_projection import central_cost_per_target
 from jobhunter.settings.model import ExecutionConfig, ModelPolicy
 from jobhunter.types import JSONValue, get_int
@@ -95,7 +98,7 @@ CYCLE_TRIGGERS: Final[tuple[CycleTrigger, ...]] = get_args(CycleTrigger)
 PauseReason = Literal[
     "reservation_bound_violated", "auth_failed", "cap_reached", "global_fence", "schema_unverified"
 ]
-ReclaimKind = Literal["older_epoch", "cycle", "claim"]
+ReclaimKind = Literal["older_epoch", "cycle"]
 
 # The owner a lost cycle predicate fences out (`FencedOut(CYCLE_OWNER)`): one piece of work lost.
 CYCLE_OWNER: Final = "score_cycle"
@@ -110,11 +113,10 @@ BUG: Final = "bug"
 WORKER_TAKEOVER: Final = "worker_takeover"
 CYCLE_ORPHANED: Final = "cycle_orphaned"
 CYCLE_FAILED: Final = "cycle_failed"
-SUBGRAPH_FAILED: Final = "subgraph_failed"
 ATTEMPTS_EXHAUSTED: Final = "attempts_exhausted"
 
 _TRIGGERS: Final[Mapping[str, CycleTrigger]] = {trigger: trigger for trigger in CYCLE_TRIGGERS}
-_LANE_OF_TRIGGER: Final[Mapping[CycleTrigger, str]] = {
+_LANE_OF_TRIGGER: Final[Mapping[CycleTrigger, Lane]] = {
     "score_now": "score_now",
     "batch_followup": "batch_followup",
 }
@@ -134,11 +136,12 @@ def cycle_trigger(value: str) -> CycleTrigger:
 
 _ACTIVE: Final = q(
     "SELECT llm_tuple_id, scope_version_id, evaluation_policy_id, model_policy_id, execution_config_id, "
-    "prompt_schema_version_id FROM active_config WHERE id = 1 FOR SHARE"
+    "prompt_schema_version_id, settings_version_id FROM active_config WHERE id = 1 FOR SHARE"
 )
-_POLICIES: Final = q(
-    "SELECT m.payload AS model_policy, e.payload AS execution FROM model_policies m, execution_configs e "
-    "WHERE m.id = :model_policy AND e.id = :execution"
+_NAMED: Final = q(
+    "SELECT m.payload AS model_policy, e.payload AS execution, s.payload AS settings "
+    "FROM model_policies m, execution_configs e, settings_versions s "
+    "WHERE m.id = :model_policy AND e.id = :execution AND s.id = :settings"
 )
 
 
@@ -152,6 +155,7 @@ class ActiveScoring:
     model_policy_id: int
     execution_config_id: int
     prompt_schema_version_id: int
+    settings_version_id: int
 
 
 async def lock_active_scoring(conn: AsyncConnection) -> ActiveScoring:
@@ -164,31 +168,50 @@ async def lock_active_scoring(conn: AsyncConnection) -> ActiveScoring:
         model_policy_id=int(row.model_policy_id),
         execution_config_id=int(row.execution_config_id),
         prompt_schema_version_id=int(row.prompt_schema_version_id),
+        settings_version_id=int(row.settings_version_id),
     )
 
 
-async def _policies(conn: AsyncConnection, active: ActiveScoring) -> tuple[ModelPolicy, ExecutionConfig]:
-    params = {"model_policy": active.model_policy_id, "execution": active.execution_config_id}
-    row = (await conn.execute(_POLICIES, params)).one()
-    return ModelPolicy.model_validate(row.model_policy), ExecutionConfig.model_validate(row.execution)
-
-
 @dataclass(frozen=True)
-class _Settings:
+class CycleSettings:
+    """The active settings' budget params and cycle sizes."""
+
     budget: BudgetParams
     max_targets_per_cycle: int
     min_cycle_targets: int
 
 
-async def _settings(conn: AsyncConnection) -> _Settings:
-    """The active settings' budget params and cycle sizes (`active_config FOR SHARE`, held already)."""
-    payload: JSONValue = (await lock_active(conn, share=True)).payload
+@dataclass(frozen=True)
+class ScoringConfig:
+    """The active configuration as the score lane's admission reads it (module docstring)."""
+
+    active: ActiveScoring
+    model_policy: ModelPolicy
+    execution: ExecutionConfig
+    settings: CycleSettings
+
+
+async def scoring_config(conn: AsyncConnection) -> ScoringConfig:
+    """`active_config FOR SHARE` and what its pointers name, in two statements (module docstring)."""
+    active = await lock_active_scoring(conn)
+    params = {
+        "model_policy": active.model_policy_id,
+        "execution": active.execution_config_id,
+        "settings": active.settings_version_id,
+    }
+    row = (await conn.execute(_NAMED, params)).one()
+    payload: JSONValue = row.settings
     if not isinstance(payload, dict):
-        raise LookupError("active_config has no settings version")
-    return _Settings(
-        budget=BudgetParams.from_payload(payload),
-        max_targets_per_cycle=get_int(payload, "scoring.max_targets_per_cycle"),
-        min_cycle_targets=get_int(payload, "scoring.min_cycle_targets"),
+        raise LookupError(f"settings version {active.settings_version_id} holds no document")
+    return ScoringConfig(
+        active=active,
+        model_policy=ModelPolicy.model_validate(row.model_policy),
+        execution=ExecutionConfig.model_validate(row.execution),
+        settings=CycleSettings(
+            budget=BudgetParams.from_payload(payload),
+            max_targets_per_cycle=get_int(payload, "scoring.max_targets_per_cycle"),
+            min_cycle_targets=get_int(payload, "scoring.min_cycle_targets"),
+        ),
     )
 
 
@@ -208,27 +231,26 @@ async def _unacknowledged(conn: AsyncConnection, code: str) -> bool:
 
 
 async def pause_reason(
-    conn: AsyncConnection, *, fake_llm: bool, now: datetime | None = None
+    conn: AsyncConnection, *, fake_llm: bool, now: datetime, config: ScoringConfig | None = None
 ) -> PauseReason | None:
-    """Why the score lane admits nothing now, or `None` (module docstring); `now` (the caller's clock,
-    `utcnow()` by default) names the month whose headroom decides `cap_reached`."""
-    at = utcnow() if now is None else now
+    """Why the score lane admits nothing now, or `None` (module docstring); `now`, the caller's clock, names
+    the month whose headroom decides `cap_reached`, and `config` is the caller's `scoring_config` of this
+    transaction (read here when not given)."""
     if await _unacknowledged(conn, BOUND_VIOLATED_ALERT):
         return "reservation_bound_violated"
     if await _unacknowledged(conn, AUTH_FAILED_ALERT):
         return "auth_failed"
-    active = await lock_active_scoring(conn)
-    model_policy, execution = await _policies(conn, active)
-    p = (await _settings(conn)).budget
-    row = await spend_ledger.read_month_or_new(conn, budget.month_of(at), p, now=at)
-    if budget.headroom(row, "scoring", p) < budget.r_first(model_policy, execution):
+    read = await scoring_config(conn) if config is None else config
+    p = read.settings.budget
+    row = await spend_ledger.read_month_or_new(conn, budget.month_of(now), p, now=now)
+    if budget.headroom(row, "scoring", p) < budget.r_first(read.model_policy, read.execution):
         return "cap_reached"
     if (await conn.execute(_GLOBAL_FENCE)).scalar_one():
         return "global_fence"
     if not fake_llm and not await validate.schema_verified(
         conn,
-        prompt_schema_version_id=active.prompt_schema_version_id,
-        model_policy_id=active.model_policy_id,
+        prompt_schema_version_id=read.active.prompt_schema_version_id,
+        model_policy_id=read.active.model_policy_id,
     ):
         return "schema_unverified"
     return None
@@ -277,10 +299,6 @@ async def request_cycle(conn: AsyncConnection, *, trigger: CycleTrigger, defer: 
     return job is not None
 
 
-_PENDING: Final = q(
-    "SELECT EXISTS (SELECT 1 FROM score_targets WHERE llm_tuple_id = :tuple AND state = 'pending' "
-    "AND (not_before IS NULL OR not_before <= :now) AND (CAST(:lane AS text) IS NULL OR lane = :lane))"
-)
 _RUNNING: Final = q("SELECT EXISTS (SELECT 1 FROM score_cycles WHERE status = 'running')")
 _INSERT_CYCLE: Final = q(
     "INSERT INTO score_cycles (trigger, llm_tuple_id, scope_version_id, evaluation_policy_id, worker_epoch, "
@@ -294,12 +312,6 @@ async def cycle_running(conn: AsyncConnection) -> bool:
     return bool((await conn.execute(_RUNNING)).scalar_one())
 
 
-async def _pending(conn: AsyncConnection, llm_tuple_id: int, *, lane: str | None, now: datetime) -> bool:
-    return bool(
-        (await conn.execute(_PENDING, {"tuple": llm_tuple_id, "now": now, "lane": lane})).scalar_one()
-    )
-
-
 def admission_size(bucket_usd: Decimal, estimate: Decimal, max_targets_per_cycle: int) -> int:
     """`S = max(0, min(max_targets_per_cycle, floor(bucket_usd / ĉ)))` (L3598)."""
     affordable = int((bucket_usd / estimate).to_integral_value(rounding=ROUND_FLOOR))
@@ -307,7 +319,7 @@ def admission_size(bucket_usd: Decimal, estimate: Decimal, max_targets_per_cycle
 
 
 async def _locked_bucket(
-    conn: AsyncConnection, settings: _Settings, estimate: Decimal, *, now: datetime
+    conn: AsyncConnection, settings: CycleSettings, estimate: Decimal, *, now: datetime
 ) -> tuple[BudgetRow, bool]:
     """The month row of `now` under its lock (created first when absent: Codex r4 B8), accrued, and whether
     its bucket holds `min(min_cycle_targets x ĉ, B_max)` (L1176)."""
@@ -318,21 +330,21 @@ async def _locked_bucket(
     return row, row.bucket_usd >= min(settings.min_cycle_targets * estimate, capacity)
 
 
-async def periodic_gate(conn: AsyncConnection, active: ActiveScoring, *, now: datetime) -> bool:
-    """The periodic trigger's gate (§3.4 step 6, L1176): a due pending target of the active tuple and the
-    bucket under the month lock (`ensure_month` first); the caller holds `active_config` and checked the
-    pause guard and the running cycle."""
-    if active.llm_tuple_id is None or not await _pending(conn, active.llm_tuple_id, lane=None, now=now):
+async def periodic_gate(conn: AsyncConnection, config: ScoringConfig, *, now: datetime) -> bool:
+    """The periodic trigger's gate (§3.4 step 6, L1176): an admissible target of the active tuple
+    (`admission.any_admissible`) and the bucket under the month lock (`ensure_month` first); the caller read
+    `config` (`scoring_config`, holding `active_config`) and checked the pause guard and the running cycle."""
+    tuple_id = config.active.llm_tuple_id
+    if tuple_id is None or not await any_admissible(conn, tuple_id, lane=None, now=now):
         return False
-    model_policy, _ = await _policies(conn, active)
     estimate, _ = await c_hat(
         conn,
-        llm_tuple_id=active.llm_tuple_id,
-        evaluation_policy_id=active.evaluation_policy_id,
-        model_policy=model_policy,
+        llm_tuple_id=tuple_id,
+        evaluation_policy_id=config.active.evaluation_policy_id,
+        model_policy=config.model_policy,
         now=now,
     )
-    _, holds = await _locked_bucket(conn, await _settings(conn), estimate, now=now)
+    _, holds = await _locked_bucket(conn, config.settings, estimate, now=now)
     return holds
 
 
@@ -346,27 +358,27 @@ async def start_cycle(
     """Start a cycle of `trigger` as worker `epoch` in the caller's transaction (module docstring); its id, or
     `None` when nothing may start. `FencedOut` when `epoch` is not the current worker epoch."""
     await fence_epoch(conn, epoch)
-    active = await lock_active_scoring(conn)
+    config = await scoring_config(conn)
+    active = config.active
     if active.llm_tuple_id is None:
         _not_started(trigger, "no_tuple")
         return None
-    reason = await pause_reason(conn, fake_llm=fake_llm, now=now)
+    reason = await pause_reason(conn, fake_llm=fake_llm, now=now, config=config)
     if reason is not None:
         _not_started(trigger, f"paused:{reason}")
         return None
     tuple_id = active.llm_tuple_id
-    if not await _pending(conn, tuple_id, lane=_LANE_OF_TRIGGER.get(trigger), now=now):
+    if not await any_admissible(conn, tuple_id, lane=_LANE_OF_TRIGGER.get(trigger), now=now):
         _not_started(trigger, "no_pending")
         return None
-    model_policy, _ = await _policies(conn, active)
     estimate, source = await c_hat(
         conn,
         llm_tuple_id=tuple_id,
         evaluation_policy_id=active.evaluation_policy_id,
-        model_policy=model_policy,
+        model_policy=config.model_policy,
         now=now,
     )
-    settings = await _settings(conn)
+    settings = config.settings
     if trigger == "score_now":  # outside the bucket: the row is read for the record, never locked
         row = await spend_ledger.read_month_or_new(conn, budget.month_of(now), settings.budget, now=now)
         size = 0
@@ -471,10 +483,9 @@ _RECLAIM_WHERE: Final[Mapping[ReclaimKind, str]] = {
         "EXISTS (SELECT 1 FROM score_attempts a WHERE a.target_id = t.id AND a.attempt_no = t.attempt_no "
         "AND a.cycle_id = :cycle)"
     ),
-    "claim": "t.id = :target AND t.claim_id = CAST(:claim AS uuid) AND t.attempt_no = :attempt_no",
 }
-# The candidates of a non-owner reclaim, read without a lock (for `bulk.lock_for_targets`), and the claims,
-# locked in id order; both statements are the registry's constants over this module's predicates.
+# The candidates of a reclaim, read without a lock (for `bulk.lock_for_targets`), and the claims, locked in id
+# order; both statements are the registry's constants over this module's predicates.
 _CANDIDATES: Final = {
     kind: q(
         f"SELECT t.id FROM score_targets t WHERE t.state = 'in_progress' AND ({where}) ORDER BY t.id"  # noqa: S608
@@ -508,11 +519,11 @@ async def reclaim(
     conn: AsyncConnection, kind: ReclaimKind, params: Mapping[str, object], *, detail: str
 ) -> list[Reclaimed]:
     """Reclaim the claims of `kind` (module docstring) in the caller's transaction; what it moved."""
-    if kind != "claim":  # not the owner: the bulk rows (step 7) before the target rows (step 10)
-        candidates = [int(i) for i in (await conn.execute(_CANDIDATES[kind], dict(params))).scalars()]
-        if not candidates:
-            return []
-        await bulk.lock_for_targets(conn, candidates)
+    # Never the claim's owner: the bulk rows (step 7) before the target rows (step 10)
+    candidates = [int(i) for i in (await conn.execute(_CANDIDATES[kind], dict(params))).scalars()]
+    if not candidates:
+        return []
+    await bulk.lock_for_targets(conn, candidates)
     locked = (await conn.execute(_LOCK_CLAIMS[kind], dict(params))).all()
     if not locked:
         return []
