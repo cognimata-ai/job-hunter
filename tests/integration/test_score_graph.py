@@ -1,6 +1,6 @@
 """`score_graph` on PostgreSQL with the fake LLM and keyed answers (spec §9.3, §9.4.3; plan Task 11, Review
-Focus 1 and 5, Codex r1 #12-#14, r2 B5, B6, Rulings P10, P34, T11-a, T11-f, Controller carries T9-b, T9-c):
-pending targets of different jobs scored by one cycle.
+Focus 1 and 5, Codex r1 #12-#14, r2 B5, B6, Rulings P10, P34, T11-a, T11-f, T11-g, Controller carries T9-b,
+T9-c): pending targets of different jobs scored by one cycle.
 
 A cycle claims three, scores them concurrently and completes with a report whose lane and outcome counts
 match, one `TargetOutcome` per work id and `spent_usd` the attempts' cost; a budget denial ends one target
@@ -10,7 +10,9 @@ stream cancels that call alone, queued claims are beaten before they run, and a 
 children and stops every beat, with a claim still queued for a slot too. A child's end is classified (Ruling
 T11-a): a node's timeout backs its target off (`failed_transient` at the attempt limit), an unclassified
 failure ends it `failed_invalid_output('bug')` for good, and the claim's own fence is `claim_lost` without an
-error; an `attach` that raises leaves no attempt running. The cycle task (`graph.execute_cycle`) runs one
+error; a retryable database error that outlasted a node's retries backs its target off (Ruling T11-g),
+`fail`'s own path outside the subgraph is tried up to three times and bounded by the `fail` node's timeout,
+and an `attach` that raises leaves no attempt running. The cycle task (`graph.execute_cycle`) runs one
 cycle under its heartbeat, fails it for a bug with its claims reclaimed, stops when its beat is refused, and
 starts nothing while admission is stopped.
 
@@ -29,12 +31,15 @@ from typing import Any, cast
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db.transitions import transition as real_transition
 from jobhunter.errors import NodeFailed
+from jobhunter.graphs.sanitize import DB_RETRY
 from jobhunter.graphs.score import graph as graph_mod
 from jobhunter.graphs.score import nodes as nodes_mod
 from jobhunter.graphs.score import subgraph as subgraph_mod
 from jobhunter.graphs.score.claims import ClaimHeartbeats
 from jobhunter.graphs.score.nodes import claim as claim_node
+from jobhunter.graphs.score.nodes import fail as fail_node
 from jobhunter.graphs.score.state import TargetState, work_id
 from jobhunter.llm import fake
 from jobhunter.llm import gateway as gateway_mod
@@ -49,7 +54,7 @@ from jobhunter.worker.executions import EXECUTIONS
 from jobhunter.worker.runtime import ShutdownState
 from langchain_core.runnables import RunnableConfig
 from procrastinate.job_context import JobContext
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.clock import ManualSleep
 from tests.support.faults import PausePoint, SimulatedCrash, raising_at
@@ -561,6 +566,130 @@ async def test_the_claim_s_own_fence_inside_the_attempt_is_claim_lost_and_no_err
     assert row.report["outcomes"] == {"claim_lost": 1, "published_accepted": 1}
     assert logged(caplog, "score_target_failed") == []
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+async def serialization_failure(conn: AsyncConnection) -> None:
+    """A real serialization failure (SQLSTATE 40001) on `conn`, which rolls its transaction back."""
+    await conn.execute(
+        sa.text("DO $$ BEGIN RAISE EXCEPTION 'could not serialize access' USING ERRCODE = '40001'; END $$")
+    )
+
+
+async def test_a_retryable_db_error_past_the_node_s_retries_backs_the_target_off(
+    engine: AsyncEngine,
+    gateway: LLMGateway,
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Ruling T11-g: a serialization failure that outlasted `DB_RETRY` (a `NodeFailed` with
+    # `retryable_db_error`) is transient, code `db_transient`, never a bug
+    failing, sibling = await insert_targets(engine, 2)
+    answer_all(fake_llm, [sibling])
+    conflicts: list[int] = []
+
+    async def conflicting(state: TargetState) -> None:
+        if state["target_id"] == failing.target_id:  # the node's database work, every try
+            conflicts.append(state["target_id"])
+            async with engine.begin() as conn:
+                await serialization_failure(conn)
+
+    before_node(monkeypatch, "load_context", conflicting)
+    runner = await cycle_runner(engine, gateway)
+    cycle_id = await runner.start("manual")
+    started = utcnow()
+    final = await runner.run(cycle_id)
+    ended = utcnow()
+    assert len(conflicts) == DB_RETRY.max_attempts == 3
+    target = await target_of(engine, failing.target_id)
+    assert (target.state, target.state_reason, target.claim_id) == ("pending", None, None)
+    assert (target.transient_failures, target.charged_attempts) == (1, 0)
+    assert started + timedelta(minutes=15) <= target.not_before <= ended + timedelta(minutes=15)
+    assert await attempts_of(engine, failing.target_id) == [(1, "transient_error", "db_transient")]
+    outcome = final["results"][work_id(failing.target_id, 1)]
+    assert (outcome["outcome"], outcome["state"]) == ("transient_error", "pending")
+    row = await cycle_of(engine, cycle_id)
+    assert row.status == "completed"
+    assert row.report["outcomes"] == {"transient_error": 1, "published_accepted": 1}
+    assert logged(caplog, "score_target_failed") == []
+
+
+class FailsToWrite:
+    """`fail`'s `transition` of the target row `target_id`: its first `times` calls raise a serialization
+    failure in `fail`'s own transaction (`hold_s`: or sleep that long first, a stalled lock wait)."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, target_id: int, *, times: int, hold_s: float = 0.0
+    ) -> None:
+        self.raised = 0
+        real = real_transition  # the one `fail` imports
+
+        async def transition(
+            conn: AsyncConnection, table: str, row_id: int, *args: Any, **kwargs: Any
+        ) -> Any:
+            if table == "score_targets" and row_id == target_id and self.raised < times:
+                self.raised += 1
+                await asyncio.sleep(hold_s)
+                await serialization_failure(conn)
+            return await real(conn, table, row_id, *args, **kwargs)
+
+        monkeypatch.setattr(fail_node, "transition", transition)
+
+
+def raising_in_load_context(monkeypatch: pytest.MonkeyPatch, target: PendingTarget) -> None:
+    async def raises(state: TargetState) -> None:
+        if state["target_id"] == target.target_id:
+            raise RuntimeError("synthetic failure")
+
+    before_node(monkeypatch, "load_context", raises)
+
+
+async def test_a_retryable_db_error_of_the_failure_path_is_tried_again(
+    engine: AsyncEngine, gateway: LLMGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `fail`, run outside the subgraph, takes up to three tries on a retryable database error
+    (failing,) = await insert_targets(engine, 1)
+    raising_in_load_context(monkeypatch, failing)
+    conflict = FailsToWrite(monkeypatch, failing.target_id, times=1)
+    runner = await cycle_runner(engine, gateway)
+    cycle_id = await runner.start("manual")
+    final = await runner.run(cycle_id)
+    assert conflict.raised == 1
+    assert final["results"][work_id(failing.target_id, 1)]["outcome"] == "failed_invalid_output"
+    target = await target_of(engine, failing.target_id)
+    assert (target.state, target.state_reason) == ("failed_invalid_output", "bug")
+    assert await attempts_of(engine, failing.target_id) == [(1, "failed_invalid_output", "bug")]
+    assert (await cycle_of(engine, cycle_id)).status == "completed"
+
+
+async def test_a_failure_path_that_keeps_failing_escapes_after_three_tries(
+    engine: AsyncEngine, gateway: LLMGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (failing,) = await insert_targets(engine, 1)
+    raising_in_load_context(monkeypatch, failing)
+    conflict = FailsToWrite(monkeypatch, failing.target_id, times=10)
+    runner = await cycle_runner(engine, gateway)
+    cycle_id = await runner.start("manual")
+    with pytest.raises(NodeFailed, match="node score_target failed: OperationalError"):
+        await runner.run(cycle_id)
+    assert conflict.raised == 3
+    assert (await target_of(engine, failing.target_id)).state == "in_progress"  # nothing written
+    assert await attempts_of(engine, failing.target_id) == [(1, "running", None)]
+
+
+async def test_a_stalled_failure_path_is_cut_at_the_fail_node_s_timeout(
+    engine: AsyncEngine, gateway: LLMGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (failing,) = await insert_targets(engine, 1)
+    raising_in_load_context(monkeypatch, failing)
+    timeouts = {**subgraph_mod.NODE_TIMEOUTS, "fail": timedelta(seconds=1)}
+    monkeypatch.setattr(subgraph_mod, "NODE_TIMEOUTS", MappingProxyType(timeouts))
+    FailsToWrite(monkeypatch, failing.target_id, times=1, hold_s=60)
+    runner = await cycle_runner(engine, gateway)
+    cycle_id = await runner.start("manual")
+    with pytest.raises(NodeFailed, match="node score_target failed: TimeoutError"):
+        await asyncio.wait_for(runner.run(cycle_id), 20)
+    assert (await target_of(engine, failing.target_id)).state == "in_progress"
 
 
 async def test_an_attach_that_raises_leaves_no_attempt_running(

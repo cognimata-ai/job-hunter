@@ -27,8 +27,11 @@ The exceptions, each with its `error_code`, the attempt's outcome and the target
 - `BudgetExhausted`: `budget_exhausted`, `budget_exhausted`, `budget_deferred('budget_exhausted')`;
 - `ClaimLost` and any other `FencedOut`: `claim_lost`, `claim_lost`, the target untouched (`None`).
 
-Two codes no step gives: they are `run_target`'s, for what escapes the subgraph (Rulings T11-a, T11-f):
+Three codes no step gives: they are `run_target`'s, for what escapes the subgraph (Rulings T11-a, T11-f,
+T11-g):
 - `node_timeout`, a deterministic node's `NodeTimeoutError`: `transient_error`, `pending` with backoff;
+- `db_transient`, a retryable database error that outlasted its node's retries: `transient_error`, `pending`
+  with backoff;
 - `bug`, an unclassified exception: `failed_invalid_output`, `failed_invalid_output('bug')`, terminal (the
   reason tells a code fault from a model's invalid output).
 
@@ -70,6 +73,7 @@ PROMPT_VERSION_UNSCORABLE: Final = "prompt_version_unscorable"
 BUDGET_EXHAUSTED: Final = "budget_exhausted"
 INPUT_UNBOUNDED: Final = "input_unbounded"
 NODE_TIMEOUT: Final = "node_timeout"
+DB_TRANSIENT: Final = "db_transient"
 BUG: Final = "bug"
 REQUEST_PREFIX: Final = "llm_request_"
 UNSPECIFIED_CATEGORY: Final = "unspecified"
@@ -107,6 +111,7 @@ _FIXED: Final[dict[str, StepOutcome]] = {
         (PROMPT_VERSION_UNSCORABLE, "transient_error", "pending", PROMPT_VERSION_UNSCORABLE, True),
         (BUDGET_EXHAUSTED, "budget_exhausted", "budget_deferred", BUDGET_EXHAUSTED, False),
         (NODE_TIMEOUT, "transient_error", "pending", NODE_TIMEOUT, True),
+        (DB_TRANSIENT, "transient_error", "pending", DB_TRANSIENT, True),
         (BUG, "failed_invalid_output", "failed_invalid_output", BUG, False),
         (CLAIM_LOST, CLAIM_LOST, None, None, False),
     )

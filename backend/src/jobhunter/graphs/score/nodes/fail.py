@@ -29,8 +29,8 @@ The attempt goes `running → <outcome>` with its `outcome_detail`. The state's 
 
 `MAX_SCORE_ATTEMPTS` is `scoring.admission`'s, the one definition (Ruling P12, Controller carry T10-a).
 
-`run_target` runs this node too, outside the subgraph, for what escapes an attempt: the codes `node_timeout`
-and `bug` (`llm_step`, Rulings T11-a, T11-f).
+`run_target` runs this node too, outside the subgraph, for what escapes an attempt: the codes `node_timeout`,
+`db_transient` and `bug` (`llm_step`, Rulings T11-a, T11-f, T11-g).
 """
 
 from datetime import timedelta
