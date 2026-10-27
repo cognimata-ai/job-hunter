@@ -33,14 +33,18 @@ last.
   | budget_deferred | deferred_duplicate` whose job's `hard_filter_results` row of the scope failed →
   `filtered_out` with `filter_scope_version_id` (the group column cleared on leaving `deferred_duplicate`);
   `filtered_out` whose row passed → `pending` (A2 R7, Deviation 24). A job without a row moves nowhere: the
-  move needs positive evidence;
+  move needs positive evidence. The scope apply's flip runs it with the new scope (Task 15);
+  `refilter_targets_of_jobs(conn, job_ids, scope)` runs its two statements over the targets of `job_ids`
+  alone, with the active tuple and scope of `scope` (`filters.ActiveScopes`): the det-facts change hook's
+  move for its job and the completeness reconciler's for the jobs it recomputed (Task 15, Ruling P37);
 - `regroup_sweep(conn, *, llm_tuple_id) -> RegroupSwept(deferred, undeferred)`: `pending | budget_deferred`
   members for which §8.7's deferral predicate holds (`DEFERRAL_ELIGIBLE_SQL`: a member of an active group
-  whose representative is another job, its membership's `score_individually` false; Task 15 adds the
-  conflicting-facts clause) → `deferred_duplicate` with the group; `deferred_duplicate` targets for which it
-  no longer holds for their group (dissolved, left, elected, `score_individually`) → `pending`. The entering
-  states guard the entry only, so an unchanged deferred member stays deferred across every sweep (Codex r1
-  #36);
+  whose representative is another job, its membership's `score_individually` false, with no conflicting fact
+  against the representative, `CONFLICTING_FACTS_SQL`, Task 15; `groups.deferral_eligible` is the same
+  predicate in Python) → `deferred_duplicate` with the group; `deferred_duplicate` targets for which it no
+  longer holds for their group (dissolved, left, elected, `score_individually`, a conflict) → `pending`. The
+  entering states guard the entry only, so an unchanged deferred member stays deferred across every sweep
+  (Codex r1 #36);
 - `exhaustion_sweep(conn, *, llm_tuple_id, held=None) -> int` (Deviation 7, Codex r1 #21): `pending |
   budget_deferred`
   with `charged_attempts >= MAX_SCORE_ATTEMPTS` → `failed_attempts_exhausted('attempts_exhausted')`, its
@@ -119,8 +123,8 @@ which holds `active_config FOR SHARE` (or `FOR UPDATE`) and passes the active tu
 3. the initial-state correction of a created or revived row (L3704, L2867-2869): `filtered_out` with
    `filter_scope_version_id` when the job's `hard_filter_results` row of the scope failed (computed inline by
    `filters.refilter_job` when the row is missing, A1 issue 21), else `deferred_duplicate` with the group when
-   §8.7's deferral predicate holds (`DEFERRAL_ELIGIBLE_SQL`, Task 13's form until Task 15: a member flagged
-   `score_individually` is created `pending`, L2906), else `pending`.
+   §8.7's deferral predicate holds (`DEFERRAL_ELIGIBLE_SQL` with the entering state, `groups.deferrable`: a
+   member flagged `score_individually` is created `pending`, L2906), else `pending`.
 `ranking.bump` is the caller's, once, last. `RETAINED_JOB_SQL` (a current revision of an unmerged,
 non-synthetic job, Codex r1 #32) and `NEEDS_TARGET_SQL` (no target of `:tuple` for it but a revivable one) are
 the predicates over `jobs j` the creators share with node 9 and I5.
@@ -370,25 +374,58 @@ def _split(predicate: str, *, suffix: str = "") -> _Split:
     )
 
 
-_FILTER_OUT: Final = _split(
-    "s.llm_tuple_id = :tuple AND s.state IN ('pending', 'budget_deferred', 'deferred_duplicate') "
-    f"AND s.override = 'none' AND {_RESULT.format(passed='NOT ')}"
-)
-_FILTER_BACK: Final = _split(
-    "s.llm_tuple_id = :tuple AND s.state = 'filtered_out' AND s.override = 'none' "
-    f"AND {_RESULT.format(passed='')}"
+@dataclass(frozen=True)
+class _Refilter:
+    """The refilter's two moves (module docstring): out to `filtered_out`, and back to `pending`."""
+
+    out: _Split
+    back: _Split
+
+
+def _refilter(also: str = "") -> _Refilter:
+    """The refilter's statements over the tuple's targets, those `also` selects besides (`AND …`)."""
+    return _Refilter(
+        out=_split(
+            "s.llm_tuple_id = :tuple AND s.state IN ('pending', 'budget_deferred', 'deferred_duplicate') "
+            f"AND s.override = 'none' AND {_RESULT.format(passed='NOT ')}{also}"
+        ),
+        back=_split(
+            "s.llm_tuple_id = :tuple AND s.state = 'filtered_out' AND s.override = 'none' "
+            f"AND {_RESULT.format(passed='')}{also}"
+        ),
+    )
+
+
+_REFILTER: Final = _refilter()
+# The same two statements limited to the targets of `:jobs` (`refilter_targets_of_jobs`, Task 15).
+_REFILTER_OF_JOBS: Final = _refilter(" AND s.job_id = ANY(CAST(:jobs AS bigint[]))")
+
+
+# §8.7's conflicting scoring-relevant facts of the member's job `mj` against the representative's `rj`
+# (L3261, Task 15): different structured work-mode sets, different structured employment types (a set that is
+# not structured on both sides says nothing), or different seniority tokens; sets compared as sets.
+CONFLICTING_FACTS_SQL: Final = (
+    "((mj.work_mode_source = 'structured' AND rj.work_mode_source = 'structured' "
+    "AND NOT (mj.work_mode_possible @> rj.work_mode_possible "
+    "AND rj.work_mode_possible @> mj.work_mode_possible)) "
+    "OR (mj.employment_source = 'structured' AND rj.employment_source = 'structured' "
+    "AND NOT (mj.employment_types @> rj.employment_types AND rj.employment_types @> mj.employment_types)) "
+    "OR NOT (mj.seniority_tokens @> rj.seniority_tokens AND rj.seniority_tokens @> mj.seniority_tokens))"
 )
 
 
 def _deferral_eligible(*, own_group: bool) -> str:
-    """§8.7's deferral predicate over `s`, without the entering states (the membership flag and the
-    representative; Task 15 adds the conflicting-facts clause); with `own_group`, for the group the target is
-    deferred to."""
+    """§8.7's deferral predicate over `s`, without the entering states (`groups.deferral_eligible`, the same
+    predicate in Python): a member of an active group whose representative is another job, its membership's
+    `score_individually` false, with no conflicting fact against the representative (Task 15); with
+    `own_group`, for the group the target is deferred to."""
     group = " AND dm.group_id = s.deferred_group_id" if own_group else ""
     return (
         "EXISTS (SELECT 1 FROM duplicate_group_members dm JOIN duplicate_groups dg ON dg.id = dm.group_id "  # noqa: S608
-        "WHERE dm.job_id = s.job_id AND dg.status = 'active' AND dg.representative_job_id IS NOT NULL "
-        f"AND dg.representative_job_id <> s.job_id AND NOT dm.score_individually{group})"
+        "JOIN jobs mj ON mj.id = dm.job_id JOIN jobs rj ON rj.id = dg.representative_job_id "
+        "WHERE dm.job_id = s.job_id AND dg.status = 'active' "
+        f"AND dg.representative_job_id <> s.job_id AND NOT dm.score_individually{group} "
+        f"AND NOT {CONFLICTING_FACTS_SQL})"
     )
 
 
@@ -536,20 +573,45 @@ async def expiry_sweep(
     return swept
 
 
-async def refilter_sweep(conn: AsyncConnection, *, llm_tuple_id: int, scope_version_id: int) -> RefilterSwept:
-    """The refilter against the scope's `hard_filter_results`, both directions (module docstring)."""
-    params: dict[str, object] = {"tuple": llm_tuple_id, "scope": scope_version_id}
+async def _refiltered(
+    conn: AsyncConnection, statements: _Refilter, params: dict[str, object], *, scope_version_id: int
+) -> RefilterSwept:
     out = await _move(
         conn,
         ["pending", "budget_deferred", "deferred_duplicate"],
         "filtered_out",
-        _FILTER_OUT,
+        statements.out,
         params,
         set_={"filter_scope_version_id": scope_version_id},
     )
-    back = await _move(conn, ["filtered_out"], "pending", _FILTER_BACK, params)
-    swept = RefilterSwept(filtered=len(out), unfiltered=len(back))
+    back = await _move(conn, ["filtered_out"], "pending", statements.back, params)
+    return RefilterSwept(filtered=len(out), unfiltered=len(back))
+
+
+async def refilter_sweep(conn: AsyncConnection, *, llm_tuple_id: int, scope_version_id: int) -> RefilterSwept:
+    """The refilter against the scope's `hard_filter_results`, both directions (module docstring)."""
+    params: dict[str, object] = {"tuple": llm_tuple_id, "scope": scope_version_id}
+    swept = await _refiltered(conn, _REFILTER, params, scope_version_id=scope_version_id)
     _logged("refilter", llm_tuple_id, filtered=swept.filtered, unfiltered=swept.unfiltered)
+    return swept
+
+
+async def refilter_targets_of_jobs(
+    conn: AsyncConnection, job_ids: Sequence[int], scope: filters.ActiveScopes
+) -> RefilterSwept:
+    """The refilter sweep's two statements (`filtered_out ⇄ pending`, `override = 'none'`) limited to the
+    unpublished targets of `job_ids` of the active tuple, by the active scope's `hard_filter_results`, both
+    as `scope` names them (Task 15, Ruling P37): the live hook's for its job, and the completeness
+    reconciler's for the jobs it recomputed. Nothing without an active tuple or jobs."""
+    if scope.llm_tuple_id is None or not job_ids:
+        return RefilterSwept(filtered=0, unfiltered=0)
+    params: dict[str, object] = {
+        "tuple": scope.llm_tuple_id,
+        "scope": scope.scope_version_id,
+        "jobs": sorted(set(job_ids)),
+    }
+    swept = await _refiltered(conn, _REFILTER_OF_JOBS, params, scope_version_id=scope.scope_version_id)
+    _logged("refilter_jobs", scope.llm_tuple_id, filtered=swept.filtered, unfiltered=swept.unfiltered)
     return swept
 
 

@@ -149,7 +149,8 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.availability.snapshots",
     "jobhunter.dedup.groups",
     "jobhunter.scoring.filters",
-    "jobhunter.graphs.collect.nodes.embed",  # through `jobhunter.embeddings`: `awaiting_embedding`
+    # `awaiting_embedding`, out of `jobhunter.embeddings` since M3 Task 15 (M1 Carry-forward 14, Ruling P44)
+    "jobhunter.worker.embedding_reconcile",
     "jobhunter.sources.watchlist_validate",
     "jobhunter.llm.spend_ledger",  # `llm_ledger_unsettled` and `budget_counters` (M2)
     "jobhunter.llm.gateway",  # `llm_refusal_rate` (M2)

@@ -42,23 +42,40 @@ count only with evidence, which in a stored result is grounded (publication drop
 
 `ScopeRow` is a scope version (its id and its scope) and `JobRow` the job the instance belongs to (its id,
 `det_results.job_id`). `job_sources(conn, job_id)` reads a job's `sources` from its `field_provenance` (Task
-10: each field's source instance's `source_id`; a field no observation supplied has none).
+10: each field's source instance's `source_id`; a field no observation supplied has none), `jobs_sources`
+those of several jobs in one statement.
+
+**The published results of a tuple** (Task 15: the scope apply and the det-facts change hook; Task 18's
+`det_completeness` reuses them): the `llm_results` of the tuple's published targets (`r.target_id`, whose
+`llm_tuple_id` is the tuple), each with the job of its revision (`job_revision_id → job_id`, the instance's
+`job_id`). `count_published(conn, llm_tuple_id=…)` counts them; `published_page(conn, …, after, limit)`
+lists them by id after `after` with their current instance for a scope (its hash and algorithm version,
+`None` without one); `stale_of(conn, page, scope)` keeps those of a page that lack a current instance whose
+`det_inputs_hash` is that of the job's current det-facts and sources under the scope (`det_inputs`, read in
+one statement each while the caller holds the job rows) and whose algorithm version is current: what a
+recompute would change. `recompute_instance` is `compute_and_write` whose content-carrying validation error
+becomes `StoredResultInvalid`, which names the result and pydantic's error types only (carry T6-g), raised
+outside the handler; `recompute_job_instances(conn, job_id=…, llm_tuple_id=…, scopes=…)` recomputes every
+published result of the tuple of the job's revisions under each scope, the live hook's half (the caller holds
+the job row; the results are locked in id order).
 """
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, get_args
 
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.seed import canonical_json, content_hash
 from jobhunter.db.sql import q
+from jobhunter.errors import InvariantViolation
 from jobhunter.llm.schemas.generator import JobFacts, RemoteRegion
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring.aggregate import Aggregation, aggregate, industry_match
 from jobhunter.scoring.det_criteria import employment_salary, location_work_mode
-from jobhunter.scoring.filters import DetFacts
+from jobhunter.scoring.filters import DetFacts, read_det_facts, read_det_facts_of
 from jobhunter.scoring.knockouts import Confirmation, derive_knockouts
 from jobhunter.scoring.rubric import LLM_CRITERIA
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
@@ -165,23 +182,32 @@ def det_inputs(
 
 
 # The source of each field an instance reads: the `source_id` of the source instance its provenance names (a
-# field no observation supplied, rule `none`, has none).
+# field no observation supplied, rule `none`, has none), for the jobs of `:jobs`.
 _SOURCES: Final = q(
-    "SELECT e.key, s.source_id FROM jobs j CROSS JOIN LATERAL jsonb_each(j.field_provenance) e "
+    "SELECT j.id, e.key, s.source_id FROM jobs j CROSS JOIN LATERAL jsonb_each(j.field_provenance) e "
     "JOIN source_instances s ON s.id = CAST(e.value ->> 'source_instance_id' AS bigint) "
-    "WHERE j.id = :job AND e.key = ANY(CAST(:fields AS text[])) AND e.value ->> 'rule' <> 'none'"
+    "WHERE j.id = ANY(CAST(:jobs AS bigint[])) AND e.key = ANY(CAST(:fields AS text[])) "
+    "AND e.value ->> 'rule' <> 'none'"
 )
+
+
+async def jobs_sources(conn: AsyncConnection, job_ids: Sequence[int]) -> dict[int, dict[str, list[str]]]:
+    """`job_sources` of each job of `job_ids`, by job id, in one statement (a job whose fields no observation
+    supplied has an empty mapping)."""
+    found: dict[int, dict[str, list[str]]] = {job_id: {} for job_id in job_ids}
+    if not job_ids:
+        return found
+    params = {"jobs": sorted(set(job_ids)), "fields": list(JOB_INPUT_FIELDS)}
+    for row in await conn.execute(_SOURCES, params):
+        found.setdefault(int(row.id), {}).setdefault(str(row.key), []).append(str(row.source_id))
+    return found
 
 
 async def job_sources(conn: AsyncConnection, job_id: int) -> dict[str, list[str]]:
     """The `sources` of a job's instances (module docstring, Inputs): for each field of `JOB_INPUT_FIELDS`,
     the source id of the observation `jobs.field_provenance` names for it, read without a lock (the callers
     of `compute_and_write` hold the job row)."""
-    rows = await conn.execute(_SOURCES, {"job": job_id, "fields": list(JOB_INPUT_FIELDS)})
-    found: dict[str, list[str]] = {}
-    for row in rows:
-        found.setdefault(str(row.key), []).append(str(row.source_id))
-    return found
+    return (await jobs_sources(conn, [job_id]))[job_id]
 
 
 # ---- writing an instance -----------------------------------------------------------------------------------
@@ -367,3 +393,141 @@ async def compute_and_write(
         det_inputs=document,
         det_inputs_hash=digest,
     )
+
+
+# ---- the published results of a tuple (Task 15) -----------------------------------------------------------
+
+# The published results of tuple `:tuple` (module docstring), with the job of their revision.
+_PUBLISHED_FROM: Final = (
+    "llm_results r JOIN score_targets t ON t.id = r.target_id "
+    "JOIN job_revisions jr ON jr.id = r.job_revision_id"
+)
+_PUBLISHED_WHERE: Final = "t.llm_tuple_id = :tuple"
+_COUNT_PUBLISHED: Final = q(
+    f"SELECT count(*) FROM {_PUBLISHED_FROM} WHERE {_PUBLISHED_WHERE}"  # noqa: S608 (the module's constants)
+)
+_PUBLISHED_PAGE: Final = q(
+    "SELECT r.id, jr.job_id, d.det_inputs_hash, d.det_algorithm_version "  # noqa: S608
+    f"FROM {_PUBLISHED_FROM} LEFT JOIN det_results d ON d.llm_result_id = r.id "
+    f"AND d.scope_version_id = :scope AND d.is_current WHERE {_PUBLISHED_WHERE} AND r.id > :after "
+    "ORDER BY r.id LIMIT :limit"
+)
+_OF_JOB: Final = q(
+    f"SELECT r.id FROM {_PUBLISHED_FROM} WHERE {_PUBLISHED_WHERE} AND jr.job_id = :job ORDER BY r.id"  # noqa: S608
+)
+
+
+@dataclass(frozen=True)
+class PublishedInstance:
+    """A published result of a tuple, the job of its revision, and its current instance for a scope: the
+    instance's `det_inputs_hash` and `det_algorithm_version`, `None` without one."""
+
+    llm_result_id: int
+    job_id: int
+    det_inputs_hash: bytes | None
+    det_algorithm_version: str | None
+
+
+class StoredResultInvalid(InvariantViolation):
+    """A stored result (or its profile version) failed its validation while its instance was recomputed: a
+    bug. The message and the attributes are the result's id and pydantic's error types, never a value (the
+    `ValidationError` holds the stored content: carry T6-g)."""
+
+    def __init__(self, llm_result_id: int, error_types: Sequence[str]) -> None:
+        self.llm_result_id = llm_result_id
+        self.error_types = tuple(error_types)
+        super().__init__(f"llm result {llm_result_id} failed its validation: {', '.join(self.error_types)}")
+
+
+async def count_published(conn: AsyncConnection, *, llm_tuple_id: int) -> int:
+    """How many published results the tuple has (module docstring), read without a lock."""
+    return int((await conn.execute(_COUNT_PUBLISHED, {"tuple": llm_tuple_id})).scalar_one())
+
+
+async def published_page(
+    conn: AsyncConnection, *, llm_tuple_id: int, scope_version_id: int, after: int, limit: int
+) -> list[PublishedInstance]:
+    """Up to `limit` published results of the tuple with an id above `after`, in id order, each with its
+    current instance for the scope (module docstring), read without a lock."""
+    params = {"tuple": llm_tuple_id, "scope": scope_version_id, "after": after, "limit": limit}
+    return [
+        PublishedInstance(
+            llm_result_id=int(row.id),
+            job_id=int(row.job_id),
+            det_inputs_hash=None if row.det_inputs_hash is None else bytes(row.det_inputs_hash),
+            det_algorithm_version=row.det_algorithm_version,
+        )
+        for row in await conn.execute(_PUBLISHED_PAGE, params)
+    ]
+
+
+async def stale_of(
+    conn: AsyncConnection, page: Sequence[PublishedInstance], scope: ScopeRow
+) -> list[PublishedInstance]:
+    """The results of `page` (read for `scope`) whose recompute would write an instance (module docstring):
+    no current instance, another algorithm version, or a `det_inputs_hash` other than the job's current
+    one. The caller holds the jobs' rows, so the facts and sources read here are the committed ones."""
+    checked = [
+        item
+        for item in page
+        if item.det_inputs_hash is not None and item.det_algorithm_version == DET_ALGORITHM_VERSION
+    ]
+    jobs = sorted({item.job_id for item in checked})
+    facts = await read_det_facts_of(conn, jobs)
+    sources = await jobs_sources(conn, jobs)
+    current: dict[int, bytes] = {
+        job_id: det_inputs(det, sources[job_id], scope.settings)[1] for job_id, det in facts.items()
+    }
+    return [
+        item
+        for item in page
+        if item.det_inputs_hash is None
+        or item.det_algorithm_version != DET_ALGORITHM_VERSION
+        or current.get(item.job_id) != item.det_inputs_hash
+    ]
+
+
+async def recompute_instance(
+    conn: AsyncConnection,
+    *,
+    llm_result_id: int,
+    scope: ScopeRow,
+    det: DetFacts,
+    sources: Mapping[str, Sequence[str]],
+    job: JobRow,
+) -> int | None:
+    """`compute_and_write` (its locks and its precondition: the caller holds the job row), whose validation
+    error of the stored result becomes `StoredResultInvalid` (module docstring)."""
+    invalid: StoredResultInvalid | None
+    try:
+        return await compute_and_write(
+            conn, llm_result_id=llm_result_id, scope=scope, det=det, sources=sources, job=job
+        )
+    except ValidationError as error:
+        types = [str(item["type"]) for item in error.errors(include_url=False, include_input=False)]
+        invalid = StoredResultInvalid(llm_result_id, list(dict.fromkeys(types)))
+    raise invalid  # outside the handler: neither its cause nor its context holds the stored content
+
+
+async def recompute_job_instances(
+    conn: AsyncConnection, *, job_id: int, llm_tuple_id: int, scopes: Sequence[ScopeRow]
+) -> list[int]:
+    """A current instance under each of `scopes` of every published result of the tuple of the job's
+    revisions (module docstring), with the job's committed det-facts and sources; the ids of the instances
+    written (none for an unchanged hash). The caller holds the job row (lock-schedule step 4)."""
+    results = [
+        int(i) for i in (await conn.execute(_OF_JOB, {"tuple": llm_tuple_id, "job": job_id})).scalars()
+    ]
+    if not results:
+        return []
+    det = await read_det_facts(conn, job_id)
+    sources = await job_sources(conn, job_id)
+    written: list[int] = []
+    for result_id in results:
+        for scope in scopes:
+            instance = await recompute_instance(
+                conn, llm_result_id=result_id, scope=scope, det=det, sources=sources, job=JobRow(job_id)
+            )
+            if instance is not None:
+                written.append(instance)
+    return written

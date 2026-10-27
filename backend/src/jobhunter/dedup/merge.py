@@ -32,8 +32,9 @@ merged again (`InvariantViolation`).
 7. `from.merged_into_job_id := into`, and the from-job's open `dedup.field_conflict` alerts are resolved:
    its selection no longer stands (carry 7). With `recompute` (the default) the into-job's availability and
    seen bounds (`derive_from_postings`) and its canonical fields (`revisions.recompute_job`) are recomputed.
-   Identity resolution passes `recompute=False` and recomputes once, after its last merge. The caller
-   writes the hard-filter results (it holds `active_config` first, §3.3.3) and bumps the ranking.
+   Identity resolution passes `recompute=False` and recomputes once, after its last merge. The caller runs
+   the det-facts change hook (`filters.refilter_job_live`: the hard-filter results, the instances and the
+   targets' moves, M3 Task 15; it holds `active_config` first, §3.3.3) and bumps the ranking.
 
 **`unmerge`** reverses one merge event (§8.6.2), in the order `active_config` `FOR SHARE` → both job rows and
 their groups' members `FOR UPDATE` in one ordered statement → the event row → the other rows →
@@ -42,18 +43,18 @@ NULL` (step 1); every key either job owns is owned by the job of its earliest `a
 `first_seen_at`, then posting id) among the two jobs' postings, and only the keys the two jobs own (step 2;
 a plan deviation, Ruling T18-f: a key a third job owns after a conflict keeps its owner);
 `dedup_decisions(different, 'unmerge')` (step 3); both jobs' availability, seen bounds and canonical fields
-are recomputed, with their hard-filter results (step 5; the from-job's stored
-field-conflict markers are dropped first, because the merge resolved their alerts, so a conflict that still
-holds is raised again); a `merge_event(unmerge)` and the original's `reversed_by_event_id` (step 6). Step 4
-(user actions) arrives with M4. Only the latest state is reversed: the from-job must still be merged into
-the into-job, and the into-job unmerged.
+are recomputed, then each job's det-facts change hook runs (`filters.refilter_job_live`, step 5; the
+from-job's stored field-conflict markers are dropped first, because the merge resolved their alerts, so a
+conflict that still holds is raised again); a `merge_event(unmerge)` and the original's
+`reversed_by_event_id` (step 6). Step 4 (user actions) arrives with M4. Only the latest state is reversed:
+the from-job must still be merged into the into-job, and the into-job unmerged.
 
 **`resolve_conflict`** settles an open conflict in the same lock order (for `merge`, the candidates' groups'
 members are locked with the jobs): `separate` writes `dedup_decisions(different, 'conflict_resolution')` for
 each (posting job, candidate) pair, the pairs the user judged, never between two candidates (Ruling T18-e),
 and moves it to `resolved_separate` (the list does not change, so no bump); `merge` merges every candidate
 into the posting's job (`user_confirmed_merge`; the last merge's step 6 resolves it), then recomputes that
-job, writes its hard-filter results and bumps the ranking.
+job, runs its det-facts change hook (`filters.refilter_job_live`) and bumps the ranking.
 
 `derive_from_postings` gives a job the best availability of its postings (`active > unknown > stale >
 closed`, §7.16.2; `availability_changed_at := now()` when it changes) and its postings' first and last
@@ -345,10 +346,10 @@ async def merge_jobs(
     merges several jobs (identity's strong-key merges, `resolve_conflict(merge)`, `groups.confirm_group`)
     locks every job and co-member of all its merges once, in one `lock_jobs` statement before the first
     merge, and passes that set as `locked` to each: a merge that locked its own pair after an earlier merge
-    of the transaction would take rows out of id order (Ruling T18-c). The caller writes
-    the hard-filter results and bumps the ranking. Raises `FencedOut` for a fenced job, `InvariantViolation`
-    for a job already merged, a job merged into itself or a row the transaction does not hold, and
-    `LookupError` for a job that does not exist, having written nothing."""
+    of the transaction would take rows out of id order (Ruling T18-c). The caller runs the det-facts change
+    hook (`filters.refilter_job_live`) and bumps the ranking. Raises `FencedOut` for a fenced job,
+    `InvariantViolation` for a job already merged, a job merged into itself or a row the transaction does not
+    hold, and `LookupError` for a job that does not exist, having written nothing."""
     # Imported here, not at the top: `groups` imports this module (`lock_jobs`, `merge_jobs`), and a module-
     # level import back would make the two a cycle (ledger L323).
     from jobhunter.dedup import groups
@@ -437,7 +438,7 @@ async def resolve_conflict(
     Raises `LookupError` for a conflict that does not exist, `InvariantViolation` for one that is not open
     (or changed since it was read) and `FencedOut` when one of its jobs is fenced, having written nothing.
     """
-    scopes = await filters.active_scopes(conn)  # active_config FOR SHARE: the first lock
+    active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock
     row = (await conn.execute(_CONFLICT, {"id": conflict_id})).first()
     if row is None:
         raise LookupError(f"identity conflict {conflict_id} does not exist")
@@ -481,7 +482,7 @@ async def resolve_conflict(
     if status == "open":  # the merges' step 6 resolves it; this is the guard
         raise InvariantViolation(f"identity conflict {conflict_id} is still open after its merges")
     await recompute_rollups(conn, posting_job)
-    await filters.refilter_job(conn, posting_job, scopes)
+    await filters.refilter_job_live(conn, posting_job, active=active)  # the det-facts change hook (Task 15)
     await ranking.bump(conn)
 
 
@@ -493,7 +494,7 @@ async def unmerge(conn: AsyncConnection, merge_event_id: int) -> int:
     event already reversed, or a merge that is no longer the latest state of its jobs, and `FencedOut` when
     one of the jobs is fenced, having written nothing.
     """
-    scopes = await filters.active_scopes(conn)  # active_config FOR SHARE: the first lock
+    active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock
     event = (await conn.execute(_EVENT, {"id": merge_event_id})).first()
     if event is None:
         raise LookupError(f"merge event {merge_event_id} does not exist")
@@ -527,7 +528,7 @@ async def unmerge(conn: AsyncConnection, merge_event_id: int) -> int:
     await conn.execute(_FORGET_FIELD_CONFLICTS, {"job": from_job, "rule": CONFLICT_RULE})
     for job_id in sorted((from_job, into_job)):
         await recompute_rollups(conn, job_id)
-        await filters.refilter_job(conn, job_id, scopes)
+        await filters.refilter_job_live(conn, job_id, active=active)  # the det-facts change hook (Task 15)
     evidence: dict[str, Any] = {"reverses_event_id": merge_event_id, "keys_reowned": reowned}
     reversal = int(
         (

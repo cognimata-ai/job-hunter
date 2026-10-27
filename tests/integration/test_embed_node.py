@@ -15,7 +15,6 @@ from jobhunter.embeddings import (
     embed_awaiting,
     make_http_client,
     mark_embedded,
-    reconcile_awaiting_embedding,
     upsert_embedding,
 )
 from jobhunter.errors import FencedOut
@@ -26,7 +25,8 @@ from jobhunter.observability.metrics import REGISTRY
 from jobhunter.quota import ledger
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow
-from jobhunter.worker import reconcilers, runs
+from jobhunter.worker import embedding_reconcile, reconcilers, runs
+from jobhunter.worker.embedding_reconcile import reconcile_awaiting_embedding
 from jobhunter.worker.runs import RunOwner
 
 from tests.support.collect import ctx, make_deps, queued_run, supersede
@@ -174,7 +174,7 @@ async def test_the_reconciler_leaves_the_alert_open_while_a_backlog_remains(
     await revisions_awaiting(engine, 3)
     async with engine.begin() as c:
         await embeddings.raise_unavailable(c, kind="unavailable", run_id=None)
-    monkeypatch.setattr(embeddings, "RECONCILE_LIMIT", 2)  # every pass embeds at most this many
+    monkeypatch.setattr(embedding_reconcile, "RECONCILE_LIMIT", 2)  # every pass embeds at most this many
     async with make_http_client() as http:
         context = ctx(
             engine, queue_app, utcnow() + LATER, embedder=EmbedderClient(fake_embedder.base_url, http)
@@ -394,7 +394,7 @@ async def test_the_reconciler_yields_to_a_running_run(
 async def test_a_reconciler_pass_embeds_at_most_32_after_the_grace(
     engine, current_epoch, fake_embedder, revisions_awaiting, queue_app
 ) -> None:
-    assert embeddings.RECONCILE_LIMIT == 32  # two batches: about 1 min of the shared tick queue (T22-a)
+    assert embedding_reconcile.RECONCILE_LIMIT == 32  # two batches: about 1 min of the tick queue (T22-a)
     await revisions_awaiting(engine, 40)
     async with make_http_client() as http:
         client = EmbedderClient(fake_embedder.base_url, http)

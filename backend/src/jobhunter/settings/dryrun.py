@@ -20,7 +20,7 @@ settings page shows on every change and that a save runs again (Task 17).
    headroom;
 6. the effect classes (`classify_effects` against the active settings) and what they add:
    - `scope`: `det_recompute`, the published results of the active tuple that the scope apply recomputes
-     without any LLM call (`count_published_results_active_tuple`: 0 before M3, which publishes results);
+     without any LLM call (`count_published_results_active_tuple`, M3 Task 15);
    - `llm_tuple`: the warning `llm_rescore` with `targets` (`count_retained_current_revisions`), `est_usd =
      targets x ĉ` and `bulk_budget_usd = scoring.bulk_rescore_max_budget_share x (A x (1 - reserve_frac) -
      scoring_counted_usd)` (§6.9.3; Task 21's confirm preview uses the same share);
@@ -56,6 +56,7 @@ from jobhunter.quota.dryrun import Warning, quota_projections
 from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, Window, current_snapshot, roll_forward
 from jobhunter.run_settings import RunSettings, ScopeSettings
+from jobhunter.scoring.det_results import count_published
 from jobhunter.settings.derive import derived
 from jobhunter.settings.effects import EffectClass, classify_effects
 from jobhunter.settings.llm_projection import (
@@ -92,6 +93,7 @@ _RETAINED_CURRENT_REVISIONS: Final = q(
     "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND current_revision_id IS NOT NULL "
     "AND NOT synthetic_eval"
 )
+_ACTIVE_TUPLE: Final = q("SELECT llm_tuple_id FROM active_config WHERE id = 1")
 _EVALUATION_POLICY_RATE: Final = q(
     "SELECT projected_critic_rate FROM evaluation_policies WHERE policy_hash = :h"
 )
@@ -151,9 +153,12 @@ async def count_retained_current_revisions(conn: AsyncConnection) -> int:
 
 
 async def count_published_results_active_tuple(conn: AsyncConnection) -> int:
-    """The published results of the active tuple, which a scope apply recomputes (§13.4). M3 publishes the
-    first results, so in M2 there are none by construction and no query is made; M3 counts them on `conn`."""
-    return 0
+    """The published results of the active tuple, which a scope apply recomputes with no LLM call (§13.4;
+    `det_results.count_published`), read without a lock; 0 while no tuple is active."""
+    tuple_id = (await conn.execute(_ACTIVE_TUPLE)).scalar_one_or_none()
+    if tuple_id is None:
+        return 0
+    return await count_published(conn, llm_tuple_id=int(tuple_id))
 
 
 async def projected_critic_rate(conn: AsyncConnection, settings: Settings) -> Decimal:

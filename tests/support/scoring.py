@@ -106,6 +106,19 @@ M3 Task 14 adds the creation's and the activation's side:
   write, read by statements of the test's own;
 - `activate_scoring_settings(conn, **scoring)`: a new settings version with those `scoring` fields, made
   active.
+
+M3 Task 15 adds the scope apply's, the det-facts hook's and the groups' side:
+- `published_result(conn, job, llm_tuple_id)`: a published target of `job`'s current revision for the tuple
+  (`tests.support.m3.insert_published`) whose stored columns `det_results.compute_and_write` reads are those
+  of a real publication (every LLM criterion at level 4, `job_facts()` asserting nothing), without an
+  instance; over the score tuple its rubric is the seeded v2 and its profile `score_profile`;
+- `instances_of(engine, result_id)`: the result's `det_results` rows (scope, current flag, supersession, hash,
+  scores), oldest first;
+- `place_far(conn, job_id)`: the job is on site only, in Leipzig (about 150 km from Berlin): beyond twice any
+  radius under 75 km of a Berlin scope location, so `beyond_radius` fails it there;
+- `set_job_facts(conn, job_id, **columns)`: the job's det-fact columns replaced (a set as a list, a JSONB
+  value as a dict or list) with a fresh `det_facts_hash`, as a det-facts writer changes them; nothing is
+  recomputed.
 """
 
 import asyncio
@@ -156,10 +169,12 @@ from tests.support.m3 import (
     CLAIM_WHERE,
     NOW,
     Job,
+    Published,
     insert_batch_item,
     insert_bulk_operation,
     insert_group,
     insert_job,
+    insert_published,
     insert_row,
     insert_submission,
 )
@@ -1347,3 +1362,91 @@ async def activate_scoring_settings(conn: AsyncConnection, **scoring: JSONValue)
     payload["scoring"] = {**get_object(payload, "scoring"), **scoring}
     version = int((await conn.execute(_SETTINGS_VERSION, {"payload": payload})).scalar_one())
     await conn.execute(_ACTIVATE_SETTINGS, {"v": version})
+
+
+# ---- M3 Task 15: the scope apply, the det-facts hook and the groups ------------------------------------
+
+_VALID_RESULT: Final = q(
+    "UPDATE llm_results SET criteria = :criteria, job_facts = :job_facts WHERE id = :id",
+    jsonb=["criteria", "job_facts"],
+)
+_INSTANCES_OF: Final = q(
+    "SELECT id, scope_version_id, is_current, superseded_at, det_inputs_hash, det_algorithm_version, "
+    "score_low, score_mid, score_high, computed_at FROM det_results WHERE llm_result_id = :r ORDER BY id"
+)
+_PLACE_FAR: Final = q(
+    "UPDATE jobs SET locations = :locations, location_kind = 'city', work_mode_possible = ARRAY['onsite'], "
+    "work_mode_source = 'structured', det_facts_hash = :hash WHERE id = :j",
+    jsonb=["locations"],
+)
+LEIPZIG_LOCATION: Final[dict[str, JSONValue]] = {
+    "label": "Leipzig",
+    "resolution": "unique",
+    "candidates": [
+        {"gazetteer_id": "geonames:2879139", "country_code": "DE", "lat": 51.33962, "lon": 12.37129}
+    ],
+    "postal_code": None,
+    "source": "test",
+}
+# The det-fact columns `set_job_facts` may replace, by how each is bound.
+_ARRAY_FACTS: Final = frozenset({"work_mode_possible", "employment_types", "seniority_tokens"})
+_JSONB_FACTS: Final = frozenset({"salary", "locations"})
+_TEXT_FACTS: Final = frozenset(
+    {"location_kind", "work_mode_source", "employment_source", "industry_structured", "ad_language"}
+)
+
+
+def _fact_assignment(name: str) -> str:
+    if name in _ARRAY_FACTS:
+        return f"{name} = CAST(:{name} AS text[])"
+    if name in _JSONB_FACTS:
+        return f"{name} = NULLIF(:{name}, 'null'::jsonb)"
+    return f"{name} = :{name}"
+
+
+async def published_result(conn: AsyncConnection, job: Job, llm_tuple_id: int) -> Published:
+    """A published result of `job` for the tuple with the stored columns of a real publication (module
+    notes)."""
+    published = await insert_published(conn, job, llm_tuple_id)
+    criteria = {
+        key: {"level": level, "basis": "observed", "rationale": "Erfunden."}
+        for key, level in dict.fromkeys(_LEVELS, 4).items()
+    }
+    params = {
+        "id": published.result_id,
+        "criteria": criteria,
+        "job_facts": job_facts().model_dump(mode="json"),
+    }
+    await conn.execute(_VALID_RESULT, params)
+    return published
+
+
+async def instances_of(engine: AsyncEngine, result_id: int) -> list[Row[Any]]:
+    """The result's score instances, oldest first (module notes)."""
+    async with engine.connect() as conn:
+        return list((await conn.execute(_INSTANCES_OF, {"r": result_id})).all())
+
+
+async def place_far(conn: AsyncConnection, job_id: int) -> None:
+    """The job on site only in Leipzig, with a fresh `det_facts_hash` (module notes)."""
+    params = {
+        "locations": [LEIPZIG_LOCATION],
+        "hash": hashlib.sha256(f"far:{job_id}".encode()).digest(),
+        "j": job_id,
+    }
+    await conn.execute(_PLACE_FAR, params)
+
+
+async def set_job_facts(conn: AsyncConnection, job_id: int, **columns: JSONValue) -> bytes:
+    """The job's det-fact `columns` replaced, its `det_facts_hash` a fresh one (module notes); the hash."""
+    unknown = set(columns) - _ARRAY_FACTS - _JSONB_FACTS - _TEXT_FACTS
+    if unknown:
+        raise ValueError(f"set_job_facts: not a det-fact column: {sorted(unknown)}")
+    digest = hashlib.sha256(canonical_json({"job": job_id, **columns})).digest()
+    assignments = ", ".join(_fact_assignment(name) for name in columns)
+    statement = q(
+        f"UPDATE jobs SET {assignments}, det_facts_hash = :hash WHERE id = :j",  # noqa: S608 (checked names)
+        jsonb=[name for name in columns if name in _JSONB_FACTS],
+    )
+    await conn.execute(statement, {**columns, "hash": digest, "j": job_id})
+    return digest

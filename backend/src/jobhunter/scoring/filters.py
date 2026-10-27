@@ -35,24 +35,41 @@ expiry).
 `write_result` upserts the row of a (job, scope) with `inputs_hash`, the `jobs.det_facts_hash` the result was
 computed from, and `det_algorithm_version`. `refilter_job` computes and writes a job's rows for the scopes it
 is given under the job row `FOR SHARE`: it waits for an identity transaction that holds the row `FOR UPDATE`
-and reads the facts that transaction committed. `read_det_facts` reads a job's committed `DetFacts` without a
-lock (the score validation's provisional aggregation, M3 Task 9).
+and reads the facts that transaction committed. It is the pure writer: it moves no target and writes no
+instance. `read_det_facts` reads a job's committed `DetFacts` without a lock (the score validation's
+provisional aggregation, M3 Task 9), `read_det_facts_of` those of several jobs in one statement.
 
-**Completeness.** `recompute_stale` finds the unmerged jobs that lack a row for a scope of `active_scopes`, or
-whose row has an `inputs_hash` other than `jobs.det_facts_hash` or another `det_algorithm_version`, and
-refilters up to `BATCH` of them. The heavy reconciler `hard_filter_completeness` runs it over every job
-(fenced by the worker epoch); node 8 (`graphs.collect.nodes.hard_filters`) over the jobs the run touched
-(fenced by the run's owner row). Each batch is one transaction in the lock order of §3.3.3: `active_config`
-(`active_scopes`), then the batch's job rows `FOR SHARE` in ascending id and in one statement (a job merged or
-deleted meanwhile is skipped), then the caller's `guard` (the owner or epoch fence), then the writes. The
-unpublished targets of a job whose result changed are refiltered once `score_targets` exists (M3).
-`STALE_PREDICATE` is that stale-result condition as one SQL fragment, which the scope apply's final
-completeness check (`settings.scope_apply.incomplete_jobs`, M2 Task 18) counts with; the apply's precompute
-calls `recompute_stale` for its pending scope alone and outside any `active_config` lock (§13.4 step 2).
+**Live** (M3 Task 15, Codex r5 B3; §9.7 L3716, §13.4 L4905). `lock_active_scopes` reads, under
+`active_config FOR SHARE` (the first lock), the active and the pending scope and the active tuple
+(`ActiveScopes`; `active_scopes` is its `scopes`). `refilter_job_live(conn, job_id, active=…)` is the
+det-facts change hook of the live writers that hold that lock before the job row (the identity hook of the
+harvest, `merge`/`unmerge`, the groups' confirmation): `refilter_job` for both scopes, then a current
+`det_results` instance of each published active-tuple result of the job's revisions for both scopes (none
+when the inputs' hash is unchanged), then the job's unpublished active-tuple targets `filtered_out ⇄ pending`
+by the active scope, `override = 'none'` (`targets.refilter_targets_of_jobs`). It returns what it wrote
+(`LiveRefiltered`; the caller bumps the ranking when `changed`). The scope precompute and the completeness
+reconciler never call it.
+
+**Completeness.** `recompute_stale_ids` finds the unmerged jobs that lack a row for a scope of the given
+scopes, or whose row has an `inputs_hash` other than `jobs.det_facts_hash` or another
+`det_algorithm_version`, refilters up to `BATCH` of them (`refilter_job`) and returns their ids, which the
+transaction still holds `FOR SHARE`; `recompute_stale` counts them (Codex r6 B4). The heavy reconciler
+`hard_filter_completeness` runs it over every job (fenced by the worker epoch) and then refilters the
+unpublished active-tuple targets of exactly those jobs by the active scope
+(`targets.refilter_targets_of_jobs`, honouring overrides; M1 Deviation 8 closed), bumping the ranking when
+one moved; node 8
+(`graphs.collect.nodes.hard_filters`) runs `recompute_stale` over the jobs the run touched (fenced by the
+run's owner row). Each batch is one transaction in the lock order of §3.3.3: `active_config`
+(`lock_active_scopes`), then the batch's job rows `FOR SHARE` in ascending id and in one statement (a job
+merged or deleted meanwhile is skipped), then the caller's `guard` (the owner or epoch fence), then the
+writes, the targets' moves after the results. `STALE_PREDICATE` is that stale-result condition as one SQL
+fragment, which the scope apply's final completeness check (`settings.scope_apply.incomplete_jobs`, M2 Task
+18) counts with; the apply's precompute calls `recompute_stale` for its pending scope alone and outside any
+`active_config` lock (§13.4 step 2), so its chunks move no target: the pending scope's moves are the flip's.
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property, lru_cache
@@ -62,6 +79,7 @@ from typing import Any, Final, Literal
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db import ranking
 from jobhunter.db.guards import Guard
 from jobhunter.db.seed import canonical_json, content_hash
 from jobhunter.db.sql import q
@@ -317,14 +335,20 @@ def _evaluate(facts: DetFacts, description: _Description, scope: ScopeSettings) 
 
 # -- reading a job -------------------------------------------------------------------------------------------
 
-_JOB: Final = (
-    "SELECT j.company_key, j.title_norm, j.seniority_tokens, j.locations, j.location_kind, "
+# The columns of `jobs j` that make its `DetFacts`.
+_FACT_COLUMNS: Final = (
+    "j.company_key, j.title_norm, j.seniority_tokens, j.locations, j.location_kind, "
     "j.work_mode_possible, j.work_mode_source, j.remote_countries, j.employment_types, j.employment_source, "
-    "j.salary, j.industry_structured, j.structured_seniority, j.ad_language, j.posted_at_effective, "
-    "j.det_facts_hash, coalesce(r.description_text, '') AS description_text "
+    "j.salary, j.industry_structured, j.structured_seniority, j.ad_language, j.posted_at_effective"
+)
+_JOB: Final = (
+    f"SELECT {_FACT_COLUMNS}, j.det_facts_hash, coalesce(r.description_text, '') AS description_text "  # noqa: S608
     "FROM jobs j LEFT JOIN job_revisions r ON r.id = j.current_revision_id WHERE j.id = :job"
 )
 _LOCK_JOB: Final = q(_JOB + " FOR SHARE OF j")
+_FACTS_OF: Final = q(
+    f"SELECT j.id, {_FACT_COLUMNS} FROM jobs j WHERE j.id = ANY(CAST(:jobs AS bigint[]))"  # noqa: S608
+)
 
 
 @dataclass(frozen=True)
@@ -367,6 +391,15 @@ async def read_det_facts(conn: AsyncConnection, job_id: int) -> DetFacts:
     return _facts(row)
 
 
+async def read_det_facts_of(conn: AsyncConnection, job_ids: Sequence[int]) -> dict[int, DetFacts]:
+    """The committed `DetFacts` of each job of `job_ids` that exists, by id, in one statement and without a
+    lock (the caller holds the job rows: the staleness check of a scope's instances, Task 15)."""
+    if not job_ids:
+        return {}
+    rows = await conn.execute(_FACTS_OF, {"jobs": sorted(set(job_ids))})
+    return {int(row.id): _facts(row) for row in rows}
+
+
 async def _load(conn: AsyncConnection, job_id: int) -> _Loaded:
     """The job's facts, description and `det_facts_hash`, its row `FOR SHARE`."""
     row = (await conn.execute(_LOCK_JOB, {"job": job_id})).first()
@@ -386,11 +419,13 @@ _WRITE: Final = q(
     "det_algorithm_version = EXCLUDED.det_algorithm_version, computed_at = EXCLUDED.computed_at"
 )
 # The scopes whose results are required: the active one and, while a flip is being prepared, the pending
-# one, with `active_config` held `FOR SHARE` (§9.1 lock order: the first lock). The scope rows are read by a
-# statement of their own: joined to the lock, a statement that waited behind a settings save would look for
-# the save's new pending scope in the snapshot of its own start, which lacks it (`settings/active.py`).
+# one, with `active_config` held `FOR SHARE` (§9.1 lock order: the first lock), and the active LLM tuple. The
+# scope rows are read by a statement of their own: joined to the lock, a statement that waited behind a
+# settings save would look for the save's new pending scope in the snapshot of its own start, which lacks it
+# (`settings/active.py`).
 _LOCK_SCOPE_POINTERS: Final = q(
-    "SELECT scope_version_id, pending_scope_version_id FROM active_config WHERE id = 1 FOR SHARE"
+    "SELECT scope_version_id, pending_scope_version_id, llm_tuple_id FROM active_config WHERE id = 1 "
+    "FOR SHARE"
 )
 _SCOPES: Final = q(
     "SELECT id, payload FROM scope_versions WHERE id = ANY(CAST(:ids AS bigint[])) ORDER BY id"
@@ -420,20 +455,44 @@ async def write_result(
     )
 
 
+@dataclass(frozen=True)
+class ActiveScopes:
+    """What a live writer reads under `active_config FOR SHARE` (`lock_active_scopes`): the active scope
+    version, the pending one while a flip is being prepared, their scopes (`scopes`, by scope version id: the
+    mapping `refilter_job` takes), and the active LLM tuple (`None` before the first confirmed profile)."""
+
+    scope_version_id: int
+    pending_scope_version_id: int | None
+    llm_tuple_id: int | None
+    scopes: Mapping[int, ScopeSettings]
+
+
+async def lock_active_scopes(conn: AsyncConnection) -> ActiveScopes:
+    """The active and the pending scope and the active tuple, `active_config` taken `FOR SHARE` (§9.1: the
+    first lock): the rows of these scopes, the job's instances and its targets' moves are written under that
+    lock until the transaction ends, so no scope flip or tuple activation commits in between."""
+    pointers = (await conn.execute(_LOCK_SCOPE_POINTERS)).first()
+    if pointers is None:
+        raise LookupError("there is no active configuration")
+    pending = pointers.pending_scope_version_id
+    ids = [int(pointers.scope_version_id)] + ([] if pending is None else [int(pending)])
+    rows = (await conn.execute(_SCOPES, {"ids": ids})).all()
+    return ActiveScopes(
+        scope_version_id=int(pointers.scope_version_id),
+        pending_scope_version_id=None if pending is None else int(pending),
+        llm_tuple_id=None if pointers.llm_tuple_id is None else int(pointers.llm_tuple_id),
+        scopes={int(row.id): scope_from_payload(get_object(row.payload, "")) for row in rows},
+    )
+
+
 async def active_scopes(conn: AsyncConnection) -> dict[int, ScopeSettings]:
-    """The active scope and the pending one when set, by scope version id, from `scope_versions.payload`.
+    """The active scope and the pending one when set, by scope version id, from `scope_versions.payload`
+    (`lock_active_scopes`' `scopes`).
 
     Takes `active_config` `FOR SHARE`: the rows of these scopes are written under that lock until the
     transaction ends, so no scope flip commits between the facts read and the results written.
     """
-    pointers = (await conn.execute(_LOCK_SCOPE_POINTERS)).first()
-    if pointers is None:
-        raise LookupError("there is no active configuration")
-    ids = [pointers.scope_version_id] + (
-        [] if pointers.pending_scope_version_id is None else [pointers.pending_scope_version_id]
-    )
-    rows = (await conn.execute(_SCOPES, {"ids": ids})).all()
-    return {int(row.id): scope_from_payload(get_object(row.payload, "")) for row in rows}
+    return dict((await lock_active_scopes(conn)).scopes)
 
 
 async def refilter_job(
@@ -453,6 +512,51 @@ async def refilter_job(
         await write_result(conn, job_id, scope_version_id, result, inputs_hash=loaded.det_facts_hash)
         results[scope_version_id] = result
     return results
+
+
+@dataclass(frozen=True)
+class LiveRefiltered:
+    """What the live hook wrote: the job's results by scope, the instances it wrote (none for an unchanged
+    hash), and the targets it moved out to `filtered_out` and back to `pending`."""
+
+    results: dict[int, HardFilterResult]
+    instances: tuple[int, ...]
+    filtered: int
+    unfiltered: int
+
+    @property
+    def changed(self) -> bool:
+        """Whether the ranking changed: an instance written or a target moved (the caller's bump)."""
+        return bool(self.instances) or self.filtered + self.unfiltered > 0
+
+
+async def refilter_job_live(conn: AsyncConnection, job_id: int, *, active: ActiveScopes) -> LiveRefiltered:
+    """The det-facts change hook (module docstring, Live): `refilter_job` for the active and the pending
+    scope; then, with an active tuple, a current instance of each of the job's published results of that
+    tuple for both scopes (`det_results.recompute_job_instances`: none for an unchanged hash), and the job's
+    unpublished targets of that tuple moved `filtered_out ⇄ pending` by the active scope
+    (`targets.refilter_targets_of_jobs`).
+
+    `active` is what the caller read under `active_config FOR SHARE`, which it took before the job row
+    (`lock_active_scopes`): the identity hook of the harvest, `merge`/`unmerge` and the groups' confirmation.
+    The hook asserts nothing about locks it cannot see; it writes the instances under the job row (`FOR
+    SHARE`, taken by `refilter_job` when the caller holds it no stronger) and before the targets, in the
+    lock schedule's order (§9.1: job rows → other domain rows). The caller bumps the ranking when `changed`.
+    """
+    # Imported here: `det_results` reads `DetFacts` from this module and `targets` imports it.
+    from jobhunter.scoring import det_results, targets
+
+    results = await refilter_job(conn, job_id, active.scopes)
+    if active.llm_tuple_id is None:
+        return LiveRefiltered(results, (), 0, 0)
+    instances = await det_results.recompute_job_instances(
+        conn,
+        job_id=job_id,
+        llm_tuple_id=active.llm_tuple_id,
+        scopes=[det_results.ScopeRow(sid, scope) for sid, scope in active.scopes.items()],
+    )
+    swept = await targets.refilter_targets_of_jobs(conn, [job_id], active)
+    return LiveRefiltered(results, tuple(instances), swept.filtered, swept.unfiltered)
 
 
 # -- completeness --------------------------------------------------------------------------------------------
@@ -476,26 +580,28 @@ _STALE: Final = q(
 )
 
 
-async def recompute_stale(
+async def recompute_stale_ids(
     conn: AsyncConnection,
     scopes: Mapping[int, ScopeSettings],
     *,
     guard: Guard,
     since: datetime | None = None,
-) -> int:
+) -> list[int]:
     """Refilter up to `BATCH` unmerged jobs, in id order, that lack a result for a scope of `scopes`, or whose
     result has an `inputs_hash` other than the job's `det_facts_hash` or another algorithm version; only the
-    jobs updated at or after `since` when it is given. Returns how many jobs it recomputed (a pass that
-    returns `BATCH` may have left more).
+    jobs updated at or after `since` when it is given. Returns the ids of the jobs it recomputed, which the
+    transaction still holds `FOR SHARE` (a pass that returns `BATCH` may have left more): the one body
+    behind `recompute_stale` (Codex r6 B4), so the completeness reconciler refilters the targets of exactly
+    these jobs without a second stale query.
 
     In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `active_scopes`, except the
     scope apply's precompute, which runs outside any `active_config` lock, §13.4 step 2): the batch's job
     rows `FOR SHARE` in one statement, then `await guard(conn)`, which proves the caller still owns the work
     (the owner row of the run or operation, or the worker epoch) and raises `FencedOut`, having written
-    nothing, when it does not; then the results are written.
+    nothing, when it does not; then the results are written (`refilter_job`: no target moves, no instance).
     """
     if not scopes:
-        return 0
+        return []
     found = await conn.execute(
         _STALE,
         {"since": since, "scopes": list(scopes), "version": DET_ALGORITHM_VERSION, "limit": BATCH},
@@ -504,14 +610,28 @@ async def recompute_stale(
     await guard(conn)
     for job_id in job_ids:
         await refilter_job(conn, job_id, scopes)
-    return len(job_ids)
+    return job_ids
+
+
+async def recompute_stale(
+    conn: AsyncConnection,
+    scopes: Mapping[int, ScopeSettings],
+    *,
+    guard: Guard,
+    since: datetime | None = None,
+) -> int:
+    """`recompute_stale_ids`, counted: how many jobs it recomputed (a pass that returns `BATCH` may have left
+    more). The scope precompute's chunks (its pending scope alone, outside any `active_config` lock) and node
+    8 call it."""
+    return len(await recompute_stale_ids(conn, scopes, guard=guard, since=since))
 
 
 @reconciler("hard_filter_completeness", "heavy")
 async def hard_filter_completeness(ctx: ReconcileContext) -> int:
     """§17.4 `hard_filter_completeness`: the unmerged jobs without a current result for the active (or
-    pending) scope are recomputed, under `active_config` `FOR SHARE`, `BATCH` jobs per pass. Returns the
-    count of jobs recomputed. When `ctx.epoch` is no longer the current worker epoch it raises `FencedOut`
+    pending) scope are recomputed, under `active_config` `FOR SHARE`, `BATCH` jobs per pass, and the
+    unpublished active-tuple targets of those jobs refiltered by the active scope (module docstring). Returns
+    the count of jobs recomputed. When `ctx.epoch` is no longer the current worker epoch it raises `FencedOut`
     (`fence_epoch`), having written nothing, so that `run_reconcilers` stops the cadence at this reconciler
     and the superseded worker requests its stop (Ruling FR-r; fix wave F7, Ruling FR-w); a `FencedOut` of
     another owner returns 0."""
@@ -519,9 +639,17 @@ async def hard_filter_completeness(ctx: ReconcileContext) -> int:
     async def fenced(conn: AsyncConnection) -> None:
         await fence_epoch(conn, ctx.epoch)
 
+    # Imported here: `targets` imports this module.
+    from jobhunter.scoring import targets
+
     try:
         async with ctx.engine.begin() as conn:
-            return await recompute_stale(conn, await active_scopes(conn), guard=fenced)
+            active = await lock_active_scopes(conn)
+            job_ids = await recompute_stale_ids(conn, active.scopes, guard=fenced)
+            swept = await targets.refilter_targets_of_jobs(conn, job_ids, active)
+            if swept.moved:
+                await ranking.bump(conn)  # `ranking_state`, the last lock
+            return len(job_ids)
     except FencedOut as fenced_out:
         if fenced_out.worker_superseded:
             raise  # the fenced transaction wrote nothing (`fence_epoch` logged it)

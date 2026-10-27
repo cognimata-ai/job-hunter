@@ -1,10 +1,14 @@
 """The representative of a duplicate group (spec §8.7, §7.17 #4): eligibility, the election order, elections
 and dissolution.
 
-**Eligibility** (M1): a member is eligible when its job is unmerged and not `closed`. The clause on its
-active-tuple target (`pending`, `budget_deferred`, `in_progress`, `in_batch`, `deferred_duplicate` or
-published) arrives with the targets in M3 (plan Deviation 9). `ELIGIBLE_SQL` is the same predicate over a
-`jobs` row aliased `j`, for the statements that select by it; the two change together.
+**Eligibility** (§8.7 L3251; M3 Task 15 closes M1 Deviation 9): a member is eligible when its job is
+unmerged and not `closed` and, while a tuple is active, its active-tuple target (the target of its current
+revision for `active_config.llm_tuple_id`) is in `ELIGIBLE_TARGET_STATES`: `pending`, `budget_deferred`,
+`in_progress`, `in_batch`, `deferred_duplicate` or published. A member without such a target, or whose
+target failed, was refused, expired, was filtered out or cancelled, is not eligible; with no active tuple M1's
+rule holds. §7.17 #4 is read with this list (A1 issue 27). `ELIGIBLE_SQL` is the same predicate over a `jobs`
+row aliased `j` and the `active_config` row aliased `ac`, which every statement that selects by it joins; the
+two change together (`eligible(availability, merged, target_state, has_tuple=…)`).
 
 **`elect`** returns the eligible member that sorts first by the six keys of §8.7: availability (`active` >
 `unknown` > `stale`), completeness (`full` > `partial`), the best source precedence rank (ATS 1, JSearch and
@@ -14,10 +18,12 @@ job id; `None` when no member is eligible.
 **`reelect`** runs an election in the caller's transaction, which holds the row of every member (the job rows
 first, §3.3.3): the group row is locked `FOR UPDATE`; a group with fewer than two members is dissolved
 instead (`dissolve`); otherwise `representative_job_id`, `election_reason`, `elected_at` and `updated_at`
-are set, and `unscorable_reason` from the result: `NULL` with a representative, `no_active_member` without
-one (the M3 reasons `all_failed` and `all_filtered` need the targets). An election never keeps an earlier
-reason it did not find again. Representative changes are not state transitions (§7.16.8); the group stays
-`active`. The revalidation of the members against a new representative is `groups`' (§8.7).
+are set, and `unscorable_reason` from the result: `NULL` with a representative, else `unscorable_reason`
+of the members (L3259): `all_failed` when every member's target failed (`failed_*`), was refused or expired
+(`expired_unscored`), `all_filtered` when every one is `filtered_out`, `no_active_member` otherwise. An
+election never keeps an earlier reason it did not find again. Representative changes are not state
+transitions (§7.16.8); the group stays `active`. The revalidation of the members against a new
+representative, and the deferred members' targets after it, are `groups`' (§8.7).
 
 **`dissolve`**: the remaining members leave (`duplicate_group_members` rows deleted, `jobs.duplicate_group_id
 := NULL`) and the group moves `active → dissolved` through `transition()` with the reason as its
@@ -42,21 +48,47 @@ from jobhunter.observability.alerts import resolve_alert
 from jobhunter.observability.logging import get_logger
 
 NO_ACTIVE_MEMBER: Final = "no_active_member"
+ALL_FAILED: Final = "all_failed"
+ALL_FILTERED: Final = "all_filtered"
 # An info alert, subject `job:<id>` (Ruling T20-b): raised by `groups` when a job joins the best of several
 # groups, resolved here when it leaves.
 AMBIGUOUS_GROUPING: Final = "dedup.ambiguous_grouping"
 # §8.7's order of the eligible availabilities; `closed` is never eligible.
 AVAILABILITY_ORDER: Final = ("active", "unknown", "stale")
 WORST_RANK: Final = 99  # the precedence rank of a job without a known source
-ELIGIBLE_SQL: Final = "(j.merged_into_job_id IS NULL AND j.availability <> 'closed')"
+# The active-tuple target states of an eligible member (§8.7 L3251, the published ones included).
+ELIGIBLE_TARGET_STATES: Final = (
+    "pending",
+    "budget_deferred",
+    "in_progress",
+    "in_batch",
+    "deferred_duplicate",
+    "published_accepted",
+    "published_contested",
+)
+# The target states of `all_failed` (L3259: every target failed, refused or expired), besides `failed_*`.
+_FAILED_STATES: Final = frozenset({"refused", "expired_unscored"})
+# `eligible` over `jobs j` and `active_config ac` (module docstring; the plan's text, verbatim).
+ELIGIBLE_SQL: Final = (
+    "(j.merged_into_job_id IS NULL AND j.availability <> 'closed' AND (ac.llm_tuple_id IS NULL OR EXISTS "
+    "(SELECT 1 FROM score_targets t WHERE t.job_revision_id = j.current_revision_id AND t.llm_tuple_id = "
+    "ac.llm_tuple_id AND t.state IN ('pending', 'budget_deferred', 'in_progress', 'in_batch', "
+    "'deferred_duplicate', 'published_accepted', 'published_contested'))))"
+)
+# A job's active-tuple target state (`target_state`, NULL without one) and whether a tuple is active, over
+# `jobs j` and `active_config ac`: what `eligible` reads beside the job's own columns.
+TARGET_STATE_SQL: Final = (
+    "(SELECT t.state FROM score_targets t WHERE t.job_revision_id = j.current_revision_id "
+    "AND t.llm_tuple_id = ac.llm_tuple_id) AS target_state, ac.llm_tuple_id IS NOT NULL AS has_tuple"
+)
 
 _GROUP: Final = q("SELECT status, representative_job_id FROM duplicate_groups WHERE id = :group FOR UPDATE")
 _MEMBER_VIEWS: Final = q(
-    "SELECT j.id, j.availability, j.completeness, j.first_seen_at, "
+    "SELECT j.id, j.availability, j.completeness, j.first_seen_at, "  # noqa: S608 (the module's constants)
     "j.merged_into_job_id IS NOT NULL AS merged, "
     "coalesce((SELECT min(s.precedence_rank) FROM sources s WHERE s.id = ANY(j.source_ids)), :worst) "
-    "AS source_rank, length(coalesce(r.description_text, '')) AS description_length "
-    "FROM duplicate_group_members m JOIN jobs j ON j.id = m.job_id "
+    f"AS source_rank, length(coalesce(r.description_text, '')) AS description_length, {TARGET_STATE_SQL} "
+    "FROM duplicate_group_members m JOIN jobs j ON j.id = m.job_id JOIN active_config ac ON ac.id = 1 "
     "LEFT JOIN job_revisions r ON r.id = j.current_revision_id WHERE m.group_id = :group ORDER BY j.id"
 )
 _ELECT: Final = q(
@@ -86,11 +118,30 @@ class MemberView:
     description_length: int
     first_seen_at: datetime
     eligible: bool
+    target_state: str | None = None  # its active-tuple target's state (`None`: none, or no active tuple)
 
 
-def eligible(availability: str, merged: bool) -> bool:
-    """§8.7's eligibility as it reads in M1: the job is unmerged and not `closed` (module docstring)."""
-    return not merged and availability != "closed"
+def eligible(availability: str, merged: bool, target_state: str | None, *, has_tuple: bool) -> bool:
+    """§8.7's eligibility (module docstring): the job is unmerged and not `closed`, and, while a tuple is
+    active (`has_tuple`), its active-tuple target is in `ELIGIBLE_TARGET_STATES`."""
+    if merged or availability == "closed":
+        return False
+    return not has_tuple or target_state in ELIGIBLE_TARGET_STATES
+
+
+def _failed(state: str | None) -> bool:
+    return state is not None and (state.startswith("failed_") or state in _FAILED_STATES)
+
+
+def unscorable_reason(members: Sequence[MemberView]) -> str:
+    """Why a group without an eligible member is not scorable (L3259; module docstring): `all_failed`,
+    `all_filtered`, else `no_active_member`."""
+    states = [member.target_state for member in members]
+    if states and all(_failed(state) for state in states):
+        return ALL_FAILED
+    if states and all(state == "filtered_out" for state in states):
+        return ALL_FILTERED
+    return NO_ACTIVE_MEMBER
 
 
 def _order(member: MemberView) -> tuple[int, int, int, int, datetime, int]:
@@ -118,6 +169,8 @@ def member_view(
     description_length: int,
     first_seen_at: datetime,
     merged: bool,
+    target_state: str | None,
+    has_tuple: bool,
 ) -> MemberView:
     """The election's view of a job, its eligibility derived here (`eligible`): the one constructor, for a
     member read from the database (`member_views`) and for a job `groups` holds in memory."""
@@ -128,7 +181,8 @@ def member_view(
         source_rank=source_rank,
         description_length=description_length,
         first_seen_at=first_seen_at,
-        eligible=eligible(availability, merged),
+        eligible=eligible(availability, merged, target_state, has_tuple=has_tuple),
+        target_state=target_state,
     )
 
 
@@ -141,6 +195,8 @@ def _member_view(row: Row[tuple[object, ...]]) -> MemberView:
         description_length=int(row.description_length),
         first_seen_at=row.first_seen_at,
         merged=bool(row.merged),
+        target_state=None if row.target_state is None else str(row.target_state),
+        has_tuple=bool(row.has_tuple),
     )
 
 
@@ -184,13 +240,19 @@ async def dissolve(conn: AsyncConnection, group_id: int, *, reason: str) -> tupl
 
 
 async def set_representative(
-    conn: AsyncConnection, group_id: int, job_id: int | None, *, reason: str
+    conn: AsyncConnection,
+    group_id: int,
+    job_id: int | None,
+    *,
+    reason: str,
+    unscorable: str = NO_ACTIVE_MEMBER,
 ) -> None:
-    """`job_id` represents the group (`None`: none does, `no_active_member`), elected for `reason`."""
+    """`job_id` represents the group (`None`: none does, and the group records `unscorable`), elected for
+    `reason`."""
     params = {
         "group": group_id,
         "rep": job_id,
-        "reason": NO_ACTIVE_MEMBER if job_id is None else None,
+        "reason": unscorable if job_id is None else None,
         "election": reason,
     }
     await conn.execute(_ELECT, params)
@@ -210,5 +272,7 @@ async def reelect(conn: AsyncConnection, group_id: int, *, reason: str) -> int |
         return None
     elected = elect(members)
     representative = None if elected is None else elected.job_id
-    await set_representative(conn, group_id, representative, reason=reason)
+    await set_representative(
+        conn, group_id, representative, reason=reason, unscorable=unscorable_reason(members)
+    )
     return representative

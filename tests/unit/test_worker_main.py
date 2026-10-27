@@ -9,6 +9,7 @@ from jobhunter.worker.main import exit_unless_lock_held
 
 from tests.support.clock import FakeClock
 from tests.support.logs import logged
+from tests.support.reconcile import registered_by
 
 
 class Exited(Exception):
@@ -643,6 +644,7 @@ M1_RECONCILERS = {
     "stale_sweep_daily": ["daily"],
     "ats_mass_events": ["tick"],
     "group_representatives": ["heavy"],
+    # M1's, registered by `worker.embedding_reconcile` since M3 Task 15 (M1 Carry-forward 14, Ruling P44)
     "awaiting_embedding": ["heavy"],
 }
 # The reconcilers M2 adds, by task: the spend ledger's two (Task 3), the gateway's refusal rate (Task 5), the
@@ -666,40 +668,6 @@ M3_RECONCILERS = {
     "bulk_operations": ["heavy"],
     "missing_targets": ["heavy"],
 }
-# Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
-# from `sys.modules` (each registry module is imported by the modules that register into it).
-_REGISTRY_SCRIPT = """\
-import importlib, json, sys
-for module in sys.argv[1:]:
-    importlib.import_module(module)
-print(json.dumps({
-    "reconcilers": {
-        name: sorted(cadences)
-        for name, (cadences, _) in sys.modules["jobhunter.worker.reconcilers"].REGISTRY.items()
-    },
-    "sweeps": sorted(sys.modules["jobhunter.worker.epoch"]._SWEEPS),
-    "handlers": sorted(sys.modules["jobhunter.worker.operations"].HANDLERS),
-    "failure_hooks": sorted(sys.modules["jobhunter.worker.operations"].FAILURE_HOOKS),
-    "main_imported": "jobhunter.worker.main" in sys.modules,
-}))
-"""
-
-
-def registered_by(modules: tuple[str, ...]) -> dict[str, object]:
-    """What a fresh interpreter has registered after importing only `modules`."""
-    import json
-    import subprocess
-    import sys
-
-    done = subprocess.run(
-        [sys.executable, "-c", _REGISTRY_SCRIPT, *modules],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=120,
-    )
-    registered: dict[str, object] = json.loads(done.stdout.strip().splitlines()[-1])
-    return registered
 
 
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
@@ -730,3 +698,16 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
         "failure_hooks": ["extract_profile", "extract_profile_text", "propose_queries"],
         "main_imported": False,
     }
+
+
+def test_awaiting_embedding_is_registered_by_the_worker_s_module_alone() -> None:
+    """M3 Task 15 (M1 Carry-forward 14, Rulings P15 and P44): the `awaiting_embedding` reconciler lives in
+    `worker.embedding_reconcile`, which step 4 lists, so the registered set keeps it; `jobhunter.embeddings`,
+    which the api imports, registers it no longer."""
+    from jobhunter.worker.main import _REGISTERING_MODULES
+
+    assert "jobhunter.worker.embedding_reconcile" in _REGISTERING_MODULES
+    moved = registered_by(("jobhunter.worker.embedding_reconcile",))["reconcilers"]
+    assert isinstance(moved, dict) and moved["awaiting_embedding"] == ["heavy"]
+    left = registered_by(("jobhunter.embeddings",))["reconcilers"]
+    assert isinstance(left, dict) and "awaiting_embedding" not in left

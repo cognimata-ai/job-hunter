@@ -1,7 +1,7 @@
 """Identity resolution (spec §8.6, §7.16.1, §7.16.2, §20.2): each pending raw item becomes a job's sighting.
 
 **`resolve_item`** runs the §8.6 transaction of one raw item on the caller's connection, inside a savepoint,
-in the lock order of §3.3.3: `active_config` `FOR SHARE` (`filters.active_scopes`, the first statement) →
+in the lock order of §3.3.3: `active_config` `FOR SHARE` (`filters.lock_active_scopes`, the first statement) →
 the job rows → the run's owner row (`ledger.lock_run_owner`) → the other domain rows → `ranking_state`.
 
 1. **Fence and idempotency.** An item no longer `pending` or `deferred` is left as it is: its disposition is
@@ -51,11 +51,14 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
 6. **Merges or the conflict**: `merge.merge_jobs(strong_key_merge, recompute=False, locked=<the rows of
    step 3>)` per merged job, in id order, with the keys and the observation as evidence; or the conflict row.
 7. **Projections**: the decided job's availability and seen bounds (`merge.derive_from_postings`), its
-   canonical fields and revision (`revisions.recompute_job`, once, after the last merge), and its hard-filter
-   results for the active and the pending scope (`filters.refilter_job`). Then `afault_point(IN_ITEM_TX)`
-   (crash case C6), the item `→ linked` with its `observation_id` and `normalized = NULL`, and, last,
-   `ranking.bump` when the list changed: a job created, a merge, a new current revision or a list column
-   (`RecomputeResult`), or the job's availability or first sighting (Ruling T18-a, §7.1).
+   canonical fields and revision (`revisions.recompute_job`, once, after the last merge), and the det-facts
+   change hook (`filters.refilter_job_live`, M3 Task 15, with what step 1 read under `active_config`): its
+   hard-filter results for the active and the pending scope, the current instances of its published results
+   of the active tuple for both scopes, and its unpublished targets' moves `filtered_out ⇄ pending`. Then
+   `afault_point(IN_ITEM_TX)` (crash case C6), the item `→ linked` with its `observation_id` and
+   `normalized = NULL`, and, last, `ranking.bump` when the list changed: a job created, a merge, a new current
+   revision or a list column (`RecomputeResult`), the job's availability or first sighting (Ruling T18-a,
+   §7.1), or an instance or a target the hook wrote or moved.
 
 A `DomainError` other than `FencedOut` rolls the savepoint back, and the item becomes
 `rejected('identity_error')` in a savepoint of its own (owner row first); `FencedOut` propagates. Every final
@@ -93,7 +96,6 @@ from jobhunter.normalize.fields import CanonicalFields, ObservationView, Watchli
 from jobhunter.normalize.keys import AdKey
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
-from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring import filters
 from jobhunter.sources import items
 from jobhunter.sources.base import NormalizedPosting
@@ -501,7 +503,7 @@ async def _posting_for(
 
 
 async def _link(
-    conn: AsyncConnection, owner: RunOwner, item: _Item, scopes: Mapping[int, ScopeSettings]
+    conn: AsyncConnection, owner: RunOwner, item: _Item, active: filters.ActiveScopes
 ) -> ResolveOutcome:
     """Steps 2 to 7 of an item that no fence and no earlier observation settled."""
     keys = collect_keys(item.posting)
@@ -589,9 +591,16 @@ async def _link(
         )
 
     derived, result = await merge.recompute_rollups(conn, job)
-    await filters.refilter_job(conn, job, scopes)
+    live = await filters.refilter_job_live(conn, job, active=active)
     await _dispose(conn, item.raw_item_id, item.from_states, "linked", observation_id=observation_id)
-    if created or decision.merged or result.current_changed or result.list_changed or derived.changed:
+    if (
+        created
+        or decision.merged
+        or result.current_changed
+        or result.list_changed
+        or derived.changed
+        or live.changed
+    ):
         await ranking.bump(conn)
     log.debug(
         "raw_item_linked",
@@ -611,7 +620,7 @@ async def _link(
 
 
 async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
-    scopes = await filters.active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3, §8.6)
+    active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3, §8.6)
     row = (await conn.execute(_ITEM, {"item": raw_item_id})).first()
     if row is None:
         raise LookupError(f"raw item {raw_item_id} does not exist")
@@ -641,7 +650,7 @@ async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> 
         watchlist_display=row.watchlist_display,
         list_item_sha256=None if row.list_item_sha256 is None else bytes(row.list_item_sha256),
     )
-    return await _link(conn, owner, item, scopes)
+    return await _link(conn, owner, item, active)
 
 
 async def _reject(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:

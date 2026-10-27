@@ -2,32 +2,37 @@
 split, confirm, leave, the node's grouping pass and the `group_representatives` reconciler. No group ever
 merges jobs, except `confirm_group`, the user's confirmation.
 
-**The rules.** A `JobView` is what they read of a job: its canonical columns, its current revision's
-description, its best source precedence rank, the `<type>:<board>` of its `ats:` keys and the Greenhouse
-requisition ids of its postings' latest observations. `pair_evidence(a, b, title_similarity)` applies:
+**The rules** (`group_rules`, pure; M1 Carry-forward 15): G1-G5 over `JobView`s, the evidence of a pair
+(`GroupEvidence`), the revalidation against a representative (`revalidation_departures`) and the choice of a
+group or a partner (`choose_group`, `choose_partner`). **Formation**: a job joins an active group whose
+representative it confirms (G2-G5), against whose every member it passes G1 and has no `different`
+decision, and that has fewer than `group_rules.MAX_MEMBERS` members; a group without a representative cannot
+be validated and is not joined. Of several, the one with the best text score, then the lowest id:
+`dedup.ambiguous_grouping` is raised as an info alert (subject `job:<id>`, Ruling T20-b) when the job joins,
+logged, and kept in the member's evidence; a regroup that only confirms the job raises nothing. The alert is
+resolved when the ambiguity is over: the job leaves the group (`representative.leave`: it left, was split
+off or merged away, or the group dissolved), or a regroup that keeps it there finds no other group still
+qualifying (`_end_ambiguity`). Otherwise the ungrouped candidate with the best pair evidence (text score,
+then lowest id) forms a new group with it, its representative elected by §8.7's order (`initial`; none
+eligible: the group records why, `representative.unscorable_reason`). Groups are never merged together.
 
-- **G1**: two jobs that carry a key of one ATS board are never grouped (Adzuna re-ingests may be);
-- **G2** (`compatible_location`): both `remote`; both `country_wide`; or a gazetteer candidate id the two
-  share (`shared_place`); or every candidate pair within `G2_KM` (`within_25km`). An unresolved location
-  gives no evidence, so a job with no resolved location is compatible only by the two kinds (an
-  interpretation: a resolved location beside an unresolved one still counts);
-- **G3**: identical seniority-token sets;
-- **G4**: `similarity(title_norm)` (pg_trgm, computed by the caller) ≥ `G4_TITLE`;
-- **G5**: `shingles.text_confirms` of the two descriptions and their completeness.
+**Eligibility** reads the members' active-tuple targets (`representative.eligible`, M3 Task 15): the
+`JobView`s carry their `target_state` and whether a tuple is active, and the reconciler's violations join
+`active_config` for `ELIGIBLE_SQL`.
 
-It returns the `GroupEvidence` (with a requisition id match as extra evidence, never in place of G1-G5), or
-`None` when a rule fails. `confirms(a, b, …)` is G2-G5 alone.
-
-**Formation** (`choose_group`, `choose_partner`, pure): a job joins an active group whose representative it
-confirms (G2-G5), against whose every member it passes G1 and has no `different` decision, and that has fewer
-than `MAX_MEMBERS` members; a group without a representative cannot be validated and is not joined. Of
-several, the one with the best text score, then the lowest id: `dedup.ambiguous_grouping` is raised as an info
-alert (subject `job:<id>`, Ruling T20-b) when the job joins, logged, and kept in the member's evidence; a
-regroup that only confirms the job raises nothing. The alert is resolved when the ambiguity is over: the job
-leaves the group (`representative.leave`: it left, was split off or merged away, or the group dissolved), or a
-regroup that keeps it there finds no other group still qualifying (`_end_ambiguity`). Otherwise the ungrouped
-candidate with the best pair evidence (text score, then lowest id) forms a new group with it, its
-representative elected by §8.7's order (`initial`). Groups are never merged together.
+**Deferral and the group events** (§8.7 L3261-3267, M3 Task 15). `deferrable(member, representative,
+target)` is L3261's predicate for entering deferral (not the representative, `override = 'none'`, not
+`score_individually`, no `conflicting_facts`, the target `pending` or `budget_deferred`); target creation
+and the regroup sweep use its SQL form (`targets.DEFERRAL_ELIGIBLE_SQL`). `deferral_eligible(member,
+representative, override=…)` is the same predicate without the entering states, the one a deferred target
+stays deferred under (Codex r1 #36, r3 B14). After every group event, in the event's own transaction
+(`regroup_job`'s, `leave_group`, `split_member`, the reconciler's repair), `settle_deferred` moves each
+target deferred to the group `deferred_duplicate → pending` (`transition`, `deferred_group_id` cleared on
+exit) unless its job is still a member of the active group and `deferral_eligible` holds against the group's
+(new) representative: a split member, a member that left after a revalidation, a dissolved group's members,
+a new representative's own target, and a member whose facts conflict with the new representative return to
+`pending`; the others stay deferred. A published representative changes nothing (step 7 of the publish,
+`representative_published`, Task 10).
 
 **`regroup_job`** (the grouping of one job, in the caller's transaction): the candidates are the jobs of the
 same `company_key`, first seen at most `CANDIDATE_DAYS` apart, unmerged, with no `different` decision against
@@ -68,8 +73,9 @@ it holds job rows, and a merge and a regroup of one company cannot deadlock: the
 rows. `split_member` and `confirm_group` (user actions) take no advisory lock either: their job rows (the
 group's members), then the group row; `confirm_group` takes `active_config` `FOR SHARE` before them.
 
-**`group_representatives`** (cadence `heavy`, §17.4): the active groups that break §7.17 #4 as it reads in M1
-(a representative that is not an eligible member; no representative while a member is eligible), have fewer
+**`group_representatives`** (cadence `heavy`, §17.4): the active groups that break §7.17 #4, read with §8.7's
+eligibility (A1 issue 27: a representative that is not an eligible member, a failed, refused, expired,
+filtered or cancelled target among them; no representative while a member is eligible), have fewer
 than two members, or hold two members whose jobs carry keys of one ATS board (G1, final review I2: a key that
 moved outside any run, an unmerge's re-own or a conflict's merge, is found here) are read; each is repaired
 in a transaction of its own: its members' rows (and its representative's: the FK of a new one takes
@@ -79,8 +85,10 @@ job row, and this one locks them), then the group row, and the violation is chec
 election per group per pass (`reconciler_repair`, or `eligible_again` for a group without a representative),
 followed by the revalidation of the members, which Task 18's stand-in never did; a group of fewer than two
 is dissolved; a group whose only breach is G1 is revalidated (G1 alone without a representative), and no
-election runs. Each repair is logged and counted in `DEDUP_GROUP_REPAIRS` once its transaction committed.
-Because ineligible members are never elected, repair terminates.
+election runs. An election that finds no eligible member records `all_failed`, `all_filtered` or
+`no_active_member`. The deferred targets are settled after each repair. Each repair is logged and counted
+in `DEDUP_GROUP_REPAIRS` once its transaction committed. Because ineligible members are never elected,
+repair terminates.
 
 **`regroup_run_jobs`** (node 6's grouping pass): every unmerged job with a `job_revision_occurrences` row
 whose `became_current_at ≥ runs.started_at` (the first attempt's start: the `running → running` self-edge
@@ -98,9 +106,9 @@ Every timestamp written is the database's `now()`; no function here takes a call
 convention, a deviation from the brief's `now` parameters).
 """
 
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Final
 
 from sqlalchemy.engine import Row
@@ -109,26 +117,35 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.db import ranking
 from jobhunter.db.guards import Guard
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge, representative
-from jobhunter.dedup.representative import ELIGIBLE_SQL, MemberView, eligible
-from jobhunter.dedup.shingles import TextSide, text_confirms
-from jobhunter.errors import FencedOut, InvariantViolation
-from jobhunter.geo.gazetteer import distance_km
+from jobhunter.dedup.group_rules import (
+    Choice,
+    GroupEvidence,
+    GroupView,
+    JobView,
+    choose_group,
+    choose_partner,
+    join_evidence,
+    member_view,
+    revalidation_departures,
+    same_board,
+)
+from jobhunter.dedup.representative import ELIGIBLE_SQL, TARGET_STATE_SQL, eligible
+from jobhunter.errors import FencedOut, InvariantViolation, TransitionConflict
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import DEDUP_GROUP_REPAIRS
 from jobhunter.quota import ledger
 from jobhunter.scoring import filters
-from jobhunter.sources.parsing.locations import Candidate, Location
+from jobhunter.scoring.targets import DENIED
+from jobhunter.sources.parsing.locations import Location
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.runs import RunOwner
 
-G4_TITLE: Final = 0.85
 CANDIDATE_DAYS: Final = 45
-MAX_MEMBERS: Final = 10
-G2_KM: Final = 25.0
 GROUPING_COUNTERS: Final = ("groups_formed", "groups_changed", "elections")
 # An info alert, subject `job:<id>` (Ruling T20-b), resolved when the job leaves its group (`representative`).
 AMBIGUOUS_GROUPING: Final = representative.AMBIGUOUS_GROUPING
@@ -141,7 +158,6 @@ REP_INACTIVE: Final = "rep_inactive"
 RECONCILER_REPAIR: Final = "reconciler_repair"
 ELIGIBLE_AGAIN: Final = "eligible_again"
 _LOCK_ROUNDS: Final = 3  # read-then-lock rounds before a set that keeps changing is an invariant breach
-_DIGITS: Final = 4  # the precision of a score in a member's evidence
 
 _JOB: Final = q("SELECT company_key, first_seen_at FROM jobs WHERE id = :job AND merged_into_job_id IS NULL")
 # The company lock's key space: the two-key form `(COMPANY_LOCK_NAMESPACE, hashtext(company_key))` keeps it
@@ -159,7 +175,7 @@ _CANDIDATES: Final = q(
     "ORDER BY c.id"
 )
 _VIEWS: Final = q(
-    "SELECT j.id, j.company_key, j.title_norm, j.seniority_tokens, j.locations, j.location_kind, "
+    "SELECT j.id, j.company_key, j.title_norm, j.seniority_tokens, j.locations, j.location_kind, "  # noqa: S608
     "j.completeness, coalesce(r.description_text, '') AS description_text, j.first_seen_at, j.availability, "
     "coalesce((SELECT min(s.precedence_rank) FROM sources s WHERE s.id = ANY(j.source_ids)), :worst) "
     "AS source_rank, "
@@ -168,9 +184,9 @@ _VIEWS: Final = q(
     "ARRAY(SELECT DISTINCT o.normalized ->> 'requisition_id' FROM postings p "
     "JOIN posting_observations o ON o.id = p.latest_observation_id WHERE p.job_id = j.id "
     "AND o.normalized ->> 'requisition_id' IS NOT NULL) AS requisition_ids, "
-    "j.merged_into_job_id IS NOT NULL AS merged "
-    "FROM jobs j LEFT JOIN job_revisions r ON r.id = j.current_revision_id "
-    "WHERE j.id = ANY(CAST(:ids AS bigint[]))"
+    f"j.merged_into_job_id IS NOT NULL AS merged, {TARGET_STATE_SQL} "
+    "FROM jobs j JOIN active_config ac ON ac.id = 1 "
+    "LEFT JOIN job_revisions r ON r.id = j.current_revision_id WHERE j.id = ANY(CAST(:ids AS bigint[]))"
 )
 _SIMILARITY: Final = q(
     "SELECT t.id, similarity(CAST(:title AS text), t.title) AS similarity "
@@ -224,9 +240,11 @@ _CHANGED_IN_RUN: Final = q(
     "SELECT c.job_id FROM changed c JOIN jobs j ON j.id = c.job_id WHERE j.merged_into_job_id IS NULL "
     "ORDER BY c.job_id"
 )
-# §7.17 #4 as it reads in M1, a group of fewer than two members, and two members on one ATS board (G1).
+# §7.17 #4 (with §8.7's eligibility over `ac`), a group of fewer than two members, and two members on one ATS
+# board (G1).
 _VIOLATIONS: Final = q(
-    "SELECT g.id FROM duplicate_groups g WHERE g.status = 'active' AND ("  # noqa: S608 (constants only)
+    "SELECT g.id FROM duplicate_groups g JOIN active_config ac ON ac.id = 1 "  # noqa: S608 (constants only)
+    "WHERE g.status = 'active' AND ("
     "(SELECT count(*) FROM duplicate_group_members m WHERE m.group_id = g.id) < 2 "
     "OR EXISTS (SELECT 1 FROM duplicate_group_members m1 JOIN duplicate_group_members m2 "
     "ON m2.group_id = m1.group_id AND m2.job_id > m1.job_id "
@@ -242,216 +260,156 @@ _VIOLATIONS: Final = q(
 log = get_logger("jobhunter.dedup.groups")
 
 
-# ---- the rules ------------------------------------------------------------------------------------------
+# ---- deferral (§8.7 L3261; M3 Task 15) -------------------------------------------------------------------
+
+# The states a target enters `deferred_duplicate` from.
+ENTERING_STATES: Final = ("pending", "budget_deferred")
 
 
 @dataclass(frozen=True)
-class JobView:
-    """What the grouping rules read of a job (module docstring)."""
+class MemberRow:
+    """What §8.7's deferral reads of a member, or of the representative: its job, its membership's
+    `score_individually`, and the facts whose conflict blocks a deferral (the structured work-mode set, the
+    structured employment types, the seniority tokens)."""
+
+    job_id: int
+    score_individually: bool
+    work_mode_possible: frozenset[str]
+    work_mode_source: str
+    employment_types: frozenset[str]
+    employment_source: str
+    seniority_tokens: frozenset[str]
+
+
+@dataclass(frozen=True)
+class TargetRow:
+    """A member's target as the group events read it: its id, state, override, reason and group."""
 
     id: int
-    company_key: str
-    title_norm: str
-    seniority_tokens: frozenset[str]
-    locations: tuple[Location, ...]
-    location_kind: str
-    completeness: str
-    description_text: str
-    first_seen_at: datetime
-    availability: str
-    source_rank: int
-    ats_boards: frozenset[str]  # `<type>:<board>` of its `ats:` keys
-    requisition_ids: frozenset[str]
-    merged: bool
+    state: str
+    override: str
+    state_reason: str | None
+    deferred_group_id: int | None
 
 
-@dataclass(frozen=True)
-class GroupEvidence:
-    """Why a pair satisfies G1-G5: the title similarity, the G5 score, the G2 rule and a requisition match."""
-
-    title_similarity: float
-    text_score: float
-    location_rule: str
-    requisition_match: bool
-
-    def as_json(self, against_job_id: int, *, ambiguous: Sequence[int] = ()) -> dict[str, JSONValue]:
-        """The membership's `evidence`: these values, validated against `against_job_id`."""
-        evidence: dict[str, JSONValue] = {
-            "against_job_id": against_job_id,
-            "title_similarity": round(self.title_similarity, _DIGITS),
-            "text_score": round(self.text_score, _DIGITS),
-            "location_rule": self.location_rule,
-            "requisition_match": self.requisition_match,
-        }
-        if ambiguous:
-            evidence["ambiguous_group_ids"] = list[JSONValue](ambiguous)
-        return evidence
+def _structured_differ(a: frozenset[str], a_source: str, b: frozenset[str], b_source: str) -> bool:
+    return a_source == b_source == "structured" and a != b
 
 
-def _places(view: JobView) -> list[Candidate]:
-    return [
-        c for location in view.locations if location.resolution != "unresolved" for c in location.candidates
-    ]
-
-
-def location_rule(a: JobView, b: JobView) -> str | None:
-    """The G2 rule the pair satisfies (module docstring), or `None`."""
-    if a.location_kind == b.location_kind == "remote":
-        return "both_remote"
-    if a.location_kind == b.location_kind == "country_wide":
-        return "both_country_wide"
-    places_a, places_b = _places(a), _places(b)
-    if not places_a or not places_b:
-        return None
-    if {c.gazetteer_id for c in places_a} & {c.gazetteer_id for c in places_b}:
-        return "shared_place"
-    if all(distance_km(x.lat, x.lon, y.lat, y.lon) <= G2_KM for x in places_a for y in places_b):
-        return "within_25km"
-    return None
-
-
-def compatible_location(a: JobView, b: JobView) -> bool:
-    """G2: the two jobs' locations are compatible."""
-    return location_rule(a, b) is not None
-
-
-def same_board(a: JobView, b: JobView) -> bool:
-    """G1 fails: both jobs carry a key of one ATS board."""
-    return bool(a.ats_boards & b.ats_boards)
-
-
-def _side(view: JobView) -> TextSide:
-    return TextSide(view.description_text, "full" if view.completeness == "full" else "partial")
-
-
-def confirms(a: JobView, b: JobView, title_similarity: float) -> GroupEvidence | None:
-    """G2-G5 of the pair (the test against a representative); `None` when one fails."""
-    rule = location_rule(a, b)
-    if rule is None or a.seniority_tokens != b.seniority_tokens or title_similarity < G4_TITLE:
-        return None
-    confirmed, score = text_confirms(_side(a), _side(b))
-    if not confirmed:
-        return None
-    return GroupEvidence(title_similarity, score, rule, bool(a.requisition_ids & b.requisition_ids))
-
-
-def pair_evidence(a: JobView, b: JobView, title_similarity: float) -> GroupEvidence | None:
-    """G1-G5 of the pair (module docstring); `None` when one fails."""
-    return None if same_board(a, b) else confirms(a, b, title_similarity)
-
-
-def revalidation_departures(
-    rep: JobView | None, others: Sequence[JobView], similarity: Mapping[int, float]
-) -> tuple[int, ...]:
-    """The members that leave a revalidation (module docstring): of `others` (every member but the
-    representative `rep`, in the order they joined; `similarity` of each title to `rep`'s), those that fail
-    G2-G5 against `rep`, then those that fail G1 against `rep` or a member that stays before them. Without a
-    representative, G1 alone."""
-    confirmed = [
-        view for view in others if rep is None or confirms(view, rep, similarity[view.id]) is not None
-    ]
-    staying: list[JobView] = [] if rep is None else [rep]
-    on_a_board: set[int] = set()
-    for view in confirmed:
-        if any(same_board(view, kept) for kept in staying):
-            on_a_board.add(view.id)
-        else:
-            staying.append(view)
-    confirmed_ids = {view.id for view in confirmed}
-    return tuple(view.id for view in others if view.id not in confirmed_ids or view.id in on_a_board)
-
-
-@dataclass(frozen=True)
-class GroupView:
-    """An active group as formation reads it: its representative (or none) and its members."""
-
-    group_id: int
-    representative: int | None
-    members: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class Choice:
-    """The group a job joins, its evidence against the representative, and every group it qualified for
-    (the chosen one first)."""
-
-    group_id: int
-    evidence: GroupEvidence
-    qualifying: tuple[int, ...]
-
-
-def join_evidence(
-    a: JobView,
-    group: GroupView,
-    views: Mapping[int, JobView],
-    *,
-    different: Collection[int],
-    similarity: Mapping[int, float],
-) -> GroupEvidence | None:
-    """Whether `a` may be in `group` (module docstring): G1 and no `different` decision against every other
-    member, fewer than `MAX_MEMBERS` others, and G2-G5 against the representative; its evidence or `None`."""
-    others = [member for member in group.members if member != a.id]
-    if group.representative is None or group.representative == a.id or len(others) >= MAX_MEMBERS:
-        return None
-    if any(member in different or same_board(a, views[member]) for member in others):
-        return None
-    return confirms(a, views[group.representative], similarity[group.representative])
-
-
-def choose_group(
-    a: JobView,
-    groups: Iterable[GroupView],
-    views: Mapping[int, JobView],
-    *,
-    different: Collection[int],
-    similarity: Mapping[int, float],
-) -> Choice | None:
-    """The group `a` joins: of those it qualifies for, the best text score, then the lowest id."""
-    qualifying = [
-        (evidence, group.group_id)
-        for group in groups
-        if (evidence := join_evidence(a, group, views, different=different, similarity=similarity))
-        is not None
-    ]
-    if not qualifying:
-        return None
-    qualifying.sort(key=lambda found: (-found[0].text_score, found[1]))
-    return Choice(qualifying[0][1], qualifying[0][0], tuple(group_id for _, group_id in qualifying))
-
-
-def choose_partner(
-    a: JobView,
-    candidates: Iterable[JobView],
-    *,
-    different: Collection[int],
-    similarity: Mapping[int, float],
-) -> tuple[JobView, GroupEvidence] | None:
-    """The ungrouped candidate `a` forms a new group with: G1-G5, no `different` decision, the best text
-    score, then the lowest id."""
-    found = [
-        (evidence, candidate)
-        for candidate in candidates
-        if candidate.id != a.id
-        and candidate.id not in different
-        and (evidence := pair_evidence(a, candidate, similarity[candidate.id])) is not None
-    ]
-    if not found:
-        return None
-    evidence, partner = min(found, key=lambda pair: (-pair[0].text_score, pair[1].id))
-    return partner, evidence
-
-
-def member_view(view: JobView) -> MemberView:
-    """The election's view of a job (`representative.member_view`)."""
-    return representative.member_view(
-        job_id=view.id,
-        availability=view.availability,
-        completeness=view.completeness,
-        source_rank=view.source_rank,
-        description_length=len(view.description_text),
-        first_seen_at=view.first_seen_at,
-        merged=view.merged,
+def conflicting_facts(member: MemberRow, representative: MemberRow) -> bool:
+    """Whether the member has a conflicting scoring-relevant fact against the representative (L3261):
+    different structured work-mode sets, different structured employment types (a set that is not
+    structured on both sides says nothing), or different seniority tokens."""
+    return (
+        _structured_differ(
+            member.work_mode_possible,
+            member.work_mode_source,
+            representative.work_mode_possible,
+            representative.work_mode_source,
+        )
+        or _structured_differ(
+            member.employment_types,
+            member.employment_source,
+            representative.employment_types,
+            representative.employment_source,
+        )
+        or member.seniority_tokens != representative.seniority_tokens
     )
+
+
+def deferral_eligible(member: MemberRow, representative: MemberRow, *, override: str) -> bool:
+    """§8.7's deferral without the entering states, the predicate a target stays `deferred_duplicate` under
+    (Codex r1 #36, r3 B14): the member is not the representative, its target's `override` is `none`, its
+    membership is not `score_individually`, and it has no conflicting fact against the representative.
+    `targets.DEFERRAL_ELIGIBLE_SQL` is the same predicate in SQL."""
+    return (
+        member.job_id != representative.job_id
+        and override == "none"
+        and not member.score_individually
+        and not conflicting_facts(member, representative)
+    )
+
+
+def deferrable(member: MemberRow, representative: MemberRow, target: TargetRow | None) -> bool:
+    """L3261 verbatim, the predicate for entering deferral: `deferral_eligible` and the target `pending` or
+    `budget_deferred` (no target: nothing to defer)."""
+    return (
+        target is not None
+        and deferral_eligible(member, representative, override=target.override)
+        and target.state in ENTERING_STATES
+    )
+
+
+# The targets deferred to the group, in id order.
+_DEFERRED_TO: Final = q(
+    "SELECT id, job_id, state, override, state_reason, deferred_group_id FROM score_targets "
+    "WHERE deferred_group_id = :group AND state = 'deferred_duplicate' ORDER BY id"
+)
+# The members of the group among `:ids`, with what the deferral reads of them.
+_MEMBER_ROWS: Final = q(
+    "SELECT j.id, m.score_individually, j.work_mode_possible, j.work_mode_source, j.employment_types, "
+    "j.employment_source, j.seniority_tokens FROM duplicate_group_members m JOIN jobs j ON j.id = m.job_id "
+    "WHERE m.group_id = :group AND m.job_id = ANY(CAST(:ids AS bigint[]))"
+)
+
+
+def _member_row(row: Row[tuple[object, ...]]) -> MemberRow:
+    return MemberRow(
+        job_id=int(row.id),
+        score_individually=bool(row.score_individually),
+        work_mode_possible=frozenset(row.work_mode_possible),
+        work_mode_source=str(row.work_mode_source),
+        employment_types=frozenset(row.employment_types),
+        employment_source=str(row.employment_source),
+        seniority_tokens=frozenset(row.seniority_tokens),
+    )
+
+
+async def settle_deferred(conn: AsyncConnection, group_id: int) -> tuple[int, ...]:
+    """After a group event (a member left, was split off or merged away, the group dissolved, its
+    representative changed), in the group transaction, which holds the members' rows and the group row: a
+    target deferred to the group (`deferred_group_id`) stays deferred while its job is still a member of the
+    active group and `deferral_eligible` holds against the group's representative, with the target's
+    `override`; any other moves `deferred_duplicate → pending` through `transition` (`deferred_group_id`
+    cleared on exit; its reason kept but the denial's, Ruling T13-c). The targets moved."""
+    deferred = (await conn.execute(_DEFERRED_TO, {"group": group_id})).all()
+    if not deferred:
+        return ()
+    group = (await conn.execute(_GROUP, {"group": group_id})).one()
+    rep_id = group.representative_job_id if group.status == "active" else None
+    ids = sorted({int(row.job_id) for row in deferred} | ({int(rep_id)} if rep_id is not None else set()))
+    rows = {
+        int(row.id): _member_row(row)
+        for row in await conn.execute(_MEMBER_ROWS, {"group": group_id, "ids": ids})
+    }
+    rep = None if rep_id is None else rows.get(int(rep_id))
+    moved: list[int] = []
+    for row in deferred:
+        target = TargetRow(
+            int(row.id), str(row.state), str(row.override), row.state_reason, row.deferred_group_id
+        )
+        member = rows.get(int(row.job_id))
+        if (
+            rep is not None
+            and member is not None
+            and deferral_eligible(member, rep, override=target.override)
+        ):
+            continue
+        try:
+            await transition(
+                conn,
+                "score_targets",
+                target.id,
+                ["deferred_duplicate"],
+                "pending",
+                reason=CLEAR_REASON if target.state_reason == DENIED else None,
+            )
+        except TransitionConflict:
+            continue  # another transaction moved it since the read (a sweep's undeferring half): left alone
+        moved.append(target.id)
+    if moved:
+        log.info("duplicate_group_targets_undeferred", group_id=group_id, target_ids=moved)
+    return tuple(moved)
 
 
 # ---- reading and writing --------------------------------------------------------------------------------
@@ -474,6 +432,8 @@ def _view(row: Row[tuple[object, ...]]) -> JobView:
         ats_boards=frozenset(row.ats_boards),
         requisition_ids=frozenset(row.requisition_ids),
         merged=bool(row.merged),
+        target_state=None if row.target_state is None else str(row.target_state),
+        has_tuple=bool(row.has_tuple),
     )
 
 
@@ -648,6 +608,7 @@ class _Regroup:
     left: list[int] = field(default_factory=list)
     reelected: bool = False
     wrote: bool = False
+    touched: set[int] = field(default_factory=set)  # the groups a member left, joined or re-elected in
 
     def effect(
         self, group_id: int | None, *, joined: bool = False, created: bool = False, ambiguous: bool = False
@@ -687,6 +648,7 @@ class _Regroup:
         await _leave(self.conn, group_id, [job_id], reason=reason)
         self.left.append(job_id)
         self.wrote = True
+        self.touched.add(group_id)
         if self.groups.status[group_id] == "active" and len(self.groups.members[group_id]) - 1 < 2:
             self.left.extend(await representative.dissolve(self.conn, group_id, reason=reason))
         self.groups = await _read_groups(self.conn, self.locked.held)
@@ -694,7 +656,8 @@ class _Regroup:
     async def _representative(self, group_id: int, a: JobView) -> GroupEffect:
         """The job represents its group and its content changed: revalidate, or re-elect if it is not
         eligible any more."""
-        elected = not eligible(a.availability, a.merged)
+        elected = not eligible(a.availability, a.merged, a.target_state, has_tuple=a.has_tuple)
+        self.touched.add(group_id)
         if elected:
             left = await _elect(self.conn, group_id, reason=REP_INACTIVE)
             self.wrote = True
@@ -757,6 +720,7 @@ class _Regroup:
         await self.conn.execute(_JOIN, {"group": choice.group_id, "job": a.id, "evidence": evidence})
         await self.conn.execute(_IN_GROUP, {"group": choice.group_id, "jobs": [a.id]})
         self.wrote = True
+        self.touched.add(choice.group_id)
         log.info("duplicate_group_joined", group_id=choice.group_id, job_id=a.id)
         if ambiguous:  # recorded once, when the job joins; a regroup that confirms it raises nothing
             await raise_alert(
@@ -775,7 +739,7 @@ class _Regroup:
         if (
             a.completeness == "full"
             and self.views[rep].completeness == "partial"
-            and eligible(a.availability, a.merged)
+            and eligible(a.availability, a.merged, a.target_state, has_tuple=a.has_tuple)
         ):
             left = await _appoint(self.conn, choice.group_id, a.id, reason=FULLER_MEMBER_JOINED)
             self.left.extend(left)
@@ -789,11 +753,12 @@ class _Regroup:
         return self.effect(choice.group_id, joined=True, ambiguous=ambiguous)
 
     async def _form(self, a: JobView, partner: JobView, evidence: GroupEvidence) -> GroupEffect:
-        elected = representative.elect([member_view(a), member_view(partner)])
+        pair = [member_view(a), member_view(partner)]
+        elected = representative.elect(pair)
         rep = None if elected is None else elected.job_id
         params = {
             "rep": rep,
-            "reason": representative.NO_ACTIVE_MEMBER if rep is None else None,
+            "reason": representative.unscorable_reason(pair) if rep is None else None,
             "election": INITIAL,
         }
         group_id = int((await self.conn.execute(_INSERT_GROUP, params)).scalar_one())
@@ -827,6 +792,8 @@ async def regroup_job(conn: AsyncConnection, job_id: int, *, guard: Guard) -> Gr
     regroup = _Regroup(conn, job_id, locked)
     effect = await regroup.run()
     if regroup.wrote:
+        for group_id in sorted(regroup.touched):  # the deferred targets after the group events
+            await settle_deferred(conn, group_id)
         await ranking.bump(conn)
     return effect
 
@@ -875,12 +842,12 @@ async def leave_group(conn: AsyncConnection, job_id: int, *, reason: str, held: 
     if unheld := sorted(set(member_ids) - set(held)):
         raise InvariantViolation(f"group {group_id}: the rows of jobs {unheld} are not locked")
     await _leave(conn, group_id, [job_id], reason=reason)
-    if group.status != "active":
-        return
-    if len(member_ids) - 1 < 2:
-        await representative.dissolve(conn, group_id, reason=reason)
-    elif group.representative_job_id == job_id:
-        await _elect(conn, group_id, reason=reason)
+    if group.status == "active":
+        if len(member_ids) - 1 < 2:
+            await representative.dissolve(conn, group_id, reason=reason)
+        elif group.representative_job_id == job_id:
+            await _elect(conn, group_id, reason=reason)
+    await settle_deferred(conn, group_id)
 
 
 async def _lock_group(
@@ -920,6 +887,7 @@ async def split_member(conn: AsyncConnection, group_id: int, job_id: int) -> Non
         await representative.dissolve(conn, group_id, reason=SPLIT)
     elif group.representative_job_id == job_id:
         await _elect(conn, group_id, reason=SPLIT)
+    await settle_deferred(conn, group_id)  # the split member's target `deferred_duplicate → pending`
     await ranking.bump(conn)
 
 
@@ -931,7 +899,7 @@ async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
 
     Raises `LookupError` for a group that does not exist, `InvariantViolation` for one that is not active or
     has no representative, and `FencedOut` for a fenced member, having written nothing."""
-    scopes = await filters.active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3)
+    active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3)
     group, member_ids, held = await _lock_group(conn, group_id, ())
     rep = group.representative_job_id
     if rep is None:
@@ -952,7 +920,7 @@ async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
             locked=held,
         )
     await merge.recompute_rollups(conn, into)
-    await filters.refilter_job(conn, into, scopes)
+    await filters.refilter_job_live(conn, into, active=active)  # the det-facts change hook (Task 15)
     log.info("duplicate_group_confirmed", group_id=group_id, into_job_id=into, merged=len(member_ids) - 1)
     await ranking.bump(conn)
     return into
@@ -1021,6 +989,7 @@ async def repair_group(conn: AsyncConnection, group_id: int, *, guard: Guard) ->
         await _revalidate(conn, group_id, None if rep is None else int(rep))
     else:
         return False
+    await settle_deferred(conn, group_id)
     log.info("duplicate_group_repaired", group_id=group_id, reason=reason, representative_job_id=rep)
     await ranking.bump(conn)
     return True
