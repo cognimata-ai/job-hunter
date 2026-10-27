@@ -26,7 +26,6 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
-from jobhunter.graphs.score.nodes import rubric_of
 from jobhunter.llm import budget, fake, spend_ledger
 from jobhunter.llm import gateway as gateway_mod
 from jobhunter.llm.bounds import text_input_bound
@@ -43,6 +42,7 @@ from jobhunter.llm.prompts.render import (
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import CAP_REACHED_ALERT, CallOutcome, Reservation
 from jobhunter.scoring import cycles, targets
+from jobhunter.scoring.steps import rubric_of
 from jobhunter.scoring.targets import ScoreNowRefused
 from jobhunter.types import JSONValue, get_list, get_object, get_str
 from jobhunter.worker.tasks import defer_in_tx

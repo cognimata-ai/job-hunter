@@ -30,6 +30,10 @@ the `llm_calls` row (`reserved`, with the durable owner and, for an online try, 
 exceed the allocation, or names a finished operation) is stored without it and debits the bucket;
 non-scoring touches neither.
 
+**A batch** (`reserve_batch`, M3 Task 16) reserves every item of a submission at once, under one owner lock,
+one month lock and its bulk row, after the allocation check of L1189 under those locks; each item is
+admitted against the hard cap as any other reservation.
+
 **The dispatch marker** (`mark_dispatched`) commits `reserved → dispatched` on both rows under the owner lock;
 for a score attempt it also counts the try (`http_calls`, `logical_calls` on a logical call's first try) and
 charges the attempt and, the first time, its target (§9.4.2, L2863). `mark_batch_dispatched` does the same for
@@ -87,7 +91,7 @@ from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.llm import budget
 from jobhunter.llm.bounds import native_pdf_extra_usd
 from jobhunter.llm.budget import BudgetParams, BudgetRow, Purpose, PurposeClass, SettleOutcome
-from jobhunter.llm.errors import BudgetExhausted, ClaimLost
+from jobhunter.llm.errors import BudgetExhausted, BulkAllocationExceeded, ClaimLost
 from jobhunter.llm.pricing import Effort, Model, Usage, settled_usd, worst_case_usd
 from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert, resolve_alerts
 from jobhunter.observability.logging import get_logger
@@ -933,6 +937,176 @@ async def reserve(
         model=model,
         batch=batch,
     )
+
+
+# A batch preparation's bulk row (§6.9.3 L1189): the accounts its allocation check reads, under the lock of
+# step 7 every writer of them takes.
+_LOCK_BULK_ACCOUNTS = q(
+    "SELECT state, budget_usd, spent_usd, followup_held_usd FROM bulk_operations WHERE id = :id "
+    "FOR NO KEY UPDATE"
+)
+
+
+@dataclass(frozen=True)
+class BatchItemReservation:
+    """One item of a batch reservation (`reserve_batch`): its target, its batch attempt and `batch_items`
+    row, the input bound of its rendered request, the request's hashes, and the ids of its inputs."""
+
+    target_id: int
+    attempt_id: int
+    batch_item_id: int
+    input_tokens_bound: int
+    rendered_prompt_sha256: bytes
+    prefix_sha256: bytes | None
+    input_refs: Mapping[str, JSONValue]
+
+
+async def reserve_batch(
+    conn: AsyncConnection,
+    *,
+    owner: BatchSubmissionOwner,
+    items: Sequence[BatchItemReservation],
+    model: Model,
+    effort: Effort,
+    max_tokens: int,
+    execution_config_id: int,
+    prompt_template_version: str,
+    bulk_operation_id: int,
+    hold_usd: Decimal,
+    now: datetime,
+) -> list[Reservation]:
+    """Reserve every item of a batch submission in the caller's transaction (plan Task 16, §10.10 lifecycle
+    step 1, L1159, L1187-1191, Codex r1 #22, r2 B10); the reservations in `items`' order.
+
+    In the §3.3.3 order, once for the whole batch: `active_config` (`current_params`), the owner (the
+    submission `FOR SHARE` in its expected state, and no active global purge fence), the month row (created
+    if new, locked and accrued) and the bulk row (`FOR NO KEY UPDATE`, step 7). Then, under those locks, the
+    allocation check of L1189, `spent_usd + followup_held_usd + Σ worst cases + len(items) x hold_usd ≤
+    budget_usd` on an `active` operation, else `BulkAllocationExceeded` before anything is written (the
+    preparation sized the batch under the same locks, so this never fires after it). Then per item: its worst
+    case at batch prices (`pricing.worst_case_usd(..., batch=True)`), the admission against the hard cap
+    (L1159, "including batches"), else `BudgetExhausted` (the caller's transaction rolls back every item
+    before it: nothing of the batch is written), the ledger row (`batch`, funded by `bulk_operation_id`,
+    `logical_call_no` NULL) and the `llm_calls` row (`transport = 'batch'`, `transport_try` 1, round 0, the
+    item's attempt, target and `batch_items` row, the owner in `input_refs`). The counters move by the sum
+    (scoring, never the bucket: the allocation pays) and the bulk row's `spent_usd` with them; then the
+    `llm.cap_80pct` check. `ValueError`, before anything is written, for an empty batch, a bulk operation
+    that is not the submission's own, or `input_refs` that set the owner or the deadline."""
+    if not items:
+        raise ValueError("a batch reservation names at least one item")
+    for item in items:
+        if reserved_keys := _RESERVED_REFS & set(item.input_refs):
+            raise ValueError(f"input_refs must not set {sorted(reserved_keys)}: the owner is reserve_batch's")
+    p = await current_params(conn)  # 0. active_config FOR SHARE
+    await _lock_owner(conn, owner)  # 1. the submission FOR SHARE in its expected state
+    await _check_own_bulk(conn, owner, bulk_operation_id)
+    month = budget.month_of(now)
+    await ensure_month(conn, month, p, now)
+    row = await lock_month(conn, month, p, now=now)  # 2. llm_budget FOR UPDATE, accrued
+    bulk = (await conn.execute(_LOCK_BULK_ACCOUNTS, {"id": bulk_operation_id})).one()  # 3. step 7
+    worst = [
+        worst_case_usd(model, input_tokens_bound=item.input_tokens_bound, max_tokens=max_tokens, batch=True)
+        for item in items
+    ]
+    needed = bulk.spent_usd + bulk.followup_held_usd + sum(worst) + len(items) * hold_usd
+    if bulk.state != "active" or needed > bulk.budget_usd:
+        shortfall = max(_ZERO, needed - bulk.budget_usd)
+        log.error(
+            "llm_bulk_allocation_exceeded",
+            bulk_operation_id=bulk_operation_id,
+            state=bulk.state,
+            items=len(items),
+            shortfall_usd=str(shortfall),
+        )
+        raise BulkAllocationExceeded(bulk_operation_id, shortfall)
+    reservations: list[Reservation] = []
+    durable = owner.durable()
+    for item, r in zip(items, worst, strict=True):
+        if not budget.admits(row, r, "scoring", p):  # 4. the hard cap, every item (L1159)
+            room = budget.headroom(row, "scoring", p)
+            log.warning(
+                "llm_budget_exhausted",
+                month=month.isoformat(),
+                purpose="generate",
+                purpose_class="scoring",
+                reserved_usd=str(r),
+                headroom_usd=str(room),
+                batch_items=len(items),
+            )
+            raise BudgetExhausted("scoring", room)
+        ledger_id = (
+            await conn.execute(
+                _INSERT_ENTRY,
+                {
+                    "month": month,
+                    "purpose": "generate",
+                    "eval_run": False,
+                    "purpose_class": "scoring",
+                    "model": model,
+                    "reserved_usd": r,
+                    "input_tokens_bound": item.input_tokens_bound,
+                    "batch": True,
+                    "bulk_operation_id": bulk_operation_id,
+                    "admitted_cap_usd": row.cap_usd,
+                    "admitted_buffer_usd": row.overrun_buffer_usd,
+                    "counted_before_usd": row.counted_usd,
+                    "now": now,
+                },
+            )
+        ).scalar_one()
+        call_id = (
+            await conn.execute(
+                _INSERT_CALL,
+                {
+                    "purpose": "generate",
+                    "attempt_id": item.attempt_id,
+                    "target_id": item.target_id,
+                    "round": 0,
+                    "logical_call_no": None,
+                    "max_tokens_stage": "first",
+                    "transport_try": 1,
+                    "profile_draft_id": None,
+                    "eval_run_id": None,
+                    "golden_case_id": None,
+                    "execution_config_id": execution_config_id,
+                    "model": model,
+                    "effort": effort,
+                    "max_tokens": max_tokens,
+                    "transport": "batch",
+                    "batch_item_id": item.batch_item_id,
+                    "prompt_template_version": prompt_template_version,
+                    "rendered_prompt_sha256": item.rendered_prompt_sha256,
+                    "prefix_sha256": item.prefix_sha256,
+                    "input_refs": {**item.input_refs, "owner": durable},
+                    "input_tokens_bound": item.input_tokens_bound,
+                    "ledger_id": ledger_id,
+                    "now": now,
+                },
+            )
+        ).scalar_one()
+        budget.apply_count(row, r, "scoring", bucket=False)  # the allocation pays, never the bucket
+        reservations.append(
+            Reservation(
+                ledger_id=int(ledger_id),
+                llm_call_id=int(call_id),
+                month=month,
+                reserved_usd=r,
+                purpose_class="scoring",
+                model=model,
+                batch=True,
+            )
+        )
+    await _save(conn, row, now)
+    await _bulk_spent(conn, bulk_operation_id, sum(worst, _ZERO))
+    await _check_cap_share(conn, row)
+    log.info(
+        "llm_batch_reserved",
+        submission_id=owner.submission_id,
+        bulk_operation_id=bulk_operation_id,
+        items=len(items),
+        reserved_usd=str(sum(worst, _ZERO)),
+    )
+    return reservations
 
 
 async def _count_tries(conn: AsyncConnection, attempt_ids: Sequence[int], *, logical: bool) -> None:

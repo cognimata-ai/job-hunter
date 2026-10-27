@@ -52,6 +52,19 @@ a lock the transaction holds already. A candidate the move then skips keeps its 
 claim's `publish` and `fail`) holds its row at step 5 and needs no such pre-lock: it releases right after its
 owner lock.
 
+**The holds of a submission** (§6.9.3 L1188-1190, plan Task 16):
+- `hold_per_item(conn, *, evaluation_policy_id, model_policy) -> Decimal`: one item's planning hold,
+  `p_followup x ĉ_followup`, the evaluation policy's stored `projected_critic_rate` (§11.7.4, the row's own
+  column) times `budget.c_hat_followup(model_policy)`, rounded half-up to $0.000001 (the precision of
+  `batch_items.hold_usd`, so `n x hold` is exactly the sum of `n` items' holds);
+- `add_hold(conn, bulk_operation_id, usd)` and `release_hold(conn, bulk_operation_id, usd) -> Decimal`: the
+  operation's `followup_held_usd` up, or down by at most what it holds (never below 0), under the bulk row's
+  lock (step 7); the release returns the amount given back;
+- `fits(conn, *, bulk_operation_id, worst_case_usd, hold_usd) -> bool`: L1189 / §7.17 #7, `spent_usd +
+  followup_held_usd + worst_case_usd + hold_usd ≤ budget_usd` of an `active` operation, read under the bulk
+  row's lock (`lock_accounts` returns the row's `Accounts`, whose `fits` is the same inequality, for a
+  caller that keeps the row).
+
 **The quarantined batch spend** (§6.9.4 L1199, Ruling P31). `QUARANTINED_USD_SQL` is the one statement of
 "the amount held by quarantined batch submissions": the reserved spend of the `submit_ambiguous` submissions,
 which `llm.cap_reached` names (`fail`, Task 10) and Task 17's `batches.quarantined_usd` reuses.
@@ -60,6 +73,7 @@ Nothing here logs content: ids and amounts only.
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
@@ -73,7 +87,7 @@ from jobhunter.llm import budget, spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.observability.logging import get_logger
 from jobhunter.settings.dryrun import bulk_budget
-from jobhunter.settings.model import Settings
+from jobhunter.settings.model import ModelPolicy, Settings
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
@@ -220,6 +234,83 @@ async def release_item_hold(conn: AsyncConnection, *, item_id: int) -> Decimal:
         await conn.execute(_GIVE_BACK, {"hold": released, "b": operation})
     log.info("bulk_hold_released", item_id=item_id, bulk_operation_id=int(operation), hold_usd=str(released))
     return released
+
+
+_ACCOUNTS: Final = q(
+    "SELECT state, budget_usd, spent_usd, followup_held_usd FROM bulk_operations WHERE id = :b "
+    "FOR NO KEY UPDATE"
+)
+_ADD_HOLD: Final = q("UPDATE bulk_operations SET followup_held_usd = followup_held_usd + :usd WHERE id = :b")
+_RELEASE_HOLD: Final = q(
+    "UPDATE bulk_operations SET followup_held_usd = followup_held_usd - least(followup_held_usd, :usd) "
+    "WHERE id = :b RETURNING followup_held_usd"
+)
+_CRITIC_RATE: Final = q("SELECT projected_critic_rate FROM evaluation_policies WHERE id = :p")
+
+
+async def hold_per_item(
+    conn: AsyncConnection, *, evaluation_policy_id: int, model_policy: ModelPolicy
+) -> Decimal:
+    """One item's follow-up hold under the evaluation policy and the model policy (module docstring);
+    `LookupError` for a policy that does not exist."""
+    rate = (await conn.execute(_CRITIC_RATE, {"p": evaluation_policy_id})).scalar_one_or_none()
+    if rate is None:
+        raise LookupError(f"evaluation policy {evaluation_policy_id} does not exist")
+    hold = Decimal(rate) * budget.c_hat_followup(model_policy)
+    return hold.quantize(budget.USD_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+@dataclass(frozen=True)
+class Accounts:
+    """A bulk operation's allocation accounts, as read under its row's lock."""
+
+    state: str
+    budget_usd: Decimal
+    spent_usd: Decimal
+    followup_held_usd: Decimal
+
+    def fits(self, *, worst_case_usd: Decimal, hold_usd: Decimal) -> bool:
+        """L1189 / §7.17 #7: an `active` operation and `spent_usd + followup_held_usd + worst_case_usd +
+        hold_usd ≤ budget_usd`."""
+        used = self.spent_usd + self.followup_held_usd + worst_case_usd + hold_usd
+        return self.state == "active" and used <= self.budget_usd
+
+
+async def lock_accounts(conn: AsyncConnection, bulk_operation_id: int) -> Accounts:
+    """The operation's accounts under its row's lock (`FOR NO KEY UPDATE`, step 7); `LookupError` for an
+    operation that does not exist."""
+    row = (await conn.execute(_ACCOUNTS, {"b": bulk_operation_id})).first()
+    if row is None:
+        raise LookupError(f"bulk operation {bulk_operation_id} does not exist")
+    return Accounts(row.state, row.budget_usd, row.spent_usd, row.followup_held_usd)
+
+
+async def add_hold(conn: AsyncConnection, bulk_operation_id: int, usd: Decimal) -> None:
+    """`followup_held_usd += usd` under the bulk row's lock (module docstring); `ValueError` for a negative
+    amount."""
+    if usd < 0:
+        raise ValueError("a hold is added with a non-negative amount (release_hold gives one back)")
+    await lock_accounts(conn, bulk_operation_id)
+    await conn.execute(_ADD_HOLD, {"usd": usd, "b": bulk_operation_id})
+
+
+async def release_hold(conn: AsyncConnection, bulk_operation_id: int, usd: Decimal) -> Decimal:
+    """`followup_held_usd -= usd`, never below 0, under the bulk row's lock (module docstring); the amount
+    given back. `ValueError` for a negative amount."""
+    if usd < 0:
+        raise ValueError("a hold is released with a non-negative amount")
+    before = (await lock_accounts(conn, bulk_operation_id)).followup_held_usd
+    after = (await conn.execute(_RELEASE_HOLD, {"usd": usd, "b": bulk_operation_id})).scalar_one()
+    return before - Decimal(after)
+
+
+async def fits(
+    conn: AsyncConnection, *, bulk_operation_id: int, worst_case_usd: Decimal, hold_usd: Decimal
+) -> bool:
+    """Whether a submission of these worst cases and holds fits the operation's allocation (module
+    docstring), read under the bulk row's lock."""
+    accounts = await lock_accounts(conn, bulk_operation_id)
+    return accounts.fits(worst_case_usd=worst_case_usd, hold_usd=hold_usd)
 
 
 async def release_target_hold(conn: AsyncConnection, target_id: int) -> Decimal:

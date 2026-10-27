@@ -659,25 +659,28 @@ M2_RECONCILERS = {
 }
 # The M3 reconcilers so far: `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
 # `score_targets` and `score_cycles`; Ruling P44), `expiry_sweep` and `budget_release` (Task 13,
-# `scoring.targets`), and `bulk_operations` (Task 14, `llm.bulk`, through `scoring.cycles`) and
-# `missing_targets` (Task 14, `scoring.targets`).
+# `scoring.targets`), `bulk_operations` (Task 14, `llm.bulk`, through `scoring.cycles`) and
+# `missing_targets` (Task 14, `scoring.targets`), and `batch_submissions` (Task 16, `scoring.batches`).
 M3_RECONCILERS = {
     "orphaned_cycles": ["tick"],
     "expiry_sweep": ["heavy"],
     "budget_release": ["tick"],
     "bulk_operations": ["heavy"],
     "missing_targets": ["heavy"],
+    "batch_submissions": ["tick"],
 }
 
 
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
     """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
     (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
-    anyway), the registries hold exactly the M1, M2 and M3 (so far) reconcilers with their cadences, the four
-    takeover sweeps (`operations`, `runs`, and M3 Task 11's `score_targets` and `score_cycles`), the
+    anyway), the registries hold exactly the M1, M2 and M3 (so far) reconcilers with their cadences, the five
+    takeover sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, and Task 16's
+    `batch_submissions`), the
     `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
-    `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate` and M3 Task 14's
-    `create_targets_for_tuple` (`scoring.targets`) handlers, and the failure
+    `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, M3 Task 14's
+    `create_targets_for_tuple` (`scoring.targets`) and Task 16's `batch_submit` (`scoring.batches`) handlers,
+    and the failure
     hooks of the two profile phases and of the query proposal (`embed_profile` has none: it drives no domain
     row). `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with
     `profile.operations`, which imports `profile.vectors`; `worker.main` lists neither."""
@@ -685,9 +688,10 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
 
     assert registered_by(_REGISTERING_MODULES) == {
         "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS, **M3_RECONCILERS},
-        "sweeps": ["operations", "runs", "score_cycles", "score_targets"],
+        "sweeps": ["batch_submissions", "operations", "runs", "score_cycles", "score_targets"],
         "handlers": [
             "apply_scope",
+            "batch_submit",
             "create_targets_for_tuple",
             "embed_profile",
             "extract_profile",

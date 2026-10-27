@@ -12,6 +12,9 @@ canonical sections, the rendered `<job_ad>` block, the job's `DetFacts`, its str
 description completeness, the attempt's evaluation policy, the critic's normal and light efforts (the model
 policy's), the T8 sample key and the ids every prompt records (`input_refs`). The active scope is not one of
 them: `validate_step` takes it from its caller, which reads it under `active_config FOR SHARE` (L4400).
+`rubric_of` (a `rubric_versions` row), `revision_ad` (a revision's material projection and description),
+`score_refs` and `role_prompt` build them the one way the `score_target` subgraph and the batch preparation
+(plan Task 16) share, so a batch item's params are the online generator's request for the same target.
 
 **The steps.**
 - `generate_step`: the generator call (`round` 0), the stage-1 parse with the version's parser family
@@ -60,6 +63,7 @@ reviews and the other issues. The provisional aggregation's scores are decimal s
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import cached_property
+from types import MappingProxyType
 from typing import Final, Protocol, get_args
 
 from jobhunter.llm.errors import InvalidOutput
@@ -72,6 +76,7 @@ from jobhunter.llm.prompts.render import (
     ScoreRole,
     draft_block,
     issues_block,
+    job_ad_block,
     required_facts_block,
     score_prompt,
 )
@@ -86,7 +91,7 @@ from jobhunter.scoring.facts import FactRef
 from jobhunter.scoring.filters import DetFacts
 from jobhunter.scoring.knockouts import Confirmation, derive_knockouts, required_facts
 from jobhunter.scoring.routing import DerivedOutcome
-from jobhunter.scoring.rubric import LLM_CRITERIA, Rubric
+from jobhunter.scoring.rubric import LLM_CRITERIA, RUBRIC_KEYS, Rubric
 from jobhunter.scoring.triggers import Trigger, critic_effort, evaluate
 from jobhunter.scoring.validator import (
     QUOTES_PER_REVIEW,
@@ -354,14 +359,88 @@ class Reviewed:
     det_failures: list[str] = field(default_factory=list, repr=False)
 
 
+# ---- the shared inputs of a score request ------------------------------------------------------------
+
+
+def rubric_of(weights: JSONValue, anchors: JSONValue) -> Rubric:
+    """A `rubric_versions` row as the renderer and the aggregation read it: the eight weights in §11.2's order
+    and the anchors (whose rendering orders their keys itself, `render.anchors_markdown`)."""
+    stored = get_object(weights, "")
+    if set(stored) != set(RUBRIC_KEYS):
+        raise ValueError("a stored rubric has other weights than the eight criteria")
+    ordered: dict[str, int] = {}
+    for key in RUBRIC_KEYS:
+        weight = stored[key]
+        if isinstance(weight, bool) or not isinstance(weight, int):
+            raise ValueError(f"the stored weight of {key} is no integer")
+        ordered[key] = weight
+    return Rubric(weights=MappingProxyType(ordered), anchors=MappingProxyType(get_object(anchors, "")))
+
+
+def material_strings(material: JSONValue, path: str) -> list[str]:
+    """The strings of the list at `path` of a revision's material projection (`job_revisions.llm_input`)."""
+    return [get_str(item, "") for item in get_list(material, path)]
+
+
+def revision_ad(material: JSONValue, *, completeness: str, description_text: str) -> JobAdBlock:
+    """The `<job_ad>` block of a job revision: its material projection (`llm_input`: the title, company,
+    locations, work modes and employment types with their sources) and its description."""
+    work_mode_source = get_str(material, "work_mode_source")
+    employment_source = get_str(material, "employment_source")
+    company = get_object(material, "").get("company_display")
+    return job_ad_block(
+        title=get_str(material, "title"),
+        company=company if isinstance(company, str) else None,
+        locations=material_strings(material, "locations"),
+        work_modes=[(mode, work_mode_source) for mode in material_strings(material, "work_mode_possible")],
+        employment_types=[
+            (kind, employment_source) for kind in material_strings(material, "employment_types")
+        ],
+        completeness=completeness,
+        description_text=description_text,
+    )
+
+
+def score_refs(
+    *, job_revision_id: int, profile_version_id: int, rubric_version_id: int
+) -> dict[str, JSONValue]:
+    """The ids every score request of a target records besides its prompt's own (`llm_calls.input_refs`)."""
+    return {
+        "job_revision_id": job_revision_id,
+        "profile_version_id": profile_version_id,
+        "rubric_version_id": rubric_version_id,
+    }
+
+
+def role_prompt(
+    role: ScoreRole,
+    *,
+    version: PromptVersion,
+    rubric: Rubric,
+    profile: ConfirmedProfile,
+    ad: JobAdBlock,
+    refs: Mapping[str, JSONValue],
+    **blocks: str,
+) -> RenderedPrompt:
+    """The request of a score `role` (`render.score_prompt`) with the target's `refs` added to its
+    `input_refs`: the one rendering of every step and of a batch item (module docstring)."""
+    prompt = score_prompt(role, version=version, rubric=rubric, profile=profile, ad=ad, **blocks)
+    return replace(prompt, input_refs={**prompt.input_refs, **refs})
+
+
 # ---- the steps ---------------------------------------------------------------------------------------------
 
 
 def _prompt(inputs: ScoreInputs, role: ScoreRole, **blocks: str) -> RenderedPrompt:
-    prompt = score_prompt(
-        role, version=inputs.version, rubric=inputs.rubric, profile=inputs.profile, ad=inputs.ad, **blocks
+    return role_prompt(
+        role,
+        version=inputs.version,
+        rubric=inputs.rubric,
+        profile=inputs.profile,
+        ad=inputs.ad,
+        refs=inputs.refs,
+        **blocks,
     )
-    return replace(prompt, input_refs={**prompt.input_refs, **inputs.refs})
 
 
 async def _drafted(

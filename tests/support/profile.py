@@ -388,6 +388,7 @@ PAUSABLE_MODULES: Final = (
     "jobhunter.settings.scope_apply",
     "jobhunter.profile.operations",
     "jobhunter.profile.activation",
+    "jobhunter.scoring.batches",  # the batch_submit handler's (M3 Task 16)
 )
 _PARSE_TIMEOUT_S: Final = 60.0
 _PARSE_POLL_S: Final = 0.05

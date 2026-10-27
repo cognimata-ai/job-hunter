@@ -38,7 +38,6 @@ What the nodes share:
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any, Final, Protocol, get_args
 from uuid import UUID
 
@@ -55,14 +54,13 @@ from jobhunter.graphs.score.state import CycleState, CycleUpdate, TargetState, T
 from jobhunter.llm.errors import LLMError
 from jobhunter.llm.gateway import CallContext, GatewayResult, RenderedPrompt, pinned_node_config
 from jobhunter.llm.pricing import Effort
-from jobhunter.llm.prompts.render import ScoreRole, job_ad_block, load_prompt_version, score_schema
+from jobhunter.llm.prompts.render import ScoreRole, load_prompt_version, score_schema
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import TargetAttemptOwner
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import evaluation_policy
 from jobhunter.scoring.filters import read_det_facts
 from jobhunter.scoring.routing import DerivedOutcome, Next, Route
-from jobhunter.scoring.rubric import RUBRIC_KEYS, Rubric
 from jobhunter.scoring.steps import (
     Caller,
     NoteRecord,
@@ -70,10 +68,14 @@ from jobhunter.scoring.steps import (
     StoredDraft,
     StoredNote,
     ValidationRecord,
+    material_strings,
+    revision_ad,
+    rubric_of,
+    score_refs,
 )
 from jobhunter.scoring.triggers import sample_key
 from jobhunter.scoring.validator import ParsedGenerator
-from jobhunter.types import JSONValue, get_list, get_object, get_str
+from jobhunter.types import JSONValue, get_str
 
 BEFORE_DRAFT: Final = "score.generate.before_draft"
 AFTER_DRAFT: Final = "score.generate.after_draft"
@@ -181,30 +183,11 @@ _INPUTS: Final = q(
 )
 
 
-def rubric_of(weights: JSONValue, anchors: JSONValue) -> Rubric:
-    """A `rubric_versions` row as the renderer and the aggregation read it: the eight weights in §11.2's order
-    and the anchors (whose rendering orders their keys itself, `render.anchors_markdown`)."""
-    stored = get_object(weights, "")
-    if set(stored) != set(RUBRIC_KEYS):
-        raise ValueError("a stored rubric has other weights than the eight criteria")
-    ordered: dict[str, int] = {}
-    for key in RUBRIC_KEYS:
-        weight = stored[key]
-        if isinstance(weight, bool) or not isinstance(weight, int):
-            raise ValueError(f"the stored weight of {key} is no integer")
-        ordered[key] = weight
-    return Rubric(weights=MappingProxyType(ordered), anchors=MappingProxyType(get_object(anchors, "")))
-
-
 def _effort(value: str) -> Effort:
     effort = _EFFORTS.get(value)
     if effort is None:
         raise ValueError("a model policy names an unknown effort")
     return effort
-
-
-def _strings(doc: JSONValue, path: str) -> list[str]:
-    return [get_str(item, "") for item in get_list(doc, path)]
 
 
 async def load_inputs(conn: AsyncConnection, state: TargetState) -> tuple[ScoreInputs, AttemptRow]:
@@ -227,18 +210,10 @@ async def load_inputs(conn: AsyncConnection, state: TargetState) -> tuple[ScoreI
         evaluation_policy_id=int(row.evaluation_policy_id),
     )
     material: JSONValue = row.llm_input
-    work_modes = _strings(material, "work_mode_possible")
+    work_modes = material_strings(material, "work_mode_possible")
     work_mode_source = get_str(material, "work_mode_source")
-    employment_source = get_str(material, "employment_source")
-    company = get_object(material, "").get("company_display")
-    ad = job_ad_block(
-        title=get_str(material, "title"),
-        company=company if isinstance(company, str) else None,
-        locations=_strings(material, "locations"),
-        work_modes=[(mode, work_mode_source) for mode in work_modes],
-        employment_types=[(kind, employment_source) for kind in _strings(material, "employment_types")],
-        completeness=row.description_completeness,
-        description_text=row.description_text,
+    ad = revision_ad(
+        material, completeness=row.description_completeness, description_text=row.description_text
     )
     inputs = ScoreInputs(
         version=await load_prompt_version(conn, state["prompt_schema_version_id"]),
@@ -252,11 +227,11 @@ async def load_inputs(conn: AsyncConnection, state: TargetState) -> tuple[ScoreI
         critic_effort=_effort(get_str(row.model_policy, "nodes.critic.effort")),
         critic_light_effort=_effort(get_str(row.model_policy, "critic_light_effort")),
         sample_key=sample_key(target_id=target_id, llm_tuple_id=attempt.llm_tuple_id),
-        refs={
-            "job_revision_id": attempt.job_revision_id,
-            "profile_version_id": attempt.profile_version_id,
-            "rubric_version_id": attempt.rubric_version_id,
-        },
+        refs=score_refs(
+            job_revision_id=attempt.job_revision_id,
+            profile_version_id=attempt.profile_version_id,
+            rubric_version_id=attempt.rubric_version_id,
+        ),
     )
     return inputs, attempt
 
