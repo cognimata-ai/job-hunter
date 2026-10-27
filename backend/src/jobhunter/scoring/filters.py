@@ -35,7 +35,8 @@ expiry).
 `write_result` upserts the row of a (job, scope) with `inputs_hash`, the `jobs.det_facts_hash` the result was
 computed from, and `det_algorithm_version`. `refilter_job` computes and writes a job's rows for the scopes it
 is given under the job row `FOR SHARE`: it waits for an identity transaction that holds the row `FOR UPDATE`
-and reads the facts that transaction committed.
+and reads the facts that transaction committed. `read_det_facts` reads a job's committed `DetFacts` without a
+lock (the score validation's provisional aggregation, M3 Task 9).
 
 **Completeness.** `recompute_stale` finds the unmerged jobs that lack a row for a scope of `active_scopes`, or
 whose row has an `inputs_hash` other than `jobs.det_facts_hash` or another `det_algorithm_version`, and
@@ -352,6 +353,18 @@ def _facts(row: Row[tuple[object, ...]]) -> DetFacts:
         ad_language=row.ad_language,
         posted_at_effective=row.posted_at_effective,
     )
+
+
+_READ_JOB: Final = q(_JOB)
+
+
+async def read_det_facts(conn: AsyncConnection, job_id: int) -> DetFacts:
+    """The job's `DetFacts` as they are committed, read without a lock (the score validation's provisional
+    aggregation, M3 Task 9); `LookupError` for a job that does not exist."""
+    row = (await conn.execute(_READ_JOB, {"job": job_id})).first()
+    if row is None:
+        raise LookupError(f"job {job_id} does not exist")
+    return _facts(row)
 
 
 async def _load(conn: AsyncConnection, job_id: int) -> _Loaded:

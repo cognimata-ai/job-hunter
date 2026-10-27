@@ -122,6 +122,14 @@ LLM_CACHE_READ_RATIO = Gauge(
     registry=REGISTRY,
 )
 
+# Every critic review whose returned verdict is not its derived outcome (§11.7.2 L4429): the `critic` node of
+# the score subgraph counts one after the note's transaction has committed (M3 Task 9; Task 18 pins it).
+CRITIC_VERDICT_MISMATCH = Counter(
+    "jobhunter_critic_verdict_mismatch",
+    "Critic reviews whose returned verdict differs from the derived outcome.",
+    registry=REGISTRY,
+)
+
 
 def start_metrics_server(port: int) -> None:
     """Serve `REGISTRY` over HTTP on `port` from a daemon thread."""
