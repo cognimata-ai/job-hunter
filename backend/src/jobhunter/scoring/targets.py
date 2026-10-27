@@ -150,7 +150,8 @@ RETRYABLE_STATES: Final = (
     "failed_attempts_exhausted",
 )
 # A user's move out of these states clears the reason of the state it leaves; a `pending`,
-# `deferred_duplicate` or `filtered_out` target keeps the reason it carries (a batch retry's, L2898).
+# `deferred_duplicate` or `filtered_out` target keeps the reason it carries (a batch retry's, L2898),
+# except a carried `budget_exhausted`, which `_clears` drops (Ruling T13-c).
 _REASON_CLEARED: Final = frozenset({"budget_deferred", "expired_unscored", *RETRYABLE_STATES})
 _ENTERING: Final = ("pending", "budget_deferred")
 _SCORE_NOW: Final = "score_now"
