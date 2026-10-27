@@ -41,7 +41,8 @@ count only with evidence, which in a stored result is grounded (publication drop
 `partial` (§8.9), so the completeness carries it.
 
 `ScopeRow` is a scope version (its id and its scope) and `JobRow` the job the instance belongs to (its id,
-`det_results.job_id`).
+`det_results.job_id`). `job_sources(conn, job_id)` reads a job's `sources` from its `field_provenance` (Task
+10: each field's source instance's `source_id`; a field no observation supplied has none).
 """
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -161,6 +162,26 @@ def det_inputs(
     """The `det_inputs` document of an instance and its `det_inputs_hash` (module docstring)."""
     document = DetInputs(job_inputs(det, sources), scope_inputs(scope)).to_json()
     return document, content_hash(document)
+
+
+# The source of each field an instance reads: the `source_id` of the source instance its provenance names (a
+# field no observation supplied, rule `none`, has none).
+_SOURCES: Final = q(
+    "SELECT e.key, s.source_id FROM jobs j CROSS JOIN LATERAL jsonb_each(j.field_provenance) e "
+    "JOIN source_instances s ON s.id = CAST(e.value ->> 'source_instance_id' AS bigint) "
+    "WHERE j.id = :job AND e.key = ANY(CAST(:fields AS text[])) AND e.value ->> 'rule' <> 'none'"
+)
+
+
+async def job_sources(conn: AsyncConnection, job_id: int) -> dict[str, list[str]]:
+    """The `sources` of a job's instances (module docstring, Inputs): for each field of `JOB_INPUT_FIELDS`,
+    the source id of the observation `jobs.field_provenance` names for it, read without a lock (the callers
+    of `compute_and_write` hold the job row)."""
+    rows = await conn.execute(_SOURCES, {"job": job_id, "fields": list(JOB_INPUT_FIELDS)})
+    found: dict[str, list[str]] = {}
+    for row in rows:
+        found.setdefault(str(row.key), []).append(str(row.source_id))
+    return found
 
 
 # ---- writing an instance -----------------------------------------------------------------------------------

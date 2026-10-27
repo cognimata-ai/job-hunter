@@ -19,14 +19,19 @@ log = get_logger("jobhunter.worker.heartbeat")
 
 
 async def heartbeat_loop(
-    beat: Callable[[], Awaitable[bool]], *, period_s: float, on_lost: Callable[[], None]
+    beat: Callable[[], Awaitable[bool]],
+    *,
+    period_s: float,
+    on_lost: Callable[[], None],
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
     """Beat every `period_s` (the first beat one period after the start) until a beat fails or is refused.
+    `sleep` waits out each period (`asyncio.sleep`; a test injects its own clock, M3 Task 10).
 
     Cancelling the task that runs it stops it; `CancelledError` is no `Exception` and is never caught here.
     """
     while True:
-        await asyncio.sleep(period_s)
+        await sleep(period_s)
         try:
             alive = await beat()
         except Exception as exc:

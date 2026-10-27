@@ -56,8 +56,6 @@ from jobhunter.llm.errors import LLMError
 from jobhunter.llm.gateway import CallContext, GatewayResult, RenderedPrompt, pinned_node_config
 from jobhunter.llm.pricing import Effort
 from jobhunter.llm.prompts.render import ScoreRole, job_ad_block, load_prompt_version, score_schema
-from jobhunter.llm.schemas.critic import CriticOut
-from jobhunter.llm.schemas.generator import GeneratorDraft
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import TargetAttemptOwner
 from jobhunter.observability.logging import get_logger
@@ -74,7 +72,7 @@ from jobhunter.scoring.steps import (
     ValidationRecord,
 )
 from jobhunter.scoring.triggers import sample_key
-from jobhunter.scoring.validator import CorrectionHistory, Normalisation, ParsedGenerator
+from jobhunter.scoring.validator import ParsedGenerator
 from jobhunter.types import JSONValue, get_list, get_object, get_str
 
 BEFORE_DRAFT: Final = "score.generate.before_draft"
@@ -393,22 +391,8 @@ class TargetDraftStore:
             row = (await conn.execute(_DRAFT, {"d": draft_id})).first()
         if row is None:
             raise LookupError(f"score draft {draft_id} does not exist")
-        validation = get_object(row.validation, "")
-        normalisation = get_object(validation, "normalisation")
-        corrections = validation.get("corrections")
-        history = (
-            None
-            if corrections is None
-            else CorrectionHistory.from_json({"normalisation": normalisation, "corrections": corrections})
-        )
-        current = validation.get("current")
-        return StoredDraft(
-            id=int(row.id),
-            round=int(row.round),
-            draft=GeneratorDraft.model_validate(row.output_json),
-            normalisation=Normalisation.from_json(normalisation),
-            history=history,
-            required=tuple(_strings(current, "required")) if isinstance(current, dict) else (),
+        return StoredDraft.from_row(
+            id=int(row.id), round=int(row.round), output_json=row.output_json, validation=row.validation
         )
 
     async def save_validation(self, draft_id: int, record: ValidationRecord) -> None:
@@ -457,10 +441,10 @@ class TargetDraftStore:
             row = (await conn.execute(_NOTE, {"n": note_id})).first()
         if row is None:
             raise LookupError(f"critic note {note_id} does not exist")
-        return StoredNote(
+        return StoredNote.from_row(
             id=int(row.id),
             draft_id=int(row.draft_id),
-            derived_outcome=derived_outcome(row.derived_outcome),
-            review=CriticOut.model_validate(row.review_json),
-            validation=get_object(row.validation, ""),
+            derived_outcome=str(row.derived_outcome),
+            review_json=row.review_json,
+            validation=row.validation,
         )

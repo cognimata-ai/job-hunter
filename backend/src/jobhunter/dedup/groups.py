@@ -831,6 +831,34 @@ async def regroup_job(conn: AsyncConnection, job_id: int, *, guard: Guard) -> Gr
     return effect
 
 
+# ---- a published representative (plan Task 10, Ruling P30) -----------------------------------------------
+
+_PUBLISHED_GROUP: Final = q(
+    "SELECT g.id, g.representative_job_id, (SELECT count(*) FROM score_targets t "
+    "JOIN duplicate_group_members m ON m.job_id = t.job_id WHERE m.group_id = g.id "
+    "AND t.state = 'deferred_duplicate') AS deferred FROM duplicate_group_members gm "
+    "JOIN duplicate_groups g ON g.id = gm.group_id WHERE gm.job_id = :job AND g.status = 'active'"
+)
+
+
+async def representative_published(conn: AsyncConnection, job_id: int) -> None:
+    """The publish transaction's step 7 (§9.4.1 L3539; Task 10): a published result of job `job_id` keeps the
+    deferred members of its active duplicate group deferred, so nothing is written; the publication is
+    logged with the group, whether the job is its representative and how many targets stay deferred (a plain
+    read, no lock: the caller holds the job row). The re-election after an `all_failed` or `all_filtered`
+    group is Task 15's."""
+    group = (await conn.execute(_PUBLISHED_GROUP, {"job": job_id})).first()
+    if group is None:
+        return
+    log.info(
+        "group_member_published",
+        job_id=job_id,
+        group_id=int(group.id),
+        representative=group.representative_job_id == job_id,
+        deferred=int(group.deferred),
+    )
+
+
 # ---- leave, split, confirm -------------------------------------------------------------------------------
 
 

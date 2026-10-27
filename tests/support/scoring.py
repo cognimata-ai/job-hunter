@@ -45,6 +45,13 @@ M3 Task 9 adds the `score_target` subgraph's side:
   outcomes, from a fresh start or a resumed one (`Resume`), and count the logical calls and HTTP tries a real
   attempt would count (a step denied before its dispatch, by the budget or a lost claim, counts neither,
   L3567).
+
+M3 Task 10 adds the terminals' side: `target_of` (a target's state, reason, claim columns, published result,
+backoff and charges), `attempt_end` (an attempt's outcome, detail and end), `count(engine, table)` of the
+result tables, `score_config(deps, claimed, claims)` (the invoke config `invoke_subgraph` uses, with a claim
+tracker), `state_at_terminal(deps, claimed, monkeypatch)` (the state with which an attempt reaches `publish`
+or `fail`, run with the stub terminals, so a test calls a real terminal node on it) and `ended_with(command)`
+(the `outcome` a terminal node's `Command` sets).
 """
 
 import asyncio
@@ -460,7 +467,8 @@ async def attempt_of(engine: AsyncEngine, attempt_id: int) -> Row[Any]:
 
 
 class NoClaims:
-    """A claim tracker that tracks nothing (the subgraph reads none of it; Task 10's heartbeats)."""
+    """A claim tracker that tracks nothing (the subgraph reads none of it; `claims.ClaimHeartbeats` is the
+    cycle's)."""
 
     def start(self, ref: ClaimRef) -> None:
         pass
@@ -520,18 +528,7 @@ _ACTIVE_CYCLE_IDS: Final = q("SELECT evaluation_policy_id, scope_version_id FROM
 
 async def invoke_subgraph(deps: ScoreDeps, claimed: ClaimedTarget) -> TargetState:
     """One attempt of `claimed` through the subgraph; its final state."""
-    async with deps.engine.connect() as conn:
-        policy = (await conn.execute(_ACTIVE_CYCLE_IDS)).one()
-    cycle = ScoreContext(
-        cycle_id=0,
-        worker_epoch=1,
-        llm_tuple_id=claimed.llm_tuple_id,
-        scope_version_id=int(policy.scope_version_id),
-        evaluation_policy_id=int(policy.evaluation_policy_id),
-        deps=deps,
-        claims=NoClaims(),
-    )
-    config: RunnableConfig = {"configurable": {"cycle": cycle}, "recursion_limit": 50}
+    config = await score_config(deps, claimed)
     graph = subgraph.build_score_target(deps)
     return cast(TargetState, await graph.ainvoke(initial_state(claimed.ref, claimed.attempt_id), config))
 
@@ -714,3 +711,74 @@ def route(walk: Walk) -> Trace:
     else:
         ends_with = "end"
     return Trace(tuple(steps), logical, http, ends_with, round, critic_rounds, last_review, reviewed_failures)
+
+
+# ---- M3 Task 10: the publish and fail terminals ----------------------------------------------------------
+
+_TARGET_ROW: Final = q(
+    "SELECT state, state_reason, attempt_no, claim_id, claim_epoch, claimed_at, claim_heartbeat_at, "
+    "published_result_id, not_before, transient_failures, charged_attempts, refusal_category "
+    "FROM score_targets WHERE id = :t"
+)
+_ATTEMPT_END: Final = q("SELECT outcome, outcome_detail, ended_at FROM score_attempts WHERE id = :a")
+# The tables `count` counts (a fixed set: the name is never a caller string in the SQL).
+COUNTED: Final = frozenset(
+    {"llm_results", "result_evidence", "det_results", "score_drafts", "critic_notes", "alerts", "llm_calls"}
+)
+
+
+async def target_of(engine: AsyncEngine, target_id: int) -> Row[Any]:
+    """The target's state, reason, claim columns, published result, backoff and charge counters."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_TARGET_ROW, {"t": target_id})).one()
+
+
+async def attempt_end(engine: AsyncEngine, attempt_id: int) -> Row[Any]:
+    """The attempt's `outcome`, `outcome_detail` and `ended_at`."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_ATTEMPT_END, {"a": attempt_id})).one()
+
+
+async def count(engine: AsyncEngine, table: str) -> int:
+    """The number of rows of `table`, one of `COUNTED`."""
+    if table not in COUNTED:
+        raise ValueError(f"count does not count {table}")
+    async with engine.connect() as conn:
+        return int((await conn.execute(q(f"SELECT count(*) FROM {table}"))).scalar_one())  # noqa: S608
+
+
+async def score_config(deps: ScoreDeps, claimed: ClaimedTarget, claims: Any = None) -> RunnableConfig:
+    """The invoke config of one attempt of `claimed`: a `ScoreContext` with `claims` (`NoClaims` by
+    default)."""
+    async with deps.engine.connect() as conn:
+        policy = (await conn.execute(_ACTIVE_CYCLE_IDS)).one()
+    cycle = ScoreContext(
+        cycle_id=0,
+        worker_epoch=1,
+        llm_tuple_id=claimed.llm_tuple_id,
+        scope_version_id=int(policy.scope_version_id),
+        evaluation_policy_id=int(policy.evaluation_policy_id),
+        deps=deps,
+        claims=NoClaims() if claims is None else claims,
+    )
+    return {"configurable": {"cycle": cycle}, "recursion_limit": 50}
+
+
+async def state_at_terminal(
+    deps: ScoreDeps, claimed: ClaimedTarget, monkeypatch: pytest.MonkeyPatch
+) -> TargetState:
+    """The state with which the attempt of `claimed` reaches `publish` or `fail` (run with the stub
+    terminals of Task 9, which only name where it went), its `outcome` back to what the routing left."""
+    with monkeypatch.context() as patched:
+        stub_terminals(patched)
+        final = await invoke_subgraph(deps, claimed)
+    reached = final["outcome"] or ""
+    final["outcome"] = "already_published" if reached == "publish(already_published)" else None
+    return final
+
+
+def ended_with(command: Command[Any]) -> str:
+    """The `outcome` a terminal node's `Command` sets."""
+    update = command.update
+    assert isinstance(update, dict), "a terminal node updates the state"
+    return str(update["outcome"])

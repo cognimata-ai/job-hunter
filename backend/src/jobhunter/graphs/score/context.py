@@ -11,7 +11,7 @@ reads the active scope itself, L4400), the deps, and `claims`.
 
 `ClaimTracker` is the claim heartbeat of §9.4.3: `start(ref)` begins beating a claim, `attach(ref, child)`
 names the task scoring it (which a lost claim cancels), `lost(ref)` says whether the claim was lost,
-`stop(ref)` ends one claim's beats and `stop_all()` every claim's. Task 10's `ClaimHeartbeats` implements it.
+`stop(ref)` ends one claim's beats and `stop_all()` every claim's. `claims.ClaimHeartbeats` implements it.
 
 Task 11's cycle graph builds the context and hands it to every `score_target` invocation; the nodes of Task 9
 work from the deps they were built with and the state, and read nothing of it yet.

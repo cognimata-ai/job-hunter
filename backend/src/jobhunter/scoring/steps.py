@@ -45,6 +45,11 @@ them: `validate_step` takes it from its caller, which reads it under `active_con
 criterion key or a fact id of the draft; a validator pseudo key (`must_have:0`, `certification_item:2`, a C
 code) is no target, so its issue has none (Controller carry T5-b).
 
+**The stored artifacts** are read back by `StoredDraft.from_row` and `StoredNote.from_row` (the node store's
+and the publish transaction's one reader of a `score_drafts` and a `critic_notes` row); `stored_validation`
+is a validated draft's last validation as a publication reads it (Task 10): stage 2 again over the stored
+draft, normalisation and history, with the row's stored failures (Controller carry T9-a).
+
 **The stored validation** (`ValidationRecord.current`): `issues`, `failures` and `groundings` (codes, keys,
 paths and offsets) and `required` (the fact ids the critic reviews); a note's (`NoteRecord.validation`): its
 completeness, the verdict mismatch, `not_a_job_ad_verified`, the required facts, each one's review and the
@@ -89,6 +94,7 @@ from jobhunter.scoring.validator import (
     CriticValidation,
     Dispute,
     DraftValidation,
+    Failure,
     Grounding,
     Normalisation,
     ParsedGenerator,
@@ -104,10 +110,11 @@ from jobhunter.scoring.validator import (
     validate_review,
 )
 from jobhunter.scoring.validator import Issue as ValidatorIssue
-from jobhunter.types import JSONValue, get_list
+from jobhunter.types import JSONValue, get_list, get_object, get_str
 
 _STRUCTURAL: Final = "structural"
 _CONFIRMATIONS: Final[Mapping[str, Confirmation]] = {c: c for c in get_args(Confirmation)}
+_OUTCOMES: Final[Mapping[str, DerivedOutcome]] = {o: o for o in get_args(DerivedOutcome)}
 _CRITERIA_PREFIX: Final = "criteria."
 _REGION_EVIDENCE: Final = "job_facts.remote_region.evidence"
 _INDUSTRY_EVIDENCE: Final = "job_facts.industry.evidence"
@@ -155,7 +162,9 @@ class ScoreInputs:
 class StoredDraft:
     """A stored draft: the internal (corrected, once validated) draft, its stage-1 normalisation, its
     correction history (the normalisation and the first validation's corrections; `None` before that
-    validation) and the facts the critic reviews (empty before it)."""
+    validation), the facts the critic reviews (empty before it) and the failures of its last validation
+    (`validation.current.failures`, the exact keys and codes whose keys `deterministic_failures` holds;
+    `None` before it)."""
 
     id: int
     round: int
@@ -163,6 +172,33 @@ class StoredDraft:
     normalisation: Normalisation
     history: CorrectionHistory | None
     required: tuple[str, ...]
+    failures: tuple[Failure, ...] | None = field(default=None, repr=False)
+
+    @classmethod
+    def from_row(cls, *, id: int, round: int, output_json: JSONValue, validation: JSONValue) -> "StoredDraft":
+        """The stored draft of a `score_drafts` row (its `id`, `round`, `output_json` and `validation`)."""
+        doc = get_object(validation, "")
+        normalisation = get_object(doc, "normalisation")
+        corrections = doc.get("corrections")
+        history = (
+            None
+            if corrections is None
+            else CorrectionHistory.from_json({"normalisation": normalisation, "corrections": corrections})
+        )
+        current = doc.get("current")
+        return cls(
+            id=id,
+            round=round,
+            draft=GeneratorDraft.model_validate(output_json),
+            normalisation=Normalisation.from_json(normalisation),
+            history=history,
+            required=tuple(_strings(current.get("required"))) if isinstance(current, dict) else (),
+            failures=(
+                tuple(Failure(get_str(f, "key"), get_str(f, "code")) for f in get_list(current, "failures"))
+                if isinstance(current, dict)
+                else None
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -229,6 +265,22 @@ class StoredNote:
         if not isinstance(stored, dict):
             raise ValueError(f"critic note {self.id}: no stored fact reviews")
         return dict(stored)
+
+    @classmethod
+    def from_row(
+        cls, *, id: int, draft_id: int, derived_outcome: str, review_json: JSONValue, validation: JSONValue
+    ) -> "StoredNote":
+        """The stored note of a `critic_notes` row; `ValueError` for an unknown derived outcome."""
+        outcome = _OUTCOMES.get(derived_outcome)
+        if outcome is None:
+            raise ValueError(f"critic note {id}: an unknown derived outcome")
+        return cls(
+            id=id,
+            draft_id=draft_id,
+            derived_outcome=outcome,
+            review=CriticOut.model_validate(review_json),
+            validation=get_object(validation, ""),
+        )
 
 
 class DraftStore(Protocol):
@@ -338,6 +390,17 @@ def _validated(inputs: ScoreInputs, stored: StoredDraft) -> DraftValidation:
     return validate_draft(
         stored.draft, inputs.ctx, normalisation=stored.normalisation, history=stored.history
     )
+
+
+def stored_validation(ctx: ValidationContext, stored: StoredDraft) -> DraftValidation:
+    """The last validation of a validated stored draft, as a publication reads it (Task 10): stage 2 again
+    over the stored (corrected) draft with its stored normalisation and history (pure: the validation it
+    stored), with the stored failures, the draft row's exact keys and codes (Controller carry T9-a).
+    `ValueError` for a draft never validated."""
+    if stored.failures is None or stored.history is None:
+        raise ValueError(f"score draft {stored.id} was never validated")
+    validation = validate_draft(stored.draft, ctx, normalisation=stored.normalisation, history=stored.history)
+    return replace(validation, failures=list(stored.failures))
 
 
 def failure_keys(validation: DraftValidation) -> list[str]:

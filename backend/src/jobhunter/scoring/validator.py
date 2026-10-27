@@ -70,7 +70,9 @@ V4's. `DraftValidation.t1` is T1's condition (a limit issue or any failure; a re
 pseudo key of an id-less fact (A3 G12): its C code (`work_mode`, `remote_region`, `employment_type`, …), or
 `<code>:<n>` for the `n`-th item (0-based) of `must_haves` (`must_have:<n>`), `nice_to_haves`,
 `required_languages` (`required_language:<n>`) and `certifications` (`certification_item:<n>`, which no fact
-id can equal). A pseudo key is no `render.Issue` target.
+id can equal). A pseudo key is no `render.Issue` target. `fact_places(facts)` is the walk V2 and V3 go by,
+each fact with its key, its path and its quotes (the contested null-out and the publication's evidence read
+it, Task 10).
 
 **History.** `CorrectionHistory` is the normalisation and the first validation's corrections, immutable: a
 later validation of the stored (corrected) draft repairs nothing, so the caller passes the stored history
@@ -85,7 +87,8 @@ publication cut.
 
 **The critic** (`validate_review`, §11.7.2): a target is an LLM criterion key with a criterion assessment,
 or a required fact id with a `fact_*` assessment; a review needs a grounded ad quote (the first 2 grounded
-count), else it is discarded; the derived outcome follows §11.7.2 with V6 special-cased first (L4365).
+count, and they are the review's `evidence`), else it is discarded; the derived outcome follows §11.7.2 with
+V6 special-cased first (L4365).
 Condition 5's "unresolved" failures are those `unresolved_failures` leaves: a fact the same review rejects
 with a grounded quote is dropped with its failures (L4555 item 3; Controller Ruling T9-f), the rule the score
 routing applies to its `det_failures` as well (`scoring.steps`).
@@ -471,7 +474,10 @@ FactReview = Literal["critic_confirmed", "critic_rejected", "uncertain"]
 @dataclass(frozen=True)
 class CriticValidation:
     """The validated critic review (§11.7.2): the derived outcome, the grounded disputes, each required fact's
-    review, the reviews discarded for want of a grounded quote, the other issues (limits, targets, quotes)."""
+    review, the reviews discarded for want of a grounded quote, the other issues (limits, targets, quotes).
+    `evidence` holds, per target of a review kept (a grounded dispute or a fact review), its first
+    `QUOTES_PER_REVIEW` grounded quotes with their groundings: the review's part of a result's evidence (Task
+    10)."""
 
     derived_outcome: Literal["accept", "revise", "incomplete"]
     grounded_disputes: list[Dispute]
@@ -481,6 +487,7 @@ class CriticValidation:
     complete: bool
     verdict_mismatch: bool
     not_a_job_ad_verified: bool
+    evidence: dict[str, list[tuple[str, Grounding]]] = field(default_factory=dict)
 
 
 # ---- stage 1 -----------------------------------------------------------------------------------------------
@@ -1007,23 +1014,34 @@ def _limits(draft: GeneratorDraft, exempt: frozenset[str]) -> Iterator[Issue]:
 
 
 @dataclass(frozen=True)
-class _Fact:
-    """One fact of the draft for V2 and V3: its key, the path of its evidence list, its quotes, and whether it
-    is asserted."""
+class FactPlace:
+    """One fact of the draft for V2 and V3: its key (a fact id, else its pseudo key; module docstring, Keys),
+    the path of its evidence list, its quotes, and whether it is asserted. `fact_path` is the fact's own path
+    (`job_facts.must_haves[1]`, `job_facts.onsite_only`)."""
 
     key: str
     path: str
     evidence: list[str]
     asserted: bool
 
+    @property
+    def fact_path(self) -> str:
+        return self.path.removesuffix(".evidence")
 
-def _facts(facts: JobFacts) -> Iterator[_Fact]:
+
+def fact_places(facts: JobFacts) -> list[FactPlace]:
+    """The draft's facts in the fact table's order, each with its fact id or pseudo key (the walk of V2 and
+    V3, which the contested null-out and the publication's evidence go by too)."""
+    return list(_facts(facts))
+
+
+def _facts(facts: JobFacts) -> Iterator[FactPlace]:
     """The draft's facts in the fact table's order, each with its fact id or pseudo key."""
     ids = {fact.path: fact_id(fact.code, fact.subject) for fact in binding_facts(facts)}
 
-    def fact(path: tuple[str | int, ...], pseudo: str, evidence: list[str], asserted: bool) -> _Fact:
+    def fact(path: tuple[str | int, ...], pseudo: str, evidence: list[str], asserted: bool) -> FactPlace:
         dotted = "job_facts." + "".join(f"[{step}]" if isinstance(step, int) else step for step in path)
-        return _Fact(ids.get(path, pseudo), f"{dotted}.evidence", evidence, asserted)
+        return FactPlace(ids.get(path, pseudo), f"{dotted}.evidence", evidence, asserted)
 
     def stated(value: str | None) -> bool:
         return value is not None and bool(value.strip())
@@ -1393,15 +1411,16 @@ def _review_limits(i: int, review: Review) -> Iterator[Issue]:
 
 def _review_groundings(
     i: int, review: Review, ctx: ValidationContext, issues: list[Issue]
-) -> list[Grounding]:
-    """The groundings of a review's first `QUOTES_PER_REVIEW` grounded quotes; each failing quote an issue."""
-    found: list[Grounding] = []
+) -> list[tuple[str, Grounding]]:
+    """A review's first `QUOTES_PER_REVIEW` grounded quotes with their groundings; each failing quote an
+    issue."""
+    found: list[tuple[str, Grounding]] = []
     for j, quote in enumerate(review.ad_evidence):
         grounding = _grounding(quote, ctx.ad, ctx.profile_sections, None)
         if not isinstance(grounding, Grounding):
             issues.append(Issue(grounding, f"reviews[{i}].ad_evidence[{j}]", {}))
         elif len(found) < QUOTES_PER_REVIEW:
-            found.append(grounding)
+            found.append((quote, grounding))
     return found
 
 
@@ -1441,6 +1460,7 @@ def validate_review(
     discarded: list[Issue] = []
     disputes: list[Dispute] = []
     fact_reviews: dict[str, FactReview] = {}
+    evidence: dict[str, list[tuple[str, Grounding]]] = {}
     seen: set[str] = set()
     complete = True
     criterion_reviews = 0
@@ -1465,12 +1485,14 @@ def validate_review(
                 fact_reviews[r.target] = "uncertain"  # two reviews of one fact settle nothing
             continue
         seen.add(r.target)
-        groundings = _review_groundings(i, r, ctx, issues)
-        if not groundings:
+        grounded = _review_groundings(i, r, ctx, issues)
+        if not grounded:
             discarded.append(Issue("review_ungrounded", path, {"target": r.target}))
             if is_fact:
                 fact_reviews[r.target] = "uncertain"
             continue
+        evidence[r.target] = grounded
+        groundings = [grounding for _, grounding in grounded]
         if is_fact:
             fact_reviews[r.target] = _FACT_REVIEW.get(r.assessment, "uncertain")
         else:
@@ -1507,6 +1529,7 @@ def validate_review(
         complete=complete,
         verdict_mismatch=(review.verdict == "accept") != (outcome == "accept"),
         not_a_job_ad_verified=verified,
+        evidence=evidence,
     )
 
 
