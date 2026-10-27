@@ -5,8 +5,10 @@ through the subgraph, on the recorded-SSE fake with keyed answers.
 An accepted publish writes the result, its evidence and its current instances (for the pending scope too),
 moves the target with its claim cleared and closes the attempt; a lost claim, an already-published 5-tuple, a
 fenced job and a publication `Bug` each end as the transaction says; a concurrent scope save is waited for;
-the reclaims resume from the stored review and draft without a new call; the correction history and the
-current-score view hold; and the lock order is the schedule's.
+the publication's aggregation is the stored current instance (accepted and contested); an unverified
+`not_a_job_ad` is stored with its badge; the reclaims resume from the stored review and draft without a new
+call; the correction history (rewritten by the second validation) and the current-score view hold; and the
+lock order is the schedule's.
 
 Every datum is invented.
 """
@@ -27,7 +29,9 @@ from jobhunter.graphs.score.nodes import publish as publish_node
 from jobhunter.graphs.score.state import TargetState
 from jobhunter.llm import gateway as gateway_module
 from jobhunter.llm.schemas.critic import CriticOut
+from jobhunter.scoring import publication
 from jobhunter.scoring import publish as publish_mod
+from jobhunter.scoring.publication import Publication
 from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -161,6 +165,33 @@ async def run_publish(deps: ScoreDeps, claimed: ClaimedTarget, state: TargetStat
     return await node(state, await score_config(deps, claimed))
 
 
+def built_publications(monkeypatch: pytest.MonkeyPatch) -> list[Publication]:
+    """Every `Publication` the publish builds from now on (`publication.build` wrapped, its result kept)."""
+    built: list[Publication] = []
+    build = publication.build
+
+    def recording(**kwargs: Any) -> Publication:
+        made = build(**kwargs)
+        built.append(made)
+        return made
+
+    monkeypatch.setattr(publication, "build", recording)
+    return built
+
+
+def same_scores(made: Publication, instance: Any) -> None:
+    """The publication's aggregation is the stored current `det_results` instance (L, M, U, confidence and
+    caps): what the publish built is what `compute_and_write` rebuilt from the stored result."""
+    built = made.aggregation
+    assert (built.low, built.mid, built.high, built.confidence, built.caps_applied) == (
+        instance.score_low,
+        instance.score_mid,
+        instance.score_high,
+        instance.confidence,
+        instance.caps_applied,
+    )
+
+
 def crash_at_arrival(point: str, arrival: int) -> Callable[[str], Awaitable[None]]:
     """An `afault_point` replacement that raises `SimulatedCrash` at the `arrival`-th arrival at `point`."""
     arrivals = 0
@@ -193,8 +224,9 @@ async def crash_before_the_commit(
 
 @pytest.mark.parametrize("pending", [False, True], ids=["active_scope", "with_pending_scope"])
 async def test_an_accepted_publish_writes_the_result_and_closes_the_claim(
-    engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM, pending: bool
+    engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch, pending: bool
 ) -> None:
+    built = built_publications(monkeypatch)
     claimed = await claimed_target(engine)
     fake_llm.answer("generate", claimed.job_revision_id, synthetic_c_draft())
     if pending:
@@ -267,6 +299,8 @@ async def test_an_accepted_publish_writes_the_result_and_closes_the_claim(
         Decimal("72.50"),
         "high",
     )  # the provisional M
+    (made,) = built
+    same_scores(made, instances[0])  # the active scope's: the publication is built under it
     target = await target_of(engine, claimed.target_id)
     assert (target.state, target.published_result_id) == ("published_accepted", result.id)
     assert (target.claim_id, target.claim_epoch, target.claim_heartbeat_at) == (None, None, None)
@@ -407,9 +441,10 @@ async def test_a_publication_bug_fails_the_target_with_the_alert(
 
 
 async def test_contested_publication_after_two_invalid_critic_outputs(
-    engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM
+    engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Codex r2 B17: the critic's first output and its repair both structurally invalid
+    built = built_publications(monkeypatch)
     ad = synthetic_ad(
         description=f"Backend Engineer (m/w/d). {INJECTION} Python, PostgreSQL. Berlin, hybrid."
     )
@@ -429,7 +464,30 @@ async def test_contested_publication_after_two_invalid_critic_outputs(
     assert result.injection_suspected is True
     (instance,) = await rows(engine, _INSTANCES, claimed.target_id)
     assert instance.confidence == "low" and instance.score_mid is not None  # nothing withheld
+    (made,) = built
+    same_scores(made, instance)
     assert (await target_of(engine, claimed.target_id)).state == "published_contested"
+
+
+async def test_an_unverified_not_a_job_ad_is_stored_with_its_badge(
+    engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # §11.10 3a: the badge "possibly not a job ad" is read back from the stored result
+    built = built_publications(monkeypatch)
+    claimed = await claimed_target(engine)
+    fake_llm.answer("generate", claimed.job_revision_id, NOT_AN_AD)
+    broken = synthetic_review()
+    del broken["summary"]
+    fake_llm.answer("critic", claimed.job_revision_id, broken, round=1, schema=CriticOut)
+    final = await invoke_subgraph(deps, claimed)
+    assert final["outcome"] == "published_contested"
+    result = await result_of(engine, claimed.target_id)
+    assert (result.status, result.not_a_job_ad) == ("contested", False)
+    assert result.fact_confirmations == {"not_a_job_ad:ad": "unconfirmed"}
+    (made,) = built
+    assert made.badge_possibly_not_a_job_ad is True
+    (instance,) = await rows(engine, _INSTANCES, claimed.target_id)
+    same_scores(made, instance)
 
 
 # ---- the reclaims (Codex r2 B23, r3 B8, B9) ----------------------------------------------------------------
@@ -554,6 +612,16 @@ async def test_a_reclaim_after_a_round_two_revise_review_publishes_contested(
     )  # kept (rule 7)
 
 
+async def draft_write(engine: AsyncEngine, draft_id: int) -> str:
+    """The id of the transaction that last wrote draft `draft_id` (its row version's `xmin`): another value
+    after an UPDATE, even to the same content."""
+    async with engine.connect() as conn:
+        found = await conn.execute(
+            sa.text("SELECT xmin::text FROM score_drafts WHERE id = :d"), {"d": draft_id}
+        )
+        return str(found.scalar_one())
+
+
 async def test_the_correction_history_survives_revalidation_and_reclaim(
     engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -572,10 +640,12 @@ async def test_the_correction_history_survives_revalidation_and_reclaim(
         await invoke_subgraph(deps, resumed)
     monkeypatch.setattr(gateway_module, "afault_point", no_fault)
     (first,) = await rows(engine, _DRAFTS, resumed.target_id)
+    first_write = await draft_write(engine, first.id)
     await reclaim_now(engine, resumed.target_id)
     again = await claim_again(engine, resumed.target_id, resumed_from_attempt_id=resumed.attempt_id)
     assert (await invoke_subgraph(deps, again))["outcome"] == "published_accepted"
     (later,) = await rows(engine, _DRAFTS, resumed.target_id)
+    assert await draft_write(engine, later.id) != first_write  # the second validation wrote the row
     assert later.validation["corrections"] == first.validation["corrections"]
     assert later.validation["normalisation"] == first.validation["normalisation"]
     assert later.validation["current"] == first.validation["current"]  # rewritten, to the same content

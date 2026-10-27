@@ -186,6 +186,44 @@ async def test_heartbeat_loop_logs_the_failure_class_only_and_reports_loss(caplo
     assert "hunter2" not in caplog.text and "detail" not in caplog.text
 
 
+async def test_heartbeat_loop_rides_out_the_tolerated_failures_in_a_row(caplog) -> None:
+    # M3 Task 10: the claim heartbeat tolerates 3 raising beats in a row; a good beat restarts the count
+    outcomes = iter(["raise", "raise", "raise", True, "raise", "raise", "raise", True, False])
+    lost: list[int] = []
+
+    async def beat() -> bool:
+        outcome = next(outcomes)
+        if outcome == "raise":
+            raise ConnectionError("password=hunter2 detail")
+        return bool(outcome)
+
+    await asyncio.wait_for(
+        heartbeat_loop(
+            beat, period_s=0, on_lost=lambda: lost.append(1), tolerated_failures=3, label="claim:7"
+        ),
+        5,
+    )
+    assert lost == [1]  # the refused beat only
+    events = logged(caplog, "heartbeat_failed")
+    assert [e["consecutive"] for e in events] == [1, 2, 3, 1, 2, 3]
+    assert {(e["error_class"], e["heartbeat"]) for e in events} == {("ConnectionError", "claim:7")}
+    assert "hunter2" not in caplog.text and "detail" not in caplog.text
+
+
+async def test_heartbeat_loop_reports_the_first_failure_past_the_tolerance_as_lost() -> None:
+    calls, lost = 0, list[int]()
+
+    async def beat() -> bool:
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("blip")
+
+    await asyncio.wait_for(
+        heartbeat_loop(beat, period_s=0, on_lost=lambda: lost.append(1), tolerated_failures=3), 5
+    )
+    assert (calls, lost) == (4, [1])
+
+
 async def test_run_owned_maps_return_error_and_fencing_to_outcomes() -> None:
     reg = ExecutionRegistry()
 

@@ -23,7 +23,14 @@ the `Publication`, touching no target, result or ranking row (L4611).
    nulled criteria, the truncations, the facts' confirmations (each fact id of the published facts, and
    `not_a_job_ad:ad` when it is published, with the last review's confirmation after its round, else
    `unconfirmed`), the knockout candidates under `scope`, the critic's outcome (`contested`; else `accepted`
-   when a review exists, `not_run` without one) and `revisions_used`. A failure is a `Bug`:
+   when a review exists, `not_run` without one) and `revisions_used`. **The badge "possibly not a job ad"**
+   (§11.10 item 3a, `badge_possibly_not_a_job_ad`: a contested draft that said it was no job ad, unverified)
+   has no `llm_results` column (0008): it is stored as `not_a_job_ad:ad` kept in `fact_confirmations` with
+   its non-confirmed status (the last review's `uncertain` or `critic_rejected`, else `unconfirmed`; a
+   confirmed status the review did not verify reads `unconfirmed`) beside `not_a_job_ad = false`, so M4's list
+   and Task 19's eval runner read the badge from the stored result: `not_a_job_ad:ad` in the confirmations of
+   a result that is a job ad. It binds nothing (no knockout candidate has that id) and draws no evidence. A
+   failure is a `Bug`:
    `PublicationInvalid`, which names the error types and the paths of field names only, never a value (the
    `ValidationError`'s text holds the input: carry T6-b), and is raised outside the handler, so neither its
    `__cause__` nor its `__context__` holds it;
@@ -83,6 +90,7 @@ UNAVAILABLE: Final = "unavailable"
 PUBLICATION_CUT: Final = "publication_cut"  # the code of a repair publication made (`repairs`)
 NOT_A_JOB_AD_UNVERIFIED: Final = "not_a_job_ad_unverified"
 _UNCONFIRMED: Final = "unconfirmed"
+_VERIFIED: Final = frozenset({"structured", "critic_confirmed"})  # what an unverified flag never stores
 _FIELD_NAME: Final = re.compile(r"[a-z_]{1,64}")
 _KEY: Final = "<key>"
 
@@ -138,7 +146,8 @@ class Evidence:
 @dataclass(frozen=True)
 class Publication:
     """What `build` gives (module docstring): the strict publication object, its aggregation under the scope
-    given, its evidence, the `critic_injection` column, `truncated_fields` and the repairs behind them."""
+    given, its evidence, the `critic_injection` column, `truncated_fields` and the repairs behind them, and
+    the badge "possibly not a job ad" (step 3: in `result.fact_confirmations` too)."""
 
     result: PublishedResult
     aggregation: Aggregation
@@ -146,6 +155,7 @@ class Publication:
     critic_injection: CriticInjection | None
     truncated_fields: list[str]
     repairs: list[Repair]
+    badge_possibly_not_a_job_ad: bool
 
 
 def _moved(validation: DraftValidation, dropped: contested.Dropped) -> DraftValidation:
@@ -186,6 +196,12 @@ def _confirmations(
     names = list(derive_fact_ids(draft.job_facts)) + ([NOT_A_JOB_AD.fact_id] if not_a_job_ad else [])
     stored = {} if review is None else review.confirmations
     return {name: stored.get(name, _UNCONFIRMED) for name in names}
+
+
+def _badge(review: Review | None) -> Confirmation:
+    """The stored status of an unverified `not_a_job_ad:ad` (module docstring, step 3)."""
+    status = _UNCONFIRMED if review is None else review.confirmations.get(NOT_A_JOB_AD.fact_id, _UNCONFIRMED)
+    return _UNCONFIRMED if status in _VERIFIED else status
 
 
 def _row(subject: str, quote: str, grounding: Grounding) -> Evidence | None:
@@ -233,10 +249,11 @@ def build(
     """The publication of `draft` (module docstring); `PublicationInvalid` for a `Bug`."""
     checked = None if last_review is None else last_review.validation
     verified = draft.not_a_job_ad and checked is not None and checked.not_a_job_ad_verified
+    badge = False
     if mode == "contested":
         nulled = contested.null_out(draft, validation, checked)
         published, nulled_criteria, dropped = nulled.draft, nulled.nulled_criteria, nulled.dropped
-        not_a_job_ad = nulled.not_a_job_ad
+        not_a_job_ad, badge = nulled.not_a_job_ad, nulled.badge_possibly_not_a_job_ad
     else:
         if draft.not_a_job_ad and not verified:
             raise PublicationInvalid([NOT_A_JOB_AD_UNVERIFIED], ["not_a_job_ad"])
@@ -245,6 +262,9 @@ def build(
     moved = _moved(validation, dropped)
     repaired, truncated = repair_for_publication(published, moved)
     confirmations = _confirmations(repaired, not_a_job_ad, last_review)
+    subjects = {*LLM_CRITERIA, *confirmations}  # the badge's key draws no evidence
+    if badge:
+        confirmations[NOT_A_JOB_AD.fact_id] = _badge(last_review)
     facts = repaired.job_facts
     candidates = derive_knockouts(facts, ctx.det, ctx.profile, scope)
     critic_outcome = "contested" if mode == "contested" else "not_run" if last_review is None else "accepted"
@@ -289,7 +309,6 @@ def build(
         critic_injection=critic_injection,
         not_a_job_ad_verified=result.not_a_job_ad,
     )
-    subjects = {*LLM_CRITERIA, *confirmations}
     history = [*moved.history.normalisation.repairs, *moved.history.corrections]
     corrected = {r.path for r in history}
     repairs = [*history, *(Repair(path, PUBLICATION_CUT) for path in truncated if path not in corrected)]
@@ -300,4 +319,5 @@ def build(
         critic_injection=critic_injection,
         truncated_fields=list(truncated),
         repairs=repairs,
+        badge_possibly_not_a_job_ad=badge,
     )

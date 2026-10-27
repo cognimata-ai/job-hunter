@@ -1,7 +1,7 @@
 """The `fail` node and the follow-up holds on PostgreSQL (spec §7.16.3, §6.9.3-6.9.4, §9.4.1; plan Task 10, A2
 T12, T15, Codex r1 #27, Rulings P8, P31): every row of the outcome table, the backoff sequence, the fourth
-charged attempt, the cap reached with the quarantined batch spend, and the once-only hold releases of
-`llm.bulk`.
+charged attempt, the cap reached with the quarantined batch spend, the once-only hold releases of `llm.bulk`
+and the bulk rows `bulk.lock_for_targets` holds.
 
 `fail` is called as the subgraph calls it, with the state the routing leaves (its `error_code`), on a claimed
 target; a refusal also goes through the whole subgraph, whose category `fail` reads from the call.
@@ -370,6 +370,34 @@ async def test_a_target_without_a_followup_item_releases_nothing(engine: AsyncEn
     async with engine.begin() as conn:
         assert await bulk.release_target_hold(conn, claimed.target_id) == Decimal(0)
         await bulk.lock_for_targets(conn, [claimed.target_id])  # no bulk row to lock: a no-op
+
+
+_RIVAL_LOCK = sa.text("SELECT 1 FROM bulk_operations WHERE id = :b FOR UPDATE NOWAIT")
+
+
+async def rival_refused(engine: AsyncEngine, operation: int) -> bool:
+    """Whether a rival transaction's `FOR UPDATE NOWAIT` on bulk row `operation` is refused (it is locked)."""
+    async with engine.connect() as conn:
+        try:
+            await conn.execute(_RIVAL_LOCK, {"b": operation})
+        except sa.exc.OperationalError:
+            return True
+        finally:
+            await conn.rollback()
+    return False
+
+
+async def test_lock_for_targets_holds_the_candidates_bulk_rows(engine: AsyncEngine, clean_db: None) -> None:
+    # Ruling P52: the bulk row (step 7) is held before the caller's first target-row lock
+    operation, claimed, _ = await followup_item(engine, held=Decimal("0.300000"))
+    bystander = await claimed_target(engine)  # no follow-up item
+    assert not await rival_refused(engine, operation)
+    async with engine.connect() as conn:
+        await conn.begin()
+        await bulk.lock_for_targets(conn, [bystander.target_id, claimed.target_id])
+        assert await rival_refused(engine, operation)
+        await conn.rollback()
+    assert not await rival_refused(engine, operation)  # held to the end of the caller's transaction only
 
 
 @pytest.mark.parametrize(

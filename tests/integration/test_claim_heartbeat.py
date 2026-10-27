@@ -4,13 +4,17 @@ graph-level cases need Task 11's `run_target` and cycle, and are Task 11's).
 
 The beat updates the claim's row every period on the injected clock and only then; a refused beat marks the
 claim lost and cancels the child attached to it, whose stream the gateway settles `ambiguous`; a beat refused
-before any attachment cancels nothing; `stop` and `stop_all` end the beats; the beat passes the fault point
-`claims.beat` first. Then the follow-up hold of a target is released once, by its terminal attempt only.
+before any attachment cancels nothing; a beat that waited on the owner's own publish ends quietly; up to three
+raising beats in a row keep the claim and the fourth loses it; `stop` and `stop_all` end the beats; the beat
+passes the fault point `claims.beat` first. Then the follow-up hold of a target is released once, by its
+terminal attempt only.
 
 Every datum is invented.
 """
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -20,14 +24,19 @@ import sqlalchemy as sa
 from jobhunter.graphs.score import claims as claims_mod
 from jobhunter.graphs.score.claims import ClaimHeartbeats
 from jobhunter.graphs.score.deps import ScoreDeps
+from jobhunter.graphs.score.nodes import publish as publish_node
 from jobhunter.llm import fake
 from jobhunter.llm.prompts.render import prompt_schema_v2
+from jobhunter.scoring import publish as publish_mod
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.clock import FakeClock, ManualSleep
 from tests.support.faults import PausePoint
 from tests.support.llm import FakeLLM, tries
+from tests.support.logs import logged
 from tests.support.m3 import NOW, insert_batch_item, insert_bulk_operation, insert_submission
+from tests.support.pg import PgServer, lock_wait_details
+from tests.support.procs import await_until
 from tests.support.scoring import (
     ClaimedTarget,
     activate_test_policy,
@@ -167,6 +176,121 @@ async def test_a_beat_refused_before_any_attach_marks_the_claim_lost_and_cancels
     with pytest.raises(asyncio.CancelledError):
         await late
     bystander.cancel()
+    await claims.stop_all()
+
+
+async def test_a_beat_blocked_by_its_own_publish_ends_quietly_after_the_commit(
+    engine: AsyncEngine,
+    deps: ScoreDeps,
+    fake_llm: FakeLLM,
+    migrated: PgServer,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The beat waits on the target row the owner's publish holds FOR UPDATE and finds no `in_progress` row
+    # after the commit: the attempt ended with its own outcome, so the beat stops and cancels nothing
+    caplog.set_level(logging.INFO)
+    claimed = await claimed_target(engine)
+    fake_llm.answer("generate", claimed.job_revision_id, synthetic_c_draft())
+    before_commit = PausePoint(publish_mod.BEFORE_COMMIT)
+    after_commit = PausePoint(publish_mod.AFTER_COMMIT)
+    monkeypatch.setattr(publish_mod, "afault_point", before_commit)
+    monkeypatch.setattr(publish_node, "afault_point", after_commit)
+    sleep = ManualSleep()
+    claims = heartbeats(engine, sleep)
+    claims.start(claimed.ref)
+    child: asyncio.Task[Any] = asyncio.create_task(invoke_subgraph(deps, claimed))
+    claims.attach(claimed.ref, child)
+    await asyncio.wait_for(before_commit.reached.wait(), 10)  # the publish holds the target FOR UPDATE
+    await sleep.release()  # the beat's UPDATE waits on that row
+
+    async def beat_waits() -> bool:
+        return any(wait.relation == "score_targets" for wait in lock_wait_details(migrated))
+
+    await await_until(beat_waits, 10, 0.02)
+    before_commit.resume()  # the publish commits
+    await asyncio.wait_for(after_commit.reached.wait(), 10)  # the child is past its commit, still running
+
+    async def beat_ended() -> bool:
+        return beat_tasks(claimed.target_id) == []
+
+    await await_until(beat_ended, 10, 0.02)
+    assert not claims.lost(claimed.ref) and not child.done()
+    after_commit.resume()
+    final = await asyncio.wait_for(child, 10)
+    assert final["outcome"] == "published_accepted" and not child.cancelled()
+    [ended] = logged(caplog, "score_claim_heartbeat_ended")
+    assert (ended["target_id"], ended["attempt_outcome"]) == (claimed.target_id, "published_accepted")
+    assert logged(caplog, "score_claim_heartbeat_lost") == []
+    await claims.stop_all()
+
+
+def failing_beats(times: int) -> Callable[[str], Awaitable[None]]:
+    """An `afault_point` replacement under which the next `times` beats raise, as a database blip would."""
+    left = times
+
+    async def fault(name: str) -> None:
+        nonlocal left
+        if name == claims_mod.BEAT_POINT and left > 0:
+            left -= 1
+            raise ConnectionError("synthetic blip password=hunter2")
+
+    return fault
+
+
+async def test_up_to_three_raising_beats_in_a_row_keep_the_claim(
+    engine: AsyncEngine, deps: ScoreDeps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Only "0 rows updated" is a lost claim (L3572); the 3-minute reclaim window covers about 5 beats
+    claimed = await claimed_target(engine)
+    sleep = ManualSleep()
+    claims = heartbeats(engine, sleep)
+    child: asyncio.Task[Any] = asyncio.create_task(asyncio.sleep(3600))  # a live stream
+    await backdate(engine, claimed.target_id)
+    monkeypatch.setattr(claims_mod, "afault_point", failing_beats(3))
+    claims.start(claimed.ref)
+    claims.attach(claimed.ref, child)
+    for beats in (1, 2, 3):
+        await sleep.release()
+        await sleep.until(beats + 1)  # tolerated: the loop sleeps again
+    assert not claims.lost(claimed.ref) and not child.done()
+    assert not await fresh(engine, claimed.target_id)
+    await sleep.release()
+    await sleep.until(5)
+    assert await fresh(engine, claimed.target_id)  # the fourth beat updates the row
+    monkeypatch.setattr(claims_mod, "afault_point", failing_beats(3))  # a good beat restarts the count
+    for beats in (5, 6, 7):
+        await sleep.release()
+        await sleep.until(beats + 1)
+    assert not claims.lost(claimed.ref) and not child.done()
+    failures = logged(caplog, "heartbeat_failed")
+    assert [f["consecutive"] for f in failures] == [1, 2, 3, 1, 2, 3]
+    assert {(f["error_class"], f["heartbeat"]) for f in failures} == {
+        ("ConnectionError", f"claim:{claimed.target_id}")
+    }
+    assert "hunter2" not in caplog.text and "synthetic blip" not in caplog.text
+    child.cancel()
+    await claims.stop_all()
+
+
+async def test_the_fourth_raising_beat_in_a_row_loses_the_claim(
+    engine: AsyncEngine, deps: ScoreDeps, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claimed = await claimed_target(engine)
+    sleep = ManualSleep()
+    claims = heartbeats(engine, sleep)
+    child: asyncio.Task[Any] = asyncio.create_task(asyncio.sleep(3600))
+    monkeypatch.setattr(claims_mod, "afault_point", failing_beats(4))
+    claims.start(claimed.ref)
+    claims.attach(claimed.ref, child)
+    for beats in (1, 2, 3):
+        await sleep.release()
+        await sleep.until(beats + 1)
+    assert not claims.lost(claimed.ref)
+    await sleep.release()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(child, 10)
+    assert claims.lost(claimed.ref) and beat_tasks(claimed.target_id) == []
     await claims.stop_all()
 
 

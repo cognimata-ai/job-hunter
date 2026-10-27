@@ -212,6 +212,7 @@ def test_rule_3a_a_verified_not_a_job_ad_is_kept_with_every_criterion_null() -> 
     assert published_levels(published) == dict.fromkeys(CRITERIA)
     assert (published.aggregation.low, published.aggregation.mid, published.aggregation.high) == (None,) * 3
     assert published.result.fact_confirmations == {"not_a_job_ad:ad": "critic_confirmed"}
+    assert published.badge_possibly_not_a_job_ad is False
 
 
 def test_rule_3a_an_unverified_not_a_job_ad_is_a_real_ad_with_the_badge_and_its_levels() -> None:
@@ -224,6 +225,41 @@ def test_rule_3a_an_unverified_not_a_job_ad_is_a_real_ad_with_the_badge_and_its_
     assert levels(result.draft) == levels(v.draft) == dict.fromkeys(CRITERIA, 4)
     published = publish(v, review)
     assert published.result.not_a_job_ad is False and published.aggregation.mid is not None
+
+
+@pytest.mark.parametrize(
+    ("assessment", "stored"),
+    [
+        (None, "unconfirmed"),  # no valid review
+        ("fact_uncertain", "uncertain"),
+        ("fact_rejected", "critic_rejected"),
+        ("chain_confirmed", "unconfirmed"),  # a chain status that says more than the last review verified
+    ],
+)
+def test_rule_3a_the_badge_is_published_with_the_flag_s_unconfirmed_status(
+    assessment: str | None, stored: str
+) -> None:
+    # §11.10 3a: the badge reaches the stored result (M4's list, Task 19's eval runner), no llm_results column
+    v = validated(synthetic_wire_c(not_a_job_ad=True))
+    review = None
+    if assessment == "chain_confirmed":
+        uncertain = reviewed(v, review_item("not_a_job_ad:ad", "fact_uncertain", "Du entwickelst Services"))
+        review = Review(uncertain.validation, "none", {"not_a_job_ad:ad": "critic_confirmed"})
+    elif assessment is not None:
+        review = reviewed(v, review_item("not_a_job_ad:ad", assessment, "Du entwickelst Services"))
+    published = publish(v, review)
+    assert published.badge_possibly_not_a_job_ad is True
+    assert published.result.not_a_job_ad is False
+    assert published.result.fact_confirmations["not_a_job_ad:ad"] == stored
+    assert all(e.subject != "not_a_job_ad:ad" for e in published.evidence)  # evidence of a verified flag only
+
+
+def test_no_badge_and_no_flag_key_for_a_draft_that_is_an_ad() -> None:
+    v = validated(wire())
+    for mode in ("contested", "accepted"):
+        published = publish(v, None, mode=mode, revisions_used=0)
+        assert published.badge_possibly_not_a_job_ad is False
+        assert "not_a_job_ad:ad" not in published.result.fact_confirmations
 
 
 def test_rule_4_a_semantic_dispute_keeps_the_validated_level() -> None:
