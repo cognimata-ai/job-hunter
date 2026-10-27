@@ -20,6 +20,14 @@ plan Task 23).
 `missed` and `skipped_overlap` are terminal statuses: the tick task counts the rows a tick inserted with them
 in `RUNS` once its transaction has committed (`observe_tick`, ruling T12-e). They are never timed: such a run
 never started.
+
+**The score-cycle trigger** (§3.4 step 6; M3 Task 11). `run_tick` is unchanged; the tick task then runs
+`tick_score(engine, *, now, epoch, defer, fake_llm)` in a transaction of its own: `fence_epoch`,
+`active_config FOR SHARE`, the score lane's pause guard (`cycles.pause_reason`), no running cycle, and the
+periodic gate (a due pending target of the active tuple, and the bucket under the month lock after
+`ensure_month`, Codex r4 B8) before `cycles.request_cycle("periodic")`. The `score_cycle` task checks
+everything again under its own locks, so a stale request costs nothing. `TickScoreReport` says whether it
+requested a cycle and why the lane is paused, if it is.
 """
 
 from dataclasses import dataclass
@@ -27,13 +35,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Final, Literal
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.seed import latest_slot_at_or_before
 from jobhunter.db.sql import is_unique_violation, pg_error, q
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import RUNS
 from jobhunter.types import get_bool
+from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, defer_run_attempt
 
 CATCH_UP_AFTER: Final = timedelta(minutes=5)
@@ -291,3 +300,35 @@ async def run_tick(conn: AsyncConnection, *, now: datetime, defer: Deferrer) -> 
     return TickReport(
         missed=missed, queued_run_id=queued_run_id, skipped_overlap=skipped_overlap, cursor=cursor
     )
+
+
+@dataclass(frozen=True)
+class TickScoreReport:
+    """What the tick's score step did: whether it requested a periodic cycle, and the lane's pause reason
+    (`None` when it is not paused)."""
+
+    requested: bool
+    pause_reason: str | None
+
+
+async def tick_score(
+    engine: AsyncEngine, *, now: datetime, epoch: int, defer: Deferrer, fake_llm: bool
+) -> TickScoreReport:
+    """§3.4 step 6 in a transaction of its own (module docstring). `FencedOut`, having written nothing, when
+    `epoch` is not the current worker epoch."""
+    # Imported here: `cycles` imports the worker's task modules, which import this one.
+    from jobhunter.scoring import cycles
+
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        active = await cycles.lock_active_scoring(conn)
+        if active.llm_tuple_id is None:
+            return TickScoreReport(requested=False, pause_reason=None)
+        reason = await cycles.pause_reason(conn, fake_llm=fake_llm, now=now)
+        if reason is not None:
+            log.info("tick_score_paused", pause_reason=reason)
+            return TickScoreReport(requested=False, pause_reason=reason)
+        if await cycles.cycle_running(conn) or not await cycles.periodic_gate(conn, active, now=now):
+            return TickScoreReport(requested=False, pause_reason=None)
+        requested = await cycles.request_cycle(conn, trigger="periodic", defer=defer)
+    return TickScoreReport(requested=requested, pause_reason=None)

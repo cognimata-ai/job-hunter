@@ -37,6 +37,10 @@ issue it finds is reported:
 
 `validate_fields` returns a `Settings` only for a payload with no issue at all, so a caller cannot act on a
 refused document.
+
+**`schema_verified`** (M3 Task 11, Ruling P11) says whether a prompt-schema version's live schema dry-runs
+passed every (schema, model) pair a model policy needs; the score lane's pause guard reads it, and Task 20's
+save-time refusal will.
 """
 
 from collections.abc import Iterator, Mapping, Sequence
@@ -47,12 +51,13 @@ from typing import Final, Literal, cast
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.llm import bounds, pricing
+from jobhunter.db.sql import q
+from jobhunter.llm import bounds, pricing, schema_dry_run
 from jobhunter.llm.pricing import Model
 from jobhunter.normalize.titles import SENIORITY_LADDER
 from jobhunter.quota import dryrun
 from jobhunter.run_settings import slug
-from jobhunter.settings.model import Settings
+from jobhunter.settings.model import ModelPolicy, Settings
 from jobhunter.sources.base import REMOTE_DE
 from jobhunter.types import JSONValue, unstorable
 
@@ -321,3 +326,47 @@ async def eval_gate_state(conn: AsyncConnection) -> GateState:
     counts the active cases on `conn` and runs the gate.
     """
     return "uncalibrated"
+
+
+# ---- the live schema dry-run (M3 Task 11, Ruling P11) ----------------------------------------------------
+
+_MODEL_POLICY: Final = q("SELECT payload FROM model_policies WHERE id = :id")
+# The (schema, model) pairs of every passed case of the live dry-runs of a version, whatever the run's end.
+_PASSED_LIVE: Final = q(
+    "SELECT DISTINCT c ->> 'schema' AS schema, c ->> 'model' AS model FROM eval_runs r "
+    "CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(r.metrics -> 'cases') = 'array' "
+    "THEN r.metrics -> 'cases' ELSE '[]'::jsonb END) AS c "
+    "WHERE r.kind = 'schema_dry_run' AND r.prompt_schema_version_id = :version "
+    "AND r.metrics ->> 'transport' = 'live' AND c -> 'passed' = 'true'::jsonb"
+)
+
+
+def schema_pairs(model_policy: ModelPolicy) -> frozenset[tuple[str, str]]:
+    """The (schema, model) pairs `model_policy`'s nodes need, by the dry-run's own mapping of each schema to
+    its nodes (`schema_dry_run._SCHEMA_NODES`): the generator schema on the `generate` and `revise` models,
+    the critic schema on the `critic` model, the profile schema on the `extract_profile` model and the
+    queries schema on the `propose_queries` model."""
+    models: dict[str, str] = {node: choice.model for node, choice in model_policy.nodes.by_node().items()}
+    return frozenset(
+        (schema, models[node]) for schema, nodes in schema_dry_run._SCHEMA_NODES for node in nodes
+    )
+
+
+async def schema_verified(
+    conn: AsyncConnection, *, prompt_schema_version_id: int, model_policy_id: int
+) -> bool:
+    """Whether the live schema dry-runs of the prompt-schema version hold a passed case for every (schema,
+    model) pair the model policy's nodes need (`schema_pairs`; Codex r1 #25, r2 B24, A3 G30, Deviation 5).
+
+    Over every `schema_dry_run` run of the version with `metrics.transport = 'live'` (a fake run never
+    counts), whatever its end and whichever policy it ran for: a new policy that reuses verified models needs
+    no new run, and one that moves a node to a model without a passed live case is refused. `LookupError` for
+    a model policy that does not exist. The pause guard of the score lane reads it (`scoring.cycles`); Task 20
+    adds the save-time refusal and Task 21 the prompt-schema activation."""
+    payload = (await conn.execute(_MODEL_POLICY, {"id": model_policy_id})).scalar_one_or_none()
+    if payload is None:
+        raise LookupError(f"model policy {model_policy_id} does not exist")
+    needed = schema_pairs(ModelPolicy.model_validate(payload))
+    rows = await conn.execute(_PASSED_LIVE, {"version": prompt_schema_version_id})
+    passed = {(str(row.schema), str(row.model)) for row in rows}
+    return needed <= passed

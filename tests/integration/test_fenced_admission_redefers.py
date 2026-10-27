@@ -18,9 +18,12 @@ import uuid
 
 import pytest
 import sqlalchemy as sa
+from jobhunter.clock import utcnow
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.graph import build_noop_collect_graph
+from jobhunter.graphs.score.deps import ScoreDeps
+from jobhunter.graphs.score.graph import build_score_graphs
 from jobhunter.worker import operations as ops
 from jobhunter.worker import runs
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
@@ -197,6 +200,7 @@ async def test_a_superseded_workers_collect_loop_stops_and_leaves_the_redeferred
         JOBHUNTER_CV_STORE_DIR=str(tmp_path / "cv"),
     )
     async with open_saver(migrated.dsn("app")) as saver, operation_deps(engine, cfg) as deps:
+        score_deps = ScoreDeps(engine, deps.gateway, utcnow, deps.gateway.monotonic, saver)
         runtime = WorkerRuntime(
             cfg=cfg,
             engine=engine,
@@ -211,6 +215,8 @@ async def test_a_superseded_workers_collect_loop_stops_and_leaves_the_redeferred
             cv_store=deps.cv_store,
             profile_graphs=deps.profile_graphs,
             operation_deps=deps,
+            score_graphs=build_score_graphs(score_deps),
+            score_deps=score_deps,
         )
         loop = asyncio.create_task(
             queue_app.run_worker_async(

@@ -31,10 +31,20 @@ empty.
 node projects the subgraph's final state into, `{"results": {work_id: outcome}}` with `work_id =
 f"t:{target_id}:a{attempt_no}"` (L3453): the attempt's outcome, the target's state, its lane and the attempt's
 `cost_usd` as a decimal string (A2 G2, Deviation 16).
+
+**`CycleState`** (Task 11) is the cycle graph's: §9.3's state verbatim (L3450-3457: the cycle's ids, `claimed`
+and `results`), with `claimed` appended to (`operator.add`: the history of every claim round, for the
+report) and `results` merged by `outcomes.merge_outcomes` (an `OutcomeConflict` fails the cycle
+`failed('bug')`), plus `claim_rounds` (the rounds claimed so far, at most `graph.MAX_CLAIM_ROUNDS`),
+`current_round` (the round's admissions in admission order, `AdmittedRef`: an `admission.Picked` as plain
+data, since a checkpoint holds no class of this code) and `round_claims` (the round's claims, which the
+fan-out sends), both replaced each round. Ids, counters and enums only.
 """
 
-from typing import Final, TypedDict
+import operator
+from typing import Annotated, Final, TypedDict
 
+from jobhunter.graphs.outcomes import merge_outcomes
 from jobhunter.llm.gateway import Stage
 from jobhunter.scoring.routing import DerivedOutcome, PublishMode
 
@@ -104,6 +114,37 @@ class TargetOutcome(TypedDict):
     state: str  # the target's state
     lane: str | None
     cost_usd: str
+
+
+class AdmittedRef(TypedDict):
+    """One admission of a claim round (`admission.Picked`, as the state holds it)."""
+
+    target_id: int
+    lane: str
+    always_include_reason: str | None
+
+
+class CycleState(TypedDict):
+    cycle_id: int
+    worker_epoch: int
+    llm_tuple_id: int
+    scope_version_id: int
+    evaluation_policy_id: int
+    claimed: Annotated[list[ClaimRef], operator.add]  # {target_id, claim_id, attempt_no}, every round's
+    results: Annotated[dict[str, TargetOutcome], merge_outcomes]  # work_id = f"t:{target_id}:a{attempt_no}"
+    claim_rounds: int
+    current_round: list[AdmittedRef]
+    round_claims: list[ClaimRef]
+
+
+class CycleUpdate(TypedDict, total=False):
+    """A cycle node's partial update of `CycleState`."""
+
+    claimed: list[ClaimRef]
+    results: dict[str, TargetOutcome]
+    claim_rounds: int
+    current_round: list[AdmittedRef]
+    round_claims: list[ClaimRef]
 
 
 def work_id(target_id: int, attempt_no: int) -> str:

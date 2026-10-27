@@ -112,6 +112,8 @@ class World:
         self.deps: list[object] = []
         self.profile_deps: list[object] = []  # Task 11: what the profile graphs were built with
         self.profile_graphs = object()
+        self.score_deps: list[object] = []  # M3 Task 11: what the score graphs were built with
+        self.score_graphs = object()
         world = self
 
         class FakeLockSession:
@@ -200,6 +202,10 @@ class World:
             world.profile_deps.append(deps)
             return world.profile_graphs
 
+        def fake_build_score_graphs(deps: object) -> object:
+            world.score_deps.append(deps)
+            return world.score_graphs
+
         async def fake_reconcilers(ctx: Any, cadence: str) -> dict[str, int]:
             events.append(f"reconcile_{cadence}")
             world.contexts.append(ctx)
@@ -256,6 +262,7 @@ class World:
             "open_saver": fake_open_saver,
             "build_collect_graph": fake_build_collect_graph,
             "build_profile_graphs": fake_build_profile_graphs,
+            "build_score_graphs": fake_build_score_graphs,
             "run_reconcilers": fake_reconcilers,
             "EXECUTIONS": FakeExecutions(),
             "make_clients": recording_make_clients,
@@ -468,8 +475,11 @@ async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_p
     """Task 11: after the saver, the gateway (on the fake LLM here), the parse client on `cfg.parse_jobs_dir`
     (its leftovers removed at the start), the CV store on `cfg.cv_store_dir` and the profile graphs on
     their process-wide deps; `operation_deps` holds the same objects and the shared embedder, and the
-    gateway's HTTP client is closed at teardown."""
+    gateway's HTTP client is closed at teardown. M3 Task 11: the score graphs on `ScoreDeps` of the same
+    engine, gateway and saver."""
+    from jobhunter.clock import utcnow
     from jobhunter.graphs.profile.deps import ProfileDeps
+    from jobhunter.graphs.score.deps import ScoreDeps
     from jobhunter.llm.gateway import LLMGateway
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -507,6 +517,16 @@ async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_p
     )
     assert runtime.gateway.http_client.is_closed  # the teardown's `llm` step
     assert runtime.gateway.configured and logged(caplog, "llm_not_configured") == []
+    # M3 Task 11: the score graphs on the process's engine, gateway, clock and saver, compiled once
+    [score_deps] = world.score_deps
+    assert runtime.score_graphs is world.score_graphs and runtime.score_deps is score_deps
+    assert isinstance(score_deps, ScoreDeps)
+    assert (score_deps.engine, score_deps.gateway, score_deps.saver) == (
+        runtime.engine,
+        runtime.gateway,
+        runtime.saver,
+    )
+    assert score_deps.monotonic is runtime.gateway.monotonic and score_deps.clock is utcnow
 
 
 async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_not_configured(
@@ -635,6 +655,9 @@ M2_RECONCILERS = {
     "scope_apply_failed": ["tick"],
     "profile_vectors": ["heavy"],
 }
+# The M3 reconcilers so far: `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
+# `score_targets` and `score_cycles`; Ruling P44).
+M3_RECONCILERS = {"orphaned_cycles": ["tick"]}
 # Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
 # from `sys.modules` (each registry module is imported by the modules that register into it).
 _REGISTRY_SCRIPT = """\
@@ -674,8 +697,9 @@ def registered_by(modules: tuple[str, ...]) -> dict[str, object]:
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
     """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
     (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
-    anyway), the registries hold exactly the M1 and M2 reconcilers with their cadences, the two takeover
-    sweeps, the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
+    anyway), the registries hold exactly the M1, M2 and M3 (so far) reconcilers with their cadences, the four
+    takeover sweeps (`operations`, `runs`, and M3 Task 11's `score_targets` and `score_cycles`), the
+    `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
     `propose_queries` (Task 20), `apply_scope` (Task 18) and `watchlist_validate` handlers, and the failure
     hooks of the two profile phases and of the query proposal (`embed_profile` has none: it drives no domain
     row). `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with
@@ -683,8 +707,8 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
-        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS},
-        "sweeps": ["operations", "runs"],
+        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS, **M3_RECONCILERS},
+        "sweeps": ["operations", "runs", "score_cycles", "score_targets"],
         "handlers": [
             "apply_scope",
             "embed_profile",

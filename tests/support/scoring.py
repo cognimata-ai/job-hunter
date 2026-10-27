@@ -52,12 +52,25 @@ result tables, `score_config(deps, claimed, claims)` (the invoke config `invoke_
 tracker), `state_at_terminal(deps, claimed, monkeypatch)` (the state with which an attempt reaches `publish`
 or `fail`, run with the stub terminals, so a test calls a real terminal node on it) and `ended_with(command)`
 (the `outcome` a terminal node's `Command` sets).
+
+M3 Task 11 adds the cycle's side:
+- `activate_score_tuple(conn)` makes the score tuple the active one (a cycle starts only under an active
+  tuple), and `insert_targets(engine, n, *, lane=None)` makes `n` pending targets of `n` new jobs
+  (`insert_target`) under it, each with `lane` when given (`score_now`: what the API's Score now leaves);
+- `cycle_runner(engine, gateway, *, sleep=asyncio.sleep, epoch=1)`: the process side of score cycles for a
+  test, `CycleRunner`: the deps on `gateway` with the test evaluation policy active (`score_deps`, so
+  `t8_sample_pct = 0` unless a test exercises T8, Ruling P48) and an in-memory checkpoint saver, the graphs
+  compiled once (`graph.build_score_graphs`), `start(trigger)` (`cycles.start_cycle` as worker `epoch`, in
+  fake LLM mode) and `run(cycle_id)` (`graph.invoke_cycle` with a fresh `ClaimHeartbeats` on the injected
+  `sleep`, kept as `claims`), so a test drives the claim beats with a `ManualSleep`;
+- `cycle_of(engine, cycle_id)`: a cycle's status, reason, trigger, admission, `ĉ`, bucket, spend and report.
 """
 
 import asyncio
+import dataclasses
 import hashlib
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, cast
@@ -66,22 +79,27 @@ import pytest
 from jobhunter.db.seed import canonical_json, load_settings_v1
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition, transition_where
+from jobhunter.graphs.score import graph as score_graph
 from jobhunter.graphs.score import subgraph
+from jobhunter.graphs.score.claims import ClaimHeartbeats
 from jobhunter.graphs.score.context import ScoreContext
 from jobhunter.graphs.score.deps import ScoreDeps
+from jobhunter.graphs.score.graph import ScoreGraphs
 from jobhunter.graphs.score.nodes import Node
-from jobhunter.graphs.score.state import ClaimRef, TargetState, initial_state
+from jobhunter.graphs.score.state import ClaimRef, CycleState, TargetState, initial_state
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.llm.schemas.generator import DraftCriterion, JobFacts, RequiredLanguage
 from jobhunter.llm.schemas.profile import ConfirmedProfile, Language
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.run_settings import ScopeLocation
-from jobhunter.scoring import routing
+from jobhunter.scoring import cycles, routing
+from jobhunter.scoring.cycles import CycleTrigger
 from jobhunter.scoring.evaluation_policy import EvaluationPolicy
 from jobhunter.scoring.routing import DerivedOutcome, Route
 from jobhunter.sources.parsing.locations import Candidate, Location
 from jobhunter.types import JSONValue, get_object
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -371,6 +389,8 @@ async def insert_target(
 
 
 _TARGET_IDS: Final = q("SELECT job_id, job_revision_id, llm_tuple_id FROM score_targets WHERE id = :t")
+# The claim node returns the claimed target's resume draft as well (Task 11), so the statement here is its.
+_CLAIM_AGAIN_RETURNING: Final = (*CLAIM_RETURNING, "resume_draft_id")
 _NEW_ATTEMPT: Final = q(
     "INSERT INTO score_attempts (target_id, attempt_no, mode, claim_id, claim_epoch, execution_config_id, "
     "evaluation_policy_id, lane, outcome, resumed_from_attempt_id) "
@@ -401,7 +421,7 @@ async def claim_again(
                 "max_attempts": 4,
             },
             set_sql=CLAIM_SET_SQL,
-            returning=CLAIM_RETURNING,
+            returning=_CLAIM_AGAIN_RETURNING,
         )
         (claim,) = rows
         params = {
@@ -782,3 +802,87 @@ def ended_with(command: Command[Any]) -> str:
     update = command.update
     assert isinstance(update, dict), "a terminal node updates the state"
     return str(update["outcome"])
+
+
+# ---- M3 Task 11: the score cycle -------------------------------------------------------------------------
+
+_SET_LANE: Final = q("UPDATE score_targets SET lane = :lane WHERE id = :t")
+_ACTIVATE_TUPLE: Final = q(
+    "UPDATE active_config SET profile_version_id = u.profile_version_id, llm_tuple_id = u.id, "
+    "updated_at = now() FROM llm_tuples u WHERE active_config.id = 1 AND u.id = :t"
+)
+
+
+async def activate_score_tuple(conn: AsyncConnection) -> int:
+    """The score tuple (`score_llm_tuple`) made the active one, its profile version with it (the reset
+    restores no tuple); its id."""
+    tuple_id = await score_llm_tuple(conn)
+    await conn.execute(_ACTIVATE_TUPLE, {"t": tuple_id})
+    return tuple_id
+
+
+async def insert_targets(engine: AsyncEngine, n: int, *, lane: str | None = None) -> list[PendingTarget]:
+    """`n` pending targets of `n` new jobs (`insert_target`), each with `lane` when given, over the score
+    tuple made active (`activate_score_tuple`)."""
+    made = [await insert_target(engine) for _ in range(n)]
+    async with engine.begin() as conn:
+        await activate_score_tuple(conn)
+        if lane is not None:
+            for target in made:
+                await conn.execute(_SET_LANE, {"lane": lane, "t": target.target_id})
+    return made
+
+
+@dataclass
+class CycleRunner:
+    """The process side of score cycles for a test (module notes)."""
+
+    deps: ScoreDeps
+    graphs: ScoreGraphs
+    sleep: Callable[[float], Awaitable[None]]
+    epoch: int = 1
+    claims: ClaimHeartbeats | None = None
+
+    async def start(self, trigger: CycleTrigger = "manual", *, fake_llm: bool = True) -> int:
+        """A new cycle of `trigger` (`cycles.start_cycle` as this runner's epoch); one must start."""
+        async with self.deps.engine.begin() as conn:
+            cycle_id = await cycles.start_cycle(
+                conn, trigger=trigger, now=self.deps.clock(), epoch=self.epoch, fake_llm=fake_llm
+            )
+        assert cycle_id is not None, f"no {trigger} cycle started"
+        return cycle_id
+
+    async def context(self, cycle_id: int) -> ScoreContext:
+        """The cycle's `ScoreContext` (`graph.cycle_context`), with a fresh `ClaimHeartbeats` on the
+        injected sleep (`claims`)."""
+        self.claims = ClaimHeartbeats(self.deps.engine, monotonic=self.deps.monotonic, sleep=self.sleep)
+        return await score_graph.cycle_context(self.deps, cycle_id, claims=self.claims)
+
+    async def run(self, cycle_id: int) -> CycleState:
+        """The cycle's graph invocation (`graph.invoke_cycle`); its final state."""
+        return await score_graph.invoke_cycle(self.graphs.cycle, await self.context(cycle_id))
+
+
+async def cycle_runner(
+    engine: AsyncEngine,
+    gateway: LLMGateway,
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    epoch: int = 1,
+) -> CycleRunner:
+    """A `CycleRunner` on `gateway` (module notes)."""
+    deps = dataclasses.replace(await score_deps(engine, gateway), saver=InMemorySaver())
+    return CycleRunner(deps=deps, graphs=score_graph.build_score_graphs(deps), sleep=sleep, epoch=epoch)
+
+
+_CYCLE_ROW: Final = q(
+    "SELECT status, status_reason, trigger, worker_epoch, admission_size, admitted, c_hat_usd, "
+    "bucket_usd_at_start, spent_usd, report, finished_at FROM score_cycles WHERE id = :c"
+)
+
+
+async def cycle_of(engine: AsyncEngine, cycle_id: int) -> Row[Any]:
+    """The cycle's status, reason, trigger, epoch, admission (`S` and `admitted`), `ĉ`, bucket at its start,
+    spend, report and end."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_CYCLE_ROW, {"c": cycle_id})).one()

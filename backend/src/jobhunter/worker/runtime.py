@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     # Only for the annotations: `shutdown` imports this module, and the M2 dependencies (Task 11) pull in the
     # SDK and modules that import the task blueprint, which imports this one.
     from jobhunter.graphs.profile.graph import ProfileGraphs
+    from jobhunter.graphs.score.deps import ScoreDeps
+    from jobhunter.graphs.score.graph import ScoreGraphs
     from jobhunter.llm.gateway import LLMGateway
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -91,3 +93,7 @@ class WorkerRuntime:
     cv_store: "CvStore"
     profile_graphs: "ProfileGraphs"
     operation_deps: "OperationDeps"
+    # M3 (Task 11): the score graphs, compiled once (the cycle graph and the subgraph its wrapper invokes),
+    # and their process-wide deps, which `score_cycle` runs every cycle on.
+    score_graphs: "ScoreGraphs"
+    score_deps: "ScoreDeps"

@@ -19,7 +19,9 @@
    Task 23), the docparse client on
    `cfg.parse_jobs_dir` (every leftover a crashed worker left there removed first, §12.2), the CV store on
    `cfg.cv_store_dir`, the profile graphs on their process-wide `ProfileDeps`, and `OperationDeps` over
-   them, the embedder and the clock, which `run_operation` hands to every execution. The collection deps:
+   them, the embedder and the clock, which `run_operation` hands to every execution; the score graphs (M3
+   Task 11: `graphs.score.graph.build_score_graphs` on `ScoreDeps` of the engine, the gateway, the clock, the
+   gateway's monotonic clock and the saver), which `score_cycle` invokes every cycle. The collection deps:
    the HTTP layer configured first (`http.configure(cfg)`: in fake
    mode the fixture transport serves every source), then one client per source (`registry.make_clients`,
    which in fake mode refuses to run before that configuration: a client made earlier would be on the live
@@ -108,6 +110,8 @@ from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.graphs.collect.graph import build_collect_graph
 from jobhunter.graphs.profile.deps import ProfileDeps
 from jobhunter.graphs.profile.graph import build_profile_graphs
+from jobhunter.graphs.score.deps import ScoreDeps
+from jobhunter.graphs.score.graph import build_score_graphs
 from jobhunter.llm import transport as llm_transport
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
@@ -153,6 +157,9 @@ _REGISTERING_MODULES: Final = (
     # `profile_vectors` reconciler (Task 19)
     "jobhunter.profile.operations",
     "jobhunter.settings.scope_apply",  # the `apply_scope` handler and `scope_apply_failed` (M2 Task 18)
+    # the takeover sweeps `score_targets` and `score_cycles` and `orphaned_cycles` (M3 Task 11; Task 27 adds
+    # the remaining M3 modules)
+    "jobhunter.scoring.cycles",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
@@ -262,6 +269,10 @@ class _WorkerProcess:
         parse_client.cleanup_leftovers()  # before any job: what a crashed worker left (§12.2)
         cv_store = CvStore(cfg.cv_store_dir)
         profile_graphs = build_profile_graphs(saver, ProfileDeps(engine=engine, clock=utcnow))
+        score_deps = ScoreDeps(
+            engine=engine, gateway=gateway, clock=utcnow, monotonic=gateway.monotonic, saver=saver
+        )
+        score_graphs = build_score_graphs(score_deps)
         http.configure(cfg)  # before the clients: in fake mode they must be on the fixture transport
         clients = self.clients = make_clients(cfg)
         shutdown = self.shutdown
@@ -304,6 +315,8 @@ class _WorkerProcess:
             cv_store=cv_store,
             profile_graphs=profile_graphs,
             operation_deps=operation_deps,
+            score_graphs=score_graphs,
+            score_deps=score_deps,
         )
 
         # 8. The source instances synced with the secrets under this worker's epoch fence, the start

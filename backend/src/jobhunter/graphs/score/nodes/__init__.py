@@ -51,7 +51,7 @@ from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.graphs.score.deps import ScoreDeps
 from jobhunter.graphs.score.llm_step import error_code_of
-from jobhunter.graphs.score.state import TargetState, TargetUpdate
+from jobhunter.graphs.score.state import CycleState, CycleUpdate, TargetState, TargetUpdate
 from jobhunter.llm.errors import LLMError
 from jobhunter.llm.gateway import CallContext, GatewayResult, RenderedPrompt, pinned_node_config
 from jobhunter.llm.pricing import Effort
@@ -91,6 +91,16 @@ class StateNode[U](Protocol):
 
 
 type Node = StateNode[Command[Route]]
+
+
+class CycleStateNode[S](Protocol):
+    """A node of the cycle graph (Task 11): its input (the cycle's state, or the claim a `Send` carries) and
+    the invoke config, to its partial update of the cycle's state."""
+
+    async def __call__(self, state: S, config: RunnableConfig) -> CycleUpdate: ...
+
+
+type CycleNode = CycleStateNode[CycleState]
 
 
 def derived_outcome(value: object) -> DerivedOutcome:

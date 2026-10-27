@@ -27,7 +27,7 @@ target goes from `in_progress` (its claim columns cleared by the transition, its
   2^(failures - 1))` of the count after this failure), else `failed_transient`.
 The attempt goes `running → <outcome>` with its `outcome_detail`. The state's `outcome` is the attempt's.
 
-`MAX_SCORE_ATTEMPTS` is here until Task 11's `scoring/admission.py` holds it (Ruling P12).
+`MAX_SCORE_ATTEMPTS` is `scoring.admission`'s, the one definition (Ruling P12, Controller carry T10-a).
 """
 
 from datetime import timedelta
@@ -49,10 +49,10 @@ from jobhunter.llm import bulk, spend_ledger
 from jobhunter.llm.budget import month_of
 from jobhunter.llm.gateway import REFUSED
 from jobhunter.scoring import routing
+from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
 from jobhunter.scoring.routing import CLAIM_LOST, Route
 
 NAME: Final = "fail"
-MAX_SCORE_ATTEMPTS: Final = 4  # §7.16.3 L2863, against `charged_attempts`
 BACKOFF_FIRST: Final = timedelta(minutes=15)
 BACKOFF_CEILING: Final = timedelta(hours=6)
 _CEILING_FROM: Final = 5  # 15 min * 2^5 is above the ceiling

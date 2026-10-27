@@ -21,7 +21,14 @@ def test_reset_task_app_allows_a_fresh_task_app() -> None:
         # The tasks were namespaced once, not twice.
         assert sorted(name for name in second.tasks if name.startswith("jh")) == sorted(
             job_task_name(name)
-            for name in ("run_collect", "run_operation", "tick", "reconcile_heavy", "retention_daily")
+            for name in (
+                "run_collect",
+                "run_operation",
+                "tick",
+                "reconcile_heavy",
+                "retention_daily",
+                "score_cycle",  # M3 Task 11
+            )
         )
     finally:
         _reset_task_app()
