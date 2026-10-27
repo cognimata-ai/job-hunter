@@ -27,14 +27,15 @@ them: `validate_step` takes it from its caller, which reads it under `active_con
   the policy (`triggers.evaluate`). It stores the corrected draft with its validation, failures, provisional
   aggregation and triggers (`DraftStore.save_validation`, `ValidationRecord`). When that note reviewed this
   very draft (a resumed attempt), `Validated` carries the note's derived outcome and the failures without
-  those of the facts it rejected (`unresolved_failures`), so the routing goes where the live critic round
-  went (Codex r2 B23).
+  those of the facts it rejected (`validator.unresolved_failures`), so the routing goes where the live critic
+  round went (Codex r2 B23).
 - `critic_step`: the stored draft validated again (pure: the same result as the stored one), the round's
   effort (`critic_effort`), the critic call with `<draft>`, `<required_facts>` and `<validator_issues>`
   (`llm_calls.round` is the critic round, 1-3), `parse_critic`, `validate_review`, the fact confirmations of
   this round over the last note's (`apply_fact_confirmations`), and the note stored (`DraftStore.add_note`).
   `Reviewed.det_failures` are the draft's failure keys without those of the facts the review rejected (a
-  rejected fact is dropped, L4555; `unresolved_failures`). An invalid output is `Reviewed` without a note.
+  rejected fact is dropped, L4555; `validator.unresolved_failures`, the rule of the derived outcome's
+  condition 5 too). An invalid output is `Reviewed` without a note.
 - `revise_step`: the reviser call (`round` the new draft's, 1-2) with `<previous_draft>` (the validated
   draft) and `<issues>` (L4544: the validator's failures and issues, the critic's grounded disputes with
   their suggested levels and quotes, the `fact_rejected`, `fact_uncertain` and unreviewed required facts, and
@@ -98,6 +99,7 @@ from jobhunter.scoring.validator import (
     parse_critic,
     parse_generator,
     profile_sections,
+    unresolved_failures,
     validate_draft,
     validate_review,
 )
@@ -342,14 +344,6 @@ def failure_keys(validation: DraftValidation) -> list[str]:
     """The keys of the draft's deterministic failures, in order, distinct (`score_drafts`'
     `deterministic_failures`)."""
     return list(dict.fromkeys(failure.key for failure in validation.failures))
-
-
-def unresolved_failures(failures: Sequence[str], fact_reviews: Mapping[str, object]) -> list[str]:
-    """`failures` without the keys of the facts a critic review rejected (`fact_reviews`: fact id to its
-    review): a rejected fact is dropped with its failures (L4555). The one rule of the live critic round
-    (`critic_step`) and of a resumed draft routed by its restored review (`validate_step`)."""
-    rejected = {name for name, status in fact_reviews.items() if status == "critic_rejected"}
-    return [key for key in failures if key not in rejected]
 
 
 def _decimal(value: object) -> JSONValue:

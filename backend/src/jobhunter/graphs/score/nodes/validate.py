@@ -13,7 +13,7 @@ triggers. The provisional aggregation reads the confirmations, the injection ass
 The state takes the triggers and the unresolved failure keys (`state.state_failure_keys`); the routing
 (`routing.after_validate`) goes to `publish`, `critic` or, for a resumed draft that already has its review
 (the last note reviewed the current draft), where that review routes (`revise` or `publish`), with the
-failures of the facts it rejected dropped as after the live critic round (`steps.unresolved_failures`).
+failures of the facts it rejected dropped as after the live critic round (`validator.unresolved_failures`).
 """
 
 from typing import Final

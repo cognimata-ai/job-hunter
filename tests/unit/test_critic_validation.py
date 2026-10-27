@@ -3,7 +3,8 @@ L4365; M3 Task 5).
 
 - `accept` iff the review is complete, every required fact is confirmed or rejected with a grounded ad quote,
   no grounded dispute remains, the injection did not influence the draft, and the draft has no unresolved
-  failure; each condition failing alone gives `revise`, except completeness, which gives `incomplete`.
+  failure (the failures of a fact the review rejects are resolved by it, Ruling T9-f); each condition
+  failing alone gives `revise`, except completeness, which gives `incomplete`.
 - A review without a grounded quote is discarded: a discarded dispute never blocks, a discarded fact review
   leaves its fact `uncertain`, which does.
 - `not_a_job_ad:ad` is special-cased: rejected gives `revise` whatever else holds, uncertain or missing
@@ -33,7 +34,14 @@ from jobhunter.scoring.validator import (
     validate_review,
 )
 
-from tests.support.validation import CRITERIA, criterion_item, ctx_for, synthetic_ad, synthetic_wire_c
+from tests.support.validation import (
+    CRITERIA,
+    criterion_item,
+    ctx_for,
+    fact_item,
+    synthetic_ad,
+    synthetic_wire_c,
+)
 
 GROUNDED = "Python, PostgreSQL"
 FRENCH: FactRef = fact_ref("mandatory_language", "fr")
@@ -162,6 +170,53 @@ def test_condition_5_an_unresolved_draft_failure_is_revise() -> None:
     assert validated_draft().failures == [] and validated_draft(not_a_job_ad=True).failures == []
     v = validate(critic(CONFIRM_FRENCH, REJECT_PERMIT), ungrounded=True)
     assert v.derived_outcome == "revise" and v.complete is True
+
+
+CERTIFICATE: FactRef = fact_ref("certification", "aws solutions architect")
+
+
+def certified_draft(*, ungrounded_skills: bool = False) -> DraftValidation:
+    """The synthetic draft with a mandatory certification whose quote does not ground in `CTX`'s ad (a V3
+    failure of its fact id), and with an ungrounded skills quote too when `ungrounded_skills`."""
+    facts = [
+        fact_item("work_mode", "hybrid", "Berlin, hybrid"),
+        fact_item("must_have", "Python", GROUNDED),
+        fact_item("employment_type", "full_time", "full_time (structured)"),
+        fact_item(
+            "certification", "AWS Solutions Architect", "AWS Solutions Architect erforderlich", required=True
+        ),
+    ]
+    items = [criterion_item(key, level=4) for key in CRITERIA]
+    if ungrounded_skills:
+        items[1] = criterion_item("skills", level=4, ad_evidence=("Java und Kotlin",))
+    parsed = parse_generator(synthetic_wire_c(facts=facts, criteria=items), family="generator_v2_items")
+    assert isinstance(parsed, ParsedGenerator)
+    return validate_draft(parsed.draft, CTX, normalisation=parsed.normalisation)
+
+
+def test_condition_5_a_failure_of_a_fact_the_review_rejects_is_resolved_by_it() -> None:
+    # Ruling T9-f: a fact the review rejects with a grounded quote is dropped with its failures (L4555)
+    draft = certified_draft()
+    assert draft.failures == [Failure(CERTIFICATE.fact_id, "quote_ungrounded")]  # its only failure
+    rejected = review(CERTIFICATE.fact_id, "fact_rejected", GROUNDED)
+    v = validate_review(critic(rejected), validation=draft, required=[CERTIFICATE], ctx=CTX)
+    assert v.fact_reviews == {CERTIFICATE.fact_id: "critic_rejected"} and v.complete is True
+    assert v.derived_outcome == "accept" and v.verdict_mismatch is False
+    # a confirmation keeps the fact and its failure; another failure stays unresolved after the rejection
+    confirmed = review(CERTIFICATE.fact_id, "fact_confirmed", GROUNDED)
+    kept = validate_review(critic(confirmed), validation=draft, required=[CERTIFICATE], ctx=CTX)
+    assert kept.derived_outcome == "revise"
+    both = certified_draft(ungrounded_skills=True)
+    other = validate_review(critic(rejected), validation=both, required=[CERTIFICATE], ctx=CTX)
+    assert other.derived_outcome == "revise"
+
+
+def test_condition_5_a_discarded_rejection_resolves_nothing() -> None:
+    ungrounded = review(CERTIFICATE.fact_id, "fact_rejected", "nicht im Text")
+    v = validate_review(critic(ungrounded), validation=certified_draft(), required=[CERTIFICATE], ctx=CTX)
+    assert v.discarded == [Issue("review_ungrounded", "reviews[0]", {"target": CERTIFICATE.fact_id})]
+    assert v.fact_reviews == {CERTIFICATE.fact_id: "uncertain"}  # not a rejection
+    assert v.derived_outcome == "revise"
 
 
 def test_a_missing_required_review_is_incomplete_and_counts_as_uncertain() -> None:

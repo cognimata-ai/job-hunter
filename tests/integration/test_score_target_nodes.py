@@ -18,13 +18,19 @@ from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.errors import NodeFailed
 from jobhunter.graphs.score import nodes as score_nodes
+from jobhunter.graphs.score import subgraph
 from jobhunter.graphs.score.deps import ScoreDeps
+from jobhunter.graphs.score.nodes import Node
+from jobhunter.graphs.score.state import TargetState
 from jobhunter.llm import fake
 from jobhunter.llm import gateway as gateway_module
 from jobhunter.llm.prompts.render import prompt_schema_v2
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.observability.metrics import REGISTRY
+from jobhunter.scoring.routing import Route
 from jobhunter.scoring.validator import ParsedGenerator, parse_generator
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.faults import SimulatedCrash, no_fault, raising_at
@@ -640,8 +646,9 @@ def answer_scenario(purpose: str, revision: int, round: int, scenario: fake.Scen
     fake.answer(fake.answer_key(purpose, {"job_revision_id": revision}, round), scenario)
 
 
-# A mandatory certification whose quote does not ground (a V3 failure of its fact id), which the critic
-# rejects with a grounded quote and an `accept` verdict.
+# A mandatory certification whose quote does not ground (a V3 failure of its fact id, the draft's only
+# failure), which the critic rejects with a grounded quote and an `accept` verdict: the review resolves the
+# failure with the fact (Ruling T9-f), so the derived outcome is `accept`.
 UNGROUNDED_CERTIFICATE = fact_item(
     "certification",
     "AWS Solutions Architect",
@@ -652,50 +659,58 @@ REJECTED = review_item(CERTIFICATION, "fact_rejected", "Python, PostgreSQL")
 
 
 async def rejected_certificate(engine: AsyncEngine, fake_llm: FakeLLM) -> ClaimedTarget:
-    """A claimed target of the scenario above, whose reviser refuses."""
+    """A claimed target of the scenario above (no reviser answer: a revision would be a request error)."""
     claimed = await claimed_target(engine, ad=CERTIFIED_AD)
     revision = claimed.job_revision_id
     fake_llm.answer("generate", revision, synthetic_c_draft(facts=[*FACTS, UNGROUNDED_CERTIFICATE]))
     fake_llm.answer("critic", revision, synthetic_review(REJECTED), round=1, schema=CriticOut)
-    answer_scenario("revise", revision, 1, "refusal")
     return claimed
 
 
-async def test_a_resumed_review_drops_the_rejected_facts_failures_as_the_live_critic_does(
+def crashing_publish(deps: ScoreDeps) -> Node:
+    """A `publish` that dies before its transaction commits (C12)."""
+
+    async def publish(state: TargetState, config: RunnableConfig) -> Command[Route]:
+        raise SimulatedCrash("publish")
+
+    return publish
+
+
+async def test_a_rejected_fact_s_failure_is_resolved_live_and_on_a_resume_without_a_revision(
     engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    record_scoring(fake_llm)
     live = await rejected_certificate(engine, fake_llm)
     live_final = await invoke_subgraph(deps, live)
-    # the same scenario dies after the critic's note has committed, at its reviser's reservation
+    # the same scenario dies in its publish, after the critic's note has committed
     crashed = await rejected_certificate(engine, fake_llm)
-    monkeypatch.setattr(gateway_module, "afault_point", crash_at_arrival("gateway.after_reserve", 3))
+    monkeypatch.setattr(subgraph, "make_publish", crashing_publish)
     with pytest.raises(NodeFailed):
         await invoke_subgraph(deps, crashed)
-    monkeypatch.setattr(gateway_module, "afault_point", no_fault)
+    stub_terminals(monkeypatch)
     await reclaim_now(engine, crashed.target_id)
     again = await claim_again(engine, crashed.target_id)
     resumed_final = await invoke_subgraph(deps, again)
     for final in (live_final, resumed_final):
-        # derived `revise` (the draft has a failure, `validate_review`); the rejected fact's failure is gone
         assert (final["outcome"], final["last_critic_outcome"], final["det_failures"]) == (
-            "fail(refused)",
-            "revise",
+            "publish(accepted)",
+            "accept",
             [],
         )
-    assert resumed_final["resumed"] is True
+    assert resumed_final["resumed"] is True and resumed_final["critic_rounds"] == 1
     for target in (live, crashed):
         (draft,) = await rows(engine, _DRAFTS, target.target_id)
         assert draft.deterministic_failures == [CERTIFICATION]  # the draft's exact key stays on its row
         (note,) = await rows(engine, _NOTES, target.target_id)
-        assert (note.verdict_returned, note.derived_outcome) == ("accept", "revise")
-    live_calls = await rows(engine, _CALLS, live.target_id)
-    assert [(c.purpose, c.round) for c in live_calls] == [("generate", 0), ("critic", 1), ("revise", 1)]
-    resumed_calls = [
-        c for c in await rows(engine, _CALLS, crashed.target_id) if c.attempt_id == again.attempt_id
-    ]
-    # the resumed attempt went where the live critic went, with no second critic call
-    assert [(c.purpose, c.round, c.logical_call_no) for c in resumed_calls] == [("revise", 1, 1)]
+        assert (note.verdict_returned, note.derived_outcome) == ("accept", "accept")
+        calls = await rows(engine, _CALLS, target.target_id)
+        # one generation and one critic round: no paid revision on either path
+        assert [(c.purpose, c.round, c.attempt_id) for c in calls] == [
+            ("generate", 0, target.attempt_id),
+            ("critic", 1, target.attempt_id),
+        ]
+    assert fake_llm.requests and not served(fake_llm, "revise")
+    # the resumed attempt was routed by the restored review: it made no call at all
+    assert (await attempt_of(engine, again.attempt_id)).logical_calls == 0
 
 
 async def test_a_budget_denial_before_the_first_dispatch_fails_the_attempt_cleanly(

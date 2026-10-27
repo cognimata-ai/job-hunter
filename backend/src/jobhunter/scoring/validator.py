@@ -86,6 +86,9 @@ publication cut.
 **The critic** (`validate_review`, §11.7.2): a target is an LLM criterion key with a criterion assessment,
 or a required fact id with a `fact_*` assessment; a review needs a grounded ad quote (the first 2 grounded
 count), else it is discarded; the derived outcome follows §11.7.2 with V6 special-cased first (L4365).
+Condition 5's "unresolved" failures are those `unresolved_failures` leaves: a fact the same review rejects
+with a grounded quote is dropped with its failures (L4555 item 3; Controller Ruling T9-f), the rule the score
+routing applies to its `det_failures` as well (`scoring.steps`).
 """
 
 import functools
@@ -1402,6 +1405,16 @@ def _review_groundings(
     return found
 
 
+def unresolved_failures(failures: Sequence[str], fact_reviews: Mapping[str, object]) -> list[str]:
+    """`failures` (failure keys) without the keys of the facts a critic review rejected (`fact_reviews`: a
+    fact id to its review, `critic_rejected` for a rejection with a grounded quote; a discarded rejection is
+    `uncertain`): a rejected fact is dropped with its failures (L4555 item 3, Controller Ruling T9-f). The one
+    rule of `validate_review`'s condition 5, of the live critic round's `det_failures` and of a resumed draft
+    routed by its restored review (`scoring.steps`)."""
+    rejected = {name for name, status in fact_reviews.items() if status == "critic_rejected"}
+    return [key for key in failures if key not in rejected]
+
+
 def validate_review(
     review: CriticOut,
     *,
@@ -1412,7 +1425,12 @@ def validate_review(
     """The critic review of a validated draft (`validation`: its corrected draft and its unresolved
     failures, the stored normalisation's included), with its derived outcome (§11.7.2; module docstring).
     `required` are the facts the critic had to review (`knockouts.required_facts`; `not_a_job_ad:ad` is
-    required whenever the draft says it is no job ad)."""
+    required whenever the draft says it is no job ad).
+
+    Condition 5 (Controller Ruling T9-f): the draft's failures do not count when they are those of a fact
+    this review rejects with a grounded quote (`unresolved_failures` over the round's fact reviews): the
+    rejected fact is dropped with its failures (L4555 item 3), so the review resolved them. A rejection that
+    was discarded (no grounded quote) leaves its fact `uncertain` and resolves nothing."""
     draft = validation.draft
     required_ids = list(dict.fromkeys(ref.fact_id for ref in required))
     if draft.not_a_job_ad and NOT_A_JOB_AD.fact_id not in required_ids:
@@ -1475,7 +1493,7 @@ def validate_review(
         and all(status in _DECIDED for status in ordered.values())
         and not disputes
         and review.injection != "present_influenced"
-        and not validation.failures
+        and not unresolved_failures([f.key for f in validation.failures], ordered)
     ):
         outcome = "accept"
     else:

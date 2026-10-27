@@ -26,7 +26,7 @@ from jobhunter.llm.errors import (
 from jobhunter.llm.prompts.render import PromptVersionUnscorable
 from jobhunter.scoring import routing
 from jobhunter.scoring.routing import Next
-from jobhunter.scoring.steps import unresolved_failures
+from jobhunter.scoring.validator import unresolved_failures
 from langgraph.errors import NodeTimeoutError
 
 from tests.support.scoring import Walk, route
