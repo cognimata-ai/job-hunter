@@ -31,6 +31,7 @@ from jobhunter.scoring import batches as batches_mod
 from jobhunter.settings.model import ModelPolicy
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.lock import LockSession
+from jobhunter.worker.operations import cancel_operation, create_operation
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.batches import (
@@ -431,6 +432,76 @@ async def test_a_create_never_sent_refunds_with_the_connect_evidence(
     assert await open_alerts(engine, "llm.auth_failed") == []
 
 
+@pytest.mark.parametrize(
+    "rejected",
+    [
+        Rejected(429, "rate_limit_error", "test: refused"),
+        Rejected(409, "conflict_error", "test: refused"),
+        Rejected(None, "connect_failed", "", evidence="connect_failed_before_send"),
+    ],
+    ids=["429", "409", "connect"],
+)
+async def test_a_not_sent_rejection_leaves_the_follow_on_to_the_reconciler(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    current_epoch: int,
+    monkeypatch: pytest.MonkeyPatch,
+    rejected: Rejected,
+) -> None:
+    """Ruling T16-f: a create that ran out of tries without being sent (a 409 or a 429 on its last try, or a
+    connect failure before any byte left) is rejected (4b, T7-d unchanged), and its follow-on is marked
+    handled but requests no operation: the provider asked for time, so the next `bulk_operations` heavy pass
+    requests the batch (`rerequest`, T16-d). A definitive 4xx keeps its immediate follow-on
+    (`test_definitive_4xx_rejects_and_releases`)."""
+    fake_llm.batches(BatchScript(create="ok"))
+
+    async def create(self: BatchesClient, requests: object) -> Rejected:
+        return rejected
+
+    monkeypatch.setattr(BatchesClient, "create", create)
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    (sub,) = await submission_rows(engine)
+    assert sub.state == "submit_rejected" and sub.follow_on_at is not None
+    assert await charged_attempts(engine, setup.llm_tuple_id) == N
+    (op,) = await operations_of(engine, "batch_submit")  # no follow-on operation
+    assert op.status == "succeeded"
+    async with engine.begin() as conn:  # handled once: a second request finds the marker set
+        assert not await batches_mod.follow_on(conn, submission_id=sub.id, defer=None)
+    assert await count_rows(engine, "operations", kind="batch_submit") == 1
+    assert await reconcile(engine, current_epoch) == 1
+    resumed = (await operations_of(engine, "batch_submit"))[-1]
+    assert (resumed.status, resumed.payload) == (
+        "pending",
+        {"bulk_operation_id": setup.bulk_operation_id, "llm_tuple_id": setup.llm_tuple_id},
+    )
+
+
+async def test_no_batch_is_requested_while_the_target_creation_is_live(
+    engine: AsyncEngine, current_epoch: int, queue_app: procrastinate.App
+) -> None:
+    """Fix round 2 (item 2): the first batch of a bulk operation is Task 14's, requested once every chunk of
+    its `create_targets_for_tuple` is done; while that creation is `pending` or `running`, the reconciler's
+    heavy pass requests nothing. Once it has ended, the pass requests the batch."""
+    setup = await bulk_with_targets(engine, N, operation=False)
+    async with engine.begin() as conn:
+        creation, _ = await create_operation(
+            conn,
+            kind="create_targets_for_tuple",
+            payload={"llm_tuple_id": setup.llm_tuple_id, "bulk_operation_id": setup.bulk_operation_id},
+            dedup_key=f"create_targets_for_tuple:{setup.llm_tuple_id}",
+            defer=None,
+        )
+    assert await reconcile(engine, current_epoch) == 0
+    assert await count_rows(engine, "operations", kind="batch_submit") == 0
+    async with engine.begin() as conn:
+        assert await cancel_operation(conn, creation, reason="test")
+    assert await reconcile(engine, current_epoch) == 1
+    assert await count_rows(engine, "operations", kind="batch_submit") == 1
+
+
 @pytest.mark.parametrize("deadlocks", [1, DB_RETRY.max_attempts])
 async def test_a_deadlocked_recording_is_retried_within_its_bound(
     engine: AsyncEngine,
@@ -466,3 +537,8 @@ async def test_a_deadlocked_recording_is_retried_within_its_bound(
         assert len(tries) == DB_RETRY.max_attempts
         assert sub.state == "submit_started" and op.status != "succeeded"
     assert len(fake_llm.state.batches) == 1  # sent once, whatever the recording's tries
+    # DB_RETRY's interval between the tries (0.5 s, then 1 s, each plus up to 1 s of jitter), waited with the
+    # gateway's injected sleep (here recorded, not waited)
+    waits = op_runner.sleeps.waits
+    assert len(waits) == len(tries) - 1
+    assert all(2 ** (n - 1) * 0.5 <= w <= 2 ** (n - 1) * 0.5 + 1 for n, w in enumerate(waits, 1))

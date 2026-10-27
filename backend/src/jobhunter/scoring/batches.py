@@ -86,9 +86,9 @@ order of node 9's cancel, `targets._cancel`: no lock cycle with it, Ruling T16-c
 Attempts move only while `running` (`transition_where`, zero rows is fine), so an attempt a supersession ended
 keeps its outcome and no accounting of an item depends on it. The handler runs the recording in a transaction
 of its own, retried on a retryable database error (`graphs.sanitize.is_retryable_db_error`: a deadlock, a
-serialization failure, a lost connection) up to `DB_RETRY.max_attempts` tries with its interval; the owner
-predicate makes each try the same recording, and a row whose tries ran out stays `submit_started`, the
-recovery's:
+serialization failure, a lost connection) up to `DB_RETRY.max_attempts` tries, its interval waited with the
+gateway's injected `sleep`; the owner predicate makes each try the same recording, and a row whose tries ran
+out stays `submit_started`, the recovery's:
 - `record_created`: `submit_started → submitted` with `provider_batch_id` and `expires_at = created_at + 24
   h` (L3954); whether a cancel was requested meanwhile (the worker then calls `messages.batches.cancel` after
   the commit; `batch_poll` retries it, Task 17);
@@ -99,7 +99,9 @@ recovery's:
   `pending` (the batch pin `batch_submission_id = :s AND attempt_no = :a`; a cancelled target is left as it
   is), their bulk rows first (P52); the attempts still `running` → `submit_rejected`; for a 401 or 403 the
   critical `llm.auth_failed`, raised as the gateway raises it (`gateway.raise_auth_failed`), so the next
-  prepare is paused (`cycles.pause_reason`); the follow-on. The attempts stay charged (Ruling T7-d,
+  prepare is paused (`cycles.pause_reason`); the follow-on, requested at once for a definitive 4xx and
+  only marked for a not-sent rejection (`Rejected.not_sent`, Ruling T16-f). The attempts stay charged (Ruling
+  T7-d,
   Deviation 13): a request the provider always rejects exhausts its targets instead of resubmitting forever;
 - `record_ambiguous`: `submit_started → submit_ambiguous` with `reconcile_report = {"error_class": …}`;
   nothing else moves (L3956): the targets stay `in_batch`, the spend reserved and counted. The release of a
@@ -130,18 +132,22 @@ candidate. An operation's failure hook cannot do it (the hook runs after the ope
 it ends `submit_rejected`, `abandoned` or `reconciled` unreleased, or at the release of a `released` one
 (never at its later adoption): the marker `follow_on_at` is set once, and with the bulk operation still
 `active` the next `batch_submit` is recorded (`{"bulk_operation_id", "llm_tuple_id", "after_submission_id"}`,
-dedup key `batch_submit:<bulk>:after:<s>`, its job under the `batch` lock, `OPERATION_LOCKS`).
+dedup key `batch_submit:<bulk>:after:<s>`, its job under the `batch` lock, `OPERATION_LOCKS`). Ruling T16-f:
+after a not-sent rejection (a 409 or a 429 on the create's last try, or a connect failure before the send:
+the provider asked for time) the marker is set but no operation is recorded; the next heavy pass requests
+the batch (`rerequest`).
 
 **The request again** (`rerequest`, Ruling T16-d): a prepare that skipped (`paused`, `budget_exhausted`, ...)
-ends its operation and requests no follow-on, so the `bulk_operations` reconciler (`bulk.reconcile_bulk_
-operations`, through `bulk.register_active_step`) asks for the batch again on each heavy pass, in its
-transaction (`fence_epoch`, `active_config FOR SHARE`), for the `active` bulk operation that it did not
-complete: when batches are enabled, the lane is not paused (`cycles.pause_reason`; its schema check is the
-prepare's, the reconciler knowing no transport), no submission is in flight (`IN_FLIGHT`, unreleased), no
-`batch_submit` of the operation is `pending` or `running`, and at least `batch_min_targets` of its targets
-are eligible, it records `{"bulk_operation_id", "llm_tuple_id"}` under the dedup key
-`batch_submit:<bulk>:resume` (`create_operation`: one live request at most). The prepare re-checks every
-gate.
+ends its operation and requests no follow-on, nor does a not-sent rejection (T16-f), so the `bulk_operations`
+reconciler (`bulk.reconcile_bulk_operations`, through `bulk.register_active_step`) asks for the batch again
+on each heavy pass, in its transaction (`fence_epoch`, `active_config FOR SHARE`), for the `active` bulk
+operation that it did not complete: when batches are enabled, the lane is not paused (`cycles.pause_reason`;
+its schema check is the prepare's, the reconciler knowing no transport), no submission is in flight
+(`IN_FLIGHT`, unreleased), no `batch_submit` of the operation is `pending` or `running`, its target creation
+(`create_targets_for_tuple`) is not live (`bulk.creation_live`: the first batch is the creation's to request,
+once every chunk is done), and at least `batch_min_targets` of its targets are eligible, it records
+`{"bulk_operation_id", "llm_tuple_id"}` under the dedup key `batch_submit:<bulk>:resume` (`create_operation`:
+one live request at most). The prepare re-checks every gate.
 
 **The `batch_submit` handler**, payload `{"bulk_operation_id", "llm_tuple_id"}`: (1) `recover_lost` of its own
 operation, (2) the four sweeps of the tuple (expiry, refilter, regroup and exhaustion, L3939, Deviation 7) in
@@ -159,10 +165,9 @@ gateway's `monotonic` and `sleep` for the create's own retries; Task 27 moves it
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
 
-import asyncio
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -223,8 +228,8 @@ from jobhunter.worker.operations import (
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer, defer_in_tx
 
-# The submissions of a tuple that are not terminal (§7.16.6).
-IN_FLIGHT: Final = ("preparing", "submit_started", "submit_ambiguous", "submitted", "ended")
+# The submissions of a tuple that are not terminal (§7.16.6): `bulk.BATCH_IN_FLIGHT`, defined once in `llm`.
+IN_FLIGHT: Final = bulk.BATCH_IN_FLIGHT
 KIND: Final = "batch_submit"
 # Deviation 27, A2 B14: the rendered requests of one submission, below the provider's 256 MB.
 BATCH_MAX_BYTES: Final = 200 * 1024 * 1024
@@ -508,8 +513,8 @@ async def prepare(
     now: datetime,
 ) -> Prepared | NotPrepared:
     """The preparation of a submission in the caller's transaction (module docstring); every write inside a
-    savepoint that a `NotPrepared` (or an exception) rolls back. `FencedOut` for a lost claim;
-    `BudgetExhausted` when the hard cap refuses an item; `gateway` renders the params."""
+    savepoint that a `NotPrepared` (or an exception) rolls back. `FencedOut` for a lost claim; a hard cap that
+    admits no item is `NotPrepared("budget_exhausted")`; `gateway` renders the params."""
     async with conn.begin_nested() as savepoint:  # an exception rolls it back on its way out
         result = await _prepare(
             conn,
@@ -1022,7 +1027,8 @@ async def record_rejected(
     ended = await _end_attempts(conn, items, "submit_rejected", None)
     if rejected.status in AUTH_FAILED_STATUSES:  # the key was refused: the lane pauses on it
         await raise_auth_failed(conn, http_status=rejected.status)
-    requested = await follow_on(conn, submission_id=submission_id, defer=defer)
+    # a not-sent rejection's follow-on is the reconciler's (Ruling T16-f): the provider asked for time
+    requested = await follow_on(conn, submission_id=submission_id, defer=defer, request=not rejected.not_sent)
     await ranking.bump(conn)  # step 11, last
     log.warning(
         "batch_submit_rejected",
@@ -1134,8 +1140,12 @@ async def recover_lost(
     return Recovered(abandoned, ambiguous)
 
 
-async def follow_on(conn: AsyncConnection, *, submission_id: int, defer: Deferrer | None) -> bool:
-    """The follow-on of an ended submission, once (module docstring); whether it was recorded now."""
+async def follow_on(
+    conn: AsyncConnection, *, submission_id: int, defer: Deferrer | None, request: bool = True
+) -> bool:
+    """The follow-on of an ended submission, once (module docstring); whether an operation was recorded now.
+    With `request=False` (a not-sent rejection, Ruling T16-f) the follow-on is marked handled, and the
+    `bulk_operations` reconciler requests the batch (`rerequest`)."""
     row = (await conn.execute(_FOLLOW_ON_OF, {"s": submission_id})).first()
     if row is None:
         return False
@@ -1147,6 +1157,13 @@ async def follow_on(conn: AsyncConnection, *, submission_id: int, defer: Deferre
     if (await conn.execute(_BULK_OF, {"b": row.bulk_operation_id})).one().state != "active":
         log.info(
             "batch_follow_on_skipped", submission_id=submission_id, bulk_operation_id=row.bulk_operation_id
+        )
+        return False
+    if not request:
+        log.info(
+            "batch_follow_on_left_to_reconciler",
+            submission_id=submission_id,
+            bulk_operation_id=row.bulk_operation_id,
         )
         return False
     bulk_operation_id, llm_tuple_id = int(row.bulk_operation_id), int(row.llm_tuple_id)
@@ -1185,6 +1202,8 @@ async def rerequest(conn: AsyncConnection, bulk_operation_id: int, ctx: Reconcil
     if await _in_flight(conn) is not None:
         return False
     if (await conn.execute(_LIVE_SUBMIT, {"b": bulk_operation_id})).scalar_one():
+        return False
+    if await bulk.creation_live(conn, bulk_operation_id):  # the first batch is the creation's to request
         return False
     params = {
         "b": bulk_operation_id,
@@ -1331,7 +1350,7 @@ async def batch_submit(ctx: OperationContext) -> None:
         await check_sendable(conn, s, operation=ctx.claim)
     outcome = await client.create(prepared.requests)  # 6. outside any transaction
     await afault_point(AFTER_CREATE)
-    state, cancel_due = await _record(ctx, s, outcome, now=clock())  # 7.
+    state, cancel_due = await _record(ctx, s, outcome, now=clock(), sleep=deps.gateway.sleep)  # 7.
     if cancel_due and isinstance(outcome, Created):
         try:
             await client.cancel(outcome.provider_batch_id)
@@ -1344,10 +1363,16 @@ async def batch_submit(ctx: OperationContext) -> None:
 
 
 async def _record(
-    ctx: OperationContext, submission_id: int, outcome: CreateOutcome, *, now: datetime
+    ctx: OperationContext,
+    submission_id: int,
+    outcome: CreateOutcome,
+    *,
+    now: datetime,
+    sleep: Callable[[float], Awaitable[object]],
 ) -> tuple[str, bool]:
     """The recording transaction of the create's outcome, retried on a retryable database error (module
-    docstring); the submission's state and whether a cancel is due."""
+    docstring), `sleep` waiting out `DB_RETRY`'s interval; the submission's state and whether a cancel is
+    due."""
     tries = 0
     while True:
         tries += 1
@@ -1362,7 +1387,7 @@ async def _record(
                 tries=tries,
                 error_class=type(exc).__name__,
             )
-        await asyncio.sleep(db_retry_interval(tries))
+        await sleep(db_retry_interval(tries))
 
 
 async def _record_once(

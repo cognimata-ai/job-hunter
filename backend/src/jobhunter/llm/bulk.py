@@ -15,8 +15,10 @@ singleton holds at most one `active` row):
   for an operation that has ended already. Its unspent budget lapses; its holds go with it;
 - `complete_if_done(conn, bulk_operation_id, *, now) -> bool` (R5, Deviation 8): under the bulk row's lock
   (`FOR NO KEY UPDATE`, step 7), `active -> completed` only when the `create_targets_for_tuple` operation
-  whose payload names it is no longer `pending` or `running`, no target of it is `pending`, `in_progress` or
-  `in_batch`, and no submission of it is in flight (the `batch_one_in_flight` states, unreleased). On
+  whose payload names it is no longer `pending` or `running` (`creation_live(conn, bulk_operation_id)` reads
+  the same), no target of it is `pending`, `in_progress` or `in_batch`, and no submission of it is in flight
+  (`BATCH_IN_FLIGHT`, the `batch_one_in_flight` states, unreleased: the one definition of them, which
+  `scoring.batches.IN_FLIGHT` binds). On
   completion `followup_held_usd := 0` in the same statement and every unreleased item of its submissions gets
   `hold_released_at := now` (other domain rows, after the bulk row). A `budget_deferred` or
   `deferred_duplicate` target does not hold it open (L1194, A1 issue 19): when it returns to `pending` later,
@@ -94,6 +96,9 @@ from jobhunter.settings.model import ModelPolicy, Settings
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
+# The submission states that are in flight (§7.16.6, the `batch_one_in_flight` predicate with `released_at IS
+# NULL`): the one definition, which `scoring.batches.IN_FLIGHT` binds (`llm` imports nothing of `scoring`).
+BATCH_IN_FLIGHT: Final = ("preparing", "submit_started", "submit_ambiguous", "submitted", "ended")
 QUARANTINED_USD_SQL: Final = (
     "SELECT coalesce(sum(reserved_usd), 0) FROM batch_submissions WHERE state = 'submit_ambiguous'"
 )
@@ -129,16 +134,20 @@ _OPEN: Final = q(
 )
 _ACTIVE_OPERATION: Final = q("SELECT id FROM bulk_operations WHERE state = 'active' ORDER BY id")
 _LOCK_STATE: Final = q("SELECT state FROM bulk_operations WHERE id = :b FOR NO KEY UPDATE")
+# Operation `:b`'s `create_targets_for_tuple` still `pending` or `running` (its creation is live).
+_CREATING: Final = (
+    "EXISTS (SELECT 1 FROM operations WHERE kind = 'create_targets_for_tuple' "
+    "AND payload ->> 'bulk_operation_id' = CAST(:b AS text) AND status IN ('pending', 'running'))"
+)
+_CREATION_LIVE: Final = q(f"SELECT {_CREATING}")
 # What still holds operation `:b` open (module docstring): its creation, a target of it being scored, a
-# submission of it in flight (the `batch_one_in_flight` predicate).
+# submission of it in flight (`BATCH_IN_FLIGHT`, bound as `:in_flight`).
 _HELD_OPEN: Final = q(
-    "SELECT EXISTS (SELECT 1 FROM operations WHERE kind = 'create_targets_for_tuple' "
-    "AND payload ->> 'bulk_operation_id' = CAST(:b AS text) AND status IN ('pending', 'running')) "
-    "AS creating, "
+    f"SELECT {_CREATING} AS creating, "  # noqa: S608
     "EXISTS (SELECT 1 FROM score_targets WHERE bulk_operation_id = :b "
     "AND state IN ('pending', 'in_progress', 'in_batch')) AS scoring, "
     "EXISTS (SELECT 1 FROM batch_submissions WHERE bulk_operation_id = :b AND released_at IS NULL "
-    "AND state IN ('preparing', 'submit_started', 'submitted', 'submit_ambiguous', 'ended')) AS batching"
+    "AND state = ANY(CAST(:in_flight AS text[]))) AS batching"
 )
 _STAMP_ITEMS: Final = q(
     "UPDATE batch_items SET hold_released_at = :now WHERE hold_released_at IS NULL "
@@ -192,7 +201,9 @@ async def complete_if_done(conn: AsyncConnection, bulk_operation_id: int, *, now
     state = (await conn.execute(_LOCK_STATE, {"b": bulk_operation_id})).scalar_one_or_none()  # step 7
     if state != "active":
         return False
-    held = (await conn.execute(_HELD_OPEN, {"b": bulk_operation_id})).one()
+    held = (
+        await conn.execute(_HELD_OPEN, {"b": bulk_operation_id, "in_flight": list(BATCH_IN_FLIGHT)})
+    ).one()
     if held.creating or held.scoring or held.batching:
         return False
     await transition(
@@ -201,6 +212,12 @@ async def complete_if_done(conn: AsyncConnection, bulk_operation_id: int, *, now
     stamped = (await conn.execute(_STAMP_ITEMS, {"b": bulk_operation_id, "now": now})).all()
     log.info("bulk_operation_completed", bulk_operation_id=bulk_operation_id, items_released=len(stamped))
     return True
+
+
+async def creation_live(conn: AsyncConnection, bulk_operation_id: int) -> bool:
+    """Whether the operation's `create_targets_for_tuple` is still `pending` or `running` (Task 14 requests
+    the operation's first batch once every chunk of it is done)."""
+    return bool((await conn.execute(_CREATION_LIVE, {"b": bulk_operation_id})).scalar_one())
 
 
 type ActiveStep = Callable[[AsyncConnection, int, ReconcileContext], Awaitable[bool]]

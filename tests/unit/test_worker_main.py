@@ -673,17 +673,17 @@ M3_RECONCILERS = {
 
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
     """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
-    (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
-    anyway), the registries hold exactly the M1, M2 and M3 (so far) reconcilers with their cadences, the five
-    takeover sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, and Task 16's
-    `batch_submissions`), the
-    `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
-    `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, M3 Task 14's
+    (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it anyway),
+    the registries hold exactly the M1, M2 and M3 (so far) reconcilers with their cadences, the five takeover
+    sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, and Task 16's
+    `batch_submissions`), the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile`
+    (Task 19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, M3 Task 14's
     `create_targets_for_tuple` (`scoring.targets`) and Task 16's `batch_submit` (`scoring.batches`) handlers,
-    and the failure
-    hooks of the two profile phases and of the query proposal (`embed_profile` has none: it drives no domain
-    row). `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with
-    `profile.operations`, which imports `profile.vectors`; `worker.main` lists neither."""
+    and the failure hooks of the two profile phases and of the query proposal (`embed_profile` has none: it
+    drives no domain row), and the `bulk_operations` reconciler's one active step, Task 16's `rerequest`
+    (Ruling T16-d, `bulk.register_active_step`). `embed_profile`, `propose_queries` and the `profile_vectors`
+    reconciler come with `profile.operations`, which imports `profile.vectors`; `worker.main` lists
+    neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
@@ -700,6 +700,7 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
             "watchlist_validate",
         ],
         "failure_hooks": ["extract_profile", "extract_profile_text", "propose_queries"],
+        "active_steps": ["jobhunter.scoring.batches.rerequest"],
         "main_imported": False,
     }
 

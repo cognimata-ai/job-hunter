@@ -31,7 +31,7 @@ from jobhunter.llm.batches import (
 )
 from jobhunter.llm.errors import LLMNotConfigured
 from jobhunter.llm.fake import BatchScript
-from jobhunter.llm.gateway import TRANSPORT_TRIES
+from jobhunter.llm.gateway import RETRY_MIN_REMAINING_S, TRANSPORT_TRIES
 from jobhunter.llm.transport import make_http_client
 
 from tests.support.llm import GATEWAY_BODY, FakeLLM, GatewayOut, Sleeps
@@ -79,8 +79,9 @@ class Answering(httpx2.AsyncBaseTransport):
     n-th of `answers` (the last one repeats): a status and a JSON body, `"connect"` (a connect failure before
     any byte was sent), `"read_timeout"` (the answer never read), or `None` (never answered)."""
 
-    def __init__(self, *answers: Answer) -> None:
+    def __init__(self, *answers: Answer, headers: dict[int, dict[str, str]] | None = None) -> None:
         self.answers = answers
+        self.headers = _HEADERS if headers is None else headers
         self.seen: list[httpx2.Request] = []
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
@@ -95,7 +96,7 @@ class Answering(httpx2.AsyncBaseTransport):
         assert isinstance(answer, tuple)
         status, body = answer
         return httpx2.Response(
-            status, headers={"request-id": "req_test", **_HEADERS.get(status, {})}, json=body
+            status, headers={"request-id": "req_test", **self.headers.get(status, {})}, json=body
         )
 
 
@@ -274,6 +275,28 @@ async def test_the_retries_stop_at_the_creates_deadline(
     assert (len(transport.seen), sleeps.waits) == (1, [])
 
 
+@pytest.mark.parametrize(("retry_after", "sent"), [(470, 2), (490, 1)])
+async def test_a_retry_starts_only_with_the_retry_minimum_left_after_its_wait(
+    fake_llm: FakeLLM, retry_after: int, sent: int
+) -> None:
+    """Fix round 2 (item 1): a not-sent create is sent again only when at least the gateway's
+    `RETRY_MIN_REMAINING_S` (120 s) of `CREATE_DEADLINE_S` (600 s) is left after its wait; a retry with less
+    could end at the deadline, and a provably unsent create would become an ambiguous one. 470 + 120 < 600 is
+    retried; 490 + 120 > 600 is rejected without a wait."""
+    assert (batches_mod.CREATE_DEADLINE_S, RETRY_MIN_REMAINING_S) == (600, 120)
+    transport = Answering(
+        (429, error_body("rate_limit_error")), OK, headers={429: {"retry-after": str(retry_after)}}
+    )
+    sleeps = Sleeps()
+    async with on(fake_llm.cfg, transport) as http:
+        outcome = await BatchesClient(fake_llm.cfg, http_client=http, sleep=sleeps).create(requests("t1_a1"))
+    assert len(transport.seen) == sent
+    if sent == 2:
+        assert isinstance(outcome, Created) and sleeps.waits == [float(retry_after)]
+    else:
+        assert outcome == Rejected(429, "rate_limit_error", "test: refused") and sleeps.waits == []
+
+
 async def test_create_runs_under_the_ten_minute_deadline(
     fake_llm: FakeLLM, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -332,6 +355,7 @@ async def test_retrieve_and_cancel_report_the_batch(fake_llm: FakeLLM, client: B
         404,
         "NotFoundError",
     )
+    assert missing.value.__cause__ is None and missing.value.__context__ is None  # no provider error
 
 
 async def test_list_all_pages_by_after_id_newest_first(
@@ -400,6 +424,7 @@ async def test_a_cut_results_stream_is_never_complete(fake_llm: FakeLLM, client:
         async for item in stream:
             read.append(item.custom_id)
     assert cut.value.operation == "results" and cut.value.status is None
+    assert cut.value.__cause__ is None and cut.value.__context__ is None  # raised outside the handler
     assert not stream.complete and len(read) <= 1
 
 
@@ -447,4 +472,5 @@ async def test_an_unreadable_result_line_ends_the_stream_with_its_class_only(
     failure = unreadable.value
     assert (failure.operation, failure.status) == ("results", None)
     assert failure.error_class in ("JSONDecodeError", "ValidationError")
-    assert "model output" not in str(failure) and failure.__cause__ is None and failure.__suppress_context__
+    assert "model output" not in str(failure)
+    assert failure.__cause__ is None and failure.__context__ is None  # the line is unreachable from it

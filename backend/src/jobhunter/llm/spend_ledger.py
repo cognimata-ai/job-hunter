@@ -131,7 +131,8 @@ UNSETTLED_CODE: Final = "unsettled"
 ONLINE_REFUND_EVIDENCE: Final = frozenset({"error_response_no_content", "connect_failed_before_send"})
 # `batch_submit_rejected` (L2335): the provider refused the whole submission, so none of its items ran; the
 # call row ends `error` with that code and the rejection's `http_status`. `connect_failed_before_send`
-# (Ruling T16-a): the create's connection failed before any byte left, on each of its tries; no batch exists.
+# (Ruling T16-a): the create's last try failed to connect before any byte left (the evidence follows the last
+# try; no earlier one was processed either), so no batch exists.
 BATCH_REFUND_EVIDENCE: Final = frozenset(
     {
         "batch_submit_rejected",

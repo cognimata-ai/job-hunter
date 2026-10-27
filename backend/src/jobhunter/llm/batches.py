@@ -21,7 +21,9 @@ The methods:
     was written (`gateway._connect_failed_before_send` on the cause chain), made no batch: the create is
     sent again within the call, after the gateway's backoff (`gateway.retry_wait`: the response's
     `Retry-After`, else 2 s then 8 s with jitter; waited with `sleep`), up to the gateway's
-    `TRANSPORT_TRIES` (3) and while the wait ends before the deadline. When the tries run out it is
+    `TRANSPORT_TRIES` (3) and only while at least the gateway's `RETRY_MIN_REMAINING_S` (120 s) of the
+    deadline is left after the wait, so the deadline never makes a provably unsent create ambiguous. When
+    the tries run out, or the time does, it is
     `Rejected` (4b) with the last response's status and error type, or `Rejected(None, "connect_failed",
     "", evidence="connect_failed_before_send")` for a connect failure; `Rejected.evidence` is the items'
     refund evidence (`batch_submit_rejected` otherwise);
@@ -36,13 +38,15 @@ The methods:
   error_type)`, the errored item's type being the SDK's nested `error.error.type` (Carry T8-b); each line
   validated (`MessageBatchIndividualResponse.model_validate`: the SDK's decoder constructs a line without
   checking it), and a line that is no JSON or no valid result ends the stream with `BatchApiError("results",
-  status=None, error_class=<the error's class>)`, raised `from None` (the error's message quotes the line,
-  which may hold model output); its `complete` is true only once the iteration ended without such an error
+  status=None, error_class=<the error's class>)` (the error's message quotes the line, which may hold model
+  output); its `complete` is true only once the iteration ended without such an error
   (the stream read to its end, §10.10 step 7);
 - `list_all() -> AsyncIterator[BatchSummary]`: every batch of the workspace, newest first, paginated by hand
   with `limit=LIST_PAGE` (100) and `after_id` (the listing's `last_id`) while `has_more`.
 A failure of `retrieve`, `results`, `cancel` or `list_all` is `BatchApiError(operation, status,
-error_class)`: the status and the class only, never the provider's message (which may quote a request).
+error_class)`: the status and the class only, never the provider's message (which may quote a request). Every
+`BatchApiError` is raised after its `except` block (the `graphs.sanitize` pattern), so neither `__cause__`
+nor `__context__` reaches the original error.
 
 Every method logs ids, counts, statuses and codes only: never a param, a message or a provider error text.
 """
@@ -68,6 +72,7 @@ from jobhunter.llm.errors import LLMError, LLMNotConfigured
 from jobhunter.llm.fake import KEY_HEADER, PURPOSE_HEADER, answer_key, batch_keys
 from jobhunter.llm.gateway import (
     CONNECT_FAILED,
+    RETRY_MIN_REMAINING_S,
     TRANSPORT_TRIES,
     _connect_failed_before_send,
     is_retryable_status,
@@ -144,6 +149,13 @@ class Rejected:
     error_type: str
     message: str = field(repr=False)
     evidence: str = SUBMIT_REJECTED
+
+    @property
+    def not_sent(self) -> bool:
+        """Whether the create's last try was refused before it was processed (a 409 or a 429) or never left
+        (a connect failure before the send): the provider asked for time, so no follow-on is requested at
+        once (Ruling T16-f); a definitive 4xx is `False`."""
+        return self.evidence == CONNECT_FAILED_BEFORE_SEND or self.status in _NOT_SENT
 
 
 @dataclass(frozen=True)
@@ -269,9 +281,11 @@ class ResultsStream:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[ItemResult]:
+        failure: BatchApiError | None = None
         try:
             async for line in self._lines:
-                # the SDK constructs a line without validating it: checked here, strictly
+                # the SDK constructs a line without validating it: validated here (pydantic's default, lax
+                # mode: a value of the right meaning in another JSON type passes)
                 checked = MessageBatchIndividualResponse.model_validate(line.to_dict(warnings=False))
                 self.read += 1
                 yield _item(checked)
@@ -283,16 +297,16 @@ class ResultsStream:
                 read=self.read,
                 error_class=failure.error_class,
             )
-            raise failure from None
         except ValueError as exc:  # no JSON, or no valid result: the class only, the message quotes the line
-            error_class = type(exc).__name__
+            failure = BatchApiError("results", status=None, error_class=type(exc).__name__)
             log.warning(
                 "llm_batch_results_unreadable",
                 provider_batch_id=self._batch_id,
                 read=self.read,
-                error_class=error_class,
+                error_class=failure.error_class,
             )
-            raise BatchApiError("results", status=None, error_class=error_class) from None
+        if failure is not None:
+            raise failure  # outside the handler: no `__context__`, the original unreachable from it
         self.complete = True
         log.info("llm_batch_results_read", provider_batch_id=self._batch_id, read=self.read)
 
@@ -348,7 +362,12 @@ class BatchesClient:
             if not isinstance(outcome, _NotSent):
                 return self._logged(outcome, requests, transport_try, started)
             wait = retry_wait(outcome.headers, transport_try, now=self._clock())
-            if transport_try == TRANSPORT_TRIES or self._monotonic() + wait >= deadline:
+            # a retry needs `RETRY_MIN_REMAINING_S` left after its wait: one that the deadline could cut would
+            # turn a create provably not sent into an ambiguous one
+            if (
+                transport_try == TRANSPORT_TRIES
+                or self._monotonic() + wait + RETRY_MIN_REMAINING_S > deadline
+            ):
                 return self._logged(outcome.rejected, requests, transport_try, started)
             log.info(
                 "llm_batch_create_retried",
@@ -432,10 +451,13 @@ class BatchesClient:
 
     async def retrieve(self, batch_id: str) -> BatchStatus:
         """`messages.batches.retrieve`; `BatchApiError` on failure."""
+        failure: BatchApiError | None = None
         try:
             batch = await self._sdk().messages.batches.retrieve(batch_id, timeout=TIMEOUT)
         except (anthropic.APIError, httpx2.HTTPError) as exc:
-            raise _failure("retrieve", exc) from None
+            failure = _failure("retrieve", exc)
+        if failure is not None:
+            raise failure  # outside the handler (module docstring)
         status = _status(batch)
         log.info(
             "llm_batch_retrieved",
@@ -447,10 +469,13 @@ class BatchesClient:
 
     async def cancel(self, batch_id: str) -> BatchStatus:
         """`messages.batches.cancel`; `BatchApiError` on failure."""
+        failure: BatchApiError | None = None
         try:
             batch = await self._sdk().messages.batches.cancel(batch_id, timeout=TIMEOUT)
         except (anthropic.APIError, httpx2.HTTPError) as exc:
-            raise _failure("cancel", exc) from None
+            failure = _failure("cancel", exc)
+        if failure is not None:
+            raise failure  # outside the handler (module docstring)
         log.info(
             "llm_batch_cancel_requested",
             provider_batch_id=batch_id,
@@ -460,10 +485,13 @@ class BatchesClient:
 
     async def results(self, batch_id: str) -> ResultsStream:
         """The batch's result stream (module docstring); `BatchApiError` when it cannot be opened."""
+        failure: BatchApiError | None = None
         try:
             decoder = await self._sdk().messages.batches.results(batch_id, timeout=TIMEOUT)
         except (anthropic.APIError, httpx2.HTTPError) as exc:
-            raise _failure("results", exc) from None
+            failure = _failure("results", exc)
+        if failure is not None:
+            raise failure  # outside the handler (module docstring)
         return ResultsStream(batch_id, decoder.__aiter__())
 
     async def list_all(self) -> AsyncIterator[BatchSummary]:
@@ -475,10 +503,13 @@ class BatchesClient:
             kwargs: dict[str, Any] = {"limit": LIST_PAGE, "timeout": TIMEOUT}
             if after is not None:
                 kwargs["after_id"] = after
+            failure: BatchApiError | None = None
             try:
                 page = await sdk.messages.batches.list(**kwargs)
             except (anthropic.APIError, httpx2.HTTPError) as exc:
-                raise _failure("list", exc) from None
+                failure = _failure("list", exc)
+            if failure is not None:
+                raise failure  # outside the handler (module docstring)
             pages += 1
             for batch in page.data:
                 listed += 1
