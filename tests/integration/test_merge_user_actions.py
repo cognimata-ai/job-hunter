@@ -7,10 +7,11 @@ inside the merge and the unmerge.
   are concatenated (the into-job's, a separator line naming the merged job, the from-job's), cut at 20,000
   characters with `[…]` (both full notes stay in the snapshot); the from-job's row is deleted.
 - An unmerge restores the from-job's row from the snapshot; on the into-job a timestamp that came only from
-  the merge (equal to the from-job's snapshot value, different from the into-job's) is reset to the earliest
-  of the into-job's own value and those of the merges still in force (Ruling T22-d), and the note loses
-  exactly the segment this merge appended, unless the user edited it (Ruling T22-c), so several merges into
-  one job unmerge in any order.
+  the merge (equal to the from-job's snapshot value, different from the into-job's own value: its snapshot
+  value with what earlier merges gave peeled off, Ruling T22-d') is reset to the earliest of that own value
+  and those of the merges still in force (Ruling T22-d); the note loses exactly the segment this merge
+  appended, unless the user edited it (Ruling T22-c); the row is deleted when the job had none before its
+  merges and nothing is left, so several merges into one job unmerge in any order.
 - The cut keeps the into-job's note whole and cuts only the appended part, which is left out when no room is
   left; an event recorded without the actions snapshot restores none.
 
@@ -419,6 +420,25 @@ async def test_the_into_jobs_own_earlier_value_survives_both_unmerges(
     await unmerged(engine, events[first])
     await unmerged(engine, events[second])
     assert hidden_applied_note(await user_actions(engine, a)) == (t0 - timedelta(hours=1), None, "A-Notiz")
+
+
+@pytest.mark.parametrize("order", ["merge_order", "reverse_order"])
+async def test_two_merged_jobs_hidden_at_the_same_instant_leave_nothing_behind(
+    engine: AsyncEngine, current_epoch: int, at: datetime, order: str
+) -> None:
+    """Ruling T22-d' (the gate on the peeled value): B and C hidden and applied at the same instant (one bulk
+    hide), A at neither and without a row; both merged into A, then both unmerged. C's snapshot of A holds B's
+    instant, which is C's too, so the reset's gate compares the value with A's own (peeled) value, not the raw
+    snapshot: A's row is deleted in either order."""
+    owner = await queued_run(engine)
+    t0 = at - timedelta(days=2)
+    same = {"hidden_at": t0, "applied_at": t0}
+    a, b, c, events = await three_merged(engine, owner, at, a_row=False, b=dict(same), c=dict(same))
+    first, second = (b, c) if order == "merge_order" else (c, b)
+    await unmerged(engine, events[first])
+    assert hidden_applied_note(await user_actions(engine, a))[:2] == (t0, t0)  # the other is still merged
+    await unmerged(engine, events[second])
+    assert await user_actions(engine, a) is None
 
 
 async def test_the_cut_keeps_the_into_notes_text_whole_at_the_boundary(engine: AsyncEngine) -> None:

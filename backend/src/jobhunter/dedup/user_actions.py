@@ -62,7 +62,8 @@ _PUT_ACTIONS: Final = q(
     "seen_at = EXCLUDED.seen_at, saved_at = EXCLUDED.saved_at, applied_at = EXCLUDED.applied_at, "
     "hidden_at = EXCLUDED.hidden_at, note = EXCLUDED.note, updated_at = now()"
 )
-# The other merges into the job that are still in force: their from-jobs' snapshot rows (Ruling T22-d).
+# Every other merge into the job, in any state, with whether it is still in force: its snapshot rows of the
+# from-job and the into-job (Rulings T22-d, T22-d').
 _OTHER_MERGES_INTO: Final = q(
     "SELECT id, from_job_id, reversed_by_event_id IS NULL AS in_force, "
     "evidence -> 'snapshot' -> 'user_job_actions' AS actions FROM merge_events "
@@ -297,9 +298,9 @@ async def restore_user_actions(conn: AsyncConnection, *, event: MergeEvent) -> N
     for name in ACTION_TIMESTAMPS:
         value = current.timestamp(name)
         merged = None if before_from is None else before_from.timestamp(name)
-        before = None if before_into is None else before_into.timestamp(name)
-        if merged is not None and value == merged and before != merged:
-            fallback = [_peeled(before, name, earlier), *(row.timestamp(name) for row in in_force)]
+        own = _peeled(None if before_into is None else before_into.timestamp(name), name, earlier)
+        if merged is not None and value == merged and own != merged:  # the gate on the peeled value
+            fallback = [own, *(row.timestamp(name) for row in in_force)]
             restored[name] = min((v for v in fallback if v is not None), default=None)
         else:
             restored[name] = value
