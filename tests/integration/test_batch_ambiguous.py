@@ -24,17 +24,20 @@ import asyncio
 import uuid
 from collections import Counter
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
 import procrastinate
 import pytest
+import sqlalchemy as sa
 from jobhunter.clock import utcnow
-from jobhunter.llm.batches import BatchesClient, BatchStatus
+from jobhunter.llm.batches import BatchesClient, BatchRequest, BatchStatus, Created
 from jobhunter.llm.fake import BatchScript
 from jobhunter.scoring import batch_items, cycles, validator
 from jobhunter.scoring import batch_operations as batch_ops
 from jobhunter.scoring import batches as batches_mod
+from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
 from jobhunter.worker.lock import LockSession
 from jobhunter.worker.tasks import defer_in_tx
@@ -63,6 +66,7 @@ from tests.support.scoring import attempt_outcomes, targets_by_state
 pytestmark = pytest.mark.integration
 N = 250
 UNRESOLVED = batches_mod.UNRESOLVED_ALERT
+_ANOMALY_CONTEXT = sa.text("SELECT context FROM alerts WHERE code = 'batch.custom_id_anomaly'")
 
 
 @pytest.fixture
@@ -90,8 +94,28 @@ def cancels(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     yield sent
 
 
-async def ambiguous(engine: AsyncEngine, op_runner: OpRunner, setup: BulkTargets, create: str) -> Any:
-    """The setup's operation run with the fake's `create` outcome: the `submit_ambiguous` row."""
+@pytest.fixture
+def calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Every provider retrieval and cancel any `BatchesClient` sends in the test, in order."""
+    sent: list[str] = []
+    real_retrieve, real_cancel = BatchesClient.retrieve, BatchesClient.cancel
+
+    async def retrieving(self: BatchesClient, batch_id: str) -> BatchStatus:
+        sent.append("retrieve")
+        return await real_retrieve(self, batch_id)
+
+    async def cancelling(self: BatchesClient, batch_id: str) -> BatchStatus:
+        sent.append("cancel")
+        return await real_cancel(self, batch_id)
+
+    monkeypatch.setattr(BatchesClient, "retrieve", retrieving)
+    monkeypatch.setattr(BatchesClient, "cancel", cancelling)
+    yield sent
+
+
+async def ambiguous(engine: AsyncEngine, op_runner: OpRunner, setup: BulkTargets) -> Any:
+    """The setup's operation run with the fake's current script (an ambiguous `create`): the
+    `submit_ambiguous` row."""
     assert setup.operation_id is not None
     await op_runner.run_one(setup.operation_id)
     rows = [r for r in await submission_rows(engine) if r.state == "submit_ambiguous"]
@@ -113,7 +137,7 @@ async def test_c20_an_ambiguous_create_is_confirmed_by_its_custom_ids_after_it_e
     ended candidate is confirmed) and records the pass; once it has ended, the pass downloads its results
     whole, finds our `custom_id` set, adopts it and reconciles it; the results publish."""
     fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=5))
-    row = await ambiguous(engine, op_runner, setup, "ambiguous_created")
+    row = await ambiguous(engine, op_runner, setup)
     first = await reconcile_ambiguous_once(engine, fake_llm)
     assert (first.listed, first.adopted) == (1, 0)
     (row,) = await submission_rows(engine)
@@ -180,7 +204,7 @@ async def test_adoption_reconciles_in_its_own_pass(
     window, is disjoint), and ends each `reconciled` with `results_complete_at` set, no `batch_poll` between.
     A's items are all `ignored_fenced` (its targets were released, L3999); B's publish."""
     fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=5))
-    a = await ambiguous(engine, op_runner, setup, "ambiguous_created")
+    a = await ambiguous(engine, op_runner, setup)
     await release(engine, a.id)
     await op_runner.run_pending()  # A's follow-on prepares B from the released targets
     rows = {r.id: r for r in await submission_rows(engine)}
@@ -197,13 +221,47 @@ async def test_adoption_reconciles_in_its_own_pass(
     assert await targets_by_state(engine, setup.llm_tuple_id) == {"published_accepted": N}
 
 
+async def test_one_submissions_error_leaves_the_others_to_the_adoption_pass(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling T17-a: the reconciliation isolates each submission: A's unexpected error (here its items
+    cannot be read) is logged with its class and counted, A is left as it was, and B is still adopted and
+    reconciled in the same pass; the next pass, without the error, adopts A."""
+    fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=5))
+    a = await ambiguous(engine, op_runner, setup)
+    await release(engine, a.id)
+    await op_runner.run_pending()  # A's follow-on prepares B from the released targets
+    (b,) = [r for r in await submission_rows(engine) if r.id != a.id]
+    real = batch_ops._items_of
+
+    async def failing(conn: Any, submission_id: int) -> Any:
+        if submission_id == a.id:
+            raise RuntimeError("test: the items cannot be read")
+        return await real(conn, submission_id)
+
+    monkeypatch.setattr(batch_ops, "_items_of", failing)
+    fake_llm.batches(BatchScript(polls_until_ended=0))
+    report = await reconcile_ambiguous_once(engine, fake_llm)
+    assert (report.submissions, report.failed, report.adopted, report.reconciled) == (2, 1, 1, 1)
+    rows = {r.id: r for r in await submission_rows(engine)}
+    assert (rows[a.id].state, rows[b.id].state) == ("released", "reconciled")
+    monkeypatch.undo()
+    again = await reconcile_ambiguous_once(engine, fake_llm)
+    assert (again.submissions, again.failed, again.adopted) == (1, 0, 1)
+    assert {r.state for r in await submission_rows(engine)} == {"reconciled"}
+
+
 async def test_a_partial_intersection_is_an_anomaly_and_never_adopted(
     engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, setup: BulkTargets
 ) -> None:
     """Rule 4 (L3990): a candidate whose results lack one of our items intersects ours partially: the
     critical `batch.custom_id_anomaly`; the submission stays `submit_ambiguous`, nothing adopted."""
     fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=0))
-    row = await ambiguous(engine, op_runner, setup, "ambiguous_created")
+    row = await ambiguous(engine, op_runner, setup)
     lost = f"t{setup.targets[7].target_id}_a1"
     fake_llm.batches(BatchScript(items={lost: "missing"}, polls_until_ended=0))
     report = await reconcile_ambiguous_once(engine, fake_llm)
@@ -211,7 +269,50 @@ async def test_a_partial_intersection_is_an_anomaly_and_never_adopted(
     (row,) = await submission_rows(engine)
     assert (row.state, row.provider_batch_id, row.results_complete_at) == ("submit_ambiguous", None, None)
     assert await open_alert_codes(engine) == ["batch.custom_id_anomaly"]
+    async with engine.connect() as conn:
+        context = (await conn.execute(_ANOMALY_CONTEXT)).scalar_one()
+    assert context == {"submission_id": row.id, "foreign_lines": 0, "lacking_lines": 1}  # a subset of ours
     assert await count_rows(engine, "batch_items", result_type="awaiting") == N
+
+
+async def partial_batch(fake_llm: FakeLLM, ours: list[str], *, shared: int) -> str:
+    """A batch of the workspace with as many requests as ours, `shared` of them with our `custom_id`s (no
+    submission of ours made it): its id."""
+    params: dict[str, JSONValue] = {"model": "claude-sonnet-5-5", "max_tokens": 256}
+    fake_llm.batches(BatchScript(create="ok", polls_until_ended=0))
+    ids = ours[:shared] + [f"t{900000 + i}_a9" for i in range(len(ours) - shared)]
+    async with fake_llm.client() as http:
+        created = await BatchesClient(fake_llm.cfg, http_client=http).create(
+            [BatchRequest(cid, params) for cid in ids]
+        )
+    assert isinstance(created, Created)
+    return created.provider_batch_id
+
+
+@pytest.mark.parametrize("ours_first", [True, False])
+async def test_the_adoption_does_not_depend_on_the_listing_order(
+    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, setup: BulkTargets, ours_first: bool
+) -> None:
+    """Minor 4 (rule 3 and rule 4, L3989-3990): every ended candidate of the window is downloaded before any
+    decision; our batch is adopted only when it is the one candidate whose `custom_id` set equals ours and no
+    candidate intersects ours partially. With a partially intersecting batch of the same size in the window,
+    listed after ours or before it, the submission stays `submit_ambiguous` and `batch.custom_id_anomaly`
+    names how many of its lines were foreign and how many of ours it lacked."""
+    ours = [f"t{t.target_id}_a1" for t in setup.targets]
+    if not ours_first:  # the partial batch is the older one: listed after ours (newest first)
+        await partial_batch(fake_llm, ours, shared=100)
+    fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=0))
+    row = await ambiguous(engine, op_runner, setup)
+    fake_llm.batches(BatchScript(polls_until_ended=0))
+    if ours_first:  # the partial batch is the newer one: listed before ours
+        await partial_batch(fake_llm, ours, shared=100)
+    report = await reconcile_ambiguous_once(engine, fake_llm)
+    assert (report.listed, report.adopted, report.anomalies) == (2, 0, 1)
+    (row,) = await submission_rows(engine)
+    assert (row.state, row.provider_batch_id) == ("submit_ambiguous", None)
+    async with engine.connect() as conn:
+        context = (await conn.execute(_ANOMALY_CONTEXT)).scalar_one()
+    assert context == {"submission_id": row.id, "foreign_lines": N - 100, "lacking_lines": N - 100}
 
 
 async def test_a_batch_item_parses_with_the_stored_family(
@@ -246,7 +347,7 @@ async def test_c21_no_batch_created_stays_quarantined_until_the_users_release(
     critical alert (with the amount it holds), never a transition; after the release the targets are
     `pending`, the attempts `released`, the spend `ambiguous` and the alert resolved."""
     fake_llm.batches(BatchScript(create="ambiguous_not_created"))
-    row = await ambiguous(engine, op_runner, setup, "ambiguous_not_created")
+    row = await ambiguous(engine, op_runner, setup)
     started = row.submit_started_at
     for hours in (1, 24):
         report = await reconcile_ambiguous_once(engine, fake_llm, now=started + timedelta(hours=hours))
@@ -276,7 +377,7 @@ async def test_c22_a_failing_listing_never_moves_the_submission_and_alerts_at_25
     """C22: the listing fails for 26 h on the injected clock: every row untouched (`batch_listing_failed`),
     no transition, the critical alert at 25 h."""
     fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=0))
-    row = await ambiguous(engine, op_runner, setup, "ambiguous_created")
+    row = await ambiguous(engine, op_runner, setup)
     fake_llm.batches(BatchScript(listing="error_500", polls_until_ended=0))
     started = row.submit_started_at
     alerts = []
@@ -302,7 +403,7 @@ async def test_a_released_submission_is_listed_for_29_days_only(
     """A2 B12: a `released` submission is reconciled while `submit_started_at > now - 29 days`; after that
     it is `released` for good and no listing is made for it."""
     fake_llm.batches(BatchScript(create="ambiguous_not_created"))
-    row = await ambiguous(engine, op_runner, setup, "ambiguous_not_created")
+    row = await ambiguous(engine, op_runner, setup)
     await release(engine, row.id)
     fake_llm.batches(BatchScript(listing="error_500"))  # a listing made would fail: `listed` None
     started = row.submit_started_at
@@ -320,7 +421,7 @@ async def test_an_adopted_batch_keeps_its_recorded_cancel_and_is_not_cancelled(
     submission is carried forward as a record only: no cancel is sent, the targets the request cancelled stay
     cancelled, and every item is `ignored_fenced` with its spend settled."""
     fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=0))
-    row = await ambiguous(engine, op_runner, setup, "ambiguous_created")
+    row = await ambiguous(engine, op_runner, setup)
     async with engine.begin() as conn:  # the tuple superseded meanwhile: the request recorded
         requested = await batches_mod.request_cancel(conn, llm_tuple_id=setup.llm_tuple_id, now=utcnow())
     assert (requested.submissions, requested.targets) == (1, N)
@@ -372,3 +473,63 @@ async def test_batch_poll_sends_the_recorded_cancel_of_a_batch_in_progress_once(
     assert set(await batch_ledger(engine)) == {("not_billed", "batch_item_canceled")}
     targets = await targets_by_custom_id(engine)
     assert {(t.state, t.outcome) for t in targets.values()} == {("cancelled", "cancelled")}
+
+
+async def test_a_failing_cancel_is_tried_cancel_tries_times_per_pass_then_given_up(
+    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, setup: BulkTargets, calls: list[str]
+) -> None:
+    """L6443: the poll retrieves the batch first and, while it is `in_progress`, sends the recorded cancel up
+    to `CANCEL_TRIES` times; a cancel failing every time is given up for the pass (the submission stays
+    `submitted`) and sent again by the next poll; once one is accepted, the batch is retrieved again, ended
+    at its cancel, and reconciled in that pass."""
+    fake_llm.batches(BatchScript(create="ok", polls_until_ended=5, cancel="error_500"))
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    async with engine.begin() as conn:
+        await batches_mod.request_cancel(conn, llm_tuple_id=setup.llm_tuple_id, now=utcnow())
+    given_up = ["retrieve", *["cancel"] * batch_ops.CANCEL_TRIES]
+    for _ in range(2):
+        calls.clear()
+        report = await poll_once(engine, fake_llm)
+        assert (report.cancels, report.ended, calls) == (0, 0, given_up)
+        (row,) = await submission_rows(engine)
+        assert row.state == "submitted"
+    fake_llm.batches(BatchScript(create="ok", polls_until_ended=5))
+    calls.clear()
+    report = await poll_once(engine, fake_llm)
+    assert (report.cancels, report.ended, calls) == (1, 1, ["retrieve", "cancel", "retrieve"])
+    (row,) = await submission_rows(engine)
+    assert row.state == "reconciled"
+    assert set(await decisions(engine)) == {"ignored_fenced"}
+
+
+@pytest.mark.parametrize("seen", ["ended", "canceling"])
+async def test_no_cancel_is_sent_to_a_batch_no_longer_in_progress(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    calls: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    seen: str,
+) -> None:
+    """L6443: the poll retrieves a `submitted` batch whose cancel is recorded before it sends one; an ended
+    batch has nothing to cancel (it moves to `ended` and is reconciled) and a `canceling` one has its cancel
+    already (it stays `submitted`): no cancel either way."""
+    fake_llm.batches(BatchScript(create="ok", polls_until_ended=0 if seen == "ended" else 5))
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    async with engine.begin() as conn:
+        await batches_mod.request_cancel(conn, llm_tuple_id=setup.llm_tuple_id, now=utcnow())
+    if seen == "canceling":  # the provider still winding a cancel accepted earlier down
+        counted = BatchesClient.retrieve
+
+        async def canceling(self: BatchesClient, batch_id: str) -> BatchStatus:
+            return replace(await counted(self, batch_id), processing_status="canceling")
+
+        monkeypatch.setattr(BatchesClient, "retrieve", canceling)
+    calls.clear()
+    report = await poll_once(engine, fake_llm)
+    (row,) = await submission_rows(engine)
+    assert (report.cancels, calls) == (0, ["retrieve"])
+    assert row.state == ("reconciled" if seen == "ended" else "submitted")

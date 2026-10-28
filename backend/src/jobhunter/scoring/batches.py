@@ -1189,7 +1189,17 @@ async def rerequest(conn: AsyncConnection, bulk_operation_id: int, ctx: Reconcil
     """Ruling T16-d (module docstring): the batch of the `active` bulk operation requested again, in the
     `bulk_operations` reconciler's transaction (`fence_epoch` and `active_config FOR SHARE` held), after the
     exhaustion sweep of its tuple (Carry T16-h); whether it repaired something (a target ended, the operation
-    completed, or a request recorded)."""
+    completed, or a request recorded).
+
+    The pass has locked this operation's bulk row (`complete_if_done`) before the sweep locks, in id order,
+    the bulk rows of its candidates' unreleased follow-up items (`bulk.lock_for_targets`). That is out of id
+    order only if one of those rows were another operation's, and today none can be: at most one operation is
+    `active` (`bulk_operations_one_active`); the completion stamps every item of the operation it completes;
+    an operation is cancelled only by a tuple supersession, which cancels its tuple's targets and so releases
+    their holds in that transaction; and a target is its tuple's alone, so a candidate of this tuple has no
+    item of another tuple's operation. (The candidates are `pending` or `budget_deferred`, never `in_batch`;
+    an `in_batch` target has no unreleased `followup` item anyway, Carry T10-b.) So every row the sweep locks
+    is this one, held already. Both invariants are pinned (`test_batch_decisions`)."""
     row = (await conn.execute(_BULK_OF, {"b": bulk_operation_id})).first()
     if row is None or row.state != "active":
         return False

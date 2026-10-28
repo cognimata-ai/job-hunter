@@ -5,15 +5,19 @@
 `budget.apply_count` for a reservation, `budget.settlement_delta` for a settlement, `budget.change_cap` for a
 cap edit) against an in-memory ledger: reservations, the three settlements (late ones from `ambiguous`
 included), releases, cap edits in both directions, time and the month boundary. M3 Task 17 adds the batch
-and bulk events (L5695): a bulk operation's batch submission reserves its items at once, each admitted against
-the hard cap and all of them against the operation's allocation (`spent + held + Σ r + n x hold ≤ budget`,
-L1189), funded by the allocation instead of the bucket, with its follow-up holds; its items are dispatched
-at submit-start, settle `billed` or `not_billed` from their results, or `ambiguous` (missing, or the user's
-release) and later `billed | not_billed` once the batch is found (§7.16.7), and each item's hold is
-released once. Its invariants are §7.17 #6: the cap invariant of every month, the admission audit of every
-ledger row (and of every batch against its allocation), the counters equal to the ledger sums of the §7.11
-formula, the operation's `spent_usd` equal to the counted amounts of the entries it funds, and its
-`followup_held_usd` equal to its items' unreleased holds.
+and bulk events (L5695): a bulk operation's batch submission reserves its items at once, all of them
+admitted against the operation's allocation by the production rule (`bulk.Accounts.fits`: `spent + held + Σ r
++ n x hold ≤ budget`, L1189) and each against the hard cap, funded by the allocation instead of the bucket,
+with its follow-up holds; its items are dispatched at submit-start, settle `billed` or `not_billed` from their
+results, or `ambiguous` (missing, or the user's release) and later `billed | not_billed` once the batch is
+found (§7.16.7), an abandoned one is released never dispatched (its debit credited), and each item's hold is
+released once, never below 0. The bulk accounts modelled are one operation's `budget_usd` (fixed),
+`spent_usd` and `followup_held_usd` (§6.9.3); not modelled are the online follow-ups the allocation funds
+(their own rule, `spent + r ≤ budget`, L1191, which their holds cover) and a cost above its reservation
+(charged in full, L1164). Its invariants are §7.17 #6: the cap invariant of every month, the admission audit
+of every ledger row, the counters equal to the ledger sums of the §7.11 formula, the operation's `spent_usd`
+equal to the counted amounts of the entries it funds, and, after every step, `spent_usd + followup_held_usd ≤
+budget_usd` (§6.9.3: the allocation bounds the batch items and their expected follow-ups).
 
 `BucketMachine` paces an unbounded scoring backlog with the §6.9.2 cycle rules (trigger
 `bucket ≥ min(min_cycle_targets x ĉ, B_max)`, `S = min(max_targets_per_cycle, floor(bucket / ĉ))`) under any
@@ -29,7 +33,7 @@ from decimal import ROUND_FLOOR, Decimal
 from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
-from jobhunter.llm import budget
+from jobhunter.llm import budget, bulk
 from jobhunter.llm.budget import BudgetParams, BudgetRow, PurposeClass
 
 START = datetime(2026, 10, 1, tzinfo=UTC)
@@ -74,20 +78,22 @@ class Entry:
 class SpendMachine(RuleBasedStateMachine):
     """The counters, the cap invariant and the admission audit (§6.9.1, §7.17 #6), over months and edits."""
 
-    @initialize(cap=cents, buffer=st.integers(0, 500).map(lambda n: Decimal(n) / 100), pct=st.integers(0, 20))
-    def start(self, cap: Decimal, buffer: Decimal, pct: int) -> None:
+    @initialize(
+        cap=cents,
+        buffer=st.integers(0, 500).map(lambda n: Decimal(n) / 100),
+        pct=st.integers(0, 20),
+        bulk_budget=st.integers(1, 4_000).map(lambda n: Decimal(n) / 100),
+    )
+    def start(self, cap: Decimal, buffer: Decimal, pct: int, bulk_budget: Decimal) -> None:
         self.p = replace(P, cap_usd=cap, overrun_buffer_usd=buffer, nonscoring_reserve_pct=pct)
         self.now = START
         self.rows: dict[date, BudgetRow] = {}
         self.entries: list[Entry] = []
         # the bulk operation (§6.9.3): its fixed budget, its spent and held accounts, its items' holds
-        self.bulk_budget = Decimal("40.00")
+        self.bulk_budget = bulk_budget  # fixed at the operation's start (L1186)
         self.bulk_spent = Decimal(0)
         self.bulk_held = Decimal(0)
         self.holds: list[tuple[Decimal, bool]] = []  # (hold, released)
-        self.batch_admissions: list[
-            tuple[Decimal, Decimal, Decimal, Decimal]
-        ] = []  # spent, held, Σ r, n x hold
 
     def _month_row(self) -> BudgetRow:
         """`ensure_month` for the month of `now`, from the current params (a new month starts full)."""
@@ -163,7 +169,7 @@ class SpendMachine(RuleBasedStateMachine):
         self._settle(data.draw(st.sampled_from(self._in("dispatched"))), "ambiguous", None)
 
     @rule(
-        n=st.integers(1, 8), r=micro_usd, hold=st.integers(0, 100_000).map(lambda n: Decimal(n) / 1_000_000)
+        n=st.integers(1, 8), r=micro_usd, hold=st.integers(0, 1_000_000).map(lambda n: Decimal(n) / 1_000_000)
     )
     def reserve_batch(self, n: int, r: Decimal, hold: Decimal) -> None:
         """A batch submission (`spend_ledger.reserve_batch`): under the month row and the bulk row, the
@@ -171,14 +177,14 @@ class SpendMachine(RuleBasedStateMachine):
         writes nothing (the preparation's savepoint)."""
         row = self._month_row()
         budget.accrue_row(row, self.p, self.now)
-        if self.bulk_spent + self.bulk_held + n * r + n * hold > self.bulk_budget:
+        account = bulk.Accounts("active", self.bulk_budget, self.bulk_spent, self.bulk_held)
+        if not account.fits(worst_case_usd=n * r, hold_usd=n * hold):  # the production rule (L1189)
             return
         trial = replace(row)
         for _ in range(n):
             if not budget.admits(trial, r, "scoring", self.p):
                 return
             budget.apply_count(trial, r, "scoring", bucket=False)
-        self.batch_admissions.append((self.bulk_spent, self.bulk_held, n * r, n * hold))
         for _ in range(n):
             self.entries.append(
                 Entry(
@@ -252,16 +258,21 @@ class SpendMachine(RuleBasedStateMachine):
 
     @invariant()
     def the_allocation_equals_its_funded_entries(self) -> None:
-        """The bulk operation's `spent_usd` is the counted amount of the entries it funds (every settlement
-        moves both by the same delta), and its `followup_held_usd` its items' unreleased holds."""
+        """The bulk operation's `spent_usd` is the counted amount of the entries it funds: each settlement
+        moves it by `budget.settlement_delta`, the entry by its own state."""
         assert self.bulk_spent == sum((e.counted for e in self.entries if e.funded), Decimal(0))
-        assert self.bulk_held == sum((hold for hold, released in self.holds if not released), Decimal(0))
-        assert self.bulk_held >= 0
 
     @invariant()
-    def every_batch_fit_its_allocation(self) -> None:
-        for spent, held, worst, holds in self.batch_admissions:
-            assert spent + held + worst + holds <= self.bulk_budget
+    def the_allocation_bounds_its_batches_and_their_holds(self) -> None:
+        """§6.9.3 after every step: `spent_usd + followup_held_usd ≤ budget_usd`, with both accounts as the
+        production rules move them (`Accounts.fits` at the admission, `settlement_delta` at each settlement,
+        the hold's release never below 0)."""
+        assert self.bulk_held >= 0
+        assert self.bulk_spent + self.bulk_held <= self.bulk_budget, (
+            self.bulk_spent,
+            self.bulk_held,
+            self.bulk_budget,
+        )
 
 
 TestSpendMachine = SpendMachine.TestCase

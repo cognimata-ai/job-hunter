@@ -85,6 +85,7 @@ __all__ = [
     "decisions",
     "eligible_for_batching",
     "entries_by_custom_id",
+    "item_ids",
     "item_rows",
     "items_of",
     "make_due",
@@ -387,6 +388,7 @@ async def reconcile_ambiguous_once(
 
 _SUBMISSION_STATE: Final = sa.text("SELECT state FROM batch_submissions WHERE id = :s")
 _DECISIONS: Final = sa.text("SELECT decision FROM batch_items WHERE decision IS NOT NULL ORDER BY id")
+_ITEM_IDS: Final = sa.text("SELECT id, custom_id FROM batch_items")
 _ITEM_ROWS: Final = sa.text(
     "SELECT custom_id, result_type, decision, stop_reason, processed_at, hold_released_at, hold_usd "
     "FROM batch_items ORDER BY id"
@@ -421,6 +423,12 @@ async def decisions(engine: AsyncEngine) -> list[str]:
     """Every decided item's decision, in item order."""
     async with engine.connect() as conn:
         return [str(d) for d in (await conn.execute(_DECISIONS)).scalars()]
+
+
+async def item_ids(engine: AsyncEngine) -> dict[str, int]:
+    """Every item's id by `custom_id`."""
+    async with engine.connect() as conn:
+        return {str(r.custom_id): int(r.id) for r in await conn.execute(_ITEM_IDS)}
 
 
 async def item_rows(engine: AsyncEngine) -> dict[str, sa.Row[Any]]:

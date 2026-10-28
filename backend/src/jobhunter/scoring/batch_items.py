@@ -15,7 +15,9 @@ Carries T8-b, T10-b, T10-f, Deviation 27): `process_item`, one item in the calle
    settled `billed` from its usage at batch prices, its call `completed` with the code and the wire JSON only
    when the output is usable, so the usage is always billed and a partial, refused, malformed or unstorable
    output is never stored; an `errored`, `canceled` or `expired` item settles `not_billed(batch_item_errored |
-   batch_item_canceled | batch_item_expired)` with its call `error` (the code its decision reason names); a
+   batch_item_canceled | batch_item_expired)` with its call `error` (`call_error_code`: the code its decision
+   reason names, an errored item's followed by `:` and the provider's nested `error.error.type`, made storable
+   and bounded to `PROVIDER_TYPE_MAX` characters, never the provider's message, Carry T8-b); a
    `missing` item (synthesised after a complete stream) settles `ambiguous` (A1 issue 22). An entry already
    `ambiguous` (a released submission's) takes the late edge `ambiguous → billed | not_billed` (L2974-2975,
    Codex N9), and the attempt's `cost_usd` follows (`settle`: ambiguous its reservation, late billed its cost;
@@ -127,6 +129,7 @@ Decided = Literal[
 IGNORED_FENCED: Final = "ignored_fenced"
 # The provider's errored type of a request it refused (`error.error.type`, Carry T8-b).
 INVALID_REQUEST_ERROR: Final = "invalid_request_error"
+PROVIDER_TYPE_MAX: Final = 64  # the characters of that type an errored item's call code keeps
 # The decisions' reasons (§7.16.3: the targets' `state_reason`, the attempts' `outcome_detail`).
 BATCH_INVALID_OUTPUT: Final = "batch_invalid_output"
 BATCH_MAX_TOKENS: Final = "batch_max_tokens"
@@ -382,7 +385,7 @@ async def _settle(
             conn, res, outcome="ambiguous", evidence=None, usage=None, call=call, now=now
         )
         return None
-    call = CallOutcome(status="error", error_code=_reason_of(result))
+    call = CallOutcome(status="error", error_code=call_error_code(result))
     await spend_ledger.settle(
         conn,
         res,
@@ -393,6 +396,15 @@ async def _settle(
         now=now,
     )
     return None
+
+
+def call_error_code(result: ItemResult) -> str:
+    """The call's code of an item the provider did not run (module docstring): its reason, and an errored
+    item's provider type after a `:` (storable, at most `PROVIDER_TYPE_MAX` characters; never the message)."""
+    reason = _reason_of(result)
+    if result.result_type != "errored" or not result.error_type:
+        return reason
+    return f"{reason}:{storable_text(result.error_type)[:PROVIDER_TYPE_MAX]}"
 
 
 def _reason_of(result: ItemResult) -> str:

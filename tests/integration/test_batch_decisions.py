@@ -14,6 +14,8 @@ from its own result and decides its target.
   provider-side cancel.
 - Carry T10-b: a follow-up target is never batched again (no `in_batch` target has an unreleased follow-up
   item, which the batch publish's hold release relies on).
+- Carry T16-h: every unreleased follow-up item is the active bulk operation's, a supersession included
+  (which `batches.rerequest`'s exhaustion sweep relies on for its bulk rows' id order).
 
 Every datum is invented.
 """
@@ -59,6 +61,11 @@ OPUS = "claude-opus-5-5"
 # The test evaluation policy's projected critic rate (0.3) times ĉ_followup of policy B: an item's hold.
 HOLD = (Decimal("0.3") * budget.c_hat_followup(ModelPolicy())).quantize(Decimal("0.000001"), ROUND_HALF_UP)
 _TARGETS_OF_TUPLE = sa.text("SELECT count(*) FROM score_targets WHERE llm_tuple_id = :t AND state = :s")
+_UNRELEASED_OUTSIDE_ACTIVE = sa.text(
+    "SELECT count(*) FROM batch_items i JOIN batch_submissions s ON s.id = i.submission_id "
+    "JOIN bulk_operations b ON b.id = s.bulk_operation_id "
+    "WHERE i.decision = 'followup' AND i.hold_released_at IS NULL AND b.state <> 'active'"
+)
 _CLEAR_LANE = sa.text("UPDATE score_targets SET lane = NULL WHERE id = ANY(CAST(:ids AS bigint[]))")
 
 
@@ -121,12 +128,12 @@ async def test_partly_expired_batch_settles_each_item_and_retries_online(
 async def test_reconfirm_during_a_batch_cancels_in_batch_targets_and_fences_late_items(
     engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, queued: None
 ) -> None:
-    """Review Focus 2 (A2 B1, Carry T8-g: the cancel comes before the batch's first retrieval)."""
+    """Review Focus 2 (A2 B1, L6443: the poll retrieves the batch, in progress, then sends the cancel)."""
     submitted = await submit_batch(engine, op_runner, fake_llm, N)
     _, tuple_b = await confirm_new_profile(engine)  # Task 14: the cancel recorded, in_batch → cancelled
     assert Counter(t.state for t in (await targets_by_custom_id(engine)).values()) == {"cancelled": N}
-    fake_llm.batches(BatchScript(items=dict.fromkeys(submitted.custom_ids, "succeeded")))
-    await poll_once(engine, fake_llm)  # the cancel sent, then the ended batch's results
+    fake_llm.batches(BatchScript(items=dict.fromkeys(submitted.custom_ids, "succeeded"), polls_until_ended=5))
+    await poll_once(engine, fake_llm)  # the cancel sent, then the batch, ended at it, and its results
     assert fake_llm.state.batches[submitted.provider_id].cancel_requested is True
     assert set(await decisions(engine)) == {"ignored_fenced"} and await count_rows(engine, "llm_results") == 0
     assert set(ledger_states(await batch_ledger(engine))) <= {"billed", "not_billed"}
@@ -240,7 +247,7 @@ async def test_the_rest_of_the_decision_table(
         "failed_request",
         "not_billed",
         "batch_item_errored",
-        "batch_invalid_request",
+        "batch_invalid_request:invalid_request_error",  # the provider's nested type on the call (T8-b)
         "failed_request",
         "batch_invalid_request",
         "failed_request",
@@ -249,7 +256,7 @@ async def test_the_rest_of_the_decision_table(
         "retry_online",
         "not_billed",
         "batch_item_errored",
-        "batch_errored",
+        "batch_errored:api_error",
         "pending",
         "batch_errored",
         "transient_error",
@@ -286,3 +293,29 @@ async def test_a_follow_up_target_is_never_batched_again(
     async with engine.begin() as conn:  # the lane cleared, as a later online attempt may leave it
         await conn.execute(_CLEAR_LANE, {"ids": followed})
     assert await eligible_for_batching(engine, submitted.setup, followed) == []
+
+
+async def test_every_unreleased_follow_up_item_is_the_active_bulk_operations(
+    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, queued: None
+) -> None:
+    """Carry T16-h (`batches.rerequest`): the `bulk_operations` pass holds the active operation's bulk row
+    before the exhaustion sweep locks the bulk rows of its candidates' unreleased follow-up items, which is in
+    id order only while every such item is the active operation's. A profile confirmed while follow-ups hold
+    supersedes the operation and cancels their targets, releasing every hold in that transaction: no
+    unreleased follow-up item outlives its operation's `active` state."""
+    submitted = await submit_batch(engine, op_runner, fake_llm, N, followups=3)
+    fake_llm.batches(BatchScript(polls_until_ended=0))
+    await poll_once(engine, fake_llm)
+    items = await item_rows(engine)
+    assert all(items[c].hold_released_at is None for c in submitted.custom_ids[:3])
+    assert await _unreleased_outside_the_active_operation(engine) == 0
+    await confirm_new_profile(engine)
+    assert (await bulk_row(engine, submitted.setup.bulk_operation_id)).state == "cancelled"
+    assert await _unreleased_outside_the_active_operation(engine) == 0
+    items = await item_rows(engine)
+    assert all(items[c].hold_released_at is not None for c in submitted.custom_ids[:3])
+
+
+async def _unreleased_outside_the_active_operation(engine: AsyncEngine) -> int:
+    async with engine.connect() as conn:
+        return int((await conn.execute(_UNRELEASED_OUTSIDE_ACTIVE)).scalar_one())

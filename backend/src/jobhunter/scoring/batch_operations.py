@@ -27,28 +27,39 @@ retries; Task 27 moves it into `OperationDeps.batches_client`).
 `active_config FOR SHARE`, and in the tick reconciler `batch_submissions`, which takes no lock on a pass whose
 lock-free read finds no candidate (`batches.any_lost`).
 
-**The provider cancel** (`cancel_requested`, L6443): `messages.batches.cancel` of a recorded request
-(`cancel_requested_at`) up to `CANCEL_TRIES` (3) times, then logged; the handler sends it right after
-`record_created`'s commit, and `batch_poll` again on every pass while the submission is `submitted`.
+**The provider cancel** (`cancel_requested`, L6443): of a recorded request (`cancel_requested_at`), the
+batch retrieved first and `messages.batches.cancel` sent only while it is `in_progress` (a `canceling` one has
+an accepted cancel already, an ended one nothing to cancel), up to `CANCEL_TRIES` (3) times, then logged; the
+handler sends it right after `record_created`'s commit, and `batch_poll` again on every pass while the
+submission is `submitted` and its batch in progress.
 
 **The poll** (`poll`, the body of `batch_poll`, every 5 min on `aux`, L3958), for every `submitted` and
-`ended` submission, one at a time, each transaction fenced by the worker epoch: a `submitted` one has its
-recorded cancel sent first, then it is retrieved, and once `processing_status = 'ended'` it moves `submitted
-→ ended` (`active_config FOR SHARE`, the owner `FOR UPDATE` under `state = 'submitted'`); an `ended` one has
-its results streamed line by line (`BatchesClient.results`, never buffered whole), each line's item decided in
-**a transaction of its own** (`batch_items.process_item`; never two items in one: an item takes its job row
-before its owner and ends on `ranking_state`, Codex r6 B1), the fault point `batch.after_item` after each
-commit. A `followup` decision requests a `batch_followup` cycle (`cycles.request_cycle`). When the stream was
-read to its end and every line named an item of the submission, `finalize_results` runs; a line naming no
-item of ours raises the critical `batch.custom_id_anomaly` and completes nothing; a cut stream completes
-nothing and decides no item `missing` (L3961): the next poll reads it again, and every item already decided
-replays its stored decision. **An unreadable stream** (Carry T16-g: a line the pinned SDK cannot validate,
-`BatchApiError.unreadable`, a provider schema change) is bounded: each such pass is counted in the
-submission's `reconcile_report` (`unreadable_passes`), and at `RESULTS_UNREADABLE_PASSES` (12, an hour at the
-poll's cadence) the completion runs with the critical `batch.results_unreadable`, so every item still unread
-is decided `missing` instead of leaving the submission `ended` for good; a stream not read whole for any
-other reason (cut, or not opened) is given up the same way once the results' retention has passed
-(`RESULTS_RETENTION`, 29 days after `submit_started_at`, reason `results_retention_passed`).
+`ended` submission, one at a time, each transaction fenced by the worker epoch: a `submitted` one is
+retrieved, has its recorded cancel sent while in progress (then is retrieved again), and once
+`processing_status = 'ended'` it moves `submitted → ended` (`active_config FOR SHARE`, the owner `FOR UPDATE`
+under `state = 'submitted'`); a retrieval still failing past `expires_at + 1 h` raises the critical
+`batch.retrieve_failing` (ids only; resolved by the move to `ended`); an `ended` one has its results streamed
+line by line (`BatchesClient.results`, never buffered whole), each line's item decided in **a transaction of
+its own** (`batch_items.process_item`; never two items in one: an item takes its job row before its owner and
+ends on `ranking_state`, Codex r6 B1), the fault point `batch.after_item` after each commit. A `followup`
+decision requests a `batch_followup` cycle (`cycles.request_cycle`). **One item's unexpected error** (Ruling
+T17-a) rolls back its own transaction only: it is logged with its class, counted in
+`reconcile_report.failed_items` (`{item_id: consecutive_passes}`, an item decided later dropped from it) and
+skipped for the pass, and the stream is not complete while any item failed; at `RESULTS_UNREADABLE_PASSES`
+consecutive failed passes the item is given up: the critical `batch.item_unprocessable` (subject the
+submission, ids only), then the missing-item path in a fresh transaction (when that raises too, the alert
+stays and the next pass tries again); the worker's `FencedOut` and a cancellation propagate. When the stream
+was read to its end, every line named an item of the submission and no item failed, `finalize_results` runs; a
+line naming no item of ours raises the critical `batch.custom_id_anomaly` and completes nothing; a cut stream
+completes nothing and decides no item `missing` (L3961): the next poll reads it again, and every item already
+decided replays its stored decision. **An unreadable stream** (Carry T16-g: a line the pinned SDK cannot
+validate, `BatchApiError.unreadable`, a provider schema change) is bounded: each such pass is counted in the
+submission's `reconcile_report` (`unreadable_passes`, and the error's class as `unreadable_error_class`), and
+at `RESULTS_UNREADABLE_PASSES` (12, an hour at the poll's cadence) the completion runs with the critical
+`batch.results_unreadable`, so every item still unread is decided `missing` instead of leaving the submission
+`ended` for good; a stream not read whole for any other reason (cut, or not opened) is given up the same way
+once the results' retention has passed (`RESULTS_RETENTION`, 29 days after `submit_started_at`, reason
+`results_retention_passed`).
 
 **The completion orchestration** (`finalize_results`, shared by the poll and the adoption, Codex r5 B5, r6
 B1, r7 B1), three kinds of transactions, never one: (1) the completion: `active_config FOR SHARE`, the owner
@@ -66,23 +77,26 @@ the reconcile (`batch.after_reconcile_commit` after it). The rows are the recove
 a crash after (1) leaves the next poll to skip the stream and run (2) and (3), a crash after the last missing
 item leaves it to run (3).
 
-**The ambiguous-submit reconciliation** (`reconcile_ambiguous`, the body of `batch_reconcile_ambiguous`,
-every 15 min on `aux`, L3984-3999), for every `submit_ambiguous` submission and every `released` one with
+**The ambiguous-submit reconciliation** (`reconcile_ambiguous`, the body of `batch_reconcile_ambiguous`, every
+15 min on `aux`, L3984-3999), for every `submit_ambiguous` submission and every `released` one with
 `submit_started_at > now - 29 days` (A2 B12; an older one is listed no more): first, at 25 h after its
 submit-start, each `submit_ambiguous` one opens the critical `batch.submit_ambiguous_unresolved` with the
 amount it holds (never a transition, chair decision C3; also while the listing fails, C22); then one listing
 of the whole workspace (`list_all`; a failure leaves every row untouched, logged `batch_listing_failed`; the
 workspace is this installation's alone, A2 B15), less the batches some submission adopted already. For each
 submission, the candidates are the batches created within `[submit_started_at - 1 min, submit_started_at + 10
-min]` whose request count totals ours; a candidate is confirmed only once it has ended and its results,
-downloaded whole (ids only), name exactly our `custom_id` set: the adoption transaction (`active_config FOR
-SHARE`, the owner `FOR UPDATE` under `state IN ('submit_ambiguous', 'released')` without a provider id) adopts
-its id and moves the submission to `ended` (a released one keeps `released_at`, outside the singleton; a
-recorded cancel stays a record: an ended batch has nothing to cancel, Codex r7 B3), then its results are
-processed and completed by the poll's own path in the same pass (every item of a released submission is
-`ignored_fenced`; the follow-on fires for a `submit_ambiguous` origin only). A candidate whose ids intersect
-ours partially raises `batch.custom_id_anomaly` and adopts nothing (rule 4); a pass without a match records
-`last_reconcile_at` and `reconcile_report = {…, "candidates": n, "listed": m}`.
+min]` whose request count totals ours; the results of every ended candidate are downloaded whole (ids only)
+before anything is decided, so the listing's order decides nothing, and a candidate is confirmed only when it
+alone names exactly our `custom_id` set and no other intersects it partially: the adoption transaction
+(`active_config FOR SHARE`, the owner `FOR UPDATE` under `state IN ('submit_ambiguous', 'released')` without a
+provider id) adopts its id and moves the submission to `ended` (a released one keeps `released_at`, outside
+the singleton; a recorded cancel stays a record: an ended batch has nothing to cancel, Codex r7 B3), then its
+results are processed and completed by the poll's own path in the same pass (every item of a released
+submission is `ignored_fenced`; the follow-on fires for a `submit_ambiguous` origin only). A candidate whose
+ids intersect ours partially, or more than one equal to ours, raises `batch.custom_id_anomaly` (with how many
+lines are foreign and how many of ours are lacking) and adopts nothing (rule 4); a pass without a match
+records `last_reconcile_at` and `reconcile_report = {…, "candidates": n, "listed": m}`. One submission's
+unexpected error is logged with its class and leaves the others to the pass (Ruling T17-a).
 
 **The task bodies** (`poll_task`, `reconcile_ambiguous_task`, Deviation 27: periodic tasks of `worker.tasks`,
 each under the queueing lock of its name) build the client from the worker's config and gateway and do
@@ -113,6 +127,7 @@ from jobhunter.llm.batches import (
     Ambiguous,
     BatchApiError,
     BatchesClient,
+    BatchStatus,
     BatchSummary,
     Created,
     CreateOutcome,
@@ -120,7 +135,7 @@ from jobhunter.llm.batches import (
     Rejected,
 )
 from jobhunter.llm.gateway import LLMGateway
-from jobhunter.observability.alerts import open_alert, raise_alert
+from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import batch_items, batches, cycles, targets
 from jobhunter.settings.dryrun import active_settings
@@ -157,17 +172,25 @@ WINDOW_AFTER: Final = timedelta(minutes=10)
 UNRESOLVED_AFTER: Final = timedelta(hours=25)
 RELEASED_LISTED_FOR: Final = timedelta(days=29)
 ITEMS_MISSING_ALERT: Final = "batch.items_missing"
+ITEM_UNPROCESSABLE_ALERT: Final = "batch.item_unprocessable"  # Ruling T17-a
 CUSTOM_ID_ANOMALY_ALERT: Final = "batch.custom_id_anomaly"
 RESULTS_UNREADABLE_ALERT: Final = "batch.results_unreadable"
+# A `submitted` batch whose retrieval still fails this long past its `expires_at` (L3958: the provider has
+# ended it by then) raises the critical `batch.retrieve_failing`.
+RETRIEVE_FAILING_ALERT: Final = "batch.retrieve_failing"
+RETRIEVE_FAILING_AFTER: Final = timedelta(hours=1)
 _SUBMISSIONS: Final = "batch_submissions"
 _UNREADABLE_PASSES: Final = "unreadable_passes"
+# the class of the error that left the stream unreadable (never `error_class`, the ambiguous create's key)
+_UNREADABLE_ERROR_CLASS: Final = "unreadable_error_class"
+_FAILED_ITEMS: Final = "failed_items"
 
 _OWN_EPOCH: Final = q(
     "SELECT worker_epoch FROM operations WHERE id = :i AND claim_id = :c AND status = 'running'"
 )
 # The poll's submissions, read without a lock, and its owners.
 _POLLED: Final = q(
-    "SELECT id, state, provider_batch_id, cancel_requested_at FROM batch_submissions "
+    "SELECT id, state, provider_batch_id, cancel_requested_at, expires_at FROM batch_submissions "
     "WHERE state IN ('submitted', 'ended') ORDER BY id"
 )
 _LOCK_SUBMITTED: Final = q(
@@ -202,6 +225,11 @@ _MARK_COMPLETE: Final = q(
 _COUNT_UNREADABLE: Final = q(
     "UPDATE batch_submissions SET reconcile_report = coalesce(reconcile_report, '{}') || :report "
     "WHERE id = :s AND state = 'ended' AND results_complete_at IS NULL",
+    jsonb=["report"],
+)
+_RECORD_FAILED_ITEMS: Final = q(
+    "UPDATE batch_submissions SET reconcile_report = (coalesce(reconcile_report, '{}') - 'failed_items') "
+    "|| :report WHERE id = :s AND state = 'ended'",
     jsonb=["report"],
 )
 _LOCK_TO_RECONCILE: Final = q(
@@ -413,10 +441,35 @@ async def _record_once(
 # ---- Task 17: the provider cancel of a recorded request ----------------------------------------------------
 
 
-async def cancel_requested(client: BatchesClient, provider_batch_id: str, *, submission_id: int) -> bool:
+async def cancel_requested(
+    client: BatchesClient, provider_batch_id: str, *, submission_id: int, status: BatchStatus | None = None
+) -> bool:
     """The provider cancel of a request recorded on submission `submission_id` (`cancel_requested_at`,
-    L6443): `messages.batches.cancel` up to `CANCEL_TRIES` times, then logged; whether one was accepted. The
-    caller has committed the request; `batch_poll` sends it again while the batch has not ended."""
+    L6443): the batch retrieved first (or `status`, the caller's retrieval of it just now), and
+    `messages.batches.cancel` sent only while it is `in_progress` (a `canceling` batch has an accepted cancel
+    already, an ended one nothing to cancel), up to `CANCEL_TRIES` times, then logged
+    (`batch_cancel_gave_up`); whether one was accepted. A failed retrieval sends nothing. The caller has
+    committed the request; `batch_poll` sends it again while the batch is in progress."""
+    if status is None:
+        try:
+            status = await client.retrieve(provider_batch_id)
+        except BatchApiError as failure:
+            log.warning(
+                "batch_cancel_retrieve_failed",
+                submission_id=submission_id,
+                provider_batch_id=provider_batch_id,
+                error_class=failure.error_class,
+                status=failure.status,
+            )
+            return False
+    if status.processing_status != "in_progress":
+        log.info(
+            "batch_cancel_not_sent",
+            submission_id=submission_id,
+            provider_batch_id=provider_batch_id,
+            processing_status=status.processing_status,
+        )
+        return False
     for tries in range(1, CANCEL_TRIES + 1):
         try:
             status = await client.cancel(provider_batch_id)
@@ -454,6 +507,11 @@ class _Ended:
     submit_started_at: datetime
     results_complete: bool
     unreadable_passes: int
+    failed_items: Mapping[int, int]  # item id -> consecutive passes its processing raised (Ruling T17-a)
+
+
+def _passes(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 async def _ended(conn: AsyncConnection, submission_id: int) -> _Ended | None:
@@ -461,13 +519,14 @@ async def _ended(conn: AsyncConnection, submission_id: int) -> _Ended | None:
     if row is None:
         return None
     report = row.reconcile_report if isinstance(row.reconcile_report, dict) else {}
-    passes = report.get(_UNREADABLE_PASSES)
+    failed = report.get(_FAILED_ITEMS)
     return _Ended(
         submission=batch_items.Submission(int(row.id), "ended", int(row.bulk_operation_id)),
         provider_batch_id=str(row.provider_batch_id),
         submit_started_at=row.submit_started_at,
         results_complete=row.results_complete_at is not None,
-        unreadable_passes=passes if isinstance(passes, int) and not isinstance(passes, bool) else 0,
+        unreadable_passes=_passes(report.get(_UNREADABLE_PASSES)),
+        failed_items={int(k): _passes(v) for k, v in failed.items()} if isinstance(failed, dict) else {},
     )
 
 
@@ -479,6 +538,13 @@ async def _items_of(conn: AsyncConnection, submission_id: int) -> dict[str, batc
     }
 
 
+@dataclass(frozen=True)
+class _Failed:
+    """An item whose processing raised this pass (Ruling T17-a): the error's class only."""
+
+    error_class: str
+
+
 async def _process(
     engine: AsyncEngine,
     submission: batch_items.Submission,
@@ -487,14 +553,30 @@ async def _process(
     *,
     now: datetime,
     epoch: int | None,
-) -> batch_items.Decision:
-    """One item in a transaction of its own (never two: Codex r6 B1), fenced by the worker epoch."""
-    async with engine.begin() as conn:
-        if epoch is not None:
-            await fence_epoch(conn, epoch)
-        decision = await batch_items.process_item(
-            conn, submission=submission, item=item, result=result, now=now
+) -> batch_items.Decision | _Failed:
+    """One item in a transaction of its own (never two: Codex r6 B1), fenced by the worker epoch. Ruling
+    T17-a: an unexpected error of the item is logged with its class only and returned as `_Failed`, its
+    transaction rolled back, so the caller goes on with the next item; a fence (`FencedOut`, the worker's or
+    the owner's) and a cancellation propagate."""
+    try:
+        async with engine.begin() as conn:
+            if epoch is not None:
+                await fence_epoch(conn, epoch)
+            decision = await batch_items.process_item(
+                conn, submission=submission, item=item, result=result, now=now
+            )
+    except FencedOut:
+        raise
+    except Exception as exc:  # noqa: BLE001 - Ruling T17-a: one item's error must not stop the lane; logged, counted
+        failed = _Failed(type(exc).__name__)
+        log.error(
+            "batch_item_failed",
+            submission_id=submission.id,
+            item_id=item.id,
+            result_type=result.result_type,
+            error_class=failed.error_class,
         )
+        return failed
     await afault_point(AFTER_ITEM)
     return decision
 
@@ -509,6 +591,8 @@ class _Streamed:
     foreign: int = 0
     complete: bool = False
     unreadable: str | None = None
+    failed: tuple[tuple[str, batch_items.Item, str], ...] = ()  # (custom_id, item, error class), this pass
+    processed: frozenset[int] = frozenset()  # the items decided, or found decided, this pass
 
 
 async def _stream(
@@ -524,6 +608,8 @@ async def _stream(
     async with engine.connect() as conn:
         items = await _items_of(conn, ended.submission.id)
     decided = followups = foreign = 0
+    failed: list[tuple[str, batch_items.Item, str]] = []
+    processed: set[int] = set()
     try:
         stream = await client.results(ended.provider_batch_id)
         async for line in stream:
@@ -532,6 +618,10 @@ async def _stream(
                 foreign += 1
                 continue
             decision = await _process(engine, ended.submission, item, line, now=now, epoch=epoch)
+            if isinstance(decision, _Failed):
+                failed.append((line.custom_id, item, decision.error_class))
+                continue
+            processed.add(item.id)
             if not decision.replayed:
                 decided += 1
                 followups += decision.decision == "followup"
@@ -545,8 +635,8 @@ async def _stream(
             unreadable=failure.unreadable,
         )
         unreadable = failure.error_class if failure.unreadable else None
-        return _Streamed(decided, followups, foreign, complete=False, unreadable=unreadable)
-    return _Streamed(decided, followups, foreign, complete=stream.complete)
+        return _Streamed(decided, followups, foreign, False, unreadable, tuple(failed), frozenset(processed))
+    return _Streamed(decided, followups, foreign, stream.complete, None, tuple(failed), frozenset(processed))
 
 
 @dataclass(frozen=True)
@@ -582,6 +672,8 @@ async def finalize_results(
         decision = await _process(
             engine, ended.submission, item, ItemResult(str(row.custom_id), "missing"), now=now, epoch=epoch
         )
+        if isinstance(decision, _Failed):  # left awaiting: the reconcile waits, the next poll retries it
+            continue
         missing += not decision.replayed
         await afault_point(AFTER_MISSING_ITEM)
     reconciled = await _reconcile(engine, submission_id, now=now, defer=defer, epoch=epoch)
@@ -685,14 +777,19 @@ async def _results(
     if ended is None:
         return _Streamed(), None
     streamed = _Streamed(complete=True)
+    unresolved = 0
     if not ended.results_complete:
         streamed = await _stream(engine, client, ended, now=now, epoch=epoch)
+        unresolved, given_up = await _record_failures(engine, ended, streamed, now=now, epoch=epoch)
+        streamed = replace(streamed, decided=streamed.decided + given_up)
     if streamed.followups:
         async with engine.begin() as conn:
             await fence_epoch(conn, epoch)
             await cycles.request_cycle(conn, trigger="batch_followup", defer=defer)
     if streamed.foreign:
         await _anomaly(engine, submission_id, epoch=epoch, foreign=streamed.foreign)
+        return streamed, None
+    if streamed.complete and unresolved:  # an item's result exists: never decided `missing` (Ruling T17-a)
         return streamed, None
     if not streamed.complete:
         unreadable = streamed.unreadable
@@ -706,6 +803,75 @@ async def _results(
         if not given_up:
             return streamed, None
     return streamed, await finalize_results(engine, submission_id, now=now, defer=defer, epoch=epoch)
+
+
+async def _record_failures(
+    engine: AsyncEngine, ended: _Ended, streamed: _Streamed, *, now: datetime, epoch: int
+) -> tuple[int, int]:
+    """Ruling T17-a: the items whose processing raised this pass, their consecutive failed passes recorded
+    (`reconcile_report.failed_items`; an item decided this pass is dropped from it), and each one at its
+    `RESULTS_UNREADABLE_PASSES`th given up (`_give_up`); how many are still unresolved and how many were
+    given up now."""
+    previous = ended.failed_items
+    counts = {item_id: n for item_id, n in previous.items() if item_id not in streamed.processed}
+    unresolved = given_up = 0
+    for custom_id, item, _ in streamed.failed:
+        passes = previous.get(item.id, 0) + 1
+        counts[item.id] = passes
+        if passes >= RESULTS_UNREADABLE_PASSES and await _give_up(
+            engine, ended, custom_id, item, passes, now=now, epoch=epoch
+        ):
+            del counts[item.id]
+            given_up += 1
+        else:
+            unresolved += 1
+    if counts != previous:
+        report: dict[str, JSONValue] = {}
+        if counts:
+            report[_FAILED_ITEMS] = {str(item_id): n for item_id, n in sorted(counts.items())}
+        async with engine.begin() as conn:
+            await fence_epoch(conn, epoch)
+            await conn.execute(_RECORD_FAILED_ITEMS, {"s": ended.submission.id, "report": report})
+    return unresolved, given_up
+
+
+async def _give_up(
+    engine: AsyncEngine,
+    ended: _Ended,
+    custom_id: str,
+    item: batch_items.Item,
+    passes: int,
+    *,
+    now: datetime,
+    epoch: int,
+) -> bool:
+    """An item whose processing failed `passes` passes in a row, given up (Ruling T17-a): the critical
+    `batch.item_unprocessable` (subject the submission, ids only) in a transaction of its own, then the
+    missing-item path in a fresh one (its spend `ambiguous`, its hold released, its target
+    `pending('batch_missing')`); whether that path decided it (when it raises too, the alert stays and the
+    next pass tries again)."""
+    submission_id = ended.submission.id
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        await raise_alert(
+            conn,
+            code=ITEM_UNPROCESSABLE_ALERT,
+            severity="critical",
+            subject=str(submission_id),
+            message="a batch item's processing kept failing; it is decided missing",
+            context={"submission_id": submission_id, "item_id": item.id, "passes": passes},
+        )
+    decided = await _process(
+        engine, ended.submission, item, ItemResult(custom_id, "missing"), now=now, epoch=epoch
+    )
+    log.error(
+        "batch_item_given_up",
+        submission_id=submission_id,
+        item_id=item.id,
+        passes=passes,
+        decided=not isinstance(decided, _Failed),
+    )
+    return not isinstance(decided, _Failed)
 
 
 async def _unreadable_pass(
@@ -722,7 +888,7 @@ async def _unreadable_pass(
                 _COUNT_UNREADABLE,
                 {
                     "s": ended.submission.id,
-                    "report": {_UNREADABLE_PASSES: passes, "error_class": error_class},
+                    "report": {_UNREADABLE_PASSES: passes, _UNREADABLE_ERROR_CLASS: error_class},
                 },
             )
         log.warning("batch_results_unreadable", submission_id=ended.submission.id, passes=passes)
@@ -731,7 +897,19 @@ async def _unreadable_pass(
     return True
 
 
-async def _anomaly(engine: AsyncEngine, submission_id: int, *, epoch: int, foreign: int) -> None:
+async def _anomaly(
+    engine: AsyncEngine, submission_id: int, *, epoch: int, foreign: int, lacking: int = 0, equal: int = 0
+) -> None:
+    """The critical `batch.custom_id_anomaly` (rule 4): a batch whose `custom_id`s are not exactly ours, with
+    how many of its lines name no item of ours (`foreign`) and how many of our items it lacks (`lacking`);
+    `equal` counts the candidates whose ids equal ours when more than one did (counts only)."""
+    context: dict[str, JSONValue] = {
+        "submission_id": submission_id,
+        "foreign_lines": foreign,
+        "lacking_lines": lacking,
+    }
+    if equal > 1:
+        context["equal_candidates"] = equal
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
         await raise_alert(
@@ -739,10 +917,10 @@ async def _anomaly(engine: AsyncEngine, submission_id: int, *, epoch: int, forei
             code=CUSTOM_ID_ANOMALY_ALERT,
             severity="critical",
             subject=str(submission_id),
-            message="a batch's results name items of no submission of ours; it is not completed",
-            context={"submission_id": submission_id, "foreign_lines": foreign},
+            message="a batch's custom_id set is not exactly ours; nothing is adopted or completed",
+            context=context,
         )
-    log.error("batch_custom_id_anomaly", submission_id=submission_id, foreign_lines=foreign)
+    log.error("batch_custom_id_anomaly", **context)
 
 
 # ---- Task 17: the poll (`batch_poll`) ---------------------------------------------------------------------
@@ -761,17 +939,14 @@ class PollReport:
     reconciled: int = 0
 
 
-async def _observe(
-    engine: AsyncEngine, client: BatchesClient, row: Row[tuple[object, ...]], *, epoch: int
-) -> tuple[bool, bool]:
-    """A `submitted` submission: its recorded cancel sent (`cancel_requested`), then the batch retrieved and,
-    once `ended`, the move `submitted → ended`; whether a cancel was sent and whether it ended."""
+async def _retrieve(
+    engine: AsyncEngine, client: BatchesClient, row: Row[tuple[object, ...]], *, now: datetime, epoch: int
+) -> BatchStatus | None:
+    """The batch of a `submitted` submission retrieved; `None` when the retrieval failed (logged), and past
+    `expires_at + RETRIEVE_FAILING_AFTER` the critical `batch.retrieve_failing` raised (ids only)."""
     submission_id, provider_batch_id = int(row.id), str(row.provider_batch_id)
-    cancelled = False
-    if row.cancel_requested_at is not None:
-        cancelled = await cancel_requested(client, provider_batch_id, submission_id=submission_id)
     try:
-        status = await client.retrieve(provider_batch_id)
+        return await client.retrieve(provider_batch_id)
     except BatchApiError as failure:
         log.warning(
             "batch_retrieve_failed",
@@ -779,7 +954,40 @@ async def _observe(
             error_class=failure.error_class,
             status=failure.status,
         )
-        return cancelled, False
+    expires_at = row.expires_at
+    if isinstance(expires_at, datetime) and now > expires_at + RETRIEVE_FAILING_AFTER:
+        async with engine.begin() as conn:
+            await fence_epoch(conn, epoch)
+            await raise_alert(
+                conn,
+                code=RETRIEVE_FAILING_ALERT,
+                severity="critical",
+                subject=str(submission_id),
+                message="a submitted batch past its expiry still cannot be retrieved",
+                context={"submission_id": submission_id, "provider_batch_id": provider_batch_id},
+            )
+        log.error("batch_retrieve_failing", submission_id=submission_id, provider_batch_id=provider_batch_id)
+    return None
+
+
+async def _observe(
+    engine: AsyncEngine, client: BatchesClient, row: Row[tuple[object, ...]], *, now: datetime, epoch: int
+) -> tuple[bool, bool]:
+    """A `submitted` submission: the batch retrieved (`_retrieve`), its recorded cancel sent while it is
+    `in_progress` (`cancel_requested`; once one is accepted, the batch retrieved again), and, once `ended`,
+    the move `submitted → ended` (resolving a `batch.retrieve_failing` of it); whether a cancel was sent and
+    whether it ended."""
+    submission_id, provider_batch_id = int(row.id), str(row.provider_batch_id)
+    status = await _retrieve(engine, client, row, now=now, epoch=epoch)
+    if status is None:
+        return False, False
+    cancelled = False
+    if row.cancel_requested_at is not None:
+        cancelled = await cancel_requested(
+            client, provider_batch_id, submission_id=submission_id, status=status
+        )
+        if cancelled:  # ended at its cancel, perhaps
+            status = await _retrieve(engine, client, row, now=now, epoch=epoch) or status
     if status.processing_status != "ended":
         return cancelled, False
     async with engine.begin() as conn:
@@ -788,6 +996,7 @@ async def _observe(
         if (await conn.execute(_LOCK_SUBMITTED, {"s": submission_id})).first() is None:
             return cancelled, False  # moved meanwhile
         await transition(conn, _SUBMISSIONS, submission_id, ["submitted"], "ended")
+        await resolve_alert(conn, code=RETRIEVE_FAILING_ALERT, subject=str(submission_id))
     log.info("batch_ended", submission_id=submission_id, provider_batch_id=provider_batch_id)
     return cancelled, True
 
@@ -796,14 +1005,15 @@ async def poll(
     engine: AsyncEngine, client: BatchesClient, *, now: datetime, epoch: int, defer: Deferrer
 ) -> PollReport:
     """The body of `batch_poll` (module docstring): every `submitted` submission observed (its recorded
-    cancel first), and every `ended` one's results processed and completed; one submission's failure leaves
-    the others to this pass and itself to the next."""
+    cancel first), and every `ended` one's results processed and completed. An item whose processing raises
+    is skipped for the pass and counted (Ruling T17-a); any other error ends the pass there, and the next
+    poll resumes from the rows (every step is idempotent)."""
     async with engine.connect() as conn:
         rows = (await conn.execute(_POLLED)).all()
     report = PollReport(polled=len(rows))
     for row in rows:
         if row.state == "submitted":
-            cancelled, ended = await _observe(engine, client, row, epoch=epoch)
+            cancelled, ended = await _observe(engine, client, row, now=now, epoch=epoch)
             report = replace(report, cancels=report.cancels + cancelled, ended=report.ended + ended)
             if not ended:
                 continue
@@ -826,7 +1036,7 @@ async def poll(
 class ReconcileReport:
     """What one reconciliation did: the submissions it looked at, the batches the listing held (`None`: the
     listing failed), the submissions it adopted and reconciled, the anomalies and the unresolved alerts it
-    opened."""
+    opened, and the submissions whose reconciliation raised (each logged and left to the next pass)."""
 
     submissions: int = 0
     listed: int | None = None
@@ -834,6 +1044,7 @@ class ReconcileReport:
     reconciled: int = 0
     anomalies: int = 0
     unresolved: int = 0
+    failed: int = 0  # submissions whose reconciliation raised this pass (Ruling T17-a)
 
 
 async def _unresolved(
@@ -951,17 +1162,17 @@ async def reconcile_ambiguous(
     async with engine.connect() as conn:
         adopted_ids = {str(i) for i in (await conn.execute(_ADOPTED_IDS)).scalars()}
     report = ReconcileReport(submissions=len(rows), listed=len(listing), unresolved=unresolved)
+    unadopted = [b for b in listing if b.id not in adopted_ids]
     for row in rows:
-        report = await _reconcile_one(
-            engine,
-            client,
-            row,
-            listing=[b for b in listing if b.id not in adopted_ids],
-            report=report,
-            now=now,
-            epoch=epoch,
-            defer=defer,
-        )
+        try:
+            report = await _reconcile_one(
+                engine, client, row, listing=unadopted, report=report, now=now, epoch=epoch, defer=defer
+            )
+        except FencedOut:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Ruling T17-a: one submission's error leaves the others to the pass
+            log.error("batch_reconcile_failed", submission_id=int(row.id), error_class=type(exc).__name__)
+            report = replace(report, failed=report.failed + 1)
     log.info("batch_ambiguous_reconciled", **asdict(report))
     return report
 
@@ -990,16 +1201,32 @@ async def _reconcile_one(
     ]
     async with engine.connect() as conn:
         ours = frozenset((await _items_of(conn, submission_id)).keys())
+    # every ended candidate downloaded first (ids only), so the decision is the listing order's in no way
+    equal: list[BatchSummary] = []
+    partial: list[frozenset[str]] = []
     for candidate in window:
         if candidate.processing_status != "ended":
             continue  # confirmed only once it has ended
         ids = await _custom_ids(client, candidate.id)
         if ids is None or ids.isdisjoint(ours):
             continue
-        if ids != ours:  # rule 4: a partial intersection, never adopted
-            await _anomaly(engine, submission_id, epoch=epoch, foreign=len(ids - ours))
-            return replace(report, anomalies=report.anomalies + 1)
-        if not await _adopt(engine, submission_id, candidate, now=now, epoch=epoch):
+        if ids == ours:
+            equal.append(candidate)
+        else:
+            partial.append(ids)
+    if partial or len(equal) > 1:  # rule 4 (or no one match): never adopted
+        first = partial[0] if partial else ours
+        await _anomaly(
+            engine,
+            submission_id,
+            epoch=epoch,
+            foreign=len(first - ours),
+            lacking=len(ours - first),
+            equal=len(equal),
+        )
+        return replace(report, anomalies=report.anomalies + 1)
+    if equal:  # rule 3: the one candidate whose ids equal ours
+        if not await _adopt(engine, submission_id, equal[0], now=now, epoch=epoch):
             return report
         _, finalized = await _results(engine, client, submission_id, now=now, epoch=epoch, defer=defer)
         reconciled = finalized is not None and finalized.reconciled
