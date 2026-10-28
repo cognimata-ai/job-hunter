@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 import procrastinate
 import pytest
 from jobhunter.llm.fake import BatchScript
-from jobhunter.scoring import batch_operations as batch_ops
+from jobhunter.scoring import batch_results
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.batches import (
@@ -89,7 +89,7 @@ async def test_c23_a_crash_between_two_items_is_finished_by_the_next_poll(
     """C23: the worker dies after the 120th item's commit; the next poll reads the stream again, replays the
     120 stored decisions and decides the rest, no item twice."""
     fake_llm.batches(BatchScript(polls_until_ended=0))
-    monkeypatch.setattr(batch_ops, "afault_point", raising_at_arrival(batch_ops.AFTER_ITEM, 120))
+    monkeypatch.setattr(batch_results, "afault_point", raising_at_arrival(batch_results.AFTER_ITEM, 120))
     with pytest.raises(SimulatedCrash):
         await poll_once(engine, fake_llm)
     assert await count_rows(engine, "batch_items", result_type="succeeded") == 120
@@ -103,8 +103,8 @@ async def test_c23_a_crash_between_two_items_is_finished_by_the_next_poll(
 @pytest.mark.parametrize(
     ("point", "arrival", "decided_missing"),
     [
-        (batch_ops.AFTER_COMPLETION_COMMIT, 1, 0),
-        (batch_ops.AFTER_MISSING_ITEM, 2, 2),
+        (batch_results.AFTER_COMPLETION_COMMIT, 1, 0),
+        (batch_results.AFTER_MISSING_ITEM, 2, 2),
     ],
 )
 async def test_finalize_results_crash_points(
@@ -121,7 +121,7 @@ async def test_finalize_results_crash_points(
     and finishes the missing items and the reconcile, deciding none twice."""
     missing = [submitted.custom_ids[i] for i in (3, 4, 5)]
     fake_llm.batches(BatchScript(items=dict.fromkeys(missing, "missing"), polls_until_ended=0))
-    monkeypatch.setattr(batch_ops, "afault_point", raising_at_arrival(point, arrival))
+    monkeypatch.setattr(batch_results, "afault_point", raising_at_arrival(point, arrival))
     with pytest.raises(SimulatedCrash):
         await poll_once(engine, fake_llm)
     (row,) = await submission_rows(engine)
@@ -145,7 +145,9 @@ async def test_a_crash_before_the_completion_commit_leaves_its_marker_unset(
     reads the stream again and completes."""
     missing = [submitted.custom_ids[i] for i in (3, 4, 5)]
     fake_llm.batches(BatchScript(items=dict.fromkeys(missing, "missing"), polls_until_ended=0))
-    monkeypatch.setattr(batch_ops, "afault_point", raising_at_arrival(batch_ops.BEFORE_COMPLETION_COMMIT, 1))
+    monkeypatch.setattr(
+        batch_results, "afault_point", raising_at_arrival(batch_results.BEFORE_COMPLETION_COMMIT, 1)
+    )
     with pytest.raises(SimulatedCrash):
         await poll_once(engine, fake_llm)
     (row,) = await submission_rows(engine)

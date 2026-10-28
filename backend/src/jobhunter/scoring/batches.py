@@ -3,9 +3,10 @@
 #22-#25, r2 B7-B15, r3 B1-B3, r4 B1, B8, B9, r5 B1, A1 issue 17, A2 B10, B13, B14, Deviations 12, 13, 27 and
 38): Task 14 records the cancellation a tuple supersession asks for; Task 16 adds the submission lifecycle up
 to the provider's answer; Task 17 the user's release of a quarantined submission and the quarantined spend.
-This module is the submission state machine; its worker side (the `batch_submit` handler, the takeover sweep,
-the tick reconciler, the poll, the completion and the ambiguous-submit reconciliation) is
-`scoring.batch_operations`, and the decision of one item `scoring.batch_items` (Ruling T16-e).
+This module is the submission state machine; its worker side is `scoring.batch_operations` (the
+`batch_submit` handler, the takeover sweep and the tick reconciler), `scoring.batch_results` (the provider
+cancel, the poll and the completion) and `scoring.batch_adoption` (the ambiguous-submit reconciliation;
+Ruling T17-b), and the decision of one item `scoring.batch_items` (Ruling T16-e).
 
 **The cancellation** (Task 14). `request_cancel(conn, *, llm_tuple_id, now) -> RequestedCancel`, in the
 caller's transaction (the tuple activation's, which holds `active_config FOR UPDATE` and has already taken the
@@ -14,7 +15,7 @@ month and bulk rows, so no batch-lane transaction runs meanwhile):
    `submit_started`, `submit_ambiguous`, `submitted`, `ended`; Codex r1 #24), whatever its phase; a request
    recorded earlier keeps its time. This record is the request: the worker calls `messages.batches.cancel`
    after the commit, as soon as a provider id is known (`record_created` below for one created during the
-   request, `batch_poll` for a `submitted` one still in progress: `batch_operations.cancel_requested`). A
+   request, `batch_poll` for a `submitted` one still in progress: `batch_results.cancel_requested`). A
    submission's state does not change here;
 2. in the same transaction, their `in_batch` targets → `cancelled('tuple_superseded')` with
    `batch_submission_id` cleared, their running attempts ended `cancelled`, each target's follow-up hold
@@ -93,7 +94,7 @@ gateway's injected `sleep`; the owner predicate makes each try the same recordin
 out stays `submit_started`, the recovery's:
 - `record_created`: `submit_started → submitted` with `provider_batch_id` and `expires_at = created_at + 24
   h` (L3954); whether a cancel was requested meanwhile (the worker then calls `messages.batches.cancel` after
-  the commit, `batch_operations.cancel_requested`; `batch_poll` sends it again while the batch runs);
+  the commit, `batch_results.cancel_requested`; `batch_poll` sends it again while the batch runs);
 - `record_rejected`: `submit_started → submit_rejected`; every item's entry settled `not_billed` on the
   rejection's evidence (`batch_submit_rejected`, the call `error` with that code and the rejection's status;
   `connect_failed_before_send` for a create never sent, the call `connect_failed` without a status, Ruling
@@ -122,7 +123,7 @@ that prepared it in the current worker epoch or later (`NOT EXISTS ... o.status 
 s.operation_claim_id AND o.worker_epoch >= :epoch`), locked `FOR UPDATE`: a `preparing` one is abandoned, a
 `submit_started` one becomes `submit_ambiguous` with `{"error_class": "execution_lost"}` and is **never
 resent**, whether the execution died before or after the HTTP send (the ambiguous reconciliation,
-`batch_operations.reconcile_ambiguous`, finds the batch if it was created, or the user releases it). The
+`batch_adoption.reconcile_ambiguous`, finds the batch if it was created, or the user releases it). The
 caller holds `fence_epoch` and `active_config FOR SHARE` first. It runs in the takeover sweep
 `batch_submissions`, in the `batch_submit` handler's first transaction (its own operation's rows), and in the
 tick reconciler `batch_submissions`, all three `scoring.batch_operations`'; `any_lost` is the reconciler's

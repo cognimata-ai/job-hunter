@@ -8,10 +8,10 @@ caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back
 
 The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12), `reconcile_heavy` and
 `retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19, unless the
-worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running,
-ledger L312), M3 Task 17's periodic `batch_poll` (every 5 min) and `batch_reconcile_ambiguous` (every 15 min)
-on `aux`, each with the queueing lock of its name (`scoring.batch_operations`: Task 27 registers and pins
-them), and M3 Task 11's `score_cycle(trigger)` on the `score` queue
+worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running, ledger
+L312), M3 Task 17's periodic `batch_poll` (every 5 min) and `batch_reconcile_ambiguous` (every 15 min) on
+`aux`, each with the queueing lock of its name (`scoring.batch_results`, `scoring.batch_adoption`: Task 27
+registers and pins them), and M3 Task 11's `score_cycle(trigger)` on the `score` queue
 (`graphs.score.graph.execute_cycle`: one cycle, created by its first transaction, never resumed). The tick
 runs the score lane's trigger (`tick.tick_score`, §3.4 step 6) after its scheduling step, in a transaction of
 its own. Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
@@ -210,9 +210,9 @@ async def score_cycle(context: JobContext, trigger: str) -> None:
 @blueprint.periodic(cron="*/5 * * * *")
 @blueprint.task(name="batch_poll", queue="aux", queueing_lock="batch_poll", pass_context=True)
 async def batch_poll(context: JobContext, timestamp: int) -> None:
-    """The submitted and ended batch submissions polled, their results processed (`batch_operations.poll`)."""
+    """The submitted and ended batch submissions polled, their results processed (`batch_results.poll`)."""
     # Imported here: the batch modules import this module (`Deferrer`, `defer_in_tx`).
-    from jobhunter.scoring.batch_operations import poll_task
+    from jobhunter.scoring.batch_results import poll_task
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     try:
@@ -232,8 +232,8 @@ async def batch_poll(context: JobContext, timestamp: int) -> None:
 )
 async def batch_reconcile_ambiguous(context: JobContext, timestamp: int) -> None:
     """The ambiguous and the released submissions matched against the listing
-    (`batch_operations.reconcile_ambiguous`)."""
-    from jobhunter.scoring.batch_operations import reconcile_ambiguous_task
+    (`batch_adoption.reconcile_ambiguous`)."""
+    from jobhunter.scoring.batch_adoption import reconcile_ambiguous_task
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     try:

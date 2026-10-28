@@ -390,6 +390,7 @@ PAUSABLE_MODULES: Final = (
     "jobhunter.profile.activation",
     "jobhunter.scoring.batches",  # the state machine's fault points (M3 Task 16)
     "jobhunter.scoring.batch_operations",  # the batch_submit handler's (M3 Task 16, Ruling T16-e)
+    "jobhunter.scoring.batch_results",  # the results' and the completion's (M3 Task 17, Ruling T17-b)
 )
 _PARSE_TIMEOUT_S: Final = 60.0
 _PARSE_POLL_S: Final = 0.05

@@ -34,7 +34,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.llm.batches import BatchesClient, BatchRequest, BatchStatus, Created
 from jobhunter.llm.fake import BatchScript
-from jobhunter.scoring import batch_items, cycles, validator
+from jobhunter.scoring import batch_adoption, batch_items, batch_results, cycles, validator
 from jobhunter.scoring import batch_operations as batch_ops
 from jobhunter.scoring import batches as batches_mod
 from jobhunter.types import JSONValue
@@ -236,14 +236,14 @@ async def test_one_submissions_error_leaves_the_others_to_the_adoption_pass(
     await release(engine, a.id)
     await op_runner.run_pending()  # A's follow-on prepares B from the released targets
     (b,) = [r for r in await submission_rows(engine) if r.id != a.id]
-    real = batch_ops._items_of
+    real = batch_results.items_of
 
     async def failing(conn: Any, submission_id: int) -> Any:
         if submission_id == a.id:
             raise RuntimeError("test: the items cannot be read")
         return await real(conn, submission_id)
 
-    monkeypatch.setattr(batch_ops, "_items_of", failing)
+    monkeypatch.setattr(batch_adoption, "items_of", failing)
     fake_llm.batches(BatchScript(polls_until_ended=0))
     report = await reconcile_ambiguous_once(engine, fake_llm)
     assert (report.submissions, report.failed, report.adopted, report.reconciled) == (2, 1, 1, 1)
@@ -410,7 +410,7 @@ async def test_a_released_submission_is_listed_for_29_days_only(
     within = await reconcile_ambiguous_once(engine, fake_llm, now=started + timedelta(days=28, hours=23))
     assert (within.submissions, within.listed) == (1, None)
     after = await reconcile_ambiguous_once(engine, fake_llm, now=started + timedelta(days=29, minutes=1))
-    assert after == batch_ops.ReconcileReport()  # nothing to reconcile, nothing listed
+    assert after == batch_adoption.ReconcileReport()  # nothing to reconcile, nothing listed
     assert (await submission_rows(engine))[0].state == "released"
 
 
@@ -487,7 +487,7 @@ async def test_a_failing_cancel_is_tried_cancel_tries_times_per_pass_then_given_
     await op_runner.run_one(setup.operation_id)
     async with engine.begin() as conn:
         await batches_mod.request_cancel(conn, llm_tuple_id=setup.llm_tuple_id, now=utcnow())
-    given_up = ["retrieve", *["cancel"] * batch_ops.CANCEL_TRIES]
+    given_up = ["retrieve", *["cancel"] * batch_results.CANCEL_TRIES]
     for _ in range(2):
         calls.clear()
         report = await poll_once(engine, fake_llm)

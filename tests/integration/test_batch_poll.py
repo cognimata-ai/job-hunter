@@ -22,8 +22,7 @@ from jobhunter.clock import utcnow
 from jobhunter.db import ranking
 from jobhunter.llm.batches import BatchApiError, BatchesClient, BatchStatus, ItemResult
 from jobhunter.llm.fake import BatchScript
-from jobhunter.scoring import batch_items
-from jobhunter.scoring import batch_operations as batch_ops
+from jobhunter.scoring import batch_items, batch_results
 from jobhunter.scoring import batches as batches_mod
 from jobhunter.scoring.attempt_inputs import load_attempt_inputs
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -93,7 +92,7 @@ async def test_a_submitted_batch_is_polled_until_it_ends_and_reconciled_in_the_s
     assert Counter(await decisions(engine)) == {"published": N}
     assert await count_rows(engine, "llm_results") == N
     assert fake_llm.state.batches[submitted.provider_id].results_read == 1  # streamed once, never buffered
-    assert await poll_once(engine, fake_llm) == batch_ops.PollReport()  # nothing left to poll
+    assert await poll_once(engine, fake_llm) == batch_results.PollReport()  # nothing left to poll
 
 
 async def test_missing_items_are_decided_after_completion_each_in_its_own_transaction(
@@ -171,7 +170,7 @@ async def test_each_entry_path_enqueues_the_follow_on_once(
     fake_llm.batches(BatchScript(items=dict.fromkeys(expired, "expired"), polls_until_ended=0))
     run = poll_once if path == "poll" else reconcile_ambiguous_once
     # a kill, not an `Exception`: the adoption isolates one submission's failure (Ruling T17-a)
-    monkeypatch.setattr(batch_ops, "afault_point", killing_at(batch_ops.AFTER_RECONCILE_COMMIT))
+    monkeypatch.setattr(batch_results, "afault_point", killing_at(batch_results.AFTER_RECONCILE_COMMIT))
     with pytest.raises(SimulatedKill):
         await run(engine, fake_llm)
     (row,) = await submission_rows(engine)
@@ -183,8 +182,8 @@ async def test_each_entry_path_enqueues_the_follow_on_once(
     await run(engine, fake_llm)  # the second run of the same path
     async with engine.begin() as conn:  # and the completion orchestration itself again
         assert not await batches_mod.follow_on(conn, submission_id=s, defer=None)
-    finalized = await batch_ops.finalize_results(engine, s, now=row.reconciled_at, defer=None)
-    assert finalized == batch_ops.Finalized(missing=0, reconciled=True)
+    finalized = await batch_results.finalize_results(engine, s, now=row.reconciled_at, defer=None)
+    assert finalized == batch_results.Finalized(missing=0, reconciled=True)
     assert len(_follow_ons(await operations_of(engine, "batch_submit"), s)) == 1
 
 
@@ -227,7 +226,7 @@ async def test_an_unreadable_result_stream_is_given_up_after_its_bound(
     of the stream. Each such pass is counted on the submission (a cut stream is not: C23) and leaves it
     `ended` with no item `missing`; at `RESULTS_UNREADABLE_PASSES` the completion runs with the critical
     `batch.results_unreadable` and every item still unread is decided `missing`."""
-    monkeypatch.setattr(batch_ops, "RESULTS_UNREADABLE_PASSES", 3)
+    monkeypatch.setattr(batch_results, "RESULTS_UNREADABLE_PASSES", 3)
     fake_llm.batches(BatchScript(polls_until_ended=0))
     async with fake_llm.client() as http:  # the batch observed as ended: its lines are fixed
         await batch_client(fake_llm, http).retrieve(submitted.provider_id)
@@ -290,7 +289,7 @@ async def test_a_retrieval_failing_past_the_expiry_raises_the_critical_alert(
         await poll_once(engine, fake_llm, now=due + timedelta(minutes=minutes))
     assert await submission_state(engine, submitted.submission_id) == "submitted"
     async with engine.connect() as conn:
-        alert = (await conn.execute(_OPEN_ALERT, {"c": batch_ops.RETRIEVE_FAILING_ALERT})).one()
+        alert = (await conn.execute(_OPEN_ALERT, {"c": batch_results.RETRIEVE_FAILING_ALERT})).one()
     assert (alert.severity, alert.dedup_key, alert.occurrences) == (
         "critical",
         f"batch.retrieve_failing:{submitted.submission_id}",
@@ -304,7 +303,7 @@ async def test_a_retrieval_failing_past_the_expiry_raises_the_critical_alert(
     fake_llm.batches(BatchScript(polls_until_ended=0))
     report = await poll_once(engine, fake_llm, now=due + timedelta(minutes=15))
     assert report.reconciled == 1
-    assert batch_ops.RETRIEVE_FAILING_ALERT not in await open_alert_codes(engine)
+    assert batch_results.RETRIEVE_FAILING_ALERT not in await open_alert_codes(engine)
 
 
 async def test_the_batch_poll_task_body_polls_with_the_workers_client(
@@ -312,7 +311,9 @@ async def test_the_batch_poll_task_body_polls_with_the_workers_client(
 ) -> None:
     """`batch_poll`'s body (`poll_task`): the worker's client from its config and gateway, `poll` at now."""
     fake_llm.batches(BatchScript(polls_until_ended=0))
-    report = await batch_ops.poll_task(engine, fake_llm.cfg, fake_llm.gateway(engine), epoch=current_epoch)
+    report = await batch_results.poll_task(
+        engine, fake_llm.cfg, fake_llm.gateway(engine), epoch=current_epoch
+    )
     assert (report.polled, report.reconciled) == (1, 1)
     assert await submission_state(engine, submitted.submission_id) == "reconciled"
 
@@ -332,7 +333,7 @@ async def test_a_stream_never_read_whole_is_given_up_after_the_results_retention
     late = await poll_once(engine, fake_llm, now=row.submit_started_at + timedelta(days=29, minutes=1))
     assert late.reconciled == 1
     (row,) = await submission_rows(engine)
-    assert row.reconcile_report == {"results_unreadable": batch_ops.RETENTION_PASSED}
+    assert row.reconcile_report == {"results_unreadable": batch_results.RETENTION_PASSED}
     assert await open_alert_codes(engine) == ["batch.items_missing", "batch.results_unreadable"]
     unread = await count_rows(engine, "batch_items", result_type="missing")
     assert 0 < unread < N and await count_rows(engine, "batch_items", result_type="awaiting") == 0
@@ -377,7 +378,7 @@ async def test_an_item_failing_unexpectedly_is_skipped_and_given_up_after_its_bo
     poisoned_id = str((await item_ids(engine))[poisoned])
     assert (row.state, row.results_complete_at) == ("ended", None)
     assert row.reconcile_report == {"failed_items": {poisoned_id: 1}}
-    for passes in range(2, batch_ops.RESULTS_UNREADABLE_PASSES):  # consecutive failed passes, counted
+    for passes in range(2, batch_results.RESULTS_UNREADABLE_PASSES):  # consecutive failed passes, counted
         assert (await poll_once(engine, fake_llm)).decided == 0
         (row,) = await submission_rows(engine)
         assert (row.state, row.reconcile_report["failed_items"]) == ("ended", {poisoned_id: passes})

@@ -52,7 +52,7 @@ from jobhunter.llm import bulk, fake
 from jobhunter.llm.batches import BatchesClient
 from jobhunter.llm.fake import ITEM_ERRORS, BatchScript, ItemOutcome, StoredBatch
 from jobhunter.llm.gateway import LLMGateway
-from jobhunter.scoring import batch_operations, batches
+from jobhunter.scoring import batch_adoption, batch_results, batches
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.settings.model import Settings
 from jobhunter.worker.operations import OperationClaim, claim_operation, create_operation
@@ -368,20 +368,20 @@ def batch_client(fake_llm: Any, http_client: httpx2.AsyncClient) -> BatchesClien
 
 async def poll_once(
     engine: AsyncEngine, fake_llm: Any, *, epoch: int = 1, now: datetime | None = None
-) -> batch_operations.PollReport:
+) -> batch_results.PollReport:
     """One `batch_poll` pass on the fake at `now`."""
     async with fake_llm.client() as http:
-        return await batch_operations.poll(
+        return await batch_results.poll(
             engine, batch_client(fake_llm, http), now=now or utcnow(), epoch=epoch, defer=defer_in_tx
         )
 
 
 async def reconcile_ambiguous_once(
     engine: AsyncEngine, fake_llm: Any, *, epoch: int = 1, now: datetime | None = None
-) -> batch_operations.ReconcileReport:
+) -> batch_adoption.ReconcileReport:
     """One `batch_reconcile_ambiguous` pass on the fake at `now`."""
     async with fake_llm.client() as http:
-        return await batch_operations.reconcile_ambiguous(
+        return await batch_adoption.reconcile_ambiguous(
             engine, batch_client(fake_llm, http), now=now or utcnow(), epoch=epoch, defer=defer_in_tx
         )
 
