@@ -284,13 +284,16 @@ async def jsearch_job(engine: AsyncEngine, owner: Any, native_id: str, at: datet
 
 
 async def three_merged(
-    engine: AsyncEngine, owner: Any, at: datetime, **actions: dict[str, Any]
+    engine: AsyncEngine, owner: Any, at: datetime, *, a_row: bool = True, **actions: dict[str, Any]
 ) -> tuple[int, int, int, dict[int, int]]:
-    """A, B and C, each with a note of its own (and `actions[name]` beside it), then one sighting of all three
-    keys: identity merges B and C into A in one transaction. The merge event of each by its from-job."""
+    """A, B and C, each with a note of its own (and `actions[name]` beside it; A with no row at all unless
+    `a_row`), then one sighting of all three keys: identity merges B and C into A in one transaction, B first.
+    The merge event of each by its from-job."""
     a, b, c = [await jsearch_job(engine, owner, f"H{n}", at + timedelta(hours=n)) for n in range(3)]
     async with engine.begin() as conn:
         for name, job in (("a", a), ("b", b), ("c", c)):
+            if name == "a" and not a_row:
+                continue
             await put_user_actions(conn, job, note=f"{name.upper()}-Notiz", **actions.get(name, {}))
     keys = tuple(AdKey("htidocid", f"H{n}") for n in range(3))
     linking = await pending_item(
@@ -367,6 +370,55 @@ async def test_an_unmerged_timestamp_falls_back_to_the_merges_still_in_force(
     kept = await user_actions(engine, a)
     assert (kept.hidden_at, kept.applied_at) == (t0 + timedelta(hours=1), t0 + timedelta(hours=1))
     assert kept.note == f"A-Notiz\n{separator(c)}\nC-Notiz"
+
+
+def hidden_applied_note(row: Any) -> tuple[Any, Any, Any]:
+    return (row.hidden_at, row.applied_at, row.note)
+
+
+@pytest.mark.parametrize("order", ["merge_order", "reverse_order"])
+@pytest.mark.parametrize("a_row", [True, False], ids=["a_with_a_note", "a_without_a_row"])
+async def test_unmerging_both_merges_in_either_order_peels_both_out(
+    engine: AsyncEngine, current_epoch: int, at: datetime, order: str, a_row: bool
+) -> None:
+    """Ruling T22-d': B hidden and applied at T0, C at T0 + 1 h, A at neither; B and C merged into A, B first,
+    then both unmerged. C's snapshot of A already holds B's T0, which the reset peels off B's merge, so A ends
+    at neither, whichever order; A's row is deleted when A had none before the merges."""
+    owner = await queued_run(engine)
+    t0 = at - timedelta(days=2)
+    b_actions = {"hidden_at": t0, "applied_at": t0}
+    c_actions = {"hidden_at": t0 + timedelta(hours=1), "applied_at": t0 + timedelta(hours=1)}
+    a, b, c, events = await three_merged(engine, owner, at, a_row=a_row, b=b_actions, c=c_actions)
+    first, second = (b, c) if order == "merge_order" else (c, b)
+    await unmerged(engine, events[first])
+    await unmerged(engine, events[second])
+    end = await user_actions(engine, a)
+    if a_row:
+        assert hidden_applied_note(end) == (None, None, "A-Notiz")
+    else:
+        assert end is None  # A had no row before either merge, and nothing of either is left
+    assert hidden_applied_note(await user_actions(engine, b)) == (t0, t0, "B-Notiz")
+    c_end = t0 + timedelta(hours=1)
+    assert hidden_applied_note(await user_actions(engine, c)) == (c_end, c_end, "C-Notiz")
+
+
+@pytest.mark.parametrize("order", ["merge_order", "reverse_order"])
+async def test_the_into_jobs_own_earlier_value_survives_both_unmerges(
+    engine: AsyncEngine, current_epoch: int, at: datetime, order: str
+) -> None:
+    """Ruling T22-d': A hidden at T0 - 1 h of its own, B and C as above: A's own value is kept through both
+    unmerges, and the applied time that came from B and C is gone."""
+    owner = await queued_run(engine)
+    t0 = at - timedelta(days=2)
+    a_actions = {"hidden_at": t0 - timedelta(hours=1)}
+    b_actions = {"hidden_at": t0, "applied_at": t0}
+    c_actions = {"hidden_at": t0 + timedelta(hours=1), "applied_at": t0 + timedelta(hours=1)}
+    a, b, c, events = await three_merged(engine, owner, at, a=a_actions, b=b_actions, c=c_actions)
+    assert hidden_applied_note(await user_actions(engine, a))[:2] == (t0 - timedelta(hours=1), t0)
+    first, second = (b, c) if order == "merge_order" else (c, b)
+    await unmerged(engine, events[first])
+    await unmerged(engine, events[second])
+    assert hidden_applied_note(await user_actions(engine, a)) == (t0 - timedelta(hours=1), None, "A-Notiz")
 
 
 async def test_the_cut_keeps_the_into_notes_text_whole_at_the_boundary(engine: AsyncEngine) -> None:

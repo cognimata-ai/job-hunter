@@ -1,7 +1,7 @@
 """The user's actions across a merge and an unmerge (spec §8.6.1 step 3, §8.6.2 step 4, §7.13; plan M3 Task
-22, R1, Rulings T22-c, T22-d): `user_job_actions` coalesced into the into-job and restored from the merge
-snapshot, in the caller's transaction (`dedup.merge`, which holds both job rows `FOR UPDATE`; the rows here
-are other domain rows, locked `FOR UPDATE` in job id order, `locked_rows`).
+22, R1, Rulings T22-c, T22-d, T22-d'): `user_job_actions` coalesced into the into-job and restored from the
+merge snapshot, in the caller's transaction (`dedup.merge`, which holds both job rows `FOR UPDATE`; the rows
+here are other domain rows, locked `FOR UPDATE` in job id order, `locked_rows`).
 
 **`coalesce_user_actions(conn, *, from_job, into_job)`** (§8.6.1 step 3): each of `seen_at`, `saved_at`,
 `applied_at` and `hidden_at` of the into-job becomes the earliest non-null value of the two rows; the notes
@@ -15,21 +15,26 @@ note stays in the snapshot either way. The from-job's row is deleted and the int
 
 **`restore_user_actions(conn, *, event)`** (§8.6.2 step 4): the from-job's snapshot row restored; on the
 into-job a timestamp that equals the from-job's snapshot value (not null) and differs from the into-job's came
-only from this merge and is reset to the earliest non-null of the into-job's snapshot value and the from-jobs'
-snapshot values of the other merges into the same job still in force (`kind <> 'unmerge'`, not reversed;
-Ruling T22-d), a value changed since being kept; the note loses exactly the segment this merge appended
-(`appended_segment`, recomputed from the event's snapshot: the separator line and the from-job's note, or its
-cut form) when that segment is still in it whole (`without_segment`), and is kept as it is when the user
-edited it (Ruling T22-c), so several merges into one job unmerge in any order; an into-job row left with
-nothing of its own (none in the snapshot, every value null) is deleted; an event whose snapshot holds no
-actions (recorded before M3) restores none (`unmerge_without_user_actions_snapshot`, its id alone).
+only from this merge and is reset (Rulings T22-d, T22-d'). The reset value is the earliest non-null of the
+into-job's own value and the from-jobs' snapshot values of the other merges into the same job still in force
+(`kind <> 'unmerge'`, not reversed); the own value is the event's into-snapshot value with every earlier merge
+peeled off (`_peeled`): walking the earlier merges into the job newest first, whatever their state, one whose
+from-job's value is the value and whose into snapshot held another gave it, and the value becomes that other
+one, so a merge reversed before this one leaves nothing behind through this event's snapshot. A value changed
+since is kept. The note loses exactly the segment this merge appended (`appended_segment`, recomputed from the
+event's snapshot: the separator line and the from-job's note, or its cut form) when that segment is still in
+it whole (`without_segment`), and is kept as it is when the user edited it (Ruling T22-c), so several merges
+into one job unmerge in any order. The into-job's row is deleted when the job had none before any merge (the
+earliest merge into it found none), no merge still in force brought a value or a note, and nothing is left on
+it; an event whose snapshot holds no actions (recorded before M3) restores none
+(`unmerge_without_user_actions_snapshot`, its id alone).
 
 `UserActions` is one row (its note out of the repr) and the form the snapshot holds it in (`to_json`, the
 timestamps as ISO 8601, `to_iso`); `MergeEvent` is a merge event as `unmerge` reverses it. Notes are the
 user's own text: they reach the snapshot and the row, never a log line.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Final
@@ -58,10 +63,10 @@ _PUT_ACTIONS: Final = q(
     "hidden_at = EXCLUDED.hidden_at, note = EXCLUDED.note, updated_at = now()"
 )
 # The other merges into the job that are still in force: their from-jobs' snapshot rows (Ruling T22-d).
-_IN_FORCE_INTO: Final = q(
-    "SELECT from_job_id, evidence -> 'snapshot' -> 'user_job_actions' AS actions FROM merge_events "
-    "WHERE into_job_id = :into AND kind <> 'unmerge' AND reversed_by_event_id IS NULL AND id <> :event "
-    "ORDER BY id"
+_OTHER_MERGES_INTO: Final = q(
+    "SELECT id, from_job_id, reversed_by_event_id IS NULL AS in_force, "
+    "evidence -> 'snapshot' -> 'user_job_actions' AS actions FROM merge_events "
+    "WHERE into_job_id = :into AND kind <> 'unmerge' AND id <> :event ORDER BY id"
 )
 
 log = get_logger("jobhunter.dedup.user_actions")
@@ -220,23 +225,59 @@ async def coalesce_user_actions(conn: AsyncConnection, *, from_job: int, into_jo
     await conn.execute(_PUT_ACTIONS, _put_params(into_job, stamps, note))
 
 
-async def _in_force_from_rows(conn: AsyncConnection, event: MergeEvent) -> list[UserActions]:
-    """The from-jobs' snapshot rows of the other merges into the event's into-job still in force (not
-    reversed, not an unmerge; Ruling T22-d); an event without one contributes nothing."""
-    rows: list[UserActions] = []
+@dataclass(frozen=True)
+class _OtherMerge:
+    """Another merge event into the same job, by its snapshot: the from-job's row and the into-job's (`None`
+    for a job that had none), and whether it is still in force (not reversed)."""
+
+    id: int
+    in_force: bool
+    from_row: UserActions | None
+    into_row: UserActions | None
+
+
+async def _other_merges(conn: AsyncConnection, event: MergeEvent) -> list[_OtherMerge]:
+    """The other merge events into the event's into-job (not an unmerge), oldest first; an event recorded
+    without the actions snapshot is left out (it tells nothing of the rows)."""
+    found: list[_OtherMerge] = []
     params = {"into": event.into_job_id, "event": event.id}
-    for found in await conn.execute(_IN_FORCE_INTO, params):
-        if found.actions is None:
+    for other in await conn.execute(_OTHER_MERGES_INTO, params):
+        if other.actions is None:
             continue
-        snapshot = (UserActions.from_json(item) for item in get_list(found.actions, ""))
-        rows.extend(row for row in snapshot if row.job_id == int(found.from_job_id))
-    return rows
+        rows = {
+            row.job_id: row for row in (UserActions.from_json(item) for item in get_list(other.actions, ""))
+        }
+        from_row, into_row = rows.get(int(other.from_job_id)), rows.get(event.into_job_id)
+        found.append(_OtherMerge(int(other.id), bool(other.in_force), from_row, into_row))
+    return found
+
+
+def _peeled(value: datetime | None, name: str, earlier: Sequence[_OtherMerge]) -> datetime | None:
+    """Ruling T22-d': the into-job's own value of `name`, from `value` (the reversed event's into snapshot)
+    with what each earlier merge contributed peeled off, walking them newest first: a merge whose from-job's
+    value is the value, and whose into snapshot held another, gave it, and the value becomes that other one.
+    A null value was given by no merge (each keeps the earliest non-null), so the walk ends there."""
+    for merge in earlier:
+        if value is None:
+            break
+        came = None if merge.from_row is None else merge.from_row.timestamp(name)
+        before = None if merge.into_row is None else merge.into_row.timestamp(name)
+        if came == value and before != value:
+            value = before
+    return value
+
+
+def _contributes(row: UserActions) -> bool:
+    """Whether a merged from-job's row brought anything: a timestamp or a note."""
+    return bool(row.note) or any(row.timestamp(name) is not None for name in ACTION_TIMESTAMPS)
 
 
 async def restore_user_actions(conn: AsyncConnection, *, event: MergeEvent) -> None:
-    """§8.6.2 step 4 (module docstring, Rulings T22-c and T22-d): the from-job's snapshot row restored; on the
-    into-job each value that came only from this merge reset to the earliest of the into-job's own and those
-    of the merges into it still in force, and the note without the segment this merge appended."""
+    """§8.6.2 step 4 (module docstring, Rulings T22-c, T22-d and T22-d'): the from-job's snapshot row
+    restored; on the into-job each value that came only from this merge reset to the earliest of the
+    into-job's own (earlier merges peeled off) and those of the merges into it still in force, the note
+    without the segment this merge appended, and the row deleted when nothing of the job's own or of a merge
+    in force is left."""
     raw = event.snapshot.get("user_job_actions")
     if raw is None:  # an event recorded before the snapshot held the user's actions
         log.info("unmerge_without_user_actions_snapshot", event_id=event.id)
@@ -249,14 +290,16 @@ async def restore_user_actions(conn: AsyncConnection, *, event: MergeEvent) -> N
         await conn.execute(_PUT_ACTIONS, _put_params(event.from_job_id, stamps, before_from.note))
     if current is None:  # nothing of the merge is left on the into-job
         return
-    others = await _in_force_from_rows(conn, event)
+    others = await _other_merges(conn, event)
+    earlier = [merge for merge in reversed(others) if merge.id < event.id]  # newest first
+    in_force = [merge.from_row for merge in others if merge.in_force and merge.from_row is not None]
     restored: dict[str, datetime | None] = {}
     for name in ACTION_TIMESTAMPS:
         value = current.timestamp(name)
         merged = None if before_from is None else before_from.timestamp(name)
-        own = None if before_into is None else before_into.timestamp(name)
-        if merged is not None and value == merged and own != merged:
-            fallback = [own, *(other.timestamp(name) for other in others)]
+        before = None if before_into is None else before_into.timestamp(name)
+        if merged is not None and value == merged and before != merged:
+            fallback = [_peeled(before, name, earlier), *(row.timestamp(name) for row in in_force)]
             restored[name] = min((v for v in fallback if v is not None), default=None)
         else:
             restored[name] = value
@@ -266,7 +309,10 @@ async def restore_user_actions(conn: AsyncConnection, *, event: MergeEvent) -> N
         from_job_id=event.from_job_id,
     )
     note = without_segment(current.note, segment)
-    if before_into is None and note is None and all(value is None for value in restored.values()):
+    # the into-job's own state before any merge: the earliest merge into it found no row of it (Ruling T22-d')
+    had_no_row = (earlier[-1].into_row if earlier else before_into) is None
+    left = note is not None or any(value is not None for value in restored.values())
+    if had_no_row and not any(_contributes(row) for row in in_force) and not left:
         await conn.execute(_DELETE_ACTIONS, {"job": event.into_job_id})
     else:
         await conn.execute(_PUT_ACTIONS, _put_params(event.into_job_id, restored, note))
