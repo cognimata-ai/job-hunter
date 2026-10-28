@@ -12,8 +12,8 @@ worker epoch fenced that pass out, final review C2; a pass that raises does not 
 L312), M3 Task 17's periodic `batch_poll` (every 5 min) and `batch_reconcile_ambiguous` (every 15 min) on
 `aux`, each with the queueing lock of its name (`scoring.batch_results`, `scoring.batch_adoption`: Task 27
 registers and pins them), M3 Task 20's periodic `canary_daily` (`41 6 * * *`) on the `tick` queue with the
-queueing lock of its name (`eval_runner.start_canary_run`; Task 27 registers and pins it, Ruling P33), and M3
-Task 11's `score_cycle(trigger)` on the `score` queue
+queueing lock of its name (`eval_calibration.start_canary_run`; Task 27 registers and pins it, Ruling P33),
+and M3 Task 11's `score_cycle(trigger)` on the `score` queue
 (`graphs.score.graph.execute_cycle`: one cycle, created by its first transaction, never resumed). The tick
 runs the score lane's trigger (`tick.tick_score`, §3.4 step 6) after its scheduling step, in a transaction of
 its own. Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
@@ -300,10 +300,10 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
 @blueprint.task(name="canary_daily", queue="tick", queueing_lock="canary_daily", pass_context=True)
 async def canary_daily(context: JobContext, timestamp: int) -> None:
     """A canary run of the active configuration and its `eval_run` operation, in one transaction
-    (`eval_runner.start_canary_run`: nothing without a tuple or an active canary), on the worker's transport;
-    the `eval_run` handler on `aux` scores it."""
-    # Imported here: the eval runner imports this module (`Deferrer`) and pulls in the score steps.
-    from jobhunter.scoring.eval_runner import start_canary_run
+    (`eval_calibration.start_canary_run`: nothing without a tuple or an active canary), on the worker's
+    transport; the `eval_run` handler on `aux` scores it."""
+    # Imported here: the eval modules import this module (`Deferrer`) and pull in the score steps.
+    from jobhunter.scoring.eval_calibration import start_canary_run
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     async with rt.engine.begin() as conn:

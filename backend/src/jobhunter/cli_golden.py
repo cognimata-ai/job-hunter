@@ -53,7 +53,8 @@ from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import configure_logging
-from jobhunter.scoring import eval_runner, golden
+from jobhunter.scoring import eval_calibration, eval_runner, golden
+from jobhunter.scoring.eval_calibration import RunCase
 from jobhunter.scoring.eval_fixtures import adversarial_dir
 from jobhunter.scoring.eval_runner import (
     Candidate,
@@ -61,7 +62,6 @@ from jobhunter.scoring.eval_runner import (
     NoActiveCases,
     NoCandidate,
     Route,
-    RunCase,
     RunKind,
     StartedRun,
     Transport,
@@ -141,11 +141,11 @@ def table_lines(rows: list[RunCase]) -> list[str]:
 
 
 async def case_table(cfg: AppConfig, eval_run_id: int) -> list[str]:
-    """The case table of run `eval_run_id` (`table_lines` of `eval_runner.run_cases`)."""
+    """The case table of run `eval_run_id` (`table_lines` of `eval_calibration.run_cases`)."""
     engine = make_engine(cfg, pool_size=1)
     try:
         async with engine.connect() as conn:
-            return table_lines(await eval_runner.run_cases(conn, eval_run_id))
+            return table_lines(await eval_calibration.run_cases(conn, eval_run_id))
     finally:
         await engine.dispose()
 

@@ -1,5 +1,5 @@
 """Canaries (spec §11.13 L4632, §3.3.2 L285; plan Task 20, Ruling P33, A1 issue 25, Deviation 29): the
-`canary_daily` task starts a canary run of the active configuration (`eval_runner.start_canary_run`), the
+`canary_daily` task starts a canary run of the active configuration (`eval_calibration.start_canary_run`), the
 runner of Task 19 scores the canaries under their own profile and scope, and the run's terminal transaction
 raises `scoring.canary_drift` (warn, subject the case) for each canary more than 8 points from its baseline,
 the first canary score under `(golden_case_id, rubric, prompt schema, model policy, evaluation policy)`.

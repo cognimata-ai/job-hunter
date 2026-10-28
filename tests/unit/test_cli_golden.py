@@ -18,13 +18,13 @@ import yaml
 from jobhunter import cli, cli_golden
 from jobhunter.scoring import eval_runner, golden
 from jobhunter.scoring.calibration import CaseRow, case_result
+from jobhunter.scoring.eval_calibration import RunCase
 from jobhunter.scoring.eval_fixtures import adversarial_dir
 from jobhunter.scoring.eval_runner import (
     Candidate,
     CandidateInvalid,
     NoActiveCases,
     NoCandidate,
-    RunCase,
     StartedRun,
 )
 from jobhunter.settings.llm_projection import central_cost_per_target

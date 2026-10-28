@@ -4,8 +4,8 @@ r5 B2, B8): the `eval_run` operation, which scores a candidate configuration on 
 target table, and calibrates it.
 
 **A run** (`eval_runs`, `kind` `golden` or `canary`) is inserted with its operation in one transaction
-(`start_run`: the CLI's `jobhunter eval run` and `canary_daily`'s `start_canary_run`), payload
-`{"eval_run_id"}`, dedup key `eval_run:<id>`, `metrics = {"transport_requested": "live" | "fake"}`,
+(`start_run`: the CLI's `jobhunter eval run` and `canary_daily`'s `eval_calibration.start_canary_run`),
+payload `{"eval_run_id"}`, dedup key `eval_run:<id>`, `metrics = {"transport_requested": "live" | "fake"}`,
 `repetitions` 2 for a golden run and 1 for a canary run. It is refused before its row, so before any paid
 call (Codex r1 #34): `NoCandidate` when an id of its candidate names no row, `NoActiveCases`
 (`eval_no_cases`) when its kind has no active case. Its candidate is the five ids of the row (`Candidate`):
@@ -14,9 +14,7 @@ validated as the settings dry-run validates it, the gate's own refusal of genera
 the run measures that gate; its derived rows inserted by content hash under `active_config FOR UPDATE`, the
 lock `derive.ensure_derived` relies on to serialise `evaluation_policies.version_no`, a new evaluation
 policy's projected critic rate replayed; no settings version, no activation; a later save of the document
-finds the same rows, so the gate's run is the candidate's). `start_canary_run` (the `canary_daily` task,
-L4632) starts a canary run of the active configuration when a tuple is active and an active canary exists,
-under `active_config FOR SHARE`, and nothing otherwise.
+finds the same rows, so the gate's run is the candidate's).
 
 **The handler** (`eval_run`, `run_eval`) builds the score steps' dependencies from today's `OperationDeps`
 fields (`cfg`, `gateway`, `clock`; Ruling P33, `worker/operations.py`; Task 27 moves them). **The owner is the
@@ -71,17 +69,18 @@ of results is the progress. A canary run scores once.
 **The end**, one transaction under the owner's lock: `running → completed` with `metrics = {"transport",
 "transport_requested", "cases", "repetitions"}` (`cases = {"active", "fenced", "deleted", "outcomes"}`, the
 outcomes counted by repetition: `{"1": {outcome: n}, "2": …}`) and, merged beside them (Ruling P17, Task 20),
-the calibration of the run's case rows (`run_cases`, `calibration.metrics` against the candidate's projected
-critic rate, its model policy's §21.2 central cost and the trailing 7-day similarity-lane cut-off;
-`calibration.metrics_json`, with the gate's state and, when it failed, `failed_gates`), `passed` from
+the calibration of the run's case rows (`eval_calibration.calibrate`: `calibration.metrics` against the
+candidate's projected critic rate, its model policy's §21.2 central cost and the trailing 7-day
+similarity-lane cut-off; `calibration.metrics_json`, with the gate's state and, when it failed,
+`failed_gates`), `passed` from
 `calibration.gate` over the user's active cases (`validate.gate_cases`: the adversarial ones are pooled in
 the metrics but never calibrate the gate, Ruling T20-b; a golden run only: `NULL` while uncalibrated and for
 a canary run) and the `cost_usd` its calls count; then its alerts (`eval.gate_failed`, warn, for a production
 golden run that failed, the candidate its subject; `scoring.canary_drift`, warn, for each canary of a canary
-run more than 8 points from its first score under its key, the case its subject: `calibration.canary_drift`,
-after the `completed`, so a first run is its own baseline); and the operation `succeeded` through
-`op.finish_in` (the fault points `eval.before_terminal_commit`, its last statement, and
-`eval.after_terminal_commit`).
+run more than 8 points from its first score under its key, the case its subject;
+`eval_calibration.raise_alerts`, after the `completed`, so a first run is its own baseline); and the
+operation `succeeded` through `op.finish_in` (the fault points `eval.before_terminal_commit`, its last
+statement, and `eval.after_terminal_commit`).
 
 Nothing here logs content: ids, counts, codes, outcomes and amounts only.
 """
@@ -89,9 +88,9 @@ Nothing here logs content: ids, counts, codes, outcomes and amounts only.
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
-from typing import Final, Literal, get_args
+from typing import Final, Literal
 
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -106,10 +105,18 @@ from jobhunter.llm.pricing import Effort
 from jobhunter.llm.prompts.render import PromptVersion, ScoreRole, load_prompt_version, score_schema
 from jobhunter.llm.prompts.render import PromptVersionUnscorable as PromptVersionUnscorableError
 from jobhunter.llm.spend_ledger import EvalRunOwner
-from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import ScopeSettings, scope_from_payload
-from jobhunter.scoring import calibration, evaluation_policy, filters, golden, publication, routing, steps
+from jobhunter.scoring import (
+    calibration,
+    eval_calibration,
+    evaluation_policy,
+    filters,
+    golden,
+    publication,
+    routing,
+    steps,
+)
 from jobhunter.scoring.publication import Publication, PublicationInvalid, PublishMode
 from jobhunter.scoring.routing import Next
 from jobhunter.scoring.rubric import Rubric
@@ -130,7 +137,7 @@ from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import unknown_references
 from jobhunter.settings.llm_projection import central_cost_per_target
 from jobhunter.settings.model import ModelPolicy
-from jobhunter.settings.validate import FieldIssue, GateState, gate_cases, validate_fields
+from jobhunter.settings.validate import FieldIssue, GateState, validate_fields
 from jobhunter.types import JSONValue, get_int, get_object
 from jobhunter.worker.operations import (
     EVAL_RUN_COST_SQL,
@@ -348,46 +355,6 @@ async def start_run(
         transport_requested=transport_requested,
     )
     return StartedRun(eval_run_id, operation_id)
-
-
-# The canary start's first lock (§9.1, step 2): the active configuration it runs, read under `FOR SHARE`.
-_ACTIVE_FOR_CANARY: Final = q(
-    "SELECT llm_tuple_id, rubric_version_id, prompt_schema_version_id, model_policy_id, "
-    "evaluation_policy_id, execution_config_id FROM active_config WHERE id = 1 FOR SHARE"
-)
-_ACTIVE_CANARY: Final = q("SELECT EXISTS (SELECT 1 FROM golden_cases WHERE active AND is_canary)")
-
-
-async def start_canary_run(
-    conn: AsyncConnection, *, transport: Transport, now: datetime, defer: Deferrer | None
-) -> StartedRun | None:
-    """The `canary_daily` task's work (§11.13 L4632, M3 Task 20), in the caller's transaction: with a tuple
-    active and at least one active canary, a canary run of the active configuration on the production route
-    and its operation (`start_run`, the worker's `transport`); `None` otherwise, writing nothing. The runner
-    scores each canary under its own profile and scope, and its terminal transaction raises
-    `scoring.canary_drift` (`calibration.canary_drift`)."""
-    row = (await conn.execute(_ACTIVE_FOR_CANARY)).one()
-    if row.llm_tuple_id is None or not (await conn.execute(_ACTIVE_CANARY)).scalar_one():
-        log.info("eval_canary_skipped", tuple_active=row.llm_tuple_id is not None)
-        return None
-    if row.rubric_version_id is None or row.prompt_schema_version_id is None:
-        raise NoCandidate("active_config has no rubric or prompt-schema version (migrate seeds both)")
-    candidate = Candidate(
-        int(row.rubric_version_id),
-        int(row.prompt_schema_version_id),
-        int(row.model_policy_id),
-        int(row.evaluation_policy_id),
-        int(row.execution_config_id),
-    )
-    return await start_run(
-        conn,
-        kind="canary",
-        route="production",
-        candidate=candidate,
-        transport_requested=transport,
-        now=now,
-        defer=defer,
-    )
 
 
 # ---- the store of one scoring ------------------------------------------------------------------------------
@@ -1084,136 +1051,6 @@ class _Execution:
         return {"r": self._run.id, "g": case.id, "n": repetition}
 
 
-# ---- the calibration (Task 20, Ruling P17) -----------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RunCase:
-    """A case repetition of a run as the calibration and the CLI's case table read it: its result, its case
-    and the case's source."""
-
-    result: calibration.CaseResult
-    case: calibration.CaseRow
-    source: str
-
-
-# Each case row of a run with its golden case, the similarity of the target its label was taken from, and the
-# counted cost of its calls (as `EVAL_RUN_COST_SQL` counts a run's).
-_RUN_CASES: Final = q(
-    "SELECT e.golden_case_id, e.repetition, e.outcome, e.critic_ran, e.score_mid, e.output, g.label, "
-    "g.expected_knockouts, g.profile_version_id, g.source, t.similarity, ("
-    "SELECT coalesce(sum(CASE l.state WHEN 'billed' THEN l.settled_usd WHEN 'not_billed' THEN 0 "
-    "ELSE l.reserved_usd END), 0) FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
-    "WHERE c.id = ANY(e.llm_call_ids)) AS cost_usd "
-    "FROM eval_case_results e JOIN golden_cases g ON g.id = e.golden_case_id "
-    "LEFT JOIN llm_results res ON res.id = g.labelled_from_result_id "
-    "LEFT JOIN score_targets t ON t.id = res.target_id "
-    "WHERE e.eval_run_id = :r ORDER BY e.golden_case_id, e.repetition"
-)
-# The trailing similarity-lane cut-off (L4628): the lowest similarity the lane admitted in the window.
-_SIMILARITY_CUTOFF: Final = q(
-    "SELECT min(t.similarity) FROM score_attempts a JOIN score_targets t ON t.id = a.target_id "
-    "WHERE a.lane = 'similarity' AND a.started_at > :since AND a.started_at <= :now "
-    "AND t.similarity IS NOT NULL"
-)
-CUTOFF_WINDOW: Final = timedelta(days=7)
-GATE_FAILED_ALERT: Final = "eval.gate_failed"
-CANARY_DRIFT_ALERT: Final = "scoring.canary_drift"
-
-
-async def run_cases(conn: AsyncConnection, eval_run_id: int) -> list[RunCase]:
-    """The run's case repetitions by case and repetition (plain reads)."""
-    found: list[RunCase] = []
-    for row in await conn.execute(_RUN_CASES, {"r": eval_run_id}):
-        if row.outcome not in get_args(calibration.Outcome) or row.label not in calibration.ORDINAL:
-            raise ValueError(f"eval run {eval_run_id} holds a case row the calibration cannot read")
-        result = calibration.case_result(
-            golden_case_id=int(row.golden_case_id),
-            repetition=int(row.repetition),
-            outcome=row.outcome,
-            critic_ran=bool(row.critic_ran),
-            score_mid=None if row.score_mid is None else Decimal(row.score_mid),
-            output=row.output,
-            cost_usd=Decimal(row.cost_usd),
-        )
-        case = calibration.CaseRow(
-            label=row.label,
-            expected_knockouts=tuple(row.expected_knockouts),
-            profile_version_id=int(row.profile_version_id),
-            similarity=None if row.similarity is None else Decimal(str(row.similarity)),
-        )
-        found.append(RunCase(result, case, str(row.source)))
-    return found
-
-
-@dataclass(frozen=True)
-class _Calibrated:
-    state: GateState
-    metrics: dict[str, JSONValue]
-    passed: bool | None
-
-
-async def _calibrate(conn: AsyncConnection, run: _Run, config: _Config, *, now: datetime) -> _Calibrated:
-    """The run's calibration and gate in its terminal transaction (module docstring, **The end**): the gate
-    counts the user's active cases (`validate.gate_cases`, Ruling T20-b); the metrics pool every case."""
-    rows = await run_cases(conn, run.id)
-    cutoff = (
-        await conn.execute(_SIMILARITY_CUTOFF, {"since": now - CUTOFF_WINDOW, "now": now})
-    ).scalar_one_or_none()
-    m = calibration.metrics(
-        [r.result for r in rows],
-        cases={r.result.golden_case_id: r.case for r in rows},
-        projected_critic_rate=config.projected_critic_rate,
-        central_cost_usd=config.central_cost_usd,
-        similarity_cutoff=None if cutoff is None else Decimal(str(cutoff)),
-    )
-    state = calibration.gate(m, active_cases=await gate_cases(conn))
-    passed = None if run.kind != "golden" or state == "uncalibrated" else state == "passed"
-    return _Calibrated(state, calibration.metrics_json(m, state=state), passed)
-
-
-async def _alert(conn: AsyncConnection, run: _Run, calibrated: _Calibrated) -> None:
-    """The run's alerts, in its terminal transaction: `eval.gate_failed` for a gated golden run that failed
-    (L5618; a forced-critic run is a diagnostic, L4612), `scoring.canary_drift` for each drifted canary of a
-    canary run (L4632). Ids and numbers only."""
-    if run.kind == "golden" and run.route == "production" and calibrated.passed is False:
-        c = run.candidate
-        failed = calibrated.metrics.get("failed_gates")
-        names = [str(name) for name in failed] if isinstance(failed, list) else []
-        await raise_alert(
-            conn,
-            code=GATE_FAILED_ALERT,
-            severity="warn",
-            subject=f"{c.rubric_version_id}:{c.prompt_schema_version_id}:{c.model_policy_id}:"
-            f"{c.evaluation_policy_id}",
-            message=f"eval run {run.id} failed the golden-set gate: {', '.join(names)}",
-            context={"eval_run_id": run.id, "failed_gates": list(names)},
-        )
-    if run.kind == "canary":
-        for drift in await calibration.canary_drift(conn, eval_run_id=run.id):
-            await raise_alert(
-                conn,
-                code=CANARY_DRIFT_ALERT,
-                severity="warn",
-                subject=str(drift.golden_case_id),
-                message=f"canary {drift.golden_case_id} scored {drift.score_mid} against its baseline "
-                f"{drift.baseline} in eval run {run.id}",
-                context={
-                    "eval_run_id": run.id,
-                    "golden_case_id": drift.golden_case_id,
-                    "score_mid": str(drift.score_mid),
-                    "baseline": str(drift.baseline),
-                    "delta": str(drift.delta),
-                },
-            )
-            log.warning(
-                "eval_canary_drift",
-                eval_run_id=run.id,
-                golden_case_id=drift.golden_case_id,
-                delta=str(drift.delta),
-            )
-
-
 # ---- the run -----------------------------------------------------------------------------------------------
 
 
@@ -1289,7 +1126,14 @@ async def run_eval(
     async with engine.begin() as conn:
         await execution.owner.lock(conn)
         cost = await _cost(conn, run.id)
-        calibrated = await _calibrate(conn, run, config, now=now)
+        calibrated = await eval_calibration.calibrate(
+            conn,
+            eval_run_id=run.id,
+            kind=run.kind,
+            projected_critic_rate=config.projected_critic_rate,
+            central_cost_usd=config.central_cost_usd,
+            now=now,
+        )
         await transition(
             conn,
             "eval_runs",
@@ -1302,7 +1146,16 @@ async def run_eval(
                 "cost_usd": cost,
             },
         )
-        await _alert(conn, run, calibrated)  # after the run's `completed`: a first canary is its own baseline
+        await (
+            eval_calibration.raise_alerts(  # after the run's `completed`: a first canary is its own baseline
+                conn,
+                eval_run_id=run.id,
+                kind=run.kind,
+                route=run.route,
+                candidate=run.candidate,
+                calibrated=calibrated,
+            )
+        )
         await op.finish_in(conn, status="succeeded")
         await afault_point(BEFORE_TERMINAL_COMMIT)
     await afault_point(AFTER_TERMINAL_COMMIT)
