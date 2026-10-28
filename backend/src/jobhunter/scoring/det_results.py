@@ -86,7 +86,9 @@ from jobhunter.scoring.filters import DetFacts, read_det_facts_of
 from jobhunter.scoring.knockouts import Confirmation, derive_knockouts
 from jobhunter.scoring.rubric import LLM_CRITERIA
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
-from jobhunter.types import JSONValue, get_object
+from jobhunter.sources.parsing.locations import Location
+from jobhunter.sources.parsing.salary import Salary
+from jobhunter.types import JSONValue, get_list, get_object, get_str
 
 JOB_INPUT_FIELDS: Final = (
     "locations",
@@ -186,6 +188,43 @@ def det_inputs(
     """The `det_inputs` document of an instance and its `det_inputs_hash` (module docstring)."""
     document = DetInputs(job_inputs(det, sources), scope_inputs(scope)).to_json()
     return document, content_hash(document)
+
+
+def det_facts_from_inputs(inputs: JSONValue) -> DetFacts:
+    """The `DetFacts` a `det_inputs` document holds (M3 Task 19: a golden case's frozen
+    `det_inputs_snapshot`, carry T6-c), the inverse of its `job` part: `det_inputs` of the facts read back,
+    with the same sources and scope, is the document again. The fields no document holds (the company key,
+    the title's normal form and seniority tokens, the structured seniority, the ad language and the posting
+    date) read as unknown (empty, `None`, `unknown`), so a hard filter on them, which fails a job only on
+    positive evidence, passes. `KeyError` for a document without one of `JOB_INPUT_FIELDS`, `TypeError` or a
+    pydantic `ValidationError` for one of another shape."""
+    job = get_object(inputs, "job")
+    held = {name: get_object(job, name)["value"] for name in JOB_INPUT_FIELDS}
+    salary = held["salary"]
+    industry = held["industry_structured"]
+    if industry is not None and not isinstance(industry, str):
+        raise TypeError("job.industry_structured.value: expected str or null")
+    return DetFacts(
+        company_key="",
+        title_norm="",
+        seniority_tokens=frozenset(),
+        structured_seniority=None,
+        locations=tuple(Location.model_validate(item) for item in get_list(held, "locations")),
+        location_kind="unknown",
+        work_mode_possible=frozenset(_strings(held, "work_mode_possible")),
+        work_mode_source=get_str(held, "work_mode_source"),
+        remote_countries=tuple(_strings(held, "remote_countries")),
+        employment_types=frozenset(_strings(held, "employment_types")),
+        employment_source=get_str(held, "employment_source"),
+        salary=None if salary is None else Salary.model_validate(salary),
+        industry_structured=industry,
+        ad_language="unknown",
+        posted_at_effective=None,
+    )
+
+
+def _strings(doc: dict[str, JSONValue], name: str) -> list[str]:
+    return [get_str(item, "") for item in get_list(doc, name)]
 
 
 def det_inputs_hash(

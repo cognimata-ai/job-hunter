@@ -13,7 +13,13 @@ from typing import Any, Final
 import pytest
 from jobhunter.db.seed import canonical_json, content_hash
 from jobhunter.run_settings import ScopeLocation
-from jobhunter.scoring.det_results import JOB_INPUT_FIELDS, SCOPE_INPUT_FIELDS, det_inputs
+from jobhunter.scoring import filters
+from jobhunter.scoring.det_results import (
+    JOB_INPUT_FIELDS,
+    SCOPE_INPUT_FIELDS,
+    det_facts_from_inputs,
+    det_inputs,
+)
 from jobhunter.sources.parsing.salary import Salary
 
 from tests.support.facts import BERLIN, HAMBURG, facts, scope
@@ -182,3 +188,67 @@ def test_a_read_job_field_changes_the_hash(field: str) -> None:
 @pytest.mark.parametrize("field", SCOPE_INPUT_FIELDS)
 def test_a_read_scope_field_changes_the_hash(field: str) -> None:
     assert det_inputs(facts(), SOURCES, scope(**SCOPE_CHANGES[field]))[1] != BASE
+
+
+# ---- M3 Task 19: the frozen snapshot read back (`det_facts_from_inputs`, carry T6-c) ----------------------
+
+FULL: Final = facts(
+    locations=(BERLIN, HAMBURG),
+    work_mode_possible=frozenset({"onsite", "hybrid"}),
+    work_mode_source="structured",
+    remote_countries=("DE", "AT"),
+    employment_types=frozenset({"part_time", "full_time"}),
+    employment_source="structured",
+    salary=SALARY,
+    industry_structured="Logistik",
+    company_key="acme",
+    title_norm="senior backend engineer",
+    seniority_tokens=frozenset({"senior"}),
+    structured_seniority="mid_senior_level",
+    ad_language="de",
+)
+
+
+def test_a_snapshot_reads_back_into_the_document_it_was_made_from() -> None:
+    doc, digest = det_inputs(FULL, SOURCES, scope(locations=(CENTRE,)))
+    read = det_facts_from_inputs(doc)
+    assert det_inputs(read, SOURCES, scope(locations=(CENTRE,))) == (doc, digest)
+    assert sorted(x.label for x in read.locations) == ["Berlin", "Hamburg"] and read.salary == SALARY
+    assert [x for x in read.locations if x.label == "Berlin"] == [BERLIN]
+    assert (read.work_mode_possible, read.employment_types) == (
+        FULL.work_mode_possible,
+        FULL.employment_types,
+    )
+    assert sorted(read.remote_countries) == ["AT", "DE"]
+    assert (read.work_mode_source, read.employment_source, read.industry_structured) == (
+        "structured",
+        "structured",
+        "Logistik",
+    )
+
+
+def test_a_snapshot_knows_nothing_of_the_fields_it_does_not_hold() -> None:
+    """The fields no snapshot holds read as unknown, so a positive-evidence filter on them passes."""
+    read = det_facts_from_inputs(det_inputs(FULL, SOURCES, scope())[0])
+    assert (read.company_key, read.title_norm, read.seniority_tokens, read.structured_seniority) == (
+        "",
+        "",
+        frozenset(),
+        None,
+    )
+    assert (read.ad_language, read.location_kind, read.posted_at_effective) == ("unknown", "unknown", None)
+    strict = scope(
+        excluded_companies=frozenset({"acme"}),
+        excluded_keywords=("senior",),
+        accepted_ad_languages=frozenset({"en"}),
+    )
+    assert filters.evaluate(read, "", strict).passed
+    assert not filters.evaluate(FULL, "", strict).passed
+
+
+def test_a_snapshot_without_a_held_field_is_refused() -> None:
+    doc, _ = det_inputs(FULL, SOURCES, scope())
+    job = dict(doc["job"])  # type: ignore[arg-type]
+    del job["salary"]
+    with pytest.raises(KeyError):
+        det_facts_from_inputs({**doc, "job": job})

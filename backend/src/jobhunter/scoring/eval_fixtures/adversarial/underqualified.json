@@ -1,0 +1,177 @@
+{
+  "key": "underqualified",
+  "label": "poor",
+  "expected_knockouts": [],
+  "profile": {
+    "summary": "Junior-Softwareentwickler mit einem Jahr Erfahrung in Python nach dem Bachelorstudium.",
+    "target_titles": [
+      {
+        "title": "Softwareentwickler",
+        "lang": "de"
+      },
+      {
+        "title": "Junior Developer",
+        "lang": "en"
+      }
+    ],
+    "seniority": "junior",
+    "total_years_experience": 1,
+    "roles": [
+      {
+        "title": "Junior-Softwareentwickler",
+        "employer": "Beispiel Energie GmbH",
+        "start": "2024-10-01",
+        "end": "present",
+        "seniority": "junior",
+        "domain": "Energie",
+        "highlights": [
+          "Auswertungen von Zählerdaten mit Python geschrieben"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "Python",
+        "category": "programming_language",
+        "level": "intermediate",
+        "years": 1,
+        "evidence": "Python"
+      },
+      {
+        "name": "Git",
+        "category": "tool",
+        "level": "basic",
+        "years": 1,
+        "evidence": "Git"
+      }
+    ],
+    "languages": [
+      {
+        "code": "de",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "Deutsch (Muttersprache)"
+      },
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "C1",
+        "evidence": "Englisch (C1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "bachelor",
+        "field": "Informatik",
+        "institution": null,
+        "year": 2024
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "Energie"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "Berlin",
+        "gazetteer_id": "geonames:2950159",
+        "lat": 52.52437,
+        "lon": 13.41053,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "Lead Software Architect (m/w/d)",
+    "company": "Beispiel Energiesysteme GmbH",
+    "locations": [
+      "Berlin"
+    ],
+    "work_modes": [
+      "hybrid"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "full",
+    "description": "Für unsere Plattform zur Steuerung von Energienetzen suchen wir eine Lead Software Architektin oder einen Lead Software Architekten in Berlin. Du verantwortest die Architektur von mehr als dreißig Diensten, führst ein Team aus acht Entwicklerinnen und Entwicklern fachlich und entscheidest über Technologien und Schnittstellen. Wir erwarten mindestens zwölf Jahre Berufserfahrung in der Softwareentwicklung, davon mehrere Jahre in einer Rolle als Architekt mit Verantwortung für verteilte Systeme. Erfahrung mit Python, Java und Kubernetes setzen wir voraus. Wir bieten dir viel Gestaltungsfreiraum, ein hybrides Arbeitsmodell und ein Büro in Berlin mit Blick auf die Spree."
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "Berlin",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2950159",
+            "country_code": "DE",
+            "lat": 52.52437,
+            "lon": 13.41053
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "hybrid"
+    ],
+    "work_mode_source": "structured",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "structured",
+    "salary": null,
+    "industry_structured": null
+  }
+}

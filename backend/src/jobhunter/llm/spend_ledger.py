@@ -64,10 +64,11 @@ rows. None of them locks or writes.
 operation, which a resumed or reclaimed execution reuses instead of paying again (§9.1);
 `last_call_of_attempt` is a score attempt's newest call of one purpose. Both carry the try's `max_tokens`.
 
-**Reconcilers.** `llm_ledger_unsettled` (tick, plan Deviation 5) fails the `eval_runs` abandoned for more than
-an hour, releases `reserved` entries older than 15 minutes whose recorded owner no longer holds, and marks
-online `dispatched` entries `ambiguous` once older than `max(15 min, deadline_s + 5 min)` (plan Deviation 24),
-one transaction per entry. A batch item's entry is never aged (L2979): its submission's processing settles
+**Reconcilers.** `llm_ledger_unsettled` (tick, plan Deviation 5) fails the abandoned `eval_runs` (no live
+`eval_run` operation and, for a run that never had one, more than an hour old; M3 Task 19), releases
+`reserved` entries older than 15 minutes whose recorded owner no longer holds, and marks online `dispatched`
+entries `ambiguous` once older than `max(15 min, deadline_s + 5 min)` (plan Deviation 24), one transaction per
+entry. A batch item's entry is never aged (L2979): its submission's processing settles
 it. `budget_counters` (heavy) recomputes the counters from the ledger with the §7.11 formula and corrects any
 drift under the month lock with the critical `llm.budget_counter_drift`, and each active bulk operation's
 `spent_usd` from the entries it funded under the bulk row's lock (M3 Task 18). Both are fenced by the worker
@@ -1827,8 +1828,18 @@ async def _correct_bulk(conn: AsyncConnection, bulk_operation_id: int) -> int:
 
 # ---- unsettled entries (§17.4 `ledger_unsettled`, plan Deviations 5 and 24) --------------------------------
 
+# M3 Task 19 (Codex r1 #31): a `running` eval run is abandoned when no live `eval_run` operation executes it
+# and, when none ever did (the CLI's schema dry-run), it started more than `EVAL_RUN_ABANDONED` ago. An
+# operation-backed run's health is its operation's claim and heartbeat (the `operations` reconciler): a
+# healthy run may take hours.
+_EVAL_RUN_OPERATION = (
+    "SELECT 1 FROM operations o WHERE o.kind = 'eval_run' "
+    "AND CAST(o.payload ->> 'eval_run_id' AS bigint) = e.id"
+)
 _ABANDONED_EVAL_RUNS = q(
-    "SELECT id FROM eval_runs WHERE status = 'running' AND started_at < :cutoff ORDER BY id"
+    "SELECT e.id FROM eval_runs e WHERE e.status = 'running' "  # noqa: S608 (a constant fragment)
+    f"AND NOT EXISTS ({_EVAL_RUN_OPERATION} AND o.status IN ('pending', 'running')) "
+    f"AND (EXISTS ({_EVAL_RUN_OPERATION}) OR e.started_at < :cutoff) ORDER BY e.id"
 )
 # The candidates (`llm_spend_unsettled` serves the scan), never a batch item's entry (L2979: its submission's
 # processing settles it, and a `reserved` one is released by the submission's own end, plan Task 16):
@@ -1861,8 +1872,9 @@ _UNSETTLED = q(
 
 
 async def _fail_abandoned_eval_runs(conn: AsyncConnection, *, now: datetime) -> int:
-    """Every eval run `running` for longer than `EVAL_RUN_ABANDONED` → `failed`, so that its unsettled
-    entries fail `owner_holds`."""
+    """Every abandoned eval run (`_ABANDONED_EVAL_RUNS`: no live `eval_run` operation, and older than
+    `EVAL_RUN_ABANDONED` when it never had one) → `failed`, so that its unsettled entries fail
+    `owner_holds`."""
     ids = [
         int(i)
         for i in (await conn.execute(_ABANDONED_EVAL_RUNS, {"cutoff": now - EVAL_RUN_ABANDONED})).scalars()

@@ -51,7 +51,8 @@ code) is no target, so its issue has none (Controller carry T5-b).
 **The stored artifacts** are read back by `StoredDraft.from_row` and `StoredNote.from_row` (the node store's
 and the publish transaction's one reader of a `score_drafts` and a `critic_notes` row); `stored_validation`
 is a validated draft's last validation as a publication reads it (Task 10): stage 2 again over the stored
-draft, normalisation and history, with the row's stored failures (Controller carry T9-a).
+draft, normalisation and history, with the row's stored failures (Controller carry T9-a); `stored_review`
+the last valid critic review as a publication reads it, validated again against the draft it reviewed.
 
 **The stored validation** (`ValidationRecord.current`): `issues`, `failures` and `groundings` (codes, keys,
 paths and offsets) and `required` (the fact ids the critic reviews); a note's (`NoteRecord.validation`): its
@@ -90,6 +91,7 @@ from jobhunter.scoring.evaluation_policy import EvaluationPolicy
 from jobhunter.scoring.facts import FactRef
 from jobhunter.scoring.filters import DetFacts
 from jobhunter.scoring.knockouts import Confirmation, derive_knockouts, required_facts
+from jobhunter.scoring.publication import Review
 from jobhunter.scoring.routing import DerivedOutcome
 from jobhunter.scoring.rubric import LLM_CRITERIA, RUBRIC_KEYS, Rubric
 from jobhunter.scoring.triggers import Trigger, critic_effort, evaluate
@@ -480,6 +482,16 @@ def stored_validation(ctx: ValidationContext, stored: StoredDraft) -> DraftValid
         raise ValueError(f"score draft {stored.id} was never validated")
     validation = validate_draft(stored.draft, ctx, normalisation=stored.normalisation, history=stored.history)
     return replace(validation, failures=list(stored.failures))
+
+
+def stored_review(ctx: ValidationContext, note: StoredNote, reviewed: StoredDraft) -> Review:
+    """The last valid critic review as a publication reads it (Task 10; Task 19's eval runner too): the note's
+    review validated again (`validate_review`) against the draft it reviewed, that draft's stored validation
+    (`stored_validation`) and required facts, with the chain's confirmations the note stored."""
+    validation = stored_validation(ctx, reviewed)
+    required = [validation.fact_ids[name] for name in reviewed.required]
+    checked = validate_review(note.review, validation=validation, required=required, ctx=ctx)
+    return Review(validation=checked, injection=note.review.injection, confirmations=note.confirmations)
 
 
 def failure_keys(validation: DraftValidation) -> list[str]:

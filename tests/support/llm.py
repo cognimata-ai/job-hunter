@@ -1115,10 +1115,16 @@ def call_context(owner: SpendOwner, execution_config_id: int, **overrides: Any) 
     return CallContext(**values)
 
 
+# The kind of `create_llm_call_operation`'s operation: one no handler of this milestone registers (`export` is
+# M5's), so the test's handler never meets a real one (M3 Task 19, B R8: `eval_run` is the eval runner's).
+LLM_CALL_KIND: Final = "export"
+
+
 async def create_llm_call_operation(engine: AsyncEngine) -> int:
-    """A `pending` operation of kind `eval_run` whose handler, registered for this test only (the `fake_llm`
-    fixture removes it), makes one gateway call of `GATEWAY_NODE` as the operation's spend owner. The handler
-    closes over its gateway and uses nothing of the operation context but the claim (no `deps`)."""
+    """A `pending` operation of kind `LLM_CALL_KIND` (`export`) whose handler, registered for this test only
+    (the `fake_llm` fixture removes it), makes one gateway call of `GATEWAY_NODE` as the operation's spend
+    owner. The handler closes over its gateway and uses nothing of the operation context but the claim (no
+    `deps`)."""
     if not _active_fake:
         raise RuntimeError("create_llm_call_operation needs the fake_llm fixture")
     fake_llm = _active_fake[-1]
@@ -1129,12 +1135,12 @@ async def create_llm_call_operation(engine: AsyncEngine) -> int:
         owner = OperationOwner(ctx.claim)
         await gateway.call(GATEWAY_NODE, gateway_prompt(), call_context(owner, execution_config_id))
 
-    if ops.HANDLERS.get("eval_run", handler) is not handler:
-        raise RuntimeError("another eval_run handler is registered")
-    ops.HANDLERS["eval_run"] = fake_llm.handlers["eval_run"] = handler
+    if ops.HANDLERS.get(LLM_CALL_KIND, handler) is not handler:
+        raise RuntimeError(f"another {LLM_CALL_KIND} handler is registered")
+    ops.HANDLERS[LLM_CALL_KIND] = fake_llm.handlers[LLM_CALL_KIND] = handler
     async with engine.begin() as conn:
         op_id, _ = await ops.create_operation(
-            conn, kind="eval_run", payload={}, dedup_key=f"llm-call:{uuid.uuid4()}", defer=None
+            conn, kind=LLM_CALL_KIND, payload={}, dedup_key=f"llm-call:{uuid.uuid4()}", defer=None
         )
     return op_id
 

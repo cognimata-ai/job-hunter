@@ -25,8 +25,8 @@ from tests.support.llm import create_llm_call_operation, ledger_states, reclaim_
 
 
 async def test_reclaimed_operation_never_sends(engine, current_epoch, fake_llm, monkeypatch) -> None:
-    # tests/support/llm.py: registers a gateway-calling handler for kind 'eval_run' for this test only; it
-    # closes over its gateway and runs with deps=None
+    # tests/support/llm.py: registers a gateway-calling handler for kind 'export' (M3 Task 19: 'eval_run' is
+    # the eval runner's) for this test only; it closes over its gateway and runs with deps=None
     op_id = await create_llm_call_operation(engine)
     pause = PausePoint("gateway.after_reserve")
     monkeypatch.setattr(gateway_module, "afault_point", pause)

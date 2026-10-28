@@ -684,10 +684,11 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, and Task 16's
     `batch_submissions`), the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile`
     (Task 19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, M3 Task 14's
-    `create_targets_for_tuple` (`scoring.targets`) and Task 16's `batch_submit` (`scoring.batch_operations`,
-    Ruling T16-e) handlers,
-    and the failure hooks of the two profile phases and of the query proposal (`embed_profile` has none: it
-    drives no domain row), the `bulk_operations` reconciler's one active step, Task 16's `rerequest`
+    `create_targets_for_tuple` (`scoring.targets`), Task 16's `batch_submit` (`scoring.batch_operations`,
+    Ruling T16-e) and Task 19's `eval_run` (`scoring.eval_runner`) handlers,
+    and the failure hooks of the two profile phases, of the query proposal and of `eval_run` (written in
+    `worker.operations`, Ruling P39; `embed_profile` has none: it drives no domain row), the
+    `bulk_operations` reconciler's one active step, Task 16's `rerequest`
     (Ruling T16-d, `bulk.register_active_step`), and the one gauge refresh `metrics_refresh` runs, M3 Task
     18's `score_lane` (`scoring.reconcilers`, `reconcilers.gauge_refresh`). `embed_profile`,
     `propose_queries` and the `profile_vectors` reconciler come with `profile.operations`, which imports
@@ -702,12 +703,13 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
             "batch_submit",
             "create_targets_for_tuple",
             "embed_profile",
+            "eval_run",
             "extract_profile",
             "extract_profile_text",
             "propose_queries",
             "watchlist_validate",
         ],
-        "failure_hooks": ["extract_profile", "extract_profile_text", "propose_queries"],
+        "failure_hooks": ["eval_run", "extract_profile", "extract_profile_text", "propose_queries"],
         "active_steps": ["jobhunter.scoring.batches.rerequest"],
         "gauge_refreshes": ["score_lane"],
         "main_imported": False,

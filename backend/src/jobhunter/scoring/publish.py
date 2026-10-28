@@ -68,8 +68,8 @@ from jobhunter.scoring import publication
 from jobhunter.scoring.det_results import JobRow, ScopeRow, compute_and_write, job_sources
 from jobhunter.scoring.filters import read_det_facts
 from jobhunter.scoring.publication import Publication, PublicationInvalid, PublishMode, Review
-from jobhunter.scoring.steps import ScoreInputs, StoredDraft, StoredNote, stored_validation
-from jobhunter.scoring.validator import ValidationContext, validate_review
+from jobhunter.scoring.steps import ScoreInputs, StoredDraft, StoredNote, stored_review, stored_validation
+from jobhunter.scoring.validator import ValidationContext
 from jobhunter.types import JSONValue, get_object
 
 BEFORE_COMMIT: Final = "score.publish.before_commit"
@@ -249,11 +249,7 @@ async def _last_review(
         review_json=row.review_json,
         validation=row.validation,
     )
-    reviewed = await _stored_draft(conn, target_id, note.draft_id)
-    validation = stored_validation(ctx, reviewed)
-    required = [validation.fact_ids[name] for name in reviewed.required]
-    checked = validate_review(note.review, validation=validation, required=required, ctx=ctx)
-    return Review(validation=checked, injection=note.review.injection, confirmations=note.confirmations)
+    return stored_review(ctx, note, await _stored_draft(conn, target_id, note.draft_id))
 
 
 async def _invalid(

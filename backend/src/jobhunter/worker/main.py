@@ -172,6 +172,8 @@ _REGISTERING_MODULES: Final = (
     # `stuck_targets`, `det_completeness`, `admission_alerts`, `scoring_drift` and the score lane's gauge
     # refresh (Task 18)
     "jobhunter.scoring.reconcilers",
+    # the `eval_run` handler and its failure hook (`worker.operations.eval_run_failed`; Task 19, Ruling P44)
+    "jobhunter.scoring.eval_runner",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

@@ -21,6 +21,10 @@ from jobhunter.observability.redact import EMAIL, KEY, PHONE
 from jobhunter.types import JSONValue
 
 ROOT = Path("tests/contract/fixtures")
+# M3 Task 19 (Ruling P39): the packaged adversarial golden-case fixtures, synthetic ads and profiles of
+# invented people, ship in the wheel and are scanned like the contract fixtures (every file, any suffix)
+EVAL_ROOT = Path("backend/src/jobhunter/scoring/eval_fixtures")
+EVAL_FIXTURES = sorted(p for p in EVAL_ROOT.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
 # bodies, headers, meta and the label file; `.html` and `.txt` hold the bodies that are not JSON (the derived
 # HTML error page and the truncated feed page), so they are scanned like every other body; `.sse` holds the
 # recorded and hand-authored Anthropic streams under `anthropic/` (M2 Task 4)
@@ -82,7 +86,25 @@ def strings(
 
 @pytest.mark.parametrize("path", FILES, ids=[str(p.relative_to(ROOT)) for p in FILES])
 def test_fixture_has_no_pii_secret_or_key_shaped_value(path) -> None:
-    text, source = path.read_text(encoding="utf-8"), path.relative_to(ROOT).parts[0]
+    scan_fixture(path, source=path.relative_to(ROOT).parts[0])
+
+
+@pytest.mark.parametrize("path", EVAL_FIXTURES, ids=[str(p.relative_to(EVAL_ROOT)) for p in EVAL_FIXTURES])
+def test_eval_fixture_has_no_pii_secret_or_key_shaped_value(path: Path) -> None:
+    """M3 Task 19: the packaged eval fixtures pass the same scan (no identifier field is allowed there)."""
+    scan_fixture(path, source="eval_fixtures")
+
+
+def test_the_eval_fixture_tree_is_scanned() -> None:
+    """The ten adversarial cases (M3 Task 19) and nothing of them escapes the scan by its suffix."""
+    adversarial = [p for p in EVAL_FIXTURES if p.parent.name == "adversarial" and p.suffix == ".json"]
+    assert len(adversarial) == 10
+    assert all(p.suffix in (".json", ".py") for p in EVAL_FIXTURES)
+
+
+def scan_fixture(path: Path, *, source: str) -> None:
+    """The scan of one fixture file (`source`: its tree, which names its identifier allowlist)."""
+    text = path.read_text(encoding="utf-8")
     assert not EMAIL.search(text), "an e-mail address survived the scrub"
     assert not PHONE.search(text) and not PHONE_DE.search(text) and not PHONE_MORE.search(text), (
         "a phone number survived the scrub"

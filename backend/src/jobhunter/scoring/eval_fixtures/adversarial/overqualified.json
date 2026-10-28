@@ -1,0 +1,198 @@
+{
+  "key": "overqualified",
+  "label": "poor",
+  "expected_knockouts": [],
+  "profile": {
+    "summary": "Principal frontend engineer with fifteen years of experience leading web platform teams.",
+    "target_titles": [
+      {
+        "title": "Principal Frontend Engineer",
+        "lang": "en"
+      },
+      {
+        "title": "Head of Frontend",
+        "lang": "en"
+      }
+    ],
+    "seniority": "principal",
+    "total_years_experience": 15,
+    "roles": [
+      {
+        "title": "Principal Frontend Engineer",
+        "employer": "Beispiel Reisen GmbH",
+        "start": "2016-01-01",
+        "end": "present",
+        "seniority": "principal",
+        "domain": "Travel",
+        "highlights": [
+          "Led three teams that rebuilt the booking frontend with React"
+        ]
+      },
+      {
+        "title": "Senior Frontend Engineer",
+        "employer": "Beispiel Medien GmbH",
+        "start": "2010-03-01",
+        "end": "2015-12-31",
+        "seniority": "senior",
+        "domain": "Media",
+        "highlights": [
+          "Introduced a component library for twelve web products"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "React",
+        "category": "framework",
+        "level": "expert",
+        "years": 9,
+        "evidence": "React"
+      },
+      {
+        "name": "JavaScript",
+        "category": "programming_language",
+        "level": "expert",
+        "years": 15,
+        "evidence": "JavaScript"
+      },
+      {
+        "name": "Technical Leadership",
+        "category": "soft_skill",
+        "level": "expert",
+        "years": 8,
+        "evidence": "Technical Leadership"
+      }
+    ],
+    "languages": [
+      {
+        "code": "de",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "Deutsch (Muttersprache)"
+      },
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "C1",
+        "evidence": "Englisch (C1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "master",
+        "field": "Informatik",
+        "institution": null,
+        "year": 2009
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "Travel",
+      "Media"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "Frankfurt am Main",
+        "gazetteer_id": "geonames:2925533",
+        "lat": 50.11552,
+        "lon": 8.68417,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "Junior Frontend-Entwickler (m/w/d)",
+    "company": "Beispiel Agentur GmbH",
+    "locations": [
+      "Frankfurt am Main"
+    ],
+    "work_modes": [
+      "onsite",
+      "hybrid"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "full",
+    "description": "Du hast deine Ausbildung oder dein Studium gerade abgeschlossen und möchtest als Junior im Frontend durchstarten? Für unsere Agentur in Frankfurt suchen wir eine Einsteigerin oder einen Einsteiger. Du setzt einfache Landingpages mit HTML, CSS und etwas JavaScript um und lernst dabei React von unserem Team. Berufserfahrung ist nicht nötig, erste Projekte aus dem Studium reichen völlig aus. Die Stelle ist ausdrücklich als Einstiegsposition gedacht und hat keine Führungsverantwortung. Wir bieten dir eine strukturierte Einarbeitung, eine Mentorin oder einen Mentor und regelmäßige Schulungen in unserem Büro in Frankfurt."
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "Frankfurt am Main",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2925533",
+            "country_code": "DE",
+            "lat": 50.11552,
+            "lon": 8.68417
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "onsite",
+      "hybrid"
+    ],
+    "work_mode_source": "structured",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "structured",
+    "salary": null,
+    "industry_structured": null
+  }
+}

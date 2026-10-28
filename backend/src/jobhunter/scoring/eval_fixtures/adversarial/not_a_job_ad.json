@@ -1,0 +1,181 @@
+{
+  "key": "not_a_job_ad",
+  "label": "poor",
+  "expected_knockouts": [],
+  "profile": {
+    "summary": "Data-Analystin mit drei Jahren Erfahrung in SQL, Python und Dashboards für den Vertrieb.",
+    "target_titles": [
+      {
+        "title": "Data Analyst",
+        "lang": "en"
+      },
+      {
+        "title": "Datenanalystin",
+        "lang": "de"
+      }
+    ],
+    "seniority": "mid",
+    "total_years_experience": 3,
+    "roles": [
+      {
+        "title": "Data Analyst",
+        "employer": "Beispiel Vertrieb GmbH",
+        "start": "2022-01-01",
+        "end": "present",
+        "seniority": "mid",
+        "domain": "Vertrieb",
+        "highlights": [
+          "Dashboards für die Vertriebssteuerung mit SQL und Python gebaut"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "SQL",
+        "category": "programming_language",
+        "level": "advanced",
+        "years": 3,
+        "evidence": "SQL"
+      },
+      {
+        "name": "Python",
+        "category": "programming_language",
+        "level": "intermediate",
+        "years": 3,
+        "evidence": "Python"
+      }
+    ],
+    "languages": [
+      {
+        "code": "de",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "Deutsch (Muttersprache)"
+      },
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "C1",
+        "evidence": "Englisch (C1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "master",
+        "field": "Statistik",
+        "institution": null,
+        "year": 2021
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "Vertrieb"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "Hamburg",
+        "gazetteer_id": "geonames:2911298",
+        "lat": 53.55073,
+        "lon": 9.99302,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "Talentpool IT (m/w/d)",
+    "company": "Beispiel Gruppe GmbH",
+    "locations": [
+      "Hamburg"
+    ],
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "full",
+    "description": "Du hast bei uns keine passende Stelle gefunden, möchtest aber trotzdem Teil der Beispiel Gruppe werden? Dann trag dich in unseren Talentpool ein. Wir haben gerade keine offene Position zu vergeben, speichern dein Profil aber für zwölf Monate und melden uns bei dir, sobald eine passende Stelle in einem unserer Teams frei wird. Lade dazu einfach deinen Lebenslauf hoch und sag uns, welche Themen dich interessieren und wo du gerne arbeiten möchtest. Mit dem Eintrag bewirbst du dich auf keine konkrete Stelle, und es entstehen dir keine Verpflichtungen. Wir freuen uns darauf, dich kennenzulernen, wenn die richtige Gelegenheit kommt."
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "Hamburg",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2911298",
+            "country_code": "DE",
+            "lat": 53.55073,
+            "lon": 9.99302
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "work_mode_source": "none",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "none",
+    "salary": null,
+    "industry_structured": null
+  }
+}

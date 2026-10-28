@@ -26,6 +26,10 @@ domain row the operation drives (a profile draft, a query proposal) never outliv
 state. A hook may lock only rows after the owner row in the §9.1 order, and it moves its domain row only while
 that row is still live: a row the handler's own write already ended in the same transaction is left as it is.
 
+**The `eval_run` hook** (M3 Task 19, written here; Task 27 pins it): `eval_run_failed` ends the run of a
+failed `eval_run` operation `failed('interrupted')` while it is still `running` (`fail_eval_run`, which the
+eval runner shares); `scoring.eval_runner` registers it with the kind's handler.
+
 **Handler-side ends** (M2 Task 11). A handler, or a graph node it runs, ends its operation inside its own
 transaction with `OperationContext.finish_in` or `requeue_in`, so the last domain write and the operation's
 end commit together. Either records the end in the context's outcome holder, and `execute_operation`, which
@@ -65,7 +69,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import transition
+from jobhunter.db.transitions import transition, transition_where
 from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert
@@ -239,6 +243,55 @@ def register_operation_handler(
         return handler
 
     return register
+
+
+# ---- the `eval_run` failure hook (M3 Task 19; Task 27 pins it) ---------------------------------------------
+
+EVAL_RUN_INTERRUPTED: Final = "interrupted"
+_BIGINT_END: Final = 2**63
+# What the ledger counts for an eval run's calls (§6.9.1): billed at their cost, not billed at 0, the rest
+# (reserved, dispatched, ambiguous) at their reservation; `eval_runs.cost_usd` is numeric(10,4), rounded half
+# up. Informational: the ledger, never the run row, is the authority for spend.
+EVAL_RUN_COST_SQL: Final = (
+    "(SELECT round(coalesce(sum(CASE l.state WHEN 'billed' THEN l.settled_usd WHEN 'not_billed' THEN 0 "
+    "ELSE l.reserved_usd END), 0), 4) FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    "WHERE c.eval_run_id = t.id)"
+)
+
+
+async def fail_eval_run(conn: AsyncConnection, eval_run_id: int, reason: str) -> bool:
+    """End eval run `eval_run_id` `running → failed` with `metrics || {"failed": reason}` and the `cost_usd`
+    its calls count (`EVAL_RUN_COST_SQL`), in the caller's transaction; `False`, writing nothing, when the
+    run is not `running` (already `completed` or `failed`: left as it is) or does not exist."""
+    moved = await transition_where(
+        conn,
+        "eval_runs",
+        ["running"],
+        "failed",
+        where="t.id = :run",
+        params={"run": eval_run_id, "reason": reason},
+        set_sql={
+            "metrics": "coalesce(t.metrics, CAST('{}' AS jsonb)) || jsonb_build_object('failed', "
+            "CAST(:reason AS text))",
+            "cost_usd": EVAL_RUN_COST_SQL,
+        },
+    )
+    return bool(moved)
+
+
+async def eval_run_failed(
+    conn: AsyncConnection, operation_id: int, payload: Mapping[str, JSONValue], error_code: str | None
+) -> None:
+    """The `eval_run` operation's failure hook (M3 Task 19, Codex r5 B2): its run, while still `running`,
+    ends `failed` with `metrics.failed = "interrupted"` (`fail_eval_run`); a run already `completed` or
+    `failed` is left as it is. It writes the run row after the operation row the finishing transaction
+    holds (steps 5 and 10 of the lock schedule) and needs no earlier lock."""
+    run = payload.get("eval_run_id")
+    if isinstance(run, bool) or not isinstance(run, int) or not 0 < run < _BIGINT_END:
+        log.error("eval_run_hook_payload_invalid", operation_id=operation_id)
+        return  # no run a `bigint` names: the operation still ends `failed`
+    if await fail_eval_run(conn, run, EVAL_RUN_INTERRUPTED):
+        log.warning("eval_run_failed", operation_id=operation_id, eval_run_id=run, error_code=error_code)
 
 
 async def _run_failure_hook(
