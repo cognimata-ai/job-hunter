@@ -20,12 +20,12 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
-from jobhunter.graphs.score.nodes import load_attempt_inputs
 from jobhunter.llm.batches import BatchApiError, BatchesClient, BatchStatus, ItemResult
 from jobhunter.llm.fake import BatchScript
 from jobhunter.scoring import batch_items
 from jobhunter.scoring import batch_operations as batch_ops
 from jobhunter.scoring import batches as batches_mod
+from jobhunter.scoring.attempt_inputs import load_attempt_inputs
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.batches import (

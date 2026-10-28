@@ -39,14 +39,15 @@ and reads the facts that transaction committed. It is the pure writer: it moves 
 instance. `read_det_facts` reads a job's committed `DetFacts` without a lock (the score validation's
 provisional aggregation, M3 Task 9), `read_det_facts_of` those of several jobs in one statement.
 
-**Live** (M3 Task 15, Codex r5 B3; §9.7 L3716, §13.4 L4905). `lock_active_scopes` reads, under
-`active_config FOR SHARE` (the first lock), the active and the pending scope and the active tuple
-(`ActiveScopes`; `active_scopes` is its `scopes`). `refilter_job_live(conn, job_id, active=…)` is the
+**Live** (M3 Task 15, Codex r5 B3; §9.7 L3716, §13.4 L4905). `lock_active_scopes` reads, under `active_config
+FOR SHARE` (the first lock), the active and the pending scope and the active tuple (`ActiveScopes`;
+`active_scopes` is its `scopes`); `active_scope` reads the active scope alone under the same lock (the score
+`validate` node's and a batch item's, Ruling T17-c). `refilter_job_live(conn, job_id, active=…)` is the
 det-facts change hook of the live writers that hold that lock before the job row (the identity hook of the
 harvest, `merge`/`unmerge`, the groups' confirmation): `refilter_job` for both scopes, then a current
-`det_results` instance of each published active-tuple result of the job's revisions for both scopes (none
-when the inputs' hash is unchanged), then the job's unpublished active-tuple targets `filtered_out ⇄ pending`
-by the active scope, `override = 'none'` (`targets.refilter_targets_of_jobs`). It returns what it wrote
+`det_results` instance of each published active-tuple result of the job's revisions for both scopes (none when
+the inputs' hash is unchanged), then the job's unpublished active-tuple targets `filtered_out ⇄ pending` by
+the active scope, `override = 'none'` (`targets.refilter_targets_of_jobs`). It returns what it wrote
 (`LiveRefiltered`; the caller bumps the ranking when `changed`). The scope precompute and the completeness
 reconciler never call it.
 
@@ -483,6 +484,19 @@ async def lock_active_scopes(conn: AsyncConnection) -> ActiveScopes:
         llm_tuple_id=None if pointers.llm_tuple_id is None else int(pointers.llm_tuple_id),
         scopes={int(row.id): scope_from_payload(get_object(row.payload, "")) for row in rows},
     )
+
+
+_LOCK_ACTIVE_SCOPE: Final = q("SELECT scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
+# A statement of its own after the lock (`settings.active`: a joined row is read in the snapshot the locking
+# statement started with).
+_SCOPE: Final = q("SELECT payload FROM scope_versions WHERE id = :s")
+
+
+async def active_scope(conn: AsyncConnection) -> tuple[int, ScopeSettings]:
+    """The active scope version and its scope, `active_config` held `FOR SHARE` for the transaction."""
+    scope_version_id = (await conn.execute(_LOCK_ACTIVE_SCOPE)).scalar_one()
+    payload = (await conn.execute(_SCOPE, {"s": scope_version_id})).scalar_one()
+    return int(scope_version_id), scope_from_payload(get_object(payload, ""))
 
 
 async def active_scopes(conn: AsyncConnection) -> dict[int, ScopeSettings]:

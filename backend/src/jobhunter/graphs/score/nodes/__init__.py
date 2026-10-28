@@ -10,13 +10,10 @@ What the nodes share:
   write (§9.4.3: the target `FOR SHARE` under `claim_id`, `attempt_no` and `state = 'in_progress'`, else
   `ClaimLost`);
 - `load_inputs(conn, state)`: the attempt's `scoring.steps.ScoreInputs` and its `AttemptRow`, read without a
-  lock: the state's prompt-schema version (`load_context` set it from the tuple; the renderer's cache serves
-  it), the tuple's rubric and profile version, the revision's `<job_ad>` block (the material projection
-  `job_revisions.llm_input` and the revision's description, which every evidence offset refers to), the
-  job's committed `DetFacts`, the attempt's pinned evaluation policy and execution config, and the model
-  policy's critic efforts. The ids every prompt records are the revision's, the profile version's and the
-  rubric version's;
-- `TargetDraftStore`: the `scoring.steps.DraftStore` of the `score_drafts` and `critic_notes` tables. Each
+  lock (`scoring.attempt_inputs.load_attempt_inputs` at the state's prompt-schema version, which
+  `load_context` set from the tuple);
+- `TargetDraftStore`: the `scoring.steps.DraftStore` of the `score_drafts` (`scoring.drafts`' statements) and
+  `critic_notes` tables. Each
   write is one transaction after the owner lock (step 5 of the lock schedule, then the domain rows, step
   10), unless the store is bound to a caller's transaction (`validate`'s, which holds `active_config` and the
   owner lock already). A generator draft (round 0) is written between the fault points
@@ -37,7 +34,6 @@ What the nodes share:
 
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Any, Final, Protocol, get_args
 from uuid import UUID
 
@@ -54,34 +50,24 @@ from jobhunter.graphs.score.state import CycleState, CycleUpdate, TargetState, T
 from jobhunter.llm.errors import LLMError
 from jobhunter.llm.gateway import CallContext, GatewayResult, RenderedPrompt, pinned_node_config
 from jobhunter.llm.pricing import Effort
-from jobhunter.llm.prompts.render import ScoreRole, load_prompt_version, score_schema
-from jobhunter.llm.schemas.profile import ConfirmedProfile
+from jobhunter.llm.prompts.render import ScoreRole, score_schema
 from jobhunter.llm.spend_ledger import TargetAttemptOwner
 from jobhunter.observability.logging import get_logger
-from jobhunter.scoring import evaluation_policy
-from jobhunter.scoring.filters import read_det_facts
-from jobhunter.scoring.routing import DerivedOutcome, Next, Route
-from jobhunter.scoring.steps import (
-    Caller,
-    NoteRecord,
-    ScoreInputs,
-    StoredDraft,
-    StoredNote,
-    ValidationRecord,
-    material_strings,
-    revision_ad,
-    rubric_of,
-    score_refs,
+from jobhunter.scoring.attempt_inputs import AttemptRow, load_attempt_inputs
+from jobhunter.scoring.drafts import (
+    INSERT_DRAFT,
+    READ_DRAFT,
+    SAVE_VALIDATION,
+    draft_params,
+    validation_params,
 )
-from jobhunter.scoring.triggers import sample_key
+from jobhunter.scoring.routing import DerivedOutcome, Next, Route
+from jobhunter.scoring.steps import Caller, NoteRecord, ScoreInputs, StoredDraft, StoredNote, ValidationRecord
 from jobhunter.scoring.validator import ParsedGenerator
-from jobhunter.types import JSONValue, get_str
 
 BEFORE_DRAFT: Final = "score.generate.before_draft"
 AFTER_DRAFT: Final = "score.generate.after_draft"
-_EFFORTS: Final[Mapping[str, Effort]] = {effort: effort for effort in get_args(Effort)}
 _OUTCOMES: Final[Mapping[str, DerivedOutcome]] = {o: o for o in get_args(DerivedOutcome)}
-_STRUCTURED: Final = "structured"
 
 log = get_logger("jobhunter.graphs.score")
 
@@ -155,41 +141,6 @@ def failure(error: LLMError | FencedOut, state: TargetState, node: str) -> Comma
 # ---- the inputs --------------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class AttemptRow:
-    """What a node reads of its target, tuple and attempt (ids only)."""
-
-    job_id: int
-    job_revision_id: int
-    llm_tuple_id: int
-    profile_version_id: int
-    rubric_version_id: int
-    model_policy_id: int
-    execution_config_id: int
-    evaluation_policy_id: int
-
-
-_INPUTS: Final = q(
-    "SELECT t.job_id, t.job_revision_id, t.llm_tuple_id, u.profile_version_id, u.rubric_version_id, "
-    "u.model_policy_id, a.execution_config_id, a.evaluation_policy_id, "
-    "r.llm_input, r.description_text, r.description_completeness, v.profile_json, w.weights, w.anchors, "
-    "m.payload AS model_policy "
-    "FROM score_targets t JOIN llm_tuples u ON u.id = t.llm_tuple_id "
-    "JOIN score_attempts a ON a.id = :attempt AND a.target_id = t.id "
-    "JOIN job_revisions r ON r.id = t.job_revision_id "
-    "JOIN profile_versions v ON v.id = u.profile_version_id "
-    "JOIN rubric_versions w ON w.id = u.rubric_version_id "
-    "JOIN model_policies m ON m.id = u.model_policy_id WHERE t.id = :target"
-)
-
-
-def _effort(value: str) -> Effort:
-    effort = _EFFORTS.get(value)
-    if effort is None:
-        raise ValueError("a model policy names an unknown effort")
-    return effort
-
-
 async def load_inputs(conn: AsyncConnection, state: TargetState) -> tuple[ScoreInputs, AttemptRow]:
     """The attempt's inputs and ids (module docstring), on the caller's connection; `LookupError` when the
     target, its attempt or the profile version's profile is gone."""
@@ -199,53 +150,6 @@ async def load_inputs(conn: AsyncConnection, state: TargetState) -> tuple[ScoreI
         attempt_id=state["attempt_id"],
         prompt_schema_version_id=state["prompt_schema_version_id"],
     )
-
-
-async def load_attempt_inputs(
-    conn: AsyncConnection, *, target_id: int, attempt_id: int, prompt_schema_version_id: int
-) -> tuple[ScoreInputs, AttemptRow]:
-    """`load_inputs` of an attempt named by its ids (a batch item's, `scoring.batch_items`, which has no
-    subgraph state)."""
-    row = (await conn.execute(_INPUTS, {"target": target_id, "attempt": attempt_id})).first()
-    if row is None:
-        raise LookupError(f"score target {target_id} or its attempt {attempt_id} does not exist")
-    if row.profile_json is None:
-        raise LookupError(f"the profile version of score target {target_id} is purged")
-    attempt = AttemptRow(
-        job_id=int(row.job_id),
-        job_revision_id=int(row.job_revision_id),
-        llm_tuple_id=int(row.llm_tuple_id),
-        profile_version_id=int(row.profile_version_id),
-        rubric_version_id=int(row.rubric_version_id),
-        model_policy_id=int(row.model_policy_id),
-        execution_config_id=int(row.execution_config_id),
-        evaluation_policy_id=int(row.evaluation_policy_id),
-    )
-    material: JSONValue = row.llm_input
-    work_modes = material_strings(material, "work_mode_possible")
-    work_mode_source = get_str(material, "work_mode_source")
-    ad = revision_ad(
-        material, completeness=row.description_completeness, description_text=row.description_text
-    )
-    inputs = ScoreInputs(
-        version=await load_prompt_version(conn, prompt_schema_version_id),
-        rubric=rubric_of(row.weights, row.anchors),
-        profile=ConfirmedProfile.model_validate(row.profile_json),
-        ad=ad,
-        det=await read_det_facts(conn, attempt.job_id),
-        structured_work_modes=tuple(work_modes) if work_mode_source == _STRUCTURED else (),
-        completeness=row.description_completeness,
-        policy=await evaluation_policy.load(conn, attempt.evaluation_policy_id),
-        critic_effort=_effort(get_str(row.model_policy, "nodes.critic.effort")),
-        critic_light_effort=_effort(get_str(row.model_policy, "critic_light_effort")),
-        sample_key=sample_key(target_id=target_id, llm_tuple_id=attempt.llm_tuple_id),
-        refs=score_refs(
-            job_revision_id=attempt.job_revision_id,
-            profile_version_id=attempt.profile_version_id,
-            rubric_version_id=attempt.rubric_version_id,
-        ),
-    )
-    return inputs, attempt
 
 
 # ---- the calls ---------------------------------------------------------------------------------------------
@@ -301,26 +205,6 @@ def score_caller(deps: ScoreDeps, state: TargetState, inputs: ScoreInputs, attem
 
 # ---- the store ---------------------------------------------------------------------------------------------
 
-# The draft statements, which a batch item's store (`scoring.batch_items`) writes too: the insert of a
-# generated draft (`validation = {"normalisation": …}`, the other NOT NULL columns placeholders), the read,
-# and the validation's update.
-INSERT_DRAFT: Final = q(
-    "INSERT INTO score_drafts (attempt_id, round, llm_call_id, output_json, validation, "
-    "deterministic_failures, provisional, triggers) "
-    "VALUES (:attempt, :round, :call, :draft, :validation, '{}', '{}', '{}') "
-    "RETURNING id",
-    jsonb=["draft", "validation"],
-)
-READ_DRAFT: Final = q("SELECT id, round, output_json, validation FROM score_drafts WHERE id = :d")
-SAVE_VALIDATION: Final = q(
-    "UPDATE score_drafts SET output_json = :draft, "
-    "validation = validation || jsonb_build_object('current', CAST(:current AS jsonb)) || "
-    "CASE WHEN validation -> 'corrections' IS NULL "
-    "THEN jsonb_build_object('corrections', CAST(:corrections AS jsonb)) ELSE CAST('{}' AS jsonb) END, "
-    "deterministic_failures = CAST(:failures AS text[]), provisional = :provisional, "
-    "triggers = CAST(:triggers AS text[]) WHERE id = :d",
-    jsonb=["draft", "current", "corrections", "provisional"],
-)
 _INSERT_NOTE: Final = q(
     "INSERT INTO critic_notes (attempt_id, round, draft_id, llm_call_id, effort, triggers, verdict_returned, "
     "derived_outcome, review_json, validation) VALUES (:attempt, :round, :draft, :call, :effort, "
@@ -330,32 +214,6 @@ _INSERT_NOTE: Final = q(
 _NOTE: Final = q(
     "SELECT id, draft_id, derived_outcome, review_json, validation FROM critic_notes WHERE id = :n"
 )
-
-
-def draft_params(
-    *, attempt_id: int, round: int, llm_call_id: int, parsed: ParsedGenerator
-) -> dict[str, object]:
-    """The binds of `INSERT_DRAFT` for a structurally valid output of the attempt's `round`."""
-    return {
-        "attempt": attempt_id,
-        "round": round,
-        "call": llm_call_id,
-        "draft": parsed.draft.model_dump(mode="json"),
-        "validation": {"normalisation": parsed.normalisation.to_json()},
-    }
-
-
-def validation_params(draft_id: int, record: ValidationRecord) -> dict[str, object]:
-    """The binds of `SAVE_VALIDATION` for `record` of draft `draft_id`."""
-    return {
-        "d": draft_id,
-        "draft": record.draft.model_dump(mode="json"),
-        "current": record.current,
-        "corrections": record.corrections,
-        "failures": record.failures,
-        "provisional": record.provisional,
-        "triggers": record.triggers,
-    }
 
 
 class TargetDraftStore:

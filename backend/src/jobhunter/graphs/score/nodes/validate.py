@@ -20,31 +20,16 @@ from typing import Final
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
-from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut, InvariantViolation
 from jobhunter.graphs.score.deps import ScoreDeps
 from jobhunter.graphs.score.nodes import Node, TargetDraftStore, failure, goto, load_inputs, log, owner_of
 from jobhunter.graphs.score.state import TargetState, state_failure_keys
-from jobhunter.run_settings import ScopeSettings, scope_from_payload
 from jobhunter.scoring import routing, steps
+from jobhunter.scoring.filters import active_scope
 from jobhunter.scoring.routing import Route
-from jobhunter.types import get_object
 
 NAME: Final = "validate"
-
-_LOCK_ACTIVE_SCOPE: Final = q("SELECT scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
-# A statement of its own after the lock (`settings.active`: a joined row is read in the snapshot the locking
-# statement started with).
-_SCOPE: Final = q("SELECT payload FROM scope_versions WHERE id = :s")
-
-
-async def active_scope(conn: AsyncConnection) -> tuple[int, ScopeSettings]:
-    """The active scope version and its scope, `active_config` held `FOR SHARE` for the transaction."""
-    scope_version_id = (await conn.execute(_LOCK_ACTIVE_SCOPE)).scalar_one()
-    payload = (await conn.execute(_SCOPE, {"s": scope_version_id})).scalar_one()
-    return int(scope_version_id), scope_from_payload(get_object(payload, ""))
 
 
 def make_validate(deps: ScoreDeps) -> Node:
