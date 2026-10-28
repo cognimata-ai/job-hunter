@@ -34,7 +34,7 @@ from decimal import Decimal
 from typing import Annotated, Final, Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.api.deps import get_config, get_engine, require_session
@@ -78,8 +78,8 @@ class BucketOut(BaseModel):
 
 
 class SpendGroupOut(BaseModel):
-    """The month's tries of one model, effort and role (`effort` is `null` for a try whose call row was
-    purged), and what they count."""
+    """The month's tries outside eval runs of one model, effort and role (`effort` is `null` for a try whose
+    call row was purged), and what they count; the eval runs' tries are `eval_by_model_role`'s."""
 
     model: str
     effort: str | None
@@ -126,8 +126,13 @@ class SpendOut(BaseModel):
     bulk_operation: BulkOperationOut | None
     quarantined_batch_usd: DecimalOut
     pause_reason: PauseReason | None
-    by_model_effort_role: list[SpendGroupOut]
-    eval_by_model_role: list[EvalSpendGroupOut]
+    by_model_effort_role: list[SpendGroupOut] = Field(
+        description="The month's tries outside eval runs by model, effort and role; the eval runs' tries "
+        "(golden, canary, schema dry-run) are excluded and counted in `eval_by_model_role`"
+    )
+    eval_by_model_role: list[EvalSpendGroupOut] = Field(
+        description="The month's tries of eval runs by model and role, from the ledger alone"
+    )
 
 
 async def _bulk_operation(conn: AsyncConnection, llm_tuple_id: int | None) -> BulkOperationOut | None:

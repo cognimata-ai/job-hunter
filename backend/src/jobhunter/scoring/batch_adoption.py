@@ -27,9 +27,9 @@ ended candidate of the window cannot be read whole decides nothing for the submi
 anomaly, no transition; logged `batch_adoption_deferred`), since that candidate may intersect ours; the next
 pass tries again. It leaves a durable trace (Carry T17-d): `last_reconcile_at` and `reconcile_report = {…,
 "candidates": n, "listed": m, "unread_candidates": k}`, the count of candidates it could not read, which the
-25 h alert's context then carries; a later pass that reads every candidate (with no match, or adopting ours)
-removes the count. One submission's unexpected error is logged with its class and leaves the others to the
-pass (Ruling T17-a).
+25 h alert's context then carries; a later pass that reads every candidate (with no match, an anomaly, or
+adopting ours) removes the count. One submission's unexpected error is logged with its class and leaves the
+others to the pass (Ruling T17-a).
 
 **The task body** (`reconcile_ambiguous_task`, Deviation 27: the periodic task `batch_reconcile_ambiguous` of
 `worker.tasks`, under the queueing lock of its name) builds the client from the worker's config and gateway
@@ -227,6 +227,14 @@ async def _record_pass(
         await conn.execute(_RECORD_PASS, {"s": submission_id, "now": now, "report": report})
 
 
+async def _forget_unread(engine: AsyncEngine, submission_id: int, *, epoch: int) -> None:
+    """The unread candidates of an earlier pass forgotten by a pass that read every candidate and recorded
+    nothing else (the anomaly's; Carry T17-d)."""
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        await conn.execute(_FORGET_UNREAD, {"s": submission_id})
+
+
 async def reconcile_ambiguous(
     engine: AsyncEngine, client: BatchesClient, *, now: datetime, epoch: int, defer: Deferrer
 ) -> ReconcileReport:
@@ -327,6 +335,7 @@ async def _reconcile_one(
             lacking=len(ours - first),
             equal=len(equal),
         )
+        await _forget_unread(engine, submission_id, epoch=epoch)  # this pass read every candidate
         return replace(report, anomalies=report.anomalies + 1)
     if equal:  # rule 3: the one candidate whose ids equal ours
         if not await _adopt(engine, submission_id, equal[0], now=now, epoch=epoch):

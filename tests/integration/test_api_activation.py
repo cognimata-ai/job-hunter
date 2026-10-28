@@ -351,25 +351,45 @@ async def test_an_activation_without_an_active_profile_flips_the_pointer_and_cre
 
 
 async def test_a_failed_eval_gate_refuses_the_rubric_activation_unless_the_override_is_acknowledged(
-    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Step 5 on the candidate (Task 20: the new rubric with the active prompt-schema version and policies):
     with 30 of the user's cases and no golden run of it the gate has failed, 409 `eval_gate_failed`; the
     override activates it, recorded on the settings version; the rubric pointer flips and the tuple with
-    it."""
+    it, its activation after `_FLIP`. Before the active pair is verified, the save's own re-check refuses it
+    after the flip, which rolls back with the rest."""
     rubrics = await rubric_versions(engine)
     _, v2 = await prompt_versions(engine)
-    await dry_run_record(engine, v2, POLICY_B_CASES)  # the active pair: an `llm_tuple` save needs it verified
     _, tuple_a = await activate_profile(engine)
     await insert_cases(engine, 30)
     assert (await active(engine)).rubric_version_id == rubrics["v2"]
+    # the save of step 8 re-checks the active policy after the flip: unverified, refused, the flip rolled back
+    r = await activate(logged_in_client, "rubric", rubrics["v1"], {**ACK, "eval_override_ack": True})
+    problem = r.json()
+    assert (r.status_code, problem["code"], problem["detail"]) == (
+        409,
+        "conflict_state",
+        "schema_dry_run_required",
+    )
+    assert (await active(engine)).rubric_version_id == rubrics["v2"]
+    assert (
+        await count_rows(engine, "settings_versions") == 1
+        and await count_rows(engine, "api_idempotency") == 0
+    )
+    await dry_run_record(engine, v2, POLICY_B_CASES)  # the active pair: an `llm_tuple` save needs it verified
     r = await activate(logged_in_client, "rubric", rubrics["v1"], ACK)
     assert (r.status_code, r.json()["code"]) == (409, "eval_gate_failed"), r.text
     assert (await active(engine)).rubric_version_id == rubrics["v2"]
+    seen = SeenAtPoints(monkeypatch)
     r = await activate(logged_in_client, "rubric", rubrics["v1"], {**ACK, "eval_override_ack": True})
     assert r.status_code == 201, r.text
     after = await active(engine)
     assert after.rubric_version_id == rubrics["v1"] and after.llm_tuple_id not in (None, tuple_a)
+    assert seen.seen == [  # the tuple's activation after `_FLIP`, as for the prompt-schema form
+        (save_mod.AFTER_LLM_TUPLE_POINT, tuple_a, tuple_a),
+        (targets.AFTER_CANCEL_POINT, after.llm_tuple_id, after.llm_tuple_id),
+    ]
+    assert await bulk_operations(engine) == {tuple_a: "cancelled", after.llm_tuple_id: "active"}
     async with engine.connect() as conn:
         version = (
             await conn.execute(
@@ -388,6 +408,35 @@ async def test_a_failed_eval_gate_refuses_the_rubric_activation_unless_the_overr
         rubrics["v1"],
     )
     assert r.json()["targets_to_create"] == 30  # the cases' jobs are retained revisions
+
+
+async def test_a_failed_eval_gate_refuses_the_prompt_schema_activation_unless_the_override_is_acknowledged(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """Step 5 for the prompt-schema form: the candidate (version 2 with the active rubric and policies) has no
+    golden run while 30 of the user's cases are active, 409 `eval_gate_failed` with nothing written; the
+    override activates it and is recorded."""
+    v1, v2 = await prompt_versions(engine)
+    await point_prompt_schema_at(engine, v1)
+    _, tuple_a = await activate_profile(engine)
+    await insert_cases(engine, 30)
+    await dry_run_record(engine, v2, POLICY_B_CASES)
+    r = await activate(logged_in_client, "prompt_schema", v2, ACK)
+    assert (r.status_code, r.json()["code"]) == (409, "eval_gate_failed"), r.text
+    assert (await active(engine)).prompt_schema_version_id == v1
+    assert await count_rows(engine, "settings_versions") == 1
+    r = await activate(logged_in_client, "prompt_schema", v2, {**ACK, "eval_override_ack": True})
+    assert r.status_code == 201, r.text
+    after = await active(engine)
+    assert after.prompt_schema_version_id == v2 and after.llm_tuple_id not in (None, tuple_a)
+    async with engine.connect() as conn:
+        override = (
+            await conn.execute(
+                sa.text("SELECT eval_override_ack FROM settings_versions WHERE id = :v"),
+                {"v": after.settings_version_id},
+            )
+        ).scalar_one()
+    assert override is True
 
 
 async def test_the_activation_refuses_an_unknown_or_active_version_and_a_missing_key(

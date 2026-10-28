@@ -29,7 +29,7 @@ from tests.support.batches import (
 )
 from tests.support.llm import FakeLLM
 from tests.support.profile import OpRunner, idem
-from tests.support.scoring import attempt_outcomes, targets_by_state
+from tests.support.scoring import attempt_outcomes, operations_of, targets_by_state
 from tests.support.settings import fresh_key
 
 pytestmark = pytest.mark.integration
@@ -89,11 +89,20 @@ async def test_the_release_of_a_quarantined_submission_re_scores_its_targets(
     assert await targets_by_state(engine, setup.llm_tuple_id) == {"pending": N}
     assert await attempt_outcomes(engine, setup.llm_tuple_id) == {"released": N}
     assert Counter(state for state, _ in await batch_ledger(engine)) == {"ambiguous": N}
+    follow_on = [op for op in await operations_of(engine, "batch_submit") if op.id != setup.operation_id]
+    assert [op.payload for op in follow_on] == [  # the released targets' batch, requested once (Codex r2 B15)
+        {
+            "bulk_operation_id": setup.bulk_operation_id,
+            "llm_tuple_id": setup.llm_tuple_id,
+            "after_submission_id": row.id,
+        }
+    ]
 
     replay = await logged_in_client.post(release_url(row.id), json=CONFIRM, headers=idem(key))
     assert (replay.status_code, replay.json()) == (202, r.json())  # the stored response
     again = await logged_in_client.post(release_url(row.id), json=CONFIRM, headers=idem(fresh_key("release")))
     assert (again.status_code, again.json()["code"]) == (409, "conflict_state")  # released already
+    assert len(await operations_of(engine, "batch_submit")) == 2  # neither the replay nor the 409 asked again
     r = await logged_in_client.post(release_url(10**12), json=CONFIRM, headers=idem(fresh_key("release")))
     assert (r.status_code, r.json()["code"]) == (404, "not_found")
 

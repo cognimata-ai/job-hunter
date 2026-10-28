@@ -1956,8 +1956,8 @@ export interface components {
         };
         /**
          * SpendGroupOut
-         * @description The month's tries of one model, effort and role (`effort` is `null` for a try whose call row was
-         *     purged), and what they count.
+         * @description The month's tries outside eval runs of one model, effort and role (`effort` is `null` for a try whose
+         *     call row was purged), and what they count; the eval runs' tries are `eval_by_model_role`'s.
          */
         SpendGroupOut: {
             /** Calls */
@@ -1982,7 +1982,10 @@ export interface components {
             billed: string;
             bucket: components["schemas"]["BucketOut"];
             bulk_operation: components["schemas"]["BulkOperationOut"] | null;
-            /** By Model Effort Role */
+            /**
+             * By Model Effort Role
+             * @description The month's tries outside eval runs by model, effort and role; the eval runs' tries (golden, canary, schema dry-run) are excluded and counted in `eval_by_model_role`
+             */
             by_model_effort_role: components["schemas"]["SpendGroupOut"][];
             /** C Hat */
             c_hat: string;
@@ -1997,7 +2000,10 @@ export interface components {
             counted: string;
             /** Critic Rate 7D */
             critic_rate_7d: string | null;
-            /** Eval By Model Role */
+            /**
+             * Eval By Model Role
+             * @description The month's tries of eval runs by model and role, from the ledger alone
+             */
             eval_by_model_role: components["schemas"]["EvalSpendGroupOut"][];
             /** Headroom */
             headroom: string;

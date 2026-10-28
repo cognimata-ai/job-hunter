@@ -359,6 +359,39 @@ async def test_the_adoption_decides_nothing_while_a_candidate_cannot_be_read_who
     assert "unread_candidates" not in row.reconcile_report  # the deciding pass read every candidate
 
 
+async def test_an_anomaly_pass_after_a_deferred_one_drops_the_unread_count(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Carry T17-d (fix round 1, item 1): a pass that reads every candidate leaves no `unread_candidates`,
+    the one that raises `batch.custom_id_anomaly` included."""
+    ours = [f"t{t.target_id}_a1" for t in setup.targets]
+    fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=0))
+    await ambiguous(engine, op_runner, setup)
+    fake_llm.batches(BatchScript(polls_until_ended=0))
+    other = await partial_batch(fake_llm, ours, shared=100)  # intersects ours partially
+    real = BatchesClient.results
+
+    async def failing(self: BatchesClient, batch_id: str) -> Any:
+        if batch_id == other:
+            raise BatchApiError("results", status=500, error_class="InternalServerError")
+        return await real(self, batch_id)
+
+    monkeypatch.setattr(BatchesClient, "results", failing)
+    report = await reconcile_ambiguous_once(engine, fake_llm)
+    assert (report.unread, report.anomalies) == (1, 0)
+    (row,) = await submission_rows(engine)
+    assert row.reconcile_report["unread_candidates"] == 1
+    monkeypatch.setattr(BatchesClient, "results", real)
+    report = await reconcile_ambiguous_once(engine, fake_llm)
+    assert (report.unread, report.anomalies, report.adopted) == (0, 1, 0)
+    (row,) = await submission_rows(engine)
+    assert row.state == "submit_ambiguous" and "unread_candidates" not in row.reconcile_report
+
+
 async def test_the_unresolved_alert_and_a_pass_without_a_match_say_whether_a_candidate_was_unread(
     engine: AsyncEngine,
     op_runner: OpRunner,

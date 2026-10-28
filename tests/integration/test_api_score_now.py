@@ -25,8 +25,6 @@ from jobhunter.graphs.score import nodes as nodes_mod
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT
 from jobhunter.observability.alerts import raise_alert
-from jobhunter.scoring import targets as targets_mod
-from jobhunter.scoring.targets import SyntheticJobRefused
 from jobhunter.worker.tasks import job_task_name
 from procrastinate.jobs import Status
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -208,15 +206,10 @@ async def db_now(engine: AsyncEngine) -> Any:
 
 
 async def test_score_now_on_a_synthetic_eval_job_is_not_found(
-    logged_in_client: httpx.AsyncClient,
-    engine: AsyncEngine,
-    queue_app: procrastinate.App,
-    tuple_id: int,
-    monkeypatch: pytest.MonkeyPatch,
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, queue_app: procrastinate.App, tuple_id: int
 ) -> None:
     """Carry T19-d: an adversarial golden case's job is never scored live, even with a target of the active
-    tuple that no creator would make (`create_or_revive` refuses one, `SyntheticJobRefused`); that refusal,
-    were it raised, is a 404 too."""
+    tuple that no creator would make (`create_or_revive` refuses one, `SyntheticJobRefused`)."""
     async with engine.begin() as conn:
         synthetic = await insert_job(conn, synthetic_eval=True)
         target = await insert_target(conn, synthetic, tuple_id)
@@ -225,13 +218,6 @@ async def test_score_now_on_a_synthetic_eval_job_is_not_found(
     assert (r.status_code, r.json()["code"]) == (404, "not_found"), r.text
     assert (await target_row(engine, target)).override == "none"
     assert await generation(engine) == before and await queued_jobs(engine, "score_cycle:score_now") == 0
-
-    async def refusing(*args: Any, **kwargs: Any) -> Any:
-        raise SyntheticJobRefused(synthetic.job_id)
-
-    monkeypatch.setattr(targets_mod, "score_now", refusing)  # the route calls it through the module
-    r = await score_now(logged_in_client, synthetic.job_id, fresh_key("score-now"))
-    assert (r.status_code, r.json()["code"]) == (404, "not_found"), r.text
 
 
 async def test_score_now_needs_a_key_and_replays_its_stored_response(

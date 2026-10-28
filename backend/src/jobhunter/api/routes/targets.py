@@ -11,7 +11,7 @@ the handler, so the key's row rolls back with the rest and a retry with the key 
   (the job's current-revision target of the active tuple to `pending` with its override and lane `score_now`,
   then the `score_now` cycle requested; a running cycle's next claim round, or the waiting job, serves it).
   404 `not_found` for a job without a target of the active tuple, a synthetic golden-case job among them
-  (Carry T19-d: `targets.create_or_revive` refuses one, `SyntheticJobRefused`, a 404 here too); 409
+  (Carry T19-d: `targets.score_now` finds none for it); 409
   `filtered_requires_force` for a filtered-out target without `force`, `budget_exhausted` when the month's
   scoring headroom is below one attempt's first reservation, `conflict_state` for a target being scored,
   batched, published or cancelled.
@@ -51,8 +51,8 @@ from jobhunter.api_idempotency import (
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
 from jobhunter.errors import TransitionConflict
-from jobhunter.scoring import batches, targets
-from jobhunter.scoring.targets import ScoreNowCode, ScoreNowRefused, SyntheticJobRefused
+from jobhunter.scoring import batches, cycles, targets
+from jobhunter.scoring.targets import ScoreNowCode, ScoreNowRefused
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
@@ -62,7 +62,6 @@ RETRY_ROUTE: Final = "targets.retry"
 RELEASE_ROUTE: Final = "batches.release"
 _BIGINT_MAX: Final = 2**63 - 1
 
-_LOCK_ACTIVE_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE")
 _SUBMISSION_EXISTS: Final = q("SELECT EXISTS (SELECT 1 FROM batch_submissions WHERE id = :s)")
 
 _KEY_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
@@ -150,7 +149,7 @@ async def _idempotent(
     """One transaction: `active_config FOR SHARE` (step 2), then `run_idempotent` around `handler` (step
     3)."""
     async with engine.begin() as conn:
-        await conn.execute(_LOCK_ACTIVE_CONFIG)
+        await cycles.lock_active_scoring(conn)  # `active_config FOR SHARE`, step 2
         stored = await run_idempotent(
             conn, route=route, key=key, fingerprint=fingerprint, now=utcnow(), handler=handler
         )
@@ -185,10 +184,7 @@ async def score_now(
     now = utcnow()
 
     async def handler(conn: AsyncConnection) -> StoredResponse:
-        try:
-            moved = await targets.score_now(conn, job_id=job_id, force=body.force, now=now, defer=defer_in_tx)
-        except SyntheticJobRefused:
-            moved = ScoreNowRefused("not_found")  # a golden case's job is never scored live (Carry T19-d)
+        moved = await targets.score_now(conn, job_id=job_id, force=body.force, now=now, defer=defer_in_tx)
         if isinstance(moved, ScoreNowRefused):
             raise _refused(moved, "Job target")
         return StoredResponse(202, TargetMovedOut(target_id=moved.target_id, state=moved.state).model_dump())

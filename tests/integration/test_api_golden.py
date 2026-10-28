@@ -30,6 +30,8 @@ from tests.support.eval import Scored, insert_cases, scored_job, seed_adversaria
 from tests.support.fixtures import count_rows
 from tests.support.llm import ledger_row, reserve_kw
 from tests.support.m3 import insert_id, insert_row
+from tests.support.profile import idem
+from tests.support.settings import fresh_key
 
 pytestmark = pytest.mark.integration
 
@@ -300,7 +302,8 @@ async def test_the_synthetic_confirmed_draft_of_the_seed_is_not_found(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine
 ) -> None:
     """Carry T19-d: the adversarial seed confirms a draft per synthetic profile; none is the user's, so the
-    draft route knows none of them."""
+    draft routes know none of them: the status, the confirm (whose replay of a confirmed draft would otherwise
+    answer its stored body) and the re-score estimate."""
     seeded = await seed_adversarial(engine)
     assert seeded
     async with engine.connect() as conn:
@@ -319,4 +322,12 @@ async def test_the_synthetic_confirmed_draft_of_the_seed_is_not_found(
     assert drafts
     for draft_id in drafts:
         r = await logged_in_client.get(f"/api/profile/drafts/{draft_id}")
+        assert (r.status_code, r.json()["code"]) == (404, "not_found"), r.text
+        r = await logged_in_client.post(
+            f"/api/profile/drafts/{draft_id}/confirm",
+            json={"expected_rescore_ack": True},
+            headers=idem(fresh_key("confirm")),
+        )
+        assert (r.status_code, r.json()["code"]) == (404, "not_found"), r.text
+        r = await logged_in_client.get(f"/api/profile/drafts/{draft_id}/rescore-estimate")
         assert (r.status_code, r.json()["code"]) == (404, "not_found"), r.text

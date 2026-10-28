@@ -69,21 +69,13 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Header, Path, Query
-from pydantic import (
-    AfterValidator,
-    BaseModel,
-    ConfigDict,
-    Field,
-    JsonValue,
-    StringConstraints,
-    field_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, field_validator
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
-from jobhunter.api.models import DecimalOut
+from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
     CURSOR_VERSION,
@@ -294,13 +286,6 @@ class VersionDetailOut(BaseModel):
 
 class RetryApplyOut(BaseModel):
     operation_id: int = Field(description="The new `apply_scope` operation of the active version's scope")
-
-
-def _utc(value: datetime) -> datetime:
-    return value.astimezone(UTC)
-
-
-UtcDatetime = Annotated[datetime, AfterValidator(_utc)]
 
 
 class RubricVersionOut(BaseModel):

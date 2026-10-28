@@ -37,11 +37,15 @@ route: `api.routes.settings`), in this order (Codex r1 #35):
    `schema_dry_run_required`) while the active policy is unverified for it, the state in which the score
    lane is paused anyway (`cycles.pause_reason`'s `schema_unverified`).
 
-Every refusal comes before the first write, so the route's transaction rolls back with nothing of it. The
-outcome (`ShippedActivation`) is §14.2's 201 body (Ruling P41): `{version, llm_tuple_id, targets_to_create,
-bulk_budget_usd}`, `version` the new settings version's number, `targets_to_create` the estimate's count and
-`bulk_budget_usd` the estimate's figure (both 0 without an active profile: no tuple, no bulk operation).
-This module does not log: the route logs the ids after its commit.
+The activation's own refusals (steps 3 to 6) come before its first write. The save's re-checks of step 8 come
+after the step-7 flip and can still refuse (the model-policy check of a rubric activation above; a dry-run
+error of the active document): the save raises, and the route's transaction rolls back with the flip and the
+idempotency row, so nothing of the activation remains and a retry with the key runs again.
+
+The outcome (`ShippedActivation`) is §14.2's 201 body (Ruling P41): `{version, llm_tuple_id,
+targets_to_create, bulk_budget_usd}`, `version` the new settings version's number, `targets_to_create` the
+estimate's count and `bulk_budget_usd` the estimate's figure (both 0 without an active profile: no tuple, no
+bulk operation). This module does not log: the route logs the ids after its commit.
 """
 
 from collections.abc import Mapping

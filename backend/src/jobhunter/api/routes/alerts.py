@@ -11,15 +11,15 @@ open; its first acknowledgement is kept, so a repeat answers the same time. An a
 `jobhunter.api.routes.alerts.utcnow`.
 """
 
-from datetime import UTC, datetime
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Path
-from pydantic import AfterValidator, BaseModel
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.api.deps import get_engine, require_session
 from jobhunter.api.errors import Problem
+from jobhunter.api.models import UtcDatetime
 from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.clock import utcnow
 from jobhunter.observability.alerts import acknowledge_alert
@@ -31,13 +31,9 @@ log = get_logger("jobhunter.api.alerts")
 _BIGINT_MAX: Final = 2**63 - 1
 
 
-def _utc(value: datetime) -> datetime:
-    return value.astimezone(UTC)
-
-
 class AcknowledgedOut(BaseModel):
     id: int
-    acknowledged_at: Annotated[datetime, AfterValidator(_utc)]
+    acknowledged_at: UtcDatetime
 
 
 AlertId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of an alert")]

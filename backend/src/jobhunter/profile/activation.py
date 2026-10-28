@@ -6,7 +6,7 @@ its profile in the caller's **one transaction**, and returns the response `(stat
 `active_config` `FOR UPDATE` first and runs it inside `run_idempotent` (`api.routes.profile`). In order:
 
 1. `active_config` `FOR UPDATE` (a no-op under the route's lock), then the draft `FOR UPDATE`; no such draft
-   is 404 `not_found`.
+   is 404 `not_found`, and so is a draft the adversarial seed confirmed for a synthetic profile (Carry T19-d).
 2. A draft already `confirmed` returns `(201, confirm_response)`: the body its confirm stored, whatever key
    the request carries and whichever profile is active now (Deviation 2). Nothing is written, and the ranking
    generation stays (R21-4).
@@ -125,9 +125,12 @@ _DRAFTS: Final = "profile_drafts"
 _CREATED: Final = 201
 
 _LOCK_ACTIVE: Final = q("SELECT model_policy_id, llm_tuple_id FROM active_config WHERE id = 1 FOR UPDATE")
+# A draft the adversarial seed confirmed for a synthetic profile is the eval's, never the user's: none, as the
+# status route shows it (Carry T19-d).
 _LOCK_DRAFT: Final = q(
     "SELECT status, cv_file_id, native_pdf, reviewed_text, draft_json, confirm_response "
-    "FROM profile_drafts WHERE id = :d FOR UPDATE"
+    "FROM profile_drafts d WHERE id = :d AND NOT EXISTS (SELECT 1 FROM profile_versions v "
+    "WHERE v.id = d.confirmed_profile_version_id AND v.synthetic_eval) FOR UPDATE"
 )
 # The user's versions only: an adversarial seed's synthetic version is the eval's, never reused by a confirm
 # nor counted in the user's `version_no` (Rulings T19-a, T19-c; `scoring.golden.SYNTHETIC_VERSION_BASE`).

@@ -34,7 +34,6 @@ from jobhunter.api_idempotency import (
 )
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
-from jobhunter.db.sql import q
 from jobhunter.embeddings import EmbedderClient
 from jobhunter.observability.health import SystemHealthOut, check_readiness, system_health
 from jobhunter.scoring import cycles
@@ -46,7 +45,6 @@ router = APIRouter(prefix="/api/system", dependencies=[Depends(require_session)]
 
 SCORE_CYCLE_ROUTE: Final = "system.score_cycle"
 NO_PENDING: Final = "no_pending"
-_LOCK_ACTIVE_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE")
 
 
 class ScoreCycleOut(BaseModel):
@@ -113,7 +111,7 @@ async def request_score_cycle(
         return StoredResponse(202, ScoreCycleOut(queued=queued, reason=reason).model_dump(mode="json"))
 
     async with engine.begin() as conn:
-        await conn.execute(_LOCK_ACTIVE_CONFIG)  # the first lock (§9.1), before the key's row
+        await cycles.lock_active_scoring(conn)  # `active_config FOR SHARE` (§9.1), before the key's row
         stored = await run_idempotent(
             conn,
             route=SCORE_CYCLE_ROUTE,
