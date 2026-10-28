@@ -49,6 +49,15 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="ID",
         help="the prompt-schema version to dry-run (default: the active one)",
     )
+    policy = dry_run.add_mutually_exclusive_group()
+    policy.add_argument(
+        "--model-policy", type=int, metavar="ID", help="the model policy to dry-run (default: the active one)"
+    )
+    policy.add_argument(
+        "--candidate-payload",
+        metavar="FILE",
+        help="a settings document (JSON) whose model policy is staged by hash, then dry-run",
+    )
     _add_golden_commands(commands)
     _add_eval_commands(commands)
     return parser

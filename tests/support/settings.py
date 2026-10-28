@@ -49,6 +49,10 @@ Task 22 (fix round 1) adds the save that has not committed yet:
   save's version. Leaving the block without `commit()` rolls the save back;
 - `change_interval(payload)`: an `edit` for it that changes `schedule.interval_hours` (class `schedule`, so
   no scope apply and no job).
+
+M3 Task 20 adds the `fake_llm_process` fixture: this process on the fake LLM (`JOBHUNTER_FAKE_LLM` set, as
+the dev stack's fake overlay and a test of the save's actions run), where the eval gate counts fake runs and
+an `llm_tuple` save needs no live schema dry-run (`settings.save._check_eval_gate`).
 """
 
 import asyncio
@@ -424,3 +428,9 @@ def operation_status_sync(server: PgServer, op_id: int) -> str:
 def seeded_jobs_sync(migrated: PgServer) -> list[int]:
     """`SEEDED_JOBS` jobs with the active scope's results, committed (module docstring); their ids."""
     return _on_own_engine(migrated, lambda engine: insert_jobs(engine, SEEDED_JOBS))
+
+
+@pytest.fixture
+def fake_llm_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This process on the fake LLM (module docstring): `JOBHUNTER_FAKE_LLM` set for the test only."""
+    monkeypatch.setenv("JOBHUNTER_FAKE_LLM", "1")

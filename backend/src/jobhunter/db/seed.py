@@ -209,22 +209,38 @@ _INSERT_EVALUATION_POLICY = q(
 )
 
 
-async def ensure_evaluation_policy(conn: AsyncConnection, payload: dict[str, JSONValue]) -> int:
+async def ensure_evaluation_policy(
+    conn: AsyncConnection, payload: dict[str, JSONValue], *, now: datetime | None = None
+) -> int:
     """The id of the `evaluation_policies` row whose hash is the content hash of `payload`, created when
-    absent with `version_no = max + 1` and `DEFAULT_PROJECTED_CRITIC_RATE` (§11.7.4: no history to replay
-    before M3).
+    absent with `version_no = max + 1` and its projected critic rate (§11.7.4 L4480, M3 Task 20): with `now`,
+    the replay of its thresholds over the round-0 drafts of the 30 days before `now`
+    (`evaluation_policy.replay_projected_critic_rate`), or `DEFAULT_PROJECTED_CRITIC_RATE` when fewer than 50
+    exist; without `now` (the migrate seed: a first installation has no history) the central estimate. The
+    rate is fixed at the creation: a payload that finds its row keeps the row's rate, and nothing is replayed.
 
     Two writers that create different policies at once would race for one `version_no`: the loser's insert
     does nothing and its read finds no row (`NoResultFound`). The writers are serialised instead: a settings
-    save holds `active_config` `FOR UPDATE` (§13.3), and the seed runs under the `migrate` lock.
+    save and a candidate's staging hold `active_config` `FOR UPDATE` (§13.3), and the seed runs under the
+    `migrate` lock.
     """
     digest = content_hash(payload)
+    found = (await conn.execute(_EVALUATION_POLICY, {"hash": digest})).scalar_one_or_none()
+    if found is not None:
+        return int(found)
+    rate = DEFAULT_PROJECTED_CRITIC_RATE
+    if now is not None:
+        # Imported here: `scoring.evaluation_policy` imports the settings model, which imports this module.
+        from jobhunter.scoring.evaluation_policy import EvaluationPolicy, replay_projected_critic_rate
+
+        replayed = await replay_projected_critic_rate(conn, EvaluationPolicy.from_payload(payload), now=now)
+        rate = DEFAULT_PROJECTED_CRITIC_RATE if replayed is None else replayed
     return await ensure_id(
         conn,
         _EVALUATION_POLICY,
         _INSERT_EVALUATION_POLICY,
         {"hash": digest},
-        {"hash": digest, "payload": payload, "rate": DEFAULT_PROJECTED_CRITIC_RATE},
+        {"hash": digest, "payload": payload, "rate": rate},
     )
 
 

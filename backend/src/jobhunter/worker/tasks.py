@@ -1,6 +1,6 @@
 """The procrastinate app, the task blueprint and deferring inside the caller's transaction (spec §3.3.2).
 
-`blueprint` declares the eight tasks. `make_queue_app` builds the process's *task app* (the blueprint under
+`blueprint` declares the nine tasks. `make_queue_app` builds the process's *task app* (the blueprint under
 the namespace `jh`, so a task is named `jh:<name>`) on a psycopg pool; `defer_in_tx` inserts a job through the
 caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back with the caller's own writes
 (spike V1). Correctness never rests on it: every mutation that needs follow-up work also leaves a durable
@@ -11,7 +11,9 @@ The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12)
 worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running, ledger
 L312), M3 Task 17's periodic `batch_poll` (every 5 min) and `batch_reconcile_ambiguous` (every 15 min) on
 `aux`, each with the queueing lock of its name (`scoring.batch_results`, `scoring.batch_adoption`: Task 27
-registers and pins them), and M3 Task 11's `score_cycle(trigger)` on the `score` queue
+registers and pins them), M3 Task 20's periodic `canary_daily` (`41 6 * * *`) on the `tick` queue with the
+queueing lock of its name (`eval_runner.start_canary_run`; Task 27 registers and pins it, Ruling P33), and M3
+Task 11's `score_cycle(trigger)` on the `score` queue
 (`graphs.score.graph.execute_cycle`: one cycle, created by its first transaction, never resumed). The tick
 runs the score lane's trigger (`tick.tick_score`, §3.4 step 6) after its scheduling step, in a transaction of
 its own. Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
@@ -68,6 +70,7 @@ TaskName = Literal[
     "score_cycle",
     "batch_poll",
     "batch_reconcile_ambiguous",
+    "canary_daily",
 ]
 # The tasks whose stalled job is failed outright, never retried (`_release_one`, Codex r1 #17; M2
 # Carry-forward I4): a retried `score_cycle` would find its cycle still `running` and start nothing until the
@@ -290,6 +293,23 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
     await run_reconcilers(_reconcile_context(rt), "daily")
     if failure is not None:
         raise failure
+
+
+# M3 Task 20 (L285, L4632; Ruling P33): the daily canary run on the `tick` queue, one waiting job.
+@blueprint.periodic(cron="41 6 * * *")
+@blueprint.task(name="canary_daily", queue="tick", queueing_lock="canary_daily", pass_context=True)
+async def canary_daily(context: JobContext, timestamp: int) -> None:
+    """A canary run of the active configuration and its `eval_run` operation, in one transaction
+    (`eval_runner.start_canary_run`: nothing without a tuple or an active canary), on the worker's transport;
+    the `eval_run` handler on `aux` scores it."""
+    # Imported here: the eval runner imports this module (`Deferrer`) and pulls in the score steps.
+    from jobhunter.scoring.eval_runner import start_canary_run
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    async with rt.engine.begin() as conn:
+        await start_canary_run(
+            conn, transport="fake" if rt.cfg.fake_llm else "live", now=utcnow(), defer=defer_in_tx
+        )
 
 
 # The blueprint can be added to one app only (adding it namespaces its tasks), so a process has one task app.

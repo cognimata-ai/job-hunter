@@ -11,24 +11,31 @@ earlier one. The payloads are the settings document's own objects, as `db.seed` 
 - the model policy is `scoring.model_policy`, the execution config `scoring.execution`, the evaluation policy
   `evaluation`.
 
-A new evaluation policy takes `version_no = max + 1` and `projected_critic_rate =
-DEFAULT_PROJECTED_CRITIC_RATE`, the §21.2 central 0.450: §11.7.4's replay needs the round-0 drafts of M3
-(`seed.ensure_evaluation_policy`, Deviation 16).
+A new evaluation policy takes `version_no = max + 1` and its projected critic rate: with the caller's `now`
+(a save, a candidate's staging) §11.7.4's replay over the round-0 drafts of the 30 days before it, or the
+§21.2 central 0.450 below 50 drafts; without `now` the central estimate (`seed.ensure_evaluation_policy`; M3
+Task 20 closes M2 Deviation 16). The callers that pass none (the profile activation, the scope retry) derive
+the active settings, whose evaluation policy row exists already.
 
 `active_profile(conn, profile_version_id)` is the profile a scope is resolved with: the settings save and
 retry-apply (Task 18) pass the active one.
+
+`candidate_of(conn, settings)` is the eval gate's candidate of a proposed document (M3 Task 20): the active
+rubric and prompt-schema versions with the content hashes of its model policy and evaluation payloads.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.db.seed import ensure_evaluation_policy, ensure_hashed, scope_payload
+from jobhunter.db.seed import content_hash, ensure_evaluation_policy, ensure_hashed, scope_payload
 from jobhunter.db.sql import q
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.normalize.titles import SENIORITY_LADDER
 from jobhunter.settings.model import Settings
+from jobhunter.settings.validate import Candidate
 from jobhunter.types import JSONValue, get_object
 
 _PROFILE: Final = q("SELECT profile_json FROM profile_versions WHERE id = :id")
@@ -84,8 +91,11 @@ def derived(settings: Settings, *, profile: ConfirmedProfile | None = None) -> D
     )
 
 
-async def ensure_derived(conn: AsyncConnection, d: DerivedPayloads) -> DerivedIds:
-    """The ids of the rows of `d`, each found by its content hash or inserted, in the caller's transaction.
+async def ensure_derived(
+    conn: AsyncConnection, d: DerivedPayloads, *, now: datetime | None = None
+) -> DerivedIds:
+    """The ids of the rows of `d`, each found by its content hash or inserted, in the caller's transaction; a
+    new evaluation policy's rate is replayed at `now` (module docstring).
 
     A settings save calls it holding `active_config` `FOR UPDATE` (§13.3), which serialises the evaluation
     policies' `version_no` (`seed.ensure_evaluation_policy`).
@@ -94,7 +104,7 @@ async def ensure_derived(conn: AsyncConnection, d: DerivedPayloads) -> DerivedId
         scope_version_id=await ensure_hashed(conn, "scope_versions", d.scope),
         model_policy_id=await ensure_hashed(conn, "model_policies", d.model_policy),
         execution_config_id=await ensure_hashed(conn, "execution_configs", d.execution),
-        evaluation_policy_id=await ensure_evaluation_policy(conn, d.evaluation),
+        evaluation_policy_id=await ensure_evaluation_policy(conn, d.evaluation, now=now),
     )
 
 
@@ -105,3 +115,24 @@ async def active_profile(conn: AsyncConnection, profile_version_id: object) -> C
         return None
     profile_json = (await conn.execute(_PROFILE, {"id": profile_version_id})).scalar_one()
     return None if profile_json is None else ConfirmedProfile.model_validate(profile_json)
+
+
+_POINTERS: Final = q("SELECT rubric_version_id, prompt_schema_version_id FROM active_config WHERE id = 1")
+
+
+async def candidate_of(conn: AsyncConnection, settings: Settings) -> Candidate:
+    """The eval gate's candidate of a proposed settings document (§11.13, M3 Task 20): the active rubric and
+    prompt-schema versions (no settings document changes them) and the content hashes of its model policy and
+    evaluation payloads, the hashes `ensure_derived` would find or insert their rows by, so the candidate of a
+    payload whose rows do not exist yet is defined too. A plain read; `LookupError` when either pointer is
+    unset (`migrate` seeds both)."""
+    pointers = (await conn.execute(_POINTERS)).one()
+    if pointers.rubric_version_id is None or pointers.prompt_schema_version_id is None:
+        raise LookupError("active_config has no rubric or prompt-schema version (migrate seeds both)")
+    d = derived(settings)
+    return Candidate(
+        rubric_version_id=int(pointers.rubric_version_id),
+        prompt_schema_version_id=int(pointers.prompt_schema_version_id),
+        model_policy_hash=content_hash(d.model_policy),
+        evaluation_policy_hash=content_hash(d.evaluation),
+    )

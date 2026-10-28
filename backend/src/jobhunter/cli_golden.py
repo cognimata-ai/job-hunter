@@ -1,4 +1,5 @@
-"""The `golden` and `eval` commands (spec §11.13 L4610-4613, §18.6; M3 plan Task 19, R2, Codex r2 B20, B21).
+"""The `golden` and `eval` commands (spec §11.13 L4610-4613, §18.6; M3 plan Tasks 19 and 20, R2, Codex r1 #34,
+r2 B20, B21).
 
 `cli.main` parses them (its parsers need no import of this module) and imports this module only when one of
 them runs. Both start like the worker (the worker-role config
@@ -18,12 +19,20 @@ and its startup assertions) and work on the installation's database, where the g
   dry-run validates it and its derived rows are staged by hash in a short transaction of their own
   (`eval_runner.stage_candidate`, Codex r2 B21), then the run is started against those ids.
 
-The output is ids, counts, codes and amounts only (stdout: the summary; stderr: the logs and the run's id at
-its start), never content or a key. An error prints its class only (SQLAlchemy puts bound values into its
-messages). Exit status: 0 for a completed run or a seed, 1 for a failed run (or a wait the database broke),
-2 when nothing could start: a malformed candidate, a payload the dry-run refuses, no active rubric or
-prompt-schema version (`LookupError`), a fixture changed since its seed (`golden.FixtureChanged`), invalid
-fixtures or a database error, each one line on stderr.
+  Nothing is inserted, so nothing is paid, when a candidate id names no row or the active configuration has no
+  rubric or prompt-schema version (`eval_runner.NoCandidate`), or when the run's kind has no active case
+  (`eval_runner.NoActiveCases`, `eval_no_cases`; M3 Task 20, Codex r1 #34). Once the run has ended it prints
+  the run's case table in Markdown (`case_table`: each case repetition's case, source, label, outcome,
+  `score_mid`, binding knockouts and expected knockouts, the table the manual workflow uploads), then the
+  summary line with the gate's state.
+
+The output is ids, counts, codes and amounts only (stdout: the case table and the summary; stderr: the logs
+and the run's id at its start), never content or a key. An error prints its class only (SQLAlchemy puts bound
+values into its messages). Exit status: 0 for a completed run or a seed, 1 for a failed run (or a wait the
+database broke), 2 when nothing could start: a malformed candidate, a payload the dry-run refuses, no
+candidate (`NoCandidate`, caught by name so that any other `LookupError` keeps its traceback, carry T19-e), no
+active case, a fixture changed since its seed (`golden.FixtureChanged`), invalid fixtures or a database error,
+each one line on stderr.
 """
 
 import argparse
@@ -46,7 +55,17 @@ from jobhunter.db.sql import q
 from jobhunter.observability.logging import configure_logging
 from jobhunter.scoring import eval_runner, golden
 from jobhunter.scoring.eval_fixtures import adversarial_dir
-from jobhunter.scoring.eval_runner import Candidate, CandidateInvalid, Route, RunKind, StartedRun, Transport
+from jobhunter.scoring.eval_runner import (
+    Candidate,
+    CandidateInvalid,
+    NoActiveCases,
+    NoCandidate,
+    Route,
+    RunCase,
+    RunKind,
+    StartedRun,
+    Transport,
+)
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import defer_in_tx
 
@@ -89,10 +108,44 @@ def read_payload(path: Path) -> JSONValue:
 
 
 def summary(*, eval_run_id: int, status: str, metrics: JSONValue, cost: str) -> str:
-    """The summary line of a run's end: its id, status, failure code (when failed) and cost."""
+    """The summary line of a run's end: its id, status, failure code (when failed), the gate's state (when the
+    run completed) and cost."""
     failed = metrics.get("failed") if isinstance(metrics, dict) else None
+    gate = metrics.get("gate") if isinstance(metrics, dict) else None
     reason = f" failed={failed}" if isinstance(failed, str) else ""
-    return f"eval_run={eval_run_id} status={status}{reason} cost_usd={cost}"
+    gated = f" gate={gate}" if isinstance(gate, str) else ""
+    return f"eval_run={eval_run_id} status={status}{reason}{gated} cost_usd={cost}"
+
+
+_TABLE_HEAD: Final = (
+    "| case | source | label | repetition | outcome | score_mid | binding knockouts | expected knockouts |",
+    "|---:|---|---|---:|---|---:|---|---|",
+)
+
+
+def table_lines(rows: list[RunCase]) -> list[str]:
+    """The run's case table in Markdown (module docstring): ids, codes and numbers only."""
+    lines = list(_TABLE_HEAD)
+    for row in rows:
+        result = row.result
+        score = "" if result.score_mid is None else str(result.score_mid)
+        binding = ", ".join(result.knockouts_applied) or "-"
+        expected = ", ".join(row.case.expected_knockouts) or "-"
+        lines.append(
+            f"| {result.golden_case_id} | {row.source} | {row.case.label} | {result.repetition} | "
+            f"{result.outcome} | {score} | {binding} | {expected} |"
+        )
+    return lines
+
+
+async def case_table(cfg: AppConfig, eval_run_id: int) -> list[str]:
+    """The case table of run `eval_run_id` (`table_lines` of `eval_runner.run_cases`)."""
+    engine = make_engine(cfg, pool_size=1)
+    try:
+        async with engine.connect() as conn:
+            return table_lines(await eval_runner.run_cases(conn, eval_run_id))
+    finally:
+        await engine.dispose()
 
 
 async def seed(cfg: AppConfig, directory: Path) -> golden.Seeded:
@@ -122,7 +175,7 @@ async def start(
     try:
         if payload is not None:
             async with engine.begin() as conn:
-                candidate = await eval_runner.stage_candidate(conn, payload)
+                candidate = await eval_runner.stage_candidate(conn, payload, now=now)
         async with engine.begin() as conn:
             chosen = await eval_runner.active_candidate(conn) if candidate is None else candidate
             return await eval_runner.start_run(
@@ -211,8 +264,11 @@ def run_eval_command(args: argparse.Namespace) -> int:
         fields = ", ".join(f"{issue.field} ({issue.code})" for issue in invalid.issues)
         print(f"eval run: the candidate payload is invalid: {fields}", file=sys.stderr)
         return NOT_STARTED
-    except LookupError as missing:  # no active rubric or prompt-schema version: its message names them only
+    except NoCandidate as missing:  # its message names the kind and the id only
         print(f"eval run: no candidate to run: {missing}", file=sys.stderr)
+        return NOT_STARTED
+    except NoActiveCases as none:
+        print(f"eval run: {none.code}: {none}", file=sys.stderr)
         return NOT_STARTED
     except SQLAlchemyError as exc:
         print(f"eval run: database error ({type(exc).__name__})", file=sys.stderr)
@@ -220,9 +276,12 @@ def run_eval_command(args: argparse.Namespace) -> int:
     print(f"eval run: eval_run={started.eval_run_id} started, waiting for the worker", file=sys.stderr)
     try:
         end = asyncio.run(wait(cfg, started.eval_run_id))
+        table = asyncio.run(case_table(cfg, started.eval_run_id))
     except SQLAlchemyError as exc:
         print(f"eval run: database error ({type(exc).__name__})", file=sys.stderr)
         return FAILED
+    for line in table:
+        print(line)
     print(
         summary(
             eval_run_id=started.eval_run_id, status=end.status, metrics=end.metrics, cost=str(end.cost_usd)

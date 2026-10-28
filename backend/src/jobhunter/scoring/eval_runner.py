@@ -1,15 +1,22 @@
-"""The eval runner (spec §11.13 L4610-4613, §20.2 L6362; plan Task 19, R2, Rulings P17, P26, P33, round-4
-ruling (a), Deviation 29, Codex r1 #29-#31, r2 B18-B22, r3 B4-B7, r4 B4-B7, r5 B2, B8): the `eval_run`
-operation, which scores a candidate configuration on the golden cases outside the target table.
+"""The eval runner (spec §11.13 L4610-4632, §17.6 L5618, §20.2 L6362; plan Tasks 19 and 20, R2, Rulings P17,
+P26, P33, round-4 ruling (a), Deviation 29, Codex r1 #29-#31, #33, #34, r2 B18-B22, r3 B4-B7, r4 B4-B7, B10,
+r5 B2, B8): the `eval_run` operation, which scores a candidate configuration on the golden cases outside the
+target table, and calibrates it.
 
 **A run** (`eval_runs`, `kind` `golden` or `canary`) is inserted with its operation in one transaction
-(`start_run`: the CLI's `jobhunter eval run` and, later, `canary_daily`), payload `{"eval_run_id"}`, dedup key
-`eval_run:<id>`, `metrics = {"transport_requested": "live" | "fake"}`, `repetitions` 2 for a golden run and 1
-for a canary run. Its candidate is the five ids of the row (`Candidate`): the active configuration's
-(`active_candidate`) or a staged one (`stage_candidate`: a settings document validated as the settings
-dry-run validates it, its derived rows inserted by content hash under `active_config FOR UPDATE`, the lock
-`derive.ensure_derived` relies on to serialise `evaluation_policies.version_no`; no settings version, no
-activation; a later save of the document finds the same rows, so the gate's run is the candidate's).
+(`start_run`: the CLI's `jobhunter eval run` and `canary_daily`'s `start_canary_run`), payload
+`{"eval_run_id"}`, dedup key `eval_run:<id>`, `metrics = {"transport_requested": "live" | "fake"}`,
+`repetitions` 2 for a golden run and 1 for a canary run. It is refused before its row, so before any paid
+call (Codex r1 #34): `NoCandidate` when an id of its candidate names no row, `NoActiveCases`
+(`eval_no_cases`) when its kind has no active case. Its candidate is the five ids of the row (`Candidate`):
+the active configuration's (`active_candidate`) or a staged one (`stage_candidate`: a settings document
+validated as the settings dry-run validates it, the gate's own refusal of generator effort `low` aside, since
+the run measures that gate; its derived rows inserted by content hash under `active_config FOR UPDATE`, the
+lock `derive.ensure_derived` relies on to serialise `evaluation_policies.version_no`, a new evaluation
+policy's projected critic rate replayed; no settings version, no activation; a later save of the document
+finds the same rows, so the gate's run is the candidate's). `start_canary_run` (the `canary_daily` task,
+L4632) starts a canary run of the active configuration when a tuple is active and an active canary exists,
+under `active_config FOR SHARE`, and nothing otherwise.
 
 **The handler** (`eval_run`, `run_eval`) builds the score steps' dependencies from today's `OperationDeps`
 fields (`cfg`, `gateway`, `clock`; Ruling P33, `worker/operations.py`; Task 27 moves them). **The owner is the
@@ -61,12 +68,18 @@ repetition in case-id order over the cases whose first has a numeric `score_mid`
 two numeric results, `MAX_RETEST_TRIES` were attempted or the cases are exhausted; the execution's own list
 of results is the progress. A canary run scores once.
 
-**The end**: `running → completed` with `metrics = {"transport", "transport_requested", "cases",
-"repetitions"}` (`cases = {"active", "fenced", "deleted", "outcomes"}`, the outcomes counted by repetition:
-`{"1": {outcome: n}, "2": …}`), `passed = NULL` (Ruling P17: the calibration and the gate are Task 20's)
-and the `cost_usd` its calls count, and the operation `succeeded` through `op.finish_in` in the same
-transaction (the fault points `eval.before_terminal_commit`, its last statement, and
-`eval.after_terminal_commit`).
+**The end**, one transaction under the owner's lock: `running → completed` with `metrics = {"transport",
+"transport_requested", "cases", "repetitions"}` (`cases = {"active", "fenced", "deleted", "outcomes"}`, the
+outcomes counted by repetition: `{"1": {outcome: n}, "2": …}`) and, merged beside them (Ruling P17, Task 20),
+the calibration of the run's case rows (`run_cases`, `calibration.metrics` against the candidate's projected
+critic rate, its model policy's §21.2 central cost and the trailing 7-day similarity-lane cut-off;
+`calibration.metrics_json`, with the gate's state and, when it failed, `failed`), `passed` from
+`calibration.gate` over the run's active cases (a golden run only: `NULL` while uncalibrated and for a canary
+run) and the `cost_usd` its calls count; then its alerts (`eval.gate_failed`, warn, for a production golden
+run that failed, the candidate its subject; `scoring.canary_drift`, warn, for each canary of a canary run more
+than 8 points from its first score under its key, the case its subject: `calibration.canary_drift`, after the
+`completed`, so a first run is its own baseline); and the operation `succeeded` through `op.finish_in` (the
+fault points `eval.before_terminal_commit`, its last statement, and `eval.after_terminal_commit`).
 
 Nothing here logs content: ids, counts, codes, outcomes and amounts only.
 """
@@ -74,9 +87,9 @@ Nothing here logs content: ids, counts, codes, outcomes and amounts only.
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Final, Literal
+from typing import Final, Literal, get_args
 
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -91,9 +104,10 @@ from jobhunter.llm.pricing import Effort
 from jobhunter.llm.prompts.render import PromptVersion, ScoreRole, load_prompt_version, score_schema
 from jobhunter.llm.prompts.render import PromptVersionUnscorable as PromptVersionUnscorableError
 from jobhunter.llm.spend_ledger import EvalRunOwner
+from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import ScopeSettings, scope_from_payload
-from jobhunter.scoring import evaluation_policy, filters, golden, publication, routing, steps
+from jobhunter.scoring import calibration, evaluation_policy, filters, golden, publication, routing, steps
 from jobhunter.scoring.publication import Publication, PublicationInvalid, PublishMode
 from jobhunter.scoring.routing import Next
 from jobhunter.scoring.rubric import Rubric
@@ -112,7 +126,9 @@ from jobhunter.scoring.triggers import TRIGGERS, Trigger, golden_sample_key
 from jobhunter.scoring.validator import QUOTE_FAILURE_CODES, DraftValidation, ParsedGenerator
 from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import unknown_references
-from jobhunter.settings.validate import FieldIssue, eval_gate_state, validate_fields
+from jobhunter.settings.llm_projection import central_cost_per_target
+from jobhunter.settings.model import ModelPolicy
+from jobhunter.settings.validate import FieldIssue, GateState, validate_fields
 from jobhunter.types import JSONValue, get_int, get_object
 from jobhunter.worker.operations import (
     EVAL_RUN_COST_SQL,
@@ -130,7 +146,7 @@ KIND: Final = "eval_run"
 RunKind = Literal["golden", "canary"]
 Route = Literal["production", "forced_critic"]
 Transport = Literal["live", "fake"]
-Outcome = Literal["accepted", "contested", "refused", "failed", "filtered_out"]
+Outcome = calibration.Outcome
 Skip = Literal["fenced", "deleted"]  # a case repetition with no row (module docstring, step 1)
 
 RETEST_CASES: Final = 10  # §11.13 L4613: test-retest runs 10 cases twice
@@ -168,6 +184,23 @@ class StartedRun:
     operation_id: int
 
 
+class NoCandidate(LookupError):
+    """No candidate to run (carry T19-e): an id of the candidate names no row, or the active configuration has
+    no rubric or prompt-schema version. Its message names the kind and the id only. A `LookupError`, so a
+    caller that catches it by name lets any other lookup bug keep its traceback."""
+
+
+class NoActiveCases(Exception):
+    """A run of a kind with no active case to score (`eval_no_cases`, Codex r1 #34), refused before its
+    row."""
+
+    code: Final = "eval_no_cases"
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        super().__init__(f"no active {kind} case")
+
+
 class CandidateInvalid(Exception):
     """A candidate settings document the settings dry-run refuses: its field issues (paths and codes; the
     messages never repeat a value)."""
@@ -185,6 +218,24 @@ _LOCK_ACTIVE: Final = q(
     "SELECT rubric_version_id, prompt_schema_version_id, profile_version_id FROM active_config WHERE id = 1 "
     "FOR UPDATE"
 )
+# Whether each id of a candidate names a row, and whether the run's kind has an active case to score.
+_RESOLVES: Final = q(
+    "SELECT EXISTS (SELECT 1 FROM rubric_versions WHERE id = :rubric) AS rubric, "
+    "EXISTS (SELECT 1 FROM prompt_schema_versions WHERE id = :prompt) AS prompt, "
+    "EXISTS (SELECT 1 FROM model_policies WHERE id = :model_policy) AS model_policy, "
+    "EXISTS (SELECT 1 FROM evaluation_policies WHERE id = :evaluation_policy) AS evaluation_policy, "
+    "EXISTS (SELECT 1 FROM execution_configs WHERE id = :execution) AS execution, "
+    "EXISTS (SELECT 1 FROM golden_cases WHERE active AND (is_canary OR NOT :canaries)) AS cases"
+)
+_CANDIDATE_KINDS: Final = (
+    ("rubric", "rubric version"),
+    ("prompt", "prompt-schema version"),
+    ("model_policy", "model policy"),
+    ("evaluation_policy", "evaluation policy"),
+    ("execution", "execution config"),
+)
+# The candidate's validation in a staging: the gate is what the run measures (`stage_candidate`).
+_STAGING_GATE: Final[GateState] = "uncalibrated"
 _INSERT_RUN: Final = q(
     "INSERT INTO eval_runs (kind, route, rubric_version_id, prompt_schema_version_id, model_policy_id, "
     "evaluation_policy_id, execution_config_id, repetitions, status, metrics, started_at) VALUES (:kind, "
@@ -198,7 +249,7 @@ async def active_candidate(conn: AsyncConnection) -> Candidate:
     """The active configuration as a candidate (`--candidate active`)."""
     row = (await conn.execute(_ACTIVE)).one()
     if row.rubric_version_id is None or row.prompt_schema_version_id is None:
-        raise LookupError("active_config has no rubric or prompt-schema version (migrate seeds both)")
+        raise NoCandidate("active_config has no rubric or prompt-schema version (migrate seeds both)")
     return Candidate(
         int(row.rubric_version_id),
         int(row.prompt_schema_version_id),
@@ -208,24 +259,26 @@ async def active_candidate(conn: AsyncConnection) -> Candidate:
     )
 
 
-async def stage_candidate(conn: AsyncConnection, payload: JSONValue) -> Candidate:
+async def stage_candidate(conn: AsyncConnection, payload: JSONValue, *, now: datetime) -> Candidate:
     """The candidate of a settings document that may not exist as rows yet (`--candidate-payload`; Codex r2
     B21, r3 B7), in the caller's transaction: `active_config FOR UPDATE` first (it serialises the new
     evaluation policy's `version_no = max + 1` with a save and with another staging), the document validated
     as the settings dry-run validates it (`CandidateInvalid`, before any row), then its derived rows found or
     inserted by content hash (`derive.ensure_derived`, the scope resolved with the active profile as a save
-    resolves it). No settings version is written and no pointer moves: the rubric and prompt-schema version
-    are the active ones."""
+    resolves it; a new evaluation policy's projected critic rate replayed at `now`, M3 Task 20). No settings
+    version is written and no pointer moves: the rubric and prompt-schema version are the active ones. The
+    gate's own refusal (generator effort `low` while the gate failed) does not apply: the run measures the
+    candidate's gate, so it cannot wait for it."""
     pointers = (await conn.execute(_LOCK_ACTIVE)).one()
-    settings, issues = validate_fields(payload, gate=await eval_gate_state(conn))
+    settings, issues = validate_fields(payload, gate=_STAGING_GATE)
     if settings is not None:
         issues = await unknown_references(conn, settings)
     if settings is None or issues:
         raise CandidateInvalid(issues)
     if pointers.rubric_version_id is None or pointers.prompt_schema_version_id is None:
-        raise LookupError("active_config has no rubric or prompt-schema version (migrate seeds both)")
+        raise NoCandidate("active_config has no rubric or prompt-schema version (migrate seeds both)")
     profile = await active_profile(conn, pointers.profile_version_id)
-    ids = await ensure_derived(conn, derived(settings, profile=profile))
+    ids = await ensure_derived(conn, derived(settings, profile=profile), now=now)
     log.info(
         "eval_candidate_staged",
         model_policy_id=ids.model_policy_id,
@@ -252,7 +305,22 @@ async def start_run(
     defer: Deferrer | None,
 ) -> StartedRun:
     """Insert an eval run of `candidate` and its `eval_run` operation in the caller's transaction (module
-    docstring); `defer` defers the operation's job (`None`: the `operations` reconciler re-defers it)."""
+    docstring); `defer` defers the operation's job (`None`: the `operations` reconciler re-defers it). Refused
+    before the row, so before any paid call (Codex r1 #34): `NoCandidate` when an id of the candidate names no
+    row, `NoActiveCases` when the kind has no active case (a canary run: no active canary)."""
+    ids = {
+        "rubric": candidate.rubric_version_id,
+        "prompt": candidate.prompt_schema_version_id,
+        "model_policy": candidate.model_policy_id,
+        "evaluation_policy": candidate.evaluation_policy_id,
+        "execution": candidate.execution_config_id,
+    }
+    resolves = (await conn.execute(_RESOLVES, {**ids, "canaries": kind == "canary"})).one()
+    for key, name in _CANDIDATE_KINDS:
+        if not getattr(resolves, key):
+            raise NoCandidate(f"{name} {ids[key]} does not exist")
+    if not resolves.cases:
+        raise NoActiveCases(kind)
     params = {
         "kind": kind,
         "route": route,
@@ -278,6 +346,46 @@ async def start_run(
         transport_requested=transport_requested,
     )
     return StartedRun(eval_run_id, operation_id)
+
+
+# The canary start's first lock (§9.1, step 2): the active configuration it runs, read under `FOR SHARE`.
+_ACTIVE_FOR_CANARY: Final = q(
+    "SELECT llm_tuple_id, rubric_version_id, prompt_schema_version_id, model_policy_id, "
+    "evaluation_policy_id, execution_config_id FROM active_config WHERE id = 1 FOR SHARE"
+)
+_ACTIVE_CANARY: Final = q("SELECT EXISTS (SELECT 1 FROM golden_cases WHERE active AND is_canary)")
+
+
+async def start_canary_run(
+    conn: AsyncConnection, *, transport: Transport, now: datetime, defer: Deferrer | None
+) -> StartedRun | None:
+    """The `canary_daily` task's work (§11.13 L4632, M3 Task 20), in the caller's transaction: with a tuple
+    active and at least one active canary, a canary run of the active configuration on the production route
+    and its operation (`start_run`, the worker's `transport`); `None` otherwise, writing nothing. The runner
+    scores each canary under its own profile and scope, and its terminal transaction raises
+    `scoring.canary_drift` (`calibration.canary_drift`)."""
+    row = (await conn.execute(_ACTIVE_FOR_CANARY)).one()
+    if row.llm_tuple_id is None or not (await conn.execute(_ACTIVE_CANARY)).scalar_one():
+        log.info("eval_canary_skipped", tuple_active=row.llm_tuple_id is not None)
+        return None
+    if row.rubric_version_id is None or row.prompt_schema_version_id is None:
+        raise NoCandidate("active_config has no rubric or prompt-schema version (migrate seeds both)")
+    candidate = Candidate(
+        int(row.rubric_version_id),
+        int(row.prompt_schema_version_id),
+        int(row.model_policy_id),
+        int(row.evaluation_policy_id),
+        int(row.execution_config_id),
+    )
+    return await start_run(
+        conn,
+        kind="canary",
+        route="production",
+        candidate=candidate,
+        transport_requested=transport,
+        now=now,
+        defer=defer,
+    )
 
 
 # ---- the store of one scoring ------------------------------------------------------------------------------
@@ -393,8 +501,9 @@ _CASE: Final = q(
     "JOIN profile_versions v ON v.id = g.profile_version_id WHERE g.id = :g"
 )
 _CANDIDATE_ROWS: Final = q(
-    "SELECT w.weights, w.anchors, m.payload AS model_policy FROM rubric_versions w, model_policies m "
-    "WHERE w.id = :rubric AND m.id = :model_policy"
+    "SELECT w.weights, w.anchors, m.payload AS model_policy, e.projected_critic_rate "
+    "FROM rubric_versions w, model_policies m, evaluation_policies e "
+    "WHERE w.id = :rubric AND m.id = :model_policy AND e.id = :evaluation_policy"
 )
 _CASE_CALLS: Final = q(
     "SELECT id FROM llm_calls WHERE eval_run_id = :r AND golden_case_id = :g "
@@ -473,12 +582,15 @@ async def _first(
 
 @dataclass(frozen=True)
 class _Config:
-    """The candidate's configuration as the steps read it."""
+    """The candidate's configuration as the steps read it, and what its calibration reports against: its
+    evaluation policy's projected critic rate and its model policy's §21.2 central cost per target."""
 
     version: PromptVersion
     rubric: Rubric
     policy: evaluation_policy.EvaluationPolicy
     efforts: tuple[Effort, Effort]  # the critic's normal and light efforts (`steps.critic_efforts`)
+    projected_critic_rate: Decimal
+    central_cost_usd: Decimal
 
 
 @dataclass(frozen=True)
@@ -520,7 +632,11 @@ async def _config(engine: AsyncEngine, candidate: Candidate) -> _Config:
         row = (
             await conn.execute(
                 _CANDIDATE_ROWS,
-                {"rubric": candidate.rubric_version_id, "model_policy": candidate.model_policy_id},
+                {
+                    "rubric": candidate.rubric_version_id,
+                    "model_policy": candidate.model_policy_id,
+                    "evaluation_policy": candidate.evaluation_policy_id,
+                },
             )
         ).one()
         return _Config(
@@ -528,6 +644,8 @@ async def _config(engine: AsyncEngine, candidate: Candidate) -> _Config:
             rubric=rubric_of(row.weights, row.anchors),
             policy=await evaluation_policy.load(conn, candidate.evaluation_policy_id),
             efforts=critic_efforts(row.model_policy),
+            projected_critic_rate=Decimal(row.projected_critic_rate),
+            central_cost_usd=central_cost_per_target(ModelPolicy.model_validate(row.model_policy)),
         )
 
 
@@ -964,6 +1082,137 @@ class _Execution:
         return {"r": self._run.id, "g": case.id, "n": repetition}
 
 
+# ---- the calibration (Task 20, Ruling P17) -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunCase:
+    """A case repetition of a run as the calibration and the CLI's case table read it: its result, its case
+    and the case's source."""
+
+    result: calibration.CaseResult
+    case: calibration.CaseRow
+    source: str
+
+
+# Each case row of a run with its golden case, the similarity of the target its label was taken from, and the
+# counted cost of its calls (as `EVAL_RUN_COST_SQL` counts a run's).
+_RUN_CASES: Final = q(
+    "SELECT e.golden_case_id, e.repetition, e.outcome, e.critic_ran, e.score_mid, e.output, g.label, "
+    "g.expected_knockouts, g.profile_version_id, g.source, t.similarity, ("
+    "SELECT coalesce(sum(CASE l.state WHEN 'billed' THEN l.settled_usd WHEN 'not_billed' THEN 0 "
+    "ELSE l.reserved_usd END), 0) FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    "WHERE c.id = ANY(e.llm_call_ids)) AS cost_usd "
+    "FROM eval_case_results e JOIN golden_cases g ON g.id = e.golden_case_id "
+    "LEFT JOIN llm_results res ON res.id = g.labelled_from_result_id "
+    "LEFT JOIN score_targets t ON t.id = res.target_id "
+    "WHERE e.eval_run_id = :r ORDER BY e.golden_case_id, e.repetition"
+)
+# The trailing similarity-lane cut-off (L4628): the lowest similarity the lane admitted in the window.
+_SIMILARITY_CUTOFF: Final = q(
+    "SELECT min(t.similarity) FROM score_attempts a JOIN score_targets t ON t.id = a.target_id "
+    "WHERE a.lane = 'similarity' AND a.started_at > :since AND a.started_at <= :now "
+    "AND t.similarity IS NOT NULL"
+)
+CUTOFF_WINDOW: Final = timedelta(days=7)
+GATE_FAILED_ALERT: Final = "eval.gate_failed"
+CANARY_DRIFT_ALERT: Final = "scoring.canary_drift"
+
+
+async def run_cases(conn: AsyncConnection, eval_run_id: int) -> list[RunCase]:
+    """The run's case repetitions by case and repetition (plain reads)."""
+    found: list[RunCase] = []
+    for row in await conn.execute(_RUN_CASES, {"r": eval_run_id}):
+        if row.outcome not in get_args(calibration.Outcome) or row.label not in calibration.ORDINAL:
+            raise ValueError(f"eval run {eval_run_id} holds a case row the calibration cannot read")
+        result = calibration.case_result(
+            golden_case_id=int(row.golden_case_id),
+            repetition=int(row.repetition),
+            outcome=row.outcome,
+            critic_ran=bool(row.critic_ran),
+            score_mid=None if row.score_mid is None else Decimal(row.score_mid),
+            output=row.output,
+            cost_usd=Decimal(row.cost_usd),
+        )
+        case = calibration.CaseRow(
+            label=row.label,
+            expected_knockouts=tuple(row.expected_knockouts),
+            profile_version_id=int(row.profile_version_id),
+            similarity=None if row.similarity is None else Decimal(str(row.similarity)),
+        )
+        found.append(RunCase(result, case, str(row.source)))
+    return found
+
+
+@dataclass(frozen=True)
+class _Calibrated:
+    state: GateState
+    metrics: dict[str, JSONValue]
+    passed: bool | None
+
+
+async def _calibrate(
+    conn: AsyncConnection, run: _Run, config: _Config, *, active_cases: int, now: datetime
+) -> _Calibrated:
+    """The run's calibration and gate in its terminal transaction (module docstring, **The end**)."""
+    rows = await run_cases(conn, run.id)
+    cutoff = (
+        await conn.execute(_SIMILARITY_CUTOFF, {"since": now - CUTOFF_WINDOW, "now": now})
+    ).scalar_one_or_none()
+    m = calibration.metrics(
+        [r.result for r in rows],
+        cases={r.result.golden_case_id: r.case for r in rows},
+        projected_critic_rate=config.projected_critic_rate,
+        central_cost_usd=config.central_cost_usd,
+        similarity_cutoff=None if cutoff is None else Decimal(str(cutoff)),
+    )
+    state = calibration.gate(m, active_cases=active_cases)
+    passed = None if run.kind != "golden" or state == "uncalibrated" else state == "passed"
+    return _Calibrated(state, calibration.metrics_json(m, state=state), passed)
+
+
+async def _alert(conn: AsyncConnection, run: _Run, calibrated: _Calibrated) -> None:
+    """The run's alerts, in its terminal transaction: `eval.gate_failed` for a gated golden run that failed
+    (L5618; a forced-critic run is a diagnostic, L4612), `scoring.canary_drift` for each drifted canary of a
+    canary run (L4632). Ids and numbers only."""
+    if run.kind == "golden" and run.route == "production" and calibrated.passed is False:
+        c = run.candidate
+        failed = calibrated.metrics.get("failed")
+        names = [str(name) for name in failed] if isinstance(failed, list) else []
+        await raise_alert(
+            conn,
+            code=GATE_FAILED_ALERT,
+            severity="warn",
+            subject=f"{c.rubric_version_id}:{c.prompt_schema_version_id}:{c.model_policy_id}:"
+            f"{c.evaluation_policy_id}",
+            message=f"eval run {run.id} failed the golden-set gate: {', '.join(names)}",
+            context={"eval_run_id": run.id, "failed": list(names)},
+        )
+    if run.kind == "canary":
+        for drift in await calibration.canary_drift(conn, eval_run_id=run.id):
+            await raise_alert(
+                conn,
+                code=CANARY_DRIFT_ALERT,
+                severity="warn",
+                subject=str(drift.golden_case_id),
+                message=f"canary {drift.golden_case_id} scored {drift.score_mid} against its baseline "
+                f"{drift.baseline} in eval run {run.id}",
+                context={
+                    "eval_run_id": run.id,
+                    "golden_case_id": drift.golden_case_id,
+                    "score_mid": str(drift.score_mid),
+                    "baseline": str(drift.baseline),
+                    "delta": str(drift.delta),
+                },
+            )
+            log.warning(
+                "eval_canary_drift",
+                eval_run_id=run.id,
+                golden_case_id=drift.golden_case_id,
+                delta=str(drift.delta),
+            )
+
+
 # ---- the run -----------------------------------------------------------------------------------------------
 
 
@@ -997,7 +1246,8 @@ async def run_eval(
     if isinstance(first, EvalOutcome):
         return first
     run = first
-    execution = _Execution(engine, gateway, run, await _config(engine, run.candidate), op)
+    config = await _config(engine, run.candidate)
+    execution = _Execution(engine, gateway, run, config, op)
     cases = await _cases(engine, run.kind)
     log.info(
         "eval_run_executing",
@@ -1038,14 +1288,20 @@ async def run_eval(
     async with engine.begin() as conn:
         await execution.owner.lock(conn)
         cost = await _cost(conn, run.id)
+        calibrated = await _calibrate(conn, run, config, active_cases=len(cases), now=now)
         await transition(
             conn,
             "eval_runs",
             run.id,
             ["running"],
             "completed",
-            set_={"metrics": metrics, "passed": None, "cost_usd": cost},
+            set_={
+                "metrics": {**metrics, **calibrated.metrics},
+                "passed": calibrated.passed,
+                "cost_usd": cost,
+            },
         )
+        await _alert(conn, run, calibrated)  # after the run's `completed`: a first canary is its own baseline
         await op.finish_in(conn, status="succeeded")
         await afault_point(BEFORE_TERMINAL_COMMIT)
     await afault_point(AFTER_TERMINAL_COMMIT)
@@ -1056,6 +1312,8 @@ async def run_eval(
         fenced=len(execution.skipped["fenced"]),
         deleted=len(execution.skipped["deleted"]),
         sample=len(sample),
+        gate=calibrated.state,
+        passed=calibrated.passed,
         cost_usd=str(cost),
     )
     return EvalOutcome(run.id, "completed", None, len(execution.results), cost)

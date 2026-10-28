@@ -224,7 +224,7 @@ async def test_an_unchanged_tuple_opens_no_bulk_operation_and_records_no_operati
 
 
 async def test_an_llm_tuple_save_activates_the_new_tuple_after_the_flip(
-    engine: AsyncEngine, queue_app: object, monkeypatch: pytest.MonkeyPatch
+    engine: AsyncEngine, queue_app: object, monkeypatch: pytest.MonkeyPatch, fake_llm_process: None
 ) -> None:
     # Codex r1 #35, r2 B7: after `_FLIP`, then `ranking.bump` last
     seeded = await seed(engine, "submitted")

@@ -26,6 +26,13 @@ independent of anything but the key. Online the key is `sample_key(target_id, ll
 policy's `critic_light_triggers` (⊆ `{T2, T3, T8}`, the settings model's set, so it never names a mandatory
 trigger), else the normal one. T0 is never light, so every re-review after a revision runs at the normal
 effort.
+
+**Replay** (§11.7.4 L4480; M3 Task 20). `replay` is `evaluate` re-run with `critic_rounds = 0` on a stored
+round-0 draft's figures under another policy: the triggers no threshold of a policy decides (`POLICY_FREE`:
+T1, T4, T5, T6, T7, each a function of the draft, its description and the literal T4 bound) as the draft
+stored them, T2 and T3 by the same rule as `evaluate` on its stored provisional `L`, `M`, `U` and coverage,
+and T8 by its sample key under the policy's rate; never T0. `evaluation_policy.replay_projected_critic_rate`
+counts the drafts that fire any.
 """
 
 import hashlib
@@ -42,6 +49,8 @@ from jobhunter.scoring.validator import DraftValidation
 Trigger = Literal["T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"]
 TRIGGERS: Final[tuple[Trigger, ...]] = get_args(Trigger)
 MANDATORY: Final[frozenset[Trigger]] = frozenset({"T0", "T1", "T4", "T5", "T6", "T7"})
+# The triggers no threshold of an evaluation policy decides (module docstring, **Replay**).
+POLICY_FREE: Final[frozenset[Trigger]] = frozenset({"T1", "T4", "T5", "T6", "T7"})
 
 _SAMPLE_DIGITS: Final = 8
 
@@ -62,18 +71,30 @@ def golden_sample_key(*, golden_case_id: int, tuple_identity: str) -> str:
     return f"golden:{golden_case_id}:{tuple_identity}"
 
 
-def _score_triggers(provisional: Aggregation, policy: EvaluationPolicy, completeness: str) -> set[Trigger]:
-    low, mid, high = provisional.low, provisional.mid, provisional.high
+def _threshold_triggers(
+    low: Decimal | None,
+    mid: Decimal | None,
+    high: Decimal | None,
+    coverage: Decimal,
+    policy: EvaluationPolicy,
+) -> set[Trigger]:
+    """T2 and T3, the triggers of the policy's thresholds; none without a score."""
     if low is None or mid is None or high is None:
         return set()
     found: set[Trigger] = set()
     tau = Decimal(policy.relevance_threshold)
-    straddles = low < tau <= high and provisional.coverage < policy.t2_straddle_max_coverage
+    straddles = low < tau <= high and coverage < policy.t2_straddle_max_coverage
     if abs(mid - tau) <= policy.t2_band or straddles:
         found.add("T2")
     if mid >= policy.t3_min_mid:
         found.add("T3")
-    if completeness == "partial" and mid >= T4_MIN_MID:
+    return found
+
+
+def _score_triggers(provisional: Aggregation, policy: EvaluationPolicy, completeness: str) -> set[Trigger]:
+    low, mid, high = provisional.low, provisional.mid, provisional.high
+    found = _threshold_triggers(low, mid, high, provisional.coverage, policy)
+    if mid is not None and completeness == "partial" and mid >= T4_MIN_MID:
         found.add("T4")
     return found
 
@@ -113,3 +134,23 @@ def critic_effort(
 ) -> Effort:
     """`light` iff `triggers` is non-empty and a subset of the policy's light triggers, else `normal`."""
     return light if triggers and set(triggers) <= policy.critic_light_triggers else normal
+
+
+def replay(
+    *,
+    stored: Sequence[str],
+    low: Decimal | None,
+    mid: Decimal | None,
+    high: Decimal | None,
+    coverage: Decimal,
+    policy: EvaluationPolicy,
+    sample_key: str,
+) -> list[Trigger]:
+    """The triggers a stored round-0 draft fires under `policy` with `critic_rounds = 0` (module docstring,
+    **Replay**): `stored` its `score_drafts.triggers`, `low`, `mid`, `high` and `coverage` its stored
+    provisional, `sample_key` its target's T8 key; in code order."""
+    found: set[Trigger] = {code for code in POLICY_FREE if code in stored}
+    found |= _threshold_triggers(low, mid, high, coverage, policy)
+    if sampled(sample_key, policy.t8_sample_pct):
+        found.add("T8")
+    return [code for code in TRIGGERS if code in found]

@@ -70,6 +70,27 @@ from tests.support.settings import generation, procrastinate_job_exists_for
 pytestmark = pytest.mark.integration
 
 METRIC_KEYS: Final = {"transport", "transport_requested", "cases", "repetitions"}
+# Task 20 (Ruling P17): the calibration merged into the same `metrics` by the terminal transaction
+CALIBRATION_KEYS: Final = {
+    "schema_validity",
+    "grounding_rate",
+    "spearman_rho",
+    "pairwise_agreement",
+    "false_exclusions",
+    "knockout_recall",
+    "contested_rate",
+    "test_retest_sd",
+    "test_retest_sample",
+    "per_profile",
+    "critic_rate",
+    "projected_critic_rate",
+    "admission_recall",
+    "similarity_cutoff",
+    "mean_cost_usd",
+    "central_cost_usd",
+    "observations",
+    "gate",
+}
 SCORED: Final = frozenset({"accepted", "contested"})
 
 
@@ -139,7 +160,10 @@ async def test_a_golden_run_scores_every_case_outside_the_target_table(
         "forced_critic",
         2,
     )
-    assert set(run.metrics) == METRIC_KEYS
+    # Task 20: the calibration beside Task 19's keys, and `passed` from the gate: ten adversarial cases are
+    # below the gate's 30, so it is uncalibrated and `passed` stays NULL
+    assert set(run.metrics) == METRIC_KEYS | CALIBRATION_KEYS
+    assert (run.metrics["gate"], run.metrics["observations"]["primary"]) == ("uncalibrated", len(keys) - 1)
     assert (run.metrics["transport"], run.metrics["transport_requested"]) == ("fake", "fake")
     assert run.metrics["cases"]["fenced"] == [fenced]
     assert (await operation_row(engine, started.operation_id)).status == "succeeded"
@@ -631,7 +655,7 @@ async def test_candidate_payload_stages_rows_without_activation(
         active_before = (await conn.execute(_ACTIVE_POLICY)).one()
     payload = candidate_payload(t2_band=7)
     async with engine.begin() as conn:
-        candidate = await eval_runner.stage_candidate(conn, payload)
+        candidate = await eval_runner.stage_candidate(conn, payload, now=utcnow())
     async with engine.connect() as conn:
         assert (await conn.execute(_ACTIVE_POLICY)).one() == active_before  # nothing activated
     assert candidate.evaluation_policy_id != active_before.evaluation_policy_id
@@ -662,7 +686,7 @@ async def test_candidate_payload_stages_rows_without_activation(
 
     async def stage(t2_band: int) -> eval_runner.Candidate:
         async with engine.begin() as conn:
-            return await eval_runner.stage_candidate(conn, candidate_payload(t2_band=t2_band))
+            return await eval_runner.stage_candidate(conn, candidate_payload(t2_band=t2_band), now=utcnow())
 
     one, two = await asyncio.gather(stage(11), stage(12))
     async with engine.connect() as conn:
@@ -675,7 +699,7 @@ async def test_an_invalid_candidate_payload_is_refused_before_any_row(engine: As
         policies = (await conn.execute(sa.text("SELECT count(*) FROM evaluation_policies"))).scalar_one()
     with pytest.raises(eval_runner.CandidateInvalid) as refused:
         async with engine.begin() as conn:
-            await eval_runner.stage_candidate(conn, candidate_payload(t2_band=99))
+            await eval_runner.stage_candidate(conn, candidate_payload(t2_band=99), now=utcnow())
     assert [issue.field for issue in refused.value.issues] == ["payload.evaluation.t2_band"]
     async with engine.connect() as conn:
         assert (
@@ -776,6 +800,7 @@ _PROBE: Final = sa.text(
 async def test_a_healthy_run_over_an_hour_is_not_abandoned(
     engine: AsyncEngine, current_epoch: int, queue_app: procrastinate.App
 ) -> None:
+    await insert_cases(engine, 1)  # a golden run starts only with an active case (Task 20, `eval_no_cases`)
     started_at = utcnow() - timedelta(hours=2)
     healthy = await start_eval(engine, now=started_at)
     queued = await start_eval(engine)  # young, its operation still pending: live

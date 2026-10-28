@@ -38,11 +38,17 @@ issue it finds is reported:
 `validate_fields` returns a `Settings` only for a payload with no issue at all, so a caller cannot act on a
 refused document.
 
+**`eval_gate_state(conn, candidate=…)`** (M3 Task 20) is the eval gate of a candidate configuration (a
+`Candidate`, by default the active one): `uncalibrated` below 30 active golden cases, else the newest
+completed golden production run of the candidate with live provenance decides, and no run is `failed`. The
+dry-run and the save pass the proposed payload's candidate (`derive.candidate_of`).
+
 **`schema_verified`** (M3 Task 11, Ruling P11) says whether a prompt-schema version's live schema dry-runs
-passed every (schema, model) pair a model policy needs; the score lane's pause guard reads it, and Task 20's
-save-time refusal will.
+passed every (schema, model) pair a model policy needs; the score lane's pause guard reads it, and so does the
+save's refusal of an unverified model policy (`save._check_eval_gate`, M3 Task 20).
 """
 
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
@@ -319,13 +325,84 @@ def warnings_only(settings: Settings, *, gate: GateState) -> list[dryrun.Warning
     return warnings
 
 
-async def eval_gate_state(conn: AsyncConnection) -> GateState:
-    """The eval gate (§11.13): `uncalibrated` while fewer than 30 golden cases exist.
+# ---- the eval gate (§11.13, M3 Task 20, B R14, Deviation 29) ---------------------------------------------
 
-    `golden_cases` is M3's table, so in M2 there are none by construction and the answer needs no query; M3
-    counts the active cases on `conn` and runs the gate.
-    """
-    return "uncalibrated"
+GATE_MIN_CASES: Final = 30  # L4631: before 30 active golden cases the gate is uncalibrated
+FAKE_LLM_VAR: Final = "JOBHUNTER_FAKE_LLM"  # the process's fake LLM mode, as `config.load_config` reads it
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """The identity an eval run gives the gate (L4631): the rubric and prompt-schema versions and the model
+    and evaluation policies by content hash, so a payload whose rows do not exist yet has one too
+    (`derive.candidate_of`); the execution config is not part of it."""
+
+    rubric_version_id: int
+    prompt_schema_version_id: int
+    model_policy_hash: bytes
+    evaluation_policy_hash: bytes
+
+
+def fake_llm_process() -> bool:
+    """Whether this process runs on the fake LLM: `JOBHUNTER_FAKE_LLM` set to anything, as
+    `config.load_config` reads it (the dev stack's fake overlay, the tests; prod refuses it at startup)."""
+    return FAKE_LLM_VAR in os.environ
+
+
+def gate_transports() -> tuple[str, ...]:
+    """The transports of the runs the gate accepts as evidence (Codex r2 B20): live runs, and fake ones only
+    while this process itself runs on the fake LLM (`fake_llm_process`)."""
+    return ("live", "fake") if fake_llm_process() else ("live",)
+
+
+_ACTIVE_CASES: Final = q("SELECT count(*) FROM golden_cases WHERE active")
+_ACTIVE_CANDIDATE: Final = q(
+    "SELECT a.rubric_version_id, a.prompt_schema_version_id, m.policy_hash AS model_policy_hash, "
+    "e.policy_hash AS evaluation_policy_hash FROM active_config a "
+    "JOIN model_policies m ON m.id = a.model_policy_id "
+    "JOIN evaluation_policies e ON e.id = a.evaluation_policy_id WHERE a.id = 1"
+)
+# The newest ended golden run of the candidate on the production route with an accepted transport.
+_GATE_RUN: Final = q(
+    "SELECT r.passed FROM eval_runs r JOIN model_policies m ON m.id = r.model_policy_id "
+    "JOIN evaluation_policies e ON e.id = r.evaluation_policy_id "
+    "WHERE r.kind = 'golden' AND r.route = 'production' AND r.status = 'completed' "
+    "AND r.rubric_version_id = :rubric AND r.prompt_schema_version_id = :prompt "
+    "AND m.policy_hash = :model_policy AND e.policy_hash = :evaluation_policy "
+    "AND r.metrics ->> 'transport' = ANY(CAST(:transports AS text[])) "
+    "ORDER BY r.finished_at DESC, r.id DESC LIMIT 1"
+)
+
+
+async def eval_gate_state(conn: AsyncConnection, *, candidate: Candidate | None = None) -> GateState:
+    """The eval gate of `candidate` (§11.13; the active configuration's when `None`), plain reads:
+    `uncalibrated` while fewer than `GATE_MIN_CASES` golden cases are active; otherwise the newest `completed`
+    golden run of the candidate on the production route whose transport is one `gate_transports` accepts
+    decides: `passed` when it passed, `failed` when it failed or was never gated (`passed` NULL), and `failed`
+    when there is none (user decision "Eval gate = fail until a run": a run is required)."""
+    if int((await conn.execute(_ACTIVE_CASES)).scalar_one()) < GATE_MIN_CASES:
+        return "uncalibrated"
+    if candidate is None:
+        row = (await conn.execute(_ACTIVE_CANDIDATE)).one()
+        candidate = Candidate(
+            int(row.rubric_version_id),
+            int(row.prompt_schema_version_id),
+            bytes(row.model_policy_hash),
+            bytes(row.evaluation_policy_hash),
+        )
+    passed = (
+        await conn.execute(
+            _GATE_RUN,
+            {
+                "rubric": candidate.rubric_version_id,
+                "prompt": candidate.prompt_schema_version_id,
+                "model_policy": candidate.model_policy_hash,
+                "evaluation_policy": candidate.evaluation_policy_hash,
+                "transports": list(gate_transports()),
+            },
+        )
+    ).scalar_one_or_none()
+    return "passed" if passed is True else "failed"
 
 
 # ---- the live schema dry-run (M3 Task 11, Ruling P11) ----------------------------------------------------

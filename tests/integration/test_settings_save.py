@@ -657,7 +657,7 @@ def with_generator_effort(payload: dict[str, Any], effort: str) -> dict[str, Any
 
 
 async def test_an_llm_tuple_save_without_a_profile_flips_the_model_policy_only(
-    logged_in_client, engine
+    logged_in_client, engine, fake_llm_process
 ) -> None:
     before = await active_row(engine)
     generation_before = await generation(engine)
@@ -672,7 +672,9 @@ async def test_an_llm_tuple_save_without_a_profile_flips_the_model_policy_only(
     assert await count_rows(engine, "llm_tuples") == 0 and await generation(engine) == generation_before
 
 
-async def test_an_llm_tuple_save_with_a_profile_flips_the_tuple_and_bumps(logged_in_client, engine) -> None:
+async def test_an_llm_tuple_save_with_a_profile_flips_the_tuple_and_bumps(
+    logged_in_client, engine, fake_llm_process
+) -> None:
     profile_id, old_tuple = await activate_profile(engine)
     before = await active_row(engine)
     generation_before = await generation(engine)
@@ -700,12 +702,13 @@ async def test_an_llm_tuple_save_with_a_profile_flips_the_tuple_and_bumps(logged
 
 
 async def test_the_eval_gate_needs_the_override_once_it_has_failed(
-    logged_in_client, engine, monkeypatch
+    logged_in_client, engine, monkeypatch, fake_llm_process
 ) -> None:
-    """M2's gate is always uncalibrated (fewer than 30 golden cases); a failed one needs the override
-    (§11.13)."""
+    """A failed gate needs the override (§11.13), for the model policy and the evaluation policy alike, and
+    refuses before step 4's first write. (The gate's reads, the candidate and the schema verification are
+    `test_eval_gate.py`'s; on the fake the save verifies no schema.)"""
 
-    async def failed(conn: object) -> str:
+    async def failed(conn: object, *, candidate: object) -> str:
         return "failed"
 
     derived_rows: list[object] = []
@@ -855,7 +858,7 @@ def test_the_action_order_is_llm_tuple_then_scope_then_the_others() -> None:
 
 
 async def test_a_fault_between_llm_tuple_and_scope_rolls_both_back(
-    logged_in_client, engine, monkeypatch
+    logged_in_client, engine, monkeypatch, fake_llm_process
 ) -> None:
     await activate_profile(engine)
     before = await active_row(engine)
@@ -888,7 +891,9 @@ async def test_a_fault_between_llm_tuple_and_scope_rolls_both_back(
     assert await count_rows(engine, "bulk_operations", state=("active",)) == 1
 
 
-async def test_llm_tuple_and_scope_commit_together(logged_in_client, engine, monkeypatch) -> None:
+async def test_llm_tuple_and_scope_commit_together(
+    logged_in_client, engine, monkeypatch, fake_llm_process
+) -> None:
     await activate_profile(engine)
     payload = with_generator_effort(await active_payload(logged_in_client), "high")
     payload["scope"]["locations"] = [berlin(30)]
@@ -911,7 +916,7 @@ async def test_llm_tuple_and_scope_commit_together(logged_in_client, engine, mon
 
 
 async def test_llm_tuple_and_budget_bump_once_after_the_budget_action(
-    logged_in_client, engine, monkeypatch
+    logged_in_client, engine, monkeypatch, fake_llm_process
 ) -> None:
     await activate_profile(engine)
     generation_before = await generation(engine)

@@ -14,7 +14,7 @@ import copy
 from collections.abc import Iterator, Mapping
 from decimal import ROUND_CEILING, Decimal
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import Any, Final
 
 import pytest
 from jobhunter.db.seed import load_settings_v1
@@ -24,12 +24,12 @@ from jobhunter.quota.dryrun import Warning
 from jobhunter.settings.model import Settings
 from jobhunter.settings.validate import (
     FieldIssue,
-    eval_gate_state,
+    fake_llm_process,
+    gate_transports,
     overrun_buffer_bound,
     validate_fields,
     warnings_only,
 )
-from sqlalchemy.ext.asyncio import AsyncConnection
 
 NODES = ("generate", "revise", "critic", "extract_profile", "propose_queries")
 OPUS: Final[Model] = "claude-opus-5-5"
@@ -672,12 +672,14 @@ def test_warnings_only() -> None:
     ]
 
 
-async def test_the_eval_gate_is_uncalibrated_without_a_query() -> None:
-    class NoQueries:
-        def __getattr__(self, name: str) -> Any:
-            raise AssertionError(f"the gate state used the connection ({name})")
-
-    assert await eval_gate_state(cast(AsyncConnection, NoQueries())) == "uncalibrated"
+def test_the_gate_accepts_fake_runs_only_in_a_fake_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Codex r2 B20 (M3 Task 20): the gate reads live runs, and fake ones only while this process runs on the
+    fake LLM: `JOBHUNTER_FAKE_LLM` set to anything, as `config.load_config` reads it. (The gate's reads of
+    the golden cases and the runs are `tests/integration/test_eval_gate.py`'s.)"""
+    monkeypatch.delenv("JOBHUNTER_FAKE_LLM", raising=False)
+    assert (fake_llm_process(), gate_transports()) == (False, ("live",))
+    monkeypatch.setenv("JOBHUNTER_FAKE_LLM", "")
+    assert (fake_llm_process(), gate_transports()) == (True, ("live", "fake"))
 
 
 def at_items(items: int, buffer: str = "50.00") -> Settings:

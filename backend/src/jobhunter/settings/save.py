@@ -12,9 +12,18 @@ r2 B7).
    issue's path, code and message; each warning code missing from `acknowledged_warnings` is 422
    `validation_failed` with `FieldError("acknowledged_warnings", "warning_not_acknowledged", <code>)`. An
    internal save (`internal=True`, Deviation 15) skips the acknowledgement check and copies the active
-   version's acknowledgements. Then the eval gate (§11.13), once, when the classes hold `llm_tuple` or
-   `evaluation_policy`: uncalibrated in M2, so skipped; a failed gate without `eval_override_ack` is 409
-   `eval_gate_failed`. Every refusal therefore comes before the first write.
+   version's acknowledgements. Then, once, when the classes hold `llm_tuple` or `evaluation_policy`
+   (`dryrun.GATED`; `_check_eval_gate`, M3 Task 20):
+   - an `llm_tuple` save whose model policy is not verified for the active prompt-schema version
+     (`validate.schema_verified` of its row, found by hash: a policy with no row yet has no proof) is 409
+     `conflict_state` with `detail = "schema_dry_run_required"`, whatever the override (Codex r2 B24; the
+     schema dry-run of the payload, `jobhunter schema-dry-run --candidate-payload`, stages the row and runs
+     its cases). A process on the fake LLM skips it, as the score lane's guard does (`cycles.pause_reason`):
+     no live dry-run exists there;
+   - the eval gate of the payload's candidate (`derive.candidate_of`, `validate.eval_gate_state`): a failed
+     gate (with 30 active golden cases, no passed run of the candidate is a failed gate) without
+     `eval_override_ack` is 409 `eval_gate_failed`.
+   Every refusal therefore comes before the first write.
 4. The derived rows (`derive.derived` with the active profile, Deviation 14; `ensure_derived`).
 5. The version row: `version_no = max + 1` (the step-1 lock serialises the writers, the unique constraint
    backs it), the stored payload `Settings.to_payload()` (the normal form, never the request; Deviation 38),
@@ -79,7 +88,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db import ranking
-from jobhunter.db.seed import SETTINGS_SCHEMA_VERSION, anchor_utc_for, ensure_id, latest_slot_at_or_before
+from jobhunter.db.seed import (
+    SETTINGS_SCHEMA_VERSION,
+    anchor_utc_for,
+    content_hash,
+    ensure_id,
+    latest_slot_at_or_before,
+)
 from jobhunter.db.sql import q
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, spend_ledger
@@ -88,16 +103,17 @@ from jobhunter.quota.cells import ensure_cells
 from jobhunter.run_settings import load_run_settings
 from jobhunter.scoring import targets
 from jobhunter.settings import scope_apply
-from jobhunter.settings.derive import DerivedIds, active_profile, derived, ensure_derived
-from jobhunter.settings.dryrun import dry_run
+from jobhunter.settings.derive import DerivedIds, active_profile, candidate_of, derived, ensure_derived
+from jobhunter.settings.dryrun import GATED, dry_run
 from jobhunter.settings.effects import EffectClass
 from jobhunter.settings.model import Settings
-from jobhunter.settings.validate import eval_gate_state
+from jobhunter.settings.validate import eval_gate_state, fake_llm_process, schema_verified
 from jobhunter.sources.instances import instance_for_company, list_instances
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import Deferrer
 
 AFTER_LLM_TUPLE_POINT: Final = "settings.after_llm_tuple"
+SCHEMA_DRY_RUN_REQUIRED: Final = "schema_dry_run_required"
 ACKNOWLEDGED_FIELD: Final = "acknowledged_warnings"
 NOT_ACKNOWLEDGED: Final = "warning_not_acknowledged"
 _SECONDS_PER_HOUR: Final = 3600
@@ -119,6 +135,7 @@ _INSERT_VERSION: Final = q(
 _TUPLE_POINTERS: Final = q(
     "SELECT rubric_version_id, prompt_schema_version_id FROM active_config WHERE id = 1"
 )
+_MODEL_POLICY_BY_HASH: Final = q("SELECT id FROM model_policies WHERE policy_hash = :hash")
 _FIND_TUPLE: Final = q(
     "SELECT id FROM llm_tuples WHERE profile_version_id = :profile_version_id "
     "AND rubric_version_id = :rubric_version_id AND prompt_schema_version_id = :prompt_schema_version_id "
@@ -205,13 +222,38 @@ class _Activation:
     scope_is_active: bool = False  # the `scope` action's desired scope is the active one
 
 
-_GATED: Final[frozenset[EffectClass]] = frozenset({"llm_tuple", "evaluation_policy"})
+async def _schema_verified(conn: AsyncConnection, proposed: Settings) -> bool:
+    """Whether the proposed model policy is verified for the active prompt-schema version
+    (`validate.schema_verified` of its row, found by its content hash); a policy with no row has no proof."""
+    found = await conn.execute(_MODEL_POLICY_BY_HASH, {"hash": content_hash(derived(proposed).model_policy)})
+    model_policy_id = found.scalar_one_or_none()
+    if model_policy_id is None:
+        return False
+    pointers = (await conn.execute(_TUPLE_POINTERS)).one()
+    if pointers.prompt_schema_version_id is None:
+        raise LookupError("active_config has no prompt-schema version (migrate seeds it)")
+    return await schema_verified(
+        conn,
+        prompt_schema_version_id=int(pointers.prompt_schema_version_id),
+        model_policy_id=int(model_policy_id),
+    )
 
 
-async def _check_eval_gate(conn: AsyncConnection, req: SaveRequest) -> None:
-    """§11.13: a change the gate covers must pass, or the override is acknowledged. Before 30 golden cases the
-    gate is `uncalibrated` and skipped, which in M2 it always is (`eval_gate_state`)."""
-    if await eval_gate_state(conn) == "failed" and not req.eval_override_ack:
+async def _check_eval_gate(
+    conn: AsyncConnection, req: SaveRequest, proposed: Settings, effects: frozenset[EffectClass]
+) -> None:
+    """The refusals of a gated save (module docstring, step 3): an unverified model policy, then a failed eval
+    gate of the payload's candidate without the override. Below 30 active golden cases the gate is
+    `uncalibrated` and does not refuse."""
+    if "llm_tuple" in effects and not fake_llm_process() and not await _schema_verified(conn, proposed):
+        raise Problem(
+            409,
+            "conflict_state",
+            "The model policy has no passed live schema dry-run",
+            detail=SCHEMA_DRY_RUN_REQUIRED,
+        )
+    candidate = await candidate_of(conn, proposed)
+    if await eval_gate_state(conn, candidate=candidate) == "failed" and not req.eval_override_ack:
         raise Problem(
             409,
             "eval_gate_failed",
@@ -358,12 +400,12 @@ async def save_settings(
         acknowledged = sorted(req.acknowledged_warnings)
     proposed = Settings.model_validate(req.payload)  # valid: the dry-run found no error
     effects = result.effects
-    if effects & _GATED:
-        await _check_eval_gate(conn, req)
+    if effects & GATED:
+        await _check_eval_gate(conn, req, proposed, effects)
 
     payload = proposed.to_payload()
     ids = await ensure_derived(
-        conn, derived(proposed, profile=await active_profile(conn, active.profile_version_id))
+        conn, derived(proposed, profile=await active_profile(conn, active.profile_version_id)), now=now
     )
     version = (
         await conn.execute(

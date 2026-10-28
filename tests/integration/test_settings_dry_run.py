@@ -312,10 +312,14 @@ async def test_effect_dependent_projections(logged_in_client, clock) -> None:
     body = await post(logged_in_client, with_(base(), "evaluation.t8_sample_pct", 0))
     assert body["projections"]["critic_rate"] == "0.450"  # no re-review of existing scores
     assert "next_slot" not in body["projections"]
+    # a gated class reports the gate a save would check (M3 Task 20): below 30 golden cases, uncalibrated
+    assert body["projections"]["eval_gate"] == "uncalibrated"
+    body = await post(logged_in_client, with_(base(), "scoring.model_policy.nodes.critic.effort", "high"))
+    assert body["projections"]["eval_gate"] == "uncalibrated"
     body = await post(logged_in_client, with_(base(), "schedule.interval_hours", 12))
     # 06:00 Berlin is 04:00 UTC on 2026-10-22: slots every 12 h, the latest at or before 09:30 is 04:00
     assert body["projections"]["next_slot"] == "2026-10-22T16:00:00Z"
-    assert "critic_rate" not in body["projections"]
+    assert "critic_rate" not in body["projections"] and "eval_gate" not in body["projections"]
     body = await post(logged_in_client, with_(base(), "schedule.enabled", False))
     assert body["projections"]["next_slot"] is None
 

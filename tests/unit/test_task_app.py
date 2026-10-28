@@ -30,6 +30,7 @@ def test_reset_task_app_allows_a_fresh_task_app() -> None:
                 "score_cycle",  # M3 Task 11
                 "batch_poll",  # M3 Task 17
                 "batch_reconcile_ambiguous",  # M3 Task 17
+                "canary_daily",  # M3 Task 20
             )
         )
     finally:

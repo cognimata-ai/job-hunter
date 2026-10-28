@@ -6,17 +6,29 @@ run, 2 when nothing could start, each refusal one line on stderr, never a traceb
 commands' database steps (`seed`, `start`, `wait`) are replaced."""
 
 import json
+import re
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Final
 
 import pytest
+import yaml
 from jobhunter import cli, cli_golden
-from jobhunter.scoring import golden
+from jobhunter.scoring import eval_runner, golden
+from jobhunter.scoring.calibration import CaseRow, case_result
 from jobhunter.scoring.eval_fixtures import adversarial_dir
-from jobhunter.scoring.eval_runner import Candidate, CandidateInvalid, StartedRun
+from jobhunter.scoring.eval_runner import (
+    Candidate,
+    CandidateInvalid,
+    NoActiveCases,
+    NoCandidate,
+    RunCase,
+    StartedRun,
+)
+from jobhunter.settings.llm_projection import central_cost_per_target
+from jobhunter.settings.model import ModelPolicy
 from jobhunter.settings.validate import FieldIssue
 from jobhunter.types import JSONValue
 from sqlalchemy.exc import OperationalError
@@ -89,6 +101,50 @@ def test_the_summary_line_carries_ids_and_codes_only() -> None:
         eval_run_id=7, status="failed", metrics={"failed": "interrupted"}, cost="0.1234"
     )
     assert line == "eval_run=7 status=failed failed=interrupted cost_usd=0.1234"
+    # a completed run reports its gate (Task 20); its failed gates are the case table's and the run's
+    completed = cli_golden.summary(
+        eval_run_id=8, status="completed", metrics={"gate": "failed", "failed": ["spearman_rho"]}, cost="1"
+    )
+    assert completed == "eval_run=8 status=completed gate=failed cost_usd=1"
+
+
+def test_the_case_table_is_markdown_of_codes_and_numbers() -> None:
+    """The table the manual workflow uploads (§18.6): each case repetition's case, source, label, outcome,
+    score, binding knockouts and expected knockouts."""
+    output: JSONValue = {
+        "aggregation": {
+            "knockouts": [{"fact_id": "mandatory_language:de", "binding": True, "severity": "hard"}]
+        }
+    }
+    published = case_result(
+        golden_case_id=3,
+        repetition=1,
+        outcome="accepted",
+        critic_ran=False,
+        score_mid=Decimal("41.50"),
+        output=output,
+        cost_usd=Decimal("0.05"),
+    )
+    filtered = case_result(
+        golden_case_id=4,
+        repetition=1,
+        outcome="filtered_out",
+        critic_ran=False,
+        score_mid=None,
+        output={"filters": ["employment_type_excluded"]},
+        cost_usd=Decimal(0),
+    )
+    rows = [
+        RunCase(published, CaseRow("poor", ("mandatory_language:de",), 1), "adversarial"),
+        RunCase(filtered, CaseRow("ok", (), 2), "week1"),
+    ]
+    assert cli_golden.table_lines(rows) == [
+        "| case | source | label | repetition | outcome | score_mid | binding knockouts | "
+        "expected knockouts |",
+        "|---:|---|---|---:|---|---:|---|---|",
+        "| 3 | adversarial | poor | 1 | accepted | 41.50 | mandatory_language:de | mandatory_language:de |",
+        "| 4 | week1 | ok | 1 | filtered_out |  | - | - |",
+    ]
 
 
 @pytest.fixture
@@ -153,22 +209,28 @@ def test_an_eval_run_exits_by_its_runs_end(
     code: int,
 ) -> None:
     monkeypatch.setattr(cli_golden, "start", replaced(StartedRun(eval_run_id=7, operation_id=9)))
-    metrics: dict[str, JSONValue] = {"failed": "interrupted"} if status == "failed" else {}
+    metrics: dict[str, JSONValue] = {"failed": "interrupted"} if status == "failed" else {"gate": "passed"}
     monkeypatch.setattr(cli_golden, "wait", replaced(cli_golden.RunEnd(status, metrics, Decimal("0.1"))))
+    monkeypatch.setattr(cli_golden, "case_table", replaced(["| the case table |"]))
     assert cli_golden.run_eval_command(eval_args()) == code  # type: ignore[arg-type]
     out, _ = capsys.readouterr()
-    assert out.strip() == cli_golden.summary(eval_run_id=7, status=status, metrics=metrics, cost="0.1")
+    assert out.splitlines() == [
+        "| the case table |",
+        cli_golden.summary(eval_run_id=7, status=status, metrics=metrics, cost="0.1"),
+    ]
 
 
 @pytest.mark.parametrize(
     ("argv", "raises", "said"),
     [
         (("--candidate", "1,2,3"), None, "a candidate is 'active' or five comma-separated ids"),
-        ((), LookupError("active_config has no rubric or prompt-schema version"), "no rubric"),
+        ((), NoCandidate("active_config has no rubric or prompt-schema version"), "no rubric"),
+        ((), NoCandidate("execution config 987 does not exist"), "no candidate to run: execution config 987"),
+        ((), NoActiveCases("golden"), "eval_no_cases: no active golden case"),
         ((), CandidateInvalid([FieldIssue("payload.evaluation.t2_band", "out_of_range", "x")]), "t2_band"),
         ((), DATABASE_ERROR, "database error (OperationalError)"),
     ],
-    ids=["malformed", "no-candidate", "invalid-payload", "database"],
+    ids=["malformed", "no-candidate", "unresolved-id", "no-cases", "invalid-payload", "database"],
 )
 def test_an_eval_run_that_cannot_start_exits_2_with_one_line(
     no_startup: None,
@@ -191,3 +253,54 @@ def test_an_eval_run_whose_wait_fails_exits_1(
     monkeypatch.setattr(cli_golden, "wait", replaced(raises=DATABASE_ERROR))
     assert cli_golden.run_eval_command(eval_args()) == cli_golden.FAILED  # type: ignore[arg-type]
     assert "database error (OperationalError)" in capsys.readouterr().err
+
+
+def test_a_lookup_bug_is_not_taken_for_a_missing_candidate(
+    no_startup: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Carry T19-e: the command catches `NoCandidate` by name, so a genuine `KeyError` (a `LookupError` too)
+    keeps its traceback instead of being printed as "no candidate"."""
+    monkeypatch.setattr(cli_golden, "start", replaced(raises=KeyError("a bug")))
+    with pytest.raises(KeyError, match="a bug"):
+        cli_golden.run_eval_command(eval_args())  # type: ignore[arg-type]
+
+
+# ---- the manual workflow (§18.6, Codex r1 #34; plan Task 20) -----------------------------------------------
+
+WORKFLOW: Final = Path(__file__).parents[2] / ".github/workflows/eval-manual.yml"
+_PINNED: Final = re.compile(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}")
+
+
+def test_the_manual_eval_workflow_is_dispatch_only_pinned_and_keyless() -> None:
+    text = WORKFLOW.read_text("utf-8")
+    doc: dict[Any, Any] = yaml.safe_load(text)
+    triggers: dict[str, Any] = doc["on"] if "on" in doc else doc[True]  # YAML 1.1 reads a bare `on` as true
+    assert set(triggers) == {"workflow_dispatch"}  # never on push or pull request
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert (inputs["route"]["options"], inputs["candidate"]["options"]) == (
+        ["production", "forced_critic"],
+        ["active"],
+    )
+    assert doc["permissions"] == {"contents": "read"}
+    steps = doc["jobs"]["eval"]["steps"]
+    assert all(_PINNED.fullmatch(step["uses"]) for step in steps if "uses" in step)
+    assert "${{ secrets.ANTHROPIC_API_KEY_EVAL }}" in text and "sk-ant" not in text
+    scripts = "\n".join(str(step.get("run", "")) for step in steps)
+    for command in (
+        "uv run jobhunter migrate",
+        "uv run jobhunter golden seed-adversarial",
+        "uv run jobhunter worker",
+        'uv run jobhunter eval run --kind golden --candidate "$CANDIDATE" --route "$ROUTE" --live',
+    ):
+        assert command in scripts, command
+    assert "JOBHUNTER_FAKE_LLM" not in str(doc["jobs"]["eval"]["env"])  # a live-configured worker
+    [cleanup] = [step for step in steps if "kill -TERM" in str(step.get("run", ""))]
+    assert cleanup["if"] == "always()" and steps[-1] is cleanup  # the secret files and the database go last
+
+
+def test_the_workflow_states_its_central_cost_from_pricing() -> None:
+    note = " ".join(line.lstrip("# ") for line in WORKFLOW.read_text("utf-8").splitlines()[:14])
+    per_case = central_cost_per_target(ModelPolicy())
+    repetitions = eval_runner.RETEST_CASES * 2  # ten cases, each scored twice at most
+    assert per_case == Decimal("0.052646")
+    assert f"{repetitions} x ${per_case} = ${(repetitions * per_case).quantize(Decimal('0.000001'))}" in note

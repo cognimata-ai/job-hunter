@@ -11,12 +11,14 @@ from types import MappingProxyType
 from typing import Any
 
 import pytest
-from jobhunter import cli_schema_dry_run
+from jobhunter import cli, cli_schema_dry_run
 from jobhunter.cli_schema_dry_run import NOT_STARTED, start_refusal
 from jobhunter.config import AppConfig, load_config
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import pricing, schema_dry_run
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS, text_input_bound
+from jobhunter.scoring.eval_runner import CandidateInvalid, NoCandidate
+from jobhunter.settings.validate import FieldIssue
 from jobhunter.types import get_object
 
 from tests.support.llm import v2_version
@@ -136,3 +138,86 @@ def test_the_workflow_states_the_worst_case_from_pricing() -> None:
     assert sum(per_try) * TRIES_PER_CASE == Decimal("1.383570")
     assert "The worst case is $1.383570" in note
     assert "at most 6 paid tries" in note
+
+
+# ---- a candidate's policy (M3 Task 20, Codex r2 B21, r3 B7) ------------------------------------------------
+
+
+def parse(*argv: str) -> argparse.Namespace:
+    return cli._build_parser().parse_args(["schema-dry-run", *argv])
+
+
+def test_a_candidate_policy_is_named_by_id_or_by_payload_never_both() -> None:
+    assert (parse().model_policy, parse().candidate_payload) == (None, None)
+    assert parse("--model-policy", "7").model_policy == 7
+    assert parse("--candidate-payload", "s.json").candidate_payload == "s.json"
+    with pytest.raises(SystemExit) as refused:
+        parse("--model-policy", "7", "--candidate-payload", "s.json")
+    assert refused.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("raises", "said"),
+    [
+        (
+            NoCandidate("model policy 7 does not exist"),
+            "schema-dry-run: model policy 7 does not exist; nothing sent",
+        ),
+        (
+            CandidateInvalid([FieldIssue("payload.evaluation.t2_band", "out_of_range", "x")]),
+            "schema-dry-run: the candidate payload is invalid: payload.evaluation.t2_band (out_of_range); "
+            "nothing sent",
+        ),
+    ],
+    ids=["unknown-policy", "invalid-payload"],
+)
+def test_a_candidate_that_does_not_resolve_starts_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raises: BaseException,
+    said: str,
+) -> None:
+    dev = config(tmp_path, "dev")
+    monkeypatch.setattr(cli_schema_dry_run, "startup_or_exit", lambda role: dev)
+    monkeypatch.setattr(cli_schema_dry_run, "configure_logging", lambda *a, **k: None)
+    seen: dict[str, Any] = {}
+
+    async def refusing(cfg: AppConfig, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise raises
+
+    monkeypatch.setattr(cli_schema_dry_run, "_dry_run", refusing)
+    path = tmp_path / "settings.json"
+    path.write_text('{"evaluation": {"t2_band": 7}}', encoding="utf-8")
+    assert cli_schema_dry_run.run_schema_dry_run(parse("--candidate-payload", str(path))) == NOT_STARTED
+    assert seen == {
+        "transport": "fake",
+        "version_id": None,
+        "model_policy_id": None,
+        "payload": {"evaluation": {"t2_band": 7}},
+    }
+    out = capsys.readouterr()
+    assert (out.out, out.err.strip()) == ("", said)
+
+
+def test_an_unreadable_candidate_payload_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dev = config(tmp_path, "dev")
+    monkeypatch.setattr(cli_schema_dry_run, "startup_or_exit", lambda role: dev)
+    monkeypatch.setattr(cli_schema_dry_run, "configure_logging", lambda *a, **k: None)
+
+    def never(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("an unreadable payload must not start the dry-run")
+
+    monkeypatch.setattr(cli_schema_dry_run, "_dry_run", never)
+    bad = tmp_path / "bad.json"
+    bad.write_text("{no json", encoding="utf-8")
+    assert cli_schema_dry_run.run_schema_dry_run(parse("--candidate-payload", str(bad))) == NOT_STARTED
+    missing = tmp_path / "missing.json"
+    assert cli_schema_dry_run.run_schema_dry_run(parse("--candidate-payload", str(missing))) == NOT_STARTED
+    assert capsys.readouterr().err.splitlines() == [
+        "schema-dry-run: the candidate payload is no JSON (line 1); nothing sent",
+        "schema-dry-run: FileNotFoundError; nothing sent",
+    ]
