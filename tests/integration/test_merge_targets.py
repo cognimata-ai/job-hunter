@@ -19,7 +19,7 @@ Every datum is invented.
 import asyncio
 import hashlib
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -282,7 +282,7 @@ async def jsearch_job(engine: AsyncEngine, owner: Any, native_id: str, at: Any, 
 
 async def two_merges(
     engine: AsyncEngine, owner: Any, at: Any, caller: str
-) -> tuple[int, int, Callable[[], Awaitable[object]]]:
+) -> tuple[int, int, Callable[[], Coroutine[Any, Any, object]]]:
     """Two jobs that one transaction of `caller` merges away, in that order, and that transaction (not run
     yet): identity's sighting of three jobs' keys, `resolve_conflict(merge)` of a conflict with two
     candidates, or `groups.confirm_group` of a group of three."""
@@ -342,7 +342,7 @@ async def test_a_transaction_of_several_merges_locks_every_hold_row_before_its_f
             sa.text("SELECT id FROM bulk_operations WHERE id = :b FOR NO KEY UPDATE"), {"b": operation}
         )
         holder_pid = int((await holder.execute(_PID)).scalar_one())
-        merging = asyncio.create_task(work())
+        merging: asyncio.Task[object] = asyncio.create_task(work())
 
         async def waiting() -> bool:
             return merging.done() or any(w.relation == "bulk_operations" for w in lock_wait_details(migrated))
