@@ -1,6 +1,6 @@
 """The user's actions across a merge and an unmerge (spec §8.6.1 steps 1 and 3, §8.6.2 step 4; plan M3 Task
-22, R1, M1 Deviation 7): `merge.coalesce_user_actions` and `merge.restore_user_actions`, run inside the merge
-and the unmerge.
+22, R1, M1 Deviation 7): `user_actions.coalesce_user_actions` and `user_actions.restore_user_actions`, run
+inside the merge and the unmerge.
 
 - A merge snapshots both jobs' `user_job_actions` rows into `merge_events.evidence`, then each of `seen_at`,
   `saved_at`, `applied_at` and `hidden_at` of the into-job becomes the earliest non-null of the two; the notes
@@ -23,8 +23,8 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
-from jobhunter.dedup import merge
 from jobhunter.dedup.merge import unmerge
+from jobhunter.dedup.user_actions import coalesce_user_actions
 from jobhunter.normalize.keys import AdKey
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -173,9 +173,9 @@ async def test_coalesce_user_actions_without_a_cut_with_one_row_and_with_none(en
         # only the from-job has a row: the into-job gets its values, the note after the separator
         await put_user_actions(conn, lonely.job_id, applied_at=t, note="Unterlagen nachreichen.")
     async with engine.begin() as conn:
-        await merge.coalesce_user_actions(conn, from_job=source.job_id, into_job=into.job_id)
-        await merge.coalesce_user_actions(conn, from_job=lonely.job_id, into_job=empty_into.job_id)
-        await merge.coalesce_user_actions(conn, from_job=empty_from.job_id, into_job=empty_into.job_id)
+        await coalesce_user_actions(conn, from_job=source.job_id, into_job=into.job_id)
+        await coalesce_user_actions(conn, from_job=lonely.job_id, into_job=empty_into.job_id)
+        await coalesce_user_actions(conn, from_job=empty_from.job_id, into_job=empty_into.job_id)
     exact = await user_actions(engine, into.job_id)
     assert exact.note == f"{into_note}\n{separator(source.job_id)}\n{from_note}" and len(exact.note) == 20_000
     assert exact.hidden_at == t
@@ -379,8 +379,8 @@ async def test_the_cut_keeps_the_into_notes_text_whole_at_the_boundary(engine: A
         await put_user_actions(conn, source_a.job_id, note="Anhang")
         await put_user_actions(conn, source_b.job_id, note="Anhang")
     async with engine.begin() as conn:
-        await merge.coalesce_user_actions(conn, from_job=source_a.job_id, into_job=tight.job_id)
-        await merge.coalesce_user_actions(conn, from_job=source_b.job_id, into_job=full.job_id)
+        await coalesce_user_actions(conn, from_job=source_a.job_id, into_job=tight.job_id)
+        await coalesce_user_actions(conn, from_job=source_b.job_id, into_job=full.job_id)
     assert (await user_actions(engine, tight.job_id)).note == "t" * 19_996 + "\n[…]"
     assert (await user_actions(engine, full.job_id)).note == "f" * 19_997
 

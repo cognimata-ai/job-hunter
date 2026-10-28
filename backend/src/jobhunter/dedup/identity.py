@@ -99,6 +99,7 @@ from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge
+from jobhunter.dedup.user_actions import ACTION_TIMESTAMPS
 from jobhunter.errors import DomainError, FencedOut, InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.normalize.fields import CanonicalFields, ObservationView, WatchlistDisplay, select_canonical
@@ -271,14 +272,14 @@ def tombstone_key_hash(key: AdKey) -> bytes:
 
 
 def _tombstone_actions(user_actions: JSONValue) -> tuple[dict[str, datetime], tuple[str, ...]]:
-    """The user-action timestamps of `job_tombstones.user_actions` (step 3): each of `merge.ACTION_TIMESTAMPS`
+    """The user-action timestamps of `job_tombstones.user_actions` (step 3): each of `ACTION_TIMESTAMPS`
     that holds an ISO 8601 time with its offset, and the names of those that hold something else (dropped,
     never guessed). Any other key is ignored."""
     if not isinstance(user_actions, dict):
         return {}, ()
     found: dict[str, datetime] = {}
     unreadable: list[str] = []
-    for name in merge.ACTION_TIMESTAMPS:
+    for name in ACTION_TIMESTAMPS:
         value = user_actions.get(name)
         if value is None:
             continue
@@ -525,7 +526,7 @@ async def _restore_actions(
     if unreadable:
         log.warning("tombstone_actions_unreadable", tombstone_id=tombstone_id, fields=list(unreadable))
     if restored:
-        stamps = {name: restored.get(name) for name in merge.ACTION_TIMESTAMPS}
+        stamps = {name: restored.get(name) for name in ACTION_TIMESTAMPS}
         await conn.execute(_RESTORE_ACTIONS, {"job": job_id, **stamps})
     log.info(
         "job_restored_from_tombstone", job_id=job_id, tombstone_id=tombstone_id, actions=sorted(restored)
