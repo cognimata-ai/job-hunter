@@ -104,9 +104,14 @@ class ScoreGraphs:
     target: ScoreTargetGraph
 
 
+# The prefix of every cycle's checkpoint thread (`thread_id`): the retention finds a cycle's thread by it
+# (`privacy.retention`'s `cycle_threads` and `score_cycles`).
+THREAD_PREFIX: Final = "cycle-"
+
+
 def thread_id(cycle_id: int) -> str:
     """The cycle's checkpoint thread (§9.3)."""
-    return f"cycle-{cycle_id}"
+    return f"{THREAD_PREFIX}{cycle_id}"
 
 
 def invoke_config(ctx: ScoreContext) -> RunnableConfig:

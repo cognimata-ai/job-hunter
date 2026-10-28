@@ -165,6 +165,14 @@ mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_tar
 7. the `batch_items` of T with their `llm_calls` (a deferred pair), then every other `llm_calls` row of T's
    attempts; the spend ledger rows stay;
 8. the `score_attempts` of T; 9. T itself.
+Step 7 is the schedule's exception: it writes `llm_calls` rows (step 9 of the lock schedule) after rows of
+step 10 (T, its drafts and critic notes, its items), an order the foreign keys force (a draft and a critic
+note reference their call, an item and its call each other), which the spec's steps follow. For the retention
+it is harmless: its rows are dead (terminal targets of an inactive tuple, and an unresolved submission's items
+are never among them, so no batch-item processing or settlement still reaches them). For M5's purges it is
+safe only because a purge chunk takes its job rows `FOR UPDATE` first (step 4), which serialises it with the
+batch-item processing, which holds the item's job row `FOR SHARE` (`batch_items`, through
+`publish.lock_config_and_job`).
 `ranking.bump` is the caller's (a purge's; the retention's targets are of an inactive tuple, which no view
 reads). The log line has the counts and at most the first `LOGGED_IDS` target ids.
 

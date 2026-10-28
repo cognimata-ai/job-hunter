@@ -766,15 +766,17 @@ async def thread_rows(engine: AsyncEngine, thread: str) -> list[int]:
 
 
 async def ended_cycle(
-    conn: AsyncConnection, llm_tuple_id: int, *, days: int, status: str = "completed"
+    conn: AsyncConnection, llm_tuple_id: int, *, days: int, status: str = "completed", thread: bool = True
 ) -> int:
-    """A cycle that ended `days` ago in `status`, with its checkpoint thread."""
+    """A cycle that ended `days` ago in `status`, with its checkpoint thread unless `thread` is false (an
+    earlier pass deleted it)."""
     cycle = await insert_cycle(conn, llm_tuple_id, status=status)
     await conn.execute(
         sa.text("UPDATE score_cycles SET started_at = :at, finished_at = :at WHERE id = :c"),
         {"at": utcnow() - timedelta(days=days), "c": cycle},
     )
-    await insert_thread(conn, thread_id(cycle))
+    if thread:
+        await insert_thread(conn, thread_id(cycle))
     return cycle
 
 
@@ -822,6 +824,20 @@ async def test_a_cycle_goes_13_months_after_it_ended_once_its_thread_is_gone(
     assert (report["cycle_threads"], report["score_cycles"]) == (2, 1)
     assert await ids_in(engine, "score_cycles", (old, recent)) == {recent}
     assert await scalar(engine, "SELECT cycle_id FROM score_attempts WHERE id = :a", a=attempt) is None
+
+
+async def test_a_failed_cycle_goes_13_months_after_it_ended(
+    engine, current_epoch, queue_app, migrated, cv_store
+) -> None:
+    """L6312: `score_cycles` deletes a `failed` cycle as it deletes a `completed` one: ended 400 days ago,
+    its thread purged by an earlier pass, it goes; one failed 396 days ago stays."""
+    async with engine.begin() as c:
+        tuple_id = await activate_score_tuple(c)
+        old = await ended_cycle(c, tuple_id, days=400, status="failed", thread=False)
+        recent = await ended_cycle(c, tuple_id, days=396, status="failed", thread=False)
+    report = await retention_pass(engine, queue_app, migrated, cv_store)
+    assert (report["cycle_threads"], report["score_cycles"]) == (0, 1)
+    assert await ids_in(engine, "score_cycles", (old, recent)) == {recent}
 
 
 async def test_a_cycle_whose_thread_deletion_failed_keeps_its_row_and_both_go_in_a_later_pass(
@@ -955,6 +971,40 @@ async def test_a_batch_history_ages_out_13_months_after_its_items_went_then_its_
     assert await ids_in(engine, "batch_submissions", every) == {s for s, _ in unresolved}
     assert await ids_in(engine, "bulk_operations", (aged, held)) == {held}
     assert await target_ids(engine, [t for _, t in unresolved]) == {t for _, t in unresolved}
+
+
+async def test_a_rejected_submission_goes_13_months_after_its_submit_start_once_its_items_went(
+    engine, current_epoch, queue_app, migrated, cv_store
+) -> None:
+    """Deviation 31: a `submit_rejected` submission ended at its submit-start. One started 400 days ago (and
+    created 600 days ago) goes in the pass that deletes its superseded target with the item; one started 396
+    days ago stays although it was created 500 days ago: its clock is `submit_started_at`, not
+    `created_at`."""
+    now = utcnow()
+    async with engine.begin() as c:
+        await activate_score_tuple(c)
+        superseded = await superseded_tuple(c)
+        operation = await insert_bulk_operation(c, superseded, state="cancelled")
+        old, old_target = await history_submission(
+            c,
+            superseded,
+            operation,
+            state="submit_rejected",
+            created_at=now - 600 * DAY,
+            submit_started_at=now - 400 * DAY,
+        )
+        young, young_target = await history_submission(
+            c,
+            superseded,
+            operation,
+            state="submit_rejected",
+            created_at=now - 500 * DAY,
+            submit_started_at=now - 396 * DAY,
+        )
+    report = await retention_pass(engine, queue_app, migrated, cv_store, now=now)
+    assert (report["score_history"], report["batch_submissions"]) == (2, 1)
+    assert await target_ids(engine, [old_target, young_target]) == set()  # a rejection needs no item
+    assert await ids_in(engine, "batch_submissions", (old, young)) == {young}
 
 
 async def quarantined(engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, n: int) -> tuple[Any, int]:

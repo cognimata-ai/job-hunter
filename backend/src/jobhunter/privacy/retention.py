@@ -107,10 +107,10 @@ body that the newest response still needs. The controller records this as a plan
   kept (`retention_targets_kept`, counts only); the fault point `retention.score_history.before_chunk` lies
   between the two. The deletion takes the bulk rows before the target rows (Ruling P52). No purge fence is
   needed (L6367): only terminal targets of inactive tuples go.
-- `cycle_threads` (L6320): the checkpoint threads `cycle-<id>` (`graphs.score.graph.thread_id`) of the
-  cycles that ended (`finished_at`) 14 days ago, found through the cycle row as `checkpoints` finds a run's
-  threads: a `cycle-` name without a cycle is never touched, and the prefix never matches the profile
-  graphs' `profile-` or `queries-` (B R17).
+- `cycle_threads` (L6320): the checkpoint threads `cycle-<id>` (`graphs.score.graph.thread_id` and its
+  `THREAD_PREFIX`) of the cycles that ended (`finished_at`) 14 days ago, found through the cycle row as
+  `checkpoints` finds a run's threads: a `cycle-` name without a cycle is never touched, and the prefix never
+  matches the profile graphs' `profile-` or `queries-` (B R17).
 - `score_cycles` (L6312): 13 months after `finished_at`, once its thread has no row left in any of the
   saver's tables; its attempts keep `cycle_id` NULL (their foreign key).
 - `batch_submissions` (Deviation 31, a rule §20.1 does not list): a terminal submission (`reconciled`,
@@ -179,6 +179,7 @@ from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.graphs.profile.graph import THREAD_PREFIXES, thread_operation_id
+from jobhunter.graphs.score.graph import THREAD_PREFIX as CYCLE_THREAD_PREFIX
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.profile.storage import CvStore
@@ -239,9 +240,9 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
 )
 
-# A cycle's checkpoint thread (`graphs.score.graph.thread_id`: `cycle-<id>`), whether any of the saver's
-# tables still holds a row of it, and the cycles that ended before the cutoff.
-_CYCLE_THREAD: Final = "('cycle-' || c.id)"
+# A cycle's checkpoint thread (`graphs.score.graph.thread_id`: the prefix and the cycle's id), whether any of
+# the saver's tables still holds a row of it, and the cycles that ended before the cutoff.
+_CYCLE_THREAD: Final = f"('{CYCLE_THREAD_PREFIX}' || c.id)"
 _CYCLE_THREAD_ROWS: Final = (
     f"(EXISTS (SELECT 1 FROM checkpoints k WHERE k.thread_id = {_CYCLE_THREAD}) "  # noqa: S608
     f"OR EXISTS (SELECT 1 FROM checkpoint_blobs b WHERE b.thread_id = {_CYCLE_THREAD}) "
@@ -309,6 +310,8 @@ _DELETES: Final[dict[str, TextClause]] = {
     # released one once the reconciler lists it no more (`listed_since`, `batches.RELEASED_LISTED_FOR`).
     "batch_submissions": q(
         "DELETE FROM batch_submissions s WHERE ((s.state = 'reconciled' AND s.reconciled_at < :cutoff) "
+        # `submit_started_at <= :listed_since` is defensive: `released_at < :cutoff` implies it (a release
+        # follows its submit-start, and the cutoff lies 13 months back, the listing's end 29 days)
         "OR (s.state = 'released' AND s.submit_started_at <= :listed_since AND s.released_at < :cutoff) "
         "OR (s.state = 'submit_rejected' AND s.submit_started_at < :cutoff) "
         "OR (s.state = 'abandoned' AND s.created_at < :cutoff)) "
