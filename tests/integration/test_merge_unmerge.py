@@ -23,6 +23,9 @@ from tests.support.collect import (
 )
 from tests.support.faults import PausePoint
 from tests.support.groups import BERLIN
+from tests.support.m3 import insert_job
+from tests.support.pg import PgServer, lock_wait_details
+from tests.support.procs import await_until
 
 pytestmark = pytest.mark.integration
 
@@ -324,6 +327,9 @@ async def test_merge_takes_the_from_job_out_of_its_group_and_refuses_fenced_jobs
     assert snapshot.evidence["snapshot"]["ad_keys"] == [
         {"key_ns": "htidocid", "key_value": "GB", "exclusive": False}
     ]
+    # neither job has user actions or a target (Task 22)
+    assert snapshot.evidence["snapshot"]["user_job_actions"] == []
+    assert snapshot.evidence["snapshot"]["non_terminal_target_ids"] == []
     # the representative left: the group elects the next member (C, first seen before D)
     groups = {
         r.id: r
@@ -545,4 +551,62 @@ async def test_no_eligible_member_left_records_no_active_member(engine, current_
     assert tuple(row) == ("active", None, "no_active_member", "member_left")
     assert (
         await scalar(engine, "SELECT count(*) FROM duplicate_group_members WHERE group_id = :g", g=group) == 2
+    )
+
+
+async def test_a_merge_never_touches_a_synthetic_golden_case_job(engine: AsyncEngine) -> None:
+    """Task 19's synthetic jobs have no postings and never merge (Task 22): either side refused, nothing
+    written."""
+    async with engine.begin() as c:
+        synthetic = await insert_job(c, synthetic_eval=True)
+        real = await insert_job(c)
+    for from_job, into_job in ((synthetic, real), (real, synthetic)):
+        with pytest.raises(InvariantViolation, match="synthetic"):
+            async with engine.begin() as c:
+                await merge_jobs(
+                    c,
+                    from_job_id=from_job.job_id,
+                    into_job_id=into_job.job_id,
+                    kind="user_confirmed_merge",
+                    evidence={},
+                    recompute=False,
+                )
+    assert await scalar(engine, "SELECT count(*) FROM merge_events") == 0
+    assert await scalar(engine, "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NOT NULL") == 0
+
+
+async def test_a_standalone_merge_takes_active_config_before_the_job_rows(
+    engine: AsyncEngine, migrated: PgServer
+) -> None:
+    """Task 22 (Task 15's live hook, the score lane's step 2): a merge that locks its own jobs takes
+    `active_config FOR SHARE` first, so under an activation's `FOR UPDATE` it waits holding no job row."""
+    async with engine.begin() as c:
+        source, into = await insert_job(c), await insert_job(c)
+
+    async def merging() -> int:
+        async with engine.begin() as c:
+            return await merge_jobs(
+                c,
+                from_job_id=source.job_id,
+                into_job_id=into.job_id,
+                kind="user_confirmed_merge",
+                evidence={},
+                recompute=False,
+            )
+
+    async with engine.connect() as holder:
+        await holder.execute(sa.text("BEGIN"))
+        await holder.execute(sa.text("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE"))
+        task = asyncio.create_task(merging())
+
+        async def waiting() -> bool:
+            return task.done() or any(w.relation == "active_config" for w in lock_wait_details(migrated))
+
+        await await_until(waiting, 10, 0.02)
+        assert not task.done()
+        assert [await job_lockable(engine, job.job_id) for job in (source, into)] == [True, True]
+        await holder.execute(sa.text("ROLLBACK"))
+    assert await asyncio.wait_for(task, 10) > 0
+    assert await scalar(engine, "SELECT merged_into_job_id FROM jobs WHERE id = :j", j=source.job_id) == (
+        into.job_id
     )

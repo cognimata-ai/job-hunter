@@ -14,7 +14,8 @@ r1 #36, r3 B14, A1 issue 27).
   deferred member deferred while `deferral_eligible` holds against the new representative and returns it to
   `pending` otherwise; a full-text twin is elected (also one without a target yet) and is an always-include
   candidate; a representative whose new revision has no target yet is not re-elected; a member that leaves on
-  a revalidation, or is merged away (merge step 5), has its deferred target returned to `pending`.
+  a revalidation has its deferred target returned to `pending`, and one merged away has it cancelled
+  `job_merged` (merge step 4, before it leaves the group in step 5; M3 Task 22).
 
 Groups of canonical jobs (`tests.support.groups.canonical_job`) pass G1-G5 with one another; the others are
 `tests.support.m3` jobs with membership rows written directly. Every datum is invented.
@@ -683,11 +684,12 @@ async def test_a_member_that_leaves_on_a_revalidation_has_its_deferred_target_re
     assert (stays.state, stays.deferred_group_id) == ("deferred_duplicate", group)
 
 
-async def test_a_member_merged_away_has_its_deferred_target_returned(
+async def test_a_member_merged_away_has_its_deferred_target_cancelled(
     engine, current_epoch, job_with_postings
 ) -> None:
-    """Merge step 5 (`leave_group`): the merged member leaves its group, and its deferred target returns to
-    `pending` in the merge's transaction; the other member stays deferred."""
+    """Merge step 4 before step 5 (M3 Task 22, §8.6.1): the merged member's deferred target is cancelled
+    `job_merged`, its group column cleared, in the merge's transaction, and the member then leaves its group
+    (`leave_group`), which returns nothing; the other member stays deferred."""
     group, made = await deferred_group(engine, job_with_postings, "Vandelay")
     _, v, w = sorted(made)
     other = await jobs_maker(engine, job_with_postings)("adzuna", description_text=varied(80, 200))
@@ -696,7 +698,7 @@ async def test_a_member_merged_away_has_its_deferred_target_returned(
             conn, from_job_id=w, into_job_id=other, kind="user_confirmed_merge", evidence={"rule": "test"}
         )
     merged = await swept_of(engine, made[w])
-    assert (merged.state, merged.deferred_group_id) == ("pending", None)
+    assert (merged.state, merged.state_reason, merged.deferred_group_id) == ("cancelled", "job_merged", None)
     stays = await swept_of(engine, made[v])
     assert (stays.state, stays.deferred_group_id) == ("deferred_duplicate", group)
 

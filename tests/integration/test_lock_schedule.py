@@ -24,6 +24,10 @@ commit.
   completes it; the other order waits on the target row only;
 - Carry T16-c: `batches.abandon` against node 9's `targets._cancel` of a batched target: both take the target
   rows before the attempts, so whichever comes second waits on the target row.
+- Carry T13-a (Task 22): an owner's `publish` against a merge's cancellation meets at the job row (`FOR
+  SHARE` against the merge's `FOR UPDATE`, step 4) whichever comes first; an owner's `fail`, which takes no
+  job row, against the merge (the job rows, the bulk row of the follow-up hold, then the target row, Ruling
+  P52) is T14-c's pair: forced into the deadlock, one side is aborted and its retry completes it.
 
 Every datum is invented.
 """
@@ -42,6 +46,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
+from jobhunter.dedup import merge
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.sanitize import is_retryable_db_error
 from jobhunter.graphs.score.context import ScoreContext
@@ -74,7 +79,7 @@ from tests.support.batches import (
 )
 from tests.support.faults import PausePoint
 from tests.support.llm import FakeLLM
-from tests.support.m3 import active_ids, insert_cycle
+from tests.support.m3 import active_ids, insert_cycle, insert_job
 from tests.support.pg import LockWait, PgServer, lock_wait_details
 from tests.support.procs import await_until
 from tests.support.profile import OpRunner
@@ -781,3 +786,114 @@ async def test_abandon_and_node_9_s_cancellation_take_the_target_rows_before_the
     assert (row.state, row.state_reason) == ("cancelled", "revision_superseded")
     (submitted,) = await submission_rows(engine)
     assert submitted.state == "abandoned"
+
+
+# ---- Carry T13-a (Task 22): an owner's publish or fail against a merge's cancellation ---------------------
+
+
+async def merge_cancel(engine: AsyncEngine, from_job_id: int, into_job_id: int) -> int:
+    """A standalone merge (`merge.merge_jobs`): `active_config FOR SHARE`, both job rows `FOR UPDATE` (step
+    4), the bulk rows of the from-job's follow-up holds (step 7, Ruling P52), then its targets cancelled
+    `job_merged` (step 10), and the ranking bump last. The jobs have no posting: nothing to recompute."""
+    async with engine.begin() as conn:
+        event = await merge.merge_jobs(
+            conn,
+            from_job_id=from_job_id,
+            into_job_id=into_job_id,
+            kind="user_confirmed_merge",
+            evidence={},
+            recompute=False,
+        )
+        await ranking.bump(conn)
+        return event
+
+
+@pytest.mark.parametrize("first", ["owner", "merge"])
+@pytest.mark.parametrize("owner_node", ["fail", "publish"])
+async def test_an_owner_publish_or_fail_and_a_merge_s_cancellation_never_deadlock_unrecoverably(
+    engine: AsyncEngine,
+    migrated: PgServer,
+    deps: ScoreDeps,
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_node: str,
+    first: str,
+) -> None:
+    # the publish takes the job row FOR SHARE (step 1a) before its target row: the merge's FOR UPDATE meets
+    # it there; the fail takes the target row (step 5), then the bulk row (step 7), as against node 9
+    claimed = await claimed_target(engine)
+    async with engine.begin() as conn:
+        await activate_score_tuple(conn)
+        operation, item = await followup_hold(
+            conn, claimed.llm_tuple_id, claimed.target_id, hold=Decimal("0.05")
+        )
+        into = await insert_job(conn)
+    owner_work: Callable[[], Awaitable[Any]]
+    if owner_node == "publish":
+        fake_llm.answer("generate", claimed.job_revision_id, synthetic_c_draft())
+        state = await state_at_terminal(deps, claimed, monkeypatch)
+        owner_work = lambda: run_publish(deps, claimed, state)  # noqa: E731
+    else:
+        owner_work = lambda: run_fail(deps, claimed, "invalid_output")  # noqa: E731
+    real_release = bulk.release_target_hold
+    gate = asyncio.Event()
+    paused: dict[str, asyncio.Task[Any] | None] = {"task": None}
+    reached = asyncio.Event()
+
+    async def held_release(conn: AsyncConnection, target_id: int) -> Decimal:
+        if asyncio.current_task() is paused["task"] and not gate.is_set():
+            reached.set()  # the target row is held; the bulk row comes next (owner) or is held (merge)
+            await gate.wait()
+        return await real_release(conn, target_id)
+
+    monkeypatch.setattr(bulk, "release_target_hold", held_release)
+    retries = Retried()
+    merge_work = lambda: merge_cancel(engine, claimed.job_id, into.job_id)  # noqa: E731
+    met_at = "jobs" if owner_node == "publish" else "score_targets"
+    met_key = str(claimed.job_id if owner_node == "publish" else claimed.target_id)
+    if first == "owner":
+        owner = background(retries.run("owner", owner_work))
+        paused["task"] = owner
+        await asyncio.wait_for(reached.wait(), WAIT_S)  # the owner holds the target row
+        merging = background(retries.run("merge", merge_work))
+        wait = one_wait(await waits(migrated, owner, merging), met_at)
+        assert wait.key == met_key
+        # the publish's job row stops the merge before its bulk row; past the fail, the merge took it
+        assert await free(engine, "bulk_operations", operation) is (owner_node == "publish")
+        gate.set()
+        await settle(owner, merging)
+        if owner_node == "publish":
+            assert retries.retried == []
+        else:
+            assert retries.retried in (["owner:40P01"], ["merge:40P01"])
+    else:
+        merging = background(retries.run("merge", merge_work))
+        paused["task"] = merging
+        await asyncio.wait_for(reached.wait(), WAIT_S)  # the merge holds its job, bulk and target rows
+        owner = background(retries.run("owner", owner_work))
+        wait = one_wait(await waits(migrated, merging, owner), met_at)
+        assert wait.key == met_key  # the owner's first lock it shares: it holds nothing the merge needs
+        gate.set()
+        await settle(merging, owner)
+        assert retries.retried == []
+    target = await target_of(engine, claimed.target_id)
+    ended = await attempt_end(engine, claimed.attempt_id)
+    # the outcome of the two in a serial order: merged first (the owner finds its claim lost and writes
+    # nothing); published first (left alone: only a published target is); failed first (its attempt keeps
+    # `failed_invalid_output`, then the failed target of the merged job cancelled)
+    if first == "merge" or retries.retried == ["owner:40P01"]:
+        assert (target.state, target.state_reason) == ("cancelled", "job_merged")
+        assert (ended.outcome, ended.outcome_detail) == ("cancelled", "job_merged")
+    elif owner_node == "publish":
+        assert (target.state, ended.outcome) == ("published_accepted", "published_accepted")
+    else:
+        assert retries.retried == ["merge:40P01"]
+        assert (target.state, target.state_reason) == ("cancelled", "job_merged")
+        assert (ended.outcome, ended.outcome_detail) == ("failed_invalid_output", "invalid_output")
+    released = await hold_of(engine, operation, item)  # given back exactly once
+    assert released.followup_held_usd == 0 and released.hold_released_at is not None
+    async with engine.connect() as conn:  # the merge itself always went through
+        merged_into = await conn.execute(
+            sa.text("SELECT merged_into_job_id FROM jobs WHERE id = :j"), {"j": claimed.job_id}
+        )
+        assert merged_into.scalar_one() == into.job_id

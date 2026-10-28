@@ -68,6 +68,10 @@ scope apply has retained jobs to precompute and the active scope's view is compl
 
 M3 Task 14: `queued_run` and `manual_run_id` record the active tuple on the run, as the run creation does
 (node 9 and I5 read the run's tuple).
+
+M3 Task 22: `user_actions(engine, job_id)` reads a job's `user_job_actions` row (`None` without one) and
+`put_user_actions(conn, job_id, **values)` writes one as the M4 routes will (the timestamps and the note
+given, `updated_at := now()`), so the merge, unmerge and tombstone tests seed and read the user's actions.
 """
 
 import asyncio
@@ -1604,3 +1608,46 @@ async def m1_rows(engine: AsyncEngine) -> M1Rows:
         params = {"job": old.job_id, "hash": os.urandom(32), "embedding": used}
         ids["revision"] = int((await conn.execute(_EMBEDDED_REVISION, params)).scalar_one())
     return M1Rows(now=now, ids=MappingProxyType(ids))
+
+
+# ---- M3 Task 22 --------------------------------------------------------------------------------------------
+
+_USER_ACTIONS: Final = q(
+    "SELECT job_id, seen_at, saved_at, applied_at, hidden_at, note, updated_at FROM user_job_actions "
+    "WHERE job_id = :job"
+)
+_PUT_USER_ACTIONS: Final = q(
+    "INSERT INTO user_job_actions (job_id, seen_at, saved_at, applied_at, hidden_at, note) "
+    "VALUES (:job, :seen_at, :saved_at, :applied_at, :hidden_at, :note) ON CONFLICT (job_id) DO UPDATE SET "
+    "seen_at = EXCLUDED.seen_at, saved_at = EXCLUDED.saved_at, applied_at = EXCLUDED.applied_at, "
+    "hidden_at = EXCLUDED.hidden_at, note = EXCLUDED.note, updated_at = now()"
+)
+
+
+async def user_actions(engine: AsyncEngine, job_id: int) -> Any:
+    """The job's `user_job_actions` row (its four timestamps, note and `updated_at`), `None` without one."""
+    async with engine.connect() as conn:
+        return (await conn.execute(_USER_ACTIONS, {"job": job_id})).first()
+
+
+async def put_user_actions(
+    conn: AsyncConnection,
+    job_id: int,
+    *,
+    seen_at: datetime | None = None,
+    saved_at: datetime | None = None,
+    applied_at: datetime | None = None,
+    hidden_at: datetime | None = None,
+    note: str | None = None,
+) -> None:
+    """The job's `user_job_actions` row written with these values (every other column `NULL`), as the M4
+    routes leave it: an existing row replaced, its `updated_at := now()`."""
+    params = {
+        "job": job_id,
+        "seen_at": seen_at,
+        "saved_at": saved_at,
+        "applied_at": applied_at,
+        "hidden_at": hidden_at,
+        "note": note,
+    }
+    await conn.execute(_PUT_USER_ACTIONS, params)

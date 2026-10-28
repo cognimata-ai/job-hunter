@@ -896,8 +896,10 @@ async def split_member(conn: AsyncConnection, group_id: int, job_id: int) -> Non
 async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
     """The user confirms the group (§8.7): every other member is merged into the representative's job
     (`merge_jobs(user_confirmed_merge)`, whose step 5 dissolves the group when the last one left), with
-    `dedup_decisions(same, user_confirm)` for each pair; the representative is recomputed once, its
-    hard-filter results written, and the ranking bumped last. Returns the representative's job id.
+    `dedup_decisions(same, user_confirm)` for each pair, after the bulk rows of every member's follow-up holds
+    (`merge.lock_target_holds`: the merges cancel the members' targets, Ruling P52); the representative is
+    recomputed once, its hard-filter results written, and the ranking bumped last. Returns the
+    representative's job id.
 
     Raises `LookupError` for a group that does not exist, `InvariantViolation` for one that is not active or
     has no representative, and `FencedOut` for a fenced member, having written nothing."""
@@ -907,6 +909,8 @@ async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
     if rep is None:
         raise InvariantViolation(f"duplicate group {group_id} has no representative to merge into")
     into = int(rep)
+    # every merge's bulk rows before the first merge's target rows (Ruling P52, `merge.lock_target_holds`)
+    await merge.lock_target_holds(conn, [member for member in member_ids if member != into])
     evidence: dict[str, JSONValue] = {"rule": "user_confirm", "group_id": group_id}
     for member in member_ids:
         if member == into:
