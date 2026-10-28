@@ -75,7 +75,7 @@ CASES: list[tuple[str, Any, frozenset[str]]] = [
     ("schedule.interval_hours", 12, SCHEDULE),
     ("schedule.anchor_local", "07:30", SCHEDULE),
     ("schedule.include_paid", False, COLLECTION),
-    ("display.timezone", "Europe/Vienna", NONE),
+    ("display.timezone", "Europe/Vienna", SCHEDULE),
     ("display.ui_language", "de", NONE),
     ("scope.locations", [LOCATION], SCOPE_COLLECTION),
     ("scope.remote_within_germany", False, SCOPE_COLLECTION),

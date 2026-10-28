@@ -28,7 +28,7 @@ def test_projections_with_defaults_and_six_hour_interval() -> None:
         settings, jsearch=boot("jsearch"), adzuna=boot("adzuna"), serpapi=None, cells=4, now=NOW
     )
     assert proj["jsearch"] == {"units_per_run": 1.453, "refresh_cadence_days": 0.688, "cells": 4}
-    assert proj["arbeitnow"] == {"page_cap": 3, "expected_pages": 1.162}
+    assert proj["arbeitnow"] == {"page_cap": 3, "expected_pages": 1.343}
     assert proj["adzuna"] == {
         "calls_per_day": 16.0,
         "allowance_per_day": 67.5,
@@ -67,7 +67,11 @@ def test_a_binding_run_cap_a_guaranteed_gap_and_adzuna_rotation() -> None:
     warns, proj = quota_projections(capped, jsearch=None, adzuna=None, serpapi=None, cells=4, now=NOW)
     # 180 units over 30.96 days, 7 days per run: a fair share of 40.7 against an explicit cap of 10
     assert proj["jsearch"] == {"units_per_run": 10, "refresh_cadence_days": 2.8, "cells": 4}
-    assert [(w.code, w.detail) for w in warns] == [("paid_run_cap_binding", {"cap": 10, "fair_share": 40.7})]
+    # (and the Arbeitnow risk: 7 days expect 10.6 pages against a cap of 7, V8's 17.5 h per page)
+    assert [(w.code, w.detail) for w in warns] == [
+        ("paid_run_cap_binding", {"cap": 10, "fair_share": 40.7}),
+        ("arbeitnow_coverage_risk", {}),
+    ]
     warns, proj = quota_projections(
         seeded_run_settings(), jsearch=None, adzuna=None, serpapi=None, cells=200, now=NOW
     )
@@ -86,10 +90,10 @@ def test_a_binding_run_cap_a_guaranteed_gap_and_adzuna_rotation() -> None:
 
 
 def test_arbeitnow_risk_beyond_the_page_cap() -> None:
-    # a 400 h interval (beyond the 7-day maximum of the settings) expects 11.8 pages against a cap of 10
+    # a 400 h interval (beyond the 7-day maximum of the settings) expects 23.9 pages against a cap of 10
     long = seeded_run_settings(interval_s=400 * 3600)
     warns, proj = quota_projections(long, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
-    assert proj["arbeitnow"] == {"page_cap": 10, "expected_pages": 11.811}
+    assert proj["arbeitnow"] == {"page_cap": 10, "expected_pages": 23.857}
     assert "arbeitnow_coverage_risk" in codes(warns)
 
 
@@ -101,18 +105,39 @@ def _interval_hours_range() -> range:
     return range(low, high + 1)
 
 
-@pytest.mark.parametrize("hours", _interval_hours_range())
-def test_arbeitnow_coverage_risk_cannot_fire_within_the_settings_interval_range(hours: int) -> None:
-    """Plan Deviation 39, pinned for the spec owner (final review FR-10): with page 1 holding about 37 h and
-    `page_cap = min(10, max(3, ceil(h / 30) + 1))`, `h / 37 + 1 <= page_cap` for every interval §13.1
-    allows, so §6.8's `arbeitnow_coverage_risk` stays silent; it is a guard for a lower measured yield."""
+@pytest.mark.parametrize(
+    ("hours", "page_cap", "expected_pages", "warns"),
+    [
+        # `page_cap = min(10, max(3, ceil(h / 30) + 1))`, `expected_pages = h / 17.5 + 1` (V8: page 1 holds
+        # about 17.5 h of postings); the warning is `expected_pages > page_cap`, first true at 36 h
+        (24, 3, 2.371, False),
+        (35, 3, 3.0, False),  # 3.0 pages against a cap of 3: not more pages than allowed
+        (36, 3, 3.057, True),
+        (48, 3, 3.743, True),
+        (72, 4, 5.114, True),
+        (120, 5, 7.857, True),
+        (168, 7, 10.6, True),
+    ],
+)
+def test_arbeitnow_warning_fires_above_35_hours(
+    hours: int, page_cap: int, expected_pages: float, warns: bool
+) -> None:
+    """Spec 3.5 (U3, V8): page 1 holds about 17.5 h, so the warning fires above 35 h of the settings range."""
     settings = seeded_run_settings(interval_s=hours * 3600)
-    warns, proj = quota_projections(settings, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
-    assert "arbeitnow_coverage_risk" not in codes(warns)
-    arbeitnow = proj["arbeitnow"]
-    assert isinstance(arbeitnow, dict)
-    expected, cap = arbeitnow["expected_pages"], arbeitnow["page_cap"]
-    assert isinstance(expected, float) and isinstance(cap, int) and expected <= cap
+    found, proj = quota_projections(settings, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
+    assert proj["arbeitnow"] == {"page_cap": page_cap, "expected_pages": expected_pages}
+    assert [w for w in found if w.code == "arbeitnow_coverage_risk"] == (
+        [Warning("arbeitnow_coverage_risk")] if warns else []
+    )
+
+
+@pytest.mark.parametrize("hours", _interval_hours_range())
+def test_arbeitnow_warning_threshold_holds_for_every_interval_hour(hours: int) -> None:
+    """The warning is raised for every interval §13.1 allows above 35 h and for none up to it (the cap steps
+    up by one at 61, 91, 121 and 151 h, and the expected pages stay ahead of it from 36 h on)."""
+    settings = seeded_run_settings(interval_s=hours * 3600)
+    warns, _ = quota_projections(settings, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
+    assert ("arbeitnow_coverage_risk" in codes(warns)) == (hours > 35)
 
 
 def test_the_sweep_covers_the_whole_settings_range() -> None:

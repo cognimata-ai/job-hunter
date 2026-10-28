@@ -259,7 +259,7 @@ class Schedule(_Group):
 
 
 class Display(_Group):
-    timezone: Annotated[str, AfterValidator(_time_zone)] = "Europe/Berlin"  # IANA zone, display only
+    timezone: Annotated[str, AfterValidator(_time_zone)] = "Europe/Berlin"  # IANA zone: display, anchor_local
     ui_language: Literal["en", "de"] = "en"
 
 

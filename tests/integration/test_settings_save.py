@@ -415,6 +415,36 @@ async def test_disabling_the_schedule_is_a_schedule_save(logged_in_client, engin
     assert state.last_evaluated_slot == datetime(2026, 10, 22, 5, 15, tzinfo=UTC)  # 6 h slots from 05:15 UTC
 
 
+async def test_a_timezone_only_save_reanchors(logged_in_client, engine, clock) -> None:
+    """`display.timezone` is a `schedule` field (spec 3.5, U3): `anchor_local` is a wall time in that zone, so
+    a change of zone alone moves `anchor_utc` by the difference of the two zones' offsets and leaves the rest
+    of the schedule row as it was."""
+    berlin_anchor = datetime(2026, 10, 22, 4, tzinfo=UTC)  # 06:00 CEST (UTC+2) on the save date
+    async with engine.begin() as conn:  # the row as an earlier schedule save at NOW leaves it
+        await conn.execute(
+            text("UPDATE schedule_state SET anchor_utc = :a, last_evaluated_slot = :a"), {"a": berlin_anchor}
+        )
+    async with engine.connect() as conn:
+        before = (await conn.execute(text("SELECT * FROM schedule_state"))).one()
+    payload = await active_payload(logged_in_client)
+    assert (payload["display"]["timezone"], payload["schedule"]["anchor_local"]) == ("Europe/Berlin", "06:00")
+    payload["display"]["timezone"] = "America/New_York"
+    body = await save(logged_in_client, payload)
+    assert body["version"]["effect_classes"] == ["schedule"]
+    async with engine.connect() as conn:
+        state = (await conn.execute(text("SELECT * FROM schedule_state"))).one()
+    # 06:00 EDT (UTC-4) is 10:00 UTC: six hours later than 06:00 CEST (UTC+2), the offsets' difference
+    assert state.anchor_utc - before.anchor_utc == timedelta(hours=6)
+    assert state.anchor_utc == datetime(2026, 10, 22, 10, tzinfo=UTC)
+    # nothing else of the schedule changed: the interval and the switch are those of the active version, and
+    # the cursor is the latest slot at or before now (04:00 UTC: 6 h slots from the new anchor)
+    assert (state.interval_s, state.enabled) == (before.interval_s, before.enabled) == (6 * 3600, True)
+    assert state.last_evaluated_slot == datetime(2026, 10, 22, 4, tzinfo=UTC)
+    assert state.settings_version_id == body["version"]["id"] and state.updated_at == NOW
+    stored = (await version_row(engine, body["version"]["id"])).payload
+    assert stored["schedule"] == payload["schedule"] and stored["display"]["timezone"] == "America/New_York"
+
+
 # --- collection ---------------------------------------------------------------------------------------------
 
 

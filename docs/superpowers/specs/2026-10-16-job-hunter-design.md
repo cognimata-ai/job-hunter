@@ -1106,7 +1106,7 @@ def dry_run(proposed: Settings, active: Settings, now) -> DryRunResult:
     if az.calls_per_day > proposed.adzuna_cap_day:
         warns.append(W("adzuna_rotation", cadence_days=az.cadence_days))
     an_cap = min(10, max(3, ceil(proposed.interval_h / 30) + 1))
-    expected_pages = proposed.interval_h / 37 + 1              # page 1 ≈ 37 h of postings
+    expected_pages = proposed.interval_h / 17.5 + 1   # page 1 ≈ 17.5 h of postings (V8)
     proj["arbeitnow"] = dict(page_cap=an_cap, expected_pages=expected_pages)
     if expected_pages > an_cap:
         warns.append(W("arbeitnow_coverage_risk"))
@@ -4817,7 +4817,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `schedule.interval_hours` | int, 1–168 | `6` | schedule |
 | | `schedule.anchor_local` | `HH:MM`, converted once at save into `anchor_utc` (that local time on the save date in `display.timezone`) | `06:00` | schedule |
 | | `schedule.include_paid` | bool (applies to scheduled runs; "Run now" has its own checkbox) | `true` | collection |
-| Display | `display.timezone` | IANA zone, display only | `Europe/Berlin` | none |
+| Display | `display.timezone` | IANA zone; display, and the zone of `schedule.anchor_local` | `Europe/Berlin` | schedule |
 | | `display.ui_language` | `en \| de` | `en` | none |
 | Scope | `scope.locations[]` | 0–10 entries of `{label, gazetteer_id, lat, lon, radius_km}`, each chosen through the gazetteer search (§8.12, unique id). `radius_km` is an int, 1–200 (a city-only search uses a small radius such as 5; 0 is rejected because distance bands divide by it). | `[]` (onboarding requires ≥ 1 entry, or the remote toggle) | scope, collection |
 | | `scope.remote_within_germany` | bool | `true` | scope, collection |

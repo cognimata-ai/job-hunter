@@ -20,7 +20,6 @@ from jobhunter.db.seed import content_hash, load_settings_v1
 from jobhunter.db.sql import q
 from jobhunter.llm.budget import BudgetParams, month_of
 from jobhunter.llm.spend_ledger import ensure_month
-from jobhunter.quota import dryrun as quota_dryrun
 from jobhunter.settings import dryrun
 from jobhunter.settings.derive import derived
 from jobhunter.settings.model import Settings
@@ -120,7 +119,7 @@ async def test_defaults_with_one_location_and_four_queries(logged_in_client, clo
         "reset_at": "2026-11-22T08:37:22Z",  # 30.96 days on
     }
     assert projections["adzuna"]["calls_per_day"] == 32.0 and projections["serpapi_fallback"] is None
-    assert projections["arbeitnow"] == {"page_cap": 3, "expected_pages": 1.162}
+    assert projections["arbeitnow"] == {"page_cap": 3, "expected_pages": 1.343}
     assert projections["llm"] == {
         "bucket_rate_per_h": "0.125134",
         "bucket_capacity": "1.501613",
@@ -154,10 +153,11 @@ def change(*steps: tuple[str, Any]) -> Change:
 # 3,000 arrivals); a baseline without it is the $200 cap below.
 WARNING_CASES: list[tuple[str, Change, set[str]]] = [
     # a weekly interval: a fair share of 40.7 units against an explicit cap of 10
+    # (a weekly interval also expects 10.6 Arbeitnow pages against a cap of 7: V8's 17.5 h per page)
     (
         "paid_run_cap_binding",
         change(("schedule.interval_hours", 168), ("quota.paid_max_requests_per_run", 10)),
-        {"paid_run_cap_binding", "llm_cap_binding"},
+        {"paid_run_cap_binding", "arbeitnow_coverage_risk", "llm_cap_binding"},
     ),
     # 24 queries x 2 = 48 cells at 1.453 units per run: 8.3 days per refresh; Adzuna's 192 calls a day fit
     ("paid_refresh_slow", lambda doc: base(24), {"paid_refresh_slow", "llm_cap_binding"}),
@@ -212,13 +212,12 @@ async def test_each_warning_appears_exactly_when_its_condition_holds(
         assert body["projections"]["llm"]["targets_per_month"] == 0
 
 
-async def test_arbeitnow_risk_is_forwarded(logged_in_client, clock, monkeypatch) -> None:
-    """Within §13.1's 1 to 168 h the page cap always exceeds the expected pages (`h / 37 < ceil(h / 30)`), so
-    the test lowers the page yield to 5 h of postings, to show that the dry-run forwards the warning."""
+async def test_arbeitnow_risk_is_forwarded(logged_in_client, clock) -> None:
+    """With page 1 holding about 17.5 h of postings (V8) the weekly interval expects 10.6 pages against a cap
+    of 7, and the dry-run forwards the warning; the 6 h default expects 1.3 pages and gives none."""
     assert "arbeitnow_coverage_risk" not in codes(await post(logged_in_client, base()))
-    monkeypatch.setattr(quota_dryrun, "ARBEITNOW_HOURS_PER_PAGE", 5)
     body = await post(logged_in_client, with_(base(), "schedule.interval_hours", 168))
-    assert body["projections"]["arbeitnow"] == {"page_cap": 7, "expected_pages": 34.6}
+    assert body["projections"]["arbeitnow"] == {"page_cap": 7, "expected_pages": 10.6}
     assert codes(body) == {"arbeitnow_coverage_risk", "llm_cap_binding"}
 
 
