@@ -69,8 +69,9 @@ an hour, releases `reserved` entries older than 15 minutes whose recorded owner 
 online `dispatched` entries `ambiguous` once older than `max(15 min, deadline_s + 5 min)` (plan Deviation 24),
 one transaction per entry. A batch item's entry is never aged (L2979): its submission's processing settles
 it. `budget_counters` (heavy) recomputes the counters from the ledger with the §7.11 formula and corrects any
-drift under the month lock with the critical `llm.budget_counter_drift`. Both are fenced by the worker epoch
-first and let the worker's own `FencedOut` propagate (M1 Ruling FR-w).
+drift under the month lock with the critical `llm.budget_counter_drift`, and each active bulk operation's
+`spent_usd` from the entries it funded under the bulk row's lock (M3 Task 18). Both are fenced by the worker
+epoch first and let the worker's own `FencedOut` propagate (M1 Ruling FR-w).
 
 Nothing here logs or alerts with content: ids, states, amounts, model ids and codes only.
 """
@@ -1660,11 +1661,14 @@ async def last_call_of_attempt(conn: AsyncConnection, *, attempt_id: int, purpos
 
 # §7.11: counted(month) = Σ settled_usd (billed) + Σ reserved_usd (reserved, dispatched, ambiguous)
 # + Σ adjustments. An adjustment row (no M2 code writes one) counts its `reserved_usd`, its one mandatory
-# amount. `CAST(:month AS date) IS NULL` selects every month.
+# amount; a `not_billed` entry counts 0. `_COUNTED` is what one ledger row counts at, for the month's counters
+# and for a bulk operation's `spent_usd` alike. `CAST(:month AS date) IS NULL` selects every month.
+_COUNTED: Final = (
+    "CASE WHEN kind = 'adjustment' THEN reserved_usd WHEN state = 'billed' THEN settled_usd "
+    "WHEN state IN ('reserved', 'dispatched', 'ambiguous') THEN reserved_usd ELSE 0 END"
+)
 _COUNTERS = q(
-    "WITH amounts AS (SELECT budget_month, purpose_class, CASE WHEN kind = 'adjustment' THEN reserved_usd "
-    "WHEN state = 'billed' THEN settled_usd WHEN state IN ('reserved', 'dispatched', 'ambiguous') "
-    "THEN reserved_usd ELSE 0 END AS amount FROM llm_spend_ledger "
+    f"WITH amounts AS (SELECT budget_month, purpose_class, {_COUNTED} AS amount FROM llm_spend_ledger "  # noqa: S608
     "WHERE CAST(:month AS date) IS NULL OR budget_month = CAST(:month AS date)), "
     "sums AS (SELECT budget_month, SUM(amount) AS counted, "
     "SUM(amount) FILTER (WHERE purpose_class = 'scoring') AS scoring, "
@@ -1680,6 +1684,16 @@ _CORRECT = q(
     "UPDATE llm_budget SET counted_usd = :counted, scoring_counted_usd = :scoring, "
     "nonscoring_counted_usd = :nonscoring, updated_at = :now WHERE month = :month"
 )
+# §7.17 #7's first clause (A1 issue 29, M3 Task 18): an active bulk operation's `spent_usd` against what the
+# ledger entries it funded count at; `_LEDGER_SPENT` again under the bulk row's lock.
+_BULK_DRIFTS = q(
+    f"SELECT b.id FROM bulk_operations b WHERE b.state = 'active' AND b.spent_usd <> (SELECT "  # noqa: S608
+    f"COALESCE(SUM({_COUNTED}), 0) FROM llm_spend_ledger l WHERE l.bulk_operation_id = b.id) ORDER BY b.id"
+)
+_LEDGER_SPENT = q(
+    f"SELECT COALESCE(SUM({_COUNTED}), 0) FROM llm_spend_ledger WHERE bulk_operation_id = :id"  # noqa: S608
+)
+_CORRECT_BULK = q("UPDATE bulk_operations SET spent_usd = :spent WHERE id = :id")
 
 
 @dataclass(frozen=True)
@@ -1722,18 +1736,26 @@ async def _drifting_months(conn: AsyncConnection) -> list[date]:
 async def reconcile_budget_counters(ctx: ReconcileContext) -> int:
     """§17.4 `budget_counters`: every month whose counters differ from the ledger is corrected from it under
     its row lock, in a transaction of its own, with the critical `llm.budget_counter_drift` (subject: the
-    month); a pass that corrects nothing resolves the alert. Returns the months corrected. Fenced by the
-    worker epoch first: the worker's own `FencedOut` propagates (Ruling FR-w), another owner's ends the pass
-    with the count so far."""
+    month); then (M3 Task 18, A1 issue 29) every active bulk operation whose `spent_usd` differs from what
+    its funded entries count at (`_COUNTED`: reserved, dispatched and ambiguous at their reservation, billed
+    at its cost, not billed 0) is corrected likewise under the bulk row's lock (step 7; every writer of a
+    funded entry holds it), with the same alert (subject `bulk:<id>`). A pass that corrects nothing resolves
+    the alert. Returns the months and operations corrected. Fenced by the worker epoch first: the worker's own
+    `FencedOut` propagates (Ruling FR-w), another owner's ends the pass with the count so far."""
     corrected = 0
     try:
         async with ctx.engine.begin() as conn:
             await fence_epoch(conn, ctx.epoch)
             months = await _drifting_months(conn)
+            operations = [int(i) for i in (await conn.execute(_BULK_DRIFTS)).scalars()]
         for month in months:
             async with ctx.engine.begin() as conn:
                 await fence_epoch(conn, ctx.epoch)
                 corrected += await _correct(conn, month, now=ctx.now)
+        for bulk_operation_id in operations:
+            async with ctx.engine.begin() as conn:
+                await fence_epoch(conn, ctx.epoch)
+                corrected += await _correct_bulk(conn, bulk_operation_id)
         if corrected == 0:
             async with ctx.engine.begin() as conn:
                 await fence_epoch(conn, ctx.epoch)
@@ -1771,6 +1793,33 @@ async def _correct(conn: AsyncConnection, month: date, *, now: datetime) -> int:
         severity="critical",
         subject=f"month:{month.isoformat()}",
         message="the LLM budget counters differed from the spend ledger and were corrected from it",
+        context=context,
+    )
+    return 1
+
+
+async def _correct_bulk(conn: AsyncConnection, bulk_operation_id: int) -> int:
+    """Correct an active bulk operation's `spent_usd` from its ledger entries under its row lock; 1 when it
+    differed (and was corrected, with the alert), 0 when it agrees again or the operation has ended."""
+    row = (await conn.execute(_LOCK_BULK, {"id": bulk_operation_id})).first()
+    if row is None or row.state != "active":
+        return 0
+    ledger = Decimal((await conn.execute(_LEDGER_SPENT, {"id": bulk_operation_id})).scalar_one())
+    if ledger == row.spent_usd:
+        return 0
+    await conn.execute(_CORRECT_BULK, {"spent": ledger, "id": bulk_operation_id})
+    context: dict[str, JSONValue] = {
+        "bulk_operation_id": bulk_operation_id,
+        "stored_spent_usd": str(row.spent_usd),
+        "ledger_spent_usd": str(ledger),
+    }
+    log.error("llm_bulk_spent_drift", **context)
+    await raise_alert(
+        conn,
+        code=COUNTER_DRIFT_ALERT,
+        severity="critical",
+        subject=f"bulk:{bulk_operation_id}",
+        message="a bulk operation's spent amount differed from the spend ledger and was corrected from it",
         context=context,
     )
     return 1

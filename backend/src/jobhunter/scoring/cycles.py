@@ -42,13 +42,14 @@ under the evaluation policy, from 20 of them on; else the §21.2 central estimat
 
 **The reclaim** (`reclaim`, §9.4.3): the `in_progress` targets a predicate selects, locked `FOR UPDATE` in id
 order, go to `pending` while charged attempts are left (`charged_attempts < MAX_SCORE_ATTEMPTS`), else to
-`failed_attempts_exhausted('attempts_exhausted')` with their follow-up hold released (a terminal move,
-`bulk.release_target_hold`); their running attempts end `claim_lost` with the reclaim's detail. A reclaim is
-never the claim's owner (a sweep, the reconciler, a failed cycle), so it locks the candidates' bulk rows
-first (`bulk.lock_for_targets`, Ruling P52: the bulk row, step 7, before the target rows, step 10). The
-predicates are this module's: `older_epoch` (`claim_epoch < :epoch`) and `cycle` (the target's current
-attempt belongs to `:cycle`). An attempt's own failure is never a reclaim: `run_target` ends it through
-`fail` (Ruling T11-a).
+`failed_attempts_exhausted('attempts_exhausted')` (`stuck_targets`: `'stuck'`) with their follow-up hold
+released (a terminal move, `bulk.release_target_hold`); their running attempts end `claim_lost` with the
+reclaim's detail. A reclaim is never the claim's owner (a sweep, a reconciler, a failed cycle), so it locks
+the candidates' bulk rows first (`bulk.lock_for_targets`, Ruling P52: the bulk row, step 7, before the target
+rows, step 10). The predicates are this module's: `older_epoch` (`claim_epoch < :epoch`), `cycle` (the
+target's current attempt belongs to `:cycle`) and `stuck` (Task 18's `stuck_targets`: a claim heartbeat
+older than `:cutoff` whose current attempt is still `running`); every reclaim runs the same statements over
+them. An attempt's own failure is never a reclaim: `run_target` ends it through `fail` (Ruling T11-a).
 
 **An orphaned cycle** is failed `orphaned` with the report closed `{"reason": "orphaned"}`, its claims
 reclaimed, and the warn alert `score_cycle.orphaned` raised (subject `cycle:<id>`), which the next completed
@@ -62,6 +63,13 @@ cycle resolves (`graphs.score.nodes.finalize_cycle`):
   first; after the commit it cancels the cycle's local execution when that runs for the cycle's epoch.
 `fail_cycle` is the cycle task's own end for a bug: `failed('bug')` with the report `{"reason": "bug",
 "error_class": …}` and the critical alert `score_cycle.failed`, its claims reclaimed (detail `cycle_failed`).
+
+**The critic rate** (§17.5 L5538, §17.6 L5595; Task 18, Ruling P32): `critic_rate_7d(conn, *, llm_tuple_id,
+evaluation_policy_id, now) -> (rate | None, n)` is the share of the tuple's charged attempts under the
+evaluation policy that ended in the 7 days before `now` and dispatched a first-round critic call, `None` below
+50 attempts; `evaluate_critic_rate` opens `scoring.critic_rate_high` (warn, subject `tuple:<t>:policy:<p>`)
+while it exceeds 1.5 times the policy's `projected_critic_rate` and resolves it below that line, in the
+caller's transaction: the `scoring_drift` reconciler and every `finalize_cycle` evaluate it.
 
 Ids, counts, codes and amounts only reach a log line, a report or an alert.
 """
@@ -82,7 +90,7 @@ from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.budget import BudgetParams, BudgetRow
 from jobhunter.llm.gateway import AUTH_FAILED_ALERT
 from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT
-from jobhunter.observability.alerts import raise_alert
+from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alerts
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring.admission import CYCLE_OWNER as CYCLE_OWNER
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS, Lane, any_admissible
@@ -100,10 +108,15 @@ CYCLE_TRIGGERS: Final[tuple[CycleTrigger, ...]] = get_args(CycleTrigger)
 PauseReason = Literal[
     "reservation_bound_violated", "auth_failed", "cap_reached", "global_fence", "schema_unverified"
 ]
-ReclaimKind = Literal["older_epoch", "cycle"]
+ReclaimKind = Literal["older_epoch", "cycle", "stuck"]
 
 ORPHANED_ALERT: Final = "score_cycle.orphaned"
 FAILED_ALERT: Final = "score_cycle.failed"
+CRITIC_RATE_ALERT: Final = "scoring.critic_rate_high"
+CRITIC_RATE_WINDOW: Final = timedelta(days=7)
+CRITIC_RATE_MIN_ATTEMPTS: Final = 50
+CRITIC_RATE_FACTOR: Final = Decimal("1.5")
+CRITIC_RATE_QUANTUM: Final = Decimal("0.0001")
 ORPHANED_AFTER: Final = timedelta(minutes=3)
 C_HAT_WINDOW: Final = timedelta(days=7)
 C_HAT_MIN_SAMPLES: Final = 20
@@ -134,10 +147,12 @@ def cycle_trigger(value: str) -> CycleTrigger:
 
 # ---- the active configuration ----------------------------------------------------------------------------
 
-_ACTIVE: Final = q(
+_ACTIVE_COLUMNS: Final = (
     "SELECT llm_tuple_id, scope_version_id, evaluation_policy_id, model_policy_id, execution_config_id, "
-    "prompt_schema_version_id, settings_version_id FROM active_config WHERE id = 1 FOR SHARE"
+    "prompt_schema_version_id, settings_version_id FROM active_config WHERE id = 1"
 )
+_ACTIVE: Final = q(f"{_ACTIVE_COLUMNS} FOR SHARE")
+_ACTIVE_PLAIN: Final = q(_ACTIVE_COLUMNS)
 _NAMED: Final = q(
     "SELECT m.payload AS model_policy, e.payload AS execution, s.payload AS settings "
     "FROM model_policies m, execution_configs e, settings_versions s "
@@ -158,9 +173,10 @@ class ActiveScoring:
     settings_version_id: int
 
 
-async def lock_active_scoring(conn: AsyncConnection) -> ActiveScoring:
-    """`active_config FOR SHARE` (step 2 of the lock schedule) and the pointers the score lane reads."""
-    row = (await conn.execute(_ACTIVE)).one()
+async def lock_active_scoring(conn: AsyncConnection, *, lock: bool = True) -> ActiveScoring:
+    """`active_config FOR SHARE` (step 2 of the lock schedule) and the pointers the score lane reads; with
+    `lock=False` a plain read (system health, Task 18)."""
+    row = (await conn.execute(_ACTIVE if lock else _ACTIVE_PLAIN)).one()
     return ActiveScoring(
         llm_tuple_id=None if row.llm_tuple_id is None else int(row.llm_tuple_id),
         scope_version_id=int(row.scope_version_id),
@@ -191,9 +207,10 @@ class ScoringConfig:
     settings: CycleSettings
 
 
-async def scoring_config(conn: AsyncConnection) -> ScoringConfig:
-    """`active_config FOR SHARE` and what its pointers name, in two statements (module docstring)."""
-    active = await lock_active_scoring(conn)
+async def scoring_config(conn: AsyncConnection, *, lock: bool = True) -> ScoringConfig:
+    """`active_config FOR SHARE` and what its pointers name, in two statements (module docstring); with
+    `lock=False` read without a lock."""
+    active = await lock_active_scoring(conn, lock=lock)
     params = {
         "model_policy": active.model_policy_id,
         "execution": active.execution_config_id,
@@ -283,6 +300,96 @@ async def c_hat(
     return central_cost_per_target(model_policy), "central"
 
 
+# ---- the critic rate (§17.5 L5538, §17.6 L5595) ---------------------------------------------------------
+
+# A charged attempt (one LLM call dispatched, L2863) that ended in the window, and whether one of its calls
+# was a dispatched first-round critic call (any transport try of it: `reserved` was never sent, `cancelled`
+# was released unsent).
+_CRITIC_COUNTS: Final = q(
+    "SELECT count(*) AS attempts, count(*) FILTER (WHERE EXISTS (SELECT 1 FROM llm_calls c "
+    "WHERE c.attempt_id = a.id AND c.purpose = 'critic' AND c.round = 1 "
+    "AND c.status NOT IN ('reserved', 'cancelled'))) AS critic "
+    "FROM score_attempts a JOIN score_targets t ON t.id = a.target_id WHERE t.llm_tuple_id = :tuple "
+    "AND a.evaluation_policy_id = :policy AND a.charged AND a.ended_at >= :since AND a.ended_at <= :now"
+)
+_PROJECTED_CRITIC_RATE: Final = q("SELECT projected_critic_rate FROM evaluation_policies WHERE id = :p")
+
+
+async def _critic_counts(
+    conn: AsyncConnection, *, llm_tuple_id: int, evaluation_policy_id: int, now: datetime
+) -> tuple[int, int]:
+    params = {
+        "tuple": llm_tuple_id,
+        "policy": evaluation_policy_id,
+        "since": now - CRITIC_RATE_WINDOW,
+        "now": now,
+    }
+    row = (await conn.execute(_CRITIC_COUNTS, params)).one()
+    return int(row.critic), int(row.attempts)
+
+
+async def critic_rate_7d(
+    conn: AsyncConnection, *, llm_tuple_id: int, evaluation_policy_id: int, now: datetime
+) -> tuple[Decimal | None, int]:
+    """`critic_rate_7d` and its `n` (module docstring): the first-round critic calls per charged attempt of
+    the tuple under the evaluation policy that ended in the 7 days before `now`, rounded half-up to 0.0001;
+    `None` while fewer than `CRITIC_RATE_MIN_ATTEMPTS` attempts make it. Read without a lock (the gauge and
+    `GET /api/system/spend`)."""
+    critic, attempts = await _critic_counts(
+        conn, llm_tuple_id=llm_tuple_id, evaluation_policy_id=evaluation_policy_id, now=now
+    )
+    if attempts < CRITIC_RATE_MIN_ATTEMPTS:
+        return None, attempts
+    return (Decimal(critic) / attempts).quantize(CRITIC_RATE_QUANTUM, rounding=ROUND_HALF_UP), attempts
+
+
+async def evaluate_critic_rate(
+    conn: AsyncConnection, *, llm_tuple_id: int, evaluation_policy_id: int, now: datetime
+) -> bool | None:
+    """§17.6 `scoring.critic_rate_high` (module docstring), in the caller's transaction: opened (warn, once)
+    while `critic_rate_7d` exceeds `CRITIC_RATE_FACTOR` times the policy's `projected_critic_rate` with at
+    least `CRITIC_RATE_MIN_ATTEMPTS` attempts, the comparison exact on the counts; resolved, whatever its
+    subject, once the rate is at or below the line (no attempt counting as 0); left as it is while too few
+    attempts make a rate above it. `True` when it opened the alert, `False` when it resolved one, else
+    `None`."""
+    critic, attempts = await _critic_counts(
+        conn, llm_tuple_id=llm_tuple_id, evaluation_policy_id=evaluation_policy_id, now=now
+    )
+    projected = Decimal(
+        (await conn.execute(_PROJECTED_CRITIC_RATE, {"p": evaluation_policy_id})).scalar_one()
+    )
+    above = critic > CRITIC_RATE_FACTOR * projected * attempts
+    if not above:
+        return False if await resolve_alerts(conn, code=CRITIC_RATE_ALERT) else None
+    if attempts < CRITIC_RATE_MIN_ATTEMPTS:
+        return None
+    rate = (Decimal(critic) / attempts).quantize(CRITIC_RATE_QUANTUM, rounding=ROUND_HALF_UP)
+    opened = await open_alert(
+        conn,
+        code=CRITIC_RATE_ALERT,
+        severity="warn",
+        subject=f"tuple:{llm_tuple_id}:policy:{evaluation_policy_id}",
+        message="the critic rate of the last 7 days is above 1.5 times the projected critic rate",
+        context={
+            "llm_tuple_id": llm_tuple_id,
+            "evaluation_policy_id": evaluation_policy_id,
+            "critic_rate_7d": str(rate),
+            "attempts": attempts,
+            "projected_critic_rate": str(projected),
+        },
+    )
+    if opened is None:
+        return None
+    log.warning(
+        "scoring_critic_rate_high",
+        llm_tuple_id=llm_tuple_id,
+        evaluation_policy_id=evaluation_policy_id,
+        critic_rate_7d=str(rate),
+        attempts=attempts,
+    )
+    return True
+
+
 # ---- the trigger and the start ---------------------------------------------------------------------------
 
 
@@ -307,6 +414,38 @@ _INSERT_CYCLE: Final = q(
 async def cycle_running(conn: AsyncConnection) -> bool:
     """Whether a score cycle is `running`."""
     return bool((await conn.execute(_RUNNING)).scalar_one())
+
+
+_RUNNING_ID: Final = q("SELECT id FROM score_cycles WHERE status = 'running'")
+# The active tuple's targets by state, with the oldest `created_at` of each (no tuple: no rows).
+_TARGET_FIGURES: Final = q(
+    "SELECT t.state, count(*) AS n, min(t.created_at) AS oldest FROM score_targets t "
+    "JOIN active_config a ON a.llm_tuple_id = t.llm_tuple_id WHERE a.id = 1 GROUP BY t.state"
+)
+
+
+async def running_cycle_id(conn: AsyncConnection) -> int | None:
+    """The `running` score cycle's id (the partial unique index allows one), read without a lock."""
+    found = (await conn.execute(_RUNNING_ID)).scalar_one_or_none()
+    return None if found is None else int(found)
+
+
+@dataclass(frozen=True)
+class TargetFigures:
+    """The active tuple's targets by state (a state without one is absent) and the `created_at` of its
+    oldest `pending` one (`None` without one)."""
+
+    by_state: Mapping[str, int]
+    oldest_pending_at: datetime | None
+
+
+async def target_figures(conn: AsyncConnection) -> TargetFigures:
+    """`TargetFigures` of the active tuple in one statement, read without a lock (system health and the
+    score lane's gauges, Task 18)."""
+    rows = (await conn.execute(_TARGET_FIGURES)).all()
+    by_state = {str(row.state): int(row.n) for row in rows}
+    oldest = next((row.oldest for row in rows if row.state == "pending"), None)
+    return TargetFigures(by_state, oldest)
 
 
 def admission_size(bucket_usd: Decimal, estimate: Decimal, max_targets_per_cycle: int) -> int:
@@ -465,6 +604,12 @@ _RECLAIM_WHERE: Final[Mapping[ReclaimKind, str]] = {
         "EXISTS (SELECT 1 FROM score_attempts a WHERE a.target_id = t.id AND a.attempt_no = t.attempt_no "
         "AND a.cycle_id = :cycle)"
     ),
+    # `stuck_targets` (Task 18): a beat older than `:cutoff` whose attempt is still `running` (a fenced
+    # publish's `cancelled` attempt leaves its target to the purge's chunk, A2 S4)
+    "stuck": (
+        "t.claim_heartbeat_at < :cutoff AND EXISTS (SELECT 1 FROM score_attempts a WHERE a.target_id = t.id "
+        "AND a.attempt_no = t.attempt_no AND a.outcome = 'running')"
+    ),
 }
 # The candidates of a reclaim, read without a lock (for `bulk.lock_for_targets`), and the claims, locked in id
 # order; both statements are the registry's constants over this module's predicates.
@@ -498,9 +643,15 @@ class Reclaimed:
 
 
 async def reclaim(
-    conn: AsyncConnection, kind: ReclaimKind, params: Mapping[str, object], *, detail: str
+    conn: AsyncConnection,
+    kind: ReclaimKind,
+    params: Mapping[str, object],
+    *,
+    detail: str,
+    exhausted_reason: str = ATTEMPTS_EXHAUSTED,
 ) -> list[Reclaimed]:
-    """Reclaim the claims of `kind` (module docstring) in the caller's transaction; what it moved."""
+    """Reclaim the claims of `kind` (module docstring) in the caller's transaction, a claim without charged
+    attempts left to `failed_attempts_exhausted(exhausted_reason)`; what it moved."""
     # Never the claim's owner: the bulk rows (step 7) before the target rows (step 10)
     candidates = [int(i) for i in (await conn.execute(_CANDIDATES[kind], dict(params))).scalars()]
     if not candidates:
@@ -526,7 +677,7 @@ async def reclaim(
             "score_targets",
             ["in_progress"],
             "failed_attempts_exhausted",
-            reason=ATTEMPTS_EXHAUSTED,
+            reason=exhausted_reason,
             where=_BY_IDS,
             params={"ids": spent},
         )

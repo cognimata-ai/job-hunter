@@ -20,7 +20,10 @@ Minor 1).
 This module is a task boundary (ruff `BLE001` is allowed here), and the catch persists an outcome (§17.1).
 
 `stalled_jobs` (fenced like the others) and the heavy `metrics_refresh` (it only reads) are registered here;
-the tasks that own the other repairs register theirs.
+the tasks that own the other repairs register theirs. A module that owns gauges read from the database
+registers their refresh with `gauge_refresh` (M3 Task 18: `scoring.reconcilers`' score lane gauges), and
+`metrics_refresh` runs each after its own, on its read-only connection, at the cadence's `now`: this module
+imports none of them.
 """
 
 from collections.abc import Awaitable, Callable
@@ -29,7 +32,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 import procrastinate
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.errors import FencedOut
 from jobhunter.observability.alerts import raise_alert, refresh_alert_gauge, resolve_alert
@@ -71,6 +74,26 @@ ReconcilerFn = Callable[[ReconcileContext], Awaitable[int]]
 
 # Insertion ordered: reconcilers run in registration order.
 REGISTRY: dict[str, tuple[frozenset[Cadence], ReconcilerFn]] = {}
+
+
+GaugeRefresh = Callable[[AsyncConnection, datetime], Awaitable[None]]
+
+# Insertion ordered: `metrics_refresh` runs them in registration order.
+GAUGE_REFRESHES: dict[str, GaugeRefresh] = {}
+
+
+def gauge_refresh(name: str) -> Callable[[GaugeRefresh], GaugeRefresh]:
+    """Decorator: `metrics_refresh` runs the function under `name` with its connection and `now` (module
+    docstring)."""
+
+    def register(fn: GaugeRefresh) -> GaugeRefresh:
+        registered = GAUGE_REFRESHES.get(name)
+        if registered is not None and registered is not fn:
+            raise ValueError(f"another gauge refresh is already registered as {name!r}")
+        GAUGE_REFRESHES[name] = fn
+        return fn
+
+    return register
 
 
 def reconciler(name: str, *cadences: Cadence) -> Callable[[ReconcilerFn], ReconcilerFn]:
@@ -178,11 +201,14 @@ async def stalled_jobs(ctx: ReconcileContext) -> int:
 
 @reconciler("metrics_refresh", "heavy")
 async def metrics_refresh(ctx: ReconcileContext) -> int:
-    """Refresh the gauges read from the database: open alerts by severity and the size of every table.
+    """Refresh the gauges read from the database: open alerts by severity, the size of every table, then each
+    registered gauge refresh (`gauge_refresh`) at `ctx.now`.
 
     It repairs nothing, so it returns 0.
     """
     async with ctx.engine.connect() as conn:
         await refresh_alert_gauge(conn)
         await refresh_table_bytes(conn)
+        for refresh in list(GAUGE_REFRESHES.values()):
+            await refresh(conn, ctx.now)
     return 0

@@ -3,8 +3,11 @@ report and its completion.
 
 In one transaction: the cycle under its owner predicate (`cycles.lock_cycle`, step 5; a lost cycle is
 `FencedOut(cycles.CYCLE_OWNER)`), its attempts' spend and the cache figures of their calls, then
-`transition(score_cycles, running → completed, owner={worker_epoch})` with the report and `spent_usd`, and
-`score_cycle.orphaned` resolved (a completed cycle ends the orphan alert of an earlier one, L5596).
+`transition(score_cycles, running → completed, owner={worker_epoch})` with the report and `spent_usd`,
+`score_cycle.orphaned` resolved (a completed cycle ends the orphan alert of an earlier one, L5596), and
+`scoring.critic_rate_high` evaluated for the cycle's tuple and evaluation policy at the deps' clock
+(`cycles.evaluate_critic_rate`, L5595: opened above 1.5 times the projected critic rate, resolved below it;
+M3 Task 18, Ruling P32).
 
 **The report** (ids and counts only): `outcomes` (attempt outcome → count) and `lanes` (lane → count) over the
 state's `results`, `spent_usd` (Σ `score_attempts.cost_usd` of the cycle's attempts, as a decimal string),
@@ -12,8 +15,7 @@ state's `results`, `spent_usd` (Σ `score_attempts.cost_usd` of the cycle's atte
 `hit_ratio = reads / (uncached input + reads + writes)`, the ratio `CacheMonitor` gauges per role, taken over
 this cycle's calls alone), `c_hat` (the cycle's `ĉ`), `admission_size` (`S`) and `claim_rounds`.
 
-It never defers another cycle: the tick decides (L3470). Task 18 adds the `scoring.critic_rate_high`
-evaluation here.
+It never defers another cycle: the tick decides (L3470).
 """
 
 from collections import Counter
@@ -81,6 +83,12 @@ def make_finalize_cycle(deps: ScoreDeps) -> CycleNode:
                 set_={"report": report, "spent_usd": spent},
             )
             resolved = await resolve_alerts(conn, code=cycles.ORPHANED_ALERT)
+            await cycles.evaluate_critic_rate(
+                conn,
+                llm_tuple_id=cycle.llm_tuple_id,
+                evaluation_policy_id=cycle.evaluation_policy_id,
+                now=deps.clock(),
+            )
         log.info(
             "score_cycle_completed",
             cycle_id=cycle.id,

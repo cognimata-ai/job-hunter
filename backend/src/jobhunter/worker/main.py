@@ -169,6 +169,9 @@ _REGISTERING_MODULES: Final = (
     # the `batch_submit` handler, the `batch_submissions` takeover sweep and tick reconciler (Task 16, Ruling
     # T16-e: the submission state machine's worker side)
     "jobhunter.scoring.batch_operations",
+    # `stuck_targets`, `det_completeness`, `admission_alerts`, `scoring_drift` and the score lane's gauge
+    # refresh (Task 18)
+    "jobhunter.scoring.reconcilers",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 

@@ -660,8 +660,9 @@ M2_RECONCILERS = {
 # The M3 reconcilers so far: `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
 # `score_targets` and `score_cycles`; Ruling P44), `expiry_sweep` and `budget_release` (Task 13,
 # `scoring.targets`), `bulk_operations` (Task 14, `llm.bulk`, through `scoring.cycles`) and
-# `missing_targets` (Task 14, `scoring.targets`), and `batch_submissions` (Task 16, `scoring.batch_operations`
-# since Ruling T16-e).
+# `missing_targets` (Task 14, `scoring.targets`), `batch_submissions` (Task 16, `scoring.batch_operations`
+# since Ruling T16-e), and Task 18's four in `scoring.reconcilers`: `stuck_targets`, `det_completeness`,
+# `admission_alerts` and `scoring_drift`.
 M3_RECONCILERS = {
     "orphaned_cycles": ["tick"],
     "expiry_sweep": ["heavy"],
@@ -669,6 +670,10 @@ M3_RECONCILERS = {
     "bulk_operations": ["heavy"],
     "missing_targets": ["heavy"],
     "batch_submissions": ["tick"],
+    "stuck_targets": ["tick"],
+    "det_completeness": ["heavy"],
+    "admission_alerts": ["heavy"],
+    "scoring_drift": ["heavy"],
 }
 
 
@@ -682,10 +687,11 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     `create_targets_for_tuple` (`scoring.targets`) and Task 16's `batch_submit` (`scoring.batch_operations`,
     Ruling T16-e) handlers,
     and the failure hooks of the two profile phases and of the query proposal (`embed_profile` has none: it
-    drives no domain row), and the `bulk_operations` reconciler's one active step, Task 16's `rerequest`
-    (Ruling T16-d, `bulk.register_active_step`). `embed_profile`, `propose_queries` and the `profile_vectors`
-    reconciler come with `profile.operations`, which imports `profile.vectors`; `worker.main` lists
-    neither."""
+    drives no domain row), the `bulk_operations` reconciler's one active step, Task 16's `rerequest`
+    (Ruling T16-d, `bulk.register_active_step`), and the one gauge refresh `metrics_refresh` runs, M3 Task
+    18's `score_lane` (`scoring.reconcilers`, `reconcilers.gauge_refresh`). `embed_profile`,
+    `propose_queries` and the `profile_vectors` reconciler come with `profile.operations`, which imports
+    `profile.vectors`; `worker.main` lists neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
@@ -703,6 +709,7 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
         ],
         "failure_hooks": ["extract_profile", "extract_profile_text", "propose_queries"],
         "active_steps": ["jobhunter.scoring.batches.rerequest"],
+        "gauge_refreshes": ["score_lane"],
         "main_imported": False,
     }
 

@@ -10,6 +10,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, star
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import TRANSITIONS
 
 REGISTRY = CollectorRegistry()
 
@@ -127,6 +128,33 @@ LLM_CACHE_READ_RATIO = Gauge(
 CRITIC_VERDICT_MISMATCH = Counter(
     "jobhunter_critic_verdict_mismatch",
     "Critic reviews whose returned verdict differs from the derived outcome.",
+    registry=REGISTRY,
+)
+
+# The score lane (§17.5 L5538-5539, M3 Task 18). `metrics_refresh` (heavy) sets the three gauges through the
+# refresh `scoring.reconcilers` registers: the active tuple's `critic_rate_7d` under the active evaluation
+# policy (NaN while fewer than 50 attempts make it), its targets in each state of `SCORE_TARGET_STATES` (0
+# included) and the age of its oldest `pending` target by `created_at` (0 with none). `stuck_targets` counts
+# every claim it reclaimed once its transaction has committed.
+SCORE_TARGET_STATES: Final = tuple(
+    sorted({state for edge in TRANSITIONS["score_targets"].allowed for state in edge})
+)
+CRITIC_RATE_7D = Gauge(
+    "jobhunter_critic_rate_7d",
+    "First-round critic calls per charged score attempt over the trailing 7 days (NaN below 50 attempts).",
+    registry=REGISTRY,
+)
+SCORE_TARGETS = Gauge(
+    "jobhunter_score_targets", "Score targets of the active tuple by state.", ["state"], registry=REGISTRY
+)
+OLDEST_PENDING_TARGET_AGE = Gauge(
+    "jobhunter_oldest_pending_target_age_seconds",
+    "Age of the oldest pending score target of the active tuple, in seconds.",
+    registry=REGISTRY,
+)
+CLAIM_RECLAIMS = Counter(
+    "jobhunter_claim_reclaims",
+    "Score target claims reclaimed by the stuck_targets reconciler.",
     registry=REGISTRY,
 )
 

@@ -11,7 +11,11 @@ later check finds still true, not a new occurrence of it (a start that finds a k
 acknowledgement ends the score lane's pause on an unacknowledged `llm.reservation_bound_violated` or
 `llm.auth_failed` (`scoring.cycles.pause_reason`, Deviation 19).
 
-All six functions run on the caller's connection and leave the transaction to the caller: an alert is
+`resolve_quiet_alerts` (M3 Task 18) resolves the open alerts of a code whose last occurrence is older than
+a given time: the quiet period after which a condition counts as cleared. `ever_raised` tells whether an alert
+was raised for a subject at all, open or resolved: an alert raised at most once per subject.
+
+All eight functions run on the caller's connection and leave the transaction to the caller: an alert is
 written in the transaction that decides to raise it, and persists only if that transaction commits.
 """
 
@@ -55,6 +59,12 @@ _RESOLVE_CODE_BEFORE = q(
     "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL "
     'AND dedup_key COLLATE "C" < :before_key RETURNING id'
 )
+# The open alerts of one code whose last occurrence is older than a given time.
+_RESOLVE_QUIET = q(
+    "UPDATE alerts SET resolved_at = now() WHERE code = :code AND resolved_at IS NULL AND last_at < :since "
+    "RETURNING id"
+)
+_EVER_RAISED = q("SELECT EXISTS (SELECT 1 FROM alerts WHERE dedup_key = :dedup_key)")
 # The first acknowledgement's time is kept: a repeated one changes nothing.
 _ACKNOWLEDGE = q(
     "UPDATE alerts SET acknowledged_at = coalesce(acknowledged_at, :now) "
@@ -136,6 +146,20 @@ async def resolve_alerts(conn: AsyncConnection, *, code: str, subject_before: st
         return len((await conn.execute(_RESOLVE_CODE, {"code": code})).all())
     params = {"code": code, "before_key": _dedup_key(code, subject_before)}
     return len((await conn.execute(_RESOLVE_CODE_BEFORE, params)).all())
+
+
+async def resolve_quiet_alerts(conn: AsyncConnection, *, code: str, since: datetime) -> int:
+    """Resolve every open alert `code` that has not occurred since `since` (its `last_at`, the time of its
+    last raise, is older): an alert that auto-resolves after a quiet period (`scoring.stuck_target_repaired`
+    after an hour without reclaims, `admission.high_sim_expired` after 24 h without recurrence; M3 Task 18).
+    The number resolved."""
+    return len((await conn.execute(_RESOLVE_QUIET, {"code": code, "since": since})).all())
+
+
+async def ever_raised(conn: AsyncConnection, *, code: str, subject: str) -> bool:
+    """Whether the alert `code`/`subject` was ever raised, open or resolved: an alert raised at most once per
+    subject (`admission.backlog_drain`, at most once a day, its subject the UTC date; M3 Task 18)."""
+    return bool((await conn.execute(_EVER_RAISED, {"dedup_key": _dedup_key(code, subject)})).scalar_one())
 
 
 async def acknowledge_alert(conn: AsyncConnection, alert_id: int, *, now: datetime) -> bool:

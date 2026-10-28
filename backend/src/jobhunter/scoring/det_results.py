@@ -249,28 +249,28 @@ async def write_instance(
     aggregation: Aggregation,
     det_inputs: dict[str, JSONValue],
     det_inputs_hash: bytes,
-    algorithm_version: str = DET_ALGORITHM_VERSION,
+    algorithm_version: str | None = None,
 ) -> int | None:
     """Write the instance of `aggregation` (module docstring, Writing): the new id, or `None` when the current
     instance has the same hash and algorithm version. `LookupError` for a result that does not exist.
+    `algorithm_version` defaults to the module's `DET_ALGORITHM_VERSION`, read at the call, as `stale_of`
+    reads it (Task 18: a changed version makes both see every instance as stale).
 
     The caller holds the job row of `job_id` `FOR SHARE` (lock-schedule step 4) before this call takes the
     result's row (step 10): the insert's foreign key to `jobs` key-shares that row."""
+    version = DET_ALGORITHM_VERSION if algorithm_version is None else algorithm_version
     if (await conn.execute(_LOCK_RESULT, {"id": llm_result_id})).first() is None:
         raise LookupError(f"llm result {llm_result_id} does not exist")
     current = (await conn.execute(_CURRENT, {"result": llm_result_id, "scope": scope_version_id})).first()
     if current is not None:
-        if (
-            bytes(current.det_inputs_hash) == det_inputs_hash
-            and current.det_algorithm_version == algorithm_version
-        ):
+        if bytes(current.det_inputs_hash) == det_inputs_hash and current.det_algorithm_version == version:
             return None
         await conn.execute(_SUPERSEDE, {"id": current.id})
     params = {
         "result": llm_result_id,
         "scope": scope_version_id,
         "job": job_id,
-        "version": algorithm_version,
+        "version": version,
         "det_criteria": aggregation.det_criteria,
         "knockouts": aggregation.knockouts,
         "industry_match": aggregation.industry_match,
