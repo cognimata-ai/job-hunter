@@ -395,3 +395,91 @@ async def test_an_item_failing_unexpectedly_is_skipped_and_given_up_after_its_bo
     assert (await targets_by_custom_id(engine))[poisoned].state_reason == "batch_missing"
     assert await open_alert_codes(engine) == ["batch.item_unprocessable"]
     assert Counter(await decisions(engine)) == {"published": N - 1, "retry_online": 1}
+
+
+async def test_a_missing_item_failing_after_the_completion_raises_the_critical_alert(
+    engine: AsyncEngine,
+    fake_llm: FakeLLM,
+    submitted: SubmittedBatch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N1, Ruling T17-a: a missing item whose processing raises after the completion committed
+    (`results_complete_at` set) stays `awaiting` and the submission `ended` (the reconcile waits for it); the
+    first such pass raises the critical `batch.item_unprocessable` (subject the submission, ids only) in a
+    transaction of its own. Once the cause is gone, the next pass decides it and reconciles."""
+    lost = submitted.custom_ids[7]
+    real = batch_items.process_item
+
+    async def process(conn: Any, *, result: ItemResult, **kwargs: Any) -> Any:
+        if result.custom_id == lost and result.result_type == "missing":
+            raise RuntimeError("test: the missing path fails")
+        return await real(conn, result=result, **kwargs)
+
+    monkeypatch.setattr(batch_items, "process_item", process)
+    fake_llm.batches(BatchScript(items={lost: "missing"}, polls_until_ended=0))
+    first = await poll_once(engine, fake_llm)
+    assert first.reconciled == 0
+    (row,) = await submission_rows(engine)
+    assert row.state == "ended" and row.results_complete_at is not None
+    assert (await item_rows(engine))[lost].result_type == "awaiting"
+    assert set(await open_alert_codes(engine)) == {"batch.item_unprocessable", "batch.items_missing"}
+    async with engine.connect() as conn:
+        alert = (await conn.execute(_OPEN_ALERT, {"c": batch_results.ITEM_UNPROCESSABLE_ALERT})).one()
+    s = submitted.submission_id
+    assert (alert.severity, alert.dedup_key) == ("critical", f"batch.item_unprocessable:{s}")
+    assert alert.context == {"submission_id": s, "item_id": (await item_ids(engine))[lost]}
+    monkeypatch.setattr(batch_items, "process_item", real)
+    last = await poll_once(engine, fake_llm)
+    assert (last.decided, last.reconciled) == (1, 1)
+    assert (await item_rows(engine))[lost].result_type == "missing"
+    assert await submission_state(engine, s) == "reconciled"
+
+
+async def test_a_line_naming_no_item_of_ours_completes_nothing(
+    engine: AsyncEngine, fake_llm: FakeLLM, submitted: SubmittedBatch
+) -> None:
+    """L3961, rule 4: a result line whose `custom_id` names no item of the submission raises the critical
+    `batch.custom_id_anomaly` with how many lines were foreign (the poll does not measure the items such a
+    stream lacks, so it records no count of them) and completes nothing: the submission stays `ended` and no
+    item is decided `missing`."""
+    fake_llm.batches(BatchScript(polls_until_ended=0))
+    async with fake_llm.client() as http:  # the batch observed as ended: its lines are fixed
+        await batch_client(fake_llm, http).retrieve(submitted.provider_id)
+    stored = fake_llm.state.batches[submitted.provider_id]
+    moved = submitted.custom_ids[5]
+    stored.lines[moved] = {**stored.lines[moved], "custom_id": "t999999_a9"}  # a line of no item of ours
+    report = await poll_once(engine, fake_llm)
+    assert report.reconciled == 0
+    (row,) = await submission_rows(engine)
+    assert (row.state, row.results_complete_at) == ("ended", None)
+    assert await count_rows(engine, "batch_items", result_type="missing") == 0
+    async with engine.connect() as conn:
+        alert = (await conn.execute(_OPEN_ALERT, {"c": batch_results.CUSTOM_ID_ANOMALY_ALERT})).one()
+    assert alert.context == {"submission_id": submitted.submission_id, "foreign_lines": 1}
+
+
+async def test_items_decided_by_a_give_up_leave_the_failed_items(
+    engine: AsyncEngine,
+    fake_llm: FakeLLM,
+    submitted: SubmittedBatch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling T17-a, Carry T16-g: the items whose processing raised are recorded in `failed_items`; when the
+    stream is given up (here a stream cut on every read, past the results' retention) and the completion
+    decides them `missing`, they leave `failed_items` too: the reconciled submission's report names none."""
+
+    async def inputs(conn: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("test: no input can be loaded")
+
+    monkeypatch.setattr(batch_items, "load_attempt_inputs", inputs)
+    fake_llm.batches(BatchScript(polls_until_ended=0, stream_cut_after=60))
+    (row,) = await submission_rows(engine)
+    started = row.submit_started_at
+    await poll_once(engine, fake_llm, now=started + timedelta(days=28))
+    (row,) = await submission_rows(engine)
+    assert row.state == "ended" and 0 < len(row.reconcile_report["failed_items"]) <= 60  # the lines read
+    late = await poll_once(engine, fake_llm, now=started + timedelta(days=29, minutes=1))
+    assert late.reconciled == 1
+    (row,) = await submission_rows(engine)
+    assert row.reconcile_report == {"results_unreadable": batch_results.RETENTION_PASSED}
+    assert await count_rows(engine, "batch_items", result_type="missing") == N

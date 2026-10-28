@@ -27,10 +27,11 @@ consecutive failed passes the item is given up: the critical `batch.item_unproce
 submission, ids only), then the missing-item path in a fresh transaction (when that raises too, the alert
 stays and the next pass tries again); the worker's `FencedOut` and a cancellation propagate. When the stream
 was read to its end, every line named an item of the submission and no item failed, `finalize_results` runs; a
-line naming no item of ours raises the critical `batch.custom_id_anomaly` and completes nothing; a cut stream
-completes nothing and decides no item `missing` (L3961): the next poll reads it again, and every item already
-decided replays its stored decision. **An unreadable stream** (Carry T16-g: a line the pinned SDK cannot
-validate, `BatchApiError.unreadable`, a provider schema change) is bounded: each such pass is counted in the
+line naming no item of ours raises the critical `batch.custom_id_anomaly` (with the count of foreign lines;
+the items such a stream lacks are not measured) and completes nothing; a cut stream completes nothing and
+decides no item `missing` (L3961): the next poll reads it again, and every item already decided replays its
+stored decision. **An unreadable stream** (Carry T16-g: a line the pinned SDK cannot validate,
+`BatchApiError.unreadable`, a provider schema change) is bounded: each such pass is counted in the
 submission's `reconcile_report` (`unreadable_passes`, and the error's class as `unreadable_error_class`), and
 at `RESULTS_UNREADABLE_PASSES` (12, an hour at the poll's cadence) the completion runs with the critical
 `batch.results_unreadable`, so every item still unread is decided `missing` instead of leaving the submission
@@ -45,12 +46,15 @@ record that the stream was read whole; the `reconciled` CHECK demands it), the i
 and the critical `batch.items_missing` when there are any (the fault point `batch.before_completion_commit`
 last; a marker set already writes nothing; then `batch.after_completion_commit`); (2) each item still
 `awaiting`, in id order, in a transaction of its own, decided through the same `process_item` from a synthetic
-`ItemResult(custom_id, "missing")` (`batch.after_missing_item` after each); (3) the reconcile: `active_config
-FOR SHARE`, the owner `FOR UPDATE` under `state = 'ended' AND results_complete_at IS NOT NULL`, no item
-unprocessed, `ended → reconciled`, `bulk.complete_if_done` and `batches.follow_on` in that same transaction,
-so its once-only marker and the follow-on operation commit with the reconcile (`batch.after_reconcile_commit`
-after it). The rows are the recovery: every step is idempotent, a crash after (1) leaves the next poll to skip
-the stream and run (2) and (3), a crash after the last missing item leaves it to run (3).
+`ItemResult(custom_id, "missing")` (`batch.after_missing_item` after each; an item decided here leaves
+`reconcile_report.failed_items`, and one whose processing raises stays `awaiting` with the critical
+`batch.item_unprocessable`, subject the submission, ids only, so the reconcile waits for it and the next pass
+tries it again, Ruling T17-a); (3) the reconcile: `active_config FOR SHARE`, the owner `FOR UPDATE` under
+`state = 'ended' AND results_complete_at IS NOT NULL`, no item unprocessed, `ended → reconciled`,
+`bulk.complete_if_done` and `batches.follow_on` in that same transaction, so its once-only marker and the
+follow-on operation commit with the reconcile (`batch.after_reconcile_commit` after it). The rows are the
+recovery: every step is idempotent, a crash after (1) leaves the next poll to skip the stream and run (2) and
+(3), a crash after the last missing item leaves it to run (3).
 
 **The task body** (`poll_task`, Deviation 27: the periodic task `batch_poll` of `worker.tasks`, under the
 queueing lock of its name) builds the client from the worker's config and gateway (`batches_client`, which the
@@ -388,7 +392,8 @@ async def finalize_results(
 ) -> Finalized:
     """The one completion orchestration of an `ended` submission whose results were read whole (module
     docstring), shared by the poll and the adoption, in its three kinds of transactions: the completion, each
-    missing item, the reconcile. Every step is idempotent; `epoch` fences each transaction."""
+    missing item, the reconcile. Every step is idempotent; `epoch` fences each transaction. A missing item
+    whose processing raises stays `awaiting` with the critical `batch.item_unprocessable` (Ruling T17-a)."""
     await _complete(engine, submission_id, now=now, epoch=epoch)
     await afault_point(AFTER_COMPLETION_COMMIT)
     async with engine.connect() as conn:
@@ -397,15 +402,21 @@ async def finalize_results(
     if ended is None or not ended.results_complete:
         return Finalized(0, await _is_reconciled(engine, submission_id))
     missing = 0
+    decided: set[int] = set()
     for row in awaiting:  # id order, as any item
         item = batch_items.Item(int(row.id), int(row.target_id), int(row.attempt_no))
         decision = await _process(
             engine, ended.submission, item, ItemResult(str(row.custom_id), "missing"), now=now, epoch=epoch
         )
-        if isinstance(decision, _Failed):  # left awaiting: the reconcile waits, the next poll retries it
+        if isinstance(decision, _Failed):  # left awaiting: the reconcile waits, the next pass retries it
+            await _item_unprocessable(engine, submission_id, item.id, epoch=epoch)
             continue
+        decided.add(item.id)
         missing += not decision.replayed
         await afault_point(AFTER_MISSING_ITEM)
+    left = {item_id: n for item_id, n in ended.failed_items.items() if item_id not in decided}
+    if left != ended.failed_items:  # the items decided here leave `failed_items` too
+        await _write_failed_items(engine, submission_id, left, epoch=epoch)
     reconciled = await _reconcile(engine, submission_id, now=now, defer=defer, epoch=epoch)
     if reconciled:
         await afault_point(AFTER_RECONCILE_COMMIT)
@@ -556,13 +567,44 @@ async def _record_failures(
         else:
             unresolved += 1
     if counts != previous:
-        report: dict[str, JSONValue] = {}
-        if counts:
-            report[_FAILED_ITEMS] = {str(item_id): n for item_id, n in sorted(counts.items())}
-        async with engine.begin() as conn:
-            await fence_epoch(conn, epoch)
-            await conn.execute(_RECORD_FAILED_ITEMS, {"s": ended.submission.id, "report": report})
+        await _write_failed_items(engine, ended.submission.id, counts, epoch=epoch)
     return unresolved, given_up
+
+
+async def _write_failed_items(
+    engine: AsyncEngine, submission_id: int, counts: Mapping[int, int], *, epoch: int | None
+) -> None:
+    """`reconcile_report.failed_items` of the `ended` submission set to `counts` (Ruling T17-a; the key is
+    dropped when no item is left in it), in a transaction of its own."""
+    report: dict[str, JSONValue] = {}
+    if counts:
+        report[_FAILED_ITEMS] = {str(item_id): n for item_id, n in sorted(counts.items())}
+    async with engine.begin() as conn:
+        if epoch is not None:
+            await fence_epoch(conn, epoch)
+        await conn.execute(_RECORD_FAILED_ITEMS, {"s": submission_id, "report": report})
+
+
+async def _item_unprocessable(
+    engine: AsyncEngine, submission_id: int, item_id: int, *, epoch: int | None, passes: int | None = None
+) -> None:
+    """The critical `batch.item_unprocessable` of an item whose processing keeps failing (Ruling T17-a:
+    subject the submission, ids only; `passes` when its stream line failed that many passes in a row), in a
+    transaction of its own; the item stays to the next pass."""
+    context: dict[str, JSONValue] = {"submission_id": submission_id, "item_id": item_id}
+    if passes is not None:
+        context["passes"] = passes
+    async with engine.begin() as conn:
+        if epoch is not None:
+            await fence_epoch(conn, epoch)
+        await raise_alert(
+            conn,
+            code=ITEM_UNPROCESSABLE_ALERT,
+            severity="critical",
+            subject=str(submission_id),
+            message="a batch item's processing keeps failing; each pass tries it again as missing",
+            context=context,
+        )
 
 
 async def _give_up(
@@ -581,16 +623,7 @@ async def _give_up(
     `pending('batch_missing')`); whether that path decided it (when it raises too, the alert stays and the
     next pass tries again)."""
     submission_id = ended.submission.id
-    async with engine.begin() as conn:
-        await fence_epoch(conn, epoch)
-        await raise_alert(
-            conn,
-            code=ITEM_UNPROCESSABLE_ALERT,
-            severity="critical",
-            subject=str(submission_id),
-            message="a batch item's processing kept failing; it is decided missing",
-            context={"submission_id": submission_id, "item_id": item.id, "passes": passes},
-        )
+    await _item_unprocessable(engine, submission_id, item.id, epoch=epoch, passes=passes)
     decided = await _process(
         engine, ended.submission, item, ItemResult(custom_id, "missing"), now=now, epoch=epoch
     )
@@ -628,16 +661,21 @@ async def _unreadable_pass(
 
 
 async def custom_id_anomaly(
-    engine: AsyncEngine, submission_id: int, *, epoch: int, foreign: int, lacking: int = 0, equal: int = 0
+    engine: AsyncEngine,
+    submission_id: int,
+    *,
+    epoch: int,
+    foreign: int,
+    lacking: int | None = None,
+    equal: int = 0,
 ) -> None:
     """The critical `batch.custom_id_anomaly` (rule 4): a batch whose `custom_id`s are not exactly ours, with
-    how many of its lines name no item of ours (`foreign`) and how many of our items it lacks (`lacking`);
-    `equal` counts the candidates whose ids equal ours when more than one did (counts only)."""
-    context: dict[str, JSONValue] = {
-        "submission_id": submission_id,
-        "foreign_lines": foreign,
-        "lacking_lines": lacking,
-    }
+    how many of its lines name no item of ours (`foreign`) and, when measured (the adoption's download of a
+    candidate, not the poll's stream), how many of our items it lacks (`lacking`); `equal` counts the
+    candidates whose ids equal ours when more than one did (counts only)."""
+    context: dict[str, JSONValue] = {"submission_id": submission_id, "foreign_lines": foreign}
+    if lacking is not None:
+        context["lacking_lines"] = lacking
     if equal > 1:
         context["equal_candidates"] = equal
     async with engine.begin() as conn:

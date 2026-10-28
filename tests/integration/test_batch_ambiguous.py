@@ -32,7 +32,7 @@ import procrastinate
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
-from jobhunter.llm.batches import BatchesClient, BatchRequest, BatchStatus, Created
+from jobhunter.llm.batches import BatchApiError, BatchesClient, BatchRequest, BatchStatus, Created
 from jobhunter.llm.fake import BatchScript
 from jobhunter.scoring import batch_adoption, batch_items, batch_results, cycles, validator
 from jobhunter.scoring import batch_operations as batch_ops
@@ -313,6 +313,44 @@ async def test_the_adoption_does_not_depend_on_the_listing_order(
     async with engine.connect() as conn:
         context = (await conn.execute(_ANOMALY_CONTEXT)).scalar_one()
     assert context == {"submission_id": row.id, "foreign_lines": N - 100, "lacking_lines": N - 100}
+
+
+async def test_the_adoption_decides_nothing_while_a_candidate_cannot_be_read_whole(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rule 3 and rule 4 (L3989-3990): an ended candidate of the window whose results cannot be read whole may
+    intersect ours, so a pass with one decides nothing for the submission, not even with our exact batch
+    beside it: nothing adopted, no anomaly, the row untouched; the next pass, which reads every candidate
+    whole, adopts ours (the other is disjoint)."""
+    ours = [f"t{t.target_id}_a1" for t in setup.targets]
+    fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=0))
+    await ambiguous(engine, op_runner, setup)
+    (before,) = await submission_rows(engine)
+    other = await partial_batch(fake_llm, ours, shared=0)
+    real = BatchesClient.results
+
+    async def failing(self: BatchesClient, batch_id: str) -> Any:
+        if batch_id == other:
+            raise BatchApiError("results", status=500, error_class="InternalServerError")
+        return await real(self, batch_id)
+
+    monkeypatch.setattr(BatchesClient, "results", failing)
+    report = await reconcile_ambiguous_once(engine, fake_llm)
+    assert (report.listed, report.adopted, report.anomalies) == (2, 0, 0)
+    assert report.unread == 1
+    (row,) = await submission_rows(engine)
+    assert (row.state, row.provider_batch_id) == ("submit_ambiguous", None)
+    assert (row.last_reconcile_at, row.reconcile_report) == (
+        before.last_reconcile_at,
+        before.reconcile_report,
+    )
+    monkeypatch.setattr(BatchesClient, "results", real)
+    report = await reconcile_ambiguous_once(engine, fake_llm)
+    assert (report.adopted, report.reconciled, report.unread) == (1, 1, 0)
 
 
 async def test_a_batch_item_parses_with_the_stored_family(

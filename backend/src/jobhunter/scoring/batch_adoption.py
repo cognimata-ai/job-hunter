@@ -21,8 +21,11 @@ results are processed and completed by the poll's own path in the same pass (eve
 submission is `ignored_fenced`; the follow-on fires for a `submit_ambiguous` origin only). A candidate whose
 ids intersect ours partially, or more than one equal to ours, raises `batch.custom_id_anomaly` (with how many
 lines are foreign and how many of ours are lacking) and adopts nothing (rule 4); a pass without a match
-records `last_reconcile_at` and `reconcile_report = {…, "candidates": n, "listed": m}`. One submission's
-unexpected error is logged with its class and leaves the others to the pass (Ruling T17-a).
+records `last_reconcile_at` and `reconcile_report = {…, "candidates": n, "listed": m}`. A pass in which an
+ended candidate of the window cannot be read whole decides nothing for the submission (no adoption, no
+anomaly, no record; logged `batch_adoption_deferred`), since that candidate may intersect ours; the next pass
+tries again. One submission's unexpected error is logged with its class and leaves the others to the pass
+(Ruling T17-a).
 
 **The task body** (`reconcile_ambiguous_task`, Deviation 27: the periodic task `batch_reconcile_ambiguous` of
 `worker.tasks`, under the queueing lock of its name) builds the client from the worker's config and gateway
@@ -92,7 +95,8 @@ log = get_logger("jobhunter.scoring.batch_adoption")
 class ReconcileReport:
     """What one reconciliation did: the submissions it looked at, the batches the listing held (`None`: the
     listing failed), the submissions it adopted and reconciled, the anomalies and the unresolved alerts it
-    opened, and the submissions whose reconciliation raised (each logged and left to the next pass)."""
+    opened, the submissions whose reconciliation raised (each logged and left to the next pass), and those
+    left undecided because an ended candidate could not be read whole."""
 
     submissions: int = 0
     listed: int | None = None
@@ -101,6 +105,7 @@ class ReconcileReport:
     anomalies: int = 0
     unresolved: int = 0
     failed: int = 0  # submissions whose reconciliation raised this pass (Ruling T17-a)
+    unread: int = 0  # submissions left undecided: an ended candidate of theirs could not be read whole
 
 
 async def _unresolved(
@@ -260,16 +265,23 @@ async def _reconcile_one(
     # every ended candidate downloaded first (ids only), so the decision is the listing order's in no way
     equal: list[BatchSummary] = []
     partial: list[frozenset[str]] = []
+    unread = 0
     for candidate in window:
         if candidate.processing_status != "ended":
             continue  # confirmed only once it has ended
         ids = await _custom_ids(client, candidate.id)
-        if ids is None or ids.isdisjoint(ours):
+        if ids is None:
+            unread += 1
+            continue
+        if ids.isdisjoint(ours):
             continue
         if ids == ours:
             equal.append(candidate)
         else:
             partial.append(ids)
+    if unread:  # a candidate not read whole may intersect ours: nothing is decided until every one is
+        log.warning("batch_adoption_deferred", submission_id=submission_id, unread_candidates=unread)
+        return replace(report, unread=report.unread + 1)
     if partial or len(equal) > 1:  # rule 4 (or no one match): never adopted
         first = partial[0] if partial else ours
         await custom_id_anomaly(
