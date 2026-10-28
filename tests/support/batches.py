@@ -52,7 +52,12 @@ from jobhunter.llm import bulk, fake
 from jobhunter.llm.batches import BatchesClient
 from jobhunter.llm.fake import ITEM_ERRORS, BatchScript, ItemOutcome, StoredBatch
 from jobhunter.llm.gateway import LLMGateway
-from jobhunter.scoring import batch_adoption, batch_results, batches
+from jobhunter.scoring import (  # batch_operations registers the batch_submit handler (Ruling T17-b)
+    batch_adoption,
+    batch_operations,  # noqa: F401
+    batch_results,
+    batches,
+)
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.settings.model import Settings
 from jobhunter.worker.operations import OperationClaim, claim_operation, create_operation
