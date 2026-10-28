@@ -1210,6 +1210,13 @@ async def _cancel(
     return Cancelled(len(moved), len(ended))
 
 
+def cancelled_states(reason: CancelReason) -> tuple[str, ...]:
+    """The target states `cancel_targets` moves for `reason`: `CANCELLABLE`, `in_progress` and, but for a
+    tuple supersession (whose `in_batch` targets are the batch cancel's, `batches.request_cancel`),
+    `in_batch`. The one definition: a merge's snapshot and its pre-lock of the bulk rows read it too."""
+    return (*CANCELLABLE, "in_progress", *(() if reason == TUPLE_SUPERSEDED else ("in_batch",)))
+
+
 async def cancel_targets(
     conn: AsyncConnection,
     *,
@@ -1231,10 +1238,8 @@ async def cancel_targets(
         match["revisions"] = (_MATCH["revision_ids"], list(revision_ids))
     if not match:
         raise ValueError("cancel_targets: no filter given; it matches every target")
-    # an in_batch target of a tuple supersession is the batch cancel's (`batches.request_cancel`)
-    states = [*CANCELLABLE, "in_progress", *(() if reason == TUPLE_SUPERSEDED else ("in_batch",))]
     del now
-    return await _cancel(conn, match, states, reason)
+    return await _cancel(conn, match, cancelled_states(reason), reason)
 
 
 async def cancel_batched(

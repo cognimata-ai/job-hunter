@@ -7,8 +7,12 @@ and the unmerge.
   are concatenated (the into-job's, a separator line naming the merged job, the from-job's), cut at 20,000
   characters with `[…]` (both full notes stay in the snapshot); the from-job's row is deleted.
 - An unmerge restores the from-job's row from the snapshot; on the into-job a timestamp that came only from
-  the merge (equal to the from-job's snapshot value, different from the into-job's) is reset, and the note is
-  restored unless it was edited after the merge.
+  the merge (equal to the from-job's snapshot value, different from the into-job's) is reset to the earliest
+  of the into-job's own value and those of the merges still in force (Ruling T22-d), and the note loses
+  exactly the segment this merge appended, unless the user edited it (Ruling T22-c), so several merges into
+  one job unmerge in any order.
+- The cut keeps the into-job's note whole and cuts only the appended part, which is left out when no room is
+  left; an event recorded without the actions snapshot restores none.
 
 Every note and datum is invented.
 """
@@ -21,6 +25,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.dedup import merge
 from jobhunter.dedup.merge import unmerge
+from jobhunter.normalize.keys import AdKey
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import (
@@ -222,11 +227,11 @@ async def test_an_unmerge_keeps_what_was_edited_after_the_merge(
     async with engine.begin() as conn:
         await unmerge(conn, event.id)
     assert values(await user_actions(engine, pair.a)) == {
-        "seen_at": at + timedelta(hours=2),  # B's value, not A's: it came from the merge, reset
+        "seen_at": at + timedelta(hours=2),  # A's own: B's earlier value came only from the merge, reset
         "saved_at": at + timedelta(hours=10),  # the user's own, not B's: kept
         "applied_at": at + timedelta(hours=5),  # A's own: kept
         "hidden_at": None,  # B's alone: reset
-        "note": "Nach dem Zusammenführen bearbeitet.",  # edited after the merge: kept
+        "note": "Nach dem Zusammenführen bearbeitet.",  # B's segment is gone from it: kept as it is
     }
     assert values(await user_actions(engine, pair.b)) == b_before
 
@@ -260,3 +265,144 @@ async def test_a_merge_of_jobs_without_actions_writes_no_row(
         await unmerge(conn, event.id)
     for job in (pair.a, pair.b):
         assert await user_actions(engine, job) is None
+
+
+# ---- fix round 1: several merges into one job (Rulings T22-c, T22-d), the cut's boundary, an old event -----
+
+_JOB_OF_ITEM = sa.text(
+    "SELECT p.job_id FROM posting_observations o JOIN postings p ON p.id = o.posting_id "
+    "WHERE o.raw_item_id = :i"
+)
+_EVENTS_BY_FROM = sa.text("SELECT from_job_id, id FROM merge_events WHERE kind <> 'unmerge' ORDER BY id")
+
+
+async def jsearch_job(engine: AsyncEngine, owner: Any, native_id: str, at: datetime) -> int:
+    item = await pending_item(engine, owner, "jsearch", {"native_id": native_id}, fetched_at=at)
+    assert await resolved(engine, owner, item) == "linked"
+    async with engine.connect() as conn:
+        return int((await conn.execute(_JOB_OF_ITEM, {"i": item})).scalar_one())
+
+
+async def three_merged(
+    engine: AsyncEngine, owner: Any, at: datetime, **actions: dict[str, Any]
+) -> tuple[int, int, int, dict[int, int]]:
+    """A, B and C, each with a note of its own (and `actions[name]` beside it), then one sighting of all three
+    keys: identity merges B and C into A in one transaction. The merge event of each by its from-job."""
+    a, b, c = [await jsearch_job(engine, owner, f"H{n}", at + timedelta(hours=n)) for n in range(3)]
+    async with engine.begin() as conn:
+        for name, job in (("a", a), ("b", b), ("c", c)):
+            await put_user_actions(conn, job, note=f"{name.upper()}-Notiz", **actions.get(name, {}))
+    keys = tuple(AdKey("htidocid", f"H{n}") for n in range(3))
+    linking = await pending_item(
+        engine, owner, "arbeitnow", {"raw_keys": keys}, fetched_at=at + timedelta(hours=4)
+    )
+    assert await resolved(engine, owner, linking) == "linked"
+    async with engine.connect() as conn:
+        events = {int(r.from_job_id): int(r.id) for r in await conn.execute(_EVENTS_BY_FROM)}
+    assert set(events) == {b, c}
+    return a, b, c, events
+
+
+async def unmerged(engine: AsyncEngine, event_id: int) -> None:
+    async with engine.begin() as conn:
+        await unmerge(conn, event_id)
+
+
+async def test_unmerging_one_of_two_merges_removes_only_its_own_note_segment(
+    engine: AsyncEngine, current_epoch: int, at: datetime
+) -> None:
+    """Ruling T22-c (a): B and C merged into A in one transaction; B unmerged while C stays merged."""
+    owner = await queued_run(engine)
+    a, b, c, events = await three_merged(engine, owner, at)
+    merged_note = f"A-Notiz\n{separator(b)}\nB-Notiz\n{separator(c)}\nC-Notiz"
+    assert (await user_actions(engine, a)).note == merged_note
+    await unmerged(engine, events[b])
+    assert (await user_actions(engine, a)).note == f"A-Notiz\n{separator(c)}\nC-Notiz"  # A's and C's text
+    assert (await user_actions(engine, b)).note == "B-Notiz"
+    await unmerged(engine, events[c])
+    assert (await user_actions(engine, a)).note == "A-Notiz"
+
+
+async def test_unmerging_both_in_reverse_order_leaves_the_into_jobs_own_note(
+    engine: AsyncEngine, current_epoch: int, at: datetime
+) -> None:
+    """Ruling T22-c (b): C unmerged first, then B: nothing of either is left in A's note, nor duplicated."""
+    owner = await queued_run(engine)
+    a, b, c, events = await three_merged(engine, owner, at)
+    await unmerged(engine, events[c])
+    assert (await user_actions(engine, a)).note == f"A-Notiz\n{separator(b)}\nB-Notiz"
+    await unmerged(engine, events[b])
+    assert (await user_actions(engine, a)).note == "A-Notiz"
+    assert [(await user_actions(engine, job)).note for job in (b, c)] == ["B-Notiz", "C-Notiz"]
+
+
+async def test_a_note_edited_inside_the_unmerged_segment_is_kept(
+    engine: AsyncEngine, current_epoch: int, at: datetime
+) -> None:
+    """Ruling T22-c (c): the user changed the text B's merge appended: the note is kept as it is."""
+    owner = await queued_run(engine)
+    a, b, c, events = await three_merged(engine, owner, at)
+    edited = f"A-Notiz\n{separator(b)}\nB-Notiz, nachgefragt\n{separator(c)}\nC-Notiz"
+    row = await user_actions(engine, a)
+    async with engine.begin() as conn:
+        await put_user_actions(conn, a, note=edited)
+    await unmerged(engine, events[b])
+    after = await user_actions(engine, a)
+    assert after.note == edited and (row.seen_at, row.hidden_at) == (after.seen_at, after.hidden_at)
+
+
+async def test_an_unmerged_timestamp_falls_back_to_the_merges_still_in_force(
+    engine: AsyncEngine, current_epoch: int, at: datetime
+) -> None:
+    """Ruling T22-d: B hidden and applied at T0, C at T0 + 1 h, A at neither; B unmerged while C stays merged:
+    A stays hidden and applied, at C's time, and its note keeps C's segment."""
+    owner = await queued_run(engine)
+    t0 = at - timedelta(days=2)
+    b_actions = {"hidden_at": t0, "applied_at": t0}
+    c_actions = {"hidden_at": t0 + timedelta(hours=1), "applied_at": t0 + timedelta(hours=1)}
+    a, b, c, events = await three_merged(engine, owner, at, b=b_actions, c=c_actions)
+    merged = await user_actions(engine, a)
+    assert (merged.hidden_at, merged.applied_at) == (t0, t0)
+    await unmerged(engine, events[b])
+    kept = await user_actions(engine, a)
+    assert (kept.hidden_at, kept.applied_at) == (t0 + timedelta(hours=1), t0 + timedelta(hours=1))
+    assert kept.note == f"A-Notiz\n{separator(c)}\nC-Notiz"
+
+
+async def test_the_cut_keeps_the_into_notes_text_whole_at_the_boundary(engine: AsyncEngine) -> None:
+    """Minor 4 (L3206: the appended part is the one cut): an into note of 19,996 characters leaves room for
+    the line break and the marker alone; one of 19,997 leaves none, and stays as it is."""
+    async with engine.begin() as conn:
+        tight, full, source_a, source_b = [await insert_job(conn) for _ in range(4)]
+        await put_user_actions(conn, tight.job_id, note="t" * 19_996)
+        await put_user_actions(conn, full.job_id, note="f" * 19_997)
+        await put_user_actions(conn, source_a.job_id, note="Anhang")
+        await put_user_actions(conn, source_b.job_id, note="Anhang")
+    async with engine.begin() as conn:
+        await merge.coalesce_user_actions(conn, from_job=source_a.job_id, into_job=tight.job_id)
+        await merge.coalesce_user_actions(conn, from_job=source_b.job_id, into_job=full.job_id)
+    assert (await user_actions(engine, tight.job_id)).note == "t" * 19_996 + "\n[…]"
+    assert (await user_actions(engine, full.job_id)).note == "f" * 19_997
+
+
+async def test_an_event_recorded_without_the_actions_snapshot_restores_none(
+    engine: AsyncEngine, current_epoch: int, at: datetime, log_events: Any
+) -> None:
+    """Minor 5: an event whose snapshot holds no `user_job_actions` (recorded before M3) leaves the rows as
+    they are and says so, with the event id alone."""
+    owner = await queued_run(engine)
+    pair = await seeded_pair(engine, owner, at)
+    event = await strong_key_merge(engine, owner, pair, at)
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE merge_events SET evidence = evidence #- '{snapshot,user_job_actions}' WHERE id = :e"
+            ),
+            {"e": event.id},
+        )
+    merged = values(await user_actions(engine, pair.a))
+    await unmerged(engine, event.id)
+    assert values(await user_actions(engine, pair.a)) == merged
+    assert await user_actions(engine, pair.b) is None
+    found = [e for e in log_events() if e["event"] == "unmerge_without_user_actions_snapshot"]
+    assert [e["event_id"] for e in found] == [event.id]

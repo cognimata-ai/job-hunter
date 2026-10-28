@@ -56,6 +56,9 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    ownership never changes here), then the `ad_key_sources` rows of the posting.
 6. **Merges or the conflict**: `merge.merge_jobs(strong_key_merge, recompute=False, locked=<the rows of
    step 3>)` per merged job, in id order, with the keys and the observation as evidence; or the conflict row.
+   A revision the recompute of step 7 supersedes is node 9's to retarget, later in the same run
+   (`enqueue_targets`: the recompute writes `jobs.updated_at`), so `merge.supersede_revision` is not run here
+   (Ruling T22-e).
 7. **Projections**: the decided job's availability and seen bounds (`merge.derive_from_postings`), its
    canonical fields and revision (`revisions.recompute_job`, once, after the last merge), and the det-facts
    change hook (`filters.refilter_job_live`, M3 Task 15, with what step 1 read under `active_config`): its

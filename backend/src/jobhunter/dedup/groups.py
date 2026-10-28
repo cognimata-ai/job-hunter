@@ -896,10 +896,11 @@ async def split_member(conn: AsyncConnection, group_id: int, job_id: int) -> Non
 async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
     """The user confirms the group (§8.7): every other member is merged into the representative's job
     (`merge_jobs(user_confirmed_merge)`, whose step 5 dissolves the group when the last one left), with
-    `dedup_decisions(same, user_confirm)` for each pair, after the bulk rows of every member's follow-up holds
-    (`merge.lock_target_holds`: the merges cancel the members' targets, Ruling P52); the representative is
-    recomputed once, its hard-filter results written, and the ranking bumped last. Returns the
-    representative's job id.
+    `dedup_decisions(same, user_confirm)` for each pair, after the bulk rows of every member's follow-up
+    holds, the representative's included (`merge.lock_target_holds`: the merges cancel the members' targets
+    and the recompute may supersede the representative's, Ruling P52); the representative is recomputed once,
+    its hard-filter results written, a revision it no longer has superseded (`merge.supersede_revision`, §9.7,
+    Ruling T22-e), and the ranking bumped last. Returns the representative's job id.
 
     Raises `LookupError` for a group that does not exist, `InvariantViolation` for one that is not active or
     has no representative, and `FencedOut` for a fenced member, having written nothing."""
@@ -909,8 +910,9 @@ async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
     if rep is None:
         raise InvariantViolation(f"duplicate group {group_id} has no representative to merge into")
     into = int(rep)
-    # every merge's bulk rows before the first merge's target rows (Ruling P52, `merge.lock_target_holds`)
-    await merge.lock_target_holds(conn, [member for member in member_ids if member != into])
+    # every merge's bulk rows, and the representative's (its revision may move), before any target row (P52)
+    await merge.lock_target_holds(conn, member_ids)
+    previous = await merge.current_revision(conn, into)
     evidence: dict[str, JSONValue] = {"rule": "user_confirm", "group_id": group_id}
     for member in member_ids:
         if member == into:
@@ -925,8 +927,11 @@ async def confirm_group(conn: AsyncConnection, group_id: int) -> int:
             recompute=False,
             locked=held,
         )
-    await merge.recompute_rollups(conn, into)
+    _, result = await merge.recompute_rollups(conn, into)
     await filters.refilter_job_live(conn, into, active=active)  # the det-facts change hook (Task 15)
+    await merge.supersede_revision(  # out of a run (Ruling T22-e)
+        conn, into, previous_revision_id=previous, current_revision_id=result.revision_id, active=active
+    )
     log.info("duplicate_group_confirmed", group_id=group_id, into_job_id=into, merged=len(member_ids) - 1)
     await ranking.bump(conn)
     return into

@@ -12,6 +12,10 @@ L3979; plan M3 Task 22, Deviation 14, Rulings P8, P52, Carries T10-f, T13-a).
   `groups.confirm_group`) locks the bulk rows of every merged job's candidates before its first target row.
 - An unmerge revives the `job_merged` target of the from-job's restored current revision under the active
   tuple, and leaves a `tuple_superseded` one of an older tuple alone.
+- Ruling T22-e (§9.7 L3713-3714): a merge or an unmerge outside a run that moves a job's current revision
+  cancels the previous revision's unpublished targets `revision_superseded` (a published one stays) and gives
+  the new current revision its target; the bulk rows of those targets' holds are locked with the merge's own,
+  before the first target row.
 
 Every datum is invented.
 """
@@ -410,3 +414,229 @@ async def test_an_unmerge_revives_the_job_merged_target_of_the_restored_current_
             {"j": pair.b, "t": tuple_id},
         )
         assert live.scalar_one() == 1  # revived, not created anew
+
+
+# ---- fix round 1: a merge or an unmerge outside a run supersedes revisions (Ruling T22-e) ----------------
+
+FULL_TEXT = "Erfundene Stelle mit vollständiger Beschreibung der Aufgaben im Team " * 5
+PARTIAL_TEXT = "Erfundene Stelle mit einer gekürzten Beschreibung der Aufgaben " * 4
+
+
+async def described_pair(engine: AsyncEngine, owner: Any, at: Any) -> tuple[int, int]:
+    """F, with a full description, then P, with a partial one (so F's id is the lower): merged into P, F
+    supplies P's description, and P's current revision moves; P's own revision returns on the unmerge."""
+    full = await jsearch_job(
+        engine, owner, "HF", at, description_text=FULL_TEXT, description_completeness="full"
+    )
+    partial = await jsearch_job(
+        engine,
+        owner,
+        "HP",
+        at + timedelta(hours=1),
+        description_text=PARTIAL_TEXT,
+        description_completeness="partial",
+    )
+    assert full < partial
+    return full, partial
+
+
+async def merge_described(engine: AsyncEngine, full: int, partial: int) -> int:
+    """F merged into P by a standalone merge (out of a run), P's rollups recomputed; the ranking bumped."""
+    async with engine.begin() as conn:
+        event = await merge_jobs(
+            conn, from_job_id=full, into_job_id=partial, kind="user_confirmed_merge", evidence={}
+        )
+        await ranking.bump(conn)
+    return event
+
+
+@pytest.mark.parametrize("old_state", ["pending", "published"])
+async def test_a_merge_out_of_a_run_supersedes_the_into_jobs_moved_revision(
+    engine: AsyncEngine, current_epoch: int, old_state: str
+) -> None:
+    owner = await queued_run(engine)
+    full, partial = await described_pair(engine, owner, utcnow() - timedelta(hours=8))
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+    before = await current_job(engine, partial)
+    async with engine.begin() as conn:
+        if old_state == "pending":
+            old_target = await state_target(conn, before, tuple_id, "pending")
+        else:
+            old_target = (await insert_published(conn, before, tuple_id)).target_id
+    await merge_described(engine, full, partial)
+
+    after = await current_job(engine, partial)
+    assert after.revision_id != before.revision_id  # F's description moved P's current revision
+    old = await target_row(engine, old_target)
+    if old_state == "pending":
+        assert (old.state, old.state_reason) == ("cancelled", "revision_superseded")
+    else:
+        assert old.state == "published_accepted"  # published targets stay as history
+    async with engine.connect() as conn:
+        new = (
+            await conn.execute(
+                sa.text(
+                    "SELECT state, llm_tuple_id FROM score_targets WHERE job_revision_id = :r AND job_id = :j"
+                ),
+                {"r": after.revision_id, "j": partial},
+            )
+        ).one()
+    assert (new.state, new.llm_tuple_id) == ("pending", tuple_id)
+
+
+@pytest.mark.parametrize("caller", ["confirm_group", "resolve_conflict"])
+async def test_the_other_merges_out_of_a_run_supersede_the_moved_revision(
+    engine: AsyncEngine, current_epoch: int, caller: str
+) -> None:
+    """Ruling T22-e for the callers that recompute the into-job themselves: `groups.confirm_group` (F and P in
+    a group represented by P) and `resolve_conflict(merge)` (a partial posting X whose keys name two jobs with
+    full descriptions and different StepStone ids)."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=8)
+    if caller == "confirm_group":
+        full, into = await described_pair(engine, owner, at)
+        async with engine.begin() as conn:
+            group = int((await conn.execute(_GROUP, {"rep": into})).scalar_one())
+            for job in (full, into):
+                await conn.execute(_MEMBER, {"g": group, "j": job})
+                await conn.execute(_IN_GROUP, {"g": group, "j": job})
+    else:
+        for n, link in ((1, STEPSTONE_1), (2, STEPSTONE_2)):
+            await jsearch_job(
+                engine, owner, f"H{n}", at + timedelta(hours=n), primary_link=link, description_text=FULL_TEXT
+            )
+        keys = {
+            "raw_keys": (AdKey("htidocid", "H1"), AdKey("htidocid", "H2")),
+            "description_text": PARTIAL_TEXT,
+            "description_completeness": "partial",
+        }
+        item = await pending_item(engine, owner, "arbeitnow", keys, fetched_at=at + timedelta(hours=3))
+        assert await resolved(engine, owner, item) == "linked"
+        into = int(await scalar(engine, _JOB_OF_ITEM, i=item))
+        conflict = int(await scalar(engine, sa.text("SELECT id FROM identity_conflicts")))
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+    before = await current_job(engine, into)
+    async with engine.begin() as conn:
+        old_target = await state_target(conn, before, tuple_id, "pending")
+    async with engine.begin() as conn:
+        if caller == "confirm_group":
+            await groups.confirm_group(conn, group)
+        else:
+            await resolve_conflict(conn, conflict, "merge")
+    after = await current_job(engine, into)
+    assert after.revision_id != before.revision_id
+    old = await target_row(engine, old_target)
+    assert (old.state, old.state_reason) == ("cancelled", "revision_superseded")
+    async with engine.connect() as conn:
+        found = await conn.execute(
+            sa.text("SELECT state FROM score_targets WHERE job_revision_id = :r AND llm_tuple_id = :t"),
+            {"r": after.revision_id, "t": tuple_id},
+        )
+        assert found.scalar_one() == "pending"
+
+
+async def test_an_unmerge_supersedes_the_moved_revisions_of_both_jobs(
+    engine: AsyncEngine, current_epoch: int
+) -> None:
+    owner = await queued_run(engine)
+    full, partial = await described_pair(engine, owner, utcnow() - timedelta(hours=8))
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+    f_job, p_before = await current_job(engine, full), await current_job(engine, partial)
+    async with engine.begin() as conn:
+        f_target = await state_target(conn, f_job, tuple_id, "pending")
+        p_old = await state_target(conn, p_before, tuple_id, "pending")
+    event = await merge_described(engine, full, partial)
+    p_merged = await current_job(engine, partial)
+    async with engine.connect() as conn:
+        p_new = int(
+            (
+                await conn.execute(
+                    sa.text("SELECT id FROM score_targets WHERE job_revision_id = :r"),
+                    {"r": p_merged.revision_id},
+                )
+            ).scalar_one()
+        )
+    assert (await target_row(engine, f_target)).state_reason == "job_merged"
+    assert (await target_row(engine, p_old)).state_reason == "revision_superseded"
+
+    async with engine.begin() as conn:
+        await unmerge(conn, event)
+    assert await current_job(engine, partial) == p_before  # P's own revision is current again
+    assert await current_job(engine, full) == f_job
+    gone = await target_row(engine, p_new)
+    assert (gone.state, gone.state_reason) == ("cancelled", "revision_superseded")
+    for target in (p_old, f_target):  # each job's current revision has its target back
+        back = await target_row(engine, target)
+        assert (back.state, back.state_reason) == ("pending", None), target
+
+
+@pytest.mark.parametrize("operation", ["merge", "unmerge"])
+async def test_the_superseded_revisions_hold_rows_are_locked_before_the_first_target_row(
+    engine: AsyncEngine, migrated: PgServer, current_epoch: int, operation: str
+) -> None:
+    """Ruling T22-e with P52: the target of P's revision that the merge (or the unmerge) supersedes holds a
+    follow-up hold whose bulk row is held elsewhere. The transaction waits for it while F's target row (the
+    merge's own cancellation, the unmerge's revival, both earlier in it) is not locked yet."""
+    owner = await queued_run(engine)
+    full, partial = await described_pair(engine, owner, utcnow() - timedelta(hours=8))
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+    f_job, p_job = await current_job(engine, full), await current_job(engine, partial)
+    async with engine.begin() as conn:
+        f_target = await state_target(conn, f_job, tuple_id, "pending")
+        superseded = await state_target(conn, p_job, tuple_id, "pending", lane="batch_followup")
+    work: Callable[[], Coroutine[Any, Any, object]]
+    if operation == "merge":
+        work = lambda: merge_described(engine, full, partial)  # noqa: E731
+    else:
+        event = await merge_described(engine, full, partial)
+        p_merged = await current_job(engine, partial)
+        async with engine.connect() as conn:
+            superseded = int(
+                (
+                    await conn.execute(
+                        sa.text("SELECT id FROM score_targets WHERE job_revision_id = :r"),
+                        {"r": p_merged.revision_id},
+                    )
+                ).scalar_one()
+            )
+
+        async def unmerging() -> int:
+            async with engine.begin() as conn:
+                return await unmerge(conn, event)
+
+        work = unmerging
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE score_targets SET lane = 'batch_followup' WHERE id = :t"), {"t": superseded}
+        )
+        operation_id, item = await followup_hold(conn, tuple_id, superseded, hold=Decimal("0.100000"))
+    async with engine.connect() as holder:
+        await holder.execute(sa.text("BEGIN"))
+        await holder.execute(
+            sa.text("SELECT id FROM bulk_operations WHERE id = :b FOR NO KEY UPDATE"), {"b": operation_id}
+        )
+        holder_pid = int((await holder.execute(_PID)).scalar_one())
+        task: asyncio.Task[object] = asyncio.create_task(work())
+
+        async def waiting() -> bool:
+            return task.done() or any(w.relation == "bulk_operations" for w in lock_wait_details(migrated))
+
+        await await_until(waiting, 10, 0.02)
+        assert not task.done()
+        (wait,) = [w for w in lock_wait_details(migrated) if w.relation == "bulk_operations"]
+        assert (wait.key, wait.blocking_pids) == (str(operation_id), (holder_pid,))
+        async with engine.connect() as probe:  # no target row is locked yet
+            await probe.execute(sa.text("BEGIN"))
+            for target in (f_target, superseded):
+                assert (await probe.execute(_TRY_TARGET, {"t": target})).scalar_one() == target
+            await probe.execute(sa.text("ROLLBACK"))
+        await holder.execute(sa.text("ROLLBACK"))
+    await asyncio.wait_for(task, 10)
+    gone = await target_row(engine, superseded)
+    assert (gone.state, gone.state_reason) == ("cancelled", "revision_superseded")
+    held = await hold_of(engine, operation_id, item)
+    assert held.followup_held_usd == Decimal("0.000000") and held.hold_released_at is not None
