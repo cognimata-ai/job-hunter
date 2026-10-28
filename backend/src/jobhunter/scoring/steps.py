@@ -65,11 +65,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from types import MappingProxyType
-from typing import Final, Protocol, get_args
+from typing import Any, Final, Protocol, get_args
+
+from sqlalchemy.engine import Row
 
 from jobhunter.llm.errors import InvalidOutput
 from jobhunter.llm.gateway import GatewayResult, RenderedPrompt
-from jobhunter.llm.pricing import Effort
+from jobhunter.llm.pricing import Effort, effort_of
 from jobhunter.llm.prompts.render import (
     Issue,
     JobAdBlock,
@@ -130,6 +132,7 @@ FACT_UNCERTAIN: Final = "fact_uncertain"
 FACT_UNREVIEWED: Final = "fact_unreviewed"
 _REVIEW_MISSING: Final = "review_missing"
 _INJECTION_NONE: Final = "none"
+_STRUCTURED: Final = "structured"
 
 
 # ---- the inputs, the stored artifacts and the store --------------------------------------------------------
@@ -400,6 +403,59 @@ def revision_ad(material: JSONValue, *, completeness: str, description_text: str
         ],
         completeness=completeness,
         description_text=description_text,
+    )
+
+
+def material_ad(row: Row[Any]) -> JobAdBlock:
+    """`revision_ad` of a row holding a revision's material as `job_revisions` names it (`llm_input`,
+    `description_text`, `description_completeness`)."""
+    return revision_ad(
+        row.llm_input,
+        completeness=str(row.description_completeness),
+        description_text=str(row.description_text),
+    )
+
+
+def critic_efforts(model_policy: JSONValue) -> tuple[Effort, Effort]:
+    """A model policy's critic efforts: its normal one (`nodes.critic.effort`) and its light one."""
+    return (
+        effort_of(get_str(model_policy, "nodes.critic.effort")),
+        effort_of(get_str(model_policy, "critic_light_effort")),
+    )
+
+
+def material_inputs(
+    row: Row[Any],
+    *,
+    version: PromptVersion,
+    rubric: Rubric,
+    policy: EvaluationPolicy,
+    efforts: tuple[Effort, Effort],
+    det: DetFacts,
+    sample_key: str,
+    refs: Mapping[str, JSONValue],
+) -> ScoreInputs:
+    """A scoring's inputs from a row holding a revision's material (`material_ad`) and a profile version's
+    `profile_json` (a score attempt's, `attempt_inputs.load_attempt_inputs`, or an eval case's): the
+    structured work modes are the material's when its source is structured; the critic efforts are
+    `critic_efforts` of the model policy."""
+    material: JSONValue = row.llm_input
+    work_modes = material_strings(material, "work_mode_possible")
+    structured = get_str(material, "work_mode_source") == _STRUCTURED
+    critic, light = efforts
+    return ScoreInputs(
+        version=version,
+        rubric=rubric,
+        profile=ConfirmedProfile.model_validate(row.profile_json),
+        ad=material_ad(row),
+        det=det,
+        structured_work_modes=tuple(work_modes) if structured else (),
+        completeness=str(row.description_completeness),
+        policy=policy,
+        critic_effort=critic,
+        critic_light_effort=light,
+        sample_key=sample_key,
+        refs=refs,
     )
 
 

@@ -4,6 +4,10 @@ wheel, so the dev stack's installed package seeds them (`jobhunter golden seed-a
 `adversarial/` holds the adversarial golden cases, one JSON file per case (`scoring.golden.Fixture`):
 synthetic ads and profiles of invented people, which the PII gate (`tests/contract/test_fixture_pii.py`)
 scans. `adversarial_dir()` is that directory on disk.
+
+A shipped fixture is immutable: an installation seeds each fixture once, by its `key`, and a re-seed that
+finds the fixture's stored case no longer matching it fails (`golden.FixtureChanged`). A changed case is a
+new file with a new key; the old one stays as it shipped.
 """
 
 from importlib import resources

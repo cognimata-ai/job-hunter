@@ -184,9 +184,10 @@ _STORE_DRAFT = q(
 )
 _OPT_IN = q("UPDATE cv_files SET native_pdf_opt_in = true, extraction_method = 'native_pdf' WHERE id = :cv")
 _ACTIVE_VERSION = q("SELECT profile_version_id FROM active_config WHERE id = 1")
+# The user's versions only: the adversarial seed's synthetic ones are the eval's (Ruling T19-a).
 _VERSIONS = q(
     "SELECT id, version_no, confirmed_at, purged_at IS NOT NULL AS purged, profile_json "
-    "FROM profile_versions ORDER BY version_no DESC"
+    "FROM profile_versions WHERE NOT synthetic_eval ORDER BY version_no DESC"
 )
 
 

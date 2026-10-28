@@ -28,6 +28,8 @@ from jobhunter.observability.metrics import REGISTRY
 from jobhunter.quota import ledger
 from jobhunter.quota.pacing import fair_share, per_run_cap
 from jobhunter.quota.windows import current_snapshot
+from jobhunter.scoring import golden
+from jobhunter.scoring.eval_fixtures import adversarial_dir
 from jobhunter.sources.base import Observation
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.worker import runs
@@ -161,6 +163,41 @@ async def test_happy_run_succeeds_with_a_full_report(
     )
     # carry 7: no company names either, neither the jobs' nor the board's slug
     assert companies and not [name for name in companies if name in blob] and DEFAULT_BOARD[1] not in blob
+
+
+async def test_an_adversarial_seed_during_a_run_changes_neither_its_status_nor_its_counts(
+    engine, current_epoch, fake_http, fake_embedder, collect_deps, monkeypatch
+) -> None:
+    """Ruling T19-a: the seed's synthetic revisions never wait for an embedding (`embeddings` skips them),
+    and they are no job of the run: seeded during it, they make it neither partial (I6) nor count in its
+    `jobs_created` or its `revisions`."""
+    seeded: list[int] = []
+
+    async def seed(name: str) -> None:
+        if name == finalize_module.BEFORE_FINALIZE:
+            async with engine.begin() as c:
+                seeded.append(
+                    (await golden.seed_adversarial(c, fixtures_dir=adversarial_dir(), now=utcnow())).jobs
+                )
+
+    monkeypatch.setattr(finalize_module, "afault_point", seed)
+    rid = await run_to_the_end(engine, collect_deps)
+    status, reason, report = await run_end(engine, rid)
+    assert seeded and seeded[0] > 0
+    async with engine.connect() as c:
+        real = (
+            await c.execute(
+                sa.text(
+                    "SELECT count(*) FROM job_revisions r JOIN jobs j ON j.id = r.job_id "
+                    "WHERE r.revision_no = 1 AND NOT j.synthetic_eval"
+                )
+            )
+        ).scalar_one()
+    assert (status, reason) == ("succeeded", None)
+    assert report["execution"]["invariants"]["I6"] == {"ok": True, "detail": {"awaiting": 0}}
+    assert report["identity"]["jobs_created"] == real > 0
+    revisions = report["revisions"]
+    assert revisions["created"] == revisions["embedded"] == real and revisions["awaiting"] == 0
 
 
 async def test_partial_and_invariant_failures(

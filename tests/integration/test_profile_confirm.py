@@ -39,6 +39,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import insert_revisions_awaiting, manual_run_id, seed_inputs
+from tests.support.eval import seed_adversarial
 from tests.support.faults import PausePoint
 from tests.support.fixtures import count_rows
 from tests.support.profile import (
@@ -703,6 +704,33 @@ async def test_the_profile_list_shows_the_confirmed_version(logged_in_client, en
         "profile": version.profile_json,
     }
     assert listed == {"active": expected, "versions": [expected]}
+
+
+async def test_the_profile_list_leaves_the_adversarial_seeds_synthetic_versions_out(
+    logged_in_client, engine, ready_draft
+) -> None:
+    """Ruling T19-a: the seed's synthetic versions are the eval's, never the user's to list."""
+    body = await confirmed(logged_in_client, ready_draft)
+    seeded = await seed_adversarial(engine)
+    assert seeded.profiles > 0
+    listed = (await logged_in_client.get("/api/profile")).json()
+    assert [v["id"] for v in listed["versions"]] == [body["profile_version_id"]]
+    assert listed["active"]["id"] == body["profile_version_id"]
+
+
+async def test_the_users_version_numbers_ignore_the_seeds_synthetic_ones(
+    logged_in_client, engine, ready_draft
+) -> None:
+    """Ruling T19-c: the user's `version_no = max + 1` counts the user's versions only. Seeded first (its ten
+    versions numbered 1,000,001 on), the first confirm is still version 1."""
+    await seed_adversarial(engine)
+    body = await confirmed(logged_in_client, ready_draft)
+    (version,) = await rows(
+        engine,
+        "SELECT version_no, synthetic_eval FROM profile_versions WHERE id = :v",
+        v=body["profile_version_id"],
+    )
+    assert (version.version_no, version.synthetic_eval) == (1, False)
 
 
 async def test_the_rescore_estimate_previews_the_count_the_costs_and_the_month(

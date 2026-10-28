@@ -154,6 +154,18 @@ async def test_a_job_that_passes_its_filters_is_created_pending_in_the_bulk_oper
     )
 
 
+async def test_a_synthetic_job_is_refused_a_target(engine: AsyncEngine, tuple_id: int, scope: int) -> None:
+    """Ruling T19-a, defence in depth: every creator selects the user's jobs only (`RETAINED_JOB_SQL`), so a
+    synthetic golden-case job reaching `create_or_revive` is a bug, refused with a typed error, no row."""
+    job = await a_job(engine, synthetic_eval=True)
+    async with engine.begin() as conn:
+        await filter_result(conn, job, scope, passed=True)
+    with pytest.raises(targets.SyntheticJobRefused) as refused:
+        await create(engine, job, tuple_id)
+    assert refused.value.job_id == job.job_id
+    assert await scalar(engine, "SELECT count(*) FROM score_targets WHERE job_id = :j", j=job.job_id) == 0
+
+
 async def test_a_failed_filter_result_creates_the_target_filtered_out(
     engine: AsyncEngine, tuple_id: int, scope: int
 ) -> None:

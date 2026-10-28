@@ -334,16 +334,19 @@ class EmbedReport:
 _NO_TIME_BOUND: Final = datetime.max.replace(tzinfo=UTC)
 _START: Final = (datetime.min.replace(tzinfo=UTC), 0)
 # A synthetic golden-case job's revisions are never embedded (M3 Task 19, Codex r1 #32): nothing ranks them.
-_NOT_SYNTHETIC: Final = "NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = r.job_id AND j.synthetic_eval)"
+# The predicate of a revision `r` of a job of the user's (Ruling T19-a: the collection's counts use it too).
+NOT_SYNTHETIC_REVISION_SQL: Final = (
+    "NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = r.job_id AND j.synthetic_eval)"
+)
 _NEXT_BATCH: Final = q(
     "SELECT r.id, r.created_at, r.llm_input FROM job_revisions r "  # noqa: S608 (a constant fragment)
     "WHERE r.embedding_status = 'awaiting_embedding' AND r.created_at < :before "
-    f"AND (r.created_at, r.id) > (:after_at, :after_id) AND {_NOT_SYNTHETIC} "
+    f"AND (r.created_at, r.id) > (:after_at, :after_id) AND {NOT_SYNTHETIC_REVISION_SQL} "
     "ORDER BY r.created_at, r.id LIMIT :n"
 )
 _COUNT_AWAITING: Final = q(
     "SELECT count(*) FROM job_revisions r WHERE r.embedding_status = 'awaiting_embedding' "  # noqa: S608
-    f"AND r.created_at < :before AND {_NOT_SYNTHETIC}"
+    f"AND r.created_at < :before AND {NOT_SYNTHETIC_REVISION_SQL}"
 )
 
 Guard = Callable[[AsyncConnection], Awaitable[None]]

@@ -20,7 +20,7 @@ from jobhunter.scoring.eval_fixtures import adversarial_dir
 from jobhunter.scoring.facts import FACT_ID_CODES
 from jobhunter.scoring.knockouts import KnockoutCandidate, derive_knockouts
 
-from tests.contract.test_fixture_pii import EVAL_FIXTURES, scan_fixture
+from tests.support.fixture_scan import EVAL_FIXTURES, scan_fixture
 from tests.support.scoring import job_facts, required_language
 
 KEYS: Final = (

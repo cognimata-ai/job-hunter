@@ -14,6 +14,7 @@ Every datum is invented: the packaged adversarial fixtures and the synthetic ad 
 import asyncio
 import json
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -28,6 +29,7 @@ from jobhunter.clock import utcnow
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import gateway as gateway_module
 from jobhunter.llm import spend_ledger
+from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.scoring import eval_runner, golden
 from jobhunter.scoring.eval_fixtures import adversarial_dir
 from jobhunter.scoring.triggers import golden_sample_key, sampled
@@ -47,6 +49,7 @@ from tests.support.eval import (
     cases,
     counted,
     eval_deps,
+    eval_generator_body,
     execute,
     fake_eval_answers,
     filtering_scope,
@@ -60,7 +63,8 @@ from tests.support.eval import (
 from tests.support.faults import PausePoint, SimulatedCrash, no_fault, raising_at
 from tests.support.fixtures import ConfigFactory
 from tests.support.llm import FakeLLM, create_llm_call_operation
-from tests.support.scoring import activate_test_policy, fence_jobs, set_job_facts
+from tests.support.m2 import insert_llm_call
+from tests.support.scoring import activate_test_policy, fence_jobs, fence_profile, set_job_facts
 from tests.support.settings import generation, procrastinate_job_exists_for
 
 pytestmark = pytest.mark.integration
@@ -159,6 +163,17 @@ async def test_a_golden_run_scores_every_case_outside_the_target_table(
     # the test-retest sample: every case whose first score is numeric, in case-id order (fewer than ten)
     assert sorted(second) == sorted(scored) and len(rows) == len(first) + len(second)
     assert run.metrics["repetitions"] == {"attempted": sorted(scored), "sample": sorted(scored)}
+    # fix round 1, item 12 (the shapes Task 20 reads): the outcomes by repetition, and each published
+    # case's final validation, its repairs and its grounding failures as paths and codes only
+    by_repetition = {str(n): dict(Counter(r.outcome for r in rows if r.repetition == n)) for n in (1, 2)}
+    assert run.metrics["cases"]["outcomes"] == by_repetition
+    for row in (r for r in rows if r.outcome in SCORED):
+        validation = row.output["validation"]
+        assert set(validation) == {"repairs", "grounding_failures"}
+        entries = [*validation["repairs"], *validation["grounding_failures"]]
+        assert all(
+            set(e) == {"path", "code"} and all(isinstance(v, str) for v in e.values()) for e in entries
+        )
 
     calls = await run_calls(engine, started.eval_run_id)
     assert calls and all(c.eval_run_id == started.eval_run_id and c.golden_case_id in scored for c in calls)
@@ -199,6 +214,138 @@ async def test_a_golden_run_scores_every_case_outside_the_target_table(
     logged = json.dumps(log_events())
     assert "Ignoriere alle bisherigen Anweisungen" not in logged and "Talentpool" not in logged
     assert "Synthetic rationale" not in logged and "Frontend-Entwicklerin" not in logged
+
+
+# ---- the cases a run skips: a fenced profile version, a case deleted meanwhile ---------------------------
+
+
+def on_arrival(
+    point: str, arrival: int, action: Callable[[], Awaitable[None]]
+) -> Callable[[str], Awaitable[None]]:
+    """An `afault_point` that runs `action` at the `arrival`-th arrival at `point`."""
+    seen = 0
+
+    async def fault(name: str) -> None:
+        nonlocal seen
+        if name == point:
+            seen += 1
+            if seen == arrival:
+                await action()
+
+    return fault
+
+
+@pytest.mark.parametrize("when", ["before-the-run", "after-its-load"])
+async def test_a_case_whose_profile_version_is_fenced_is_skipped_and_reported(
+    engine: AsyncEngine, fake_llm: FakeLLM, current_epoch: int, monkeypatch: pytest.MonkeyPatch, when: str
+) -> None:
+    """Ruling T19-b (§20.2 L6352, L6362): an unreleased `profile` purge fence on the case's profile version
+    skips the case as a fenced job does, whether it is there when the case is loaded or comes before its
+    write: no row, reported in `metrics.cases.fenced`, and the run goes on."""
+    keys, started = await seeded_run(engine, fake_llm, route="forced_critic")
+    fenced = min(keys)  # the first case: its load is the run's first, its write follows its second call
+    version = next(c.profile_version_id for c in await cases(engine) if c.id == fenced)
+
+    async def fence() -> None:
+        async with engine.begin() as conn:
+            await fence_profile(conn, version)
+
+    if when == "before-the-run":
+        await fence()
+    else:
+        monkeypatch.setattr(eval_runner, "afault_point", on_arrival(eval_runner.BEFORE_CASE, 1, fence))
+    await execute(engine, started.operation_id, eval_deps(engine, fake_llm), epoch=current_epoch)
+
+    run = await run_row(engine, started.eval_run_id)
+    assert (run.status, run.metrics["cases"]["fenced"]) == ("completed", [fenced])
+    rows = await case_rows(engine, started.eval_run_id)
+    assert {r.golden_case_id for r in rows if r.repetition == 1} == set(keys) - {fenced}
+    calls = {c.golden_case_id for c in await run_calls(engine, started.eval_run_id)}
+    assert (fenced in calls) == (when == "after-its-load")  # loaded, it was scored, but nothing is written
+
+
+# where the case is deleted: before its load (at the previous case's commit), after its load (before its first
+# call, whose reservation then names a case that is gone) or after its last call (before its write)
+DELETIONS: Final[dict[str, tuple[str, int, int]]] = {
+    "before-its-load": (eval_runner.AFTER_CASE_COMMIT, 1, 1),
+    "before-its-first-call": (eval_runner.BEFORE_CASE, 1, 0),
+    "before-its-write": (eval_runner.AFTER_CALL, 2, 0),
+}
+
+
+@pytest.mark.parametrize("when", list(DELETIONS))
+async def test_a_case_deleted_during_the_run_is_skipped_and_reported(
+    engine: AsyncEngine, fake_llm: FakeLLM, current_epoch: int, monkeypatch: pytest.MonkeyPatch, when: str
+) -> None:
+    """Fix round 1, item 5: a case deleted while the run scores it (`golden.delete_case`) is skipped and
+    reported in `metrics.cases.deleted`, never requeued as a bug; the run goes on and completes."""
+    point, arrival, index = DELETIONS[when]
+    keys, started = await seeded_run(engine, fake_llm, route="forced_critic")
+    deleted = sorted(keys)[index]
+
+    async def delete() -> None:
+        async with engine.begin() as conn:
+            assert await golden.delete_case(conn, deleted)
+
+    monkeypatch.setattr(eval_runner, "afault_point", on_arrival(point, arrival, delete))
+    await execute(engine, started.operation_id, eval_deps(engine, fake_llm), epoch=current_epoch)
+
+    run = await run_row(engine, started.eval_run_id)
+    assert (await operation_row(engine, started.operation_id)).status == "succeeded"
+    assert (run.status, run.metrics["cases"]["deleted"], run.metrics["cases"]["fenced"]) == (
+        "completed",
+        [deleted],
+        [],
+    )
+    rows = await case_rows(engine, started.eval_run_id)
+    assert {r.golden_case_id for r in rows if r.repetition == 1} == set(keys) - {deleted}
+    assert deleted not in {c.golden_case_id for c in await run_calls(engine, started.eval_run_id)}
+
+
+UNGROUNDED: Final = "Dieser Satz steht in keiner Anzeige und in keinem Profil"
+
+
+async def test_a_published_case_keeps_its_final_validations_repairs_and_grounding_failures(
+    engine: AsyncEngine, fake_llm: FakeLLM, current_epoch: int
+) -> None:
+    """Fix round 1, item 12: a published case's `output.validation` holds its final draft's repairs and its
+    grounding failures (the V3 quote issues), each as a path and a code, never a quote. Every draft of the
+    case repeats a criterion (the normaliser's `duplicate_criterion`) and cites an ungrounded ad quote, so the
+    route revises twice and publishes it contested with both."""
+    keys, started = await seeded_run(engine, fake_llm, route="forced_critic")
+    flawed = key_of(keys, "overqualified")
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.text(
+                    "SELECT g.job_revision_id, r.description_text, v.profile_json FROM golden_cases g "
+                    "JOIN job_revisions r ON r.id = g.job_revision_id "
+                    "JOIN profile_versions v ON v.id = g.profile_version_id WHERE g.id = :g"
+                ),
+                {"g": flawed},
+            )
+        ).one()
+    body = eval_generator_body(
+        "overqualified", row.description_text, ConfirmedProfile.model_validate(row.profile_json)
+    )
+    first, second = body["criteria"][0], body["criteria"][1]
+    first["ad_evidence"] = [*first["ad_evidence"], UNGROUNDED]
+    body["criteria"].append(dict(second))  # the same criterion twice
+    revision = int(row.job_revision_id)
+    fake_llm.answer("generate", revision, body, consume=True)
+    for round_ in (1, 2):
+        fake_llm.answer("revise", revision, body, round=round_, consume=True)
+    await execute(engine, started.operation_id, eval_deps(engine, fake_llm), epoch=current_epoch)
+
+    rows = [r for r in await case_rows(engine, started.eval_run_id) if r.golden_case_id == flawed]
+    (case,) = [r for r in rows if r.repetition == 1]  # its second repetition reads the standing answers
+    assert case.outcome == "contested"
+    validation = case.output["validation"]
+    assert {"path": f"criteria.{second['criterion']}", "code": "duplicate_criterion"} in validation["repairs"]
+    assert validation["grounding_failures"] == [
+        {"path": f"criteria.{first['criterion']}.ad_evidence[1]", "code": "quote_ungrounded"}
+    ]
+    assert UNGROUNDED not in json.dumps(case.output)  # a path and a code: never the quote
 
 
 async def test_the_production_route_runs_the_critic_on_its_triggers_only(
@@ -604,7 +751,7 @@ async def test_a_canary_run_scores_the_canaries_once(
     await fake_eval_answers(engine, fake_llm)
     async with engine.begin() as conn:
         for case in made[1:3]:
-            await golden.set_flags(conn, case.id, active=None, is_canary=True)
+            await golden.set_flags(conn, case.id, active=None, is_canary=True, now=utcnow())
     started = await start_eval(engine, kind="canary")
     await execute(engine, started.operation_id, eval_deps(engine, fake_llm), epoch=current_epoch)
     rows = await case_rows(engine, started.eval_run_id)
@@ -636,12 +783,18 @@ async def test_a_healthy_run_over_an_hour_is_not_abandoned(
         claim = await ops.claim_operation(conn, healthy.operation_id, epoch=current_epoch)
         assert claim is not None  # running, its heartbeat now: a live operation at started_at + 2 h
         probe = int((await conn.execute(_PROBE, {"at": started_at})).scalar_one())  # a CLI probe, no op
+        await insert_llm_call(conn, purpose="generate", eval_run_id=probe)  # reserved at $1, unsettled
         young = int((await conn.execute(_PROBE, {"at": utcnow() - timedelta(minutes=59)})).scalar_one())
     reconcile = spend_ledger.reconcile_llm_ledger_unsettled
     assert await reconcile(ctx(engine, queue_app, now=utcnow(), epoch=current_epoch)) == 1
     assert (await run_row(engine, healthy.eval_run_id)).status == "running"
     assert (await run_row(engine, queued.eval_run_id)).status == "running"
-    assert (await run_row(engine, probe)).status == "failed"  # abandoned after an hour
+    abandoned = await run_row(engine, probe)  # abandoned after an hour: the reason and the cost recorded
+    assert (abandoned.status, abandoned.metrics, abandoned.cost_usd) == (
+        "failed",
+        {"failed": "abandoned"},
+        Decimal("1.0000"),
+    )
     assert (await run_row(engine, young)).status == "running"
 
     async with engine.begin() as conn:  # the operation ends `failed`: its hook fails the run

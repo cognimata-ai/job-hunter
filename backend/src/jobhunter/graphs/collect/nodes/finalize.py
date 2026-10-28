@@ -66,6 +66,7 @@ from typing import Final, Literal, cast, get_args
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
+from jobhunter.embeddings import NOT_SYNTHETIC_REVISION_SQL
 from jobhunter.errors import InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.graphs.collect.deps import CollectDeps
@@ -173,10 +174,11 @@ _I5 = q(
     f"SELECT count(*) AS revisions, count(*) FILTER (WHERE {NEEDS_TARGET_SQL}) AS missing "  # noqa: S608
     f"FROM jobs j WHERE {RETAINED_JOB_SQL} AND {RUN_JOB_SQL} AND NOT is_fenced(j.id, :tuple)"
 )
+# The run's revisions: the user's jobs' only (a synthetic golden-case job's are never embedded, Ruling T19-a).
 _REVISIONS = q(
-    "SELECT count(*) AS created, count(*) FILTER (WHERE embedding_status = 'embedded') AS embedded, "
-    "count(*) FILTER (WHERE embedding_status = 'awaiting_embedding') AS awaiting FROM job_revisions "
-    "WHERE created_at >= (SELECT started_at FROM runs WHERE id = :run)"
+    "SELECT count(*) AS created, count(*) FILTER (WHERE r.embedding_status = 'embedded') AS embedded, "  # noqa: S608
+    "count(*) FILTER (WHERE r.embedding_status = 'awaiting_embedding') AS awaiting FROM job_revisions r "
+    f"WHERE r.created_at >= (SELECT started_at FROM runs WHERE id = :run) AND {NOT_SYNTHETIC_REVISION_SQL}"
 )
 _PARTIAL = q(
     "SELECT EXISTS (SELECT 1 FROM fetch_requests WHERE run_id = :run AND status = 'failed') AS failed, "

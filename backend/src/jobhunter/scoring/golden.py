@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.api.errors import Problem
 from jobhunter.db.seed import content_hash, ensure_hashed
 from jobhunter.db.sql import q
+from jobhunter.errors import DomainError
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.normalize.companies import company_key
 from jobhunter.normalize.language import detect_language
@@ -199,9 +200,7 @@ _SOURCE_OF: Final[dict[FeedbackKind, CaseSource]] = {"label": "week1", "wrong_sc
 # The canary flag's serialisation (`set_flags`): the two-key advisory form, a key space of its own.
 CANARY_LOCK_NAMESPACE: Final = 7261019
 
-_LOCK_CONFIG: Final = q(
-    "SELECT profile_version_id, scope_version_id FROM active_config WHERE id = 1 FOR SHARE"
-)
+_LOCK_CONFIG: Final = q("SELECT scope_version_id FROM active_config WHERE id = 1 FOR SHARE")
 _LOCK_JOB: Final = q("SELECT id FROM jobs WHERE id = :j FOR SHARE")
 # The job's current published result of the active tuple and its instance under the active scope (the view
 # joins both), with the ids of the result's tuple and the instance's inputs.
@@ -235,11 +234,10 @@ _UPSERT_CASE: Final = q(
 
 @dataclass(frozen=True)
 class Feedback:
-    """A recorded label or "wrong score": its `score_feedback` row and the golden case it upserted (`None`
-    without an active profile)."""
+    """A recorded label or "wrong score": its `score_feedback` row and the golden case it upserted."""
 
     feedback_id: int
-    golden_case_id: int | None
+    golden_case_id: int
 
 
 def _decimal(value: object) -> JSONValue:
@@ -281,10 +279,12 @@ async def record_feedback(
 
     Lock order: `active_config FOR SHARE`, then the job `FOR SHARE`. The job's current published result of the
     active tuple and its instance under the active scope (`current_scores`) are snapshotted into
-    `score_feedback` (`{L, M, U, coverage, confidence}`, the tuple's ids, the scope and the instance); with a
-    profile active, the golden case of (revision, profile) is upserted with the active scope, the instance's
+    `score_feedback` (`{L, M, U, coverage, confidence}`, the tuple's ids, the scope and the instance), and the
+    golden case of (revision, the tuple's profile) is upserted with the active scope, the instance's
     `det_inputs` as its frozen snapshot and their source ids, `source = 'week1'` for a label and `'feedback'`
-    for a "wrong score" (an update keeps the case's source). No published result is a 409 `conflict_state`;
+    for a "wrong score" (an update keeps the case's source). No published result is a 409 `conflict_state`
+    (so is every job with no profile active: `active_config` holds a profile exactly when it holds a tuple,
+    and `current_scores` reads the active tuple's targets);
     a comment longer than 2,000 characters or holding a NUL or a lone surrogate a 422, both before any
     write."""
     if (problem := _comment_problem(comment)) is not None:
@@ -328,25 +328,23 @@ async def record_feedback(
             )
         ).scalar_one()
     )
-    case_id: int | None = None
-    if pointers.profile_version_id is not None:
-        case_id = int(
-            (
-                await conn.execute(
-                    _UPSERT_CASE,
-                    {
-                        **common,
-                        "scope": int(pointers.scope_version_id),
-                        "label": label,
-                        "comment": comment,
-                        "source": _SOURCE_OF[kind],
-                        "result": int(row.llm_result_id),
-                        "snapshot": row.det_inputs,
-                        "sources": snapshot_sources(row.det_inputs),
-                    },
-                )
-            ).scalar_one()
-        )
+    case_id = int(
+        (
+            await conn.execute(
+                _UPSERT_CASE,
+                {
+                    **common,
+                    "scope": int(pointers.scope_version_id),
+                    "label": label,
+                    "comment": comment,
+                    "source": _SOURCE_OF[kind],
+                    "result": int(row.llm_result_id),
+                    "snapshot": row.det_inputs,
+                    "sources": snapshot_sources(row.det_inputs),
+                },
+            )
+        ).scalar_one()
+    )
     log.info(
         "golden_feedback_recorded",
         job_id=job_id,
@@ -393,7 +391,7 @@ _CANARY_LOCK: Final = q("SELECT pg_advisory_xact_lock(CAST(:namespace AS integer
 _OTHER_CANARIES: Final = q("SELECT count(*) FROM golden_cases WHERE is_canary AND id <> :i")
 _SET_FLAGS: Final = q(
     "UPDATE golden_cases SET active = coalesce(CAST(:active AS boolean), active), "
-    "is_canary = coalesce(CAST(:canary AS boolean), is_canary), updated_at = now() WHERE id = :i RETURNING id"
+    "is_canary = coalesce(CAST(:canary AS boolean), is_canary), updated_at = :now WHERE id = :i RETURNING id"
 )
 
 
@@ -431,10 +429,10 @@ async def delete_case(conn: AsyncConnection, case_id: int) -> bool:
 
 
 async def set_flags(
-    conn: AsyncConnection, case_id: int, *, active: bool | None, is_canary: bool | None
+    conn: AsyncConnection, case_id: int, *, active: bool | None, is_canary: bool | None, now: datetime
 ) -> CaseRow:
-    """Set the case's `active` and `is_canary` flags (`None` keeps one) in the caller's transaction; the
-    case.
+    """Set the case's `active` and `is_canary` flags (`None` keeps one) in the caller's transaction, its
+    `updated_at` to `now` (the caller's clock); the case.
 
     At most `MAX_CANARIES` cases are canaries (L4632): making a third one a canary is a 422
     `validation_failed`; the check and the write are serialised by an advisory transaction lock, so two
@@ -449,7 +447,8 @@ async def set_flags(
                 "Too many canaries",
                 detail=f"At most {MAX_CANARIES} golden cases can be canaries.",
             )
-    updated = await conn.execute(_SET_FLAGS, {"i": case_id, "active": active, "canary": is_canary})
+    params = {"i": case_id, "active": active, "canary": is_canary, "now": now}
+    updated = await conn.execute(_SET_FLAGS, params)
     if updated.first() is None:
         raise Problem(404, "not_found", "Golden case not found")
     log.info("golden_case_flags_set", golden_case_id=case_id, active=active, is_canary=is_canary)
@@ -473,6 +472,19 @@ def tuple_identity(
 # ---- the adversarial seed (L4610) --------------------------------------------------------------------------
 
 
+class FixtureChanged(DomainError):
+    """A shipped fixture no longer matches what an earlier seed stored for its key (`what`). Shipped fixtures
+    are immutable: a changed case is a new fixture with a new key."""
+
+    def __init__(self, key: str, what: str) -> None:
+        super().__init__(
+            f"adversarial fixture {key!r} changed since it was seeded ({what}): shipped fixtures are "
+            "immutable, a changed case takes a new key"
+        )
+        self.key = key
+        self.what = what
+
+
 @dataclass(frozen=True)
 class Seeded:
     """What a seed inserted: cases, jobs and profile versions (an existing one is reused, never counted)."""
@@ -482,12 +494,23 @@ class Seeded:
     profiles: int
 
 
+# Ruling T19-c: a synthetic version's `version_no` is `SYNTHETIC_VERSION_BASE + n`, apart from the user's
+# (`profile.activation` counts the user's only).
+SYNTHETIC_VERSION_BASE: Final = 1_000_000
+
 _LOCK_ACTIVE: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
 _SEEDED_JOB: Final = q(
-    "SELECT id, current_revision_id FROM jobs WHERE company_key = :k AND synthetic_eval FOR SHARE"
+    "SELECT j.id, j.current_revision_id, r.material_hash FROM jobs j "
+    "JOIN job_revisions r ON r.id = j.current_revision_id WHERE j.company_key = :k AND j.synthetic_eval "
+    "FOR SHARE OF j"
+)
+_SEEDED_CASES: Final = q(
+    "SELECT profile_version_id, scope_version_id, label, expected_knockouts, det_inputs_snapshot "
+    "FROM golden_cases WHERE job_revision_id = :r AND source = 'adversarial' ORDER BY id"
 )
 _LIVE_PROFILE: Final = q(
-    "SELECT id FROM profile_versions WHERE profile_hash = :h AND purged_at IS NULL FOR KEY SHARE"
+    "SELECT id FROM profile_versions WHERE profile_hash = :h AND purged_at IS NULL AND synthetic_eval "
+    "FOR KEY SHARE"
 )
 _INSERT_CV: Final = q(
     "INSERT INTO cv_files (sha256, mime, size_bytes, stripped_text, strip_report, extraction_method, "
@@ -504,8 +527,8 @@ _INSERT_DRAFT: Final = q(
 _INSERT_VERSION: Final = q(
     "INSERT INTO profile_versions (id, version_no, draft_id, cv_file_id, profile_json, profile_hash, "
     "confirmed_at, synthetic_eval) OVERRIDING SYSTEM VALUE "
-    "SELECT :id, coalesce(max(version_no), 0) + 1, :draft, :cv, "
-    ":profile, :hash, :now, true FROM profile_versions",
+    "SELECT :id, coalesce(max(version_no), CAST(:base AS integer)) + 1, :draft, :cv, "
+    ":profile, :hash, :now, true FROM profile_versions WHERE synthetic_eval",
     jsonb=["profile"],
 )
 _INSERT_JOB: Final = q(
@@ -544,13 +567,20 @@ def profile_text(profile: ConfirmedProfile) -> str:
     return "\n".join(lines)
 
 
+def synthetic_profile_hash(profile_json: JSONValue) -> bytes:
+    """A synthetic version's `profile_hash`: the content hash of `{"synthetic_eval": profile}`, apart from
+    `content_hash(profile)` that a version of the user's with the same content holds, so the two never meet
+    in the partial unique index `profile_versions_live_hash` and neither is ever reused as the other."""
+    return content_hash({"synthetic_eval": profile_json})
+
+
 async def _seed_profile(
     conn: AsyncConnection, profile: ConfirmedProfile, *, now: datetime
 ) -> tuple[int, bool]:
-    """The fixture profile's live version, inserted as a synthetic chain when absent (module docstring of
-    `seed_adversarial`); `(id, inserted)`."""
+    """The fixture profile's live synthetic version, inserted as a synthetic chain when absent (module
+    docstring of `seed_adversarial`); `(id, inserted)`."""
     profile_json = profile.model_dump(mode="json")
-    digest = content_hash(profile_json)
+    digest = synthetic_profile_hash(profile_json)
     found = (await conn.execute(_LIVE_PROFILE, {"h": digest})).scalar_one_or_none()
     if found is not None:
         return int(found), False
@@ -585,18 +615,29 @@ async def _seed_profile(
     )
     await conn.execute(
         _INSERT_VERSION,
-        {"id": version, "draft": draft, "cv": cv, "profile": profile_json, "hash": digest, "now": now},
+        {
+            "id": version,
+            "base": SYNTHETIC_VERSION_BASE,
+            "draft": draft,
+            "cv": cv,
+            "profile": profile_json,
+            "hash": digest,
+            "now": now,
+        },
     )
     return version, True
 
 
 async def _seed_job(conn: AsyncConnection, fixture: Fixture, *, now: datetime) -> tuple[int, bool]:
-    """The fixture's synthetic job's current revision, inserted with the job when absent; `(id, inserted)`."""
+    """The fixture's synthetic job's current revision, inserted with the job when absent; `(id, inserted)`.
+    A job seeded before from a fixture whose material differs is `FixtureChanged`."""
     det = fixture.det()
+    material = fixture.material()
     found = (await conn.execute(_SEEDED_JOB, {"k": det.company_key})).first()
     if found is not None:
+        if bytes(found.material_hash) != content_hash(material):
+            raise FixtureChanged(fixture.key, "ad")
         return int(found.current_revision_id), False
-    material = fixture.material()
     job = int(
         (
             await conn.execute(
@@ -644,39 +685,69 @@ async def _seed_job(conn: AsyncConnection, fixture: Fixture, *, now: datetime) -
     return revision, True
 
 
+async def _check_seeded(
+    conn: AsyncConnection, fixture: Fixture, revision_id: int, expected: dict[str, Any]
+) -> None:
+    """`FixtureChanged` unless every adversarial case an earlier seed stored on the fixture's revision is the
+    one the fixture makes now: its profile version, scope, label, knockouts and snapshot."""
+    for row in await conn.execute(_SEEDED_CASES, {"r": revision_id}):
+        stored = {
+            "profile": int(row.profile_version_id),
+            "scope": int(row.scope_version_id),
+            "label": row.label,
+            "knockouts": sorted(row.expected_knockouts),
+            "snapshot": content_hash(row.det_inputs_snapshot),
+        }
+        now = {
+            **{k: expected[k] for k in ("profile", "scope", "label")},
+            "knockouts": sorted(expected["knockouts"]),
+            "snapshot": content_hash(expected["snapshot"]),
+        }
+        changed = next((name for name in stored if stored[name] != now[name]), None)
+        if changed is not None:
+            raise FixtureChanged(fixture.key, changed)
+
+
 async def seed_adversarial(conn: AsyncConnection, *, fixtures_dir: Path, now: datetime) -> Seeded:
     """Seed the adversarial cases of `fixtures_dir` (each `*.json` a `Fixture`) in the caller's transaction,
     idempotent by each fixture's `key` (L4610; Codex r1 #32).
 
-    `active_config FOR UPDATE` first: it serialises `profile_versions.version_no = max + 1` with a profile
-    confirm. For each fixture, in file name order: a synthetic CV (`cv_files`: the profile's text, contact
-    stripped, as `stripped_text` with its `strip_report`), a `confirmed` `profile_drafts` row and a
-    `profile_versions` row with `synthetic_eval = true` and the fixture's profile (a live version with the
-    same content hash is reused); the fixture's scope (`ensure_hashed`); a `jobs` row with `synthetic_eval =
-    true` (`availability = 'active'`, `company_key = 'eval-<key>'`, the fixture's structured fields and
-    det-facts, no source, no posting) and its one `job_revisions` row (the fixture's description, `awaiting_
-    embedding`) as its current revision, found again by its company key; and the golden case (`source =
-    'adversarial'`, the fixture's label and expected knockouts, its frozen snapshot, `active`), inserted
-    unless the (revision, profile) case exists. A synthetic job gets no target, no embedding and no row in
-    the current-score views (their `NOT synthetic_eval`). The counts are what was inserted."""
+    `active_config FOR UPDATE` first: it serialises the synthetic `version_no = max + 1` with another seed
+    (and the user's with a profile confirm). For each fixture, in file name order: a synthetic CV
+    (`cv_files`: the profile's text, contact stripped, as `stripped_text` with its `strip_report`), a
+    `confirmed` `profile_drafts` row and a `profile_versions` row with `synthetic_eval = true`, the fixture's
+    profile and its `synthetic_profile_hash`, numbered in the synthetic range (`SYNTHETIC_VERSION_BASE + n`,
+    Ruling T19-c; a live synthetic version with the same hash is reused, a version of the user's never is);
+    the fixture's scope (`ensure_hashed`); a `jobs` row with `synthetic_eval = true` (`availability =
+    'active'`, `company_key = 'eval-<key>'`, the fixture's structured fields and det-facts, no source, no
+    posting) and its one `job_revisions` row (the fixture's description, `awaiting_embedding`) as its current
+    revision, found again by its company key; and the golden case (`source = 'adversarial'`, the fixture's
+    label and expected knockouts, its frozen snapshot, `active`), inserted unless the (revision, profile) case
+    exists. A synthetic job gets no target, no embedding and no row in the current-score views (their `NOT
+    synthetic_eval`). The counts are what was inserted.
+
+    **Shipped fixtures are immutable**: a changed case is a new fixture with a new key. A fixture found again
+    by its key whose ad material differs from its stored revision's, or whose case on that revision differs
+    from the stored one (its profile version, scope, label, knockouts or snapshot), is `FixtureChanged`
+    naming the fixture and what changed; the caller's transaction then rolls back with whatever the seed
+    wrote."""
     await conn.execute(_LOCK_ACTIVE)
     cases = jobs = profiles = 0
     for fixture in load_fixtures(fixtures_dir):
         profile_version_id, new_profile = await _seed_profile(conn, fixture.profile, now=now)
         scope_version_id = await ensure_hashed(conn, "scope_versions", fixture.scope_payload())
         revision_id, new_job = await _seed_job(conn, fixture, now=now)
-        inserted = await conn.execute(
-            _INSERT_CASE,
-            {
-                "revision": revision_id,
-                "profile": profile_version_id,
-                "scope": scope_version_id,
-                "label": fixture.label,
-                "knockouts": list(fixture.expected_knockouts),
-                "snapshot": fixture.snapshot(),
-                "now": now,
-            },
-        )
+        case: dict[str, Any] = {
+            "revision": revision_id,
+            "profile": profile_version_id,
+            "scope": scope_version_id,
+            "label": fixture.label,
+            "knockouts": list(fixture.expected_knockouts),
+            "snapshot": fixture.snapshot(),
+        }
+        if not new_job:
+            await _check_seeded(conn, fixture, revision_id, case)
+        inserted = await conn.execute(_INSERT_CASE, {**case, "now": now})
         cases += inserted.first() is not None
         jobs += new_job
         profiles += new_profile

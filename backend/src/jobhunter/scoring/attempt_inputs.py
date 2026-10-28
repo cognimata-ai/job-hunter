@@ -11,24 +11,17 @@ critic efforts. The ids every prompt records are the revision's, the profile ver
 version's. No draft, ad or profile text reaches a log line.
 """
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Final, get_args
+from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.llm.pricing import Effort
 from jobhunter.llm.prompts.render import load_prompt_version
-from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.scoring import evaluation_policy
 from jobhunter.scoring.filters import read_det_facts
-from jobhunter.scoring.steps import ScoreInputs, material_strings, revision_ad, rubric_of, score_refs
+from jobhunter.scoring.steps import ScoreInputs, critic_efforts, material_inputs, rubric_of, score_refs
 from jobhunter.scoring.triggers import sample_key
-from jobhunter.types import JSONValue, get_str
-
-_EFFORTS: Final[Mapping[str, Effort]] = {effort: effort for effort in get_args(Effort)}
-_STRUCTURED: Final = "structured"
 
 
 @dataclass(frozen=True)
@@ -59,13 +52,6 @@ _INPUTS: Final = q(
 )
 
 
-def _effort(value: str) -> Effort:
-    effort = _EFFORTS.get(value)
-    if effort is None:
-        raise ValueError("a model policy names an unknown effort")
-    return effort
-
-
 async def load_attempt_inputs(
     conn: AsyncConnection, *, target_id: int, attempt_id: int, prompt_schema_version_id: int
 ) -> tuple[ScoreInputs, AttemptRow]:
@@ -86,23 +72,13 @@ async def load_attempt_inputs(
         execution_config_id=int(row.execution_config_id),
         evaluation_policy_id=int(row.evaluation_policy_id),
     )
-    material: JSONValue = row.llm_input
-    work_modes = material_strings(material, "work_mode_possible")
-    work_mode_source = get_str(material, "work_mode_source")
-    ad = revision_ad(
-        material, completeness=row.description_completeness, description_text=row.description_text
-    )
-    inputs = ScoreInputs(
+    inputs = material_inputs(
+        row,
         version=await load_prompt_version(conn, prompt_schema_version_id),
         rubric=rubric_of(row.weights, row.anchors),
-        profile=ConfirmedProfile.model_validate(row.profile_json),
-        ad=ad,
-        det=await read_det_facts(conn, attempt.job_id),
-        structured_work_modes=tuple(work_modes) if work_mode_source == _STRUCTURED else (),
-        completeness=row.description_completeness,
         policy=await evaluation_policy.load(conn, attempt.evaluation_policy_id),
-        critic_effort=_effort(get_str(row.model_policy, "nodes.critic.effort")),
-        critic_light_effort=_effort(get_str(row.model_policy, "critic_light_effort")),
+        efforts=critic_efforts(row.model_policy),
+        det=await read_det_facts(conn, attempt.job_id),
         sample_key=sample_key(target_id=target_id, llm_tuple_id=attempt.llm_tuple_id),
         refs=score_refs(
             job_revision_id=attempt.job_revision_id,

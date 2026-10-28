@@ -2,10 +2,10 @@
 plan Task 19, R2, Deviation 21, Codex r1 #32): `scoring.golden`.
 
 - `record_feedback` writes `score_feedback` with the score snapshot of the job's current published result
-  of the active tuple (through `current_scores`) and, with a profile active, upserts the golden case of
-  (revision, profile) with the active scope, the instance's `det_inputs` and their source ids: a `label` is
-  a `week1` case, a `wrong_score` a `feedback` one; a second label updates the case; a job without a
-  published result is 409 `conflict_state`.
+  of the active tuple (through `current_scores`) and upserts the golden case of (revision, profile) with the
+  active scope, the instance's `det_inputs` and their source ids: a `label` is a `week1` case, a
+  `wrong_score` a `feedback` one; a second label updates the case; a job without a published result (every
+  job, with no profile active) is 409 `conflict_state`.
 - `list_cases` pages by id (keyset), `delete_case` takes the case's eval rows and calls with it,
   `set_flags` refuses a third canary (422).
 - `seed_adversarial` inserts the ten fixtures' marked jobs, profiles, scopes and cases once; a synthetic job
@@ -16,6 +16,8 @@ Every datum is invented.
 """
 
 import hashlib
+import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Final
 
@@ -23,14 +25,17 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.api.errors import Problem
 from jobhunter.clock import utcnow
+from jobhunter.db.seed import content_hash
 from jobhunter.embeddings import _COUNT_AWAITING, _NEXT_BATCH, _NO_TIME_BOUND, _START
-from jobhunter.scoring import golden
+from jobhunter.run_settings import scope_from_payload
+from jobhunter.scoring import filters, golden
 from jobhunter.scoring.eval_fixtures import adversarial_dir
+from jobhunter.settings import scope_apply
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.eval import cases, scored_job, seed_adversarial
 from tests.support.llm import FakeLLM
-from tests.support.m2 import insert_eval_run, insert_llm_call
+from tests.support.m2 import insert_eval_run, insert_llm_call, insert_profile_chain
 from tests.support.m3 import NOW, insert_job, insert_row
 from tests.support.reconcile import run_reconciler
 from tests.support.scoring import activate_score_tuple
@@ -42,6 +47,7 @@ _CASE: Final = sa.text("SELECT * FROM golden_cases WHERE id = :i")
 _INSTANCE: Final = sa.text("SELECT * FROM det_results WHERE id = :i")
 _RESULT: Final = sa.text("SELECT * FROM llm_results WHERE id = :i")
 _ACTIVE: Final = sa.text("SELECT profile_version_id, scope_version_id FROM active_config WHERE id = 1")
+HOUR: Final = timedelta(hours=1)
 
 
 async def one(engine: AsyncEngine, statement: sa.TextClause, row_id: int) -> Any:
@@ -59,7 +65,6 @@ async def test_a_label_writes_the_score_snapshot_and_upserts_the_case(engine: As
     async with engine.begin() as conn:
         scored = await scored_job(conn)
     made = await feedback(engine, scored.job.job_id)
-    assert made.golden_case_id is not None
     row = await one(engine, _FEEDBACK, made.feedback_id)
     instance = await one(engine, _INSTANCE, scored.det_result_id)
     result = await one(engine, _RESULT, scored.result_id)
@@ -109,7 +114,6 @@ async def test_a_second_label_updates_the_case(engine: AsyncEngine) -> None:
     first = await feedback(engine, scored.job.job_id)
     second = await feedback(engine, scored.job.job_id, label="poor", comment=None)
     assert second.golden_case_id == first.golden_case_id and second.feedback_id != first.feedback_id
-    assert first.golden_case_id is not None
     case = await one(engine, _CASE, first.golden_case_id)
     assert (case.label, case.comment, case.source) == ("poor", None, "week1")
     assert len(await cases(engine)) == 1  # one case per (revision, profile)
@@ -119,9 +123,26 @@ async def test_wrong_score_feedback_makes_a_feedback_case(engine: AsyncEngine) -
     async with engine.begin() as conn:
         scored = await scored_job(conn)
     made = await feedback(engine, scored.job.job_id, kind="wrong_score", label="poor")
-    assert made.golden_case_id is not None
     assert (await one(engine, _FEEDBACK, made.feedback_id)).kind == "wrong_score"
     assert (await one(engine, _CASE, made.golden_case_id)).source == "feedback"
+
+
+async def test_with_no_profile_active_there_is_no_score_to_label(engine: AsyncEngine) -> None:
+    """Fix round 1, item 8: "no profile active" has no branch of its own. `active_config` holds a profile
+    exactly when it holds a tuple (its CHECK), and `current_scores` joins the active tuple's target, so with
+    no profile active no job has a current score: the feedback is the 409 of a job without one, and nothing
+    is written. A recorded feedback always upserts its case (`Feedback.golden_case_id` is an id)."""
+    async with engine.begin() as conn:
+        scored = await scored_job(conn)
+        await conn.execute(
+            sa.text("UPDATE active_config SET profile_version_id = NULL, llm_tuple_id = NULL WHERE id = 1")
+        )
+    with pytest.raises(Problem) as refused:
+        await feedback(engine, scored.job.job_id)
+    assert (refused.value.status, refused.value.code) == (409, "conflict_state")
+    async with engine.connect() as conn:
+        assert (await conn.execute(sa.text("SELECT count(*) FROM score_feedback"))).scalar_one() == 0
+    assert await cases(engine) == []
 
 
 async def test_feedback_without_a_published_result_is_conflict_state(engine: AsyncEngine) -> None:
@@ -149,7 +170,7 @@ async def test_list_cases_pages_by_id(engine: AsyncEngine) -> None:
     await seed_adversarial(engine)
     seeded = await cases(engine)
     async with engine.begin() as conn:
-        await golden.set_flags(conn, seeded[3].id, active=False, is_canary=None)
+        await golden.set_flags(conn, seeded[3].id, active=False, is_canary=None, now=NOW)
     async with engine.connect() as conn:
         first = await golden.list_cases(conn, after_id=None, limit=4, active=None)
         rest = await golden.list_cases(conn, after_id=first[-1].id, limit=20, active=None)
@@ -207,21 +228,24 @@ async def test_set_flags_allows_two_canaries_and_refuses_a_third(engine: AsyncEn
     await seed_adversarial(engine)
     first, second, third = (await cases(engine))[:3]
     async with engine.begin() as conn:
-        assert (await golden.set_flags(conn, first.id, active=None, is_canary=True)).is_canary
-        made = await golden.set_flags(conn, second.id, active=None, is_canary=True)
+        assert (await golden.set_flags(conn, first.id, active=None, is_canary=True, now=NOW)).is_canary
+        made = await golden.set_flags(conn, second.id, active=None, is_canary=True, now=NOW + HOUR)
     assert (made.id, made.is_canary, made.active) == (second.id, True, True)
+    assert (await one(engine, _CASE, second.id)).updated_at == NOW + HOUR  # the caller's clock (item 7)
     with pytest.raises(Problem) as refused:
         async with engine.begin() as conn:
-            await golden.set_flags(conn, third.id, active=None, is_canary=True)
+            await golden.set_flags(conn, third.id, active=None, is_canary=True, now=NOW)
     assert (refused.value.status, refused.value.code) == (422, "validation_failed")
     async with engine.begin() as conn:
-        again = await golden.set_flags(conn, first.id, active=False, is_canary=True)  # already one: allowed
+        again = await golden.set_flags(
+            conn, first.id, active=False, is_canary=True, now=NOW
+        )  # already one: allowed
         assert (again.is_canary, again.active) == (True, False)
-        await golden.set_flags(conn, first.id, active=None, is_canary=False)
-        assert (await golden.set_flags(conn, third.id, active=None, is_canary=True)).is_canary
+        await golden.set_flags(conn, first.id, active=None, is_canary=False, now=NOW)
+        assert (await golden.set_flags(conn, third.id, active=None, is_canary=True, now=NOW)).is_canary
     with pytest.raises(Problem) as missing:
         async with engine.begin() as conn:
-            await golden.set_flags(conn, 10**12, active=True, is_canary=None)
+            await golden.set_flags(conn, 10**12, active=True, is_canary=None, now=NOW)
     assert missing.value.status == 404
 
 
@@ -282,6 +306,71 @@ async def test_the_seed_inserts_ten_marked_cases_once(engine: AsyncEngine) -> No
     assert [c.id for c in await cases(engine)] == [c.id for c in seeded]
 
 
+_VERSIONS: Final = sa.text("SELECT id, version_no, synthetic_eval FROM profile_versions ORDER BY version_no")
+
+
+async def test_the_seed_numbers_its_versions_apart_and_never_reuses_a_users_version(
+    engine: AsyncEngine,
+) -> None:
+    """Ruling T19-c: the seed's synthetic versions take `version_no` from their own range (1,000,001 on),
+    whatever the user's are; and a live version of the user's holding a fixture's very profile is never the
+    fixture's: the seed makes its own (a synthetic version's `profile_hash` is domain-separated, so the two
+    never meet in the partial unique index `profile_versions_live_hash`)."""
+    profile = golden.load_fixture(golden_fixture("underqualified")).profile.model_dump(mode="json")
+    async with engine.begin() as conn:
+        users = await insert_profile_chain(conn, 1, profile=profile)
+        await conn.execute(
+            sa.text("UPDATE profile_versions SET profile_hash = :h WHERE id = :v"),
+            {"h": content_hash(profile), "v": users.profile_version_id},
+        )
+    assert await seed_adversarial(engine) == golden.Seeded(cases=10, jobs=10, profiles=10)
+    async with engine.connect() as conn:
+        versions = (await conn.execute(_VERSIONS)).all()
+    assert [(v.version_no, v.synthetic_eval) for v in versions] == [(1, False)] + [
+        (1_000_000 + n, True) for n in range(1, 11)
+    ]
+    assert users.profile_version_id not in {c.profile_version_id for c in await cases(engine)}
+    assert golden.SYNTHETIC_VERSION_BASE == 1_000_000
+    # a second seed finds its own versions again (by their synthetic hash) and inserts nothing
+    assert await seed_adversarial(engine) == golden.Seeded(cases=0, jobs=0, profiles=0)
+
+
+def edit_description(fixture: dict[str, Any]) -> None:
+    fixture["ad"]["description"] += " Neu: ein zusätzlicher Satz."
+
+
+def edit_label(fixture: dict[str, Any]) -> None:
+    fixture["label"] = "good" if fixture["label"] != "good" else "poor"
+
+
+def edit_profile(fixture: dict[str, Any]) -> None:
+    fixture["profile"]["summary"] += " Neu."
+
+
+@pytest.mark.parametrize("edit", [edit_description, edit_label, edit_profile], ids=lambda e: e.__name__)
+async def test_a_fixture_edited_after_its_seed_fails_the_seed_loudly(
+    engine: AsyncEngine, tmp_path: Path, edit: Any
+) -> None:
+    """Fix round 1, item 10: shipped fixtures are immutable. A re-seed finds a fixture's job by its key; when
+    the fixture no longer matches what the first seed stored (its revision's material, its case's label,
+    knockouts, scope or snapshot, its profile), the seed raises `FixtureChanged` naming the fixture and
+    writes nothing."""
+    for path in adversarial_dir().glob("*.json"):
+        (tmp_path / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    await seed_adversarial(engine, fixtures_dir=tmp_path)
+    before = [c.id for c in await cases(engine)]
+    target = tmp_path / "overqualified.json"
+    fixture = json.loads(target.read_text(encoding="utf-8"))
+    edit(fixture)
+    target.write_text(json.dumps(fixture, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(golden.FixtureChanged) as changed:
+        await seed_adversarial(engine, fixtures_dir=tmp_path)
+    assert changed.value.key == "overqualified" and "overqualified" in str(changed.value)
+    assert [c.id for c in await cases(engine)] == before
+    async with engine.connect() as conn:
+        assert len((await conn.execute(_VERSIONS)).all()) == 10  # the edited profile made no version
+
+
 async def test_a_deleted_adversarial_case_is_seeded_again(engine: AsyncEngine) -> None:
     await seed_adversarial(engine)
     first = (await cases(engine))[0]
@@ -315,6 +404,26 @@ async def test_a_synthetic_job_gets_no_target_embedding_or_score_row(
             shown = (await conn.execute(sa.text(f"SELECT job_id FROM {view}"))).scalars()  # noqa: S608
             assert list(shown) == [regular.job_id], view
     assert fake_llm.served == 0
+
+
+async def allow(conn: Any) -> None:
+    """A guard that always lets the work through."""
+
+
+async def test_a_synthetic_job_is_no_job_of_the_hard_filters_or_the_scope_apply(engine: AsyncEngine) -> None:
+    """Ruling T19-a: the eval evaluates a case's filters itself on its frozen facts (`filters.evaluate` on
+    `golden.case_det_facts`) and never reads `hard_filter_results`, so a synthetic job is none of the stale
+    recompute's jobs and none of the scope apply's retained or incomplete ones."""
+    await seed_adversarial(engine)
+    async with engine.begin() as conn:
+        regular = await insert_job(conn)
+    scope_version_id = (await one(engine, _CASE, (await cases(engine))[0].id)).scope_version_id
+    payload = await one(engine, sa.text("SELECT payload FROM scope_versions WHERE id = :i"), scope_version_id)
+    async with engine.begin() as conn:
+        assert await scope_apply.incomplete_jobs(conn, scope_version_id) == 1
+        assert (await conn.execute(scope_apply._RETAINED)).scalar_one() == 1
+        scopes = {scope_version_id: scope_from_payload(payload.payload)}
+        assert await filters.recompute_stale_ids(conn, scopes, guard=allow) == [regular.job_id]
 
 
 _KEYS: Final = (

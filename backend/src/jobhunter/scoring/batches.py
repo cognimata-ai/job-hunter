@@ -688,11 +688,7 @@ async def _rendered(
             version=version,
             rubric=rubric,
             profile=profile,
-            ad=steps.revision_ad(
-                row.llm_input,
-                completeness=row.description_completeness,
-                description_text=row.description_text,
-            ),
+            ad=steps.material_ad(row),
             refs=steps.score_refs(
                 job_revision_id=int(row.job_revision_id),
                 profile_version_id=int(tuple_row.profile_version_id),

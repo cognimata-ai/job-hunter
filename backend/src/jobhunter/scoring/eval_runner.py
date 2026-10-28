@@ -18,8 +18,9 @@ claim=op.claim), purpose_class="nonscoring", eval_run_id, golden_case_id, round,
 with `input_refs["repetition"]` for the ledger's audit; every domain write (a case row, the run's end) runs
 under that owner's lock (the operation row under its claim, then the run row `FOR SHARE` while `running`), so
 a reclaimed execution can neither reserve nor write (`FencedOut`). The lock order of a case's write:
-`active_config FOR SHARE` → the case's job `FOR SHARE` → the operation row → the run row → its
-`eval_case_results` row (a call takes the month and the ledger rows between, `spend_ledger.reserve`).
+`active_config FOR SHARE` → the case's job `FOR SHARE` → the operation row → the run row → the case row
+`FOR KEY SHARE` → its `eval_case_results` row (a call takes the month and the ledger rows between,
+`spend_ledger.reserve`).
 
 **One execution, no resume** (round-4 ruling (a)). The first transaction, under the owner's operation row and
 the run row `FOR UPDATE`: a run already `completed` or `failed` is left as it is (a crash between a terminal
@@ -32,8 +33,11 @@ call to its completion: the steps of a case run over a `MemoryDraftStore` (Task 
 handler's memory: nothing is written between calls), and the case's only durable write is its terminal row.
 
 **A case** (in case-id order: every active case of a golden run, every active canary of a canary run):
-1. under `active_config FOR SHARE` and its job `FOR SHARE`, a fenced job (`is_fenced`) is skipped and
-   reported (`metrics.cases.fenced`), with no row (L6362); the fault point `eval.before_case`;
+1. under `active_config FOR SHARE` and its job `FOR SHARE`, a fenced case (its job's fence, `is_fenced`, or
+   an unreleased `profile` fence of its profile version, Ruling T19-b) is skipped and reported
+   (`metrics.cases.fenced`), with no row (L6362); so is a case deleted meanwhile (`metrics.cases.deleted`:
+   here, before its write, or a call naming it failing because it is gone), never requeued; the fault point
+   `eval.before_case`;
 2. its hard filters under its scope on its frozen facts (`golden.case_det_facts`): a filtered case is
    `filtered_out` (`output = {"filters": [...]}`, no call);
 3. otherwise the production route of Task 9 (`steps` and `routing`) with the candidate's rubric and
@@ -45,9 +49,11 @@ handler's memory: nothing is written between calls), and the case's only durable
    target, result, instance or ranking row); a gateway error is `refused` (a refusal) or `failed`, a
    publication bug `failed`, and the run goes on;
 5. its row `eval_case_results(outcome, critic_ran, llm_call_ids, output, score_mid)` in one transaction after
-   its last call (the job's fence checked again), then the fault point `eval.after_case_commit`. `output`
-   holds the publication object, its aggregation and badge (`not_a_job_ad:ad` kept unconfirmed, carry
-   T10-e), its evidence places, and the route's events (each validation's triggers, each critic round's
+   its last call (the fences checked again, the case row `FOR KEY SHARE` after the owner's), then the fault
+   point `eval.after_case_commit`. A published case's `output` holds the publication object, its
+   aggregation and badge (`not_a_job_ad:ad` kept unconfirmed, carry T10-e), its evidence places, its final
+   validation's repairs and grounding failures (`validation: {"repairs", "grounding_failures"}`, each a path
+   and a code, never a quote), and the route's events (each validation's triggers, each critic round's
    effort and derived outcome).
 
 **Repetitions** (§11.13 L4613, Codex r2 B22): a golden run scores every case once, then attempts a second
@@ -56,9 +62,11 @@ two numeric results, `MAX_RETEST_TRIES` were attempted or the cases are exhauste
 of results is the progress. A canary run scores once.
 
 **The end**: `running → completed` with `metrics = {"transport", "transport_requested", "cases",
-"repetitions"}`, `passed = NULL` (Ruling P17: the calibration and the gate are Task 20's) and the `cost_usd`
-its calls count, and the operation `succeeded` through `op.finish_in` in the same transaction (the fault
-points `eval.before_terminal_commit`, its last statement, and `eval.after_terminal_commit`).
+"repetitions"}` (`cases = {"active", "fenced", "deleted", "outcomes"}`, the outcomes counted by repetition:
+`{"1": {outcome: n}, "2": …}`), `passed = NULL` (Ruling P17: the calibration and the gate are Task 20's)
+and the `cost_usd` its calls count, and the operation `succeeded` through `op.finish_in` in the same
+transaction (the fault points `eval.before_terminal_commit`, its last statement, and
+`eval.after_terminal_commit`).
 
 Nothing here logs content: ids, counts, codes, outcomes and amounts only.
 """
@@ -68,20 +76,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Final, Literal, get_args
+from typing import Final, Literal
 
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
+from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.llm.errors import LLMError, Refused
 from jobhunter.llm.gateway import CallContext, GatewayResult, LLMGateway, RenderedPrompt, pinned_node_config
 from jobhunter.llm.pricing import Effort
 from jobhunter.llm.prompts.render import PromptVersion, ScoreRole, load_prompt_version, score_schema
 from jobhunter.llm.prompts.render import PromptVersionUnscorable as PromptVersionUnscorableError
-from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import EvalRunOwner
 from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import ScopeSettings, scope_from_payload
@@ -95,17 +103,17 @@ from jobhunter.scoring.steps import (
     StoredDraft,
     StoredNote,
     ValidationRecord,
-    material_strings,
-    revision_ad,
+    critic_efforts,
+    material_inputs,
     rubric_of,
     score_refs,
 )
 from jobhunter.scoring.triggers import TRIGGERS, Trigger, golden_sample_key
-from jobhunter.scoring.validator import ParsedGenerator
+from jobhunter.scoring.validator import QUOTE_FAILURE_CODES, DraftValidation, ParsedGenerator
 from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import unknown_references
 from jobhunter.settings.validate import FieldIssue, eval_gate_state, validate_fields
-from jobhunter.types import JSONValue, get_int, get_object, get_str
+from jobhunter.types import JSONValue, get_int, get_object
 from jobhunter.worker.operations import (
     EVAL_RUN_COST_SQL,
     EVAL_RUN_INTERRUPTED,
@@ -123,6 +131,7 @@ RunKind = Literal["golden", "canary"]
 Route = Literal["production", "forced_critic"]
 Transport = Literal["live", "fake"]
 Outcome = Literal["accepted", "contested", "refused", "failed", "filtered_out"]
+Skip = Literal["fenced", "deleted"]  # a case repetition with no row (module docstring, step 1)
 
 RETEST_CASES: Final = 10  # §11.13 L4613: test-retest runs 10 cases twice
 MAX_RETEST_TRIES: Final = 20  # the call bound of the second repetitions (Codex r2 B22)
@@ -135,8 +144,6 @@ AFTER_CALL: Final = "eval.after_call"
 AFTER_CASE_COMMIT: Final = "eval.after_case_commit"
 BEFORE_TERMINAL_COMMIT: Final = "eval.before_terminal_commit"
 AFTER_TERMINAL_COMMIT: Final = "eval.after_terminal_commit"
-_EFFORTS: Final[dict[str, Effort]] = {effort: effort for effort in get_args(Effort)}
-_STRUCTURED: Final = "structured"
 
 log = get_logger("jobhunter.scoring.eval_runner")
 
@@ -369,7 +376,16 @@ _CASES: Final = q(
     "ORDER BY g.id"
 )
 _LOCK_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR SHARE")
-_FENCED: Final = q("SELECT is_fenced(j.id) FROM jobs j WHERE j.id = :j FOR SHARE OF j")
+# Whether a purge fence holds the case (L6362): its job's (`is_fenced`), or a `profile` fence of its profile
+# version (Ruling T19-b, L6352); no row when the job is gone, and its case with it.
+_FENCED: Final = q(
+    "SELECT is_fenced(j.id) OR EXISTS (SELECT 1 FROM purge_fences f WHERE f.released_at IS NULL "
+    "AND f.kind = 'profile' AND f.profile_version_id = :pv) FROM jobs j WHERE j.id = :j FOR SHARE OF j"
+)
+# The case row of a write, `FOR KEY SHARE`: a deletion (`golden.delete_case`) waits for the write's commit and
+# then cascades to its row; none when the case was deleted meanwhile.
+_HOLD_CASE: Final = q("SELECT 1 FROM golden_cases WHERE id = :g FOR KEY SHARE")
+_CASE_EXISTS: Final = q("SELECT EXISTS (SELECT 1 FROM golden_cases WHERE id = :g)")
 _CASE: Final = q(
     "SELECT g.det_inputs_snapshot, s.payload AS scope, r.llm_input, r.description_text, "
     "r.description_completeness, r.ad_language, v.profile_json FROM golden_cases g "
@@ -462,8 +478,7 @@ class _Config:
     version: PromptVersion
     rubric: Rubric
     policy: evaluation_policy.EvaluationPolicy
-    critic_effort: Effort
-    critic_light_effort: Effort
+    efforts: tuple[Effort, Effort]  # the critic's normal and light efforts (`steps.critic_efforts`)
 
 
 @dataclass(frozen=True)
@@ -476,8 +491,8 @@ class _Case:
 
 @dataclass(frozen=True)
 class _Result:
-    """A case repetition's end as the execution keeps it (its progress): `outcome` `None` for a fenced case,
-    which has no row."""
+    """A case repetition's end as the execution keeps it (its progress): `outcome` `None` for a skipped case
+    (fenced or deleted), which has no row."""
 
     case_id: int
     repetition: int
@@ -500,13 +515,6 @@ class _Walk:
     events: list[JSONValue] = field(default_factory=list)
 
 
-def _effort(value: str) -> Effort:
-    effort = _EFFORTS.get(value)
-    if effort is None:
-        raise ValueError("a model policy names an unknown effort")
-    return effort
-
-
 async def _config(engine: AsyncEngine, candidate: Candidate) -> _Config:
     async with engine.connect() as conn:
         row = (
@@ -519,8 +527,7 @@ async def _config(engine: AsyncEngine, candidate: Candidate) -> _Config:
             version=await load_prompt_version(conn, candidate.prompt_schema_version_id),
             rubric=rubric_of(row.weights, row.anchors),
             policy=await evaluation_policy.load(conn, candidate.evaluation_policy_id),
-            critic_effort=_effort(get_str(row.model_policy, "nodes.critic.effort")),
-            critic_light_effort=_effort(get_str(row.model_policy, "critic_light_effort")),
+            efforts=critic_efforts(row.model_policy),
         )
 
 
@@ -528,9 +535,18 @@ def _decimal(value: Decimal | None) -> JSONValue:
     return None if value is None else str(value)
 
 
-def _publication_output(made: Publication, walk: _Walk) -> dict[str, JSONValue]:
-    """A published case's `output`: the publication object, its aggregation, badge and evidence places, and
-    the route's events."""
+def _validation_output(validation: DraftValidation) -> dict[str, JSONValue]:
+    """The final validation's repairs and grounding failures (the V3 quote issues), paths and codes only."""
+    repairs: list[JSONValue] = [{"path": r.path, "code": r.code} for r in validation.repairs]
+    grounding: list[JSONValue] = [
+        {"path": i.path, "code": i.code} for i in validation.issues if i.code in QUOTE_FAILURE_CODES
+    ]
+    return {"repairs": repairs, "grounding_failures": grounding}
+
+
+def _publication_output(made: Publication, validation: DraftValidation, walk: _Walk) -> dict[str, JSONValue]:
+    """A published case's `output`: the publication object, its aggregation, badge and evidence places, its
+    final validation's repairs and grounding failures, and the route's events."""
     aggregation = made.aggregation
     return {
         "publication": made.result.model_dump(mode="json"),
@@ -558,6 +574,7 @@ def _publication_output(made: Publication, walk: _Walk) -> dict[str, JSONValue]:
             }
             for e in made.evidence
         ],
+        "validation": _validation_output(validation),
         "rounds": list(walk.events),
     }
 
@@ -579,7 +596,7 @@ class _Execution:
         self._config = config
         self.owner = EvalRunOwner(run.id, claim=op.claim)
         self.results: list[_Result] = []
-        self.fenced: list[int] = []
+        self.skipped: dict[Skip, list[int]] = {"fenced": [], "deleted": []}
 
     # -- the calls
 
@@ -741,8 +758,9 @@ class _Execution:
         scope: ScopeSettings,
         mode: PublishMode,
         walk: _Walk,
-    ) -> Publication:
-        """Task 10's pure publication of the final draft (module docstring, step 4)."""
+    ) -> tuple[Publication, DraftValidation]:
+        """Task 10's pure publication of the final draft (module docstring, step 4), and that draft's final
+        validation."""
         if walk.draft_id is None:
             raise ValueError("a publication needs a draft")
         ctx = inputs.ctx
@@ -751,9 +769,10 @@ class _Execution:
         if walk.note_id is not None:
             note = await store.note(walk.note_id)
             review = steps.stored_review(ctx, note, await store.draft(note.draft_id))
-        return publication.build(
+        validation = steps.stored_validation(ctx, stored)
+        made = publication.build(
             draft=stored.draft,
-            validation=steps.stored_validation(ctx, stored),
+            validation=validation,
             last_review=review,
             mode=mode,
             scope=scope,
@@ -761,24 +780,35 @@ class _Execution:
             weights=inputs.rubric.weights,
             revisions_used=stored.round,
         )
+        return made, validation
 
     # -- a case
 
-    async def _load(self, case: _Case) -> Row[tuple[object, ...]] | None:
-        """The case's inputs under `active_config FOR SHARE` and its job `FOR SHARE`; `None` when a purge
-        fence holds the job (L6362)."""
+    async def _skip(self, conn: AsyncConnection, case: _Case) -> Skip | None:
+        """Under `active_config FOR SHARE`, the case's job `FOR SHARE`: whether a purge fence holds the case
+        (its job's or its profile version's) or its job is gone with it."""
+        fenced = (
+            await conn.execute(_FENCED, {"j": case.job_id, "pv": case.profile_version_id})
+        ).scalar_one_or_none()
+        if fenced is None:
+            return "deleted"
+        return "fenced" if fenced else None
+
+    async def _load(self, case: _Case) -> Row[tuple[object, ...]] | Skip:
+        """The case's inputs under `active_config FOR SHARE` and its job `FOR SHARE`, or why it is skipped: a
+        purge fence holds it (L6362, Ruling T19-b) or it was deleted."""
         async with self._engine.begin() as conn:
             await conn.execute(_LOCK_CONFIG)
-            if (await conn.execute(_FENCED, {"j": case.job_id})).scalar_one_or_none() is not False:
-                return None
-            return (await conn.execute(_CASE, {"g": case.id})).one()
+            skip = await self._skip(conn, case)
+            if skip is not None:
+                return skip
+            row = (await conn.execute(_CASE, {"g": case.id})).one_or_none()
+            return "deleted" if row is None else row
 
     def _inputs(
         self, case: _Case, row: Row[tuple[object, ...]], repetition: int, det: filters.DetFacts
     ) -> ScoreInputs:
         config, candidate = self._config, self._run.candidate
-        material: JSONValue = row.llm_input
-        work_modes = material_strings(material, "work_mode_possible")
         identity = golden.tuple_identity(
             profile_version_id=case.profile_version_id,
             rubric_version_id=candidate.rubric_version_id,
@@ -794,32 +824,43 @@ class _Execution:
             "golden_case_id": case.id,
             "repetition": repetition,
         }
-        return ScoreInputs(
+        return material_inputs(
+            row,
             version=config.version,
             rubric=config.rubric,
-            profile=ConfirmedProfile.model_validate(row.profile_json),
-            ad=revision_ad(
-                material,
-                completeness=str(row.description_completeness),
-                description_text=str(row.description_text),
-            ),
-            det=det,
-            structured_work_modes=(
-                tuple(work_modes) if get_str(material, "work_mode_source") == _STRUCTURED else ()
-            ),
-            completeness=str(row.description_completeness),
             policy=config.policy,
-            critic_effort=config.critic_effort,
-            critic_light_effort=config.critic_light_effort,
+            efforts=config.efforts,
+            det=det,
             sample_key=golden_sample_key(golden_case_id=case.id, tuple_identity=identity),
             refs=refs,
         )
 
     async def case(self, case: _Case, repetition: int) -> _Result:
-        """One repetition of one case (module docstring, steps 1-5)."""
+        """One repetition of one case (module docstring, steps 1-5). A case deleted meanwhile is skipped
+        whatever its scoring then raised (a call's reservation naming it, say), and never requeued: an error
+        is re-raised while the case exists, and a lost claim (`FencedOut`) always is."""
+        try:
+            return await self._score(case, repetition)
+        except FencedOut:
+            raise
+        except Exception as error:
+            async with self._engine.connect() as conn:
+                exists = bool((await conn.execute(_CASE_EXISTS, {"g": case.id})).scalar_one())
+            if exists:
+                raise
+            log.warning(
+                "eval_case_deleted_meanwhile",
+                eval_run_id=self._run.id,
+                golden_case_id=case.id,
+                repetition=repetition,
+                error_class=type(error).__name__,
+            )
+            return self._skipped(case, repetition, "deleted")
+
+    async def _score(self, case: _Case, repetition: int) -> _Result:
         row = await self._load(case)
-        if row is None:
-            return self._fenced(case, repetition)
+        if isinstance(row, str):
+            return self._skipped(case, repetition, row)
         await afault_point(BEFORE_CASE)
         scope = scope_from_payload(get_object(row.scope, ""))
         det = golden.case_det_facts(
@@ -847,7 +888,7 @@ class _Execution:
         mode = nxt.publish_mode
         invalid: PublicationInvalid | None = None
         try:
-            made = await self._publication(inputs, store, scope, mode, walk)
+            made, validation = await self._publication(inputs, store, scope, mode, walk)
         except PublicationInvalid as error:
             invalid = error
         if invalid is not None:
@@ -857,13 +898,20 @@ class _Execution:
                 "rounds": list(walk.events),
             }
             return await self._write(case, repetition, "failed", walk, failed, None)
-        output = _publication_output(made, walk)
+        output = _publication_output(made, validation, walk)
         return await self._write(case, repetition, mode, walk, output, made.aggregation.mid)
 
-    def _fenced(self, case: _Case, repetition: int) -> _Result:
-        if case.id not in self.fenced:
-            self.fenced.append(case.id)
-        log.info("eval_case_fenced", eval_run_id=self._run.id, golden_case_id=case.id, repetition=repetition)
+    def _skipped(self, case: _Case, repetition: int, skip: Skip) -> _Result:
+        skipped = self.skipped[skip]
+        if case.id not in skipped:
+            skipped.append(case.id)
+        log.info(
+            "eval_case_skipped",
+            eval_run_id=self._run.id,
+            golden_case_id=case.id,
+            repetition=repetition,
+            skip=skip,
+        )
         return _Result(case.id, repetition, None, None)
 
     async def _write(
@@ -876,12 +924,15 @@ class _Execution:
         score_mid: Decimal | None,
     ) -> _Result:
         """The case's terminal row (module docstring, step 5): one transaction in the lock order, under the
-        owner; a job fenced meanwhile writes nothing."""
+        owner; a case fenced or deleted meanwhile writes nothing."""
         async with self._engine.begin() as conn:
             await conn.execute(_LOCK_CONFIG)
-            if (await conn.execute(_FENCED, {"j": case.job_id})).scalar_one_or_none() is not False:
-                return self._fenced(case, repetition)
+            skip = await self._skip(conn, case)
+            if skip is not None:
+                return self._skipped(case, repetition, skip)
             await self.owner.lock(conn)
+            if (await conn.execute(_HOLD_CASE, {"g": case.id})).first() is None:
+                return self._skipped(case, repetition, "deleted")
             ids = [int(i) for i in (await conn.execute(_CASE_CALLS, self._keys(case, repetition))).scalars()]
             await conn.execute(
                 _INSERT_CASE,
@@ -969,12 +1020,19 @@ async def run_eval(
             second = await execution.case(by_id[case_id], 2)
             if second.score_mid is not None:
                 sample.append(case_id)
-    counts = Counter(result.outcome for result in execution.results if result.outcome is not None)
-    outcomes: dict[str, JSONValue] = {outcome: count for outcome, count in sorted(counts.items())}
+    outcomes: dict[str, JSONValue] = {}  # by repetition (`"1"`, `"2"`): each outcome's count
+    for repetition in sorted({result.repetition for result in execution.results}):
+        counts = Counter(r.outcome for r in execution.results if r.repetition == repetition and r.outcome)
+        outcomes[str(repetition)] = {outcome: count for outcome, count in sorted(counts.items())}
     metrics: dict[str, JSONValue] = {
         "transport": "fake" if op.deps.cfg.fake_llm else "live",
         "transport_requested": run.transport_requested,
-        "cases": {"active": len(cases), "fenced": list(execution.fenced), "outcomes": outcomes},
+        "cases": {
+            "active": len(cases),
+            "fenced": list(execution.skipped["fenced"]),
+            "deleted": list(execution.skipped["deleted"]),
+            "outcomes": outcomes,
+        },
         "repetitions": {"attempted": list(attempted), "sample": list(sample)},
     }
     async with engine.begin() as conn:
@@ -995,7 +1053,8 @@ async def run_eval(
         "eval_run_completed",
         eval_run_id=run.id,
         case_rows=len(execution.results),
-        fenced=len(execution.fenced),
+        fenced=len(execution.skipped["fenced"]),
+        deleted=len(execution.skipped["deleted"]),
         sample=len(sample),
         cost_usd=str(cost),
     )

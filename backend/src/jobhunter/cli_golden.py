@@ -20,7 +20,10 @@ and its startup assertions) and work on the installation's database, where the g
 
 The output is ids, counts, codes and amounts only (stdout: the summary; stderr: the logs and the run's id at
 its start), never content or a key. An error prints its class only (SQLAlchemy puts bound values into its
-messages). Exit status: 0 for a completed run or a seed, 1 for a failed run, 2 when nothing could start.
+messages). Exit status: 0 for a completed run or a seed, 1 for a failed run (or a wait the database broke),
+2 when nothing could start: a malformed candidate, a payload the dry-run refuses, no active rubric or
+prompt-schema version (`LookupError`), a fixture changed since its seed (`golden.FixtureChanged`), invalid
+fixtures or a database error, each one line on stderr.
 """
 
 import argparse
@@ -174,6 +177,9 @@ def run_golden_command(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:  # an unreadable directory or a fixture that is none
         print(f"golden seed-adversarial: invalid fixtures ({type(exc).__name__})", file=sys.stderr)
         return NOT_STARTED
+    except golden.FixtureChanged as changed:  # its message names the fixture's key and the field only
+        print(f"golden seed-adversarial: {changed}", file=sys.stderr)
+        return NOT_STARTED
     print(f"golden seed-adversarial: cases={seeded.cases} jobs={seeded.jobs} profiles={seeded.profiles}")
     return COMPLETED
 
@@ -204,6 +210,9 @@ def run_eval_command(args: argparse.Namespace) -> int:
     except CandidateInvalid as invalid:
         fields = ", ".join(f"{issue.field} ({issue.code})" for issue in invalid.issues)
         print(f"eval run: the candidate payload is invalid: {fields}", file=sys.stderr)
+        return NOT_STARTED
+    except LookupError as missing:  # no active rubric or prompt-schema version: its message names them only
+        print(f"eval run: no candidate to run: {missing}", file=sys.stderr)
         return NOT_STARTED
     except SQLAlchemyError as exc:
         print(f"eval run: database error ({type(exc).__name__})", file=sys.stderr)

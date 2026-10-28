@@ -108,7 +108,7 @@ from jobhunter.observability.metrics import (
 from jobhunter.settings.active import lock_active
 from jobhunter.types import JSONValue, get_int, unstorable
 from jobhunter.worker.epoch import fence_epoch
-from jobhunter.worker.operations import OperationClaim, lock_operation_owner
+from jobhunter.worker.operations import OperationClaim, fail_eval_run, lock_operation_owner
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
 CAP_80PCT_ALERT: Final = "llm.cap_80pct"
@@ -122,6 +122,7 @@ RECOVERY_AFTER: Final = timedelta(minutes=15)
 DEADLINE_GRACE: Final = timedelta(minutes=5)
 # A `running` eval run older than this is abandoned (a CLI that died between cases or inside a call).
 EVAL_RUN_ABANDONED: Final = timedelta(hours=1)
+EVAL_RUN_ABANDONED_REASON: Final = "abandoned"  # its `metrics.failed`
 # The reconciler recovers at most this many entries per tick; the next tick takes the rest.
 RECOVERY_BATCH: Final = 100
 
@@ -1873,7 +1874,8 @@ _UNSETTLED = q(
 
 async def _fail_abandoned_eval_runs(conn: AsyncConnection, *, now: datetime) -> int:
     """Every abandoned eval run (`_ABANDONED_EVAL_RUNS`: no live `eval_run` operation, and older than
-    `EVAL_RUN_ABANDONED` when it never had one) → `failed`, so that its unsettled entries fail
+    `EVAL_RUN_ABANDONED` when it never had one) → `failed` with `metrics.failed = "abandoned"` and the
+    `cost_usd` its calls count (`operations.fail_eval_run`), so that its unsettled entries fail
     `owner_holds`."""
     ids = [
         int(i)
@@ -1881,9 +1883,7 @@ async def _fail_abandoned_eval_runs(conn: AsyncConnection, *, now: datetime) -> 
     ]
     failed = 0
     for eval_run_id in ids:
-        try:
-            await transition(conn, "eval_runs", eval_run_id, ["running"], "failed")
-        except TransitionConflict:
+        if not await fail_eval_run(conn, eval_run_id, EVAL_RUN_ABANDONED_REASON):
             continue  # it finished meanwhile
         log.warning("eval_run_abandoned", eval_run_id=eval_run_id)
         failed += 1

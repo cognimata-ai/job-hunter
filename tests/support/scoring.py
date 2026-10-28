@@ -1242,6 +1242,9 @@ _FENCE_JOBS: Final = q(
     "INSERT INTO purge_fences (kind, job_ids, manifest_id) VALUES ('jobs', CAST(:jobs AS bigint[]), 1) "
     "RETURNING id"
 )
+_FENCE_PROFILE: Final = q(
+    "INSERT INTO purge_fences (kind, profile_version_id, manifest_id) VALUES ('profile', :pv, 1) RETURNING id"
+)
 _MANY_REVISIONED_JOBS: Final = q(
     "WITH j AS (INSERT INTO jobs (company_key, company_display, title, title_norm, location_kind, "
     "work_mode_possible, work_mode_source, employment_source, ad_language, completeness, posted_precision, "
@@ -1306,6 +1309,11 @@ async def profile_of_tuple(conn: AsyncConnection, llm_tuple_id: int) -> int:
 async def fence_jobs(conn: AsyncConnection, *job_ids: int) -> int:
     """An active purge fence of kind `jobs` over `job_ids`; its id."""
     return int((await conn.execute(_FENCE_JOBS, {"jobs": list(job_ids)})).scalar_one())
+
+
+async def fence_profile(conn: AsyncConnection, profile_version_id: int) -> int:
+    """An active purge fence of kind `profile` over `profile_version_id`; its id."""
+    return int((await conn.execute(_FENCE_PROFILE, {"pv": profile_version_id})).scalar_one())
 
 
 async def revisioned_jobs(engine: AsyncEngine, n: int, *, availability: str = "active") -> list[Job]:

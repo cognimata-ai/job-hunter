@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import TRANSITIONS
+from jobhunter.embeddings import NOT_SYNTHETIC_REVISION_SQL
 from jobhunter.graphs.collect.nodes import run_started_at
 from jobhunter.graphs.collect.nodes.enqueue_targets import (
     SKIPPED_PREFIX,
@@ -138,10 +139,12 @@ _GAPS = q(
     "AND c.source_instance_id IN (SELECT source_instance_id FROM fetch_requests WHERE run_id = :run) "
     "AND (g.run_id = :run OR g.closed_at >= :started) GROUP BY 1"
 )
+# `jobs_created`: the user's jobs only (a synthetic golden-case job is the eval's, Ruling T19-a).
 _IDENTITY = q(
-    "SELECT (SELECT count(*) FROM job_revisions WHERE revision_no = 1 AND created_at >= :started) "
-    "AS jobs_created, (SELECT count(*) FROM merge_events WHERE kind = 'strong_key_merge' "
-    "AND created_at >= :started) AS merges, "
+    "SELECT (SELECT count(*) FROM job_revisions r WHERE r.revision_no = 1 "  # noqa: S608
+    f"AND r.created_at >= :started AND {NOT_SYNTHETIC_REVISION_SQL}) AS jobs_created, "
+    "(SELECT count(*) FROM merge_events WHERE kind = 'strong_key_merge' AND created_at >= :started) "
+    "AS merges, "
     "(SELECT count(*) FROM identity_conflicts WHERE created_at >= :started) AS conflicts, "
     "(SELECT count(*) FROM duplicate_groups WHERE created_at >= :started) AS groups_formed, "
     "(SELECT count(*) FROM duplicate_groups g WHERE g.created_at < :started AND (g.updated_at >= :started "

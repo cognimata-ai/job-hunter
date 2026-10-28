@@ -165,9 +165,10 @@ _FLIP: Final = q(
     "updated_at = :now WHERE id = 1"
 )
 _SCOPE: Final = q("SELECT payload FROM scope_versions WHERE id = :id")
-_RETAINED: Final = q("SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL")
+# The user's unmerged jobs: a synthetic golden-case job has no hard-filter rows to wait for (Ruling T19-a).
+_RETAINED: Final = q("SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND NOT synthetic_eval")
 _INCOMPLETE: Final = q(
-    "SELECT count(*) FROM jobs j WHERE j.merged_into_job_id IS NULL "  # noqa: S608 (constants only)
+    "SELECT count(*) FROM jobs j WHERE j.merged_into_job_id IS NULL AND NOT j.synthetic_eval "  # noqa: S608
     f"AND {STALE_PREDICATE}"
 )
 _ANY_LIVE: Final = q(
@@ -215,8 +216,8 @@ async def set_desired_scope(
 
 
 async def incomplete_jobs(conn: AsyncConnection, scope_version_id: int) -> int:
-    """How many unmerged jobs have no current `hard_filter_results` row for the scope
-    (`filters.STALE_PREDICATE`): no limit, no lock."""
+    """How many of the user's unmerged jobs (no synthetic golden-case job, Ruling T19-a) have no current
+    `hard_filter_results` row for the scope (`filters.STALE_PREDICATE`): no limit, no lock."""
     params = {"scopes": [scope_version_id], "version": DET_ALGORITHM_VERSION}
     return int((await conn.execute(_INCOMPLETE, params)).scalar_one())
 

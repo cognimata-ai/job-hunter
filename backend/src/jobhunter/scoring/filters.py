@@ -585,9 +585,11 @@ STALE_PREDICATE: Final = (
     "WHERE h.job_id IS NULL OR h.inputs_hash <> j.det_facts_hash OR h.det_algorithm_version <> :version)"
 )
 # The unmerged jobs (touched since `since`, when given) that lack a row for a scope, or whose row is stale,
-# in id order, locked `FOR SHARE` as they are returned: a job merged or deleted since the scan is skipped.
+# in id order, locked `FOR SHARE` as they are returned: a job merged or deleted since the scan is skipped. A
+# synthetic golden-case job is none of them: the eval filters a case on its frozen facts and never reads its
+# rows (Ruling T19-a).
 _STALE: Final = q(
-    "SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL "  # noqa: S608 (constants only)
+    "SELECT j.id FROM jobs j WHERE j.merged_into_job_id IS NULL AND NOT j.synthetic_eval "  # noqa: S608
     "AND (CAST(:since AS timestamptz) IS NULL OR j.updated_at >= :since) "
     f"AND {STALE_PREDICATE} "
     "ORDER BY j.id LIMIT :limit FOR SHARE OF j"

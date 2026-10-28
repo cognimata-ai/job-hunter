@@ -109,7 +109,8 @@ tuple with the active `max_ad_age_days`, and `ranking.bump` when it moved a targ
 **Creation and revival** (§9.7, §7.16.3; Task 14). `create_or_revive(conn, *, job_id, job_revision_id,
 llm_tuple_id, profile_version_id, scope_version_id, bulk_operation_id, now)`, in the caller's transaction,
 which holds `active_config FOR SHARE` (or `FOR UPDATE`) and passes the active tuple, scope and profile:
-1. the job row `FOR SHARE` (step 4) with `is_fenced(job_id, llm_tuple_id)`: `Skipped("tuple_inactive")` when
+1. the job row `FOR SHARE` (step 4) with `is_fenced(job_id, llm_tuple_id)`: a synthetic golden-case job is
+   `SyntheticJobRefused` (a bug: no creator selects one, Ruling T19-a); `Skipped("tuple_inactive")` when
    the tuple is not the active one, `Skipped("fenced")` under a purge fence (L6358), `Skipped("merged")` for a
    merged job, `Skipped("not_current")` when the revision is not the job's current one (or the job is gone);
 2. the upsert of L3694-3702 (`UNIQUE (job_revision_id, llm_tuple_id)`), `similarity` from
@@ -201,7 +202,7 @@ from jobhunter.db.transitions import (
     transition_set_clause,
     transition_where,
 )
-from jobhunter.errors import FencedOut
+from jobhunter.errors import DomainError, FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.budget import BudgetParams
@@ -989,7 +990,8 @@ class Activated:
 
 
 _LOCK_JOB: Final = q(
-    "SELECT j.merged_into_job_id, j.current_revision_id, is_fenced(j.id, :tuple) AS fenced, "
+    "SELECT j.merged_into_job_id, j.current_revision_id, j.synthetic_eval, "
+    "is_fenced(j.id, :tuple) AS fenced, "
     "(SELECT a.llm_tuple_id FROM active_config a WHERE a.id = 1) IS NOT DISTINCT FROM :tuple AS active "
     "FROM jobs j WHERE j.id = :job FOR SHARE OF j"
 )
@@ -1071,6 +1073,15 @@ async def _corrected(conn: AsyncConnection, target_id: int, *, job_id: int, scop
     return "deferred_duplicate" if deferred else "pending"
 
 
+class SyntheticJobRefused(DomainError):
+    """A synthetic golden-case job reached target creation (Ruling T19-a, Codex r1 #32): none gets a target,
+    and every creator's selection (`RETAINED_JOB_SQL`) excludes it, so this is a bug; nothing is written."""
+
+    def __init__(self, job_id: int) -> None:
+        super().__init__(f"job {job_id} is a synthetic golden-case job: it never gets a target")
+        self.job_id = job_id
+
+
 async def create_or_revive(
     conn: AsyncConnection,
     *,
@@ -1087,6 +1098,8 @@ async def create_or_revive(
     job = (await conn.execute(_LOCK_JOB, {"job": job_id, "tuple": llm_tuple_id})).first()  # step 4
     if job is None:
         return Skipped("not_current")  # deleted since it was read
+    if job.synthetic_eval:
+        raise SyntheticJobRefused(job_id)
     if not job.active:
         return Skipped("tuple_inactive")
     if job.fenced:

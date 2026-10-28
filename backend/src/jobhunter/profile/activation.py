@@ -28,10 +28,11 @@ its profile in the caller's **one transaction**, and returns the response `(stat
    locks the row `FOR UPDATE` before it deletes anything (§20.2), then waits for this commit, and one that got
    there first has made `purged_at IS NULL` false, so the read finds nothing and a new version is made. Under
    an active fence of kind `profile` on that version, 409 `profile_purge_in_progress`; the confirm can be
-   repeated when the purge has finished. Otherwise a new row: `version_no = max + 1` (the `active_config` lock
-   serialises the writers), the draft, its CV file, the profile, its hash and `confirmed_at = now`. A purged
-   version is never reused or revived: identical content gets a new id, which §7.4's partial unique index
-   allows. Then the fault point `confirm.after_version`.
+   repeated when the purge has finished. Otherwise a new row: `version_no = max + 1` over the user's versions
+   (a synthetic one of the adversarial seed is never reused nor counted, Ruling T19-c; the `active_config`
+   lock serialises the writers), the draft, its CV file, the profile, its hash and `confirmed_at = now`. A
+   purged version is never reused or revived: identical content gets a new id, which §7.4's partial unique
+   index allows. Then the fault point `confirm.after_version`.
 7. (b) The tuple: `save.ensure_tuple` with the version and the active model policy (it reads the active rubric
    and prompt-schema versions itself).
 8. (c) `active_config.profile_version_id` and `llm_tuple_id` set, then the fault point `confirm.after_flip`.
@@ -128,8 +129,11 @@ _LOCK_DRAFT: Final = q(
     "SELECT status, cv_file_id, native_pdf, reviewed_text, draft_json, confirm_response "
     "FROM profile_drafts WHERE id = :d FOR UPDATE"
 )
+# The user's versions only: an adversarial seed's synthetic version is the eval's, never reused by a confirm
+# nor counted in the user's `version_no` (Rulings T19-a, T19-c; `scoring.golden.SYNTHETIC_VERSION_BASE`).
 _USABLE_VERSION: Final = q(
-    "SELECT id FROM profile_versions WHERE profile_hash = :h AND purged_at IS NULL FOR KEY SHARE"
+    "SELECT id FROM profile_versions WHERE profile_hash = :h AND purged_at IS NULL AND NOT synthetic_eval "
+    "FOR KEY SHARE"
 )
 _FENCED: Final = q(
     "SELECT EXISTS (SELECT 1 FROM purge_fences WHERE released_at IS NULL AND kind = 'profile' "
@@ -138,7 +142,7 @@ _FENCED: Final = q(
 _INSERT_VERSION: Final = q(
     "INSERT INTO profile_versions (version_no, draft_id, cv_file_id, profile_json, profile_hash, "
     "confirmed_at) SELECT coalesce(max(version_no), 0) + 1, :d, :cv, :profile, :h, :now "
-    "FROM profile_versions RETURNING id",
+    "FROM profile_versions WHERE NOT synthetic_eval RETURNING id",
     jsonb=["profile"],
 )
 _ACTIVATE: Final = q(

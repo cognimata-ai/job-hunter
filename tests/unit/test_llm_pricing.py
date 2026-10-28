@@ -15,6 +15,7 @@ from jobhunter.llm.pricing import (
     Price,
     Usage,
     bound_input_price,
+    effort_of,
     price_for,
     settled_usd,
     worst_case_usd,
@@ -220,3 +221,13 @@ def test_the_value_objects_are_frozen() -> None:
     usage = Usage(1, 2, 3, 4)
     with pytest.raises(FrozenInstanceError):
         usage.input_tokens = 0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("effort", get_args(Effort))
+def test_effort_of_reads_every_effort(effort: Effort) -> None:
+    assert effort_of(effort) == effort
+
+
+def test_effort_of_refuses_an_unknown_effort() -> None:
+    with pytest.raises(ValueError, match="unknown effort"):
+        effort_of("extreme")

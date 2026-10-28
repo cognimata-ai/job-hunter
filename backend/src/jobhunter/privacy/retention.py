@@ -59,7 +59,8 @@ body that the newest response still needs. The controller records this as a plan
 - `cv_files`: a CV file and its texts (`storage_path`, `raw_text_enc`, `stripped_text`). Kept: the file of the
   active profile version and of the previous one, and that of every open draft. "Previous" follows the
   activation order, not `version_no`: the version of the newest confirmed draft before the newest one that
-  names another version, so a reactivated older version keeps the version it replaced as its previous. The
+  names another version, so a reactivated older version keeps the version it replaced as its previous. Only
+  the user's confirmed drafts count: the adversarial seed's name synthetic versions (Ruling T19-a). The
   draft ids are the confirm order: one draft is open at a time and only an open (`ready`) draft is confirmed,
   and a draft older than the open one cannot come back to confirm after it, since every new upload discards
   every `failed` draft (`profile.upload.open_new_draft`, pinned by `test_profile_upload_api.py`'s
@@ -299,13 +300,17 @@ _PURGE_EXTRACT_OUTPUTS: Final = q(
 )
 
 # `cv_files`: the protection set under `active_config` (the active version's file, the previous version's, an
-# open draft's), the candidates (one batch after `:after`), their drafts and rows locked, the purge.
+# open draft's), the candidates (one batch after `:after`), their drafts and rows locked, the purge. The
+# newest and the previous confirmed drafts are the user's own: the adversarial seed's confirmed drafts name
+# synthetic versions (Ruling T19-a), newer than the user's but never activated.
 _PROTECTED_FILES: Final = q(
-    "WITH newest AS (SELECT id, confirmed_profile_version_id AS version FROM profile_drafts "
-    "WHERE status = 'confirmed' ORDER BY id DESC LIMIT 1), "
+    "WITH newest AS (SELECT d.id, d.confirmed_profile_version_id AS version FROM profile_drafts d "
+    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
+    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1), "
     "previous AS (SELECT d.confirmed_profile_version_id AS version FROM profile_drafts d JOIN newest n "
-    "ON d.id < n.id AND d.confirmed_profile_version_id <> n.version WHERE d.status = 'confirmed' "
-    "ORDER BY d.id DESC LIMIT 1) "
+    "ON d.id < n.id AND d.confirmed_profile_version_id <> n.version "
+    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
+    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1) "
     "SELECT v.cv_file_id FROM profile_versions v WHERE v.cv_file_id IS NOT NULL "
     "AND (v.id = CAST(:active AS bigint) OR v.id IN (SELECT version FROM newest) "
     "OR v.id IN (SELECT version FROM previous)) "
