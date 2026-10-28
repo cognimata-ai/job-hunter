@@ -125,6 +125,13 @@ def test_rules_name_every_report_key_with_its_window() -> None:
         "cv_files": timedelta(days=30),
         "cv_store_orphans": timedelta(days=1),
         "eval_runs": timedelta(days=397),
+        # M3 Task 23: the score tables (their own tests are in test_retention_m3.py); `score_history`'s
+        # window is the active settings' `retention.score_history_months`, read at the start of the pass
+        "score_history": timedelta(0),
+        "cycle_threads": timedelta(days=14),
+        "score_cycles": timedelta(days=397),
+        "batch_submissions": timedelta(days=397),
+        "bulk_operations": timedelta(days=397),
         "checkpoints": timedelta(days=14),
         "profile_checkpoints": timedelta(days=14),
         "runs": timedelta(days=397),  # 13 months, never fewer days than any 13 calendar months
@@ -133,9 +140,15 @@ def test_rules_name_every_report_key_with_its_window() -> None:
     names = [rule.name for rule in RULES]
     assert names.index("draft_content") < names.index("cv_files")  # the content, then the file
     assert names.index("checkpoints") < names.index("runs")  # threads go while their attempts still name them
+    # M3 (Codex r1 #37-#39): after `eval_runs` and before `checkpoints`, in this order
+    m3 = ["score_history", "cycle_threads", "score_cycles", "batch_submissions", "bulk_operations"]
+    start = names.index("eval_runs") + 1
+    assert names[start : start + len(m3) + 1] == [*m3, "checkpoints"]
     # A dependency is named explicitly (ruling T21-f), and only ever on a rule that runs before it.
     assert {rule.name: rule.depends_on for rule in RULES if rule.depends_on} == {
         "fetch_requests": ("raw_items",),
+        "score_cycles": ("cycle_threads",),
+        "bulk_operations": ("batch_submissions",),
         "runs": ("checkpoints",),
     }
     for rule in RULES:

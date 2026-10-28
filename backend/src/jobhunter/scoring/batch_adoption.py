@@ -70,7 +70,8 @@ from jobhunter.worker.tasks import Deferrer, defer_in_tx
 WINDOW_BEFORE: Final = timedelta(minutes=1)
 WINDOW_AFTER: Final = timedelta(minutes=10)
 UNRESOLVED_AFTER: Final = timedelta(hours=25)
-RELEASED_LISTED_FOR: Final = timedelta(days=29)
+# The state machine's (`batches.UNRESOLVED_SUBMISSION_SQL` keeps a listed submission's items from retention).
+RELEASED_LISTED_FOR: Final = batches.RELEASED_LISTED_FOR
 _SUBMISSIONS: Final = "batch_submissions"
 # The ambiguous reconciliation's submissions (L3984: every `submit_ambiguous` one, the `released` ones within
 # the results' retention), the ids adopted already, its owner and its record of a pass without a match.

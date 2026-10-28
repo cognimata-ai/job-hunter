@@ -78,6 +78,8 @@ def test_the_m1_rules_follow_operations_in_order_with_their_windows() -> None:
     ]
     assert {rule.name: rule.depends_on for rule in RULES if rule.depends_on} == {
         "fetch_requests": ("raw_items",),
+        "score_cycles": ("cycle_threads",),  # M3 Task 23
+        "bulk_operations": ("batch_submissions",),  # M3 Task 23
         "runs": ("checkpoints",),
     }
 

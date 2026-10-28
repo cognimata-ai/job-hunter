@@ -131,15 +131,42 @@ non-synthetic job, Codex r1 #32) and `NEEDS_TARGET_SQL` (no target of `:tuple` f
 the predicates over `jobs j` the creators share with node 9 and I5.
 
 **Cancellation** (§7.16.3, Rulings P9, P52, T10-f). `cancel_targets(conn, *, llm_tuple_id=None, job_ids=None,
-revision_ids=None, reason, now) -> Cancelled(targets, attempts)` moves every target the filters match (all of
-them that are given) in `CANCELLABLE` or `in_progress` to `cancelled(reason)` (the claim, group and filter
-columns cleared), ends their running attempts `cancelled` with `outcome_detail = reason` (a non-owner writes
-no other outcome), and releases the follow-up hold of each (`bulk.release_target_hold`). An `in_batch` target
-is the batch cancel's on a tuple supersession (`batches.request_cancel`, below) and cancelled individually
-for a revision supersession, a merge or a purge (L3979). Never the targets' owner: the candidates are read
-without a lock, their bulk rows locked (`bulk.lock_for_targets`, step 7), then the target rows `FOR UPDATE`
-in id order (step 10), the attempts and the items after. `cancel_batched(conn, *, submission_ids, reason)` is
-the same move for the `in_batch` targets of the given submissions.
+revision_ids=None, target_ids=None, reason, now) -> Cancelled(targets, attempts)` moves every target the
+filters match (all of them that are given) in `CANCELLABLE` or `in_progress` to `cancelled(reason)` (the
+claim, group and filter columns cleared), ends their running attempts `cancelled` with `outcome_detail =
+reason` (a non-owner writes no other outcome), and releases the follow-up hold of each
+(`bulk.release_target_hold`). An `in_batch` target is the batch cancel's on a tuple supersession
+(`batches.request_cancel`, below) and cancelled individually for a revision supersession, a merge or a purge
+(L3979). Never the targets' owner: the candidates are read without a lock, their bulk rows locked
+(`bulk.lock_for_targets`, step 7), then the target rows `FOR UPDATE` in id order (step 10), the attempts and
+the items after. `cancel_batched(conn, *, submission_ids, reason)` is the same move for the `in_batch` targets
+of the given submissions.
+
+**Target-set deletion** (§20.2 L6369-6378; Task 23, Rulings P8, P52, Carries T10-f, T13-a, T16-c).
+`delete_target_set(conn, target_ids, *, now) -> int` deletes a set T of at most `TARGET_SET_CHUNK` (200)
+targets with every row they own, in the caller's transaction (the score-history retention's chunk, which holds
+`active_config FOR SHARE`; M5's purges reuse it), and returns how many targets it deleted. It is a non-owner
+mover: first the bulk rows of T's unreleased follow-up items (`bulk.lock_for_targets`, step 7), then T's rows
+`FOR UPDATE` in id order (step 10), before the attempts (T16-c); then the nine steps:
+1. `cancel_targets(target_ids=T, reason='purged')`: every target of T that is neither published nor
+   cancelled → `cancelled('purged')`; an `in_progress` one loses its claim and its running attempt ends
+   `cancelled` (T10-f); an `in_batch` one is cancelled individually, as a merge cancels it (L3979, Ruling P8):
+   its `batch_submission_id` cleared, its attempt `cancelled`, the submission untouched; each cancelled
+   target's follow-up hold is given back once. S:L6370's "the submission's cancel is requested first"
+   disagrees with S:L3979; M5, whose purges are the callers that meet `in_batch` targets (the retention
+   deletes terminal ones only), decides it for purges;
+2. `resume_draft_id := NULL` on T;
+3. the `result_evidence` and `det_results` (every instance, superseded or current) of T's results; the
+   `score_feedback` and `golden_cases.labelled_from_result_id` references become NULL by their foreign keys;
+4. the `critic_notes` of T's attempts;
+5. the `llm_results` of T (the deferred keys with `published_result_id` hold at the commit: step 9 runs in
+   the same transaction);
+6. the `score_drafts` of T's attempts;
+7. the `batch_items` of T with their `llm_calls` (a deferred pair), then every other `llm_calls` row of T's
+   attempts; the spend ledger rows stay;
+8. the `score_attempts` of T; 9. T itself.
+`ranking.bump` is the caller's (a purge's; the retention's targets are of an inactive tuple, which no view
+reads). The log line has the counts and at most the first `LOGGED_IDS` target ids.
 
 **The tuple activation** (§12.6 (d)-(f) and (h), §13.3 `llm_tuple`; Deviation 38, Codex r1 #24, #35).
 `activate_tuple(conn, *, old_tuple_id, new_tuple_id, settings, now, defer) -> Activated(bulk_operation_id,
@@ -1136,6 +1163,7 @@ _MATCH: Final = {
     "llm_tuple_id": "s.llm_tuple_id = :tuple",
     "job_ids": "s.job_id = ANY(CAST(:jobs AS bigint[]))",
     "revision_ids": "s.job_revision_id = ANY(CAST(:revisions AS bigint[]))",
+    "target_ids": "s.id = ANY(CAST(:targets AS bigint[]))",
     "submission_ids": "s.batch_submission_id = ANY(CAST(:submissions AS bigint[]))",
 }
 _IN_STATES: Final = "s.state = ANY(CAST(:states AS text[]))"
@@ -1223,6 +1251,7 @@ async def cancel_targets(
     llm_tuple_id: int | None = None,
     job_ids: Sequence[int] | None = None,
     revision_ids: Sequence[int] | None = None,
+    target_ids: Sequence[int] | None = None,
     reason: CancelReason,
     now: datetime,
 ) -> Cancelled:
@@ -1236,6 +1265,8 @@ async def cancel_targets(
         match["jobs"] = (_MATCH["job_ids"], list(job_ids))
     if revision_ids is not None:
         match["revisions"] = (_MATCH["revision_ids"], list(revision_ids))
+    if target_ids is not None:
+        match["targets"] = (_MATCH["target_ids"], list(target_ids))
     if not match:
         raise ValueError("cancel_targets: no filter given; it matches every target")
     del now
@@ -1249,6 +1280,60 @@ async def cancel_batched(
     cancels: their attempts ended, their holds released, the bulk rows first."""
     match = {"submissions": (_MATCH["submission_ids"], list(submission_ids))}
     return await _cancel(conn, match, ["in_batch"], reason)
+
+
+# ---- target-set deletion (§20.2 L6369-6378) ----------------------------------------------------------------
+
+TARGET_SET_CHUNK: Final = 200  # the targets of one transaction of a target-set deletion (L6369)
+PURGED: Final = "purged"
+_SET: Final = "CAST(:ids AS bigint[])"
+_LOCK_SET: Final = q(f"SELECT id FROM score_targets WHERE id = ANY({_SET}) ORDER BY id FOR UPDATE")  # noqa: S608
+_UNRESUME: Final = q(f"UPDATE score_targets SET resume_draft_id = NULL WHERE id = ANY({_SET})")  # noqa: S608
+_RESULTS_OF_SET: Final = f"SELECT id FROM llm_results WHERE target_id = ANY({_SET})"  # noqa: S608
+_ATTEMPTS_OF_SET: Final = f"SELECT id FROM score_attempts WHERE target_id = ANY({_SET})"  # noqa: S608
+# Steps 3 to 9 (module docstring), each counted under its name; the static fragments above, no input.
+_SET_DELETES: Final = (
+    ("evidence", q(f"DELETE FROM result_evidence WHERE llm_result_id IN ({_RESULTS_OF_SET})")),  # noqa: S608
+    ("instances", q(f"DELETE FROM det_results WHERE llm_result_id IN ({_RESULTS_OF_SET})")),  # noqa: S608
+    ("critic_notes", q(f"DELETE FROM critic_notes WHERE attempt_id IN ({_ATTEMPTS_OF_SET})")),  # noqa: S608
+    ("results", q(f"DELETE FROM llm_results WHERE target_id = ANY({_SET})")),  # noqa: S608
+    ("drafts", q(f"DELETE FROM score_drafts WHERE attempt_id IN ({_ATTEMPTS_OF_SET})")),  # noqa: S608
+    (
+        "item_calls",
+        q(
+            "DELETE FROM llm_calls WHERE id IN "  # noqa: S608
+            f"(SELECT llm_call_id FROM batch_items WHERE target_id = ANY({_SET}))"
+        ),
+    ),
+    ("items", q(f"DELETE FROM batch_items WHERE target_id = ANY({_SET})")),  # noqa: S608
+    ("calls", q(f"DELETE FROM llm_calls WHERE attempt_id IN ({_ATTEMPTS_OF_SET})")),  # noqa: S608
+    ("attempts", q(f"DELETE FROM score_attempts WHERE target_id = ANY({_SET})")),  # noqa: S608
+    ("targets", q(f"DELETE FROM score_targets WHERE id = ANY({_SET})")),  # noqa: S608
+)
+
+
+async def delete_target_set(conn: AsyncConnection, target_ids: Sequence[int], *, now: datetime) -> int:
+    """Delete the targets `target_ids` (at most `TARGET_SET_CHUNK`) and every row they own, in the caller's
+    transaction (module docstring); how many targets it deleted. `ValueError` for a larger set."""
+    ids = sorted(set(target_ids))
+    if len(ids) > TARGET_SET_CHUNK:
+        raise ValueError(f"a target-set deletion takes at most {TARGET_SET_CHUNK} targets, not {len(ids)}")
+    if not ids:
+        return 0
+    await bulk.lock_for_targets(conn, ids)  # step 7, before the first target row (P52)
+    await conn.execute(_LOCK_SET, {"ids": ids})  # step 10, in id order, before the attempts (T16-c)
+    cancelled = await cancel_targets(conn, target_ids=ids, reason=PURGED, now=now)  # 1
+    await conn.execute(_UNRESUME, {"ids": ids})  # 2
+    counts: dict[str, int] = {}
+    for name, statement in _SET_DELETES:  # 3 to 9, in order
+        counts[name] = (await conn.execute(statement, {"ids": ids})).rowcount
+    log.info(
+        "score_targets_deleted",
+        cancelled=cancelled.targets,
+        **counts,
+        target_ids=ids[:LOGGED_IDS],
+    )
+    return counts["targets"]
 
 
 # ---- the tuple activation (§12.6 (d)-(f) and (h), §13.3) --------------------------------------------------

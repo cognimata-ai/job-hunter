@@ -172,6 +172,17 @@ reconciliation keeps listing a released submission for 29 days.
 submissions, by `bulk.QUARANTINED_USD_SQL` (`/api/system/spend`'s `quarantined_batch_usd`, and the context of
 `fail`'s `llm.cap_reached`).
 
+**The unresolved submissions** (Task 23, Codex r4 B11, r5 B9): `UNRESOLVED_SUBMISSION_SQL` is the one
+predicate of "a submission still needs target `t`'s items": an item of `t` belongs to a submission in flight
+(`IN_FLIGHT`), or to a `released` one the ambiguous reconciliation still lists, `submit_started_at` within
+`RELEASED_LISTED_FOR` (29 days, L3984, Deviation 27: one clock, `submit_started_at`, the reconciler's, which
+`batch_adoption` binds). Its items and their calls are the item-to-ledger mapping a release and a
+reconciliation join through (`_ITEMS`, `spend_ledger.settle`), so the score-history retention keeps such a
+target while it holds and deletes it in the pass after the submission is resolved; no timeout releases
+anything (C3). It is an SQL predicate correlated to the outer alias `t` of `score_targets` and binds
+`:listed_since`, the caller's `now` less `RELEASED_LISTED_FOR` (Ruling P14: the caller's clock, not the
+database's).
+
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
 
@@ -232,6 +243,15 @@ from jobhunter.worker.tasks import Deferrer
 
 # The submissions of a tuple that are not terminal (§7.16.6): `bulk.BATCH_IN_FLIGHT`, defined once in `llm`.
 IN_FLIGHT: Final = bulk.BATCH_IN_FLIGHT
+# L3984: how long after its submit-start the ambiguous reconciliation lists a `released` submission (the
+# results' retention); `batch_adoption.RELEASED_LISTED_FOR` is this one.
+RELEASED_LISTED_FOR: Final = timedelta(days=29)
+# Task 23 (module docstring): a submission still needs target `t`'s items; binds `:listed_since`.
+UNRESOLVED_SUBMISSION_SQL: Final = (
+    "EXISTS (SELECT 1 FROM batch_items i JOIN batch_submissions s ON s.id = i.submission_id "  # noqa: S608
+    f"WHERE i.target_id = t.id AND (s.state IN ({', '.join(repr(state) for state in IN_FLIGHT)}) "
+    "OR (s.state = 'released' AND s.submit_started_at > :listed_since)))"
+)
 KIND: Final = "batch_submit"
 # Deviation 27, A2 B14: the rendered requests of one submission, below the provider's 256 MB.
 BATCH_MAX_BYTES: Final = 200 * 1024 * 1024
