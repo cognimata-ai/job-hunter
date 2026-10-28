@@ -5,6 +5,7 @@ triggers, the guard that opens the migration and NOT NULL on the two `active_con
 
 import asyncio
 import importlib
+import re
 import uuid
 from decimal import Decimal
 
@@ -507,15 +508,32 @@ async def test_a_delete_finds_the_referencing_rows_by_index(
     engine, table: str, column: str, index: str
 ) -> None:
     """The lookup a foreign key's action runs on the referencing side (`<column> = $1`, a generic plan, as a
-    referential trigger prepares it) uses the index; the names are constants of this module."""
+    referential trigger prepares it) has an index that leads with `column` (the named one, checked in the
+    catalog), and the generic plan is an index search on `column`. Which index the planner picks is not
+    asserted: on these near-empty test tables the costs tie, and rows left by other tests can tip the choice
+    to a composite index (e.g. `golden_cases (job_revision_id, profile_version_id)`). The names are constants
+    of this module."""
     async with engine.connect() as c:
         await c.execute(sa.text("SET LOCAL plan_cache_mode = force_generic_plan"))
-        await c.execute(sa.text("SET LOCAL enable_seqscan = off"))  # the tables are empty: no cost choice
+        await c.execute(sa.text("SET LOCAL enable_seqscan = off"))
         await c.execute(sa.text(f"PREPARE lookup (bigint) AS SELECT 1 FROM {table} WHERE {column} = $1"))  # noqa: S608
         plan = "\n".join((await c.execute(sa.text("EXPLAIN EXECUTE lookup (1)"))).scalars())
         await c.execute(sa.text("DEALLOCATE lookup"))
+        used = re.findall(r"(?:Index (?:Only )?Scan using|Bitmap Index Scan on) (\S+)", plan)
+        rows = (
+            await c.execute(
+                sa.text(
+                    "SELECT i.relname, a.attname FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid "
+                    "JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = x.indkey[0] "
+                    "WHERE x.indrelid = CAST(:t AS regclass)"
+                ),
+                {"t": table},
+            )
+        ).all()
         await c.rollback()
-    assert index in plan, plan
+    leading = {str(name): str(first) for name, first in rows}
+    assert leading.get(index) == column, leading
+    assert used and f"({column} = $1)" in plan, plan
 
 
 async def test_the_synthetic_job_index(engine) -> None:
