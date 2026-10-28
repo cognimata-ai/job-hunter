@@ -11,7 +11,7 @@ Every datum is generated; no real person's data is used.
 from typing import get_args
 from unittest.mock import patch
 
-from hypothesis import assume, given, settings
+from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 from jobhunter.profile import contacts
 from jobhunter.profile.contacts import (
@@ -200,9 +200,19 @@ def table_rows(draw: st.DrawFn) -> list[tuple[str, str, str]]:
 
 tables = table_rows().map(lambda rows: "\n".join(f"{label}{gap}{value}" for label, gap, value in rows))
 
+# Found by `test_stripping_twice_changes_nothing`: the claims run the first line past 1000 characters before
+# its title word, and the header-name rule read a line in pieces of 1000 (the first pass's first piece was all
+# claims; a second pass, which reads short tokens, saw the title and took the name below it).
+LONG_CLAIMED_TITLE_LINE = (
+    "https://example.org/a\u2013geb.a@b.de: ReligionMustermannGeburtsdatum-Ort:"
+    + "Religion: " * 100
+    + "Technischer Leiter\nPeter Leiter\n"
+)
+
 
 @settings(max_examples=2000, deadline=None)
 @given(st.one_of(documents, anything, tables))
+@example(LONG_CLAIMED_TITLE_LINE)
 def test_stripping_twice_changes_nothing(text: str) -> None:
     once = strip_contacts(text)
     twice = strip_contacts(once.stripped_text)
@@ -223,6 +233,7 @@ def test_a_table_with_every_cell_on_its_own_line_is_stripped_row_by_row(
 
 @settings(max_examples=2000, deadline=None)
 @given(st.one_of(documents, anything, tables))
+@example(LONG_CLAIMED_TITLE_LINE)
 def test_three_rounds_are_enough_for_one_pass_to_reach_the_fixed_point(text: str) -> None:
     """`_MAX_ROUNDS` is 6; the chains of claims that expose one another are at most three links long."""
     with patch.object(contacts, "_MAX_ROUNDS", 3):
