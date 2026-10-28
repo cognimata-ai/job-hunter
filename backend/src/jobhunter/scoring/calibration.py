@@ -65,7 +65,7 @@ from typing import Final, Literal
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
-from jobhunter.settings.validate import GateState
+from jobhunter.settings.validate import GATE_MIN_CASES, GateState  # one threshold for both gate reads
 from jobhunter.types import JSONValue
 
 Label = Literal["good", "ok", "poor"]
@@ -75,7 +75,6 @@ ORDINAL: Final[Mapping[str, int]] = MappingProxyType({"good": 2, "ok": 1, "poor"
 PUBLISHED: Final[frozenset[str]] = frozenset({"accepted", "contested"})
 SCHEMA_VALID: Final[frozenset[str]] = frozenset({"accepted", "contested", "refused", "filtered_out"})
 
-GATE_MIN_CASES: Final = 30  # L4631: before 30 cases the gate is uncalibrated
 RHO_MIN: Final = Decimal("0.6")
 PAIRWISE_MIN: Final = Decimal("0.75")
 CONTESTED_MAX: Final = Decimal("0.15")
