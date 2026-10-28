@@ -37,14 +37,18 @@ _PROFILE_HAS_VECTORS: Final = q(
     "SELECT u.profile_version_id FROM llm_tuples u WHERE u.id = :tuple "
     "AND EXISTS (SELECT 1 FROM profile_vectors v WHERE v.profile_version_id = u.profile_version_id)"
 )
+# The candidates are locked in a materialised CTE, evaluated once: inside `t.id IN (…)` the planner may
+# rescan a `LIMIT … FOR UPDATE SKIP LOCKED` subquery for each target row, and each rescan skips the rows the
+# statement has set already and takes the next ones, so more than `limit` rows would be set.
 _FILL: Final = q(
-    "UPDATE score_targets t SET similarity = "  # noqa: S608 (the module's constant)
-    + SIMILARITY_SQL.format(profile=":profile", revision="t.job_revision_id")
-    + ", updated_at = :now WHERE t.id IN (SELECT s.id FROM score_targets s "
+    "WITH picked AS MATERIALIZED (SELECT s.id FROM score_targets s "  # noqa: S608 (the module's constant)
     "JOIN job_revisions r ON r.id = s.job_revision_id WHERE s.llm_tuple_id = :tuple AND s.similarity IS NULL "
     "AND r.embedding_id IS NOT NULL "
     "AND s.state NOT IN ('published_accepted', 'published_contested', 'cancelled') "
-    "ORDER BY s.id LIMIT :limit FOR UPDATE OF s SKIP LOCKED) RETURNING t.id"
+    "ORDER BY s.id LIMIT :limit FOR UPDATE OF s SKIP LOCKED) "
+    "UPDATE score_targets t SET similarity = "
+    + SIMILARITY_SQL.format(profile=":profile", revision="t.job_revision_id")
+    + ", updated_at = :now FROM picked WHERE t.id = picked.id RETURNING t.id"
 )
 
 

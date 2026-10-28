@@ -405,6 +405,30 @@ async def test_a_profile_without_vectors_gives_no_similarity(engine: AsyncEngine
         )
 
 
+async def test_fill_missing_similarity_sets_at_most_limit_whatever_the_plan(
+    engine: AsyncEngine, tuple_id: int, scope: int
+) -> None:
+    """`limit` bounds the rows set even when the planner rescans the candidates per row: a nested-loop semi
+    join over a `LIMIT … FOR UPDATE SKIP LOCKED` subquery skips the rows the statement has set already and
+    takes the next ones on each rescan (hash joins, merge joins, materialisation, hash aggregation and sorting
+    off force that plan: the target table outside, the subquery rescanned for each of its rows)."""
+    jobs = [await a_job(engine) for _ in range(3)]
+    async with engine.begin() as conn:
+        profile = await profile_of_tuple(conn, tuple_id)
+        await profile_vector_at(conn, profile, "summary", (1023, 1.0))
+        for job in jobs:
+            await filter_result(conn, job, scope, passed=True)
+    made = [await create(engine, job, tuple_id) for job in jobs]
+    assert all(isinstance(m, Created) for m in made)
+    async with engine.begin() as conn:
+        for n, job in enumerate(jobs):
+            await embed_revision(conn, job.revision_id, await embedding_at(conn, f"plan{n}", (1023, 1.0)))
+    async with engine.begin() as conn:
+        for setting in ("hashjoin", "mergejoin", "material", "hashagg", "sort"):
+            await conn.execute(sa.text(f"SET LOCAL enable_{setting} = off"))
+        assert await similarity.fill_missing_similarity(conn, llm_tuple_id=tuple_id, now=NOW, limit=1) == 1
+
+
 async def test_fill_missing_similarity_sets_it_once_the_embedding_exists(
     engine: AsyncEngine, tuple_id: int, scope: int
 ) -> None:
