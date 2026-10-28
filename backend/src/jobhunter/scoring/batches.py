@@ -1,11 +1,11 @@
-"""The score lane's batch submissions (spec §10.10, §7.12, §6.9.3, §12.6 (e); plan Tasks 14 and 16, Rulings
-P14, P16, P52, T7-c, T7-d, T16-a, T16-c, T16-d, T16-e, Codex r1 #18, #22-#25, r2 B7-B15, r3 B1-B3, r4 B1, B8,
-B9, r5 B1, A1 issue 17,
-A2 B10, B13, B14, Deviations 12, 13, 27 and 38): Task 14 records the cancellation a tuple supersession asks
-for; Task 16 adds the submission lifecycle up to the provider's answer (Task 17 polls, decides the items,
-adopts an ambiguous submission and releases a quarantined one). This module is the submission state machine;
-its worker side (the `batch_submit` handler, the takeover sweep and the tick reconciler) is
-`scoring.batch_operations` (Ruling T16-e).
+"""The score lane's batch submissions (spec §10.10, §7.12, §6.9.3, §6.9.4, §12.6 (e); plan Tasks 14, 16 and
+17, Rulings P14, P16, P31, P52, T7-b, T7-c, T7-d, T16-a, T16-c, T16-d, T16-e, Carry T16-h, Codex r1 #18,
+#22-#25, r2 B7-B15, r3 B1-B3, r4 B1, B8, B9, r5 B1, A1 issue 17, A2 B10, B13, B14, Deviations 12, 13, 27 and
+38): Task 14 records the cancellation a tuple supersession asks for; Task 16 adds the submission lifecycle up
+to the provider's answer; Task 17 the user's release of a quarantined submission and the quarantined spend.
+This module is the submission state machine; its worker side (the `batch_submit` handler, the takeover sweep,
+the tick reconciler, the poll, the completion and the ambiguous-submit reconciliation) is
+`scoring.batch_operations`, and the decision of one item `scoring.batch_items` (Ruling T16-e).
 
 **The cancellation** (Task 14). `request_cancel(conn, *, llm_tuple_id, now) -> RequestedCancel`, in the
 caller's transaction (the tuple activation's, which holds `active_config FOR UPDATE` and has already taken the
@@ -14,12 +14,12 @@ month and bulk rows, so no batch-lane transaction runs meanwhile):
    `submit_started`, `submit_ambiguous`, `submitted`, `ended`; Codex r1 #24), whatever its phase; a request
    recorded earlier keeps its time. This record is the request: the worker calls `messages.batches.cancel`
    after the commit, as soon as a provider id is known (`record_created` below for one created during the
-   request, `batch_poll` for a `submitted` one still in progress, Task 17). A submission's state does not
-   change here;
+   request, `batch_poll` for a `submitted` one still in progress: `batch_operations.cancel_requested`). A
+   submission's state does not change here;
 2. in the same transaction, their `in_batch` targets → `cancelled('tuple_superseded')` with
    `batch_submission_id` cleared, their running attempts ended `cancelled`, each target's follow-up hold
    released (`targets.cancel_batched`: the bulk rows first, Ruling P52). An item that arrives later for such a
-   target is fenced (`ignored_fenced`, Task 17).
+   target is fenced (`ignored_fenced`, `scoring.batch_items`).
 
 **Eligibility** (`ELIGIBLE_SQL`, L3939, A2 §5.4): one static predicate over `score_targets t` binding `:b`
 (the bulk operation) and `:policy` (the active evaluation policy): a `pending` target of the operation whose
@@ -93,7 +93,7 @@ gateway's injected `sleep`; the owner predicate makes each try the same recordin
 out stays `submit_started`, the recovery's:
 - `record_created`: `submit_started → submitted` with `provider_batch_id` and `expires_at = created_at + 24
   h` (L3954); whether a cancel was requested meanwhile (the worker then calls `messages.batches.cancel` after
-  the commit; `batch_poll` retries it, Task 17);
+  the commit, `batch_operations.cancel_requested`; `batch_poll` sends it again while the batch runs);
 - `record_rejected`: `submit_started → submit_rejected`; every item's entry settled `not_billed` on the
   rejection's evidence (`batch_submit_rejected`, the call `error` with that code and the rejection's status;
   `connect_failed_before_send` for a create never sent, the call `connect_failed` without a status, Ruling
@@ -106,9 +106,8 @@ out stays `submit_started`, the recovery's:
   T7-d,
   Deviation 13): a request the provider always rejects exhausts its targets instead of resubmitting forever;
 - `record_ambiguous`: `submit_started → submit_ambiguous` with `reconcile_report = {"error_class": …}`;
-  nothing else moves (L3956): the targets stay `in_batch`, the spend reserved and counted. The release of a
-  quarantined submission, and with it the ambiguous entries' cost on their attempts (Carry T7-b, as the
-  ledger reconciler's `_mark_ambiguous` adds it), is Task 17's.
+  nothing else moves (L3956): the targets stay `in_batch`, the spend reserved and counted, until the
+  ambiguous reconciliation adopts its batch or the user releases it (below).
 
 **Abandon** (`abandon`, step 4d), in the recording shape under `state = 'preparing'` (no operation lock: its
 callers are the recovery of a lost execution and `submit_start`, which holds it): `preparing → abandoned`;
@@ -122,13 +121,13 @@ credited); the items' holds released; the submission's `in_batch` targets → `p
 that prepared it in the current worker epoch or later (`NOT EXISTS ... o.status = 'running' AND o.claim_id =
 s.operation_claim_id AND o.worker_epoch >= :epoch`), locked `FOR UPDATE`: a `preparing` one is abandoned, a
 `submit_started` one becomes `submit_ambiguous` with `{"error_class": "execution_lost"}` and is **never
-resent**, whether the execution died before or after the HTTP send (the ambiguous reconciler of Task 17 finds
-the batch if it was created, or the user releases it). The caller holds `fence_epoch` and `active_config FOR
-SHARE` first. It runs in the takeover sweep `batch_submissions`, in the `batch_submit` handler's first
-transaction (its own operation's rows), and in the tick reconciler `batch_submissions`, all three
-`scoring.batch_operations`'; `any_lost` is the reconciler's lock-free probe. An operation's failure hook
-cannot do it (the hook runs after the operation row, and `active_config` comes first), so a row left by an
-operation that ended `failed` waits for the next tick.
+resent**, whether the execution died before or after the HTTP send (the ambiguous reconciliation,
+`batch_operations.reconcile_ambiguous`, finds the batch if it was created, or the user releases it). The
+caller holds `fence_epoch` and `active_config FOR SHARE` first. It runs in the takeover sweep
+`batch_submissions`, in the `batch_submit` handler's first transaction (its own operation's rows), and in the
+tick reconciler `batch_submissions`, all three `scoring.batch_operations`'; `any_lost` is the reconciler's
+lock-free probe. An operation's failure hook cannot do it (the hook runs after the operation row, and
+`active_config` comes first), so a row left by an operation that ended `failed` waits for the next tick.
 
 **The follow-on** (`follow_on`, L3945, Codex r2 B15, A2 B13): keyed by the originating submission, once, when
 it ends `submit_rejected`, `abandoned` or `reconciled` unreleased, or at the release of a `released` one
@@ -149,7 +148,28 @@ its schema check is the prepare's, the reconciler knowing no transport), no subm
 (`create_targets_for_tuple`) is not live (`bulk.creation_live`: the first batch is the creation's to request,
 once every chunk is done), and at least `batch_min_targets` of its targets are eligible, it records
 `{"bulk_operation_id", "llm_tuple_id"}` under the dedup key `batch_submit:<bulk>:resume` (`create_operation`:
-one live request at most). The prepare re-checks every gate.
+one live request at most). The prepare re-checks every gate. Carry T16-h: before the request, the step runs
+the tuple's exhaustion sweep (`targets.exhaustion_sweep`, its bulk rows before its target rows, P52), which a
+not-sent rejection's missing follow-on would otherwise leave to the next cycle; when it ended the operation's
+last open targets, `bulk.complete_if_done` completes the operation in the same pass and nothing is requested;
+`ranking.bump` last when it moved any.
+
+**The release** (`release`, L3991-3997, Codex r2 B7, B13, B15), the user's "release and re-score" of a
+`submit_ambiguous` submission, in the route's transaction (Task 21: `active_config FOR SHARE` and the
+idempotency row held), in the schedule's order: the submission `FOR UPDATE` under `state =
+'submit_ambiguous'` (else `TransitionConflict`) → `released` (`released_at`, outside the `batch_one_in_flight`
+singleton from now on); every item's entry `dispatched → ambiguous` (`settle(outcome="ambiguous")`, the call
+`ambiguous` with `batch_released`), counted at its reservation, which `settle` also adds to the attempt's
+`cost_usd` (Carry T7-b, as the ledger reconciler's `_mark_ambiguous` does); the bulk row and each item's hold
+released once (`bulk.release_item_hold`); the submission's `in_batch` targets → `pending` under the batch pin
+(a cancelled one untouched; their bulk rows first, P52) before the attempts still `running` → `released` (a
+superseded one keeps `cancelled`; T16-c's order); `batch.submit_ambiguous_unresolved` resolved; the follow-on
+(it fires for a release, and never again when the submission is adopted later); `ranking.bump` last. The
+reconciliation keeps listing a released submission for 29 days.
+
+**The quarantined spend** (`quarantined_usd`, S:L1199, Ruling P31): Σ `reserved_usd` of the `submit_ambiguous`
+submissions, by `bulk.QUARANTINED_USD_SQL` (`/api/system/spend`'s `quarantined_batch_usd`, and the context of
+`fail`'s `llm.cap_reached`).
 
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
@@ -170,7 +190,7 @@ from jobhunter.db import ranking
 from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import is_unique_violation, q
 from jobhunter.db.transitions import transition, transition_where
-from jobhunter.errors import FencedOut
+from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, bulk, spend_ledger
 from jobhunter.llm.batches import (
@@ -194,6 +214,7 @@ from jobhunter.llm.pricing import worst_case_usd
 from jobhunter.llm.prompts.render import PromptVersion, load_prompt_version, score_schema
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import BatchItemReservation, BatchSubmissionOwner, CallOutcome, Reservation
+from jobhunter.observability.alerts import resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import cycles, steps, targets
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS
@@ -221,6 +242,9 @@ BEFORE_SUBMIT_START: Final = "batch.before_submit_start"
 # The codes this module records.
 EXECUTION_LOST: Final = "execution_lost"
 ABANDONED_DETAIL: Final = "batch_abandoned"
+RELEASED_CODE: Final = "batch_released"  # the call's code of an entry the release made ambiguous
+# The critical alert of a quarantine 25 h old (L3988), resolved by the release (subject: the submission id).
+UNRESOLVED_ALERT: Final = "batch.submit_ambiguous_unresolved"
 _ONLINE_RETRY_REASONS: Final = (
     "batch_max_tokens",
     "batch_invalid_output",
@@ -320,6 +344,10 @@ _LOCK_STARTED: Final = q(
     "SELECT llm_tuple_id, bulk_operation_id, cancel_requested_at FROM batch_submissions "
     "WHERE id = :s AND state = 'submit_started' AND operation_claim_id = :claim FOR UPDATE"
 )
+_LOCK_RELEASABLE: Final = q(
+    "SELECT reserved_usd FROM batch_submissions WHERE id = :s AND state = 'submit_ambiguous' FOR UPDATE"
+)
+_QUARANTINED: Final = q(bulk.QUARANTINED_USD_SQL)
 _LOCK_IN_STATE: Final = q(
     "SELECT bulk_operation_id FROM batch_submissions WHERE id = :s AND state = :state FOR UPDATE"
 )
@@ -1159,16 +1187,40 @@ async def follow_on(
 @bulk.register_active_step
 async def rerequest(conn: AsyncConnection, bulk_operation_id: int, ctx: ReconcileContext) -> bool:
     """Ruling T16-d (module docstring): the batch of the `active` bulk operation requested again, in the
-    `bulk_operations` reconciler's transaction (`fence_epoch` and `active_config FOR SHARE` held); whether a
-    request was recorded now."""
+    `bulk_operations` reconciler's transaction (`fence_epoch` and `active_config FOR SHARE` held), after the
+    exhaustion sweep of its tuple (Carry T16-h); whether it repaired something (a target ended, the operation
+    completed, or a request recorded)."""
     row = (await conn.execute(_BULK_OF, {"b": bulk_operation_id})).first()
     if row is None or row.state != "active":
         return False
-    scoring = (await active_settings(conn)).scoring
-    if not scoring.batch_bulk_rescore:
-        return False
     config = await cycles.scoring_config(conn)
     if config.active.llm_tuple_id != row.llm_tuple_id:
+        return False
+    llm_tuple_id = int(row.llm_tuple_id)
+    # Carry T16-h: the targets a rejection's charge used up end here, as the follow-on's handler would sweep
+    # them (a not-sent rejection requests none, Ruling T16-f), so their operation can complete in this pass
+    exhausted = await targets.exhaustion_sweep(conn, llm_tuple_id=llm_tuple_id)
+    if exhausted and await bulk.complete_if_done(conn, bulk_operation_id, now=ctx.now):
+        requested = False
+    else:
+        requested = await _request_again(conn, bulk_operation_id, llm_tuple_id, config, ctx)
+    if exhausted:
+        await ranking.bump(conn)  # step 11, last
+    return requested or exhausted > 0
+
+
+async def _request_again(
+    conn: AsyncConnection,
+    bulk_operation_id: int,
+    llm_tuple_id: int,
+    config: cycles.ScoringConfig,
+    ctx: ReconcileContext,
+) -> bool:
+    """`rerequest`'s request (module docstring): none when batches are disabled, the lane is paused, a
+    submission is in flight, a `batch_submit` or the target creation is live, or too few targets are
+    eligible."""
+    scoring = (await active_settings(conn)).scoring
+    if not scoring.batch_bulk_rescore:
         return False
     # the schema check is the prepare's (`fake_llm` is the transport's, which the reconciler does not know)
     if await cycles.pause_reason(conn, fake_llm=True, now=ctx.now, config=config) is not None:
@@ -1186,7 +1238,6 @@ async def rerequest(conn: AsyncConnection, bulk_operation_id: int, ctx: Reconcil
     }
     if int((await conn.execute(_ELIGIBLE_COUNT, params)).scalar_one()) < scoring.batch_min_targets:
         return False
-    llm_tuple_id = int(row.llm_tuple_id)
     operation_id, created = await create_operation(
         conn,
         kind=KIND,
@@ -1197,6 +1248,60 @@ async def rerequest(conn: AsyncConnection, bulk_operation_id: int, ctx: Reconcil
     if created:
         log.info("batch_rerequested", bulk_operation_id=bulk_operation_id, operation_id=operation_id)
     return created
+
+
+# ---- the release of a quarantined submission (§10.10 recovery step 7) --------------------------------------
+
+
+@dataclass(frozen=True)
+class Released:
+    """A quarantined submission released: the reservation its entries keep counted as `ambiguous`."""
+
+    reserved_usd: Decimal
+
+
+async def release(
+    conn: AsyncConnection, submission_id: int, *, now: datetime, defer: Deferrer | None
+) -> Released:
+    """The user's release of a `submit_ambiguous` submission (module docstring), in the caller's transaction,
+    which holds `active_config FOR SHARE` and its idempotency row (the route's, Task 21);
+    `TransitionConflict` for a submission in another state."""
+    locked = (await conn.execute(_LOCK_RELEASABLE, {"s": submission_id})).first()  # the owner
+    if locked is None:
+        raise TransitionConflict(_SUBMISSIONS, submission_id, "released")
+    await transition(conn, _SUBMISSIONS, submission_id, ["submit_ambiguous"], "released")
+    items = await _items(conn, submission_id)
+    call = CallOutcome("ambiguous", error_code=RELEASED_CODE)
+    for item in items:  # the month row, the bulk row of each funded entry, the ledger entries
+        await spend_ledger.settle(
+            conn, item.reservation, outcome="ambiguous", evidence=None, usage=None, call=call, now=now
+        )
+    for item in items:  # the bulk row, then each item
+        await bulk.release_item_hold(conn, item_id=item.id)
+    moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
+    ended = await _end_attempts(conn, items, "released", None)
+    resolved = await resolve_alert(conn, code=UNRESOLVED_ALERT, subject=str(submission_id))
+    requested = await follow_on(conn, submission_id=submission_id, defer=defer)
+    await ranking.bump(conn)  # step 11, last
+    reserved = Decimal(locked.reserved_usd)
+    log.warning(
+        "batch_released",
+        submission_id=submission_id,
+        items=len(items),
+        attempts=ended,
+        targets=moved,
+        reserved_usd=str(reserved),
+        alert_resolved=resolved,
+        follow_on=requested,
+        at=now.isoformat(),
+    )
+    return Released(reserved)
+
+
+async def quarantined_usd(conn: AsyncConnection) -> Decimal:
+    """The reserved spend of the `submit_ambiguous` submissions (S:L1199), by `bulk.QUARANTINED_USD_SQL`,
+    the one statement `fail`'s `llm.cap_reached` context uses too; read without a lock."""
+    return Decimal((await conn.execute(_QUARANTINED)).scalar_one())
 
 
 async def any_lost(conn: AsyncConnection, *, epoch: int) -> bool:

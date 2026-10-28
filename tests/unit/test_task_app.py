@@ -28,7 +28,28 @@ def test_reset_task_app_allows_a_fresh_task_app() -> None:
                 "reconcile_heavy",
                 "retention_daily",
                 "score_cycle",  # M3 Task 11
+                "batch_poll",  # M3 Task 17
+                "batch_reconcile_ambiguous",  # M3 Task 17
             )
         )
+    finally:
+        _reset_task_app()
+
+
+def test_the_batch_tasks_are_periodic_on_aux_with_their_queueing_locks() -> None:
+    """M3 Task 17 (A2 B16, Deviation 27): `batch_poll` every 5 minutes and `batch_reconcile_ambiguous` every
+    15, both on `aux`, each with the queueing lock of its name (one waiting job each)."""
+    _reset_task_app()
+    try:
+        periodic = make_queue_app(_DSN).periodic_registry.periodic_tasks
+        found = {
+            name: (task.cron, task.task.queue, task.task.queueing_lock)
+            for (name, _), task in periodic.items()
+            if name in (job_task_name("batch_poll"), job_task_name("batch_reconcile_ambiguous"))
+        }
+        assert found == {
+            job_task_name("batch_poll"): ("*/5 * * * *", "aux", "batch_poll"),
+            job_task_name("batch_reconcile_ambiguous"): ("*/15 * * * *", "aux", "batch_reconcile_ambiguous"),
+        }
     finally:
         _reset_task_app()

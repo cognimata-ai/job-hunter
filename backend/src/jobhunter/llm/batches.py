@@ -39,12 +39,14 @@ The methods:
   validated (`MessageBatchIndividualResponse.model_validate`: the SDK's decoder constructs a line without
   checking it), and a line that is no JSON or no valid result ends the stream with `BatchApiError("results",
   status=None, error_class=<the error's class>)` (the error's message quotes the line, which may hold model
-  output); its `complete` is true only once the iteration ended without such an error
-  (the stream read to its end, §10.10 step 7);
+  output; its `unreadable` is true, Carry T16-g); its `complete` is true only once the iteration ended
+  without such an error (the stream read to its end, §10.10 step 7);
 - `list_all() -> AsyncIterator[BatchSummary]`: every batch of the workspace, newest first, paginated by hand
   with `limit=LIST_PAGE` (100) and `after_id` (the listing's `last_id`) while `has_more`.
-A failure of `retrieve`, `results`, `cancel` or `list_all` is `BatchApiError(operation, status,
-error_class)`: the status and the class only, never the provider's message (which may quote a request). Every
+A failure of `retrieve`, `results`, `cancel` or `list_all` (any SDK error, `anthropic.AnthropicError`: also
+the SDK's own refusal to open the results of a batch without a `results_url`, or a transport error) is
+`BatchApiError(operation, status, error_class)`: the status and the class only, never the provider's message
+(which may quote a request). Every
 `BatchApiError` is raised after its `except` block (the `graphs.sanitize` pattern), so neither `__cause__`
 nor `__context__` reaches the original error.
 
@@ -98,6 +100,9 @@ CONNECT_FAILED_BEFORE_SEND: Final = "connect_failed_before_send"
 
 ProcessingStatus = Literal["in_progress", "canceling", "ended"]
 ResultType = Literal["succeeded", "errored", "canceled", "expired"]
+# An item's result as its processing reads it: the provider's, or `missing` for an item without a line after a
+# complete stream (synthesised by the poll, never read from a stream; plan Task 17, Codex r2 B14).
+ItemResultType = ResultType | Literal["missing"]
 
 log = get_logger("jobhunter.llm.batches")
 
@@ -203,20 +208,24 @@ class ItemResult:
     provider error type of an errored one (`error.error.type`, Carry T8-b)."""
 
     custom_id: str
-    result_type: ResultType
+    result_type: ItemResultType
     message: Message | None = field(default=None, repr=False)
     error_type: str | None = None
 
 
 class BatchApiError(LLMError):
     """A batch API call other than the create failed: the operation, the HTTP status (`None` without a
-    response) and the error's class, never the provider's message."""
+    response), the error's class, never the provider's message, and whether a result line was unreadable (no
+    JSON, or no result the pinned SDK validates: a schema change, Carry T16-g) rather than the stream cut."""
 
-    def __init__(self, operation: str, *, status: int | None, error_class: str) -> None:
+    def __init__(
+        self, operation: str, *, status: int | None, error_class: str, unreadable: bool = False
+    ) -> None:
         super().__init__(f"batch {operation} failed: {error_class} (status {status})")
         self.operation = operation
         self.status = status
         self.error_class = error_class
+        self.unreadable = unreadable
 
 
 def _counts(batch: MessageBatch) -> RequestCounts:
@@ -239,7 +248,7 @@ def _status(batch: MessageBatch) -> BatchStatus:
     )
 
 
-def _failure(operation: str, exc: anthropic.APIError | httpx2.HTTPError) -> BatchApiError:
+def _failure(operation: str, exc: anthropic.AnthropicError | httpx2.HTTPError) -> BatchApiError:
     status = exc.status_code if isinstance(exc, anthropic.APIStatusError) else None
     return BatchApiError(operation, status=status, error_class=type(exc).__name__)
 
@@ -289,7 +298,7 @@ class ResultsStream:
                 checked = MessageBatchIndividualResponse.model_validate(line.to_dict(warnings=False))
                 self.read += 1
                 yield _item(checked)
-        except (anthropic.APIError, httpx2.HTTPError) as exc:
+        except (anthropic.AnthropicError, httpx2.HTTPError) as exc:
             failure = _failure("results", exc)
             log.warning(
                 "llm_batch_results_cut",
@@ -298,7 +307,7 @@ class ResultsStream:
                 error_class=failure.error_class,
             )
         except ValueError as exc:  # no JSON, or no valid result: the class only, the message quotes the line
-            failure = BatchApiError("results", status=None, error_class=type(exc).__name__)
+            failure = BatchApiError("results", status=None, error_class=type(exc).__name__, unreadable=True)
             log.warning(
                 "llm_batch_results_unreadable",
                 provider_batch_id=self._batch_id,
@@ -454,7 +463,7 @@ class BatchesClient:
         failure: BatchApiError | None = None
         try:
             batch = await self._sdk().messages.batches.retrieve(batch_id, timeout=TIMEOUT)
-        except (anthropic.APIError, httpx2.HTTPError) as exc:
+        except (anthropic.AnthropicError, httpx2.HTTPError) as exc:
             failure = _failure("retrieve", exc)
         if failure is not None:
             raise failure  # outside the handler (module docstring)
@@ -472,7 +481,7 @@ class BatchesClient:
         failure: BatchApiError | None = None
         try:
             batch = await self._sdk().messages.batches.cancel(batch_id, timeout=TIMEOUT)
-        except (anthropic.APIError, httpx2.HTTPError) as exc:
+        except (anthropic.AnthropicError, httpx2.HTTPError) as exc:
             failure = _failure("cancel", exc)
         if failure is not None:
             raise failure  # outside the handler (module docstring)
@@ -488,7 +497,7 @@ class BatchesClient:
         failure: BatchApiError | None = None
         try:
             decoder = await self._sdk().messages.batches.results(batch_id, timeout=TIMEOUT)
-        except (anthropic.APIError, httpx2.HTTPError) as exc:
+        except (anthropic.AnthropicError, httpx2.HTTPError) as exc:
             failure = _failure("results", exc)
         if failure is not None:
             raise failure  # outside the handler (module docstring)
@@ -506,7 +515,7 @@ class BatchesClient:
             failure: BatchApiError | None = None
             try:
                 page = await sdk.messages.batches.list(**kwargs)
-            except (anthropic.APIError, httpx2.HTTPError) as exc:
+            except (anthropic.AnthropicError, httpx2.HTTPError) as exc:
                 failure = _failure("list", exc)
             if failure is not None:
                 raise failure  # outside the handler (module docstring)

@@ -13,6 +13,7 @@ the `batch_submit` operation (`op_runner`). The targets are synthetic ads of the
 """
 
 import asyncio
+import re
 import uuid
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -98,6 +99,7 @@ from tests.support.scoring import (
 )
 
 pytestmark = pytest.mark.integration
+_INDEX_DEFINITION = sa.text("SELECT pg_get_indexdef(CAST('batch_one_in_flight' AS regclass))")
 Q = Decimal("0.000001")
 _LOCK_MONTH = sa.text("SELECT 1 FROM llm_budget WHERE month = :m FOR UPDATE")
 _LOCK_BULK = sa.text("SELECT 1 FROM bulk_operations WHERE id = :b FOR NO KEY UPDATE")
@@ -638,6 +640,17 @@ async def test_batch_one_in_flight_has_the_last_word(
     assert result == NotPrepared("in_flight")
     assert await batch_rows(engine) == (1, 0, 0, 0)
     assert await count_rows(engine, "score_targets", state="pending") == 3
+
+
+async def test_the_in_flight_states_are_the_singleton_index_predicate(engine: AsyncEngine) -> None:
+    """Carry T16-i: `bulk.BATCH_IN_FLIGHT` (which `scoring.batches.IN_FLIGHT` binds) is exactly the states of
+    the migrated `batch_one_in_flight` index (0008), whose predicate also leaves out released rows."""
+    async with engine.connect() as conn:
+        definition = str((await conn.execute(_INDEX_DEFINITION)).scalar_one())
+    states = re.findall(r"'(\w+)'::text", definition)
+    assert sorted(states) == sorted(bulk.BATCH_IN_FLIGHT) and len(states) == len(set(states))
+    assert "released_at IS NULL" in definition
+    assert batches_mod.IN_FLIGHT is bulk.BATCH_IN_FLIGHT
 
 
 async def test_an_insufficient_allocation_before_the_prepare_is_not_prepared(

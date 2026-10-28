@@ -65,6 +65,7 @@ _LEDGER_SUM = sa.text(
 _ATTEMPT_DETAILS = sa.text("SELECT DISTINCT outcome, outcome_detail FROM score_attempts WHERE mode = 'batch'")
 _CALL_ERRORS = sa.text("SELECT DISTINCT http_status, error_code FROM llm_calls WHERE transport = 'batch'")
 _RAISE = "DO $$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE = '{}'; END $$"
+_CHARGE_THREE = sa.text("UPDATE score_targets SET charged_attempts = 3 WHERE bulk_operation_id = :b")
 
 
 @pytest.fixture
@@ -543,3 +544,37 @@ async def test_a_deadlocked_recording_is_retried_within_its_bound(
     waits = op_runner.sleeps.waits
     assert len(waits) == len(tries) - 1
     assert all(2 ** (n - 1) * 0.5 <= w <= 2 ** (n - 1) * 0.5 + 1 for n, w in enumerate(waits, 1))
+
+
+async def test_a_not_sent_rejection_exhausting_the_last_targets_completes_the_operation_in_one_pass(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    current_epoch: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Carry T16-h: a not-sent rejection requests no follow-on (Ruling T16-f), whose handler would have run
+    the exhaustion sweep; when its charge used up the operation's last pending targets, the next
+    `bulk_operations` heavy pass sweeps them (`rerequest`, under its locks) and completes the operation in
+    that same pass, requesting no batch."""
+    async with engine.begin() as conn:  # every target in its fourth and last attempt
+        await conn.execute(_CHARGE_THREE, {"b": setup.bulk_operation_id})
+    fake_llm.batches(BatchScript(create="ok"))
+
+    async def create(self: BatchesClient, requests: object) -> Rejected:
+        return Rejected(429, "rate_limit_error", "")
+
+    monkeypatch.setattr(BatchesClient, "create", create)
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    (sub,) = await submission_rows(engine)
+    assert sub.state == "submit_rejected" and sub.follow_on_at is not None
+    assert await targets_by_state(engine, setup.llm_tuple_id) == {"pending": N}  # charged out, not swept
+    assert await charged_attempts(engine, setup.llm_tuple_id) == 4 * N
+    assert (await bulk_row(engine, setup.bulk_operation_id)).state == "active"
+    assert await reconcile(engine, current_epoch) == 1
+    assert await targets_by_state(engine, setup.llm_tuple_id) == {"failed_attempts_exhausted": N}
+    assert (await bulk_row(engine, setup.bulk_operation_id)).state == "completed"
+    assert await count_rows(engine, "operations", kind="batch_submit") == 1  # no batch requested
+    assert await reconcile(engine, current_epoch) == 0  # nothing left

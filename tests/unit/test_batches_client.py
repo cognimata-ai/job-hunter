@@ -426,6 +426,7 @@ async def test_a_cut_results_stream_is_never_complete(fake_llm: FakeLLM, client:
     assert cut.value.operation == "results" and cut.value.status is None
     assert cut.value.__cause__ is None and cut.value.__context__ is None  # raised outside the handler
     assert not stream.complete and len(read) <= 1
+    assert not cut.value.unreadable  # a cut, not a line the SDK cannot read (Carry T16-g)
 
 
 class ResultsLines(httpx2.AsyncBaseTransport):
@@ -474,3 +475,33 @@ async def test_an_unreadable_result_line_ends_the_stream_with_its_class_only(
     assert failure.error_class in ("JSONDecodeError", "ValidationError")
     assert "model output" not in str(failure)
     assert failure.__cause__ is None and failure.__context__ is None  # the line is unreachable from it
+    assert failure.unreadable  # Carry T16-g: the poll bounds a stream that stays unreadable
+
+
+@pytest.mark.parametrize("operation", ["cancel", "results", "list"])
+async def test_a_failed_cancel_results_or_listing_carries_no_provider_error(
+    fake_llm: FakeLLM, client: BatchesClient, operation: str
+) -> None:
+    """Carry T16-i: a `cancel` of no batch (404), a `results` of a batch that has not ended (the SDK refuses
+    to open it without a `results_url`) and a failing listing (500) are each a `BatchApiError` of the status
+    and the class only, raised outside its handler: neither `__cause__` nor `__context__` reaches the
+    provider's error, whose message may quote a request."""
+    fake_llm.batches(BatchScript(create="ok", polls_until_ended=5, listing="error_500"))
+    created = await client.create(requests("t1_a1"))
+    assert isinstance(created, Created)
+    with pytest.raises(BatchApiError) as failed:
+        if operation == "cancel":
+            await client.cancel("msgbatch_absent")
+        elif operation == "results":
+            await client.results(created.provider_batch_id)
+        else:
+            [summary async for summary in client.list_all()]
+    failure = failed.value
+    expected = {
+        "cancel": (404, "NotFoundError"),
+        "results": (None, "AnthropicError"),  # the SDK's own: no `results_url` before the batch ends
+        "list": (500, "InternalServerError"),
+    }
+    assert (failure.operation, failure.status, failure.error_class) == (operation, *expected[operation])
+    assert failure.__cause__ is None and failure.__context__ is None
+    assert "fake:" not in str(failure) and not failure.unreadable  # the provider's message never kept

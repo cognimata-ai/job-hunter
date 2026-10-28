@@ -56,7 +56,10 @@ it reserves the enlarged stage's worst case, and the logical call counts the tri
   `InvalidOutput("structural")`, the caller's one repair, and so is an output a string of which holds a NUL
   character or a lone surrogate (`storable`: no JSONB value can hold it, so the billed settlement, which
   writes `output_json`, would roll back); any other stop reason is `unexpected_stop_reason`,
-  `InvalidOutput("unexpected_stop_reason")` and the warn `llm.unexpected_stop_reason` (Deviation 6).
+  `InvalidOutput("unexpected_stop_reason")` and the warn `llm.unexpected_stop_reason` (Deviation 6). The
+  classification is the pure `classify`, and the alert `raise_classified_alert`; a batch item's `succeeded`
+  message is classified by the same function as a try of its first stage (`classify_message`, M3 Task 17,
+  Codex r1 #26: its text parsed as JSON, its usage the Messages API's).
 - An error response (4xx, 5xx) is `not_billed(error_response_no_content)`, its call `error` with
   `http_<status>`. 408, 409, 429, 5xx and 529 are retried after the `Retry-After` it asks for, else after the
   jittered 2 s / 8 s; any other status is `LLMRequestError(status)`. 401 and 403 raise the critical
@@ -124,7 +127,7 @@ import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
@@ -134,6 +137,7 @@ from typing import Any, Final, Literal, cast
 
 import anthropic
 import httpx2
+from anthropic.types import Message
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -628,6 +632,129 @@ class RenderedPrompt:
             system=tuple(block.text for block in self.system),
             messages=tuple(_message_text(m) for m in self.messages),
             schema_json=canonical_schema_json(schema.json),
+        )
+
+
+@dataclass(frozen=True)
+class Classified:
+    """A response that ended with its usage, classified (module docstring, "Each try's end"): its
+    `llm_calls.error_code` (`None` exactly when `parsed` holds the validated, storable output), the stop
+    reason and the served model as the provider sent them, the refusal category (`unspecified` when the
+    provider gave none; the call stores it for a refusal only, `refusal_category`), and the usage to bill."""
+
+    code: str | None
+    stop_reason: str
+    model_served: str
+    category: str
+    parsed: BaseModel | None = field(repr=False)
+    usage: Usage
+
+    @property
+    def refusal_category(self) -> str | None:
+        return self.category if self.code == REFUSED else None
+
+
+def classify(
+    *,
+    requested: str,
+    schema: WireSchema,
+    served: str,
+    stop_reason: str,
+    stop_details: object,
+    parsed: object,
+    parsing_failed: bool,
+    usage: Usage,
+    stage: Stage,
+) -> Classified:
+    """A completed response's `Classified`, in the gateway's order (module docstring): another served model
+    is `model_mismatch`; `max_tokens` is `max_tokens_first_stage` in the first stage and `max_tokens` in the
+    enlarged one; `refusal` is `refused`; `end_turn` is the output when it parsed (`parsing_failed` false),
+    fits the structural mirror and is storable, else `invalid_output`; any other stop reason is
+    `unexpected_stop_reason`. Pure: no I/O, and nothing of the output in an error."""
+    category = stop_details.get("category") if isinstance(stop_details, dict) else None
+    if not isinstance(category, str) or not category:
+        category = "unspecified"
+    output: BaseModel | None = None
+    code: str | None
+    if served != requested:
+        code = MODEL_MISMATCH
+    elif stop_reason == "max_tokens":
+        code = MAX_TOKENS_FIRST_STAGE if stage == "first" else MAX_TOKENS
+    elif stop_reason == "refusal":
+        code = REFUSED
+    elif stop_reason == "end_turn":
+        valid = None if parsing_failed else _structural(schema.model, parsed)
+        output = valid if valid is not None and storable(valid) else None
+        code = None if output is not None else INVALID_OUTPUT
+    else:
+        code = UNEXPECTED_STOP_REASON
+    return Classified(code, stop_reason, served, category, output, usage)
+
+
+def classify_message(*, node_model: Model, schema: WireSchema, message: Message) -> Classified:
+    """A batch item's `succeeded` message classified as an online try of its first stage is (`classify`;
+    plan Task 17, Codex r1 #26): its text blocks joined and parsed as JSON (`json.loads`: a text that is no
+    JSON is a parsing failure), its stop details, and its usage (the Messages API's `input_tokens` holds no
+    cache tokens). A message that names no stop reason is `unexpected_stop_reason` (`"none"`)."""
+    text = "".join(block.text for block in message.content if block.type == "text")
+    parsed: object = None
+    failed = False
+    try:
+        parsed = json.loads(text)
+    except ValueError:  # the error quotes the text: dropped here, never raised or kept
+        failed = True
+    usage = message.usage
+    details = message.stop_details
+    return classify(
+        requested=node_model,
+        schema=schema,
+        served=message.model,
+        stop_reason=message.stop_reason or "none",
+        stop_details=None if details is None else details.model_dump(mode="json"),
+        parsed=parsed,
+        parsing_failed=failed,
+        usage=Usage(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
+            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
+        ),
+        stage="first",
+    )
+
+
+async def raise_classified_alert(
+    conn: AsyncConnection, classified: Classified, *, purpose: Purpose, requested: str
+) -> None:
+    """The alert a classified response raises, in the caller's settlement transaction: the critical
+    `llm.model_mismatch` for another served model (G11, subject `model:<requested>`), the warn
+    `llm.unexpected_stop_reason` for an unexpected stop reason (Deviation 6); nothing otherwise. Provider
+    metadata is quoted as it is stored (`storable_text`)."""
+    if classified.code == MODEL_MISMATCH:
+        await raise_alert(
+            conn,
+            code=MODEL_MISMATCH_ALERT,
+            severity="critical",
+            subject=f"model:{requested}",
+            message="the provider served another model than requested; its output is not used",
+            context={
+                "purpose": purpose,
+                "requested": requested,
+                "served": storable_text(classified.model_served),
+            },
+        )
+    elif classified.code == UNEXPECTED_STOP_REASON:
+        await raise_alert(
+            conn,
+            code=UNEXPECTED_STOP_ALERT,
+            severity="warn",
+            subject=f"purpose:{purpose}",
+            message="an LLM call stopped for an unexpected reason",
+            context={
+                "purpose": purpose,
+                "model": requested,
+                "stop_reason": storable_text(classified.stop_reason),
+            },
         )
 
 
@@ -1168,28 +1295,18 @@ class LLMGateway:
         if not isinstance(served, str):
             return await self._lost(t, receipt)
         usage = usage_of(cast(Mapping[str, Any], raw.usage_metadata))
-        output: BaseModel | None = None  # the validated output, exactly when the try succeeded
-        details = meta.get("stop_details")  # present only when not null (V13)
-        category = details.get("category") if isinstance(details, dict) else None
-        if not isinstance(category, str) or not category:
-            category = "unspecified"
-        code: str | None
-        if served != t.node.model:
-            code = MODEL_MISMATCH
-        elif stop_reason == "max_tokens":
-            code = MAX_TOKENS_FIRST_STAGE if t.stage == "first" else MAX_TOKENS
-        elif stop_reason == "refusal":
-            code = REFUSED
-        elif stop_reason == "end_turn":
-            parsed = (
-                None
-                if out.get("parsing_error") is not None
-                else _structural(t.node.schema.model, out.get("parsed"))
-            )
-            output = parsed if parsed is not None and storable(parsed) else None
-            code = None if output is not None else INVALID_OUTPUT
-        else:
-            code = UNEXPECTED_STOP_REASON
+        classified = classify(
+            requested=t.node.model,
+            schema=t.node.schema,
+            served=served,
+            stop_reason=stop_reason,
+            stop_details=meta.get("stop_details"),  # present only when not null (V13)
+            parsed=out.get("parsed"),
+            parsing_failed=out.get("parsing_error") is not None,
+            usage=usage,
+            stage=t.stage,
+        )
+        code, output, category = classified.code, classified.parsed, classified.category
         call = CallOutcome(
             status="completed",
             model_served=served,
@@ -1206,32 +1323,7 @@ class LLMGateway:
                 conn, t.res, outcome="billed", evidence=None, usage=usage, call=call, now=self._clock()
             )
             await resolve_alert(conn, code=AUTH_FAILED_ALERT, subject=_AUTH_SUBJECT)  # the key works again
-            if code == MODEL_MISMATCH:
-                await raise_alert(
-                    conn,
-                    code=MODEL_MISMATCH_ALERT,
-                    severity="critical",
-                    subject=f"model:{t.node.model}",
-                    message="the provider served another model than requested; its output is not used",
-                    context={
-                        "purpose": t.node.purpose,
-                        "requested": t.node.model,
-                        "served": storable_text(served),
-                    },
-                )
-            elif code == UNEXPECTED_STOP_REASON:
-                await raise_alert(
-                    conn,
-                    code=UNEXPECTED_STOP_ALERT,
-                    severity="warn",
-                    subject=f"purpose:{t.node.purpose}",
-                    message="an LLM call stopped for an unexpected reason",
-                    context={
-                        "purpose": t.node.purpose,
-                        "model": t.node.model,
-                        "stop_reason": storable_text(stop_reason),
-                    },
-                )
+            await raise_classified_alert(conn, classified, purpose=t.node.purpose, requested=t.node.model)
         self._committed(t, receipt, "billed", figures, code)
         await self._observe_cache(t, storable_text(served), prefix, usage)
         if output is not None:

@@ -25,6 +25,16 @@ M3 Task 16 adds the submission lifecycle's side:
   tuple_id)`: the tuple's targets' charged attempts summed; `make_due(engine)`: every `pending` operation due
   now (a requeue's `not_before` cleared).
 
+M3 Task 17 adds the poll's and the adoption's side:
+- `submit_batch(engine, op_runner, fake_llm, n, *, followups=0, bodies=None, polls_until_ended=1)`: `n`
+  targets, each answered by `PUBLISHED_BODY` (the first `followups` by `FOLLOWUP_BODY`), and their batch
+  submitted on the fake, not yet ended (a test registers the items' outcomes afterwards, with
+  `polls_until_ended=0` for a single poll, Carry T8-e): `SubmittedBatch`;
+- `poll_once(engine, fake_llm)` and `reconcile_ambiguous_once(engine, fake_llm)`: one pass of each task body
+  on the fake, at the current epoch (1) unless given, with `defer_in_tx` (the test needs `queue_app`);
+- `submission_state`, `decisions`, `item_rows`, `entries_by_custom_id`, `targets_by_custom_id`,
+  `open_alert_codes` and `eligible_for_batching` read the outcome.
+
 Every value is synthetic: ids, counts and the synthetic draft bodies of `tests.support.llm`.
 """
 
@@ -35,36 +45,59 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Final
 
+import httpx2
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.llm import bulk, fake
+from jobhunter.llm.batches import BatchesClient
 from jobhunter.llm.fake import ITEM_ERRORS, BatchScript, ItemOutcome, StoredBatch
 from jobhunter.llm.gateway import LLMGateway
-from jobhunter.scoring import batches
+from jobhunter.scoring import batch_operations, batches
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.settings.model import Settings
 from jobhunter.worker.operations import OperationClaim, claim_operation, create_operation
+from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.llm import generator_wire_body, synthetic_message_json
-from tests.support.scoring import PendingTarget, activate_score_tuple, activate_test_policy, insert_score_job
+from tests.support.scoring import (
+    PendingTarget,
+    activate_score_tuple,
+    activate_test_policy,
+    insert_score_job,
+    synthetic_c_draft,
+)
 from tests.support.validation import synthetic_ad
 
 __all__ = [
+    "FOLLOWUP_BODY",
+    "PUBLISHED_BODY",
     "BatchScript",
     "BulkTargets",
     "ItemOutcome",
     "StoredBatch",
+    "SubmittedBatch",
+    "batch_client",
     "batch_ledger",
     "bulk_row",
     "bulk_with_targets",
     "charged_attempts",
+    "decisions",
+    "eligible_for_batching",
+    "entries_by_custom_id",
+    "item_rows",
     "items_of",
     "make_due",
+    "open_alert_codes",
+    "poll_once",
     "prepared_submission",
+    "reconcile_ambiguous_once",
     "scripted_batches",
     "submission_rows",
+    "submission_state",
+    "submit_batch",
     "synthetic_batch_results_jsonl",
+    "targets_by_custom_id",
 ]
 
 
@@ -274,3 +307,153 @@ async def make_due(engine: AsyncEngine) -> None:
     """Every `pending` operation due now: a requeue's `not_before` (one minute after a `bug`) cleared."""
     async with engine.begin() as conn:
         await conn.execute(_MAKE_DUE)
+
+
+# ---- M3 Task 17: polling, the item decisions, the adoption and the release ---------------------------------
+
+# A candidate C answer that publishes `accepted` for the synthetic ad, and one whose provisional score lands
+# within T2's band (`M = 63.75`, `tests/integration/test_publish.py`): a follow-up.
+PUBLISHED_BODY: Final = synthetic_c_draft()
+FOLLOWUP_BODY: Final = synthetic_c_draft(levels={"role_fit": 2, "domain": 2, "education_certifications": 2})
+
+
+@dataclass(frozen=True)
+class SubmittedBatch:
+    """A submission of `bulk_with_targets`'s targets created on the fake: its row, its provider batch and its
+    items' `custom_id`s in the setup's target order."""
+
+    setup: BulkTargets
+    submission_id: int
+    provider_id: str
+    custom_ids: tuple[str, ...]
+
+    def custom_id(self, target: PendingTarget) -> str:
+        return self.custom_ids[self.setup.targets.index(target)]
+
+
+async def submit_batch(
+    engine: AsyncEngine,
+    op_runner: Any,
+    fake_llm: Any,
+    n: int,
+    *,
+    followups: int = 0,
+    bodies: Mapping[int, Any] | None = None,
+    polls_until_ended: int = 1,
+) -> SubmittedBatch:
+    """`n` targets in a bulk operation, each answered (`fake_llm.answer`, its revision's key) by
+    `PUBLISHED_BODY` (the first `followups` by `FOLLOWUP_BODY`; `bodies` by target index replace either), and
+    the setup's `batch_submit` operation run once on the fake (`BatchScript(create="ok",
+    polls_until_ended=…)`, not ended at the create by default, so a test registers the items' outcomes
+    afterwards): the submitted batch."""
+    setup = await bulk_with_targets(engine, n)
+    for i, target in enumerate(setup.targets):
+        body = FOLLOWUP_BODY if i < followups else PUBLISHED_BODY
+        fake_llm.answer("generate", target.job_revision_id, (bodies or {}).get(i, body))
+    fake.batches(BatchScript(create="ok", polls_until_ended=polls_until_ended))
+    assert setup.operation_id is not None
+    await op_runner.run_one(setup.operation_id)
+    (row,) = await submission_rows(engine)
+    assert row.state == "submitted", row.state
+    attempts = dict(await items_of(engine, row.id))
+    ids = tuple(f"t{t.target_id}_a{attempts[t.target_id]}" for t in setup.targets)
+    return SubmittedBatch(setup, int(row.id), str(row.provider_batch_id), ids)
+
+
+def batch_client(fake_llm: Any, http_client: httpx2.AsyncClient) -> BatchesClient:
+    """A Batches client on the fake (`fake_llm.cfg`) over `http_client`."""
+    return BatchesClient(fake_llm.cfg, http_client=http_client)
+
+
+async def poll_once(
+    engine: AsyncEngine, fake_llm: Any, *, epoch: int = 1, now: datetime | None = None
+) -> batch_operations.PollReport:
+    """One `batch_poll` pass on the fake at `now`."""
+    async with fake_llm.client() as http:
+        return await batch_operations.poll(
+            engine, batch_client(fake_llm, http), now=now or utcnow(), epoch=epoch, defer=defer_in_tx
+        )
+
+
+async def reconcile_ambiguous_once(
+    engine: AsyncEngine, fake_llm: Any, *, epoch: int = 1, now: datetime | None = None
+) -> batch_operations.ReconcileReport:
+    """One `batch_reconcile_ambiguous` pass on the fake at `now`."""
+    async with fake_llm.client() as http:
+        return await batch_operations.reconcile_ambiguous(
+            engine, batch_client(fake_llm, http), now=now or utcnow(), epoch=epoch, defer=defer_in_tx
+        )
+
+
+_SUBMISSION_STATE: Final = sa.text("SELECT state FROM batch_submissions WHERE id = :s")
+_DECISIONS: Final = sa.text("SELECT decision FROM batch_items WHERE decision IS NOT NULL ORDER BY id")
+_ITEM_ROWS: Final = sa.text(
+    "SELECT custom_id, result_type, decision, stop_reason, processed_at, hold_released_at, hold_usd "
+    "FROM batch_items ORDER BY id"
+)
+_BATCH_ENTRY_OF: Final = sa.text(
+    "SELECT i.custom_id, l.state, l.evidence, l.reserved_usd, l.settled_usd, c.status, c.error_code, "
+    "c.output_json IS NOT NULL AS has_output, c.http_status, a.cost_usd AS attempt_cost "
+    "FROM batch_items i JOIN llm_calls c ON c.id = i.llm_call_id "
+    "JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    "JOIN score_attempts a ON a.target_id = i.target_id AND a.attempt_no = i.attempt_no ORDER BY i.id"
+)
+_TARGET_BY_CUSTOM_ID: Final = sa.text(
+    "SELECT i.custom_id, t.state, t.state_reason, t.lane, t.resume_draft_id, t.batch_submission_id, "
+    "t.refusal_category, a.outcome, a.outcome_detail FROM batch_items i "
+    "JOIN score_targets t ON t.id = i.target_id "
+    "JOIN score_attempts a ON a.target_id = i.target_id AND a.attempt_no = i.attempt_no ORDER BY i.id"
+)
+_OPEN_ALERT_CODES: Final = sa.text("SELECT code FROM alerts WHERE resolved_at IS NULL ORDER BY code")
+_ELIGIBLE_OF: Final = sa.text(
+    f"SELECT t.id FROM score_targets t WHERE {batches.ELIGIBLE_SQL} "  # noqa: S608
+    "AND t.id = ANY(CAST(:ids AS bigint[])) ORDER BY t.id"
+)
+_POLICY: Final = sa.text("SELECT evaluation_policy_id FROM active_config WHERE id = 1")
+
+
+async def submission_state(engine: AsyncEngine, submission_id: int) -> str:
+    async with engine.connect() as conn:
+        return str((await conn.execute(_SUBMISSION_STATE, {"s": submission_id})).scalar_one())
+
+
+async def decisions(engine: AsyncEngine) -> list[str]:
+    """Every decided item's decision, in item order."""
+    async with engine.connect() as conn:
+        return [str(d) for d in (await conn.execute(_DECISIONS)).scalars()]
+
+
+async def item_rows(engine: AsyncEngine) -> dict[str, sa.Row[Any]]:
+    """Every item by `custom_id`: its result type, decision, stop reason, processing time and hold."""
+    async with engine.connect() as conn:
+        return {str(r.custom_id): r for r in await conn.execute(_ITEM_ROWS)}
+
+
+async def entries_by_custom_id(engine: AsyncEngine) -> dict[str, sa.Row[Any]]:
+    """Every item's ledger entry and call (state, evidence, amounts, the call's status and code, whether it
+    stored an output) and its attempt's `cost_usd`, by `custom_id`."""
+    async with engine.connect() as conn:
+        return {str(r.custom_id): r for r in await conn.execute(_BATCH_ENTRY_OF)}
+
+
+async def targets_by_custom_id(engine: AsyncEngine) -> dict[str, sa.Row[Any]]:
+    """Every item's target (state, reason, lane, resume draft, batch pin, refusal category) and attempt
+    (outcome, detail), by `custom_id`."""
+    async with engine.connect() as conn:
+        return {str(r.custom_id): r for r in await conn.execute(_TARGET_BY_CUSTOM_ID)}
+
+
+async def open_alert_codes(engine: AsyncEngine) -> list[str]:
+    """The codes of every open alert, sorted."""
+    async with engine.connect() as conn:
+        return [str(c) for c in (await conn.execute(_OPEN_ALERT_CODES)).scalars()]
+
+
+async def eligible_for_batching(engine: AsyncEngine, setup: BulkTargets, target_ids: list[int]) -> list[int]:
+    """The targets of `target_ids` that `ELIGIBLE_SQL` would batch for the setup's operation now."""
+    async with engine.connect() as conn:
+        policy = int((await conn.execute(_POLICY)).scalar_one())
+        found = await conn.execute(
+            _ELIGIBLE_OF, {"b": setup.bulk_operation_id, "policy": policy, "ids": target_ids}
+        )
+        return [int(t) for t in found.scalars()]

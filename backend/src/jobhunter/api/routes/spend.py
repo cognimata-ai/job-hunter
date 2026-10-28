@@ -12,8 +12,9 @@ ledger (`spend_totals`, `spend_by_model_effort_role`).
   dry-run's projection;
 - `c_hat` is §21.2's central cost per target of the active model policy (no attempt history before M3), and
   `projected_critic_rate` the active evaluation policy's;
-- `critic_rate_7d` and `bulk_operation` are `null` and `quarantined_batch_usd` is `"0"` until M3 scores
-  targets, opens bulk operations and submits batches;
+- `critic_rate_7d` and `bulk_operation` are `null` until M3 scores targets and opens bulk operations
+  (Task 21 finishes the route); `quarantined_batch_usd` is the reserved spend of the `submit_ambiguous` batch
+  submissions (`scoring.batches.quarantined_usd`, S:L1199, M3 Task 17);
 - `by_model_effort_role` groups the month's tries by model, effort and role (the call's purpose).
 
 USD amounts are decimal strings at $0.000001, the cap at its cents. `utcnow` is a name of this module, so a
@@ -36,6 +37,7 @@ from jobhunter.db.sql import q
 from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams, Purpose
 from jobhunter.llm.spend_ledger import read_month_or_new, spend_by_model_effort_role, spend_totals
+from jobhunter.scoring import batches
 from jobhunter.settings.llm_projection import central_cost_per_target
 from jobhunter.settings.model import Settings
 
@@ -111,7 +113,7 @@ async def _spend(conn: AsyncConnection) -> SpendOut:
         critic_rate_7d=None,
         projected_critic_rate=Decimal(active.projected_critic_rate),
         bulk_operation=None,
-        quarantined_batch_usd=Decimal(0),
+        quarantined_batch_usd=usd_micro(await batches.quarantined_usd(conn)),
         by_model_effort_role=[
             SpendGroupOut(
                 model=g.model, effort=g.effort, role=g.role, calls=g.calls, counted=usd_micro(g.counted_usd)

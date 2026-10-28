@@ -92,7 +92,7 @@ async def test_the_totals_and_the_headroom_match_the_ledger(logged_in_client, en
     assert (body["critic_rate_7d"], body["bulk_operation"], body["quarantined_batch_usd"]) == (
         None,
         None,
-        "0",
+        "0.000000",  # no quarantined batch submission (M3 Task 17: `batches.quarantined_usd`)
     )
     assert body["by_model_effort_role"] == [
         {

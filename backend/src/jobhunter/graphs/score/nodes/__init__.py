@@ -193,10 +193,22 @@ def _effort(value: str) -> Effort:
 async def load_inputs(conn: AsyncConnection, state: TargetState) -> tuple[ScoreInputs, AttemptRow]:
     """The attempt's inputs and ids (module docstring), on the caller's connection; `LookupError` when the
     target, its attempt or the profile version's profile is gone."""
-    target_id = state["target_id"]
-    row = (await conn.execute(_INPUTS, {"target": target_id, "attempt": state["attempt_id"]})).first()
+    return await load_attempt_inputs(
+        conn,
+        target_id=state["target_id"],
+        attempt_id=state["attempt_id"],
+        prompt_schema_version_id=state["prompt_schema_version_id"],
+    )
+
+
+async def load_attempt_inputs(
+    conn: AsyncConnection, *, target_id: int, attempt_id: int, prompt_schema_version_id: int
+) -> tuple[ScoreInputs, AttemptRow]:
+    """`load_inputs` of an attempt named by its ids (a batch item's, `scoring.batch_items`, which has no
+    subgraph state)."""
+    row = (await conn.execute(_INPUTS, {"target": target_id, "attempt": attempt_id})).first()
     if row is None:
-        raise LookupError(f"score target {target_id} or its attempt {state['attempt_id']} does not exist")
+        raise LookupError(f"score target {target_id} or its attempt {attempt_id} does not exist")
     if row.profile_json is None:
         raise LookupError(f"the profile version of score target {target_id} is purged")
     attempt = AttemptRow(
@@ -216,7 +228,7 @@ async def load_inputs(conn: AsyncConnection, state: TargetState) -> tuple[ScoreI
         material, completeness=row.description_completeness, description_text=row.description_text
     )
     inputs = ScoreInputs(
-        version=await load_prompt_version(conn, state["prompt_schema_version_id"]),
+        version=await load_prompt_version(conn, prompt_schema_version_id),
         rubric=rubric_of(row.weights, row.anchors),
         profile=ConfirmedProfile.model_validate(row.profile_json),
         ad=ad,
@@ -289,15 +301,18 @@ def score_caller(deps: ScoreDeps, state: TargetState, inputs: ScoreInputs, attem
 
 # ---- the store ---------------------------------------------------------------------------------------------
 
-_INSERT_DRAFT: Final = q(
+# The draft statements, which a batch item's store (`scoring.batch_items`) writes too: the insert of a
+# generated draft (`validation = {"normalisation": …}`, the other NOT NULL columns placeholders), the read,
+# and the validation's update.
+INSERT_DRAFT: Final = q(
     "INSERT INTO score_drafts (attempt_id, round, llm_call_id, output_json, validation, "
     "deterministic_failures, provisional, triggers) "
     "VALUES (:attempt, :round, :call, :draft, :validation, '{}', '{}', '{}') "
     "RETURNING id",
     jsonb=["draft", "validation"],
 )
-_DRAFT: Final = q("SELECT id, round, output_json, validation FROM score_drafts WHERE id = :d")
-_SAVE_VALIDATION: Final = q(
+READ_DRAFT: Final = q("SELECT id, round, output_json, validation FROM score_drafts WHERE id = :d")
+SAVE_VALIDATION: Final = q(
     "UPDATE score_drafts SET output_json = :draft, "
     "validation = validation || jsonb_build_object('current', CAST(:current AS jsonb)) || "
     "CASE WHEN validation -> 'corrections' IS NULL "
@@ -315,6 +330,32 @@ _INSERT_NOTE: Final = q(
 _NOTE: Final = q(
     "SELECT id, draft_id, derived_outcome, review_json, validation FROM critic_notes WHERE id = :n"
 )
+
+
+def draft_params(
+    *, attempt_id: int, round: int, llm_call_id: int, parsed: ParsedGenerator
+) -> dict[str, object]:
+    """The binds of `INSERT_DRAFT` for a structurally valid output of the attempt's `round`."""
+    return {
+        "attempt": attempt_id,
+        "round": round,
+        "call": llm_call_id,
+        "draft": parsed.draft.model_dump(mode="json"),
+        "validation": {"normalisation": parsed.normalisation.to_json()},
+    }
+
+
+def validation_params(draft_id: int, record: ValidationRecord) -> dict[str, object]:
+    """The binds of `SAVE_VALIDATION` for `record` of draft `draft_id`."""
+    return {
+        "d": draft_id,
+        "draft": record.draft.model_dump(mode="json"),
+        "current": record.current,
+        "corrections": record.corrections,
+        "failures": record.failures,
+        "provisional": record.provisional,
+        "triggers": record.triggers,
+    }
 
 
 class TargetDraftStore:
@@ -347,18 +388,14 @@ class TargetDraftStore:
 
     async def add_draft(self, *, round: int, llm_call_id: int, parsed: ParsedGenerator) -> int:
         generated = round == 0
-        params = {
-            "attempt": self._owner.attempt_id,
-            "round": round,
-            "call": llm_call_id,
-            "draft": parsed.draft.model_dump(mode="json"),
-            "validation": {"normalisation": parsed.normalisation.to_json()},
-        }
+        params = draft_params(
+            attempt_id=self._owner.attempt_id, round=round, llm_call_id=llm_call_id, parsed=parsed
+        )
         async with self._engine.begin() as conn:
             if generated:
                 await afault_point(BEFORE_DRAFT)
             await self._owner.lock(conn)
-            draft_id = int((await conn.execute(_INSERT_DRAFT, params)).scalar_one())
+            draft_id = int((await conn.execute(INSERT_DRAFT, params)).scalar_one())
         if generated:
             await afault_point(AFTER_DRAFT)
         log.info(
@@ -373,7 +410,7 @@ class TargetDraftStore:
 
     async def draft(self, draft_id: int) -> StoredDraft:
         async with self._reading() as conn:
-            row = (await conn.execute(_DRAFT, {"d": draft_id})).first()
+            row = (await conn.execute(READ_DRAFT, {"d": draft_id})).first()
         if row is None:
             raise LookupError(f"score draft {draft_id} does not exist")
         return StoredDraft.from_row(
@@ -381,17 +418,8 @@ class TargetDraftStore:
         )
 
     async def save_validation(self, draft_id: int, record: ValidationRecord) -> None:
-        params = {
-            "d": draft_id,
-            "draft": record.draft.model_dump(mode="json"),
-            "current": record.current,
-            "corrections": record.corrections,
-            "failures": record.failures,
-            "provisional": record.provisional,
-            "triggers": record.triggers,
-        }
         async with self._writing() as conn:
-            await conn.execute(_SAVE_VALIDATION, params)
+            await conn.execute(SAVE_VALIDATION, validation_params(draft_id, record))
 
     async def add_note(self, note: NoteRecord) -> int:
         params = {
