@@ -7,7 +7,9 @@ settings page shows on every change and that a save runs again (Task 17).
    `unknown_references` (Task 17): an entry of `queries[]` or `watchlist[]` whose id names no row is an
    `invalid` error at the entry's id. On any issue the result holds the errors only, so the preview and the
    save (which runs this again) refuse the same documents;
-2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `serpapi_disabled_no_fallback`);
+2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `eval_failed`,
+   `serpapi_disabled_no_fallback`); both read `active`, which tells a selection of generator effort `low` from
+   a kept one (Ruling T20-d);
 3. `paid_cells`: the enabled queries times the location keys (the scope's locations, plus `remote-de` with
    remote work within Germany, `quota.cells.location_keys`);
 4. `quota_projections` with the run view of the proposed settings (`RunSettings.from_settings`, the proposed
@@ -265,12 +267,12 @@ async def dry_run(
 ) -> DryRunResult:
     """The §6.8 dry-run of `payload` against the `active` settings at `now` (module docstring)."""
     gate = await payload_gate(conn, payload)
-    proposed, errors = validate_fields(payload, gate=gate)
+    proposed, errors = validate_fields(payload, gate=gate, active=active)
     if proposed is not None:
         errors = await unknown_references(conn, proposed)
     if proposed is None or errors:
         return DryRunResult(errors=errors, warnings=[], projections={}, effects=frozenset())
-    warns = warnings_only(proposed, gate=gate)
+    warns = warnings_only(proposed, gate=gate, active=active)
 
     run = RunSettings.from_settings(
         proposed,

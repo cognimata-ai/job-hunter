@@ -35,9 +35,11 @@ from tests.support.eval import (
     eval_deps,
     eval_generator_body,
     execute,
+    fake_eval_answers,
     insert_cases,
     operation_row,
     run_row,
+    seed_adversarial,
     start_eval,
 )
 from tests.support.faults import no_fault, raising_at
@@ -102,7 +104,7 @@ def label_of(i: int, n: int) -> str:
 async def graded_cases(engine: AsyncEngine, fake_llm: FakeLLM, n: int = 30) -> list[CaseRef]:
     """`n` cases labelled `poor`, `ok`, `good` in thirds by id, the fake's generator answering each at the
     level of its label and the critic accepting (module docstring)."""
-    made = await insert_cases(engine, n)
+    made = (await insert_cases(engine, n))[-n:]  # the new ones: every case is listed, by id
     ad, profile = synthetic_ad(), score_profile()
     async with engine.begin() as conn:
         for i, case in enumerate(made):
@@ -159,7 +161,7 @@ async def test_a_golden_run_ends_with_its_calibration_and_its_gate(
     assert (run.status, run.passed) == ("completed", True)
     assert set(run.metrics) == METRIC_KEYS | CALIBRATION_KEYS  # merged beside Task 19's keys
     m = run.metrics
-    assert (m["gate"], m["transport"]) == ("passed", "fake") and "failed" not in m
+    assert (m["gate"], m["transport"]) == ("passed", "fake") and "failed_gates" not in m and "failed" not in m
     assert m["observations"] == {"primary": 30, "paired": 10, "cost": 40}
     assert m["test_retest_sample"] == [c.id for c in made[:10]] == m["repetitions"]["sample"]
     assert (m["schema_validity"], m["grounding_rate"], m["contested_rate"]) == (
@@ -199,16 +201,32 @@ async def test_a_run_without_its_repeated_sample_fails_the_gate_and_alerts(
     await graded_cases(engine, fake_llm)
     started, run = await golden_run(engine, fake_llm, current_epoch, repetitions=1)
     assert (run.status, run.passed, run.metrics["gate"]) == ("completed", False, "failed")
-    assert run.metrics["failed"] == [calibration.TEST_RETEST_MISSING]
+    assert run.metrics["failed_gates"] == [calibration.TEST_RETEST_MISSING] and "failed" not in run.metrics
     assert run.metrics["test_retest_sd"] is None and run.metrics["observations"]["paired"] == 0
     [alert] = await alerts(engine, "eval.gate_failed")
     assert (alert.severity, alert.resolved_at, alert.occurrences) == ("warn", None, 1)
-    assert alert.context == {"eval_run_id": started.eval_run_id, "failed": [calibration.TEST_RETEST_MISSING]}
+    assert alert.context == {
+        "eval_run_id": started.eval_run_id,
+        "failed_gates": [calibration.TEST_RETEST_MISSING],
+    }
     assert str(started.eval_run_id) in alert.message
     # a forced-critic run is a diagnostic: reported, never gating, never alerting (L4612)
     _, diagnostic = await golden_run(engine, fake_llm, current_epoch, route="forced_critic", repetitions=1)
     assert (diagnostic.passed, diagnostic.metrics["gate"]) == (False, "failed")
     assert [a.occurrences for a in await alerts(engine, "eval.gate_failed")] == [1]
+
+
+async def test_a_runs_gate_counts_the_users_cases_only(
+    engine: AsyncEngine, fake_llm: FakeLLM, current_epoch: int
+) -> None:
+    """Ruling T20-b (L4608, L4630): the ten adversarial cases are scored and pooled in the metrics, but the
+    30 of the gate are the user's: 20 of them leave the run uncalibrated."""
+    await seed_adversarial(engine)
+    await fake_eval_answers(engine, fake_llm)
+    await graded_cases(engine, fake_llm, 20)
+    _, run = await golden_run(engine, fake_llm, current_epoch)
+    assert (run.status, run.passed, run.metrics["gate"]) == ("completed", None, "uncalibrated")
+    assert run.metrics["cases"]["active"] == 30 and run.metrics["observations"]["primary"] == 30
 
 
 async def test_the_calibration_commits_with_the_operations_end(
@@ -285,8 +303,11 @@ async def test_the_gate_reads_the_candidates_newest_live_run(
     async with engine.connect() as conn:
         ids = (await conn.execute(_ACTIVE)).one()
     await finished_run(engine, ids, passed=True)
-    made = await insert_cases(engine, 29)
-    assert await gate_state(engine) == "uncalibrated"  # fewer than 30 active cases (L4631)
+    await seed_adversarial(engine)  # ten active adversarial cases: pooled in the metrics, never counted here
+    made = (await insert_cases(engine, 20))[-20:]  # the user's: `insert_cases` lists every case
+    assert await gate_state(engine) == "uncalibrated"  # 20 of the user's cases and 10 adversarial (T20-b)
+    await insert_cases(engine, 9)
+    assert await gate_state(engine) == "uncalibrated"  # fewer than 30 of the user's cases (L4631)
     await insert_cases(engine, 1)
     assert await gate_state(engine) == "passed"  # the active configuration's passed live run
     async with engine.begin() as conn:
@@ -434,11 +455,12 @@ async def test_a_gated_save_needs_a_passed_run_of_its_candidate(
 async def test_the_generator_effort_low_rule_reads_the_payloads_gate(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, fake_llm: FakeLLM
 ) -> None:
-    """§11.13: below 30 cases the gate is uncalibrated and M2's warning applies; from 30 cases with no run of
-    the candidate it is failed, and generator effort `low` is refused."""
+    """§11.13, L3827, Ruling T20-d: below 30 cases the gate is uncalibrated and M2's warning applies; from
+    30 cases with no run of the candidate it is failed, and selecting generator effort `low` is refused, while
+    a save that carries an already-active `low` unchanged is allowed with the warning `eval_failed`."""
     payload = json.loads(json.dumps((await settings_body(logged_in_client))["payload"]))
     payload["scoring"]["model_policy"]["nodes"]["generate"]["effort"] = "low"
-    await insert_cases(engine, 29)
+    made = await insert_cases(engine, 29)
     body = await dry_run_body(logged_in_client, payload)
     assert body["errors"] == [] and body["projections"]["eval_gate"] == "uncalibrated"
     assert {"code": "eval_uncalibrated", "detail": {"node": "generate"}} in body["warnings"]
@@ -447,6 +469,28 @@ async def test_the_generator_effort_low_rule_reads_the_payloads_gate(
     assert [(e["field"], e["code"]) for e in body["errors"]] == [
         ("payload.scoring.model_policy.nodes.generate.effort", "conflict")
     ]
+    # `low` selected while the gate was uncalibrated (29 active cases, the policy's models verified)...
+    await dry_run_record(engine, await active_version(engine), POLICY_B_CASES)
+    async with engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE golden_cases SET active = false WHERE id = :g"), {"g": made[0].id})
+    assert (await post_save(logged_in_client, payload)).status_code == 201
+    async with engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE golden_cases SET active = true"))
+    # ...then kept unchanged once the gate has failed: a schedule save carries it, with the warning
+    kept = json.loads(json.dumps((await settings_body(logged_in_client))["payload"]))
+    kept["schedule"]["interval_hours"] = 12
+    body = await dry_run_body(logged_in_client, kept)
+    assert (
+        body["errors"] == [] and {"code": "eval_failed", "detail": {"node": "generate"}} in body["warnings"]
+    )
+    r = await post_save(logged_in_client, kept)
+    assert r.status_code == 201, r.text
+    assert r.json()["version"]["effect_classes"] == ["schedule"]
+
+
+async def active_version(engine: AsyncEngine) -> int:
+    async with engine.connect() as conn:
+        return int((await conn.execute(_ACTIVE)).one().prompt_schema_version_id)
 
 
 # ---- the schema verification at the save (Ruling P11, Codex r1 #25, r2 B24) --------------------------------
@@ -482,25 +526,20 @@ async def dry_run_record(engine: AsyncEngine, version: int, cases: list[dict[str
         )
 
 
+async def model_policies(engine: AsyncEngine) -> int:
+    async with engine.connect() as conn:
+        return int((await conn.execute(sa.text("SELECT count(*) FROM model_policies"))).scalar_one())
+
+
 async def test_a_model_policy_save_needs_a_verified_policy(
-    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
 ) -> None:
-    """An `llm_tuple` save whose policy moves `revise` to a model with no passed live case of the active
-    prompt-schema version is 409 `conflict_state` (`schema_dry_run_required`), whatever the override: before
-    its row exists, after the row is staged, and with a pass of another version only; a live pass of the
-    version unblocks it."""
-    payload = json.loads(json.dumps((await settings_body(logged_in_client))["payload"]))
-    payload["scoring"]["model_policy"]["preset"] = "custom"
-    payload["scoring"]["model_policy"]["nodes"]["revise"]["model"] = HAIKU
-
-    async def refused() -> None:
-        r = await post_save(logged_in_client, payload, eval_override_ack=True)
-        assert (r.status_code, r.json()["code"], r.json()["detail"]) == (
-            409,
-            "conflict_state",
-            "schema_dry_run_required",
-        ), r.text
-
+    """Ruling T20-a: the save finds or inserts the proposed policy's row by hash, then asks Task 11's
+    `schema_verified`. A new policy that reuses verified models saves with no new run; one that moves
+    `revise` to a model with no passed live case of the active prompt-schema version is 409 `conflict_state`
+    (`schema_dry_run_required`, its title naming the pair), whatever the override, also with a pass of another
+    version only, and its row goes with the refused save; a live pass of the version unblocks it."""
+    base = json.loads(json.dumps((await settings_body(logged_in_client))["payload"]))
     async with engine.connect() as conn:
         ids = (await conn.execute(_ACTIVE)).one()
         other_version = int(
@@ -513,16 +552,54 @@ async def test_a_model_policy_save_needs_a_verified_policy(
         )
     version = int(ids.prompt_schema_version_id)
     await dry_run_record(engine, version, POLICY_B_CASES)
-    await refused()  # no row of the policy yet: nothing can be verified
-    async with engine.begin() as conn:  # what `schema-dry-run --candidate-payload` stages first
-        await eval_runner.stage_candidate(conn, payload, now=utcnow())
-    await refused()  # the row, but no live pass of the revise model
+    effort_only = json.loads(json.dumps(base))
+    effort_only["scoring"]["model_policy"]["nodes"]["critic"]["effort"] = "high"
+    r = await post_save(logged_in_client, effort_only)  # a new row, its models verified: no new run needed
+    assert r.status_code == 201, r.text
+    assert r.json()["version"]["effect_classes"] == ["llm_tuple"]
+
+    payload = json.loads(json.dumps(base))
+    payload["scoring"]["model_policy"]["preset"] = "custom"
+    payload["scoring"]["model_policy"]["nodes"]["revise"]["model"] = HAIKU
+
+    async def refused() -> None:
+        before = await model_policies(engine)
+        r = await post_save(logged_in_client, payload, eval_override_ack=True)
+        body = r.json()
+        assert (r.status_code, body["code"], body["detail"]) == (
+            409,
+            "conflict_state",
+            "schema_dry_run_required",
+        ), r.text
+        assert body["title"] == f"The model policy has no passed live schema dry-run for generator on {HAIKU}"
+        assert await model_policies(engine) == before  # the row inserted for the check is rolled back
+
+    await refused()
     await dry_run_record(engine, other_version, [case("generator", HAIKU)])
     await refused()  # a pass of another version (Codex r1 #25)
     async with engine.connect() as conn:  # nothing was written by the refusals
-        assert (await conn.execute(sa.text("SELECT count(*) FROM settings_versions"))).scalar_one() == 1
+        assert (await conn.execute(sa.text("SELECT count(*) FROM settings_versions"))).scalar_one() == 2
     await dry_run_record(engine, version, [case("generator", HAIKU)])
     r = await post_save(logged_in_client, payload)
+    assert r.status_code == 201, r.text
+    assert r.json()["version"]["effect_classes"] == ["llm_tuple"]
+
+
+async def test_a_model_policy_save_needs_a_passed_eval_of_its_candidate(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """The `llm_tuple` class is gated like the `evaluation_policy` class (§11.13): with 30 of the user's
+    cases, a verified policy with no passed run of its candidate is 409 `eval_gate_failed` (its row rolled
+    back) unless the override is acknowledged."""
+    await insert_cases(engine, 30)
+    await dry_run_record(engine, await active_version(engine), POLICY_B_CASES)
+    payload = json.loads(json.dumps((await settings_body(logged_in_client))["payload"]))
+    payload["scoring"]["model_policy"]["nodes"]["generate"]["effort"] = "high"
+    before = await model_policies(engine)
+    r = await post_save(logged_in_client, payload)
+    assert (r.status_code, r.json()["code"]) == (409, "eval_gate_failed"), r.text
+    assert await model_policies(engine) == before
+    r = await post_save(logged_in_client, payload, eval_override_ack=True)
     assert r.status_code == 201, r.text
     assert r.json()["version"]["effect_classes"] == ["llm_tuple"]
 

@@ -503,8 +503,8 @@ export interface paths {
         };
         /**
          * Get System Health
-         * @description Readiness, run ages and their state, queue depths, open alerts, disk and table sizes, versions, and
-         *     the embedder's health and model id.
+         * @description Readiness, run ages and their state, queue depths, the score lane, open alerts, disk and table sizes,
+         *     versions, and the embedder's health and model id.
          */
         get: operations["get_system_health_api_system_health_get"];
         put?: never;
@@ -1312,6 +1312,24 @@ export interface components {
             /** Version No */
             version_no: number;
         };
+        /**
+         * ScoringHealthOut
+         * @description The score lane (module docstring): ages are seconds at the caller's `now`, the amount in USD.
+         */
+        ScoringHealthOut: {
+            /** In Batch Targets */
+            in_batch_targets: number;
+            /** Oldest Pending Target Age S */
+            oldest_pending_target_age_s: number | null;
+            /** Pause Reason */
+            pause_reason: ("reservation_bound_violated" | "auth_failed" | "cap_reached" | "global_fence" | "schema_unverified") | null;
+            /** Pending Targets */
+            pending_targets: number;
+            /** Quarantined Batch Usd */
+            quarantined_batch_usd: string;
+            /** Running Cycle Id */
+            running_cycle_id: number | null;
+        };
         /** SecurityClearance */
         SecurityClearance: {
             /** Level */
@@ -1496,6 +1514,7 @@ export interface components {
          *     - `queue_depths`: procrastinate jobs by queue and status.
          *     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
          *     - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
+         *     - `scoring`: the score lane (`scoring_health`).
          *     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
          *     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
          */
@@ -1529,6 +1548,7 @@ export interface components {
              * @enum {string}
              */
             run_age_state: "ok" | "warn" | "critical" | "grace" | "none";
+            scoring: components["schemas"]["ScoringHealthOut"];
             /** Table Bytes */
             table_bytes: {
                 [key: string]: number;
@@ -3263,7 +3283,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The base is not the active version (`stale_base_version`), the eval gate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The base is not the active version (`stale_base_version`), the model policy has no passed live schema dry-run of a (schema, model) pair it needs (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;

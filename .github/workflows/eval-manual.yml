@@ -18,11 +18,14 @@
 # the repository secret ANTHROPIC_API_KEY_EVAL to the worker's `anthropic_key` secret file and starts a
 # live-configured worker (JOBHUNTER_FAKE_LLM unset): `jobhunter eval run` inserts the run and its operation
 # and waits for the worker to end it. Readiness is the worker's heartbeat row, polled through psql for up to
-# 60 s. The run's stdout, the case table (label, outcome, score_mid, binding knockouts against the expected
-# ones) and the summary line with the gate's state, is printed, written to the job summary and uploaded as a
-# Markdown artifact; the logs are not printed, and nothing printed carries content or the key. At the end,
-# whatever the outcome, the worker gets SIGTERM and its exit is awaited before the secret files and the
-# database are removed.
+# 60 s. The eval has a timeout of its own and stops waiting, failing, as soon as the worker process is gone.
+# The run's stdout, the case table (label, outcome, score_mid, binding knockouts against the expected ones)
+# and the summary line with the gate's state, is printed, written to the job summary and uploaded as a
+# Markdown artifact. The step keeps the command's exit status: on a non-zero one it prints the last line of
+# the command's stderr (a refusal line or a log line: ids and codes only) and fails with it. Every script runs
+# under bash with pipefail. The logs are not printed otherwise, and nothing printed carries content or the
+# key. At the end, whatever the outcome, the worker gets SIGTERM and its exit is awaited before the secret
+# files and the database are removed.
 #
 # Supply chain as in ci.yml: actions pinned to full commit SHAs (the release tag is the trailing comment), uv to
 # an exact version; the token is read-only and the checkout does not keep it.
@@ -56,6 +59,9 @@ jobs:
   eval:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash  # bash --noprofile --norc -eo pipefail {0}
     env:
       JOBHUNTER_ENV: dev
       JOBHUNTER_DB_HOST: 127.0.0.1
@@ -90,6 +96,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/worker-data/cv" "$RUNNER_TEMP/worker-data/parse"
       - name: Throwaway PostgreSQL
         run: |
+          set -o pipefail
           docker run -d --name jh-eval-pg -p 127.0.0.1:5432:5432 \
             -e POSTGRES_USER=jobhunter_bootstrap -e POSTGRES_DB=jobhunter \
             -e POSTGRES_PASSWORD_FILE=/run/secrets/pg_bootstrap \
@@ -150,16 +157,36 @@ jobs:
           echo "the worker wrote no heartbeat within 60 s" >&2
           exit 1
       - name: Eval run (live)
+        timeout-minutes: 75
         env:
           JOBHUNTER_SECRETS_DIR: ${{ runner.temp }}/secrets/worker
           ROUTE: ${{ inputs.route }}
           CANDIDATE: ${{ inputs.candidate }}
         run: |
+          set -o pipefail
           report="$RUNNER_TEMP/eval-report.md"
           printf '# Adversarial smoke\n\nroute=%s candidate=%s\n\n' "$ROUTE" "$CANDIDATE" > "$report"
-          uv run jobhunter eval run --kind golden --candidate "$CANDIDATE" --route "$ROUTE" --live 2> /dev/null \
-            | tee -a "$report"
+          uv run jobhunter eval run --kind golden --candidate "$CANDIDATE" --route "$ROUTE" --live \
+            > "$RUNNER_TEMP/eval-stdout.txt" 2> "$RUNNER_TEMP/eval-stderr.txt" &
+          eval_pid=$!
+          # The command waits for the worker to end the run: once the worker is gone, nothing ever will.
+          while kill -0 "$eval_pid" 2> /dev/null; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/worker.pid")" 2> /dev/null; then
+              echo "the worker exited during the eval run" >&2
+              kill -TERM "$eval_pid" 2> /dev/null || true
+              wait "$eval_pid" 2> /dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          status=0
+          wait "$eval_pid" || status=$?
+          tee -a "$report" < "$RUNNER_TEMP/eval-stdout.txt"
           cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "eval run exited $status: $(tail -n 1 "$RUNNER_TEMP/eval-stderr.txt")" >&2
+            exit "$status"
+          fi
       - name: Upload the case table
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -184,4 +211,5 @@ jobs:
             fi
           fi
           docker rm -f -v jh-eval-pg > /dev/null 2>&1 || true
-          rm -rf "$RUNNER_TEMP/secrets" "$RUNNER_TEMP/worker-data" "$RUNNER_TEMP/worker.log"
+          rm -rf "$RUNNER_TEMP/secrets" "$RUNNER_TEMP/worker-data" "$RUNNER_TEMP/worker.log" \
+            "$RUNNER_TEMP/eval-stdout.txt" "$RUNNER_TEMP/eval-stderr.txt"

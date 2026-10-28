@@ -349,7 +349,9 @@ def test_the_metrics_json_holds_numbers_and_the_gate() -> None:
     assert doc["admission_recall"] is None and doc["projected_critic_rate"] == "0.45"
     assert doc["observations"] == {"primary": 30, "paired": 10, "cost": 40}
     failed = calibration.metrics_json(replace(m, test_retest_sd=None), state="failed")
-    assert failed["failed"] == ["test_retest_missing"] and failed["test_retest_sd"] is None
+    # the gates under their own key: `metrics.failed` stays a failed run's reason (fix round 1, item 6)
+    assert failed["failed_gates"] == ["test_retest_missing"] and failed["test_retest_sd"] is None
+    assert "failed" not in failed and "failed_gates" not in doc
 
 
 def test_a_case_result_is_read_from_its_stored_row() -> None:

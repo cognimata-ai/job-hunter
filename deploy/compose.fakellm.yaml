@@ -11,8 +11,14 @@
 # errored). Batches live in the worker's memory only, and its batch ids never repeat across restarts; the
 # 50 newest keep their full params, an older one only each item's model, max_tokens and output schema.
 #
+# The api runs on the fake as well (M3 Task 20, Ruling T20-c): its eval gate then counts the fake eval runs the
+# worker makes, and its settings save needs no live schema dry-run, as the worker's score lane does.
+#
 # Never in prod: the startup assertion `fake_mode_in_prod` refuses JOBHUNTER_FAKE_LLM there (exit 78).
 services:
+  api:
+    environment:
+      JOBHUNTER_FAKE_LLM: "1"
   worker:
     environment:
       JOBHUNTER_FAKE_LLM: "1"

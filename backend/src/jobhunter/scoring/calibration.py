@@ -40,12 +40,14 @@ exactly.
   similarity that reaches `similarity_cutoff` (`None` without a cut-off or such a case); `mean_cost_usd`
   (the cost set) beside `central_cost_usd`.
 
-**The gate** (`gate`, L4616-4631): `uncalibrated` while fewer than `GATE_MIN_CASES` cases are active;
+**The gate** (`gate`, L4616-4631): `uncalibrated` while fewer than `GATE_MIN_CASES` of the user's cases are
+active (`active_cases`: the caller's count, `validate.gate_cases`, which leaves the adversarial ones out);
 `passed` iff every gate holds (`failed_gates` is empty): schema validity and grounding rate 1, rho at least
 0.6, pairwise agreement at least 0.75, no false exclusion, knockout recall 1, contested rate at most 0.15 and
 a measured test-retest SD of at most 5 (a missing one fails as `test_retest_missing`); `failed` otherwise.
 `metrics_json` is what the run's terminal transaction merges into `eval_runs.metrics`: ids, counts and decimal
-strings, the gate's state and, when it failed, `failed` naming every gate that did.
+strings, the gate's state and, when it failed, `failed_gates` naming every gate that did (`failed` stays a
+failed run's reason, Task 19's string).
 
 **Canaries** (L4632): `canary_drift` compares each canary of a canary run with the first canary score of the
 same case under the same key `(golden_case_id, rubric_version_id, prompt_schema_version_id, model_policy_id,
@@ -377,7 +379,7 @@ def failed_gates(m: Metrics) -> list[str]:
 
 
 def gate(m: Metrics, *, active_cases: int) -> GateState:
-    """The gate's state (module docstring): `active_cases` is the number of active golden cases."""
+    """The gate's state (module docstring): `active_cases` is the number of the user's active golden cases."""
     if active_cases < GATE_MIN_CASES:
         return "uncalibrated"
     return "failed" if failed_gates(m) else "passed"
@@ -390,7 +392,7 @@ def _json(value: Decimal | None) -> JSONValue:
 def metrics_json(m: Metrics, *, state: GateState) -> dict[str, JSONValue]:
     """The calibration as the run's `metrics` holds it beside Task 19's keys (module docstring): decimal
     strings at 6 places (the stored rates as they are), the sample's case ids, the gate's `state` and, when it
-    failed, `failed`."""
+    failed, `failed_gates`."""
     doc: dict[str, JSONValue] = {
         "schema_validity": _json(m.schema_validity),
         "grounding_rate": _json(m.grounding_rate),
@@ -420,7 +422,7 @@ def metrics_json(m: Metrics, *, state: GateState) -> dict[str, JSONValue]:
         "gate": state,
     }
     if state == "failed":
-        doc["failed"] = list(failed_gates(m))
+        doc["failed_gates"] = list(failed_gates(m))
     return doc
 
 

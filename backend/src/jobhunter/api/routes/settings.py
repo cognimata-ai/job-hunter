@@ -16,6 +16,7 @@ no-op. Unlike `POST /api/runs` it never takes `FOR SHARE` first: two tabs holdin
 deadlock on the upgrade, where this way the second waits and gets 409 `stale_base_version`. The request's
 fingerprint takes the acknowledged codes as a set (sorted), so a reordered retry replays. `settings_saved` is
 logged after the commit when the save ran (a replay is `run_idempotent`'s `idempotent_replay`). 409 is also
+`conflict_state` with detail `schema_dry_run_required` (an unverified model policy, M3 Task 20),
 `eval_gate_failed` (§11.13) and `idempotency_in_progress`; 422 is `validation_failed` (the dry-run's errors,
 an unacknowledged warning, an unknown query or watchlist company) and `idempotency_key_reused`.
 
@@ -320,9 +321,10 @@ def _saved(outcome: SaveOutcome) -> SaveOut:
     responses={
         400: {"description": "Idempotency-Key missing or malformed (`idempotency_key_required`)"},
         409: {
-            "description": "The base is not the active version (`stale_base_version`), the eval gate failed "
-            "without the override (`eval_gate_failed`), or a request with this key is still running "
-            "(`idempotency_in_progress`)"
+            "description": "The base is not the active version (`stale_base_version`), the model policy has "
+            "no passed live schema dry-run of a (schema, model) pair it needs (`conflict_state`, detail "
+            "`schema_dry_run_required`, whatever the override), the eval gate failed without the override "
+            "(`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`)"
         },
         422: {
             "description": "Invalid body or settings, an unacknowledged warning (`validation_failed`), or "

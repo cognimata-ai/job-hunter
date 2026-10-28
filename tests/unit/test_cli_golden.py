@@ -103,9 +103,14 @@ def test_the_summary_line_carries_ids_and_codes_only() -> None:
     assert line == "eval_run=7 status=failed failed=interrupted cost_usd=0.1234"
     # a completed run reports its gate (Task 20); its failed gates are the case table's and the run's
     completed = cli_golden.summary(
-        eval_run_id=8, status="completed", metrics={"gate": "failed", "failed": ["spearman_rho"]}, cost="1"
+        eval_run_id=8,
+        status="completed",
+        metrics={"gate": "failed", "failed_gates": ["spearman_rho", "test_retest_missing"]},
+        cost="1",
     )
-    assert completed == "eval_run=8 status=completed gate=failed cost_usd=1"
+    assert completed == (
+        "eval_run=8 status=completed gate=failed failed_gates=spearman_rho,test_retest_missing cost_usd=1"
+    )
 
 
 def test_the_case_table_is_markdown_of_codes_and_numbers() -> None:
@@ -269,6 +274,7 @@ def test_a_lookup_bug_is_not_taken_for_a_missing_candidate(
 
 WORKFLOW: Final = Path(__file__).parents[2] / ".github/workflows/eval-manual.yml"
 _PINNED: Final = re.compile(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}")
+_PIPE: Final = re.compile(r"(?<!\|)\|(?!\|)")  # a pipe, not `||`
 
 
 def test_the_manual_eval_workflow_is_dispatch_only_pinned_and_keyless() -> None:
@@ -294,8 +300,27 @@ def test_the_manual_eval_workflow_is_dispatch_only_pinned_and_keyless() -> None:
     ):
         assert command in scripts, command
     assert "JOBHUNTER_FAKE_LLM" not in str(doc["jobs"]["eval"]["env"])  # a live-configured worker
-    [cleanup] = [step for step in steps if "kill -TERM" in str(step.get("run", ""))]
+    [cleanup] = [step for step in steps if "rm -rf" in str(step.get("run", ""))]
+    assert "kill -TERM" in cleanup["run"]
     assert cleanup["if"] == "always()" and steps[-1] is cleanup  # the secret files and the database go last
+
+
+def test_the_manual_eval_workflow_fails_with_the_eval() -> None:
+    """Fix round 1, item 1: every script that pipes runs under `pipefail`, so a failed command fails its step;
+    the eval keeps its exit status, prints its stderr's last line on a failure (the refusal line: ids and
+    codes), has a timeout of its own, and stops waiting once the worker is gone."""
+    doc: dict[Any, Any] = yaml.safe_load(WORKFLOW.read_text("utf-8"))
+    job = doc["jobs"]["eval"]
+    steps = job["steps"]
+    piping = [step for step in steps if _PIPE.search(str(step.get("run", "")))]
+    assert piping  # the image digest's lookup at least
+    for step in piping:
+        assert "set -o pipefail" in step["run"], step.get("name")
+    [run] = [step for step in steps if "jobhunter eval run" in str(step.get("run", ""))]
+    script = str(run["run"])
+    assert 0 < run["timeout-minutes"] < job["timeout-minutes"]
+    assert 'kill -0 "$(cat "$RUNNER_TEMP/worker.pid")"' in script  # the worker watched while the eval waits
+    assert 'tail -n 1 "$RUNNER_TEMP/eval-stderr.txt"' in script and 'exit "$status"' in script
 
 
 def test_the_workflow_states_its_central_cost_from_pricing() -> None:

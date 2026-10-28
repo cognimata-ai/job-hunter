@@ -14,16 +14,19 @@ r2 B7).
    internal save (`internal=True`, Deviation 15) skips the acknowledgement check and copies the active
    version's acknowledgements. Then, once, when the classes hold `llm_tuple` or `evaluation_policy`
    (`dryrun.GATED`; `_check_eval_gate`, M3 Task 20):
-   - an `llm_tuple` save whose model policy is not verified for the active prompt-schema version
-     (`validate.schema_verified` of its row, found by hash: a policy with no row yet has no proof) is 409
-     `conflict_state` with `detail = "schema_dry_run_required"`, whatever the override (Codex r2 B24; the
-     schema dry-run of the payload, `jobhunter schema-dry-run --candidate-payload`, stages the row and runs
-     its cases). A process on the fake LLM skips it, as the score lane's guard does (`cycles.pause_reason`):
-     no live dry-run exists there;
+   - an `llm_tuple` save whose model policy is not verified for the active prompt-schema version is 409
+     `conflict_state` with `detail = "schema_dry_run_required"` and a title naming the (schema, model) pairs
+     without a pass, whatever the override (Codex r2 B24, Ruling T20-a): the policy's row is found or
+     inserted by its content hash (`ensure_hashed`, under the step-1 lock), then `validate.schema_verified`
+     reads it, so a new policy that reuses verified models saves with no new run, and one with a new model
+     is unblocked by the schema dry-run of the payload (`jobhunter schema-dry-run --candidate-payload`). A
+     process on the fake LLM skips it, as the score lane's guard does (`cycles.pause_reason`): no live
+     dry-run exists there;
    - the eval gate of the payload's candidate (`derive.candidate_of`, `validate.eval_gate_state`): a failed
-     gate (with 30 active golden cases, no passed run of the candidate is a failed gate) without
-     `eval_override_ack` is 409 `eval_gate_failed`.
-   Every refusal therefore comes before the first write.
+     gate (with 30 of the user's active golden cases, no passed run of the candidate is a failed gate)
+     without `eval_override_ack` is 409 `eval_gate_failed`.
+   Every refusal therefore comes before the version and its actions; the policy row a refused save inserted
+   rolls back with it (the route's transaction; an internal save's caller's).
 4. The derived rows (`derive.derived` with the active profile, Deviation 14; `ensure_derived`).
 5. The version row: `version_no = max + 1` (the step-1 lock serialises the writers, the unique constraint
    backs it), the stored payload `Settings.to_payload()` (the normal form, never the request; Deviation 38),
@@ -91,7 +94,7 @@ from jobhunter.db import ranking
 from jobhunter.db.seed import (
     SETTINGS_SCHEMA_VERSION,
     anchor_utc_for,
-    content_hash,
+    ensure_hashed,
     ensure_id,
     latest_slot_at_or_before,
 )
@@ -107,7 +110,7 @@ from jobhunter.settings.derive import DerivedIds, active_profile, candidate_of, 
 from jobhunter.settings.dryrun import GATED, dry_run
 from jobhunter.settings.effects import EffectClass
 from jobhunter.settings.model import Settings
-from jobhunter.settings.validate import eval_gate_state, fake_llm_process, schema_verified
+from jobhunter.settings.validate import eval_gate_state, fake_llm_process, schema_verified, unverified_pairs
 from jobhunter.sources.instances import instance_for_company, list_instances
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import Deferrer
@@ -135,7 +138,6 @@ _INSERT_VERSION: Final = q(
 _TUPLE_POINTERS: Final = q(
     "SELECT rubric_version_id, prompt_schema_version_id FROM active_config WHERE id = 1"
 )
-_MODEL_POLICY_BY_HASH: Final = q("SELECT id FROM model_policies WHERE policy_hash = :hash")
 _FIND_TUPLE: Final = q(
     "SELECT id FROM llm_tuples WHERE profile_version_id = :profile_version_id "
     "AND rubric_version_id = :rubric_version_id AND prompt_schema_version_id = :prompt_schema_version_id "
@@ -222,20 +224,19 @@ class _Activation:
     scope_is_active: bool = False  # the `scope` action's desired scope is the active one
 
 
-async def _schema_verified(conn: AsyncConnection, proposed: Settings) -> bool:
-    """Whether the proposed model policy is verified for the active prompt-schema version
-    (`validate.schema_verified` of its row, found by its content hash); a policy with no row has no proof."""
-    found = await conn.execute(_MODEL_POLICY_BY_HASH, {"hash": content_hash(derived(proposed).model_policy)})
-    model_policy_id = found.scalar_one_or_none()
-    if model_policy_id is None:
-        return False
+async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[tuple[str, str]]:
+    """The (schema, model) pairs of the proposed model policy without a passed live schema dry-run of the
+    active prompt-schema version, none when it is verified (module docstring, step 3; Ruling T20-a): its row
+    found or inserted by hash in the save's transaction, then Task 11's `validate.schema_verified` on it."""
+    model_policy_id = await ensure_hashed(conn, "model_policies", derived(proposed).model_policy)
     pointers = (await conn.execute(_TUPLE_POINTERS)).one()
     if pointers.prompt_schema_version_id is None:
         raise LookupError("active_config has no prompt-schema version (migrate seeds it)")
-    return await schema_verified(
-        conn,
-        prompt_schema_version_id=int(pointers.prompt_schema_version_id),
-        model_policy_id=int(model_policy_id),
+    version = int(pointers.prompt_schema_version_id)
+    if await schema_verified(conn, prompt_schema_version_id=version, model_policy_id=model_policy_id):
+        return []
+    return await unverified_pairs(
+        conn, prompt_schema_version_id=version, model_policy=proposed.scoring.model_policy
     )
 
 
@@ -245,13 +246,16 @@ async def _check_eval_gate(
     """The refusals of a gated save (module docstring, step 3): an unverified model policy, then a failed eval
     gate of the payload's candidate without the override. Below 30 active golden cases the gate is
     `uncalibrated` and does not refuse."""
-    if "llm_tuple" in effects and not fake_llm_process() and not await _schema_verified(conn, proposed):
-        raise Problem(
-            409,
-            "conflict_state",
-            "The model policy has no passed live schema dry-run",
-            detail=SCHEMA_DRY_RUN_REQUIRED,
-        )
+    if "llm_tuple" in effects and not fake_llm_process():
+        missing = await _unverified_pairs(conn, proposed)
+        if missing:
+            pairs = ", ".join(f"{schema} on {model}" for schema, model in missing)
+            raise Problem(
+                409,
+                "conflict_state",
+                f"The model policy has no passed live schema dry-run for {pairs}",
+                detail=SCHEMA_DRY_RUN_REQUIRED,
+            )
     candidate = await candidate_of(conn, proposed)
     if await eval_gate_state(conn, candidate=candidate) == "failed" and not req.eval_override_ack:
         raise Problem(

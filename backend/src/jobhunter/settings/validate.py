@@ -10,7 +10,8 @@ a map (`payload.scope.locations[0].radius_km`, `payload.scope.language_policy.fr
 - `out_of_range`: a number outside its §13.1 range, a list or string longer or shorter than allowed, and an
   overrun buffer below its §6.9.1 bound (a lower limit that the other fields set);
 - `unsupported`: a model or effort that §10.3 does not list, or that the node's model does not support (G5);
-- `conflict`: a rule across fields (below), and generator effort `low` while the eval gate has failed;
+- `conflict`: a rule across fields (below), and selecting generator effort `low` while the eval gate has
+  failed;
 - `invalid`: anything else, an unknown key, a wrong JSON type or value, a repeated set value included, and a
   string holding a NUL character (U+0000), which no JSONB column can store, or a lone UTF-16 surrogate (a JSON
   escape such as `"\\ud800"`), which no UTF-8 text holds and which `effects` and the hashes would fail to
@@ -30,8 +31,10 @@ issue it finds is reported:
 3. not every source disabled (SerpApi alone is the warning `serpapi_disabled_no_fallback`);
 4. no `query_id` and no `watchlist_company_id` twice (the run view keys them, `RunSettings.queries`);
 5. each node's effort, and the critic's light effort, among `pricing.SUPPORTED_EFFORTS` of its model; the
-   generator's effort `low` needs a passing eval gate (§11.13): an error when the gate failed, the warning
-   `eval_uncalibrated` while it is uncalibrated (`warnings_only`);
+   generator's effort `low` needs a passing eval gate (§11.13, L3827): selecting it (the `active` settings'
+   generator effort is not `low`, or no active settings are given) is an error while the gate has failed,
+   and a document that carries the active `low` unchanged is valid with the warning `eval_failed` (Ruling
+   T20-d); either way the warning `eval_uncalibrated` while the gate is uncalibrated (`warnings_only`);
 6. each node's `max_tokens_retry ≥ max_tokens`;
 7. `llm.overrun_buffer_usd ≥ overrun_buffer_bound(settings)`.
 
@@ -39,13 +42,15 @@ issue it finds is reported:
 refused document.
 
 **`eval_gate_state(conn, candidate=…)`** (M3 Task 20) is the eval gate of a candidate configuration (a
-`Candidate`, by default the active one): `uncalibrated` below 30 active golden cases, else the newest
+`Candidate`, by default the active one): `uncalibrated` below 30 of the user's active golden cases (the
+adversarial ones never count, `gate_cases`), else the newest
 completed golden production run of the candidate with live provenance decides, and no run is `failed`. The
 dry-run and the save pass the proposed payload's candidate (`derive.candidate_of`).
 
 **`schema_verified`** (M3 Task 11, Ruling P11) says whether a prompt-schema version's live schema dry-runs
 passed every (schema, model) pair a model policy needs; the score lane's pause guard reads it, and so does the
-save's refusal of an unverified model policy (`save._check_eval_gate`, M3 Task 20).
+save's refusal of an unverified model policy (`save._check_eval_gate`, M3 Task 20), whose title names the
+pairs without a pass (`unverified_pairs`, the same reads).
 """
 
 import os
@@ -143,9 +148,11 @@ def _unstorable_strings(value: JSONValue, loc: tuple[str | int, ...] = ()) -> It
 
 
 def validate_fields(
-    payload: JSONValue, *, gate: GateState = "uncalibrated"
+    payload: JSONValue, *, gate: GateState = "uncalibrated", active: Settings | None = None
 ) -> tuple[Settings | None, list[FieldIssue]]:
-    """The settings of `payload` and no issue, or no settings and every issue (module docstring)."""
+    """The settings of `payload` and no issue, or no settings and every issue (module docstring); `active` is
+    the settings the document would replace (rule 5 tells a selection of generator effort `low` from a kept
+    one by it)."""
     unsafe = list(_unstorable_strings(payload))
     try:
         settings = Settings.model_validate(payload)
@@ -162,7 +169,7 @@ def validate_fields(
         *_evaluation(settings),
         *_sources(settings),
         *_entries(settings),
-        *_model_policy(settings, gate),
+        *_model_policy(settings, gate, active),
         *_execution(settings),
         *_overrun_buffer(settings),
     ]
@@ -249,7 +256,15 @@ def _entries(settings: Settings) -> Iterator[FieldIssue]:
         companies.add(company.watchlist_company_id)
 
 
-def _model_policy(settings: Settings, gate: GateState) -> Iterator[FieldIssue]:
+def _selects_generator_low(settings: Settings, active: Settings | None) -> bool:
+    """Whether `settings` changes the generator's effort to `low` (Ruling T20-d): it is `low` and the active
+    settings' is not, or no active settings are known."""
+    selected = settings.scoring.model_policy.nodes.generate.effort == "low"
+    kept = active is not None and active.scoring.model_policy.nodes.generate.effort == "low"
+    return selected and not kept
+
+
+def _model_policy(settings: Settings, gate: GateState, active: Settings | None) -> Iterator[FieldIssue]:
     policy = settings.scoring.model_policy
     where = ("scoring", "model_policy")
     nodes = policy.nodes.by_node()
@@ -261,10 +276,10 @@ def _model_policy(settings: Settings, gate: GateState) -> Iterator[FieldIssue]:
     critic = nodes["critic"].model
     if policy.critic_light_effort not in pricing.SUPPORTED_EFFORTS[critic]:
         yield _issue("unsupported", f"{critic} does not support this effort", *where, "critic_light_effort")
-    if nodes["generate"].effort == "low" and gate == "failed":
+    if gate == "failed" and _selects_generator_low(settings, active):
         yield _issue(
             "conflict",
-            "generator effort low needs a passing eval (§11.13)",
+            "selecting generator effort low needs a passing eval (§11.13)",
             *where,
             "nodes",
             "generate",
@@ -313,13 +328,19 @@ def overrun_buffer_bound(settings: Settings, *, overhead: Mapping[Model, int] | 
     return (total / _TOKENS_PER_MTOK).quantize(_CENT, rounding=ROUND_CEILING)
 
 
-def warnings_only(settings: Settings, *, gate: GateState) -> list[dryrun.Warning]:
+def warnings_only(
+    settings: Settings, *, gate: GateState, active: Settings | None = None
+) -> list[dryrun.Warning]:
     """The field-level warnings of valid `settings`, for the dry-run (§6.8) to join after a clean
-    `validate_fields`: `eval_uncalibrated` for generator effort `low` while the gate is uncalibrated (§11.13),
-    and `serpapi_disabled_no_fallback` when SerpApi is disabled (§13.1)."""
+    `validate_fields` with the same `gate` and `active`: for generator effort `low`, `eval_uncalibrated`
+    while the gate is uncalibrated (§11.13) and `eval_failed` while it has failed (a kept `low`: selecting it
+    then is an error, Ruling T20-d); and `serpapi_disabled_no_fallback` when SerpApi is disabled (§13.1)."""
     warnings: list[dryrun.Warning] = []
-    if settings.scoring.model_policy.nodes.generate.effort == "low" and gate == "uncalibrated":
+    low = settings.scoring.model_policy.nodes.generate.effort == "low"
+    if low and gate == "uncalibrated":
         warnings.append(dryrun.Warning("eval_uncalibrated", node="generate"))
+    elif low and gate == "failed" and not _selects_generator_low(settings, active):
+        warnings.append(dryrun.Warning("eval_failed", node="generate"))
     if not settings.sources.enabled.serpapi:
         warnings.append(dryrun.Warning("serpapi_disabled_no_fallback"))
     return warnings
@@ -355,7 +376,9 @@ def gate_transports() -> tuple[str, ...]:
     return ("live", "fake") if fake_llm_process() else ("live",)
 
 
-_ACTIVE_CASES: Final = q("SELECT count(*) FROM golden_cases WHERE active")
+# The cases the gate's 30 counts (L4608, L4630, Ruling T20-b): the user's active ones (week 1 and feedback);
+# the adversarial cases are scored and pooled in the metrics but never calibrate the gate.
+_GATE_CASES: Final = q("SELECT count(*) FROM golden_cases WHERE active AND source <> 'adversarial'")
 _ACTIVE_CANDIDATE: Final = q(
     "SELECT a.rubric_version_id, a.prompt_schema_version_id, m.policy_hash AS model_policy_hash, "
     "e.policy_hash AS evaluation_policy_hash FROM active_config a "
@@ -374,13 +397,20 @@ _GATE_RUN: Final = q(
 )
 
 
+async def gate_cases(conn: AsyncConnection) -> int:
+    """The number of the user's active golden cases, which the gate's `GATE_MIN_CASES` counts (Ruling T20-b):
+    the adversarial ones are left out. `eval_gate_state` and an eval run's own gate both read it."""
+    return int((await conn.execute(_GATE_CASES)).scalar_one())
+
+
 async def eval_gate_state(conn: AsyncConnection, *, candidate: Candidate | None = None) -> GateState:
     """The eval gate of `candidate` (§11.13; the active configuration's when `None`), plain reads:
-    `uncalibrated` while fewer than `GATE_MIN_CASES` golden cases are active; otherwise the newest `completed`
+    `uncalibrated` while fewer than `GATE_MIN_CASES` of the user's golden cases are active (`gate_cases`: the
+    adversarial ones never count); otherwise the newest `completed`
     golden run of the candidate on the production route whose transport is one `gate_transports` accepts
     decides: `passed` when it passed, `failed` when it failed or was never gated (`passed` NULL), and `failed`
     when there is none (user decision "Eval gate = fail until a run": a run is required)."""
-    if int((await conn.execute(_ACTIVE_CASES)).scalar_one()) < GATE_MIN_CASES:
+    if await gate_cases(conn) < GATE_MIN_CASES:
         return "uncalibrated"
     if candidate is None:
         row = (await conn.execute(_ACTIVE_CANDIDATE)).one()
@@ -427,6 +457,17 @@ def schema_pairs(model_policy: ModelPolicy) -> frozenset[tuple[str, str]]:
     return frozenset(
         (schema, models[node]) for schema, nodes in schema_dry_run.SCHEMA_NODES for node in nodes
     )
+
+
+async def unverified_pairs(
+    conn: AsyncConnection, *, prompt_schema_version_id: int, model_policy: ModelPolicy
+) -> list[tuple[str, str]]:
+    """The (schema, model) pairs `model_policy` needs (`schema_pairs`) that no live schema dry-run of the
+    prompt-schema version passed, sorted: what a refusal names when `schema_verified` is false (M3 Task 20).
+    The same reads as `schema_verified`'s, which stays the one verdict."""
+    rows = await conn.execute(_PASSED_LIVE, {"version": prompt_schema_version_id})
+    passed = {(str(row.schema), str(row.model)) for row in rows}
+    return sorted(schema_pairs(model_policy) - passed)
 
 
 async def schema_verified(

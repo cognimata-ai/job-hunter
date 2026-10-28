@@ -73,13 +73,15 @@ of results is the progress. A canary run scores once.
 outcomes counted by repetition: `{"1": {outcome: n}, "2": …}`) and, merged beside them (Ruling P17, Task 20),
 the calibration of the run's case rows (`run_cases`, `calibration.metrics` against the candidate's projected
 critic rate, its model policy's §21.2 central cost and the trailing 7-day similarity-lane cut-off;
-`calibration.metrics_json`, with the gate's state and, when it failed, `failed`), `passed` from
-`calibration.gate` over the run's active cases (a golden run only: `NULL` while uncalibrated and for a canary
-run) and the `cost_usd` its calls count; then its alerts (`eval.gate_failed`, warn, for a production golden
-run that failed, the candidate its subject; `scoring.canary_drift`, warn, for each canary of a canary run more
-than 8 points from its first score under its key, the case its subject: `calibration.canary_drift`, after the
-`completed`, so a first run is its own baseline); and the operation `succeeded` through `op.finish_in` (the
-fault points `eval.before_terminal_commit`, its last statement, and `eval.after_terminal_commit`).
+`calibration.metrics_json`, with the gate's state and, when it failed, `failed_gates`), `passed` from
+`calibration.gate` over the user's active cases (`validate.gate_cases`: the adversarial ones are pooled in
+the metrics but never calibrate the gate, Ruling T20-b; a golden run only: `NULL` while uncalibrated and for
+a canary run) and the `cost_usd` its calls count; then its alerts (`eval.gate_failed`, warn, for a production
+golden run that failed, the candidate its subject; `scoring.canary_drift`, warn, for each canary of a canary
+run more than 8 points from its first score under its key, the case its subject: `calibration.canary_drift`,
+after the `completed`, so a first run is its own baseline); and the operation `succeeded` through
+`op.finish_in` (the fault points `eval.before_terminal_commit`, its last statement, and
+`eval.after_terminal_commit`).
 
 Nothing here logs content: ids, counts, codes, outcomes and amounts only.
 """
@@ -128,7 +130,7 @@ from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import unknown_references
 from jobhunter.settings.llm_projection import central_cost_per_target
 from jobhunter.settings.model import ModelPolicy
-from jobhunter.settings.validate import FieldIssue, GateState, validate_fields
+from jobhunter.settings.validate import FieldIssue, GateState, gate_cases, validate_fields
 from jobhunter.types import JSONValue, get_int, get_object
 from jobhunter.worker.operations import (
     EVAL_RUN_COST_SQL,
@@ -1151,10 +1153,9 @@ class _Calibrated:
     passed: bool | None
 
 
-async def _calibrate(
-    conn: AsyncConnection, run: _Run, config: _Config, *, active_cases: int, now: datetime
-) -> _Calibrated:
-    """The run's calibration and gate in its terminal transaction (module docstring, **The end**)."""
+async def _calibrate(conn: AsyncConnection, run: _Run, config: _Config, *, now: datetime) -> _Calibrated:
+    """The run's calibration and gate in its terminal transaction (module docstring, **The end**): the gate
+    counts the user's active cases (`validate.gate_cases`, Ruling T20-b); the metrics pool every case."""
     rows = await run_cases(conn, run.id)
     cutoff = (
         await conn.execute(_SIMILARITY_CUTOFF, {"since": now - CUTOFF_WINDOW, "now": now})
@@ -1166,7 +1167,7 @@ async def _calibrate(
         central_cost_usd=config.central_cost_usd,
         similarity_cutoff=None if cutoff is None else Decimal(str(cutoff)),
     )
-    state = calibration.gate(m, active_cases=active_cases)
+    state = calibration.gate(m, active_cases=await gate_cases(conn))
     passed = None if run.kind != "golden" or state == "uncalibrated" else state == "passed"
     return _Calibrated(state, calibration.metrics_json(m, state=state), passed)
 
@@ -1177,7 +1178,7 @@ async def _alert(conn: AsyncConnection, run: _Run, calibrated: _Calibrated) -> N
     canary run (L4632). Ids and numbers only."""
     if run.kind == "golden" and run.route == "production" and calibrated.passed is False:
         c = run.candidate
-        failed = calibrated.metrics.get("failed")
+        failed = calibrated.metrics.get("failed_gates")
         names = [str(name) for name in failed] if isinstance(failed, list) else []
         await raise_alert(
             conn,
@@ -1186,7 +1187,7 @@ async def _alert(conn: AsyncConnection, run: _Run, calibrated: _Calibrated) -> N
             subject=f"{c.rubric_version_id}:{c.prompt_schema_version_id}:{c.model_policy_id}:"
             f"{c.evaluation_policy_id}",
             message=f"eval run {run.id} failed the golden-set gate: {', '.join(names)}",
-            context={"eval_run_id": run.id, "failed": list(names)},
+            context={"eval_run_id": run.id, "failed_gates": list(names)},
         )
     if run.kind == "canary":
         for drift in await calibration.canary_drift(conn, eval_run_id=run.id):
@@ -1288,7 +1289,7 @@ async def run_eval(
     async with engine.begin() as conn:
         await execution.owner.lock(conn)
         cost = await _cost(conn, run.id)
-        calibrated = await _calibrate(conn, run, config, active_cases=len(cases), now=now)
+        calibrated = await _calibrate(conn, run, config, now=now)
         await transition(
             conn,
             "eval_runs",

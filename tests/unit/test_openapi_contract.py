@@ -171,3 +171,11 @@ def test_only_the_403_of_routes_that_need_x_jh_request_names_it(document) -> Non
     for (method, path), response in forbidden.items():
         assert ("X-JH-Request" in response["description"]) == (path != LOGIN_PATH), (method, path)
         assert "Origin" in response["description"], (method, path)
+
+
+def test_the_settings_save_documents_each_of_its_409s(document) -> None:
+    """M3 Task 20 fix round 1, item 9: the save's 409 names the gate's refusals, `eval_gate_failed` and the
+    unverified model policy's `conflict_state` (`schema_dry_run_required`), beside the M2 codes."""
+    description = error_responses(document)[("post", "/api/settings", "409")]["description"]
+    for code in ("stale_base_version", "eval_gate_failed", "conflict_state", "schema_dry_run_required"):
+        assert f"`{code}`" in description, code

@@ -658,6 +658,26 @@ def test_generator_effort_low_needs_a_passing_or_uncalibrated_gate() -> None:
     assert validate_fields(critic_low, gate="failed")[1] == []
 
 
+def test_a_failed_gate_refuses_selecting_generator_low_not_keeping_it() -> None:
+    """Ruling T20-d (L3827, "low can be selected only after the gate shows parity"): with the gate failed,
+    a document that changes the generator's effort to `low` is refused; one that carries the active `low`
+    unchanged is valid, with the warning `eval_failed`."""
+    active_low = Settings.model_validate(low_generator())
+    active_medium = Settings()
+    assert validate_fields(low_generator(), gate="failed", active=active_low) == (active_low, [])
+    _, issues = validate_fields(low_generator(), gate="failed", active=active_medium)
+    assert [(i.field, i.code) for i in issues] == [
+        ("payload.scoring.model_policy.nodes.generate.effort", "conflict")
+    ]
+    kept = Settings.model_validate(low_generator())
+    assert warnings_only(kept, gate="failed", active=active_low) == [Warning("eval_failed", node="generate")]
+    assert warnings_only(kept, gate="passed", active=active_low) == []
+    # below 30 cases M2's warning, whether selected or kept
+    assert warnings_only(kept, gate="uncalibrated", active=active_low) == [
+        Warning("eval_uncalibrated", node="generate")
+    ]
+
+
 def test_warnings_only() -> None:
     assert warnings_only(Settings(), gate="uncalibrated") == []
     low = Settings.model_validate(low_generator())

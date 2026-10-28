@@ -24,7 +24,7 @@ and its startup assertions) and work on the installation's database, where the g
   (`eval_runner.NoActiveCases`, `eval_no_cases`; M3 Task 20, Codex r1 #34). Once the run has ended it prints
   the run's case table in Markdown (`case_table`: each case repetition's case, source, label, outcome,
   `score_mid`, binding knockouts and expected knockouts, the table the manual workflow uploads), then the
-  summary line with the gate's state.
+  summary line with the gate's state and the gates it failed (`metrics.failed_gates`).
 
 The output is ids, counts, codes and amounts only (stdout: the case table and the summary; stderr: the logs
 and the run's id at its start), never content or a key. An error prints its class only (SQLAlchemy puts bound
@@ -108,13 +108,15 @@ def read_payload(path: Path) -> JSONValue:
 
 
 def summary(*, eval_run_id: int, status: str, metrics: JSONValue, cost: str) -> str:
-    """The summary line of a run's end: its id, status, failure code (when failed), the gate's state (when the
-    run completed) and cost."""
-    failed = metrics.get("failed") if isinstance(metrics, dict) else None
-    gate = metrics.get("gate") if isinstance(metrics, dict) else None
+    """The summary line of a run's end: its id, status, failure code (a failed run's `metrics.failed`), the
+    gate's state and the gates it failed (a completed run's `metrics.gate` and `metrics.failed_gates`) and
+    cost."""
+    doc = metrics if isinstance(metrics, dict) else {}
+    failed, gate, gates = doc.get("failed"), doc.get("gate"), doc.get("failed_gates")
     reason = f" failed={failed}" if isinstance(failed, str) else ""
     gated = f" gate={gate}" if isinstance(gate, str) else ""
-    return f"eval_run={eval_run_id} status={status}{reason}{gated} cost_usd={cost}"
+    names = f" failed_gates={','.join(str(g) for g in gates)}" if isinstance(gates, list) and gates else ""
+    return f"eval_run={eval_run_id} status={status}{reason}{gated}{names} cost_usd={cost}"
 
 
 _TABLE_HEAD: Final = (
