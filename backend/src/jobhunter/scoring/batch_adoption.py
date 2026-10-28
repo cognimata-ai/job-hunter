@@ -7,7 +7,8 @@ workspace's listing, its batch adopted and its results completed by the poll's o
 15 min on `aux`, L3984-3999), for every `submit_ambiguous` submission and every `released` one with
 `submit_started_at > now - 29 days` (A2 B12; an older one is listed no more): first, at 25 h after its
 submit-start, each `submit_ambiguous` one opens the critical `batch.submit_ambiguous_unresolved` with the
-amount it holds (never a transition, chair decision C3; also while the listing fails, C22); then one listing
+amount it holds and the unread candidates of the last pass (`reconcile_report.unread_candidates`, 0 without;
+never a transition, chair decision C3; also while the listing fails, C22); then one listing
 of the whole workspace (`list_all`; a failure leaves every row untouched, logged `batch_listing_failed`; the
 workspace is this installation's alone, A2 B15), less the batches some submission adopted already. For each
 submission, the candidates are the batches created within `[submit_started_at - 1 min, submit_started_at + 10
@@ -23,9 +24,12 @@ ids intersect ours partially, or more than one equal to ours, raises `batch.cust
 lines are foreign and how many of ours are lacking) and adopts nothing (rule 4); a pass without a match
 records `last_reconcile_at` and `reconcile_report = {…, "candidates": n, "listed": m}`. A pass in which an
 ended candidate of the window cannot be read whole decides nothing for the submission (no adoption, no
-anomaly, no record; logged `batch_adoption_deferred`), since that candidate may intersect ours; the next pass
-tries again. One submission's unexpected error is logged with its class and leaves the others to the pass
-(Ruling T17-a).
+anomaly, no transition; logged `batch_adoption_deferred`), since that candidate may intersect ours; the next
+pass tries again. It leaves a durable trace (Carry T17-d): `last_reconcile_at` and `reconcile_report = {…,
+"candidates": n, "listed": m, "unread_candidates": k}`, the count of candidates it could not read, which the
+25 h alert's context then carries; a later pass that reads every candidate (with no match, or adopting ours)
+removes the count. One submission's unexpected error is logged with its class and leaves the others to the
+pass (Ruling T17-a).
 
 **The task body** (`reconcile_ambiguous_task`, Deviation 27: the periodic task `batch_reconcile_ambiguous` of
 `worker.tasks`, under the queueing lock of its name) builds the client from the worker's config and gateway
@@ -57,6 +61,7 @@ from jobhunter.observability.alerts import open_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import batches, cycles
 from jobhunter.scoring.batch_results import batches_client, custom_id_anomaly, items_of, process_results
+from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, defer_in_tx
 
@@ -70,7 +75,9 @@ _SUBMISSIONS: Final = "batch_submissions"
 # The ambiguous reconciliation's submissions (L3984: every `submit_ambiguous` one, the `released` ones within
 # the results' retention), the ids adopted already, its owner and its record of a pass without a match.
 _AMBIGUOUS: Final = q(
-    "SELECT id, state, submit_started_at, request_count, reserved_usd FROM batch_submissions "
+    "SELECT id, state, submit_started_at, request_count, reserved_usd, "
+    "coalesce(CAST(reconcile_report ->> 'unread_candidates' AS integer), 0) AS unread_candidates "
+    "FROM batch_submissions "
     "WHERE state = 'submit_ambiguous' OR (state = 'released' AND submit_started_at > :since) ORDER BY id"
 )
 _ADOPTED_IDS: Final = q("SELECT provider_batch_id FROM batch_submissions WHERE provider_batch_id IS NOT NULL")
@@ -78,11 +85,17 @@ _LOCK_ADOPTABLE: Final = q(
     "SELECT state, cancel_requested_at FROM batch_submissions WHERE id = :s "
     "AND state IN ('submit_ambiguous', 'released') AND provider_batch_id IS NULL FOR UPDATE"
 )
+# A pass's record: the report's keys merged, `unread_candidates` dropped first (a pass that read every
+# candidate leaves none; a deferred one writes its own count, Carry T17-d).
 _RECORD_PASS: Final = q(
     "UPDATE batch_submissions SET last_reconcile_at = :now, "
-    "reconcile_report = coalesce(reconcile_report, '{}') || :report "
+    "reconcile_report = (coalesce(reconcile_report, '{}') - 'unread_candidates') || :report "
     "WHERE id = :s AND state IN ('submit_ambiguous', 'released')",
     jsonb=["report"],
+)
+_FORGET_UNREAD: Final = q(
+    "UPDATE batch_submissions SET reconcile_report = reconcile_report - 'unread_candidates' "
+    "WHERE id = :s AND reconcile_report ? 'unread_candidates'"
 )
 
 log = get_logger("jobhunter.scoring.batch_adoption")
@@ -132,7 +145,11 @@ async def _unresolved(
                 severity="critical",
                 subject=str(r.id),
                 message="a batch submission is still ambiguous 25 h after its send; release it to re-score",
-                context={"submission_id": int(r.id), "reserved_usd": str(r.reserved_usd)},
+                context={
+                    "submission_id": int(r.id),
+                    "reserved_usd": str(r.reserved_usd),
+                    "unread_candidates": int(r.unread_candidates),
+                },
             )
             opened += found is not None
     return opened
@@ -180,6 +197,7 @@ async def _adopt(
                 "last_reconcile_at": now,
             },
         )
+        await conn.execute(_FORGET_UNREAD, {"s": submission_id})  # this pass read every candidate
     log.warning(
         "batch_adopted",
         submission_id=submission_id,
@@ -191,14 +209,22 @@ async def _adopt(
 
 
 async def _record_pass(
-    engine: AsyncEngine, submission_id: int, *, now: datetime, epoch: int, candidates: int, listed: int
+    engine: AsyncEngine,
+    submission_id: int,
+    *,
+    now: datetime,
+    epoch: int,
+    candidates: int,
+    listed: int,
+    unread: int = 0,
 ) -> None:
+    """A pass that adopted nothing, recorded (module docstring): with `unread` candidates, their count."""
+    report: dict[str, JSONValue] = {"candidates": candidates, "listed": listed}
+    if unread:
+        report["unread_candidates"] = unread
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
-        await conn.execute(
-            _RECORD_PASS,
-            {"s": submission_id, "now": now, "report": {"candidates": candidates, "listed": listed}},
-        )
+        await conn.execute(_RECORD_PASS, {"s": submission_id, "now": now, "report": report})
 
 
 async def reconcile_ambiguous(
@@ -281,6 +307,15 @@ async def _reconcile_one(
             partial.append(ids)
     if unread:  # a candidate not read whole may intersect ours: nothing is decided until every one is
         log.warning("batch_adoption_deferred", submission_id=submission_id, unread_candidates=unread)
+        await _record_pass(
+            engine,
+            submission_id,
+            now=now,
+            epoch=epoch,
+            candidates=len(window),
+            listed=len(listing),
+            unread=unread,
+        )
         return replace(report, unread=report.unread + 1)
     if partial or len(equal) > 1:  # rule 4 (or no one match): never adopted
         first = partial[0] if partial else ours

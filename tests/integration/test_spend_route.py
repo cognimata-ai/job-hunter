@@ -1,5 +1,8 @@
 """`GET /api/system/spend` and the `llm` section of `GET /api/system/health` (spec §14.2, §17.5; plan Task
-16): the month row read without a lock (`spend_ledger.read_month`), the totals from the ledger."""
+16): the month row read without a lock (`spend_ledger.read_month`), the totals from the ledger. M3 Task 21:
+`c_hat` with its source and `critic_rate_7d` of the active tuple, with and without history, the bulk
+operation, the quarantined batch spend, the pause reason, and the eval spend apart from live scoring (Carry
+T19-d)."""
 
 import asyncio
 from datetime import datetime, timedelta
@@ -12,12 +15,31 @@ from jobhunter.clock import utcnow
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams, month_of
-from jobhunter.llm.spend_ledger import CallOutcome, mark_dispatched, reserve, settle
+from jobhunter.llm.spend_ledger import (
+    BOUND_VIOLATED_ALERT,
+    CallOutcome,
+    EvalRunOwner,
+    mark_dispatched,
+    reserve,
+    settle,
+)
+from jobhunter.observability.alerts import raise_alert
 from jobhunter.settings.llm_projection import central_cost_per_target
 from jobhunter.settings.model import ModelPolicy
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.eval import insert_cases
 from tests.support.llm import USAGE, budget_rows, completed_call, reserve_kw, save_budget
+from tests.support.m3 import (
+    insert_attempt,
+    insert_bulk_operation,
+    insert_id,
+    insert_job,
+    insert_scoring_call,
+    insert_submission,
+    insert_target,
+)
+from tests.support.scoring import activate_score_tuple
 
 pytestmark = pytest.mark.integration
 
@@ -174,3 +196,164 @@ async def test_a_later_settlement_moves_the_figures(logged_in_client, engine, op
     body = await spend(logged_in_client)
     assert (body["counted"], body["reserved"]) == ("0.088000", "0.040000")
     assert body["by_model_effort_role"][0]["calls"] == 3
+
+
+# ---- M3 Task 21: ĉ, the critic rate, the bulk operation, the quarantine, the pause and the eval spend ------
+
+
+async def history(engine: AsyncEngine, tuple_id: int, *, ended: datetime) -> None:
+    """50 online, charged attempts of the tuple under the active evaluation policy that ended published at
+    `ended`, half at $0.10 and half at $0.20, the first ten with a dispatched first-round critic call."""
+    async with engine.begin() as conn:
+        job = await insert_job(conn)
+        target = await insert_target(conn, job, tuple_id, state="refused", refusal_category="other")
+        for attempt_no in range(1, 51):
+            attempt = await insert_attempt(
+                conn,
+                target,
+                attempt_no=attempt_no,
+                outcome="published_accepted",
+                charged=True,
+                cost_usd=Decimal("0.100000") if attempt_no % 2 else Decimal("0.200000"),
+                started_at=ended - timedelta(minutes=5),
+                ended_at=ended,
+            )
+            if attempt_no <= 10:
+                _, call = await insert_scoring_call(
+                    conn, attempt_id=attempt, target_id=target, purpose="critic"
+                )
+                await conn.execute(
+                    sa.text("UPDATE llm_calls SET round = 1, status = 'dispatched' WHERE id = :c"),
+                    {"c": call},
+                )
+
+
+async def test_without_history_c_hat_is_central_and_there_is_no_critic_rate_or_bulk_operation(
+    logged_in_client, engine, now
+) -> None:
+    body = await spend(logged_in_client)
+    assert (body["c_hat"], body["c_hat_source"]) == ("0.052646", "central")
+    assert (body["critic_rate_7d"], body["bulk_operation"], body["quarantined_batch_usd"]) == (
+        None,
+        None,
+        "0.000000",
+    )
+    assert body["pause_reason"] == "schema_unverified"  # this api is a live process: nothing verified yet
+    assert body["eval_by_model_role"] == []
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+    await history(engine, tuple_id, ended=now - timedelta(days=8))  # outside the trailing 7 days
+    body = await spend(logged_in_client)
+    assert (body["c_hat"], body["c_hat_source"], body["critic_rate_7d"]) == ("0.052646", "central", None)
+
+
+async def test_with_history_c_hat_and_the_critic_rate_are_the_tuple_s_and_the_bulk_operation_is_shown(
+    logged_in_client, engine, now
+) -> None:
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+        bulk_id = await insert_bulk_operation(
+            conn, tuple_id, budget_usd=Decimal("37.240000"), spent_usd=Decimal("1.500000")
+        )
+        await conn.execute(
+            sa.text("UPDATE bulk_operations SET followup_held_usd = 0.25 WHERE id = :b"), {"b": bulk_id}
+        )
+        submission = await insert_submission(
+            conn,
+            tuple_id,
+            bulk_id,
+            state="submit_ambiguous",
+            submit_started_at=now,
+            reserved_usd=Decimal("0.012000"),
+        )
+        await raise_alert(
+            conn,
+            code=BOUND_VIOLATED_ALERT,
+            severity="critical",
+            subject="model:claude-sonnet-5-5",
+            message="test",
+        )
+    await history(engine, tuple_id, ended=now - timedelta(days=1))
+    body = await spend(logged_in_client)
+    assert (body["c_hat"], body["c_hat_source"]) == ("0.150000", "history")  # 25 x $0.10 and 25 x $0.20
+    assert body["critic_rate_7d"] == "0.2000"  # 10 of 50
+    assert body["bulk_operation"] == {
+        "id": bulk_id,
+        "state": "active",
+        "budget_usd": "37.240000",
+        "spent_usd": "1.500000",
+        "followup_held_usd": "0.250000",
+        "llm_tuple_id": tuple_id,
+    }
+    assert body["quarantined_batch_usd"] == "0.012000" and submission
+    assert body["pause_reason"] == "reservation_bound_violated"
+
+
+async def test_eval_spend_is_reported_apart_from_live_scoring_and_outlives_its_case(
+    logged_in_client, engine, eval_owner, now
+) -> None:
+    """Carry T19-d: an eval case's calls are non-scoring tries of the eval run; they never join the live
+    scoring rows of the same model, effort and role, and once the case is deleted (its call rows go with it by
+    cascade) their ledger entries still count, in the eval spend, never as a row with no effort."""
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+        job = await insert_job(conn)
+        target = await insert_target(conn, job, tuple_id)
+        attempt = await insert_attempt(conn, target)
+        await insert_scoring_call(
+            conn, attempt_id=attempt, target_id=target
+        )  # live: Sonnet, medium, generate
+        run = await insert_id(
+            conn,
+            "eval_runs",
+            {"kind": "golden", "route": "production", "status": "running", "repetitions": 2},
+        )
+    (case,) = await insert_cases(engine, 1)
+    owner = EvalRunOwner(run)
+    kw = reserve_kw(
+        owner,
+        now=now,
+        bound=4000,
+        max_tokens=1000,
+        purpose="generate",
+        model="claude-sonnet-5-5",
+        deadline_s=600,
+        golden_case_id=case.id,
+    )
+    async with engine.begin() as conn:
+        reservation = await reserve(conn, **kw)
+        await mark_dispatched(conn, reservation, owner, now=now)
+    async with engine.begin() as conn:
+        await settle(
+            conn, reservation, outcome="billed", evidence=None, usage=USAGE, call=completed_call(), now=now
+        )
+    body = await spend(logged_in_client)
+    live = {
+        "model": "claude-sonnet-5-5",
+        "effort": "medium",
+        "role": "generate",
+        "calls": 1,
+        "counted": "0.100000",
+    }
+    assert body["by_model_effort_role"] == [live]
+    (eval_row,) = body["eval_by_model_role"]
+    assert (eval_row["model"], eval_row["role"], eval_row["calls"]) == ("claude-sonnet-5-5", "generate", 1)
+    counted = eval_row["counted"]
+    assert Decimal(counted) > 0
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE eval_runs SET status = 'completed', finished_at = now() WHERE id = :r"),
+            {"r": run},
+        )
+    r = await logged_in_client.delete(f"/api/golden-cases/{case.id}")
+    assert r.status_code == 204, r.text
+    async with engine.connect() as conn:
+        calls = (
+            await conn.execute(sa.text("SELECT count(*) FROM llm_calls WHERE eval_run_id = :r"), {"r": run})
+        ).scalar_one()
+    assert calls == 0  # gone with the case
+    body = await spend(logged_in_client)
+    assert body["by_model_effort_role"] == [live]  # no effort-less row
+    assert body["eval_by_model_role"] == [
+        {"model": "claude-sonnet-5-5", "role": "generate", "calls": 1, "counted": counted}
+    ]

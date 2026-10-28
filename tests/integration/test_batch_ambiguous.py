@@ -324,8 +324,9 @@ async def test_the_adoption_decides_nothing_while_a_candidate_cannot_be_read_who
 ) -> None:
     """Rule 3 and rule 4 (L3989-3990): an ended candidate of the window whose results cannot be read whole may
     intersect ours, so a pass with one decides nothing for the submission, not even with our exact batch
-    beside it: nothing adopted, no anomaly, the row untouched; the next pass, which reads every candidate
-    whole, adopts ours (the other is disjoint)."""
+    beside it: nothing adopted, no anomaly, no transition; the pass leaves a durable trace, the count of
+    unread candidates in `reconcile_report` (Carry T17-d); the next pass, which reads every candidate whole,
+    adopts ours (the other is disjoint) and the count goes."""
     ours = [f"t{t.target_id}_a1" for t in setup.targets]
     fake_llm.batches(BatchScript(create="ambiguous_created", polls_until_ended=0))
     await ambiguous(engine, op_runner, setup)
@@ -344,13 +345,62 @@ async def test_the_adoption_decides_nothing_while_a_candidate_cannot_be_read_who
     assert report.unread == 1
     (row,) = await submission_rows(engine)
     assert (row.state, row.provider_batch_id) == ("submit_ambiguous", None)
-    assert (row.last_reconcile_at, row.reconcile_report) == (
-        before.last_reconcile_at,
-        before.reconcile_report,
-    )
+    assert row.last_reconcile_at is not None and before.last_reconcile_at is None
+    assert row.reconcile_report == {
+        **before.reconcile_report,
+        "candidates": 2,
+        "listed": 2,
+        "unread_candidates": 1,
+    }
     monkeypatch.setattr(BatchesClient, "results", real)
     report = await reconcile_ambiguous_once(engine, fake_llm)
     assert (report.adopted, report.reconciled, report.unread) == (1, 1, 0)
+    (row,) = await submission_rows(engine)
+    assert "unread_candidates" not in row.reconcile_report  # the deciding pass read every candidate
+
+
+async def test_the_unresolved_alert_and_a_pass_without_a_match_say_whether_a_candidate_was_unread(
+    engine: AsyncEngine,
+    op_runner: OpRunner,
+    fake_llm: FakeLLM,
+    setup: BulkTargets,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Carry T17-d: the 25 h `batch.submit_ambiguous_unresolved` carries the unread candidates of the last
+    pass (ids and numbers only), and a later pass that reads every candidate without a match records its
+    count no more."""
+    ours = [f"t{t.target_id}_a1" for t in setup.targets]
+    fake_llm.batches(BatchScript(create="ambiguous_not_created"))
+    row = await ambiguous(engine, op_runner, setup)
+    started = row.submit_started_at
+    other = await partial_batch(fake_llm, ours, shared=0)  # of our size, in our window, disjoint
+    real = BatchesClient.results
+
+    async def failing(self: BatchesClient, batch_id: str) -> Any:
+        if batch_id == other:
+            raise BatchApiError("results", status=500, error_class="InternalServerError")
+        return await real(self, batch_id)
+
+    monkeypatch.setattr(BatchesClient, "results", failing)
+    report = await reconcile_ambiguous_once(engine, fake_llm, now=started + timedelta(hours=1))
+    assert (report.unread, report.unresolved) == (1, 0)
+    report = await reconcile_ambiguous_once(engine, fake_llm, now=started + timedelta(hours=25, minutes=1))
+    assert (report.unread, report.unresolved) == (1, 1)
+    async with engine.connect() as conn:
+        (context,) = (
+            await conn.execute(sa.text("SELECT context FROM alerts WHERE code = :c"), {"c": UNRESOLVED})
+        ).scalars()
+    assert context == {
+        "submission_id": row.id,
+        "reserved_usd": str(row.reserved_usd),
+        "unread_candidates": 1,
+    }
+    monkeypatch.setattr(BatchesClient, "results", real)
+    report = await reconcile_ambiguous_once(engine, fake_llm, now=started + timedelta(hours=26))
+    assert (report.unread, report.adopted, report.anomalies) == (0, 0, 0)
+    (after,) = await submission_rows(engine)
+    assert after.state == "submit_ambiguous"
+    assert after.reconcile_report == {**row.reconcile_report, "candidates": 1, "listed": 1}
 
 
 async def test_a_batch_item_parses_with_the_stored_family(

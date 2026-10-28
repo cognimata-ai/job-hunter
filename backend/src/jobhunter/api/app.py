@@ -43,8 +43,10 @@ from jobhunter.api.edge import EdgeMiddleware
 from jobhunter.api.errors import exception_handlers
 from jobhunter.api.openapi import JobHunterAPI
 from jobhunter.api.routes import (
+    alerts,
     auth,
     geo,
+    golden,
     health,
     profile,
     profile_review,
@@ -53,6 +55,7 @@ from jobhunter.api.routes import (
     settings,
     spend,
     system,
+    targets,
     watchlist,
 )
 from jobhunter.config import AppConfig, startup_or_exit
@@ -198,6 +201,9 @@ def create_app(
     api.include_router(queries.router)
     api.include_router(watchlist.router)
     api.include_router(geo.router)
+    api.include_router(targets.router)
+    api.include_router(golden.router)
+    api.include_router(alerts.router)
     for router in extra_routers:
         api.include_router(router)
     api.state.rate_limiter = SessionRateLimiter()

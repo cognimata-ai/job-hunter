@@ -33,6 +33,23 @@ The reads, each a plain `SELECT` (no lock):
   previous version's document and this one's (empty for version 1), both read as normal forms. 404
   `not_found` for an unknown id.
 
+The shipped versions (M3 Task 21, §13.3 L4896-4900, §14.2 L5005-5006, Deviation 23):
+- `GET /api/settings/rubric-versions` → `[{id, version, content_hash, created_at, active}]` and `GET
+  /api/settings/prompt-schema-versions` → `[{id, prompt_schema_hash, created_at, active, dry_run}]`, by id,
+  plain reads: `active` is the version `active_config` points at, the hashes are hex, and `dry_run` is the
+  version's newest schema dry-run (`{eval_run_id, passed, transport, finished_at}`, by `started_at`; its
+  `passed`, `transport` and `finished_at` null while it runs) or `null` without one, so the id to activate is
+  discoverable;
+- `POST /api/settings/rubric-versions/{id}/activate` and `POST /api/settings/prompt-schema-versions/{id}/
+  activate` (`Idempotency-Key`; `{expected_rescore_ack, eval_override_ack?}`) → 201 `{version, llm_tuple_id,
+  targets_to_create, bulk_budget_usd}` (Ruling P41): `settings.activate.activate_shipped_version` in one
+  transaction, `active_config FOR UPDATE` first, then `run_idempotent` around it, as the save does. 404
+  `not_found` for no such version; 409 `conflict_state` for the active one and (detail
+  `schema_dry_run_required`) for a model policy without a passed live schema dry-run, `eval_gate_failed`
+  and `idempotency_in_progress`; 422 `validation_failed` (the re-score not acknowledged at
+  `body.expected_rescore_ack`, an invalid body) and `idempotency_key_reused`. `shipped_version_activated` is
+  logged with the ids after the commit, a refusal as `shipped_version_activation_refused` with its code.
+
 `POST /api/settings/scope/retry-apply` (Task 18, §13.4 step 5) → 202 `{operation_id}`: a new `apply_scope`
 operation for the active settings version's scope, after a permanent failure cleared the pending pointer. In
 one transaction: `active_config` `FOR UPDATE` first (§9.1), then the scope `derive.derived` gives for the
@@ -49,15 +66,24 @@ warning codes and effect classes only, never a value of the payload.
 """
 
 from datetime import UTC, datetime
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Header, Path, Query
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+    field_validator,
+)
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
+from jobhunter.api.models import DecimalOut
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
     CURSOR_VERSION,
@@ -80,12 +106,18 @@ from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
 from jobhunter.settings import scope_apply
+from jobhunter.settings.activate import (
+    ActivateRequest,
+    ShippedActivation,
+    ShippedKind,
+    activate_shipped_version,
+)
 from jobhunter.settings.active import lock_active
 from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.dryrun import active_settings, dry_run
 from jobhunter.settings.effects import EffectClass, diff_payloads
 from jobhunter.settings.model import Settings
-from jobhunter.settings.save import SaveOutcome, SaveRequest, save_settings
+from jobhunter.settings.save import SCHEMA_DRY_RUN_REQUIRED, SaveOutcome, SaveRequest, save_settings
 from jobhunter.settings.scope_apply import KIND as APPLY_SCOPE
 from jobhunter.settings.validate import IssueCode
 from jobhunter.types import JSONValue
@@ -124,6 +156,23 @@ _VERSION: Final = q(
     "SELECT id, version_no, created_at, effect_classes, payload FROM settings_versions WHERE id = :id"
 )
 _PREVIOUS: Final = q("SELECT payload FROM settings_versions WHERE version_no = :no")
+_RUBRIC_VERSIONS: Final = q(
+    "SELECT r.id, r.version, r.content_hash, r.created_at, r.id = a.rubric_version_id AS active "
+    "FROM rubric_versions r CROSS JOIN active_config a WHERE a.id = 1 ORDER BY r.id"
+)
+# Each version with its newest schema dry-run (by `started_at`, then id), whatever its end.
+_PROMPT_SCHEMA_VERSIONS: Final = q(
+    "SELECT p.id, p.prompt_schema_hash, p.created_at, p.id = a.prompt_schema_version_id AS active, "
+    "d.id AS eval_run_id, d.passed, d.metrics ->> 'transport' AS transport, d.finished_at "
+    "FROM prompt_schema_versions p CROSS JOIN active_config a LEFT JOIN LATERAL (SELECT e.id, e.passed, "
+    "e.metrics, e.finished_at FROM eval_runs e WHERE e.kind = 'schema_dry_run' "
+    "AND e.prompt_schema_version_id = p.id ORDER BY e.started_at DESC, e.id DESC LIMIT 1) d ON true "
+    "WHERE a.id = 1 ORDER BY p.id"
+)
+ACTIVATE_ROUTES: Final[dict[ShippedKind, str]] = {
+    "rubric": "settings.rubric_versions.activate",
+    "prompt_schema": "settings.prompt_schema_versions.activate",
+}
 _NEVER: Final = (
     "null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is "
     "ever refreshed"
@@ -247,7 +296,65 @@ class RetryApplyOut(BaseModel):
     operation_id: int = Field(description="The new `apply_scope` operation of the active version's scope")
 
 
+def _utc(value: datetime) -> datetime:
+    return value.astimezone(UTC)
+
+
+UtcDatetime = Annotated[datetime, AfterValidator(_utc)]
+
+
+class RubricVersionOut(BaseModel):
+    """A shipped rubric version; `content_hash` in hex, `active` when `active_config` points at it."""
+
+    id: int
+    version: str
+    content_hash: str
+    created_at: UtcDatetime
+    active: bool
+
+
+class SchemaDryRunOut(BaseModel):
+    """A schema dry-run of a prompt-schema version (§10.11): `passed`, `transport` (`live` or `fake`) and
+    `finished_at` are null while it runs."""
+
+    eval_run_id: int
+    passed: bool | None
+    transport: str | None
+    finished_at: UtcDatetime | None
+
+
+class PromptSchemaVersionOut(BaseModel):
+    """A shipped prompt-schema version, its hash in hex, whether it is active, and its newest schema
+    dry-run (`null` without one)."""
+
+    id: int
+    prompt_schema_hash: str
+    created_at: UtcDatetime
+    active: bool
+    dry_run: SchemaDryRunOut | None
+
+
+class ActivateIn(BaseModel):
+    """An activation (§14.2): `expected_rescore_ack` acknowledges the re-score of the retained ads (required
+    while there are any), `eval_override_ack` a failed eval gate (§11.13)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_rescore_ack: bool
+    eval_override_ack: bool = False
+
+
+class ActivatedOut(BaseModel):
+    version: int = Field(description="The number of the settings version the activation saved")
+    llm_tuple_id: int | None = Field(description="The tuple active after it; null while no profile is active")
+    targets_to_create: int = Field(description="The retained ads the new tuple re-scores")
+    bulk_budget_usd: DecimalOut = Field(description="The budget of the re-score's bulk operation (§6.9.3)")
+
+
 VersionId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a settings version")]
+ShippedVersionId = Annotated[
+    int, Path(ge=1, le=_BIGINT_MAX, description="The id of a shipped rubric or prompt-schema version")
+]
 
 
 @router.post(
@@ -454,6 +561,153 @@ async def get_version(
         payload=payload,
         diff=[DiffEntryOut(path=e.path, before=e.before, after=e.after) for e in diff],
     )
+
+
+@router.get("/rubric-versions", response_model=list[RubricVersionOut])
+async def list_rubric_versions(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> list[RubricVersionOut]:
+    """The shipped rubric versions, by id, the active one marked."""
+    async with engine.connect() as conn:
+        rows = (await conn.execute(_RUBRIC_VERSIONS)).all()
+    return [
+        RubricVersionOut(
+            id=row.id,
+            version=row.version,
+            content_hash=bytes(row.content_hash).hex(),
+            created_at=row.created_at,
+            active=row.active,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/prompt-schema-versions", response_model=list[PromptSchemaVersionOut])
+async def list_prompt_schema_versions(
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+) -> list[PromptSchemaVersionOut]:
+    """The shipped prompt-schema versions, by id, the active one marked, each with its newest schema
+    dry-run."""
+    async with engine.connect() as conn:
+        rows = (await conn.execute(_PROMPT_SCHEMA_VERSIONS)).all()
+    return [
+        PromptSchemaVersionOut(
+            id=row.id,
+            prompt_schema_hash=bytes(row.prompt_schema_hash).hex(),
+            created_at=row.created_at,
+            active=row.active,
+            dry_run=None
+            if row.eval_run_id is None
+            else SchemaDryRunOut(
+                eval_run_id=row.eval_run_id,
+                passed=row.passed,
+                transport=row.transport,
+                finished_at=row.finished_at,
+            ),
+        )
+        for row in rows
+    ]
+
+
+_ACTIVATE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    400: {"description": "Idempotency-Key missing or malformed (`idempotency_key_required`)"},
+    404: {"description": "No such version (`not_found`)"},
+    409: {
+        "description": "The version is the active one (`conflict_state`), the active model policy has no "
+        "passed live schema dry-run of a (schema, model) pair it needs for the prompt-schema version the "
+        "activation leaves active (`conflict_state`, detail `schema_dry_run_required`, whatever the "
+        "override), the eval gate of the candidate failed without the override (`eval_gate_failed`), or a "
+        "request with this key is still running (`idempotency_in_progress`)"
+    },
+    422: {
+        "description": "Invalid body, the re-score of retained ads not acknowledged (`validation_failed` at "
+        "`body.expected_rescore_ack`), or the key was used for another request (`idempotency_key_reused`)"
+    },
+    **CSRF_RESPONSES,
+    **BODY_LIMIT_RESPONSES,
+}
+
+
+async def _activate(
+    kind: ShippedKind, version_id: int, body: ActivateIn, engine: AsyncEngine, idempotency_key: str | None
+) -> Response:
+    """The activation's transaction (module docstring): `active_config FOR UPDATE`, then `run_idempotent`."""
+    key = check_idempotency_key(idempotency_key)  # a malformed key costs no database round trip
+    now = utcnow()
+    request = ActivateRequest(
+        expected_rescore_ack=body.expected_rescore_ack, eval_override_ack=body.eval_override_ack
+    )
+    done: list[ShippedActivation] = []  # the handler's activation; empty on a replay of the stored response
+
+    async def handler(conn: AsyncConnection) -> StoredResponse:
+        activation = await activate_shipped_version(
+            conn, kind=kind, version_id=version_id, req=request, now=now, defer=defer_in_tx
+        )
+        done.append(activation)
+        return StoredResponse(201, activation.body())
+
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(_LOCK_ACTIVE_CONFIG)  # the first lock (§9.1), before the key's row
+            stored = await run_idempotent(
+                conn,
+                route=ACTIVATE_ROUTES[kind],
+                key=key,
+                fingerprint=request_fingerprint(body.model_dump(mode="json"), {"version_id": version_id}),
+                now=now,
+                handler=handler,
+            )
+    except Problem as problem:
+        log.info(
+            "shipped_version_activation_refused",
+            kind=kind,
+            shipped_version_id=version_id,
+            code=problem.code,
+            detail_code=problem.detail if problem.detail == SCHEMA_DRY_RUN_REQUIRED else None,
+        )
+        raise
+    for activation in done:  # after the commit; a replay is logged by `run_idempotent`
+        log.info(
+            "shipped_version_activated",
+            kind=kind,
+            shipped_version_id=version_id,
+            version_id=activation.saved.version_id,
+            version_no=activation.saved.version_no,
+            llm_tuple_id=activation.saved.llm_tuple_id,
+            targets_to_create=activation.targets_to_create,
+        )
+    return JSONResponse(stored.body, status_code=stored.status)
+
+
+@router.post(
+    "/rubric-versions/{version_id}/activate",
+    status_code=201,
+    response_model=ActivatedOut,
+    responses=_ACTIVATE_RESPONSES,
+)
+async def activate_rubric_version(
+    version_id: ShippedVersionId,
+    body: ActivateIn,
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
+) -> Response:
+    """Activate a shipped rubric version: an `llm_tuple` change (§13.3), its re-score acknowledged (201)."""
+    return await _activate("rubric", version_id, body, engine, idempotency_key)
+
+
+@router.post(
+    "/prompt-schema-versions/{version_id}/activate",
+    status_code=201,
+    response_model=ActivatedOut,
+    responses=_ACTIVATE_RESPONSES,
+)
+async def activate_prompt_schema_version(
+    version_id: ShippedVersionId,
+    body: ActivateIn,
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
+) -> Response:
+    """Activate a shipped prompt-schema version: an `llm_tuple` change (§13.3) that needs a passed live schema
+    dry-run of every (schema, model) pair of the active model policy (§10.11) (201)."""
+    return await _activate("prompt_schema", version_id, body, engine, idempotency_key)
 
 
 def _retry_refused(reason: str, detail: str) -> Problem:

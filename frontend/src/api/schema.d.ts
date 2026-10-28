@@ -4,6 +4,26 @@
  */
 
 export interface paths {
+    "/api/alerts/{alert_id}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge
+         * @description Acknowledge an open alert; it stays open (200).
+         */
+        post: operations["acknowledge_api_alerts__alert_id__ack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/login": {
         parameters: {
             query?: never;
@@ -64,6 +84,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/batches/{submission_id}/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release Batch
+         * @description Release a quarantined batch submission and re-score its targets; its reserved spend stays counted as
+         *     `ambiguous` unless the batch is found later (202).
+         */
+        post: operations["release_batch_api_batches__submission_id__release_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/geo/places": {
         parameters: {
             query?: never;
@@ -78,6 +119,91 @@ export interface paths {
         get: operations["search_places_api_geo_places_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/golden-cases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Golden Cases
+         * @description The golden cases by id, keyset-paged (§14.3).
+         */
+        get: operations["list_golden_cases_api_golden_cases_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/golden-cases/{case_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Golden Case
+         * @description Delete a golden case and its eval rows (204); its job's inputs lose their retention exemption.
+         */
+        delete: operations["delete_golden_case_api_golden_cases__case_id__delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Set Golden Case Flags
+         * @description Set the case's `active` and `is_canary` flags; the case.
+         */
+        patch: operations["set_golden_case_flags_api_golden_cases__case_id__patch"];
+        trace?: never;
+    };
+    "/api/jobs/{job_id}/feedback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record Feedback
+         * @description Label a scored job, or mark its score wrong: the feedback with its score snapshot, and its golden case
+         *     (201).
+         */
+        post: operations["record_feedback_api_jobs__job_id__feedback_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{job_id}/score-now": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Score Now
+         * @description Score the job's target now, outside the cycle's admission and the bucket (202).
+         */
+        post: operations["score_now_api_jobs__job_id__score_now_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -434,6 +560,88 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/prompt-schema-versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Prompt Schema Versions
+         * @description The shipped prompt-schema versions, by id, the active one marked, each with its newest schema
+         *     dry-run.
+         */
+        get: operations["list_prompt_schema_versions_api_settings_prompt_schema_versions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/prompt-schema-versions/{version_id}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Activate Prompt Schema Version
+         * @description Activate a shipped prompt-schema version: an `llm_tuple` change (§13.3) that needs a passed live schema
+         *     dry-run of every (schema, model) pair of the active model policy (§10.11) (201).
+         */
+        post: operations["activate_prompt_schema_version_api_settings_prompt_schema_versions__version_id__activate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/rubric-versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Rubric Versions
+         * @description The shipped rubric versions, by id, the active one marked.
+         */
+        get: operations["list_rubric_versions_api_settings_rubric_versions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/rubric-versions/{version_id}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Activate Rubric Version
+         * @description Activate a shipped rubric version: an `llm_tuple` change (§13.3), its re-score acknowledged (201).
+         */
+        post: operations["activate_rubric_version_api_settings_rubric_versions__version_id__activate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/settings/scope/retry-apply": {
         parameters: {
             query?: never;
@@ -515,6 +723,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/system/score-cycle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request Score Cycle
+         * @description Request a manual score cycle (202), and say at once why it would start nothing.
+         */
+        post: operations["request_score_cycle_api_system_score_cycle_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/system/spend": {
         parameters: {
             query?: never;
@@ -525,11 +753,32 @@ export interface paths {
         /**
          * Get Spend
          * @description The LLM spend of the current month: counted, billed, ambiguous and in flight, the cap and headroom,
-         *     the USD bucket, `ĉ`, the projected critic rate, and the spend per model, effort and role.
+         *     the USD bucket, `ĉ`, the critic rates, the bulk operation, the quarantined batch spend, the score lane's
+         *     pause, and the spend per model, effort and role, the eval runs' apart.
          */
         get: operations["get_spend_api_system_spend_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/targets/{target_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Target
+         * @description Retry a refused or failed target: its charged attempts reset, scored now (202).
+         */
+        post: operations["retry_target_api_targets__target_id__retry_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -642,6 +891,53 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AcknowledgedOut */
+        AcknowledgedOut: {
+            /**
+             * Acknowledged At
+             * Format: date-time
+             */
+            acknowledged_at: string;
+            /** Id */
+            id: number;
+        };
+        /**
+         * ActivateIn
+         * @description An activation (§14.2): `expected_rescore_ack` acknowledges the re-score of the retained ads (required
+         *     while there are any), `eval_override_ack` a failed eval gate (§11.13).
+         */
+        ActivateIn: {
+            /**
+             * Eval Override Ack
+             * @default false
+             */
+            eval_override_ack: boolean;
+            /** Expected Rescore Ack */
+            expected_rescore_ack: boolean;
+        };
+        /** ActivatedOut */
+        ActivatedOut: {
+            /**
+             * Bulk Budget Usd
+             * @description The budget of the re-score's bulk operation (§6.9.3)
+             */
+            bulk_budget_usd: string;
+            /**
+             * Llm Tuple Id
+             * @description The tuple active after it; null while no profile is active
+             */
+            llm_tuple_id: number | null;
+            /**
+             * Targets To Create
+             * @description The retained ads the new tuple re-scores
+             */
+            targets_to_create: number;
+            /**
+             * Version
+             * @description The number of the settings version the activation saved
+             */
+            version: number;
+        };
         /** AlertsOpen */
         AlertsOpen: {
             /** Critical */
@@ -659,6 +955,28 @@ export interface components {
             rate_per_h: string;
             /** Usd */
             usd: string;
+        };
+        /**
+         * BulkOperationOut
+         * @description The active tuple's newest bulk operation (§6.9.3): its fixed budget, its counted spend and the
+         *     follow-up holds of its batched items.
+         */
+        BulkOperationOut: {
+            /** Budget Usd */
+            budget_usd: string;
+            /** Followup Held Usd */
+            followup_held_usd: string;
+            /** Id */
+            id: number;
+            /** Llm Tuple Id */
+            llm_tuple_id: number;
+            /** Spent Usd */
+            spent_usd: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "active" | "completed" | "cancelled";
         };
         /** Certification */
         Certification: {
@@ -836,6 +1154,24 @@ export interface components {
             /** Ok */
             ok: boolean;
         };
+        /**
+         * EvalSpendGroupOut
+         * @description The month's tries of eval runs (golden, canary, schema dry-run) of one model and role, and what they
+         *     count.
+         */
+        EvalSpendGroupOut: {
+            /** Calls */
+            calls: number;
+            /** Counted */
+            counted: string;
+            /** Model */
+            model: string;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "generate" | "revise" | "critic" | "extract_profile" | "propose_queries" | "schema_dry_run";
+        };
         /** ExtractingOut */
         ExtractingOut: {
             /**
@@ -843,6 +1179,31 @@ export interface components {
              * @constant
              */
             status: "extracting_profile";
+        };
+        /**
+         * FeedbackIn
+         * @description A label, or a "wrong score" with the label the user expected (§14.2 L4977).
+         */
+        FeedbackIn: {
+            /** Comment */
+            comment?: string | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "label" | "wrong_score";
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "good" | "ok" | "poor";
+        };
+        /** FeedbackOut */
+        FeedbackOut: {
+            /** Feedback Id */
+            feedback_id: number;
+            /** Golden Case Id */
+            golden_case_id: number;
         };
         /**
          * FieldError
@@ -873,6 +1234,54 @@ export interface components {
             field: string;
             /** Message */
             message: string;
+        };
+        /**
+         * FlagsIn
+         * @description The case's flags to set; an absent one is kept. At most two cases are canaries (L4632).
+         */
+        FlagsIn: {
+            /** Active */
+            active?: boolean | null;
+            /** Is Canary */
+            is_canary?: boolean | null;
+        };
+        /**
+         * GoldenCaseOut
+         * @description A golden case: its job, label and comment, its profile version's number and its scope version's id, its
+         *     source and its flags.
+         */
+        GoldenCaseOut: {
+            /** Active */
+            active: boolean;
+            /** Comment */
+            comment: string | null;
+            /** Id */
+            id: number;
+            /** Is Canary */
+            is_canary: boolean;
+            /** Job Id */
+            job_id: number;
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "good" | "ok" | "poor";
+            /** Profile Version */
+            profile_version: number;
+            /** Scope Version */
+            scope_version: number;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "week1" | "feedback" | "adversarial";
+        };
+        /** GoldenCasesPageOut */
+        GoldenCasesPageOut: {
+            /** Items */
+            items: components["schemas"]["GoldenCaseOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /** HealthOut */
         HealthOut: {
@@ -1047,6 +1456,25 @@ export interface components {
             /** Total */
             total: number;
         };
+        /**
+         * PromptSchemaVersionOut
+         * @description A shipped prompt-schema version, its hash in hex, whether it is active, and its newest schema
+         *     dry-run (`null` without one).
+         */
+        PromptSchemaVersionOut: {
+            /** Active */
+            active: boolean;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            dry_run: components["schemas"]["SchemaDryRunOut"] | null;
+            /** Id */
+            id: number;
+            /** Prompt Schema Hash */
+            prompt_schema_hash: string;
+        };
         /** ProposalCreatedOut */
         ProposalCreatedOut: {
             /** Proposal Id */
@@ -1177,6 +1605,32 @@ export interface components {
             ok: boolean;
         };
         /**
+         * ReleaseIn
+         * @description The release of a quarantined submission (§10.10): `confirm` must be `true`.
+         */
+        ReleaseIn: {
+            /**
+             * Confirm
+             * @constant
+             */
+            confirm: true;
+        };
+        /**
+         * ReleasedOut
+         * @description A released submission and the reservation its entries keep counted as `ambiguous`.
+         */
+        ReleasedOut: {
+            /** Reserved Usd */
+            reserved_usd: string;
+            /**
+             * State
+             * @constant
+             */
+            state: "released";
+            /** Submission Id */
+            submission_id: number;
+        };
+        /**
          * RescoreEstimateOut
          * @description The re-score preview (§12.6 step 2, §21.4): the retained ads to score again, their cost online and in
          *     Batches, the month's counted spend and its cap.
@@ -1233,6 +1687,25 @@ export interface components {
             start: string | null;
             /** Title */
             title: string;
+        };
+        /**
+         * RubricVersionOut
+         * @description A shipped rubric version; `content_hash` in hex, `active` when `active_config` points at it.
+         */
+        RubricVersionOut: {
+            /** Active */
+            active: boolean;
+            /** Content Hash */
+            content_hash: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /** Version */
+            version: string;
         };
         /**
          * RunNowIn
@@ -1311,6 +1784,45 @@ export interface components {
             id: number;
             /** Version No */
             version_no: number;
+        };
+        /**
+         * SchemaDryRunOut
+         * @description A schema dry-run of a prompt-schema version (§10.11): `passed`, `transport` (`live` or `fake`) and
+         *     `finished_at` are null while it runs.
+         */
+        SchemaDryRunOut: {
+            /** Eval Run Id */
+            eval_run_id: number;
+            /** Finished At */
+            finished_at: string | null;
+            /** Passed */
+            passed: boolean | null;
+            /** Transport */
+            transport: string | null;
+        };
+        /** ScoreCycleOut */
+        ScoreCycleOut: {
+            /**
+             * Queued
+             * @description False when a manual cycle job already waits: it serves this request
+             */
+            queued: boolean;
+            /**
+             * Reason
+             * @description Why the cycle would start nothing now: the score lane's pause reason, or `no_pending` without an admissible target; null otherwise
+             */
+            reason: ("reservation_bound_violated" | "auth_failed" | "cap_reached" | "global_fence" | "schema_unverified") | "no_pending" | null;
+        };
+        /**
+         * ScoreNowIn
+         * @description Score now (§9.6.4): `force` scores a filtered-out job anyway (`override = 'score_anyway'`).
+         */
+        ScoreNowIn: {
+            /**
+             * Force
+             * @default false
+             */
+            force: boolean;
         };
         /**
          * ScoringHealthOut
@@ -1469,18 +1981,24 @@ export interface components {
             /** Billed */
             billed: string;
             bucket: components["schemas"]["BucketOut"];
-            /** Bulk Operation */
-            bulk_operation: null;
+            bulk_operation: components["schemas"]["BulkOperationOut"] | null;
             /** By Model Effort Role */
             by_model_effort_role: components["schemas"]["SpendGroupOut"][];
             /** C Hat */
             c_hat: string;
+            /**
+             * C Hat Source
+             * @enum {string}
+             */
+            c_hat_source: "history" | "central";
             /** Cap */
             cap: string;
             /** Counted */
             counted: string;
             /** Critic Rate 7D */
             critic_rate_7d: string | null;
+            /** Eval By Model Role */
+            eval_by_model_role: components["schemas"]["EvalSpendGroupOut"][];
             /** Headroom */
             headroom: string;
             /**
@@ -1488,6 +2006,8 @@ export interface components {
              * Format: date
              */
             month: string;
+            /** Pause Reason */
+            pause_reason: ("reservation_bound_violated" | "auth_failed" | "cap_reached" | "global_fence" | "schema_unverified") | null;
             /** Projected Critic Rate */
             projected_critic_rate: string;
             /** Quarantined Batch Usd */
@@ -1554,6 +2074,16 @@ export interface components {
                 [key: string]: number;
             };
             versions: components["schemas"]["Versions"];
+        };
+        /**
+         * TargetMovedOut
+         * @description The target a move took, and its state after it (`pending`).
+         */
+        TargetMovedOut: {
+            /** State */
+            state: string;
+            /** Target Id */
+            target_id: number;
         };
         /** TargetTitle */
         TargetTitle: {
@@ -1733,6 +2263,74 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    acknowledge_api_alerts__alert_id__ack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of an alert */
+                alert_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcknowledgedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No open alert with this id: it does not exist or is resolved (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     login_api_auth_login_post: {
         parameters: {
             query?: never;
@@ -1883,6 +2481,107 @@ export interface operations {
             };
         };
     };
+    release_batch_api_batches__submission_id__release_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a batch submission */
+                submission_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReleaseIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReleasedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such batch submission (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The submission is not quarantined (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body or no `confirm: true` (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     search_places_api_geo_places_get: {
         parameters: {
             query?: {
@@ -1915,6 +2614,415 @@ export interface operations {
                 };
             };
             /** @description A `q` over 100 characters or with a NUL, or a `limit` outside 1 to 25 */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_golden_cases_api_golden_cases_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+                /** @description Only the cases whose `active` flag is this */
+                active?: boolean | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoldenCasesPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_golden_case_api_golden_cases__case_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a golden case */
+                case_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such golden case (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A running eval run includes the case (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    set_golden_case_flags_api_golden_cases__case_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a golden case */
+                case_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FlagsIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoldenCaseOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such golden case (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, or a third canary (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    record_feedback_api_jobs__job_id__feedback_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FeedbackIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FeedbackOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such job (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The job has no published score of the active tuple to label (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body: a comment over 2,000 characters or holding a NUL or a lone surrogate, an unknown kind or label (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    score_now_api_jobs__job_id__score_now_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScoreNowIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TargetMovedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No target of the active tuple for the job (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The job is filtered out and `force` is not set (`filtered_requires_force`), the month's scoring budget is exhausted (`budget_exhausted`), the target is being scored, batched, published or cancelled (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3390,6 +4498,284 @@ export interface operations {
             };
         };
     };
+    list_prompt_schema_versions_api_settings_prompt_schema_versions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PromptSchemaVersionOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    activate_prompt_schema_version_api_settings_prompt_schema_versions__version_id__activate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a shipped rubric or prompt-schema version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ActivateIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActivatedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The version is the active one (`conflict_state`), the active model policy has no passed live schema dry-run of a (schema, model) pair it needs for the prompt-schema version the activation leaves active (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate of the candidate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, the re-score of retained ads not acknowledged (`validation_failed` at `body.expected_rescore_ack`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_rubric_versions_api_settings_rubric_versions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RubricVersionOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    activate_rubric_version_api_settings_rubric_versions__version_id__activate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a shipped rubric or prompt-schema version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ActivateIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActivatedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The version is the active one (`conflict_state`), the active model policy has no passed live schema dry-run of a (schema, model) pair it needs for the prompt-schema version the activation leaves active (`conflict_state`, detail `schema_dry_run_required`, whatever the override), the eval gate of the candidate failed without the override (`eval_gate_failed`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body, the re-score of retained ads not acknowledged (`validation_failed` at `body.expected_rescore_ack`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     retry_scope_apply_api_settings_scope_retry_apply_post: {
         parameters: {
             query?: never;
@@ -3603,6 +4989,82 @@ export interface operations {
             };
         };
     };
+    request_score_cycle_api_system_score_cycle_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScoreCycleOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_spend_api_system_spend_get: {
         parameters: {
             query?: never;
@@ -3623,6 +5085,94 @@ export interface operations {
             };
             /** @description No valid session (`unauthenticated`) */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    retry_target_api_targets__target_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path: {
+                /** @description The id of a score target */
+                target_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TargetMovedOut"];
+                };
+            };
+            /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such target (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The target is not refused or failed (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

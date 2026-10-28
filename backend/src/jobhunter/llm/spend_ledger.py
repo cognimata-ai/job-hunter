@@ -1284,16 +1284,28 @@ _SPEND_BY_STATE = q(
     "COALESCE(SUM(reserved_usd) FILTER (WHERE state IN ('reserved', 'dispatched')), 0) AS reserved "
     "FROM llm_spend_ledger WHERE budget_month = :month AND kind = 'request'"
 )
-# The month's tries per (model, effort, purpose), each at what it counts (§7.11): billed its cost, reserved,
-# dispatched and ambiguous their reservation, not billed nothing. A try whose `llm_calls` row a purge deleted
-# (§20.2) keeps its ledger row and is grouped with no effort.
-_SPEND_BY_MODEL_EFFORT_ROLE = q(
-    "SELECT l.model_requested AS model, c.effort, l.purpose AS role, count(*) AS calls, "
+# What a try counts (§7.11): billed its cost, reserved, dispatched and ambiguous their reservation, not billed
+# nothing.
+_COUNTED_SQL: Final = (
     "COALESCE(SUM(CASE WHEN l.state = 'billed' THEN l.settled_usd "
-    "WHEN l.state IN ('reserved', 'dispatched', 'ambiguous') THEN l.reserved_usd ELSE 0 END), 0) AS counted "
-    "FROM llm_spend_ledger l LEFT JOIN llm_calls c ON c.spend_ledger_id = l.id "
-    "WHERE l.budget_month = :month AND l.kind = 'request' "
+    "WHEN l.state IN ('reserved', 'dispatched', 'ambiguous') THEN l.reserved_usd ELSE 0 END), 0) AS counted"
+)
+# The month's tries outside eval runs per (model, effort, purpose). A try whose `llm_calls` row a purge
+# deleted (§20.2) keeps its ledger row and is grouped with no effort. An eval run's tries (golden, canary and
+# schema dry-run; `eval_run`) are `_EVAL_SPEND_BY_MODEL_ROLE`'s (Carry T19-d): they are non-scoring and must
+# not join the live scoring rows of the same model, effort and role, and a deleted golden case takes its call
+# rows with it by cascade, so their effort is not kept.
+_SPEND_BY_MODEL_EFFORT_ROLE = q(
+    "SELECT l.model_requested AS model, c.effort, l.purpose AS role, count(*) AS calls, "  # noqa: S608
+    f"{_COUNTED_SQL} FROM llm_spend_ledger l LEFT JOIN llm_calls c ON c.spend_ledger_id = l.id "
+    "WHERE l.budget_month = :month AND l.kind = 'request' AND NOT l.eval_run "
     "GROUP BY l.model_requested, c.effort, l.purpose ORDER BY l.model_requested, c.effort, l.purpose"
+)
+# The month's tries of eval runs per (model, purpose), from the ledger alone.
+_EVAL_SPEND_BY_MODEL_ROLE = q(
+    f"SELECT l.model_requested AS model, l.purpose AS role, count(*) AS calls, {_COUNTED_SQL} "  # noqa: S608
+    "FROM llm_spend_ledger l WHERE l.budget_month = :month AND l.kind = 'request' AND l.eval_run "
+    "GROUP BY l.model_requested, l.purpose ORDER BY l.model_requested, l.purpose"
 )
 
 
@@ -1309,11 +1321,21 @@ class SpendTotals:
 
 @dataclass(frozen=True)
 class SpendGroup:
-    """The tries of one (model, effort, role) in a month and what they count; `effort` is `None` for a try
-    whose call row was purged."""
+    """The tries outside eval runs of one (model, effort, role) in a month and what they count; `effort` is
+    `None` for a try whose call row was purged."""
 
     model: str
     effort: str | None
+    role: Purpose
+    calls: int
+    counted_usd: Decimal
+
+
+@dataclass(frozen=True)
+class EvalSpendGroup:
+    """The eval runs' tries of one (model, role) in a month and what they count (Carry T19-d)."""
+
+    model: str
     role: Purpose
     calls: int
     counted_usd: Decimal
@@ -1326,11 +1348,20 @@ async def spend_totals(conn: AsyncConnection, month: date) -> SpendTotals:
 
 
 async def spend_by_model_effort_role(conn: AsyncConnection, month: date) -> list[SpendGroup]:
-    """`month`'s tries per (model, effort, role), ordered by them, one plain `SELECT` (no lock)."""
+    """`month`'s tries outside eval runs per (model, effort, role), ordered by them, one plain `SELECT` (no
+    lock)."""
     rows = await conn.execute(_SPEND_BY_MODEL_EFFORT_ROLE, {"month": month})
     return [
         SpendGroup(model=r.model, effort=r.effort, role=r.role, calls=int(r.calls), counted_usd=r.counted)
         for r in rows
+    ]
+
+
+async def eval_spend_by_model_role(conn: AsyncConnection, month: date) -> list[EvalSpendGroup]:
+    """`month`'s tries of eval runs per (model, role), ordered by them, one plain `SELECT` (no lock)."""
+    rows = await conn.execute(_EVAL_SPEND_BY_MODEL_ROLE, {"month": month})
+    return [
+        EvalSpendGroup(model=r.model, role=r.role, calls=int(r.calls), counted_usd=r.counted) for r in rows
     ]
 
 

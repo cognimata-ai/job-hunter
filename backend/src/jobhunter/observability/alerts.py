@@ -68,7 +68,7 @@ _EVER_RAISED = q("SELECT EXISTS (SELECT 1 FROM alerts WHERE dedup_key = :dedup_k
 # The first acknowledgement's time is kept: a repeated one changes nothing.
 _ACKNOWLEDGE = q(
     "UPDATE alerts SET acknowledged_at = coalesce(acknowledged_at, :now) "
-    "WHERE id = :id AND resolved_at IS NULL RETURNING id"
+    "WHERE id = :id AND resolved_at IS NULL RETURNING acknowledged_at"
 )
 _OPEN_BY_SEVERITY = q(
     "SELECT severity, count(*) AS n FROM alerts WHERE resolved_at IS NULL GROUP BY severity"
@@ -161,10 +161,14 @@ async def ever_raised(conn: AsyncConnection, *, code: str, subject: str) -> bool
     return bool((await conn.execute(_EVER_RAISED, {"dedup_key": _dedup_key(code, subject)})).scalar_one())
 
 
-async def acknowledge_alert(conn: AsyncConnection, alert_id: int, *, now: datetime) -> bool:
-    """Acknowledge the open alert `alert_id` at `now` (module docstring); `False` when no open alert has that
-    id (it does not exist or is resolved). An alert acknowledged before keeps its first `acknowledged_at`."""
-    return (await conn.execute(_ACKNOWLEDGE, {"id": alert_id, "now": now})).first() is not None
+async def acknowledge_alert(conn: AsyncConnection, alert_id: int, *, now: datetime) -> datetime | None:
+    """Acknowledge the open alert `alert_id` at `now` (module docstring); its `acknowledged_at`, or `None`
+    when no open alert has that id (it does not exist or is resolved). An alert acknowledged before keeps its
+    first `acknowledged_at`, which a repeat returns."""
+    acknowledged: datetime | None = (
+        await conn.execute(_ACKNOWLEDGE, {"id": alert_id, "now": now})
+    ).scalar_one_or_none()
+    return acknowledged
 
 
 async def refresh_alert_gauge(conn: AsyncConnection) -> dict[Severity, int]:

@@ -616,10 +616,10 @@ async def test_acknowledge_alert_lifts_the_pause_and_keeps_the_alert_open(
     async with engine.connect() as conn:
         assert await cycles.pause_reason(conn, fake_llm=True, now=now) == "reservation_bound_violated"
     async with engine.begin() as conn:
-        assert await acknowledge_alert(conn, alert, now=now) is True
+        assert await acknowledge_alert(conn, alert, now=now) == now
     async with engine.begin() as conn:
         assert await cycles.pause_reason(conn, fake_llm=True, now=now) is None
-        assert await acknowledge_alert(conn, alert, now=now + timedelta(minutes=1)) is True  # idempotent
+        assert await acknowledge_alert(conn, alert, now=now + timedelta(minutes=1)) == now  # the first kept
         row = (
             await conn.execute(
                 sa.text("SELECT acknowledged_at, resolved_at FROM alerts WHERE id = :a"), {"a": alert}
@@ -627,8 +627,8 @@ async def test_acknowledge_alert_lifts_the_pause_and_keeps_the_alert_open(
         ).one()
         assert (row.acknowledged_at, row.resolved_at) == (now, None)
         await conn.execute(sa.text("UPDATE alerts SET resolved_at = now() WHERE id = :a"), {"a": alert})
-        assert await acknowledge_alert(conn, alert, now=now) is False  # resolved: nothing to acknowledge
-        assert await acknowledge_alert(conn, 10**12, now=now) is False
+        assert await acknowledge_alert(conn, alert, now=now) is None  # resolved: nothing to acknowledge
+        assert await acknowledge_alert(conn, 10**12, now=now) is None
 
 
 # ---- helpers -------------------------------------------------------------------------------------------

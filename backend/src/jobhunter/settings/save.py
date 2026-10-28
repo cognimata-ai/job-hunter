@@ -12,7 +12,10 @@ r2 B7).
    issue's path, code and message; each warning code missing from `acknowledged_warnings` is 422
    `validation_failed` with `FieldError("acknowledged_warnings", "warning_not_acknowledged", <code>)`. An
    internal save (`internal=True`, Deviation 15) skips the acknowledgement check and copies the active
-   version's acknowledgements. Then, once, when the classes hold `llm_tuple` or `evaluation_policy`
+   version's acknowledgements. The classes are the dry-run's with `forced_effects` merged in (M3 Task 21):
+   the shipped-version activation (`settings.activate`) saves the unchanged document with `llm_tuple` forced,
+   since it changes a pointer no field of the document holds, so the derived classes alone would be `none`
+   (the merge drops `none`). Then, once, when the classes hold `llm_tuple` or `evaluation_policy`
    (`dryrun.GATED`; `_check_eval_gate`, M3 Task 20):
    - an `llm_tuple` save whose model policy is not verified for the active prompt-schema version is 409
      `conflict_state` with `detail = "schema_dry_run_required"` and a title naming the (schema, model) pairs
@@ -80,7 +83,7 @@ module nor `scope_apply` logs: the caller logs ids and codes after its commit. (
 `change_buffer` log the month row's change in the transaction, as every month-row writer of Task 3 does.)
 """
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
@@ -162,6 +165,7 @@ _FLIP: Final = q(
     "updated_at = :now WHERE id = 1"
 )
 _FLIPPABLE: Final = ("model_policy_id", "llm_tuple_id", "execution_config_id", "evaluation_policy_id")
+_NONE: Final[frozenset[EffectClass]] = frozenset({"none"})
 
 
 @dataclass(frozen=True)
@@ -177,13 +181,14 @@ class SaveRequest:
 
 @dataclass(frozen=True)
 class SaveOutcome:
-    """The new version, the classes it applied, and the `apply_scope` operation its scope needs, or
-    `None`."""
+    """The new version, the classes it applied, the `apply_scope` operation its scope needs (or `None`), and
+    the tuple active after it (`None` while no profile is active)."""
 
     version_id: int
     version_no: int
     effects: frozenset[EffectClass]
     apply_scope_operation_id: int | None
+    llm_tuple_id: int | None
 
 
 async def ensure_tuple(conn: AsyncConnection, *, profile_version_id: int, model_policy_id: int) -> int:
@@ -240,6 +245,29 @@ async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[t
     )
 
 
+def schema_dry_run_required(missing: Sequence[tuple[str, str]]) -> Problem:
+    """409 `conflict_state` (`schema_dry_run_required`) of a model policy without a passed live schema
+    dry-run of the (schema, model) pairs `missing`, which its title names (the save, and the shipped-version
+    activation's step 4, `settings.activate`)."""
+    pairs = ", ".join(f"{schema} on {model}" for schema, model in missing)
+    return Problem(
+        409,
+        "conflict_state",
+        f"The model policy has no passed live schema dry-run for {pairs}",
+        detail=SCHEMA_DRY_RUN_REQUIRED,
+    )
+
+
+def eval_gate_failed() -> Problem:
+    """409 `eval_gate_failed` of a gated change whose candidate failed the eval gate, without the override."""
+    return Problem(
+        409,
+        "eval_gate_failed",
+        "The eval gate failed",
+        detail="acknowledge the override (eval_override_ack) to activate this change",
+    )
+
+
 async def _check_eval_gate(
     conn: AsyncConnection, req: SaveRequest, proposed: Settings, effects: frozenset[EffectClass]
 ) -> None:
@@ -249,21 +277,10 @@ async def _check_eval_gate(
     if "llm_tuple" in effects and not fake_llm_process():
         missing = await _unverified_pairs(conn, proposed)
         if missing:
-            pairs = ", ".join(f"{schema} on {model}" for schema, model in missing)
-            raise Problem(
-                409,
-                "conflict_state",
-                f"The model policy has no passed live schema dry-run for {pairs}",
-                detail=SCHEMA_DRY_RUN_REQUIRED,
-            )
+            raise schema_dry_run_required(missing)
     candidate = await candidate_of(conn, proposed)
     if await eval_gate_state(conn, candidate=candidate) == "failed" and not req.eval_override_ack:
-        raise Problem(
-            409,
-            "eval_gate_failed",
-            "The eval gate failed",
-            detail="acknowledge the override (eval_override_ack) to activate this change",
-        )
+        raise eval_gate_failed()
 
 
 async def _apply_llm_tuple(a: _Activation) -> None:
@@ -372,9 +389,16 @@ def _validation_failed(errors: list[FieldError]) -> Problem:
 
 
 async def save_settings(
-    conn: AsyncConnection, req: SaveRequest, *, now: datetime, defer: Deferrer, internal: bool = False
+    conn: AsyncConnection,
+    req: SaveRequest,
+    *,
+    now: datetime,
+    defer: Deferrer,
+    internal: bool = False,
+    forced_effects: frozenset[EffectClass] = frozenset(),
 ) -> SaveOutcome:
-    """Save and activate `req` in the caller's transaction (module docstring, steps 1 to 7)."""
+    """Save and activate `req` in the caller's transaction (module docstring, steps 1 to 9), with
+    `forced_effects` merged into the dry-run's classes (step 3)."""
     active = (await conn.execute(_LOCK_ACTIVE)).one()
     if req.base_version_id != active.settings_version_id:
         raise Problem(
@@ -403,7 +427,7 @@ async def save_settings(
             )
         acknowledged = sorted(req.acknowledged_warnings)
     proposed = Settings.model_validate(req.payload)  # valid: the dry-run found no error
-    effects = result.effects
+    effects = ((result.effects | forced_effects) - _NONE) if forced_effects else result.effects
     if effects & GATED:
         await _check_eval_gate(conn, req, proposed, effects)
 
@@ -469,9 +493,11 @@ async def save_settings(
         )
     if a.tuple_flipped or a.targets_moved:  # step 9, last
         await ranking.bump(conn)
+    tuple_id = a.flips.get("llm_tuple_id", a.active.llm_tuple_id)
     return SaveOutcome(
         version_id=a.version_id,
         version_no=int(version.version_no),
         effects=effects,
         apply_scope_operation_id=a.apply_scope_operation_id,
+        llm_tuple_id=tuple_id if isinstance(tuple_id, int) else None,
     )

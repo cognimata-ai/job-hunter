@@ -81,7 +81,7 @@ holds: Codex r1 #19, #20):
   `expired_unscored` or a Retry state clears the reason of the state it leaves, and so does a move of a
   target that still carries `budget_exhausted` (Controller ruling T13-c); then
   `cycles.request_cycle("score_now")` (a running cycle's next claim round, or the waiting job, serves it) and
-  `ranking.bump`;
+  `ranking.bump`. A synthetic golden-case job has no target here, so it is `not_found` (Carry T19-d);
 - `retry(conn, *, target_id, now, defer)`: the Retry edge alone for `refused | failed_*` (`conflict_state`
   otherwise, `not_found` for no target), as above;
 - `score_individually(conn, *, group_id, job_id, now) -> IndividualMember | ScoreNowRefused` (§8.7, L2878,
@@ -762,10 +762,13 @@ async def reconcile_budget_release(ctx: ReconcileContext) -> int:
 
 # ---- the user's moves (§9.6.4, §7.16.3, §8.7) -------------------------------------------------------------
 
+# A synthetic golden-case job is never scored live (Carry T19-d): it has no target here, even one that no
+# creator would make (`create_or_revive` refuses it).
 _JOB_TARGET: Final = q(
     "SELECT t.id, t.state, t.state_reason FROM score_targets t "
     "JOIN jobs j ON j.current_revision_id = t.job_revision_id "
-    "WHERE j.id = :job AND j.merged_into_job_id IS NULL AND t.llm_tuple_id = :tuple FOR UPDATE OF t"
+    "WHERE j.id = :job AND j.merged_into_job_id IS NULL AND NOT j.synthetic_eval AND t.llm_tuple_id = :tuple "
+    "FOR UPDATE OF t"
 )
 _TARGET: Final = q("SELECT id, state, state_reason FROM score_targets WHERE id = :t FOR UPDATE")
 _MEMBER: Final = q(

@@ -15,7 +15,8 @@ rules.
   (a later release tightened it; final review FR-3) is shown as `draft: null` with one issue
   `schema_mismatch` at the path `""` and no value, `recomputed_total_years: null`, and `repairs` with
   `paste_text` (a new draft, which discards this one), so the client can discard it; a stored issue the
-  current model refuses is left out. Neither quotes a stored value or the validation error.
+  current model refuses is left out. Neither quotes a stored value or the validation error. A draft the
+  adversarial seed confirmed for a synthetic profile (M3 Task 19) is the eval's: 404 (Carry T19-d).
 - `PUT /drafts/{id}` (`{draft}`), in `ready` only: a string of the profile that holds a NUL character or a
   lone surrogate (a JSON body can escape both; no JSONB value or UTF-8 text holds them) is a 422
   `validation_failed` with a `FieldError` (`invalid`) at its path (`body.draft.roles[0].highlights[1]`),
@@ -150,7 +151,8 @@ _IDEMPOTENT_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 }
 
 # The draft and its CV file as the status route shows them: the reviewed text's presence, never the text; the
-# sealed raw text only where the review map needs it.
+# sealed raw text only where the review map needs it. A draft the adversarial seed confirmed for a synthetic
+# profile is the eval's, never the user's: none (Carry T19-d).
 _DRAFT_VIEW = q(
     "SELECT d.status, d.draft_json, d.validation_issues, d.reviewed_text_sha256, d.failure_code, "
     "d.native_pdf, d.reviewed_text IS NOT NULL AS has_reviewed_text, "
@@ -158,7 +160,8 @@ _DRAFT_VIEW = q(
     "d.text_edits, d.cv_file_id, c.mime, (c.storage_path IS NOT NULL AND c.purged_at IS NULL) AS has_file, "
     "c.stripped_text, c.strip_report, "
     "CASE WHEN d.status IN ('text_review', 'ready') THEN c.raw_text_enc END AS raw_text_enc "
-    "FROM profile_drafts d JOIN cv_files c ON c.id = d.cv_file_id WHERE d.id = :d"
+    "FROM profile_drafts d JOIN cv_files c ON c.id = d.cv_file_id WHERE d.id = :d AND NOT EXISTS ("
+    "SELECT 1 FROM profile_versions v WHERE v.id = d.confirmed_profile_version_id AND v.synthetic_eval)"
 )
 _LOCK_DRAFT = q(
     "SELECT status, cv_file_id, failure_code, native_pdf, reviewed_text_sha256, "
