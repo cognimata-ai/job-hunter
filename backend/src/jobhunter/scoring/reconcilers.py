@@ -25,10 +25,10 @@ chunk of `DET_CHUNK` one transaction in the schedule's order: `fence_epoch`, `ac
 tuple and the scope pointers, read again each chunk: a changed tuple or scope starts that scope's paging over,
 a cleared one ends it), the page's job rows `FOR SHARE` in id order (step 4, carry T6-d: before any result
 lock), then every result of the page without a current instance for the scope whose hash and algorithm version
-are current recomputed by `det_results.recompute_stale`, which the scope apply's chunks share (`stale_of`, the
-staleness the live hook reads too, then `recompute_instance`: the result rows `FOR UPDATE` in id order, step
-10). A changed `DET_ALGORITHM_VERSION` makes every current instance stale, so the next pass recomputes each
-once. It counts the instances written.
+are current recomputed by `det_results.recompute_stale_instances`, which the scope apply's chunks share
+(`stale_of`, the staleness the live hook reads too, then `recompute_instance`: the result rows `FOR UPDATE`
+in id order, step 10). A changed `DET_ALGORITHM_VERSION` makes every current instance stale, so the next
+pass recomputes each once. It counts the instances written.
 
 **`admission_alerts`** (heavy, §9.6.5 L3686-3688; A2 A8) and **`scoring_drift`** (heavy, §11.13 L4633-4635,
 §17.6 L5595), one transaction each: `fence_epoch`, a plain read of the active tuple, scope and evaluation
@@ -175,7 +175,8 @@ async def _det_chunk(
     if not page:
         return page, 0
     await targets.lock_jobs(conn, [item.job_id for item in page])  # step 4, before any result (carry T6-d)
-    recomputed = await det_results.recompute_stale(conn, page, scope, scope_part=scope_part)  # step 10
+    # step 10
+    recomputed = await det_results.recompute_stale_instances(conn, page, scope, scope_part=scope_part)
     return page, sum(1 for instance in recomputed if instance is not None)
 
 
