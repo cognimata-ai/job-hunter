@@ -14,9 +14,10 @@ charged attempts are left, else `failed_attempts_exhausted('stuck')` with the fo
 attempts `claim_lost('stale_heartbeat')` (the detail of Task 9's `reclaim_now`). A target whose attempt a
 fenced publish ended `cancelled` is left for the purge's chunk (A2 S4); `in_batch` is never `in_progress`.
 `scoring.stuck_target_repaired` (warn, subject the hour of `ctx.now`, `%Y-%m-%dT%H`, L5594 "aggregated
-hourly") is raised in the same transaction by every pass with reclaims; a pass without one resolves the open
-ones whose last raise is older than an hour (`resolve_quiet_alerts`: an hour without reclaims). After the
-commit, `jobhunter_claim_reclaims_total` counts the reclaimed claims.
+hourly"): every pass first resolves the open ones whose last raise is older than an hour
+(`resolve_quiet_alerts`: an hour without reclaims, also while a later hour still reclaims), then a pass with
+reclaims raises its hour's in the same transaction. After the commit, `jobhunter_claim_reclaims_total` counts
+the reclaimed claims (`cycles.count_reclaims`, which every reclaim calls: Ruling T18-a).
 
 **`det_completeness`** (heavy, §17.4 L5511, §7.17 #5, L4568): for the active scope, then for the pending scope
 while one exists, the active tuple's published results are paged by id (`det_results.published_page`), each
@@ -24,10 +25,10 @@ chunk of `DET_CHUNK` one transaction in the schedule's order: `fence_epoch`, `ac
 tuple and the scope pointers, read again each chunk: a changed tuple or scope starts that scope's paging over,
 a cleared one ends it), the page's job rows `FOR SHARE` in id order (step 4, carry T6-d: before any result
 lock), then every result of the page without a current instance for the scope whose hash and algorithm version
-are current (`det_results.stale_of`, the staleness the scope apply and the live hook read) recomputed by
-`det_results.recompute_instance` (the result rows `FOR UPDATE` in id order, step 10). A changed
-`DET_ALGORITHM_VERSION` makes every current instance stale, so the next pass recomputes each once. It counts
-the instances written.
+are current recomputed by `det_results.recompute_stale`, which the scope apply's chunks share (`stale_of`, the
+staleness the live hook reads too, then `recompute_instance`: the result rows `FOR UPDATE` in id order, step
+10). A changed `DET_ALGORITHM_VERSION` makes every current instance stale, so the next pass recomputes each
+once. It counts the instances written.
 
 **`admission_alerts`** (heavy, §9.6.5 L3686-3688; A2 A8) and **`scoring_drift`** (heavy, §11.13 L4633-4635,
 §17.6 L5595), one transaction each: `fence_epoch`, a plain read of the active tuple, scope and evaluation
@@ -84,7 +85,6 @@ from jobhunter.observability.alerts import (
 )
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import (
-    CLAIM_RECLAIMS,
     CRITIC_RATE_7D,
     OLDEST_PENDING_TARGET_AGE,
     SCORE_TARGET_STATES,
@@ -92,7 +92,7 @@ from jobhunter.observability.metrics import (
 )
 from jobhunter.run_settings import scope_from_payload
 from jobhunter.scoring import cycles, det_results, targets
-from jobhunter.scoring.det_results import JobRow, PublishedInstance, ScopeRow
+from jobhunter.scoring.det_results import PublishedInstance, ScopeRow
 from jobhunter.scoring.evaluation_policy import EvaluationPolicy
 from jobhunter.types import JSONValue, get_object
 from jobhunter.worker.epoch import fence_epoch
@@ -129,6 +129,9 @@ async def reconcile_stuck_targets(ctx: ReconcileContext) -> int:
                 detail=STALE_HEARTBEAT,
                 exhausted_reason=STUCK,
             )
+            # every pass, before its own raise: an earlier hour's alert quiet for an hour is resolved even
+            # while this hour still reclaims, and this hour's is never resolved by its own pass
+            await resolve_quiet_alerts(conn, code=STUCK_ALERT, since=ctx.now - STUCK_QUIET)
             if moved:
                 pending = sum(1 for m in moved if m.state == "pending")
                 await raise_alert(
@@ -139,14 +142,12 @@ async def reconcile_stuck_targets(ctx: ReconcileContext) -> int:
                     message="score target claims with a stale heartbeat were reclaimed",
                     context={"reclaimed": len(moved), "pending": pending, "exhausted": len(moved) - pending},
                 )
-            else:
-                await resolve_quiet_alerts(conn, code=STUCK_ALERT, since=ctx.now - STUCK_QUIET)
     except FencedOut as fenced:
         if fenced.worker_superseded:
             raise  # `fence_epoch` logged it
         return 0
+    cycles.count_reclaims(len(moved))  # after the commit (Ruling T18-a)
     if moved:
-        CLAIM_RECLAIMS.inc(len(moved))
         log.warning("stuck_targets_reclaimed", reclaimed=len(moved))  # `reclaim` logged the ids
     return len(moved)
 
@@ -174,21 +175,8 @@ async def _det_chunk(
     if not page:
         return page, 0
     await targets.lock_jobs(conn, [item.job_id for item in page])  # step 4, before any result (carry T6-d)
-    stale = await det_results.stale_of(conn, page, scope, scope_part=scope_part)
-    written = 0
-    for item in stale.results:  # step 10: the results in id order, with the facts `stale_of` read
-        if item.job_id not in stale.facts:
-            continue  # deleted since the page was read: its results went with it
-        instance = await det_results.recompute_instance(
-            conn,
-            llm_result_id=item.llm_result_id,
-            scope=scope,
-            det=stale.facts[item.job_id],
-            sources=stale.sources[item.job_id],
-            job=JobRow(item.job_id),
-        )
-        written += instance is not None
-    return page, written
+    recomputed = await det_results.recompute_stale(conn, page, scope, scope_part=scope_part)  # step 10
+    return page, sum(1 for instance in recomputed if instance is not None)
 
 
 @reconciler("det_completeness", "heavy")

@@ -21,6 +21,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.graphs.score.nodes import claim as claim_node
 from jobhunter.graphs.score.nodes.claim import Claimed
+from jobhunter.observability import metrics
 from jobhunter.scoring import cycles
 from jobhunter.scoring.admission import Picked
 from jobhunter.worker.epoch import WorkerIdentity, claim_epoch_and_sweep
@@ -54,6 +55,11 @@ def claimant(lock: LockSession, pid: int) -> WorkerIdentity:
 
 
 ORPHANED = cycles.ORPHANED_ALERT
+
+
+def reclaims() -> float:
+    """`jobhunter_claim_reclaims_total` (Ruling T18-a: every reclaim counts, after its commit)."""
+    return metrics.REGISTRY.get_sample_value("jobhunter_claim_reclaims_total") or 0.0
 
 
 async def started(engine: AsyncEngine, *, epoch: int = 1) -> int:
@@ -107,7 +113,9 @@ async def test_a_cycle_with_a_stale_heartbeat_fails_orphaned_and_its_claims_are_
     assert (await cycle_of(engine, cycle_id)).status == "running"
     local = EXECUTIONS.start(("cycle", cycle_id), 1, asyncio.sleep(3600))  # the hung cycle's execution
     await beat_aged(engine, cycle_id, 4)
+    before = reclaims()
     assert await run_reconciler("orphaned_cycles", engine, now=utcnow(), epoch=1) == 1
+    assert reclaims() == before + 2  # its two claims, counted once the pass committed
     row = await cycle_of(engine, cycle_id)
     assert (row.status, row.status_reason, row.report) == ("failed", "orphaned", {"reason": "orphaned"})
     assert row.finished_at is not None
@@ -175,8 +183,10 @@ async def test_the_takeover_sweeps_fail_older_epoch_cycles_and_reclaim_their_cla
         await conn.execute(
             sa.text("UPDATE score_targets SET charged_attempts = 4 WHERE id = :t"), {"t": spent.target_id}
         )
+    before = reclaims()
     epoch, counts = await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))
     assert epoch == 2 and (counts["score_targets"], counts["score_cycles"]) == (3, 1)
+    assert reclaims() == before + 3  # the takeover's reclaims, counted after its commit
     row = await cycle_of(engine, cycle_id)
     assert (row.status, row.status_reason, row.report) == ("failed", "orphaned", {"reason": "orphaned"})
     assert [(await target_of(engine, c.id)).state for c in claimed] == ["pending", "pending"]
@@ -208,6 +218,7 @@ async def test_the_takeover_sweeps_fail_older_epoch_cycles_and_reclaim_their_cla
     assert await open_alerts(engine, ORPHANED) == [(f"{ORPHANED}:cycle:{cycle_id}", "warn", 1)]
     _, again = await claim_epoch_and_sweep(engine, claimant(worker_lock, 3))
     assert (again["score_targets"], again["score_cycles"]) == (0, 0)  # idempotent over `< :epoch`
+    assert reclaims() == before + 3
 
 
 async def test_the_orphaned_cycles_reconciler_follows_the_fence_rule(

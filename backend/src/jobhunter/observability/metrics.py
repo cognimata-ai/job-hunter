@@ -134,8 +134,9 @@ CRITIC_VERDICT_MISMATCH = Counter(
 # The score lane (§17.5 L5538-5539, M3 Task 18). `metrics_refresh` (heavy) sets the three gauges through the
 # refresh `scoring.reconcilers` registers: the active tuple's `critic_rate_7d` under the active evaluation
 # policy (NaN while fewer than 50 attempts make it), its targets in each state of `SCORE_TARGET_STATES` (0
-# included) and the age of its oldest `pending` target by `created_at` (0 with none). `stuck_targets` counts
-# every claim it reclaimed once its transaction has committed.
+# included) and the age of its oldest `pending` target by `created_at` (0 with none). Every reclaim of a claim
+# counts once its transaction has committed (Ruling T18-a: `scoring.cycles.count_reclaims`, called by the
+# takeover sweeps, `orphaned_cycles`, a failed cycle's end and `stuck_targets`).
 SCORE_TARGET_STATES: Final = tuple(
     sorted({state for edge in TRANSITIONS["score_targets"].allowed for state in edge})
 )
@@ -154,7 +155,7 @@ OLDEST_PENDING_TARGET_AGE = Gauge(
 )
 CLAIM_RECLAIMS = Counter(
     "jobhunter_claim_reclaims",
-    "Score target claims reclaimed by the stuck_targets reconciler.",
+    "Score target claims reclaimed: a stale heartbeat, a worker takeover, an orphaned or a failed cycle.",
     registry=REGISTRY,
 )
 

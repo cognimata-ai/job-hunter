@@ -7,7 +7,8 @@ share, holding nothing the first one still needs (`tests.support.pg.lock_wait_de
 waited on and who blocks it; `FOR UPDATE NOWAIT` probes of the rows the first one takes later), and both
 commit.
 
-- a settings activation (`active_config FOR UPDATE`, step 2) against `batch_items.process_item` publishing;
+- a settings save (the real `save_settings`, `active_config FOR UPDATE`, step 2) against
+  `batch_items.process_item` publishing;
 - `budget_release` (the month row, then target rows `SKIP LOCKED`) against `score_now` (`active_config`, then
   the target row, never the month row);
 - a takeover holding the worker-heartbeat row `FOR UPDATE` against a `score_now` request (the API stamps no
@@ -17,10 +18,10 @@ commit.
   candidate whose row another transaction holds while it is still `pending` is skipped, never waited for;
 - the confirm's `activate_tuple` (`active_config FOR UPDATE`) against a cycle's `claim` (`active_config FOR
   SHARE`, the cycle, then the targets);
-- Carry T14-c: an owner's `fail` (the target row, then the bulk row of its follow-up hold) against node 9's
-  cancellation (the bulk row first, Ruling P52, then the target row): forced into the deadlock, PostgreSQL
-  aborts one and that side's retry of a deadlock (`DB_RETRY`, `is_retryable_db_error`) completes it; the other
-  order waits on the target row only;
+- Carry T14-c: an owner's `publish` or `fail` (the target row, then the bulk row of its follow-up hold)
+  against node 9's cancellation (the bulk row first, Ruling P52, then the target row): forced into the
+  deadlock, PostgreSQL aborts one and that side's retry of a deadlock (`DB_RETRY`, `is_retryable_db_error`)
+  completes it; the other order waits on the target row only;
 - Carry T16-c: `batches.abandon` against node 9's `targets._cancel` of a batched target: both take the target
   rows before the attempts, so whichever comes second waits on the target row.
 
@@ -34,6 +35,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any, Final, cast
 
+import httpx
 import procrastinate
 import pytest
 import sqlalchemy as sa
@@ -46,14 +48,14 @@ from jobhunter.graphs.score.context import ScoreContext
 from jobhunter.graphs.score.deps import ScoreDeps
 from jobhunter.graphs.score.nodes import claim as claim_node
 from jobhunter.graphs.score.nodes import fail as fail_mod
-from jobhunter.graphs.score.state import CycleState, initial_state
+from jobhunter.graphs.score.nodes import publish as publish_node
+from jobhunter.graphs.score.state import CycleState, TargetState, initial_state
 from jobhunter.llm import bulk
 from jobhunter.llm import fake as fake_mod
 from jobhunter.llm.budget import month_of
 from jobhunter.llm.fake import BatchScript
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.scoring import batches, cycles, targets
-from jobhunter.settings.active import lock_active
 from jobhunter.settings.dryrun import active_settings
 from jobhunter.settings.model import Settings
 from jobhunter.worker import epoch as epoch_mod
@@ -91,11 +93,13 @@ from tests.support.scoring import (
     insert_targets,
     score_config,
     score_deps,
+    state_at_terminal,
     state_target,
     swept_of,
+    synthetic_c_draft,
     target_of,
 )
-from tests.support.settings import confirm_new_profile
+from tests.support.settings import active_row, change_interval, confirm_new_profile, held_save
 
 pytestmark = pytest.mark.integration
 
@@ -237,10 +241,12 @@ async def deps(engine: AsyncEngine, gateway: LLMGateway) -> ScoreDeps:
     return await score_deps(engine, gateway)
 
 
-async def activation(conn: AsyncConnection) -> None:
-    """A settings activation's first step: `active_config FOR UPDATE` (`lock_active`), its pointer write."""
-    await lock_active(conn)
-    await conn.execute(sa.text("UPDATE active_config SET updated_at = now() WHERE id = 1"))
+async def save_and_commit(engine: AsyncEngine, client: httpx.AsyncClient) -> int:
+    """A settings save (`held_save`: the real `save_settings`, `active_config FOR UPDATE` first) committed at
+    once; its version id."""
+    async with held_save(engine, client, change_interval) as save:
+        await save.commit()
+        return save.version_id
 
 
 # ---- a settings activation against process_item publishing (Codex r1 #18) --------------------------------
@@ -253,27 +259,29 @@ async def test_an_activation_and_process_item_publishing_never_wait_out_of_order
     op_runner: OpRunner,
     fake_llm: FakeLLM,
     current_epoch: int,
+    logged_in_client: httpx.AsyncClient,
     first: str,
 ) -> None:
-    # the smallest batch the settings allow (`batch_min_targets`, 200)
+    # the activation is a real settings save (`held_save`: `save_settings` in a transaction left open); the
+    # batch is the smallest the settings allow (`batch_min_targets`, 200)
     submitted = await submit_batch(engine, op_runner, fake_llm, BATCH)
     target = submitted.setup.targets[0]
     fake_mod.batches(BatchScript(polls_until_ended=0))  # the next poll ends it and processes its items
     month = month_of(utcnow())
     if first == "activation":
-        held = Held(engine, activation)
-        await held.holding()
-        polling = background(poll_once(engine, fake_llm))
-        wait = one_wait(await waits(migrated, polling), "active_config")
-        assert wait.key == "1" and held.pid in wait.blocking_pids  # process_item's first lock (step 2)
-        for table, key in (
-            ("jobs", target.job_id),
-            ("score_targets", target.target_id),
-            ("llm_budget", month),
-            ("bulk_operations", submitted.setup.bulk_operation_id),
-        ):
-            assert await free(engine, table, key), table  # it took nothing of a later step
-        await held.commit()
+        async with held_save(engine, logged_in_client, change_interval) as save:  # active_config FOR UPDATE
+            polling = background(poll_once(engine, fake_llm))
+            wait = one_wait(await waits(migrated, polling), "active_config")
+            assert wait.key == "1" and len(wait.blocking_pids) == 1  # process_item's first lock (step 2)
+            for table, key in (
+                ("jobs", target.job_id),
+                ("score_targets", target.target_id),
+                ("llm_budget", month),
+                ("bulk_operations", submitted.setup.bulk_operation_id),
+            ):
+                assert await free(engine, table, key), table  # it took nothing of a later step
+            await save.commit()
+            version = save.version_id
         await settle(polling)
     else:
         async with holding(engine, _LOCK_RANKING) as blocker:  # its last lock (step 11)
@@ -282,18 +290,14 @@ async def test_an_activation_and_process_item_publishing_never_wait_out_of_order
             assert blocker in wait.blocking_pids
             publisher = wait.pid  # an item's publish holds every lock but the last
             assert not await free(engine, "bulk_operations", submitted.setup.bulk_operation_id)
-            activating = background(run_activation(engine))
-            found = await waits(migrated, polling, activating, count=2)
+            saving = background(save_and_commit(engine, logged_in_client))
+            found = await waits(migrated, polling, saving, count=2)
             wait = one_wait(found, "active_config")
-            assert wait.key == "1" and wait.blocking_pids == (publisher,)  # step 2, first: it holds nothing
-        await settle(polling, activating)
+            assert wait.key == "1" and wait.blocking_pids == (publisher,)  # the save's first lock
+        _, version = await settle(polling, saving)
     assert await decisions(engine) == ["published"] * BATCH
     assert (await target_of(engine, target.target_id)).state == "published_accepted"
-
-
-async def run_activation(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn:
-        await activation(conn)
+    assert (await active_row(engine)).settings_version_id == version  # the save went through
 
 
 # ---- budget_release against score_now (Codex r1 #19, #20) ------------------------------------------------
@@ -633,18 +637,38 @@ class Retried:
         raise AssertionError("unreachable")
 
 
+async def run_publish(deps: ScoreDeps, claimed: ClaimedTarget, state: TargetState) -> Any:
+    """The `publish` node itself, called as the subgraph calls it."""
+    return await publish_node.make_publish(deps)(state, await score_config(deps, claimed))
+
+
 @pytest.mark.parametrize("first", ["owner", "node_9"])
-async def test_an_owner_fail_and_node_9_s_cancellation_never_deadlock_unrecoverably(
-    engine: AsyncEngine, migrated: PgServer, deps: ScoreDeps, monkeypatch: pytest.MonkeyPatch, first: str
+@pytest.mark.parametrize("owner_node", ["fail", "publish"])
+async def test_an_owner_publish_or_fail_and_node_9_s_cancellation_never_deadlock_unrecoverably(
+    engine: AsyncEngine,
+    migrated: PgServer,
+    deps: ScoreDeps,
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_node: str,
+    first: str,
 ) -> None:
-    # Carry T14-c: the owner takes the target row (step 5), then its follow-up hold's bulk row (step 7); node
-    # 9, never the owner, takes the bulk row first (Ruling P52), then the target row
+    # Carry T14-c: the owner (its publish or its fail) takes the target row (step 5), then its follow-up
+    # hold's bulk row (step 7); node 9, never the owner, takes the bulk row first (Ruling P52), then the
+    # target row
     claimed = await claimed_target(engine)
     async with engine.begin() as conn:
         await activate_score_tuple(conn)
         operation, item = await followup_hold(
             conn, claimed.llm_tuple_id, claimed.target_id, hold=Decimal("0.05")
         )
+    owner_work: Callable[[], Awaitable[Any]]
+    if owner_node == "publish":
+        fake_llm.answer("generate", claimed.job_revision_id, synthetic_c_draft())
+        state = await state_at_terminal(deps, claimed, monkeypatch)  # an attempt that reaches `publish`
+        owner_work = lambda: run_publish(deps, claimed, state)  # noqa: E731
+    else:
+        owner_work = lambda: run_fail(deps, claimed, "invalid_output")  # noqa: E731
     real_release = bulk.release_target_hold
     gate = asyncio.Event()
     paused: dict[str, asyncio.Task[Any] | None] = {"task": None}
@@ -658,7 +682,6 @@ async def test_an_owner_fail_and_node_9_s_cancellation_never_deadlock_unrecovera
 
     monkeypatch.setattr(bulk, "release_target_hold", held_release)
     retries = Retried()
-    owner_work = lambda: run_fail(deps, claimed, "invalid_output")  # noqa: E731
     cancel_work = lambda: node_9_cancel(engine, claimed.job_id, claimed.job_revision_id)  # noqa: E731
     if first == "owner":
         owner = background(retries.run("owner", owner_work))
@@ -683,15 +706,18 @@ async def test_an_owner_fail_and_node_9_s_cancellation_never_deadlock_unrecovera
         assert retries.retried == []
     target = await target_of(engine, claimed.target_id)
     ended = await attempt_end(engine, claimed.attempt_id)
-    # the outcome of the two in a serial order: cancelled first (the owner's retry finds its claim lost and
-    # writes nothing), or failed first (its attempt ended `failed_invalid_output`, then the failed target of
-    # the superseded revision cancelled: `failed_*` is cancellable)
-    assert (target.state, target.state_reason) == ("cancelled", "revision_superseded")
-    owner_aborted = retries.retried == ["owner:40P01"]
-    if first == "node_9" or owner_aborted:
+    # the outcome of the two in a serial order (L3431): cancelled first (the owner's retry finds its claim
+    # lost and writes nothing); published first (left alone: only a published target is); failed first (its
+    # attempt keeps `failed_invalid_output`, then the failed target of the superseded revision cancelled)
+    if first == "node_9" or retries.retried == ["owner:40P01"]:
+        assert (target.state, target.state_reason) == ("cancelled", "revision_superseded")
         assert (ended.outcome, ended.outcome_detail) == ("cancelled", "revision_superseded")
+    elif owner_node == "publish":
+        assert retries.retried == ["node_9:40P01"]
+        assert (target.state, ended.outcome) == ("published_accepted", "published_accepted")
     else:
         assert retries.retried == ["node_9:40P01"]
+        assert (target.state, target.state_reason) == ("cancelled", "revision_superseded")
         assert (ended.outcome, ended.outcome_detail) == ("failed_invalid_output", "invalid_output")
     released = await hold_of(engine, operation, item)  # given back exactly once
     assert released.followup_held_usd == 0 and released.hold_released_at is not None

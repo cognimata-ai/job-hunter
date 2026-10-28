@@ -27,6 +27,7 @@ from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability import metrics
 from jobhunter.scoring import cycles
 from jobhunter.scoring import reconcilers as scoring_reconcilers
+from jobhunter.worker.epoch import Swept
 from jobhunter.worker.reconcilers import ReconcileContext
 from jobhunter.worker.tasks import defer_in_tx
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -228,6 +229,27 @@ async def test_the_hourly_alert_counts_each_pass_with_reclaims_and_resolves_afte
     assert await open_alerts(engine, ALERT) == [(f"{ALERT}:{hour(later)}", "warn", 1)]
 
 
+async def test_an_older_hour_s_alert_resolves_while_a_later_hour_still_reclaims(
+    engine: AsyncEngine, current_epoch: int
+) -> None:
+    # fix round 1, item 1: every pass resolves the alerts quiet for an hour, a pass with reclaims too
+    await stuck(engine)
+    now = utcnow()
+    assert await run(engine, now) == 1  # hour H
+    await stuck(engine)
+    later = now + timedelta(hours=2)
+    assert await run(engine, later) == 1  # hour H+2 reclaims again: H has been quiet for over an hour
+    assert await open_alerts(engine, ALERT) == [(f"{ALERT}:{hour(later)}", "warn", 1)]
+    async with engine.connect() as conn:
+        resolved = (
+            await conn.execute(
+                sa.text("SELECT resolved_at IS NOT NULL FROM alerts WHERE dedup_key = :k"),
+                {"k": f"{ALERT}:{hour(now)}"},
+            )
+        ).scalar_one()
+    assert resolved
+
+
 async def test_the_stuck_reclaim_is_the_reclaim_of_the_helper_and_of_the_takeover_sweep(
     engine: AsyncEngine, current_epoch: int
 ) -> None:
@@ -245,7 +267,8 @@ async def test_the_stuck_reclaim_is_the_reclaim_of_the_helper_and_of_the_takeove
     assert await run(engine, utcnow()) == 1
     by_sweep = await stuck(engine, charged=2)
     async with engine.begin() as conn:
-        assert await cycles.sweep_older_epoch_claims(conn, 2) == 1  # a takeover by epoch 2
+        swept = await cycles.sweep_older_epoch_claims(conn, 2)  # a takeover by epoch 2
+        assert isinstance(swept, Swept) and swept.count == 1
     expected = await reclaimed(by_helper)
     assert expected[:2] == ("pending", None) and expected[-1] == "claim_lost"
     assert await reclaimed(by_reconciler) == expected

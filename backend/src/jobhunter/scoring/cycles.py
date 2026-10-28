@@ -63,6 +63,9 @@ cycle resolves (`graphs.score.nodes.finalize_cycle`):
   first; after the commit it cancels the cycle's local execution when that runs for the cycle's epoch.
 `fail_cycle` is the cycle task's own end for a bug: `failed('bug')` with the report `{"reason": "bug",
 "error_class": …}` and the critical alert `score_cycle.failed`, its claims reclaimed (detail `cycle_failed`).
+Every reclaim (the takeover sweeps, `orphaned_cycles`, `fail_cycle` and Task 18's `stuck_targets`) is counted
+in `jobhunter_claim_reclaims_total` once its transaction has committed (`count_reclaims`, Ruling T18-a): the
+sweeps through their `Swept.after_commit`, the others after their own commit, `fail_cycle`'s by its caller.
 
 **The critic rate** (§17.5 L5538, §17.6 L5595; Task 18, Ruling P32): `critic_rate_7d(conn, *, llm_tuple_id,
 evaluation_policy_id, now) -> (rate | None, n)` is the share of the tuple's charged attempts under the
@@ -92,13 +95,14 @@ from jobhunter.llm.gateway import AUTH_FAILED_ALERT
 from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT
 from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alerts
 from jobhunter.observability.logging import get_logger
+from jobhunter.observability.metrics import CLAIM_RECLAIMS
 from jobhunter.scoring.admission import CYCLE_OWNER as CYCLE_OWNER
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS, Lane, any_admissible
 from jobhunter.settings import validate
 from jobhunter.settings.llm_projection import central_cost_per_target
 from jobhunter.settings.model import ExecutionConfig, ModelPolicy
 from jobhunter.types import JSONValue, get_int
-from jobhunter.worker.epoch import fence_epoch, register_takeover_sweep
+from jobhunter.worker.epoch import Swept, fence_epoch, register_takeover_sweep
 from jobhunter.worker.executions import EXECUTIONS, ExecKey
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer
@@ -701,6 +705,13 @@ async def reclaim(
     return moved
 
 
+def count_reclaims(reclaimed: int) -> None:
+    """`jobhunter_claim_reclaims_total` by `reclaimed` (Ruling T18-a: every reclaim counts, whoever
+    reclaimed), called once the reclaiming transaction has committed: a rolled-back reclaim never counts."""
+    if reclaimed:
+        CLAIM_RECLAIMS.inc(reclaimed)
+
+
 # ---- a cycle's ends other than `finalize_cycle` ----------------------------------------------------------
 
 _OLDER_CYCLES: Final = q(
@@ -737,9 +748,10 @@ async def _orphan(conn: AsyncConnection, cycle_id: int, *, detail: str) -> int:
     return len(reclaimed)
 
 
-async def fail_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int, error_class: str) -> bool:
-    """The cycle task's end for a bug (module docstring), under the owner predicate; `False` when the cycle
-    is no longer this owner's running cycle (nothing is written then)."""
+async def fail_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int, error_class: str) -> int | None:
+    """The cycle task's end for a bug (module docstring), under the owner predicate; how many claims it
+    reclaimed (the caller counts them after its commit, `count_reclaims`), `None` when the cycle is no longer
+    this owner's running cycle (nothing is written then)."""
     try:
         await transition(
             conn,
@@ -752,7 +764,7 @@ async def fail_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int, error_
             set_={"report": {"reason": BUG, "error_class": error_class}},
         )
     except TransitionConflict:
-        return False
+        return None
     reclaimed = await reclaim(conn, "cycle", {"cycle": cycle_id}, detail=CYCLE_FAILED)
     await raise_alert(
         conn,
@@ -763,23 +775,27 @@ async def fail_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int, error_
         context={"cycle_id": cycle_id, "error_class": error_class, "reclaimed": len(reclaimed)},
     )
     log.error("score_cycle_failed", cycle_id=cycle_id, error_class=error_class, reclaimed=len(reclaimed))
-    return True
+    return len(reclaimed)
 
 
 @register_takeover_sweep("score_targets")
-async def sweep_older_epoch_claims(conn: AsyncConnection, epoch: int) -> int:
-    """§3.3.1 step 3: reclaim every claim of an older epoch (detail `worker_takeover`); the count."""
-    return len(await reclaim(conn, "older_epoch", {"epoch": epoch}, detail=WORKER_TAKEOVER))
+async def sweep_older_epoch_claims(conn: AsyncConnection, epoch: int) -> Swept:
+    """§3.3.1 step 3: reclaim every claim of an older epoch (detail `worker_takeover`); the count, counted in
+    `jobhunter_claim_reclaims_total` once the takeover has committed."""
+    reclaimed = len(await reclaim(conn, "older_epoch", {"epoch": epoch}, detail=WORKER_TAKEOVER))
+    return Swept(reclaimed, after_commit=lambda: count_reclaims(reclaimed))
 
 
 @register_takeover_sweep("score_cycles")
-async def sweep_older_epoch_cycles(conn: AsyncConnection, epoch: int) -> int:
+async def sweep_older_epoch_cycles(conn: AsyncConnection, epoch: int) -> Swept:
     """§3.3.1 step 4: fail every running cycle of an older epoch `orphaned` (its claims were reclaimed by the
-    `score_targets` sweep before it; any left are reclaimed here); the count."""
+    `score_targets` sweep before it; any left are reclaimed here, and counted once the takeover has
+    committed); the count of cycles."""
     cycle_ids = [int(c) for c in (await conn.execute(_OLDER_CYCLES, {"epoch": epoch})).scalars()]
+    reclaimed = 0
     for cycle_id in cycle_ids:
-        await _orphan(conn, cycle_id, detail=WORKER_TAKEOVER)
-    return len(cycle_ids)
+        reclaimed += await _orphan(conn, cycle_id, detail=WORKER_TAKEOVER)
+    return Swept(len(cycle_ids), after_commit=lambda: count_reclaims(reclaimed))
 
 
 @reconciler("orphaned_cycles", "tick")
@@ -788,15 +804,17 @@ async def reconcile_orphaned_cycles(ctx: ReconcileContext) -> int:
     (module docstring); the count. Fenced by the worker epoch first: the worker's own `FencedOut` propagates
     (Ruling FR-w), another owner's ends the pass with 0, having written nothing."""
     try:
+        reclaimed = 0
         async with ctx.engine.begin() as conn:
             await fence_epoch(conn, ctx.epoch)
             stale = (await conn.execute(_STALE_CYCLES, {"cutoff": ctx.now - ORPHANED_AFTER})).all()
             for row in stale:
-                await _orphan(conn, int(row.id), detail=CYCLE_ORPHANED)
+                reclaimed += await _orphan(conn, int(row.id), detail=CYCLE_ORPHANED)
     except FencedOut as fenced:
         if fenced.worker_superseded:
             raise  # `fence_epoch` logged it
         return 0
+    count_reclaims(reclaimed)  # after the commit (Ruling T18-a)
     for row in stale:  # after the commit: a hung local execution of that cycle stops
         key: ExecKey = ("cycle", int(row.id))
         live = EXECUTIONS.get(key)

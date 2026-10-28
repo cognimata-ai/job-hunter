@@ -38,7 +38,8 @@ heartbeat (`UPDATE score_cycles SET heartbeat_at = now() WHERE id = :c AND worke
 'running'` every `CYCLE_HEARTBEAT_S`) and `ClaimHeartbeats` for its claims. A refused beat or `FencedOut`
 (`lost`) cancels the graph and writes nothing more (its claims are the reconciler's); an unclassified error
 (`raised`: a node's `NodeFailed` or timeout, an `OutcomeConflict` of `results`) fails the cycle
-`failed('bug')` with the critical alert `score_cycle.failed` and reclaims its claims (`cycles.fail_cycle`). A
+`failed('bug')` with the critical alert `score_cycle.failed` and reclaims its claims (`cycles.fail_cycle`;
+counted in `jobhunter_claim_reclaims_total` after its commit, `cycles.count_reclaims`, Ruling T18-a). A
 delivery never resumes a cycle: each creates a fresh one or starts nothing, so a crashed cycle's thread is
 never invoked again.
 """
@@ -260,7 +261,9 @@ async def execute_cycle(
     elif outcome.status == "raised":
         error_class = type(outcome.error).__name__
         async with engine.begin() as conn:
-            failed = await cycles.fail_cycle(conn, started, epoch=epoch, error_class=error_class)
-        if not failed:
+            reclaimed = await cycles.fail_cycle(conn, started, epoch=epoch, error_class=error_class)
+        if reclaimed is None:
             log.warning("score_cycle_failed_after_its_end", cycle_id=started, error_class=error_class)
+        else:
+            cycles.count_reclaims(reclaimed)  # after the commit (Ruling T18-a)
     return started

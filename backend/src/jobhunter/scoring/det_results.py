@@ -60,7 +60,10 @@ error types only (carry T6-g), raised outside the handler; `recompute_job_instan
 llm_tuple_id=…, scopes=…)` recomputes every published result of the tuple of the job's revisions under each
 scope, the live hook's half (the caller holds the job row): only the (result, scope) pairs `stale_of` finds
 stale reach `compute_and_write`, in result id order, so a re-sighting with unchanged det-facts takes no
-`llm_results` lock (Review Minor 5).
+`llm_results` lock (Review Minor 5). `recompute_stale(conn, page, scope, *, scope_part=None)` is a page's
+half (the caller holds its job rows): the results `stale_of` finds stale, recomputed in id order by
+`recompute_instance` (a deleted job's skipped), what each wrote; the scope apply's `det_results` chunks and
+the `det_completeness` reconciler share it (Task 18).
 """
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -536,6 +539,37 @@ async def recompute_instance(
         types = [str(item["type"]) for item in error.errors(include_url=False, include_input=False)]
         invalid = StoredResultInvalid(llm_result_id, list(dict.fromkeys(types)))
     raise invalid  # outside the handler: neither its cause nor its context holds the stored content
+
+
+async def recompute_stale(
+    conn: AsyncConnection,
+    page: Sequence[PublishedInstance],
+    scope: ScopeRow,
+    *,
+    scope_part: dict[str, JSONValue] | None = None,
+) -> list[int | None]:
+    """The results of `page` (read for `scope`) that `stale_of` finds stale, recomputed in id order with the
+    facts and sources it read (`recompute_instance`): what each recompute wrote, `None` where the current
+    instance was up to date meanwhile. A result whose job was deleted since the page was read is skipped (its
+    results went with it). The caller holds the page's job rows (step 4) and its own owner row, if any (step
+    5); this takes the result rows (step 10): the scope apply's `det_results` chunks and the
+    `det_completeness` reconciler (Task 18)."""
+    stale = await stale_of(conn, page, scope, scope_part=scope_part)
+    written: list[int | None] = []
+    for item in stale.results:
+        if item.job_id not in stale.facts:
+            continue
+        written.append(
+            await recompute_instance(
+                conn,
+                llm_result_id=item.llm_result_id,
+                scope=scope,
+                det=stale.facts[item.job_id],
+                sources=stale.sources[item.job_id],
+                job=JobRow(item.job_id),
+            )
+        )
+    return written
 
 
 async def recompute_job_instances(

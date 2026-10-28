@@ -151,8 +151,7 @@ async def resolve_alerts(conn: AsyncConnection, *, code: str, subject_before: st
 async def resolve_quiet_alerts(conn: AsyncConnection, *, code: str, since: datetime) -> int:
     """Resolve every open alert `code` that has not occurred since `since` (its `last_at`, the time of its
     last raise, is older): an alert that auto-resolves after a quiet period (`scoring.stuck_target_repaired`
-    after an hour without reclaims, `admission.high_sim_expired` after 24 h without recurrence; M3 Task 18).
-    The number resolved."""
+    after an hour without reclaims; M3 Task 18). The number resolved."""
     return len((await conn.execute(_RESOLVE_QUIET, {"code": code, "since": since})).all())
 
 

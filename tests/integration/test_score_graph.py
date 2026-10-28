@@ -48,6 +48,7 @@ from jobhunter.llm.errors import ClaimLost
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.llm.prompts.render import prompt_schema_v2
 from jobhunter.llm.spend_ledger import CAP_REACHED_ALERT
+from jobhunter.observability import metrics
 from jobhunter.scoring import cycles
 from jobhunter.worker import tasks
 from jobhunter.worker.executions import EXECUTIONS
@@ -783,8 +784,11 @@ async def test_an_unclassified_failure_fails_the_cycle_for_a_bug_and_reclaims_it
 ) -> None:
     targets = await insert_targets(engine, 2)
     monkeypatch.setattr(claim_node, "afault_point", raising_at(claim_node.AFTER_CLAIM))
+    before = metrics.REGISTRY.get_sample_value("jobhunter_claim_reclaims_total") or 0.0
     cycle_id = await execute(runner)
     assert cycle_id is not None
+    # Ruling T18-a: `fail_cycle`'s reclaims count, once its transaction committed
+    assert metrics.REGISTRY.get_sample_value("jobhunter_claim_reclaims_total") == before + 2
     row = await cycle_of(engine, cycle_id)
     assert (row.status, row.status_reason) == ("failed", "bug")
     assert row.report == {"reason": "bug", "error_class": "NodeFailed"}

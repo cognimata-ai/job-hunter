@@ -26,9 +26,11 @@ transaction:
 then its bulk row (step 7) in its publish or fail, while this cancellation, never the owner, takes the bulk
 row first (P52) and then waits for the target row. Both hold `active_config FOR SHARE`, so the two can meet.
 PostgreSQL detects the cycle and aborts one: this node retries it (`DB_RETRY`), the owner's attempt retries
-its `db_transient` (`escaped_db_transient`), and the outcome is that of the two in either serial order (the
-target published or failed and then left alone as terminal, or cancelled first and the owner's write fenced).
-An activation, which holds `active_config FOR UPDATE`, never meets an owner.
+its `db_transient` (`escaped_db_transient`), and the outcome is that of the two in either serial order: the
+target published first and then left alone (only a published target is, L3431), failed first and then
+cancelled `revision_superseded` (`failed_*` is cancellable; its attempt keeps its `failed_*` outcome), or
+cancelled first and the owner's write fenced. An activation, which holds `active_config FOR UPDATE`, never
+meets an owner (`tests/integration/test_lock_schedule.py` pins the pair, Carry T14-c).
 
 The counts go to `state["counters"]`: `targets_created`, `targets_revived`, `targets_cancelled`,
 `targets_skipped_<reason>`, and `targets_state_<state>` for the state each created or revived target was left
