@@ -5,6 +5,7 @@ version a fresh database (the workflow's) runs on (M3 Task 4)."""
 
 import argparse
 import dataclasses
+import json
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -15,13 +16,14 @@ from jobhunter import cli, cli_schema_dry_run
 from jobhunter.cli_schema_dry_run import NOT_STARTED, start_refusal
 from jobhunter.config import AppConfig, load_config
 from jobhunter.db.seed import load_settings_v1
-from jobhunter.llm import pricing, schema_dry_run
+from jobhunter.llm import fake, pricing, schema_dry_run
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS, text_input_bound
+from jobhunter.llm.gateway import output_schema
 from jobhunter.scoring.eval_runner import CandidateInvalid, NoCandidate
 from jobhunter.settings.validate import FieldIssue
 from jobhunter.types import get_object
 
-from tests.support.llm import v2_version
+from tests.support.llm import FAKE_LLM_DIR, v2_version
 
 PROD_WITHOUT_LIVE = "without --live the dry-run runs on the fake transport, which prod refuses"
 WORKFLOW = Path(__file__).parents[2] / ".github/workflows/schema-dry-run-manual.yml"
@@ -138,6 +140,26 @@ def test_the_workflow_states_the_worst_case_from_pricing() -> None:
     assert sum(per_try) * TRIES_PER_CASE == Decimal("1.383570")
     assert "The worst case is $1.383570" in note
     assert "at most 6 paid tries" in note
+
+
+def test_the_workflow_states_what_the_live_version_2_run_settled() -> None:
+    # M3 Task 26: spike v4v2 ran the live dry-run of version 2 once. Its four gating messages are the streams
+    # the fake replays for the gating cases; pricing recomputes their settled cost from the recorded usage.
+    note = " ".join(line.lstrip("# ") for line in WORKFLOW.read_text("utf-8").splitlines()[:20])
+    policy = get_object(load_settings_v1(), "scoring.model_policy")
+    version = v2_version()
+    settled = Decimal(0)
+    for case in schema_dry_run.cases(policy):
+        if case.probe:
+            continue
+        node = schema_dry_run.node_for(case, version)
+        stream = fake.recording_path(FAKE_LLM_DIR, "schema_dry_run", case.model, output_schema(node.schema))
+        sidecar = json.loads(stream.with_suffix(".components.json").read_text("utf-8"))
+        assert (sidecar["source"], sidecar["spike"]) == ("recorded", "v4v2")
+        settled += pricing.settled_usd(case.model, pricing.Usage(**sidecar["usage"]))
+    assert settled == Decimal("0.065028")
+    assert f"four messages settled ${settled}" in note
+    assert "$0.049816" not in note  # V4's figure, at version 1
 
 
 # ---- a candidate's policy (M3 Task 20, Codex r2 B21, r3 B7) ------------------------------------------------

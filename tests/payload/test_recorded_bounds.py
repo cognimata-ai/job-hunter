@@ -12,6 +12,7 @@ Hand-authored synthetic streams (Tasks 13 and 20) are no recordings and are skip
 """
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,14 @@ def test_every_sidecar_is_labelled_and_there_are_real_recordings() -> None:
     assert {_meta(path)["source"] for path in SIDECARS} <= {"recorded", "synthetic"}
     assert TEXT_RECORDED, "no recorded text stream: the bound check would be vacuous"
     assert set(TEXT_RECORDED) | set(NATIVE_PDF_RECORDED) == set(RECORDED)
+
+
+def test_the_m3_live_recordings_join_the_check() -> None:
+    # M3 Task 26: v4v2's four gating streams, V5's 20 case-named streams and the three the fake serves (its
+    # `generate`, `critic` and `revise` keys, Carry T8-c), and V14's pair. V12's batch documents are no
+    # streams; `tests/unit/test_v12_replay.py` replays them.
+    spikes = Counter(_meta(path).get("spike") for path in TEXT_RECORDED)
+    assert (spikes["v4v2"], spikes["v5"], spikes["v14"]) == (4, 23, 2)
 
 
 @pytest.mark.parametrize("sidecar", TEXT_RECORDED, ids=lambda p: str(p.relative_to(FAKE_LLM_DIR)))

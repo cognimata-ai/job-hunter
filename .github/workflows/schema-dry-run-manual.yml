@@ -1,10 +1,11 @@
 # The live schema dry-run (spec §10.11; M2 plan Task 7): one minimal request per structured-output schema and
 # configured model of the seeded settings, through the real gateway, recorded as an eval_runs row of a throwaway
-# database. Manual only: it spends a few cents of Anthropic credit (spike V4's four messages settled $0.049816);
-# the informational `minimum` probe goes to the free counting endpoint. A fresh database's active version is
-# prompt-schema version 2, whose generator schema is candidate C (docs/spikes/V4b-generator-v2.md, M3 Task 4);
-# version 1's run ended red, because the API rejects the §11.5 generator schema (docs/spikes/V4.md, M2 plan
-# Deviation 33), and the command exits non-zero while a gating case fails.
+# database. Manual only: it spends a few cents of Anthropic credit (at prompt-schema version 2, spike v4v2's
+# four messages settled $0.065028, docs/spikes/V4.md, M3 Task 26); the informational `minimum` probe goes to the
+# free counting endpoint. A fresh database's active version is prompt-schema version 2, whose generator schema
+# is candidate C (docs/spikes/V4b-generator-v2.md, M3 Task 4); version 1's run ended red, because the API
+# rejects the §11.5 generator schema (docs/spikes/V4.md, M2 plan Deviation 33), and the command exits non-zero
+# while a gating case fails.
 #
 # Cost note. The worst case is $1.383570, the gateway's own reservations for prompt-schema version 2
 # (llm/pricing.py, 2,000 output tokens, PROMPT_OVERHEAD_TOKENS = 1,878): one try reserves $0.034280 (generator
@@ -12,7 +13,8 @@
 # claude-opus-5-5), $0.230595 for one try per case, and a case is at most 6 paid tries: 3 transport tries in
 # each of 2 max_tokens stages. Both stages are 2,000 tokens (max_tokens_retry = max_tokens), so a first-stage
 # max_tokens stop sends a second, identical paid try rather than a larger one (llm/schema_dry_run.py).
-# tests/unit/test_cli_schema_dry_run.py recomputes these figures from pricing and fails when this note is stale.
+# tests/unit/test_cli_schema_dry_run.py recomputes these figures from pricing, and the settled cost from the
+# usage of the committed v4v2 recordings, and fails when this note is stale.
 #
 # The job starts PostgreSQL from the digest in deploy/images.lock with the repository's init script and
 # throwaway role passwords, runs `jobhunter migrate`, writes the repository secret
