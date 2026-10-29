@@ -380,6 +380,8 @@ class AttemptTiming:
     events: int
     usage: dict[str, int] | None
     stop_reason: str | None
+    thinking_tokens: int | None = None
+    max_tokens: int | None = None  # the stage the attempt was sent at (6,000 first, 12,000 enlarged)
 
 
 @dataclass(frozen=True)
@@ -416,12 +418,23 @@ def _usage(events: Sequence[fake.SSEEvent]) -> dict[str, int] | None:
     return {k: int(delta.get(k) if delta.get(k) is not None else start.get(k) or 0) for k in keys}
 
 
+def _thinking_tokens(events: Sequence[fake.SSEEvent]) -> int | None:
+    """The thinking tokens of the output (`usage.output_tokens_details.thinking_tokens`), final first."""
+    for event in reversed(events):
+        if event.name == "message_delta":
+            details = (event.data.get("usage") or {}).get("output_tokens_details") or {}
+            if details.get("thinking_tokens") is not None:
+                return int(details["thinking_tokens"])
+    return None
+
+
 def attempt_timing(exchange: Any) -> AttemptTiming:
     """An attempt's figures from the recorder's `Exchange`."""
     timed = exchange.event_times()
     events = [event for _, event in timed]
     stop = next((e.data["delta"].get("stop_reason") for e in events if e.name == "message_delta"), None)
     started, ended = exchange.started, exchange.ended
+    body = exchange.request_body() or {}
     return AttemptTiming(
         case=str(exchange.case),
         status=exchange.status,
@@ -431,6 +444,8 @@ def attempt_timing(exchange: Any) -> AttemptTiming:
         events=len(events),
         usage=_usage(events),
         stop_reason=stop,
+        thinking_tokens=_thinking_tokens(events),
+        max_tokens=None if body.get("max_tokens") is None else int(body["max_tokens"]),
     )
 
 
@@ -450,6 +465,14 @@ def analyse(calls: Sequence[CallTiming], *, expected: int = 2 * 2 * PAIRS) -> di
         "all_measured": len(measured) == expected,
     }
     first_generator = next((c for c in calls if c.role == "generate"), None)
+    by_model: dict[str, dict[str, int]] = {}
+    for c in calls:
+        for a in c.attempts:
+            if a.stop_reason is None:
+                continue  # no answer that ended (an error response, a cut stream)
+            counts = by_model.setdefault(c.model, {"attempts": 0, "max_tokens": 0})
+            counts["attempts"] += 1
+            counts["max_tokens"] += a.stop_reason == "max_tokens"
     return {
         "accepted": all(checks.values()),
         "failed": [name for name in CRITERIA if not checks[name]],
@@ -462,6 +485,12 @@ def analyse(calls: Sequence[CallTiming], *, expected: int = 2 * 2 * PAIRS) -> di
         "p99_call_s": p99,
         "max_gap_s": max_gap,
         "first_generator_call_s": None if first_generator is None else first_generator.call_s,
+        "first_generator_ttfe_s": None
+        if first_generator is None or not first_generator.attempts
+        else first_generator.attempts[0].ttfe_s,
+        "max_tokens_by_model": by_model,
+        "stop_reasons": {c.case: [a.stop_reason for a in c.attempts] for c in calls},
+        "thinking_tokens": {c.case: [a.thinking_tokens for a in c.attempts] for c in calls},
         "call_s": {c.case: c.call_s for c in calls},
         "ttfe_s": {c.case: c.final.ttfe_s for c in calls if c.final is not None},
         "second_of_pair_cache_read": second,
@@ -600,6 +629,10 @@ async def run_gateway(spike: str, session: Any) -> dict[str, Any]:
         final = timing.final
         session.say(
             f"{call.case} {node.model} {outcome} call_s={timing.call_s:.1f} attempts={len(timing.attempts)} "
+            f"stages={[a.max_tokens for a in timing.attempts]} "
+            f"stops={[a.stop_reason for a in timing.attempts]} "
+            f"thinking={[a.thinking_tokens for a in timing.attempts]} "
+            f"ttfe_s={[a.ttfe_s for a in timing.attempts]} gaps_s={[a.max_gap_s for a in timing.attempts]} "
             f"max_gap_s={None if final is None else final.max_gap_s} "
             f"usage={None if final is None else final.usage}"
         )
@@ -631,7 +664,9 @@ async def run_gateway(spike: str, session: Any) -> dict[str, Any]:
         "attempts; "
         f"accepted={analysis['accepted']} failed={analysis['failed']}",
         f"p99_call_s={analysis['p99_call_s']} max_gap_s={analysis['max_gap_s']} "
-        f"first_generator_call_s={analysis['first_generator_call_s']}",
+        f"first_generator_call_s={analysis['first_generator_call_s']} "
+        f"first_generator_ttfe_s={analysis['first_generator_ttfe_s']}",
+        f"max_tokens_by_model={analysis['max_tokens_by_model']}",
         f"second_of_pair_cache_read={analysis['second_of_pair_cache_read']}",
         f"cache_creation_by_role={analysis['cache_creation_by_role']} "
         f"critic_read_generator_entry={analysis['critic_read_generator_entry']}",

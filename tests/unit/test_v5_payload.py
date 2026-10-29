@@ -332,6 +332,31 @@ def test_a_retried_call_is_measured_once_and_reported() -> None:
     assert report["attempts"] == 21
 
 
+def test_the_max_tokens_rate_per_model_and_each_attempts_stop_and_thinking_are_reported() -> None:
+    """Ruling T26-c: an attempt cut at the first stage's `max_tokens` is followed by the enlarged stage; the
+    report counts each model's attempts and its first-stage cuts, and keeps every attempt's stop reason and
+    thinking tokens."""
+    base = {c.case: c for c in measured()}
+    cut = V5.AttemptTiming(
+        **{**attempt("c2a#1").__dict__, "stop_reason": "max_tokens", "thinking_tokens": 5_100}
+    )
+    enlarged = V5.CallTiming(**{**base["c2a"].__dict__, "attempts": (cut, attempt("c2a#2"))})
+    report = V5.analyse(measured(c2a=enlarged))
+    assert report["max_tokens_by_model"] == {
+        SONNET: {"attempts": 10, "max_tokens": 0},
+        OPUS: {"attempts": 11, "max_tokens": 1},
+    }
+    assert report["stop_reasons"]["c2a"] == ["max_tokens", "end_turn"]
+    assert report["thinking_tokens"]["c2a"] == [5_100, None]
+    assert report["retried"] == {"c2a": 2} and report["accepted"] is True
+
+
+def test_an_attempts_thinking_tokens_come_from_its_final_usage() -> None:
+    sse = synthetic_sse(generator_wire_body(), model=SONNET)
+    events = fake.parse_sse(sse)
+    assert V5._thinking_tokens(events) == 0  # synthetic_sse's `output_tokens_details`
+
+
 def test_a_run_stopped_by_a_refusal_reports_what_it_measured() -> None:
     report = V5.analyse(measured()[:7])
     assert report["measured"] == 7 and report["accepted"] is False

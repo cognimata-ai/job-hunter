@@ -610,6 +610,13 @@ async def test_the_v5_run_sends_its_twenty_calls_one_at_a_time_and_commits_each_
     report = json.loads((tmp_path / "raw/anthropic/v5/report.json").read_text("utf-8"))
     assert report["analysis"]["measured"] == 20 and report["analysis"]["accepted"] is True
     assert set(report["counts"]) == {"generate", "critic"}  # the free counts of the token split (T25-a)
+    # each attempt keeps its stage's max_tokens, its stop reason and its thinking tokens (Ruling T26-c)
+    (first,) = report["calls"][0]["attempts"]
+    assert (first["max_tokens"], first["stop_reason"], first["thinking_tokens"]) == (6_000, "end_turn", 0)
+    assert report["analysis"]["max_tokens_by_model"] == {
+        "claude-sonnet-5-5": {"attempts": 10, "max_tokens": 0},
+        "claude-opus-5-5": {"attempts": 10, "max_tokens": 0},
+    }
     # every stream committed by its case, and the second call of the first pairs where the fake serves it
     fixtures = tmp_path / "fixtures"
     for k in range(1, 6):
