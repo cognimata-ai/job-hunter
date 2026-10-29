@@ -557,6 +557,23 @@ def relation_locks(server: PgServer, pid: int) -> frozenset[str]:
     return frozenset(str(row[0]) for row in pg_rows(server, "superuser", _RELATION_LOCKS, pid))
 
 
+_RELATION_LOCK_MODES: Final = (
+    "SELECT CAST(relation AS regclass)::text, mode FROM pg_locks WHERE pid = %s AND locktype = 'relation' "
+    "AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
+def relation_lock_modes(server: PgServer, pid: int) -> dict[str, frozenset[str]]:
+    """The modes of the relation locks backend `pid` holds, by relation (M3 Task 27). A row-locking clause
+    (`FOR SHARE`, `FOR KEY SHARE`, `FOR UPDATE`) takes `RowShareLock` on its table and a plain read only
+    `AccessShareLock`, so `"RowShareLock" in modes["active_config"]` shows that the transaction took a row
+    lock there, where `relation_locks` shows only that it touched the table."""
+    modes: dict[str, set[str]] = {}
+    for relation, mode in pg_rows(server, "superuser", _RELATION_LOCK_MODES, pid):
+        modes.setdefault(str(relation), set()).add(str(mode))
+    return {relation: frozenset(found) for relation, found in modes.items()}
+
+
 async def blocked_or_done(server: PgServer, task: asyncio.Task[Any]) -> bool:
     """Whether `task` has ended or some statement waits for a lock: what `await_until` polls at a barrier."""
     return task.done() or lock_waits(server) > 0

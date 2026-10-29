@@ -11,28 +11,65 @@ jobhunter …` starts a one-off container of the worker image with the worker's 
 never starts a second worker loop (§3.3: the worker stays a singleton). The logs carry ids, counts, codes and
 amounts, never ad, CV or profile text.
 
+Until M4 the API has no alert list (`GET /api/alerts`, spec §14.2) and no needs-attention list, and the web
+UI has no System view (§15.7: Health, Needs attention, the alerts' [Ack], "Release & re-score"): those come
+with M4. Today an operator finds ids with read-only queries in the postgres container and acts through the
+API routes below.
+
+**A read-only query.** As the application role, over the container's local socket (it selects ids, codes,
+states, times and counts only, never ad or profile text):
+
+```
+docker compose exec postgres psql -U jobhunter_app -d jobhunter -c "<the query>"
+```
+
+**An API call from the host.** Every `/api` call needs the logged-in session's cookie; a state-changing one
+also an `Origin` header equal to the public origin (`JOBHUNTER_PUBLIC_ORIGIN`, here `$ORIGIN`) and
+`X-JH-Request: 1` (§16.5). Log in once with the body `{"username": "…", "password": "…"}` (and `"totp":
+"123456"` when TOTP is on) in a file of mode 0600 that you write with an editor, never with the password on a
+command line, and delete the file afterwards:
+
+```
+curl -sS -c jh.cookies -H "Origin: $ORIGIN" -H 'Content-Type: application/json' \
+  --data @login.json "$ORIGIN/api/auth/login"
+rm login.json
+```
+
+Then pass `-b jh.cookies -H "Origin: $ORIGIN" -H 'X-JH-Request: 1'` to each call below, and remove
+`jh.cookies` when done (`POST /api/auth/logout` ends the session).
+
 ## A paused score lane
 
 **What you see.** No score cycle starts. The worker logs `score_cycle_not_started` with a `reason`, and a batch
 preparation ends its operation with `progress = {"skipped": "paused"}`. `GET /api/system/health` shows the
-score lane, and `POST /api/system/score-cycle` answers with the same `reason` at once. Scoring pauses at
-admission only: a cycle that is already running finishes.
+reason as the score lane's `pause_reason` (with the open alerts counted by severity), and
+`POST /api/system/score-cycle` (an `Idempotency-Key` header of 16 to 128 characters from `A-Z a-z 0-9 _ -`)
+answers with the same `reason` at once. Scoring pauses at admission only: a cycle that is already running
+finishes.
 
 The reasons, in the order the lane checks them (`scoring.cycles.pause_reason`), and what lifts each:
 
 | Reason | Cause | What to do |
 |---|---|---|
 | `reservation_bound_violated` | An open, unacknowledged `llm.reservation_bound_violated` (critical): a settled cost exceeded its reservation (§10.7). | Compare the call's usage in the alert's context with `llm/pricing.py` and the prompt overhead constant. Fix and deploy if they are wrong. Then acknowledge the alert. |
-| `auth_failed` | An open, unacknowledged `llm.auth_failed` (critical): Anthropic answered 401 or 403. | Rotate or renew `anthropic_key` (§19.2), then `docker compose up -d worker`. Then acknowledge the alert; a successful call also resolves it. |
-| `cap_reached` | The month's scoring headroom is below the first reservation of an attempt (§6.9). `llm.cap_reached` (critical) is raised once per month and names any amount a quarantined batch holds. | Nothing to acknowledge: the pause lifts by itself when headroom returns (the next UTC month, or a higher `llm.cap_usd` saved in Settings). Release a quarantined batch only for the reasons below, never to win headroom. |
-| `global_fence` | A global purge fence is active (§20.2). | It lifts when the purge completes. If `privacy.purge_failed` is open, follow its entry (§19.8). |
+| `auth_failed` | An open, unacknowledged `llm.auth_failed` (critical): Anthropic answered 401 or 403. | Rotate or renew `anthropic_key` (§19.2), then `docker compose restart worker`: the worker reads its file secrets at start, and `up -d` would keep the running container, with the old key, when its compose configuration did not change. Then acknowledge the alert; a successful call also resolves it. |
+| `cap_reached` | The month's scoring headroom is below the first reservation of an attempt (§6.9). `llm.cap_reached` (critical) is raised once per month and names any amount a quarantined batch holds. | Nothing to acknowledge: the pause lifts by itself when headroom returns (the next UTC month, or a higher `llm.cap_usd` in a settings save, `POST /api/settings`; the Settings page comes with M4). Release a quarantined batch only for the reasons below, never to win headroom. |
+| `global_fence` | A global purge fence is active (§20.2). | It lifts when the purge completes. The `privacy.purge_failed` entry comes with M5's runbook (spec §19.8 L6300), with the purge procedures. |
 | `schema_unverified` | The active prompt-schema version and model policy have no passed live schema dry-run (§10.11). | Run the live dry-run (below). |
 
 **Acknowledging.** The acknowledgement lifts the two alert pauses while the alert itself stays open, so the
-cause stays visible (spec Deviation 19). Find the alert's id in `GET /api/system/health` (its open alerts), or
-in System → Health, and acknowledge it there or with `POST /api/alerts/{id}/ack` from a logged-in session.
-Acknowledge only after the cause is fixed: the next cycle admits targets at once, and a still wrong bound or a
-still refused key fails its calls again.
+cause stays visible (spec §17.6 L5608–5609; M3 plan Deviation 19). Acknowledge only after the cause is fixed:
+the next cycle admits targets at once, and a still wrong bound or a still refused key fails its calls again.
+1. Find the alert's id with a read-only query:
+
+   ```
+   SELECT id, code, severity, first_at, last_at, occurrences, acknowledged_at FROM alerts
+    WHERE code IN ('llm.auth_failed', 'llm.reservation_bound_violated') AND resolved_at IS NULL;
+   ```
+
+2. Acknowledge it: `curl -sS -b jh.cookies -H "Origin: $ORIGIN" -H 'X-JH-Request: 1' -X POST
+   "$ORIGIN/api/alerts/<id>/ack"` (200 with `acknowledged_at`; 404 when no open alert has that id).
+3. `GET /api/system/health` then reports no `pause_reason` (or the next one in the order above).
 
 ## A quarantined batch and its release
 
@@ -44,14 +81,31 @@ At 25 h after the submit-start it raises `batch.submit_ambiguous_unresolved` (cr
 timeout. `GET /api/system/spend` shows the held amount as `quarantined_batch_usd`.
 
 **What to do.**
-1. Look for the batch in the Anthropic console (Message Batches) created within a few minutes of the
-   submission's `submit_started_at`, with its request count. A batch there will be adopted by the next pass
-   once it has ended: wait for it.
-2. Release only when you are certain that no such batch exists (chair decision C3: an empty listing is no
-   proof). Release it from System → Needs attention ("Release & re-score"), or with
-   `POST /api/batches/{id}/release` and the body `{"confirm": true}` (an `Idempotency-Key` header is
-   required). The response states the reserved amount.
-3. After the release the submission is `released`: its targets are `pending` again and are re-scored, its
+1. Find the submission. The worker logged `batch_submit_ambiguous` with its `submission_id` when it became
+   quarantined (and `batch_execution_lost`, with `submission_ids`, when a lost execution's recovery made it
+   so). Its submit-start time and request count come from a read-only query:
+
+   ```
+   SELECT id, state, submit_started_at, request_count, reserved_usd, last_reconcile_at FROM batch_submissions
+    WHERE state = 'submit_ambiguous';
+   ```
+
+2. Look for the batch in the Anthropic console (Message Batches) created within a few minutes of that
+   `submit_started_at`, with that request count. A batch there will be adopted by the next pass once it has
+   ended: wait for it.
+3. Release only when you are certain that no such batch exists (chair decision C3: an empty listing is no
+   proof):
+
+   ```
+   curl -sS -b jh.cookies -H "Origin: $ORIGIN" -H 'X-JH-Request: 1' -H 'Content-Type: application/json' \
+     -H "Idempotency-Key: release-<id>-$(date +%s)" --data '{"confirm": true}' \
+     "$ORIGIN/api/batches/<id>/release"
+   ```
+
+   It answers 202 with `{"submission_id", "state": "released", "reserved_usd"}`: the amount that stays counted.
+   A submission that is not `submit_ambiguous` is 409 `conflict_state`. ("Release & re-score" in System →
+   Needs attention comes with M4's UI.)
+4. After the release the submission is `released`: its targets are `pending` again and are re-scored, its
    reserved amount stays counted as `ambiguous`, and the alert is resolved. The reconciler keeps listing for
    29 days: if the batch turns up after all, its items settle from the provider's per-item results and publish
    nothing.

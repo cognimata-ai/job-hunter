@@ -190,3 +190,4 @@ async def test_a_60_target_cycle_runs_on_the_spec_s_pool_sizes(
     assert (row.status, row.report["outcomes"]) == ("completed", {"published_accepted": TARGETS})
     assert published == ["published_accepted"] * TARGETS
     assert measured["checkpointer_timeouts"] == 0 and use.timeouts == 0 and elapsed < LIMIT_S
+    assert use.claim_beats > 0 and use.cycle_beats > 0  # the beats ran under these pools

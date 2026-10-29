@@ -734,21 +734,25 @@ M3_MODULES = (
 
 
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
-    """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
-    (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it anyway),
-    the registries hold exactly the M1, M2 and M3 (so far) reconcilers with their cadences, the five takeover
-    sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, and Task 16's
-    `batch_submissions`), the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile`
-    (Task 19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, M3 Task 14's
-    `create_targets_for_tuple` (`scoring.targets`), Task 16's `batch_submit` (`scoring.batch_operations`,
-    Ruling T16-e) and Task 19's `eval_run` (`scoring.eval_runner`) handlers,
-    and the failure hooks of the two profile phases, of the query proposal and of `eval_run` (written in
-    `worker.operations`, Ruling P39; `embed_profile` has none: it drives no domain row), the
-    `bulk_operations` reconciler's one active step, Task 16's `rerequest`
-    (Ruling T16-d, `bulk.register_active_step`), and the one gauge refresh `metrics_refresh` runs, M3 Task
-    18's `score_lane` (`scoring.reconcilers`, `reconcilers.gauge_refresh`). `embed_profile`,
-    `propose_queries` and the `profile_vectors` reconciler come with `profile.operations`, which imports
-    `profile.vectors`; `worker.main` lists neither."""
+    """The final pin of M3 (Task 27; M2 fix round 1, Minor 5, made it a fresh interpreter): one that imports
+    ONLY `worker.main._REGISTERING_MODULES` (step 4, before the takeover; never `worker.main` itself, whose
+    imports would register most of it anyway) holds exactly:
+    - the reconcilers of M1, M2 and M3 with their cadences (`M3_RECONCILERS` is the milestone's final set);
+    - the five takeover sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, Task
+      16's `batch_submissions`), each run in a fenced transaction of its own since Task 27;
+    - the handlers `extract_profile_text` (M2 Task 11), `extract_profile` (Task 13), `embed_profile` (Task
+      19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, and M3's
+      `create_targets_for_tuple` (Task 14, `scoring.targets`), `batch_submit` (Task 16,
+      `scoring.batch_operations`, Ruling T16-e) and `eval_run` (Task 19, `scoring.eval_runner`);
+    - the failure hooks of the two profile phases, of the query proposal and of `eval_run` only (written in
+      `worker.operations`, Ruling P39; `embed_profile` drives no domain row; `batch_submit`'s cleanup needs
+      `active_config`, which its reconciler takes, Codex r3 B2; `create_targets_for_tuple` is re-requested
+      by `missing_targets`);
+    - the `bulk_operations` reconciler's one active step, Task 16's `rerequest` (Ruling T16-d);
+    - the one gauge refresh `metrics_refresh` runs, Task 18's `score_lane`;
+    - the execution lock of each kind that has one (`OPERATION_LOCKS`: `batch_submit` under `batch`, Task 14).
+    `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with `profile.operations`,
+    which imports `profile.vectors`; `worker.main` lists neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {

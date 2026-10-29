@@ -55,7 +55,15 @@ from tests.support.faults import PausePoint, SimulatedKill, killing_at, no_fault
 from tests.support.llm import FakeLLM
 from tests.support.logs import logged
 from tests.support.m3 import active_ids
-from tests.support.pg import LockWait, PgServer, blocked_or_done, lock_wait_details, pg_one, relation_locks
+from tests.support.pg import (
+    LockWait,
+    PgServer,
+    blocked_or_done,
+    lock_wait_details,
+    pg_one,
+    relation_lock_modes,
+    relation_locks,
+)
 from tests.support.procs import await_until, wait_until
 from tests.support.profile import OpRunner
 from tests.support.reconcile import run_reconciler
@@ -339,16 +347,26 @@ def claimant(lock: LockSession, pid: int) -> WorkerIdentity:
     return WorkerIdentity(uuid.uuid4(), "h", pid, lock.backend_pid, "v")
 
 
+def row_shares(server: PgServer, pid: int) -> frozenset[str]:
+    """The tables on which backend `pid` holds `RowShareLock`: where its transaction took a row lock
+    (`fence_epoch`'s `FOR KEY SHARE`, the `active_config FOR SHARE`), not just read (`AccessShareLock`)."""
+    return frozenset(
+        relation for relation, modes in relation_lock_modes(server, pid).items() if "RowShareLock" in modes
+    )
+
+
 @dataclass(frozen=True)
 class SweepStart:
     """What a sweep's transaction held when the sweep's own statements began: its backend and transaction,
-    the relations it had locked, whether another session read the new epoch, and the state of the previous
-    sweep's transaction (`None` for the first sweep)."""
+    the relations it had locked and those it had taken a row lock on (`RowShareLock`), whether another
+    session read the new epoch, and the state of the previous sweep's transaction (`None` for the first
+    sweep)."""
 
     name: str
     pid: int
     xid: str
     relations: frozenset[str]
+    shares: frozenset[str]
     epoch_visible: bool
     previous: str | None
 
@@ -374,8 +392,8 @@ class Observed:
                 status = pg_one(self.server, "superuser", _XACT_STATUS, self.starts[-1].xid)
                 previous = None if status is None else str(status[0])
             visible = pg_one(self.server, "app", _EPOCH) == (self.epoch,)  # another session reads it
-            locked = relation_locks(self.server, pid)
-            self.starts.append(SweepStart(name, pid, xid, locked, visible, previous))
+            locked, shares = relation_locks(self.server, pid), row_shares(self.server, pid)
+            self.starts.append(SweepStart(name, pid, xid, locked, shares, visible, previous))
             if self.pause is not None:
                 await self.pause(name)
             return await sweep(conn, epoch)
@@ -384,20 +402,22 @@ class Observed:
 
     def assert_one_fenced_transaction_each(self, order: tuple[str, ...]) -> None:
         """Every sweep ran in order, in a transaction of its own that began after the epoch claim committed
-        and after the previous sweep's transaction committed, holding the heartbeat row (`fence_epoch`) and
-        `active_config` before any owner row."""
+        and after the previous sweep's transaction committed, holding the heartbeat row (`fence_epoch`'s
+        `FOR KEY SHARE`) and `active_config FOR SHARE` (each a `RowShareLock` on its table) before it touched
+        any owner table."""
         assert [start.name for start in self.starts] == list(order)
         assert len({start.xid for start in self.starts}) == len(order)
         for start in self.starts:
             assert start.epoch_visible, start
-            assert {"worker_heartbeat", "active_config"} <= start.relations, start
+            assert {"worker_heartbeat", "active_config"} <= start.shares, start
             assert not start.relations & OWNER_TABLES, start
         assert [start.previous for start in self.starts] == [None] + ["committed"] * (len(order) - 1)
 
 
 class WaitSampler:
     """Every lock wait of the running sweep's backend on an owner row, sampled while `until` runs, with
-    whether that backend held `active_config` at the time."""
+    whether that backend held its row lock on `active_config` at the time (`RowShareLock`). A test adds the
+    wait it observed itself (`waits.append`), so the list never depends on a sample's timing."""
 
     def __init__(self, server: PgServer, observed: Observed) -> None:
         self.server, self.observed = server, observed
@@ -409,7 +429,7 @@ class WaitSampler:
                 current = self.observed.starts[-1]
                 for wait in lock_wait_details(self.server):
                     if wait.pid == current.pid and wait.relation in OWNER_TABLES:
-                        held = "active_config" in relation_locks(self.server, wait.pid)
+                        held = "active_config" in row_shares(self.server, wait.pid)
                         self.waits.append((current.name, wait.relation, held))
             await asyncio.sleep(0.05)
 
@@ -599,7 +619,9 @@ async def test_each_takeover_sweep_is_its_own_fenced_transaction_the_lock_order(
         assert not takeover.done()
         (sweep_wait,) = [w for w in lock_wait_details(migrated) if w.pid == operations_sweep.pid]
         assert sweep_wait.key == str(setup.operation_id) and preparer in sweep_wait.blocking_pids
-        assert "active_config" in relation_locks(migrated, operations_sweep.pid)
+        shared = "active_config" in row_shares(migrated, operations_sweep.pid)
+        assert shared  # `active_config FOR SHARE` is held while the sweep waits for an owner row
+        sampler.waits.append(("operations", "operations", shared))
     finally:
         await holder.rollback()  # the month row goes
         await holder.close()
@@ -610,7 +632,6 @@ async def test_each_takeover_sweep_is_its_own_fenced_transaction_the_lock_order(
 
     assert epoch == current_epoch + 1 and counts["operations"] == 1  # the old operation, reclaimed
     observed.assert_one_fenced_transaction_each(sweep_order)
-    assert ("operations", "operations", True) in sampler.waits
     assert all(held for _, _, held in sampler.waits), sampler.waits  # never an owner row before the config
     assert await operation_row(engine, setup.operation_id) == ("pending", None, None, 1)
     # the old attempt's target, by the order the sessions committed in: its fail first, or the reclaim
@@ -713,8 +734,9 @@ async def test_a_failing_sweep_ends_the_takeover_and_the_next_start_sweeps_again
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A sweep that raises ends the takeover with its error: the epoch stays claimed and the earlier sweeps'
-    commits stay, the later ones never ran. The next start claims the next epoch and runs every sweep again
-    (each is idempotent over the epochs before its own)."""
+    commits stay, each with its `after_commit` already run (right after its own commit, so a committed
+    reclaim's action is not lost to a later failure), the later ones never ran. The next start claims the
+    next epoch and runs every sweep again (each is idempotent over the epochs before its own)."""
     async with engine.begin() as conn:
         op, _ = await ops.create_operation(conn, kind="export", payload={}, dedup_key="t27", defer=None)
         claimed = await ops.claim_operation(conn, op, epoch=current_epoch)
@@ -727,6 +749,12 @@ async def test_a_failing_sweep_ends_the_takeover_and_the_next_start_sweeps_again
     assert cycle_id is not None
     failures = [RuntimeError("detail that must not be logged")]
     ran: list[tuple[str, int]] = []
+    committed: list[tuple[int, int]] = []  # each `operations` sweep's after_commit: (epoch, count)
+
+    async def reclaiming(conn: Any, epoch: int) -> Swept:
+        count = await ops.sweep_older_epoch_operations(conn, epoch)
+        assert isinstance(count, int)  # the `operations` sweep returns its count alone
+        return Swept(count, after_commit=lambda: committed.append((epoch, count)))
 
     async def failing(conn: Any, epoch: int) -> int:
         ran.append(("failing", epoch))
@@ -741,13 +769,14 @@ async def test_a_failing_sweep_ends_the_takeover_and_the_next_start_sweeps_again
     monkeypatch.setattr(
         epoch_module,
         "_SWEEPS",
-        {"operations": ops.sweep_older_epoch_operations, "failing": failing, "score_cycles": orphaning},
+        {"operations": reclaiming, "failing": failing, "score_cycles": orphaning},
     )
     with pytest.raises(RuntimeError):
         await claim_epoch_and_sweep(engine, claimant(worker_lock, 2))
     async with engine.connect() as conn:
         assert (await conn.execute(sa.text(_EPOCH))).scalar_one() == current_epoch + 1  # claimed
     assert await operation_row(engine, op) == ("pending", None, None, 1)  # the earlier sweep's commit
+    assert committed == [(current_epoch + 1, 1)]  # and its after_commit, though a later sweep failed
     assert ran == [("failing", current_epoch + 1)]  # the later sweep never ran
     assert (await cycle_of(engine, cycle_id)).status == "running"
     (event,) = logged(caplog, "takeover_sweep_failed")
@@ -762,6 +791,7 @@ async def test_a_failing_sweep_ends_the_takeover_and_the_next_start_sweeps_again
     assert epoch == current_epoch + 2
     assert counts == {"operations": 0, "failing": 0, "score_cycles": 1}
     assert ran[1:] == [("failing", epoch), ("score_cycles", epoch)]
+    assert committed == [(current_epoch + 1, 1), (epoch, 0)]
     row = await cycle_of(engine, cycle_id)
     assert (row.status, row.status_reason) == ("failed", "orphaned")
 
@@ -832,8 +862,8 @@ async def test_a_superseded_workers_fail_cycle_and_the_takeover_sweeps_never_dea
         sweep = observed.starts[-1]
         (wait,) = [w for w in lock_wait_details(migrated) if w.pid == sweep.pid]
         assert (wait.relation, wait.key) == ("score_cycles", str(cycle_id))  # the old owner's cycle row
-        locked = relation_locks(migrated, sweep.pid)
-        assert "active_config" in locked and "score_targets" not in locked  # T11-b: no target row held
+        assert "active_config" in row_shares(migrated, sweep.pid)  # `FOR SHARE`, while it waits
+        assert "score_targets" not in relation_locks(migrated, sweep.pid)  # T11-b: no target row held
         for target in targets:  # reclaimed and committed by the `score_targets` sweep's own transaction
             assert (await target_of(engine, target.target_id)).state == "pending"
     finally:
