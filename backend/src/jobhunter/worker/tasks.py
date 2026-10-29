@@ -10,13 +10,17 @@ The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12)
 `retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19, unless the
 worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running, ledger
 L312), M3 Task 17's periodic `batch_poll` (every 5 min) and `batch_reconcile_ambiguous` (every 15 min) on
-`aux`, each with the queueing lock of its name (`scoring.batch_results`, `scoring.batch_adoption`: Task 27
-registers and pins them), M3 Task 20's periodic `canary_daily` (`41 6 * * *`) on the `tick` queue with the
-queueing lock of its name (`eval_calibration.start_canary_run`; Task 27 registers and pins it, Ruling P33),
-and M3 Task 11's `score_cycle(trigger)` on the `score` queue
-(`graphs.score.graph.execute_cycle`: one cycle, created by its first transaction, never resumed). The tick
-runs the score lane's trigger (`tick.tick_score`, §3.4 step 6) after its scheduling step, in a transaction of
-its own. Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
+`aux`, each with the queueing lock of its name (`scoring.batch_results`, `scoring.batch_adoption`, on the
+runtime's one Batches client), M3 Task 20's periodic `canary_daily` (`41 6 * * *`) on the `tick` queue with
+the queueing lock of its name (`eval_calibration.start_canary_run`, Ruling P33), and M3 Task 11's
+`score_cycle(trigger)` on the `score` queue under the lock `score` (`graphs.score.graph.execute_cycle`: one
+cycle, created by its first transaction, never resumed; its job is failed, never retried, when it stalls:
+`NO_STALL_RETRY`). Task 27 registers and pins the four. Each of the three periodic M3 tasks does nothing once
+the admission stop is set (§3.3.5: no new LLM call or batch submit after it; logged `periodic_task_skipped`)
+and starts with the worker's epoch fence (`canary_daily` in its one transaction, the batch tasks in one of
+their own before they reach the provider), so a superseded worker's does nothing and stops it. The tick runs
+the score lane's trigger (`tick.tick_score`, §3.4 step 6) after its scheduling step, in a transaction of its
+own. Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
 `context.additional_context["runtime"]`. The tick's own scheduling step (`run_tick`) is fenced by the worker
 epoch too (Ruling FR-h): a superseded worker's tick writes nothing. Whatever the worker's own fence refuses
 (`FencedOut.worker_superseded`), a delivery, the tick's step, a cadence or the retention pass, the body then
@@ -98,6 +102,25 @@ def _stop_when_superseded(rt: "WorkerRuntime") -> Callable[[], None]:
     from jobhunter.worker.runtime import EPOCH_SUPERSEDED, request_shutdown
 
     return lambda: request_shutdown(rt.shutdown, reason=EPOCH_SUPERSEDED)
+
+
+async def _admitted(rt: "WorkerRuntime", task: TaskName) -> bool:
+    """Whether a periodic M3 task may run (module docstring): not once the admission stop is set, and only
+    while this worker's epoch is current, proved by its fence in a transaction of its own. A superseded
+    worker's task does nothing and requests this worker's stop (Ruling T24-a); another owner's fence
+    propagates, a failure of the job."""
+    if rt.shutdown.admission_stopped:
+        log.info("periodic_task_skipped", task=task, reason="admission_stopped")
+        return False
+    try:
+        async with rt.engine.begin() as conn:
+            await fence_epoch(conn, rt.epoch)
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise
+        _stop_when_superseded(rt)()
+        return False
+    return True
 
 
 def _reconcile_context(rt: "WorkerRuntime") -> "ReconcileContext":
@@ -213,13 +236,17 @@ async def score_cycle(context: JobContext, trigger: str) -> None:
 @blueprint.periodic(cron="*/5 * * * *")
 @blueprint.task(name="batch_poll", queue="aux", queueing_lock="batch_poll", pass_context=True)
 async def batch_poll(context: JobContext, timestamp: int) -> None:
-    """The submitted and ended batch submissions polled, their results processed (`batch_results.poll`)."""
+    """The submitted and ended batch submissions polled, their results processed (`batch_results.poll`),
+    with the runtime's Batches client; nothing after the admission stop or for a superseded worker
+    (`_admitted`)."""
     # Imported here: the batch modules import this module (`Deferrer`, `defer_in_tx`).
-    from jobhunter.scoring.batch_results import poll_task
+    from jobhunter.scoring import batch_results
 
     rt: WorkerRuntime = context.additional_context["runtime"]
+    if not await _admitted(rt, "batch_poll"):
+        return
     try:
-        await poll_task(rt.engine, rt.cfg, rt.gateway, epoch=rt.epoch)
+        await batch_results.poll_task(rt.engine, rt.batches_client, epoch=rt.epoch)
     except FencedOut as fenced:
         if not fenced.worker_superseded:
             raise  # not this worker's own fence: a failure of the job
@@ -235,12 +262,15 @@ async def batch_poll(context: JobContext, timestamp: int) -> None:
 )
 async def batch_reconcile_ambiguous(context: JobContext, timestamp: int) -> None:
     """The ambiguous and the released submissions matched against the listing
-    (`batch_adoption.reconcile_ambiguous`)."""
-    from jobhunter.scoring.batch_adoption import reconcile_ambiguous_task
+    (`batch_adoption.reconcile_ambiguous`), with the runtime's Batches client; nothing after the admission
+    stop or for a superseded worker (`_admitted`)."""
+    from jobhunter.scoring import batch_adoption
 
     rt: WorkerRuntime = context.additional_context["runtime"]
+    if not await _admitted(rt, "batch_reconcile_ambiguous"):
+        return
     try:
-        await reconcile_ambiguous_task(rt.engine, rt.cfg, rt.gateway, epoch=rt.epoch)
+        await batch_adoption.reconcile_ambiguous_task(rt.engine, rt.batches_client, epoch=rt.epoch)
     except FencedOut as fenced:
         if not fenced.worker_superseded:
             raise  # not this worker's own fence: a failure of the job
@@ -299,17 +329,27 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
 @blueprint.periodic(cron="41 6 * * *")
 @blueprint.task(name="canary_daily", queue="tick", queueing_lock="canary_daily", pass_context=True)
 async def canary_daily(context: JobContext, timestamp: int) -> None:
-    """A canary run of the active configuration and its `eval_run` operation, in one transaction
-    (`eval_calibration.start_canary_run`: nothing without a tuple or an active canary), on the worker's
-    transport; the `eval_run` handler on `aux` scores it."""
+    """A canary run of the active configuration and its `eval_run` operation, in one transaction that the
+    worker's epoch fence opens (`eval_calibration.start_canary_run`: nothing without a tuple or an active
+    canary), on the worker's transport; the `eval_run` handler on `aux` scores it. Nothing after the admission
+    stop; a superseded worker's writes nothing and stops it (Ruling T24-a)."""
     # Imported here: the eval modules import this module (`Deferrer`) and pull in the score steps.
-    from jobhunter.scoring.eval_calibration import start_canary_run
+    from jobhunter.scoring import eval_calibration
 
     rt: WorkerRuntime = context.additional_context["runtime"]
-    async with rt.engine.begin() as conn:
-        await start_canary_run(
-            conn, transport="fake" if rt.cfg.fake_llm else "live", now=utcnow(), defer=defer_in_tx
-        )
+    if rt.shutdown.admission_stopped:
+        log.info("periodic_task_skipped", task="canary_daily", reason="admission_stopped")
+        return
+    try:
+        async with rt.engine.begin() as conn:
+            await fence_epoch(conn, rt.epoch)  # step 1, before `active_config` (the run's candidate)
+            await eval_calibration.start_canary_run(
+                conn, transport="fake" if rt.cfg.fake_llm else "live", now=utcnow(), defer=defer_in_tx
+            )
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the job
+        _stop_when_superseded(rt)()
 
 
 # The blueprint can be added to one app only (adding it namespaces its tasks), so a process has one task app.

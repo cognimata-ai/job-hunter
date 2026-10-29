@@ -14,7 +14,8 @@ M3 Task 15 moves `registered_by(modules)` here from `tests/unit/test_worker_main
 uses it too): what a fresh interpreter has registered (reconcilers with their cadences, takeover sweeps,
 operation handlers, failure hooks and, M3 Task 16, the `bulk_operations` reconciler's active steps) after
 importing only `modules`; a registry module those imports never reach registered nothing. M3 Task 18 adds the
-gauge refreshes `metrics_refresh` runs (`reconcilers.GAUGE_REFRESHES`).
+gauge refreshes `metrics_refresh` runs (`reconcilers.GAUGE_REFRESHES`); M3 Task 27 the execution lock of each
+operation kind that has one (`operations.OPERATION_LOCKS`).
 """
 
 import dataclasses
@@ -49,6 +50,7 @@ print(json.dumps({
     "handlers": sorted(registry("jobhunter.worker.operations", "HANDLERS")),
     "failure_hooks": sorted(registry("jobhunter.worker.operations", "FAILURE_HOOKS")),
     "active_steps": sorted(registry("jobhunter.llm.bulk", "_ACTIVE_STEPS")),
+    "operation_locks": dict(registry("jobhunter.worker.operations", "OPERATION_LOCKS")),
     "gauge_refreshes": sorted(registry("jobhunter.worker.reconcilers", "GAUGE_REFRESHES")),
     "main_imported": "jobhunter.worker.main" in sys.modules,
 }))

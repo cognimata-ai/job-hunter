@@ -412,6 +412,35 @@ async def test_a_fence_of_another_owner_at_the_startup_sync_fails_the_start_and_
     assert logged(caplog, "worker_superseded_at_start") == []
 
 
+@pytest.mark.parametrize(("owner", "code"), [("worker_epoch", 70), ("worker_lock", 1)])
+async def test_a_takeover_fenced_by_a_newer_epoch_exits_70_and_the_claim_s_own_fence_exits_1(
+    monkeypatch, tmp_path, caplog, owner, code
+) -> None:
+    """M3 Task 27: the claim commits before the sweeps, so a newer worker can claim in between and a sweep's
+    fence then refuses this worker's epoch: it is superseded, as at its startup sync (exit 70,
+    `worker_superseded_at_start`), and nothing after the takeover is built. The claim's own lock check
+    (`worker_lock`) stays a failed start (exit 1)."""
+    from jobhunter.errors import FencedOut
+    from jobhunter.worker import main
+
+    world = World(monkeypatch, tmp_path)
+
+    async def fenced_claim(engine: object, ident: object) -> tuple[int, dict[str, int]]:
+        world.events.append("claim")
+        raise FencedOut(owner=owner)
+
+    monkeypatch.setattr(main, "claim_epoch_and_sweep", fenced_claim)
+    assert await main.worker_main(world.cfg) == code
+    assert world.events[world.events.index("claim") :] == [
+        "claim",
+        "queue_close",
+        "engine_dispose",
+        "lock_close",
+    ]
+    assert len(logged(caplog, "worker_superseded_at_start")) == (code == 70)
+    assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [code]
+
+
 async def test_a_worker_superseded_during_its_start_cadence_stops_itself_and_exits_0(
     monkeypatch, tmp_path, caplog
 ) -> None:
@@ -481,6 +510,7 @@ async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_p
     from jobhunter.clock import utcnow
     from jobhunter.graphs.profile.deps import ProfileDeps
     from jobhunter.graphs.score.deps import ScoreDeps
+    from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -528,6 +558,17 @@ async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_p
         runtime.saver,
     )
     assert score_deps.monotonic is runtime.gateway.monotonic and score_deps.clock is utcnow
+    # M3 Task 27: one Batches client on the gateway's client, monotonic clock and sleep; the operation
+    # dependencies carry the score steps' deps and that client, the handlers build neither themselves
+    client = runtime.batches_client
+    assert isinstance(client, BatchesClient) and client.configured
+    assert (client._http, client._monotonic, client._sleep, client._clock) == (
+        runtime.gateway.http_client,
+        runtime.gateway.monotonic,
+        runtime.gateway.sleep,
+        utcnow,
+    )
+    assert deps.score_steps is runtime.score_deps and deps.batches_client is client
 
 
 async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_not_configured(
@@ -657,24 +698,39 @@ M2_RECONCILERS = {
     "scope_apply_failed": ["tick"],
     "profile_vectors": ["heavy"],
 }
-# The M3 reconcilers so far: `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
+# The M3 reconcilers, final (Task 27): `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
 # `score_targets` and `score_cycles`; Ruling P44), `expiry_sweep` and `budget_release` (Task 13,
 # `scoring.targets`), `bulk_operations` (Task 14, `llm.bulk`, through `scoring.cycles`) and
 # `missing_targets` (Task 14, `scoring.targets`), `batch_submissions` (Task 16, `scoring.batch_operations`
 # since Ruling T16-e), and Task 18's four in `scoring.reconcilers`: `stuck_targets`, `det_completeness`,
-# `admission_alerts` and `scoring_drift`.
+# `admission_alerts` and `scoring_drift`. (`awaiting_embedding` is M1's, registered by
+# `worker.embedding_reconcile` since Task 15.)
 M3_RECONCILERS = {
     "orphaned_cycles": ["tick"],
-    "expiry_sweep": ["heavy"],
+    "stuck_targets": ["tick"],
     "budget_release": ["tick"],
     "bulk_operations": ["heavy"],
     "missing_targets": ["heavy"],
-    "batch_submissions": ["tick"],
-    "stuck_targets": ["tick"],
     "det_completeness": ["heavy"],
+    "expiry_sweep": ["heavy"],
     "admission_alerts": ["heavy"],
     "scoring_drift": ["heavy"],
+    "batch_submissions": ["tick"],
 }
+# The modules step 4 imports for M3 (Task 27): each registers what the pin below names, or is listed so that
+# the start imports it before the takeover (`scoring.golden`, `llm.batches`: nothing of their own, checked by
+# import in `test_the_registering_modules_list_every_m3_module`).
+M3_MODULES = (
+    "jobhunter.scoring.targets",
+    "jobhunter.scoring.cycles",
+    "jobhunter.scoring.batches",
+    "jobhunter.scoring.batch_operations",
+    "jobhunter.scoring.reconcilers",
+    "jobhunter.scoring.golden",
+    "jobhunter.scoring.eval_runner",
+    "jobhunter.llm.batches",
+    "jobhunter.worker.embedding_reconcile",
+)
 
 
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
@@ -712,8 +768,24 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
         "failure_hooks": ["eval_run", "extract_profile", "extract_profile_text", "propose_queries"],
         "active_steps": ["jobhunter.scoring.batches.rerequest"],
         "gauge_refreshes": ["score_lane"],
+        # M3 Task 14 (Codex r3 B20): `defer_operation_job` reads it at every enqueue
+        "operation_locks": {"batch_submit": "batch"},
         "main_imported": False,
     }
+
+
+def test_the_registering_modules_list_every_m3_module() -> None:
+    """M3 Task 27: step 4 imports every M3 module of the plan's list. `scoring.golden` and `llm.batches`
+    register nothing of their own (checked by import: what each registers is what its imports bring along),
+    so listing them changes nothing of the pin above."""
+    from jobhunter.worker.main import _REGISTERING_MODULES
+
+    assert set(M3_MODULES) <= set(_REGISTERING_MODULES)
+    for module in ("jobhunter.scoring.golden", "jobhunter.llm.batches"):
+        registered = registered_by((module,))
+        assert registered["handlers"] == [] and registered["failure_hooks"] == [], module
+        assert registered["active_steps"] == [] and registered["gauge_refreshes"] == [], module
+        assert registered["sweeps"] in ([], ["operations"]), module  # `worker.operations`', through an import
 
 
 def test_awaiting_embedding_is_registered_by_the_worker_s_module_alone() -> None:
@@ -727,3 +799,43 @@ def test_awaiting_embedding_is_registered_by_the_worker_s_module_alone() -> None
     assert isinstance(moved, dict) and moved["awaiting_embedding"] == ["heavy"]
     left = registered_by(("jobhunter.embeddings",))["reconcilers"]
     assert isinstance(left, dict) and "awaiting_embedding" not in left
+    # Ruling P15, Task 27: the api still registers other reconcilers (only the worker runs them), not this one
+    api = registered_by(("jobhunter.api.app",))["reconcilers"]
+    assert isinstance(api, dict) and api and "awaiting_embedding" not in api
+
+
+def test_the_m3_tasks_queues_and_pools_keep_their_pinned_shape() -> None:
+    """M3 Task 27: the four M3 tasks on their queues (spec §3.3.2): `score_cycle` under the lock `score`, its
+    stalled job failed, never retried (`NO_STALL_RETRY`, Codex r1 #17); the three periodic ones at their
+    crons with the queueing lock of their name; the queues' concurrency; and the pools at the spec's sizes
+    (§9.1 L3375: the checkpointer 1 to 4, the engine 10, the queue pool 4), which the perf test measures."""
+    from jobhunter.graphs import checkpointer
+    from jobhunter.worker.main import ENGINE_POOL_SIZE, QUEUE_POOL_MAX_SIZE
+    from jobhunter.worker.tasks import NO_STALL_RETRY, QUEUES, _reset_task_app, job_task_name, make_queue_app
+
+    assert dict(QUEUES) == {"collect": 1, "score": 1, "aux": 2, "tick": 1}
+    assert NO_STALL_RETRY == frozenset({"score_cycle"})
+    assert (ENGINE_POOL_SIZE, QUEUE_POOL_MAX_SIZE) == (10, 4)
+    assert (checkpointer._POOL_MIN_SIZE, checkpointer._POOL_MAX_SIZE) == (1, 4)
+    _reset_task_app()
+    try:
+        app = make_queue_app("dbname=unused")
+        cycle = app.tasks[job_task_name("score_cycle")]
+        assert (cycle.queue, cycle.lock, cycle.queueing_lock) == (
+            "score",
+            "score",
+            None,
+        )  # per trigger, at defer
+        periodic = {
+            name: (task.cron, task.task.queue, task.task.queueing_lock)
+            for (name, _), task in app.periodic_registry.periodic_tasks.items()
+        }
+        assert {
+            name: periodic[job_task_name(name)] for name in ("batch_poll", "batch_reconcile_ambiguous")
+        } == {
+            "batch_poll": ("*/5 * * * *", "aux", "batch_poll"),
+            "batch_reconcile_ambiguous": ("*/15 * * * *", "aux", "batch_reconcile_ambiguous"),
+        }
+        assert periodic[job_task_name("canary_daily")] == ("41 6 * * *", "tick", "canary_daily")
+    finally:
+        _reset_task_app()

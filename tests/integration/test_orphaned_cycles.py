@@ -4,8 +4,9 @@ L5596; plan Task 11, Codex r4 B1, Ruling P52): the `orphaned_cycles` reconciler 
 A running cycle whose heartbeat is 4 minutes old fails `orphaned` with its report closed, its claims are
 reclaimed (`pending`, or `failed_attempts_exhausted` with the follow-up hold released when no charged attempt
 is left) with their attempts `claim_lost`, its local execution is cancelled, and `score_cycle.orphaned`
-(warn) is raised; the next completed cycle resolves it. A fresh cycle is left alone. The takeover sweeps of an
-older epoch do the same for every claim and cycle of that epoch. The reconciler follows the fence rule.
+(warn) is raised; the next completed cycle resolves it, and `score_cycle.failed` with it (Carry T25-b). A
+fresh cycle is left alone. The takeover sweeps of an older epoch do the same for every claim and cycle of that
+epoch. The reconciler follows the fence rule.
 
 Every datum is invented.
 """
@@ -143,6 +144,34 @@ async def test_the_next_completed_cycle_resolves_the_orphan_alert(
     await runner.run(completed)
     assert (await cycle_of(engine, completed)).status == "completed"
     assert await open_alerts(engine, ORPHANED) == []
+
+
+async def test_only_a_completed_cycle_resolves_the_failed_and_the_orphaned_alerts(
+    engine: AsyncEngine, current_epoch: int, queue_app: procrastinate.App, fake_llm: FakeLLM
+) -> None:
+    """Carry T25-b (spec §17.6 L5617, L5596): `score_cycle.failed` resolves at the next completed cycle, in
+    the same transaction as `score_cycle.orphaned`. A cycle that ends any other way resolves neither: an
+    orphaned end leaves the failed alert open, a failed end the orphaned one."""
+    first = await insert_targets(engine, 1, lane="score_now")
+    failed = await started(engine)
+    async with engine.begin() as conn:
+        assert await cycles.fail_cycle(conn, failed, epoch=1, error_class="NodeFailed") == 0
+    orphan = await started(engine)
+    await beat_aged(engine, orphan, 4)
+    assert await run_reconciler("orphaned_cycles", engine, now=utcnow(), epoch=1) == 1
+    assert len(await open_alerts(engine, cycles.FAILED_ALERT)) == 1  # the orphaned end resolved neither
+    again = await started(engine)
+    async with engine.begin() as conn:
+        assert await cycles.fail_cycle(conn, again, epoch=1, error_class="NodeFailed") == 0
+    assert len(await open_alerts(engine, ORPHANED)) == 1  # nor did a failed end
+    assert len(await open_alerts(engine, cycles.FAILED_ALERT)) == 2
+    runner = await cycle_runner(engine, fake_llm.gateway(engine))
+    for target in (*first, *await insert_targets(engine, 1)):
+        fake_llm.answer("generate", target.job_revision_id, synthetic_c_draft())
+    completed = await runner.start("manual")
+    await runner.run(completed)
+    assert (await cycle_of(engine, completed)).status == "completed"
+    assert await open_alerts(engine, ORPHANED) == [] and await open_alerts(engine, cycles.FAILED_ALERT) == []
 
 
 async def test_the_takeover_sweeps_fail_older_epoch_cycles_and_reclaim_their_claims(

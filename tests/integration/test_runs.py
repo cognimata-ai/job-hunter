@@ -443,9 +443,11 @@ async def test_an_exhausted_run_with_a_live_execution_is_counted_once_by_the_rec
         assert await runs.run_completion(c, rid, 4) is None  # no end of the attempt's own
 
 
-async def test_takeover_sweep_counts_an_exhausted_run_only_after_the_takeover_commits(
+async def test_takeover_sweep_counts_an_exhausted_run_only_after_its_transaction_commits(
     engine, queue_app, worker_lock, monkeypatch
 ) -> None:
+    """M3 Task 27: each sweep commits in a transaction of its own, so the `runs` sweep's end of a run is
+    counted once that transaction committed, and never when it rolled back."""
     rid = await queued(engine)
     e1, _ = await claim_epoch_and_sweep(
         engine, WorkerIdentity(uuid.uuid4(), "h", 1, worker_lock.backend_pid, "v")
@@ -453,11 +455,12 @@ async def test_takeover_sweep_counts_an_exhausted_run_only_after_the_takeover_co
     await resume_three_times(engine, rid, epoch=e1)
     failed, timed = runs_total("failed"), timed_runs()
 
-    async def failing_sweep(conn, epoch: int) -> int:
-        raise RuntimeError("a later sweep fails")
+    async def failing_after_the_runs_sweep(conn, epoch: int) -> int:
+        await runs.sweep_older_epoch_runs(conn, epoch)
+        raise RuntimeError("the runs sweep's transaction fails after it ended the run")
 
-    with monkeypatch.context() as m:  # the takeover rolls back after the `runs` sweep ended the run
-        m.setattr(epoch_module, "_SWEEPS", {**epoch_module._SWEEPS, "failing": failing_sweep})
+    with monkeypatch.context() as m:  # the `runs` sweep's transaction rolls back after it ended the run
+        m.setattr(epoch_module, "_SWEEPS", {**epoch_module._SWEEPS, "runs": failing_after_the_runs_sweep})
         with pytest.raises(RuntimeError):
             await claim_epoch_and_sweep(
                 engine, WorkerIdentity(uuid.uuid4(), "h", 2, worker_lock.backend_pid, "v")

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from jobhunter.graphs.profile.graph import ProfileGraphs
     from jobhunter.graphs.score.deps import ScoreDeps
     from jobhunter.graphs.score.graph import ScoreGraphs
+    from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -97,3 +98,6 @@ class WorkerRuntime:
     # and their process-wide deps, which `score_cycle` runs every cycle on.
     score_graphs: "ScoreGraphs"
     score_deps: "ScoreDeps"
+    # M3 (Task 27): the process's one Message Batches client, on the gateway's client, which `batch_poll` and
+    # `batch_reconcile_ambiguous` use and `operation_deps` hands to the `batch_submit` handler.
+    batches_client: "BatchesClient"

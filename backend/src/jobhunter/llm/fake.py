@@ -95,8 +95,9 @@ outcome `errored:not_found`, and `FakeLLMState.batch_recording_misses` counts it
 retrievals, the results reads, the cancel, the outcomes). The process-wide state of a dev worker keeps the
 full params of its `PROCESS_BATCHES_KEPT` (50) newest batches only: an older batch keeps each item's model,
 `max_tokens` and output schema (`KEPT_PARAMS`), so it stays answerable without holding ad or profile text.
-Until V12's recorded bodies are committed (`tests/contract/fixtures/anthropic/batches/`, plan Task 26), the
-fake generates every batch body.
+V12's recorded documents are committed (`tests/contract/fixtures/anthropic/batches/v12/`, plan Task 26), but
+the fake does not read them: it still generates every batch body as above, and the recordings are replayed
+only by `tests/unit/test_v12_replay.py`.
 
 The state of a test (its scenario, the count answer, the keyed answers, the batch script and batches, the
 requests served) lives in a context variable; `fresh_state()` gives a block its own. Outside any (a dev worker

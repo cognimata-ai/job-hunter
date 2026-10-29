@@ -25,7 +25,8 @@ Task 11 adds the operation side:
 - `nul_char_pdf(lines)`: as `replacement_char_pdf`, with "€" read as U+0000 (a text PostgreSQL refuses);
 - `operation_deps(engine, cfg)`: a real `OperationDeps` on `cfg` (the gateway on its fake LLM transport, the
   parse client on `cfg.parse_jobs_dir`, the CV store on `cfg.cv_store_dir`, the profile graphs on a
-  checkpointer of their own), closed when the block ends;
+  checkpointer of their own; M3 Task 27: the score steps' deps and the Batches client on that gateway),
+  closed when the block ends;
 - the `op_runner` fixture (`OpRunner`): claims and executes operations in process with those deps, served by
   a docparse loop that counts its jobs (`docparse_jobs`). `run_pending()` runs every due `pending` operation;
   `run_one(op_id, *, pause=None, registry=None)` runs one through `execute_operation(…, deps=…,
@@ -100,6 +101,7 @@ from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.profile.deps import ProfileDeps
 from jobhunter.graphs.profile.graph import build_profile_graphs
+from jobhunter.graphs.score.deps import ScoreDeps
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
 from jobhunter.llm.schemas.profile import ProfileOut
@@ -409,13 +411,18 @@ async def operation_deps(
     engine: AsyncEngine, cfg: AppConfig, *, sleep: Callable[[float], Awaitable[object]] = asyncio.sleep
 ) -> AsyncIterator[OperationDeps]:
     """A real `OperationDeps` on `cfg` (module docstring); `cfg` must be in fake LLM mode or carry a key.
-    `sleep` is the gateway's backoff wait."""
+    `sleep` is the gateway's backoff wait. The score steps' deps and the Batches client are the worker's
+    (M3 Task 27): on the same gateway, as `worker.main` builds them."""
+    # Imported here: the batch modules register the score lane's sweeps, handlers and reconcilers.
+    from jobhunter.scoring.batch_results import batches_client
+
     async with open_saver(cfg.dsn("psycopg")) as saver:
         http_client = make_http_client(cfg)
         try:
+            gateway = LLMGateway(engine, cfg, http_client=http_client, cache=CacheMonitor(), sleep=sleep)
             yield OperationDeps(
                 cfg=cfg,
-                gateway=LLMGateway(engine, cfg, http_client=http_client, cache=CacheMonitor(), sleep=sleep),
+                gateway=gateway,
                 parse_client=ParseClient(
                     cfg.parse_jobs_dir, timeout_s=_PARSE_TIMEOUT_S, poll_s=_PARSE_POLL_S
                 ),
@@ -423,6 +430,10 @@ async def operation_deps(
                 profile_graphs=build_profile_graphs(saver, ProfileDeps(engine=engine, clock=utcnow)),
                 embedder=None,
                 clock=utcnow,
+                score_steps=ScoreDeps(
+                    engine=engine, gateway=gateway, clock=utcnow, monotonic=gateway.monotonic, saver=saver
+                ),
+                batches_client=batches_client(cfg, gateway),
             )
         finally:
             await http_client.aclose()

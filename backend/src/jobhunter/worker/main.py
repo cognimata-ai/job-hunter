@@ -8,8 +8,9 @@
 4. the task app (`make_queue_app`, a pool of 4) and the modules whose import registers the takeover sweeps,
    the reconcilers and the operation handlers and failure hooks (`operations`, `runs`, `profile.operations`,
    …: `_REGISTERING_MODULES`): all of them exist before the takeover;
-5. the epoch claim and the takeover sweep (`claim_epoch_and_sweep`; its sweeps defer through the sweep
-   transaction's own connection), then `startup_check_passed` with `check="advisory_lock_acquired"`;
+5. the epoch claim, committed alone, then the takeover sweeps, each in a fenced transaction of its own, in
+   registration order (`claim_epoch_and_sweep`, M3 Task 27; a sweep defers through its own transaction's
+   connection), then `startup_check_passed` with `check="advisory_lock_acquired"`;
 6. the watchdog;
 7. the task app opened, the checkpointer, the M2 operation dependencies (Task 11), the collection graph on
    its `CollectDeps` and the `WorkerRuntime` with a fresh `ShutdownState`. The operation dependencies, after
@@ -21,7 +22,10 @@
    `cfg.cv_store_dir`, the profile graphs on their process-wide `ProfileDeps`, and `OperationDeps` over
    them, the embedder and the clock, which `run_operation` hands to every execution; the score graphs (M3
    Task 11: `graphs.score.graph.build_score_graphs` on `ScoreDeps` of the engine, the gateway, the clock, the
-   gateway's monotonic clock and the saver), which `score_cycle` invokes every cycle. The collection deps:
+   gateway's monotonic clock and the saver), which `score_cycle` invokes every cycle, and the process's
+   Message Batches client on the gateway's client (M3 Task 27, `batch_results.batches_client`), which
+   `batch_poll` and `batch_reconcile_ambiguous` use; `OperationDeps` carries both, the `ScoreDeps` as the
+   `eval_run` handler's `score_steps` and the client as the `batch_submit` handler's. The collection deps:
    the HTTP layer configured first (`http.configure(cfg)`: in fake
    mode the fixture transport serves every source), then one client per source (`registry.make_clients`,
    which in fake mode refuses to run before that configuration: a client made earlier would be on the live
@@ -61,11 +65,14 @@ logged and the process exit drops the socket, and with it the lock.
 Exit codes: 0 after a requested shutdown: a signal's, or the one a superseded worker requests of itself once a
 fence refused its epoch (a task body, the tick, a reconciler cadence, the start's cadence; Ruling T24-a); 1
 when a worker loop ended by itself, when the takeover was blocked (`takeover_blocked`: a row lock outlived the
-claim's lock timeout, ruling T13-b) and when the start failed (`worker_failed`), so the container restart
-tries again. 70 (`lock.WATCHDOG_EXIT_CODE`) means superseded: the watchdog's exit, and a worker whose startup
-sync a newer one fenced out (`worker_superseded_at_start`, Ruling FR-i): the newer worker's claim needed the
-singleton lock, so this one had lost it, the watchdog's condition, and one code holds whichever of the two
-sees it first; the restart stands by while the newer worker is healthy. The startup assertions exit 78.
+lock timeout of the claim or of a sweep, ruling T13-b) and when the start failed (`worker_failed`, a failing
+sweep's error among them), so the container restart tries again (a takeover that ended at a sweep keeps its
+committed epoch claim and the earlier sweeps' commits; the next start sweeps again under the next epoch). 70
+(`lock.WATCHDOG_EXIT_CODE`) means superseded: the watchdog's exit, and a worker whose startup sync a newer one
+fenced out (`worker_superseded_at_start`, Ruling FR-i): the newer worker's claim needed the singleton lock, so
+this one had lost it, the watchdog's condition, and one code holds whichever of the two sees it first; the
+restart stands by while the newer worker is healthy; so does a worker whose takeover sweep a newer epoch
+fenced out (the claim commits before the sweeps, M3 Task 27). The startup assertions exit 78.
 
 A loop that ends by itself can be the first sign that this process lost the singleton lock: a zombie (frozen
 while a replacement took over, §18.2 C17) finds its procrastinate workers pruned by the replacement, so its
@@ -104,7 +111,7 @@ from jobhunter.config import AppConfig
 from jobhunter.db.session import make_engine
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE, pg_error
 from jobhunter.embeddings import EmbedderClient, make_http_client
-from jobhunter.errors import FencedOut
+from jobhunter.errors import WORKER_EPOCH, FencedOut
 from jobhunter.graphs.checkpointer import open_saver
 from jobhunter.graphs.collect.deps import CollectDeps, FetchContext
 from jobhunter.graphs.collect.graph import build_collect_graph
@@ -119,6 +126,7 @@ from jobhunter.observability.logging import configure_logging, get_logger
 from jobhunter.observability.metrics import start_metrics_server
 from jobhunter.profile.parse_client import ParseClient
 from jobhunter.profile.storage import CvStore
+from jobhunter.scoring.batch_results import batches_client as make_batches_client
 from jobhunter.sources import http
 from jobhunter.sources.base import SourceAdapter
 from jobhunter.sources.instances import InstanceRow, sync_instances
@@ -158,8 +166,7 @@ _REGISTERING_MODULES: Final = (
     # `profile_vectors` reconciler (Task 19)
     "jobhunter.profile.operations",
     "jobhunter.settings.scope_apply",  # the `apply_scope` handler and `scope_apply_failed` (M2 Task 18)
-    # the takeover sweeps `score_targets` and `score_cycles` and `orphaned_cycles` (M3 Task 11; Task 27 adds
-    # the remaining M3 modules)
+    # the takeover sweeps `score_targets` and `score_cycles` and `orphaned_cycles` (M3 Task 11)
     "jobhunter.scoring.cycles",
     # `expiry_sweep` and `budget_release` (M3 Task 13), `missing_targets` and the `create_targets_for_tuple`
     # handler (Task 14); `llm.bulk`'s `bulk_operations` comes with `scoring.cycles`
@@ -174,6 +181,10 @@ _REGISTERING_MODULES: Final = (
     "jobhunter.scoring.reconcilers",
     # the `eval_run` handler and its failure hook (`worker.operations.eval_run_failed`; Task 19, Ruling P44)
     "jobhunter.scoring.eval_runner",
+    # Task 27: the golden set and the Batches client register nothing of their own (checked by import); the
+    # start imports them before the takeover with the rest of the score lane
+    "jobhunter.scoring.golden",
+    "jobhunter.llm.batches",
 )
 _SHUTDOWN_SIGNALS: Final = (signal.SIGTERM, signal.SIGINT)
 
@@ -263,10 +274,19 @@ class _WorkerProcess:
         except (sa.exc.DBAPIError, ConnectorException) as exc:
             if not is_lock_timeout(exc):
                 raise
-            # Nothing was committed. The teardown closes the lock session, which releases the lock, and the
-            # exit lets the restart try again once the holder of the row lock is gone.
+            # The blocked transaction committed nothing (a sweep's: the claim and the earlier sweeps stay, and
+            # the next start sweeps again). The teardown closes the lock session, which releases the lock, and
+            # the exit lets the restart try again once the holder of the row lock is gone.
             log.error("takeover_blocked", error_class=type(exc).__name__)
             return 1
+        except FencedOut as refused:
+            if refused.owner != WORKER_EPOCH:
+                raise  # the claim's own lock check (`worker_lock`) or another owner: the start failed, exit 1
+            # A sweep's fence found a newer epoch (M3 Task 27: the claim commits before the sweeps, so a newer
+            # worker can claim in between): that worker owns the work and sweeps it; no loop starts here, as
+            # for a superseded startup sync (Ruling FR-i).
+            log.critical("worker_superseded_at_start", exit_code=WATCHDOG_EXIT_CODE)
+            return WATCHDOG_EXIT_CODE
         log.info("startup_check_passed", check="advisory_lock_acquired", epoch=epoch)
         # 6. The watchdog.
         self.watchdog = Watchdog(self.lock_session, ident.instance_id, epoch)
@@ -287,6 +307,7 @@ class _WorkerProcess:
             engine=engine, gateway=gateway, clock=utcnow, monotonic=gateway.monotonic, saver=saver
         )
         score_graphs = build_score_graphs(score_deps)
+        batches_client = make_batches_client(cfg, gateway)  # M3 Task 27: one for the process
         http.configure(cfg)  # before the clients: in fake mode they must be on the fixture transport
         clients = self.clients = make_clients(cfg)
         shutdown = self.shutdown
@@ -314,6 +335,8 @@ class _WorkerProcess:
             profile_graphs=profile_graphs,
             embedder=embedder,
             clock=utcnow,
+            score_steps=score_deps,
+            batches_client=batches_client,
         )
         runtime = WorkerRuntime(
             cfg=cfg,
@@ -331,6 +354,7 @@ class _WorkerProcess:
             operation_deps=operation_deps,
             score_graphs=score_graphs,
             score_deps=score_deps,
+            batches_client=batches_client,
         )
 
         # 8. The source instances synced with the secrets under this worker's epoch fence, the start

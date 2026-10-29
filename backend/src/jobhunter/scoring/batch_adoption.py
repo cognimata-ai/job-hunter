@@ -32,8 +32,8 @@ adopting ours) removes the count. One submission's unexpected error is logged wi
 others to the pass (Ruling T17-a).
 
 **The task body** (`reconcile_ambiguous_task`, Deviation 27: the periodic task `batch_reconcile_ambiguous` of
-`worker.tasks`, under the queueing lock of its name) builds the client from the worker's config and gateway
-(`batch_results.batches_client`) and does nothing without a configured one.
+`worker.tasks`, under the queueing lock of its name) lists with the worker's one client
+(`WorkerRuntime.batches_client`, M3 Task 27) and does nothing without a configured one.
 
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
@@ -47,7 +47,6 @@ from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.clock import utcnow
-from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition
 from jobhunter.errors import FencedOut
@@ -56,11 +55,10 @@ from jobhunter.llm.batches import (
     BatchesClient,
     BatchSummary,
 )
-from jobhunter.llm.gateway import LLMGateway
 from jobhunter.observability.alerts import open_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import batches, cycles
-from jobhunter.scoring.batch_results import batches_client, custom_id_anomaly, items_of, process_results
+from jobhunter.scoring.batch_results import custom_id_anomaly, items_of, process_results
 from jobhunter.types import JSONValue
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import Deferrer, defer_in_tx
@@ -354,11 +352,10 @@ async def _reconcile_one(
 
 
 async def reconcile_ambiguous_task(
-    engine: AsyncEngine, cfg: AppConfig, gateway: LLMGateway, *, epoch: int
+    engine: AsyncEngine, client: BatchesClient, *, epoch: int
 ) -> ReconcileReport:
-    """`batch_reconcile_ambiguous`'s body: `reconcile_ambiguous` at now, nothing without a configured
-    client."""
-    client = batches_client(cfg, gateway)
+    """`batch_reconcile_ambiguous`'s body: `reconcile_ambiguous` at now with the worker's `client`, nothing
+    without a configured one."""
     if not client.configured:
         return ReconcileReport()
     return await reconcile_ambiguous(engine, client, now=utcnow(), epoch=epoch, defer=defer_in_tx)

@@ -32,6 +32,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import ensure_hashed
 from jobhunter.db.sql import q
+from jobhunter.graphs.score.deps import ScoreDeps
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.run_settings import scope_from_payload
@@ -244,20 +245,26 @@ async def fake_eval_answers(engine: AsyncEngine, fake_llm: FakeLLM) -> dict[int,
 
 
 def eval_deps(engine: AsyncEngine, fake_llm: FakeLLM, *, fake_mode: bool = True) -> OperationDeps:
-    """The worker's `OperationDeps` an `eval_run` execution reads (`cfg`, `gateway`, `clock`; Ruling P33):
-    a gateway on the fake, the config in fake LLM mode or, with `fake_mode=False`, the same config as a
-    live-configured worker's (the transport check reads `cfg.fake_llm`; the gateway still sends to the
-    fake, so a test sees any try that would have been paid). The profile collaborators are not used."""
+    """The worker's `OperationDeps` an `eval_run` execution reads (`cfg` and `score_steps`, its gateway and
+    clock; Ruling P33, M3 Task 27): a gateway on the fake, the config in fake LLM mode or, with
+    `fake_mode=False`, the same config as a live-configured worker's (the transport check reads
+    `cfg.fake_llm`; the gateway still sends to the fake, so a test sees any try that would have been paid).
+    The profile collaborators and the Batches client are not used."""
     cfg = fake_llm.cfg if fake_mode else dataclasses.replace(fake_llm.cfg, fake_llm=False)
+    gateway = fake_llm.gateway(engine)
     unused: Any = None
     return OperationDeps(
         cfg=cfg,
-        gateway=fake_llm.gateway(engine),
+        gateway=gateway,
         parse_client=unused,
         cv_store=unused,
         profile_graphs=unused,
         embedder=None,
         clock=utcnow,
+        score_steps=ScoreDeps(
+            engine=engine, gateway=gateway, clock=utcnow, monotonic=gateway.monotonic, saver=None
+        ),
+        batches_client=unused,
     )
 
 

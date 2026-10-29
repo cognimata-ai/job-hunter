@@ -4,7 +4,8 @@ report and its completion.
 In one transaction: the cycle under its owner predicate (`cycles.lock_cycle`, step 5; a lost cycle is
 `FencedOut(cycles.CYCLE_OWNER)`), its attempts' spend and the cache figures of their calls, then
 `transition(score_cycles, running → completed, owner={worker_epoch})` with the report and `spent_usd`,
-`score_cycle.orphaned` resolved (a completed cycle ends the orphan alert of an earlier one, L5596), and
+`score_cycle.orphaned` and `score_cycle.failed` resolved (a completed cycle ends the orphan and the failure
+alerts of the earlier ones, L5596, L5617; Carry T25-b: only a completed cycle resolves them), and
 `scoring.critic_rate_high` evaluated for the cycle's tuple and evaluation policy at the deps' clock
 (`cycles.evaluate_critic_rate`, L5595: opened above 1.5 times the projected critic rate, resolved below it;
 M3 Task 18, Ruling P32).
@@ -83,6 +84,7 @@ def make_finalize_cycle(deps: ScoreDeps) -> CycleNode:
                 set_={"report": report, "spent_usd": spent},
             )
             resolved = await resolve_alerts(conn, code=cycles.ORPHANED_ALERT)
+            failures_resolved = await resolve_alerts(conn, code=cycles.FAILED_ALERT)
             await cycles.evaluate_critic_rate(
                 conn,
                 llm_tuple_id=cycle.llm_tuple_id,
@@ -96,6 +98,7 @@ def make_finalize_cycle(deps: ScoreDeps) -> CycleNode:
             spent_usd=str(spent),
             claim_rounds=state["claim_rounds"],
             orphan_alerts_resolved=resolved,
+            failed_alerts_resolved=failures_resolved,
         )
         return {}
 

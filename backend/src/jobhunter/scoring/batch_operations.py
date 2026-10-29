@@ -19,14 +19,15 @@ record_ambiguous` in a transaction of its own, retried on a retryable database e
 `DB_RETRY.max_attempts` tries, its interval waited with the gateway's injected `sleep` (the owner predicate
 makes each try the same recording, and a row whose tries ran out stays `submit_started`, the recovery's), then
 the carried cancel (`batch_results.cancel_requested`), and (8) `finish_in(succeeded)` with `progress =
-{"submission_id", "state", "request_count"}`. The client is built from today's `OperationDeps` fields (`cfg`,
-`gateway.http_client`, `clock`, and the gateway's `monotonic` and `sleep` for the create's own retries; Task
-27 moves it into `OperationDeps.batches_client`).
+{"submission_id", "state", "request_count"}`. The client is the worker's one, `OperationDeps.batches_client`
+(on the gateway's `httpx2` client, its `monotonic` and `sleep` for the create's own retries; M3 Task 27,
+Ruling P33).
 
 **The recovery of a lost execution** (`batches.recover_lost`) runs in the takeover sweep `batch_submissions`
-(today in the takeover's transaction; Task 27 gives each sweep its own), after `fence_epoch` and
-`active_config FOR SHARE`, and in the tick reconciler `batch_submissions`, which takes no lock on a pass whose
-lock-free read finds no candidate (`batches.any_lost`).
+(in a transaction of its own, which the takeover opens with `fence_epoch` and `active_config FOR SHARE`, both
+taken again here; M3 Task 27), and in the tick reconciler `batch_submissions`, which takes no lock on a pass
+whose lock-free read finds no candidate (`batches.any_lost`). A row an execution's prepare commits after the
+sweep scanned is the reconciler's: it is recovered within a tick (Codex r6 B5, r7 B4).
 
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
@@ -44,13 +45,7 @@ from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.graphs.sanitize import DB_RETRY, db_retry_interval, is_retryable_db_error
-from jobhunter.llm.batches import (
-    Ambiguous,
-    BatchesClient,
-    Created,
-    CreateOutcome,
-    Rejected,
-)
+from jobhunter.llm.batches import Ambiguous, Created, CreateOutcome, Rejected
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import batches, cycles, targets
 from jobhunter.scoring.batch_results import cancel_requested
@@ -149,13 +144,7 @@ async def batch_submit(ctx: OperationContext) -> None:
     bulk_operation_id = get_int(payload, "bulk_operation_id")
     llm_tuple_id = get_int(payload, "llm_tuple_id")
     clock = deps.clock
-    client = BatchesClient(
-        deps.cfg,
-        http_client=deps.gateway.http_client,
-        clock=clock,
-        monotonic=deps.gateway.monotonic,
-        sleep=deps.gateway.sleep,
-    )
+    client = deps.batches_client
     async with ctx.engine.begin() as conn:  # 1. this operation's lost executions
         epoch = (
             await conn.execute(_OWN_EPOCH, {"i": ctx.claim.operation_id, "c": ctx.claim.claim_id})

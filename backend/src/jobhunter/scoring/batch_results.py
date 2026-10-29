@@ -57,8 +57,9 @@ recovery: every step is idempotent, a crash after (1) leaves the next poll to sk
 (3), a crash after the last missing item leaves it to run (3).
 
 **The task body** (`poll_task`, Deviation 27: the periodic task `batch_poll` of `worker.tasks`, under the
-queueing lock of its name) builds the client from the worker's config and gateway (`batches_client`, which the
-adoption's body shares) and does nothing without a configured one.
+queueing lock of its name) polls with the worker's one client (`WorkerRuntime.batches_client`, which
+`worker.main` builds once with `batches_client` from the gateway: the adoption's body and the `batch_submit`
+handler share it; M3 Task 27) and does nothing without a configured one.
 
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
@@ -803,16 +804,16 @@ async def poll(
 
 
 def batches_client(cfg: AppConfig, gateway: LLMGateway) -> BatchesClient:
-    """The worker's Batches client on the gateway's `httpx2` client, clocks and sleep (Task 27 moves it into
-    the runtime)."""
+    """The worker's Batches client on the gateway's `httpx2` client, monotonic clock and sleep, at `utcnow`:
+    `worker.main` builds the process's one (`WorkerRuntime.batches_client`, `OperationDeps.batches_client`;
+    M3 Task 27)."""
     return BatchesClient(
         cfg, http_client=gateway.http_client, clock=utcnow, monotonic=gateway.monotonic, sleep=gateway.sleep
     )
 
 
-async def poll_task(engine: AsyncEngine, cfg: AppConfig, gateway: LLMGateway, *, epoch: int) -> PollReport:
-    """`batch_poll`'s body: `poll` at now, nothing without a configured client."""
-    client = batches_client(cfg, gateway)
+async def poll_task(engine: AsyncEngine, client: BatchesClient, *, epoch: int) -> PollReport:
+    """`batch_poll`'s body: `poll` at now with the worker's `client`, nothing without a configured one."""
     if not client.configured:
         return PollReport()
     return await poll(engine, client, now=utcnow(), epoch=epoch, defer=defer_in_tx)

@@ -21,6 +21,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.scoring import eval_runner, golden
 from jobhunter.worker import tasks
+from jobhunter.worker.runtime import ShutdownState
 from jobhunter.worker.tasks import _reset_task_app, job_task_name, make_queue_app
 from procrastinate.job_context import JobContext
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -60,9 +61,10 @@ def _unfaulted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(eval_runner, "afault_point", no_fault)
 
 
-def context(engine: AsyncEngine, fake_llm: FakeLLM) -> JobContext:
-    """The task's context: a runtime with the engine and the worker's config (on the fake)."""
-    runtime = SimpleNamespace(engine=engine, cfg=fake_llm.cfg)
+def context(engine: AsyncEngine, fake_llm: FakeLLM, epoch: int = 1) -> JobContext:
+    """The task's context: a runtime with the engine, the worker's config (on the fake), its epoch (the
+    task's fence, M3 Task 27) and a shutdown state that has not stopped admission."""
+    runtime = SimpleNamespace(engine=engine, cfg=fake_llm.cfg, epoch=epoch, shutdown=ShutdownState())
     return cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
 
 
@@ -106,7 +108,7 @@ def answer(fake_llm: FakeLLM, case: CaseRef, raised: tuple[str, ...] = ()) -> No
 async def canary_run(engine: AsyncEngine, fake_llm: FakeLLM, epoch: int) -> Any:
     """One `canary_daily`, then its operation executed; the ended run."""
     before = {run.id for run in await canary_runs(engine)}
-    await tasks.canary_daily(context(engine, fake_llm), timestamp=0)
+    await tasks.canary_daily(context(engine, fake_llm, epoch), timestamp=0)
     [run] = [run for run in await canary_runs(engine) if run.id not in before]
     await execute(engine, (await operation_of(engine, run.id)).id, eval_deps(engine, fake_llm), epoch=epoch)
     return await run_row(engine, run.id)
@@ -126,7 +128,7 @@ async def scores(engine: AsyncEngine, eval_run_id: int) -> dict[int, Decimal]:
 
 
 async def test_canary_daily_starts_a_canary_run_of_the_active_configuration(
-    engine: AsyncEngine, fake_llm: FakeLLM, queue_app: procrastinate.App
+    engine: AsyncEngine, fake_llm: FakeLLM, queue_app: procrastinate.App, current_epoch: int
 ) -> None:
     """L4632: with a tuple active and an active canary, one `eval_runs` row (`kind = 'canary'`, production,
     the active rubric, prompt schema, model policy, evaluation policy and execution config, on the worker's

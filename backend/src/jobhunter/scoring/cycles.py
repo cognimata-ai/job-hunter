@@ -53,11 +53,12 @@ them. An attempt's own failure is never a reclaim: `run_target` ends it through 
 
 **An orphaned cycle** is failed `orphaned` with the report closed `{"reason": "orphaned"}`, its claims
 reclaimed, and the warn alert `score_cycle.orphaned` raised (subject `cycle:<id>`), which the next completed
-cycle resolves (`graphs.score.nodes.finalize_cycle`):
+cycle resolves (`graphs.score.nodes.finalize_cycle`, with `score_cycle.failed`, Carry T25-b):
 - the takeover sweep `score_targets` (§3.3.1 step 3) reclaims every claim of an older epoch, detail
   `worker_takeover`, and the sweep `score_cycles` (step 4) fails every running cycle of an older epoch, in
-  this order (registration). Each runs in the takeover's transaction today; Task 27 gives each sweep a
-  transaction of its own that starts with `fence_epoch` and `active_config FOR SHARE`;
+  this order (registration). Each runs in a transaction of its own that the takeover opens with
+  `fence_epoch` and `active_config FOR SHARE` (M3 Task 27), so the targets sweep's rows are committed before
+  the cycles sweep locks a cycle row (Carries T11-b, T11-e);
 - the tick reconciler `orphaned_cycles` (§17.4) fails a running cycle whose `heartbeat_at` is older than 3 min
   (rows another transaction holds are skipped this time), detail `cycle_orphaned`, fenced by the worker epoch
   first; after the commit it cancels the cycle's local execution when that runs for the cycle's epoch.
@@ -781,7 +782,7 @@ async def fail_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int, error_
 @register_takeover_sweep("score_targets")
 async def sweep_older_epoch_claims(conn: AsyncConnection, epoch: int) -> Swept:
     """§3.3.1 step 3: reclaim every claim of an older epoch (detail `worker_takeover`); the count, counted in
-    `jobhunter_claim_reclaims_total` once the takeover has committed."""
+    `jobhunter_claim_reclaims_total` once the sweep's transaction has committed."""
     reclaimed = len(await reclaim(conn, "older_epoch", {"epoch": epoch}, detail=WORKER_TAKEOVER))
     return Swept(reclaimed, after_commit=lambda: count_reclaims(reclaimed))
 
@@ -789,8 +790,8 @@ async def sweep_older_epoch_claims(conn: AsyncConnection, epoch: int) -> Swept:
 @register_takeover_sweep("score_cycles")
 async def sweep_older_epoch_cycles(conn: AsyncConnection, epoch: int) -> Swept:
     """§3.3.1 step 4: fail every running cycle of an older epoch `orphaned` (its claims were reclaimed by the
-    `score_targets` sweep before it; any left are reclaimed here, and counted once the takeover has
-    committed); the count of cycles."""
+    `score_targets` sweep before it; any left are reclaimed here, and counted once the sweep's transaction
+    has committed); the count of cycles."""
     cycle_ids = [int(c) for c in (await conn.execute(_OLDER_CYCLES, {"epoch": epoch})).scalars()]
     reclaimed = 0
     for cycle_id in cycle_ids:

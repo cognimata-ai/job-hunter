@@ -16,13 +16,14 @@ lock `derive.ensure_derived` relies on to serialise `evaluation_policies.version
 policy's projected critic rate replayed; no settings version, no activation; a later save of the document
 finds the same rows, so the gate's run is the candidate's).
 
-**The handler** (`eval_run`, `run_eval`) builds the score steps' dependencies from today's `OperationDeps`
-fields (`cfg`, `gateway`, `clock`; Ruling P33, `worker/operations.py`; Task 27 moves them). **The owner is the
-operation's claim** (Codex r1 #29): every paid call carries `CallContext(owner=EvalRunOwner(eval_run_id,
-claim=op.claim), purpose_class="nonscoring", eval_run_id, golden_case_id, round, logical_call_no, deadline)`
-with `input_refs["repetition"]` for the ledger's audit; every domain write (a case row, the run's end) runs
-under that owner's lock (the operation row under its claim, then the run row `FOR SHARE` while `running`), so
-a reclaimed execution can neither reserve nor write (`FencedOut`). The lock order of a case's write:
+**The handler** (`eval_run`, `run_eval`) scores on the worker's score steps' dependencies,
+`OperationDeps.score_steps` (its gateway and clock; Ruling P33, M3 Task 27), and reads the worker's transport
+from `OperationDeps.cfg`. **The owner is the operation's claim** (Codex r1 #29): every paid call carries
+`CallContext(owner=EvalRunOwner(eval_run_id, claim=op.claim), purpose_class="nonscoring", eval_run_id,
+golden_case_id, round, logical_call_no, deadline)` with `input_refs["repetition"]` for the ledger's audit;
+every domain write (a case row, the run's end) runs under that owner's lock (the operation row under its
+claim, then the run row `FOR SHARE` while `running`), so a reclaimed execution can neither reserve nor write
+(`FencedOut`). The lock order of a case's write:
 `active_config FOR SHARE` → the case's job `FOR SHARE` → the operation row → the run row → the case row
 `FOR KEY SHARE` → its `eval_case_results` row (a call takes the month and the ledger rows between,
 `spend_ledger.reserve`).
@@ -1175,10 +1176,11 @@ async def run_eval(
 
 @register_operation_handler(KIND, on_failed=eval_run_failed)
 async def eval_run(ctx: OperationContext) -> None:
-    """The `eval_run` operation (module docstring): payload `{"eval_run_id"}`; its dependencies are today's
-    `OperationDeps` fields (Ruling P33)."""
+    """The `eval_run` operation (module docstring): payload `{"eval_run_id"}`, scored on the worker's
+    `OperationDeps.score_steps` (Ruling P33)."""
     deps = ctx.deps
     if deps is None:
         raise RuntimeError("eval_run needs the worker's operation dependencies")
     eval_run_id = get_int(dict(ctx.claim.payload), "eval_run_id")
-    await run_eval(ctx.engine, deps.gateway, eval_run_id=eval_run_id, op=ctx, now=deps.clock())
+    steps = deps.score_steps
+    await run_eval(ctx.engine, steps.gateway, eval_run_id=eval_run_id, op=ctx, now=steps.clock())

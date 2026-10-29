@@ -309,11 +309,11 @@ async def test_a_retrieval_failing_past_the_expiry_raises_the_critical_alert(
 async def test_the_batch_poll_task_body_polls_with_the_workers_client(
     engine: AsyncEngine, fake_llm: FakeLLM, submitted: SubmittedBatch, current_epoch: int
 ) -> None:
-    """`batch_poll`'s body (`poll_task`): the worker's client from its config and gateway, `poll` at now."""
+    """`batch_poll`'s body (`poll_task`): `poll` at now with the worker's client (`batches_client`, on its
+    config and gateway; M3 Task 27: `worker.main` builds the one of the process)."""
     fake_llm.batches(BatchScript(polls_until_ended=0))
-    report = await batch_results.poll_task(
-        engine, fake_llm.cfg, fake_llm.gateway(engine), epoch=current_epoch
-    )
+    client = batch_results.batches_client(fake_llm.cfg, fake_llm.gateway(engine))
+    report = await batch_results.poll_task(engine, client, epoch=current_epoch)
     assert (report.polled, report.reconciled) == (1, 1)
     assert await submission_state(engine, submitted.submission_id) == "reconciled"
 

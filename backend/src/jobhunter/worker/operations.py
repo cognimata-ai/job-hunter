@@ -26,9 +26,12 @@ domain row the operation drives (a profile draft, a query proposal) never outliv
 state. A hook may lock only rows after the owner row in the §9.1 order, and it moves its domain row only while
 that row is still live: a row the handler's own write already ended in the same transaction is left as it is.
 
-**The `eval_run` hook** (M3 Task 19, written here; Task 27 pins it): `eval_run_failed` ends the run of a
-failed `eval_run` operation `failed('interrupted')` while it is still `running` (`fail_eval_run`, which the
-eval runner shares); `scoring.eval_runner` registers it with the kind's handler.
+**The `eval_run` hook** (M3 Task 19, written here; pinned by Task 27's registration test): `eval_run_failed`
+ends the run of a failed `eval_run` operation `failed('interrupted')` while it is still `running`
+(`fail_eval_run`, which the eval runner shares); `scoring.eval_runner` registers it with the kind's handler.
+`batch_submit` has no hook: its cleanup needs `active_config`, an earlier lock than the operation row a hook
+runs after, so the `batch_submissions` tick reconciler recovers its rows in a fenced transaction of its own
+(Codex r3 B2); a failed `create_targets_for_tuple` needs none (`missing_targets` requests it again).
 
 **Handler-side ends** (M2 Task 11). A handler, or a graph node it runs, ends its operation inside its own
 transaction with `OperationContext.finish_in` or `requeue_in`, so the last domain write and the operation's
@@ -86,6 +89,8 @@ if TYPE_CHECKING:
     from jobhunter.config import AppConfig
     from jobhunter.embeddings import EmbedderClient
     from jobhunter.graphs.profile.graph import ProfileGraphs
+    from jobhunter.graphs.score.deps import ScoreDeps
+    from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -146,10 +151,14 @@ class OperationClaim:
 
 @dataclass(frozen=True)
 class OperationDeps:
-    """What the M2 handlers need from the worker process, built once in `worker.main` (Task 11).
+    """What the M2 and M3 handlers need from the worker process, built once in `worker.main` (M2 Task 11, M3
+    Task 27).
 
     `embedder` is `None` when the worker has none, as for `WorkerRuntime.embedder`; `clock` is the injected
-    clock of the handlers' times.
+    clock of the handlers' times. `score_steps` are the score steps' dependencies (`WorkerRuntime.score_deps`:
+    the engine, the gateway, the clock and the gateway's monotonic clock), which the `eval_run` handler scores
+    its cases with; `batches_client` is the process's Message Batches client (`WorkerRuntime.batches_client`),
+    which the `batch_submit` handler creates its batch with. Neither handler builds its own (Ruling P33).
     """
 
     cfg: "AppConfig"
@@ -159,6 +168,8 @@ class OperationDeps:
     profile_graphs: "ProfileGraphs"
     embedder: "EmbedderClient | None"
     clock: Callable[[], datetime]
+    score_steps: "ScoreDeps"
+    batches_client: "BatchesClient"
 
 
 @dataclass(frozen=True)
@@ -628,8 +639,8 @@ async def _reclaim_stale(conn: AsyncConnection, *, now: datetime) -> list[tuple[
 async def sweep_older_epoch_operations(conn: AsyncConnection, epoch: int) -> int:
     """At takeover: take back every `running` operation of an older worker epoch; the count.
 
-    It waits for the row locks of those owners (none is skipped), so once the takeover commits no older claim
-    is valid any more.
+    It waits for the row locks of those owners (none is skipped), so once its transaction commits no older
+    claim is valid any more.
     """
     rows = (await conn.execute(_OLDER_EPOCH, {"epoch": epoch})).all()
     for row in rows:

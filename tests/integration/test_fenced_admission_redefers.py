@@ -217,6 +217,7 @@ async def test_a_superseded_workers_collect_loop_stops_and_leaves_the_redeferred
             operation_deps=deps,
             score_graphs=build_score_graphs(score_deps),
             score_deps=score_deps,
+            batches_client=deps.batches_client,
         )
         loop = asyncio.create_task(
             queue_app.run_worker_async(
