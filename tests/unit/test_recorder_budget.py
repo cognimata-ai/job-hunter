@@ -259,7 +259,7 @@ def test_the_ledger_keeps_its_entries_and_records_the_new_limits(rec: ModuleType
     assert state["limits"] == {
         "actual_usd": "10.00",
         "rule": rec.BUDGET_RULE,
-        "spikes": {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3},
+        "spikes": {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3, "v4v2": 4, "v12": 1, "v5": 20, "v14": 2},
     }
     each = pricing.settled_usd("claude-sonnet-5-5", pricing.Usage(900, 300, 0, 0)) + pricing.settled_usd(
         "claude-opus-5-5", pricing.Usage(900, 300, 0, 0)
@@ -289,9 +289,26 @@ def test_the_spike_call_count_is_enforced(rec: ModuleType, tmp_path: Path) -> No
 
 def test_the_spike_call_counts_and_the_total_are_the_rulings(rec: ModuleType) -> None:
     # R7-2: V4 sends its 4 gating cases and its probe goes to the free counting endpoint, never as a message.
-    # v2probe: the ladder A, B, C sends at most 3. The user's M3 total covers every spike.
-    assert rec.SPIKE_CALLS == {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3}
+    # v2probe: the ladder A, B, C sends at most 3. The user's M3 total covers every spike. M3 Task 26: the
+    # gateway spikes count HTTP attempts (v4v2, v5, v14), V12 its one batch.
+    assert rec.SPIKE_CALLS == {
+        "v13": 2,
+        "v4": 4,
+        "v19": 1,
+        "v2probe": 3,
+        "v4v2": 4,
+        "v12": 1,
+        "v5": 20,
+        "v14": 2,
+    }
     assert rec.SPIKE_MODULES["v2probe"] == "v4b_generator_v2_probe"
+    assert {s: rec.SPIKE_MODULES[s] for s in ("v4v2", "v12", "v5", "v14")} == {
+        "v4v2": "v4_schema_dry_run",
+        "v12": "v12_batches",
+        "v5": "v5_stream_timing",
+        "v14": "v5_stream_timing",
+    }
+    assert rec.GATEWAY_SPIKES == frozenset({"v4v2", "v5", "v14"}) and rec.BATCH_SPIKES == frozenset({"v12"})
     assert rec.MAX_ACTUAL_USD == Decimal("10.00")
     assert not hasattr(rec, "MAX_MESSAGES") and not hasattr(rec, "MAX_WORST_CASE_USD")
 
@@ -907,3 +924,72 @@ def test_the_v2probe_dry_run_names_the_ladder_and_sends_nothing(
     assert factory.created == 0 and out.count("payload ok") == 3
     assert "candidate_a waits" not in out
     assert "candidate_b waits for the ladder" in out and "candidate_c waits for the ladder" in out
+
+
+# --- M3 Task 26: the gateway and batch spikes' modes -----------------------------------------------------
+
+
+def test_the_v4v2_dry_run_checks_the_four_version_2_cases_offline(
+    rec: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_budget(tmp_path, settled("v2probe", "candidate_c", "0.118852", worst_case_usd="0.2"))
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", "v4v2", "--dry-run", environ={}) == rec.OK
+    out = capsys.readouterr().out
+    assert factory.created == 0 and out.count("payload ok") == 4 and "BAD" not in out
+    for case in ("generator-claude-sonnet-5-5", "critic-claude-opus-5-5", "profile-claude-opus-5-5"):
+        assert f"v4v2 {case} " in out
+    assert "probe:minimum/claude-sonnet-5-5 goes to the free counting endpoint" in out
+    module = _load("v4_schema_dry_run")
+    worst = sum(
+        pricing.worst_case_usd(
+            c["node"].model,
+            input_tokens_bound=bounds.text_input_bound(
+                c["node"].model, c["prompt"].as_request(c["node"].schema)
+            ),
+            max_tokens=c["node"].max_tokens,
+        )
+        for c in module.gateway_calls("v4v2")
+    )
+    assert f"committed_usd={Decimal('0.118852') + worst} of 10.00" in out
+    assert budget(tmp_path)["entries"] == [
+        settled("v2probe", "candidate_c", "0.118852", worst_case_usd="0.2")
+    ]
+
+
+def test_the_v4v2_cases_send_the_stored_version_2_schemas() -> None:
+    module = _load("v4_schema_dry_run")
+    calls = module.gateway_calls("v4v2")
+    assert [c["case"] for c in calls] == [
+        "generator-claude-sonnet-5-5",
+        "critic-claude-opus-5-5",
+        "profile-claude-opus-5-5",
+        "queries-claude-opus-5-5",
+    ]
+    v2 = module.V2
+    assert [c["node"].schema.json for c in calls] == [
+        v2.schemas[n] for n in ("generator", "critic", "profile", "queries")
+    ]
+    assert {(c["node"].effort, c["node"].max_tokens, c["node"].purpose) for c in calls} == {
+        ("low", 2000, "schema_dry_run")
+    }
+
+
+@pytest.mark.parametrize("spike", ["v13", "v4", "v12"])
+def test_through_gateway_is_refused_for_a_spike_that_does_not_run_through_the_gateway(
+    rec: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str], spike: str
+) -> None:
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", spike, "--dry-run", "--through-gateway") == rec.REFUSED
+    out = capsys.readouterr().out
+    assert f"{spike}: REFUSED, --through-gateway is for v4v2, v5 and v14 only; nothing sent" in out
+    assert factory.created == 0 and not (tmp_path / "raw").exists()
+
+
+@pytest.mark.parametrize("spike", ["v4v2", "v5", "v14", "v12"])
+def test_commit_recorded_is_refused_for_the_gateway_and_batch_spikes(
+    rec: ModuleType, tmp_path: Path, spike: str
+) -> None:
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", spike, "--commit-recorded") == rec.REFUSED
+    assert factory.created == 0 and not (tmp_path / "raw").exists()
