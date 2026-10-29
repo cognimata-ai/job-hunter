@@ -2,7 +2,8 @@
 
 | | |
 |---|---|
-| Status | **Approved** — revision 3.4. Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Revision 3.4 (2026-10-21, the user's decision after spike V19): the default `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured prompt overhead (§6.9.1). Audit trail: `docs/council/` |
+| Status | **Approved** — revision 3.5. Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Revision 3.4 (2026-10-21, the user's decision after spike V19): the default `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured prompt overhead (§6.9.1). Revision 3.5 (2026-10-29, the user's decisions U1–U4 and the M3 plan's deviations): the generator output schema of §11.5 is candidate C of spike V4b (generic fact items plus generic criterion items; the §11.5 schema of revision 3.4 is rejected by the API as too large), with §11.4, §11.6, §10.6, §10.11 and §11.9 adjusted to it; §11.3's language anchor follows §11.4 (B2 or higher is `met`); §6.8's Arbeitnow page yield is V8's 17.5 h, so the coverage-risk warning fires for intervals above 35 h (a 7-day interval raises it); `display.timezone` is a `schedule` field (§13.1); and the M3 plan's recorded deviations (its Deviations 1–41) on §3.3.3, §6.9.3, §7.11–7.13, §7.16, §7.18, §9.2, §9.3, §9.6, §9.7, §10.6, §10.10, §10.11, §11.6, §11.8, §11.13, §13.1, §14.2, §17.2, §17.6, §18.6, §20.1, §21.4 and §22, with the M3 execution rulings T3-b (§11.4, §11.6), T4-a (§7.3), T5-e (§11.6), T9-f (§11.7.2), T11-f and T11-g (§10.4), T12-b (§9.6.2), T15-a and T15-d (§8.7), T16-a, T16-d, T16-f, T16-g and T17-a (§10.10, §17.4, §17.6), T18-a (§17.5), T19-c (§7.4), T20-a (§13.2), T20-d (§10.3, §11.13), T22-c and T22-d′ (§8.6.1, §8.6.2), T22-e (§9.7) and M2-C1 (§12.3), and the overhead of V19's M3 re-count, 1,878 tokens (§6.9.1). Audit trail: `docs/council/` |
+| Known open points (revision 3.5) | Recorded, not decided: (1) §10.10 has a purge cancel the affected `in_batch` targets individually, while §20.2 step 1 requests the submission's cancel first; M5 decides (`targets.delete_target_set` records it). (2) §12.3's header-name rule takes a name only from a line that is nothing but a name, so mixed header lines (`Max Mustermann \| Senior Backend Engineer`, `Max Mustermann, M.Sc.`, `Lebenslauf Max Mustermann`, `Max Mustermann · max@… · +49 …`) and glued URLs (`LinkedInhttps://…`, an e-mail glued to a URL) leave contact data in the text; the user's review of the stripped text is the guarantee (a decision for the user). (3) §13.4: the scope apply's final staleness check recomputes in Python under `active_config FOR UPDATE` (about 0.7–1 s per 10,000 published results). (4) §18.3 C28: the old attempt's gateway path releases the entry `not_billed(never_dispatched)`, not the new owner; the end state is the same. (5) §8.6: the merge, unmerge and conflict routes (M4) must retry 40P01, and every `user_job_actions` write sets `updated_at`. |
 | Date | 2026-10-16 |
 | Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, the user's cost decision of revision 2 (§2.1 U14), and the chair's decisions of revision 3 (§2.4) |
 | Scope | One deployment for one user, German job market |
@@ -256,7 +257,7 @@ Three review findings cannot be fixed literally. The chair decided:
 2. **When the lock is held by someone else**, the worker reads `worker_heartbeat`:
    - `heartbeat_at` older than 60 s: the worker calls `pg_terminate_backend(lock_backend_pid)`. That pid is recorded in the row and cross-checked against `pg_locks`. The worker then retries acquiring the lock.
    - `heartbeat_at` fresh: the holder is healthy and MUST NOT be terminated. The new process logs `standby`, sleeps 10 s and retries. Two accidental worker processes therefore never kill each other in a loop. This follows consensus B3 (v3.1).
-3. **Epoch and takeover sweep.** Immediately after acquiring the lock, and before starting procrastinate, the worker runs one transaction:
+3. **Epoch and takeover sweep.** Immediately after acquiring the lock, and before starting procrastinate, the worker claims its epoch and runs the takeover sweeps (the epoch claim commits first, with no sweep; then the sweeps run in registration order, each in a transaction of its own that starts with `fence_epoch` and `active_config FOR SHARE` and takes its rows in the §3.3.3 order; no sweep depends on another's result, and a failing sweep ends the takeover, which the next start repeats under the next epoch):
    1. `UPDATE worker_heartbeat SET worker_epoch = worker_epoch + 1, worker_instance_id = :me, … RETURNING worker_epoch` — this is *my epoch*.
    2. Every `running` run whose current `run_attempts.worker_epoch` is older takes a new attempt (`attempt_no + 1`, new thread, `resume_count + 1`) owned by my epoch, and a locked `run_collect` task is deferred.
    3. Every `in_progress` score target whose `claim_epoch` is older is reclaimed (§9.4.3).
@@ -309,7 +310,7 @@ Three review findings cannot be fixed literally. The chair decided:
   - An undispatched reservation of a superseded owner is released (`not_billed(never_dispatched)`) only by the reconciler or the new owner. The stale owner's later dispatch-marker transaction fails the predicate and returns 0 rows, and the stale owner MUST then abort without sending (`FencedOut`).
   - The ownership predicate is checked by **every** reservation, dispatch marker, heartbeat and domain write of the owner, including those of operations (profile extraction, query proposal, exports, purges, evals).
   - **Purge fences** (§20.2) are persisted beside the predicate: every reservation and dispatch-marker transaction also refuses (`FencedOut`) while a `global` fence is active, except those of the purge operation itself, and work on a fenced job is refused as listed in §20.2.
-  - **Global lock order** (deadlock avoidance), always acquired in this order: `active_config` → job rows (purge chunks `FOR UPDATE`; target creation, revival and publication `FOR SHARE`, §20.2) → owner row → `llm_budget` month row → `quota_windows` row → ledger rows → other domain rows → `ranking_state`.
+  - **Global lock order** (deadlock avoidance), always acquired in this order: (1) `fence_epoch(conn, epoch)`, the first statement of every worker transaction that stamps `claim_epoch` or `worker_epoch`; (2) `active_config` (`FOR SHARE`, or `FOR UPDATE` in a save, a confirm and an activation); (3) the idempotency row (API routes); (4) job rows in id order (purge chunks `FOR UPDATE`; target creation, revival, publication and batch-item processing `FOR SHARE`, §20.2); (5) the owner row (`score_targets` under the claim predicate, `batch_submissions` under `state = :expected`, `score_cycles` under `worker_epoch = :e AND status = 'running'`, or an `operations` row under its claim); (6) the `llm_budget` month row (created if absent before it is locked, at every entry point that may meet a fresh UTC month); (7) the `bulk_operations` row; (8) the `quota_windows` row; (9) ledger rows (`llm_spend_ledger`, `llm_calls`); (10) other domain rows (`score_targets` not as the owner, `score_attempts`, `batch_items`, `score_drafts`, `critic_notes`, `llm_results` with its `det_results`, `duplicate_group_members`, `admission_lane_credits`); (11) `ranking_state`. A transaction that already holds a lock may name it again at any later step; a shared helper never takes an earlier step's lock for the first time after a later one. `ranking_state` is always the last lock. An API transaction stamps no epoch; the ones that take the month row take it after the configuration and the idempotency row and before any target row. The batch preparation is the one transaction that locks target rows after the month row: it does so with `FOR UPDATE SKIP LOCKED` and therefore never waits for a target. A transaction that creates its owner row inserts it after the rows its foreign keys reference have been locked, because an insert key-shares its parents. An operation's failure hook holds the operation row already and takes no earlier lock; cleanup that needs the configuration runs in a fenced transaction of its own afterwards. The epoch claim commits alone; every takeover sweep is then a transaction of its own that begins with the fence and the configuration, so no sweep holds another's rows.
 - Before any resume within one process, the previous asyncio task for that run is cancelled and awaited.
 
 #### 3.3.4 Heartbeats
@@ -1130,6 +1131,8 @@ def dry_run(proposed: Settings, active: Settings, now) -> DryRunResult:
     return DryRunResult(errs, warns, proj, effects)
 ```
 
+With the 17.5 h page yield (V8) and the unchanged page cap, `arbeitnow_coverage_risk` fires for intervals above 35 h: none at 24 h or 35 h, a warning at 36, 48, 72, 120 and 168 h. A 7-day collection interval therefore raises it (10.6 expected pages against a cap of 7).
+
 `llm_projection` reports the bucket rate, the bucket capacity, `ĉ`, the projected critic rate of the proposed evaluation policy and `targets_per_month = (scoring share − cache overhead) / ĉ` (§21.5). `arrival_per_month` is the trailing 7-day rate of new targets × 30, or 3,000 when there is no history.
 
 ### 6.9 LLM spend: monthly budget lock, USD bucket, bulk budgets
@@ -1143,7 +1146,7 @@ Paid LLM spend uses the same reserve-before-every-attempt discipline as the quot
 - **Every** LLM reservation (online, batch item, profile, queries, canary, eval, schema dry-run), every settlement, every cap edit and every bulk-budget change runs in a transaction that takes `SELECT … FROM llm_budget WHERE month = :m FOR UPDATE`, after the owner row and before any ledger row (lock order, §3.3.3). The check and the counter update happen **in the same transaction**, so concurrent reservations cannot both pass against the same balance.
 - **Counter maintenance**:
 
-  | Event | `counted_usd` (and the scoring or non-scoring part) | `bucket_usd` (scoring outside bulk operations only) |
+  | Event | `counted_usd` (and the scoring or non-scoring part) | `bucket_usd` (scoring reservations without `bulk_operation_id` only) |
   |---|---|---|
   | reservation of `r` | `+ r` | `− r` |
   | settled `billed` at `s ≤ r` | `+ (s − r)` | `+ (r − s)` |
@@ -1153,7 +1156,7 @@ Paid LLM spend uses the same reserve-before-every-attempt discipline as the quot
   | `ambiguous → not_billed(batch_item_errored \| canceled \| expired)` (an item of a batch that was found, provider evidence) | `− r` | `+ r` |
 
   The heavy reconciler (§17.4) recomputes the counters from the ledger every 10 min. Any difference raises the critical alert `llm.budget_counter_drift` and the counters are corrected from the ledger under the lock.
-- **Overrun buffer** (chair decision C1, §2.4). `overrun_buffer_usd` (settings `llm.overrun_buffer_usd`, default $2.00) is part of the cap that is **never admitted for spending**. It absorbs the residual estimation error of the input bound (§10.7). Settings validation requires `overrun_buffer_usd ≥ max_concurrent_llm_calls × PROMPT_OVERHEAD_TOKENS × the highest input price per token`, where `max_concurrent_llm_calls` is 3 score calls + 2 auxiliary calls + `batch_max_items` batch items (at batch prices). Spike V19 measured the overhead at 2,640 tokens per request (`docs/spikes/V19.md`). With the default 500 batch items that is about $1.72 (5 online slots × 2,640 × $5.00 + 500 × 2,640 × $1.25, per MTok), so the $2.00 default holds; with 1,000 items it would be about $3.37 (revision 3.4).
+- **Overrun buffer** (chair decision C1, §2.4). `overrun_buffer_usd` (settings `llm.overrun_buffer_usd`, default $2.00) is part of the cap that is **never admitted for spending**. It absorbs the residual estimation error of the input bound (§10.7). Settings validation requires `overrun_buffer_usd ≥ max_concurrent_llm_calls × PROMPT_OVERHEAD_TOKENS × the highest input price per token`, where `max_concurrent_llm_calls` is 3 score calls + 2 auxiliary calls + `batch_max_items` batch items (at batch prices). Spike V19 measured the overhead at 2,640 tokens per request, and its M3 re-count against prompt-schema version 2 (candidate C) at 1,878 (`docs/spikes/V19.md`). With the default 500 batch items that is about $1.23 (5 online slots × 1,878 × $5.00 + 500 × 1,878 × $1.25, per MTok, rounded up to the cent), so the $2.00 default holds; with 1,000 items at 2,640 tokens it would be about $3.37 (revision 3.4).
 - **Admission against the hard cap.** With `A = cap_usd − overrun_buffer_usd` (the admissible budget) and `reserve_frac = nonscoring_reserve_pct / 100` (default 0.05):
   - a non-scoring reservation is admitted iff `counted_usd + r ≤ A`;
   - a scoring reservation (including batches and follow-ups) is admitted iff `counted_usd + r ≤ A − max(0, A × reserve_frac − nonscoring_counted_usd)`. Scoring can never use the unspent part of the non-scoring reserve.
@@ -1170,8 +1173,8 @@ The bucket spreads scoring spend over the month. It gates the **size** of each a
 - **Accrual rate**: `rate = A × (1 − reserve_frac) / month_length_s`, the scoring share spread over the length of the current calendar month (USD per second). With the defaults, `rate × 1 h ≈ $0.127`.
 - **Capacity**: `B_max = max(2 × rate × collection_interval_s, min_bucket_capacity_usd)`, with `min_bucket_capacity_usd = 1.00` (settings). At a 6-hour interval `B_max ≈ $1.53`; at 1 hour the floor of $1.00 applies.
 - **Accrual** happens under the month-row lock at every reservation, settlement and tick: `bucket_usd := min(B_max, bucket_usd + rate × (now − bucket_at))`, `bucket_at := now`. A new month's row starts with `bucket_usd = B_max` (initial credit).
-- **Debit**: scoring reservations of targets that do not belong to a bulk operation debit the bucket by their reservation, and settlement credits back the difference (table above). The bucket therefore tracks **counted** scoring spend, not estimated admission counts. It may go negative while admitted work finishes; that is bounded by the in-flight targets of one cycle, and the next cycle waits until accrual has repaid it.
-- **Expected cost per target `ĉ`**: the trailing 7-day mean counted spend per completed attempt of the active tuple and evaluation policy, with at least 20 samples; otherwise the §21.2 central estimate for the active model policy and evaluation policy.
+- **Debit**: scoring reservations of targets that are not batched (and of follow-ups beyond the allocation) debit the bucket by their reservation; the reservations of batched targets and their funded follow-ups carry `bulk_operation_id` and debit `spent_usd` (§6.9.3). Settlement credits back the difference (table above). The bucket therefore tracks **counted** scoring spend, not estimated admission counts. It may go negative while admitted work finishes; that is bounded by the in-flight targets of one cycle, and the next cycle waits until accrual has repaid it.
+- **Expected cost per target `ĉ`**: the trailing 7-day mean `score_attempts.cost_usd` of online attempts with a dispatched call that ended published, of the active tuple and evaluation policy, with at least 20; otherwise the §21.2 central estimate for the active model policy and evaluation policy.
 - **Admission size**: a periodic cycle admits `S = min(max_targets_per_cycle, floor(bucket_usd / ĉ))` targets (`max_targets_per_cycle` default 60, settings).
 - **Cycle trigger** (§3.4): a periodic cycle starts only when `bucket_usd ≥ min(min_cycle_targets × ĉ, B_max)` (`min_cycle_targets` default 10, settings), pending targets exist and no cycle is running. The tick is the only trigger; a cycle that leaves pending targets does **not** re-defer itself. With the defaults and a 6-hour interval this yields a cycle about every 4 h.
 - **Score now** (§9.6.4) bypasses the bucket for admission but still debits it, and it remains subject to the hard cap.
@@ -1184,21 +1187,21 @@ A tuple change that creates targets for retained revisions (a new CV, a rubric o
 **What the 40% bounds.** `bulk_rescore_max_budget_share` defines a **batch allocation**, not a limit on all spending that a re-score causes: it bounds the batch generator items plus the **expected** follow-ups of the batched drafts. Follow-ups beyond that expectation, and all targets of the operation that are scored online, are paced by the USD bucket like any other scoring work. Every reservation, batched or not, is still admitted against the hard cap.
 
 - **Budget**: `budget_usd = bulk_rescore_max_budget_share (0.4, settings) × scoring headroom at the start`, where scoring headroom is `A × (1 − reserve_frac) − scoring_counted_usd`. The budget is fixed for the life of the operation.
-- **Cumulative accounting**: every reservation for a **batched** target of the operation — its batch generator item and its online follow-ups (critic, revise) — debits `bulk_operations.spent_usd` instead of the USD bucket, under the month-row lock, while it fits (next rule). Settlement credits it back exactly like the bucket. Repeated submissions therefore can never charge more than the allocation in total.
+- **Cumulative accounting**: every reservation for a **batched** target of the operation — its batch generator item and its online follow-ups (critic, revise) — carries `bulk_operation_id` and debits `bulk_operations.spent_usd` instead of the USD bucket, under the month-row lock, while it fits (next rule); an entry that would not fit is stored without the id and debits the bucket. Settlement credits it back exactly like the bucket. Repeated submissions therefore can never charge more than the allocation in total.
 - **Funded follow-ups**: a batch submission of `n` items is admitted only if
   `spent_usd + followup_held_usd + batch_worst_case(n) + n × p_followup × ĉ_followup ≤ budget_usd`,
-  where `p_followup` is the evaluation policy's `projected_critic_rate` (§11.7.4) and `ĉ_followup` the expected online critic-plus-revise cost of a triggered draft (§21.2). The last term is added to `followup_held_usd`. It is an **expected-value planning hold inside the allocation, not a ledger reservation**: it does not reserve hard-cap headroom, and an actual follow-up is admitted against the hard cap when it runs. Each item releases its share `p_followup × ĉ_followup` when it needs no follow-up, or when its follow-up attempt ends. The submission is shrunk to the largest `n` that fits; below `batch_min_targets` no batch is submitted (§10.10).
+  where `p_followup` is the evaluation policy's `projected_critic_rate` (§11.7.4) and `ĉ_followup` the expected online critic-plus-revise cost of a triggered draft: the critic and revision parts of §21.2's per-target cost divided by the first-round critic rate. The last term is added to `followup_held_usd`. It is an **expected-value planning hold inside the allocation, not a ledger reservation**: it does not reserve hard-cap headroom, and an actual follow-up is admitted against the hard cap when it runs. Each item releases its share `p_followup × ĉ_followup` when it needs no follow-up, or when its follow-up attempt ends. The submission is shrunk to the largest `n` that fits; below `batch_min_targets` no batch is submitted (§10.10).
 - **Follow-up reservations** debit the allocation while `spent_usd + r ≤ budget_usd`; a follow-up that would exceed it is charged to the USD bucket like any other online work. `spent_usd` therefore never exceeds `budget_usd`.
 - **Eligibility** for a batch is limited to targets that still need their **initial generator** pass (§10.10): drafts awaiting follow-up and online-retry dispositions are never batched again.
 - **Online share**: targets of the operation that are not batched (batches disabled, too few, or not fitting) flow through normal admission and debit the USD bucket, so a bulk re-score never exceeds the monthly pace.
-- **End**: the operation becomes `completed` when none of its targets is `pending`, `in_progress` or `in_batch`, and `cancelled` when its tuple is superseded. Its unspent budget simply lapses.
+- **End**: the operation becomes `completed` when its `create_targets_for_tuple` operation has ended and none of its targets is `pending`, `in_progress` or `in_batch`, and `cancelled` when its tuple is superseded. Its unspent budget simply lapses.
 
 #### 6.9.4 When the cap is reached
 
 - A reservation that fails `BudgetExhausted` moves its target to `budget_deferred` (§7.16.3); unadmitted targets stay `pending`.
 - The critical alert `llm.cap_reached` is raised once per month and names the amount held by quarantined batch submissions, if any (R9).
 - "Score now" returns 409 `budget_exhausted`.
-- **Deferred targets return when headroom returns**, not only at month start: every tick, under the month-row lock, if the scoring headroom (`A` minus `counted_usd`, minus the unspent non-scoring reserve) is at least `k × r_first`, the `k` oldest `budget_deferred` targets go back to `pending`, where `r_first` is the worst-case reservation of a first generator call. This happens after settlements release reservations, after a cap increase and at the month rollover.
+- **Deferred targets return when headroom returns**, not only at month start: every tick, under the month-row lock, if the scoring headroom (`A` minus `counted_usd`, minus the unspent non-scoring reserve) is at least `k × r_first`, the `k` oldest `budget_deferred` targets go back to `pending` (`budget_release`: under the month row, then the deferred targets), where `r_first` is the worst-case first-stage generator reservation at §21.4's component sizes and the measured overhead. This happens after settlements release reservations, after a cap increase and at the month rollover.
 - The bucket does not promise that scoring never stops early. It makes a backlog drain at the accrual rate. Only "Score now", the batch allocation of a bulk operation (§6.9.3) and non-scoring calls can spend faster, and the hard cap bounds all of them.
 
 ---
@@ -1354,7 +1357,11 @@ CREATE TABLE prompt_schema_versions (
   id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   prompt_schema_hash bytea NOT NULL UNIQUE,          -- sha256(templates ‖ JSON schemas ‖ renderer version)
   templates          jsonb NOT NULL,
-  schemas            jsonb NOT NULL,
+  schemas            json NOT NULL,                  -- json, not jsonb: key order kept (the model follows a
+                                                     -- schema's property order); the hash stays the sorted canonical JSON
+  parser_family      text NOT NULL DEFAULT 'generator_v1' CHECK (parser_family IN ('generator_v1','generator_v2_items')),
+                                                     -- the parser that reads this version's generator outputs, an explicit
+                                                     -- constant written with the row by the seed, never derived from the schema
   created_at         timestamptz NOT NULL DEFAULT now()
 );
 
@@ -1505,6 +1512,11 @@ CREATE TABLE profile_versions (                      -- never deleted; content i
   profile_hash bytea NOT NULL,                               -- see the partial unique index below
   confirmed_at timestamptz NOT NULL DEFAULT now(),
   purged_at    timestamptz,
+  synthetic_eval boolean NOT NULL DEFAULT false,             -- the rows the adversarial golden cases of §11.13 are
+                                                             -- built on; they get no target, no embedding and no card;
+                                                             -- numbered from 1,000,001 with profile_hash the hash of
+                                                             -- {"synthetic_eval": <profile>}; the user's version_no
+                                                             -- counts real versions only
   CHECK ((purged_at IS NULL) = (profile_json IS NOT NULL))
 );
 ALTER TABLE profile_drafts ADD FOREIGN KEY (confirmed_profile_version_id) REFERENCES profile_versions(id)
@@ -1991,6 +2003,8 @@ CREATE TABLE jobs (
                                                              --  observation_id, observed_at, rule}}
   det_facts_hash          bytea NOT NULL,                    -- hash of fields used by det_results/filters
   restored_from_tombstone_id bigint,                         -- §8.6 step 2
+  synthetic_eval          boolean NOT NULL DEFAULT false,    -- the rows the adversarial golden cases of §11.13 are
+                                                             -- built on; they get no target, no embedding and no card
   updated_at              timestamptz NOT NULL DEFAULT now(),
   CHECK (merged_into_job_id IS NULL OR merged_into_job_id <> id),
   CHECK (posted_at_effective IS NULL OR posted_at_effective <= first_seen_at),
@@ -2193,7 +2207,7 @@ CREATE TABLE bulk_operations (                       -- §6.9.3
   llm_tuple_id      bigint NOT NULL REFERENCES llm_tuples(id),
   state             text NOT NULL CHECK (state IN ('active','completed','cancelled')),
   budget_usd        numeric(12,6) NOT NULL CHECK (budget_usd >= 0),
-  spent_usd         numeric(12,6) NOT NULL DEFAULT 0,     -- counted spend (reservations − credits)
+  spent_usd         numeric(12,6) NOT NULL DEFAULT 0 CHECK (spent_usd >= 0),   -- counted spend (reservations − credits)
   followup_held_usd numeric(12,6) NOT NULL DEFAULT 0 CHECK (followup_held_usd >= 0),
   created_at        timestamptz NOT NULL DEFAULT now(),
   finished_at       timestamptz,
@@ -2230,7 +2244,7 @@ CREATE TABLE score_targets (
   deferred_group_id       bigint REFERENCES duplicate_groups(id) ON DELETE SET NULL,
   bulk_operation_id       bigint REFERENCES bulk_operations(id) ON DELETE SET NULL,
   not_before              timestamptz,                                -- transient backoff
-  transient_failures      integer NOT NULL DEFAULT 0,
+  transient_failures      integer NOT NULL DEFAULT 0 CHECK (transient_failures >= 0),
   refusal_category        text,
   filter_scope_version_id bigint REFERENCES scope_versions(id),
   resume_draft_id         bigint,                                     -- FK below (deferrable)
@@ -2257,6 +2271,9 @@ CREATE INDEX score_targets_batch ON score_targets (batch_submission_id) WHERE st
 CREATE INDEX score_targets_job ON score_targets (job_id);
 CREATE INDEX score_targets_group ON score_targets (deferred_group_id) WHERE state = 'deferred_duplicate';
 CREATE INDEX score_targets_bulk ON score_targets (bulk_operation_id, state) WHERE bulk_operation_id IS NOT NULL;
+CREATE INDEX score_targets_resume_draft ON score_targets (resume_draft_id) WHERE resume_draft_id IS NOT NULL;
+CREATE INDEX score_targets_filter_scope ON score_targets (filter_scope_version_id) WHERE filter_scope_version_id IS NOT NULL;
+CREATE INDEX score_targets_submission ON score_targets (batch_submission_id) WHERE batch_submission_id IS NOT NULL;
 
 CREATE TABLE admission_lane_credits (               -- persistent fair rotation (§9.6.2)
   llm_tuple_id bigint NOT NULL REFERENCES llm_tuples(id),
@@ -2275,6 +2292,11 @@ CREATE TABLE score_attempts (
   cycle_id                bigint REFERENCES score_cycles(id) ON DELETE SET NULL,
   execution_config_id     bigint NOT NULL REFERENCES execution_configs(id),
   evaluation_policy_id    bigint NOT NULL REFERENCES evaluation_policies(id),
+  lane                    text CHECK (lane IN ('similarity','oldest','exploration','always_include','score_now',
+                                               'batch_followup','batch')),
+                          -- the lane the attempt was admitted in, the same seven values as score_targets.lane,
+                          -- written by the claim and the batch preparation; §9.6.5's alerts read it, since the
+                          -- target's lane changes with every claim
   outcome                 text NOT NULL CHECK (outcome IN ('running','published_accepted','published_contested',
                             'refused','failed_max_tokens','failed_invalid_output','failed_request','transient_error',
                             'budget_exhausted','claim_lost','cancelled','batch_draft_ready','submit_rejected','released')),
@@ -2291,6 +2313,8 @@ CREATE TABLE score_attempts (
   CHECK ((outcome = 'running') = (ended_at IS NULL)),
   CHECK (logical_calls <= http_calls)
 );
+CREATE INDEX score_attempts_cycle ON score_attempts (cycle_id) WHERE cycle_id IS NOT NULL;
+CREATE INDEX score_attempts_resumed ON score_attempts (resumed_from_attempt_id) WHERE resumed_from_attempt_id IS NOT NULL;
 
 CREATE TABLE llm_budget (                            -- the serialisation point (§6.9.1)
   month                     date PRIMARY KEY CHECK (extract(day FROM month) = 1),   -- UTC calendar month
@@ -2325,6 +2349,7 @@ CREATE TABLE llm_spend_ledger (                      -- retained indefinitely; h
   batch              boolean NOT NULL DEFAULT false,
   bulk_operation_id  bigint REFERENCES bulk_operations(id) ON DELETE SET NULL,
   admitted_cap_usd   numeric(10,2) NOT NULL,                   -- audit of the admission decision
+  admitted_buffer_usd numeric(10,2),                           -- the buffer in force at admission (§7.17 #6)
   counted_before_usd numeric(12,6) NOT NULL,
   evidence           text,
   created_at         timestamptz NOT NULL DEFAULT now(),
@@ -2342,6 +2367,7 @@ CREATE TABLE llm_spend_ledger (                      -- retained indefinitely; h
 );
 CREATE INDEX llm_spend_month ON llm_spend_ledger (budget_month, state);
 CREATE INDEX llm_spend_unsettled ON llm_spend_ledger (state, created_at) WHERE state IN ('reserved','dispatched');
+CREATE INDEX llm_spend_bulk ON llm_spend_ledger (bulk_operation_id) WHERE bulk_operation_id IS NOT NULL;
 -- counted(month) = Σ settled_usd (billed) + Σ reserved_usd (reserved, dispatched, ambiguous) + Σ adjustments;
 -- it must equal llm_budget.counted_usd (heavy reconciler, §6.9.1).
 
@@ -2351,7 +2377,8 @@ CREATE TABLE llm_calls (                             -- content-bearing; deleted
                                 'propose_queries','schema_dry_run')),
   attempt_id                  bigint REFERENCES score_attempts(id),
   target_id                   bigint REFERENCES score_targets(id),
-  round                       smallint CHECK (round BETWEEN 0 AND 3),
+  round                       smallint CHECK (round BETWEEN 0 AND 3),   -- the draft's round for generate/revise,
+                                                                        -- the critic round for critic
   logical_call_no             smallint CHECK (logical_call_no BETWEEN 1 AND 7),
   max_tokens_stage            text NOT NULL DEFAULT 'first' CHECK (max_tokens_stage IN ('first','enlarged')),
   transport_try               smallint NOT NULL DEFAULT 1 CHECK (transport_try BETWEEN 1 AND 3),
@@ -2396,6 +2423,9 @@ CREATE TABLE llm_calls (                             -- content-bearing; deleted
 CREATE INDEX llm_calls_attempt ON llm_calls (attempt_id);
 CREATE INDEX llm_calls_recent ON llm_calls (started_at DESC);
 CREATE INDEX llm_calls_cache ON llm_calls (model_served, effort, purpose, started_at DESC);
+CREATE INDEX llm_calls_target ON llm_calls (target_id) WHERE target_id IS NOT NULL;
+CREATE INDEX llm_calls_golden_case ON llm_calls (golden_case_id) WHERE golden_case_id IS NOT NULL;
+CREATE INDEX llm_calls_batch_item ON llm_calls (batch_item_id) WHERE batch_item_id IS NOT NULL;
 ALTER TABLE profile_drafts ADD FOREIGN KEY (llm_call_id) REFERENCES llm_calls(id) ON DELETE SET NULL;
 ALTER TABLE query_proposals ADD FOREIGN KEY (llm_call_id) REFERENCES llm_calls(id) ON DELETE SET NULL;
 
@@ -2428,6 +2458,7 @@ CREATE TABLE critic_notes (
   created_at       timestamptz NOT NULL DEFAULT now(),
   UNIQUE (attempt_id, round)
 );
+CREATE INDEX critic_notes_draft ON critic_notes (draft_id);
 
 CREATE TABLE llm_results (
   id                       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -2451,14 +2482,20 @@ CREATE TABLE llm_results (
   nulled_criteria          text[] NOT NULL DEFAULT '{}',
   truncated_fields         text[] NOT NULL DEFAULT '{}',     -- explicit, marked truncations (§11.6)
   critic_outcome           text NOT NULL CHECK (critic_outcome IN ('not_run','accepted','contested')),
+  critic_injection         text CHECK (critic_injection IN ('none','present_no_influence','present_influenced','unavailable')),
+                           -- the last valid review's assessment, `unavailable` when the critic ran and left none;
+                           -- §11.8's confidence recomputes from it, reading `unavailable` as not `none`
   revisions_used           smallint NOT NULL CHECK (revisions_used BETWEEN 0 AND 2),
   summary_en               text NOT NULL,
   summary_de               text NOT NULL,
   published_at             timestamptz NOT NULL DEFAULT now(),
   UNIQUE (job_revision_id, profile_version_id, rubric_version_id, prompt_schema_version_id, model_policy_id),
   CHECK (status = 'contested' OR cardinality(nulled_criteria) = 0),
-  CHECK ((critic_outcome = 'contested') = (status = 'contested'))
+  CHECK ((critic_outcome = 'contested') = (status = 'contested')),
+  CHECK ((critic_injection IS NULL) = (critic_outcome = 'not_run'))
 );
+CREATE INDEX llm_results_attempt ON llm_results (attempt_id);
+CREATE INDEX llm_results_final_draft ON llm_results (final_draft_id);
 ALTER TABLE llm_results ADD FOREIGN KEY (target_id) REFERENCES score_targets(id) DEFERRABLE INITIALLY DEFERRED;
 ALTER TABLE score_targets ADD FOREIGN KEY (published_result_id) REFERENCES llm_results(id) DEFERRABLE INITIALLY DEFERRED;
 ALTER TABLE score_targets ADD FOREIGN KEY (resume_draft_id) REFERENCES score_drafts(id) DEFERRABLE INITIALLY DEFERRED;
@@ -2507,6 +2544,7 @@ CREATE UNIQUE INDEX det_results_current ON det_results (llm_result_id, scope_ver
 CREATE INDEX det_rank_mid ON det_results (scope_version_id, score_mid DESC NULLS LAST, job_id DESC) WHERE is_current;
 CREATE INDEX det_rank_low ON det_results (scope_version_id, score_low DESC NULLS LAST, job_id DESC) WHERE is_current;
 CREATE INDEX det_results_job ON det_results (job_id, scope_version_id) WHERE is_current;
+CREATE INDEX det_results_result ON det_results (llm_result_id);   -- the cascade from llm_results cannot use the partial det_results_current
 ```
 
 - **Score instances.** A `det_results` row's scores are never updated; only its `is_current` flag is cleared when it is superseded. A recompute (scope change, det-facts change, algorithm change) runs in one transaction: it locks the `llm_results` row `FOR UPDATE` (serialising replacements of that result), **first** sets the previous current row's `is_current = false, superseded_at = now()`, and **then** inserts the new current row, so the immediate partial unique index `det_results_current` is never violated. A failure rolls back both statements and the previous instance stays current. A recompute whose `det_inputs_hash` and `det_algorithm_version` equal the current row's is a no-op. Feedback and history reference the instance they were made against, so an old labelled score never changes. Superseded instances follow score-history retention (§20.1).
@@ -2522,11 +2560,17 @@ CREATE TABLE batch_submissions (
                                            'submit_ambiguous','released','ended','reconciled','abandoned')),
   llm_tuple_id        bigint NOT NULL REFERENCES llm_tuples(id),
   bulk_operation_id   bigint NOT NULL REFERENCES bulk_operations(id),
+  operation_id        bigint REFERENCES operations(id) ON DELETE SET NULL,
+  operation_claim_id  uuid,
+  follow_on_at        timestamptz,
+  -- the batch_submit operation and the execution claim that prepared it: a preparing or submit_started row whose
+  -- operation is not running, or runs under another claim, belongs to a lost execution and is recovered;
+  -- follow_on_at marks the once-only follow-on request at the submission's end
   request_count       integer NOT NULL CHECK (request_count BETWEEN 1 AND 100000),
   request_hash        bytea NOT NULL,                  -- sha256 over ordered (custom_id, params hash)
   provider_batch_id   text UNIQUE,
-  reserved_usd        numeric(12,4) NOT NULL CHECK (reserved_usd >= 0),   -- Σ of the items' ledger entries
-  followup_held_usd   numeric(12,4) NOT NULL CHECK (followup_held_usd >= 0), -- §6.9.3 planning hold
+  reserved_usd        numeric(12,6) NOT NULL CHECK (reserved_usd >= 0),   -- Σ of the items' ledger entries
+  followup_held_usd   numeric(12,6) NOT NULL CHECK (followup_held_usd >= 0), -- §6.9.3 planning hold
   submit_started_at   timestamptz,
   submitted_at        timestamptz,
   expires_at          timestamptz,                     -- provider created_at + 24 h
@@ -2546,6 +2590,7 @@ CREATE TABLE batch_submissions (
 );
 CREATE UNIQUE INDEX batch_one_in_flight ON batch_submissions ((true))
   WHERE state IN ('preparing','submit_started','submitted','submit_ambiguous','ended') AND released_at IS NULL;
+CREATE INDEX batch_submissions_operation ON batch_submissions (operation_id) WHERE operation_id IS NOT NULL;
 -- A released submission is never in flight again: after the user's release new batches may be submitted,
 -- and if its batch is found later it is reconciled (released → ended → reconciled, released_at kept)
 -- outside this singleton, alongside the current submission (Codex R3-2, §10.10).
@@ -2561,6 +2606,8 @@ CREATE TABLE batch_items (
   result_type   text NOT NULL DEFAULT 'awaiting' CHECK (result_type IN ('awaiting','succeeded','errored',
                                                                          'canceled','expired','missing')),
   stop_reason   text,
+  hold_usd      numeric(12,6) NOT NULL DEFAULT 0 CHECK (hold_usd >= 0),
+  hold_released_at timestamptz,                                 -- the item's §6.9.3 follow-up hold and its once-only release
   decision      text CHECK (decision IN ('published','followup','refused','retry_online','failed_request',
                                          'failed_invalid_output','cancelled','ignored_fenced')),   -- §10.10 table
   processed_at  timestamptz,
@@ -2569,11 +2616,14 @@ CREATE TABLE batch_items (
   CHECK ((result_type = 'awaiting') = (processed_at IS NULL)),
   CHECK ((processed_at IS NULL) = (decision IS NULL))
 );
+CREATE INDEX batch_items_submission ON batch_items (submission_id);
 ALTER TABLE batch_items ADD FOREIGN KEY (llm_call_id) REFERENCES llm_calls(id) DEFERRABLE INITIALLY DEFERRED;
 ALTER TABLE llm_calls ADD FOREIGN KEY (batch_item_id) REFERENCES batch_items(id) DEFERRABLE INITIALLY DEFERRED;
 ```
 
 ### 7.13 User actions, feedback, calibration
+
+`user_job_actions` is created in M3 with the merge, unmerge and tombstone wiring of §8.6; its routes are M4's.
 
 ```sql
 CREATE TABLE user_job_actions (
@@ -2600,6 +2650,10 @@ CREATE TABLE score_feedback (                        -- snapshot survives score 
   comment            text CHECK (length(comment) <= 2000),
   created_at         timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX score_feedback_result ON score_feedback (llm_result_id) WHERE llm_result_id IS NOT NULL;
+CREATE INDEX score_feedback_det_result ON score_feedback (det_result_id) WHERE det_result_id IS NOT NULL;
+CREATE INDEX score_feedback_job ON score_feedback (job_id) WHERE job_id IS NOT NULL;
+CREATE INDEX score_feedback_revision ON score_feedback (job_revision_id) WHERE job_revision_id IS NOT NULL;
 
 CREATE TABLE golden_cases (                          -- §11.13; its job inputs are retention-exempt (§20.1)
   id                      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -2621,6 +2675,9 @@ CREATE TABLE golden_cases (                          -- §11.13; its job inputs 
   UNIQUE (job_revision_id, profile_version_id)        -- a second label upserts (ON CONFLICT DO UPDATE)
 );
 CREATE INDEX golden_cases_sources ON golden_cases USING gin (det_input_sources);
+CREATE INDEX golden_cases_labelled_from ON golden_cases (labelled_from_result_id) WHERE labelled_from_result_id IS NOT NULL;
+CREATE INDEX golden_cases_profile ON golden_cases (profile_version_id);
+CREATE INDEX golden_cases_scope ON golden_cases (scope_version_id);
 
 CREATE TABLE eval_runs (
   id                       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -2645,7 +2702,7 @@ ALTER TABLE llm_calls ADD FOREIGN KEY (golden_case_id) REFERENCES golden_cases(i
 CREATE TABLE eval_case_results (
   eval_run_id    bigint NOT NULL REFERENCES eval_runs(id) ON DELETE CASCADE,
   golden_case_id bigint NOT NULL REFERENCES golden_cases(id) ON DELETE CASCADE,
-  repetition     smallint NOT NULL DEFAULT 1,
+  repetition     smallint NOT NULL DEFAULT 1 CHECK (repetition BETWEEN 1 AND 3),
   outcome        text NOT NULL CHECK (outcome IN ('accepted','contested','filtered_out','refused','failed')),
   critic_ran     boolean NOT NULL,
   llm_call_ids   bigint[] NOT NULL,
@@ -2653,6 +2710,7 @@ CREATE TABLE eval_case_results (
   score_mid      numeric(5,2),
   PRIMARY KEY (eval_run_id, golden_case_id, repetition)
 );
+CREATE INDEX eval_case_results_case ON eval_case_results (golden_case_id);
 ```
 
 ### 7.14 Operations: alerts, manifests, backups, exports
@@ -2788,7 +2846,7 @@ CREATE TABLE exports (
 
 ### 7.16 State machines
 
-Every state change MUST go through `transition(table, id, from_states, to_state, reason=None, **fields)`. It reads the table's transition metadata below and runs a **CAS update**:
+Every single-row state change MUST go through `transition(table, id, from_states, to_state, reason=None, **fields)`; the set-based statements of this specification (the atomic claim, the revive upsert, bulk cancellations, `budget_release`, the sweeps, target-set deletion) go through `transition_where(table, from_states, to_state, …)` over the same registry, and the `assert_transition` trigger checks every row either way. `transition` reads the table's transition metadata below and runs a **CAS update**:
 
 ```sql
 UPDATE <table> SET <state_col> = :to, <reason_col> = :reason, <changed_at_col> = now(), <fields>
@@ -2807,8 +2865,8 @@ RETURNING id;
 | `fetch_requests` | `status` | `skip_reason` or `error_code` | `finished_at` | the run's predicate |
 | `raw_items` | `disposition` | `reason_code` | `disposed_at` | the run's predicate; for a `deferred` item, the predicate of the run that resolves it |
 | `postings` | `availability` | `availability_reason` | `availability_changed_at` | — |
-| `batch_submissions` | `state` | `reconcile_report` | the per-state timestamp | `state = :expected` |
-| `batch_items` | `result_type` | `decision` | `processed_at` | the submission's predicate |
+| `batch_submissions` | `state` | — (the report is written by the same update) | the per-state timestamp where one exists | `state = :expected` |
+| `batch_items` | `result_type` | `decision` | `processed_at` | the submission row under `state = :expected` |
 | `profile_drafts` | `status` | `status_reason` | `status_changed_at` | — |
 | `operations` | `status` | `last_error_code` | `started_at` / `finished_at` | `claim_id = :c` (fresh per execution) |
 | `score_cycles` | `status` | `status_reason` | `finished_at` | `worker_epoch = :e` |
@@ -2860,7 +2918,7 @@ unknown ──mass disappearance confirmed or acknowledged (§8.11)────�
 
 #### 7.16.3 Score target (closed transition contract)
 
-`max_score_attempts = 4` (const, `scoring/admission.py`), compared with `charged_attempts`. An attempt is *charged* when it dispatches its first LLM call (online) or its batch item is submitted. Denied reservations (`budget_exhausted`) and `claim_lost` before any dispatch do not charge an attempt.
+`max_score_attempts = 4` (const, `scoring/admission.py`), compared with `charged_attempts`. An attempt is *charged* when it dispatches its first LLM call (online) or when its batch submission reaches `submit_started` (its item entries are `dispatched`). A `pending` or `budget_deferred` target whose `charged_attempts` has reached `max_score_attempts` (a rejected or ambiguous submission, or a budget denial inside its fourth attempt) is moved to `failed_attempts_exhausted('attempts_exhausted')` by the admission sweeps; the claim and the batch candidate predicate exclude it. Denied reservations (`budget_exhausted`) and `claim_lost` before any dispatch do not charge an attempt.
 
 | From | Event | To | Column effects (same UPDATE) |
 |---|---|---|---|
@@ -2870,17 +2928,19 @@ unknown ──mass disappearance confirmed or acknowledged (§8.11)────�
 | `pending` | admitted + atomic claim | `in_progress` | `claim_id`, `claim_epoch`, `claimed_at`, `claim_heartbeat_at`, `attempt_no+1`, `lane` |
 | `pending` | prepared into a bulk batch (§10.10) | `in_batch` | `batch_submission_id`, `attempt_no+1`, `lane='batch'` |
 | `pending`, `budget_deferred` | expiry rule (§9.6.3), `override = 'none'` | `expired_unscored(reason)` | — |
+| `pending` | `charged_attempts ≥ max_score_attempts` (admission sweep) | `failed_attempts_exhausted('attempts_exhausted')` | — |
+| `budget_deferred` | `charged_attempts ≥ max_score_attempts` (admission sweep) | `failed_attempts_exhausted('attempts_exhausted')` | — |
 | `pending`, `budget_deferred`, `deferred_duplicate` | refilter: now fails, `override = 'none'` | `filtered_out` | `filter_scope_version_id`; `deferred_group_id := NULL` |
 | `pending`, `budget_deferred` | regroup: deferrable member, `override = 'none'` | `deferred_duplicate` | `deferred_group_id` |
-| `filtered_out` | scope flip: now passes | `pending` | `filter_scope_version_id := NULL` |
-| `filtered_out` | user "Score anyway" | `pending` | `filter_scope_version_id := NULL`, `override := 'score_anyway'`, `lane := 'score_now'` |
+| `filtered_out` | scope flip: now passes, `override = 'none'` | `pending` | `filter_scope_version_id := NULL` |
+| `filtered_out` | user "Score anyway" | `pending` | `filter_scope_version_id := NULL`, `override := 'score_anyway'`, `override_at := now()`, `lane := 'score_now'` |
 | `deferred_duplicate` | split, member left, group dissolved, conflicting facts, elected representative | `pending` | `deferred_group_id := NULL` |
-| `deferred_duplicate` | user "Score individually" | `pending` | `deferred_group_id := NULL`, `override := 'individual'` (and the membership flag, §8.7) |
-| `pending`, `budget_deferred`, `expired_unscored`, `deferred_duplicate` | user "Score now" | `pending` | `override := 'score_now'`, `lane := 'score_now'`; group columns cleared |
-| `refused`, `failed_*` | user "Retry" | `pending` | `charged_attempts := 0`, `override := 'score_now'`, `lane := 'score_now'` |
+| `deferred_duplicate` | user "Score individually" | `pending` | `deferred_group_id := NULL`, `override := 'individual'`, `override_at := now()` (and the membership flag, §8.7) |
+| `pending`, `budget_deferred`, `expired_unscored`, `deferred_duplicate` | user "Score now" | `pending` | `override := 'score_now'`, `override_at := now()`, `lane := 'score_now'`; group columns cleared |
+| `refused`, `failed_*` | user "Retry" | `pending` | `charged_attempts := 0`, `override := 'score_now'`, `override_at := now()`, `lane := 'score_now'` |
 | `budget_deferred` | headroom returns (§6.9.4) | `pending` | — |
-| `expired_unscored` | the expiry condition no longer holds | `pending` | — |
-| `in_progress` | reservation denied by the cap | `budget_deferred('budget_exhausted')` | claim columns := NULL |
+| `expired_unscored` | the expiry condition no longer holds | `pending` | `state_reason := NULL` |
+| `in_progress` | reservation denied by the cap | `budget_deferred('budget_exhausted')` | claim columns := NULL (`claim_id`, `claim_epoch`, `claim_heartbeat_at`; `claimed_at` is kept as history) |
 | `in_progress` | publish CAS (§9.4.1) | `published_accepted`, `published_contested` | `published_result_id`; claim columns := NULL |
 | `in_progress` | `stop_reason = refusal` | `refused(category)` | `refusal_category`; claim columns := NULL |
 | `in_progress` | `max_tokens` after the enlarged retry | `failed_max_tokens` | claim columns := NULL |
@@ -2900,7 +2960,7 @@ unknown ──mass disappearance confirmed or acknowledged (§8.11)────�
 | `in_batch` | user "release and re-score" on `submit_ambiguous` | `pending` | `batch_submission_id := NULL` |
 | `in_batch` | tuple superseded (after `messages.batches.cancel` is requested), revision superseded, job merged, or purge | `cancelled(reason)` | `batch_submission_id := NULL`; the item's later result is fenced: it settles spend from usage or from the provider's per-item evidence and publishes nothing (§10.10) |
 | `pending`, `budget_deferred`, `deferred_duplicate`, `filtered_out`, `expired_unscored`, `refused`, `failed_*` | tuple superseded, revision superseded, job merged, purge | `cancelled(reason)` | group/filter columns := NULL |
-| `cancelled` (`tuple_superseded`, `revision_superseded`, `job_merged`) | its tuple is active again **and** its revision is the job's current revision of an unmerged job | `pending` | `override := 'none'` |
+| `cancelled` (`tuple_superseded`, `revision_superseded`, `job_merged`) | its tuple is active again **and** its revision is the job's current revision of an unmerged job | `pending` | `override := 'none'`, `override_at := NULL`, `lane := NULL`, `state_reason := NULL`, `charged_attempts := 0`, `transient_failures := 0`, `not_before := NULL`, `resume_draft_id := NULL`, `refusal_category := NULL`, `bulk_operation_id := the new operation's` |
 
 - **Every other pair is forbidden.** In particular, published states are terminal and immutable, and `cancelled('purged')` never revives. **No automatic sweep (expiry, refilter, regroup) ever moves a target whose `override ≠ 'none'`**: an explicit user intent (Score now, Score anyway, Score individually, Retry) protects the target for its whole lifetime.
 - An **override** lives as long as its target: it ends when the target reaches a published, failed, refused or cancelled state (the column is kept for audit). A new revision of the same job creates a new target with `override = 'none'`, except that a member flagged `score_individually` (§8.7) is created `pending`.
@@ -2947,7 +3007,7 @@ dispatched ──lost, timed out, or found by a new attempt without a response�
 
 ```
 preparing ──submit_started_at committed──► submit_started
-preparing ──found at restart (never started), or delete-everything──► abandoned   (targets → pending, spend not_billed)
+preparing ──found at restart (never started), or delete-everything──► abandoned   (targets → pending, spend not_billed, attempts `cancelled`)
 submit_started ──create returned id──► submitted
 submit_started ──definitive 4xx response──► submit_rejected                (targets → pending, spend not_billed)
 submit_started ──timeout | connection lost | 5xx | crash──► submit_ambiguous
@@ -2999,7 +3059,8 @@ ambiguous ──(LLM batch item of a batch that was found) errored | canceled | 
   ```
 - **Operation**: `pending → running` (a fresh `claim_id`) `→ succeeded | failed`; `running → pending` with `claim_id := NULL` (older epoch at takeover, heartbeat older than 3 min, or a retryable error with `not_before`); `pending | running → cancelled` (delete-everything, a superseding purge, or a superseded scope, §20.4).
 - **Score cycle**: `running → completed | failed(orphaned | bug | cancelled)`; `cancelled` only by delete-everything (§20.4).
-- **Bulk operation**: `active → completed | cancelled`.
+- **Score attempt**: `running → published_accepted | published_contested | refused | failed_max_tokens | failed_invalid_output | failed_request | transient_error | budget_exhausted | claim_lost | cancelled | batch_draft_ready | submit_rejected | released`; an abandoned submission ends its attempts `cancelled('batch_abandoned')`, a `retry_online` item decision ends the batch attempt with the outcome its cause maps to.
+- **Bulk operation**: `active → completed | cancelled`; the operation becomes `completed` when its `create_targets_for_tuple` operation has ended and none of its targets is `pending`, `in_progress` or `in_batch`.
 - **Deletion manifest**: `executing → completed → shipped`.
 - **Backup set**: `running → succeeded | failed`.
 - **Duplicate group**: `active → dissolved` when fewer than 2 members remain. Representative changes and `unscorable_reason` changes are recorded in `election_reason` (§8.7).
@@ -3016,8 +3077,8 @@ These are checked by reconcilers (§17.4) and by integration tests:
 3. No target is `in_progress` with `claim_heartbeat_at < now() − 3 min`, or with a `claim_epoch` older than the current worker epoch after the takeover sweep. `in_batch` is exempt.
 4. Every `active` duplicate group either has a representative whose active-tuple target is `pending`, `budget_deferred`, `in_progress`, `in_batch` or published, or has `unscorable_reason` set and no eligible member (§8.7).
 5. For every published `llm_result` of the active tuple there is exactly one **current** `det_result` for the active scope, and for the pending scope while one exists, whose `det_inputs_hash` and `det_algorithm_version` are current.
-6. For every quota window, counted units ≤ `limit_units`. For every month, `llm_budget.counted_usd` equals the ledger sum, and `counted_usd ≤ max(cap_usd, counted_at_cap_change_usd)`. Every ledger row satisfies `counted_before_usd + reserved_usd ≤ admitted_cap_usd − overrun_buffer_usd`. The buffer is the only tolerance: a billed row above its reservation is the critical defect `llm.reservation_bound_violated`.
-7. For every bulk operation, `spent_usd ≤ budget_usd`, and every batch submission was admitted with `spent_usd + followup_held_usd + its worst case ≤ budget_usd` (§6.9.3).
+6. For every quota window, counted units ≤ `limit_units`. For every month, `llm_budget.counted_usd` equals the ledger sum, and `counted_usd ≤ max(cap_usd, counted_at_cap_change_usd)`. Every ledger row satisfies `counted_before_usd + reserved_usd ≤ admitted_cap_usd − admitted_buffer_usd`. The buffer is the only tolerance: a billed row above its reservation is the critical defect `llm.reservation_bound_violated`.
+7. For every bulk operation, every reservation was admitted with `spent_usd + r ≤ budget_usd`, and every batch submission with `spent_usd + followup_held_usd + its worst case ≤ budget_usd` (§6.9.3); a billed settlement above its reservation may leave `spent_usd` above `budget_usd` by the violation, which `llm.reservation_bound_violated` reports.
 8. Every `submit_ambiguous` submission younger than 25 h is being reconciled; older ones have an open alert.
 9. Every deletion manifest is `shipped` within 1 h of completion — a shipment item names its `manifest_uuid` with an equal file hash — or `privacy.manifest_unshipped` is open.
 10. No running score cycle or operation has a `worker_epoch` older than the current one after the takeover sweep, and every running operation has a `claim_id`.
@@ -3050,7 +3111,8 @@ SELECT j.id                    AS job_id,
                          AND d.is_current
   LEFT JOIN hard_filter_results hf ON hf.job_id = j.id AND hf.scope_version_id = ac.scope_version_id
  WHERE j.merged_into_job_id IS NULL
-   AND j.current_revision_id IS NOT NULL;               -- NULL only for a fenced job mid-replay (§19.5)
+   AND j.current_revision_id IS NOT NULL                -- NULL only for a fenced job mid-replay (§19.5)
+   AND NOT j.synthetic_eval;                            -- adversarial golden-case rows (§11.13)
 
 -- Display view: a deferred group member shows its representative's score, labelled "scored via".
 -- A member with its own published score keeps it and is labelled "possible duplicate of".
@@ -3203,7 +3265,7 @@ A strong-key merge and a user-confirmed merge run the same steps, in one transac
 
 1. **Snapshot** into `merge_events.evidence`: the `user_job_actions` rows of both jobs, the group memberships, the `ad_keys` rows owned by the from-job, and the ids of the from-job's non-terminal targets.
 2. **Move** every posting of the from-job (`postings.job_id`) and every key it owns (`ad_keys.job_id`) to the into-job. `ad_key_sources` is untouched.
-3. **Coalesce user actions** into the into-job: each of `seen_at`, `saved_at`, `applied_at`, `hidden_at` becomes the earliest non-null value of the two jobs. The notes are concatenated (into-job note, a separator line naming the merged job, then the from-job note). If the result would exceed 20,000 characters, the appended part is cut at the limit with an explicit `[…]` marker; both full notes stay in the merge snapshot, shown in the Provenance tab. The from-job's `user_job_actions` row is deleted.
+3. **Coalesce user actions** into the into-job: each of `seen_at`, `saved_at`, `applied_at`, `hidden_at` becomes the earliest non-null value of the two jobs. The notes are concatenated (into-job note, a separator line naming the merged job, then the from-job note). If the result would exceed 20,000 characters, the into-job's note is kept whole and only the appended part is cut at the limit with an explicit `[…]` marker; both full notes stay in the merge snapshot, shown in the Provenance tab. The from-job's `user_job_actions` row is deleted.
 4. **Targets** of the from-job that are not terminal → `cancelled('job_merged')`. Published ones stay as history.
 5. **Groups**: the from-job leaves its duplicate group, which re-elects or dissolves (§8.7).
 6. **Conflicts** that name the from-job are rewritten to the into-job. A conflict left with no candidate other than its `posting_job_id` becomes `resolved_merged`.
@@ -3216,7 +3278,7 @@ Unmerge (by the user, or by resolving an identity conflict as `separate`) revers
 1. The event's `posting_ids` move back to the from-job, and `from.merged_into_job_id := NULL`.
 2. **Key ownership** is recomputed for every key either job supplies: the owner is the job of the earliest `ad_key_sources` row among the two jobs' postings. The other job keeps its provenance rows.
 3. `dedup_decisions(from, into, 'different', source = 'unmerge')` is written, so a shared key can never merge the two again (§8.6 step 6).
-4. **User actions**: the from-job's snapshot row is restored. On the into-job, a timestamp that equals the from-job's snapshot value and differs from the into-job's snapshot value came only from the merge, and is reset to the into-job's snapshot value. The into-job's note is restored from its snapshot unless it was edited after the merge.
+4. **User actions**: the from-job's snapshot row is restored. On the into-job, a timestamp that came only from this merge (equal to the from-job's snapshot value and different from the into-job's own value, i.e. its snapshot value with earlier merges' contributions peeled off) resets to the earliest non-null of that own value and the from-values of the other merges into the job still in force. The into-job's note loses exactly the segment this merge appended when that segment is present verbatim; otherwise the note is kept. The into-job's row is deleted when it had none before its merges and nothing is left.
 5. Canonical fields are recomputed for both jobs. A target cancelled as `job_merged` whose revision is current again moves back to `pending` (§7.16.3).
 6. A `merge_event(unmerge)` is written, and the original event's `reversed_by_event_id` points to it.
 
@@ -3248,7 +3310,7 @@ A Greenhouse `requisition_id` match counts as additional evidence in `evidence`.
 - If A qualifies for two groups, it joins the one whose representative has the higher G5 score, and `dedup.ambiguous_grouping` (info) is recorded. Groups are never merged together.
 - If neither A nor B is in a group, a new group {A, B} is created.
 
-**Eligibility and representative election.** A member is **eligible** when its job is unmerged and not `closed`, and its active-tuple target is `pending`, `budget_deferred`, `in_progress`, `in_batch`, `deferred_duplicate` or published. Members whose targets are `failed_*`, `refused`, `expired_unscored`, `filtered_out` or `cancelled` are not eligible. The representative is the eligible member that sorts first by:
+**Eligibility and representative election.** A member is **eligible** when its job is unmerged and not `closed`, and its active-tuple target is `pending`, `budget_deferred`, `in_progress`, `in_batch`, `deferred_duplicate` or published; a member whose current revision has no active-tuple target yet is eligible too. Members whose targets are `failed_*`, `refused`, `expired_unscored`, `filtered_out` or `cancelled` are not eligible. The representative is the eligible member that sorts first by:
 1. availability (`active` > `unknown` > `stale`);
 2. description completeness (`full` > `partial`);
 3. best source precedence rank (ATS = 1, JSearch/SerpApi = 2, Arbeitnow = 3, Adzuna = 4);
@@ -3258,7 +3320,7 @@ A Greenhouse `requisition_id` match counts as additional evidence in `evidence`.
 
 If no member is eligible, the group has no representative and records `unscorable_reason`: `all_failed` (every target failed, refused or expired), `all_filtered`, or `no_active_member`. **Nothing is retried automatically**: a failed member is never re-elected, and repair never resets an attempt budget or bills a failing member again. The group becomes scorable again (`election_reason='eligible_again'`) when a member becomes eligible, for example after a user Retry, a new sighting or a scope change.
 
-**Deferral.** A member's target is `deferred_duplicate(group)` when the member is *deferrable*: it is not the representative, its target is `pending` or `budget_deferred`, its target has `override = 'none'`, its membership has `score_individually = false`, and it has **no conflicting scoring-relevant fact** against the representative (different structured work-mode sets, different structured employment types, or different seniority tokens). Deferral costs no LLM spend. The same predicate is used when a target is created, by the regroup sweep (§9.6.2) and when a member is moved back to `pending`, so the sweeps never undo each other.
+**Deferral.** A member's target is `deferred_duplicate(group)` when the member is *deferrable*: it is not the representative, its target is `pending` or `budget_deferred`, its target has `override = 'none'`, its membership has `score_individually = false`, and it has **no conflicting scoring-relevant fact** against the representative (different work-mode sets or different employment types, each counted only when both sides are `structured`, or different seniority tokens). Deferral costs no LLM spend. The same predicate is used when a target is created, by the regroup sweep (§9.6.2) and when a member is moved back to `pending`, so the sweeps never undo each other.
 
 **Re-election** happens when:
 - the representative stops being eligible before it has a published result for the active tuple. `budget_deferred` counts as live and does not trigger re-election;
@@ -3428,7 +3490,7 @@ class CollectState(TypedDict):
 | 6 | `resolve_identity` | det | Per `pending` raw item of the run, then per `deferred('job_fenced')` item of earlier runs whose jobs are no longer fenced (§7.16.1): §8.6 in one transaction holding `active_config` `FOR SHARE` (fence, idempotency, job decision, posting, observation, keys and provenance, tombstones, merge or conflict, canonical fields, revision reuse or creation, lineage, and the job's `hard_filter_results` and det instances for the active and pending scope). Then, per ATS snapshot of the run, the availability effects of §8.11 in one transaction, guarded by `applied_at`. Then duplicate grouping for changed revisions (§8.7), under `pg_advisory_xact_lock(hashtext(company_key))`. | 20 min, heartbeat | item `rejected('identity_error')` on a domain error |
 | 7 | `embed` | det (embedder) | For revisions with `awaiting_embedding`, in batches of 16: `POST embedder/v1/embed` (passage, ≤ 1,024 tokens, truncation flagged), then upsert `embeddings` and mark `embedded`. | 20 min, heartbeat; 120 s per batch | **Embedder unavailable**: stop embedding, leave `awaiting_embedding`, count them, run → `partial`, alert `embedder.unavailable` (warn) |
 | 8 | `hard_filters` | det | Verification and backfill: for each job touched by the run whose `hard_filter_results` for the active (or pending) scope is missing, or whose `inputs_hash` or `det_algorithm_version` is stale, recompute it under `active_config` `FOR SHARE`. Normally there is nothing to do, because node 6 writes them atomically. | 5 min | bug → run `failed` |
-| 9 | `enqueue_targets` | det | If `llm_tuple_id` is set: for each current revision without an active-tuple target, take the job row `FOR SHARE`, skip it if a purge fence covers the job, and otherwise create one (§9.7 insert rule) with `similarity` = the max cosine against the profile vectors, or NULL if awaiting embedding. The state is `filtered_out`, `deferred_duplicate` or `pending` (§7.16.3). Targets of revisions that stopped being current → `cancelled('revision_superseded')` unless published. | 5 min | bug → run `failed` |
+| 9 | `enqueue_targets` | det | If `llm_tuple_id` is set: for the run's tuple, while it is still the active one (re-checked under `active_config FOR SHARE` per chunk), for each current revision without a target of that tuple, take the job row `FOR SHARE`, skip it if a purge fence covers the job, and otherwise create one (§9.7 insert rule) with `similarity` = the max cosine against the profile vectors, or NULL if awaiting embedding. The state is `filtered_out`, `deferred_duplicate` or `pending` (§7.16.3). Targets of revisions that stopped being current → `cancelled('revision_superseded')` unless published. A run whose tuple was superseded creates nothing and records it. | 5 min | bug → run `failed` |
 | 10 | `finalize` | det | Run invariants (§17.2); the run report; `coverage_cells` updates; alerts; run status `succeeded`/`partial`/`failed_invariant`; dead-man ping (§17.7). It does not start a score cycle: the tick does, gated by the USD bucket (§3.4, §6.9.2). | 60 s | invariant violation → `failed_invariant` + critical alert |
 
 **Edges**: `START → plan → fetch_primary (Send fan-out) → plan_fallback → [fetch_fallback | (no specs) skip] → parse_normalize → resolve_identity → embed → hard_filters → enqueue_targets → finalize → END`. `plan_fallback` has a conditional edge: when it produced specs it routes to `fetch_fallback`, otherwise straight to `parse_normalize`.
@@ -3464,10 +3526,12 @@ class ClaimRef(TypedDict):
 
 | Node | Kind | Behaviour |
 |---|---|---|
-| `admit` | det | Runs the sweeps (expiry, refilter, regroup) and the allocation (§9.6) for `S` slots, where `S` comes from the USD bucket (§6.9.2). Writes `score_cycles.admission_size`, `admitted` and `c_hat_usd`. Returns target ids in admission order. |
+| `admit` | det | Runs the sweeps (expiry, refilter, regroup) and the allocation (§9.6) for `S` slots, where `S` comes from the USD bucket (§6.9.2), `S = max(0, …)`; `S = 0` for a `score_now` cycle and the bucket-gated `S` for `batch_followup`. The cycle-row columns (`admission_size`, `c_hat_usd`, `bucket_usd_at_start`) are computed at insert; `admit` writes `admitted`. Returns target ids in admission order. |
 | `claim` | det | Atomic claim (below). The claimed targets go to state. |
-| `score_target` | subgraph | `Send("score_target", ClaimRef)` per claim, `max_concurrency=3`. |
+| `score_target` | subgraph | `Send("score_target", ClaimRef)` per claim, `max_concurrency=3`. Every claim's heartbeat starts when the claim transaction commits, owned by the cycle, so a claim waiting for a fan-out slot is beaten from the first second; the `score_target` node is a wrapper that runs the subgraph in an owned child task attached to that heartbeat, turns a lost heartbeat into the `claim_lost` outcome of that one target, stops the heartbeat in its `finally` and returns the outcome under `work_id`. |
 | `finalize_cycle` | det | Writes the cycle report (counts per outcome and lane, `spent_usd` from the counted spend of its attempts, cache-hit stats), alerts (§17.6) and `status='completed'`. It never defers another cycle; the tick decides (§3.4). |
+
+**Edges**: `START → admit → claim → Send(score_target) → more → admit | finalize_cycle → END`. `more` returns to `admit` while pending `score_now` or `batch_followup` targets of the cycle's tuple exist, at most 5 rounds; a later round admits those targets only (`score_now` outside `S`, follow-ups within the slots left) and claims that round's list.
 
 The cycle task heartbeats `score_cycles.heartbeat_at` every 30 s (§3.3.4).
 
@@ -3477,18 +3541,19 @@ The cycle task heartbeats `score_cycles.heartbeat_at` every 30 s (§3.3.4).
 UPDATE score_targets t
    SET state = 'in_progress', claim_id = gen_random_uuid(), claim_epoch = :epoch, claimed_at = now(),
        claim_heartbeat_at = now(), attempt_no = t.attempt_no + 1, lane = a.lane,
-       state_changed_at = now()
-  FROM (SELECT id, lane FROM unnest(:ids, :lanes) AS x(id, lane)) a
+       always_include_reason = a.reason, state_changed_at = now()
+  FROM (SELECT id, lane, reason FROM unnest(:ids, :lanes, :reasons) AS x(id, lane, reason)) a
  WHERE t.id = a.id
    AND t.id IN (SELECT id FROM score_targets
                  WHERE id = ANY(:ids) AND state = 'pending'
                    AND (not_before IS NULL OR not_before <= now())
+                   AND charged_attempts < :max_attempts
                    AND NOT is_fenced(job_id, llm_tuple_id)   -- active purge fence (§7.14, §20.2)
                  FOR UPDATE SKIP LOCKED)
 RETURNING t.id, t.claim_id, t.attempt_no;
 ```
 
-A `score_attempts(target_id, attempt_no, mode='online', outcome='running', claim_epoch, cycle_id, execution_config_id, evaluation_policy_id)` row is inserted for each returned target, recording the **active** execution config and evaluation policy, which the attempt uses throughout.
+A `score_attempts(target_id, attempt_no, mode='online', outcome='running', claim_epoch, cycle_id, execution_config_id, evaluation_policy_id)` row is inserted for each returned target, recording the **active** execution config and evaluation policy, which the attempt uses throughout: a reclaim's new attempt pins the then-active configuration; an in-process resume keeps the attempt's.
 
 **Triggers for a cycle**:
 - `periodic`: the tick, only when the USD bucket holds `min(min_cycle_targets × ĉ, B_max)`, pending targets exist and no cycle runs (§3.4, §6.9.2);
@@ -3496,7 +3561,7 @@ A `score_attempts(target_id, attempt_no, mode='online', outcome='running', claim
 - `batch_followup`: after batch results arrive; follow-ups of a bulk operation draw on its budget (§6.9.3);
 - `manual`: the System page; it is bucket-gated like `periodic`.
 
-The `score_cycles_one_running` index allows only one running cycle. A `score_now` or `batch_followup` trigger that arrives while a cycle runs is recorded, and the running cycle admits those targets in its next claim round before it finishes; other triggers are dropped.
+The `score_cycles_one_running` index allows only one running cycle. A trigger requests a cycle by deferring `score_cycle(trigger)` (one waiting job per trigger kind); the job creates the `score_cycles` row under its worker epoch with `ON CONFLICT DO NOTHING` on the one-running index and ends when a cycle is still running; a `score_now` or `batch_followup` request during a running cycle is served by that cycle's next claim round, or by the waiting job.
 
 ### 9.4 Per-target subgraph `score_target`
 
@@ -3520,8 +3585,8 @@ class TargetState(TypedDict):
 
 | Node | Kind | Model / effort (config B) | Behaviour |
 |---|---|---|---|
-| `load_context` | det | — | Verifies the claim (CAS read). If an `llm_result` already exists for the 5-tuple, links it and publishes (idempotent). Otherwise resumes from DB artifacts: if a previous attempt of this target left a validated draft and critic notes under the same tuple and evaluation policy (or `resume_draft_id` is set from a batch), it sets `current_draft_id`, `round` and `critic_rounds` from them, so no completed LLM work is repeated. |
-| `generate` | **LLM** | `claude-sonnet-5-5` / `medium` | Claim check → spend reservation → gateway call (generator schema) → structural parse → `score_drafts(round=0)`. A structurally invalid output is never stored as a draft (§11.6). |
+| `load_context` | det | — | Verifies the claim (CAS read). If an `llm_result` already exists for the 5-tuple, links it and publishes (idempotent). Otherwise resumes from DB artifacts: if a previous attempt of this target left a validated draft and critic notes under the same tuple and evaluation policy (or `resume_draft_id` is set from a batch), it sets `current_draft_id`, `round` and `critic_rounds` from them, so no completed LLM work is repeated. A resume reads the whole attempt chain of the target under the same tuple and evaluation policy (`resumed_from_attempt_id`): the newest draft, the count of critic rounds over every draft of the chain, and the last valid review (its derived outcome, the fact confirmations and the not-a-job-ad verification); `validate` re-runs and routes by that review, so an accepted review publishes, a round-0/1 `revise` or `incomplete` review revises and a round-2 one publishes contested, each without a new critic call; `critic_rounds > 0 → critic` applies to a draft newer than every review. |
+| `generate` | **LLM** | `claude-sonnet-5-5` / `medium` | Claim check → spend reservation → gateway call (generator schema) → structural parse → `score_drafts(round=0)`, stored with empty validation columns, which `validate` fills. A structurally invalid output is never stored as a draft (§11.6). |
 | `validate` | det | — | Semantic validation V1–V6 (§11.6) on the current draft. Derives job-fact ids and knockout candidates (§11.4), computes the provisional aggregation under the active scope, and evaluates triggers T0–T8 under the attempt's evaluation policy (§11.7). Writes `validation`, `deterministic_failures`, `provisional` and `triggers`. |
 | `critic` | **LLM** | `claude-opus-5-5` / `low` or `medium` by trigger (§11.7.4) | Claim check → reservation → gateway call (critic schema) with rubric + profile + ad + draft + the list of required fact ids → structural parse → `critic_notes(round)` with the **derived outcome** (§11.7.2). |
 | `revise` | **LLM** | `claude-sonnet-5-5` / `medium` | Claim check → reservation → gateway call (generator schema) with the prior draft and the issues in a **new user message**. No assistant-turn replay. → `score_drafts(round+1)`. |
@@ -3549,8 +3614,10 @@ load_context ─(resume with draft)→ validate
 load_context ─(fresh)→ generate
 generate ─(ok)→ validate
 generate ─(refusal | max_tokens final | invalid_request | transient exhausted | budget | claim lost)→ fail
+           (these error exits apply to critic and revise too)
 generate | revise ─(structurally invalid, repair unused)→ the same step again (repair_used := true)
-generate | revise ─(structurally invalid, repair used)→ fail(failed_invalid_output)
+generate ─(structurally invalid, repair used)→ fail(failed_invalid_output)
+revise ─(structurally invalid, repair used)→ publish(contested from the last validated draft, null-out)
 validate ─(no trigger AND det_failures = ∅ AND critic_rounds = 0)→ publish(accepted)
 validate ─(trigger OR det_failures ≠ ∅ OR critic_rounds > 0) AND critic_rounds < 3→ critic
 validate ─(critic_rounds = 3 already; only reachable on resume)→ publish(contested, null-out)
@@ -3629,10 +3696,10 @@ def admit(cycle) -> list[tuple[int, str]]:
     assert sum(slots.values()) == S                 # exactly S credit-backed slots, before any selection
     # Always-include shares the SIMILARITY slots only (at most half of S); it can never take a
     # safeguard (oldest/exploration) slot. Order, highest similarity first (NULL last): full-text twins
-    # of partial scored members, watchlist companies, title trigram >= 0.6 against a confirmed target
-    # title, batch follow-ups.
+    # of partial scored members, watchlist companies (enabled watchlist entries only), title trigram
+    # >= 0.6 against a confirmed target title, batch follow-ups.
     always = take(always_include_candidates(exclude=picked),
-                  limit=min(slots["similarity"], ceil(0.5 * S)), lane="always_include")
+                  limit=min(slots["similarity"], S // 2), lane="always_include")
     sim = take(candidates("similarity", exclude=picked + always),
                limit=slots["similarity"] - len(always), lane="similarity")
     excl, taken = picked + always + sim, {"similarity": len(always) + len(sim)}
@@ -3656,9 +3723,9 @@ def admit(cycle) -> list[tuple[int, str]]:
   - `oldest`: ordered by `created_at` ascending, any similarity;
   - `exploration`: a reproducible random order seeded by the cycle id.
 - **Fair rotation for every `S`.** `admission_lane_credits` persists each lane's fractional credit across cycles. All three lanes accrue `share × S` per cycle (a lane carries at most `share × S + 1`), whole credits become slots, and leftover slots go to the largest remainders, ties to the safeguard lanes. **The slots always sum to exactly `S`** before any candidate is selected: when carried whole credits exceed `S` (for example after cycles in which a lane had no candidates, or after `S` was lowered), slots are trimmed one at a time from the lane with the largest excess over `share × S`, similarity first on ties, and the trimmed credit simply carries. *Example (Codex R3-3).* `S = 10`; cycle 1 has no similarity candidates, so similarity keeps 7 credits; in cycle 2 the credits after accrual are 8 / 2 / 1, the trim gives 7 / 2 / 1, and 10 targets are admitted, not 14. Using a slot costs one credit, so a remainder slot may leave a lane at most one credit in debt. Over any 10 consecutive cycles with `S = 1`, the lanes get 7, 2 and 1 slots; the oldest and exploration lanes therefore never starve, even under a permanent always-include backlog (Codex #11).
-- **Always-include** draws only on the similarity slots and at most `ceil(0.5 × S)` per cycle. Candidates beyond that stay first in line for the next cycle.
+- **Always-include** draws only on the similarity slots and at most `⌊S / 2⌋` per cycle. Candidates beyond that stay first in line for the next cycle.
 - **Spill** uses the counts actually taken, so a lane can never be asked for a negative number, and a lane without candidates passes its slots on. *Example (Codex #11).* `S = 10`, slots 7/2/1, zero similarity candidates and nine oldest candidates: the oldest lane takes 2 and the exploration lane 1 by slot; 7 slots are spare and spill to the oldest lane (7 more), so 10 targets are admitted, and only the 3 slot-backed takes cost credit.
-- Lane membership is recorded on the target (`lane`) and in the cycle report.
+- Lane membership is recorded on the target (`lane`) and in the cycle report. The claim records the always-include reason (`always_include_reason`); the bulk accounting identifies batched targets through `batch_items`, never through `lane`.
 - Null-similarity targets (`awaiting_embedding`) are eligible for the oldest lane, the exploration lane and always-include.
 - Unadmitted targets stay `pending`. They are browsable with a clearly labelled **preliminary similarity**, and they have **Score now**.
 
@@ -3675,7 +3742,7 @@ A `pending` or `budget_deferred` target with `override = 'none'` is moved to `ex
 `POST /api/jobs/{id}/score-now` (with an `Idempotency-Key`, §14.1) acts on the job's current-revision target for the active tuple.
 - Accepted states: `pending`, `budget_deferred`, `expired_unscored` and `deferred_duplicate` set `override = 'score_now'` (the last also leaves the group's deferral, §7.16.3). `refused` and `failed_*` take the Retry transition (`charged_attempts := 0`). `filtered_out` requires `force=true`, labelled "Score anyway", which sets `override = 'score_anyway'`. All of them set `lane = 'score_now'`.
 - The target moves to `pending` with `lane='score_now'`, and a `score_cycle(trigger='score_now')` is deferred. It bypasses the USD bucket.
-- The hard cap still applies: if the first reservation could not be admitted (§6.9.1), the endpoint returns 409 `budget_exhausted` and nothing changes.
+- The hard cap still applies: the endpoint checks the scoring headroom against `r_first` before it touches the target, then moves the target and requests a `score_now` cycle; it takes no month lock. When the headroom is lower than `r_first`, the endpoint answers 409 `budget_exhausted` and nothing changes; the attempt's own reservation is the authority.
 
 #### 9.6.5 Admission alerts
 
@@ -3683,8 +3750,8 @@ These fire only on meaningful conditions:
 
 | Code | Condition | Severity |
 |---|---|---|
-| `admission.exploration_hits` | Over the trailing 14 days, with n ≥ 10 exploration-lane published targets, more than 25% have `score_mid ≥ relevance_threshold`. The similarity allocation is miscalibrated. | warn |
-| `admission.high_sim_expired` | ≥ 3 targets in 24 h end `expired_unscored` with similarity ≥ the 70th percentile of similarity-lane admissions over the trailing 7 days | warn |
+| `admission.exploration_hits` | Over the trailing 14 days, with n ≥ 10 exploration-lane (the attempt's lane) published targets, more than 25% have `score_mid ≥ relevance_threshold`. The similarity allocation is miscalibrated. | warn |
+| `admission.high_sim_expired` | ≥ 3 targets in 24 h end `expired_unscored` with similarity ≥ the 70th percentile of similarity-lane admissions (the attempt's lane) over the trailing 7 days | warn |
 | `admission.backlog_drain` | The projected drain time of `pending` (`count / admitted_per_day`) exceeds `max_ad_age_days`. Raised at most once a day. | info |
 
 ### 9.7 Re-score triggers
@@ -3696,6 +3763,8 @@ INSERT INTO score_targets (job_revision_id, llm_tuple_id, job_id, state, …)
 VALUES (…)
 ON CONFLICT (job_revision_id, llm_tuple_id) DO UPDATE
    SET state = 'pending', state_reason = NULL, override = 'none', override_at = NULL, lane = NULL,
+       charged_attempts = 0, transient_failures = 0, not_before = NULL, resume_draft_id = NULL,
+       refusal_category = NULL,
        bulk_operation_id = EXCLUDED.bulk_operation_id, state_changed_at = now(), updated_at = now()
  WHERE score_targets.state = 'cancelled'
    AND score_targets.state_reason IN ('tuple_superseded', 'revision_superseded', 'job_merged');
@@ -3711,7 +3780,7 @@ The initial state is then corrected by the same rules as creation (filter, group
 | Evaluation policy change (effect class `evaluation_policy`) | **No re-review.** New attempts use the new policy; published results keep the policy recorded on them (§11.11). |
 | Execution config change (effect class `execution`) | No re-score. The execution config is **pinned per attempt** (`score_attempts.execution_config_id`): attempts that are already running finish with their config, a resumed attempt keeps it, and the next new attempt uses the new one. |
 | New material job revision, or reuse of an earlier one | A target for the active tuple is created or revived. The previous revision's unpublished target is cancelled (`revision_superseded`). |
-| Merge reversal or group split | Targets for the affected revisions are created, revived or moved to `pending`. |
+| Merge reversal or group split | Targets for the affected revisions are created, revived or moved to `pending`. A merge or unmerge outside a run cancels the superseded revision's unpublished targets (`revision_superseded`) and creates or revives the new current revision's target itself. |
 | Scope change | **No LLM call.** `apply_scope` recomputes `hard_filter_results` and `det_results`, then flips the pointer (§13.4). |
 | Job det-facts change (salary, locations, industry) | A new current `det_results` instance and new `hard_filter_results` for that job. No LLM call. |
 
@@ -3824,7 +3893,7 @@ The configuration has two immutable, separately hashed parts:
 - **Allowed models**: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`.
 - **Allowed efforts**: `low | medium | high | xhigh | max`, constrained by each model's capabilities as listed in `llm/pricing.py`, where `claude-haiku-5-5` supports `low…max`.
 - The score nodes' first stage of 6,000 output tokens is about 1.5× the high-case output including thinking (§21.1) under the slim limits of U14; it keeps worst-case reservations and batch holds small. A `max_tokens` stop moves to the 12,000-token enlarged stage.
-- The generator's effort stays `medium` by default. `low` can be selected only after the golden-set gate shows parity (§11.13), and the UI says so.
+- The generator's effort stays `medium` by default. `low` can be selected only after the golden-set gate shows parity (§11.13), and the UI says so. Switching the generator to `low` is refused while the golden-set gate is `failed`; while it is `uncalibrated` the switch is allowed with a warning; an already-active `low` under a failed gate is kept with the warning `eval_failed`.
 - The UI offers the presets **A** (all Opus medium), **B** (default) and **C** (Haiku generator and reviser, Sonnet critic), plus per-node overrides.
 
 ### 10.4 Retries, deadlines, errors
@@ -3842,9 +3911,14 @@ The configuration has two immutable, separately hashed parts:
   | `LLMTransient` | `pending(not_before)` or `failed_transient` |
   | `LLMRequestError` (400/401/403/404/413/422) | `failed_request(code)`. Codes 401/403 also raise the critical alert `llm.auth_failed` and pause the score lane. |
   | `BudgetExhausted` | `budget_deferred` |
-  | `ClaimLost` / `FencedOut` | the attempt ends `claim_lost`, and the target is untouched |
+  | `ClaimLost` / `FencedOut` | the attempt ends `claim_lost`, and the target is untouched; a `claim_lost` attempt is ended by whoever changed the predicate: a reclaim writes `claim_lost`, a cancellation `cancelled` |
   | `DeadlineExhausted` | `transient_error` |
   | `MaxTokensExhausted` | `failed_max_tokens` |
+  | `InputUnbounded` | `failed_request('input_unbounded')` |
+  | `LLMNotConfigured` | `transient_error` (no charge) |
+  | `ModelMismatch` | `failed_request('model_mismatch')` |
+  | an unclassified exception | `failed_invalid_output('bug')` (the attempt ends `failed_invalid_output`, detail `bug`) |
+  | a retryable DB error that exhausted its retries | the transient path, code `db_transient` |
 
 ### 10.5 `stop_reason` handling
 
@@ -3870,13 +3944,18 @@ messages[0] (user):
            possibilities + source, employment types + source, completeness flag) + description
            (≤ 24,000 chars: head 20,000 + tail 4,000 with an explicit "[… truncated …]" marker;
            truncation recorded in llm_calls.input_refs) </job_ad>
-           critic adds: <draft> JSON, <required_facts> list (fact_id, code, subject), <validator_issues>
-           revise adds: <previous_draft> JSON, <issues> list (validator + critic), instruction to
-           return a complete corrected output
+           the rendered block keeps an origin map (a segment per structured field, the description
+           head, the marker and the tail with its source offset), so a quote from the tail maps to
+           the right description span
+           critic adds: <draft> JSON (the internal draft of §11.4 with each binding fact's fact_id),
+           <required_facts> list (fact_id, code, subject), <validator_issues>
+           revise adds: <previous_draft> JSON (the same internal form), <issues> list (validator +
+           critic), instruction to return a complete corrected output; the reviser returns the wire
+           form of §11.5
 ```
 
 - **No assistant turns** are ever sent. Revisions present the prior draft inside the new user message, so there is no prefill and no history editing.
-- Cache entries are per **(model, effort)**: generator and reviser (Sonnet/medium) share one entry; the critic has one entry per effort it runs at (Opus/medium and Opus/low).
+- Cache entries are per **(model, effort)** (the provider documents that a changed `output_config.format` invalidates the prompt cache, so entries are per (model, effort, schema); the generator and the reviser share one, V14 measures it): generator and reviser (Sonnet/medium) share one entry; the critic has one entry per effort it runs at (Opus/medium and Opus/low).
 - The shared prefix (system[0] + system[1]) is ≥ 512 tokens by construction. Startup asserts that the rendered rubric block alone is ≥ 600 tokens, counted with a conservative chars/4 estimate.
 - No dynamic content (dates, ids) is placed before the breakpoint.
 - Profile extraction and query proposal are single calls with no cache marker.
@@ -3940,26 +4019,26 @@ The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_
 
 **Size, budget and order.**
 - Order: availability `active` first, then the previous tuple's `score_mid` descending, then similarity descending.
-- The batch is cut to at most `batch_max_items` (500, settings) and then to the largest `n` whose worst-case reservation **plus its expected follow-up allocation** fits the remaining batch allocation (§6.9.3). The allocation (40% by default) bounds the batch items and their expected follow-ups; it is not a limit on everything the re-score spends.
+- The batch is cut to at most `batch_max_items` (500, settings) and a byte cap of 200 MiB on the request body, then to the largest `n` whose worst-case reservation **plus its expected follow-up allocation** fits the remaining batch allocation (§6.9.3) and the hard-cap headroom. The allocation (40% by default) bounds the batch items and their expected follow-ups; it is not a limit on everything the re-score spends.
 - If fewer than `batch_min_targets` (200, settings) targets remain after pruning, no batch is submitted. The targets stay `pending` and are scored by online admission at the monthly pace.
-- **Follow-on submissions.** When a submission ends (`reconciled`, `released`, `submit_rejected` or `abandoned`), the worker inserts the next `batch_submit` operation for the active bulk operation. A released submission triggers its follow-on at the release, never again when it is later reconciled. It is sized again from the remaining allocation, so repeated submissions never exceed it in total (§6.9.3).
+- **Follow-on submissions.** When a submission ends (`reconciled`, `released`, `submit_rejected` or `abandoned`), the worker inserts the next `batch_submit` operation for the active bulk operation. A released submission triggers its follow-on at the release, never again when it is later reconciled. It is sized again from the remaining allocation, so repeated submissions never exceed it in total (§6.9.3). The follow-on is requested once per originating submission, at its end, never for an adopted released one. After a not-sent rejection (step 4b: 409, 429 or a connect failure before any byte was sent) the follow-on is marked handled but requests nothing; the `bulk_operations` reconciler's heavy pass re-requests `batch_submit` for an active bulk operation with funded `pending` targets and nothing in flight or queued (not during a live target creation).
 
 **Lifecycle.**
 
 | Step | Transaction / call |
 |---|---|
-| 1. Prepare | One transaction, holding the `llm_budget` month row (§6.9.1):<br>• insert `batch_submissions(state='preparing', bulk_operation_id, request_count, request_hash, followup_held_usd)`;<br>• for each target, `attempt_no+1` and `state='in_batch'` (CAS from `pending`);<br>• insert `score_attempts(mode='batch')`, `batch_items(custom_id='t<target_id>_a<attempt_no>')`, and an `llm_calls` row with `transport='batch'` and a reserved spend entry (`batch=true`, 50% prices, `bulk_operation_id`);<br>• add the follow-up hold to `bulk_operations.followup_held_usd`. |
+| 1. Prepare | One transaction, holding the `llm_budget` month row (§6.9.1). The §9.6 admission guard (the pause reasons) applies to a batch as to a cycle; the operation's claim is verified; the candidates are sized under the month and bulk rows; the CAS on the targets (`FOR UPDATE SKIP LOCKED`, so it never waits) advances `attempt_no` before any attempt or item row exists; the minimum is re-applied to the claimed set and a shortfall rolls the whole preparation back; the reservations check the allocation under the same locks:<br>• insert `batch_submissions(state='preparing', bulk_operation_id, request_count, request_hash, followup_held_usd)`;<br>• for each target, `attempt_no+1` and `state='in_batch'` (CAS from `pending`);<br>• insert `score_attempts(mode='batch')`, `batch_items(custom_id='t<target_id>_a<attempt_no>')`, and an `llm_calls` row with `transport='batch'` and a reserved spend entry (`batch=true`, 50% prices, `bulk_operation_id`);<br>• add the follow-up hold to `bulk_operations.followup_held_usd`. |
 | 2. Submit-start | Commit `state='submit_started', submit_started_at=now()`, and mark the item ledger entries `dispatched`. |
-| 3. Create | `messages.batches.create(requests=[{custom_id, params}])`. The params are identical to the online generator request, without `stream`. |
+| 3. Create | `messages.batches.create(requests=[{custom_id, params}])`, under a 600 s client deadline. The params are identical to the online generator request, without `stream`. |
 | 4a. Response | Store `provider_batch_id`, `submitted_at`, `expires_at = created_at + 24 h`; `state='submitted'`. |
-| 4b. Definitive 4xx | `submit_rejected`. The items' spend → `not_billed` (`batch_submit_rejected`), targets → `pending`, the attempts end `submit_rejected`, and the follow-up hold is released. |
-| 4c. Timeout, connection loss, 5xx or crash after step 2 | `submit_ambiguous`. The targets stay `in_batch(submission_id)` and the spend stays reserved and counted. **The submission is never resubmitted while ambiguous.** |
+| 4b. Definitive 4xx | `submit_rejected`. A definitive 4xx is a non-retryable status (400/401/403/404/413/422); 401/403 also raise `llm.auth_failed`. 409, 429 and a connect failure before any byte was sent are retried inside the create call (gateway backoff, `Retry-After`, within the 10-minute deadline, at least `RETRY_MIN_REMAINING_S` left) and end here (`connect_failed_before_send` / `batch_submit_rejected`) when the tries run out. The items' spend → `not_billed` (`batch_submit_rejected`), targets → `pending`, the attempts end `submit_rejected`, and the follow-up hold is released. |
+| 4c. 408, timeout, connection loss after the send started, 5xx or crash after step 2 | `submit_ambiguous`. The targets stay `in_batch(submission_id)` and the spend stays reserved and counted. **The submission is never resubmitted while ambiguous.** A `preparing` or `submit_started` submission whose `batch_submit` execution was lost (its operation not running, running under a claim other than the stored `operation_claim_id`, or belonging to an older worker epoch) is recovered at takeover, by the re-run handler and by the `batch_submissions` tick reconciler, each in a fenced transaction that takes the configuration before the operation row: `preparing → abandoned`, `submit_started → submit_ambiguous`; a `submit_started` row is never resent. |
 | 4d. Crash before step 2 | At restart, a `preparing` submission is set to `abandoned`. The items' spend → `not_billed` (`never_dispatched`), the targets → `pending`, and the follow-up hold is released. |
-| 5. Poll | `batch_poll` (aux queue, every 5 min). It calls `retrieve`; once `processing_status='ended'`, it sets `state='ended'` and streams `results()`. |
-| 6. Per item | Match on `custom_id`; processing is idempotent on `batch_items.processed_at`. Every target mutation is fenced by `state='in_batch' AND batch_submission_id=:s AND attempt_no=:a`; a fenced item (the target was released or cancelled meanwhile) only settles spend and records `decision='ignored_fenced'`. The decision table below applies. |
-| 7. Reconciled | `missing` is decided only after the result stream was read to its end and validated (`results_complete_at`): every item without a result is then `missing`. Once every item is processed: `state='reconciled'`. Results stay downloadable for 29 days, and processing MUST finish within that window. |
+| 5. Poll | `batch_poll` (a periodic aux task, every 5 min). It calls `retrieve`; once `processing_status='ended'`, it sets `state='ended'` and streams `results()`. A `retrieve` still failing past `expires_at + 1 h` raises the critical alert `batch.retrieve_failing`. A result stream unreadable for 12 consecutive passes, or not read whole by `submit_started_at + 29 days`, is given up (critical `batch.results_unreadable`); the remaining items take the missing-item path. |
+| 6. Per item | Match on `custom_id`; processing is idempotent on `batch_items.processed_at`. Every target mutation is fenced by `state='in_batch' AND batch_submission_id=:s AND attempt_no=:a`; a fenced item (the target was released or cancelled meanwhile) only settles spend and records `decision='ignored_fenced'`. The decision table below applies. One item whose decision raises is skipped for the pass, and after 12 consecutive failed passes is given up as missing (critical `batch.item_unprocessable`). |
+| 7. Reconciled | `missing` is decided only after the result stream was read to its end and validated (`results_complete_at`): every item without a result is then `missing`, and a missing item is processed as an item result of type `missing` through the same path as every other result. Once every item is processed: `state='reconciled'`. Results stay downloadable for 29 days, and processing MUST finish within that window. |
 
-**Per-item decision table** (step 6):
+**Per-item decision table** (step 6). A `succeeded` item is classified as an online response (§10.5: model mismatch, `max_tokens`, refusal, structural validity and storability); the usage is always billed and the output stored only when it is valid; a served model other than the requested one is `failed_request('model_mismatch')` with the §10.1 G11 alert:
 
 | Provider result | Content | Spend | Decision → target (§7.16.3) |
 |---|---|---|---|
@@ -3967,24 +4046,25 @@ The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_
 | `succeeded` | `end_turn`, valid, a trigger or a deterministic failure | `billed` | `followup` → `pending(lane='batch_followup', resume_draft_id)`; the batch attempt ends `batch_draft_ready` |
 | `succeeded` | `end_turn`, structurally invalid | `billed` | `retry_online` → `pending('batch_invalid_output')`; no draft is stored |
 | `succeeded` | `stop_reason=refusal` | `billed` | `refused` → `refused(category)` |
-| `succeeded` | `stop_reason=max_tokens` | `billed` | `retry_online` → `pending('batch_max_tokens')`; the online attempt starts at the enlarged stage |
+| `succeeded` | `stop_reason=max_tokens` | `billed` | `retry_online` → `pending('batch_max_tokens')`, the call recorded as `max_tokens_first_stage`; the online attempt starts at the enlarged stage |
 | `succeeded` | any other stop reason | `billed` | `failed_invalid_output('unexpected_stop_reason')` |
 | `errored` | `invalid_request` | `not_billed(batch_item_errored)` | `failed_request` → `failed_request('batch_invalid_request')` |
 | `errored` | other error types | `not_billed(batch_item_errored)` | `retry_online` → `pending('batch_errored')` |
-| `canceled` | — | `not_billed(batch_item_canceled)` | `cancelled` when the cancel was requested for a superseded tuple; otherwise `retry_online` → `pending('batch_canceled')`, an excluded disposition (eligibility above) |
+| `canceled` | — | `not_billed(batch_item_canceled)` | `ignored_fenced` when the submission's cancel was requested (its targets were cancelled with the request); otherwise `retry_online` → `pending('batch_canceled')`, an excluded disposition (eligibility above) |
 | `expired` | — | `not_billed(batch_item_expired)` | `retry_online` → `pending('batch_expired')` |
 | *(no result after a complete stream)* | — | stays `ambiguous`; critical alert `batch.items_missing` | `retry_online` → `pending('batch_missing')` |
 
 - **Batched targets are `in_batch(submission_id)`.** That state is exempt from claim-reclaim, from online admission and from the stuck-target invariant until the batch ends or expires, the submission is rejected or abandoned, or the user releases it.
-- **Cancellation of batched targets.** If the tuple of a submitted batch is superseded, the worker requests `messages.batches.cancel`, sets `cancel_requested_at`, and moves the submission's `in_batch` targets to `cancelled('tuple_superseded')`. A revision supersession, job merge or purge cancels the affected `in_batch` targets individually (`cancelled(reason)`, §7.16.3) without cancelling the batch. Either way, an item that later arrives for a cancelled target is fenced: it settles spend from usage (`billed`) or from the provider's per-item evidence (`not_billed(batch_item_*)`) and publishes nothing (`decision='ignored_fenced'`).
-- Follow-ups of a bulk operation release their share of `followup_held_usd` as they complete.
+- **Cancellation of batched targets.** If the tuple of a submitted batch is superseded, the worker requests `messages.batches.cancel`, sets `cancel_requested_at`, and moves the submission's `in_batch` targets to `cancelled('tuple_superseded')`. The cancel request is recorded on every non-terminal submission of the tuple, whatever its phase, and is sent to the provider as soon as a provider id is known, only while the batch is `in_progress`, after a retrieve. A revision supersession, job merge or purge cancels the affected `in_batch` targets individually (`cancelled(reason)`, §7.16.3) without cancelling the batch. Either way, an item that later arrives for a cancelled target is fenced: it settles spend from usage (`billed`) or from the provider's per-item evidence (`not_billed(batch_item_*)`) and publishes nothing (`decision='ignored_fenced'`).
+- Every item decision but `followup` releases its share of `followup_held_usd` at processing (`batch_items.hold_released_at`, once), a `followup` when its target ends terminally.
+- Every cleanup of this section ends an attempt only while it is `running`; an attempt supersession ended keeps its outcome, and the accounting of an item never depends on its target's state.
 
-**Ambiguous-submit recovery (exact procedure).** The batch list/retrieve API exposes no caller metadata, so metadata matching is impossible. Only this single worker submits batches, one at a time; the `batch_one_in_flight` index guarantees this.
+**Ambiguous-submit recovery (exact procedure).** The batch list/retrieve API exposes no caller metadata, so metadata matching is impossible. Only this single worker submits batches, one at a time; the `batch_one_in_flight` index guarantees this. The workspace is assumed to hold this installation's batches only.
 
-The job `batch_reconcile_ambiguous` runs every 15 min for every `submit_ambiguous` submission, and for every `released` one younger than 29 days:
-1. List **every** batch in the workspace (auto-paginating `messages.batches.list`) and select those with `created_at ∈ [submit_started_at − 1 min, submit_started_at + 10 min]` (the creation window; `create` has a 10-minute client deadline).
+The periodic aux task `batch_reconcile_ambiguous` runs every 15 min for every `submit_ambiguous` submission, and for every `released` one younger than 29 days:
+1. List **every** batch in the workspace (auto-paginating `messages.batches.list`) and select those with `created_at ∈ [submit_started_at − 1 min, submit_started_at + 10 min]` (the creation window; `create` runs under a 600 s client deadline).
 2. **Candidates** are the selected batches whose total request count equals ours.
-3. A candidate is **confirmed** only after it has `ended`, its results are downloaded completely, and its `custom_id` set **equals** ours. Our ids are unique per target and attempt. Confirmation adopts `provider_batch_id`, moves the submission (from `submit_ambiguous` or `released`) to `ended`, and processes results per lifecycle step 6.
+3. A candidate is **confirmed** only after it has `ended`, its results are downloaded completely, and its `custom_id` set **equals** ours. Our ids are unique per target and attempt. The adoption decides only when every ended window candidate was read whole, adopting exactly one equal candidate with no partial intersection. Confirmation adopts `provider_batch_id`, moves the submission (from `submit_ambiguous` or `released`) to `ended`, and processes results per lifecycle step 6.
 4. A batch whose `custom_id` set partially intersects ours raises the critical alert `batch.custom_id_anomaly`. The submission stays quarantined and is never auto-settled.
 5. **No automatic absence proof** (chair decision C3, §2.4). A client timeout does not prove that the server stopped creating the batch, and no authoritative bound on creation or listing delay exists. An empty or non-matching listing therefore **never** settles the submission: it stays `submit_ambiguous`, with its reservations counted, until a matching batch is found (step 3) or the user releases it (step 7).
 6. **Unresolved quarantine.** At 25 h after `submit_started_at` the submission raises `batch.submit_ambiguous_unresolved` (critical). **It never transitions on timeout.** The alert text and the Budget page state the reserved amount that the quarantine holds against the month (R9), and offer the release.
@@ -4009,9 +4089,9 @@ While any submission is `submit_ambiguous`, no new batch is submitted; after an 
   - `stop_reason='end_turn'`;
   - the output validates against the structural Pydantic model;
   - the sent `output_config.format.schema` equals the expected transformed schema byte for byte;
-  - each enum-constrained field in the output takes an allowed value. This detects silent stripping of `enum`, `anyOf` or `$ref`.
-- An informational probe sends the generator schema with one added `"minimum": 0` and records whether it is rejected (400) or accepted. The schemas never rely on such keywords; **all ranges and lengths are enforced by the semantic validator** (§11.6).
-- Results are stored as `eval_runs(kind='schema_dry_run')`. Activation of a new prompt/schema version requires a passing record. Total cost is below $0.10.
+  - each enum-constrained field in the output takes an allowed value, and the generator's fact items pass the §11.6 normaliser without an out-of-vocabulary issue. This detects silent stripping of `enum`, `anyOf` or `$ref`.
+- An informational probe sends the generator schema with one added `"minimum": 0` and records whether it is rejected (400) or accepted; the probe is sent to `messages.count_tokens`, which rejects the keyword without a paid message (V4). The keyword probe is sent on a probe-only schema (one integer property with `minimum`) when the generator schema has no plain integer field, as candidate C has not; it answers whether the keyword is rejected, which does not depend on the generator schema. The schemas never rely on such keywords; **all ranges and lengths are enforced by the semantic validator** (§11.6).
+- Results are stored as `eval_runs(kind='schema_dry_run')`. Activation of a new prompt/schema version requires a passing record of a **live** run for that version: a passed live case for each (schema, model) pair the active model policy uses across all five nodes (generate, revise, critic, extract_profile, propose_queries), and a model-policy change is refused until the version has such cases for the new models. Total actual cost is below $0.10 per run; the worst-case reservations are about $0.25.
 
 ---
 
@@ -4126,7 +4206,7 @@ The levels are integers 0–4, or `null` when unknown. The anchors are rendered 
 | 3 | All mandatory languages are met; a preferred language is 1 level short. |
 | 4 | Every stated language requirement is met. |
 
-`unknown` applies when the ad states no language requirement. **The ad's own language is not evidence of a requirement.** `unconstrained` applies when the ad explicitly states that no particular language is required (quote). A mandatory language with an `unspecified` level is *provably unmet* only when the language is absent from the profile; when the profile has it at any level, the rating follows the evidence and the knockout comparison is `uncomparable` (§11.4).
+`unknown` applies when the ad states no language requirement. **The ad's own language is not evidence of a requirement.** `unconstrained` applies when the ad explicitly states that no particular language is required (quote). A mandatory language with an `unspecified` level is *provably unmet* only when the language is absent from the profile; when the profile has it at B2 or higher, the knockout comparison is `met`; below B2 it is `uncomparable` (§11.4).
 
 **`education_certifications`**:
 
@@ -4154,22 +4234,22 @@ An `unconstrained` rating without a grounded quote is a deterministic failure (V
 
 **Job facts** are CV-independent, emitted by the generator with evidence, and stored in `llm_results.job_facts`. Every fact that can bind gets a **stable fact id** `code:subject`, derived deterministically by the validator, so a critic review, a confirmation and a cap all refer to the same item:
 
-| Fact | Content | Fact id |
-|---|---|---|
-| `work_mode` | `remote / hybrid / onsite / unspecified` | — |
-| `onsite_only` | asserted flag | `onsite_required:onsite` |
-| `remote_region` | `germany / dach / eu_eea / europe / worldwide / other_country / unspecified`, plus `remote_countries[]` (ISO codes) | — |
-| `required_languages[]` | language (code, or `other` + name), CEFR level or `native`/`unspecified`, mandatory flag | `mandatory_language:<code>` or `mandatory_language:other:<folded name>` |
-| `must_haves[]`, `nice_to_haves[]` | requirement items | — |
-| `seniority` | seniority level | — |
-| `min_years_experience` | number of years | — |
-| `industry` | industry | — |
-| `employment_types[]` | employment types | — |
-| `degree` | level, mandatory, field | `degree:degree` |
-| `certifications[]` | name, mandatory | `certification:<folded name>` |
-| `security_clearance` | required flag, level | `security_clearance:clearance` |
-| `work_permit` | required flag | `work_permit:work_permit` |
-| `not_a_job_ad` (top-level flag) | asserted flag; the critic's mandatory review supplies the grounded quote | `not_a_job_ad:ad` |
+| Fact | Content | Fact id | Generator code |
+|---|---|---|---|
+| `work_mode` | `remote / hybrid / onsite / unspecified` | — | `work_mode` |
+| `onsite_only` | asserted flag | `onsite_required:onsite` | `onsite_only` |
+| `remote_region` | `germany / dach / eu_eea / europe / worldwide / other_country / unspecified`, plus `remote_countries[]` (ISO codes) | — | `remote_region` + `remote_country` |
+| `required_languages[]` | language (code, or `other` + name), CEFR level or `native`/`unspecified`, mandatory flag | `mandatory_language:<code>` or `mandatory_language:other:<folded name>` | `required_language` |
+| `must_haves[]`, `nice_to_haves[]` | requirement items | — | `must_have` / `nice_to_have` |
+| `seniority` | seniority level | — | `seniority` |
+| `min_years_experience` | number of years | — | `min_years_experience` |
+| `industry` | industry | — | `industry` |
+| `employment_types[]` | employment types | — | `employment_type` |
+| `degree` | level, mandatory, field | `degree:degree` | `degree` + `degree_or_equivalent` |
+| `certifications[]` | name, mandatory | `certification:<folded name>` | `certification` |
+| `security_clearance` | required flag, level | `security_clearance:clearance` | `security_clearance` |
+| `work_permit` | required flag | `work_permit:work_permit` | `work_permit` |
+| `not_a_job_ad` (top-level flag) | asserted flag; the critic's mandatory review supplies the grounded quote | `not_a_job_ad:ad` | — |
 
 Two facts with the same fact id are a V4 issue; the first is kept.
 
@@ -4198,7 +4278,7 @@ A **cap applies only when the comparison is `unmet` and the fact is structured o
 | `security_clearance` | required | the profile has no user-entered clearance | the ad's level is specified, the profile has a clearance, and the levels are not comparable strings (folded equality) | hard |
 | `work_permit` | required | `work_authorization_de = requires_sponsorship` | `work_authorization_de = unspecified` | hard |
 | `degree` | mandatory, with no "or equivalent" clause | the ad's level is specified and above the profile's highest degree (`none < vocational < bachelor < master < phd`) | the ad's level is `unspecified` | soft |
-| `certification` | mandatory | no profile certification matches (folded token-set similarity ≥ 0.8) | — | soft |
+| `certification` | mandatory | no profile certification matches (folded token-set similarity ≥ 0.8; the similarity is the overlap coefficient \|A∩B\| / min(\|A\|, \|B\|) over folded word sets, not Jaccard) | — | soft |
 | `contract_type` | structured employment types | all outside scope (this is the `employment_type_excluded` filter; it applies only to "score anyway" results) | — | hard (filter) |
 
 - **Confirmation** is per fact id: `fact_confirmations[fact_id] ∈ {structured, critic_confirmed, critic_rejected, uncertain, unconfirmed}`. Critic `rejected` → the knockout is dropped. `uncertain` or `unconfirmed` → no cap, the "unconfirmed requirement" badge, and the result is `contested` if no further revision is possible.
@@ -4206,124 +4286,53 @@ A **cap applies only when the comparison is `unmet` and the fact is structured o
 
 ### 11.5 Generator output JSON schema
 
-This is a conservative subset: `type`, `enum`, `anyOf`, `$ref`/`$defs`, `required`, `additionalProperties: false`. **No** `minimum`, `maximum`, `minLength`, `maxLength`, `minItems` or `maxItems`; those limits are enforced by the semantic validator (V1, §11.6).
+This is a conservative subset: `type`, `enum`, `anyOf`, `$ref`/`$defs`, `required`, `additionalProperties: false`. **No** `minimum`, `maximum`, `minLength`, `maxLength`, `minItems` or `maxItems`; those limits are enforced by the semantic validator (V1, §11.6). The API also enforces documented limits (24 optional parameters, 16 union parameters, 20 strict tools) and an undocumented compiled-grammar size with a 180 s compile timeout; `messages.count_tokens` does not compile the grammar, so only a message call proves a schema compiles (V4, V4b).
 
 ```json
 {
-  "type": "object", "additionalProperties": false,
-  "required": ["not_a_job_ad", "injection_observed", "job_facts", "criteria", "summary_en", "summary_de"],
-  "properties": {
-    "not_a_job_ad": {"type": "boolean"},
-    "injection_observed": {"type": "boolean"},
-    "job_facts": {"$ref": "#/$defs/job_facts"},
-    "criteria": {
-      "type": "object", "additionalProperties": false,
-      "required": ["role_fit", "skills", "experience_seniority", "domain", "languages", "education_certifications"],
-      "properties": {
-        "role_fit": {"$ref": "#/$defs/criterion"},
-        "skills": {"$ref": "#/$defs/criterion"},
-        "experience_seniority": {"$ref": "#/$defs/criterion"},
-        "domain": {"$ref": "#/$defs/criterion"},
-        "languages": {"$ref": "#/$defs/criterion"},
-        "education_certifications": {"$ref": "#/$defs/criterion"}
-      }
-    },
-    "summary_en": {"type": "string"},
-    "summary_de": {"type": "string"}
+ "type": "object", "additionalProperties": false,
+ "required": ["not_a_job_ad", "injection_observed", "facts", "criteria", "summary_en", "summary_de"],
+ "properties": {
+  "not_a_job_ad": {"type": "boolean"},
+  "injection_observed": {"type": "boolean"},
+  "facts": {"type": "array", "items": {"$ref": "#/$defs/fact"}},
+  "criteria": {"type": "array", "items": {"$ref": "#/$defs/criterion"}},
+  "summary_en": {"type": "string"},
+  "summary_de": {"type": "string"}
+ },
+ "$defs": {
+  "quotes": {"type": "array", "items": {"type": "string"}},
+  "fact": {
+   "type": "object", "additionalProperties": false,
+   "required": ["code", "value", "qualifier", "required", "evidence"],
+   "properties": {
+    "code": {"type": "string", "enum": ["work_mode", "onsite_only", "remote_region", "remote_country", "required_language",
+              "must_have", "nice_to_have", "seniority", "min_years_experience", "industry", "employment_type", "degree",
+              "degree_or_equivalent", "certification", "security_clearance", "work_permit"]},
+    "value": {"type": "string"},
+    "qualifier": {"type": "string"},
+    "required": {"type": "boolean"},
+    "evidence": {"$ref": "#/$defs/quotes"}
+   }
   },
-  "$defs": {
-    "quotes": {"type": "array", "items": {"type": "string"}},
+  "criterion": {
+   "type": "object", "additionalProperties": false,
+   "required": ["criterion", "level", "basis", "ad_evidence", "profile_evidence", "rationale"],
+   "properties": {
+    "criterion": {"type": "string", "enum": ["role_fit", "skills", "experience_seniority", "domain", "languages", "education_certifications"]},
     "level": {"anyOf": [{"type": "integer", "enum": [0, 1, 2, 3, 4]}, {"type": "null"}]},
-    "profile_ref": {
-      "type": "object", "additionalProperties": false, "required": ["section", "quote"],
-      "properties": {
-        "section": {"type": "string", "enum": ["summary", "target_titles", "roles", "skills", "languages",
-                                                "education", "certifications", "domains", "seniority"]},
-        "quote": {"type": "string"}
-      }
-    },
-    "criterion": {
-      "type": "object", "additionalProperties": false,
-      "required": ["level", "basis", "ad_evidence", "profile_evidence", "rationale"],
-      "properties": {
-        "level": {"$ref": "#/$defs/level"},
-        "basis": {"type": "string", "enum": ["observed", "unknown", "unconstrained"]},
-        "ad_evidence": {"$ref": "#/$defs/quotes"},
-        "profile_evidence": {"type": "array", "items": {"$ref": "#/$defs/profile_ref"}},
-        "rationale": {"type": "string"}
-      }
-    },
-    "cefr": {"type": "string", "enum": ["A1", "A2", "B1", "B2", "C1", "C2", "native", "unspecified"]},
-    "lang_code": {"type": "string", "enum": ["de", "en", "fr", "es", "it", "nl", "pl", "pt", "other"]},
-    "nullable_string": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-    "nullable_int": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-    "requirement": {
-      "type": "object", "additionalProperties": false, "required": ["text", "evidence"],
-      "properties": {"text": {"type": "string"}, "evidence": {"$ref": "#/$defs/quotes"}}
-    },
-    "job_facts": {
-      "type": "object", "additionalProperties": false,
-      "required": ["work_mode", "onsite_only", "remote_region", "required_languages", "must_haves",
-                   "nice_to_haves", "seniority", "min_years_experience", "industry", "employment_types",
-                   "degree", "certifications", "security_clearance", "work_permit"],
-      "properties": {
-        "work_mode": {"type": "object", "additionalProperties": false, "required": ["value", "evidence"],
-          "properties": {"value": {"type": "string", "enum": ["remote", "hybrid", "onsite", "unspecified"]},
-                         "evidence": {"$ref": "#/$defs/quotes"}}},
-        "onsite_only": {"type": "object", "additionalProperties": false, "required": ["asserted", "evidence"],
-          "properties": {"asserted": {"type": "boolean"}, "evidence": {"$ref": "#/$defs/quotes"}}},
-        "remote_region": {"type": "object", "additionalProperties": false,
-          "required": ["value", "countries", "evidence"],
-          "properties": {"value": {"type": "string", "enum": ["germany", "dach", "eu_eea", "europe", "worldwide",
-                                                               "other_country", "unspecified"]},
-                         "countries": {"type": "array", "items": {"type": "string"}},
-                         "evidence": {"$ref": "#/$defs/quotes"}}},
-        "required_languages": {"type": "array", "items": {
-          "type": "object", "additionalProperties": false,
-          "required": ["language", "language_other", "level", "mandatory", "evidence"],
-          "properties": {"language": {"$ref": "#/$defs/lang_code"},
-                         "language_other": {"$ref": "#/$defs/nullable_string"},
-                         "level": {"$ref": "#/$defs/cefr"},
-                         "mandatory": {"type": "boolean"},
-                         "evidence": {"$ref": "#/$defs/quotes"}}}},
-        "must_haves": {"type": "array", "items": {"$ref": "#/$defs/requirement"}},
-        "nice_to_haves": {"type": "array", "items": {"$ref": "#/$defs/requirement"}},
-        "seniority": {"type": "object", "additionalProperties": false, "required": ["value", "evidence"],
-          "properties": {"value": {"type": "string", "enum": ["intern", "working_student", "apprentice", "junior",
-                           "mid", "senior", "lead", "principal", "head", "unspecified"]},
-                         "evidence": {"$ref": "#/$defs/quotes"}}},
-        "min_years_experience": {"type": "object", "additionalProperties": false, "required": ["value", "evidence"],
-          "properties": {"value": {"$ref": "#/$defs/nullable_int"}, "evidence": {"$ref": "#/$defs/quotes"}}},
-        "industry": {"type": "object", "additionalProperties": false, "required": ["value", "evidence"],
-          "properties": {"value": {"$ref": "#/$defs/nullable_string"}, "evidence": {"$ref": "#/$defs/quotes"}}},
-        "employment_types": {"type": "object", "additionalProperties": false, "required": ["values", "evidence"],
-          "properties": {"values": {"type": "array", "items": {"type": "string", "enum": ["full_time",
-                           "part_time", "contract", "temporary", "internship", "working_student",
-                           "apprenticeship", "freelance"]}},
-                         "evidence": {"$ref": "#/$defs/quotes"}}},
-        "degree": {"type": "object", "additionalProperties": false,
-          "required": ["level", "mandatory", "or_equivalent", "field", "evidence"],
-          "properties": {"level": {"type": "string", "enum": ["none_required", "vocational", "bachelor", "master",
-                           "phd", "unspecified"]},
-                         "mandatory": {"type": "boolean"},
-                         "or_equivalent": {"type": "boolean"},
-                         "field": {"$ref": "#/$defs/nullable_string"},
-                         "evidence": {"$ref": "#/$defs/quotes"}}},
-        "certifications": {"type": "array", "items": {
-          "type": "object", "additionalProperties": false, "required": ["name", "mandatory", "evidence"],
-          "properties": {"name": {"type": "string"}, "mandatory": {"type": "boolean"},
-                         "evidence": {"$ref": "#/$defs/quotes"}}}},
-        "security_clearance": {"type": "object", "additionalProperties": false,
-          "required": ["required", "level", "evidence"],
-          "properties": {"required": {"type": "boolean"}, "level": {"$ref": "#/$defs/nullable_string"},
-                         "evidence": {"$ref": "#/$defs/quotes"}}},
-        "work_permit": {"type": "object", "additionalProperties": false, "required": ["required", "evidence"],
-          "properties": {"required": {"type": "boolean"}, "evidence": {"$ref": "#/$defs/quotes"}}}
-      }
-    }
+    "basis": {"type": "string", "enum": ["observed", "unknown", "unconstrained"]},
+    "ad_evidence": {"$ref": "#/$defs/quotes"},
+    "profile_evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["section", "quote"],
+                         "properties": {"section": {"type": "string"}, "quote": {"type": "string"}}}},
+    "rationale": {"type": "string"}
+   }
   }
+ }
 }
 ```
+
+Only stated facts are emitted; an absent code means `unspecified`, not asserted, or `required = false`. `value` carries the vocabulary word for `work_mode` (`remote | hybrid | onsite | unspecified`), `remote_region` (`germany | dach | eu_eea | europe | worldwide | other_country | unspecified`), `seniority` (`intern | working_student | apprentice | junior | mid | senior | lead | principal | head | unspecified`), `employment_type` (`full_time | part_time | contract | temporary | internship | working_student | apprenticeship | freelance`) and `degree` (`none_required | vocational | bachelor | master | phd | unspecified`); the integer text for `min_years_experience`; an ISO 3166-1 alpha-2 code for `remote_country` (one item per country); the language code (`de | en | fr | es | it | nl | pl | pt`) or `other:<name>` for `required_language`; the name for `certification`; the industry for `industry`; the requirement text for `must_have` and `nice_to_have`; and `""` for `onsite_only`, `work_permit`, `security_clearance` and `degree_or_equivalent`. `qualifier` carries the CEFR level (`A1`–`C2`, `native`, `unspecified`) of a language, the field of a degree and the level of a clearance, and `""` otherwise. `required` is the fact's `mandatory`, `asserted` or `required` flag. A single-valued code appears at most once (the first is kept, V4); `degree_or_equivalent` sets the degree's `or_equivalent`. `profile_evidence[].section` names a profile section (`summary | target_titles | roles | skills | languages | education | certifications | domains | seniority`); an unknown section fails grounding (V3). The validator normalises this wire form into the internal draft of §11.4's fact table before V1–V6 run; the internal draft, not the wire form, is stored in `score_drafts.output_json` and rendered to the critic and the reviser (§10.6).
 
 **Output limits** (semantic validator, V1). These are the slim-output defaults of the user's cost decision (U14), and the prompt states them:
 
@@ -4343,8 +4352,10 @@ This is a conservative subset: `type`, `enum`, `anyOf`, `$ref`/`$defs`, `require
 | Profile reference `quote` | same rules as an ad quote |
 | `required_languages` | ≤ 6 |
 | `certifications` | ≤ 10 |
-| `remote_region.countries` | ≤ 30 ISO 3166-1 alpha-2 codes |
+| `remote_country` items | ≤ 30 |
 | `min_years_experience` | 0–40 |
+| `criteria` | exactly one item per criterion key; a missing key is a V2 failure on that criterion, a duplicate keeps the first (V4) |
+| single-valued fact codes | at most one item each (the first is kept, V4) |
 
 A limit violation is a V1 *issue* (non-fatal) and sends the draft to the critic (T1). §11.6 defines the explicit repair applied if the issue survives to publication.
 
@@ -4352,28 +4363,29 @@ A limit violation is a V1 *issue* (non-fatal) and sends the draft to the critic 
 
 Validation has **two stages**, so that limits never turn a usable output into a parse failure:
 
-1. **Structural parse** with a Pydantic model that mirrors the JSON schema exactly: types, enums, required keys, no extra keys, and **no** length or count limits. A failure here is the only *fatal* outcome. The step is repeated once (the attempt's single structural repair, §9.4.2); a second failure → `failed_invalid_output` for the generator, or a `contested` publication for the critic. A structurally invalid output is never stored as a draft (`llm_calls.output_json = NULL`, with an error code).
+1. **Structural parse** with a Pydantic model that mirrors the JSON schema exactly: types, enums, required keys, no extra keys, and **no** length or count limits. A failure here is the only *fatal* outcome. The step is repeated once (the attempt's single structural repair, §9.4.2); a second failure → `failed_invalid_output` for the generator, or a `contested` publication for the critic. A structurally invalid output is never stored as a draft (`llm_calls.output_json = NULL`, with an error code). The mirror is the wire schema of §11.5; the normaliser that follows it (the §11.4 fact table from the fact items; the six criteria from the criterion items) turns an out-of-vocabulary `value` or `qualifier` into `unspecified` with a V1 issue, an unparsable or out-of-range `min_years_experience` into `null` (the repair of this section), a duplicate single-valued code or criterion into the first occurrence (V4), and a missing criterion key into `level = null, basis = unknown` with a V2 failure on that criterion. None of these is a structural failure. The normaliser's diagnostics (its issues, failures and repairs) are stored with the draft and merged into V1–V4, so they survive a resume.
 2. **Semantic validation** (V1 limits and V2–V6) over the parsed object. It produces issues and deterministic failures, never exceptions.
 
 | Rule | Check | Failure class |
 |---|---|---|
 | **V1** Limits | The §11.5 limits (and §11.7.3 for the critic). | Issue → T1 |
-| **V2** Level/basis consistency | `unknown ⇔ level = null`. `unconstrained ⇒ level = 4` plus ≥ 1 ad quote. `observed ⇒ level ≠ null` plus an ad quote (plus a profile reference when level ≥ 1). Every asserted fact (`mandatory = true`, `asserted = true`, `required = true`, or a non-`unspecified` value) has ≥ 1 quote. | **Deterministic evidence failure** on that criterion or fact id |
-| **V3** Grounding | Every ad quote must be one **contiguous** substring of the rendered `<job_ad>` text, after `fold` normalisation and whitespace collapsing. A quote containing `…` or `...`, or one with fewer than 4 characters or fewer than 3 letters or digits, fails; quotes are never split into segments. The match records `source_kind` (`description` or `structured_field` with its field name) and, for the description, the span in `job_revisions.description_text`, mapped back through the offset map that `fold` produces. A quote may not include the truncation marker. Every profile quote must be a substring of the canonical serialisation of the named profile section. Critic quotes are checked the same way. | **Deterministic evidence failure** |
+| **V2** Level/basis consistency | `unknown ⇔ level = null`. `unconstrained ⇒ level = 4` plus ≥ 1 ad quote. `observed ⇒ level ≠ null` plus an ad quote (plus a profile reference when level ≥ 1). Every asserted fact (`mandatory = true`, `asserted = true`, `required = true`, or a non-`unspecified` value) has ≥ 1 quote. A fact without a fact id fails on its code (`work_mode`, `remote_region`, `seniority`, `min_years_experience`, `industry`, `employment_types`) or on `must_have:<n>` / `nice_to_have:<n>`. | **Deterministic evidence failure** on that criterion or fact id |
+| **V3** Grounding | Every ad quote must be one **contiguous** substring of the rendered `<job_ad>` text, after `fold` normalisation and whitespace collapsing. A quote containing `…` or `...`, or one with fewer than 4 characters or fewer than 3 letters or digits, fails; quotes are never split into segments. The match records `source_kind` (`description` or `structured_field` with its field name) and, for the description, the span in `job_revisions.description_text`, mapped back through the offset map that `fold` produces. A quote may not include the truncation marker. Every profile quote must be a substring of the canonical serialisation of the named profile section; a profile quote naming an unknown section fails grounding. Critic quotes are checked the same way. | **Deterministic evidence failure** |
 | **V4** Consistency | Listed below. *Repairable* checks are corrected deterministically at validation; *consistency failures* cannot be computed and block acceptance like V2/V3 failures. | Repairable: corrected and recorded, no trigger. Consistency failure → T1, blocks acceptance, null-out at contested |
-| **V5** Injection | Deterministic detector over the ad text, case-insensitive DE/EN. It flags: `ignore (all\|previous\|above) instructions`, `ignoriere (alle\|vorherige)`, `system prompt`, `you are (a\|an) (ai\|language model\|assistant)`, `as an ai`, `score this (job\|ad)`, `rate (this\|me)`, `bewerte (diese\|dieses\|mich)`, `give (this\|me) (100\|10/10\|full marks)`, role tags (`<system>`, `assistant:`, `[INST]`), and runs of more than 5 zero-width characters. A hit, or `injection_observed = true`, sets `injection_suspected`. | Issue → critic (T6), badge |
-| **V6** Not a job ad | `not_a_job_ad = true`. | Critic (T7) with a **mandatory review** of fact id `not_a_job_ad:ad`. Only a `fact_confirmed` review with a grounded quote publishes the result with `not_a_job_ad = true`, every criterion `null`, and `score_* = NULL` ("Not a job ad (verified)"), excluded from default lists. A `fact_rejected` review sends the draft to revision as a real ad; an `uncertain` or missing review never yields the label (§11.10). |
+| **V5** Injection | Deterministic detector over the ad text, case-insensitive DE/EN. It flags: `ignore (all\|previous\|above) instructions`, `ignoriere (alle\|vorherige)`, `system prompt`, `you are (a\|an) (ai\|language model\|assistant)`, `as an ai`, `score this (job\|ad)`, `rate (this\|me)`, `bewerte (diese\|dieses\|mich)`, `give (this\|me) (100\|10/10\|full marks)`, role tags (`<system>`, `assistant:`, `[INST]`), and runs of more than 5 zero-width characters. `you are (a\|an) (ai\|language model\|assistant)` and `as an ai` match only model-directed use (followed by punctuation, the end of the text, or a model or assistant word; never a role noun). A hit, or `injection_observed = true`, sets `injection_suspected`. | Issue → critic (T6), badge |
+| **V6** Not a job ad | `not_a_job_ad = true`. | Critic (T7) with a **mandatory review** of fact id `not_a_job_ad:ad`. Only a `fact_confirmed` review with a grounded quote publishes the result with `not_a_job_ad = true`, every criterion `null`, and `score_* = NULL` ("Not a job ad (verified)"), excluded from default lists. A `fact_rejected` review sends the draft to revision as a real ad; an `uncertain` or missing review never yields the label (§11.10). A `fact_rejected` review of `not_a_job_ad:ad` sends the draft to revision whatever the other reviews say; `not_a_job_ad` is published `true` only when verified, in both publication modes. |
 
-V4 checks. **Repairable** (the value is computable, so it is corrected at validation, recorded in `validation` and in `llm_results.truncated_fields` as a correction, and shown with a "corrected" marker; it triggers no critic call):
-- `experience_seniority.level` differs from the deterministic two-sub-rating value (§11.3): the deterministic value replaces it (Fable round-2 minor);
+V4 checks. **Repairable** (the value is computable, so it is corrected at validation, recorded in `validation` and in `llm_results.truncated_fields` as a correction, and shown with a "corrected" marker; it triggers no critic call). The repairable corrections of V4 are written back into the stored draft; the critic, the reviser, the publication and a resumed attempt read the corrected draft, and the raw output stays on the call row:
+- `experience_seniority.level` differs from the deterministic two-sub-rating value (§11.3): the deterministic value replaces it (Fable round-2 minor); the recomputed rating keeps basis `observed` with the `seniority` and `min_years_experience` facts' quotes as its ad evidence, and becomes `unknown` when both sub-ratings are unknown;
 - the `work_mode` fact contradicts a structured work mode: the structured value replaces the fact;
 - `remote_region.value = other_country` while `countries` contains `DE`, or `germany`/`dach` while `countries` is non-empty and excludes `DE`: the value becomes `unspecified`;
-- two facts with the same fact id: the first is kept.
+- two facts with the same fact id: the first is kept;
+- two items of a single-valued fact code: the first is kept.
 
 **Consistency failures** (not computable; they trigger T1, block acceptance until a revision resolves them, and null the criterion at contested publication, §11.10):
 - `languages.level ≥ 3` while a mandatory language comparison is `unmet`;
 - `languages.level ≤ 1` while every mandatory language comparison is `met`;
-- `skills.level = 4` while a must-have has no matching profile skill (folded token-set similarity < 0.5 against every profile skill);
+- `skills.level = 4` while a must-have has no matching profile skill (folded token-set similarity < 0.5, the overlap coefficient of §11.4, against every profile skill);
 - `languages.basis = unconstrained` while `required_languages` is non-empty;
 - `not_a_job_ad = true` while any criterion level is non-null.
 
@@ -4388,6 +4400,7 @@ V4 checks. **Repairable** (the value is computable, so it is corrected at valida
 | A list over its count limit (`must_haves`, `nice_to_haves`, `required_languages`, `certifications`, `countries`) | Keep the first N items |
 | An invalid ISO code in `countries` | Dropped |
 | `min_years_experience` outside 0–40 | Treated as `null` (unknown) |
+| An out-of-vocabulary `value` or `qualifier` | Treated as `unspecified` (the fact is not asserted) |
 | Critic `explanation` or `summary` over its limit | Cut with `[…]` |
 | Critic reviews over the count limit | Disputes beyond the limit are ignored; required fact reviews are never dropped |
 
@@ -4420,7 +4433,7 @@ The critic reviews **only** the criteria it disputes, plus **exactly one review 
   2. every required fact is `fact_confirmed` or `fact_rejected`, **with at least one grounded ad quote** (V3);
   3. no grounded criterion dispute remains;
   4. `injection ≠ present_influenced`;
-  5. the draft has no unresolved deterministic failure (V2/V3) and no unresolved V4 consistency failure.
+  5. the draft has no unresolved deterministic failure (V2/V3) and no unresolved V4 consistency failure; the failures of a fact that the same review rejects with a grounded quote are not unresolved.
 - **`incomplete`** if condition 1 fails. Missing fact reviews count as `uncertain`. It routes like `revise`.
 - **`revise`** otherwise.
 
@@ -4477,7 +4490,7 @@ The evaluation policy is an immutable, hashed row (`evaluation_policies`, §7.3)
 | `critic_light_triggers` | `{T2, T8}` | When the triggers of a round are a **subset** of this set, the critic runs at the model policy's light effort (`low`); otherwise at its normal effort (`medium`). T0 is never in the set, so every re-review after a revision runs at `medium`. |
 
 - Every attempt records the active policy (`score_attempts.evaluation_policy_id`) and uses it throughout, and every result records it (`llm_results.evaluation_policy_id`).
-- **`projected_critic_rate`** is computed when a policy row is created: the new thresholds are replayed over the stored `provisional` aggregations and triggers of the last 30 days of round-0 drafts (at least 50); without enough history, the §21.2 central estimate is used. It feeds the dry-run, the bulk follow-up allocation (§6.9.3) and the `critic_rate_7d` alert (§17.6).
+- **`projected_critic_rate`** is computed when a policy row is created: the new thresholds are replayed over the stored `provisional` aggregations and triggers of the last 30 days of round-0 drafts (at least 50); without enough history, the §21.2 central estimate is used. The rate is fixed at the row's creation; an identical payload reuses its row. It feeds the dry-run, the bulk follow-up allocation (§6.9.3) and the `critic_rate_7d` alert (§17.6).
 - A policy change affects **new attempts only**. Published results are not re-reviewed (§11.11).
 - Activation passes the eval gate (§11.13), like any change that affects scores.
 
@@ -4518,7 +4531,7 @@ coverage = Σ_{i∈K} w_i / 100
 ```
 
 **Caps and penalties** (`det_results.caps_applied`) are applied to the **endpoints** L and U, in this order, and the midpoint is recomputed afterwards:
-1. soft penalties, deduplicated per code: every binding knockout with severity `soft`, and an industry preference (`excluded` or `outside_include`) derived from a non-structured LLM fact (with a badge): `x := max(0, x − 10)` for `x ∈ {L, U}`;
+1. soft penalties, deduplicated per code: every binding knockout with severity `soft`, and an industry preference (`excluded` or `outside_include`) derived from a non-structured LLM fact (with a badge; `outside_include`: the folded fact is absent from a non-empty `industries_include`; `excluded` takes precedence; an empty include list is no preference): `x := max(0, x − 10)` for `x ∈ {L, U}`;
 2. hard caps: every binding knockout with severity `hard`: `x := min(x, 25)` for `x ∈ {L, U}`;
 3. `M = (L + U) / 2`, rounded to two decimals. **M is always the midpoint of the final interval** (user decision U8).
 
@@ -4541,7 +4554,7 @@ if injection_suspected and critic.injection != "none": base = low
 
 ### 11.9 Revision protocol
 
-1. **Inputs**: the shared prefix (cache hit), reviser role instructions, the `<job_ad>`, `<previous_draft>` (validated JSON), and `<issues>`. The issues are the validator's deterministic failures and issues, plus the critic's grounded disputes (with suggested levels and quotes), `fact_rejected`/`fact_uncertain` and unreviewed required facts, and the injection assessment.
+1. **Inputs**: the shared prefix (cache hit), reviser role instructions, the `<job_ad>`, `<previous_draft>` (the internal draft, validated), and `<issues>`. The issues are the validator's deterministic failures and issues, plus the critic's grounded disputes (with suggested levels and quotes), `fact_rejected`/`fact_uncertain` and unreviewed required facts, and the injection assessment.
 2. **The instruction**: return a complete corrected output within the limits; keep items unaffected by issues unchanged; never raise a level without a grounded quote.
 3. **Every revision is validated** (V1–V6) and then goes back to the critic (T0), at the critic's normal effort.
 4. **At most 2 revisions** per attempt. After the second revision's critic round, anything other than a derived `accept` with zero deterministic failures publishes `contested`.
@@ -4607,17 +4620,17 @@ Semantic limits:
 
 ### 11.13 Calibration and the eval gate
 
-- **Golden set.** In week 1 the user labels about 40–50 published ads (`good / ok / poor` plus an optional comment) in the labelling UI (§15.6). Each case is stored in `golden_cases` **bound to** its job revision (the label revision), the profile version, the **scope version** the label assumed (the active ones at labelling time) and a **frozen snapshot of the job's det-facts** (`det_inputs_snapshot`: salary, locations, work modes, employment types, industry), because those can change without a new material revision. The snapshot keeps each fact's **source provenance** in the `det_results.det_inputs` format, and `det_input_sources` lists every source it draws on, so a source purge finds the case even when its material revision is untainted (§20.5); a second label of the same case updates it (upsert). Later "wrong score" feedback adds cases (`source='feedback'`). Adversarial synthetic cases are part of the test fixtures (`source='adversarial'`), each with its own profile and scope: injection, a partial snippet, language traps (an English ad requiring German, and the reverse), seniority traps (over- and under-qualification) and not-a-job-ad. The user can list and delete cases (§14.2).
-- **Candidate configuration.** An eval run (`eval_runs(kind='golden')`) evaluates a candidate `(rubric, prompt/schema, model policy, evaluation policy, execution config)`. For each active case it forms the case's own tuple (case profile × candidate rubric, prompt and model policy), runs the **case's hard filters under the case's scope**, and, if they pass, scores the revision **on the production route**: conditional critic per the candidate evaluation policy, revisions, contested null-out, and aggregation under the case's scope. Hard filters, knockouts and aggregation use the case's frozen `det_inputs_snapshot`, never the job's current facts, so reruns compare the same inputs against the same label. The T8 sample identity is `sha256(f"golden:{golden_case_id}:{tuple_identity}")`, where `tuple_identity` is the case tuple's hash, so a case is sampled reproducibly across runs of the same candidate. Runs happen outside the target table, their calls carry `golden_case_id`, and they draw on the non-scoring reserve.
+- **Golden set.** In week 1 the user labels about 40–50 published ads (`good / ok / poor` plus an optional comment) in the labelling UI (§15.6). Each case is stored in `golden_cases` **bound to** its job revision (the label revision), the profile version, the **scope version** the label assumed (the active ones at labelling time) and a **frozen snapshot of the job's det-facts** (`det_inputs_snapshot`: salary, locations, work modes, employment types, industry), because those can change without a new material revision. The snapshot keeps each fact's **source provenance** in the `det_results.det_inputs` format, and `det_input_sources` lists every source it draws on, so a source purge finds the case even when its material revision is untainted (§20.5); a second label of the same case updates it (upsert). Later "wrong score" feedback adds cases (`source='feedback'`); a `label` feedback is `week1`, a `wrong_score` feedback is `feedback`. Adversarial synthetic cases are part of the test fixtures (`source='adversarial'`), each with its own profile and scope: injection, a partial snippet, language traps (an English ad requiring German, and the reverse), seniority traps (over- and under-qualification) and not-a-job-ad. Adversarial cases are seeded by `jobhunter golden seed-adversarial` as synthetic jobs and profile versions (`synthetic_eval`); the ten fixtures are the eight bullets of §18.6 with the injection pair as two and both seniority traps. The user can list and delete cases (§14.2).
+- **Candidate configuration.** An eval run (`eval_runs(kind='golden')`) evaluates a candidate `(rubric, prompt/schema, model policy, evaluation policy, execution config)`. For each active case it forms the case's own tuple (case profile × candidate rubric, prompt and model policy), runs the **case's hard filters under the case's scope**, and, if they pass, scores the revision **on the production route**: conditional critic per the candidate evaluation policy, revisions, contested null-out, and aggregation under the case's scope. Hard filters, knockouts and aggregation use the case's frozen `det_inputs_snapshot`, never the job's current facts, so reruns compare the same inputs against the same label. The T8 sample identity is `sha256(f"golden:{golden_case_id}:{tuple_identity}")`, where `tuple_identity` is the SHA-256 of the canonical JSON of (profile_version_id, rubric_version_id, prompt_schema_version_id, model_policy_id), so a case is sampled reproducibly across runs of the same candidate. Runs happen outside the target table, their calls carry `golden_case_id`, and they draw on the non-scoring reserve. An eval run is an operation scored by one execution: its paid calls are owned by the operation's claim as well as the run row, each case's steps live in the execution's memory and its only durable write is its terminal result row; an execution that finds the run already touched (a call row or a result row exists) ends it `failed` with `metrics.failed = 'interrupted'` and succeeds its operation, and so does the failure hook of an operation that ends `failed`: an interrupted run is never resumed, the user starts a new one, at the cost of one run; a requested transport that the worker cannot serve fails the run before any call with the reason in `metrics`; a candidate staged by content hash takes the configuration lock that serialises policy versions and is staged without activation; a run is abandoned when its operation is lost, not after a fixed hour.
 - **Diagnostics.** An optional second run with `route='forced_critic'` reviews every case. It is reported but never gates.
-- **Aggregation.** Metrics are computed pooled over all active cases, and per profile version for every profile with at least 10 cases. Test–retest runs 10 cases twice (`repetitions = 2`).
+- **Aggregation.** Metrics are computed pooled over all active cases, and per profile version for every profile with at least 10 cases. Test–retest runs 10 cases twice (`repetitions = 2`): the first ten active cases in id order that have two numeric scores. The second repetitions are attempted in case-id order after every first repetition, until ten cases have two numeric scores, at most twenty attempts; every gate metric is computed over one observation per active case, its first repetition; the test–retest SD over the paired repetitions; the cost over every result.
 - **Metrics and gates** (judged with `ordinal(good)=2, ok=1, poor=0`, on the production route):
 
   | Metric | Gate |
   |---|---|
   | Schema validity | 100% |
   | Grounding rate of published accepted ratings | 100% |
-  | Spearman ρ(M, label), pooled | ≥ 0.6 |
+  | Spearman ρ(M, label), pooled, with average ranks for ties, over published cases | ≥ 0.6 |
   | Pairwise ordering agreement (good > ok > poor pairs), pooled | ≥ 0.75 |
   | **False exclusions**: a `good` case that is hard-filtered, or gets a binding hard knockout | 0 |
   | Expected-knockout recall | 100% |
@@ -4628,8 +4641,8 @@ Semantic limits:
   | Admission recall: share of `good` cases whose similarity reaches the trailing 7-day similarity-lane cut-off | reported |
   | Mean cost per case vs the §21 estimate | reported |
 
-- **What is gated.** Activating a rubric, prompt/schema, model-policy or evaluation-policy change, and selecting generator effort `low`, **must pass**. Otherwise the user must acknowledge the override, which is stored on the settings version (`eval_override_ack`). Before the golden set reaches 30 cases, the gate is skipped and labelled "uncalibrated". Execution-config changes are not gated.
-- **Canaries.** Two `golden_cases.is_canary` ads are re-scored daily (`canary_daily`) with the active configuration on the production route, under their own profile and scope. If `|ΔM|` exceeds 8 against the first canary score of that configuration, `scoring.canary_drift` (warn) is raised. Cost is about $3/month.
+- **What is gated.** Activating a rubric, prompt/schema, model-policy or evaluation-policy change, and selecting generator effort `low`, **must pass**. Otherwise the user must acknowledge the override, which is stored on the settings version (`eval_override_ack`). Before the golden set reaches 30 cases, the gate is skipped and labelled "uncalibrated". The gate reads the newest completed golden run of the candidate's (rubric, prompt/schema, model policy, evaluation policy); with 30 or more active cases and no such run, the gate is failed; the test–retest gate is measured on every golden run (the first ten active cases in id order that have two numeric scores; fewer than five usable cases is a failed gate, never a waived one). Generator effort `low` follows §10.3. Execution-config changes are not gated.
+- **Canaries.** Two `golden_cases.is_canary` ads are re-scored daily (`canary_daily`) with the active configuration on the production route, under their own profile and scope. If `|ΔM|` exceeds 8 against the first canary score of that configuration (the baseline key is (case, rubric, prompt/schema, model policy, evaluation policy)), `scoring.canary_drift` (warn) is raised. Cost is about $3/month.
 - **Drift alerts**:
   - `scoring.feedback_disagreement` (warn): over 14 days, with at least 10 labels, more than 30% are `poor` on results with `M ≥ τ`, or `good` on results with `M < τ − 20`;
   - `scoring.distribution_shift` (info): the 7-day mean M differs by more than 10 from the previous 28-day mean under the same tuple.
@@ -4673,7 +4686,7 @@ Semantic limits:
 | Street address | German street suffixes (`straße`, `str.`, `weg`, `allee`, `platz`, `gasse`, `ring`, `damm`, `ufer`) followed by a house number; and `\b\d{5}\s+[A-ZÄÖÜ][\wäöüß-]+` (postal code + city) | `[ADDRESS]` |
 | Date / place of birth | Labels `Geburtsdatum`, `geb.`, `geboren`, `Date of birth`, `DOB`, `Geburtsort`, `Place of birth` with the rest of the line | `[PERSONAL]` |
 | Protected attributes | Lines labelled `Familienstand`, `Marital status`, `Staatsangehörigkeit`, `Nationalität`, `Nationality`, `Konfession`, `Religion`, `Geschlecht`, `Gender`, `Kinder`, `Children` | `[PERSONAL]` |
-| Name | The header name: the first non-empty line(s) that look like a person's name (2–4 capitalised tokens, no digits, no role keywords). Every later case-insensitive occurrence of those tokens as a full name is replaced too. | `[NAME]` |
+| Name | The header name: the first non-empty line(s) that look like a person's name (2–4 capitalised tokens, no digits, no role keywords). Each header line is read whole (no fixed-length window), and a run of more than 120 blanks splits a line into cells read as lines. Every later case-insensitive occurrence of those tokens as a full name is replaced too. | `[NAME]` |
 
 **Nothing leaves the machine before the user has reviewed the text.** After stripping, the draft is in **`text_review`**:
 - The review UI shows the stripped text with the replacements highlighted, plus the counts. The user can mark extra spans for removal and restore false positives.
@@ -4824,7 +4837,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `scope.work_modes` | non-empty subset of `{remote, hybrid, onsite}` | all | scope |
 | | `scope.employment_types` | non-empty subset of the 8 types (§11.5) | all | scope |
 | | `scope.seniority_range` | `{mode: profile_relative \| explicit, below: 0–3, above: 0–3, min, max}` | `profile_relative`, ±1 | scope |
-| | `scope.industries_include` / `scope.industries_exclude` | lists of ≤ 30 strings, each 2–60 characters, case-folded | `[]` / `[]` | scope |
+| | `scope.industries_include` / `scope.industries_exclude` | lists of ≤ 30 strings, each 2–60 characters, case-folded. `outside_include`: the folded fact is absent from a non-empty `industries_include`; `excluded` takes precedence; an empty include list is no preference (§11.8) | `[]` / `[]` | scope |
 | | `scope.accepted_ad_languages` | non-empty subset of `{de, en, other}` | `{de, en}` | scope |
 | | `scope.language_policy_default` | `hard \| soft` | `hard` | scope |
 | | `scope.language_policy` | map `lang → hard \| soft` | `{}` | scope |
@@ -4865,6 +4878,8 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | Retention | `retention.score_history_months` | int, 1–36 | `12` | none |
 | Notifications | `notifications.push_min_severity` | `warn \| critical` | `warn` | none |
 
+The hard filters, the knockouts, the deterministic criteria and `det_inputs` read one view of the scope that carries `industries_include`, `language_policy`, `language_policy_default`, `min_salary_eur_year` and `knockout_severity`.
+
 **Cross-field validation**:
 - at least one scope location, or `remote_within_germany = true`;
 - `industries_include ∩ industries_exclude = ∅`;
@@ -4879,7 +4894,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 - **Optimistic concurrency**: the request carries `base_version_id`, which must equal the active version, otherwise the save fails with 409.
 - The request must list `acknowledged_warnings` covering every warning code returned by the dry-run for the same payload. The server re-runs the dry-run inside the save and compares.
 - A run uses the settings version it started with (`runs.settings_version_id`). Edits never leak into a running run.
-- **Derived rows are immutable and deduplicated by a hash of their complete payload**: `scope_versions` by `scope_hash`, `model_policies` by `policy_hash`, `execution_configs` by `config_hash`, and `evaluation_policies` by `policy_hash`. A payload is never mutated in place: an edit that changes any field produces a new row. Reverting reuses the earlier row, and for a scope its current `det_results` if they still exist.
+- **Derived rows are immutable and deduplicated by a hash of their complete payload**: `scope_versions` by `scope_hash`, `model_policies` by `policy_hash`, `execution_configs` by `config_hash`, and `evaluation_policies` by `policy_hash`. A payload is never mutated in place: an edit that changes any field produces a new row. Reverting reuses the earlier row, and for a scope its current `det_results` if they still exist. A model-policy save finds or inserts the proposed policy row by hash inside the save's transaction, then checks schema verification per (schema, model) pair (§10.11), so an effort-only change whose models are verified needs no new dry-run.
 
 ### 13.3 Activation semantics (effect classes)
 
@@ -4890,7 +4905,7 @@ Every class below is consistent with immutable, versioned storage: activation on
 | `none` | `active_config.settings_version_id` flips. |
 | `schedule` | Flip. `schedule_state` is reset (§3.4). The dead-man period is updated (§17.7). |
 | `collection` | Flip. `source_instances` and `coverage_cells` are upserted for the watchlist and queries (new cells start never-covered). Takes effect at the next run plan. |
-| `admission` | Flip. Takes effect at the next score cycle. Changes to `max_ad_age_days` trigger an immediate expiry sweep in both directions. |
+| `admission` | Flip. Takes effect at the next score cycle. Changes to `max_ad_age_days` trigger an immediate expiry sweep in both directions; the immediate sweep runs in the save transaction. |
 | `budget` | Flip. The new cap is written to the current `llm_budget` row under its lock (§6.9.1). A raised cap lets `budget_deferred` targets return through the headroom rule (§6.9.4). |
 | `execution` | Flip `execution_config_id`. The next **new** score attempt (and every non-score call) uses it; running and resumed attempts keep the config they pinned (§10.3). No re-score, no eval gate. |
 | `evaluation_policy` | New `evaluation_policies` row (with its `projected_critic_rate`), eval gate (§11.13), then flip `evaluation_policy_id`. New attempts use it; **published results are not re-reviewed**. |
@@ -4976,7 +4991,8 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | POST | `/api/jobs/{job_id}/score-now` | Score now | `{force?: bool}` → 202 `{target_id, state}`. 409 `budget_exhausted`, 409 `filtered_requires_force`. |
 | POST | `/api/jobs/{job_id}/feedback` | Label or "wrong score" | `{kind: label \| wrong_score, label: good \| ok \| poor, comment?}` → 201. Creates `score_feedback` (with the score snapshot) and, when a profile is active, upserts the `golden_cases` row for (revision, profile) with the active scope. |
 | GET | `/api/golden-cases` | Golden set | keyset paged → `[{id, job_id, label, comment, profile_version, scope_version, source, active}]` |
-| DELETE | `/api/golden-cases/{id}` | Delete a golden case | → 204. Writes a `golden_case_delete` manifest; the job's inputs lose their retention exemption (§20.1). |
+| PATCH | `/api/golden-cases/{id}` | Activate, deactivate or mark a canary | `{active?, is_canary?}` → 200 |
+| DELETE | `/api/golden-cases/{id}` | Delete a golden case | → 204. Writes a `golden_case_delete` manifest (the manifest from M5); the job's inputs lose their retention exemption (§20.1). |
 | DELETE | `/api/feedback/{id}` | Delete a label or feedback | → 204 |
 | POST | `/api/jobs/{job_id}/unmerge` | Reverse a merge | `{merge_event_id}` → 202 |
 | POST | `/api/duplicate-groups/{group_id}/split` | Split a member out | `{job_id}` → 200 `Group` |
@@ -5002,6 +5018,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | POST | `/api/settings` | Save a new version | `{payload, base_version_id, acknowledged_warnings[]}` → 201 `{version}`. 409 stale base, 422 validation. |
 | GET | `/api/settings/versions` | Version list | keyset paged |
 | GET | `/api/settings/versions/{id}` | A version and its diff vs the previous one | → `{payload, diff}` |
+| GET | `/api/settings/{rubric,prompt-schema}-versions` | Shipped rubric and prompt/schema versions | → the versions with their ids, so the version to activate is discoverable |
 | POST | `/api/settings/rubric-versions/{id}/activate` | Activate a shipped rubric version | `{expected_rescore_ack, eval_override_ack?}` → 201 `{version}` (an `llm_tuple` change, §13.3); 409 `eval_gate_failed` without the override |
 | POST | `/api/settings/prompt-schema-versions/{id}/activate` | Activate a shipped prompt/schema version | as above; also requires a passing schema dry-run (§10.11) |
 | POST | `/api/settings/scope/retry-apply` | Retry a failed scope application | → 202 `{operation_id}`: a new `apply_scope` operation for the active settings version's scope (§13.4 step 5); 409 if one is live |
@@ -5025,7 +5042,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | POST | `/api/identity-conflicts/{id}/resolve` | Resolve a conflict | `{decision: separate \| merge}` → 202 |
 | POST | `/api/ats-snapshots/{id}/acknowledge` | Confirm a mass disappearance | → 200; the absent postings close (§8.11) |
 | POST | `/api/batches/{id}/release` | Release and re-score quarantined targets | `{confirm: true}` → 202. The submission becomes `released`; its reserved amount stays counted as `ambiguous` unless the batch is found later (§10.10). The response states that amount. |
-| POST | `/api/system/score-cycle` | Start a cycle manually | → 202 |
+| POST | `/api/system/score-cycle` | Start a cycle manually | → 202 `{queued, reason}`: the API requests a cycle; the worker creates it |
 | GET | `/api/alerts` | Alerts | `?status=open\|acknowledged\|resolved` keyset paged |
 | POST | `/api/alerts/{id}/ack` | Acknowledge | → 200 |
 | POST | `/api/privacy/export` | Start an export | → 202 `{export_id}` |
@@ -5470,7 +5487,7 @@ Broad `except Exception` is allowed **only** at task boundaries, where it maps t
 | I2 | Every `fetch_request` of the run is terminal (`succeeded`, `failed`, `ambiguous` or `skipped`). | `failed_invariant` |
 | I3 | **Spend ≤ allowance**: for each quota provider, counted units in every window touched by the run ≤ `limit_units`, and the run's normal-class units ≤ the effective per-run cap (§6.4). | `failed_invariant` + `quota.limit_breach` (critical) |
 | I4 | Every `linked` raw item has an observation whose posting has a job. | `failed_invariant` |
-| I5 | Every current revision created or changed in this run has a target for the active tuple, or the active tuple is NULL. | `failed_invariant` |
+| I5 | Every current revision created or changed in this run has a target for the run's tuple, or the run's tuple is NULL or no longer active (then I5 passes and records why). | `failed_invariant` |
 | I6 | Every revision created in this run is `embedded`, or `awaiting_embedding` (counted). | `partial` if any remain awaiting |
 | I7 | The outcome reducer saw no conflicts. | `failed_invariant` |
 
@@ -5501,11 +5518,11 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `stale_runs` | tick | `running` with `heartbeat_at` older than 3 min | New attempt (run row `FOR UPDATE`, `attempt_no+1`, new thread, locked task), or `failed('resume_exhausted')` + critical alert when `resume_count > 3` |
 | `orphaned_cycles` | tick | A `running` score cycle with `heartbeat_at` older than 3 min | `failed('orphaned')`, close its report, reclaim its claims; `score_cycle.orphaned` (warn) |
 | `operations` | tick | A `pending` operation without a live procrastinate job for 2 min; a `running` one with `heartbeat_at` older than 3 min | Re-defer; set the stale one back to `pending` with `claim_id := NULL` in one statement (attempts + 1), which invalidates the old execution (§3.3.3) |
-| `stuck_targets` | tick | `in_progress` with `claim_heartbeat_at` older than 3 min (`in_batch` exempt) | Reclaim → `pending` / `failed_attempts_exhausted`; log; `scoring.stuck_target_repaired` aggregated hourly |
+| `stuck_targets` | tick | `in_progress` with `claim_heartbeat_at` older than 3 min, whose attempt is still `running` (`in_batch` exempt) | Reclaim → `pending` / `failed_attempts_exhausted`; log; `scoring.stuck_target_repaired` aggregated hourly |
 | `ledger_unsettled` | tick | Quota or spend entries `reserved` older than 15 min whose owner predicate no longer holds (owner row locked `FOR UPDATE` first); `dispatched` online entries older than 15 min | `not_billed(never_dispatched)` / `ambiguous`, with the `llm_budget` counters updated in the same transaction |
 | `budget_release` | tick | Scoring headroom ≥ `k × r_first` (§6.9.4): after settlements, a raised cap or a new month | The `k` oldest `budget_deferred → pending` |
-| `budget_counters` | every 10 min | `llm_budget` counters differ from the ledger sums | Correct under the month-row lock; `llm.budget_counter_drift` (critical) |
-| `bulk_operations` | every 10 min | An active bulk operation with no `pending`, `in_progress` or `in_batch` target | `completed` |
+| `budget_counters` | every 10 min | `llm_budget` counters differ from the ledger sums, and each active bulk operation's `spent_usd` against its ledger entries | Correct under the month-row lock; `llm.budget_counter_drift` (critical) |
+| `bulk_operations` | every 10 min | An active bulk operation whose `create_targets_for_tuple` operation has ended, with no `pending`, `in_progress` or `in_batch` target; an active one with funded `pending` targets and nothing in flight or queued (not during a live target creation) | `completed`; re-request `batch_submit` (§10.10) |
 | `missing_targets` | every 10 min | A current revision of a retained, unfenced job lacks an active-tuple target | Create (idempotent, job row `FOR SHARE` and fence check, §20.2), log the count |
 | `group_representatives` | every 10 min | §7.17 invariant 4 is violated | Re-elect; log; metric |
 | `det_completeness` | every 10 min | An active-tuple published result lacks a **current** det_result for the active (or pending) scope, or its `det_inputs_hash` or `det_algorithm_version` is stale | Insert a new current instance |
@@ -5515,8 +5532,8 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `stale_sweep` | tick (≤ 1,000 rows) + daily | Aggregator TTL | `active → stale` ("not re-confirmed"; targets are not expired by it) |
 | `manifest_shipping` | every 5 min | `completed` manifests named by a `manifest_shipment_items` row with an equal file hash; manifests `completed` for more than 1 h without one | Mark exactly those `shipped`; raise `privacy.manifest_unshipped` (critical) for the others |
 | `ats_mass_events` | after every ATS snapshot | An unconfirmed mass disappearance with two later **structurally complete** snapshots (`complete` or `mass_disappearance`) ≥ 24 h apart | Confirm and close (§8.11) |
-| `batch_poll` | every 5 min | `submitted` or `ended` submissions | Poll and process (§10.10) |
-| `ambiguous_batches` | every 15 min | `submit_ambiguous`, and `released` younger than 29 days | The §10.10 reconciliation (a released submission is reconciled outside the `batch_one_in_flight` singleton); alert at 25 h; never settles by timeout or from an empty listing (chair decision C3) |
+| `batch_poll` | every 5 min (a periodic task on `aux`) | `submitted` or `ended` submissions | Poll and process (§10.10) |
+| `ambiguous_batches` | every 15 min (a periodic task on `aux`) | `submit_ambiguous`, and `released` younger than 29 days | The §10.10 reconciliation (a released submission is reconciled outside the `batch_one_in_flight` singleton); alert at 25 h; never settles by timeout or from an empty listing (chair decision C3) |
 | `purge_fences` | every 10 min | An active purge fence whose purge operation is `failed` or has not progressed for 1 h; an `executing` manifest without a live `purge` operation | Keep the fence (fenced work stays blocked); raise `privacy.purge_failed` (critical); re-queue the missing operation, which resumes from the stored affected set (§19.5) |
 | `deadman_sync` | daily + on schedule changes | The healthchecks check's timeout/grace ≠ expected | Update via the Management API |
 | `retention_daily` | daily 03:17 UTC | §20.1 | Purges and tombstones |
@@ -5536,7 +5553,7 @@ The UI renders the report under System → Runs. It contains no ad text.
   - `jobhunter_quota_used_units{provider}`, `jobhunter_quota_remaining_units{provider}`;
   - `jobhunter_llm_calls_total{model,effort,purpose,outcome}`, `jobhunter_llm_spend_usd{state}`, `jobhunter_llm_cache_read_ratio{model,effort,role}`;
   - `jobhunter_llm_bucket_usd`, `jobhunter_llm_headroom_usd`, `jobhunter_critic_rate_7d`, `jobhunter_critic_verdict_mismatch_total`, `jobhunter_llm_reservation_ratio` (settled ÷ reserved, per purpose);
-  - `jobhunter_score_targets{state}`, `jobhunter_oldest_pending_target_age_seconds`, `jobhunter_claim_reclaims_total`;
+  - `jobhunter_score_targets{state}`, `jobhunter_oldest_pending_target_age_seconds`, `jobhunter_claim_reclaims_total` (every reclaim: takeover sweep, orphaned cycles, cycle failure, stuck targets);
   - `jobhunter_embed_seconds`, `jobhunter_dedup_group_repairs_total`;
   - `jobhunter_table_bytes{table}` (including `procrastinate_jobs`);
   - `jobhunter_alerts_open{severity}`, `jobhunter_backup_age_seconds`;
@@ -5587,13 +5604,15 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `llm.cap_reached` | critical | A scoring reservation was denied by the cap; scoring paused. The text names any amount held by a quarantined batch. | headroom returns |
 | `llm.budget_counter_drift` | critical | `llm_budget` counters differ from the ledger (§6.9.1) | after correction |
 | `llm.reservation_bound_violated` | critical | A settled cost exceeded its reservation (§10.7); the score lane is paused | manual acknowledgement |
-| `llm.auth_failed` | critical | 401/403 from Anthropic; score lane paused | successful call |
+| `llm.auth_failed` | critical | 401/403 from Anthropic; score lane paused | successful call, or manual acknowledgement |
 | `llm.model_mismatch` | critical | `model_served ≠ model_requested` | manual |
 | `llm.cache_miss_streak` | warn | §10.8 | a cache read |
 | `llm.refusal_rate` | warn | > 5% refusals over 24 h with n ≥ 20 | rate below threshold |
-| `scoring.stuck_target_repaired` | warn | Reclaims happened in the last hour | hour without reclaims |
+| `scoring.stuck_target_repaired` | warn | Reclaims happened in the last hour (the subject is the hour) | hour without reclaims |
+| `scoring.publication_invalid` | critical | The publication object failed the strict model; the target is `failed_invalid_output('publication_invalid')` | manual |
 | `scoring.critic_rate_high` | warn | `critic_rate_7d` (first-round critic calls ÷ attempts, n ≥ 50) exceeds 1.5 × the evaluation policy's `projected_critic_rate` | below threshold |
 | `score_cycle.orphaned` | warn | A cycle was failed as orphaned | next completed cycle |
+| `score_cycle.failed` | critical | A cycle failed with an unclassified error (`failed('bug')`) | next completed cycle |
 | `operation.failed` | warn | A durable operation failed permanently | manual |
 | `scoring.canary_drift` | warn | §11.13 | next canary within bounds |
 | `scoring.feedback_disagreement` | warn | §11.13 | below threshold |
@@ -5602,6 +5621,9 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `admission.high_sim_expired` | warn | §9.6.5 | 24 h without recurrence |
 | `admission.backlog_drain` | info | §9.6.5 | below threshold |
 | `batch.submit_ambiguous_unresolved` | critical | 25 h without a matching batch; the text states the reserved amount and offers the release | found or released |
+| `batch.results_unreadable` | critical | A result stream unreadable for 12 consecutive passes, or not read whole by `submit_started_at + 29 days`; the remaining items take the missing-item path (§10.10) | manual |
+| `batch.item_unprocessable` | critical | One item's decision failed in 12 consecutive passes; it is given up as missing (§10.10) | manual |
+| `batch.retrieve_failing` | critical | `retrieve` still failing past `expires_at + 1 h` (§10.10) | the submission moves to `ended` |
 | `scope.apply_failed` | critical | An `apply_scope` operation failed permanently; the old scope stays active (§13.4) | a later successful apply |
 | `batch.custom_id_anomaly` | critical | Partial `custom_id` intersection | manual |
 | `batch.items_missing` | critical | A result is missing for an item | manual |
@@ -5815,7 +5837,7 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
 
 ### 18.6 LLM evaluation
 
-- The golden-set eval (§11.13) runs via the manual workflow `eval-manual.yml` (secrets required). It is required before merging prompt, rubric or LLM-library changes, and before activating a model policy.
+- The manual workflow `eval-manual.yml` runs the adversarial cases on a throwaway database as a smoke of the pipeline (its gate state is `uncalibrated` by construction); the golden-set evaluation that gates an activation runs on the installation through `jobhunter eval run --live` (§19.8). It is required before merging prompt, rubric or LLM-library changes, and before activating a model policy.
 - Metrics are those of §11.13. Results are stored in `eval_runs`, and a markdown report is attached to the PR.
 - Adversarial cases:
   - prompt injection in DE and EN;
@@ -6301,7 +6323,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Contact-stripped profile JSON | `profile_versions.profile_json` | While retained scores, retained feedback (`score_feedback.profile_version_id`) or active golden cases reference it. The row itself is deleted only by delete-everything; purging nulls its content | Profile purge (§20.2) |
 | Query proposals (`items`, and the `output_json` of their `propose_queries` calls) | `query_proposals`, `llm_calls` | With the profile content; the proposal becomes `purged` | Profile purge |
 | Profile vectors | `profile_vectors` + `embeddings` | With the profile content | Profile purge |
-| Score history (targets, attempts, drafts, critic notes, llm_results, evidence, det instances, llm_calls) | DB | `retention.score_history_months` (default 12) after the target ended terminally, **except**: targets of the active tuple and everything they reference are never deleted by age (deleting one would make `missing_targets` re-create and re-score it); results referenced by an active golden case are kept | Target-set deletion (§20.2) |
+| Score history (targets, attempts, drafts, critic notes, llm_results, evidence, det instances, llm_calls) | DB | `retention.score_history_months` (default 12) after the target ended terminally, **except**: targets of the active tuple and everything they reference are never deleted by age (deleting one would make `missing_targets` re-create and re-score it); results referenced by an active golden case are kept; a target whose batch item belongs to a submission not yet resolved (`preparing`, `submit_started`, `submit_ambiguous`, `submitted`, `ended`, or `released` with `submit_started_at` younger than 29 days, the reconciler's clock) is kept with its items and calls until the submission is resolved; no age releases a submission (C3) | Target-set deletion (§20.2) |
 | Superseded `det_results` instances | DB | With score history; the current instance follows its result | Same |
 | Feedback | `score_feedback` | Until the user deletes it, or delete-everything. Its references are detached (`SET NULL`) when the result or job is removed; the score snapshot stays | User action |
 | Golden cases | `golden_cases`, `eval_case_results`, their eval calls | Until the user deletes them (§14.2). While a case is active, **its job revision, the job and its profile version are exempt** from tombstoning and purges (the Adzuna purge excepted, §20.5). Tombstoning and the profile purge delete **inactive** cases they would otherwise orphan (§20.2) | User action (manifest) |
@@ -6310,6 +6332,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | `raw_items` | DB | 90 days; observations keep their provenance copy (`raw_item_id := NULL`) | `retention_daily` |
 | `raw_responses` rows (metadata, body already nulled) | DB | With their fetch request (13 months) | Cascade |
 | Runs, run attempts, fetch requests, score cycles, coverage intervals, operations, bulk operations | DB (metadata, no content) | 13 months (operations: 30 days after they finish) | `retention_daily` |
+| Batch submissions (metadata, no content) | DB | 13 months after they ended (`reconciled`, `submit_rejected`, `abandoned`, or `released` with `submit_started_at` older than 29 days), once their items went with their targets; their bulk operation after them | `retention_daily` |
 | ATS snapshots | DB | 30 days, except the latest complete one and unacknowledged mass-disappearance snapshots | `retention_daily` |
 | Quota ledger, LLM spend ledger, `llm_budget`, `quota_windows` | DB (no content) | Indefinitely, so a restart can never exceed a window or the cap | — |
 | `llm_tuples`, `execution_configs`, `evaluation_policies`, `model_policies` | DB (ids and settings, no personal content) | Indefinitely | — |
@@ -6317,7 +6340,7 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Closed or stale jobs (not saved or applied, not referenced by an active golden case) | DB | 90 days after `jobs.availability_changed_at`, then **tombstoned**: hashed keys and user-action timestamps kept, content deleted | `retention_daily` + manifest |
 | Saved or applied jobs | DB | Until the user clears saved/applied, or deletes everything | User action |
 | Embeddings | `embeddings` | While a revision or profile vector references them | `retention_daily` (unreferenced rows) |
-| LangGraph checkpoints | DB | 14 days after the run or cycle ends | `retention_daily` (deletes threads) |
+| LangGraph checkpoints | DB | 14 days after the run or cycle ends; a cycle's row goes only after its checkpoint thread | `retention_daily` (deletes threads) |
 | procrastinate finished jobs | DB | 7 days | daily cleanup |
 | Idempotency records | `api_idempotency` | 7 days | daily |
 | Logs | Docker local driver | about 14 days (rotation) | Rotation |
@@ -6329,6 +6352,8 @@ Retention is **dependency-aware**: a row is removed only after everything that r
 | Backup sets, backup runs | DB | 13 months | daily |
 | Deletion manifests, shipments, purge fences | DB + `manifests` volume + offsite | Indefinitely (ids and hashes only) | — |
 | LangSmith traces | LangSmith EU | Per the LangSmith project retention setting (no I/O content) | LangSmith console |
+
+(M3 implements the score-history, cycle, bulk-operation, batch-submission and cycle-thread rules; the purges that use target-set deletion and the tombstone rule with its golden-case exemption are M5's.)
 
 ### 20.2 Deletion graph
 
@@ -6536,6 +6561,8 @@ German text runs at about 4 characters per token, and an average ad is about 1,6
 | extract_profile | ≈ 5,000 | — | ≈ 6,000 |
 | propose_queries | ≈ 3,500 | — | ≈ 4,000 |
 
+The structured-output framing (V19: about 1,320 tokens for the v1 generator schema, re-measured for v2) is counted in `input_tokens`; where it sits relative to the cache breakpoint is measured by V14.
+
 **What slimming yields.** The generator JSON (facts with quotes, six criteria with ad and profile quotes, rationales, two summaries) is about 1,200–1,800 tokens at the revision-1 limits, plus 500–1,500 thinking tokens at `medium`, which gives the realistic 2,500 central. The U14 limits (two summaries of ≤ 60 words, rationales of ≤ 25 words, ≤ 2 quotes per criterion and per fact) remove about 800 output tokens: ≈ 190 from the summaries, ≈ 270 from the rationales and ≈ 340 from quotes and profile references. Central generator output is therefore **1,700**. The critic, which now reviews only disputed criteria and the required facts, drops from 2,000 to 1,300 output tokens at `medium`.
 
 **Funnel per target** under the default evaluation policy (U14):
@@ -6621,9 +6648,9 @@ In a month with an eval run, non-scoring spend (≈ $6.80) exceeds the reserve b
 | All online | $0.0526 | ≈ $52.65 |
 | Generator in Batches at 50% prices, **cold cache** (the batch params keep the prefix cache marker, so the prefix is written, not read: `2,200 × $1 + 4,500 × $1.25 + 1,700 × $5`), plus online follow-ups (critic $0.0249, revise $0.0052) | $0.0163 + $0.0301 = $0.0464; with the 1% repair allowance $0.0467 | ≈ $46.45; ≈ $46.67 with repairs |
 
-**Sizing under the hard cap.** A batch item's worst-case reservation uses the byte bound of §10.7. The assumed component sizes are: rubric 9.0 KB, profile 9.5 KB, role 1.3 KB, ad block 8.0 KB (German, with umlauts counted as two bytes), output schema 8.0 KB, plus the 1,000-token overhead floor. That is an input bound of about 36,800 tokens. At the batch cache-write price ($1.25/MTok) plus 6,000 output tokens at the batch output price ($5/MTok), the reservation is **$0.0760**. Each item also holds its expected follow-up allocation (0.45 × $0.0669 = $0.0301, §6.9.3), so about **$0.1061** per item is held until the batch settles. With the default 40% batch allocation:
-- **At the start of a month** the allocation is 40% × $93.10 = $37.24, so a first batch of about 350 ads fits. Once it settles at about $0.0464 per ad, about $20.98 remains, which fits 197 items. That is below the 200-item minimum, so no second batch is submitted.
-- **With $38.20 already counted** (about $37.00 of it scoring), the allocation is 40% × ($93.10 − $37.00) ≈ $22.44, so one batch of about 211 ads fits. About $12.64 remains, below the minimum.
+**Sizing under the hard cap.** A batch item's worst-case reservation uses the byte bound of §10.7. The assumed component sizes are: rubric 9.0 KB, profile 9.5 KB, role 1.3 KB, ad block 8.0 KB (German, with umlauts counted as two bytes), output schema 1,713 B (prompt-schema version 2, candidate C), plus the measured overhead of 1,878 tokens (§6.9.1). That is an input bound of about 31,400 tokens. At the batch cache-write price ($1.25/MTok) plus 6,000 output tokens at the batch output price ($5/MTok), the reservation is **$0.0692**. Each item also holds its expected follow-up allocation (0.45 × $0.0669 = $0.0301, §6.9.3), so about **$0.0994** per item is held until the batch settles. With the default 40% batch allocation:
+- **At the start of a month** the allocation is 40% × $93.10 = $37.24, so a first batch of about 374 ads fits. Once it settles at about $0.0464 per ad, about $19.87 remains, which fits 199 items. That is below the 200-item minimum, so no second batch is submitted.
+- **With $38.20 already counted** (about $37.00 of it scoring), the allocation is 40% × ($93.10 − $37.00) ≈ $22.44, so one batch of about 225 ads fits. About $11.99 remains, below the minimum.
 
 The remaining ads of a bulk re-score are scored online at the monthly pace. The confirmation dialog states both numbers before anything is spent (§15.7).
 
@@ -6653,15 +6680,16 @@ Each spike produces a short recorded result in `docs/spikes/` and, where relevan
 | V1 | procrastinate can defer a job inside the caller's SQLAlchemy/psycopg transaction | Integration test: defer within a transaction, then roll back or commit | Rollback leaves 0 jobs; commit leaves exactly 1. Either way correctness rests on the durable `operations` and `runs` rows (§3.3.2); the test asserts that the reconcilers re-defer a lost job within 2 min. |
 | V2 | procrastinate 3.10's stalled-job detection and release API | Kill the worker mid-job | After restart the job is detected and released within 60 s, and the run resumes as a new attempt |
 | V3 | SerpApi `hl=en` yields `detected_extensions` **and** the same `htidocid` as `hl=de`/JSearch | 1 recorded `hl=en` call (1 unit) for a query with known JSearch overlap | ≥ 3 overlapping ads with identical `htidocid`. If not, `SERPAPI_HL=de` stays, and the bilingual parsers are already required. |
-| V4 | The JSON-schema subset (enum, anyOf null, `$ref`/`$defs`, nested objects) is accepted and not stripped, for every schema × model | `schema-dry-run --live` (< $0.10) | All 200, valid outputs, enums respected. The informational `minimum` probe result is recorded. |
-| V5 | Stream idle and timeout values; ChatAnthropic accepts `anthropic.Timeout` (httpx2) | A local stalled-SSE test server, plus 20 real streamed generator and critic calls at medium | Idle read timeout fires at 120 s ± 5. p99 call duration < 300 s, so the 600 s deadline gives 2× margin. SSE pings arrive at < 30 s intervals during thinking. If ChatAnthropic rejects the object, the subclass fallback (G3) passes the same tests. |
+| V4 | The JSON-schema subset (enum, anyOf null, `$ref`/`$defs`, nested objects) is accepted and not stripped, for every schema × model | `schema-dry-run --live` (< $0.10; a live run per shipped prompt-schema version) | All 200, valid outputs, enums respected. The informational `minimum` probe result is recorded. |
+| V4b | Which candidate generator wire schema compiles | 3 probe messages on Sonnet, effort `low`, `max_tokens` 1,024 (about $0.02) | A and B rejected, C accepted (`docs/spikes/V4b-generator-v2.md`) |
+| V5 | Stream idle and timeout values; ChatAnthropic accepts `anthropic.Timeout` (httpx2) | A local stalled-SSE test server, plus 20 real streamed generator and critic calls at medium (10 generator + 10 critic calls, in identical-prefix pairs; V14 folded in) | Idle read timeout fires at 120 s ± 5. p99 call duration < 300 s, so the 600 s deadline gives 2× margin. SSE pings arrive at < 30 s intervals during thinking. If ChatAnthropic rejects the object, the subclass fallback (G3) passes the same tests. |
 | V6 | The PostgresSaver contract: dedicated autocommit pool; `setup()` on an autocommit connection; per-attempt threads; thread deletion for retention | Integration tests | Resume within an attempt re-runs only the unfinished node. Deleting old threads leaves others intact. `setup()` is idempotent. |
 | V7 | The arctic-embed-l-v2.0 int8 ONNX export and throughput in the container on the target VPS CPU | Run `embedder` on the provisioned VPS | ≥ 1.5 docs/s at 1,024 tokens, RSS ≤ 3 GB, cosine parity with fp32 ≥ 0.99 on 50 ads, query-prefix handling verified. Otherwise use the fp16 export. |
 | V8 | The Arbeitnow rate-limit window (`x-ratelimit-limit: 50`) | ≤ 6 requests spread over 2 h, recording `x-ratelimit-remaining` | The window length is determined. The page cap formula keeps a 7-day catch-up within the limit, or the cap is lowered. |
 | V9 | JSearch page and date semantics: 1 credit per page; `date_posted` buckets filter correctly; cursor reusability across hours; per-second limit | ≤ 6 paid calls | Recorded fixtures prove each point. `cursor_reuse_ttl` is set from the observation (0 if not reusable). |
 | V10 | `htidocid` stability across days | The same JSearch query on 2 days (2 units, combinable with V9) | The overlapping ads have identical `job_uid` |
 | V11 | LangGraph `TimeoutPolicy` cancels an in-flight streaming gateway call and the gateway settles `ambiguous` | Unit and integration test with a fake slow stream | Cancellation happens within 1 s of the deadline; the ledger is `ambiguous`; no leaked tasks |
-| V12 | Batches: `custom_id` pattern; result `usage` present; errored and expired items unbilled; the list API fields (`created_at`, `request_counts`) that the §10.10 matching rule uses; cache behaviour in batches | A 3-item Haiku batch (< $0.01), then a workspace listing | Results are processed by the real code path, and the fields needed by the §10.10 reconciliation exist. The listing is used only to **find** a batch; an empty listing is never treated as proof of absence (chair decision C3), so no visibility-lag constant is measured or used |
+| V12 | Batches: `custom_id` pattern; result `usage` present; errored and expired items unbilled; the list API fields (`created_at`, `request_counts`) that the §10.10 matching rule uses; cache behaviour in batches | A 3-item Haiku batch (< $0.01), then a workspace listing (expired items cannot be produced on demand; the decision path is tested on the fake) | Results are processed by the real code path, and the fields needed by the §10.10 reconciliation exist. The listing is used only to **find** a batch; an empty listing is never treated as proof of absence (chair decision C3), so no visibility-lag constant is measured or used |
 | V13 | `with_structured_output(method="json_schema", include_raw=True)` with `streaming=True` exposes `stop_reason`, `stop_details`, the served `model` and the cache usage fields | 2 calls (Sonnet, Opus) with payload capture | The fields are present in `raw.response_metadata` / `usage_metadata`. The request carries `output_config.format` and `effort`, and no `tool_choice`. |
 | V14 | Prompt cache hits per (model, effort) with the §10.6 layout | 2 identical-prefix calls per model | The second call has `cache_read_input_tokens ≥ 4,000` |
 | V15 | healthchecks Management API timeout/grace update, and ntfy publish with a token | Calls against the user's accounts at deployment | The check shows the updated timeout and grace; an ntfy test notification arrives |

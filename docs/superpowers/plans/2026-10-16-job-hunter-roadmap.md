@@ -4,7 +4,7 @@
 
 **Goal:** build the approved Job Hunter platform in six milestones. Each milestone ships working, tested software.
 
-**Spec:** [`docs/superpowers/specs/2026-10-16-job-hunter-design.md`](../specs/2026-10-16-job-hunter-design.md) (revision 3.3, approved). Council record: [`docs/council/`](../../council/).
+**Spec:** [`docs/superpowers/specs/2026-10-16-job-hunter-design.md`](../specs/2026-10-16-job-hunter-design.md) (revision 3.5, approved). Council record: [`docs/council/`](../../council/).
 
 ## Why milestones
 
@@ -41,7 +41,7 @@ Spikes run only with the user's keys and only inside the limits in §22:
 - JSearch: ≤ 8 requests in total (V9 + V10).
 - SerpApi: 1 search (V3).
 - Adzuna: ≤ 5 requests (V18).
-- Anthropic: < $1 in total (V4, V5, V12, V13, V14, V19).
+- Anthropic spikes: $10.00 of actual spend in total, enforced by the recorder (V4, V4b, V5, V12, V13, V14, V19).
 
 Each spike records its result in `docs/spikes/V<n>.md`.
 
