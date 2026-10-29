@@ -51,12 +51,22 @@ def _candidates() -> ModuleType:
     return module
 
 
+# Revision 3.4's status text after its "**Approved** — revision 3.4. " head: the 3.3 and 3.4 entries.
+EARLIER_REVISIONS = (
+    "Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and"
+    " Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4)."
+    " Revision 3.4 (2026-10-21, the user's decision after spike V19): the default"
+    " `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured"
+    " prompt overhead (§6.9.1)."
+)
+
+
 def test_the_status_line_names_revision_3_5_and_keeps_the_earlier_revisions() -> None:
     status = [line for line in _spec_lines() if line.startswith("| Status |")]
     assert len(status) == 1
-    assert status[0].startswith("| Status | **Approved** — revision 3.5. Revision 3.3 was approved")
-    assert "Revision 3.4 (2026-10-21, the user's decision after spike V19)" in status[0]
-    assert "Revision 3.5 (" in status[0]
+    head = f"| Status | **Approved** — revision 3.5. {EARLIER_REVISIONS} Revision 3.5 ("
+    assert status[0].startswith(head)
+    assert status[0].endswith(" Audit trail: `docs/council/` |")
 
 
 def test_the_generator_schema_of_11_5_is_candidate_c() -> None:
@@ -65,7 +75,10 @@ def test_the_generator_schema_of_11_5_is_candidate_c() -> None:
     assert len(opens) == 1, "§11.5 holds exactly one JSON block"
     close = body.index("```", opens[0] + 1)
     block = json.loads("\n".join(body[opens[0] + 1 : close]))
-    assert canonical_schema_json(block) == canonical_schema_json(_candidates().candidate_c())
+    candidate = _candidates().candidate_c()
+    assert canonical_schema_json(block) == canonical_schema_json(candidate)
+    # The key order too (`json.loads` keeps it): the model emits the properties in the schema's order.
+    assert json.dumps(block) == json.dumps(candidate)
 
 
 def test_the_arbeitnow_page_yield_of_6_8_is_the_dry_run_constant() -> None:
