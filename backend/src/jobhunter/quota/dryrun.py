@@ -36,7 +36,8 @@ from jobhunter.types import JSONValue
 
 PAID_REFRESH_SLOW_DAYS: Final = 7
 JSEARCH_DATE_WINDOW_H: Final = 720  # `date_posted=month`, the widest JSearch window (§5.5.3)
-ARBEITNOW_HOURS_PER_PAGE: Final = 17.5  # V8: page 1 holds 300 items spanning about 17.5 h (the cap bounds it)
+# V8: page 1 holds 300 items spanning about 17.5 h (the only page whose span the cap formula bounds)
+ARBEITNOW_HOURS_PER_PAGE: Final = 17.5
 _DAY: Final = timedelta(days=1)
 
 

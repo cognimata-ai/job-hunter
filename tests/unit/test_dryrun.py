@@ -136,8 +136,13 @@ def test_arbeitnow_warning_threshold_holds_for_every_interval_hour(hours: int) -
     """The warning is raised for every interval §13.1 allows above 35 h and for none up to it (the cap steps
     up by one at 61, 91, 121 and 151 h, and the expected pages stay ahead of it from 36 h on)."""
     settings = seeded_run_settings(interval_s=hours * 3600)
-    warns, _ = quota_projections(settings, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
+    warns, proj = quota_projections(settings, jsearch=None, adzuna=None, serpapi=None, cells=1, now=NOW)
     assert ("arbeitnow_coverage_risk" in codes(warns)) == (hours > 35)
+    arbeitnow = proj["arbeitnow"]
+    assert isinstance(arbeitnow, dict)
+    pages, cap = arbeitnow["expected_pages"], arbeitnow["page_cap"]
+    assert isinstance(pages, float | int) and isinstance(cap, int)
+    assert (pages > cap) == (hours > 35)  # the projection agrees with the warning
 
 
 def test_the_sweep_covers_the_whole_settings_range() -> None:

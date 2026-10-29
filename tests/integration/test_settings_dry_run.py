@@ -321,6 +321,12 @@ async def test_effect_dependent_projections(logged_in_client, clock) -> None:
     assert "critic_rate" not in body["projections"] and "eval_gate" not in body["projections"]
     body = await post(logged_in_client, with_(base(), "schedule.enabled", False))
     assert body["projections"]["next_slot"] is None
+    # a zone-only change is a schedule change (spec 3.5, U3): 06:00 Tokyo on 2026-10-22 is 21:00 UTC the day
+    # before; slots every 6 h, the latest at or before 09:30 is 09:00, the next 15:00 (Berlin's: 10:00)
+    zone_only = with_(copy.deepcopy(load_settings_v1()), "display.timezone", "Asia/Tokyo")  # the active doc
+    body = await post(logged_in_client, zone_only)
+    assert body["effects"] == ["schedule"]
+    assert body["projections"]["next_slot"] == "2026-10-22T15:00:00Z"
 
 
 async def test_an_unchanged_normal_form_is_none(logged_in_client, clock) -> None:
