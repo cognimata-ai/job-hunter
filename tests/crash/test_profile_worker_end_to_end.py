@@ -3,9 +3,11 @@ a real docparse process (`python -m docparse.worker`): a synthetic two-page PDF 
 reaches the text review through docparse, and after the approval its profile is extracted on the synthetic
 `extract_profile` stream; the worker then stops cleanly on SIGTERM.
 
-Both children share a tmp `parse_jobs` root of mode 2770 (`JOBHUNTER_PARSE_JOBS_DIR`), as the tmpfs of §12.2
-is shared; the worker reads the file from the api's CV store, and its embedder is the session's fake one. The
-CV is `SYNTHETIC_CV`, an invented candidate; no paid call.
+The docparse child imports its parsers from the environment, so `docparse_group` checks the `docparse` group
+there before and after the test (M3 carry T18-b). Both children share a tmp `parse_jobs` root of mode 2770
+(`JOBHUNTER_PARSE_JOBS_DIR`), as the tmpfs of §12.2 is shared; the worker reads the file from the api's CV
+store, and its embedder is the session's fake one. The CV is `SYNTHETIC_CV`, an invented candidate; no paid
+call.
 """
 
 import os
@@ -45,7 +47,16 @@ def reached(engine: AsyncEngine, draft_id: int, status: str) -> Callable[[], Awa
 
 
 async def test_pdf_draft_through_the_worker_process(
-    migrated, proc_env, procs, fake_embedder, engine, logged_in_client, upload, cv_store_dir, tmp_path: Path
+    migrated,
+    proc_env,
+    procs,
+    fake_embedder,
+    engine,
+    logged_in_client,
+    upload,
+    cv_store_dir,
+    docparse_group,
+    tmp_path: Path,
 ) -> None:
     root = tmp_path / "parse"
     root.mkdir()

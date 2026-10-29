@@ -20,6 +20,9 @@ no real CV and no real person's data is ever used (§12, privacy rules).
 
 `docparse_root` is a parse_jobs root (mode 2770, as the tmpfs of §12.2) served by a `docparse.worker.serve`
 loop thread for the length of a test; it needs the `docparse` group (`uv run --group docparse pytest`).
+`docparse_group` (M3 Task 28, carry T18-b), which it uses, checks that group in the environment at the
+test's setup and again at its teardown (`docparse_group_missing`: what a fresh interpreter, as a docparse
+child is, can import), so a group that a `uv sync` removed during a run is named as the cause.
 
 Task 11 adds the operation side:
 - `nul_char_pdf(lines)`: as `replacement_char_pdf`, with "€" read as U+0000 (a text PostgreSQL refuses);
@@ -78,7 +81,7 @@ Task 21 adds the confirm's side:
 import asyncio
 import hashlib
 import importlib
-import importlib.util
+import importlib.machinery
 import io
 import pkgutil
 import struct
@@ -356,13 +359,50 @@ def docx_of_body(body: str, *, macro: bool = False) -> bytes:
     return buffer.getvalue()
 
 
+# The top-level modules of the `docparse` dependency group, which a docparse child imports to extract
+# (`docparse/extract.py`; tests/unit/test_docparse_group_guard.py keeps the two in step).
+DOCPARSE_GROUP_MODULES: Final = ("pypdf", "pdfplumber", "docx")
+_LOST_DURING_THE_TEST: Final = (
+    "It was there when the test started: a `uv sync` without `--group docparse` removed it meanwhile (the "
+    "session-start hook runs `uv sync --frozen`, M3 carry T18-b), and this test's parse failures are that."
+)
+
+
+def _group_missing(missing: Sequence[str], *, during_the_test: bool) -> str:
+    found = (
+        f"the `docparse` group is not in the environment ({', '.join(missing)}), so every docparse child "
+        "answers `parse_error`: run `uv run --group docparse pytest`."
+    )
+    return f"{found} {_LOST_DURING_THE_TEST}" if during_the_test else found
+
+
+def docparse_group_missing() -> list[str]:
+    """The modules of `DOCPARSE_GROUP_MODULES` that a fresh interpreter, as a docparse child is, could not
+    import now: each is looked up on `sys.path` on disk (`PathFinder`, the import caches invalidated first),
+    never in this process's `sys.modules`. Collection imports pypdf into the test process (an `encrypted_pdf`
+    parameter of `test_profile_extract_phase.py`), so `importlib.util.find_spec` keeps answering from there
+    after the group has left the environment (carry T18-b)."""
+    importlib.invalidate_caches()
+    return [name for name in DOCPARSE_GROUP_MODULES if importlib.machinery.PathFinder.find_spec(name) is None]
+
+
 @pytest.fixture
-def docparse_root(tmp_path: Path) -> Iterator[Path]:
+def docparse_group() -> Iterator[None]:
+    """The `docparse` group is in the environment when the test starts, and still there when it ends: a test
+    that runs a docparse child, in process or as `python -m docparse.worker`, fails at its setup when the
+    group is missing, and its teardown names the group's removal during the test as the cause of what
+    failed."""
+    missing = docparse_group_missing()
+    assert not missing, _group_missing(missing, during_the_test=False)
+    yield
+    missing = docparse_group_missing()
+    assert not missing, _group_missing(missing, during_the_test=True)
+
+
+@pytest.fixture
+def docparse_root(tmp_path: Path, docparse_group: None) -> Iterator[Path]:
     """A parse_jobs root (mode 2770: per-job directories inherit its group) served by a docparse loop
     thread; the loop stops, and its thread is joined, after the test."""
-    assert importlib.util.find_spec("pypdf") is not None, (
-        "the docparse loop extracts with the `docparse` group: run `uv run --group docparse pytest`"
-    )
     root = tmp_path / "parse"
     root.mkdir()
     root.chmod(0o2770)
