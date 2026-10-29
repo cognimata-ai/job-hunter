@@ -107,7 +107,7 @@ def test_the_plan_is_five_generator_pairs_and_five_critic_pairs_in_order() -> No
     assert [c["case"] for c in CALLS] == [
         f"{role}{k}{position}" for k in range(1, 6) for role in "gc" for position in "ab"
     ]
-    assert len(CALLS) == rec.SPIKE_CALLS["v5"] == 20
+    assert len(CALLS) == 20 and rec.SPIKE_CALLS["v5"] == 30  # Ruling T26-c: up to 10 enlarged stages
     for call in CALLS:
         node = call["node"]
         role = "generate" if call["case"][0] == "g" else "critic"

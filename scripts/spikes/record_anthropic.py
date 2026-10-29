@@ -203,8 +203,9 @@ BUDGET_RULE: Final = (
     "call's worst_case_usd > actual_usd"
 )
 # V4: the 4 gating cases, no probe message (R7-2). v2probe: the ladder A, B, C, at most 3 sends. M3 Task 26:
-# the gateway spikes count HTTP attempts (v4v2's 4 cases, V5's 20 calls, V14's pair), V12 its one batch.
-SPIKE_CALLS: Final = {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3, "v4v2": 4, "v12": 1, "v5": 20, "v14": 2}
+# the gateway spikes count HTTP attempts (v4v2's 4 cases, V14's pair; V5's 20 calls plus up to 10 enlarged
+# max_tokens stages, Ruling T26-c), V12 its one batch.
+SPIKE_CALLS: Final = {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3, "v4v2": 4, "v12": 1, "v5": 30, "v14": 2}
 SPIKE_MODULES: Final = {
     "v13": "v13_structured_stream",
     "v4": "v4_schema_dry_run",

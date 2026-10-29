@@ -259,7 +259,7 @@ def test_the_ledger_keeps_its_entries_and_records_the_new_limits(rec: ModuleType
     assert state["limits"] == {
         "actual_usd": "10.00",
         "rule": rec.BUDGET_RULE,
-        "spikes": {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3, "v4v2": 4, "v12": 1, "v5": 20, "v14": 2},
+        "spikes": {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3, "v4v2": 4, "v12": 1, "v5": 30, "v14": 2},
     }
     each = pricing.settled_usd("claude-sonnet-5-5", pricing.Usage(900, 300, 0, 0)) + pricing.settled_usd(
         "claude-opus-5-5", pricing.Usage(900, 300, 0, 0)
@@ -290,7 +290,8 @@ def test_the_spike_call_count_is_enforced(rec: ModuleType, tmp_path: Path) -> No
 def test_the_spike_call_counts_and_the_total_are_the_rulings(rec: ModuleType) -> None:
     # R7-2: V4 sends its 4 gating cases and its probe goes to the free counting endpoint, never as a message.
     # v2probe: the ladder A, B, C sends at most 3. The user's M3 total covers every spike. M3 Task 26: the
-    # gateway spikes count HTTP attempts (v4v2, v5, v14), V12 its one batch.
+    # gateway spikes count HTTP attempts (v4v2, v5, v14), V12 its one batch. Ruling T26-c: V5's 20 calls and
+    # up to 10 enlarged max_tokens stages.
     assert rec.SPIKE_CALLS == {
         "v13": 2,
         "v4": 4,
@@ -298,7 +299,7 @@ def test_the_spike_call_counts_and_the_total_are_the_rulings(rec: ModuleType) ->
         "v2probe": 3,
         "v4v2": 4,
         "v12": 1,
-        "v5": 20,
+        "v5": 30,
         "v14": 2,
     }
     assert rec.SPIKE_MODULES["v2probe"] == "v4b_generator_v2_probe"
