@@ -697,11 +697,14 @@ def message_figures(body: Mapping[str, Any], *, batch: bool = False) -> AttemptF
     """The gateway's reservation of one message request, or of one batch item's params with `batch`: its text
     bound (`bounds.text_input_bound` of the system texts, the message texts and the output schema as canonical
     JSON, the components `RenderedPrompt.as_request` bounds) at `pricing.worst_case_usd` with its
-    `max_tokens`. A request the gateway would not bound by bytes (a non-text block, no output schema, no
-    positive `max_tokens`, an unknown model) is a `ValueError`."""
+    `max_tokens`. A request the gateway would not bound by bytes (a non-text system or message block, no
+    output schema, no positive `max_tokens`, an unknown model) is a `ValueError`."""
     model = body.get("model")
     if not isinstance(model, str) or model not in pricing.MODELS:
         raise ValueError("a request for no known model")
+    system = body.get("system")
+    if isinstance(system, list) and any(block.get("type") != "text" for block in system):
+        raise ValueError("a non-text system block has no byte bound")
     for message in body.get("messages") or []:
         content = message.get("content")
         if not isinstance(content, str) and any(block.get("type") != "text" for block in content):
@@ -1006,6 +1009,10 @@ class Exchange:
 
     def events(self) -> list[fake.SSEEvent]:
         return _events_of(self.status, self.response_headers, self.body())
+
+    def usage(self) -> dict[str, int] | None:
+        """The response's usage (`_merged_usage` of its events), or None when no `message_delta` came."""
+        return _merged_usage(self.events())
 
     def event_times(self) -> list[tuple[float, fake.SSEEvent]]:
         """Every SSE event with the arrival time of the chunk that completed it."""

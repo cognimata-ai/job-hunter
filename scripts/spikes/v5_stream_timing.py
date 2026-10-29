@@ -45,9 +45,12 @@ value here is synthetic: invented candidates and employers, no names, no contact
 """
 
 import dataclasses
+import importlib.util
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
 from typing import Any, Final
 
 import anthropic
@@ -81,19 +84,19 @@ POLICY: Final[Mapping[str, JSONValue]] = get_object(_SETTINGS, "scoring.model_po
 EXECUTION: Final[Mapping[str, JSONValue]] = get_object(_SETTINGS, "scoring.execution")
 
 
-def _v2() -> render.PromptVersion:
-    """Prompt-schema version 2 as the seed stores it (built offline; the id is never sent)."""
-    templates, schemas = render.prompt_schema_v2()
-    return render.PromptVersion(
-        id=2,
-        prompt_schema_hash=render.prompt_schema_hash(templates, schemas),
-        templates={name: str(text) for name, text in templates.items()},
-        schemas=schemas,
-        parser_family="generator_v2_items",
-    )
+def _sibling(name: str) -> ModuleType:
+    """A spike module beside this one, loaded from its file (the spikes are scripts, not a package)."""
+    path = Path(__file__).parent / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"jobhunter_spike_{name}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"the spike module {name} is missing")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-V2: Final = _v2()
+# Prompt-schema version 2 as the seed stores it, built offline once, by the schema dry-run's spike module.
+V2: Final[render.PromptVersion] = _sibling("v4_schema_dry_run").V2
 
 # ---- the synthetic inputs ----------------------------------------------------------------------------------
 
@@ -409,16 +412,6 @@ class CallTiming:
         return None if final is None or final.usage is None else int(final.usage.get(name) or 0)
 
 
-def _usage(events: Sequence[fake.SSEEvent]) -> dict[str, int] | None:
-    """The response's usage: `message_delta`'s cumulative counts, `message_start`'s for what it lacks."""
-    start = next((e.data["message"].get("usage", {}) for e in events if e.name == "message_start"), {})
-    delta = next((e.data.get("usage", {}) for e in events if e.name == "message_delta"), None)
-    if delta is None:
-        return None
-    keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
-    return {k: int(delta.get(k) if delta.get(k) is not None else start.get(k) or 0) for k in keys}
-
-
 def _thinking_tokens(events: Sequence[fake.SSEEvent]) -> int | None:
     """The thinking tokens of the output (`usage.output_tokens_details.thinking_tokens`), final first."""
     for event in reversed(events):
@@ -443,7 +436,7 @@ def attempt_timing(exchange: Any) -> AttemptTiming:
         ttfe_s=timed[0][0] - started if timed else None,
         max_gap_s=exchange.max_gap_s(),
         events=len(events),
-        usage=_usage(events),
+        usage=exchange.usage(),
         stop_reason=stop,
         thinking_tokens=_thinking_tokens(events),
         max_tokens=None if body.get("max_tokens") is None else int(body["max_tokens"]),

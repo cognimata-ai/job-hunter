@@ -87,7 +87,9 @@ V1: Final = _v1()
 
 
 def _v2() -> render.PromptVersion:
-    """Prompt-schema version 2 as the M3 seed stores it (built offline; the id is never sent): candidate C."""
+    """Prompt-schema version 2 as the M3 seed stores it (built offline; the id is never sent): candidate C.
+    `V2` is the one copy of it the spikes use: `v5_stream_timing` (and through it `v12_batches`) loads it
+    from here."""
     templates, schemas = render.prompt_schema_v2()
     return render.PromptVersion(
         id=2,

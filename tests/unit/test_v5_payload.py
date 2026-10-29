@@ -181,6 +181,29 @@ async def test_each_request_is_the_three_block_layout_with_the_marker_on_the_pro
     )
 
 
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "synthetic"}},
+    ],
+)
+def test_a_non_text_system_block_has_no_byte_bound(block: dict[str, Any]) -> None:
+    """The budget reserves a request by its bytes, so a system block it cannot size (one that is not `text`)
+    is refused, as a non-text message block is, instead of being reserved at 0 bytes."""
+    body = {
+        "model": SONNET,
+        "max_tokens": 6_000,
+        "system": [{"type": "text", "text": "Synthetic rubric."}, block],
+        "messages": [{"role": "user", "content": "Synthetic ad."}],
+        "output_config": {"format": {"type": "json_schema", "schema": GENERATOR_SCHEMA}},
+    }
+    with pytest.raises(ValueError, match="non-text system block"):
+        rec.message_figures(body)
+    body["system"] = [{"type": "text", "text": "Synthetic rubric."}]
+    assert rec.message_figures(body).input_tokens_bound > 0  # a text block is sized
+
+
 async def test_a_pair_has_one_prefix_and_each_pair_its_own_prefix_and_ad(cfg: AppConfig) -> None:
     bodies = {c["case"]: (await captured(cfg, c)).request_body() for c in CALLS}
     prefixes, ads = {}, {}
@@ -355,6 +378,43 @@ def test_an_attempts_thinking_tokens_come_from_its_final_usage() -> None:
     sse = synthetic_sse(generator_wire_body(), model=SONNET)
     events = fake.parse_sse(sse)
     assert V5._thinking_tokens(events) == 0  # synthetic_sse's `output_tokens_details`
+    # two cumulative `message_delta` usages with different counts: the final one is the attempt's
+    *body, delta, stop = events
+    assert (delta.name, stop.name) == ("message_delta", "message_stop")
+
+    def counted(thinking: int) -> fake.SSEEvent:
+        usage = {**delta.data["usage"], "output_tokens_details": {"thinking_tokens": thinking}}
+        return fake.SSEEvent(delta.name, {**delta.data, "usage": usage})
+
+    assert V5._thinking_tokens([*body, counted(1_200), counted(3_400), stop]) == 3_400
+    assert V5._thinking_tokens([*body, counted(3_400), counted(1_200), stop]) == 1_200
+    assert V5._thinking_tokens(body) is None  # no usage that ended: unknown, never 0
+
+
+async def test_an_attempts_figures_come_from_its_exchange() -> None:
+    """`attempt_timing` on the recorder's `Exchange` of one streamed attempt: its usage is the recorder's own
+    (`Exchange.usage`, the settlement's `_merged_usage`), its stage the request's `max_tokens`."""
+    usage = {"input_tokens": 1_792, "cache_creation_input_tokens": 8_644, "output_tokens": 2_400}
+    sse = synthetic_sse(generator_wire_body(), model=SONNET, usage=usage)
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=sse)
+
+    timing = rec.TimingTransport(httpx2.MockTransport(answer))
+    body = {"model": SONNET, "max_tokens": 12_000, "stream": True}
+    async with httpx2.AsyncClient(transport=timing) as client:
+        await client.post("https://api.anthropic.com/v1/messages", content=json.dumps(body).encode())
+    (exchange,) = timing.exchanges
+    figures = V5.attempt_timing(exchange)
+    assert figures.usage == exchange.usage() == rec._merged_usage(fake.parse_sse(sse))
+    assert figures.usage is not None and figures.usage["cache_creation_input_tokens"] == 8_644
+    assert (figures.status, figures.stop_reason, figures.max_tokens, figures.thinking_tokens) == (
+        200,
+        "end_turn",
+        12_000,
+        0,
+    )
+    assert figures.events == len(fake.parse_sse(sse)) and figures.ttfe_s is not None
 
 
 def test_a_run_stopped_by_a_refusal_reports_what_it_measured() -> None:

@@ -7,14 +7,13 @@ the four documents, without provider identity, under `tests/contract/fixtures/an
 `create.json`, `retrieve.json` (each retrieval in order), `results.json` (the result lines) and `list.json`
 (the listing reduced to the spike's batch).
 
-Until the live documents exist, every test here runs on documents the same recorder path writes on the fake
-Batches API (`fake.RecordedSSETransport`, one item scripted `errored:invalid_request` so the not-billed path
-is exercised too). The replay maps the recorded lines onto a submission of three synthetic targets (on a
-tuple whose generator is Haiku, the batch's model; a submission takes at least 200) and runs
-`batch_items.process_item` on each: usage present,
-the `custom_id` pattern, the listing's `created_at` and `request_counts`, and every errored, canceled or
-expired item settled `not_billed`. An `expired` item cannot be produced on demand (A3 G27); the expiry is
-Task 17's fake's.
+Every test of the documents runs twice: on the committed live documents, and on documents the same recorder
+path writes on the fake Batches API (`fake.RecordedSSETransport`, one item scripted `errored:invalid_request`,
+so the not-billed path is exercised too: the live batch had no errored item). The replay maps the recorded
+lines onto a submission of three synthetic targets (on a tuple whose generator is Haiku, the batch's model; a
+submission takes at least 200) and runs `batch_items.process_item` on each: usage present, the `custom_id`
+pattern, the listing's `created_at` and `request_counts`, and every errored, canceled or expired item settled
+`not_billed`. An `expired` item cannot be produced on demand (A3 G27); the expiry is Task 17's fake's.
 """
 
 import copy
@@ -37,6 +36,7 @@ from jobhunter.clock import utcnow
 from jobhunter.db.seed import canonical_json, load_settings_v1
 from jobhunter.llm import batches as llm_batches
 from jobhunter.llm import fake, pricing
+from jobhunter.llm.bounds import text_input_bound
 from jobhunter.llm.fake import BatchScript
 from jobhunter.scoring import batch_items
 from jobhunter.types import get_object
@@ -114,15 +114,21 @@ async def fake_run(tmp: Path) -> tuple[int, Path]:
     return code, tmp / "fixtures" / "batches" / "v12"
 
 
-@pytest.fixture
-async def documents(tmp_path: Path) -> Documents:
-    """The recorded V12 documents once they are committed; until then those the recorder writes on the
-    fake."""
-    if all((RECORDED / f"{name}.json").is_file() for name in DOCUMENTS):
+@pytest.fixture(params=["recorded", "fake"])
+async def documents(request: pytest.FixtureRequest, tmp_path: Path) -> Documents:
+    """The committed live V12 documents, and those the recorder writes on the fake with its third item
+    errored (the live batch's three items all succeeded, so only the fake's run reaches the not-billed
+    path)."""
+    if request.param == "recorded":
+        assert all((RECORDED / f"{name}.json").is_file() for name in DOCUMENTS), (
+            "the V12 documents are missing"
+        )
         return _read(RECORDED)
     code, directory = await fake_run(tmp_path)
     assert code == rec.OK
-    return _read(directory)
+    docs = _read(directory)
+    assert [line["result"]["type"] for line in docs.results].count("errored") == 1
+    return docs
 
 
 # --- the documents -----------------------------------------------------------------------------------------
@@ -456,7 +462,24 @@ def test_the_v12_dry_run_builds_the_batch_offline_within_the_budget(
     out = capsys.readouterr().out
     assert code == rec.OK, out
     assert out.count("payload ok") == 4 and "BAD" not in out  # three items and the create
-    assert "committed_usd=" in out and not (tmp_path / "raw").exists()
+    # the batch is reserved at the sum of its items' batch worst cases, each item sized from its own prompt
+    worst = Decimal(0)
+    for item in V12.batch_requests("v12"):
+        node, prompt = item["node"], item["prompt"]
+        params = {
+            "model": node.model,
+            "max_tokens": node.max_tokens,
+            "system": [{"type": "text", "text": block.text} for block in prompt.system],
+            "messages": [{"role": "user", "content": message.content} for message in prompt.messages],
+            "output_config": {"format": {"type": "json_schema", "schema": node.schema.json}},
+        }
+        figures = rec.message_figures(params, batch=True)
+        assert figures.input_tokens_bound == text_input_bound(HAIKU, prompt.as_request(node.schema))
+        worst += figures.worst_case_usd
+    assert worst > 0
+    assert f"{rec.BATCH_CASE} of 3 items worst_case_usd={worst}" in out
+    assert f"committed_usd={worst} of 10.00" in out
+    assert not (tmp_path / "raw").exists()
 
 
 # --- the replay through the item decision ---------------------------------------------------------------
@@ -516,6 +539,7 @@ async def test_the_recorded_results_replay_through_the_item_decision(
         assert decision.result_type == result.result_type
         replayed[mine] = result.result_type
     entries = await entries_by_custom_id(engine)
+    not_billed = 0
     for line in documents.results:
         mine, result = ours[line["custom_id"]], line["result"]
         entry = entries[mine]
@@ -541,4 +565,7 @@ async def test_the_recorded_results_replay_through_the_item_decision(
             ):  # Carry T8-b: the SDK's nested error.error.type, never the message
                 kind = result["error"]["error"]["type"]
                 assert entry.error_code.endswith(f":{kind}")
+            not_billed += 1
     assert sorted(replayed) == sorted(replaying)
+    # the recorded batch has no errored item; the fake's run settles its one errored item not billed
+    assert not_billed == (0 if documents.recorded else 1)
