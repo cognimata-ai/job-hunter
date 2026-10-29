@@ -6,10 +6,10 @@
 
 Both are gateway spikes of the budgeted recorder (`record_anthropic.GATEWAY_SPIKES`): each call is
 `LLMGateway.call()` on the recorder's throwaway database, sent through `BudgetedTransport(TimingTransport(
-network))`, so every HTTP attempt is authorised and reserved before it leaves (`SPIKE_CALLS`: v5 20, v14 2)
-and every SSE event carries its arrival time. The calls run one at a time, as an eval run's non-scoring calls
-(an `eval_runs` row of kind `canary` owns them), at the seeded policy's models, efforts, `max_tokens` stages
-and deadlines.
+network))`, so every HTTP attempt is authorised and reserved before it leaves (`SPIKE_CALLS`: v5 30, its 20
+calls and up to 10 enlarged `max_tokens` stages, Ruling T26-c; v14 2) and every SSE event carries its arrival
+time. The calls run one at a time, as an eval run's non-scoring calls (an `eval_runs` row of kind `canary`
+owns them), at the seeded policy's models, efforts, `max_tokens` stages and deadlines.
 
 **The calls** (`gateway_calls`), every one rendered by `render.score_prompt` from prompt-schema version 2 in
 the real three-block layout: `system[0]` the shared rubric block of rubric v2, `system[1]` the synthetic
@@ -24,17 +24,18 @@ the real three-block layout: `system[0]` the shared rubric block of rubric v2, `
   prompt and schema on Sonnet/`medium` (A3 G6: whether two schemas on one (model, effort) share an entry).
 
 **What is measured** (`run_gateway`): per call its duration from the send to the settled result (`call_s`)
-and per HTTP attempt its stream duration, its time to the first event, the largest gap between two SSE events
-and its usage (`AttemptTiming`). `analyse` holds the acceptance: the p99 (the largest of the 20) call under
-300 s, every gap under 30 s, and the second call of each pair reading at least 4,000 cached tokens (V14), with
-every call measured once (a retried call reduces the sample: it is reported). It also reports the first
-generator call on its own (it includes the grammar compile, A3 G28), whether a critic call on Opus read the
-Sonnet generator's entry (V14: it should not, another model), and the cache-creation counts by role (G7: the
-generator and the critic of a pair cache the same prefix bytes under different schemas, so equal counts put
-the schema's framing outside the cached part). For v5, free `count_tokens` requests then split the first
-generator and critic requests into their components (the V19 method: the whole request, and each component
-as the one user message), for the token figures Ruling T25-a asks for. The spike stops at the first refusal
-of an attempt and reports what it measured.
+and per HTTP attempt its stream duration, its time to the first event, the largest gap between two SSE
+events, its usage, its stop reason, its `max_tokens` stage and its thinking tokens (`AttemptTiming`).
+`analyse` holds the acceptance: the p99 (the largest of the 20) call under 300 s, every gap under 30 s, and
+the second call of each pair reading at least 4,000 cached tokens (V14), with every call measured once (a
+retried call reduces the sample: it is reported). It also reports each model's attempts and how many were
+cut at `max_tokens`, the first generator call on its own (it may include the grammar compile, A3 G28),
+whether a critic call on Opus read the Sonnet generator's entry (V14: it should not, another model), and the
+cache-creation counts by role (G7: the generator and the critic of a pair cache the same prefix bytes under
+different schemas, so equal counts put the schema's framing outside the cached part). For v5, free
+`count_tokens` requests then split the first generator and critic requests into their components (the V19
+method: the whole request, and each component as the one user message), for the token figures Ruling T25-a
+asks for. The spike stops at the first refusal of an attempt and reports what it measured.
 
 **What is committed**: every completed stream as `<purpose>/<model>/<schema12>.<case>.sse` with its sidecars,
 and for v5 the second calls of the first pair (`g1b`, `c1b`) also where the dev stack's fake serves the

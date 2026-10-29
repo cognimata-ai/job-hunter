@@ -1,0 +1,26 @@
+{
+  "case": "g1b",
+  "component_bytes": {
+    "messages": [
+      2634
+    ],
+    "schema": 1713,
+    "system": [
+      13252,
+      5698,
+      1836
+    ]
+  },
+  "effort": "medium",
+  "max_tokens": 6000,
+  "model": "claude-sonnet-5-5",
+  "purpose": "generate",
+  "source": "recorded",
+  "spike": "v5",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 8644,
+    "input_tokens": 1792,
+    "output_tokens": 2603
+  }
+}
