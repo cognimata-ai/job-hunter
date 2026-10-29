@@ -673,3 +673,63 @@ async def test_a_failed_settlement_of_a_cancelled_try_never_hides_the_cancellati
     assert row.state == "dispatched"  # left to llm_ledger_unsettled, which makes it ambiguous
     (event,) = [e for e in log_events() if e["event"] == "llm_cancelled_try_unsettled"]
     assert (event["llm_call_id"], event["error_class"]) == (row.call_id, "OperationalError")
+
+
+# --- M3 Task 28: the shutdown's settlement of the tries in flight (spec §3.3.5 step 4) ---------------------
+
+
+async def stalled_call(engine: AsyncEngine, fake_llm: FakeLLM, owner: Any, ec: Any) -> Any:
+    """A gateway and a task whose call's stream stalls after its first event (only a cancellation ends it),
+    returned once that try was served."""
+    fake_llm.scenario("stall_after_first_event")
+    gateway = fake_llm.gateway(engine)
+    call = asyncio.create_task(gateway.call(GATEWAY_NODE, gateway_prompt(), call_context(owner, ec)))
+    for _ in range(500):
+        if fake_llm.served:
+            break
+        await asyncio.sleep(0.01)
+    assert fake_llm.served == 1
+    return gateway, call
+
+
+async def test_settle_in_flight_waits_for_a_cancelled_try_that_no_caller_awaits(
+    engine, fake_llm: FakeLLM, owner, ec
+) -> None:
+    # LangGraph cancels a node's task and does not wait for it: the try settles in that task, later
+    gateway, call = await stalled_call(engine, fake_llm, owner, ec)
+    call.cancel()
+    (row,) = await tries(engine)
+    assert row.state == "dispatched"  # nothing has settled it yet
+    assert await gateway.settle_in_flight(10) == 0
+    (row,) = await tries(engine)
+    assert (row.state, row.status, row.error_code) == ("ambiguous", "ambiguous", "cancelled")
+    assert call.cancelled()
+
+
+async def test_settle_in_flight_cancels_a_try_still_streaming_and_waits_for_its_settlement(
+    engine, fake_llm: FakeLLM, owner, ec
+) -> None:
+    gateway, call = await stalled_call(engine, fake_llm, owner, ec)
+    assert await gateway.settle_in_flight(10) == 0  # what remains is cancelled (§3.3.5 step 4)
+    (row,) = await tries(engine)
+    assert (row.state, row.status, row.error_code) == ("ambiguous", "ambiguous", "cancelled")
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+
+async def test_settle_in_flight_counts_what_is_still_settling_at_its_timeout(
+    engine, fake_llm: FakeLLM, owner, ec, monkeypatch
+) -> None:
+    gateway, call = await stalled_call(engine, fake_llm, owner, ec)
+    released = asyncio.Event()
+
+    async def slow_settlement(*args: Any, **kwargs: Any) -> spend_ledger.SettleFigures:
+        await released.wait()
+        raise sa.exc.OperationalError("SELECT 1", {}, ConnectionError("database unreachable"))
+
+    monkeypatch.setattr(spend_ledger, "settle", slow_settlement)
+    assert await gateway.settle_in_flight(0.2) == 1
+    released.set()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert await gateway.settle_in_flight(0.2) == 0  # an ended try leaves the count

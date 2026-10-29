@@ -48,11 +48,13 @@
    the reason);
 10. one procrastinate worker loop per queue of `QUEUES`, then `worker_ready`;
 11. `shutdown.coordinate` until a shutdown is requested or a loop ends by itself;
-12. the teardown: the live executions cancelled, the watchdog stopped, the saver, the task app, the source
-    clients, the embedder's and the gateway's HTTP clients and the engine closed, and the lock session closed
-    last, which releases the lock; then `worker_shutdown_complete`. Each of its waits takes at most what is
-    left of the stop's one deadline (`shutdown.StopDeadline`), so the whole stop fits in
-    `shutdown.STOP_BUDGET_S`.
+12. the teardown: the live executions cancelled, then the gateway's tries still in flight settled
+    (`LLMGateway.settle_in_flight`, §3.3.5 step 4: a cancelled execution can end before its streams have
+    settled `ambiguous`, because a graph does not wait for a cancelled node's task; M3 Task 28), the watchdog
+    stopped, the saver, the task app, the source clients, the embedder's and the gateway's HTTP clients and
+    the engine closed, and the lock session closed last, which releases the lock; then
+    `worker_shutdown_complete`. Each of its waits takes at most what is left of the stop's one deadline
+    (`shutdown.StopDeadline`), so the whole stop fits in `shutdown.STOP_BUDGET_S`.
 
 Until step 9 a SIGTERM ends the process at once (the default action): nothing runs yet that could drain. The
 teardown runs on every other path, also when a step of the start fails, and closes what the start had built.
@@ -147,6 +149,8 @@ ENGINE_POOL_SIZE: Final = 10
 QUEUE_POOL_MAX_SIZE: Final = 4
 # The bounds of two teardown waits; each also takes at most what is left of the stop's deadline.
 EXECUTIONS_CANCEL_S: Final = 30.0
+# What the teardown waits for the gateway's tries still in flight to settle (`LLMGateway.settle_in_flight`).
+TRIES_SETTLE_S: Final = 10.0
 WATCHDOG_STOP_S: Final = 15.0
 # Imported before the takeover (step 4): importing them registers their sweeps, reconcilers and handlers.
 _REGISTERING_MODULES: Final = (
@@ -247,6 +251,7 @@ class _WorkerProcess:
         self.clients: dict[str, httpx.AsyncClient] = {}  # the source clients (step 7), closed at teardown
         self.embedder_http: httpx.AsyncClient | None = None
         self.llm_http: httpx2.AsyncClient | None = None  # the gateway's client (step 7), closed at teardown
+        self.gateway: LLMGateway | None = None  # step 7's: its tries in flight are settled at teardown
         self.shutdown = ShutdownState()  # its `stop_deadline` is set once the stop began (`coordinate`)
 
     async def run(self) -> int:
@@ -296,7 +301,7 @@ class _WorkerProcess:
         await queue.open_async()
         saver = await self.saver_scope.enter_async_context(open_saver(dsn))
         llm_http = self.llm_http = llm_transport.make_http_client(cfg)
-        gateway = LLMGateway(engine, cfg, http_client=llm_http, cache=CacheMonitor())
+        gateway = self.gateway = LLMGateway(engine, cfg, http_client=llm_http, cache=CacheMonitor())
         if not gateway.configured:
             log.warning("llm_not_configured")  # neither the key nor the fake: every LLM call fails with it
         parse_client = ParseClient(cfg.parse_jobs_dir)
@@ -433,6 +438,10 @@ class _WorkerProcess:
         if self.embedder_http is not None:
             await self.embedder_http.aclose()
 
+    async def _settle_tries(self, timeout_s: float) -> None:
+        if self.gateway is not None:
+            await self.gateway.settle_in_flight(timeout_s)
+
     async def _close_llm(self) -> None:
         if self.llm_http is not None:
             await self.llm_http.aclose()
@@ -462,6 +471,7 @@ class _WorkerProcess:
         deadline = self.shutdown.stop_deadline or StopDeadline.start()
         steps: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
             ("executions", lambda: EXECUTIONS.cancel_all(timeout_s=deadline.remaining(EXECUTIONS_CANCEL_S))),
+            ("llm_tries", lambda: self._settle_tries(deadline.remaining(TRIES_SETTLE_S))),
             ("watchdog", lambda: self._stop_watchdog(deadline.remaining(WATCHDOG_STOP_S))),
             ("saver", lambda: _within(deadline, self.saver_scope.aclose())),
             ("queue", lambda: _within(deadline, self._close_queue())),
