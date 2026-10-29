@@ -112,7 +112,8 @@ returns its report, written raw as `report.json`. Every exchange is written raw,
 are `LLMGateway.batch_request_body`. The create goes through `BatchesClient.create` on the same budgeted
 transport, which reserves the batch's worst case, the sum of its items' batch worst cases, as one entry that
 stays `created` (counted at its worst case) until the results are read. The recorder polls `retrieve` every
-`BATCH_POLL_S` up to `BATCH_MAX_WAIT` or until the batch ends, streams the results, settles the entry at the
+`BATCH_POLL_S` up to `BATCH_MAX_WAIT` (`--max-wait-hours` shortens it) or until the batch ends, writing each
+exchange raw as it completes, streams the results, settles the entry at the
 sum of the items' batch costs (an errored, canceled or expired item $0, a missing one its worst case), and
 lists the workspace until it finds the batch (an empty listing is never proof of absence). A run after a crash
 resumes polling a `created` entry's batch and never creates a second one. The create, every retrieve, the
@@ -1697,6 +1698,20 @@ def _write_exchange(raw: Tree, directory: Path, stem: str, exchange: Exchange, k
 SANITISED_BATCH_ID: Final = "msgbatch_{spike}_recorded"
 
 
+def _without_thinking(block: Any) -> Any:
+    """A message content block without its thinking: a thinking block keeps its shape with
+    `fake.THINKING_OMITTED` and `fake.SIGNATURE_OMITTED`, a redacted one `fake.SIGNATURE_OMITTED` as its
+    data."""
+    if not isinstance(block, dict):
+        return block
+    if block.get("type") == "thinking":
+        thinking = fake.THINKING_OMITTED if block.get("thinking") else ""
+        return {**block, "thinking": thinking, "signature": fake.SIGNATURE_OMITTED}
+    if block.get("type") == "redacted_thinking":
+        return {**block, "data": fake.SIGNATURE_OMITTED}
+    return block
+
+
 def _without_request_ids(doc: Any) -> Any:
     if isinstance(doc, dict):
         return {k: _without_request_ids(v) for k, v in doc.items() if k != "request_id"}
@@ -1722,6 +1737,8 @@ class Recorder:
     batch_items: list[BatchItem] = field(default_factory=list)
     sleep: Sleep = asyncio.sleep
     database: DatabaseFactory = throwaway_database
+    max_wait: timedelta = BATCH_MAX_WAIT
+    _written: int = field(default=0, init=False, repr=False)
 
     def say(self, line: str) -> None:
         print(line, file=self.out, flush=True)
@@ -2004,7 +2021,7 @@ class Recorder:
         self.say(f"{self.spike} create payload {verdict}")
         self.say(
             f"{self.spike} the live run polls every {BATCH_POLL_S:.0f} s for up to "
-            f"{BATCH_MAX_WAIT.total_seconds() / 3600:.0f} h, then lists the workspace until it finds the "
+            f"{self.max_wait.total_seconds() / 3600:g} h, then lists the workspace until it finds the "
             "batch"
         )
         self._budget_line(budget)
@@ -2044,6 +2061,7 @@ class Recorder:
                     client = BatchesClient(cfg, http_client=http, sleep=self.sleep)
                     if entry is None:
                         outcome = await client.create(await self._batch_requests(cfg, http))
+                        self._flush(timing.exchanges, key)  # the create's capture first: a resume reads it
                         entry = budgeted.entries[-1] if budgeted.entries else None
                         if (
                             not isinstance(outcome, Created)
@@ -2062,7 +2080,7 @@ class Recorder:
                     else:
                         self.say(f"{self.spike} resuming the created batch: it is never created again")
                     batch_id = str(entry["provider_batch_id"])
-                    if not await self._poll(client, timing, batch_id, entry):
+                    if not await self._poll(client, timing, batch_id, entry, key):
                         return STOPPED
                     with _tagged(timing, "results"):  # the SDK retrieves the batch first, for its results_url
                         stream = await client.results(batch_id)
@@ -2077,7 +2095,7 @@ class Recorder:
                 return STOPPED
             finally:
                 budgeted.finish()
-                self._write_batch_exchanges(timing.exchanges, key)
+                self._flush(timing.exchanges, key)
             self._settle_batch(budget, entry, results)
             docs = self._commit_batch(key)
             check = getattr(self.module, "check_batch", None)
@@ -2091,22 +2109,33 @@ class Recorder:
             return OK if report.get("expected", True) and found else STOPPED
 
     async def _poll(
-        self, client: BatchesClient, timing: TimingTransport, batch_id: str, entry: Mapping[str, Any]
+        self,
+        client: BatchesClient,
+        timing: TimingTransport,
+        batch_id: str,
+        entry: Mapping[str, Any],
+        key: str,
     ) -> bool:
-        """Retrieve the batch every `BATCH_POLL_S` until it ends or `BATCH_MAX_WAIT` after its creation has
-        passed; whether it ended."""
+        """Retrieve the batch every `BATCH_POLL_S` until it ends or `max_wait` after its creation has passed
+        (`--max-wait-hours`, at most `BATCH_MAX_WAIT`); whether it ended. Each retrieval is written raw at
+        once."""
         created = datetime.fromisoformat(str(entry.get("created_at") or entry["sent_at"]))
         while True:
             with _tagged(timing, "retrieve"):
                 status = await client.retrieve(batch_id)
+            self._flush(timing.exchanges, key)
             counts = status.request_counts
-            self.say(f"{self.spike} retrieve: {status.processing_status} processing={counts.processing}")
+            waited = (self.now() - created).total_seconds()
+            self.say(
+                f"{self.spike} retrieve after {waited:.0f} s: {status.processing_status} "
+                f"processing={counts.processing} succeeded={counts.succeeded} errored={counts.errored}"
+            )
             if status.processing_status == "ended":
                 return True
-            if self.now() >= created + BATCH_MAX_WAIT:
+            if self.now() >= created + self.max_wait:
                 self.say(
-                    f"{self.spike}: STOP, the batch has not ended "
-                    f"{BATCH_MAX_WAIT.total_seconds() / 3600:.0f} h after its creation; run again"
+                    f"{self.spike}: STOP, the batch has not ended {self.max_wait.total_seconds() / 3600:g} h "
+                    "after its creation; it stays counted at its worst case; run again to resume"
                 )
                 return False
             await self.sleep(BATCH_POLL_S)
@@ -2122,8 +2151,34 @@ class Recorder:
             await cast(Any, listing).aclose()
         return False
 
+    def _recommit_batch(self) -> int:
+        with exclusive(self.root) as held:
+            if not held:
+                self.say(
+                    f"{self.spike}: LOCKED, another recorder holds {self.root / 'anthropic-budget.lock'}"
+                )
+                return LOCKED
+            counted = Budget(self.root).logical_entries(self.spike, BATCH_CASE)
+            if (
+                not counted
+                or counted[-1].get("state") != "done"
+                or not (self._batch_dir() / "results.response.jsonl").is_file()
+            ):
+                self.say(
+                    f"{self.spike}: REFUSED, no settled batch with its results to commit; nothing written"
+                )
+                return REFUSED
+            docs = self._commit_batch("")
+        self.say(f"{self.spike}: committed {', '.join(sorted(docs))} from the raw capture; nothing sent")
+        return OK
+
     def _batch_dir(self) -> Path:
         return self.root / "anthropic" / self.spike
+
+    def _flush(self, exchanges: Sequence[Exchange], key: str) -> None:
+        """Write the exchanges of this run not written yet (`_write_batch_exchanges`)."""
+        self._write_batch_exchanges(exchanges[self._written :], key)
+        self._written = len(exchanges)
 
     def _write_batch_exchanges(self, exchanges: Sequence[Exchange], key: str) -> None:
         """The batch spike's exchanges raw, named by route so a resumed run adds to them: `create`,
@@ -2217,6 +2272,8 @@ class Recorder:
             message = (line.get("result") or {}).get("message")
             if isinstance(message, dict):
                 message["id"] = f"msg_{self.spike}_recorded_{line['custom_id']}"
+                if isinstance(message.get("content"), list):  # thinking is never stored (G6)
+                    message["content"] = [_without_thinking(block) for block in message["content"]]
         listed: list[Any] = []
         for n in range(1, len(list(directory.glob("list-*.request.json"))) + 1):
             listed += [b for b in read(f"list-{n}").get("data", []) if b.get("id") == batch_id]
@@ -2355,7 +2412,10 @@ class Recorder:
 
     def commit_recorded(self) -> int:
         """`--commit-recorded`: commit the fake's answer of each counted case of a spike that records every
-        answer, whose raw capture is an error response; nothing is sent and no key is read."""
+        answer, whose raw capture is an error response; for the batch spike, its documents again from the raw
+        capture of its settled batch. Nothing is sent and no key is read."""
+        if self.spike in BATCH_SPIKES:
+            return self._recommit_batch()
         if not self.records_every_answer:
             self.say(f"{self.spike}: REFUSED, the spike does not record every answer; nothing written")
             return REFUSED
@@ -2484,6 +2544,12 @@ def _parse(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="the gateway spikes' mode (v4v2, v5, v14), which they always run in; refused for any other",
     )
+    parser.add_argument(
+        "--max-wait-hours",
+        type=float,
+        default=None,
+        help="the batch spike's longest wait for its batch to end, after its creation (at most 24)",
+    )
     return parser.parse_args(argv)
 
 
@@ -2514,9 +2580,16 @@ async def _main(
             file=stream,
         )
         return REFUSED
-    if args.commit_recorded and args.spike in GATEWAY_SPIKES | BATCH_SPIKES:
+    hours = args.max_wait_hours
+    if hours is not None and (args.spike not in BATCH_SPIKES or not 0 < hours <= 24):
         print(
-            f"{args.spike}: REFUSED, --commit-recorded is for the message spikes; nothing written",
+            f"{args.spike}: REFUSED, --max-wait-hours is for v12, above 0 and at most 24; nothing sent",
+            file=stream,
+        )
+        return REFUSED
+    if args.commit_recorded and args.spike in GATEWAY_SPIKES:
+        print(
+            f"{args.spike}: REFUSED, --commit-recorded is for the message and batch spikes; nothing written",
             file=stream,
         )
         return REFUSED
@@ -2561,6 +2634,7 @@ async def _main(
         batch_items=batch_items,
         sleep=asyncio.sleep if sleep is None else sleep,
         database=throwaway_database if database is None else database,
+        max_wait=BATCH_MAX_WAIT if hours is None else timedelta(hours=hours),
     )
     if args.dry_run:
         return await recorder.dry_run()

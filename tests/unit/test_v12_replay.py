@@ -23,6 +23,7 @@ import importlib.util
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -174,6 +175,20 @@ async def test_no_document_keeps_a_provider_id(documents: Documents) -> None:
     assert "request_id" not in text
 
 
+async def test_no_document_keeps_thinking(documents: Documents) -> None:
+    """Thinking content is never stored (G6): a thinking block keeps its shape only."""
+    blocks = [
+        block
+        for line in documents.results
+        for block in ((line["result"].get("message") or {}).get("content") or [])
+        if block.get("type") in ("thinking", "redacted_thinking")
+    ]
+    for block in blocks:
+        assert block.get("thinking", "") in ("", fake.THINKING_OMITTED)
+        assert block.get("signature", fake.SIGNATURE_OMITTED) == fake.SIGNATURE_OMITTED
+        assert block.get("data", fake.SIGNATURE_OMITTED) == fake.SIGNATURE_OMITTED
+
+
 # --- the recorder's batch path, on the fake -------------------------------------------------------------
 
 
@@ -301,6 +316,57 @@ async def test_a_run_after_a_crash_resumes_polling_the_created_batch_and_never_c
     ]
 
 
+async def test_a_batch_that_has_not_ended_within_the_wait_stops_and_stays_counted(tmp_path: Path) -> None:
+    """`--max-wait-hours 2`: the poll stops two hours after the creation with the batch still `created`
+    (counted at its worst case, for a later run to resume), and every exchange is on disk while it waits."""
+    answers = _fake_answers(tmp_path)
+    fake.batches(BatchScript(polls_until_ended=1_000))
+    start = datetime(2026, 10, 29, 12, 0, tzinfo=UTC)
+    ticks: list[datetime] = []
+
+    def clock() -> datetime:  # every reading half an hour after the previous one
+        ticks.append(start + timedelta(minutes=30 * len(ticks)))
+        return ticks[-1]
+
+    raw = tmp_path / "raw/anthropic/v12"
+    on_disk: list[bool] = []
+
+    async def sleep(seconds: float) -> None:
+        assert seconds == rec.BATCH_POLL_S
+        retrieves = len(list(raw.glob("retrieve-*.response.json")))
+        on_disk.append((raw / "create.request.json").is_file() and retrieves == len(on_disk) + 1)
+
+    code = await rec.main_async(
+        ["--spike", "v12", "--live", "--max-wait-hours", "2"],
+        root=tmp_path / "raw",
+        fixtures_out=tmp_path / "fixtures",
+        environ={"JOBHUNTER_ANTHROPIC_API_KEY": FAKE_KEY},
+        transport_factory=lambda: fake.RecordedSSETransport(answers),
+        sleep=sleep,
+        now=clock,
+    )
+    assert code == rec.STOPPED
+    (entry,) = json.loads((tmp_path / "raw/anthropic-budget.json").read_text("utf-8"))["entries"]
+    assert (entry["state"], entry["settled_usd"]) == ("created", None)
+    assert on_disk and all(on_disk)
+    assert not (tmp_path / "fixtures").exists()  # nothing committed before the results
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--spike", "v5", "--dry-run", "--max-wait-hours", "2"],
+        ["--spike", "v12", "--dry-run", "--max-wait-hours", "0"],
+        ["--spike", "v12", "--dry-run", "--max-wait-hours", "25"],
+    ],
+)
+def test_max_wait_hours_is_for_the_batch_spike_within_a_day(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    code = rec.main(argv, root=tmp_path / "raw", fixtures_out=tmp_path / "fixtures", environ={})
+    assert code == rec.REFUSED and "--max-wait-hours is for v12" in capsys.readouterr().out
+
+
 async def test_a_create_without_a_known_outcome_is_never_sent_again(tmp_path: Path) -> None:
     sending = {
         "spike": "v12",
@@ -324,6 +390,50 @@ async def test_a_create_without_a_known_outcome_is_never_sent_again(tmp_path: Pa
     )
     assert code == rec.STOPPED
     assert json.loads((tmp_path / "raw/anthropic-budget.json").read_text("utf-8"))["entries"] == [sending]
+
+
+async def test_commit_recorded_rebuilds_the_documents_from_the_raw_capture_without_thinking(
+    tmp_path: Path,
+) -> None:
+    code, directory = await fake_run(tmp_path)
+    assert code == rec.OK
+    # the API's answer carries a thinking block before the text (the fake's never does)
+    raw = tmp_path / "raw/anthropic/v12/results.response.jsonl"
+    lines = [json.loads(line) for line in raw.read_text("utf-8").splitlines()]
+    succeeded = next(line for line in lines if line["result"]["type"] == "succeeded")
+    thinking = {"type": "thinking", "thinking": "Synthetic reasoning.", "signature": "U3ludGhldGlj" * 8}
+    succeeded["result"]["message"]["content"].insert(0, thinking)
+    raw.write_text("".join(json.dumps(line) + "\n" for line in lines), "utf-8")
+    again = await rec.main_async(
+        ["--spike", "v12", "--commit-recorded"],
+        root=tmp_path / "raw",
+        fixtures_out=tmp_path / "fixtures",
+        environ={},
+        transport_factory=lambda: (_ for _ in ()).throw(AssertionError("nothing is sent")),
+    )
+    assert again == rec.OK
+    committed = json.loads((directory / "results.json").read_text("utf-8"))
+    mine = next(line for line in committed if line["custom_id"] == succeeded["custom_id"])
+    assert mine["result"]["message"]["content"][0] == {
+        "type": "thinking",
+        "thinking": fake.THINKING_OMITTED,
+        "signature": fake.SIGNATURE_OMITTED,
+    }
+    text = (directory / "results.json").read_text("utf-8")
+    assert "Synthetic reasoning." not in text and "U3ludGhldGlj" not in text
+
+
+async def test_commit_recorded_needs_a_settled_batch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = await rec.main_async(
+        ["--spike", "v12", "--commit-recorded"],
+        root=tmp_path / "raw",
+        fixtures_out=tmp_path / "fixtures",
+        environ={},
+    )
+    assert code == rec.REFUSED and "no settled batch" in capsys.readouterr().out
+    assert not (tmp_path / "fixtures").exists()
 
 
 def _raw_create(tmp: Path) -> dict[str, Any]:

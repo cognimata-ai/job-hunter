@@ -986,8 +986,8 @@ def test_through_gateway_is_refused_for_a_spike_that_does_not_run_through_the_ga
     assert factory.created == 0 and not (tmp_path / "raw").exists()
 
 
-@pytest.mark.parametrize("spike", ["v4v2", "v5", "v14", "v12"])
-def test_commit_recorded_is_refused_for_the_gateway_and_batch_spikes(
+@pytest.mark.parametrize("spike", ["v4v2", "v5", "v14"])
+def test_commit_recorded_is_refused_for_the_gateway_spikes(
     rec: ModuleType, tmp_path: Path, spike: str
 ) -> None:
     factory = Factory(recorded_stream)

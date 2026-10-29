@@ -1,0 +1,134 @@
+[
+  {
+    "custom_id": "t2_a1",
+    "result": {
+      "message": {
+        "container": null,
+        "content": [
+          {
+            "signature": "[signature omitted]",
+            "thinking": "",
+            "type": "thinking"
+          },
+          {
+            "text": "{\"not_a_job_ad\":false,\"injection_observed\":false,\"facts\":[{\"code\":\"work_mode\",\"value\":\"hybrid\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Work modes: hybrid (structured)\",\"Wir bieten hybrides Arbeiten mit zwei Bürotagen pro Woche\"]},{\"code\":\"remote_region\",\"value\":\"germany\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Remote (Deutschland)\"]},{\"code\":\"remote_country\",\"value\":\"DE\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Remote (Deutschland)\"]},{\"code\":\"required_language\",\"value\":\"de\",\"qualifier\":\"B2\",\"required\":true,\"evidence\":[\"Sehr gute Deutschkenntnisse und gute Englischkenntnisse (mindestens C1) sind Voraussetzung.\"]},{\"code\":\"required_language\",\"value\":\"en\",\"qualifier\":\"C1\",\"required\":true,\"evidence\":[\"Sehr gute Deutschkenntnisse und gute Englischkenntnisse (mindestens C1) sind Voraussetzung.\"]},{\"code\":\"must_have\",\"value\":\"Backend-Entwicklung mit Python und PostgreSQL bis in die Produktion\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Du entwickelst und betreibst Dienste in Python und PostgreSQL, bis in die Produktion.\"]},{\"code\":\"must_have\",\"value\":\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"]},{\"code\":\"must_have\",\"value\":\"Code-Reviews, Testautomatisierung und Monitoring\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Code-Reviews, Testautomatisierung und Monitoring sind für dich selbstverständlich.\"]},{\"code\":\"nice_to_have\",\"value\":\"Erfahrung mit Kafka, Kubernetes und Terraform\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Erfahrung mit Kafka, Kubernetes und Terraform ist von Vorteil, aber kein Muss.\"]},{\"code\":\"seniority\",\"value\":\"senior\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Senior Backend Engineer (Python) Netzleitstelle\"]},{\"code\":\"min_years_experience\",\"value\":\"5\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"]},{\"code\":\"industry\",\"value\":\"Energie\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Unsere Plattform verarbeitet täglich viele Ereignisse aus dem Bereich Energie; Zuverlässigkeit zählt.\"]},{\"code\":\"employment_type\",\"value\":\"full_time\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Employment types: full_time (structured)\"]},{\"code\":\"degree\",\"value\":\"unspecified\",\"qualifier\":\"Informatik\",\"required\":true,\"evidence\":[\"Ein abgeschlossenes Studium der Informatik oder eine vergleichbare Qualifikation wird erwartet.\"]},{\"code\":\"degree_or_equivalent\",\"value\":\"\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"oder eine vergleichbare Qualifikation wird erwartet\"]}],\"criteria\":[{\"criterion\":\"role_fit\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Du entwickelst und betreibst Dienste in Python und PostgreSQL, bis in die Produktion.\"],\"profile_evidence\":[{\"section\":\"target_titles\",\"quote\":\"Senior Backend Engineer\"}],\"rationale\":\"Same role family and title as a confirmed target; backend service development and operation match.\"},{\"criterion\":\"skills\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Erfahrung mit Kafka, Kubernetes und Terraform ist von Vorteil, aber kein Muss.\",\"Code-Reviews, Testautomatisierung und Monitoring sind für dich selbstverständlich.\"],\"profile_evidence\":[{\"section\":\"skills\",\"quote\":\"Code-Reviews (7 Jahre, Logistik)\"},{\"section\":\"skills\",\"quote\":\"Kafka (3 Jahre, Logistik)\"}],\"rationale\":\"All must-haves evidenced at depth, including Python, PostgreSQL and testing; nice-to-haves Kafka, Kubernetes and Terraform also present.\"},{\"criterion\":\"experience_seniority\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"],\"profile_evidence\":[{\"section\":\"seniority\",\"quote\":\"senior\"},{\"section\":\"summary\",\"quote\":\"zehn Jahren Erfahrung\"}],\"rationale\":\"Senior profile matches senior ad; 10 years total exceeds the required 5 years.\"},{\"criterion\":\"domain\",\"level\":2,\"basis\":\"observed\",\"ad_evidence\":[\"Unsere Plattform verarbeitet täglich viele Ereignisse aus dem Bereich Energie; Zuverlässigkeit zählt.\"],\"profile_evidence\":[{\"section\":\"domains\",\"quote\":\"Logistik\"},{\"section\":\"roles\",\"quote\":\"Built shipment tracking services in Python with an event pipeline on Kafka (1).\"}],\"rationale\":",
+            "type": "text"
+          }
+        ],
+        "diagnostics": null,
+        "id": "msg_v12_recorded_t2_a1",
+        "model": "claude-haiku-5-5",
+        "role": "assistant",
+        "stop_details": null,
+        "stop_reason": "max_tokens",
+        "stop_sequence": null,
+        "type": "message",
+        "usage": {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 8644,
+          "inference_geo": "global",
+          "input_tokens": 1779,
+          "output_tokens": 6000,
+          "output_tokens_details": {
+            "thinking_tokens": 4116
+          },
+          "service_tier": "batch",
+          "speed": "standard"
+        }
+      },
+      "type": "succeeded"
+    }
+  },
+  {
+    "custom_id": "t1_a1",
+    "result": {
+      "message": {
+        "container": null,
+        "content": [
+          {
+            "signature": "[signature omitted]",
+            "thinking": "",
+            "type": "thinking"
+          },
+          {
+            "text": "{\"not_a_job_ad\":false,\"injection_observed\":false,\"facts\":[{\"code\":\"work_mode\",\"value\":\"hybrid\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Wir bieten hybrides Arbeiten mit zwei Bürotagen pro Woche\"]},{\"code\":\"seniority\",\"value\":\"senior\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Senior Backend Engineer (Python) Sendungsverfolgung\"]},{\"code\":\"min_years_experience\",\"value\":\"5\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"]},{\"code\":\"must_have\",\"value\":\"Du entwickelst und betreibst Dienste in Python und PostgreSQL, bis in die Produktion.\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Du entwickelst und betreibst Dienste in Python und PostgreSQL, bis in die Produktion.\"]},{\"code\":\"required_language\",\"value\":\"de\",\"qualifier\":\"B2\",\"required\":true,\"evidence\":[\"Sehr gute Deutschkenntnisse und gute Englischkenntnisse (mindestens C1) sind Voraussetzung.\"]},{\"code\":\"required_language\",\"value\":\"en\",\"qualifier\":\"C1\",\"required\":true,\"evidence\":[\"Sehr gute Deutschkenntnisse und gute Englischkenntnisse (mindestens C1) sind Voraussetzung.\"]},{\"code\":\"nice_to_have\",\"value\":\"Erfahrung mit Kafka, Kubernetes und Terraform\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Erfahrung mit Kafka, Kubernetes und Terraform ist von Vorteil, aber kein Muss.\"]},{\"code\":\"must_have\",\"value\":\"Code-Reviews, Testautomatisierung und Monitoring\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Code-Reviews, Testautomatisierung und Monitoring sind für dich selbstverständlich.\"]},{\"code\":\"must_have\",\"value\":\"Enge Zusammenarbeit mit Fachbereich, Betrieb und Produktmanagement sowie Moderation von Workshops\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Du arbeitest eng mit Fachbereich, Betrieb und Produktmanagement zusammen und moderierst Workshops.\"]},{\"code\":\"degree\",\"value\":\"unspecified\",\"qualifier\":\"Informatik\",\"required\":true,\"evidence\":[\"Ein abgeschlossenes Studium der Informatik oder eine vergleichbare Qualifikation wird erwartet.\"]},{\"code\":\"degree_or_equivalent\",\"value\":\"\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"oder eine vergleichbare Qualifikation wird erwartet\"]},{\"code\":\"industry\",\"value\":\"Logistik\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Unsere Plattform verarbeitet täglich viele Ereignisse aus dem Bereich Logistik\"]},{\"code\":\"employment_type\",\"value\":\"full_time\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Employment types: full_time (structured)\"]}],\"criteria\":[{\"criterion\":\"role_fit\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Senior Backend Engineer (Python) Sendungsverfolgung\"],\"profile_evidence\":[{\"section\":\"target_titles\",\"quote\":\"Senior Backend Engineer\"}],\"rationale\":\"Ad title and responsibilities match the confirmed target title and demonstrated backend roles.\"},{\"criterion\":\"skills\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Du entwickelst und betreibst Dienste in Python und PostgreSQL, bis in die Produktion.\",\"Code-Reviews, Testautomatisierung und Monitoring sind für dich selbstverständlich.\"],\"profile_evidence\":[{\"section\":\"skills\",\"quote\":\"Python (7 Jahre, Logistik)\"},{\"section\":\"skills\",\"quote\":\"PostgreSQL (6 Jahre, Logistik)\"}],\"rationale\":\"All must-haves are evidenced, and Kafka, Kubernetes and Terraform are present as nice-to-haves.\"},{\"criterion\":\"experience_seniority\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"],\"profile_evidence\":[{\"section\":\"summary\",\"quote\":\"Backend-Entwicklerin mit zehn Jahren Erfahrung\"}],\"rationale\":\"Senior level matches senior requirement; ten years exceed the five-year minimum.\"},{\"criterion\":\"domain\",\"level\":4,\"basis\":\"observed\",\"ad_evidence",
+            "type": "text"
+          }
+        ],
+        "diagnostics": null,
+        "id": "msg_v12_recorded_t1_a1",
+        "model": "claude-haiku-5-5",
+        "role": "assistant",
+        "stop_details": null,
+        "stop_reason": "max_tokens",
+        "stop_sequence": null,
+        "type": "message",
+        "usage": {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 8644
+          },
+          "cache_creation_input_tokens": 8644,
+          "cache_read_input_tokens": 0,
+          "inference_geo": "global",
+          "input_tokens": 1792,
+          "output_tokens": 6000,
+          "output_tokens_details": {
+            "thinking_tokens": 4372
+          },
+          "service_tier": "batch",
+          "speed": "standard"
+        }
+      },
+      "type": "succeeded"
+    }
+  },
+  {
+    "custom_id": "t3_a1",
+    "result": {
+      "message": {
+        "container": null,
+        "content": [
+          {
+            "signature": "[signature omitted]",
+            "thinking": "",
+            "type": "thinking"
+          },
+          {
+            "text": "{\"not_a_job_ad\":false,\"injection_observed\":false,\"facts\":[{\"code\":\"work_mode\",\"value\":\"hybrid\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Wir bieten hybrides Arbeiten mit zwei Bürotagen pro Woche\"]},{\"code\":\"remote_region\",\"value\":\"germany\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Remote (Deutschland)\"]},{\"code\":\"remote_country\",\"value\":\"DE\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Remote (Deutschland)\"]},{\"code\":\"employment_type\",\"value\":\"full_time\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Employment types: full_time (structured)\"]},{\"code\":\"seniority\",\"value\":\"senior\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Senior Backend Engineer (Python) Schadenbearbeitung\"]},{\"code\":\"min_years_experience\",\"value\":\"5\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"]},{\"code\":\"industry\",\"value\":\"Versicherung\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Unsere Plattform verarbeitet täglich viele Ereignisse aus dem Bereich Versicherung\"]},{\"code\":\"must_have\",\"value\":\"Backend-Entwicklung mit Python\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"]},{\"code\":\"must_have\",\"value\":\"Dienste in Python und PostgreSQL entwickeln und betreiben bis in die Produktion\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Du entwickelst und betreibst Dienste in Python und PostgreSQL, bis in die Produktion.\"]},{\"code\":\"must_have\",\"value\":\"Code-Reviews, Testautomatisierung und Monitoring\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Code-Reviews, Testautomatisierung und Monitoring sind für dich selbstverständlich.\"]},{\"code\":\"must_have\",\"value\":\"Moderation von Workshops\",\"qualifier\":\"\",\"required\":true,\"evidence\":[\"Du arbeitest eng mit Fachbereich, Betrieb und Produktmanagement zusammen und moderierst Workshops.\"]},{\"code\":\"nice_to_have\",\"value\":\"Kafka, Kubernetes und Terraform\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"Erfahrung mit Kafka, Kubernetes und Terraform ist von Vorteil, aber kein Muss.\"]},{\"code\":\"required_language\",\"value\":\"de\",\"qualifier\":\"B2\",\"required\":true,\"evidence\":[\"Sehr gute Deutschkenntnisse und gute Englischkenntnisse (mindestens C1) sind Voraussetzung.\"]},{\"code\":\"required_language\",\"value\":\"en\",\"qualifier\":\"C1\",\"required\":true,\"evidence\":[\"gute Englischkenntnisse (mindestens C1) sind Voraussetzung\"]},{\"code\":\"degree\",\"value\":\"unspecified\",\"qualifier\":\"Informatik\",\"required\":true,\"evidence\":[\"Ein abgeschlossenes Studium der Informatik oder eine vergleichbare Qualifikation wird erwartet.\"]},{\"code\":\"degree_or_equivalent\",\"value\":\"\",\"qualifier\":\"\",\"required\":false,\"evidence\":[\"oder eine vergleichbare Qualifikation wird erwartet\"]}],\"criteria\":[{\"criterion\":\"role_fit\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Wir suchen eine erfahrene Person für die Backend-Entwicklung unserer Schadenbearbeitung.\"],\"profile_evidence\":[{\"section\":\"target_titles\",\"quote\":\"Senior Backend Engineer\"}],\"rationale\":\"Same role family and title as a confirmed target; responsibilities match backend service work.\"},{\"criterion\":\"skills\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Du entwickelst und betreibst Dienste in Python und PostgreSQL, bis in die Produktion.\",\"Code-Reviews, Testautomatisierung und Monitoring sind für dich selbstverständlich.\"],\"profile_evidence\":[{\"section\":\"skills\",\"quote\":\"Python (7 Jahre, Logistik)\"},{\"section\":\"skills\",\"quote\":\"PostgreSQL (6 Jahre, Logistik)\"}],\"rationale\":\"All must-haves evidenced at depth; Kafka, Kubernetes and Terraform also evidenced as nice-to-haves.\"},{\"criterion\":\"experience_seniority\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Mindestens fünf Jahre Erfahrung in der Backend-Entwicklung mit Python setzen wir voraus.\"],\"profile_evidence\":[{\"section\":\"seniority\",\"quote\":\"senior\"},{\"section\":\"summary\",\"quote\":\"Backend-Entwicklerin mit zehn Jahren Erfahrung\"}],\"rationale\":\"Senior level matches senior role; ten years total exceed the five required.\"},{\"criterion\":\"domain\",\"level\":1,\"basis\":\"observed\",\"ad_evidence\":[\"Unsere Plattform verarbeitet täglich viele Ereignisse aus dem Bereich Versicherung\"],\"profile_evidence\":[{\"section\":\"domains\",\"quote\":\"Logistik\"}],\"rationale\":\"Insurance domain is new; only generic event-pipeline and platform overlap from logistics.\"},{\"criterion\":\"languages\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Sehr gute Deutschkenntnisse und gute Englischkenntnisse (mindestens C1) sind Voraussetzung.\"],\"profile_evidence\":[{\"section\":\"languages\",\"quote\":\"Deutsch (Muttersprache)\"},{\"section\":\"languages\",\"quote\":\"Englisch (C1)\"}],\"rationale\":\"German native and English C1 meet both stated requirements.\"},{\"criterion\":\"education_certifications\",\"level\":4,\"basis\":\"observed\",\"ad_evidence\":[\"Ein abgeschlossenes Studium der Informatik oder eine vergleichbare Qualifikation wird erwartet.\"],\"profile_evidence\":[{\"section\":\"education\",\"quote\":\"Informatik\"}],\"rationale\":\"Master in Informatik meets the stated degree requirement.\"}],\"summary_en\":\"Strong fit: the title, the Python and PostgreSQL must-haves, the years of experience, the German and English levels and the degree all match the profile. Main gap: the insurance domain is new, while the profile shows logistics. Kafka, Kubernetes and Terraform are optional and evidenced.\",\"summary_de\":\"Starker Fit: Titel, Python- und PostgreSQL-Anforderungen, Berufserfahrung, Sprachniveau und Studium passen zum Profil. Hauptlücke: Die Versicherungsdomäne ist neu, das Profil zeigt Logistik. Kafka, Kubernetes und Terraform sind optional und vorhanden.\"}",
+            "type": "text"
+          }
+        ],
+        "diagnostics": null,
+        "id": "msg_v12_recorded_t3_a1",
+        "model": "claude-haiku-5-5",
+        "role": "assistant",
+        "stop_details": null,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "type": "message",
+        "usage": {
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 8644,
+          "inference_geo": "global",
+          "input_tokens": 1791,
+          "output_tokens": 5759,
+          "output_tokens_details": {
+            "thinking_tokens": 3356
+          },
+          "service_tier": "batch",
+          "speed": "standard"
+        }
+      },
+      "type": "succeeded"
+    }
+  }
+]
