@@ -11,10 +11,7 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"{\"summary\":\"Back"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end engineer with about"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" 9"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end engineer with about 9"}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" years of"}}
@@ -26,61 +23,118 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ience in logistics and data"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" software.\",\"target_titles\":"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" processing.\",\"target_titles"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[{\"title\":\"Back"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":[{\"title\":\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end Engineer\",\"lang"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Backend Engineer\",\"l"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"en\"},{\"title"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ang\":\"en\"},{\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"Softwareentw"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"title\":\"Soft"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ickler\",\"lang\":\"de"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"wareentwickler\",\"l"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"}],\"seniority\":"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ang\":\"de\"}],\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"senior\",\"total_years_"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"seniority\":\"sen"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"experience\":9,"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ior\",\"total_years_experience"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"roles\":[{\"title"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":9,\"roles\":["}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"Backend Engine"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"{\"title\":\"Backend"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"er\",\"employer\":\"Be"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Engineer\",\"employer\":"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ispiel Logistik G"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"Beispiel Log"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"mbH\",\"start\":\"2"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"istik GmbH\",\"start"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"019-03-01\",\"end\":"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"2019-03-01"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"present\",\"seniority\":\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"end\":\"present\",\"seni"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"unspecified\",\"domain\":"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ority\":\"un"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"Logistics\",\"highl"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"specified\",\"domain\":\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ights\":[\"Sendungs"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Logistics\",\"highlights"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":[\"Sendungsver"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"folgung mit Python"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" und PostgreSQL"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":".\"]},{\"title\":\""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Softwareentwickler"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"employer\":\"Muster"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"daten AG\",\"start\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"2016-09-01\",\""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end\":\"2019-02-"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"28\",\"seniority\":\"un"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"specified\",\"domain\":\""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Data\",\"highlights\":[\""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Datenimporte in"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Python.\"]}],\"skills"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":[{\"name\":\""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Python\",\"category\":\"programming_"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"language\",\"level\":\"advanced"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"years\":9,\"evid"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ence\":\"Sendungs"}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"verfolgung mit"}}
@@ -89,67 +143,13 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Python und PostgreSQ"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"L.\"]},{\"title\":"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"L.\"},{\"name\":\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"Softwareentwick"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PostgreSQL\",\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ler\",\"employer\":\"Mus"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"terdaten AG\",\"start"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"2016-09-01"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"end\":\"2019-02"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"-28\",\"seniority\":\""}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"unspecified\",\"domain\":"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"Data\",\"highlights\":"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[\"Datenimporte in"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Python.\"]}],\"sk"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ills\":[{\"name\":\""}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Python\",\"category\":\"programming"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"_language\",\"level\":\"advan"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ced\",\"years\":9,\"ev"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"idence\":\"Sendung"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"sverfolgung mit"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Python und PostgreS"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"QL.\"},{\"name\":"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"PostgreSQL"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"category\":\"t"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"category\":\"t"}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ool\",\"level\":\"intermedi"}}
@@ -260,16 +260,16 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"],\"domains\":[\"Log"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"istics\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"istics\",\"Data process"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"]}"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ing\"]}"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"container":null},"usage":{"input_tokens":2588,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":650,"output_tokens_details":{"thinking_tokens":0}}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"container":null},"usage":{"input_tokens":2588,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":656,"output_tokens_details":{"thinking_tokens":0}}}
 
 event: message_stop
 data: {"type":"message_stop"}
