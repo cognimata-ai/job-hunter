@@ -12,6 +12,7 @@ invented.
 """
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
 import httpx
@@ -227,6 +228,61 @@ async def test_a_runs_gate_counts_the_users_cases_only(
     _, run = await golden_run(engine, fake_llm, current_epoch)
     assert (run.status, run.passed, run.metrics["gate"]) == ("completed", None, "uncalibrated")
     assert run.metrics["cases"]["active"] == 30 and run.metrics["observations"]["primary"] == 30
+
+
+_SET_ACTIVE: Final = sa.text("UPDATE golden_cases SET active = :active WHERE id = ANY(:ids)")
+
+
+async def set_active(engine: AsyncEngine, ids: list[int], *, active: bool) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(_SET_ACTIVE, {"active": active, "ids": ids})
+
+
+def membership_changed_before_the_first_case(
+    engine: AsyncEngine, *, activated: list[int], deactivated: list[int]
+) -> Callable[[str], Awaitable[None]]:
+    """An `afault_point` replacement that activates and deactivates cases once, when the run reaches its first
+    case: after the runner listed its cases, before its terminal transaction."""
+    changed = False
+
+    async def fault(name: str) -> None:
+        nonlocal changed
+        if name == eval_runner.BEFORE_CASE and not changed:
+            changed = True
+            await set_active(engine, activated, active=True)
+            await set_active(engine, deactivated, active=False)
+
+    return fault
+
+
+@pytest.mark.parametrize("change", ["added", "swapped"])
+async def test_a_runs_gate_counts_only_the_cases_it_evaluated_that_are_still_active(
+    engine: AsyncEngine,
+    fake_llm: FakeLLM,
+    current_epoch: int,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    """Ruling F1-a (L4630): the gate's count is the user's cases the run evaluated (a primary observation)
+    that are still active at its end. Twenty cases activated while ten run (`added`), or a case swapped for
+    an unevaluated one (`swapped`), never make a run of fewer than 30 such cases `passed`."""
+    if change == "added":  # ten cases of every label run; twenty more are activated meanwhile
+        made = await graded_cases(engine, fake_llm, 30)
+        kept = [c.id for i, c in enumerate(made) if i in {0, 1, 2, 10, 11, 12, 20, 21, 22, 23}]
+        later = [c.id for c in made if c.id not in kept]
+        await set_active(engine, later, active=False)
+        activated, deactivated, evaluated = later, [], 10
+    else:  # thirty run; one of them is deactivated and an unevaluated one activated meanwhile
+        made = await graded_cases(engine, fake_llm, 31)
+        await set_active(engine, [made[-1].id], active=False)
+        activated, deactivated, evaluated = [made[-1].id], [made[0].id], 30
+    hook = membership_changed_before_the_first_case(engine, activated=activated, deactivated=deactivated)
+    monkeypatch.setattr(eval_runner, "afault_point", hook)
+    _, run = await golden_run(engine, fake_llm, current_epoch)
+    assert run.metrics["observations"]["primary"] == evaluated
+    assert (run.status, run.passed, run.metrics["gate"]) == ("completed", None, "uncalibrated")
+    async with engine.connect() as conn:  # the golden set holds 30 active user cases at the run's end
+        assert await validate.gate_cases(conn) == validate.GATE_MIN_CASES
 
 
 async def test_the_calibration_commits_with_the_operations_end(

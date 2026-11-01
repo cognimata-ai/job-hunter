@@ -41,7 +41,8 @@ exactly.
   (the cost set) beside `central_cost_usd`.
 
 **The gate** (`gate`, L4616-4631): `uncalibrated` while fewer than `GATE_MIN_CASES` of the user's cases are
-active (`active_cases`: the caller's count, `validate.gate_cases`, which leaves the adversarial ones out);
+active (`active_cases`: the caller's count; a run's is `validate.run_gate_cases`, the cases it evaluated that
+are still active, which leaves the adversarial ones out, Rulings T20-b, F1-a);
 `passed` iff every gate holds (`failed_gates` is empty): schema validity and grounding rate 1, rho at least
 0.6, pairwise agreement at least 0.75, no false exclusion, knockout recall 1, contested rate at most 0.15 and
 a measured test-retest SD of at most 5 (a missing one fails as `test_retest_missing`); `failed` otherwise.
@@ -378,7 +379,8 @@ def failed_gates(m: Metrics) -> list[str]:
 
 
 def gate(m: Metrics, *, active_cases: int) -> GateState:
-    """The gate's state (module docstring): `active_cases` is the number of the user's active golden cases."""
+    """The gate's state (module docstring): `active_cases` is the number of the user's active golden cases
+    the run evaluated (`validate.run_gate_cases`)."""
     if active_cases < GATE_MIN_CASES:
         return "uncalibrated"
     return "failed" if failed_gates(m) else "passed"

@@ -74,8 +74,9 @@ the calibration of the run's case rows (`eval_calibration.calibrate`: `calibrati
 candidate's projected critic rate, its model policy's §21.2 central cost and the trailing 7-day
 similarity-lane cut-off; `calibration.metrics_json`, with the gate's state and, when it failed,
 `failed_gates`), `passed` from
-`calibration.gate` over the user's active cases (`validate.gate_cases`: the adversarial ones are pooled in
-the metrics but never calibrate the gate, Ruling T20-b; a golden run only: `NULL` while uncalibrated and for
+`calibration.gate` over the user's active cases the run evaluated (`validate.run_gate_cases`, Ruling F1-a:
+the adversarial ones are pooled in the metrics but never calibrate the gate, Ruling T20-b, and a case added,
+activated or deactivated during the run never counts; a golden run only: `NULL` while uncalibrated and for
 a canary run) and the `cost_usd` its calls count; then its alerts (`eval.gate_failed`, warn, for a production
 golden run that failed, the candidate its subject; `scoring.canary_drift`, warn, for each canary of a canary
 run more than 8 points from its first score under its key, the case its subject;

@@ -378,7 +378,15 @@ def gate_transports() -> tuple[str, ...]:
 
 # The cases the gate's 30 counts (L4608, L4630, Ruling T20-b): the user's active ones (week 1 and feedback);
 # the adversarial cases are scored and pooled in the metrics but never calibrate the gate.
-_GATE_CASES: Final = q("SELECT count(*) FROM golden_cases WHERE active AND source <> 'adversarial'")
+_GATE_CASE: Final = "g.active AND g.source <> 'adversarial'"
+_GATE_CASES: Final = q(f"SELECT count(*) FROM golden_cases g WHERE {_GATE_CASE}")  # noqa: S608 (a constant)
+# A run's own count (Ruling F1-a): those of them that the run evaluated, with a primary observation (its first
+# repetition's result row; a deleted case's rows go with it).
+_RUN_GATE_CASES: Final = q(
+    f"SELECT count(*) FROM golden_cases g WHERE {_GATE_CASE} "  # noqa: S608 (a constant)
+    "AND EXISTS (SELECT 1 FROM eval_case_results e WHERE e.eval_run_id = :run AND e.golden_case_id = g.id "
+    "AND e.repetition = 1)"
+)
 _ACTIVE_CANDIDATE: Final = q(
     "SELECT a.rubric_version_id, a.prompt_schema_version_id, m.policy_hash AS model_policy_hash, "
     "e.policy_hash AS evaluation_policy_hash FROM active_config a "
@@ -399,8 +407,16 @@ _GATE_RUN: Final = q(
 
 async def gate_cases(conn: AsyncConnection) -> int:
     """The number of the user's active golden cases, which the gate's `GATE_MIN_CASES` counts (Ruling T20-b):
-    the adversarial ones are left out. `eval_gate_state` and an eval run's own gate both read it."""
+    the adversarial ones are left out. `eval_gate_state` reads it; an eval run's own gate reads
+    `run_gate_cases`."""
     return int((await conn.execute(_GATE_CASES)).scalar_one())
+
+
+async def run_gate_cases(conn: AsyncConnection, eval_run_id: int) -> int:
+    """The number of the cases `gate_cases` counts that eval run `eval_run_id` evaluated, with a primary
+    observation (Ruling F1-a): a case added or activated during the run was never evaluated, and one
+    deactivated during it is no longer the user's, so neither can make a run of fewer cases calibrated."""
+    return int((await conn.execute(_RUN_GATE_CASES, {"run": eval_run_id})).scalar_one())
 
 
 async def eval_gate_state(conn: AsyncConnection, *, candidate: Candidate | None = None) -> GateState:

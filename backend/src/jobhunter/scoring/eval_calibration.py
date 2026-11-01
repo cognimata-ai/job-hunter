@@ -8,8 +8,8 @@
 - `calibrate(conn, …)`: the run's calibration in its terminal transaction: `calibration.metrics` over its
   case rows against the candidate's projected critic rate, its model policy's §21.2 central cost and the
   trailing 7-day similarity-lane cut-off (`CUTOFF_WINDOW`; the lowest similarity the lane admitted),
-  `calibration.gate` over the user's active cases (`validate.gate_cases`), and `passed` (a golden run only,
-  `NULL` while uncalibrated).
+  `calibration.gate` over the user's active cases that the run evaluated (`validate.run_gate_cases`, Ruling
+  F1-a), and `passed` (a golden run only, `NULL` while uncalibrated).
 - `raise_alerts(conn, …)`: after the run's `completed`, `eval.gate_failed` (warn) for a production golden
   run that failed, its candidate the subject, and `scoring.canary_drift` (warn) for each canary of a canary
   run more than 8 points from its first score under its key (`calibration.canary_drift`), its case the
@@ -31,7 +31,7 @@ from jobhunter.db.sql import q
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring import calibration
-from jobhunter.settings.validate import GateState, gate_cases
+from jobhunter.settings.validate import GateState, run_gate_cases
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import Deferrer
 
@@ -123,7 +123,8 @@ async def calibrate(
     now: datetime,
 ) -> Calibrated:
     """Run `eval_run_id`'s calibration and gate in its terminal transaction (module docstring): the gate
-    counts the user's active cases (`validate.gate_cases`, Ruling T20-b); the metrics pool every case."""
+    counts the user's cases (Ruling T20-b) that the run evaluated and that are still active
+    (`validate.run_gate_cases`, Ruling F1-a); the metrics pool every case."""
     rows = await run_cases(conn, eval_run_id)
     cutoff = (
         await conn.execute(_SIMILARITY_CUTOFF, {"since": now - CUTOFF_WINDOW, "now": now})
@@ -135,7 +136,7 @@ async def calibrate(
         central_cost_usd=central_cost_usd,
         similarity_cutoff=None if cutoff is None else Decimal(str(cutoff)),
     )
-    state = calibration.gate(m, active_cases=await gate_cases(conn))
+    state = calibration.gate(m, active_cases=await run_gate_cases(conn, eval_run_id))
     passed = None if kind != "golden" or state == "uncalibrated" else state == "passed"
     return Calibrated(state, calibration.metrics_json(m, state=state), passed)
 
