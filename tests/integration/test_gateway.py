@@ -16,8 +16,8 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.errors import FencedOut
+from jobhunter.llm import fake, spend_ledger
 from jobhunter.llm import gateway as gateway_module
-from jobhunter.llm import spend_ledger
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS, native_pdf_bound, text_input_bound
 from jobhunter.llm.cache_monitor import CacheMonitor, write_alerts
 from jobhunter.llm.errors import (
@@ -718,7 +718,7 @@ async def test_settle_in_flight_cancels_a_try_still_streaming_and_waits_for_its_
 
 
 async def test_settle_in_flight_counts_what_is_still_settling_at_its_timeout(
-    engine, fake_llm: FakeLLM, owner, ec, monkeypatch
+    engine, fake_llm: FakeLLM, owner, ec, monkeypatch, log_events
 ) -> None:
     gateway, call = await stalled_call(engine, fake_llm, owner, ec)
     released = asyncio.Event()
@@ -729,7 +729,78 @@ async def test_settle_in_flight_counts_what_is_still_settling_at_its_timeout(
 
     monkeypatch.setattr(spend_ledger, "settle", slow_settlement)
     assert await gateway.settle_in_flight(0.2) == 1
+    # a second stop while the cancelled try settles: it waits again and does not cancel the settlement
+    assert await gateway.settle_in_flight(0.2) == 1
     released.set()
     with pytest.raises(asyncio.CancelledError):
         await call
+    # the first cancel's path: the settlement ran to its database error and logged it (a second cancel
+    # would have cut it at `released.wait()`, and nothing would be logged)
+    assert [e["event"] for e in log_events() if e["event"] == "llm_cancelled_try_unsettled"] == [
+        "llm_cancelled_try_unsettled"
+    ]
     assert await gateway.settle_in_flight(0.2) == 0  # an ended try leaves the count
+
+
+async def test_settle_in_flight_waits_for_a_settlement_under_way_and_never_cancels_it(
+    engine, fake_llm: FakeLLM, owner, ec, monkeypatch
+) -> None:
+    """Fix round 1, item 1: a try whose stream has ended is settling; the stop waits for its settlement
+    within its timeout and never cancels it, so the entry is billed."""
+    settling, released = asyncio.Event(), asyncio.Event()
+    settle = spend_ledger.settle
+
+    async def slow_settlement(*args: Any, **kwargs: Any) -> spend_ledger.SettleFigures:
+        settling.set()
+        await released.wait()
+        return await settle(*args, **kwargs)
+
+    monkeypatch.setattr(spend_ledger, "settle", slow_settlement)
+    gateway = fake_llm.gateway(engine)
+    call = asyncio.create_task(gateway.call(GATEWAY_NODE, gateway_prompt(), call_context(owner, ec)))
+    await asyncio.wait_for(settling.wait(), 10)
+    assert await gateway.settle_in_flight(0.2) == 1  # still settling at the timeout
+    assert (call.cancelling(), call.done()) == (0, False)
+    released.set()
+    result = await call
+    assert isinstance(result, GatewayResult)
+    (row,) = await tries(engine)
+    assert (states([row]), row.status) == (["billed"], "completed")
+    assert await gateway.settle_in_flight(0.2) == 0
+
+
+class SlowCleanupStream(fake._StalledStream):
+    """The stalled stream, whose cancellation runs a cleanup that waits for `released` (a connection that
+    takes a while to close) and then records that it finished."""
+
+    released: asyncio.Event
+    finished: list[str]
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in super().__aiter__():
+                yield chunk
+        except asyncio.CancelledError:
+            await self.released.wait()
+            self.finished.append("cleanup")
+            raise
+
+
+async def test_settle_in_flight_never_cancels_a_try_twice(
+    engine, fake_llm: FakeLLM, owner, ec, monkeypatch
+) -> None:
+    """Fix round 1, item 3: a try that a cancellation has reached is still in its stream while the stream's
+    own cleanup runs; a second stop must not cancel it again, which would cut that cleanup short."""
+    released, finished = asyncio.Event(), list[str]()
+    monkeypatch.setattr(SlowCleanupStream, "released", released, raising=False)
+    monkeypatch.setattr(SlowCleanupStream, "finished", finished, raising=False)
+    monkeypatch.setattr(fake, "_StalledStream", SlowCleanupStream)
+    gateway, call = await stalled_call(engine, fake_llm, owner, ec)
+    assert await gateway.settle_in_flight(0.2) == 1  # cancelled; its stream's cleanup is waiting
+    assert await gateway.settle_in_flight(0.2) == 1  # a second stop: no second cancellation
+    released.set()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert finished == ["cleanup"]
+    (row,) = await tries(engine)
+    assert (row.state, row.status, row.error_code) == ("ambiguous", "ambiguous", "cancelled")

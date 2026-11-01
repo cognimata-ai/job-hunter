@@ -148,6 +148,7 @@ class World:
 
         class FakeExecutions:
             async def cancel_all(self, *, timeout_s: float = 30.0) -> int:
+                events.append("executions_cancel")
                 world.timeouts["executions"] = timeout_s
                 world.on_executions_cancelled()
                 return 0
@@ -250,6 +251,15 @@ class World:
         self.superseded = False  # a newer worker took over before step 8
         self.fence_owner = "worker_epoch"  # the owner of the fence step 8's guard raises when `superseded`
         self.start_fenced = False  # a newer worker took over after step 8's sync, before its reconcilers
+        # Task 28 fix round 1: the teardown's `llm_tries` step, on the real gateway the start builds.
+        from jobhunter.llm.gateway import LLMGateway
+
+        async def recording_settle_in_flight(gateway: object, timeout_s: float) -> int:
+            events.append("llm_tries")
+            world.timeouts["llm_tries"] = timeout_s
+            return 0
+
+        monkeypatch.setattr(LLMGateway, "settle_in_flight", recording_settle_in_flight)
         monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
         monkeypatch.setattr(http, "configure", recording_configure)
 
@@ -293,7 +303,17 @@ class World:
         self.cfg = load_config("worker", env, secrets)
 
 
-TEARDOWN = ["watchdog_stop", "saver_close", "queue_close", "engine_dispose", "lock_close"]
+# The executions are cancelled first, then the gateway's tries still in flight settle (`llm_tries`), before
+# the watchdog stops and well before the engine and the lock session close (Task 28 fix round 1).
+TEARDOWN = [
+    "executions_cancel",
+    "llm_tries",
+    "watchdog_stop",
+    "saver_close",
+    "queue_close",
+    "engine_dispose",
+    "lock_close",
+]
 
 
 async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch, tmp_path, caplog) -> None:
@@ -433,6 +453,7 @@ async def test_a_takeover_fenced_by_a_newer_epoch_exits_70_and_the_claim_s_own_f
     assert await main.worker_main(world.cfg) == code
     assert world.events[world.events.index("claim") :] == [
         "claim",
+        "executions_cancel",  # no gateway was built, so no `llm_tries`
         "queue_close",
         "engine_dispose",
         "lock_close",
@@ -614,6 +635,7 @@ async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_
     assert await worker_main(world.cfg) == 1
     # Nothing after the failed step was built; what was built is closed, the lock session last.
     assert world.events[world.events.index("queue_open") + 1 :] == [
+        "executions_cancel",  # no gateway was built, so no `llm_tries`
         "watchdog_stop",
         "queue_close",
         "engine_dispose",
@@ -662,7 +684,11 @@ async def test_the_teardown_shares_what_is_left_of_the_one_stop_deadline(
     world.saver_close_hangs = True
     # Bounded: a teardown that waits past its budget fails the test, never hangs it.
     assert await asyncio.wait_for(main.worker_main(world.cfg), 5) == 1  # a teardown step was cut off
-    assert world.timeouts == {"executions": shutdown.TEARDOWN_S, "watchdog": shutdown.TEARDOWN_S - 4.0}
+    assert world.timeouts == {
+        "executions": shutdown.TEARDOWN_S,
+        "llm_tries": min(main.TRIES_SETTLE_S, shutdown.TEARDOWN_S - 4.0),  # the tries share what is left
+        "watchdog": shutdown.TEARDOWN_S - 4.0,
+    }
     (event,) = logged(caplog, "worker_teardown_failed")
     assert (event["step"], event["error_class"]) == ("saver", "TimeoutError")
     assert world.events[-len(TEARDOWN) :] == TEARDOWN  # every step still ran, the lock session last

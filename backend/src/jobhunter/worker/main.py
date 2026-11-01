@@ -147,9 +147,10 @@ from jobhunter.worker.watchdog import Watchdog
 METRICS_PORT: Final = 9100
 ENGINE_POOL_SIZE: Final = 10
 QUEUE_POOL_MAX_SIZE: Final = 4
-# The bounds of two teardown waits; each also takes at most what is left of the stop's deadline.
+# The bounds of the teardown's three waits (the executions' cancel, the tries' settlement, the watchdog's
+# stop); each also takes at most what is left of the stop's deadline. `TRIES_SETTLE_S` is what the teardown
+# waits for the gateway's tries still in flight to settle (`LLMGateway.settle_in_flight`).
 EXECUTIONS_CANCEL_S: Final = 30.0
-# What the teardown waits for the gateway's tries still in flight to settle (`LLMGateway.settle_in_flight`).
 TRIES_SETTLE_S: Final = 10.0
 WATCHDOG_STOP_S: Final = 15.0
 # Imported before the takeover (step 4): importing them registers their sweeps, reconcilers and handlers.

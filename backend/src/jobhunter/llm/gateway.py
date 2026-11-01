@@ -72,8 +72,9 @@ it reserves the enlarged stage's worst case, and the logical call counts the tri
 - The call's deadline passing in flight is `ambiguous` with `deadline`, then `DeadlineExhausted`.
 - A cancellation (`TimeoutPolicy`, a reconciler, the shutdown) is `ambiguous` with `cancelled`, settled in the
   cancelled task, and the `CancelledError` propagates (V11). A graph does not wait for a cancelled node's
-  task, so the worker's teardown awaits the tasks still streaming a try (`settle_in_flight`, cancelling any
-  no cancellation reached) before it closes the engine (§3.3.5 step 4; M3 Task 28).
+  task, so the worker's teardown awaits the tasks still sending a try (`settle_in_flight`: it cancels a try
+  still in its stream that no cancellation reached, and waits for one already settling) before it closes the
+  engine (§3.3.5 step 4; M3 Task 28).
 
 Every `completed` call without an `output_json` therefore carries an `error_code` (receipts, Task 13). The
 first-stage `max_tokens` code is not a terminal one: that logical call went on to its enlarged stage. A retry
@@ -1003,9 +1004,10 @@ class LLMGateway:
         self._cache = cache
         self._key = _api_key(cfg)
         self._fake_llm = cfg.fake_llm  # only the fake is sent `X-JH-Fake-Key`
-        self._streaming: set[asyncio.Task[Any]] = (
-            set()
-        )  # the tasks inside a try's stream (`settle_in_flight`)
+        # `settle_in_flight`: the tasks sending a try (its stream and its settlement), and of them those still
+        # inside the provider call's stream, the only phase a stop cancels
+        self._trying: set[asyncio.Task[Any]] = set()
+        self._streaming: set[asyncio.Task[Any]] = set()
 
     @property
     def configured(self) -> bool:
@@ -1080,7 +1082,7 @@ class LLMGateway:
                 await self._dispatch(node, ctx, res, stage, transport_try)
                 await afault_point("gateway.after_dispatch")
                 t = _Try(node, ctx, res, stage, transport_try, max_tokens, self._clock())
-                with self._in_flight():
+                with self._in_phase(self._trying):
                     step = await self._send(t, runnable, receipt, messages, prefix, counted)
                 counted += step.counted
                 if step.result is not None:
@@ -1247,7 +1249,8 @@ class LLMGateway:
         status = 0
         try:
             async with asyncio.timeout(t.ctx.deadline - self._monotonic()) as scope:
-                out = await runnable.ainvoke(messages)
+                with self._in_phase(self._streaming):
+                    out = await runnable.ainvoke(messages)
         except asyncio.CancelledError:
             await self._settle_cancelled(t, receipt)
             raise
@@ -1277,27 +1280,29 @@ class LLMGateway:
         return await self._lost(t, receipt)
 
     @contextlib.contextmanager
-    def _in_flight(self) -> Iterator[None]:
-        """The current task counts as streaming a try for as long as the block runs (`settle_in_flight`)."""
+    def _in_phase(self, phase: set[asyncio.Task[Any]]) -> Iterator[None]:
+        """The current task is in `phase` (`_trying` or `_streaming`) for as long as the block runs
+        (`settle_in_flight`)."""
         task = asyncio.current_task()
         if task is None:  # pragma: no cover - a coroutine always runs in a task
             raise RuntimeError("a try is sent from a task")
-        self._streaming.add(task)
+        phase.add(task)
         try:
             yield
         finally:
-            self._streaming.discard(task)
+            phase.discard(task)
 
     async def settle_in_flight(self, timeout_s: float) -> int:
-        """The shutdown's §3.3.5 step 4 for the tries still in a stream: each task streaming one that no
-        cancellation has reached is cancelled, and every such task is awaited up to `timeout_s`, so its try
-        settles `ambiguous` (`cancelled`) before the worker closes its engine. A cancelled try settles in its
-        own task, and a graph does not wait for that task: LangGraph cancels a running node's task and goes on
-        without it, so a cancelled execution can end before its streams have settled. The number of tasks
-        still running at `timeout_s` (each logged by its count only)."""
-        pending = {task for task in self._streaming if not task.done()}
-        for task in pending:
-            if not task.cancelling():  # a second cancellation would cut its settlement short
+        """The shutdown's §3.3.5 step 4 for the tries still in flight: each task still streaming a try that no
+        cancellation has reached is cancelled, so its try settles `ambiguous` (`cancelled`); a task whose
+        stream has ended is settling its try and is never cancelled (Task 28 fix round 1). Every task sending
+        a try is awaited up to `timeout_s`, so each settlement ends before the worker closes its engine. A
+        cancelled try settles in its own task, and a graph does not wait for that task: LangGraph cancels a
+        running node's task and goes on without it, so a cancelled execution can end before its streams have
+        settled. The number of tasks still running at `timeout_s` (logged by its count only)."""
+        pending = {task for task in self._trying if not task.done()}
+        for task in self._streaming & pending:
+            if not task.cancelling():  # a second cancellation would cut the stream's own cleanup short
                 task.cancel()
         if not pending:
             return 0

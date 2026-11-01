@@ -47,9 +47,11 @@ transaction of its own after the epoch claim (Task 27), and its start's tick sta
 Every datum is invented; no paid call.
 """
 
+import re
 import signal
 import sys
 import time
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Final
@@ -57,6 +59,7 @@ from typing import Final
 import httpx
 import pytest
 from jobhunter.llm import fake
+from jobhunter.scoring import publish
 from jobhunter.worker.shutdown import STOP_BUDGET_S
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -239,12 +242,28 @@ def old_claim(server: PgServer, target_id: int) -> tuple[str, int]:
     return str(found[0]), int(str(found[1]))
 
 
+# Step 2 of `scoring.publish`, the target locked under the claim: the production statement itself
+# (`publish._LOCK_CLAIMED`), its binds `:t`, `:c`, `:a` made positional in that order (the next test pins
+# the order), wrapped to count the rows it locks (Task 28 fix round 1, item 8).
+REPLAYED_LOCK: Final = (
+    "SELECT count(*) FROM (" + re.sub(r":[a-z]\b", "%s", publish._LOCK_CLAIMED.text) + ") s"  # noqa: S608
+)
+
+
+def test_the_replayed_lock_is_the_publishs_own() -> None:
+    assert re.findall(r":[a-z]\b", publish._LOCK_CLAIMED.text) == [":t", ":c", ":a"]
+    assert REPLAYED_LOCK.count("%s") == 3 and "FOR UPDATE" in REPLAYED_LOCK
+
+
 def replay_publish(server: PgServer, target_id: int, claim_id: str, attempt_no: int) -> list[int]:
-    """The zombie's publish under its old claim, replayed by hand (`scoring.publish`: step 2's lock of the
-    target under the claim, step 6's move of the target, and its attempt's end): the rows each affected."""
+    """The zombie's publish under its old claim, replayed by hand (Ruling T28-b; `scoring.publish`: step 2's
+    lock of the target under the claim, step 6's move of the target, and its attempt's end): the rows each
+    affected. The lock is `publish._LOCK_CLAIMED` itself (`REPLAYED_LOCK`). The two moves have no statement
+    to reuse: `db.transitions.transition` renders them at run time, so they are written here with its
+    predicate (the row, its from-state and the owner columns the publish passes)."""
+    claim = uuid.UUID(claim_id)
     statements = (
-        "SELECT count(*) FROM (SELECT id FROM score_targets WHERE id = %s AND claim_id = %s::uuid "
-        "AND attempt_no = %s AND state = 'in_progress' FOR UPDATE) s",
+        REPLAYED_LOCK,
         "WITH s AS (UPDATE score_targets SET state = 'published_accepted' WHERE id = %s "
         "AND claim_id = %s::uuid AND attempt_no = %s AND state = 'in_progress' RETURNING 1) "
         "SELECT count(*) FROM s",
@@ -252,9 +271,7 @@ def replay_publish(server: PgServer, target_id: int, claim_id: str, attempt_no: 
         "WHERE target_id = %s AND claim_id = %s::uuid AND attempt_no = %s AND outcome = 'running' "
         "RETURNING 1) SELECT count(*) FROM s",
     )
-    return [
-        int(str(rows(server, statement, target_id, claim_id, attempt_no)[0][0])) for statement in statements
-    ]
+    return [int(str(rows(server, statement, target_id, claim, attempt_no)[0][0])) for statement in statements]
 
 
 def domain_rows(server: PgServer) -> dict[str, list[tuple[object, ...]]]:

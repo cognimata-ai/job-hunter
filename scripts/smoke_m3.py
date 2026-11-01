@@ -38,7 +38,7 @@ one JSON line, `{"check": <name>, "ok": <bool>}` with an optional `"detail"`:
 14. `batch_path` (Ruling T28-e): `jobhunter golden seed-adversarial` in the worker container exits 0 with 10
     cases; a second CV through the profile flow, its draft saved with one more target title (an unchanged
     profile activates nothing) and confirmed as `version_no` 2; then the old bulk operation is `cancelled`
-    (or `completed` before the confirm: `OLD_BULK`) and the new one `active`, the new tuple's
+    (or, when no target carries it, `completed`: `OLD_BULK`) and the new one `active`, the new tuple's
     `create_targets_for_tuple` `succeeded` with every target of the tuple carrying the new bulk operation
     (they came from that operation: Ruling T28-c), and the
     `batch_submit` it requested `succeeded` with `skipped = below_minimum` and no submission, its eligible
@@ -49,12 +49,12 @@ one JSON line, `{"check": <name>, "ok": <bool>}` with an optional `"detail"`:
     (`COUNTERS_CLEAN`: `spend_ledger.recompute`'s formula, `_COUNTED`, over `psql`).
 
 **Why check 14 stops at the skip.** The seeded settings already hold `scoring.batch_min_targets = 200`, the
-settings model's floor, so the smoke does not lower it. The fixtures' postings keep their recorded dates, and
-those age past `scope.max_ad_age_days` (30): of the 313 retained revisions, the second confirm creates 242
-pending targets (61 are filtered out, 10 deferred duplicates), and the batch preparation's expiry sweep moves
-125 of them to `expired_unscored('too_old')` (104 of the ads are more than 590 days old), so 117 are eligible
-and the preparation ends `below_minimum`. Even at the largest `max_ad_age_days`, 90, only 142 would be, and
-the count only falls as the dates age. The submission on the fake Batches API, its polls, the reconcile, the
+settings model's floor, so the smoke does not lower it. The fixtures' postings keep their recorded dates,
+which age past `scope.max_ad_age_days`: the batch preparation's expiry sweep moves the second confirm's
+targets of those ads to `expired_unscored('too_old')`, fewer than `batch_min_targets` stay eligible, and the
+preparation ends `below_minimum`. The count of eligible targets only falls as the dates age; the line prints
+it with the `too_old` count. (On 2026-11-01: 313 retained revisions, 242 pending targets at the confirm, 129
+moved `too_old`, 113 eligible.) The submission on the fake Batches API, its polls, the reconcile, the
 decided items and the follow-up cycle are proven in process by
 `tests/integration/test_m3_end_to_end.py::test_scoring_end_to_end_on_the_fake_llm` (250 items). Fixture
 dates relative to the fake's clock, which would let the stack show the batch too, are carried to M4.
@@ -66,9 +66,10 @@ first cycle spends it and more: its size is set by the central ĉ ($0.052646: 28
 some $6 below zero, and a cycle after a periodic one would wait days. Like M0's `UPDATE_SLOT_DUE`, which
 makes a scheduled run due, the smoke advances the bucket's clock (`ADVANCE_BUCKET`: the month row's
 `bucket_at` a month back, so the next accrual fills it to `B_max`) right before check 10's request, in a
-quiet moment (`quiet_moment`: no cycle running, no `score_cycle` job waiting) at a second of the minute away
-from the worker's tick (`AWAY_FROM_THE_TICK`), so neither a periodic cycle nor a running cycle's settlements
-take the refill first. The counters and the ledger are untouched, so check 15 recomputes them clean.
+quiet moment (`quiet_moment`: no cycle running, no `score_cycle` job waiting, no tick running) at a second of
+the minute away from the worker's tick (`AWAY_FROM_THE_TICK`), so neither a periodic cycle nor a running
+cycle's settlements take the refill first. The counters and the ledger are untouched, so check 15
+recomputes them clean.
 
 It stops at the first failed check (exit 1); after fifteen `ok` lines it exits 0. A `detail` holds ids,
 states, counts, codes and amounts, and fixed text: never the password, the session cookie or its token
@@ -178,11 +179,13 @@ ADVANCE_BUCKET: Final = (
 # The worker's tick runs at the top of each minute (`jh:tick`, `* * * * *`); its periodic trigger reads the
 # bucket. A refill and the request that should use it happen at one of these seconds of the minute.
 AWAY_FROM_THE_TICK: Final = range(10, 46)
-# Running cycles and waiting `score_cycle` jobs; the newest cycle's id.
+# Running cycles; waiting `score_cycle` jobs and a running `tick` (whose periodic trigger reads the bucket, so
+# a slow tick could still take a refill: Task 28 fix round 1); the newest cycle's id.
 LANE_STATE: Final = """\
 SELECT (SELECT count(*) FROM score_cycles WHERE status = 'running'),
-  (SELECT count(*) FROM procrastinate_jobs WHERE task_name = 'jh:score_cycle'
-    AND status IN ('todo', 'doing')),
+  (SELECT count(*) FROM procrastinate_jobs
+    WHERE (task_name = 'jh:score_cycle' AND status IN ('todo', 'doing'))
+      OR (task_name = 'jh:tick' AND status = 'doing')),
   (SELECT coalesce(max(id), 0) FROM score_cycles)"""
 QUIET_WITHIN_S: Final = 600
 CYCLE_WITHIN_S: Final = 180
@@ -262,14 +265,15 @@ SELECT coalesce((SELECT status FROM operations WHERE kind = 'create_targets_for_
   (SELECT count(*) FROM jobs j WHERE {RETAINED_JOB_SQL} AND NOT EXISTS (SELECT 1 FROM score_targets t
     WHERE t.job_revision_id = j.current_revision_id AND t.llm_tuple_id = {{tuple}}))"""  # noqa: S608
 BULK_OF: Final = "SELECT id, state FROM bulk_operations WHERE llm_tuple_id = {tuple} ORDER BY id DESC LIMIT 1"
-# The first bulk operation `{old}` after the second confirm: its state, and whether it had ended before the
-# new one `{new}` was opened. The confirm's activation cancels the old tuple's operation while it is
-# `active`; the heavy reconciler `bulk_operations` completes an operation once its work is done, and the first
-# confirm's had none (its `create_targets_for_tuple` found no job: the collection's targets carry no bulk
-# operation), so a heavy pass between the two confirms leaves it `completed` instead.
+# The first bulk operation `{old}` after the second confirm: its state, and how many targets carry it. The
+# confirm's activation cancels the old tuple's operation while it is `active`. The heavy reconciler
+# `bulk_operations` completes an operation once its work is done, and the first confirm's has none when no
+# target carries it (its `create_targets_for_tuple` found no job: the collection's targets carry no bulk
+# operation), so a heavy pass between the two confirms may leave it `completed` instead. An operation that
+# targets carry must have been `cancelled`.
 OLD_BULK: Final = """\
-SELECT o.state, coalesce(o.finished_at < n.created_at, false)
-FROM bulk_operations o CROSS JOIN bulk_operations n WHERE o.id = {old} AND n.id = {new}"""
+SELECT o.state, (SELECT count(*) FROM score_targets WHERE bulk_operation_id = {old})
+FROM bulk_operations o WHERE o.id = {old}"""
 # The bulk operation's newest `batch_submit`: its status and what its progress skipped; the bulk
 # operation's submissions.
 BATCH_SUBMIT_OF: Final = """\
@@ -359,7 +363,7 @@ def active() -> tuple[int, int]:
 
 
 def await_quiet_lane() -> int:
-    """Wait until no cycle runs and no `score_cycle` job waits; the newest cycle's id."""
+    """Wait until no cycle runs, no `score_cycle` job waits and no tick runs; the newest cycle's id."""
 
     def done(row: list[str]) -> tuple[bool, str]:
         running, waiting, _ = ints(row)
@@ -376,9 +380,10 @@ def away_from_the_tick() -> None:
 
 
 def quiet_moment() -> int:
-    """A moment, at a second in `AWAY_FROM_THE_TICK`, when no cycle runs and no `score_cycle` job waits: the
-    newest cycle's id then. The lane is read again after each wait for the window, since the tick at the top
-    of the minute may have started a cycle meanwhile (its settlements would take a refill made under it)."""
+    """A moment, at a second in `AWAY_FROM_THE_TICK`, when no cycle runs, no `score_cycle` job waits and no
+    tick runs: the newest cycle's id then. The lane is read again after each wait for the window, since the
+    tick at the top of the minute may have started a cycle meanwhile (its settlements would take a refill made
+    under it)."""
     while True:
         after = await_quiet_lane()
         if datetime.now(UTC).second in AWAY_FROM_THE_TICK:
@@ -646,9 +651,12 @@ def check_batch_path(ctx: Context) -> str | None:
     bulk_id, bulk_state = query_row(BULK_OF.format(tuple=tuple_id), 2)
     if not bulk_id.isdigit() or bulk_state != "active":
         raise CheckFailed(f"tuple {tuple_id} has no active bulk operation ({bulk_state!r})")
-    old_state, ended_before = query_row(OLD_BULK.format(old=int(old_bulk), new=int(bulk_id)), 2)
-    if not (old_state == "cancelled" or (old_state == "completed" and ended_before == "t")):
-        raise CheckFailed(f"the first bulk operation {old_bulk} is {old_state!r}, not ended by the confirm")
+    old_state, carried = query_row(OLD_BULK.format(old=int(old_bulk)), 2)
+    if not (old_state == "cancelled" or (old_state == "completed" and carried == "0")):
+        raise CheckFailed(
+            f"the first bulk operation {old_bulk} is {old_state!r} with {carried} targets, not ended by the "
+            "confirm"
+        )
 
     def created(row: list[str]) -> tuple[bool, str]:
         status = row[0]

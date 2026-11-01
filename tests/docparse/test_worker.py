@@ -44,8 +44,12 @@ from tests.docparse.conftest import (
     stall_mid_answer,
 )
 from tests.support.profile import DOCX_MIME, PDF_MIME, docx_bytes, minimal_pdf
+from tests.support.profile import docparse_group as docparse_group  # the guard fixture
 
-pytestmark = pytest.mark.docparse
+# Every job here runs in a spawned child, which imports `docparse.extract` and its parsers from the
+# environment: `docparse_group` names a mid-run `uv sync` as the cause of their failures (Task 28 fix
+# round 1).
+pytestmark = [pytest.mark.docparse, pytest.mark.usefixtures("docparse_group")]
 
 REPO = Path(__file__).resolve().parents[2]
 LIMIT_WAIT_S = 5

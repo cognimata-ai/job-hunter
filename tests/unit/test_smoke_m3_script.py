@@ -131,6 +131,25 @@ def test_the_golden_seed_runs_in_the_worker_container_on_both_overlays(smoke, mo
     assert args[args.index("exec") :] == ["exec", "-T", "worker", "jobhunter", "golden", "seed-adversarial"]
 
 
+def test_a_running_tick_keeps_the_lane_from_quiet(smoke, monkeypatch) -> None:
+    """Task 28 fix round 1, item 6: a `jh:tick` job in `doing` counts as waiting (its periodic trigger reads
+    the bucket, so a slow tick could still take a refill), and the quiet wait polls until it has ended."""
+    assert (
+        "(task_name = 'jh:score_cycle' AND status IN ('todo', 'doing'))\n"
+        "      OR (task_name = 'jh:tick' AND status = 'doing')"
+    ) in smoke.LANE_STATE
+    rows = iter([["0", "1", "4"], ["0", "0", "4"]])  # a tick running, then none
+    asked: list[str] = []
+
+    def query_row(sql: str, columns: int) -> list[str]:
+        asked.append(sql)
+        return next(rows)
+
+    monkeypatch.setattr(smoke, "query_row", query_row)
+    monkeypatch.setattr(smoke, "POLL_INTERVAL_S", 0)
+    assert smoke.await_quiet_lane() == 4 and asked == [smoke.LANE_STATE] * 2
+
+
 def test_the_refill_moment_reads_the_lane_again_after_waiting_for_the_window(smoke, monkeypatch) -> None:
     """Smoke run 3: the lane was quiet at second 55, the tick at the top of the minute started a periodic
     cycle while the smoke waited for second 10, and that cycle's settlements took the refill. The lane is
@@ -201,7 +220,7 @@ class Database:
         *,
         batch_submit: str = "succeeded|below_minimum|0",
         eligible: str = "117|125",
-        old_bulk: str = "cancelled|f",
+        old_bulk: str = "cancelled|0",
     ) -> None:
         self.seen: list[str] = []
         self.batch_submit = batch_submit
@@ -440,14 +459,27 @@ def test_a_whole_run_prints_fifteen_ok_lines_and_never_a_secret_or_a_text(smoke,
 
 @pytest.mark.parametrize(
     ("old_bulk", "ok"),
-    [("cancelled|f", True), ("completed|t", True), ("completed|f", False), ("active|f", False)],
-    ids=["cancelled-by-the-confirm", "completed-before-it", "completed-after-it", "still-active"],
+    [
+        ("cancelled|0", True),
+        ("cancelled|3", True),
+        ("completed|0", True),
+        ("completed|3", False),
+        ("active|0", False),
+    ],
+    ids=[
+        "cancelled-without-targets",
+        "cancelled-with-targets",
+        "completed-without-targets",
+        "completed-with-targets",
+        "still-active",
+    ],
 )
 def test_the_first_bulk_operation_has_ended_by_the_second_confirm(
     smoke, monkeypatch, capsys, old_bulk: str, ok: bool
 ) -> None:
-    """The activation cancels the old tuple's active operation; one whose (empty) work a heavy pass completed
-    before the confirm stays `completed`. Any other state fails the check."""
+    """The activation cancels the old tuple's active operation. One that no target carries has no work, so a
+    heavy pass may have completed it first; one that targets carry must be `cancelled` (Task 28 fix round 1,
+    item 5: the reason, not the order of two transaction-start stamps). Any other state fails the check."""
     run_against(smoke, monkeypatch, Stack(Database(smoke, old_bulk=old_bulk)), exit_code=0 if ok else 1)
     last = json.loads(capsys.readouterr().out.splitlines()[-1 if not ok else -2])
     assert (last["check"], last["ok"]) == ("batch_path", ok)
