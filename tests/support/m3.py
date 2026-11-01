@@ -275,7 +275,7 @@ async def insert_claimed(
 
 _BUDGET: Final = q(
     "INSERT INTO llm_budget (month, cap_usd, overrun_buffer_usd, bucket_usd, bucket_at) "
-    "VALUES ('2026-10-01', 100, 2, 1, now()) ON CONFLICT DO NOTHING"
+    "VALUES (:m, 100, 2, 1, now()) ON CONFLICT DO NOTHING"
 )
 
 
@@ -288,18 +288,20 @@ async def insert_scoring_call(
     batch_item_id: int | None = None,
     bulk_operation_id: int | None = None,
     purpose: str = "generate",
+    budget_month: date = _BUDGET_MONTH,
 ) -> tuple[int, int]:
-    """A `reserved` scoring ledger row (October 2026) and its call of the attempt and target, for `purpose`
-    (`generate`, `revise` or `critic`).
+    """A `reserved` scoring ledger row of `budget_month` (October 2026 by default, its `llm_budget` row
+    inserted when absent) and its call of the attempt and target, for `purpose` (`generate`, `revise` or
+    `critic`).
 
     A streamed call is logical call 1; a batch call names its `batch_item_id`. Returns `(ledger_id, call_id)`.
     """
-    await c.execute(_BUDGET)
+    await c.execute(_BUDGET, {"m": budget_month})
     ledger = await insert_id(
         c,
         "llm_spend_ledger",
         {
-            "budget_month": _BUDGET_MONTH,
+            "budget_month": budget_month,
             "kind": "request",
             "purpose": purpose,
             "purpose_class": "scoring",

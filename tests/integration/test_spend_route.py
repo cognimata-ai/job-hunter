@@ -300,9 +300,9 @@ async def test_eval_spend_is_reported_apart_from_live_scoring_and_outlives_its_c
         job = await insert_job(conn)
         target = await insert_target(conn, job, tuple_id)
         attempt = await insert_attempt(conn, target)
-        await insert_scoring_call(
-            conn, attempt_id=attempt, target_id=target
-        )  # live: Sonnet, medium, generate
+        await insert_scoring_call(  # live: Sonnet, medium, generate, in the month the route reads
+            conn, attempt_id=attempt, target_id=target, budget_month=month_of(now)
+        )
         run = await insert_id(
             conn,
             "eval_runs",

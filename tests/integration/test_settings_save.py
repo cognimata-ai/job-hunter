@@ -946,8 +946,9 @@ async def test_llm_tuple_and_scope_commit_together(
 
 
 async def test_llm_tuple_and_budget_bump_once_after_the_budget_action(
-    logged_in_client, engine, monkeypatch, fake_llm_process
+    logged_in_client, engine, monkeypatch, fake_llm_process, clock
 ) -> None:
+    # `clock`: the save writes the row of its own month, and `month_row` reads `MONTH`'s (October 2026).
     await activate_profile(engine)
     generation_before = await generation(engine)
     calls: list[str] = []
