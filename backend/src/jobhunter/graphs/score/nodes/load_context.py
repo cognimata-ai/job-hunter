@@ -24,10 +24,12 @@ In one transaction:
    attempt of `resume_draft_id` whatever its policy (spec L3589: the batch draft is resumed and `validate`
    re-runs the triggers under this attempt's policy, plan L942, Deviation 27; final review, Fable I1). The
    newest draft of the chain is the current one (`current_draft_id`, `round`); `critic_rounds` counts the
-   critic notes on the chain's drafts (so T0 and the three-round limit survive a revision committed by one
-   attempt and reviewed by another); the newest note gives `last_critic_note_id`, its derived outcome, the
-   draft it reviewed and `not_a_job_ad_verified` (its stored fact confirmations are the chain's, applied in
-   order: each note stores the confirmations after its round). A chain without a draft starts fresh.
+   critic notes the chain's attempts wrote on the chain's drafts (so T0 and the three-round limit survive a
+   revision committed by one attempt and reviewed by another, and a note of an attempt the chain leaves out,
+   such as a batch follow-up's review under an earlier policy, is never restored: Codex R-I1); the newest
+   note gives `last_critic_note_id`, its derived outcome, the draft it reviewed and `not_a_job_ad_verified`
+   (its stored fact confirmations are the chain's, applied in order: each note stores the confirmations after
+   its round). A chain without a draft starts fresh.
 
 `repair_used` is `False` on every attempt (A2 T6). The routing (`routing.after_load_context`) then goes to
 `END`, `publish`, `fail`, `validate` (a resume) or `generate`.
@@ -96,11 +98,15 @@ _CURRENT_DRAFT: Final = q(
     "SELECT id, round FROM score_drafts WHERE attempt_id = ANY(CAST(:chain AS bigint[])) "
     "ORDER BY id DESC LIMIT 1"
 )
+# The chain's critic notes: written by an attempt of the chain, on a draft of the chain. A note on a chain
+# draft by an attempt outside it (a batch follow-up's review under a policy the chain left out) is not the
+# chain's (final review re-review, Codex R-I1).
 _NOTES: Final = q(
     "SELECT count(*) OVER () AS rounds, n.id, n.draft_id, n.derived_outcome, "
     "coalesce(n.validation ->> 'not_a_job_ad_verified' = 'true', false) AS verified "
     "FROM critic_notes n JOIN score_drafts d ON d.id = n.draft_id "
-    "WHERE d.attempt_id = ANY(CAST(:chain AS bigint[])) ORDER BY n.id DESC LIMIT 1"
+    "WHERE n.attempt_id = ANY(CAST(:chain AS bigint[])) AND d.attempt_id = ANY(CAST(:chain AS bigint[])) "
+    "ORDER BY n.id DESC LIMIT 1"
 )
 
 

@@ -385,6 +385,73 @@ async def test_a_batch_follow_up_resumes_its_draft_under_another_policy_and_an_o
     assert len(served(fake_llm, "critic")) == (1 if policy_changes else 0)
 
 
+_NOTE_OWNERS = sa.text(
+    "SELECT n.id, n.attempt_id, n.round, n.draft_id, n.triggers FROM critic_notes n "
+    "JOIN score_attempts a ON a.id = n.attempt_id WHERE a.target_id = :t ORDER BY n.id"
+)
+
+
+@pytest.mark.parametrize("policy_changes", [False, True], ids=["same_policy", "policy_changed"])
+async def test_a_reclaimed_follow_up_restores_only_the_critic_notes_of_its_own_chain(
+    engine: AsyncEngine,
+    deps: ScoreDeps,
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    policy_changes: bool,
+) -> None:
+    """Final review re-review, Codex R-I1: a batch draft D (its attempt B), reviewed and accepted by its
+    follow-up F1, which ends before publication (the stubbed publish writes nothing). The reclaim F2 resumes D
+    either way. Under the same policy F1 is in F2's chain and its note is restored, so F2 publishes on it.
+    After a policy change F1 is not in the chain (it ran under the old policy and is not the batch's), so its
+    note is not restored either: F2 counts no critic round and has D reviewed under the new policy."""
+    claimed = await claimed_target(engine, ad=CERTIFIED_AD)
+    revision = claimed.job_revision_id
+    fake_llm.answer("generate", revision, synthetic_c_draft(facts=CERTIFIED_FACTS))
+    fake_llm.answer("critic", revision, synthetic_review(CONFIRMED), round=1, schema=CriticOut)
+    monkeypatch.setattr(score_nodes, "afault_point", raising_at(score_nodes.AFTER_DRAFT))
+    with pytest.raises(NodeFailed):  # B: its draft D committed
+        await invoke_subgraph(deps, claimed)
+    monkeypatch.setattr(score_nodes, "afault_point", no_fault)
+    (draft,) = await rows(engine, _DRAFTS, claimed.target_id)
+    await reclaim_now(engine, claimed.target_id)
+    async with engine.begin() as conn:
+        await conn.execute(_FOLLOW_UP, {"d": draft.id, "t": claimed.target_id})
+    first = await claim_again(engine, claimed.target_id, resumed_from_attempt_id=claimed.attempt_id)
+    accepted = await invoke_subgraph(deps, first)  # F1: D's unmet certification sends it to the critic
+    assert accepted["outcome"] == "publish(accepted)" and accepted["resumed"] is True
+    (note,) = await rows(engine, _NOTE_OWNERS, claimed.target_id)
+    assert (note.attempt_id, note.draft_id, note.round) == (first.attempt_id, draft.id, 1)
+    await reclaim_now(engine, claimed.target_id)  # F1 ended before its publication
+    async with engine.begin() as conn:
+        new_policy = await activate_test_policy(conn, t8_sample_pct=100) if policy_changes else None
+    # the link the claim writes: F1 under the same policy, the batch attempt B under the new one
+    linked = claimed.attempt_id if policy_changes else first.attempt_id
+    again = await claim_again(engine, claimed.target_id, resumed_from_attempt_id=linked)
+    final = await invoke_subgraph(deps, again)
+    assert final["outcome"] == "publish(accepted)" and final["resumed"] is True
+    assert final["current_draft_id"] == draft.id and len(served(fake_llm, "generate")) == 1  # D resumed
+    notes = await rows(engine, _NOTE_OWNERS, claimed.target_id)
+    if not policy_changes:  # F1's acceptance restored: F2 publishes on it, with no critic call of its own
+        assert [n.id for n in notes] == [note.id]
+        assert (final["critic_rounds"], final["last_critic_note_id"]) == (1, note.id)
+        assert len(served(fake_llm, "critic")) == 1
+        return
+    # F1's note not restored: F2's own critic round is round 1 (no round counted before it), under the new
+    # policy, which samples every draft (T8)
+    assert [(n.attempt_id, n.draft_id, n.round) for n in notes] == [
+        (first.attempt_id, draft.id, 1),
+        (again.attempt_id, draft.id, 1),
+    ]
+    own = notes[-1]
+    assert "T8" in own.triggers and "T8" not in note.triggers
+    assert (final["critic_rounds"], final["last_critic_note_id"]) == (1, own.id)
+    assert len(served(fake_llm, "critic")) == 2
+    (policy,) = [a.evaluation_policy_id for a in await rows(engine, _ATTEMPT_POLICIES, claimed.target_id)][
+        -1:
+    ]
+    assert policy == new_policy
+
+
 async def test_injection_suspected_forces_a_critic_round_and_low_confidence(
     engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM
 ) -> None:
