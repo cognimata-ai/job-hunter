@@ -6,15 +6,19 @@ similarity first, a leftover slot goes to a safeguard first); the accrual cap; a
 similarity slots only and at most `S // 2` of them (Deviation 24: the floor, so `S = 1` admits none); the
 spill by actual remaining capacity in the order oldest, exploration, similarity, at no credit; Score now
 first and outside `S`; one pick per target across the lanes; and a batch follow-up keeping lane
-`batch_followup` whichever slot it takes (T11-d).
+`batch_followup` whichever slot it takes (T11-d). Last, the claim's re-check holds every condition of the
+admissible predicate (final review, Fable M2 / Codex parked 3, Ruling T11-h).
 
 Every datum is invented.
 """
 
+import re
 from decimal import Decimal
 from fractions import Fraction as F
+from typing import Final
 
 import pytest
+from jobhunter.graphs.score.nodes import claim
 from jobhunter.scoring import admission, cycles
 from jobhunter.scoring.admission import (
     ALWAYS_INCLUDE_LIMIT,
@@ -241,3 +245,63 @@ def test_a_followup_known_from_the_lane_lists_keeps_its_lane() -> None:
 
 def test_the_cycle_owner_is_one_constant() -> None:
     assert cycles.CYCLE_OWNER is admission.CYCLE_OWNER == "score_cycle"
+
+
+# ---- the claim re-checks the admissible predicate (final review, Fable M2 / Codex parked 3) ----------------
+
+# The one condition of `admission._ADMISSIBLE_WHERE` the claim does not repeat: the tuple of the admission's
+# lists. The claim takes the ids the admission picked from the cycle's tuple, under `active_config FOR SHARE`
+# and the cycle's lock, and its statement is the spec's, which has no tuple condition (L3539-3554).
+ADMISSION_ONLY: Final = frozenset({"llm_tuple_id = :tuple"})
+_CLAIM_RECHECK: Final = re.compile(
+    r"\bIN \(SELECT id FROM score_targets WHERE (.*) FOR UPDATE SKIP LOCKED\)$"
+)
+
+
+def conditions(predicate: str) -> list[str]:
+    """The top-level `AND` conjuncts of `predicate`, normalised: the alias `t.` dropped, and the admission's
+    `:now` read as the claim's `now()` (each the time of its own transaction)."""
+    text = re.sub(r"\bt\.", "", predicate).replace(":now", "now()")
+    found: list[str] = []
+    depth = start = i = 0
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        elif depth == 0 and text.startswith(" AND ", i):
+            found.append(text[start:i].strip())
+            start = i = i + len(" AND ")
+            continue
+        i += 1
+    return [*found, text[start:].strip()]
+
+
+def missing_from_the_claim(claim_where: str) -> set[str]:
+    """The conditions of the admissible predicate that the claim's `FOR UPDATE SKIP LOCKED` re-check over the
+    admitted ids lacks, the tuple's left out (`ADMISSION_ONLY`)."""
+    recheck = _CLAIM_RECHECK.search(claim_where)
+    assert recheck is not None, "the claim's re-check is no longer a locking subquery over the admitted ids"
+    admissible = set(conditions(admission._ADMISSIBLE_WHERE)) - ADMISSION_ONLY
+    return admissible - set(conditions(recheck.group(1)))
+
+
+RECHECKED: Final = sorted(set(conditions(admission._ADMISSIBLE_WHERE)) - ADMISSION_ONLY)
+
+
+def test_the_claim_rechecks_every_condition_of_the_admissible_predicate() -> None:
+    assert ADMISSION_ONLY <= set(conditions(admission._ADMISSIBLE_WHERE))
+    assert RECHECKED == [
+        "(not_before IS NULL OR not_before <= now())",
+        "NOT is_fenced(job_id, llm_tuple_id)",
+        "charged_attempts < :max_attempts",
+        "state = 'pending'",
+    ]
+    assert missing_from_the_claim(claim.CLAIM_WHERE) == set()
+
+
+@pytest.mark.parametrize("dropped", RECHECKED)
+def test_a_condition_dropped_from_the_claim_is_found_missing(dropped: str) -> None:
+    weakened = claim.CLAIM_WHERE.replace(f" AND {dropped}", "")
+    assert weakened != claim.CLAIM_WHERE
+    assert missing_from_the_claim(weakened) == {dropped}
