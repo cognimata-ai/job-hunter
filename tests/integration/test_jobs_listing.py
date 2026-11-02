@@ -8,6 +8,8 @@ is never a row but its fields match its representative's card, and the counts of
 cap.
 """
 
+import math
+import random
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -18,7 +20,8 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.api.pagination import JobSection, JobSort
 from jobhunter.db.snapshot import read_snapshot
-from jobhunter.jobs import listing
+from jobhunter.db.sql import q
+from jobhunter.jobs import _sql, listing
 from jobhunter.jobs._sql import TRGM_WORD_THRESHOLD
 from jobhunter.jobs.listing import Counts, PageSelection, Position, SelectedRow, select_page
 from jobhunter.jobs.query import JobsQuery, LocationFilter
@@ -613,3 +616,57 @@ async def test_a_second_tuple_activated_later_is_the_one_read(engine: AsyncEngin
         (waiting, "unscored"),
         (old, "unscored"),
     ]
+
+
+def _destination(lat: float, lon: float, km: float, bearing: float) -> tuple[float, float]:
+    """The point `km` from `(lat, lon)` at `bearing` (radians) on `geo_km`'s sphere, its longitude in
+    [-180, 180)."""
+    phi, lam, delta = math.radians(lat), math.radians(lon), km / 6371.0088
+    to_phi = math.asin(math.sin(phi) * math.cos(delta) + math.cos(phi) * math.sin(delta) * math.cos(bearing))
+    to_lam = lam + math.atan2(
+        math.sin(bearing) * math.sin(delta) * math.cos(phi),
+        math.cos(delta) - math.sin(phi) * math.sin(to_phi),
+    )
+    return math.degrees(to_phi), (math.degrees(to_lam) + 180) % 360 - 180
+
+
+_CENTRES: Final = (BERLIN, (0.0, 179.95), (-33.9, -179.99), (88.9, 10.0), (-89.6, -120.0), (0.01, 0.0))
+
+
+async def test_the_location_filter_decides_as_job_within_km(engine: AsyncEngine) -> None:
+    """The near term (`_sql.ROW_TEMPLATES["near"]`: the inner box, the latitude band, then `job_within_km`)
+    accepts exactly the candidates `job_within_km` accepts, in the box, in the ring between box and radius,
+    outside it, at the poles and across the antimeridian; an unresolved entry never matches (M4 Task 5)."""
+    rng = random.Random(4711)  # noqa: S311 (sampling, not secrecy)
+    rows: list[dict[str, Any]] = []
+    for lat, lon in _CENTRES:
+        for radius_km in (1, 30, 200):
+            for _ in range(150):
+                point = _destination(lat, lon, rng.uniform(0, 2.2) * radius_km, rng.uniform(0, 2 * math.pi))
+                resolution = rng.choice(("unique", "ambiguous", "unresolved"))
+                rows.append(
+                    {
+                        "locations": [place(point, resolution=resolution)],
+                        "lat": lat,
+                        "lon": lon,
+                        "radius_km": radius_km,
+                        "near_box": listing._near_box(lat, lon, radius_km),
+                    }
+                )
+    near = _sql.ROW_SQL["j"]["near"]
+    statement = (
+        "SELECT count(*) FILTER (WHERE decided) AS inside, count(*) FILTER (WHERE decided IS DISTINCT FROM "  # noqa: S608
+        "exact) AS differ, count(*) AS n FROM (SELECT "
+        + near.replace(":near_box", "c.near_box")
+        .replace(":lat", "c.lat")
+        .replace(":lon", "c.lon")
+        .replace(":radius_km", "c.radius_km")
+        + " AS decided, job_within_km(j.locations, c.lat, c.lon, c.radius_km) AS exact "
+        "FROM jsonb_to_recordset(:rows) AS c(locations jsonb, lat float8, lon float8, "
+        "radius_km float8, near_box jsonb) CROSS JOIN LATERAL (SELECT c.locations AS locations, "
+        "'city' AS location_kind) j) s"
+    )
+    async with engine.connect() as c:
+        result = (await c.execute(q(statement, jsonb=["rows"]), {"rows": rows})).one()
+    assert (result.differ, result.n) == (0, len(rows))
+    assert 0 < result.inside < result.n  # both answers occur

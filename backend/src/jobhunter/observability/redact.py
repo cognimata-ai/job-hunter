@@ -38,6 +38,8 @@ REDACT_KEYS: Final[frozenset[str]] = frozenset(
         "secret",
         "redirect_url",
         "outbound_url_private",
+        "primary_link",  # a posting's ad link and a card's (M4 Task 5): private-ish, never logged
+        "open_ad",
         "stripped_text",
         "reviewed_text",
     }

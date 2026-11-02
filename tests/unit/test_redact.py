@@ -34,6 +34,15 @@ def test_listed_keys_and_prefixes_are_redacted() -> None:
     assert ev["nested"] == {"set-cookie": "[REDACTED]", "ok": 1} and ev["run_id"] == 7
 
 
+def test_the_outbound_link_keys_are_redacted() -> None:
+    """A job's outbound links (M4 Task 5, `jobs.links`) by any of their names, also nested."""
+    link = "https://jobs.example/ad/1?ref=invented"
+    names = ("redirect_url", "outbound_url_private", "primary_link", "open_ad")
+    ev = redact_event(None, "info", {"event": "x", **dict.fromkeys(names, link), "links": {"open_ad": link}})
+    assert [ev[name] for name in names] == ["[REDACTED]"] * len(names)
+    assert ev["links"] == {"open_ad": "[REDACTED]"}
+
+
 def test_values_are_masked() -> None:
     out = mask_text(
         "mail max.mustermann@example.org, call +49 170 1234567 or 0170 1234567, "

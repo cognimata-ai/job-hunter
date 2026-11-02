@@ -1,9 +1,9 @@
 """The M4 routes in the OpenAPI document (spec §14.2; plan Global Constraints, API rules).
 
 Every M4 route is listed in `M4_ROUTES` with the error statuses it documents; each route task adds its rows.
-M4 adds no route that takes an `Idempotency-Key`, so there is no idempotency set here. While `M4_ROUTES` is
-empty, the parametrized test has no case; `test_the_m3_rows_of_the_document_are_unchanged` keeps the module
-asserting something: M4's changes leave every M3 row as M3 documented it.
+M4 adds no route that takes an `Idempotency-Key`, so there is no idempotency set here.
+`test_the_m3_rows_of_the_document_are_unchanged` checks that M4's changes leave every M3 row as M3
+documented it.
 """
 
 from typing import Any, Final
@@ -13,7 +13,10 @@ from jobhunter.api.app import create_app
 
 from tests.unit.test_openapi_m3 import M3_ROUTES
 
-M4_ROUTES: Final[dict[tuple[str, str], set[str]]] = {}
+M4_ROUTES: Final[dict[tuple[str, str], set[str]]] = {
+    ("get", "/api/jobs"): {"400", "401", "422", "429"},
+    ("get", "/api/jobs/facets"): {"401", "422", "429"},
+}
 
 
 @pytest.fixture(scope="module")

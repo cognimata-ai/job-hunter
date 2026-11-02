@@ -13,24 +13,29 @@ that many job ids unused before the card's own, so a test can lay its cards out 
 `bulk_seed_cards(engine, n, *, scored_share, groups, langs)` commits `n` cards in one set-based
 `INSERT … SELECT` per table (every row from one JSONB array, `jsonb_to_recordset`) over the active tuple,
 which it activates when there is none: `scored_share` of the cards published with their current score
-instance; of the others every tenth (the first, the eleventh, …) without a target of the tuple and the rest
-pending, some targets without a similarity; `groups` active duplicate
+instance; of the others that represent no group every tenth (the first, the eleventh, …) without a target
+of the tuple, and the rest pending, some targets without a similarity; `groups` active duplicate
 groups (each a card and one deferred member job, which is no card), and revisions whose description text is
 in each language of `langs` in turn. It analyses nothing: a caller that needs planner statistics runs
 `ANALYZE` as the owner on a server of its own.
 
 `activate_tuple` makes a new confirmed profile's tuple the active one; the `active_tuple` fixture does it for
-a test on the shared database (whose reset restores no tuple).
+a test on the shared database (whose reset restores no tuple). `activate_scope(engine, **changes)` makes a
+copy of the active scope with `changes` the active scope (the reset restores the seeded one), and
+`add_posting(engine, job_id, source_id, …)` gives a card a posting of a source with its latest observation
+(the outbound links of M4 Task 5).
 """
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Final
+from typing import Any, Final
 
 import pytest
 from jobhunter.clock import utcnow
+from jobhunter.db.seed import canonical_json
 from jobhunter.db.sql import q
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.types import JSONValue
@@ -50,6 +55,7 @@ from tests.support.m3 import (
     insert_target,
     result_values,
 )
+from tests.support.observations import normalized
 
 SEEN: Final = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)  # a card's first sighting unless it names its own
 BERLIN: Final = (52.52437, 13.41053)
@@ -161,6 +167,98 @@ async def activate_tuple(engine: AsyncEngine, n: int = 1) -> int:
 async def active_tuple(engine: AsyncEngine) -> int:
     """The id of the tuple `activate_tuple` made the active one on the shared database."""
     return await activate_tuple(engine)
+
+
+_ACTIVE_SCOPE: Final = q(
+    "SELECT s.payload FROM active_config a JOIN scope_versions s ON s.id = a.scope_version_id WHERE a.id = 1"
+)
+_NEW_SCOPE: Final = q(
+    "INSERT INTO scope_versions (scope_hash, payload) VALUES (:h, :payload) RETURNING id", jsonb=["payload"]
+)
+_ACTIVATE_SCOPE: Final = q("UPDATE active_config SET scope_version_id = :s, updated_at = now()")
+
+
+async def activate_scope(engine: AsyncEngine, **changes: Any) -> int:
+    """A copy of the active scope's payload with `changes`, made the active scope (committed); its id."""
+    async with engine.begin() as c:
+        payload = {**(await c.execute(_ACTIVE_SCOPE)).scalar_one(), **changes}
+        scope = int(
+            (
+                await c.execute(
+                    _NEW_SCOPE, {"h": hashlib.sha256(canonical_json(payload)).digest(), "payload": payload}
+                )
+            ).scalar_one()
+        )
+        await c.execute(_ACTIVATE_SCOPE, {"s": scope})
+    return scope
+
+
+_INSTANCE: Final = q(
+    "INSERT INTO source_instances (source_id, instance_key) VALUES (:s, :k) "
+    "ON CONFLICT (source_id, instance_key) DO UPDATE SET source_id = EXCLUDED.source_id RETURNING id"
+)
+_POSTING: Final = q(
+    "INSERT INTO postings (source_instance_id, native_id, job_id, first_seen_at, last_seen_at, availability, "
+    "availability_changed_at, outbound_url_private) VALUES (:instance, :native_id, :job, :at, :at, 'active', "
+    ":at, :outbound) RETURNING id"
+)
+_OBSERVATION: Final = q(
+    "INSERT INTO posting_observations (posting_id, source_instance_id, raw_response_sha256, observed_at, "
+    "normalized, content_hash, completeness, quality) VALUES (:posting, :instance, :sha, :at, :normalized, "
+    ":sha, 'full', 'ok') RETURNING id",
+    jsonb=["normalized"],
+)
+_LATEST: Final = q("UPDATE postings SET latest_observation_id = :o WHERE id = :p")
+_ATS: Final = frozenset({"greenhouse", "lever", "ashby", "personio", "recruitee", "smartrecruiters"})
+
+
+async def add_posting(
+    engine: AsyncEngine,
+    job_id: int,
+    source_id: str,
+    *,
+    observed_at: datetime = SEEN,
+    primary_link: str | None = None,
+    redirect: str | None = None,
+) -> int:
+    """A posting of `source_id` on job `job_id` (an ATS source on a board instance of its own), its latest
+    observation made at `observed_at` with `primary_link`, and `redirect` as its `outbound_url_private` (an
+    Adzuna posting's `redirect_url`); its id. Committed."""
+    key = f"board-{job_id}" if source_id in _ATS else "default"
+    async with engine.begin() as c:
+        instance = int((await c.execute(_INSTANCE, {"s": source_id, "k": key})).scalar_one())
+        native = f"{source_id}-{job_id}-{observed_at.timestamp():.0f}"
+        posting = int(
+            (
+                await c.execute(
+                    _POSTING,
+                    {
+                        "instance": instance,
+                        "native_id": native,
+                        "job": job_id,
+                        "at": observed_at,
+                        "outbound": redirect,
+                    },
+                )
+            ).scalar_one()
+        )
+        document = normalized(native, primary_link=primary_link, outbound_url_private=redirect)
+        observation = int(
+            (
+                await c.execute(
+                    _OBSERVATION,
+                    {
+                        "posting": posting,
+                        "instance": instance,
+                        "sha": hashlib.sha256(native.encode()).digest(),
+                        "at": observed_at,
+                        "normalized": document.model_dump(mode="json"),
+                    },
+                )
+            ).scalar_one()
+        )
+        await c.execute(_LATEST, {"o": observation, "p": posting})
+    return posting
 
 
 async def seed_cards(engine: AsyncEngine, specs: Sequence[Card]) -> list[int]:
@@ -664,8 +762,10 @@ async def bulk_seed_cards(
         await activate_tuple(engine, n=_BULK_CHAIN)
     now = utcnow()
     scored = [int((i + 1) * scored_share) > int(i * scored_share) for i in range(n)]
-    untargeted = frozenset([i for i in range(n) if not scored[i]][::10])  # every tenth unscored card
     representatives = sorted({(g * n) // groups for g in range(groups)}) if groups else []
+    # every tenth of the unscored cards that represent no group, so that every representative has a target
+    grouped = frozenset(representatives)
+    untargeted = frozenset([i for i in range(n) if not scored[i] and i not in grouped][::10])
     async with engine.begin() as c:
         config = (await c.execute(_CONFIG)).one()
         llm_tuple = int((await c.execute(_ACTIVE)).one().llm_tuple_id)

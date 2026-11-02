@@ -169,6 +169,46 @@ export interface paths {
         patch: operations["set_golden_case_flags_api_golden_cases__case_id__patch"];
         trace?: never;
     };
+    "/api/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Jobs
+         * @description A page of the Jobs list in one read snapshot, with its ranking generation (module docstring).
+         */
+        get: operations["list_jobs_api_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/facets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Job Facets
+         * @description The companies and sources of the listed cards, with their counts (module docstring).
+         */
+        get: operations["list_job_facets_api_jobs_facets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/jobs/{job_id}/feedback": {
         parameters: {
             query?: never;
@@ -978,6 +1018,19 @@ export interface components {
              */
             state: "active" | "completed" | "cancelled";
         };
+        /** CardUserOut */
+        CardUserOut: {
+            /** Applied At */
+            applied_at: string | null;
+            /** Has Note */
+            has_note: boolean;
+            /** Hidden At */
+            hidden_at: string | null;
+            /** Saved At */
+            saved_at: string | null;
+            /** Seen At */
+            seen_at: string | null;
+        };
         /** Certification */
         Certification: {
             /** Issuer */
@@ -986,6 +1039,15 @@ export interface components {
             name: string;
             /** Year */
             year: number | null;
+        };
+        /** CompanyFacetOut */
+        CompanyFacetOut: {
+            /** Company Key */
+            company_key: string;
+            /** Count */
+            count: number;
+            /** Display Name */
+            display_name: string;
         };
         /**
          * ConfirmIn
@@ -1042,6 +1104,15 @@ export interface components {
             /** Total Years Experience */
             total_years_experience: number | null;
             user_entered?: components["schemas"]["UserEntered"];
+        };
+        /** CountsOut */
+        CountsOut: {
+            /** Capped */
+            capped: boolean;
+            /** Total Estimate */
+            total_estimate: number;
+            /** Unscored */
+            unscored: number;
         };
         /** CvTextIn */
         CvTextIn: {
@@ -1181,6 +1252,16 @@ export interface components {
             status: "extracting_profile";
         };
         /**
+         * FacetsOut
+         * @description The Company and Source options of the listed cards, with their counts (module docstring).
+         */
+        FacetsOut: {
+            /** Companies */
+            companies: components["schemas"]["CompanyFacetOut"][];
+            /** Sources */
+            sources: components["schemas"]["SourceFacetOut"][];
+        };
+        /**
          * FeedbackIn
          * @description A label, or a "wrong score" with the label the user expected (§14.2 L4977).
          */
@@ -1283,6 +1364,23 @@ export interface components {
             /** Next Cursor */
             next_cursor: string | null;
         };
+        /** GroupBadgeOut */
+        GroupBadgeOut: {
+            /** Group Id */
+            group_id: number;
+            /** Unscorable Reason */
+            unscorable_reason: string | null;
+        };
+        /** GroupCardOut */
+        GroupCardOut: {
+            /** Group Id */
+            group_id: number;
+            /** Members */
+            members: components["schemas"]["MemberBriefOut"][];
+            representative: components["schemas"]["RefOut"];
+            /** Size */
+            size: number;
+        };
         /** HealthOut */
         HealthOut: {
             /**
@@ -1293,7 +1391,104 @@ export interface components {
         };
         /** @enum {string} */
         IssueCode: "limit" | "date_invalid" | "date_order" | "years_mismatch" | "contact_removed" | "ungrounded" | "language_without_evidence" | "code_other" | "unverifiable";
+        /**
+         * JobCardOut
+         * @description One card of the Jobs list (module docstring).
+         */
+        JobCardOut: {
+            /** Ad Language */
+            ad_language: string;
+            /** Availability */
+            availability: string;
+            /** Badges */
+            badges: ("contested" | "partial" | "shortened" | "possibly_not_a_job_ad" | "injection_suspected" | "stale" | "closed" | "adzuna")[];
+            /**
+             * Bucket
+             * @enum {string}
+             */
+            bucket: "scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad";
+            /** Company */
+            company: string;
+            /** Company Key */
+            company_key: string;
+            /** Completeness */
+            completeness: string;
+            /** Filter Keyword */
+            filter_keyword: string | null;
+            /** Filter Reasons */
+            filter_reasons: string[];
+            /**
+             * First Seen At
+             * Format: date-time
+             */
+            first_seen_at: string;
+            group: components["schemas"]["GroupCardOut"] | null;
+            group_badge: components["schemas"]["GroupBadgeOut"] | null;
+            /** Job Id */
+            job_id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "job" | "group";
+            /** Knockouts */
+            knockouts: components["schemas"]["KnockoutOut"][];
+            /**
+             * Last Seen At
+             * Format: date-time
+             */
+            last_seen_at: string;
+            links: components["schemas"]["LinksOut"];
+            /** Location Kind */
+            location_kind: string;
+            /** Locations */
+            locations: string[];
+            possible_duplicate_of: components["schemas"]["RefOut"] | null;
+            /** Posted At */
+            posted_at: string | null;
+            /** Posted Precision */
+            posted_precision: string;
+            previous: components["schemas"]["PreviousOut"] | null;
+            score: components["schemas"]["ScoreOut"] | null;
+            /** Source Ids */
+            source_ids: string[];
+            target: components["schemas"]["TargetOut"] | null;
+            /** Title */
+            title: string;
+            user: components["schemas"]["CardUserOut"] | null;
+            /** Work Mode Known */
+            work_mode_known: boolean;
+            /** Work Modes */
+            work_modes: string[];
+        };
+        /** JobsPageOut */
+        JobsPageOut: {
+            counts: components["schemas"]["CountsOut"] | null;
+            /** Items */
+            items: components["schemas"]["JobCardOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Ranking Changed */
+            ranking_changed: boolean;
+            /** Ranking Generation */
+            ranking_generation: number;
+        };
         JsonValue: unknown;
+        /** KnockoutOut */
+        KnockoutOut: {
+            /** Binding */
+            binding: boolean;
+            /** Code */
+            code: string;
+            /** Profile Value */
+            profile_value: string | null;
+            /** Requirement */
+            requirement: string | null;
+            /** Severity */
+            severity: string;
+            /** Status */
+            status: string;
+        };
         /** Language */
         Language: {
             /**
@@ -1310,6 +1505,13 @@ export interface components {
             code_other: string | null;
             /** Evidence */
             evidence: string;
+        };
+        /** LinksOut */
+        LinksOut: {
+            /** Adzuna */
+            adzuna: string | null;
+            /** Open Ad */
+            open_ad: string | null;
         };
         /**
          * LlmSpendOut
@@ -1340,6 +1542,21 @@ export interface components {
             totp?: string | null;
             /** Username */
             username: string;
+        };
+        /** MemberBriefOut */
+        MemberBriefOut: {
+            /** Availability */
+            availability: string;
+            /** Completeness */
+            completeness: string;
+            /** Job Id */
+            job_id: number;
+            /** Source Ids */
+            source_ids: string[];
+            /** Target State */
+            target_state: string | null;
+            /** Title */
+            title: string;
         };
         /** NotReadyOut */
         NotReadyOut: {
@@ -1390,6 +1607,13 @@ export interface components {
             population: number;
             /** Postal Codes */
             postal_codes: string[];
+        };
+        /** PreviousOut */
+        PreviousOut: {
+            /** Mid */
+            mid: string;
+            /** Profile Version No */
+            profile_version_no: number;
         };
         /**
          * Problem
@@ -1603,6 +1827,15 @@ export interface components {
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
             /** Ok */
             ok: boolean;
+        };
+        /** RefOut */
+        RefOut: {
+            /** Job Id */
+            job_id: number;
+            /** Source Ids */
+            source_ids: string[];
+            /** Title */
+            title: string;
         };
         /**
          * ReleaseIn
@@ -1824,6 +2057,27 @@ export interface components {
              */
             force: boolean;
         };
+        /** ScoreOut */
+        ScoreOut: {
+            /**
+             * Confidence
+             * @enum {string}
+             */
+            confidence: "low" | "medium" | "high";
+            /** Coverage */
+            coverage: string;
+            /** High */
+            high: string;
+            /** Low */
+            low: string;
+            /** Mid */
+            mid: string;
+            /**
+             * Result Status
+             * @enum {string}
+             */
+            result_status: "accepted" | "contested";
+        };
         /**
          * ScoringHealthOut
          * @description The score lane (module docstring): ages are seconds at the caller's `now`, the amount in USD.
@@ -1922,6 +2176,13 @@ export interface components {
             name: string;
             /** Years */
             years: number | null;
+        };
+        /** SourceFacetOut */
+        SourceFacetOut: {
+            /** Count */
+            count: number;
+            /** Source Id */
+            source_id: string;
         };
         /**
          * SpanEditIn
@@ -2090,6 +2351,21 @@ export interface components {
             state: string;
             /** Target Id */
             target_id: number;
+        };
+        /** TargetOut */
+        TargetOut: {
+            /** Id */
+            id: number;
+            /** Override */
+            override: string;
+            /** Refusal Category */
+            refusal_category: string | null;
+            /** Similarity */
+            similarity: number | null;
+            /** State */
+            state: string;
+            /** State Reason */
+            state_reason: string | null;
         };
         /** TargetTitle */
         TargetTitle: {
@@ -2838,6 +3114,217 @@ export interface operations {
                 };
             };
             /** @description Invalid body, or a third canary (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_jobs_api_jobs_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+                /** @description Default `score_mid` */
+                sort?: ("score_mid" | "score_low" | "posted" | "first_seen") | null;
+                /** @description A keyword: 1 to 200 characters */
+                q?: string | null;
+                /** @description Default `30d` */
+                posted?: ("24h" | "3d" | "7d" | "14d" | "30d" | "any" | "custom") | null;
+                /** @description With `posted=custom` only */
+                posted_from?: string | null;
+                /** @description With `posted=custom` only */
+                posted_to?: string | null;
+                /** @description 0 to 100, default 0 */
+                score_min?: number | null;
+                /** @description 0 to 100, default 100 */
+                score_max?: number | null;
+                /** @description 0 to 100 (%), default 0 */
+                coverage_min?: number | null;
+                /** @description Default `any` */
+                confidence?: ("any" | "medium" | "high") | null;
+                /** @description A `gazetteer_id` of `GET /api/geo/places` */
+                loc_id?: string | null;
+                /** @description The place's `lat` */
+                loc_lat?: number | null;
+                /** @description The place's `lon` */
+                loc_lon?: number | null;
+                /** @description 1 to 200 */
+                radius_km?: number | null;
+                /** @description Default true */
+                include_remote?: boolean | null;
+                /** @description Default all four */
+                work_mode?: ("remote" | "hybrid" | "onsite" | "unknown")[] | null;
+                /** @description Company keys; default any */
+                company?: string[] | null;
+                /** @description Source ids; default any */
+                source?: string[] | null;
+                /** @description Default all four */
+                lang?: ("de" | "en" | "other" | "unknown")[] | null;
+                /** @description Employment types or `unknown` */
+                employment?: string[] | null;
+                /** @description Seniority levels */
+                seniority?: string[] | null;
+                /** @description Default all but `hidden` */
+                status?: ("unseen" | "seen" | "saved" | "applied" | "hidden")[] | null;
+                /** @description Default `active`, `unknown` */
+                availability?: ("active" | "unknown" | "stale" | "closed")[] | null;
+                /** @description Default `any` */
+                contested?: ("any" | "only" | "exclude") | null;
+                /** @description Default `any` */
+                partial?: ("any" | "only" | "exclude") | null;
+                /** @description Default all but `not_a_job_ad` */
+                scoring_state?: ("scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad")[] | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for this sort and these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A filter of the wrong type, outside its set or refused by the list, or a `limit` outside 1 to 100 (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_job_facets_api_jobs_facets_get: {
+        parameters: {
+            query?: {
+                /** @description A prefix of a company's name or key, folded; empty: every company */
+                company_q?: string;
+                limit?: number;
+                /** @description Default `score_mid` */
+                sort?: ("score_mid" | "score_low" | "posted" | "first_seen") | null;
+                /** @description A keyword: 1 to 200 characters */
+                q?: string | null;
+                /** @description Default `30d` */
+                posted?: ("24h" | "3d" | "7d" | "14d" | "30d" | "any" | "custom") | null;
+                /** @description With `posted=custom` only */
+                posted_from?: string | null;
+                /** @description With `posted=custom` only */
+                posted_to?: string | null;
+                /** @description 0 to 100, default 0 */
+                score_min?: number | null;
+                /** @description 0 to 100, default 100 */
+                score_max?: number | null;
+                /** @description 0 to 100 (%), default 0 */
+                coverage_min?: number | null;
+                /** @description Default `any` */
+                confidence?: ("any" | "medium" | "high") | null;
+                /** @description A `gazetteer_id` of `GET /api/geo/places` */
+                loc_id?: string | null;
+                /** @description The place's `lat` */
+                loc_lat?: number | null;
+                /** @description The place's `lon` */
+                loc_lon?: number | null;
+                /** @description 1 to 200 */
+                radius_km?: number | null;
+                /** @description Default true */
+                include_remote?: boolean | null;
+                /** @description Default all four */
+                work_mode?: ("remote" | "hybrid" | "onsite" | "unknown")[] | null;
+                /** @description Company keys; default any */
+                company?: string[] | null;
+                /** @description Source ids; default any */
+                source?: string[] | null;
+                /** @description Default all four */
+                lang?: ("de" | "en" | "other" | "unknown")[] | null;
+                /** @description Employment types or `unknown` */
+                employment?: string[] | null;
+                /** @description Seniority levels */
+                seniority?: string[] | null;
+                /** @description Default all but `hidden` */
+                status?: ("unseen" | "seen" | "saved" | "applied" | "hidden")[] | null;
+                /** @description Default `active`, `unknown` */
+                availability?: ("active" | "unknown" | "stale" | "closed")[] | null;
+                /** @description Default `any` */
+                contested?: ("any" | "only" | "exclude") | null;
+                /** @description Default `any` */
+                partial?: ("any" | "only" | "exclude") | null;
+                /** @description Default all but `not_a_job_ad` */
+                scoring_state?: ("scored" | "unscored" | "filtered" | "failed" | "expired" | "not_a_job_ad")[] | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FacetsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A filter of the wrong type, outside its set or refused by the list, a `company_q` over 200 characters or with a NUL, or a `limit` outside 1 to 100 (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;

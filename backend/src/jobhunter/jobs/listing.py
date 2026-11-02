@@ -3,7 +3,9 @@
 `select_page` selects one page of cards in the caller's read snapshot (`db.snapshot.read_snapshot`): it reads
 the active tuple and scope from `active_config` without a lock, then runs one statement per segment of the
 page's walk until it holds `limit + 1` rows, and returns the first `limit`, the position after the last one
-(`next`, when there is more) and, on a first page that asks for them, the counts.
+(`next`, when there is more) and, on a first page that asks for them, the counts. `read_active` is that read
+of the active tuple and scope; `card_set` is the same cards under the same filters as SQL to aggregate over
+(the facets of M4 Task 5), and `display_timezone` the active settings' zone of a `custom` window (B31).
 
 **Cards** (B2). A card is an unmerged job with a current revision, not a synthetic golden-case job, whose
 current revision has no target of the active tuple in `deferred_duplicate`. A group card is its
@@ -42,25 +44,30 @@ dates. A segment that no selected bucket can fill is not run.
 **Counts** (B18), on a first page only: the cards matching every filter and those of them without a score
 (the unscored section), each a `count(*)` over a sub-select limited to `COUNT_CAP + 1` rows; above the cap
 both stop at `COUNT_CAP` and `capped` is set.
+
+**Plans.** The statements keep their index walks and their cost low on 50,000 cards (M4 Task 5, B29):
+`jobs._sql`'s "Plans at scale", and the location filter's jsonpath bounds (`_near_box`).
 """
 
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from math import isfinite
+from math import cos, degrees, isfinite, radians
 from types import MappingProxyType
 from typing import Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.api.pagination import JobSection
-from jobhunter.db.sql import q as sql
 from jobhunter.jobs import _sql
 from jobhunter.jobs.query import JobsQuery, score_filter_active
 from jobhunter.normalize.text import fold
+from jobhunter.settings.model import Display
 
 COUNT_CAP: Final = 10_000  # B18
+EARTH_RADIUS_KM: Final = 6371.0088  # `geo_km`'s sphere (migration 0009, `geo.gazetteer.distance_km`)
+INSIDE_SHARE: Final = 0.99  # of half the radius: the inner box's margin below the radius
 
 SortValue = Decimal | float | datetime | None
 
@@ -114,9 +121,21 @@ Branch = Literal["ranked", "unranked"]
 
 
 @dataclass(frozen=True)
-class _Active:
+class Active:
+    """The active tuple (`None` before the first confirmed profile) and scope that `active_config` names."""
+
     llm_tuple_id: int | None
     scope_version_id: int
+
+
+@dataclass(frozen=True)
+class CardSet:
+    """The cards that match every filter of a query, as SQL over a card's score row (the aliases of
+    `jobs._sql`): `sql` is its `FROM … WHERE …`, to which a caller may add ` AND` conjuncts, and `binds` its
+    parameters."""
+
+    sql: str
+    binds: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -159,7 +178,12 @@ def _row_terms(
         binds |= {"q": q.q, "qf": fold(q.q)}
     if q.loc is not None:
         terms.append(("near", "remote") if q.include_remote else ("near",))
-        binds |= {"lat": q.loc.lat, "lon": q.loc.lon, "radius_km": q.loc.radius_km}
+        binds |= {
+            "lat": q.loc.lat,
+            "lon": q.loc.lon,
+            "radius_km": q.loc.radius_km,
+            "near_box": _near_box(q.loc.lat, q.loc.lon, q.loc.radius_km),
+        }
     if q.work_mode != _ALL_MODES:
         known = sorted(q.work_mode - {"unknown"})
         terms.append(
@@ -194,6 +218,31 @@ def _row_terms(
     return terms, binds
 
 
+def _near_box(lat: float, lon: float, radius_km: int) -> dict[str, float]:
+    """The bounds of the location filter's two jsonpath steps (`jobs._sql.NEAR_INSIDE`, `NEAR_BAND`).
+
+    `lo`/`hi` is `job_within_km`'s own latitude band, widened. The inner box, `lo_in..hi_in` by `west..east`,
+    lies within the radius: it spans `INSIDE_SHARE` of half the radius each way on `geo_km`'s sphere of radius
+    `EARTH_RADIUS_KM`, in latitude along the meridian and in longitude along the parallel of the box's
+    latitude nearest the equator, where a degree is longest. A point of the box is reached from the centre by
+    a meridian arc and then a parallel arc, each at most that share of half the radius, and the great circle
+    is no longer than that path, so its `geo_km` distance is below the radius whatever the float rounding.
+    """
+    band = radius_km / 110.5 + _sql.NEAR_BAND_WIDENING
+    half = degrees(INSIDE_SHARE * radius_km / (2 * EARTH_RADIUS_KM))
+    lo_in, hi_in = lat - half, lat + half
+    nearest = 0.0 if lo_in <= 0 <= hi_in else min(abs(lo_in), abs(hi_in))
+    wide = degrees(INSIDE_SHARE * radius_km / (2 * EARTH_RADIUS_KM * cos(radians(min(nearest, 90.0)))))
+    return {
+        "lo": lat - band,
+        "hi": lat + band,
+        "lo_in": lo_in,
+        "hi_in": hi_in,
+        "west": lon - wide,
+        "east": lon + wide,
+    }
+
+
 def _rendered(terms: Sequence[tuple[str, ...]], alias: str) -> str:
     fragments = _sql.ROW_SQL[alias]
     return (
@@ -201,7 +250,7 @@ def _rendered(terms: Sequence[tuple[str, ...]], alias: str) -> str:
     )
 
 
-def _filter(q: JobsQuery, window: tuple[datetime | None, datetime | None], active: _Active) -> _Filter:
+def _filter(q: JobsQuery, window: tuple[datetime | None, datetime | None], active: Active) -> _Filter:
     """Every predicate of `q` over a card's score row (`j`, `t`, `r`, `d`, `h`, `u`), module docstring."""
     terms, binds = _row_terms(q, window)
     conjuncts: list[str] = []
@@ -252,7 +301,7 @@ def _merged(branch: Branch, walks: Sequence[_sql.Walk], where: _Filter, *, bound
     return _sql.MERGED_HEAD + parts + _sql.MERGED_ORDER[branch]
 
 
-def _unscored_walks(q: JobsQuery, active: _Active, branch: Branch) -> list[_sql.Walk]:
+def _unscored_walks(q: JobsQuery, active: Active, branch: Branch) -> list[_sql.Walk]:
     """The sources of one branch of the unscored section that a selected bucket can fill."""
     if score_filter_active(q):  # B15: scored cards only
         return []
@@ -280,7 +329,7 @@ def _bound(after: Position) -> dict[str, object]:
     return binds
 
 
-def _segments(q: JobsQuery, active: _Active, where: _Filter, after: Position | None) -> Iterator[_Segment]:
+def _segments(q: JobsQuery, active: Active, where: _Filter, after: Position | None) -> Iterator[_Segment]:
     """The statements of the page's walk in order (module docstring, Sections)."""
     no_bound: Mapping[str, object] = MappingProxyType({})
     bound = no_bound if after is None else MappingProxyType(_bound(after))
@@ -305,7 +354,7 @@ def _segments(q: JobsQuery, active: _Active, where: _Filter, after: Position | N
 
 def _nulls_last(
     q: JobsQuery,
-    active: _Active,
+    active: Active,
     where: _Filter,
     after: Position | None,
     bound: Mapping[str, object],
@@ -372,9 +421,30 @@ async def _counts(conn: AsyncConnection, where: _Filter, binds: Mapping[str, obj
     unscored_sql = (
         _sql.TAG["count_unscored"] + _sql.COUNT_HEAD + _sql.UNSCORED_SECTION + where.sql + _sql.COUNT_TAIL
     )
-    total = int((await conn.execute(sql(total_sql), params)).scalar_one())
-    unscored = int((await conn.execute(sql(unscored_sql), params)).scalar_one())
+    total = int((await conn.execute(_sql.clause(total_sql), params)).scalar_one())
+    unscored = int((await conn.execute(_sql.clause(unscored_sql), params)).scalar_one())
     return Counts(total=min(total, cap), unscored=min(unscored, cap), capped=total > cap)
+
+
+async def read_active(conn: AsyncConnection) -> Active:
+    """The active tuple and scope, read without a lock (a read snapshot takes none)."""
+    row = (await conn.execute(_sql.ACTIVE)).one()
+    return Active(None if row.llm_tuple_id is None else int(row.llm_tuple_id), int(row.scope_version_id))
+
+
+async def display_timezone(conn: AsyncConnection) -> str:
+    """The active settings' `display.timezone`, the zone of a `custom` posted window (B31); the settings
+    model's default when the payload has none."""
+    zone = (await conn.execute(_sql.DISPLAY_TIMEZONE)).scalar_one()
+    return Display().timezone if zone is None else str(zone)
+
+
+def card_set(q: JobsQuery, *, window: tuple[datetime | None, datetime | None], active: Active) -> CardSet:
+    """The cards `select_page` lists for `q` under `active`, in no order (the facets' set, `jobs.facets`):
+    every filter of `q` over the card's score row, with the sort's score variant."""
+    where = _filter(q, window, active)
+    context = {"tuple": active.llm_tuple_id, "scope": active.scope_version_id}
+    return CardSet(_sql.CARD_FROM + _sql.CARD + where.sql, MappingProxyType({**context, **where.binds}))
 
 
 async def select_page(
@@ -393,8 +463,7 @@ async def select_page(
     if limit < 1:
         raise ValueError("the limit must be at least 1")
     _checked(q, after)
-    row = (await conn.execute(_sql.ACTIVE)).one()
-    active = _Active(None if row.llm_tuple_id is None else int(row.llm_tuple_id), int(row.scope_version_id))
+    active = await read_active(conn)
     where = _filter(q, window, active)
     context = {"tuple": active.llm_tuple_id, "scope": active.scope_version_id}
     rows: list[SelectedRow] = []
@@ -402,7 +471,7 @@ async def select_page(
         if len(rows) > limit:
             break
         params = {**context, **where.binds, **segment.binds, "limit": limit + 1 - len(rows)}
-        result = await conn.execute(sql(_sql.TAG[segment.tag] + segment.sql), params)
+        result = await conn.execute(_sql.clause(_sql.TAG[segment.tag] + segment.sql), params)
         rows += [
             SelectedRow(int(r.job_id), segment.section, _sort_value(segment.section, r.sort_value))
             for r in result

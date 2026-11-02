@@ -201,7 +201,8 @@ _UNTARGETED: Final = sa.text(
 
 async def test_the_bulk_seed_holds_its_cards(seeded: tuple[PgServer, BulkSeed]) -> None:
     """`bulk_seed_cards` (which the p95 tests of Tasks 5 and 6 consume) made `CARDS` cards: 80 % of them
-    scored, and of the 400 unscored ones every tenth without a target (40) and the rest pending (360); the
+    scored, and of the 400 unscored ones the 40 group representatives pending and of the other 360 every
+    tenth without a target (36) and the rest pending (324), so every representative has a target (T4-f); the
     members of its groups are no cards. Every filter opened, the counts say so."""
     server, seed = seeded
     every = JobsQuery(
@@ -221,9 +222,10 @@ async def test_the_bulk_seed_holds_its_cards(seeded: tuple[PgServer, BulkSeed]) 
     finally:
         await engine.dispose()
     assert (len(seed.card_ids), len(seed.scored_ids), len(seed.representative_ids)) == (CARDS, 1_600, 40)
-    assert states == {"published_accepted": 1_600, "pending": 360, "deferred_duplicate": 40}
-    assert untargeted == list(seed.untargeted_ids) and len(untargeted) == 40
+    assert states == {"published_accepted": 1_600, "pending": 364, "deferred_duplicate": 40}
+    assert untargeted == list(seed.untargeted_ids) and len(untargeted) == 36
     assert set(untargeted).isdisjoint(seed.scored_ids)
+    assert set(untargeted).isdisjoint(seed.representative_ids)  # every representative has a target
     assert first.counts is not None
     assert (first.counts.total, first.counts.unscored, first.counts.capped) == (CARDS, CARDS - 1_600, False)
     assert {row.section for row in first.rows} == {"scored"}

@@ -29,7 +29,8 @@ expiry).
   FR-9); a key with no stable form matches nothing.
 - `excluded_keyword`: a whole-word match in the title (and in the description when the scope says so). Text
   and keywords go through the normalisation of `title_norm` (`normalize_title`: separators, `Sr.`, accents,
-  case) before the match, so `Front-End` and a title normalised to `front end` meet.
+  case) before the match, so `Front-End` and a title normalised to `front end` meet. `first_excluded_keyword`
+  names the keyword that matched, by the same match (the Jobs list's chip, M4 Task 5).
 - `ad_language_excluded`: the language is known (not `unknown`) and not accepted.
 
 `write_result` upserts the row of a (job, scope) with `inputs_hash`, the `jobs.det_facts_hash` the result was
@@ -307,6 +308,23 @@ def _excluded_keyword(facts: DetFacts, description: _Description, scope: ScopeSe
     if pattern.search(facts.title_norm) is not None:
         return True
     return scope.exclude_keywords_in_description and pattern.search(description.comparison_form) is not None
+
+
+def first_excluded_keyword(
+    keywords: Sequence[str], title_norm: str, description_text: str | None = None
+) -> str | None:
+    """The keyword the `excluded_keyword` filter found, as the scope spells it (the Jobs list's "Filtered:
+    excluded keyword …" chip, plan M4 B24): the first of `keywords`, in their order, that matches the title
+    (`title_norm`) as the filter matches it; else the first that matches `description_text` (given when the
+    scope matches descriptions too); `None` when none does."""
+    patterns = [(keyword, _keyword_pattern((keyword,))) for keyword in keywords]
+    for text in (title_norm, None if description_text is None else _comparison_form(description_text)):
+        if text is None:
+            continue
+        for keyword, pattern in patterns:
+            if pattern is not None and pattern.search(text) is not None:
+                return keyword
+    return None
 
 
 def evaluate(facts: DetFacts, description_text: str, scope: ScopeSettings) -> HardFilterResult:

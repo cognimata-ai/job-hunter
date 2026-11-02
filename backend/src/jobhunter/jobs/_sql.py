@@ -4,6 +4,15 @@ Every string here is a constant. A statement is a choice among them, joined in a
 name or variant name is ever interpolated, and every value is a bound parameter. The aliases are those of a
 card's score row: `j` the job, `t` its active-tuple target, `r` the published result, `d` the current
 instance, `h` the hard-filter result, `u` the user's actions, and `m` a deferred group member.
+
+**Plans at scale** (M4 Task 5, B29: the list's p95 on 50,000 cards). Three shapes keep the planner's estimates
+honest, without which it chose nested loops over whole-table scans and JIT compilation:
+- a walk from an instance or a target finds its job by a fenced lateral lookup (`OFFSET 0`): the job is one
+  row per walked row, so the redundant `current_revision_id` check is no join selectivity that would multiply
+  the walk's estimate down to one row (and make a full sort look cheaper than the LIMIT walk of its index);
+- the deferred members that match (`DEFERRED_MEMBER`) are one uncorrelated set, an InitPlan run once per
+  statement, not an EXISTS costed (and planned around) for every row it would rarely run for;
+- the location filter decides most rows by two jsonpath steps before `job_within_km` (`NEAR_INSIDE`).
 """
 
 from collections.abc import Mapping
@@ -11,10 +20,16 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
 
+from sqlalchemy.sql.elements import TextClause
+
 from jobhunter.db.sql import q as sql
 from jobhunter.jobs.query import ScoringBucket, UserStatus
 
 ACTIVE: Final = sql("SELECT llm_tuple_id, scope_version_id FROM active_config WHERE id = 1")
+DISPLAY_TIMEZONE: Final = sql(
+    "SELECT v.payload #>> '{display,timezone}' FROM active_config a "
+    "JOIN settings_versions v ON v.id = a.settings_version_id WHERE a.id = 1"
+)
 
 # The card's score row, from the job (R8)
 CARD_FROM: Final = (
@@ -29,19 +44,22 @@ CARD: Final = (
     " WHERE j.merged_into_job_id IS NULL AND NOT j.synthetic_eval AND j.current_revision_id IS NOT NULL"
     " AND t.state IS DISTINCT FROM 'deferred_duplicate'"
 )
-# ... from the current instance (the scored section and the not-a-job-ad cards)
+# ... from the current instance (the scored section and the not-a-job-ad cards); its job is a fenced lateral
+# lookup (module docstring, Plans at scale)
 INSTANCE_FROM: Final = (
     " FROM det_results d"
     " JOIN llm_results r ON r.id = d.llm_result_id"
     " JOIN score_targets t ON t.published_result_id = r.id AND t.llm_tuple_id = :tuple"
-    " JOIN jobs j ON j.id = d.job_id AND j.current_revision_id = t.job_revision_id"
+    " CROSS JOIN LATERAL (SELECT * FROM jobs cj WHERE cj.id = d.job_id"
+    " AND cj.current_revision_id = t.job_revision_id OFFSET 0) j"
     " LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = :scope"
     " LEFT JOIN user_job_actions u ON u.job_id = j.id"
 )
-# ... from an unscored target (`score_targets_unscored_rank`: its predicate, verbatim)
+# ... from an unscored target (`score_targets_unscored_rank`: its predicate, verbatim); its job as above
 TARGET_FROM: Final = (
     " FROM score_targets t"
-    " JOIN jobs j ON j.id = t.job_id AND j.current_revision_id = t.job_revision_id"
+    " CROSS JOIN LATERAL (SELECT * FROM jobs cj WHERE cj.id = t.job_id"
+    " AND cj.current_revision_id = t.job_revision_id OFFSET 0) j"
     " LEFT JOIN llm_results r ON r.id = t.published_result_id"
     " LEFT JOIN det_results d ON d.llm_result_id = r.id AND d.scope_version_id = :scope AND d.is_current"
     " LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = :scope"
@@ -189,6 +207,24 @@ TEXT_REVISIONS: Final = (
     "OR kr.tsv @@ websearch_to_tsquery('german_unaccent', :q)"
 )
 TITLE_JOBS: Final = "SELECT kt.id FROM jobs kt WHERE :qf <% kt.title_norm"
+# The location filter is `job_within_km` (B5), decided in two jsonpath steps first (M4 Task 5, B29), since
+# the function is SQL, not inlinable, and costs ~11 µs a call. `:near_box` holds their bounds
+# (`listing._near_box`), a JSONB bind (`clause`), so the variables are one constant, not a document built per
+# row:
+# - NEAR_INSIDE: a candidate of a resolved entry lies in the box `lo_in..hi_in` by `west..east`, every point
+#   of which lies within the radius on `geo_km`'s sphere (a subset of the function's matches): a match, with
+#   no call. Gazetteer candidates sit on place centroids, so most matches are decided here;
+# - NEAR_BAND: else the function runs only when some candidate lies in the latitude band it checks first,
+#   |Δlat| <= radius / 110.5, widened by `NEAR_BAND_WIDENING` degrees (0.1 m) so that the bounds' conversion
+#   to jsonb numbers never narrows it (a superset of its matches).
+# Both compare the candidates' coordinates as the JSON numbers `sources.parsing.locations.Location` stores.
+NEAR_INSIDE: Final = (
+    '\'$[*] ? (@.resolution == "unique" || @.resolution == "ambiguous").candidates[*] '
+    "? (@.lat >= $lo_in && @.lat <= $hi_in && @.lon >= $west && @.lon <= $east)'"
+)
+NEAR_BAND: Final = "'$[*].candidates[*] ? (@.lat >= $lo && @.lat <= $hi)'"
+NEAR_BAND_WIDENING: Final = 1e-6
+JSONB_BINDS: Final = ("near_box",)
 # B4: the word similarity `<%` requires, pg_trgm's `word_similarity_threshold`. The list sets nothing: it runs
 # under the server's value, and `test_jobs_listing.py` checks that value is this one for the app's role.
 TRGM_WORD_THRESHOLD: Final = 0.6
@@ -197,8 +233,10 @@ ROW_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
         "posted_after": "coalesce({x}.posted_at_effective, {x}.first_seen_at) >= :posted_after",
         "posted_before": "coalesce({x}.posted_at_effective, {x}.first_seen_at) < :posted_before",
         "keyword": "({x}.current_revision_id IN (" + TEXT_REVISIONS + ") OR {x}.id IN (" + TITLE_JOBS + "))",
-        "near": "(job_within_km({x}.locations, CAST(:lat AS float8), CAST(:lon AS float8), "
-        "CAST(:radius_km AS float8)) AND {x}.location_kind <> 'country_wide')",
+        "near": "((jsonb_path_exists({x}.locations, " + NEAR_INSIDE + ", :near_box, true) "
+        "OR (jsonb_path_exists({x}.locations, " + NEAR_BAND + ", :near_box, true) "
+        "AND job_within_km({x}.locations, CAST(:lat AS float8), CAST(:lon AS float8), "
+        "CAST(:radius_km AS float8)))) AND {x}.location_kind <> 'country_wide')",
         # B5: an unknown work mode is never remote
         "remote": "({x}.location_kind = 'remote' OR ({x}.work_mode_source <> 'none' "
         "AND 'remote' = ANY({x}.work_mode_possible)))",
@@ -226,16 +264,19 @@ ROW_SQL: Final[Mapping[str, Mapping[str, str]]] = MappingProxyType(
     }
 )
 # A deferred member `m` of the representative `j`'s active group that matches P(m): `DEFERRED_MEMBER`, then
-# P(m) rendered for `m`, then `DEFERRED_MEMBER_END`, which closes the EXISTS and the term it opened.
+# P(m) rendered for `m`, then `DEFERRED_MEMBER_END`, which closes the set and the term it opened. The set is
+# the representatives (joined as members of their own group, `rj`) of the active groups with such a member:
+# uncorrelated, so an InitPlan computed once per statement (module docstring, Plans at scale).
 DEFERRED_MEMBER: Final = (
-    "(j.duplicate_group_id IS NOT NULL AND EXISTS (SELECT 1 FROM duplicate_groups g "
+    "(j.duplicate_group_id IS NOT NULL AND j.id = ANY(ARRAY(SELECT g.representative_job_id "
+    "FROM duplicate_groups g "
+    "JOIN jobs rj ON rj.id = g.representative_job_id AND rj.duplicate_group_id = g.id "
     "JOIN jobs m ON m.duplicate_group_id = g.id "
     "JOIN score_targets tm ON tm.job_revision_id = m.current_revision_id AND tm.llm_tuple_id = :tuple "
     "AND tm.state = 'deferred_duplicate' "
-    "WHERE g.id = j.duplicate_group_id AND g.status = 'active' AND g.representative_job_id = j.id "
-    "AND m.id <> j.id AND m.merged_into_job_id IS NULL AND "
+    "WHERE g.status = 'active' AND m.id <> g.representative_job_id AND m.merged_into_job_id IS NULL AND "
 )
-DEFERRED_MEMBER_END: Final = "))"
+DEFERRED_MEMBER_END: Final = ")))"
 
 # The representative's own predicates
 STATUS_ORDER: Final[tuple[UserStatus, ...]] = ("unseen", "seen", "saved", "applied", "hidden")
@@ -281,3 +322,8 @@ CONFIDENCE: Final[Mapping[str, str]] = MappingProxyType(
 CONTESTED: Final[Mapping[str, str]] = MappingProxyType(
     {"only": "r.status = 'contested'", "exclude": "r.status IS DISTINCT FROM 'contested'"}
 )
+
+
+def clause(statement: str) -> TextClause:
+    """`statement` as a text clause whose JSONB binds (`JSONB_BINDS`, those it holds) are typed JSONB."""
+    return sql(statement, jsonb=[name for name in JSONB_BINDS if f":{name}" in statement])
