@@ -78,8 +78,9 @@ jobs:
 
   integration:
     runs-on: ubuntu-24.04
-    # M3's suite takes about 42 minutes on a hosted runner (71% at 30 minutes in run 296).
-    timeout-minutes: 60
+    # M3's suite takes about 50 minutes on a hosted runner (47 and 50 minutes on c41d2df); the bound leaves
+    # room for a slower runner and M4's tests.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
