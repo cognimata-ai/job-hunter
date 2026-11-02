@@ -16,8 +16,10 @@ fenced publish ended `cancelled` is left for the purge's chunk (A2 S4); `in_batc
 `scoring.stuck_target_repaired` (warn, subject the hour of `ctx.now`, `%Y-%m-%dT%H`, L5594 "aggregated
 hourly"): every pass first resolves the open ones whose last raise is older than an hour
 (`resolve_quiet_alerts`: an hour without reclaims, also while a later hour still reclaims), then a pass with
-reclaims raises its hour's in the same transaction. After the commit, `jobhunter_claim_reclaims_total` counts
-the reclaimed claims (`cycles.count_reclaims`, which every reclaim calls: Ruling T18-a).
+reclaims raises its hour's in the same transaction, which bumps the ranking last when a claim ended
+`failed_attempts_exhausted` (`cycles.any_exhausted`; one back to `pending` stays in the unscored bucket, B30).
+After the commit, `jobhunter_claim_reclaims_total` counts the reclaimed claims (`cycles.count_reclaims`, which
+every reclaim calls: Ruling T18-a).
 
 **`det_completeness`** (heavy, §17.4 L5511, §7.17 #5, L4568): for the active scope, then for the pending scope
 while one exists, the active tuple's published results are paged by id (`det_results.published_page`), each
@@ -27,8 +29,10 @@ a cleared one ends it), the page's job rows `FOR SHARE` in id order (step 4, car
 lock), then every result of the page without a current instance for the scope whose hash and algorithm version
 are current recomputed by `det_results.recompute_stale_instances`, which the scope apply's chunks share
 (`stale_of`, the staleness the live hook reads too, then `recompute_instance`: the result rows `FOR UPDATE`
-in id order, step 10). A changed `DET_ALGORITHM_VERSION` makes every current instance stale, so the next
-pass recomputes each once. It counts the instances written.
+in id order, step 10). A chunk of the active scope that wrote an instance bumps the ranking as its last
+statement (a `det_results` current-instance change, §7.1 L1255); the pending scope's never do, the Jobs list
+shows the active scope's alone. A changed `DET_ALGORITHM_VERSION` makes every current instance stale, so the
+next pass recomputes each once. It counts the instances written.
 
 **`admission_alerts`** (heavy, §9.6.5 L3686-3688; A2 A8) and **`scoring_drift`** (heavy, §11.13 L4633-4635,
 §17.6 L5595), one transaction each: `fence_epoch`, a plain read of the active tuple, scope and evaluation
@@ -74,6 +78,7 @@ from typing import Final, Literal
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.observability.alerts import (
@@ -142,6 +147,8 @@ async def reconcile_stuck_targets(ctx: ReconcileContext) -> int:
                     message="score target claims with a stale heartbeat were reclaimed",
                     context={"reclaimed": len(moved), "pending": pending, "exhausted": len(moved) - pending},
                 )
+            if cycles.any_exhausted(moved):
+                await ranking.bump(conn)  # `ranking_state`, the last lock
     except FencedOut as fenced:
         if fenced.worker_superseded:
             raise  # `fence_epoch` logged it
@@ -211,6 +218,8 @@ async def reconcile_det_completeness(ctx: ReconcileContext) -> int:
                         conn, llm_tuple_id=int(tuple_id), scope=scope, scope_part=part, after=after
                     )
                     written += count
+                    if count and pointer == "active":  # the list shows the active scope's instances alone
+                        await ranking.bump(conn)  # `ranking_state`, the last lock
                 if len(page) < DET_CHUNK:
                     break
                 after = page[-1].llm_result_id

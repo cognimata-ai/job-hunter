@@ -57,8 +57,9 @@ scopes, or whose row has an `inputs_hash` other than `jobs.det_facts_hash` or an
 transaction still holds `FOR SHARE`; `recompute_stale` counts them (Codex r6 B4). The heavy reconciler
 `hard_filter_completeness` runs it over every job (fenced by the worker epoch) and then refilters the
 unpublished active-tuple targets of exactly those jobs by the active scope
-(`targets.refilter_targets_of_jobs`, honouring overrides; M1 Deviation 8 closed), bumping the ranking when
-one moved; node 8
+(`targets.refilter_targets_of_jobs`, honouring overrides; M1 Deviation 8 closed), bumping the ranking last
+when one moved or when a job's `passed` under the active scope changed (the list's `passes_hard_filters`; a
+job without a result before counts, a rewrite of an equal value does not, B32); node 8
 (`graphs.collect.nodes.hard_filters`) runs `recompute_stale` over the jobs the run touched (fenced by the
 run's owner row). Each batch is one transaction in the lock order of §3.3.3: `active_config`
 (`lock_active_scopes`), then the batch's job rows `FOR SHARE` in ascending id and in one statement (a job
@@ -596,6 +597,13 @@ _STALE: Final = q(
 )
 
 
+# The jobs' `passed` under one scope, read before their recompute (a job without a row has none).
+_PASSED: Final = q(
+    "SELECT job_id, passed FROM hard_filter_results WHERE scope_version_id = :scope "
+    "AND job_id = ANY(CAST(:jobs AS bigint[]))"
+)
+
+
 async def recompute_stale_ids(
     conn: AsyncConnection,
     scopes: Mapping[int, ScopeSettings],
@@ -616,17 +624,40 @@ async def recompute_stale_ids(
     (the owner row of the run or operation, or the worker epoch) and raises `FencedOut`, having written
     nothing, when it does not; then the results are written (`refilter_job`: no target moves, no instance).
     """
+    job_ids, _ = await _recompute_stale(conn, scopes, guard=guard, since=since, watched=None)
+    return job_ids
+
+
+async def _recompute_stale(
+    conn: AsyncConnection,
+    scopes: Mapping[int, ScopeSettings],
+    *,
+    guard: Guard,
+    since: datetime | None,
+    watched: int | None,
+) -> tuple[list[int], bool]:
+    """`recompute_stale_ids`, and whether a recomputed job's `passed` under scope `watched` (one of `scopes`)
+    changed: the jobs' values are read after the guard and before the writes, and a job without a result for
+    that scope before counts as changed (its `passes_hard_filters` was NULL). Always `False` without
+    `watched`."""
     if not scopes:
-        return []
+        return [], False
     found = await conn.execute(
         _STALE,
         {"since": since, "scopes": list(scopes), "version": DET_ALGORITHM_VERSION, "limit": BATCH},
     )
     job_ids = [int(job_id) for job_id in found.scalars()]
     await guard(conn)
+    prior: dict[int, bool] = {}
+    if watched is not None and job_ids:
+        rows = await conn.execute(_PASSED, {"scope": watched, "jobs": job_ids})
+        prior = {int(row.job_id): bool(row.passed) for row in rows}
+    changed = False
     for job_id in job_ids:
-        await refilter_job(conn, job_id, scopes)
-    return job_ids
+        results = await refilter_job(conn, job_id, scopes)
+        if watched is not None and results[watched].passed != prior.get(job_id):
+            changed = True
+    return job_ids, changed
 
 
 async def recompute_stale(
@@ -646,7 +677,8 @@ async def recompute_stale(
 async def hard_filter_completeness(ctx: ReconcileContext) -> int:
     """§17.4 `hard_filter_completeness`: the unmerged jobs without a current result for the active (or
     pending) scope are recomputed, under `active_config` `FOR SHARE`, `BATCH` jobs per pass, and the
-    unpublished active-tuple targets of those jobs refiltered by the active scope (module docstring). Returns
+    unpublished active-tuple targets of those jobs refiltered by the active scope; the ranking is bumped last
+    when a target moved or a job's active-scope `passed` changed (module docstring, B32). Returns
     the count of jobs recomputed. When `ctx.epoch` is no longer the current worker epoch it raises `FencedOut`
     (`fence_epoch`), having written nothing, so that `run_reconcilers` stops the cadence at this reconciler
     and the superseded worker requests its stop (Ruling FR-r; fix wave F7, Ruling FR-w); a `FencedOut` of
@@ -661,9 +693,11 @@ async def hard_filter_completeness(ctx: ReconcileContext) -> int:
     try:
         async with ctx.engine.begin() as conn:
             active = await lock_active_scopes(conn)
-            job_ids = await recompute_stale_ids(conn, active.scopes, guard=fenced)
+            job_ids, passed_changed = await _recompute_stale(
+                conn, active.scopes, guard=fenced, since=None, watched=active.scope_version_id
+            )
             swept = await targets.refilter_targets_of_jobs(conn, job_ids, active)
-            if swept.moved:
+            if passed_changed or swept.moved:
                 await ranking.bump(conn)  # `ranking_state`, the last lock
             return len(job_ids)
     except FencedOut as fenced_out:

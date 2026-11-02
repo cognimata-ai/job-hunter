@@ -50,6 +50,10 @@ rows, step 10). The predicates are this module's: `older_epoch` (`claim_epoch < 
 target's current attempt belongs to `:cycle`) and `stuck` (Task 18's `stuck_targets`: a claim heartbeat
 older than `:cutoff` whose current attempt is still `running`); every reclaim runs the same statements over
 them. An attempt's own failure is never a reclaim: `run_target` ends it through `fail` (Ruling T11-a).
+`reclaim` never bumps the ranking: its caller does, once and as its transaction's last statement, when a claim
+ended `failed_attempts_exhausted` (`any_exhausted`; a claim back to `pending` stays in the unscored bucket,
+`ranking.crosses_bucket`, B30): `stuck_targets`, `fail_cycle`, the `score_targets` sweep, and the owners of
+the transactions that call `_orphan` in a loop (the `score_cycles` sweep and `orphaned_cycles`), after it.
 
 **An orphaned cycle** is failed `orphaned` with the report closed `{"reason": "orphaned"}`, its claims
 reclaimed, and the warn alert `score_cycle.orphaned` raised (subject `cycle:<id>`), which the next completed
@@ -78,7 +82,7 @@ caller's transaction: the `scoring_drift` reconciler and every `finalize_cycle` 
 Ids, counts, codes and amounts only reach a log line, a report or an alert.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
@@ -86,6 +90,7 @@ from typing import Final, Literal, get_args
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.db import ranking
 from jobhunter.db.guards import global_fence_active
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import transition, transition_where
@@ -656,7 +661,8 @@ async def reclaim(
     exhausted_reason: str = ATTEMPTS_EXHAUSTED,
 ) -> list[Reclaimed]:
     """Reclaim the claims of `kind` (module docstring) in the caller's transaction, a claim without charged
-    attempts left to `failed_attempts_exhausted(exhausted_reason)`; what it moved."""
+    attempts left to `failed_attempts_exhausted(exhausted_reason)`; what it moved. It never bumps the ranking:
+    the caller does last, when `any_exhausted(moved)`."""
     # Never the claim's owner: the bulk rows (step 7) before the target rows (step 10)
     candidates = [int(i) for i in (await conn.execute(_CANDIDATES[kind], dict(params))).scalars()]
     if not candidates:
@@ -706,6 +712,12 @@ async def reclaim(
     return moved
 
 
+def any_exhausted(moved: Sequence[Reclaimed]) -> bool:
+    """Whether a reclaim moved a claim out of the unscored bucket (`ranking.crosses_bucket`): one that ended
+    `failed_attempts_exhausted`; a claim back to `pending` does not, B30. Its caller bumps then, last."""
+    return any(m.state == "failed_attempts_exhausted" for m in moved)
+
+
 def count_reclaims(reclaimed: int) -> None:
     """`jobhunter_claim_reclaims_total` by `reclaimed` (Ruling T18-a: every reclaim counts, whoever
     reclaimed), called once the reclaiming transaction has committed: a rolled-back reclaim never counts."""
@@ -724,9 +736,11 @@ _STALE_CYCLES: Final = q(
 )
 
 
-async def _orphan(conn: AsyncConnection, cycle_id: int, *, detail: str) -> int:
+async def _orphan(conn: AsyncConnection, cycle_id: int, *, detail: str) -> list[Reclaimed]:
     """Fail the locked running cycle `orphaned` with its report closed, reclaim its claims and raise the
-    warn alert; how many claims it reclaimed."""
+    warn alert; the claims it reclaimed. It never bumps the ranking: its callers run it in a loop, and bump
+    once after the loop, last, when `any_exhausted` of them all (a bump here would take `ranking_state` before
+    the next cycle's target rows)."""
     await transition(
         conn,
         "score_cycles",
@@ -746,13 +760,14 @@ async def _orphan(conn: AsyncConnection, cycle_id: int, *, detail: str) -> int:
         context={"cycle_id": cycle_id, "reclaimed": len(reclaimed)},
     )
     log.warning("score_cycle_orphaned", cycle_id=cycle_id, reclaimed=len(reclaimed), detail=detail)
-    return len(reclaimed)
+    return reclaimed
 
 
 async def fail_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int, error_class: str) -> int | None:
     """The cycle task's end for a bug (module docstring), under the owner predicate; how many claims it
     reclaimed (the caller counts them after its commit, `count_reclaims`), `None` when the cycle is no longer
-    this owner's running cycle (nothing is written then)."""
+    this owner's running cycle (nothing is written then). The ranking bump, when `any_exhausted`, is its last
+    statement: the caller commits right after it."""
     try:
         await transition(
             conn,
@@ -775,15 +790,21 @@ async def fail_cycle(conn: AsyncConnection, cycle_id: int, *, epoch: int, error_
         message="a score cycle failed",
         context={"cycle_id": cycle_id, "error_class": error_class, "reclaimed": len(reclaimed)},
     )
+    if any_exhausted(reclaimed):
+        await ranking.bump(conn)  # `ranking_state`, the last lock
     log.error("score_cycle_failed", cycle_id=cycle_id, error_class=error_class, reclaimed=len(reclaimed))
     return len(reclaimed)
 
 
 @register_takeover_sweep("score_targets")
 async def sweep_older_epoch_claims(conn: AsyncConnection, epoch: int) -> Swept:
-    """§3.3.1 step 3: reclaim every claim of an older epoch (detail `worker_takeover`); the count, counted in
+    """§3.3.1 step 3: reclaim every claim of an older epoch (detail `worker_takeover`), the ranking bumped
+    last when `any_exhausted` (the sweep's transaction commits right after it); the count, counted in
     `jobhunter_claim_reclaims_total` once the sweep's transaction has committed."""
-    reclaimed = len(await reclaim(conn, "older_epoch", {"epoch": epoch}, detail=WORKER_TAKEOVER))
+    moved = await reclaim(conn, "older_epoch", {"epoch": epoch}, detail=WORKER_TAKEOVER)
+    if any_exhausted(moved):
+        await ranking.bump(conn)  # `ranking_state`, the last lock
+    reclaimed = len(moved)
     return Swept(reclaimed, after_commit=lambda: count_reclaims(reclaimed))
 
 
@@ -791,11 +812,15 @@ async def sweep_older_epoch_claims(conn: AsyncConnection, epoch: int) -> Swept:
 async def sweep_older_epoch_cycles(conn: AsyncConnection, epoch: int) -> Swept:
     """§3.3.1 step 4: fail every running cycle of an older epoch `orphaned` (its claims were reclaimed by the
     `score_targets` sweep before it; any left are reclaimed here, and counted once the sweep's transaction
-    has committed); the count of cycles."""
+    has committed), the ranking bumped once after every cycle, last, when `any_exhausted`; the count of
+    cycles."""
     cycle_ids = [int(c) for c in (await conn.execute(_OLDER_CYCLES, {"epoch": epoch})).scalars()]
-    reclaimed = 0
+    moved: list[Reclaimed] = []
     for cycle_id in cycle_ids:
-        reclaimed += await _orphan(conn, cycle_id, detail=WORKER_TAKEOVER)
+        moved += await _orphan(conn, cycle_id, detail=WORKER_TAKEOVER)
+    if any_exhausted(moved):
+        await ranking.bump(conn)  # `ranking_state`, the last lock: after every cycle's target rows
+    reclaimed = len(moved)
     return Swept(len(cycle_ids), after_commit=lambda: count_reclaims(reclaimed))
 
 
@@ -803,19 +828,22 @@ async def sweep_older_epoch_cycles(conn: AsyncConnection, epoch: int) -> Swept:
 async def reconcile_orphaned_cycles(ctx: ReconcileContext) -> int:
     """Fail every running cycle whose heartbeat is older than `ORPHANED_AFTER` at `ctx.now` `orphaned`
     (module docstring); the count. Fenced by the worker epoch first: the worker's own `FencedOut` propagates
-    (Ruling FR-w), another owner's ends the pass with 0, having written nothing."""
+    (Ruling FR-w), another owner's ends the pass with 0, having written nothing. The ranking is bumped once
+    after every cycle, last, when `any_exhausted`."""
     try:
-        reclaimed = 0
+        moved: list[Reclaimed] = []
         async with ctx.engine.begin() as conn:
             await fence_epoch(conn, ctx.epoch)
             stale = (await conn.execute(_STALE_CYCLES, {"cutoff": ctx.now - ORPHANED_AFTER})).all()
             for row in stale:
-                reclaimed += await _orphan(conn, int(row.id), detail=CYCLE_ORPHANED)
+                moved += await _orphan(conn, int(row.id), detail=CYCLE_ORPHANED)
+            if any_exhausted(moved):
+                await ranking.bump(conn)  # `ranking_state`, the last lock: after every cycle's target rows
     except FencedOut as fenced:
         if fenced.worker_superseded:
             raise  # `fence_epoch` logged it
         return 0
-    count_reclaims(reclaimed)  # after the commit (Ruling T18-a)
+    count_reclaims(len(moved))  # after the commit (Ruling T18-a)
     for row in stale:  # after the commit: a hung local execution of that cycle stops
         key: ExecKey = ("cycle", int(row.id))
         live = EXECUTIONS.get(key)

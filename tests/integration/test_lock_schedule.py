@@ -17,7 +17,7 @@ commit.
   one of its candidates (the target, step 5, then the month row, step 6), and the stated exception itself: a
   candidate whose row another transaction holds while it is still `pending` is skipped, never waited for;
 - the confirm's `activate_tuple` (`active_config FOR UPDATE`) against a cycle's `claim` (`active_config FOR
-  SHARE`, the cycle, then the targets);
+  SHARE`, the cycle, then the targets; no `ranking_state`, M4 Task 3, B30);
 - Carry T14-c: an owner's `publish` or `fail` (the target row, then the bulk row of its follow-up hold)
   against node 9's cancellation (the bulk row first, Ruling P52, then the target row): forced into the
   deadlock, PostgreSQL aborts one and that side's retry of a deadlock (`DB_RETRY`, `is_retryable_db_error`)
@@ -121,6 +121,7 @@ _PROBES: Final[dict[str, str]] = {
     "llm_budget": "SELECT 1 FROM llm_budget WHERE month = :key FOR UPDATE NOWAIT",
     "bulk_operations": "SELECT 1 FROM bulk_operations WHERE id = :key FOR UPDATE NOWAIT",
     "worker_heartbeat": "SELECT 1 FROM worker_heartbeat WHERE id = :key FOR UPDATE NOWAIT",
+    "ranking_state": "SELECT 1 FROM ranking_state WHERE id = :key FOR UPDATE NOWAIT",
 }
 
 
@@ -572,15 +573,28 @@ async def test_the_confirm_s_tuple_activation_and_a_cycle_s_claim_meet_at_active
         target = await target_of(engine, pending.target_id)
         assert (target.state, target.state_reason) == ("cancelled", "tuple_superseded")
     else:
-        async with holding(engine, _LOCK_RANKING) as blocker:  # the claim's last lock
-            claiming = background(run_claim(deps, cycle_id, pending.target_id))
-            wait = one_wait(await waits(migrated, claiming), "ranking_state")
-            assert blocker in wait.blocking_pids
-            claimer = wait.pid
-            assert not await free(engine, "score_targets", pending.target_id)  # the claimed target, held
-            confirming = background(confirm_new_profile(engine))
-            wait = one_wait(await waits(migrated, claiming, confirming, count=2), "active_config")
-            assert wait.key == "1" and wait.blocking_pids == (claimer,)  # the confirm's first lock
+        # The claim takes no `ranking_state` (B30: `pending → in_progress` stays in the unscored bucket), so
+        # its transaction is held open after its last statement, every lock it took still held.
+        claimed, release, claimer_pids = asyncio.Event(), asyncio.Event(), []
+        real_claim_round = claim_node.claim_round
+
+        async def held_claim_round(conn: AsyncConnection, *args: Any, **kwargs: Any) -> Any:
+            rows = await real_claim_round(conn, *args, **kwargs)
+            claimer_pids.append(await pid_of(conn))
+            claimed.set()
+            await asyncio.wait_for(release.wait(), WAIT_S)
+            return rows
+
+        monkeypatch.setattr(claim_node, "claim_round", held_claim_round)
+        claiming = background(run_claim(deps, cycle_id, pending.target_id))
+        await asyncio.wait_for(claimed.wait(), WAIT_S)
+        (claimer,) = claimer_pids
+        assert not await free(engine, "score_targets", pending.target_id)  # the claimed target, held
+        assert await free(engine, "ranking_state", 1)  # and no ranking bump
+        confirming = background(confirm_new_profile(engine))
+        wait = one_wait(await waits(migrated, claiming, confirming), "active_config")
+        assert wait.key == "1" and wait.blocking_pids == (claimer,)  # the confirm's first lock
+        release.set()
         update, _ = await settle(claiming, confirming)
         (ref,) = update["claimed"]
         target = await target_of(engine, pending.target_id)  # claimed, then cancelled by the activation
