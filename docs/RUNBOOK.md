@@ -120,11 +120,12 @@ adopted. Report it as a bug before any release.
 every batch. `batch_poll` (every 5 min) retrieves the batch, and once it has ended moves the submission to
 `ended` and processes its results. Each failed retrieval logs `batch_retrieve_failed` (warning) with the
 `submission_id`, the `error_class` and the HTTP `status`. A retrieval that still fails past `expires_at + 1 h`
-raises the critical alert `batch.retrieve_failing` (its subject the submission id, its context the
-`submission_id` and the `provider_batch_id`) and logs `batch_retrieve_failing`; every later failing pass raises
-it again. While the submission stays `submitted`, its targets stay `in_batch`, its reserved spend stays counted
-against the month, and no new batch is submitted for the tuple (a batch preparation ends `in_flight`). The
-tuple's other pending targets are still scored by the online cycles.
+raises the critical alert `batch.retrieve_failing` and logs `batch_retrieve_failing`. The alert's `dedup_key`
+is `batch.retrieve_failing:<submission id>`, and its `context` holds the `submission_id` and the
+`provider_batch_id`; every later failing pass raises it again. While the submission stays `submitted`, its
+targets stay `in_batch`, its reserved spend stays counted against the month, and no new batch is submitted for
+the tuple (a batch preparation ends `in_flight`). The tuple's other pending targets are still scored by the
+online cycles.
 
 **What to do.**
 1. Find the submission and the alert with read-only queries:
@@ -132,7 +133,7 @@ tuple's other pending targets are still scored by the online cycles.
    ```
    SELECT id, state, provider_batch_id, submitted_at, expires_at, request_count, reserved_usd
      FROM batch_submissions WHERE state = 'submitted';
-   SELECT id, subject, first_at, last_at, occurrences FROM alerts
+   SELECT id, dedup_key, context, first_at, last_at, occurrences, acknowledged_at FROM alerts
     WHERE code = 'batch.retrieve_failing' AND resolved_at IS NULL;
    ```
 
