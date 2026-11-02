@@ -287,8 +287,9 @@ FROM (SELECT 1) one LEFT JOIN LATERAL (SELECT status, progress FROM operations W
 ELIGIBLE_SQL: Final = (
     "t.bulk_operation_id = :b AND t.state = 'pending' AND (t.not_before IS NULL OR t.not_before <= now()) "
     "AND NOT is_fenced(t.job_id, t.llm_tuple_id) AND t.resume_draft_id IS NULL "
-    "AND NOT EXISTS (SELECT 1 FROM score_attempts a JOIN score_drafts d ON d.attempt_id = a.id "
-    "WHERE a.target_id = t.id AND a.evaluation_policy_id = :policy) "
+    "AND NOT (t.resume_draft_id IS NOT NULL OR EXISTS (SELECT 1 FROM score_attempts a "
+    "JOIN score_drafts d ON d.attempt_id = a.id "
+    "WHERE a.target_id = t.id AND a.evaluation_policy_id = :policy)) "
     "AND (t.lane IS NULL OR t.lane NOT IN ('batch_followup', 'score_now')) "
     "AND (t.state_reason IS NULL OR t.state_reason NOT IN ('batch_max_tokens', 'batch_invalid_output', "
     "'batch_errored', 'batch_canceled', 'batch_expired', 'batch_missing')) "
