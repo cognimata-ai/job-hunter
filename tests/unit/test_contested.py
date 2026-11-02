@@ -20,10 +20,10 @@ from typing import Any
 
 import pytest
 from jobhunter.llm.schemas.critic import CriticOut
-from jobhunter.llm.schemas.generator import GeneratorDraft
+from jobhunter.llm.schemas.generator import GeneratorDraft, JobFacts
 from jobhunter.scoring import contested, publication
 from jobhunter.scoring.contested import null_out
-from jobhunter.scoring.facts import FactRef
+from jobhunter.scoring.facts import FactRef, derive_fact_ids, name_subject
 from jobhunter.scoring.knockouts import Confirmation, derive_knockouts, required_facts
 from jobhunter.scoring.publication import Publication, PublicationInvalid, Review, build
 from jobhunter.scoring.rubric import load_rubric
@@ -479,3 +479,103 @@ def test_null_out_needs_a_review_only_for_rejections_and_the_flag() -> None:
     assert (result.nulled_criteria, result.dropped_facts) == ([], [])
     assert result.draft == v.draft
     assert contested.rejected_facts(None) == []
+
+
+# ---- a fact's review across the publication's repairs (final review, Codex I2) ----------------------------
+
+# A mandatory certification over its 120-character limit: publication cuts it to 116 characters and `[…]`,
+# which gives the fact another id than the one the critic reviewed (`facts.name_subject`).
+LONG_PREFIX = "AWS Solutions Architect " + "mit Praxis in Cloud-Sicherheit und Netzwerken, " * 2
+LONG_NAME = f"{LONG_PREFIX}inklusive Nachweis der Rezertifizierung"
+OTHER_LANGUAGE = "Plattdeutsch aus dem nordlichen Emsland, fliessend"  # over the 40 of `language_other`
+CONFIRMING_QUOTE = "AWS Solutions Architect erforderlich"
+
+
+def long_certification(name: str = LONG_NAME) -> dict[str, Any]:
+    return fact_item("certification", name, CONFIRMING_QUOTE, required=True)
+
+
+def name_fact_id(code: str, name: str) -> str:
+    return f"{code}:{name_subject(name)}"
+
+
+def published_fact_id(code: str, published: Publication) -> str:
+    """The one fact id of `code` the published facts hold (`facts.derive_fact_ids` over them, read back as
+    `det_results` reads the stored facts)."""
+    stored = JobFacts.model_validate(published.result.job_facts.model_dump(mode="json"))
+    (found,) = [name for name in derive_fact_ids(stored) if name.startswith(f"{code}:")]
+    return found
+
+
+def test_a_confirmed_overlong_certification_keeps_its_confirmation_and_its_penalty() -> None:
+    v = validated(wire(facts=[*DEFAULT_FACTS, long_certification()]))
+    reviewed_id = name_fact_id("certification", LONG_NAME)
+    assert [ref.fact_id for ref in required_of(v)] == [reviewed_id]  # unmet: the profile lacks it
+    review = reviewed(v, review_item(reviewed_id, "fact_confirmed", CONFIRMING_QUOTE))
+    published = publish(v, review, mode="accepted", revisions_used=0)
+    (certification,) = published.result.job_facts.certifications
+    assert certification.name.endswith("[…]") and len(certification.name) == 120  # the publication's cut
+    repaired_id = published_fact_id("certification", published)
+    assert repaired_id != reviewed_id
+    assert published.result.fact_confirmations == {repaired_id: "critic_confirmed"}
+    (candidate,) = published.result.knockout_candidates
+    assert (candidate.fact_id, candidate.comparison, candidate.severity) == (repaired_id, "unmet", "soft")
+    assert [k["binding"] for k in published.aggregation.knockouts] == [True]
+    without = publish(validated(wire()), None, mode="accepted", revisions_used=0)
+    assert without.aggregation.mid is not None and published.aggregation.mid is not None
+    assert published.aggregation.mid == without.aggregation.mid - 10  # the soft penalty, not lost
+    # the critic's quote is the evidence of the fact under its published id
+    assert ("AWS Solutions Architect erforderlich", repaired_id) in {
+        (e.quote, e.subject) for e in published.evidence
+    }
+    assert all(e.subject != reviewed_id for e in published.evidence)
+
+
+def test_a_confirmed_overlong_other_language_keeps_its_confirmation() -> None:
+    other = fact_item(
+        "required_language", f"other:{OTHER_LANGUAGE}", "Französisch B2", qualifier="B2", required=True
+    )
+    v = validated(wire(facts=[*DEFAULT_FACTS, other]))
+    reviewed_id = f"mandatory_language:other:{name_subject(OTHER_LANGUAGE)}"
+    assert [ref.fact_id for ref in required_of(v)] == [reviewed_id]  # uncomparable: binding-capable
+    review = reviewed(v, review_item(reviewed_id, "fact_confirmed", "Französisch B2"))
+    published = publish(v, review, mode="contested")
+    (language,) = published.result.job_facts.required_languages
+    assert language.language_other is not None and language.language_other.endswith("[…]")
+    repaired_id = published_fact_id("mandatory_language", published)
+    assert repaired_id != reviewed_id
+    assert published.result.fact_confirmations == {repaired_id: "critic_confirmed"}
+    (candidate,) = published.result.knockout_candidates
+    assert (candidate.fact_id, candidate.comparison) == (repaired_id, "uncomparable")
+
+
+@pytest.mark.parametrize(
+    ("second", "expected"),
+    [("fact_confirmed", "critic_confirmed"), ("fact_uncertain", "unconfirmed")],
+    ids=["both_confirmed", "one_uncertain"],
+)
+def test_two_certifications_cut_to_one_id_share_a_confirmation_only_when_both_have_it(
+    second: str, expected: str
+) -> None:
+    shared = LONG_PREFIX[:100] + "x" * (116 - 100)  # the 116 characters the cut keeps
+    first_name, second_name = f"{shared}Alpha-Stufe mit Nachweis", f"{shared}Beta-Stufe mit Nachweis"
+    v = validated(
+        wire(facts=[*DEFAULT_FACTS, long_certification(first_name), long_certification(second_name)])
+    )
+    first_id, second_id = (
+        name_fact_id("certification", first_name),
+        name_fact_id("certification", second_name),
+    )
+    assert [ref.fact_id for ref in required_of(v)] == sorted([first_id, second_id])  # two ids reviewed
+    review = reviewed(
+        v,
+        review_item(first_id, "fact_confirmed", CONFIRMING_QUOTE),
+        review_item(second_id, second, CONFIRMING_QUOTE),
+    )
+    published = publish(v, review, mode="contested")
+    assert len(published.result.job_facts.certifications) == 2  # both published, cut to one name
+    repaired_id = published_fact_id("certification", published)
+    assert published.result.fact_confirmations == {repaired_id: expected}
+    (candidate,) = published.result.knockout_candidates  # one candidate per fact id
+    assert candidate.comparison == "unmet"
+    assert [k["binding"] for k in published.aggregation.knockouts] == [expected == "critic_confirmed"]

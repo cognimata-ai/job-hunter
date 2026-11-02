@@ -22,8 +22,16 @@ the `Publication`, touching no target, result or ranking row (L4611).
 3. **the publication object**: `PublishedResult.model_validate` of the repaired draft with the status, the
    nulled criteria, the truncations, the facts' confirmations (each fact id of the published facts, and
    `not_a_job_ad:ad` when it is published, with the last review's confirmation after its round, else
-   `unconfirmed`), the knockout candidates under `scope`, the critic's outcome (`contested`; else `accepted`
-   when a review exists, `not_run` without one) and `revisions_used`. **The badge "possibly not a job ad"**
+   `unconfirmed`; carried across the repairs, below), the knockout candidates under `scope`, the critic's
+   outcome (`contested`; else `accepted` when a review exists, `not_run` without one) and `revisions_used`.
+   **The review across the repairs** (final review, Codex I2): a cut certification name or `language_other`
+   gives its fact another id (`facts.name_subject`) than the one the critic reviewed, and the stored facts,
+   `derive_knockouts` and `det_results` all derive the cut one. So the confirmations are keyed by the
+   repaired draft's ids, each taking the review of the fact at the same place before the repairs
+   (`facts.fact_ids_by_place`; a repair cuts names and the tails of lists, it moves no fact). When the cut
+   makes several facts share an id, the id takes their confirmation only if every one of them had the same,
+   else `unconfirmed`, so a cut never gives an unconfirmed fact a confirmation (and a reviewed id whose facts
+   end under several ids gives none of them its review). **The badge "possibly not a job ad"**
    (§11.10 item 3a, `badge_possibly_not_a_job_ad`: a contested draft that said it was no job ad, unverified)
    has no `llm_results` column (0008): it is stored as `not_a_job_ad:ad` kept in `fact_confirmations` with
    its non-confirmed status (the last review's `uncertain` or `critic_rejected`, else `unconfirmed`; a
@@ -45,8 +53,8 @@ the `Publication`, touching no target, result or ranking row (L4611).
 6. **the evidence** (`result_evidence`): every quote of the published draft with its grounding (`ctx`, as V3
    grounds it: a description span, a structured field or a profile section), its subject the criterion key
    or the fact's key (its fact id, else its pseudo key), then the last review's grounded quotes of a subject
-   the result still holds (a criterion, a published fact, a verified `not_a_job_ad:ad`), each row once and
-   each quote of 4 to 300 characters (the table's CHECK).
+   the result still holds (a criterion, a published fact under its repaired id, a verified
+   `not_a_job_ad:ad`), each row once and each quote of 4 to 300 characters (the table's CHECK).
 
 `ctx` is the scoring's `ValidationContext` (the ad, the profile with its sections, the job's `DetFacts` under
 the lock the caller holds, the description's completeness) and `weights` the rubric's: the brief's `det`,
@@ -60,13 +68,13 @@ from typing import Final, Literal
 
 from pydantic import ValidationError
 
-from jobhunter.llm.schemas.generator import GeneratorDraft
+from jobhunter.llm.schemas.generator import GeneratorDraft, JobFacts
 from jobhunter.llm.schemas.published import PublishedResult
 from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring import contested
 from jobhunter.scoring.aggregate import Aggregation, aggregate, industry_match
 from jobhunter.scoring.det_criteria import employment_salary, location_work_mode
-from jobhunter.scoring.facts import NOT_A_JOB_AD, derive_fact_ids
+from jobhunter.scoring.facts import NOT_A_JOB_AD, derive_fact_ids, fact_ids_by_place
 from jobhunter.scoring.knockouts import Confirmation, KnockoutCandidate, derive_knockouts
 from jobhunter.scoring.rubric import LLM_CRITERIA
 from jobhunter.scoring.validator import (
@@ -190,12 +198,48 @@ def _knockout(candidate: KnockoutCandidate) -> dict[str, JSONValue]:
     }
 
 
+@dataclass(frozen=True)
+class _Carried:
+    """The last review carried across the publication repairs (module docstring, step 3): the confirmation of
+    each fact id of the repaired facts, and each reviewed fact id renamed to the one id its facts have now."""
+
+    confirmations: dict[str, Confirmation]
+    renamed: dict[str, str]
+
+
+def _carry(published: JobFacts, repaired: JobFacts, stored: Mapping[str, Confirmation]) -> _Carried:
+    """The review of the facts of `published` (the critic's ids, `stored` their confirmations) carried to
+    `repaired`, its facts after the repairs, by place (module docstring, step 3)."""
+    before, after = fact_ids_by_place(published), fact_ids_by_place(repaired)
+    images: dict[str, set[str]] = {}
+    for place, name in after.items():
+        reviewed = before.get(place)
+        if reviewed is not None:
+            images.setdefault(reviewed, set()).add(name)
+    found: dict[str, set[Confirmation]] = {}
+    for place, name in after.items():
+        reviewed = before.get(place)
+        status: Confirmation = _UNCONFIRMED
+        if reviewed is not None and images[reviewed] == {name}:
+            status = stored.get(reviewed, _UNCONFIRMED)
+        found.setdefault(name, set()).add(status)
+    return _Carried(
+        confirmations={
+            name: statuses.pop() if len(statuses) == 1 else _UNCONFIRMED for name, statuses in found.items()
+        },
+        renamed={reviewed: next(iter(names)) for reviewed, names in images.items() if len(names) == 1},
+    )
+
+
 def _confirmations(
-    draft: GeneratorDraft, not_a_job_ad: bool, review: Review | None
+    draft: GeneratorDraft, not_a_job_ad: bool, stored: Mapping[str, Confirmation], carried: _Carried
 ) -> dict[str, Confirmation]:
-    names = list(derive_fact_ids(draft.job_facts)) + ([NOT_A_JOB_AD.fact_id] if not_a_job_ad else [])
-    stored = {} if review is None else review.confirmations
-    return {name: stored.get(name, _UNCONFIRMED) for name in names}
+    """The published confirmations (module docstring, step 3): each fact id of the repaired `draft` with its
+    carried review, and `not_a_job_ad:ad` with its own."""
+    found = {name: carried.confirmations.get(name, _UNCONFIRMED) for name in derive_fact_ids(draft.job_facts)}
+    if not_a_job_ad:
+        found[NOT_A_JOB_AD.fact_id] = stored.get(NOT_A_JOB_AD.fact_id, _UNCONFIRMED)
+    return found
 
 
 def _badge(review: Review | None) -> Confirmation:
@@ -213,9 +257,14 @@ def _row(subject: str, quote: str, grounding: Grounding) -> Evidence | None:
 
 
 def _evidence(
-    draft: GeneratorDraft, ctx: ValidationContext, review: CriticValidation | None, subjects: set[str]
+    draft: GeneratorDraft,
+    ctx: ValidationContext,
+    review: CriticValidation | None,
+    subjects: set[str],
+    renamed: Mapping[str, str],
 ) -> list[Evidence]:
-    """The evidence of the published `draft` and of the review (module docstring, step 6)."""
+    """The evidence of the published `draft` and of the review (module docstring, step 6); `renamed` maps a
+    reviewed fact id to its repaired one."""
     found: list[Evidence | None] = []
     for key in LLM_CRITERIA:
         criterion = getattr(draft.criteria, key)
@@ -229,7 +278,8 @@ def _evidence(
         for quote in place.evidence:
             grounding = ground_quote(quote, ctx.ad, ctx.profile_sections)
             found.append(None if grounding is None else _row(place.key, quote, grounding))
-    for subject, grounded in ({} if review is None else review.evidence).items():
+    for reviewed, grounded in ({} if review is None else review.evidence).items():
+        subject = renamed.get(reviewed, reviewed)
         if subject in subjects:
             found += [_row(subject, quote, grounding) for quote, grounding in grounded]
     return list(dict.fromkeys(row for row in found if row is not None))
@@ -261,7 +311,9 @@ def build(
         nulled_criteria, not_a_job_ad = [], draft.not_a_job_ad
     moved = _moved(validation, dropped)
     repaired, truncated = repair_for_publication(published, moved)
-    confirmations = _confirmations(repaired, not_a_job_ad, last_review)
+    stored = {} if last_review is None else last_review.confirmations
+    carried = _carry(published.job_facts, repaired.job_facts, stored)
+    confirmations = _confirmations(repaired, not_a_job_ad, stored, carried)
     subjects = {*LLM_CRITERIA, *confirmations}  # the badge's key draws no evidence
     if badge:
         confirmations[NOT_A_JOB_AD.fact_id] = _badge(last_review)
@@ -315,7 +367,7 @@ def build(
     return Publication(
         result=result,
         aggregation=aggregation,
-        evidence=_evidence(repaired, ctx, checked, subjects),
+        evidence=_evidence(repaired, ctx, checked, subjects, carried.renamed),
         critic_injection=critic_injection,
         truncated_fields=list(truncated),
         repairs=repairs,

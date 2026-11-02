@@ -22,9 +22,19 @@ from typing import Any, Final
 import pytest
 import sqlalchemy as sa
 from jobhunter.db.sql import q
+from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.scoring.aggregate import Aggregation
 from jobhunter.scoring.det_results import JobRow, ScopeRow, compute_and_write, det_inputs, write_instance
+from jobhunter.scoring.knockouts import derive_knockouts, required_facts
+from jobhunter.scoring.publication import Publication, Review, build
 from jobhunter.scoring.rubric import LLM_CRITERIA, load_rubric
+from jobhunter.scoring.validator import (
+    ParsedGenerator,
+    apply_fact_confirmations,
+    parse_generator,
+    validate_draft,
+    validate_review,
+)
 from jobhunter.scoring.versioning import DET_ALGORITHM_VERSION
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -34,7 +44,8 @@ from tests.support.m2 import insert_profile_chain
 from tests.support.m3 import active_ids, insert_id, insert_job, insert_published
 from tests.support.pg import PgServer, blocked_or_done
 from tests.support.procs import await_until
-from tests.support.scoring import job_facts
+from tests.support.scoring import job_facts, review_item, synthetic_review
+from tests.support.validation import DESCRIPTION, ctx_for, fact_item, synthetic_ad, synthetic_wire_c
 
 pytestmark = pytest.mark.integration
 
@@ -374,3 +385,87 @@ async def test_a_verified_not_a_job_ad_instance_has_no_score(engine: AsyncEngine
         assert (row.score_low, row.score_mid, row.score_high, row.confidence) == (None, None, None, None)
         assert row.coverage == Decimal(0)
         await c.rollback()
+
+
+async def test_a_published_overlong_certification_keeps_its_penalty_when_recomputed(
+    engine: AsyncEngine,
+) -> None:
+    """Final review, Codex I2: a mandatory certification over its 120 characters, confirmed by the critic and
+    unmet, is published under the id of its cut name with the critic's confirmation, so the recomputation
+    from the stored result keeps its soft penalty."""
+    made = overlong_certification_publication()
+    doc = made.result.model_dump(mode="json")
+    (repaired_id,) = doc["fact_confirmations"]
+    async with engine.connect() as c:
+        stored = await stored_result(
+            c,
+            facts_doc=doc["job_facts"],
+            confirmations=doc["fact_confirmations"],
+            critic="accepted",
+            critic_injection="none",
+        )
+        written = await compute_and_write(
+            c, llm_result_id=stored.result_id, scope=stored.scope, det=facts(), sources={}, job=stored.job
+        )
+        (row,) = [r for r in await instances(c, stored.result_id) if r.id == written]
+        # 90..100 without it (`test_compute_and_write_rebuilds_the_stored_result_under_a_scope`); the soft
+        # penalty takes 10
+        assert (row.score_low, row.score_mid, row.score_high) == (Decimal(80), Decimal(85), Decimal(90))
+        assert row.knockouts == [
+            {
+                "code": "certification",
+                "fact_id": repaired_id,
+                "severity": "soft",
+                "source": "critic_confirmed",
+                "comparison": "unmet",
+                "binding": True,
+            }
+        ]
+        await c.rollback()
+
+
+# The default facts of `synthetic_wire_c`, beside which the certification is asserted.
+_WIRE_FACTS: Final = [
+    fact_item("work_mode", "hybrid", "Berlin, hybrid"),
+    fact_item("must_have", "Python", "Python, PostgreSQL"),
+    fact_item("must_have", "PostgreSQL", "Python, PostgreSQL"),
+    fact_item("employment_type", "full_time", "full_time (structured)"),
+]
+
+
+def overlong_certification_publication() -> Publication:
+    """The accepted publication of a synthetic draft whose mandatory certification is 150 characters long, the
+    critic confirming it under the id it reviewed (the uncut name's)."""
+    quote = "AWS Solutions Architect erforderlich"
+    ad = synthetic_ad(description=f"{DESCRIPTION} Zertifizierung {quote}.")
+    ctx = ctx_for(ad)
+    name = "AWS Solutions Architect " + "mit Praxis in Cloud-Sicherheit und Netzwerken, " * 2 + "Stufe III"
+    certification = fact_item("certification", name, quote, required=True)
+    parsed = parse_generator(
+        synthetic_wire_c(facts=[*_WIRE_FACTS, certification]), family="generator_v2_items"
+    )
+    assert isinstance(parsed, ParsedGenerator)
+    validation = validate_draft(parsed.draft, ctx, normalisation=parsed.normalisation)
+    settings = scope()
+    found = derive_knockouts(validation.draft.job_facts, ctx.det, ctx.profile, settings)
+    required = required_facts(validation.draft.job_facts, found, not_a_job_ad=False)
+    (fact,) = required
+    out = CriticOut.model_validate(synthetic_review(review_item(fact.fact_id, "fact_confirmed", quote)))
+    checked = validate_review(out, validation=validation, required=required, ctx=ctx)
+    review = Review(
+        validation=checked,
+        injection="none",
+        confirmations=apply_fact_confirmations({}, checked, required),
+    )
+    made = build(
+        draft=validation.draft,
+        validation=validation,
+        last_review=review,
+        mode="accepted",
+        scope=settings,
+        ctx=ctx,
+        weights=load_rubric("v2").weights,
+        revisions_used=0,
+    )
+    assert fact.fact_id not in made.result.fact_confirmations  # published under its cut name's id
+    return made

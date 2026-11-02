@@ -24,8 +24,10 @@ flag, so its id is a constant the callers add (`knockouts.required_facts`).
 
 `binding_facts(facts)` is the one walk of the asserted facts: each one's code, subject and path in the
 `job_facts` document (the field name, and the index in a list), so `derive_fact_ids` and the critic's
-rendering of a draft (`prompts.render.draft_block`) name the same facts. `FACT_ID_CODES` are the codes a fact
-id of a draft can have.
+rendering of a draft (`prompts.render.draft_block`) name the same facts. `fact_ids_by_place` keys the ids by
+that path: a publication repair that cuts a name gives its fact another id at the same place, and the
+publication carries the critic's review of the fact across it by the place (final review, Codex I2).
+`FACT_ID_CODES` are the codes a fact id of a draft can have.
 """
 
 import re
@@ -138,6 +140,12 @@ def binding_facts(facts: JobFacts) -> Iterator[BindingFact]:
         yield BindingFact("security_clearance", "clearance", ("security_clearance",))
     if facts.work_permit.required:
         yield BindingFact("work_permit", "work_permit", ("work_permit",))
+
+
+def fact_ids_by_place(facts: JobFacts) -> dict[tuple[str | int, ...], str]:
+    """The fact id of every asserted fact that binds, by its place in the `job_facts` document
+    (`BindingFact.path`): what a repair that cuts a name renames, the place stays (`publication.build`)."""
+    return {fact.path: fact_id(fact.code, fact.subject) for fact in binding_facts(facts)}
 
 
 def derive_fact_ids(facts: JobFacts) -> dict[str, FactRef]:
