@@ -1,6 +1,6 @@
 import sqlalchemy as sa
 from jobhunter.db.sql import PgErrorInfo, is_unique_violation, pg_error, q
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSON, JSONB
 
 
 def test_q_binds_only_the_named_parameters_as_jsonb() -> None:
@@ -10,6 +10,17 @@ def test_q_binds_only_the_named_parameters_as_jsonb() -> None:
         .binds
     )
     assert isinstance(binds["a"].type, JSONB) and not isinstance(binds["b"].type, JSONB)
+
+
+def test_q_binds_the_json_parameters_as_json() -> None:
+    binds = (
+        q("INSERT INTO t (a, b, c) VALUES (:a, :b, :c)", jsonb=["a"], json=["b"])
+        .compile(dialect=sa.create_engine("postgresql+psycopg://u@h/d").dialect)
+        .binds
+    )
+    assert isinstance(binds["a"].type, JSONB)
+    assert isinstance(binds["b"].type, JSON) and not isinstance(binds["b"].type, JSONB)
+    assert not isinstance(binds["c"].type, JSON)
 
 
 def test_q_without_jsonb_is_a_plain_text_clause() -> None:

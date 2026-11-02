@@ -1,0 +1,188 @@
+{
+  "key": "adzuna_snippet",
+  "label": "ok",
+  "expected_knockouts": [],
+  "profile": {
+    "summary": "Java-Entwickler mit fünf Jahren Erfahrung in Spring Boot und relationalen Datenbanken.",
+    "target_titles": [
+      {
+        "title": "Java-Entwickler",
+        "lang": "de"
+      },
+      {
+        "title": "Java Developer",
+        "lang": "en"
+      }
+    ],
+    "seniority": "mid",
+    "total_years_experience": 5,
+    "roles": [
+      {
+        "title": "Softwareentwickler Java",
+        "employer": "Beispiel Versicherungsdienste GmbH",
+        "start": "2020-04-01",
+        "end": "present",
+        "seniority": "mid",
+        "domain": "Versicherungen",
+        "highlights": [
+          "Schnittstellen zur Vertragsverwaltung mit Spring Boot entwickelt"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "Java",
+        "category": "programming_language",
+        "level": "advanced",
+        "years": 5,
+        "evidence": "Java"
+      },
+      {
+        "name": "Spring Boot",
+        "category": "framework",
+        "level": "advanced",
+        "years": 4,
+        "evidence": "Spring Boot"
+      },
+      {
+        "name": "PostgreSQL",
+        "category": "tool",
+        "level": "intermediate",
+        "years": 3,
+        "evidence": "PostgreSQL"
+      }
+    ],
+    "languages": [
+      {
+        "code": "de",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "Deutsch (Muttersprache)"
+      },
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "C1",
+        "evidence": "Englisch (C1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "bachelor",
+        "field": "Wirtschaftsinformatik",
+        "institution": null,
+        "year": 2019
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "Versicherungen"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "München",
+        "gazetteer_id": "geonames:2867714",
+        "lat": 48.13743,
+        "lon": 11.57549,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "Softwareentwickler Java (m/w/d)",
+    "company": "Testdaten Systems GmbH",
+    "locations": [
+      "München"
+    ],
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "partial",
+    "description": "Zur Verstärkung unseres Teams in München suchen wir ab sofort einen Softwareentwickler Java (m/w/d) in Vollzeit. Ihre Aufgaben: Weiterentwicklung unserer Anwendungen für Kunden aus dem Finanzumfeld, Umsetzung neuer Schnittstellen und Pflege bestehender Module. Ihr Profil: abgeschlossene Ausbildung oder Studium, Erfahrung mit Java und gängigen Frameworks, Teamfähigkeit und gute Deutschkenntnisse. Wir bieten ein …"
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "München",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2867714",
+            "country_code": "DE",
+            "lat": 48.13743,
+            "lon": 11.57549
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "work_mode_source": "none",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "structured",
+    "salary": null,
+    "industry_structured": null
+  }
+}

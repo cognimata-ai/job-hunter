@@ -1,0 +1,530 @@
+"""scripts/smoke_m3.py (Task 28): its fifteen checks in order (smoke_m2's checks 1-8 as they are, then its
+own), the score lane's predicates it copies pinned to the code's, every compose call on the three files (the
+fixtures and the fake LLM over the dev stack), the paid run posted only once the running worker is on both
+fakes, and a whole run against a stubbed stack that prints fifteen `ok` lines and never the cookie, the
+password, a key, an ad's text, a CV text or a draft; `subprocess` and the HTTP transport stubbed."""
+
+import importlib.util
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any, Final
+
+import httpx
+import pytest
+from jobhunter.llm import spend_ledger
+from jobhunter.scoring import batches, targets
+
+from tests.support.profile import SYNTHETIC_CV, SYNTHETIC_PROFILE, SYNTHETIC_QUERIES
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+M2_CHECK_NAMES: Final = [
+    "user_create",
+    "login",
+    "health_ready",
+    "cv_upload",
+    "text_review",
+    "extract_ready",
+    "confirm",
+    "proposal_ready",
+]
+CHECK_NAMES: Final = [
+    *M2_CHECK_NAMES,
+    "targets_created",
+    "score_cycle",
+    "score_now",
+    "feedback",
+    "scope_apply",
+    "batch_path",
+    "health",
+]
+OVERLAYS: Final = ["compose.dev.yaml", "compose.fixtures.yaml", "compose.fakellm.yaml"]
+TOKEN: Final = "c2Vzc2lvbi10b2tlbi1vZi10aGUtc3R1Yg"  # the stub's session token
+COOKIE: Final = f"__Host-jh_session={TOKEN}"
+KEY: Final = "sk-ant-api03-c3R1Yi1rZXktbmV2ZXItcHJpbnRlZA"  # a key-shaped value in the stub's answers
+AD_TEXT: Final = "Wir suchen eine Backend-Entwicklerin (m/w/d) für unser Plattform-Team in Berlin."
+# Texts the stub's answers hold, as the stack's do, and the output must not: the CV, the profile, the
+# proposal's query texts, an ad, and a key.
+CONTENT: Final = (
+    "Erika Musterfrau",
+    "erika.musterfrau@example.org",
+    "Musterfirma",
+    SYNTHETIC_PROFILE["summary"],
+    *(query["text"] for query in SYNTHETIC_QUERIES["queries"]),
+    AD_TEXT,
+    KEY,
+)
+
+
+def load(name: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def import_smoke(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """scripts/smoke_m3.py loaded as when it runs as a script (`smoke_m0`, `smoke_m1` and `smoke_m2` beside
+    it on `sys.path`), leaving no cached copy of any behind (`test_smoke_m2_script.import_smoke`)."""
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    for name in ("smoke_m0", "smoke_m1", "smoke_m2"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.setitem(sys.modules, name, load(name))
+    return load("smoke_m3")
+
+
+@pytest.fixture
+def smoke(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return import_smoke(monkeypatch)
+
+
+def compose_files(args: list[str]) -> list[str]:
+    return [Path(args[i + 1]).name for i, arg in enumerate(args) if arg == "-f"]
+
+
+Answer = tuple[int, str, str]
+
+
+def stub_subprocess(smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[list[str]]:
+    """Replace `subprocess.run` in the smoke and the modules it runs docker through (`smoke_m0`'s `psql`,
+    `smoke_m2`'s user creation and `printenv`) with `answer(args) -> (returncode, stdout, stderr)`; the calls,
+    in order."""
+    calls: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, *answer(args))
+
+    stub = SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired)
+    for module in (smoke, sys.modules["smoke_m0"], sys.modules["smoke_m2"]):
+        monkeypatch.setattr(module, "subprocess", stub)
+    return calls
+
+
+def test_the_fifteen_checks_run_in_order(smoke) -> None:
+    assert [name for name, _ in smoke.CHECKS] == CHECK_NAMES
+    m2 = sys.modules["smoke_m2"]
+    assert smoke.CHECKS[: len(M2_CHECK_NAMES)] == m2.CHECKS[: len(M2_CHECK_NAMES)]  # M2's, as they are
+
+
+def test_the_copied_predicates_are_the_score_lanes(smoke) -> None:
+    """The retained current revision is `create_targets_for_tuple`'s, the batch candidate the preparation's,
+    and the counted amount the one `spend_ledger.recompute` sums: the smoke's `psql` copies cannot drift from
+    them."""
+    assert smoke.RETAINED_JOB_SQL == targets.RETAINED_JOB_SQL
+    assert smoke.ELIGIBLE_SQL == batches.ELIGIBLE_SQL
+    assert smoke.COUNTED == spend_ledger._COUNTED
+    assert smoke.COUNTED in smoke.COUNTERS_CLEAN and smoke.RETAINED_JOB_SQL in smoke.TARGETS_CREATED
+
+
+def test_the_golden_seed_runs_in_the_worker_container_on_both_overlays(smoke, monkeypatch) -> None:
+    calls = stub_subprocess(smoke, monkeypatch, lambda args: (1, "", "boom\n"))
+    with pytest.raises(smoke.CheckFailed, match="golden seed-adversarial: exit 1: boom"):
+        smoke.golden_seed()
+    (args,) = calls
+    assert args[:4] == ["docker", "compose", "--env-file", str(SCRIPTS.parent / "deploy/images.lock")]
+    assert compose_files(args) == OVERLAYS
+    assert args[args.index("exec") :] == ["exec", "-T", "worker", "jobhunter", "golden", "seed-adversarial"]
+
+
+def test_a_running_tick_keeps_the_lane_from_quiet(smoke, monkeypatch) -> None:
+    """Task 28 fix round 1, item 6: a `jh:tick` job in `doing` counts as waiting (its periodic trigger reads
+    the bucket, so a slow tick could still take a refill), and the quiet wait polls until it has ended."""
+    assert (
+        "(task_name = 'jh:score_cycle' AND status IN ('todo', 'doing'))\n"
+        "      OR (task_name = 'jh:tick' AND status = 'doing')"
+    ) in smoke.LANE_STATE
+    rows = iter([["0", "1", "4"], ["0", "0", "4"]])  # a tick running, then none
+    asked: list[str] = []
+
+    def query_row(sql: str, columns: int) -> list[str]:
+        asked.append(sql)
+        return next(rows)
+
+    monkeypatch.setattr(smoke, "query_row", query_row)
+    monkeypatch.setattr(smoke, "POLL_INTERVAL_S", 0)
+    assert smoke.await_quiet_lane() == 4 and asked == [smoke.LANE_STATE] * 2
+
+
+def test_the_refill_moment_reads_the_lane_again_after_waiting_for_the_window(smoke, monkeypatch) -> None:
+    """Smoke run 3: the lane was quiet at second 55, the tick at the top of the minute started a periodic
+    cycle while the smoke waited for second 10, and that cycle's settlements took the refill. The lane is
+    read again inside the window."""
+    seconds = iter([55, 20])
+    reads = iter([4, 5])
+    waits: list[str] = []
+
+    class Clock:
+        @staticmethod
+        def now(tz: Any) -> Any:
+            return SimpleNamespace(second=next(seconds))
+
+    monkeypatch.setattr(smoke, "datetime", Clock)
+    monkeypatch.setattr(smoke, "await_quiet_lane", lambda: next(reads))
+    monkeypatch.setattr(smoke, "away_from_the_tick", lambda: waits.append("window"))
+    assert smoke.quiet_moment() == 5 and waits == ["window"]
+
+
+class Posts:
+    """An `httpx.Client` stand-in that records each post (none may happen)."""
+
+    def __init__(self) -> None:
+        self.posts: list[str] = []
+
+    def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        self.posts.append(url)
+        return httpx.Response(202, json={"run": {"id": 1}, "created": True})
+
+
+@pytest.mark.parametrize(
+    ("llm", "sources"),
+    [((1, ""), (0, "1\n")), ((0, "1\n"), (0, "0\n"))],
+    ids=["fake-llm-unset", "fake-sources-off"],
+)
+def test_no_paid_run_is_posted_unless_the_worker_is_on_both_fakes(
+    smoke, monkeypatch, llm: tuple[int, str], sources: tuple[int, str]
+) -> None:
+    by_variable = {"JOBHUNTER_FAKE_LLM": llm, "JOBHUNTER_FAKE_SOURCES": sources}
+
+    def docker(args: list[str]) -> Answer:
+        if "printenv" in args:
+            return (*by_variable[args[-1]], "")
+        return 0, "1|2|3|4\n" if "INSERT INTO queries" in args[-1] else "4|4|1\n", ""  # the two seeds
+
+    calls = stub_subprocess(smoke, monkeypatch, docker)
+    client = Posts()
+    with pytest.raises(smoke.CheckFailed, match="no run was posted"):
+        smoke.check_targets_created(smoke.Context(client=client, cookie="c"))
+    assert client.posts == []
+    assert all(compose_files(args) == OVERLAYS for args in calls if "printenv" in args)
+
+
+def template(statement: str) -> re.Pattern[str]:
+    """`statement` with each `{name}` placeholder matching what `str.format` puts there."""
+    return re.compile(re.sub(r"\\\{\w+\\\}", r"[^\\s]+?", re.escape(statement)))
+
+
+class Database:
+    """The rows the stubbed stack's `psql` answers, by statement; `seen` the statements' names in order.
+    The first bulk operation is cancelled by the second confirm; `batch_submit` is the bulk operation's
+    `batch_submit` row (status, what it skipped, submissions) and `eligible` its eligible and too-old counts,
+    as the dev stack's fixtures leave them (Ruling T28-e)."""
+
+    def __init__(
+        self,
+        smoke: ModuleType,
+        *,
+        batch_submit: str = "succeeded|below_minimum|0",
+        eligible: str = "117|125",
+        old_bulk: str = "cancelled|0",
+    ) -> None:
+        self.seen: list[str] = []
+        self.batch_submit = batch_submit
+        self.eligible = eligible
+        self.old_bulk = old_bulk
+        self.confirmed = 0
+        self.statements = [
+            (name, template(getattr(smoke, name)))
+            for name in (
+                "SEED_BOARDS",
+                "ACTIVE",
+                "TARGETS_CREATED",
+                "LANE_STATE",
+                "ADVANCE_BUCKET",
+                "PENDING_OF",
+                "CYCLE_AFTER",
+                "INSTANCES_OF",
+                "PUBLISHED_JOB",
+                "PENDING_JOB",
+                "TARGET_STATE",
+                "APPLY_STATE",
+                "FILTERED_BY",
+                "BULK_OF",
+                "BULK_TARGETS",
+                "OLD_BULK",
+                "BATCH_SUBMIT_OF",
+                "ELIGIBLE_OF",
+                "COUNTERS_CLEAN",
+            )
+        ]
+        self.seed_inputs = sys.modules["smoke_m1"].SEED_INPUTS
+        self.proposals = template(sys.modules["smoke_m2"].PROPOSALS_OF)
+
+    def answer(self, sql: str) -> str:
+        if sql == self.seed_inputs:
+            self.seen.append("SEED_INPUTS")
+            return "1|2|3|4"
+        if self.proposals.fullmatch(sql):
+            return "1|7"  # the confirm's one proposal, id 7
+        name = next((name for name, pattern in self.statements if pattern.fullmatch(sql)), None)
+        assert name is not None, f"the stub has no statement {sql[:80]!r}"
+        self.seen.append(name)
+        tuple_id = 1 + self.confirmed
+        rows = {
+            "SEED_BOARDS": "4|4|1",
+            "ACTIVE": f"{tuple_id}|{3 if 'APPLY_STATE' in self.seen else 2}",
+            "TARGETS_CREATED": "succeeded|310|310|0",
+            "LANE_STATE": "0|0|4",
+            "ADVANCE_BUCKET": "1",
+            "PENDING_OF": "250",
+            "CYCLE_AFTER": "5|completed|28|28",
+            "INSTANCES_OF": "29|0",
+            "PUBLISHED_JOB": "41|141",
+            "PENDING_JOB": "42|142",
+            "TARGET_STATE": "published_accepted|score_now",
+            "APPLY_STATE": "succeeded|3|0",
+            "FILTERED_BY": "12",
+            "BULK_OF": f"{tuple_id}|active",
+            "BULK_TARGETS": "succeeded|298|298|0",
+            "OLD_BULK": self.old_bulk,
+            "BATCH_SUBMIT_OF": self.batch_submit,
+            "ELIGIBLE_OF": self.eligible,
+            "COUNTERS_CLEAN": "t|4.120000|3.910000",
+        }
+        return rows[name]
+
+
+class Stack:
+    """The api of a stubbed dev stack: every route the smoke uses, answered as the stack answers it, with the
+    CV, profile, query and ad texts and a key in its answers. `warning` is the scope dry-run's one warning."""
+
+    def __init__(self, database: Database, warning: str = "scope_narrowed") -> None:
+        self.database = database
+        self.warning = warning
+        self.drafts = {11: "uploaded", 12: "uploaded"}
+        self.uploads = 0
+        self.seen: list[tuple[str, str]] = []
+        self.saved_draft: Any = None
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        route = (request.method, request.url.path)
+        self.seen.append(route)
+        if route == ("POST", "/api/auth/login"):
+            return httpx.Response(204, headers={"set-cookie": f"{COOKIE}; Path=/; Secure; HttpOnly"})
+        assert request.headers["cookie"] == COOKIE, route
+        if request.method in ("POST", "PUT"):
+            assert (request.headers["origin"], request.headers["x-jh-request"]) == (
+                "http://localhost:8080",
+                "1",
+            ), route
+        return self.answer(request, route)
+
+    def draft(self, draft_id: int) -> httpx.Response:
+        status = self.drafts[draft_id]
+        report = {"email": 1, "phone": 0, "url": 0, "address": 0, "personal": 0, "name": 1}
+        body = {
+            "status": status,
+            "failure_code": None,
+            "strip_report": report,
+            "stripped_text_preview": SYNTHETIC_CV,
+            "draft": SYNTHETIC_PROFILE if status == "ready" else None,
+            "validation_issues": [{"path": "total_years_experience", "code": "years_mismatch"}],
+        }
+        return httpx.Response(200, json=body)
+
+    def answer(self, request: httpx.Request, route: tuple[str, str]) -> httpx.Response:
+        is_json = request.headers.get("content-type") == "application/json"
+        sent: Any = json.loads(request.content) if is_json else None
+        confirmed = self.database.confirmed
+        match route:
+            case ("GET", "/api/system/health"):
+                scoring = {"running_cycle_id": None, "pause_reason": None, "pending_targets": 0}
+                body = {
+                    "ready": {"ok": True},
+                    "embedder": {"ok": True},
+                    "quota": {},
+                    "last_run": {"id": 3, "status": "succeeded"},
+                    "scoring": scoring,
+                }
+                return httpx.Response(200, json=body)
+            case ("POST", "/api/profile/cv"):
+                assert b"%PDF-1.4" in request.content
+                self.uploads += 1
+                draft_id = 10 + self.uploads
+                self.drafts[draft_id] = "text_review"
+                return httpx.Response(202, json={"draft_id": draft_id})
+            case ("GET", path) if path.startswith("/api/profile/drafts/"):
+                return self.draft(int(path.rsplit("/", 1)[1]))
+            case ("POST", path) if path.endswith("/text-review"):
+                assert request.headers["idempotency-key"]
+                self.drafts[int(path.split("/")[-2])] = "ready"
+                return httpx.Response(202, json={"status": "extracting_profile"})
+            case ("PUT", "/api/profile/drafts/12"):
+                self.saved_draft = sent["draft"]
+                return httpx.Response(200, json={"validation_issues": []})
+            case ("POST", path) if path.endswith("/confirm"):
+                assert sent == {"expected_rescore_ack": True} and request.headers["idempotency-key"]
+                self.database.confirmed += 1
+                body = {"profile_version_id": 5 + confirmed, "targets_to_create": 310 * confirmed}
+                return httpx.Response(201, json={**body, "est_usd": "0.000000", "bulk_budget_usd": "37.24"})
+            case ("GET", "/api/profile"):
+                active = {"id": 4 + confirmed, "version_no": confirmed, "profile": SYNTHETIC_PROFILE}
+                return httpx.Response(200, json={"active": active, "versions": [active]})
+            case ("GET", "/api/profile/query-proposals/7"):
+                return httpx.Response(200, json={"status": "ready", "items": SYNTHETIC_QUERIES["queries"]})
+            case ("POST", "/api/runs"):
+                assert sent == {"include_paid": True} and request.headers["idempotency-key"]
+                return httpx.Response(202, json={"run": {"id": 3}, "created": True})
+            case ("POST", "/api/system/score-cycle"):
+                assert request.headers["idempotency-key"]
+                assert self.database.seen[-2:] == ["ADVANCE_BUCKET", "PENDING_OF"]  # the refill just before
+                return httpx.Response(202, json={"queued": True, "reason": None})
+            case ("GET", "/api/system/spend"):
+                group = {"model": "claude-sonnet-5-5", "effort": "medium", "role": "generate", "calls": 28}
+                body = {"counted": "1.400000", "c_hat": "0.052646", "c_hat_source": "central"}
+                return httpx.Response(
+                    200,
+                    json={
+                        **body,
+                        "critic_rate_7d": None,
+                        "by_model_effort_role": [{**group, "counted": "1.2"}],
+                    },
+                )
+            case ("POST", "/api/jobs/42/score-now"):
+                assert sent == {} and request.headers["idempotency-key"]
+                return httpx.Response(202, json={"target_id": 142, "state": "pending"})
+            case ("POST", "/api/jobs/41/feedback"):
+                assert sent == {"kind": "label", "label": "good"}
+                return httpx.Response(201, json={"feedback_id": 1, "golden_case_id": 9})
+            case ("GET", "/api/golden-cases"):
+                case = {"id": 9, "job_id": 41, "label": "good", "comment": AD_TEXT, "source": "week1"}
+                return httpx.Response(200, json={"items": [{**case, "active": True}], "next_cursor": None})
+            case ("GET", "/api/settings"):
+                payload = {"scope": {"locations": [], "excluded_keywords": [AD_TEXT]}, "anthropic": KEY}
+                return httpx.Response(200, json={"version": {"id": 1}, "payload": payload})
+            case ("POST", "/api/settings/dry-run"):
+                (location,) = sent["payload"]["scope"]["locations"]
+                assert location["radius_km"] == 200 and location["gazetteer_id"] == "geonames:2950159"
+                return httpx.Response(200, json={"errors": [], "warnings": [{"code": self.warning}]})
+            case ("POST", "/api/settings"):
+                assert (sent["base_version_id"], sent["acknowledged_warnings"]) == (1, [self.warning])
+                assert request.headers["idempotency-key"]
+                saved = {"id": 2, "version_no": 2, "effect_classes": ["scope"]}
+                return httpx.Response(201, json={"version": saved, "apply_scope_operation_id": 77})
+        raise AssertionError(f"the stub stack has no route {route}")
+
+
+def run_against(
+    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, stack: Stack, *, exit_code: int = 0
+) -> list[list[str]]:
+    """`main()` on `stack`, every docker call answered as the fresh stack answers it, ending `exit_code`; the
+    docker calls."""
+
+    def docker(args: list[str]) -> Answer:
+        if "printenv" in args:
+            return 0, "1\n", ""
+        if "psql" in args:
+            return 0, stack.database.answer(args[-1]) + "\n", ""
+        if args[-3:] == ["jobhunter", "golden", "seed-adversarial"]:
+            return 0, "golden seed-adversarial: cases=10 jobs=10 profiles=10\n", f"key={KEY} {AD_TEXT}\n"
+        assert "run" in args, args  # the user's creation: the one other docker call
+        return 0, "", ""
+
+    calls = stub_subprocess(smoke, monkeypatch, docker)
+    monkeypatch.setattr(smoke, "AWAY_FROM_THE_TICK", range(60))
+    real_client = httpx.Client
+
+    def client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(stack), **kwargs)
+
+    monkeypatch.setattr(smoke, "httpx", SimpleNamespace(Client=client, HTTPError=httpx.HTTPError))
+    assert smoke.main() == exit_code
+    return calls
+
+
+def test_a_whole_run_prints_fifteen_ok_lines_and_never_a_secret_or_a_text(smoke, monkeypatch, capsys) -> None:
+    stack = Stack(Database(smoke))
+    calls = run_against(smoke, monkeypatch, stack)
+    out = capsys.readouterr().out
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert [(line["check"], line["ok"]) for line in lines] == [(name, True) for name in CHECK_NAMES]
+    assert TOKEN not in out and sys.modules["smoke_m0"].PASSWORD not in out
+    assert [text for text in CONTENT if text in out] == []
+    assert all(compose_files(args) == OVERLAYS for args in calls if "psql" not in args)
+    # the bucket advanced before the manual cycle's request (the stub checks it there), nowhere else
+    assert stack.database.seen.count("ADVANCE_BUCKET") == 1
+    assert stack.database.seen.index("SEED_INPUTS") < stack.database.seen.index("SEED_BOARDS")
+    # the second draft is the first one with one more target title, so the confirm activates a new tuple
+    titles = SYNTHETIC_PROFILE["target_titles"]
+    assert stack.saved_draft["target_titles"] == [*titles, smoke.ADDED_TITLE]
+    assert ("POST", "/api/runs") in stack.seen and stack.uploads == 2
+    batch = lines[CHECK_NAMES.index("batch_path")]["detail"]
+    assert "skipped=below_minimum submissions=0: eligible=117" in batch
+    assert "expired_unscored_too_old=125" in batch
+
+
+@pytest.mark.parametrize(
+    ("old_bulk", "ok"),
+    [
+        ("cancelled|0", True),
+        ("cancelled|3", True),
+        ("completed|0", True),
+        ("completed|3", False),
+        ("active|0", False),
+    ],
+    ids=[
+        "cancelled-without-targets",
+        "cancelled-with-targets",
+        "completed-without-targets",
+        "completed-with-targets",
+        "still-active",
+    ],
+)
+def test_the_first_bulk_operation_has_ended_by_the_second_confirm(
+    smoke, monkeypatch, capsys, old_bulk: str, ok: bool
+) -> None:
+    """The activation cancels the old tuple's active operation. One that no target carries has no work, so a
+    heavy pass may have completed it first; one that targets carry must be `cancelled` (Task 28 fix round 1,
+    item 5: the reason, not the order of two transaction-start stamps). Any other state fails the check."""
+    run_against(smoke, monkeypatch, Stack(Database(smoke, old_bulk=old_bulk)), exit_code=0 if ok else 1)
+    last = json.loads(capsys.readouterr().out.splitlines()[-1 if not ok else -2])
+    assert (last["check"], last["ok"]) == ("batch_path", ok)
+    if ok:
+        assert f"bulk 2 {old_bulk.split('|')[0]} -> 3 active" in last["detail"]
+
+
+@pytest.mark.parametrize(
+    ("batch_submit", "eligible"),
+    [
+        ("succeeded|none|1", "0|125"),  # a submission: the stack's fixtures cannot give one (T28-e)
+        ("failed|none|0", "117|125"),
+        ("succeeded|below_minimum|0", "200|0"),  # skipped although enough targets were eligible
+    ],
+    ids=["submitted", "failed", "skipped-with-enough"],
+)
+def test_the_batch_path_holds_only_a_skip_below_the_minimum(
+    smoke, monkeypatch, capsys, batch_submit: str, eligible: str
+) -> None:
+    database = Database(smoke, batch_submit=batch_submit, eligible=eligible)
+    run_against(smoke, monkeypatch, Stack(database), exit_code=1)
+    last = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert (last["check"], last["ok"]) == ("batch_path", False)
+    assert last["detail"].startswith("expected the batch_submit skipped below_minimum")
+
+
+def test_a_detail_never_shows_the_session_token(smoke, monkeypatch, capsys) -> None:
+    """A value the stack answers that a detail quotes (here a warning code) is scrubbed of the token."""
+    run_against(smoke, monkeypatch, Stack(Database(smoke), warning=TOKEN))
+    out = capsys.readouterr().out
+    assert TOKEN not in out and "[redacted]" in out
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_loading_the_smoke_leaves_sys_modules_as_it_was(cached: bool) -> None:
+    names = ("smoke_m0", "smoke_m1", "smoke_m2")
+    before = {name: ModuleType(name) if cached else None for name in names}
+    with pytest.MonkeyPatch.context() as outer:
+        for name, module in before.items():
+            if module is None:
+                outer.delitem(sys.modules, name, raising=False)
+            else:
+                outer.setitem(sys.modules, name, module)
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            smoke = import_smoke(monkeypatch)
+            assert smoke.smoke_m2 is sys.modules["smoke_m2"]
+            assert smoke.Context is sys.modules["smoke_m0"].Context
+        assert {name: sys.modules.get(name) for name in names} == before

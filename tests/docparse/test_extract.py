@@ -28,8 +28,12 @@ from tests.support.profile import (
     paragraph_xml,
     replacement_char_pdf,
 )
+from tests.support.profile import docparse_group as docparse_group  # the guard fixture
 
-pytestmark = pytest.mark.docparse
+# Every job here runs in a spawned child, which imports `docparse.extract` and its parsers from the
+# environment: `docparse_group` names a mid-run `uv sync` as the cause of their failures (Task 28 fix
+# round 1).
+pytestmark = [pytest.mark.docparse, pytest.mark.usefixtures("docparse_group")]
 
 CV_LINES = [
     "Max Mustermann",

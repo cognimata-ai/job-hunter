@@ -7,9 +7,11 @@ The fake replays V4's live answers (`docs/spikes/V4.md`; controller rulings R7-1
 - `schema_dry_run/claude-opus-5-5/<schema12>`: the recorded streams of the critic, profile and queries cases;
 - `count_tokens/claude-sonnet-5-5/<probe schema12>.json`: the counting endpoint's 400 for the informational
   `minimum` probe, which is never a paid message.
-The real gateway runs above the fake, so each case reserves, dispatches and settles as a live run does. On
-these answers the default run is the correct M2 state of prompt-schema version 1: `completed`, not passed,
-with the generator case rejected.
+The real gateway runs above the fake, so each case reserves, dispatches and settles as a live run does. The
+answers are of prompt-schema version 1, so the runs here name version 1's row, which the seed keeps next to
+the active version 2 (M3 Task 4). On these answers the run is the correct M2 state of version 1: `completed`,
+not passed, with the generator case rejected. Version 2's run replays synthetic C-shaped and critic-shaped
+streams (`tests/support/llm.py`) until M3 Task 26 records live ones.
 """
 
 import asyncio
@@ -34,13 +36,27 @@ from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import fake, schema_dry_run
 from jobhunter.llm.cache_monitor import CacheMonitor
 from jobhunter.llm.gateway import LLMGateway
-from jobhunter.llm.schema_dry_run import DryRunCase
-from jobhunter.llm.schemas import SCHEMAS, transformed
+from jobhunter.llm.prompts.render import (
+    load_prompt_version,
+    prompt_schema_hash,
+    prompt_schema_v1,
+    prompt_schema_v2,
+)
+from jobhunter.llm.schema_dry_run import PROBE_ONLY_SCHEMA, DryRunCase
+from jobhunter.llm.schemas import SCHEMAS_V1, SCHEMAS_V2, transformed
 from jobhunter.llm.schemas.generator import GeneratorOut
 from jobhunter.types import JSONValue, get_object
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.support.llm import FAKE_LLM_DIR, FakeAnthropic, fake_llm_config, synthetic_sse
+from tests.support.llm import (
+    FAKE_LLM_DIR,
+    FakeAnthropic,
+    fake_llm_config,
+    synthetic_generator_sse,
+    synthetic_sse,
+    v1_version,
+    v2_version,
+)
 from tests.support.pg import PgServer
 
 SONNET: Final = "claude-sonnet-5-5"
@@ -55,10 +71,13 @@ MINIMUM_NOT_SUPPORTED: Final = (
     "output_config.format.schema: For 'integer' type, property 'minimum' is not supported"
 )
 GATING: Final = ("generator", "critic", "profile", "queries")
+V1: Final = v1_version()
+V1_GENERATOR: Final = transformed(SCHEMAS_V1["generator"])
 
 _ACTIVE = sa.text(
     "SELECT prompt_schema_version_id, model_policy_id, execution_config_id FROM active_config WHERE id = 1"
 )
+_VERSION_ID = sa.text("SELECT id FROM prompt_schema_versions WHERE prompt_schema_hash = :hash")
 _EVAL_RUN = sa.text(
     "SELECT kind, route, status, passed, metrics, cost_usd, prompt_schema_version_id, model_policy_id, "
     "execution_config_id, finished_at FROM eval_runs WHERE id = :id"
@@ -76,7 +95,8 @@ async def no_sleep(_seconds: float) -> None:
 
 @dataclasses.dataclass
 class DryRun:
-    """Runs the dry-run of the active configuration on a gateway over `fake_llm`."""
+    """Runs the dry-run of `ids` (a prompt-schema version and the active policy and execution config) on a
+    gateway over `fake_llm`."""
 
     engine: AsyncEngine
     fake_llm: FakeAnthropic
@@ -103,11 +123,17 @@ class DryRun:
             )
 
 
-async def active_ids(engine: AsyncEngine) -> dict[str, int]:
+async def active_ids(engine: AsyncEngine, *, version: int = 1) -> dict[str, int]:
+    """The active model policy and execution config, and the seeded prompt-schema version `version` (1 or
+    2)."""
+    content = prompt_schema_v1() if version == 1 else prompt_schema_v2()
     async with engine.connect() as conn:
         row = (await conn.execute(_ACTIVE)).one()
+        version_id = (await conn.execute(_VERSION_ID, {"hash": prompt_schema_hash(*content)})).scalar_one()
+    if version == 2:
+        assert int(row.prompt_schema_version_id) == int(version_id)  # a fresh install runs on version 2
     return {
-        "prompt_schema_version_id": int(row.prompt_schema_version_id),
+        "prompt_schema_version_id": int(version_id),
         "model_policy_id": int(row.model_policy_id),
         "execution_config_id": int(row.execution_config_id),
     }
@@ -115,6 +141,7 @@ async def active_ids(engine: AsyncEngine) -> dict[str, int]:
 
 @pytest.fixture
 async def dry_run(engine: AsyncEngine, fake_anthropic: FakeAnthropic) -> AsyncIterator[DryRun]:
+    """The dry-run of prompt-schema version 1, whose answers V4 recorded."""
     yield DryRun(engine, fake_anthropic, await active_ids(engine))
 
 
@@ -189,13 +216,13 @@ def test_each_distinct_model_of_a_schema_is_one_case() -> None:
 
 
 def test_the_probe_schema_is_the_generator_schema_with_one_added_minimum() -> None:
-    probe = schema_dry_run.probe_schema()
-    generator = transformed(SCHEMAS["generator"])
+    probe = schema_dry_run.probe_schema(V1_GENERATOR)
+    generator = V1_GENERATOR
     assert probe != generator
     assert probe["$defs"]["nullable_int"]["anyOf"][0] == {"type": "integer", "minimum": 0}
     probe["$defs"]["nullable_int"]["anyOf"][0].pop("minimum")
     assert probe == generator  # nothing else differs
-    assert schema_dry_run.probe_schema() != probe  # each call gives its own copy
+    assert schema_dry_run.probe_schema(V1_GENERATOR) != probe  # each call gives its own copy
 
 
 # ---- the default run on V4's answers ----------------------------------------------------------------------
@@ -260,6 +287,13 @@ async def test_the_default_run_completes_unpassed_with_the_generator_rejected(
         ("profile", OPUS, "passed"),
         ("queries", OPUS, "passed"),
     ]
+    # each case's name and verdict: the (schema, model, passed) triples schema verification reads
+    assert [(c["name"], c["passed"]) for c in cases] == [
+        (f"generator/{SONNET}", False),
+        (f"critic/{OPUS}", True),
+        (f"profile/{OPUS}", True),
+        (f"queries/{OPUS}", True),
+    ]
     passing = {"http_200": True, "end_turn": True, "structural": True, "schema_bytes_equal": True}
     for case in cases[1:]:
         assert case["checks"] == {**passing, "enums_allowed": True}
@@ -301,7 +335,7 @@ async def test_the_probe_is_answered_by_the_counting_endpoint_and_never_gates(
     }
     assert len(await calls(engine)) == 4  # nothing reserved for the probe
     # the committed count answer is the API's own text
-    answer_path = fake.count_recording_path(FAKE_LLM_DIR, SONNET, schema_dry_run.probe_schema())
+    answer_path = fake.count_recording_path(FAKE_LLM_DIR, SONNET, schema_dry_run.probe_schema(V1_GENERATOR))
     answer = json.loads(answer_path.read_text("utf-8"))
     assert answer == {
         "status": 400,
@@ -333,7 +367,7 @@ async def test_every_message_call_sends_max_tokens_2000_effort_low_and_its_store
         assert served.body["output_config"]["effort"] == "low"
         assert served.body["stream"] is True
     assert [r.body["output_config"]["format"]["schema"] for r in requests] == [
-        transformed(SCHEMAS[name]) for name in GATING
+        transformed(SCHEMAS_V1[name]) for name in GATING
     ]
     for call in await calls(engine):
         assert (call.max_tokens, call.effort) == (2000, "low")
@@ -392,7 +426,7 @@ async def test_a_run_whose_gating_cases_all_pass_completes_passed_whatever_the_p
     # A generator answer that the API would give for a compilable schema (synthetic, in a copy): every gating
     # case passes, and the probe's rejection does not change that.
     root = copied_recordings(tmp_path)
-    generator = fake.recording_path(root, "schema_dry_run", SONNET, transformed(SCHEMAS["generator"]))
+    generator = fake.recording_path(root, "schema_dry_run", SONNET, V1_GENERATOR)
     generator.write_bytes(synthetic_sse(_generator_body(), model=SONNET))
     generator.with_suffix(".headers.json").unlink()
     report = await DryRun(
@@ -432,15 +466,19 @@ def _one_byte_off(schema: dict[str, Any]) -> dict[str, Any]:
 async def test_a_sent_schema_one_byte_off_fails_its_case(
     engine: AsyncEngine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    critic = transformed(SCHEMAS["critic"])
+    critic = transformed(SCHEMAS_V1["critic"])
     changed = _one_byte_off(critic)
     assert len(canonical(changed)) == len(canonical(critic))
     assert sum(a != b for a, b in zip(canonical(changed), canonical(critic), strict=True)) == 1
-    # The SDK sends `transform_schema(model)`: from here on it sends the critic schema one byte off. The fake
-    # answers it with the recorded critic stream, so only the sent schema differs.
+    # The gateway binds `transform_schema(stored schema)`: from here on it sends the critic schema one byte
+    # off. The fake answers it with the recorded critic stream, so only the sent schema differs.
     root = copied_recordings(tmp_path)
     recorded = fake.recording_path(root, "schema_dry_run", OPUS, critic)
     shutil.copy(recorded, fake.recording_path(root, "schema_dry_run", OPUS, changed))
+    ids = await active_ids(engine)  # before the patch: version 1's hash is computed with the real transform
+    # and the version loaded, which checks its stored schemas against the real transform too
+    async with engine.connect() as conn:
+        await load_prompt_version(conn, ids["prompt_schema_version_id"])
     original: Callable[..., dict[str, Any]] = anthropic.transform_schema
 
     def transform(schema: Any) -> dict[str, Any]:
@@ -449,7 +487,7 @@ async def test_a_sent_schema_one_byte_off_fails_its_case(
 
     monkeypatch.setattr(anthropic, "transform_schema", transform)
     fake_llm = FakeAnthropic(fake_llm_config(root, tmp_path / "no-secrets"))
-    report = await DryRun(engine, fake_llm, await active_ids(engine))()
+    report = await DryRun(engine, fake_llm, ids)()
     results = {r.case.schema_name: r for r in report.results if not r.case.probe}
     assert results["critic"].outcome == "schema_mismatch"
     assert results["critic"].checks["schema_bytes_equal"] is False
@@ -459,9 +497,12 @@ async def test_a_sent_schema_one_byte_off_fails_its_case(
     assert (await eval_run(engine, report.eval_run_id)).metrics["cases_passed"] == 2
 
 
-async def test_a_prompt_schema_version_one_byte_off_fails_its_case(
-    dry_run: DryRun, engine: AsyncEngine
+async def test_a_prompt_schema_version_is_dry_run_with_the_schema_it_stores(
+    dry_run: DryRun, engine: AsyncEngine, tmp_path: Path
 ) -> None:
+    """The pinned version is what renders (M3 Task 4): a version whose stored critic schema is one byte off
+    is sent with exactly those bytes, so the bytes check holds, and the recorded answer (`injection: none`)
+    is a value the stored enum (`nonE`) does not allow."""
     async with engine.begin() as conn:
         templates, schemas = (
             await conn.execute(
@@ -474,18 +515,27 @@ async def test_a_prompt_schema_version_one_byte_off_fails_its_case(
             await conn.execute(
                 sa.text(
                     "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
-                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS jsonb)) RETURNING id"
+                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS json)) RETURNING id"
                 ),
                 {"hash": b"\x07" * 32, "t": json.dumps(templates), "s": json.dumps(schemas)},
             )
         ).scalar_one()
-    report = await dry_run(prompt_schema_version_id=int(version))
+    root = copied_recordings(tmp_path)
+    recorded = fake.recording_path(root, "schema_dry_run", OPUS, transformed(SCHEMAS_V1["critic"]))
+    shutil.copy(recorded, fake.recording_path(root, "schema_dry_run", OPUS, schemas["critic"]))
+    fake_llm = FakeAnthropic(fake_llm_config(root, tmp_path / "no-secrets"))
+    report = await DryRun(engine, fake_llm, dry_run.ids)(prompt_schema_version_id=int(version))
     assert outcomes(report) == {
         "generator": "http_400",
-        "critic": "schema_mismatch",
+        "critic": "enum_violation",
         "profile": "passed",
         "queries": "passed",
     }
+    critic = next(r for r in report.results if r.case.schema_name == "critic")
+    assert critic.checks["schema_bytes_equal"] is True and critic.checks["structural"] is True
+    assert critic.violations == ("$.injection",)
+    sent = [r.body["output_config"]["format"]["schema"] for r in fake.state().requests]
+    assert sent[1] == schemas["critic"] != transformed(SCHEMAS_V1["critic"])
     assert report.passed is False
 
 
@@ -573,7 +623,7 @@ async def test_a_schema_the_version_lacks_fails_its_case_without_a_call(
             await conn.execute(
                 sa.text(
                     "INSERT INTO prompt_schema_versions (prompt_schema_hash, templates, schemas) "
-                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS jsonb)) RETURNING id"
+                    "VALUES (:hash, CAST(:t AS jsonb), CAST(:s AS json)) RETURNING id"
                 ),
                 {"hash": b"\x08" * 32, "t": json.dumps(templates), "s": json.dumps(schemas)},
             )
@@ -603,6 +653,96 @@ async def test_a_run_whose_sent_requests_are_not_seen_fails_its_cases(
     assert report.passed is False
 
 
+# ---- prompt-schema version 2 -------------------------------------------------------------------------------
+
+
+def v2_recordings(tmp_path: Path) -> Path:
+    """The committed answers of the critic, profile and queries cases (version 2 keeps those schemas), a
+    synthetic C-shaped generator answer for version 2's generator schema on Sonnet, and the counting
+    endpoint's answer for the probe-only schema (the V4 refusal text, synthetic here), until M3 Task 26
+    records the live ones."""
+    root = copied_recordings(tmp_path)
+    c = transformed(SCHEMAS_V2["generator"])
+    fake.recording_path(root, "schema_dry_run", SONNET, c).write_bytes(synthetic_generator_sse(model=SONNET))
+    count = fake.count_recording_path(root, SONNET, PROBE_ONLY_SCHEMA)
+    count.write_text(
+        json.dumps(
+            {
+                "status": 400,
+                "body": {
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": MINIMUM_NOT_SUPPORTED},
+                },
+            }
+        ),
+        "utf-8",
+    )
+    return root
+
+
+async def test_version_2_sends_candidate_c_and_passes_on_the_synthetic_streams(
+    engine: AsyncEngine, tmp_path: Path
+) -> None:
+    ids = await active_ids(engine, version=2)
+    fake_llm = FakeAnthropic(fake_llm_config(v2_recordings(tmp_path), tmp_path / "no-secrets"))
+    report = await DryRun(engine, fake_llm, ids)()
+    assert outcomes(report) == dict.fromkeys(GATING, "passed")
+    assert (report.status, report.passed) == ("completed", True)
+    # every case sent version 2's stored schema: the generator's is candidate C
+    requests = fake.state().requests
+    assert [r.body["output_config"]["format"]["schema"] for r in requests] == [
+        transformed(SCHEMAS_V2[name]) for name in GATING
+    ]
+    assert requests[0].body["output_config"]["format"]["schema"] == v2_version().schemas["generator"]
+    # the probe went to the counting endpoint with the probe-only schema, the keyword on the wire
+    assert report.probe is not None
+    assert (report.probe.outcome, report.probe.keyword_sent) == ("rejected", True)
+    row = await eval_run(engine, report.eval_run_id)
+    assert row.prompt_schema_version_id == ids["prompt_schema_version_id"]
+    assert [(c["name"], c["schema"], c["model"], c["passed"]) for c in row.metrics["cases"]] == [
+        (f"generator/{SONNET}", "generator", SONNET, True),
+        (f"critic/{OPUS}", "critic", OPUS, True),
+        (f"profile/{OPUS}", "profile", OPUS, True),
+        (f"queries/{OPUS}", "queries", OPUS, True),
+    ]
+    assert row.metrics["transport"] == "fake"
+
+
+async def test_a_reviser_on_another_model_is_dry_run_on_it_too(engine: AsyncEngine, tmp_path: Path) -> None:
+    """The generator schema serves `generate` and `revise`: with the reviser on Haiku, version 2's generator
+    case runs on both models, and each is its own `(schema, model, passed)` entry."""
+    root = v2_recordings(tmp_path)
+    c = transformed(SCHEMAS_V2["generator"])
+    fake.recording_path(root, "schema_dry_run", HAIKU, c).parent.mkdir(parents=True, exist_ok=True)
+    fake.recording_path(root, "schema_dry_run", HAIKU, c).write_bytes(synthetic_generator_sse(model=HAIKU))
+    ids = await active_ids(engine, version=2)
+    async with engine.begin() as conn:
+        payload = (
+            await conn.execute(
+                sa.text("SELECT payload FROM model_policies WHERE id = :id"), {"id": ids["model_policy_id"]}
+            )
+        ).scalar_one()
+        payload["nodes"]["revise"] = {**payload["nodes"]["revise"], "model": HAIKU}
+        policy_id = (
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO model_policies (policy_hash, payload) VALUES (:hash, CAST(:p AS jsonb)) "
+                    "RETURNING id"
+                ),
+                {"hash": b"\x09" * 32, "p": json.dumps(payload)},
+            )
+        ).scalar_one()
+    fake_llm = FakeAnthropic(fake_llm_config(root, tmp_path / "no-secrets"))
+    report = await DryRun(engine, fake_llm, ids)(model_policy_id=int(policy_id))
+    assert [(r.case.schema_name, r.case.model, r.passed) for r in report.results if not r.case.probe] == [
+        ("generator", SONNET, True),
+        ("generator", HAIKU, True),
+        ("critic", OPUS, True),
+        ("profile", OPUS, True),
+        ("queries", OPUS, True),
+    ]
+
+
 # ---- the CLI ----------------------------------------------------------------------------------------------
 
 
@@ -622,7 +762,8 @@ async def test_the_cli_runs_on_the_fake_prints_only_the_case_table_and_fails_on_
     migrated: PgServer, proc_env: Callable[..., dict[str, str]], engine: AsyncEngine
 ) -> None:
     env = proc_env("worker", migrated, JOBHUNTER_FAKE_LLM_DIR=str(FAKE_LLM_DIR))
-    done = await asyncio.to_thread(_cli, env)
+    version_1 = (await active_ids(engine))["prompt_schema_version_id"]
+    done = await asyncio.to_thread(_cli, env, "--version", str(version_1))
     assert done.returncode == 1, done.stderr  # a gating case failed
     lines = done.stdout.splitlines()
     assert lines[0].split() == ["schema", "model", "result"]
@@ -646,10 +787,33 @@ async def test_the_cli_runs_on_the_fake_prints_only_the_case_table_and_fails_on_
     ):
         assert text not in done.stdout + done.stderr
     async with engine.connect() as conn:
-        assert (await conn.execute(sa.text("SELECT status, passed FROM eval_runs"))).one() == (
-            "completed",
-            False,
-        )
+        assert (
+            await conn.execute(sa.text("SELECT status, passed, prompt_schema_version_id FROM eval_runs"))
+        ).one() == ("completed", False, version_1)
+
+
+async def test_the_cli_dry_runs_the_active_version_unless_told_another(
+    migrated: PgServer, proc_env: Callable[..., dict[str, str]], engine: AsyncEngine, tmp_path: Path
+) -> None:
+    """Without `--version` the CLI dry-runs the active prompt-schema version (2 on a fresh install); with it,
+    the named one, active or not, so an upgraded install can gate version 2 before activating it."""
+    root = v2_recordings(tmp_path)
+    env = proc_env("worker", migrated, JOBHUNTER_FAKE_LLM_DIR=str(root))
+    done = await asyncio.to_thread(_cli, env)
+    assert done.returncode == 0, done.stderr
+    assert [line.split()[:3] for line in done.stdout.splitlines()[1:5]] == [
+        ["generator", SONNET, "passed"],
+        ["critic", OPUS, "passed"],
+        ["profile", OPUS, "passed"],
+        ["queries", OPUS, "passed"],
+    ]
+    missing = await asyncio.to_thread(_cli, env, "--version", "987654321")
+    assert missing.returncode == 1 and "ValueError" in missing.stderr
+    async with engine.connect() as conn:
+        rows = (await conn.execute(sa.text("SELECT prompt_schema_version_id, passed FROM eval_runs"))).all()
+    assert [tuple(r) for r in rows] == [
+        ((await active_ids(engine, version=2))["prompt_schema_version_id"], True)
+    ]
 
 
 async def test_live_needs_the_anthropic_key_and_sends_nothing_without_it(

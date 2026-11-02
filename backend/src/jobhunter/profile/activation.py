@@ -1,12 +1,12 @@
 """Profile confirm and activation (spec §12.6 step 2, §9.1; plan Task 21, Deviations 2, 10, 14, 19, 36 and
-40, rulings R21-1 to R21-5).
+40, rulings R21-1 to R21-5; M3 Task 14, Deviation 38, Codex r1 #24).
 
 `confirm_draft(conn, draft_id, *, expected_rescore_ack, now, defer)` confirms a `ready` draft and activates
 its profile in the caller's **one transaction**, and returns the response `(status, body)`. The route takes
 `active_config` `FOR UPDATE` first and runs it inside `run_idempotent` (`api.routes.profile`). In order:
 
 1. `active_config` `FOR UPDATE` (a no-op under the route's lock), then the draft `FOR UPDATE`; no such draft
-   is 404 `not_found`.
+   is 404 `not_found`, and so is a draft the adversarial seed confirmed for a synthetic profile (Carry T19-d).
 2. A draft already `confirmed` returns `(201, confirm_response)`: the body its confirm stored, whatever key
    the request carries and whichever profile is active now (Deviation 2). Nothing is written, and the ranking
    generation stays (R21-4).
@@ -28,14 +28,22 @@ its profile in the caller's **one transaction**, and returns the response `(stat
    locks the row `FOR UPDATE` before it deletes anything (§20.2), then waits for this commit, and one that got
    there first has made `purged_at IS NULL` false, so the read finds nothing and a new version is made. Under
    an active fence of kind `profile` on that version, 409 `profile_purge_in_progress`; the confirm can be
-   repeated when the purge has finished. Otherwise a new row: `version_no = max + 1` (the `active_config` lock
-   serialises the writers), the draft, its CV file, the profile, its hash and `confirmed_at = now`. A purged
-   version is never reused or revived: identical content gets a new id, which §7.4's partial unique index
-   allows. Then the fault point `confirm.after_version`.
+   repeated when the purge has finished. Otherwise a new row: `version_no = max + 1` over the user's versions
+   (a synthetic one of the adversarial seed is never reused nor counted, Ruling T19-c; the `active_config`
+   lock serialises the writers), the draft, its CV file, the profile, its hash and `confirmed_at = now`. A
+   purged version is never reused or revived: identical content gets a new id, which §7.4's partial unique
+   index allows. Then the fault point `confirm.after_version`.
 7. (b) The tuple: `save.ensure_tuple` with the version and the active model policy (it reads the active rubric
    and prompt-schema versions itself).
 8. (c) `active_config.profile_version_id` and `llm_tuple_id` set, then the fault point `confirm.after_flip`.
-   (d) to (f) are M3's (Deviation 10).
+   Then, for a tuple other than the one active before (M3 Task 14), (d) to (f) and (h)'s
+   `create_targets_for_tuple` in the schedule's order (`scoring.targets.activate_tuple`, Deviation 38): the
+   month row, the old tuple's bulk operation cancelled and the new tuple's opened (its budget the preview's
+   `bulk_budget_usd` figure), the old tuple's unpublished targets cancelled (`in_progress` ones with their
+   attempts), the cancellation recorded on every in-flight submission of the old tuple with its `in_batch`
+   targets cancelled, the fault point `activation.after_cancel`, and the `create_targets_for_tuple` operation
+   of the new bulk operation. An unchanged tuple (the same profile and policy, L4786) activates nothing: every
+   target of it exists.
 9. (g) The scope: `derive.derived(active settings, profile=new)` gives the desired scope (`ensure_derived`):
    with `seniority_range.mode = explicit` it is the settings' own scope, with `profile_relative` the explicit
    range around the profile's level (Deviation 14). `scope_apply.set_desired_scope` reconciles the pending
@@ -46,24 +54,31 @@ its profile in the caller's **one transaction**, and returns the response `(stat
 10. (h) `vectors.request_embedding` (its dedup key reuses a live operation, and its handler does nothing for
     complete vectors), then `proposals.request_proposal`, unless the version already has a `ready` proposal
     (R21-5: an identical re-confirm pays for no new call; `request_proposal` itself reuses a running one). The
-    operations and their jobs (`defer`) commit or roll back with the activation (C24).
-    `create_targets_for_tuple` is M3's.
+    operations and their jobs (`defer`) commit or roll back with the activation (C24), step 8's
+    `create_targets_for_tuple` with them.
 11. (i) The draft `ready → confirmed`, with `confirmed_profile_version_id` and `confirm_response := body`.
 12. `scope_apply.resolve_apply_failed` when step 9 asked for it, then `ranking.bump` **last** (R21-1:
     `ranking_state` is the last lock of §9.1), on every confirm that reaches (i) (R21-4). Then the fault
     point `confirm.before_commit`.
 
 The body (`ConfirmOutcome`, §14.2's 201) holds ids and decimal strings only: the version, `targets_to_create`
-(the estimate's count, the one the user acknowledged and M3's `create_targets_for_tuple` creates; R21-3),
+(the estimate's count, the one the user acknowledged and `create_targets_for_tuple` creates; R21-3, M2
+Deviation 42),
 `est_usd` (`est_usd_online`, the quantity §6.8 calls `est_usd`; R21-2) and `bulk_budget_usd`.
 
-**Lock order** (§9.1: `active_config` → owner row → `llm_budget` → … → other domain rows →
-`ranking_state`): `active_config` first; no owner row is locked and the month row is only read; then the
-other domain rows: the draft, a reused version (`FOR KEY SHARE`, then `FOR NO KEY UPDATE` in
-`request_proposal`, which a key share never blocks), and the rows this transaction inserts (version, tuple,
-derived scope, operations, proposal), then the alerts and `ranking_state`. The embedding is requested before
-the proposal: a running `embed_profile` write holds the version `FOR SHARE`, which a key share lets through
-and `FOR NO KEY UPDATE` waits for. A live operation of a dedup key is reused, never locked.
+**Lock order** (§9.1: `active_config` → owner row → `llm_budget` → … → other domain rows → `ranking_state`).
+What actually happens, in order: `active_config FOR UPDATE` first; no owner row is locked; then the draft
+(step 1, an other domain row), a reused version (`FOR KEY SHARE`) and the version and tuple rows this
+transaction inserts; then the activation of step 8: the month row (the estimate only read it), the bulk rows,
+the old tuple's targets, attempts, items and submissions; then the derived scope, the operations and the
+proposal (a reused version's `FOR NO KEY UPDATE` in `request_proposal`, which a key share never blocks), the
+alerts and `ranking_state` last. So the draft and the version precede the month row, against the schedule's
+order. That is safe because `active_config FOR UPDATE` serialises the confirm with every score-lane
+transaction (each takes `active_config` first, step 2), the only transactions that take a month row together
+with bulk or target rows; and no month-row writer ever waits for a draft or a profile version. The embedding
+is requested before the proposal: a running `embed_profile` write holds the version `FOR SHARE`, which a key
+share lets through and `FOR NO KEY UPDATE` waits for. A live operation of a dedup key is reused, never locked
+(a superseded `create_targets_for_tuple` excepted, which the activation cancels).
 
 The module does not log: the route logs the ids that `activated` collects, after its commit. `afault_point`
 is a name of this module, so a test replaces it.
@@ -90,6 +105,7 @@ from jobhunter.profile import estimate, vectors
 from jobhunter.profile.contacts import scan_value
 from jobhunter.profile.validate import validate_profile, validate_user_entered
 from jobhunter.queries import proposals
+from jobhunter.scoring import targets
 from jobhunter.settings import save, scope_apply
 from jobhunter.settings.derive import derived, ensure_derived
 from jobhunter.settings.dryrun import active_settings
@@ -108,13 +124,19 @@ BEFORE_COMMIT_POINT: Final = "confirm.before_commit"
 _DRAFTS: Final = "profile_drafts"
 _CREATED: Final = 201
 
-_LOCK_ACTIVE: Final = q("SELECT model_policy_id FROM active_config WHERE id = 1 FOR UPDATE")
+_LOCK_ACTIVE: Final = q("SELECT model_policy_id, llm_tuple_id FROM active_config WHERE id = 1 FOR UPDATE")
+# A draft the adversarial seed confirmed for a synthetic profile is the eval's, never the user's: none, as the
+# status route shows it (Carry T19-d).
 _LOCK_DRAFT: Final = q(
     "SELECT status, cv_file_id, native_pdf, reviewed_text, draft_json, confirm_response "
-    "FROM profile_drafts WHERE id = :d FOR UPDATE"
+    "FROM profile_drafts d WHERE id = :d AND NOT EXISTS (SELECT 1 FROM profile_versions v "
+    "WHERE v.id = d.confirmed_profile_version_id AND v.synthetic_eval) FOR UPDATE"
 )
+# The user's versions only: an adversarial seed's synthetic version is the eval's, never reused by a confirm
+# nor counted in the user's `version_no` (Rulings T19-a, T19-c; `scoring.golden.SYNTHETIC_VERSION_BASE`).
 _USABLE_VERSION: Final = q(
-    "SELECT id FROM profile_versions WHERE profile_hash = :h AND purged_at IS NULL FOR KEY SHARE"
+    "SELECT id FROM profile_versions WHERE profile_hash = :h AND purged_at IS NULL AND NOT synthetic_eval "
+    "FOR KEY SHARE"
 )
 _FENCED: Final = q(
     "SELECT EXISTS (SELECT 1 FROM purge_fences WHERE released_at IS NULL AND kind = 'profile' "
@@ -123,7 +145,7 @@ _FENCED: Final = q(
 _INSERT_VERSION: Final = q(
     "INSERT INTO profile_versions (version_no, draft_id, cv_file_id, profile_json, profile_hash, "
     "confirmed_at) SELECT coalesce(max(version_no), 0) + 1, :d, :cv, :profile, :h, :now "
-    "FROM profile_versions RETURNING id",
+    "FROM profile_versions WHERE NOT synthetic_eval RETURNING id",
     jsonb=["profile"],
 )
 _ACTIVATE: Final = q(
@@ -153,8 +175,9 @@ class ConfirmOutcome:
 
 
 @dataclass(frozen=True)
-class Activated:
-    """The ids of one activation, for the caller's log line after its commit."""
+class ProfileActivated:
+    """The ids of one profile activation, for the caller's log line after its commit (the tuple activation's
+    own result is `scoring.targets.Activated`)."""
 
     draft_id: int
     version_id: int
@@ -267,11 +290,11 @@ async def confirm_draft(
     expected_rescore_ack: bool,
     now: datetime,
     defer: Deferrer,
-    activated: list[Activated] | None = None,
+    activated: list[ProfileActivated] | None = None,
 ) -> tuple[int, dict[str, JSONValue]]:
     """Confirm draft `draft_id` and activate its profile in the caller's transaction (module docstring); the
     response `(status, body)`. An activation's ids are appended to `activated` when it is given."""
-    model_policy_id = (await conn.execute(_LOCK_ACTIVE)).scalar_one()
+    active = (await conn.execute(_LOCK_ACTIVE)).one()
     draft = (await conn.execute(_LOCK_DRAFT, {"d": draft_id})).first()
     if draft is None:
         raise draft_not_found()
@@ -301,10 +324,15 @@ async def confirm_draft(
     version_id, version_created = await _version(conn, draft_id, int(draft.cv_file_id), profile_json, now=now)
     await afault_point(AFTER_VERSION_POINT)
     tuple_id = await save.ensure_tuple(
-        conn, profile_version_id=version_id, model_policy_id=int(model_policy_id)
+        conn, profile_version_id=version_id, model_policy_id=int(active.model_policy_id)
     )
     await conn.execute(_ACTIVATE, {"v": version_id, "t": tuple_id, "now": now})
     await afault_point(AFTER_FLIP_POINT)
+    old_tuple_id = None if active.llm_tuple_id is None else int(active.llm_tuple_id)
+    if tuple_id != old_tuple_id:  # (d) to (f) and (h)'s create_targets_for_tuple
+        await targets.activate_tuple(
+            conn, old_tuple_id=old_tuple_id, new_tuple_id=tuple_id, settings=settings, now=now, defer=defer
+        )
 
     ids = await ensure_derived(conn, derived(settings, profile=profile))
     apply_id = await scope_apply.set_desired_scope(conn, ids.scope_version_id, now=now, defer=defer)
@@ -337,7 +365,7 @@ async def confirm_draft(
     await afault_point(BEFORE_COMMIT_POINT)
     if activated is not None:
         activated.append(
-            Activated(
+            ProfileActivated(
                 draft_id=draft_id,
                 version_id=version_id,
                 version_created=version_created,

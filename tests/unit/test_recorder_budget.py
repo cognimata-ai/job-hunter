@@ -127,7 +127,24 @@ def seed_budget(tmp: Path, *entries: dict[str, Any]) -> None:
 
 
 def entry(spike: str, case: str, worst_case_usd: str = "0.01") -> dict[str, Any]:
+    """A done entry without a settled cost: the budget counts it at its worst case."""
     return {"spike": spike, "case": case, "state": "done", "worst_case_usd": worst_case_usd}
+
+
+def settled(spike: str, case: str, settled_usd: str, worst_case_usd: str = "0.05") -> dict[str, Any]:
+    """A done entry with its settled cost."""
+    return {**entry(spike, case, worst_case_usd), "settled_usd": settled_usd}
+
+
+def unsettled(spike: str, case: str, worst_case_usd: str) -> dict[str, Any]:
+    """An entry counted before its send whose outcome never came (a crash during the send)."""
+    return {
+        "spike": spike,
+        "case": case,
+        "state": "sending",
+        "worst_case_usd": worst_case_usd,
+        "settled_usd": None,
+    }
 
 
 def every_file(root: Path) -> Iterator[str]:
@@ -151,27 +168,116 @@ def expected_worst_case(call: dict[str, Any]) -> Decimal:
 # --- refusals before any transport exists -----------------------------------------------------------------
 
 
-def test_the_ninth_message_is_refused_before_any_transport_exists(rec: ModuleType, tmp_path: Path) -> None:
-    # 8 messages counted (more V4 entries than its cap of 4, so that only the M2 total can refuse): 6 of V4,
-    # 1 of V19 and the Sonnet case of V13; the Opus case would be the 9th
+# The M3 budget: $10.00 actual for every spike, M2's included. A send is refused when the settled cost of the
+# done entries + the worst case of every other entry + its own worst case is above it.
+
+
+def test_a_send_that_fits_is_sent_with_no_message_cap_and_no_worst_case_sum_cap(
+    rec: ModuleType, tmp_path: Path
+) -> None:
+    # 8 done messages (M2's old cap) whose worst cases sum to $12.00, above both M2's $0.80 and the $10.00
+    # total, but which settled at $0.08: a done entry counts at its settled cost only
     seed_budget(
-        tmp_path,
-        *(entry("v4", f"case{i}") for i in range(6)),
-        entry("v19", "native_pdf"),
-        entry("v13", "sonnet"),
+        tmp_path, *(settled("v4", f"case{i}", "0.010000", worst_case_usd="1.500000") for i in range(8))
     )
     factory = Factory(recorded_stream)
-    assert run(rec, tmp_path, factory, "--spike", "v13", "--live") == rec.REFUSED
-    assert factory.created == 0 and factory.requests == []
-    assert len(budget(tmp_path)["entries"]) == 8
+    assert run(rec, tmp_path, factory, "--spike", "v13", "--live") == rec.OK
+    assert factory.created == 2
+    state = budget(tmp_path)
+    assert state["sent"] == 10 and Decimal(state["worst_case_usd"]) > rec.MAX_ACTUAL_USD
 
 
-def test_a_send_whose_worst_case_would_pass_080_is_refused_unsent(rec: ModuleType, tmp_path: Path) -> None:
-    seed_budget(tmp_path, entry("v4", "case0", "0.79"))
+@pytest.mark.parametrize(("over", "sent"), [("0", True), ("0.000001", False)], ids=["at-10.00", "past-10.00"])
+def test_the_total_is_refused_just_past_the_boundary(
+    rec: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    over: str,
+    sent: bool,
+) -> None:
+    # settled + this call's worst case is exactly $10.00, or $0.000001 more
+    worst = expected_worst_case(CALL)
+    seed_budget(tmp_path, settled("v13", "earlier", str(rec.MAX_ACTUAL_USD - worst + Decimal(over))))
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike([CALL]))
     factory = Factory(recorded_stream)
-    assert run(rec, tmp_path, factory, "--spike", "v13", "--live") == rec.REFUSED
-    assert factory.created == 0
-    assert [e["case"] for e in budget(tmp_path)["entries"]] == ["case0"]
+    code = run(rec, tmp_path, factory, "--spike", "v4", "--live")
+    assert (code, factory.created) == ((rec.OK, 1) if sent else (rec.REFUSED, 0))
+    assert len(budget(tmp_path)["entries"]) == (2 if sent else 1)
+    if not sent:
+        assert f"above ${rec.MAX_ACTUAL_USD}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state", ["sending", "done"])
+def test_an_entry_that_is_not_done_counts_at_its_worst_case(
+    rec: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    # One entry with a worst case that leaves no room for this call. While it is `sending` (a crash during
+    # its send: the outcome is unknown), its worst case counts and the send is refused. Once it is done and
+    # settled at $0, the same send fits.
+    worst = expected_worst_case(CALL)
+    held = rec.MAX_ACTUAL_USD - Decimal("0.100000") - worst + Decimal("0.000001")
+    other = unsettled("v19", "crashed", str(held))
+    if state == "done":
+        other = {**other, "state": "done", "settled_usd": "0.000000"}
+    seed_budget(tmp_path, settled("v13", "earlier", "0.100000"), other)
+    monkeypatch.setattr(rec, "load_spike", lambda spike: _spike([CALL]))
+    factory = Factory(recorded_stream)
+    code = run(rec, tmp_path, factory, "--spike", "v4", "--live")
+    assert (code, factory.created) == ((rec.REFUSED, 0) if state == "sending" else (rec.OK, 1))
+
+
+def test_the_ledger_keeps_its_entries_and_records_the_new_limits(rec: ModuleType, tmp_path: Path) -> None:
+    # an M2 entry in the shape the M2 runs wrote, with every key
+    m2 = {
+        "spike": "v4",
+        "case": "generator-claude-sonnet-5-5",
+        "purpose": "schema_dry_run",
+        "model": "claude-sonnet-5-5",
+        "effort": "low",
+        "max_tokens": 2000,
+        "input_tokens_bound": 8742,
+        "extra_usd": "0",
+        "worst_case_usd": "0.041855",
+        "state": "done",
+        "sent_at": "2026-10-21T04:30:12.655901+00:00",
+        "finished_at": "2026-10-21T04:30:13.000000+00:00",
+        "status": 400,
+        "error": "BadRequestError",
+        "settled_usd": "0.000000",
+        "settlement": "not_billed:error_response_no_content",
+        "usage": None,
+        "stop_reason": None,
+    }
+    (tmp_path / "raw").mkdir(parents=True)
+    old_limits = {"messages": 8, "worst_case_usd": "0.80", "spikes": {"v13": 2, "v4": 5, "v19": 1}}
+    (tmp_path / "raw/anthropic-budget.json").write_text(json.dumps({"limits": old_limits, "entries": [m2]}))
+    assert run(rec, tmp_path, Factory(recorded_stream), "--spike", "v13", "--live") == rec.OK
+    state = budget(tmp_path)
+    assert set(state) == {"limits", "sent", "worst_case_usd", "settled_usd", "entries"}
+    assert state["entries"][0] == m2
+    assert state["limits"] == {
+        "actual_usd": "10.00",
+        "rule": rec.BUDGET_RULE,
+        "spikes": {"v13": 2, "v4": 4, "v19": 1, "v2probe": 3, "v4v2": 4, "v12": 1, "v5": 30, "v14": 2},
+    }
+    each = pricing.settled_usd("claude-sonnet-5-5", pricing.Usage(900, 300, 0, 0)) + pricing.settled_usd(
+        "claude-opus-5-5", pricing.Usage(900, 300, 0, 0)
+    )
+    assert Decimal(state["settled_usd"]) == each
+
+
+def test_the_dry_run_reports_the_budget_under_the_new_rule(
+    rec: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_budget(tmp_path, settled("v4", "earlier", "0.106520", worst_case_usd="0.470363"))
+    assert run(rec, tmp_path, Factory(recorded_stream), "--spike", "v13", "--dry-run") == rec.OK
+    worst = sum(expected_worst_case(c) for c in V13.calls())
+    out = capsys.readouterr().out
+    assert f"committed_usd={Decimal('0.106520') + worst} of 10.00" in out
+    assert json.loads((tmp_path / "raw/anthropic-budget.json").read_text())["entries"] == [
+        settled("v4", "earlier", "0.106520", worst_case_usd="0.470363")
+    ]  # the dry run writes nothing
 
 
 def test_the_spike_call_count_is_enforced(rec: ModuleType, tmp_path: Path) -> None:
@@ -181,10 +287,31 @@ def test_the_spike_call_count_is_enforced(rec: ModuleType, tmp_path: Path) -> No
     assert factory.created == 0 and len(budget(tmp_path)["entries"]) == 2
 
 
-def test_the_spike_call_counts_are_the_rulings(rec: ModuleType) -> None:
-    # R7-2: V4 sends its 4 gating cases and its probe goes to the free counting endpoint, never as a message
-    assert rec.SPIKE_CALLS == {"v13": 2, "v4": 4, "v19": 1}
-    assert sum(rec.SPIKE_CALLS.values()) <= rec.MAX_MESSAGES
+def test_the_spike_call_counts_and_the_total_are_the_rulings(rec: ModuleType) -> None:
+    # R7-2: V4 sends its 4 gating cases and its probe goes to the free counting endpoint, never as a message.
+    # v2probe: the ladder A, B, C sends at most 3. The user's M3 total covers every spike. M3 Task 26: the
+    # gateway spikes count HTTP attempts (v4v2, v5, v14), V12 its one batch. Ruling T26-c: V5's 20 calls and
+    # up to 10 enlarged max_tokens stages.
+    assert rec.SPIKE_CALLS == {
+        "v13": 2,
+        "v4": 4,
+        "v19": 1,
+        "v2probe": 3,
+        "v4v2": 4,
+        "v12": 1,
+        "v5": 30,
+        "v14": 2,
+    }
+    assert rec.SPIKE_MODULES["v2probe"] == "v4b_generator_v2_probe"
+    assert {s: rec.SPIKE_MODULES[s] for s in ("v4v2", "v12", "v5", "v14")} == {
+        "v4v2": "v4_schema_dry_run",
+        "v12": "v12_batches",
+        "v5": "v5_stream_timing",
+        "v14": "v5_stream_timing",
+    }
+    assert rec.GATEWAY_SPIKES == frozenset({"v4v2", "v5", "v14"}) and rec.BATCH_SPIKES == frozenset({"v12"})
+    assert rec.MAX_ACTUAL_USD == Decimal("10.00")
+    assert not hasattr(rec, "MAX_MESSAGES") and not hasattr(rec, "MAX_WORST_CASE_USD")
 
 
 def test_v4_sends_no_fifth_message(rec: ModuleType, tmp_path: Path) -> None:
@@ -294,7 +421,6 @@ def test_each_send_is_counted_with_its_worst_case_before_the_transport_exists(
     state = budget(tmp_path)
     assert state["sent"] == 2
     assert Decimal(state["worst_case_usd"]) == sum(expected_worst_case(c) for c in calls.values())
-    assert Decimal(state["worst_case_usd"]) <= Decimal("0.80")
 
 
 # A recorder process whose send never returns: it marks that the request reached the network, then hangs
@@ -671,3 +797,200 @@ def test_a_call_with_both_a_bound_and_a_count_is_refused(rec: ModuleType) -> Non
     call = {**CALL, "input_tokens_bound": 5_000, "native_pdf_count_tokens": 1_800}
     with pytest.raises(ValueError, match="not both"):
         rec.plan("v19", _spike([call]))
+
+
+# --- M3 pre-plan spike V4b (v2probe): the ladder and the raw-only answers ---------------------------------
+
+
+V2PROBE = _load("v4b_generator_v2_probe")
+GRAMMAR = {
+    "type": "invalid_request_error",
+    "message": "The compiled grammar is too large, which would cause performance issues. Simplify your tool "
+    "schemas or reduce the number of strict tools.",
+}
+
+
+def _candidate_of(request: httpx2.Request) -> str:
+    sent = json.loads(request.content)["output_config"]["format"]["schema"]
+    label: str = next(label for label, build in V2PROBE.CANDIDATES.CANDIDATES.items() if build() == sent)
+    return label
+
+
+def ladder_answers(kinds: dict[str, str]) -> Handler:
+    """Answers each candidate's request as `kinds` says: `accept` (200 end_turn), `cut` (200 max_tokens),
+    `grammar` (the 400 V4 recorded), `other400` (a 400 with another message), `500` or `timeout`."""
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        kind = kinds[_candidate_of(request)]
+        if kind == "accept":
+            return recorded_stream(request)
+        if kind == "cut":
+            cut = synthetic_sse(
+                '{"not_a_job_ad": false, "summ', model="claude-sonnet-5-5", stop_reason="max_tokens"
+            )
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=cut)
+        if kind == "timeout":
+            raise httpx2.ReadTimeout("timed out", request=request)
+        status, error = {
+            "grammar": (400, GRAMMAR),
+            "other400": (400, {"type": "invalid_request_error", "message": "synthetic: something else"}),
+            "500": (500, {"type": "api_error", "message": "synthetic: internal"}),
+        }[kind]
+        body = {"type": "error", "error": error, "request_id": "req_0123456789abcdef"}
+        return httpx2.Response(status, headers={"request-id": "req_0123456789abcdef"}, json=body)
+
+    return handle
+
+
+LADDER_RUNS = [
+    # (answers per candidate, candidates sent in order, exit code name, the candidate the plan uses)
+    ({"a": "accept", "c": "accept"}, "ac", "OK", "a"),
+    ({"a": "cut", "c": "grammar"}, "ac", "OK", "a"),
+    ({"a": "grammar", "b": "accept"}, "ab", "OK", "b"),
+    ({"a": "grammar", "b": "grammar", "c": "cut"}, "abc", "OK", "c"),
+    ({"a": "grammar", "b": "grammar", "c": "grammar"}, "abc", "OK", None),
+    ({"a": "other400"}, "a", "STOPPED", None),
+    ({"a": "grammar", "b": "500"}, "ab", "STOPPED", None),
+    ({"a": "timeout"}, "a", "STOPPED", None),
+]
+
+
+@pytest.mark.parametrize(("kinds", "sent", "code", "chosen"), LADDER_RUNS)
+def test_the_v2probe_ladder_sends_only_what_it_needs_and_commits_nothing(
+    rec: ModuleType, tmp_path: Path, kinds: dict[str, str], sent: str, code: str, chosen: str | None
+) -> None:
+    factory = Factory(ladder_answers(kinds))
+    assert run(rec, tmp_path, factory, "--spike", "v2probe", "--live") == getattr(rec, code)
+    assert [_candidate_of(r) for r in factory.requests] == list(sent)
+    entries = budget(tmp_path)["entries"]
+    assert [e["case"] for e in entries] == [f"candidate_{label}" for label in sent]
+    for counted, label in zip(entries, sent, strict=True):
+        kind = kinds[label]
+        if kind in ("accept", "cut"):
+            assert (counted["status"], counted["settlement"]) == (200, "billed")
+        elif kind == "timeout":
+            assert counted["settled_usd"] == counted["worst_case_usd"]  # the outcome is unknown
+        else:
+            assert (counted["settled_usd"], counted["settlement"]) == (
+                "0.000000",
+                "not_billed:error_response_no_content",
+            )
+    recorder = rec.Recorder(
+        "v2probe",
+        V2PROBE,
+        rec.plan("v2probe", V2PROBE),
+        tmp_path / "raw",
+        tmp_path / "fixtures",
+        factory,
+        lambda: None,
+        sys.stdout,
+    )
+    verdicts = recorder.verdicts(rec.Budget(tmp_path / "raw"))
+    assert V2PROBE.chosen(verdicts) == chosen
+    assert not (tmp_path / "fixtures").exists()  # raw only: no recording is committed
+    for text in every_file(tmp_path / "raw/anthropic/v2probe"):
+        assert FAKE_KEY not in text
+    for check in (tmp_path / "raw/anthropic/v2probe").glob("*.check.json"):
+        assert "Backend Engineer" not in check.read_text("utf-8")  # verdicts and paths, never the output
+    # a second run sends nothing: a counted case is never sent twice, and the ladder wants no other
+    assert run(rec, tmp_path, factory, "--spike", "v2probe", "--live") == rec.OK
+    assert len(factory.requests) == len(sent)
+
+
+def test_the_v2probe_sends_each_candidate_byte_for_byte_without_a_title(
+    rec: ModuleType, tmp_path: Path
+) -> None:
+    factory = Factory(ladder_answers({"a": "grammar", "b": "grammar", "c": "accept"}))
+    assert run(rec, tmp_path, factory, "--spike", "v2probe", "--live") == rec.OK
+    for request in factory.requests:
+        body = json.loads(request.content)
+        schema = body["output_config"]["format"]["schema"]
+        assert schema == V2PROBE.CANDIDATES.CANDIDATES[_candidate_of(request)]() and "title" not in schema
+        assert (body["model"], body["max_tokens"], body["output_config"]["effort"]) == (
+            "claude-sonnet-5-5",
+            1024,
+            "low",
+        )
+        assert request.headers[fake.PURPOSE_HEADER] == "generate"
+    report = json.loads((tmp_path / "raw/anthropic/v2probe/candidate_a.check.json").read_text("utf-8"))
+    assert (report["verdict"], report["error_message"]) == ("rejected", GRAMMAR["message"])
+
+
+def test_the_v2probe_dry_run_names_the_ladder_and_sends_nothing(
+    rec: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", "v2probe", "--dry-run", environ={}) == rec.OK
+    out = capsys.readouterr().out
+    assert factory.created == 0 and out.count("payload ok") == 3
+    assert "candidate_a waits" not in out
+    assert "candidate_b waits for the ladder" in out and "candidate_c waits for the ladder" in out
+
+
+# --- M3 Task 26: the gateway and batch spikes' modes -----------------------------------------------------
+
+
+def test_the_v4v2_dry_run_checks_the_four_version_2_cases_offline(
+    rec: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_budget(tmp_path, settled("v2probe", "candidate_c", "0.118852", worst_case_usd="0.2"))
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", "v4v2", "--dry-run", environ={}) == rec.OK
+    out = capsys.readouterr().out
+    assert factory.created == 0 and out.count("payload ok") == 4 and "BAD" not in out
+    for case in ("generator-claude-sonnet-5-5", "critic-claude-opus-5-5", "profile-claude-opus-5-5"):
+        assert f"v4v2 {case} " in out
+    assert "probe:minimum/claude-sonnet-5-5 goes to the free counting endpoint" in out
+    module = _load("v4_schema_dry_run")
+    worst = sum(
+        pricing.worst_case_usd(
+            c["node"].model,
+            input_tokens_bound=bounds.text_input_bound(
+                c["node"].model, c["prompt"].as_request(c["node"].schema)
+            ),
+            max_tokens=c["node"].max_tokens,
+        )
+        for c in module.gateway_calls("v4v2")
+    )
+    assert f"committed_usd={Decimal('0.118852') + worst} of 10.00" in out
+    assert budget(tmp_path)["entries"] == [
+        settled("v2probe", "candidate_c", "0.118852", worst_case_usd="0.2")
+    ]
+
+
+def test_the_v4v2_cases_send_the_stored_version_2_schemas() -> None:
+    module = _load("v4_schema_dry_run")
+    calls = module.gateway_calls("v4v2")
+    assert [c["case"] for c in calls] == [
+        "generator-claude-sonnet-5-5",
+        "critic-claude-opus-5-5",
+        "profile-claude-opus-5-5",
+        "queries-claude-opus-5-5",
+    ]
+    v2 = module.V2
+    assert [c["node"].schema.json for c in calls] == [
+        v2.schemas[n] for n in ("generator", "critic", "profile", "queries")
+    ]
+    assert {(c["node"].effort, c["node"].max_tokens, c["node"].purpose) for c in calls} == {
+        ("low", 2000, "schema_dry_run")
+    }
+
+
+@pytest.mark.parametrize("spike", ["v13", "v4", "v12"])
+def test_through_gateway_is_refused_for_a_spike_that_does_not_run_through_the_gateway(
+    rec: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str], spike: str
+) -> None:
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", spike, "--dry-run", "--through-gateway") == rec.REFUSED
+    out = capsys.readouterr().out
+    assert f"{spike}: REFUSED, --through-gateway is for v4v2, v5 and v14 only; nothing sent" in out
+    assert factory.created == 0 and not (tmp_path / "raw").exists()
+
+
+@pytest.mark.parametrize("spike", ["v4v2", "v5", "v14"])
+def test_commit_recorded_is_refused_for_the_gateway_spikes(
+    rec: ModuleType, tmp_path: Path, spike: str
+) -> None:
+    factory = Factory(recorded_stream)
+    assert run(rec, tmp_path, factory, "--spike", spike, "--commit-recorded") == rec.REFUSED
+    assert factory.created == 0 and not (tmp_path / "raw").exists()

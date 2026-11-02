@@ -426,6 +426,26 @@ def run_startup_assertions(cfg: AppConfig) -> None:
     # Also after the §16.8 checks (ruling T18-c): the edge's CSRF check compares `Origin` with this value.
     _check_public_origin(cfg)
 
+    # §10.6 L3880 (M3 Task 4): the cached score prefix rests on a rubric block of at least 600 tokens.
+    _check_rubric_block()
+
+
+def _check_rubric_block() -> None:
+    """L3880: every shipped rubric rendered into the packaged `shared_rubric` template is at least
+    `RUBRIC_BLOCK_MIN_TOKENS` tokens at chars/4 (`rubric_block_too_short`). Imported here: the renderer
+    imports the gateway, which imports this module."""
+    from jobhunter.llm.prompts import render
+    from jobhunter.scoring.rubric import RUBRIC_V1, RUBRIC_V2, load_rubric
+
+    template = render.template_text("shared_rubric")
+    for version in (RUBRIC_V1, RUBRIC_V2):
+        block = render.rubric_block(template, load_rubric(version))
+        if render.estimated_tokens(block) < render.RUBRIC_BLOCK_MIN_TOKENS:
+            raise StartupCheckFailed(
+                "rubric_block_too_short",
+                f"the rubric block of {version} is under {render.RUBRIC_BLOCK_MIN_TOKENS} tokens",
+            )
+
 
 def _log_startup_failure(role: Role, exc: StartupCheckFailed) -> None:
     fields = {"check": exc.check, "role": role}

@@ -1,0 +1,186 @@
+{
+  "key": "english_ad_german_c1",
+  "label": "poor",
+  "expected_knockouts": [
+    "mandatory_language:de"
+  ],
+  "profile": {
+    "summary": "Product manager with eight years of experience in B2B software for logistics companies.",
+    "target_titles": [
+      {
+        "title": "Product Manager",
+        "lang": "en"
+      },
+      {
+        "title": "Senior Product Manager",
+        "lang": "en"
+      }
+    ],
+    "seniority": "senior",
+    "total_years_experience": 8,
+    "roles": [
+      {
+        "title": "Senior Product Manager",
+        "employer": "Beispiel Freight Software Ltd",
+        "start": "2019-01-01",
+        "end": "present",
+        "seniority": "senior",
+        "domain": "Logistics",
+        "highlights": [
+          "Owned the roadmap of a route planning product for freight forwarders"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "Product Discovery",
+        "category": "method",
+        "level": "expert",
+        "years": 8,
+        "evidence": "Product Discovery"
+      },
+      {
+        "name": "Roadmapping",
+        "category": "method",
+        "level": "expert",
+        "years": 8,
+        "evidence": "Roadmapping"
+      },
+      {
+        "name": "SQL",
+        "category": "programming_language",
+        "level": "intermediate",
+        "years": 4,
+        "evidence": "SQL"
+      }
+    ],
+    "languages": [
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "English (native)"
+      },
+      {
+        "code": "fr",
+        "code_other": null,
+        "cefr": "B1",
+        "evidence": "French (B1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "master",
+        "field": "Business Administration",
+        "institution": null,
+        "year": 2016
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "Logistics"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "Berlin",
+        "gazetteer_id": "geonames:2950159",
+        "lat": 52.52437,
+        "lon": 13.41053,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "Product Manager Mobility (m/w/d)",
+    "company": "Beispiel Mobility GmbH",
+    "locations": [
+      "Berlin"
+    ],
+    "work_modes": [
+      "hybrid"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "full",
+    "description": "We are looking for a product manager for our mobility platform in Berlin. You will own the roadmap of our booking product, talk to our customers every week and turn their feedback into clear requirements for two engineering teams. You have several years of experience as a product manager for software products and you are used to working with data. Fluent German at level C1 is mandatory for this role, because you will run workshops with our customers in German and write all customer documentation in German. English is our internal language. We offer a hybrid setup with two office days in Berlin, a learning budget and a team that ships every week."
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "Berlin",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2950159",
+            "country_code": "DE",
+            "lat": 52.52437,
+            "lon": 13.41053
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "hybrid"
+    ],
+    "work_mode_source": "structured",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "structured",
+    "salary": null,
+    "industry_structured": null
+  }
+}

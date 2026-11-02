@@ -50,8 +50,8 @@ codes and counts.
 
 `GET /api/profile/drafts/{id}/rescore-estimate` → `{targets, est_usd_online, est_usd_batch, month_spend,
 cap}` (§14.2, `profile.estimate.rescore_estimate`): what confirming would re-score and cost under the active
-settings in the current month, read without a lock; an unknown draft is 404 `not_found`. The figures do not
-depend on the draft's state.
+settings in the current month, read without a lock; an unknown draft, or a synthetic confirmed one of the
+adversarial seed (Carry T19-d), is 404 `not_found`. The figures do not depend on the draft's state.
 
 `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.profile.utcnow`; the confirm takes its `now` from it.
@@ -148,7 +148,11 @@ DraftId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a pro
 
 CONFIRM_ROUTE: Final = "profile.confirm"
 _LOCK_ACTIVE_CONFIG: Final = q("SELECT 1 FROM active_config WHERE id = 1 FOR UPDATE")
-_DRAFT_EXISTS: Final = q("SELECT 1 FROM profile_drafts WHERE id = :d")
+# A synthetic confirmed draft of the adversarial seed is the eval's: none here (Carry T19-d).
+_DRAFT_EXISTS: Final = q(
+    "SELECT 1 FROM profile_drafts d WHERE id = :d AND NOT EXISTS (SELECT 1 FROM profile_versions v "
+    "WHERE v.id = d.confirmed_profile_version_id AND v.synthetic_eval)"
+)
 
 
 class DraftCreatedOut(BaseModel):
@@ -512,7 +516,7 @@ async def confirm_draft(
     """Confirm a ready draft and activate its profile (201); a repeat returns the original outcome."""
     key = check_idempotency_key(idempotency_key)  # a malformed key costs no database round trip
     now = utcnow()
-    activated: list[activation.Activated] = []  # the handler's activation; empty on any replay
+    activated: list[activation.ProfileActivated] = []  # the handler's activation; empty on any replay
     replayed: list[JSONValue] = []  # the version of a confirmed draft's stored body, under a new key
 
     async def handler(conn: AsyncConnection) -> StoredResponse:

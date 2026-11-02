@@ -1,0 +1,26 @@
+{
+  "case": "x6",
+  "component_bytes": {
+    "messages": [
+      5828
+    ],
+    "schema": 952,
+    "system": [
+      13252,
+      5822,
+      2261
+    ]
+  },
+  "effort": "medium",
+  "max_tokens": 6000,
+  "model": "claude-sonnet-5-5",
+  "purpose": "critic",
+  "source": "recorded",
+  "spike": "v14",
+  "usage": {
+    "cache_creation_input_tokens": 8218,
+    "cache_read_input_tokens": 0,
+    "input_tokens": 3489,
+    "output_tokens": 1199
+  }
+}

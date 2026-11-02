@@ -199,11 +199,11 @@ def observe_graph_end(owner: RunOwner, end: RunEnd) -> None:
     observe_run_ends([end])
 
 
-# The run row and its current attempt, the run row locked: the DB step of the admission.
-_ADMISSION = q(
-    "SELECT r.status, r.attempt_no, a.worker_epoch, a.ended_at FROM runs r "
-    "LEFT JOIN run_attempts a ON a.run_id = r.id AND a.attempt_no = r.attempt_no "
-    "WHERE r.id = :i FOR UPDATE OF r"
+# The DB step of the admission: the run row locked alone (M2 Deviation 43, Carry-forward I3: no join under
+# `FOR UPDATE`), then its current attempt read by id in a second statement, under that lock.
+_ADMISSION = q("SELECT status, attempt_no FROM runs WHERE id = :i FOR UPDATE")
+_ADMISSION_ATTEMPT = q(
+    "SELECT worker_epoch, ended_at FROM run_attempts WHERE run_id = :i AND attempt_no = :a"
 )
 _LOCK_RUNNING = q("SELECT status, attempt_no, resume_count FROM runs WHERE id = :i FOR UPDATE")
 _INSERT_ATTEMPT = q(
@@ -337,7 +337,8 @@ async def _admit(
         return "finished", None, False
     if row.attempt_no != attempt_no:
         return "superseded", None, False
-    if row.worker_epoch != epoch or row.ended_at is not None:
+    current = (await conn.execute(_ADMISSION_ATTEMPT, {"i": run_id, "a": row.attempt_no})).first()
+    if current is None or current.worker_epoch != epoch or current.ended_at is not None:
         return "foreign_epoch", None, False
     await heartbeat_run(conn, owner)
     return "resumed", owner, False
@@ -528,8 +529,9 @@ async def request_manual_run(
 async def sweep_older_epoch_runs(conn: AsyncConnection, epoch: int) -> Swept:
     """At takeover: give every `running` run whose current attempt belongs to an older epoch a new attempt.
 
-    The runs it ends (`resume_exhausted`) are observed once the takeover transaction has committed. The
-    takeover holds the `worker_heartbeat` row with `epoch` written, so each new attempt's fence passes.
+    The runs it ends (`resume_exhausted`) are observed once the sweep's transaction has committed. That
+    transaction opened with `fence_epoch(epoch)` (the claim of `epoch` committed before it), so each new
+    attempt's fence passes.
     """
     run_ids = [int(run_id) for run_id in (await conn.execute(_OLDER_EPOCH, {"epoch": epoch})).scalars()]
     ends: list[RunEnd] = []

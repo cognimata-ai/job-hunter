@@ -1,0 +1,186 @@
+{
+  "key": "degree_or_equivalent",
+  "label": "good",
+  "expected_knockouts": [],
+  "profile": {
+    "summary": "Fachinformatiker für Anwendungsentwicklung mit acht Jahren Erfahrung in Python und Django.",
+    "target_titles": [
+      {
+        "title": "Python-Entwickler",
+        "lang": "de"
+      },
+      {
+        "title": "Backend Developer",
+        "lang": "en"
+      }
+    ],
+    "seniority": "senior",
+    "total_years_experience": 8,
+    "roles": [
+      {
+        "title": "Backend-Entwickler",
+        "employer": "Beispiel Buchungssysteme GmbH",
+        "start": "2017-08-01",
+        "end": "present",
+        "seniority": "senior",
+        "domain": "Tourismus",
+        "highlights": [
+          "Buchungsschnittstellen mit Python und Django entwickelt und betrieben"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "Python",
+        "category": "programming_language",
+        "level": "expert",
+        "years": 8,
+        "evidence": "Python"
+      },
+      {
+        "name": "Django",
+        "category": "framework",
+        "level": "expert",
+        "years": 7,
+        "evidence": "Django"
+      },
+      {
+        "name": "PostgreSQL",
+        "category": "tool",
+        "level": "advanced",
+        "years": 6,
+        "evidence": "PostgreSQL"
+      }
+    ],
+    "languages": [
+      {
+        "code": "de",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "Deutsch (Muttersprache)"
+      },
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "C1",
+        "evidence": "Englisch (C1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "vocational",
+        "field": "Fachinformatik Anwendungsentwicklung",
+        "institution": null,
+        "year": 2017
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "Tourismus"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "München",
+        "gazetteer_id": "geonames:2867714",
+        "lat": 48.13743,
+        "lon": 11.57549,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "Senior Python-Entwickler Django (m/w/d)",
+    "company": "Beispiel Reiseplattform GmbH",
+    "locations": [
+      "München"
+    ],
+    "work_modes": [
+      "remote",
+      "hybrid"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "full",
+    "description": "Für unsere Reiseplattform in München suchen wir eine erfahrene Python-Entwicklerin oder einen erfahrenen Python-Entwickler. Du entwickelst unsere Buchungsdienste mit Python und Django weiter, entwirfst Schnittstellen zu Hotels und Fluggesellschaften und betreibst die Dienste mit PostgreSQL in der Cloud. Du hast ein abgeschlossenes Studium der Informatik oder eine vergleichbare Qualifikation durch mehrjährige Berufserfahrung in der Softwareentwicklung. Mindestens fünf Jahre Erfahrung mit Python und Django sind uns wichtig. Wir bieten dir mobiles Arbeiten, ein Büro in München und ein Team, das Wert auf saubere Reviews und gute Tests legt."
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "München",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2867714",
+            "country_code": "DE",
+            "lat": 48.13743,
+            "lon": 11.57549
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "remote",
+      "hybrid"
+    ],
+    "work_mode_source": "structured",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "structured",
+    "salary": null,
+    "industry_structured": null
+  }
+}

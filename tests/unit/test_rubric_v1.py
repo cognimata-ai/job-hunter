@@ -206,7 +206,7 @@ def test_a_rubric_without_the_anchors_of_an_llm_criterion_is_refused(missing: st
         parse_rubric(text.replace(marker, f"\n  {missing}_removed:\n", 1), name="v1")
 
 
-@pytest.mark.parametrize("name", ["v0", "../v1", "v1.yaml", "V1", "", "v2"])
+@pytest.mark.parametrize("name", ["v0", "../v1", "v1.yaml", "V1", "", "v3"])  # v2 ships since M3
 def test_load_rubric_takes_a_shipped_version_name_only(name: str) -> None:
     with pytest.raises(ValueError, match="rubric"):
         load_rubric(name)

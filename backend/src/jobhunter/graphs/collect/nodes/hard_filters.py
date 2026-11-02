@@ -16,9 +16,8 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.db.sql import q
 from jobhunter.graphs.collect.deps import CollectDeps
-from jobhunter.graphs.collect.nodes import Node
+from jobhunter.graphs.collect.nodes import Node, run_started_at
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate
 from jobhunter.quota.ledger import lock_run_owner
 from jobhunter.scoring import filters
@@ -26,7 +25,6 @@ from jobhunter.worker.runs import RunOwner
 
 HARD_FILTERS: Final = "hard_filters"
 HARD_FILTER_BACKFILLED: Final = "hard_filter_backfilled"
-_STARTED_AT: Final = q("SELECT started_at FROM runs WHERE id = :run")
 
 
 def make_hard_filters(deps: CollectDeps) -> Node:
@@ -37,9 +35,7 @@ def make_hard_filters(deps: CollectDeps) -> Node:
             await lock_run_owner(conn, owner)
 
         async with deps.engine.connect() as conn:
-            started_at = (await conn.execute(_STARTED_AT, {"run": owner.run_id})).scalar_one()
-        if started_at is None:
-            raise LookupError(f"run {owner.run_id} has not started")
+            started_at = await run_started_at(conn, owner.run_id)
         backfilled = 0
         while True:
             async with deps.engine.begin() as conn:

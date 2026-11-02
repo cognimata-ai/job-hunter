@@ -1,3 +1,4 @@
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -5,9 +6,27 @@ import sqlalchemy as sa
 from jobhunter.db.seed import sync_transition_matrix
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.sql import CHECK_VIOLATION, pg_error
-from jobhunter.db.transitions import CLEAR_REASON, TRANSITIONS, transition
+from jobhunter.db.transitions import (
+    CLEAR_REASON,
+    TRANSITIONS,
+    transition,
+    transition_set_clause,
+    transition_where,
+)
 from jobhunter.errors import TransitionConflict
 
+from tests.support.m2 import insert_profile_chain
+from tests.support.m3 import (
+    CLAIM_FROM,
+    CLAIM_RETURNING,
+    CLAIM_SET_SQL,
+    CLAIM_WHERE,
+    NOW,
+    insert_cycle,
+    insert_job,
+    insert_published,
+    insert_target,
+)
 from tests.support.pg import MANUAL_RUN_SQL
 
 pytestmark = pytest.mark.integration
@@ -246,3 +265,192 @@ async def test_clear_reason_empties_the_reason_column_and_no_reason_leaves_it(en
         await c.execute(sa.text("UPDATE runs SET status_reason = 'kept' WHERE id=:i"), {"i": rid})
         await transition(c, "runs", rid, ["running"], "succeeded", owner={"attempt_no": 1})
         assert tuple((await c.execute(reason, {"i": rid})).one()) == ("succeeded", "kept")
+
+
+CLAIMED = sa.text(
+    "SELECT id, state, claim_id, claim_epoch, attempt_no, lane, always_include_reason, "
+    "claimed_at = now() AS claimed_now, claim_heartbeat_at = now() AS heartbeat_now, "
+    "state_changed_at = now() AS changed_now FROM score_targets WHERE id = ANY(CAST(:ids AS bigint[])) "
+    "ORDER BY id"
+)
+
+
+async def test_transition_where_moves_only_matching_rows_and_the_trigger_checks_each(engine) -> None:
+    async with engine.connect() as c:
+        tuple_id = (await insert_profile_chain(c)).llm_tuple_id
+        # Back-dated, because every `now()` of one transaction is the same instant.
+        pending = [
+            await insert_target(c, await insert_job(c), tuple_id, attempt_no=n, state_changed_at=NOW)
+            for n in (0, 1, 2)
+        ]
+        held = uuid4()
+        busy = await insert_target(
+            c,
+            await insert_job(c),
+            tuple_id,
+            state="in_progress",
+            state_changed_at=NOW,
+            claim_id=held,
+            claim_epoch=1,
+            claimed_at=NOW,
+            claim_heartbeat_at=NOW,
+            attempt_no=5,
+            lane="similarity",
+        )
+        ids = [*pending, busy]
+        lanes = ["similarity", "oldest", "always_include", "exploration"]
+        reasons = [None, None, "watchlist", "title_match"]
+        rows = await transition_where(
+            c,
+            "score_targets",
+            ["pending"],
+            "in_progress",
+            where=CLAIM_WHERE,
+            from_sql=CLAIM_FROM,
+            params={"ids": ids, "lanes": lanes, "reasons": reasons, "epoch": 2, "max_attempts": 4},
+            set_sql=CLAIM_SET_SQL,
+            returning=CLAIM_RETURNING,
+        )
+        assert sorted(row["id"] for row in rows) == pending
+        assert all(set(row) == {"id", "claim_id", "attempt_no"} for row in rows)
+        claims = {row["id"]: row["claim_id"] for row in rows}
+        assert None not in claims.values()
+        assert len(set(claims.values())) == 3  # gen_random_uuid() per row
+        assert {row["id"]: row["attempt_no"] for row in rows} == dict(zip(pending, (1, 2, 3), strict=True))
+        stored = [tuple(row) for row in await c.execute(CLAIMED, {"ids": ids})]
+        assert stored == [
+            (pending[0], "in_progress", claims[pending[0]], 2, 1, "similarity", None, True, True, True),
+            (pending[1], "in_progress", claims[pending[1]], 2, 2, "oldest", None, True, True, True),
+            (
+                pending[2],
+                "in_progress",
+                claims[pending[2]],
+                2,
+                3,
+                "always_include",
+                "watchlist",
+                True,
+                True,
+                True,
+            ),
+            # not pending: the in-progress target keeps its claim, its attempt and its lane
+            (busy, "in_progress", held, 1, 5, "similarity", None, False, False, False),
+        ]
+
+        # A where that selects a published row moves nothing: the state is part of the predicate.
+        published = (await insert_published(c, await insert_job(c), tuple_id)).target_id
+        claim = {"claim_id": uuid4(), "claim_epoch": 2, "claim_heartbeat_at": NOW}
+        assert (
+            await transition_where(
+                c,
+                "score_targets",
+                ["pending"],
+                "in_progress",
+                where="t.id = :id",
+                params={"id": published},
+                set_=claim,
+            )
+            == []
+        )
+        state = sa.text("SELECT state FROM score_targets WHERE id = :id")
+        assert (await c.execute(state, {"id": published})).scalar_one() == "published_accepted"
+
+        # The trigger checks every row of a set-based UPDATE: one legal row does not carry an illegal one.
+        fresh = await insert_target(c, await insert_job(c), tuple_id)
+        with pytest.raises(
+            sa.exc.IntegrityError,
+            match="disallowed transition score_targets: published_accepted -> in_progress",
+        ) as bad:
+            async with c.begin_nested():
+                await c.execute(
+                    sa.text(
+                        "UPDATE score_targets SET state = 'in_progress', claim_id = gen_random_uuid(), "
+                        "claim_epoch = 2, claim_heartbeat_at = now() WHERE id = ANY(CAST(:ids AS bigint[]))"
+                    ),
+                    {"ids": [fresh, published]},
+                )
+        assert pg_error(bad.value).sqlstate == CHECK_VIOLATION
+        assert (await c.execute(state, {"id": fresh})).scalar_one() == "pending"
+        await c.rollback()
+
+
+REVIVE = (
+    "INSERT INTO score_targets (job_revision_id, llm_tuple_id, job_id, state) "
+    "VALUES (:revision, :tuple, :job, 'pending') "
+    "ON CONFLICT (job_revision_id, llm_tuple_id) DO UPDATE SET {clause} "
+    "WHERE score_targets.state = 'cancelled' "
+    "AND score_targets.state_reason IN ('tuple_superseded', 'revision_superseded', 'job_merged') RETURNING id"
+)
+REVIVED = sa.text(
+    "SELECT state, state_reason, override, override_at, lane, state_changed_at = now() FROM score_targets "
+    "WHERE id = :id"
+)
+
+
+async def test_the_revive_upsert_moves_a_cancelled_target_through_the_set_clause(engine) -> None:
+    clause = transition_set_clause(
+        "score_targets",
+        "pending",
+        reason=CLEAR_REASON,
+        set_sql={"override": "'none'", "override_at": "NULL", "lane": "NULL", "updated_at": "now()"},
+    )
+    async with engine.connect() as c:
+        tuple_id = (await insert_profile_chain(c)).llm_tuple_id
+        job = await insert_job(c)
+        target = await insert_target(
+            c,
+            job,
+            tuple_id,
+            state="cancelled",
+            state_reason="tuple_superseded",
+            state_changed_at=NOW,
+            override="score_now",
+            override_at=NOW,
+            lane="score_now",
+        )
+        # The fragment binds nothing of its own: the statement's binds are the INSERT's alone.
+        statement = sa.text(REVIVE.format(clause=clause))
+        assert set(statement.compile().params) == {"revision", "tuple", "job"}
+        params = {"revision": job.revision_id, "tuple": tuple_id, "job": job.job_id}
+        revived = await c.execute(statement, params)
+        assert revived.scalar_one() == target
+        assert tuple((await c.execute(REVIVED, {"id": target})).one()) == (
+            "pending",
+            None,
+            "none",
+            None,
+            None,
+            True,
+        )
+        await c.rollback()
+
+
+CYCLE = sa.text(
+    "SELECT status, report, admitted, jsonb_typeof(report), jsonb_typeof(admitted), spent_usd, "
+    "finished_at = now() FROM score_cycles WHERE id = :id"
+)
+
+
+async def test_transition_where_binds_json_values_as_jsonb(engine) -> None:
+    report = {
+        "outcomes": {"published_accepted": 2, "refused": 0},
+        "lanes": ["similarity", "oldest"],
+        "ü": None,
+    }
+    admitted = {"similarity": 2, "oldest": 1}
+    async with engine.connect() as c:
+        cycle = await insert_cycle(c, (await insert_profile_chain(c)).llm_tuple_id)
+        rows = await transition_where(
+            c,
+            "score_cycles",
+            ["running"],
+            "completed",
+            where="t.id = :id AND t.worker_epoch = :epoch",
+            params={"id": cycle, "epoch": 1},
+            set_={"report": report, "admitted": admitted, "spent_usd": Decimal("0.104")},
+            returning=("id", "report", "admitted"),
+        )
+        assert [dict(row) for row in rows] == [{"id": cycle, "report": report, "admitted": admitted}]
+        stored = tuple((await c.execute(CYCLE, {"id": cycle})).one())
+        assert stored == ("completed", report, admitted, "object", "object", Decimal("0.104000"), True)
+        await c.rollback()

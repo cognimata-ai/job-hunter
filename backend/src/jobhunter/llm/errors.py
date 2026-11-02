@@ -1,15 +1,21 @@
-"""The LLM layer's domain errors (spec §6.9.1, §10.4, §10.5).
+"""The LLM layer's domain errors (spec §6.9.1, §9.4.3, §10.4, §10.5, §17.1).
 
-`BudgetExhausted` is the spend ledger's (a reservation the monthly cap refuses); the others are the gateway's
-outcomes of a call (Task 5), `LLMNotConfigured` that of a gateway without a key (Task 23). Like every
-`DomainError` they carry codes, statuses, model ids and amounts only, never a prompt, a response or any CV or
-profile text, so their messages are safe to log and to put into a checkpoint.
+`BudgetExhausted` is the spend ledger's (a reservation the monthly cap refuses), and so are
+`BulkAllocationExceeded` (a batch reservation past its bulk operation's allocation, M3 Task 16) and
+`ClaimLost` (a score attempt's claim no longer holds, M3); the others are the gateway's outcomes of a call
+(Task 5), `LLMNotConfigured` that of a gateway without a key (Task 23). Like every `DomainError` they carry
+codes, statuses, model ids and amounts only, never a prompt, a response or any CV or profile text, so their
+messages are safe to log and to put into a checkpoint.
 """
 
 from decimal import Decimal
+from typing import Final
 
-from jobhunter.errors import DomainError
+from jobhunter.errors import DomainError, FencedOut
 from jobhunter.llm.budget import PurposeClass
+
+# The owner `ClaimLost` names: the score target whose claim predicate failed (§3.3.3).
+SCORE_TARGET_OWNER: Final = "score_target"
 
 
 class LLMError(DomainError):
@@ -24,6 +30,30 @@ class BudgetExhausted(LLMError):
         super().__init__(f"LLM budget exhausted for {purpose_class} calls (headroom ${headroom_usd})")
         self.purpose_class: PurposeClass = purpose_class
         self.headroom_usd = headroom_usd
+
+
+class BulkAllocationExceeded(LLMError):
+    """A batch reservation (`spend_ledger.reserve_batch`) would take its bulk operation past its allocation
+    (§6.9.3 L1189: `spent_usd + followup_held_usd + Σ worst cases + n x hold > budget_usd`), or the operation
+    is no longer `active`. Checked under the month and bulk row locks, so nothing is written; after the
+    preparation's own sizing under the same locks it never fires (a bug when it does: plan Task 16)."""
+
+    def __init__(self, bulk_operation_id: int, shortfall_usd: Decimal) -> None:
+        super().__init__(
+            f"batch reservation exceeds bulk operation {bulk_operation_id}'s allocation by ${shortfall_usd}"
+        )
+        self.bulk_operation_id = bulk_operation_id
+        self.shortfall_usd = shortfall_usd
+
+
+class ClaimLost(FencedOut):
+    """§17.1 `claim_lost`: the score target's claim predicate (`claim_id`, `attempt_no`, `state =
+    'in_progress'`) failed under the owner lock of a reservation or a dispatch marker (§9.4.3), so nothing is
+    reserved or sent and the attempt ends `claim_lost`. A `FencedOut` of one owner, never the worker's own
+    (`worker_superseded` is false)."""
+
+    def __init__(self) -> None:
+        super().__init__(SCORE_TARGET_OWNER)
 
 
 class LLMNotConfigured(LLMError):

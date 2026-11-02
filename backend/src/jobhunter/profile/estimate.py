@@ -1,9 +1,10 @@
 """The re-score estimate of a profile confirm (spec §12.6 step 2, §6.9.3, §21.4; plan Task 21).
 
-A confirm activates a new tuple, whose targets M3's `create_targets_for_tuple` creates for every retained
-current revision (Deviation 10). Before anything is spent the user sees what that costs:
+A confirm activates a new tuple, whose targets its `create_targets_for_tuple` operation creates for every
+retained current revision (M3 Task 14). Before anything is spent the user sees what that costs:
 
-- `targets`: the current revisions of retained jobs (`dryrun.count_retained_current_revisions`);
+- `targets`: the current revisions of retained jobs (`dryrun.count_retained_current_revisions`), the ones
+  the operation creates targets for (`targets_to_create`, M2 Deviation 42);
 - `est_usd_online = targets x ĉ`, ĉ the §21.2 central cost per target of the active model policy
   (`llm_projection.central_cost_per_target`), the quantity §6.8's `llm_rescore` warning calls `est_usd`;
 - `est_usd_batch = targets x central_batch_cost_per_target`, §21.4's batch path: the generator call in Batches
@@ -15,7 +16,8 @@ current revision (Deviation 10). Before anything is spent the user sees what tha
   (`spend_ledger.read_month_or_new`: a month without a row is shown as a reservation would create it);
 - `bulk_budget_usd = bulk_rescore_max_budget_share x (A x (1 - reserve_frac) - scoring_counted_usd)` (§6.9.3,
   `dryrun.bulk_budget`), with `A` the month row's cap less its buffer (`budget.row_params`, what admission on
-  the row uses): $37.24 at the start of a month with the seeded settings (§21.4).
+  the row uses): $37.24 at the start of a month with the seeded settings (§21.4). The confirm's `bulk.open`
+  fixes the operation's budget with the same function on the locked row.
 
 Every amount is rounded half-up to $0.000001; the unit costs are rounded before they are multiplied, as the
 dry-run's `llm_rescore` warning multiplies ĉ. `estimate_for` is the pure part; `rescore_estimate` reads the

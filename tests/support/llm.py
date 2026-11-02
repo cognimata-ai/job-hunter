@@ -15,6 +15,23 @@ try on it, no database, no network) and `assert_single_call_payload`.
 Task 13 adds `write_synthetic_recording`, the builder of a hand-authored synthetic stream and its sidecars
 (the committed `extract_profile` fixture; Task 20's `propose_queries` one).
 
+M3 Task 4 adds the score side: the score purposes in `GATEWAY_PURPOSES`, synthetic bodies of version 2's
+generator (C-shaped, `generator_wire_body`) and of the critic (`critic_body`) with their streams
+(`synthetic_generator_sse`, `synthetic_critic_sse`), the internal draft (`generator_draft_body`), a synthetic
+confirmed profile (`score_profile`), and the two shipped prompt-schema versions built offline (`v1_version`,
+`v2_version`).
+
+M3 Task 7 adds the score spend owners: `new_target_owner` (a claimed target and its running attempt, built on
+`tests.support.m3.insert_claimed`) with the `target_owner` fixture, `new_submission_owner` (a batch submission
+of `in_batch` targets with their batch attempts and items) with the `submission_owner` fixture, `scoring_kw`
+naming the owner's real target and attempt, `batch_kw` (one batch item's reservation), `attempt_and_target`
+(the attempt and target counters) and `reclaim_target` (the claim's reclaim and a new claim).
+
+M3 Task 8 adds the keyed answers and the batch side: `FakeLLM.answer` (a stream for one job revision's key,
+by default a valid C draft), `FakeAnthropic.batches` (the batch script) and `synthetic_message_json` (a
+non-streamed message, the shape of a batch item's `succeeded` result); `tests/support/batches.py` holds the
+batch script builders.
+
 Every row these helpers write holds ids, hashes and amounts only, never prompt or CV text.
 """
 
@@ -22,7 +39,7 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -38,6 +55,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig, load_config
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import transition
 from jobhunter.llm import fake
 from jobhunter.llm.budget import BudgetParams, BudgetRow, month_of
 from jobhunter.llm.cache_monitor import CacheMonitor
@@ -47,16 +65,24 @@ from jobhunter.llm.gateway import (
     NodeConfig,
     RenderedPrompt,
     SystemBlock,
+    WireSchema,
     _chat,
     to_messages,
 )
 from jobhunter.llm.pricing import MODELS, Usage
-from jobhunter.llm.schemas import transformed
+from jobhunter.llm.prompts.render import PromptVersion, prompt_schema_hash, prompt_schema_v1, prompt_schema_v2
+from jobhunter.llm.schemas import ParserFamily
+from jobhunter.llm.schemas.critic import CriticOut
+from jobhunter.llm.schemas.generator import GeneratorWire
+from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.llm.spend_ledger import (
+    BatchState,
+    BatchSubmissionOwner,
     CallOutcome,
     EvalRunOwner,
     OperationOwner,
     SpendOwner,
+    TargetAttemptOwner,
     change_cap,
     ensure_month,
 )
@@ -65,10 +91,21 @@ from jobhunter.types import JSONValue, get_object
 from jobhunter.worker import operations as ops
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, SecretStr
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from tests.support.m2 import insert_eval_run
+from tests.support.m2 import insert_eval_run, insert_profile_chain
+from tests.support.m3 import (
+    NOW,
+    insert_attempt,
+    insert_batch_item,
+    insert_bulk_operation,
+    insert_claimed,
+    insert_job,
+    insert_submission,
+    insert_target,
+)
 from tests.support.pg import PgServer, pg_one
+from tests.support.quota import seeded_payload
 
 _ACTIVE_EXECUTION_CONFIG: Final = "SELECT execution_config_id FROM active_config WHERE id = 1"
 _MONTH: Final = q(
@@ -103,6 +140,13 @@ def _seeded_execution_config(server: PgServer) -> int:
         assert row is not None
         _execution_config_id = int(str(row[0]))
     return _execution_config_id
+
+
+async def _read_execution_config(conn: AsyncConnection) -> None:
+    """`_seeded_execution_config` for the owner helpers that hold an engine, not a server."""
+    global _execution_config_id
+    if _execution_config_id is None:
+        _execution_config_id = int((await conn.execute(sa.text(_ACTIVE_EXECUTION_CONFIG))).scalar_one())
 
 
 async def new_operation_owner(
@@ -199,19 +243,239 @@ def reserve_kw(
 
 
 def scoring_kw(
-    owner: SpendOwner, *, now: datetime, bound: int, max_tokens: int, **overrides: Any
+    owner: SpendOwner,
+    *,
+    now: datetime,
+    bound: int,
+    max_tokens: int,
+    target_id: int | None = None,
+    attempt_id: int | None = None,
+    **overrides: Any,
 ) -> dict[str, Any]:
-    """`reserve_kw` for a scoring `generate` call. M2 has no score attempts, so the attempt and target ids
-    are made up (their FKs are M3's, plan Deviation 1): only the arithmetic of the scoring class is tested."""
+    """`reserve_kw` for a scoring `generate` call (600 s) of attempt `attempt_id` of target `target_id`, which
+    a `TargetAttemptOwner` names itself. Migration 0008 closed the two foreign keys M2 staged
+    (`llm_calls.attempt_id` and `llm_calls.target_id`), so both name real rows: `new_target_owner` makes an
+    owner over a pair, `tests.support.m3.insert_claimed` a pair for another owner."""
+    if isinstance(owner, TargetAttemptOwner):
+        target_id = owner.target_id if target_id is None else target_id
+        attempt_id = owner.attempt_id if attempt_id is None else attempt_id
+    if target_id is None or attempt_id is None:
+        raise ValueError("a scoring call names its real target and attempt")
     values: dict[str, Any] = {
         "purpose": "generate",
         "purpose_class": "scoring",
         "deadline_s": 600,
-        "attempt_id": 1,
-        "target_id": 1,
+        "attempt_id": attempt_id,
+        "target_id": target_id,
         **overrides,
     }
     return reserve_kw(owner, now=now, bound=bound, max_tokens=max_tokens, **values)
+
+
+@dataclass(frozen=True)
+class BatchItemRef:
+    """One item of a test batch submission: its `in_batch` target, the target's batch attempt and the
+    `batch_items` row."""
+
+    target_id: int
+    attempt_id: int
+    item_id: int
+
+
+@dataclass(frozen=True)
+class BatchSubmission:
+    """A test batch submission as its spend owner (`owner`, expecting the state it was made in), the tuple and
+    bulk operation it belongs to, and its items."""
+
+    owner: BatchSubmissionOwner
+    llm_tuple_id: int
+    bulk_operation_id: int
+    items: tuple[BatchItemRef, ...]
+
+
+def batch_kw(
+    sub: BatchSubmission,
+    item: BatchItemRef,
+    *,
+    now: datetime,
+    bound: int,
+    max_tokens: int = 6000,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """`scoring_kw` for `item`'s generator request of `sub` (§10.10): on `claude-sonnet-5-5`, `transport =
+    'batch'`, its single submission attempt (`transport_try` 1), no logical call number and no deadline,
+    naming the item and the submission's bulk operation."""
+    values: dict[str, Any] = {
+        "model": "claude-sonnet-5-5",
+        "transport": "batch",
+        "logical_call_no": None,
+        "deadline_s": None,
+        "batch_item_id": item.item_id,
+        "bulk_operation_id": sub.bulk_operation_id,
+        **overrides,
+    }
+    return scoring_kw(
+        sub.owner,
+        now=now,
+        bound=bound,
+        max_tokens=max_tokens,
+        target_id=item.target_id,
+        attempt_id=item.attempt_id,
+        **values,
+    )
+
+
+# A test chain's tuple, made by `insert_profile_chain` (its rubric version is `test-<n>`).
+_TEST_TUPLE: Final = q(
+    "SELECT t.id FROM llm_tuples t JOIN rubric_versions r ON r.id = t.rubric_version_id "
+    "WHERE r.version LIKE 'test-%' ORDER BY t.id LIMIT 1"
+)
+_SCORE_CHAIN: Final = 70  # the chain number `score_tuple` creates; a test's own chains count from 1
+
+
+async def score_tuple(conn: AsyncConnection) -> int:
+    """The tuple the score owners belong to: the first test chain's, else a new one (chain 70)."""
+    found = (await conn.execute(_TEST_TUPLE)).scalar_one_or_none()
+    if found is not None:
+        return int(found)
+    return (await insert_profile_chain(conn, _SCORE_CHAIN)).llm_tuple_id
+
+
+async def new_target_owner(
+    engine: AsyncEngine, *, llm_tuple_id: int | None = None, attempt_no: int = 1, **target_columns: object
+) -> TargetAttemptOwner:
+    """A claimed (`in_progress`) target of a new job and its `running` attempt `attempt_no`, as a spend owner
+    (§3.3.3 score-attempt predicate); `target_columns` add to the target's columns (`bulk_operation_id`)."""
+    async with engine.begin() as conn:
+        await _read_execution_config(conn)
+        tuple_id = await score_tuple(conn) if llm_tuple_id is None else llm_tuple_id
+        claimed = await insert_claimed(conn, tuple_id, attempt_no=attempt_no, **target_columns)
+    return TargetAttemptOwner(
+        target_id=claimed.target_id,
+        claim_id=claimed.claim_id,
+        attempt_no=claimed.attempt_no,
+        attempt_id=claimed.attempt_id,
+    )
+
+
+@pytest.fixture
+async def target_owner(engine: AsyncEngine, clean_db: None, migrated: PgServer) -> TargetAttemptOwner:
+    """The spend owner of a claimed target's running attempt."""
+    _seeded_execution_config(migrated)
+    return await new_target_owner(engine)
+
+
+# The columns the `batch_submissions` CHECKs require of a submission in each state.
+_SUBMISSION_COLUMNS: Final[Mapping[str, Mapping[str, object]]] = {
+    "preparing": {},
+    "abandoned": {},
+    "submit_started": {"submit_started_at": NOW},
+    "submit_rejected": {"submit_started_at": NOW},
+    "submit_ambiguous": {"submit_started_at": NOW},
+    "submitted": {"submit_started_at": NOW, "provider_batch_id": "msgbatch_test"},
+    "ended": {"submit_started_at": NOW, "provider_batch_id": "msgbatch_test", "ended_at": NOW},
+    "released": {"submit_started_at": NOW, "released_at": NOW},
+    "reconciled": {
+        "submit_started_at": NOW,
+        "provider_batch_id": "msgbatch_test",
+        "results_complete_at": NOW,
+        "reconciled_at": NOW,
+    },
+}
+
+
+async def new_submission_owner(
+    engine: AsyncEngine,
+    *,
+    items: int = 1,
+    state: BatchState = "preparing",
+    bulk_operation_id: int | None = None,
+    budget_usd: Decimal = Decimal(5),
+) -> BatchSubmission:
+    """A batch submission in `state` of `items` `in_batch` targets (new jobs of the score tuple), each with
+    its `running` batch attempt 1 and its `awaiting` item, in a new active bulk operation of `budget_usd`
+    unless `bulk_operation_id` names one; its owner expects `state`. One submission at most is in flight
+    (`batch_one_in_flight`) and one bulk operation active (`bulk_operations_one_active`)."""
+    async with engine.begin() as conn:
+        await _read_execution_config(conn)
+        tuple_id = await score_tuple(conn)
+        bulk = (
+            await insert_bulk_operation(conn, tuple_id, budget_usd=budget_usd)
+            if bulk_operation_id is None
+            else bulk_operation_id
+        )
+        submission = await insert_submission(
+            conn, tuple_id, bulk, state=state, request_count=items, **_SUBMISSION_COLUMNS[state]
+        )
+        refs: list[BatchItemRef] = []
+        for _ in range(items):
+            target = await insert_target(
+                conn,
+                await insert_job(conn),
+                tuple_id,
+                state="in_batch",
+                batch_submission_id=submission,
+                attempt_no=1,
+                lane="batch",
+                bulk_operation_id=bulk,
+            )
+            attempt = await insert_attempt(conn, target, mode="batch", lane="batch")
+            refs.append(BatchItemRef(target, attempt, await insert_batch_item(conn, submission, target)))
+    return BatchSubmission(BatchSubmissionOwner(submission, state), tuple_id, bulk, tuple(refs))
+
+
+@pytest.fixture
+async def submission_owner(engine: AsyncEngine, clean_db: None, migrated: PgServer) -> BatchSubmission:
+    """A `preparing` batch submission of two items, owned while it is `preparing`."""
+    _seeded_execution_config(migrated)
+    return await new_submission_owner(engine, items=2)
+
+
+_ATTEMPT: Final = q(
+    "SELECT logical_calls, http_calls, charged, cost_usd, outcome FROM score_attempts WHERE id = :a"
+)
+_TARGET: Final = q("SELECT charged_attempts, state, attempt_no FROM score_targets WHERE id = :t")
+
+
+async def attempt_and_target(
+    engine: AsyncEngine, owner: TargetAttemptOwner | BatchItemRef
+) -> tuple[Any, Any]:
+    """The counters of the owner's attempt (`logical_calls`, `http_calls`, `charged`, `cost_usd`, `outcome`)
+    and of its target (`charged_attempts`, `state`, `attempt_no`)."""
+    async with engine.connect() as conn:
+        attempt = (await conn.execute(_ATTEMPT, {"a": owner.attempt_id})).one()
+        target = (await conn.execute(_TARGET, {"t": owner.target_id})).one()
+    return attempt, target
+
+
+async def reclaim_target(engine: AsyncEngine, owner: TargetAttemptOwner) -> TargetAttemptOwner:
+    """A reclaim of `owner`'s claim (§9.4.3: the target back to `pending`, the attempt `claim_lost`), then
+    a new claim of the target with a new `claim_id` and the next attempt; returns the new owner."""
+    async with engine.begin() as conn:
+        await transition(conn, "score_targets", owner.target_id, ["in_progress"], "pending")
+        await transition(
+            conn, "score_attempts", owner.attempt_id, ["running"], "claim_lost", reason="stale_heartbeat"
+        )
+        claim = uuid.uuid4()
+        attempt_no = owner.attempt_no + 1
+        await transition(
+            conn,
+            "score_targets",
+            owner.target_id,
+            ["pending"],
+            "in_progress",
+            set_={
+                "claim_id": claim,
+                "claim_epoch": 1,
+                "claimed_at": NOW,
+                "claim_heartbeat_at": NOW,
+                "attempt_no": attempt_no,
+            },
+        )
+        attempt = await insert_attempt(
+            conn, owner.target_id, attempt_no=attempt_no, claim_id=claim, claim_epoch=1, lane="similarity"
+        )
+    return TargetAttemptOwner(owner.target_id, claim, attempt_no, attempt)
 
 
 def completed_call(**overrides: Any) -> CallOutcome:
@@ -381,6 +645,11 @@ class FakeAnthropic:
     def scenario(self, *names: fake.Scenario) -> None:
         fake.scenario(*names)
 
+    def batches(self, script: fake.BatchScript) -> dict[str, fake.StoredBatch]:
+        """Register `script` as the test's batch script (`fake.batches`) and return the batches the fake
+        stores (the live mapping, by batch id)."""
+        return fake.batches(script).batches
+
     def count_tokens(self, result: int | Literal["error"]) -> None:
         fake.count_tokens(result)
 
@@ -479,6 +748,37 @@ def synthetic_sse(
         fake.SSEEvent("message_stop", {"type": "message_stop"}),
     ]
     return fake.render_sse(events)
+
+
+def synthetic_message_json(
+    body: Any,
+    *,
+    model: str,
+    stop_reason: str = "end_turn",
+    usage: dict[str, int] | None = None,
+    stop_details: dict[str, Any] | None = None,
+    message_id: str = "msg_0123456789synthetic",
+) -> dict[str, Any]:
+    """A non-streamed Messages answer whose text is `body` (a JSON value, a string sent as it is, or `None`
+    for no content, a refusal's), as a batch item's `succeeded` result carries it (M3 Task 8): one text
+    block, the stop reason and `stop_details`, and `usage` with the four token counts of `synthetic_sse`'s
+    defaults updated by `usage`. No thinking block. Every value is synthetic."""
+    content: list[dict[str, Any]] = []
+    if body is not None:
+        text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+        content = [{"type": "text", "text": text}]
+    return {
+        "model": model,
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "container": None,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "stop_details": stop_details,
+        "usage": {**_SYNTHETIC_USAGE, **(usage or {})},
+    }
 
 
 # The one response header a hand-authored stream keeps: the fixture PII gate allows it, the fake serves it.
@@ -653,7 +953,14 @@ class GatewayOut(BaseModel):
 
 GATEWAY_BODY: Final[dict[str, JSONValue]] = {"answer": "a synthetic answer", "score": 3}
 # The purposes the `fake_llm` fixture records `GatewayOut` for, on every model.
-GATEWAY_PURPOSES: Final = ("extract_profile", "propose_queries", "schema_dry_run")
+GATEWAY_PURPOSES: Final = (
+    "extract_profile",
+    "propose_queries",
+    "schema_dry_run",
+    "generate",
+    "revise",
+    "critic",
+)
 # A non-scoring node of an operation: `extract_profile`'s purpose with small stages and its 900 s deadline.
 GATEWAY_NODE: Final = NodeConfig(
     purpose="extract_profile",
@@ -662,7 +969,7 @@ GATEWAY_NODE: Final = NodeConfig(
     max_tokens=1000,
     max_tokens_retry=2000,
     deadline_s=900,
-    schema=GatewayOut,
+    schema=WireSchema.from_model(GatewayOut),
 )
 
 
@@ -704,14 +1011,43 @@ class FakeLLM(FakeAnthropic):
         model: str,
         body: Any = GATEWAY_BODY,
         *,
-        schema: type[BaseModel] = GatewayOut,
+        schema: type[BaseModel] | Mapping[str, Any] = GatewayOut,
         **sse: Any,
     ) -> Path:
-        """Write the stream the fake serves for `(purpose, model, schema)`: `synthetic_sse(body, **sse)`."""
-        path = fake.recording_path(self.root, purpose, model, anthropic.transform_schema(schema))
+        """Write the stream the fake serves for `(purpose, model, schema)`: `synthetic_sse(body, **sse)`.
+        `schema` is a mirror (its `WireSchema.from_model` wire schema) or a stored wire schema."""
+        sent = WireSchema.from_model(schema).json if isinstance(schema, type) else schema
+        path = fake.recording_path(self.root, purpose, model, sent)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(synthetic_sse(body, model=model, **sse))
         return path
+
+    def answer(
+        self,
+        purpose: str,
+        job_revision_id: int,
+        body: Any = None,
+        *,
+        round: int = 0,
+        schema: type[BaseModel] = GeneratorWire,
+        model: str | None = None,
+        consume: bool = False,
+        **sse: Any,
+    ) -> str:
+        """Register `synthetic_sse(body, model=model, **sse)` for the key of `purpose`, `job_revision_id` and
+        `round` (`fake.answer_key`, as the gateway sends it in fake mode) and return the key, so each target
+        of a test gets its own answer. Without a `body`, the valid synthetic body of `schema`: a C draft
+        (`generator_wire_body`) for `GeneratorWire`, the critic's (`critic_body`) for `CriticOut`. `model`
+        is the served model, by default the seeded policy's model of `purpose`. `consume` makes it a one-shot
+        answer (`fake.answer`)."""
+        key = fake.answer_key(purpose, {"job_revision_id": job_revision_id}, round)
+        if body is None:
+            if schema not in _DEFAULT_BODIES:
+                raise ValueError(f"no default body for {schema.__name__}: pass a body")
+            body = _DEFAULT_BODIES[schema]()
+        served = model if model is not None else _policy_model(purpose)
+        fake.answer(key, synthetic_sse(body, model=served, **sse), consume=consume)
+        return key
 
     def gateway(
         self,
@@ -779,10 +1115,16 @@ def call_context(owner: SpendOwner, execution_config_id: int, **overrides: Any) 
     return CallContext(**values)
 
 
+# The kind of `create_llm_call_operation`'s operation: one no handler of this milestone registers (`export` is
+# M5's), so the test's handler never meets a real one (M3 Task 19, B R8: `eval_run` is the eval runner's).
+LLM_CALL_KIND: Final = "export"
+
+
 async def create_llm_call_operation(engine: AsyncEngine) -> int:
-    """A `pending` operation of kind `eval_run` whose handler, registered for this test only (the `fake_llm`
-    fixture removes it), makes one gateway call of `GATEWAY_NODE` as the operation's spend owner. The handler
-    closes over its gateway and uses nothing of the operation context but the claim (no `deps`)."""
+    """A `pending` operation of kind `LLM_CALL_KIND` (`export`) whose handler, registered for this test only
+    (the `fake_llm` fixture removes it), makes one gateway call of `GATEWAY_NODE` as the operation's spend
+    owner. The handler closes over its gateway and uses nothing of the operation context but the claim (no
+    `deps`)."""
     if not _active_fake:
         raise RuntimeError("create_llm_call_operation needs the fake_llm fixture")
     fake_llm = _active_fake[-1]
@@ -793,12 +1135,12 @@ async def create_llm_call_operation(engine: AsyncEngine) -> int:
         owner = OperationOwner(ctx.claim)
         await gateway.call(GATEWAY_NODE, gateway_prompt(), call_context(owner, execution_config_id))
 
-    if ops.HANDLERS.get("eval_run", handler) is not handler:
-        raise RuntimeError("another eval_run handler is registered")
-    ops.HANDLERS["eval_run"] = fake_llm.handlers["eval_run"] = handler
+    if ops.HANDLERS.get(LLM_CALL_KIND, handler) is not handler:
+        raise RuntimeError(f"another {LLM_CALL_KIND} handler is registered")
+    ops.HANDLERS[LLM_CALL_KIND] = fake_llm.handlers[LLM_CALL_KIND] = handler
     async with engine.begin() as conn:
         op_id, _ = await ops.create_operation(
-            conn, kind="eval_run", payload={}, dedup_key=f"llm-call:{uuid.uuid4()}", defer=None
+            conn, kind=LLM_CALL_KIND, payload={}, dedup_key=f"llm-call:{uuid.uuid4()}", defer=None
         )
     return op_id
 
@@ -913,22 +1255,23 @@ async def capture_request(
     cfg: AppConfig, node: NodeConfig, prompt: RenderedPrompt, answer: Any
 ) -> CapturedRequest:
     """The request one `gateway._chat` try sends for `node` (its model, effort, first `max_tokens` stage and
-    schema) with `prompt`, on a capturing transport that answers with `answer` as the structured output. The
-    answer must parse as `node.schema`, so the whole try ran. No database and no network: the `payload` CI
-    job has neither."""
+    wire schema) with `prompt`, on a capturing transport that answers with `answer` as the structured output.
+    The answer must validate as the node's mirror (`node.schema.model`), as the gateway checks it, so the
+    whole try ran. No database and no network: the `payload` CI job has neither."""
     transport = CapturingTransport(synthetic_sse(answer, model=node.model))
     async with make_http_client(cfg, mount=transport) as client:
         runnable = _chat(
             node.model,
             node.effort,
             node.max_tokens,
-            node.schema,
+            node.schema.json,
             api_key=PAYLOAD_KEY,
             http_client=client,
             purpose=node.purpose,
         )
         out = await runnable.ainvoke(to_messages(prompt))
-    assert out["parsing_error"] is None and isinstance(out["parsed"], node.schema)
+    assert out["parsing_error"] is None
+    node.schema.model.model_validate(out["parsed"])
     (request,) = transport.requests
     return request
 
@@ -955,7 +1298,7 @@ def assert_single_call_payload(
     execution: dict[str, JSONValue],
 ) -> None:
     """The §10.9 assertions for a single (uncached) call of `node`, against the stored policy and execution
-    config it was configured from: the API host, the json_schema output format with exactly the transformed
+    config it was configured from: the API host, the json_schema output format with exactly the node's wire
     schema, the policy's model and effort, the execution config's first `max_tokens` stage, `stream`, none
     of the banned keys, a user turn last, and no `cache_control` anywhere (§10.6: a single call)."""
     policy_node = get_object(model_policy, f"nodes.{node.purpose}")
@@ -970,7 +1313,7 @@ def assert_single_call_payload(
     assert "anthropic-beta" not in request.headers  # no betas (G6)
     body = request.body
     assert body["model"] == policy_node["model"] == node.model
-    assert body["output_config"]["format"] == {"type": "json_schema", "schema": transformed(node.schema)}
+    assert body["output_config"]["format"] == {"type": "json_schema", "schema": dict(node.schema.json)}
     assert body["output_config"]["effort"] == policy_node["effort"]
     assert body["max_tokens"] == stages["max_tokens"]
     assert body["stream"] is True
@@ -979,3 +1322,221 @@ def assert_single_call_payload(
     assert body["messages"] and body["messages"][-1]["role"] == "user"
     assert {message["role"] for message in body["messages"]} == {"user"}  # never an assistant prefill
     assert cache_control_paths(body) == []
+
+
+# --- M3 Task 4: the score side -----------------------------------------------------------------------------
+
+_CRITERIA: Final = (
+    "role_fit",
+    "skills",
+    "experience_seniority",
+    "domain",
+    "languages",
+    "education_certifications",
+)
+
+
+def generator_wire_body() -> dict[str, Any]:
+    """A synthetic generator answer of prompt-schema version 2 (candidate C): a few facts, each criterion
+    once."""
+
+    def fact(
+        code: str, value: str, quote: str, *, qualifier: str = "", required: bool = False
+    ) -> dict[str, Any]:
+        return {
+            "code": code,
+            "value": value,
+            "qualifier": qualifier,
+            "required": required,
+            "evidence": [quote],
+        }
+
+    criterion = {
+        "level": 3,
+        "basis": "observed",
+        "ad_evidence": ["Services in Python und PostgreSQL"],
+        "profile_evidence": [{"section": "skills", "quote": "Python"}],
+        "rationale": "Die geforderten Kernkenntnisse sind belegt.",
+    }
+    return {
+        "not_a_job_ad": False,
+        "injection_observed": False,
+        "facts": [
+            fact("work_mode", "hybrid", "hybrid (structured)"),
+            fact("required_language", "de", "sehr gute Deutschkenntnisse", qualifier="B2", required=True),
+            fact("must_have", "Python", "Services in Python"),
+            fact("employment_type", "full_time", "full_time (structured)"),
+        ],
+        "criteria": [{"criterion": key, **criterion} for key in _CRITERIA],
+        "summary_en": "A good fit for the backend role.",
+        "summary_de": "Eine gute Passung für die Backend-Rolle.",
+    }
+
+
+def critic_body() -> dict[str, Any]:
+    """A synthetic critic answer (§11.7.3): one criterion dispute with its quote."""
+    return {
+        "verdict": "revise",
+        "reviews": [
+            {
+                "target": "languages",
+                "assessment": "level_too_high",
+                "suggested_level": 2,
+                "ad_evidence": ["sehr gute Deutschkenntnisse"],
+                "explanation": "The German requirement is not fully evidenced.",
+            }
+        ],
+        "injection": "none",
+        "summary": "One dispute on the languages criterion.",
+    }
+
+
+def synthetic_generator_sse(body: Any = None, *, model: str, **sse: Any) -> bytes:
+    """A C-shaped generator stream (`generator_wire_body` unless `body` is given), as `synthetic_sse`."""
+    return synthetic_sse(generator_wire_body() if body is None else body, model=model, **sse)
+
+
+def synthetic_critic_sse(body: Any = None, *, model: str, **sse: Any) -> bytes:
+    """A critic-shaped stream (`critic_body` unless `body` is given), as `synthetic_sse`."""
+    return synthetic_sse(critic_body() if body is None else body, model=model, **sse)
+
+
+# The valid synthetic body of a mirror, `FakeLLM.answer`'s default (M3 Task 8).
+_DEFAULT_BODIES: Final[Mapping[type[BaseModel], Callable[[], dict[str, Any]]]] = {
+    GeneratorWire: generator_wire_body,
+    CriticOut: critic_body,
+}
+
+
+def _policy_model(purpose: str) -> str:
+    """The model the seeded model policy (`settings_v1.json`) gives `purpose`'s node."""
+    nodes = seeded_payload()["scoring"]["model_policy"]["nodes"]
+    if purpose not in nodes:
+        raise ValueError(f"the seeded policy has no node {purpose!r}: pass a model")
+    return str(nodes[purpose]["model"])
+
+
+def generator_draft_body(*, not_a_job_ad: bool = False) -> dict[str, Any]:
+    """A synthetic internal draft (`GeneratorDraft`, v1's shape) in which every kind of binding fact is
+    asserted: on-site only, two mandatory languages and a preferred one, a mandatory degree and certification,
+    a required clearance and work permit."""
+    quoted: dict[str, Any] = {"evidence": ["Python und PostgreSQL"]}
+    criterion = {
+        "level": 3,
+        "basis": "observed",
+        "ad_evidence": ["Python und PostgreSQL"],
+        "profile_evidence": [{"section": "skills", "quote": "Python"}],
+        "rationale": "Die Kernkenntnisse sind belegt.",
+    }
+
+    def language(code: str, level: str, *, mandatory: bool, other: str | None = None) -> dict[str, Any]:
+        return {"language": code, "language_other": other, "level": level, "mandatory": mandatory, **quoted}
+
+    return {
+        "not_a_job_ad": not_a_job_ad,
+        "injection_observed": False,
+        "job_facts": {
+            "work_mode": {"value": "hybrid", **quoted},
+            "onsite_only": {"asserted": True, **quoted},
+            "remote_region": {"value": "unspecified", "countries": [], **quoted},
+            "required_languages": [
+                language("de", "B2", mandatory=True),
+                language("en", "B1", mandatory=False),
+                language("other", "A2", mandatory=True, other="Dänisch"),
+            ],
+            "must_haves": [{"text": "Python", **quoted}],
+            "nice_to_haves": [],
+            "seniority": {"value": "senior", **quoted},
+            "min_years_experience": {"value": 4, **quoted},
+            "industry": {"value": "Logistik", **quoted},
+            "employment_types": {"values": ["full_time"], **quoted},
+            "degree": {
+                "level": "bachelor",
+                "mandatory": True,
+                "or_equivalent": False,
+                "field": "Informatik",
+                **quoted,
+            },
+            "certifications": [{"name": "AWS Solutions Architect", "mandatory": True, **quoted}],
+            "security_clearance": {"required": True, "level": "Ü1", **quoted},
+            "work_permit": {"required": True, **quoted},
+        },
+        "criteria": {key: criterion for key in _CRITERIA},
+        "summary_en": "A good fit.",
+        "summary_de": "Eine gute Passung.",
+    }
+
+
+def score_profile() -> ConfirmedProfile:
+    """A synthetic confirmed profile (an invented candidate) with a user-entered block."""
+    return ConfirmedProfile.model_validate(
+        {
+            "summary": "Backend-Entwickler mit sechs Jahren Erfahrung in Python und PostgreSQL.",
+            "target_titles": [
+                {"title": "Backend Engineer", "lang": "en"},
+                {"title": "Backend-Entwickler", "lang": "de"},
+            ],
+            "seniority": "senior",
+            "total_years_experience": 6,
+            "roles": [
+                {
+                    "title": "Backend Engineer",
+                    "employer": "Beispiel Logistik GmbH",
+                    "start": "2019-03-01",
+                    "end": "present",
+                    "seniority": "senior",
+                    "domain": "Logistik",
+                    "highlights": ["Sendungsverfolgung mit Python und PostgreSQL entwickelt"],
+                }
+            ],
+            "skills": [
+                {
+                    "name": "Python",
+                    "category": "programming_language",
+                    "level": "expert",
+                    "years": 6,
+                    "evidence": "Python",
+                },
+                {
+                    "name": "PostgreSQL",
+                    "category": "tool",
+                    "level": "advanced",
+                    "years": 5,
+                    "evidence": "PostgreSQL",
+                },
+            ],
+            "languages": [
+                {"code": "de", "code_other": None, "cefr": "native", "evidence": "Deutsch (Muttersprache)"},
+                {"code": "en", "code_other": None, "cefr": "C1", "evidence": "Englisch (C1)"},
+            ],
+            "education": [{"level": "bachelor", "field": "Informatik", "institution": None, "year": 2016}],
+            "certifications": [],
+            "domains": ["Logistik"],
+            "user_entered": {"work_authorization_de": "authorized", "security_clearances": []},
+        }
+    )
+
+
+def _packaged_version(
+    version_id: int,
+    content: tuple[dict[str, JSONValue], dict[str, JSONValue]],
+    family: ParserFamily,
+) -> PromptVersion:
+    templates, schemas = content
+    return PromptVersion(
+        id=version_id,
+        prompt_schema_hash=prompt_schema_hash(templates, schemas),
+        templates={name: str(text) for name, text in templates.items()},
+        schemas=schemas,
+        parser_family=family,
+    )
+
+
+def v2_version(version_id: int = 2) -> PromptVersion:
+    """Prompt-schema version 2 as the seed stores it, built offline under the id `version_id`."""
+    return _packaged_version(version_id, prompt_schema_v2(), "generator_v2_items")
+
+
+def v1_version(version_id: int = 1) -> PromptVersion:
+    """Prompt-schema version 1 as the M2 seed stored it, built offline under the id `version_id`."""
+    return _packaged_version(version_id, prompt_schema_v1(), "generator_v1")

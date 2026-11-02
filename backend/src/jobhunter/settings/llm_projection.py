@@ -152,21 +152,27 @@ class TargetCost:
     repairs: Decimal
 
 
+def funnel(model_policy: ModelPolicy) -> Funnel:
+    """The §21.1 critic funnel of `model_policy`: the weak generator's (§21.2, config C) for a Haiku
+    generator, else the default one."""
+    return WEAK_GENERATOR_FUNNEL if model_policy.nodes.generate.model in WEAK_GENERATORS else DEFAULT_FUNNEL
+
+
 def target_cost(model_policy: ModelPolicy) -> TargetCost:
     """The parts of `central_cost_per_target` under `model_policy`, each online (the cached prefix read)."""
     nodes = model_policy.nodes
-    funnel = WEAK_GENERATOR_FUNNEL if nodes.generate.model in WEAK_GENERATORS else DEFAULT_FUNNEL
+    funnel_ = funnel(model_policy)
     generator = _call_usd(nodes.generate.model, GENERATE)
     full_critic = _call_usd(nodes.critic.model, _critic_tokens(nodes.critic.effort))
     light_critic = _call_usd(nodes.critic.model, _critic_tokens(model_policy.critic_light_effort))
     revision = _call_usd(nodes.revise.model, REVISE)
-    follow_ups = funnel.q1 + funnel.q1 * funnel.q2  # revisions per reviewed draft, each re-reviewed
-    first_round = funnel.light_share * light_critic + (1 - funnel.light_share) * full_critic
+    follow_ups = funnel_.q1 + funnel_.q1 * funnel_.q2  # revisions per reviewed draft, each re-reviewed
+    first_round = funnel_.light_share * light_critic + (1 - funnel_.light_share) * full_critic
     return TargetCost(
         generator=generator,
-        critic=funnel.first_round_rate * (first_round + follow_ups * full_critic),
-        revise=funnel.first_round_rate * follow_ups * revision,
-        repairs=funnel.repairs * generator,
+        critic=funnel_.first_round_rate * (first_round + follow_ups * full_critic),
+        revise=funnel_.first_round_rate * follow_ups * revision,
+        repairs=funnel_.repairs * generator,
     )
 
 

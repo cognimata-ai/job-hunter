@@ -10,6 +10,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, star
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
+from jobhunter.db.transitions import TRANSITIONS
 
 REGISTRY = CollectorRegistry()
 
@@ -119,6 +120,42 @@ LLM_CACHE_READ_RATIO = Gauge(
     "jobhunter_llm_cache_read_ratio",
     "Share of prompt tokens read from the cache over a rolling hour, by model, effort and role.",
     ["model", "effort", "role"],
+    registry=REGISTRY,
+)
+
+# Every critic review whose returned verdict is not its derived outcome (§11.7.2 L4429): the `critic` node of
+# the score subgraph counts one after the note's transaction has committed (M3 Task 9; Task 18 pins it).
+CRITIC_VERDICT_MISMATCH = Counter(
+    "jobhunter_critic_verdict_mismatch",
+    "Critic reviews whose returned verdict differs from the derived outcome.",
+    registry=REGISTRY,
+)
+
+# The score lane (§17.5 L5538-5539, M3 Task 18). `metrics_refresh` (heavy) sets the three gauges through the
+# refresh `scoring.reconcilers` registers: the active tuple's `critic_rate_7d` under the active evaluation
+# policy (NaN while fewer than 50 attempts make it), its targets in each state of `SCORE_TARGET_STATES` (0
+# included) and the age of its oldest `pending` target by `created_at` (0 with none). Every reclaim of a claim
+# counts once its transaction has committed (Ruling T18-a: `scoring.cycles.count_reclaims`, called by the
+# takeover sweeps, `orphaned_cycles`, a failed cycle's end and `stuck_targets`).
+SCORE_TARGET_STATES: Final = tuple(
+    sorted({state for edge in TRANSITIONS["score_targets"].allowed for state in edge})
+)
+CRITIC_RATE_7D = Gauge(
+    "jobhunter_critic_rate_7d",
+    "First-round critic calls per charged score attempt over the trailing 7 days (NaN below 50 attempts).",
+    registry=REGISTRY,
+)
+SCORE_TARGETS = Gauge(
+    "jobhunter_score_targets", "Score targets of the active tuple by state.", ["state"], registry=REGISTRY
+)
+OLDEST_PENDING_TARGET_AGE = Gauge(
+    "jobhunter_oldest_pending_target_age_seconds",
+    "Age of the oldest pending score target of the active tuple, in seconds.",
+    registry=REGISTRY,
+)
+CLAIM_RECLAIMS = Counter(
+    "jobhunter_claim_reclaims",
+    "Score target claims reclaimed: a stale heartbeat, a worker takeover, an orphaned or a failed cycle.",
     registry=REGISTRY,
 )
 

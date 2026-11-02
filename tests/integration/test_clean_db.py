@@ -1,16 +1,39 @@
+from decimal import Decimal
+
 import psycopg
 import pytest
 import sqlalchemy as sa
 from jobhunter.db.sql import LOCK_NOT_AVAILABLE
+from sqlalchemy.ext.asyncio import AsyncConnection
 
-from tests.support.fixtures import reset_database
+from tests.support.fixtures import TRUNCATED_TABLES, reset_database
 from tests.support.m2 import (
+    ProfileChain,
     digest,
+    insert_embedding,
     insert_eval_run,
     insert_llm_call,
     insert_profile_chain,
     insert_proposal,
     insert_vector,
+)
+from tests.support.m3 import (
+    NOW,
+    active_ids,
+    insert_attempt,
+    insert_batch_item,
+    insert_bulk_operation,
+    insert_cycle,
+    insert_det_result,
+    insert_golden_case,
+    insert_group,
+    insert_id,
+    insert_job,
+    insert_published,
+    insert_row,
+    insert_scoring_call,
+    insert_submission,
+    insert_target,
 )
 from tests.support.pg import MANUAL_RUN_SQL, pg_one, pg_rows
 
@@ -104,11 +127,159 @@ TEST_ROWS = (
     "SELECT (SELECT count(*) FROM rubric_versions WHERE content_hash = %s), "
     "(SELECT count(*) FROM prompt_schema_versions WHERE prompt_schema_hash = %s)"
 )
+SHIPPED_RUBRICS = "SELECT version FROM rubric_versions ORDER BY version"
+
+
+# The M3 tables, and the M1 tables `_M3_DELETE` empties because a TRUNCATE of them would cascade into them.
+M3_COUNTS = " UNION ALL ".join(
+    f"SELECT '{table}', count(*) FROM {table}"  # noqa: S608 (constant names)
+    for table in (
+        "score_cycles",
+        "bulk_operations",
+        "score_targets",
+        "admission_lane_credits",
+        "score_attempts",
+        "score_drafts",
+        "critic_notes",
+        "llm_results",
+        "result_evidence",
+        "det_results",
+        "batch_submissions",
+        "batch_items",
+        "user_job_actions",
+        "score_feedback",
+        "golden_cases",
+        "eval_case_results",
+        "jobs",
+        "job_revisions",
+        "duplicate_groups",
+        "job_tombstones",
+        "embeddings",
+        "operations",
+    )
+)
+
+
+async def insert_scored_jobs(c: AsyncConnection, chain: ProfileChain) -> None:
+    """One row of every M3 table, and every reference the reset must undo: a scored job (cycle, bulk
+    operation, published target, attempt, its call, draft, critic note, result with an instance and
+    evidence), a second job in a batch (submission of an operation, item, the batch call naming it), a
+    deferred member of a duplicate group, a golden case with its eval call and case result, feedback, a user
+    action, a lane credit, an embedded revision and a job restored from a tombstone."""
+    tuple_id = chain.llm_tuple_id
+    embedding = await insert_embedding(c, "m3-reset", input_kind="passage")
+    scored = await insert_job(c, embedding_id=embedding)
+    batched, deferred = await insert_job(c), await insert_job(c)
+    tombstone = await insert_id(c, "job_tombstones", {"former_job_id": 999_999})
+    await c.execute(
+        sa.text("UPDATE jobs SET restored_from_tombstone_id = :t WHERE id = :j"),
+        {"t": tombstone, "j": deferred.job_id},
+    )
+    group = await insert_group(c, scored, [deferred])
+    cycle = await insert_cycle(c, tuple_id)
+    bulk = await insert_bulk_operation(c, tuple_id)
+    await insert_row(c, "admission_lane_credits", {"llm_tuple_id": tuple_id, "lane": "oldest", "credit": -1})
+
+    published = await insert_published(c, scored, tuple_id, bulk_operation_id=bulk, cycle_id=cycle)
+    _, critic_call = await insert_scoring_call(
+        c, attempt_id=published.attempt_id, target_id=published.target_id, purpose="critic"
+    )
+    await insert_row(
+        c,
+        "critic_notes",
+        {
+            "attempt_id": published.attempt_id,
+            "round": 1,
+            "draft_id": published.draft_id,
+            "llm_call_id": critic_call,
+            "effort": "medium",
+            "triggers": ["T2"],
+            "verdict_returned": "accept",
+            "derived_outcome": "accept",
+            "review_json": {},
+            "validation": {},
+        },
+    )
+    scope = (await active_ids(c)).scope_version_id
+    det = await insert_det_result(
+        c, published.result_id, scored.job_id, scope, low=Decimal(40), high=Decimal(60)
+    )
+    evidence = {
+        "llm_result_id": published.result_id,
+        "subject": "skills",
+        "source_kind": "description",
+        "quote": "Erfundenes Zitat",
+        "span_start": 0,
+        "span_end": 16,
+    }
+    await insert_row(c, "result_evidence", evidence)
+
+    operation = await insert_id(
+        c,
+        "operations",
+        {"kind": "batch_submit", "payload": {}, "dedup_key": "batch_submit:1", "status": "pending"},
+    )
+    submission = await insert_submission(c, tuple_id, bulk, operation_id=operation)
+    in_batch = await insert_target(
+        c, batched, tuple_id, state="in_batch", batch_submission_id=submission, attempt_no=1, lane="batch"
+    )
+    batch_attempt = await insert_attempt(c, in_batch, mode="batch", lane="batch")
+    item = await insert_batch_item(c, submission, in_batch, hold_usd=Decimal("0.010000"))
+    _, batch_call = await insert_scoring_call(
+        c,
+        attempt_id=batch_attempt,
+        target_id=in_batch,
+        transport="batch",
+        batch_item_id=item,
+        bulk_operation_id=bulk,
+    )
+    await c.execute(
+        sa.text("UPDATE batch_items SET llm_call_id = :c WHERE id = :i"), {"c": batch_call, "i": item}
+    )
+    await insert_target(c, deferred, tuple_id, state="deferred_duplicate", deferred_group_id=group)
+
+    eval_run = await insert_eval_run(c)
+    case = await insert_golden_case(
+        c, scored, chain.profile_version_id, labelled_from_result_id=published.result_id
+    )
+    _, eval_call = await insert_llm_call(c, purpose="critic", eval_run_id=eval_run)
+    await c.execute(
+        sa.text("UPDATE llm_calls SET golden_case_id = :g WHERE id = :c"), {"g": case, "c": eval_call}
+    )
+    await insert_row(
+        c,
+        "eval_case_results",
+        {
+            "eval_run_id": eval_run,
+            "golden_case_id": case,
+            "outcome": "accepted",
+            "critic_ran": True,
+            "llm_call_ids": [eval_call],
+            "output": {},
+        },
+    )
+    await insert_row(
+        c,
+        "score_feedback",
+        {
+            "job_id": scored.job_id,
+            "job_revision_id": scored.revision_id,
+            "profile_version_id": chain.profile_version_id,
+            "llm_result_id": published.result_id,
+            "det_result_id": det,
+            "kind": "label",
+            "label": "good",
+        },
+    )
+    await insert_row(
+        c, "user_job_actions", {"job_id": scored.job_id, "saved_at": NOW, "note": "Erfundene Notiz"}
+    )
 
 
 async def test_two_resets_keep_active_config(engine, migrated) -> None:
     """`TRUNCATE ... CASCADE` of a table `active_config` reaches through its foreign keys would empty
-    `active_config` itself: the M2 tables are deleted instead, and the pointers are restored first."""
+    `active_config` itself: the M2 and M3 tables are deleted instead, and the pointers are restored first. The
+    rows here cover every reference between them, the deferrable ones included (they hold at commit)."""
     seeded = pg_one(migrated, "migrator", ACTIVE_CONFIG)
     assert seeded is not None and pg_one(migrated, "migrator", M2_COUNTS) == (0,) * 10
     async with engine.begin() as c:
@@ -133,11 +304,64 @@ async def test_two_resets_keep_active_config(engine, migrated) -> None:
                 "s": chain.prompt_schema_version_id,
             },
         )
-    assert pg_one(migrated, "migrator", M2_COUNTS) == (1,) * 10
+        await insert_scored_jobs(c, chain)
+    m2_counts = pg_one(migrated, "migrator", M2_COUNTS)
+    assert m2_counts is not None and 0 not in m2_counts
+    assert [table for table, count in pg_rows(migrated, "migrator", M3_COUNTS) if count == 0] == []
     assert pg_one(migrated, "migrator", ACTIVE_CONFIG) != seeded
 
     for _ in range(2):  # the second reset meets the state the first one left
         reset_database(migrated)
         assert pg_rows(migrated, "migrator", ACTIVE_CONFIG) == [seeded]
         assert pg_one(migrated, "migrator", M2_COUNTS) == (0,) * 10
+        assert [table for table, count in pg_rows(migrated, "migrator", M3_COUNTS) if count != 0] == []
         assert pg_one(migrated, "migrator", TEST_ROWS, digest(1), digest(1)) == (0, 0)
+        # the seed's two rubric rows stay, v1 too, which nothing points at (M3 Task 3)
+        assert pg_rows(migrated, "migrator", SHIPPED_RUBRICS) == [("v1",), ("v2",)]
+
+
+# Every foreign key as (referencing table, referenced table).
+REFERENCES = (
+    "SELECT DISTINCT CAST(CAST(conrelid AS regclass) AS text), CAST(CAST(confrelid AS regclass) AS text) "
+    "FROM pg_constraint WHERE contype = 'f'"
+)
+# What the reset keeps or deletes row by row: the chain `active_config` stands on (M2), the configuration and
+# the seeded single rows. A TRUNCATE that reached any of them would empty it, or `active_config` with it.
+KEPT = {
+    "active_config",
+    "llm_calls",
+    "llm_spend_ledger",
+    "llm_budget",
+    "profile_drafts",
+    "profile_versions",
+    "cv_files",
+    "llm_tuples",
+    "eval_runs",
+    "settings_versions",
+    "scope_versions",
+    "model_policies",
+    "execution_configs",
+    "evaluation_policies",
+    "rubric_versions",
+    "prompt_schema_versions",
+    "schedule_state",
+    "ranking_state",
+    "sources",
+    "transition_matrix",
+}
+
+
+def test_reset_truncates_no_configuration_path(migrated) -> None:
+    """`TRUNCATE ... CASCADE` empties every table that references a truncated one, and so on: walked along
+    the referencing foreign keys of the fully migrated schema from `TRUNCATED_TABLES`, that closure holds no
+    table the reset keeps, so a later foreign key cannot bring the cascade back silently."""
+    edges = pg_rows(migrated, "migrator", REFERENCES)
+    assert ("llm_calls", "score_targets") in edges  # the M3 foreign keys are in the graph
+    closure, frontier = set(TRUNCATED_TABLES), set(TRUNCATED_TABLES)
+    while frontier:
+        frontier = {str(child) for child, parent in edges if parent in frontier} - closure
+        closure |= frontier
+    assert sorted(closure & KEPT) == []
+    removed = {"jobs", "job_revisions", "duplicate_groups", "operations", "embeddings", "job_tombstones"}
+    assert sorted(removed & closure) == []  # the six tables `_TRUNCATE` no longer names
+    assert "score_targets" not in closure

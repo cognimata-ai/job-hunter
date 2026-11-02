@@ -15,9 +15,9 @@ Figures are rounded to 3 decimals in the projections and to 1 in the warning det
   calls exceed the daily cap (§6.8). With no allowance at all (a monthly cap of 1 leaves a bucket of 0 units)
   a cell is never refreshed: `cadence_days` is then `None` ("never"), in the projection and in the warning,
   never an infinite float, which JSON cannot carry.
-- **Arbeitnow.** `page_cap = min(10, max(3, ceil(interval_h / 30) + 1))`, `expected_pages = interval_h / 37 +
-  1` (page 1 holds about 37 h of postings); `arbeitnow_coverage_risk` when more pages are expected than
-  allowed.
+- **Arbeitnow.** `page_cap = min(10, max(3, ceil(interval_h / 30) + 1))`, `expected_pages = interval_h / 17.5
+  + 1` (page 1 holds about 17.5 h of postings, V8's measurement); `arbeitnow_coverage_risk` when more pages
+  are expected than allowed, which is the case above 35 h within §13.1's 1 to 168 h.
 - **SerpApi fallback.** `None` before the first account read (no window: no fallback); otherwise its units per
   run, the effective hourly cap and the window's state (an unvalidated window admits nothing, Ruling T7-a).
 - **`stale_ttl_short`** when `stale_ttl_days` is below `max_ad_age_days` (§8.11).
@@ -36,7 +36,8 @@ from jobhunter.types import JSONValue
 
 PAID_REFRESH_SLOW_DAYS: Final = 7
 JSEARCH_DATE_WINDOW_H: Final = 720  # `date_posted=month`, the widest JSearch window (§5.5.3)
-ARBEITNOW_HOURS_PER_PAGE: Final = 37
+# V8: page 1 holds 300 items spanning about 17.5 h (the only page whose span the cap formula bounds)
+ARBEITNOW_HOURS_PER_PAGE: Final = 17.5
 _DAY: Final = timedelta(days=1)
 
 

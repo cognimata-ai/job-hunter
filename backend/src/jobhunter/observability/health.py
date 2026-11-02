@@ -25,9 +25,17 @@ gave no usable answer, `unusable` for another model or dimension). Never an exce
 
 `system_health` is the detailed health of `GET /api/system/health` (§17.5): readiness plus the run ages and
 their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_OPEN`), the current quota
-window of each provider, the LLM spend of the month (`llm_spend`, plan Task 16), disk and database sizes,
-the versions and the embedder's health (with its model id) as the readiness check read it. Run ages are
-reported, never readiness gates. `RunOut` is the api's view of a run row, shared with `POST /api/runs`.
+window of each provider, the LLM spend of the month (`llm_spend`, plan Task 16), the score lane
+(`scoring_health`, M3 Task 18), disk and database sizes, the versions and the embedder's health (with its
+model id) as the readiness check read it. Run ages are reported, never readiness gates. `RunOut` is the api's
+view of a run row, shared with `POST /api/runs`.
+
+**The score lane** (`scoring`, §17.5 L5552 "oldest pending target age", M3 Task 18), read without a lock (a
+save holding `active_config FOR UPDATE` never holds the page): the running cycle's id, the pause guard's
+reason (`scoring.cycles.pause_reason` over a plain read of the active configuration, in the process's LLM
+mode), the age of the active tuple's oldest `pending` target by its `created_at` (`null` without one), its
+`pending` and `in_batch` targets (`cycles.target_figures`) and the quarantined batch spend (the reserved
+spend of the `submit_ambiguous` submissions, `scoring.batches.quarantined_usd`, Ruling P31).
 
 **One freshness rule** (ruling T17-g): `read_run_freshness` is the one query of the run figures and
 `run_age_state` the one rule over them. System health reports that state, and the worker's `stale_data`
@@ -65,6 +73,8 @@ from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, WindowState, current_snapshot
+from jobhunter.scoring import batches, cycles
+from jobhunter.scoring.cycles import PauseReason
 from jobhunter.worker.tasks import QUEUES
 
 ReadinessCode = Literal["db", "migrations", "worker_heartbeat", "embedder"]
@@ -391,6 +401,36 @@ async def llm_spend(conn: AsyncConnection, *, now: datetime) -> LlmSpendOut | No
     return LlmSpendOut.of(await read_month_or_new(conn, budget.month_of(now), p, now=now), p)
 
 
+class ScoringHealthOut(BaseModel):
+    """The score lane (module docstring): ages are seconds at the caller's `now`, the amount in USD."""
+
+    running_cycle_id: int | None
+    pause_reason: PauseReason | None
+    oldest_pending_target_age_s: float | None
+    pending_targets: int
+    in_batch_targets: int
+    quarantined_batch_usd: DecimalOut
+
+
+async def scoring_health(conn: AsyncConnection, *, now: datetime, fake_llm: bool) -> ScoringHealthOut:
+    """The score lane's section at `now`, read without a lock (module docstring); with nothing seeded, no
+    pause is reported."""
+    seeded = await active_budget_params(conn) is not None
+    config = await cycles.scoring_config(conn, lock=False) if seeded else None
+    reason = (
+        None if config is None else await cycles.pause_reason(conn, fake_llm=fake_llm, now=now, config=config)
+    )
+    figures = await cycles.target_figures(conn)
+    return ScoringHealthOut(
+        running_cycle_id=await cycles.running_cycle_id(conn),
+        pause_reason=reason,
+        oldest_pending_target_age_s=_age_s(now, figures.oldest_pending_at),
+        pending_targets=figures.by_state.get("pending", 0),
+        in_batch_targets=figures.by_state.get("in_batch", 0),
+        quarantined_batch_usd=usd_micro(await batches.quarantined_usd(conn)),
+    )
+
+
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -401,6 +441,7 @@ class SystemHealthOut(BaseModel):
     - `queue_depths`: procrastinate jobs by queue and status.
     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
     - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
+    - `scoring`: the score lane (`scoring_health`).
     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
     """
@@ -414,6 +455,7 @@ class SystemHealthOut(BaseModel):
     queue_depths: dict[str, dict[str, int]]
     quota: dict[Provider, QuotaOut | None]
     llm: LlmSpendOut | None
+    scoring: ScoringHealthOut
     alerts_open: AlertsOpen
     disk: DiskUsage
     database_bytes: int
@@ -498,9 +540,10 @@ def _versions() -> Versions:
 
 
 async def system_health(
-    conn: AsyncConnection, *, readiness: ReadinessReport, now: datetime
+    conn: AsyncConnection, *, readiness: ReadinessReport, now: datetime, fake_llm: bool
 ) -> SystemHealthOut:
-    """The detailed health at `now` (the caller's clock), read on `conn`, with the caller's `readiness`.
+    """The detailed health at `now` (the caller's clock), read on `conn`, with the caller's `readiness`;
+    `fake_llm` is the process's LLM mode, which the score lane's pause guard reads.
 
     The caller runs `check_readiness` before it opens `conn`, so it never holds two pool connections at once
     (readiness probes on a connection of its own), and the embedder is asked once, by that check. Read-only,
@@ -521,6 +564,7 @@ async def system_health(
         queue_depths=await _queue_depths(conn),
         quota=await quota_health(conn),
         llm=await llm_spend(conn, now=now),
+        scoring=await scoring_health(conn, now=now, fake_llm=fake_llm),
         alerts_open=AlertsOpen(info=alerts["info"], warn=alerts["warn"], critical=alerts["critical"]),
         disk=DiskUsage(path=DISK_PATH, total_bytes=disk.total, free_bytes=disk.free),
         database_bytes=int((await conn.execute(_DATABASE_BYTES)).scalar_one()),

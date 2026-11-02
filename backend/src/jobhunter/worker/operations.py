@@ -26,6 +26,13 @@ domain row the operation drives (a profile draft, a query proposal) never outliv
 state. A hook may lock only rows after the owner row in the §9.1 order, and it moves its domain row only while
 that row is still live: a row the handler's own write already ended in the same transaction is left as it is.
 
+**The `eval_run` hook** (M3 Task 19, written here; pinned by Task 27's registration test): `eval_run_failed`
+ends the run of a failed `eval_run` operation `failed('interrupted')` while it is still `running`
+(`fail_eval_run`, which the eval runner shares); `scoring.eval_runner` registers it with the kind's handler.
+`batch_submit` has no hook: its cleanup needs `active_config`, an earlier lock than the operation row a hook
+runs after, so the `batch_submissions` tick reconciler recovers its rows in a fenced transaction of its own
+(Codex r3 B2); a failed `create_targets_for_tuple` needs none (`missing_targets` requests it again).
+
 **Handler-side ends** (M2 Task 11). A handler, or a graph node it runs, ends its operation inside its own
 transaction with `OperationContext.finish_in` or `requeue_in`, so the last domain write and the operation's
 end commit together. Either records the end in the context's outcome holder, and `execute_operation`, which
@@ -35,6 +42,11 @@ and the execution is then requeued as `bug` like any other raise). The context a
 `OperationDeps` (`deps`), which the M2 handlers need; an M1 handler runs with `deps=None`. A handler records
 its progress (`operations.progress`, which the API polls) with `set_progress`, under the claim predicate like
 every owner write (M2 Task 18).
+
+**Execution locks** (M3 Task 14, Codex r3 B20). A kind of `OPERATION_LOCKS` runs its jobs under that
+procrastinate lock (`batch_submit`: `batch`, one submission at a time, worker-side): `defer_operation_job`
+reads the row's kind and passes the lock on every enqueue, the first one (`create_operation`), the
+`operations` reconciler's re-enqueue of a lost job and a fenced delivery's re-defer alike.
 
 `execute_operation` is the task body's protocol; it runs the kind's handler through `executions.run_owned`,
 the one ownership-loss protocol shared with runs. A claim that the epoch fence refuses (a superseded worker,
@@ -51,6 +63,7 @@ reports an unexpected handler error as an outcome, which `execute_operation` per
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal
 from uuid import UUID, uuid4
 
@@ -59,7 +72,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.clock import utcnow
 from jobhunter.db.sql import q
-from jobhunter.db.transitions import transition
+from jobhunter.db.transitions import transition, transition_where
 from jobhunter.errors import FencedOut, TransitionConflict
 from jobhunter.faults import afault_point
 from jobhunter.observability.alerts import raise_alert
@@ -76,6 +89,8 @@ if TYPE_CHECKING:
     from jobhunter.config import AppConfig
     from jobhunter.embeddings import EmbedderClient
     from jobhunter.graphs.profile.graph import ProfileGraphs
+    from jobhunter.graphs.score.deps import ScoreDeps
+    from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -94,6 +109,9 @@ OperationKind = Literal[
     "watchlist_validate",
 ]
 
+# The procrastinate execution lock of a kind's `run_operation` job, applied at every enqueue
+# (`defer_operation_job`): the batch submissions run one at a time, worker-side (M3 Task 14, L284, A2 R4).
+OPERATION_LOCKS: Final[Mapping[OperationKind, str | None]] = MappingProxyType({"batch_submit": "batch"})
 MAX_OPERATION_ATTEMPTS: Final = 10
 # These thresholds compare times the database wrote (`heartbeat_at`, `created_at`: its `now()`) with the
 # caller's clock (`ctx.now`, the worker's `utcnow()`). That is safe because the worker and PostgreSQL run on
@@ -133,10 +151,14 @@ class OperationClaim:
 
 @dataclass(frozen=True)
 class OperationDeps:
-    """What the M2 handlers need from the worker process, built once in `worker.main` (Task 11).
+    """What the M2 and M3 handlers need from the worker process, built once in `worker.main` (M2 Task 11, M3
+    Task 27).
 
     `embedder` is `None` when the worker has none, as for `WorkerRuntime.embedder`; `clock` is the injected
-    clock of the handlers' times.
+    clock of the handlers' times. `score_steps` are the score steps' dependencies (`WorkerRuntime.score_deps`:
+    the engine, the gateway, the clock and the gateway's monotonic clock), which the `eval_run` handler scores
+    its cases with; `batches_client` is the process's Message Batches client (`WorkerRuntime.batches_client`),
+    which the `batch_submit` handler creates its batch with. Neither handler builds its own (Ruling P33).
     """
 
     cfg: "AppConfig"
@@ -146,6 +168,8 @@ class OperationDeps:
     profile_graphs: "ProfileGraphs"
     embedder: "EmbedderClient | None"
     clock: Callable[[], datetime]
+    score_steps: "ScoreDeps"
+    batches_client: "BatchesClient"
 
 
 @dataclass(frozen=True)
@@ -232,6 +256,55 @@ def register_operation_handler(
     return register
 
 
+# ---- the `eval_run` failure hook (M3 Task 19; Task 27 pins it) ---------------------------------------------
+
+EVAL_RUN_INTERRUPTED: Final = "interrupted"
+_BIGINT_END: Final = 2**63
+# What the ledger counts for an eval run's calls (§6.9.1): billed at their cost, not billed at 0, the rest
+# (reserved, dispatched, ambiguous) at their reservation; `eval_runs.cost_usd` is numeric(10,4), rounded half
+# up. Informational: the ledger, never the run row, is the authority for spend.
+EVAL_RUN_COST_SQL: Final = (
+    "(SELECT round(coalesce(sum(CASE l.state WHEN 'billed' THEN l.settled_usd WHEN 'not_billed' THEN 0 "
+    "ELSE l.reserved_usd END), 0), 4) FROM llm_calls c JOIN llm_spend_ledger l ON l.id = c.spend_ledger_id "
+    "WHERE c.eval_run_id = t.id)"
+)
+
+
+async def fail_eval_run(conn: AsyncConnection, eval_run_id: int, reason: str) -> bool:
+    """End eval run `eval_run_id` `running → failed` with `metrics || {"failed": reason}` and the `cost_usd`
+    its calls count (`EVAL_RUN_COST_SQL`), in the caller's transaction; `False`, writing nothing, when the
+    run is not `running` (already `completed` or `failed`: left as it is) or does not exist."""
+    moved = await transition_where(
+        conn,
+        "eval_runs",
+        ["running"],
+        "failed",
+        where="t.id = :run",
+        params={"run": eval_run_id, "reason": reason},
+        set_sql={
+            "metrics": "coalesce(t.metrics, CAST('{}' AS jsonb)) || jsonb_build_object('failed', "
+            "CAST(:reason AS text))",
+            "cost_usd": EVAL_RUN_COST_SQL,
+        },
+    )
+    return bool(moved)
+
+
+async def eval_run_failed(
+    conn: AsyncConnection, operation_id: int, payload: Mapping[str, JSONValue], error_code: str | None
+) -> None:
+    """The `eval_run` operation's failure hook (M3 Task 19, Codex r5 B2): its run, while still `running`,
+    ends `failed` with `metrics.failed = "interrupted"` (`fail_eval_run`); a run already `completed` or
+    `failed` is left as it is. It writes the run row after the operation row the finishing transaction
+    holds (steps 5 and 10 of the lock schedule) and needs no earlier lock."""
+    run = payload.get("eval_run_id")
+    if isinstance(run, bool) or not isinstance(run, int) or not 0 < run < _BIGINT_END:
+        log.error("eval_run_hook_payload_invalid", operation_id=operation_id)
+        return  # no run a `bigint` names: the operation still ends `failed`
+    if await fail_eval_run(conn, run, EVAL_RUN_INTERRUPTED):
+        log.warning("eval_run_failed", operation_id=operation_id, eval_run_id=run, error_code=error_code)
+
+
 async def _run_failure_hook(
     conn: AsyncConnection,
     kind: OperationKind,
@@ -252,6 +325,7 @@ _INSERT = q(
     "ON CONFLICT (kind, dedup_key) WHERE status IN ('pending','running') DO NOTHING RETURNING id",
     jsonb=["payload"],
 )
+_KIND = q("SELECT kind FROM operations WHERE id = :i")
 _LIVE_ID = q(
     "SELECT id FROM operations "
     "WHERE kind = :kind AND dedup_key = :dedup_key AND status IN ('pending','running')"
@@ -328,9 +402,15 @@ async def create_operation(
 
 
 async def defer_operation_job(conn: AsyncConnection, defer: Deferrer, operation_id: int) -> int | None:
-    """Defer `run_operation(operation_id)` with `defer` under the queueing lock `op:<id>`, in the caller's
-    transaction: the job id, or `None` when that operation's job already waits."""
-    return await defer(conn, "run_operation", queueing_lock=f"op:{operation_id}", operation_id=operation_id)
+    """Defer `run_operation(operation_id)` with `defer` under the queueing lock `op:<id>` and the execution
+    lock of the operation's kind (`OPERATION_LOCKS`, read from its row), in the caller's transaction: the job
+    id, or `None` when that operation's job already waits. Every enqueue goes through here: the first one,
+    `_redefer_lost_jobs`' and a fenced delivery's re-defer (M3 Task 14, Codex r3 B20)."""
+    kind = (await conn.execute(_KIND, {"i": operation_id})).scalar_one_or_none()
+    lock = None if kind is None else OPERATION_LOCKS.get(kind)
+    return await defer(
+        conn, "run_operation", lock=lock, queueing_lock=f"op:{operation_id}", operation_id=operation_id
+    )
 
 
 async def claim_operation(conn: AsyncConnection, operation_id: int, *, epoch: int) -> OperationClaim | None:
@@ -559,8 +639,8 @@ async def _reclaim_stale(conn: AsyncConnection, *, now: datetime) -> list[tuple[
 async def sweep_older_epoch_operations(conn: AsyncConnection, epoch: int) -> int:
     """At takeover: take back every `running` operation of an older worker epoch; the count.
 
-    It waits for the row locks of those owners (none is skipped), so once the takeover commits no older claim
-    is valid any more.
+    It waits for the row locks of those owners (none is skipped), so once its transaction commits no older
+    claim is valid any more.
     """
     rows = (await conn.execute(_OLDER_EPOCH, {"epoch": epoch})).all()
     for row in rows:

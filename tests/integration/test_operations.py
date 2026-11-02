@@ -212,9 +212,10 @@ async def test_an_older_owners_row_lock_held_past_the_lock_timeout_fails_the_tak
         finally:
             await tx.rollback()
     assert pg_error(blocked.value).sqlstate == LOCK_NOT_AVAILABLE
-    # Nothing was committed: the epoch is still e1 and the operation still belongs to the old claim.
+    # M3 Task 27: the epoch claim committed alone, so the epoch is e1 + 1; the `operations` sweep's own
+    # transaction rolled back, so the operation still belongs to the old claim (the next start sweeps it).
     async with engine.connect() as c:
-        assert (await c.execute(sa.text("SELECT worker_epoch FROM worker_heartbeat"))).scalar_one() == e1
+        assert (await c.execute(sa.text("SELECT worker_epoch FROM worker_heartbeat"))).scalar_one() == e1 + 1
     assert await row(engine, op) == before and before[:3] == ("running", old.claim_id, e1)
 
 

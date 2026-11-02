@@ -8,8 +8,10 @@ and `scope.max_ad_age_days` gives `admission` only, as it is not stored with the
 38), field by field, as canonical JSON. A request that differs from the active document only in formatting
 (`"0.70"` for `"0.7"`, `"Zalando SE"` for the stored key `zalando`, a reordered set, a key left out for its
 default) has the same normal form and is no change. The result is the union of the changed fields' classes
-without `none`; it is `{"none"}` when nothing changed, or only fields of class `none` (`display.*`,
-`retention.*`, `notifications.*`).
+without `none`; it is `{"none"}` when nothing changed, or only fields of class `none` (`display.ui_language`,
+`retention.*`, `notifications.*`). `display.timezone` is `schedule` (spec 3.5, U3): it is the zone of
+`schedule.anchor_local`, which a save converts into `anchor_utc` in that zone, so a change of zone alone runs
+the schedule action and re-anchors the schedule.
 
 Each derived row (§13.2) changes exactly when its class appears, because both hash the same normal form:
 the scope (every `scope.*` field but `max_ad_age_days`) with `scope`, the whole `scoring.model_policy` object
@@ -69,7 +71,7 @@ FIELD_EFFECTS: Final[Mapping[str, frozenset[EffectClass]]] = MappingProxyType(
         "schedule.interval_hours": _SCHEDULE,
         "schedule.anchor_local": _SCHEDULE,
         "schedule.include_paid": _COLLECTION,
-        "display.timezone": _NONE,
+        "display.timezone": _SCHEDULE,
         "display.ui_language": _NONE,
         "scope.locations": _SCOPE_COLLECTION,
         "scope.remote_within_germany": _SCOPE_COLLECTION,

@@ -24,6 +24,7 @@ state only, and the profile nodes, which take the config too.
 """
 
 import functools
+import random
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, Final
 
@@ -49,6 +50,13 @@ def is_retryable_db_error(exc: BaseException) -> bool:
 DB_RETRY: Final = RetryPolicy(
     max_attempts=3, initial_interval=0.5, backoff_factor=2, jitter=True, retry_on=is_retryable_db_error
 )
+
+
+def db_retry_interval(tries: int) -> float:
+    """`DB_RETRY`'s wait after the `tries`-th failed try (LangGraph's own formula, jitter included), for a
+    caller that retries outside a graph node."""
+    interval = min(DB_RETRY.max_interval, DB_RETRY.initial_interval * DB_RETRY.backoff_factor ** (tries - 1))
+    return interval + random.uniform(0, 1) if DB_RETRY.jitter else interval  # noqa: S311 - jitter, no secret
 
 
 def sanitized[**P, U](

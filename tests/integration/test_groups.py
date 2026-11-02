@@ -8,7 +8,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db import ranking
-from jobhunter.dedup import groups, merge, revisions
+from jobhunter.dedup import group_rules, groups, merge, revisions
 from jobhunter.dedup.groups import GroupEffect
 from jobhunter.errors import FencedOut
 from jobhunter.graphs.collect.nodes.resolve_identity import make_resolve_identity
@@ -708,7 +708,7 @@ async def test_two_postings_of_one_ats_board_are_never_grouped(
     assert await regroup(engine, b) == NOTHING  # G1 against a member rules the group out
 
 
-async def _views(engine: AsyncEngine, *job_ids: int) -> dict[int, groups.JobView]:
+async def _views(engine: AsyncEngine, *job_ids: int) -> dict[int, group_rules.JobView]:
     async with engine.connect() as conn:
         return await groups.load_views(conn, job_ids)
 

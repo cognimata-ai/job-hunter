@@ -1,13 +1,14 @@
 """The local execution registry and the owned-execution protocol (spec §3.3.3).
 
-`ExecutionRegistry` keeps at most one live asyncio task per execution key (`("run", id)` or
-`("operation", id)`), together with the token of the owner it runs for (a run's `attempt_no`, an operation's
-`claim_id`). A finished task leaves the registry by itself. The worker's reconcilers use it to stop a local
-execution whose row they took away (`cancel_and_await`), and the shutdown uses `cancel_all`.
+`ExecutionRegistry` keeps at most one live asyncio task per execution key (`("run", id)`, `("operation", id)`
+or, M3 Task 11, `("cycle", id)`), together with the token of the owner it runs for (a run's `attempt_no`, an
+operation's `claim_id`, a score cycle's worker epoch). A finished task leaves the registry by itself. The
+worker's reconcilers use it to stop a local execution whose row they took away (`cancel_and_await`), and the
+shutdown uses `cancel_all`.
 
 `run_owned` is the one protocol by which an owner runs its work (Task 10 `execute_operation`, Task 12
-`execute_run`): the work runs as the registry's task for the key, next to a heartbeat task whose loss cancels
-it, and the outcome tells the owner what is left to write:
+`execute_run`, M3 Task 11 `graphs.score.graph.execute_cycle`): the work runs as the registry's task for the
+key, next to a heartbeat task whose loss cancels it, and the outcome tells the owner what is left to write:
 - `returned`: the work ended normally; the owner records its completion (fenced by its token);
 - `lost`: someone other than the caller requested the work's cancellation (a refused or failed heartbeat, a
   reconciler's `cancel_and_await`, the shutdown's `cancel_all`), however the work then ended (ruling T10-f:
@@ -30,7 +31,7 @@ from jobhunter.errors import DomainError, FencedOut
 from jobhunter.observability.logging import get_logger
 from jobhunter.worker.heartbeat import heartbeat_loop
 
-ExecKey = tuple[Literal["run", "operation"], int]
+ExecKey = tuple[Literal["run", "operation", "cycle"], int]
 
 log = get_logger("jobhunter.worker.executions")
 

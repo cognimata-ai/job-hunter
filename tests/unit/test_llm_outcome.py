@@ -38,11 +38,11 @@ OUTPUT: Any = {"summary": "synthetic"}
 
 
 def ok(call_id: int) -> Receipt:
-    return Receipt(llm_call_id=call_id, output_json=OUTPUT, error_code=None)
+    return Receipt(llm_call_id=call_id, output_json=OUTPUT, error_code=None, max_tokens=16_000)
 
 
 def failed(call_id: int, code: str) -> Receipt:
-    return Receipt(llm_call_id=call_id, output_json=None, error_code=code)
+    return Receipt(llm_call_id=call_id, output_json=None, error_code=code, max_tokens=16_000)
 
 
 # --- the receipts walk -------------------------------------------------------------------------------------

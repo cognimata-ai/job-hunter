@@ -12,7 +12,7 @@ from jobhunter.config import AppConfig
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm.bounds import PROMPT_OVERHEAD_TOKENS, text_input_bound
 from jobhunter.llm.fake import canonical_schema_json
-from jobhunter.llm.gateway import node_config
+from jobhunter.llm.gateway import WireSchema, node_config
 from jobhunter.llm.prompts.render import (
     extract_profile_native_pdf_prompt,
     extract_profile_prompt,
@@ -26,7 +26,12 @@ from tests.support.llm import assert_single_call_payload, capture_request
 SETTINGS = load_settings_v1()
 MODEL_POLICY = get_object(SETTINGS, "scoring.model_policy")
 EXECUTION = get_object(SETTINGS, "scoring.execution")
-NODE = node_config("extract_profile", model_policy=MODEL_POLICY, execution=EXECUTION, schema=ProfileOut)
+NODE = node_config(
+    "extract_profile",
+    model_policy=MODEL_POLICY,
+    execution=EXECUTION,
+    schema=WireSchema.from_model(ProfileOut),
+)
 
 # German typography on purpose: the byte bound counts UTF-8 bytes, not characters.
 REVIEWED = (

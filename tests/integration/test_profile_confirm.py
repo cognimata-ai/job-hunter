@@ -39,6 +39,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import insert_revisions_awaiting, manual_run_id, seed_inputs
+from tests.support.eval import seed_adversarial
 from tests.support.faults import PausePoint
 from tests.support.fixtures import count_rows
 from tests.support.profile import (
@@ -648,27 +649,42 @@ async def activate_explicit_scope(client: httpx.AsyncClient, op_runner: OpRunner
     await op_runner.run_one(saved["apply_scope_operation_id"])
 
 
-# --- Deviation 10: the collection with a tuple --------------------------------------------------------------
+# --- M3 Task 14 (Deviation 10's switch flipped): the collection with a tuple -------------------------------
 
 
-async def test_after_confirm_a_collect_run_succeeds_with_node_9_a_no_op_and_i5_ok(
+async def test_after_confirm_a_collect_run_creates_its_targets_and_i5_holds(
     logged_in_client, engine, ready_draft, current_epoch, fake_http, fake_embedder, collect_deps
 ) -> None:
     await confirmed(logged_in_client, ready_draft)
     _, tuple_id = await active_profile(engine)
     await seed_inputs(engine, companies=(("greenhouse", "getyourguide"),), enabled=("arbeitnow", "ats"))
-    run_id = await manual_run_id(engine)
-    async with engine.begin() as conn:  # the run carries the active tuple, as M3's run creation records it
-        await conn.execute(
-            sa.text("UPDATE runs SET llm_tuple_id = :t WHERE id = :r"), {"t": tuple_id, "r": run_id}
-        )
+    run_id = await manual_run_id(engine)  # the run records the active tuple, as the run creation does
     compiled = build_collect_graph(InMemorySaver(), collect_deps)
     assert await runs.execute_run(engine, compiled, run_id, 1, epoch=1) == "started"
     (run,) = await rows(engine, "SELECT status, status_reason, report FROM runs WHERE id = :r", r=run_id)
     assert (run.status, run.status_reason) == ("succeeded", None)
+    (made,) = await rows(
+        engine, "SELECT count(*) AS n FROM score_targets WHERE llm_tuple_id = :t", t=tuple_id
+    )
+    assert made.n > 0  # node 9 gave the run's revisions their targets of the confirmed tuple
     assert run.report["execution"]["invariants"]["I5"] == {
         "ok": True,
-        "detail": {"llm_tuple_id": tuple_id, "targets": "m3"},
+        "detail": {"llm_tuple_id": tuple_id, "revisions": made.n, "missing": 0},
+    }
+    by_state = {
+        str(r.state): int(r.n)
+        for r in await rows(
+            engine,
+            "SELECT state, count(*) AS n FROM score_targets WHERE llm_tuple_id = :t GROUP BY state",
+            t=tuple_id,
+        )
+    }
+    assert run.report["revisions"]["targets"] == {
+        "created": made.n,
+        "revived": 0,
+        "cancelled": 0,
+        "skipped": {},
+        "by_state": by_state,  # Ruling T14-a
     }
     assert ENQUEUE_TARGETS in run.report["execution"]["nodes"]
 
@@ -688,6 +704,33 @@ async def test_the_profile_list_shows_the_confirmed_version(logged_in_client, en
         "profile": version.profile_json,
     }
     assert listed == {"active": expected, "versions": [expected]}
+
+
+async def test_the_profile_list_leaves_the_adversarial_seeds_synthetic_versions_out(
+    logged_in_client, engine, ready_draft
+) -> None:
+    """Ruling T19-a: the seed's synthetic versions are the eval's, never the user's to list."""
+    body = await confirmed(logged_in_client, ready_draft)
+    seeded = await seed_adversarial(engine)
+    assert seeded.profiles > 0
+    listed = (await logged_in_client.get("/api/profile")).json()
+    assert [v["id"] for v in listed["versions"]] == [body["profile_version_id"]]
+    assert listed["active"]["id"] == body["profile_version_id"]
+
+
+async def test_the_users_version_numbers_ignore_the_seeds_synthetic_ones(
+    logged_in_client, engine, ready_draft
+) -> None:
+    """Ruling T19-c: the user's `version_no = max + 1` counts the user's versions only. Seeded first (its ten
+    versions numbered 1,000,001 on), the first confirm is still version 1."""
+    await seed_adversarial(engine)
+    body = await confirmed(logged_in_client, ready_draft)
+    (version,) = await rows(
+        engine,
+        "SELECT version_no, synthetic_eval FROM profile_versions WHERE id = :v",
+        v=body["profile_version_id"],
+    )
+    assert (version.version_no, version.synthetic_eval) == (1, False)
 
 
 async def test_the_rescore_estimate_previews_the_count_the_costs_and_the_month(

@@ -14,11 +14,11 @@
   "model": "claude-opus-5-5",
   "purpose": "schema_dry_run",
   "source": "recorded",
-  "spike": "v4",
+  "spike": "v4v2",
   "usage": {
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
     "input_tokens": 2588,
-    "output_tokens": 650
+    "output_tokens": 656
   }
 }

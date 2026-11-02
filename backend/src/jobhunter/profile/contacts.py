@@ -66,7 +66,9 @@ result. It is a best-effort aid; the user's review is the guarantee. Task 11 cal
   Leiter`) it is taken as a name and the search goes on, so that a name below it is taken too. The
   feminine `-in` form of a title word is a title word when its stem has four letters or more (`Architektin`;
   `Evin` is no feminine `ev`). A title or heading line that holds a contact is passed over as well
-  (`Senior Engineer | max@example.org`).
+  (`Senior Engineer | max@example.org`). A line is read whole, however long the claims in it are (a second
+  pass reads their shorter tokens there), and a gap of more than `_HEADER_LINE_MAX` blanks in it separates
+  cells that are read as lines of their own.
 
 **The order the categories claim text in** is `APPLY_ORDER`: personal, url, email, phone, address, name.
 Each category runs on the text with everything claimed so far masked out (NUL, which no pattern matches or
@@ -444,8 +446,17 @@ _POSTAL: Final = re.compile(r"(?<!\w)[0-9]{5}\s{1,3}(?P<city>[A-ZÄÖÜ][\w\-]{1
 _POSTAL_BEFORE: Final = re.compile(r"(?<!\w)[0-9]{5}\s{1,3}\Z")
 _POSTAL_INLINE: Final = re.compile(r"(?<!\w)[0-9]{5}[ \t\xa0]{1,3}[A-ZÄÖÜ][\w\-]{1,40}(?![\w\-])")
 
-# A line longer than the header-name rule looks at is cut into pieces of this size; the first piece decides.
-_LINE: Final = re.compile(rf"[^{_EOL}]{{1,1000}}")
+# The header-name rule reads each line whole (`_lines`), never in pieces of a fixed length: a claim is as long
+# as its text and a second pass reads a shorter token there, so a cut at a fixed length falls in another place
+# in a second pass (the idempotence property found a title word past the cut of the first pass only). What a
+# line holds besides claims and tokens is capped by `_HEADER_LINE_MAX`. A run of more blanks than that
+# (`_GAP`, a gap between the columns of a layout) separates a line into cells, each read as a line of its own:
+# the line as a whole is over the cap and would end the search. A claim takes its blanks with it, in the
+# first pass as in the second, so both passes find the same gaps.
+_NOT_EOL: Final = re.compile(rf"[^{_EOL}]")
+_EOL_CHAR: Final = re.compile(rf"[{_EOL}]")
+_GAP: Final = re.compile(rf"[^\S{_EOL}]{{{_HEADER_LINE_MAX + 1}}}")
+_NOT_SPACE: Final = re.compile(r"\S")
 _PLACEHOLDER: Final = re.compile(r"\[(?:EMAIL|PHONE|URL|ADDRESS|PERSONAL|NAME|REMOVED)\]")
 _NAME_WORD: Final = re.compile(r"(?:[^\W\d_]|['\u2019\-\u0300-\u036f]){1,40}")
 _TITLE_SPLIT: Final = re.compile(r"[.\-]")
@@ -751,12 +762,34 @@ def _name_words(tokens: list[str]) -> list[str] | None:
     return words if 2 <= capitalised <= 4 and words[-1] not in _NAME_PARTICLES else None
 
 
+def _lines(text: str) -> Iterator[Span]:
+    """The lines of `text` that hold a character, as (start, end): each line whole, or the cells that the
+    gaps in it (`_GAP`) separate."""
+    position = 0
+    while (first := _NOT_EOL.search(text, position)) is not None:
+        stop = _EOL_CHAR.search(text, first.start())
+        position = len(text) if stop is None else stop.start()
+        cell = first.start()
+        while cell < position:
+            gap = _GAP.search(text, cell, position)
+            if gap is None:
+                yield cell, position
+                break
+            if gap.start() > cell:
+                yield cell, gap.start()
+            after = _NOT_SPACE.search(text, gap.end(), position)
+            cell = position if after is None else after.start()
+
+
 def _header_names(text: str) -> list[tuple[Span, list[str]]]:
     """The header names, each as the span of the name in its line and its words: the first line that holds
     a name, and the lines before it that may be a name or a title.
 
-    Lines of white space are passed over. A line that holds a title or heading word (`ROLE_KEYWORDS`), or is
-    a heading for a name cell (`Name`, `Name:`), is passed over too, `_HEADER_SKIPS` times at most.
+    A line is read whole, however long its claims are, so that a second pass, which reads their shorter
+    tokens, sees the same words in the same line; a gap of more blanks than the cap allows separates it into
+    cells, each read as a line (`_lines`). Lines of white space are passed over. A line that holds a title
+    or heading word (`ROLE_KEYWORDS`), or is a heading for a name cell (`Name`, `Name:`), is passed over
+    too, `_HEADER_SKIPS` times at most.
     `Name:` with a name after it (also `Vorname/Nachname:`) is the name label: the name after the colon
     is the header name. A line with a title word that is also a surname where it may be a surname
     (`_may_be_surname`: `Max Kaufmann`, `IT Leiter`, `Stellv. Leiter`) is passed over as well (it counts),
@@ -769,15 +802,15 @@ def _header_names(text: str) -> list[tuple[Span, list[str]]]:
     """
     found: list[tuple[Span, list[str]]] = []
     skipped = 0
-    for line in _LINE.finditer(text):
-        raw = line.group()
+    for line_start, line_end in _lines(text):
+        raw = text[line_start:line_end]
         content = raw.strip()
         if not content:
             continue
         # Claims and tokens do not count: a claim is as long as its text, a second pass reads a shorter token.
         if len(_PLACEHOLDER.sub("", content).replace(_MASK, "")) > _HEADER_LINE_MAX:
             return found
-        start = line.start() + len(raw) - len(raw.lstrip())
+        start = line_start + len(raw) - len(raw.lstrip())
         label = _NAME_LABEL.match(content)
         value = content[label.end() :] if label is not None else content
         if label is not None:

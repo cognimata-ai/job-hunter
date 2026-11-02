@@ -1,0 +1,181 @@
+{
+  "key": "clearance_required",
+  "label": "poor",
+  "expected_knockouts": [
+    "security_clearance:clearance"
+  ],
+  "profile": {
+    "summary": "IT-Sicherheitsberater mit sieben Jahren Erfahrung in ISO 27001 und Penetrationstests.",
+    "target_titles": [
+      {
+        "title": "IT-Sicherheitsberater",
+        "lang": "de"
+      },
+      {
+        "title": "Security Consultant",
+        "lang": "en"
+      }
+    ],
+    "seniority": "senior",
+    "total_years_experience": 7,
+    "roles": [
+      {
+        "title": "IT-Sicherheitsberater",
+        "employer": "Beispiel Sicherheitsberatung GmbH",
+        "start": "2018-05-01",
+        "end": "present",
+        "seniority": "senior",
+        "domain": "IT-Sicherheit",
+        "highlights": [
+          "Audits nach ISO 27001 für mittelständische Kunden geleitet"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "ISO 27001",
+        "category": "domain_knowledge",
+        "level": "expert",
+        "years": 7,
+        "evidence": "ISO 27001"
+      },
+      {
+        "name": "Penetrationstests",
+        "category": "method",
+        "level": "advanced",
+        "years": 5,
+        "evidence": "Penetrationstests"
+      }
+    ],
+    "languages": [
+      {
+        "code": "de",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "Deutsch (Muttersprache)"
+      },
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "C1",
+        "evidence": "Englisch (C1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "master",
+        "field": "IT-Sicherheit",
+        "institution": null,
+        "year": 2017
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "IT-Sicherheit"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "Köln",
+        "gazetteer_id": "geonames:2886242",
+        "lat": 50.93333,
+        "lon": 6.95,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "IT-Sicherheitsberater Behörden (m/w/d)",
+    "company": "Beispiel Sicherheitstechnik GmbH",
+    "locations": [
+      "Köln"
+    ],
+    "work_modes": [
+      "onsite",
+      "hybrid"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "full",
+    "description": "Für Projekte bei Bundesbehörden suchen wir eine IT-Sicherheitsberaterin oder einen IT-Sicherheitsberater in Köln. Du berätst unsere Kunden aus der öffentlichen Verwaltung beim Aufbau von Managementsystemen für Informationssicherheit nach ISO 27001 und dem BSI-Grundschutz, führst Audits durch und begleitest Penetrationstests. Eine gültige Sicherheitsüberprüfung nach dem Sicherheitsüberprüfungsgesetz (Ü2) ist für diese Stelle zwingend erforderlich, da du in Verschlusssachen eingebunden bist. Du bringst mehrere Jahre Erfahrung in der IT-Sicherheit mit und arbeitest gerne vor Ort bei unseren Kunden. Wir bieten dir eine unbefristete Anstellung und regelmäßige Weiterbildungen."
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "Köln",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2886242",
+            "country_code": "DE",
+            "lat": 50.93333,
+            "lon": 6.95
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "onsite",
+      "hybrid"
+    ],
+    "work_mode_source": "structured",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "structured",
+    "salary": null,
+    "industry_structured": null
+  }
+}

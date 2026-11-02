@@ -46,17 +46,9 @@ flight: the `embed` node (the collect queue runs one run at a time) and the `awa
 (the tick queue's one worker), which yields to a running run, so the two overlap only when a run starts during
 a reconciler pass: at most two batches together in M1; with M2's profile embedding at most three.
 
-**The reconciler** `awaiting_embedding` (§17.4, cadence `heavy`) runs only while the embedder is healthy and
-**no run is `running`** (ruling T22-a: a running run's `embed` node embeds the backlog itself, oldest first,
-so the two never compete for one batch). Its first transaction proves the worker epoch (`fence_epoch`) and
-reads whether a run is running; a pass that skips logs `awaiting_embedding_skipped` with its `reason`. It
-embeds the revisions awaiting for more than `AWAITING_GRACE`, fenced by the worker epoch, at most
-`RECONCILE_LIMIT` (32, two batches) per pass. `reconcile_heavy` runs on the `tick` queue, whose one worker
-the minute tick shares, so one pass holds that queue for about 1 min at the measured 0.57 docs/s, and for at
-most twice `BATCH_TIMEOUT_S` (4 min) when the embedder is slow. A run that starts during a pass can overlap
-it by that one pass. It resolves `embedder.unavailable` once no revision awaits at all ("embedder healthy
-and backlog cleared", §17.6). M1 has no score targets, so there is no similarity to set yet. The `embed`
-node raises that alert (`raise_unavailable`).
+**The reconciler** `awaiting_embedding` (§17.4) lives in `worker.embedding_reconcile` (M1 Carry-forward 14,
+M3 Task 15), so this module, which the api imports, registers no reconciler; it calls `embed_awaiting`,
+`count_awaiting` and resolves `UNAVAILABLE_ALERT`. The `embed` node raises that alert (`raise_unavailable`).
 """
 
 import asyncio
@@ -65,7 +57,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Final, Literal, get_args
 
 import httpx
@@ -74,12 +66,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.db.sql import q
 from jobhunter.errors import DomainError
 from jobhunter.faults import afault_point
-from jobhunter.observability.alerts import raise_alert, resolve_alert
+from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import EMBED_SECONDS
 from jobhunter.types import JSONValue
-from jobhunter.worker.epoch import fence_epoch
-from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
 EMBEDDING_MODEL_ID: Final = "snowflake-arctic-embed-l-v2.0@ac6544c8a46e00af67e330e85a9028c66b8cfd9a/fp32"
 EMBEDDING_DIM: Final = 1024  # `embeddings.vector halfvec(1024)`
@@ -90,10 +80,6 @@ MAX_TEXT_BYTES: Final = 65_536  # the service's limit (Task 21)
 # The `llm_input` fields of a revision's text, in order.
 TEXT_FIELDS: Final = ("title", "company_display", "description_text")
 AFTER_HTTP: Final = "collect.embed.after_http"
-# §17.4: the reconciler embeds revisions awaiting for longer than this.
-AWAITING_GRACE: Final = timedelta(minutes=10)
-# The most revisions one reconciler pass embeds (ruling T22-a): 2 batches, about 1 min on the V7 CPU.
-RECONCILE_LIMIT: Final = 2 * BATCH
 # The largest finite half-precision value: `halfvec` refuses a component beyond it.
 HALFVEC_MAX: Final = 65_504.0
 # The service's vectors are L2-normalised; a norm off by more than this is no answer of the pinned model.
@@ -347,16 +333,21 @@ class EmbedReport:
 # The keyset bounds of a selection without a time bound, and its start.
 _NO_TIME_BOUND: Final = datetime.max.replace(tzinfo=UTC)
 _START: Final = (datetime.min.replace(tzinfo=UTC), 0)
+# A synthetic golden-case job's revisions are never embedded (M3 Task 19, Codex r1 #32): nothing ranks them.
+# The predicate of a revision `r` of a job of the user's (Ruling T19-a: the collection's counts use it too).
+NOT_SYNTHETIC_REVISION_SQL: Final = (
+    "NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = r.job_id AND j.synthetic_eval)"
+)
 _NEXT_BATCH: Final = q(
-    "SELECT id, created_at, llm_input FROM job_revisions WHERE embedding_status = 'awaiting_embedding' "
-    "AND created_at < :before AND (created_at, id) > (:after_at, :after_id) ORDER BY created_at, id LIMIT :n"
+    "SELECT r.id, r.created_at, r.llm_input FROM job_revisions r "  # noqa: S608 (a constant fragment)
+    "WHERE r.embedding_status = 'awaiting_embedding' AND r.created_at < :before "
+    f"AND (r.created_at, r.id) > (:after_at, :after_id) AND {NOT_SYNTHETIC_REVISION_SQL} "
+    "ORDER BY r.created_at, r.id LIMIT :n"
 )
 _COUNT_AWAITING: Final = q(
-    "SELECT count(*) FROM job_revisions WHERE embedding_status = 'awaiting_embedding' "
-    "AND created_at < :before"
+    "SELECT count(*) FROM job_revisions r WHERE r.embedding_status = 'awaiting_embedding' "  # noqa: S608
+    f"AND r.created_at < :before AND {NOT_SYNTHETIC_REVISION_SQL}"
 )
-
-_RUN_RUNNING: Final = q("SELECT EXISTS (SELECT 1 FROM runs WHERE status = 'running')")
 
 Guard = Callable[[AsyncConnection], Awaitable[None]]
 
@@ -454,47 +445,3 @@ async def raise_unavailable(conn: AsyncConnection, *, kind: EmbedderErrorKind, r
         message="embedding failed in a run: its revisions stay awaiting_embedding",
         context={"kind": kind, "run_id": run_id},
     )
-
-
-@reconciler("awaiting_embedding", "heavy")
-async def reconcile_awaiting_embedding(ctx: ReconcileContext) -> int:
-    """§17.4 `awaiting_embedding` (see the module docstring); how many revisions it embedded.
-
-    0, having asked the embedder for no vector: without a client (`ctx.embedder`), while a run is `running`
-    and while the embedder is not healthy (each logged `awaiting_embedding_skipped`). Raises `FencedOut` when
-    `ctx.epoch` is no longer the current worker epoch (`fence_epoch` logged it; the fenced transaction wrote
-    nothing), so that `run_reconcilers` stops the cadence and the superseded worker stops, as for every
-    other reconciler (Ruling FR-r).
-    """
-    client = ctx.embedder
-    if client is None:
-        log.warning("awaiting_embedding_skipped", reason="no_embedder")
-        return 0
-
-    async def fenced(conn: AsyncConnection) -> None:
-        await fence_epoch(conn, ctx.epoch)
-
-    async with ctx.engine.begin() as conn:
-        await fenced(conn)
-        running = bool((await conn.execute(_RUN_RUNNING)).scalar_one())
-    if running:
-        # The pass yields to a running run (Ruling T22-a), whatever its state: a run left `running` by a
-        # dead worker keeps every pass skipping (logged `run_running` each time) until `stale_runs` gives
-        # it a new attempt or ends it, once its heartbeat is 3 min stale (`failed('resume_exhausted')`
-        # after 3 resumes); its revisions wait meanwhile, and the next run's embed node takes them up.
-        log.info("awaiting_embedding_skipped", reason="run_running")
-        return 0
-    health = await client.health()
-    if not health.ok:
-        # Not the model id: its 40-hex revision reads as a key to the redaction (§16.8).
-        log.info("awaiting_embedding_skipped", reason="embedder_unhealthy", checksum_ok=health.checksum_ok)
-        return 0
-    report = await embed_awaiting(
-        ctx.engine, client, guard=fenced, limit=RECONCILE_LIMIT, created_before=ctx.now - AWAITING_GRACE
-    )
-    if not report.unavailable:
-        async with ctx.engine.begin() as conn:
-            await fence_epoch(conn, ctx.epoch)
-            if await count_awaiting(conn) == 0:
-                await resolve_alert(conn, code=UNAVAILABLE_ALERT, subject=ALERT_SUBJECT)
-    return report.embedded

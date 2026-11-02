@@ -9,6 +9,7 @@ from jobhunter.worker.main import exit_unless_lock_held
 
 from tests.support.clock import FakeClock
 from tests.support.logs import logged
+from tests.support.reconcile import registered_by
 
 
 class Exited(Exception):
@@ -112,6 +113,8 @@ class World:
         self.deps: list[object] = []
         self.profile_deps: list[object] = []  # Task 11: what the profile graphs were built with
         self.profile_graphs = object()
+        self.score_deps: list[object] = []  # M3 Task 11: what the score graphs were built with
+        self.score_graphs = object()
         world = self
 
         class FakeLockSession:
@@ -145,6 +148,7 @@ class World:
 
         class FakeExecutions:
             async def cancel_all(self, *, timeout_s: float = 30.0) -> int:
+                events.append("executions_cancel")
                 world.timeouts["executions"] = timeout_s
                 world.on_executions_cancelled()
                 return 0
@@ -200,6 +204,10 @@ class World:
             world.profile_deps.append(deps)
             return world.profile_graphs
 
+        def fake_build_score_graphs(deps: object) -> object:
+            world.score_deps.append(deps)
+            return world.score_graphs
+
         async def fake_reconcilers(ctx: Any, cadence: str) -> dict[str, int]:
             events.append(f"reconcile_{cadence}")
             world.contexts.append(ctx)
@@ -243,6 +251,15 @@ class World:
         self.superseded = False  # a newer worker took over before step 8
         self.fence_owner = "worker_epoch"  # the owner of the fence step 8's guard raises when `superseded`
         self.start_fenced = False  # a newer worker took over after step 8's sync, before its reconcilers
+        # Task 28 fix round 1: the teardown's `llm_tries` step, on the real gateway the start builds.
+        from jobhunter.llm.gateway import LLMGateway
+
+        async def recording_settle_in_flight(gateway: object, timeout_s: float) -> int:
+            events.append("llm_tries")
+            world.timeouts["llm_tries"] = timeout_s
+            return 0
+
+        monkeypatch.setattr(LLMGateway, "settle_in_flight", recording_settle_in_flight)
         monkeypatch.setattr(http, "_configuration", http._configuration)  # restored on teardown
         monkeypatch.setattr(http, "configure", recording_configure)
 
@@ -256,6 +273,7 @@ class World:
             "open_saver": fake_open_saver,
             "build_collect_graph": fake_build_collect_graph,
             "build_profile_graphs": fake_build_profile_graphs,
+            "build_score_graphs": fake_build_score_graphs,
             "run_reconcilers": fake_reconcilers,
             "EXECUTIONS": FakeExecutions(),
             "make_clients": recording_make_clients,
@@ -285,7 +303,17 @@ class World:
         self.cfg = load_config("worker", env, secrets)
 
 
-TEARDOWN = ["watchdog_stop", "saver_close", "queue_close", "engine_dispose", "lock_close"]
+# The executions are cancelled first, then the gateway's tries still in flight settle (`llm_tries`), before
+# the watchdog stops and well before the engine and the lock session close (Task 28 fix round 1).
+TEARDOWN = [
+    "executions_cancel",
+    "llm_tries",
+    "watchdog_stop",
+    "saver_close",
+    "queue_close",
+    "engine_dispose",
+    "lock_close",
+]
 
 
 async def test_a_requested_shutdown_tears_down_in_order_and_exits_0(monkeypatch, tmp_path, caplog) -> None:
@@ -404,6 +432,36 @@ async def test_a_fence_of_another_owner_at_the_startup_sync_fails_the_start_and_
     assert logged(caplog, "worker_superseded_at_start") == []
 
 
+@pytest.mark.parametrize(("owner", "code"), [("worker_epoch", 70), ("worker_lock", 1)])
+async def test_a_takeover_fenced_by_a_newer_epoch_exits_70_and_the_claim_s_own_fence_exits_1(
+    monkeypatch, tmp_path, caplog, owner, code
+) -> None:
+    """M3 Task 27: the claim commits before the sweeps, so a newer worker can claim in between and a sweep's
+    fence then refuses this worker's epoch: it is superseded, as at its startup sync (exit 70,
+    `worker_superseded_at_start`), and nothing after the takeover is built. The claim's own lock check
+    (`worker_lock`) stays a failed start (exit 1)."""
+    from jobhunter.errors import FencedOut
+    from jobhunter.worker import main
+
+    world = World(monkeypatch, tmp_path)
+
+    async def fenced_claim(engine: object, ident: object) -> tuple[int, dict[str, int]]:
+        world.events.append("claim")
+        raise FencedOut(owner=owner)
+
+    monkeypatch.setattr(main, "claim_epoch_and_sweep", fenced_claim)
+    assert await main.worker_main(world.cfg) == code
+    assert world.events[world.events.index("claim") :] == [
+        "claim",
+        "executions_cancel",  # no gateway was built, so no `llm_tries`
+        "queue_close",
+        "engine_dispose",
+        "lock_close",
+    ]
+    assert len(logged(caplog, "worker_superseded_at_start")) == (code == 70)
+    assert [e["exit_code"] for e in logged(caplog, "worker_shutdown_complete")] == [code]
+
+
 async def test_a_worker_superseded_during_its_start_cadence_stops_itself_and_exits_0(
     monkeypatch, tmp_path, caplog
 ) -> None:
@@ -468,8 +526,12 @@ async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_p
     """Task 11: after the saver, the gateway (on the fake LLM here), the parse client on `cfg.parse_jobs_dir`
     (its leftovers removed at the start), the CV store on `cfg.cv_store_dir` and the profile graphs on
     their process-wide deps; `operation_deps` holds the same objects and the shared embedder, and the
-    gateway's HTTP client is closed at teardown."""
+    gateway's HTTP client is closed at teardown. M3 Task 11: the score graphs on `ScoreDeps` of the same
+    engine, gateway and saver."""
+    from jobhunter.clock import utcnow
     from jobhunter.graphs.profile.deps import ProfileDeps
+    from jobhunter.graphs.score.deps import ScoreDeps
+    from jobhunter.llm.batches import BatchesClient
     from jobhunter.llm.gateway import LLMGateway
     from jobhunter.profile.parse_client import ParseClient
     from jobhunter.profile.storage import CvStore
@@ -507,6 +569,27 @@ async def test_the_runtime_carries_the_operation_dependencies(monkeypatch, tmp_p
     )
     assert runtime.gateway.http_client.is_closed  # the teardown's `llm` step
     assert runtime.gateway.configured and logged(caplog, "llm_not_configured") == []
+    # M3 Task 11: the score graphs on the process's engine, gateway, clock and saver, compiled once
+    [score_deps] = world.score_deps
+    assert runtime.score_graphs is world.score_graphs and runtime.score_deps is score_deps
+    assert isinstance(score_deps, ScoreDeps)
+    assert (score_deps.engine, score_deps.gateway, score_deps.saver) == (
+        runtime.engine,
+        runtime.gateway,
+        runtime.saver,
+    )
+    assert score_deps.monotonic is runtime.gateway.monotonic and score_deps.clock is utcnow
+    # M3 Task 27: one Batches client on the gateway's client, monotonic clock and sleep; the operation
+    # dependencies carry the score steps' deps and that client, the handlers build neither themselves
+    client = runtime.batches_client
+    assert isinstance(client, BatchesClient) and client.configured
+    assert (client._http, client._monotonic, client._sleep, client._clock) == (
+        runtime.gateway.http_client,
+        runtime.gateway.monotonic,
+        runtime.gateway.sleep,
+        utcnow,
+    )
+    assert deps.score_steps is runtime.score_deps and deps.batches_client is client
 
 
 async def test_a_worker_without_a_key_and_not_in_fake_mode_starts_and_logs_llm_not_configured(
@@ -552,6 +635,7 @@ async def test_a_start_that_fails_after_the_claim_stops_the_watchdog_and_closes_
     assert await worker_main(world.cfg) == 1
     # Nothing after the failed step was built; what was built is closed, the lock session last.
     assert world.events[world.events.index("queue_open") + 1 :] == [
+        "executions_cancel",  # no gateway was built, so no `llm_tries`
         "watchdog_stop",
         "queue_close",
         "engine_dispose",
@@ -600,7 +684,11 @@ async def test_the_teardown_shares_what_is_left_of_the_one_stop_deadline(
     world.saver_close_hangs = True
     # Bounded: a teardown that waits past its budget fails the test, never hangs it.
     assert await asyncio.wait_for(main.worker_main(world.cfg), 5) == 1  # a teardown step was cut off
-    assert world.timeouts == {"executions": shutdown.TEARDOWN_S, "watchdog": shutdown.TEARDOWN_S - 4.0}
+    assert world.timeouts == {
+        "executions": shutdown.TEARDOWN_S,
+        "llm_tries": min(main.TRIES_SETTLE_S, shutdown.TEARDOWN_S - 4.0),  # the tries share what is left
+        "watchdog": shutdown.TEARDOWN_S - 4.0,
+    }
     (event,) = logged(caplog, "worker_teardown_failed")
     assert (event["step"], event["error_class"]) == ("saver", "TimeoutError")
     assert world.events[-len(TEARDOWN) :] == TEARDOWN  # every step still ran, the lock session last
@@ -623,6 +711,7 @@ M1_RECONCILERS = {
     "stale_sweep_daily": ["daily"],
     "ats_mass_events": ["tick"],
     "group_representatives": ["heavy"],
+    # M1's, registered by `worker.embedding_reconcile` since M3 Task 15 (M1 Carry-forward 14, Ruling P44)
     "awaiting_embedding": ["heavy"],
 }
 # The reconcilers M2 adds, by task: the spend ledger's two (Task 3), the gateway's refusal rate (Task 5), the
@@ -635,64 +724,148 @@ M2_RECONCILERS = {
     "scope_apply_failed": ["tick"],
     "profile_vectors": ["heavy"],
 }
-# Run with the module names as arguments: it imports those modules and nothing else, then reads the registries
-# from `sys.modules` (each registry module is imported by the modules that register into it).
-_REGISTRY_SCRIPT = """\
-import importlib, json, sys
-for module in sys.argv[1:]:
-    importlib.import_module(module)
-print(json.dumps({
-    "reconcilers": {
-        name: sorted(cadences)
-        for name, (cadences, _) in sys.modules["jobhunter.worker.reconcilers"].REGISTRY.items()
-    },
-    "sweeps": sorted(sys.modules["jobhunter.worker.epoch"]._SWEEPS),
-    "handlers": sorted(sys.modules["jobhunter.worker.operations"].HANDLERS),
-    "failure_hooks": sorted(sys.modules["jobhunter.worker.operations"].FAILURE_HOOKS),
-    "main_imported": "jobhunter.worker.main" in sys.modules,
-}))
-"""
-
-
-def registered_by(modules: tuple[str, ...]) -> dict[str, object]:
-    """What a fresh interpreter has registered after importing only `modules`."""
-    import json
-    import subprocess
-    import sys
-
-    done = subprocess.run(
-        [sys.executable, "-c", _REGISTRY_SCRIPT, *modules],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=120,
-    )
-    registered: dict[str, object] = json.loads(done.stdout.strip().splitlines()[-1])
-    return registered
+# The M3 reconcilers, final (Task 27): `orphaned_cycles` (Task 11, `scoring.cycles`, with the takeover sweeps
+# `score_targets` and `score_cycles`; Ruling P44), `expiry_sweep` and `budget_release` (Task 13,
+# `scoring.targets`), `bulk_operations` (Task 14, `llm.bulk`, through `scoring.cycles`) and
+# `missing_targets` (Task 14, `scoring.targets`), `batch_submissions` (Task 16, `scoring.batch_operations`
+# since Ruling T16-e), and Task 18's four in `scoring.reconcilers`: `stuck_targets`, `det_completeness`,
+# `admission_alerts` and `scoring_drift`. (`awaiting_embedding` is M1's, registered by
+# `worker.embedding_reconcile` since Task 15.)
+M3_RECONCILERS = {
+    "orphaned_cycles": ["tick"],
+    "stuck_targets": ["tick"],
+    "budget_release": ["tick"],
+    "bulk_operations": ["heavy"],
+    "missing_targets": ["heavy"],
+    "det_completeness": ["heavy"],
+    "expiry_sweep": ["heavy"],
+    "admission_alerts": ["heavy"],
+    "scoring_drift": ["heavy"],
+    "batch_submissions": ["tick"],
+}
+# The modules step 4 imports for M3 (Task 27): each registers what the pin below names, or is listed so that
+# the start imports it before the takeover (`scoring.golden`, `llm.batches`: nothing of their own, checked by
+# import in `test_the_registering_modules_list_every_m3_module`).
+M3_MODULES = (
+    "jobhunter.scoring.targets",
+    "jobhunter.scoring.cycles",
+    "jobhunter.scoring.batches",
+    "jobhunter.scoring.batch_operations",
+    "jobhunter.scoring.reconcilers",
+    "jobhunter.scoring.golden",
+    "jobhunter.scoring.eval_runner",
+    "jobhunter.llm.batches",
+    "jobhunter.worker.embedding_reconcile",
+)
 
 
 def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handler() -> None:
-    """Fix round 1 (Minor 5): in a fresh interpreter that imports ONLY `worker.main._REGISTERING_MODULES`
-    (step 4, before the takeover; never `worker.main` itself, whose imports would register most of it
-    anyway), the registries hold exactly the M1 and M2 reconcilers with their cadences, the two takeover
-    sweeps, the `extract_profile_text` (Task 11), `extract_profile` (Task 13), `embed_profile` (Task 19),
-    `propose_queries` (Task 20), `apply_scope` (Task 18) and `watchlist_validate` handlers, and the failure
-    hooks of the two profile phases and of the query proposal (`embed_profile` has none: it drives no domain
-    row). `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with
-    `profile.operations`, which imports `profile.vectors`; `worker.main` lists neither."""
+    """The final pin of M3 (Task 27; M2 fix round 1, Minor 5, made it a fresh interpreter): one that imports
+    ONLY `worker.main._REGISTERING_MODULES` (step 4, before the takeover; never `worker.main` itself, whose
+    imports would register most of it anyway) holds exactly:
+    - the reconcilers of M1, M2 and M3 with their cadences (`M3_RECONCILERS` is the milestone's final set);
+    - the five takeover sweeps (`operations`, `runs`, M3 Task 11's `score_targets` and `score_cycles`, Task
+      16's `batch_submissions`), each run in a fenced transaction of its own since Task 27;
+    - the handlers `extract_profile_text` (M2 Task 11), `extract_profile` (Task 13), `embed_profile` (Task
+      19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, and M3's
+      `create_targets_for_tuple` (Task 14, `scoring.targets`), `batch_submit` (Task 16,
+      `scoring.batch_operations`, Ruling T16-e) and `eval_run` (Task 19, `scoring.eval_runner`);
+    - the failure hooks of the two profile phases, of the query proposal and of `eval_run` only (written in
+      `worker.operations`, Ruling P39; `embed_profile` drives no domain row; `batch_submit`'s cleanup needs
+      `active_config`, which its reconciler takes, Codex r3 B2; `create_targets_for_tuple` is re-requested
+      by `missing_targets`);
+    - the `bulk_operations` reconciler's one active step, Task 16's `rerequest` (Ruling T16-d);
+    - the one gauge refresh `metrics_refresh` runs, Task 18's `score_lane`;
+    - the execution lock of each kind that has one (`OPERATION_LOCKS`: `batch_submit` under `batch`, Task 14).
+    `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with `profile.operations`,
+    which imports `profile.vectors`; `worker.main` lists neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
 
     assert registered_by(_REGISTERING_MODULES) == {
-        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS},
-        "sweeps": ["operations", "runs"],
+        "reconcilers": {**M1_RECONCILERS, **M2_RECONCILERS, **M3_RECONCILERS},
+        "sweeps": ["batch_submissions", "operations", "runs", "score_cycles", "score_targets"],
         "handlers": [
             "apply_scope",
+            "batch_submit",
+            "create_targets_for_tuple",
             "embed_profile",
+            "eval_run",
             "extract_profile",
             "extract_profile_text",
             "propose_queries",
             "watchlist_validate",
         ],
-        "failure_hooks": ["extract_profile", "extract_profile_text", "propose_queries"],
+        "failure_hooks": ["eval_run", "extract_profile", "extract_profile_text", "propose_queries"],
+        "active_steps": ["jobhunter.scoring.batches.rerequest"],
+        "gauge_refreshes": ["score_lane"],
+        # M3 Task 14 (Codex r3 B20): `defer_operation_job` reads it at every enqueue
+        "operation_locks": {"batch_submit": "batch"},
         "main_imported": False,
     }
+
+
+def test_the_registering_modules_list_every_m3_module() -> None:
+    """M3 Task 27: step 4 imports every M3 module of the plan's list. `scoring.golden` and `llm.batches`
+    register nothing of their own (checked by import: what each registers is what its imports bring along),
+    so listing them changes nothing of the pin above."""
+    from jobhunter.worker.main import _REGISTERING_MODULES
+
+    assert set(M3_MODULES) <= set(_REGISTERING_MODULES)
+    for module in ("jobhunter.scoring.golden", "jobhunter.llm.batches"):
+        registered = registered_by((module,))
+        assert registered["handlers"] == [] and registered["failure_hooks"] == [], module
+        assert registered["active_steps"] == [] and registered["gauge_refreshes"] == [], module
+        assert registered["sweeps"] in ([], ["operations"]), module  # `worker.operations`', through an import
+
+
+def test_awaiting_embedding_is_registered_by_the_worker_s_module_alone() -> None:
+    """M3 Task 15 (M1 Carry-forward 14, Rulings P15 and P44): the `awaiting_embedding` reconciler lives in
+    `worker.embedding_reconcile`, which step 4 lists, so the registered set keeps it; `jobhunter.embeddings`,
+    which the api imports, registers it no longer."""
+    from jobhunter.worker.main import _REGISTERING_MODULES
+
+    assert "jobhunter.worker.embedding_reconcile" in _REGISTERING_MODULES
+    moved = registered_by(("jobhunter.worker.embedding_reconcile",))["reconcilers"]
+    assert isinstance(moved, dict) and moved["awaiting_embedding"] == ["heavy"]
+    left = registered_by(("jobhunter.embeddings",))["reconcilers"]
+    assert isinstance(left, dict) and "awaiting_embedding" not in left
+    # Ruling P15, Task 27: the api still registers other reconcilers (only the worker runs them), not this one
+    api = registered_by(("jobhunter.api.app",))["reconcilers"]
+    assert isinstance(api, dict) and api and "awaiting_embedding" not in api
+
+
+def test_the_m3_tasks_queues_and_pools_keep_their_pinned_shape() -> None:
+    """M3 Task 27: the four M3 tasks on their queues (spec §3.3.2): `score_cycle` under the lock `score`, its
+    stalled job failed, never retried (`NO_STALL_RETRY`, Codex r1 #17); the three periodic ones at their
+    crons with the queueing lock of their name; the queues' concurrency; and the pools at the spec's sizes
+    (§9.1 L3375: the checkpointer 1 to 4, the engine 10, the queue pool 4), which the perf test measures."""
+    from jobhunter.graphs import checkpointer
+    from jobhunter.worker.main import ENGINE_POOL_SIZE, QUEUE_POOL_MAX_SIZE
+    from jobhunter.worker.tasks import NO_STALL_RETRY, QUEUES, _reset_task_app, job_task_name, make_queue_app
+
+    assert dict(QUEUES) == {"collect": 1, "score": 1, "aux": 2, "tick": 1}
+    assert NO_STALL_RETRY == frozenset({"score_cycle"})
+    assert (ENGINE_POOL_SIZE, QUEUE_POOL_MAX_SIZE) == (10, 4)
+    assert (checkpointer._POOL_MIN_SIZE, checkpointer._POOL_MAX_SIZE) == (1, 4)
+    _reset_task_app()
+    try:
+        app = make_queue_app("dbname=unused")
+        cycle = app.tasks[job_task_name("score_cycle")]
+        assert (cycle.queue, cycle.lock, cycle.queueing_lock) == (
+            "score",
+            "score",
+            None,
+        )  # per trigger, at defer
+        periodic = {
+            name: (task.cron, task.task.queue, task.task.queueing_lock)
+            for (name, _), task in app.periodic_registry.periodic_tasks.items()
+        }
+        assert {
+            name: periodic[job_task_name(name)] for name in ("batch_poll", "batch_reconcile_ambiguous")
+        } == {
+            "batch_poll": ("*/5 * * * *", "aux", "batch_poll"),
+            "batch_reconcile_ambiguous": ("*/15 * * * *", "aux", "batch_reconcile_ambiguous"),
+        }
+        assert periodic[job_task_name("canary_daily")] == ("41 6 * * *", "tick", "canary_daily")
+    finally:
+        _reset_task_app()

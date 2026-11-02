@@ -39,6 +39,7 @@ from tests.support.fixtures import count_rows
 from tests.support.pg import PgServer, blocked_or_done
 from tests.support.procs import await_until
 from tests.support.profile import idem
+from tests.support.scoring import activate_score_tuple, aged_job, state_target, swept_of
 from tests.support.settings import (
     SETTINGS_URL,
     activate_profile,
@@ -414,6 +415,36 @@ async def test_disabling_the_schedule_is_a_schedule_save(logged_in_client, engin
     assert state.last_evaluated_slot == datetime(2026, 10, 22, 5, 15, tzinfo=UTC)  # 6 h slots from 05:15 UTC
 
 
+async def test_a_timezone_only_save_reanchors(logged_in_client, engine, clock) -> None:
+    """`display.timezone` is a `schedule` field (spec 3.5, U3): `anchor_local` is a wall time in that zone, so
+    a change of zone alone moves `anchor_utc` by the difference of the two zones' offsets and leaves the rest
+    of the schedule row as it was."""
+    berlin_anchor = datetime(2026, 10, 22, 4, tzinfo=UTC)  # 06:00 CEST (UTC+2) on the save date
+    async with engine.begin() as conn:  # the row as an earlier schedule save at NOW leaves it
+        await conn.execute(
+            text("UPDATE schedule_state SET anchor_utc = :a, last_evaluated_slot = :a"), {"a": berlin_anchor}
+        )
+    async with engine.connect() as conn:
+        before = (await conn.execute(text("SELECT * FROM schedule_state"))).one()
+    payload = await active_payload(logged_in_client)
+    assert (payload["display"]["timezone"], payload["schedule"]["anchor_local"]) == ("Europe/Berlin", "06:00")
+    payload["display"]["timezone"] = "America/New_York"
+    body = await save(logged_in_client, payload)
+    assert body["version"]["effect_classes"] == ["schedule"]
+    async with engine.connect() as conn:
+        state = (await conn.execute(text("SELECT * FROM schedule_state"))).one()
+    # 06:00 EDT (UTC-4) is 10:00 UTC: six hours later than 06:00 CEST (UTC+2), the offsets' difference
+    assert state.anchor_utc - before.anchor_utc == timedelta(hours=6)
+    assert state.anchor_utc == datetime(2026, 10, 22, 10, tzinfo=UTC)
+    # nothing else of the schedule changed: the interval and the switch are those of the active version, and
+    # the cursor is the latest slot at or before now (04:00 UTC: 6 h slots from the new anchor)
+    assert (state.interval_s, state.enabled) == (before.interval_s, before.enabled) == (6 * 3600, True)
+    assert state.last_evaluated_slot == datetime(2026, 10, 22, 4, tzinfo=UTC)
+    assert state.settings_version_id == body["version"]["id"] and state.updated_at == NOW
+    stored = (await version_row(engine, body["version"]["id"])).payload
+    assert stored["schedule"] == payload["schedule"] and stored["display"]["timezone"] == "America/New_York"
+
+
 # --- collection ---------------------------------------------------------------------------------------------
 
 
@@ -589,6 +620,39 @@ async def test_a_buffer_only_edit_writes_the_buffer_and_keeps_the_lowering(
 # --- execution and evaluation policy ------------------------------------------------------------------------
 
 
+async def test_an_admission_save_sweeps_the_expiry_at_once_in_both_directions(
+    logged_in_client, engine, clock
+) -> None:
+    """M3 Task 13 (L4893, A2 A5, Deviation 24): a changed `max_ad_age_days` runs the expiry sweep of the
+    active tuple in the save's transaction: raised, a target the old age expired returns `pending` with its
+    reason cleared; lowered, a pending one of that age expires; the ranking is bumped each time."""
+    async with engine.begin() as conn:
+        tuple_id = await activate_score_tuple(conn)
+        returning = await state_target(
+            conn, await aged_job(conn, now=NOW, first_seen_days=40), tuple_id, "expired_unscored"
+        )
+        older = await state_target(
+            conn, await aged_job(conn, now=NOW, first_seen_days=70), tuple_id, "expired_unscored"
+        )
+    before = await generation(engine)
+    payload = await active_payload(logged_in_client)
+    payload["scope"]["max_ad_age_days"] = 60
+    body = await save(logged_in_client, payload)
+    assert "admission" in body["version"]["effect_classes"]
+    back = await swept_of(engine, returning)
+    assert (back.state, back.state_reason) == ("pending", None)
+    assert (await swept_of(engine, older)).state == "expired_unscored"  # past the raised age as well
+    assert await generation(engine) == before + 1
+    payload["scope"]["max_ad_age_days"] = 30
+    await save(logged_in_client, payload)
+    again = await swept_of(engine, returning)
+    assert (again.state, again.state_reason) == ("expired_unscored", "too_old")
+    assert await generation(engine) == before + 2
+    payload["display"]["ui_language"] = "de"  # no admission change: no sweep, no bump
+    await save(logged_in_client, payload)
+    assert await generation(engine) == before + 2
+
+
 async def test_execution_and_evaluation_policy_flip_their_pointers(logged_in_client, engine) -> None:
     before = await active_row(engine)
     payload = await active_payload(logged_in_client)
@@ -623,7 +687,7 @@ def with_generator_effort(payload: dict[str, Any], effort: str) -> dict[str, Any
 
 
 async def test_an_llm_tuple_save_without_a_profile_flips_the_model_policy_only(
-    logged_in_client, engine
+    logged_in_client, engine, fake_llm_process
 ) -> None:
     before = await active_row(engine)
     generation_before = await generation(engine)
@@ -638,7 +702,9 @@ async def test_an_llm_tuple_save_without_a_profile_flips_the_model_policy_only(
     assert await count_rows(engine, "llm_tuples") == 0 and await generation(engine) == generation_before
 
 
-async def test_an_llm_tuple_save_with_a_profile_flips_the_tuple_and_bumps(logged_in_client, engine) -> None:
+async def test_an_llm_tuple_save_with_a_profile_flips_the_tuple_and_bumps(
+    logged_in_client, engine, fake_llm_process
+) -> None:
     profile_id, old_tuple = await activate_profile(engine)
     before = await active_row(engine)
     generation_before = await generation(engine)
@@ -666,12 +732,13 @@ async def test_an_llm_tuple_save_with_a_profile_flips_the_tuple_and_bumps(logged
 
 
 async def test_the_eval_gate_needs_the_override_once_it_has_failed(
-    logged_in_client, engine, monkeypatch
+    logged_in_client, engine, monkeypatch, fake_llm_process
 ) -> None:
-    """M2's gate is always uncalibrated (fewer than 30 golden cases); a failed one needs the override
-    (§11.13)."""
+    """A failed gate needs the override (§11.13), for the model policy and the evaluation policy alike, and
+    refuses before step 4's first write. (The gate's reads, the candidate and the schema verification are
+    `test_eval_gate.py`'s; on the fake the save verifies no schema.)"""
 
-    async def failed(conn: object) -> str:
+    async def failed(conn: object, *, candidate: object) -> str:
         return "failed"
 
     derived_rows: list[object] = []
@@ -821,7 +888,7 @@ def test_the_action_order_is_llm_tuple_then_scope_then_the_others() -> None:
 
 
 async def test_a_fault_between_llm_tuple_and_scope_rolls_both_back(
-    logged_in_client, engine, monkeypatch
+    logged_in_client, engine, monkeypatch, fake_llm_process
 ) -> None:
     await activate_profile(engine)
     before = await active_row(engine)
@@ -834,7 +901,11 @@ async def test_a_fault_between_llm_tuple_and_scope_rolls_both_back(
     assert r.status_code == 500 and r.json()["code"] == "internal"
     assert await active_row(engine) == before and await generation(engine) == generation_before
     assert await count_rows(engine, "llm_tuples") == 1  # the active profile's own tuple only
-    assert await count_rows(engine, "settings_versions") == 1 and await count_rows(engine, "operations") == 0
+    assert await count_rows(engine, "settings_versions") == 1
+    # the active profile's activation recorded its create_targets_for_tuple and bulk operation (M3 Task 14)
+    assert await count_rows(engine, "operations", kind=("apply_scope",)) == 0
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 1
+    assert await count_rows(engine, "bulk_operations") == 1
     assert await count_rows(engine, "api_idempotency") == 0  # the key's claim rolled back with the rest
     monkeypatch.setattr(save_module, "afault_point", no_fault)
     r = await post(logged_in_client, request, key="fault-key-000000001")  # the client's retry
@@ -844,9 +915,15 @@ async def test_a_fault_between_llm_tuple_and_scope_rolls_both_back(
     assert after.llm_tuple_id != before.llm_tuple_id and after.pending_scope_version_id is not None
     assert await count_rows(engine, "llm_tuples") == 2 and await generation(engine) == generation_before + 1
     assert [op[0] for op in await apply_scope_operations(engine)] == ["pending"]
+    # the new tuple's activation (M3 Task 14): the old bulk operation cancelled, a new one and its creation
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 2
+    assert await count_rows(engine, "bulk_operations", state=("cancelled",)) == 1
+    assert await count_rows(engine, "bulk_operations", state=("active",)) == 1
 
 
-async def test_llm_tuple_and_scope_commit_together(logged_in_client, engine, monkeypatch) -> None:
+async def test_llm_tuple_and_scope_commit_together(
+    logged_in_client, engine, monkeypatch, fake_llm_process
+) -> None:
     await activate_profile(engine)
     payload = with_generator_effort(await active_payload(logged_in_client), "high")
     payload["scope"]["locations"] = [berlin(30)]
@@ -856,16 +933,22 @@ async def test_llm_tuple_and_scope_commit_together(logged_in_client, engine, mon
     task = asyncio.create_task(post(logged_in_client, request))
     await asyncio.wait_for(pause.reached.wait(), 10)
     # the tuple row and the model-policy flip are written, uncommitted: another connection sees neither
-    assert await count_rows(engine, "llm_tuples") == 1 and await count_rows(engine, "operations") == 0
+    assert await count_rows(engine, "llm_tuples") == 1
+    assert await count_rows(engine, "operations", kind=("apply_scope",)) == 0
+    # the active profile's own activation recorded one create_targets_for_tuple (M3 Task 14)
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 1
     pause.resume()
     r = await task
     assert r.status_code == 201, r.text
-    assert await count_rows(engine, "llm_tuples") == 2 and await count_rows(engine, "operations") == 1
+    assert await count_rows(engine, "llm_tuples") == 2
+    assert await count_rows(engine, "operations", kind=("apply_scope",)) == 1
+    assert await count_rows(engine, "operations", kind=("create_targets_for_tuple",)) == 2
 
 
 async def test_llm_tuple_and_budget_bump_once_after_the_budget_action(
-    logged_in_client, engine, monkeypatch
+    logged_in_client, engine, monkeypatch, fake_llm_process, clock
 ) -> None:
+    # `clock`: the save writes the row of its own month, and `month_row` reads `MONTH`'s (October 2026).
     await activate_profile(engine)
     generation_before = await generation(engine)
     calls: list[str] = []

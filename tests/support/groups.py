@@ -1,9 +1,9 @@
 """Duplicate-group test data (Task 20): `JobView`s with sane defaults, Location fixtures and canonical jobs.
 
-`job(**overrides)` is a `groups.JobView` of a senior software engineer at `acme` in Berlin (`BERLIN`, kind
-`city`), full text `FULL_TEXT`, first seen at `T`, `active`, source rank 1, no ATS board and no requisition
-id; any field can be overridden. `varied(n, offset)` is a text of `n` distinct words of letters (`n - 4`
-distinct 5-shingles).
+`job(**overrides)` is a `group_rules.JobView` of a senior software engineer at `acme` in Berlin (`BERLIN`,
+kind `city`), full text `FULL_TEXT`, first seen at `T`, `active`, source rank 1, no ATS board and no
+requisition id; any field can be overridden. `varied(n, offset)` is a text of `n` distinct words of letters
+(`n - 4` distinct 5-shingles).
 
 The Location fixtures are built by hand, not from the gazetteer: `BERLIN`, `LEIPZIG` (about 150 km from
 Berlin) and `ZURICH` carry their GeoNames ids and coordinates; `POTSDAM_24KM` is a point 24 km west of Berlin
@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from jobhunter.dedup import revisions
-from jobhunter.dedup.groups import JobView
+from jobhunter.dedup.group_rules import JobView
 from jobhunter.sources.parsing.locations import Candidate, Location
 from sqlalchemy.ext.asyncio import AsyncEngine
 

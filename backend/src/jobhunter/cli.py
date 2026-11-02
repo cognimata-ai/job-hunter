@@ -43,6 +43,23 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="send to the Anthropic API with the worker's anthropic_key (default: the recorded-SSE fake)",
     )
+    dry_run.add_argument(
+        "--version",
+        type=int,
+        metavar="ID",
+        help="the prompt-schema version to dry-run (default: the active one)",
+    )
+    policy = dry_run.add_mutually_exclusive_group()
+    policy.add_argument(
+        "--model-policy", type=int, metavar="ID", help="the model policy to dry-run (default: the active one)"
+    )
+    policy.add_argument(
+        "--candidate-payload",
+        metavar="FILE",
+        help="a settings document (JSON) whose model policy is staged by hash, then dry-run",
+    )
+    _add_golden_commands(commands)
+    _add_eval_commands(commands)
     return parser
 
 
@@ -91,6 +108,39 @@ def _add_sessions_commands(commands: "argparse._SubParsersAction[argparse.Argume
     sessions_commands.add_parser(
         "unlock", help="lift every login lockout and resolve the global auth.lockout alert"
     )
+
+
+def _add_golden_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    golden = commands.add_parser("golden", help="the golden set (§11.13): the adversarial seed")
+    golden_commands = golden.add_subparsers(dest="golden_command", required=True)
+    seed = golden_commands.add_parser(
+        "seed-adversarial",
+        help="seed the adversarial golden cases (synthetic ads and profiles), idempotently",
+    )
+    seed.add_argument(
+        "--fixtures", metavar="DIR", help="the fixture directory (default: the packaged adversarial fixtures)"
+    )
+
+
+def _add_eval_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    evals = commands.add_parser("eval", help="golden-set eval runs (§11.13)")
+    eval_commands = evals.add_subparsers(dest="eval_command", required=True)
+    run = eval_commands.add_parser("run", help="start an eval run on the worker and wait for its end")
+    run.add_argument("--kind", required=True, choices=["golden"])
+    candidate = run.add_mutually_exclusive_group(required=True)
+    candidate.add_argument(
+        "--candidate",
+        metavar="active|IDS",
+        help="'active', or the rubric, prompt-schema, model-policy, evaluation-policy and execution-config "
+        "ids, comma-separated",
+    )
+    candidate.add_argument(
+        "--candidate-payload", metavar="FILE", help="a settings document (JSON) whose rows are staged by hash"
+    )
+    run.add_argument("--route", default="production", choices=["production", "forced_critic"])
+    transport = run.add_mutually_exclusive_group(required=True)
+    transport.add_argument("--live", action="store_true", help="the run is requested on the Anthropic API")
+    transport.add_argument("--fake", action="store_true", help="the run is requested on the fake transport")
 
 
 def _add_fixtures_commands(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
@@ -188,6 +238,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         from jobhunter.cli_schema_dry_run import run_schema_dry_run
 
         return run_schema_dry_run(args)
+    if args.command == "golden":
+        # Imported here: the golden set needs the database layer and the scoring modules.
+        from jobhunter.cli_golden import run_golden_command
+
+        return run_golden_command(args)
+    if args.command == "eval":
+        # Imported here, like `golden`.
+        from jobhunter.cli_golden import run_eval_command
+
+        return run_eval_command(args)
     if args.command == "fixtures":
         # Imported here: only the fixture tooling needs the scrubber.
         from jobhunter.cli_fixtures import run_fixtures_command

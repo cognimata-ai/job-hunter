@@ -1362,6 +1362,83 @@ def test_the_length_of_a_header_line_does_not_count_claims_so_a_second_pass_read
     assert strip_contacts(once).stripped_text == once
 
 
+@pytest.mark.parametrize(
+    ("text", "stripped"),
+    [
+        # Found by the idempotence property: five personal spans run the line past 1000 characters before its
+        # title word, and a second pass, which reads five short tokens there, took `Peter Leiter` below it.
+        (
+            "https://example.org/a\u2013geb.a@b.de: ReligionMustermannGeburtsdatum-Ort:"
+            + "Religion: " * 100
+            + "Technischer Leiter\nPeter Leiter\n",
+            "[URL][PERSONAL] [PERSONAL] [PERSONAL] [PERSONAL] [PERSONAL] Technischer Leiter\n[NAME]\n",
+        ),
+        # A long link or a run of addresses before the title: the claims, not the title, cross the 1000th
+        # character, and the title line is kept as it is.
+        (
+            "https://example.org/" + "a" * 1200 + " Senior Backend Engineer\nMax Mustermann\nSkills\n"
+            "Gruß, Max Mustermann\n",
+            "[URL] Senior Backend Engineer\n[NAME]\nSkills\nGruß, [NAME]\n",
+        ),
+        (
+            "max@example.org " * 70 + "Senior Backend Engineer\nMax Mustermann\nSkills\n",
+            "[EMAIL] " * 70 + "Senior Backend Engineer\n[NAME]\nSkills\n",
+        ),
+        (
+            "https://example.org/" + "a" * 1200 + " Technischer Leiter\nPeter Leiter\nSkills\n",
+            "[URL] Technischer Leiter\n[NAME]\nSkills\n",
+        ),
+    ],
+    ids=["property-counterexample", "long-url", "many-emails", "long-url-adjective-title"],
+)
+def test_a_header_line_is_read_whole_so_one_pass_takes_the_name_a_second_pass_would(
+    text: str, stripped: str
+) -> None:
+    # A claim is as long as its text and its token is shorter: a line read in pieces of a fixed length is cut
+    # in other places by a second pass, which then saw the title word that the first pass's first piece did
+    # not hold (the first piece was all claims, which ends the search).
+    once = strip_contacts(text)
+    assert once.stripped_text == stripped
+    assert strip_contacts(once.stripped_text).stripped_text == once.stripped_text
+    with patch.object(contacts, "_MAX_ROUNDS", 3):
+        assert strip_contacts(text).stripped_text == stripped
+
+
+@pytest.mark.parametrize(
+    ("text", "stripped"),
+    [
+        # A name, a wide gap and more text: the line as a whole is over the cap, the cell before the gap is a
+        # name (the pieces of 1000 took it when the gap ran past the 1000th character only).
+        ("Max Kaufmann" + " " * 300 + "\tx\nSkills\n", "[NAME]" + " " * 300 + "\tx\nSkills\n"),
+        ("Max Kaufmann" + " " * 990 + "\tx\nSkills\n", "[NAME]" + " " * 990 + "\tx\nSkills\n"),
+        # A title, a wide gap and the name: the name is a cell of its own after a title cell. The pieces of
+        # 1000 left it to a second pass, which cut the line after the gap once the link was a token.
+        (
+            "https://example.org/"
+            + "a" * 980
+            + " Senior Backend Engineer"
+            + " " * 971
+            + "Max Mustermann\nSkills\n",
+            "[URL] Senior Backend Engineer" + " " * 971 + "[NAME]\nSkills\n",
+        ),
+        (
+            "Lebenslauf" + " " * 200 + "Erika Musterfrau\nSkills\n",
+            "Lebenslauf" + " " * 200 + "[NAME]\nSkills\n",
+        ),
+    ],
+    ids=["name-gap-300", "name-gap-990", "url-title-gap-name", "heading-gap-name"],
+)
+def test_a_gap_wider_than_a_header_line_separates_cells_that_are_read_as_lines(
+    text: str, stripped: str
+) -> None:
+    # A gap of more blanks than the cap allows puts the line over the cap, which would end the search; its
+    # cells are read as lines instead, so the rule finds at least what it finds in the whole line. A claim
+    # takes its blanks with it in both passes, so a second pass finds the same gaps.
+    once = strip_contacts(text)
+    assert once.stripped_text == stripped
+    assert strip_contacts(once.stripped_text).stripped_text == once.stripped_text
+
+
 def test_the_feminine_form_of_a_title_word_needs_a_stem_of_four_letters() -> None:
     # `Evin` is no feminine `ev` (a legal form), `Agin` no feminine `ag`.
     for name in ("Evin Mustermann", "Agin Mustermann", "Lin Mustermann"):
@@ -1947,6 +2024,10 @@ _ADVERSARIAL = [
     "Im Spring 5 " * 15_000,
     "Am " * 60_000,
     "Kinder\n030 2312\n54563 Berlin\n" * 6_000,
+    # a header line read whole, and the gaps that separate its cells
+    ("x" + " " * 120) * 2_000,
+    ("Lebenslauf" + " " * 121) * 1_800,
+    "https://example.org/" + "a" * 2_000 + " Senior Engineer" * 12_000,
 ]
 
 

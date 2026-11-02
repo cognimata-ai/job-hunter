@@ -224,11 +224,14 @@ async def test_1201_jobs_take_three_chunks_then_the_checked_flip(
     on_fixed_clock(op_runner)
     await op_runner.run_one(op_id)
     assert chunks == [
-        ("running", {"done": 500, "total": 1201}, s0),
-        ("running", {"done": 1000, "total": 1201}, s0),
-        ("running", {"done": 1201, "total": 1201}, s0),
+        ("running", {"done": 500, "total": 1201, "det_done": 0, "det_total": 0}, s0),
+        ("running", {"done": 1000, "total": 1201, "det_done": 0, "det_total": 0}, s0),
+        ("running", {"done": 1201, "total": 1201, "det_done": 0, "det_total": 0}, s0),
     ]  # the view stays on the old, complete scope through the precompute
-    assert await operation_end(engine, op_id) == ("succeeded", {"done": 1201, "total": 1201})
+    assert await operation_end(engine, op_id) == (
+        "succeeded",
+        {"done": 1201, "total": 1201, "det_done": 0, "det_total": 0},
+    )
     after = await active_row(engine)
     assert (after.scope_version_id, after.pending_scope_version_id, after.updated_at) == (sid, None, NOW)
     assert await generation(engine) == before + 1
@@ -262,7 +265,7 @@ async def test_a_job_changed_after_the_last_chunk_is_recomputed_before_the_flip(
     assert await incomplete_jobs_for(engine, sid) == 0
     assert await operation_end(engine, saved["apply_scope_operation_id"]) == (
         "succeeded",
-        {"done": 20, "total": 20},
+        {"done": 20, "total": 20, "det_done": 0, "det_total": 0},
     )
 
 
@@ -317,7 +320,7 @@ async def test_a_pointer_moved_back_keeps_the_reused_apply_and_ends_the_other_ob
     await op_runner.run_one(first["apply_scope_operation_id"])
     assert await operation_end(engine, first["apply_scope_operation_id"]) == (
         "succeeded",
-        {"done": 5, "total": 5},
+        {"done": 5, "total": 5, "det_done": 0, "det_total": 0},
     )
     assert (await active_scope_id(engine), await pending_scope_id(engine)) == (a, None)
 
@@ -345,7 +348,10 @@ async def test_a_hint_never_ends_the_apply_whose_pointer_moves_back_before_its_f
     monkeypatch.setattr(scope_apply, "_final", pointer_back_first)
     await op_runner.run_one(op_a)
     assert between == [(5, op_a)]  # the hint stopped A before any chunk; the save reused A's live apply
-    assert await operation_end(engine, op_a) == ("succeeded", {"done": 5, "total": 5})
+    assert await operation_end(engine, op_a) == (
+        "succeeded",
+        {"done": 5, "total": 5, "det_done": 0, "det_total": 0},
+    )
     assert (await active_scope_id(engine), await pending_scope_id(engine)) == (a, None)
     assert await incomplete_jobs_for(engine, a) == 0
 

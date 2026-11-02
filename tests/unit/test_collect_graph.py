@@ -23,8 +23,8 @@ from jobhunter.graphs.collect.graph import (
 )
 from jobhunter.graphs.collect.nodes import enqueue_targets
 from jobhunter.graphs.collect.nodes.enqueue_targets import make_enqueue_targets
-from jobhunter.graphs.collect.nodes.finalize import WARNING_COUNTERS
 from jobhunter.graphs.collect.nodes.plan_fallback import ACCOUNT_READ_TIMEOUT_S, route, serpapi_account
+from jobhunter.graphs.collect.report import WARNING_COUNTERS
 from jobhunter.graphs.collect.state import CollectState, CollectUpdate, FetchCellInput, initial_state
 from jobhunter.quota.windows import AccountObservation
 from jobhunter.run_settings import SourcesEnabled
@@ -262,23 +262,12 @@ async def test_a_timed_node_lets_its_error_propagate() -> None:
         await timed("finalize", node)(initial_state(1, 1))
 
 
-async def test_enqueue_targets_records_its_step_and_is_a_no_op_with_a_tuple_until_m3() -> None:
-    """Plan Deviation 10: while `SCORE_TARGETS_ENABLED` is false, a run with a tuple creates no target."""
-    assert enqueue_targets.SCORE_TARGETS_ENABLED is False
+async def test_enqueue_targets_is_switched_on_and_a_no_op_without_a_tuple() -> None:
+    """M3 Task 14 (plan Deviation 10's switch flipped): node 9 creates the run's targets; a run without a
+    tuple (no profile active) records its step and touches nothing (`deps` unused)."""
+    assert enqueue_targets.SCORE_TARGETS_ENABLED is True
     node = make_enqueue_targets(cast(CollectDeps, None))
     assert await node(initial_state(1, 1)) == {"steps": ["enqueue_targets"]}
-    assert await node({**initial_state(1, 1), "llm_tuple_id": 4}) == {"steps": ["enqueue_targets"]}
-
-
-async def test_enqueue_targets_refuses_a_tuple_when_switched_on_without_the_creation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The switch alone, before M3 fills the node, would silently create no target: a bug."""
-    monkeypatch.setattr(enqueue_targets, "SCORE_TARGETS_ENABLED", True)
-    node = make_enqueue_targets(cast(CollectDeps, None))
-    assert await node(initial_state(1, 1)) == {"steps": ["enqueue_targets"]}
-    with pytest.raises(NotImplementedError, match="M3"):
-        await node({**initial_state(1, 1), "llm_tuple_id": 4})
 
 
 def test_the_report_warns_of_the_error_handlers_counters() -> None:

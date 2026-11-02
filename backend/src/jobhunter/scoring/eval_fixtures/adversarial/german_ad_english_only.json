@@ -1,0 +1,186 @@
+{
+  "key": "german_ad_english_only",
+  "label": "good",
+  "expected_knockouts": [],
+  "profile": {
+    "summary": "DevOps engineer with six years of experience in Kubernetes, Terraform and cloud platforms.",
+    "target_titles": [
+      {
+        "title": "DevOps Engineer",
+        "lang": "en"
+      },
+      {
+        "title": "Platform Engineer",
+        "lang": "en"
+      }
+    ],
+    "seniority": "senior",
+    "total_years_experience": 6,
+    "roles": [
+      {
+        "title": "DevOps Engineer",
+        "employer": "Beispiel Cloud Services Ltd",
+        "start": "2019-06-01",
+        "end": "present",
+        "seniority": "senior",
+        "domain": "Cloud",
+        "highlights": [
+          "Migrated forty services to Kubernetes with Terraform and Helm"
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "name": "Kubernetes",
+        "category": "platform",
+        "level": "expert",
+        "years": 6,
+        "evidence": "Kubernetes"
+      },
+      {
+        "name": "Terraform",
+        "category": "tool",
+        "level": "expert",
+        "years": 5,
+        "evidence": "Terraform"
+      },
+      {
+        "name": "Python",
+        "category": "programming_language",
+        "level": "advanced",
+        "years": 6,
+        "evidence": "Python"
+      }
+    ],
+    "languages": [
+      {
+        "code": "en",
+        "code_other": null,
+        "cefr": "native",
+        "evidence": "English (native)"
+      },
+      {
+        "code": "es",
+        "code_other": null,
+        "cefr": "C1",
+        "evidence": "Spanish (C1)"
+      }
+    ],
+    "education": [
+      {
+        "level": "bachelor",
+        "field": "Computer Science",
+        "institution": null,
+        "year": 2018
+      }
+    ],
+    "certifications": [],
+    "domains": [
+      "Cloud"
+    ],
+    "user_entered": {
+      "work_authorization_de": "authorized",
+      "security_clearances": []
+    }
+  },
+  "scope": {
+    "locations": [
+      {
+        "label": "Köln",
+        "gazetteer_id": "geonames:2886242",
+        "lat": 50.93333,
+        "lon": 6.95,
+        "radius_km": 30
+      }
+    ],
+    "remote_within_germany": true,
+    "work_modes": [
+      "remote",
+      "hybrid",
+      "onsite"
+    ],
+    "employment_types": [
+      "full_time",
+      "part_time",
+      "contract",
+      "temporary",
+      "internship",
+      "working_student",
+      "apprenticeship",
+      "freelance"
+    ],
+    "seniority_range": {
+      "mode": "profile_relative",
+      "below": 1,
+      "above": 1,
+      "min": null,
+      "max": null
+    },
+    "industries_include": [],
+    "industries_exclude": [],
+    "accepted_ad_languages": [
+      "de",
+      "en"
+    ],
+    "language_policy_default": "hard",
+    "language_policy": {},
+    "excluded_companies": [],
+    "excluded_keywords": [],
+    "exclude_keywords_in_description": false,
+    "min_salary_eur_year": null,
+    "knockout_severity": {
+      "degree": "soft",
+      "certification": "soft",
+      "security_clearance": "hard",
+      "work_permit": "hard",
+      "onsite_required": "hard",
+      "contract_type": "hard"
+    }
+  },
+  "ad": {
+    "title": "DevOps Engineer Kubernetes (m/w/d)",
+    "company": "Beispiel Plattform GmbH",
+    "locations": [
+      "Köln"
+    ],
+    "work_modes": [
+      "remote",
+      "hybrid"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
+    "completeness": "full",
+    "description": "Für unser internationales Plattformteam in Köln suchen wir eine DevOps-Engineerin oder einen DevOps-Engineer. Du betreibst unsere Kubernetes-Cluster, automatisierst die Infrastruktur mit Terraform und verbesserst unsere Deployments mit Helm und GitOps. Du hast mehrere Jahre Erfahrung mit Kubernetes und Terraform in Produktion. Unsere Arbeitssprache ist ausschließlich Englisch, Deutschkenntnisse sind für diese Stelle nicht erforderlich. Alle Meetings, Dokumente und Reviews finden auf Englisch statt. Wir bieten dir mobiles Arbeiten in ganz Deutschland, ein Büro in Köln und ein Team, das dich bei der Einarbeitung begleitet und dir viel Verantwortung gibt."
+  },
+  "det_facts": {
+    "locations": [
+      {
+        "label": "Köln",
+        "resolution": "unique",
+        "candidates": [
+          {
+            "gazetteer_id": "geonames:2886242",
+            "country_code": "DE",
+            "lat": 50.93333,
+            "lon": 6.95
+          }
+        ],
+        "postal_code": null,
+        "source": "eval_fixture"
+      }
+    ],
+    "work_mode_possible": [
+      "remote",
+      "hybrid"
+    ],
+    "work_mode_source": "structured",
+    "remote_countries": [],
+    "employment_types": [
+      "full_time"
+    ],
+    "employment_source": "structured",
+    "salary": null,
+    "industry_structured": null
+  }
+}

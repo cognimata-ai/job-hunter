@@ -1,5 +1,5 @@
-"""Daily retention (spec §20.1), of the M0 data, of the M1 collection data and of the M2 profile data: the
-body of the `retention_daily` task.
+"""Daily retention (spec §20.1), of the M0 data, of the M1 collection data, of the M2 profile data and of the
+M3 score tables: the body of the `retention_daily` task.
 
 Each rule removes what has passed its window. Every window is measured from the caller's `now`, never from the
 database's `now()` (ruling P14), with one exception: procrastinate's finished jobs are deleted with
@@ -59,7 +59,8 @@ body that the newest response still needs. The controller records this as a plan
 - `cv_files`: a CV file and its texts (`storage_path`, `raw_text_enc`, `stripped_text`). Kept: the file of the
   active profile version and of the previous one, and that of every open draft. "Previous" follows the
   activation order, not `version_no`: the version of the newest confirmed draft before the newest one that
-  names another version, so a reactivated older version keeps the version it replaced as its previous. The
+  names another version, so a reactivated older version keeps the version it replaced as its previous. Only
+  the user's confirmed drafts count: the adversarial seed's name synthetic versions (Ruling T19-a). The
   draft ids are the confirm order: one draft is open at a time and only an open (`ready`) draft is confirmed,
   and a draft older than the open one cannot come back to confirm after it, since every new upload discards
   every `failed` draft (`profile.upload.open_new_draft`, pinned by `test_profile_upload_api.py`'s
@@ -88,19 +89,59 @@ body that the newest response still needs. The controller records this as a plan
   draft or profile version included, is never touched, and a name the profile graphs did not write is never
   deleted.
 
-**Batches** (M1 Carry-forward 17, and every M2 rule). A rule that may meet a large backlog works in bounded
-batches, each a fenced transaction of its own: `checkpoints` and `profile_checkpoints` 500 threads,
-`procrastinate_jobs` 1,000 jobs, `draft_content` 100 drafts, `cv_files` and `cv_store_orphans` 100 files,
-`eval_runs` 20 runs (their calls cascade). The next batch starts after the last key of the one before
-(keyset), so a pass always ends, also over rows a batch skipped. The fence is held for one batch only, so it
-never holds a takeover back past `TAKEOVER_LOCK_TIMEOUT_MS` on a large backlog; a takeover that commits
-between two batches stops the rule after the batch in flight (`FencedOut`), and the next pass resumes.
+**The M3 rules** (Task 23; Codex r1 #37-#39, r4 B11, r5 B9; Deviation 31), after `eval_runs` and before
+`checkpoints`:
+- `score_history` (§20.1 L6304-6305, §20.2 L6367): the targets of an inactive tuple (any tuple but
+  `active_config.llm_tuple_id`) that ended terminally (`published_*`, `refused`, `failed_*`,
+  `expired_unscored`, `cancelled`) before the cutoff (`state_changed_at`), `retention.score_history_months`
+  calendar months before `now` (the active settings, read once when the rule starts), each chunk deleted with
+  every row its targets own by `targets.delete_target_set`. Never a target whose result an active golden case
+  labels (`golden_cases.labelled_from_result_id`), nor one an unresolved batch submission still needs
+  (`batches.UNRESOLVED_SUBMISSION_SQL`: its items and their calls are the item-to-ledger mapping a release or
+  a reconciliation joins through, so they stay until the reconciler or the user's release resolves the
+  submission, and go in the pass after that). A target of the active tuple is never deleted by age
+  (`missing_targets` would score it again). Superseded `det_results` instances have no rule of their own:
+  they go with their result (step 3 of the deletion), so one beneath a kept result stays, however old. A
+  chunk's candidates are read without a lock; then `active_config FOR SHARE` (`lock_active`: no activation
+  commits meanwhile) and the same predicate again over them, so a target whose tuple became active since is
+  kept (`retention_targets_kept`, counts only); the fault point `retention.score_history.before_chunk` lies
+  between the two. The deletion takes the bulk rows before the target rows (Ruling P52). No purge fence is
+  needed (L6367): only terminal targets of inactive tuples go.
+- `cycle_threads` (L6320): the checkpoint threads `cycle-<id>` (`graphs.score.graph.thread_id` and its
+  `THREAD_PREFIX`) of the cycles that ended (`finished_at`) 14 days ago, found through the cycle row as
+  `checkpoints` finds a run's threads: a `cycle-` name without a cycle is never touched, and the prefix never
+  matches the profile graphs' `profile-` or `queries-` (B R17).
+- `score_cycles` (L6312): 13 months after `finished_at`, once its thread has no row left in any of the
+  saver's tables; its attempts keep `cycle_id` NULL (their foreign key).
+- `batch_submissions` (Deviation 31, a rule §20.1 does not list): a terminal submission (`reconciled`,
+  `submit_rejected`, `abandoned`, or `released` with `submit_started_at` older than
+  `batches.RELEASED_LISTED_FOR`, the reconciler's listing) whose `batch_items` are all gone (with their
+  targets, `score_history`) and whose end (`reconciled_at`, `released_at`, `submit_started_at` for a
+  rejection, `created_at` for an abandonment) is 13 months old.
+- `bulk_operations` (L6312): a `completed` or `cancelled` operation 13 months after `finished_at` that no
+  submission references any more; the targets and ledger entries naming it keep theirs NULL (their foreign
+  keys).
+The eval rows: `eval_case_results` and their calls go with `eval_runs` (cascade), and a `running` run is
+never deleted, so no call of a running run, nor the `dispatched` entry it holds, loses its row (Carry T19-d,
+the reason of `golden.delete_case_unless_running`). No M3 rule deletes a job, a revision or a profile version,
+so the synthetic rows of the golden set (Ruling T19-a) and the inputs of every golden case stay.
+
+**Batches** (M1 Carry-forward 17, and every M2 and M3 rule). A rule that may meet a large backlog works in
+bounded batches, each a fenced transaction of its own: `checkpoints`, `profile_checkpoints` and
+`cycle_threads` 500 threads, `procrastinate_jobs` 1,000 jobs, `draft_content` 100 drafts, `cv_files` and
+`cv_store_orphans` 100 files, `eval_runs` 20 runs (their calls cascade), `score_history` 200 targets (one
+target-set deletion, L6369). The next batch starts after the last key of the one before (keyset), so a pass
+always ends, also over rows a batch skipped. The fence is held for one batch only, so it never holds a
+takeover back past `TAKEOVER_LOCK_TIMEOUT_MS` on a large backlog; a takeover that commits between two batches
+stops the rule after the batch in flight (`FencedOut`), and the next pass resumes.
 
 Isolation has one exception, the dependent rules (ruling T21-f): a rule names in `depends_on` the rules whose
 work its own would make impossible to finish later. `runs` depends on `checkpoints`, because its cascade
 removes the `run_attempts` through which the checkpoint threads are found; `fetch_requests` depends on
 `raw_items`, because its cascade deletes the raw items of the requests' responses, which the `raw_items` rule
-(with its exception for deferred items) must have handled first. A rule whose dependency failed (or
+(with its exception for deferred items) must have handled first; `score_cycles` depends on `cycle_threads`,
+because a cycle's thread is found through its row (Codex r1 #38); `bulk_operations` depends on
+`batch_submissions`, whose rows reference the operations. A rule whose dependency failed (or
 was skipped itself) earlier in the same pass is skipped: it is reported as `-1` and logged
 `retention_rule_skipped` (with `blocked_by`), and it neither raises nor resolves an alert, so the failed
 dependency's alert stays open until a pass in which both succeed. Independent rules still run.
@@ -108,12 +149,13 @@ dependency's alert stays open until a pass in which both succeed. Independent ru
 **The epoch fence** (final review C2). Retention is worker-owned maintenance, so every write of a pass is
 fenced by the worker epoch (`epoch.fence_epoch`, the first statement of its transaction; no rule locks a job
 row, so the guard may come first, Ruling T19-a): each row rule's transaction, each batch and each alert write.
-The rules that delete through another pool or on disk, the saver's (`checkpoints` and `profile_checkpoints`,
-per thread), procrastinate's (`procrastinate_jobs`) and the CV store's (`cv_files`, `cv_store_orphans`), hold
-the fence in their batch's open transaction while they delete, so no takeover can commit in between. A
-superseded worker's pass (a newer epoch is current) is therefore `FencedOut` before its first write, or before
-the first one after the takeover: it is logged `retention_fenced` (the rule it stopped at, the counts so far),
-writes nothing more (no other rule, no alert) and raises the `FencedOut` to its caller.
+The rules that delete through another pool or on disk, the saver's (`checkpoints`, `profile_checkpoints` and
+`cycle_threads`, per thread), procrastinate's (`procrastinate_jobs`) and the CV store's (`cv_files`,
+`cv_store_orphans`), hold the fence in their batch's open transaction while they delete, so no takeover can
+commit in between. A superseded worker's pass (a newer epoch is current) is therefore `FencedOut` before its
+first write, or before the first one after the takeover: it is logged `retention_fenced` (the rule it stopped
+at, the counts so far), writes nothing more (no other rule, no alert) and raises the `FencedOut` to its
+caller.
 
 This module is a task boundary (ruff `BLE001` is allowed here). The catch around a rule persists its outcome
 as the alert, written in a transaction of its own. When that write fails too, `retention_alert_write_failed`
@@ -122,7 +164,8 @@ is logged: the database that would hold the outcome is the one that failed, so t
 rule: it is never caught as one.
 """
 
-from collections.abc import Awaitable, Sequence
+import calendar
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final
@@ -136,10 +179,13 @@ from jobhunter.db.sql import q
 from jobhunter.errors import FencedOut
 from jobhunter.faults import afault_point
 from jobhunter.graphs.profile.graph import THREAD_PREFIXES, thread_operation_id
+from jobhunter.graphs.score.graph import THREAD_PREFIX as CYCLE_THREAD_PREFIX
 from jobhunter.observability.alerts import raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.profile.storage import CvStore
+from jobhunter.scoring import batches, targets
 from jobhunter.settings.active import lock_active
+from jobhunter.settings.dryrun import active_settings
 from jobhunter.worker.epoch import fence_epoch
 from jobhunter.worker.tasks import delete_finished_jobs
 
@@ -178,6 +224,15 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("cv_files", timedelta(days=30)),  # a discarded or failed draft's, an abandoned upload's
     RetentionRule("cv_store_orphans", timedelta(days=1)),  # after the file was written
     RetentionRule("eval_runs", THIRTEEN_MONTHS),
+    # The M3 rules (Task 23). `score_history`'s window is the active settings'
+    # `retention.score_history_months` calendar months after the target ended, read when the rule starts.
+    RetentionRule("score_history", timedelta(0)),
+    RetentionRule("cycle_threads", timedelta(days=14)),  # threads of the cycles that ended that long ago
+    # A cycle's thread is found through its row, so never after a failed thread purge (Codex r1 #38).
+    RetentionRule("score_cycles", THIRTEEN_MONTHS, depends_on=("cycle_threads",)),
+    RetentionRule("batch_submissions", THIRTEEN_MONTHS),  # after they ended, once their items are gone
+    # Its submissions reference it, so never after a failed submission purge.
+    RetentionRule("bulk_operations", THIRTEEN_MONTHS, depends_on=("batch_submissions",)),
     RetentionRule("checkpoints", timedelta(days=14)),  # threads of the runs that ended that long ago
     RetentionRule("profile_checkpoints", timedelta(days=14)),  # threads of operations ended that long ago
     # Its cascade deletes the run_attempts that name the checkpoint threads, so never after a failed purge.
@@ -185,8 +240,18 @@ RULES: Final[tuple[RetentionRule, ...]] = (
     RetentionRule("procrastinate_jobs", timedelta(days=7)),  # finished jobs
 )
 
+# A cycle's checkpoint thread (`graphs.score.graph.thread_id`: the prefix and the cycle's id), whether any of
+# the saver's tables still holds a row of it, and the cycles that ended before the cutoff.
+_CYCLE_THREAD: Final = f"('{CYCLE_THREAD_PREFIX}' || c.id)"
+_CYCLE_THREAD_ROWS: Final = (
+    f"(EXISTS (SELECT 1 FROM checkpoints k WHERE k.thread_id = {_CYCLE_THREAD}) "  # noqa: S608
+    f"OR EXISTS (SELECT 1 FROM checkpoint_blobs b WHERE b.thread_id = {_CYCLE_THREAD}) "
+    f"OR EXISTS (SELECT 1 FROM checkpoint_writes w WHERE w.thread_id = {_CYCLE_THREAD}))"
+)
+_ENDED_CYCLES: Final = "c.status IN ('completed', 'failed') AND c.finished_at < :cutoff"
+
 # One statement per row rule, each bound to its rule's `cutoff` (`now - window`): a DELETE, or for
-# `raw_bodies` the UPDATE that nulls the bodies.
+# `raw_bodies` the UPDATE that nulls the bodies. `batch_submissions` binds `listed_since` too.
 _DELETES: Final[dict[str, TextClause]] = {
     "api_idempotency": q("DELETE FROM api_idempotency WHERE expires_at < :cutoff"),
     "sessions": q("DELETE FROM sessions WHERE absolute_expires_at < :cutoff OR idle_expires_at < :cutoff"),
@@ -239,6 +304,25 @@ _DELETES: Final[dict[str, TextClause]] = {
         "JOIN raw_responses b ON b.fetch_request_id = f.id JOIN raw_responses d ON d.body_ref_id = b.id "
         "WHERE f.run_id = r.id AND d.purged_at IS NULL)"
     ),
+    # Ended before the cutoff and no row of its thread left (`cycle_threads` deletes them).
+    "score_cycles": q(f"DELETE FROM score_cycles c WHERE {_ENDED_CYCLES} AND NOT {_CYCLE_THREAD_ROWS}"),  # noqa: S608
+    # Deviation 31: terminal, ended before the cutoff, every item gone with its target (`score_history`); a
+    # released one once the reconciler lists it no more (`listed_since`, `batches.RELEASED_LISTED_FOR`).
+    "batch_submissions": q(
+        "DELETE FROM batch_submissions s WHERE ((s.state = 'reconciled' AND s.reconciled_at < :cutoff) "
+        # `submit_started_at <= :listed_since` is defensive: `released_at < :cutoff` implies it (a release
+        # follows its submit-start, and the cutoff lies 13 months back, the listing's end 29 days)
+        "OR (s.state = 'released' AND s.submit_started_at <= :listed_since AND s.released_at < :cutoff) "
+        "OR (s.state = 'submit_rejected' AND s.submit_started_at < :cutoff) "
+        "OR (s.state = 'abandoned' AND s.created_at < :cutoff)) "
+        "AND NOT EXISTS (SELECT 1 FROM batch_items i WHERE i.submission_id = s.id)"
+    ),
+    # Finished before the cutoff, and no submission references it any more (`batch_submissions`).
+    "bulk_operations": q(
+        "DELETE FROM bulk_operations b WHERE b.state IN ('completed', 'cancelled') "
+        "AND b.finished_at < :cutoff "
+        "AND NOT EXISTS (SELECT 1 FROM batch_submissions s WHERE s.bulk_operation_id = b.id)"
+    ),
 }
 
 # The batch sizes ("Batches" in the module docstring).
@@ -248,8 +332,11 @@ DRAFT_BATCH: Final = 100
 CV_FILE_BATCH: Final = 100
 ORPHAN_BATCH: Final = 100
 EVAL_RUN_BATCH: Final = 20
+HISTORY_CHUNK: Final = targets.TARGET_SET_CHUNK  # 200: one target-set deletion (§20.2 L6369)
 # Reached once a `cv_files` batch has selected and locked its candidates, before it deletes anything.
 CV_FILES_AFTER_SELECT: Final = "retention.cv_files.after_select"
+# Reached once a `score_history` chunk has read its candidates, before `active_config` and the check again.
+SCORE_HISTORY_BEFORE_CHUNK: Final = "retention.score_history.before_chunk"
 _BIGINT_END: Final = 2**63
 
 # The checkpoint threads of the attempts of runs that ended before the cutoff and still have rows in any of
@@ -299,13 +386,17 @@ _PURGE_EXTRACT_OUTPUTS: Final = q(
 )
 
 # `cv_files`: the protection set under `active_config` (the active version's file, the previous version's, an
-# open draft's), the candidates (one batch after `:after`), their drafts and rows locked, the purge.
+# open draft's), the candidates (one batch after `:after`), their drafts and rows locked, the purge. The
+# newest and the previous confirmed drafts are the user's own: the adversarial seed's confirmed drafts name
+# synthetic versions (Ruling T19-a), newer than the user's but never activated.
 _PROTECTED_FILES: Final = q(
-    "WITH newest AS (SELECT id, confirmed_profile_version_id AS version FROM profile_drafts "
-    "WHERE status = 'confirmed' ORDER BY id DESC LIMIT 1), "
+    "WITH newest AS (SELECT d.id, d.confirmed_profile_version_id AS version FROM profile_drafts d "
+    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
+    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1), "
     "previous AS (SELECT d.confirmed_profile_version_id AS version FROM profile_drafts d JOIN newest n "
-    "ON d.id < n.id AND d.confirmed_profile_version_id <> n.version WHERE d.status = 'confirmed' "
-    "ORDER BY d.id DESC LIMIT 1) "
+    "ON d.id < n.id AND d.confirmed_profile_version_id <> n.version "
+    "JOIN profile_versions v ON v.id = d.confirmed_profile_version_id AND NOT v.synthetic_eval "
+    "WHERE d.status = 'confirmed' ORDER BY d.id DESC LIMIT 1) "
     "SELECT v.cv_file_id FROM profile_versions v WHERE v.cv_file_id IS NOT NULL "
     "AND (v.id = CAST(:active AS bigint) OR v.id IN (SELECT version FROM newest) "
     "OR v.id IN (SELECT version FROM previous)) "
@@ -345,6 +436,36 @@ _DELETE_EVAL_RUNS: Final = q(
     "ORDER BY kind, coalesce(finished_at, started_at) DESC, id DESC) "
     "ORDER BY r.id LIMIT :limit)"
 )
+# `cycle_threads`: the threads of the cycles that ended before the cutoff and still have rows in any of the
+# saver's tables (so a thread is purged, and counted, once), one batch after cycle `:after`.
+_ENDED_CYCLE_THREADS: Final = q(
+    f"SELECT c.id, {_CYCLE_THREAD} AS thread_id FROM score_cycles c WHERE {_ENDED_CYCLES} "  # noqa: S608
+    f"AND c.id > :after AND {_CYCLE_THREAD_ROWS} ORDER BY c.id LIMIT :limit"
+)
+# `score_history` (module docstring): the targets §20.1 lets go (L6304), ended in these states before the
+# cutoff; one page after `:after`, and a chunk's candidates `:ids` checked again under `active_config`.
+_ENDED_TARGET_STATES: Final = (
+    "published_accepted",
+    "published_contested",
+    *targets.RETRYABLE_STATES,
+    "expired_unscored",
+    "cancelled",
+)
+_EXPIRED_HISTORY: Final = (
+    "t.state = ANY(CAST(:states AS text[])) AND t.state_changed_at < :cutoff "  # noqa: S608
+    "AND t.llm_tuple_id IS DISTINCT FROM (SELECT a.llm_tuple_id FROM active_config a WHERE a.id = 1) "
+    "AND NOT EXISTS (SELECT 1 FROM llm_results r JOIN golden_cases g ON g.labelled_from_result_id = r.id "
+    "WHERE r.target_id = t.id AND g.active) "
+    f"AND NOT {batches.UNRESOLVED_SUBMISSION_SQL}"
+)
+_HISTORY_PAGE: Final = q(
+    f"SELECT t.id FROM score_targets t WHERE {_EXPIRED_HISTORY} AND t.id > :after "  # noqa: S608
+    "ORDER BY t.id LIMIT :limit"
+)
+_HISTORY_AGAIN: Final = q(
+    f"SELECT t.id FROM score_targets t WHERE {_EXPIRED_HISTORY} "  # noqa: S608
+    "AND t.id = ANY(CAST(:ids AS bigint[])) ORDER BY t.id"
+)
 
 FAILED_ALERT_CODE: Final = "retention.failed"
 
@@ -361,10 +482,12 @@ class CvFilesNotDeleted(Exception):
 log = get_logger("jobhunter.privacy.retention")
 
 
-async def _delete_rows(engine: AsyncEngine, statement: TextClause, cutoff: datetime, epoch: int) -> int:
+async def _delete_rows(
+    engine: AsyncEngine, statement: TextClause, params: Mapping[str, object], epoch: int
+) -> int:
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
-        return (await conn.execute(statement, {"cutoff": cutoff})).rowcount
+        return (await conn.execute(statement, dict(params))).rowcount
 
 
 async def _delete_threads(saver: AsyncPostgresSaver, threads: Sequence[str]) -> None:
@@ -413,6 +536,76 @@ async def _profile_threads(
         if len(batch) < THREAD_BATCH:
             return deleted
         after = batch[-1]
+
+
+async def _purge_cycle_threads(
+    engine: AsyncEngine, saver: AsyncPostgresSaver, cutoff: datetime, epoch: int
+) -> int:
+    """Delete the checkpoint threads of the cycles that ended before `cutoff`, `THREAD_BATCH` per fenced
+    transaction; the number of threads."""
+    deleted, after = 0, 0
+    while True:
+        async with engine.begin() as fenced:
+            await fence_epoch(fenced, epoch)  # held while the saver deletes the batch
+            params = {"cutoff": cutoff, "after": after, "limit": THREAD_BATCH}
+            batch = (await fenced.execute(_ENDED_CYCLE_THREADS, params)).all()
+            await _delete_threads(saver, [str(row.thread_id) for row in batch])
+        deleted += len(batch)
+        if len(batch) < THREAD_BATCH:
+            return deleted
+        after = int(batch[-1].id)
+
+
+def _months_before(t: datetime, months: int) -> datetime:
+    """`t` moved back `months` calendar months, its day clamped to the last of a shorter month (31 March less
+    one month is the last day of February)."""
+    year, month = divmod(t.year * 12 + t.month - 1 - months, 12)
+    month += 1
+    return t.replace(year=year, month=month, day=min(t.day, calendar.monthrange(year, month)[1]))
+
+
+async def _history_chunk(
+    conn: AsyncConnection, page: Sequence[int], params: Mapping[str, object], now: datetime
+) -> int:
+    """One `score_history` chunk after its fence and its candidates `page` (module docstring): `active_config
+    FOR SHARE`, the candidates checked again under it, the targets still expired deleted; how many."""
+    await afault_point(SCORE_HISTORY_BEFORE_CHUNK)
+    await lock_active(conn, share=True)  # step 2, a statement of its own (Deviation 43)
+    checked = await conn.execute(_HISTORY_AGAIN, {**params, "ids": list(page)})
+    expired = [int(target_id) for target_id in checked.scalars()]
+    if len(expired) < len(page):
+        log.info(
+            "retention_targets_kept",
+            rule="score_history",
+            candidates=len(page),
+            kept=len(page) - len(expired),
+        )
+    if not expired:
+        return 0
+    return await targets.delete_target_set(conn, expired, now=now)
+
+
+async def _purge_score_history(engine: AsyncEngine, now: datetime, epoch: int) -> int:
+    """`score_history` (module docstring), `HISTORY_CHUNK` targets per fenced transaction; the targets
+    deleted."""
+    async with engine.connect() as conn:
+        months = (await active_settings(conn)).retention.score_history_months
+    params: dict[str, object] = {
+        "states": list(_ENDED_TARGET_STATES),
+        "cutoff": _months_before(now, months),
+        "listed_since": now - batches.RELEASED_LISTED_FOR,
+    }
+    deleted, after = 0, 0
+    while True:
+        async with engine.begin() as conn:
+            await fence_epoch(conn, epoch)
+            found = await conn.execute(_HISTORY_PAGE, {**params, "after": after, "limit": HISTORY_CHUNK})
+            page = [int(target_id) for target_id in found.scalars()]
+            if page:
+                deleted += await _history_chunk(conn, page, params, now)
+        if len(page) < HISTORY_CHUNK:
+            return deleted
+        after = page[-1]
 
 
 async def _delete_finished_jobs(
@@ -575,7 +768,14 @@ async def _apply(
         return await _purge_orphans(engine, cv_store, cutoff, epoch)
     if rule.name == "eval_runs":
         return await _delete_eval_runs(engine, cutoff, epoch)
-    return await _delete_rows(engine, _DELETES[rule.name], cutoff, epoch)
+    if rule.name == "score_history":
+        return await _purge_score_history(engine, now, epoch)
+    if rule.name == "cycle_threads":
+        return await _purge_cycle_threads(engine, saver, cutoff, epoch)
+    params: dict[str, object] = {"cutoff": cutoff}
+    if rule.name == "batch_submissions":
+        params["listed_since"] = now - batches.RELEASED_LISTED_FOR
+    return await _delete_rows(engine, _DELETES[rule.name], params, epoch)
 
 
 async def _raise_failure(engine: AsyncEngine, name: str, error_class: str, epoch: int) -> None:
@@ -620,10 +820,10 @@ async def run_retention_daily(
     """Apply every rule of `RULES` at `now` for worker `epoch`, in order; the number deleted (or purged) by
     rule name, `-1` when it failed or was skipped (a dependency of it failed in this pass).
 
-    `checkpoints` and `profile_checkpoints` count threads, `cv_files` and `cv_store_orphans` files. `queue`
-    must be open; `cv_store` is the CV store whose files the two file rules delete. Raises `FencedOut`, logged
-    `retention_fenced`, once `epoch` is no longer the current worker epoch: the pass stops before that write
-    and writes nothing more (see "The epoch fence").
+    `checkpoints`, `profile_checkpoints` and `cycle_threads` count threads, `cv_files` and `cv_store_orphans`
+    files, `score_history` targets. `queue` must be open; `cv_store` is the CV store whose files the two file
+    rules delete. Raises `FencedOut`, logged `retention_fenced`, once `epoch` is no longer the current worker
+    epoch: the pass stops before that write and writes nothing more (see "The epoch fence").
     """
     report: dict[str, int] = {}
     not_done: set[str] = set()  # the rules that failed or were skipped in this pass

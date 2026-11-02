@@ -39,6 +39,17 @@ MODELS: Final[tuple[Model, ...]] = (
 )
 
 _ALL_EFFORTS: Final[frozenset[Effort]] = frozenset({"low", "medium", "high", "xhigh", "max"})
+_EFFORTS: Final[Mapping[str, Effort]] = MappingProxyType({effort: effort for effort in _ALL_EFFORTS})
+
+
+def effort_of(value: str) -> Effort:
+    """A stored effort name (a model policy's) as an `Effort`; `ValueError` for any other string."""
+    effort = _EFFORTS.get(value)
+    if effort is None:
+        raise ValueError("a model policy names an unknown effort")
+    return effort
+
+
 SUPPORTED_EFFORTS: Final[Mapping[Model, frozenset[Effort]]] = MappingProxyType(
     dict.fromkeys(MODELS, _ALL_EFFORTS)
 )

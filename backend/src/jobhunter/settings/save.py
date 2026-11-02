@@ -1,4 +1,5 @@
-"""The settings save (spec §13.2, §13.3; plan Task 17, Deviations 10, 14 and 15).
+"""The settings save (spec §13.2, §13.3; plan Task 17, Deviations 10, 14 and 15; M3 Task 14, Codex r1 #35,
+r2 B7).
 
 `save_settings` writes a new immutable `settings_versions` row and activates it, in the caller's transaction:
 
@@ -11,9 +12,24 @@
    issue's path, code and message; each warning code missing from `acknowledged_warnings` is 422
    `validation_failed` with `FieldError("acknowledged_warnings", "warning_not_acknowledged", <code>)`. An
    internal save (`internal=True`, Deviation 15) skips the acknowledgement check and copies the active
-   version's acknowledgements. Then the eval gate (§11.13), once, when the classes hold `llm_tuple` or
-   `evaluation_policy`: uncalibrated in M2, so skipped; a failed gate without `eval_override_ack` is 409
-   `eval_gate_failed`. Every refusal therefore comes before the first write.
+   version's acknowledgements. The classes are the dry-run's with `forced_effects` merged in (M3 Task 21):
+   the shipped-version activation (`settings.activate`) saves the unchanged document with `llm_tuple` forced,
+   since it changes a pointer no field of the document holds, so the derived classes alone would be `none`
+   (the merge drops `none`). Then, once, when the classes hold `llm_tuple` or `evaluation_policy`
+   (`dryrun.GATED`; `_check_eval_gate`, M3 Task 20):
+   - an `llm_tuple` save whose model policy is not verified for the active prompt-schema version is 409
+     `conflict_state` with `detail = "schema_dry_run_required"` and a title naming the (schema, model) pairs
+     without a pass, whatever the override (Codex r2 B24, Ruling T20-a): the policy's row is found or
+     inserted by its content hash (`ensure_hashed`, under the step-1 lock), then `validate.schema_verified`
+     reads it, so a new policy that reuses verified models saves with no new run, and one with a new model
+     is unblocked by the schema dry-run of the payload (`jobhunter schema-dry-run --candidate-payload`). A
+     process on the fake LLM skips it, as the score lane's guard does (`cycles.pause_reason`): no live
+     dry-run exists there;
+   - the eval gate of the payload's candidate (`derive.candidate_of`, `validate.eval_gate_state`): a failed
+     gate (with 30 of the user's active golden cases, no passed run of the candidate is a failed gate)
+     without `eval_override_ack` is 409 `eval_gate_failed`.
+   Every refusal therefore comes before the version and its actions; the policy row a refused save inserted
+   rolls back with it (the route's transaction; an internal save's caller's).
 4. The derived rows (`derive.derived` with the active profile, Deviation 14; `ensure_derived`).
 5. The version row: `version_no = max + 1` (the step-1 lock serialises the writers, the unique constraint
    backs it), the stored payload `Settings.to_payload()` (the normal form, never the request; Deviation 38),
@@ -24,7 +40,7 @@
    after `schedule`, since `load_run_settings` joins `schedule_state`. The fault point
    `settings.after_llm_tuple` lies between `llm_tuple` and `scope`.
    - `llm_tuple`: `model_policy_id := new`, and with an active profile the tuple (`ensure_tuple`) and
-     `llm_tuple_id := it`. §12.6 (d) to (f) and `create_targets_for_tuple` are M3's (Deviation 10);
+     `llm_tuple_id := it` (flipped in step 7; §12.6 (d) to (h) are step 8's);
    - `scope`: `scope_apply.set_desired_scope` with the derived scope. When that is the active scope (a
      revert, §13.4 step 5's second remedy), nothing is left unapplied: after every action, so after the
      `budget` action's month row, every open `scope.apply_failed` is resolved
@@ -37,24 +53,37 @@
      `enabled`, the cursor at the latest slot at or before `now`, and the version;
    - `collection`: the instance of every `watchlist[]` board (`instance_for_company`), then the cells of the
      new version (`ensure_cells`; new cells start never covered);
-   - `admission`: the flip only (the `max_ad_age_days` expiry sweep needs targets, M3);
+   - `admission`: the flip and, when `scope.max_ad_age_days` changed, the expiry sweep of the active tuple in
+     both directions (`scoring.targets.expiry_sweep`, M3 Task 13: the bulk rows, then the target rows);
    - `execution`: `execution_config_id := new`;
    - `evaluation_policy`: `evaluation_policy_id := new` (the row is step 4's).
-   After every action, when the tuple pointer changed, `ranking.bump` runs once: `ranking_state` is the
-   last lock of §3.3.3, after the `budget` action's month row.
-7. `settings_version_id := new` and `updated_at`, in the statement that flips the pointers of step 6.
-   `active_config` is locked since step 1, so this takes no new lock after `ranking_state`.
+7. `settings_version_id := new` and `updated_at`, in the statement that flips the pointers of step 6
+   (`_FLIP`). `active_config` is locked since step 1, so this takes no new lock.
+8. When the tuple pointer changed, the tuple activation (`scoring.targets.activate_tuple`, §12.6 (d) to (f)
+   and (h), §13.3 `llm_tuple`; M3 Task 14, Codex r1 #35): the month row, the old tuple's bulk operation
+   cancelled and the new one opened under the new settings, the old tuple's unpublished targets and in-flight
+   submissions cancelled, and `create_targets_for_tuple` recorded. It runs after `_FLIP` because it needs the
+   flipped pointer.
+9. When the tuple pointer changed or the `admission` action's sweep moved a target, `ranking.bump` once, the
+   save's last statement: `ranking_state` is the last lock of §3.3.3, after the month row of the `budget`
+   action and of the activation (Codex r2 B7).
 
-Every write of the class actions that takes a row lock follows that order. The rows inserted before the month
-row (the derived rows, the version, the tuple) are new rows of tables that only writers holding
-`active_config` `FOR UPDATE` insert into, so no other transaction can hold or wait for them.
+The class actions do not keep the schedule's order among themselves, and this is what actually happens. The
+derived rows, the version and the tuple are new rows of tables that only writers holding `active_config` `FOR
+UPDATE` insert into, so no other transaction can hold or wait for them. With `budget` the month row comes
+before every other domain row of the actions. With `admission` the expiry sweep's bulk rows and target rows
+and `resolve_apply_failed`'s alerts come before the activation's month row of step 8 whenever the month row
+was not taken by `budget` already. That is safe because `active_config FOR UPDATE`, held from step 1,
+serialises the save with every score-lane transaction (each takes `active_config` first, step 2), the only
+transactions that take a month row together with bulk or target rows; and none of them, nor any other
+month-row writer, waits for a `scope.apply_failed` alert. `ranking_state` is always the last lock.
 
 `ensure_tuple` is the one select-or-insert of an `llm_tuples` row (Task 21's confirm reuses it). Neither this
 module nor `scope_apply` logs: the caller logs ids and codes after its commit. (`spend_ledger.change_cap` and
 `change_buffer` log the month row's change in the transaction, as every month-row writer of Task 3 does.)
 """
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
@@ -65,24 +94,32 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db import ranking
-from jobhunter.db.seed import SETTINGS_SCHEMA_VERSION, anchor_utc_for, ensure_id, latest_slot_at_or_before
+from jobhunter.db.seed import (
+    SETTINGS_SCHEMA_VERSION,
+    anchor_utc_for,
+    ensure_hashed,
+    ensure_id,
+    latest_slot_at_or_before,
+)
 from jobhunter.db.sql import q
 from jobhunter.faults import afault_point
 from jobhunter.llm import budget, spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.quota.cells import ensure_cells
 from jobhunter.run_settings import load_run_settings
+from jobhunter.scoring import targets
 from jobhunter.settings import scope_apply
-from jobhunter.settings.derive import DerivedIds, active_profile, derived, ensure_derived
-from jobhunter.settings.dryrun import dry_run
+from jobhunter.settings.derive import DerivedIds, active_profile, candidate_of, derived, ensure_derived
+from jobhunter.settings.dryrun import GATED, dry_run
 from jobhunter.settings.effects import EffectClass
 from jobhunter.settings.model import Settings
-from jobhunter.settings.validate import eval_gate_state
+from jobhunter.settings.validate import eval_gate_state, fake_llm_process, schema_verified, unverified_pairs
 from jobhunter.sources.instances import instance_for_company, list_instances
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import Deferrer
 
 AFTER_LLM_TUPLE_POINT: Final = "settings.after_llm_tuple"
+SCHEMA_DRY_RUN_REQUIRED: Final = "schema_dry_run_required"
 ACKNOWLEDGED_FIELD: Final = "acknowledged_warnings"
 NOT_ACKNOWLEDGED: Final = "warning_not_acknowledged"
 _SECONDS_PER_HOUR: Final = 3600
@@ -128,6 +165,7 @@ _FLIP: Final = q(
     "updated_at = :now WHERE id = 1"
 )
 _FLIPPABLE: Final = ("model_policy_id", "llm_tuple_id", "execution_config_id", "evaluation_policy_id")
+_NONE: Final[frozenset[EffectClass]] = frozenset({"none"})
 
 
 @dataclass(frozen=True)
@@ -143,13 +181,14 @@ class SaveRequest:
 
 @dataclass(frozen=True)
 class SaveOutcome:
-    """The new version, the classes it applied, and the `apply_scope` operation its scope needs, or
-    `None`."""
+    """The new version, the classes it applied, the `apply_scope` operation its scope needs (or `None`), and
+    the tuple active after it (`None` while no profile is active)."""
 
     version_id: int
     version_no: int
     effects: frozenset[EffectClass]
     apply_scope_operation_id: int | None
+    llm_tuple_id: int | None
 
 
 async def ensure_tuple(conn: AsyncConnection, *, profile_version_id: int, model_policy_id: int) -> int:
@@ -185,23 +224,63 @@ class _Activation:
     version_id: int
     flips: dict[str, int] = field(default_factory=dict)
     tuple_flipped: bool = False
+    targets_moved: bool = False  # the `admission` action's expiry sweep moved a target
     apply_scope_operation_id: int | None = None
     scope_is_active: bool = False  # the `scope` action's desired scope is the active one
 
 
-_GATED: Final[frozenset[EffectClass]] = frozenset({"llm_tuple", "evaluation_policy"})
+async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[tuple[str, str]]:
+    """The (schema, model) pairs of the proposed model policy without a passed live schema dry-run of the
+    active prompt-schema version, none when it is verified (module docstring, step 3; Ruling T20-a): its row
+    found or inserted by hash in the save's transaction, then Task 11's `validate.schema_verified` on it."""
+    model_policy_id = await ensure_hashed(conn, "model_policies", derived(proposed).model_policy)
+    pointers = (await conn.execute(_TUPLE_POINTERS)).one()
+    if pointers.prompt_schema_version_id is None:
+        raise LookupError("active_config has no prompt-schema version (migrate seeds it)")
+    version = int(pointers.prompt_schema_version_id)
+    if await schema_verified(conn, prompt_schema_version_id=version, model_policy_id=model_policy_id):
+        return []
+    return await unverified_pairs(
+        conn, prompt_schema_version_id=version, model_policy=proposed.scoring.model_policy
+    )
 
 
-async def _check_eval_gate(conn: AsyncConnection, req: SaveRequest) -> None:
-    """§11.13: a change the gate covers must pass, or the override is acknowledged. Before 30 golden cases the
-    gate is `uncalibrated` and skipped, which in M2 it always is (`eval_gate_state`)."""
-    if await eval_gate_state(conn) == "failed" and not req.eval_override_ack:
-        raise Problem(
-            409,
-            "eval_gate_failed",
-            "The eval gate failed",
-            detail="acknowledge the override (eval_override_ack) to activate this change",
-        )
+def schema_dry_run_required(missing: Sequence[tuple[str, str]]) -> Problem:
+    """409 `conflict_state` (`schema_dry_run_required`) of a model policy without a passed live schema
+    dry-run of the (schema, model) pairs `missing`, which its title names (the save, and the shipped-version
+    activation's step 4, `settings.activate`)."""
+    pairs = ", ".join(f"{schema} on {model}" for schema, model in missing)
+    return Problem(
+        409,
+        "conflict_state",
+        f"The model policy has no passed live schema dry-run for {pairs}",
+        detail=SCHEMA_DRY_RUN_REQUIRED,
+    )
+
+
+def eval_gate_failed() -> Problem:
+    """409 `eval_gate_failed` of a gated change whose candidate failed the eval gate, without the override."""
+    return Problem(
+        409,
+        "eval_gate_failed",
+        "The eval gate failed",
+        detail="acknowledge the override (eval_override_ack) to activate this change",
+    )
+
+
+async def _check_eval_gate(
+    conn: AsyncConnection, req: SaveRequest, proposed: Settings, effects: frozenset[EffectClass]
+) -> None:
+    """The refusals of a gated save (module docstring, step 3): an unverified model policy, then a failed eval
+    gate of the payload's candidate without the override. Below 30 active golden cases the gate is
+    `uncalibrated` and does not refuse."""
+    if "llm_tuple" in effects and not fake_llm_process():
+        missing = await _unverified_pairs(conn, proposed)
+        if missing:
+            raise schema_dry_run_required(missing)
+    candidate = await candidate_of(conn, proposed)
+    if await eval_gate_state(conn, candidate=candidate) == "failed" and not req.eval_override_ack:
+        raise eval_gate_failed()
 
 
 async def _apply_llm_tuple(a: _Activation) -> None:
@@ -267,7 +346,18 @@ async def _apply_collection(a: _Activation) -> None:
 
 
 async def _apply_admission(a: _Activation) -> None:
-    """The flip only (step 7); the expiry sweep of `max_ad_age_days` needs targets (M3, Deviation 10)."""
+    """The flip (step 7) and, when `scope.max_ad_age_days` changed, the expiry sweep of the tuple active after
+    this save in both directions, under the `active_config` lock the save holds (L4893; M3 Task 13, A2 A5,
+    Deviation 24): the candidates' bulk rows, then their target rows (other domain rows), after the `budget`
+    action's month row. A sweep that moved a target bumps the ranking (step 6)."""
+    max_age = a.proposed.scope.max_ad_age_days
+    if max_age == a.before.scope.max_ad_age_days:
+        return
+    tuple_id = a.flips.get("llm_tuple_id", a.active.llm_tuple_id)
+    if not isinstance(tuple_id, int):
+        return
+    swept = await targets.expiry_sweep(a.conn, llm_tuple_id=tuple_id, max_ad_age_days=max_age, now=a.now)
+    a.targets_moved = a.targets_moved or swept.moved > 0
 
 
 async def _apply_execution(a: _Activation) -> None:
@@ -299,9 +389,16 @@ def _validation_failed(errors: list[FieldError]) -> Problem:
 
 
 async def save_settings(
-    conn: AsyncConnection, req: SaveRequest, *, now: datetime, defer: Deferrer, internal: bool = False
+    conn: AsyncConnection,
+    req: SaveRequest,
+    *,
+    now: datetime,
+    defer: Deferrer,
+    internal: bool = False,
+    forced_effects: frozenset[EffectClass] = frozenset(),
 ) -> SaveOutcome:
-    """Save and activate `req` in the caller's transaction (module docstring, steps 1 to 7)."""
+    """Save and activate `req` in the caller's transaction (module docstring, steps 1 to 9), with
+    `forced_effects` merged into the dry-run's classes (step 3)."""
     active = (await conn.execute(_LOCK_ACTIVE)).one()
     if req.base_version_id != active.settings_version_id:
         raise Problem(
@@ -330,13 +427,13 @@ async def save_settings(
             )
         acknowledged = sorted(req.acknowledged_warnings)
     proposed = Settings.model_validate(req.payload)  # valid: the dry-run found no error
-    effects = result.effects
-    if effects & _GATED:
-        await _check_eval_gate(conn, req)
+    effects = ((result.effects | forced_effects) - _NONE) if forced_effects else result.effects
+    if effects & GATED:
+        await _check_eval_gate(conn, req, proposed, effects)
 
     payload = proposed.to_payload()
     ids = await ensure_derived(
-        conn, derived(proposed, profile=await active_profile(conn, active.profile_version_id))
+        conn, derived(proposed, profile=await active_profile(conn, active.profile_version_id)), now=now
     )
     version = (
         await conn.execute(
@@ -376,8 +473,6 @@ async def save_settings(
             await afault_point(AFTER_LLM_TUPLE_POINT)
     if a.scope_is_active:  # other domain rows: after the month row, before `ranking_state` (step 6)
         await scope_apply.resolve_apply_failed(conn)
-    if a.tuple_flipped:
-        await ranking.bump(conn)
     await conn.execute(
         _FLIP,
         {
@@ -386,9 +481,23 @@ async def save_settings(
             "now": now,
         },
     )
+    if a.tuple_flipped:  # step 8, on the flipped pointer
+        old_tuple_id = a.active.llm_tuple_id
+        await targets.activate_tuple(
+            conn,
+            old_tuple_id=old_tuple_id if isinstance(old_tuple_id, int) else None,
+            new_tuple_id=a.flips["llm_tuple_id"],
+            settings=proposed,
+            now=now,
+            defer=defer,
+        )
+    if a.tuple_flipped or a.targets_moved:  # step 9, last
+        await ranking.bump(conn)
+    tuple_id = a.flips.get("llm_tuple_id", a.active.llm_tuple_id)
     return SaveOutcome(
         version_id=a.version_id,
         version_no=int(version.version_no),
         effects=effects,
         apply_scope_operation_id=a.apply_scope_operation_id,
+        llm_tuple_id=tuple_id if isinstance(tuple_id, int) else None,
     )

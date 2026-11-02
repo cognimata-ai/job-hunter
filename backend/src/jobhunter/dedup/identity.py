@@ -1,7 +1,7 @@
 """Identity resolution (spec §8.6, §7.16.1, §7.16.2, §20.2): each pending raw item becomes a job's sighting.
 
 **`resolve_item`** runs the §8.6 transaction of one raw item on the caller's connection, inside a savepoint,
-in the lock order of §3.3.3: `active_config` `FOR SHARE` (`filters.active_scopes`, the first statement) →
+in the lock order of §3.3.3: `active_config` `FOR SHARE` (`filters.lock_active_scopes`, the first statement) →
 the job rows → the run's owner row (`ledger.lock_run_owner`) → the other domain rows → `ranking_state`.
 
 1. **Fence and idempotency.** An item no longer `pending` or `deferred` is left as it is: its disposition is
@@ -22,14 +22,20 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    kept, and nothing else is written. Then (`_decide`):
    - `J` empty: a new job, its row from `select_canonical` of this observation alone (its provenance is
      written in step 7, when the posting and observation ids exist), `restored_from_tombstone_id` from the
-     first key of `K` whose `sha256(ns ‖ 0x00 ‖ value)` is in `tombstone_keys` (the `user_job_actions` it
-     restores arrive with M4, plan Deviation 7);
+     first key of `K` whose `sha256(ns ‖ 0x00 ‖ value)` is in `tombstone_keys`, and then its
+     `user_job_actions` row from that tombstone's timestamps (`job_tombstones.user_actions`: `seen_at`,
+     `saved_at`, `applied_at`, `hidden_at`, each an ISO 8601 time with its offset; never a note), so a hidden
+     ad that is re-posted stays hidden and an applied one stays applied (M3 Task 22, L3188). A value that is
+     no such time is dropped (`tombstone_actions_unreadable`, its field names only), and a tombstone without a
+     timestamp writes no row;
    - a `different` decision between two jobs of `J`: no merge and no conflict; the posting's own job, or a
      new job for a new posting (an interpretation: the spec names only the posting's own job);
    - an exclusive conflict (the observation and a job other than the posting's, or two jobs of `J`, carry
      disjoint values of one exclusive namespace): no merge; the posting's job, or a new job for a new
      posting, and an open conflict naming the other jobs (`merge.open_conflict`, which repeats none);
-   - one job: it; several: the lowest id, the others merged into it in step 6.
+   - one job: it; several: the lowest id, the others merged into it in step 6; the bulk rows of the follow-up
+     holds of every merged job's targets are locked next (`merge.lock_target_holds`, before any write: the
+     merges cancel those targets, Ruling P52).
 4. **Posting and observation.** A new posting is inserted `ON CONFLICT DO NOTHING` (a posting another
    transaction inserted meanwhile is locked and used when it is on the decided job) with `seen_count = 1`
    and `t` as its first and last sighting and availability change; an existing one is locked `FOR UPDATE`
@@ -50,12 +56,18 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    ownership never changes here), then the `ad_key_sources` rows of the posting.
 6. **Merges or the conflict**: `merge.merge_jobs(strong_key_merge, recompute=False, locked=<the rows of
    step 3>)` per merged job, in id order, with the keys and the observation as evidence; or the conflict row.
+   A revision the recompute of step 7 supersedes is node 9's to retarget, later in the same run
+   (`enqueue_targets`: the recompute writes `jobs.updated_at`), so `merge.supersede_revision` is not run here
+   (Ruling T22-e).
 7. **Projections**: the decided job's availability and seen bounds (`merge.derive_from_postings`), its
-   canonical fields and revision (`revisions.recompute_job`, once, after the last merge), and its hard-filter
-   results for the active and the pending scope (`filters.refilter_job`). Then `afault_point(IN_ITEM_TX)`
-   (crash case C6), the item `→ linked` with its `observation_id` and `normalized = NULL`, and, last,
-   `ranking.bump` when the list changed: a job created, a merge, a new current revision or a list column
-   (`RecomputeResult`), or the job's availability or first sighting (Ruling T18-a, §7.1).
+   canonical fields and revision (`revisions.recompute_job`, once, after the last merge), and the det-facts
+   change hook (`filters.refilter_job_live`, M3 Task 15, with what step 1 read under `active_config`): its
+   hard-filter results for the active and the pending scope, the current instances of its published results
+   of the active tuple for both scopes, and its unpublished targets' moves `filtered_out ⇄ pending`. Then
+   `afault_point(IN_ITEM_TX)` (crash case C6), the item `→ linked` with its `observation_id` and
+   `normalized = NULL`, and, last, `ranking.bump` when the list changed: a job created, a merge, a new current
+   revision or a list column (`RecomputeResult`), the job's availability or first sighting (Ruling T18-a,
+   §7.1), or an instance or a target the hook wrote or moved.
 
 A `DomainError` other than `FencedOut` rolls the savepoint back, and the item becomes
 `rejected('identity_error')` in a savepoint of its own (owner row first); `FencedOut` propagates. Every final
@@ -87,13 +99,13 @@ from jobhunter.db import ranking
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge
+from jobhunter.dedup.user_actions import ACTION_TIMESTAMPS
 from jobhunter.errors import DomainError, FencedOut, InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.normalize.fields import CanonicalFields, ObservationView, WatchlistDisplay, select_canonical
 from jobhunter.normalize.keys import AdKey
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
-from jobhunter.run_settings import ScopeSettings
 from jobhunter.scoring import filters
 from jobhunter.sources import items
 from jobhunter.sources.base import NormalizedPosting
@@ -149,7 +161,12 @@ _DIFFERENT: Final = q(
     "AND job_a = ANY(CAST(:jobs AS bigint[])) AND job_b = ANY(CAST(:jobs AS bigint[])))"
 )
 _TOMBSTONES: Final = q(
-    "SELECT key_hash, tombstone_id FROM tombstone_keys WHERE key_hash = ANY(CAST(:hashes AS bytea[]))"
+    "SELECT k.key_hash, k.tombstone_id, t.user_actions FROM tombstone_keys k "
+    "JOIN job_tombstones t ON t.id = k.tombstone_id WHERE k.key_hash = ANY(CAST(:hashes AS bytea[]))"
+)
+_RESTORE_ACTIONS: Final = q(
+    "INSERT INTO user_job_actions (job_id, seen_at, saved_at, applied_at, hidden_at) "
+    "VALUES (:job, :seen_at, :saved_at, :applied_at, :hidden_at)"
 )
 _INSERT_JOB: Final = q(
     "INSERT INTO jobs (company_key, company_display, title, title_norm, seniority_tokens, "
@@ -252,6 +269,29 @@ def collect_keys(n: NormalizedPosting) -> list[AdKey]:
 def tombstone_key_hash(key: AdKey) -> bytes:
     """`tombstone_keys.key_hash` of a key: `sha256(ns ‖ 0x00 ‖ value)` (§7.9; M5's tombstoning writes it)."""
     return hashlib.sha256(key.ns.encode() + b"\x00" + key.value.encode()).digest()
+
+
+def _tombstone_actions(user_actions: JSONValue) -> tuple[dict[str, datetime], tuple[str, ...]]:
+    """The user-action timestamps of `job_tombstones.user_actions` (step 3): each of `ACTION_TIMESTAMPS`
+    that holds an ISO 8601 time with its offset, and the names of those that hold something else (dropped,
+    never guessed). Any other key is ignored."""
+    if not isinstance(user_actions, dict):
+        return {}, ()
+    found: dict[str, datetime] = {}
+    unreadable: list[str] = []
+    for name in ACTION_TIMESTAMPS:
+        value = user_actions.get(name)
+        if value is None:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value) if isinstance(value, str) else None
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.tzinfo is None:
+            unreadable.append(name)
+        else:
+            found[name] = parsed
+    return found, tuple(unreadable)
 
 
 @dataclass(frozen=True)
@@ -440,11 +480,12 @@ def _view(item: _Item) -> tuple[ObservationView, WatchlistDisplay | None]:
 
 
 async def _new_job(conn: AsyncConnection, item: _Item, fields: CanonicalFields, keys: Sequence[AdKey]) -> int:
-    """A job from this observation alone (step 3), flagged by the first key a tombstone holds."""
+    """A job from this observation alone (step 3), flagged by the first key a tombstone holds, with that
+    tombstone's user-action timestamps."""
     hashes = [tombstone_key_hash(key) for key in keys]
-    found = {
-        bytes(r.key_hash): int(r.tombstone_id) for r in await conn.execute(_TOMBSTONES, {"hashes": hashes})
-    }
+    rows = (await conn.execute(_TOMBSTONES, {"hashes": hashes})).all()
+    found = {bytes(r.key_hash): int(r.tombstone_id) for r in rows}
+    actions_of: dict[int, JSONValue] = {int(r.tombstone_id): r.user_actions for r in rows}
     tombstone = next((found[h] for h in hashes if h in found), None)
     params = {
         "company_key": fields.company_key,
@@ -473,8 +514,23 @@ async def _new_job(conn: AsyncConnection, item: _Item, fields: CanonicalFields, 
     }
     job_id = int((await conn.execute(_INSERT_JOB, params)).scalar_one())
     if tombstone is not None:
-        log.info("job_restored_from_tombstone", job_id=job_id, tombstone_id=tombstone)
+        await _restore_actions(conn, job_id, tombstone, actions_of[tombstone])
     return job_id
+
+
+async def _restore_actions(
+    conn: AsyncConnection, job_id: int, tombstone_id: int, user_actions: JSONValue
+) -> None:
+    """The new job's `user_job_actions` row from the tombstone's timestamps (step 3); none without one."""
+    restored, unreadable = _tombstone_actions(user_actions)
+    if unreadable:
+        log.warning("tombstone_actions_unreadable", tombstone_id=tombstone_id, fields=list(unreadable))
+    if restored:
+        stamps = {name: restored.get(name) for name in ACTION_TIMESTAMPS}
+        await conn.execute(_RESTORE_ACTIONS, {"job": job_id, **stamps})
+    log.info(
+        "job_restored_from_tombstone", job_id=job_id, tombstone_id=tombstone_id, actions=sorted(restored)
+    )
 
 
 async def _posting_for(
@@ -501,7 +557,7 @@ async def _posting_for(
 
 
 async def _link(
-    conn: AsyncConnection, owner: RunOwner, item: _Item, scopes: Mapping[int, ScopeSettings]
+    conn: AsyncConnection, owner: RunOwner, item: _Item, active: filters.ActiveScopes
 ) -> ResolveOutcome:
     """Steps 2 to 7 of an item that no fence and no earlier observation settled."""
     keys = collect_keys(item.posting)
@@ -512,6 +568,8 @@ async def _link(
         await _dispose(conn, item.raw_item_id, item.from_states, "deferred", reason=JOB_FENCED)
         return ResolveOutcome("deferred")
     decision = await _decide(conn, found, keys)
+    if decision.merged:  # the bulk rows of every merge's targets, before any write (module docstring)
+        await merge.lock_target_holds(conn, decision.merged)
     view, display = _view(item)
     fields = select_canonical([view], first_seen_at=item.t, watchlist_display=display)
     created = decision.target is None
@@ -589,9 +647,16 @@ async def _link(
         )
 
     derived, result = await merge.recompute_rollups(conn, job)
-    await filters.refilter_job(conn, job, scopes)
+    live = await filters.refilter_job_live(conn, job, active=active)
     await _dispose(conn, item.raw_item_id, item.from_states, "linked", observation_id=observation_id)
-    if created or decision.merged or result.current_changed or result.list_changed or derived.changed:
+    if (
+        created
+        or decision.merged
+        or result.current_changed
+        or result.list_changed
+        or derived.changed
+        or live.changed
+    ):
         await ranking.bump(conn)
     log.debug(
         "raw_item_linked",
@@ -611,7 +676,7 @@ async def _link(
 
 
 async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
-    scopes = await filters.active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3, §8.6)
+    active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3, §8.6)
     row = (await conn.execute(_ITEM, {"item": raw_item_id})).first()
     if row is None:
         raise LookupError(f"raw item {raw_item_id} does not exist")
@@ -641,7 +706,7 @@ async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> 
         watchlist_display=row.watchlist_display,
         list_item_sha256=None if row.list_item_sha256 is None else bytes(row.list_item_sha256),
     )
-    return await _link(conn, owner, item, scopes)
+    return await _link(conn, owner, item, active)
 
 
 async def _reject(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:

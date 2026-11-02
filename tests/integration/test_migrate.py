@@ -11,7 +11,7 @@ from jobhunter.db.migrate import MIGRATE_ORDER, apply_explicit_grants, run_migra
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.db.session import make_engine
 from jobhunter.graphs.checkpointer import setup_checkpointer
-from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
+from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v2
 from jobhunter.scoring.rubric import load_rubric
 
 from tests.support.pg import PgRole, PgServer, pg_one
@@ -81,18 +81,19 @@ async def test_seed_values(fresh_pg_server, make_config) -> None:
         1,
         "0.450",
     )
-    # The rubric and prompt-schema pointers name the rows `seed_defaults` inserted (M2).
+    # The rubric and prompt-schema pointers name the rows `seed_defaults` inserted (M2): the shipped rubric v2
+    # and prompt-schema version 2 since M3.
     assert pg_one(
         fresh_pg_server,
         "migrator",
         "SELECT a.settings_version_id = s.id, a.scope_version_id = s.scope_version_id, "
-        "a.rubric_version_id = (SELECT r.id FROM rubric_versions r WHERE r.version = 'v1' "
+        "a.rubric_version_id = (SELECT r.id FROM rubric_versions r WHERE r.version = 'v2' "
         "AND r.content_hash = %s), "
         "a.prompt_schema_version_id = (SELECT p.id FROM prompt_schema_versions p "
         "WHERE p.prompt_schema_hash = %s), a.llm_tuple_id IS NULL "
         "FROM active_config a, settings_versions s WHERE s.version_no = 1",
-        load_rubric("v1").content_hash,
-        prompt_schema_hash(*prompt_schema_v1()),
+        load_rubric("v2").content_hash,
+        prompt_schema_hash(*prompt_schema_v2()),
     ) == (True, True, True, True, True)
     assert one(
         fresh_pg_server,

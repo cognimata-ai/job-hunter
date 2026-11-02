@@ -1,15 +1,26 @@
 """The procrastinate app, the task blueprint and deferring inside the caller's transaction (spec §3.3.2).
 
-`blueprint` declares the five tasks. `make_queue_app` builds the process's *task app* (the blueprint under the
-namespace `jh`, so a task is named `jh:<name>`) on a psycopg pool; `defer_in_tx` inserts a job through the
+`blueprint` declares the nine tasks. `make_queue_app` builds the process's *task app* (the blueprint under
+the namespace `jh`, so a task is named `jh:<name>`) on a psycopg pool; `defer_in_tx` inserts a job through the
 caller's SQLAlchemy connection, in a savepoint, so the job commits or rolls back with the caller's own writes
 (spike V1). Correctness never rests on it: every mutation that needs follow-up work also leaves a durable
 `operations` or `runs` row that the reconcilers re-defer from (§3.3.2).
 
 The bodies: `run_operation` (Task 10), `tick` (Task 11), `run_collect` (Task 12), `reconcile_heavy` and
 `retention_daily` (Task 13; it runs the `daily` reconcilers after the retention pass, Task 19, unless the
-worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running,
-ledger L312). Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
+worker epoch fenced that pass out, final review C2; a pass that raises does not keep them from running, ledger
+L312), M3 Task 17's periodic `batch_poll` (every 5 min) and `batch_reconcile_ambiguous` (every 15 min) on
+`aux`, each with the queueing lock of its name (`scoring.batch_results`, `scoring.batch_adoption`, on the
+runtime's one Batches client), M3 Task 20's periodic `canary_daily` (`41 6 * * *`) on the `tick` queue with
+the queueing lock of its name (`eval_calibration.start_canary_run`, Ruling P33), and M3 Task 11's
+`score_cycle(trigger)` on the `score` queue under the lock `score` (`graphs.score.graph.execute_cycle`: one
+cycle, created by its first transaction, never resumed; its job is failed, never retried, when it stalls:
+`NO_STALL_RETRY`). Task 27 registers and pins the four. Each of the three periodic M3 tasks does nothing once
+the admission stop is set (§3.3.5: no new LLM call or batch submit after it; logged `periodic_task_skipped`)
+and starts with the worker's epoch fence (`canary_daily` in its one transaction, the batch tasks in one of
+their own before they reach the provider), so a superseded worker's does nothing and stops it. The tick runs
+the score lane's trigger (`tick.tick_score`, §3.4 step 6) after its scheduling step, in a transaction of its
+own. Every body is `pass_context` and reads its inputs from the `WorkerRuntime` in
 `context.additional_context["runtime"]`. The tick's own scheduling step (`run_tick`) is fenced by the worker
 epoch too (Ruling FR-h): a superseded worker's tick writes nothing. Whatever the worker's own fence refuses
 (`FencedOut.worker_superseded`), a delivery, the tick's step, a cadence or the retention pass, the body then
@@ -54,7 +65,22 @@ if TYPE_CHECKING:
     from jobhunter.worker.runtime import WorkerRuntime
 
 TASK_NAMESPACE: Final = "jh"
-TaskName = Literal["run_collect", "run_operation", "tick", "reconcile_heavy", "retention_daily"]
+TaskName = Literal[
+    "run_collect",
+    "run_operation",
+    "tick",
+    "reconcile_heavy",
+    "retention_daily",
+    "score_cycle",
+    "batch_poll",
+    "batch_reconcile_ambiguous",
+    "canary_daily",
+]
+# The tasks whose stalled job is failed outright, never retried (`_release_one`, Codex r1 #17; M2
+# Carry-forward I4): a retried `score_cycle` would find its cycle still `running` and start nothing until the
+# takeover sweep or `orphaned_cycles` failed it; failing the job leaves that to them, and the next trigger
+# starts a new cycle.
+NO_STALL_RETRY: Final[frozenset[TaskName]] = frozenset({"score_cycle"})
 
 # Queue name to the concurrency of the worker that serves it (spec §3.3.2).
 QUEUES: Final[Mapping[str, int]] = {"collect": 1, "score": 1, "aux": 2, "tick": 1}
@@ -76,6 +102,25 @@ def _stop_when_superseded(rt: "WorkerRuntime") -> Callable[[], None]:
     from jobhunter.worker.runtime import EPOCH_SUPERSEDED, request_shutdown
 
     return lambda: request_shutdown(rt.shutdown, reason=EPOCH_SUPERSEDED)
+
+
+async def _admitted(rt: "WorkerRuntime", task: TaskName) -> bool:
+    """Whether a periodic M3 task may run (module docstring): not once the admission stop is set, and only
+    while this worker's epoch is current, proved by its fence in a transaction of its own. A superseded
+    worker's task does nothing and requests this worker's stop (Ruling T24-a); another owner's fence
+    propagates, a failure of the job."""
+    if rt.shutdown.admission_stopped:
+        log.info("periodic_task_skipped", task=task, reason="admission_stopped")
+        return False
+    try:
+        async with rt.engine.begin() as conn:
+            await fence_epoch(conn, rt.epoch)
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise
+        _stop_when_superseded(rt)()
+        return False
+    return True
 
 
 def _reconcile_context(rt: "WorkerRuntime") -> "ReconcileContext":
@@ -133,7 +178,7 @@ async def run_operation(context: JobContext, operation_id: int) -> None:
 async def tick(context: JobContext, timestamp: int) -> None:
     # Imported here: `reconcilers` and `tick` import this module (`Deferrer`, `release_stalled_jobs`).
     from jobhunter.worker.reconcilers import run_reconcilers
-    from jobhunter.worker.tick import observe_tick, run_tick
+    from jobhunter.worker.tick import observe_tick, run_tick, tick_score
 
     rt: WorkerRuntime = context.additional_context["runtime"]
     # The `stalled_jobs` reconciler runs in this cadence, so the tick does not release stalled jobs itself.
@@ -151,6 +196,85 @@ async def tick(context: JobContext, timestamp: int) -> None:
         _stop_when_superseded(rt)()
         return
     observe_tick(report)  # after the commit: a rolled-back tick inserted nothing
+    try:
+        # §3.4 step 6, in a transaction of its own: the score lane's periodic trigger (fenced by the epoch).
+        await tick_score(rt.engine, now=utcnow(), epoch=rt.epoch, defer=defer_in_tx, fake_llm=rt.cfg.fake_llm)
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise
+        _stop_when_superseded(rt)()
+
+
+@blueprint.task(name="score_cycle", queue="score", lock="score", pass_context=True)
+async def score_cycle(context: JobContext, trigger: str) -> None:
+    """One score cycle of `trigger` (§9.3): `execute_cycle` creates it in its first transaction and runs its
+    graph, owned and beaten; a delivery never resumes a cycle (a retried one creates a fresh cycle or starts
+    nothing). The worker's own fence refusing it stops this superseded worker (Ruling T24-a)."""
+    # Imported here: the graph pulls in langgraph, which a process that only defers (the API) skips; and
+    # `cycles` imports this module (`Deferrer`).
+    from jobhunter.graphs.score.graph import execute_cycle
+    from jobhunter.scoring.cycles import cycle_trigger
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    shutdown = rt.shutdown
+    try:
+        await execute_cycle(
+            rt.score_graphs,
+            rt.score_deps,
+            trigger=cycle_trigger(trigger),
+            epoch=rt.epoch,
+            fake_llm=rt.cfg.fake_llm,
+            admission_stopped=lambda: shutdown.admission_stopped,
+        )
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the job
+        _stop_when_superseded(rt)()
+
+
+# M3 Task 17 (A2 B16, Deviation 27): the batch branch's periodic tasks on `aux`, one waiting job each.
+@blueprint.periodic(cron="*/5 * * * *")
+@blueprint.task(name="batch_poll", queue="aux", queueing_lock="batch_poll", pass_context=True)
+async def batch_poll(context: JobContext, timestamp: int) -> None:
+    """The submitted and ended batch submissions polled, their results processed (`batch_results.poll`),
+    with the runtime's Batches client; nothing after the admission stop or for a superseded worker
+    (`_admitted`)."""
+    # Imported here: the batch modules import this module (`Deferrer`, `defer_in_tx`).
+    from jobhunter.scoring import batch_results
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    if not await _admitted(rt, "batch_poll"):
+        return
+    try:
+        await batch_results.poll_task(rt.engine, rt.batches_client, epoch=rt.epoch)
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the job
+        _stop_when_superseded(rt)()
+
+
+@blueprint.periodic(cron="*/15 * * * *")
+@blueprint.task(
+    name="batch_reconcile_ambiguous",
+    queue="aux",
+    queueing_lock="batch_reconcile_ambiguous",
+    pass_context=True,
+)
+async def batch_reconcile_ambiguous(context: JobContext, timestamp: int) -> None:
+    """The ambiguous and the released submissions matched against the listing
+    (`batch_adoption.reconcile_ambiguous`), with the runtime's Batches client; nothing after the admission
+    stop or for a superseded worker (`_admitted`)."""
+    from jobhunter.scoring import batch_adoption
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    if not await _admitted(rt, "batch_reconcile_ambiguous"):
+        return
+    try:
+        await batch_adoption.reconcile_ambiguous_task(rt.engine, rt.batches_client, epoch=rt.epoch)
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the job
+        _stop_when_superseded(rt)()
 
 
 # On the `tick` queue, as the tick and `retention_daily` (module docstring): it holds the tick back while it
@@ -199,6 +323,33 @@ async def retention_daily(context: JobContext, timestamp: int) -> None:
     await run_reconcilers(_reconcile_context(rt), "daily")
     if failure is not None:
         raise failure
+
+
+# M3 Task 20 (L285, L4632; Ruling P33): the daily canary run on the `tick` queue, one waiting job.
+@blueprint.periodic(cron="41 6 * * *")
+@blueprint.task(name="canary_daily", queue="tick", queueing_lock="canary_daily", pass_context=True)
+async def canary_daily(context: JobContext, timestamp: int) -> None:
+    """A canary run of the active configuration and its `eval_run` operation, in one transaction that the
+    worker's epoch fence opens (`eval_calibration.start_canary_run`: nothing without a tuple or an active
+    canary), on the worker's transport; the `eval_run` handler on `aux` scores it. Nothing after the admission
+    stop; a superseded worker's writes nothing and stops it (Ruling T24-a)."""
+    # Imported here: the eval modules import this module (`Deferrer`) and pull in the score steps.
+    from jobhunter.scoring import eval_calibration
+
+    rt: WorkerRuntime = context.additional_context["runtime"]
+    if rt.shutdown.admission_stopped:
+        log.info("periodic_task_skipped", task="canary_daily", reason="admission_stopped")
+        return
+    try:
+        async with rt.engine.begin() as conn:
+            await fence_epoch(conn, rt.epoch)  # step 1, before `active_config` (the run's candidate)
+            await eval_calibration.start_canary_run(
+                conn, transport="fake" if rt.cfg.fake_llm else "live", now=utcnow(), defer=defer_in_tx
+            )
+    except FencedOut as fenced:
+        if not fenced.worker_superseded:
+            raise  # not this worker's own fence: a failure of the job
+        _stop_when_superseded(rt)()
 
 
 # The blueprint can be added to one app only (adding it namespaces its tasks), so a process has one task app.
@@ -357,13 +508,15 @@ async def live_job_exists(
 _RETRYABLE: Final = (Status.DOING, Status.FAILED)
 _FINISHABLE: Final = (Status.TODO, Status.DOING)
 
-type _Outcome = Literal["released", "superseded", "not_retryable"]
+type _Outcome = Literal["released", "superseded", "not_retryable", "failed"]
 
 _OUTCOME_EVENTS: Final[Mapping[_Outcome, str]] = {
     "released": "stalled_job_released",
     "superseded": "stalled_job_superseded",
     "not_retryable": "stalled_job_not_retryable",
+    "failed": "stalled_job_failed",
 }
+_NO_RETRY_NAMES: Final = frozenset(job_task_name(name) for name in NO_STALL_RETRY)
 
 
 async def _has_left(manager: JobManager, job_id: int, statuses: tuple[Status, ...]) -> bool:
@@ -374,8 +527,20 @@ async def _has_left(manager: JobManager, job_id: int, statuses: tuple[Status, ..
         return True
 
 
+async def _fail_job(manager: JobManager, job: Job, job_id: int, outcome: _Outcome) -> _Outcome:
+    """Mark `job` failed (kept); `not_retryable` when it ended meanwhile, any other error propagates."""
+    try:
+        await manager.finish_job(job, Status.FAILED, delete_job=False)
+    except ConnectorException:
+        if not await _has_left(manager, job_id, _FINISHABLE):
+            raise
+        return "not_retryable"
+    return outcome
+
+
 async def _release_one(manager: JobManager, job: Job) -> _Outcome:
-    """Retry `job`, or fail it when its queueing lock is taken, or leave it when it is no longer stalled.
+    """Retry `job`, or fail it when its queueing lock is taken or its task is one of `NO_STALL_RETRY`, or
+    leave it when it is no longer stalled.
 
     Only these two failures of the retry are expected; any other error propagates. A retry raises
     `UniqueViolation` (on the queueing-lock index) when a waiting job holds the job's queueing lock, and
@@ -383,6 +548,8 @@ async def _release_one(manager: JobManager, job: Job) -> _Outcome:
     """
     if job.id is None:
         raise TypeError("a stalled job from the manager has no id")
+    if job.task_name in _NO_RETRY_NAMES:  # Codex r1 #17: failed outright, its owner row is the sweeps'
+        return await _fail_job(manager, job, job.id, "failed")
     try:
         await manager.retry_job(job)
     except UniqueViolation as exc:
@@ -395,13 +562,7 @@ async def _release_one(manager: JobManager, job: Job) -> _Outcome:
     else:
         return "released"
     # The waiting job with the same queueing lock supersedes this one: it is what the lock exists to allow.
-    try:
-        await manager.finish_job(job, Status.FAILED, delete_job=False)
-    except ConnectorException:
-        if not await _has_left(manager, job.id, _FINISHABLE):
-            raise
-        return "not_retryable"
-    return "superseded"
+    return await _fail_job(manager, job, job.id, "superseded")
 
 
 async def release_stalled_jobs(app: procrastinate.App, *, seconds_since_heartbeat: float = 60.0) -> int:
@@ -411,6 +572,8 @@ async def release_stalled_jobs(app: procrastinate.App, *, seconds_since_heartbea
     its own, so one job cannot keep the others from being released:
     - a job whose queueing lock a waiting job holds is superseded by it, so it is marked failed (logged
       `stalled_job_superseded`) and not counted;
+    - a job of a task in `NO_STALL_RETRY` (`score_cycle`) is marked failed (logged `stalled_job_failed`) and
+      not counted: its cycle is failed `orphaned` by the takeover sweep or `orphaned_cycles` (M3 Task 11);
     - a job that is no longer retryable, because it ended after it was listed, is skipped (logged
       `stalled_job_not_retryable`) and not counted;
     - any other error propagates, and the `stalled_jobs` reconciler records it as `reconciler.failed`.

@@ -56,7 +56,10 @@ it reserves the enlarged stage's worst case, and the logical call counts the tri
   `InvalidOutput("structural")`, the caller's one repair, and so is an output a string of which holds a NUL
   character or a lone surrogate (`storable`: no JSONB value can hold it, so the billed settlement, which
   writes `output_json`, would roll back); any other stop reason is `unexpected_stop_reason`,
-  `InvalidOutput("unexpected_stop_reason")` and the warn `llm.unexpected_stop_reason` (Deviation 6).
+  `InvalidOutput("unexpected_stop_reason")` and the warn `llm.unexpected_stop_reason` (Deviation 6). The
+  classification is the pure `classify`, and the alert `raise_classified_alert`; a batch item's `succeeded`
+  message is classified by the same function as a try of its first stage (`classify_message`, M3 Task 17,
+  Codex r1 #26: its text parsed as JSON, its usage the Messages API's).
 - An error response (4xx, 5xx) is `not_billed(error_response_no_content)`, its call `error` with
   `http_<status>`. 408, 409, 429, 5xx and 529 are retried after the `Retry-After` it asks for, else after the
   jittered 2 s / 8 s; any other status is `LLMRequestError(status)`. 401 and 403 raise the critical
@@ -68,7 +71,10 @@ it reserves the enlarged stage's worst case, and the logical call counts the tri
   reserves anew (C15).
 - The call's deadline passing in flight is `ambiguous` with `deadline`, then `DeadlineExhausted`.
 - A cancellation (`TimeoutPolicy`, a reconciler, the shutdown) is `ambiguous` with `cancelled`, settled in the
-  cancelled task, and the `CancelledError` propagates (V11).
+  cancelled task, and the `CancelledError` propagates (V11). A graph does not wait for a cancelled node's
+  task, so the worker's teardown awaits the tasks still sending a try (`settle_in_flight`: it cancels a try
+  still in its stream that no cancellation reached, and waits for one already settling) before it closes the
+  engine (§3.3.5 step 4; M3 Task 28).
 
 Every `completed` call without an `output_json` therefore carries an `error_code` (receipts, Task 13). The
 first-stage `max_tokens` code is not a terminal one: that logical call went on to its enlarged stage. A retry
@@ -85,6 +91,30 @@ raised after the handler that classified its cause has ended, so neither its `__
 `__context__` refers to a provider error (which holds the request) or to an encoding error (which holds the
 prompt).
 
+**Score calls** (M3 Task 7). A score attempt's call carries its spend owner (`TargetAttemptOwner`), its
+attempt, target and round, and its funding bulk operation in `CallContext`; `_reserve` hands them to the
+ledger, and `_dispatch` tells the dispatch marker whether the try is its logical call's first (the first try
+of the stage it starts at), on which the attempt counts one more logical call (§9.4.2). A score node reads
+the attempt's pinned configuration by id (`pinned_node_config`, never the active one, L3813) with the
+critic's per-round effort; `reservation_for` states the worst case `call()` reserves for a prompt's first try,
+and `batch_request_body` the batch params of a request (the online body with `max_tokens`, without `stream`,
+L3932). Alerts and errors quote provider metadata only as it is stored (`spend_ledger.storable_text`).
+
+**The fake's key** (M3 Task 8). In fake LLM mode (`AppConfig.fake_llm`) every try also sends `X-JH-Fake-Key`,
+`fake.answer_key(purpose, input_refs, round)` of the node, the prompt's `input_refs` and `CallContext.round`,
+by which a test gives each target its own answer (`llm/fake.py`); outside fake mode no request carries it.
+
+**The schema** of a node is a `WireSchema`, two inputs and never one (plan Deviation 40): `json`, the stored
+wire schema the request sends (`output_config.format.schema`: `output_schema`, `count_body` and the byte bound
+read it as it is, and the try binds `anthropic.transform_schema` of it as langchain's json_schema method does,
+which leaves every stored schema unchanged: `prompts.render.load_prompt_version` refuses a row whose schema
+it would change), and `model`, the structural mirror the parsed JSON is validated against
+(`model.model_validate`, then `storable`).
+`WireSchema.from_model(cls)` (`json = schemas.transformed(cls)`) is the schema of a mirror as M2 sent it; a
+score node takes its version's stored schema and its family's mirror (`prompts.render.score_schema`). A stored
+schema that does not fit its mirror is a structural failure at the first call, the case the live schema
+dry-run catches before such a version is activated.
+
 **The reconciler** `llm_refusal_rate` (heavy, §17.6): more than 5% refusals among the completed calls of the
 last 24 h, with at least 20 of them, opens `llm.refusal_rate` (warn); a rate of 5% or less resolves it (a
 window without calls is 0%), and too few calls at a rate above 5% leave it as it is.
@@ -92,28 +122,33 @@ window without calls is 0%), and too few calls at a rate above 5% leave it as it
 
 import asyncio
 import contextlib
+import copy
+import dataclasses
 import hashlib
 import json
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from functools import cached_property
+from operator import itemgetter
 from typing import Any, Final, Literal, cast
 
 import anthropic
 import httpx2
+from anthropic.types import Message
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import Runnable
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.runnables import Runnable, RunnableMap, RunnablePassthrough
+from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validator
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
@@ -135,9 +170,18 @@ from jobhunter.llm.errors import (
     ModelMismatch,
     Refused,
 )
-from jobhunter.llm.fake import PURPOSE_HEADER, canonical_schema_json
-from jobhunter.llm.pricing import CONTEXT_WINDOW, MODELS, SUPPORTED_EFFORTS, Effort, Model, Usage
-from jobhunter.llm.spend_ledger import CallOutcome, Reservation, SettleFigures, SpendOwner
+from jobhunter.llm.fake import KEY_HEADER, PURPOSE_HEADER, answer_key, canonical_schema_json
+from jobhunter.llm.pricing import (
+    CONTEXT_WINDOW,
+    MODELS,
+    SUPPORTED_EFFORTS,
+    Effort,
+    Model,
+    Usage,
+    worst_case_usd,
+)
+from jobhunter.llm.schemas import transformed
+from jobhunter.llm.spend_ledger import CallOutcome, Reservation, SettleFigures, SpendOwner, storable_text
 from jobhunter.llm.transport import ANTHROPIC_BASE_URL, TIMEOUT
 from jobhunter.observability.alerts import open_alert, raise_alert, resolve_alert
 from jobhunter.observability.logging import get_logger
@@ -161,6 +205,7 @@ BACKOFF_S: Final = (2.0, 8.0)  # after the first and the second try
 JITTER: Final = 0.25
 
 AUTH_FAILED_ALERT: Final = "llm.auth_failed"
+AUTH_FAILED_STATUSES: Final = frozenset({401, 403})  # the key was refused
 MODEL_MISMATCH_ALERT: Final = "llm.model_mismatch"
 UNEXPECTED_STOP_ALERT: Final = "llm.unexpected_stop_reason"  # plan Deviation 6
 REFUSAL_RATE_ALERT: Final = "llm.refusal_rate"
@@ -306,6 +351,7 @@ def _chat_model(
     http_client: httpx2.AsyncClient,
     purpose: Purpose | None = None,
     receipt: TryReceipt | None = None,
+    fake_key: str | None = None,
 ) -> GatewayChatAnthropic:
     if not api_key.get_secret_value():
         raise ValueError("an empty api_key: the gateway passes the anthropic_key secret explicitly (G1)")
@@ -313,6 +359,10 @@ def _chat_model(
         raise ValueError("max_tokens must be positive (G4)")
     if effort not in SUPPORTED_EFFORTS[model]:
         raise ValueError(f"{model} does not support effort {effort!r} (G5)")
+    headers = {
+        **({PURPOSE_HEADER: purpose} if purpose is not None else {}),
+        **({KEY_HEADER: fake_key} if fake_key is not None else {}),
+    }
     return GatewayChatAnthropic(
         model=model,
         base_url=ANTHROPIC_BASE_URL,
@@ -323,7 +373,7 @@ def _chat_model(
         max_retries=0,
         timeout=http_client.timeout,
         http_client=http_client,
-        default_headers={PURPOSE_HEADER: purpose} if purpose is not None else None,
+        default_headers=headers or None,
         receipt=receipt,
     )
 
@@ -332,31 +382,86 @@ def _chat(
     model: Model,
     effort: Effort,
     max_tokens: int,
-    schema: type[BaseModel] | dict[str, Any],
+    schema: type[BaseModel] | Mapping[str, Any],
     *,
     api_key: SecretStr,
     http_client: httpx2.AsyncClient,
     purpose: Purpose | None = None,
     receipt: TryReceipt | None = None,
+    fake_key: str | None = None,
 ) -> StructuredChat:
     """The §10.2 runnable of one try: `ainvoke(messages)` streams once and returns `{"raw", "parsed",
-    "parsing_error"}` (`with_structured_output(…, method="json_schema", include_raw=True)`).
+    "parsing_error"}`, as `with_structured_output(…, method="json_schema", include_raw=True)` does.
+
+    The gateway passes a node's stored wire schema (`WireSchema.json`): it is bound as that method binds a
+    schema (`output_config.format` with `anthropic.transform_schema` of it, which leaves every stored schema
+    unchanged), `parsed` is the JSON object and the gateway validates it against the mirror. The method
+    itself is not used for it, because its tracing metadata (`convert_to_openai_tool`) needs a top-level
+    `title`, which a wire schema never has (candidate C is sent without one). A spike may pass a mirror
+    class, for which langchain's method parses into the class.
 
     The request carries `output_config.format` (`anthropic.transform_schema(schema)`) and
     `output_config.effort`, `stream: true` and exactly `max_tokens`; no tools, `tool_choice`, sampling
     parameters, betas or fallbacks (G2, G4, G6). `purpose` is sent as `X-JH-Purpose`, by which the fake
-    transport chooses its recording; the API ignores the header. `receipt` keeps the HTTP response.
+    transport chooses its recording; the API ignores the header. `fake_key` is sent as `X-JH-Fake-Key`, by
+    which the fake chooses a keyed answer (M3 Task 8): the gateway passes it in fake mode only, so no request
+    to the API carries it. `receipt` keeps the HTTP response.
     """
     llm = _chat_model(
-        model, effort, max_tokens, api_key=api_key, http_client=http_client, purpose=purpose, receipt=receipt
+        model,
+        effort,
+        max_tokens,
+        api_key=api_key,
+        http_client=http_client,
+        purpose=purpose,
+        receipt=receipt,
+        fake_key=fake_key,
     )
-    # `include_raw=True`: the output is always the `{"raw", "parsed", "parsing_error"}` dict.
-    return cast(StructuredChat, llm.with_structured_output(schema, method="json_schema", include_raw=True))
+    if isinstance(schema, type):
+        # `include_raw=True`: the output is always the `{"raw", "parsed", "parsing_error"}` dict.
+        return cast(
+            StructuredChat, llm.with_structured_output(schema, method="json_schema", include_raw=True)
+        )
+    # A copy, so no caller's stored schema is ever shared with the request.
+    sent = anthropic.transform_schema(copy.deepcopy(dict(schema)))
+    bound = llm.bind(output_config={"format": {"type": "json_schema", "schema": sent}})
+    parse = RunnablePassthrough.assign(
+        parsed=itemgetter("raw") | JsonOutputParser(), parsing_error=lambda _: None
+    )
+    unparsed = RunnablePassthrough.assign(parsed=lambda _: None)
+    chain = RunnableMap(raw=bound) | parse.with_fallbacks([unparsed], exception_key="parsing_error")
+    return cast(StructuredChat, chain)
 
 
-def output_schema(schema: type[BaseModel]) -> dict[str, Any]:
-    """The `output_config.format.schema` a request of `schema` sends (G2)."""
-    return anthropic.transform_schema(schema)
+@dataclass(frozen=True)
+class WireSchema:
+    """A node's schema (module docstring): `json`, the stored wire schema a request sends, and `model`, the
+    structural mirror its parsed output is validated against."""
+
+    json: Mapping[str, JSONValue]
+    model: type[BaseModel]
+
+    @classmethod
+    def from_model(cls, model: type[BaseModel]) -> "WireSchema":
+        """The wire schema of the mirror `model` as M2 sends it: `schemas.transformed(model)`, parsed as
+        `model` (the profile and queries nodes, version 1, the tests' own schemas)."""
+        return cls(json=transformed(model), model=model)
+
+
+def output_schema(schema: WireSchema) -> dict[str, Any]:
+    """The `output_config.format.schema` a request of `schema` sends (G2): its stored `json`, as it is (a
+    copy)."""
+    return copy.deepcopy(dict(schema.json))
+
+
+def _structural(model: type[BaseModel], parsed: object) -> BaseModel | None:
+    """`parsed` validated against the structural mirror `model`, or `None`. The validation error quotes the
+    output, so it is dropped here and never raised or kept."""
+    try:
+        return model.model_validate(parsed)
+    except ValidationError:
+        pass
+    return None
 
 
 # ---- nodes and prompts -------------------------------------------------------------------------------------
@@ -365,7 +470,8 @@ def output_schema(schema: type[BaseModel]) -> dict[str, Any]:
 @dataclass(frozen=True)
 class NodeConfig:
     """One node's call: model and effort (the model policy), the two `max_tokens` stages and the deadline (the
-    execution config), and its structured-output schema (§10.3)."""
+    execution config), and its structured-output schema (§10.3): the wire schema and the mirror
+    (`WireSchema`)."""
 
     purpose: NodePurpose
     model: Model
@@ -373,7 +479,7 @@ class NodeConfig:
     max_tokens: int
     max_tokens_retry: int
     deadline_s: int
-    schema: type[BaseModel]
+    schema: WireSchema
 
 
 def node_config(
@@ -381,7 +487,7 @@ def node_config(
     *,
     model_policy: Mapping[str, JSONValue],
     execution: Mapping[str, JSONValue],
-    schema: type[BaseModel],
+    schema: WireSchema,
 ) -> NodeConfig:
     """The node of `purpose` from the stored payloads: `nodes.<purpose>` of the model policy (its model and
     effort; a missing or unsupported effort is a `ValueError`, G5) and `<purpose>` of the execution config."""
@@ -415,7 +521,7 @@ _ACTIVE_LLM_CONFIG: Final = q(
 
 
 async def active_node_config(
-    engine: AsyncEngine, purpose: NodePurpose, schema: type[BaseModel]
+    engine: AsyncEngine, purpose: NodePurpose, schema: WireSchema
 ) -> tuple[NodeConfig, int]:
     """The node of `purpose` from the active model policy and execution config, read without a lock, and the
     execution config's id (the profile graphs' LLM nodes, Tasks 13 and 20)."""
@@ -423,6 +529,41 @@ async def active_node_config(
         row = (await conn.execute(_ACTIVE_LLM_CONFIG)).one()
     node = node_config(purpose, model_policy=row.model_policy, execution=row.execution, schema=schema)
     return node, int(row.execution_config_id)
+
+
+# An attempt's pinned configuration (§10.3 L3813): its tuple's model policy and its execution config, by id.
+_PINNED_LLM_CONFIG: Final = q(
+    "SELECT m.payload AS model_policy, e.payload AS execution FROM model_policies m, execution_configs e "
+    "WHERE m.id = :model_policy_id AND e.id = :execution_config_id"
+)
+
+
+async def pinned_node_config(
+    conn: AsyncConnection,
+    purpose: NodePurpose,
+    *,
+    model_policy_id: int,
+    execution_config_id: int,
+    schema: WireSchema,
+    effort: Effort | None = None,
+) -> NodeConfig:
+    """The node of `purpose` from the model policy `model_policy_id` (the attempt's tuple) and the execution
+    config `execution_config_id` the attempt pinned at its claim or batch preparation (§10.3 L3813: never the
+    active ones), read by id in the caller's transaction; `effort` overrides the policy's (the critic's
+    per-round effort, the light one for a round whose triggers are all light, §11.7.4), refused when the
+    model does not support it (G5). `LookupError` when either row is missing."""
+    params = {"model_policy_id": model_policy_id, "execution_config_id": execution_config_id}
+    row = (await conn.execute(_PINNED_LLM_CONFIG, params)).first()
+    if row is None:
+        raise LookupError(
+            f"no model policy {model_policy_id} or execution config {execution_config_id} to pin"
+        )
+    node = node_config(purpose, model_policy=row.model_policy, execution=row.execution, schema=schema)
+    if effort is None:
+        return node
+    if effort not in SUPPORTED_EFFORTS[node.model]:
+        raise ValueError(f"{node.model} does not support effort {effort!r} (G5)")
+    return dataclasses.replace(node, effort=effort)
 
 
 @dataclass(frozen=True)
@@ -488,12 +629,135 @@ class RenderedPrompt:
             return None
         return hashlib.sha256(_canonical([b.text for b in self.system[: marked[-1] + 1]])).digest()
 
-    def as_request(self, schema: type[BaseModel]) -> RenderedRequest:
+    def as_request(self, schema: WireSchema) -> RenderedRequest:
         """Every byte-bounded component: the system texts, the message texts and the sent schema."""
         return RenderedRequest(
             system=tuple(block.text for block in self.system),
             messages=tuple(_message_text(m) for m in self.messages),
-            schema_json=canonical_schema_json(output_schema(schema)),
+            schema_json=canonical_schema_json(schema.json),
+        )
+
+
+@dataclass(frozen=True)
+class Classified:
+    """A response that ended with its usage, classified (module docstring, "Each try's end"): its
+    `llm_calls.error_code` (`None` exactly when `parsed` holds the validated, storable output), the stop
+    reason and the served model as the provider sent them, the refusal category (`unspecified` when the
+    provider gave none; the call stores it for a refusal only, `refusal_category`), and the usage to bill."""
+
+    code: str | None
+    stop_reason: str
+    model_served: str
+    category: str
+    parsed: BaseModel | None = field(repr=False)
+    usage: Usage
+
+    @property
+    def refusal_category(self) -> str | None:
+        return self.category if self.code == REFUSED else None
+
+
+def classify(
+    *,
+    requested: str,
+    schema: WireSchema,
+    served: str,
+    stop_reason: str,
+    stop_details: object,
+    parsed: object,
+    parsing_failed: bool,
+    usage: Usage,
+    stage: Stage,
+) -> Classified:
+    """A completed response's `Classified`, in the gateway's order (module docstring): another served model
+    is `model_mismatch`; `max_tokens` is `max_tokens_first_stage` in the first stage and `max_tokens` in the
+    enlarged one; `refusal` is `refused`; `end_turn` is the output when it parsed (`parsing_failed` false),
+    fits the structural mirror and is storable, else `invalid_output`; any other stop reason is
+    `unexpected_stop_reason`. Pure: no I/O, and nothing of the output in an error."""
+    category = stop_details.get("category") if isinstance(stop_details, dict) else None
+    if not isinstance(category, str) or not category:
+        category = "unspecified"
+    output: BaseModel | None = None
+    code: str | None
+    if served != requested:
+        code = MODEL_MISMATCH
+    elif stop_reason == "max_tokens":
+        code = MAX_TOKENS_FIRST_STAGE if stage == "first" else MAX_TOKENS
+    elif stop_reason == "refusal":
+        code = REFUSED
+    elif stop_reason == "end_turn":
+        valid = None if parsing_failed else _structural(schema.model, parsed)
+        output = valid if valid is not None and storable(valid) else None
+        code = None if output is not None else INVALID_OUTPUT
+    else:
+        code = UNEXPECTED_STOP_REASON
+    return Classified(code, stop_reason, served, category, output, usage)
+
+
+def classify_message(*, node_model: Model, schema: WireSchema, message: Message) -> Classified:
+    """A batch item's `succeeded` message classified as an online try of its first stage is (`classify`;
+    plan Task 17, Codex r1 #26): its text blocks joined and parsed as JSON (`json.loads`: a text that is no
+    JSON is a parsing failure), its stop details, and its usage (the Messages API's `input_tokens` holds no
+    cache tokens). A message that names no stop reason is `unexpected_stop_reason` (`"none"`)."""
+    text = "".join(block.text for block in message.content if block.type == "text")
+    parsed: object = None
+    failed = False
+    try:
+        parsed = json.loads(text)
+    except ValueError:  # the error quotes the text: dropped here, never raised or kept
+        failed = True
+    usage = message.usage
+    details = message.stop_details
+    return classify(
+        requested=node_model,
+        schema=schema,
+        served=message.model,
+        stop_reason=message.stop_reason or "none",
+        stop_details=None if details is None else details.model_dump(mode="json"),
+        parsed=parsed,
+        parsing_failed=failed,
+        usage=Usage(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
+            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
+        ),
+        stage="first",
+    )
+
+
+async def raise_classified_alert(
+    conn: AsyncConnection, classified: Classified, *, purpose: Purpose, requested: str
+) -> None:
+    """The alert a classified response raises, in the caller's settlement transaction: the critical
+    `llm.model_mismatch` for another served model (G11, subject `model:<requested>`), the warn
+    `llm.unexpected_stop_reason` for an unexpected stop reason (Deviation 6); nothing otherwise. Provider
+    metadata is quoted as it is stored (`storable_text`)."""
+    if classified.code == MODEL_MISMATCH:
+        await raise_alert(
+            conn,
+            code=MODEL_MISMATCH_ALERT,
+            severity="critical",
+            subject=f"model:{requested}",
+            message="the provider served another model than requested; its output is not used",
+            context={
+                "purpose": purpose,
+                "requested": requested,
+                "served": storable_text(classified.model_served),
+            },
+        )
+    elif classified.code == UNEXPECTED_STOP_REASON:
+        await raise_alert(
+            conn,
+            code=UNEXPECTED_STOP_ALERT,
+            severity="warn",
+            subject=f"purpose:{purpose}",
+            message="an LLM call stopped for an unexpected reason",
+            context={
+                "purpose": purpose,
+                "model": requested,
+                "stop_reason": storable_text(classified.stop_reason),
+            },
         )
 
 
@@ -533,8 +797,15 @@ def to_messages(prompt: RenderedPrompt) -> list[BaseMessage]:
 class CallContext:
     """Who a call is for: the spend owner and class, the pinned execution config, the deadline (monotonic,
     the node's active `deadline_s` from now, enforced per call: Deviation 28), the draft or eval run it
-    records, its `logical_call_no` (2 for a node's one repair), whether its input is a native PDF, and the
-    stage it starts at (`enlarged` for a call resumed after its paid first stage stopped at `max_tokens`)."""
+    records, its `logical_call_no`, whether its input is a native PDF, and the stage it starts at (`enlarged`
+    for a call resumed after its paid first stage stopped at `max_tokens`).
+
+    `logical_call_no` is 1, or 2 for a profile node's one repair; for a score call it is 1-7 within the
+    attempt (`score_attempts.logical_calls + 1` at the node's start, A2 T9). A score call (M3) names its
+    attempt and target (`attempt_id`, `target_id`, those of its `TargetAttemptOwner`), its `round` (0 for the
+    generator, the critic round after it), and `bulk_operation_id`, the operation that funds a batched
+    target's follow-up (`spend_ledger.funded_bulk_operation_id`), `None` for every other online call; an eval
+    case's call names its `golden_case_id`."""
 
     owner: SpendOwner
     purpose_class: PurposeClass
@@ -545,6 +816,11 @@ class CallContext:
     logical_call_no: int = 1
     native_pdf: bool = False
     start_stage: Stage = "first"
+    attempt_id: int | None = None
+    target_id: int | None = None
+    round: int | None = None
+    bulk_operation_id: int | None = None
+    golden_case_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -562,6 +838,20 @@ class GatewayResult:
 
 
 # ---- retry policy (§10.4) ----------------------------------------------------------------------------------
+
+
+async def raise_auth_failed(conn: AsyncConnection, *, http_status: int) -> None:
+    """Raise the critical `llm.auth_failed` alert in `conn`'s transaction: the Anthropic API refused the key
+    (`http_status` 401 or 403). It pauses scoring (`cycles.pause_reason`) until it is acknowledged or a call
+    succeeds again."""
+    await raise_alert(
+        conn,
+        code=AUTH_FAILED_ALERT,
+        severity="critical",
+        subject=_AUTH_SUBJECT,
+        message="the Anthropic API refused the key; LLM calls fail until it is fixed",
+        context={"http_status": http_status},
+    )
 
 
 def is_retryable_status(status: int) -> bool:
@@ -713,6 +1003,11 @@ class LLMGateway:
         self._sleep = sleep
         self._cache = cache
         self._key = _api_key(cfg)
+        self._fake_llm = cfg.fake_llm  # only the fake is sent `X-JH-Fake-Key`
+        # `settle_in_flight`: the tasks sending a try (its stream and its settlement), and of them those still
+        # inside the provider call's stream, the only phase a stop cancels
+        self._trying: set[asyncio.Task[Any]] = set()
+        self._streaming: set[asyncio.Task[Any]] = set()
 
     @property
     def configured(self) -> bool:
@@ -738,6 +1033,12 @@ class LLMGateway:
         """The clock the loop compares `CallContext.deadline` with: a caller builds its deadline from it."""
         return self._monotonic
 
+    @property
+    def sleep(self) -> Callable[[float], Awaitable[object]]:
+        """What the loop waits out its backoff with: a caller that retries a call of its own (the batch
+        create, `llm.batches`) waits with it too."""
+        return self._sleep
+
     async def call(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> GatewayResult:
         """One logical call: ≤ 3 transport tries per `max_tokens` stage, ≤ 2 stages (≤ 6 HTTP tries) from
         `ctx.start_stage`; a gateway without a key raises `LLMNotConfigured` first."""
@@ -747,7 +1048,8 @@ class LLMGateway:
         if hashes is None:  # raised outside the handler: the encoding error holds the whole prompt
             raise InputUnbounded("unencodable")
         rendered, prefix = hashes
-        bound = await self._input_bound(node, prompt, ctx)
+        bound = await self._input_bound(node, prompt, native_pdf=ctx.native_pdf)
+        fake_key = answer_key(node.purpose, prompt.input_refs, ctx.round) if self._fake_llm else None
         counted = Decimal(0)
         stages: tuple[tuple[Stage, int], ...] = (
             ("first", node.max_tokens),
@@ -766,11 +1068,12 @@ class LLMGateway:
                     node.model,
                     node.effort,
                     max_tokens,
-                    node.schema,
+                    node.schema.json,
                     api_key=api_key,
                     http_client=self._http,
                     purpose=node.purpose,
                     receipt=receipt,
+                    fake_key=fake_key,
                 )
                 res = await self._reserve(
                     node, prompt, ctx, stage, transport_try, max_tokens, bound, rendered, prefix
@@ -779,7 +1082,8 @@ class LLMGateway:
                 await self._dispatch(node, ctx, res, stage, transport_try)
                 await afault_point("gateway.after_dispatch")
                 t = _Try(node, ctx, res, stage, transport_try, max_tokens, self._clock())
-                step = await self._send(t, runnable, receipt, messages, prefix, counted)
+                with self._in_phase(self._trying):
+                    step = await self._send(t, runnable, receipt, messages, prefix, counted)
                 counted += step.counted
                 if step.result is not None:
                     return step.result
@@ -787,6 +1091,28 @@ class LLMGateway:
                     break
                 await self._sleep(step.wait)
         raise MaxTokensExhausted("the enlarged max_tokens stage stopped at max_tokens too")
+
+    async def reservation_for(
+        self, node: NodeConfig, prompt: RenderedPrompt, *, stage: Stage = "first"
+    ) -> Decimal:
+        """The worst case `call()` reserves for `prompt`'s first try at `stage` (Codex r2 B26): its input
+        bound (`_input_bound`, a text request) and the stage's `max_tokens` at `pricing.worst_case_usd`. A
+        test or a spike states a fixture's real reservation with it, instead of a policy-level estimate. Sends
+        nothing and reserves nothing; `InputUnbounded` as `call()` would raise it."""
+        bound = await self._input_bound(node, prompt, native_pdf=False)
+        max_tokens = node.max_tokens if stage == "first" else node.max_tokens_retry
+        return worst_case_usd(node.model, input_tokens_bound=bound, max_tokens=max_tokens)
+
+    def batch_request_body(
+        self, node: NodeConfig, prompt: RenderedPrompt, *, max_tokens: int
+    ) -> dict[str, JSONValue]:
+        """The `params` of a batch request (§10.10): the online body of `node` and `prompt` (`count_body`,
+        cache marker included) plus `max_tokens` and without `stream` (L3932: the online generator body
+        equals the batch params except for `stream`). A gateway without a key raises `LLMNotConfigured`."""
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive (G4)")
+        body: dict[str, JSONValue] = {**self.count_body(node, prompt), "max_tokens": max_tokens}
+        return body
 
     def count_body(self, node: NodeConfig, prompt: RenderedPrompt) -> dict[str, Any]:
         """The `messages.count_tokens` body of the exact request a try of `node` sends: langchain's payload of
@@ -806,13 +1132,13 @@ class LLMGateway:
         counted = await client.messages.count_tokens(**{**body, "model": model})
         return int(counted.input_tokens)
 
-    async def _input_bound(self, node: NodeConfig, prompt: RenderedPrompt, ctx: CallContext) -> int:
+    async def _input_bound(self, node: NodeConfig, prompt: RenderedPrompt, *, native_pdf: bool) -> int:
         """The reservation's input bound (§10.7), before anything is reserved; `InputUnbounded` otherwise.
 
         Each `InputUnbounded` is raised after the handler that classified its cause has ended, so neither its
         `__cause__` nor its `__context__` refers to that error: an encoding error holds the prompt, and the
         SDK's error holds its request, the count body with the native PDF."""
-        if not ctx.native_pdf:
+        if not native_pdf:
             try:
                 return text_input_bound(node.model, prompt.as_request(node.schema))
             except UnicodeEncodeError:
@@ -846,7 +1172,7 @@ class LLMGateway:
         rendered: bytes,
         prefix: bytes | None,
     ) -> Reservation:
-        """Step 1 in its own transaction."""
+        """Step 1 in its own transaction, with the call's score ids, round and funding operation."""
         async with self._engine.begin() as conn:
             return await spend_ledger.reserve(
                 conn,
@@ -871,15 +1197,24 @@ class LLMGateway:
                 eval_run_id=ctx.eval_run_id,
                 transport="stream",
                 now=self._clock(),
+                attempt_id=ctx.attempt_id,
+                target_id=ctx.target_id,
+                round=ctx.round,
+                bulk_operation_id=ctx.bulk_operation_id,
+                golden_case_id=ctx.golden_case_id,
             )
 
     async def _dispatch(
         self, node: NodeConfig, ctx: CallContext, res: Reservation, stage: Stage, transport_try: int
     ) -> None:
-        """Step 2 in its own transaction. A fenced marker releases the try in another and re-raises."""
+        """Step 2 in its own transaction, counting the logical call on its first try (the first try of the
+        stage the call starts at, §9.4.2). A fenced marker releases the try in another and re-raises."""
+        first_try = transport_try == 1 and stage == ctx.start_stage
         try:
             async with self._engine.begin() as conn:
-                await spend_ledger.mark_dispatched(conn, res, ctx.owner, now=self._clock())
+                await spend_ledger.mark_dispatched(
+                    conn, res, ctx.owner, now=self._clock(), first_try_of_logical_call=first_try
+                )
         except FencedOut:
             async with self._engine.begin() as conn:
                 await spend_ledger.release_never_dispatched(conn, res, now=self._clock())
@@ -914,7 +1249,8 @@ class LLMGateway:
         status = 0
         try:
             async with asyncio.timeout(t.ctx.deadline - self._monotonic()) as scope:
-                out = await runnable.ainvoke(messages)
+                with self._in_phase(self._streaming):
+                    out = await runnable.ainvoke(messages)
         except asyncio.CancelledError:
             await self._settle_cancelled(t, receipt)
             raise
@@ -943,6 +1279,38 @@ class LLMGateway:
             return await self._connect_failed(t)
         return await self._lost(t, receipt)
 
+    @contextlib.contextmanager
+    def _in_phase(self, phase: set[asyncio.Task[Any]]) -> Iterator[None]:
+        """The current task is in `phase` (`_trying` or `_streaming`) for as long as the block runs
+        (`settle_in_flight`)."""
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover - a coroutine always runs in a task
+            raise RuntimeError("a try is sent from a task")
+        phase.add(task)
+        try:
+            yield
+        finally:
+            phase.discard(task)
+
+    async def settle_in_flight(self, timeout_s: float) -> int:
+        """The shutdown's §3.3.5 step 4 for the tries still in flight: each task still streaming a try that no
+        cancellation has reached is cancelled, so its try settles `ambiguous` (`cancelled`); a task whose
+        stream has ended is settling its try and is never cancelled (Task 28 fix round 1). Every task sending
+        a try is awaited up to `timeout_s`, so each settlement ends before the worker closes its engine. A
+        cancelled try settles in its own task, and a graph does not wait for that task: LangGraph cancels a
+        running node's task and goes on without it, so a cancelled execution can end before its streams have
+        settled. The number of tasks still running at `timeout_s` (logged by its count only)."""
+        pending = {task for task in self._trying if not task.done()}
+        for task in self._streaming & pending:
+            if not task.cancelling():  # a second cancellation would cut the stream's own cleanup short
+                task.cancel()
+        if not pending:
+            return 0
+        _, running = await asyncio.wait(pending, timeout=timeout_s)
+        if running:
+            log.warning("llm_tries_unsettled_at_stop", tries=len(running))
+        return len(running)
+
     async def _settle_cancelled(self, t: _Try, receipt: TryReceipt) -> None:
         """Settle a cancelled try `ambiguous` in the cancelled task. A database failure here must not replace
         the cancellation: it is logged (its class only) and `llm_ledger_unsettled` settles the entry later."""
@@ -968,23 +1336,18 @@ class LLMGateway:
         if not isinstance(served, str):
             return await self._lost(t, receipt)
         usage = usage_of(cast(Mapping[str, Any], raw.usage_metadata))
-        parsed = out.get("parsed")
-        details = meta.get("stop_details")  # present only when not null (V13)
-        category = details.get("category") if isinstance(details, dict) else None
-        if not isinstance(category, str) or not category:
-            category = "unspecified"
-        code: str | None
-        if served != t.node.model:
-            code = MODEL_MISMATCH
-        elif stop_reason == "max_tokens":
-            code = MAX_TOKENS_FIRST_STAGE if t.stage == "first" else MAX_TOKENS
-        elif stop_reason == "refusal":
-            code = REFUSED
-        elif stop_reason == "end_turn":
-            ok = isinstance(parsed, t.node.schema) and out.get("parsing_error") is None and storable(parsed)
-            code = None if ok else INVALID_OUTPUT
-        else:
-            code = UNEXPECTED_STOP_REASON
+        classified = classify(
+            requested=t.node.model,
+            schema=t.node.schema,
+            served=served,
+            stop_reason=stop_reason,
+            stop_details=meta.get("stop_details"),  # present only when not null (V13)
+            parsed=out.get("parsed"),
+            parsing_failed=out.get("parsing_error") is not None,
+            usage=usage,
+            stage=t.stage,
+        )
+        code, output, category = classified.code, classified.parsed, classified.category
         call = CallOutcome(
             status="completed",
             model_served=served,
@@ -993,7 +1356,7 @@ class LLMGateway:
             stop_reason=stop_reason,
             refusal_category=category if code == REFUSED else None,
             provider_request_id=receipt.request_id,
-            output_json=cast(BaseModel, parsed).model_dump(mode="json") if code is None else None,
+            output_json=None if output is None else output.model_dump(mode="json"),
             first_event_at=receipt.responded_at,
         )
         async with self._engine.begin() as conn:
@@ -1001,45 +1364,28 @@ class LLMGateway:
                 conn, t.res, outcome="billed", evidence=None, usage=usage, call=call, now=self._clock()
             )
             await resolve_alert(conn, code=AUTH_FAILED_ALERT, subject=_AUTH_SUBJECT)  # the key works again
-            if code == MODEL_MISMATCH:
-                await raise_alert(
-                    conn,
-                    code=MODEL_MISMATCH_ALERT,
-                    severity="critical",
-                    subject=f"model:{t.node.model}",
-                    message="the provider served another model than requested; its output is not used",
-                    context={"purpose": t.node.purpose, "requested": t.node.model, "served": served},
-                )
-            elif code == UNEXPECTED_STOP_REASON:
-                await raise_alert(
-                    conn,
-                    code=UNEXPECTED_STOP_ALERT,
-                    severity="warn",
-                    subject=f"purpose:{t.node.purpose}",
-                    message="an LLM call stopped for an unexpected reason",
-                    context={"purpose": t.node.purpose, "model": t.node.model, "stop_reason": stop_reason},
-                )
+            await raise_classified_alert(conn, classified, purpose=t.node.purpose, requested=t.node.model)
         self._committed(t, receipt, "billed", figures, code)
-        await self._observe_cache(t, served, prefix, usage)
+        await self._observe_cache(t, storable_text(served), prefix, usage)
+        if output is not None:
+            result = GatewayResult(
+                parsed=output,
+                llm_call_id=t.res.llm_call_id,
+                usage=usage,
+                model_served=served,
+                stop_reason=stop_reason,
+                cost_usd=counted + figures.settled_usd,
+            )
+            return _Next("return", figures.settled_usd, result=result)
         match code:
-            case None:
-                result = GatewayResult(
-                    parsed=cast(BaseModel, parsed),
-                    llm_call_id=t.res.llm_call_id,
-                    usage=usage,
-                    model_served=served,
-                    stop_reason=stop_reason,
-                    cost_usd=counted + figures.settled_usd,
-                )
-                return _Next("return", figures.settled_usd, result=result)
             case "max_tokens_first_stage":
                 return _Next("enlarge", figures.settled_usd)
             case "max_tokens":
                 raise MaxTokensExhausted("the enlarged max_tokens stage stopped at max_tokens too")
             case "refused":
-                raise Refused(category)
+                raise Refused(storable_text(category))
             case "model_mismatch":
-                raise ModelMismatch(t.node.model, served)
+                raise ModelMismatch(t.node.model, storable_text(served))
             case "invalid_output":
                 raise InvalidOutput("structural")
             case _:
@@ -1085,15 +1431,8 @@ class LLMGateway:
                 call=call,
                 now=self._clock(),
             )
-            if status in (401, 403):
-                await raise_alert(
-                    conn,
-                    code=AUTH_FAILED_ALERT,
-                    severity="critical",
-                    subject=_AUTH_SUBJECT,
-                    message="the Anthropic API refused the key; LLM calls fail until it is fixed",
-                    context={"http_status": status},
-                )
+            if status in AUTH_FAILED_STATUSES:
+                await raise_auth_failed(conn, http_status=status)
         self._committed(t, receipt, "not_billed", figures, code)
         if not is_retryable_status(status):
             raise LLMRequestError(status)

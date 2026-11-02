@@ -10,10 +10,10 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import FencedOut
+from jobhunter.graphs.collect import report as report_module
 from jobhunter.graphs.collect.graph import build_collect_graph, build_noop_collect_graph
 from jobhunter.graphs.collect.nodes import finalize as finalize_module
 from jobhunter.graphs.collect.nodes.finalize import (
-    FallbackRequests,
     InvariantCode,
     InvariantResult,
     check_invariants,
@@ -22,11 +22,14 @@ from jobhunter.graphs.collect.nodes.finalize import (
     partial_conditions,
     run_revisions,
 )
+from jobhunter.graphs.collect.report import FallbackRequests
 from jobhunter.graphs.collect.state import initial_state
 from jobhunter.observability.metrics import REGISTRY
 from jobhunter.quota import ledger
 from jobhunter.quota.pacing import fair_share, per_run_cap
 from jobhunter.quota.windows import current_snapshot
+from jobhunter.scoring import golden
+from jobhunter.scoring.eval_fixtures import adversarial_dir
 from jobhunter.sources.base import Observation
 from jobhunter.sources.instances import InstanceRow
 from jobhunter.worker import runs
@@ -142,7 +145,9 @@ async def test_happy_run_succeeds_with_a_full_report(
     assert arbeitnow["units"] == {"billed": 0, "ambiguous": 0, "not_billed": 0}
     revisions = report["revisions"]
     assert revisions["created"] == revisions["embedded"] > 0 and revisions["awaiting"] == 0
-    assert revisions["targets"] == {} and report["quota"]["fallback"]["used"] is False
+    # no tuple was active: node 9 made nothing (M3 Task 14's shape of the section)
+    assert revisions["targets"] == {"created": 0, "revived": 0, "cancelled": 0, "skipped": {}, "by_state": {}}
+    assert report["quota"]["fallback"]["used"] is False
     assert report["execution"]["warnings"] == [] and report["execution"]["partial"] == []
     # no ad text anywhere: no title, no 40-character slice of any description of the run, is in the report
     async with engine.connect() as c:
@@ -158,6 +163,41 @@ async def test_happy_run_succeeds_with_a_full_report(
     )
     # carry 7: no company names either, neither the jobs' nor the board's slug
     assert companies and not [name for name in companies if name in blob] and DEFAULT_BOARD[1] not in blob
+
+
+async def test_an_adversarial_seed_during_a_run_changes_neither_its_status_nor_its_counts(
+    engine, current_epoch, fake_http, fake_embedder, collect_deps, monkeypatch
+) -> None:
+    """Ruling T19-a: the seed's synthetic revisions never wait for an embedding (`embeddings` skips them),
+    and they are no job of the run: seeded during it, they make it neither partial (I6) nor count in its
+    `jobs_created` or its `revisions`."""
+    seeded: list[int] = []
+
+    async def seed(name: str) -> None:
+        if name == finalize_module.BEFORE_FINALIZE:
+            async with engine.begin() as c:
+                seeded.append(
+                    (await golden.seed_adversarial(c, fixtures_dir=adversarial_dir(), now=utcnow())).jobs
+                )
+
+    monkeypatch.setattr(finalize_module, "afault_point", seed)
+    rid = await run_to_the_end(engine, collect_deps)
+    status, reason, report = await run_end(engine, rid)
+    assert seeded and seeded[0] > 0
+    async with engine.connect() as c:
+        real = (
+            await c.execute(
+                sa.text(
+                    "SELECT count(*) FROM job_revisions r JOIN jobs j ON j.id = r.job_id "
+                    "WHERE r.revision_no = 1 AND NOT j.synthetic_eval"
+                )
+            )
+        ).scalar_one()
+    assert (status, reason) == ("succeeded", None)
+    assert report["execution"]["invariants"]["I6"] == {"ok": True, "detail": {"awaiting": 0}}
+    assert report["identity"]["jobs_created"] == real > 0
+    revisions = report["revisions"]
+    assert revisions["created"] == revisions["embedded"] == real and revisions["awaiting"] == 0
 
 
 async def test_partial_and_invariant_failures(
@@ -389,11 +429,11 @@ async def test_a_superseded_finalize_writes_nothing(
     assert newer.attempt_no == owner.attempt_no + 1
 
 
-async def test_i5_passes_with_a_tuple_until_m3_switches_the_score_targets_on(
-    engine, current_epoch, monkeypatch
-) -> None:
-    """M2 plan Deviation 10: M2's confirm activates a tuple and creates no target, so I5 passes with the tuple
-    and records `"targets": "m3"`; with the switch on and no target check (M3's), it fails."""
+async def test_i5_is_evaluated_against_the_runs_own_tuple(engine, current_epoch) -> None:
+    """M3 Task 14 (R9): I5 reads the run's tuple (`runs.llm_tuple_id`), never the one active at finalize: a
+    run created before any profile was active has none, so I5 is vacuous even once a tuple is active (the
+    active tuple's targets are `create_targets_for_tuple`'s and `missing_targets`'). The cases with a tuple
+    are `test_enqueue_targets.py`'s."""
     owner = await queued_run(engine)
     async with engine.begin() as c:
         chain = await insert_profile_chain(c)
@@ -403,16 +443,8 @@ async def test_i5_passes_with_a_tuple_until_m3_switches_the_score_targets_on(
         )
     async with engine.connect() as c:
         revisions = await run_revisions(c, owner.run_id)
-
-        async def i5() -> InvariantResult:
-            results = await check_invariants(c, owner.run_id, outcome_conflicts=0, revisions=revisions)
-            return {r.code: r for r in results}["I5"]
-
-        assert await i5() == InvariantResult(
-            "I5", True, {"llm_tuple_id": chain.llm_tuple_id, "targets": "m3"}
-        )
-        monkeypatch.setattr(finalize_module, "SCORE_TARGETS_ENABLED", True)
-        assert await i5() == InvariantResult("I5", False, {"llm_tuple_id": chain.llm_tuple_id})
+        results = await check_invariants(c, owner.run_id, outcome_conflicts=0, revisions=revisions)
+    assert {r.code: r for r in results}["I5"] == InvariantResult("I5", True, {"llm_tuple_id": None})
 
 
 async def test_check_invariants_counts_a_deferred_item_as_a_disposition(engine, current_epoch) -> None:
@@ -669,7 +701,7 @@ MEMBER = sa.text("INSERT INTO ats_snapshot_members (snapshot_id, native_id) VALU
 
 async def report_sources(engine, run_id: int) -> dict[str, Any]:
     async with engine.connect() as c:
-        report = await finalize_module.build_report(
+        report = await report_module.build_report(
             c,
             run_id,
             invariants=[],

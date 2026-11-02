@@ -51,6 +51,8 @@ from tests.support.llm import (
     scoring_kw,
 )
 from tests.support.logs import logged
+from tests.support.m2 import insert_profile_chain
+from tests.support.m3 import insert_claimed
 from tests.support.pg import PgServer, blocked_or_done, lock_waits
 from tests.support.procs import await_until
 from tests.support.reconcile import assert_fence_rule
@@ -124,22 +126,37 @@ async def test_eight_concurrent_sessions_never_exceed_the_cap(engine, op_owner, 
         min_bucket_capacity_usd=Decimal("1.00"),
         collection_interval_s=6 * 3600,
     )
+    kinds = ["nonscoring", "scoring", "nonscoring", "cap", "scoring", "nonscoring", "scoring", "nonscoring"]
     async with engine.begin() as conn:
         await ensure_month(conn, month, small, now)  # A = $0.90 (the settings' 5 % reserve applies)
+        # A scoring call names its target and attempt (the foreign keys of migration 0008): one each.
+        llm_tuple_id = (await insert_profile_chain(conn)).llm_tuple_id
+        claims = {
+            n: await insert_claimed(conn, llm_tuple_id) for n, kind in enumerate(kinds) if kind == "scoring"
+        }
     # each try reserves $0.25: 10,000 x $5 (the cache-write price bounds input) + 10,000 x $20 per MTok
     assert worst_case_usd("claude-opus-5-5", input_tokens_bound=10_000, max_tokens=10_000) == Decimal("0.25")
-    kinds = ["nonscoring", "scoring", "nonscoring", "cap", "scoring", "nonscoring", "scoring", "nonscoring"]
 
-    async def session(kind: str) -> Reservation | BudgetExhausted | None:
+    async def session(n: int, kind: str) -> Reservation | BudgetExhausted | None:
         async with engine.begin() as conn:
             if kind == "cap":  # a save lowers the cap to $0.60 (A = $0.50) under the same lock
                 await change_cap(
                     conn, month=month, cap_usd=Decimal("0.60"), overrun_buffer_usd=Decimal("0.10"), now=now
                 )
                 return None
-            make = scoring_kw if kind == "scoring" else reserve_kw
+            if kind == "scoring":
+                kw = scoring_kw(
+                    op_owner,
+                    now=now,
+                    bound=10_000,
+                    max_tokens=10_000,
+                    target_id=claims[n].target_id,
+                    attempt_id=claims[n].attempt_id,
+                )
+            else:
+                kw = reserve_kw(op_owner, now=now, bound=10_000, max_tokens=10_000)
             try:
-                return await reserve(conn, **make(op_owner, now=now, bound=10_000, max_tokens=10_000))
+                return await reserve(conn, **kw)
             except BudgetExhausted as exc:
                 return exc
 
@@ -147,7 +164,7 @@ async def test_eight_concurrent_sessions_never_exceed_the_cap(engine, op_owner, 
     async with engine.connect() as blocker:
         await blocker.begin()
         await blocker.execute(LOCK_MONTH, {"m": month})
-        tasks = [asyncio.create_task(session(kind)) for kind in kinds]
+        tasks = [asyncio.create_task(session(n, kind)) for n, kind in enumerate(kinds)]
 
         async def all_waiting() -> bool:
             return lock_waits(migrated) >= len(kinds) or any(t.done() for t in tasks)
@@ -583,6 +600,31 @@ async def test_settlement_figures_and_the_counter_table(engine, op_owner) -> Non
             )
 
 
+async def test_unstorable_provider_metadata_is_replaced_and_the_settlement_commits(
+    engine, op_owner, caplog
+) -> None:
+    """M2 Carry-forward J1: a NUL or a lone surrogate in the provider metadata a settlement writes is replaced
+    by `?` (no `text` column holds a NUL, no UTF-8 a lone surrogate), so the billed settlement never rolls
+    back; the event names the fields only."""
+    t = utcnow()
+    res = await dispatched(engine, reserve_kw(op_owner, now=t, bound=4000, max_tokens=1000))
+    call = completed_call(
+        model_served="claude-opus-5-5\x00", stop_reason="end_turn\ud800", provider_request_id="req_\x00\udfff"
+    )
+    async with engine.begin() as conn:
+        await settle(conn, res, outcome="billed", evidence=None, usage=USAGE, call=call, now=t)
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.text("SELECT model_served, stop_reason, provider_request_id, status FROM llm_calls"),
+            )
+        ).one()
+    assert tuple(row) == ("claude-opus-5-5?", "end_turn?", "req_??", "completed")
+    assert (await ledger_row(engine, res.ledger_id)).state == "billed"
+    (event,) = logged(caplog, "llm_provider_metadata_unstorable")
+    assert event["fields"] == ["model_served", "stop_reason", "provider_request_id"]
+
+
 async def test_the_call_records_its_owner_and_deadline(engine, op_owner) -> None:
     t = utcnow()
     res = await reserved(
@@ -662,8 +704,8 @@ async def test_owner_holds_tests_the_recorded_owner(engine, op_owner, eval_owner
         assert not await owner_holds(conn, stale, now=utcnow())
         assert not await owner_holds(conn, {"kind": "operation", "id": 10**9, "claim_id": "x"}, now=utcnow())
         assert not await owner_holds(conn, {"kind": "eval_run", "id": 10**9}, now=utcnow())
-        with pytest.raises(ValueError, match="owner"):
-            await owner_holds(conn, {"kind": "target", "id": 1}, now=utcnow())
+        with pytest.raises(ValueError, match="owner"):  # a writer this function does not know
+            await owner_holds(conn, {"kind": "run", "id": 1}, now=utcnow())
 
 
 # ---- the reconcilers (§17.4) ------------------------------------------------------------------------------

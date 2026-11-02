@@ -29,7 +29,7 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ration\":false,\"rationale"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"Matches current"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"Matches the current"}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" sen"}}
@@ -38,52 +38,46 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ior role and core"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Python expertise.\"},{"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Python skill.\"},{\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"text\":\"Backend-"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"text\":\"Backend-"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Entwickler Python P"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Entwickler Python Post"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ostgreSQL\",\"l"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"greSQL\",\"lang"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ang\":\"de\",\"target_title"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"de\",\"target_title\":"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"Backend-Ent"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"Backend-Entw"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"wickler\",\"exploration\":"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ickler\",\"exploration\":false"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"false,\"rationale\":\""}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"German"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":",\"rationale\":\"German"}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" target title combined"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" with the two"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" with the two main skills.\"},"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" main skills.\"},{\"text"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"{\"text\":\"Python"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":\"Python Developer"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Developer Logistik\",\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Logistik\",\"lang\":\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lang\":\"de"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"de\",\"target_title\":\""}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Back"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"target_title\":\"Back"}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end-Entwickler\",\""}}
@@ -92,25 +86,25 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"exploration\":false,\"r"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ationale\":\"U"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ationale\":\"Uses the"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ses dom"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" candidate's log"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ain experience in logistics.\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"istics domain exper"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"},{\"text\":\"Sen"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ience.\"},{\"text\":\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ior Python Software Engine"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Senior Python Eng"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"er\",\"lang\":\"en\",\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ineer\",\"lang\":\"en"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"target_title\":\"Back"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"target_title\":\"Back"}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end Engineer\",\"explo"}}
@@ -125,82 +119,91 @@ event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" English"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" vari"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" title variant for the same"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ant of the target"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" prof"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" role"}}
-
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":".\"},{\"text\":\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ile.\"},{\"text\":\""}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Soft"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"wareentwickler Back"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"wareentwickler"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end Python\",\"lang\":\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Back"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"de\",\"target_title\":\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"end Sen"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Backend-Entwickler"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ior\",\"lang\":\"de\",\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"exploration\":false,\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"target_title\":\"Backend"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"rationale\":\"Altern"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"-Entwickler\",\"ex"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ative German title used"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ploration\":false,\"ration"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" in Hamburg job"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ale\":\"Bro"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" ads.\"},{\"text\":"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ader"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"Data Engineer"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" German title for senior backend ro"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Python PostgreSQL"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"les.\"},{\"text\":\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\",\"lang\":\"en\",\"target"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Data Engineer Python"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"_title\":\"Data Eng"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" SQL\",\"lang\":\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ineer\",\"exploration\":true"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"en\",\"target_title\":\""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":",\"rationale\":\""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Data"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Broader ad"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Engineer\",\"exploration"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"jacent role that"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\":true,\"rationale\":"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" fits the Python and database sk"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"Python and Postgre"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ills.\"}]}"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"SQL skills trans"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"fer to data eng"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ineering ro"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"les.\"}]"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"}"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"container":null},"usage":{"input_tokens":1058,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":406,"output_tokens_details":{"thinking_tokens":0}}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"container":null},"usage":{"input_tokens":1058,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":407,"output_tokens_details":{"thinking_tokens":0}}}
 
 event: message_stop
 data: {"type":"message_stop"}

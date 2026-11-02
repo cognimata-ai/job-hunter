@@ -1,0 +1,215 @@
+# The adversarial smoke (spec §18.6, §11.13; M3 plan Task 20, Codex r1 #34, Deviation 29): the ten packaged
+# adversarial golden cases scored by the eval runner on the live Anthropic API, in a throwaway database.
+# It is not the activation gate: a throwaway database holds the shipped versions and these ten synthetic cases
+# only, so the gate state it reports is `uncalibrated` by construction (fewer than 30 cases). The gate's
+# golden-set run (at least 30 of the user's cases) runs on the installation, `jobhunter eval run --live --kind
+# golden --candidate ...` (the runbook's). Manual only: it is never run on push or pull request.
+#
+# Cost note. About $1.05 on the production route: 10 first repetitions and at most 10 second ones (the
+# test-retest sample), each about the §21.2 central cost of one target of policy B, $0.052646
+# (settings/llm_projection.central_cost_per_target), so 20 x $0.052646 = $1.052920; `forced_critic` adds a
+# critic round to every case. The calls are non-scoring and reserved at the gateway's own worst case before
+# each send; the throwaway database's budget row (the seeded $100.00 cap) is the hard ceiling.
+# tests/unit/test_cli_golden.py recomputes the figures from pricing and fails when this note is stale.
+#
+# The job starts PostgreSQL from the digest in deploy/images.lock with the repository's init script and
+# throwaway role passwords (as schema-dry-run-manual.yml does), runs `jobhunter migrate` and `jobhunter golden
+# seed-adversarial`, turns the collection schedule off (the worker scores the eval and nothing else), writes
+# the repository secret ANTHROPIC_API_KEY_EVAL to the worker's `anthropic_key` secret file and starts a
+# live-configured worker (JOBHUNTER_FAKE_LLM unset): `jobhunter eval run` inserts the run and its operation
+# and waits for the worker to end it. Readiness is the worker's heartbeat row, polled through psql for up to
+# 60 s. The eval has a timeout of its own and stops waiting, failing, as soon as the worker process is gone.
+# The run's stdout, the case table (label, outcome, score_mid, binding knockouts against the expected ones)
+# and the summary line with the gate's state, is printed, written to the job summary and uploaded as a
+# Markdown artifact. The step keeps the command's exit status: on a non-zero one it prints the last line of
+# the command's stderr (a refusal line or a log line: ids and codes only) and fails with it. Every script runs
+# under bash with pipefail. The logs are not printed otherwise, and nothing printed carries content or the
+# key. At the end, whatever the outcome, the worker gets SIGTERM and its exit is awaited before the secret
+# files and the database are removed.
+#
+# Supply chain as in ci.yml: actions pinned to full commit SHAs (the release tag is the trailing comment), uv to
+# an exact version; the token is read-only and the checkout does not keep it.
+name: Eval adversarial smoke (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      route:
+        description: "The route: production, or forced_critic (a critic round for every case)"
+        type: choice
+        options:
+          - production
+          - forced_critic
+        default: production
+      candidate:
+        description: "The candidate: the throwaway database holds the shipped versions only"
+        type: choice
+        options:
+          - active
+        default: active
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-manual
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash  # bash --noprofile --norc -eo pipefail {0}
+    env:
+      JOBHUNTER_ENV: dev
+      JOBHUNTER_DB_HOST: 127.0.0.1
+      JOBHUNTER_DB_PORT: "5432"
+      JOBHUNTER_DB_NAME: jobhunter
+      JOBHUNTER_PUBLIC_ORIGIN: http://localhost:8080
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.13.1"
+      - run: uv sync --frozen
+      # Throwaway values: the role passwords exist only for this job's database. The server's copies are
+      # readable by the image's postgres user; each application role gets its own directory with exactly its
+      # secrets, not readable by others (the startup assertions refuse anything else).
+      - name: Secret files
+        run: |
+          umask 077
+          dir="$RUNNER_TEMP/secrets"
+          mkdir -p "$dir/server" "$dir/migrate" "$dir/worker"
+          for name in pg_bootstrap db_app db_migrator db_backup db_restore; do
+            openssl rand -hex 24 > "$dir/server/$name"
+          done
+          chmod 0755 "$dir" "$dir/server"
+          chmod 0444 "$dir"/server/*
+          cp "$dir/server/db_migrator" "$dir/migrate/db_migrator"
+          cp "$dir/server/db_app" "$dir/worker/db_app"
+          openssl rand -base64 32 > "$dir/worker/data_key"
+          chmod 0600 "$dir"/migrate/* "$dir"/worker/*
+          mkdir -p "$RUNNER_TEMP/worker-data/cv" "$RUNNER_TEMP/worker-data/parse"
+      - name: Throwaway PostgreSQL
+        run: |
+          set -o pipefail
+          docker run -d --name jh-eval-pg -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_USER=jobhunter_bootstrap -e POSTGRES_DB=jobhunter \
+            -e POSTGRES_PASSWORD_FILE=/run/secrets/pg_bootstrap \
+            -v "$RUNNER_TEMP/secrets/server:/run/secrets:ro" \
+            -v "$PWD/deploy/postgres/init:/docker-entrypoint-initdb.d:ro" \
+            "$(grep ^pgvector= deploy/images.lock | cut -d= -f2)" > /dev/null
+          # Over TCP: the init phase's temporary server listens on the Unix socket only, so this answers once
+          # the init scripts have run and the final server is up.
+          for _ in $(seq 1 90); do
+            if docker exec jh-eval-pg pg_isready -q -h 127.0.0.1 -U jobhunter_bootstrap -d jobhunter; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+      - name: Migrate
+        env:
+          JOBHUNTER_SECRETS_DIR: ${{ runner.temp }}/secrets/migrate
+        run: uv run jobhunter migrate > /dev/null 2>&1
+      - name: Seed the adversarial cases
+        env:
+          JOBHUNTER_SECRETS_DIR: ${{ runner.temp }}/secrets/worker
+        run: |
+          uv run jobhunter golden seed-adversarial 2> /dev/null
+          # The worker scores the eval and collects nothing: the schedule is off.
+          docker exec jh-eval-pg psql -q -U jobhunter_bootstrap -d jobhunter -v ON_ERROR_STOP=1 \
+            -c "UPDATE schedule_state SET enabled = false"
+      - name: Start a live-configured worker
+        env:
+          JOBHUNTER_SECRETS_DIR: ${{ runner.temp }}/secrets/worker
+          JOBHUNTER_CV_STORE_DIR: ${{ runner.temp }}/worker-data/cv
+          JOBHUNTER_PARSE_JOBS_DIR: ${{ runner.temp }}/worker-data/parse
+          EVAL_KEY: ${{ secrets.ANTHROPIC_API_KEY_EVAL }}
+        run: |
+          umask 077
+          if [ -z "$EVAL_KEY" ]; then
+            echo "the repository secret ANTHROPIC_API_KEY_EVAL is not set" >&2
+            exit 2
+          fi
+          printf '%s' "$EVAL_KEY" > "$JOBHUNTER_SECRETS_DIR/anthropic_key"
+          unset EVAL_KEY
+          unset JOBHUNTER_FAKE_LLM
+          nohup uv run jobhunter worker > "$RUNNER_TEMP/worker.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/worker.pid"
+          for _ in $(seq 1 30); do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/worker.pid")" 2> /dev/null; then
+              echo "the worker exited during its start" >&2
+              exit 1
+            fi
+            beating=$(docker exec jh-eval-pg psql -At -U jobhunter_bootstrap -d jobhunter \
+              -c "SELECT count(*) FROM worker_heartbeat WHERE heartbeat_at > now() - interval '60 seconds'")
+            if [ "$beating" = "1" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "the worker wrote no heartbeat within 60 s" >&2
+          exit 1
+      - name: Eval run (live)
+        timeout-minutes: 75
+        env:
+          JOBHUNTER_SECRETS_DIR: ${{ runner.temp }}/secrets/worker
+          ROUTE: ${{ inputs.route }}
+          CANDIDATE: ${{ inputs.candidate }}
+        run: |
+          set -o pipefail
+          report="$RUNNER_TEMP/eval-report.md"
+          printf '# Adversarial smoke\n\nroute=%s candidate=%s\n\n' "$ROUTE" "$CANDIDATE" > "$report"
+          uv run jobhunter eval run --kind golden --candidate "$CANDIDATE" --route "$ROUTE" --live \
+            > "$RUNNER_TEMP/eval-stdout.txt" 2> "$RUNNER_TEMP/eval-stderr.txt" &
+          eval_pid=$!
+          # The command waits for the worker to end the run: once the worker is gone, nothing ever will.
+          while kill -0 "$eval_pid" 2> /dev/null; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/worker.pid")" 2> /dev/null; then
+              echo "the worker exited during the eval run" >&2
+              kill -TERM "$eval_pid" 2> /dev/null || true
+              wait "$eval_pid" 2> /dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          status=0
+          wait "$eval_pid" || status=$?
+          tee -a "$report" < "$RUNNER_TEMP/eval-stdout.txt"
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "eval run exited $status: $(tail -n 1 "$RUNNER_TEMP/eval-stderr.txt")" >&2
+            exit "$status"
+          fi
+      - name: Upload the case table
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: eval-adversarial-smoke
+          path: ${{ runner.temp }}/eval-report.md
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Stop the worker, remove the secret files and the database
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/worker.pid" ]; then
+            pid=$(cat "$RUNNER_TEMP/worker.pid")
+            kill -TERM "$pid" 2> /dev/null || true
+            for _ in $(seq 1 60); do
+              kill -0 "$pid" 2> /dev/null || break
+              sleep 1
+            done
+            if kill -0 "$pid" 2> /dev/null; then
+              echo "the worker did not exit within 60 s of SIGTERM" >&2
+              kill -KILL "$pid" 2> /dev/null || true
+            fi
+          fi
+          docker rm -f -v jh-eval-pg > /dev/null 2>&1 || true
+          rm -rf "$RUNNER_TEMP/secrets" "$RUNNER_TEMP/worker-data" "$RUNNER_TEMP/worker.log" \
+            "$RUNNER_TEMP/eval-stdout.txt" "$RUNNER_TEMP/eval-stderr.txt"

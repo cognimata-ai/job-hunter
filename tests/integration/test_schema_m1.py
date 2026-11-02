@@ -4,7 +4,7 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.db.sql import CHECK_VIOLATION, UNIQUE_VIOLATION, PgErrorInfo, pg_error
 from jobhunter.db.transitions import CLEAR_REASON, transition
-from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v1
+from jobhunter.llm.prompts.render import prompt_schema_hash, prompt_schema_v2
 
 from tests.support.fixtures import reset_database
 from tests.support.pg import MANUAL_RUN_SQL
@@ -272,16 +272,16 @@ ACTIVE_CONFIG = (
     "rubric_version_id, prompt_schema_version_id, model_policy_id, execution_config_id, "
     "evaluation_policy_id, llm_tuple_id FROM active_config WHERE id = 1"
 )
-# The rubric and prompt-schema pointers name the rows the migrate seed inserted (M2): rubric `v1` and the
-# prompt-schema version of this code's templates and schemas.
+# The rubric and prompt-schema pointers name the rows the migrate seed inserted (M2): the shipped rubric `v2`
+# and prompt-schema version 2 (M3).
 SEEDED_CONFIG = (
     "SELECT id, scope_version_id, NULL::bigint, NULL::bigint, "
-    "(SELECT r.id FROM rubric_versions r WHERE r.version = 'v1'), "
+    "(SELECT r.id FROM rubric_versions r WHERE r.version = 'v2'), "
     "(SELECT p.id FROM prompt_schema_versions p WHERE p.prompt_schema_hash = :prompt_schema_hash), "
     "model_policy_id, execution_config_id, evaluation_policy_id, NULL::bigint "
     "FROM settings_versions WHERE version_no = 1"
 )
-SEEDED_PARAMS = {"prompt_schema_hash": prompt_schema_hash(*prompt_schema_v1())}
+SEEDED_PARAMS = {"prompt_schema_hash": prompt_schema_hash(*prompt_schema_v2())}
 # Every pointer of the row moved off the seed: a second scope (active) with the seeded one pending, a profile
 # and a tuple (they are NULL together), a rubric, a prompt schema, and a second model policy, execution config
 # and evaluation policy. The profile and the tuple are a real chain (a CV file, a draft confirmed into a

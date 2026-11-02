@@ -1,4 +1,4 @@
-"""SQL helpers: JSONB-typed bind parameters and classification of database errors.
+"""SQL helpers: JSONB- and JSON-typed bind parameters and classification of database errors.
 
 Database errors that pass through SQLAlchemy are `sqlalchemy.exc.DBAPIError` subclasses. `pg_error` is the
 only code that looks beneath one, to read the SQLSTATE and the constraint name from the driver's exception.
@@ -10,7 +10,7 @@ from typing import Final
 
 import psycopg
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy.sql.elements import TextClause
 
 UNIQUE_VIOLATION: Final = "23505"
@@ -22,16 +22,18 @@ SERIALIZATION_FAILURE: Final = "40001"
 DEADLOCK_DETECTED: Final = "40P01"
 
 
-def q(statement: str, *, jsonb: Iterable[str] = ()) -> TextClause:
-    """`sa.text(statement)` with the named parameters in `jsonb` bound as `JSONB`.
+def q(statement: str, *, jsonb: Iterable[str] = (), json: Iterable[str] = ()) -> TextClause:
+    """`sa.text(statement)` with the named parameters in `jsonb` bound as `JSONB`, and those in `json` as
+    `JSON`: serialised in the value's own key order, for a `json` column whose key order matters
+    (`prompt_schema_versions.schemas`, Ruling T4-a; `jsonb` does not keep it).
 
     Every JSON value that reaches SQL goes through such a parameter, never through a string.
     """
     clause = sa.text(statement)
-    names = tuple(jsonb)
-    if not names:
+    typed = [*((name, JSONB()) for name in jsonb), *((name, JSON()) for name in json)]
+    if not typed:
         return clause
-    return clause.bindparams(*(sa.bindparam(name, type_=JSONB) for name in names))
+    return clause.bindparams(*(sa.bindparam(name, type_=type_) for name, type_ in typed))
 
 
 @dataclass(frozen=True)

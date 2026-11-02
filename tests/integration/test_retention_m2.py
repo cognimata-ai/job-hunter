@@ -39,6 +39,7 @@ from jobhunter.profile.storage import CvStore
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from tests.support.eval import seed_adversarial
 from tests.support.faults import PausePoint
 from tests.support.m2 import (
     insert_cv_file,
@@ -732,6 +733,34 @@ async def test_the_previous_version_follows_the_activation_order_not_the_version
     assert (cv_store_dir / v2_path).is_file() and (cv_store_dir / v1_path).is_file()
     for gone in (v3_path, again_v1_path, again_v2_path):
         assert not (cv_store_dir / gone).exists()
+
+
+async def test_the_adversarial_seeds_synthetic_drafts_never_displace_the_users_previous_version(
+    engine, current_epoch, queue_app, migrated, cv_store, cv_store_dir, logged_in_client, op_runner, upload
+) -> None:
+    """Ruling T19-a: the seed's confirmed synthetic drafts are newer than the user's, but the newest and the
+    previous confirmed drafts the rule protects are the user's own. V1 then V2, a seed: V1's file stays (V2's
+    previous). Then V3: V3's and V2's stay and V1's goes."""
+    v1_draft, v1_path = await pdf_draft(logged_in_client, op_runner, upload)
+    await confirm(logged_in_client, v1_draft)
+    v2_draft, v2_path = await pdf_draft(logged_in_client, op_runner, upload, with_seniority("junior"))
+    await confirm(logged_in_client, v2_draft)
+    seeded = await seed_adversarial(engine)
+
+    report = await retention_pass(engine, queue_app, migrated, cv_store)
+
+    assert (cv_store_dir / v1_path).is_file() and (cv_store_dir / v2_path).is_file()
+    # the seed's pasted synthetic texts go (no version of the user's names them, nothing reads them again)
+    assert report["cv_files"] == seeded.profiles
+
+    v3_draft, v3_path = await pdf_draft(logged_in_client, op_runner, upload, with_seniority("lead"))
+    await confirm(logged_in_client, v3_draft)
+
+    report = await retention_pass(engine, queue_app, migrated, cv_store)
+
+    assert report["cv_files"] == 1
+    assert not (cv_store_dir / v1_path).exists()
+    assert (cv_store_dir / v2_path).is_file() and (cv_store_dir / v3_path).is_file()
 
 
 @pytest.mark.parametrize("order", ["confirm_first", "batch_first"])

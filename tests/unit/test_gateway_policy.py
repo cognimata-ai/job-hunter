@@ -16,6 +16,7 @@ from jobhunter.llm.gateway import (
     FIRST_TRY_MIN_REMAINING_S,
     RETRY_MIN_REMAINING_S,
     LLMGateway,
+    WireSchema,
     is_retryable_status,
     jittered_backoff,
     min_remaining_s,
@@ -152,7 +153,9 @@ SEED = json.loads((REPO / "backend/src/jobhunter/db/seed_data/settings_v1.json")
 
 def test_node_config_reads_the_model_policy_and_the_execution_config() -> None:
     policy, execution = SEED["scoring"]["model_policy"], SEED["scoring"]["execution"]
-    node = node_config("extract_profile", model_policy=policy, execution=execution, schema=GatewayOut)
+    node = node_config(
+        "extract_profile", model_policy=policy, execution=execution, schema=WireSchema.from_model(GatewayOut)
+    )
     assert node == gateway.NodeConfig(
         purpose="extract_profile",
         model="claude-opus-5-5",
@@ -160,9 +163,11 @@ def test_node_config_reads_the_model_policy_and_the_execution_config() -> None:
         max_tokens=16_000,
         max_tokens_retry=32_000,
         deadline_s=900,
-        schema=GatewayOut,
+        schema=WireSchema.from_model(GatewayOut),
     )
-    queries = node_config("propose_queries", model_policy=policy, execution=execution, schema=GatewayOut)
+    queries = node_config(
+        "propose_queries", model_policy=policy, execution=execution, schema=WireSchema.from_model(GatewayOut)
+    )
     assert (queries.max_tokens, queries.max_tokens_retry, queries.deadline_s) == (8_000, 16_000, 300)
 
 
@@ -170,28 +175,40 @@ def test_node_config_refuses_a_policy_without_a_supported_effort() -> None:
     execution = SEED["scoring"]["execution"]
     no_effort: dict[str, JSONValue] = {"nodes": {"extract_profile": {"model": "claude-opus-5-5"}}}
     with pytest.raises(ValueError, match="no effort"):
-        node_config("extract_profile", model_policy=no_effort, execution=execution, schema=GatewayOut)
+        node_config(
+            "extract_profile",
+            model_policy=no_effort,
+            execution=execution,
+            schema=WireSchema.from_model(GatewayOut),
+        )
     bad_effort: dict[str, JSONValue] = {
         "nodes": {"extract_profile": {"model": "claude-opus-5-5", "effort": "extreme"}}
     }
     with pytest.raises(ValueError, match="does not support effort"):
-        node_config("extract_profile", model_policy=bad_effort, execution=execution, schema=GatewayOut)
+        node_config(
+            "extract_profile",
+            model_policy=bad_effort,
+            execution=execution,
+            schema=WireSchema.from_model(GatewayOut),
+        )
     unknown: dict[str, JSONValue] = {
         "nodes": {"extract_profile": {"model": "claude-opus-4", "effort": "low"}}
     }
     with pytest.raises(ValueError, match="unknown model"):
-        node_config("extract_profile", model_policy=unknown, execution=execution, schema=GatewayOut)
+        node_config(
+            "extract_profile",
+            model_policy=unknown,
+            execution=execution,
+            schema=WireSchema.from_model(GatewayOut),
+        )
 
 
 async def test_the_input_bound_raises_unencodable_without_the_encoding_error(tmp_path: Path) -> None:
     cfg = fake_llm_config(FAKE_LLM_DIR, tmp_path / "no-secrets")
     async with make_http_client(cfg) as client:
         gw = LLMGateway(cast(AsyncEngine, _NoEngine()), cfg, http_client=client, cache=CacheMonitor())
-        ctx = gateway.CallContext(
-            owner=EvalRunOwner(1), purpose_class="nonscoring", execution_config_id=1, deadline=0.0
-        )
         with pytest.raises(InputUnbounded) as refused:
-            await gw._input_bound(GATEWAY_NODE, gateway_prompt("half a pair: \ud800"), ctx)
+            await gw._input_bound(GATEWAY_NODE, gateway_prompt("half a pair: \ud800"), native_pdf=False)
     assert refused.value.reason == "unencodable"
     assert refused.value.__cause__ is None and refused.value.__context__ is None
 

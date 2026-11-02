@@ -76,5 +76,20 @@ def raising_at(point: str) -> Callable[[str], Awaitable[None]]:
     return fault
 
 
+class SimulatedKill(BaseException):
+    """What `killing_at` injects: a killed process that no `except Exception` of the code under test can
+    absorb (a loop that isolates one row's failure from the others, M3 Ruling T17-a, still dies with it)."""
+
+
+def killing_at(point: str) -> Callable[[str], Awaitable[None]]:
+    """An `afault_point` replacement that raises `SimulatedKill` at `point` and passes every other point."""
+
+    async def fault(name: str) -> None:
+        if name == point:
+            raise SimulatedKill(point)
+
+    return fault
+
+
 async def no_fault(name: str) -> None:
     """An `afault_point` replacement that passes every point, as an unarmed fault point does."""

@@ -1,0 +1,24 @@
+{
+  "case": "generator-claude-sonnet-5-5",
+  "component_bytes": {
+    "messages": [
+      1594
+    ],
+    "schema": 1713,
+    "system": [
+      527
+    ]
+  },
+  "effort": "low",
+  "max_tokens": 2000,
+  "model": "claude-sonnet-5-5",
+  "purpose": "schema_dry_run",
+  "source": "recorded",
+  "spike": "v4v2",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "input_tokens": 2146,
+    "output_tokens": 1060
+  }
+}

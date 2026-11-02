@@ -453,6 +453,127 @@ def lock_waits(server: PgServer) -> int:
     return 0 if row is None else int(str(row[0]))
 
 
+@dataclass(frozen=True)
+class LockWait:
+    """One ungranted lock request (`lock_wait_details`).
+
+    `relation` is the table waited on, `ctid` the row version and `key` that row's primary key as text (a
+    composite key joined by `,`); all three are `None` for a wait that names no row of this database. A
+    transaction that waits for a row lock holds the row's `tuple` lock and waits for its holder's
+    `transactionid` (PostgreSQL's `heap_lock_tuple`), so that wait's row is the tuple lock it holds.
+    `blocking_pids` is `pg_blocking_pids(pid)`."""
+
+    pid: int
+    locktype: str
+    mode: str
+    relation: str | None
+    ctid: str | None
+    key: str | None
+    blocking_pids: tuple[int, ...]
+    query: str
+
+
+# A wait on a `transactionid` names its row through the `tuple` lock the same backend holds; relation
+# names are resolved in this database only.
+_LOCK_WAITS: Final = (
+    "SELECT w.pid, w.locktype, w.mode, "
+    "CASE WHEN COALESCE(w.database, t.database) = d.oid THEN COALESCE(w.relation, t.relation) END AS relid, "
+    "COALESCE(w.page, t.page) AS page, COALESCE(w.tuple, t.tuple) AS tuple, "
+    "pg_blocking_pids(w.pid) AS blocking, a.query "
+    "FROM pg_locks w JOIN pg_stat_activity a ON a.pid = w.pid "
+    "CROSS JOIN (SELECT oid FROM pg_database WHERE datname = current_database()) d "
+    "LEFT JOIN LATERAL (SELECT h.database, h.relation, h.page, h.tuple FROM pg_locks h "
+    "WHERE h.pid = w.pid AND h.locktype = 'tuple' AND h.granted ORDER BY h.relation LIMIT 1) t "
+    "ON w.locktype = 'transactionid' "
+    "WHERE NOT w.granted ORDER BY w.pid, w.locktype"
+)
+_PRIMARY_KEY: Final = (
+    "SELECT array_agg(a.attname::text ORDER BY array_position(CAST(i.indkey AS int2[]), a.attnum)) "
+    "FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) "
+    "WHERE i.indrelid = %s AND i.indisprimary"
+)
+
+
+def _relation_name(conn: psycopg.Connection[TupleRow], relid: int) -> str:
+    found = conn.execute("SELECT CAST(%s AS regclass)::text", (relid,)).fetchone()
+    if found is None:
+        raise LookupError(f"no relation {relid}")
+    return str(found[0])
+
+
+def _row_key(conn: psycopg.Connection[TupleRow], relid: int, ctid: str) -> str | None:
+    """The primary key, as text, of row version `ctid` of relation `relid` (`None` when the table has no
+    primary key or the version is not visible)."""
+    found = conn.execute(_PRIMARY_KEY, (relid,)).fetchone()
+    if found is None or found[0] is None:
+        return None
+    columns = psycopg.sql.SQL(" || ',' || ").join(
+        psycopg.sql.SQL("CAST({} AS text)").format(psycopg.sql.Identifier(column)) for column in found[0]
+    )
+    table = psycopg.sql.Identifier(*_relation_name(conn, relid).split("."))
+    statement = psycopg.sql.SQL("SELECT {} FROM {} WHERE ctid = CAST(%s AS tid)").format(columns, table)
+    row = conn.execute(statement, (ctid,)).fetchone()
+    return None if row is None else str(row[0])
+
+
+def lock_wait_details(server: PgServer) -> list[LockWait]:
+    """Every lock request that waits right now (`pg_locks` rows not granted), one `LockWait` each, joined with
+    `pg_stat_activity` and `pg_blocking_pids`: the waiting pid, the relation and row it waits on, and who
+    blocks it (P49: the lock-order tests assert which row is waited on and by whom)."""
+    waits: list[LockWait] = []
+    with psycopg.connect(server.dsn("superuser", _DB_NAME), autocommit=True) as conn:
+        for pid, locktype, mode, relid, page, tup, blocking, query in conn.execute(_LOCK_WAITS).fetchall():
+            relation = ctid = key = None
+            if relid is not None:
+                relation = _relation_name(conn, int(relid))
+                if page is not None and tup is not None:
+                    ctid = f"({page},{tup})"
+                    key = _row_key(conn, int(relid), ctid)
+            waits.append(
+                LockWait(
+                    pid=int(pid),
+                    locktype=str(locktype),
+                    mode=str(mode),
+                    relation=relation,
+                    ctid=ctid,
+                    key=key,
+                    blocking_pids=tuple(int(p) for p in blocking),
+                    query=str(query),
+                )
+            )
+    return waits
+
+
+_RELATION_LOCKS: Final = (
+    "SELECT DISTINCT CAST(relation AS regclass)::text FROM pg_locks WHERE pid = %s AND locktype = 'relation' "
+    "AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
+def relation_locks(server: PgServer, pid: int) -> frozenset[str]:
+    """The relations of this database (tables and indexes) on which backend `pid` holds a lock. A transaction
+    keeps each relation lock to its end, so a table missing here is one the transaction has not touched yet:
+    a lock-order test reads which steps a waiting transaction has taken and which it has not."""
+    return frozenset(str(row[0]) for row in pg_rows(server, "superuser", _RELATION_LOCKS, pid))
+
+
+_RELATION_LOCK_MODES: Final = (
+    "SELECT CAST(relation AS regclass)::text, mode FROM pg_locks WHERE pid = %s AND locktype = 'relation' "
+    "AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+)
+
+
+def relation_lock_modes(server: PgServer, pid: int) -> dict[str, frozenset[str]]:
+    """The modes of the relation locks backend `pid` holds, by relation (M3 Task 27). A row-locking clause
+    (`FOR SHARE`, `FOR KEY SHARE`, `FOR UPDATE`) takes `RowShareLock` on its table and a plain read only
+    `AccessShareLock`, so `"RowShareLock" in modes["active_config"]` shows that the transaction took a row
+    lock there, where `relation_locks` shows only that it touched the table."""
+    modes: dict[str, set[str]] = {}
+    for relation, mode in pg_rows(server, "superuser", _RELATION_LOCK_MODES, pid):
+        modes.setdefault(str(relation), set()).add(str(mode))
+    return {relation: frozenset(found) for relation, found in modes.items()}
+
+
 async def blocked_or_done(server: PgServer, task: asyncio.Task[Any]) -> bool:
     """Whether `task` has ended or some statement waits for a lock: what `await_until` polls at a barrier."""
     return task.done() or lock_waits(server) > 0

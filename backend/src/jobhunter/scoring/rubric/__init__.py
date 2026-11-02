@@ -1,13 +1,17 @@
-"""The shipped rubric versions (spec §11.2, §11.3; `rubric_versions`, §7.3).
+"""The shipped rubric versions (spec §11.2, §11.3; `rubric_versions`, §7.3): v1 (M2) and v2 (M3, R13: v1 with
+the `languages` anchor of an `unspecified` mandatory level reading as the §11.4 knockout table does).
+`RUBRIC_SHIPPED` (v2) is the version a fresh install's `active_config` points at; `seed_defaults` stores both
+and never moves a pointer already set.
 
-`load_rubric("v1")` reads the packaged `v1.yaml` with `yaml.safe_load` and validates it (`parse_rubric`):
+`load_rubric(name)` (`"v1"` or `"v2"`) reads the packaged `<name>.yaml` with `yaml.safe_load` and validates it
+(`parse_rubric`):
 - `version` names the file;
 - `weights` has exactly the eight §11.2 keys, each an integer, summing to 100 (`Rubric.weights` keeps the
   §11.2 order);
 - `anchors` is an object with an entry for each of the six LLM-rated criteria.
 
 `Rubric.content_hash` is the content hash of `{"weights", "anchors"}`, the `rubric_versions.content_hash` of
-the row `seed_defaults` inserts.
+the rows `seed_defaults` inserts.
 """
 
 import re
@@ -35,6 +39,8 @@ LLM_CRITERIA: Final = (
 RUBRIC_KEYS: Final = (*LLM_CRITERIA, "location_work_mode", "employment_salary")
 WEIGHT_TOTAL: Final = 100
 RUBRIC_V1: Final = "v1"
+RUBRIC_V2: Final = "v2"
+RUBRIC_SHIPPED: Final = RUBRIC_V2
 _VERSION_NAME: Final = re.compile(r"v[1-9][0-9]*")
 
 
@@ -75,7 +81,7 @@ def parse_rubric(document: str, *, name: str) -> Rubric:
 
 
 def load_rubric(name: str) -> Rubric:
-    """The shipped rubric version `name` (for example `"v1"`), validated."""
+    """The shipped rubric version `name` (`"v1"` or `"v2"`), validated."""
     if not _VERSION_NAME.fullmatch(name):
         raise ValueError(f"no rubric version {name!r}: a version is named v1, v2, …")
     resource = resources.files(__name__).joinpath(f"{name}.yaml")

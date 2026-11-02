@@ -14,8 +14,8 @@ from typing import Any
 import anthropic
 import pytest
 from jobhunter.db.seed import canonical_json
-from jobhunter.llm.gateway import output_schema
-from jobhunter.llm.schemas import SCHEMAS, json_schema, transformed
+from jobhunter.llm.gateway import WireSchema, output_schema
+from jobhunter.llm.schemas import SCHEMAS_V1, json_schema, transformed
 from jobhunter.llm.schemas.critic import CriticOut
 from jobhunter.llm.schemas.generator import GeneratorOut
 from jobhunter.llm.schemas.profile import ConfirmedProfile, ProfileOut, UserEntered
@@ -257,7 +257,7 @@ MODELS: dict[str, type[BaseModel]] = {
 
 
 def test_the_schema_registry_holds_the_four_structured_outputs() -> None:
-    assert dict(SCHEMAS) == MODELS
+    assert dict(SCHEMAS_V1) == MODELS  # prompt-schema version 1's, frozen
 
 
 @pytest.mark.parametrize("name", sorted(MODELS))
@@ -271,7 +271,9 @@ def test_the_request_sends_the_transformed_spec_schema(name: str) -> None:
     model class, which reads `model_json_schema`) is `transformed(model)`."""
     model = MODELS[name]
     assert model.model_json_schema() == json_schema(model)
-    assert anthropic.transform_schema(model) == transformed(model) == output_schema(model)
+    assert (
+        anthropic.transform_schema(model) == transformed(model) == output_schema(WireSchema.from_model(model))
+    )
     assert transformed(model) == anthropic.transform_schema(SPEC_SCHEMAS[name])
 
 

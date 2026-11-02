@@ -11,7 +11,7 @@ import importlib
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from jobhunter.db.alembic_runner import alembic_config, code_head
+from jobhunter.db.alembic_runner import alembic_config
 from jobhunter.db.sql import CHECK_VIOLATION, pg_error
 
 from tests.support.m2 import insert_cv_file
@@ -26,10 +26,10 @@ _NEW_DRAFT = (
 )
 
 
-def test_0007_is_the_head_and_follows_0006() -> None:
+def test_0007_follows_0006() -> None:
+    """0007 was M2's head; M3's 0008 follows it (tests/integration/test_schema_m3.py)."""
     module = importlib.import_module(f"jobhunter.db.migrations.versions.{M2_HEAD}")
     assert (module.revision, module.down_revision) == (M2_HEAD, M2_SCHEMA)
-    assert code_head() == M2_HEAD
 
 
 def test_0007_has_no_downgrade() -> None:
@@ -111,7 +111,7 @@ async def test_an_upgrade_from_0006_gives_every_draft_the_empty_set_and_no_downg
             "INSERT INTO profile_drafts (cv_file_id, status) SELECT id, %s FROM cv_files",
             status,
         )
-    await asyncio.to_thread(command.upgrade, alembic_config(dsn), "head")
+    await asyncio.to_thread(command.upgrade, alembic_config(dsn), M2_HEAD)
     assert pg_rows(
         fresh_pg_server, "migrator", "SELECT status, text_edits FROM profile_drafts ORDER BY id"
     ) == [

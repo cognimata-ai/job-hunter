@@ -2,11 +2,14 @@
 settings page shows on every change and that a save runs again (Task 17).
 
 `dry_run` composes §6.8's pseudo-code in its order:
-1. `validate_fields` (with the eval gate, `eval_gate_state`), then `unknown_references` (Task 17): an entry
-   of `queries[]` or `watchlist[]` whose id names no row is an `invalid` error at the entry's id. On any issue
-   the result holds the errors only, so the preview and the save (which runs this again) refuse the same
-   documents;
-2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `serpapi_disabled_no_fallback`);
+1. `validate_fields` (with the eval gate of the payload's candidate, `payload_gate`: the active rubric and
+   prompt-schema versions with the payload's model and evaluation policies by hash, M3 Task 20), then
+   `unknown_references` (Task 17): an entry of `queries[]` or `watchlist[]` whose id names no row is an
+   `invalid` error at the entry's id. On any issue the result holds the errors only, so the preview and the
+   save (which runs this again) refuse the same documents;
+2. right after a clean validation, `warnings_only` (`eval_uncalibrated`, `eval_failed`,
+   `serpapi_disabled_no_fallback`); both read `active`, which tells a selection of generator effort `low` from
+   a kept one (Ruling T20-d);
 3. `paid_cells`: the enabled queries times the location keys (the scope's locations, plus `remote-de` with
    remote work within Germany, `quota.cells.location_keys`);
 4. `quota_projections` with the run view of the proposed settings (`RunSettings.from_settings`, the proposed
@@ -14,17 +17,19 @@ settings page shows on every change and that a save runs again (Task 17).
    the counted units (`ledger.used_units`), the limit and the reset (`window`);
 5. the LLM projection (`llm_projection`) with `ĉ = central_cost_per_target` of the proposed model policy (no
    attempt history before M3), the proposed evaluation policy's projected critic rate (the stored row's, or
-   the 0.450 a new row gets), 3,000 arrivals a month, and `llm_cap_binding`; beside it the month's figures as
-   the save would leave them: the month row read without a lock (`spend_ledger.read_month_or_new`), its cap
-   and buffer set to the proposed ones in memory (`budget.change_cap`), its counted spend and scoring
-   headroom;
+   the rate a new row gets: the replay over the round-0 drafts, else 0.450), 3,000 arrivals a month, and
+   `llm_cap_binding`; beside it the month's figures as the save would leave them: the month row read without
+   a lock (`spend_ledger.read_month_or_new`), its cap and buffer set to the proposed ones in memory
+   (`budget.change_cap`), its counted spend and scoring headroom;
 6. the effect classes (`classify_effects` against the active settings) and what they add:
    - `scope`: `det_recompute`, the published results of the active tuple that the scope apply recomputes
-     without any LLM call (`count_published_results_active_tuple`: 0 before M3, which publishes results);
+     without any LLM call (`count_published_results_active_tuple`, M3 Task 15);
    - `llm_tuple`: the warning `llm_rescore` with `targets` (`count_retained_current_revisions`), `est_usd =
      targets x ĉ` and `bulk_budget_usd = scoring.bulk_rescore_max_budget_share x (A x (1 - reserve_frac) -
      scoring_counted_usd)` (§6.9.3; Task 21's confirm preview uses the same share);
    - `evaluation_policy`: `critic_rate`, the projected critic rate (published results are not re-reviewed);
+   - either of the gated classes (`GATED`, §11.13 "What is gated"): `eval_gate`, the state of the gate a
+     save would check (`uncalibrated`, `passed` or `failed`);
    - `schedule`: `next_slot`, the first slot after `now` under the proposed schedule (`null` when disabled),
      as a save would reset it (§3.4).
 
@@ -39,6 +44,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
 
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.seed import (
@@ -56,7 +62,9 @@ from jobhunter.quota.dryrun import Warning, quota_projections
 from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, Window, current_snapshot, roll_forward
 from jobhunter.run_settings import RunSettings, ScopeSettings
-from jobhunter.settings.derive import derived
+from jobhunter.scoring.det_results import count_published
+from jobhunter.scoring.evaluation_policy import EvaluationPolicy, replay_projected_critic_rate
+from jobhunter.settings.derive import candidate_of, derived
 from jobhunter.settings.effects import EffectClass, classify_effects
 from jobhunter.settings.llm_projection import (
     DEFAULT_ARRIVAL_PER_MONTH,
@@ -69,6 +77,7 @@ from jobhunter.settings.llm_projection import (
 from jobhunter.settings.model import Settings
 from jobhunter.settings.validate import (
     FieldIssue,
+    GateState,
     eval_gate_state,
     field_path,
     validate_fields,
@@ -76,6 +85,8 @@ from jobhunter.settings.validate import (
 )
 from jobhunter.types import JSONValue
 
+# §11.13 "What is gated": a save of either class checks the eval gate (`save._check_eval_gate`).
+GATED: Final[frozenset[EffectClass]] = frozenset({"llm_tuple", "evaluation_policy"})
 # A proposal has no settings version or scope version yet; the quota projections read neither id.
 _NO_VERSION: Final = 0
 _SECONDS_PER_HOUR: Final = 3600
@@ -86,10 +97,13 @@ _ACTIVE_PAYLOAD: Final = q(
     "WHERE a.id = 1"
 )
 # Retained jobs (tombstones are M5's) that a re-score would create targets for: unmerged, with a current
-# revision (§12.6, `create_targets_for_tuple`).
+# revision, not an adversarial golden case (§12.6, `create_targets_for_tuple`'s `targets.RETAINED_JOB_SQL`,
+# Codex r1 #32).
 _RETAINED_CURRENT_REVISIONS: Final = q(
-    "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND current_revision_id IS NOT NULL"
+    "SELECT count(*) FROM jobs WHERE merged_into_job_id IS NULL AND current_revision_id IS NOT NULL "
+    "AND NOT synthetic_eval"
 )
+_ACTIVE_TUPLE: Final = q("SELECT llm_tuple_id FROM active_config WHERE id = 1")
 _EVALUATION_POLICY_RATE: Final = q(
     "SELECT projected_critic_rate FROM evaluation_policies WHERE policy_hash = :h"
 )
@@ -143,23 +157,32 @@ async def unknown_references(conn: AsyncConnection, settings: Settings) -> list[
 
 
 async def count_retained_current_revisions(conn: AsyncConnection) -> int:
-    """The current revisions of retained jobs: unmerged jobs with a current revision (the targets of a
-    re-score)."""
+    """The current revisions of retained jobs: unmerged, non-synthetic jobs with a current revision (the
+    targets of a re-score)."""
     return int((await conn.execute(_RETAINED_CURRENT_REVISIONS)).scalar_one())
 
 
 async def count_published_results_active_tuple(conn: AsyncConnection) -> int:
-    """The published results of the active tuple, which a scope apply recomputes (§13.4). M3 publishes the
-    first results, so in M2 there are none by construction and no query is made; M3 counts them on `conn`."""
-    return 0
+    """The published results of the active tuple, which a scope apply recomputes with no LLM call (§13.4;
+    `det_results.count_published`), read without a lock; 0 while no tuple is active."""
+    tuple_id = (await conn.execute(_ACTIVE_TUPLE)).scalar_one_or_none()
+    if tuple_id is None:
+        return 0
+    return await count_published(conn, llm_tuple_id=int(tuple_id))
 
 
-async def projected_critic_rate(conn: AsyncConnection, settings: Settings) -> Decimal:
+async def projected_critic_rate(conn: AsyncConnection, settings: Settings, *, now: datetime) -> Decimal:
     """The projected critic rate of the evaluation policy of `settings` (§11.7.4): the stored row's when it
-    exists, else the rate a new row gets (`DEFAULT_PROJECTED_CRITIC_RATE`, the §21.2 central 0.450)."""
-    found = await conn.execute(_EVALUATION_POLICY_RATE, {"h": content_hash(derived(settings).evaluation)})
+    exists, else the rate a save at `now` would give the new row: the replay over the round-0 drafts
+    (`evaluation_policy.replay_projected_critic_rate`, plain reads), or `DEFAULT_PROJECTED_CRITIC_RATE`, the
+    §21.2 central 0.450, below 50 of them."""
+    payload = derived(settings).evaluation
+    found = await conn.execute(_EVALUATION_POLICY_RATE, {"h": content_hash(payload)})
     stored = found.scalar_one_or_none()
-    return DEFAULT_PROJECTED_CRITIC_RATE if stored is None else Decimal(stored)
+    if stored is not None:
+        return Decimal(stored)
+    replayed = await replay_projected_critic_rate(conn, EvaluationPolicy.from_payload(payload), now=now)
+    return DEFAULT_PROJECTED_CRITIC_RATE if replayed is None else replayed
 
 
 def paid_cells(settings: Settings) -> int:
@@ -228,17 +251,28 @@ def bulk_budget(settings: Settings, p: BudgetParams, row: BudgetRow) -> Decimal:
     return settings.scoring.bulk_rescore_max_budget_share * headroom
 
 
+async def payload_gate(conn: AsyncConnection, payload: JSONValue) -> GateState:
+    """The eval gate of `payload`'s candidate (`derive.candidate_of`, `validate.eval_gate_state`); for a
+    document the settings model refuses, `uncalibrated`: `validate_fields` then reports its model errors only,
+    and no rule reads the gate."""
+    try:
+        settings = Settings.model_validate(payload)
+    except ValidationError:
+        return "uncalibrated"
+    return await eval_gate_state(conn, candidate=await candidate_of(conn, settings))
+
+
 async def dry_run(
     conn: AsyncConnection, payload: JSONValue, *, active: Settings, now: datetime
 ) -> DryRunResult:
     """The §6.8 dry-run of `payload` against the `active` settings at `now` (module docstring)."""
-    gate = await eval_gate_state(conn)
-    proposed, errors = validate_fields(payload, gate=gate)
+    gate = await payload_gate(conn, payload)
+    proposed, errors = validate_fields(payload, gate=gate, active=active)
     if proposed is not None:
         errors = await unknown_references(conn, proposed)
     if proposed is None or errors:
         return DryRunResult(errors=errors, warnings=[], projections={}, effects=frozenset())
-    warns = warnings_only(proposed, gate=gate)
+    warns = warnings_only(proposed, gate=gate, active=active)
 
     run = RunSettings.from_settings(
         proposed,
@@ -263,7 +297,7 @@ async def dry_run(
             projection["window"] = await _window(conn, provider, snapshot, run, now)
 
     c_hat = central_cost_per_target(proposed.scoring.model_policy)
-    critic_rate = await projected_critic_rate(conn, proposed)
+    critic_rate = await projected_critic_rate(conn, proposed, now=now)
     llm = llm_projection(
         proposed,
         now=now,
@@ -299,6 +333,8 @@ async def dry_run(
         )
     if "evaluation_policy" in effects:
         proj["critic_rate"] = format(critic_rate, "f")
+    if effects & GATED:
+        proj["eval_gate"] = gate
     if "schedule" in effects:
         slot = next_slot(proposed, now)
         proj["next_slot"] = None if slot is None else _iso(slot)

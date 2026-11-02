@@ -384,7 +384,12 @@ async def test_tick_task_runs_the_tick_reconcilers_once_and_then_the_tick(
     monkeypatch.setattr(tasks, "utcnow", lambda: now)
     # the fields it reads; its epoch is the current one (the reconcilers and the tick are fenced by it)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        epoch=current_epoch,
+        embedder=None,
+        shutdown=ShutdownState(),
+        cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
     await tasks.tick(context, timestamp=0)
@@ -519,7 +524,12 @@ async def test_a_fence_of_another_owner_fails_the_tick_and_never_stops_the_worke
     monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
     monkeypatch.setattr(tick_module, "run_tick", fenced_tick)
     runtime = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=current_epoch, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        epoch=current_epoch,
+        embedder=None,
+        shutdown=ShutdownState(),
+        cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
     )
     with pytest.raises(FencedOut):
         await tasks.tick(
@@ -604,7 +614,12 @@ async def test_the_tick_task_counts_the_missed_and_overlapping_runs_it_inserted(
     await schedule(engine, interval=3600, cursor=A)
     monkeypatch.setattr(reconcilers, "REGISTRY", {})  # only the tick itself
     runtime = SimpleNamespace(  # the fields it reads
-        engine=engine, queue=queue_app, epoch=1, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        epoch=1,
+        embedder=None,
+        shutdown=ShutdownState(),
+        cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
     )
     context = cast(JobContext, SimpleNamespace(additional_context={"runtime": runtime}))
 
@@ -670,7 +685,12 @@ async def test_a_superseded_workers_tick_inserts_no_run_and_moves_no_cursor(
     [stop] = logged(caplog, "shutdown_requested")
     assert (stop["level"], stop["reason"]) == ("warning", "epoch_superseded")
     current = SimpleNamespace(
-        engine=engine, queue=queue_app, epoch=current_epoch + 1, embedder=None, shutdown=ShutdownState()
+        engine=engine,
+        queue=queue_app,
+        epoch=current_epoch + 1,
+        embedder=None,
+        shutdown=ShutdownState(),
+        cfg=SimpleNamespace(fake_llm=True),  # M3 Task 11: the score step reads it
     )
     await tasks.tick(cast(JobContext, SimpleNamespace(additional_context={"runtime": current})), timestamp=0)
     assert len(await runs(engine)) == 3 and await stored_cursor(engine) == A + timedelta(hours=3)

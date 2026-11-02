@@ -1,0 +1,26 @@
+{
+  "case": "c2b",
+  "component_bytes": {
+    "messages": [
+      5814
+    ],
+    "schema": 952,
+    "system": [
+      13252,
+      5606,
+      2261
+    ]
+  },
+  "effort": "medium",
+  "max_tokens": 6000,
+  "model": "claude-opus-5-5",
+  "purpose": "critic",
+  "source": "recorded",
+  "spike": "v5",
+  "usage": {
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 8104,
+    "input_tokens": 3480,
+    "output_tokens": 2684
+  }
+}
