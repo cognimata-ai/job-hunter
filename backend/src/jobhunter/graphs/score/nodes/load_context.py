@@ -6,8 +6,9 @@ In one transaction:
    execution config (A2 T5: a reclaim creates a new attempt, which pinned the active configuration at its
    claim, L3491).
 2. The target under the claim predicate, `FOR SHARE OF t`, with `targets.RESUMABLE_DRAFT_SQL` as its column
-   `resumable` (bound to the attempt's policy). No row: the claim is lost; the node ends the attempt with
-   `outcome = "claim_lost"` and writes nothing.
+   `resumable` (bound to the attempt's policy; a batch follow-up's `resume_draft_id` holds under any policy,
+   spec L3589). No row: the claim is lost; the node ends the attempt with `outcome = "claim_lost"` and writes
+   nothing.
 3. The tuple; an `llm_results` row of the 5-tuple (revision, profile version, rubric, prompt-schema version,
    model policy) is `outcome = "already_published"`, which `publish` returns without inserting (L3523,
    defensive; Task 10).
@@ -19,7 +20,9 @@ In one transaction:
 6. `funded_bulk_operation_id` (Task 7's rule, Codex r1 #27): `spend_ledger.funded_bulk_operation_id`, once.
 7. When `resumable`, the resume over the attempt chain (Codex r2 B23, r3 B8): the newest earlier attempt and
    every attempt reachable from it through `resumed_from_attempt_id`, the attempt of the target's
-   `resume_draft_id` (a batch follow-up) and this attempt, those under the attempt's evaluation policy. The
+   `resume_draft_id` (a batch follow-up) and this attempt, those under the attempt's evaluation policy and the
+   attempt of `resume_draft_id` whatever its policy (spec L3589: the batch draft is resumed and `validate`
+   re-runs the triggers under this attempt's policy, plan L942, Deviation 27; final review, Fable I1). The
    newest draft of the chain is the current one (`current_draft_id`, `round`); `critic_rounds` counts the
    critic notes on the chain's drafts (so T0 and the three-round limit survive a revision committed by one
    attempt and reviewed by another); the newest note gives `last_critic_note_id`, its derived outcome, the
@@ -75,7 +78,7 @@ _PUBLISHED: Final = q(
 _PREVIOUS_ATTEMPT: Final = q(
     "SELECT id FROM score_attempts WHERE target_id = :t AND attempt_no < :a ORDER BY attempt_no DESC LIMIT 1"
 )
-# The chain (module docstring, step 7): its attempts under the policy, by id.
+# The chain (module docstring, step 7): its attempts under the policy and the batch follow-up's, by id.
 _CHAIN: Final = q(
     "WITH RECURSIVE chain(id) AS ("
     "SELECT s.id FROM ((SELECT id FROM score_attempts WHERE target_id = :t AND attempt_no < :a "
@@ -84,8 +87,10 @@ _CHAIN: Final = q(
     "UNION SELECT CAST(:attempt AS bigint)) s "
     "UNION SELECT a.resumed_from_attempt_id FROM score_attempts a JOIN chain c ON a.id = c.id "
     "WHERE a.resumed_from_attempt_id IS NOT NULL) "
-    "SELECT a.id FROM chain c JOIN score_attempts a ON a.id = c.id "
-    "WHERE a.target_id = :t AND a.evaluation_policy_id = :policy ORDER BY a.id"
+    "SELECT a.id FROM chain c JOIN score_attempts a ON a.id = c.id WHERE a.target_id = :t "
+    "AND (a.evaluation_policy_id = :policy "
+    "OR a.id = (SELECT d.attempt_id FROM score_drafts d WHERE d.id = CAST(:resume_draft AS bigint))) "
+    "ORDER BY a.id"
 )
 _CURRENT_DRAFT: Final = q(
     "SELECT id, round FROM score_drafts WHERE attempt_id = ANY(CAST(:chain AS bigint[])) "

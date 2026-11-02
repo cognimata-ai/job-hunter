@@ -182,6 +182,55 @@ async def test_a_target_with_a_resumable_draft_links_its_newest_earlier_attempt(
         assert (await conn.execute(links, {"a": rows[undrafted].attempt_id})).scalar_one() is None
 
 
+async def test_a_batch_follow_up_links_its_batch_attempt_whatever_the_policy(
+    engine: AsyncEngine, pending_targets: list[PendingTarget], cycle_id: int
+) -> None:
+    # Spec L3589 (final review, Fable I1): a batch's `resume_draft_id` is resumed under a later policy too, so
+    # the claim links its attempt, and the reclaim of a follow-up links the follow-up's attempt (whose own
+    # link reaches the batch); an online target's draft under another policy is not resumed (no link)
+    follow_up, reclaimed, online = (t.target_id for t in pending_targets[:3])
+    batches: dict[int, int] = {}
+    async with engine.begin() as conn:
+        for target in (follow_up, reclaimed):
+            batch = await insert_attempt(
+                conn, target, mode="batch", lane="batch", outcome="batch_draft_ready"
+            )
+            _, call = await insert_scoring_call(conn, attempt_id=batch, target_id=target, transport="batch")
+            draft = await insert_draft(conn, batch, call)
+            batches[target] = batch
+            await conn.execute(
+                sa.text(
+                    "UPDATE score_targets SET attempt_no = 1, lane = 'batch_followup', resume_draft_id = :d "
+                    "WHERE id = :t"
+                ),
+                {"d": draft, "t": target},
+            )
+        lost = await insert_attempt(conn, online, outcome="claim_lost")
+        _, call = await insert_scoring_call(conn, attempt_id=lost, target_id=online)
+        await insert_draft(conn, lost, call)
+        await conn.execute(sa.text("UPDATE score_targets SET attempt_no = 1 WHERE id = :t"), {"t": online})
+        policy = await activate_test_policy(conn, t3_min_mid=75)  # the attempts above pinned the one before
+        # the follow-up of `reclaimed` was claimed under the new policy and lost before any draft of its own
+        lost_follow_up = await insert_attempt(
+            conn,
+            reclaimed,
+            attempt_no=2,
+            lane="batch_followup",
+            outcome="claim_lost",
+            evaluation_policy_id=policy,
+            resumed_from_attempt_id=batches[reclaimed],
+        )
+        await conn.execute(sa.text("UPDATE score_targets SET attempt_no = 2 WHERE id = :t"), {"t": reclaimed})
+    rows = {r.id: r for r in await claim_ids(engine, [follow_up, reclaimed, online], cycle_id=cycle_id)}
+    links = sa.text("SELECT resumed_from_attempt_id FROM score_attempts WHERE id = :a")
+    async with engine.connect() as conn:
+        assert (await conn.execute(links, {"a": rows[follow_up].attempt_id})).scalar_one() == batches[
+            follow_up
+        ]
+        assert (await conn.execute(links, {"a": rows[reclaimed].attempt_id})).scalar_one() == lost_follow_up
+        assert (await conn.execute(links, {"a": rows[online].attempt_id})).scalar_one() is None
+
+
 async def test_the_claim_statement_is_the_one_claim_again_runs(
     engine: AsyncEngine, pending_targets: list[PendingTarget], cycle_id: int
 ) -> None:

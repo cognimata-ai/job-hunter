@@ -329,6 +329,62 @@ async def test_a_resumed_attempt_continues_from_the_persisted_draft(
     assert set(validated.validation) == {"normalisation", "corrections", "current"}
 
 
+_FOLLOW_UP = sa.text("UPDATE score_targets SET lane = 'batch_followup', resume_draft_id = :d WHERE id = :t")
+_ATTEMPT_POLICIES = sa.text(
+    "SELECT id, evaluation_policy_id FROM score_attempts WHERE target_id = :t ORDER BY attempt_no"
+)
+
+
+@pytest.mark.parametrize(
+    ("follow_up", "policy_changes", "resumes"),
+    [(True, False, True), (True, True, True), (False, True, False)],
+    ids=["batch_follow_up", "batch_follow_up_after_a_policy_change", "online_resume_after_a_policy_change"],
+)
+async def test_a_batch_follow_up_resumes_its_draft_under_another_policy_and_an_online_attempt_does_not(
+    engine: AsyncEngine,
+    deps: ScoreDeps,
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    follow_up: bool,
+    policy_changes: bool,
+    resumes: bool,
+) -> None:
+    """Spec L3589 (final review, Fable I1): an attempt resumes from the drafts of an earlier attempt under the
+    same tuple and evaluation policy, or from the draft a batch set as `resume_draft_id` whatever the policy,
+    and then re-validates it under its own (plan L942, Deviation 27). A target with a persisted draft under
+    the old policy is made a batch follow-up (the shape of `batch_items`' `followup` decision) or left an
+    online target; the active policy then changes to one that samples every draft for the critic (T8)."""
+    claimed = await claimed_target(engine)
+    revision = claimed.job_revision_id
+    fake_llm.answer("generate", revision, synthetic_c_draft())
+    fake_llm.answer("critic", revision, synthetic_review(), round=1, schema=CriticOut)
+    monkeypatch.setattr(score_nodes, "afault_point", raising_at(score_nodes.AFTER_DRAFT))
+    with pytest.raises(NodeFailed):  # the first attempt dies after its draft's commit
+        await invoke_subgraph(deps, claimed)
+    monkeypatch.setattr(score_nodes, "afault_point", no_fault)
+    (draft,) = await rows(engine, _DRAFTS, claimed.target_id)
+    await reclaim_now(engine, claimed.target_id)
+    async with engine.begin() as conn:
+        if follow_up:
+            await conn.execute(_FOLLOW_UP, {"d": draft.id, "t": claimed.target_id})
+        new_policy = await activate_test_policy(conn, t8_sample_pct=100) if policy_changes else None
+    again = await claim_again(engine, claimed.target_id)
+    final = await invoke_subgraph(deps, again)
+    assert final["outcome"] == "publish(accepted)" and final["resumed"] is resumes
+    drafts = await rows(engine, _DRAFTS, claimed.target_id)
+    assert len(served(fake_llm, "generate")) == len(drafts) == (1 if resumes else 2)
+    assert final["current_draft_id"] == (draft.id if resumes else drafts[-1].id)
+    first, second = await rows(engine, _ATTEMPT_POLICIES, claimed.target_id)
+    assert (first.id, second.id) == (claimed.attempt_id, again.attempt_id)
+    assert (second.evaluation_policy_id != first.evaluation_policy_id) is policy_changes
+    if new_policy is not None:
+        assert second.evaluation_policy_id == new_policy
+    # validated under the attempt's own policy: the new one sends the draft to the critic (T8), the old never
+    (current,) = [d for d in drafts if d.id == final["current_draft_id"]]
+    assert ("T8" in current.triggers) is policy_changes and ("T8" in final["triggers"]) is policy_changes
+    assert len(served(fake_llm, "critic")) == (1 if policy_changes else 0)
+
+
 async def test_injection_suspected_forces_a_critic_round_and_low_confidence(
     engine: AsyncEngine, deps: ScoreDeps, fake_llm: FakeLLM
 ) -> None:

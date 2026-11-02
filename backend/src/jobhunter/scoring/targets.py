@@ -6,13 +6,17 @@ user, the moves a user asks for, `budget_release`, and (Task 14) the creation, r
 targets, the tuple activation, the `create_targets_for_tuple` operation and the `missing_targets` reconciler.
 
 `RESUMABLE_DRAFT_SQL` (Codex r2 B23, r4 B9, r5 B1) is the one predicate of "this target has a draft to resume
-from": a `score_drafts` row on any attempt of the target under the evaluation policy `:policy`, whatever the
-attempt's mode (an online attempt's draft or a batch draft). It is an SQL predicate correlated to the outer
-alias `t` of `score_targets` and binds `:policy` only:
+from" (spec L3589): a batch follow-up's `resume_draft_id`, whatever the policy its batch attempt ran under
+(L3589's "or `resume_draft_id` is set from a batch"; the follow-up re-validates the draft under its own
+policy, plan L942 and Deviation 27; final review, Fable I1), or a `score_drafts` row on any attempt of the
+target under the evaluation policy `:policy`, whatever the attempt's mode (an online attempt's draft or a
+batch draft). It is an SQL predicate correlated to the outer alias `t` of `score_targets` and binds `:policy`
+only:
 - `load_context` (the `score_target` subgraph, Task 9) reads it as a column of its own target row, under the
   claim predicate, and resumes the target's attempt chain when it holds;
-- Task 16's `ELIGIBLE_SQL` negates it per candidate row, so a target that `load_context` would resume is
-  never batched again.
+- the claim (Task 11) names the attempt a resumed attempt continues (`resumed_from_attempt_id`) when it holds;
+- Task 16's `ELIGIBLE_SQL` negates it per candidate row beside `t.resume_draft_id IS NULL`, so a target that
+  `load_context` would resume is never batched again (the batch exception changes nothing there).
 
 **The sweeps**, each in the caller's transaction, each direction `transition_where` statements with a static
 predicate over the tuple's targets (the expiry's forward move one per reason; a move that sets no reason of
@@ -260,8 +264,9 @@ from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 from jobhunter.worker.tasks import Deferrer, defer_in_tx
 
 RESUMABLE_DRAFT_SQL: Final = (
-    "EXISTS (SELECT 1 FROM score_attempts a JOIN score_drafts d ON d.attempt_id = a.id "
-    "WHERE a.target_id = t.id AND a.evaluation_policy_id = :policy)"
+    "(t.resume_draft_id IS NOT NULL OR EXISTS (SELECT 1 FROM score_attempts a "
+    "JOIN score_drafts d ON d.attempt_id = a.id "
+    "WHERE a.target_id = t.id AND a.evaluation_policy_id = :policy))"
 )
 
 ScoreNowCode = Literal["not_found", "filtered_requires_force", "conflict_state", "budget_exhausted"]

@@ -14,9 +14,10 @@ predicate (`cycles.lock_cycle`, step 5; a lost cycle is `FencedOut(cycles.CYCLE_
    the same statement (Ruling P29).
 2. One `score_attempts` row per claimed target: `mode = 'online'`, `outcome = 'running'`, the claim and its
    epoch, the cycle, the active execution config and evaluation policy, the admission's lane, and
-   `resumed_from_attempt_id`: when the target has a draft to resume from under that policy
-   (`targets.RESUMABLE_DRAFT_SQL`), the newest earlier attempt of the target under the policy, the link
-   `load_context`'s resume chain follows (Controller carry T9-d); else `NULL`.
+   `resumed_from_attempt_id`: when the target has a draft to resume from (`targets.RESUMABLE_DRAFT_SQL`: under
+   that policy, or a batch follow-up's `resume_draft_id` under any), the newest earlier attempt of the target
+   under the policy or of that draft, the link `load_context`'s resume chain follows (Controller carry T9-d;
+   final review, Fable I1); else `NULL`.
 3. `ranking.bump` last, when anything was claimed.
 After the commit: the fault point `score.claim.after_claim` (`AFTER_CLAIM`, C29), then `claims.start(ref)` for
 every claim of the round (cycle-owned heartbeats from the first second, so a claim waiting for a fan-out slot
@@ -67,12 +68,15 @@ CLAIM_SET_SQL: Final = {
 }
 CLAIM_RETURNING: Final = ("id", "claim_id", "attempt_no", "resume_draft_id")
 
-# The resumed attempt: the newest earlier attempt of the target under the policy, when it has a draft to
-# resume from (`RESUMABLE_DRAFT_SQL`, correlated to `t`).
+# The resumed attempt, when the target has a draft to resume from (`RESUMABLE_DRAFT_SQL`, correlated to `t`):
+# the newest earlier attempt of its chain, one under the policy or the attempt of its batch follow-up's
+# `resume_draft_id` whatever that one's policy (L3589; final review, Fable I1). A first follow-up names its
+# batch attempt; the reclaim of a follow-up names the attempt it reclaims, whose own link reaches the batch.
 _RESUMED_FROM: Final = (
     f"CASE WHEN {RESUMABLE_DRAFT_SQL} THEN (SELECT p.id FROM score_attempts p "  # noqa: S608 (a constant)
-    "WHERE p.target_id = c.id "
-    "AND p.attempt_no < c.attempt_no AND p.evaluation_policy_id = :policy "
+    "WHERE p.target_id = c.id AND p.attempt_no < c.attempt_no "
+    "AND (p.evaluation_policy_id = :policy "
+    "OR p.id = (SELECT d.attempt_id FROM score_drafts d WHERE d.id = t.resume_draft_id)) "
     "ORDER BY p.attempt_no DESC LIMIT 1) END"
 )
 _ATTEMPTS: Final = q(
