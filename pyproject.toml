@@ -59,7 +59,7 @@ embedder = [
 # that extract add `--group docparse`: `-m docparse tests/docparse`, and the integration tests that serve a
 # `docparse.worker` loop in process (tests/integration/test_parse_client.py, Task 11's op_runner).
 docparse = [
-    "pypdf==6.21.1",
+    "pypdf==6.21.4",
     "pdfplumber==0.11.10",
     "python-docx==1.2.0",
 ]
