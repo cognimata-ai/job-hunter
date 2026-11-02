@@ -30,6 +30,16 @@ paths = ['''^tests/unit/test_config\.py$''']
 regexTarget = "line"
 regexes = ['''^\s*adzuna_key\s*=\s*"[A-Za-z0-9]+"\s*$''']
 
+# tests/unit/test_config.py checks that an empty secret of another role still counts as a foreign mount: the
+# `anthropic_key` it writes is the empty byte string, no value at all. Only that one call, with `b""`, is allowed.
+[[allowlists]]
+description = "the empty anthropic_key stand-in in tests/unit/test_config.py"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/unit/test_config\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*d = write_secrets\(tmp_path / "s", \*\*API_SECRETS, anthropic_key=b""\)\s*$''']
+
 # scripts/spikes/v7_embedder.py (spike V7) pins the embedding model's files by sha256: each entry maps a file of
 # the public model revision to its Hugging Face LFS object id, 64 lowercase hex characters. They are checksums
 # of published files, not credentials. Only a dict entry of exactly that shape is allowed.
