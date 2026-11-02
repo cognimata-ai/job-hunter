@@ -209,7 +209,13 @@ def _filter(q: JobsQuery, window: tuple[datetime | None, datetime | None], activ
         conjuncts.append(_rendered(terms, "j"))
     elif terms:
         conjuncts.append(
-            "(" + _rendered(terms, "j") + " OR " + _sql.DEFERRED_MEMBER + _rendered(terms, "m") + ")))"
+            "("
+            + _rendered(terms, "j")
+            + " OR "
+            + _sql.DEFERRED_MEMBER
+            + _rendered(terms, "m")
+            + _sql.DEFERRED_MEMBER_END
+            + ")"
         )
     if "hidden" not in q.status:
         conjuncts.append(_sql.NOT_HIDDEN)

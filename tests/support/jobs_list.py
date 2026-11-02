@@ -13,7 +13,8 @@ that many job ids unused before the card's own, so a test can lay its cards out 
 `bulk_seed_cards(engine, n, *, scored_share, groups, langs)` commits `n` cards in one set-based
 `INSERT … SELECT` per table (every row from one JSONB array, `jsonb_to_recordset`) over the active tuple,
 which it activates when there is none: `scored_share` of the cards published with their current score
-instance, the others pending (some without a similarity) or without a target, `groups` active duplicate
+instance; of the others every tenth (the first, the eleventh, …) without a target of the tuple and the rest
+pending, some targets without a similarity; `groups` active duplicate
 groups (each a card and one deferred member job, which is no card), and revisions whose description text is
 in each language of `langs` in turn. It analyses nothing: a caller that needs planner statistics runs
 `ANALYZE` as the owner on a server of its own.
@@ -370,11 +371,12 @@ _SOURCES: Final = (("jsearch",), ("adzuna",), ("greenhouse",), ("jsearch", "gree
 
 @dataclass(frozen=True)
 class BulkSeed:
-    """What `bulk_seed_cards` made: the card ids (ascending), the scored and the grouped ones among them,
-    and the tuple and scope it scored them under."""
+    """What `bulk_seed_cards` made: the card ids (ascending), the scored, the untargeted and the grouped ones
+    among them, and the tuple and scope it scored them under."""
 
     card_ids: tuple[int, ...]
     scored_ids: tuple[int, ...]
+    untargeted_ids: tuple[int, ...]
     representative_ids: tuple[int, ...]
     llm_tuple_id: int
     scope_version_id: int
@@ -662,6 +664,7 @@ async def bulk_seed_cards(
         await activate_tuple(engine, n=_BULK_CHAIN)
     now = utcnow()
     scored = [int((i + 1) * scored_share) > int(i * scored_share) for i in range(n)]
+    untargeted = frozenset([i for i in range(n) if not scored[i]][::10])  # every tenth unscored card
     representatives = sorted({(g * n) // groups for g in range(groups)}) if groups else []
     async with engine.begin() as c:
         config = (await c.execute(_CONFIG)).one()
@@ -675,8 +678,7 @@ async def bulk_seed_cards(
             table: await _ids(c, table, k_scored)
             for table in ("llm_spend_ledger", "llm_calls", "score_attempts", "score_drafts", "llm_results")
         }
-        targeted = [i for i in range(n) if scored[i] or i % 10 != 3]
-        target_ids = iter(await _ids(c, "score_targets", len(targeted) + len(representatives)))
+        target_ids = iter(await _ids(c, "score_targets", n - len(untargeted) + len(representatives)))
         rows = _Rows()
         rank = 0
         for i in range(n):
@@ -708,7 +710,7 @@ async def bulk_seed_cards(
                 )
                 rows.filters.append({"job_id": jobs[i], "passed": i % 29 != 0, "reasons": _reasons(i)})
                 rank += 1
-            elif i % 10 != 3:
+            elif i not in untargeted:
                 rows.targets.append(_target(next(target_ids), revisions[i], jobs[i], "pending", similarity))
             if i % 6 == 0:
                 mark = (now - timedelta(days=1)).isoformat()
@@ -763,6 +765,7 @@ async def bulk_seed_cards(
     return BulkSeed(
         card_ids=tuple(jobs[:n]),
         scored_ids=tuple(jobs[i] for i in range(n) if scored[i]),
+        untargeted_ids=tuple(jobs[i] for i in sorted(untargeted)),
         representative_ids=tuple(jobs[rep] for rep in representatives),
         llm_tuple_id=llm_tuple,
         scope_version_id=scope,

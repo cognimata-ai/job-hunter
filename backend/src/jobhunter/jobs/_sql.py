@@ -180,15 +180,18 @@ TAG: Final[Mapping[str, str]] = MappingProxyType(
 
 # The non-score predicates P(x) of a job `x`: the card's representative `j` or a deferred member `m`. The
 # keyword matches the full text of the job's current revision in both configurations or its title by word
-# similarity (B4: `<%`, the threshold 0.6): two indexed branches, each its own set. The full-text branch is a
-# set of revision ids that the current revision is looked up in: joined to `jobs` inside the set, the
-# mergeable `current_revision_id = kr.id` would make the planner read the revisions in `job_revisions_pkey`
-# order instead of through `job_revisions_tsv` (P6).
+# similarity (B4: `<%` at `TRGM_WORD_THRESHOLD`): two indexed branches, each its own set. The full-text
+# branch is a set of revision ids that the current revision is looked up in: joined to `jobs` inside the
+# set, the mergeable `current_revision_id = kr.id` would make the planner read the revisions in
+# `job_revisions_pkey` order instead of through `job_revisions_tsv` (P6).
 TEXT_REVISIONS: Final = (
     "SELECT kr.id FROM job_revisions kr WHERE kr.tsv @@ websearch_to_tsquery('english', :q) "
     "OR kr.tsv @@ websearch_to_tsquery('german_unaccent', :q)"
 )
 TITLE_JOBS: Final = "SELECT kt.id FROM jobs kt WHERE :qf <% kt.title_norm"
+# B4: the word similarity `<%` requires, pg_trgm's `word_similarity_threshold`. The list sets nothing: it runs
+# under the server's value, and `test_jobs_listing.py` checks that value is this one for the app's role.
+TRGM_WORD_THRESHOLD: Final = 0.6
 ROW_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
     {
         "posted_after": "coalesce({x}.posted_at_effective, {x}.first_seen_at) >= :posted_after",
@@ -222,6 +225,8 @@ ROW_SQL: Final[Mapping[str, Mapping[str, str]]] = MappingProxyType(
         for alias in ("j", "m")
     }
 )
+# A deferred member `m` of the representative `j`'s active group that matches P(m): `DEFERRED_MEMBER`, then
+# P(m) rendered for `m`, then `DEFERRED_MEMBER_END`, which closes the EXISTS and the term it opened.
 DEFERRED_MEMBER: Final = (
     "(j.duplicate_group_id IS NOT NULL AND EXISTS (SELECT 1 FROM duplicate_groups g "
     "JOIN jobs m ON m.duplicate_group_id = g.id "
@@ -230,6 +235,7 @@ DEFERRED_MEMBER: Final = (
     "WHERE g.id = j.duplicate_group_id AND g.status = 'active' AND g.representative_job_id = j.id "
     "AND m.id <> j.id AND m.merged_into_job_id IS NULL AND "
 )
+DEFERRED_MEMBER_END: Final = "))"
 
 # The representative's own predicates
 STATUS_ORDER: Final[tuple[UserStatus, ...]] = ("unseen", "seen", "saved", "applied", "hidden")

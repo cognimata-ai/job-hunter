@@ -9,7 +9,7 @@ with (`/* jobs_list.<segment> */`):
 
 - P1, P2: a second page of a score sort walks `det_rank_mid` (`det_rank_low`) with the scope and the row
   comparison in its `Index Cond`, and sorts nothing;
-- P3: a page of the unscored section walks `score_targets_unscored_rank`;
+- P3: a page of the unscored section walks `score_targets_unscored_rank` and sorts nothing;
 - P4: the `posted` sort walks `jobs_list_posted_any`, in its dated and its undated branch;
 - P5: a second page of the `first_seen` sort walks `jobs_list_first_seen` with the row comparison and sorts
   nothing;
@@ -141,6 +141,7 @@ async def test_p3_the_unscored_section_walks_its_index(seeded: tuple[PgServer, B
     plan = plans["jobs_list.unscored_ranked"]
     assert "score_targets_unscored_rank" in plan, plan
     assert re.search(r"Index Cond: .*ROW\((?:t\.)?similarity, (?:t\.)?job_id\) < ROW\(", plan), plan
+    assert _SORT_NODE.search(plan) is None, plan
 
 
 async def test_p4_the_posted_sort_walks_the_posted_index_in_both_branches(
@@ -191,9 +192,17 @@ async def test_p8_each_count_aggregates_a_limit(seeded: tuple[PgServer, BulkSeed
         assert lines[1].lstrip().startswith("->  Limit"), plans[tag]
 
 
+_TARGET_STATES: Final = sa.text("SELECT state, count(*) FROM score_targets GROUP BY state")
+_UNTARGETED: Final = sa.text(
+    "SELECT j.id FROM jobs j WHERE NOT EXISTS (SELECT 1 FROM score_targets t "
+    "WHERE t.job_revision_id = j.current_revision_id) ORDER BY j.id"
+)
+
+
 async def test_the_bulk_seed_holds_its_cards(seeded: tuple[PgServer, BulkSeed]) -> None:
-    """`bulk_seed_cards` (which the p95 tests of Tasks 5 and 6 consume) made `CARDS` cards, 80 % of them
-    scored, and the members of its groups are no cards: every filter opened, the counts say so."""
+    """`bulk_seed_cards` (which the p95 tests of Tasks 5 and 6 consume) made `CARDS` cards: 80 % of them
+    scored, and of the 400 unscored ones every tenth without a target (40) and the rest pending (360); the
+    members of its groups are no cards. Every filter opened, the counts say so."""
     server, seed = seeded
     every = JobsQuery(
         posted="any",
@@ -207,15 +216,15 @@ async def test_the_bulk_seed_holds_its_cards(seeded: tuple[PgServer, BulkSeed]) 
             first = await select_page(
                 conn, every, window=(None, None), after=None, limit=50, with_counts=True
             )
-            members = await conn.execute(
-                sa.text("SELECT count(*) FROM score_targets WHERE state = 'deferred_duplicate'")
-            )
-            deferred = int(members.scalar_one())
+            states = {str(state): int(n) for state, n in (await conn.execute(_TARGET_STATES)).all()}
+            untargeted = [int(job) for job in (await conn.execute(_UNTARGETED)).scalars()]
     finally:
         await engine.dispose()
     assert (len(seed.card_ids), len(seed.scored_ids), len(seed.representative_ids)) == (CARDS, 1_600, 40)
+    assert states == {"published_accepted": 1_600, "pending": 360, "deferred_duplicate": 40}
+    assert untargeted == list(seed.untargeted_ids) and len(untargeted) == 40
+    assert set(untargeted).isdisjoint(seed.scored_ids)
     assert first.counts is not None
     assert (first.counts.total, first.counts.unscored, first.counts.capped) == (CARDS, CARDS - 1_600, False)
-    assert deferred == 40
     assert {row.section for row in first.rows} == {"scored"}
     assert {row.job_id for row in first.rows} <= set(seed.scored_ids)

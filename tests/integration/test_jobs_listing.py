@@ -15,9 +15,11 @@ from itertools import pairwise
 from typing import Any, Final
 
 import pytest
+import sqlalchemy as sa
 from jobhunter.api.pagination import JobSection, JobSort
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.jobs import listing
+from jobhunter.jobs._sql import TRGM_WORD_THRESHOLD
 from jobhunter.jobs.listing import Counts, PageSelection, Position, SelectedRow, select_page
 from jobhunter.jobs.query import JobsQuery, LocationFilter
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -527,12 +529,29 @@ async def test_counts_count_cards_on_the_first_page_and_cap(
     dated = await page(engine, JobsQuery(sort="first_seen"), with_counts=True)
     assert dated.counts == Counts(total=7, unscored=3, capped=False)
 
+    monkeypatch.setattr(listing, "COUNT_CAP", 7)  # exactly the cap: counted, not capped
+    at_cap = await page(engine, JobsQuery(), limit=2, with_counts=True)
+    assert at_cap.counts == Counts(total=7, unscored=3, capped=False)
+
     monkeypatch.setattr(listing, "COUNT_CAP", 5)
     first = await page(engine, JobsQuery(), limit=2, with_counts=True)
     assert first.counts == Counts(total=5, unscored=3, capped=True)
     assert [r.job_id for r in first.rows] == [made[0], made[1]]
     second = await page(engine, JobsQuery(), after=first.next, limit=2, with_counts=True)
     assert second.counts is None
+
+
+async def test_the_word_similarity_threshold_is_b4s(engine: AsyncEngine, active_tuple: int) -> None:
+    """The title branch of the keyword (`<%`) runs at pg_trgm's `word_similarity_threshold`, which the list
+    never sets: as the app's role, after a keyword page has loaded pg_trgm, it is B4's 0.6."""
+    await seed_cards(engine, [Card(title="Softwareentwickler")])
+    async with read_snapshot(engine) as conn:
+        selected = await select_page(
+            conn, JobsQuery(q="Entwickler"), window=ANY, after=None, limit=5, with_counts=False
+        )
+        shown = (await conn.execute(sa.text("SHOW pg_trgm.word_similarity_threshold"))).scalar_one()
+    assert len(selected.rows) == 1  # found by the title alone: the threshold took part
+    assert float(shown) == TRGM_WORD_THRESHOLD
 
 
 async def test_a_group_card_sorts_by_its_representatives_dates(
