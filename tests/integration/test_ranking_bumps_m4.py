@@ -5,18 +5,21 @@ every transaction that changes what a page shows, at most once and as its last s
 - a claim (`pending → in_progress`) stays in the unscored bucket and leaves it as it is (B30);
 - a reclaim (`stuck_targets`, `orphaned_cycles`, `fail_cycle` and both takeover sweeps) leaves it as it is
   while every claim goes back to `pending`, and advances it once when any claim ends
-  `failed_attempts_exhausted`, however many do;
+  `failed_attempts_exhausted`, however many do; the two owners of `_orphan`'s loop advance it once over two
+  cycles, never once per cycle (the schema allows one running cycle: the test lifts that index for it);
 - `det_completeness` advances it once per chunk that wrote a current instance of the active scope, never for
   the pending scope's;
 - `awaiting_embedding` advances it once when it set a similarity, never for a pass with nothing to fill;
 - `hard_filter_completeness` advances it when a job's active-scope `passed` changed, never for a rewrite of
-  equal values (B32).
+  equal values (B32), and so does collect node 8, once per batch transaction that changed one, never when
+  its guard fences it out (Ruling T3-a).
 
 Each reads the generation before and after (`tests.support.settings.generation`). Every datum is invented.
 """
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any, Final, cast
 from uuid import uuid4
@@ -26,6 +29,9 @@ import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.embeddings import EmbedderClient, make_http_client
+from jobhunter.errors import FencedOut
+from jobhunter.graphs.collect.nodes.hard_filters import make_hard_filters
+from jobhunter.graphs.collect.state import initial_state
 from jobhunter.graphs.score.context import ScoreContext
 from jobhunter.graphs.score.deps import ScoreDeps
 from jobhunter.graphs.score.nodes import claim as claim_node
@@ -33,18 +39,23 @@ from jobhunter.graphs.score.state import CycleState
 from jobhunter.scoring import cycles, filters
 from jobhunter.scoring import reconcilers as scoring_reconcilers
 from jobhunter.scoring.admission import Picked
+from jobhunter.sources.base import SourceAdapter
+from jobhunter.sources.instances import InstanceRow
 from jobhunter.worker.embedding_reconcile import reconcile_awaiting_embedding
 from jobhunter.worker.epoch import Swept
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.support.collect import ctx
+from tests.support.collect import JobFactory, ctx, make_deps, queued_run, supersede
 from tests.support.embedder import FakeEmbedder
+from tests.support.fixtures import reset_database
 from tests.support.llm import FakeLLM
 from tests.support.m3 import active_ids, insert_cycle, insert_job
+from tests.support.pg import PgServer, pg_one, pg_rows
 from tests.support.scoring import (
     NoClaims,
     PendingTarget,
     activate_score_tuple,
+    cycle_of,
     embed_revision,
     embedding_at,
     insert_target,
@@ -154,14 +165,17 @@ RECLAIMERS: Final = (
 )
 
 
-async def claim_in_cycle(engine: AsyncEngine, targets: Sequence[PendingTarget]) -> int:
-    """The running cycle of epoch 1 (the one a reclaim that ends no cycle left, else a new one) claims
-    `targets` (`claim_round`: their attempts are the cycle's), claims and cycle beaten 10 minutes ago; its
-    id."""
+async def claim_in_cycle(
+    engine: AsyncEngine, targets: Sequence[PendingTarget], *, cycle_id: int | None = None
+) -> int:
+    """Cycle `cycle_id` of epoch 1 (by default the running one: the one a reclaim that ends no cycle left,
+    else a new one) claims `targets` (`claim_round`: their attempts are the cycle's), claims and cycle beaten
+    10 minutes ago; its id."""
     ids = [t.target_id for t in targets]
     async with engine.begin() as conn:
-        running = (await conn.execute(_RUNNING_CYCLE)).scalar_one_or_none()
-        cycle_id = await insert_cycle(conn, targets[0].llm_tuple_id) if running is None else int(running)
+        if cycle_id is None:
+            running = (await conn.execute(_RUNNING_CYCLE)).scalar_one_or_none()
+            cycle_id = await insert_cycle(conn, targets[0].llm_tuple_id) if running is None else int(running)
         active = await active_ids(conn)
         claimed = await claim_node.claim_round(
             conn,
@@ -221,6 +235,49 @@ async def test_a_reclaim_to_pending_does_not_bump_and_to_exhausted_bumps_once(
         "pending",
     ]
     assert await generation(engine) == before + 1  # once for the transaction, however many crossed
+
+
+_ONE_RUNNING: Final = "score_cycles_one_running"
+
+
+@contextmanager
+def two_running_cycles(server: PgServer) -> Iterator[None]:
+    """The block runs without the index that allows one running cycle (no code path makes two; the loops of
+    `_orphan`'s owners are written for any number), which is created again after it from its own definition,
+    the test's rows emptied first (`reset_database`) so that it builds."""
+    found = pg_one(server, "migrator", "SELECT indexdef FROM pg_indexes WHERE indexname = %s", _ONE_RUNNING)
+    assert found is not None, _ONE_RUNNING
+    pg_rows(server, "migrator", f"DROP INDEX {_ONE_RUNNING}")
+    try:
+        yield
+    finally:
+        reset_database(server)
+        pg_rows(server, "migrator", str(found[0]))
+
+
+@pytest.mark.parametrize("owner", ["orphaned_cycles", "score_cycles_sweep"])
+async def test_a_loop_owner_bumps_once_over_two_cycles_with_exhausted_claims(
+    engine: AsyncEngine, migrated: PgServer, current_epoch: int, queue_app: procrastinate.App, owner: str
+) -> None:
+    targets = await insert_targets(engine, 2)
+    with two_running_cycles(migrated):
+        async with engine.begin() as conn:
+            pair = [await insert_cycle(conn, targets[0].llm_tuple_id) for _ in targets]
+        for cycle_id, target in zip(pair, targets, strict=True):  # one claim each
+            await claim_in_cycle(engine, [target], cycle_id=cycle_id)
+        async with engine.begin() as conn:
+            await conn.execute(_SPEND, {"ids": [t.target_id for t in targets]})  # neither has one left
+        before = await generation(engine)
+        if owner == "orphaned_cycles":
+            assert await cycles.reconcile_orphaned_cycles(ctx(engine, queue_app)) == 2
+        else:
+            async with engine.begin() as conn:  # the sweep's own transaction
+                swept = await cycles.sweep_older_epoch_cycles(conn, 2)
+            assert isinstance(swept, Swept) and swept.count == 2
+        assert [(await cycle_of(engine, c)).status for c in pair] == ["failed", "failed"]
+        states = [(await target_of(engine, t.target_id)).state for t in targets]
+        assert states == ["failed_attempts_exhausted"] * 2  # one per `_orphan` call
+        assert await generation(engine) == before + 1  # once after the loop, never once per cycle
 
 
 # ---- det_completeness --------------------------------------------------------------------------------------
@@ -320,3 +377,62 @@ async def test_hard_filter_completeness_bumps_when_passed_changes_only(
     assert await generation(engine) == before + 2  # once
     assert await reconcile(ctx(engine, queue_app)) == 0
     assert await generation(engine) == before + 2  # nothing stale: no bump
+
+
+# ---- collect node 8 ----------------------------------------------------------------------------------------
+
+_REHASH: Final = sa.text("UPDATE jobs SET det_facts_hash = :h WHERE id = ANY(CAST(:ids AS bigint[]))")
+
+
+def no_adapter(instance: InstanceRow) -> SourceAdapter:
+    raise AssertionError(f"node 8 needs no adapter, asked for {instance.source_id}")
+
+
+async def rehash(engine: AsyncEngine, ids: Sequence[int], label: bytes) -> None:
+    """The jobs' det-facts hash moves while their facts do not: their results go stale, `passed` unchanged."""
+    async with engine.begin() as conn:
+        await conn.execute(_REHASH, {"h": hashlib.sha256(label).digest(), "ids": list(ids)})
+
+
+async def test_node_8_bumps_once_per_batch_that_changed_a_passed_value(
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    job_factory: JobFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = await queued_run(engine, include_paid=False)
+    first, second, third = [(await job_factory(native_id=name)).job_id for name in "abc"]  # the run's jobs
+    node = make_hard_filters(make_deps(engine, no_adapter))
+    state = initial_state(owner.run_id, owner.attempt_no)
+    monkeypatch.setattr(filters, "BATCH", 2)  # two batches, [first, second] and [third], a transaction each
+    before = await generation(engine)
+    assert (await node(state))["counters"] == {"hard_filter_backfilled": 3}
+    assert await generation(engine) == before + 2  # first results in both batches: one bump each
+
+    await rehash(engine, [first, second, third], b"rehashed")
+    assert (await node(state))["counters"] == {"hard_filter_backfilled": 3}
+    assert await generation(engine) == before + 2  # equal rewrites in both batches: no bump
+
+    await rehash(engine, [first, second], b"rehashed again")
+    changed = hashlib.sha256(b"det facts changed").digest()
+    async with engine.begin() as conn:  # the third job's language becomes one the scope excludes
+        await conn.execute(_SET_LANGUAGE, {"l": "other", "h": changed, "j": third})
+    assert (await node(state))["counters"] == {"hard_filter_backfilled": 3}
+    async with engine.connect() as conn:
+        scope = int((await conn.execute(_ACTIVE_SCOPE)).scalar_one())
+        found = await conn.execute(_FILTER_ROW, {"j": third, "s": scope})
+        assert found.one().passed is False
+    assert await generation(engine) == before + 3  # the second batch alone changed a `passed`
+
+    # a superseded attempt's guard fences its batch out before any write: no bump
+    async with engine.begin() as conn:
+        await conn.execute(_SET_LANGUAGE, {"l": "other", "h": changed, "j": first})
+    newer = await supersede(engine, owner)
+    with pytest.raises(FencedOut):
+        await node(state)
+    assert await generation(engine) == before + 3
+    assert (await node(initial_state(newer.run_id, newer.attempt_no)))["counters"] == {
+        "hard_filter_backfilled": 1
+    }
+    assert await generation(engine) == before + 4

@@ -590,7 +590,7 @@ async def test_the_confirm_s_tuple_activation_and_a_cycle_s_claim_meet_at_active
         await asyncio.wait_for(claimed.wait(), WAIT_S)
         (claimer,) = claimer_pids
         assert not await free(engine, "score_targets", pending.target_id)  # the claimed target, held
-        assert await free(engine, "ranking_state", 1)  # and no ranking bump
+        assert await free(engine, "ranking_state", 1)  # claim_round takes no ranking_state
         confirming = background(confirm_new_profile(engine))
         wait = one_wait(await waits(migrated, claiming, confirming), "active_config")
         assert wait.key == "1" and wait.blocking_pids == (claimer,)  # the confirm's first lock
