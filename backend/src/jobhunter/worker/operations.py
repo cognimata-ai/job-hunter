@@ -107,6 +107,7 @@ OperationKind = Literal[
     "purge",
     "eval_run",
     "watchlist_validate",
+    "replay_raw_items",  # M4 Task 12 registers its handler (migration 0009 adds it to the CHECK)
 ]
 
 # The procrastinate execution lock of a kind's `run_operation` job, applied at every enqueue

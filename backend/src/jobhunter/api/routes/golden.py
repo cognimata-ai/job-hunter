@@ -9,10 +9,11 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
   comment is at most 2,000 characters and holds no NUL and no lone surrogate (422 at the model's edge,
   `models.clean_text`; M2 Deviation 44).
 - `GET /api/golden-cases?cursor&limit&active` → `{items, next_cursor}`: the cases by id ascending,
-  keyset-paged with §14.3's signed cursor (`api.pagination`: sort `id`, section `all`, `last_key = [id]`, the
-  filters `{"active": …}` when given), limit 1 to 100 (default 50); a cursor this list did not sign for these
-  filters is 400 `invalid_cursor`. Each item `{id, job_id, label, comment, profile_version, scope_version,
-  source, active, is_canary}` (`golden.CaseRow`; `profile_version` the version's number).
+  keyset-paged with §14.3's signed cursor (`api.pagination`: sort `golden_cases.id`, `asc`,
+  `last_key = [id]`, the filters `{"active": …}` when given), limit 1 to 100 (default 50); a cursor this list
+  did not sign for these filters is 400 `invalid_cursor`. Each item `{id, job_id, label, comment,
+  profile_version, scope_version, source, active, is_canary}` (`golden.CaseRow`; `profile_version` the
+  version's number).
 - `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`): a third
   canary is 422 `validation_failed` (L4632), an unknown case 404.
 - `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
@@ -34,12 +35,10 @@ from jobhunter.api.errors import Problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
-    CURSOR_VERSION,
-    SECTION_ALL,
+    GOLDEN_CASES_SORT,
     cursor_key,
-    decode_cursor,
-    encode_cursor,
-    filters_hash,
+    decode_list_cursor,
+    encode_list_cursor,
     invalid_cursor,
 )
 from jobhunter.clock import utcnow
@@ -50,7 +49,6 @@ from jobhunter.types import JSONValue
 
 router = APIRouter(dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
 
-CASES_SORT: Final = "id"
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
 _BIGINT_MAX: Final = 2**63 - 1
@@ -161,11 +159,7 @@ def _after(cursor: str | None, key: bytes, filters: dict[str, JSONValue]) -> int
     page."""
     if cursor is None:
         return None
-    body = decode_cursor(cursor, key=key, sort=CASES_SORT, filters_hash=filters_hash(filters))
-    last_key = body.get("last_key")
-    if body.get("section") != SECTION_ALL or body.get("dir") != "asc" or not isinstance(last_key, list):
-        raise invalid_cursor()
-    match last_key:
+    match decode_list_cursor(cursor, key=key, sort=GOLDEN_CASES_SORT, dir="asc", filters=filters):
         case [int(case_id)] if not isinstance(case_id, bool) and case_id >= 1:
             return case_id
     raise invalid_cursor()
@@ -194,16 +188,8 @@ async def list_golden_cases(
     items = [GoldenCaseOut.of(row) for row in rows[:limit]]
     next_cursor = None
     if len(rows) > limit:
-        next_cursor = encode_cursor(
-            {
-                "v": CURSOR_VERSION,
-                "sort": CASES_SORT,
-                "dir": "asc",
-                "section": SECTION_ALL,
-                "last_key": [items[-1].id],
-                "filters_hash": filters_hash(filters),
-            },
-            key=key,
+        next_cursor = encode_list_cursor(
+            sort=GOLDEN_CASES_SORT, dir="asc", last_key=[items[-1].id], filters=filters, key=key
         )
     return GoldenCasesPageOut(items=items, next_cursor=next_cursor)
 

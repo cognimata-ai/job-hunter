@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
-from jobhunter.api.pagination import encode_cursor, filters_hash
+from jobhunter.api.pagination import SETTINGS_VERSIONS_SORT, encode_list_cursor, filters_hash
 from jobhunter.crypto import hkdf_sha256
 from jobhunter.db.seed import load_settings_v1
 
@@ -107,23 +107,35 @@ async def test_a_tampered_cursor_is_400_invalid_cursor(logged_in_client, api_app
     body = json.loads(_unb64(data))
     assert body == {
         "v": 2,
-        "sort": "version_no",
+        "sort": "settings_versions.version_no",
         "dir": "desc",
         "section": "all",
         "last_key": [4],
         "filters_hash": filters_hash({}),
     }
     key = hkdf_sha256(api_app.api.state.cfg.secret_b64("session_secret"), b"cursor")
-    assert encode_cursor(body, key=key) == cursor  # signed with HKDF(session_secret, "cursor")
+
+    def signed(*, key: bytes = key, **changes: Any) -> str:
+        fields: dict[str, Any] = {
+            "sort": SETTINGS_VERSIONS_SORT,
+            "dir": "desc",
+            "last_key": [4],
+            "filters": {},
+        }
+        return encode_list_cursor(**{**fields, **changes}, key=key)
+
+    assert signed() == cursor  # signed with HKDF(session_secret, "cursor")
     forged = _b64(json.dumps({**body, "last_key": [2]}, separators=(",", ":"), sort_keys=True).encode())
     other_key = hkdf_sha256(b"\x01" * 32, b"cursor")
-    other_sort = encode_cursor({**body, "sort": "created_at"}, key=key)
-    other_filters = encode_cursor({**body, "filters_hash": filters_hash({"effect": "scope"})}, key=key)
-    bad_key = encode_cursor({**body, "last_key": ["4"]}, key=key)
+    other_sort = signed(sort="created_at")
+    other_filters = signed(filters={"effect": "scope"})
+    bad_key = signed(last_key=["4"])
     for tampered in (
         f"{forged}.{signature}",
         f"{data}.{'B' if signature[0] == 'A' else 'A'}{signature[1:]}",
-        encode_cursor(body, key=other_key),
+        signed(key=other_key),
+        signed(dir="asc"),
+        signed(sort="version_no"),  # the M3 form of this cursor (resolution (c))
         other_sort,
         other_filters,
         bad_key,

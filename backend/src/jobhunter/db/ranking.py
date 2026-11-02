@@ -3,7 +3,8 @@
 Every transaction that can change the order or the membership of the list (a job inserted, a job field that
 a filter or sort reads, a current revision, an availability, a merge, a group, a target or user action, ...)
 calls `bump` as its **last statement before commit**: the `ranking_state` row is the last lock of the §3.3.3
-order and is held for microseconds. The list API reads the generation and the page rows in one snapshot.
+order and is held for microseconds. The list API reads the generation (`generation`) and the page rows in one
+snapshot (`db.snapshot.read_snapshot`).
 """
 
 from typing import Final
@@ -13,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db.sql import q
 
 _BUMP: Final = q("UPDATE ranking_state SET generation = generation + 1, updated_at = now() WHERE id = 1")
+_GENERATION: Final = q("SELECT generation FROM ranking_state WHERE id = 1")
+_NO_ROW: Final = "ranking_state has no row 1 (migrate seeds it)"
 
 
 async def bump(conn: AsyncConnection) -> None:
@@ -21,4 +24,15 @@ async def bump(conn: AsyncConnection) -> None:
     Raises `LookupError` when the `ranking_state` row is missing (`migrate` seeds it).
     """
     if (await conn.execute(_BUMP)).rowcount != 1:
-        raise LookupError("ranking_state has no row 1 (migrate seeds it)")
+        raise LookupError(_NO_ROW)
+
+
+async def generation(conn: AsyncConnection) -> int:
+    """The ranking generation as the caller's transaction sees it (a list page reads it in its snapshot).
+
+    Raises `LookupError` when the `ranking_state` row is missing (`migrate` seeds it).
+    """
+    value = (await conn.execute(_GENERATION)).scalar_one_or_none()
+    if value is None:
+        raise LookupError(_NO_ROW)
+    return int(value)

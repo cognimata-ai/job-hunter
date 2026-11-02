@@ -26,9 +26,9 @@ The reads, each a plain `SELECT` (no lock):
   operation's `{done, total}` (`0`/`0` before its first chunk), or `null` when no apply is live (one that
   failed for good, until the `scope_apply_failed` reconciler clears the pointer);
 - `GET /api/settings/versions?cursor&limit` (limit 1 to 100, default 50) → `{items, next_cursor}`, newest
-  first (`version_no DESC`), keyset-paged with §14.3's signed cursor (`api.pagination`: sort `version_no`,
-  section `all`, `last_key = [version_no]`, no filters). A cursor this list did not sign is 400
-  `invalid_cursor`;
+  first (`version_no DESC`), keyset-paged with §14.3's signed cursor (`api.pagination`: sort
+  `settings_versions.version_no`, `desc`, `last_key = [version_no]`, no filters). A cursor this list did not
+  sign is 400 `invalid_cursor`;
 - `GET /api/settings/versions/{id}` → `{version, payload, diff}`, `diff` the `effects.diff_payloads` of the
   previous version's document and this one's (empty for version 1), both read as normal forms. 404
   `not_found` for an unknown id.
@@ -78,12 +78,10 @@ from jobhunter.api.errors import Problem, as_problem
 from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
-    CURSOR_VERSION,
-    SECTION_ALL,
+    SETTINGS_VERSIONS_SORT,
     cursor_key,
-    decode_cursor,
-    encode_cursor,
-    filters_hash,
+    decode_list_cursor,
+    encode_list_cursor,
     invalid_cursor,
 )
 from jobhunter.api_idempotency import (
@@ -122,7 +120,6 @@ router = APIRouter(
 log = get_logger("jobhunter.api.settings")
 
 SAVE_ROUTE: Final = "settings.save"
-VERSIONS_SORT: Final = "version_no"
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
 _BIGINT_MAX: Final = 2**63 - 1
@@ -482,11 +479,7 @@ def _version_after(cursor: str | None, key: bytes) -> int | None:
     """The `version_no` the next page starts below, from a cursor of this list; `None` for the first page."""
     if cursor is None:
         return None
-    body = decode_cursor(cursor, key=key, sort=VERSIONS_SORT, filters_hash=filters_hash({}))
-    last_key = body.get("last_key")
-    if body.get("section") != SECTION_ALL or body.get("dir") != "desc" or not isinstance(last_key, list):
-        raise invalid_cursor()
-    match last_key:
+    match decode_list_cursor(cursor, key=key, sort=SETTINGS_VERSIONS_SORT, dir="desc", filters={}):
         case [int(version_no)] if not isinstance(version_no, bool) and version_no >= 1:
             return version_no
     raise invalid_cursor()
@@ -513,16 +506,8 @@ async def list_versions(
     items = [VersionOut.model_validate(row, from_attributes=True) for row in rows[:limit]]
     next_cursor = None
     if len(rows) > limit:
-        next_cursor = encode_cursor(
-            {
-                "v": CURSOR_VERSION,
-                "sort": VERSIONS_SORT,
-                "dir": "desc",
-                "section": SECTION_ALL,
-                "last_key": [items[-1].version_no],
-                "filters_hash": filters_hash({}),
-            },
-            key=key,
+        next_cursor = encode_list_cursor(
+            sort=SETTINGS_VERSIONS_SORT, dir="desc", last_key=[items[-1].version_no], filters={}, key=key
         )
     return VersionsPageOut(items=items, next_cursor=next_cursor)
 
