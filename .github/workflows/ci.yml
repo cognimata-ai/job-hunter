@@ -68,7 +68,9 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           version: "0.13.1"
-      - run: uv sync --frozen
+      # With the docparse group: tests/unit/test_v12_replay.py replays V12 through Task 11's op_runner, which
+      # serves parse jobs with an in-process `docparse.worker` loop and checks the group is installed.
+      - run: uv sync --frozen --group docparse
       # tests/embedder runs in the base environment: the embedder app tests need no model and no `embedder`
       # group (Task 21); the `embedder_model` tests that load the model are deselected (pyproject addopts).
       # tests/live: addopts deselects its `live` tests too, so only its offline paid-host guards run here.
@@ -76,7 +78,8 @@ jobs:
 
   integration:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # M3's suite takes about 42 minutes on a hosted runner (71% at 30 minutes in run 296).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
