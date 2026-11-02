@@ -16,10 +16,10 @@ from typing import Any, Final
 import httpx
 import pytest
 import sqlalchemy as sa
-from jobhunter.api.errors import Problem
 from jobhunter.api.routes import settings as settings_routes
 from jobhunter.db import ranking
 from jobhunter.db.seed import ensure_hashed, load_settings_v1
+from jobhunter.errors import Refusal
 from jobhunter.llm import spend_ledger
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.llm.spend_ledger import ensure_month
@@ -1029,8 +1029,8 @@ async def test_two_direct_saves_on_two_connections_never_deadlock(engine: AsyncE
                 outcome = await save_settings(conn, request, now=NOW, defer=defer_in_tx)
                 await asyncio.sleep(0.2)  # hold the lock while the other save starts
                 return outcome.version_no
-        except Problem as problem:  # str() is its code
-            return str(problem)
+        except Refusal as refusal:  # str() is its code
+            return str(refusal)
 
     results = await asyncio.gather(one_save("de"), one_save("en"))
     assert sorted(results, key=str) == [2, "stale_base_version"]
@@ -1075,7 +1075,7 @@ async def test_an_internal_save_copies_the_active_acknowledgements(logged_in_cli
     assert outcome.effects == frozenset({"collection"}) and outcome.version_no == 3
     stored = await version_row(engine, outcome.version_id)
     assert stored.acknowledged_warnings == ["llm_cap_binding", "serpapi_disabled_no_fallback"]
-    with pytest.raises(Problem, match="validation_failed"):  # field validation still runs
+    with pytest.raises(Refusal, match="validation_failed"):  # field validation still runs
         async with engine.begin() as conn:
             bad = copy.deepcopy(payload)
             bad["schedule"]["interval_hours"] = 0

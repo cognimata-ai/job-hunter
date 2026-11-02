@@ -10,11 +10,14 @@ anything they print: a secret file is compared by its inode, size and modificati
 
 Run explicitly with `-m stack`. The stack runs as a compose project of its own, `jobhunter-stacktest` (every
 compose call passes `-p jobhunter-stacktest`; ruling T21-g), never as the normal dev stack `jobhunter-dev`,
-whose database it must not touch. The fixture removes every container, network and volume of
-`jobhunter-stacktest`, and its egress probe container, on every path: before the start (what a killed earlier
-run left behind) and after the module, also when the start fails. It never stops or removes anything of
-`jobhunter-dev`: when that project has a running container or a network (its fixed subnet `172.30.0.0/24`
-and port `127.0.0.1:8080` would collide), the module is skipped with a message saying so.
+whose database it must not touch. Its images are not its own, though: the build tags them as
+`compose.dev.yaml` names them, so it rebuilds the shared `jobhunter-app:dev` image tag (and the other `:dev`
+tags it builds), which the next start of `jobhunter-dev` then runs (M0 Carry-forward 7). The fixture removes
+every container, network and volume of `jobhunter-stacktest`, and its egress probe container, on every path:
+before the start (what a killed earlier run left behind) and after the module, also when the start fails. It
+never stops or removes anything of `jobhunter-dev`: when that project has a running container or a network
+(its fixed subnet `172.30.0.0/24` and port `127.0.0.1:8080` would collide), the module is skipped with a
+message saying so.
 """
 
 import os

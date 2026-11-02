@@ -13,6 +13,9 @@ system health probe. The lifespan's HTTP client is closed when the lifespan ends
 one of its own on the injected `cfg`, which nothing closes: the tests' fake embedder closes every connection
 after its answer, so the client holds none open.
 
+The Argon2 gate's thread pool is the first thing the lifespan's end closes (`Argon2Gate.close`, M0
+Carry-forward 7): a computation still running is waited for, so the threads end with the app.
+
 The gazetteer (M2 Task 22) is loaded by the first `/api/geo/places` request, in a worker thread, and kept on
 the state (`deps.get_gazetteer`): `create_app` sets only its slot and the lock that makes a first load happen
 once.
@@ -149,13 +152,18 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         try:
-            await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
+            gate = getattr(api.state, "argon2_gate", None)
+            if isinstance(gate, Argon2Gate):  # `create_app` made it; a running computation is waited for
+                gate.close()
         finally:
             try:
-                if embedder_http is not None:
-                    await embedder_http.aclose()
+                await queue.close_async()  # ruling T17-d: a no-op unless something opened its pool
             finally:
-                await engine.dispose()
+                try:
+                    if embedder_http is not None:
+                        await embedder_http.aclose()
+                finally:
+                    await engine.dispose()
 
 
 def _state_config(api: FastAPI) -> AppConfig | None:

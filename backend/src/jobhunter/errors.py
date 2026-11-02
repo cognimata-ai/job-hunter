@@ -1,10 +1,42 @@
 """Domain errors (spec §17.1): outcomes a caller handles, as opposed to bugs.
 
-None of them carries content: they name tables, ids, states and owners only, so their messages are safe to
-log. `NodeFailed`, the one bug here, is the content-free stand-in for an unclassified error of a graph node.
+None of them carries content in its message: they name tables, ids, states and owners only, so their messages
+are safe to log. `NodeFailed`, the one bug here, is the content-free stand-in for an unclassified error of a
+graph node.
+
+`Refusal` (M4 Task 1, R6) is a request the domain refuses, in the terms of the api's answer (§14.4): domain
+code raises it, never the api's `Problem`, and never imports `jobhunter.api.errors`; the api answers it in one
+handler (`api.errors.problem_of`). Its message (`str`) is its code. Its title, detail and field messages go to
+the client only, never to a log line: a field message may echo the sender's own input (ruling T14-h).
 """
 
-from typing import Final
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Final, Literal
+
+from jobhunter.types import JSONValue
+
+# The problem codes of §14.4 (`api.errors.ProblemCode` is this type).
+ErrorCode = Literal[
+    "unauthenticated",
+    "csrf_failed",
+    "throttled",
+    "invalid_cursor",
+    "stale_base_version",
+    "validation_failed",
+    "budget_exhausted",
+    "filtered_requires_force",
+    "run_active",
+    "not_found",
+    "conflict_state",
+    "upload_rejected",
+    "idempotency_key_required",
+    "idempotency_key_reused",
+    "idempotency_in_progress",
+    "eval_gate_failed",
+    "profile_purge_in_progress",
+    "internal",
+]
 
 
 class DomainError(Exception):
@@ -48,6 +80,43 @@ class FencedOut(DomainError):
 
 class InvariantViolation(DomainError):
     """A cross-table invariant (§7.17) does not hold."""
+
+
+@dataclass(frozen=True)
+class RefusalField:
+    """A field a refusal names (a member of the problem's `errors`): its path, a code and a message."""
+
+    field: str
+    code: str
+    message: str
+
+
+class Refusal(DomainError):
+    """A refused request: the status (4xx only), code, title, detail, fields and extra members of its problem.
+
+    `fields=None` gives the problem no `errors` member, an empty sequence an empty one. A 5xx is never a
+    refusal: it is a bug or an outage, which the api answers itself.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        code: ErrorCode,
+        title: str,
+        *,
+        detail: str | None = None,
+        fields: Sequence[RefusalField] | None = None,
+        extra: Mapping[str, JSONValue] | None = None,
+    ) -> None:
+        super().__init__(code)
+        if not 400 <= status <= 499:
+            raise ValueError(f"a refusal has a 4xx status, not {status}")
+        self.status = status
+        self.code: ErrorCode = code
+        self.title = title
+        self.detail = detail
+        self.fields = None if fields is None else tuple(fields)
+        self.extra = dict(extra or {})
 
 
 class NodeFailed(Exception):

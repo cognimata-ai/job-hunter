@@ -74,7 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
-from jobhunter.api.errors import Problem
+from jobhunter.api.errors import Problem, problem_of
 from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
@@ -96,6 +96,7 @@ from jobhunter.api_idempotency import (
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.sql import q
+from jobhunter.errors import Refusal
 from jobhunter.observability.logging import get_logger
 from jobhunter.settings import scope_apply
 from jobhunter.settings.activate import (
@@ -457,7 +458,8 @@ async def save_settings_version(
             stored = await run_idempotent(
                 conn, route=SAVE_ROUTE, key=key, fingerprint=fingerprint, now=now, handler=handler
             )
-    except Problem as problem:  # counts and codes: a field path can hold a key the sender typed
+    except (Problem, Refusal) as refused:  # counts and codes: a field path can hold a key the sender typed
+        problem = refused if isinstance(refused, Problem) else problem_of(refused)
         log.info(
             "settings_save_refused",
             code=problem.code,
@@ -640,7 +642,8 @@ async def _activate(
                 now=now,
                 handler=handler,
             )
-    except Problem as problem:
+    except (Problem, Refusal) as refused:
+        problem = refused if isinstance(refused, Problem) else problem_of(refused)
         log.info(
             "shipped_version_activation_refused",
             kind=kind,

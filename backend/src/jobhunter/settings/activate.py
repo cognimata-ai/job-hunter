@@ -45,7 +45,8 @@ idempotency row, so nothing of the activation remains and a retry with the key r
 The outcome (`ShippedActivation`) is §14.2's 201 body (Ruling P41): `{version, llm_tuple_id,
 targets_to_create, bulk_budget_usd}`, `version` the new settings version's number, `targets_to_create` the
 estimate's count and `bulk_budget_usd` the estimate's figure (both 0 without an active profile: no tuple, no
-bulk operation). This module does not log: the route logs the ids after its commit.
+bulk operation). Every refusal is a `jobhunter.errors.Refusal` (M4 Task 1, R6), which the api answers with its
+problem. This module does not log: the route logs the ids after its commit.
 """
 
 from collections.abc import Mapping
@@ -58,8 +59,8 @@ from typing import Final, Literal
 from sqlalchemy import TextClause
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from jobhunter.api.errors import FieldError, Problem
 from jobhunter.db.sql import q
+from jobhunter.errors import Refusal, RefusalField
 from jobhunter.llm.budget import USD_QUANTUM
 from jobhunter.profile.activation import ACK_FIELD, ACK_REQUIRED
 from jobhunter.profile.estimate import rescore_estimate
@@ -157,9 +158,9 @@ async def activate_shipped_version(
     active = (await conn.execute(_LOCK_ACTIVE)).one()  # step 1
     shipped = _SHIPPED[kind]
     if (await conn.execute(shipped.find, {"id": version_id})).first() is None:  # step 3
-        raise Problem(404, "not_found", f"{shipped.name} not found")
+        raise Refusal(404, "not_found", f"{shipped.name} not found")
     if getattr(active, shipped.pointer) == version_id:
-        raise Problem(
+        raise Refusal(
             409,
             "conflict_state",
             f"{shipped.name} {version_id} is the active one",
@@ -189,11 +190,11 @@ async def activate_shipped_version(
         targets, bulk_budget_usd = preview.targets, preview.bulk_budget_usd
     if targets > 0 and not req.expected_rescore_ack:
         message = f"Activating re-scores {targets} retained ads; acknowledge the estimate to activate."
-        raise Problem(
+        raise Refusal(
             422,
             "validation_failed",
             "The re-score is not acknowledged",
-            errors=[FieldError(field=ACK_FIELD, code=ACK_REQUIRED, message=message)],
+            fields=[RefusalField(field=ACK_FIELD, code=ACK_REQUIRED, message=message)],
         )
     await conn.execute(shipped.flip, {"id": version_id, "now": now})  # step 7
     warnings = (await dry_run(conn, payload, active=settings, now=now)).warnings

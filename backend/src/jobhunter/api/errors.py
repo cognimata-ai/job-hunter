@@ -5,6 +5,9 @@ the one place that builds that document; the handlers here and the edge middlewa
 
 The handlers (installed through `exception_handlers()`):
 - `Problem`: its own document;
+- `jobhunter.errors.Refusal`, what domain code raises instead of a `Problem` (M4 Task 1, R6): the document of
+  `problem_of(refusal)`, the `Problem` with its status, code, title, detail, fields (as `FieldError`s, in
+  order) and extra members, so a refusal answers byte for byte what the `Problem` it replaces did;
 - `RequestValidationError`: 422 `validation_failed`, one `FieldError` per pydantic error (`field` is the `loc`
   joined with "."; `code` is the pydantic error type; `message` is pydantic's `msg`). The `msg` can echo the
   sender's own input (a validator's `ValueError` text, a parse error's offending character): it goes back to
@@ -18,13 +21,19 @@ The handlers (installed through `exception_handlers()`):
 This module is a task boundary (ruff `BLE001` is allowed here). No exception message or traceback reaches a
 log line or an alert, and none reaches a response body except the 422 validation messages above: they can
 carry SQL, input or secrets.
+
+`domain_problem(exc)` is the one mapping of the other domain errors a route meets, which the route raises
+`from None` in place of its own mapping (M4 Task 1, R6): a `LookupError` that is not a `KeyError` → 404
+`not_found`; `FencedOut` → 409 `conflict_state` with `detail = "purge_in_progress"`; `InvariantViolation` and
+`TransitionConflict` → 409 `conflict_state`; anything else `None`. Their messages, which name tables and ids,
+stay out of the body. There is no global `LookupError` handler: it would turn a `KeyError` bug into a 404.
 """
 
 import asyncio
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
@@ -33,34 +42,18 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
+from jobhunter.errors import ErrorCode, FencedOut, InvariantViolation, Refusal, TransitionConflict
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
 
-ProblemCode = Literal[
-    "unauthenticated",
-    "csrf_failed",
-    "throttled",
-    "invalid_cursor",
-    "stale_base_version",
-    "validation_failed",
-    "budget_exhausted",
-    "filtered_requires_force",
-    "run_active",
-    "not_found",
-    "conflict_state",
-    "upload_rejected",
-    "idempotency_key_required",
-    "idempotency_key_reused",
-    "idempotency_in_progress",
-    "eval_gate_failed",
-    "profile_purge_in_progress",
-    "internal",
-]
+ProblemCode = ErrorCode  # the codes of §14.4, which live in `jobhunter.errors`: a `Refusal` carries one too
 
 PROBLEM_TYPE_BASE: Final = "https://jobhunter.local/problems/"
 PROBLEM_MEDIA_TYPE: Final = "application/problem+json"
 UNHANDLED_ALERT_CODE: Final = "api.unhandled_exception"
+# The `detail` of a fenced-out owner's 409 (`domain_problem`).
+PURGE_IN_PROGRESS: Final = "purge_in_progress"
 # How long the last-resort handler waits for the alert write; a database that does not answer is no reason to
 # hold the 500 back for longer.
 ALERT_PERSIST_TIMEOUT_S: Final = 5.0
@@ -146,6 +139,26 @@ def internal_problem() -> Problem:
     return Problem(500, "internal", "Internal server error")
 
 
+def problem_of(refusal: Refusal) -> Problem:
+    """The problem of a domain refusal: its status, code, title, detail, fields and extra members."""
+    fields = refusal.fields
+    errors = None if fields is None else [FieldError(f.field, f.code, f.message) for f in fields]
+    return Problem(
+        refusal.status, refusal.code, refusal.title, detail=refusal.detail, errors=errors, extra=refusal.extra
+    )
+
+
+def domain_problem(exc: BaseException) -> Problem | None:
+    """The problem of a domain error a route meets, or `None` for any other (module docstring)."""
+    if isinstance(exc, LookupError) and not isinstance(exc, KeyError):
+        return Problem(404, "not_found", "Not found")
+    if isinstance(exc, FencedOut):
+        return Problem(409, "conflict_state", "A purge is in progress", detail=PURGE_IN_PROGRESS)
+    if isinstance(exc, InvariantViolation | TransitionConflict):
+        return Problem(409, "conflict_state", "The current state does not allow this")
+    return None
+
+
 def request_instance(scope: Scope) -> str:
     """The `instance` of a problem: the request path, without the query string."""
     return str(scope.get("path", ""))
@@ -191,6 +204,10 @@ async def persist_unhandled_alert(engine: AsyncEngine | None, exc: BaseException
 
 async def _on_problem(request: Request, exc: Problem) -> Response:
     return _respond(request, exc)
+
+
+async def _on_refusal(request: Request, exc: Refusal) -> Response:
+    return _respond(request, problem_of(exc))
 
 
 async def _on_validation_error(request: Request, exc: RequestValidationError) -> Response:
@@ -256,6 +273,7 @@ def exception_handlers() -> ExceptionHandlers:
     """The handlers for `FastAPI(exception_handlers=...)`; they replace FastAPI's defaults."""
     return {
         Problem: _on_problem,
+        Refusal: _on_refusal,
         RequestValidationError: _on_validation_error,
         StarletteHTTPException: _on_http_exception,
         Exception: _on_unhandled,
