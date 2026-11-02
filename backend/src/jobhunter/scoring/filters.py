@@ -40,11 +40,12 @@ instance. `read_det_facts` reads a job's committed `DetFacts` without a lock (th
 provisional aggregation, M3 Task 9), `read_det_facts_of` those of several jobs in one statement.
 
 **Live** (M3 Task 15, Codex r5 B3; §9.7 L3716, §13.4 L4905). `lock_active_scopes` reads, under `active_config
-FOR SHARE` (the first lock), the active and the pending scope and the active tuple (`ActiveScopes`;
-`active_scopes` is its `scopes`); `active_scope` reads the active scope alone under the same lock (the score
-`validate` node's and a batch item's, Ruling T17-c). `refilter_job_live(conn, job_id, active=…)` is the
-det-facts change hook of the live writers that hold that lock before the job row (the identity hook of the
-harvest, `merge`/`unmerge`, the groups' confirmation): `refilter_job` for both scopes, then a current
+FOR SHARE` (the first lock), the active and the pending scope and the active tuple (`ActiveScopes`, whose
+`scopes` is the mapping `refilter_job` takes); `active_scope` reads the active scope alone under the same
+lock (the score `validate` node's and a batch item's, Ruling T17-c). `refilter_job_live(conn, job_id,
+active=…)` is the det-facts change hook of the live writers that hold that lock before the job row (the
+identity hook of the harvest, `merge`/`unmerge`, the groups' confirmation): `refilter_job` for both scopes,
+then a current
 `det_results` instance of each published active-tuple result of the job's revisions for both scopes (none when
 the inputs' hash is unchanged), then the job's unpublished active-tuple targets `filtered_out ⇄ pending` by
 the active scope, `override = 'none'` (`targets.refilter_targets_of_jobs`). It returns what it wrote
@@ -502,24 +503,14 @@ async def active_scope(conn: AsyncConnection) -> tuple[int, ScopeSettings]:
     return int(scope_version_id), scope_from_payload(get_object(payload, ""))
 
 
-async def active_scopes(conn: AsyncConnection) -> dict[int, ScopeSettings]:
-    """The active scope and the pending one when set, by scope version id, from `scope_versions.payload`
-    (`lock_active_scopes`' `scopes`).
-
-    Takes `active_config` `FOR SHARE`: the rows of these scopes are written under that lock until the
-    transaction ends, so no scope flip commits between the facts read and the results written.
-    """
-    return dict((await lock_active_scopes(conn)).scopes)
-
-
 async def refilter_job(
     conn: AsyncConnection, job_id: int, scopes: Mapping[int, ScopeSettings]
 ) -> dict[int, HardFilterResult]:
     """Compute and write the results of the job for every scope of `scopes` (by scope version id).
 
     The job row is taken `FOR SHARE`, so the facts are the committed ones and `inputs_hash` is their hash.
-    The caller holds `active_config` `FOR SHARE` (`active_scopes`). Raises `LookupError` for a job that does
-    not exist.
+    The caller holds `active_config` `FOR SHARE` (`lock_active_scopes`). Raises `LookupError` for a job that
+    does not exist.
     """
     loaded = await _load(conn, job_id)
     description = _Description(loaded.description_text)  # normalised at most once, whatever the scopes
@@ -621,8 +612,8 @@ async def recompute_stale_ids(
     targets of exactly these jobs without a second stale query. It never says whether a `passed` changed:
     the scope apply's precompute (its pending scope alone) needs no ranking bump.
 
-    In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `active_scopes`, except the
-    scope apply's precompute, which runs outside any `active_config` lock, §13.4 step 2): the batch's job
+    In the lock order of §3.3.3 (the caller took `active_config` `FOR SHARE`, `lock_active_scopes`, except
+    the scope apply's precompute, which runs outside any `active_config` lock, §13.4 step 2): the batch's job
     rows `FOR SHARE` in one statement, then `await guard(conn)`, which proves the caller still owns the work
     (the owner row of the run or operation, or the worker epoch) and raises `FencedOut`, having written
     nothing, when it does not; then the results are written (`refilter_job`: no target moves, no instance).

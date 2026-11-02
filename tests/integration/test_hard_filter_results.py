@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from collections.abc import Mapping
 from datetime import timedelta
 from functools import partial
 from typing import Any
@@ -203,12 +204,12 @@ async def test_the_database_refuses_a_result_whose_passed_and_reasons_disagree(
             await filters.write_result(conn, job, scope_id, bad, inputs_hash=H2)
 
 
-async def test_active_scopes_reads_the_active_and_the_pending_scope_under_share(
+async def test_lock_active_scopes_reads_the_active_and_the_pending_scope_under_share(
     engine, current_epoch
 ) -> None:
     active = await active_scope_id(engine)
     async with engine.begin() as conn:
-        scopes = await filters.active_scopes(conn)
+        scopes = (await filters.lock_active_scopes(conn)).scopes
     assert list(scopes) == [active]
     seeded = scopes[active]
     assert isinstance(seeded, ScopeSettings) and seeded.max_ad_age_days is None  # a `scope_versions` payload
@@ -216,7 +217,7 @@ async def test_active_scopes_reads_the_active_and_the_pending_scope_under_share(
 
     pending = await add_pending_scope(engine, excluded_keywords=["python"], remote_within_germany=False)
     async with engine.begin() as conn:
-        scopes = await filters.active_scopes(conn)
+        scopes = (await filters.lock_active_scopes(conn)).scopes
         assert sorted(scopes) == sorted([active, pending])
         assert scopes[pending].excluded_keywords == ("python",) and not scopes[pending].remote_within_germany
         # `active_config` is held `FOR SHARE` until the transaction ends: a writer cannot take it meanwhile.
@@ -230,7 +231,7 @@ async def test_active_scopes_reads_the_active_and_the_pending_scope_under_share(
             )  # a reader can
 
 
-async def test_active_scopes_queued_behind_a_settings_save_reads_the_pending_scope_it_sets(
+async def test_lock_active_scopes_queued_behind_a_settings_save_reads_the_pending_scope_it_sets(
     engine, logged_in_client, current_epoch, job_factory
 ) -> None:
     """Task 22 fix round 2: the statement waits at `active_config` while a save is open. Joined to the lock,
@@ -246,9 +247,9 @@ async def test_active_scopes_queued_behind_a_settings_save_reads_the_pending_sco
     async def allow(conn: AsyncConnection) -> None:
         return None
 
-    async def recompute() -> dict[int, ScopeSettings]:
+    async def recompute() -> Mapping[int, ScopeSettings]:
         async with engine.begin() as conn:
-            scopes = await filters.active_scopes(conn)
+            scopes = (await filters.lock_active_scopes(conn)).scopes
             await filters.recompute_stale(conn, scopes, guard=allow)
             return scopes
 
@@ -375,7 +376,7 @@ async def test_refilter_job_writes_a_row_per_scope_with_the_stored_hash(
     active = await active_scope_id(engine)
     pending = await add_pending_scope(engine, excluded_keywords=["python"])
     async with engine.begin() as conn:
-        scopes = await filters.active_scopes(conn)
+        scopes = (await filters.lock_active_scopes(conn)).scopes
         results = await filters.refilter_job(conn, job, scopes)
     assert results == {
         active: HardFilterResult(True, ()),
@@ -581,13 +582,16 @@ async def test_the_batch_is_locked_before_the_guard_and_a_refused_guard_writes_n
         raise FencedOut("run")
 
     async with engine.begin() as conn:
-        assert await filters.recompute_stale(conn, await filters.active_scopes(conn), guard=probe) == 1
+        assert (
+            await filters.recompute_stale(conn, (await filters.lock_active_scopes(conn)).scopes, guard=probe)
+            == 1
+        )
     assert held == [LOCK_NOT_AVAILABLE]
     async with engine.begin() as conn:
         await conn.execute(sa.text("DELETE FROM hard_filter_results"))
     with pytest.raises(FencedOut):
         async with engine.begin() as conn:
-            await filters.recompute_stale(conn, await filters.active_scopes(conn), guard=refuse)
+            await filters.recompute_stale(conn, (await filters.lock_active_scopes(conn)).scopes, guard=refuse)
     assert await row(engine, job, active) is None
 
 
@@ -601,7 +605,9 @@ async def test_a_job_deleted_or_merged_between_the_scan_and_the_lock_is_skipped(
 
     async def recompute() -> int:
         async with engine.begin() as conn:
-            return await filters.recompute_stale(conn, await filters.active_scopes(conn), guard=allow)
+            return await filters.recompute_stale(
+                conn, (await filters.lock_active_scopes(conn)).scopes, guard=allow
+            )
 
     async with engine.connect() as other:
         if change == "deleted":
