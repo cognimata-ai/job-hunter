@@ -25,7 +25,8 @@ from typing import Final, Literal
 
 from jobhunter.normalize.text import fold
 
-_EARTH_RADIUS_KM: Final = 6371.0088
+# The sphere of `distance_km` (and of migration 0009's `geo_km`, which writes the same number as a literal)
+EARTH_RADIUS_KM: Final = 6371.0088
 # A degree of latitude is at least this long, so `km / _MIN_KM_PER_DEGREE` degrees never miss a point.
 _MIN_KM_PER_DEGREE: Final = 110.5
 _LIST_SEPARATOR: Final = "|"
@@ -37,7 +38,7 @@ def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     d_phi = phi2 - phi1
     d_lambda = math.radians(lon2 - lon1)
     a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    return 2 * _EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(a)))
+    return 2 * EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(a)))
 
 
 @dataclass(frozen=True)

@@ -256,8 +256,10 @@ async def list_jobs(
             selection = await select_page(
                 conn, query, window=(posted_after, posted_before), after=after, limit=limit, with_counts=True
             )
-        except ValueError:  # a position that no page of this sort ends at
-            raise invalid_cursor() from None
+        except ValueError:
+            if after is None:  # no cursor: a bug, which the last-resort handler answers 500 and alerts on
+                raise
+            raise invalid_cursor() from None  # a position that no page of this sort ends at
         items = await build_cards(conn, selection.rows, now=now)
     next_cursor = None
     if selection.next is not None:

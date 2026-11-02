@@ -9,8 +9,10 @@ offering the values it can add, with the number of cards each would bring in.
 
 - `companies`: one entry per `company_key`, its `display_name` the cards' most frequent `company_display`
   (then the first in order), the number of cards, by that number descending, then by name and key; with a
-  `company_q`, only the companies whose folded display name (`lower(immutable_unaccent(…))`, the database's
-  `normalize.text.fold`) or key starts with `fold(company_q)`. An empty `company_q` filters nothing.
+  `company_q`, only the companies whose key, or the folded display name (`lower(immutable_unaccent(…))`, the
+  database's `normalize.text.fold`) of any of whose cards, starts with `fold(company_q)`. The prefix picks
+  companies, not cards: a company it matches is counted, and named, over all its listed cards (Ruling
+  T5-e). An empty `company_q` filters nothing.
 - `sources`: one entry per source id of the cards' `source_ids`, with the number of cards that have it, by
   that number descending, then by id.
 
@@ -34,13 +36,13 @@ _COMPANIES_HEAD: Final = (
     "mode() WITHIN GROUP (ORDER BY c.company_display) AS display_name, count(*) AS n "
     "FROM (SELECT j.company_key, j.company_display"
 )
+_COMPANIES_GROUP: Final = ") c GROUP BY c.company_key"
+# A company matches a prefix by its key or by any of its cards' spellings, and is then counted whole
 _COMPANY_PREFIX: Final = (
-    " AND (starts_with(lower(immutable_unaccent(j.company_display)), :prefix) "
-    "OR starts_with(j.company_key, :prefix))"
+    " HAVING starts_with(c.company_key, :prefix) "
+    "OR bool_or(starts_with(lower(immutable_unaccent(c.company_display)), :prefix))"
 )
-_COMPANIES_TAIL: Final = (
-    ") c GROUP BY c.company_key ORDER BY n DESC, display_name, c.company_key LIMIT :limit"
-)
+_COMPANIES_ORDER: Final = " ORDER BY n DESC, display_name, c.company_key LIMIT :limit"
 _SOURCES_HEAD: Final = "/* jobs_facets.sources */ SELECT s.source_id, count(*) AS n FROM (SELECT j.source_ids"
 _SOURCES_TAIL: Final = (
     ") c CROSS JOIN LATERAL unnest(c.source_ids) AS s(source_id) "
@@ -82,7 +84,8 @@ async def facets(
     by_company = card_set(q.model_copy(update={"company": frozenset()}), window=window, active=active)
     by_source = card_set(q.model_copy(update={"source": frozenset()}), window=window, active=active)
     prefix = fold(company_q)
-    company_sql = _COMPANIES_HEAD + by_company.sql + (_COMPANY_PREFIX if prefix else "") + _COMPANIES_TAIL
+    having = _COMPANY_PREFIX if prefix else ""
+    company_sql = _COMPANIES_HEAD + by_company.sql + _COMPANIES_GROUP + having + _COMPANIES_ORDER
     companies = await conn.execute(
         _sql.clause(company_sql), {**by_company.binds, "prefix": prefix, "limit": limit}
     )

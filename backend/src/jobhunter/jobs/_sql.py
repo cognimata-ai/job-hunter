@@ -25,7 +25,10 @@ from sqlalchemy.sql.elements import TextClause
 from jobhunter.db.sql import q as sql
 from jobhunter.jobs.query import ScoringBucket, UserStatus
 
-ACTIVE: Final = sql("SELECT llm_tuple_id, scope_version_id FROM active_config WHERE id = 1")
+ACTIVE: Final = sql(
+    "SELECT a.llm_tuple_id, a.scope_version_id, s.payload AS scope FROM active_config a "
+    "JOIN scope_versions s ON s.id = a.scope_version_id WHERE a.id = 1"
+)
 DISPLAY_TIMEZONE: Final = sql(
     "SELECT v.payload #>> '{display,timezone}' FROM active_config a "
     "JOIN settings_versions v ON v.id = a.settings_version_id WHERE a.id = 1"
@@ -214,15 +217,19 @@ TITLE_JOBS: Final = "SELECT kt.id FROM jobs kt WHERE :qf <% kt.title_norm"
 # - NEAR_INSIDE: a candidate of a resolved entry lies in the box `lo_in..hi_in` by `west..east`, every point
 #   of which lies within the radius on `geo_km`'s sphere (a subset of the function's matches): a match, with
 #   no call. Gazetteer candidates sit on place centroids, so most matches are decided here;
-# - NEAR_BAND: else the function runs only when some candidate lies in the latitude band it checks first,
-#   |Δlat| <= radius / 110.5, widened by `NEAR_BAND_WIDENING` degrees (0.1 m) so that the bounds' conversion
-#   to jsonb numbers never narrows it (a superset of its matches).
-# Both compare the candidates' coordinates as the JSON numbers `sources.parsing.locations.Location` stores.
+# - NEAR_BAND: else the function runs only when some candidate passes the bounds it checks first, |Δlat| <=
+#   radius / 110.5 and, where it applies one, its |Δlon| bound, each widened by `NEAR_BAND_WIDENING` degrees
+#   (0.1 m) so that the bounds' conversion to jsonb numbers never narrows them (a superset of its matches;
+#   `listing._near_box`).
+# Both compare the candidates' coordinates as the JSON numbers `sources.parsing.locations.Location` stores,
+# their longitudes in [-180, 180].
 NEAR_INSIDE: Final = (
     '\'$[*] ? (@.resolution == "unique" || @.resolution == "ambiguous").candidates[*] '
     "? (@.lat >= $lo_in && @.lat <= $hi_in && @.lon >= $west && @.lon <= $east)'"
 )
-NEAR_BAND: Final = "'$[*].candidates[*] ? (@.lat >= $lo && @.lat <= $hi)'"
+NEAR_BAND: Final = (
+    "'$[*].candidates[*] ? (@.lat >= $lo && @.lat <= $hi && @.lon >= $lo_lon && @.lon <= $hi_lon)'"
+)
 NEAR_BAND_WIDENING: Final = 1e-6
 JSONB_BINDS: Final = ("near_box",)
 # B4: the word similarity `<%` requires, pg_trgm's `word_similarity_threshold`. The list sets nothing: it runs

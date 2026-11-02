@@ -16,8 +16,9 @@ which it activates when there is none: `scored_share` of the cards published wit
 instance; of the others that represent no group every tenth (the first, the eleventh, …) without a target
 of the tuple, and the rest pending, some targets without a similarity; `groups` active duplicate
 groups (each a card and one deferred member job, which is no card), and revisions whose description text is
-in each language of `langs` in turn. It analyses nothing: a caller that needs planner statistics runs
-`ANALYZE` as the owner on a server of its own.
+in each language of `langs` in turn. Its places are four cities in turn, the Berlin ones spread over the
+centre, the 30 km ring and the latitude strip beyond it (`_bulk_place`). It analyses nothing: a caller that
+needs planner statistics runs `ANALYZE` as the owner on a server of its own.
 
 `activate_tuple` makes a new confirmed profile's tuple the active one; the `active_tuple` fixture does it for
 a test on the shared database (whose reset restores no tuple). `activate_scope(engine, **changes)` makes a
@@ -27,6 +28,7 @@ copy of the active scope with `changes` the active scope (the reset restores the
 """
 
 import hashlib
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -37,6 +39,7 @@ import pytest
 from jobhunter.clock import utcnow
 from jobhunter.db.seed import canonical_json
 from jobhunter.db.sql import q
+from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.normalize.titles import normalize_title
 from jobhunter.types import JSONValue
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -706,6 +709,34 @@ async def _ids(c: AsyncConnection, table: str, k: int) -> list[int]:
     return [int(i) for i in (await c.execute(_IDS, {"table": table, "k": k})).scalars()]
 
 
+def offset(point: tuple[float, float], km: float, bearing_deg: float) -> tuple[float, float]:
+    """The point `km` from `point` at `bearing_deg` (degrees from north) on the haversine sphere."""
+    lat, lon, delta = math.radians(point[0]), math.radians(point[1]), km / EARTH_RADIUS_KM
+    bearing = math.radians(bearing_deg)
+    to_lat = math.asin(math.sin(lat) * math.cos(delta) + math.cos(lat) * math.sin(delta) * math.cos(bearing))
+    to_lon = lon + math.atan2(
+        math.sin(bearing) * math.sin(delta) * math.cos(lat),
+        math.cos(delta) - math.sin(lat) * math.sin(to_lat),
+    )
+    return math.degrees(to_lat), math.degrees(to_lon)
+
+
+def _bulk_place(i: int) -> tuple[float, float]:
+    """Card number `i`'s place: a city of `_CITIES` in turn; of the Berlin cards a third on the centre, a
+    third in the ring 16 to 28 km out (beyond the location filter's inner box, within 30 km), a third in the
+    latitude strip of a 30 km circle but 35 to 80 km east or west (beyond its longitude bound)."""
+    city = _CITIES[i % len(_CITIES)]
+    if city != BERLIN:
+        return city
+    match (i // len(_CITIES)) % 3:
+        case 0:
+            return BERLIN
+        case 1:
+            return offset(BERLIN, 16 + i % 13, (37 * i) % 360)
+        case _:
+            return offset(BERLIN, 35 + i % 46, 90 if i % 2 else 270)
+
+
 def _job_row(
     i: int, job_id: int, revision_id: int, now: datetime, langs: Sequence[str]
 ) -> dict[str, JSONValue]:
@@ -724,7 +755,7 @@ def _job_row(
         "title": title.title,
         "title_norm": title.title_norm,
         "seniority_tokens": _texts(sorted(title.seniority_tokens)),
-        "locations": [] if remote else [place(_CITIES[i % len(_CITIES)])],
+        "locations": [] if remote else [place(_bulk_place(i))],
         "location_kind": "remote" if remote else "city",
         "work_mode_possible": _texts(modes),
         "work_mode_source": ("structured", "text", "none")[i % 3],

@@ -3,11 +3,11 @@ B17, B21-B24, B27).
 
 `build_cards(conn, rows, *, now)` renders the rows of a list page (`listing.SelectedRow`, in their order) as
 `JobCardOut`s in the caller's read snapshot, with **one statement per kind of data for the whole page**, never
-one per card: the active configuration, the cards, the members of the page's group cards, the knockout texts
-of its results, the previous scores of its cards being re-scored, the descriptions its keyword chips are
-found in, and its outbound links (`jobs.links`). A kind that no card of the page needs is not read, so a
-page runs at most seven statements, however many cards it holds. `now` is the request's time (the route's
-clock); no card field depends on it.
+one per card: the active configuration (`listing.read_active`), the cards, the members of the page's group
+cards, the knockout texts of its results, the previous scores of its cards being re-scored, the descriptions
+its keyword chips are found in, and its outbound links (`jobs.links`). A kind that no card of the page needs
+is not read, so a page runs at most seven statements, however many cards it holds. `now` is the request's
+time (the route's clock); no card field depends on it.
 
 A card is a row of the list: an unmerged job with a current revision (a group card is its representative's
 row, `listing`). Its score row is the listing's (`jobs._sql.CARD_FROM`): `t` the active-tuple target of its
@@ -36,12 +36,14 @@ its hard-filter result under that scope, `u` the user's actions.
   `unmet` one that does not bind is unconfirmed), `requirement` the ad's requirement, read from `r.job_facts`
   at the fact id's place (`scoring.facts.binding_facts`), and `profile_value` the profile's side, read from
   the candidate's `inputs` in `r.knockout_candidates` (`scoring.knockouts`); `profile_value` is `None` once
-  the result's profile version is purged. `requirement` is, by code: `mandatory_language` the language (its
-  ISO code, or the ad's name for `other`) and its level (none when `unspecified`), as in `de C1`; `degree`
-  the level and, in parentheses, the field; `certification` the name; `security_clearance` the level;
-  `contract_type` the job's structured employment types; `None` for the rest. `profile_value` is the
-  profile's level for `mandatory_language` and `degree`, its `work_authorization_de` for `work_permit`, else
-  `None`.
+  the result's profile version is purged. Each stored record (a knockout record, a candidate, a field of
+  the job facts or an item of one of its lists) is read on its own: one that cannot be read is left out,
+  and a warning names the result and how many were, never their content (`job_card_records_skipped`).
+  `requirement` is, by code: `mandatory_language` the language (its ISO code, or the ad's name for `other`)
+  and its level (none when `unspecified`), as in `de C1`; `degree` the level and, in parentheses, the field;
+  `certification` the name; `security_clearance` the level; `contract_type` the job's structured employment
+  types; `None` for the rest. `profile_value` is the profile's level for `mandatory_language` and `degree`,
+  its `work_authorization_de` for `work_permit`, else `None`.
 - **`filter_reasons`**: `h.reasons` (§11.1 codes; empty without a row). **`filter_keyword`** (B24): with
   `excluded_keyword` among them, the first of the active scope's excluded keywords found in the title, else
   in the current revision's description when the scope matches descriptions
@@ -74,13 +76,16 @@ from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.jobs import _sql
 from jobhunter.jobs.links import OutboundLinks, outbound_links
-from jobhunter.jobs.listing import SelectedRow
+from jobhunter.jobs.listing import Active, SelectedRow, read_active
 from jobhunter.jobs.query import ScoringBucket
 from jobhunter.llm.schemas.generator import JobFacts
+from jobhunter.observability.logging import get_logger
 from jobhunter.run_settings import ScopeSettings, scope_from_payload
 from jobhunter.scoring.facts import binding_facts, fact_id
 from jobhunter.scoring.filters import first_excluded_keyword
 from jobhunter.types import JSONValue
+
+log = get_logger("jobhunter.jobs.cards")
 
 Badge = Literal[
     "contested",
@@ -211,10 +216,6 @@ class JobCardOut(BaseModel):
 
 # --- the statements ---------------------------------------------------------------------------------------
 
-_ACTIVE: Final = q(
-    "/* jobs_cards.active */ SELECT a.llm_tuple_id, a.scope_version_id, s.payload AS scope "
-    "FROM active_config a JOIN scope_versions s ON s.id = a.scope_version_id WHERE a.id = 1"
-)
 # The scoring bucket of a card's score row: the listing's exclusive buckets (B8), each its own WHEN
 _BUCKET: Final = (
     "CASE " + " ".join(f"WHEN {_sql.BUCKET_SQL[b]} THEN '{b}'" for b in _sql.BUCKET_ORDER) + " END"
@@ -293,14 +294,26 @@ class _Candidate(BaseModel):
     inputs: dict[str, JSONValue]
 
 
-def _records(value: object) -> list[_Record]:
-    """The knockout records of an instance; none when the document is not a list of records."""
+def _skipped(result_id: int, kind: str, count: int) -> None:
+    """A content-free warning that `count` stored records of a result could not be read (never their text)."""
+    if count:
+        log.warning("job_card_records_skipped", result_id=result_id, kind=kind, skipped=count)
+
+
+def _records(value: object) -> tuple[list[_Record], int]:
+    """The knockout records of an instance, each read on its own, and how many could not be (a document that
+    is no list counts once; an empty one, as some writers leave it, is no record)."""
+    if value in (None, {}, []):
+        return [], 0
     if not isinstance(value, list):
-        return []
-    try:
-        return [_Record.model_validate(item) for item in value]
-    except ValidationError:
-        return []
+        return [], 1
+    records: list[_Record] = []
+    for item in value:
+        try:
+            records.append(_Record.model_validate(item))
+        except ValidationError:
+            continue
+    return records, len(value) - len(records)
 
 
 @dataclass(frozen=True)
@@ -318,13 +331,67 @@ def _text(*parts: object) -> str | None:
     return " ".join(words) or None
 
 
-def _requirements(document: object) -> dict[str, str | None]:
-    """The requirement text of each fact id of a result's `job_facts` (module docstring); none when the
-    document is not a `JobFacts`."""
+# A `JobFacts` that asserts nothing: what a field of a stored document that cannot be read stands for
+_NOTHING_ASSERTED: Final[dict[str, JSONValue]] = {
+    "work_mode": {"value": "unspecified", "evidence": []},
+    "onsite_only": {"asserted": False, "evidence": []},
+    "remote_region": {"value": "unspecified", "countries": [], "evidence": []},
+    "required_languages": [],
+    "must_haves": [],
+    "nice_to_haves": [],
+    "seniority": {"value": "unspecified", "evidence": []},
+    "min_years_experience": {"value": None, "evidence": []},
+    "industry": {"value": None, "evidence": []},
+    "employment_types": {"values": [], "evidence": []},
+    "degree": {
+        "level": "unspecified",
+        "mandatory": False,
+        "or_equivalent": False,
+        "field": None,
+        "evidence": [],
+    },
+    "certifications": [],
+    "security_clearance": {"required": False, "level": None, "evidence": []},
+    "work_permit": {"required": False, "evidence": []},
+}
+_NEUTRAL_FACTS: Final = JobFacts.model_validate(_NOTHING_ASSERTED)  # fails at import if the model changed
+_LIST_FACTS: Final = frozenset({"required_languages", "must_haves", "nice_to_haves", "certifications"})
+
+
+def _valid_facts(fields: Mapping[str, object]) -> bool:
     try:
-        facts = JobFacts.model_validate(document)
+        JobFacts.model_validate({**_NOTHING_ASSERTED, **fields})
     except ValidationError:
-        return {}
+        return False
+    return True
+
+
+def _job_facts(document: object) -> tuple[JobFacts, int]:
+    """A result's `job_facts` as a `JobFacts`, each field (and each item of a list field) read on its own: a
+    field that is absent or cannot be read asserts nothing, an item that cannot be read is left out; and how
+    many present ones could not be read (a key that is no field among them)."""
+    if not isinstance(document, dict):
+        return _NEUTRAL_FACTS, 1
+    if _valid_facts(document):
+        return JobFacts.model_validate({**_NOTHING_ASSERTED, **document}), 0
+    kept: dict[str, object] = {}
+    skipped = 0
+    for name, value in document.items():
+        if name not in JobFacts.model_fields:
+            skipped += 1
+        elif name in _LIST_FACTS and isinstance(value, list):
+            items = [item for item in value if _valid_facts({name: [item]})]
+            skipped += len(value) - len(items)
+            kept[name] = items
+        elif _valid_facts({name: value}):
+            kept[name] = value
+        else:
+            skipped += 1
+    return JobFacts.model_validate({**_NOTHING_ASSERTED, **kept}), skipped
+
+
+def _requirements(facts: JobFacts) -> dict[str, str | None]:
+    """The requirement text of each fact id of a result's job facts (module docstring)."""
     found: dict[str, str | None] = {}
     for fact in binding_facts(facts):
         key = fact_id(fact.code, fact.subject)
@@ -350,15 +417,28 @@ def _requirements(document: object) -> dict[str, str | None]:
 
 
 def _texts(row: Any) -> _Texts:
+    """The knockout texts of a result's row, each stored record read on its own (the unreadable ones are
+    left out with a content-free warning)."""
+    result_id = int(row.result_id)
+    stored = row.knockout_candidates if isinstance(row.knockout_candidates, list) else []
+    readable = _readable(stored)
+    _skipped(result_id, "knockout_candidates", len(stored) - len(readable))
     candidates: dict[str, Mapping[str, JSONValue]] = {}
-    if isinstance(row.knockout_candidates, list):
-        for item in row.knockout_candidates:
-            try:
-                candidate = _Candidate.model_validate(item)
-            except ValidationError:
-                continue
-            candidates.setdefault(candidate.fact_id, candidate.inputs)
-    return _Texts(_requirements(row.job_facts), candidates, bool(row.purged))
+    for candidate in readable:
+        candidates.setdefault(candidate.fact_id, candidate.inputs)
+    facts, skipped = _job_facts(row.job_facts)
+    _skipped(result_id, "job_facts", skipped)
+    return _Texts(_requirements(facts), candidates, bool(row.purged))
+
+
+def _readable(stored: Sequence[object]) -> list[_Candidate]:
+    readable: list[_Candidate] = []
+    for item in stored:
+        try:
+            readable.append(_Candidate.model_validate(item))
+        except ValidationError:
+            continue
+    return readable
 
 
 def _input_text(inputs: Mapping[str, JSONValue], name: str) -> str | None:
@@ -391,13 +471,6 @@ def _knockout(record: _Record, texts: _Texts | None) -> KnockoutOut:
 
 
 # --- the page ---------------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Active:
-    llm_tuple_id: int | None
-    scope_version_id: int
-    scope: Mapping[str, JSONValue]
 
 
 def _ids(values: Sequence[int]) -> list[int]:
@@ -470,7 +543,7 @@ class _Member:
     deferred: bool
 
 
-async def _members(conn: AsyncConnection, groups: Sequence[int], active: _Active) -> dict[int, list[_Member]]:
+async def _members(conn: AsyncConnection, groups: Sequence[int], active: Active) -> dict[int, list[_Member]]:
     found: dict[int, list[_Member]] = {}
     if not groups:
         return found
@@ -495,7 +568,7 @@ async def _knockout_texts(conn: AsyncConnection, results: Sequence[int]) -> dict
     return {int(row.result_id): _texts(row) for row in rows}
 
 
-async def _previous(conn: AsyncConnection, jobs: Sequence[int], active: _Active) -> dict[int, PreviousOut]:
+async def _previous(conn: AsyncConnection, jobs: Sequence[int], active: Active) -> dict[int, PreviousOut]:
     if not jobs:
         return {}
     params = {"ids": _ids(jobs), "tuple": active.llm_tuple_id, "scope": active.scope_version_id}
@@ -505,7 +578,7 @@ async def _previous(conn: AsyncConnection, jobs: Sequence[int], active: _Active)
     }
 
 
-async def _keywords(conn: AsyncConnection, cards: Sequence[Any], active: _Active) -> dict[int, str]:
+async def _keywords(conn: AsyncConnection, cards: Sequence[Any], active: Active) -> dict[int, str]:
     """B24: the excluded keyword of each card filtered by one (module docstring)."""
     filtered = [row for row in cards if _KEYWORD_REASON in (row.reasons or ())]
     if not filtered:
@@ -532,12 +605,7 @@ async def build_cards(
     (the rows come from a page selected in the same snapshot, so it never does)."""
     if not rows:
         return []
-    config = (await conn.execute(_ACTIVE)).one()
-    active = _Active(
-        None if config.llm_tuple_id is None else int(config.llm_tuple_id),
-        int(config.scope_version_id),
-        config.scope,
-    )
+    active = await read_active(conn)
     params = {"ids": _ids([row.job_id for row in rows]), "tuple": active.llm_tuple_id}
     cards = {
         int(row.job_id): row
@@ -546,23 +614,32 @@ async def build_cards(
     if missing := [row.job_id for row in rows if row.job_id not in cards]:
         raise LookupError(f"no card for the jobs {missing}")
     listed = list(cards.values())
+    records: dict[int, list[_Record]] = {}
+    for card in listed:
+        records[int(card.job_id)], skipped = _records(card.knockouts)
+        if card.result_id is not None:
+            _skipped(int(card.result_id), "knockouts", skipped)
     represented = [
         int(c.group_id) for c in listed if c.group_id is not None and c.representative_job_id == c.job_id
     ]
     members = await _members(conn, represented, active)
-    with_knockouts = [int(c.result_id) for c in listed if _records(c.knockouts)]
+    with_knockouts = [int(c.result_id) for c in listed if records[int(c.job_id)]]
     texts = await _knockout_texts(conn, with_knockouts)
     rescored = [int(c.job_id) for c in listed if c.state not in _PUBLISHED]
     previous = await _previous(conn, rescored, active)
     keywords = await _keywords(conn, listed, active)
     links = await outbound_links(conn, list(cards))
     return [
-        _card(cards[row.job_id], members, texts, previous, keywords, links.get(row.job_id)) for row in rows
+        _card(
+            cards[row.job_id], records[row.job_id], members, texts, previous, keywords, links.get(row.job_id)
+        )
+        for row in rows
     ]
 
 
 def _card(
     row: Any,
+    records: Sequence[_Record],
     members: Mapping[int, Sequence[_Member]],
     texts: Mapping[int, _Texts],
     previous: Mapping[int, PreviousOut],
@@ -616,7 +693,7 @@ def _card(
         target=_target(row),
         bucket=_bucket(row),
         badges=_badges(row, availability),
-        knockouts=[_knockout(record, found) for record in _records(row.knockouts)],
+        knockouts=[_knockout(record, found) for record in records],
         filter_reasons=list(row.reasons or ()),
         filter_keyword=keywords.get(job_id),
         previous=previous.get(job_id),

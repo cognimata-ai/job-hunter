@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.facts import facts, seeded_scope
 from tests.support.jobs_list import SEEN, Card, activate_scope, activate_tuple, add_posting, seed_cards
-from tests.support.m3 import Job, insert_target
+from tests.support.m3 import Job, insert_det_result, insert_published, insert_target
 from tests.support.scoring import job_facts, profile_with_language, required_language
 
 pytestmark = pytest.mark.integration
@@ -217,6 +217,68 @@ async def test_knockout_text_comes_from_job_facts_and_candidate_inputs(
     assert [(k.requirement, k.profile_value) for k in purged.knockouts] == [("de C1", None)]
 
 
+async def test_an_unreadable_stored_record_is_left_out_and_the_others_stay(
+    engine: AsyncEngine, active_tuple: int, log_events: Any
+) -> None:
+    """Each stored record is read on its own (Minor 2): a knockout record, a candidate, a job-facts field and
+    a job-facts list item that cannot be read are left out, the others keep their texts, and the warnings
+    name the result and how many were left out, never what they hold."""
+    (job_id,) = await seed_cards(engine, [scored(20, 25)])
+    certification = {"name": "Erfundenes Zertifikat Alpha", "mandatory": True, "evidence": ["Zertifikat"]}
+    facts_doc = job_facts(
+        required_languages=[required_language("de", level="C1")], certifications=[certification]
+    )
+    language, certified = derive_knockouts(
+        facts_doc, facts(), profile_with_language("de", "B2"), seeded_scope()
+    )
+    assert (language.code, certified.code) == ("mandatory_language", "certification")
+    stored_facts = facts_doc.model_dump(mode="json")
+    stored_facts["required_languages"].append({"language": "xx-unreadable"})  # an unreadable item
+    stored_facts["work_mode"] = "unreadable-work-mode"  # an unreadable field
+    records = [
+        {
+            "code": k.code,
+            "fact_id": k.fact_id,
+            "comparison": k.comparison,
+            "severity": k.severity,
+            "binding": False,
+        }
+        for k in (language, certified)
+    ]
+    result = await result_of(engine, job_id)
+    async with engine.begin() as c:
+        await c.execute(
+            q(
+                "UPDATE llm_results SET job_facts = :f, knockout_candidates = :k WHERE id = :r",
+                jsonb=["f", "k"],
+            ),
+            {
+                "f": stored_facts,
+                "k": [asdict(language), {"unreadable": True}, asdict(certified)],
+                "r": result,
+            },
+        )
+        await c.execute(
+            q("UPDATE det_results SET knockouts = :k WHERE llm_result_id = :r", jsonb=["k"]),
+            {"k": [records[0], {"code": 5, "unreadable": "x"}, records[1]], "r": result},
+        )
+    (card,) = await cards(engine, [job_id])
+    assert [(k.code, k.requirement, k.profile_value) for k in card.knockouts] == [
+        ("mandatory_language", "de C1", "B2"),
+        ("certification", "Erfundenes Zertifikat Alpha", None),
+    ]
+    skipped = {e["kind"]: e for e in log_events() if e.get("event") == "job_card_records_skipped"}
+    assert {kind: (e["result_id"], e["skipped"]) for kind, e in skipped.items()} == {
+        "knockouts": (result, 1),
+        "knockout_candidates": (result, 1),
+        "job_facts": (result, 2),
+    }
+    assert all(
+        set(e) <= {"event", "result_id", "kind", "skipped", "level", "ts", "logger"} for e in skipped.values()
+    )
+    assert "unreadable" not in repr(log_events())
+
+
 # --- the badges -------------------------------------------------------------------------------------------
 
 
@@ -337,6 +399,71 @@ async def test_previous_score_during_a_rescore_names_the_old_profile_version(
     assert other.previous is not None and other.previous.mid == Decimal("40.00")
     assert (other.target, other.bucket) == (None, "unscored")
     assert by_id[published].previous is None  # published under the active tuple: nothing is re-scored
+
+
+async def _version_no(engine: AsyncEngine, result_id: int) -> int:
+    async with engine.connect() as c:
+        row = await c.execute(
+            sa.text(
+                "SELECT p.version_no FROM llm_results r "
+                "JOIN profile_versions p ON p.id = r.profile_version_id WHERE r.id = :r"
+            ),
+            {"r": result_id},
+        )
+        return int(row.scalar_one())
+
+
+async def test_previous_is_the_newest_other_tuple_result_and_its_active_scope_instance(
+    engine: AsyncEngine, active_tuple: int
+) -> None:
+    """B17's two choices: of the results of other tuples, the newest by `published_at` (not the highest id);
+    of its current instances, the one under the active scope, even when another scope's was computed later,
+    and that other one only once the active scope's is gone."""
+    (job_id,) = await seed_cards(engine, [scored(60, 80)])
+    first = await result_of(engine, job_id)  # tuple A, its instance under the active scope: 70.00
+    async with engine.connect() as c:
+        active_scope = int(
+            (await c.execute(sa.text("SELECT scope_version_id FROM active_config"))).scalar_one()
+        )
+        revision = int(
+            (
+                await c.execute(sa.text("SELECT current_revision_id FROM jobs WHERE id = :j"), {"j": job_id})
+            ).scalar_one()
+        )
+    other_scope = await activate_scope(engine, remote_within_germany=False)
+    await execute(engine, "UPDATE active_config SET scope_version_id = :s", s=active_scope)
+    tuple_b = await activate_tuple(engine, n=2)
+    async with engine.begin() as c:
+        second = (await insert_published(c, Job(job_id, revision), tuple_b)).result_id
+        await insert_det_result(c, second, job_id, active_scope, low=Decimal(20), high=Decimal(40))  # 30.00
+    await activate_tuple(engine, n=3)  # the card is re-scored: no target of the active tuple
+
+    async def previous() -> tuple[str, int]:
+        (card,) = await cards(engine, [job_id])
+        assert card.previous is not None
+        return format(card.previous.mid, "f"), card.previous.profile_version_no
+
+    stamp = "UPDATE llm_results SET published_at = now() - CAST(:age AS interval) WHERE id = :r"
+    await execute(engine, stamp, age="1 hour", r=first)
+    await execute(engine, stamp, age="2 hours", r=second)
+    assert await previous() == ("70.00", await _version_no(engine, first))  # the older id, published last
+    await execute(engine, stamp, age="3 hours", r=first)
+    assert await previous() == ("30.00", await _version_no(engine, second))
+    async with engine.begin() as c:  # another scope's instance of `second`, computed later: not preferred
+        own = await insert_det_result(c, second, job_id, other_scope, low=Decimal(80), high=Decimal(100))
+        await c.execute(
+            sa.text("UPDATE det_results SET computed_at = now() + interval '1 hour' WHERE id = :d"),
+            {"d": own},
+        )
+    assert await previous() == ("30.00", await _version_no(engine, second))
+    await execute(
+        engine,
+        "UPDATE det_results SET is_current = false, superseded_at = now() "
+        "WHERE llm_result_id = :r AND scope_version_id = :s",
+        r=second,
+        s=active_scope,
+    )
+    assert await previous() == ("90.00", await _version_no(engine, second))  # else its own scope's
 
 
 # --- groups -----------------------------------------------------------------------------------------------
@@ -537,9 +664,11 @@ async def test_one_statement_per_data_kind(engine: AsyncEngine, active_tuple: in
         assert all(card.filter_keyword == "Praktikum" for card in built[3::5])
         assert all(card.links.open_ad == PUBLISHER_LINK for card in built[4::5])
         kinds = [s.split("*/", 1)[0].removeprefix(_TAG).strip() for s in statements if s.startswith(_TAG)]
-        assert len(kinds) == len(statements) - 1  # and the snapshot's SET TRANSACTION
+        # and two untagged: the snapshot's SET TRANSACTION and the active configuration (`read_active`)
+        assert len(kinds) == len(statements) - 2
+        assert any("FROM active_config a JOIN scope_versions" in s for s in statements)
         counts[n] = Counter(kinds)
     assert counts[5] == counts[50]
     assert counts[50] == Counter(
-        {kind: 1 for kind in ("active", "cards", "members", "knockouts", "previous", "descriptions", "links")}
+        {kind: 1 for kind in ("cards", "members", "knockouts", "previous", "descriptions", "links")}
     )

@@ -2,10 +2,12 @@
 
 50,000 cards seeded set-based (`bulk_seed_cards`: 30 % scored, 500 groups, German and English ads) and
 analysed, on a server of their own (ANALYZE writes statistics no reset takes back), behind the whole api
-(`create_app`, edge and session included) at the lifespan's pool size. Six requests, each once to warm up and
-then `REPEATS` times: the first page of the default score sort (with its counts), its third page by cursor,
-the first page of the unscored section (`scoring_state=unscored`), the first page of the `posted` sort, a
-keyword page (`q=entwickler`, the page Ruling T4-a watches) and a Berlin 30 km page. Each request's p95 (the
+(`create_app`, edge and session included) at the lifespan's pool size. Seven requests, each once to warm up
+and then `REPEATS` times: the first page of the default score sort (with its counts), its third page by
+cursor, the first page of the unscored section (`scoring_state=unscored`), the first page of the `posted`
+sort, a keyword page (`q=entwickler`, the page Ruling T4-a watches), a Berlin 30 km page (the seed's Berlin
+cards a third on the centre, a third in the ring, a third in the latitude strip beyond it) and the facets
+under the default filters (Ruling T5-c). Each request's p95 (the
 nearest rank) is recorded (`record_property`) and printed, and must be below `P95_LIMIT_S`: the budget is
 never relaxed here.
 """
@@ -35,6 +37,7 @@ CARDS: Final = 50_000
 REPEATS: Final = 20
 P95_LIMIT_S: Final = 0.300  # B29
 URL: Final = "/api/jobs"
+FACETS_URL: Final = "/api/jobs/facets"
 BERLIN_30_KM: Final = {
     "loc_id": "geonames:2950159",
     "loc_lat": BERLIN[0],
@@ -71,15 +74,17 @@ def p95(samples: list[float]) -> float:
     return ordered[math.ceil(0.95 * len(ordered)) - 1]
 
 
-async def _timed(client: httpx.AsyncClient, params: dict[str, Any]) -> list[float]:
-    """The request once to warm up, then `REPEATS` timed runs; every answer a non-empty 200 page."""
+async def _timed(client: httpx.AsyncClient, url: str, params: dict[str, Any]) -> list[float]:
+    """The request once to warm up, then `REPEATS` timed runs; every answer a non-empty 200 page (cards, or
+    companies and sources)."""
     samples: list[float] = []
     for run in range(REPEATS + 1):
         started = time.perf_counter()
-        r = await client.get(URL, params=params)
+        r = await client.get(url, params=params)
         elapsed = time.perf_counter() - started
         assert r.status_code == 200, (params, r.status_code, r.text[:500])
-        assert r.json()["items"], params
+        body = r.json()
+        assert body["items"] if url == URL else body["companies"] and body["sources"], params
         if run:
             samples.append(elapsed)
     return samples
@@ -108,15 +113,16 @@ async def test_the_list_p95_is_under_300_ms(
             assert login.status_code == 204, login.text
             one = (await client.get(URL)).json()
             two = (await client.get(URL, params={"cursor": one["next_cursor"]})).json()
-            requests: dict[str, dict[str, Any]] = {
-                "score_page_1": {},
-                "score_page_3": {"cursor": two["next_cursor"]},
-                "unscored_page": {"scoring_state": "unscored"},
-                "posted_page": {"sort": "posted"},
-                "keyword_entwickler": {"q": "entwickler"},
-                "berlin_30_km": BERLIN_30_KM,
+            requests: dict[str, tuple[str, dict[str, Any]]] = {
+                "score_page_1": (URL, {}),
+                "score_page_3": (URL, {"cursor": two["next_cursor"]}),
+                "unscored_page": (URL, {"scoring_state": "unscored"}),
+                "posted_page": (URL, {"sort": "posted"}),
+                "keyword_entwickler": (URL, {"q": "entwickler"}),
+                "berlin_30_km": (URL, BERLIN_30_KM),
+                "facets": (FACETS_URL, {}),
             }
-            measured = {name: p95(await _timed(client, params)) for name, params in requests.items()}
+            measured = {name: p95(await _timed(client, *request)) for name, request in requests.items()}
     finally:
         await engine.dispose()
     for name, seconds in measured.items():

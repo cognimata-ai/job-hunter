@@ -60,14 +60,17 @@ from typing import Final, Literal
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.api.pagination import JobSection
+from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.jobs import _sql
 from jobhunter.jobs.query import JobsQuery, score_filter_active
 from jobhunter.normalize.text import fold
 from jobhunter.settings.model import Display
+from jobhunter.types import JSONValue
 
 COUNT_CAP: Final = 10_000  # B18
-EARTH_RADIUS_KM: Final = 6371.0088  # `geo_km`'s sphere (migration 0009, `geo.gazetteer.distance_km`)
 INSIDE_SHARE: Final = 0.99  # of half the radius: the inner box's margin below the radius
+LONGITUDE_BOUND_BELOW: Final = 89  # `job_within_km` bounds longitude only while |lat| + radius / 110.5 < 89
+NO_LONGITUDE_BOUND: Final = 360.0  # a band longitude bound that every candidate meets
 
 SortValue = Decimal | float | datetime | None
 
@@ -122,10 +125,12 @@ Branch = Literal["ranked", "unranked"]
 
 @dataclass(frozen=True)
 class Active:
-    """The active tuple (`None` before the first confirmed profile) and scope that `active_config` names."""
+    """The active tuple (`None` before the first confirmed profile) and scope that `active_config` names, and
+    the scope's payload (`scope_versions.payload`: the cards' keyword chips read it, `jobs.cards`)."""
 
     llm_tuple_id: int | None
     scope_version_id: int
+    scope: Mapping[str, JSONValue]
 
 
 @dataclass(frozen=True)
@@ -221,21 +226,36 @@ def _row_terms(
 def _near_box(lat: float, lon: float, radius_km: int) -> dict[str, float]:
     """The bounds of the location filter's two jsonpath steps (`jobs._sql.NEAR_INSIDE`, `NEAR_BAND`).
 
-    `lo`/`hi` is `job_within_km`'s own latitude band, widened. The inner box, `lo_in..hi_in` by `west..east`,
-    lies within the radius: it spans `INSIDE_SHARE` of half the radius each way on `geo_km`'s sphere of radius
-    `EARTH_RADIUS_KM`, in latitude along the meridian and in longitude along the parallel of the box's
-    latitude nearest the equator, where a degree is longest. A point of the box is reached from the centre by
-    a meridian arc and then a parallel arc, each at most that share of half the radius, and the great circle
-    is no longer than that path, so its `geo_km` distance is below the radius whatever the float rounding.
+    **The band** is a superset of `job_within_km`'s matches: its own pre-check, widened by
+    `NEAR_BAND_WIDENING`. Latitude: `lo..hi`, |Δlat| <= radius / 110.5. Longitude: `lo_lon..hi_lon`, the
+    function's |Δlon| bound radius / (110.5 * cos(|lat| + radius / 110.5)), but only where the function
+    applies it (|lat| + radius / 110.5 below 89, here with the widening) and the bounds stay within ±180, so
+    that the shorter way round the meridians is the direct one for a candidate in [-180, 180]; elsewhere they
+    are ±`NO_LONGITUDE_BOUND`, which bounds nothing.
+
+    **The inner box**, `lo_in..hi_in` by `west..east`, lies within the radius: it spans `INSIDE_SHARE` of
+    half the radius each way on `geo_km`'s sphere (of radius `geo.gazetteer.EARTH_RADIUS_KM`), in latitude
+    along the meridian and in longitude along the parallel of the box's latitude nearest the equator, where a
+    degree is longest. A point of the box is reached from the centre by a meridian arc and then a parallel
+    arc, each at most that share of half the radius, and the great circle is no longer than that path, so its
+    `geo_km` distance is below the radius whatever the float rounding.
     """
-    band = radius_km / 110.5 + _sql.NEAR_BAND_WIDENING
+    widening = _sql.NEAR_BAND_WIDENING
+    band = radius_km / 110.5
+    lo_lon, hi_lon = -NO_LONGITUDE_BOUND, NO_LONGITUDE_BOUND
+    if abs(lat) + band + widening < LONGITUDE_BOUND_BELOW:
+        reach = radius_km / (110.5 * cos(radians(abs(lat) + band))) + widening
+        if -180 < lon - reach and lon + reach < 180:
+            lo_lon, hi_lon = lon - reach, lon + reach
     half = degrees(INSIDE_SHARE * radius_km / (2 * EARTH_RADIUS_KM))
     lo_in, hi_in = lat - half, lat + half
     nearest = 0.0 if lo_in <= 0 <= hi_in else min(abs(lo_in), abs(hi_in))
     wide = degrees(INSIDE_SHARE * radius_km / (2 * EARTH_RADIUS_KM * cos(radians(min(nearest, 90.0)))))
     return {
-        "lo": lat - band,
-        "hi": lat + band,
+        "lo": lat - band - widening,
+        "hi": lat + band + widening,
+        "lo_lon": lo_lon,
+        "hi_lon": hi_lon,
         "lo_in": lo_in,
         "hi_in": hi_in,
         "west": lon - wide,
@@ -427,9 +447,10 @@ async def _counts(conn: AsyncConnection, where: _Filter, binds: Mapping[str, obj
 
 
 async def read_active(conn: AsyncConnection) -> Active:
-    """The active tuple and scope, read without a lock (a read snapshot takes none)."""
+    """The active tuple, scope and scope payload, read without a lock (a read snapshot takes none)."""
     row = (await conn.execute(_sql.ACTIVE)).one()
-    return Active(None if row.llm_tuple_id is None else int(row.llm_tuple_id), int(row.scope_version_id))
+    llm_tuple = None if row.llm_tuple_id is None else int(row.llm_tuple_id)
+    return Active(llm_tuple, int(row.scope_version_id), MappingProxyType(dict(row.scope)))
 
 
 async def display_timezone(conn: AsyncConnection) -> str:

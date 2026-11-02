@@ -271,6 +271,9 @@ async def test_facets_count_companies_and_sources_and_filter_by_prefix(
         c["company_key"] for c in (await get(logged_in_client, FACETS_URL, company_q="bet"))["companies"]
     ] == ["beta"]
     assert (await get(logged_in_client, FACETS_URL, company_q="gmbh"))["companies"] == []  # a prefix only
+    # the prefix picks companies, not cards: the `ACME` card counts for the company `Acme GmbH` matched
+    by_spelling = await get(logged_in_client, FACETS_URL, company_q="acme g")
+    assert by_spelling["companies"] == [{"company_key": "acme", "display_name": "Acme GmbH", "count": 3}]
     # each facet under every filter but its own: a chosen company still offers the others
     chosen = await get(logged_in_client, FACETS_URL, company="beta")
     assert [c["company_key"] for c in chosen["companies"]] == ["acme", "beta", "arzte plus"]
@@ -340,3 +343,21 @@ async def test_the_outbound_links_reach_the_page_and_never_a_log_line(
     assert page["items"][0]["badges"] == ["adzuna"]
     logged = repr(log_events())
     assert "adzuna.example" not in logged and "invented-tracking" not in logged
+
+
+async def test_a_foreign_position_is_an_invalid_cursor_but_a_first_page_value_error_is_internal(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: Any, monkeypatch: Any
+) -> None:
+    """`select_page` refuses a position no page of the sort ends at with `ValueError`: 400 `invalid_cursor` on
+    a page with a cursor; on a first page the same error is a bug, the last-resort 500 `internal`."""
+    await seed_cards(engine, [scored(40, 60), scored(20, 40)])
+    cursor = (await get(logged_in_client, limit=1))["next_cursor"]
+
+    async def refused(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("not a position of the score_mid sort")
+
+    monkeypatch.setattr(jobs_route, "select_page", refused)
+    later = await logged_in_client.get(URL, params={"limit": 1, "cursor": cursor})
+    assert (later.status_code, later.json()["code"]) == (400, "invalid_cursor")
+    first = await logged_in_client.get(URL, params={"limit": 1})
+    assert (first.status_code, first.json()["code"]) == (500, "internal")

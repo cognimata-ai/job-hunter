@@ -21,6 +21,7 @@ import sqlalchemy as sa
 from jobhunter.api.pagination import JobSection, JobSort
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.sql import q
+from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.jobs import _sql, listing
 from jobhunter.jobs._sql import TRGM_WORD_THRESHOLD
 from jobhunter.jobs.listing import Counts, PageSelection, Position, SelectedRow, select_page
@@ -621,7 +622,7 @@ async def test_a_second_tuple_activated_later_is_the_one_read(engine: AsyncEngin
 def _destination(lat: float, lon: float, km: float, bearing: float) -> tuple[float, float]:
     """The point `km` from `(lat, lon)` at `bearing` (radians) on `geo_km`'s sphere, its longitude in
     [-180, 180)."""
-    phi, lam, delta = math.radians(lat), math.radians(lon), km / 6371.0088
+    phi, lam, delta = math.radians(lat), math.radians(lon), km / EARTH_RADIUS_KM
     to_phi = math.asin(math.sin(phi) * math.cos(delta) + math.cos(phi) * math.sin(delta) * math.cos(bearing))
     to_lam = lam + math.atan2(
         math.sin(bearing) * math.sin(delta) * math.cos(phi),
@@ -631,28 +632,45 @@ def _destination(lat: float, lon: float, km: float, bearing: float) -> tuple[flo
 
 
 _CENTRES: Final = (BERLIN, (0.0, 179.95), (-33.9, -179.99), (88.9, 10.0), (-89.6, -120.0), (0.01, 0.0))
+# Beside the band's longitude cut-offs at 30 km (|lat| + 0.2715 against 89; lon ± 0.2715 against ±180)
+_CUT_OFFS: Final = ((88.72, 5.0), (88.73, 5.0), (-88.72, -5.0), (0.0, 179.72), (0.0, 179.73), (0.0, -179.72))
 
 
 async def test_the_location_filter_decides_as_job_within_km(engine: AsyncEngine) -> None:
-    """The near term (`_sql.ROW_TEMPLATES["near"]`: the inner box, the latitude band, then `job_within_km`)
-    accepts exactly the candidates `job_within_km` accepts, in the box, in the ring between box and radius,
-    outside it, at the poles and across the antimeridian; an unresolved entry never matches (M4 Task 5)."""
+    """The near term (`_sql.ROW_TEMPLATES["near"]`: the inner box, the band, then `job_within_km`) accepts
+    exactly the candidates `job_within_km` accepts, in the box, in the ring between box and radius, outside
+    it, in the latitude strip beyond the band's longitude bound, at the poles, across the antimeridian and
+    beside the band's longitude cut-offs; an unresolved entry never matches (M4 Task 5)."""
     rng = random.Random(4711)  # noqa: S311 (sampling, not secrecy)
     rows: list[dict[str, Any]] = []
-    for lat, lon in _CENTRES:
-        for radius_km in (1, 30, 200):
-            for _ in range(150):
-                point = _destination(lat, lon, rng.uniform(0, 2.2) * radius_km, rng.uniform(0, 2 * math.pi))
-                resolution = rng.choice(("unique", "ambiguous", "unresolved"))
-                rows.append(
-                    {
-                        "locations": [place(point, resolution=resolution)],
-                        "lat": lat,
-                        "lon": lon,
-                        "radius_km": radius_km,
-                        "near_box": listing._near_box(lat, lon, radius_km),
-                    }
-                )
+
+    def add(point: tuple[float, float], lat: float, lon: float, radius_km: int) -> None:
+        resolution = rng.choice(("unique", "ambiguous", "unresolved"))
+        rows.append(
+            {
+                "locations": [place(point, resolution=resolution)],
+                "lat": lat,
+                "lon": lon,
+                "radius_km": radius_km,
+                "near_box": listing._near_box(lat, lon, radius_km),
+            }
+        )
+
+    cases = [(lat, lon, radius_km) for lat, lon in _CENTRES for radius_km in (1, 30, 200)]
+    for lat, lon, radius_km in [*cases, *((lat, lon, 30) for lat, lon in _CUT_OFFS)]:
+        for _ in range(150):
+            add(
+                _destination(lat, lon, rng.uniform(0, 2.2) * radius_km, rng.uniform(0, 2 * math.pi)),
+                lat,
+                lon,
+                radius_km,
+            )
+        band = radius_km / 110.5
+        for _ in range(50):  # the latitude strip, out to three longitude reaches either way
+            strip_lat = min(90.0, max(-90.0, lat + rng.uniform(-band, band)))
+            reach = 3 * band / max(math.cos(math.radians(min(abs(lat) + band, 89.9))), 1e-3)
+            strip_lon = (lon + rng.uniform(-reach, reach) + 180) % 360 - 180
+            add((strip_lat, strip_lon), lat, lon, radius_km)
     near = _sql.ROW_SQL["j"]["near"]
     statement = (
         "SELECT count(*) FILTER (WHERE decided) AS inside, count(*) FILTER (WHERE decided IS DISTINCT FROM "  # noqa: S608
