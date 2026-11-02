@@ -1,10 +1,10 @@
 # Job Hunter runbook
 
 The operations guide of spec §19.8. This file starts with the score lane's entries (M3, plan Task 27): a
-paused score lane and its acknowledgement, a quarantined batch and its release, the live schema dry-run before
-a prompt-schema version is activated, and the golden eval run on the installation before an activation. M5
-adds the host setup, start and stop, the health check, secret rotation, restore and the rest of the alert
-table (§19.8).
+paused score lane and its acknowledgement, a quarantined batch and its release, a submitted batch that cannot
+be retrieved, the live schema dry-run before a prompt-schema version is activated, and the golden eval run on
+the installation before an activation. M5 adds the host setup, start and stop, the health check, secret
+rotation, restore and the rest of the alert table (§19.8).
 
 Every command below runs on the host in the compose directory. `docker compose run --rm --no-deps worker
 jobhunter …` starts a one-off container of the worker image with the worker's configuration and secrets; it
@@ -113,6 +113,46 @@ timeout. `GET /api/system/spend` shows the held amount as `quarantined_batch_usd
 A `batch.custom_id_anomaly` (critical) means a batch shares only part of the submission's ids: it is never
 adopted. Report it as a bug before any release.
 
+## A submitted batch that cannot be retrieved (`batch.retrieve_failing`)
+
+**What it means.** The provider accepted the batch, so its submission is `submitted` with the provider's
+`provider_batch_id` and an `expires_at` 24 h after the batch's creation, by which time the provider has ended
+every batch. `batch_poll` (every 5 min) retrieves the batch, and once it has ended moves the submission to
+`ended` and processes its results. Each failed retrieval logs `batch_retrieve_failed` (warning) with the
+`submission_id`, the `error_class` and the HTTP `status`. A retrieval that still fails past `expires_at + 1 h`
+raises the critical alert `batch.retrieve_failing` (its subject the submission id, its context the
+`submission_id` and the `provider_batch_id`) and logs `batch_retrieve_failing`; every later failing pass raises
+it again. While the submission stays `submitted`, its targets stay `in_batch`, its reserved spend stays counted
+against the month, and no new batch is submitted for the tuple (a batch preparation ends `in_flight`). The
+tuple's other pending targets are still scored by the online cycles.
+
+**What to do.**
+1. Find the submission and the alert with read-only queries:
+
+   ```
+   SELECT id, state, provider_batch_id, submitted_at, expires_at, request_count, reserved_usd
+     FROM batch_submissions WHERE state = 'submitted';
+   SELECT id, subject, first_at, last_at, occurrences FROM alerts
+    WHERE code = 'batch.retrieve_failing' AND resolved_at IS NULL;
+   ```
+
+2. Read the worker's `batch_retrieve_failed` lines of that `submission_id` (`docker compose logs worker`).
+   Their `status` says why the retrieval fails:
+   - 401 or 403: the key is refused. Rotate or renew `anthropic_key` and restart the worker, as for
+     `auth_failed` above.
+   - no status (a connection failure), 429 or a 5xx: the network or the provider is failing. Wait: the poll
+     retries every 5 minutes.
+   - 404: the provider does not know the batch. Look for its `provider_batch_id` in the Anthropic console
+     (Message Batches).
+3. Once a retrieval succeeds and the batch has ended, the next poll moves the submission to `ended`, resolves
+   the alert and processes the results as usual. Nothing else is needed.
+4. A batch that is gone for good (404, and not in the console) has no operator path today. The batch state
+   machine (`db/transitions.py`, `batch_submissions`) lets a `submitted` submission move only to `ended`, and
+   only the poll makes that move, after a successful retrieval. No API route or CLI command moves it, and the
+   database's transition trigger refuses any other move of its state. Do not edit the row by hand. The
+   submission keeps its targets and its reserved spend until an operator path arrives in M4. Acknowledging the
+   alert (`POST /api/alerts/<id>/ack`) records that you saw it; it moves nothing, and the alert stays open.
+
 ## The live schema dry-run before a prompt-schema version is activated
 
 A prompt-schema version can be activated (`POST /api/settings/prompt-schema-versions/{id}/activate`) only once
@@ -147,7 +187,9 @@ the eval gate of §11.13. The gate reads the newest completed golden run of the 
 prompt-schema version, model policy and evaluation policy) on this installation's golden set. With fewer than
 30 active cases it is skipped ("uncalibrated"); with 30 or more and no run, it fails. A failed gate can only be
 overridden by acknowledging it at the activation (`eval_override_ack`), which is stored on the settings
-version.
+version. A run's own gate counts only the user's cases it evaluated that are still active when it ends: a case
+added, activated or deactivated while it runs never brings a run of fewer cases to 30 (it ends uncalibrated,
+`passed` empty, which the gate reads as failed once 30 cases are active). Label first, then start the run.
 
 1. If the candidate's prompt-schema version is new, run the live dry-run above first: the golden run sends the
    candidate's real requests.
