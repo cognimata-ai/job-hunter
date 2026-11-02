@@ -349,7 +349,6 @@ def test_job_cursor_refuses_a_section_the_sort_lacks(
         (SCORED, {"last_key": ["71.50", 4711]}),
         (SCORED, {"last_key": "71.50"}),
         (SCORED, {"dir": "asc"}),
-        (SCORED, {"posted_after": 5}),
         (UNSCORED, {"last_key": [1.5]}),
         (UNSCORED, {"last_key": [-1.0000001]}),
         (UNSCORED, {"last_key": [True]}),
@@ -370,6 +369,38 @@ def test_job_cursor_refuses_a_malformed_last_key(template: dict[str, Any], chang
 
 
 @pytest.mark.parametrize(
+    "posted_after",
+    [
+        5,
+        True,
+        "yesterday",
+        "2026-13-01T00:00:00+00:00",  # an unparsable time
+        "2026-10-19T12:00:00.000000",  # no zone
+        "2026-10-19T14:00:00.000000+02:00",  # not UTC
+        "2026-10-19",
+    ],
+)
+def test_job_cursor_refuses_a_posted_after_that_is_no_utc_time(posted_after: JSONValue) -> None:
+    """Ruling T2-b: the cut-off is `None` or a UTC time. The hash callable here ignores its argument and
+    returns the template's own hash, so the cut-off's check alone can refuse; the route's callable is never
+    asked with such a value."""
+    template = body_of(job_cursor(ROUND_TRIPS[6]))
+    asked: list[str | None] = []
+
+    def any_cut_off(cut_off: str | None) -> str:
+        asked.append(cut_off)
+        return cast(str, template["filters_hash"])
+
+    for accepted in (POSTED_AFTER, None, "2026-10-20T00:00:00Z"):
+        assert decode_job(sign({**template, "posted_after": accepted}), "posted", any_cut_off).job_id == 5
+    assert asked == [POSTED_AFTER, None, "2026-10-20T00:00:00Z"]
+    refused(lambda: decode_job(sign({**template, "posted_after": posted_after}), "posted", any_cut_off))
+    assert len(asked) == 3
+    with pytest.raises(ValueError):
+        JobCursor("posted", "all", None, 5, 2, cast(Any, posted_after))  # nor can an encoder make one
+
+
+@pytest.mark.parametrize(
     "fields",
     [
         {"last_value": 71.5},
@@ -378,6 +409,7 @@ def test_job_cursor_refuses_a_malformed_last_key(template: dict[str, Any], chang
         {"job_id": True},
         {"gen": -1},
         {"gen": False},
+        {"posted_after": "last week"},
     ],
 )
 def test_a_job_cursor_that_breaks_its_rules_cannot_be_made(fields: dict[str, Any]) -> None:

@@ -198,7 +198,8 @@ class JobCursor:
     (`"71.50"`); in the `unscored` section its similarity (a number in [-1, 1]) or `None`; under the date
     sorts (section `all`) its time as an ISO-8601 UTC string with microseconds, or `None` for `posted` (an
     unknown posting date sorts last). `job_id` is that row's job id (at least 1), `gen` the ranking generation
-    of the first page (at least 0), `posted_after` the cut-off the filters' hash is computed with.
+    of the first page (at least 0), `posted_after` the cut-off the filters' hash is computed with: `None`, or
+    an ISO-8601 UTC time as `last_value` is under the date sorts.
 
     A cursor that breaks these rules (a section its sort lacks, a value of the wrong shape, a `bool` for a
     number) cannot be made: `ValueError`.
@@ -235,7 +236,7 @@ def _holds(c: JobCursor) -> bool:
         return False
     if not (_count(c.job_id, 1) and _count(c.gen, 0)):
         return False
-    if c.posted_after is not None and not isinstance(c.posted_after, str):
+    if not (c.posted_after is None or _utc_time(c.posted_after)):
         return False
     value = c.last_value
     match c.section:
@@ -285,8 +286,8 @@ def decode_job_cursor(
         or len(last_key) != 1
         or not isinstance(job_id, int)
         or not isinstance(gen, int)
-        or not (posted_after is None or isinstance(posted_after, str))
-        or body.get("filters_hash") != filters_hash(posted_after)
+        or not (posted_after is None or (isinstance(posted_after, str) and _utc_time(posted_after)))
+        or body.get("filters_hash") != filters_hash(posted_after)  # asked only with a valid cut-off
     ):
         raise invalid_cursor()
     last_value = last_key[0]

@@ -5,6 +5,7 @@ operation kind (Task 12). 0009 adds no view and no row, and its downgrade is exa
 
 import asyncio
 import importlib
+import math
 import random
 import re
 from typing import Final, get_args
@@ -107,6 +108,7 @@ async def test_geo_km_equals_distance_km(engine) -> None:
     assert (same, null) == (0.0, None)  # STRICT
 
 
+EARTH_RADIUS_KM: Final = 6371.0088  # `geo.gazetteer`'s sphere
 BERLIN: Final = (52.52, 13.405)
 MUNICH: Final = (48.137, 11.575)
 # A point 20 km north of Berlin: a degree of latitude is 6371.0088 km * pi / 180 on the haversine sphere.
@@ -127,12 +129,18 @@ def entry(resolution: str, *points: tuple[float, float]) -> dict[str, JSONValue]
     }
 
 
-async def within(c: AsyncConnection, locations: list[JSONValue], radius_km: float) -> bool | None:
+async def within(
+    c: AsyncConnection,
+    locations: list[JSONValue],
+    radius_km: float,
+    *,
+    centre: tuple[float, float] = BERLIN,
+) -> bool | None:
     statement = q(
         "SELECT job_within_km(:locations, CAST(:lat AS float8), CAST(:lon AS float8), CAST(:r AS float8))",
         jsonb=["locations"],
     )
-    params = {"locations": locations, "lat": BERLIN[0], "lon": BERLIN[1], "r": radius_km}
+    params = {"locations": locations, "lat": centre[0], "lon": centre[1], "r": radius_km}
     result: bool | None = (await c.execute(statement, params)).scalar_one()
     return result
 
@@ -153,6 +161,51 @@ async def test_job_within_km_matches_any_resolved_candidate_only(engine) -> None
         assert await within(c, [entry("ambiguous")], 200) is False  # no candidate
         null = q("SELECT job_within_km(NULL, 52.52, 13.405, 30)")
         assert (await c.execute(null)).scalar_one() is None  # STRICT
+
+
+def east_of(centre: tuple[float, float], km: float) -> tuple[float, float]:
+    """The point `km` due east of `centre` on its parallel: `distance_km` inverted for Δlat = 0, where
+    a = cos²(lat) · sin²(Δlon / 2)."""
+    lat, lon = centre
+    half = math.asin(math.sin(km / (2 * EARTH_RADIUS_KM)) / math.cos(math.radians(lat)))
+    return lat, lon + math.degrees(2 * half)
+
+
+# Ruling T2-a: the two pairs that the brief's first box refused although they lie within the radius.
+NEAR_THE_POLE: Final = ((89.5, 10.0), (89.6114, 49.0154), 40.0)  # 35.0 km apart; `least(89, …)` clamped
+ACROSS_THE_ANTIMERIDIAN: Final = ((0.0, 179.9), (0.0, -179.9), 30.0)  # 22.24 km apart; |Δlon| is 359.8
+
+
+@pytest.mark.parametrize(
+    ("centre", "candidate", "radius_km", "km"),
+    [
+        (*NEAR_THE_POLE, 35.0),
+        (*ACROSS_THE_ANTIMERIDIAN, 22.24),
+        (ACROSS_THE_ANTIMERIDIAN[1], ACROSS_THE_ANTIMERIDIAN[0], ACROSS_THE_ANTIMERIDIAN[2], 22.24),
+    ],
+    ids=["near-the-pole", "across-the-antimeridian-west", "across-the-antimeridian-east"],
+)
+async def test_the_bounding_box_holds_the_whole_circle(
+    engine, centre: tuple[float, float], candidate: tuple[float, float], radius_km: float, km: float
+) -> None:
+    """The pre-check is a superset of the circle at the poles and across ±180°: `geo_km` decides."""
+    assert abs(distance_km(*centre, *candidate) - km) < 0.01 and km < radius_km
+    async with engine.connect() as c:
+        assert await within(c, [entry("unique", candidate)], radius_km, centre=centre) is True
+        assert await within(c, [entry("unique", candidate)], km - 0.1, centre=centre) is False
+
+
+async def test_the_distance_decides_at_the_radius_due_east(engine) -> None:
+    """Minor 1: along a parallel, where the longitude bound applies, a candidate 29.9 km away matches at 30
+    km and one 30.1 km away does not; their longitudes come from inverting `distance_km`, not from a guess."""
+    inside, outside = east_of(BERLIN, 29.9), east_of(BERLIN, 30.1)
+    assert (
+        abs(distance_km(*BERLIN, *inside) - 29.9) < 1e-9 and abs(distance_km(*BERLIN, *outside) - 30.1) < 1e-9
+    )
+    async with engine.connect() as c:
+        assert await within(c, [entry("unique", inside)], 30) is True
+        assert await within(c, [entry("unique", outside)], 30) is False
+        assert await within(c, [entry("unique", outside)], 30.2) is True
 
 
 async def test_operations_accept_replay_raw_items(engine) -> None:

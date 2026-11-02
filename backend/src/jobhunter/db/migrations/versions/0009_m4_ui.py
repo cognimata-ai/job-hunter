@@ -16,12 +16,15 @@ per statement:
       formula of `geo.gazetteer.distance_km` term by term, `asin(least(1, sqrt(a)))` included; and
       job_within_km(locations, lat, lon, radius_km): true when a candidate of a `unique` or `ambiguous` entry
       of a job's `locations` (`sources.parsing.locations.Location`) lies within `radius_km` of the point. An
-      `unresolved` entry never matches, whatever it holds. Each candidate passes a bounding box first: |Δlat|
-      ≤ radius/110.5 and |Δlon| ≤ radius / (110.5 · cos(radians(least(89, |lat| + radius/110.5)))), wider
-      than the circle because a degree of latitude is 111.2 km on this sphere and the longitude bound takes
-      the circle's latitude nearest a pole. Both are IMMUTABLE STRICT PARALLEL SAFE; their bodies are SQL
-      strings, so PostgreSQL records no dependency of job_within_km on geo_km and the downgrade drops them
-      in either order;
+      `unresolved` entry never matches, whatever it holds. A candidate passes a bounding-box pre-check before
+      `geo_km` decides: |Δlat| ≤ radius/110.5, and, unless the circle may reach a pole (|lat| + radius/110.5
+      ≥ 89, where no longitude bound holds), the shorter way round the meridians, least(|Δlon|, 360 -
+      |Δlon|), at most radius / (110.5 · cos(radians(|lat| + radius/110.5))). The box is a superset of the
+      circle everywhere, poles and antimeridian included (Ruling T2-a): a degree of latitude is 111.2 km on
+      this sphere, more than 110.5, and no point within the circle lies poleward of |lat| + radius/110.5,
+      where a degree of longitude is shortest, so it only spares `geo_km` the candidates far away. Both are
+      IMMUTABLE STRICT PARALLEL SAFE; their bodies are SQL strings, so PostgreSQL records no dependency of
+      job_within_km on geo_km and the downgrade drops them in either order;
   T12 operations.kind: the CHECK of 0001 dropped and added again with every 0001 value plus
       'replay_raw_items' (Task 12's operation). The kinds are 0001's literal, copied from
       0001_m0_baseline.py, so the downgrade restores the CHECK as 0001 wrote it.
@@ -67,7 +70,8 @@ AS $$
     + cos(radians(lat1)) * cos(radians(lat2)) * power(sin(radians(lon2 - lon1) / 2), 2))))
 $$;""")
     op.execute("""\
--- B5: some candidate of a resolved (unique or ambiguous) entry lies within radius_km, after a bounding box
+-- B5: some candidate of a resolved (unique or ambiguous) entry lies within radius_km by geo_km, after a
+-- bounding box that contains the circle (no longitude bound near a pole; the shorter way across ±180°)
 CREATE FUNCTION job_within_km(locations jsonb, lat float8, lon float8, radius_km float8) RETURNS boolean
   LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
 AS $$
@@ -78,7 +82,9 @@ AS $$
          LATERAL (SELECT CAST(c ->> 'lat' AS float8) AS c_lat, CAST(c ->> 'lon' AS float8) AS c_lon) AS p
     WHERE l ->> 'resolution' IN ('unique', 'ambiguous')
       AND abs(p.c_lat - lat) <= radius_km / 110.5
-      AND abs(p.c_lon - lon) <= radius_km / (110.5 * cos(radians(least(89, abs(lat) + radius_km / 110.5))))
+      AND (abs(lat) + radius_km / 110.5 >= 89
+           OR least(abs(p.c_lon - lon), 360 - abs(p.c_lon - lon))
+              <= radius_km / (110.5 * cos(radians(abs(lat) + radius_km / 110.5))))
       AND geo_km(lat, lon, p.c_lat, p.c_lon) <= radius_km)
 $$;""")
     op.execute("ALTER TABLE operations DROP CONSTRAINT operations_kind_check;")
