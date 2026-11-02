@@ -23,10 +23,14 @@ log line or an alert, and none reaches a response body except the 422 validation
 carry SQL, input or secrets.
 
 `domain_problem(exc)` is the one mapping of the other domain errors a route meets, which the route raises
-`from None` in place of its own mapping (M4 Task 1, R6): a `LookupError` that is not a `KeyError` → 404
-`not_found`; `FencedOut` → 409 `conflict_state` with `detail = "purge_in_progress"`; `InvariantViolation` and
-`TransitionConflict` → 409 `conflict_state`; anything else `None`. Their messages, which name tables and ids,
-stay out of the body. There is no global `LookupError` handler: it would turn a `KeyError` bug into a 404.
+`from None` in place of its own mapping (M4 Task 1, R6): a `LookupError` that is neither a `KeyError` nor an
+`IndexError` → 404 `not_found` (a named domain lookup such as `auth.users.UserMissing` or
+`scoring.eval_runner.NoCandidate`, whichever subclass; ruling T1-a); `FencedOut` → 409 `conflict_state` with
+`detail = "purge_in_progress"`; `InvariantViolation` and `TransitionConflict` → 409 `conflict_state`; anything
+else `None`. Their messages, which name tables and ids, stay out of the body. A `KeyError` or `IndexError` is
+a bug, which the last-resort handler answers 500 and alerts on; so there is no global `LookupError` handler
+either. `as_problem(exc)` is the one view of a `Problem` or a `Refusal` that a route's catch logs (ruling
+T1-c).
 """
 
 import asyncio
@@ -42,7 +46,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
-from jobhunter.errors import ErrorCode, FencedOut, InvariantViolation, Refusal, TransitionConflict
+from jobhunter.errors import (
+    RESERVED_PROBLEM_MEMBERS,
+    ErrorCode,
+    FencedOut,
+    InvariantViolation,
+    Refusal,
+    TransitionConflict,
+)
 from jobhunter.observability.alerts import raise_alert
 from jobhunter.observability.logging import get_logger
 from jobhunter.types import JSONValue
@@ -58,10 +69,8 @@ PURGE_IN_PROGRESS: Final = "purge_in_progress"
 # hold the 500 back for longer.
 ALERT_PERSIST_TIMEOUT_S: Final = 5.0
 
-# The members `problem_body` writes itself; `extra` cannot replace them.
-_STANDARD_MEMBERS: Final = frozenset(
-    {"type", "title", "status", "code", "detail", "instance", "request_id", "errors"}
-)
+# The members `problem_body` writes itself; `extra` cannot replace them (`jobhunter.errors`', ruling T1-b).
+_STANDARD_MEMBERS: Final = RESERVED_PROBLEM_MEMBERS
 
 ExceptionHandlers = dict[int | type[Exception], Callable[[Request, Any], Coroutine[Any, Any, Response]]]
 
@@ -148,9 +157,14 @@ def problem_of(refusal: Refusal) -> Problem:
     )
 
 
+def as_problem(exc: Problem | Refusal) -> Problem:
+    """`exc` itself for a `Problem`, `problem_of(exc)` for a `Refusal`."""
+    return exc if isinstance(exc, Problem) else problem_of(exc)
+
+
 def domain_problem(exc: BaseException) -> Problem | None:
     """The problem of a domain error a route meets, or `None` for any other (module docstring)."""
-    if isinstance(exc, LookupError) and not isinstance(exc, KeyError):
+    if isinstance(exc, LookupError) and not isinstance(exc, KeyError | IndexError):
         return Problem(404, "not_found", "Not found")
     if isinstance(exc, FencedOut):
         return Problem(409, "conflict_state", "A purge is in progress", detail=PURGE_IN_PROGRESS)

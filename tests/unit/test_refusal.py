@@ -11,8 +11,16 @@ import httpx
 import pytest
 from fastapi import APIRouter
 from jobhunter.api.app import create_app
-from jobhunter.api.errors import Problem, domain_problem, problem_body, problem_of
-from jobhunter.errors import FencedOut, InvariantViolation, Refusal, RefusalField, TransitionConflict
+from jobhunter.api.errors import Problem, as_problem, domain_problem, problem_body, problem_of
+from jobhunter.auth.users import UserMissing
+from jobhunter.errors import (
+    RESERVED_PROBLEM_MEMBERS,
+    FencedOut,
+    InvariantViolation,
+    Refusal,
+    RefusalField,
+    TransitionConflict,
+)
 from jobhunter.settings.save import schema_dry_run_required
 from jobhunter.types import JSONValue
 from starlette.responses import JSONResponse
@@ -77,6 +85,29 @@ def test_a_refusal_is_4xx_only() -> None:
     assert [Refusal(status, "validation_failed", "t").status for status in (400, 499)] == [400, 499]
 
 
+def test_a_refusal_refuses_a_reserved_extra_member() -> None:
+    """Ruling T1-b: at construction, as a `Problem` does, never only when the api answers it."""
+    assert {"status", "errors"} <= RESERVED_PROBLEM_MEMBERS
+    for member in sorted(RESERVED_PROBLEM_MEMBERS):  # the one set: the api's `Problem` refuses the same names
+        with pytest.raises(ValueError, match=member):
+            Refusal(409, "conflict_state", "Busy", extra={member: 1, "retryable": True})
+        with pytest.raises(ValueError, match=member):
+            Problem(409, "conflict_state", "Busy", extra={member: 1, "retryable": True})
+    assert Refusal(409, "conflict_state", "Busy", extra={"retryable": True}).extra == {"retryable": True}
+
+
+def test_as_problem_keeps_a_problem_and_maps_a_refusal() -> None:
+    """Ruling T1-c: the one view the route catches log a refusal or a problem through."""
+    problem = Problem(409, "idempotency_in_progress", "A request with this Idempotency-Key is still running")
+    assert as_problem(problem) is problem
+    refusal = Refusal(422, "validation_failed", "Invalid", fields=[RefusalField("a", "b", "c")])
+    assert rendered(as_problem(refusal)) == rendered(problem_of(refusal))
+
+
+class _NoSuchDraft(LookupError):
+    """A domain lookup that found no row, as `UserMissing` and `eval_runner.NoCandidate` are."""
+
+
 def test_domain_problem_maps_the_domain_errors() -> None:
     cases: list[tuple[BaseException, tuple[int, str, str | None]]] = [
         (LookupError("profile_drafts 7 has no row"), (404, "not_found", None)),
@@ -90,7 +121,12 @@ def test_domain_problem_maps_the_domain_errors() -> None:
         assert (problem.status, problem.code, problem.detail) == expected
         assert str(exc) not in json.dumps(rendered(problem))  # its message names tables and ids: not sent
     assert domain_problem(KeyError("settings_version_id")) is None  # a bug, never a 404
+    assert domain_problem(IndexError("list index out of range")) is None  # a bug too (ruling T1-a)
     assert domain_problem(ValueError("bad")) is None
+    # a named domain `LookupError` is a 404, whichever subclass it is
+    for named in (UserMissing("no user"), _NoSuchDraft("profile_drafts 7")):
+        problem = domain_problem(named)
+        assert problem is not None and (problem.status, problem.code) == (404, "not_found"), named
 
 
 async def test_a_raised_refusal_is_answered_with_its_problem_document() -> None:

@@ -74,7 +74,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import Message
 
 from jobhunter.api.deps import get_config, get_data_keys, get_engine, require_session
-from jobhunter.api.errors import FieldError, Problem, problem_of
+from jobhunter.api.errors import FieldError, Problem, as_problem
 from jobhunter.api.models import DecimalOut
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
@@ -545,7 +545,7 @@ async def confirm_draft(
                 handler=handler,
             )
     except (Problem, Refusal) as refused:  # codes and counts: a field path names the user's own entries
-        problem = refused if isinstance(refused, Problem) else problem_of(refused)
+        problem = as_problem(refused)
         log.info(
             "profile_confirm_refused",
             draft_id=draft_id,

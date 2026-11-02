@@ -37,6 +37,11 @@ ErrorCode = Literal[
     "profile_purge_in_progress",
     "internal",
 ]
+# The members a problem document writes itself (`api.errors.problem_body`): no `extra` may replace them, of a
+# `Refusal` or of the api's `Problem` (ruling T1-b).
+RESERVED_PROBLEM_MEMBERS: Final = frozenset(
+    {"type", "title", "status", "code", "detail", "instance", "request_id", "errors"}
+)
 
 
 class DomainError(Exception):
@@ -94,7 +99,8 @@ class RefusalField:
 class Refusal(DomainError):
     """A refused request: the status (4xx only), code, title, detail, fields and extra members of its problem.
 
-    `fields=None` gives the problem no `errors` member, an empty sequence an empty one. A 5xx is never a
+    `fields=None` gives the problem no `errors` member, an empty sequence an empty one. `extra` cannot hold a
+    `RESERVED_PROBLEM_MEMBERS` name (`ValueError`, as the api's `Problem` refuses it). A 5xx is never a
     refusal: it is a bug or an outage, which the api answers itself.
     """
 
@@ -111,6 +117,8 @@ class Refusal(DomainError):
         super().__init__(code)
         if not 400 <= status <= 499:
             raise ValueError(f"a refusal has a 4xx status, not {status}")
+        if clash := RESERVED_PROBLEM_MEMBERS & set(extra or {}):
+            raise ValueError(f"extra cannot replace the standard members {sorted(clash)}")
         self.status = status
         self.code: ErrorCode = code
         self.title = title
