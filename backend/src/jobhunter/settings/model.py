@@ -24,6 +24,10 @@
   fixed_point`): both are idempotent on ordinary text, but not on a few inputs (`company_key` of a name ending
   in two country words, `fold` of a spacing diacritic), and a stored value must validate to itself. The hard
   filter compares the same fixed point of a job's one-pass key and industry with them (`scoring.filters`).
+- **The model policy's label** (plan M4 Task 14, D20): `scoring.model_policy.preset` is always the label of
+  its grid (`settings.presets.label_for`: `A`, `B` or `C` for a preset's grid, `custom` for any other),
+  whatever label the request carried, so a label-only change is no change and derives no new
+  `model_policies` row (§13.3).
 - **Set-valued lists** (`work_modes`, `employment_types`, `accepted_ad_languages`, `critic_light_triggers`)
   hold no value twice and are kept in the order their type declares, so a reordering is no change and derives
   no new row (§13.2). Other lists keep their order.
@@ -46,10 +50,18 @@ import re
 from collections.abc import Callable
 from decimal import Decimal
 from functools import cache
-from typing import Annotated, Final, Literal, cast, get_args
+from typing import Annotated, Final, Literal, Self, cast, get_args
 from zoneinfo import available_timezones
 
-from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    model_validator,
+)
 from pydantic_core import PydanticCustomError
 
 from jobhunter.db.seed import ANCHOR_LOCAL
@@ -60,6 +72,7 @@ from jobhunter.types import JSONValue
 
 Node = Literal["generate", "revise", "critic", "extract_profile", "propose_queries"]
 NODES: Final[tuple[Node, ...]] = get_args(Node)
+PolicyLabel = Literal["A", "B", "C", "custom"]  # a preset's letter, or `custom` (`settings.presets`)
 Severity = Literal["hard", "soft"]
 WorkMode = Literal["remote", "hybrid", "onsite"]
 EmploymentType = Literal[  # §11.5
@@ -91,7 +104,10 @@ _BIGINT_MAX: Final = 2**63 - 1  # the ids are `bigint` row ids (`queries.id`, `w
 
 
 class _Group(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    # `to_payload()` writes every key: the published (serialisation) schema requires each, defaults included
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, json_schema_serialization_defaults_required=True
+    )
 
 
 def _decimal(value: object) -> object:
@@ -370,9 +386,9 @@ class Collection(_Group):
     stale_ttl_days: Annotated[int, Field(ge=7, le=90)] | None = None  # null: `scope.max_ad_age_days`
 
 
+# The upper bounds fit the pacing columns' `numeric(10,4)` (M1 Carry-forward 9).
 class Quota(_Group):
-    """The quota limits (§6); the upper bounds fit the pacing columns' `numeric(10,4)` (M1 Carry-forward
-    9)."""
+    """The quota limits (§6)."""
 
     jsearch_monthly_limit: int = Field(200, ge=1, le=100_000)
     serpapi_monthly_limit: int = Field(250, ge=1, le=100_000)
@@ -399,7 +415,7 @@ def _choice(model: Model, effort: Effort = "medium") -> Callable[[], NodeChoice]
 
 
 class ModelPolicyNodes(_Group):
-    """Model policy B, the default (§10.3)."""
+    """The model and effort of each node; the defaults are model policy B (§10.3)."""
 
     generate: NodeChoice = Field(default_factory=_choice("claude-sonnet-5-5"))
     revise: NodeChoice = Field(default_factory=_choice("claude-sonnet-5-5"))
@@ -412,9 +428,24 @@ class ModelPolicyNodes(_Group):
 
 
 class ModelPolicy(_Group):
-    preset: Literal["A", "B", "C", "custom"] = "B"
+    """The model and effort of each node, and the critic's effort for a light round (§10.3). `preset` is the
+    label of that grid, `A`, `B` or `C` for a preset's, `custom` for any other; a label a request sends is
+    replaced by it."""
+
+    preset: PolicyLabel = "B"
     nodes: ModelPolicyNodes = Field(default_factory=ModelPolicyNodes)
     critic_light_effort: SupportedEffort = "low"  # the critic's effort for a light round (§11.7.4)
+
+    @model_validator(mode="after")
+    def _label_of_the_grid(self) -> Self:
+        """The label normal form (module docstring): `preset` set to the label of the grid."""
+        # `presets` builds its grids from this module's models, so it is imported when a policy is validated
+        from jobhunter.settings.presets import label_for
+
+        label = label_for(self.nodes, self.critic_light_effort)
+        if label != self.preset:
+            object.__setattr__(self, "preset", label)  # frozen: set here, before the model is handed out
+        return self
 
 
 class ExecutionNode(_Group):
@@ -476,8 +507,9 @@ class Notifications(_Group):
     push_min_severity: Literal["warn", "critical"] = "warn"
 
 
+# The document a `settings_versions.payload` holds.
 class Settings(_Group):
-    """The settings document, `settings_versions.payload` (§13.1)."""
+    """The settings document (§13.1): every group with each of its fields."""
 
     schedule: Schedule = Field(default_factory=Schedule)
     display: Display = Field(default_factory=Display)

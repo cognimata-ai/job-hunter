@@ -47,6 +47,14 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("get", "/api/queries"): {"401", "429"},
     ("get", "/api/queries/stats"): {"401", "429"},
     ("get", "/api/watchlist"): {"401", "429"},
+    ("get", "/api/settings/rubric-versions/{version_id}/activation-preview"): {"401", "404", "422", "429"},
+    ("get", "/api/settings/prompt-schema-versions/{version_id}/activation-preview"): {
+        "401",
+        "404",
+        "422",
+        "429",
+    },
+    ("get", "/api/eval-runs"): {"400", "401", "422", "429"},
 }
 # What a published description must not cite (Ruling T6-g). A ruling is matched in any case and in the plural
 # (the codebase writes "ruling R14-1" and "rulings R14-1 and R14-2" as well as "Ruling P13"); `Task`, the

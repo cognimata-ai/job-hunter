@@ -21,12 +21,13 @@ VERSIONS_URL = "/api/settings/versions"
 
 async def test_get_settings_shows_the_active_version(logged_in_client, engine) -> None:
     body = await settings_body(logged_in_client)
-    assert set(body) == {"version", "payload", "pending_scope"}
+    assert set(body) == {"version", "payload", "pending_scope", "scope_applied"}
     assert set(body["version"]) == {"id", "version_no", "created_at", "effect_classes"}
     assert body["version"]["id"] == (await active_row(engine)).settings_version_id
     assert (body["version"]["version_no"], body["version"]["effect_classes"]) == (1, ["none"])
     assert body["version"]["created_at"].endswith("Z")
     assert body["payload"] == load_settings_v1() and body["pending_scope"] is None
+    assert body["scope_applied"] is True
 
 
 async def test_get_settings_shows_the_pending_scope_and_its_progress(logged_in_client, engine) -> None:
@@ -37,15 +38,19 @@ async def test_get_settings_shows_the_pending_scope_and_its_progress(logged_in_c
     assert body["version"]["id"] == saved["version"]["id"]
     assert body["pending_scope"] == {
         "version_id": pending,
-        "progress": {"done": 0, "total": 0},
+        "progress": {"done": 0, "total": 0, "det_done": 0, "det_total": 0},
     }  # not started
     async with engine.begin() as conn:
         await conn.execute(
-            sa.text('UPDATE operations SET progress = \'{"done": 500, "total": 1201}\' WHERE id = :i'),
+            sa.text(
+                "UPDATE operations SET progress = "
+                '\'{"done": 500, "total": 1201, "det_done": 2, "det_total": 9}\' WHERE id = :i'
+            ),
             {"i": op_id},
         )
     body = await settings_body(logged_in_client)
-    assert body["pending_scope"] == {"version_id": pending, "progress": {"done": 500, "total": 1201}}
+    progress = {"done": 500, "total": 1201, "det_done": 2, "det_total": 9}
+    assert body["pending_scope"] == {"version_id": pending, "progress": progress}
     async with engine.begin() as conn:  # the apply failed for good; the reconciler has not cleared it yet
         for statement in (
             "UPDATE operations SET status = 'running', claim_id = gen_random_uuid(), worker_epoch = 1, "

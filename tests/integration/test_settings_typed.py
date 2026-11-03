@@ -1,0 +1,269 @@
+"""The typed settings document and the dry-run's history (spec §6.8 L1137, §6.9.2, §13.4, §14.2; plan M4 Task
+14, D11, D17, D22).
+
+- `GET /api/settings` and `GET /api/settings/versions/{id}` publish the document as the `Settings` schema,
+  and the dry-run its projections as `ProjectionsOut`; requests keep plain JSON, so an invalid draft still
+  reaches the dry-run and comes back as field issues.
+- `GET /api/settings` shows the pending scope's apply in both of its phases and whether the active settings
+  version's scope is the applied one.
+- The dry-run's ĉ is the active tuple's 7-day history while the proposed model and evaluation policies are
+  the active ones, else the proposed policy's central estimate; its arrivals are the tuple's targets of the
+  last 7 days a month, or 3,000 without 7 days of history; it warns of no re-score while no profile is active.
+
+Every datum is invented.
+"""
+
+import copy
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Any, Final
+
+import httpx
+import pytest
+import sqlalchemy as sa
+from jobhunter.api.app import create_app
+from jobhunter.db.seed import load_settings_v1
+from jobhunter.quota.windows import bootstrap_window
+from jobhunter.settings import presets
+from jobhunter.settings.llm_projection import central_cost_per_target
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from tests.integration.test_scope_apply import fail_for_good
+from tests.support.m3 import insert_attempt, insert_job, insert_target
+from tests.support.quota import SETTINGS, SIX_H, account, insert_window
+from tests.support.reconcile import run_reconciler
+from tests.support.settings import activate_profile, active_row, save_scope, settings_body
+
+pytestmark = pytest.mark.integration
+
+DRY_RUN_URL: Final = "/api/settings/dry-run"
+NOW: Final = datetime(2026, 10, 22, 9, 30, tzinfo=UTC)
+SCHEMAS: Final = "#/components/schemas/"
+CENTRAL_B: Final = "0.052646"
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    monkeypatch.setattr("jobhunter.api.routes.settings.utcnow", lambda: NOW)
+    return NOW
+
+
+def seeded() -> dict[str, Any]:
+    """The active (seeded) document."""
+    doc: dict[str, Any] = copy.deepcopy(load_settings_v1())
+    return doc
+
+
+def changed(path: str, value: Any) -> dict[str, Any]:
+    doc = seeded()
+    *parents, key = path.split(".")
+    node = doc
+    for part in parents:
+        node = node[part]
+    node[key] = value
+    return doc
+
+
+async def dry_run(client: httpx.AsyncClient, payload: Any) -> dict[str, Any]:
+    r = await client.post(DRY_RUN_URL, json={"payload": payload})
+    assert r.status_code == 200, r.text
+    body: dict[str, Any] = r.json()
+    return body
+
+
+def codes(body: dict[str, Any]) -> list[str]:
+    return [w["code"] for w in body["warnings"]]
+
+
+# ---- the document ------------------------------------------------------------------------------------------
+
+
+async def test_settings_payload_is_typed_in_the_document(logged_in_client: httpx.AsyncClient) -> None:
+    schemas = create_app().api.openapi()["components"]["schemas"]
+    assert schemas["SettingsOut"]["properties"]["payload"] == {"$ref": SCHEMAS + "Settings"}
+    assert schemas["VersionDetailOut"]["properties"]["payload"] == {"$ref": SCHEMAS + "Settings"}
+    assert set(schemas["Settings"]["properties"]) == set(load_settings_v1())
+    policy = schemas["ModelPolicy"]["properties"]
+    assert policy["preset"]["enum"] == ["A", "B", "C", "custom"]
+    assert schemas["Llm"]["properties"]["cap_usd"]["type"] == "string"  # a decimal leaves as a string
+    projections = schemas["DryRunOut"]["properties"]["projections"]
+    assert {"$ref": SCHEMAS + "ProjectionsOut"} in projections["anyOf"]
+    parts = schemas["ProjectionsOut"]
+    assert set(parts["required"]) == {"jsearch", "adzuna", "arbeitnow", "serpapi_fallback", "llm"}
+    assert set(parts["properties"]) - set(parts["required"]) == {
+        "det_recompute",
+        "critic_rate",
+        "eval_gate",
+        "next_slot",
+    }
+    assert set(schemas["SettingsOut"]["required"]) == {"version", "payload", "pending_scope", "scope_applied"}
+    # a request's document stays plain JSON, whatever it holds
+    for request in ("DryRunIn", "SaveIn"):
+        assert schemas[request]["properties"]["payload"] == {"$ref": SCHEMAS + "JsonValue"}
+
+    body = await settings_body(logged_in_client)
+    assert body["payload"] == load_settings_v1()  # the stored normal form, typed
+    version = await logged_in_client.get(f"/api/settings/versions/{body['version']['id']}")
+    assert version.status_code == 200 and version.json()["payload"] == load_settings_v1()
+    invalid = await dry_run(logged_in_client, changed("schedule.interval_hours", "6"))
+    assert [(e["field"], e["code"]) for e in invalid["errors"]] == [
+        ("payload.schedule.interval_hours", "invalid")
+    ]
+    assert (invalid["projections"], invalid["effects"]) == (None, [])
+    valid = await dry_run(logged_in_client, changed("schedule.interval_hours", 12))
+    assert set(valid["projections"]) == {
+        "jsearch",
+        "adzuna",
+        "arbeitnow",
+        "serpapi_fallback",
+        "llm",
+        "next_slot",
+    }
+
+
+async def test_the_serpapi_fallback_is_typed_with_its_window(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: datetime
+) -> None:
+    serpapi = bootstrap_window(
+        "serpapi", NOW, SETTINGS, interval_s=SIX_H, account=account(NOW, NOW + timedelta(days=12))
+    )
+    assert serpapi is not None
+    await insert_window(engine, serpapi)
+    fallback = (await dry_run(logged_in_client, seeded()))["projections"]["serpapi_fallback"]
+    assert set(fallback) == {"units_per_run", "hourly_cap", "state", "window"}
+    assert (fallback["hourly_cap"], fallback["state"]) == (45, "validated")
+    assert isinstance(fallback["units_per_run"], float) and fallback["units_per_run"] > 0
+    assert fallback["window"] == {
+        "used_units": 0,
+        "limit_units": 250,
+        "reset_at": serpapi.window_end.isoformat().replace("+00:00", "Z"),
+    }
+
+
+async def test_progress_has_both_phases_and_scope_applied(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, current_epoch: int
+) -> None:
+    body = await settings_body(logged_in_client)
+    assert (body["pending_scope"], body["scope_applied"]) == (None, True)  # the seeded scope is in force
+    saved = await save_scope(logged_in_client, radius_km=40)
+    op_id = saved["apply_scope_operation_id"]
+    pending = (await active_row(engine)).pending_scope_version_id
+    body = await settings_body(logged_in_client)
+    zero = {"done": 0, "total": 0, "det_done": 0, "det_total": 0}
+    assert (body["pending_scope"], body["scope_applied"]) == (
+        {"version_id": pending, "progress": zero},
+        False,
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE operations SET progress = "
+                '\'{"done": 1201, "total": 1201, "det_done": 40, "det_total": 350}\' WHERE id = :i'
+            ),
+            {"i": op_id},
+        )
+    progress = (await settings_body(logged_in_client))["pending_scope"]["progress"]
+    assert progress == {"done": 1201, "total": 1201, "det_done": 40, "det_total": 350}
+
+    await fail_for_good(engine, op_id)  # no live apply, until the reconciler clears the pointer
+    body = await settings_body(logged_in_client)
+    assert (body["pending_scope"], body["scope_applied"]) == (
+        {"version_id": pending, "progress": None},
+        False,
+    )
+    assert await run_reconciler("scope_apply_failed", engine, now=NOW, epoch=current_epoch) == 1
+    body = await settings_body(logged_in_client)
+    # nothing pending, and the active version's scope is still not the active one: what retry-apply acts on
+    assert (body["pending_scope"], body["scope_applied"]) == (None, False)
+    assert body["version"]["id"] == saved["version"]["id"]
+
+
+# ---- the dry-run's history (D22) ---------------------------------------------------------------------------
+
+
+async def published_attempts(engine: AsyncEngine, llm_tuple_id: int, n: int, cost: str) -> None:
+    """`n` charged online attempts of the tuple that ended published a day before `NOW`, at `cost` each."""
+    async with engine.begin() as conn:
+        target = await insert_target(conn, await insert_job(conn), llm_tuple_id)
+        for number in range(1, n + 1):
+            await insert_attempt(
+                conn,
+                target,
+                attempt_no=number,
+                outcome="published_accepted",
+                charged=True,
+                cost_usd=Decimal(cost),
+                ended_at=NOW - timedelta(days=1),
+            )
+
+
+async def test_dry_run_uses_history_c_hat_for_unchanged_policies_and_central_otherwise(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: datetime
+) -> None:
+    assert (await dry_run(logged_in_client, seeded()))["projections"]["llm"]["c_hat"] == CENTRAL_B  # no tuple
+    _, tuple_id = await activate_profile(engine)
+    await published_attempts(engine, tuple_id, 19, "0.120000")
+    assert (await dry_run(logged_in_client, seeded()))["projections"]["llm"]["c_hat"] == CENTRAL_B  # 19 < 20
+    await published_attempts(engine, tuple_id, 1, "0.120000")
+    # the active policies: the tuple's 7-day mean, also for a change that touches neither policy
+    for doc in (
+        seeded(),
+        changed("schedule.interval_hours", 12),
+        changed("scoring.model_policy.preset", "C"),
+    ):
+        body = await dry_run(logged_in_client, doc)
+        assert body["projections"]["llm"]["c_hat"] == "0.120000", doc
+        assert body["projections"]["llm"]["targets_per_month"] == 745  # 93.10 / (0.12 + 0.004923)
+    # another model policy: its own central estimate, not the tuple's history
+    c_grid = presets.PRESETS["C"].policy().model_dump(mode="json")
+    body = await dry_run(logged_in_client, changed("scoring.model_policy", c_grid))
+    assert body["projections"]["llm"]["c_hat"] == "0.019352"
+    c_central = central_cost_per_target(presets.PRESETS["C"].policy())
+    assert Decimal(body["projections"]["llm"]["c_hat"]) == c_central
+    # another evaluation policy over the same model policy: central too
+    body = await dry_run(logged_in_client, changed("evaluation.t2_band", 3))
+    assert body["projections"]["llm"]["c_hat"] == CENTRAL_B
+
+
+async def recent_targets(engine: AsyncEngine, llm_tuple_id: int, *ages: timedelta) -> None:
+    """A target of a new job for each of `ages`, created that long before `NOW`."""
+    async with engine.begin() as conn:
+        for age in ages:
+            await insert_target(conn, await insert_job(conn), llm_tuple_id, created_at=NOW - age)
+
+
+async def test_dry_run_arrivals_from_the_seven_day_rate(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: datetime
+) -> None:
+    def arrivals(body: dict[str, Any]) -> int:
+        found: int = body["projections"]["llm"]["arrival_per_month"]
+        return found
+
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 3000  # no tuple
+    _, tuple_id = await activate_profile(engine)
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 3000  # a tuple without targets
+    days = [timedelta(days=d, hours=1) for d in range(7)][:-1] * 2 + [timedelta(hours=2), timedelta(hours=3)]
+    await recent_targets(engine, tuple_id, *days)  # 14 targets, all within the last 7 days
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 3000  # the oldest is younger than 7 days
+    # an old one, and one created after `now`
+    await recent_targets(engine, tuple_id, timedelta(days=10), timedelta(hours=-1))
+    body = await dry_run(logged_in_client, seeded())
+    assert arrivals(body) == 60  # 14 x 30 / 7
+    assert "llm_cap_binding" not in codes(body)  # 60 arrive, about 1,617 fit
+    await recent_targets(engine, tuple_id, timedelta(days=6, hours=23))
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 64  # 15 x 30 / 7 = 64.3
+
+
+async def test_no_rescore_warning_without_a_profile(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: datetime
+) -> None:
+    async with engine.begin() as conn:
+        for _ in range(3):
+            await insert_job(conn)
+    tuple_change = changed("scoring.model_policy.nodes.critic.effort", "high")
+    body = await dry_run(logged_in_client, tuple_change)
+    assert "llm_tuple" in body["effects"] and "llm_rescore" not in codes(body)
+    await activate_profile(engine)
+    body = await dry_run(logged_in_client, tuple_change)
+    (rescore,) = [w["detail"] for w in body["warnings"] if w["code"] == "llm_rescore"]
+    assert rescore == {"targets": 3, "est_usd": "0.157938", "bulk_budget_usd": "37.240000"}  # 3 x $0.052646

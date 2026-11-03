@@ -210,6 +210,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/eval-runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Eval Runs
+         * @description The eval runs of one kind, newest first, keyset-paged (§14.3), with the active configuration's gate.
+         */
+        get: operations["list_eval_runs_api_eval_runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/feedback/{feedback_id}": {
         parameters: {
             query?: never;
@@ -901,7 +921,8 @@ export interface paths {
         };
         /**
          * Get Settings
-         * @description The active settings version, its document and the scope being applied, if any.
+         * @description The active settings version, its document, the scope being applied, if any, and whether the active
+         *     version's scope is in force.
          */
         get: operations["get_settings_api_settings_get"];
         put?: never;
@@ -978,6 +999,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/prompt-schema-versions/{version_id}/activation-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview Prompt Schema Activation
+         * @description What activating a shipped prompt-schema version would check and re-score: the live schema dry-runs it
+         *     lacks for the active model policy, the eval gate of the candidate, its latest golden run and the
+         *     re-score's estimate, read without writing anything.
+         */
+        get: operations["preview_prompt_schema_activation_api_settings_prompt_schema_versions__version_id__activation_preview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/settings/rubric-versions": {
         parameters: {
             query?: never;
@@ -1012,6 +1055,27 @@ export interface paths {
          * @description Activate a shipped rubric version: an `llm_tuple` change (§13.3), its re-score acknowledged (201).
          */
         post: operations["activate_rubric_version_api_settings_rubric_versions__version_id__activate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/rubric-versions/{version_id}/activation-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview Rubric Activation
+         * @description What activating a shipped rubric version would check and re-score: the eval gate of the candidate,
+         *     its latest golden run and the re-score's estimate, read without writing anything.
+         */
+        get: operations["preview_rubric_activation_api_settings_rubric_versions__version_id__activation_preview_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1452,6 +1516,86 @@ export interface components {
             version: number;
         };
         /**
+         * ActivationPreviewOut
+         * @description What activating the version would check and re-score, read without writing anything.
+         */
+        ActivationPreviewOut: {
+            /**
+             * Active
+             * @description The version is the active one, which cannot be activated again
+             */
+            active: boolean;
+            /**
+             * Bulk Budget Usd
+             * @description The budget of the re-score's bulk operation
+             */
+            bulk_budget_usd: string;
+            /**
+             * Est Usd Batch
+             * @description The re-score's estimated cost in batches
+             */
+            est_usd_batch: string;
+            /**
+             * Est Usd Online
+             * @description The re-score's estimated cost online
+             */
+            est_usd_online: string;
+            /**
+             * Gate State
+             * @description The eval gate of the candidate, the active configuration with this version
+             * @enum {string}
+             */
+            gate_state: "uncalibrated" | "passed" | "failed";
+            latest_golden_run: components["schemas"]["GoldenRunOut"] | null;
+            /**
+             * Schema Verified
+             * @description Whether passed live schema dry-runs of this prompt-schema version cover every model of the active model policy; null where the activation checks none (a rubric version, or the fake LLM)
+             */
+            schema_verified: boolean | null;
+            /**
+             * Targets
+             * @description The retained ads the activation re-scores; 0 while no profile is active
+             */
+            targets: number;
+            /**
+             * Unverified Models
+             * @description The models without a passed live schema dry-run of a schema they need, sorted
+             */
+            unverified_models: string[];
+            /** Version Id */
+            version_id: number;
+        };
+        /**
+         * ActiveGateOut
+         * @description The active configuration's eval gate and the number of the user's golden cases it counts.
+         */
+        ActiveGateOut: {
+            /** Cases */
+            cases: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "uncalibrated" | "passed" | "failed";
+        };
+        /**
+         * AdzunaProjectionOut
+         * @description Adzuna under the proposed settings: the calls a day the cells need and the allowance a day.
+         */
+        AdzunaProjectionOut: {
+            /** Allowance Per Day */
+            allowance_per_day: number;
+            /**
+             * Cadence Days
+             * @description Days to refresh every cell; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed
+             */
+            cadence_days: number | null;
+            /** Calls Per Day */
+            calls_per_day: number;
+            /** Cells */
+            cells: number;
+        };
+        /**
          * AlertOut
          * @description An alert and its status: `resolved` once it is resolved, else `acknowledged` once it is acknowledged,
          *     else `open`. A client shows it by its `code`; `message` is an untranslated fallback.
@@ -1509,6 +1653,16 @@ export interface components {
             items: components["schemas"]["AlertOut"][];
             /** Next Cursor */
             next_cursor: string | null;
+        };
+        /**
+         * ArbeitnowProjectionOut
+         * @description Arbeitnow: the pages a run may read and the pages the interval is expected to need.
+         */
+        ArbeitnowProjectionOut: {
+            /** Expected Pages */
+            expected_pages: number;
+            /** Page Cap */
+            page_cap: number;
         };
         /**
          * AttentionOut
@@ -1712,6 +1866,11 @@ export interface components {
             name: string;
             /** Year */
             year: number | null;
+        };
+        /** Collection */
+        Collection: {
+            /** Stale Ttl Days */
+            stale_ttl_days: number | null;
         };
         /** CompanyFacetOut */
         CompanyFacetOut: {
@@ -1940,6 +2099,20 @@ export interface components {
             /** Total Bytes */
             total_bytes: number;
         };
+        /** Display */
+        Display: {
+            /**
+             * Timezone
+             * @default Europe/Berlin
+             */
+            timezone: string;
+            /**
+             * Ui Language
+             * @default en
+             * @enum {string}
+             */
+            ui_language: "en" | "de";
+        };
         /** DraftCreatedOut */
         DraftCreatedOut: {
             /** Draft Id */
@@ -1990,13 +2163,8 @@ export interface components {
             effects: ("none" | "schedule" | "collection" | "admission" | "budget" | "scope" | "execution" | "evaluation_policy" | "llm_tuple")[];
             /** Errors */
             errors: components["schemas"]["FieldIssueOut"][];
-            /**
-             * Projections
-             * @description The preview by part (§13.5). In `adzuna`, `cadence_days` is days or null; null means never: with no Adzuna allowance (a monthly cap of 1 leaves a bucket of 0 units) no cell is ever refreshed.
-             */
-            projections: {
-                [key: string]: components["schemas"]["JsonValue"];
-            };
+            /** @description The preview by part; null with errors */
+            projections: components["schemas"]["ProjectionsOut"] | null;
             /** Warnings */
             warnings: components["schemas"]["WarningOut"][];
         };
@@ -2028,6 +2196,75 @@ export interface components {
             ok: boolean;
         };
         /**
+         * EvalRunOut
+         * @description An eval run with its gate's figures; a run not calibrated (running, crashed, a schema dry-run) has
+         *     none of them.
+         */
+        EvalRunOut: {
+            /** Contested Rate */
+            contested_rate: string | null;
+            /** Cost Usd */
+            cost_usd: string;
+            /**
+             * Failed Gates
+             * @description The gates a failed run missed
+             */
+            failed_gates: string[];
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Gate
+             * @description The state of the gate the run measured
+             */
+            gate: ("uncalibrated" | "passed" | "failed") | null;
+            /** Id */
+            id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "golden" | "schema_dry_run";
+            /**
+             * Pairwise
+             * @description The pairwise agreement of score and label order
+             */
+            pairwise: string | null;
+            /**
+             * Passed
+             * @description Whether it passed; null while it runs or when never gated
+             */
+            passed: boolean | null;
+            /** Prompt Schema Version Id */
+            prompt_schema_version_id: number | null;
+            /**
+             * Route
+             * @enum {string}
+             */
+            route: "production" | "forced_critic";
+            /** Rubric Version Id */
+            rubric_version_id: number | null;
+            /** Spearman Rho */
+            spearman_rho: string | null;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "completed" | "failed";
+        };
+        /** EvalRunsPageOut */
+        EvalRunsPageOut: {
+            active_gate: components["schemas"]["ActiveGateOut"];
+            /** Items */
+            items: components["schemas"]["EvalRunOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
          * EvalSpendGroupOut
          * @description The month's tries of eval runs (golden, canary, schema dry-run) of one model and role, and what they
          *     count.
@@ -2044,6 +2281,36 @@ export interface components {
              * @enum {string}
              */
             role: "generate" | "revise" | "critic" | "extract_profile" | "propose_queries" | "schema_dry_run";
+        };
+        /** Evaluation */
+        Evaluation: {
+            /** Critic Light Triggers */
+            critic_light_triggers: ("T2" | "T3" | "T8")[];
+            /**
+             * Relevance Threshold
+             * @default 60
+             */
+            relevance_threshold: number;
+            /**
+             * T2 Band
+             * @default 5
+             */
+            t2_band: number;
+            /**
+             * T2 Straddle Max Coverage
+             * @default 0.7
+             */
+            t2_straddle_max_coverage: string;
+            /**
+             * T3 Min Mid
+             * @default 80
+             */
+            t3_min_mid: number;
+            /**
+             * T8 Sample Pct
+             * @default 5
+             */
+            t8_sample_pct: number;
         };
         /** EvidenceOut */
         EvidenceOut: {
@@ -2062,6 +2329,26 @@ export interface components {
             span_start: number | null;
             /** Subject */
             subject: string;
+        };
+        /**
+         * ExecutionConfig
+         * @description The §10.3 table.
+         */
+        ExecutionConfig: {
+            critic: components["schemas"]["ExecutionNode"];
+            extract_profile: components["schemas"]["ExecutionNode"];
+            generate: components["schemas"]["ExecutionNode"];
+            propose_queries: components["schemas"]["ExecutionNode"];
+            revise: components["schemas"]["ExecutionNode"];
+        };
+        /** ExecutionNode */
+        ExecutionNode: {
+            /** Deadline S */
+            deadline_s: number;
+            /** Max Tokens */
+            max_tokens: number;
+            /** Max Tokens Retry */
+            max_tokens_retry: number;
         };
         /** ExtractingOut */
         ExtractingOut: {
@@ -2228,6 +2515,27 @@ export interface components {
             items: components["schemas"]["GoldenCaseOut"][];
             /** Next Cursor */
             next_cursor: string | null;
+        };
+        /**
+         * GoldenRunOut
+         * @description The golden run that decides the candidate's eval gate once it is calibrated: the newest completed run
+         *     of the candidate on the production route with an accepted transport.
+         */
+        GoldenRunOut: {
+            /** Eval Run Id */
+            eval_run_id: number;
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Passed
+             * @description Whether it passed; null when it was never gated
+             */
+            passed: boolean | null;
+            /**
+             * Spearman Rho
+             * @description Spearman's rho of score and label; null when undefined
+             */
+            spearman_rho: string | null;
         };
         /** GroupBadgeOut */
         GroupBadgeOut: {
@@ -2621,6 +2929,19 @@ export interface components {
             /** Ranking Generation */
             ranking_generation: number;
         };
+        /**
+         * JsearchProjectionOut
+         * @description JSearch under the proposed settings: units per run, days to refresh every paid cell, the cells.
+         */
+        JsearchProjectionOut: {
+            /** Cells */
+            cells: number;
+            /** Refresh Cadence Days */
+            refresh_cadence_days: number;
+            /** Units Per Run */
+            units_per_run: number;
+            window: components["schemas"]["QuotaWindowOut"] | null;
+        };
         JsonValue: unknown;
         /** KnockoutOut */
         KnockoutOut: {
@@ -2636,6 +2957,48 @@ export interface components {
             severity: string;
             /** Status */
             status: string;
+        };
+        /**
+         * KnockoutSeverity
+         * @description The severity per §11.4 knockout code; `mandatory_language` follows `language_policy` (§13.6).
+         */
+        KnockoutSeverity: {
+            /**
+             * Certification
+             * @default soft
+             * @enum {string}
+             */
+            certification: "hard" | "soft";
+            /**
+             * Contract Type
+             * @default hard
+             * @enum {string}
+             */
+            contract_type: "hard" | "soft";
+            /**
+             * Degree
+             * @default soft
+             * @enum {string}
+             */
+            degree: "hard" | "soft";
+            /**
+             * Onsite Required
+             * @default hard
+             * @enum {string}
+             */
+            onsite_required: "hard" | "soft";
+            /**
+             * Security Clearance
+             * @default hard
+             * @enum {string}
+             */
+            security_clearance: "hard" | "soft";
+            /**
+             * Work Permit
+             * @default hard
+             * @enum {string}
+             */
+            work_permit: "hard" | "soft";
         };
         /**
          * LabelItemOut
@@ -2719,6 +3082,68 @@ export interface components {
             adzuna: string | null;
             /** Open Ad */
             open_ad: string | null;
+        };
+        /** Llm */
+        Llm: {
+            /**
+             * Cap Usd
+             * @default 100.00
+             */
+            cap_usd: string;
+            /**
+             * Min Bucket Capacity Usd
+             * @default 1.00
+             */
+            min_bucket_capacity_usd: string;
+            /**
+             * Nonscoring Reserve Pct
+             * @default 5
+             */
+            nonscoring_reserve_pct: number;
+            /**
+             * Overrun Buffer Usd
+             * @default 2.00
+             */
+            overrun_buffer_usd: string;
+        };
+        /**
+         * LlmProjectionOut
+         * @description The scoring budget under the proposed settings (§6.9.2, §21): the bucket, the expected cost per target,
+         *     the projected critic rate, the targets a month can score against those expected to arrive, and the
+         *     month's figures as a save would leave them.
+         */
+        LlmProjectionOut: {
+            /**
+             * Arrival Per Month
+             * @description New targets a month: the active tuple's rate of the last 7 days, or 3000 without 7 days of history
+             */
+            arrival_per_month: number;
+            /** Bucket Capacity */
+            bucket_capacity: string;
+            /** Bucket Rate Per H */
+            bucket_rate_per_h: string;
+            /**
+             * C Hat
+             * @description The expected cost per target: the active tuple's 7-day mean while the model and evaluation policies are unchanged, else the central estimate of the proposed model policy
+             */
+            c_hat: string;
+            /** Cap Usd */
+            cap_usd: string;
+            /** Counted Usd */
+            counted_usd: string;
+            /** Headroom Usd */
+            headroom_usd: string;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+            /** Projected Critic Rate */
+            projected_critic_rate: string;
+            /** Projected Month Spend */
+            projected_month_spend: string;
+            /** Targets Per Month */
+            targets_per_month: number;
         };
         /**
          * LlmSpendOut
@@ -2823,10 +3248,64 @@ export interface components {
             /** Model */
             model: string;
         };
+        /**
+         * ModelPolicy
+         * @description The model and effort of each node, and the critic's effort for a light round (§10.3). `preset` is the
+         *     label of that grid, `A`, `B` or `C` for a preset's, `custom` for any other; a label a request sends is
+         *     replaced by it.
+         */
+        ModelPolicy: {
+            /**
+             * Critic Light Effort
+             * @default low
+             * @enum {string}
+             */
+            critic_light_effort: "low" | "medium" | "high" | "xhigh" | "max";
+            nodes: components["schemas"]["ModelPolicyNodes"];
+            /**
+             * Preset
+             * @default B
+             * @enum {string}
+             */
+            preset: "A" | "B" | "C" | "custom";
+        };
+        /**
+         * ModelPolicyNodes
+         * @description The model and effort of each node; the defaults are model policy B (§10.3).
+         */
+        ModelPolicyNodes: {
+            critic: components["schemas"]["NodeChoice"];
+            extract_profile: components["schemas"]["NodeChoice"];
+            generate: components["schemas"]["NodeChoice"];
+            propose_queries: components["schemas"]["NodeChoice"];
+            revise: components["schemas"]["NodeChoice"];
+        };
+        /** NodeChoice */
+        NodeChoice: {
+            /**
+             * Effort
+             * @enum {string}
+             */
+            effort: "low" | "medium" | "high" | "xhigh" | "max";
+            /**
+             * Model
+             * @enum {string}
+             */
+            model: "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-haiku-5-5" | "claude-fable-5-1";
+        };
         /** NotReadyOut */
         NotReadyOut: {
             /** Failing */
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
+        };
+        /** Notifications */
+        Notifications: {
+            /**
+             * Push Min Severity
+             * @default warn
+             * @enum {string}
+             */
+            push_min_severity: "warn" | "critical";
         };
         /**
          * PaidSearchOut
@@ -2876,11 +3355,11 @@ export interface components {
         };
         /**
          * PendingScopeOut
-         * @description The scope being applied (§13.4) and its live apply's progress; `progress` is `null` while no apply is
-         *     live (one that failed for good, until the pointer is cleared).
+         * @description The scope being applied (§13.4) and its live apply's progress in both phases; `progress` is `null`
+         *     while no apply is live (one that failed for good, until the pointer is cleared).
          */
         PendingScopeOut: {
-            progress: components["schemas"]["ProgressOut"] | null;
+            progress: components["schemas"]["ScopeProgressOut"] | null;
             /** Version Id */
             version_id: number;
         };
@@ -3001,12 +3480,37 @@ export interface components {
             /** Version No */
             version_no: number;
         };
-        /** ProgressOut */
-        ProgressOut: {
-            /** Done */
-            done: number;
-            /** Total */
-            total: number;
+        /**
+         * ProjectionsOut
+         * @description The preview by part (§13.5). The last four are present only where an effect class adds them.
+         */
+        ProjectionsOut: {
+            adzuna: components["schemas"]["AdzunaProjectionOut"];
+            arbeitnow: components["schemas"]["ArbeitnowProjectionOut"];
+            /**
+             * Critic Rate
+             * @description With an evaluation-policy change: its projected critic rate
+             */
+            critic_rate?: string | null;
+            /**
+             * Det Recompute
+             * @description With a scope change: the published results recomputed without an LLM call
+             */
+            det_recompute?: number | null;
+            /**
+             * Eval Gate
+             * @description With a model- or evaluation-policy change: the eval gate a save checks
+             */
+            eval_gate?: ("uncalibrated" | "passed" | "failed") | null;
+            jsearch: components["schemas"]["JsearchProjectionOut"];
+            llm: components["schemas"]["LlmProjectionOut"];
+            /**
+             * Next Slot
+             * @description With a schedule change: the next slot, null while the schedule is disabled
+             */
+            next_slot?: string | null;
+            /** @description Null before the first SerpApi account read: no window, so no fallback */
+            serpapi_fallback: components["schemas"]["SerpapiProjectionOut"] | null;
         };
         /**
          * PromptSchemaVersionOut
@@ -3111,6 +3615,13 @@ export interface components {
             lang?: ("de" | "en") | null;
             /** Text */
             text?: string | null;
+        };
+        /** QueryEntry */
+        QueryEntry: {
+            /** Enabled */
+            enabled: boolean;
+            /** Query Id */
+            query_id: number;
         };
         /** QueryIn */
         QueryIn: {
@@ -3220,6 +3731,57 @@ export interface components {
             text: string;
         };
         /**
+         * Quota
+         * @description The quota limits (§6).
+         */
+        Quota: {
+            /**
+             * Adzuna Cap Day
+             * @default 225
+             */
+            adzuna_cap_day: number;
+            /**
+             * Adzuna Cap Minute
+             * @default 20
+             */
+            adzuna_cap_minute: number;
+            /**
+             * Adzuna Cap Month
+             * @default 2250
+             */
+            adzuna_cap_month: number;
+            /**
+             * Adzuna Cap Week
+             * @default 900
+             */
+            adzuna_cap_week: number;
+            /**
+             * Jsearch Monthly Limit
+             * @default 200
+             */
+            jsearch_monthly_limit: number;
+            /**
+             * Paid Max Requests Per Run
+             * @default auto
+             */
+            paid_max_requests_per_run: number | "auto";
+            /**
+             * Reserve Pct
+             * @default 10
+             */
+            reserve_pct: number;
+            /**
+             * Serpapi Hourly Cap
+             * @default 45
+             */
+            serpapi_hourly_cap: number;
+            /**
+             * Serpapi Monthly Limit
+             * @default 250
+             */
+            serpapi_monthly_limit: number;
+        };
+        /**
          * QuotaDetailOut
          * @description A provider's current quota window and its ledger: `used` is the window's counted usage (the attempts
          *     that count and every adjustment), `reserved` the units reserved or in flight, `ambiguous` the units of
@@ -3285,6 +3847,21 @@ export interface components {
              * Format: date-time
              */
             window_start: string;
+        };
+        /**
+         * QuotaWindowOut
+         * @description A paid provider's quota window at the time of the preview: its counted units, limit and reset.
+         */
+        QuotaWindowOut: {
+            /** Limit Units */
+            limit_units: number;
+            /**
+             * Reset At
+             * Format: date-time
+             */
+            reset_at: string;
+            /** Used Units */
+            used_units: number;
         };
         /**
          * RawItemsSectionOut
@@ -3446,6 +4023,14 @@ export interface components {
              * @enum {string}
              */
             decision: "separate" | "merge";
+        };
+        /** Retention */
+        Retention: {
+            /**
+             * Score History Months
+             * @default 12
+             */
+            score_history_months: number;
         };
         /**
          * RetrieveFailingBatchOut
@@ -3685,6 +4270,29 @@ export interface components {
             /** Version No */
             version_no: number;
         };
+        /** Schedule */
+        Schedule: {
+            /**
+             * Anchor Local
+             * @default 06:00
+             */
+            anchor_local: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Include Paid
+             * @default true
+             */
+            include_paid: boolean;
+            /**
+             * Interval Hours
+             * @default 6
+             */
+            interval_hours: number;
+        };
         /**
          * SchemaDryRunOut
          * @description A schema dry-run of a prompt-schema version (§10.11): `passed`, `transport` (`live` or `fake`) and
@@ -3700,6 +4308,54 @@ export interface components {
             /** Transport */
             transport: string | null;
         };
+        /** Scope */
+        Scope: {
+            /** Accepted Ad Languages */
+            accepted_ad_languages: ("de" | "en" | "other")[];
+            /** Employment Types */
+            employment_types: ("full_time" | "part_time" | "contract" | "temporary" | "internship" | "working_student" | "apprenticeship" | "freelance")[];
+            /**
+             * Exclude Keywords In Description
+             * @default false
+             */
+            exclude_keywords_in_description: boolean;
+            /** Excluded Companies */
+            excluded_companies: string[];
+            /** Excluded Keywords */
+            excluded_keywords: string[];
+            /** Industries Exclude */
+            industries_exclude: string[];
+            /** Industries Include */
+            industries_include: string[];
+            knockout_severity: components["schemas"]["KnockoutSeverity"];
+            /** Language Policy */
+            language_policy: {
+                [key: string]: "hard" | "soft";
+            };
+            /**
+             * Language Policy Default
+             * @default hard
+             * @enum {string}
+             */
+            language_policy_default: "hard" | "soft";
+            /** Locations */
+            locations: components["schemas"]["ScopeLocation"][];
+            /**
+             * Max Ad Age Days
+             * @default 30
+             */
+            max_ad_age_days: number;
+            /** Min Salary Eur Year */
+            min_salary_eur_year: number | null;
+            /**
+             * Remote Within Germany
+             * @default true
+             */
+            remote_within_germany: boolean;
+            seniority_range: components["schemas"]["SeniorityRange"];
+            /** Work Modes */
+            work_modes: ("remote" | "hybrid" | "onsite")[];
+        };
         /**
          * ScopeApplyFailedOut
          * @description The scope whose apply failed, and its open alert (null until the alert is raised).
@@ -3709,6 +4365,22 @@ export interface components {
             alert_id: number | null;
             /** Version Id */
             version_id: number;
+        };
+        /**
+         * ScopeLocation
+         * @description A gazetteer place (§8.12), chosen through the gazetteer search.
+         */
+        ScopeLocation: {
+            /** Gazetteer Id */
+            gazetteer_id: string;
+            /** Label */
+            label: string;
+            /** Lat */
+            lat: number;
+            /** Lon */
+            lon: number;
+            /** Radius Km */
+            radius_km: number;
         };
         /**
          * ScopeProgressOut
@@ -3832,6 +4504,41 @@ export interface components {
              */
             result_status: "accepted" | "contested";
         };
+        /** Scoring */
+        Scoring: {
+            /**
+             * Batch Bulk Rescore
+             * @default true
+             */
+            batch_bulk_rescore: boolean;
+            /**
+             * Batch Max Items
+             * @default 500
+             */
+            batch_max_items: number;
+            /**
+             * Batch Min Targets
+             * @default 200
+             */
+            batch_min_targets: number;
+            /**
+             * Bulk Rescore Max Budget Share
+             * @default 0.4
+             */
+            bulk_rescore_max_budget_share: string;
+            execution: components["schemas"]["ExecutionConfig"];
+            /**
+             * Max Targets Per Cycle
+             * @default 60
+             */
+            max_targets_per_cycle: number;
+            /**
+             * Min Cycle Targets
+             * @default 10
+             */
+            min_cycle_targets: number;
+            model_policy: components["schemas"]["ModelPolicy"];
+        };
         /**
          * ScoringHealthOut
          * @description The score lane: the running cycle, the pause reason, the oldest pending target's age, the pending and
@@ -3888,6 +4595,45 @@ export interface components {
             /** Stripped Start */
             stripped_start: number;
         };
+        /** SeniorityRange */
+        SeniorityRange: {
+            /**
+             * Above
+             * @default 1
+             */
+            above: number;
+            /**
+             * Below
+             * @default 1
+             */
+            below: number;
+            /** Max */
+            max: ("intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head") | null;
+            /** Min */
+            min: ("intern" | "working_student" | "apprentice" | "junior" | "mid" | "senior" | "lead" | "principal" | "head") | null;
+            /**
+             * Mode
+             * @default profile_relative
+             * @enum {string}
+             */
+            mode: "profile_relative" | "explicit";
+        };
+        /**
+         * SerpapiProjectionOut
+         * @description The SerpApi fallback: units per run, the effective hourly cap and the window's state.
+         */
+        SerpapiProjectionOut: {
+            /** Hourly Cap */
+            hourly_cap: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Units Per Run */
+            units_per_run: number;
+            window: components["schemas"]["QuotaWindowOut"] | null;
+        };
         /** SessionOut */
         SessionOut: {
             /**
@@ -3905,13 +4651,36 @@ export interface components {
             /** Username */
             username: string;
         };
+        /**
+         * Settings
+         * @description The settings document (§13.1): every group with each of its fields.
+         */
+        Settings: {
+            collection: components["schemas"]["Collection"];
+            display: components["schemas"]["Display"];
+            evaluation: components["schemas"]["Evaluation"];
+            llm: components["schemas"]["Llm"];
+            notifications: components["schemas"]["Notifications"];
+            /** Queries */
+            queries: components["schemas"]["QueryEntry"][];
+            quota: components["schemas"]["Quota"];
+            retention: components["schemas"]["Retention"];
+            schedule: components["schemas"]["Schedule"];
+            scope: components["schemas"]["Scope"];
+            scoring: components["schemas"]["Scoring"];
+            sources: components["schemas"]["Sources"];
+            /** Watchlist */
+            watchlist: components["schemas"]["WatchlistEntry"][];
+        };
         /** SettingsOut */
         SettingsOut: {
-            /** Payload */
-            payload: {
-                [key: string]: components["schemas"]["JsonValue"];
-            };
+            payload: components["schemas"]["Settings"];
             pending_scope: components["schemas"]["PendingScopeOut"] | null;
+            /**
+             * Scope Applied
+             * @description Whether the active version's scope is in force; false while one is pending, and after an apply that failed for good, until a retried apply succeeds
+             */
+            scope_applied: boolean;
             version: components["schemas"]["VersionOut"];
         };
         /** Skill */
@@ -3950,6 +4719,38 @@ export interface components {
             count: number;
             /** Source Id */
             source_id: string;
+        };
+        /** SourceSwitches */
+        SourceSwitches: {
+            /**
+             * Adzuna
+             * @default true
+             */
+            adzuna: boolean;
+            /**
+             * Arbeitnow
+             * @default true
+             */
+            arbeitnow: boolean;
+            /**
+             * Ats
+             * @default true
+             */
+            ats: boolean;
+            /**
+             * Jsearch
+             * @default true
+             */
+            jsearch: boolean;
+            /**
+             * Serpapi
+             * @default true
+             */
+            serpapi: boolean;
+        };
+        /** Sources */
+        Sources: {
+            enabled: components["schemas"]["SourceSwitches"];
         };
         /**
          * SpanEditIn
@@ -4331,10 +5132,7 @@ export interface components {
         VersionDetailOut: {
             /** Diff */
             diff: components["schemas"]["DiffEntryOut"][];
-            /** Payload */
-            payload: {
-                [key: string]: components["schemas"]["JsonValue"];
-            };
+            payload: components["schemas"]["Settings"];
             version: components["schemas"]["VersionOut"];
         };
         /**
@@ -4452,6 +5250,13 @@ export interface components {
              * @constant
              */
             validation_status: "unvalidated";
+        };
+        /** WatchlistEntry */
+        WatchlistEntry: {
+            /** Enabled */
+            enabled: boolean;
+            /** Watchlist Company Id */
+            watchlist_company_id: number;
         };
         /** WatchlistIn */
         WatchlistIn: {
@@ -5200,6 +6005,68 @@ export interface operations {
                 };
             };
             /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_eval_runs_api_eval_runs_get: {
+        parameters: {
+            query: {
+                /** @description The kind of run to list */
+                kind: "golden" | "schema_dry_run";
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvalRunsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -8249,6 +9116,65 @@ export interface operations {
             };
         };
     };
+    preview_prompt_schema_activation_api_settings_prompt_schema_versions__version_id__activation_preview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a shipped rubric or prompt-schema version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActivationPreviewOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_rubric_versions_api_settings_rubric_versions_get: {
         parameters: {
             query?: never;
@@ -8369,6 +9295,65 @@ export interface operations {
                 };
             };
             /** @description Invalid body, the re-score of retained ads not acknowledged (`validation_failed` at `body.expected_rescore_ack`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    preview_rubric_activation_api_settings_rubric_versions__version_id__activation_preview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a shipped rubric or prompt-schema version */
+                version_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActivationPreviewOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such version (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;

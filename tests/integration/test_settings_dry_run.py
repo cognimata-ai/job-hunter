@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import insert_revisions_awaiting
 from tests.support.pg import PgServer, pg_rows
+from tests.support.settings import activate_profile
 
 pytestmark = pytest.mark.integration
 
@@ -179,13 +180,15 @@ WARNING_CASES: list[tuple[str, Change, set[str]]] = [
         change(("sources.enabled.serpapi", False)),
         {"serpapi_disabled_no_fallback", "llm_cap_binding"},
     ),
-    # generator effort low while the eval gate is uncalibrated; a model-policy change also re-scores
+    # generator effort low while the eval gate is uncalibrated; a model-policy change re-scores nothing while
+    # no profile is active (M4 D22), so it gives no `llm_rescore`
     (
         "eval_uncalibrated",
         change(("scoring.model_policy.nodes.generate.effort", "low")),
-        {"eval_uncalibrated", "llm_rescore", "llm_cap_binding"},
+        {"eval_uncalibrated", "llm_cap_binding"},
     ),
-    ("llm_rescore", change(("scoring.model_policy.preset", "custom")), {"llm_rescore", "llm_cap_binding"}),
+    # a label-only change is no change (M4 D20): the label of the grid is stored, whatever the request says
+    ("label_only", change(("scoring.model_policy.preset", "custom")), {"llm_cap_binding"}),
     ("no_cap_binding", change(("llm.cap_usd", "200.00")), set()),
     # Ruling 4: a cap at or below the overrun buffer admits nothing (A ≤ 0)
     ("cap_below_buffer", change(("llm.cap_usd", "1.00")), {"llm_cap_binding"}),
@@ -243,6 +246,7 @@ async def test_llm_rescore_counts_the_retained_revisions_and_uses_the_bulk_share
     logged_in_client, engine, clock
 ) -> None:
     await retained_revisions(engine, 3)
+    await activate_profile(engine)  # without a profile no tuple re-scores anything (M4 D22)
     p = BudgetParams.from_payload(load_settings_v1())
     async with engine.begin() as conn:  # this month has $7.00 of scoring and $3.00 of non-scoring spend
         await ensure_month(conn, month_of(NOW), p, NOW)
@@ -350,7 +354,7 @@ async def test_invalid_input_returns_the_errors_with_their_paths(logged_in_clien
         ("payload.scope.colour", "invalid"),
     ]
     assert all(e["message"] for e in body["errors"])
-    assert (body["warnings"], body["projections"], body["effects"]) == ([], {}, [])
+    assert (body["warnings"], body["projections"], body["effects"]) == ([], None, [])
     # a cross-field rule: no location and no remote work
     doc = with_(with_(base(), "scope.locations", []), "scope.remote_within_germany", False)
     body = await post(logged_in_client, doc)
@@ -424,7 +428,7 @@ async def test_dry_run_writes_nothing(logged_in_client, engine, migrated: PgServ
         ("schedule.interval_hours", 12),
         ("scope.max_ad_age_days", 14),
         ("evaluation.t2_band", 3),
-        ("scoring.model_policy.preset", "custom"),
+        ("scoring.model_policy.nodes.critic.effort", "high"),
         ("scoring.execution.critic.deadline_s", 900),
         ("llm.cap_usd", "150.00"),
         ("display.ui_language", "de"),
@@ -441,19 +445,25 @@ async def test_dry_run_writes_nothing(logged_in_client, engine, migrated: PgServ
         "schedule",
         "scope",
     ]
-    assert {"llm_rescore", "llm_cap_binding"} <= codes(body)
+    assert "llm_cap_binding" in codes(body) and "llm_rescore" not in codes(body)  # no profile (M4 D22)
     after = table_counts(migrated)
     assert after == before
     assert after["public.quota_windows"] == 0
 
 
 async def test_dry_run_runs_inside_a_read_only_transaction(engine) -> None:
-    """The function itself, on a connection whose transaction refuses any write (SQLSTATE 25006)."""
+    """The function itself, on a connection whose transaction refuses any write (SQLSTATE 25006), with a
+    profile and its tuple active, so the re-score warning and the tuple's history are read too."""
+    await activate_profile(engine)
     async with engine.connect() as conn:
         await conn.execute(sa.text("SET TRANSACTION READ ONLY"))
         active = await dryrun.active_settings(conn)
         assert active == Settings.model_validate(load_settings_v1())
-        doc = with_(with_(base(), "scoring.model_policy.preset", "A"), "schedule.anchor_local", "07:00")
+        doc = with_(
+            with_(base(), "scoring.model_policy.critic_light_effort", "medium"),
+            "schedule.anchor_local",
+            "07:00",
+        )
         result = await dryrun.dry_run(conn, doc, active=active, now=NOW)
         await conn.rollback()
     assert result.errors == [] and result.effects == {"collection", "llm_tuple", "schedule", "scope"}

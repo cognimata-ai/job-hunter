@@ -692,7 +692,7 @@ async def test_an_llm_tuple_save_without_a_profile_flips_the_model_policy_only(
     before = await active_row(engine)
     generation_before = await generation(engine)
     payload = with_generator_effort(await active_payload(logged_in_client), "high")
-    assert "llm_rescore" in await warning_codes(logged_in_client, payload)
+    assert "llm_rescore" not in await warning_codes(logged_in_client, payload)  # no tuple (M4 D22)
     body = await save(logged_in_client, payload)
     assert body["version"]["effect_classes"] == ["llm_tuple"]
     after = await active_row(engine)

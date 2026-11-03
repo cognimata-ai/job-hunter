@@ -401,12 +401,16 @@ def _count(progress: JSONValue, name: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def scope_progress(progress: JSONValue) -> ScopeProgressOut:
+    """A live `apply_scope` operation's `operations.progress` in both phases; a count it has not reported yet
+    is 0. `GET /api/settings` reads it so too."""
+    names = ("done", "total", "det_done", "det_total")
+    return ScopeProgressOut(**{name: _count(progress, name) for name in names})
+
+
 async def _scope(conn: AsyncConnection) -> ScopeStatusOut:
     row = (await conn.execute(_PENDING_SCOPE, {"kind": scope_apply.KIND})).one()
-    progress = None
-    if row.operation_id is not None:
-        names = ("done", "total", "det_done", "det_total")
-        progress = ScopeProgressOut(**{name: _count(row.progress, name) for name in names})
+    progress = None if row.operation_id is None else scope_progress(row.progress)
     return ScopeStatusOut(
         pending_version_id=row.pending_scope_version_id,
         progress=progress,

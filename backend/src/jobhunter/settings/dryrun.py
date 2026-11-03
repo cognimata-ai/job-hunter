@@ -15,18 +15,28 @@ settings page shows on every change and that a save runs again (Task 17).
 4. `quota_projections` with the run view of the proposed settings (`RunSettings.from_settings`, the proposed
    interval), on the current window snapshots (none: simulated in memory). Paid search also shows its window:
    the counted units (`ledger.used_units`), the limit and the reset (`window`);
-5. the LLM projection (`llm_projection`) with `ĉ = central_cost_per_target` of the proposed model policy (no
-   attempt history before M3), the proposed evaluation policy's projected critic rate (the stored row's, or
-   the rate a new row gets: the replay over the round-0 drafts, else 0.450), 3,000 arrivals a month, and
-   `llm_cap_binding`; beside it the month's figures as the save would leave them: the month row read without
-   a lock (`spend_ledger.read_month_or_new`), its cap and buffer set to the proposed ones in memory
-   (`budget.change_cap`), its counted spend and scoring headroom;
+5. the LLM projection (`llm_projection`) with `ĉ` (`c_hat`), the proposed evaluation policy's projected
+   critic rate (the stored row's, or the rate a new row gets: the replay over the round-0 drafts, else
+   0.450), the arrivals (`arrival_per_month`) and `llm_cap_binding`; beside it the month's figures as the
+   save would leave them: the month row read without a lock (`spend_ledger.read_month_or_new`), its cap and
+   buffer set to the proposed ones in memory (`budget.change_cap`), its counted spend and scoring headroom.
+   With the active configuration read once (`ActivePolicies`; plan M4 Task 14, D22, spec L1137, L1178):
+   - `ĉ` is §6.9.2's: `cycles.c_hat` of the active tuple and evaluation policy (the trailing 7-day mean of
+     its published online attempts, from 20 of them; else the central estimate) while the proposed model and
+     evaluation policies are the active ones by content hash, else `central_cost_per_target` of the proposed
+     model policy, whose own history no tuple has yet. Without an active tuple it is the central estimate;
+   - `arrival_per_month` is the trailing 7-day rate of new targets a month: the active tuple's targets
+     created in the 7 days up to `now`, x 30 / 7, rounded to the nearest whole number; 3,000
+     (`DEFAULT_ARRIVAL_PER_MONTH`) when there is no such history, which is without an active tuple or while
+     the tuple's oldest target is younger than 7 days (one created by the tuple's own re-score included);
 6. the effect classes (`classify_effects` against the active settings) and what they add:
    - `scope`: `det_recompute`, the published results of the active tuple that the scope apply recomputes
      without any LLM call (`count_published_results_active_tuple`, M3 Task 15);
-   - `llm_tuple`: the warning `llm_rescore` with `targets` (`count_retained_current_revisions`), `est_usd =
-     targets x ĉ` and `bulk_budget_usd = scoring.bulk_rescore_max_budget_share x (A x (1 - reserve_frac) -
-     scoring_counted_usd)` (§6.9.3; Task 21's confirm preview uses the same share);
+   - `llm_tuple` with an active profile: the warning `llm_rescore` with `targets`
+     (`count_retained_current_revisions`), `est_usd = targets x ĉ` and `bulk_budget_usd =
+     scoring.bulk_rescore_max_budget_share x (A x (1 - reserve_frac) - scoring_counted_usd)` (§6.9.3; Task
+     21's confirm preview uses the same share). Without an active profile there is no tuple to re-score
+     (`active_config` pairs them), so there is no warning (D22);
    - `evaluation_policy`: `critic_rate`, the projected critic rate (published results are not re-reviewed);
    - either of the gated classes (`GATED`, §11.13 "What is gated"): `eval_gate`, the state of the gate a
      save would check (`uncalibrated`, `passed` or `failed`);
@@ -104,6 +114,20 @@ _RETAINED_CURRENT_REVISIONS: Final = q(
     "AND NOT synthetic_eval"
 )
 _ACTIVE_TUPLE: Final = q("SELECT llm_tuple_id FROM active_config WHERE id = 1")
+# The active configuration the LLM projection compares the proposal with (D22).
+_ACTIVE_POLICIES: Final = q(
+    "SELECT a.profile_version_id, a.llm_tuple_id, a.evaluation_policy_id, "
+    "m.policy_hash AS model_policy_hash, e.policy_hash AS evaluation_policy_hash FROM active_config a "
+    "JOIN model_policies m ON m.id = a.model_policy_id "
+    "JOIN evaluation_policies e ON e.id = a.evaluation_policy_id WHERE a.id = 1"
+)
+# A tuple's oldest target and its targets created in the window `[since, now]`.
+_ARRIVALS: Final = q(
+    "SELECT min(created_at) AS oldest, count(*) FILTER (WHERE created_at >= :since AND created_at <= :now) "
+    "AS recent FROM score_targets WHERE llm_tuple_id = :tuple"
+)
+ARRIVAL_WINDOW: Final = timedelta(days=7)
+_DAYS_PER_MONTH: Final = 30
 _EVALUATION_POLICY_RATE: Final = q(
     "SELECT projected_critic_rate FROM evaluation_policies WHERE policy_hash = :h"
 )
@@ -126,6 +150,71 @@ class DryRunResult:
     warnings: list[Warning]
     projections: dict[str, JSONValue]
     effects: frozenset[EffectClass]
+
+
+@dataclass(frozen=True)
+class ActivePolicies:
+    """What the LLM projection compares a proposal with (module docstring, step 5): whether a profile is
+    active, the active tuple and evaluation policy, and the hashes of the active model and evaluation
+    policies."""
+
+    profile_active: bool
+    llm_tuple_id: int | None
+    evaluation_policy_id: int
+    model_policy_hash: bytes
+    evaluation_policy_hash: bytes
+
+
+async def active_policies(conn: AsyncConnection) -> ActivePolicies:
+    """The active configuration's `ActivePolicies` (a plain read)."""
+    row = (await conn.execute(_ACTIVE_POLICIES)).one()
+    return ActivePolicies(
+        profile_active=row.profile_version_id is not None,
+        llm_tuple_id=None if row.llm_tuple_id is None else int(row.llm_tuple_id),
+        evaluation_policy_id=int(row.evaluation_policy_id),
+        model_policy_hash=bytes(row.model_policy_hash),
+        evaluation_policy_hash=bytes(row.evaluation_policy_hash),
+    )
+
+
+async def c_hat(
+    conn: AsyncConnection, proposed: Settings, active: ActivePolicies, *, now: datetime
+) -> Decimal:
+    """§6.9.2's `ĉ` for `proposed` (module docstring, step 5): the active tuple's history while its model and
+    evaluation policies are the active ones, else the proposed model policy's central estimate."""
+    policy = proposed.scoring.model_policy
+    d = derived(proposed)
+    same = (
+        content_hash(d.model_policy) == active.model_policy_hash
+        and content_hash(d.evaluation) == active.evaluation_policy_hash
+    )
+    if active.llm_tuple_id is None or not same:
+        return central_cost_per_target(policy)
+    # `cycles` imports `llm.bulk`, which imports this module: imported when the dry-run runs
+    from jobhunter.scoring import cycles
+
+    found, _ = await cycles.c_hat(
+        conn,
+        llm_tuple_id=active.llm_tuple_id,
+        evaluation_policy_id=active.evaluation_policy_id,
+        model_policy=policy,
+        now=now,
+    )
+    return found
+
+
+async def arrival_per_month(conn: AsyncConnection, llm_tuple_id: int | None, *, now: datetime) -> int:
+    """§6.8's arrivals a month (module docstring, step 5): the active tuple's targets of the 7 days up to
+    `now` x 30 / 7, or `DEFAULT_ARRIVAL_PER_MONTH` without 7 days of history."""
+    if llm_tuple_id is None:
+        return DEFAULT_ARRIVAL_PER_MONTH
+    row = (
+        await conn.execute(_ARRIVALS, {"tuple": llm_tuple_id, "since": now - ARRIVAL_WINDOW, "now": now})
+    ).one()
+    if row.oldest is None or row.oldest > now - ARRIVAL_WINDOW:
+        return DEFAULT_ARRIVAL_PER_MONTH
+    rate = Decimal(int(row.recent) * _DAYS_PER_MONTH) / ARRIVAL_WINDOW.days
+    return int(rate.to_integral_value(rounding=ROUND_HALF_UP))
 
 
 async def active_settings(conn: AsyncConnection) -> Settings:
@@ -297,14 +386,15 @@ async def dry_run(
         if isinstance(projection, dict):
             projection["window"] = await _window(conn, provider, snapshot, run, now)
 
-    c_hat = central_cost_per_target(proposed.scoring.model_policy)
+    policies = await active_policies(conn)
+    cost = await c_hat(conn, proposed, policies, now=now)
     critic_rate = await projected_critic_rate(conn, proposed, now=now)
     llm = llm_projection(
         proposed,
         now=now,
-        c_hat=c_hat,
+        c_hat=cost,
         projected_critic_rate=critic_rate,
-        arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
+        arrival_per_month=await arrival_per_month(conn, policies.llm_tuple_id, now=now),
     )
     p = BudgetParams.from_payload(proposed.to_payload())
     month = budget.month_of(now)
@@ -322,13 +412,13 @@ async def dry_run(
     effects = classify_effects(active, proposed)
     if "scope" in effects:
         proj["det_recompute"] = await count_published_results_active_tuple(conn)
-    if "llm_tuple" in effects:
+    if "llm_tuple" in effects and policies.profile_active:
         targets = await count_retained_current_revisions(conn)
         warns.append(
             Warning(
                 "llm_rescore",
                 targets=targets,
-                est_usd=_usd(targets * c_hat),
+                est_usd=_usd(targets * cost),
                 bulk_budget_usd=_usd(bulk_budget(proposed, p, after)),
             )
         )

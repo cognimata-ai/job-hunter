@@ -47,6 +47,17 @@ targets_to_create, bulk_budget_usd}`, `version` the new settings version's numbe
 estimate's count and `bulk_budget_usd` the estimate's figure (both 0 without an active profile: no tuple, no
 bulk operation). Every refusal is a `jobhunter.errors.Refusal` (M4 Task 1, R6), which the api answers with its
 problem. This module does not log: the route logs the ids after its commit.
+
+**The preview** (`activation_preview(conn, *, kind, version_id, now)`, plan M4 Task 14, D8) is what steps 3
+to 6 read, with no refusal but the 404 and no write: the route runs it in one read snapshot
+(`db.snapshot.read_snapshot`, read-only, so PostgreSQL refuses any write and any row lock), with a plain read
+of `active_config` in place of step 1's lock. `_checks` is the one computation of steps 4 to 6 that the
+activation and the preview share: the active document, the prompt-schema version's verification of the
+active model policy (`None` where step 4 checks nothing: a rubric version, or a process on the fake LLM) with
+the pairs it lacks, the candidate's gate, and the re-score estimate (`None` without an active profile). The
+preview adds whether the version is the active one (step 3's 409), the run the candidate's gate reads once
+it is calibrated (`validate.gate_run`; shown below 30 cases too), the models of the unverified pairs, and the
+estimate's figures, all 0 without an active profile, as the activation's body has them.
 """
 
 from collections.abc import Mapping
@@ -54,16 +65,19 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
+from pydantic import BaseModel, Field
 from sqlalchemy import TextClause
+from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.errors import Refusal, RefusalField
 from jobhunter.llm.budget import USD_QUANTUM
 from jobhunter.profile.activation import ACK_FIELD, ACK_REQUIRED
-from jobhunter.profile.estimate import rescore_estimate
+from jobhunter.profile.estimate import RescoreEstimate, rescore_estimate
 from jobhunter.settings.derive import candidate_of
 from jobhunter.settings.dryrun import dry_run
 from jobhunter.settings.effects import EffectClass
@@ -75,7 +89,15 @@ from jobhunter.settings.save import (
     save_settings,
     schema_dry_run_required,
 )
-from jobhunter.settings.validate import eval_gate_state, fake_llm_process, schema_verified, unverified_pairs
+from jobhunter.settings.validate import (
+    Candidate,
+    GateState,
+    eval_gate_state,
+    fake_llm_process,
+    gate_run,
+    schema_verified,
+    unverified_pairs,
+)
 from jobhunter.types import JSONValue
 from jobhunter.worker.tasks import Deferrer
 
@@ -83,10 +105,12 @@ ShippedKind = Literal["rubric", "prompt_schema"]
 FORCED: Final[frozenset[EffectClass]] = frozenset({"llm_tuple"})
 _NO_USD: Final = Decimal(0).quantize(USD_QUANTUM)
 
-_LOCK_ACTIVE: Final = q(
+_ACTIVE_SQL: Final = (
     "SELECT settings_version_id, profile_version_id, model_policy_id, rubric_version_id, "
-    "prompt_schema_version_id FROM active_config WHERE id = 1 FOR UPDATE"
+    "prompt_schema_version_id FROM active_config WHERE id = 1"
 )
+_LOCK_ACTIVE: Final = q(_ACTIVE_SQL + " FOR UPDATE")
+_ACTIVE: Final = q(_ACTIVE_SQL)  # the preview's plain read
 _PAYLOAD: Final = q("SELECT payload FROM settings_versions WHERE id = :id")
 
 
@@ -145,6 +169,56 @@ class ShippedActivation:
         }
 
 
+@dataclass(frozen=True)
+class _Checks:
+    """What steps 4 to 6 read (module docstring, the preview): the active document, the prompt-schema
+    version's verification (`None`: not checked) with the pairs it lacks, the candidate and its gate, and the
+    re-score estimate (`None`: no active profile)."""
+
+    payload: JSONValue
+    settings: Settings
+    schema_verified: bool | None
+    unverified: list[tuple[str, str]]
+    candidate: Candidate
+    gate_state: GateState
+    estimate: RescoreEstimate | None
+
+
+async def _found(conn: AsyncConnection, kind: ShippedKind, version_id: int) -> None:
+    """Step 3's 404 `not_found` for no such version."""
+    shipped = _SHIPPED[kind]
+    if (await conn.execute(shipped.find, {"id": version_id})).first() is None:
+        raise Refusal(404, "not_found", f"{shipped.name} not found")
+
+
+async def _checks(
+    conn: AsyncConnection, *, kind: ShippedKind, version_id: int, active: Row[Any], now: datetime
+) -> _Checks:
+    """Steps 4 to 6's reads for `active` (the `active_config` row), refusing nothing (module docstring)."""
+    payload = (await conn.execute(_PAYLOAD, {"id": active.settings_version_id})).scalar_one()
+    settings = Settings.model_validate(payload)
+    verified: bool | None = None
+    unverified: list[tuple[str, str]] = []
+    if kind == "prompt_schema" and not fake_llm_process():  # step 4
+        verified = await schema_verified(
+            conn, prompt_schema_version_id=version_id, model_policy_id=int(active.model_policy_id)
+        )
+        if not verified:
+            unverified = await unverified_pairs(
+                conn, prompt_schema_version_id=version_id, model_policy=settings.scoring.model_policy
+            )
+    candidate = await candidate_of(conn, settings)  # step 5: the active one with the new pointer
+    if kind == "rubric":
+        candidate = replace(candidate, rubric_version_id=version_id)
+    else:
+        candidate = replace(candidate, prompt_schema_version_id=version_id)
+    gate = await eval_gate_state(conn, candidate=candidate)
+    estimate = None
+    if active.profile_version_id is not None:  # step 6: without a profile no tuple re-scores anything
+        estimate = await rescore_estimate(conn, settings, now=now)
+    return _Checks(payload, settings, verified, unverified, candidate, gate, estimate)
+
+
 async def activate_shipped_version(
     conn: AsyncConnection,
     *,
@@ -157,8 +231,7 @@ async def activate_shipped_version(
     """Activate the shipped `kind` version `version_id` in the caller's transaction (module docstring)."""
     active = (await conn.execute(_LOCK_ACTIVE)).one()  # step 1
     shipped = _SHIPPED[kind]
-    if (await conn.execute(shipped.find, {"id": version_id})).first() is None:  # step 3
-        raise Refusal(404, "not_found", f"{shipped.name} not found")
+    await _found(conn, kind, version_id)  # step 3
     if getattr(active, shipped.pointer) == version_id:
         raise Refusal(
             409,
@@ -166,28 +239,15 @@ async def activate_shipped_version(
             f"{shipped.name} {version_id} is the active one",
             detail="activate another version; this one is in use already",
         )
-    payload = (await conn.execute(_PAYLOAD, {"id": active.settings_version_id})).scalar_one()
-    settings = Settings.model_validate(payload)
-    if kind == "prompt_schema" and not fake_llm_process():  # step 4
-        verified = await schema_verified(
-            conn, prompt_schema_version_id=version_id, model_policy_id=int(active.model_policy_id)
-        )
-        if not verified:
-            missing = await unverified_pairs(
-                conn, prompt_schema_version_id=version_id, model_policy=settings.scoring.model_policy
-            )
-            raise schema_dry_run_required(missing)
-    candidate = await candidate_of(conn, settings)
-    if kind == "rubric":
-        candidate = replace(candidate, rubric_version_id=version_id)
-    else:
-        candidate = replace(candidate, prompt_schema_version_id=version_id)
-    if await eval_gate_state(conn, candidate=candidate) == "failed" and not req.eval_override_ack:
+    checks = await _checks(conn, kind=kind, version_id=version_id, active=active, now=now)
+    if checks.schema_verified is False:  # step 4
+        raise schema_dry_run_required(checks.unverified)
+    if checks.gate_state == "failed" and not req.eval_override_ack:
         raise eval_gate_failed()  # step 5
     targets, bulk_budget_usd = 0, _NO_USD
-    if active.profile_version_id is not None:  # step 6: without a profile no tuple re-scores anything
-        preview = await rescore_estimate(conn, settings, now=now)
-        targets, bulk_budget_usd = preview.targets, preview.bulk_budget_usd
+    if checks.estimate is not None:  # step 6
+        targets, bulk_budget_usd = checks.estimate.targets, checks.estimate.bulk_budget_usd
+    payload = checks.payload
     if targets > 0 and not req.expected_rescore_ack:
         message = f"Activating re-scores {targets} retained ads; acknowledge the estimate to activate."
         raise Refusal(
@@ -197,7 +257,7 @@ async def activate_shipped_version(
             fields=[RefusalField(field=ACK_FIELD, code=ACK_REQUIRED, message=message)],
         )
     await conn.execute(shipped.flip, {"id": version_id, "now": now})  # step 7
-    warnings = (await dry_run(conn, payload, active=settings, now=now)).warnings
+    warnings = (await dry_run(conn, payload, active=checks.settings, now=now)).warnings
     saved = await save_settings(  # step 8
         conn,
         SaveRequest(
@@ -212,3 +272,73 @@ async def activate_shipped_version(
         forced_effects=FORCED,
     )
     return ShippedActivation(saved, targets_to_create=targets, bulk_budget_usd=bulk_budget_usd)
+
+
+# ---- the preview (module docstring) ------------------------------------------------------------------------
+
+
+class GoldenRunOut(BaseModel):
+    """The golden run that decides the candidate's eval gate once it is calibrated: the newest completed run
+    of the candidate on the production route with an accepted transport."""
+
+    eval_run_id: int
+    passed: bool | None = Field(description="Whether it passed; null when it was never gated")
+    spearman_rho: DecimalOut | None = Field(
+        description="Spearman's rho of score and label; null when undefined"
+    )
+    finished_at: UtcDatetime | None
+
+
+class ActivationPreviewOut(BaseModel):
+    """What activating the version would check and re-score, read without writing anything."""
+
+    version_id: int
+    active: bool = Field(description="The version is the active one, which cannot be activated again")
+    gate_state: GateState = Field(
+        description="The eval gate of the candidate, the active configuration with this version"
+    )
+    latest_golden_run: GoldenRunOut | None
+    schema_verified: bool | None = Field(
+        description="Whether passed live schema dry-runs of this prompt-schema version cover every model of "
+        "the active model policy; null where the activation checks none (a rubric version, or the fake LLM)"
+    )
+    unverified_models: list[str] = Field(
+        description="The models without a passed live schema dry-run of a schema they need, sorted"
+    )
+    targets: int = Field(
+        description="The retained ads the activation re-scores; 0 while no profile is active"
+    )
+    est_usd_online: DecimalOut = Field(description="The re-score's estimated cost online")
+    est_usd_batch: DecimalOut = Field(description="The re-score's estimated cost in batches")
+    bulk_budget_usd: DecimalOut = Field(description="The budget of the re-score's bulk operation")
+
+
+async def activation_preview(
+    conn: AsyncConnection, *, kind: ShippedKind, version_id: int, now: datetime
+) -> ActivationPreviewOut:
+    """What activating the shipped `kind` version `version_id` reads before its pointer flip, on the caller's
+    read snapshot (module docstring); 404 `not_found` for no such version, nothing written."""
+    active = (await conn.execute(_ACTIVE)).one()
+    await _found(conn, kind, version_id)
+    checks = await _checks(conn, kind=kind, version_id=version_id, active=active, now=now)
+    run = await gate_run(conn, checks.candidate)
+    estimate = checks.estimate
+    return ActivationPreviewOut(
+        version_id=version_id,
+        active=getattr(active, _SHIPPED[kind].pointer) == version_id,
+        gate_state=checks.gate_state,
+        latest_golden_run=None
+        if run is None
+        else GoldenRunOut(
+            eval_run_id=run.eval_run_id,
+            passed=run.passed,
+            spearman_rho=run.spearman_rho,
+            finished_at=run.finished_at,
+        ),
+        schema_verified=checks.schema_verified,
+        unverified_models=sorted({model for _, model in checks.unverified}),
+        targets=0 if estimate is None else estimate.targets,
+        est_usd_online=_NO_USD if estimate is None else estimate.est_usd_online,
+        est_usd_batch=_NO_USD if estimate is None else estimate.est_usd_batch,
+        bulk_budget_usd=_NO_USD if estimate is None else estimate.bulk_budget_usd,
+    )

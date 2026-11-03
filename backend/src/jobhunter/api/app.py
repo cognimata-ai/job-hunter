@@ -50,6 +50,7 @@ from jobhunter.api.routes import (
     auth,
     cycles,
     docs,
+    eval_runs,
     geo,
     golden,
     groups,
@@ -213,6 +214,7 @@ def create_app(
     api.include_router(profile.router)
     api.include_router(profile_review.router)
     api.include_router(settings.router)
+    api.include_router(eval_runs.router)
     api.include_router(queries.router)
     api.include_router(watchlist.router)
     api.include_router(geo.router)

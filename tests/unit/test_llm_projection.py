@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from jobhunter.settings import presets
 from jobhunter.settings.llm_projection import (
     DEFAULT_ARRIVAL_PER_MONTH,
     LlmProjection,
@@ -46,9 +47,8 @@ def policy(preset: str, generate: str, revise: str, critic: str, *, light: str =
 
 
 OPUS, SONNET, HAIKU = "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"
-PRESET_A = policy("A", OPUS, OPUS, OPUS)
-PRESET_B = ModelPolicy()  # the default (§10.3): Sonnet generator and reviser, Opus critic, light effort low
-PRESET_C = policy("C", HAIKU, HAIKU, SONNET)
+# §10.3's presets (`settings.presets`): B is the default, Sonnet generator and reviser, Opus critic
+PRESET_A, PRESET_B, PRESET_C = (presets.PRESETS[label].policy() for label in ("A", "B", "C"))
 
 
 def settings(**llm: Any) -> Settings:
@@ -59,7 +59,7 @@ def test_preset_b_is_the_central_figure_of_section_21_2() -> None:
     # generate 2,200 x $2 + 4,500 x $0.20 + 1,700 x $10 = $0.0223; critic 0.45 x (0.35 x $0.0305 + 0.65 x
     # $0.0405 + 0.455 x $0.0405) = $0.024942375; revise 0.45 x 0.455 x $0.0253 = $0.005180175; repairs 1% of
     # the generator, $0.000223: $0.05264555, rounded half-up to $0.000001
-    assert PRESET_B.preset == "B" and PRESET_B.nodes.generate.model == SONNET
+    assert PRESET_B == ModelPolicy() and PRESET_B.nodes.generate.model == SONNET
     cost = central_cost_per_target(PRESET_B)
     assert abs(cost - Decimal("0.0526")) <= TOLERANCE
     assert cost == Decimal("0.052646")
@@ -89,7 +89,8 @@ def test_the_preset_label_alone_changes_no_cost() -> None:
 
 
 def test_the_weaker_generator_funnel_follows_the_generator_model_not_the_label() -> None:
-    # C's nodes labelled `custom` keep C's funnel and uplift; a `C` label on B's models keeps B's figure
+    # C's nodes sent as `custom` keep C's funnel and uplift, and a `C` label on B's models B's figure: the
+    # stored label is the grid's own (the label normal form), and the cost reads the models only
     assert central_cost_per_target(policy("custom", HAIKU, HAIKU, SONNET)) == Decimal("0.019352")
     assert central_cost_per_target(policy("C", SONNET, SONNET, OPUS)) == Decimal("0.052646")
     # the funnel is the generator's: a Haiku reviser under a Sonnet generator keeps the default funnel
