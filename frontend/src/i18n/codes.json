@@ -213,5 +213,14 @@
     "acknowledged",
     "open",
     "resolved"
+  ],
+  "pace": [
+    "ahead",
+    "ok"
+  ],
+  "paid_search_reason": [
+    "serpapi_disabled",
+    "serpapi_exhausted",
+    "serpapi_unavailable"
   ]
 }

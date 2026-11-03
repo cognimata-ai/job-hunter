@@ -1,0 +1,219 @@
+/* The header strip: line 1 (the brand, the navigation and the actions), lines 2 and 3 (the facts), then the
+   banners. Every row wraps at its items' boundaries; an item breaks only when it alone is wider than the row. */
+.strip {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: 0 var(--space-6) var(--space-3);
+}
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  column-gap: var(--space-8);
+  row-gap: var(--space-1);
+  min-height: var(--header-height);
+}
+
+.brand {
+  align-self: center;
+  font-size: var(--font-size-4);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.nav,
+.navList {
+  display: flex;
+}
+
+.navList {
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* The link fills the bar's height; its 3 px rule marks the current page. */
+.navLink {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  color: var(--color-text-muted);
+  font-weight: var(--font-weight-medium);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.navLink:hover {
+  color: var(--color-text);
+}
+
+/* Inside the link: the link fills the bar, so a ring outside it would be cut at the top of the page. */
+.navLink:focus-visible {
+  outline-offset: -2px;
+}
+
+.navLink[aria-current="page"] {
+  border-bottom-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  margin-left: auto;
+  padding: var(--space-2) 0;
+}
+
+.alerts {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-2);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.alerts:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
+.alertsCount {
+  color: var(--color-text);
+}
+
+/* Critical alerts: "n critical" says it in text; the colour repeats it. */
+.alertsCritical,
+.alertsCritical .alertsCount,
+.alertsCritical:hover {
+  color: var(--color-critical);
+}
+
+.logout {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 34px;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.logout:hover {
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.logout:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.icon {
+  flex: none;
+}
+
+/* Lines 2 and 3. The separator sits in the gap before each item; the row's left edge clips the one before
+   the first item of each visual line, so a wrapped line never starts with a dot. */
+.facts {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2) 0 var(--space-3);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-2);
+  --gap: var(--space-5);
+}
+
+/* `.facts >`: above the global `ul[role="list"]` reset, which zeroes the padding. */
+.facts > .line {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--gap);
+  row-gap: 2px;
+  /* room for a focus ring inside the clip: 4 px on each side, given back by the margin */
+  margin: -2px calc(-1 * var(--space-1));
+  padding: 4px var(--space-1);
+  overflow: hidden;
+}
+
+.item {
+  position: relative;
+  white-space: nowrap;
+}
+
+.item::before {
+  content: "·" / "";
+  position: absolute;
+  left: calc(-0.5 * var(--gap) - 0.3ch);
+  color: var(--color-border-strong);
+}
+
+.value {
+  color: var(--color-text);
+  font-weight: var(--font-weight-medium);
+}
+
+/* The causes may be long; they alone may break inside their item. */
+.causes {
+  white-space: normal;
+}
+
+.inlineAction {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-accent);
+  font: inherit;
+  font-weight: var(--font-weight-medium);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+}
+
+.inlineAction:hover {
+  color: var(--color-accent-hover);
+}
+
+.loading {
+  padding: var(--space-2) 0 var(--space-3);
+  max-width: 640px;
+}
+
+.problem {
+  padding: var(--space-1) 0 var(--space-3);
+}
+
+@media (max-width: 640px) {
+  .strip {
+    padding: var(--space-2) var(--space-4) var(--space-3);
+  }
+
+  .bar {
+    column-gap: var(--space-4);
+  }
+
+  .navLink {
+    padding-inline: var(--space-2);
+  }
+
+  .actions {
+    margin-left: 0;
+  }
+}

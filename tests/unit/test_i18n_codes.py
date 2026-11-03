@@ -31,7 +31,7 @@ from jobhunter.graphs.collect.nodes.finalize import PartialCause
 from jobhunter.llm import gateway
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus
-from jobhunter.observability.status import BannerCode
+from jobhunter.observability.status import BannerCode, Pace, PaidSearchReason
 from jobhunter.profile.errors import RejectReason
 from jobhunter.profile.review import Repair
 from jobhunter.quota import windows
@@ -259,6 +259,9 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "issue": issue_codes,
     "alert": alert_codes,
     "banner": lambda: literal_values(BannerCode),
+    # the header's LLM pace and the reason of the paid-search pause (plan M4 Task 21)
+    "pace": lambda: literal_values(Pace),
+    "paid_search_reason": lambda: literal_values(PaidSearchReason),
     "window_state": lambda: literal_values(WindowState),
     "instance_health": lambda: literal_values(breaker.Health),
     "alert_status": lambda: literal_values(AlertStatus),
