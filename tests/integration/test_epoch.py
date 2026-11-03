@@ -315,7 +315,7 @@ async def test_a_claimant_that_lost_its_lock_after_the_check_cannot_evict_the_ne
 # --- M3 Task 27 (Codex r4 B1): the epoch claim commits alone, then one fenced transaction per sweep ---------
 
 WAIT_S: Final = 30.0
-BATCH: Final = 200  # `scoring.batch_min_targets`, the smallest batch the settings allow
+BATCH: Final = 200  # `scoring.batch_min_targets`, the seeded default
 # The production registration order (`worker.main._REGISTERING_MODULES`): `worker.operations`, `worker.runs`,
 # `scoring.cycles` (its two), `scoring.batch_operations`.
 PRODUCTION_ORDER: Final = ("operations", "runs", "score_targets", "score_cycles", "batch_submissions")

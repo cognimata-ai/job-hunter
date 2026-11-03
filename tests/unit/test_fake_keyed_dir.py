@@ -127,6 +127,28 @@ async def test_the_keyed_file_answers_before_the_scenario_script(keyed: tuple[Fa
     ]
 
 
+@pytest.mark.parametrize("key", ["generate:1/2:0", "generate:..:0"])
+async def test_a_key_that_names_no_file_raises_at_the_lookup(keyed: tuple[FakeLLM, Path], key: str) -> None:
+    """A key holding `/` or `..` is refused where the directory is read: the try is never answered by the
+    recording in its place, and the fake records no try."""
+    fake_llm, directory = keyed
+    transport = fake.RecordedSSETransport(fake_llm.root, keyed_dir=directory)
+    with pytest.raises(ValueError, match="names no file"):
+        transport.keyed_answer(key)
+    with pytest.raises(anthropic.APIConnectionError) as exc:
+        await _ask(fake_llm, key)
+    assert any(isinstance(cause, ValueError) for cause in _causes(exc.value))
+    assert fake_llm.requests == [] and fake_llm.served == 0
+
+
+def _causes(error: BaseException) -> list[BaseException]:
+    seen, current = [], error.__cause__ or error.__context__
+    while current is not None:
+        seen.append(current)
+        current = current.__cause__ or current.__context__
+    return seen
+
+
 async def test_without_a_keyed_dir_no_file_is_read(fake_llm: FakeLLM, tmp_path: Path) -> None:
     """The variable unset (every test's fake, and the dev stack's three files): a file named like a key's
     answer anywhere answers nothing."""

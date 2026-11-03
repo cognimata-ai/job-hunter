@@ -49,7 +49,9 @@ key in the current state. A message try is answered by, in this order:
    (`JOBHUNTER_FAKE_LLM_KEYED_DIR`, `AppConfig.fake_llm_keyed_dir`): the bytes of
    `<dir>/<keyed_answer_filename(key)>` when that file exists, read at each try (never cached), served as a
    keyed body is. `keyed_answer_filename` (`generate:123:0` → `generate_123_0.sse`) is the one place a key
-   becomes a file name: this lookup and the E2E setup that writes the files both call it;
+   becomes a file name: this lookup and the E2E setup that writes the files both call it. As a file is read at
+   every try, its writer writes a temporary file in the same directory and then `os.replace`s it, so a try
+   reads the old answer or the new one, never a partial file;
 3. the scenario script (the next name per try, in arrival order, as above);
 4. the recording `root/<purpose>/<model>/<schema12>.sse`.
 
@@ -59,7 +61,9 @@ batches too). Every script field is read from the script current when it is need
 may register a batch's item outcomes after the batch exists. On the stack (M4 Task 18), a transport given a
 batch script file (`JOBHUNTER_FAKE_BATCH_SCRIPT`, `AppConfig.fake_batch_script`) reads it at each create and
 registers it as the state's script (`load_batch_script`: a JSON object of `BatchScript` fields; no file is
-`BatchScript()`), so the E2E setup steers the next batch by writing the file. A file that cannot be read, is
+`BatchScript()`), so the E2E setup steers the next batch by writing the file: as it is read at every create,
+its writer writes a temporary file in the same directory and then `os.replace`s it, so a create never reads a
+partial script. A file that cannot be read, is
 no JSON object, or has an unknown field, a field of the wrong type or an unknown outcome fails that create
 with a 400 `invalid_request_error` naming the variable and the fault, logged (`fake_batch_script_invalid`),
 with no batch stored and the script in force kept: never the default in its place, so a mistyped script
@@ -703,12 +707,14 @@ class RecordedSSETransport(httpx2.AsyncBaseTransport):
 
     def keyed_answer(self, key: str) -> bytes | None:
         """The keyed directory's standing answer of `key`, read now: `None` without a directory, or without
-        its file (a key that names no file has none)."""
+        its file. A key that names no file of the directory (`keyed_answer_filename`'s `ValueError`) raises:
+        it is never answered by the recording instead."""
         if self._keyed_dir is None:
             return None
+        path = self._keyed_dir / keyed_answer_filename(key)
         try:
-            return (self._keyed_dir / keyed_answer_filename(key)).read_bytes()
-        except (FileNotFoundError, ValueError):
+            return path.read_bytes()
+        except FileNotFoundError:
             return None
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:

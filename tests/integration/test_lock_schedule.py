@@ -269,7 +269,7 @@ async def test_an_activation_and_process_item_publishing_never_wait_out_of_order
     first: str,
 ) -> None:
     # the activation is a real settings save (`held_save`: `save_settings` in a transaction left open); the
-    # batch is the smallest the settings allow (`batch_min_targets`, 200)
+    # batch is of the seeded default size (`batch_min_targets`, 200)
     submitted = await submit_batch(engine, op_runner, fake_llm, BATCH)
     target = submitted.setup.targets[0]
     fake_mod.batches(BatchScript(polls_until_ended=0))  # the next poll ends it and processes its items

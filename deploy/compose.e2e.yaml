@@ -16,6 +16,8 @@
 #   - JOBHUNTER_FAKE_LLM_KEYED_DIR: a directory of standing keyed answers (<purpose>_<id>_<round>.sse, the
 #     key's file name `fake.keyed_answer_filename`), read at each message try; the E2E setup creates it and
 #     writes E9's grounded answers there (Task 32).
+#   Both are read at every create or try, so a writer writes a temporary file in the same directory and then
+#   os.replace()s it into place: a reader sees the old file or the new one, never a partial one.
 #   The startup assertion fake_mode_in_prod refuses both in prod (exit 78), as it refuses the fake modes.
 #
 # The smoke scripts and the visual checks run on this four-file stack too: without a script file every batch

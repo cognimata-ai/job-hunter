@@ -1042,7 +1042,7 @@ async def test_an_unresolved_submission_keeps_its_targets_through_retention(
     counted spend unchanged (L3997); the next pass deletes the targets (no listing window protects a
     submission started 14 months ago), the ledger entries kept; and 13 months after its release the
     submission goes, then its bulk operation."""
-    n = 200  # the smallest batch the settings allow (`batch_min_targets`)
+    n = 200  # `scoring.batch_min_targets`, the seeded default
     row, old_tuple = await quarantined(engine, op_runner, fake_llm, n)
     await activate_profile(engine)  # the tuple superseded: the batched targets cancelled one by one
     aged = utcnow() - timedelta(days=425)

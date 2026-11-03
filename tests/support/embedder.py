@@ -29,16 +29,21 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socket import socket
-from typing import Any, Final
+from typing import Any
 
 import pytest
 from jobhunter.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_ID, MAX_TEXT_BYTES
 
-from embedder.app import QUERY_PREFIX, FakeModel, fake_vector
+from embedder.app import MAX_BATCH, QUERY_PREFIX, FakeModel, fake_vector
 
-__all__ = ["QUERY_PREFIX", "FakeEmbedder", "fake_embedder", "fake_embedder_server", "fake_vector"]
-
-MAX_BATCH: Final = 16
+__all__ = [
+    "MAX_BATCH",
+    "QUERY_PREFIX",
+    "FakeEmbedder",
+    "fake_embedder",
+    "fake_embedder_server",
+    "fake_vector",
+]
 
 
 class _Server(ThreadingHTTPServer):
