@@ -759,10 +759,12 @@ export interface paths {
          *     cells: how many, the oldest coverage of its locations, their open gaps, their mean yield, whether one is
          *     too broad, and JSearch's refresh cadence.
          *
-         *     A query's planned cells are those a run searches while the query is enabled: its cells of the enabled
-         *     sources at the scope's locations, shown for a disabled query too. Cells no longer planned (a location
-         *     removed from the scope, a source switched off, an edited query's previous text) are not counted here,
-         *     while the open-gap total of the status header still counts their open gaps.
+         *     A query's planned cells are those a run searches while the query is enabled: one per enabled source and
+         *     location of the scope, counted whether a run has created them yet or not, so that a disabled query is
+         *     judged on the scope as it is now. Cells no longer planned (a location removed from the scope, a source
+         *     switched off, an edited query's previous text) are not counted here, while the open-gap total of the
+         *     status header also counts their open gaps, and those of the cells without a query (Arbeitnow's and the
+         *     watchlist boards').
          */
         get: operations["list_queries_api_queries_get"];
         put?: never;
@@ -791,9 +793,11 @@ export interface paths {
          *     cadence for a JSearch cell.
          *
          *     A planned cell is one a run searches while its query is enabled: a cell of an enabled source at one of the
-         *     scope's locations, listed for a disabled query too. Cells no longer planned (a location removed from the
-         *     scope, a source switched off, an edited query's previous text) are not listed, while the open-gap total
-         *     of the status header still counts their open gaps.
+         *     scope's locations, listed for a disabled query too. Only the cells that exist are listed: a planned cell
+         *     a run has not created yet has no id, though the query list counts it. Cells no longer planned (a location
+         *     removed from the scope, a source switched off, an edited query's previous text) are not listed, while the
+         *     open-gap total of the status header also counts their open gaps, and those of the cells without a query
+         *     (Arbeitnow's and the watchlist boards').
          */
         get: operations["query_cell_stats_api_queries_stats_get"];
         put?: never;
@@ -1639,7 +1643,7 @@ export interface components {
         };
         /**
          * CellStatsOut
-         * @description A planned coverage cell of a live query (one source instance, one query, one place) and its
+         * @description An existing planned coverage cell of a live query (one source instance, one query, one place) and its
          *     statistics.
          */
         CellStatsOut: {
@@ -1674,7 +1678,7 @@ export interface components {
              * Location Key
              * @description The scope location's key, or `remote-de`
              */
-            location_key: string | null;
+            location_key: string;
             /**
              * Open Gaps
              * @description Its open coverage gaps
@@ -1691,7 +1695,7 @@ export interface components {
             too_broad: boolean;
             /**
              * Yield Ema
-             * @description New postings per request, smoothed
+             * @description New postings per request, smoothed; a cell never searched shows its starting value
              */
             yield_ema: number;
             /**
@@ -3130,13 +3134,14 @@ export interface components {
         };
         /**
          * QueryListOut
-         * @description A live query, whether the active settings enable it, and the coverage of its planned cells: its cells
-         *     of the enabled sources at the scope's locations, which a run searches while it is enabled.
+         * @description A live query, whether the active settings enable it, and the coverage of its planned cells: one per
+         *     enabled source and scope location, which a run searches while it is enabled, judged on the scope as it is
+         *     now whether the query is enabled or not.
          */
         QueryListOut: {
             /**
              * Cells
-             * @description Its planned coverage cells, also while it is disabled
+             * @description Its planned coverage cells, one per enabled source and scope location, counted whether a run has created them yet or not
              */
             cells: number;
             /**
@@ -3160,7 +3165,7 @@ export interface components {
             lang: "de" | "en";
             /**
              * Last Covered At
-             * @description The oldest coverage of its planned locations, a location being covered as of the newer frontier of its JSearch cell and its SerpApi fallback cell; null when a planned location is covered by neither, or without a planned JSearch or SerpApi cell
+             * @description The oldest coverage of the scope's locations for it, a location being covered as of the newer frontier of its JSearch cell and its SerpApi fallback cell; null when a location is covered by neither (also when those cells do not exist yet), or when neither JSearch nor SerpApi is enabled
              */
             last_covered_at: string | null;
             /**
@@ -3177,7 +3182,7 @@ export interface components {
             proposal_id: number | null;
             /**
              * Refresh Cadence Days
-             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null without a planned JSearch cell
+             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null when JSearch is not enabled or the scope has no location
              */
             refresh_cadence_days: number | null;
             /** Text */
@@ -3189,7 +3194,7 @@ export interface components {
             too_broad: boolean;
             /**
              * Yield Ema
-             * @description The mean yield of its planned cells; null without one
+             * @description The mean yield of its planned cells that a run has searched; null when none has been
              */
             yield_ema: number | null;
         };

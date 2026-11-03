@@ -2,11 +2,12 @@
 and 15; plan M4 Task 13).
 
 - `GET /api/queries` → the live queries by id (`queries.listing.query_list`), each with its flag in the active
-  settings and the aggregates of its planned coverage cells; `GET /api/queries/stats` → every planned cell of
-  a live query with its statistics and open gaps (`queries.listing.cell_stats`). Planned: the planner's
-  selection under the active settings, for every live query (Rulings T13-b and T13-d); both descriptions say
-  that the header's open-gap total also counts the gaps of cells no longer planned. Each reads in one read
-  snapshot (`db.snapshot.read_snapshot`), a fixed number of statements, no lock.
+  settings and the aggregates of its planned coverage cells; `GET /api/queries/stats` → every existing planned
+  cell of a live query with its statistics and open gaps (`queries.listing.cell_stats`). Planned: the
+  planner's selection under the active settings, for every live query, a query's planned cells counted
+  whether they exist yet or not (Rulings T13-b, T13-d and T13-e); both descriptions say that the header's
+  open-gap total also counts the gaps of cells no longer planned and of the cells without a query. Each reads
+  in one read snapshot (`db.snapshot.read_snapshot`), a fixed number of statements, no lock.
 - `POST /api/queries` (`{text, lang, proposal_id?, exploration?}`) → 201 `QueryOut`: a new query
   (`queries.authoring.create_query`), not enabled; enabling it is a settings save with its preview (§13.5).
   `proposal_id` and `exploration` go beyond §14.2's body (Deviation 3), so an accepted proposal item keeps its
@@ -97,10 +98,12 @@ async def list_queries(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> l
     cells: how many, the oldest coverage of its locations, their open gaps, their mean yield, whether one is
     too broad, and JSearch's refresh cadence.
 
-    A query's planned cells are those a run searches while the query is enabled: its cells of the enabled
-    sources at the scope's locations, shown for a disabled query too. Cells no longer planned (a location
-    removed from the scope, a source switched off, an edited query's previous text) are not counted here,
-    while the open-gap total of the status header still counts their open gaps."""
+    A query's planned cells are those a run searches while the query is enabled: one per enabled source and
+    location of the scope, counted whether a run has created them yet or not, so that a disabled query is
+    judged on the scope as it is now. Cells no longer planned (a location removed from the scope, a source
+    switched off, an edited query's previous text) are not counted here, while the open-gap total of the
+    status header also counts their open gaps, and those of the cells without a query (Arbeitnow's and the
+    watchlist boards')."""
     now = utcnow()
     async with read_snapshot(engine) as conn:
         return await listing.query_list(conn, now=now)
@@ -113,9 +116,11 @@ async def query_cell_stats(engine: Annotated[AsyncEngine, Depends(get_engine)]) 
     cadence for a JSearch cell.
 
     A planned cell is one a run searches while its query is enabled: a cell of an enabled source at one of the
-    scope's locations, listed for a disabled query too. Cells no longer planned (a location removed from the
-    scope, a source switched off, an edited query's previous text) are not listed, while the open-gap total
-    of the status header still counts their open gaps."""
+    scope's locations, listed for a disabled query too. Only the cells that exist are listed: a planned cell
+    a run has not created yet has no id, though the query list counts it. Cells no longer planned (a location
+    removed from the scope, a source switched off, an edited query's previous text) are not listed, while the
+    open-gap total of the status header also counts their open gaps, and those of the cells without a query
+    (Arbeitnow's and the watchlist boards')."""
     now = utcnow()
     async with read_snapshot(engine) as conn:
         return await listing.cell_stats(conn, now=now)

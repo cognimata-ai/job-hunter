@@ -16,6 +16,7 @@ import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.sources import watchlist_listing
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import make_posting
@@ -205,3 +206,18 @@ async def test_an_unvalidated_company_without_an_instance(
             "postings": NO_POSTINGS,
         }
     ]
+
+
+async def test_without_settings_a_company_is_listed_disabled(
+    engine: AsyncEngine, logged_in_client: httpx.AsyncClient
+) -> None:
+    company_id = await added(
+        logged_in_client, display_name="Acme GmbH", ats_type="greenhouse", board_slug="acme"
+    )
+    async with engine.connect() as conn:  # nothing seeded, in a transaction rolled back
+        await conn.execute(sa.text("DELETE FROM active_config"))
+        companies = await watchlist_listing.watchlist(conn)
+        await conn.rollback()
+
+    assert [(c.id, c.enabled, c.instance is not None) for c in companies] == [(company_id, False, True)]
+    assert (await listed(logged_in_client))[0]["enabled"] is True  # the settings list it, enabled
