@@ -1099,6 +1099,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/system/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get System Status
+         * @description The header strip: the last and the active run, the next slots, the quota windows, the month's LLM
+         *     spend and its pace, the open coverage gaps, the pending targets, the unacknowledged alerts, the re-score,
+         *     the paid-search pause, the run-now estimate, the scope's apply and the banners.
+         */
+        get: operations["get_system_status_api_system_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/targets/{target_id}/retry": {
         parameters: {
             query?: never;
@@ -1374,6 +1396,27 @@ export interface components {
             items: components["schemas"]["AlertOut"][];
             /** Next Cursor */
             next_cursor: string | null;
+        };
+        /**
+         * BannerOut
+         * @description A banner: a client shows it by its `code`, with `params` (JSON values; instants as ISO 8601 UTC
+         *     strings).
+         */
+        BannerOut: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "stale_data" | "cap_reached" | "reservation_bound_violated" | "scoring_paused" | "critical_alerts" | "paid_search_paused" | "scope_not_applied" | "applying_settings" | "rescoring";
+            /** Params */
+            params: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "critical" | "warn" | "info";
         };
         /** BucketOut */
         BucketOut: {
@@ -1989,6 +2032,42 @@ export interface components {
             /** Unscorable Reason */
             unscorable_reason: string | null;
         };
+        /**
+         * HeaderLlmOut
+         * @description The month's counted LLM spend against the cap, in USD, and whether the month's counted scoring spend is
+         *     ahead of the even pace of the scoring share over the month.
+         */
+        HeaderLlmOut: {
+            /** Cap */
+            cap: string;
+            /** Counted */
+            counted: string;
+            /**
+             * Pace
+             * @enum {string}
+             */
+            pace: "ok" | "ahead";
+        };
+        /**
+         * HeaderQuotaOut
+         * @description A provider's current quota window: the counted usage against its limit, its reset and its state.
+         */
+        HeaderQuotaOut: {
+            /** Limit */
+            limit: number;
+            /**
+             * Reset At
+             * Format: date-time
+             */
+            reset_at: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Used */
+            used: number;
+        };
         /** HealthOut */
         HealthOut: {
             /**
@@ -2321,6 +2400,17 @@ export interface components {
             /** Evidence */
             evidence: string;
         };
+        /**
+         * LastRunOut
+         * @description The newest run, its age in seconds since it was queued, and the causes of a partial run.
+         */
+        LastRunOut: {
+            /** Age S */
+            age_s: number;
+            /** Partial Causes */
+            partial_causes: ("fetch_failed" | "fetch_ambiguous" | "source_breaker_open" | "source_auth_failed" | "source_contract_broken" | "source_not_found" | "awaiting_embedding" | "raw_item_rejected")[];
+            run: components["schemas"]["RunOut"];
+        };
         /** LevelDiffOut */
         LevelDiffOut: {
             /** Criterion */
@@ -2411,6 +2501,19 @@ export interface components {
         NotReadyOut: {
             /** Failing */
             failing: ("db" | "migrations" | "worker_heartbeat" | "embedder")[];
+        };
+        /**
+         * PaidSearchOut
+         * @description Whether paid search is paused (JSearch exhausted and SerpApi unable to fall back), until when and
+         *     why.
+         */
+        PaidSearchOut: {
+            /** Paused */
+            paused: boolean;
+            /** Reason */
+            reason: ("serpapi_disabled" | "serpapi_unavailable" | "serpapi_exhausted") | null;
+            /** Until */
+            until: string | null;
         };
         /** ParseUrlIn */
         ParseUrlIn: {
@@ -2796,6 +2899,21 @@ export interface components {
             targets: number;
         };
         /**
+         * RescoreOut
+         * @description The re-score of the active scoring tuple: of its targets (`total`), those that left the unscored
+         *     states (`done`); `creating` while its targets are still being created.
+         */
+        RescoreOut: {
+            /** Bulk Operation Id */
+            bulk_operation_id: number;
+            /** Creating */
+            creating: boolean;
+            /** Done */
+            done: number;
+            /** Total */
+            total: number;
+        };
+        /**
          * ResolveIn
          * @description How the identity conflict is settled: `separate` keeps the posting's job and the other jobs apart,
          *     `merge` merges the other jobs into the posting's job.
@@ -2908,6 +3026,16 @@ export interface components {
             run: components["schemas"]["RunOut"];
         };
         /**
+         * RunNowUnitsOut
+         * @description What a run with paid sources may spend, in whole units: an upper estimate.
+         */
+        RunNowUnitsOut: {
+            /** Jsearch Units */
+            jsearch_units: number;
+            /** Serpapi Fallback Units */
+            serpapi_fallback_units: number;
+        };
+        /**
          * RunOut
          * @description A run as the api shows it (`runs` row, §7.6); its times in UTC. `status_reason` is why it has its
          *     status, as a code (the first partial cause, the failed invariant, `bug`, `resume_exhausted`,
@@ -3015,6 +3143,33 @@ export interface components {
             passed: boolean | null;
             /** Transport */
             transport: string | null;
+        };
+        /**
+         * ScopeProgressOut
+         * @description A scope apply's progress in both of its phases: the jobs (`done` of `total`) and the published results
+         *     (`det_done` of `det_total`).
+         */
+        ScopeProgressOut: {
+            /** Det Done */
+            det_done: number;
+            /** Det Total */
+            det_total: number;
+            /** Done */
+            done: number;
+            /** Total */
+            total: number;
+        };
+        /**
+         * ScopeStatusOut
+         * @description The scope being applied, if any, with its live apply's progress (null while no apply is live), and
+         *     whether the active settings version's scope is the applied one.
+         */
+        ScopeStatusOut: {
+            /** Applied */
+            applied: boolean;
+            /** Pending Version Id */
+            pending_version_id: number | null;
+            progress: components["schemas"]["ScopeProgressOut"] | null;
         };
         /**
          * ScoreCycleOut
@@ -3317,6 +3472,38 @@ export interface components {
             /** Reserved */
             reserved: string;
         };
+        /**
+         * StatusOut
+         * @description The header strip: the last and the active run, the next slots, the quota windows, the month's LLM
+         *     spend, the open coverage gaps, the pending targets, the unacknowledged alerts, the re-score, the
+         *     paid-search pause, the run-now estimate, the scope's apply and the banners, critical first.
+         */
+        StatusOut: {
+            /** Active Run Id */
+            active_run_id: number | null;
+            alerts: components["schemas"]["UnackedAlertsOut"];
+            /** Banners */
+            banners: components["schemas"]["BannerOut"][];
+            /** Coverage Gaps Open */
+            coverage_gaps_open: number;
+            last_run: components["schemas"]["LastRunOut"] | null;
+            llm: components["schemas"]["HeaderLlmOut"] | null;
+            /**
+             * Next Slots
+             * @description The schedule's next 3 slots; empty while it is disabled
+             */
+            next_slots: string[];
+            paid_search: components["schemas"]["PaidSearchOut"];
+            /** Pending Targets */
+            pending_targets: number;
+            /** Quota */
+            quota: {
+                [key: string]: components["schemas"]["HeaderQuotaOut"] | null;
+            };
+            rescore: components["schemas"]["RescoreOut"] | null;
+            run_now: components["schemas"]["RunNowUnitsOut"];
+            scope: components["schemas"]["ScopeStatusOut"];
+        };
         /** StrippedTextOut */
         StrippedTextOut: {
             /**
@@ -3430,6 +3617,16 @@ export interface components {
             removed: components["schemas"]["SpanOut"][];
             /** Restored */
             restored: components["schemas"]["SpanOut"][];
+        };
+        /**
+         * UnackedAlertsOut
+         * @description The alerts that are unresolved and unacknowledged, and the critical ones among them.
+         */
+        UnackedAlertsOut: {
+            /** Critical Unacked */
+            critical_unacked: number;
+            /** Total Unacked */
+            total_unacked: number;
         };
         /**
          * UnmergeIn
@@ -7706,6 +7903,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SpendOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_system_status_api_system_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatusOut"];
                 };
             };
             /** @description No valid session (`unauthenticated`) */

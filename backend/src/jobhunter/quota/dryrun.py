@@ -1,9 +1,17 @@
-"""The quota part of the settings dry-run (spec §6.8): projections and warnings for proposed settings.
+"""The quota part of the settings dry-run (spec §6.8): projections and warnings for proposed settings, and the
+run-now estimate of the header strip (§15.1 L5123; plan M4 Task 11, D16).
 
 `quota_projections` covers the `jsearch`, `adzuna`, `arbeitnow`, `serpapi_fallback` and `stale_ttl_short`
 parts of §6.8's `dry_run`, on window snapshots the caller read (M2 composes `dry_run()` around it, Deviation
 10). It is pure: windows are rolled forward (or bootstrapped) in memory to `now` and nothing is written.
 Figures are rounded to 3 decimals in the projections and to 1 in the warning details.
+
+`per_run(settings, w)` is the one computation of a paid provider's units per run, `min(per-run cap, fair
+share)`, which the JSearch and SerpApi projections and `run_now_units` share.
+`run_now_units(conn, settings, now)` is that figure for JSearch and the SerpApi fallback on the live windows
+(`windows.current_snapshot`, plain reads, rolled forward in memory as here), rounded up to whole units: an
+upper estimate of what a run spends, the run itself being paced by the bucket. A provider that the settings
+disable, or that has no window (SerpApi before its first account read), counts 0.
 
 - **JSearch.** `fair_share = N x interval / window length` units per run; `units_per_run = min(per-run cap,
   fair share)`; `refresh_cadence_days = cells x interval_days / units_per_run`. Warnings:
@@ -24,13 +32,16 @@ Figures are rounded to 3 decimals in the projections and to 1 in the warning det
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import ceil
 from types import MappingProxyType
-from typing import Final
+from typing import Final, NamedTuple
+
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.quota.pacing import fair_share, per_run_cap
-from jobhunter.quota.windows import Provider, Window, roll_forward
+from jobhunter.quota.windows import Provider, Window, current_snapshot, roll_forward
 from jobhunter.run_settings import RunSettings
 from jobhunter.types import JSONValue
 
@@ -73,11 +84,25 @@ def _length_days(w: Window) -> float:
     return (w.window_end - w.window_start) / _DAY
 
 
-def _jsearch(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning], dict[str, JSONValue]]:
-    warns: list[Warning] = []
+class PerRun(NamedTuple):
+    """A paid provider's units per run on a window: `units = min(cap, fair_share)`."""
+
+    units: float
+    fair_share: float
+    cap: int
+
+
+def per_run(settings: RunSettings, w: Window) -> PerRun:
+    """The fair share of a run on `w` at the schedule's interval, the per-run cap of `settings` and the units
+    per run they allow (module docstring)."""
     fair = fair_share(w, settings.interval_s)
     cap = per_run_cap(settings.quota, fair)
-    units_per_run = min(cap, fair)
+    return PerRun(units=min(cap, fair), fair_share=fair, cap=cap)
+
+
+def _jsearch(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning], dict[str, JSONValue]]:
+    warns: list[Warning] = []
+    units_per_run, fair, cap = per_run(settings, w)
     if cap < fair:
         warns.append(Warning("paid_run_cap_binding", cap=cap, fair_share=round(fair, 1)))
     interval_days = settings.interval_s / 86400
@@ -130,12 +155,11 @@ def _arbeitnow(settings: RunSettings) -> tuple[list[Warning], dict[str, JSONValu
 def _serpapi(settings: RunSettings, w: Window | None) -> JSONValue:
     if w is None:
         return None  # no account read yet: SerpApi has no window, so no fallback is admitted
-    fair = fair_share(w, settings.interval_s)
     hourly_cap = settings.quota.serpapi_hourly_cap
     if w.observed_hourly_cap is not None:
         hourly_cap = min(hourly_cap, w.observed_hourly_cap)
     return {
-        "units_per_run": round(min(per_run_cap(settings.quota, fair), fair), 3),
+        "units_per_run": round(per_run(settings, w).units, 3),
         "hourly_cap": hourly_cap,
         "state": w.state,
     }
@@ -169,3 +193,25 @@ def quota_projections(
         warns.append(Warning("stale_ttl_short", label_after_days=settings.stale_ttl_days))
     proj["serpapi_fallback"] = _serpapi(settings, _rolled(serpapi, "serpapi", settings, now))
     return warns, proj
+
+
+@dataclass(frozen=True)
+class RunNowUnits:
+    """The run-now estimate: whole units of JSearch and of the SerpApi fallback (module docstring)."""
+
+    jsearch_units: int
+    serpapi_fallback_units: int
+
+
+async def run_now_units(conn: AsyncConnection, settings: RunSettings, now: datetime) -> RunNowUnits:
+    """`per_run(settings, w).units` on the live JSearch and SerpApi windows at `now`, rounded up; 0 for a
+    provider `settings` disable or without a window (module docstring). Plain reads, nothing written."""
+    units: dict[Provider, int] = {}
+    paid: tuple[tuple[Provider, bool], ...] = (
+        ("jsearch", settings.sources.jsearch),
+        ("serpapi", settings.sources.serpapi),
+    )
+    for provider, enabled in paid:
+        w = _rolled(await current_snapshot(conn, provider), provider, settings, now) if enabled else None
+        units[provider] = 0 if w is None else ceil(per_run(settings, w).units)
+    return RunNowUnits(jsearch_units=units["jsearch"], serpapi_fallback_units=units["serpapi"])

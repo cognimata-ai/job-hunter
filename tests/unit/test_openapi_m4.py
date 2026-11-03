@@ -39,6 +39,7 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("get", "/api/score-cycles"): {"400", "401", "422", "429"},
     ("get", "/api/alerts"): {"400", "401", "422", "429"},
     ("get", "/api/system/quota"): {"401", "429"},
+    ("get", "/api/system/status"): {"401", "429"},
 }
 # What a published description must not cite (Ruling T6-g). A ruling is matched in any case and in the plural
 # (the codebase writes "ruling R14-1" and "rulings R14-1 and R14-2" as well as "Ruling P13"); `Task`, the

@@ -5,6 +5,11 @@ manual score cycle (§14.2 L5028; M3 Task 21, Deviation 39), for a logged-in ses
 - `GET /api/system/quota` → per provider its current window with the window's counted usage, its reserved,
   ambiguous and adjustment units and its bucket, `null` without a current window
   (`observability.lists.quota_summary`), in one read snapshot (`db.snapshot.read_snapshot`).
+- `GET /api/system/status` → the header strip's composite (`observability.status.system_status`, plan M4
+  Task 11): the last run, the next slots, the quota windows, the LLM spend and its pace, the open gaps, the
+  pending targets, the unacknowledged alerts, the re-score, the paid-search pause, the run-now units, the
+  scope's apply and every banner, in one read snapshot; no readiness probe and no table sizes, so a down
+  embedder never slows it. The UI polls it every 60 s; `/api/system/health` stays the System panel's.
 - `POST /api/system/score-cycle` (`Idempotency-Key`, no body) → 202 `{queued, reason}`: one transaction,
   `active_config FOR SHARE` first, then `run_idempotent` around `cycles.request_cycle(trigger="manual")`.
   `queued` is false when a `manual` job already waits (it serves the request). `reason` says at once why the
@@ -41,9 +46,10 @@ from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.embeddings import EmbedderClient
-from jobhunter.observability import lists
+from jobhunter.observability import lists, status
 from jobhunter.observability.health import SystemHealthOut, check_readiness, system_health
 from jobhunter.observability.lists import QuotaDetailOut
+from jobhunter.observability.status import StatusOut
 from jobhunter.quota.windows import Provider
 from jobhunter.scoring import cycles
 from jobhunter.scoring.admission import any_admissible
@@ -88,6 +94,19 @@ async def get_quota(
     units and its bucket; null for a provider without a current window."""
     async with read_snapshot(engine) as conn:
         return await lists.quota_summary(conn)
+
+
+@router.get("/status", response_model=StatusOut)
+async def get_system_status(
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    cfg: Annotated[AppConfig, Depends(get_config)],
+) -> StatusOut:
+    """The header strip: the last and the active run, the next slots, the quota windows, the month's LLM
+    spend and its pace, the open coverage gaps, the pending targets, the unacknowledged alerts, the re-score,
+    the paid-search pause, the run-now estimate, the scope's apply and the banners."""
+    now = utcnow()
+    async with read_snapshot(engine) as conn:
+        return await status.system_status(conn, now=now, fake_llm=cfg.fake_llm)
 
 
 async def _idle_reason(
