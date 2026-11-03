@@ -600,13 +600,16 @@ def _fake_llm_state() -> Iterator[fake.FakeLLMState]:
         yield state
 
 
-def fake_llm_config(root: Path, secrets_dir: Path) -> AppConfig:
-    """A worker config in fake LLM mode over the recordings under `root` (no secret files needed)."""
+def fake_llm_config(root: Path, secrets_dir: Path, **extra: str) -> AppConfig:
+    """A worker config in fake LLM mode over the recordings under `root` (no secret files needed), with the
+    environment variables `extra` (the stack controls of M4 Task 18, `JOBHUNTER_FAKE_BATCH_SCRIPT` and
+    `JOBHUNTER_FAKE_LLM_KEYED_DIR`)."""
     env = {
         "JOBHUNTER_ENV": "test",
         "JOBHUNTER_DB_NAME": "jobhunter",
         "JOBHUNTER_FAKE_LLM": "1",
         "JOBHUNTER_FAKE_LLM_DIR": str(root),
+        **extra,
     }
     return load_config("worker", env, secrets_dir)
 

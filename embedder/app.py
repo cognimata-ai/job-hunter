@@ -18,11 +18,23 @@ This file runs as `/app/app.py` in the image, beside `health.py` and `model.lock
 `jobhunter`. `OnnxModel` imports onnxruntime, tokenizers and numpy itself, so `create_app` and
 `verify_checksums` work in the base environment (tests/embedder). Nothing is written at run time: the
 container runs read-only. Request texts are never logged, only their counts.
+
+**The test-only fake** (M4 Task 18; the image's `fake` target, `deploy/compose.e2e.yaml`). With
+`EMBEDDER_FAKE` set (to anything, as `JOBHUNTER_FAKE_*` counts when set), `main()` reads neither the model
+files nor their checksums and serves `FakeModel`: a deterministic unit vector per text, seeded from the sha256
+of the text the model sees (`fake_vector`; a query with its prefix), a token per 4 characters and the
+truncation flag above 4,000 characters, the answers of the tests' `FakeEmbedder` (`tests/support/embedder.py`
+imports them from here). Its `/health` adds `"fake": true` to the lock's `model_id`, `checksum_ok: true` and
+the dimension, which is what the api compares (`embeddings.EmbedderClient.health`), so the dev and E2E stacks
+run on it unchanged. It is refused outside dev and test: unless `JOBHUNTER_ENV` is `dev` or `test`, `main()`
+exits 78 (`fake_embedder_outside_dev`), as `fake_mode_in_prod` refuses the fake LLM (§16.8).
 """
 
 import hashlib
 import logging
+import math
 import os
+import random
 import re
 import sys
 import threading
@@ -55,6 +67,10 @@ LOCK_PATH: Final = Path(__file__).resolve().with_name("model.lock")
 # only counts before the import (V7). The Hugging Face hub (a dependency of tokenizers) is kept offline and
 # without telemetry as well, though the service only reads local files.
 RUNTIME_ENV: Final = {"ORT_DISABLE_TELEMETRY": "1", "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"}
+
+# The fake (module docstring): the environments it may run in, and the text length it flags as truncated.
+FAKE_ENVS: Final = ("dev", "test")
+FAKE_TRUNCATE_CHARS: Final = 4_000
 
 _LOCK_META: Final = ("repo", "revision", "model_id")
 _SHA256: Final = re.compile(r"sha256:([0-9a-f]{64})")
@@ -248,6 +264,32 @@ class OnnxModel(Model):
         return vectors.tolist(), truncated, tokens
 
 
+def fake_vector(text: str, dim: int) -> list[float]:
+    """The fake's unit vector of `text` (as the model sees it): Gaussian components seeded from its sha256."""
+    seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
+    rng = random.Random(seed)  # noqa: S311 - a test vector, deterministic on purpose
+    raw = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+    norm = math.sqrt(sum(x * x for x in raw))
+    return [x / norm for x in raw]
+
+
+class FakeModel(Model):
+    """The test-only model (module docstring): `fake_vector` of each text as the model would see it, a token
+    per 4 characters (at least one) and `MAX_TOKENS` with the truncation flag above `FAKE_TRUNCATE_CHARS`.
+    `dim` is `DIM`; the tests' `FakeEmbedder` sets another to answer as a foreign model would."""
+
+    def __init__(self, *, dim: int = DIM) -> None:
+        self.dim = dim
+
+    def embed(
+        self, texts: Sequence[str], input_kind: Literal["query", "passage"]
+    ) -> tuple[list[list[float]], list[bool], list[int]]:
+        seen = [QUERY_PREFIX + t if input_kind == "query" else t for t in texts]
+        truncated = [len(t) > FAKE_TRUNCATE_CHARS for t in texts]
+        tokens = [MAX_TOKENS if cut else max(1, len(t) // 4) for t, cut in zip(texts, truncated, strict=True)]
+        return [fake_vector(t, self.dim) for t in seen], truncated, tokens
+
+
 class EmbedRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -275,8 +317,9 @@ def _check_sizes(texts: Sequence[str]) -> None:
             raise HTTPException(413, f"text {i} is over {MAX_TEXT_BYTES} bytes")
 
 
-def create_app(model: Model, *, model_id: str, checksum_ok: bool) -> FastAPI:
-    """The HTTP service around `model`; `checksum_ok` is the startup check's result (else /health is 503)."""
+def create_app(model: Model, *, model_id: str, checksum_ok: bool, fake: bool = False) -> FastAPI:
+    """The HTTP service around `model`; `checksum_ok` is the startup check's result (else /health is 503), and
+    `fake` adds `"fake": true` to the health (`FakeModel`, module docstring)."""
     app = FastAPI(title="embedder", docs_url=None, redoc_url=None, openapi_url=None)
     # One batch at a time: concurrent batches would only share the same CPUs and add their memory peaks.
     # /v1/embed is a sync handler (FastAPI's thread pool), so /health stays answerable during a batch.
@@ -290,12 +333,14 @@ def create_app(model: Model, *, model_id: str, checksum_ok: bool) -> FastAPI:
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        body = {
+        body: dict[str, object] = {
             "status": "ok" if checksum_ok else "error",
             "model_id": model_id,
             "checksum_ok": checksum_ok,
             "dim": DIM,
         }
+        if fake:
+            body["fake"] = True
         return JSONResponse(body, status_code=200 if checksum_ok else 503)
 
     @app.post("/v1/embed")
@@ -321,11 +366,32 @@ def create_app(model: Model, *, model_id: str, checksum_ok: bool) -> FastAPI:
     return app
 
 
+def _serve_fake() -> None:
+    """`FakeModel` under the lock's `model_id`, in dev and test only (module docstring): exit 78 elsewhere."""
+    if os.environ.get("JOBHUNTER_ENV") not in FAKE_ENVS:
+        log.critical(
+            "embedder.startup_check_failed fake_embedder_outside_dev: EMBEDDER_FAKE is for dev and test"
+        )
+        raise SystemExit(EXIT_STARTUP_CHECK)
+    try:
+        model_id = read_lock(LOCK_PATH)[0]["model_id"]
+    except (OSError, ValueError) as exc:  # model.lock unreadable or malformed
+        log.critical("embedder.startup_check_failed %s", exc)
+        raise SystemExit(EXIT_STARTUP_CHECK) from None
+    log.warning("embedder.ready model_id=%s fake=true: test vectors, no model", model_id)
+    app = create_app(FakeModel(), model_id=model_id, checksum_ok=True, fake=True)
+    uvicorn.run(app, host=HOST, port=PORT, access_log=False, server_header=False, log_level="info")
+
+
 def main() -> None:
-    """Verify the model against model.lock (exit 78 on a mismatch, naming the file), load it and serve."""
+    """Verify the model against model.lock (exit 78 on a mismatch, naming the file), load it and serve; with
+    `EMBEDDER_FAKE`, serve `FakeModel` instead (module docstring)."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", stream=sys.stderr
     )
+    if "EMBEDDER_FAKE" in os.environ:
+        _serve_fake()
+        return
     model_dir = Path(os.environ.get("EMBEDDER_MODEL_DIR", DEFAULT_MODEL_DIR))
     try:
         model_id = verify_checksums(model_dir, LOCK_PATH)

@@ -47,6 +47,22 @@ RUN --mount=type=secret,id=build_ca,required=false \
     if [ -s /run/secrets/build_ca ]; then export CURL_CA_BUNDLE=/run/secrets/build_ca; fi; \
     sh /build/download_model.sh /opt/model
 
+# The test-only target (M4 Task 18; deploy/compose.e2e.yaml, dev and CI only, never in prod): the runtime image
+# without the model stage, so `docker build --target fake` downloads no model. It serves app.py's FakeModel
+# once EMBEDDER_FAKE is set, in dev and test only (app.py exits 78 elsewhere); without it, app.py checks the
+# absent /opt/model against model.lock and exits 78. This stage comes before `runtime`, which stays the last
+# stage: a build without a target is still the real image.
+FROM ${PYTHON_IMAGE} AS fake
+COPY --from=build /opt/venv /opt/venv
+COPY embedder/app.py embedder/health.py embedder/model.lock /app/
+RUN chmod 0555 /app/health.py && ln -s /app/health.py /usr/local/bin/embedder-health
+ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 ORT_DISABLE_TELEMETRY=1 HF_HUB_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
+WORKDIR /
+USER 10004:10004
+EXPOSE 8080
+CMD ["python", "/app/app.py"]
+
 FROM ${PYTHON_IMAGE} AS runtime
 COPY --from=build /opt/venv /opt/venv
 COPY --from=model /opt/model /opt/model

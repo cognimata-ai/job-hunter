@@ -57,7 +57,15 @@ _TRACING_VARS: Final = (
     "LANGCHAIN_TRACING_V2",
     "LANGCHAIN_TRACING",
 )
-_FAKE_MODE_VARS: Final = ("JOBHUNTER_FAKE_SOURCES", "JOBHUNTER_FAKE_LLM", "JOBHUNTER_FAULT")
+# Every fake mode and test control, refused in prod (`fake_mode_in_prod`, §16.8 check 3), M4 Task 18's two
+# stack controls of the fake LLM included.
+_FAKE_MODE_VARS: Final = (
+    "JOBHUNTER_FAKE_SOURCES",
+    "JOBHUNTER_FAKE_LLM",
+    "JOBHUNTER_FAULT",
+    "JOBHUNTER_FAKE_BATCH_SCRIPT",
+    "JOBHUNTER_FAKE_LLM_KEYED_DIR",
+)
 _ANTHROPIC_ENV_VARS: Final = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_API_KEY")
 # The values with which the Anthropic SDK configures its own logging at its import, and at `debug` logs each
 # request's options, the prompt included (anthropic 1.15.0 `_utils/_logs.py`). The SDK compares exactly; the
@@ -146,6 +154,11 @@ class AppConfig:
     # recorded-SSE fake transport from `fake_llm_dir` (`llm/fake.py`; dev and test only, refused in prod).
     fake_llm: bool
     fake_llm_dir: Path
+    # M4 Task 18, the fake LLM's two stack controls (dev and test only; `None` when unset or empty):
+    # `JOBHUNTER_FAKE_BATCH_SCRIPT`, a JSON file of `BatchScript` fields the fake Batches API reads at each
+    # create, and `JOBHUNTER_FAKE_LLM_KEYED_DIR`, a directory of standing keyed answers read at each try.
+    fake_batch_script: Path | None
+    fake_llm_keyed_dir: Path | None
     embedder_url: str
     http_user_agent: str
     # `JOBHUNTER_CV_STORE_DIR`: where `profile.storage.CvStore` keeps the encrypted CV files.
@@ -213,6 +226,10 @@ def _read_secret_files(
     return contents, modes, frozenset(unreadable)
 
 
+def _optional_path(value: str | None) -> Path | None:
+    return Path(value) if value else None
+
+
 def _parse_db_settings(environ: Mapping[str, str]) -> DbSettings:
     name = environ.get("JOBHUNTER_DB_NAME")
     if not name:
@@ -259,6 +276,8 @@ def load_config(
         fixtures_dir=Path(env.get("JOBHUNTER_FIXTURES_DIR") or DEFAULT_FIXTURES_DIR).resolve(),
         fake_llm="JOBHUNTER_FAKE_LLM" in env,
         fake_llm_dir=Path(env.get("JOBHUNTER_FAKE_LLM_DIR") or DEFAULT_FAKE_LLM_DIR).resolve(),
+        fake_batch_script=_optional_path(env.get("JOBHUNTER_FAKE_BATCH_SCRIPT")),
+        fake_llm_keyed_dir=_optional_path(env.get("JOBHUNTER_FAKE_LLM_KEYED_DIR")),
         embedder_url=env.get("JOBHUNTER_EMBEDDER_URL") or DEFAULT_EMBEDDER_URL,
         http_user_agent=env.get("JOBHUNTER_HTTP_USER_AGENT") or DEFAULT_HTTP_USER_AGENT,
         cv_store_dir=Path(env.get("JOBHUNTER_CV_STORE_DIR") or DEFAULT_CV_STORE_DIR),

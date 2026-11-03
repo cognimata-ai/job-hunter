@@ -2,9 +2,11 @@
 
 `FakeEmbedder` is a `ThreadingHTTPServer` on `127.0.0.1:0` that answers `GET /health` and `POST /v1/embed` as
 `embedder/app.py` does (its field names, its 413 and 422 refusals, a 503 health when the checksum failed),
-with a deterministic unit vector per text, seeded from the sha256 of the text the model would see (a query
-with its `query: ` prefix). A text over 4,000 characters is flagged `truncated` and counted 1,024 tokens, the
-service's own truncation; every other text counts a token per 4 characters. Its switches:
+with the answers of the service's own test-only model, `embedder.app.FakeModel` (M4 Task 18: one
+implementation, which the stack's fake embedder serves too): a deterministic unit vector per text, seeded from
+the sha256 of the text the model would see (a query with its `query: ` prefix), a text over 4,000 characters
+flagged `truncated` and counted 1,024 tokens, the service's own truncation, and every other text a token per
+4 characters. Its switches:
 
 - `down`: every request is refused: the server closes each connection at once, without an answer, so the
   client sees a transport error, as for a refused connection, while the port stays bound and the URL every
@@ -22,10 +24,7 @@ One server per session (`fake_embedder_server`): `make_config` and `proc_env` pa
 into the next one.
 """
 
-import hashlib
 import json
-import math
-import random
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,19 +34,11 @@ from typing import Any, Final
 import pytest
 from jobhunter.embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_ID, MAX_TEXT_BYTES
 
-TRUNCATE_CHARS: Final = 4_000
-MAX_TOKENS: Final = 1_024
+from embedder.app import QUERY_PREFIX, FakeModel, fake_vector
+
+__all__ = ["QUERY_PREFIX", "FakeEmbedder", "fake_embedder", "fake_embedder_server", "fake_vector"]
+
 MAX_BATCH: Final = 16
-QUERY_PREFIX: Final = "query: "
-
-
-def fake_vector(text: str, dim: int) -> list[float]:
-    """The unit vector of `text` (as the model sees it): Gaussian components seeded from its sha256."""
-    seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
-    rng = random.Random(seed)  # noqa: S311 - a test vector, deterministic on purpose
-    raw = [rng.gauss(0.0, 1.0) for _ in range(dim)]
-    norm = math.sqrt(sum(x * x for x in raw))
-    return [x / norm for x in raw]
 
 
 class _Server(ThreadingHTTPServer):
@@ -117,14 +108,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not fake.checksum_ok:
             self._answer(503, {"detail": "the model failed its checksum"})
             return
-        seen = [QUERY_PREFIX + text if kind == "query" else text for text in texts]
-        body = {
-            "model_id": fake.model_id,
-            "vectors": [fake_vector(text, fake.dim) for text in seen],
-            "truncated": [len(text) > TRUNCATE_CHARS for text in texts],
-            "tokens": [MAX_TOKENS if len(t) > TRUNCATE_CHARS else max(1, len(t) // 4) for t in texts],
-        }
-        self._answer(200, body)
+        vectors, truncated, tokens = FakeModel(dim=fake.dim).embed(texts, kind)
+        self._answer(
+            200, {"model_id": fake.model_id, "vectors": vectors, "truncated": truncated, "tokens": tokens}
+        )
 
 
 class FakeEmbedder:

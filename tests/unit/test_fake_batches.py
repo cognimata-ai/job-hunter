@@ -9,8 +9,10 @@ the result lines are checked as raw JSON too. Everything runs offline.
 """
 
 import json
+import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
 import anthropic
@@ -33,10 +35,12 @@ from tests.support.llm import (
     GATEWAY_BODY,
     FakeLLM,
     GatewayOut,
+    fake_llm_config,
     generator_wire_body,
     synthetic_message_json,
     synthetic_sse,
 )
+from tests.support.logs import logged
 
 KEY = SecretStr("fake-batches-test-key-0001")  # visibly fake; the fake ignores keys
 MODEL = "claude-sonnet-5-5"
@@ -702,3 +706,103 @@ def test_a_script_refuses_unknown_outcomes_and_negative_counts() -> None:
         BatchScript(stream_cut_after=-1)
     with pytest.raises(ValueError, match="create"):
         BatchScript(create=cast(Any, "sometimes"))
+
+
+# ---- the batch script file of the stack (M4 Task 18: JOBHUNTER_FAKE_BATCH_SCRIPT) --------------------------
+
+
+@pytest.fixture
+async def script_file(tmp_path: Path) -> AsyncIterator[tuple[Batches, Path]]:
+    """The SDK's batch client on a fake whose batch script is read from a file at each create (none yet)."""
+    path = tmp_path / "fake-batch-script.json"
+    cfg = fake_llm_config(
+        tmp_path / "anthropic", tmp_path / "no-secrets", JOBHUNTER_FAKE_BATCH_SCRIPT=str(path)
+    )
+    fake_llm = FakeLLM(cfg)
+    fake_llm.record("generate", MODEL)
+    async with fake_llm.client() as http:
+        yield Batches(http), path
+
+
+async def test_the_batch_script_file_is_read_at_each_create(script_file: tuple[Batches, Path]) -> None:
+    """An absent file is `BatchScript()`; each create reads the file as it is then, so a rewritten or removed
+    file takes effect at the next create."""
+    api, path = script_file
+    first = await api.create()
+    assert first.processing_status == "in_progress"  # the default: one in-progress poll
+    path.write_text(json.dumps({"create": "reject_400"}), "utf-8")
+    with pytest.raises(anthropic.BadRequestError, match="the batch was rejected"):
+        await api.create()
+    path.write_text(json.dumps({"polls_until_ended": 0, "default_item": "errored:other"}), "utf-8")
+    ended = await api.create()
+    assert ended.processing_status == "ended"
+    assert {line["result"]["type"] for line in await api.raw_results(ended.id)} == {"errored"}
+    path.unlink()
+    assert (await api.create()).processing_status == "in_progress"
+    assert fake.state().current_batch_script == BatchScript()
+
+
+async def test_the_file_quarantines_a_batch_as_e17_writes_it(script_file: tuple[Batches, Path]) -> None:
+    """E17's script (`{"create": "ambiguous_not_created", "listing": "empty"}`, Task 34): the create drops the
+    connection with nothing stored, and the listing that the reconciliation reads then lists nothing."""
+    api, path = script_file
+    earlier = await api.create()
+    path.write_text(json.dumps({"create": "ambiguous_not_created", "listing": "empty"}), "utf-8")
+    with pytest.raises(anthropic.APIConnectionError):
+        await api.create()
+    assert list(fake.state().batches) == [earlier.id]
+    assert (await api.listing())["data"] == []
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (b"{not json", "not JSON"),
+        (b"", "not JSON"),
+        (b"[]", "not a JSON object"),
+        (b'{"creat": "ok"}', "unknown field creat"),
+        (b'{"polls_until_ended": "1"}', "polls_until_ended"),
+        (b'{"polls_until_ended": true}', "polls_until_ended"),
+        (b'{"stream_cut_after": 1.5}', "stream_cut_after"),
+        (b'{"items": ["t1_a1"]}', "items"),
+        (b'{"items": {"t1_a1": "lost"}}', "unknown batch item outcome"),
+        (b'{"create": "sometimes"}', "unknown batch create outcome"),
+        (b'{"listing": 1}', "listing"),
+        (None, "unreadable"),
+    ],
+    ids=[
+        "malformed",
+        "empty",
+        "array",
+        "unknown_field",
+        "string_count",
+        "bool_count",
+        "float_cut",
+        "items_list",
+        "unknown_item_outcome",
+        "unknown_create_outcome",
+        "listing_number",
+        "a_directory",
+    ],
+)
+async def test_a_malformed_batch_script_fails_the_create_loudly(
+    script_file: tuple[Batches, Path], caplog: pytest.LogCaptureFixture, content: bytes | None, reason: str
+) -> None:
+    """Never the default instead: the create is a 400 naming the variable and what is wrong, nothing is
+    stored, the script in force is not replaced, and the error is logged."""
+    api, path = script_file
+    path.write_text(json.dumps({"create": "reject_400"}), "utf-8")
+    with pytest.raises(anthropic.BadRequestError):
+        await api.create()  # the file in force before the bad one
+    if content is None:
+        path.unlink()
+        path.mkdir()  # a path that cannot be read as a file
+    else:
+        path.write_bytes(content)
+    with caplog.at_level(logging.ERROR), pytest.raises(anthropic.BadRequestError) as exc:
+        await api.create()
+    assert "JOBHUNTER_FAKE_BATCH_SCRIPT" in str(exc.value) and reason in str(exc.value)
+    assert fake.state().batches == {}
+    assert fake.state().current_batch_script == BatchScript(create="reject_400")
+    (event,) = logged(caplog, "fake_batch_script_invalid")
+    assert reason in event["reason"]
