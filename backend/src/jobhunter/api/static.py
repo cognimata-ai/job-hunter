@@ -13,6 +13,10 @@ or `HEAD` outside `/api`. `SpaFiles.response` then answers:
 - anything else → `None`, and the caller keeps its 404 `not_found` problem. A path with a NUL or a backslash,
   or one that resolves (`..`, a symlink) outside `dist`, is refused outright, whatever it accepts.
 
+A request with `Range` (a deep link's `index.html` included) is answered as Starlette's `FileResponse` ships
+it: 206 with the part, or its own plain-text 400 (a malformed range) or 416 (a range past the end), still
+with the edge headers.
+
 The path is the server's, percent-decoded once; it is never decoded again, so `%252e%252e` stays a name of
 its own. A directory is never listed or served. The content type of each file Vite emits comes from
 `CONTENT_TYPES`, since a container's `mimetypes` database may lack or misname it; anything else from
@@ -59,7 +63,7 @@ log = get_logger("jobhunter.api.static")
 def content_type(path: Path) -> str:
     """The media type of `path`: `CONTENT_TYPES` by its suffix, else `mimetypes`, else a byte stream."""
     known = CONTENT_TYPES.get(path.suffix.lower())
-    return known or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return known or mimetypes.guess_file_type(path)[0] or "application/octet-stream"
 
 
 def _quality(params: list[str]) -> float:

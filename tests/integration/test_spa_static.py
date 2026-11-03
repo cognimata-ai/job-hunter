@@ -127,10 +127,10 @@ async def test_the_types_of_vite_s_files_do_not_depend_on_the_mimetypes_database
     spa: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A container's database may lack a type or name another one (`application/javascript`, `text/plain`).
-    def wrong(url: object, strict: bool = True) -> tuple[str, None]:
+    def wrong(path: object, *, strict: bool = True) -> tuple[str, None]:
         return "application/x-wrong", None
 
-    monkeypatch.setattr(mimetypes, "guess_type", wrong)
+    monkeypatch.setattr(mimetypes, "guess_file_type", wrong)
     types = {
         "/assets/app-1a2b.js": "text/javascript; charset=utf-8",
         "/assets/app-3c4d.css": "text/css; charset=utf-8",
@@ -139,6 +139,19 @@ async def test_the_types_of_vite_s_files_do_not_depend_on_the_mimetypes_database
         "/favicon.svg": "image/svg+xml",
     }
     assert {path: (await spa.get(path)).headers["content-type"] for path in types} == types
+
+
+async def test_a_range_is_answered_as_starlette_ships_it_with_the_edge_headers(
+    spa: httpx.AsyncClient,
+) -> None:
+    size = len(FILES["index.html"])
+    part = await spa.get("/index.html", headers={"Range": "bytes=0-3"})
+    assert (part.status_code, part.content) == (206, FILES["index.html"][:4])
+    assert part.headers["content-range"] == f"bytes 0-3/{size}"
+    assert_edge_headers(part)
+    past = await spa.get("/index.html", headers={"Range": "bytes=999-"})
+    assert (past.status_code, past.headers["content-range"]) == (416, f"bytes */{size}")
+    assert_edge_headers(past)
 
 
 async def test_head_has_the_status_and_headers_of_get_and_no_body(spa: httpx.AsyncClient) -> None:

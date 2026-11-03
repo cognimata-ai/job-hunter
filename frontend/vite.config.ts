@@ -1,15 +1,42 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
+// The dev stack's public origin (devproxy), and the dev server's own origins.
+const API_ORIGIN = "http://localhost:8080";
+const DEV_SERVER_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
+
+// What the proxy hook uses of http-proxy-3's ProxyServer (an EventEmitter) and of the outgoing request. Their
+// own types build on @types/node, which this browser project does not install, so they are written out here.
+interface ProxiedRequest {
+  getHeader(name: string): unknown;
+  setHeader(name: string, value: string): unknown;
+}
+interface DevProxy {
+  on(event: "proxyReq", listener: (proxyReq: ProxiedRequest) => void): unknown;
+}
+
 // The api serves this build same-origin (spec §15, §16.6): no inline script or style may be needed.
 export default defineConfig({
   plugins: [react()],
   server: {
     // `vite` (the dev server) only; `vite build` is unchanged. The api behind devproxy answers /api. The edge's
-    // CSRF check compares Origin with the public origin, so the proxy sends that one; every other header
-    // (X-JH-Request, X-JH-Background, the session cookie) goes through as the browser sent it.
+    // CSRF check compares Origin with the public origin, so a request from the dev server's own page has its
+    // Origin rewritten to that one. Any other Origin, a cross-site page's included, goes through unchanged, and
+    // the api refuses it as it would without the proxy. Every other header (X-JH-Request, X-JH-Background, the
+    // session cookie) goes through as the browser sent it.
     proxy: {
-      "/api": { target: "http://localhost:8080", headers: { origin: "http://localhost:8080" } },
+      "/api": {
+        target: API_ORIGIN,
+        configure: (server) => {
+          const proxy = server as unknown as DevProxy;
+          proxy.on("proxyReq", (proxyReq) => {
+            const origin = proxyReq.getHeader("origin");
+            if (typeof origin === "string" && DEV_SERVER_ORIGINS.has(origin)) {
+              proxyReq.setHeader("origin", API_ORIGIN);
+            }
+          });
+        },
+      },
     },
   },
   test: { include: ["src/**/*.test.ts"] },
