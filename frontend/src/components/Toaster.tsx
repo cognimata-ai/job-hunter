@@ -1,6 +1,9 @@
 // Non-blocking notices (spec §15.8: "Offline / 5xx: a non-blocking toast"). A store outside React, so the
 // query client can raise one (`onTransient`); `<Toaster>` shows its notices and gives `useToast()` to the
-// components inside it. A notice already shown is not shown twice; each one leaves after `TOAST_MS`.
+// components inside it. A notice already shown is not shown twice; each one leaves after `TOAST_MS`. The
+// region is a branch of every open layer (Radix `DismissableLayerBranch`): dismissing a notice is not a click
+// outside an open drawer or dialog, so it does not close them.
+import { DismissableLayerBranch } from "@radix-ui/react-dismissable-layer";
 import { createContext, type ReactNode, useContext, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { cx } from "./cx";
@@ -76,17 +79,19 @@ export function Toaster({ store, children }: { store: ToastStore; children: Reac
   return (
     <ToastContext.Provider value={store}>
       {children}
-      <section className={styles.region} aria-label={t("toast.region")} aria-live="polite">
-        {toasts.map((toast) => (
-          <div key={toast.id} className={cx(styles.toast, toast.tone === "critical" && styles.critical)}>
-            <p className={styles.message}>{toast.message}</p>
-            <button type="button" className={styles.dismiss} aria-label={t("action.dismiss")}
-              onClick={() => { store.dismiss(toast.id); }}>
-              <span aria-hidden="true">×</span>
-            </button>
-          </div>
-        ))}
-      </section>
+      <DismissableLayerBranch asChild>
+        <section className={styles.region} aria-label={t("toast.region")} aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} className={cx(styles.toast, toast.tone === "critical" && styles.critical)}>
+              <p className={styles.message}>{toast.message}</p>
+              <button type="button" className={styles.dismiss} aria-label={t("action.dismiss")}
+                onClick={() => { store.dismiss(toast.id); }}>
+                <span aria-hidden="true">×</span>
+              </button>
+            </div>
+          ))}
+        </section>
+      </DismissableLayerBranch>
     </ToastContext.Provider>
   );
 }

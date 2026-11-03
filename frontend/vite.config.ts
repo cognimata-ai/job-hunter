@@ -49,5 +49,8 @@ export default defineConfig({
     include: ["src/**/*.test.{ts,tsx}"],
     environment: "jsdom",
     setupFiles: ["src/test/setup.ts"],
+    // A fresh worker and jsdom per test file is the isolation these tests want, so the two hints that suggest
+    // trading it away (a vm pool, `isolate: false`) are noise; the import and transform hints stay on.
+    experimental: { diagnostics: { environment: false, isolate: false } },
   },
 });

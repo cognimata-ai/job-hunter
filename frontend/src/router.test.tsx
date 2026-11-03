@@ -1,5 +1,5 @@
 import { createMemoryHistory } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App, createApp } from "./app/App";
 import de from "./i18n/de.json";
@@ -12,8 +12,18 @@ afterEach(async () => {
   await i18n.changeLanguage("en");
 });
 
-function at(path: string) {
+/** Lets the query client's notification batch (a zero-delay timer) reach React. */
+function settled(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+function at(path: string, { retryDelay }: { retryDelay?: number } = {}) {
   const app = createApp({ history: createMemoryHistory({ initialEntries: [path] }) });
+  if (retryDelay !== undefined) {
+    // this test's client only: the same retry policy, without its waits
+    const queries = app.queryClient.getDefaultOptions().queries;
+    app.queryClient.setDefaultOptions({ queries: { ...queries, retryDelay } });
+  }
   render(<App app={app} />);
   return app;
 }
@@ -50,6 +60,33 @@ describe("the routes", () => {
     });
   });
 
+  it("keep the signed-in page while a session refetch fails transiently, and raise the toast", async () => {
+    const api = fakeApi({ signedIn: true });
+    const app = at("/settings", { retryDelay: 0 });
+    expect(await screen.findByRole("heading", { level: 1, name: en["settings.title"] })).toBeTruthy();
+    api.sessionDown = true;
+    await act(async () => {
+      await app.queryClient.refetchQueries({ queryKey: ["session"] });
+      await settled(); // the query client tells its observers in a batch of its own
+    });
+    const sessionReads = api.calls.filter((call) => call === "GET /api/auth/session");
+    expect(sessionReads).toHaveLength(1 + 4); // the first read, then the refetch and its 3 retries
+    expect(app.queryClient.getQueryState(["session"])?.status).toBe("error");
+    expect(screen.getByRole("heading", { level: 1, name: en["settings.title"] })).toBeTruthy();
+    expect(screen.getByRole("navigation", { name: en["nav.label"] })).toBeTruthy();
+    expect(screen.getByRole("navigation", { name: en["settings.nav_label"] })).toBeTruthy();
+    expect(screen.getByText(en["toast.transient"])).toBeTruthy();
+    expect(app.router.state.location.pathname).toBe("/settings");
+  });
+
+  it("show the problem only when the first session read fails", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.sessionDown = true;
+    at("/settings", { retryDelay: 0 });
+    expect((await screen.findByRole("alert")).textContent).toContain(en["problem.internal"]);
+    expect(screen.queryByRole("heading", { level: 1, name: en["settings.title"] })).toBeNull();
+  });
+
   it("render the shell with its landmarks and the settings' language", async () => {
     const api = fakeApi({ signedIn: true });
     api.uiLanguage = "de";
@@ -77,6 +114,16 @@ describe("the routes", () => {
       const heading = document.getElementById(section?.getAttribute("aria-labelledby") ?? "");
       expect(heading?.textContent, id).toBe(en[`settings.section.${id}` as keyof typeof en]);
     }
+  });
+
+  it("render the login bare at any case of its path", async () => {
+    const api = fakeApi({ signedIn: true });
+    const app = at("/Login");
+    expect(await screen.findByRole("button", { name: en["login.submit"] })).toBeTruthy();
+    expect(screen.queryByRole("banner")).toBeNull(); // not inside the shell
+    expect(screen.queryByRole("navigation", { name: en["nav.label"] })).toBeNull();
+    expect(api.calls).not.toContain("GET /api/settings");
+    expect(app.router.state.location.pathname).toBe("/Login");
   });
 
   it("show a translated page for an unknown path", async () => {

@@ -4,7 +4,7 @@ import { useRouter } from "@tanstack/react-router";
 import { type ReactNode, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { isProblem } from "../api/client";
-import { LOGIN_PATH, useSession } from "../api/session";
+import { isLoginPath, LOGIN_PATH, useSession } from "../api/session";
 import { ProblemBox } from "../components/ProblemBox";
 import { Spinner } from "../components/Spinner";
 import type { AppRouter } from "../router";
@@ -17,7 +17,7 @@ import styles from "./AppShell.module.css";
  */
 export function expireSession(router: AppRouter, queryClient: QueryClient): void {
   const { pathname, href } = router.latestLocation;
-  if (pathname === LOGIN_PATH) {
+  if (isLoginPath(pathname)) {
     return;
   }
   void router.navigate({ to: LOGIN_PATH, search: { redirect: href }, replace: true }).then(() => {
@@ -25,7 +25,12 @@ export function expireSession(router: AppRouter, queryClient: QueryClient): void
   });
 }
 
-/** Renders `children` once the session read finds a session; without one, sends the user to the login. */
+/**
+ * Renders `children` once the session read has found a session, and keeps them while a later read of it
+ * fails transiently (a refetch on focus, an api restart): that failure is the toast's, not a page's (§15.8).
+ * A 401 on any read, the first or a refetch, sends the user to the login; a first read that fails otherwise
+ * shows the problem with [Retry].
+ */
 export function RequireSession({ children }: { children: ReactNode }) {
   const { t } = useTranslation();
   const session = useSession();
@@ -37,10 +42,10 @@ export function RequireSession({ children }: { children: ReactNode }) {
       expireSession(router, queryClient);
     }
   }, [missing, router, queryClient]);
-  if (session.isSuccess) {
+  if (session.data !== undefined) {
     return children;
   }
-  if (session.isError && !missing) {
+  if (session.isLoadingError && !missing) {
     return (
       <main className={styles.centred}>
         <ProblemBox error={session.error} onRetry={() => { void session.refetch(); }} />

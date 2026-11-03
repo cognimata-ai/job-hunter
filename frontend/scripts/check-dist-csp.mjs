@@ -5,8 +5,8 @@
 // built text file, a `data:` URL of a font.
 //
 //   node scripts/check-dist-csp.mjs [dist-directory]   (default: ../dist from this file)
-import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const TEXT_FILE = /\.(html|css|js|mjs|json|svg|txt|map)$/i;
@@ -53,11 +53,14 @@ export function findViolations(files) {
 }
 
 /**
- * Every text file under `dir`, with its path relative to it.
+ * Every text file under `dir`, at any depth, with its path relative to it (none when `dir` does not exist).
  * @param {string} dir
  * @returns {{ path: string, text: string }[]}
  */
 function readBuild(dir) {
+  if (!existsSync(dir)) {
+    return [];
+  }
   return readdirSync(dir, { recursive: true, withFileTypes: true })
     .filter((entry) => entry.isFile() && TEXT_FILE.test(entry.name))
     .map((entry) => {
@@ -66,15 +69,22 @@ function readBuild(dir) {
     });
 }
 
+/**
+ * The CSP violations of the build in `dir`: those of its files (`findViolations`), and a missing
+ * `index.html` (nothing to serve is a failed build too).
+ * @param {string | URL} dir a path (relative to the working directory) or a `file:` URL
+ * @returns {string[]} one line per violation, `<path>: <what>`
+ */
+export function checkDist(dir) {
+  const root = typeof dir === "string" ? resolve(dir) : fileURLToPath(dir.href);
+  const files = readBuild(root);
+  const missing = files.some((file) => file.path === "index.html") ? [] : ["index.html: missing (no build to serve)"];
+  return [...missing, ...findViolations(files)];
+}
+
 function main() {
-  const dir = process.argv[2] ?? fileURLToPath(new URL("../dist/", import.meta.url));
-  const files = readBuild(dir);
-  if (!files.some((file) => file.path === "index.html")) {
-    console.error(`check-dist-csp: no index.html in ${dir}`);
-    process.exitCode = 1;
-    return;
-  }
-  const violations = findViolations(files);
+  const dir = process.argv[2] ?? new URL("../dist/", import.meta.url);
+  const violations = checkDist(dir);
   for (const violation of violations) {
     console.error(`check-dist-csp: ${violation}`);
   }
@@ -82,7 +92,7 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  console.log(`check-dist-csp: ${String(files.length)} files, no inline script, style or data: font`);
+  console.log("check-dist-csp: no inline script, style or data: font");
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

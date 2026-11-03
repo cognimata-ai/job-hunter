@@ -16,7 +16,8 @@ from; a computed call not listed there fails the test, as does a listed site the
 import ast
 import importlib
 import json
-from collections.abc import Callable, Iterator
+import textwrap
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from types import UnionType
 from typing import Any, Final, Literal, TypeAliasType, Union, get_args, get_origin
@@ -177,31 +178,44 @@ def wrappers(tree: ast.Module) -> set[str]:
     return found
 
 
-def alert_codes() -> set[str]:
+def alert_codes(
+    modules: Iterable[tuple[str, ast.Module]] | None = None,
+    dynamic: Mapping[tuple[str, str], Callable[[], set[str]]] = DYNAMIC_SITES,
+) -> set[str]:
+    """The alert codes of `modules` (default: every module of `backend/src`).
+
+    The forwarding wrappers are collected across all the modules first; a wrapper's callers are then found in
+    any module, called by name (`wrapper(…)`) or through a module (`mod.wrapper(…)`), and each must pass a
+    `code=` the walk resolves, as every alert call must, or be a `dynamic` site.
+    """
+    parsed = list(sources() if modules is None else modules)
+    forwarding = {(module, name) for module, tree in parsed for name in wrappers(tree)}
+    wrapper_names = {name for _, name in forwarding}
     codes: set[str] = set()
     computed: set[tuple[str, str]] = set()
-    for module, tree in sources():
-        forwarding = wrappers(tree)
+    for module, tree in parsed:
         for call, function in calls_by_function(tree):
             name = called_name(call)
-            if name not in ALERT_FUNCTIONS and not (isinstance(call.func, ast.Name) and name in forwarding):
+            alert_call = name in ALERT_FUNCTIONS
+            if not alert_call and name not in wrapper_names:
                 continue
             expr = keyword(call, "code")
             assert expr is not None, f"{module}:{call.lineno}: {name}() without code="
-            if function is not None and function.name in forwarding and name in ALERT_FUNCTIONS:
-                continue  # the wrapper's own forwarding call: its callers pass the codes
+            own = function is not None and (module, function.name) in forwarding
+            if alert_call and own and isinstance(expr, ast.Name) and expr.id == "code":
+                continue  # a wrapper's own forwarding call: its callers pass the codes
             code = resolve(module, expr, function)
             if code is not None:
                 codes.add(code)
                 continue
             site = (module, function.name if function is not None else "<module>")
-            assert site in DYNAMIC_SITES, (
+            assert site in dynamic, (
                 f"{module}:{call.lineno}: {name}(code={ast.unparse(expr)}) is computed; add the site to "
                 "DYNAMIC_SITES with the source of its codes"
             )
             computed.add(site)
-            codes |= DYNAMIC_SITES[site]()
-    stale = set(DYNAMIC_SITES) - computed
+            codes |= dynamic[site]()
+    stale = set(dynamic) - computed
     assert not stale, f"DYNAMIC_SITES lists sites the walk no longer finds: {sorted(stale)}"
     return codes
 
@@ -286,3 +300,54 @@ def test_the_alert_walk_sees_the_gateway_s_classified_alerts() -> None:
 def test_the_warning_walk_reads_each_module_that_warns(module: str) -> None:
     """`settings/validate.py` holds only some of the warnings; the rest are in the two dry-run modules."""
     assert warning_codes((PACKAGE / module,))
+
+
+# Two modules beside a wrapper's own, which call it through the module and by its imported name.
+WRAPPER: Final = """
+async def opened(conn, *, code, message):
+    await open_alert(conn, code=code, severity="warn", subject="s", message=message)
+"""
+
+
+def synthetic(modules: Mapping[str, str]) -> list[tuple[str, ast.Module]]:
+    return [(name, ast.parse(textwrap.dedent(source))) for name, source in modules.items()]
+
+
+def test_a_wrapper_s_callers_count_in_any_module_by_name_or_through_the_module() -> None:
+    walk = synthetic(
+        {
+            "pkg.alerts": WRAPPER,
+            "pkg.jobs": """
+                from pkg import alerts
+                async def check(conn):
+                    await alerts.opened(conn, code="pkg.through_the_module", message="m")
+            """,
+            "pkg.runs": """
+                from pkg.alerts import opened
+                async def check(conn):
+                    await opened(conn, code="pkg.by_name", message="m")
+            """,
+        }
+    )
+    assert alert_codes(walk, dynamic={}) == {"pkg.through_the_module", "pkg.by_name"}
+
+
+def test_a_wrapper_s_caller_that_passes_a_computed_code_fails_naming_it() -> None:
+    walk = synthetic(
+        {
+            "pkg.alerts": WRAPPER,
+            "pkg.jobs": """
+                from pkg import alerts
+                async def check(conn, which):
+                    await alerts.opened(conn, code=which, message="m")
+            """,
+        }
+    )
+    with pytest.raises(AssertionError, match=r"pkg\.jobs:\d+: opened\(code=which\) is computed"):
+        alert_codes(walk, dynamic={})
+
+
+def test_the_walk_finds_the_forwarding_wrapper_of_the_score_lane() -> None:
+    """Today's one wrapper, so a change in how wrappers are found cannot drop its five callers silently."""
+    forwarding = {(module, name) for module, tree in sources() for name in wrappers(tree)}
+    assert forwarding == {("jobhunter.scoring.reconcilers", "_opened")}

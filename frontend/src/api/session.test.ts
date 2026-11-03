@@ -20,9 +20,26 @@ describe("safeRedirect", () => {
     }
   });
 
-  it("never sends a sign-in back to the login page", () => {
-    for (const login of ["/login", "/login?redirect=%2Fsettings", "/login#x", "/login/"]) {
+  it("never sends a sign-in back to the login page, in any case (the router matches paths so)", () => {
+    for (const login of [
+      "/login",
+      "/login?redirect=%2Fsettings",
+      "/login#x",
+      "/login/",
+      "/LOGIN",
+      "/Login?x",
+      "/LOGIN/",
+      "/%4Cogin", // decodes to /Login
+    ]) {
       expect(safeRedirect(login), login).toBe("/");
+    }
+  });
+
+  it("refuses a path whose decoded form would leave the origin", () => {
+    // `/%2F%2Fevil.example` is a path of this origin as it stands, but the router decodes it to
+    // `//evil.example`, a protocol-relative URL: refused, `/`
+    for (const hostile of ["/%2F%2Fevil.example", "/%2f%2fevil.example/settings", "/\\evil", "/%5Cevil", "/%E0%A4%A"]) {
+      expect(safeRedirect(hostile), hostile).toBe("/");
     }
   });
 

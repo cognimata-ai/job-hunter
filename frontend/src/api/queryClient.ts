@@ -31,8 +31,12 @@ export function isTransient(error: unknown): boolean {
  * never retry (a manual retry reuses the action's `Idempotency-Key`, `api/idempotency.ts`).
  *
  * A 401 `unauthenticated` from anything but an `authCall` calls `onUnauthenticated` once for a burst: it is
- * armed again only when an `authCall` succeeds (a login, or a session read that finds the session). A query
- * that still fails transiently after its retries, and a mutation that fails transiently, call `onTransient`.
+ * armed again only when an `authCall` succeeds (a login, or a session read that finds the session).
+ *
+ * `onTransient` (the toast, §15.8: "a non-blocking toast plus automatic retry with backoff") is called once
+ * per fetch of a query, at its first transient failure, while its retries run (the cache's `failed` event);
+ * a query that does not retry calls it at its one failure; its final failure after retries does not call it
+ * again. A mutation calls it when it fails transiently.
  */
 export function makeQueryClient({
   onUnauthenticated,
@@ -42,16 +46,10 @@ export function makeQueryClient({
   onTransient: () => void;
 }): QueryClient {
   let expired = false;
-  const failed = (error: unknown, meta: AppMeta | undefined) => {
-    if (isProblem(error, "unauthenticated")) {
-      if (meta?.authCall !== true && !expired) {
-        expired = true;
-        onUnauthenticated();
-      }
-      return;
-    }
-    if (isTransient(error)) {
-      onTransient();
+  const unauthenticated = (error: unknown, meta: AppMeta | undefined) => {
+    if (isProblem(error, "unauthenticated") && meta?.authCall !== true && !expired) {
+      expired = true;
+      onUnauthenticated();
     }
   };
   const succeeded = (meta: AppMeta | undefined) => {
@@ -59,18 +57,36 @@ export function makeQueryClient({
       expired = false;
     }
   };
+  const queryCache = new QueryCache({
+    onError: (error, query) => {
+      unauthenticated(error, query.meta);
+      // a count of 1 is a failure with no retry, so no `failed` event announced it (`fetch` resets the count)
+      if (query.state.fetchFailureCount === 1 && isTransient(error)) {
+        onTransient();
+      }
+    },
+    onSuccess: (_data, query) => {
+      succeeded(query.meta);
+    },
+  });
+  queryCache.subscribe((event) => {
+    if (
+      event.type === "updated" &&
+      event.action.type === "failed" &&
+      event.action.failureCount === 1 &&
+      isTransient(event.action.error)
+    ) {
+      onTransient();
+    }
+  });
   return new QueryClient({
-    queryCache: new QueryCache({
-      onError: (error, query) => {
-        failed(error, query.meta);
-      },
-      onSuccess: (_data, query) => {
-        succeeded(query.meta);
-      },
-    }),
+    queryCache,
     mutationCache: new MutationCache({
       onError: (error, _vars, _context, mutation) => {
-        failed(error, mutation.meta);
+        unauthenticated(error, mutation.meta);
+        if (isTransient(error)) {
+          onTransient();
+        }
       },
       onSuccess: (_data, _vars, _context, mutation) => {
         succeeded(mutation.meta);

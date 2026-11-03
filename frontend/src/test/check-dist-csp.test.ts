@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findViolations } from "../../scripts/check-dist-csp.mjs";
+import { checkDist, findViolations } from "../../scripts/check-dist-csp.mjs";
 
 const GOOD_INDEX = `<!doctype html>
 <html lang="en">
@@ -14,6 +14,11 @@ const GOOD_INDEX = `<!doctype html>
     <div id="root"></div>
   </body>
 </html>`;
+// A committed build the CSP would refuse: an inline script and a style attribute in its index.html, and a
+// data: font in a stylesheet two directories down (only .html and .css, so neither ESLint nor tsc reads it).
+// Through a variable: Vite rewrites the literal `new URL("…", import.meta.url)` as a served asset's URL.
+const HERE = import.meta.url;
+const BAD_DIST = new URL("./fixtures/bad-dist/", HERE);
 
 function check(index: string, more: { path: string; text: string }[] = []) {
   return findViolations([{ path: "index.html", text: index }, ...more]);
@@ -49,5 +54,25 @@ describe("check-dist-csp", () => {
   it("allows a data: image (img-src allows data:)", () => {
     expect(check(GOOD_INDEX, [{ path: "assets/a.css", text: ".x{background:url(data:image/png;base64,iVBOR)}" }]))
       .toEqual([]);
+  });
+
+  describe("checkDist", () => {
+    it("walks the build's directories and reports each violation, the nested stylesheet's included", () => {
+      const violations = checkDist(BAD_DIST);
+      expect(violations).toHaveLength(3);
+      expect(violations).toEqual(expect.arrayContaining([
+        expect.stringMatching(/^index\.html: an inline <script>/),
+        expect.stringMatching(/^index\.html: a style attribute on <div>/),
+        "assets/nested/x.css: a data: font (font-src 'self')",
+      ]));
+    });
+
+    it("reports a build without index.html as a violation, not a crash", () => {
+      expect(checkDist(new URL("./assets/", BAD_DIST))).toEqual([
+        "index.html: missing (no build to serve)",
+        "nested/x.css: a data: font (font-src 'self')",
+      ]);
+      expect(checkDist(new URL("./no-such-build/", BAD_DIST))).toEqual(["index.html: missing (no build to serve)"]);
+    });
   });
 });

@@ -67,6 +67,7 @@ describe("makeQueryClient", () => {
     const result = qc.query({ queryKey: ["jobs"], queryFn: failing }).catch((e: unknown) => e);
     await vi.advanceTimersByTimeAsync(0);
     expect(failing).toHaveBeenCalledTimes(1);
+    expect(onTransient).toHaveBeenCalledTimes(1); // the toast comes with the first failure, before the retries
     for (const [delay, calls] of [[1000, 2], [2000, 3], [4000, 4]] as const) {
       await vi.advanceTimersByTimeAsync(delay - 1);
       expect(failing).toHaveBeenCalledTimes(calls - 1);
@@ -92,6 +93,13 @@ describe("makeQueryClient", () => {
     await both;
     expect(offline).toHaveBeenCalledTimes(4);
     expect(missing).toHaveBeenCalledTimes(1);
+    expect(onTransient).toHaveBeenCalledTimes(1);
+  });
+
+  it("a query that does not retry raises the toast on its one failure", async () => {
+    const { qc, onTransient } = client();
+    await qc.query({ queryKey: ["once"], queryFn: () => Promise.reject(problem(502, "internal")), retry: false })
+      .catch(() => undefined);
     expect(onTransient).toHaveBeenCalledTimes(1);
   });
 

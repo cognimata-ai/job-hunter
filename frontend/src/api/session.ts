@@ -29,16 +29,35 @@ function hasControl(text: string): boolean {
   return false;
 }
 
+/** Whether `pathname` (as the router has it, decoded) is the login page's: the router matches paths without
+ * regard to case, and a trailing slash is the same path. */
+export function isLoginPath(pathname: string): boolean {
+  return pathname.toLowerCase().replace(/\/+$/, "") === LOGIN_PATH;
+}
+
+function decodedPath(path: string): string | null {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return null; // malformed percent-encoding
+  }
+}
+
 /**
  * Where a login may send the user: `raw` when it is a path of this origin (one leading `/`, no backslash, no
- * control character, which a browser would strip into `//`) and not the login page itself; else `/`.
+ * control character, which a browser would strip into `//`), also once decoded as the router decodes it (so
+ * `/%2F%2Fevil.example` is refused), and not the login page itself in any case (`/LOGIN`); else `/`.
  */
 export function safeRedirect(raw: string | undefined): string {
   if (raw === undefined || !raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\") || hasControl(raw)) {
     return "/";
   }
   const url = new URL(raw, BASE);
-  if (url.origin !== BASE || url.pathname === LOGIN_PATH || url.pathname.startsWith(`${LOGIN_PATH}/`)) {
+  const path = decodedPath(url.pathname);
+  if (url.origin !== BASE || path === null || path.startsWith("//") || path.includes("\\") || hasControl(path)) {
+    return "/";
+  }
+  if (isLoginPath(path) || path.toLowerCase().startsWith(`${LOGIN_PATH}/`)) {
     return "/";
   }
   return `${url.pathname}${url.search}${url.hash}`;

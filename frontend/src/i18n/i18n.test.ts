@@ -57,11 +57,24 @@ describe("initI18n", () => {
     expect(de["alert.batch.retrieve_failing"]).not.toBe(en["alert.batch.retrieve_failing"]);
   });
 
-  it("never reads a colon as a namespace, nor escapes an interpolated value (React escapes)", () => {
+  it("never reads a dot as a path or a colon as a namespace, nor escapes an interpolated value", () => {
     initI18n("en");
-    const { result } = renderHook(() => useServerText());
-    expect(result.current("alert", "x:y", "fallback <b>")).toBe("fallback <b>");
-    expect(i18n.t("login.throttled", { minutes: "<5>" })).toContain("<5>");
+    expect(i18n.options.keySeparator).toBe(false);
+    expect(i18n.options.nsSeparator).toBe(false);
+    // a code with a colon of its own resolves as one key (with nsSeparator ":" it would look in namespace "alert.x")
+    // i18next keeps the bundled table itself (not a copy), so the key is deleted from it afterwards
+    const table = en as Record<string, string>;
+    i18n.addResource("en", "translation", "alert.x:y", "An alert with a colon");
+    expect(table["alert.x:y"]).toBe("An alert with a colon");
+    try {
+      const { result } = renderHook(() => useServerText());
+      expect(result.current("alert", "x:y", "fallback")).toBe("An alert with a colon");
+      expect(result.current("alert", "x:z", "fallback <b>")).toBe("fallback <b>");
+    } finally {
+      delete table["alert.x:y"];
+    }
+    expect(i18n.exists("alert.x:y")).toBe(false);
+    expect(i18n.t("login.throttled", { minutes: "<5>" })).toContain("<5>"); // React escapes, not i18next
   });
 
   it("sets the document's language and follows a change", async () => {

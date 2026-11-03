@@ -39,11 +39,13 @@ export interface FakeApi {
   calls: string[];
   signedIn: boolean;
   uiLanguage: "en" | "de";
+  /** The session read answers 503 (the api restarting, the proxy's 502 alike). */
+  sessionDown: boolean;
 }
 
 /** Installs the stub; `loginAnswers` answer the logins in order (a 204 opens the session). */
 export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response)[] } = {}): FakeApi {
-  const api: FakeApi = { logins: [], calls: [], signedIn, uiLanguage: "en" };
+  const api: FakeApi = { logins: [], calls: [], signedIn, uiLanguage: "en", sessionDown: false };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
     const path = typeof input === "string" ? input : input instanceof URL ? input.pathname : input.url;
     const method = (init?.method ?? "GET").toUpperCase();
@@ -61,7 +63,7 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
       return Promise.resolve(problem(401, "unauthenticated"));
     }
     if (method === "GET" && path === "/api/auth/session") {
-      return Promise.resolve(json(SESSION));
+      return Promise.resolve(api.sessionDown ? problem(503, "internal") : json(SESSION));
     }
     if (method === "GET" && path === "/api/settings") {
       return Promise.resolve(json(settingsRead(api.uiLanguage)));

@@ -90,6 +90,61 @@ describe("useKeyedMutation", () => {
     expect(m.keys[1]).not.toBe(m.keys[0]);
   });
 
+  it("keeps each action's key: A, then B, then a retry of A reuses A's key after A's 503", async () => {
+    const m = setup<{ id: number }>([
+      () => Promise.reject(problem(503, "internal")), // A
+      () => Promise.resolve("b"), // B
+      () => Promise.resolve("a"), // A again: the manual retry
+    ]);
+    await m.act({ id: 1 });
+    await m.act({ id: 2 });
+    await m.act({ id: 1 });
+    const [a, b, retryOfA] = m.keys;
+    expect(retryOfA).toBe(a);
+    expect(b).not.toBe(a);
+  });
+
+  it("gives two different files two keys, and the same file retried after a network error one", async () => {
+    const cv = new File(["%PDF-1.7 first"], "cv.pdf", { type: "application/pdf" });
+    const other = new File(["%PDF-1.7 first"], "cv.pdf", { type: "application/pdf" }); // equal, not the same
+    const m = setup<{ file: File; sendOriginal: boolean }>([
+      () => Promise.reject(new TypeError("Failed to fetch")),
+      () => Promise.reject(new TypeError("Failed to fetch")),
+      () => Promise.resolve("uploaded"),
+    ]);
+    await m.act({ file: cv, sendOriginal: false }); // no answer: the key is kept
+    await m.act({ file: other, sendOriginal: false }); // another file while it is kept
+    await m.act({ file: cv, sendOriginal: false }); // the retry: the same file object
+    const [first, otherFile, retry] = m.keys;
+    expect(otherFile).not.toBe(first);
+    expect(retry).toBe(first);
+  });
+
+  it("reads FormData by its entries in order, a file by its object", async () => {
+    const cv = new File(["a"], "cv.pdf");
+    const form = (file: File, mode: string) => {
+      const data = new FormData();
+      data.append("file", file);
+      data.append("mode", mode);
+      return data;
+    };
+    const m = setup<FormData>([
+      () => Promise.reject(problem(500, "internal")),
+      () => Promise.reject(problem(500, "internal")),
+      () => Promise.reject(problem(500, "internal")),
+      () => Promise.resolve("ok"),
+    ]);
+    await m.act(form(cv, "text"));
+    await m.act(form(cv, "text")); // another FormData, the same file and fields: the same action
+    await m.act(form(cv, "native_pdf")); // another field value
+    await m.act(form(new File(["a"], "cv.pdf"), "text")); // another file
+    const [first, same, otherField, otherFile] = m.keys;
+    expect(same).toBe(first);
+    expect(otherField).not.toBe(first);
+    expect(otherFile).not.toBe(first);
+    expect(new Set(m.keys).size).toBe(3);
+  });
+
   it("answers any failure as a ProblemError and never retries by itself", async () => {
     const m = setup<string>([() => Promise.reject(new TypeError("Failed to fetch"))]);
     await m.act("run");

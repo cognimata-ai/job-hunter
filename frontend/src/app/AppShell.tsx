@@ -2,12 +2,11 @@
 // landmark. It reads the settings for the UI language and the display time zone. The login page is
 // rendered bare (it is the only route outside the session).
 import { useQuery } from "@tanstack/react-query";
-import { Link, Outlet, useRouterState } from "@tanstack/react-router";
+import { Link, Outlet, useMatch } from "@tanstack/react-router";
 import { createContext, useContext, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { apiFetch } from "../api/client";
 import type { components } from "../api/schema";
-import { LOGIN_PATH } from "../api/session";
 import { Spinner } from "../components/Spinner";
 import styles from "./AppShell.module.css";
 import { RequireSession } from "./RequireSession";
@@ -30,8 +29,9 @@ export function useDisplay(): Display {
 }
 
 export function AppShell() {
-  const onLogin = useRouterState({ select: (state) => state.location.pathname === LOGIN_PATH });
-  if (onLogin) {
+  // by route match, as the router matches the path (without regard to case): `/LOGIN` is the login too
+  const login = useMatch({ from: "/login", shouldThrow: false });
+  if (login !== undefined) {
     return <Outlet />;
   }
   return (
