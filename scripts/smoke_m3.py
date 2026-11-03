@@ -8,7 +8,10 @@ recorded fake (the Message Batches API included) and every source by the fixture
     uv run python scripts/smoke_m3.py
 
 The precondition is M2's: a FRESH dev stack with both overlays. The script creates the one user, so a stack
-that has one already fails the first check with M2's hint. It never deletes anything.
+that has one already fails the first check with M2's hint. It never deletes anything. The E2E stack's overlay
+(`deploy/compose.e2e.yaml`, M4 Task 18: the fake embedder and the fake LLM's stack controls) may be layered
+last: the compose calls below name the same project, `jobhunter-dev`, and work against the four files as they
+are (with no batch script file, every batch follows the default script).
 
 It imports `scripts/smoke_m2.py` and runs its checks 1-8 as they are (the user, the login, the health, the CV
 through the profile flow on the fake, the confirm and its query proposal), then seven of its own. Its compose
@@ -35,29 +38,35 @@ one JSON line, `{"check": <name>, "ok": <bool>}` with an optional `"detail"`:
 13. `scope_apply`: a scope save (one location, `SCOPE_LOCATION` at `SCOPE_RADIUS_KM`) answers 201 with its
     apply operation; the apply flips within 120 s (the operation `succeeded`, the new scope active, none
     pending) and every published result of the tuple has a current instance for the new scope;
-14. `batch_path` (Ruling T28-e): `jobhunter golden seed-adversarial` in the worker container exits 0 with 10
-    cases; a second CV through the profile flow, its draft saved with one more target title (an unchanged
-    profile activates nothing) and confirmed as `version_no` 2; then the old bulk operation is `cancelled`
-    (or, when no target carries it, `completed`: `OLD_BULK`) and the new one `active`, the new tuple's
-    `create_targets_for_tuple` `succeeded` with every target of the tuple carrying the new bulk operation
-    (they came from that operation: Ruling T28-c), and the
-    `batch_submit` it requested `succeeded` with `skipped = below_minimum` and no submission, its eligible
-    targets (`ELIGIBLE_SQL`, as `scoring.batches` defines it) fewer than `batch_min_targets`. The line
-    counts the eligible targets and the tuple's `expired_unscored('too_old')` ones;
+14. `batch_path` (Ruling T28-e; the full path from M4 Task 18, M3 ledger L656): `jobhunter golden
+    seed-adversarial` in the worker container exits 0 with 10 cases; a second CV through the profile flow, its
+    draft saved with one more target title (an unchanged profile activates nothing) and confirmed as
+    `version_no` 2; then the old bulk operation is `cancelled` (or, when no target carries it, `completed`:
+    `OLD_BULK`) and the new one `active`, the new tuple's `create_targets_for_tuple` `succeeded` with every
+    target of the tuple carrying the new bulk operation (they came from that operation: Ruling T28-c), and
+    the `batch_submit` it requested `succeeded` with one submission (none skipped), on the batch floor the
+    check saves first (`lower_batch_floor`: `SMOKE_BATCH_MIN_TARGETS`, a dry-run then the save, every warning
+    acknowledged, before the second confirm); that submission reaches
+    `submitted`, then `ended` and `reconciled` on the fake Batches API within `RECONCILE_WITHIN_S` (two
+    `batch_poll` passes 5 min apart: the fake ends a batch at its second retrieval), every stamp of that path
+    set, every item decided, and the follow-ups' `batch_followup` cycle requested (`FOLLOWUP_REQUESTED`).
+    The line names the reconciled submission with its items' decisions, and counts the tuple's
+    `expired_unscored('too_old')` targets; a `batch_submit` that submitted nothing fails with the eligible
+    targets (`ELIGIBLE_SQL`, as `scoring.batches` defines it) against that floor, and a submission of fewer
+    requests than it fails too;
 15. `health`: `GET /api/system/health` has `scoring.pause_reason = null` and `scoring.running_cycle_id =
     null` (once the running cycle, if any, has ended: 120 s), and the month's counters equal the ledger
     (`COUNTERS_CLEAN`: `spend_ledger.recompute`'s formula, `_COUNTED`, over `psql`).
 
-**Why check 14 stops at the skip.** The seeded settings already hold `scoring.batch_min_targets = 200`, the
-settings model's floor, so the smoke does not lower it. The fixtures' postings keep their recorded dates,
-which age past `scope.max_ad_age_days`: the batch preparation's expiry sweep moves the second confirm's
-targets of those ads to `expired_unscored('too_old')`, fewer than `batch_min_targets` stay eligible, and the
-preparation ends `below_minimum`. The count of eligible targets only falls as the dates age; the line prints
-it with the `too_old` count. (On 2026-11-01: 313 retained revisions, 242 pending targets at the confirm, 129
-moved `too_old`, 113 eligible.) The submission on the fake Batches API, its polls, the reconcile, the
-decided items and the follow-up cycle are proven in process by
-`tests/integration/test_m3_end_to_end.py::test_scoring_end_to_end_on_the_fake_llm` (250 items). Fixture
-dates relative to the fake's clock, which would let the stack show the batch too, are carried to M4.
+**Why check 14 lowers the batch floor** (M4 Task 18). In fake mode the fixture transport moves every posting
+date the adapters read, and the responses' `Date`, by the whole days between each recording's `fetched_at` and
+the clock (`sources.fixtures.shift_dates`, `tests/contract/README.md`): each ad keeps the age it had when it
+was recorded, whatever the date. A third of the recorded ads were already older than
+`scope.max_ad_age_days` (30) when fetched (the Lever demo board's hundred postings are years old), so the
+batch preparation's expiry sweep moves them to `expired_unscored('too_old')` and the stack reaches about 130
+eligible targets, below the seeded `scoring.batch_min_targets` of 200. Check 14 therefore saves the floor down
+to `SMOKE_BATCH_MIN_TARGETS` (20, the settings model's floor) through the settings API before its second
+confirm, and the full path runs on the fake Batches API.
 
 **The bucket** (§6.9.2; Ruling T28-f) paces the score lane at the month's rate, about $0.13 an hour on the dev
 settings, and a cycle other than Score now starts only when it holds `min(min_cycle_targets x ĉ, B_max)`. The
@@ -252,7 +261,10 @@ SEEDED: Final = re.compile(r"golden seed-adversarial: cases=(\d+) ")
 APPROVE_KEY: Final = "smoke-m3-approve-0002"
 CONFIRM_KEY: Final = "smoke-m3-confirm-0002"
 ADDED_TITLE: Final = {"title": "Platform Engineer", "lang": "en"}
-BATCH_MIN_TARGETS: Final = 200  # the seeded `scoring.batch_min_targets`, the settings model's floor
+# The batch floor check 14 saves before its second confirm (M4 Task 18, ruling T18-a): the settings model's
+# floor, below the eligible targets the fixtures reach (about 130; the seeded 200 is out of reach).
+SMOKE_BATCH_MIN_TARGETS: Final = 20
+BATCH_FLOOR_KEY: Final = "smoke-m3-batch-floor-0001"
 SUBMIT_WITHIN_S: Final = 120
 # The tuple's newest `create_targets_for_tuple`, its targets, those of bulk operation `{bulk}`, and the
 # retained current revisions without a target of the tuple.
@@ -305,7 +317,37 @@ ELIGIBLE_OF: Final = (
     + "), (SELECT count(*) FROM score_targets WHERE llm_tuple_id = {tuple} AND state = 'expired_unscored' "
     "AND state_reason = 'too_old')"
 )
-BELOW_MINIMUM: Final = "below_minimum"
+# M4 Task 18: the full batch path. A `batch_submit` that submitted skipped nothing (`progress->>'skipped'`
+# absent) and made one submission.
+SUBMITTED: Final = ("succeeded", "none", "1")
+# The fake Batches API ends a batch at its second retrieval (`BatchScript().polls_until_ended = 1`), so two
+# `batch_poll` passes of the 5-minute cadence (`*/5 * * * *`) end it: at most 10 min after the submission, and
+# the margin for deciding its items, one transaction each.
+RECONCILE_WITHIN_S: Final = 720
+# The bulk operation's newest submission: its id, state, request count, whether every stamp of the path
+# (submitted, ended, results complete, reconciled) is set, its items and those still awaiting a decision.
+SUBMISSION_OF: Final = """\
+SELECT coalesce(s.id, 0), coalesce(s.state, 'none'), coalesce(s.request_count, 0),
+  coalesce(s.submitted_at IS NOT NULL AND s.ended_at IS NOT NULL AND s.results_complete_at IS NOT NULL
+    AND s.reconciled_at IS NOT NULL, false),
+  (SELECT count(*) FROM batch_items i WHERE i.submission_id = s.id),
+  (SELECT count(*) FROM batch_items i WHERE i.submission_id = s.id AND i.processed_at IS NULL)
+FROM (SELECT 1) one LEFT JOIN LATERAL (SELECT id, state, request_count, submitted_at, ended_at,
+  results_complete_at, reconciled_at FROM batch_submissions WHERE bulk_operation_id = {bulk}
+  ORDER BY id DESC LIMIT 1) s ON true"""
+# A submission that left the path: rejected, ambiguous (the quarantine), abandoned or released.
+OFF_THE_PATH: Final = frozenset({"submit_rejected", "submit_ambiguous", "abandoned", "released"})
+# The submission's decisions, `<decision>=<count>` joined by commas.
+DECISIONS_OF: Final = (
+    "SELECT coalesce(string_agg(decision || '=' || n, ',' ORDER BY decision), '') FROM (SELECT decision, "
+    "count(*) AS n FROM batch_items WHERE submission_id = {submission} GROUP BY decision) d"
+)
+# The `batch_followup` cycles requested (`cycles.request_cycle` defers `score_cycle(trigger)`; a finished job
+# stays in the table until the retention pass, hours later).
+FOLLOWUP_REQUESTED: Final = (
+    "SELECT count(*) FROM procrastinate_jobs WHERE task_name = 'jh:score_cycle' "
+    "AND args->>'trigger' = 'batch_followup'"
+)
 
 # Check 15: `spend_ledger._COUNTED` (pinned by the test) and `_COUNTERS`' comparison for the month.
 COUNTED: Final = (
@@ -637,6 +679,46 @@ def second_profile(ctx: Context) -> int:
     return version_id
 
 
+def lower_batch_floor(ctx: Context) -> str:
+    """One settings save through the API, as `smoke_m2.check_settings_save` makes one (the dry-run, then the
+    save with every warning acknowledged and a key of its own): `scoring.batch_min_targets` lowered to
+    `SMOKE_BATCH_MIN_TARGETS`, so the second confirm's bulk operation submits the targets the fixtures leave
+    eligible. What the detail says of it."""
+    active = json_object(ctx.client.get(f"{ORIGIN}/api/settings", headers=ctx.auth()), 200)
+    payload, base = copy.deepcopy(pick(active, "payload")), pick(active, "version", "id")
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("scoring"), dict)
+        or not isinstance(base, int)
+    ):
+        raise CheckFailed("the active settings have no scoring group or version id")
+    payload["scoring"]["batch_min_targets"] = SMOKE_BATCH_MIN_TARGETS
+    preview = json_object(
+        ctx.client.post(f"{ORIGIN}/api/settings/dry-run", json={"payload": payload}, headers=mutating(ctx)),
+        200,
+    )
+    errors, warnings = pick(preview, "errors"), pick(preview, "warnings")
+    if not isinstance(errors, list) or not isinstance(warnings, list):
+        raise CheckFailed("the dry-run answered no errors and warnings lists")
+    if errors:
+        raise CheckFailed(
+            f"the dry-run refused the batch floor: {sorted({str(pick(e, 'code')) for e in errors})}"
+        )
+    codes = [str(pick(w, "code")) for w in warnings]
+    saved = json_object(
+        ctx.client.post(
+            f"{ORIGIN}/api/settings",
+            json={"payload": payload, "base_version_id": base, "acknowledged_warnings": codes},
+            headers=mutating(ctx, BATCH_FLOOR_KEY),
+        ),
+        201,
+    )
+    version_no = pick(saved, "version", "version_no")
+    return (
+        f"batch_min_targets={SMOKE_BATCH_MIN_TARGETS} saved as version_no {version_no!r} (warnings={codes})"
+    )
+
+
 def check_batch_path(ctx: Context) -> str | None:
     if STATE.tuple_id is None:
         raise CheckFailed("no active tuple: check targets_created did not pass")
@@ -645,6 +727,7 @@ def check_batch_path(ctx: Context) -> str | None:
         raise CheckFailed(f"expected {GOLDEN_CASES} adversarial cases, got {cases}")
     old_tuple = STATE.tuple_id
     (old_bulk, _) = query_row(BULK_OF.format(tuple=old_tuple), 2)
+    floor = lower_batch_floor(ctx)
     version_id = second_profile(ctx)
     tuple_id, _ = active()
     if tuple_id == old_tuple:
@@ -681,20 +764,60 @@ def check_batch_path(ctx: Context) -> str | None:
         found = f"batch_submit={status} skipped={skipped} submissions={submissions}"
         return status in ("succeeded", "failed"), found
 
-    status, skipped, submissions = poll_row(
-        BATCH_SUBMIT_OF.format(bulk=int(bulk_id)), 3, ended, within_s=SUBMIT_WITHIN_S, what="the batch_submit"
+    submit = tuple(
+        poll_row(
+            BATCH_SUBMIT_OF.format(bulk=int(bulk_id)),
+            3,
+            ended,
+            within_s=SUBMIT_WITHIN_S,
+            what="the batch_submit",
+        )
     )
     eligible, too_old = ints(query_row(ELIGIBLE_OF.format(bulk=int(bulk_id), tuple=tuple_id), 2))
-    batch = (
-        f"batch_submit={status} skipped={skipped} submissions={submissions}: eligible={eligible} "
-        f"(batch_min_targets={BATCH_MIN_TARGETS}) expired_unscored_too_old={too_old}"
-    )
-    if (status, skipped, submissions) != ("succeeded", BELOW_MINIMUM, "0") or eligible >= BATCH_MIN_TARGETS:
-        raise CheckFailed(f"expected the batch_submit skipped below_minimum; {batch}")
+    if submit != SUBMITTED:
+        raise CheckFailed(
+            f"expected the batch_submit to submit one batch; batch_submit={submit[0]} skipped={submit[1]} "
+            f"submissions={submit[2]}: eligible={eligible} (batch_min_targets={SMOKE_BATCH_MIN_TARGETS}) "
+            f"expired_unscored_too_old={too_old}"
+        )
+    batch = batch_reconciled(int(bulk_id))
     STATE.tuple_id = tuple_id
     return (
-        f"{cases} adversarial cases; version {version_id} confirmed as version_no 2: tuple {old_tuple} -> "
-        f"{tuple_id}, bulk {old_bulk} {old_state} -> {bulk_id} active; {targets}; {batch}"
+        f"{cases} adversarial cases; {floor}; version {version_id} confirmed as version_no 2: tuple "
+        f"{old_tuple} -> {tuple_id}, bulk {old_bulk} {old_state} -> {bulk_id} active; {targets}; {batch}; "
+        f"expired_unscored_too_old={too_old}"
+    )
+
+
+def batch_reconciled(bulk_id: int) -> str:
+    """Bulk operation `bulk_id`'s submission, polled until `reconciled` (on the fake Batches API, through
+    `submitted` and `ended`) with every item decided, and the `batch_followup` cycle its follow-ups requested:
+    what the detail says of them."""
+
+    def found(row: list[str]) -> str:
+        return f"submission {row[0]} {row[1]} ({row[2]} requests, {row[4]} items, {row[5]} awaiting)"
+
+    def reconciled(row: list[str]) -> tuple[bool, str]:
+        if row[1] in OFF_THE_PATH:
+            raise CheckFailed(f"{found(row)}: off the batch path")
+        return row[1] == "reconciled", found(row)
+
+    row = poll_row(
+        SUBMISSION_OF.format(bulk=bulk_id), 6, reconciled, within_s=RECONCILE_WITHIN_S, what="the reconcile"
+    )
+    submission, count, items, awaiting = (int(row[i]) for i in (0, 2, 4, 5))
+    decisions = query_row(DECISIONS_OF.format(submission=submission), 1)[0]
+    if row[3] != "t" or items != count or awaiting or count < SMOKE_BATCH_MIN_TARGETS:
+        raise CheckFailed(
+            f"{found(row)}: a stamp of the path is missing, an item is undecided, or fewer requests than the "
+            f"floor ({SMOKE_BATCH_MIN_TARGETS})"
+        )
+    (requested,) = ints(query_row(FOLLOWUP_REQUESTED, 1))
+    if requested < 1:
+        raise CheckFailed(f"submission {submission} reconciled ({decisions}) but no batch_followup cycle")
+    return (
+        f"batch_submit succeeded: submission {submission} submitted, ended and reconciled with {count} "
+        f"items, each decided ({decisions}); batch_followup cycle requested ({requested})"
     )
 
 

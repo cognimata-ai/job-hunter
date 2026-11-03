@@ -477,7 +477,7 @@ class Scoring(_Group):
     max_targets_per_cycle: int = Field(60, ge=1, le=500)
     min_cycle_targets: int = Field(10, ge=1, le=100)
     batch_bulk_rescore: bool = True
-    batch_min_targets: int = Field(200, ge=200, le=100_000)
+    batch_min_targets: int = Field(200, ge=20, le=100_000)  # floor 20: the dev fixtures' reach (M4 T18-a)
     batch_max_items: int = Field(500, ge=200, le=10_000)  # 500 since spec revision 3.4 (Deviation 34)
     # a rate: at most 2 decimal places, no trailing zero
     bulk_rescore_max_budget_share: Annotated[Decimal, _DECIMAL, _rate("0.1", "1.0"), _AS_STRING] = Decimal(

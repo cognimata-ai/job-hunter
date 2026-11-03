@@ -211,20 +211,26 @@ def template(statement: str) -> re.Pattern[str]:
 class Database:
     """The rows the stubbed stack's `psql` answers, by statement; `seen` the statements' names in order.
     The first bulk operation is cancelled by the second confirm; `batch_submit` is the bulk operation's
-    `batch_submit` row (status, what it skipped, submissions) and `eligible` its eligible and too-old counts,
-    as the dev stack's fixtures leave them (Ruling T28-e)."""
+    `batch_submit` row (status, what it skipped, submissions) and `eligible` its eligible and too-old counts;
+    `submission` is its submission's row (id, state, requests, every stamp set, items, items awaiting) and
+    `followups` the `batch_followup` cycles requested: by default the full batch path, which the dev stack's
+    fixtures take since their dates move with the clock (M4 Task 18)."""
 
     def __init__(
         self,
         smoke: ModuleType,
         *,
-        batch_submit: str = "succeeded|below_minimum|0",
-        eligible: str = "117|125",
+        batch_submit: str = "succeeded|none|1",
+        eligible: str = "0|28",
+        submission: str = "7|reconciled|243|t|243|0",
+        followups: str = "1",
         old_bulk: str = "cancelled|0",
     ) -> None:
         self.seen: list[str] = []
         self.batch_submit = batch_submit
         self.eligible = eligible
+        self.submission = submission
+        self.followups = followups
         self.old_bulk = old_bulk
         self.confirmed = 0
         self.statements = [
@@ -248,6 +254,9 @@ class Database:
                 "OLD_BULK",
                 "BATCH_SUBMIT_OF",
                 "ELIGIBLE_OF",
+                "SUBMISSION_OF",
+                "DECISIONS_OF",
+                "FOLLOWUP_REQUESTED",
                 "COUNTERS_CLEAN",
             )
         ]
@@ -283,6 +292,9 @@ class Database:
             "OLD_BULK": self.old_bulk,
             "BATCH_SUBMIT_OF": self.batch_submit,
             "ELIGIBLE_OF": self.eligible,
+            "SUBMISSION_OF": self.submission,
+            "DECISIONS_OF": "followup=241,published=2",
+            "FOLLOWUP_REQUESTED": self.followups,
             "COUNTERS_CLEAN": "t|4.120000|3.910000",
         }
         return rows[name]
@@ -299,6 +311,8 @@ class Stack:
         self.uploads = 0
         self.seen: list[tuple[str, str]] = []
         self.saved_draft: Any = None
+        self.settings_version = 1
+        self.saves: list[tuple[str, Any]] = []  # each settings save's idempotency key and payload, in order
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         route = (request.method, request.url.path)
@@ -394,17 +408,34 @@ class Stack:
                 case = {"id": 9, "job_id": 41, "label": "good", "comment": AD_TEXT, "source": "week1"}
                 return httpx.Response(200, json={"items": [{**case, "active": True}], "next_cursor": None})
             case ("GET", "/api/settings"):
-                payload = {"scope": {"locations": [], "excluded_keywords": [AD_TEXT]}, "anthropic": KEY}
-                return httpx.Response(200, json={"version": {"id": 1}, "payload": payload})
+                payload = {
+                    "scope": {"locations": [], "excluded_keywords": [AD_TEXT]},
+                    "scoring": {"batch_min_targets": 200, "min_cycle_targets": 10},
+                    "anthropic": KEY,
+                }
+                return httpx.Response(
+                    200, json={"version": {"id": self.settings_version}, "payload": payload}
+                )
             case ("POST", "/api/settings/dry-run"):
+                if sent["payload"]["scoring"]["batch_min_targets"] != 200:  # check 14's floor
+                    assert sent["payload"]["scope"]["locations"] == []
+                    return httpx.Response(200, json={"errors": [], "warnings": [{"code": "budget_tight"}]})
                 (location,) = sent["payload"]["scope"]["locations"]
                 assert location["radius_km"] == 200 and location["gazetteer_id"] == "geonames:2950159"
                 return httpx.Response(200, json={"errors": [], "warnings": [{"code": self.warning}]})
             case ("POST", "/api/settings"):
+                self.saves.append((request.headers["idempotency-key"], sent["payload"]))
+                base = self.settings_version
+                self.settings_version += 1
+                saved = {"id": self.settings_version, "version_no": self.settings_version}
+                if sent["payload"]["scoring"]["batch_min_targets"] != 200:
+                    assert (base, sent["acknowledged_warnings"]) == (2, ["budget_tight"])
+                    return httpx.Response(201, json={"version": {**saved, "effect_classes": ["budget"]}})
                 assert (sent["base_version_id"], sent["acknowledged_warnings"]) == (1, [self.warning])
-                assert request.headers["idempotency-key"]
-                saved = {"id": 2, "version_no": 2, "effect_classes": ["scope"]}
-                return httpx.Response(201, json={"version": saved, "apply_scope_operation_id": 77})
+                return httpx.Response(
+                    201,
+                    json={"version": {**saved, "effect_classes": ["scope"]}, "apply_scope_operation_id": 77},
+                )
         raise AssertionError(f"the stub stack has no route {route}")
 
 
@@ -453,8 +484,32 @@ def test_a_whole_run_prints_fifteen_ok_lines_and_never_a_secret_or_a_text(smoke,
     assert stack.saved_draft["target_titles"] == [*titles, smoke.ADDED_TITLE]
     assert ("POST", "/api/runs") in stack.seen and stack.uploads == 2
     batch = lines[CHECK_NAMES.index("batch_path")]["detail"]
-    assert "skipped=below_minimum submissions=0: eligible=117" in batch
-    assert "expired_unscored_too_old=125" in batch
+    assert "batch_min_targets=20 saved as version_no 3 (warnings=['budget_tight'])" in batch
+    assert "submission 7 submitted, ended and reconciled with 243 items" in batch
+    assert "each decided (followup=241,published=2); batch_followup cycle requested (1)" in batch
+    assert "expired_unscored_too_old=28" in batch
+    seen = stack.database.seen
+    assert seen.index("BATCH_SUBMIT_OF") < seen.index("SUBMISSION_OF") < seen.index("FOLLOWUP_REQUESTED")
+
+
+def test_check_14_saves_the_batch_floor_before_its_second_confirm(smoke, monkeypatch) -> None:
+    """Ruling T18-a: one settings save of `scoring.batch_min_targets = SMOKE_BATCH_MIN_TARGETS` (20), with its
+    own key and the dry-run's warnings acknowledged, after check 13's scope save and before the second
+    confirm; nothing else of the payload changes."""
+    stack = Stack(Database(smoke))
+    run_against(smoke, monkeypatch, stack)
+    assert smoke.SMOKE_BATCH_MIN_TARGETS == 20
+    (scope_key, _), (floor_key, floor_payload) = stack.saves
+    assert (scope_key, floor_key) == (smoke.SCOPE_KEY, smoke.BATCH_FLOOR_KEY)
+    assert floor_payload == {  # the active payload (the stub's) with the floor changed, and nothing else
+        "scope": {"locations": [], "excluded_keywords": [AD_TEXT]},
+        "scoring": {"batch_min_targets": 20, "min_cycle_targets": 10},
+        "anthropic": KEY,
+    }
+    confirms = [i for i, (method, path) in enumerate(stack.seen) if path.endswith("/confirm")]
+    saves = [i for i, route in enumerate(stack.seen) if route == ("POST", "/api/settings")]
+    assert len(confirms) == 2 and saves[0] < saves[1] < confirms[1]
+    assert confirms[0] < saves[1]
 
 
 @pytest.mark.parametrize(
@@ -488,22 +543,44 @@ def test_the_first_bulk_operation_has_ended_by_the_second_confirm(
 
 
 @pytest.mark.parametrize(
-    ("batch_submit", "eligible"),
+    ("changes", "detail"),
     [
-        ("succeeded|none|1", "0|125"),  # a submission: the stack's fixtures cannot give one (T28-e)
-        ("failed|none|0", "117|125"),
-        ("succeeded|below_minimum|0", "200|0"),  # skipped although enough targets were eligible
+        (
+            {"batch_submit": "succeeded|below_minimum|0", "eligible": "13|129"},
+            "expected the batch_submit to submit one batch; batch_submit=succeeded skipped=below_minimum "
+            "submissions=0: eligible=13 (batch_min_targets=20) expired_unscored_too_old=129",
+        ),
+        ({"batch_submit": "failed|none|0"}, "expected the batch_submit to submit one batch"),
+        ({"submission": "7|submit_ambiguous|243|f|243|243"}, "submission 7 submit_ambiguous"),
+        ({"submission": "7|submit_rejected|243|f|243|0"}, "submission 7 submit_rejected"),
+        ({"submission": "7|reconciled|243|f|243|0"}, "a stamp of the path is missing"),
+        ({"submission": "7|reconciled|243|t|243|3"}, "an item is undecided"),
+        ({"submission": "7|reconciled|243|t|240|0"}, "an item is undecided"),
+        ({"submission": "7|reconciled|19|t|19|0"}, "fewer requests than the floor"),
+        ({"followups": "0"}, "but no batch_followup cycle"),
     ],
-    ids=["submitted", "failed", "skipped-with-enough"],
+    ids=[
+        "below-minimum",
+        "failed",
+        "ambiguous",
+        "rejected",
+        "a-stamp-missing",
+        "items-awaiting",
+        "items-missing",
+        "below-the-floor",
+        "no-followup-cycle",
+    ],
 )
-def test_the_batch_path_holds_only_a_skip_below_the_minimum(
-    smoke, monkeypatch, capsys, batch_submit: str, eligible: str
+def test_the_batch_path_needs_a_reconciled_submission(
+    smoke, monkeypatch, capsys, changes: dict[str, str], detail: str
 ) -> None:
-    database = Database(smoke, batch_submit=batch_submit, eligible=eligible)
-    run_against(smoke, monkeypatch, Stack(database), exit_code=1)
+    """Check 14 passes only on the full path: one submission, `reconciled` with every stamp of the path set
+    and every item decided, and a `batch_followup` cycle requested; a skip below the minimum (M3's stopping
+    point) now fails with the eligible and too-old counts."""
+    run_against(smoke, monkeypatch, Stack(Database(smoke, **changes)), exit_code=1)
     last = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert (last["check"], last["ok"]) == ("batch_path", False)
-    assert last["detail"].startswith("expected the batch_submit skipped below_minimum")
+    assert detail in last["detail"]
 
 
 def test_a_detail_never_shows_the_session_token(smoke, monkeypatch, capsys) -> None:
