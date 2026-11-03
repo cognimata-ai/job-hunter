@@ -61,8 +61,9 @@ class SourceFacetOut(BaseModel):
     count: int
 
 
+# What they count: the module docstring.
 class FacetsOut(BaseModel):
-    """The Company and Source options of the listed cards, with their counts (module docstring)."""
+    """The Company and Source options of the listed cards, with their counts."""
 
     companies: list[CompanyFacetOut]
     sources: list[SourceFacetOut]

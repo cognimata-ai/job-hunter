@@ -282,7 +282,7 @@ export interface paths {
         };
         /**
          * List Jobs
-         * @description A page of the Jobs list in one read snapshot, with its ranking generation (module docstring).
+         * @description A page of the Jobs list in one read snapshot, with its ranking generation.
          */
         get: operations["list_jobs_api_jobs_get"];
         put?: never;
@@ -302,7 +302,7 @@ export interface paths {
         };
         /**
          * List Job Facets
-         * @description The companies and sources of the listed cards, with their counts (module docstring).
+         * @description The companies and sources of the listed cards, with their counts.
          */
         get: operations["list_job_facets_api_jobs_facets_get"];
         put?: never;
@@ -386,8 +386,8 @@ export interface paths {
         };
         /**
          * Get Job History
-         * @description A page of the job's score history in one read snapshot (module docstring). The cursor is read before
-         *     the snapshot, so a cursor this route did not sign is 400 even for a gone job, before its 404.
+         * @description A page of the job's score history in one read snapshot. The cursor is read before the snapshot, so a
+         *     cursor this route did not sign is 400 even for a gone job, before its 404.
          */
         get: operations["get_job_history_api_jobs__job_id__history_get"];
         put?: never;
@@ -1453,7 +1453,7 @@ export interface components {
         };
         /**
          * DetailScoreOut
-         * @description The card's score and the rest of the result (module docstring, The score).
+         * @description The card's score and the rest of the result.
          */
         DetailScoreOut: {
             /** Caps Applied */
@@ -1661,7 +1661,7 @@ export interface components {
         };
         /**
          * FacetsOut
-         * @description The Company and Source options of the listed cards, with their counts (module docstring).
+         * @description The Company and Source options of the listed cards, with their counts.
          */
         FacetsOut: {
             /** Companies */
@@ -1671,7 +1671,7 @@ export interface components {
         };
         /**
          * FeedbackIn
-         * @description A label, or a "wrong score" with the label the user expected (§14.2 L4977).
+         * @description A label, or a "wrong score" with the label the user expected (§14.2).
          */
         FeedbackIn: {
             /** Comment */
@@ -1744,7 +1744,7 @@ export interface components {
         };
         /**
          * FlagsIn
-         * @description The case's flags to set; an absent one is kept. At most two cases are canaries (L4632).
+         * @description The case's flags to set; an absent one is kept. At most two cases are canaries.
          */
         FlagsIn: {
             /** Active */
@@ -1866,7 +1866,7 @@ export interface components {
         };
         /**
          * HistoryItemOut
-         * @description One result of the job's history with every instance of it (module docstring).
+         * @description One result of the job's history with every instance of it.
          */
         HistoryItemOut: {
             /** Instances */
@@ -1943,7 +1943,7 @@ export interface components {
         } | null;
         /**
          * JobCardOut
-         * @description One card of the Jobs list (module docstring).
+         * @description One card of the Jobs list.
          */
         JobCardOut: {
             /** Ad Language */
@@ -2013,7 +2013,7 @@ export interface components {
         };
         /**
          * JobDetailOut
-         * @description A job's detail (module docstring).
+         * @description A job's detail.
          */
         JobDetailOut: {
             contested: components["schemas"]["ContestedOut"] | null;
@@ -2206,9 +2206,9 @@ export interface components {
         };
         /**
          * LlmSpendOut
-         * @description The month's LLM spend (§17.5 "LLM spend", M0 Deviation 6): the counted spend, the cap, the scoring
-         *     headroom (§6.9.4) and the USD bucket accrued to now, from the month row as `read_month` gives it; a month
-         *     without a row is the one a reservation would create, with the settings' cap and nothing counted.
+         * @description The month's LLM spend (§17.5 "LLM spend"): the counted spend, the cap, the scoring headroom (§6.9.4)
+         *     and the USD bucket accrued to now, from the month row as `read_month` gives it; a month without a row is
+         *     the one a reservation would create, with the settings' cap and nothing counted.
          */
         LlmSpendOut: {
             /** Bucket Usd */
@@ -2867,7 +2867,9 @@ export interface components {
         };
         /**
          * ScoringHealthOut
-         * @description The score lane (module docstring): ages are seconds at the caller's `now`, the amount in USD.
+         * @description The score lane: the running cycle, the pause reason, the oldest pending target's age, the pending and
+         *     batched targets and the quarantined batch spend. Ages are seconds at the caller's `now`, the amount in
+         *     USD.
          */
         ScoringHealthOut: {
             /** In Batch Targets */
@@ -3166,7 +3168,7 @@ export interface components {
         };
         /**
          * TextEditsIn
-         * @description The draft's complete edit set, never a delta (plan Deviation 29): an edit left out is undone.
+         * @description The draft's complete edit set, never a delta: an edit left out is undone.
          */
         TextEditsIn: {
             /** Span Edits */

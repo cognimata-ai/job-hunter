@@ -285,8 +285,9 @@ class SpanEditIn(BaseModel):
     replacement_index: int | None = None
 
 
+# The complete edit set: plan Deviation 29.
 class TextEditsIn(BaseModel):
-    """The draft's complete edit set, never a delta (plan Deviation 29): an edit left out is undone."""
+    """The draft's complete edit set, never a delta: an edit left out is undone."""
 
     model_config = ConfigDict(extra="forbid")
 

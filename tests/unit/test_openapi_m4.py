@@ -3,9 +3,13 @@
 Every M4 route is listed in `M4_ROUTES` with the error statuses it documents; each route task adds its rows.
 M4 adds no route that takes an `Idempotency-Key`, so there is no idempotency set here.
 `test_the_m3_rows_of_the_document_are_unchanged` checks that M4's changes leave every M3 row as M3
-documented it.
+documented it. `test_no_description_cites_an_internal_document` (Ruling T6-g, Task 10): the published
+document is public text, so no `description` or `summary` in it names the codebase's module docstrings or the
+plan's rulings, deviations, tasks, blocker ids or spec line numbers.
 """
 
+import re
+from collections.abc import Iterator
 from typing import Any, Final
 
 import pytest
@@ -30,6 +34,10 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("post", "/api/identity-conflicts/{conflict_id}/resolve"): GROUP_WRITE,
     ("get", "/api/labelling/queue"): {"401", "422", "429"},
 }
+# What a published description must not cite (Ruling T6-g).
+INTERNAL_CITATION: Final = re.compile(
+    r"module docstring|\bRuling\b|\bDeviation \d|\bTask \d+\b|\bB\d{2}\b|\bL\d{3,4}\b"
+)
 
 
 @pytest.fixture(scope="module")
@@ -54,3 +62,22 @@ def test_the_m3_rows_of_the_document_are_unchanged(document: dict[str, Any]) -> 
     for (method, path), statuses in M3_ROUTES.items():
         assert method in document["paths"].get(path, {}), (method, path)
         assert error_statuses(document, method, path) == statuses, (method, path)
+
+
+def texts(node: object, path: str = "") -> Iterator[tuple[str, str]]:
+    """Every `description` and `summary` string in `node`, recursively, with its path."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{path}/{key}"
+            if key in {"description", "summary"} and isinstance(value, str):
+                yield here, value
+            yield from texts(value, here)
+    elif isinstance(node, list):
+        for n, value in enumerate(node):
+            yield from texts(value, f"{path}/{n}")
+
+
+def test_no_description_cites_an_internal_document(document: dict[str, Any]) -> None:
+    found = list(texts(document))
+    assert len(found) > 100  # the walk reaches the operations' and the schemas' texts
+    assert [(path, text) for path, text in found if INTERNAL_CITATION.search(text)] == []

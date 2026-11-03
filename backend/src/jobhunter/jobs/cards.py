@@ -180,8 +180,9 @@ class LinksOut(BaseModel):
     adzuna: str | None
 
 
+# Its fields: the module docstring.
 class JobCardOut(BaseModel):
-    """One card of the Jobs list (module docstring)."""
+    """One card of the Jobs list."""
 
     job_id: int
     kind: Literal["job", "group"]

@@ -225,8 +225,9 @@ class VersionsOut(BaseModel):
     critic: ModelOut | None
 
 
+# Its fields: the module docstring, The score.
 class DetailScoreOut(ScoreOut):
-    """The card's score and the rest of the result (module docstring, The score)."""
+    """The card's score and the rest of the result."""
 
     result_id: int
     det_result_id: int
@@ -306,8 +307,9 @@ class JobFeedbackOut(BaseModel):
     created_at: UtcDatetime
 
 
+# Its sections: the module docstring.
 class JobDetailOut(BaseModel):
-    """A job's detail (module docstring)."""
+    """A job's detail."""
 
     job: JobOut
     description: DescriptionOut

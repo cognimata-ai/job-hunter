@@ -59,8 +59,9 @@ _BIGINT_MAX: Final = 2**63 - 1
 Comment = Annotated[str, StringConstraints(max_length=COMMENT_MAX_CHARS), AfterValidator(clean_text)]
 
 
+# §14.2 L4977.
 class FeedbackIn(BaseModel):
-    """A label, or a "wrong score" with the label the user expected (§14.2 L4977)."""
+    """A label, or a "wrong score" with the label the user expected (§14.2)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -108,8 +109,9 @@ class GoldenCasesPageOut(BaseModel):
     next_cursor: str | None
 
 
+# The canary bound: §11.13 L4632.
 class FlagsIn(BaseModel):
-    """The case's flags to set; an absent one is kept. At most two cases are canaries (L4632)."""
+    """The case's flags to set; an absent one is kept. At most two cases are canaries."""
 
     model_config = ConfigDict(extra="forbid")
 

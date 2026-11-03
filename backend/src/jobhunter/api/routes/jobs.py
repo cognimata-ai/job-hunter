@@ -267,7 +267,8 @@ async def list_jobs(
     ] = None,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> JobsPageOut:
-    """A page of the Jobs list in one read snapshot, with its ranking generation (module docstring)."""
+    """A page of the Jobs list in one read snapshot, with its ranking generation."""
+    # How the page is read and paged: the module docstring.
     key = cursor_key(cfg)
     now = utcnow()
     async with read_snapshot(engine) as conn:
@@ -339,7 +340,8 @@ async def list_job_facets(
     ] = "",
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> FacetsOut:
-    """The companies and sources of the listed cards, with their counts (module docstring)."""
+    """The companies and sources of the listed cards, with their counts."""
+    # What the facets count: the module docstring.
     now = utcnow()
     async with read_snapshot(engine) as conn:
         tz = await display_timezone(conn) if query.posted == "custom" else _UTC
@@ -450,8 +452,9 @@ async def get_job_history(
     ] = None,
     limit: Annotated[int, Query(ge=1, le=HISTORY_MAX_LIMIT)] = HISTORY_LIMIT,
 ) -> history.HistoryPageOut:
-    """A page of the job's score history in one read snapshot (module docstring). The cursor is read before
-    the snapshot, so a cursor this route did not sign is 400 even for a gone job, before its 404."""
+    """A page of the job's score history in one read snapshot. The cursor is read before the snapshot, so a
+    cursor this route did not sign is 400 even for a gone job, before its 404."""
+    # The history's order and cursor: the module docstring.
     key = cursor_key(cfg)
     after = None if cursor is None else _history_after(cursor, job_id, key)
     try:

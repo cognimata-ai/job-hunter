@@ -65,8 +65,9 @@ class InstanceOut(BaseModel):
     computed_at: UtcDatetime
 
 
+# Its fields: the module docstring.
 class HistoryItemOut(BaseModel):
-    """One result of the job's history with every instance of it (module docstring)."""
+    """One result of the job's history with every instance of it."""
 
     result_id: int
     published_at: UtcDatetime

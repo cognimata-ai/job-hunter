@@ -364,10 +364,11 @@ async def quota_health(conn: AsyncConnection) -> dict[Provider, QuotaOut | None]
     return out
 
 
+# §17.5 "LLM spend" as M0 Deviation 6 reads it.
 class LlmSpendOut(BaseModel):
-    """The month's LLM spend (§17.5 "LLM spend", M0 Deviation 6): the counted spend, the cap, the scoring
-    headroom (§6.9.4) and the USD bucket accrued to now, from the month row as `read_month` gives it; a month
-    without a row is the one a reservation would create, with the settings' cap and nothing counted."""
+    """The month's LLM spend (§17.5 "LLM spend"): the counted spend, the cap, the scoring headroom (§6.9.4)
+    and the USD bucket accrued to now, from the month row as `read_month` gives it; a month without a row is
+    the one a reservation would create, with the settings' cap and nothing counted."""
 
     month: date
     counted: DecimalOut
@@ -401,8 +402,11 @@ async def llm_spend(conn: AsyncConnection, *, now: datetime) -> LlmSpendOut | No
     return LlmSpendOut.of(await read_month_or_new(conn, budget.month_of(now), p, now=now), p)
 
 
+# What each figure reads: the module docstring, The score lane.
 class ScoringHealthOut(BaseModel):
-    """The score lane (module docstring): ages are seconds at the caller's `now`, the amount in USD."""
+    """The score lane: the running cycle, the pause reason, the oldest pending target's age, the pending and
+    batched targets and the quarantined batch spend. Ages are seconds at the caller's `now`, the amount in
+    USD."""
 
     running_cycle_id: int | None
     pause_reason: PauseReason | None
