@@ -61,7 +61,7 @@ from jobhunter.quota.cells import location_keys
 from jobhunter.quota.dryrun import Warning, quota_projections
 from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, Window, current_snapshot, roll_forward
-from jobhunter.run_settings import RunSettings, ScopeSettings
+from jobhunter.run_settings import RunSettings
 from jobhunter.scoring.det_results import count_published
 from jobhunter.scoring.evaluation_policy import EvaluationPolicy, replay_projected_critic_rate
 from jobhunter.settings.derive import candidate_of, derived
@@ -185,10 +185,11 @@ async def projected_critic_rate(conn: AsyncConnection, settings: Settings, *, no
     return DEFAULT_PROJECTED_CRITIC_RATE if replayed is None else replayed
 
 
-def paid_cells(settings: Settings) -> int:
-    """§6.8's paid cells: the enabled queries times the location keys (locations, and `remote-de`)."""
-    queries = sum(1 for entry in settings.queries if entry.enabled)
-    return queries * len(location_keys(ScopeSettings.from_model(settings.scope)))
+def paid_cells(settings: RunSettings) -> int:
+    """§6.8's paid cells of the run view `settings`: the enabled queries times the location keys (locations,
+    and `remote-de`). The query lists count the active settings' paid cells with it too."""
+    queries = sum(1 for enabled in settings.queries.values() if enabled)
+    return queries * len(location_keys(settings.scope))
 
 
 def next_slot(settings: Settings, now: datetime) -> datetime | None:
@@ -284,7 +285,7 @@ async def dry_run(
     adzuna = await current_snapshot(conn, "adzuna")
     serpapi = await current_snapshot(conn, "serpapi")
     quota_warns, proj = quota_projections(
-        run, jsearch=jsearch, adzuna=adzuna, serpapi=serpapi, cells=paid_cells(proposed), now=now
+        run, jsearch=jsearch, adzuna=adzuna, serpapi=serpapi, cells=paid_cells(run), now=now
     )
     warns += quota_warns
     paid_search: tuple[tuple[Provider, Window | None, str], ...] = (

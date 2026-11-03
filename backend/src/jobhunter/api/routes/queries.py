@@ -1,5 +1,10 @@
-"""`/api/queries`: adding and editing search queries (spec §5.5.1, §14.2; plan Task 20, Deviations 3 and 15).
+"""`/api/queries`: listing, adding and editing search queries (spec §5.5.1, §14.2; plan Task 20, Deviations 3
+and 15; plan M4 Task 13).
 
+- `GET /api/queries` → the live queries by id (`queries.listing.query_list`), each with its flag in the active
+  settings and the aggregates of its coverage cells; `GET /api/queries/stats` → every cell of a live query
+  with its statistics and open gaps (`queries.listing.cell_stats`). Each reads in one read snapshot
+  (`db.snapshot.read_snapshot`), a fixed number of statements, no lock.
 - `POST /api/queries` (`{text, lang, proposal_id?, exploration?}`) → 201 `QueryOut`: a new query
   (`queries.authoring.create_query`), not enabled; enabling it is a settings save with its preview (§13.5).
   `proposal_id` and `exploration` go beyond §14.2's body (Deviation 3), so an accepted proposal item keeps its
@@ -26,9 +31,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from jobhunter.api.deps import get_engine, require_session
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.clock import utcnow
+from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.sql import q
 from jobhunter.observability.logging import get_logger
-from jobhunter.queries import authoring
+from jobhunter.queries import authoring, listing
+from jobhunter.queries.listing import CellStatsOut, QueryListOut
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(
@@ -80,6 +87,26 @@ def _out(row: authoring.QueryRow) -> QueryOut:
         exploration=row.exploration,
         proposal_id=row.proposal_id,
     )
+
+
+@router.get("", response_model=list[QueryListOut])
+async def list_queries(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> list[QueryListOut]:
+    """The live queries by id, each with whether the active settings enable it and the coverage of its cells:
+    how many, the oldest coverage of its paid cells, their open gaps, their mean yield, whether one is too
+    broad, and JSearch's refresh cadence."""
+    now = utcnow()
+    async with read_snapshot(engine) as conn:
+        return await listing.query_list(conn, now=now)
+
+
+@router.get("/stats", response_model=list[CellStatsOut])
+async def query_cell_stats(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> list[CellStatsOut]:
+    """Every coverage cell of a live query, by query, source, instance and place: its coverage, its yield,
+    its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh cadence
+    for a JSearch cell."""
+    now = utcnow()
+    async with read_snapshot(engine) as conn:
+        return await listing.cell_stats(conn, now=now)
 
 
 @router.post(

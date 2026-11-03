@@ -209,6 +209,7 @@ _VERSION = q(
     "SELECT v.payload, v.scope_version_id, s.interval_s FROM settings_versions v CROSS JOIN schedule_state s "
     "WHERE v.id = :id"
 )
+_ACTIVE_VERSION = q("SELECT settings_version_id FROM active_config WHERE id = 1")
 
 
 async def load_run_settings(conn: AsyncConnection, settings_version_id: int) -> RunSettings:
@@ -223,3 +224,10 @@ async def load_run_settings(conn: AsyncConnection, settings_version_id: int) -> 
         scope_version_id=int(row.scope_version_id),
         interval_s=int(row.interval_s),
     )
+
+
+async def load_active_run_settings(conn: AsyncConnection) -> RunSettings | None:
+    """The run's view of the active settings version (`load_run_settings`), read without a lock; `None` when
+    nothing is seeded."""
+    version = (await conn.execute(_ACTIVE_VERSION)).scalar_one_or_none()
+    return None if version is None else await load_run_settings(conn, int(version))

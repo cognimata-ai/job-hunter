@@ -24,7 +24,8 @@ window counts the units of the window its first run would bootstrap. A provider 
 admits no search (Ruling T7-a).
 
 - **JSearch.** `fair_share = N x interval / window length` units per run; `units_per_run = min(per-run cap,
-  fair share)`; `refresh_cadence_days = cells x interval_days / units_per_run`. Warnings:
+  fair share)`; `refresh_cadence_days = cells x interval_days / units_per_run` (`refresh_cadence_days`, which
+  the query lists show too). Warnings:
   `paid_run_cap_binding` (an explicit cap below the fair share), `paid_refresh_slow` (cadence over 7 days) and
   `coverage_gap_guaranteed` (cadence x 24 h + 24 h beyond JSearch's 720 h date window).
 - **Adzuna.** Every cell runs every run (its first page, §5.5.3): `calls_per_day = cells x runs per day`. The
@@ -110,13 +111,22 @@ def per_run(settings: RunSettings, w: Window) -> PerRun:
     return PerRun(units=min(cap, fair), fair_share=fair, cap=cap)
 
 
+def _cadence_days(settings: RunSettings, units_per_run: float, cells: int) -> float:
+    return cells * (settings.interval_s / 86400) / max(units_per_run, 1e-9)
+
+
+def refresh_cadence_days(settings: RunSettings, w: Window, cells: int) -> float:
+    """The JSearch projection's `refresh_cadence_days` on `w` for `cells` paid cells, `cells x interval_days /
+    units_per_run`, rounded as the projection shows it (module docstring)."""
+    return round(_cadence_days(settings, per_run(settings, w).units, cells), 3)
+
+
 def _jsearch(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning], dict[str, JSONValue]]:
     warns: list[Warning] = []
     units_per_run, fair, cap = per_run(settings, w)
     if cap < fair:
         warns.append(Warning("paid_run_cap_binding", cap=cap, fair_share=round(fair, 1)))
-    interval_days = settings.interval_s / 86400
-    cadence_days = cells * interval_days / max(units_per_run, 1e-9)
+    cadence_days = _cadence_days(settings, units_per_run, cells)  # the warnings judge it unrounded
     if cadence_days > PAID_REFRESH_SLOW_DAYS:
         warns.append(Warning("paid_refresh_slow", cadence_days=round(cadence_days, 1)))
     if cadence_days * 24 + 24 > JSEARCH_DATE_WINDOW_H:
@@ -127,7 +137,7 @@ def _jsearch(settings: RunSettings, w: Window, cells: int) -> tuple[list[Warning
         )
     projection: dict[str, JSONValue] = {
         "units_per_run": round(units_per_run, 3),
-        "refresh_cadence_days": round(cadence_days, 3),
+        "refresh_cadence_days": refresh_cadence_days(settings, w, cells),
         "cells": cells,
     }
     return warns, projection

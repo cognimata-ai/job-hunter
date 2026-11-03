@@ -1,0 +1,392 @@
+"""`GET /api/queries` and `GET /api/queries/stats` (spec §14.2, §15.7; plan M4 Task 13, D1, M2 Carry-forward
+2, M1 Carry-forward 3's per-query gap counts).
+
+The query list is the live queries by id, each with its flag in the active settings (false for a query they
+do not list) and the aggregates of its coverage cells: how many, the oldest frontier of its paid cells (null
+when one was never covered, or without one), the open gaps, the mean yield, whether one is too broad (a paid
+cell left incomplete by 3 runs in a row) and the dry-run's JSearch refresh cadence when it has a JSearch cell.
+The stats list every cell of a live query with its own figures. The queries are created and enabled through
+the api (a settings save creates the enabled ones' cells); the other cells and every interval are inserted
+directly. The routes' clock is injected (`jobhunter.api.routes.queries.utcnow`). Every query text is an
+invented job title.
+"""
+
+import copy
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import Any, Final
+
+import httpx
+import pytest
+import sqlalchemy as sa
+from jobhunter.clock import utcnow
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from tests.support.collect import free_cell
+from tests.support.settings import DRY_RUN_URL, berlin, save, settings_body
+
+pytestmark = pytest.mark.integration
+
+URL: Final = "/api/queries"
+STATS: Final = "/api/queries/stats"
+QUERIES_UTCNOW: Final = "jobhunter.api.routes.queries.utcnow"
+# The cells a settings save makes for an enabled query with a Berlin location: (source, location key).
+SAVED_CELLS: Final = (
+    ("adzuna", "berlin"),
+    ("adzuna", "remote-de"),
+    ("jsearch", "berlin"),
+    ("jsearch", "remote-de"),
+    ("serpapi", "berlin"),
+    ("serpapi", "remote-de"),
+)
+CELL_OF: Final = sa.text(
+    "SELECT c.id FROM coverage_cells c JOIN source_instances i ON i.id = c.source_instance_id "
+    "WHERE c.query_id = :q AND i.source_id = :s AND i.instance_key = 'default' AND c.location_key = :k"
+)
+INSERT_CELL: Final = sa.text(
+    "INSERT INTO coverage_cells (source_instance_id, query_id, location_key) SELECT id, :q, :k "
+    "FROM source_instances WHERE source_id = :s AND instance_key = 'default' RETURNING id"
+)
+SET_CELL: Final = sa.text(
+    "UPDATE coverage_cells SET last_covered_at = :covered, last_success_at = :success, yield_ema = :ema, "
+    "zero_yield_streak = :streak, consecutive_incomplete = :incomplete WHERE id = :c"
+)
+INTERVAL: Final = sa.text(
+    "INSERT INTO coverage_intervals (cell_id, kind, span, gap_status, reason) VALUES (:c, :kind, "
+    "tstzrange(:lower, :upper, '[)'), :status, CASE WHEN :kind = 'gap' THEN 'page_cap' END)"
+)
+RETIRED_QUERY: Final = sa.text(
+    "INSERT INTO queries (text, lang, origin, retired_at) VALUES (:t, 'en', 'user', :at) RETURNING id"
+)
+
+
+@pytest.fixture
+def now(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """The routes' clock, fixed for the test."""
+    moment = utcnow()
+    monkeypatch.setattr(QUERIES_UTCNOW, lambda: moment)
+    return moment
+
+
+def at(text: str | None) -> datetime | None:
+    return None if text is None else datetime.fromisoformat(text)
+
+
+async def listed(client: httpx.AsyncClient, url: str = URL) -> list[dict[str, Any]]:
+    r = await client.get(url)
+    assert r.status_code == 200, (r.status_code, r.text)
+    body: list[dict[str, Any]] = r.json()
+    return body
+
+
+async def created(client: httpx.AsyncClient, text: str) -> int:
+    r = await client.post(URL, json={"text": text, "lang": "en"})
+    assert r.status_code == 201, (r.status_code, r.text)
+    return int(r.json()["id"])
+
+
+async def in_settings(client: httpx.AsyncClient, flags: Mapping[int, bool]) -> dict[str, Any]:
+    """The active payload with a Berlin location and `queries[]` = `flags`, saved; the saved payload."""
+    payload = copy.deepcopy((await settings_body(client))["payload"])
+    payload["scope"]["locations"] = [berlin(30)]
+    payload["queries"] = [{"query_id": query_id, "enabled": enabled} for query_id, enabled in flags.items()]
+    await save(client, payload)
+    saved: dict[str, Any] = (await settings_body(client))["payload"]
+    return saved
+
+
+async def dry_run_cadence(client: httpx.AsyncClient, payload: Mapping[str, Any]) -> float:
+    """The settings dry-run's `projections.jsearch.refresh_cadence_days` for `payload`."""
+    r = await client.post(DRY_RUN_URL, json={"payload": payload})
+    assert r.status_code == 200, (r.status_code, r.text)
+    cadence = r.json()["projections"]["jsearch"]["refresh_cadence_days"]
+    assert isinstance(cadence, float) and cadence > 0
+    return cadence
+
+
+async def cell(engine: AsyncEngine, query_id: int, source_id: str, location_key: str) -> int:
+    """The default instance's cell of `source_id` for the query and place, inserted when absent."""
+    params = {"q": query_id, "s": source_id, "k": location_key}
+    async with engine.begin() as c:
+        found = (await c.execute(CELL_OF, params)).scalar_one_or_none()
+        return int(found if found is not None else (await c.execute(INSERT_CELL, params)).scalar_one())
+
+
+async def set_cell(
+    engine: AsyncEngine,
+    cell_id: int,
+    *,
+    covered: datetime | None = None,
+    success: datetime | None = None,
+    ema: float = 0.5,
+    streak: int = 0,
+    incomplete: int = 0,
+) -> None:
+    params = {
+        "c": cell_id,
+        "covered": covered,
+        "success": success,
+        "ema": ema,
+        "streak": streak,
+        "incomplete": incomplete,
+    }
+    async with engine.begin() as c:
+        await c.execute(SET_CELL, params)
+
+
+async def intervals(engine: AsyncEngine, cell_id: int, *kinds: tuple[str, str | None], at: datetime) -> None:
+    """One interval per `(kind, gap_status)`, each an hour of its own before `at`."""
+    async with engine.begin() as c:
+        for n, (kind, status) in enumerate(kinds, start=1):
+            lower, upper = at - timedelta(hours=n + 1), at - timedelta(hours=n)
+            params = {"c": cell_id, "kind": kind, "lower": lower, "upper": upper, "status": status}
+            await c.execute(INTERVAL, params)
+
+
+def by_id(items: Sequence[Mapping[str, Any]]) -> dict[int, Mapping[str, Any]]:
+    return {int(item["id"]): item for item in items}
+
+
+def figures(query: Mapping[str, Any]) -> dict[str, Any]:
+    """A listed query's settings flag and cell aggregates, its times parsed."""
+    return {
+        "enabled": query["enabled"],
+        "cells": query["cells"],
+        "last_covered_at": at(query["last_covered_at"]),
+        "open_gaps": query["open_gaps"],
+        "yield_ema": query["yield_ema"],
+        "too_broad": query["too_broad"],
+        "refresh_cadence_days": query["refresh_cadence_days"],
+    }
+
+
+# --- GET /api/queries -------------------------------------------------------------------------------------
+
+
+async def test_queries_list_the_live_rows_with_enabled_and_their_cell_aggregates(
+    engine: AsyncEngine, logged_in_client: httpx.AsyncClient, now: datetime
+) -> None:
+    a = await created(logged_in_client, "Platform Engineer")
+    b = await created(logged_in_client, "Data Engineer")
+    c = await created(logged_in_client, "Site Reliability Engineer")
+    d = await created(logged_in_client, "Backend Developer")
+    # a enabled (the save makes its six cells), b listed but disabled; c and d live, not listed
+    payload = await in_settings(logged_in_client, {a: True, b: False})
+    cadence = await dry_run_cadence(logged_in_client, payload)
+    hours = [now - timedelta(hours=n) for n in range(11)]
+    a_cells = {key: await cell(engine, a, *key) for key in SAVED_CELLS}
+    stats: dict[tuple[str, str], dict[str, Any]] = {
+        # the oldest paid frontier is JSearch remote-de's; Adzuna's older one and its never-covered one are no
+        # paid cells
+        ("jsearch", "berlin"): {"covered": hours[1], "success": hours[1], "ema": 0.25, "incomplete": 2},
+        ("jsearch", "remote-de"): {"covered": hours[5], "success": hours[5], "ema": 0.5},
+        ("serpapi", "berlin"): {"covered": hours[3], "ema": 0.75},
+        ("serpapi", "remote-de"): {"covered": hours[2], "ema": 1.0},
+        ("adzuna", "berlin"): {"covered": hours[10], "ema": 0.125, "streak": 4},
+        ("adzuna", "remote-de"): {"covered": None, "ema": 0.625},
+    }
+    for key, values in stats.items():
+        await set_cell(engine, a_cells[key], **values)
+    await intervals(
+        engine, a_cells["jsearch", "berlin"], ("gap", "open"), ("gap", "open"), ("gap", "closed"), at=now
+    )
+    await intervals(engine, a_cells["adzuna", "berlin"], ("gap", "open"), ("gap", "abandoned"), at=now)
+    await intervals(engine, a_cells["serpapi", "berlin"], ("covered", None), at=now)
+    # b: a paid cell never covered beside a covered one
+    await set_cell(engine, await cell(engine, b, "jsearch", "berlin"), covered=None, ema=0.25)
+    await set_cell(engine, await cell(engine, b, "serpapi", "berlin"), covered=hours[1], ema=0.75)
+    # c: a covered cell, but no paid one; its open gap is its own
+    c_cell = await cell(engine, c, "adzuna", "berlin")
+    await set_cell(engine, c_cell, covered=hours[1], ema=0.375)
+    await intervals(engine, c_cell, ("gap", "open"), at=now)
+
+    body = await listed(logged_in_client)
+
+    assert [q["id"] for q in body] == [a, b, c, d]
+    first = body[0]
+    assert {k: v for k, v in first.items() if k not in figures(first)} == {
+        "id": a,
+        "text": "Platform Engineer",
+        "lang": "en",
+        "origin": "user",
+        "exploration": False,
+        "proposal_id": None,
+        "created_at": first["created_at"],
+    }
+    assert at(first["created_at"]) == now
+    got = {query_id: figures(query) for query_id, query in by_id(body).items()}
+    assert got[a] == {
+        "enabled": True,
+        "cells": 6,
+        "last_covered_at": hours[5],
+        "open_gaps": 3,
+        "yield_ema": pytest.approx((0.25 + 0.5 + 0.75 + 1.0 + 0.125 + 0.625) / 6),
+        "too_broad": False,
+        "refresh_cadence_days": cadence,
+    }
+    assert got[b] == {
+        "enabled": False,
+        "cells": 2,
+        "last_covered_at": None,  # its JSearch cell was never covered
+        "open_gaps": 0,
+        "yield_ema": pytest.approx(0.5),
+        "too_broad": False,
+        "refresh_cadence_days": cadence,  # it has a JSearch cell, though not enabled
+    }
+    assert got[c] == {
+        "enabled": False,
+        "cells": 1,
+        "last_covered_at": None,  # no paid cell
+        "open_gaps": 1,
+        "yield_ema": pytest.approx(0.375),
+        "too_broad": False,
+        "refresh_cadence_days": None,  # no JSearch cell
+    }
+    assert got[d] == {
+        "enabled": False,
+        "cells": 0,
+        "last_covered_at": None,
+        "open_gaps": 0,
+        "yield_ema": None,
+        "too_broad": False,
+        "refresh_cadence_days": None,
+    }
+    # each query's aggregates are those of its cells in the stats
+    cells = await listed(logged_in_client, STATS)
+    for query_id in (a, b, c, d):
+        own = [x for x in cells if x["query_id"] == query_id]
+        assert (len(own), sum(x["open_gaps"] for x in own)) == (
+            got[query_id]["cells"],
+            got[query_id]["open_gaps"],
+        )
+
+
+async def test_a_query_with_a_paid_cell_three_times_incomplete_is_too_broad(
+    engine: AsyncEngine, logged_in_client: httpx.AsyncClient, now: datetime
+) -> None:
+    jsearch_broad = await created(logged_in_client, "Software Engineer")
+    serpapi_broad = await created(logged_in_client, "Software Developer")
+    twice = await created(logged_in_client, "Frontend Developer")
+    free = await created(logged_in_client, "Fullstack Developer")
+    await set_cell(engine, await cell(engine, jsearch_broad, "jsearch", "berlin"), incomplete=3)
+    await set_cell(engine, await cell(engine, jsearch_broad, "adzuna", "berlin"), incomplete=0)
+    await set_cell(engine, await cell(engine, serpapi_broad, "serpapi", "berlin"), incomplete=4)
+    await set_cell(engine, await cell(engine, twice, "jsearch", "berlin"), incomplete=2)  # one run short
+    await set_cell(engine, await cell(engine, free, "adzuna", "berlin"), incomplete=5)  # Adzuna is free
+
+    queries = by_id(await listed(logged_in_client))
+    assert {query_id: queries[query_id]["too_broad"] for query_id in queries} == {
+        jsearch_broad: True,
+        serpapi_broad: True,
+        twice: False,
+        free: False,
+    }
+    cells = await listed(logged_in_client, STATS)
+    assert [(x["query_id"], x["source_id"], x["consecutive_incomplete"], x["too_broad"]) for x in cells] == [
+        (jsearch_broad, "adzuna", 0, False),
+        (jsearch_broad, "jsearch", 3, True),
+        (serpapi_broad, "serpapi", 4, True),
+        (twice, "jsearch", 2, False),
+        (free, "adzuna", 5, False),
+    ]
+
+
+async def test_a_retired_query_is_not_listed(
+    engine: AsyncEngine, logged_in_client: httpx.AsyncClient, now: datetime
+) -> None:
+    old = await created(logged_in_client, "Data Engineer")
+    await in_settings(logged_in_client, {old: True})
+    old_cell = await cell(engine, old, "jsearch", "berlin")  # one of the six the save made
+    await intervals(engine, old_cell, ("gap", "open"), at=now)
+    r = await logged_in_client.patch(f"{URL}/{old}", json={"text": "Data Engineer Kafka"})  # retire + create
+    assert r.status_code == 200, r.text
+    new = int(r.json()["id"])
+
+    body = await listed(logged_in_client)
+    assert [(q["id"], q["text"], q["enabled"], q["cells"], q["open_gaps"]) for q in body] == [
+        (new, "Data Engineer Kafka", True, 6, 0)  # the entry moved to it, and its own cells were made
+    ]
+    assert {x["query_id"] for x in await listed(logged_in_client, STATS)} == {new}
+
+
+# --- GET /api/queries/stats -------------------------------------------------------------------------------
+
+
+async def test_stats_list_every_cell_with_open_gaps(
+    engine: AsyncEngine, logged_in_client: httpx.AsyncClient, now: datetime
+) -> None:
+    a = await created(logged_in_client, "Platform Engineer")
+    b = await created(logged_in_client, "Data Engineer")
+    payload = await in_settings(logged_in_client, {a: True})
+    cadence = await dry_run_cadence(logged_in_client, payload)
+    a_cells = {key: await cell(engine, a, *key) for key in SAVED_CELLS}
+    covered, success = now - timedelta(hours=6), now - timedelta(hours=2)
+    await set_cell(
+        engine,
+        a_cells["jsearch", "berlin"],
+        covered=covered,
+        success=success,
+        ema=0.75,
+        streak=1,
+        incomplete=1,
+    )
+    await intervals(engine, a_cells["jsearch", "berlin"], ("gap", "open"), ("gap", "open"), at=now)
+    await intervals(engine, a_cells["serpapi", "remote-de"], ("gap", "open"), ("gap", "closed"), at=now)
+    await intervals(engine, a_cells["adzuna", "berlin"], ("covered", None), ("gap", "abandoned"), at=now)
+    b_cell = await cell(engine, b, "jsearch", "berlin")
+    await intervals(engine, b_cell, ("gap", "open"), at=now)
+    # not listed: a retired query's cell and Arbeitnow's cell without a query, each with an open gap
+    async with engine.begin() as conn:
+        retired = int((await conn.execute(RETIRED_QUERY, {"t": "Python Developer", "at": now})).scalar_one())
+        arbeitnow = await free_cell(conn, "arbeitnow")
+    await intervals(engine, await cell(engine, retired, "jsearch", "berlin"), ("gap", "open"), at=now)
+    await intervals(engine, arbeitnow, ("gap", "open"), at=now)
+
+    body = await listed(logged_in_client, STATS)
+
+    expected_gaps = {("jsearch", "berlin"): 2, ("serpapi", "remote-de"): 1}
+    blank: dict[str, Any] = {
+        "last_covered_at": None,
+        "last_success_at": None,
+        "yield_ema": 0.5,
+        "zero_yield_streak": 0,
+        "consecutive_incomplete": 0,
+        "too_broad": False,
+    }
+    expected: list[dict[str, Any]] = [
+        {
+            "cell_id": a_cells[source_id, key],
+            "query_id": a,
+            "source_id": source_id,
+            "instance_label": "default",
+            "location_key": key,
+            **blank,
+            "open_gaps": expected_gaps.get((source_id, key), 0),
+            "cadence_days": cadence if source_id == "jsearch" else None,
+        }
+        for source_id, key in SAVED_CELLS  # in (source, location key) order
+    ]
+    expected[2] |= {
+        "last_covered_at": covered,
+        "last_success_at": success,
+        "yield_ema": 0.75,
+        "zero_yield_streak": 1,
+        "consecutive_incomplete": 1,
+    }
+    expected.append(
+        {
+            "cell_id": b_cell,
+            "query_id": b,
+            "source_id": "jsearch",
+            "instance_label": "default",
+            "location_key": "berlin",
+            **blank,
+            "open_gaps": 1,
+            "cadence_days": cadence,
+        }
+    )
+    got = [
+        x | {"last_covered_at": at(x["last_covered_at"]), "last_success_at": at(x["last_success_at"])}
+        for x in body
+    ]
+    assert got == expected

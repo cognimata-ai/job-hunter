@@ -192,6 +192,12 @@ YIELD_ALPHA: Final = 0.3  # the EMA of new postings per request (§5.5.3)
 log = get_logger("jobhunter.sources.coverage")
 
 
+def too_broad(source_id: str, consecutive_incomplete: int) -> bool:
+    """Whether a cell reads as too broad (§5.6): a paid cell left incomplete by `TOO_BROAD_AFTER` runs in a
+    row. The one predicate of the `coverage.too_broad` alert and of the query lists (`queries.listing`)."""
+    return source_id in PAID_SOURCES and consecutive_incomplete >= TOO_BROAD_AFTER
+
+
 @dataclass(frozen=True)
 class CoverageEffect:
     """The intervals one recording wrote: gaps opened, gaps closed (or abandoned), covered rows inserted."""
@@ -651,8 +657,8 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
     read: a page 2 whose reservation was denied, or whose attempt failed or was ambiguous, keeps page 1's
     eligible cursor, page 1 being the last succeeded page (cleared otherwise: that page ended the traversal,
     had fewer than 7 new ids, or was page 2).
-    `coverage.too_broad` (info) is raised for a paid cell at `consecutive_incomplete >= 3` and resolved
-    when the cell is covered. `now` is the finalize time, for the log.
+    `coverage.too_broad` (info) is raised for a paid cell at `consecutive_incomplete >= 3` (`too_broad`) and
+    resolved when the cell is covered. `now` is the finalize time, for the log.
     """
     await conn.execute(_LOCK_CELLS, {"run": run_id})
     cells = (await conn.execute(_RUN_CELLS, {"run": run_id})).all()
@@ -728,18 +734,21 @@ async def finalize_cells(conn: AsyncConnection, run_id: int, *, now: datetime) -
         )
         if cell.source_id == "jsearch" and (page := last_pages.get(cell_id)) is not None:
             await conn.execute(_SET_CONTINUATION, {"c": cell_id, "doc": _continuation(page)})
-        if cell.source_id in PAID_SOURCES:
-            await _too_broad(conn, cell_id, incomplete=incomplete, covered=covered)
+        if cell.source_id in PAID_SOURCES:  # only a paid cell has the alert
+            broad = too_broad(cell.source_id, incomplete)
+            await _too_broad_alert(conn, cell_id, incomplete=incomplete, covered=covered, broad=broad)
         stats[cell_id] = CellStats(requests, new, bool(cell.reached_end), covered)
     log.info("coverage_cells_finalized", run_id=run_id, cells=len(stats), at=now.isoformat())
     return stats
 
 
-async def _too_broad(conn: AsyncConnection, cell_id: int, *, incomplete: int, covered: bool) -> None:
+async def _too_broad_alert(
+    conn: AsyncConnection, cell_id: int, *, incomplete: int, covered: bool, broad: bool
+) -> None:
     subject = f"cell:{cell_id}"
     if covered:
         await resolve_alert(conn, code=TOO_BROAD_ALERT, subject=subject)
-    elif incomplete >= TOO_BROAD_AFTER:
+    elif broad:
         await raise_alert(
             conn,
             code=TOO_BROAD_ALERT,

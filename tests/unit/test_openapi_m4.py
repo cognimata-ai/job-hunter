@@ -44,6 +44,9 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     # 404: an unknown `raw_response_id` (the controller's ruling (a) on Task 12)
     ("post", "/api/system/raw-items/replay"): {"401", "403", "404", "409", "413", "422", "429"},
     ("post", "/api/ats-snapshots/{snapshot_id}/acknowledge"): {"401", "403", "404", "409", "422", "429"},
+    ("get", "/api/queries"): {"401", "429"},
+    ("get", "/api/queries/stats"): {"401", "429"},
+    ("get", "/api/watchlist"): {"401", "429"},
 }
 # What a published description must not cite (Ruling T6-g). A ruling is matched in any case and in the plural
 # (the codebase writes "ruling R14-1" and "rulings R14-1 and R14-2" as well as "Ruling P13"); `Task`, the

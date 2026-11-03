@@ -753,13 +753,41 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List Queries
+         * @description The live queries by id, each with whether the active settings enable it and the coverage of its cells:
+         *     how many, the oldest coverage of its paid cells, their open gaps, their mean yield, whether one is too
+         *     broad, and JSearch's refresh cadence.
+         */
+        get: operations["list_queries_api_queries_get"];
         put?: never;
         /**
          * Add Query
          * @description Add a query (201); it is not enabled until a settings save lists it.
          */
         post: operations["add_query_api_queries_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/queries/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Query Cell Stats
+         * @description Every coverage cell of a live query, by query, source, instance and place: its coverage, its yield,
+         *     its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh cadence
+         *     for a JSearch cell.
+         */
+        get: operations["query_cell_stats_api_queries_stats_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1213,7 +1241,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List Companies
+         * @description Every watchlist company by display name, then id: its board, its validation, whether the active
+         *     settings enable it, its source instance's health, last error, last success and last complete snapshot,
+         *     and its postings by availability.
+         */
+        get: operations["list_companies_api_watchlist_get"];
         put?: never;
         /**
          * Add Company
@@ -1592,6 +1626,68 @@ export interface components {
             saved_at: string | null;
             /** Seen At */
             seen_at: string | null;
+        };
+        /**
+         * CellStatsOut
+         * @description A coverage cell of a live query (one source instance, one query, one place) and its statistics.
+         */
+        CellStatsOut: {
+            /**
+             * Cadence Days
+             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null for a cell of another source
+             */
+            cadence_days: number | null;
+            /** Cell Id */
+            cell_id: number;
+            /**
+             * Consecutive Incomplete
+             * @description Consecutive runs that left it incomplete
+             */
+            consecutive_incomplete: number;
+            /**
+             * Instance Label
+             * @description The source instance's key
+             */
+            instance_label: string;
+            /**
+             * Last Covered At
+             * @description Its contiguous coverage frontier; null when it was never covered
+             */
+            last_covered_at: string | null;
+            /**
+             * Last Success At
+             * @description Its last successful request
+             */
+            last_success_at: string | null;
+            /**
+             * Location Key
+             * @description The scope location's key, or `remote-de`
+             */
+            location_key: string | null;
+            /**
+             * Open Gaps
+             * @description Its open coverage gaps
+             */
+            open_gaps: number;
+            /** Query Id */
+            query_id: number;
+            /** Source Id */
+            source_id: string;
+            /**
+             * Too Broad
+             * @description A paid cell (JSearch, SerpApi) left incomplete in 3 runs in a row
+             */
+            too_broad: boolean;
+            /**
+             * Yield Ema
+             * @description New postings per request, smoothed
+             */
+            yield_ema: number;
+            /**
+             * Zero Yield Streak
+             * @description Consecutive runs in which its requests found no new posting
+             */
+            zero_yield_streak: number;
         };
         /** Certification */
         Certification: {
@@ -2788,6 +2884,20 @@ export interface components {
             /** Postal Codes */
             postal_codes: string[];
         };
+        /**
+         * PostingCountsOut
+         * @description The board's postings by availability.
+         */
+        PostingCountsOut: {
+            /** Active */
+            active: number;
+            /** Closed */
+            closed: number;
+            /** Stale */
+            stale: number;
+            /** Unknown */
+            unknown: number;
+        };
         /** PostingOut */
         PostingOut: {
             /** Availability */
@@ -3006,6 +3116,70 @@ export interface components {
             proposal_id?: number | null;
             /** Text */
             text: string;
+        };
+        /**
+         * QueryListOut
+         * @description A live query, whether the active settings enable it, and the coverage of its cells.
+         */
+        QueryListOut: {
+            /**
+             * Cells
+             * @description Its coverage cells
+             */
+            cells: number;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Enabled
+             * @description Its flag in the active settings; false for a query they do not list
+             */
+            enabled: boolean;
+            /** Exploration */
+            exploration: boolean;
+            /** Id */
+            id: number;
+            /**
+             * Lang
+             * @enum {string}
+             */
+            lang: "de" | "en";
+            /**
+             * Last Covered At
+             * @description The oldest coverage frontier of its paid cells (JSearch, SerpApi); null when one of them was never covered, or without a paid cell
+             */
+            last_covered_at: string | null;
+            /**
+             * Open Gaps
+             * @description The open coverage gaps of its cells
+             */
+            open_gaps: number;
+            /**
+             * Origin
+             * @enum {string}
+             */
+            origin: "llm_proposal" | "user";
+            /** Proposal Id */
+            proposal_id: number | null;
+            /**
+             * Refresh Cadence Days
+             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null without a JSearch cell
+             */
+            refresh_cadence_days: number | null;
+            /** Text */
+            text: string;
+            /**
+             * Too Broad
+             * @description One of its cells is too broad
+             */
+            too_broad: boolean;
+            /**
+             * Yield Ema
+             * @description The mean yield of its cells; null without a cell
+             */
+            yield_ema: number | null;
         };
         /** QueryOut */
         QueryOut: {
@@ -4213,6 +4387,45 @@ export interface components {
                 [key: string]: components["schemas"]["JsonValue"];
             };
         };
+        /**
+         * WatchlistCompanyOut
+         * @description A watchlist company: its board, its validation, whether the active settings enable it, its source
+         *     instance and its postings.
+         */
+        WatchlistCompanyOut: {
+            /**
+             * Ats Type
+             * @enum {string}
+             */
+            ats_type: "greenhouse" | "lever" | "ashby" | "personio" | "recruitee" | "smartrecruiters";
+            /** Board Slug */
+            board_slug: string;
+            /** Display Name */
+            display_name: string;
+            /**
+             * Enabled
+             * @description Its flag in the active settings; false for a company they do not list
+             */
+            enabled: boolean;
+            /** Id */
+            id: number;
+            /** @description Null for a company without a source instance */
+            instance: components["schemas"]["WatchlistInstanceOut"] | null;
+            /**
+             * Lever Region
+             * @description Lever's region; null for every other ATS
+             */
+            lever_region: ("global" | "eu") | null;
+            /** @description All 0 for a company without a source instance */
+            postings: components["schemas"]["PostingCountsOut"];
+            /** Validated At */
+            validated_at: string | null;
+            /**
+             * Validation Status
+             * @enum {string}
+             */
+            validation_status: "unvalidated" | "ok" | "not_found" | "error";
+        };
         /** WatchlistCreatedOut */
         WatchlistCreatedOut: {
             /** Id */
@@ -4244,6 +4457,26 @@ export interface components {
              * @description Required for Lever, refused otherwise
              */
             lever_region?: ("global" | "eu") | null;
+        };
+        /**
+         * WatchlistInstanceOut
+         * @description The board as a source: its health, its last error, its last success and its last complete snapshot.
+         */
+        WatchlistInstanceOut: {
+            /**
+             * Health
+             * @enum {string}
+             */
+            health: "ok" | "degraded" | "breaker_open" | "auth_failed" | "contract_broken" | "not_found" | "disabled";
+            /**
+             * Last Complete Snapshot At
+             * @description When its last structurally complete snapshot was taken; null before the first
+             */
+            last_complete_snapshot_at: string | null;
+            /** Last Error Code */
+            last_error_code: string | null;
+            /** Last Success At */
+            last_success_at: string | null;
         };
     };
     responses: never;
@@ -7150,6 +7383,44 @@ export interface operations {
             };
         };
     };
+    list_queries_api_queries_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryListOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     add_query_api_queries_post: {
         parameters: {
             query?: never;
@@ -7210,6 +7481,44 @@ export interface operations {
             };
             /** @description Invalid body, text or proposal (`validation_failed`) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    query_cell_stats_api_queries_stats_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CellStatsOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8662,6 +8971,44 @@ export interface operations {
             };
             /** @description Invalid path (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_companies_api_watchlist_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchlistCompanyOut"][];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
