@@ -15,11 +15,13 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    lowest (the jobs a merge can take away: its target is always the lowest id), are locked `FOR UPDATE` in
    one ordered statement (`merge.lock_jobs`; the transaction writes every job of `J`, so the spec's `FOR
    SHARE` would only be upgraded: plan Deviation 21; Ruling T18-c), then the owner row. Each read-and-lock
-   round runs in a savepoint: when a job of the set was merged (or deleted) between the read and the lock, or
-   the co-members changed, the savepoint is rolled back, which releases that round's row locks, and the
-   round runs again with a fresh read, so the second set is locked in id order too (at most
-   `_ROOT_ROUNDS`). A fenced job (`merge.fenced_jobs`) makes the item `deferred('job_fenced')`, `normalized`
-   kept, and nothing else is written. Then (`_decide`):
+   round runs in a savepoint: when a job of the set was merged (or deleted) between the read and the lock,
+   the co-members changed, or `P`'s job or an owner of a key of `K` is no longer what the round read (an
+   unmerge moves `P` back and re-owns the keys without merging any job of `J`, so only a re-read of both
+   under the lock sees it: M1 Carry-forward 10), the savepoint is rolled back, which releases that round's
+   row locks, and the round runs again with a fresh read, so the second set is locked in id order too (at
+   most `_ROOT_ROUNDS`, then `merge.CoMemberChanged`). A fenced job (`merge.fenced_jobs`) makes the item
+   `deferred('job_fenced')`, `normalized` kept, and nothing else is written. Then (`_decide`):
    - `J` empty: a new job, its row from `select_canonical` of this observation alone (its provenance is
      written in step 7, when the posting and observation ids exist), `restored_from_tombstone_id` from the
      first key of `K` whose `sha256(ns ‖ 0x00 ‖ value)` is in `tombstone_keys`, and then its
@@ -382,10 +384,20 @@ async def _decide(conn: AsyncConnection, found: _JobSet, keys: Sequence[AdKey]) 
     return _Decision(jobs[0], "strong_key_merge", merged=jobs[1:])
 
 
-async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey]) -> _JobSet | None:
-    """One round of step 2's reads and step 3's lock: `P`, the owners of `K` and their roots `J`, then `J` and
-    the group co-members of every job of `J` but the lowest in one ordered statement. `None` when what was
-    read no longer holds under the lock (a job of `J` merged or gone, or other co-members)."""
+@dataclass(frozen=True)
+class _Read:
+    posting: Row[tuple[object, ...]] | None  # P: id, job_id
+    direct: Mapping[AdKey, int]  # the job that owns each key of K that has an owner
+
+    @property
+    def state(self) -> tuple[tuple[int, int] | None, Mapping[AdKey, int]]:
+        """What a re-read compares: `P` and its job, and the owner of each key."""
+        posting = None if self.posting is None else (int(self.posting.id), int(self.posting.job_id))
+        return posting, self.direct
+
+
+async def _read(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey]) -> _Read:
+    """Step 2's plain reads: `P` and the owners of `K`."""
     posting = (
         await conn.execute(
             _POSTING, {"instance": item.source_instance_id, "native_id": item.posting.native_id}
@@ -397,6 +409,16 @@ async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKe
             _KEY_OWNERS, {"ns": [key.ns for key in keys], "values": [key.value for key in keys]}
         )
     }
+    return _Read(posting, direct)
+
+
+async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey]) -> _JobSet | None:
+    """One round of step 2's reads and step 3's lock: `P`, the owners of `K` and their roots `J`, then `J` and
+    the group co-members of every job of `J` but the lowest in one ordered statement. `None` when what was
+    read no longer holds under the lock: a job of `J` merged or gone, other co-members, or `P`'s job or a
+    key's owner moved (an unmerge, which merges no job of `J`; module docstring)."""
+    read = await _read(conn, item, keys)
+    posting, direct = read.posting, read.direct
     starts = {*direct.values(), *([int(posting.job_id)] if posting is not None else [])}
     roots = (
         {int(row.start): int(row.root) for row in await conn.execute(_ROOTS, {"ids": sorted(starts)})}
@@ -410,6 +432,8 @@ async def _read_and_lock(conn: AsyncConnection, item: _Item, keys: Sequence[AdKe
     if any(job not in locked or locked[job] is not None for job in jobs):
         return None
     if not await merge.co_members(conn, mergeable) <= locked.keys():
+        return None
+    if (await _read(conn, item, keys)).state != read.state:  # the re-read under the lock (M1 Carry 10)
         return None
     return _JobSet(
         posting=posting,
@@ -435,7 +459,7 @@ async def _lock_job_set(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey
             return found
         await attempt.rollback()
         log.info("job_set_changed_under_the_lock", raw_item_id=item.raw_item_id)
-    raise InvariantViolation(f"raw item {item.raw_item_id}: its job set kept changing under the lock")
+    raise merge.CoMemberChanged(f"raw item {item.raw_item_id}: its job set kept changing under the lock")
 
 
 async def _dispose(

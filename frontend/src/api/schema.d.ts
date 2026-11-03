@@ -105,6 +105,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/duplicate-groups/{group_id}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm Group
+         * @description Confirm that the group's members are one job: every other member is merged into the representative
+         *     (202).
+         */
+        post: operations["confirm_group_api_duplicate_groups__group_id__confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/duplicate-groups/{group_id}/score-individually": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Score Individually
+         * @description Score the member on its own: it stays in the group, but its score is no longer the representative's.
+         *     A member waiting for the representative's score is scored in the normal order. Answers the group.
+         */
+        post: operations["score_individually_api_duplicate_groups__group_id__score_individually_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/duplicate-groups/{group_id}/split": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Split Member
+         * @description Split the job out of its duplicate group for good: it is never grouped with the other members again,
+         *     and its score is its own. A group left with one member is dissolved. Answers the group after the
+         *     split.
+         */
+        post: operations["split_member_api_duplicate_groups__group_id__split_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/feedback/{feedback_id}": {
         parameters: {
             query?: never;
@@ -187,6 +251,26 @@ export interface paths {
          * @description Set the case's `active` and `is_canary` flags; the case.
          */
         patch: operations["set_golden_case_flags_api_golden_cases__case_id__patch"];
+        trace?: never;
+    };
+    "/api/identity-conflicts/{conflict_id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve Conflict
+         * @description Settle an open identity conflict: keep its jobs apart, or merge them into the posting's job (202).
+         */
+        post: operations["resolve_conflict_api_identity_conflicts__conflict_id__resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/jobs": {
@@ -328,6 +412,27 @@ export interface paths {
          * @description Score the job's target now, outside the cycle's admission and the bucket (202).
          */
         post: operations["score_now_api_jobs__job_id__score_now_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{job_id}/unmerge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Unmerge Job
+         * @description Reverse the merge of another job into this one: its postings, keys and user actions go back to it, and
+         *     the two jobs are never merged again by a shared key (202).
+         */
+        post: operations["unmerge_job_api_jobs__job_id__unmerge_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1211,6 +1316,14 @@ export interface components {
             targets_to_create: number;
         };
         /**
+         * ConfirmedOut
+         * @description The job the group's other members were merged into: the group's representative.
+         */
+        ConfirmedOut: {
+            /** Job Id */
+            job_id: number;
+        };
+        /**
          * ConfirmedProfile
          * @description `profile_versions.profile_json` and a draft's `draft_json`: the extraction plus `user_entered`.
          */
@@ -1239,6 +1352,19 @@ export interface components {
             /** Total Years Experience */
             total_years_experience: number | null;
             user_entered?: components["schemas"]["UserEntered"];
+        };
+        /**
+         * ConflictResolvedOut
+         * @description The conflict and its status after the resolution.
+         */
+        ConflictResolvedOut: {
+            /** Conflict Id */
+            conflict_id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "resolved_separate" | "resolved_merged";
         };
         /** ContestedOut */
         ContestedOut: {
@@ -1660,6 +1786,14 @@ export interface components {
             /** Size */
             size: number;
         };
+        /**
+         * GroupMemberIn
+         * @description The member of the duplicate group the move is about.
+         */
+        GroupMemberIn: {
+            /** Job Id */
+            job_id: number;
+        };
         /** GroupMemberOut */
         GroupMemberOut: {
             /** Availability */
@@ -1685,7 +1819,7 @@ export interface components {
         };
         /**
          * GroupOut
-         * @description A duplicate group and its members (module docstring).
+         * @description A duplicate group and its members, by job id.
          */
         GroupOut: {
             /** Election Reason */
@@ -2432,6 +2566,18 @@ export interface components {
             /** Targets */
             targets: number;
         };
+        /**
+         * ResolveIn
+         * @description How the identity conflict is settled: `separate` keeps the posting's job and the other jobs apart,
+         *     `merge` merges the other jobs into the posting's job.
+         */
+        ResolveIn: {
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "separate" | "merge";
+        };
         /** RetryApplyOut */
         RetryApplyOut: {
             /**
@@ -2977,6 +3123,22 @@ export interface components {
             /** Restored */
             restored: components["schemas"]["SpanOut"][];
         };
+        /**
+         * UnmergeIn
+         * @description The merge to reverse: an event that merged another job into this one.
+         */
+        UnmergeIn: {
+            /** Merge Event Id */
+            merge_event_id: number;
+        };
+        /**
+         * UnmergedOut
+         * @description The unmerge event that reversed the merge.
+         */
+        UnmergedOut: {
+            /** Unmerge Event Id */
+            unmerge_event_id: number;
+        };
         /** UnsupportedUrlOut */
         UnsupportedUrlOut: {
             /**
@@ -3479,6 +3641,263 @@ export interface operations {
             };
         };
     };
+    confirm_group_api_duplicate_groups__group_id__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a duplicate group */
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfirmedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such duplicate group (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The group is not active or has no representative (`conflict_state`), a member is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    score_individually_api_duplicate_groups__group_id__score_individually_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a duplicate group */
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GroupMemberIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The job is not a member of the group (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    split_member_api_duplicate_groups__group_id__split_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a duplicate group */
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GroupMemberIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GroupOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such duplicate group (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The group is not active or the job is not its member (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     delete_feedback_api_feedback__feedback_id__delete: {
         parameters: {
             query?: never;
@@ -3795,6 +4214,96 @@ export interface operations {
                 };
             };
             /** @description Invalid body, or a third canary (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    resolve_conflict_api_identity_conflicts__conflict_id__resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of an identity conflict */
+                conflict_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolveIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConflictResolvedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such identity conflict (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The conflict is not open (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -4409,6 +4918,96 @@ export interface operations {
                 };
             };
             /** @description Invalid body (`validation_failed`), or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    unmerge_job_api_jobs__job_id__unmerge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnmergeIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnmergedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No merge event of that id merged a job into this one (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The event is an unmerge, is reversed already or is no longer the latest state of its jobs (`conflict_state`), a job is being purged (`conflict_state`, `purge_in_progress`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path or body (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;

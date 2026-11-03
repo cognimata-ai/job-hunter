@@ -20,6 +20,10 @@ in each language of `langs` in turn. Its places are four cities in turn, the Ber
 centre, the 30 km ring and the latitude strip beyond it (`_bulk_place`). It analyses nothing: a caller that
 needs planner statistics runs `ANALYZE` as the owner on a server of its own.
 
+Both seeders give every job they put in a group its membership row (`duplicate_group_members`, evidence
+`{}`) and its `jobs.duplicate_group_id`, the two writes of `dedup.groups`' join (M4 Ruling T7-b), so the
+dedup functions that read the members (a split, score individually) see the group as seeded.
+
 `activate_tuple` makes a new confirmed profile's tuple the active one; the `active_tuple` fixture does it for
 a test on the shared database (whose reset restores no tuple). `activate_scope(engine, **changes)` makes a
 copy of the active scope with `changes` the active scope (the reset restores the seeded one), and
@@ -137,6 +141,11 @@ class Card:
 _ACTIVE: Final = q("SELECT llm_tuple_id, scope_version_id FROM active_config WHERE id = 1")
 _ACTIVATE: Final = q(
     "UPDATE active_config SET profile_version_id = :p, llm_tuple_id = :t, updated_at = now()"
+)
+# A member's row as `dedup.groups` writes it when the job joins (its `_JOIN`).
+_JOIN_GROUP: Final = q(
+    "INSERT INTO duplicate_group_members (group_id, job_id, evidence) VALUES (:group, :job, :evidence)",
+    jsonb=["evidence"],
 )
 _SKIP_JOB_IDS: Final = q("SELECT nextval(pg_get_serial_sequence('jobs', 'id')) FROM generate_series(1, :k)")
 _NEXT_RESULT_ID: Final = q("SELECT nextval(pg_get_serial_sequence('llm_results', 'id'))")
@@ -274,12 +283,12 @@ async def seed_cards(engine: AsyncEngine, specs: Sequence[Card]) -> list[int]:
             if spec.skip_ids:
                 await c.execute(_SKIP_JOB_IDS, {"k": spec.skip_ids})
             jobs.append(await _insert_card(c, spec))
-        groups = {
-            rep: await insert_group(
-                c, jobs[rep], [jobs[i] for i, s in enumerate(specs) if s.deferred_to == rep]
-            )
-            for rep in sorted({s.deferred_to for s in specs if s.deferred_to is not None})
-        }
+        groups: dict[int, int] = {}
+        for rep in sorted({s.deferred_to for s in specs if s.deferred_to is not None}):
+            members = [jobs[i] for i, s in enumerate(specs) if s.deferred_to == rep]
+            groups[rep] = await insert_group(c, jobs[rep], members)
+            for job in (jobs[rep], *members):
+                await c.execute(_JOIN_GROUP, {"group": groups[rep], "job": job.job_id, "evidence": {}})
         for spec, job in zip(specs, jobs, strict=True):
             if spec.state is not None or spec.deferred_to is not None:
                 if llm_tuple is None:
@@ -572,6 +581,11 @@ _BULK_GROUPS: Final = _set_insert(
 _BULK_GROUP_MEMBERS: Final = q(
     "UPDATE jobs SET duplicate_group_id = c.group_id FROM jsonb_to_recordset(:rows) AS c(job_id bigint, "
     "group_id bigint) WHERE jobs.id = c.job_id",
+    jsonb=["rows"],
+)
+_BULK_MEMBERSHIPS: Final = q(
+    "INSERT INTO duplicate_group_members (group_id, job_id, evidence) SELECT c.group_id, c.job_id, '{}' "
+    "FROM jsonb_to_recordset(:rows) AS c(job_id bigint, group_id bigint)",
     jsonb=["rows"],
 )
 _BULK_TARGETS: Final = _set_insert(
@@ -888,6 +902,7 @@ async def bulk_seed_cards(
                 for g, rep in zip(group_ids, representatives, strict=True)
             ]
             await c.execute(_BULK_GROUPS, {"rows": groups_rows})
+            await c.execute(_BULK_MEMBERSHIPS, {"rows": members})
             await c.execute(_BULK_GROUP_MEMBERS, {"rows": members})
         await c.execute(_BULK_TARGETS, {"rows": rows.targets, **binds})
         if rows.published:

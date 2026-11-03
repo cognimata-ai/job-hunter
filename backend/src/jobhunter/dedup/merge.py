@@ -101,7 +101,17 @@ candidate) pair, the pairs the user judged, never between two candidates (Ruling
 `resolved_separate` (the list does not change, so no bump); `merge` merges every candidate into the posting's
 job (`user_confirmed_merge`; the last merge's step 6 resolves it), then recomputes that job, runs its
 det-facts change hook (`filters.refilter_job_live`), supersedes a revision it no longer has
-(`supersede_revision`) and bumps the ranking.
+(`supersede_revision`) and bumps the ranking. It returns the conflict's status after the resolution, read
+under its row lock before the bump (M4 Task 8: the api answers it).
+
+**`CoMemberChanged`** (an `InvariantViolation`, M1 Carry-forward 10, M4 Task 8) is the give-up of a
+read-then-lock round whose job set changed under its lock and that wrote nothing: here, a merge whose
+from-job's group gained a member the transaction does not hold (`_hold_pair`), and a conflict rewritten
+between `resolve_conflict`'s read and its row lock; in `identity`, a job set that kept changing for
+`_ROOT_ROUNDS` rounds; in `groups`, a regroup's set that kept changing for `_LOCK_ROUNDS` rounds and a group
+whose members changed while `split_member` or `confirm_group` locked them. A worker handles it as the
+`InvariantViolation` it is; the api answers it as a retryable 409, since the same request may succeed once
+the other transaction committed.
 
 `derive_from_postings` gives a job the best availability of its postings (`active > unknown > stale >
 closed`, §7.16.2; `availability_changed_at := now()` when it changes) and its postings' first and last
@@ -144,6 +154,10 @@ from jobhunter.scoring.targets import CancelReason
 from jobhunter.types import JSONValue, get_object
 
 MergeKind = Literal["strong_key_merge", "user_confirmed_merge"]
+# The status of a conflict after `resolve_conflict` (the `identity_conflicts.status` CHECK).
+ResolvedStatus = Literal["resolved_separate", "resolved_merged"]
+RESOLVED_SEPARATE: Final[ResolvedStatus] = "resolved_separate"
+RESOLVED_MERGED: Final[ResolvedStatus] = "resolved_merged"
 IDENTITY_CONFLICT_ALERT: Final = "dedup.identity_conflict"
 JOB_MERGED: Final[CancelReason] = "job_merged"
 # The order of a job's availability (§7.16.2): the first state its postings hold.
@@ -259,6 +273,11 @@ _FORGET_FIELD_CONFLICTS: Final = q(
 _REVERSED: Final = q("UPDATE merge_events SET reversed_by_event_id = :by WHERE id = :id")
 
 log = get_logger("jobhunter.dedup.merge")
+
+
+class CoMemberChanged(InvariantViolation):
+    """A job set changed under the lock of the round that read it, and the transaction gave up having
+    written nothing (module docstring): the request may be sent again. Its message names ids only."""
 
 
 @dataclass(frozen=True)
@@ -479,7 +498,8 @@ async def _hold_pair(
         log.warning("merge_refused_fenced", job_ids=fenced)
         raise FencedOut("purge_fence")
     if unheld := sorted(await co_members(conn, (from_job_id,)) - held):  # before the merge writes anything
-        raise InvariantViolation(f"the rows of jobs {unheld} of job {from_job_id}'s group are not locked")
+        # a member that joined after the lock's snapshot, or one the caller did not lock (module docstring)
+        raise CoMemberChanged(f"the rows of jobs {unheld} of job {from_job_id}'s group are not locked")
     return held
 
 
@@ -509,8 +529,9 @@ async def merge_jobs(
     take rows out of id order (Ruling T18-c), and its bulk rows after the earlier merge's target rows (Ruling
     P52). The caller runs the det-facts change hook (`filters.refilter_job_live`) and bumps the ranking.
     Raises `FencedOut` for a fenced job, `InvariantViolation` for a job already merged, a synthetic job, a job
-    merged into itself or a row the transaction does not hold, and `LookupError` for a job that does not
-    exist, having written nothing."""
+    merged into itself or a pair the transaction does not hold, `CoMemberChanged` for a member of the
+    from-job's group it does not hold, and `LookupError` for a job that does not exist, having written
+    nothing."""
     # Imported here, not at the top: `groups` imports this module (`lock_jobs`, `merge_jobs`), and a module-
     # level import back would make the two a cycle (ledger L323).
     from jobhunter.dedup import groups
@@ -617,11 +638,13 @@ async def open_conflict(
 
 async def resolve_conflict(
     conn: AsyncConnection, conflict_id: int, decision: Literal["separate", "merge"]
-) -> None:
-    """Settle the open conflict as `separate` or `merge` (module docstring) in the caller's transaction.
+) -> ResolvedStatus:
+    """Settle the open conflict as `separate` or `merge` (module docstring) in the caller's transaction; its
+    status after the resolution.
 
-    Raises `LookupError` for a conflict that does not exist, `InvariantViolation` for one that is not open
-    (or changed since it was read) and `FencedOut` when one of its jobs is fenced, having written nothing.
+    Raises `LookupError` for a conflict that does not exist, `InvariantViolation` for one that is not open,
+    `CoMemberChanged` for one that changed since it was read (or a candidate's group that gained a member)
+    and `FencedOut` when one of its jobs is fenced, having written nothing.
     """
     active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock
     row = (await conn.execute(_CONFLICT, {"id": conflict_id})).first()
@@ -644,16 +667,16 @@ async def resolve_conflict(
         posting_job,
         candidates,
     ):
-        raise InvariantViolation(f"identity conflict {conflict_id} changed while it was being resolved")
+        raise CoMemberChanged(f"identity conflict {conflict_id} changed while it was being resolved")
     if any(locked.get(job, -1) is not None for job in jobs):
         raise InvariantViolation(f"identity conflict {conflict_id} names a merged or missing job")
     if decision == "separate":
         for candidate in candidates:  # the pairs the user judged (Ruling T18-e)
             await decide_different(conn, posting_job, candidate, source="conflict_resolution")
-        await transition(conn, "identity_conflicts", conflict_id, ["open"], "resolved_separate")
+        await transition(conn, "identity_conflicts", conflict_id, ["open"], RESOLVED_SEPARATE)
         await resolve_alert(conn, code=IDENTITY_CONFLICT_ALERT, subject=f"conflict:{conflict_id}")
-        log.info("identity_conflict_resolved", conflict_id=conflict_id, status="resolved_separate")
-        return
+        log.info("identity_conflict_resolved", conflict_id=conflict_id, status=RESOLVED_SEPARATE)
+        return RESOLVED_SEPARATE
     evidence: dict[str, JSONValue] = {"rule": "conflict_resolution", "conflict_id": conflict_id}
     for candidate in candidates:
         await merge_jobs(
@@ -666,8 +689,8 @@ async def resolve_conflict(
             locked=locked,
         )
     status = (await conn.execute(_LOCK_CONFLICT, {"id": conflict_id})).one().status
-    if status == "open":  # the merges' step 6 resolves it; this is the guard
-        raise InvariantViolation(f"identity conflict {conflict_id} is still open after its merges")
+    if status != RESOLVED_MERGED:  # the merges' step 6 resolves it; this is the guard
+        raise InvariantViolation(f"identity conflict {conflict_id} is {status} after its merges")
     previous = await current_revision(conn, posting_job)
     _, result = await recompute_rollups(conn, posting_job)
     await filters.refilter_job_live(conn, posting_job, active=active)  # the det-facts change hook (Task 15)
@@ -679,6 +702,7 @@ async def resolve_conflict(
         active=active,
     )
     await ranking.bump(conn)
+    return RESOLVED_MERGED
 
 
 async def unmerge(conn: AsyncConnection, merge_event_id: int) -> int:

@@ -50,6 +50,7 @@ from jobhunter.api.routes import (
     auth,
     geo,
     golden,
+    groups,
     health,
     jobs,
     profile,
@@ -213,6 +214,7 @@ def create_app(
     # before any `/api/jobs/{job_id}` GET route, so that `/api/jobs/facets` is matched first
     api.include_router(jobs.router)
     api.include_router(targets.router)
+    api.include_router(groups.router)
     api.include_router(golden.router)
     api.include_router(alerts.router)
     for router in extra_routers:

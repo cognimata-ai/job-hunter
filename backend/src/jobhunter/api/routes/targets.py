@@ -130,8 +130,9 @@ _REFUSALS: Final[Mapping[ScoreNowCode, tuple[str, str]]] = MappingProxyType(
 )
 
 
-def _refused(refusal: ScoreNowRefused, what: str) -> Problem:
-    """The problem of a refused move."""
+def refused_problem(refusal: ScoreNowRefused, what: str) -> Problem:
+    """The problem of a refused move: 404 `not_found` naming `what`, or the 409 of its code. The one mapping
+    of a `ScoreNowRefused`, which `api.routes.groups` answers Score individually's refusal with too."""
     if refusal.code == "not_found":
         return _not_found(what)
     title, detail = _REFUSALS[refusal.code]
@@ -186,7 +187,7 @@ async def score_now(
     async def handler(conn: AsyncConnection) -> StoredResponse:
         moved = await targets.score_now(conn, job_id=job_id, force=body.force, now=now, defer=defer_in_tx)
         if isinstance(moved, ScoreNowRefused):
-            raise _refused(moved, "Job target")
+            raise refused_problem(moved, "Job target")
         return StoredResponse(202, TargetMovedOut(target_id=moved.target_id, state=moved.state).model_dump())
 
     fingerprint = request_fingerprint(body.model_dump(mode="json"), {"job_id": job_id})
@@ -217,7 +218,7 @@ async def retry_target(
     async def handler(conn: AsyncConnection) -> StoredResponse:
         moved = await targets.retry(conn, target_id=target_id, now=now, defer=defer_in_tx)
         if isinstance(moved, ScoreNowRefused):
-            raise _refused(moved, "Target")
+            raise refused_problem(moved, "Target")
         return StoredResponse(202, TargetMovedOut(target_id=moved.target_id, state=moved.state).model_dump())
 
     fingerprint = request_fingerprint({}, {"target_id": target_id})

@@ -13,13 +13,21 @@ from jobhunter.api.app import create_app
 
 from tests.unit.test_openapi_m3 import M3_ROUTES
 
-M4_ROUTES: Final[dict[tuple[str, str], set[str]]] = {
+# The error statuses of a group or merge-family write (Task 8).
+GROUP_WRITE: Final = frozenset({"401", "403", "404", "409", "413", "422", "429"})
+
+M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("get", "/api/jobs"): {"400", "401", "422", "429"},
     ("get", "/api/jobs/facets"): {"401", "422", "429"},
     ("get", "/api/jobs/{job_id}"): {"401", "404", "422", "429"},
     ("get", "/api/jobs/{job_id}/history"): {"400", "401", "404", "422", "429"},
     ("put", "/api/jobs/{job_id}/actions"): {"401", "403", "404", "413", "422", "429"},
     ("delete", "/api/feedback/{feedback_id}"): {"401", "403", "404", "422", "429"},
+    ("post", "/api/duplicate-groups/{group_id}/split"): GROUP_WRITE,
+    ("post", "/api/duplicate-groups/{group_id}/score-individually"): GROUP_WRITE,
+    ("post", "/api/duplicate-groups/{group_id}/confirm"): GROUP_WRITE - {"413"},  # no body
+    ("post", "/api/jobs/{job_id}/unmerge"): GROUP_WRITE,
+    ("post", "/api/identity-conflicts/{conflict_id}/resolve"): GROUP_WRITE,
 }
 
 
@@ -34,7 +42,7 @@ def error_statuses(document: dict[str, Any], method: str, path: str) -> set[str]
 
 @pytest.mark.parametrize(("route", "statuses"), M4_ROUTES.items(), ids=[" ".join(k) for k in M4_ROUTES])
 def test_every_m4_route_is_in_the_document_with_its_error_statuses(
-    document: dict[str, Any], route: tuple[str, str], statuses: set[str]
+    document: dict[str, Any], route: tuple[str, str], statuses: set[str] | frozenset[str]
 ) -> None:
     method, path = route
     assert error_statuses(document, method, path) == statuses

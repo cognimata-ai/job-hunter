@@ -93,9 +93,10 @@ holds: Codex r1 #19, #20):
   active-tuple target (the flag carries into its later revisions, L3271; `not_found` without the
   membership), and a `deferred_duplicate` target → `pending` with `override = 'individual'` and
   `override_at`; its lane is left alone and no cycle is requested: the member waits in normal admission
-  (L3599, L5241), and its card offers Score now. A target in another state keeps it. The result names the
-  group, which the route answers (200 `Group`, L4983), the member, and the target with its state after the
-  move.
+  (L3599, L5241), and its card offers Score now. A target in another state keeps it. Either way the ranking
+  is bumped once, last: the flag is a change of the group's membership (L1255, M4 Task 8). The result names
+  the group, which the route answers (200 `Group`, L4983), the member, and the target with its state after
+  the move.
 
 **`budget_release`** (§6.9.4 L1201, tick, `release_deferred`): `fence_epoch`; `active_config FOR SHARE`;
 `ensure_month` and the month row `FOR UPDATE` (`lock_month`: the first tick of a fresh month creates the row
@@ -926,6 +927,7 @@ async def score_individually(
     if row is None or row.state != "deferred_duplicate":
         target_id = None if row is None else int(row.id)
         state = None if row is None else str(row.state)
+        await ranking.bump(conn)  # the membership changed (a group change, L1255): last
         log.info("score_target_action", action="score_individually", target_id=target_id, from_state=state)
         return IndividualMember(group_id, job_id, target_id, state)
     target_id = int(row.id)

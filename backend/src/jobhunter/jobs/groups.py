@@ -57,7 +57,7 @@ class GroupMemberOut(BaseModel):
 
 
 class GroupOut(BaseModel):
-    """A duplicate group and its members (module docstring)."""
+    """A duplicate group and its members, by job id."""
 
     id: int
     status: str
