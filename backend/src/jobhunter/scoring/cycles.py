@@ -468,12 +468,16 @@ async def _locked_bucket(
     conn: AsyncConnection, settings: CycleSettings, estimate: Decimal, *, now: datetime
 ) -> tuple[BudgetRow, bool]:
     """The month row of `now` under its lock (created first when absent: Codex r4 B8), accrued, and whether
-    its bucket holds `min(min_cycle_targets x ĉ, B_max)` (L1176)."""
+    its bucket holds `min(min_cycle_targets x ĉ, B_max)` (L1176). `B_max` is taken at the precision a full
+    bucket is stored at (`budget.USD_QUANTUM`, rounded down, as `budget.accrue` stores it): unrounded, a
+    capacity with more decimals (the dev defaults' $1.551666...) is never reached by a full bucket, and once
+    `min_cycle_targets x ĉ >= B_max` no gated cycle could start again (M4 Task 18, ruling T18-b)."""
     month = budget.month_of(now)
     await spend_ledger.ensure_month(conn, month, settings.budget, now)
     row = await spend_ledger.lock_month(conn, month, settings.budget, now=now)
     capacity = budget.bucket_capacity(budget.row_params(row, settings.budget), month)
-    return row, row.bucket_usd >= min(settings.min_cycle_targets * estimate, capacity)
+    full = capacity.quantize(budget.USD_QUANTUM, rounding=ROUND_FLOOR)
+    return row, row.bucket_usd >= min(settings.min_cycle_targets * estimate, full)
 
 
 async def periodic_gate(conn: AsyncConnection, config: ScoringConfig, *, now: datetime) -> bool:
