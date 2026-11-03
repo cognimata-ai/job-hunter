@@ -8,8 +8,9 @@ A login runs in phases, so that what it writes persists whatever the answer is (
    Then, when TOTP is on and the login carries no code (`totp` absent, `null` or empty), it gets 401
    `totp_required` at once (§15.2), before the gate and any Argon2 work. That answer records nothing (no
    attempt, so no lockout) and comes from the single user's flag alone (`users.totp_enabled_for_any`, which
-   names no user), so it is the same for any username and password: it tells only that TOTP is on. A login
-   with a code, even a malformed one, goes on, and its every failure is the generic 401 below.
+   names no user), so it is the same for any username and password: it tells only that TOTP is on. A code
+   that is not six digits is refused by the request's validation (422) before the login runs at all; a login
+   with a well-formed code goes on, and its every failure is the generic 401 below.
    Then a slot of the process's Argon2 gate (`argon2_gate`, ruling T21-e): two logins verify at once and
    eight wait; one more gets 429 `throttled` (`Retry-After: 1`) at once, before any Argon2 work. A login that
    gets a slot repeats the pre-check first: a burst ahead of it in the queue may have locked it out by then.
@@ -85,6 +86,7 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
     totp: str | None = Field(
         default=None,
+        pattern=r"^(\d{6})?$",
         description="The six-digit code of the authenticator app, needed when TOTP is on; an empty string "
         "counts as no code",
     )
@@ -92,8 +94,7 @@ class LoginIn(BaseModel):
     @field_validator("totp", mode="before")
     @classmethod
     def _empty_code_is_no_code(cls, value: object) -> object:
-        # A code of any other shape is kept: it fails like a wrong code (`totp.matched_step`), so a login
-        # with a code has one failure answer whatever the code looks like.
+        # Only the empty string: a code of any other shape than six digits stays a validation error (422).
         return None if value == "" else value
 
 

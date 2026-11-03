@@ -232,24 +232,34 @@ async def test_totp_required_when_enabled(api_client, make_user, engine, make_co
     assert argon2 == []  # the Argon2 gate was not entered
     for table in ("login_attempts", "login_lockouts", "sessions"):
         assert await count_rows(engine, table) == 0, table
-    # With a code, every failure is the generic one, and each is an attempt.
-    with_code = [
-        await login(api_client, totp=wrong_code(secret)),
-        await login(api_client, totp="12345"),  # malformed: a wrong code like any other
-        await login(api_client, totp="abcdef"),
-    ]
-    for r in with_code:
-        assert r.status_code == 401
-        assert (r.json()["code"], r.json()["title"]) == ("unauthenticated", "Invalid credentials")
-    assert argon2 == ["check_password"] * 3
-    assert await count_rows(engine, "login_attempts", success=False) == 3
+    # A code that is not six digits fails the request's validation, before the login runs: nothing is
+    # recorded, and the problem names the field only, none of what was sent.
+    for malformed in ("12345", "abcdef", "1234567"):
+        r = await login(api_client, totp=malformed)
+        assert r.status_code == 422 and r.json()["code"] == "validation_failed"
+        assert [e["field"] for e in r.json()["errors"]] == ["body.totp"]
+        shown = json.dumps({k: v for k, v in r.json().items() if k != "request_id"}, ensure_ascii=False)
+        names_a_credential = any(sent in shown for sent in (PW, "ada", malformed))
+        assert not names_a_credential
+    assert argon2 == []
+    assert await count_rows(engine, "login_attempts") == 0
+    # A well-formed wrong code: the generic failure, and an attempt.
+    wrong = await login(api_client, totp=wrong_code(secret))
+    assert wrong.status_code == 401
+    assert (wrong.json()["code"], wrong.json()["title"]) == ("unauthenticated", "Invalid credentials")
+    assert argon2 == ["check_password"]
+    assert await count_rows(engine, "login_attempts", success=False) == 1
     code = pyotp.TOTP(secret).now()
     accepted = await login(api_client, totp=code)
     assert accepted.status_code == 204  # the six logins without a code did not lock the address out
     async with engine.begin() as c:
         await users.disable_totp(c)
-    off = await login(api_client)  # TOTP off: a login needs no code
-    assert off.status_code == 204
+    off = [  # TOTP off: a login needs no code, whether `totp` is omitted, empty or null
+        await login(api_client),
+        await login(api_client, totp=""),
+        await api_client.post("/api/auth/login", json={"username": "ada", "password": PW, "totp": None}),
+    ]
+    assert [r.status_code for r in off] == [204] * 3
 
 
 async def test_a_locked_out_client_without_a_totp_code_gets_the_lockout_answer(
