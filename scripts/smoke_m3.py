@@ -693,26 +693,7 @@ def lower_batch_floor(ctx: Context) -> str:
     ):
         raise CheckFailed("the active settings have no scoring group or version id")
     payload["scoring"]["batch_min_targets"] = SMOKE_BATCH_MIN_TARGETS
-    preview = json_object(
-        ctx.client.post(f"{ORIGIN}/api/settings/dry-run", json={"payload": payload}, headers=mutating(ctx)),
-        200,
-    )
-    errors, warnings = pick(preview, "errors"), pick(preview, "warnings")
-    if not isinstance(errors, list) or not isinstance(warnings, list):
-        raise CheckFailed("the dry-run answered no errors and warnings lists")
-    if errors:
-        raise CheckFailed(
-            f"the dry-run refused the batch floor: {sorted({str(pick(e, 'code')) for e in errors})}"
-        )
-    codes = [str(pick(w, "code")) for w in warnings]
-    saved = json_object(
-        ctx.client.post(
-            f"{ORIGIN}/api/settings",
-            json={"payload": payload, "base_version_id": base, "acknowledged_warnings": codes},
-            headers=mutating(ctx, BATCH_FLOOR_KEY),
-        ),
-        201,
-    )
+    saved, codes = smoke_m2.save_settings(ctx, payload, base, BATCH_FLOOR_KEY, what="the batch floor")
     version_no = pick(saved, "version", "version_no")
     return (
         f"batch_min_targets={SMOKE_BATCH_MIN_TARGETS} saved as version_no {version_no!r} (warnings={codes})"

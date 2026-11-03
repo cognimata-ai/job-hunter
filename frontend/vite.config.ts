@@ -39,5 +39,15 @@ export default defineConfig({
       },
     },
   },
-  test: { include: ["src/**/*.test.ts"] },
+  build: {
+    // Every asset is a file of its own, never a `data:` URL (the CSP's `font-src 'self'` refuses a data: font),
+    // and no modulepreload polyfill: the entry stays the one `<script type="module" src>` of index.html.
+    assetsInlineLimit: 0,
+    modulePreload: { polyfill: false },
+  },
+  test: {
+    include: ["src/**/*.test.{ts,tsx}"],
+    environment: "jsdom",
+    setupFiles: ["src/test/setup.ts"],
+  },
 });

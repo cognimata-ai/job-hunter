@@ -1,0 +1,20 @@
+/* The drawer sits at z-index 41 over its backdrop (40); a dialog at 51 over its own (50), so a confirmation
+   opened from the drawer covers it. */
+.backdrop,
+.backdropCenter {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgb(23 32 43 / 32%);
+  animation: fade var(--duration) ease-out;
+}
+
+.backdropCenter {
+  z-index: 50;
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
