@@ -3,12 +3,14 @@ Carry-forward 10).
 
 - `POST /api/jobs/{job_id}/unmerge {merge_event_id}` → 202 `{unmerge_event_id}`: the merge reversed. An
   event that does not exist or merged into another job is 404 (no `merged_into_job_id`: the event is what is
-  missing); an unmerge event, or a merge already reversed, reaches the unmerge and is 409.
+  missing); an unmerge event, a merge already reversed, or one that is no longer the latest state of its jobs
+  reaches the unmerge and is 409.
 - `POST /api/identity-conflicts/{conflict_id}/resolve {decision}` → 202 `{conflict_id, status}`: the
   conflict's status after its resolution; a conflict resolved already is 409, an unknown one 404.
 - A deadlock (40P01) is tried again in a fresh transaction, three tries in all, each retry logged
   `api_deadlock_retried` with its attempt and SQLSTATE only; the third failure is 409 `conflict_state` with
-  `retryable: true`, and nothing is written.
+  `retryable: true`, logged `api_deadlock_retries_exhausted` once (the attempts and the SQLSTATE), and
+  nothing is written.
 - A job set that changed under the lock (a member that joined a group while the request waited for its
   rows) is 409 `conflict_state` with `retryable: true`, tried once, and nothing is written.
 
@@ -24,6 +26,7 @@ import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter.clock import utcnow
+from jobhunter.db import ranking
 from jobhunter.dedup import merge
 from jobhunter.normalize.keys import AdKey
 from jobhunter.worker.runs import RunOwner
@@ -81,6 +84,12 @@ def status_code(r: httpx.Response) -> tuple[int, str]:
 
 async def merged_pair(engine: AsyncEngine) -> tuple[KeyPair, int]:
     """Jobs A and B (`key_pair`) and the event of B's strong-key merge into A (a sighting with both keys)."""
+    _, _, pair, event = await merged_run(engine)
+    return pair, event
+
+
+async def merged_run(engine: AsyncEngine) -> tuple[RunOwner, datetime, KeyPair, int]:
+    """`merged_pair` with the run's owner and the time of A's sighting."""
     owner = await queued_run(engine)
     at = utcnow() - timedelta(days=1)
     pair = await key_pair(engine, owner, at=at)
@@ -94,7 +103,7 @@ async def merged_pair(engine: AsyncEngine) -> tuple[KeyPair, int]:
     assert await resolved(engine, owner, merging) == "linked"
     [event] = await rows(engine, EVENTS)
     assert (event.kind, event.from_job_id, event.into_job_id) == ("strong_key_merge", pair.b, pair.a)
-    return pair, int(event.id)
+    return owner, at, pair, int(event.id)
 
 
 async def merged_into(engine: AsyncEngine, job_id: int) -> int | None:
@@ -167,6 +176,31 @@ async def test_unmerging_a_reversed_merge_is_409(
     r = await logged_in_client.post(unmerge_url(pair.a), json={"merge_event_id": event})
     assert status_code(r) == (409, "conflict_state") and "retryable" not in r.json()
     assert len(await rows(engine, EVENTS)) == 2 and await merged_into(engine, pair.b) is None
+    assert await generation(engine) == before
+
+
+async def test_unmerging_a_merge_that_is_no_longer_the_latest_state_is_409(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, current_epoch: int
+) -> None:
+    owner, at, pair, event = await merged_run(engine)
+    sighting = await pending_item(
+        engine, owner, "jsearch", {"native_id": "HC"}, fetched_at=at + timedelta(hours=3)
+    )
+    assert await resolved(engine, owner, sighting) == "linked"
+    c = int(await scalar(engine, "SELECT job_id FROM postings WHERE native_id = 'HC'"))
+    async with engine.begin() as conn:  # A, into which B was merged, is merged into C since
+        await merge.merge_jobs(
+            conn, from_job_id=pair.a, into_job_id=c, kind="user_confirmed_merge", evidence={}
+        )
+        await ranking.bump(conn)
+    before = await generation(engine)
+    # the event names the job (the route's check passes); the unmerge refuses a merge that is not the latest
+    r = await logged_in_client.post(unmerge_url(pair.a), json={"merge_event_id": event})
+    assert status_code(r) == (409, "conflict_state") and "retryable" not in r.json(), r.text
+    original, later = await rows(engine, EVENTS)
+    assert (original.id, original.reversed_by_event_id) == (event, None)
+    assert (later.kind, later.from_job_id, later.into_job_id) == ("user_confirmed_merge", pair.a, c)
+    assert (await merged_into(engine, pair.b), await merged_into(engine, pair.a)) == (pair.a, c)
     assert await generation(engine) == before
 
 
@@ -264,6 +298,8 @@ async def test_a_deadlock_is_retried_and_the_third_failure_is_a_retryable_409(
     assert calls == [event] * 3  # three tries in all
     [unchanged] = await rows(engine, EVENTS)
     assert unchanged.reversed_by_event_id is None and await generation(engine) == before
+    [exhausted] = [e for e in log_events() if e.get("event") == "api_deadlock_retries_exhausted"]
+    assert (exhausted["attempts"], exhausted["sqlstate"]) == (3, "40P01")
 
     calls.clear()
     failing["times"] = 2
@@ -274,10 +310,14 @@ async def test_a_deadlock_is_retried_and_the_third_failure_is_a_retryable_409(
     assert r.json() == {"unmerge_event_id": reversal.id} and original.reversed_by_event_id == reversal.id
     assert await generation(engine) == before + 1
 
-    retried = [e for e in log_events() if e.get("event") == "api_deadlock_retried"]
+    events = log_events()
+    retried = [e for e in events if e.get("event") == "api_deadlock_retried"]
     assert [(e["attempt"], e["sqlstate"]) for e in retried] == [(1, "40P01"), (2, "40P01")] * 2
     standard = {"event", "level", "logger", "ts", "request_id"}  # the chain's own and the edge's
     assert all(set(e) - standard == {"attempt", "sqlstate"} for e in retried), retried
+    # the exhaustion is logged once, on the 409 run only, and as content-free
+    assert [e for e in events if e.get("event") == "api_deadlock_retries_exhausted"] == [exhausted]
+    assert set(exhausted) - standard == {"attempts", "sqlstate"}, exhausted
 
 
 async def wait_at_jobs(server: PgServer, task: "asyncio.Task[Any]") -> None:

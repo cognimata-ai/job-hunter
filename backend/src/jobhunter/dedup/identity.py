@@ -20,7 +20,7 @@ the job rows → the run's owner row (`ledger.lock_run_owner`) → the other dom
    unmerge moves `P` back and re-owns the keys without merging any job of `J`, so only a re-read of both
    under the lock sees it: M1 Carry-forward 10), the savepoint is rolled back, which releases that round's
    row locks, and the round runs again with a fresh read, so the second set is locked in id order too (at
-   most `_ROOT_ROUNDS`, then `merge.CoMemberChanged`). A fenced job (`merge.fenced_jobs`) makes the item
+   most `_ROOT_ROUNDS`, then `CoMemberChanged`). A fenced job (`merge.fenced_jobs`) makes the item
    `deferred('job_fenced')`, `normalized` kept, and nothing else is written. Then (`_decide`):
    - `J` empty: a new job, its row from `select_canonical` of this observation alone (its provenance is
      written in step 7, when the posting and observation ids exist), `restored_from_tombstone_id` from the
@@ -102,7 +102,7 @@ from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.dedup import merge
 from jobhunter.dedup.user_actions import ACTION_TIMESTAMPS
-from jobhunter.errors import DomainError, FencedOut, InvariantViolation
+from jobhunter.errors import CoMemberChanged, DomainError, FencedOut, InvariantViolation
 from jobhunter.faults import afault_point
 from jobhunter.normalize.fields import CanonicalFields, ObservationView, WatchlistDisplay, select_canonical
 from jobhunter.normalize.keys import AdKey
@@ -459,7 +459,7 @@ async def _lock_job_set(conn: AsyncConnection, item: _Item, keys: Sequence[AdKey
             return found
         await attempt.rollback()
         log.info("job_set_changed_under_the_lock", raw_item_id=item.raw_item_id)
-    raise merge.CoMemberChanged(f"raw item {item.raw_item_id}: its job set kept changing under the lock")
+    raise CoMemberChanged(f"raw item {item.raw_item_id}: its job set kept changing under the lock")
 
 
 async def _dispose(

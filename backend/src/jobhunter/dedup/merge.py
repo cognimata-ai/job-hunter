@@ -104,12 +104,13 @@ det-facts change hook (`filters.refilter_job_live`), supersedes a revision it no
 (`supersede_revision`) and bumps the ranking. It returns the conflict's status after the resolution, read
 under its row lock before the bump (M4 Task 8: the api answers it).
 
-**`CoMemberChanged`** (an `InvariantViolation`, M1 Carry-forward 10, M4 Task 8) is the give-up of a
+**`errors.CoMemberChanged`** (an `InvariantViolation`, M1 Carry-forward 10, M4 Task 8) is the give-up of a
 read-then-lock round whose job set changed under its lock and that wrote nothing: here, a merge whose
 from-job's group gained a member the transaction does not hold (`_hold_pair`), and a conflict rewritten
 between `resolve_conflict`'s read and its row lock; in `identity`, a job set that kept changing for
 `_ROOT_ROUNDS` rounds; in `groups`, a regroup's set that kept changing for `_LOCK_ROUNDS` rounds and a group
-whose members changed while `split_member` or `confirm_group` locked them. A worker handles it as the
+whose members changed while `split_member` or `confirm_group` locked them; in `availability.rules`, a
+posting set whose jobs kept changing for its `_LOCK_ROUNDS` rounds. A worker handles it as the
 `InvariantViolation` it is; the api answers it as a retryable 409, since the same request may succeed once
 the other transaction committed.
 
@@ -144,7 +145,7 @@ from jobhunter.dedup.user_actions import (
     restore_user_actions,
     to_iso,
 )
-from jobhunter.errors import FencedOut, InvariantViolation
+from jobhunter.errors import CoMemberChanged, FencedOut, InvariantViolation
 from jobhunter.llm import bulk
 from jobhunter.normalize.fields import CONFLICT_FIELDS, CONFLICT_RULE
 from jobhunter.observability.alerts import raise_alert, resolve_alert
@@ -273,11 +274,6 @@ _FORGET_FIELD_CONFLICTS: Final = q(
 _REVERSED: Final = q("UPDATE merge_events SET reversed_by_event_id = :by WHERE id = :id")
 
 log = get_logger("jobhunter.dedup.merge")
-
-
-class CoMemberChanged(InvariantViolation):
-    """A job set changed under the lock of the round that read it, and the transaction gave up having
-    written nothing (module docstring): the request may be sent again. Its message names ids only."""
 
 
 @dataclass(frozen=True)

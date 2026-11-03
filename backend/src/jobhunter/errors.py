@@ -87,6 +87,16 @@ class InvariantViolation(DomainError):
     """A cross-table invariant (§7.17) does not hold."""
 
 
+class CoMemberChanged(InvariantViolation):
+    """A read-then-lock round gave up on a job set that changed under its lock, having written nothing (M1
+    Carry-forward 10, M4 Task 8): a member that joined a group, a job merged or a posting moved meanwhile.
+
+    The same request may succeed once the other transaction committed: a worker handles it as the
+    `InvariantViolation` it is, and the api answers it as a retryable 409 (`api.errors.domain_problem`). Its
+    message names ids only.
+    """
+
+
 @dataclass(frozen=True)
 class RefusalField:
     """A field a refusal names (a member of the problem's `errors`): its path, a code and a message."""

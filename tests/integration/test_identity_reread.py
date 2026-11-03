@@ -5,12 +5,16 @@ An unmerge moves postings and re-owns keys without merging any job of the round'
 round read stay unmerged, so only a re-read of `P`'s job and of the owners of `K` sees it. A round whose
 re-read differs from its read is rolled back to its savepoint and the next round reads afresh, so the item
 is linked to the restored job (with the round's lock on the job it read released), never refused for a
-posting that is no longer on the decided job, nor linked to a job that no longer owns its key.
+posting that is no longer on the decided job, nor linked to a job that no longer owns its key. A set whose
+re-read never matches gives up after `_ROOT_ROUNDS` rounds as `CoMemberChanged`: the item is rejected
+`identity_error`, and nothing else is written.
 
 Every datum is invented.
 """
 
 import asyncio
+import dataclasses
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, Final
 
@@ -19,7 +23,7 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from jobhunter.dedup import identity, merge
 from jobhunter.normalize.keys import AdKey
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import STEPSTONE_1, job_lockable, key_pair, pending_item, queued_run, resolved
 from tests.support.faults import PausePoints
@@ -96,3 +100,41 @@ async def test_the_reread_round_rereads_the_posting_job_and_key_owners(
         assert observed.posting_id == pair.posting_b
     assert len(await rows(engine, EVENTS)) == 2  # the merge and its unmerge: no merge since
     assert [tuple(r) for r in await rows(engine, OWNER_OF, ns="adzuna", v="9")] == [(pair.b,)]
+
+
+ITEM: Final = sa.text("SELECT disposition, reason_code FROM raw_items WHERE id = :i")
+POSTING_OF: Final = sa.text("SELECT job_id FROM postings WHERE native_id = :n")
+
+
+async def test_a_job_set_that_keeps_changing_rejects_the_item_as_a_co_member_change(
+    engine: AsyncEngine,
+    current_epoch: int,
+    monkeypatch: pytest.MonkeyPatch,
+    log_events: Callable[[], list[dict[str, Any]]],
+) -> None:
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(hours=3)
+    first = await pending_item(engine, owner, "jsearch", {"native_id": "HA"}, fetched_at=at)
+    assert await resolved(engine, owner, first) == "linked"
+    [(a,)] = await rows(engine, POSTING_OF, n="HA")
+    item = await pending_item(
+        engine, owner, "jsearch", {"native_id": "HB"}, fetched_at=at + timedelta(hours=1)
+    )
+    real_read = identity._read
+    reads = iter(range(1000))
+
+    async def changing(conn: AsyncConnection, read_item: Any, keys: Any) -> Any:
+        """Step 2's reads, each seeing one more key owned by A that no read saw before: no re-read matches."""
+        read = await real_read(conn, read_item, keys)
+        return dataclasses.replace(read, direct={**read.direct, AdKey("adzuna", f"moving-{next(reads)}"): a})
+
+    monkeypatch.setattr(identity, "_read", changing)
+    assert await resolved(engine, owner, item) == "rejected"
+    assert tuple((await rows(engine, ITEM, i=item))[0]) == ("rejected", "identity_error")
+    events = log_events()
+    changed = [e for e in events if e.get("event") == "job_set_changed_under_the_lock"]
+    assert [e["raw_item_id"] for e in changed] == [item] * identity._ROOT_ROUNDS
+    [error] = [e for e in events if e.get("event") == "identity_error"]
+    assert (error["raw_item_id"], error["error"]) == (item, "CoMemberChanged")
+    assert await rows(engine, POSTING_OF, n="HB") == []  # no posting, no observation, no key
+    assert await job_lockable(engine, a)  # every round's lock went with its savepoint

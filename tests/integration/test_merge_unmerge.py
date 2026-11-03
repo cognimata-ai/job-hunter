@@ -8,7 +8,7 @@ from jobhunter.clock import utcnow
 from jobhunter.db import ranking
 from jobhunter.dedup import identity, merge
 from jobhunter.dedup.merge import merge_jobs, resolve_conflict, unmerge
-from jobhunter.errors import FencedOut, InvariantViolation
+from jobhunter.errors import CoMemberChanged, FencedOut, InvariantViolation
 from jobhunter.normalize.keys import AdKey
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -226,6 +226,56 @@ async def test_resolve_conflict_separate_and_merge(engine, current_epoch) -> Non
     with pytest.raises(InvariantViolation):  # a resolved conflict stays resolved
         async with engine.begin() as c:
             await resolve_conflict(c, second.id, "separate")
+
+
+async def test_a_conflict_rewritten_before_its_row_lock_is_a_co_member_change(
+    engine, current_epoch, migrated
+) -> None:
+    """M4 Task 8 (M1 Carry-forward 10): a conflict whose candidates change between `resolve_conflict`'s read
+    and its row lock (a merge's step 6 in flight) gives up as `CoMemberChanged`, having written nothing."""
+    owner = await queued_run(engine)
+    at = utcnow() - timedelta(days=1)
+    pair = await key_pair(engine, owner, at=at)
+    serp = await pending_item(
+        engine,
+        owner,
+        "serpapi",
+        {"native_id": "H", "primary_link": STEPSTONE_2},
+        fetched_at=at + timedelta(hours=2),
+    )
+    assert await resolved(engine, owner, serp) == "linked"
+    [conflict] = await fetch(engine, CONFLICTS)
+    assert (conflict.status, conflict.candidate_job_ids) == ("open", [pair.a])
+    gen = await generation(engine)
+
+    async def resolving() -> None:
+        async with engine.begin() as c:
+            await resolve_conflict(c, conflict.id, "separate")
+
+    async with engine.connect() as rewriter:
+        await rewriter.begin()
+        # another transaction holds the conflict row and names one more candidate in it
+        await rewriter.execute(
+            sa.text("SELECT id FROM identity_conflicts WHERE id = :c FOR UPDATE"), {"c": conflict.id}
+        )
+        await rewriter.execute(
+            sa.text("UPDATE identity_conflicts SET candidate_job_ids = CAST(:ids AS bigint[]) WHERE id = :c"),
+            {"ids": [pair.a, pair.b], "c": conflict.id},
+        )
+        task = asyncio.create_task(resolving())
+
+        async def waiting() -> bool:
+            return task.done() or any(w.relation == "identity_conflicts" for w in lock_wait_details(migrated))
+
+        await await_until(waiting, 10, 0.02)
+        assert not task.done()  # it read the conflict as it was, locked its jobs, and waits for the row
+        await rewriter.commit()
+    with pytest.raises(CoMemberChanged, match="changed while it was being resolved"):
+        await asyncio.wait_for(task, 10)
+    [unresolved] = await fetch(engine, CONFLICTS)
+    assert (unresolved.status, unresolved.candidate_job_ids) == ("open", [pair.a, pair.b])
+    assert await fetch(engine, sa.text("SELECT job_a FROM dedup_decisions")) == []
+    assert await generation(engine) == gen
 
 
 async def test_the_merged_jobs_field_conflict_alert_is_resolved_and_reopens_on_unmerge(

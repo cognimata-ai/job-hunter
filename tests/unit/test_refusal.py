@@ -15,6 +15,7 @@ from jobhunter.api.errors import Problem, as_problem, domain_problem, problem_bo
 from jobhunter.auth.users import UserMissing
 from jobhunter.errors import (
     RESERVED_PROBLEM_MEMBERS,
+    CoMemberChanged,
     FencedOut,
     InvariantViolation,
     Refusal,
@@ -127,6 +128,20 @@ def test_domain_problem_maps_the_domain_errors() -> None:
     for named in (UserMissing("no user"), _NoSuchDraft("profile_drafts 7")):
         problem = domain_problem(named)
         assert problem is not None and (problem.status, problem.code) == (404, "not_found"), named
+
+
+def test_domain_problem_answers_a_changed_job_set_as_a_retryable_409() -> None:
+    """M4 Task 8: `CoMemberChanged` is an `InvariantViolation` (a worker handles it as one), but the api
+    answers it as a 409 the client may send again; every other `InvariantViolation` stays non-retryable."""
+    changed = CoMemberChanged("duplicate group 7 changed while it was being locked")
+    assert isinstance(changed, InvariantViolation)
+    problem = domain_problem(changed)
+    assert problem is not None
+    assert (problem.status, problem.code, problem.extra) == (409, "conflict_state", {"retryable": True})
+    body = dict(rendered(problem))
+    assert body["retryable"] is True and "duplicate group 7" not in json.dumps(body)  # ids not sent
+    plain = domain_problem(InvariantViolation("duplicate group 7 is dissolved, not active"))
+    assert plain is not None and (plain.status, plain.code, plain.extra) == (409, "conflict_state", {})
 
 
 async def test_a_raised_refusal_is_answered_with_its_problem_document() -> None:

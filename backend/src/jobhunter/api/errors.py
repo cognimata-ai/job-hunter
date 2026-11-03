@@ -26,11 +26,13 @@ carry SQL, input or secrets.
 `from None` in place of its own mapping (M4 Task 1, R6): a `LookupError` that is neither a `KeyError` nor an
 `IndexError` → 404 `not_found` (a named domain lookup such as `auth.users.UserMissing` or
 `scoring.eval_runner.NoCandidate`, whichever subclass; ruling T1-a); `FencedOut` → 409 `conflict_state` with
-`detail = "purge_in_progress"`; `InvariantViolation` and `TransitionConflict` → 409 `conflict_state`; anything
-else `None`. Their messages, which name tables and ids, stay out of the body. A `KeyError` or `IndexError` is
-a bug, which the last-resort handler answers 500 and alerts on; so there is no global `LookupError` handler
-either. `as_problem(exc)` is the one view of a `Problem` or a `Refusal` that a route's catch logs (ruling
-T1-c).
+`detail = "purge_in_progress"`; `CoMemberChanged` (a read-then-lock round that gave up on a job set changing
+under its lock, M4 Task 8), checked before the other `InvariantViolation`s → `retryable_conflict()`, 409
+`conflict_state` with `retryable: true`, which `api.retry.with_deadlock_retry` answers its last deadlock with
+too; `InvariantViolation` and `TransitionConflict` → 409 `conflict_state`; anything else `None`. Their
+messages, which name tables and ids, stay out of the body. A `KeyError` or `IndexError` is a bug, which the
+last-resort handler answers 500 and alerts on; so there is no global `LookupError` handler either.
+`as_problem(exc)` is the one view of a `Problem` or a `Refusal` that a route's catch logs (ruling T1-c).
 """
 
 import asyncio
@@ -48,6 +50,7 @@ from starlette.types import Scope
 
 from jobhunter.errors import (
     RESERVED_PROBLEM_MEMBERS,
+    CoMemberChanged,
     ErrorCode,
     FencedOut,
     InvariantViolation,
@@ -65,6 +68,8 @@ PROBLEM_MEDIA_TYPE: Final = "application/problem+json"
 UNHANDLED_ALERT_CODE: Final = "api.unhandled_exception"
 # The `detail` of a fenced-out owner's 409 (`domain_problem`).
 PURGE_IN_PROGRESS: Final = "purge_in_progress"
+# The problem member that tells the client to send the same request again (`retryable_conflict`).
+RETRYABLE: Final = "retryable"
 # How long the last-resort handler waits for the alert write; a database that does not answer is no reason to
 # hold the 500 back for longer.
 ALERT_PERSIST_TIMEOUT_S: Final = 5.0
@@ -162,12 +167,25 @@ def as_problem(exc: Problem | Refusal) -> Problem:
     return exc if isinstance(exc, Problem) else problem_of(exc)
 
 
+def retryable_conflict() -> Problem:
+    """409 `conflict_state` with `retryable: true`: a concurrent change the same request may outlast."""
+    return Problem(
+        409,
+        "conflict_state",
+        "A concurrent change got in the way",
+        detail="the jobs changed while this request was being applied; send it again",
+        extra={RETRYABLE: True},
+    )
+
+
 def domain_problem(exc: BaseException) -> Problem | None:
     """The problem of a domain error a route meets, or `None` for any other (module docstring)."""
     if isinstance(exc, LookupError) and not isinstance(exc, KeyError | IndexError):
         return Problem(404, "not_found", "Not found")
     if isinstance(exc, FencedOut):
         return Problem(409, "conflict_state", "A purge is in progress", detail=PURGE_IN_PROGRESS)
+    if isinstance(exc, CoMemberChanged):  # before the `InvariantViolation` it is
+        return retryable_conflict()
     if isinstance(exc, InvariantViolation | TransitionConflict):
         return Problem(409, "conflict_state", "The current state does not allow this")
     return None

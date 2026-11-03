@@ -8,7 +8,8 @@
   the member's deferred target `pending` with `override = 'individual'` at the request's time; the flag of a
   member whose target is not deferred too. A refusal is the score-now problem of its code.
 - `POST /api/duplicate-groups/{group_id}/confirm` → 202 `{job_id}`: every other member merged into the
-  representative, the group dissolved by the last merge.
+  representative, the group dissolved by the last merge. A member under a purge fence is 409
+  `conflict_state` with `detail = "purge_in_progress"`, and nothing is merged.
 
 Each write bumps the ranking generation exactly once. The clock is injected
 (`jobhunter.api.routes.groups.utcnow`), far from the database's own. Every datum is invented.
@@ -33,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from tests.support.collect import JobWithPostings
 from tests.support.groups import FULL_TEXT, canonical_job
 from tests.support.jobs_list import Card, seed_cards
+from tests.support.scoring import fence_jobs
 from tests.support.settings import generation
 
 pytestmark = pytest.mark.integration
@@ -315,3 +317,22 @@ async def test_confirm_merges_the_members_into_the_representative(
     r = await logged_in_client.post(f"/api/duplicate-groups/{group}/confirm")
     assert status_code(r) == (409, "conflict_state")
     assert await generation(engine) == before + 1
+
+
+async def test_confirm_of_a_group_with_a_fenced_member_is_409_purge_in_progress(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int
+) -> None:
+    _, (a,), group = await grouped(engine, 1)
+    async with engine.begin() as c:
+        await fence_jobs(c, a)  # a purge of the member is under way
+    before = await generation(engine)
+    r = await logged_in_client.post(f"/api/duplicate-groups/{group}/confirm")
+    assert status_code(r) == (409, "conflict_state"), r.text
+    assert r.json()["detail"] == "purge_in_progress" and "retryable" not in r.json()
+    assert await rows(engine, EVENTS) == [] and await generation(engine) == before
+    assert await scalar(engine, "SELECT merged_into_job_id FROM jobs WHERE id = :j", j=a) is None
+    assert await scalar(engine, "SELECT status FROM duplicate_groups WHERE id = :g", g=group) == "active"
+    assert (await rows(engine, TARGET, j=a))[0].state == "deferred_duplicate"
+    assert (
+        await scalar(engine, "SELECT count(*) FROM duplicate_group_members WHERE group_id = :g", g=group) == 2
+    )

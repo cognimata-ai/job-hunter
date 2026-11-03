@@ -27,11 +27,11 @@ group's membership); `resolve_conflict(separate)` changes nothing the list shows
   `merge.resolve_conflict`, whose return is the conflict's status after the resolution, read under its row
   lock before the bump.
 
-The errors: `merge.CoMemberChanged` (a read-then-lock round whose job set changed under its lock, having
-written nothing) is the retryable 409 (`api.retry.retryable_conflict`), checked before
-`api.errors.domain_problem`, which answers the others: a `LookupError` (an unknown group, conflict or member)
-404 `not_found`, an `InvariantViolation` or `TransitionConflict` 409 `conflict_state`, a `FencedOut` (a
-member under a purge fence) 409 `conflict_state` with `detail = "purge_in_progress"`. Their messages, which
+The errors are `api.errors.domain_problem`'s: an `errors.CoMemberChanged` (a read-then-lock round whose job
+set changed under its lock, having written nothing) the retryable 409 (`api.errors.retryable_conflict`), a
+`LookupError` (an unknown group, conflict or member) 404 `not_found`, another `InvariantViolation` or a
+`TransitionConflict` 409 `conflict_state`, a `FencedOut` (a member under a purge fence) 409 `conflict_state`
+with `detail = "purge_in_progress"`. Their messages, which
 name ids, stay out of the body. `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.groups.utcnow`.
 """
@@ -46,13 +46,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from jobhunter.api.deps import get_engine, require_session
 from jobhunter.api.errors import Problem, domain_problem
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
-from jobhunter.api.retry import retryable_conflict, with_deadlock_retry
+from jobhunter.api.retry import with_deadlock_retry
 from jobhunter.api.routes.targets import refused_problem
 from jobhunter.clock import utcnow
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.sql import q
 from jobhunter.dedup import groups, merge
-from jobhunter.dedup.merge import CoMemberChanged, ResolvedStatus
+from jobhunter.dedup.merge import ResolvedStatus
 from jobhunter.errors import DomainError
 from jobhunter.jobs.groups import GroupOut, group_view
 from jobhunter.scoring import targets
@@ -116,19 +116,12 @@ class ConflictResolvedOut(BaseModel):
     status: ResolvedStatus
 
 
-def _problem(exc: DomainError | LookupError) -> Problem | None:
-    """The problem of a domain error (module docstring): a changed job set first, then `domain_problem`."""
-    if isinstance(exc, CoMemberChanged):
-        return retryable_conflict()
-    return domain_problem(exc)
-
-
 async def _write[T](engine: AsyncEngine, work: Callable[[AsyncConnection], Awaitable[T]]) -> T:
     """`work` through `with_deadlock_retry`, its domain errors answered as problems."""
     try:
         return await with_deadlock_retry(engine, work)
     except (DomainError, LookupError) as exc:
-        if (problem := _problem(exc)) is None:
+        if (problem := domain_problem(exc)) is None:
             raise
         raise problem from None
 
