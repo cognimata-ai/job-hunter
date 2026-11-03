@@ -2,8 +2,10 @@
 and 15; plan M4 Task 13).
 
 - `GET /api/queries` → the live queries by id (`queries.listing.query_list`), each with its flag in the active
-  settings and the aggregates of its coverage cells; `GET /api/queries/stats` → every cell of a live query
-  with its statistics and open gaps (`queries.listing.cell_stats`). Each reads in one read snapshot
+  settings and the aggregates of its planned coverage cells; `GET /api/queries/stats` → every planned cell of
+  a live query with its statistics and open gaps (`queries.listing.cell_stats`). Planned: the planner's
+  selection under the active settings (Ruling T13-b); both descriptions say that the header's open-gap total
+  also counts the gaps of cells no longer planned. Each reads in one read snapshot
   (`db.snapshot.read_snapshot`), a fixed number of statements, no lock.
 - `POST /api/queries` (`{text, lang, proposal_id?, exploration?}`) → 201 `QueryOut`: a new query
   (`queries.authoring.create_query`), not enabled; enabling it is a settings save with its preview (§13.5).
@@ -91,9 +93,14 @@ def _out(row: authoring.QueryRow) -> QueryOut:
 
 @router.get("", response_model=list[QueryListOut])
 async def list_queries(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> list[QueryListOut]:
-    """The live queries by id, each with whether the active settings enable it and the coverage of its cells:
-    how many, the oldest coverage of its paid cells, their open gaps, their mean yield, whether one is too
-    broad, and JSearch's refresh cadence."""
+    """The live queries by id, each with whether the active settings enable it and the coverage of its planned
+    cells: how many, the oldest coverage of its locations, their open gaps, their mean yield, whether one is
+    too broad, and JSearch's refresh cadence.
+
+    A query's planned cells are those the next run would search while the query is enabled: its cells of the
+    enabled sources at the scope's locations. Cells no longer planned (a location removed from the scope, a
+    source switched off, a query disabled or edited) are not counted here, while the open-gap total of the
+    status header still counts their open gaps."""
     now = utcnow()
     async with read_snapshot(engine) as conn:
         return await listing.query_list(conn, now=now)
@@ -101,9 +108,14 @@ async def list_queries(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> l
 
 @router.get("/stats", response_model=list[CellStatsOut])
 async def query_cell_stats(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> list[CellStatsOut]:
-    """Every coverage cell of a live query, by query, source, instance and place: its coverage, its yield,
-    its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh cadence
-    for a JSearch cell."""
+    """Every planned coverage cell of a live query, by query, source, instance and place: its coverage, its
+    yield, its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh
+    cadence for a JSearch cell.
+
+    A planned cell is one the next run would search: a cell of an enabled query, of an enabled source, at one
+    of the scope's locations. Cells no longer planned (a location removed from the scope, a source switched
+    off, a query disabled or edited) are not listed, while the open-gap total of the status header still
+    counts their open gaps."""
     now = utcnow()
     async with read_snapshot(engine) as conn:
         return await listing.cell_stats(conn, now=now)

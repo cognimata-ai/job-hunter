@@ -755,9 +755,14 @@ export interface paths {
         };
         /**
          * List Queries
-         * @description The live queries by id, each with whether the active settings enable it and the coverage of its cells:
-         *     how many, the oldest coverage of its paid cells, their open gaps, their mean yield, whether one is too
-         *     broad, and JSearch's refresh cadence.
+         * @description The live queries by id, each with whether the active settings enable it and the coverage of its planned
+         *     cells: how many, the oldest coverage of its locations, their open gaps, their mean yield, whether one is
+         *     too broad, and JSearch's refresh cadence.
+         *
+         *     A query's planned cells are those the next run would search while the query is enabled: its cells of the
+         *     enabled sources at the scope's locations. Cells no longer planned (a location removed from the scope, a
+         *     source switched off, a query disabled or edited) are not counted here, while the open-gap total of the
+         *     status header still counts their open gaps.
          */
         get: operations["list_queries_api_queries_get"];
         put?: never;
@@ -781,9 +786,14 @@ export interface paths {
         };
         /**
          * Query Cell Stats
-         * @description Every coverage cell of a live query, by query, source, instance and place: its coverage, its yield,
-         *     its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh cadence
-         *     for a JSearch cell.
+         * @description Every planned coverage cell of a live query, by query, source, instance and place: its coverage, its
+         *     yield, its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh
+         *     cadence for a JSearch cell.
+         *
+         *     A planned cell is one the next run would search: a cell of an enabled query, of an enabled source, at one
+         *     of the scope's locations. Cells no longer planned (a location removed from the scope, a source switched
+         *     off, a query disabled or edited) are not listed, while the open-gap total of the status header still
+         *     counts their open gaps.
          */
         get: operations["query_cell_stats_api_queries_stats_get"];
         put?: never;
@@ -1629,7 +1639,8 @@ export interface components {
         };
         /**
          * CellStatsOut
-         * @description A coverage cell of a live query (one source instance, one query, one place) and its statistics.
+         * @description A planned coverage cell of a live query (one source instance, one query, one place) and its
+         *     statistics.
          */
         CellStatsOut: {
             /**
@@ -3119,12 +3130,13 @@ export interface components {
         };
         /**
          * QueryListOut
-         * @description A live query, whether the active settings enable it, and the coverage of its cells.
+         * @description A live query, whether the active settings enable it, and the coverage of its planned cells: while it is
+         *     enabled, its cells of the enabled sources at the scope's locations.
          */
         QueryListOut: {
             /**
              * Cells
-             * @description Its coverage cells
+             * @description Its planned coverage cells; none while it is disabled
              */
             cells: number;
             /**
@@ -3148,12 +3160,12 @@ export interface components {
             lang: "de" | "en";
             /**
              * Last Covered At
-             * @description The oldest coverage frontier of its paid cells (JSearch, SerpApi); null when one of them was never covered, or without a paid cell
+             * @description The oldest coverage of its planned locations, a location being covered as of the newer frontier of its JSearch cell and its SerpApi fallback cell; null when a planned location is covered by neither, or without a planned JSearch or SerpApi cell
              */
             last_covered_at: string | null;
             /**
              * Open Gaps
-             * @description The open coverage gaps of its cells
+             * @description The open coverage gaps of its planned cells
              */
             open_gaps: number;
             /**
@@ -3165,19 +3177,19 @@ export interface components {
             proposal_id: number | null;
             /**
              * Refresh Cadence Days
-             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null without a JSearch cell
+             * @description How many days JSearch takes to refresh each paid cell under the active settings, as the settings preview projects it; null without a planned JSearch cell
              */
             refresh_cadence_days: number | null;
             /** Text */
             text: string;
             /**
              * Too Broad
-             * @description One of its cells is too broad
+             * @description One of its planned cells is too broad
              */
             too_broad: boolean;
             /**
              * Yield Ema
-             * @description The mean yield of its cells; null without a cell
+             * @description The mean yield of its planned cells; null without one
              */
             yield_ema: number | null;
         };
