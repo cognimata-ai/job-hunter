@@ -1,0 +1,34 @@
+# Dev and CI only, never in prod: the data of the E2E stack (M4 Task 18), layered last over the dev stack and
+# both fake overlays (one project, jobhunter-dev):
+#
+#   docker compose --env-file deploy/images.lock -f deploy/compose.dev.yaml -f deploy/compose.fixtures.yaml \
+#     -f deploy/compose.fakellm.yaml -f deploy/compose.e2e.yaml up -d --build --wait
+#
+# - embedder: the image's `fake` target (embedder/Dockerfile: no model stage, so its build downloads no model),
+#   tagged apart from the real image, serving embedder/app.py's FakeModel (EMBEDDER_FAKE): deterministic test
+#   vectors under the lock's model_id, which the api's health and readiness checks accept. app.py refuses it
+#   unless JOBHUNTER_ENV is dev or test (exit 78, fake_embedder_outside_dev).
+# - worker: the fake LLM's two stack controls (llm/fake.py), both on the worker's /tmp tmpfs (compose.dev.yaml's
+#   x-app), written by the E2E setup and gone with the container:
+#   - JOBHUNTER_FAKE_BATCH_SCRIPT: a JSON file of BatchScript fields, read by the fake Batches API at each create;
+#     no file is the default script. E17 writes {"create": "ambiguous_not_created", "listing": "empty"} there
+#     to quarantine a batch (Task 34); a malformed file fails that create, never falling back to the default.
+#   - JOBHUNTER_FAKE_LLM_KEYED_DIR: a directory of standing keyed answers (<purpose>_<id>_<round>.sse, the
+#     key's file name `fake.keyed_answer_filename`), read at each message try; the E2E setup creates it and
+#     writes E9's grounded answers there (Task 32).
+#   The startup assertion fake_mode_in_prod refuses both in prod (exit 78), as it refuses the fake modes.
+#
+# The smoke scripts and the visual checks run on this four-file stack too: without a script file every batch
+# follows the default script (one in-progress poll, then every item succeeded).
+services:
+  embedder:
+    image: jobhunter-embedder:e2e
+    build:
+      target: fake
+    environment:
+      EMBEDDER_FAKE: "1"
+      JOBHUNTER_ENV: dev
+  worker:
+    environment:
+      JOBHUNTER_FAKE_BATCH_SCRIPT: /tmp/fake-batch-script.json
+      JOBHUNTER_FAKE_LLM_KEYED_DIR: /tmp/fake-keyed
