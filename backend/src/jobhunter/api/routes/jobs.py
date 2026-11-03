@@ -32,15 +32,23 @@ order, a location id that is no gazetteer id, a NUL), is 422 `validation_failed`
   cursor of another job's history, of another list, or whose position has another shape is 400
   `invalid_cursor`.
 
+- `PUT /api/jobs/{job_id}/actions` (`jobs.actions.ActionsIn`) → `jobs.actions.ActionsOut{job, members}`
+  (`jobs.actions.put_actions`, Task 7, B11) in one transaction at the request's time: the user's actions on
+  the job, and with `apply_to_group` its group members' `saved`, `applied` and `hidden`; 404 as above for a
+  job without a detail (a merge that held the job meanwhile included); 422 for a body `ActionsIn` refuses.
+  No `Idempotency-Key` (§14.1 keys none of these routes): a repeated write leaves the same values, only
+  `updated_at` and the ranking generation move.
+
 The `{job_id}` routes are declared after `/facets`, which would otherwise be a `job_id` that is no integer
 (422). A job without a detail (`jobs.detail.JobGone`: unknown, synthetic, fenced, without a current
-revision, or merged) is 404 `not_found` on both, with the member `merged_into_job_id`, the survivor of a
+revision, or merged) is 404 `not_found` on each, with the member `merged_into_job_id`, the survivor of a
 merged job and `null` for the others (B28); any other domain error is `api.errors.domain_problem`'s. A
 `job_id` that is no integer from 1 to 2^63 - 1 is 422.
 
-All depend on `require_session`; none changes state, so none takes `X-JH-Request` or a body. The outbound
-links are never logged (`jobs.links`). `utcnow` is a name of this module, so a test injects the clock by
-patching `jobhunter.api.routes.jobs.utcnow`.
+All depend on `require_session`. The GET routes change no state, so none takes `X-JH-Request` or a body;
+the PUT is checked for `Origin` and `X-JH-Request` by the edge (403) and its body for the edge's ceiling
+(413). The outbound links and the note are never logged (`jobs.links`, `jobs.actions`). `utcnow` is a name
+of this module, so a test injects the clock by patching `jobhunter.api.routes.jobs.utcnow`.
 """
 
 from datetime import UTC, date, datetime, timedelta
@@ -55,7 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import Problem, domain_problem
 from jobhunter.api.models import clean_text
-from jobhunter.api.openapi import SESSION_RESPONSES
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
     JOB_HISTORY_SORT,
     JobCursor,
@@ -73,6 +81,7 @@ from jobhunter.db.ranking import generation
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.errors import DomainError
 from jobhunter.jobs import history
+from jobhunter.jobs.actions import ActionsIn, ActionsOut, put_actions
 from jobhunter.jobs.cards import JobCardOut, build_cards
 from jobhunter.jobs.detail import HISTORY_LIMIT, JobDetailOut, JobGone, ensure_job, job_detail
 from jobhunter.jobs.facets import FacetsOut, facets
@@ -454,3 +463,36 @@ async def get_job_history(
             raise
         raise problem from None
     return history.HistoryPageOut(items=items, next_cursor=_history_cursor(job_id, position, key))
+
+
+@router.put(
+    "/api/jobs/{job_id}/actions",
+    response_model=ActionsOut,
+    responses={
+        **_GONE_RESPONSES,
+        422: {
+            "description": "A `job_id` that is no integer from 1 to 2^63 - 1, or an invalid body: an unknown "
+            "field, none of `seen`, `saved`, `applied`, `hidden`, `note` and `seen_on_open`, `seen_on_open` "
+            "with `seen`, or a note over 2,000 characters or holding a NUL or a lone surrogate "
+            "(`validation_failed`)"
+        },
+        **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
+    },
+)
+async def put_job_actions(
+    job_id: JobId, body: ActionsIn, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> ActionsOut:
+    """Mark the job seen, saved, applied or hidden, clear a mark or edit its note, and with `apply_to_group`
+    write `saved`, `applied` and `hidden` on the other members of its duplicate group; the rows after the
+    write."""
+    now = utcnow()
+    try:
+        async with engine.begin() as conn:
+            written = await put_actions(conn, job_id, body, now=now)
+    except DomainError as exc:
+        # Not `LookupError`: the only one the write can meet is `ranking.bump`'s missing row, a bug (500).
+        if (problem := _domain(exc)) is None:
+            raise
+        raise problem from None
+    return written

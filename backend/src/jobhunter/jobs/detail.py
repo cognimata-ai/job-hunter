@@ -294,7 +294,7 @@ class UserActionsOut(BaseModel):
     saved_at: UtcDatetime | None
     applied_at: UtcDatetime | None
     hidden_at: UtcDatetime | None
-    note: str | None
+    note: str | None = Field(repr=False)  # the user's own text: never in a repr, so never in a traceback
     updated_at: UtcDatetime
 
 

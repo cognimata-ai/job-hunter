@@ -18,6 +18,8 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str]]] = {
     ("get", "/api/jobs/facets"): {"401", "422", "429"},
     ("get", "/api/jobs/{job_id}"): {"401", "404", "422", "429"},
     ("get", "/api/jobs/{job_id}/history"): {"400", "401", "404", "422", "429"},
+    ("put", "/api/jobs/{job_id}/actions"): {"401", "403", "404", "413", "422", "429"},
+    ("delete", "/api/feedback/{feedback_id}"): {"401", "403", "404", "422", "429"},
 }
 
 

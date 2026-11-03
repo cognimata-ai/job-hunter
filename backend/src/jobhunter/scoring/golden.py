@@ -356,6 +356,28 @@ async def record_feedback(
     return Feedback(feedback_id, case_id)
 
 
+_DELETE_FEEDBACK: Final = q("DELETE FROM score_feedback WHERE id = :i RETURNING id")
+
+
+class FeedbackMissing(LookupError):
+    """No `score_feedback` row has the id (its message names the id only)."""
+
+    def __init__(self, feedback_id: int) -> None:
+        super().__init__(f"score_feedback {feedback_id}: no such feedback")
+        self.feedback_id = feedback_id
+
+
+async def delete_feedback(conn: AsyncConnection, feedback_id: int) -> None:
+    """Delete the label or "wrong score" `feedback_id` (`DELETE /api/feedback/{id}`, §14.2) in the caller's
+    transaction: its `score_feedback` row alone. The golden case it upserted stays: the golden set is edited
+    through `/api/golden-cases` (plan M4 Deviation 24), and no foreign key references `score_feedback`, so
+    nothing else changes; the Jobs list does not read it, so the ranking is not bumped. `FeedbackMissing` (a
+    `LookupError`) when there is no such row."""
+    if (await conn.execute(_DELETE_FEEDBACK, {"i": feedback_id})).first() is None:
+        raise FeedbackMissing(feedback_id)
+    log.info("golden_feedback_deleted", feedback_id=feedback_id)
+
+
 # ---- the cases (§14.2 L4978-4979) --------------------------------------------------------------------------
 
 

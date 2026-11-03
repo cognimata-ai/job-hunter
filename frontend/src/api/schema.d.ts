@@ -105,6 +105,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/feedback/{feedback_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Feedback
+         * @description Delete a label or a wrong score (204); the golden case it made stays in the golden set.
+         */
+        delete: operations["delete_feedback_api_feedback__feedback_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/geo/places": {
         parameters: {
             query?: never;
@@ -223,6 +243,28 @@ export interface paths {
          */
         get: operations["get_job_api_jobs__job_id__get"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{job_id}/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Job Actions
+         * @description Mark the job seen, saved, applied or hidden, clear a mark or edit its note, and with `apply_to_group`
+         *     write `saved`, `applied` and `hidden` on the other members of its duplicate group; the rows after the
+         *     write.
+         */
+        put: operations["put_job_actions_api_jobs__job_id__actions_put"];
         post?: never;
         delete?: never;
         options?: never;
@@ -982,6 +1024,50 @@ export interface components {
             acknowledged_at: string;
             /** Id */
             id: number;
+        };
+        /**
+         * ActionsIn
+         * @description The user's actions to write on a job.
+         *
+         *     For each of `seen`, `saved`, `applied` and `hidden`, `true` marks it at the time of the request unless it
+         *     is marked already (the earlier time is kept), `false` clears it, and an absent or null one is left as it
+         *     is. `note` replaces the note: at most 2,000 characters, `""` clears it. `seen_on_open`, which the drawer
+         *     sends when it opens, marks the job seen as `seen: true` does without moving the ranking generation; it
+         *     cannot be combined with `seen`. With `apply_to_group`, `saved`, `applied` and `hidden` are written on the
+         *     other members of the job's active duplicate group too. A body that gives none of `seen`, `saved`,
+         *     `applied`, `hidden`, `note` and `seen_on_open` is refused.
+         */
+        ActionsIn: {
+            /** Applied */
+            applied?: boolean | null;
+            /**
+             * Apply To Group
+             * @default false
+             */
+            apply_to_group: boolean;
+            /** Hidden */
+            hidden?: boolean | null;
+            /** Note */
+            note?: string | null;
+            /** Saved */
+            saved?: boolean | null;
+            /** Seen */
+            seen?: boolean | null;
+            /**
+             * Seen On Open
+             * @default false
+             */
+            seen_on_open: boolean;
+        };
+        /**
+         * ActionsOut
+         * @description The job's actions after the write and, for a write with `apply_to_group`, those of each other member of
+         *     its active duplicate group it wrote, by job id (otherwise none).
+         */
+        ActionsOut: {
+            job: components["schemas"]["UserActionsOut"];
+            /** Members */
+            members: components["schemas"]["UserActionsOut"][];
         };
         /**
          * ActivateIn
@@ -3393,6 +3479,72 @@ export interface operations {
             };
         };
     };
+    delete_feedback_api_feedback__feedback_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a label or a wrong score */
+                feedback_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such label or wrong score (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     search_places_api_geo_places_get: {
         parameters: {
             query?: {
@@ -3913,6 +4065,87 @@ export interface operations {
                 };
             };
             /** @description A `job_id` that is no integer from 1 to 2^63 - 1 (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_job_actions_api_jobs__job_id__actions_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ActionsIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionsOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such job, or one without a detail: a synthetic, fenced or merged job (`not_found`, with `merged_into_job_id`: a merged job's survivor, else null) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `job_id` that is no integer from 1 to 2^63 - 1, or an invalid body: an unknown field, none of `seen`, `saved`, `applied`, `hidden`, `note` and `seen_on_open`, `seen_on_open` with `seen`, or a note over 2,000 characters or holding a NUL or a lone surrogate (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;

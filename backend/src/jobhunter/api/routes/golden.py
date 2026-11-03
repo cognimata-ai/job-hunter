@@ -18,6 +18,9 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
   canary is 422 `validation_failed` (L4632), an unknown case 404.
 - `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
   deletion manifest is M5's): 404 for no such case, 409 `conflict_state` while a running eval run includes it.
+- `DELETE /api/feedback/{feedback_id}` → 204 (`golden.delete_feedback`, plan M4 Task 7): the `score_feedback`
+  row alone; the golden case it upserted stays (Deviation 24). 404 `not_found` for no such feedback
+  (`golden.FeedbackMissing` through `api.errors.domain_problem`).
 
 The domain functions log ids, kinds, labels and flags, never a comment. `utcnow` is a name of this module, so
 a test injects the clock by patching `jobhunter.api.routes.golden.utcnow`.
@@ -31,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.responses import Response
 
 from jobhunter.api.deps import get_config, get_engine, require_session
-from jobhunter.api.errors import Problem
+from jobhunter.api.errors import Problem, domain_problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api.pagination import (
@@ -116,6 +119,7 @@ class FlagsIn(BaseModel):
 
 JobId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a job")]
 CaseId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a golden case")]
+FeedbackId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a label or a wrong score")]
 _NOT_FOUND: Final[dict[int | str, dict[str, Any]]] = {
     404: {"description": "No such golden case (`not_found`)"}
 }
@@ -233,4 +237,28 @@ async def delete_golden_case(
     async with engine.begin() as conn:
         if not await golden.delete_case_unless_running(conn, case_id):
             raise Problem(404, "not_found", "Golden case not found")
+    return Response(status_code=204)
+
+
+@router.delete(
+    "/api/feedback/{feedback_id}",
+    status_code=204,
+    response_class=Response,
+    responses={
+        404: {"description": "No such label or wrong score (`not_found`)"},
+        422: {"description": "Invalid path (`validation_failed`)"},
+        **CSRF_RESPONSES,
+    },
+)
+async def delete_feedback(
+    feedback_id: FeedbackId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> Response:
+    """Delete a label or a wrong score (204); the golden case it made stays in the golden set."""
+    try:
+        async with engine.begin() as conn:
+            await golden.delete_feedback(conn, feedback_id)
+    except LookupError as exc:
+        if (problem := domain_problem(exc)) is None:
+            raise
+        raise problem from None
     return Response(status_code=204)
