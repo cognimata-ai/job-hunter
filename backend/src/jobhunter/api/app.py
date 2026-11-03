@@ -48,6 +48,8 @@ from jobhunter.api.openapi import JobHunterAPI
 from jobhunter.api.routes import (
     alerts,
     auth,
+    cycles,
+    docs,
     geo,
     golden,
     groups,
@@ -193,7 +195,8 @@ def create_app(
         version=__version__,
         lifespan=_lifespan if cfg is None else None,
         exception_handlers=exception_handlers(),
-        # No interactive docs and no served schema: the export writes `openapi.json` (§14.5).
+        # No interactive docs and no unauthenticated schema: the export writes `openapi.json` (§14.5), and
+        # `routes.docs` serves the document to a session only (§14.2, `GET /api/openapi.json`).
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -219,6 +222,8 @@ def create_app(
     api.include_router(golden.router)
     api.include_router(labelling.router)
     api.include_router(alerts.router)
+    api.include_router(cycles.router)
+    api.include_router(docs.router)
     for router in extra_routers:
         api.include_router(router)
     api.state.rate_limiter = SessionRateLimiter()

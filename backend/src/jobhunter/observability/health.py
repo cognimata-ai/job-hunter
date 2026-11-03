@@ -28,7 +28,8 @@ their `run_age_state`, the queue depths, the open alerts (it refreshes `ALERTS_O
 window of each provider, the LLM spend of the month (`llm_spend`, plan Task 16), the score lane
 (`scoring_health`, M3 Task 18), disk and database sizes, the versions and the embedder's health (with its
 model id) as the readiness check read it. Run ages are reported, never readiness gates. `RunOut` is the api's
-view of a run row, shared with `POST /api/runs`.
+view of a run row, shared with `POST /api/runs` and the run lists (`observability.lists`); every select of one
+names `RUN_COLUMNS`, its fields.
 
 **The score lane** (`scoring`, §17.5 L5552 "oldest pending target age", M3 Task 18), read without a lock (a
 save holding `active_config FOR UPDATE` never holds the page): the running cycle's id, the pause guard's
@@ -239,11 +240,6 @@ DISK_PATH: Final = "/"
 # The job statuses every known queue reports, 0 included; any other status is reported when it has jobs.
 DEPTH_STATUSES: Final = ("todo", "doing")
 
-# `runs_recent` serves it.
-_LAST_RUN: Final = q(
-    "SELECT id, kind, trigger, status, scheduled_slot, include_paid, attempt_no, queued_at, started_at, "
-    "finished_at FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1"
-)
 _RUN_FRESHNESS: Final = q(
     "SELECT EXISTS (SELECT 1 FROM runs) AS any_run, "
     "(SELECT max(finished_at) FROM runs WHERE status IN ('succeeded', 'partial')) AS last_success_at, "
@@ -263,12 +259,15 @@ _ACTIVE_PAYLOAD: Final = q(
 
 
 class RunOut(BaseModel):
-    """A run as the api shows it (`runs` row, §7.6); its times in UTC."""
+    """A run as the api shows it (`runs` row, §7.6); its times in UTC. `status_reason` is why it has its
+    status, as a code (the first partial cause, the failed invariant, `bug`, `resume_exhausted`,
+    `orphaned_queue`, …), null when it has none."""
 
     id: int
     kind: str
     trigger: str
     status: str
+    status_reason: str | None
     scheduled_slot: datetime | None
     include_paid: bool
     attempt_no: int
@@ -285,6 +284,12 @@ class RunOut(BaseModel):
     def of(cls, run: object) -> "RunOut":
         """The `RunOut` of anything with the run's columns as attributes (a `RunRow`, a result row)."""
         return cls.model_validate(run, from_attributes=True)
+
+
+# The `runs` columns a `RunOut` is built from, `status_reason` included (D5): every select of one names them.
+RUN_COLUMNS: Final = ", ".join(RunOut.model_fields)
+# `runs_recent` serves it.
+_LAST_RUN: Final = q(f"SELECT {RUN_COLUMNS} FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1")  # noqa: S608
 
 
 class ReadyState(BaseModel):

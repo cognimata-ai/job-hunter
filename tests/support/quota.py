@@ -1,14 +1,23 @@
 """Quota test helpers: the seeded settings (Task 7) and, for the ledger (Task 8), account reads, a seeded run
-settings view and a window written as it is."""
+settings view, a window written as it is and (M4 Task 10) a ledger entry written as it is."""
 
 import json
+import os
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from importlib import resources
-from typing import Any, Final
+from typing import Any, Final, Literal
 
-from jobhunter.quota.windows import AccountObservation, Insert, Window, apply_changes, bootstrap_window
+from jobhunter.db.sql import q
+from jobhunter.quota.windows import (
+    AccountObservation,
+    Insert,
+    Provider,
+    Window,
+    apply_changes,
+    bootstrap_window,
+)
 from jobhunter.run_settings import QuotaSettings, RunSettings, SourcesEnabled, scope_from_payload
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -85,3 +94,40 @@ def jsearch_window(now: datetime, *, limit: int, reserve: int, tokens: int, inte
         capacity=max(Decimal(tokens), Decimal(1)),
         tokens_at=now,
     )
+
+
+LedgerState = Literal["reserved", "dispatched", "billed", "not_billed", "ambiguous"]  # the `state` CHECK
+_SETTLED: Final = frozenset({"billed", "not_billed", "ambiguous"})
+_LEDGER_REQUEST: Final = q(
+    "INSERT INTO quota_ledger (provider, window_start, kind, request_class, request_key, attempt_seq, units, "
+    "state, evidence, per_run_cap, dispatched_at, settled_at) VALUES (:p, :ws, 'request', 'normal', :key, 1, "
+    ":units, :state, :evidence, 1, CASE WHEN :dispatched THEN now() END, CASE WHEN :settled THEN now() END)"
+)
+_LEDGER_ADJUSTMENT: Final = q(
+    "INSERT INTO quota_ledger (provider, window_start, kind, units, evidence) "
+    "VALUES (:p, :ws, 'adjustment', :units, 'provider_remaining')"
+)
+
+
+async def insert_ledger_entry(
+    engine: AsyncEngine, provider: Provider, window_start: datetime, *, units: int, state: LedgerState | None
+) -> None:
+    """A ledger row of the window `(provider, window_start)`, written as it is (committed): a normal-class
+    `request` of a fresh key in `state` with the columns that state needs (`not_billed` as never dispatched),
+    or an `adjustment` when `state` is `None`."""
+    params: dict[str, object] = {"p": provider, "ws": window_start, "units": units}
+    async with engine.begin() as conn:
+        if state is None:
+            await conn.execute(_LEDGER_ADJUSTMENT, params)
+            return
+        await conn.execute(
+            _LEDGER_REQUEST,
+            {
+                **params,
+                "key": os.urandom(32),
+                "state": state,
+                "evidence": "never_dispatched" if state == "not_billed" else None,
+                "dispatched": state not in {"reserved", "not_billed"},
+                "settled": state in _SETTLED,
+            },
+        )

@@ -4,6 +4,26 @@
  */
 
 export interface paths {
+    "/api/alerts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Alerts
+         * @description The alerts, newest first, with their status, keyset-paged (§14.3).
+         */
+        get: operations["list_alerts_api_alerts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alerts/{alert_id}/ack": {
         parameters: {
             query?: never;
@@ -753,13 +773,57 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List Runs
+         * @description The runs, newest first, keyset-paged (§14.3).
+         */
+        get: operations["list_runs_api_runs_get"];
         put?: never;
         /**
          * Run Now
          * @description 202 with the active collection (`created=false`) or a new manual one (`created=true`).
          */
         post: operations["run_now_api_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Run
+         * @description A run with its report and the partial causes the report names.
+         */
+        get: operations["get_run_api_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/score-cycles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Score Cycles
+         * @description The score cycles, newest first, keyset-paged (§14.3).
+         */
+        get: operations["list_score_cycles_api_score_cycles_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -965,6 +1029,27 @@ export interface paths {
          *     versions, and the embedder's health and model id.
          */
         get: operations["get_system_health_api_system_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/quota": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Quota
+         * @description Each quota provider's current window with its counted usage, its reserved, ambiguous and adjustment
+         *     units and its bucket; null for a provider without a current window.
+         */
+        get: operations["get_quota_api_system_quota_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1232,6 +1317,49 @@ export interface components {
              */
             version: number;
         };
+        /**
+         * AlertOut
+         * @description An alert and its status: `resolved` once it is resolved, else `acknowledged` once it is acknowledged,
+         *     else `open`. A client shows it by its `code`; `message` is an untranslated fallback.
+         */
+        AlertOut: {
+            /** Acknowledged At */
+            acknowledged_at: string | null;
+            /** Code */
+            code: string;
+            /** Context */
+            context: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /**
+             * First At
+             * Format: date-time
+             */
+            first_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Last At
+             * Format: date-time
+             */
+            last_at: string;
+            /** Message */
+            message: string;
+            /** Occurrences */
+            occurrences: number;
+            /** Resolved At */
+            resolved_at: string | null;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "info" | "warn" | "critical";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "open" | "acknowledged" | "resolved";
+        };
         /** AlertsOpen */
         AlertsOpen: {
             /** Critical */
@@ -1240,6 +1368,13 @@ export interface components {
             info: number;
             /** Warn */
             warn: number;
+        };
+        /** AlertsPageOut */
+        AlertsPageOut: {
+            /** Items */
+            items: components["schemas"]["AlertOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /** BucketOut */
         BucketOut: {
@@ -2527,6 +2662,42 @@ export interface components {
             text: string;
         };
         /**
+         * QuotaDetailOut
+         * @description A provider's current quota window and its ledger: `used` is the window's counted usage (the attempts
+         *     that count and every adjustment), `reserved` the units reserved or in flight, `ambiguous` the units of
+         *     attempts that settled ambiguous, `adjustments` the units of the adjustments; `tokens` is the window's
+         *     bucket as stored.
+         */
+        QuotaDetailOut: {
+            /** Adjustments */
+            adjustments: number;
+            /** Ambiguous */
+            ambiguous: number;
+            /** Limit Units */
+            limit_units: number;
+            /** Reserved */
+            reserved: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "validated" | "extrapolated_unvalidated" | "exhausted_until_reset";
+            /** Tokens */
+            tokens: number;
+            /** Used */
+            used: number;
+            /**
+             * Window End
+             * Format: date-time
+             */
+            window_end: string;
+            /**
+             * Window Start
+             * Format: date-time
+             */
+            window_start: string;
+        };
+        /**
          * QuotaOut
          * @description A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket.
          */
@@ -2712,6 +2883,19 @@ export interface components {
             version: string;
         };
         /**
+         * RunDetailOut
+         * @description A run, its stored report (null while none is stored) and the partial causes the report names.
+         */
+        RunDetailOut: {
+            /** Partial Causes */
+            partial_causes: ("fetch_failed" | "fetch_ambiguous" | "source_breaker_open" | "source_auth_failed" | "source_contract_broken" | "source_not_found" | "awaiting_embedding" | "raw_item_rejected")[];
+            /** Report */
+            report: {
+                [key: string]: components["schemas"]["JsonValue"];
+            } | null;
+            run: components["schemas"]["RunOut"];
+        };
+        /**
          * RunNowIn
          * @description `include_paid` only: an unknown member is refused (422 `validation_failed`), as by every other body.
          */
@@ -2727,7 +2911,9 @@ export interface components {
         };
         /**
          * RunOut
-         * @description A run as the api shows it (`runs` row, §7.6); its times in UTC.
+         * @description A run as the api shows it (`runs` row, §7.6); its times in UTC. `status_reason` is why it has its
+         *     status, as a code (the first partial cause, the failed invariant, `bug`, `resume_exhausted`,
+         *     `orphaned_queue`, …), null when it has none.
          */
         RunOut: {
             /** Attempt No */
@@ -2751,8 +2937,17 @@ export interface components {
             started_at: string | null;
             /** Status */
             status: string;
+            /** Status Reason */
+            status_reason: string | null;
             /** Trigger */
             trigger: string;
+        };
+        /** RunsPageOut */
+        RunsPageOut: {
+            /** Items */
+            items: components["schemas"]["RunOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /** SalaryOut */
         SalaryOut: {
@@ -2820,8 +3015,51 @@ export interface components {
             /** Transport */
             transport: string | null;
         };
-        /** ScoreCycleOut */
+        /**
+         * ScoreCycleOut
+         * @description A score cycle: its trigger and status (`status_reason` says why it failed), its tuple, its admission
+         *     size and the admitted targets per lane, the counted spend of its attempts in USD, its report (null while
+         *     it runs) and its times in UTC.
+         */
         ScoreCycleOut: {
+            /** Admission Size */
+            admission_size: number;
+            /** Admitted */
+            admitted: {
+                [key: string]: number;
+            };
+            /** Finished At */
+            finished_at: string | null;
+            /** Id */
+            id: number;
+            /** Llm Tuple Id */
+            llm_tuple_id: number;
+            /** Report */
+            report: {
+                [key: string]: components["schemas"]["JsonValue"];
+            } | null;
+            /** Spent Usd */
+            spent_usd: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "completed" | "failed";
+            /** Status Reason */
+            status_reason: string | null;
+            /**
+             * Trigger
+             * @enum {string}
+             */
+            trigger: "periodic" | "score_now" | "batch_followup" | "manual";
+        };
+        /** ScoreCycleQueuedOut */
+        ScoreCycleQueuedOut: {
             /**
              * Queued
              * @description False when a manual cycle job already waits: it serves this request
@@ -2832,6 +3070,13 @@ export interface components {
              * @description Why the cycle would start nothing now: the score lane's pause reason, or `no_pending` without an admissible target; null otherwise
              */
             reason: ("reservation_bound_violated" | "auth_failed" | "cap_reached" | "global_fence" | "schema_unverified") | "no_pending" | null;
+        };
+        /** ScoreCyclesPageOut */
+        ScoreCyclesPageOut: {
+            /** Items */
+            items: components["schemas"]["ScoreCycleOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /**
          * ScoreNowIn
@@ -3384,6 +3629,68 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_alerts_api_alerts_get: {
+        parameters: {
+            query?: {
+                /** @description Only the alerts of this status */
+                status?: ("open" | "acknowledged" | "resolved") | null;
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     acknowledge_api_alerts__alert_id__ack_post: {
         parameters: {
             query?: never;
@@ -6309,6 +6616,68 @@ export interface operations {
             };
         };
     };
+    list_runs_api_runs_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+                /** @description Only the runs of this status */
+                status?: ("queued" | "running" | "succeeded" | "partial" | "failed" | "failed_invariant" | "cancelled" | "missed" | "skipped_overlap") | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunsPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue for these filters (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     run_now_api_runs_post: {
         parameters: {
             query?: never;
@@ -6379,6 +6748,125 @@ export interface operations {
                 };
             };
             /** @description Invalid body, or the key was used for another request (`idempotency_key_reused`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_run_api_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a run */
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunDetailOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such run (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_score_cycles_api_score_cycles_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScoreCyclesPageOut"];
+                };
+            };
+            /** @description A cursor this list did not issue (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Request validation failed (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -7085,6 +7573,46 @@ export interface operations {
             };
         };
     };
+    get_quota_api_system_quota_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: components["schemas"]["QuotaDetailOut"] | null;
+                    };
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     request_score_cycle_api_system_score_cycle_post: {
         parameters: {
             query?: never;
@@ -7102,7 +7630,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ScoreCycleOut"];
+                    "application/json": components["schemas"]["ScoreCycleQueuedOut"];
                 };
             };
             /** @description Idempotency-Key missing or malformed (`idempotency_key_required`) */

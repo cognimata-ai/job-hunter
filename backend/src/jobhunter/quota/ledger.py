@@ -176,9 +176,12 @@ _ENTRY = q(
     "SELECT provider, window_start, request_class, units, state, run_id, run_attempt_no, fetch_request_id, "
     "created_at, dispatched_at FROM quota_ledger WHERE id = :id AND kind = 'request'"
 )
+# The ledger rows a window's counted usage sums (§6.7): the `COUNTED` attempts and every adjustment, with the
+# bind `counted` (`_counted()`). `observability.lists` sums the same rows for every provider at once.
+COUNTED_USAGE_SQL: Final = "(kind = 'adjustment' OR state = ANY(:counted))"
 _USED = q(
-    "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND window_start = :ws "
-    "AND (kind = 'adjustment' OR state = ANY(:counted))"
+    "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND window_start = :ws "  # noqa: S608
+    f"AND {COUNTED_USAGE_SQL}"
 )
 _RUN_NORMAL = q(
     "SELECT COALESCE(SUM(units), 0) FROM quota_ledger WHERE provider = :p AND run_id = :run "

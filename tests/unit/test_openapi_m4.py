@@ -33,6 +33,11 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("post", "/api/jobs/{job_id}/unmerge"): GROUP_WRITE,
     ("post", "/api/identity-conflicts/{conflict_id}/resolve"): GROUP_WRITE,
     ("get", "/api/labelling/queue"): {"401", "422", "429"},
+    ("get", "/api/runs"): {"400", "401", "422", "429"},
+    ("get", "/api/runs/{run_id}"): {"401", "404", "422", "429"},
+    ("get", "/api/score-cycles"): {"400", "401", "422", "429"},
+    ("get", "/api/alerts"): {"400", "401", "422", "429"},
+    ("get", "/api/system/quota"): {"401", "429"},
 }
 # What a published description must not cite (Ruling T6-g).
 INTERNAL_CITATION: Final = re.compile(
