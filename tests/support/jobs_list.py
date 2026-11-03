@@ -723,8 +723,10 @@ def offset(point: tuple[float, float], km: float, bearing_deg: float) -> tuple[f
 
 def _bulk_place(i: int) -> tuple[float, float]:
     """Card number `i`'s place: a city of `_CITIES` in turn; of the Berlin cards a third on the centre, a
-    third in the ring 16 to 28 km out (beyond the location filter's inner box, within 30 km), a third in the
-    latitude strip of a 30 km circle but 35 to 80 km east or west (beyond its longitude bound)."""
+    third in the ring 16 to 28 km out (within 30 km; most beyond the 30 km filter's inner box, but about a
+    tenth, those on bearings near a diagonal at 16 to 20 km, inside it and decided by it: 384 of the 4,167
+    ring cards of a 50,000-card seed), a third in the latitude strip of a 30 km circle but 35 to 80 km east
+    or west (beyond its longitude bound)."""
     city = _CITIES[i % len(_CITIES)]
     if city != BERLIN:
         return city

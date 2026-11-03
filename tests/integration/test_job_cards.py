@@ -279,6 +279,42 @@ async def test_an_unreadable_stored_record_is_left_out_and_the_others_stay(
     assert "unreadable" not in repr(log_events())
 
 
+async def test_a_candidates_document_that_is_no_list_is_one_skipped_record(
+    engine: AsyncEngine, active_tuple: int, log_events: Any
+) -> None:
+    """Ruling T5-g: stored candidates that are no list count once, as a knockout document that is no list
+    does, with the same content-free warning; the empty document some writers leave is no record."""
+    (job_id,) = await seed_cards(engine, [scored(20, 25)])
+    record = {
+        "code": "work_permit",
+        "fact_id": "work_permit:de",
+        "comparison": "unmet",
+        "severity": "hard",
+        "binding": True,
+    }
+    result = await result_of(engine, job_id)
+    async with engine.begin() as c:
+        await c.execute(
+            q("UPDATE det_results SET knockouts = :k WHERE llm_result_id = :r", jsonb=["k"]),
+            {"k": [record], "r": result},
+        )
+        await c.execute(
+            q("UPDATE llm_results SET knockout_candidates = :k WHERE id = :r", jsonb=["k"]),
+            {"k": {"unreadable": True}, "r": result},
+        )
+    (card,) = await cards(engine, [job_id])
+    assert [(k.code, k.status, k.profile_value) for k in card.knockouts] == [("work_permit", "unmet", None)]
+    skipped = [e for e in log_events() if e.get("event") == "job_card_records_skipped"]
+    assert [(e["kind"], e["result_id"], e["skipped"]) for e in skipped] == [
+        ("knockout_candidates", result, 1)
+    ]
+    assert "unreadable" not in repr(log_events())
+    await execute(engine, "UPDATE llm_results SET knockout_candidates = '{}' WHERE id = :r", r=result)
+    (empty,) = await cards(engine, [job_id])
+    assert [k.code for k in empty.knockouts] == ["work_permit"]
+    assert len([e for e in log_events() if e.get("event") == "job_card_records_skipped"]) == 1
+
+
 # --- the badges -------------------------------------------------------------------------------------------
 
 

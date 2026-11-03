@@ -209,6 +209,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Job
+         * @description A job's detail in one read snapshot, its history's first page with a signed cursor (module
+         *     docstring).
+         */
+        get: operations["get_job_api_jobs__job_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/jobs/{job_id}/feedback": {
         parameters: {
             query?: never;
@@ -224,6 +245,26 @@ export interface paths {
          *     (201).
          */
         post: operations["record_feedback_api_jobs__job_id__feedback_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/jobs/{job_id}/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Job History
+         * @description A page of the job's score history in one read snapshot (module docstring).
+         */
+        get: operations["get_job_history_api_jobs__job_id__history_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1018,6 +1059,13 @@ export interface components {
              */
             state: "active" | "completed" | "cancelled";
         };
+        /** CapOut */
+        CapOut: {
+            /** Code */
+            code: string;
+            /** Kind */
+            kind: string;
+        };
         /** CardUserOut */
         CardUserOut: {
             /** Applied At */
@@ -1105,6 +1153,15 @@ export interface components {
             total_years_experience: number | null;
             user_entered?: components["schemas"]["UserEntered"];
         };
+        /** ContestedOut */
+        ContestedOut: {
+            /** Nulled Criteria */
+            nulled_criteria: string[];
+            /** Rejected Drafts */
+            rejected_drafts: components["schemas"]["RejectedDraftOut"][];
+            /** Rounds */
+            rounds: components["schemas"]["RoundOut"][];
+        };
         /** CountsOut */
         CountsOut: {
             /** Capped */
@@ -1114,10 +1171,107 @@ export interface components {
             /** Unscored */
             unscored: number;
         };
+        /** CriterionOut */
+        CriterionOut: {
+            /** Basis */
+            basis: string;
+            /** Criterion */
+            criterion: string;
+            /** Evidence */
+            evidence: components["schemas"]["EvidenceOut"][];
+            /** Level */
+            level: number | null;
+            /** Rationale */
+            rationale: string;
+            /** Weight */
+            weight: number | null;
+        };
         /** CvTextIn */
         CvTextIn: {
             /** Text */
             text: string;
+        };
+        /** DescriptionOut */
+        DescriptionOut: {
+            /** Completeness */
+            completeness: string;
+            /** From Job Id */
+            from_job_id: number;
+            /** Lang */
+            lang: ("de" | "en") | null;
+            /** Text */
+            text: string;
+        };
+        /** DetCriterionOut */
+        DetCriterionOut: {
+            /** Basis */
+            basis: string;
+            /** Criterion */
+            criterion: string;
+            /** Inputs */
+            inputs: {
+                [key: string]: components["schemas"]["JSONValue"];
+            };
+            /** Level */
+            level: number | null;
+            /** Weight */
+            weight: number | null;
+        };
+        /**
+         * DetailScoreOut
+         * @description The card's score and the rest of the result (module docstring, The score).
+         */
+        DetailScoreOut: {
+            /** Caps Applied */
+            caps_applied: components["schemas"]["CapOut"][];
+            /**
+             * Confidence
+             * @enum {string}
+             */
+            confidence: "low" | "medium" | "high";
+            /** Corrected Fields */
+            corrected_fields: string[];
+            /** Coverage */
+            coverage: string;
+            /** Criteria */
+            criteria: components["schemas"]["CriterionOut"][];
+            /**
+             * Critic Outcome
+             * @enum {string}
+             */
+            critic_outcome: "not_run" | "accepted" | "contested";
+            /** Det Criteria */
+            det_criteria: components["schemas"]["DetCriterionOut"][];
+            /** Det Result Id */
+            det_result_id: number;
+            /** High */
+            high: string;
+            /** Industry Match */
+            industry_match: string;
+            /** Injection Suspected */
+            injection_suspected: boolean;
+            /** Knockouts */
+            knockouts: components["schemas"]["KnockoutOut"][];
+            /** Low */
+            low: string;
+            /** Mid */
+            mid: string;
+            /** Result Id */
+            result_id: number;
+            /**
+             * Result Status
+             * @enum {string}
+             */
+            result_status: "accepted" | "contested";
+            /** Scored Via Job Id */
+            scored_via_job_id: number | null;
+            /** Shortened Fields */
+            shortened_fields: string[];
+            /** Summary De */
+            summary_de: string;
+            /** Summary En */
+            summary_en: string;
+            versions: components["schemas"]["VersionsOut"];
         };
         /**
          * DiffEntryOut
@@ -1243,6 +1397,24 @@ export interface components {
              */
             role: "generate" | "revise" | "critic" | "extract_profile" | "propose_queries" | "schema_dry_run";
         };
+        /** EvidenceOut */
+        EvidenceOut: {
+            /** Field Name */
+            field_name: string | null;
+            /** Quote */
+            quote: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "description" | "structured_field" | "profile";
+            /** Span End */
+            span_end: number | null;
+            /** Span Start */
+            span_start: number | null;
+            /** Subject */
+            subject: string;
+        };
         /** ExtractingOut */
         ExtractingOut: {
             /**
@@ -1316,6 +1488,24 @@ export interface components {
             /** Message */
             message: string;
         };
+        /** FieldProvenanceOut */
+        FieldProvenanceOut: {
+            /** Observation Id */
+            observation_id: number;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Posting Id */
+            posting_id: number;
+            /** Rule */
+            rule: string;
+            /** Source Id */
+            source_id: string | null;
+            /** Source Instance Id */
+            source_instance_id: number;
+        };
         /**
          * FlagsIn
          * @description The case's flags to set; an absent one is kept. At most two cases are canaries (L4632).
@@ -1381,6 +1571,47 @@ export interface components {
             /** Size */
             size: number;
         };
+        /** GroupMemberOut */
+        GroupMemberOut: {
+            /** Availability */
+            availability: string;
+            /** Company */
+            company: string;
+            /** Completeness */
+            completeness: string;
+            /** Is Representative */
+            is_representative: boolean;
+            /** Job Id */
+            job_id: number;
+            /** Locations */
+            locations: string[];
+            /** Score Individually */
+            score_individually: boolean;
+            /** Source Ids */
+            source_ids: string[];
+            /** Target State */
+            target_state: string | null;
+            /** Title */
+            title: string;
+        };
+        /**
+         * GroupOut
+         * @description A duplicate group and its members (module docstring).
+         */
+        GroupOut: {
+            /** Election Reason */
+            election_reason: string | null;
+            /** Id */
+            id: number;
+            /** Members */
+            members: components["schemas"]["GroupMemberOut"][];
+            /** Representative Job Id */
+            representative_job_id: number | null;
+            /** Status */
+            status: string;
+            /** Unscorable Reason */
+            unscorable_reason: string | null;
+        };
         /** HealthOut */
         HealthOut: {
             /**
@@ -1389,8 +1620,83 @@ export interface components {
              */
             status: "ok";
         };
+        /**
+         * HistoryItemOut
+         * @description One result of the job's history with every instance of it (module docstring).
+         */
+        HistoryItemOut: {
+            /** Instances */
+            instances: components["schemas"]["InstanceOut"][];
+            /** Llm Tuple Id */
+            llm_tuple_id: number;
+            /** Profile Version No */
+            profile_version_no: number;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /** Result Id */
+            result_id: number;
+            /** Rubric Version */
+            rubric_version: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "accepted" | "contested";
+        };
+        /**
+         * HistoryPageOut
+         * @description A page of the history and the cursor of the next (`None` on the last page).
+         */
+        HistoryPageOut: {
+            /** Items */
+            items: components["schemas"]["HistoryItemOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
+         * InstanceOut
+         * @description One score instance of a result (`None` scores: a verified not-a-job-ad).
+         */
+        InstanceOut: {
+            /**
+             * Computed At
+             * Format: date-time
+             */
+            computed_at: string;
+            /** Confidence */
+            confidence: ("low" | "medium" | "high") | null;
+            /** Coverage */
+            coverage: string | null;
+            /** Det Result Id */
+            det_result_id: number;
+            /** High */
+            high: string | null;
+            /** Is Current */
+            is_current: boolean;
+            /** Low */
+            low: string | null;
+            /** Mid */
+            mid: string | null;
+            /** Scope Version Id */
+            scope_version_id: number;
+        };
         /** @enum {string} */
         IssueCode: "limit" | "date_invalid" | "date_order" | "years_mismatch" | "contact_removed" | "ungrounded" | "language_without_evidence" | "code_other" | "unverifiable";
+        /** IssueOut */
+        IssueOut: {
+            /** Criterion */
+            criterion: string;
+            /** Issue */
+            issue: string;
+            /** Suggested Level */
+            suggested_level: number | null;
+        };
+        JSONValue: boolean | number | string | components["schemas"]["JSONValue"][] | {
+            [key: string]: components["schemas"]["JSONValue"];
+        } | null;
         /**
          * JobCardOut
          * @description One card of the Jobs list (module docstring).
@@ -1461,6 +1767,100 @@ export interface components {
             /** Work Modes */
             work_modes: string[];
         };
+        /**
+         * JobDetailOut
+         * @description A job's detail (module docstring). `history_next` is the first history page's next position,
+         *     unsigned: the route signs it into `history.next_cursor`; it is no member of the answer.
+         */
+        JobDetailOut: {
+            contested: components["schemas"]["ContestedOut"] | null;
+            description: components["schemas"]["DescriptionOut"];
+            /** Feedback */
+            feedback: components["schemas"]["JobFeedbackOut"][];
+            group: components["schemas"]["GroupOut"] | null;
+            history: components["schemas"]["HistoryPageOut"];
+            job: components["schemas"]["JobOut"];
+            links: components["schemas"]["LinksOut"];
+            /** Merge Events */
+            merge_events: components["schemas"]["MergeEventOut"][];
+            /** Postings */
+            postings: components["schemas"]["PostingOut"][];
+            score: components["schemas"]["DetailScoreOut"] | null;
+            target: components["schemas"]["TargetOut"] | null;
+            user: components["schemas"]["UserActionsOut"] | null;
+        };
+        /** JobFeedbackOut */
+        JobFeedbackOut: {
+            /** Comment */
+            comment: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "label" | "wrong_score";
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "good" | "ok" | "poor";
+        };
+        /** JobOut */
+        JobOut: {
+            /** Ad Language */
+            ad_language: string;
+            /** Availability */
+            availability: string;
+            /** Company */
+            company: string;
+            /** Company Key */
+            company_key: string;
+            /** Completeness */
+            completeness: string;
+            /** Employment Types */
+            employment_types: string[];
+            /** Field Provenance */
+            field_provenance: {
+                [key: string]: components["schemas"]["FieldProvenanceOut"];
+            };
+            /**
+             * First Seen At
+             * Format: date-time
+             */
+            first_seen_at: string;
+            /** Job Id */
+            job_id: number;
+            /**
+             * Last Seen At
+             * Format: date-time
+             */
+            last_seen_at: string;
+            /** Location Kind */
+            location_kind: string;
+            /** Locations */
+            locations: string[];
+            /** Posted At */
+            posted_at: string | null;
+            /** Posted Precision */
+            posted_precision: string;
+            salary: components["schemas"]["SalaryOut"] | null;
+            /** Source Ids */
+            source_ids: string[];
+            /** Title */
+            title: string;
+            /** Work Mode Known */
+            work_mode_known: boolean;
+            /** Work Mode Source Id */
+            work_mode_source_id: string | null;
+            /** Work Modes */
+            work_modes: string[];
+        };
         /** JobsPageOut */
         JobsPageOut: {
             counts: components["schemas"]["CountsOut"] | null;
@@ -1505,6 +1905,15 @@ export interface components {
             code_other: string | null;
             /** Evidence */
             evidence: string;
+        };
+        /** LevelDiffOut */
+        LevelDiffOut: {
+            /** Criterion */
+            criterion: string;
+            /** From Level */
+            from_level: number | null;
+            /** To Level */
+            to_level: number | null;
         };
         /** LinksOut */
         LinksOut: {
@@ -1558,6 +1967,31 @@ export interface components {
             /** Title */
             title: string;
         };
+        /** MergeEventOut */
+        MergeEventOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** From Job Id */
+            from_job_id: number;
+            /** Id */
+            id: number;
+            /** Into Job Id */
+            into_job_id: number;
+            /** Kind */
+            kind: string;
+            /** Reversible */
+            reversible: boolean;
+        };
+        /** ModelOut */
+        ModelOut: {
+            /** Effort */
+            effort: string;
+            /** Model */
+            model: string;
+        };
         /** NotReadyOut */
         NotReadyOut: {
             /** Failing */
@@ -1607,6 +2041,29 @@ export interface components {
             population: number;
             /** Postal Codes */
             postal_codes: string[];
+        };
+        /** PostingOut */
+        PostingOut: {
+            /** Availability */
+            availability: string;
+            /**
+             * First Seen At
+             * Format: date-time
+             */
+            first_seen_at: string;
+            /** Id */
+            id: number;
+            /**
+             * Last Seen At
+             * Format: date-time
+             */
+            last_seen_at: string;
+            /** Link */
+            link: string | null;
+            /** Native Id */
+            native_id: string;
+            /** Source Id */
+            source_id: string;
         };
         /** PreviousOut */
         PreviousOut: {
@@ -1837,6 +2294,13 @@ export interface components {
             /** Title */
             title: string;
         };
+        /** RejectedDraftOut */
+        RejectedDraftOut: {
+            /** Level Diff */
+            level_diff: components["schemas"]["LevelDiffOut"][];
+            /** Round */
+            round: number;
+        };
         /**
          * ReleaseIn
          * @description The release of a quarantined submission (§10.10): `confirm` must be `true`.
@@ -1921,6 +2385,19 @@ export interface components {
             /** Title */
             title: string;
         };
+        /** RoundOut */
+        RoundOut: {
+            /** Issues */
+            issues: components["schemas"]["IssueOut"][];
+            /** Outcome */
+            outcome: string;
+            /** Round */
+            round: number;
+            /** Triggers */
+            triggers: string[];
+            /** Verdict */
+            verdict: string;
+        };
         /**
          * RubricVersionOut
          * @description A shipped rubric version; `content_hash` in hex, `active` when `active_config` points at it.
@@ -1982,6 +2459,22 @@ export interface components {
             status: string;
             /** Trigger */
             trigger: string;
+        };
+        /** SalaryOut */
+        SalaryOut: {
+            /** Currency */
+            currency: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "stated" | "estimate";
+            /** Max */
+            max: string | null;
+            /** Min */
+            min: string | null;
+            /** Period */
+            period: string;
         };
         /**
          * SaveIn
@@ -2405,6 +2898,29 @@ export interface components {
             unsupported: "workable" | "unsupported_pattern" | "bad_slug" | "not_a_url";
         };
         /**
+         * UserActionsOut
+         * @description The user's actions on a job, its note included (`user_job_actions`).
+         */
+        UserActionsOut: {
+            /** Applied At */
+            applied_at: string | null;
+            /** Hidden At */
+            hidden_at: string | null;
+            /** Job Id */
+            job_id: number;
+            /** Note */
+            note: string | null;
+            /** Saved At */
+            saved_at: string | null;
+            /** Seen At */
+            seen_at: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
          * UserEntered
          * @description Entered by the user in the review form, never by the LLM (§12.4, §12.5).
          */
@@ -2481,6 +2997,17 @@ export interface components {
             python: string;
             /** Sqlalchemy */
             sqlalchemy: string;
+        };
+        /** VersionsOut */
+        VersionsOut: {
+            critic: components["schemas"]["ModelOut"] | null;
+            generator: components["schemas"]["ModelOut"];
+            /** Profile Version No */
+            profile_version_no: number;
+            /** Prompt Schema Hash */
+            prompt_schema_hash: string;
+            /** Rubric Version */
+            rubric_version: string;
         };
         /** VersionsPageOut */
         VersionsPageOut: {
@@ -3344,6 +3871,65 @@ export interface operations {
             };
         };
     };
+    get_job_api_jobs__job_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobDetailOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such job, or one without a detail: a synthetic, fenced or merged job (`not_found`, with `merged_into_job_id`: a merged job's survivor, else null) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `job_id` that is no integer from 1 to 2^63 - 1 (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     record_feedback_api_jobs__job_id__feedback_post: {
         parameters: {
             query?: never;
@@ -3415,6 +4001,78 @@ export interface operations {
                 };
             };
             /** @description Invalid body: a comment over 2,000 characters or holding a NUL or a lone surrogate, an unknown kind or label (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_job_history_api_jobs__job_id__history_get: {
+        parameters: {
+            query?: {
+                /** @description `next_cursor` of the page before */
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The id of a job */
+                job_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryPageOut"];
+                };
+            };
+            /** @description A cursor this job's history did not issue (`invalid_cursor`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such job, or one without a detail: a synthetic, fenced or merged job (`not_found`, with `merged_into_job_id`: a merged job's survivor, else null) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `job_id` that is no integer from 1 to 2^63 - 1, a `limit` outside 1 to 50 or a `cursor` over 2,048 characters (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;

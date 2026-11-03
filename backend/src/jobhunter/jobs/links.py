@@ -29,7 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.db.sql import q
 
 # An absolute http(s) URL with a host (case-insensitive), the only kind of link a card offers
-_HTTP_URL: Final = "'^https?://[^/?#\\s]'"
+HTTP_URL: Final = "'^https?://[^/?#\\s]'"
+# The candidate link of a posting `p` of the source instance `i`, `o` its latest observation (module
+# docstring); a link only when it matches `HTTP_URL`. The drawer's postings (M4 Task 6) offer it as well.
+POSTING_LINK: Final = (
+    "coalesce(o.normalized ->> 'primary_link', "
+    "CASE WHEN i.source_id = 'adzuna' THEN p.outbound_url_private END)"
+)
 _LINKS: Final = q(
     "/* jobs_cards.links */ SELECT x.job_id, ad.link AS open_ad, az.link AS adzuna "  # noqa: S608 (constants)
     "FROM unnest(CAST(:ids AS bigint[])) AS x(job_id) "
@@ -37,14 +43,13 @@ _LINKS: Final = q(
     "JOIN source_instances i ON i.id = p.source_instance_id "
     "JOIN sources s ON s.id = i.source_id "
     "LEFT JOIN posting_observations o ON o.id = p.latest_observation_id "
-    "CROSS JOIN LATERAL (SELECT coalesce(o.normalized ->> 'primary_link', "
-    "CASE WHEN i.source_id = 'adzuna' THEN p.outbound_url_private END) AS link) c "
-    f"WHERE p.job_id = x.job_id AND c.link ~* {_HTTP_URL} "
+    f"CROSS JOIN LATERAL (SELECT {POSTING_LINK} AS link) c "
+    f"WHERE p.job_id = x.job_id AND c.link ~* {HTTP_URL} "
     "ORDER BY s.precedence_rank, o.observed_at DESC NULLS LAST, p.id LIMIT 1) ad ON true "
     "LEFT JOIN LATERAL (SELECT p.outbound_url_private AS link FROM postings p "
     "JOIN source_instances i ON i.id = p.source_instance_id "
     "LEFT JOIN posting_observations o ON o.id = p.latest_observation_id "
-    f"WHERE p.job_id = x.job_id AND i.source_id = 'adzuna' AND p.outbound_url_private ~* {_HTTP_URL} "
+    f"WHERE p.job_id = x.job_id AND i.source_id = 'adzuna' AND p.outbound_url_private ~* {HTTP_URL} "
     "ORDER BY o.observed_at DESC NULLS LAST, p.id LIMIT 1) az ON true"
 )
 

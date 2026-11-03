@@ -420,9 +420,8 @@ def _texts(row: Any) -> _Texts:
     """The knockout texts of a result's row, each stored record read on its own (the unreadable ones are
     left out with a content-free warning)."""
     result_id = int(row.result_id)
-    stored = row.knockout_candidates if isinstance(row.knockout_candidates, list) else []
-    readable = _readable(stored)
-    _skipped(result_id, "knockout_candidates", len(stored) - len(readable))
+    readable, skipped = _candidates(row.knockout_candidates)
+    _skipped(result_id, "knockout_candidates", skipped)
     candidates: dict[str, Mapping[str, JSONValue]] = {}
     for candidate in readable:
         candidates.setdefault(candidate.fact_id, candidate.inputs)
@@ -431,14 +430,20 @@ def _texts(row: Any) -> _Texts:
     return _Texts(_requirements(facts), candidates, bool(row.purged))
 
 
-def _readable(stored: Sequence[object]) -> list[_Candidate]:
+def _candidates(value: object) -> tuple[list[_Candidate], int]:
+    """A result's knockout candidates, each read on its own, and how many could not be (as `_records`: a
+    document that is no list counts once, an empty one is no candidate; Ruling T5-g)."""
+    if value in (None, {}, []):
+        return [], 0
+    if not isinstance(value, list):
+        return [], 1
     readable: list[_Candidate] = []
-    for item in stored:
+    for item in value:
         try:
             readable.append(_Candidate.model_validate(item))
         except ValidationError:
             continue
-    return readable
+    return readable, len(value) - len(readable)
 
 
 def _input_text(inputs: Mapping[str, JSONValue], name: str) -> str | None:
@@ -468,6 +473,17 @@ def _knockout(record: _Record, texts: _Texts | None) -> KnockoutOut:
         requirement=requirement,
         profile_value=None if texts is None or texts.purged else profile_value,
     )
+
+
+def instance_knockouts(row: Any) -> list[KnockoutOut]:
+    """The knockouts of one score instance as a card shows them (module docstring, `knockouts`), for the
+    drawer (M4 Task 6): `row` holds the instance's `knockouts` and its result's `result_id`, `job_facts`,
+    `knockout_candidates` and `purged` (whether its profile version is purged). Each stored record is read on
+    its own; the unreadable ones are left out with the content-free warning."""
+    records, skipped = _records(row.knockouts)
+    _skipped(int(row.result_id), "knockouts", skipped)
+    texts = _texts(row) if records else None
+    return [_knockout(record, texts) for record in records]
 
 
 # --- the page ---------------------------------------------------------------------------------------------

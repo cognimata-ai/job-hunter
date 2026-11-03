@@ -16,6 +16,8 @@ from tests.unit.test_openapi_m3 import M3_ROUTES
 M4_ROUTES: Final[dict[tuple[str, str], set[str]]] = {
     ("get", "/api/jobs"): {"400", "401", "422", "429"},
     ("get", "/api/jobs/facets"): {"401", "422", "429"},
+    ("get", "/api/jobs/{job_id}"): {"401", "404", "422", "429"},
+    ("get", "/api/jobs/{job_id}/history"): {"400", "401", "404", "422", "429"},
 }
 
 

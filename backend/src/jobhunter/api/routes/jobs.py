@@ -1,5 +1,5 @@
-"""`/api/jobs` (spec §14.2, §14.3, §15.3; plan M4 Task 5, B7, B13, B18, B20, B29, B31): the Jobs list and its
-facets.
+"""`/api/jobs` (spec §14.2, §14.3, §15.3, §15.4; plan M4 Tasks 5 and 6, B7, B13, B18, B20, B25, B28, B29,
+B31): the Jobs list, its facets, a job's detail and its score history.
 
 **The filters** of both routes are `jobs.query.JobsQuery`'s fields as query parameters (`jobs_query`): a set
 is a repeated parameter (`work_mode=remote&work_mode=hybrid`), an absent parameter is the field's default
@@ -23,37 +23,58 @@ order, a location id that is no gazetteer id, a NUL), is 422 `validation_failed`
   characters, no NUL) → `FacetsOut{companies, sources}` (`jobs.facets`): the listed cards' companies and
   sources with their counts, each facet under every filter but its own, in one read snapshot; the posted
   window as on a first page.
+- `GET /api/jobs/{job_id}` → `jobs.detail.JobDetailOut` in one read snapshot (`jobs.detail.job_detail`),
+  its `history` the first page of the history below with its cursor signed here.
+- `GET /api/jobs/{job_id}/history?cursor&limit` (`limit` 1 to 50, default 20; `cursor` at most 2,048
+  characters) → `jobs.history.HistoryPageOut` in one read snapshot (`jobs.history.history_page`). Its
+  cursor is a list cursor (`encode_list_cursor`) of the sort `JOB_HISTORY_SORT`, `desc`, whose `last_key` is
+  the last row's `[published_at (ISO-8601 UTC), result_id]` and whose filters are `{"job_id": job_id}`: a
+  cursor of another job's history, of another list, or whose position has another shape is 400
+  `invalid_cursor`.
 
-Both depend on `require_session`; neither changes state, so neither takes `X-JH-Request` or a body. The
-outbound links of the cards are never logged (`jobs.links`). `utcnow` is a name of this module, so a test
-injects the clock by patching `jobhunter.api.routes.jobs.utcnow`.
+The `{job_id}` routes are declared after `/facets`, which would otherwise be a `job_id` that is no integer
+(422). A job without a detail (`jobs.detail.JobGone`: unknown, synthetic, fenced, without a current
+revision, or merged) is 404 `not_found` on both, with the member `merged_into_job_id`, the survivor of a
+merged job and `null` for the others (B28); any other domain error is `api.errors.domain_problem`'s. A
+`job_id` that is no integer from 1 to 2^63 - 1 is 422.
+
+All depend on `require_session`; none changes state, so none takes `X-JH-Request` or a body. The outbound
+links are never logged (`jobs.links`). `utcnow` is a name of this module, so a test injects the clock by
+patching `jobhunter.api.routes.jobs.utcnow`.
 """
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Final
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, StringConstraints, ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.api.deps import get_config, get_engine, require_session
+from jobhunter.api.errors import Problem, domain_problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import SESSION_RESPONSES
 from jobhunter.api.pagination import (
+    JOB_HISTORY_SORT,
     JobCursor,
     JobSort,
     cursor_key,
     decode_job_cursor,
+    decode_list_cursor,
     encode_job_cursor,
+    encode_list_cursor,
     invalid_cursor,
 )
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.ranking import generation
 from jobhunter.db.snapshot import read_snapshot
+from jobhunter.errors import DomainError
+from jobhunter.jobs import history
 from jobhunter.jobs.cards import JobCardOut, build_cards
+from jobhunter.jobs.detail import HISTORY_LIMIT, JobDetailOut, JobGone, ensure_job, job_detail
 from jobhunter.jobs.facets import FacetsOut, facets
 from jobhunter.jobs.listing import Counts, Position, display_timezone, select_page
 from jobhunter.jobs.query import (
@@ -84,6 +105,10 @@ _LOC_PARAMETERS: Final = {
     "radius_km": "radius_km",
 }
 _UTC: Final = "UTC"  # the zone of a relative window, which no zone moves
+HISTORY_MAX_LIMIT: Final = 50
+_BIGINT_MAX: Final = 2**63 - 1
+
+JobId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a job")]
 
 
 class CountsOut(BaseModel):
@@ -311,3 +336,120 @@ async def list_job_facets(
         tz = await display_timezone(conn) if query.posted == "custom" else _UTC
         window = resolve_window(query, now=now, tz=tz)
         return await facets(conn, query, window=window, company_q=company_q, limit=limit)
+
+
+# --- a job's detail and history ---------------------------------------------------------------------------
+
+_GONE_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    404: {
+        "description": "No such job, or one without a detail: a synthetic, fenced or merged job "
+        "(`not_found`, with `merged_into_job_id`: a merged job's survivor, else null)"
+    },
+}
+
+
+def _gone(gone: JobGone) -> Problem:
+    """B28's 404: content-free, with the survivor of a merged job."""
+    return Problem(404, "not_found", "Not found", extra={"merged_into_job_id": gone.merged_into_job_id})
+
+
+def _history_filters(job_id: int) -> dict[str, Any]:
+    return {"job_id": job_id}
+
+
+def _history_cursor(job_id: int, position: history.Position | None, key: bytes) -> str | None:
+    """The signed cursor after `position` of the job's history (module docstring), `None` without one."""
+    if position is None:
+        return None
+    published_at, result_id = position
+    return encode_list_cursor(
+        sort=JOB_HISTORY_SORT,
+        dir="desc",
+        last_key=[_utc_iso(published_at), result_id],
+        filters=_history_filters(job_id),
+        key=key,
+    )
+
+
+def _history_after(cursor: str, job_id: int, key: bytes) -> history.Position:
+    """The position of a cursor of the job's history; 400 `invalid_cursor` for any other."""
+    last_key = decode_list_cursor(
+        cursor, key=key, sort=JOB_HISTORY_SORT, dir="desc", filters=_history_filters(job_id)
+    )
+    match last_key:
+        case [str(at), int(result_id)] if not isinstance(result_id, bool) and result_id >= 1:
+            try:
+                published_at = datetime.fromisoformat(at)
+            except ValueError:
+                raise invalid_cursor() from None
+            if published_at.utcoffset() != timedelta(0):
+                raise invalid_cursor()
+            return published_at, result_id
+        case _:
+            raise invalid_cursor()
+
+
+def _domain(exc: DomainError | LookupError) -> Problem | None:
+    return _gone(exc) if isinstance(exc, JobGone) else domain_problem(exc)
+
+
+@router.get(
+    "/api/jobs/{job_id}",
+    response_model=JobDetailOut,
+    responses={
+        **_GONE_RESPONSES,
+        422: {"description": "A `job_id` that is no integer from 1 to 2^63 - 1 (`validation_failed`)"},
+    },
+)
+async def get_job(
+    job_id: JobId,
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    cfg: Annotated[AppConfig, Depends(get_config)],
+) -> JobDetailOut:
+    """A job's detail in one read snapshot, its history's first page with a signed cursor (module
+    docstring)."""
+    now = utcnow()
+    try:
+        async with read_snapshot(engine) as conn:
+            detail = await job_detail(conn, job_id, now=now)
+    except (DomainError, LookupError) as exc:
+        if (problem := _domain(exc)) is None:
+            raise
+        raise problem from None
+    detail.history.next_cursor = _history_cursor(job_id, detail.history_next, cursor_key(cfg))
+    return detail
+
+
+@router.get(
+    "/api/jobs/{job_id}/history",
+    response_model=history.HistoryPageOut,
+    responses={
+        400: {"description": "A cursor this job's history did not issue (`invalid_cursor`)"},
+        **_GONE_RESPONSES,
+        422: {
+            "description": "A `job_id` that is no integer from 1 to 2^63 - 1, a `limit` outside 1 to 50 or a "
+            "`cursor` over 2,048 characters (`validation_failed`)"
+        },
+    },
+)
+async def get_job_history(
+    job_id: JobId,
+    engine: Annotated[AsyncEngine, Depends(get_engine)],
+    cfg: Annotated[AppConfig, Depends(get_config)],
+    cursor: Annotated[
+        str | None, Query(max_length=MAX_CURSOR_CHARS, description="`next_cursor` of the page before")
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=HISTORY_MAX_LIMIT)] = HISTORY_LIMIT,
+) -> history.HistoryPageOut:
+    """A page of the job's score history in one read snapshot (module docstring)."""
+    key = cursor_key(cfg)
+    after = None if cursor is None else _history_after(cursor, job_id, key)
+    try:
+        async with read_snapshot(engine) as conn:
+            await ensure_job(conn, job_id)
+            items, position = await history.history_page(conn, job_id, after=after, limit=limit)
+    except (DomainError, LookupError) as exc:
+        if (problem := _domain(exc)) is None:
+            raise
+        raise problem from None
+    return history.HistoryPageOut(items=items, next_cursor=_history_cursor(job_id, position, key))
