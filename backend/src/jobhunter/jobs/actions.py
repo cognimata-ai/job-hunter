@@ -9,8 +9,8 @@ leaves it. `note` replaces the note, `""` clears it to NULL, `None` leaves it. `
 sends it when it opens) sets `seen_at` as `seen: true` does. `ActionsIn` refuses, with a 422 at the model's
 edge, `seen_on_open` together with `seen`, and a body that gives none of the five and no `seen_on_open`
 (`apply_to_group` alone included). A note holds at most `API_NOTE_LIMIT` (2,000) code points and no NUL or
-lone surrogate (`api.models.clean_text`); `dedup.user_actions.NOTE_LIMIT` (20,000, the column's CHECK) bounds
-a merge's concatenation only.
+lone surrogate (pydantic's `string_unicode` refuses the surrogate, `api.models.clean_text` the NUL);
+`dedup.user_actions.NOTE_LIMIT` (20,000, the column's CHECK) bounds a merge's concatenation only.
 
 **The group.** With `apply_to_group` and one of `saved`, `applied` or `hidden` given, those three (never
 `seen`, never the note) are written on every other member of the job's active duplicate group too (the

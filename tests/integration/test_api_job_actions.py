@@ -8,7 +8,8 @@
   422.
 - `apply_to_group` writes `saved`, `applied` and `hidden` on every other member of the job's active duplicate
   group too, never `seen` or the note; `members` is their rows after the write, by job id. Without an active
-  group, or without one of those three, only the job is written.
+  group, or without one of those three, only the job is written. A member that leaves the group while the
+  PUT waits for its row is not written.
 - Every write sets `updated_at` to the request's time (the route's clock), the first one creating the row.
 - A PUT that meets a merge holding the job waits for it, then answers 404 with the survivor and writes
   nothing; an unknown, synthetic or merged job is 404, a request without the session 401, without the CSRF
@@ -175,7 +176,14 @@ async def test_an_empty_note_clears_and_a_note_over_2000_is_422(
     cleared = await put(logged_in_client, job, {"note": ""})
     assert cleared["job"] == out(job, updated=T1)
     assert (await user_actions(engine, job)).note is None
-    logged = json.dumps(log_events())
+    events = log_events()
+    written = [e for e in events if e.get("event") == "job_actions_written"]
+    assert [e["fields"] for e in written] == [
+        ["note"],
+        ["note"],
+        ["note"],
+    ]  # the field's name, never its text
+    logged = json.dumps(events)
     assert "Rückruf" not in logged and "🙂" not in logged and "geheim" not in logged
 
 
@@ -303,8 +311,10 @@ async def test_every_write_sets_updated_at(
     opened = await put(logged_in_client, a, {"seen_on_open": True})
     assert opened["job"] == out(a, seen=T3, updated=T3)
     clock.at = T4
+    before = await generation(engine)
     both = await put(logged_in_client, a, {"saved": False, "apply_to_group": True})
     assert both == {"job": out(a, seen=T3, updated=T4), "members": [out(b, updated=T4)]}
+    assert await generation(engine) == before + 1  # one bump for the write, not one per row
     assert [(await user_actions(engine, job)).updated_at for job in (a, b)] == [T4, T4]
 
 
@@ -346,12 +356,36 @@ async def test_actions_racing_a_merge_write_no_row_for_the_merged_job(
         )
         wait = await wait_at_jobs(migrated, putting)
         assert wait.key == str(merged)  # the PUT waits at the job row, holding nothing the merge needs
+        assert "jobs_actions.lock" in wait.query  # in its explicit lock, not the upsert's key check
         await ranking.bump(merging)
         await merging.commit()
     r = await asyncio.wait_for(putting, WAIT_S)
     assert (r.status_code, r.json()["code"], r.json()["merged_into_job_id"]) == (404, "not_found", into)
     assert await count_rows(engine, "user_job_actions", job_id=merged) == 0
     assert await count_rows(engine, "user_job_actions", job_id=into) == 0
+
+
+async def test_a_member_that_leaves_the_group_while_the_put_waits_is_not_written(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, migrated: PgServer, clock: Clock
+) -> None:
+    a, b, c = await grouped(engine, 3)
+    async with engine.connect() as leaving:
+        await leaving.begin()
+        await leaving.execute(sa.text("SELECT 1 FROM jobs WHERE id = :j FOR UPDATE"), {"j": b})
+        await leaving.execute(sa.text("DELETE FROM duplicate_group_members WHERE job_id = :j"), {"j": b})
+        await leaving.execute(sa.text("UPDATE jobs SET duplicate_group_id = NULL WHERE id = :j"), {"j": b})
+        # the PUT's first read still sees b as a member: it locks a, then waits at b
+        putting = asyncio.create_task(
+            logged_in_client.put(url(a), json={"saved": True, "apply_to_group": True})
+        )
+        wait = await wait_at_jobs(migrated, putting)
+        assert wait.key == str(b) and "jobs_actions.lock" in wait.query
+        await leaving.commit()
+    r = await asyncio.wait_for(putting, WAIT_S)
+    assert r.status_code == 200, r.text
+    # re-read under the lock: b left, so only c is written
+    assert r.json() == {"job": out(a, saved=T1, updated=T1), "members": [out(c, saved=T1, updated=T1)]}
+    assert await user_actions(engine, b) is None
 
 
 async def test_unknown_job_404_and_csrf_403(
