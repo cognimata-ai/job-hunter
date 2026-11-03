@@ -57,7 +57,13 @@ active model policy (`None` where step 4 checks nothing: a rubric version, or a 
 the pairs it lacks, the candidate's gate, and the re-score estimate (`None` without an active profile). The
 preview adds whether the version is the active one (step 3's 409), the run the candidate's gate reads once
 it is calibrated (`validate.gate_run`; shown below 30 cases too), the models of the unverified pairs, and the
-estimate's figures, all 0 without an active profile, as the activation's body has them.
+estimate's figures, all 0 without an active profile, as the activation's body has them. For a rubric version
+it reports the verification that step 8's save checks after the flip (Ruling T14-e): the active model policy
+on the active prompt-schema version, by the save's own check (`save.unverified_on_active_schema`), on the
+active policy row: the row the save finds by the document's hash is that row (or, for a label a client
+stored before the label normal form, one of the same grid, whose pairs are the same). So the preview
+predicts each refusal the activation can give; it is `None` only in a process on the fake LLM, where neither
+the activation nor its save checks one.
 """
 
 from collections.abc import Mapping
@@ -88,6 +94,7 @@ from jobhunter.settings.save import (
     eval_gate_failed,
     save_settings,
     schema_dry_run_required,
+    unverified_on_active_schema,
 )
 from jobhunter.settings.validate import (
     Candidate,
@@ -299,8 +306,9 @@ class ActivationPreviewOut(BaseModel):
     )
     latest_golden_run: GoldenRunOut | None
     schema_verified: bool | None = Field(
-        description="Whether passed live schema dry-runs of this prompt-schema version cover every model of "
-        "the active model policy; null where the activation checks none (a rubric version, or the fake LLM)"
+        description="Whether passed live schema dry-runs cover every model the activation checks: for a "
+        "prompt-schema version, the active model policy on this version; for a rubric version, the active "
+        "model policy on the active prompt-schema version. Null on the fake LLM, where none is checked"
     )
     unverified_models: list[str] = Field(
         description="The models without a passed live schema dry-run of a schema they need, sorted"
@@ -321,6 +329,12 @@ async def activation_preview(
     active = (await conn.execute(_ACTIVE)).one()
     await _found(conn, kind, version_id)
     checks = await _checks(conn, kind=kind, version_id=version_id, active=active, now=now)
+    verified, unverified = checks.schema_verified, checks.unverified
+    if kind == "rubric" and not fake_llm_process():  # step 8's save re-checks the active pair
+        unverified = await unverified_on_active_schema(
+            conn, checks.settings, model_policy_id=int(active.model_policy_id)
+        )
+        verified = not unverified
     run = await gate_run(conn, checks.candidate)
     estimate = checks.estimate
     return ActivationPreviewOut(
@@ -335,8 +349,8 @@ async def activation_preview(
             spearman_rho=run.spearman_rho,
             finished_at=run.finished_at,
         ),
-        schema_verified=checks.schema_verified,
-        unverified_models=sorted({model for _, model in checks.unverified}),
+        schema_verified=verified,
+        unverified_models=sorted({model for _, model in unverified}),
         targets=0 if estimate is None else estimate.targets,
         est_usd_online=_NO_USD if estimate is None else estimate.est_usd_online,
         est_usd_batch=_NO_USD if estimate is None else estimate.est_usd_batch,

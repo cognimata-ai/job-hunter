@@ -443,6 +443,22 @@ def pg_one(
     return rows[0] if rows else None
 
 
+def table_counts(server: PgServer) -> dict[str, int]:
+    """The row count of every table of the `public` and `procrastinate` schemas (a test of a read that
+    writes nothing compares two of them)."""
+    tables = pg_rows(
+        server,
+        "superuser",
+        "SELECT schemaname, tablename FROM pg_tables WHERE schemaname IN ('public', 'procrastinate') "
+        "ORDER BY 1, 2",
+    )
+    counts: dict[str, int] = {}
+    for schema, table in tables:
+        row = pg_rows(server, "superuser", f'SELECT count(*) FROM "{schema}"."{table}"')  # noqa: S608
+        counts[f"{schema}.{table}"] = int(str(row[0][0]))
+    return counts
+
+
 def lock_waits(server: PgServer) -> int:
     """How many lock requests wait right now (`pg_locks` rows not granted), across the whole server.
 

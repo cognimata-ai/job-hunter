@@ -14,31 +14,39 @@ The tests' process is a live one (`_live_process`): a fake run never verifies a 
 invented.
 """
 
-from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Final
 
 import httpx
 import pytest
 import sqlalchemy as sa
-from jobhunter.clock import utcnow
 from jobhunter.scoring import targets
 from jobhunter.settings import activate as activate_mod
 from jobhunter.settings import save as save_mod
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from tests.support.activation import (
+    ACK,
+    HAIKU,
+    POLICY_B_CASES,
+    PROMPTS_URL,
+    RUBRICS_URL,
+    SONNET,
+    activate,
+    case,
+    dry_run_record,
+    point_prompt_schema_at,
+    prompt_versions,
+    rubric_versions,
+)
 from tests.support.eval import insert_cases
 from tests.support.fixtures import count_rows
-from tests.support.m3 import insert_id, insert_job, insert_target
+from tests.support.m3 import insert_job, insert_target
 from tests.support.profile import idem
 from tests.support.settings import activate_profile, fresh_key, generation, settings_body
 
 pytestmark = pytest.mark.integration
 
-SONNET, OPUS, HAIKU = "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"
-RUBRICS_URL: Final = "/api/settings/rubric-versions"
-PROMPTS_URL: Final = "/api/settings/prompt-schema-versions"
-ACK: Final = {"expected_rescore_ack": True}
 _ACTIVE: Final = sa.text(
     "SELECT rubric_version_id, prompt_schema_version_id, model_policy_id, llm_tuple_id, settings_version_id "
     "FROM active_config WHERE id = 1"
@@ -51,80 +59,9 @@ def _live_process(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("JOBHUNTER_FAKE_LLM", raising=False)
 
 
-def case(schema: str, model: str) -> dict[str, Any]:
-    return {"name": f"{schema}/{model}", "schema": schema, "model": model, "passed": True}
-
-
-POLICY_B_CASES: Final = [
-    case("generator", SONNET),
-    case("critic", OPUS),
-    case("profile", OPUS),
-    case("queries", OPUS),
-]
-
-
-async def dry_run_record(
-    engine: AsyncEngine,
-    version: int,
-    cases: list[dict[str, Any]],
-    *,
-    transport: str = "live",
-    status: str = "completed",
-    started_minutes_ago: int = 0,
-) -> int:
-    """A schema dry-run of prompt-schema version `version` with `cases`; its id."""
-    started = utcnow() - timedelta(minutes=started_minutes_ago)
-    async with engine.begin() as conn:
-        return await insert_id(
-            conn,
-            "eval_runs",
-            {
-                "kind": "schema_dry_run",
-                "route": "production",
-                "prompt_schema_version_id": version,
-                "status": status,
-                "passed": None if status == "running" else True,
-                "metrics": None if status == "running" else {"transport": transport, "cases": cases},
-                "started_at": started,
-                "finished_at": None if status == "running" else started + timedelta(seconds=30),
-            },
-        )
-
-
-async def prompt_versions(engine: AsyncEngine) -> tuple[int, int]:
-    """The shipped prompt-schema versions 1 and 2, by their parser families."""
-    async with engine.connect() as conn:
-        rows = await conn.execute(sa.text("SELECT id, parser_family FROM prompt_schema_versions ORDER BY id"))
-        by_family = {str(r.parser_family): int(r.id) for r in rows}
-    return by_family["generator_v1"], by_family["generator_v2_items"]
-
-
-async def rubric_versions(engine: AsyncEngine) -> dict[str, int]:
-    async with engine.connect() as conn:
-        rows = await conn.execute(sa.text("SELECT id, version FROM rubric_versions ORDER BY id"))
-        return {str(r.version): int(r.id) for r in rows}
-
-
 async def active(engine: AsyncEngine) -> Any:
     async with engine.connect() as conn:
         return (await conn.execute(_ACTIVE)).one()
-
-
-async def point_prompt_schema_at(engine: AsyncEngine, version: int) -> None:
-    """The prompt-schema pointer on `version` (the reset restores version 2)."""
-    async with engine.begin() as conn:
-        await conn.execute(
-            sa.text("UPDATE active_config SET prompt_schema_version_id = :v WHERE id = 1"), {"v": version}
-        )
-
-
-async def activate(
-    client: httpx.AsyncClient, kind: str, version_id: int, body: dict[str, Any], *, key: str | None = None
-) -> httpx.Response:
-    path = RUBRICS_URL if kind == "rubric" else PROMPTS_URL
-    return await client.post(
-        f"{path}/{version_id}/activate", json=body, headers=idem(key or fresh_key("act"))
-    )
 
 
 async def save_revise_on_haiku(client: httpx.AsyncClient) -> None:

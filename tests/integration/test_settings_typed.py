@@ -7,8 +7,10 @@
 - `GET /api/settings` shows the pending scope's apply in both of its phases and whether the active settings
   version's scope is the applied one.
 - The dry-run's ĉ is the active tuple's 7-day history while the proposed model and evaluation policies are
-  the active ones, else the proposed policy's central estimate; its arrivals are the tuple's targets of the
-  last 7 days a month, or 3,000 without 7 days of history; it warns of no re-score while no profile is active.
+  the active ones, else the proposed policy's central estimate; its arrivals are the tuple's new targets (no
+  bulk operation: no activation's catch-up) of the last 7 days a month, or 3,000 without 7 days of history,
+  also within 7 days of the tuple's latest activation (Ruling T14-d); it warns of no re-score while no
+  profile is active.
 
 Every datum is invented.
 """
@@ -22,17 +24,25 @@ import httpx
 import pytest
 import sqlalchemy as sa
 from jobhunter.api.app import create_app
+from jobhunter.clock import utcnow
 from jobhunter.db.seed import load_settings_v1
 from jobhunter.quota.windows import bootstrap_window
 from jobhunter.settings import presets
 from jobhunter.settings.llm_projection import central_cost_per_target
+from jobhunter.worker.operations import execute_operation
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.integration.test_scope_apply import fail_for_good
 from tests.support.m3 import insert_attempt, insert_job, insert_target
 from tests.support.quota import SETTINGS, SIX_H, account, insert_window
 from tests.support.reconcile import run_reconciler
-from tests.support.settings import activate_profile, active_row, save_scope, settings_body
+from tests.support.settings import (
+    activate_profile,
+    active_row,
+    fail_for_good,
+    save,
+    save_scope,
+    settings_body,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -40,6 +50,16 @@ DRY_RUN_URL: Final = "/api/settings/dry-run"
 NOW: Final = datetime(2026, 10, 22, 9, 30, tzinfo=UTC)
 SCHEMAS: Final = "#/components/schemas/"
 CENTRAL_B: Final = "0.052646"
+_CREATION: Final = sa.text(
+    "SELECT id FROM operations WHERE dedup_key = :key AND status = 'pending' ORDER BY id DESC LIMIT 1"
+)
+# The tuple's targets in its newest bulk operation: those it created in the window, and those it revived.
+_CATCH_UP: Final = sa.text(
+    "SELECT count(*) FILTER (WHERE t.created_at >= :since AND t.created_at <= :now) AS created, "
+    "count(*) FILTER (WHERE t.created_at < :since) AS revived FROM score_targets t "
+    "WHERE t.llm_tuple_id = :tuple AND t.bulk_operation_id = (SELECT max(b.id) FROM bulk_operations b "
+    "WHERE b.llm_tuple_id = :tuple)"
+)
 
 
 @pytest.fixture
@@ -225,25 +245,40 @@ async def test_dry_run_uses_history_c_hat_for_unchanged_policies_and_central_oth
     assert body["projections"]["llm"]["c_hat"] == CENTRAL_B
 
 
-async def recent_targets(engine: AsyncEngine, llm_tuple_id: int, *ages: timedelta) -> None:
-    """A target of a new job for each of `ages`, created that long before `NOW`."""
+async def recent_targets(
+    engine: AsyncEngine, llm_tuple_id: int, *ages: timedelta, at: datetime = NOW, bulk: int | None = None
+) -> None:
+    """A target of a new job for each of `ages`, created that long before `at`, in bulk operation `bulk`
+    (an activation's) or in none (an ordinary arrival)."""
     async with engine.begin() as conn:
         for age in ages:
-            await insert_target(conn, await insert_job(conn), llm_tuple_id, created_at=NOW - age)
+            job = await insert_job(conn)
+            await insert_target(conn, job, llm_tuple_id, created_at=at - age, bulk_operation_id=bulk)
+
+
+_ACTIVATED_AT: Final = sa.text("UPDATE bulk_operations SET created_at = :t WHERE llm_tuple_id = :tuple")
+
+
+async def activated_at(engine: AsyncEngine, llm_tuple_id: int, at: datetime) -> None:
+    """The tuple's activations (its bulk operations) moved to `at`, as if it was activated then."""
+    async with engine.begin() as conn:
+        await conn.execute(_ACTIVATED_AT, {"t": at, "tuple": llm_tuple_id})
+
+
+def arrivals(body: dict[str, Any]) -> int:
+    found: int = body["projections"]["llm"]["arrival_per_month"]
+    return found
 
 
 async def test_dry_run_arrivals_from_the_seven_day_rate(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: datetime
 ) -> None:
-    def arrivals(body: dict[str, Any]) -> int:
-        found: int = body["projections"]["llm"]["arrival_per_month"]
-        return found
-
     assert arrivals(await dry_run(logged_in_client, seeded())) == 3000  # no tuple
     _, tuple_id = await activate_profile(engine)
+    await activated_at(engine, tuple_id, NOW - timedelta(days=30))
     assert arrivals(await dry_run(logged_in_client, seeded())) == 3000  # a tuple without targets
     days = [timedelta(days=d, hours=1) for d in range(7)][:-1] * 2 + [timedelta(hours=2), timedelta(hours=3)]
-    await recent_targets(engine, tuple_id, *days)  # 14 targets, all within the last 7 days
+    await recent_targets(engine, tuple_id, *days)  # 14 ordinary arrivals, all within the last 7 days
     assert arrivals(await dry_run(logged_in_client, seeded())) == 3000  # the oldest is younger than 7 days
     # an old one, and one created after `now`
     await recent_targets(engine, tuple_id, timedelta(days=10), timedelta(hours=-1))
@@ -251,7 +286,63 @@ async def test_dry_run_arrivals_from_the_seven_day_rate(
     assert arrivals(body) == 60  # 14 x 30 / 7
     assert "llm_cap_binding" not in codes(body)  # 60 arrive, about 1,617 fit
     await recent_targets(engine, tuple_id, timedelta(days=6, hours=23))
-    assert arrivals(await dry_run(logged_in_client, seeded())) == 64  # 15 x 30 / 7 = 64.3
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 64  # 15 x 30 / 7 = 64.29
+    await recent_targets(engine, tuple_id, timedelta(days=3))
+    assert (
+        arrivals(await dry_run(logged_in_client, seeded())) == 69
+    )  # 16 x 30 / 7 = 68.57: the nearest, not 68
+
+
+async def test_the_seven_days_include_their_first_instant(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: datetime
+) -> None:
+    """The oldest target and the activation exactly 7 days before `now` take the history branch, and a target
+    created exactly at the window's start is counted: 7 x 30 / 7 = 30 (6 would give 26, a young one 3,000)."""
+    _, tuple_id = await activate_profile(engine)
+    await activated_at(engine, tuple_id, NOW - timedelta(days=7))
+    await recent_targets(engine, tuple_id, timedelta(days=7), *(timedelta(days=d) for d in range(1, 7)))
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 30
+
+
+async def test_a_re_activated_tuple_waits_out_its_activation_and_never_counts_its_catch_up(
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    current_epoch: int,
+    fake_llm_process: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling T14-d: switching the model policy away and back re-activates the profile's earlier tuple; its
+    `create_targets_for_tuple` revives the old targets and creates one for each revision that became current
+    meanwhile, all in the activation's bulk operation. Inside 7 days of that activation the arrivals are
+    3,000; after them, the ordinary arrivals' rate, the catch-up left out."""
+    clock = [utcnow()]  # the activations' and the catch-up's rows take the database's clock
+    monkeypatch.setattr("jobhunter.api.routes.settings.utcnow", lambda: clock[0])
+    _, tuple_id = await activate_profile(engine)
+    await recent_targets(engine, tuple_id, timedelta(days=40), timedelta(days=39), at=clock[0])  # history
+    await save(logged_in_client, changed("scoring.model_policy.nodes.critic.effort", "high"))
+    assert (await active_row(engine)).llm_tuple_id != tuple_id
+    async with engine.begin() as conn:
+        for _ in range(5):
+            await insert_job(conn)  # five revisions become current while another tuple is active
+    await save(logged_in_client, seeded())  # back: the same tuple, activated again
+    assert (await active_row(engine)).llm_tuple_id == tuple_id
+    key = f"create_targets_for_tuple:{tuple_id}"
+    async with engine.connect() as conn:
+        creation = int((await conn.execute(_CREATION, {"key": key})).scalar_one())
+    await execute_operation(engine, creation, epoch=current_epoch)
+    now = clock[0] = utcnow()  # the dry-run's `now`, after the catch-up
+    params = {"tuple": tuple_id, "since": now - timedelta(days=7), "now": now}
+    async with engine.connect() as conn:
+        caught_up = (await conn.execute(_CATCH_UP, params)).one()
+    # in the dry-run's window, in the activation's bulk operation
+    assert (caught_up.created, caught_up.revived) == (5, 2)
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 3000  # the latest activation is just now
+
+    # 8 days on from the activations, with 7 ordinary arrivals in the window: 7 x 30 / 7, no catch-up
+    async with engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE bulk_operations SET created_at = created_at - interval '8 days'"))
+    await recent_targets(engine, tuple_id, *(timedelta(days=d, hours=1) for d in range(7)), at=now)
+    assert arrivals(await dry_run(logged_in_client, seeded())) == 30  # (7 + 5) x 30 / 7 would be 51
 
 
 async def test_no_rescore_warning_without_a_profile(

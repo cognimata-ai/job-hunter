@@ -26,7 +26,7 @@ from jobhunter.settings.model import Settings
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tests.support.collect import insert_revisions_awaiting
-from tests.support.pg import PgServer, pg_rows
+from tests.support.pg import PgServer, pg_rows, table_counts
 from tests.support.settings import activate_profile
 
 pytestmark = pytest.mark.integration
@@ -400,21 +400,6 @@ async def test_the_route_runs_the_dry_run_in_a_read_only_transaction(
     monkeypatch.setattr("jobhunter.api.routes.settings.dry_run", probe)
     await post(logged_in_client, base())
     assert seen == ["on"]
-
-
-def table_counts(server: PgServer) -> dict[str, int]:
-    """The row count of every table of the `public` and `procrastinate` schemas."""
-    tables = pg_rows(
-        server,
-        "superuser",
-        "SELECT schemaname, tablename FROM pg_tables WHERE schemaname IN ('public', 'procrastinate') "
-        "ORDER BY 1, 2",
-    )
-    counts: dict[str, int] = {}
-    for schema, table in tables:
-        row = pg_rows(server, "superuser", f'SELECT count(*) FROM "{schema}"."{table}"')  # noqa: S608
-        counts[f"{schema}.{table}"] = int(str(row[0][0]))
-    return counts
 
 
 async def test_dry_run_writes_nothing(logged_in_client, engine, migrated: PgServer, clock) -> None:

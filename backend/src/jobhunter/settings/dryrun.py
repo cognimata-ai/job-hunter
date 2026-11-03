@@ -25,10 +25,17 @@ settings page shows on every change and that a save runs again (Task 17).
      its published online attempts, from 20 of them; else the central estimate) while the proposed model and
      evaluation policies are the active ones by content hash, else `central_cost_per_target` of the proposed
      model policy, whose own history no tuple has yet. Without an active tuple it is the central estimate;
-   - `arrival_per_month` is the trailing 7-day rate of new targets a month: the active tuple's targets
-     created in the 7 days up to `now`, x 30 / 7, rounded to the nearest whole number; 3,000
-     (`DEFAULT_ARRIVAL_PER_MONTH`) when there is no such history, which is without an active tuple or while
-     the tuple's oldest target is younger than 7 days (one created by the tuple's own re-score included);
+   - `arrival_per_month` is §6.8's trailing 7-day rate of new targets, a month (Ruling T14-d): the active
+     tuple's targets created in `[now - 7 d, now]` without a bulk operation, x 30 / 7, rounded to the nearest
+     whole number. An ordinary arrival has none (the collection's `enqueue_targets`, the `missing_targets`
+     reconciler and a merge's new current revision create with `bulk_operation_id = NULL`); the targets an
+     activation's `create_targets_for_tuple` creates or revives carry its bulk operation, so a re-activated
+     tuple's catch-up is no arrival. It is 3,000 (`DEFAULT_ARRIVAL_PER_MONTH`) when there is no such history:
+     without an active tuple, while it has no target or its oldest target is younger than 7 days, and while
+     its latest activation is younger than 7 days, so a window never straddles one. The latest activation is
+     the newest `created_at` of the tuple's `bulk_operations`: every activation (`targets.activate_tuple`, a
+     confirm's or an `llm_tuple` save's) opens one (`bulk.open`), with or without retained revisions, and the
+     retention deletes only those that ended 13 months before. One statement;
 6. the effect classes (`classify_effects` against the active settings) and what they add:
    - `scope`: `det_recompute`, the published results of the active tuple that the scope apply recomputes
      without any LLM call (`count_published_results_active_tuple`, M3 Task 15);
@@ -121,10 +128,13 @@ _ACTIVE_POLICIES: Final = q(
     "JOIN model_policies m ON m.id = a.model_policy_id "
     "JOIN evaluation_policies e ON e.id = a.evaluation_policy_id WHERE a.id = 1"
 )
-# A tuple's oldest target and its targets created in the window `[since, now]`.
+# A tuple's oldest target, its new targets (no bulk operation) created in `[since, now]`, and its latest
+# activation (the newest of its bulk operations).
 _ARRIVALS: Final = q(
-    "SELECT min(created_at) AS oldest, count(*) FILTER (WHERE created_at >= :since AND created_at <= :now) "
-    "AS recent FROM score_targets WHERE llm_tuple_id = :tuple"
+    "SELECT t.oldest, t.recent, (SELECT max(b.created_at) FROM bulk_operations b "
+    "WHERE b.llm_tuple_id = :tuple) AS activated FROM (SELECT min(created_at) AS oldest, count(*) FILTER "
+    "(WHERE bulk_operation_id IS NULL AND created_at >= :since AND created_at <= :now) AS recent "
+    "FROM score_targets WHERE llm_tuple_id = :tuple) t"
 )
 ARRIVAL_WINDOW: Final = timedelta(days=7)
 _DAYS_PER_MONTH: Final = 30
@@ -204,14 +214,14 @@ async def c_hat(
 
 
 async def arrival_per_month(conn: AsyncConnection, llm_tuple_id: int | None, *, now: datetime) -> int:
-    """§6.8's arrivals a month (module docstring, step 5): the active tuple's targets of the 7 days up to
-    `now` x 30 / 7, or `DEFAULT_ARRIVAL_PER_MONTH` without 7 days of history."""
+    """§6.8's arrivals a month (module docstring, step 5): the active tuple's new targets of the 7 days up to
+    `now` x 30 / 7, or `DEFAULT_ARRIVAL_PER_MONTH` without 7 days of history since its latest activation."""
     if llm_tuple_id is None:
         return DEFAULT_ARRIVAL_PER_MONTH
-    row = (
-        await conn.execute(_ARRIVALS, {"tuple": llm_tuple_id, "since": now - ARRIVAL_WINDOW, "now": now})
-    ).one()
-    if row.oldest is None or row.oldest > now - ARRIVAL_WINDOW:
+    since = now - ARRIVAL_WINDOW
+    row = (await conn.execute(_ARRIVALS, {"tuple": llm_tuple_id, "since": since, "now": now})).one()
+    young = row.oldest is None or row.oldest > since
+    if young or (row.activated is not None and row.activated > since):
         return DEFAULT_ARRIVAL_PER_MONTH
     rate = Decimal(int(row.recent) * _DAYS_PER_MONTH) / ARRIVAL_WINDOW.days
     return int(rate.to_integral_value(rounding=ROUND_HALF_UP))

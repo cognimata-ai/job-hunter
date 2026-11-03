@@ -231,11 +231,14 @@ class _Activation:
     scope_is_active: bool = False  # the `scope` action's desired scope is the active one
 
 
-async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[tuple[str, str]]:
-    """The (schema, model) pairs of the proposed model policy without a passed live schema dry-run of the
-    active prompt-schema version, none when it is verified (module docstring, step 3; Ruling T20-a): its row
-    found or inserted by hash in the save's transaction, then Task 11's `validate.schema_verified` on it."""
-    model_policy_id = await ensure_hashed(conn, "model_policies", derived(proposed).model_policy)
+async def unverified_on_active_schema(
+    conn: AsyncConnection, proposed: Settings, *, model_policy_id: int
+) -> list[tuple[str, str]]:
+    """The (schema, model) pairs of `proposed`'s model policy, row `model_policy_id`, without a passed live
+    schema dry-run of the active prompt-schema version, none when it is verified: Task 11's
+    `validate.schema_verified` on the row, then the pairs it lacks (`validate.unverified_pairs`). Plain reads,
+    so a read-only snapshot may call it: the rubric activation's preview predicts with it what this save's
+    step 3 checks after a rubric version's pointer flip (M4 Task 14, Ruling T14-e)."""
     pointers = (await conn.execute(_TUPLE_POINTERS)).one()
     if pointers.prompt_schema_version_id is None:
         raise LookupError("active_config has no prompt-schema version (migrate seeds it)")
@@ -245,6 +248,14 @@ async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[t
     return await unverified_pairs(
         conn, prompt_schema_version_id=version, model_policy=proposed.scoring.model_policy
     )
+
+
+async def _unverified_pairs(conn: AsyncConnection, proposed: Settings) -> list[tuple[str, str]]:
+    """The (schema, model) pairs of the proposed model policy without a passed live schema dry-run of the
+    active prompt-schema version, none when it is verified (module docstring, step 3; Ruling T20-a): its row
+    found or inserted by hash in the save's transaction, then `unverified_on_active_schema` on it."""
+    model_policy_id = await ensure_hashed(conn, "model_policies", derived(proposed).model_policy)
+    return await unverified_on_active_schema(conn, proposed, model_policy_id=model_policy_id)
 
 
 def schema_dry_run_required(missing: Sequence[tuple[str, str]]) -> Refusal:

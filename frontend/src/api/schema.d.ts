@@ -1549,7 +1549,7 @@ export interface components {
             latest_golden_run: components["schemas"]["GoldenRunOut"] | null;
             /**
              * Schema Verified
-             * @description Whether passed live schema dry-runs of this prompt-schema version cover every model of the active model policy; null where the activation checks none (a rubric version, or the fake LLM)
+             * @description Whether passed live schema dry-runs cover every model the activation checks: for a prompt-schema version, the active model policy on this version; for a rubric version, the active model policy on the active prompt-schema version. Null on the fake LLM, where none is checked
              */
             schema_verified: boolean | null;
             /**

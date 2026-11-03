@@ -3,8 +3,10 @@
 
 A preview reads what the activation reads before its pointer flip (the version, whether it is active, the
 live schema dry-runs a prompt-schema version needs, the eval gate of the candidate and the re-score estimate)
-with the activation's own computation, in one read-only snapshot: it writes nothing and waits for no lock.
-The tests' process is a live one, so a fake run never verifies a schema. Every datum is invented.
+with the activation's own computation, in one read-only snapshot: it writes nothing and waits for no lock. A
+rubric version's preview reports the active pair's verification, which the activation's save re-checks
+(Ruling T14-e). The tests' process is a live one, so a fake run never verifies a schema. Every datum is
+invented.
 """
 
 import asyncio
@@ -17,10 +19,12 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.integration.test_api_activation import (
+from tests.support.activation import (
     ACK,
     OPUS,
     POLICY_B_CASES,
+    PROMPTS_URL,
+    RUBRICS_URL,
     SONNET,
     activate,
     case,
@@ -29,16 +33,13 @@ from tests.integration.test_api_activation import (
     prompt_versions,
     rubric_versions,
 )
-from tests.integration.test_settings_dry_run import table_counts
 from tests.support.eval import insert_cases
 from tests.support.m3 import insert_id, insert_job
-from tests.support.pg import PgServer
+from tests.support.pg import PgServer, table_counts
 from tests.support.settings import activate_profile
 
 pytestmark = pytest.mark.integration
 
-RUBRICS_URL: Final = "/api/settings/rubric-versions"
-PROMPTS_URL: Final = "/api/settings/prompt-schema-versions"
 PREVIEW_KEYS: Final = {
     "version_id",
     "active",
@@ -107,6 +108,7 @@ async def test_preview_of_an_inactive_rubric_has_gate_cost_and_writes_nothing(
 ) -> None:
     rubrics = await rubric_versions(engine)
     _, v2 = await prompt_versions(engine)
+    await dry_run_record(engine, v2, POLICY_B_CASES)  # the active pair, which a rubric activation re-checks
     await activate_profile(engine)
     async with engine.begin() as conn:
         for _ in range(2):
@@ -119,8 +121,8 @@ async def test_preview_of_an_inactive_rubric_has_gate_cost_and_writes_nothing(
     golden = body["latest_golden_run"]
     assert (golden["eval_run_id"], golden["passed"], golden["spearman_rho"]) == (run, True, "0.710000")
     assert golden["finished_at"].endswith("Z")
-    # a rubric version needs no schema dry-run of its own
-    assert (body["schema_verified"], body["unverified_models"]) == (None, [])
+    # a rubric version needs no schema dry-run of its own; the active pair it keeps is verified
+    assert (body["schema_verified"], body["unverified_models"]) == (True, [])
     # 2 x ĉ $0.052646 online, 2 x $0.046671 in Batches (§21.4); 0.4 x $93.10 of scoring share (§6.9.3)
     assert (body["targets"], body["est_usd_online"], body["est_usd_batch"], body["bulk_budget_usd"]) == (
         2,
@@ -152,7 +154,6 @@ async def test_preview_of_an_inactive_rubric_has_gate_cost_and_writes_nothing(
     assert table_counts(migrated) == before
 
     # the activation computes the same figures: it re-scores what the preview counted at its budget
-    await dry_run_record(engine, v2, POLICY_B_CASES)  # the save re-checks the active pair
     r = await activate(logged_in_client, "rubric", rubrics["v1"], {**ACK, "eval_override_ack": True})
     assert r.status_code == 201, r.text
     assert (r.json()["targets_to_create"], r.json()["bulk_budget_usd"]) == (
@@ -196,6 +197,39 @@ async def test_prompt_schema_preview_names_the_unverified_models(
     body = await preview(logged_in_client, "prompt_schema", v1)
     assert (body["schema_verified"], body["unverified_models"]) == (None, [])
     assert (await preview(logged_in_client, "prompt_schema", v2))["active"] is True
+
+
+async def test_a_rubric_preview_reports_the_active_pair_its_save_re_checks(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rubrics = await rubric_versions(engine)
+    _, v2 = await prompt_versions(engine)
+    await dry_run_record(engine, v2, [case("generator", SONNET)])  # the critic, profile and queries lack one
+    body = await preview(logged_in_client, "rubric", rubrics["v1"])
+    assert (body["gate_state"], body["schema_verified"], body["unverified_models"]) == (
+        "uncalibrated",
+        False,
+        [OPUS],
+    )
+    # the refusal the preview predicts: the save after the flip re-checks the pair, and it all rolls back
+    r = await activate(logged_in_client, "rubric", rubrics["v1"], {**ACK, "eval_override_ack": True})
+    problem = r.json()
+    assert (r.status_code, problem["code"], problem["detail"]) == (
+        409,
+        "conflict_state",
+        "schema_dry_run_required",
+    ), r.text
+    assert OPUS in problem["title"]
+    assert (await preview(logged_in_client, "rubric", rubrics["v1"]))["active"] is False
+    await dry_run_record(engine, v2, POLICY_B_CASES[1:])
+    body = await preview(logged_in_client, "rubric", rubrics["v1"])
+    assert (body["schema_verified"], body["unverified_models"]) == (True, [])
+    r = await activate(logged_in_client, "rubric", rubrics["v1"], ACK)
+    assert r.status_code == 201, r.text
+    # on the fake LLM neither the activation nor its save checks a schema
+    monkeypatch.setenv("JOBHUNTER_FAKE_LLM", "1")
+    body = await preview(logged_in_client, "rubric", rubrics["v2"])
+    assert (body["schema_verified"], body["unverified_models"]) == (None, [])
 
 
 async def test_preview_of_an_unknown_version_is_404(logged_in_client: httpx.AsyncClient) -> None:
