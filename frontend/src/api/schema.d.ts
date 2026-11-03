@@ -2800,7 +2800,9 @@ export interface components {
         };
         /**
          * QuotaOut
-         * @description A provider's current quota window as stored (§7.8): counted usage against its limit, and its bucket.
+         * @description A provider's quota window at the time of the request (§7.8): counted usage against its limit, and its
+         *     bucket. A stored window whose reset has passed shows its successor, which starts unspent; a provider with
+         *     no stored window shows the window its first request would open.
          */
         QuotaOut: {
             /** Limit Units */
@@ -3521,7 +3523,8 @@ export interface components {
          *       `last_fully_successful_run_age_s`: of a `succeeded` one only.
          *     - `run_age_state`: see `run_age_state`.
          *     - `queue_depths`: procrastinate jobs by queue and status.
-         *     - `quota`: each quota provider's current window, `null` before its first one.
+         *     - `quota`: each quota provider's window at the time of the request, as the header status shows it;
+         *       `null` for SerpApi before its first account read.
          *     - `llm`: the month's LLM spend, `null` when nothing is seeded.
          *     - `scoring`: the score lane.
          *     - `table_bytes`: the size of every table of the `public` schema, in bytes.

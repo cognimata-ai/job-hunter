@@ -267,7 +267,7 @@ async def test_status_reports_partial_causes_gaps_pending_and_unacked_alerts(
     assert body["banners"] == []
 
 
-async def test_a_quarantined_cap_pause_gives_the_cap_banner(
+async def test_a_cap_pause_gives_the_cap_banner_whatever_the_cap_alert(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, now: datetime
 ) -> None:
     """With the month's whole scoring share counted (as a quarantined submission's held reservation keeps it
@@ -572,12 +572,12 @@ async def test_a_jsearch_window_exhausted_before_its_reset_pauses_nothing_after_
     assert body["quota"]["jsearch"]["used"] == 200
 
 
-async def test_the_review_s_stale_window_reproduction_is_self_consistent(
+async def test_an_ended_exhausted_window_reads_alike_in_the_pause_the_quota_and_run_now(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, now: datetime
 ) -> None:
-    """The review's reproduction: a JSearch window stored `exhausted_until_reset` that ended a day ago. The
-    pause, the quota block and run now agree that a new, unspent window is current; with JSearch and SerpApi
-    disabled in the settings nothing is paused and run now spends nothing."""
+    """A JSearch window stored `exhausted_until_reset` that ended a day ago: the pause, the quota block and
+    run now agree that a new, unspent window is current; with JSearch and SerpApi disabled in the settings
+    nothing is paused and run now spends nothing."""
     start = now - timedelta(days=31)
     jsearch = bootstrap_window("jsearch", start, SETTINGS, interval_s=SIX_H, account=None)
     assert jsearch is not None

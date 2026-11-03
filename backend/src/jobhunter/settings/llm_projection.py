@@ -202,8 +202,9 @@ def _usd(amount: Decimal) -> Decimal:
 
 
 def scoring_share(p: BudgetParams) -> Decimal:
-    """`A x (1 - reserve_frac)`, never below zero (§6.9.1: $93.10 with the defaults)."""
-    return max(_ZERO, budget.admissible(p) * (1 - budget.reserve_frac(p)))
+    """`budget.scoring_share`, `A x (1 - reserve_frac)`, never below zero (§6.9.1: $93.10 with the
+    defaults)."""
+    return max(_ZERO, budget.scoring_share(p))
 
 
 def llm_projection(

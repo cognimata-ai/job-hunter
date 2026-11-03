@@ -17,8 +17,9 @@ and no table sizes (D5). What each field reads:
   `paid_search` and `run_now`. A stored window that has ended is replaced by its successor, which starts
   unspent, so a past reset never pauses paid search; a provider without a stored window shows the window
   its first reservation would bootstrap (JSearch and Adzuna; SerpApi has none before an account read).
-  Each shows its counted usage in the ledger (`ledger.used_units` of the window shown), its limit, its reset
-  (the window's end) and its state.
+  Each shows its counted usage in the ledger (`health.quota_views`: `ledger.used_units` of the window shown),
+  its limit, its reset (the window's end) and its state; `/api/system/health` shows the same view
+  (`health.quota_health`, Ruling T11-f).
 - `llm`: `null` when nothing is seeded (`health.active_budget_params`); otherwise the month's counted spend
   and cap (`health.LlmSpendOut` of the month row `spend_ledger.read_month_or_new` gives, as `llm_spend`
   builds it) and the `pace` of the scoring lane's counted spend against the scoring share `A x (1 -
@@ -88,17 +89,16 @@ from jobhunter.llm.spend_ledger import read_month_or_new
 from jobhunter.observability import lists
 from jobhunter.observability.health import (
     LAST_RUN,
-    QUOTA_PROVIDERS,
     LlmSpendOut,
     QuotaOut,
     RunAgeState,
     RunOut,
     active_budget_params,
+    quota_views,
     read_run_freshness,
     run_age_state,
 )
 from jobhunter.quota.dryrun import live_windows, run_now_units
-from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, WindowState
 from jobhunter.run_settings import load_run_settings
 from jobhunter.scoring import cycles
@@ -466,12 +466,7 @@ async def system_status(conn: AsyncConnection, *, now: datetime, fake_llm: bool)
         run = await load_run_settings(conn, config.active.settings_version_id)
     # One view of each window at `now`, rolled forward once, for the quota block, the pause and run now.
     windows = {} if run is None else await live_windows(conn, run, now)
-    quota: dict[Provider, QuotaOut | None] = {}
-    for provider in QUOTA_PROVIDERS:
-        w = windows.get(provider)
-        quota[provider] = (
-            None if w is None else QuotaOut.of(w, await used_units(conn, provider, w.window_start))
-        )
+    quota = await quota_views(conn, windows)
     paid = paid_search(
         quota["jsearch"],
         quota["serpapi"],
