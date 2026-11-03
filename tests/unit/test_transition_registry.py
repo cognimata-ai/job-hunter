@@ -433,7 +433,9 @@ def test_m3_machines() -> None:
     assert bulk.clear_on_exit == {}
     assert bulk.settable == {"spent_usd", "followup_held_usd"}
 
-    # §7.16.6 (L2948-2962): 11 edges; the self-loops of L2955 and L2958 are plain UPDATEs, not transitions
+    # §7.16.6 (L2948-2962): 11 edges, and M4's lost-batch release (plan M4 Task 16, U3): a `submitted`
+    # submission whose retrieval keeps failing past `expires_at + 1 h` → `released`. The self-loops of L2955
+    # and L2958 are plain UPDATEs, not transitions
     submissions = TRANSITIONS["batch_submissions"]
     assert submissions.allowed == {
         ("preparing", "submit_started"),
@@ -444,6 +446,7 @@ def test_m3_machines() -> None:
         ("submit_started", "released"),
         ("submit_ambiguous", "ended"),
         ("submit_ambiguous", "released"),
+        ("submitted", "released"),
         ("released", "ended"),
         ("submitted", "ended"),
         ("ended", "reconciled"),

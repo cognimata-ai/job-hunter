@@ -24,12 +24,15 @@ through an index or within a bound):
   cancelled), the states inlined as constants so that the partial index's predicate is provably implied.
 - `quarantined_batches` (D26, closing Carry T17-d without a new alert): the `submit_ambiguous` submissions
   and the `released` ones whose `submit_started_at` is within `batches.RELEASED_LISTED_FOR` of `now` (the
-  ambiguous reconciliation's own listing, `scoring.batch_adoption`), with the candidates its last pass could
-  not read (`reconcile_report.unread_candidates`, 0 without). Newest submit-start first. `batch_submissions`
-  is scanned: one row per batch, and at most one in flight at a time.
+  ambiguous reconciliation's own listing, `scoring.batch_adoption`, and a released lost batch, which the poll
+  looks for by its provider id as long), with the candidates its last pass could not read
+  (`reconcile_report.unread_candidates`, 0 without). Newest submit-start first. `batch_submissions` is
+  scanned: one row per batch, and at most one in flight at a time.
 - `retrieve_failing` (U3): the `submitted` submissions with an open `batch.retrieve_failing` (joined by the
-  alert's dedup key, `alerts_open_dedup`); `releasable` when `now > expires_at + RETRIEVE_FAILING_AFTER` (1
-  h), and `reserved_usd` the submission's reserved spend, which a release leaves counted as ambiguous (as
+  alert's dedup key, `alerts_open_dedup`); `releasable` by `batches.RELEASABLE_SQL` at `now`, the very
+  predicate under which `batches.release` locks the submission (M4 Task 16: the alert open and `now >
+  expires_at + RETRIEVE_FAILING_AFTER`, 1 h), so the Release button and the route never disagree; and
+  `reserved_usd` the submission's reserved spend, which a release leaves counted as ambiguous (as
   `batches.release` reports it). Newest submit-start first.
 - `mass_disappearances`: the open events, one per source instance with `mass_event_snapshot_id` set, shown by
   their opening snapshot (the id `POST /api/ats-snapshots/{id}/acknowledge` takes). Newest first.
@@ -67,8 +70,12 @@ from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.llm.gateway import AUTH_FAILED_ALERT
 from jobhunter.llm.spend_ledger import BOUND_VIOLATED_ALERT
-from jobhunter.scoring.batch_results import RETRIEVE_FAILING_AFTER, RETRIEVE_FAILING_ALERT
-from jobhunter.scoring.batches import RELEASED_LISTED_FOR
+from jobhunter.scoring.batches import (
+    RELEASABLE_SQL,
+    RELEASED_LISTED_FOR,
+    RETRIEVE_FAILING_ALERT,
+    releasable_params,
+)
 from jobhunter.scoring.targets import RETRYABLE_STATES
 from jobhunter.settings import scope_apply
 from jobhunter.sources.replay import RESPONSE_REPLAYABLE_SQL, replayable_since
@@ -122,8 +129,8 @@ _QUARANTINED: Final = q(
     "ORDER BY submit_started_at DESC, id DESC LIMIT :limit"
 )
 _RETRIEVE_FAILING: Final = q(
-    "/* attention.retrieve_failing */ SELECT s.id, s.provider_batch_id, s.expires_at, a.id AS alert_id, "
-    "s.reserved_usd, count(*) OVER () AS total FROM batch_submissions s "
+    "/* attention.retrieve_failing */ SELECT s.id, s.provider_batch_id, s.expires_at, a.id AS alert_id, "  # noqa: S608
+    f"s.reserved_usd, {RELEASABLE_SQL} AS releasable, count(*) OVER () AS total FROM batch_submissions s "
     "JOIN alerts a ON a.dedup_key = :prefix || CAST(s.id AS text) AND a.resolved_at IS NULL "
     "WHERE s.state = 'submitted' ORDER BY s.submit_started_at DESC, s.id DESC LIMIT :limit"
 )
@@ -457,7 +464,9 @@ async def _quarantined(conn: AsyncConnection, now: datetime) -> QuarantinedBatch
 
 
 async def _retrieve_failing(conn: AsyncConnection, now: datetime) -> RetrieveFailingSectionOut:
-    count, rows = await _rows(conn, _RETRIEVE_FAILING, prefix=f"{RETRIEVE_FAILING_ALERT}:")
+    count, rows = await _rows(
+        conn, _RETRIEVE_FAILING, prefix=f"{RETRIEVE_FAILING_ALERT}:", **releasable_params(now)
+    )
     return RetrieveFailingSectionOut(
         count=count,
         items=[
@@ -467,7 +476,7 @@ async def _retrieve_failing(conn: AsyncConnection, now: datetime) -> RetrieveFai
                 expires_at=r.expires_at,
                 alert_id=r.alert_id,
                 reserved_usd=r.reserved_usd,
-                releasable=r.expires_at is not None and now > r.expires_at + RETRIEVE_FAILING_AFTER,
+                releasable=r.releasable,
             )
             for r in rows
         ],

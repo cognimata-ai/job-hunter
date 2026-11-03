@@ -136,7 +136,8 @@ export interface paths {
         put?: never;
         /**
          * Release Batch
-         * @description Release a quarantined batch submission and re-score its targets; its reserved spend stays counted as
+         * @description Release a quarantined batch submission, or a submitted batch whose retrieval still fails more than 1 h
+         *     past its expiry (its alert open), and re-score its targets; its reserved spend stays counted as
          *     `ambiguous` unless the batch is found later (202).
          */
         post: operations["release_batch_api_batches__submission_id__release_post"];
@@ -4003,7 +4004,7 @@ export interface components {
         };
         /**
          * ReleaseIn
-         * @description The release of a quarantined submission (§10.10): `confirm` must be `true`.
+         * @description The release of a quarantined or lost batch submission (§10.10): `confirm` must be `true`.
          */
         ReleaseIn: {
             /**
@@ -5829,7 +5830,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The submission is not quarantined (`conflict_state`), or a request with this key is still running (`idempotency_in_progress`) */
+            /** @description The submission cannot be released now (`conflict_state` with detail `not_releasable`): it is neither quarantined nor a submitted batch whose retrieval still fails more than 1 h past its expiry with its alert open, or a request with this key is still running (`idempotency_in_progress`) */
             409: {
                 headers: {
                     [name: string]: unknown;

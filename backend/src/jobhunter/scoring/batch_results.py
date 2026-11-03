@@ -11,11 +11,22 @@ handler sends it right after `record_created`'s commit, and `batch_poll` again o
 submission is `submitted` and its batch in progress.
 
 **The poll** (`poll`, the body of `batch_poll`, every 5 min on `aux`, L3958), for every `submitted` and
-`ended` submission, one at a time, each transaction fenced by the worker epoch: a `submitted` one is
-retrieved, has its recorded cancel sent while in progress (then is retrieved again), and once
-`processing_status = 'ended'` it moves `submitted → ended` (`active_config FOR SHARE`, the owner `FOR UPDATE`
-under `state = 'submitted'`); a retrieval still failing past `expires_at + 1 h` raises the critical
-`batch.retrieve_failing` (ids only; resolved by the move to `ended`); an `ended` one has its results streamed
+`ended` submission, and every `released` one with a provider id (a lost batch the user released, plan M4 Task
+16) whose `submit_started_at` is within `batches.RELEASED_LISTED_FOR` (29 days) of `now`, one at a time, each
+transaction fenced by the worker epoch: a `submitted` one is retrieved, has its recorded cancel sent while in
+progress (then is retrieved again), and once `processing_status = 'ended'` it moves `submitted → ended`
+(`active_config FOR SHARE`, the owner `FOR UPDATE` under `state = 'submitted'`, or `released` with a provider
+id); a retrieval still failing past `expires_at + 1 h` raises the critical `batch.retrieve_failing` (ids only;
+in a transaction that holds the submission `FOR SHARE` while it is still `submitted`, so a release that
+committed meanwhile is never alerted again; resolved by the move to `ended` or by the release). A released
+lost batch is observed the same way
+but raises nothing while its retrieval fails; once its batch has `ended` it moves `released → ended`
+(`released_at` kept, outside the singleton), and its results take the path of every `ended` submission: every
+item `ignored_fenced` (its targets are no longer `in_batch` for it), each entry settled from the provider's
+evidence, `reconciled` without a follow-on (§10.10's released lifecycle, as the adoption of a released
+quarantine has it). The release and the poll's move both lock the owner row, so whichever commits second
+sees the other's state: a release after the move finds nothing releasable, and a move after the release
+locks the row as `released` (the owner lock takes either state). An `ended` one has its results streamed
 line by line (`BatchesClient.results`, never buffered whole), each line's item decided in **a transaction of
 its own** (`batch_items.process_item`; never two items in one: an item takes its job row before its owner and
 ends on `ranking_state`, Codex r6 B1), the fault point `batch.after_item` after each commit. A `followup`
@@ -113,21 +124,30 @@ ITEM_UNPROCESSABLE_ALERT: Final = "batch.item_unprocessable"  # Ruling T17-a
 CUSTOM_ID_ANOMALY_ALERT: Final = "batch.custom_id_anomaly"
 RESULTS_UNREADABLE_ALERT: Final = "batch.results_unreadable"
 # A `submitted` batch whose retrieval still fails this long past its `expires_at` (L3958: the provider has
-# ended it by then) raises the critical `batch.retrieve_failing`.
-RETRIEVE_FAILING_ALERT: Final = "batch.retrieve_failing"
-RETRIEVE_FAILING_AFTER: Final = timedelta(hours=1)
+# ended it by then) raises the critical `batch.retrieve_failing`; the state machine's (`batches`, whose
+# release of a lost batch is gated by them too).
+RETRIEVE_FAILING_ALERT: Final = batches.RETRIEVE_FAILING_ALERT
+RETRIEVE_FAILING_AFTER: Final = batches.RETRIEVE_FAILING_AFTER
 _SUBMISSIONS: Final = "batch_submissions"
 _UNREADABLE_PASSES: Final = "unreadable_passes"
 # the class of the error that left the stream unreadable (never `error_class`, the ambiguous create's key)
 _UNREADABLE_ERROR_CLASS: Final = "unreadable_error_class"
 _FAILED_ITEMS: Final = "failed_items"
-# The poll's submissions, read without a lock, and its owners.
+# The poll's submissions, read without a lock (a released lost batch while `submit_started_at` is within
+# `batches.RELEASED_LISTED_FOR` of `:listed_since`'s `now`), and its owners: the one whose batch it observes
+# (`submitted`, or a released lost batch: a release may commit between the read and this lock), and the one
+# whose `batch.retrieve_failing` it raises (still `submitted`).
 _POLLED: Final = q(
     "SELECT id, state, provider_batch_id, cancel_requested_at, expires_at FROM batch_submissions "
-    "WHERE state IN ('submitted', 'ended') ORDER BY id"
+    "WHERE state IN ('submitted', 'ended') OR (state = 'released' AND provider_batch_id IS NOT NULL "
+    "AND submit_started_at > :listed_since) ORDER BY id"
 )
-_LOCK_SUBMITTED: Final = q(
-    "SELECT id FROM batch_submissions WHERE id = :s AND state = 'submitted' FOR UPDATE"
+_LOCK_OBSERVED: Final = q(
+    "SELECT state FROM batch_submissions WHERE id = :s "
+    "AND (state = 'submitted' OR (state = 'released' AND provider_batch_id IS NOT NULL)) FOR UPDATE"
+)
+_LOCK_STILL_SUBMITTED: Final = q(
+    "SELECT id FROM batch_submissions WHERE id = :s AND state = 'submitted' FOR SHARE"
 )
 _ENDED: Final = q(
     "SELECT id, bulk_operation_id, provider_batch_id, submit_started_at, results_complete_at, "
@@ -711,8 +731,10 @@ class PollReport:
 async def _retrieve(
     engine: AsyncEngine, client: BatchesClient, row: Row[tuple[object, ...]], *, now: datetime, epoch: int
 ) -> BatchStatus | None:
-    """The batch of a `submitted` submission retrieved; `None` when the retrieval failed (logged), and past
-    `expires_at + RETRIEVE_FAILING_AFTER` the critical `batch.retrieve_failing` raised (ids only)."""
+    """The batch of a `submitted` submission (or of a released lost one) retrieved; `None` when the retrieval
+    failed (logged), and for a `submitted` one past `expires_at + RETRIEVE_FAILING_AFTER` the critical
+    `batch.retrieve_failing` raised (ids only), while it is still `submitted` under its lock: a released one
+    raises nothing, also when its release committed during the retrieval."""
     submission_id, provider_batch_id = int(row.id), str(row.provider_batch_id)
     try:
         return await client.retrieve(provider_batch_id)
@@ -720,32 +742,41 @@ async def _retrieve(
         log.warning(
             "batch_retrieve_failed",
             submission_id=submission_id,
+            state=str(row.state),
             error_class=failure.error_class,
             status=failure.status,
         )
     expires_at = row.expires_at
-    if isinstance(expires_at, datetime) and now > expires_at + RETRIEVE_FAILING_AFTER:
-        async with engine.begin() as conn:
-            await fence_epoch(conn, epoch)
-            await raise_alert(
-                conn,
-                code=RETRIEVE_FAILING_ALERT,
-                severity="critical",
-                subject=str(submission_id),
-                message="a submitted batch past its expiry still cannot be retrieved",
-                context={"submission_id": submission_id, "provider_batch_id": provider_batch_id},
-            )
-        log.error("batch_retrieve_failing", submission_id=submission_id, provider_batch_id=provider_batch_id)
+    if row.state != "submitted" or not isinstance(expires_at, datetime):
+        return None
+    if now <= expires_at + RETRIEVE_FAILING_AFTER:
+        return None
+    async with engine.begin() as conn:
+        await fence_epoch(conn, epoch)
+        await cycles.lock_active_scoring(conn)
+        if (await conn.execute(_LOCK_STILL_SUBMITTED, {"s": submission_id})).first() is None:
+            return None  # released meanwhile: nothing to raise
+        await raise_alert(
+            conn,
+            code=RETRIEVE_FAILING_ALERT,
+            severity="critical",
+            subject=str(submission_id),
+            message="a submitted batch past its expiry still cannot be retrieved",
+            context={"submission_id": submission_id, "provider_batch_id": provider_batch_id},
+        )
+    log.error("batch_retrieve_failing", submission_id=submission_id, provider_batch_id=provider_batch_id)
     return None
 
 
 async def _observe(
     engine: AsyncEngine, client: BatchesClient, row: Row[tuple[object, ...]], *, now: datetime, epoch: int
 ) -> tuple[bool, bool]:
-    """A `submitted` submission: the batch retrieved (`_retrieve`), its recorded cancel sent while it is
-    `in_progress` (`cancel_requested`; once one is accepted, the batch retrieved again), and, once `ended`,
-    the move `submitted → ended` (resolving a `batch.retrieve_failing` of it); whether a cancel was sent and
-    whether it ended."""
+    """A `submitted` submission, or a released lost one: the batch retrieved (`_retrieve`), its recorded
+    cancel sent while it is `in_progress` (`cancel_requested`; once one is accepted, the batch retrieved
+    again), and, once `ended`, the move to `ended` from the state it holds under its lock (resolving a
+    `batch.retrieve_failing` of it): `submitted → ended`, or `released → ended` keeping `released_at` (also
+    for a row listed `submitted` whose release committed meanwhile: it is then processed as released, every
+    item fenced); whether a cancel was sent and whether it ended."""
     submission_id, provider_batch_id = int(row.id), str(row.provider_batch_id)
     status = await _retrieve(engine, client, row, now=now, epoch=epoch)
     if status is None:
@@ -762,26 +793,32 @@ async def _observe(
     async with engine.begin() as conn:
         await fence_epoch(conn, epoch)
         await cycles.lock_active_scoring(conn)
-        if (await conn.execute(_LOCK_SUBMITTED, {"s": submission_id})).first() is None:
+        owner = (await conn.execute(_LOCK_OBSERVED, {"s": submission_id})).first()
+        if owner is None:
             return cancelled, False  # moved meanwhile
-        await transition(conn, _SUBMISSIONS, submission_id, ["submitted"], "ended")
+        await transition(conn, _SUBMISSIONS, submission_id, [str(owner.state)], "ended")
         await resolve_alert(conn, code=RETRIEVE_FAILING_ALERT, subject=str(submission_id))
-    log.info("batch_ended", submission_id=submission_id, provider_batch_id=provider_batch_id)
+    log.info(
+        "batch_ended",
+        submission_id=submission_id,
+        provider_batch_id=provider_batch_id,
+        origin=str(owner.state),
+    )
     return cancelled, True
 
 
 async def poll(
     engine: AsyncEngine, client: BatchesClient, *, now: datetime, epoch: int, defer: Deferrer
 ) -> PollReport:
-    """The body of `batch_poll` (module docstring): every `submitted` submission observed (its recorded
-    cancel first), and every `ended` one's results processed and completed. An item whose processing raises
-    is skipped for the pass and counted (Ruling T17-a); any other error ends the pass there, and the next
-    poll resumes from the rows (every step is idempotent)."""
+    """The body of `batch_poll` (module docstring): every `submitted` submission and every released lost one
+    still listed observed (its recorded cancel first), and every `ended` one's results processed and
+    completed. An item whose processing raises is skipped for the pass and counted (Ruling T17-a); any other
+    error ends the pass there, and the next poll resumes from the rows (every step is idempotent)."""
     async with engine.connect() as conn:
-        rows = (await conn.execute(_POLLED)).all()
+        rows = (await conn.execute(_POLLED, {"listed_since": now - batches.RELEASED_LISTED_FOR})).all()
     report = PollReport(polled=len(rows))
     for row in rows:
-        if row.state == "submitted":
+        if row.state in ("submitted", "released"):
             cancelled, ended = await _observe(engine, client, row, now=now, epoch=epoch)
             report = replace(report, cancels=report.cancels + cancelled, ended=report.ended + ended)
             if not ended:

@@ -103,8 +103,8 @@ timeout. `GET /api/system/spend` shows the held amount as `quarantined_batch_usd
    ```
 
    It answers 202 with `{"submission_id", "state": "released", "reserved_usd"}`: the amount that stays counted.
-   A submission that is not `submit_ambiguous` is 409 `conflict_state`. ("Release & re-score" in System →
-   Needs attention comes with M4's UI.)
+   A submission that cannot be released is 409 `conflict_state` with `detail` `not_releasable`. ("Release &
+   re-score" in System → Needs attention comes with M4's UI.)
 4. After the release the submission is `released`: its targets are `pending` again and are re-scored, its
    reserved amount stays counted as `ambiguous`, and the alert is resolved. The reconciler keeps listing for
    29 days: if the batch turns up after all, its items settle from the provider's per-item results and publish
@@ -147,12 +147,18 @@ online cycles.
      (Message Batches).
 3. Once a retrieval succeeds and the batch has ended, the next poll moves the submission to `ended`, resolves
    the alert and processes the results as usual. Nothing else is needed.
-4. A batch that is gone for good (404, and not in the console) has no operator path today. The batch state
-   machine (`db/transitions.py`, `batch_submissions`) lets a `submitted` submission move only to `ended`, and
-   only the poll makes that move, after a successful retrieval. No API route or CLI command moves it, and the
-   database's transition trigger refuses any other move of its state. Do not edit the row by hand. The
-   submission keeps its targets and its reserved spend until an operator path arrives in M4. Acknowledging the
-   alert (`POST /api/alerts/<id>/ack`) records that you saw it; it moves nothing, and the alert stays open.
+4. A batch that stays lost (a 404, and not in the console): past `expires_at + 1 h` with the alert open,
+   System → Needs attention → Release & re-score (or `POST /api/batches/{id}/release {"confirm": true}`)
+   releases it; its reservation stays counted as ambiguous and the poll keeps looking for the batch for 29
+   days. The request is the one of step 3 of the quarantine above, with that submission's id; it answers 202
+   with the `reserved_usd` that stays counted, and 409 `conflict_state` with `detail` `not_releasable` before
+   the hour has passed, without the open alert, or once the poll has moved the submission on. After the
+   release the submission is `released` (its `provider_batch_id` kept), its targets are `pending` again and
+   re-scored, the alert is resolved, and a new batch may be submitted. If a later retrieval finds the batch
+   ended, the poll moves the submission `released → ended → reconciled`: its items settle from the provider's
+   per-item results and publish nothing. A retrieval that keeps failing raises nothing more. Do not edit the
+   row by hand. Acknowledging the alert (`POST /api/alerts/<id>/ack`) records that you saw it; it moves
+   nothing.
 
 ## The live schema dry-run before a prompt-schema version is activated
 

@@ -5,10 +5,11 @@ workspace's listing, its batch adopted and its results completed by the poll's o
 
 **The ambiguous-submit reconciliation** (`reconcile_ambiguous`, the body of `batch_reconcile_ambiguous`, every
 15 min on `aux`, L3984-3999), for every `submit_ambiguous` submission and every `released` one with
-`submit_started_at > now - 29 days` (A2 B12; an older one is listed no more): first, at 25 h after its
-submit-start, each `submit_ambiguous` one opens the critical `batch.submit_ambiguous_unresolved` with the
-amount it holds and the unread candidates of the last pass (`reconcile_report.unread_candidates`, 0 without;
-never a transition, chair decision C3; also while the listing fails, C22); then one listing
+`submit_started_at > now - 29 days` (A2 B12; an older one is listed no more), each without a provider id (a
+released lost batch has its own, and `batch_poll` looks for it by that id, plan M4 Task 16): first, at 25 h
+after its submit-start, each `submit_ambiguous` one opens the critical `batch.submit_ambiguous_unresolved`
+with the amount it holds and the unread candidates of the last pass (`reconcile_report.unread_candidates`, 0
+without; never a transition, chair decision C3; also while the listing fails, C22); then one listing
 of the whole workspace (`list_all`; a failure leaves every row untouched, logged `batch_listing_failed`; the
 workspace is this installation's alone, A2 B15), less the batches some submission adopted already. For each
 submission, the candidates are the batches created within `[submit_started_at - 1 min, submit_started_at + 10
@@ -72,12 +73,13 @@ UNRESOLVED_AFTER: Final = timedelta(hours=25)
 RELEASED_LISTED_FOR: Final = batches.RELEASED_LISTED_FOR
 _SUBMISSIONS: Final = "batch_submissions"
 # The ambiguous reconciliation's submissions (L3984: every `submit_ambiguous` one, the `released` ones within
-# the results' retention), the ids adopted already, its owner and its record of a pass without a match.
+# the results' retention; only those without a provider id: a released lost batch, plan M4 Task 16, is the
+# poll's to find by its id), the ids adopted already, its owner and its record of a pass without a match.
 _AMBIGUOUS: Final = q(
     "SELECT id, state, submit_started_at, request_count, reserved_usd, "
     "coalesce(CAST(reconcile_report ->> 'unread_candidates' AS integer), 0) AS unread_candidates "
-    "FROM batch_submissions "
-    "WHERE state = 'submit_ambiguous' OR (state = 'released' AND submit_started_at > :since) ORDER BY id"
+    "FROM batch_submissions WHERE provider_batch_id IS NULL "
+    "AND (state = 'submit_ambiguous' OR (state = 'released' AND submit_started_at > :since)) ORDER BY id"
 )
 _ADOPTED_IDS: Final = q("SELECT provider_batch_id FROM batch_submissions WHERE provider_batch_id IS NOT NULL")
 _LOCK_ADOPTABLE: Final = q(

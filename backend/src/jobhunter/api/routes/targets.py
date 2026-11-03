@@ -18,11 +18,14 @@ the handler, so the key's row rolls back with the rest and a retry with the key 
 - `POST /api/targets/{target_id}/retry` → 202 `{target_id, state}`: `targets.retry` of a `refused` or
   `failed_*` target (the Retry edge: its charged attempts reset); 404 `not_found`, 409 `conflict_state`.
 - `POST /api/batches/{submission_id}/release` (`{confirm: true}`) → 202 `{submission_id, state:
-  "released", reserved_usd}`: `batches.release` of a `submit_ambiguous` submission (the owner row, then the
-  month row its entries' settlements lock, the bulk rows, the targets: after `active_config` and the key's
-  row, before any target row); `reserved_usd` is the amount its entries keep counted as `ambiguous` unless
-  the batch is found later. 409 `conflict_state` for a submission in any other state, 404 `not_found` for
-  no such submission, 422 without `confirm: true`.
+  "released", reserved_usd}`: `batches.release` of a releasable submission (`batches.RELEASABLE_SQL` at the
+  route's `now`: a `submit_ambiguous` one, or, plan M4 Task 16, a `submitted` one whose
+  `batch.retrieve_failing` is open past `expires_at + 1 h`; the owner row, then the month row its entries'
+  settlements lock, the bulk rows, the targets: after `active_config` and the key's row, before any target
+  row); `reserved_usd` is the amount its entries keep counted as `ambiguous` unless the batch is found later.
+  404 `not_found` for no such submission; 409 `conflict_state` with `detail = "not_releasable"` for one that
+  is not releasable (`api.errors.domain_problem`'s mapping of the `TransitionConflict`, with this route's
+  detail); 422 without `confirm: true`.
 
 `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.targets.utcnow`. The domain functions log their moves and refusals (ids and codes).
@@ -38,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_engine, require_session
-from jobhunter.api.errors import Problem
+from jobhunter.api.errors import Problem, domain_problem
 from jobhunter.api.models import DecimalOut
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
@@ -60,6 +63,8 @@ router = APIRouter(dependencies=[Depends(require_session)], responses=SESSION_RE
 SCORE_NOW_ROUTE: Final = "jobs.score_now"
 RETRY_ROUTE: Final = "targets.retry"
 RELEASE_ROUTE: Final = "batches.release"
+# The `detail` of the release's 409: the submission is not releasable now.
+NOT_RELEASABLE: Final = "not_releasable"
 _BIGINT_MAX: Final = 2**63 - 1
 
 _SUBMISSION_EXISTS: Final = q("SELECT EXISTS (SELECT 1 FROM batch_submissions WHERE id = :s)")
@@ -87,7 +92,7 @@ class TargetMovedOut(BaseModel):
 
 
 class ReleaseIn(BaseModel):
-    """The release of a quarantined submission (§10.10): `confirm` must be `true`."""
+    """The release of a quarantined or lost batch submission (§10.10): `confirm` must be `true`."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -232,7 +237,11 @@ async def retry_target(
     responses={
         **_KEY_RESPONSES,
         404: {"description": "No such batch submission (`not_found`)"},
-        409: {"description": f"The submission is not quarantined (`conflict_state`), or {_IN_PROGRESS}"},
+        409: {
+            "description": "The submission cannot be released now (`conflict_state` with detail "
+            "`not_releasable`): it is neither quarantined nor a submitted batch whose retrieval still fails "
+            f"more than 1 h past its expiry with its alert open, or {_IN_PROGRESS}"
+        },
         422: {"description": f"Invalid body or no `confirm: true` (`validation_failed`), or {_KEY_REUSED}"},
         **CSRF_RESPONSES,
         **BODY_LIMIT_RESPONSES,
@@ -244,7 +253,8 @@ async def release_batch(
     engine: Annotated[AsyncEngine, Depends(get_engine)],
     idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
 ) -> Response:
-    """Release a quarantined batch submission and re-score its targets; its reserved spend stays counted as
+    """Release a quarantined batch submission, or a submitted batch whose retrieval still fails more than 1 h
+    past its expiry (its alert open), and re-score its targets; its reserved spend stays counted as
     `ambiguous` unless the batch is found later (202)."""
     key = check_idempotency_key(idempotency_key)
     now = utcnow()
@@ -252,16 +262,14 @@ async def release_batch(
     async def handler(conn: AsyncConnection) -> StoredResponse:
         try:
             released = await batches.release(conn, submission_id, now=now, defer=defer_in_tx)
-        except TransitionConflict:
+        except TransitionConflict as exc:
             exists = bool((await conn.execute(_SUBMISSION_EXISTS, {"s": submission_id})).scalar_one())
             if not exists:
                 raise _not_found("Batch submission") from None
-            raise Problem(
-                409,
-                "conflict_state",
-                "The batch submission is not quarantined",
-                detail="only a submission whose send is ambiguous can be released",
-            ) from None
+            if (problem := domain_problem(exc)) is None:
+                raise
+            problem.detail = NOT_RELEASABLE  # this route's 409 only
+            raise problem from None
         out = ReleasedOut(submission_id=submission_id, state="released", reserved_usd=released.reserved_usd)
         return StoredResponse(202, out.model_dump(mode="json"))
 
