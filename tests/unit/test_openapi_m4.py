@@ -28,6 +28,7 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("post", "/api/duplicate-groups/{group_id}/confirm"): GROUP_WRITE - {"413"},  # no body
     ("post", "/api/jobs/{job_id}/unmerge"): GROUP_WRITE,
     ("post", "/api/identity-conflicts/{conflict_id}/resolve"): GROUP_WRITE,
+    ("get", "/api/labelling/queue"): {"401", "422", "429"},
 }
 
 

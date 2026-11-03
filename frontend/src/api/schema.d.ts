@@ -439,6 +439,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/labelling/queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Labelling Queue
+         * @description The next ads to label, spread over the score bands with the unlabelled ones first, and the labelling
+         *     progress; neither shows a score.
+         */
+        get: operations["get_labelling_queue_api_labelling_queue_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/profile": {
         parameters: {
             query?: never;
@@ -2110,6 +2131,45 @@ export interface components {
             severity: string;
             /** Status */
             status: string;
+        };
+        /**
+         * LabelItemOut
+         * @description An ad to label: its job, title, company, location labels, ad language and the first 600 characters
+         *     (code points) of its description. It carries no score.
+         */
+        LabelItemOut: {
+            /** Ad Language */
+            ad_language: string;
+            /** Company */
+            company: string;
+            /** Excerpt */
+            excerpt: string;
+            /** Job Id */
+            job_id: number;
+            /** Locations */
+            locations: string[];
+            /** Title */
+            title: string;
+        };
+        /**
+         * LabelProgressOut
+         * @description The active week-1 golden cases of the active profile, and the number to reach.
+         */
+        LabelProgressOut: {
+            /** Labelled */
+            labelled: number;
+            /** Target */
+            target: number;
+        };
+        /**
+         * LabellingQueueOut
+         * @description The ads to label next, spread over the score bands, those without a label for the active profile
+         *     first, and the labelling progress. Neither carries a score or a band.
+         */
+        LabellingQueueOut: {
+            /** Items */
+            items: components["schemas"]["LabelItemOut"][];
+            progress: components["schemas"]["LabelProgressOut"];
         };
         /** Language */
         Language: {
@@ -5008,6 +5068,55 @@ export interface operations {
                 };
             };
             /** @description Invalid path or body (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_labelling_queue_api_labelling_queue_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LabellingQueueOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A `limit` outside 1 to 50 (`validation_failed`) */
             422: {
                 headers: {
                     [name: string]: unknown;

@@ -53,6 +53,7 @@ from jobhunter.api.routes import (
     groups,
     health,
     jobs,
+    labelling,
     profile,
     profile_review,
     queries,
@@ -216,6 +217,7 @@ def create_app(
     api.include_router(targets.router)
     api.include_router(groups.router)
     api.include_router(golden.router)
+    api.include_router(labelling.router)
     api.include_router(alerts.router)
     for router in extra_routers:
         api.include_router(router)
