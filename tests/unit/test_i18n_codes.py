@@ -16,6 +16,7 @@ from; a computed call not listed there fails the test, as does a listed site the
 import ast
 import importlib
 import json
+import re
 import textwrap
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
@@ -26,9 +27,12 @@ import pytest
 from jobhunter.api.routes import profile_review
 from jobhunter.api.routes import settings as settings_routes
 from jobhunter.db import ranking
+from jobhunter.db.seed import SOURCES
 from jobhunter.errors import ErrorCode
 from jobhunter.graphs.collect.nodes.finalize import PartialCause
+from jobhunter.jobs.cards import Badge, ScoreOut
 from jobhunter.llm import gateway
+from jobhunter.llm.schemas.published import KnockoutCode
 from jobhunter.observability.health import RunStatus
 from jobhunter.observability.lists import AlertStatus
 from jobhunter.observability.status import BannerCode, Pace, PaidSearchReason
@@ -37,6 +41,7 @@ from jobhunter.profile.review import Repair
 from jobhunter.quota import windows
 from jobhunter.quota.windows import WindowState
 from jobhunter.scoring.cycles import PauseReason
+from jobhunter.scoring.filters import FilterCode
 from jobhunter.sources import breaker
 from jobhunter.worker import runs
 
@@ -44,6 +49,7 @@ REPO: Final = Path(__file__).resolve().parents[2]
 SRC: Final = REPO / "backend/src"
 PACKAGE: Final = SRC / "jobhunter"
 CODES: Final = REPO / "frontend/src/i18n/codes.json"
+COLLECTION_MIGRATION: Final = PACKAGE / "db/migrations/versions/0005_m1_collection.py"
 ALERT_FUNCTIONS: Final = frozenset({"raise_alert", "open_alert"})
 
 
@@ -244,6 +250,16 @@ def issue_codes() -> set[str]:
     )
 
 
+def check_values(path: Path, column: str) -> set[str]:
+    """The values of a migration's `<column> text CHECK (<column> IN ('a','b',…))`, read from its text."""
+    text = path.read_text(encoding="utf-8")
+    found = re.findall(rf"\b{column}\s+text\s+CHECK\s*\(\s*{column}\s+IN\s*\(([^)]*)\)\s*\)", text)
+    assert len(found) == 1, f"{path.name}: {len(found)} CHECKs of {column}"
+    values = re.findall(r"'([^']*)'", found[0])
+    assert values, f"{path.name}: the CHECK of {column} lists no value"
+    return set(values)
+
+
 # Each namespace of codes.json with its backend source.
 NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "problem": lambda: literal_values(ErrorCode),
@@ -267,6 +283,15 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     "window_state": lambda: literal_values(WindowState),
     "instance_health": lambda: literal_values(breaker.Health),
     "alert_status": lambda: literal_values(AlertStatus),
+    # the job cards (plan M4 Task 22): the card badges, the knockout codes, the hard-filter reasons, why a
+    # duplicate group is not scorable (the `duplicate_groups.unscorable_reason` CHECK), the score's confidence
+    # and the source ids, whose names are the product names, the same in both languages
+    "badge": lambda: literal_values(Badge),
+    "knockout": lambda: literal_values(KnockoutCode),
+    "filter_reason": lambda: literal_values(FilterCode),
+    "group_unscorable": lambda: check_values(COLLECTION_MIGRATION, "unscorable_reason"),
+    "confidence": lambda: literal_values(ScoreOut.model_fields["confidence"].annotation),
+    "source": lambda: {source.id for source in SOURCES},
 }
 
 

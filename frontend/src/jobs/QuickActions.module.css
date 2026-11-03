@@ -1,0 +1,45 @@
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.toggle {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.toggle:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+}
+
+/* Pressed: filled, and the card's text marker (★ saved, ✓ applied) says so as well. */
+.toggle[aria-pressed="true"] {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.toggle:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+.open {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 32px;
+  margin-left: auto;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}

@@ -227,5 +227,57 @@
     "adzuna",
     "jsearch",
     "serpapi"
+  ],
+  "badge": [
+    "adzuna",
+    "closed",
+    "contested",
+    "injection_suspected",
+    "partial",
+    "possibly_not_a_job_ad",
+    "shortened",
+    "stale"
+  ],
+  "knockout": [
+    "certification",
+    "contract_type",
+    "degree",
+    "mandatory_language",
+    "onsite_required",
+    "security_clearance",
+    "work_permit"
+  ],
+  "filter_reason": [
+    "ad_language_excluded",
+    "beyond_radius",
+    "employment_type_excluded",
+    "excluded_company",
+    "excluded_industry",
+    "excluded_keyword",
+    "outside_germany",
+    "seniority_out_of_range",
+    "work_mode_excluded"
+  ],
+  "group_unscorable": [
+    "all_failed",
+    "all_filtered",
+    "no_active_member"
+  ],
+  "confidence": [
+    "high",
+    "low",
+    "medium"
+  ],
+  "source": [
+    "adzuna",
+    "arbeitnow",
+    "ashby",
+    "greenhouse",
+    "jsearch",
+    "lever",
+    "personio",
+    "recruitee",
+    "serpapi",
+    "smartrecruiters"
   ]
 }

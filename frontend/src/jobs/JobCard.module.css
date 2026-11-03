@@ -1,0 +1,136 @@
+/* A card: the facts on the left, the score or the state on the right, the actions along the bottom. One column
+ * at 640 px and below (a phone, or 1280 px at 200 % zoom). */
+.card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 280px);
+  grid-template-areas:
+    "main side"
+    "actions actions";
+  gap: var(--space-3) var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface);
+}
+
+.card:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.main {
+  grid-area: main;
+  display: grid;
+  align-content: start;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.title {
+  font-size: var(--font-size-4);
+  overflow-wrap: anywhere;
+}
+
+.company {
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.where,
+.dates {
+  font-size: var(--font-size-2);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* The "·" between dates sits in the gap before each date; the row's left edge clips the one before the first
+   date of each visual line, so a wrapped line never starts with a dot (as the header strip's lines do). */
+.dates {
+  --gap: var(--space-4);
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--gap);
+  overflow: hidden;
+}
+
+.date {
+  position: relative;
+}
+
+.date::before {
+  content: "·" / "";
+  position: absolute;
+  left: calc(-0.5 * var(--gap) - 0.3ch);
+  color: var(--color-border-strong);
+}
+
+.marks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+}
+
+.sources {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.source {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-1);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.8;
+}
+
+.new {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-1);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  font-size: var(--font-size-1);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: 0.04em;
+  line-height: 1.8;
+}
+
+.marker {
+  color: var(--color-accent);
+  font-size: var(--font-size-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.side {
+  grid-area: side;
+  display: grid;
+  align-content: start;
+  justify-items: stretch;
+  min-width: 0;
+}
+
+.unscored {
+  display: grid;
+  gap: var(--space-3);
+  justify-items: start;
+}
+
+.actions {
+  grid-area: actions;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+@media (max-width: 640px) {
+  .card {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "main"
+      "side"
+      "actions";
+    padding: var(--space-3);
+  }
+}

@@ -13,6 +13,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { AppShell } from "./app/AppShell";
 import styles from "./app/Pages.module.css";
+import { JobsPage } from "./pages/JobsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { ProfileSettingsPage } from "./pages/ProfileSettingsPage";
 
@@ -27,11 +28,6 @@ export interface LoginSearch {
 
 export function parseLoginSearch(search: Record<string, unknown>): LoginSearch {
   return typeof search.redirect === "string" ? { redirect: search.redirect } : {};
-}
-
-function JobsPage() {
-  const { t } = useTranslation();
-  return <h1 className={styles.title}>{t("jobs.title")}</h1>;
 }
 
 function NotFoundPage() {

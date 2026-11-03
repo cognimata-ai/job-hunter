@@ -1,0 +1,94 @@
+/* The score badge: the midpoint large, the interval bar under it, then coverage and confidence. */
+.badge {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    "mid interval"
+    "facts facts";
+  align-items: center;
+  column-gap: var(--space-3);
+  row-gap: var(--space-1);
+  min-width: 168px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2);
+  background: var(--color-surface-sunken);
+}
+
+.mid {
+  grid-area: mid;
+  font-size: var(--font-size-6);
+  font-weight: var(--font-weight-bold);
+  line-height: 1;
+  color: var(--color-text);
+}
+
+.interval {
+  grid-area: interval;
+  display: grid;
+  gap: 2px;
+}
+
+.bar {
+  width: 100%;
+  min-width: 72px;
+  height: 10px;
+  overflow: visible;
+}
+
+.track {
+  fill: var(--color-border);
+}
+
+.range {
+  fill: var(--color-accent);
+  opacity: 0.45;
+}
+
+.marker {
+  fill: var(--color-accent);
+}
+
+.numbers {
+  font-size: var(--font-size-1);
+  color: var(--color-text-muted);
+}
+
+.facts {
+  grid-area: facts;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  font-size: var(--font-size-1);
+  color: var(--color-text-muted);
+}
+
+.confidence {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+}
+
+.high {
+  border-color: var(--color-success);
+  background: var(--color-success);
+}
+
+.medium {
+  border-color: var(--color-warn);
+  background: var(--color-warn-bg);
+}
+
+.low {
+  border-color: var(--color-critical);
+  background: var(--color-surface);
+}

@@ -21,6 +21,17 @@ export interface RelativeTimeProps {
   now?: Date;
 }
 
+/** `date` relative to `now` in `locale`'s words, in the largest unit that fits ("2 hours ago", "yesterday");
+ * "now" within 45 seconds. */
+export function relativeText(date: Date, now: Date, locale: string): string {
+  const seconds = (date.getTime() - now.getTime()) / 1000;
+  const relative = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+  const unit = UNITS.find(([, size]) => Math.abs(seconds) >= size);
+  return Math.abs(seconds) < NOW_WITHIN_S || unit === undefined
+    ? relative.format(0, "second")
+    : relative.format(Math.round(seconds / unit[1]), unit[0]);
+}
+
 export function RelativeTime({ value, tz, now }: RelativeTimeProps) {
   const { i18n } = useTranslation();
   const date = typeof value === "string" ? new Date(value) : value;
@@ -28,13 +39,7 @@ export function RelativeTime({ value, tz, now }: RelativeTimeProps) {
     return null;
   }
   const locale = intlLocale(i18n.language);
-  const seconds = (date.getTime() - (now ?? new Date()).getTime()) / 1000;
-  const relative = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
-  const unit = UNITS.find(([, size]) => Math.abs(seconds) >= size);
-  const text =
-    Math.abs(seconds) < NOW_WITHIN_S || unit === undefined
-      ? relative.format(0, "second")
-      : relative.format(Math.round(seconds / unit[1]), unit[0]);
+  const text = relativeText(date, now ?? new Date(), locale);
   const absolute = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short", timeZone: tz }).format(date);
   return (
     <time dateTime={date.toISOString()} title={absolute}>

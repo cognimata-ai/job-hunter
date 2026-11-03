@@ -1,11 +1,14 @@
 // A stub of the api behind `fetch`, for tests that render the app: a session that a login opens and a test
-// can end, the session, settings and header-status reads, the logout, the login's answers in the order a test
-// gives them, and any other route a test answers itself (`routes`).
+// can end, the session, settings, header-status, Jobs-list and spend reads, the logout, the login's answers in
+// the order a test gives them, and any other route a test answers itself (`routes`).
 import { vi } from "vitest";
 import type { components } from "../api/schema";
 
 type SessionOut = components["schemas"]["SessionOut"];
 type StatusOut = components["schemas"]["StatusOut"];
+type JobCardOut = components["schemas"]["JobCardOut"];
+type JobsPageOut = components["schemas"]["JobsPageOut"];
+type SpendOut = components["schemas"]["SpendOut"];
 
 export const SESSION: SessionOut = {
   username: "smoke",
@@ -64,6 +67,79 @@ export function statusOut(overrides: Partial<StatusOut> = {}): StatusOut {
   };
 }
 
+/** A card of the Jobs list: job 5, a pending (unscored) ad at Acme in Berlin, posted two days before `NOW`
+ * (07:00 UTC on 3 Nov 2026), first seen the day before and last seen two hours before, not yet acted on. */
+export function jobCard(overrides: Partial<JobCardOut> = {}): JobCardOut {
+  return {
+    job_id: 5,
+    kind: "job",
+    title: "Senior Backend Engineer",
+    company: "Acme GmbH",
+    company_key: "acme",
+    locations: ["Berlin"],
+    location_kind: "city",
+    work_modes: ["hybrid"],
+    work_mode_known: true,
+    posted_at: "2026-11-01T07:00:00Z",
+    posted_precision: "exact",
+    first_seen_at: "2026-11-02T07:00:00Z",
+    last_seen_at: "2026-11-03T05:00:00Z",
+    source_ids: ["greenhouse"],
+    availability: "active",
+    completeness: "full",
+    ad_language: "en",
+    user: null,
+    score: null,
+    target: { id: 50, state: "pending", state_reason: null, refusal_category: null, similarity: 0.62, override: "none" },
+    bucket: "unscored",
+    badges: [],
+    knockouts: [],
+    filter_reasons: [],
+    filter_keyword: null,
+    previous: null,
+    possible_duplicate_of: null,
+    group: null,
+    group_badge: null,
+    links: { open_ad: "https://boards.example.com/acme/jobs/5", adzuna: null },
+    ...overrides,
+  };
+}
+
+/** A first page of the Jobs list holding `items`, with no further page. */
+export function jobsPage(items: JobCardOut[] = []): JobsPageOut {
+  return {
+    items,
+    next_cursor: null,
+    ranking_generation: 1,
+    ranking_changed: false,
+    counts: { total_estimate: items.length, unscored: items.filter((c) => c.score === null).length, capped: false },
+  };
+}
+
+/** The month's spend: $38.20 of $100.00 counted, and an estimated $0.052646 per scored ad (`c_hat`). */
+export function spendOut(overrides: Partial<SpendOut> = {}): SpendOut {
+  return {
+    month: "2026-11-01",
+    counted: "38.200000",
+    billed: "38.200000",
+    ambiguous: "0.000000",
+    reserved: "0.000000",
+    cap: "100.00",
+    headroom: "61.800000",
+    bucket: { usd: "1.200000", capacity: "1.551667", rate_per_h: "0.129306" },
+    c_hat: "0.052646",
+    c_hat_source: "history",
+    critic_rate_7d: null,
+    projected_critic_rate: "0.450",
+    bulk_operation: null,
+    quarantined_batch_usd: "0.000000",
+    pause_reason: null,
+    by_model_effort_role: [],
+    eval_by_model_role: [],
+    ...overrides,
+  };
+}
+
 export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -102,6 +178,10 @@ export interface FakeApi {
   sessionDown: boolean;
   /** What `GET /api/system/status` answers. */
   status: StatusOut;
+  /** What `GET /api/jobs` answers (an empty page by default). */
+  jobs: JobsPageOut;
+  /** What `GET /api/system/spend` answers. */
+  spend: SpendOut;
   /** The test's own answers, by `METHOD path` (`"POST /api/runs"`). */
   routes: Map<string, FakeRoute>;
 }
@@ -122,6 +202,8 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     timezone: "Europe/Berlin",
     sessionDown: false,
     status: statusOut(),
+    jobs: jobsPage(),
+    spend: spendOut(),
     routes: new Map(),
   };
   vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
@@ -158,6 +240,12 @@ export function fakeApi({ signedIn = false, loginAnswers = [] as (() => Response
     }
     if (method === "GET" && path === "/api/system/status") {
       return Promise.resolve(json(api.status));
+    }
+    if (method === "GET" && path === "/api/jobs") {
+      return Promise.resolve(json(api.jobs));
+    }
+    if (method === "GET" && path === "/api/system/spend") {
+      return Promise.resolve(json(api.spend));
     }
     if (method === "POST" && path === "/api/auth/logout") {
       api.signedIn = false;
