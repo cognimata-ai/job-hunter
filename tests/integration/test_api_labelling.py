@@ -4,10 +4,13 @@ The queue takes the bands `[75, 100]`, `[60, 75)`, `[40, 60)`, `[0, 40)` round-r
 unlabelled candidates first (no golden case for the current revision and the active profile, whatever the
 case's source or flag), each band by job id descending, and fills the rest with labelled candidates once
 every band's unlabelled ones ran out. A candidate is a live job with its own published score of the active
-tuple under the active scope: a deferred member, a not-a-job-ad, a merged, synthetic or fenced job, a job
-without a published score and a result of an older revision are none. No key of the answer names a score, a
-mid or a band, in the body or in the OpenAPI schema. The progress counts the active `week1` cases of the
-active profile against 50; without an active profile the queue is empty. The limit is 1 to 50, default 10.
+tuple under the active scope that the scope's hard filters do not reject: a deferred member, a
+not-a-job-ad, a merged, synthetic or fenced job, a job without a published score, a result of an older
+revision or of another tuple and a filtered job are none; a fence of another job changes nothing. No key of
+the answer names a score, a mid or a band, in the body or in the OpenAPI schema. The progress counts the
+active `week1` cases of the active profile against 50, and a case labelled through the feedback route reads
+back as the golden eval reads it; without an active profile the queue is empty. The limit is 1 to 50, default
+10.
 
 P9: on a server of its own, 2,000 cards seeded and analysed (`test_jobs_list_plans.py` says why), every band
 read uses `det_rank_mid` with the scope and the band's score range in its index condition.
@@ -31,10 +34,19 @@ from jobhunter.db.migrate import run_migrate
 from jobhunter.db.session import make_null_engine
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.jobs.labelling import BANDS, Candidate, labelling_queue, queue_order
+from jobhunter.scoring.det_results import det_facts_from_inputs
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tests.support.jobs_list import BERLIN, Card, activate_scope, bulk_seed_cards, place, seed_cards
+from tests.support.jobs_list import (
+    BERLIN,
+    Card,
+    activate_scope,
+    activate_tuple,
+    bulk_seed_cards,
+    place,
+    seed_cards,
+)
 from tests.support.m2 import insert_profile_chain
 from tests.support.m3 import Job, insert_golden_case, insert_id
 from tests.support.pg import PgServer, config_for, remove_pg_server, start_pg_server
@@ -43,7 +55,7 @@ pytestmark = pytest.mark.integration
 
 URL: Final = "/api/labelling/queue"
 FORBIDDEN_KEY: Final = re.compile(r"score|mid|band")
-# 16 code points, two of them outside ASCII and one outside the BMP: 50 of them are 800 code points
+# 15 code points, two of them outside ASCII and one outside the BMP: 50 of them are 750 code points
 PARAGRAPH: Final = "Prüfe 🙂 Daten. "
 
 
@@ -294,6 +306,45 @@ async def test_merged_synthetic_fenced_unscored_and_stale_jobs_are_no_candidates
     assert (await queue(logged_in_client, limit=50))["items"] == []
 
 
+async def test_a_job_the_active_scope_s_hard_filters_reject_is_no_candidate(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int
+) -> None:
+    passed, unfiltered, rejected = await seed_cards(
+        engine, [scored("50.00", passed=True), scored("50.00"), scored("50.00", passed=False)]
+    )
+    # the list's `filtered` bucket, not its `scored` one: a label on it would calibrate nothing the user sees
+    assert ids(await queue(logged_in_client, limit=50)) == [unfiltered, passed]
+    assert rejected not in ids(await queue(logged_in_client, limit=50))
+
+
+async def test_an_open_fence_of_another_job_leaves_every_other_candidate(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int
+) -> None:
+    first, second, elsewhere = await seed_cards(engine, [scored("50.00"), scored("50.00"), Card()])
+    async with engine.begin() as c:
+        await insert_id(c, "purge_fences", {"kind": "jobs", "job_ids": [elsewhere], "manifest_id": 1})
+    assert ids(await queue(logged_in_client, limit=50)) == [second, first]
+    async with engine.begin() as c:
+        await insert_id(c, "purge_fences", {"kind": "jobs", "job_ids": [second], "manifest_id": 2})
+    assert ids(await queue(logged_in_client, limit=50)) == [first]
+    await execute(engine, "UPDATE purge_fences SET released_at = now()")  # released fences fence nothing
+    assert ids(await queue(logged_in_client, limit=50)) == [second, first]
+    async with engine.begin() as c:
+        await insert_id(c, "purge_fences", {"kind": "global", "manifest_id": 3})
+    assert (await queue(logged_in_client, limit=50))["items"] == []
+
+
+async def test_a_job_published_under_another_tuple_only_is_no_candidate(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int
+) -> None:
+    (old,) = await seed_cards(engine, [scored("50.00")])
+    assert ids(await queue(logged_in_client)) == [old]
+    await activate_tuple(engine, 2)  # a new profile: its tuple has no target of the job yet
+    assert (await queue(logged_in_client))["items"] == []
+    (new,) = await seed_cards(engine, [scored("50.00")])
+    assert ids(await queue(logged_in_client)) == [new]
+
+
 async def test_progress_counts_active_week1_cases_of_the_active_profile(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int
 ) -> None:
@@ -309,12 +360,6 @@ async def test_progress_counts_active_week1_cases_of_the_active_profile(
     assert (await queue(logged_in_client))["progress"] == {"labelled": 2, "target": 50}
     # through the feedback route: a label is an active `week1` case, a "wrong score" a `feedback` one
     labelled, wrong = await seed_cards(engine, [scored("65.00"), scored("62.00")])
-    # the frozen snapshot is the instance's `det_inputs`, whose job facts the case's sources come from
-    await execute(
-        engine,
-        "UPDATE det_results SET det_inputs = '{\"job\": {}}' WHERE job_id = ANY(CAST(:j AS bigint[]))",
-        j=[labelled, wrong],
-    )
     assert ids(await queue(logged_in_client)) == [wrong, labelled]
     for job_id, kind in ((labelled, "label"), (wrong, "wrong_score")):
         r = await logged_in_client.post(f"/api/jobs/{job_id}/feedback", json={"kind": kind, "label": "good"})
@@ -322,6 +367,16 @@ async def test_progress_counts_active_week1_cases_of_the_active_profile(
     body = await queue(logged_in_client)
     assert body["progress"] == {"labelled": 3, "target": 50}
     assert ids(body) == [wrong, labelled]  # both labelled now, so still listed: they fill the rest
+    async with engine.connect() as c:
+        snapshots = await c.execute(
+            sa.text(
+                "SELECT g.det_inputs_snapshot FROM golden_cases g JOIN jobs j "
+                "ON j.current_revision_id = g.job_revision_id WHERE j.id = ANY(CAST(:j AS bigint[]))"
+            ),
+            {"j": [labelled, wrong]},
+        )
+        facts = [det_facts_from_inputs(snapshot) for snapshot in snapshots.scalars()]
+    assert len(facts) == 2  # the cases' frozen det-facts read back, as the golden eval reads them
 
 
 async def test_labelled_cases_fill_the_rest(
@@ -361,9 +416,14 @@ async def test_limit_bounds(
 
 
 async def test_without_an_active_profile_the_queue_is_empty(
-    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int
 ) -> None:
-    await seed_cards(engine, [Card()] * 2)
+    candidate, labelled = await seed_cards(engine, [scored("50.00"), scored("40.00")])
+    await label(engine, labelled)
+    body = await queue(logged_in_client)
+    assert (ids(body), body["progress"]) == ([candidate, labelled], {"labelled": 1, "target": 50})
+    # no active profile, and so no active tuple (one CHECK ties them): the same rows are no queue
+    await execute(engine, "UPDATE active_config SET profile_version_id = NULL, llm_tuple_id = NULL")
     assert await queue(logged_in_client) == {"items": [], "progress": {"labelled": 0, "target": 50}}
 
 

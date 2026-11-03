@@ -7,10 +7,11 @@ label, stratified over the score bands `BANDS`, and the progress towards `LABEL_
 `is_fenced(job_id)`, as `jobs.detail.ensure_job` checks it) whose **own** current-revision target of the
 active tuple is published (`published_accepted` or `published_contested`; a deferred member, which its
 representative's result scores, is none) with a current instance under the active scope that has a score
-(`det_results.score_mid` not NULL), and whose result is not a verified not-a-job-ad
-(`llm_results.not_a_job_ad` false; such a result's instance usually has no score anyway). A candidate is
-**labelled** when a golden case exists for its current revision and the active profile, active or not and of
-any source: the pair is unique, so a new label upserts that case.
+(`det_results.score_mid` not NULL) and that the active scope's hard filters do not reject (no
+`hard_filter_results` row, or one that passed: the list's `scored` bucket, not its `filtered` one), and whose
+result is not a verified not-a-job-ad (`llm_results.not_a_job_ad` false; such a result's instance usually
+has no score anyway). A candidate is **labelled** when a golden case exists for its current revision and the
+active profile, active or not and of any source: the pair is unique, so a new label upserts that case.
 
 **The bands** are `[75, 100]`, `[60, 75)`, `[40, 60)` and `[0, 40)` of `score_mid`. Each band is one read
 (`/* labelling.band */`) over `det_rank_mid`, the scope and the score range in its index condition: the
@@ -40,6 +41,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from jobhunter.db.sql import q
+from jobhunter.jobs import _sql
 from jobhunter.jobs.groups import location_labels
 
 # Each band is `[low, high)`, except the first, `[75, 100]` (B16)
@@ -54,23 +56,31 @@ _ACTIVE: Final = q(
 # A band's candidates (module docstring), the unlabelled first, each part by job id descending. Two fences
 # (`OFFSET 0`) keep the plan on the band (the shape of `jobs._sql`, Plans at scale): the band's current
 # instances are a set of their own, read by the scope and score range of `det_rank_mid`, never along a whole
-# index that a merge join would rather walk; and each one's job is a lookup of its own, so the redundant
-# `current_revision_id` check is no join selectivity that would multiply the band's estimate down to one row.
+# index that a merge join would rather walk; and each one's job is a lookup of its own, so the
+# `current_revision_id` check (which drops an older revision's instance: it stays current), a second
+# correlation of the job with the target beside its id, is no join selectivity that would multiply the band's
+# estimate down to one row. The set is `d`, the alias of a card's instance, so the list's `scored` bucket
+# (`_sql.BUCKET_SQL`) reads it as it is. Purge fences are rare: one uncorrelated EXISTS (an InitPlan, run
+# once) spares the band's rows `is_fenced` while none is open.
 _BAND_HEAD: Final = (
-    "/* labelling.band */ SELECT b.job_id, EXISTS (SELECT 1 FROM golden_cases g "
+    "/* labelling.band */ SELECT d.job_id, EXISTS (SELECT 1 FROM golden_cases g "
     "WHERE g.job_revision_id = j.current_revision_id AND g.profile_version_id = :profile) AS labelled "
-    "FROM (SELECT d.job_id, d.llm_result_id FROM det_results d "
+    "FROM (SELECT d.job_id, d.llm_result_id, d.score_mid FROM det_results d "
     "WHERE d.scope_version_id = :scope AND d.is_current AND d.score_mid >= CAST(:low AS numeric)"
 )
 _BAND_TAIL: Final = (
-    " OFFSET 0) b"
-    " JOIN llm_results r ON r.id = b.llm_result_id"
+    " OFFSET 0) d"  # noqa: S608 (constants)
+    " JOIN llm_results r ON r.id = d.llm_result_id"
     " JOIN score_targets t ON t.published_result_id = r.id AND t.llm_tuple_id = :tuple"
     " CROSS JOIN LATERAL (SELECT cj.id, cj.current_revision_id, cj.merged_into_job_id, cj.synthetic_eval"
-    " FROM jobs cj WHERE cj.id = b.job_id AND cj.current_revision_id = t.job_revision_id OFFSET 0) j"
-    " WHERE t.state IN ('published_accepted','published_contested') AND NOT r.not_a_job_ad"
-    " AND j.merged_into_job_id IS NULL AND NOT j.synthetic_eval AND NOT is_fenced(j.id)"
-    " ORDER BY labelled, b.job_id DESC LIMIT :limit"
+    " FROM jobs cj WHERE cj.id = d.job_id AND cj.current_revision_id = t.job_revision_id OFFSET 0) j"
+    " LEFT JOIN hard_filter_results h ON h.job_id = j.id AND h.scope_version_id = :scope"
+    " WHERE "
+    + _sql.BUCKET_SQL["scored"]
+    + " AND t.state IN ('published_accepted','published_contested') AND NOT r.not_a_job_ad"
+    " AND j.merged_into_job_id IS NULL AND NOT j.synthetic_eval"
+    " AND (NOT EXISTS (SELECT 1 FROM purge_fences f WHERE f.released_at IS NULL) OR NOT is_fenced(j.id))"
+    " ORDER BY labelled, d.job_id DESC LIMIT :limit"
 )
 _TOP_BAND: Final = q(_BAND_HEAD + " AND d.score_mid <= CAST(:high AS numeric)" + _BAND_TAIL)
 _LOWER_BAND: Final = q(_BAND_HEAD + " AND d.score_mid < CAST(:high AS numeric)" + _BAND_TAIL)

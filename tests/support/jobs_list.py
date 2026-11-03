@@ -20,6 +20,10 @@ in each language of `langs` in turn. Its places are four cities in turn, the Ber
 centre, the 30 km ring and the latitude strip beyond it (`_bulk_place`). It analyses nothing: a caller that
 needs planner statistics runs `ANALYZE` as the owner on a server of its own.
 
+Both seeders write an instance's `det_inputs` as M3's writer makes it (`scoring.det_results.det_inputs` of
+the job's committed det-facts, their sources and the scope), so a golden case snapshotted from it can be read
+back (`det_facts_from_inputs`); its `det_inputs_hash` stays `\x00`, as no M4 reader compares it.
+
 Both seeders give every job they put in a group its membership row (`duplicate_group_members`, evidence
 `{}`) and its `jobs.duplicate_group_id`, the two writes of `dedup.groups`' join (M4 Ruling T7-b), so the
 dedup functions that read the members (a split, score individually) see the group as seeded.
@@ -45,7 +49,10 @@ from jobhunter.db.seed import canonical_json
 from jobhunter.db.sql import q
 from jobhunter.geo.gazetteer import EARTH_RADIUS_KM
 from jobhunter.normalize.titles import normalize_title
-from jobhunter.types import JSONValue
+from jobhunter.run_settings import ScopeSettings, scope_from_payload
+from jobhunter.scoring.det_results import det_inputs, job_sources, jobs_sources
+from jobhunter.scoring.filters import read_det_facts, read_det_facts_of
+from jobhunter.types import JSONValue, get_object
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql.elements import TextClause
 
@@ -188,6 +195,12 @@ _NEW_SCOPE: Final = q(
     "INSERT INTO scope_versions (scope_hash, payload) VALUES (:h, :payload) RETURNING id", jsonb=["payload"]
 )
 _ACTIVATE_SCOPE: Final = q("UPDATE active_config SET scope_version_id = :s, updated_at = now()")
+_SCOPE_PAYLOAD: Final = q("SELECT payload FROM scope_versions WHERE id = :s")
+
+
+async def _scope_settings(c: AsyncConnection, scope: int) -> ScopeSettings:
+    """The scope version's settings, as an instance of it reads them."""
+    return scope_from_payload(get_object((await c.execute(_SCOPE_PAYLOAD, {"s": scope})).scalar_one(), ""))
 
 
 async def activate_scope(engine: AsyncEngine, **changes: Any) -> int:
@@ -278,6 +291,7 @@ async def seed_cards(engine: AsyncEngine, specs: Sequence[Card]) -> list[int]:
     async with engine.begin() as c:
         active = (await c.execute(_ACTIVE)).one()
         llm_tuple, scope = active.llm_tuple_id, int(active.scope_version_id)
+        settings = await _scope_settings(c, scope)
         jobs: list[Job] = []
         for spec in specs:
             if spec.skip_ids:
@@ -293,7 +307,7 @@ async def seed_cards(engine: AsyncEngine, specs: Sequence[Card]) -> list[int]:
             if spec.state is not None or spec.deferred_to is not None:
                 if llm_tuple is None:
                     raise LookupError("a card with a target needs an active tuple (activate_tuple)")
-                await _insert_state(c, spec, job, int(llm_tuple), scope, groups)
+                await _insert_state(c, spec, job, int(llm_tuple), (scope, settings), groups)
             await _insert_marks(c, spec, job, scope)
     return [job.job_id for job in jobs]
 
@@ -338,8 +352,14 @@ async def _insert_card(c: AsyncConnection, spec: Card) -> Job:
 
 
 async def _insert_state(
-    c: AsyncConnection, spec: Card, job: Job, llm_tuple: int, scope: int, groups: Mapping[int, int]
+    c: AsyncConnection,
+    spec: Card,
+    job: Job,
+    llm_tuple: int,
+    active_scope: tuple[int, ScopeSettings],
+    groups: Mapping[int, int],
 ) -> None:
+    scope, settings = active_scope
     if spec.deferred_to is not None:
         await insert_target(
             c,
@@ -353,7 +373,7 @@ async def _insert_state(
     if spec.state in PUBLISHED:
         result = await _publish(c, spec, job, llm_tuple)
         if spec.score is not None or spec.not_a_job_ad:
-            await _insert_instance(c, spec, result, job.job_id, scope)
+            await _insert_instance(c, spec, result, job.job_id, scope, settings)
         return
     state = spec.state
     if state is None or state not in _STATE_COLUMNS:
@@ -384,8 +404,11 @@ async def _publish(c: AsyncConnection, spec: Card, job: Job, llm_tuple: int) -> 
     return result
 
 
-async def _insert_instance(c: AsyncConnection, spec: Card, result: int, job_id: int, scope: int) -> None:
+async def _insert_instance(
+    c: AsyncConnection, spec: Card, result: int, job_id: int, scope: int, settings: ScopeSettings
+) -> None:
     low, high = spec.score if spec.score is not None else (None, None)
+    document, _ = det_inputs(await read_det_facts(c, job_id), await job_sources(c, job_id), settings)
     mid = None if low is None or high is None else ((low + high) / 2).quantize(Decimal("0.01"), ROUND_HALF_UP)
     await insert_id(
         c,
@@ -404,7 +427,7 @@ async def _insert_instance(c: AsyncConnection, spec: Card, result: int, job_id: 
             "score_high": high,
             "coverage": None if mid is None else spec.coverage,
             "confidence": None if mid is None else spec.confidence,
-            "det_inputs": {},
+            "det_inputs": document,
             "det_inputs_hash": b"\x00",
         },
     )
@@ -691,6 +714,7 @@ _BULK_INSTANCES: Final = _set_insert(
         "score_high": "numeric",
         "coverage": "numeric",
         "confidence": "text",
+        "det_inputs": "jsonb",
     },
     {
         "scope_version_id": ":scope",
@@ -699,7 +723,6 @@ _BULK_INSTANCES: Final = _set_insert(
         "knockouts": "'{}'",
         "industry_match": "'neutral'",
         "caps_applied": "'{}'",
-        "det_inputs": "'{}'",
         "det_inputs_hash": "'\\x00'",
     },
 )
@@ -906,6 +929,7 @@ async def bulk_seed_cards(
             await c.execute(_BULK_GROUP_MEMBERS, {"rows": members})
         await c.execute(_BULK_TARGETS, {"rows": rows.targets, **binds})
         if rows.published:
+            await _bulk_inputs(c, rows.published, [jobs[i] for i in range(n) if scored[i]], scope)
             await _bulk_publish(c, rows.published, binds)
             await c.execute(_BULK_FILTERS, {"rows": rows.filters, **binds})
         if rows.actions:
@@ -941,6 +965,18 @@ def _texts(values: Sequence[str]) -> list[JSONValue]:
 
 def _reasons(i: int) -> list[JSONValue]:
     return [] if i % 29 != 0 else ["excluded_keyword"]
+
+
+async def _bulk_inputs(
+    c: AsyncConnection, published: list[dict[str, JSONValue]], job_ids: list[int], scope: int
+) -> None:
+    """Each published card's `det_inputs`, as M3's writer makes it from the card's committed det-facts and
+    the scope (`scoring.det_results.det_inputs`), in `published` order: `job_ids`."""
+    facts = await read_det_facts_of(c, job_ids)
+    sources = await jobs_sources(c, job_ids)
+    settings = await _scope_settings(c, scope)
+    for row, job_id in zip(published, job_ids, strict=True):
+        row["det_inputs"], _ = det_inputs(facts[job_id], sources[job_id], settings)
 
 
 async def _bulk_publish(
@@ -981,7 +1017,10 @@ async def _bulk_publish(
         {
             "llm_result_id": r["llm_results"],
             "job_id": r["job"],
-            **{k: r[k] for k in ("score_low", "score_mid", "score_high", "coverage", "confidence")},
+            **{
+                k: r[k]
+                for k in ("score_low", "score_mid", "score_high", "coverage", "confidence", "det_inputs")
+            },
         }
         for r in p
     ]
