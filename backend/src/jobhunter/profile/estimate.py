@@ -30,17 +30,20 @@ retained current revision (M3 Task 14). Before anything is spent the user sees w
   §21.4's two cases. The real submission (`scoring.batches`) also stops at the request bytes and the month's
   scoring headroom, which the estimate does not foresee;
 - `online_targets = targets - batch_targets`, scored online at the bucket's pace:
-  `online_per_day = floor(budget.rate_per_h x 24 / llm_projection.paced_cost_per_target(ĉ))`, the bucket's
-  accrual a day on the month row's cap and buffer over `ĉ` with a target's share of its cycle's cache writes
-  (§21.3: "about 53 targets per day at the central cost including cache writes"). `ĉ` is `cycles.c_hat` of
-  the active tuple and evaluation policy under the active model policy (a profile change keeps the model
-  policy), the central estimate without a tuple. With the seeded settings and the central `ĉ` that is
-  $3.103344 / $0.057569 = 53 a day in a month of 30 days (§15.7: "about 53 per day"), 52 in one of 31;
+  `online_per_day = floor(budget.rate_per_h x 24 / llm_projection.paced_cost_per_target(ĉ, source))`, the
+  bucket's accrual a day on the month row's cap and buffer over what a target costs it with its cache writes
+  (§21.3: "about 53 targets per day at the central cost including cache writes"): a central `ĉ` plus its
+  share of a cycle's cache writes, a history `ĉ` as it is (its measured costs include them). `ĉ` and its
+  source are `cycles.c_hat`'s, of the active tuple and evaluation policy under the active model policy (a
+  profile change keeps the model policy); the central estimate without a tuple. With the seeded settings and
+  the central `ĉ` that is $3.103344 / $0.057569 = 53 a day in a month of 30 days (§15.7: "about 53 per
+  day"), 52 in one of 31; a history `ĉ` of $0.10 gives $3.103344 / $0.10 = 31;
 - `next_version_no`: one more than the newest of the user's profile versions (the adversarial seed's synthetic
   ones are not counted, as the confirm numbers a new version).
 
 Every amount is rounded half-up to $0.000001; the unit costs are rounded before they are multiplied, as the
-dry-run's `llm_rescore` warning multiplies ĉ. `estimate_for` is the pure part, given ĉ and the hold;
+dry-run's `llm_rescore` warning multiplies ĉ. `estimate_for` is the pure part, given ĉ with its source and
+the hold;
 `rescore_estimate` reads the count, the month row, the active pointers with the next version number, the hold
 and ĉ on the caller's connection, plain reads, and writes nothing.
 
@@ -70,6 +73,7 @@ from jobhunter.settings.llm_projection import (
     GENERATE,
     PROPOSE_QUERIES,
     CallTokens,
+    CHatSource,
     call_usd,
     central_cost_per_target,
     paced_cost_per_target,
@@ -175,11 +179,13 @@ def estimate_for(
     targets: int,
     row: BudgetRow,
     c_hat: Decimal,
+    c_hat_source: CHatSource,
     hold_per_item_usd: Decimal,
     next_version_no: int,
 ) -> RescoreEstimate:
     """The estimate of `targets` re-scores under `settings`, with the month's spend as `row` holds it, `c_hat`
-    the expected cost of an online target and `hold_per_item_usd` a batch item's follow-up hold."""
+    the expected cost of an online target (from `c_hat_source`) and `hold_per_item_usd` a batch item's
+    follow-up hold."""
     if targets < 0:
         raise ValueError(f"targets must not be negative, got {targets}")
     scoring = settings.scoring
@@ -200,7 +206,7 @@ def estimate_for(
         bulk_share=scoring.bulk_rescore_max_budget_share,
         batch_targets=batch_targets,
         online_targets=targets - batch_targets,
-        online_per_day=_floor(daily / paced_cost_per_target(scoring, c_hat)),
+        online_per_day=_floor(daily / paced_cost_per_target(scoring, c_hat, c_hat_source)),
         next_version_no=next_version_no,
     )
 
@@ -215,9 +221,9 @@ async def rescore_estimate(conn: AsyncConnection, settings: Settings, *, now: da
     policy = settings.scoring.model_policy
     evaluation_policy_id = int(active.evaluation_policy_id)
     hold = await bulk.hold_per_item(conn, evaluation_policy_id=evaluation_policy_id, model_policy=policy)
-    c_hat = central_cost_per_target(policy)
+    c_hat: tuple[Decimal, CHatSource] = (central_cost_per_target(policy), "central")
     if active.llm_tuple_id is not None:
-        c_hat, _ = await cycles.c_hat(
+        c_hat = await cycles.c_hat(
             conn,
             llm_tuple_id=int(active.llm_tuple_id),
             evaluation_policy_id=evaluation_policy_id,
@@ -228,7 +234,8 @@ async def rescore_estimate(conn: AsyncConnection, settings: Settings, *, now: da
         settings,
         targets=await count_retained_current_revisions(conn),
         row=row,
-        c_hat=c_hat,
+        c_hat=c_hat[0],
+        c_hat_source=c_hat[1],
         hold_per_item_usd=hold,
         next_version_no=int(active.next_version_no),
     )

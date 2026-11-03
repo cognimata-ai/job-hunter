@@ -29,9 +29,10 @@ counted_at_cap_change_usd)` (`cap_holds`).
 
 **Scoring estimates** (M3). `r_first` is §6.9.4's worst-case reservation of a first generator call, the unit
 of the headroom that returns `budget_deferred` targets, over the §21.4 sizing bound (`sizing_input_bound`,
-which a batch item's estimated reservation uses too); `c_hat_followup` is §6.9.3's `ĉ_followup`, the expected
-online critic-plus-revise cost of a triggered draft, which a batch submission holds per item. `rate_per_h` is
-the bucket's accrual an hour as the spend view, the dry-run and the confirm estimate show it.
+which the confirm estimate's planning figure for a batch item uses too); `c_hat_followup` is §6.9.3's
+`ĉ_followup`, the expected online critic-plus-revise cost of a triggered draft, which a batch submission holds
+per item. `rate_per_h` is the bucket's accrual an hour as the spend view, the dry-run and the confirm estimate
+show it.
 """
 
 from collections.abc import Mapping
@@ -304,8 +305,9 @@ def sizing_input_bound(model: Model) -> int:
 
 def r_first(model_policy: "ModelPolicy", execution: "ExecutionConfig") -> Decimal:
     """§6.9.4's `r_first`: the worst-case reservation of a first generator call, on the policy's generate
-    model at the execution config's first stage, over `sizing_input_bound`. A batch item's is
-    `profile.estimate.batch_item_worst_usd`, at the batch prices."""
+    model at the execution config's first stage, over `sizing_input_bound`. The confirm estimate prices a
+    batch item over the same bound (`profile.estimate.batch_item_worst_usd`, at the batch prices); a batch
+    submission reserves each item over its own rendered prompt's bound."""
     model = model_policy.nodes.generate.model
     return worst_case_usd(
         model, input_tokens_bound=sizing_input_bound(model), max_tokens=execution.generate.max_tokens

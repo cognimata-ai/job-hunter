@@ -220,10 +220,13 @@ async def published_attempts(engine: AsyncEngine, llm_tuple_id: int, n: int, cos
 async def test_dry_run_uses_history_c_hat_for_unchanged_policies_and_central_otherwise(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: datetime
 ) -> None:
-    assert (await dry_run(logged_in_client, seeded()))["projections"]["llm"]["c_hat"] == CENTRAL_B  # no tuple
+    central = (await dry_run(logged_in_client, seeded()))["projections"]["llm"]  # no tuple
+    # a central ĉ with its share of a cycle's cache writes: 93.10 / (0.052646 + 0.004923) = 1617.2
+    assert (central["c_hat"], central["targets_per_month"]) == (CENTRAL_B, 1617)
     _, tuple_id = await activate_profile(engine)
     await published_attempts(engine, tuple_id, 19, "0.120000")
-    assert (await dry_run(logged_in_client, seeded()))["projections"]["llm"]["c_hat"] == CENTRAL_B  # 19 < 20
+    central = (await dry_run(logged_in_client, seeded()))["projections"]["llm"]  # 19 < 20
+    assert (central["c_hat"], central["targets_per_month"]) == (CENTRAL_B, 1617)
     await published_attempts(engine, tuple_id, 1, "0.120000")
     # the active policies: the tuple's 7-day mean, also for a change that touches neither policy
     for doc in (
@@ -233,7 +236,8 @@ async def test_dry_run_uses_history_c_hat_for_unchanged_policies_and_central_oth
     ):
         body = await dry_run(logged_in_client, doc)
         assert body["projections"]["llm"]["c_hat"] == "0.120000", doc
-        assert body["projections"]["llm"]["targets_per_month"] == 745  # 93.10 / (0.12 + 0.004923)
+        # a history ĉ already holds its cache writes: 93.10 / 0.12 = 775.8, no share added
+        assert body["projections"]["llm"]["targets_per_month"] == 775
     # another model policy: its own central estimate, not the tuple's history
     c_grid = presets.PRESETS["C"].policy().model_dump(mode="json")
     body = await dry_run(logged_in_client, changed("scoring.model_policy", c_grid))

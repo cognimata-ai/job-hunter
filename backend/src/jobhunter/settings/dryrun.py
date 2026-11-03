@@ -24,7 +24,9 @@ settings page shows on every change and that a save runs again (Task 17).
    - `ĉ` is §6.9.2's: `cycles.c_hat` of the active tuple and evaluation policy (the trailing 7-day mean of
      its published online attempts, from 20 of them; else the central estimate) while the proposed model and
      evaluation policies are the active ones by content hash, else `central_cost_per_target` of the proposed
-     model policy, whose own history no tuple has yet. Without an active tuple it is the central estimate;
+     model policy, whose own history no tuple has yet. Without an active tuple it is the central estimate.
+     Its source goes with it: the capacity adds a cycle's cache-write share to a central `ĉ` only
+     (`llm_projection.paced_cost_per_target`), since a history mean already includes its cache writes;
    - `arrival_per_month` is §6.8's trailing 7-day rate of new targets, a month (Ruling T14-d): the active
      tuple's targets created in `[now - 7 d, now]` without a bulk operation, x 30 / 7, rounded to the nearest
      whole number. An ordinary arrival has none (the collection's `enqueue_targets`, the `missing_targets`
@@ -85,6 +87,7 @@ from jobhunter.settings.derive import candidate_of, derived
 from jobhunter.settings.effects import EffectClass, classify_effects
 from jobhunter.settings.llm_projection import (
     DEFAULT_ARRIVAL_PER_MONTH,
+    CHatSource,
     LlmProjection,
     cap_binding,
     central_cost_per_target,
@@ -189,9 +192,10 @@ async def active_policies(conn: AsyncConnection) -> ActivePolicies:
 
 async def c_hat(
     conn: AsyncConnection, proposed: Settings, active: ActivePolicies, *, now: datetime
-) -> Decimal:
-    """§6.9.2's `ĉ` for `proposed` (module docstring, step 5): the active tuple's history while its model and
-    evaluation policies are the active ones, else the proposed model policy's central estimate."""
+) -> tuple[Decimal, CHatSource]:
+    """§6.9.2's `ĉ` for `proposed` and where it came from (module docstring, step 5): the active tuple's
+    history while its model and evaluation policies are the active ones (`cycles.c_hat`, itself central below
+    20 attempts), else the proposed model policy's central estimate."""
     policy = proposed.scoring.model_policy
     d = derived(proposed)
     same = (
@@ -199,18 +203,17 @@ async def c_hat(
         and content_hash(d.evaluation) == active.evaluation_policy_hash
     )
     if active.llm_tuple_id is None or not same:
-        return central_cost_per_target(policy)
+        return central_cost_per_target(policy), "central"
     # `cycles` imports `llm.bulk`, which imports this module: imported when the dry-run runs
     from jobhunter.scoring import cycles
 
-    found, _ = await cycles.c_hat(
+    return await cycles.c_hat(
         conn,
         llm_tuple_id=active.llm_tuple_id,
         evaluation_policy_id=active.evaluation_policy_id,
         model_policy=policy,
         now=now,
     )
-    return found
 
 
 async def arrival_per_month(conn: AsyncConnection, llm_tuple_id: int | None, *, now: datetime) -> int:
@@ -397,12 +400,13 @@ async def dry_run(
             projection["window"] = await _window(conn, provider, snapshot, run, now)
 
     policies = await active_policies(conn)
-    cost = await c_hat(conn, proposed, policies, now=now)
+    cost, source = await c_hat(conn, proposed, policies, now=now)
     critic_rate = await projected_critic_rate(conn, proposed, now=now)
     llm = llm_projection(
         proposed,
         now=now,
         c_hat=cost,
+        c_hat_source=source,
         projected_critic_rate=critic_rate,
         arrival_per_month=await arrival_per_month(conn, policies.llm_tuple_id, now=now),
     )

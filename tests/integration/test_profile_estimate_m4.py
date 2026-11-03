@@ -144,7 +144,8 @@ async def test_online_per_day_from_the_bucket_rate(engine: AsyncEngine) -> None:
 
 async def test_online_per_day_uses_the_active_tuples_history(engine: AsyncEngine, current_epoch: int) -> None:
     """From 20 published online attempts of the active tuple in the 7 days before `now`, `ĉ` is their mean
-    cost: $0.10 a target, $0.104923 with the cache writes, so $3.103344 / $0.104923 = 29.6, 29 a day."""
+    cost, $0.10 a target. Their settled costs already include the cache writes their calls made, so no share
+    is added: $3.103344 / $0.10 = 31.03, 31 a day (with the share it would be 29)."""
     (pending,) = await insert_targets(engine, 1)  # the score tuple, made active
     async with engine.begin() as conn:
         for attempt_no in range(1, 21):
@@ -157,6 +158,6 @@ async def test_online_per_day_uses_the_active_tuples_history(engine: AsyncEngine
                 cost_usd=Decimal("0.100000"),
                 ended_at=NOVEMBER - timedelta(days=1),
             )
-    assert await online_per_day(engine, NOVEMBER) == 29
+    assert await online_per_day(engine, NOVEMBER) == 31
     # a week later the attempts are out of the window: the central cost again
     assert await online_per_day(engine, NOVEMBER + timedelta(days=7)) == 53

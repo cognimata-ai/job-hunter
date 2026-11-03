@@ -71,8 +71,8 @@ class FeedbackOut(BaseModel):
 
 
 class GoldenCaseOut(BaseModel):
-    """A golden case: its job, label and comment, its profile version's number and its scope version's id, its
-    source and its flags."""
+    """A golden case: its job with the labelled ad's title and the company, its label and comment, its profile
+    version's number and its scope version's id, its source and its flags."""
 
     id: int
     job_id: int

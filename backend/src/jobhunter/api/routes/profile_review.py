@@ -68,7 +68,7 @@ import hashlib
 from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import date, datetime
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, get_args
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Header, Path
@@ -136,6 +136,9 @@ SCHEMA_MISMATCH_MESSAGE: Final = (
 _DISCARDABLE: Final = ("text_review", "ready", "failed")
 
 DraftId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a profile draft")]
+# The open statuses (`profile_drafts_one_open`'s): the model's Literal and the open-draft read's list.
+OpenDraftStatus = Literal["uploaded", "extracting_text", "text_review", "extracting_profile", "ready"]
+OPEN_DRAFT_STATUSES: Final[tuple[OpenDraftStatus, ...]] = get_args(OpenDraftStatus)
 DraftStatus = Literal[
     "uploaded",
     "extracting_text",
@@ -205,9 +208,7 @@ _VERSIONS = q(
 # The newest draft in an open status (`profile_drafts_one_open` allows one), and the newest proposal with the
 # code of a failed one.
 _OPEN_DRAFT = q(
-    "SELECT id, status FROM profile_drafts "
-    "WHERE status IN ('uploaded', 'extracting_text', 'text_review', 'extracting_profile', 'ready') "
-    "ORDER BY id DESC LIMIT 1"
+    "SELECT id, status FROM profile_drafts WHERE status = ANY(CAST(:open AS text[])) ORDER BY id DESC LIMIT 1"
 )
 _LATEST_PROPOSAL = q(
     f"SELECT p.id, p.status, {proposals.FAILURE_CODE_SQL} AS failure_code FROM query_proposals p "  # noqa: S608 (constants)
@@ -347,7 +348,7 @@ class OpenDraftOut(BaseModel):
     """The draft in progress: uploaded, being extracted, in review or ready to confirm."""
 
     id: int
-    status: Literal["uploaded", "extracting_text", "text_review", "extracting_profile", "ready"]
+    status: OpenDraftStatus
 
 
 class LatestProposalOut(BaseModel):
@@ -889,7 +890,7 @@ async def get_profile(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> Pr
     async with read_snapshot(engine) as conn:
         active_id = (await conn.execute(_ACTIVE_VERSION)).scalar_one_or_none()
         rows = (await conn.execute(_VERSIONS)).all()
-        draft = (await conn.execute(_OPEN_DRAFT)).first()
+        draft = (await conn.execute(_OPEN_DRAFT, {"open": list(OPEN_DRAFT_STATUSES)})).first()
         proposal = (await conn.execute(_LATEST_PROPOSAL)).first()
         settings = await active_settings(conn)
     versions = [

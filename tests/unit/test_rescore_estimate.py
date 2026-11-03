@@ -11,7 +11,7 @@ from jobhunter.db.seed import load_settings_v1
 from jobhunter.llm import budget
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.profile.estimate import RescoreEstimate, central_batch_cost_per_target, estimate_for
-from jobhunter.settings.llm_projection import central_cost_per_target
+from jobhunter.settings.llm_projection import CHatSource, central_cost_per_target
 from jobhunter.settings.model import Settings
 
 NOW: Final = datetime(2026, 10, 1, 0, 5, tzinfo=UTC)
@@ -27,10 +27,21 @@ def month_start_row() -> budget.BudgetRow:
 
 
 def estimate_of(
-    targets: int, row: budget.BudgetRow, *, c_hat: Decimal = CENTRAL, settings: Settings = SETTINGS
+    targets: int,
+    row: budget.BudgetRow,
+    *,
+    c_hat: Decimal = CENTRAL,
+    source: CHatSource = "central",
+    settings: Settings = SETTINGS,
 ) -> RescoreEstimate:
     return estimate_for(
-        settings, targets=targets, row=row, c_hat=c_hat, hold_per_item_usd=HOLD, next_version_no=3
+        settings,
+        targets=targets,
+        row=row,
+        c_hat=c_hat,
+        c_hat_source=source,
+        hold_per_item_usd=HOLD,
+        next_version_no=3,
     )
 
 
@@ -118,8 +129,10 @@ def test_the_batch_holds_what_the_bulk_budget_fits_and_the_rest_is_online() -> N
 def test_the_online_pace_follows_c_hat_and_the_row_s_cap() -> None:
     row = month_start_row()
     assert estimate_of(0, row).online_per_day == 52
-    # ĉ $0.10: $3.003216 / ($0.10 + $0.004923) = 28.6
+    # a central ĉ of $0.10 gets a cycle's cache-write share: $3.003216 / ($0.10 + $0.004923) = 28.6
     assert estimate_of(0, row, c_hat=Decimal("0.100000")).online_per_day == 28
+    # a history ĉ of $0.10 already holds its cache writes: $3.003216 / $0.10 = 30.03
+    assert estimate_of(0, row, c_hat=Decimal("0.100000"), source="history").online_per_day == 30
     row.cap_usd = Decimal("50.00")  # A = $48.00: $45.60 over 744 h, $0.061290 an hour, $1.470960 a day: 25.6
     assert estimate_of(0, row).online_per_day == 25
     row.cap_usd = row.overrun_buffer_usd  # A = 0: nothing accrues

@@ -35,27 +35,35 @@ Sonnet/low 0.8 x $0.01035), rounded half-up to $0.000001.
 
 **`llm_projection`** gives the §6.9.2 bucket of the settings in the month of `now` (rate per hour and
 capacity), `ĉ`, the evaluation policy's projected critic rate, and §21.3's capacity of a month:
-`targets_per_month = floor(scoring share / (ĉ + cache writes per cycle / min_cycle_targets))`, the scoring
-share `A x (1 - reserve_frac)`, with one cycle per `scoring.min_cycle_targets` targets (§6.9.2: a cycle starts
-when the bucket holds that many); the divisor is `paced_cost_per_target`, which the confirm estimate's pace
-divides a day's accrual by too (`profile.estimate`). With the defaults that is B's 1,617 (§21.3: about
-1,620); A gives 1,119 (about 1,120) and C 4,374 (about 4,370); `min_cycle_targets` 20 gives B 1,689 (§21.5:
-about +70) with about $4.16 of cache writes. `projected_month_spend` is what the targets that arrive and fit
-cost with their cache writes. A cap at or below the overrun buffer admits nothing (`A ≤ 0`): no target, no
-accrual. `cap_binding` is §6.8's `llm_cap_binding` condition: more arrivals than capacity, or no capacity at
-all.
+`targets_per_month = floor(scoring share / paced_cost_per_target)`, the scoring share `A x (1 -
+reserve_frac)`. **`paced_cost_per_target`** is what one target costs the bucket, its cache writes included:
+a central `ĉ` (`central_cost_per_target`, which charges every prefix as a read) plus its share of a cycle's
+cache writes, `ĉ + cache writes per cycle / min_cycle_targets`, with one cycle per `scoring.min_cycle_targets`
+targets (§6.9.2: a cycle starts when the bucket holds that many); a history `ĉ` (`cycles.c_hat`'s source
+`history`) as it is, since it is the mean of measured attempt costs, whose settlements already charged the
+cache writes their calls made (`pricing.settled_usd`). The confirm estimate's pace divides a day's accrual
+by the same figure (`profile.estimate`). With the defaults and the central `ĉ` that is B's 1,617 (§21.3:
+about 1,620); A gives 1,119 (about 1,120) and C 4,374 (about 4,370); `min_cycle_targets` 20 gives B 1,689
+(§21.5: about +70) with about $4.16 of cache writes. `projected_month_spend` is what the targets that arrive
+and fit cost with their cache writes. A cap at or below the overrun buffer admits nothing (`A ≤ 0`): no
+target, no accrual. `cap_binding` is §6.8's `llm_cap_binding` condition: more arrivals than capacity, or no
+capacity at all.
 """
 
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Literal
 
 from jobhunter.llm import budget, pricing
 from jobhunter.llm.budget import BudgetParams
 from jobhunter.llm.pricing import Effort, Model
 from jobhunter.settings.model import ModelPolicy, Scoring, Settings
+
+# Where a `ĉ` comes from (`scoring.cycles.c_hat`): the trailing mean of measured attempt costs, or the §21.2
+# central estimate.
+CHatSource = Literal["history", "central"]
 
 DEFAULT_ARRIVAL_PER_MONTH: Final = 3000  # §6.8: new targets a month when there is no target history
 # §21.1: the light critic prefix is written "in about 80% of cycles"
@@ -143,10 +151,13 @@ def cache_writes_per_cycle(model_policy: ModelPolicy) -> Decimal:
     return total.quantize(budget.USD_QUANTUM, rounding=ROUND_HALF_UP)
 
 
-def paced_cost_per_target(scoring: Scoring, c_hat: Decimal) -> Decimal:
-    """`ĉ` with a target's share of its cycle's cache writes, `ĉ + cache_writes_per_cycle / min_cycle_targets`
-    (module docstring: one cycle per `min_cycle_targets` targets), not rounded: what the bucket's accrual is
-    divided by for a month's capacity and a day's pace (§21.3). $0.057569 for policy B at the central `ĉ`."""
+def paced_cost_per_target(scoring: Scoring, c_hat: Decimal, c_hat_source: CHatSource) -> Decimal:
+    """What one target costs the bucket, its cache writes included (module docstring), not rounded: a
+    central `ĉ` plus its share of a cycle's cache writes, `ĉ + cache_writes_per_cycle / min_cycle_targets`; a
+    history `ĉ`, whose measured costs include their cache writes, as it is. What the bucket's accrual is
+    divided by for a month's capacity and a day's pace (§21.3): $0.057569 for policy B at the central `ĉ`."""
+    if c_hat_source == "history":
+        return c_hat
     return c_hat + cache_writes_per_cycle(scoring.model_policy) / scoring.min_cycle_targets
 
 
@@ -225,13 +236,15 @@ def llm_projection(
     *,
     now: datetime,
     c_hat: Decimal,
+    c_hat_source: CHatSource,
     projected_critic_rate: Decimal,
     arrival_per_month: int,
 ) -> LlmProjection:
-    """The LLM projection of `settings` in the month of `now` (module docstring)."""
+    """The LLM projection of `settings` in the month of `now` (module docstring), with `c_hat` from
+    `c_hat_source`."""
     p = BudgetParams.from_payload(settings.to_payload())
     month = budget.month_of(now)
-    per_target = paced_cost_per_target(settings.scoring, c_hat)
+    per_target = paced_cost_per_target(settings.scoring, c_hat, c_hat_source)
     targets = int((scoring_share(p) / per_target).to_integral_value(rounding=ROUND_FLOOR))
     return LlmProjection(
         # A ≤ 0 accrues nothing; the capacity is then its floor, `min_bucket_capacity_usd`

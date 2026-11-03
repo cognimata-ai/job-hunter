@@ -183,7 +183,8 @@ class ProposedQueryOut(BaseModel):
 
 
 class ProposalOut(BaseModel):
-    """A proposal's status and, once `ready`, its kept queries; `items` is `null` in every other status."""
+    """A proposal's status, once `ready` its kept queries (`items`, `null` in every other status), and once
+    `failed` why (`failure_code`)."""
 
     status: Literal["running", "ready", "failed", "purged"]
     items: list[ProposedQueryOut] | None
@@ -237,8 +238,9 @@ class RescoreEstimateOut(BaseModel):
     )
     online_targets: int = Field(description="The other ads, scored online at the monthly pace")
     online_per_day: int = Field(
-        description="The monthly pace: the ads a day the budget's hourly accrual scores at the expected cost "
-        "per ad, its share of the cache writes included"
+        description="The monthly pace: the ads a day the budget's hourly accrual pays for at the expected "
+        "cost per ad, which includes the cache writes: a cost measured from recent scoring as it is, the "
+        "central estimate with its share of a cycle's cache writes added"
     )
     next_version_no: int = Field(description="The number of the profile version a confirm creates")
 

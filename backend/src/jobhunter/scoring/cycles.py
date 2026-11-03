@@ -105,7 +105,7 @@ from jobhunter.observability.metrics import CLAIM_RECLAIMS
 from jobhunter.scoring.admission import CYCLE_OWNER as CYCLE_OWNER
 from jobhunter.scoring.admission import MAX_SCORE_ATTEMPTS, Lane, any_admissible
 from jobhunter.settings import validate
-from jobhunter.settings.llm_projection import central_cost_per_target
+from jobhunter.settings.llm_projection import CHatSource, central_cost_per_target
 from jobhunter.settings.model import ExecutionConfig, ModelPolicy
 from jobhunter.types import JSONValue, get_int
 from jobhunter.worker.epoch import Swept, fence_epoch, register_takeover_sweep
@@ -298,7 +298,7 @@ async def c_hat(
     evaluation_policy_id: int,
     model_policy: ModelPolicy,
     now: datetime,
-) -> tuple[Decimal, Literal["history", "central"]]:
+) -> tuple[Decimal, CHatSource]:
     """`ĉ` and where it came from (module docstring), at $0.000001; a history mean that rounds to no cost
     (`c_hat_usd > 0`) falls back to the central estimate too."""
     params = {"tuple": llm_tuple_id, "policy": evaluation_policy_id, "since": now - C_HAT_WINDOW, "now": now}

@@ -19,6 +19,7 @@ from jobhunter.settings.llm_projection import (
     cap_binding,
     central_cost_per_target,
     llm_projection,
+    paced_cost_per_target,
 )
 from jobhunter.settings.model import ModelPolicy, Settings
 
@@ -128,6 +129,7 @@ def projected(model_policy: ModelPolicy, *, min_cycle_targets: int = 10) -> LlmP
         s,
         now=OCTOBER,
         c_hat=central_cost_per_target(model_policy),
+        c_hat_source="central",
         projected_critic_rate=Decimal("0.450"),
         arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
     )
@@ -165,6 +167,7 @@ def test_targets_per_month_for_b_under_the_default_cap() -> None:
         settings(),
         now=OCTOBER,
         c_hat=central_cost_per_target(PRESET_B),
+        c_hat_source="central",
         projected_critic_rate=Decimal("0.450"),
         arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
     )
@@ -176,11 +179,35 @@ def test_targets_per_month_for_b_under_the_default_cap() -> None:
     assert p.projected_month_spend == Decimal("93.089073")
 
 
+def test_a_history_c_hat_gets_no_cache_write_share() -> None:
+    """A history `ĉ` is the mean of measured attempt costs, whose settlements charged their cache writes: the
+    cycle's share is added to a central `ĉ` only."""
+    scoring = settings().scoring
+    assert paced_cost_per_target(scoring, Decimal("0.052646"), "central") == Decimal("0.057569")
+    assert paced_cost_per_target(scoring, Decimal("0.052646"), "history") == Decimal("0.052646")
+    p = llm_projection(
+        settings(),
+        now=OCTOBER,
+        c_hat=Decimal("0.052646"),
+        c_hat_source="history",
+        projected_critic_rate=Decimal("0.450"),
+        arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
+    )
+    # 93.10 / 0.052646 = 1768.42, not the central figure's 1,617
+    assert p.targets_per_month == 1768
+    assert p.projected_month_spend == Decimal("93.078128")  # 1,768 x $0.052646
+
+
 def test_bucket_rate_and_capacity() -> None:
     def at(now: datetime, **schedule: Any) -> LlmProjection:
         s = Settings.model_validate({"schedule": schedule}) if schedule else Settings()
         return llm_projection(
-            s, now=now, c_hat=Decimal("0.052646"), projected_critic_rate=Decimal("0.450"), arrival_per_month=0
+            s,
+            now=now,
+            c_hat=Decimal("0.052646"),
+            c_hat_source="central",
+            projected_critic_rate=Decimal("0.450"),
+            arrival_per_month=0,
         )
 
     # §6.9.2: rate = $93.10 over the month; B_max = max(2 x rate x 6 h, $1.00)
@@ -200,6 +227,7 @@ def test_a_cap_at_or_below_the_buffer_admits_nothing_and_binds() -> None:
             settings(cap_usd=cap, overrun_buffer_usd="2.00"),
             now=OCTOBER,
             c_hat=Decimal("0.052646"),
+            c_hat_source="central",
             projected_critic_rate=Decimal("0.450"),
             arrival_per_month=0,  # it binds even without any arrival
         )
@@ -214,6 +242,7 @@ def test_a_cap_that_covers_the_arrivals_does_not_bind() -> None:
         settings(cap_usd="200.00"),
         now=OCTOBER,
         c_hat=Decimal("0.052646"),
+        c_hat_source="central",
         projected_critic_rate=Decimal("0.450"),
         arrival_per_month=DEFAULT_ARRIVAL_PER_MONTH,
     )

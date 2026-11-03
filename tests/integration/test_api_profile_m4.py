@@ -149,6 +149,7 @@ async def test_estimate_has_the_modal_figures(
     await activate_profile(engine)
     await seed_adversarial(engine)
     draft_id = await make_ready_draft(logged_in_client, op_runner, upload)
+    assert (await profile(logged_in_client))["open_draft"] == {"id": draft_id, "status": "ready"}
     await retained_revisions(engine, 400)
     await counted(engine, scoring="37.00", nonscoring="1.20")
     r = await logged_in_client.get(f"/api/profile/drafts/{draft_id}/rescore-estimate")
