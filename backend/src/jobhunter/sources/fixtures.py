@@ -16,8 +16,8 @@ concurrent processes never interleave. The logged query has no credential parame
 With `clock` (the fake mode of `http.configure` passes `utcnow`), the SerpApi account read (`ACCOUNT_CASE`)
 is served with its plan renewing `ACCOUNT_RENEWAL_AHEAD` after `clock()`'s date (`renewed_account`), so the
 recorded account describes a current window whatever the date, and every other 2xx body has its posting dates
-moved with the clock (`shift_dates`, M4 Task 18); without one every case is served as recorded (the contract
-tests, R4).
+and every 2xx response its `Date` header moved with the clock (`shift_dates`, `shift_date_header`, M4 Task
+18); without one every case is served as recorded (the contract tests, R4).
 
 **The shift** (`shift_dates`). `DATE_FIELDS` names, by fixture prefix, every field an adapter reads as a
 posting date (`DateField`: its path and its encoding; SerpApi's relative `2 days ago` chips are no field). A
@@ -33,9 +33,12 @@ unix seconds and milliseconds stay numbers of their type. A value the adapter wo
 cannot keep raises `ValueError`, so no ad ages out unnoticed. A body with none of its prefix's values moved
 is served byte for byte; a JSON body with one is written back in the recordings' own form (two-space indent,
 UTF-8 as is, the final newline kept: the same bytes but for the dates); an XML body is changed in place, the
-lexical `<tag>` texts checked against the parsed path first. Headers, metas and non-2xx bodies are never
-touched: the recorded `Date` header stays as recorded (it dates SerpApi's relative chips and Arbeitnow's
-fill instants, which therefore do not move).
+lexical `<tag>` texts checked against the parsed path first. Metas and non-2xx responses are never touched.
+
+**The `Date` header** (`shift_date_header`, ruling T18-c). A 2xx response with a body has its `Date` moved by
+the same whole days, never past `now` (truncated to the second), and written back in IMF-fixdate; every other
+header is served as recorded. SerpApi's relative chips (`2 days ago`) resolve against that header and
+Arbeitnow's fill instant is the header less `Age`, so both move with the clock as the listed fields do.
 """
 
 import json
@@ -44,6 +47,7 @@ import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
+from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal
@@ -383,16 +387,36 @@ def shift_dates(body: bytes, *, case: str, kind: str, now: datetime, reference: 
     return body
 
 
+def shift_date_header(headers: dict[str, str], *, now: datetime, reference: datetime) -> dict[str, str]:
+    """`headers` (lower-case names) with `date` moved by the whole days from `reference` to `now`, never past
+    `now`, in IMF-fixdate (the module docstring); `headers` itself when there is no readable `date` or it did
+    not move."""
+    value = headers.get("date")
+    if value is None:
+        return headers
+    try:
+        at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return headers
+    at = at.replace(tzinfo=UTC) if at.tzinfo is None else at.astimezone(UTC)
+    moved = min(at + timedelta(days=(now - reference) // _DAY), now.astimezone(UTC).replace(microsecond=0))
+    if moved == at:
+        return headers
+    return {**headers, "date": format_datetime(moved, usegmt=True)}
+
+
 def _serve(fixtures_dir: Path, case: str, clock: Callable[[], datetime] | None) -> httpx.Response:
     status, headers, body = load_case(fixtures_dir, case)
-    if clock is not None:
+    if clock is not None and 200 <= status < 300:
         now = clock()
+        reference = case_reference(fixtures_dir, case)
         if case == ACCOUNT_CASE:
             body = renewed_account(body, now.date())
-        elif 200 <= status < 300:
+        else:
             kind = _body(fixtures_dir, case)[0].suffix
-            reference = case_reference(fixtures_dir, case)
             body = shift_dates(body, case=case, kind=kind, now=now, reference=reference)
+        if body:  # a response with a body: its `Date` moves with it
+            headers = shift_date_header(headers, now=now, reference=reference)
     return httpx.Response(status, headers=headers, content=body)
 
 

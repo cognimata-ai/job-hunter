@@ -13,6 +13,7 @@ import re
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -22,8 +23,8 @@ from defusedxml import DefusedXmlException
 from defusedxml.ElementTree import ParseError, fromstring
 from jobhunter.sources import fixtures
 from jobhunter.sources.adzuna import AdzunaAdapter
-from jobhunter.sources.arbeitnow import ArbeitnowAdapter
-from jobhunter.sources.base import RawPage, RequestSpec, SourceAdapter, SourceError
+from jobhunter.sources.arbeitnow import ArbeitnowAdapter, filled_at
+from jobhunter.sources.base import Parsed, RawPage, RequestSpec, SourceAdapter, SourceError
 from jobhunter.sources.fixtures import (
     DATE_FIELDS,
     FIXTURE_REFERENCE,
@@ -34,7 +35,8 @@ from jobhunter.sources.fixtures import (
     shift_dates,
 )
 from jobhunter.sources.jsearch import JSearchAdapter
-from jobhunter.sources.parsing.dates import parse_iso
+from jobhunter.sources.parsing.dates import BERLIN, parse_iso, parse_relative
+from jobhunter.sources.serpapi import SerpApiAdapter
 from jobhunter.sources.watchlist_patterns import AtsType
 
 from tests.support.sources import adapter_for_fixture
@@ -186,7 +188,9 @@ def test_every_dated_fixture_field_is_shifted_by_whole_days() -> None:
             status, headers, recorded = load_case(FIXTURES, case)
             served, kind = response.content, _kind(case)
             served_headers = {k: v for k, v in response.headers.items() if k != "content-length"}  # httpx's
-            assert (response.status_code, served_headers) == (status, headers)  # never the headers
+            shift = parsedate_to_datetime(served_headers.pop("date")) - parsedate_to_datetime(headers["date"])
+            others = {k: v for k, v in headers.items() if k != "date"}
+            assert (response.status_code, served_headers, shift) == (status, others, timedelta(days=DAYS))
             for field in DATE_FIELDS[prefix]:
                 before, after = _values(recorded, kind, field), _values(served, kind, field)
                 assert len(after) == len(before), (case, field)
@@ -475,3 +479,102 @@ def test_every_adapter_reads_the_shifted_dates_n_days_later(case: str) -> None:
                 assert new == old + timedelta(days=DAYS), (case, index)
             else:  # clamped at the clock
                 assert new is not None and new <= now and now - new < timedelta(seconds=1)
+
+
+# ---- the Date header (Task 18 ruling T18-c) ----------------------------------------------------------------
+
+SERPAPI_SEARCH: Final = "https://serpapi.com/search.json?engine=google_jobs&q=x"
+ARBEITNOW_PAGE1: Final = "https://www.arbeitnow.com/api/job-board-api?page=1"
+
+
+def _date(response: httpx.Response) -> datetime:
+    return parsedate_to_datetime(response.headers["date"])
+
+
+def test_a_2xx_date_header_moves_by_the_same_days_and_nothing_else_does() -> None:
+    """With a clock, a 2xx response's `Date` moves by the body's whole days, written back in IMF-fixdate;
+    every other header is served as recorded."""
+    for url in (SERPAPI_SEARCH, ARBEITNOW_PAGE1, *SERVED["ats/lever_"]):
+        case = _case_of(url)
+        now = fixtures.case_reference(FIXTURES, case) + LATER
+        recorded, served = _served(url, None), _served(url, now)
+        assert _date(served) - _date(recorded) == timedelta(days=DAYS), case
+        assert re.fullmatch(
+            r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT", served.headers["date"]
+        )
+        others = {k: v for k, v in served.headers.items() if k not in ("date", "content-length")}
+        assert others == {k: v for k, v in recorded.headers.items() if k not in ("date", "content-length")}
+    # in the case's reference day: a shift of 0 days, the header as recorded
+    case = _case_of(SERPAPI_SEARCH)
+    same_day = _served(SERPAPI_SEARCH, fixtures.case_reference(FIXTURES, case) + timedelta(hours=1))
+    assert same_day.headers["date"] == load_case(FIXTURES, case)[1]["date"]
+
+
+def test_a_shifted_date_header_never_passes_now() -> None:
+    """A recorded `Date` after the case's reference (a server clock ahead of the recorder's) is the clock
+    itself once moved, truncated to the second."""
+    reference = parsedate_to_datetime("Sun, 18 Oct 2026 20:50:48 GMT")
+    now = reference + timedelta(days=1, minutes=30, microseconds=500)
+    headers = {"content-type": "application/json", "date": "Sun, 18 Oct 2026 21:50:48 GMT", "age": "5"}
+    shifted = fixtures.shift_date_header(headers, now=now, reference=reference)
+    assert shifted == {**headers, "date": "Mon, 19 Oct 2026 21:20:48 GMT"}
+    earlier = {**headers, "date": "Sun, 18 Oct 2026 20:00:00 GMT"}  # no shift, not after the clock: as it is
+    assert fixtures.shift_date_header(earlier, now=reference, reference=reference) is earlier
+    unreadable = {"date": "not a date"}
+    assert fixtures.shift_date_header(unreadable, now=now, reference=reference) is unreadable
+
+
+def test_a_serpapi_chip_resolves_against_the_shifted_date() -> None:
+    """SerpApi's `2 days ago` resolves against the response `Date`: on the shifted header, to the Berlin day
+    2 days before the shifted `Date`, so the posting moves with the clock as the other sources' do."""
+    case = _case_of(SERPAPI_SEARCH)
+    now = fixtures.case_reference(FIXTURES, case) + LATER
+    served = _served(SERPAPI_SEARCH, now)
+    page = RawPage(SPEC, served.status_code, dict(served.headers), served.content, now)
+    adapter = SerpApiAdapter(httpx.AsyncClient(), api_key=b"k", instance_id=1, clock=lambda: now)
+    first = next(o for o in adapter.parse(page) if isinstance(o, Parsed))
+    chip = json.loads(served.content)["jobs_results"][first.item_index]["extensions"][0]
+    assert chip == "2 days ago"
+    expected = parse_relative(chip, reference=_date(served))
+    assert expected is not None and first.normalized.posted_at == expected.at
+    recorded = parse_relative(chip, reference=_date(_served(SERPAPI_SEARCH, None)))
+    assert recorded is not None
+    berlin_day = expected.at.astimezone(BERLIN).date() - recorded.at.astimezone(BERLIN).date()
+    assert berlin_day == timedelta(days=DAYS)
+
+
+def test_arbeitnows_fill_instant_moves_by_the_same_days() -> None:
+    """`arbeitnow.filled_at` (`Date`, never later than the arrival, less `Age`) moves with the clock, so a
+    fake-mode read to the end of the feed proves its span again."""
+    case = _case_of(ARBEITNOW_PAGE1)
+    now = fixtures.case_reference(FIXTURES, case) + LATER
+    fills = []
+    for clock in (None, now):
+        served = _served(ARBEITNOW_PAGE1, clock)
+        fills.append(filled_at(RawPage(SPEC, served.status_code, dict(served.headers), served.content, now)))
+    assert fills[0] is not None and fills[1] is not None
+    assert fills[1] - fills[0] == timedelta(days=DAYS)
+
+
+def test_a_non_2xx_or_bodyless_response_keeps_its_headers(tmp_path: Path) -> None:
+    later = FIXTURE_REFERENCE + LATER
+    for url in (
+        "https://boards-api.greenhouse.io/v1/boards/nobody/jobs",
+        "https://jsearch.p.rapidapi.com/search",
+    ):
+        case = _case_of(url)
+        served = _served(url, later)
+        assert served.status_code == 404
+        assert {k: v for k, v in served.headers.items() if k != "content-length"} == load_case(
+            FIXTURES, case
+        )[1]
+    (tmp_path / "ats").mkdir()
+    (tmp_path / "ats/lever_eu_end.json").write_bytes(b"")
+    recorded_date = "Sun, 18 Oct 2026 20:49:45 GMT"
+    recorded = {"status": 200, "headers": {"date": recorded_date}}
+    (tmp_path / "ats/lever_eu_end.headers.json").write_text(json.dumps(recorded), "utf-8")
+    transport = fixture_transport(tmp_path, clock=lambda: later)
+    served = transport.handle_request(
+        httpx.Request("GET", "https://api.eu.lever.co/v0/postings/leverdemo?skip=9")
+    )
+    assert (served.status_code, served.content, served.headers["date"]) == (200, b"", recorded_date)

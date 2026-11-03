@@ -224,12 +224,13 @@ after its reference). Each value keeps its encoding: an ISO string moves its dat
 offset, separator, precision and zone word. A JSON body with a moved value is written back in the files' own
 form (two-space indent, UTF-8, the final newline), so it differs from the recording in its dates only; the
 Personio XML is changed in place. Bodies without a listed value (SerpApi, the 404 and end pages, the HTML and
-truncated bodies), the headers and the metas are served as recorded.
+truncated bodies) and the metas are served as recorded.
 
-Two dates do not move, because they come from the recorded `Date` header, which is never changed: SerpApi's
-relative chips (`2 days ago`) resolve against it, so its ten postings keep their recorded dates; and
-Arbeitnow's fill instant (`filled_at`: `Date` less `Age`) stays at the recording, so a fake-mode read of the
-firehose proves no covered span above it.
+The `Date` header of a 2xx response with a body moves by the same whole days (never past `now`, written back
+in IMF-fixdate); every other header, and every header of a non-2xx response, is served as recorded. So the
+two dates read from it move as well: SerpApi's relative chips (`2 days ago`) resolve against it, and
+Arbeitnow's fill instant (`filled_at`: `Date` less `Age`) stays with the shifted feed, whose read to the end
+proves its span as the recording's did.
 
 ## Location labels (V17)
 
