@@ -83,8 +83,9 @@ export interface FakeRequest {
   body: string | null;
 }
 
-/** A route a test answers itself, by `METHOD path`; it is asked before the stub's own routes. */
-export type FakeRoute = (request: FakeRequest) => Response;
+/** A route a test answers itself, by `METHOD path`; it is asked before the stub's own routes. A promise holds
+ * the answer until the test settles it. */
+export type FakeRoute = (request: FakeRequest) => Response | Promise<Response>;
 
 export interface FakeApi {
   /** The bodies of the login requests, in order. */

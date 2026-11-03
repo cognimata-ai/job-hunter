@@ -73,9 +73,18 @@ export function RunNowPopover({ status, open, onOpenChange }: RunNowPopoverProps
   const activeRunId = status?.active_run_id ?? null;
   const units = status?.run_now.jsearch_units;
 
+  // A run that becomes active elsewhere (a slot, another tab) closes the popover for good: the owner's state
+  // follows, so the popover does not open again by itself, taking the focus, once that run has ended.
+  useEffect(() => {
+    if (activeRunId !== null && open) {
+      onOpenChange(false);
+    }
+  }, [activeRunId, open, onOpenChange]);
+
   const start = (vars: RunNowIn) => {
     runNow.mutate(vars, {
       onSuccess: ({ created }) => {
+        setIncludePaid(false); // a paid run is chosen each time; a failure keeps the box, so Retry is that action
         onOpenChange(false);
         announce(t(created ? "run_now.started" : "run_now.already_running"));
       },
@@ -84,7 +93,7 @@ export function RunNowPopover({ status, open, onOpenChange }: RunNowPopoverProps
 
   return (
     <>
-      <Popover.Root open={open && activeRunId === null}
+      <Popover.Root open={open && activeRunId === null /* a guard: the effect above closes it */}
         onOpenChange={(next) => {
           if (next && !runNow.isPending) {
             runNow.reset(); // a new visit starts without the last failure; its key is kept by the action

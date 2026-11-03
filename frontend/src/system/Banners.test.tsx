@@ -86,6 +86,14 @@ describe("Banners", () => {
     });
     // the same element, updated in place: the live region persists, so the change is announced
     expect(applying.isConnected).toBe(true);
+    // an apply that has not reported yet (its counts are 0) shows no counts
+    api.status = statusOut({ banners: [{ code: "applying_settings", severity: "info", params: { done: 0, total: 0 } }] });
+    await act(async () => {
+      await app.queryClient.refetchQueries({ queryKey: ["system", "status"] });
+    });
+    await waitFor(() => {
+      expect(applying.textContent).toBe(en["banner.applying_settings_starting"]);
+    });
     api.status = statusOut({ banners: [{ code: "applying_settings", severity: "info", params: { failed: true } }] });
     await act(async () => {
       await app.queryClient.refetchQueries({ queryKey: ["system", "status"] });

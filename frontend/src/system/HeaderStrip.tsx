@@ -10,20 +10,36 @@
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useDisplay } from "../app/AppShell";
+import { useDisplay } from "../app/display";
 import { cx } from "../components/cx";
 import { ProblemBox } from "../components/ProblemBox";
 import { RelativeTime } from "../components/RelativeTime";
 import { Skeleton } from "../components/Skeleton";
 import { useServerText } from "../i18n/index";
-import { type HeaderQuotaOut, type Provider, quotaOf, type StatusOut, useLogout, useStatus } from "./api";
+import { type HeaderQuotaOut, type Provider, PROVIDERS, quotaOf, type StatusOut, useLogout, useStatus } from "./api";
 import { Banners } from "./Banners";
 import { useFormat } from "./format";
 import styles from "./HeaderStrip.module.css";
 import { RunNowPopover } from "./RunNowPopover";
 
-/** Product names, never translated. A member added to `Provider` fails the typecheck here until it is named. */
-const PROVIDER_NAMES: Record<Provider, string> = { jsearch: "JSearch", serpapi: "SerpApi", adzuna: "Adzuna" };
+/** The line each provider's window is on (§15.1); a provider added to `PROVIDERS` fails the typecheck here until
+ * it is placed. Line 2's show their reset date. The names are the catalogue's (`provider.<p>`, product names). */
+const PLACEMENT: Record<Provider, "line2" | "line3"> = { jsearch: "line2", serpapi: "line3", adzuna: "line3" };
+
+function ProviderItem({ status, provider }: { status: StatusOut; provider: Provider }) {
+  const { t } = useTranslation();
+  const serverText = useServerText();
+  const fmt = useFormat();
+  const window = quotaOf(status, provider);
+  return (
+    <li className={styles.item}>
+      {serverText("provider", provider)} <Usage window={window} />
+      {PLACEMENT[provider] === "line2" && window !== null && (
+        <> {t("header.resets", { date: fmt.dayMonth(window.reset_at) })}</>
+      )}
+    </li>
+  );
+}
 
 function Usage({ window }: { window: HeaderQuotaOut | null }) {
   const { t } = useTranslation();
@@ -59,7 +75,6 @@ function Facts({ status, onRunNow }: { status: StatusOut; onRunNow: () => void }
   const { timezone } = useDisplay();
   const last = status.last_run;
   const next = status.next_slots.at(0); // none while the schedule is off
-  const jsearch = quotaOf(status, "jsearch");
   return (
     <div className={styles.facts}>
       <ul role="list" className={styles.line}>
@@ -96,16 +111,13 @@ function Facts({ status, onRunNow }: { status: StatusOut; onRunNow: () => void }
             </li>
           </>
         )}
-        <li className={styles.item}>
-          {PROVIDER_NAMES.jsearch} <Usage window={jsearch} />
-          {jsearch !== null && <> {t("header.resets", { date: fmt.dayMonth(jsearch.reset_at) })}</>}
-        </li>
+        {PROVIDERS.filter((p) => PLACEMENT[p] === "line2").map((p) => (
+          <ProviderItem key={p} status={status} provider={p} />
+        ))}
       </ul>
       <ul role="list" className={styles.line}>
-        {(["serpapi", "adzuna"] as const).map((provider) => (
-          <li key={provider} className={styles.item}>
-            {PROVIDER_NAMES[provider]} <Usage window={quotaOf(status, provider)} />
-          </li>
+        {PROVIDERS.filter((p) => PLACEMENT[p] === "line3").map((p) => (
+          <ProviderItem key={p} status={status} provider={p} />
         ))}
         {status.llm !== null && (
           <li className={styles.item}>

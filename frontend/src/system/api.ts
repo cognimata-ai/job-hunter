@@ -24,13 +24,17 @@ export type RunNowOut = components["schemas"]["RunNowOut"];
 export type RunStatus = RunOut["status"];
 export type PartialCause = RunDetailOut["partial_causes"][number];
 export type JsonValue = components["schemas"]["JsonValue"];
+export type RetryApplyOut = components["schemas"]["RetryApplyOut"];
 
 /**
- * The quota providers (`quota.windows.Provider`). `StatusOut.quota` is typed by `string` keys in schema.d.ts
- * (openapi-typescript drops the document's `propertyNames` enum), so the union is written here; the header
- * reads each window through `quotaOf`, and a provider missing from an answer shows as having none.
+ * The quota providers (`quota.windows.Provider`), in the header's order. `StatusOut.quota` is typed by `string`
+ * keys in schema.d.ts (openapi-typescript drops the document's `propertyNames` enum), so the list is written
+ * here and held to the backend by the code catalogue: `test_i18n_codes.py` derives `codes.json`'s `provider`
+ * from `Provider`, and `HeaderStrip.test.tsx` checks this list against it; the header places each one by a
+ * `Record<Provider, …>`. A provider missing from an answer shows as having no window (`quotaOf`).
  */
-export type Provider = "jsearch" | "serpapi" | "adzuna";
+export const PROVIDERS = ["jsearch", "serpapi", "adzuna"] as const;
+export type Provider = (typeof PROVIDERS)[number];
 
 export const STATUS_KEY = ["system", "status"] as const;
 export const runKey = (id: number | null) => ["runs", id] as const;
@@ -108,10 +112,10 @@ export function useRunNow(): UseMutationResult<RunNowOut, ProblemError, RunNowIn
  * `Idempotency-Key`: a repeated request finds the apply live and is refused (409 `conflict_state`). A 202
  * reads the status again.
  */
-export function useRetryApply(): UseMutationResult<{ operation_id: number }, unknown, undefined> {
+export function useRetryApply(): UseMutationResult<RetryApplyOut, unknown, undefined> {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: () => apiFetch<{ operation_id: number }>("/api/settings/scope/retry-apply", { method: "POST" }),
+    mutationFn: () => apiFetch<RetryApplyOut>("/api/settings/scope/retry-apply", { method: "POST" }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: STATUS_KEY });
     },
@@ -121,7 +125,8 @@ export function useRetryApply(): UseMutationResult<{ operation_id: number }, unk
 /**
  * The logout (`POST /api/auth/logout`, 204). An `authCall`: its 401 (the session had already ended) is an
  * answer, not an expiry. On a 204 or a 401 it goes to the login without `redirect`, then clears the cache, as
- * `expireSession` does; on any other failure (no answer, a 5xx) the user stays signed in, told by a toast.
+ * `expireSession` does; on any other failure (no answer, a 5xx) the user stays signed in, told by its own toast
+ * (`ownToast`: not the generic transient one as well).
  */
 export function useLogout(): UseMutationResult<undefined, unknown, undefined> {
   const { t } = useTranslation();
@@ -135,7 +140,7 @@ export function useLogout(): UseMutationResult<undefined, unknown, undefined> {
   };
   return useMutation({
     mutationFn: () => apiFetch<undefined>("/api/auth/logout", { method: "POST" }),
-    meta: { authCall: true },
+    meta: { authCall: true, ownToast: true },
     onSuccess: leave,
     onError: (error) => {
       if (isProblem(error, "unauthenticated")) {

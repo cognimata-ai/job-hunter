@@ -3,7 +3,7 @@
 // (`settings.display.timezone`), never the browser's.
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { useDisplay } from "../app/AppShell";
+import { useDisplay } from "../app/display";
 import { intlLocale } from "../i18n/index";
 
 export interface Format {

@@ -44,6 +44,21 @@ export default defineConfig({
     // and no modulepreload polyfill: the entry stays the one `<script type="module" src>` of index.html.
     assetsInlineLimit: 0,
     modulePreload: { polyfill: false },
+    // The vendor code in a few chunks of its own, each under Vite's 500 kB advisory (rolldown's
+    // `output.codeSplitting`, Vite 8). They load as `modulepreload` links of the one entry script, which stays
+    // the only `<script>` of index.html (check-dist-csp).
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: "react", test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
+            { name: "tanstack", test: /[\\/]node_modules[\\/]@tanstack[\\/]/ },
+            { name: "i18n", test: /[\\/]node_modules[\\/](i18next|react-i18next)[\\/]/ },
+            { name: "radix", test: /[\\/]node_modules[\\/](@radix-ui|@floating-ui)[\\/]/ },
+          ],
+        },
+      },
+    },
   },
   test: {
     include: ["src/**/*.test.{ts,tsx}"],

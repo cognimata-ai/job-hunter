@@ -6,6 +6,8 @@ import { isProblem } from "./client";
 export interface AppMeta extends Record<string, unknown> {
   /** The login and the session read: a 401 is their answer, never an expired session. */
   authCall?: true;
+  /** A mutation that tells its own failure (the logout's toast): no transient toast besides it. */
+  ownToast?: true;
 }
 
 declare module "@tanstack/react-query" {
@@ -36,7 +38,8 @@ export function isTransient(error: unknown): boolean {
  * `onTransient` (the toast, §15.8: "a non-blocking toast plus automatic retry with backoff") is called once
  * per fetch of a query, at its first transient failure, while its retries run (the cache's `failed` event);
  * a query that does not retry calls it at its one failure; its final failure after retries does not call it
- * again. A mutation calls it when it fails transiently.
+ * again. A mutation calls it when it fails transiently, unless its `meta.ownToast` is set (it raises a notice of
+ * its own); queries ignore that flag.
  */
 export function makeQueryClient({
   onUnauthenticated,
@@ -84,7 +87,7 @@ export function makeQueryClient({
     mutationCache: new MutationCache({
       onError: (error, _vars, _context, mutation) => {
         unauthenticated(error, mutation.meta);
-        if (isTransient(error)) {
+        if (isTransient(error) && mutation.meta?.ownToast !== true) {
           onTransient();
         }
       },

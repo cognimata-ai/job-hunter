@@ -93,7 +93,7 @@ function Section({ name, value }: { name: (typeof SECTIONS)[number]; value: Json
   return (
     <section aria-labelledby={id} className={styles.section}>
       <h3 id={id} className={styles.sectionTitle}>{t(`run_report.section.${name}`)}</h3>
-      {isRecord(value) ? <Value value={value} /> : <p className={styles.value}><Value value={value} /></p>}
+      {isRecord(value) ? <Value value={value} /> : <div className={styles.value}><Value value={value} /></div>}
     </section>
   );
 }

@@ -217,6 +217,7 @@
   "banner.needs_attention": "Needs attention",
   "banner.retry_apply": "Retry apply",
   "banner.retry_apply_started": "Applying the search scope again",
+  "banner.applying_settings_starting": "Applying settings…",
   "window_state.exhausted_until_reset": "Exhausted until reset",
   "window_state.extrapolated_unvalidated": "Estimated, not yet confirmed",
   "window_state.validated": "Confirmed",
@@ -276,5 +277,8 @@
   "pace.ok": "ok",
   "paid_search_reason.serpapi_disabled": "SerpApi is off",
   "paid_search_reason.serpapi_exhausted": "SerpApi is used up too",
-  "paid_search_reason.serpapi_unavailable": "SerpApi is unavailable"
+  "paid_search_reason.serpapi_unavailable": "SerpApi is unavailable",
+  "provider.adzuna": "Adzuna",
+  "provider.jsearch": "JSearch",
+  "provider.serpapi": "SerpApi"
 }

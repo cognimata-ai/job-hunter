@@ -262,6 +262,8 @@ NAMESPACES: Final[dict[str, Callable[[], set[str]]]] = {
     # the header's LLM pace and the reason of the paid-search pause (plan M4 Task 21)
     "pace": lambda: literal_values(Pace),
     "paid_search_reason": lambda: literal_values(PaidSearchReason),
+    # the quota providers: their names are the product names, the same in both languages (plan M4 Task 21)
+    "provider": lambda: literal_values(windows.Provider),
     "window_state": lambda: literal_values(WindowState),
     "instance_health": lambda: literal_values(breaker.Health),
     "alert_status": lambda: literal_values(AlertStatus),

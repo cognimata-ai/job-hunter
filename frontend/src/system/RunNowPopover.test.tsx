@@ -83,8 +83,15 @@ describe("RunNowPopover", () => {
 
   it("Start sends a keyed POST with include_paid", async () => {
     const api = fakeApi({ signedIn: true });
+    // after the POST, the status read is held, and the server's status has no active run yet: the label can
+    // come from the response's run only
+    let release: (() => void) | null = null;
     api.routes.set("POST /api/runs", () => {
-      api.status = statusOut({ active_run_id: 9 });
+      api.routes.set("GET /api/system/status", () =>
+        new Promise<Response>((resolve) => {
+          release = () => { resolve(json(api.status)); };
+        }),
+      );
       return json({ run: run(9, "queued", { include_paid: true }), created: true }, 202);
     });
     renderApp("/");
@@ -101,12 +108,71 @@ describe("RunNowPopover", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).toBeNull();
     });
+    expect(api.status.active_run_id).toBeNull();
     expect(within(strip).getByRole("button", { name: en["run_now.in_progress"] })).toBeTruthy();
     await settled();
     expect(liveText()).toBe(en["run_now.started"]);
-    // the status is read again at once; the drawer is not opened by itself
+    // the status is being read again at once; the drawer is not opened by itself
     expect(requestsTo(api, "GET /api/system/status").length).toBeGreaterThanOrEqual(2);
     expect(screen.queryByRole("dialog")).toBeNull();
+    // the next status names the run: the label now comes from it
+    api.status = statusOut({ active_run_id: 9 });
+    await act(async () => {
+      release?.();
+      await Promise.resolve();
+    });
+    await settled();
+    expect(within(strip).getByRole("button", { name: en["run_now.in_progress"] })).toBeTruthy();
+  });
+
+  it("a successful Start clears Include paid sources, a failed one keeps it", async () => {
+    const api = fakeApi({ signedIn: true });
+    // the retry queues run 9, which has ended by the next status read (a fixture run is short)
+    const answers = [() => problem(503, "internal"), () => json({ run: run(9, "queued"), created: true }, 202)];
+    api.routes.set("POST /api/runs", () => answers.shift()?.() ?? problem(500, "internal"));
+    renderApp("/");
+    const strip = await header();
+    const user = userEvent.setup();
+    await user.click(within(strip).getByRole("button", { name: en["run_now.open"] }));
+    let dialog = await screen.findByRole("dialog", { name: en["run_now.title"] });
+    await user.click(within(dialog).getByRole("checkbox"));
+    await user.click(within(dialog).getByRole("button", { name: en["run_now.start"] }));
+    const failed = await within(dialog).findByRole("alert");
+    expect(within(dialog).getByRole<HTMLInputElement>("checkbox").checked).toBe(true); // the same action
+    await user.click(within(failed).getByRole("button", { name: en["action.retry"] }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(requestsTo(api, "POST /api/runs").map((r) => JSON.parse(r.body ?? "null") as unknown)).toEqual([
+      { include_paid: true },
+      { include_paid: true },
+    ]);
+    await user.click(await within(strip).findByRole("button", { name: en["run_now.open"] }));
+    dialog = await screen.findByRole("dialog", { name: en["run_now.title"] });
+    expect(within(dialog).getByRole<HTMLInputElement>("checkbox").checked).toBe(false);
+  });
+
+  it("closes for good when a run starts elsewhere, and does not reopen when it ends", async () => {
+    const api = fakeApi({ signedIn: true });
+    const app = renderApp("/");
+    const strip = await header();
+    await userEvent.setup().click(within(strip).getByRole("button", { name: en["run_now.open"] }));
+    expect(await screen.findByRole("dialog", { name: en["run_now.title"] })).toBeTruthy();
+    const refetch = async () => {
+      await act(async () => {
+        await app.queryClient.refetchQueries({ queryKey: ["system", "status"] });
+      });
+      await settled();
+    };
+    api.status = statusOut({ active_run_id: 9 }); // a scheduled run, or another tab's
+    await refetch();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(within(strip).getByRole("button", { name: en["run_now.in_progress"] })).toBeTruthy();
+    api.status = statusOut({ active_run_id: null }); // it ended
+    await refetch();
+    expect(within(strip).getByRole("button", { name: en["run_now.open"] })).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement?.closest("[role=dialog]") ?? null).toBeNull();
   });
 
   it("an already active run is announced as such", async () => {
@@ -152,6 +218,7 @@ describe("RunNowPopover", () => {
     const answers = [
       () => json({ run: run(9, "queued"), report: null, partial_causes: [] }),
       () => json({ run: run(9, "running"), report: null, partial_causes: [] }),
+      () => json({ run: run(9, "running"), report: null, partial_causes: [] }), // the same status again
       () => {
         api.status = statusOut({ active_run_id: null });
         return json({
@@ -182,13 +249,35 @@ describe("RunNowPopover", () => {
     await settled();
     expect(liveText()).toBe(`Run 9: ${en["run_status.running"]}`);
 
+    // a poll that changes nothing announces nothing: the region, cleared, stays empty
+    const live = document.querySelector("[aria-live=polite][role=status]");
+    if (live === null) {
+      throw new Error("no live region");
+    }
+    live.textContent = "";
+    // the clock moves timer by timer up to that poll, then in 50 ms steps, each in an act of its own, so that
+    // React commits between them: an announcement empties the region, then fills it 100 ms later
+    for (let i = 0; i < 20 && reads().length < 3; i++) {
+      await act(async () => {
+        await vi.advanceTimersToNextTimerAsync();
+      });
+    }
+    expect(reads()).toHaveLength(3);
+    for (let i = 0; i < 4; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+      });
+    }
+    expect(within(drawer).getByText(en["run_status.running"])).toBeTruthy();
+    expect(liveText()).toBe("");
+
     const statusReads = requestsTo(api, "GET /api/system/status").length;
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
     expect(await within(drawer).findByText(en["run_status.partial"])).toBeTruthy();
-    expect(reads()).toHaveLength(3);
-    expect(reads()[2].headers.get("X-JH-Background")).toBe("1");
+    expect(reads()).toHaveLength(4);
+    expect(reads()[3].headers.get("X-JH-Background")).toBe("1");
     // the run ended: the status is read at once, the header's button is Run now again, the drawer stays
     await waitFor(() => {
       expect(requestsTo(api, "GET /api/system/status").length).toBeGreaterThan(statusReads);
@@ -205,6 +294,6 @@ describe("RunNowPopover", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30_000);
     });
-    expect(reads()).toHaveLength(3);
+    expect(reads()).toHaveLength(4);
   });
 });

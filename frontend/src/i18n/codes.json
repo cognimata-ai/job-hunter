@@ -222,5 +222,10 @@
     "serpapi_disabled",
     "serpapi_exhausted",
     "serpapi_unavailable"
+  ],
+  "provider": [
+    "adzuna",
+    "jsearch",
+    "serpapi"
   ]
 }

@@ -1,11 +1,13 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import codes from "../i18n/codes.json";
 import de from "../i18n/de.json";
 import en from "../i18n/en.json";
 import i18n from "../i18n/index";
 import { fakeApi, json, problem, requestsTo, statusOut } from "../test/api";
 import { NOW, renderApp } from "../test/app";
+import { PROVIDERS } from "./api";
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -55,6 +57,29 @@ describe("HeaderStrip", () => {
     expect(screen.getAllByRole("navigation")).toHaveLength(1);
     expect(within(header).getByRole("button", { name: en["run_now.open"] })).toBeTruthy();
     expect(within(header).getByRole("button", { name: en["header.logout"] })).toBeTruthy();
+  });
+
+  it("shows the last run's age as the server measured it", async () => {
+    const api = fakeApi({ signedIn: true });
+    const base = statusOut();
+    if (base.last_run === null) {
+      throw new Error("the fixture has a run");
+    }
+    // queued 2 h before the client's clock, but the server measured 5 min (its clock is the one that counts)
+    api.status = { ...base, last_run: { ...base.last_run, age_s: 300 } };
+    renderApp("/");
+    expect(await headerItems()).toContain("Last run 5 minutes ago");
+  });
+
+  it("places every provider of the code catalogue, by its catalogue name", async () => {
+    expect([...PROVIDERS].sort()).toEqual(codes.provider); // codes.provider is the backend's Provider
+    fakeApi({ signedIn: true });
+    renderApp("/");
+    const items = await headerItems();
+    for (const provider of codes.provider) {
+      const name = en[`provider.${provider}` as keyof typeof en];
+      expect(items.filter((text) => text.startsWith(`${name} `)), provider).toHaveLength(1);
+    }
   });
 
   it("names the partial causes", async () => {
@@ -189,6 +214,7 @@ describe("HeaderStrip", () => {
     await within(header).findByText(en["header.last_run"]);
     await userEvent.setup().click(within(header).getByRole("button", { name: en["header.logout"] }));
     expect(await screen.findByText(en["header.logout_failed"])).toBeTruthy();
+    expect(screen.queryByText(en["toast.transient"])).toBeNull(); // one toast: the logout's own
     expect(app.router.state.location.pathname).toBe("/");
     expect(screen.getByRole("banner")).toBeTruthy();
   });

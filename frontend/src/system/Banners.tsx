@@ -49,8 +49,12 @@ function bannerText(banner: BannerOut, t: T, serverText: ServerText, fmt: Format
         reason: serverText("paid_search_reason", text(p.reason)),
       });
     case "applying_settings":
-      return p.failed === true
-        ? t("banner.applying_settings_failed")
+      if (p.failed === true) {
+        return t("banner.applying_settings_failed");
+      }
+      // no counts before the apply reports any (status.py: "a count it has not reported yet is 0")
+      return count(p.total) === 0
+        ? t("banner.applying_settings_starting")
         : t("banner.applying_settings", { done: fmt.number(count(p.done)), total: fmt.number(count(p.total)) });
     case "rescoring":
       return t("banner.rescoring", { done: fmt.number(count(p.done)), total: fmt.number(count(p.total)) });

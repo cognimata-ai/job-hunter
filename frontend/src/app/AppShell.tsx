@@ -3,31 +3,22 @@
 // the display time zone. The login page is rendered bare (it is the only route outside the session).
 import { useQuery } from "@tanstack/react-query";
 import { Outlet, useMatch } from "@tanstack/react-router";
-import { createContext, useContext, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { apiFetch } from "../api/client";
 import type { components } from "../api/schema";
 import { Spinner } from "../components/Spinner";
 import { HeaderStrip } from "../system/HeaderStrip";
 import styles from "./AppShell.module.css";
+import { DEFAULT_TIMEZONE, DisplayContext } from "./display";
 import { RequireSession } from "./RequireSession";
+
+// Task 20's interface: the display settings, re-exported from their own module.
+export { type Display, useDisplay } from "./display";
 
 export type SettingsOut = components["schemas"]["SettingsOut"];
 
 export const SETTINGS_KEY = ["settings"] as const;
-const DEFAULT_TIMEZONE = "Europe/Berlin"; // the settings' own default (§13.1)
-
-export interface Display {
-  /** The IANA time zone times are shown in (`settings.display.timezone`). */
-  timezone: string;
-}
-
-const DisplayContext = createContext<Display>({ timezone: DEFAULT_TIMEZONE });
-
-/** The display settings of the signed-in user. */
-export function useDisplay(): Display {
-  return useContext(DisplayContext);
-}
 
 export function AppShell() {
   // by route match, as the router matches the path (without regard to case): `/LOGIN` is the login too

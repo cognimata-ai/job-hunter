@@ -112,6 +112,19 @@ describe("makeQueryClient", () => {
     expect(failing).toHaveBeenCalledTimes(1);
     expect(onTransient).toHaveBeenCalledTimes(1);
   });
+
+  it("a mutation that raises its own toast does not raise the transient one", async () => {
+    const { qc, onTransient } = client();
+    const failing = () => Promise.reject(problem(503, "internal"));
+    await qc.getMutationCache().build(qc, { mutationFn: failing, meta: { ownToast: true } }).execute(undefined)
+      .catch(() => undefined);
+    await qc.getMutationCache().build(qc, { mutationFn: () => Promise.reject(new TypeError("Failed to fetch")),
+      meta: { ownToast: true } }).execute(undefined).catch(() => undefined);
+    expect(onTransient).not.toHaveBeenCalled();
+    // queries are untouched by it
+    await qc.query({ queryKey: ["q"], queryFn: failing, retry: false, meta: { ownToast: true } }).catch(() => undefined);
+    expect(onTransient).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("isTransient", () => {

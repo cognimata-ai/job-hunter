@@ -116,6 +116,13 @@ describe("RunReport", () => {
     expect(screen.queryByText(en["run_report.reason"])).toBeNull();
   });
 
+  it("puts a section that is not an object in a block that may hold a list", () => {
+    render(<RunReport run={RUN} report={{ execution: [{ node: "plan", s: 0.5 }] }} partialCauses={[]} />);
+    const execution = screen.getByRole("region", { name: en["run_report.section.execution"] });
+    expect(within(execution).getByRole("list")).toBeTruthy();
+    expect(execution.querySelector("p ol, p ul, p dl")).toBeNull(); // no list inside a paragraph
+  });
+
   it("is translated, numbers and booleans included", async () => {
     await i18n.changeLanguage("de");
     render(<RunReport run={RUN} report={REPORT} partialCauses={["fetch_failed"]} />);
