@@ -1,17 +1,19 @@
 """The query table of Queries & sources (spec §14.2, §15.7; plan M4 Task 13, D1, M2 Carry-forward 2, M1
-Carry-forward 3's per-query gap counts; Rulings T13-a and T13-b): `GET /api/queries` and `GET
+Carry-forward 3's per-query gap counts; Rulings T13-a, T13-b and T13-d): `GET /api/queries` and `GET
 /api/queries/stats`.
 
 `query_list(conn, *, now)` and `cell_stats(conn, *, now)` read on the caller's connection, which the routes
 open as one read snapshot (`db.snapshot.read_snapshot`): plain reads, no lock, and the same few statements
-however many queries and cells there are (the active settings, the source instances, the quota windows, the
-cells, the queries).
+however many queries and cells there are (the active settings, the quota windows, the queries, the source
+instances, the cells).
 
-**The planned cells** (Ruling T13-b): only the cells the run's planner selects under the active settings are
-counted and listed, by its own selection (`quota.cells.planned_cells` and its search predicate
-`PLANNED_SEARCH_CELL_SQL`): the search cells of the enabled sources' instances, for the enabled queries, at
-the scope's location keys. A disabled or unlisted query has none, and neither has a query's cell whose
-location left the scope or whose source was switched off. Nothing is planned when nothing is seeded. The
+**The planned cells** (Rulings T13-b and T13-d): only the cells the run's planner selects under the active
+settings are counted and listed, by its own selection (`quota.cells.planned_cells` and its search predicate
+`PLANNED_SEARCH_CELL_SQL`): the search cells of the enabled sources' instances at the scope's location keys,
+bound to every live query rather than to the enabled ones (T13-d), so that a disabled or unlisted query shows
+the cells it would have, and their coverage, were it enabled again. A query's cell whose location left the
+scope or whose source was switched off is neither counted nor listed. Nothing is planned when nothing is
+seeded. The
 header's open-gap total (`observability.status`) counts every open gap, so it also counts the gaps of cells
 no longer planned, of retired queries and of the cells without a query; the route descriptions say so.
 
@@ -113,8 +115,8 @@ class CellStatsOut(BaseModel):
 
 
 class QueryListOut(BaseModel):
-    """A live query, whether the active settings enable it, and the coverage of its planned cells: while it is
-    enabled, its cells of the enabled sources at the scope's locations."""
+    """A live query, whether the active settings enable it, and the coverage of its planned cells: its cells
+    of the enabled sources at the scope's locations, which a run searches while it is enabled."""
 
     id: int
     text: str
@@ -124,7 +126,7 @@ class QueryListOut(BaseModel):
     proposal_id: int | None
     created_at: UtcDatetime
     enabled: bool = Field(description="Its flag in the active settings; false for a query they do not list")
-    cells: int = Field(description="Its planned coverage cells; none while it is disabled")
+    cells: int = Field(description="Its planned coverage cells, also while it is disabled")
     last_covered_at: UtcDatetime | None = Field(
         description="The oldest coverage of its planned locations, a location being covered as of the newer "
         "frontier of its JSearch cell and its SerpApi fallback cell; null when a planned location is covered "
@@ -162,19 +164,28 @@ def _cell(row: Row[Any], cadence: float | None) -> CellStatsOut:
     )
 
 
-async def _cells(conn: AsyncConnection, run: RunSettings | None, cadence: float | None) -> list[CellStatsOut]:
-    """The planned cells of the live queries under the active settings `run` (none when unseeded)."""
-    if run is None:
+async def _cells(
+    conn: AsyncConnection, run: RunSettings | None, live: Sequence[int], cadence: float | None
+) -> list[CellStatsOut]:
+    """The planned cells of the `live` queries under the active settings `run`, each query enabled or not
+    (none when unseeded; module docstring)."""
+    if run is None or not live:
         return []
     planned = planned_cells(run, await list_instances(conn))
-    return [_cell(row, cadence) for row in await conn.execute(_CELLS, planned.search_params())]
+    params = {**planned.search_params(), "queries": list(live)}  # every live query, not only the enabled
+    return [_cell(row, cadence) for row in await conn.execute(_CELLS, params)]
+
+
+async def _live(conn: AsyncConnection) -> list[Row[Any]]:
+    return list((await conn.execute(_QUERIES)).all())
 
 
 async def cell_stats(conn: AsyncConnection, *, now: datetime) -> list[CellStatsOut]:
     """Every planned cell of a live query with its statistics, its open gaps and its cadence (module
     docstring)."""
     run = await load_active_run_settings(conn)
-    return await _cells(conn, run, await _jsearch_cadence(conn, run, now))
+    live = [int(row.id) for row in await _live(conn)]
+    return await _cells(conn, run, live, await _jsearch_cadence(conn, run, now))
 
 
 def _location_coverage(cells: Sequence[CellStatsOut]) -> datetime | None:
@@ -218,11 +229,12 @@ async def query_list(conn: AsyncConnection, *, now: datetime) -> list[QueryListO
     docstring)."""
     run = await load_active_run_settings(conn)
     cadence = await _jsearch_cadence(conn, run, now)
+    queries = await _live(conn)
     by_query: defaultdict[int, list[CellStatsOut]] = defaultdict(list)
-    for cell in await _cells(conn, run, cadence):
+    for cell in await _cells(conn, run, [int(row.id) for row in queries], cadence):
         by_query[cell.query_id].append(cell)
     flags: Mapping[int, bool] = {} if run is None else run.queries
     return [
         _query(row, enabled=flags.get(row.id, False), cells=by_query[row.id], cadence=cadence)
-        for row in await conn.execute(_QUERIES)
+        for row in queries
     ]

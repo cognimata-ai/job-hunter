@@ -1,17 +1,17 @@
 """`GET /api/queries` and `GET /api/queries/stats` (spec §14.2, §15.7; plan M4 Task 13, D1, M2 Carry-forward
-2, M1 Carry-forward 3's per-query gap counts; Rulings T13-a and T13-b).
+2, M1 Carry-forward 3's per-query gap counts; Rulings T13-a, T13-b and T13-d).
 
 The query list is the live queries by id, each with its flag in the active settings (false for a query they
 do not list) and the aggregates of its planned cells, the cells the run's planner selects under the active
-settings (its scope's locations, its enabled sources and its enabled queries): how many, the coverage of its
-planned locations (a location is covered as of the newest frontier of its JSearch cell and its SerpApi
-fallback cell; the query as of the oldest location, null when one is covered by neither or without a planned
-paid location), the open gaps, the mean yield, whether one is too broad (a paid cell left incomplete by 3
-runs in a row) and the dry-run's JSearch refresh cadence when it has a planned JSearch cell. The stats list
-every planned cell of a live query with its own figures. The queries are created and enabled through the api
-(a settings save creates the enabled ones' cells); the other cells and every interval are inserted directly.
-The routes' clock is injected (`jobhunter.api.routes.queries.utcnow`). Every query text is an invented job
-title.
+settings (its scope's locations and its enabled sources), for every live query, enabled or not: how many, the
+coverage of its planned locations (a location is covered as of the newest frontier of its JSearch cell and
+its SerpApi fallback cell; the query as of the oldest location, null when one is covered by neither or
+without a planned paid location), the open gaps, the mean yield, whether one is too broad (a paid cell left
+incomplete by 3 runs in a row) and the dry-run's JSearch refresh cadence when it has a planned JSearch cell.
+The stats list every planned cell of a live query with its own figures. The queries are created and enabled
+through the api (a settings save creates the enabled ones' cells); the other cells and every interval are
+inserted directly. The routes' clock is injected (`jobhunter.api.routes.queries.utcnow`). Every query text is
+an invented job title.
 """
 
 import copy
@@ -243,7 +243,7 @@ async def test_queries_list_the_live_rows_with_enabled_and_their_cell_aggregates
     )
     await intervals(engine, a_cells["adzuna", "berlin"], ("gap", "open"), ("gap", "abandoned"), at=now)
     await intervals(engine, a_cells["serpapi", "berlin"], ("covered", None), at=now)
-    # b and c have cells, with an open gap each, but no planned cell: neither query is enabled
+    # b and c, though not enabled, have cells at the scope's Berlin, each with an open gap
     b_cells = await cells_of(engine, b, [("jsearch", "berlin"), ("serpapi", "berlin")])
     await set_cell(engine, b_cells["serpapi", "berlin"], covered=hours[1], ema=0.75)
     await intervals(engine, b_cells["jsearch", "berlin"], ("gap", "open"), at=now)
@@ -275,8 +275,24 @@ async def test_queries_list_the_live_rows_with_enabled_and_their_cell_aggregates
         "too_broad": False,
         "refresh_cadence_days": cadence,
     }
-    assert got[b] == {"enabled": False, **NO_CELLS}
-    assert got[c] == {"enabled": False, **NO_CELLS}
+    assert got[b] == {
+        "enabled": False,
+        "cells": 2,
+        "last_covered_at": hours[1],  # Berlin, its one location, as of its SerpApi cell
+        "open_gaps": 1,
+        "yield_ema": pytest.approx((0.5 + 0.75) / 2),
+        "too_broad": False,
+        "refresh_cadence_days": cadence,  # it has a JSearch cell
+    }
+    assert got[c] == {
+        "enabled": False,
+        "cells": 1,
+        "last_covered_at": None,  # no paid cell
+        "open_gaps": 1,
+        "yield_ema": pytest.approx(0.375),
+        "too_broad": False,
+        "refresh_cadence_days": None,  # no JSearch cell
+    }
     assert got[d] == {"enabled": False, **NO_CELLS}
     # each query's aggregates are those of its cells in the stats
     cells = await listed(logged_in_client, STATS)
@@ -468,6 +484,40 @@ async def test_a_cell_of_a_disabled_source_is_not_counted_or_listed(
     ]
 
 
+async def test_a_disabled_query_lists_enabled_false_with_its_cells_and_coverage_at_the_current_scope(
+    engine: AsyncEngine, logged_in_client: httpx.AsyncClient, now: datetime
+) -> None:
+    query_id = await created(logged_in_client, "Platform Engineer")
+    other = await created(logged_in_client, "Data Engineer")
+    await in_settings(logged_in_client, {query_id: True, other: True})
+    cells = await cells_of(engine, query_id)
+    hours = [now - timedelta(hours=n) for n in range(10)]
+    await set_cell(engine, cells["jsearch", "berlin"], covered=hours[9], ema=0.0, incomplete=3)
+    await intervals(engine, cells["jsearch", "berlin"], ("gap", "open"), at=now)
+    await set_cell(engine, cells["jsearch", "remote-de"], covered=hours[4], ema=1.0)
+    await set_cell(engine, cells["serpapi", "remote-de"], covered=hours[2], ema=0.25)
+    await intervals(engine, cells["adzuna", "remote-de"], ("gap", "open"), ("gap", "open"), at=now)
+
+    # disabled, and Berlin removed from the scope: its remote-de cells are what it would search again
+    payload = await in_settings(logged_in_client, {query_id: False, other: True}, locations=())
+    cadence = await dry_run_cadence(logged_in_client, payload)
+
+    assert await figures_of(logged_in_client, query_id) == {
+        "enabled": False,
+        "cells": 3,
+        "last_covered_at": hours[2],  # remote-de as of the newer of its two paid cells
+        "open_gaps": 2,
+        "yield_ema": pytest.approx((0.5 + 1.0 + 0.25) / 3),
+        "too_broad": False,  # its too broad cell is Berlin's
+        "refresh_cadence_days": cadence,
+    }
+    assert await stats_keys(logged_in_client, query_id) == [
+        ("adzuna", "remote-de"),
+        ("jsearch", "remote-de"),
+        ("serpapi", "remote-de"),
+    ]
+
+
 # --- GET /api/queries/stats -------------------------------------------------------------------------------
 
 
@@ -494,13 +544,16 @@ async def test_stats_list_every_cell_with_open_gaps(
     await intervals(engine, a_cells["serpapi", "remote-de"], ("gap", "open"), ("gap", "closed"), at=now)
     await intervals(engine, a_cells["adzuna", "berlin"], ("covered", None), ("gap", "abandoned"), at=now)
     await intervals(engine, b_cells["jsearch", "berlin"], ("gap", "open"), at=now)
-    # not listed, each with an open gap: a retired query's cell, a query's that the settings do not enable,
-    # and Arbeitnow's cell without a query
+    # listed: the cell at the scope's Berlin of a query the settings do not list
+    unlisted_cell = await cell(engine, unlisted, "jsearch", "berlin")
+    await intervals(engine, unlisted_cell, ("gap", "open"), at=now)
+    # not listed, each with an open gap: a retired query's cell, a cell at a place outside the scope, and
+    # Arbeitnow's cell without a query
     async with engine.begin() as conn:
         retired = int((await conn.execute(RETIRED_QUERY, {"t": "Python Developer", "at": now})).scalar_one())
         arbeitnow = await free_cell(conn, "arbeitnow")
     await intervals(engine, await cell(engine, retired, "jsearch", "berlin"), ("gap", "open"), at=now)
-    await intervals(engine, await cell(engine, unlisted, "jsearch", "berlin"), ("gap", "open"), at=now)
+    await intervals(engine, await cell(engine, unlisted, "jsearch", "hamburg"), ("gap", "open"), at=now)
     await intervals(engine, arbeitnow, ("gap", "open"), at=now)
 
     body = await listed(logged_in_client, STATS)
@@ -535,6 +588,18 @@ async def test_stats_list_every_cell_with_open_gaps(
         "zero_yield_streak": 1,
         "consecutive_incomplete": 1,
     }
+    expected.append(
+        {
+            "cell_id": unlisted_cell,
+            "query_id": unlisted,
+            "source_id": "jsearch",
+            "instance_label": "default",
+            "location_key": "berlin",
+            **blank,
+            "open_gaps": 1,
+            "cadence_days": cadence,
+        }
+    )
     got = [
         x | {"last_covered_at": at(x["last_covered_at"]), "last_success_at": at(x["last_success_at"])}
         for x in body

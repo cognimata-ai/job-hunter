@@ -759,10 +759,10 @@ export interface paths {
          *     cells: how many, the oldest coverage of its locations, their open gaps, their mean yield, whether one is
          *     too broad, and JSearch's refresh cadence.
          *
-         *     A query's planned cells are those the next run would search while the query is enabled: its cells of the
-         *     enabled sources at the scope's locations. Cells no longer planned (a location removed from the scope, a
-         *     source switched off, a query disabled or edited) are not counted here, while the open-gap total of the
-         *     status header still counts their open gaps.
+         *     A query's planned cells are those a run searches while the query is enabled: its cells of the enabled
+         *     sources at the scope's locations, shown for a disabled query too. Cells no longer planned (a location
+         *     removed from the scope, a source switched off, an edited query's previous text) are not counted here,
+         *     while the open-gap total of the status header still counts their open gaps.
          */
         get: operations["list_queries_api_queries_get"];
         put?: never;
@@ -790,10 +790,10 @@ export interface paths {
          *     yield, its zero-yield and incomplete runs, whether it is too broad, its open gaps, and JSearch's refresh
          *     cadence for a JSearch cell.
          *
-         *     A planned cell is one the next run would search: a cell of an enabled query, of an enabled source, at one
-         *     of the scope's locations. Cells no longer planned (a location removed from the scope, a source switched
-         *     off, a query disabled or edited) are not listed, while the open-gap total of the status header still
-         *     counts their open gaps.
+         *     A planned cell is one a run searches while its query is enabled: a cell of an enabled source at one of the
+         *     scope's locations, listed for a disabled query too. Cells no longer planned (a location removed from the
+         *     scope, a source switched off, an edited query's previous text) are not listed, while the open-gap total
+         *     of the status header still counts their open gaps.
          */
         get: operations["query_cell_stats_api_queries_stats_get"];
         put?: never;
@@ -3130,13 +3130,13 @@ export interface components {
         };
         /**
          * QueryListOut
-         * @description A live query, whether the active settings enable it, and the coverage of its planned cells: while it is
-         *     enabled, its cells of the enabled sources at the scope's locations.
+         * @description A live query, whether the active settings enable it, and the coverage of its planned cells: its cells
+         *     of the enabled sources at the scope's locations, which a run searches while it is enabled.
          */
         QueryListOut: {
             /**
              * Cells
-             * @description Its planned coverage cells; none while it is disabled
+             * @description Its planned coverage cells, also while it is disabled
              */
             cells: number;
             /**
