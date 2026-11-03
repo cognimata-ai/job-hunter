@@ -182,14 +182,15 @@ submissions, by `bulk.QUARANTINED_USD_SQL` (`/api/system/spend`'s `quarantined_b
 
 **The unresolved submissions** (Task 23, Codex r4 B11, r5 B9): `UNRESOLVED_SUBMISSION_SQL` is the one
 predicate of "a submission still needs target `t`'s items": an item of `t` belongs to a submission in flight
-(`IN_FLIGHT`), or to a `released` one the ambiguous reconciliation still lists, `submit_started_at` within
-`RELEASED_LISTED_FOR` (29 days, L3984, Deviation 27: one clock, `submit_started_at`, the reconciler's, which
-`batch_adoption` binds). Its items and their calls are the item-to-ledger mapping a release and a
-reconciliation join through (`_ITEMS`, `spend_ledger.settle`), so the score-history retention keeps such a
-target while it holds and deletes it in the pass after the submission is resolved; no timeout releases
-anything (C3). It is an SQL predicate correlated to the outer alias `t` of `score_targets` and binds
-`:listed_since`, the caller's `now` less `RELEASED_LISTED_FOR` (Ruling P14: the caller's clock, not the
-database's).
+(`IN_FLIGHT`), or to a `released` one that is still looked for, `submit_started_at` within
+`RELEASED_LISTED_FOR` (29 days, L3984, Deviation 27: one clock, `submit_started_at`): a released quarantine by
+the ambiguous reconciliation (`batch_adoption`), a released lost batch by the poll's 29-day listing of it by
+its provider id (`batch_results`, plan M4 Task 16), both binding that window. Its items and their calls are
+the item-to-ledger mapping a release and a reconciliation join through (`_ITEMS`, `spend_ledger.settle`), so
+the score-history retention keeps such a target while it holds and deletes it in the pass after the
+submission is resolved; no timeout releases anything (C3). It is an SQL predicate correlated to the outer
+alias `t` of `score_targets` and binds `:listed_since`, the caller's `now` less `RELEASED_LISTED_FOR` (Ruling
+P14: the caller's clock, not the database's).
 
 Ids, counts, codes and amounts only reach a log line, a payload or a report: never a param or prompt text.
 """
@@ -289,13 +290,12 @@ RELEASABLE_SQL: Final = (
     "AND EXISTS (SELECT 1 FROM alerts rf WHERE rf.resolved_at IS NULL "
     f"AND rf.dedup_key = '{RETRIEVE_FAILING_ALERT}:' || CAST(s.id AS text))))"
 )
-_RELEASABLE_STATES: Final = ("submit_ambiguous", "submitted")
-# The alerts a release resolves, by the state it locked (each a no-op when it is not open): a quarantine's
-# 25 h alert; a lost batch's `batch.retrieve_failing`, and the 25 h alert too should one be open.
-_RELEASE_RESOLVES: Final[Mapping[str, tuple[str, ...]]] = {
-    "submit_ambiguous": (UNRESOLVED_ALERT,),
-    "submitted": (RETRIEVE_FAILING_ALERT, UNRESOLVED_ALERT),
-}
+# The alerts a release resolves, each only while it is open (resolving a closed one is a no-op), so the state
+# it locked decides which one it closes: a quarantine's 25 h alert (a quarantine has no provider id, so it is
+# never retrieved and has no `batch.retrieve_failing`); a lost batch's `batch.retrieve_failing`, which
+# `RELEASABLE_SQL` requires open (and the 25 h alert should one be open). `RELEASABLE_SQL` stays the one list
+# of the releasable states.
+_RELEASE_RESOLVES: Final = (UNRESOLVED_ALERT, RETRIEVE_FAILING_ALERT)
 _ONLINE_RETRY_REASONS: Final = (
     "batch_max_tokens",
     "batch_invalid_output",
@@ -1334,7 +1334,7 @@ async def release(
     locked = (await conn.execute(_LOCK_RELEASABLE, params)).first()  # the owner
     if locked is None:
         raise TransitionConflict(_SUBMISSIONS, submission_id, "released")
-    await transition(conn, _SUBMISSIONS, submission_id, list(_RELEASABLE_STATES), "released")
+    await transition(conn, _SUBMISSIONS, submission_id, [str(locked.state)], "released")  # the locked state
     items = await _items(conn, submission_id)
     call = CallOutcome("ambiguous", error_code=RELEASED_CODE)
     for item in items:  # the month row, the bulk row of each funded entry, the ledger entries
@@ -1345,11 +1345,10 @@ async def release(
         await bulk.release_item_hold(conn, item_id=item.id)
     moved = await _release_targets(conn, submission_id, items)  # the targets before the attempts (T16-c)
     ended = await _end_attempts(conn, items, "released", None)
-    resolved = [
-        code
-        for code in _RELEASE_RESOLVES[str(locked.state)]
-        if await resolve_alert(conn, code=code, subject=str(submission_id))
-    ]
+    resolved: list[str] = []
+    for code in _RELEASE_RESOLVES:  # the alerts rows: each a write when the alert is open
+        if await resolve_alert(conn, code=code, subject=str(submission_id)):
+            resolved.append(code)
     requested = await follow_on(conn, submission_id=submission_id, defer=defer)
     await ranking.bump(conn)  # step 11, last
     reserved = Decimal(locked.reserved_usd)

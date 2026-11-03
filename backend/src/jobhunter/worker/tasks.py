@@ -236,9 +236,9 @@ async def score_cycle(context: JobContext, trigger: str) -> None:
 @blueprint.periodic(cron="*/5 * * * *")
 @blueprint.task(name="batch_poll", queue="aux", queueing_lock="batch_poll", pass_context=True)
 async def batch_poll(context: JobContext, timestamp: int) -> None:
-    """The submitted and ended batch submissions polled, their results processed (`batch_results.poll`),
-    with the runtime's Batches client; nothing after the admission stop or for a superseded worker
-    (`_admitted`)."""
+    """The submitted and ended batch submissions polled, and a released lost batch for 29 days after its
+    submit-start (looked for by its provider id), their results processed (`batch_results.poll`), with the
+    runtime's Batches client; nothing after the admission stop or for a superseded worker (`_admitted`)."""
     # Imported here: the batch modules import this module (`Deferrer`, `defer_in_tx`).
     from jobhunter.scoring import batch_results
 

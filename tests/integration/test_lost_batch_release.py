@@ -17,7 +17,9 @@ The targets are 250 synthetic ads of the score tuple in one bulk operation; ever
 """
 
 import asyncio
+import logging
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -28,7 +30,7 @@ import procrastinate
 import pytest
 import sqlalchemy as sa
 from jobhunter.llm.batches import BatchesClient, BatchStatus
-from jobhunter.llm.fake import BatchScript, StoredBatch
+from jobhunter.llm.fake import BatchScript, ItemOutcome, StoredBatch
 from jobhunter.observability.alerts import resolve_alert
 from jobhunter.scoring import batch_results
 from jobhunter.scoring import batches as batches_mod
@@ -67,6 +69,19 @@ RETRIEVE_FAILING: Final = batch_results.RETRIEVE_FAILING_ALERT
 # The poll's `resolve_alert`, which it calls inside its move to `ended`.
 POLL_RESOLVE_ALERT: Final = "jobhunter.scoring.batch_results.resolve_alert"
 _GENERATION: Final = sa.text("SELECT generation FROM ranking_state WHERE id = 1")
+# The money (M3): the month of the batch entries, its row's counters, and the entries of the month and of
+# the bulk operation, whose counted amounts the test sums by its own rule (`counts_at`).
+_BATCH_MONTHS: Final = sa.text(
+    "SELECT DISTINCT l.budget_month FROM llm_spend_ledger l JOIN llm_calls c ON c.spend_ledger_id = l.id "
+    "WHERE c.transport = 'batch'"
+)
+_MONTH_COUNTERS: Final = sa.text("SELECT counted_usd, scoring_counted_usd FROM llm_budget WHERE month = :m")
+_MONTH_ENTRIES: Final = sa.text(
+    "SELECT state, reserved_usd, settled_usd, purpose_class FROM llm_spend_ledger WHERE budget_month = :m"
+)
+_BULK_ENTRIES: Final = sa.text(
+    "SELECT state, reserved_usd, settled_usd FROM llm_spend_ledger WHERE bulk_operation_id = :b"
+)
 
 
 @dataclass(frozen=True)
@@ -93,19 +108,29 @@ class Lost:
         return self.hour + timedelta(minutes=1)
 
 
-@pytest.fixture
-async def lost(
-    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, queue_app: procrastinate.App
+async def lose(
+    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, outcomes: Mapping[int, ItemOutcome]
 ) -> Lost:
+    """`N` targets submitted on the fake, the batch ended by the provider (each item `succeeded`, but the
+    target indexes of `outcomes`, which take theirs), then forgotten by the fake."""
     submitted = await submit_batch(engine, op_runner, fake_llm, N)
-    fake_llm.batches(BatchScript(polls_until_ended=0))
-    async with fake_llm.client() as http:  # the provider ends it, with every item succeeded ...
+    items = {submitted.custom_ids[i]: outcome for i, outcome in outcomes.items()}
+    fake_llm.batches(BatchScript(items=items, polls_until_ended=0))
+    async with fake_llm.client() as http:  # the provider ends it ...
         status = await batch_client(fake_llm, http).retrieve(submitted.provider_id)
     assert status.processing_status == "ended"
     stored = fake_llm.state.batches.pop(submitted.provider_id)  # ... and the fake forgets it
     (row,) = await submission_rows(engine)
     assert row.state == "submitted"
     return Lost(submitted, stored, row.expires_at)
+
+
+@pytest.fixture
+async def lost(
+    engine: AsyncEngine, op_runner: OpRunner, fake_llm: FakeLLM, queue_app: procrastinate.App
+) -> Lost:
+    """A lost batch whose every item succeeded."""
+    return await lose(engine, op_runner, fake_llm, {})
 
 
 def learn(fake_llm: FakeLLM, lost: Lost) -> None:
@@ -157,6 +182,66 @@ def follow_ons_of(ops: list[Any], submission_id: int) -> list[Any]:
     return [op for op in ops if op.payload.get("after_submission_id") == submission_id]
 
 
+def counts_at(entry: Any) -> Decimal:
+    """What a ledger entry counts (§7.11, the test's own rule): billed its cost, not billed nothing, reserved,
+    dispatched and ambiguous their reservation."""
+    if entry.state == "billed":
+        return Decimal(entry.settled_usd)
+    return Decimal(0) if entry.state == "not_billed" else Decimal(entry.reserved_usd)
+
+
+@dataclass(frozen=True)
+class Money:
+    """The month row's counters and the bulk row's amounts, each with what the ledger entries behind it count
+    at (`counts_at`)."""
+
+    month_counted: Decimal
+    month_scoring: Decimal
+    month_ledger: Decimal
+    month_scoring_ledger: Decimal
+    bulk_spent: Decimal
+    bulk_held: Decimal
+    bulk_ledger: Decimal
+
+    def consistent(self) -> bool:
+        """The month's counters are its entries' (§7.11) and the bulk's `spent_usd` its funded entries' (§7.17
+        #7)."""
+        return (self.month_counted, self.month_scoring, self.bulk_spent) == (
+            self.month_ledger,
+            self.month_scoring_ledger,
+            self.bulk_ledger,
+        )
+
+
+async def money(engine: AsyncEngine, bulk_operation_id: int) -> Money:
+    async with engine.connect() as conn:
+        (month,) = (await conn.execute(_BATCH_MONTHS)).scalars().all()  # one month holds the batch entries
+        counters = (await conn.execute(_MONTH_COUNTERS, {"m": month})).one()
+        in_month = (await conn.execute(_MONTH_ENTRIES, {"m": month})).all()
+        in_bulk = (await conn.execute(_BULK_ENTRIES, {"b": bulk_operation_id})).all()
+    account = await bulk_row(engine, bulk_operation_id)
+    return Money(
+        month_counted=Decimal(counters.counted_usd),
+        month_scoring=Decimal(counters.scoring_counted_usd),
+        month_ledger=sum((counts_at(e) for e in in_month), Decimal(0)),
+        month_scoring_ledger=sum(
+            (counts_at(e) for e in in_month if e.purpose_class == "scoring"), Decimal(0)
+        ),
+        bulk_spent=Decimal(account.spent_usd),
+        bulk_held=Decimal(account.followup_held_usd),
+        bulk_ledger=sum((counts_at(e) for e in in_bulk), Decimal(0)),
+    )
+
+
+def retrieve_failures(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
+    """The `batch_retrieve_failed` lines logged: (level, the submission's state)."""
+    return [
+        (r.levelname, r.msg["state"])
+        for r in caplog.records
+        if isinstance(r.msg, dict) and r.msg.get("event") == "batch_retrieve_failed"
+    ]
+
+
 async def test_a_submitted_batch_is_not_releasable_before_the_alert_and_the_hour(
     logged_in_client: httpx.AsyncClient,
     engine: AsyncEngine,
@@ -167,7 +252,9 @@ async def test_a_submitted_batch_is_not_releasable_before_the_alert_and_the_hour
     """Past the hour without the alert (never polled): 409 `not_releasable`, and no Needs attention item.
     With the alert open: 409 at `expires_at + 59 min` and at exactly `expires_at + 1 h` (the bound is
     strict), the item `releasable: false` at both; a minute past the hour the item is `releasable: true` and
-    the release is accepted: the button and the route never disagree. Nothing moves before that."""
+    the release is accepted: the button and the route never disagree. Nothing moves before that. The alert
+    acknowledged (`POST /api/alerts/{id}/ack`) is still open, so the batch stays releasable: acknowledging
+    moves nothing (the predicate reads only `resolved_at`)."""
     s = lost.submission_id
     assert_not_releasable(await release_at(logged_in_client, monkeypatch, s, lost.after))
     assert await retrieve_failing_at(logged_in_client, monkeypatch, lost.after) == EMPTY
@@ -182,10 +269,15 @@ async def test_a_submitted_batch_is_not_releasable_before_the_alert_and_the_hour
     assert {e.state for e in (await entries_by_custom_id(engine)).values()} == {"dispatched"}
     assert await open_alert_codes(engine) == [RETRIEVE_FAILING]
 
+    (item,) = (await retrieve_failing_at(logged_in_client, monkeypatch, lost.after))["items"]
+    ack = await logged_in_client.post(f"/api/alerts/{item['alert_id']}/ack")
+    assert ack.status_code == 200, ack.text
+    assert await open_alert_codes(engine) == [RETRIEVE_FAILING]  # acknowledged, still open
     section = await retrieve_failing_at(logged_in_client, monkeypatch, lost.after)
     assert [(i["submission_id"], i["releasable"]) for i in section["items"]] == [(s, True)]
     r = await release_at(logged_in_client, monkeypatch, s, lost.after)
     assert (r.status_code, r.json()["state"]) == (202, "released"), r.text
+    assert await open_alert_codes(engine) == []  # the acknowledged alert resolved by the release
 
 
 async def test_a_lost_batch_release_frees_targets_and_keeps_the_spend_ambiguous(
@@ -200,12 +292,20 @@ async def test_a_lost_batch_release_frees_targets_and_keeps_the_spend_ambiguous(
     provider id kept, every entry `dispatched → ambiguous` (the call `batch_released`) at the amount Needs
     attention showed and the 202 states, the holds released, the targets `pending`, the attempts `released`,
     `batch.retrieve_failing` resolved, the follow-on requested once, the ranking bumped; the singleton is
-    free: the follow-on submits a new batch of the same targets."""
+    free: the follow-on submits a new batch of the same targets. The money: the month row's counters and the
+    bulk operation's `spent_usd` are what the entries count at before and after, the release changes neither
+    (the reservation stays counted), and the bulk's follow-up hold drops from the submission's to 0."""
     s = lost.submission_id
+    setup = lost.batch.setup
     await lost_and_alerted(engine, fake_llm, lost)
     (item,) = (await retrieve_failing_at(logged_in_client, monkeypatch, lost.after))["items"]
     assert (item["submission_id"], item["releasable"]) == (s, True)
     before = await generation(engine)
+    (submitted,) = await submission_rows(engine)
+    held = await money(engine, setup.bulk_operation_id)
+    assert held.consistent(), held
+    assert held.bulk_spent == held.month_counted == submitted.reserved_usd > 0  # the reservation, counted
+    assert held.bulk_held == submitted.followup_held_usd > 0
 
     r = await release_at(logged_in_client, monkeypatch, s, lost.after)
     assert r.status_code == 202, r.text
@@ -216,12 +316,18 @@ async def test_a_lost_batch_release_frees_targets_and_keeps_the_spend_ambiguous(
     (row,) = await submission_rows(engine)
     assert (row.state, row.provider_batch_id) == ("released", lost.batch.provider_id)
     assert row.released_at is not None and row.follow_on_at is not None
-    setup = lost.batch.setup
+    released = await money(engine, setup.bulk_operation_id)
+    assert released.consistent(), released
+    assert (released.month_counted, released.month_scoring, released.bulk_spent) == (
+        held.month_counted,
+        held.month_scoring,
+        held.bulk_spent,
+    )  # still counted, at the reservation
+    assert released.bulk_held == 0
     assert await targets_by_state(engine, setup.llm_tuple_id) == {"pending": N}
     assert await attempt_outcomes(engine, setup.llm_tuple_id) == {"released": N}
     assert all(t.batch_submission_id is None for t in (await targets_by_custom_id(engine)).values())
     assert all(i.hold_released_at is not None for i in (await item_rows(engine)).values())
-    assert (await bulk_row(engine, setup.bulk_operation_id)).followup_held_usd == 0
     assert await open_alert_codes(engine) == []  # the alert resolved
     assert await retrieve_failing_at(logged_in_client, monkeypatch, lost.after) == EMPTY
     assert await generation(engine) > before  # the ranking bumped
@@ -242,16 +348,25 @@ async def test_a_released_batch_found_later_ends_and_settles_without_publishing(
     engine: AsyncEngine,
     op_runner: OpRunner,
     fake_llm: FakeLLM,
-    lost: Lost,
+    queue_app: procrastinate.App,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The released lifecycle through the poll (§10.10 L3999): while its retrieval still fails it raises
-    nothing and moves nothing, and the ambiguous reconciliation does not list it (it has a provider id); once
-    the fake knows the batch again, the next poll moves it `released → ended → reconciled` with `released_at`
-    kept, every item `ignored_fenced`, every entry `ambiguous → billed` from its usage and nothing published,
-    while the follow-on submission stays `submitted` with the re-claimed targets (outside the singleton), and
-    no second follow-on."""
+    """The released lifecycle through the poll (§10.10 L3999), the provider having ended the batch with one
+    item errored and one expired: while its retrieval still fails it raises nothing, moves nothing and logs
+    each failure at debug (a `submitted` batch's at warning), and the ambiguous reconciliation does not list
+    it (it has a provider id); once the fake knows the batch again, the next poll moves it `released → ended
+    → reconciled` with `released_at` kept, every item `ignored_fenced`, each entry settled from the provider's
+    evidence (`ambiguous → billed` from its usage, `ambiguous → not_billed(batch_item_errored |
+    batch_item_expired)`) and nothing published, while the follow-on submission stays `submitted` with the
+    re-claimed targets (outside the singleton), and no second follow-on. The money: the month row's counters
+    and the bulk's `spent_usd` drop by exactly what the settlements free (each the ledger's count), and the
+    bulk's follow-up hold stays the new submission's (the released one's holds were released once)."""
+    caplog.set_level(logging.DEBUG, logger="jobhunter.scoring.batch_results")
+    lost = await lose(engine, op_runner, fake_llm, {0: "errored:other", 1: "expired"})
+    errored, expired = lost.batch.custom_ids[0], lost.batch.custom_ids[1]
     s = lost.submission_id
+    setup = lost.batch.setup
     await lost_and_alerted(engine, fake_llm, lost)
     assert (await release_at(logged_in_client, monkeypatch, s, lost.after)).status_code == 202
     (follow_on,) = follow_ons_of(await operations_of(engine, "batch_submit"), s)
@@ -264,9 +379,17 @@ async def test_a_released_batch_found_later_ends_and_settles_without_publishing(
         report = await poll_once(engine, fake_llm, now=lost.after + timedelta(minutes=minutes))
         assert (report.polled, report.ended, report.decided) == (2, 0, 0)
     assert await open_alert_codes(engine) == []
+    assert retrieve_failures(caplog) == [
+        ("WARNING", "submitted"),
+        ("DEBUG", "released"),
+        ("DEBUG", "released"),
+    ]
     adoption = await reconcile_ambiguous_once(engine, fake_llm, now=lost.after + timedelta(minutes=10))
     assert adoption.submissions == 0  # the poll's to find, not the ambiguous reconciliation's
     assert {r.id: r.state for r in await submission_rows(engine)} == {s: "released", b.id: "submitted"}
+    pending = await money(engine, setup.bulk_operation_id)
+    assert pending.consistent(), pending
+    assert pending.bulk_held == b.followup_held_usd > 0  # the new submission's hold only
 
     learn(fake_llm, lost)
     report = await poll_once(engine, fake_llm, now=lost.after + timedelta(minutes=15))
@@ -281,11 +404,19 @@ async def test_a_released_batch_found_later_ends_and_settles_without_publishing(
     assert a.released_at is not None and a.ended_at is not None and a.results_complete_at is not None
     a_ids = set(lost.batch.custom_ids)
     items = {c: i for c, i in (await item_rows(engine)).items() if c in a_ids}
-    assert {(i.result_type, i.decision) for i in items.values()} == {("succeeded", "ignored_fenced")}
+    assert Counter((i.result_type, i.decision) for i in items.values()) == {
+        ("succeeded", "ignored_fenced"): N - 2,
+        ("errored", "ignored_fenced"): 1,
+        ("expired", "ignored_fenced"): 1,
+    }
     assert await decisions(engine) == ["ignored_fenced"] * N  # the new batch's items wait for it
     entries = {c: e for c, e in (await entries_by_custom_id(engine)).items() if c in a_ids}
-    assert {e.state for e in entries.values()} == {"billed"}
-    assert all(e.settled_usd > 0 and e.attempt_cost == e.settled_usd for e in entries.values())
+    assert (entries[errored].state, entries[errored].evidence) == ("not_billed", "batch_item_errored")
+    assert (entries[expired].state, entries[expired].evidence) == ("not_billed", "batch_item_expired")
+    assert all(entries[c].settled_usd == 0 == entries[c].attempt_cost for c in (errored, expired))
+    billed = [e for c, e in entries.items() if c not in (errored, expired)]
+    assert {e.state for e in billed} == {"billed"}
+    assert all(e.settled_usd > 0 and e.attempt_cost == e.settled_usd for e in billed)
     assert await count_rows(engine, "llm_results") == 0  # nothing published
     targets = await targets_by_custom_id(engine)
     assert {(targets[c].state, targets[c].batch_submission_id) for c in targets if c not in a_ids} == {
@@ -293,6 +424,19 @@ async def test_a_released_batch_found_later_ends_and_settles_without_publishing(
     }
     assert len(follow_ons_of(await operations_of(engine, "batch_submit"), s)) == 1  # the release's only
     assert await open_alert_codes(engine) == []
+
+    found = await money(engine, setup.bulk_operation_id)
+    assert found.consistent(), found
+    freed = sum((e.reserved_usd for e in entries.values()), Decimal(0)) - sum(
+        (e.settled_usd for e in billed), Decimal(0)
+    )
+    assert freed > 0
+    assert (found.month_counted, found.month_scoring, found.bulk_spent) == (
+        pending.month_counted - freed,
+        pending.month_scoring - freed,
+        pending.bulk_spent - freed,
+    )
+    assert found.bulk_held == pending.bulk_held  # no hold released twice
 
 
 async def test_after_29_days_the_poll_stops_listing_it(
@@ -445,6 +589,66 @@ async def test_a_poll_waiting_on_a_release_ends_the_batch_as_released(
     assert await attempt_outcomes(engine, setup.llm_tuple_id) == {"released": N}
     assert await open_alert_codes(engine) == []
     assert len(follow_ons_of(await operations_of(engine, "batch_submit"), s)) == 1
+
+
+async def test_two_concurrent_releases_settle_the_batch_once(
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    fake_llm: FakeLLM,
+    lost: Lost,
+    monkeypatch: pytest.MonkeyPatch,
+    migrated: PgServer,
+) -> None:
+    """Two releases of a lost batch at once: the second arrives while the first's transaction holds the row
+    (`released`, not committed) and waits on it; once the first commits, the second's lock statement re-checks
+    the row and finds nothing releasable: 409 `not_releasable`. The entries are settled once (`ambiguous`, the
+    month row's counters and the bulk's `spent_usd` unchanged, each the ledger's count), the holds released
+    once, and the follow-on requested once."""
+    s = lost.submission_id
+    setup = lost.batch.setup
+    await lost_and_alerted(engine, fake_llm, lost)
+    held = await money(engine, setup.bulk_operation_id)
+    real = batches_mod.follow_on
+    second: list[asyncio.Task[httpx.Response]] = []
+
+    async def meet_a_second_release(
+        conn: Any, *, submission_id: int, defer: Any, request: bool = True
+    ) -> bool:
+        if not second:  # the first release's call, inside its transaction: the row is `released`, uncommitted
+            task = asyncio.create_task(release_at(logged_in_client, monkeypatch, s, lost.after))
+            second.append(task)
+
+            async def waiting() -> bool:
+                return task.done() or any(
+                    w.relation == "batch_submissions" for w in lock_wait_details(migrated)
+                )
+
+            await await_until(waiting, 60, 0.05)
+            assert not task.done()  # the second release waits for the first's row
+            (wait,) = [w for w in lock_wait_details(migrated) if w.relation == "batch_submissions"]
+            assert wait.key == str(s), wait
+        return await real(conn, submission_id=submission_id, defer=defer, request=request)
+
+    monkeypatch.setattr(batches_mod, "follow_on", meet_a_second_release)
+    first = await release_at(logged_in_client, monkeypatch, s, lost.after)
+    assert (first.status_code, first.json()["state"]) == (202, "released"), first.text
+    (task,) = second
+    assert_not_releasable(await asyncio.wait_for(task, 60))
+
+    entries = await entries_by_custom_id(engine)
+    assert {(e.state, e.error_code) for e in entries.values()} == {("ambiguous", batches_mod.RELEASED_CODE)}
+    assert all(e.attempt_cost == e.reserved_usd for e in entries.values())  # counted once, at the reservation
+    assert await attempt_outcomes(engine, setup.llm_tuple_id) == {"released": N}
+    assert await targets_by_state(engine, setup.llm_tuple_id) == {"pending": N}
+    released = await money(engine, setup.bulk_operation_id)
+    assert released.consistent(), released
+    assert (released.month_counted, released.bulk_spent, released.bulk_held) == (
+        held.month_counted,
+        held.bulk_spent,
+        Decimal(0),
+    )
+    assert len(follow_ons_of(await operations_of(engine, "batch_submit"), s)) == 1
+    assert await open_alert_codes(engine) == []
 
 
 async def test_a_retrieval_failing_after_a_release_re_opens_no_alert(

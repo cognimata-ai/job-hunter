@@ -739,7 +739,10 @@ async def _retrieve(
     try:
         return await client.retrieve(provider_batch_id)
     except BatchApiError as failure:
-        log.warning(
+        # a released lost batch is a state the user decided: its failing retrievals of up to 28 days (every
+        # pass) are debug, a `submitted` one's a warning
+        emit = log.debug if row.state == "released" else log.warning
+        emit(
             "batch_retrieve_failed",
             submission_id=submission_id,
             state=str(row.state),
