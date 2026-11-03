@@ -265,18 +265,19 @@ async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) 
         raise _locked(ip, retry_after)
 
 
-async def _refuse_if_totp_code_missing(engine: AsyncEngine, body: LoginIn, ip: str) -> None:
-    """Raise 401 `totp_required` when TOTP is on and `body` has no code (nothing is recorded).
+async def _refuse_if_totp_code_missing(engine: AsyncEngine, code: str | None, ip: str) -> None:
+    """Raise 401 `totp_required` when TOTP is on and the login sent no `code` (nothing is recorded).
 
-    It reads the single user's flag only, never the username or the password: its answer and its cost are
-    the same for any of them.
+    It is given the code only, never the username or the password, and reads the single user's flag: its
+    answer and its cost are the same for any credentials. Logged at `info`, like an accepted login: a sign-in
+    with TOTP on sends its first request without a code, to learn that one is needed.
     """
-    if body.totp is not None:
+    if code is not None:
         return
     async with engine.connect() as conn:  # read-only, rolled back when the block ends
         required = await users.totp_enabled_for_any(conn)
     if required:
-        log.warning("login", outcome="totp_required", ip=ip)
+        log.info("login", outcome="totp_required", ip=ip)
         raise Problem(401, "totp_required", TOTP_REQUIRED)
 
 
@@ -306,7 +307,7 @@ async def login(
     now = utcnow()
     ip = client_ip(request)
     await _refuse_if_locked_out(engine, ip, now=now)  # phase 0
-    await _refuse_if_totp_code_missing(engine, body, ip)  # before the gate: no Argon2 work, nothing recorded
+    await _refuse_if_totp_code_missing(engine, body.totp, ip)  # before the gate: no Argon2, nothing recorded
     session_secret = cfg.secret_b64("session_secret")
     try:
         async with gate.slot():

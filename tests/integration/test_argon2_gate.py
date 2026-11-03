@@ -96,14 +96,15 @@ class Gated:
     verifier: Verifier
     gate: ObservedGate
 
-    async def login(self, ip: str, username: str = "ada") -> httpx.Response:
+    async def login(self, ip: str, username: str = "ada", totp: str | None = None) -> httpx.Response:
         transport = httpx.ASGITransport(app=self.app, raise_app_exceptions=False, client=(ip, 50000))
+        body = {"username": username, "password": "wrong-password-123"}
+        if totp is not None:
+            body["totp"] = totp
         async with httpx.AsyncClient(
             transport=transport, base_url="https://testserver", headers={"Origin": "https://testserver"}
         ) as client:
-            return await client.post(
-                "/api/auth/login", json={"username": username, "password": "wrong-password-123"}
-            )
+            return await client.post("/api/auth/login", json=body)
 
     def saturated(self, arrivals: int) -> bool:
         """`arrivals` requests reached the gate and two of them verify; or, wrongly, a third verifies."""
@@ -217,3 +218,46 @@ async def test_a_queued_login_rechecks_the_lockout_once_it_has_a_slot(gated, mak
     assert 0 < r.json()["retry_after_s"] <= 900  # the ten minutes of that lockout, from the login's own clock
     assert gated.verifier.entries == SLOTS  # the queued login never verified
     assert [a.status_code for a in answers] == [401, 401]
+
+
+async def _enable_totp(engine, make_config) -> None:
+    from jobhunter.auth import totp, users
+
+    async with engine.begin() as c:
+        await users.enable_totp(c, totp.new_secret(), data_key=make_config("api").secret_b64("data_key"))
+
+
+async def test_a_login_without_a_totp_code_never_reaches_the_gate(
+    gated, make_user, engine, make_config
+) -> None:
+    await make_user()
+    await _enable_totp(engine, make_config)
+    gated.verifier.released.set()  # nothing is held here: a verification that runs ends at once
+    r = await gated.login("198.51.100.101")
+    assert (r.status_code, r.json()["code"]) == (401, "totp_required")
+    assert (gated.gate.arrivals, gated.verifier.entries) == (0, 0)
+    coded = await gated.login("198.51.100.101", totp="000000")  # the same login with a code goes through it
+    assert (coded.status_code, coded.json()["code"]) == (401, "unauthenticated")
+    assert (gated.gate.arrivals, gated.verifier.entries) == (1, 1)
+
+
+async def test_a_saturated_gate_still_answers_a_login_without_a_code_with_totp_required(
+    gated, make_user, engine, make_config
+) -> None:
+    await make_user()
+    await _enable_totp(engine, make_config)
+    n = SLOTS + QUEUE
+    tasks = [asyncio.create_task(gated.login(f"198.51.100.{100 + i}", totp="000000")) for i in range(n)]
+    try:
+        await gated.progress.until(lambda: gated.saturated(n))  # two verify, eight wait: the gate is full
+        async with asyncio.timeout(WAIT_S):
+            r = await gated.login("198.51.100.200")  # no code: past the gate it would get 429 at once
+        arrivals = gated.gate.arrivals
+        gated.verifier.released.set()
+        answers = await asyncio.gather(*tasks)
+    finally:
+        gated.verifier.released.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert (r.status_code, r.json()["code"]) == (401, "totp_required")
+    assert arrivals == n  # the code-less login was not one of the gate's arrivals
+    assert [a.status_code for a in answers] == [401] * n and gated.verifier.entries == n

@@ -18,7 +18,7 @@ from jobhunter.embeddings import EmbedderClient
 from jobhunter.geo.gazetteer import Gazetteer
 
 # The request header of the SPA's polls: `X-JH-Background: 1` (that exact value only) marks a poll, not a
-# user's action, which `require_session` validates without sliding the session's idle expiry (spec §16.4).
+# user's action, which `require_session` validates without sliding the session's idle expiry (plan M4, D28).
 BACKGROUND_HEADER: Final = "X-JH-Background"
 
 

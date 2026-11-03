@@ -1,7 +1,7 @@
 """A background request (`X-JH-Background: 1`, the SPA's polls) is validated without sliding the session.
 
 Its session is checked like any other (both expiries, the rate limit), but its last use and its idle expiry
-stay as they were, so polls alone never keep an unattended session alive (spec §16.4).
+stay as they were, so polls alone never keep an unattended session alive (plan M4, D28).
 """
 
 from dataclasses import replace

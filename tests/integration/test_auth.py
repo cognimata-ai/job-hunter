@@ -558,9 +558,9 @@ async def test_a_login_without_origin_is_refused(api_client, make_user) -> None:
 
 
 async def test_auth_logs_carry_the_outcome_and_the_address_only(
-    api_client, make_user, make_config, log_events
+    api_client, make_user, make_config, engine, log_events
 ) -> None:
-    from jobhunter.auth import throttle
+    from jobhunter.auth import throttle, totp, users
 
     await make_user("Ada Lovelace")
     body = {"username": "Ada Lovelace", "password": "wrong-password-123"}
@@ -568,16 +568,22 @@ async def test_auth_logs_carry_the_outcome_and_the_address_only(
     r = await api_client.post("/api/auth/login", json={**body, "password": PW})
     assert r.status_code == 204
     token = r.headers["set-cookie"].split(";")[0].split("=", 1)[1]
+    async with engine.begin() as c:
+        await users.enable_totp(c, totp.new_secret(), data_key=make_config("api").secret_b64("data_key"))
+    required = await api_client.post("/api/auth/login", json={**body, "password": PW})  # TOTP on, no code
+    assert required.status_code == 401 and required.json()["code"] == "totp_required"
     events = log_events()
     logins = [e for e in events if e["event"] == "login"]
-    assert [(e["outcome"], e["ip"]) for e in logins] == [
-        ("rejected", "198.51.100.10"),
-        ("accepted", "198.51.100.10"),
+    assert [(e["outcome"], e["ip"], e["level"]) for e in logins] == [
+        ("rejected", "198.51.100.10", "warning"),
+        ("accepted", "198.51.100.10", "info"),
+        ("totp_required", "198.51.100.10", "info"),  # the first request of every sign-in with TOTP on
     ]
-    dumped = json.dumps(events)
+    dumped = json.dumps(events, ensure_ascii=False)  # unescaped, so the password's "Ö" can be found
     username_hmac = throttle.username_hmac("Ada Lovelace", make_config("api").secret_b64("session_secret"))
-    for value in ("Ada Lovelace", PW, "wrong-password-123", token, username_hmac.hex()):
-        assert value not in dumped
+    sent = ("Ada Lovelace", PW, "wrong-password-123", token, username_hmac.hex())
+    leaked = [n for n, value in enumerate(sent) if value in dumped]  # indices only, never the values
+    assert leaked == []
 
 
 def test_the_username_hmac_normalises_the_name_like_the_user_lookup() -> None:
