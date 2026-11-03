@@ -769,7 +769,8 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
     - the handlers `extract_profile_text` (M2 Task 11), `extract_profile` (Task 13), `embed_profile` (Task
       19), `propose_queries` (Task 20), `apply_scope` (Task 18), `watchlist_validate`, and M3's
       `create_targets_for_tuple` (Task 14, `scoring.targets`), `batch_submit` (Task 16,
-      `scoring.batch_operations`, Ruling T16-e) and `eval_run` (Task 19, `scoring.eval_runner`);
+      `scoring.batch_operations`, Ruling T16-e) and `eval_run` (Task 19, `scoring.eval_runner`), and M4's
+      `replay_raw_items` (M4 Task 12, `sources.replay`);
     - the failure hooks of the two profile phases, of the query proposal and of `eval_run` only (written in
       `worker.operations`, Ruling P39; `embed_profile` drives no domain row; `batch_submit`'s cleanup needs
       `active_config`, which its reconciler takes, Codex r3 B2; `create_targets_for_tuple` is re-requested
@@ -793,6 +794,7 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
             "extract_profile",
             "extract_profile_text",
             "propose_queries",
+            "replay_raw_items",
             "watchlist_validate",
         ],
         "failure_hooks": ["eval_run", "extract_profile", "extract_profile_text", "propose_queries"],

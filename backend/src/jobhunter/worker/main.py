@@ -165,6 +165,7 @@ _REGISTERING_MODULES: Final = (
     # `awaiting_embedding`, out of `jobhunter.embeddings` since M3 Task 15 (M1 Carry-forward 14, Ruling P44)
     "jobhunter.worker.embedding_reconcile",
     "jobhunter.sources.watchlist_validate",
+    "jobhunter.sources.replay",  # the `replay_raw_items` handler (M4 Task 12)
     "jobhunter.llm.spend_ledger",  # `llm_ledger_unsettled` and `budget_counters` (M2)
     "jobhunter.llm.gateway",  # `llm_refusal_rate` (M2)
     # the profile handlers and hooks (M2 Tasks 11 and 13), `embed_profile` and, through `profile.vectors`, the

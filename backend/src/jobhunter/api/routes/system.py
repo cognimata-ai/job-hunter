@@ -1,5 +1,7 @@
-"""`/api/system`: the detailed health (spec §17.5), the quota summary (§14.2 L5038; plan M4 Task 10) and the
-manual score cycle (§14.2 L5028; M3 Task 21, Deviation 39), for a logged-in session.
+"""`/api/system`: the detailed health (spec §17.5), the quota summary (§14.2 L5038; plan M4 Task 10), the
+manual score cycle (§14.2 L5028; M3 Task 21, Deviation 39), needs attention and the replay of rejected raw
+items (§14.2 L5040-5042; plan M4 Task 12); and `/api/ats-snapshots`' acknowledgement (L5044), for a
+logged-in session.
 
 - `GET /api/system/health`: readiness, runs, queues, the score lane, alerts, sizes and versions.
 - `GET /api/system/quota` → per provider its current window with the window's counted usage, its reserved,
@@ -21,20 +23,42 @@ manual score cycle (§14.2 L5028; M3 Task 21, Deviation 39), for a logged-in ses
   `ScoreCycleOut` is the score-cycle list's item (`observability.lists`, Task 10), and two models of one name
   would give both a module-qualified schema name.
 
+- `GET /api/system/needs-attention` → `AttentionOut` (`observability.attention.needs_attention`, plan M4
+  Task 12, D23): each section's full count and at most 50 of its items, the score lane's acknowledgeable
+  pause and a failed scope apply, in one read snapshot.
+- `POST /api/system/raw-items/replay {raw_response_id | raw_item_ids}` → 202 `{operation_id, items}`
+  (`sources.replay`, M1 Carry-forward 3 and 10; not keyed, §14.1): exactly one of the two (both or neither is
+  422 `validation_failed`), `raw_item_ids` 1 to 500 ids. A `raw_response_id` is that response's `rejected`
+  items (an unknown response is 404 `not_found`). In one transaction: the ids that can be replayed now
+  (`replay.replayable_items`: `rejected`, their body kept and fetched within `RAW_BODY_TTL`, at most 500,
+  lowest first), then `request_replay`, whose dedup key makes the same set reuse its live operation. `items`
+  is how many ids it queued; none is 409 `conflict_state`.
+
+The second router, `ats_snapshots_router` (`/api/ats-snapshots`):
+- `POST /api/ats-snapshots/{snapshot_id}/acknowledge` → 200 `{snapshot_id, closed}`
+  (`availability.snapshots.acknowledge`, §8.11; not keyed): the mass disappearance confirmed at once, its
+  `unknown` postings closed, in `api.retry.with_deadlock_retry` like the merge family's writes; the
+  acknowledgement bumps the ranking generation itself, last, when a job's availability changed. An unknown
+  snapshot is 404 `not_found` (`api.errors.domain_problem`); one that is no mass disappearance (its
+  `ValueError`, caught here first) 409 `conflict_state`. An event that is no longer open closes nothing (200,
+  `closed = 0`).
+
 `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.system.utcnow`.
 """
 
 from datetime import datetime
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, Self
 
-from fastapi import APIRouter, Depends, Header
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, Header, Path
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_code_head, get_config, get_embedder, get_engine, require_session
-from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.errors import Problem, domain_problem
+from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
+from jobhunter.api.retry import with_deadlock_retry
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
     StoredResponse,
@@ -42,11 +66,14 @@ from jobhunter.api_idempotency import (
     request_fingerprint,
     run_idempotent,
 )
+from jobhunter.availability import snapshots
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.embeddings import EmbedderClient
-from jobhunter.observability import lists, status
+from jobhunter.errors import DomainError
+from jobhunter.observability import attention, lists, status
+from jobhunter.observability.attention import AttentionOut
 from jobhunter.observability.health import SystemHealthOut, check_readiness, system_health
 from jobhunter.observability.lists import QuotaDetailOut
 from jobhunter.observability.status import StatusOut
@@ -54,12 +81,20 @@ from jobhunter.quota.windows import Provider
 from jobhunter.scoring import cycles
 from jobhunter.scoring.admission import any_admissible
 from jobhunter.scoring.cycles import PauseReason
+from jobhunter.sources import replay
 from jobhunter.worker.tasks import defer_in_tx
 
 router = APIRouter(prefix="/api/system", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES)
+ats_snapshots_router = APIRouter(
+    prefix="/api/ats-snapshots", dependencies=[Depends(require_session)], responses=SESSION_RESPONSES
+)
 
 SCORE_CYCLE_ROUTE: Final = "system.score_cycle"
 NO_PENDING: Final = "no_pending"
+_BIGINT_MAX: Final = 2**63 - 1
+
+RawId = Annotated[int, Field(ge=1, le=_BIGINT_MAX)]
+SnapshotId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of an ATS snapshot")]
 
 
 class ScoreCycleQueuedOut(BaseModel):
@@ -68,6 +103,38 @@ class ScoreCycleQueuedOut(BaseModel):
         description="Why the cycle would start nothing now: the score lane's pause reason, or `no_pending` "
         "without an admissible target; null otherwise"
     )
+
+
+class ReplayIn(BaseModel):
+    """The rejected raw items to replay: every rejected item of one stored response, or a list of raw item
+    ids (1 to 500); exactly one of the two."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw_response_id: RawId | None = None
+    raw_item_ids: list[RawId] | None = Field(default=None, min_length=1, max_length=replay.MAX_ITEMS)
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> Self:
+        if (self.raw_response_id is None) == (self.raw_item_ids is None):
+            raise ValueError("give exactly one of raw_response_id and raw_item_ids")
+        return self
+
+
+class ReplayQueuedOut(BaseModel):
+    """The replay operation and how many of the listed items it replays: those still rejected whose stored
+    body is kept and at most 30 days old."""
+
+    operation_id: int
+    items: int
+
+
+class SnapshotAcknowledgedOut(BaseModel):
+    """The acknowledged snapshot and how many postings of its mass disappearance closed (0 for an event that
+    is no longer open)."""
+
+    snapshot_id: int
+    closed: int
 
 
 @router.get("/health", response_model=SystemHealthOut)
@@ -159,3 +226,83 @@ async def request_score_cycle(
             handler=handler,
         )
     return JSONResponse(stored.body, status_code=stored.status)
+
+
+@router.get("/needs-attention", response_model=AttentionOut)
+async def get_needs_attention(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> AttentionOut:
+    """What needs the user: rejected raw items, identity conflicts, refused and failed targets, quarantined
+    batches, batches whose retrieval keeps failing, mass disappearances, unscorable duplicate groups, broken
+    sources, the score lane's acknowledgeable pause and a failed scope apply."""
+    now = utcnow()
+    async with read_snapshot(engine) as conn:
+        return await attention.needs_attention(conn, now=now)
+
+
+@router.post(
+    "/raw-items/replay",
+    status_code=202,
+    response_model=ReplayQueuedOut,
+    responses={
+        404: {"description": "No stored response has the id (`not_found`)"},
+        409: {"description": "None of the listed items can be replayed (`conflict_state`)"},
+        422: {"description": "Both or neither of the two, or no or too many ids (`validation_failed`)"},
+        **CSRF_RESPONSES,
+        **BODY_LIMIT_RESPONSES,
+    },
+)
+async def replay_raw_items(
+    body: ReplayIn, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> ReplayQueuedOut:
+    """Replay rejected raw items (202): each item still rejected whose stored body is kept and at most 30 days
+    old is parsed again by its source's current parser, and the items it now reads are resolved to jobs. The
+    same set of items reuses the replay already queued for it."""
+    now = utcnow()
+    async with engine.begin() as conn:
+        if body.raw_response_id is None:
+            listed = body.raw_item_ids or []  # the model's rule: exactly one of the two is given
+        else:
+            try:
+                listed = await replay.items_of_response(conn, body.raw_response_id)
+            except LookupError as exc:
+                if (problem := domain_problem(exc)) is None:
+                    raise
+                raise problem from None
+        queued = await replay.replayable_items(conn, listed, now=now)
+        if not queued:
+            raise Problem(409, "conflict_state", "No listed raw item can be replayed")
+        operation_id = await replay.request_replay(conn, raw_item_ids=queued, defer=defer_in_tx)
+    return ReplayQueuedOut(operation_id=operation_id, items=len(queued))
+
+
+@ats_snapshots_router.post(
+    "/{snapshot_id}/acknowledge",
+    response_model=SnapshotAcknowledgedOut,
+    responses={
+        404: {"description": "No ATS snapshot has the id (`not_found`)"},
+        409: {
+            "description": "The snapshot is no mass disappearance (`conflict_state`), or a concurrent change "
+            "got in the way (`conflict_state`, with `retryable: true`)"
+        },
+        422: {"description": "Invalid path (`validation_failed`)"},
+        **CSRF_RESPONSES,
+    },
+)
+async def acknowledge_snapshot(
+    snapshot_id: SnapshotId, engine: Annotated[AsyncEngine, Depends(get_engine)]
+) -> SnapshotAcknowledgedOut:
+    """Confirm the mass disappearance of the snapshot (its opening snapshot or a follow-up) at once: the
+    postings of the event that are still unknown close."""
+    now = utcnow()
+
+    async def work(conn: AsyncConnection) -> int:
+        return await snapshots.acknowledge(conn, snapshot_id, now=now)
+
+    try:
+        closed = await with_deadlock_retry(engine, work)
+    except ValueError:  # before `domain_problem`, which maps no `ValueError`
+        raise Problem(409, "conflict_state", "The snapshot is no mass disappearance") from None
+    except (DomainError, LookupError) as exc:
+        if (problem := domain_problem(exc)) is None:
+            raise
+        raise problem from None
+    return SnapshotAcknowledgedOut(snapshot_id=snapshot_id, closed=closed)

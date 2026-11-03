@@ -30,6 +30,11 @@ The pure cores (`admission`, `settle_window`, `serpapi_hour_admits`, `note_forei
 are what the property tests drive (§18.1). `quota_windows` changes only through `windows.save_window` and
 `windows.apply_changes` (Ruling P11); ledger rows change state only through `transition()`.
 
+**The item owner** (`lock_item_owner`, M4 Task 12, M1 Carry-forward 10): the owner of an identity resolution
+(`dedup.identity.resolve_item`) is an `ItemOwner`, a run's admitted attempt (`lock_run_owner`) or an
+operation's claim (`worker.operations.lock_operation_owner`, the replay of rejected items, whose run is
+over), held at the same place of the lock order, and refused under an active `global` purge fence either way.
+
 Alerts are raised with the subject `provider:<name>`: `quota.limit_increased` (info),
 `quota.unaccounted_usage` (warn) and the `adjustment` row it explains; `quota.exhausted` (warn, JSearch 429
 exhaustion, resolved by a later validated observation with `remaining > 0`); `quota.ambiguous_attempt` (warn);
@@ -86,11 +91,16 @@ from jobhunter.quota.windows import (
 from jobhunter.run_settings import QuotaSettings, RunSettings
 from jobhunter.sources.base import Observation
 from jobhunter.worker.epoch import fence_epoch
+from jobhunter.worker.operations import OperationClaim, lock_operation_owner
 from jobhunter.worker.reconcilers import ReconcileContext, reconciler
 
 if TYPE_CHECKING:
     # `worker.runs` imports `observability.health`, which imports this module: the owner type only.
     from jobhunter.worker.runs import RunOwner
+
+# The owner of an identity resolution (module docstring, The item owner): lazily evaluated, so the run's type
+# needs no import at run time.
+type ItemOwner = RunOwner | OperationClaim
 
 COUNTED: Final = ("reserved", "dispatched", "billed", "ambiguous")
 RECOVERY_AFTER: Final = timedelta(minutes=15)
@@ -525,6 +535,18 @@ async def lock_run_owner(conn: AsyncConnection, owner: "RunOwner") -> None:
         raise FencedOut("run")
     if await global_fence_active(conn):
         raise FencedOut("purge_fence")
+
+
+async def lock_item_owner(conn: AsyncConnection, owner: ItemOwner) -> None:
+    """The owner row of an item's resolution (module docstring, The item owner): a run's through
+    `lock_run_owner`; an operation claim's `FOR SHARE` (`lock_operation_owner`, else
+    `FencedOut("operation")`), then no active `global` purge fence, else `FencedOut("purge_fence")`."""
+    if isinstance(owner, OperationClaim):
+        await lock_operation_owner(conn, owner)
+        if await global_fence_active(conn):
+            raise FencedOut("purge_fence")
+        return
+    await lock_run_owner(conn, owner)
 
 
 async def _record_effects(

@@ -2,12 +2,17 @@
 
 **`resolve_item`** runs the §8.6 transaction of one raw item on the caller's connection, inside a savepoint,
 in the lock order of §3.3.3: `active_config` `FOR SHARE` (`filters.lock_active_scopes`, the first statement) →
-the job rows → the run's owner row (`ledger.lock_run_owner`) → the other domain rows → `ranking_state`.
+the job rows → the owner row (`ledger.lock_item_owner`) → the other domain rows → `ranking_state`. The owner
+is a `ledger.ItemOwner` (M4 Task 12, M1 Carry-forward 10): a run's admitted attempt (node 6, its run row
+through `ledger.lock_run_owner`), or the claim of a `replay_raw_items` operation (`sources.replay`, which
+resolves the items it moved under a run that is over: its operation row through
+`worker.operations.lock_operation_owner`). Either way an active `global` purge fence is `FencedOut`; every
+owner step below is that one lock.
 
 1. **Fence and idempotency.** An item no longer `pending` or `deferred` is left as it is: its disposition is
    returned (a replay of a linked item writes nothing). An active `source` purge fence for the item's source
    makes it `out_of_scope('source_purged')`; an observation that already names the item links it to that
-   observation. Both are owner writes, after `lock_run_owner`.
+   observation. Both are owner writes, after `lock_item_owner`.
 2. **Read before writing** (plain reads): the sighting time `t = raw_responses.fetched_at`; the posting `P`
    by `(source_instance_id, native_id)`; the keys `K` (`collect_keys`) and their `ad_keys` owners; with `P`'s
    job, every job followed through `merged_into_job_id` to its root: the job set `J`.
@@ -581,12 +586,12 @@ async def _posting_for(
 
 
 async def _link(
-    conn: AsyncConnection, owner: RunOwner, item: _Item, active: filters.ActiveScopes
+    conn: AsyncConnection, owner: ledger.ItemOwner, item: _Item, active: filters.ActiveScopes
 ) -> ResolveOutcome:
     """Steps 2 to 7 of an item that no fence and no earlier observation settled."""
     keys = collect_keys(item.posting)
     found = await _lock_job_set(conn, item, keys)
-    await ledger.lock_run_owner(conn, owner)  # the owner row after the job rows (§3.3.3)
+    await ledger.lock_item_owner(conn, owner)  # the owner row after the job rows (§3.3.3)
     if fenced := await merge.fenced_jobs(conn, found.jobs):
         log.info("raw_item_deferred", raw_item_id=item.raw_item_id, fenced_job_ids=fenced)
         await _dispose(conn, item.raw_item_id, item.from_states, "deferred", reason=JOB_FENCED)
@@ -699,7 +704,7 @@ async def _link(
     )
 
 
-async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
+async def _resolve(conn: AsyncConnection, owner: ledger.ItemOwner, raw_item_id: int) -> ResolveOutcome:
     active = await filters.lock_active_scopes(conn)  # active_config FOR SHARE: the first lock (§3.3.3, §8.6)
     row = (await conn.execute(_ITEM, {"item": raw_item_id})).first()
     if row is None:
@@ -711,11 +716,11 @@ async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> 
         return ResolveOutcome(resolution)
     from_states = (str(row.disposition),)
     if (await conn.execute(_SOURCE_FENCED, {"source": row.source_id})).scalar_one():
-        await ledger.lock_run_owner(conn, owner)
+        await ledger.lock_item_owner(conn, owner)
         await _dispose(conn, raw_item_id, from_states, "out_of_scope", reason=items.SOURCE_PURGED)
         return ResolveOutcome("out_of_scope")
     if row.observation_id is not None:
-        await ledger.lock_run_owner(conn, owner)
+        await ledger.lock_item_owner(conn, owner)
         await _dispose(conn, raw_item_id, from_states, "linked", observation_id=int(row.observation_id))
         return ResolveOutcome("linked")
     item = _Item(
@@ -733,15 +738,17 @@ async def _resolve(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> 
     return await _link(conn, owner, item, active)
 
 
-async def _reject(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
+async def _reject(conn: AsyncConnection, owner: ledger.ItemOwner, raw_item_id: int) -> ResolveOutcome:
     """`rejected('identity_error')`, under the owner row, from whichever of `pending` and `deferred` it is."""
-    await ledger.lock_run_owner(conn, owner)
+    await ledger.lock_item_owner(conn, owner)
     disposition = (await conn.execute(_DISPOSITION, {"item": raw_item_id})).scalar_one()
     await _dispose(conn, raw_item_id, (str(disposition),), "rejected", reason=items.IDENTITY_ERROR)
     return ResolveOutcome("rejected")
 
 
-async def _resolve_counted(conn: AsyncConnection, owner: RunOwner, raw_item_id: int) -> ResolveOutcome:
+async def _resolve_counted(
+    conn: AsyncConnection, owner: ledger.ItemOwner, raw_item_id: int
+) -> ResolveOutcome:
     try:
         async with conn.begin_nested():
             return await _resolve(conn, owner, raw_item_id)
@@ -753,10 +760,11 @@ async def _resolve_counted(conn: AsyncConnection, owner: RunOwner, raw_item_id: 
             return await _reject(conn, owner, raw_item_id)
 
 
-async def resolve_item(conn: AsyncConnection, *, owner: RunOwner, raw_item_id: int) -> Resolution:
+async def resolve_item(conn: AsyncConnection, *, owner: ledger.ItemOwner, raw_item_id: int) -> Resolution:
     """Resolve one raw item (the §8.6 transaction; module docstring) on the caller's connection, in a
-    savepoint; its resolution. Raises `FencedOut` for a superseded owner (or an active global purge fence),
-    having written nothing, and `LookupError` for an item that does not exist or cannot be resolved."""
+    savepoint, under `owner` (a run's attempt or an operation's claim); its resolution. Raises `FencedOut` for
+    a superseded owner (or an active global purge fence), having written nothing, and `LookupError` for an
+    item that does not exist or cannot be resolved."""
     return (await _resolve_counted(conn, owner, raw_item_id)).resolution
 
 

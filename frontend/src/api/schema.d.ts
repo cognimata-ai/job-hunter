@@ -44,6 +44,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/ats-snapshots/{snapshot_id}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Snapshot
+         * @description Confirm the mass disappearance of the snapshot (its opening snapshot or a follow-up) at once: the
+         *     postings of the event that are still unknown close.
+         */
+        post: operations["acknowledge_snapshot_api_ats_snapshots__snapshot_id__acknowledge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/login": {
         parameters: {
             query?: never;
@@ -1036,6 +1057,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/system/needs-attention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Needs Attention
+         * @description What needs the user: rejected raw items, identity conflicts, refused and failed targets, quarantined
+         *     batches, batches whose retrieval keeps failing, mass disappearances, unscorable duplicate groups, broken
+         *     sources, the score lane's acknowledgeable pause and a failed scope apply.
+         */
+        get: operations["get_needs_attention_api_system_needs_attention_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/system/quota": {
         parameters: {
             query?: never;
@@ -1051,6 +1094,28 @@ export interface paths {
         get: operations["get_quota_api_system_quota_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/system/raw-items/replay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replay Raw Items
+         * @description Replay rejected raw items (202): each item still rejected whose stored body is kept and at most 30 days
+         *     old is parsed again by its source's current parser, and the items it now reads are resolved to jobs. The
+         *     same set of items reuses the replay already queued for it.
+         */
+        post: operations["replay_raw_items_api_system_raw_items_replay_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1398,6 +1463,23 @@ export interface components {
             next_cursor: string | null;
         };
         /**
+         * AttentionOut
+         * @description What needs the user: each list section's full count and at most 50 of its items, the score lane's
+         *     acknowledgeable pause and a failed scope apply (each null when there is none).
+         */
+        AttentionOut: {
+            broken_sources: components["schemas"]["BrokenSourcesSectionOut"];
+            failed_targets: components["schemas"]["FailedTargetsSectionOut"];
+            identity_conflicts: components["schemas"]["IdentityConflictsSectionOut"];
+            mass_disappearances: components["schemas"]["MassDisappearancesSectionOut"];
+            paused_lane: components["schemas"]["PausedLaneOut"] | null;
+            quarantined_batches: components["schemas"]["QuarantinedBatchesSectionOut"];
+            raw_items: components["schemas"]["RawItemsSectionOut"];
+            retrieve_failing: components["schemas"]["RetrieveFailingSectionOut"];
+            scope_apply_failed: components["schemas"]["ScopeApplyFailedOut"] | null;
+            unscorable_groups: components["schemas"]["UnscorableGroupsSectionOut"];
+        };
+        /**
          * BannerOut
          * @description A banner: a client shows it by its `code`, with `params` (JSON values; instants as ISO 8601 UTC
          *     strings).
@@ -1417,6 +1499,48 @@ export interface components {
              * @enum {string}
              */
             severity: "critical" | "warn" | "info";
+        };
+        /**
+         * BrokenSourceOut
+         * @description A source instance that does not collect (`critical`), or collects with failures (`degraded`, `warn`):
+         *     its health, its last error and its breaker's times.
+         */
+        BrokenSourceOut: {
+            /** Breaker Opened At */
+            breaker_opened_at: string | null;
+            /** Half Open After */
+            half_open_after: string | null;
+            /**
+             * Health
+             * @enum {string}
+             */
+            health: "breaker_open" | "auth_failed" | "contract_broken" | "not_found" | "degraded";
+            /** Instance Id */
+            instance_id: number;
+            /**
+             * Label
+             * @description The watchlist company's name, else the instance key
+             */
+            label: string;
+            /** Last Error Code */
+            last_error_code: string | null;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "critical" | "warn";
+            /** Source Id */
+            source_id: string;
+        };
+        /**
+         * BrokenSourcesSectionOut
+         * @description The broken and degraded source instances: how many, and 50 of them, the broken ones first.
+         */
+        BrokenSourcesSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["BrokenSourceOut"][];
         };
         /** BucketOut */
         BucketOut: {
@@ -1847,6 +1971,34 @@ export interface components {
             sources: components["schemas"]["SourceFacetOut"][];
         };
         /**
+         * FailedTargetOut
+         * @description A target of the active scoring tuple that was refused or failed, which a retry can take back.
+         */
+        FailedTargetOut: {
+            /** Job Id */
+            job_id: number;
+            /** Refusal Category */
+            refusal_category: string | null;
+            /** State */
+            state: string;
+            /** State Reason */
+            state_reason: string | null;
+            /** Target Id */
+            target_id: number;
+            /** Title */
+            title: string;
+        };
+        /**
+         * FailedTargetsSectionOut
+         * @description The refused and failed targets: how many, and the 50 that changed state last.
+         */
+        FailedTargetsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["FailedTargetOut"][];
+        };
+        /**
          * FeedbackIn
          * @description A label, or a "wrong score" with the label the user expected (§14.2).
          */
@@ -2111,6 +2263,36 @@ export interface components {
             items: components["schemas"]["HistoryItemOut"][];
             /** Next Cursor */
             next_cursor: string | null;
+        };
+        /**
+         * IdentityConflictOut
+         * @description An open identity conflict: the jobs whose strong keys disagree, the posting's job first.
+         */
+        IdentityConflictOut: {
+            /** Conflict Id */
+            conflict_id: number;
+            /** Job Ids */
+            job_ids: number[];
+            /**
+             * Opened At
+             * Format: date-time
+             */
+            opened_at: string;
+            /**
+             * Reason
+             * @description The exclusive key namespaces in which the jobs carry different values, comma-separated (for example `pub:stepstone.de`); `exclusive_conflict` when none is named
+             */
+            reason: string;
+        };
+        /**
+         * IdentityConflictsSectionOut
+         * @description The open identity conflicts: how many, and the 50 opened last.
+         */
+        IdentityConflictsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["IdentityConflictOut"][];
         };
         /**
          * InstanceOut
@@ -2457,6 +2639,39 @@ export interface components {
             /** Username */
             username: string;
         };
+        /**
+         * MassDisappearanceOut
+         * @description An unconfirmed mass disappearance of a board, by its opening snapshot: the postings absent from it
+         *     against the board's active count before it.
+         */
+        MassDisappearanceOut: {
+            /** Absent Count */
+            absent_count: number | null;
+            /** Baseline Active Count */
+            baseline_active_count: number | null;
+            /**
+             * Instance Label
+             * @description The watchlist company's name, else the board's instance key
+             */
+            instance_label: string;
+            /** Snapshot Id */
+            snapshot_id: number;
+            /**
+             * Taken At
+             * Format: date-time
+             */
+            taken_at: string;
+        };
+        /**
+         * MassDisappearancesSectionOut
+         * @description The open mass disappearances: how many, and the 50 opened last.
+         */
+        MassDisappearancesSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["MassDisappearanceOut"][];
+        };
         /** MemberBriefOut */
         MemberBriefOut: {
             /** Availability */
@@ -2534,6 +2749,19 @@ export interface components {
             region: ("global" | "eu") | null;
             /** Slug */
             slug: string;
+        };
+        /**
+         * PausedLaneOut
+         * @description The alert that pauses the score lane until it is acknowledged, and why.
+         */
+        PausedLaneOut: {
+            /** Alert Id */
+            alert_id: number | null;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "reservation_bound_violated" | "auth_failed";
         };
         /**
          * PendingScopeOut
@@ -2712,6 +2940,44 @@ export interface components {
             text: string;
         };
         /**
+         * QuarantinedBatchOut
+         * @description A batch submission whose send is ambiguous (`submit_ambiguous`) or that was released and is still
+         *     reconciled (`released`): the spend it holds, its requests, when it was sent, the last reconciliation pass
+         *     and the candidate batches that pass could not read.
+         */
+        QuarantinedBatchOut: {
+            /** Last Reconcile At */
+            last_reconcile_at: string | null;
+            /** Request Count */
+            request_count: number;
+            /** Reserved Usd */
+            reserved_usd: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "submit_ambiguous" | "released";
+            /** Submission Id */
+            submission_id: number;
+            /**
+             * Submit Started At
+             * Format: date-time
+             */
+            submit_started_at: string;
+            /** Unread Candidates */
+            unread_candidates: number;
+        };
+        /**
+         * QuarantinedBatchesSectionOut
+         * @description The quarantined batch submissions: how many, and the 50 sent last.
+         */
+        QuarantinedBatchesSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["QuarantinedBatchOut"][];
+        };
+        /**
          * QueryEditIn
          * @description An absent member keeps the query's value.
          */
@@ -2830,6 +3096,16 @@ export interface components {
             window_start: string;
         };
         /**
+         * RawItemsSectionOut
+         * @description The responses with rejected items: how many, and the 50 fetched last.
+         */
+        RawItemsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["RejectedResponseOut"][];
+        };
+        /**
          * ReadyOut
          * @description Every serving prerequisite holds; the body is `{}`.
          */
@@ -2858,6 +3134,37 @@ export interface components {
             round: number;
         };
         /**
+         * RejectedResponseOut
+         * @description A stored response with rejected items: its source and instance, when it was fetched, how many of its
+         *     items are rejected and why, and whether they can be replayed (its body is kept and at most 30 days
+         *     old).
+         */
+        RejectedResponseOut: {
+            /**
+             * Fetched At
+             * Format: date-time
+             */
+            fetched_at: string;
+            /**
+             * Instance Label
+             * @description The watchlist company's name, else the instance key
+             */
+            instance_label: string;
+            /** Raw Response Id */
+            raw_response_id: number;
+            /**
+             * Reasons
+             * @description The distinct reason codes of its rejected items, sorted
+             */
+            reasons: string[];
+            /** Rejected */
+            rejected: number;
+            /** Replayable */
+            replayable: boolean;
+            /** Source Id */
+            source_id: string;
+        };
+        /**
          * ReleaseIn
          * @description The release of a quarantined submission (§10.10): `confirm` must be `true`.
          */
@@ -2882,6 +3189,28 @@ export interface components {
             state: "released";
             /** Submission Id */
             submission_id: number;
+        };
+        /**
+         * ReplayIn
+         * @description The rejected raw items to replay: every rejected item of one stored response, or a list of raw item
+         *     ids (1 to 500); exactly one of the two.
+         */
+        ReplayIn: {
+            /** Raw Item Ids */
+            raw_item_ids?: number[] | null;
+            /** Raw Response Id */
+            raw_response_id?: number | null;
+        };
+        /**
+         * ReplayQueuedOut
+         * @description The replay operation and how many of the listed items it replays: those still rejected whose stored
+         *     body is kept and at most 30 days old.
+         */
+        ReplayQueuedOut: {
+            /** Items */
+            items: number;
+            /** Operation Id */
+            operation_id: number;
         };
         /**
          * RescoreEstimateOut
@@ -2926,6 +3255,40 @@ export interface components {
              * @enum {string}
              */
             decision: "separate" | "merge";
+        };
+        /**
+         * RetrieveFailingBatchOut
+         * @description A submitted batch that still cannot be retrieved past its expiry, with its open alert.
+         */
+        RetrieveFailingBatchOut: {
+            /** Alert Id */
+            alert_id: number;
+            /** Expires At */
+            expires_at: string | null;
+            /** Provider Batch Id */
+            provider_batch_id: string;
+            /**
+             * Releasable
+             * @description Whether it can be released: more than 1 h past its expiry
+             */
+            releasable: boolean;
+            /**
+             * Reserved Usd
+             * @description The spend the submission holds, which a release leaves counted as ambiguous
+             */
+            reserved_usd: string;
+            /** Submission Id */
+            submission_id: number;
+        };
+        /**
+         * RetrieveFailingSectionOut
+         * @description The submitted batches whose retrieval keeps failing: how many, and the 50 sent last.
+         */
+        RetrieveFailingSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["RetrieveFailingBatchOut"][];
         };
         /** RetryApplyOut */
         RetryApplyOut: {
@@ -3145,6 +3508,16 @@ export interface components {
             passed: boolean | null;
             /** Transport */
             transport: string | null;
+        };
+        /**
+         * ScopeApplyFailedOut
+         * @description The scope whose apply failed, and its open alert (null until the alert is raised).
+         */
+        ScopeApplyFailedOut: {
+            /** Alert Id */
+            alert_id: number | null;
+            /** Version Id */
+            version_id: number;
         };
         /**
          * ScopeProgressOut
@@ -3368,6 +3741,17 @@ export interface components {
             name: string;
             /** Years */
             years: number | null;
+        };
+        /**
+         * SnapshotAcknowledgedOut
+         * @description The acknowledged snapshot and how many postings of its mass disappearance closed (0 for an event that
+         *     is no longer open).
+         */
+        SnapshotAcknowledgedOut: {
+            /** Closed */
+            closed: number;
+            /** Snapshot Id */
+            snapshot_id: number;
         };
         /** SourceFacetOut */
         SourceFacetOut: {
@@ -3646,6 +4030,46 @@ export interface components {
         UnmergedOut: {
             /** Unmerge Event Id */
             unmerge_event_id: number;
+        };
+        /**
+         * UnscorableGroupOut
+         * @description An active duplicate group that no member can represent, why, and its members by job id.
+         */
+        UnscorableGroupOut: {
+            /** Group Id */
+            group_id: number;
+            /** Members */
+            members: components["schemas"]["UnscorableMemberOut"][];
+            /**
+             * Unscorable Reason
+             * @enum {string}
+             */
+            unscorable_reason: "all_failed" | "all_filtered" | "no_active_member";
+        };
+        /**
+         * UnscorableGroupsSectionOut
+         * @description The unscorable duplicate groups: how many, and the 50 elected last.
+         */
+        UnscorableGroupsSectionOut: {
+            /** Count */
+            count: number;
+            /** Items */
+            items: components["schemas"]["UnscorableGroupOut"][];
+        };
+        /**
+         * UnscorableMemberOut
+         * @description A member of an unscorable group, with its current revision's target of the active scoring tuple (null
+         *     without one).
+         */
+        UnscorableMemberOut: {
+            /** Job Id */
+            job_id: number;
+            /** Target Id */
+            target_id: number | null;
+            /** Target State */
+            target_state: string | null;
+            /** Title */
+            title: string;
         };
         /** UnsupportedUrlOut */
         UnsupportedUrlOut: {
@@ -3933,6 +4357,83 @@ export interface operations {
             };
             /** @description No open alert with this id: it does not exist or is resolved (`not_found`) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid path (`validation_failed`) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    acknowledge_snapshot_api_ats_snapshots__snapshot_id__acknowledge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The id of an ATS snapshot */
+                snapshot_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SnapshotAcknowledgedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No ATS snapshot has the id (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The snapshot is no mass disappearance (`conflict_state`), or a concurrent change got in the way (`conflict_state`, with `retryable: true`) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7774,6 +8275,44 @@ export interface operations {
             };
         };
     };
+    get_needs_attention_api_system_needs_attention_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttentionOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_quota_api_system_quota_get: {
         parameters: {
             query?: never;
@@ -7796,6 +8335,93 @@ export interface operations {
             };
             /** @description No valid session (`unauthenticated`) */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Too many requests in this session (`throttled`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    replay_raw_items_api_system_raw_items_replay_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplayIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReplayQueuedOut"];
+                };
+            };
+            /** @description No valid session (`unauthenticated`) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Origin or `X-JH-Request` check failed (`csrf_failed`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No stored response has the id (`not_found`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description None of the listed items can be replayed (`conflict_state`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is larger than 1 MiB (`upload_rejected`, `too_large`) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Both or neither of the two, or no or too many ids (`validation_failed`) */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

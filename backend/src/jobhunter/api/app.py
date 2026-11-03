@@ -208,6 +208,7 @@ def create_app(
     api.include_router(auth.router)
     api.include_router(runs.router)
     api.include_router(system.router)
+    api.include_router(system.ats_snapshots_router)
     api.include_router(spend.router)
     api.include_router(profile.router)
     api.include_router(profile_review.router)
