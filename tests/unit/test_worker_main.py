@@ -777,7 +777,8 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
       by `missing_targets`);
     - the `bulk_operations` reconciler's one active step, Task 16's `rerequest` (Ruling T16-d);
     - the one gauge refresh `metrics_refresh` runs, Task 18's `score_lane`;
-    - the execution lock of each kind that has one (`OPERATION_LOCKS`: `batch_submit` under `batch`, Task 14).
+    - the execution lock of each kind that has one (`OPERATION_LOCKS`: `batch_submit` under `batch`, Task 14;
+      M4's `replay_raw_items` under `replay`, M4 Task 12).
     `embed_profile`, `propose_queries` and the `profile_vectors` reconciler come with `profile.operations`,
     which imports `profile.vectors`; `worker.main` lists neither."""
     from jobhunter.worker.main import _REGISTERING_MODULES
@@ -801,7 +802,7 @@ def test_the_registering_modules_alone_register_every_reconciler_sweep_and_handl
         "active_steps": ["jobhunter.scoring.batches.rerequest"],
         "gauge_refreshes": ["score_lane"],
         # M3 Task 14 (Codex r3 B20): `defer_operation_job` reads it at every enqueue
-        "operation_locks": {"batch_submit": "batch"},
+        "operation_locks": {"batch_submit": "batch", "replay_raw_items": "replay"},
         "main_imported": False,
     }
 

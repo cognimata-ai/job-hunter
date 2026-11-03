@@ -29,10 +29,11 @@ logged-in session.
 - `POST /api/system/raw-items/replay {raw_response_id | raw_item_ids}` → 202 `{operation_id, items}`
   (`sources.replay`, M1 Carry-forward 3 and 10; not keyed, §14.1): exactly one of the two (both or neither is
   422 `validation_failed`), `raw_item_ids` 1 to 500 ids. A `raw_response_id` is that response's `rejected`
-  items (an unknown response is 404 `not_found`). In one transaction: the ids that can be replayed now
-  (`replay.replayable_items`: `rejected`, their body kept and fetched within `RAW_BODY_TTL`, at most 500,
-  lowest first), then `request_replay`, whose dedup key makes the same set reuse its live operation. `items`
-  is how many ids it queued; none is 409 `conflict_state`.
+  items (an unknown response is 404 `not_found`). In one transaction: the ids that are replayable now
+  (`replay.replayable_items`, the one predicate of `sources.replay`: `rejected`, their run ended, their body
+  kept and fetched at most `RAW_BODY_TTL` ago; at most 500, lowest first), then `request_replay`, whose dedup
+  key makes the same set reuse its live operation. `items` is how many ids it queued; none (also a running
+  run's items only) is 409 `conflict_state`.
 
 The second router, `ats_snapshots_router` (`/api/ats-snapshots`):
 - `POST /api/ats-snapshots/{snapshot_id}/acknowledge` → 200 `{snapshot_id, closed}`
@@ -122,8 +123,8 @@ class ReplayIn(BaseModel):
 
 
 class ReplayQueuedOut(BaseModel):
-    """The replay operation and how many of the listed items it replays: those still rejected whose stored
-    body is kept and at most 30 days old."""
+    """The replay operation and how many of the listed items it replays: those still rejected whose run has
+    ended and whose stored body is kept and at most 30 days old."""
 
     operation_id: int
     items: int
@@ -244,7 +245,10 @@ async def get_needs_attention(engine: Annotated[AsyncEngine, Depends(get_engine)
     response_model=ReplayQueuedOut,
     responses={
         404: {"description": "No stored response has the id (`not_found`)"},
-        409: {"description": "None of the listed items can be replayed (`conflict_state`)"},
+        409: {
+            "description": "None of the listed items can be replayed, for example while their run still runs "
+            "(`conflict_state`)"
+        },
         422: {"description": "Both or neither of the two, or no or too many ids (`validation_failed`)"},
         **CSRF_RESPONSES,
         **BODY_LIMIT_RESPONSES,
@@ -253,9 +257,9 @@ async def get_needs_attention(engine: Annotated[AsyncEngine, Depends(get_engine)
 async def replay_raw_items(
     body: ReplayIn, engine: Annotated[AsyncEngine, Depends(get_engine)]
 ) -> ReplayQueuedOut:
-    """Replay rejected raw items (202): each item still rejected whose stored body is kept and at most 30 days
-    old is parsed again by its source's current parser, and the items it now reads are resolved to jobs. The
-    same set of items reuses the replay already queued for it."""
+    """Replay rejected raw items (202): each item still rejected whose run has ended and whose stored body is
+    kept and at most 30 days old is parsed again by its source's current parser, and the items it now reads
+    are resolved to jobs. The same set of items reuses the replay already queued for it."""
     now = utcnow()
     async with engine.begin() as conn:
         if body.raw_response_id is None:

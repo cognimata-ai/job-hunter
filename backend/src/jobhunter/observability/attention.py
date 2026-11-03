@@ -10,7 +10,8 @@ through an index or within a bound):
 
 - `raw_items`: the stored responses with `rejected` items, one entry per response: its source and instance
   label, its fetch time, how many of its items are rejected and their distinct reasons (sorted), and
-  `replayable` (its body not purged and fetched after `now - RAW_BODY_TTL`, what `sources.replay` queues).
+  `replayable`, the one predicate `sources.replay` queues by (`replay.RESPONSE_REPLAYABLE_SQL`: its run has
+  ended, its body is not purged and it was fetched at most `RAW_BODY_TTL` ago, inclusive).
   Newest fetch first, then the response id. The rejected items through `raw_items_attention` (a partial index
   of exactly the `pending`, `rejected` and `deferred` items), bounded by the 90-day retention of raw items;
   each response by its key.
@@ -70,7 +71,7 @@ from jobhunter.scoring.batch_results import RETRIEVE_FAILING_AFTER, RETRIEVE_FAI
 from jobhunter.scoring.batches import RELEASED_LISTED_FOR
 from jobhunter.scoring.targets import RETRYABLE_STATES
 from jobhunter.settings import scope_apply
-from jobhunter.sources.receipts import RAW_BODY_TTL
+from jobhunter.sources.replay import RESPONSE_REPLAYABLE_SQL, replayable_since
 
 ITEMS_PER_SECTION: Final = 50
 NO_NAMESPACE_REASON: Final = "exclusive_conflict"
@@ -89,9 +90,9 @@ _PAUSING_ALERTS: Final[dict[str, PausedReason]] = {
 _RETRYABLE_SQL: Final = ", ".join(f"'{state}'" for state in RETRYABLE_STATES)
 
 _RAW_ITEMS: Final = q(
-    "/* attention.raw_items */ SELECT g.raw_response_id, s.source_id, "
+    "/* attention.raw_items */ SELECT g.raw_response_id, s.source_id, "  # noqa: S608
     "coalesce(w.display_name, s.instance_key) AS instance_label, r.fetched_at, g.rejected, g.reasons, "
-    "(r.purged_at IS NULL AND r.fetched_at > :since) AS replayable, count(*) OVER () AS total "
+    f"{RESPONSE_REPLAYABLE_SQL} AS replayable, count(*) OVER () AS total "
     "FROM (SELECT raw_response_id, count(*) AS rejected, "
     "array_agg(DISTINCT reason_code ORDER BY reason_code) AS reasons "
     "FROM raw_items WHERE disposition = 'rejected' GROUP BY raw_response_id) g "
@@ -176,8 +177,8 @@ _NEWEST_APPLY_FAILED: Final = q(
 
 class RejectedResponseOut(BaseModel):
     """A stored response with rejected items: its source and instance, when it was fetched, how many of its
-    items are rejected and why, and whether they can be replayed (its body is kept and at most 30 days
-    old)."""
+    items are rejected and why, and whether they can be replayed (the run that fetched it has ended, and its
+    body is kept and at most 30 days old)."""
 
     raw_response_id: int
     source_id: str
@@ -384,7 +385,7 @@ def _namespaces(conflicting: object) -> str:
 
 
 async def _raw_items(conn: AsyncConnection, now: datetime) -> RawItemsSectionOut:
-    count, rows = await _rows(conn, _RAW_ITEMS, since=now - RAW_BODY_TTL)
+    count, rows = await _rows(conn, _RAW_ITEMS, since=replayable_since(now))
     return RawItemsSectionOut(
         count=count,
         items=[

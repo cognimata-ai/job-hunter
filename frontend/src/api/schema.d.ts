@@ -1111,9 +1111,9 @@ export interface paths {
         put?: never;
         /**
          * Replay Raw Items
-         * @description Replay rejected raw items (202): each item still rejected whose stored body is kept and at most 30 days
-         *     old is parsed again by its source's current parser, and the items it now reads are resolved to jobs. The
-         *     same set of items reuses the replay already queued for it.
+         * @description Replay rejected raw items (202): each item still rejected whose run has ended and whose stored body is
+         *     kept and at most 30 days old is parsed again by its source's current parser, and the items it now reads
+         *     are resolved to jobs. The same set of items reuses the replay already queued for it.
          */
         post: operations["replay_raw_items_api_system_raw_items_replay_post"];
         delete?: never;
@@ -3136,8 +3136,8 @@ export interface components {
         /**
          * RejectedResponseOut
          * @description A stored response with rejected items: its source and instance, when it was fetched, how many of its
-         *     items are rejected and why, and whether they can be replayed (its body is kept and at most 30 days
-         *     old).
+         *     items are rejected and why, and whether they can be replayed (the run that fetched it has ended, and its
+         *     body is kept and at most 30 days old).
          */
         RejectedResponseOut: {
             /**
@@ -3203,8 +3203,8 @@ export interface components {
         };
         /**
          * ReplayQueuedOut
-         * @description The replay operation and how many of the listed items it replays: those still rejected whose stored
-         *     body is kept and at most 30 days old.
+         * @description The replay operation and how many of the listed items it replays: those still rejected whose run has
+         *     ended and whose stored body is kept and at most 30 days old.
          */
         ReplayQueuedOut: {
             /** Items */
@@ -8402,7 +8402,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["Problem"];
                 };
             };
-            /** @description None of the listed items can be replayed (`conflict_state`) */
+            /** @description None of the listed items can be replayed, for example while their run still runs (`conflict_state`) */
             409: {
                 headers: {
                     [name: string]: unknown;

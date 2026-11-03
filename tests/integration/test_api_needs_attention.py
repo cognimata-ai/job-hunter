@@ -30,7 +30,7 @@ from jobhunter.sources import replay
 from jobhunter.sources.arbeitnow import ArbeitnowAdapter
 from jobhunter.sources.items import parse_response
 from jobhunter.sources.receipts import RAW_BODY_TTL
-from jobhunter.worker.runs import RunOwner
+from jobhunter.worker.runs import RunOwner, finalize_run
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.collect import Board, pending_item, queued_run
@@ -113,6 +113,12 @@ async def parsed_arbeitnow(engine: AsyncEngine, adapter: ArbeitnowAdapter, page:
         return [int(i) for i in (await c.execute(PENDING_OF, {"r": rr})).scalars()]
 
 
+async def ended(engine: AsyncEngine, owner: RunOwner) -> None:
+    """The run over (`succeeded`): no node of it resolves its items any more, so they can be replayed."""
+    async with engine.begin() as c:
+        await finalize_run(c, owner, status="succeeded", reason=None, report={})
+
+
 async def alert(c: AsyncConnection, code: str, subject: str, **context: Any) -> int:
     return await raise_alert(
         c, code=code, severity="critical", subject=subject, message="test", context=context
@@ -149,6 +155,7 @@ async def test_raw_items_are_grouped_by_response_with_their_reasons_and_replayab
         r: await scalar(engine, "SELECT fetched_at FROM raw_responses WHERE id = :r", r=r)
         for r in (rr, purged)
     }
+    await ended(engine, owner)
 
     section = (await attention(logged_in_client))["raw_items"]
     assert section["count"] == 3
@@ -166,6 +173,57 @@ async def test_raw_items_are_grouped_by_response_with_their_reasons_and_replayab
         "default",  # the default instance, which no watchlist company names: labelled by its instance key
         fetched[rr],
     )
+
+
+async def test_a_running_run_s_items_are_not_replayable(
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    arbeitnow_adapter: ArbeitnowAdapter,
+    stored_arbeitnow_page: StoredPage,
+    now: datetime,
+) -> None:
+    owner, rr = stored_arbeitnow_page
+    pending = await parsed_arbeitnow(engine, arbeitnow_adapter, stored_arbeitnow_page)
+    await reject(engine, pending[:2])
+    # the run still runs: its resolve node or its finalize may still count them (I1), so no replay
+    [item] = (await attention(logged_in_client))["raw_items"]["items"]
+    assert (item["raw_response_id"], item["replayable"]) == (rr, False)
+    for body in ({"raw_response_id": rr}, {"raw_item_ids": pending[:2]}):
+        r = await logged_in_client.post(REPLAY, json=body)
+        assert (r.status_code, r.json()["code"]) == (409, "conflict_state"), body
+    assert await scalar(engine, "SELECT count(*) FROM operations") == 0
+    # the run over: both replayable
+    await ended(engine, owner)
+    [item] = (await attention(logged_in_client))["raw_items"]["items"]
+    assert (item["raw_response_id"], item["replayable"]) == (rr, True)
+    r = await logged_in_client.post(REPLAY, json={"raw_response_id": rr})
+    assert (r.status_code, r.json()["items"]) == (202, 2)
+
+
+async def test_a_body_exactly_30_days_old_is_still_replayable(
+    logged_in_client: httpx.AsyncClient,
+    engine: AsyncEngine,
+    arbeitnow_adapter: ArbeitnowAdapter,
+    stored_arbeitnow_page: StoredPage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, rr = stored_arbeitnow_page
+    pending = await parsed_arbeitnow(engine, arbeitnow_adapter, stored_arbeitnow_page)
+    await reject(engine, pending[:1])
+    await ended(engine, owner)
+    fetched_at = await scalar(engine, "SELECT fetched_at FROM raw_responses WHERE id = :r", r=rr)
+    edge = fetched_at + RAW_BODY_TTL  # retention keeps the body until then, and `replay_rejected` takes it
+    assert RAW_BODY_TTL == timedelta(days=30)
+
+    monkeypatch.setattr(SYSTEM_UTCNOW, lambda: edge)
+    assert [i["replayable"] for i in (await attention(logged_in_client))["raw_items"]["items"]] == [True]
+    r = await logged_in_client.post(REPLAY, json={"raw_response_id": rr})
+    assert (r.status_code, r.json()["items"]) == (202, 1)
+    # a microsecond later it is past the TTL
+    monkeypatch.setattr(SYSTEM_UTCNOW, lambda: edge + timedelta(microseconds=1))
+    assert [i["replayable"] for i in (await attention(logged_in_client))["raw_items"]["items"]] == [False]
+    r = await logged_in_client.post(REPLAY, json={"raw_response_id": rr})
+    assert (r.status_code, r.json()["code"]) == (409, "conflict_state")
 
 
 async def test_identity_conflicts_list_the_open_ones_with_their_jobs_and_namespaces(
@@ -430,7 +488,8 @@ async def test_mass_disappearances_are_the_open_events_by_their_opening_snapshot
         "baseline_active_count": 20,
     }
     assert at(item["taken_at"]) == taken
-    await logged_in_client.post(f"/api/ats-snapshots/{opening}/acknowledge")  # the event ends
+    r = await logged_in_client.post(f"/api/ats-snapshots/{opening}/acknowledge")  # the event ends
+    assert (r.status_code, r.json()) == (200, {"snapshot_id": opening, "closed": 20})
     assert (await attention(logged_in_client))["mass_disappearances"] == EMPTY
 
 
@@ -481,47 +540,68 @@ async def test_broken_sources_are_the_four_partial_causes_and_degraded_as_a_warn
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, board: Board, now: datetime
 ) -> None:
     opened = now - timedelta(minutes=30)
-    await execute(
-        engine,
-        "UPDATE source_instances SET health = 'breaker_open', breaker_opened_at = :o, half_open_after = :h, "
-        "last_error_code = 'http_503' WHERE source_id = 'jsearch' AND instance_key = 'default'",
-        o=opened,
-        h=now + timedelta(minutes=30),
-    )
-    await execute(
-        engine,
-        "UPDATE source_instances SET health = 'not_found', breaker_opened_at = :o, half_open_after = :h, "
-        "last_error_code = 'http_404' WHERE id = :i",
-        o=opened - timedelta(hours=1),
-        h=now + timedelta(hours=1),
-        i=board.instance_id,
+
+    async def broken(health: str, opened_at: datetime, code: str, where: str, **params: Any) -> None:
+        await execute(
+            engine,
+            f"UPDATE source_instances SET health = :health, breaker_opened_at = :o, half_open_after = :h, "  # noqa: S608
+            f"last_error_code = :code WHERE {where}",
+            health=health,
+            o=opened_at,
+            h=now + timedelta(hours=1),
+            code=code,
+            **params,
+        )
+
+    default = "source_id = :s AND instance_key = 'default'"
+    await broken("breaker_open", opened, "http_503", default, s="jsearch")
+    await broken("not_found", opened - timedelta(hours=1), "http_404", "id = :i", i=board.instance_id)
+    await broken("auth_failed", opened - timedelta(hours=2), "http_401", default, s="arbeitnow")
+    lever = int(
+        (
+            await execute(
+                engine,
+                "INSERT INTO source_instances (source_id, instance_key, health, breaker_opened_at, "
+                "half_open_after, last_error_code) "
+                "VALUES ('lever', 'global:acme', 'contract_broken', :o, :h, 'item_array') RETURNING id",
+                o=opened - timedelta(hours=3),
+                h=now + timedelta(hours=1),
+            )
+        ).scalar_one()
     )
     await execute(
         engine,
         "UPDATE source_instances SET health = 'degraded', last_error_code = 'timeout' "
         "WHERE source_id = 'adzuna' AND instance_key = 'default'",
     )
+    await execute(  # not collected on purpose: no attention needed
+        engine,
+        "UPDATE source_instances SET health = 'disabled', last_error_code = 'no_credential' "
+        "WHERE source_id = 'serpapi' AND instance_key = 'default'",
+    )
     ids = {
         s: await scalar(
             engine, "SELECT id FROM source_instances WHERE source_id = :s AND instance_key = 'default'", s=s
         )
-        for s in ("jsearch", "adzuna")
+        for s in ("jsearch", "adzuna", "arbeitnow")
     }
     section = (await attention(logged_in_client))["broken_sources"]
-    assert section["count"] == 3
+    assert section["count"] == 5  # not the disabled instance, not the healthy ones
     # the broken ones first, the newest opened breaker first; then the degraded one
     assert [
         (i["instance_id"], i["source_id"], i["label"], i["health"], i["severity"]) for i in section["items"]
     ] == [
         (ids["jsearch"], "jsearch", "default", "breaker_open", "critical"),
         (board.instance_id, "greenhouse", "acme-board", "not_found", "critical"),
+        (ids["arbeitnow"], "arbeitnow", "default", "auth_failed", "critical"),
+        (lever, "lever", "global:acme", "contract_broken", "critical"),
         (ids["adzuna"], "adzuna", "default", "degraded", "warn"),
     ]
-    first, _, last = section["items"]
+    first, *_, last = section["items"]
     assert (first["last_error_code"], at(first["breaker_opened_at"]), at(first["half_open_after"])) == (
         "http_503",
         opened,
-        now + timedelta(minutes=30),
+        now + timedelta(hours=1),
     )
     assert (last["last_error_code"], last["breaker_opened_at"], last["half_open_after"]) == (
         "timeout",
@@ -702,6 +782,7 @@ async def test_replay_route_expands_a_response_id_and_refuses_both_or_neither(
     (expired_item,) = (
         await execute(engine, "SELECT id FROM raw_items WHERE raw_response_id = :r", r=expired)
     ).scalars()
+    await ended(engine, owner)
 
     # a response id: its rejected items (its pending ones are no replay)
     r = await logged_in_client.post(REPLAY, json={"raw_response_id": rr})

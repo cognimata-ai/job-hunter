@@ -25,7 +25,8 @@ from jobhunter.clock import utcnow
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.transitions import transition
 from jobhunter.dedup import identity
-from jobhunter.errors import FencedOut
+from jobhunter.errors import FencedOut, InvariantViolation
+from jobhunter.graphs.collect.nodes.finalize import _i1
 from jobhunter.observability.attention import needs_attention
 from jobhunter.sources import replay
 from jobhunter.sources.arbeitnow import ArbeitnowAdapter
@@ -139,24 +140,26 @@ async def test_replay_moves_rejected_items_and_resolves_them_under_the_operation
     assert (op.kind, op.status, op.payload) == ("replay_raw_items", "pending", {"raw_item_ids": ids})
     assert op.dedup_key == replay.dedup_key(ids) and op.dedup_key.startswith("replay_raw_items:")
     assert await requested(engine, [*ids, ids[0]]) == operation_id  # the same set: the live operation
-    async with engine.connect() as c:  # its job, deferred once
+    async with engine.connect() as c:  # its job, deferred once, under the replays' execution lock
         jobs = (
             await c.execute(
                 sa.text(
-                    "SELECT count(*) FROM procrastinate_jobs WHERE task_name = :t "
+                    "SELECT lock, queueing_lock FROM procrastinate_jobs WHERE task_name = :t "
                     "AND args @> jsonb_build_object('operation_id', CAST(:o AS bigint))"
                 ),
                 {"t": job_task_name("run_operation"), "o": operation_id},
             )
-        ).scalar_one()
-    assert jobs == 1
+        ).all()
+    assert [tuple(job) for job in jobs] == [("replay", f"op:{operation_id}")]
+    assert operations.OPERATION_LOCKS["replay_raw_items"] == "replay"
 
     await execute(engine, operation_id, current_epoch)
     op = await operation(engine, operation_id)
     assert (op.status, op.attempts, op.progress) == ("succeeded", 0, {"asked": 3, "moved": 3, "resolved": 3})
     assert await item_states(engine, ids) == [("linked", None)] * 3
     assert await linked_jobs(engine, ids) == 3  # three new jobs, each with its posting and observation
-    assert await generation(engine) > before  # each job's insertion bumped the ranking generation
+    # one bump per resolution that inserted a job (`identity._link`, its last statement); step 1 bumps nothing
+    assert await generation(engine) == before + 3
 
 
 async def test_an_active_global_fence_requeues_with_purge_in_progress(
@@ -281,6 +284,99 @@ async def test_a_crash_between_an_item_and_its_progress_loses_no_count(
     await execute(engine, operation_id, current_epoch)
     op = await operation(engine, operation_id)
     assert (op.status, op.progress) == ("succeeded", {"asked": 3, "moved": 3, "resolved": 3})
+
+
+async def test_an_item_of_a_running_run_stays_rejected_and_is_not_moved(
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    arbeitnow_adapter: ArbeitnowAdapter,
+    stored_arbeitnow_page: StoredPage,
+) -> None:
+    owner, rr = stored_arbeitnow_page
+    async with engine.begin() as c:  # parsed by its run, which is still running
+        await parse_response(c, rr, adapter=arbeitnow_adapter, owner=owner)
+    async with engine.connect() as c:
+        pending = [int(i) for i in (await c.execute(PENDING_OF, {"r": rr})).scalars()]
+    ids = pending[:2]
+    await rejected_by_an_old_parser(engine, ids)
+    async with engine.begin() as c:  # the run's resolve node settled the rest: I1 holds
+        for raw_item_id in pending[2:]:
+            await transition(c, "raw_items", raw_item_id, ["pending"], "linked", set_={"normalized": None})
+        assert (await _i1(c, owner.run_id)).ok
+
+    # an operation recorded for them (the route refuses them; another path, or a run that resumed): step 1
+    # moves nothing while the run runs, so its I1 still holds
+    operation_id = await requested(engine, ids)
+    await execute(engine, operation_id, current_epoch)
+    op = await operation(engine, operation_id)
+    assert (op.status, op.progress) == ("succeeded", {"asked": 2, "moved": 0, "resolved": 0})
+    assert await item_states(engine, ids) == [("rejected", "item_contract")] * 2
+    async with engine.connect() as c:
+        assert (await _i1(c, owner.run_id)).ok
+
+    # the run over, a new replay of them moves and resolves them
+    async with engine.begin() as c:
+        await finalize_run(c, owner, status="succeeded", reason=None, report={})
+    operation_id = await requested(engine, ids)
+    await execute(engine, operation_id, current_epoch)
+    op = await operation(engine, operation_id)
+    assert (op.status, op.progress) == ("succeeded", {"asked": 2, "moved": 2, "resolved": 2})
+    assert await item_states(engine, ids) == [("linked", None)] * 2
+
+
+async def test_a_re_execution_moves_nothing_again(
+    engine: AsyncEngine,
+    current_epoch: int,
+    queue_app: procrastinate.App,
+    arbeitnow_adapter: ArbeitnowAdapter,
+    stored_arbeitnow_page: StoredPage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = (await parsed_page(engine, arbeitnow_adapter, stored_arbeitnow_page))[:3]
+    await rejected_by_an_old_parser(engine, ids)
+    operation_id = await requested(engine, ids)
+    first = ids[0]
+    link = identity._link
+    written = operations.set_progress
+    calls: list[int] = []
+
+    async def identity_error_on_the_first(conn: AsyncConnection, owner: Any, item: Any, active: Any) -> Any:
+        if item.raw_item_id == first:
+            raise InvariantViolation(f"raw item {first}: a test's identity error")
+        return await link(conn, owner, item, active)
+
+    async def dies_after_the_first_item(conn: AsyncConnection, claim: Any, progress: Any) -> None:
+        calls.append(1)
+        if len(calls) == 2:
+            raise SimulatedCrash("after the first item")
+        await written(conn, claim, progress)
+
+    # execution 1: step 1 moves the three, step 2 rejects the first (`identity_error`), then dies
+    monkeypatch.setattr(identity, "_link", identity_error_on_the_first)
+    monkeypatch.setattr(replay, "set_progress", dies_after_the_first_item)
+    await execute(engine, operation_id, current_epoch)
+    op = await operation(engine, operation_id)
+    assert (op.status, op.progress) == ("pending", {"asked": 3, "moved": 3, "resolved": 0})
+    assert await item_states(engine, ids) == [
+        ("rejected", "identity_error"),
+        ("pending", None),
+        ("pending", None),
+    ]
+
+    # execution 2: step 1 committed before (its progress has `moved`), so nothing is replayed again; the
+    # first item stays rejected, and `moved` stays within `asked`
+    monkeypatch.setattr(identity, "_link", link)
+    monkeypatch.setattr(replay, "set_progress", written)
+    await make_due(engine)
+    await execute(engine, operation_id, current_epoch)
+    op = await operation(engine, operation_id)
+    assert (op.status, op.progress) == ("succeeded", {"asked": 3, "moved": 3, "resolved": 3})
+    assert await item_states(engine, ids) == [
+        ("rejected", "identity_error"),
+        ("linked", None),
+        ("linked", None),
+    ]
 
 
 async def test_an_expired_body_is_not_replayable(

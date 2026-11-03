@@ -2,13 +2,24 @@
 and 10): the explicit replay `rejected -> pending` of rejected raw items, and the resolution of the items it
 moved, whose run is over.
 
+**Replayable** (M4 Ruling T12-c; one predicate, `RESPONSE_REPLAYABLE_SQL` for a response `r` and
+`ITEM_REPLAYABLE_SQL` for an item `i` of it, at `:since = now - RAW_BODY_TTL`, which the route's selection,
+the handler's step 1 and the `raw_items` section of Needs attention all use): the item is `rejected`, the run
+of its response has ended (`RUN_ENDED`, the statuses the `runs` CHECK gives a `finished_at`), its body is not
+purged and it was fetched at most `RAW_BODY_TTL` ago (`fetched_at >= now - RAW_BODY_TTL`, inclusive, as
+`items.replay_rejected` and retention keep it). A running run's items are not replayable: its
+`resolve_identity` may still list them, and its finalize counts a `pending` one against I1 (§17.2), so a
+replay of them could fail a healthy run or race its resolution. A run's end is final, so a plain read of it
+suffices.
+
 **The request** (`POST /api/system/raw-items/replay`, `api.routes.system`): `items_of_response` expands a
 stored response into its `rejected` items (`LookupError` for a response that does not exist);
-`replayable_items` keeps those of the listed ids that can be replayed at the request's time: `rejected` now,
-their response's body not purged and fetched after `now - RAW_BODY_TTL`, at most `MAX_ITEMS`, lowest ids
-first; `request_replay` records the operation, payload `{"raw_item_ids": [...]}` (the ids deduplicated and
-sorted, 1 to `MAX_ITEMS`), dedup key `replay_raw_items:` + the hex SHA-256 of those ids joined by commas
-(`dedup_key`), so the same set reuses the live operation of that set through `operations_live_dedup`.
+`replayable_items` keeps those of the listed ids that are replayable at the request's time, at most
+`MAX_ITEMS`, lowest ids first; `request_replay` records the operation, payload `{"raw_item_ids": [...]}` (the
+ids deduplicated and sorted, 1 to `MAX_ITEMS`), dedup key `replay_raw_items:` + the hex SHA-256 of those ids
+joined by commas (`dedup_key`), so the same set reuses the live operation of that set through
+`operations_live_dedup`. Replays run one at a time (the `replay` execution lock, `OPERATION_LOCKS`), so two
+operations whose sets overlap never resolve one item at once.
 
 **The handler** (`run_replay`, `@register_operation_handler("replay_raw_items")`):
 
@@ -16,10 +27,13 @@ sorted, 1 to `MAX_ITEMS`), dedup key `replay_raw_items:` + the hex SHA-256 of th
    `fence_epoch` with it (step 1 of the lock schedule), the owner row (`lock_operation_owner`), then the
    global purge fence: while one is active the operation is requeued (`requeue_in`, error code
    `purge_in_progress`, `not_before = now + PURGE_RETRY_AFTER`) and nothing else is written (§20.2: a replay
-   checks the fence itself, `items.replay_rejected` has no owner of its own). Otherwise
-   `items.replay_rejected` over the payload's ids with the planning-time adapters (`spec_adapters`, which
-   parse and never send), then the progress, last. The fault point `replay.after_replay_commit`
-   (`AFTER_REPLAY_COMMIT`) follows the commit.
+   checks the fence itself, `items.replay_rejected` has no owner of its own). Otherwise, when no execution
+   before has committed this step (its stored progress has no `moved`): the payload's ids that are
+   replayable now (`replayable_items`, so an item whose run is running at execution time is not moved), then
+   `items.replay_rejected` over them with the planning-time adapters (`spec_adapters`, which parse and never
+   send), then the progress, last. An execution after one that committed step 1 replays nothing again: an
+   item that step 2 rejected (`identity_error`) is `rejected` once more, and moving it again would count it
+   twice. The fault point `replay.after_replay_commit` (`AFTER_REPLAY_COMMIT`) follows the commit.
 2. Every payload id that is `pending` now is resolved in a transaction of its own by
    `identity.resolve_item(owner=claim)` (`ledger.lock_item_owner`: the operation row, then the global purge
    fence), oldest id first, each followed by its progress in a short transaction of its own (the ranking
@@ -27,17 +41,17 @@ sorted, 1 to `MAX_ITEMS`), dedup key `replay_raw_items:` + the hex SHA-256 of th
    operation as in step 1; an item that no longer exists (retention deleted it) is skipped. The last
    transaction writes the final progress and ends the operation `succeeded`.
 
-A crashed execution (a reclaim or the takeover requeues it) runs again from step 1: `replay_rejected` moves
-nothing it moved before (those items are no longer `rejected`), and step 2 resumes on the ids still
-`pending`. The embedding, the hard filters and the targets of the new jobs follow through their reconcilers
-(`awaiting_embedding`, `hard_filter_completeness`, `missing_targets`), as for a run's.
+A crashed execution (a reclaim or the takeover requeues it) runs again from step 1, which then only fences
+and checks the purge fence, and step 2 resumes on the ids still `pending`. The embedding, the hard filters
+and the targets of the new jobs follow through their reconcilers (`awaiting_embedding`,
+`hard_filter_completeness`, `missing_targets`), as for a run's.
 
 **The progress** (`operations.progress`, which the api polls) is `{"asked", "moved", "resolved"}`: the
-payload's ids, those moved `rejected -> pending`, and those resolved since. `moved` and `resolved` carry
-over from the execution before (read from the row with the epoch), and step 2 starts `resolved` at least at
-`moved` less the ids still `pending`, so a crash between an item's commit and its progress write loses no
-count. An item the current parser still refuses stays `rejected`, and is counted as not moved, never as
-recovered.
+payload's ids, those moved `rejected -> pending`, and those resolved since; `moved` never exceeds `asked`.
+`moved` and `resolved` carry over from the execution before (read from the row with the epoch), and step 2
+starts `resolved` at least at `moved` less the ids still `pending`, so a crash between an item's commit and
+its progress write loses no count. An item the current parser still refuses, or that is not replayable when
+step 1 runs, stays `rejected`, and is counted as not moved, never as recovered.
 
 Ids and counts only reach the payload, the progress and the log lines: never a raw item's content.
 """
@@ -79,6 +93,19 @@ PURGE_RETRY_AFTER: Final = timedelta(minutes=5)
 AFTER_REPLAY_COMMIT: Final = "replay.after_replay_commit"
 # The owner `ledger.lock_item_owner` names for an active global purge fence.
 _PURGE_FENCE: Final = "purge_fence"
+# The ended statuses of a run: those the `runs` CHECK gives a `finished_at` (`succeeded`, `partial`, `failed`,
+# `failed_invariant`, `cancelled`). `queued` and `running` are not; `missed` and `skipped_overlap` never
+# started, so no response is theirs.
+RUN_ENDED: Final = ("succeeded", "partial", "failed", "failed_invariant", "cancelled")
+_RUN_ENDED_SQL: Final = ", ".join(f"'{status}'" for status in RUN_ENDED)  # constants of the code, never input
+# The one predicate of "replayable" (module docstring) for a response `r`, at `:since` (`now - RAW_BODY_TTL`).
+RESPONSE_REPLAYABLE_SQL: Final = (
+    "(r.purged_at IS NULL AND r.fetched_at >= :since AND EXISTS (SELECT 1 FROM fetch_requests rf "  # noqa: S608
+    "JOIN runs ru ON ru.id = rf.run_id WHERE rf.id = r.fetch_request_id "
+    f"AND ru.status IN ({_RUN_ENDED_SQL})))"
+)
+# ... and for an item `i` of `r`.
+ITEM_REPLAYABLE_SQL: Final = f"(i.disposition = 'rejected' AND {RESPONSE_REPLAYABLE_SQL})"
 
 # Whether the response exists, with its `rejected` items (`raw_items (raw_response_id, item_index)`).
 _REJECTED_OF_RESPONSE: Final = q(
@@ -86,9 +113,8 @@ _REJECTED_OF_RESPONSE: Final = q(
     "AND i.disposition = 'rejected' WHERE r.id = :r ORDER BY i.id"
 )
 _REPLAYABLE: Final = q(
-    "SELECT i.id FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "
-    "WHERE i.id = ANY(CAST(:ids AS bigint[])) AND i.disposition = 'rejected' AND r.purged_at IS NULL "
-    "AND r.fetched_at > :since ORDER BY i.id LIMIT :limit"
+    "SELECT i.id FROM raw_items i JOIN raw_responses r ON r.id = i.raw_response_id "  # noqa: S608
+    f"WHERE i.id = ANY(CAST(:ids AS bigint[])) AND {ITEM_REPLAYABLE_SQL} ORDER BY i.id LIMIT :limit"
 )
 _PENDING: Final = q(
     "SELECT id FROM raw_items WHERE id = ANY(CAST(:ids AS bigint[])) AND disposition = 'pending' ORDER BY id"
@@ -124,10 +150,16 @@ async def items_of_response(conn: AsyncConnection, raw_response_id: int) -> list
     return [int(raw_item_id) for raw_item_id in rows if raw_item_id is not None]
 
 
+def replayable_since(now: datetime) -> datetime:
+    """The `:since` of the replayable predicate at `now`: `now - RAW_BODY_TTL` (inclusive)."""
+    return now - RAW_BODY_TTL
+
+
 async def replayable_items(conn: AsyncConnection, raw_item_ids: Sequence[int], *, now: datetime) -> list[int]:
-    """The ids among `raw_item_ids` that can be replayed at `now` (module docstring): `rejected`, their body
-    not purged and fetched after `now - RAW_BODY_TTL`; at most `MAX_ITEMS`, lowest ids first."""
-    params = {"ids": sorted(set(raw_item_ids)), "since": now - RAW_BODY_TTL, "limit": MAX_ITEMS}
+    """The ids among `raw_item_ids` that are replayable at `now` (module docstring, Replayable: `rejected`,
+    their run ended, their body kept and at most `RAW_BODY_TTL` old); at most `MAX_ITEMS`, lowest ids
+    first."""
+    params = {"ids": sorted(set(raw_item_ids)), "since": replayable_since(now), "limit": MAX_ITEMS}
     return [int(raw_item_id) for raw_item_id in (await conn.execute(_REPLAYABLE, params)).scalars()]
 
 
@@ -160,6 +192,11 @@ class _Progress:
 
         return cls(asked, count("moved"), count("resolved"))
 
+    @staticmethod
+    def replayed(stored: Mapping[str, JSONValue]) -> bool:
+        """Whether an earlier execution committed step 1: it writes `moved` with the replay, atomically."""
+        return "moved" in stored
+
     def as_json(self) -> dict[str, JSONValue]:
         return {"asked": self.asked, "moved": self.moved, "resolved": self.resolved}
 
@@ -187,7 +224,13 @@ async def _replay(ctx: OperationContext, ids: Sequence[int], *, now: datetime) -
             await ctx.requeue_in(conn, error_code=PURGE_IN_PROGRESS, not_before=now + PURGE_RETRY_AFTER)
             return None
         progress = _Progress.carried(own.progress, asked=len(ids))
-        progress.moved += await items.replay_rejected(conn, raw_item_ids=ids, now=now, adapters=adapters)
+        if _Progress.replayed(own.progress):
+            return progress  # replayed by an execution before: nothing is moved twice
+        replayable = await replayable_items(conn, ids, now=now)  # a running run's items stay rejected
+        if replayable:
+            progress.moved += await items.replay_rejected(
+                conn, raw_item_ids=replayable, now=now, adapters=adapters
+            )
         await set_progress(conn, claim, progress.as_json())  # the last statement
     return progress
 
