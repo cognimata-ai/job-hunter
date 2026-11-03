@@ -32,12 +32,14 @@ from tests.support.llm import ledger_row, reserve_kw
 from tests.support.m3 import insert_id, insert_row
 from tests.support.profile import idem
 from tests.support.settings import fresh_key
+from tests.support.validation import TITLE
 
 pytestmark = pytest.mark.integration
 
 CASES_URL: Final = "/api/golden-cases"
 JSON: Final = {"content-type": "application/json"}
 SONNET: Final = "claude-sonnet-5-5"
+COMPANY: Final = "Beispiel Logistik GmbH"  # the synthetic ad's (`tests.support.validation.synthetic_ad`)
 
 
 @pytest.fixture
@@ -176,6 +178,8 @@ async def test_the_listing_pages_by_id_with_a_cursor_bound_to_its_filter(
     assert set(item) == {
         "id",
         "job_id",
+        "title",
+        "company",
         "label",
         "comment",
         "profile_version",
@@ -184,12 +188,14 @@ async def test_the_listing_pages_by_id_with_a_cursor_bound_to_its_filter(
         "active",
         "is_canary",
     }
-    assert (item["job_id"], item["source"], item["active"], item["is_canary"]) == (
+    assert (item["job_id"], item["title"], item["company"], item["source"], item["active"]) == (
         made[0].job_id,
+        TITLE,
+        COMPANY,
         "week1",
         True,
-        False,
     )
+    assert item["is_canary"] is False
     second = (
         await logged_in_client.get(CASES_URL, params={"limit": 2, "cursor": first["next_cursor"]})
     ).json()
@@ -204,6 +210,34 @@ async def test_the_listing_pages_by_id_with_a_cursor_bound_to_its_filter(
     assert (r.status_code, r.json()["code"]) == (400, "invalid_cursor")  # another filter's cursor
     r = await logged_in_client.get(CASES_URL, params={"limit": 101})
     assert (r.status_code, r.json()["code"]) == (422, "validation_failed")
+
+
+async def test_a_case_names_the_title_it_was_labelled_on_and_its_company(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine
+) -> None:
+    """The title is the one of the case's revision, whatever the job is called later; a revision without one
+    falls back to the job's title. The company is the job's display name."""
+    renamed, untitled = await insert_cases(engine, 2)
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE jobs SET title = 'Plattform-Ingenieurin', company_display = 'Beispiel Logistik SE' "
+                "WHERE id = ANY(CAST(:jobs AS bigint[]))"
+            ),
+            {"jobs": [renamed.job_id, untitled.job_id]},
+        )
+        await conn.execute(
+            sa.text("UPDATE job_revisions SET llm_input = llm_input - 'title' WHERE id = :r"),
+            {"r": untitled.job_revision_id},
+        )
+    items = (await logged_in_client.get(CASES_URL)).json()["items"]
+    assert [(i["id"], i["title"], i["company"]) for i in items] == [
+        (renamed.id, TITLE, "Beispiel Logistik SE"),
+        (untitled.id, "Plattform-Ingenieurin", "Beispiel Logistik SE"),
+    ]
+    r = await logged_in_client.patch(f"{CASES_URL}/{renamed.id}", json={"active": False})
+    assert r.status_code == 200, r.text
+    assert (r.json()["title"], r.json()["company"]) == (TITLE, "Beispiel Logistik SE")
 
 
 async def test_at_most_two_cases_are_canaries(

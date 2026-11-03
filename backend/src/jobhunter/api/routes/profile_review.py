@@ -39,9 +39,14 @@ rules.
   `extraction_method = 'native_pdf'`) and the draft (`native_pdf := true`); `failed → extracting_profile`
   clears the failure and `content_purged_at`, and the operation is created; → 202.
 - `POST /drafts/{id}/discard` → 204, from `text_review`, `ready` or `failed` (reason `user_discard`).
-- `GET /api/profile` → `{active, versions}` (`ProfileVersionOut`, newest first): the versions the confirm
+- `GET /api/profile` → `{active, versions, open_draft, latest_proposal, estimates}` (`ProfileVersionOut`,
+  newest first), in one read snapshot (`db.snapshot.read_snapshot`): the versions the confirm
   (`api/routes/profile.py`, Task 21) writes, each with its profile, `null` once purged, and `null` with
-  `purged: false` for a stored profile that the current model refuses (FR-3).
+  `purged: false` for a stored profile that the current model refuses (FR-3); the newest draft in an open
+  status (`{id, status}`, `uploaded` to `ready`, or `null`); the newest query proposal of any version (`{id,
+  status, failure_code}`, `failure_code` a failed one's code, `proposals.FAILURE_CODE_SQL`, or `null`); and
+  what one call of each profile node costs under the active model policy (`estimates`,
+  `profile.estimate.node_call_usd`: $0.14 and $0.094 under preset B, §21.3).
 A repeated `Idempotency-Key` returns the stored response (`run_idempotent`); a refused request stores
 nothing. Logs carry ids, codes and counts only; no response holds the raw text or a value that was stripped
 or removed (R14-5).
@@ -74,6 +79,7 @@ from starlette.responses import JSONResponse, Response
 
 from jobhunter.api.deps import get_config, get_data_keys, get_engine, require_session
 from jobhunter.api.errors import FieldError, Problem
+from jobhunter.api.models import DecimalOut
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
@@ -85,6 +91,7 @@ from jobhunter.api_idempotency import (
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.crypto import DecryptError
+from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.sql import q
 from jobhunter.db.transitions import CLEAR_REASON, transition
 from jobhunter.errors import InvariantViolation
@@ -93,6 +100,7 @@ from jobhunter.llm.schemas.profile import ConfirmedProfile
 from jobhunter.observability.logging import get_logger
 from jobhunter.profile import review, upload
 from jobhunter.profile.contacts import Category, Edits, SegmentKind, StripResult, apply_edits
+from jobhunter.profile.estimate import node_call_usd
 from jobhunter.profile.storage import CvStore
 from jobhunter.profile.validate import (
     Issue,
@@ -101,6 +109,8 @@ from jobhunter.profile.validate import (
     validate_profile,
     validate_user_entered,
 )
+from jobhunter.queries import proposals
+from jobhunter.settings.dryrun import active_settings
 from jobhunter.types import json_strings, unstorable
 from jobhunter.worker.tasks import defer_in_tx
 
@@ -191,6 +201,17 @@ _ACTIVE_VERSION = q("SELECT profile_version_id FROM active_config WHERE id = 1")
 _VERSIONS = q(
     "SELECT id, version_no, confirmed_at, purged_at IS NOT NULL AS purged, profile_json "
     "FROM profile_versions WHERE NOT synthetic_eval ORDER BY version_no DESC"
+)
+# The newest draft in an open status (`profile_drafts_one_open` allows one), and the newest proposal with the
+# code of a failed one.
+_OPEN_DRAFT = q(
+    "SELECT id, status FROM profile_drafts "
+    "WHERE status IN ('uploaded', 'extracting_text', 'text_review', 'extracting_profile', 'ready') "
+    "ORDER BY id DESC LIMIT 1"
+)
+_LATEST_PROPOSAL = q(
+    f"SELECT p.id, p.status, {proposals.FAILURE_CODE_SQL} AS failure_code FROM query_proposals p "  # noqa: S608 (constants)
+    "ORDER BY p.id DESC LIMIT 1"
 )
 
 
@@ -322,9 +343,37 @@ class ProfileVersionOut(BaseModel):
     profile: ConfirmedProfile | None
 
 
+class OpenDraftOut(BaseModel):
+    """The draft in progress: uploaded, being extracted, in review or ready to confirm."""
+
+    id: int
+    status: Literal["uploaded", "extracting_text", "text_review", "extracting_profile", "ready"]
+
+
+class LatestProposalOut(BaseModel):
+    """The newest query proposal, of any profile version."""
+
+    id: int
+    status: Literal["running", "ready", "failed", "purged"]
+    failure_code: str | None = Field(
+        description="Why a failed proposal failed: the error code of its newest operation; null in every "
+        "other status"
+    )
+
+
+class NodeEstimatesOut(BaseModel):
+    """What one call of each profile step is expected to cost under the active model policy."""
+
+    extract_profile_usd: DecimalOut = Field(description="Extracting a profile from a CV's text")
+    propose_queries_usd: DecimalOut = Field(description="Proposing search queries for a profile")
+
+
 class ProfileListOut(BaseModel):
     active: ProfileVersionOut | None
     versions: list[ProfileVersionOut]
+    open_draft: OpenDraftOut | None
+    latest_proposal: LatestProposalOut | None
+    estimates: NodeEstimatesOut
 
 
 def _not_found() -> Problem:
@@ -835,10 +884,14 @@ def _version_profile(version_id: int, stored: Any) -> ConfirmedProfile | None:
 
 @router.get("", response_model=ProfileListOut)
 async def get_profile(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> ProfileListOut:
-    """The active profile version and every version, newest first (empty until a draft is confirmed)."""
-    async with engine.connect() as conn:
+    """The active profile version and every version, newest first (empty until a draft is confirmed), the
+    draft in progress, the newest query proposal, and what one call of each profile step costs."""
+    async with read_snapshot(engine) as conn:
         active_id = (await conn.execute(_ACTIVE_VERSION)).scalar_one_or_none()
         rows = (await conn.execute(_VERSIONS)).all()
+        draft = (await conn.execute(_OPEN_DRAFT)).first()
+        proposal = (await conn.execute(_LATEST_PROPOSAL)).first()
+        settings = await active_settings(conn)
     versions = [
         ProfileVersionOut(
             id=row.id,
@@ -849,4 +902,15 @@ async def get_profile(engine: Annotated[AsyncEngine, Depends(get_engine)]) -> Pr
         )
         for row in rows
     ]
-    return ProfileListOut(active=next((v for v in versions if v.id == active_id), None), versions=versions)
+    return ProfileListOut(
+        active=next((v for v in versions if v.id == active_id), None),
+        versions=versions,
+        open_draft=None if draft is None else OpenDraftOut(id=draft.id, status=draft.status),
+        latest_proposal=None
+        if proposal is None
+        else LatestProposalOut(id=proposal.id, status=proposal.status, failure_code=proposal.failure_code),
+        estimates=NodeEstimatesOut(
+            extract_profile_usd=node_call_usd(settings, "extract_profile"),
+            propose_queries_usd=node_call_usd(settings, "propose_queries"),
+        ),
+    )

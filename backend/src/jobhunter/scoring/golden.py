@@ -383,11 +383,14 @@ async def delete_feedback(conn: AsyncConnection, feedback_id: int) -> None:
 
 @dataclass(frozen=True)
 class CaseRow:
-    """A golden case as the API lists it: its job (the revision's), label, comment, profile version number,
-    scope version id, source and flags."""
+    """A golden case as the API lists it: its job (the revision's) with the title the case was labelled on
+    (the revision's own; the job's title for a revision without one) and the job's company, its label,
+    comment, profile version number, scope version id, source and flags."""
 
     id: int
     job_id: int
+    title: str
+    company: str
     label: Label
     comment: str | None
     profile_version: int
@@ -397,10 +400,13 @@ class CaseRow:
     is_canary: bool
 
 
+# A case's revision is retention-exempt and its job is never deleted while the revision exists, so both are
+# always there; the revision's material names the title the case was labelled on (`llm_input ->> 'title'`).
 _CASE_COLUMNS: Final = (
-    "g.id, r.job_id, g.label, g.comment, v.version_no AS profile_version, "
+    "g.id, r.job_id, coalesce(r.llm_input ->> 'title', j.title) AS title, j.company_display AS company, "
+    "g.label, g.comment, v.version_no AS profile_version, "
     "g.scope_version_id AS scope_version, g.source, g.active, g.is_canary "
-    "FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id "
+    "FROM golden_cases g JOIN job_revisions r ON r.id = g.job_revision_id JOIN jobs j ON j.id = r.job_id "
     "JOIN profile_versions v ON v.id = g.profile_version_id"
 )
 _LIST: Final = q(
@@ -430,6 +436,8 @@ def _case(row: Row[Any]) -> CaseRow:
     return CaseRow(
         id=int(row.id),
         job_id=int(row.job_id),
+        title=str(row.title),
+        company=str(row.company),
         label=row.label,
         comment=row.comment,
         profile_version=int(row.profile_version),

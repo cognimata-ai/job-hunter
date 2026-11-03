@@ -27,9 +27,11 @@ active profile version (`active_config`, read without a lock; none, or a purged 
 and stores nothing), then `queries.proposals.request_proposal`, which returns the version's running proposal
 when there is one (a repeat with a new key gets the same id) and otherwise opens one with its
 `propose_queries` operation and job. The call counts against the non-scoring share of the budget (its spend
-owner is that operation, §6.9.1). `GET /api/profile/query-proposals/{id}` → `{status, items}`: `items` is the
-list of kept queries of a `ready` proposal (`{text, lang, target_title, exploration, rationale}` each), `null`
-before and otherwise; an unknown id is 404 `not_found`. A stored item that the current model refuses (a
+owner is that operation, §6.9.1). `GET /api/profile/query-proposals/{id}` → `{status, items, failure_code}`:
+`items` is the list of kept queries of a `ready` proposal (`{text, lang, target_title, exploration,
+rationale}` each), `null` before and otherwise; `failure_code` is a `failed` proposal's code, the
+`last_error_code` of its newest `propose_queries` operation (`proposals.FAILURE_CODE_SQL`), `null` in every
+other status; an unknown id is 404 `not_found`. A stored item that the current model refuses (a
 later release tightened it; final review FR-3) is left out, and neither it nor the validation error is
 quoted.
 
@@ -49,9 +51,12 @@ as `profile_confirm_replayed` (the draft and version ids), a refusal as `profile
 codes and counts.
 
 `GET /api/profile/drafts/{id}/rescore-estimate` → `{targets, est_usd_online, est_usd_batch, month_spend,
-cap}` (§14.2, `profile.estimate.rescore_estimate`): what confirming would re-score and cost under the active
-settings in the current month, read without a lock; an unknown draft, or a synthetic confirmed one of the
-adversarial seed (Carry T19-d), is 404 `not_found`. The figures do not depend on the draft's state.
+cap, bulk_budget_usd, bulk_share, batch_targets, online_targets, online_per_day, next_version_no}` (§14.2,
+§15.7's confirm modal, `profile.estimate.rescore_estimate`): what confirming would re-score and cost under the
+active settings in the current month, how the ads split between one batch and the online pace, and the
+version number a confirm creates, read without a lock on the route's one connection; an unknown draft, or a
+synthetic confirmed one of the adversarial seed (Carry T19-d), is 404 `not_found`. The figures do not depend
+on the draft's state.
 
 `utcnow` is a name of this module, so a test injects the clock by patching
 `jobhunter.api.routes.profile.utcnow`; the confirm takes its `now` from it.
@@ -68,7 +73,7 @@ from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, Header, Path, Request
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import JSONResponse, Response
 from starlette.types import Message
@@ -142,7 +147,10 @@ _ACTIVE_VERSION: Final = q(
     "SELECT a.profile_version_id, v.purged_at IS NOT NULL AS purged FROM active_config a "
     "LEFT JOIN profile_versions v ON v.id = a.profile_version_id WHERE a.id = 1"
 )
-_PROPOSAL: Final = q("SELECT status, items FROM query_proposals WHERE id = :p")
+_PROPOSAL: Final = q(
+    f"SELECT p.status, p.items, {proposals.FAILURE_CODE_SQL} AS failure_code FROM query_proposals p "  # noqa: S608 (constants)
+    "WHERE p.id = :p"
+)
 
 ProposalId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a query proposal")]
 DraftId = Annotated[int, Path(ge=1, le=_BIGINT_MAX, description="The id of a profile draft")]
@@ -179,6 +187,10 @@ class ProposalOut(BaseModel):
 
     status: Literal["running", "ready", "failed", "purged"]
     items: list[ProposedQueryOut] | None
+    failure_code: str | None = Field(
+        description="Why a failed proposal failed (for example `budget_exhausted`, `invalid_output` or "
+        "`refused`): the error code of its newest operation; null in every other status"
+    )
 
 
 class CvTextIn(BaseModel):
@@ -204,14 +216,31 @@ class ConfirmOut(BaseModel):
 
 
 class RescoreEstimateOut(BaseModel):
-    """The re-score preview (§12.6 step 2, §21.4): the retained ads to score again, their cost online and in
-    Batches, the month's counted spend and its cap."""
+    """The re-score preview (§12.6 step 2, §15.7, §21.4): the retained ads to score again, their cost online
+    and in Batches, the month's counted spend and its cap, the batch allocation and how the ads split between
+    one batch and the online pace, and the number of the profile version a confirm creates."""
 
     targets: int
     est_usd_online: DecimalOut
     est_usd_batch: DecimalOut
     month_spend: DecimalOut
     cap: DecimalOut
+    bulk_budget_usd: DecimalOut = Field(
+        description="The batch allocation: `bulk_share` of the month's remaining scoring budget"
+    )
+    bulk_share: DecimalOut = Field(
+        description="The share of the remaining scoring budget a re-score may batch"
+    )
+    batch_targets: int = Field(
+        description="The ads one batch holds within the allocation, each at its worst-case cost plus its "
+        "expected critic follow-ups; 0 when batches are off or fewer than the minimum batch would fit"
+    )
+    online_targets: int = Field(description="The other ads, scored online at the monthly pace")
+    online_per_day: int = Field(
+        description="The monthly pace: the ads a day the budget's hourly accrual scores at the expected cost "
+        "per ad, its share of the cache writes included"
+    )
+    next_version_no: int = Field(description="The number of the profile version a confirm creates")
 
 
 def _native_refused(code: str, message: str) -> Problem:
@@ -473,7 +502,7 @@ async def get_query_proposal(
         items = [item for item in map(_proposed_query, stored) if item is not None]
         if left_out := len(stored) - len(items):
             log.warning("query_proposal_items_left_out", proposal_id=proposal_id, items=left_out)
-    return ProposalOut(status=row.status, items=items)
+    return ProposalOut(status=row.status, items=items, failure_code=row.failure_code)
 
 
 def _proposed_query(stored: Any) -> ProposedQueryOut | None:
@@ -593,4 +622,10 @@ async def get_rescore_estimate(
         est_usd_batch=estimate.est_usd_batch,
         month_spend=estimate.month_spend,
         cap=estimate.cap,
+        bulk_budget_usd=estimate.bulk_budget_usd,
+        bulk_share=estimate.bulk_share,
+        batch_targets=estimate.batch_targets,
+        online_targets=estimate.online_targets,
+        online_per_day=estimate.online_per_day,
+        next_version_no=estimate.next_version_no,
     )

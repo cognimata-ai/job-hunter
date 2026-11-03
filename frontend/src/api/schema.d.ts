@@ -529,7 +529,8 @@ export interface paths {
         };
         /**
          * Get Profile
-         * @description The active profile version and every version, newest first (empty until a draft is confirmed).
+         * @description The active profile version and every version, newest first (empty until a draft is confirmed), the
+         *     draft in progress, the newest query proposal, and what one call of each profile step costs.
          */
         get: operations["get_profile_api_profile_get"];
         put?: never;
@@ -1070,8 +1071,10 @@ export interface paths {
         };
         /**
          * Preview Rubric Activation
-         * @description What activating a shipped rubric version would check and re-score: the eval gate of the candidate,
-         *     its latest golden run and the re-score's estimate, read without writing anything.
+         * @description What activating a shipped rubric version would check and re-score: the verification of the active
+         *     prompt-schema version for the active model policy, which the activation checks (`schema_verified`, and in
+         *     `unverified_models` the models without a passed live schema dry-run), the eval gate of the candidate, its
+         *     latest golden run and the re-score's estimate, read without writing anything.
          */
         get: operations["preview_rubric_activation_api_settings_rubric_versions__version_id__activation_preview_get"];
         put?: never;
@@ -2488,6 +2491,11 @@ export interface components {
             active: boolean;
             /** Comment */
             comment: string | null;
+            /**
+             * Company
+             * @description The job's company, as the job list shows it
+             */
+            company: string;
             /** Id */
             id: number;
             /** Is Canary */
@@ -2508,6 +2516,11 @@ export interface components {
              * @enum {string}
              */
             source: "week1" | "feedback" | "adversarial";
+            /**
+             * Title
+             * @description The title of the ad version the case was labelled on (the job's title when that version names none)
+             */
+            title: string;
         };
         /** GoldenCasesPageOut */
         GoldenCasesPageOut: {
@@ -3067,6 +3080,24 @@ export interface components {
             partial_causes: ("fetch_failed" | "fetch_ambiguous" | "source_breaker_open" | "source_auth_failed" | "source_contract_broken" | "source_not_found" | "awaiting_embedding" | "raw_item_rejected")[];
             run: components["schemas"]["RunOut"];
         };
+        /**
+         * LatestProposalOut
+         * @description The newest query proposal, of any profile version.
+         */
+        LatestProposalOut: {
+            /**
+             * Failure Code
+             * @description Why a failed proposal failed: the error code of its newest operation; null in every other status
+             */
+            failure_code: string | null;
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "ready" | "failed" | "purged";
+        };
         /** LevelDiffOut */
         LevelDiffOut: {
             /** Criterion */
@@ -3115,7 +3146,7 @@ export interface components {
         LlmProjectionOut: {
             /**
              * Arrival Per Month
-             * @description New targets a month: the active tuple's rate of the last 7 days, or 3000 without 7 days of history
+             * @description New targets a month: the active tuple's rate of new targets over the last 7 days, an activation's catch-up of retained ads not counted; 3,000 without 7 days of history, and while the active tuple's latest activation is younger than 7 days
              */
             arrival_per_month: number;
             /** Bucket Capacity */
@@ -3293,6 +3324,22 @@ export interface components {
              */
             model: "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-haiku-5-5" | "claude-fable-5-1";
         };
+        /**
+         * NodeEstimatesOut
+         * @description What one call of each profile step is expected to cost under the active model policy.
+         */
+        NodeEstimatesOut: {
+            /**
+             * Extract Profile Usd
+             * @description Extracting a profile from a CV's text
+             */
+            extract_profile_usd: string;
+            /**
+             * Propose Queries Usd
+             * @description Proposing search queries for a profile
+             */
+            propose_queries_usd: string;
+        };
         /** NotReadyOut */
         NotReadyOut: {
             /** Failing */
@@ -3306,6 +3353,19 @@ export interface components {
              * @enum {string}
              */
             push_min_severity: "warn" | "critical";
+        };
+        /**
+         * OpenDraftOut
+         * @description The draft in progress: uploaded, being extracted, in review or ready to confirm.
+         */
+        OpenDraftOut: {
+            /** Id */
+            id: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "uploaded" | "extracting_text" | "text_review" | "extracting_profile" | "ready";
         };
         /**
          * PaidSearchOut
@@ -3462,6 +3522,9 @@ export interface components {
         /** ProfileListOut */
         ProfileListOut: {
             active: components["schemas"]["ProfileVersionOut"] | null;
+            estimates: components["schemas"]["NodeEstimatesOut"];
+            latest_proposal: components["schemas"]["LatestProposalOut"] | null;
+            open_draft: components["schemas"]["OpenDraftOut"] | null;
             /** Versions */
             versions: components["schemas"]["ProfileVersionOut"][];
         };
@@ -3541,6 +3604,11 @@ export interface components {
          * @description A proposal's status and, once `ready`, its kept queries; `items` is `null` in every other status.
          */
         ProposalOut: {
+            /**
+             * Failure Code
+             * @description Why a failed proposal failed (for example `budget_exhausted`, `invalid_output` or `refused`): the error code of its newest operation; null in every other status
+             */
+            failure_code: string | null;
             /** Items */
             items: components["schemas"]["ProposedQueryOut"][] | null;
             /**
@@ -3982,10 +4050,26 @@ export interface components {
         };
         /**
          * RescoreEstimateOut
-         * @description The re-score preview (§12.6 step 2, §21.4): the retained ads to score again, their cost online and in
-         *     Batches, the month's counted spend and its cap.
+         * @description The re-score preview (§12.6 step 2, §15.7, §21.4): the retained ads to score again, their cost online
+         *     and in Batches, the month's counted spend and its cap, the batch allocation and how the ads split between
+         *     one batch and the online pace, and the number of the profile version a confirm creates.
          */
         RescoreEstimateOut: {
+            /**
+             * Batch Targets
+             * @description The ads one batch holds within the allocation, each at its worst-case cost plus its expected critic follow-ups; 0 when batches are off or fewer than the minimum batch would fit
+             */
+            batch_targets: number;
+            /**
+             * Bulk Budget Usd
+             * @description The batch allocation: `bulk_share` of the month's remaining scoring budget
+             */
+            bulk_budget_usd: string;
+            /**
+             * Bulk Share
+             * @description The share of the remaining scoring budget a re-score may batch
+             */
+            bulk_share: string;
             /** Cap */
             cap: string;
             /** Est Usd Batch */
@@ -3994,6 +4078,21 @@ export interface components {
             est_usd_online: string;
             /** Month Spend */
             month_spend: string;
+            /**
+             * Next Version No
+             * @description The number of the profile version a confirm creates
+             */
+            next_version_no: number;
+            /**
+             * Online Per Day
+             * @description The monthly pace: the ads a day the budget's hourly accrual scores at the expected cost per ad, its share of the cache writes included
+             */
+            online_per_day: number;
+            /**
+             * Online Targets
+             * @description The other ads, scored online at the monthly pace
+             */
+            online_targets: number;
             /** Targets */
             targets: number;
         };

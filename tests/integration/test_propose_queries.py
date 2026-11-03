@@ -215,7 +215,7 @@ async def test_an_unknown_proposal_is_not_found(logged_in_client) -> None:
 async def test_a_confirmed_profiles_proposal_reaches_ready(engine, op_runner, logged_in_client) -> None:
     version_id, proposal_id, op_id = await proposed(engine, logged_in_client)
     running = await logged_in_client.get(f"{URL}/{proposal_id}")
-    assert running.json() == {"status": "running", "items": None}
+    assert running.json() == {"status": "running", "items": None, "failure_code": None}
     async with engine.connect() as conn:  # the activation's own operation (M3 Task 14) runs first
         creation = (
             await conn.execute(sa.text("SELECT id FROM operations WHERE kind = 'create_targets_for_tuple'"))
@@ -237,7 +237,7 @@ async def test_a_confirmed_profiles_proposal_reaches_ready(engine, op_runner, lo
     assert (call.input_tokens, call.output_tokens) == (QUERIES_USAGE["input_tokens"], 700)
     assert served() == 1
     r = await logged_in_client.get(f"{URL}/{proposal_id}")
-    assert (r.status_code, r.json()) == (200, {"status": "ready", "items": QUERIES})
+    assert (r.status_code, r.json()) == (200, {"status": "ready", "items": QUERIES, "failure_code": None})
     assert await state_of(op_runner, proposal_id, op_id, 0) == {
         "proposal_id": proposal_id,
         "operation_id": op_id,
@@ -338,7 +338,7 @@ async def test_a_second_invalid_set_fails_the_proposal(engine, op_runner, logged
     assert served() == 2  # one repair, never a third call
     assert [r.logical_call_no for r in await tries(engine)] == [1, 2]
     r = await logged_in_client.get(f"{URL}/{proposal_id}")
-    assert r.json() == {"status": "failed", "items": None}
+    assert r.json() == {"status": "failed", "items": None, "failure_code": "invalid_output"}
 
 
 async def test_a_structural_failure_is_repaired_once(engine, op_runner, logged_in_client) -> None:

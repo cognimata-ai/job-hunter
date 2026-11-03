@@ -11,9 +11,10 @@ Deviation 21, Carry T19-d): thin routes over `scoring.golden`, each one transact
 - `GET /api/golden-cases?cursor&limit&active` → `{items, next_cursor}`: the cases by id ascending,
   keyset-paged with §14.3's signed cursor (`api.pagination`: sort `golden_cases.id`, `asc`,
   `last_key = [id]`, the filters `{"active": …}` when given), limit 1 to 100 (default 50); a cursor this list
-  did not sign for these filters is 400 `invalid_cursor`. Each item `{id, job_id, label, comment,
-  profile_version, scope_version, source, active, is_canary}` (`golden.CaseRow`; `profile_version` the
-  version's number).
+  did not sign for these filters is 400 `invalid_cursor`. Each item `{id, job_id, title, company, label,
+  comment, profile_version, scope_version, source, active, is_canary}` (`golden.CaseRow`; `title` the case's
+  revision's, the job's for a revision without one, `company` the job's `company_display`, both joined in the
+  list's one statement; `profile_version` the version's number).
 - `PATCH /api/golden-cases/{id}` (`{active?, is_canary?}`) → 200 the case (`golden.set_flags`): a third
   canary is 422 `validation_failed` (L4632), an unknown case 404.
 - `DELETE /api/golden-cases/{id}` → 204 (`golden.delete_case_unless_running`, cascading to its eval rows; the
@@ -29,7 +30,7 @@ a test injects the clock by patching `jobhunter.api.routes.golden.utcnow`.
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Path, Query
-from pydantic import AfterValidator, BaseModel, ConfigDict, StringConstraints
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.responses import Response
 
@@ -75,6 +76,11 @@ class GoldenCaseOut(BaseModel):
 
     id: int
     job_id: int
+    title: str = Field(
+        description="The title of the ad version the case was labelled on (the job's title when that version "
+        "names none)"
+    )
+    company: str = Field(description="The job's company, as the job list shows it")
     label: Label
     comment: str | None
     profile_version: int
@@ -88,6 +94,8 @@ class GoldenCaseOut(BaseModel):
         return cls(
             id=case.id,
             job_id=case.job_id,
+            title=case.title,
+            company=case.company,
             label=case.label,
             comment=case.comment,
             profile_version=case.profile_version,

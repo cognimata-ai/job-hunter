@@ -285,8 +285,9 @@ class LlmProjectionOut(BaseModel):
     projected_critic_rate: DecimalOut
     targets_per_month: int
     arrival_per_month: int = Field(
-        description="New targets a month: the active tuple's rate of the last 7 days, or 3000 without 7 "
-        "days of history"
+        description="New targets a month: the active tuple's rate of new targets over the last 7 days, an "
+        "activation's catch-up of retained ads not counted; 3,000 without 7 days of history, and while the "
+        "active tuple's latest activation is younger than 7 days"
     )
     projected_month_spend: DecimalOut
     month: date
@@ -717,8 +718,10 @@ async def _preview(kind: ShippedKind, version_id: int, engine: AsyncEngine) -> A
 async def preview_rubric_activation(
     version_id: ShippedVersionId, engine: Annotated[AsyncEngine, Depends(get_engine)]
 ) -> ActivationPreviewOut:
-    """What activating a shipped rubric version would check and re-score: the eval gate of the candidate,
-    its latest golden run and the re-score's estimate, read without writing anything."""
+    """What activating a shipped rubric version would check and re-score: the verification of the active
+    prompt-schema version for the active model policy, which the activation checks (`schema_verified`, and in
+    `unverified_models` the models without a passed live schema dry-run), the eval gate of the candidate, its
+    latest golden run and the re-score's estimate, read without writing anything."""
     return await _preview("rubric", version_id, engine)
 
 
