@@ -2,7 +2,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from jobhunter.quota.dryrun import Warning, quota_projections
+from jobhunter.quota.dryrun import RunNowUnits, Warning, per_run, quota_projections, run_now_units
 from jobhunter.quota.windows import AccountObservation, Provider, Window, bootstrap_window
 from jobhunter.settings.model import Schedule
 
@@ -181,3 +181,29 @@ def test_no_adzuna_allowance_is_a_cadence_of_never() -> None:
         "cells": 4,
     }
     assert [(w.code, w.detail) for w in warns] == [("adzuna_rotation", {"cadence_days": None})]
+
+
+def test_run_now_units_are_the_even_pace_of_the_admitting_windows() -> None:
+    settings = seeded_run_settings()
+    jsearch = boot("jsearch")  # no stored window: the one its first run would bootstrap counts
+    serpapi = boot("serpapi", account=account(NOW, NOW + timedelta(days=12)))
+    assert jsearch.state == "extrapolated_unvalidated" and serpapi.state == "validated"
+    # min(per-run cap, fair share), rounded up: JSearch 180 units x 6 h / 2,675,242 s = 1.453; SerpApi 225
+    # units x 6 h over its 31-day month = 1.815
+    assert (per_run(settings, jsearch).units, per_run(settings, serpapi).units) == pytest.approx(
+        (1.4533, 1.8145), abs=1e-4
+    )
+    windows: dict[Provider, Window | None] = {
+        "jsearch": jsearch,
+        "serpapi": serpapi,
+        "adzuna": boot("adzuna"),
+    }
+    assert run_now_units(settings, windows) == RunNowUnits(jsearch_units=2, serpapi_fallback_units=2)
+    # SerpApi without a window, or with one not validated yet, admits no search: no fallback units; an
+    # unvalidated JSearch window still counts (its first request is a probe)
+    assert run_now_units(settings, {**windows, "serpapi": None}).serpapi_fallback_units == 0
+    unvalidated = replace(serpapi, state="extrapolated_unvalidated")
+    assert run_now_units(settings, {**windows, "serpapi": unvalidated}) == RunNowUnits(2, 0)
+    # a provider the settings disable spends nothing
+    off = replace(settings, sources=replace(settings.sources, jsearch=False, serpapi=False))
+    assert run_now_units(off, windows) == RunNowUnits(jsearch_units=0, serpapi_fallback_units=0)

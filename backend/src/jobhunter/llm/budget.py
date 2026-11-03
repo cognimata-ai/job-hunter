@@ -140,9 +140,15 @@ def reserve_frac(p: BudgetParams) -> Decimal:
     return Decimal(p.nonscoring_reserve_pct) / 100
 
 
+def scoring_share(p: BudgetParams) -> Decimal:
+    """`A x (1 - reserve_frac)`: the month's share of `A` that scoring may spend at an even pace, $93.10 with
+    the defaults (the bucket's rate over the month, and the header status's pace line)."""
+    return admissible(p) * (1 - reserve_frac(p))
+
+
 def rate_per_s(p: BudgetParams, month: date) -> Decimal:
     """The bucket's accrual in USD per second: the scoring share of `A` spread over the month."""
-    return admissible(p) * (1 - reserve_frac(p)) / month_length_s(month)
+    return scoring_share(p) / month_length_s(month)
 
 
 def bucket_capacity(p: BudgetParams, month: date) -> Decimal:

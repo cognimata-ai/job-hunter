@@ -1,11 +1,12 @@
 """M4 schema: the list indexes of the unscored section and of the posted sort, the index of the merge events
-from a job, the radius functions, and the `replay_raw_items` operation kind.
+from a job, the indexes of the header status's freshness and scope reads, the radius functions, and the
+`replay_raw_items` operation kind.
 
 Revision ID: 0009_m4_ui
 Revises: 0008_m3_scoring
 
-Staged by docs/superpowers/plans/2026-11-02-m4-api-and-web-ui.md (Task 2; Task 6 added T6), as static SQL,
-one `op.execute` per statement:
+Staged by docs/superpowers/plans/2026-11-02-m4-api-and-web-ui.md (Task 2; Task 6 added T6, Task 11 the two
+T11 indexes, Ruling T11-d), as static SQL, one `op.execute` per statement:
 
   B1  score_targets_unscored_rank: the unscored section of the Jobs list (§14.3) walks a tuple's targets,
       but for the published, the deferred duplicates and the cancelled, by similarity (NULLS LAST), then job
@@ -14,6 +15,14 @@ one `op.execute` per statement:
       `availability`, so it serves only a list filtered to one availability;
   T6  merge_events_from_job: the drawer's merge events from a job (Task 6, Ruling T6-e). M1 indexes only
       `into_job_id` (merge_events_into), so the events a job was merged in by would scan the table;
+  T11 runs_last_success: the latest `finished_at` of a `succeeded` or `partial` run, and of a `succeeded` one
+      (`status` included, so that maximum is index-only too), which the freshness rule reads
+      (`observability.health.read_run_freshness`: the header status every 60 s, the system health and the
+      `stale_data` reconciler). Without it both maxima scan `runs`;
+  T11 operations_dedup_newest: the newest operation of a dedup key, by id, whatever its status: the newest
+      ended apply of a scope (`settings.scope_apply.scope_applied`, every header status poll) and the newest
+      apply of the pending scope (its `scope_apply_failed` reconciler). `operations_live_dedup` covers the
+      live operations only, so both would scan `operations`;
   B5  geo_km(lat1, lon1, lat2, lon2): the haversine distance in km on the sphere of radius 6371.0088 km, the
       formula of `geo.gazetteer.distance_km` term by term, `asin(least(1, sqrt(a)))` included; and
       job_within_km(locations, lat, lon, radius_km): true when a candidate of a `unique` or `ambiguous` entry
@@ -32,7 +41,7 @@ one `op.execute` per statement:
       0001_m0_baseline.py, so the downgrade restores the CHECK as 0001 wrote it.
 
 No view changes and no INSERT. Unlike the earlier migrations, 0009 has an exact downgrade: it drops the
-functions and the three indexes and restores 0001's CHECK. A database that holds a `replay_raw_items`
+functions and the five indexes and restores 0001's CHECK. A database that holds a `replay_raw_items`
 operation refuses that CHECK (23514) and stays at 0009: the downgrade never deletes an operation.
 """
 
@@ -65,6 +74,13 @@ CREATE INDEX jobs_list_posted_any ON jobs (posted_at_effective DESC NULLS LAST, 
     op.execute("""\
 -- T6: the merge events from a job (the drawer's; merge_events_into serves those into it)
 CREATE INDEX merge_events_from_job ON merge_events (from_job_id);""")
+    op.execute("""\
+-- T11: the freshness rule's latest successful finishes; `status` included: the `succeeded` max is index-only
+CREATE INDEX runs_last_success ON runs (finished_at) INCLUDE (status)
+  WHERE status IN ('succeeded','partial');""")
+    op.execute("""\
+-- T11: the newest operation of a dedup key, any status (operations_live_dedup has the live ones only)
+CREATE INDEX operations_dedup_newest ON operations (kind, dedup_key, id);""")
     op.execute("""\
 -- B5: geo.gazetteer.distance_km, the haversine on the sphere of radius 6371.0088 km
 CREATE FUNCTION geo_km(lat1 float8, lon1 float8, lat2 float8, lon2 float8) RETURNS float8
@@ -106,6 +122,8 @@ def downgrade() -> None:
     )
     op.execute("DROP FUNCTION job_within_km(jsonb, float8, float8, float8);")
     op.execute("DROP FUNCTION geo_km(float8, float8, float8, float8);")
+    op.execute("DROP INDEX operations_dedup_newest;")
+    op.execute("DROP INDEX runs_last_success;")
     op.execute("DROP INDEX merge_events_from_job;")
     op.execute("DROP INDEX jobs_list_posted_any;")
     op.execute("DROP INDEX score_targets_unscored_rank;")

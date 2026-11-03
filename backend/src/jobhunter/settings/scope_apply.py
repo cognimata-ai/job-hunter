@@ -184,12 +184,13 @@ _INCOMPLETE: Final = q(
 _ANY_LIVE: Final = q(
     "SELECT id FROM operations WHERE kind = :kind AND status IN ('pending', 'running') ORDER BY id LIMIT 1"
 )
-# The newest operation of a dedup key, live or ended (`operations_live_dedup` covers the live ones only).
+# The newest operation of a dedup key, live or ended (`operations_dedup_newest`, backwards; the partial
+# `operations_live_dedup` covers the live ones only).
 _NEWEST: Final = q(
     "SELECT id, status FROM operations WHERE kind = :kind AND dedup_key = :key ORDER BY id DESC LIMIT 1"
 )
 # `scope_applied`'s reads: the pointers with the active document and the active scope's hash, then the end of
-# the newest apply of a scope that ended `succeeded` or `failed`.
+# the newest apply of a scope that ended `succeeded` or `failed` (`operations_dedup_newest`, backwards).
 _APPLIED_POINTERS: Final = q(
     "SELECT a.pending_scope_version_id, a.scope_version_id, a.profile_version_id, v.payload, s.scope_hash "
     "FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "

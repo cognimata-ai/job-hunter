@@ -3027,7 +3027,7 @@ export interface components {
         };
         /**
          * RunNowUnitsOut
-         * @description What a run with paid sources may spend, in whole units: an upper estimate.
+         * @description What a run with paid sources may spend, in whole units: an estimate (the even pace).
          */
         RunNowUnitsOut: {
             /** Jsearch Units */

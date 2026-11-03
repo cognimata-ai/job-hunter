@@ -1,6 +1,8 @@
 """The header strip's composite (spec §15.1; plan M4 Task 11, D4-D6, D11, D13-D16): `GET
 /api/system/status`, which every open page polls every 60 s, so every read is an indexed lookup or a bounded
-count, and every banner is computed here, never in the client.
+count, and every banner is computed here, never in the client. The two reads that would otherwise grow with
+history have their indexes in 0009 (Ruling T11-d): the freshness rule's maxima (`runs_last_success`) and the
+newest ended apply of the active scope (`operations_dedup_newest`).
 
 `system_status(conn, *, now, fake_llm)` reads on the caller's connection, which the route opens as one read
 snapshot (`db.snapshot.read_snapshot`): plain reads, no lock, no readiness probe (the embedder is never asked)
@@ -10,8 +12,13 @@ and no table sizes (D5). What each field reads:
   (`lists.partial_causes`, the run detail's own extractor).
 - `active_run_id`: the collection `queued` or `running` (`runs_one_active_collect`).
 - `next_slots`: the next 3 slots of `schedule_state` after `now` (`next_slots`), none while it is disabled.
-- `quota`: each provider's current window as `health.quota_health` reads it: the counted usage, the limit,
-  the reset (the window's end) and the state.
+- `quota`: each provider's window at `now` (Ruling T11-c): `quota.dryrun.live_windows`, the stored current
+  window rolled forward in memory as a run would roll it, computed once and judged alike by `quota`,
+  `paid_search` and `run_now`. A stored window that has ended is replaced by its successor, which starts
+  unspent, so a past reset never pauses paid search; a provider without a stored window shows the window
+  its first reservation would bootstrap (JSearch and Adzuna; SerpApi has none before an account read).
+  Each shows its counted usage in the ledger (`ledger.used_units` of the window shown), its limit, its reset
+  (the window's end) and its state.
 - `llm`: `null` when nothing is seeded (`health.active_budget_params`); otherwise the month's counted spend
   and cap (`health.LlmSpendOut` of the month row `spend_ledger.read_month_or_new` gives, as `llm_spend`
   builds it) and the `pace` of the scoring lane's counted spend against the scoring share `A x (1 -
@@ -23,10 +30,13 @@ and no table sizes (D5). What each field reads:
   targets and `done` those no longer `pending`, `budget_deferred`, `in_progress` or `in_batch`
   (`score_targets_bulk`), `creating` while its `create_targets_for_tuple` operation is `pending` or
   `running` (`bulk.creation_live`); `null` without one.
-- `paid_search` (D14): `paid_search` over the JSearch and SerpApi windows, the settings' SerpApi switch and
-  the health of SerpApi's default instance as the run's planner judges it (`breaker.instance_availability`:
-  healthy unless `blocked`, so a breaker past its half-open time, which admits a probe, is healthy).
-- `run_now` (D16): `quota.dryrun.run_now_units` with the active run settings.
+- `paid_search` (D14): `paid_search` over the JSearch and SerpApi windows at `now`, the settings' SerpApi
+  switch and the health of SerpApi's default instance as the run's planner judges it
+  (`breaker.instance_availability`: healthy unless `blocked`, so a breaker past its half-open time, which
+  admits a probe, is healthy).
+- `run_now` (D16): `quota.dryrun.run_now_units` with the active run settings on those windows: an estimate
+  (the even pace), 0 for a disabled provider and for SerpApi without a validated window; JSearch without a
+  stored window shows the units of the window its first run would bootstrap.
 - `scope` (D11): the pending scope, the progress of its live `apply_scope` operation (`null` without a live
   one; a count it has not reported yet is 0), and `scope_apply.scope_applied`.
 - `banners`: `compute_banners` over the facts above and the score lane's pause reason
@@ -77,17 +87,18 @@ from jobhunter.llm import budget, bulk
 from jobhunter.llm.spend_ledger import read_month_or_new
 from jobhunter.observability import lists
 from jobhunter.observability.health import (
-    RUN_COLUMNS,
+    LAST_RUN,
+    QUOTA_PROVIDERS,
     LlmSpendOut,
     QuotaOut,
     RunAgeState,
     RunOut,
     active_budget_params,
-    quota_health,
     read_run_freshness,
     run_age_state,
 )
-from jobhunter.quota.dryrun import run_now_units
+from jobhunter.quota.dryrun import live_windows, run_now_units
+from jobhunter.quota.ledger import used_units
 from jobhunter.quota.windows import Provider, WindowState
 from jobhunter.run_settings import load_run_settings
 from jobhunter.scoring import cycles
@@ -117,11 +128,6 @@ _MICROSECOND: Final = timedelta(microseconds=1)
 # The target states that keep a target of a bulk operation unscored (the unscored bucket).
 _UNSCORED_STATES: Final = ("pending", "budget_deferred", "in_progress", "in_batch")
 
-# `runs_recent` serves it; `report` for the partial causes.
-_LAST_RUN: Final = q(
-    f"/* status.last_run */ SELECT {RUN_COLUMNS}, report FROM runs "  # noqa: S608 (constants)
-    "ORDER BY queued_at DESC, id DESC LIMIT 1"
-)
 # `runs_one_active_collect` allows one.
 _ACTIVE_RUN: Final = q(
     "/* status.active_run */ SELECT id FROM runs WHERE kind = 'collect' AND status IN ('queued', 'running')"
@@ -222,7 +228,7 @@ class PaidSearchOut(BaseModel):
 
 
 class RunNowUnitsOut(BaseModel):
-    """What a run with paid sources may spend, in whole units: an upper estimate."""
+    """What a run with paid sources may spend, in whole units: an estimate (the even pace)."""
 
     jsearch_units: int
     serpapi_fallback_units: int
@@ -427,7 +433,7 @@ async def _serpapi_healthy(conn: AsyncConnection, now: datetime) -> bool:
 
 
 async def _last_run(conn: AsyncConnection, now: datetime) -> LastRunOut | None:
-    row = (await conn.execute(_LAST_RUN)).first()
+    row = (await conn.execute(LAST_RUN)).first()
     if row is None:
         return None
     run = RunOut.of(row)
@@ -442,7 +448,6 @@ async def system_status(conn: AsyncConnection, *, now: datetime, fake_llm: bool)
     """The header strip at `now` (the caller's clock), read on `conn` without a lock; `fake_llm` is the
     process's LLM mode, which the score lane's pause guard reads (module docstring)."""
     schedule = (await conn.execute(_SCHEDULE)).one()
-    quota = await quota_health(conn)
     p = await active_budget_params(conn)
     config = None if p is None else await cycles.scoring_config(conn, lock=False)
     llm = None
@@ -451,8 +456,7 @@ async def system_status(conn: AsyncConnection, *, now: datetime, fake_llm: bool)
     if config is not None and p is not None:  # seeded
         row = await read_month_or_new(conn, budget.month_of(now), p, now=now)
         spend = LlmSpendOut.of(row, p)
-        rp = budget.row_params(row, p)
-        share = budget.admissible(rp) * (1 - budget.reserve_frac(rp))
+        share = budget.scoring_share(budget.row_params(row, p))
         llm = HeaderLlmOut(
             counted=spend.counted,
             cap=spend.cap,
@@ -460,14 +464,21 @@ async def system_status(conn: AsyncConnection, *, now: datetime, fake_llm: bool)
         )
         pause = await cycles.pause_reason(conn, fake_llm=fake_llm, now=now, config=config)
         run = await load_run_settings(conn, config.active.settings_version_id)
-    serpapi_enabled = run is not None and run.sources.serpapi
+    # One view of each window at `now`, rolled forward once, for the quota block, the pause and run now.
+    windows = {} if run is None else await live_windows(conn, run, now)
+    quota: dict[Provider, QuotaOut | None] = {}
+    for provider in QUOTA_PROVIDERS:
+        w = windows.get(provider)
+        quota[provider] = (
+            None if w is None else QuotaOut.of(w, await used_units(conn, provider, w.window_start))
+        )
     paid = paid_search(
         quota["jsearch"],
         quota["serpapi"],
-        serpapi_enabled=serpapi_enabled,
+        serpapi_enabled=run is not None and run.sources.serpapi,
         serpapi_healthy=await _serpapi_healthy(conn, now),
     )
-    units = None if run is None else await run_now_units(conn, run, now)
+    units = None if run is None else run_now_units(run, windows)
     alerts = (await conn.execute(_UNACKED_ALERTS)).one()
     unacked = UnackedAlertsOut(critical_unacked=int(alerts.critical), total_unacked=int(alerts.total))
     rescore = await _rescore(conn)

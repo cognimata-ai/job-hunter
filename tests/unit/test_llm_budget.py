@@ -8,7 +8,15 @@ from importlib import resources
 import pytest
 from jobhunter.errors import FencedOut
 from jobhunter.llm import bounds, budget
-from jobhunter.llm.budget import BudgetParams, admissible, admits, bucket_capacity, month_of, rate_per_s
+from jobhunter.llm.budget import (
+    BudgetParams,
+    admissible,
+    admits,
+    bucket_capacity,
+    month_of,
+    rate_per_s,
+    scoring_share,
+)
 from jobhunter.llm.errors import (
     BudgetExhausted,
     ClaimLost,
@@ -59,6 +67,8 @@ def budget_row():
 
 def test_defaults_give_the_spec_shares() -> None:
     assert admissible(P) == Decimal("98.00")
+    assert scoring_share(P) == Decimal("93.1000")  # 98 x (1 - 0.05); the rate spreads it over the month
+    assert rate_per_s(P, OCT) == scoring_share(P) / (31 * 86400)
     # 93.10 / (31 d x 24 h); §6.9.2 quotes ≈ 0.127 for a 30.5-day month
     assert round(rate_per_s(P, OCT) * 3600, 3) == Decimal("0.125")
     # 2 x rate x 6 h; ≈ 1.53 in §6.9.2's 30.5-day month

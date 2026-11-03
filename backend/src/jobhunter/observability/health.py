@@ -74,7 +74,7 @@ from jobhunter.observability.alerts import refresh_alert_gauge
 from jobhunter.observability.logging import get_logger
 from jobhunter.observability.metrics import refresh_table_bytes
 from jobhunter.quota.ledger import used_units
-from jobhunter.quota.windows import Provider, WindowState, current_snapshot
+from jobhunter.quota.windows import Provider, Window, WindowState, current_snapshot
 from jobhunter.scoring import batches, cycles
 from jobhunter.scoring.cycles import PauseReason
 from jobhunter.worker.tasks import QUEUES
@@ -241,6 +241,8 @@ DISK_PATH: Final = "/"
 # The job statuses every known queue reports, 0 included; any other status is reported when it has jobs.
 DEPTH_STATUSES: Final = ("todo", "doing")
 
+# `runs_last_success` serves both maxima (index-only, backwards), so the header status's 60 s poll, the system
+# health and the `stale_data` reconciler never scan `runs`.
 _RUN_FRESHNESS: Final = q(
     "SELECT EXISTS (SELECT 1 FROM runs) AS any_run, "
     "(SELECT max(finished_at) FROM runs WHERE status IN ('succeeded', 'partial')) AS last_success_at, "
@@ -304,8 +306,11 @@ class RunOut(BaseModel):
 # The `runs` columns a `RunOut` is built from, `status_reason` included (D5): every select of one names them,
 # except those that fill a `worker.runs.RunRow`, whose required `status_reason` `RunOut` validates too.
 RUN_COLUMNS: Final = ", ".join(RunOut.model_fields)
+# The newest run, with its report (the header status reads its partial causes; a `RunOut` ignores it):
 # `runs_recent` serves it.
-_LAST_RUN: Final = q(f"SELECT {RUN_COLUMNS} FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1")  # noqa: S608
+LAST_RUN: Final = q(
+    f"SELECT {RUN_COLUMNS}, report FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1"  # noqa: S608
+)
 
 
 class ReadyState(BaseModel):
@@ -360,6 +365,19 @@ class QuotaOut(BaseModel):
     def _in_utc(cls, value: datetime) -> datetime:
         return value.astimezone(UTC)
 
+    @classmethod
+    def of(cls, w: Window, used: int) -> "QuotaOut":
+        """The view of window `w` with its counted usage `used`."""
+        return cls(
+            window_start=w.window_start,
+            window_end=w.window_end,
+            state=w.state,
+            limit_units=w.limit_units,
+            used_units=used,
+            remaining_units=max(0, w.limit_units - used),
+            tokens=float(w.tokens),
+        )
+
 
 QUOTA_PROVIDERS: Final[tuple[Provider, ...]] = ("jsearch", "serpapi", "adzuna")
 
@@ -369,18 +387,8 @@ async def quota_health(conn: AsyncConnection) -> dict[Provider, QuotaOut | None]
     out: dict[Provider, QuotaOut | None] = {}
     for provider in QUOTA_PROVIDERS:
         w = await current_snapshot(conn, provider)
-        if w is None:
-            out[provider] = None
-            continue
-        used = await used_units(conn, provider, w.window_start)
-        out[provider] = QuotaOut(
-            window_start=w.window_start,
-            window_end=w.window_end,
-            state=w.state,
-            limit_units=w.limit_units,
-            used_units=used,
-            remaining_units=max(0, w.limit_units - used),
-            tokens=float(w.tokens),
+        out[provider] = (
+            None if w is None else QuotaOut.of(w, await used_units(conn, provider, w.window_start))
         )
     return out
 
@@ -576,7 +584,7 @@ async def system_health(
     (readiness probes on a connection of its own), and the embedder is asked once, by that check. Read-only,
     apart from the gauges it refreshes: `ALERTS_OPEN` and `TABLE_BYTES`.
     """
-    last = (await conn.execute(_LAST_RUN)).first()
+    last = (await conn.execute(LAST_RUN)).first()
     freshness = await read_run_freshness(conn)
     alerts = await refresh_alert_gauge(conn)
     disk = shutil.disk_usage(DISK_PATH)

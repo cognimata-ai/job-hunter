@@ -12,7 +12,6 @@ unless a test switches the mode off. Every datum is invented.
 import dataclasses
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
@@ -27,7 +26,7 @@ from jobhunter.clock import utcnow
 from jobhunter.llm.budget import month_of
 from jobhunter.llm.spend_ledger import current_params, ensure_month
 from jobhunter.observability.alerts import raise_alert
-from jobhunter.quota.windows import bootstrap_window
+from jobhunter.quota.windows import NOMINAL_PERIOD, bootstrap_window
 from jobhunter.settings.derive import active_profile, derived, ensure_derived
 from jobhunter.settings.model import Settings
 from jobhunter.types import JSONValue
@@ -38,7 +37,7 @@ from tests.support.collect import free_cell, instance_id
 from tests.support.embedder import FakeEmbedder
 from tests.support.fixtures import ConfigFactory
 from tests.support.pg import FAKE_LLM_DIR
-from tests.support.quota import SETTINGS, SIX_H, insert_window
+from tests.support.quota import SETTINGS, SIX_H, insert_ledger_entry, insert_window
 from tests.support.scoring import activate_score_tuple
 
 pytestmark = pytest.mark.integration
@@ -46,6 +45,16 @@ pytestmark = pytest.mark.integration
 URL: Final = "/api/system/status"
 SYSTEM_UTCNOW: Final = "jobhunter.api.routes.system.utcnow"
 NO_ALERTS: Final = {"critical_unacked": 0, "total_unacked": 0}
+# A new active settings version: the active one with JSearch and SerpApi disabled.
+PAID_DISABLED: Final = sa.text(
+    "INSERT INTO settings_versions (version_no, schema_version, payload, scope_version_id, model_policy_id, "
+    "execution_config_id, evaluation_policy_id, effect_classes) "
+    "SELECT (SELECT max(version_no) + 1 FROM settings_versions), v.schema_version, "
+    "jsonb_set(jsonb_set(v.payload, '{sources,enabled,jsearch}', 'false'), '{sources,enabled,serpapi}', "
+    "'false'), v.scope_version_id, v.model_policy_id, v.execution_config_id, v.evaluation_policy_id, "
+    "'{collection}' FROM active_config a JOIN settings_versions v ON v.id = a.settings_version_id "
+    "WHERE a.id = 1 RETURNING id"
+)
 ACTIVE_DOCUMENT: Final = sa.text(
     "SELECT v.payload, a.profile_version_id FROM active_config a "
     "JOIN settings_versions v ON v.id = a.settings_version_id"
@@ -144,15 +153,31 @@ async def test_status_without_a_profile_or_runs(
     assert body == {
         "last_run": None,
         "active_run_id": None,
-        "quota": {"jsearch": None, "serpapi": None, "adzuna": None},
+        # no window is stored yet: JSearch and Adzuna show the windows their first reservations would
+        # bootstrap now, unspent; SerpApi has none before its first account read
+        "quota": {
+            "jsearch": {
+                "used": 0,
+                "limit": 200,
+                "reset_at": iso(now + NOMINAL_PERIOD["jsearch"]),
+                "state": "extrapolated_unvalidated",
+            },
+            "serpapi": None,
+            "adzuna": {
+                "used": 0,
+                "limit": 2250,
+                "reset_at": iso(now + timedelta(days=30)),
+                "state": "validated",
+            },
+        },
         "llm": {"counted": "0.000000", "cap": "100.00", "pace": "ok"},  # the month's row is not created yet
         "coverage_gaps_open": 0,
         "pending_targets": 0,
         "alerts": NO_ALERTS,
         "rescore": None,
         "paid_search": {"paused": False, "until": None, "reason": None},
-        # the seeded 200 JSearch units less the 10 % reserve over the month, at 6 h: under 2 units a run, up;
-        # SerpApi has no window before its first account read
+        # that JSearch window's 200 units less the 10 % reserve over its 31 days, at 6 h: under 2 units a
+        # run, rounded up; SerpApi has no window
         "run_now": {"jsearch_units": 2, "serpapi_fallback_units": 0},
         "scope": {"pending_version_id": None, "progress": None, "applied": True},
         "banners": [],
@@ -245,20 +270,12 @@ async def test_status_reports_partial_causes_gaps_pending_and_unacked_alerts(
 async def test_a_quarantined_cap_pause_gives_the_cap_banner(
     logged_in_client: httpx.AsyncClient, engine: AsyncEngine, now: datetime
 ) -> None:
-    """A batch submission whose submit was ambiguous holds its reservation, counted against the cap; with the
-    month's scoring share counted, the score lane is paused `cap_reached`: one banner, whatever the alert."""
+    """With the month's whole scoring share counted (as a quarantined submission's held reservation keeps it
+    counted), the scoring headroom is below `r_first` and the score lane is paused `cap_reached`: one banner,
+    keyed on the ledger, whatever the `llm.cap_reached` alert's state."""
     month = month_of(now)
     async with engine.begin() as c:
-        tuple_id = await activate_tuple_and_its_scope(c)
-        operation = await m3.insert_bulk_operation(c, tuple_id)
-        await m3.insert_submission(
-            c,
-            tuple_id,
-            operation,
-            state="submit_ambiguous",
-            submit_started_at=m3.NOW,
-            reserved_usd=Decimal("1.250000"),
-        )
+        await activate_tuple_and_its_scope(c)
         await ensure_month(c, month, await current_params(c), now)
         await c.execute(
             sa.text(
@@ -358,15 +375,19 @@ async def test_status_does_not_probe_the_embedder(
     fake_embedder.down = True
     health = (await logged_in_client.get("/api/system/health")).json()
     assert "embedder" in health["ready"]["failing"]  # the embedder is down indeed
+    assert fake_embedder.connections > 0  # and the health's probe reached it: the count sees a probe
 
     def no_embedder() -> None:
         raise AssertionError("the header status asked for the embedder")
 
+    before = fake_embedder.connections
     api_app.api.dependency_overrides[get_embedder] = no_embedder
     try:
         body = await status(logged_in_client)
     finally:
         api_app.api.dependency_overrides.pop(get_embedder)
+    # no connection at all, through the dependency or the app's own client
+    assert fake_embedder.connections - before == 0
     assert body["banners"] == [] and "embedder" not in body and "table_bytes" not in body
 
 
@@ -515,3 +536,90 @@ async def test_paid_search_reads_the_windows_and_the_serpapi_breaker(
         i=serpapi_instance,
     )
     assert (await status(logged_in_client))["paid_search"]["paused"] is False
+
+
+async def test_a_jsearch_window_exhausted_before_its_reset_pauses_nothing_after_it(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, now: datetime
+) -> None:
+    """Every quota figure is judged on the window at `now`: a stored JSearch window that ran out and has since
+    ended is replaced by its successor, which starts unspent, whether or not a ledger write rolled it yet."""
+    start = now - timedelta(days=40)
+    jsearch = bootstrap_window("jsearch", start, SETTINGS, interval_s=SIX_H, account=None)
+    assert jsearch is not None
+    ended = start + timedelta(days=31)  # 9 days ago
+    stored = dataclasses.replace(jsearch, window_end=ended, state="exhausted_until_reset", reserve_units=20)
+    await insert_window(engine, stored)
+    await insert_ledger_entry(engine, "jsearch", start, units=200, state="billed")
+    body = await status(logged_in_client)
+    assert body["paid_search"] == {"paused": False, "until": None, "reason": None}
+    assert body["banners"] == []
+    assert body["quota"]["jsearch"] == {
+        "used": 0,  # the new window's own counted usage: the old window's 200 units stay with it
+        "limit": 200,
+        "reset_at": iso(ended + NOMINAL_PERIOD["jsearch"]),
+        "state": "extrapolated_unvalidated",
+    }
+    assert body["run_now"]["jsearch_units"] == 2
+    # while it was current, the same window paused paid search (no SerpApi window to fall back on)
+    async with engine.begin() as c:
+        await c.execute(
+            sa.text("UPDATE quota_windows SET window_end = :end WHERE provider = 'jsearch' AND is_current"),
+            {"end": now + timedelta(days=1)},
+        )
+    body = await status(logged_in_client)
+    until = iso(now + timedelta(days=1))
+    assert body["paid_search"] == {"paused": True, "until": until, "reason": "serpapi_unavailable"}
+    assert body["quota"]["jsearch"]["used"] == 200
+
+
+async def test_the_review_s_stale_window_reproduction_is_self_consistent(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, now: datetime
+) -> None:
+    """The review's reproduction: a JSearch window stored `exhausted_until_reset` that ended a day ago. The
+    pause, the quota block and run now agree that a new, unspent window is current; with JSearch and SerpApi
+    disabled in the settings nothing is paused and run now spends nothing."""
+    start = now - timedelta(days=31)
+    jsearch = bootstrap_window("jsearch", start, SETTINGS, interval_s=SIX_H, account=None)
+    assert jsearch is not None
+    stored = dataclasses.replace(jsearch, window_end=now - timedelta(days=1), state="exhausted_until_reset")
+    await insert_window(engine, stored)
+    body = await status(logged_in_client)
+    shown = body["quota"]["jsearch"]
+    assert body["paid_search"]["paused"] is False and body["banners"] == []
+    assert shown["state"] == "extrapolated_unvalidated" and shown["used"] < shown["limit"]
+    assert datetime.fromisoformat(shown["reset_at"]) > now and body["run_now"]["jsearch_units"] == 2
+    async with engine.begin() as c:
+        version = (await c.execute(PAID_DISABLED)).scalar_one()
+        await c.execute(sa.text("UPDATE active_config SET settings_version_id = :v"), {"v": version})
+    body = await status(logged_in_client)
+    assert body["paid_search"] == {"paused": False, "until": None, "reason": None}
+    assert body["run_now"] == {"jsearch_units": 0, "serpapi_fallback_units": 0}
+    assert body["banners"] == []
+
+
+async def test_an_unvalidated_serpapi_window_counts_no_fallback_units(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, now: datetime
+) -> None:
+    """A SerpApi window not validated yet admits no search: run now counts no fallback units, as the pause
+    reads it unavailable."""
+    start = now - timedelta(days=5)
+    jsearch = bootstrap_window("jsearch", start, SETTINGS, interval_s=SIX_H, account=None)
+    assert jsearch is not None
+    await insert_window(engine, dataclasses.replace(jsearch, state="exhausted_until_reset"))
+    serpapi = dataclasses.replace(
+        jsearch,
+        provider="serpapi",
+        window_end=start + timedelta(days=12),
+        state="extrapolated_unvalidated",
+        limit_units=300,
+        reserve_units=30,
+    )
+    await insert_window(engine, serpapi)
+    body = await status(logged_in_client)
+    assert body["paid_search"]["reason"] == "serpapi_unavailable"
+    assert body["run_now"] == {"jsearch_units": 2, "serpapi_fallback_units": 0}
+    # validated, the same window counts its fair share of a run, rounded up: 270 x 6 h / 12 d = 5.625
+    await execute(engine, "UPDATE quota_windows SET state = 'validated' WHERE provider = 'serpapi'")
+    body = await status(logged_in_client)
+    assert body["paid_search"]["paused"] is False
+    assert body["run_now"] == {"jsearch_units": 2, "serpapi_fallback_units": 6}

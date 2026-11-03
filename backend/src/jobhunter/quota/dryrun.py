@@ -1,5 +1,5 @@
-"""The quota part of the settings dry-run (spec §6.8): projections and warnings for proposed settings, and the
-run-now estimate of the header strip (§15.1 L5123; plan M4 Task 11, D16).
+"""The quota part of the settings dry-run (spec §6.8): projections and warnings for proposed settings, the
+live windows and the run-now estimate of the header strip (§15.1 L5123; plan M4 Task 11, D16, Ruling T11-c).
 
 `quota_projections` covers the `jsearch`, `adzuna`, `arbeitnow`, `serpapi_fallback` and `stale_ttl_short`
 parts of §6.8's `dry_run`, on window snapshots the caller read (M2 composes `dry_run()` around it, Deviation
@@ -8,10 +8,20 @@ Figures are rounded to 3 decimals in the projections and to 1 in the warning det
 
 `per_run(settings, w)` is the one computation of a paid provider's units per run, `min(per-run cap, fair
 share)`, which the JSearch and SerpApi projections and `run_now_units` share.
-`run_now_units(conn, settings, now)` is that figure for JSearch and the SerpApi fallback on the live windows
-(`windows.current_snapshot`, plain reads, rolled forward in memory as here), rounded up to whole units: an
-upper estimate of what a run spends, the run itself being paced by the bucket. A provider that the settings
-disable, or that has no window (SerpApi before its first account read), counts 0.
+
+`live_windows(conn, settings, now)` is each quota provider's window as a run would find it at `now`: the
+stored current one (`windows.current_snapshot`, a plain read) rolled forward in memory exactly as here, so a
+stored window that has ended is replaced by its successor, which starts unspent; a provider without a stored
+window gets the window its first reservation would bootstrap (JSearch and Adzuna always; SerpApi only from an
+account read, so `None`). Nothing is written. The header status computes it once and judges every quota
+figure on it (Ruling T11-c).
+
+`run_now_units(settings, windows)` is `per_run` of JSearch and the SerpApi fallback on those windows, rounded
+up to whole units: an estimate (the even pace), not a bound, since a run spends what the bucket holds, up to
+twice the fair share after an idle stretch and next to nothing right after a run. A JSearch without a stored
+window counts the units of the window its first run would bootstrap. A provider the settings disable counts
+0, and so does SerpApi without a window or with one not yet validated (`extrapolated_unvalidated`), which
+admits no search (Ruling T7-a).
 
 - **JSearch.** `fair_share = N x interval / window length` units per run; `units_per_run = min(per-run cap,
   fair share)`; `refresh_cadence_days = cells x interval_days / units_per_run`. Warnings:
@@ -36,7 +46,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import ceil
 from types import MappingProxyType
-from typing import Final, NamedTuple
+from typing import Final, NamedTuple, get_args
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -203,15 +213,29 @@ class RunNowUnits:
     serpapi_fallback_units: int
 
 
-async def run_now_units(conn: AsyncConnection, settings: RunSettings, now: datetime) -> RunNowUnits:
-    """`per_run(settings, w).units` on the live JSearch and SerpApi windows at `now`, rounded up; 0 for a
-    provider `settings` disable or without a window (module docstring). Plain reads, nothing written."""
-    units: dict[Provider, int] = {}
-    paid: tuple[tuple[Provider, bool], ...] = (
-        ("jsearch", settings.sources.jsearch),
-        ("serpapi", settings.sources.serpapi),
+async def live_windows(
+    conn: AsyncConnection, settings: RunSettings, now: datetime
+) -> dict[Provider, Window | None]:
+    """Each quota provider's window at `now`, the stored one rolled forward in memory, or the one its first
+    reservation would bootstrap (module docstring). Plain reads, nothing written."""
+    return {
+        provider: _rolled(await current_snapshot(conn, provider), provider, settings, now)
+        for provider in get_args(Provider)
+    }
+
+
+def _admits(provider: Provider, enabled: bool, w: Window | None) -> Window | None:
+    if not enabled or w is None or (provider == "serpapi" and w.state == "extrapolated_unvalidated"):
+        return None
+    return w
+
+
+def run_now_units(settings: RunSettings, windows: Mapping[Provider, Window | None]) -> RunNowUnits:
+    """`per_run(settings, w).units`, rounded up, of JSearch and SerpApi on `windows` (`live_windows`); 0 for a
+    provider `settings` disable, and for SerpApi without a validated window (module docstring)."""
+    jsearch = _admits("jsearch", settings.sources.jsearch, windows.get("jsearch"))
+    serpapi = _admits("serpapi", settings.sources.serpapi, windows.get("serpapi"))
+    return RunNowUnits(
+        jsearch_units=0 if jsearch is None else ceil(per_run(settings, jsearch).units),
+        serpapi_fallback_units=0 if serpapi is None else ceil(per_run(settings, serpapi).units),
     )
-    for provider, enabled in paid:
-        w = _rolled(await current_snapshot(conn, provider), provider, settings, now) if enabled else None
-        units[provider] = 0 if w is None else ceil(per_run(settings, w).units)
-    return RunNowUnits(jsearch_units=units["jsearch"], serpapi_fallback_units=units["serpapi"])

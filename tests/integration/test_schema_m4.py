@@ -1,7 +1,8 @@
 """The M4 schema (migration 0009): the index of the unscored section (B1), of the posted sort over every
-availability (B6) and of the merge events from a job (the drawer's, Task 6, Ruling T6-e), the radius functions
-`geo_km` and `job_within_km` (B5), and the `replay_raw_items` operation kind (Task 12). 0009 adds no view and
-no row, and its downgrade is exact.
+availability (B6) and of the merge events from a job (the drawer's, Task 6, Ruling T6-e), the header status's
+two read indexes (Task 11, Ruling T11-d: the freshness rule's latest successful finishes, the newest operation
+of a dedup key), the radius functions `geo_km` and `job_within_km` (B5), and the `replay_raw_items` operation
+kind (Task 12). 0009 adds no view and no row, and its downgrade is exact.
 """
 
 import asyncio
@@ -41,6 +42,13 @@ INDEXES: Final = {
     ),
     "merge_events_from_job": (
         "CREATE INDEX merge_events_from_job ON public.merge_events USING btree (from_job_id)"
+    ),
+    "runs_last_success": (
+        "CREATE INDEX runs_last_success ON public.runs USING btree (finished_at) INCLUDE (status) "
+        "WHERE (status = ANY (ARRAY['succeeded'::text, 'partial'::text]))"
+    ),
+    "operations_dedup_newest": (
+        "CREATE INDEX operations_dedup_newest ON public.operations USING btree (kind, dedup_key, id)"
     ),
 }
 _INDEXES: Final = "SELECT indexname, indexdef FROM pg_indexes WHERE indexname = ANY (%s) ORDER BY indexname"

@@ -12,7 +12,9 @@ service's own truncation; every other text counts a token per 4 characters. Its 
 - `checksum_ok`: `False` gives a 503 health (`checksum_ok: false`) and a 503 for every embed request, the
   answers of a service whose model failed its check;
 - `dim` and `model_id`: what every embed answer carries (a wrong dimension, a foreign model);
-- `batches`: the size of every embed request it received while up, in order.
+- `batches`: the size of every embed request it received while up, in order;
+- `connections`: how many connections it accepted, down or up (a refused one counts too), so a test can
+  assert that a code path never reached it.
 
 One server per session (`fake_embedder_server`): `make_config` and `proc_env` pass its `base_url` as
 `JOBHUNTER_EMBEDDER_URL` to every configuration and every child process. The function fixture
@@ -57,6 +59,7 @@ class _Server(ThreadingHTTPServer):
 
     def verify_request(self, request: socket | tuple[bytes, socket], client_address: Any) -> bool:
         # A refused request is closed by the server at once (`shutdown_request`), without an answer.
+        self.fake.connected()
         return not self.fake.down
 
 
@@ -133,6 +136,7 @@ class FakeEmbedder:
         self.dim = EMBEDDING_DIM
         self.model_id = EMBEDDING_MODEL_ID
         self.batches: list[int] = []
+        self.connections = 0
         self._lock = threading.Lock()
         self._server = _Server(self)
         host, port = self._server.server_address[:2]
@@ -144,14 +148,19 @@ class FakeEmbedder:
         with self._lock:
             self.batches.append(size)
 
+    def connected(self) -> None:
+        with self._lock:
+            self.connections += 1
+
     def reset(self) -> None:
-        """Up, with a good checksum, the pinned model and dimension, and no batch recorded."""
+        """Up, with a good checksum, the pinned model and dimension, and no batch or connection recorded."""
         self.down = False
         self.checksum_ok = True
         self.dim = EMBEDDING_DIM
         self.model_id = EMBEDDING_MODEL_ID
         with self._lock:
             self.batches.clear()
+            self.connections = 0
 
     def close(self) -> None:
         self._server.shutdown()
