@@ -48,6 +48,8 @@ DEFAULT_CV_STORE_DIR: Final = Path("/data/cv")
 # M2 (plan Task 11): the `parse_jobs` tmpfs the worker shares with docparse (§12.2); docparse's own
 # `docparse.worker.main` reads the same variable.
 DEFAULT_PARSE_JOBS_DIR: Final = Path("/data/parse")
+# M4 (plan Task 19): the built SPA in the app image (the Dockerfile's `spa` stage), which the api serves.
+DEFAULT_SPA_DIR: Final = Path("/opt/spa")
 
 # LANGCHAIN_* are the legacy names the langsmith SDK still honours, so `langsmith_config` must see them.
 ENV_PREFIXES: Final = ("JOBHUNTER_", "LANGSMITH_", "LANGCHAIN_", "ANTHROPIC_")
@@ -165,6 +167,8 @@ class AppConfig:
     cv_store_dir: Path
     # `JOBHUNTER_PARSE_JOBS_DIR`: the root of the docparse jobs (`profile.parse_client.ParseClient`).
     parse_jobs_dir: Path
+    # `JOBHUNTER_SPA_DIR`: the built SPA the api serves (`api.static.SpaFiles`); absent outside the image.
+    spa_dir: Path
     # Neither mapping appears in repr(): a config that is logged or shown in a traceback must not leak.
     secrets: Mapping[str, bytes] = field(repr=False)
     environ: Mapping[str, str] = field(repr=False)
@@ -282,6 +286,7 @@ def load_config(
         http_user_agent=env.get("JOBHUNTER_HTTP_USER_AGENT") or DEFAULT_HTTP_USER_AGENT,
         cv_store_dir=Path(env.get("JOBHUNTER_CV_STORE_DIR") or DEFAULT_CV_STORE_DIR),
         parse_jobs_dir=Path(env.get("JOBHUNTER_PARSE_JOBS_DIR") or DEFAULT_PARSE_JOBS_DIR),
+        spa_dir=Path(env.get("JOBHUNTER_SPA_DIR") or DEFAULT_SPA_DIR),
         secrets=MappingProxyType(contents),
         environ=MappingProxyType(env),
         secrets_dir=secrets_dir,

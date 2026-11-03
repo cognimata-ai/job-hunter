@@ -4,6 +4,10 @@ __pycache__/
 frontend/node_modules/
 frontend/dist/
 frontend/openapi.json
+# The E2E suite's results, reports and stored login (M4): the stored login holds a session cookie
+frontend/test-results/
+frontend/playwright-report/
+frontend/e2e/.auth/
 # Raw source recordings (Task 6 spikes): recruiter personal data, NEVER committed (spec §2.3, §18.4)
 .fixtures-raw/
 # Embedder model downloads (Task 21: embedder/download_model.sh, spike V7): model weights are never committed

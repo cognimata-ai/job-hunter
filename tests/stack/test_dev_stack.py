@@ -21,6 +21,7 @@ message saying so.
 """
 
 import os
+import re
 import stat
 import subprocess
 import time
@@ -230,6 +231,52 @@ def test_dev_stack_serves_through_devproxy(stack) -> None:
     while httpx.get("http://localhost:8080/readyz", timeout=5).status_code != 200:
         assert time.monotonic() < deadline, "readyz never 200"
         time.sleep(2)
+
+
+SPA_IMAGE_CHECK: Final = "\n".join(
+    [
+        "import pathlib, shutil",
+        "spa = pathlib.Path('/opt/spa')",
+        "assert (spa / 'index.html').is_file() and list(spa.glob('assets/*.js')), sorted(spa.rglob('*'))",
+        "assert not (spa / 'node_modules').exists() and not pathlib.Path('/src/frontend').exists()",
+        "assert shutil.which('node') is None and shutil.which('npm') is None, shutil.which('node')",
+    ]
+)
+# What a browser sends for a navigation.
+NAVIGATION: Final = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+
+def test_the_spa_is_served_with_the_csp(stack) -> None:
+    """M4 Task 19: the image's node stage built the SPA into /opt/spa and left no Node runtime behind. The api
+    serves it through devproxy with the §16.6 headers: a deep link gets index.html, an asset is immutable."""
+    from jobhunter.api.edge import SECURITY_HEADERS
+
+    r = subprocess.run(
+        ["docker", "run", "--rm", "jobhunter-app:dev", "python", "-I", "-c", SPA_IMAGE_CHECK],
+        capture_output=True,
+        text=True,
+        timeout=CALL_TIMEOUT_S,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    with httpx.Client(base_url=ORIGIN, timeout=10) as client:
+        page = client.get("/settings", headers={"Accept": NAVIGATION})
+        assert page.status_code == 200, page.text
+        assert page.headers["content-type"] == "text/html; charset=utf-8"
+        assert page.headers["cache-control"] == "no-cache"
+        assert page.headers["content-security-policy"] == SECURITY_HEADERS["Content-Security-Policy"]
+        assert '<div id="root"></div>' in page.text
+        assert "<style" not in page.text and " style=" not in page.text, page.text  # what the CSP blocks
+        scripts = re.findall(r'<script\b[^>]*\ssrc="(/assets/[^"]+\.js)"[^>]*></script>', page.text)
+        assert len(scripts) == 1 and page.text.count("<script") == 1, page.text  # no inline script
+        asset = client.get(scripts[0])
+        assert asset.status_code == 200
+        assert asset.headers["content-type"] == "text/javascript; charset=utf-8"
+        assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+        assert asset.headers["content-security-policy"] == SECURITY_HEADERS["Content-Security-Policy"]
+        problem = client.get("/settings")  # curl's `*/*`: no page
+        assert (problem.status_code, problem.json()["code"]) == (404, "not_found")
+        api = client.get("/api/no-such-route", headers={"Accept": NAVIGATION})
+        assert (api.status_code, api.json()["code"]) == (404, "not_found")
 
 
 def test_embedder_is_healthy_and_readiness_reports_no_embedder_failure(stack) -> None:

@@ -13,7 +13,8 @@ The handlers (installed through `exception_handlers()`):
   sender's own input (a validator's `ValueError` text, a parse error's offending character): it goes back to
   that sender only and is never logged (ruling T14-h). Pydantic's `input` member is never copied;
 - Starlette's `HTTPException`: mapped by `code_for_http_status` (404 and 405 are `not_found`; a 405 keeps its
-  `Allow` header);
+  `Allow` header). A 404 to a `GET` or `HEAD` outside `/api` (no route matched) is first offered to the SPA,
+  `api.static.SpaFiles` on the app state (M4 Task 19); the problem stands when it declines;
 - any other `Exception`: the last-resort 500 `internal`. It logs `unhandled_exception` with the error class
   only and persists the deduplicated `api.unhandled_exception` alert (§17.1). Starlette runs it from
   `ServerErrorMiddleware`, which then re-raises to the edge.
@@ -48,6 +49,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
+from jobhunter.api.static import SpaFiles
 from jobhunter.errors import (
     RESERVED_PROBLEM_MEMBERS,
     CoMemberChanged,
@@ -287,7 +289,18 @@ def code_for_http_status(status: int) -> ProblemCode:
     return "validation_failed"
 
 
+def _spa_response(request: Request) -> Response | None:
+    """The SPA's answer to a 404 `GET` or `HEAD` outside `/api`, or `None` (module docstring)."""
+    path = request_instance(request.scope)
+    if request.method not in ("GET", "HEAD") or path == "/api" or path.startswith("/api/"):
+        return None
+    spa = getattr(request.app.state, "spa", None)
+    return spa.response(request.scope) if isinstance(spa, SpaFiles) else None
+
+
 async def _on_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+    if exc.status_code == 404 and (spa := _spa_response(request)) is not None:
+        return spa
     # Their `detail` is not passed on: it is library text, not a client message. Their headers (`Allow` of a
     # 405, `WWW-Authenticate` of a 401) are.
     status = exc.status_code if 400 <= exc.status_code <= 599 else 500

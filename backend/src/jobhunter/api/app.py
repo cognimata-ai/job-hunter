@@ -8,6 +8,9 @@ and, outside the test env, the metrics server on port 8001). With `cfg` and `eng
 state, the task app included, is set at once and the lifespan does nothing; the caller owns and disposes that
 engine.
 
+The SPA (M4 Task 19) is `api.state.spa`, an `api.static.SpaFiles` on `cfg.spa_dir`, set with the rest of the
+state: the 404 handler of `api.errors` offers it what no route matched, so it is no Mount.
+
 The embedder client (Task 22) is an `embeddings.EmbedderClient` on `cfg.embedder_url`, which readiness and
 system health probe. The lifespan's HTTP client is closed when the lifespan ends. An injected app (tests) gets
 one of its own on the injected `cfg`, which nothing closes: the tests' fake embedder closes every connection
@@ -67,6 +70,7 @@ from jobhunter.api.routes import (
     targets,
     watchlist,
 )
+from jobhunter.api.static import SpaFiles
 from jobhunter.config import AppConfig, startup_or_exit
 from jobhunter.db.alembic_runner import code_head
 from jobhunter.db.session import make_engine
@@ -155,6 +159,7 @@ async def _lifespan(api: FastAPI) -> AsyncIterator[None]:
         api.state.engine = engine
         api.state.queue = queue
         api.state.embedder = EmbedderClient(cfg.embedder_url, embedder_http)
+        api.state.spa = SpaFiles(cfg.spa_dir)
         yield
     finally:
         try:
@@ -239,6 +244,7 @@ def create_app(
         api.state.code_head = code_head()
         api.state.queue = make_queue_app(cfg.dsn("psycopg"))  # ruling P2: built, not opened
         api.state.embedder = EmbedderClient(cfg.embedder_url, make_http_client())
+        api.state.spa = SpaFiles(cfg.spa_dir)
     edge = EdgeMiddleware(api, config=lambda: _state_config(api), engine=lambda: _state_engine(api))
     return JobHunterApp(api, edge)
 

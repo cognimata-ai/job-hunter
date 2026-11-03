@@ -705,6 +705,16 @@ def test_parse_jobs_dir_defaults_to_the_tmpfs_and_follows_the_environment(tmp_pa
     assert load_config("worker", env, secrets).parse_jobs_dir == tmp_path / "parse"
 
 
+# --- M4 Task 19: the built SPA the api serves (`JOBHUNTER_SPA_DIR`) ---------------------------------------
+
+
+def test_spa_dir_defaults_to_the_image_s_directory_and_follows_the_environment(tmp_path: Path) -> None:
+    secrets = write_secrets(tmp_path / "s", **API_SECRETS)
+    assert load_config("api", BASE_ENV, secrets).spa_dir == Path("/opt/spa")
+    env = {**BASE_ENV, "JOBHUNTER_SPA_DIR": str(tmp_path / "dist")}
+    assert load_config("api", env, secrets).spa_dir == tmp_path / "dist"
+
+
 # --- M2 Task 4 (fix round 1): `ANTHROPIC_LOG` makes the Anthropic SDK log request content ------------------
 
 
