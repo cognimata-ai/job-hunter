@@ -61,6 +61,7 @@ from tests.support.collect import (
 from tests.support.faults import PausePoint
 from tests.support.quota import SIX_H, insert_window, jsearch_window
 from tests.support.sources import (
+    FIXTURES,
     Adapters,
     fixture_variant,
     load_fixture,
@@ -191,7 +192,7 @@ COVERED_ROW = sa.text(
 
 
 async def test_adzuna_page_cap_and_arbeitnow_overlap(
-    engine, current_epoch, fake_http, respx_mock: respx.MockRouter, adapters: Adapters
+    engine, current_epoch, fake_http, respx_mock: respx.MockRouter
 ) -> None:
     await seed_inputs(engine, queries=(TEST_QUERY,), enabled=("adzuna", "arbeitnow"))
     oldest, newest = feed_times()
@@ -200,14 +201,21 @@ async def test_adzuna_page_cap_and_arbeitnow_overlap(
     respx_mock.get(url__regex=rf"^{re.escape(ADZUNA_URL)}/[123]\?").mock(return_value=adzuna_full_page(1000))
     async with engine.connect() as c:
         adzuna, arbeitnow = await instance_id(c, "adzuna"), await instance_id(c, "arbeitnow")
-    async with httpx.AsyncClient() as client:  # respx serves it
+    # The first Arbeitnow read is served the recorded feed (a fixture transport without a clock, as the
+    # contract tests are): fake mode's transport moves its dates with the wall clock (Task 18), and this test
+    # reasons about the recorded times on its own clock.
+    async with (
+        httpx.AsyncClient() as client,
+        httpx.AsyncClient(transport=fixture_transport(FIXTURES)) as feed,
+    ):
         adzuna_adapter = AdzunaAdapter(
             client, app_id=b"fake", app_key=b"fake", instance_id=adzuna, clock=utcnow
         )
         respx_feed = ArbeitnowAdapter(client, instance_id=arbeitnow, clock=utcnow)
+        recorded_feed = ArbeitnowAdapter(feed, instance_id=arbeitnow, clock=utcnow)
 
         def first_adapters(instance: InstanceRow):
-            return adzuna_adapter if instance.source_id == "adzuna" else adapters(instance)
+            return adzuna_adapter if instance.source_id == "adzuna" else recorded_feed
 
         deps = make_deps(engine, first_adapters)
         feed_deps = replace(deps, clock=lambda: feed_now)

@@ -197,6 +197,40 @@ of each ATS (a Personio or Recruitee subdomain by the `*.` host wildcard) → th
 detail of a posting whose detail was not recorded is answered `smartrecruiters_404`. Every page-2 cursor is
 served `search_v2_page2`, so a traversal that continues from page 2 is served page 2 again (no new `job_uid`).
 
+## Posting dates in fake mode (M4 Task 18)
+
+The committed files keep their recorded dates; the fixture transport moves them when it is given a clock, as
+fake mode's `http.configure` gives it (`fixtures.shift_dates`). Without a clock, as in the contract tests,
+every body is served as recorded. The fields moved are `fixtures.DATE_FIELDS`, by prefix, each one a posting
+date its adapter reads:
+
+| Prefix | Field | Encoding |
+|---|---|---|
+| `jsearch/` | `data.jobs[].job_posted_at_timestamp` | unix seconds |
+| `adzuna/` | `results[].created` | ISO (`2026-10-18T18:42:17Z`) |
+| `arbeitnow/` | `data[].created_at` | unix seconds |
+| `ats/greenhouse_` | `jobs[].first_published` | ISO (`-04:00`) |
+| `ats/lever_` | `[].createdAt` | unix milliseconds |
+| `ats/ashby_` | `jobs[].publishedAt` | ISO (`.fff+00:00`) |
+| `ats/personio_` | `position/createdAt` (XML) | ISO (`+00:00`) |
+| `ats/recruitee_` | `offers[].published_at` | ISO (`2026-10-15 09:31:36 UTC`) |
+| `ats/smartrecruiters_` | `content[].releasedDate` (list), `releasedDate` (detail) | ISO (`.fffZ`) |
+
+A case's reference is its recording's `fetched_at` (`<case>.meta.json`), or `FIXTURE_REFERENCE` (2026-10-18
+21:00 UTC) for a derived case without a meta. At the clock's `now` every listed value moves by the whole
+days `floor((now - reference) / 1 day)`: an ad is as old on the stack as it was when it was recorded, and a body
+changes at most once a day. A value that would then be after `now` is `now` (none of the committed values is
+after its reference). Each value keeps its encoding: an ISO string moves its date part only, so it keeps its
+offset, separator, precision and zone word. A JSON body with a moved value is written back in the files' own
+form (two-space indent, UTF-8, the final newline), so it differs from the recording in its dates only; the
+Personio XML is changed in place. Bodies without a listed value (SerpApi, the 404 and end pages, the HTML and
+truncated bodies), the headers and the metas are served as recorded.
+
+Two dates do not move, because they come from the recorded `Date` header, which is never changed: SerpApi's
+relative chips (`2 days ago`) resolve against it, so its ten postings keep their recorded dates; and
+Arbeitnow's fill instant (`filled_at`: `Date` less `Age`) stays at the recording, so a fake-mode read of the
+firehose proves no covered span above it.
+
 ## Location labels (V17)
 
 `location_labels.tsv` (tab-separated, `source string country kind`) holds one row per distinct location string
