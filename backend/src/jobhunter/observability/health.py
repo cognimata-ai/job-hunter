@@ -301,7 +301,8 @@ class RunOut(BaseModel):
         return cls.model_validate(run, from_attributes=True)
 
 
-# The `runs` columns a `RunOut` is built from, `status_reason` included (D5): every select of one names them.
+# The `runs` columns a `RunOut` is built from, `status_reason` included (D5): every select of one names them,
+# except those that fill a `worker.runs.RunRow`, whose required `status_reason` `RunOut` validates too.
 RUN_COLUMNS: Final = ", ".join(RunOut.model_fields)
 # `runs_recent` serves it.
 _LAST_RUN: Final = q(f"SELECT {RUN_COLUMNS} FROM runs ORDER BY queued_at DESC, id DESC LIMIT 1")  # noqa: S608

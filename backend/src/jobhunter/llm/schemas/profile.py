@@ -112,7 +112,8 @@ class UserEntered(SchemaModel):
     security_clearances: list[SecurityClearance] = Field(default_factory=list)
 
 
+# Stored as `profile_versions.profile_json` and as a draft's `draft_json`.
 class ConfirmedProfile(ProfileOut):
-    """`profile_versions.profile_json` and a draft's `draft_json`: the extraction plus `user_entered`."""
+    """A profile as a confirmed version or a draft holds it: the extraction plus `user_entered`."""
 
     user_entered: UserEntered = Field(default_factory=UserEntered)

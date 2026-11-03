@@ -42,9 +42,10 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
 }
 # What a published description must not cite (Ruling T6-g). A ruling is matched in any case and in the plural
 # (the codebase writes "ruling R14-1" and "rulings R14-1 and R14-2" as well as "Ruling P13"); `Task`, the
-# blocker ids and the line numbers stay case-sensitive, so that ordinary words do not match.
+# blocker ids and the line numbers stay case-sensitive, so that ordinary words do not match. A multi-word
+# citation is matched across any whitespace: a docstring may wrap it onto the next line.
 INTERNAL_CITATION: Final = re.compile(
-    r"module docstring|(?i:\brulings?\b)|\bDeviation \d|\bTask \d+\b|\bB\d{2}\b|\bL\d{3,4}\b"
+    r"module\s+docstring|(?i:\brulings?\b)|\bDeviation\s+\d|\bTask\s+\d+\b|\bB\d{2}\b|\bL\d{3,4}\b"
 )
 
 
@@ -101,6 +102,14 @@ def test_the_guard_matches_a_ruling_in_any_case_and_the_other_citations_as_writt
     )
     for cited in (*cited_forms, "Task 10", "B16", "L4977", "(module docstring)"):
         assert INTERNAL_CITATION.search(cited), cited
+    # a docstring wraps where it will: a citation broken across lines is still one
+    for wrapped in (
+        "a signed cursor (module\n    docstring).",
+        "plan Deviation\n29",
+        "Task\n    10",
+        "Ruling\nP13",
+    ):
+        assert INTERNAL_CITATION.search(wrapped), wrapped
     for plain in ("a task 10 minutes long", "a b16 value", "the l4977 key", "a deviation of 2", "overruled"):
         assert not INTERNAL_CITATION.search(plain), plain
 

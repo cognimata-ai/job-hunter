@@ -342,8 +342,7 @@ export interface paths {
         };
         /**
          * Get Job
-         * @description A job's detail in one read snapshot, its history's first page with a signed cursor (module
-         *     docstring).
+         * @description A job's detail in one read snapshot, its history's first page with a signed cursor.
          */
         get: operations["get_job_api_jobs__job_id__get"];
         put?: never;
@@ -1481,7 +1480,7 @@ export interface components {
         };
         /**
          * ConfirmedProfile
-         * @description `profile_versions.profile_json` and a draft's `draft_json`: the extraction plus `user_entered`.
+         * @description A profile as a confirmed version or a draft holds it: the extraction plus `user_entered`.
          */
         ConfirmedProfile: {
             /** Certifications */

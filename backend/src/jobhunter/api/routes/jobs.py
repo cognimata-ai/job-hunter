@@ -417,8 +417,8 @@ async def get_job(
     engine: Annotated[AsyncEngine, Depends(get_engine)],
     cfg: Annotated[AppConfig, Depends(get_config)],
 ) -> JobDetailOut:
-    """A job's detail in one read snapshot, its history's first page with a signed cursor (module
-    docstring)."""
+    """A job's detail in one read snapshot, its history's first page with a signed cursor."""
+    # What the detail holds and how its history is paged: the module docstring.
     now = utcnow()
     try:
         async with read_snapshot(engine) as conn:
