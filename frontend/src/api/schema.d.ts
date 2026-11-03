@@ -76,7 +76,8 @@ export interface paths {
         put?: never;
         /**
          * Login
-         * @description Log in: 204 with the session cookie, 401 for any failure, 429 when locked out or busy.
+         * @description Log in: 204 with the session cookie; 401 `totp_required` when TOTP is on and no code was sent, 401
+         *     `unauthenticated` for any other failure; 429 when locked out or busy.
          */
         post: operations["login_api_auth_login_post"];
         delete?: never;
@@ -3202,7 +3203,10 @@ export interface components {
         LoginIn: {
             /** Password */
             password: string;
-            /** Totp */
+            /**
+             * Totp
+             * @description The six-digit code of the authenticator app, needed when TOTP is on; an empty string counts as no code
+             */
             totp?: string | null;
             /** Username */
             username: string;
@@ -3496,7 +3500,7 @@ export interface components {
              * Code
              * @enum {string}
              */
-            code: "unauthenticated" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
+            code: "unauthenticated" | "totp_required" | "csrf_failed" | "throttled" | "invalid_cursor" | "stale_base_version" | "validation_failed" | "budget_exhausted" | "filtered_requires_force" | "run_active" | "not_found" | "conflict_state" | "upload_rejected" | "idempotency_key_required" | "idempotency_key_reused" | "idempotency_in_progress" | "eval_gate_failed" | "profile_purge_in_progress" | "internal";
             /**
              * Detail
              * @default null
@@ -5637,7 +5641,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Invalid credentials (`unauthenticated`) */
+            /** @description Invalid credentials (`unauthenticated`), or TOTP is on and no code was sent (`totp_required`) */
             401: {
                 headers: {
                     [name: string]: unknown;

@@ -16,9 +16,10 @@ from typing import Final, Literal
 
 from jobhunter.types import JSONValue
 
-# The problem codes of §14.4 (`api.errors.ProblemCode` is this type).
+# The problem codes of §14.4, and the login's `totp_required` (§15.2) (`api.errors.ProblemCode` is this type).
 ErrorCode = Literal[
     "unauthenticated",
+    "totp_required",
     "csrf_failed",
     "throttled",
     "invalid_cursor",

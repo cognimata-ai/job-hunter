@@ -15,6 +15,8 @@ import sqlalchemy as sa
 from jobhunter.clock import utcnow
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from tests.support.fixtures import count_rows
+
 pytestmark = pytest.mark.integration
 PW = "Tannenbaum-Ölfass-7"
 
@@ -193,15 +195,98 @@ async def test_csrf_on_state_changing_routes(logged_in_client) -> None:
     assert (await logged_in_client.get("/api/auth/session")).status_code == 401
 
 
-async def test_totp_required_when_enabled(api_client, make_user, engine, make_config) -> None:
-    from jobhunter.auth import totp, users
+async def test_totp_required_when_enabled(api_client, make_user, engine, make_config, monkeypatch) -> None:
+    import jobhunter.api.routes.auth as auth_routes
+    from jobhunter.auth import passwords, totp, users
 
+    argon2: list[str] = []  # the Argon2 work of the logins, which happens inside the gate only
+    real_check_password = passwords.check_password
+
+    def check_password(stored: str, password: str) -> tuple[bool, bool]:
+        argon2.append("check_password")
+        return real_check_password(stored, password)
+
+    monkeypatch.setattr(auth_routes, "check_password", check_password)
+    monkeypatch.setattr(auth_routes, "dummy_verify", lambda p: argon2.append("dummy_verify"))
     await make_user()
     secret = totp.new_secret()
     async with engine.begin() as c:
         await users.enable_totp(c, secret, data_key=make_config("api").secret_b64("data_key"))
-    assert (await login(api_client)).status_code == 401
-    assert (await login(api_client, totp=pyotp.TOTP(secret).now())).status_code == 204
+    # Without a code: the right password, a wrong one, an unknown username, an empty code and a null one. Six
+    # of them, one more than the per-address lockout's five failures.
+    without_code = [
+        await login(api_client),
+        await login(api_client, password="wrong-password-123"),
+        await api_client.post("/api/auth/login", json={"username": "nobody", "password": PW}),
+        await login(api_client, totp=""),
+        await api_client.post("/api/auth/login", json={"username": "ada", "password": PW, "totp": None}),
+        await login(api_client, password="wrong-password-123", totp=""),
+    ]
+    assert [r.status_code for r in without_code] == [401] * 6
+    first = without_code[0].json()
+    assert (first["code"], first["title"]) == ("totp_required", "TOTP code required")
+    for r in without_code:  # one answer, whoever and whatever was sent: it tells only that TOTP is on
+        assert {**r.json(), "request_id": first["request_id"]} == first
+        sets_cookie = "set-cookie" in r.headers
+        assert not sets_cookie
+    assert argon2 == []  # the Argon2 gate was not entered
+    for table in ("login_attempts", "login_lockouts", "sessions"):
+        assert await count_rows(engine, table) == 0, table
+    # With a code, every failure is the generic one, and each is an attempt.
+    with_code = [
+        await login(api_client, totp=wrong_code(secret)),
+        await login(api_client, totp="12345"),  # malformed: a wrong code like any other
+        await login(api_client, totp="abcdef"),
+    ]
+    for r in with_code:
+        assert r.status_code == 401
+        assert (r.json()["code"], r.json()["title"]) == ("unauthenticated", "Invalid credentials")
+    assert argon2 == ["check_password"] * 3
+    assert await count_rows(engine, "login_attempts", success=False) == 3
+    code = pyotp.TOTP(secret).now()
+    accepted = await login(api_client, totp=code)
+    assert accepted.status_code == 204  # the six logins without a code did not lock the address out
+    async with engine.begin() as c:
+        await users.disable_totp(c)
+    off = await login(api_client)  # TOTP off: a login needs no code
+    assert off.status_code == 204
+
+
+async def test_a_locked_out_client_without_a_totp_code_gets_the_lockout_answer(
+    api_client, make_user, engine, make_config
+) -> None:
+    from jobhunter.auth import totp, users
+
+    await make_user()
+    async with engine.begin() as c:
+        await users.enable_totp(c, totp.new_secret(), data_key=make_config("api").secret_b64("data_key"))
+        await c.execute(
+            sa.text(
+                "INSERT INTO login_lockouts "
+                "VALUES ('ip:198.51.100.10', now() + interval '15 minutes', 'ip_failures')"
+            )
+        )
+    r = await login(api_client)
+    assert r.status_code == 429 and r.json()["code"] == "throttled"
+    assert await count_rows(engine, "login_attempts") == 0
+
+
+async def test_totp_enabled_for_any_is_the_single_user_s_flag(engine, make_user) -> None:
+    from jobhunter.auth import totp, users
+
+    async def enabled() -> bool:
+        async with engine.connect() as c:
+            return await users.totp_enabled_for_any(c)
+
+    assert await enabled() is False  # no user at all
+    await make_user()
+    assert await enabled() is False
+    async with engine.begin() as c:
+        await users.enable_totp(c, totp.new_secret(), data_key=os.urandom(32))
+    assert await enabled() is True
+    async with engine.begin() as c:
+        await users.disable_totp(c)
+    assert await enabled() is False
 
 
 async def test_rate_limit_600_per_minute(logged_in_client, monkeypatch) -> None:

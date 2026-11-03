@@ -34,6 +34,7 @@ _INSERT_USER = q(
     "VALUES (1, :username, :password_hash, :now) ON CONFLICT (id) DO NOTHING RETURNING id"
 )
 _SELECT_USER = q("SELECT username, password_hash, totp_secret_enc, totp_enabled FROM users WHERE id = 1")
+_SELECT_TOTP_ENABLED = q("SELECT EXISTS (SELECT 1 FROM users WHERE totp_enabled)")
 _SET_PASSWORD = q(
     "UPDATE users SET password_hash = :password_hash, password_changed_at = :now WHERE id = 1 RETURNING id"
 )
@@ -128,6 +129,14 @@ async def get_user(conn: AsyncConnection) -> UserRow | None:
         totp_secret_enc=row.totp_secret_enc,
         totp_enabled=row.totp_enabled,
     )
+
+
+async def totp_enabled_for_any(conn: AsyncConnection) -> bool:
+    """Whether the single user has TOTP on; `False` when there is no user. One plain read, no lock.
+
+    It names no user, so what it answers is the same for any username a login sends.
+    """
+    return bool((await conn.execute(_SELECT_TOTP_ENABLED)).scalar_one())
 
 
 async def find_user(conn: AsyncConnection, username: str) -> UserRow | None:

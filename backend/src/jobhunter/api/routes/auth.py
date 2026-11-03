@@ -5,6 +5,11 @@ A login runs in phases, so that what it writes persists whatever the answer is (
 0. A read-only lockout pre-check (`throttle.peek_lockout`, its own short transaction): a locked-out client
    gets its 429 before any Argon2 work. Being locked out does not depend on the credentials, so the early
    answer reveals nothing about them.
+   Then, when TOTP is on and the login carries no code (`totp` absent, `null` or empty), it gets 401
+   `totp_required` at once (§15.2), before the gate and any Argon2 work. That answer records nothing (no
+   attempt, so no lockout) and comes from the single user's flag alone (`users.totp_enabled_for_any`, which
+   names no user), so it is the same for any username and password: it tells only that TOTP is on. A login
+   with a code, even a malformed one, goes on, and its every failure is the generic 401 below.
    Then a slot of the process's Argon2 gate (`argon2_gate`, ruling T21-e): two logins verify at once and
    eight wait; one more gets 429 `throttled` (`Retry-After: 1`) at once, before any Argon2 work. A login that
    gets a slot repeats the pre-check first: a burst ahead of it in the queue may have locked it out by then.
@@ -25,9 +30,9 @@ raises the critical alert `auth.totp_key_mismatch` (subject `totp`), for a right
 A successful login replaces the session whose cookie the request carried (rotation, §16.4): that session is
 deleted in the transaction that creates the new one.
 
-Every failure is the same generic 401. The client address is `request.client.host`, which uvicorn's proxy
-headers middleware sets from the trusted proxy's `X-Forwarded-For` only (§16.3, V20). The login is checked
-for `Origin` by the edge; it needs no `X-JH-Request` (§16.5).
+Every other failure is the same generic 401 `unauthenticated`. The client address is `request.client.host`,
+which uvicorn's proxy headers middleware sets from the trusted proxy's `X-Forwarded-For` only (§16.3, V20).
+The login is checked for `Origin` by the edge; it needs no `X-JH-Request` (§16.5).
 
 Logs carry the outcome and the client address only (ruling T16-b): never the username, password, TOTP code,
 token, cookie or username HMAC.
@@ -40,7 +45,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from starlette.responses import Response
 
@@ -66,6 +71,7 @@ from jobhunter.observability.logging import get_logger
 # escape the per-address throttle (uvicorn over TCP always has an address; a misconfiguration may not).
 UNKNOWN_CLIENT_IP: Final = "0.0.0.0"  # noqa: S104 - an address recorded, not one bound to
 INVALID_CREDENTIALS: Final = "Invalid credentials"
+TOTP_REQUIRED: Final = "TOTP code required"
 # What a login refused by the full Argon2 gate is told to wait: a slot frees within one verification or two.
 BUSY_RETRY_AFTER_S: Final = 1
 TOTP_KEY_ALERT_CODE: Final = "auth.totp_key_mismatch"
@@ -77,7 +83,18 @@ log = get_logger("jobhunter.auth")
 class LoginIn(BaseModel):
     username: str = Field(min_length=1, max_length=256)
     password: str = Field(min_length=1, max_length=1024)
-    totp: str | None = Field(default=None, pattern=r"^\d{6}$")
+    totp: str | None = Field(
+        default=None,
+        description="The six-digit code of the authenticator app, needed when TOTP is on; an empty string "
+        "counts as no code",
+    )
+
+    @field_validator("totp", mode="before")
+    @classmethod
+    def _empty_code_is_no_code(cls, value: object) -> object:
+        # A code of any other shape is kept: it fails like a wrong code (`totp.matched_step`), so a login
+        # with a code has one failure answer whatever the code looks like.
+        return None if value == "" else value
 
 
 class SessionOut(BaseModel):
@@ -247,12 +264,30 @@ async def _refuse_if_locked_out(engine: AsyncEngine, ip: str, *, now: datetime) 
         raise _locked(ip, retry_after)
 
 
+async def _refuse_if_totp_code_missing(engine: AsyncEngine, body: LoginIn, ip: str) -> None:
+    """Raise 401 `totp_required` when TOTP is on and `body` has no code (nothing is recorded).
+
+    It reads the single user's flag only, never the username or the password: its answer and its cost are
+    the same for any of them.
+    """
+    if body.totp is not None:
+        return
+    async with engine.connect() as conn:  # read-only, rolled back when the block ends
+        required = await users.totp_enabled_for_any(conn)
+    if required:
+        log.warning("login", outcome="totp_required", ip=ip)
+        raise Problem(401, "totp_required", TOTP_REQUIRED)
+
+
 @router.post(
     "/login",
     status_code=204,
     response_class=Response,
     responses={
-        401: {"description": "Invalid credentials (`unauthenticated`)"},
+        401: {
+            "description": "Invalid credentials (`unauthenticated`), or TOTP is on and no code was sent "
+            "(`totp_required`)"
+        },
         429: {"description": "Locked out, or too many logins at once (`throttled`, `retry_after_s`)"},
         **LOGIN_CSRF_RESPONSES,
         **BODY_LIMIT_RESPONSES,
@@ -265,10 +300,12 @@ async def login(
     cfg: Annotated[AppConfig, Depends(get_config)],
     gate: Annotated[Argon2Gate, Depends(get_argon2_gate)],
 ) -> Response:
-    """Log in: 204 with the session cookie, 401 for any failure, 429 when locked out or busy."""
+    """Log in: 204 with the session cookie; 401 `totp_required` when TOTP is on and no code was sent, 401
+    `unauthenticated` for any other failure; 429 when locked out or busy."""
     now = utcnow()
     ip = client_ip(request)
     await _refuse_if_locked_out(engine, ip, now=now)  # phase 0
+    await _refuse_if_totp_code_missing(engine, body, ip)  # before the gate: no Argon2 work, nothing recorded
     session_secret = cfg.secret_b64("session_secret")
     try:
         async with gate.slot():
