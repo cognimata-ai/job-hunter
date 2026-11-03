@@ -1,6 +1,7 @@
-"""The M4 schema (migration 0009): the index of the unscored section (B1) and of the posted sort over every
-availability (B6), the radius functions `geo_km` and `job_within_km` (B5), and the `replay_raw_items`
-operation kind (Task 12). 0009 adds no view and no row, and its downgrade is exact.
+"""The M4 schema (migration 0009): the index of the unscored section (B1), of the posted sort over every
+availability (B6) and of the merge events from a job (the drawer's, Task 6, Ruling T6-e), the radius functions
+`geo_km` and `job_within_km` (B5), and the `replay_raw_items` operation kind (Task 12). 0009 adds no view and
+no row, and its downgrade is exact.
 """
 
 import asyncio
@@ -37,6 +38,9 @@ INDEXES: Final = {
     "jobs_list_posted_any": (
         "CREATE INDEX jobs_list_posted_any ON public.jobs USING btree "
         "(posted_at_effective DESC NULLS LAST, id DESC) WHERE (merged_into_job_id IS NULL)"
+    ),
+    "merge_events_from_job": (
+        "CREATE INDEX merge_events_from_job ON public.merge_events USING btree (from_job_id)"
     ),
 }
 _INDEXES: Final = "SELECT indexname, indexdef FROM pg_indexes WHERE indexname = ANY (%s) ORDER BY indexname"
@@ -75,7 +79,7 @@ def test_0009_follows_0008_and_is_the_head() -> None:
     assert code_head() == M4_SCHEMA
 
 
-def test_0009_creates_the_two_indexes_and_the_functions(migrated: PgServer) -> None:
+def test_0009_creates_the_indexes_and_the_functions(migrated: PgServer) -> None:
     assert pg_rows(migrated, "migrator", _INDEXES, list(INDEXES)) == sorted(INDEXES.items())
     assert pg_rows(migrated, "migrator", _FUNCTIONS) == FUNCTIONS
 

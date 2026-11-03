@@ -25,10 +25,13 @@ description are the representative's, and `score.scored_via_job_id` and `descrip
 every other part of the detail (fields, postings, links, target, group, actions, feedback, history) is the
 job's own. Otherwise the job is scored by its own result. The result is the one the scored job's
 current-revision target of the active tuple published, its instance the current one under the active scope;
-`score` is `None` without an instance with a score (as on the card). Beyond the card's `ScoreOut`:
+`score` is `None` without an instance with a score (as on the card), and then so is `contested`: neither,
+nor the evidence and the chain behind them, is read. Beyond the card's `ScoreOut`:
 - `criteria`: the six LLM criteria in §11.2's order, each with its rubric weight (`None` when the result's
   rubric names none), level, basis, rationale and its evidence, the `result_evidence` rows whose subject is
   the criterion, in order;
+- `fact_evidence` (Ruling T6-a): the other `result_evidence` rows, in the same order, those whose subject is a
+  fact's key (its fact id `code:subject`, or an id-less fact's pseudo key), with the same span rule;
 - `det_criteria` (the instance's two deterministic criteria with their weights and inputs), `knockouts` (the
   card's, `cards.instance_knockouts`), `caps_applied`, `industry_match`;
 - `versions`: the profile version's number, the rubric's version, the prompt-schema hash (hex), the model
@@ -41,10 +44,17 @@ current-revision target of the active tuple published, its instance the current 
 
 **The chain** of a result (as `load_context` resumes it): its attempt, the attempt of its final draft, and
 every attempt each was resumed from. **Contested** (`None` unless the result is contested, §11.10 item 7):
-the chain's critic notes on the chain's drafts in order (`rounds`: the round, its triggers, the returned
-verdict, the derived outcome, and each review's target, assessment and suggested level, never its text), the
-chain's drafts other than the final one (`rejected_drafts`, by round: each criterion whose level differs from
-the final draft's), and `nulled_criteria`.
+- `rounds`: the chain's critic notes on the chain's drafts, in order: the round, its triggers, the returned
+  verdict, the derived outcome, and its `issues` as M3's validation of the round kept them
+  (`critic_notes.validation`, Ruling T6-d; `scoring.steps.note_issues` without the injection issue, which
+  `injection_suspected` shows). First each grounded dispute (`disputes`: its target, assessment and
+  suggested level, `None` unless a plain integer), then each required fact (`required`) the round did not
+  confirm (`fact_reviews`): `fact_rejected` when rejected, else `fact_unreviewed` when the critic did not
+  review it (`unreviewed`), else `fact_uncertain`. The critic's raw output (`review_json`) is never read: a
+  review it discarded, one of no valid target or a confirmed fact is no issue. No text is served;
+- `rejected_drafts`: the chain's drafts other than the final one, by round, each with the criteria whose
+  level differs from the final draft's;
+- `nulled_criteria`.
 
 **The description** (B14) is `job_revisions.description_text` as stored: one normalised line per paragraph
 of the sanitised ad, joined by line breaks (`normalize.html.html_to_text`), so the evidence spans, offsets in
@@ -52,15 +62,17 @@ code points into that text (Python's `str` indexing), index it as served. `lang`
 `ad_language` when `de` or `en`.
 
 **Postings** of the job by id, each with its own link (`jobs.links.POSTING_LINK`, http(s) only); `links` are
-`jobs.links.outbound_links`'. Links are never logged. **Merge events** into or from the job, oldest first;
-`reversible` while the event is a merge not reversed yet. **Feedback** newest first. `group` is
-`jobs.groups.group_view` of the job's group.
+`jobs.links.outbound_links`'. Links are never logged. **Merge events** into or from the job, oldest first
+(each side by its index: `merge_events_into`, `merge_events_from_job`); `reversible` while the event is a
+merge not reversed yet. **Feedback** newest first. `group` is `jobs.groups.group_view` of the job's group.
 
 Each stored document (a criterion, a deterministic criterion, a cap, a provenance entry, the salary, a
-repair, a critic review, a draft's level) is read on its own: one that cannot be read is left out and a
-warning names the job, the kind and how many were left out, never their content
-(`job_detail_records_skipped`).
-Every statement is static SQL with its tag, `/* jobs_detail.<kind> */`.
+repair, a stored dispute or required fact of a round, a draft's level) is read on its own: one that cannot be
+read is left out and a warning names the job whose document it is (for a deferred member's score, its
+representative), the kind and how many were left out, never their content (`job_detail_records_skipped`).
+The knockouts are read by the card's `cards.instance_knockouts`, so their skips are the card's warning,
+`job_card_records_skipped`, which names the result. Every statement is static SQL with its tag,
+`/* jobs_detail.<kind> */`.
 """
 
 from collections.abc import Mapping, Sequence
@@ -74,13 +86,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.errors import DomainError
-from jobhunter.jobs.cards import KnockoutOut, LinksOut, ScoreOut, TargetOut, instance_knockouts
+from jobhunter.jobs.cards import KnockoutOut, LinksOut, ScoreOut, TargetOut, instance_knockouts, target_of
 from jobhunter.jobs.groups import GroupOut, group_view, location_labels
 from jobhunter.jobs.history import HistoryPageOut, Position, history_page
 from jobhunter.jobs.links import HTTP_URL, POSTING_LINK, OutboundLinks, outbound_links
 from jobhunter.jobs.listing import Active, read_active
 from jobhunter.observability.logging import get_logger
 from jobhunter.scoring.rubric import LLM_CRITERIA
+from jobhunter.scoring.steps import FACT_REJECTED, FACT_UNCERTAIN, FACT_UNREVIEWED
 from jobhunter.types import JSONValue
 
 log = get_logger("jobhunter.jobs.detail")
@@ -223,6 +236,7 @@ class DetailScoreOut(ScoreOut):
     summary_en: str
     summary_de: str
     criteria: list[CriterionOut]
+    fact_evidence: list[EvidenceOut]
     det_criteria: list[DetCriterionOut]
     knockouts: list[KnockoutOut]
     caps_applied: list[CapOut]
@@ -293,8 +307,7 @@ class JobFeedbackOut(BaseModel):
 
 
 class JobDetailOut(BaseModel):
-    """A job's detail (module docstring). `history_next` is the first history page's next position,
-    unsigned: the route signs it into `history.next_cursor`; it is no member of the answer."""
+    """A job's detail (module docstring)."""
 
     job: JobOut
     description: DescriptionOut
@@ -308,6 +321,8 @@ class JobDetailOut(BaseModel):
     user: UserActionsOut | None
     feedback: list[JobFeedbackOut]
     history: HistoryPageOut
+    # The first history page's next position, unsigned: the route signs it into `history.next_cursor`. A
+    # private attribute, so no member of the answer and not in the OpenAPI document.
     _history_next: Position | None = PrivateAttr(default=None)
 
     @property
@@ -379,7 +394,7 @@ _CRITIC: Final = q(
 )
 _NOTES: Final = q(
     "/* jobs_detail.notes */ SELECT n.round, n.triggers, n.verdict_returned, n.derived_outcome, "
-    "n.review_json FROM critic_notes n JOIN score_drafts d ON d.id = n.draft_id "
+    "n.validation FROM critic_notes n JOIN score_drafts d ON d.id = n.draft_id "
     "WHERE n.attempt_id = ANY(CAST(:chain AS bigint[])) AND d.attempt_id = ANY(CAST(:chain AS bigint[])) "
     "ORDER BY n.id"
 )
@@ -398,10 +413,17 @@ _SOURCES: Final = q(
     "/* jobs_detail.sources */ SELECT id, source_id FROM source_instances "
     "WHERE id = ANY(CAST(:ids AS bigint[]))"
 )
+# The merge events into the job (`merge_events_into`) and from it (`merge_events_from_job`), each side by its
+# index; an event is from and into two different jobs (its CHECK), and the second side leaves out an event
+# into the job all the same, so each is listed once.
+_MERGE_COLUMNS: Final = (
+    "e.id, e.kind, e.from_job_id, e.into_job_id, e.created_at, "
+    "(e.kind <> 'unmerge' AND e.reversed_by_event_id IS NULL) AS reversible FROM merge_events e"
+)
 _MERGES: Final = q(
-    "/* jobs_detail.merges */ SELECT e.id, e.kind, e.from_job_id, e.into_job_id, e.created_at, "
-    "(e.kind <> 'unmerge' AND e.reversed_by_event_id IS NULL) AS reversible FROM merge_events e "
-    "WHERE e.into_job_id = :job OR e.from_job_id = :job ORDER BY e.created_at, e.id"
+    f"/* jobs_detail.merges */ SELECT {_MERGE_COLUMNS} WHERE e.into_job_id = :job "
+    f"UNION ALL SELECT {_MERGE_COLUMNS} WHERE e.from_job_id = :job AND e.into_job_id <> :job "
+    "ORDER BY created_at, id"
 )
 _FEEDBACK: Final = q(
     "/* jobs_detail.feedback */ SELECT f.id, f.kind, f.label, f.comment, f.created_at FROM score_feedback f "
@@ -459,14 +481,21 @@ class _Repair(_Lenient):
     path: str
 
 
-class _Review(_Lenient):
+class _Dispute(_Lenient):
+    """A grounded dispute of a round's validation (`steps._note_validation`)."""
+
     target: str
     assessment: str
-    suggested_level: Level
+    suggested_level: JSONValue = None
 
 
-class _Reviews(_Lenient):
-    reviews: list[JSONValue]
+class _Round(_Lenient):
+    """What a round's issues read of its validation (`critic_notes.validation`, `steps._note_validation`)."""
+
+    disputes: list[JSONValue] = Field(default_factory=list)
+    required: list[JSONValue] = Field(default_factory=list)
+    fact_reviews: dict[str, JSONValue] = Field(default_factory=dict)
+    unreviewed: list[JSONValue] = Field(default_factory=list)
 
 
 def _skipped(job_id: int, kind: str, count: int) -> None:
@@ -609,19 +638,6 @@ def _job(row: Any, provenance: Mapping[str, _Provenance], sources: Mapping[int, 
     )
 
 
-def _target(row: Any) -> TargetOut | None:
-    if row.target_id is None:
-        return None
-    return TargetOut(
-        id=row.target_id,
-        state=row.state,
-        state_reason=row.state_reason,
-        refusal_category=row.refusal_category,
-        similarity=None if row.similarity is None else float(row.similarity),
-        override=row.override,
-    )
-
-
 def _user(row: Any) -> UserActionsOut | None:
     if row.acted_job_id is None:
         return None
@@ -699,16 +715,20 @@ async def _critic(conn: AsyncConnection, chain: Sequence[int]) -> ModelOut | Non
     return None if found is None else ModelOut(model=found.model, effort=found.effort)
 
 
+def _has_score(row: Any) -> bool:
+    """Whether a score row has a result with a current instance that has a score (module docstring)."""
+    values = (row.score_mid, row.score_low, row.score_high, row.coverage, row.confidence)
+    return row.result_id is not None and row.instance_id is not None and all(v is not None for v in values)
+
+
 def _score(
     job_id: int,
     row: Any,
     evidence: Sequence[EvidenceOut],
     critic: ModelOut | None,
     scored_via: int | None,
-) -> DetailScoreOut | None:
-    values = (row.score_mid, row.score_low, row.score_high, row.coverage, row.confidence)
-    if row.result_id is None or row.instance_id is None or any(value is None for value in values):
-        return None
+) -> DetailScoreOut:
+    """The score of a row that has one (`_has_score`); `job_id` is the job whose result it is."""
     corrected = _corrected(job_id, row.final_validation)
     history = set(corrected)
     return DetailScoreOut(
@@ -732,6 +752,7 @@ def _score(
         summary_en=row.summary_en,
         summary_de=row.summary_de,
         criteria=_criteria(job_id, row, evidence),
+        fact_evidence=[e for e in evidence if e.subject not in LLM_CRITERIA],
         det_criteria=_det_criteria(job_id, row),
         knockouts=instance_knockouts(row),
         caps_applied=[
@@ -744,15 +765,34 @@ def _score(
     )
 
 
-def _issues(job_id: int, review: object) -> list[IssueOut]:
-    stored = _read(_Reviews, review)
+def _plain_level(value: JSONValue) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _issues(job_id: int, validation: object) -> list[IssueOut]:
+    """A round's issues from its validation (module docstring, Contested, Ruling T6-d): its grounded disputes,
+    then the required facts it did not confirm. A record that cannot be read is skipped with the warning."""
+    stored = _read(_Round, validation)
     if stored is None:
-        _skipped(job_id, "critic_reviews", 1)
+        _skipped(job_id, "critic_round", 1)
         return []
-    return [
-        IssueOut(criterion=r.target, issue=r.assessment, suggested_level=r.suggested_level)
-        for r in _listed(job_id, "critic_reviews", _Review, stored.reviews)
+    issues = [
+        IssueOut(criterion=d.target, issue=d.assessment, suggested_level=_plain_level(d.suggested_level))
+        for d in _listed(job_id, "critic_disputes", _Dispute, stored.disputes)
     ]
+    required = [name for name in stored.required if isinstance(name, str)]
+    unreviewed = {name for name in stored.unreviewed if isinstance(name, str)}
+    _skipped(job_id, "critic_facts", len(stored.required) - len(required))
+    for name in required:
+        status = stored.fact_reviews.get(name)
+        if status == "critic_rejected":
+            issue = FACT_REJECTED
+        elif status == "critic_confirmed":
+            continue
+        else:
+            issue = FACT_UNREVIEWED if name in unreviewed else FACT_UNCERTAIN
+        issues.append(IssueOut(criterion=name, issue=issue, suggested_level=None))
+    return issues
 
 
 def _levels(job_id: int, criteria: object) -> dict[str, int | None]:
@@ -768,7 +808,7 @@ async def _contested(conn: AsyncConnection, job_id: int, row: Any, chain: Sequen
             triggers=list(note.triggers),
             verdict=note.verdict_returned,
             outcome=note.derived_outcome,
-            issues=_issues(job_id, note.review_json),
+            issues=_issues(job_id, note.validation),
         )
         for note in await conn.execute(_NOTES, {"chain": list(chain)})
     ]
@@ -812,19 +852,20 @@ async def job_detail(conn: AsyncConnection, job_id: int, *, now: datetime) -> Jo
         scored, scoring = job_id, await _score_row(conn, job_id, active)
     if scoring is None:
         raise JobGone(job_id)
-    evidence: list[EvidenceOut] = []
-    critic: ModelOut | None = None
+    score: DetailScoreOut | None = None
     contested: ContestedOut | None = None
-    if scoring.result_id is not None:
+    if _has_score(scoring):  # else neither score nor contested data, and none of their reads
         evidence = [
             EvidenceOut.model_validate(e._asdict())
             for e in await conn.execute(_EVIDENCE, {"result": scoring.result_id})
         ]
+        critic: ModelOut | None = None
         if scoring.critic_outcome != "not_run":
             chain = await _chain(conn, scoring)
             critic = await _critic(conn, chain)
             if scoring.result_status == "contested":
-                contested = await _contested(conn, job_id, scoring, chain)
+                contested = await _contested(conn, scored, scoring, chain)
+        score = _score(scored, scoring, evidence, critic, scored if scored != job_id else None)
     provenance = _provenance(job_id, row.field_provenance)
     sources = await _sources(conn, provenance)
     postings = [
@@ -842,9 +883,9 @@ async def job_detail(conn: AsyncConnection, job_id: int, *, now: datetime) -> Jo
         description=_description(scoring, scored),
         postings=postings,
         links=LinksOut(open_ad=links.open_ad, adzuna=links.adzuna),
-        score=_score(job_id, scoring, evidence, critic, scored if scored != job_id else None),
+        score=score,
         contested=contested,
-        target=_target(row),
+        target=target_of(row),
         group=group,
         merge_events=merges,
         user=_user(row),

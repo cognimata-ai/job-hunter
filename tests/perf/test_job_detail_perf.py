@@ -5,8 +5,12 @@ German and English ads) and analysed, on a server of their own, behind the whole
 session included) at the lifespan's pool size. 50 of the scored cards, spread over the seed, are made
 contested drawers (`_contest`): their result contested with a nulled criterion, six criteria at the v1
 weights, a knockout candidate and its instance's record, deterministic criteria and a cap, a review chain of
-two drafts and two critic rounds, and six evidence rows (two of them description spans). Three of them are
-requested once to warm up, then each of the 50 once; every answer is a 200 with a score and contested data.
+two drafts and two critic rounds (their validated disputes and required facts), and six evidence rows (two
+of them description spans). Every fifth of them (`ENRICHED`) also has two postings with their links, merge
+events on both sides (two merged jobs into it, and a merge of it into another card reversed by an unmerge)
+and a feedback row (`_enrich`), so those reads are measured with rows. Three of them are requested once to
+warm up, then each of the 50 once; every answer is a 200 with a score and contested data, the enriched ones
+with their postings, merge events and feedback.
 The p95 (the nearest rank) is recorded (`record_property`) and printed, and must be below `P95_LIMIT_S`: the
 budget is never relaxed here.
 """
@@ -30,7 +34,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tests.support.fixtures import TEST_PASSWORD, TEST_USERNAME, ConfigFactory
 from tests.support.job_detail import Note, add_evidence, criteria_doc, published_of, set_weights, write_chain
-from tests.support.jobs_list import BulkSeed, bulk_seed_cards
+from tests.support.jobs_list import BulkSeed, add_posting, bulk_seed_cards
+from tests.support.m3 import insert_id, insert_job
 from tests.support.pg import PgServer, config_for, remove_pg_server, start_pg_server
 
 pytestmark = [pytest.mark.perf, pytest.mark.integration]
@@ -38,6 +43,7 @@ pytestmark = [pytest.mark.perf, pytest.mark.integration]
 CARDS: Final = 50_000
 DETAILS: Final = 50
 WARM_UP: Final = 3
+ENRICHED: Final = 5  # every fifth drawer has postings, merge events and feedback (`_enrich`)
 P95_LIMIT_S: Final = 0.200  # B29
 _CONTEST: Final = q(
     "UPDATE llm_results SET status = 'contested', critic_outcome = 'contested', critic_injection = 'none', "
@@ -72,9 +78,19 @@ _NOTES: Final = (
         ("T1",),
         "revise",
         "revise",
-        (("role_fit", "level_too_high", 3), ("skills", "evidence_overlooked", 4)),
+        disputes=(("role_fit", "level_too_high", 3), ("skills", "evidence_overlooked", 4)),
+        facts=(("work_permit:de", "fact_uncertain"),),
+        discarded=(("languages", "level_too_low", 2),),
     ),
-    Note(1, ("T0",), "revise", "revise", (("domain", "evidence_ungrounded", None),), effort="max"),
+    Note(
+        1,
+        ("T0",),
+        "revise",
+        "revise",
+        disputes=(("domain", "evidence_ungrounded", None),),
+        facts=(("work_permit:de", "fact_rejected"),),
+        effort="max",
+    ),
 )
 
 
@@ -93,6 +109,7 @@ async def _seed(server: PgServer) -> list[int]:
     try:
         seed = await bulk_seed_cards(engine, CARDS, scored_share=0.3, groups=500, langs=("de", "en"))
         details = await _contest(engine, seed)
+        await _enrich(engine, details[::ENRICHED], other=seed.untargeted_ids[0])  # no drawer
         async with engine.connect() as c:
             await c.execute(sa.text("ANALYZE"))  # as the owner
             await c.commit()
@@ -160,13 +177,45 @@ async def _contest_one(c: AsyncConnection, job_id: int) -> None:
     )
 
 
+async def _enrich(engine: AsyncEngine, job_ids: list[int], *, other: int) -> None:
+    """Postings, merge events on both sides and a feedback row for each of `job_ids` (module docstring)."""
+    for job_id in job_ids:
+        await add_posting(
+            engine, job_id, "jsearch", primary_link=f"https://jobs.publisher.example/ad/{job_id}"
+        )
+        await add_posting(engine, job_id, "adzuna", redirect=f"https://www.adzuna.example/land/ad/{job_id}")
+    async with engine.begin() as c:
+        for job_id in job_ids:
+            for _ in range(2):
+                merged = (await insert_job(c, merged_into_job_id=job_id)).job_id
+                await _event(c, "strong_key_merge", merged, job_id)
+            confirmed = await _event(c, "user_confirmed_merge", job_id, other)
+            unmerge = await _event(c, "unmerge", job_id, other)
+            await c.execute(_REVERSED, {"u": unmerge, "e": confirmed})
+            await insert_id(c, "score_feedback", {"job_id": job_id, "kind": "label", "label": "ok"})
+
+
+_REVERSED: Final = q("UPDATE merge_events SET reversed_by_event_id = :u WHERE id = :e")
+
+
+async def _event(c: AsyncConnection, kind: str, from_job: int, into_job: int) -> int:
+    values = {
+        "kind": kind,
+        "from_job_id": from_job,
+        "into_job_id": into_job,
+        "posting_ids": [],
+        "evidence": {},
+    }
+    return await insert_id(c, "merge_events", values)
+
+
 def p95(samples: list[float]) -> float:
     """The nearest-rank 95th percentile."""
     ordered = sorted(samples)
     return ordered[math.ceil(0.95 * len(ordered)) - 1]
 
 
-async def _get(client: httpx.AsyncClient, job_id: int) -> float:
+async def _get(client: httpx.AsyncClient, job_id: int, *, enriched: bool) -> float:
     started = time.perf_counter()
     r = await client.get(f"/api/jobs/{job_id}")
     elapsed = time.perf_counter() - started
@@ -174,6 +223,8 @@ async def _get(client: httpx.AsyncClient, job_id: int) -> float:
     body = r.json()
     assert body["score"] is not None and body["contested"] is not None, job_id
     assert len(body["contested"]["rounds"]) == 2 and body["score"]["criteria"], job_id
+    rows = (len(body["postings"]), len(body["merge_events"]), len(body["feedback"]))
+    assert rows == ((2, 4, 1) if enriched else (0, 0, 0)), (job_id, rows)
     return elapsed
 
 
@@ -198,9 +249,10 @@ async def test_the_detail_p95_is_under_200_ms(
                 "/api/auth/login", json={"username": TEST_USERNAME, "password": TEST_PASSWORD}
             )
             assert login.status_code == 204, login.text
+            enriched = set(details[::ENRICHED])
             for job_id in details[:WARM_UP]:
-                await _get(client, job_id)
-            samples = [await _get(client, job_id) for job_id in details]
+                await _get(client, job_id, enriched=job_id in enriched)
+            samples = [await _get(client, job_id, enriched=job_id in enriched) for job_id in details]
     finally:
         await engine.dispose()
     measured = p95(samples)

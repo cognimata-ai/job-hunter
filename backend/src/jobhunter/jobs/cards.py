@@ -75,6 +75,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.jobs import _sql
+from jobhunter.jobs.groups import location_labels
 from jobhunter.jobs.links import OutboundLinks, outbound_links
 from jobhunter.jobs.listing import Active, SelectedRow, read_active
 from jobhunter.jobs.query import ScoringBucket
@@ -507,7 +508,9 @@ def _score(row: Any) -> ScoreOut | None:
     )
 
 
-def _target(row: Any) -> TargetOut | None:
+def target_of(row: Any) -> TargetOut | None:
+    """The target of a row that holds `t`'s columns as the card's statement names them (`target_id`, `state`,
+    `state_reason`, `refusal_category`, `similarity`, `override`); `None` without one. The drawer's too."""
     if row.target_id is None:
         return None
     similarity = None if row.similarity is None else float(row.similarity)
@@ -531,12 +534,6 @@ def _user(row: Any) -> CardUserOut | None:
         hidden_at=row.hidden_at,
         has_note=bool(row.has_note),
     )
-
-
-def _labels(locations: object) -> list[str]:
-    if not isinstance(locations, list):
-        return []
-    return [str(x["label"]) for x in locations if isinstance(x, dict) and isinstance(x.get("label"), str)]
 
 
 def _badges(row: Any, availability: str) -> list[Badge]:
@@ -692,7 +689,7 @@ def _card(
         title=row.title,
         company=row.company_display,
         company_key=row.company_key,
-        locations=_labels(row.locations),
+        locations=location_labels(row.locations),
         location_kind=row.location_kind,
         work_modes=[mode for mode in _MODES if mode in row.work_mode_possible],
         work_mode_known=row.work_mode_source != "none",
@@ -706,7 +703,7 @@ def _card(
         ad_language=row.ad_language,
         user=_user(row),
         score=_score(row),
-        target=_target(row),
+        target=target_of(row),
         bucket=_bucket(row),
         badges=_badges(row, availability),
         knockouts=[_knockout(record, found) for record in records],

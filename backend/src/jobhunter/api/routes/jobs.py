@@ -441,7 +441,8 @@ async def get_job_history(
     ] = None,
     limit: Annotated[int, Query(ge=1, le=HISTORY_MAX_LIMIT)] = HISTORY_LIMIT,
 ) -> history.HistoryPageOut:
-    """A page of the job's score history in one read snapshot (module docstring)."""
+    """A page of the job's score history in one read snapshot (module docstring). The cursor is read before
+    the snapshot, so a cursor this route did not sign is 400 even for a gone job, before its 404."""
     key = cursor_key(cfg)
     after = None if cursor is None else _history_after(cursor, job_id, key)
     try:

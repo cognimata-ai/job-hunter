@@ -29,9 +29,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.job_detail import (
     LEVELS,
     Note,
+    add_attempt,
+    add_draft,
     add_evidence,
+    add_note,
     criteria_doc,
     published_of,
+    set_final,
     set_weights,
     write_chain,
 )
@@ -434,16 +438,14 @@ async def test_contested_detail_has_critic_rounds_and_the_rejected_drafts_level_
             p,
             drafts=[{"role_fit": 4, "languages": 3}, {"role_fit": 3, "languages": 2}],
             notes=[
-                Note(0, ("T1",), "revise", "revise", (("role_fit", "level_too_high", 3),)),
+                Note(0, ("T1",), "revise", "revise", disputes=(("role_fit", "level_too_high", 3),)),
                 Note(
                     1,
                     ("T0", "T3"),
                     "revise",
                     "revise",
-                    (
-                        ("languages", "evidence_ungrounded", None),
-                        ("mandatory_language:de", "fact_uncertain", None),
-                    ),
+                    disputes=(("languages", "evidence_ungrounded", None),),
+                    facts=(("mandatory_language:de", "fact_uncertain"),),
                     effort="max",
                 ),
             ],
@@ -498,6 +500,247 @@ async def test_contested_detail_has_critic_rounds_and_the_rejected_drafts_level_
         "nulled_criteria": ["languages"],
     }
     assert len(drafts) == 2
+
+
+async def test_the_rounds_issues_are_the_validated_rounds_disputes_and_required_facts(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None, log_events: Any
+) -> None:
+    """Ruling T6-d: a round's issues are those M3's validation of it kept (`steps.note_issues` but the
+    injection): its grounded disputes, then each required fact the review did not confirm (rejected,
+    uncertain, unreviewed). A discarded review, a review of no valid target and a confirmed fact are no issue,
+    though the critic's raw output holds them; a suggested level that is no plain integer is null, and a
+    stored dispute that cannot be read is left out with the content-free warning."""
+    (job_id,) = await seed_cards(engine, [scored(40, 60, state="published_contested")])
+    note = Note(
+        0,
+        ("T1",),
+        "revise",
+        "revise",
+        disputes=(("role_fit", "level_too_high", 3),),
+        facts=(
+            ("mandatory_language:de", "fact_rejected"),
+            ("degree:master", "fact_confirmed"),
+            ("certification:erfunden", "fact_uncertain"),
+            ("work_permit:de", None),
+        ),
+        discarded=(("skills", "level_too_low", 2),),
+        invalid=(("Ein erfundenes Freitextziel", "level_too_high"),),
+    )
+    async with engine.begin() as c:
+        p = await published_of(c, job_id)
+        await write_chain(c, p, drafts=[LEVELS], notes=[note])
+        await c.execute(
+            q(
+                "UPDATE critic_notes SET validation = jsonb_set(validation, '{disputes}', "
+                "(validation -> 'disputes') || :more) WHERE attempt_id = :a",
+                jsonb=["more"],
+            ),
+            {
+                "more": [
+                    {"target": "domain", "assessment": "should_be_unknown", "suggested_level": "3"},
+                    {"unreadable": True},
+                ],
+                "a": p.attempt_id,
+            },
+        )
+    (round_,) = (await detail(logged_in_client, job_id))["contested"]["rounds"]
+    assert round_["issues"] == [
+        {"criterion": "role_fit", "issue": "level_too_high", "suggested_level": 3},
+        {"criterion": "domain", "issue": "should_be_unknown", "suggested_level": None},
+        {"criterion": "mandatory_language:de", "issue": "fact_rejected", "suggested_level": None},
+        {"criterion": "certification:erfunden", "issue": "fact_uncertain", "suggested_level": None},
+        {"criterion": "work_permit:de", "issue": "fact_unreviewed", "suggested_level": None},
+    ]
+    skipped = [e for e in log_events() if e.get("event") == "job_detail_records_skipped"]
+    assert [(e["kind"], e["job_id"], e["skipped"]) for e in skipped] == [("critic_disputes", job_id, 1)]
+    assert "unreadable" not in repr(log_events())
+
+
+async def test_a_resumed_chain_over_two_attempts_gives_the_rounds_and_drafts_of_both(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None
+) -> None:
+    """The result's attempt was resumed from the first one, past an attempt under another evaluation policy
+    (as the claim links them): the chain's rounds and rejected drafts are those of the first and the last
+    attempt, the final draft the last one's, and the attempt left out adds nothing, as `load_context` keeps
+    them."""
+    (job_id,) = await seed_cards(engine, [scored(40, 60, state="published_contested")])
+    async with engine.begin() as c:
+        p = await published_of(c, job_id)
+        first = p.attempt_id
+        await write_chain(
+            c,
+            p,
+            drafts=[{"role_fit": 4}],
+            notes=[Note(0, ("T1",), "revise", "revise", disputes=(("role_fit", "level_too_high", 3),))],
+        )
+        policy = (
+            await c.execute(
+                sa.text(
+                    "INSERT INTO evaluation_policies (version_no, policy_hash, payload, "
+                    "projected_critic_rate) SELECT max(version_no) + 1, '\\x0f0f', '{}', 0.3 "
+                    "FROM evaluation_policies RETURNING id"
+                )
+            )
+        ).scalar_one()
+        stray = await add_attempt(
+            c, p, resumed_from=None, evaluation_policy_id=policy, outcome="failed_request"
+        )
+        stray_draft = await add_draft(c, p, stray, 0, {"role_fit": 1})
+        await add_note(c, p, stray, 1, stray_draft, Note(0, ("T9",), "accept", "accept"))
+        last = await add_attempt(c, p, resumed_from=first)
+        revision = await add_draft(c, p, last, 1, {"role_fit": 3}, generator=("claude-sonnet-5-5", "high"))
+        await add_note(
+            c,
+            p,
+            last,
+            2,
+            revision,
+            Note(
+                1, ("T0",), "revise", "incomplete", disputes=(("skills", "level_too_low", 4),), effort="max"
+            ),
+        )
+        await set_final(c, p, revision, 1)
+        await c.execute(
+            sa.text("UPDATE llm_results SET attempt_id = :a WHERE id = :r"), {"a": last, "r": p.result_id}
+        )
+    body = await detail(logged_in_client, job_id)
+    contested = body["contested"]
+    assert [
+        (r["round"], r["triggers"], r["outcome"], r["issues"][0]["criterion"]) for r in contested["rounds"]
+    ] == [
+        (1, ["T1"], "revise", "role_fit"),
+        (2, ["T0"], "incomplete", "skills"),
+    ]
+    assert contested["rejected_drafts"] == [
+        {"round": 0, "level_diff": [{"criterion": "role_fit", "from_level": 4, "to_level": 3}]}
+    ]
+    assert body["score"]["versions"]["generator"] == {"model": "claude-sonnet-5-5", "effort": "high"}
+    assert body["score"]["versions"]["critic"] == {"model": "claude-opus-5-5", "effort": "max"}
+
+
+async def test_an_accepted_result_the_critic_reviewed_has_its_critic_and_no_contested_data(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None
+) -> None:
+    (job_id,) = await seed_cards(engine, [scored(60, 80)])
+    async with engine.begin() as c:
+        p = await published_of(c, job_id)
+        await write_chain(
+            c,
+            p,
+            drafts=[LEVELS],
+            notes=[
+                Note(
+                    0,
+                    ("T2",),
+                    "accept",
+                    "accept",
+                    facts=(("work_permit:de", "fact_confirmed"),),
+                    effort="medium",
+                )
+            ],
+        )
+        await c.execute(
+            sa.text(
+                "UPDATE llm_results SET critic_outcome = 'accepted', critic_injection = 'none' WHERE id = :r"
+            ),
+            {"r": p.result_id},
+        )
+    body = await detail(logged_in_client, job_id)
+    assert (body["score"]["result_status"], body["score"]["critic_outcome"]) == ("accepted", "accepted")
+    assert body["score"]["versions"]["critic"] == {"model": "claude-opus-5-5", "effort": "medium"}
+    assert body["contested"] is None
+
+
+async def test_a_contested_result_without_a_current_instance_has_neither_score_nor_contested_data(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None
+) -> None:
+    """Between a scope flip and its recompute a published result has no current instance under the active
+    scope: the drawer has no score, and so no contested data either (as on the card)."""
+    (job_id,) = await seed_cards(engine, [scored(40, 60, state="published_contested")])
+    async with engine.begin() as c:
+        p = await published_of(c, job_id)
+        await write_chain(
+            c,
+            p,
+            drafts=[LEVELS],
+            notes=[Note(0, ("T1",), "revise", "revise", disputes=(("role_fit", "level_too_high", 3),))],
+        )
+        await c.execute(
+            sa.text(
+                "UPDATE det_results SET is_current = false, superseded_at = now() WHERE llm_result_id = :r"
+            ),
+            {"r": p.result_id},
+        )
+    body = await detail(logged_in_client, job_id)
+    assert (body["score"], body["contested"]) == (None, None)
+    assert body["target"]["state"] == "published_contested"
+
+
+# --- fact evidence ----------------------------------------------------------------------------------------
+
+
+async def test_fact_evidence_holds_the_evidence_of_facts(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None
+) -> None:
+    """Ruling T6-a: the evidence rows of a fact (a subject that is no criterion key) are the score's
+    `fact_evidence`, in row order, with the criteria evidence's span rule; no criterion holds them."""
+    text = "Wir suchen erfundene Entwickler.\nDeutschkenntnisse auf C1-Niveau sind erforderlich."
+    quotes = {"role_fit": "erfundene Entwickler", "mandatory_language:de": "Deutschkenntnisse auf C1-Niveau"}
+    (job_id,) = await seed_cards(engine, [scored(50, 70, description=text)])
+    async with engine.begin() as c:
+        p = await published_of(c, job_id)
+        await c.execute(
+            q("UPDATE llm_results SET criteria = :c WHERE id = :r", jsonb=["c"]),
+            {"c": criteria_doc(), "r": p.result_id},
+        )
+        await add_evidence(
+            c,
+            p.result_id,
+            [
+                *(
+                    {
+                        "subject": subject,
+                        "source_kind": "description",
+                        "quote": quote,
+                        "span_start": text.index(quote),
+                        "span_end": text.index(quote) + len(quote),
+                    }
+                    for subject, quote in quotes.items()
+                ),
+                {
+                    "subject": "work_permit:de",
+                    "source_kind": "structured_field",
+                    "field_name": "locations",
+                    "quote": "Berlin",
+                },
+            ],
+        )
+    body = await detail(logged_in_client, job_id)
+    score = body["score"]
+    start = text.index(quotes["mandatory_language:de"])
+    assert score["fact_evidence"] == [
+        {
+            "subject": "mandatory_language:de",
+            "source_kind": "description",
+            "field_name": None,
+            "quote": quotes["mandatory_language:de"],
+            "span_start": start,
+            "span_end": start + len(quotes["mandatory_language:de"]),
+        },
+        {
+            "subject": "work_permit:de",
+            "source_kind": "structured_field",
+            "field_name": "locations",
+            "quote": "Berlin",
+            "span_start": None,
+            "span_end": None,
+        },
+    ]
+    served = body["description"]["text"]
+    first = score["fact_evidence"][0]
+    assert served[first["span_start"] : first["span_end"]] == first["quote"]
+    held = [e["subject"] for c in score["criteria"] for e in c["evidence"]]
+    assert held == ["role_fit"]
 
 
 # --- a deferred member ------------------------------------------------------------------------------------
@@ -584,6 +827,25 @@ async def test_a_deferred_member_shows_the_representatives_result_and_descriptio
         "completeness": "full",
         "from_job_id": split,
     }
+
+
+async def test_a_deferred_members_warnings_name_the_representative(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, active_tuple: int, clock: None, log_events: Any
+) -> None:
+    """The drawer of a deferred member reads its representative's result: a record of it that cannot be read
+    is warned about under the representative, whose documents it is."""
+    representative, member = await seed_cards(engine, [scored(60, 80), Card(deferred_to=0)])
+    criteria = criteria_doc()
+    criteria["skills"] = {"level": "unreadable"}
+    async with engine.begin() as c:
+        p = await published_of(c, representative)
+        await c.execute(
+            q("UPDATE llm_results SET criteria = :c WHERE id = :r", jsonb=["c"]),
+            {"c": criteria, "r": p.result_id},
+        )
+    assert (await detail(logged_in_client, member))["score"]["scored_via_job_id"] == representative
+    skipped = [e for e in log_events() if e.get("event") == "job_detail_records_skipped"]
+    assert [(e["kind"], e["job_id"], e["skipped"]) for e in skipped] == [("criteria", representative, 1)]
 
 
 # --- gone jobs --------------------------------------------------------------------------------------------
@@ -677,6 +939,18 @@ async def test_a_synthetic_or_unknown_job_is_404_without_survivor(
     for bad in ("0", "-1", "abc", str(2**63)):
         r = await logged_in_client.get(f"/api/jobs/{bad}")
         assert (r.status_code, r.json()["code"]) == (422, "validation_failed"), bad
+
+
+async def test_a_job_without_a_current_revision_is_404_without_survivor(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: None
+) -> None:
+    async with engine.begin() as c:
+        job_id = (await insert_job(c)).job_id
+        await c.execute(sa.text("UPDATE jobs SET current_revision_id = NULL WHERE id = :j"), {"j": job_id})
+    for url in (f"/api/jobs/{job_id}", f"/api/jobs/{job_id}/history"):
+        r = await logged_in_client.get(url)
+        assert r.status_code == 404, (url, r.text)
+        assert (r.json()["code"], r.json()["merged_into_job_id"]) == ("not_found", None), url
 
 
 # --- stored documents -------------------------------------------------------------------------------------
@@ -1012,6 +1286,21 @@ async def test_a_bad_history_cursor_is_400(
         assert (r.status_code, r.json()["code"]) == (422, "validation_failed"), limit
     r = await logged_in_client.get(f"/api/jobs/{one}/history", params={"cursor": "x" * 2049})
     assert r.status_code == 422
+
+
+async def test_a_bad_cursor_is_400_before_a_gone_job_is_404(
+    logged_in_client: httpx.AsyncClient, engine: AsyncEngine, clock: None
+) -> None:
+    """The history route reads its cursor before the snapshot: a merged job's history with a cursor this
+    route did not sign is 400 `invalid_cursor`, without one 404 with the survivor (the intended order)."""
+    async with engine.begin() as c:
+        survivor = (await insert_job(c)).job_id
+        merged = (await insert_job(c, merged_into_job_id=survivor)).job_id
+    url = f"/api/jobs/{merged}/history"
+    r = await logged_in_client.get(url, params={"cursor": "not-a-cursor"})
+    assert (r.status_code, r.json()["code"]) == (400, "invalid_cursor")
+    r = await logged_in_client.get(url)
+    assert (r.status_code, r.json()["merged_into_job_id"]) == (404, survivor)
 
 
 async def published_of_engine(engine: AsyncEngine, job_id: int) -> int:

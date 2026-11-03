@@ -260,7 +260,8 @@ export interface paths {
         };
         /**
          * Get Job History
-         * @description A page of the job's score history in one read snapshot (module docstring).
+         * @description A page of the job's score history in one read snapshot (module docstring). The cursor is read before
+         *     the snapshot, so a cursor this route did not sign is 400 even for a gone job, before its 404.
          */
         get: operations["get_job_history_api_jobs__job_id__history_get"];
         put?: never;
@@ -1244,6 +1245,8 @@ export interface components {
             det_criteria: components["schemas"]["DetCriterionOut"][];
             /** Det Result Id */
             det_result_id: number;
+            /** Fact Evidence */
+            fact_evidence: components["schemas"]["EvidenceOut"][];
             /** High */
             high: string;
             /** Industry Match */
@@ -1769,8 +1772,7 @@ export interface components {
         };
         /**
          * JobDetailOut
-         * @description A job's detail (module docstring). `history_next` is the first history page's next position,
-         *     unsigned: the route signs it into `history.next_cursor`; it is no member of the answer.
+         * @description A job's detail (module docstring).
          */
         JobDetailOut: {
             contested: components["schemas"]["ContestedOut"] | null;

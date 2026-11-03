@@ -1,17 +1,19 @@
-"""M4 schema: the list indexes of the unscored section and of the posted sort, the radius functions, and the
-`replay_raw_items` operation kind.
+"""M4 schema: the list indexes of the unscored section and of the posted sort, the index of the merge events
+from a job, the radius functions, and the `replay_raw_items` operation kind.
 
 Revision ID: 0009_m4_ui
 Revises: 0008_m3_scoring
 
-Staged by docs/superpowers/plans/2026-11-02-m4-api-and-web-ui.md (Task 2), as static SQL, one `op.execute`
-per statement:
+Staged by docs/superpowers/plans/2026-11-02-m4-api-and-web-ui.md (Task 2; Task 6 added T6), as static SQL,
+one `op.execute` per statement:
 
   B1  score_targets_unscored_rank: the unscored section of the Jobs list (§14.3) walks a tuple's targets,
       but for the published, the deferred duplicates and the cancelled, by similarity (NULLS LAST), then job
       id, both descending;
   B6  jobs_list_posted_any: the `posted` sort over every availability. M1's jobs_list_posted leads with
       `availability`, so it serves only a list filtered to one availability;
+  T6  merge_events_from_job: the drawer's merge events from a job (Task 6, Ruling T6-e). M1 indexes only
+      `into_job_id` (merge_events_into), so the events a job was merged in by would scan the table;
   B5  geo_km(lat1, lon1, lat2, lon2): the haversine distance in km on the sphere of radius 6371.0088 km, the
       formula of `geo.gazetteer.distance_km` term by term, `asin(least(1, sqrt(a)))` included; and
       job_within_km(locations, lat, lon, radius_km): true when a candidate of a `unique` or `ambiguous` entry
@@ -30,8 +32,8 @@ per statement:
       0001_m0_baseline.py, so the downgrade restores the CHECK as 0001 wrote it.
 
 No view changes and no INSERT. Unlike the earlier migrations, 0009 has an exact downgrade: it drops the
-functions and the indexes and restores 0001's CHECK. A database that holds a `replay_raw_items` operation
-refuses that CHECK (23514) and stays at 0009: the downgrade never deletes an operation.
+functions and the three indexes and restores 0001's CHECK. A database that holds a `replay_raw_items`
+operation refuses that CHECK (23514) and stays at 0009: the downgrade never deletes an operation.
 """
 
 from collections.abc import Sequence
@@ -60,6 +62,9 @@ CREATE INDEX score_targets_unscored_rank
 -- B6: the posted sort over every availability
 CREATE INDEX jobs_list_posted_any ON jobs (posted_at_effective DESC NULLS LAST, id DESC)
   WHERE merged_into_job_id IS NULL;""")
+    op.execute("""\
+-- T6: the merge events from a job (the drawer's; merge_events_into serves those into it)
+CREATE INDEX merge_events_from_job ON merge_events (from_job_id);""")
     op.execute("""\
 -- B5: geo.gazetteer.distance_km, the haversine on the sphere of radius 6371.0088 km
 CREATE FUNCTION geo_km(lat1 float8, lon1 float8, lat2 float8, lon2 float8) RETURNS float8
@@ -101,5 +106,6 @@ def downgrade() -> None:
     )
     op.execute("DROP FUNCTION job_within_km(jsonb, float8, float8, float8);")
     op.execute("DROP FUNCTION geo_km(float8, float8, float8, float8);")
+    op.execute("DROP INDEX merge_events_from_job;")
     op.execute("DROP INDEX jobs_list_posted_any;")
     op.execute("DROP INDEX score_targets_unscored_rank;")
