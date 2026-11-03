@@ -10,10 +10,11 @@ plan's rulings, deviations, tasks, blocker ids or spec line numbers.
 
 import re
 from collections.abc import Iterator
-from typing import Any, Final
+from typing import Any, Final, get_args
 
 import pytest
 from jobhunter.api.app import create_app
+from jobhunter.observability.health import RunStatus
 
 from tests.unit.test_openapi_m3 import M3_ROUTES
 
@@ -39,9 +40,11 @@ M4_ROUTES: Final[dict[tuple[str, str], set[str] | frozenset[str]]] = {
     ("get", "/api/alerts"): {"400", "401", "422", "429"},
     ("get", "/api/system/quota"): {"401", "429"},
 }
-# What a published description must not cite (Ruling T6-g).
+# What a published description must not cite (Ruling T6-g). A ruling is matched in any case and in the plural
+# (the codebase writes "ruling R14-1" and "rulings R14-1 and R14-2" as well as "Ruling P13"); `Task`, the
+# blocker ids and the line numbers stay case-sensitive, so that ordinary words do not match.
 INTERNAL_CITATION: Final = re.compile(
-    r"module docstring|\bRuling\b|\bDeviation \d|\bTask \d+\b|\bB\d{2}\b|\bL\d{3,4}\b"
+    r"module docstring|(?i:\brulings?\b)|\bDeviation \d|\bTask \d+\b|\bB\d{2}\b|\bL\d{3,4}\b"
 )
 
 
@@ -86,3 +89,22 @@ def test_no_description_cites_an_internal_document(document: dict[str, Any]) -> 
     found = list(texts(document))
     assert len(found) > 100  # the walk reaches the operations' and the schemas' texts
     assert [(path, text) for path, text in found if INTERNAL_CITATION.search(text)] == []
+
+
+def test_the_guard_matches_a_ruling_in_any_case_and_the_other_citations_as_written() -> None:
+    cited_forms = (
+        "(Ruling P13)",
+        "(ruling R14-1)",
+        "rulings R14-1 and R14-2",
+        "RULING T6-g",
+        "plan Deviation 29",
+    )
+    for cited in (*cited_forms, "Task 10", "B16", "L4977", "(module docstring)"):
+        assert INTERNAL_CITATION.search(cited), cited
+    for plain in ("a task 10 minutes long", "a b16 value", "the l4977 key", "a deviation of 2", "overruled"):
+        assert not INTERNAL_CITATION.search(plain), plain
+
+
+def test_a_run_s_status_is_one_of_the_run_statuses(document: dict[str, Any]) -> None:
+    status = document["components"]["schemas"]["RunOut"]["properties"]["status"]
+    assert status["enum"] == list(get_args(RunStatus))

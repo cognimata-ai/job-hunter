@@ -14,7 +14,7 @@ Every datum is invented.
 
 import re
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Final, get_args
 
 import httpx
@@ -25,7 +25,7 @@ from jobhunter.api.pagination import GOLDEN_CASES_SORT, RUNS_SORT, cursor_key, e
 from jobhunter.clock import utcnow
 from jobhunter.graphs.collect.nodes.finalize import PartialCause, decide_status, run_revisions
 from jobhunter.graphs.collect.report import FallbackRequests, build_report
-from jobhunter.observability.lists import RunStatus
+from jobhunter.observability.health import RunStatus
 from jobhunter.types import JSONValue
 from jobhunter.worker import runs
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -171,10 +171,12 @@ async def test_runs_cursor_pages_and_a_golden_case_cursor_is_400(
     golden = encode_list_cursor(sort=GOLDEN_CASES_SORT, dir="asc", last_key=[1], filters={}, key=key)
     assert (await page(logged_in_client, "/api/golden-cases", cursor=golden))["items"] == []  # its own list's
     assert await refused(logged_in_client, URL, cursor=golden) == (400, "invalid_cursor")
-    # this list's sort, but not its key's shape: an id alone, a time without its zone, a bool for the id
+    # this list's sort, but not its key's shape: an id alone, a time without its zone, a time in another zone
+    # than UTC (the same instant), a bool for the id
     forgeries: list[list[JSONValue]] = [
         [made[0]],
         [now.replace(tzinfo=None).isoformat(), made[0]],
+        [now.astimezone(timezone(timedelta(hours=1))).isoformat(timespec="microseconds"), made[0]],
         [iso(now), True],
     ]
     for last_key in forgeries:

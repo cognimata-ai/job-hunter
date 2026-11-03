@@ -29,7 +29,8 @@ window of each provider, the LLM spend of the month (`llm_spend`, plan Task 16),
 (`scoring_health`, M3 Task 18), disk and database sizes, the versions and the embedder's health (with its
 model id) as the readiness check read it. Run ages are reported, never readiness gates. `RunOut` is the api's
 view of a run row, shared with `POST /api/runs` and the run lists (`observability.lists`); every select of one
-names `RUN_COLUMNS`, its fields.
+either names `RUN_COLUMNS`, its fields, or fills a `worker.runs.RunRow`, whose required `status_reason` the
+validation of `RunOut` checks too.
 
 **The score lane** (`scoring`, §17.5 L5552 "oldest pending target age", M3 Task 18), read without a lock (a
 save holding `active_config FOR UPDATE` never holds the page): the running cycle's id, the pause guard's
@@ -258,6 +259,20 @@ _ACTIVE_PAYLOAD: Final = q(
 )
 
 
+# The values of the `runs.status` CHECK (§7.6), in its order.
+RunStatus = Literal[
+    "queued",
+    "running",
+    "succeeded",
+    "partial",
+    "failed",
+    "failed_invariant",
+    "cancelled",
+    "missed",
+    "skipped_overlap",
+]
+
+
 class RunOut(BaseModel):
     """A run as the api shows it (`runs` row, §7.6); its times in UTC. `status_reason` is why it has its
     status, as a code (the first partial cause, the failed invariant, `bug`, `resume_exhausted`,
@@ -266,7 +281,7 @@ class RunOut(BaseModel):
     id: int
     kind: str
     trigger: str
-    status: str
+    status: RunStatus
     status_reason: str | None
     scheduled_slot: datetime | None
     include_paid: bool
@@ -440,6 +455,8 @@ async def scoring_health(conn: AsyncConnection, *, now: datetime, fake_llm: bool
     )
 
 
+# Its sections come from `quota_health`, `llm_spend`, `scoring_health`, `metrics.refresh_table_bytes` and the
+# caller's readiness report (`EmbedderOut`).
 class SystemHealthOut(BaseModel):
     """The detailed health (§17.5). Ages are seconds at the caller's `now`.
 
@@ -448,11 +465,11 @@ class SystemHealthOut(BaseModel):
       `last_fully_successful_run_age_s`: of a `succeeded` one only.
     - `run_age_state`: see `run_age_state`.
     - `queue_depths`: procrastinate jobs by queue and status.
-    - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
-    - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
-    - `scoring`: the score lane (`scoring_health`).
-    - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
-    - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
+    - `quota`: each quota provider's current window, `null` before its first one.
+    - `llm`: the month's LLM spend, `null` when nothing is seeded.
+    - `scoring`: the score lane.
+    - `table_bytes`: the size of every table of the `public` schema, in bytes.
+    - `embedder`: the embedder's health as the readiness check read it.
     """
 
     ready: ReadyState

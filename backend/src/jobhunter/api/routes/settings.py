@@ -175,9 +175,9 @@ class DryRunIn(BaseModel):
     payload: JsonValue
 
 
+# A `settings.validate.FieldIssue`.
 class FieldIssueOut(BaseModel):
-    """A refused field (`settings.validate.FieldIssue`): its path from `payload`, a code and a message that
-    never repeats the value."""
+    """A refused field: its path from `payload`, a code and a message that never repeats the value."""
 
     field: str
     code: IssueCode

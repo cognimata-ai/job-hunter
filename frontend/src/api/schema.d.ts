@@ -1833,7 +1833,7 @@ export interface components {
          * FieldError
          * @description One invalid field of a `validation_failed` problem; `field` is the pydantic `loc` joined with ".".
          *
-         *     `message` can echo the sender's own input (ruling T14-h).
+         *     `message` can echo the sender's own input.
          */
         FieldError: {
             /** Code */
@@ -1845,8 +1845,7 @@ export interface components {
         };
         /**
          * FieldIssueOut
-         * @description A refused field (`settings.validate.FieldIssue`): its path from `payload`, a code and a message that
-         *     never repeats the value.
+         * @description A refused field: its path from `payload`, a code and a message that never repeats the value.
          */
         FieldIssueOut: {
             /**
@@ -2935,8 +2934,11 @@ export interface components {
             scheduled_slot: string | null;
             /** Started At */
             started_at: string | null;
-            /** Status */
-            status: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "succeeded" | "partial" | "failed" | "failed_invariant" | "cancelled" | "missed" | "skipped_overlap";
             /** Status Reason */
             status_reason: string | null;
             /** Trigger */
@@ -3139,11 +3141,11 @@ export interface components {
         };
         /**
          * SegmentOut
-         * @description One run of `stripped_text_preview` and the raw span it stands for (ruling R14-2): `text` (the same
-         *     characters), `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact
-         *     inside a restored personal span, which is restored by its span; `restorable` false for one that the edit
-         *     set cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript
-         *     client must convert them, for example with `Array.from(text)`.
+         * @description One run of `stripped_text_preview` and the raw span it stands for: `text` (the same characters),
+         *     `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact inside a
+         *     restored personal span, which is restored by its span; `restorable` false for one that the edit set
+         *     cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript client
+         *     must convert them, for example with `Array.from(text)`.
          */
         SegmentOut: {
             /** Category */
@@ -3333,11 +3335,11 @@ export interface components {
          *       `last_fully_successful_run_age_s`: of a `succeeded` one only.
          *     - `run_age_state`: see `run_age_state`.
          *     - `queue_depths`: procrastinate jobs by queue and status.
-         *     - `quota`: each quota provider's current window, `null` before its first one (`quota_health`).
-         *     - `llm`: the month's LLM spend (`llm_spend`), `null` when nothing is seeded.
-         *     - `scoring`: the score lane (`scoring_health`).
-         *     - `table_bytes`: every table of the `public` schema (`metrics.refresh_table_bytes`).
-         *     - `embedder`: the embedder's health as the caller's readiness check read it (`EmbedderOut`).
+         *     - `quota`: each quota provider's current window, `null` before its first one.
+         *     - `llm`: the month's LLM spend, `null` when nothing is seeded.
+         *     - `scoring`: the score lane.
+         *     - `table_bytes`: the size of every table of the `public` schema, in bytes.
+         *     - `embedder`: the embedder's health as the readiness check read it.
          */
         SystemHealthOut: {
             alerts_open: components["schemas"]["AlertsOpen"];
@@ -3421,8 +3423,8 @@ export interface components {
         };
         /**
          * TextEditsOut
-         * @description The draft's stored edit set (ruling R14-1): the replacements put back and the spans removed, as spans
-         *     of the raw text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it.
+         * @description The draft's stored edit set: the replacements put back and the spans removed, as spans of the raw
+         *     text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it.
          */
         TextEditsOut: {
             /** Removed */
@@ -3493,9 +3495,9 @@ export interface components {
         };
         /**
          * ValidationIssueOut
-         * @description An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal. The
-         *     code `schema_mismatch` (path `""`, no proposal) says that the stored profile no longer matches the profile
-         *     schema and is not shown.
+         * @description An issue of the profile: where, what kind, a fixed message, a proposal. The code `schema_mismatch`
+         *     (path `""`, no proposal) says that the stored profile no longer matches the profile schema and is not
+         *     shown.
          */
         ValidationIssueOut: {
             /** Code */

@@ -21,7 +21,10 @@ async def test_the_document_is_served_to_a_session_only(
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "application/json"
     document = r.json()
-    assert document["paths"] == create_app().api.openapi()["paths"]
+    app_document = create_app().api.openapi()
+    assert document["paths"] == app_document["paths"]
+    assert document["components"] == app_document["components"]  # the problem contract's schemas included
+    assert "Problem" in document["components"]["schemas"]
     assert URL not in document["paths"]
     for default in ("/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"):  # FastAPI's, disabled
         assert (await logged_in_client.get(default)).status_code == 404, default

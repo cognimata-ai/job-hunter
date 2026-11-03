@@ -32,11 +32,13 @@ from jobhunter.api.pagination import (
     ListDir,
     canonical_json,
     cursor_key,
+    decode_id_cursor,
     decode_job_cursor,
     decode_list_cursor,
     encode_job_cursor,
     encode_list_cursor,
     filters_hash,
+    list_page,
 )
 from jobhunter.config import AppConfig
 from jobhunter.crypto import hkdf_sha256
@@ -208,6 +210,60 @@ def test_decimals_encode_as_fixed_point_strings() -> None:
     for not_finite in (Decimal("NaN"), Decimal("Infinity"), float("nan")):
         with pytest.raises(ValueError):
             canonical_json({"min_score": not_finite})
+
+
+# ---- the id cursor and the page (M4 Task 10) ---------------------------------------------------------------
+
+
+def decode_id(cursor: str, **kw: Any) -> int:
+    args: dict[str, Any] = {
+        "key": KEY,
+        "sort": SETTINGS_VERSIONS_SORT,
+        "dir": "desc",
+        "filters": FILTERS,
+    } | kw
+    return decode_id_cursor(cursor, **args)
+
+
+def test_an_id_cursor_round_trips_and_refuses_another_list_or_filter() -> None:
+    assert decode_id(list_cursor(last_key=[17])) == 17
+    assert (
+        decode_id(list_cursor(sort=ALERTS_SORT, last_key=[1], filters={}), sort=ALERTS_SORT, filters={}) == 1
+    )
+    cursor = list_cursor(last_key=[17])
+    refused(lambda: decode_id(cursor, filters={}))
+    refused(lambda: decode_id(cursor, sort=SCORE_CYCLES_SORT))
+    refused(lambda: decode_id(cursor, dir="asc"))
+    refused(lambda: decode_id("not-a-cursor"))
+
+
+@pytest.mark.parametrize(
+    "last_key",
+    [[0], [-3], [True], ["17"], [1.5], [None], [], [17, 1]],
+    ids=["zero", "negative", "bool", "string", "float", "null", "empty", "two-parts"],
+)
+def test_an_id_cursor_needs_one_id_of_at_least_1(last_key: list[JSONValue]) -> None:
+    refused(lambda: decode_id(list_cursor(last_key=last_key)))
+
+
+def test_a_page_keeps_limit_rows_and_has_a_cursor_only_when_more_were_read() -> None:
+    def page(rows: list[int], limit: int) -> tuple[list[int], str | None]:
+        return list_page(
+            rows,
+            limit=limit,
+            last_key=lambda n: [n * 10],
+            sort=SCORE_CYCLES_SORT,
+            dir="desc",
+            filters=FILTERS,
+            key=KEY,
+        )
+
+    items, cursor = page([5, 4, 3], 2)  # read with `limit + 1`: a third row means a next page
+    assert items == [5, 4] and cursor is not None
+    assert decode_list(cursor, sort=SCORE_CYCLES_SORT) == [40]  # the last kept row's key, this list's sort
+    assert page([5, 4], 2) == ([5, 4], None)  # exactly `limit`: the last page
+    assert page([5], 2) == ([5], None)
+    assert page([], 2) == ([], None)
 
 
 def test_the_list_sorts_are_namespaced_and_distinct() -> None:

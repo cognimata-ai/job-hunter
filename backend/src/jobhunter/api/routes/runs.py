@@ -30,13 +30,7 @@ from starlette.responses import JSONResponse, Response
 from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import domain_problem
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
-from jobhunter.api.pagination import (
-    RUNS_SORT,
-    cursor_key,
-    decode_list_cursor,
-    encode_list_cursor,
-    invalid_cursor,
-)
+from jobhunter.api.pagination import RUNS_SORT, cursor_key, decode_list_cursor, invalid_cursor, list_page
 from jobhunter.api_idempotency import (
     IDEMPOTENCY_HEADER,
     StoredResponse,
@@ -49,8 +43,8 @@ from jobhunter.config import AppConfig
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.db.sql import q
 from jobhunter.observability import lists
-from jobhunter.observability.health import RunOut
-from jobhunter.observability.lists import RunDetailOut, RunsPageOut, RunStatus
+from jobhunter.observability.health import RunOut, RunStatus
+from jobhunter.observability.lists import RunDetailOut, RunsPageOut
 from jobhunter.types import JSONValue
 from jobhunter.worker.runs import request_manual_run
 from jobhunter.worker.tasks import defer_in_tx
@@ -165,13 +159,15 @@ async def list_runs(
     after = _after(cursor, key, filters)
     async with read_snapshot(engine) as conn:
         rows = await lists.runs_page(conn, after=after, status=status, limit=limit + 1)
-    items = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit:
-        last = items[-1]
-        next_cursor = encode_list_cursor(
-            sort=RUNS_SORT, dir="desc", last_key=[_utc_iso(last.queued_at), last.id], filters=filters, key=key
-        )
+    items, next_cursor = list_page(
+        rows,
+        limit=limit,
+        last_key=lambda run: [_utc_iso(run.queued_at), run.id],
+        sort=RUNS_SORT,
+        dir="desc",
+        filters=filters,
+        key=key,
+    )
     return RunsPageOut(items=items, next_cursor=next_cursor)
 
 

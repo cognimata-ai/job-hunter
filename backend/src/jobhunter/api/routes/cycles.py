@@ -14,13 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.openapi import SESSION_RESPONSES
-from jobhunter.api.pagination import (
-    SCORE_CYCLES_SORT,
-    cursor_key,
-    decode_list_cursor,
-    encode_list_cursor,
-    invalid_cursor,
-)
+from jobhunter.api.pagination import SCORE_CYCLES_SORT, cursor_key, decode_id_cursor, list_page
 from jobhunter.config import AppConfig
 from jobhunter.db.snapshot import read_snapshot
 from jobhunter.observability import lists
@@ -32,16 +26,6 @@ router = APIRouter(
 
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
-
-
-def _after(cursor: str | None, key: bytes) -> int | None:
-    """The id the next page starts below, from a cursor of this list; `None` for the first page."""
-    if cursor is None:
-        return None
-    match decode_list_cursor(cursor, key=key, sort=SCORE_CYCLES_SORT, dir="desc", filters={}):
-        case [int(cycle_id)] if not isinstance(cycle_id, bool) and cycle_id >= 1:
-            return cycle_id
-    raise invalid_cursor()
 
 
 @router.get(
@@ -59,13 +43,20 @@ async def list_score_cycles(
 ) -> ScoreCyclesPageOut:
     """The score cycles, newest first, keyset-paged (§14.3)."""
     key = cursor_key(cfg)
-    after = _after(cursor, key)
+    after = (
+        None
+        if cursor is None
+        else decode_id_cursor(cursor, key=key, sort=SCORE_CYCLES_SORT, dir="desc", filters={})
+    )
     async with read_snapshot(engine) as conn:
         rows = await lists.score_cycles_page(conn, after_id=after, limit=limit + 1)
-    items = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit:
-        next_cursor = encode_list_cursor(
-            sort=SCORE_CYCLES_SORT, dir="desc", last_key=[items[-1].id], filters={}, key=key
-        )
+    items, next_cursor = list_page(
+        rows,
+        limit=limit,
+        last_key=lambda cycle: [cycle.id],
+        sort=SCORE_CYCLES_SORT,
+        dir="desc",
+        filters={},
+        key=key,
+    )
     return ScoreCyclesPageOut(items=items, next_cursor=next_cursor)

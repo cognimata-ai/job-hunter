@@ -12,7 +12,9 @@ The sorts are namespaced by their list (D35): `GOLDEN_CASES_SORT` is `golden_cas
 
 - A list cursor (`encode_list_cursor` / `decode_list_cursor`) has the section `all`, a direction and a
   `last_key` list whose shape the route checks. A cursor of M3's form (a bare `sort` such as `version_no`) is
-  refused: the client starts again from the first page.
+  refused: the client starts again from the first page. `decode_id_cursor` decodes the common shape `[id]`,
+  an id of at least 1; `list_page` cuts a page from rows read with `limit + 1` and signs its `next_cursor`
+  (`None` on the last page) (M4 Task 10).
 - A job cursor (`JobCursor`, `encode_job_cursor` / `decode_job_cursor`) is `desc`, in the `scored` or
   `unscored` section of a score sort or the `all` section of a date sort, with the last row's sort value, its
   job id, the ranking generation `gen` of the first page and `posted_after`, the absolute cut-off of the
@@ -188,6 +190,37 @@ def decode_list_cursor(
     ):
         raise invalid_cursor()
     return list(last_key)
+
+
+def decode_id_cursor(
+    cursor: str, *, key: bytes, sort: str, dir: ListDir, filters: Mapping[str, JSONValue]
+) -> int:
+    """The id of a cursor `encode_list_cursor` made with `last_key = [id]` for this sort, direction and these
+    filters: an `int` of at least 1 (a `bool` is none); else 400 `invalid_cursor`."""
+    match decode_list_cursor(cursor, key=key, sort=sort, dir=dir, filters=filters):
+        case [int(last_id)] if not isinstance(last_id, bool) and last_id >= 1:
+            return last_id
+    raise invalid_cursor()
+
+
+def list_page[T](
+    rows: Sequence[T],
+    *,
+    limit: int,
+    last_key: Callable[[T], Sequence[JSONValue]],
+    sort: str,
+    dir: ListDir,
+    filters: Mapping[str, JSONValue],
+    key: bytes,
+) -> tuple[list[T], str | None]:
+    """A list page from `rows` read with `limit + 1`: their first `limit`, and the cursor after the last of
+    those (its `last_key`) when a further row was read; else `None`, the last page."""
+    items = list(rows[:limit])
+    if len(rows) <= limit:
+        return items, None
+    return items, encode_list_cursor(
+        sort=sort, dir=dir, last_key=last_key(items[-1]), filters=filters, key=key
+    )
 
 
 @dataclass(frozen=True)

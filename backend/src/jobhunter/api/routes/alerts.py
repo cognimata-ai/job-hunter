@@ -29,13 +29,7 @@ from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import Problem
 from jobhunter.api.models import UtcDatetime
 from jobhunter.api.openapi import CSRF_RESPONSES, SESSION_RESPONSES
-from jobhunter.api.pagination import (
-    ALERTS_SORT,
-    cursor_key,
-    decode_list_cursor,
-    encode_list_cursor,
-    invalid_cursor,
-)
+from jobhunter.api.pagination import ALERTS_SORT, cursor_key, decode_id_cursor, list_page
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.db.snapshot import read_snapshot
@@ -65,17 +59,6 @@ def _filters(status: AlertStatus | None) -> dict[str, JSONValue]:
     return {} if status is None else {"status": status}
 
 
-def _after(cursor: str | None, key: bytes, filters: dict[str, JSONValue]) -> int | None:
-    """The id the next page starts below, from a cursor of this list and these filters; `None` for the first
-    page."""
-    if cursor is None:
-        return None
-    match decode_list_cursor(cursor, key=key, sort=ALERTS_SORT, dir="desc", filters=filters):
-        case [int(alert_id)] if not isinstance(alert_id, bool) and alert_id >= 1:
-            return alert_id
-    raise invalid_cursor()
-
-
 @router.get(
     "",
     response_model=AlertsPageOut,
@@ -93,15 +76,22 @@ async def list_alerts(
     """The alerts, newest first, with their status, keyset-paged (§14.3)."""
     key = cursor_key(cfg)
     filters = _filters(status)
-    after = _after(cursor, key, filters)
+    after = (
+        None
+        if cursor is None
+        else decode_id_cursor(cursor, key=key, sort=ALERTS_SORT, dir="desc", filters=filters)
+    )
     async with read_snapshot(engine) as conn:
         rows = await lists.alerts_page(conn, after_id=after, status=status, limit=limit + 1)
-    items = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit:
-        next_cursor = encode_list_cursor(
-            sort=ALERTS_SORT, dir="desc", last_key=[items[-1].id], filters=filters, key=key
-        )
+    items, next_cursor = list_page(
+        rows,
+        limit=limit,
+        last_key=lambda alert: [alert.id],
+        sort=ALERTS_SORT,
+        dir="desc",
+        filters=filters,
+        key=key,
+    )
     return AlertsPageOut(items=items, next_cursor=next_cursor)
 
 

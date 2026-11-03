@@ -43,24 +43,12 @@ from jobhunter.api.models import DecimalOut, UtcDatetime
 from jobhunter.db.sql import q
 from jobhunter.graphs.collect.nodes.finalize import PARTIAL_CAUSES, PartialCause
 from jobhunter.observability.alerts import Severity
-from jobhunter.observability.health import QUOTA_PROVIDERS, RUN_COLUMNS, RunOut
+from jobhunter.observability.health import QUOTA_PROVIDERS, RUN_COLUMNS, RunOut, RunStatus
 from jobhunter.observability.logging import get_logger
 from jobhunter.quota import ledger
 from jobhunter.quota.windows import Provider, WindowState, current_snapshot
 from jobhunter.scoring.cycles import CycleTrigger
 
-# The values of the `runs.status` CHECK (§7.6).
-RunStatus = Literal[
-    "queued",
-    "running",
-    "succeeded",
-    "partial",
-    "failed",
-    "failed_invariant",
-    "cancelled",
-    "missed",
-    "skipped_overlap",
-]
 # The values of the `score_cycles.status` CHECK (§7.6).
 CycleStatus = Literal["running", "completed", "failed"]
 AlertStatus = Literal["open", "acknowledged", "resolved"]
@@ -241,7 +229,7 @@ async def quota_summary(conn: AsyncConnection) -> dict[Provider, QuotaDetailOut 
     windows = {provider: await current_snapshot(conn, provider) for provider in QUOTA_PROVIDERS}
     sums = {
         row.provider: (int(row.used), int(row.reserved), int(row.ambiguous), int(row.adjustments))
-        for row in await conn.execute(_LEDGER_SUMS, {"counted": list(ledger.COUNTED)})
+        for row in await conn.execute(_LEDGER_SUMS, ledger.counted_params())
     }
     out: dict[Provider, QuotaDetailOut | None] = {}
     for provider, w in windows.items():

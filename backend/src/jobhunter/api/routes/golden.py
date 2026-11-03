@@ -37,13 +37,7 @@ from jobhunter.api.deps import get_config, get_engine, require_session
 from jobhunter.api.errors import Problem, domain_problem
 from jobhunter.api.models import clean_text
 from jobhunter.api.openapi import BODY_LIMIT_RESPONSES, CSRF_RESPONSES, SESSION_RESPONSES
-from jobhunter.api.pagination import (
-    GOLDEN_CASES_SORT,
-    cursor_key,
-    decode_list_cursor,
-    encode_list_cursor,
-    invalid_cursor,
-)
+from jobhunter.api.pagination import GOLDEN_CASES_SORT, cursor_key, decode_id_cursor, list_page
 from jobhunter.clock import utcnow
 from jobhunter.config import AppConfig
 from jobhunter.scoring import golden
@@ -160,17 +154,6 @@ def _filters(active: bool | None) -> dict[str, JSONValue]:
     return {} if active is None else {"active": active}
 
 
-def _after(cursor: str | None, key: bytes, filters: dict[str, JSONValue]) -> int | None:
-    """The id the next page starts after, from a cursor of this list and these filters; `None` for the first
-    page."""
-    if cursor is None:
-        return None
-    match decode_list_cursor(cursor, key=key, sort=GOLDEN_CASES_SORT, dir="asc", filters=filters):
-        case [int(case_id)] if not isinstance(case_id, bool) and case_id >= 1:
-            return case_id
-    raise invalid_cursor()
-
-
 @router.get(
     "/api/golden-cases",
     response_model=GoldenCasesPageOut,
@@ -188,16 +171,23 @@ async def list_golden_cases(
     """The golden cases by id, keyset-paged (§14.3)."""
     key = cursor_key(cfg)
     filters = _filters(active)
-    after = _after(cursor, key, filters)
+    after = (
+        None
+        if cursor is None
+        else decode_id_cursor(cursor, key=key, sort=GOLDEN_CASES_SORT, dir="asc", filters=filters)
+    )
     async with engine.connect() as conn:
         rows = await golden.list_cases(conn, after_id=after, limit=limit + 1, active=active)
-    items = [GoldenCaseOut.of(row) for row in rows[:limit]]
-    next_cursor = None
-    if len(rows) > limit:
-        next_cursor = encode_list_cursor(
-            sort=GOLDEN_CASES_SORT, dir="asc", last_key=[items[-1].id], filters=filters, key=key
-        )
-    return GoldenCasesPageOut(items=items, next_cursor=next_cursor)
+    cases, next_cursor = list_page(
+        rows,
+        limit=limit,
+        last_key=lambda case: [case.id],
+        sort=GOLDEN_CASES_SORT,
+        dir="asc",
+        filters=filters,
+        key=key,
+    )
+    return GoldenCasesPageOut(items=[GoldenCaseOut.of(case) for case in cases], next_cursor=next_cursor)
 
 
 @router.patch(

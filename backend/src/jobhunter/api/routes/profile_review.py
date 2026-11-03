@@ -209,20 +209,22 @@ class SpanOut(BaseModel):
     end: int
 
 
+# The stored edit set: ruling R14-1.
 class TextEditsOut(BaseModel):
-    """The draft's stored edit set (ruling R14-1): the replacements put back and the spans removed, as spans
-    of the raw text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it."""
+    """The draft's stored edit set: the replacements put back and the spans removed, as spans of the raw
+    text. A client sends it back as `span_edits` (`restore` and `remove` by span) to keep it."""
 
     restored: list[SpanOut]
     removed: list[SpanOut]
 
 
+# A segment of the preview: ruling R14-2.
 class SegmentOut(BaseModel):
-    """One run of `stripped_text_preview` and the raw span it stands for (ruling R14-2): `text` (the same
-    characters), `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact
-    inside a restored personal span, which is restored by its span; `restorable` false for one that the edit
-    set cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript
-    client must convert them, for example with `Array.from(text)`."""
+    """One run of `stripped_text_preview` and the raw span it stands for: `text` (the same characters),
+    `replacement` (`category`; `replacement_index` into the fresh strip, `null` for a contact inside a
+    restored personal span, which is restored by its span; `restorable` false for one that the edit set
+    cannot name), or `removed`. Offsets are Unicode code points, not UTF-16 code units: a JavaScript client
+    must convert them, for example with `Array.from(text)`."""
 
     kind: SegmentKind
     category: Category | None
@@ -234,10 +236,11 @@ class SegmentOut(BaseModel):
     raw_end: int
 
 
+# An issue of `profile.validate.Issue`.
 class ValidationIssueOut(BaseModel):
-    """An issue of the profile (`profile.validate.Issue`): where, what kind, a fixed message, a proposal. The
-    code `schema_mismatch` (path `""`, no proposal) says that the stored profile no longer matches the profile
-    schema and is not shown."""
+    """An issue of the profile: where, what kind, a fixed message, a proposal. The code `schema_mismatch`
+    (path `""`, no proposal) says that the stored profile no longer matches the profile schema and is not
+    shown."""
 
     path: str
     code: IssueCode | Literal["schema_mismatch"]

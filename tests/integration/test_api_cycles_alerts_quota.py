@@ -214,6 +214,12 @@ async def test_alert_statuses_open_acknowledged_resolved(
         "invalid_cursor",
     )
     assert await refused(logged_in_client, ALERTS_URL, cursor=cursor) == (400, "invalid_cursor")
+    unfiltered = await page(logged_in_client, ALERTS_URL, limit=1)  # and the other way round
+    assert ids(unfiltered) == [made["acknowledged_then_resolved"]] and unfiltered["next_cursor"] is not None
+    for status in ("open", "resolved"):
+        assert await refused(
+            logged_in_client, ALERTS_URL, status=status, cursor=unfiltered["next_cursor"]
+        ) == (400, "invalid_cursor"), status
     assert await refused(logged_in_client, ALERTS_URL, status="closed") == (422, "validation_failed")
 
 
