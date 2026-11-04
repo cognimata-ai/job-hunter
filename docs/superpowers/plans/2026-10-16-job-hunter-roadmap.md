@@ -4,7 +4,7 @@
 
 **Goal:** build the approved Job Hunter platform in six milestones. Each milestone ships working, tested software.
 
-**Spec:** [`docs/superpowers/specs/2026-10-16-job-hunter-design.md`](../specs/2026-10-16-job-hunter-design.md) (revision 3.5, approved). Council record: [`docs/council/`](../../council/).
+**Spec:** [`docs/superpowers/specs/2026-10-16-job-hunter-design.md`](../specs/2026-10-16-job-hunter-design.md) (revision 3.6, approved). Council record: [`docs/council/`](../../council/).
 
 ## Why milestones
 

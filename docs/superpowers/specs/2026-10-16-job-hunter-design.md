@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Status | **Approved** — revision 3.5. Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Revision 3.4 (2026-10-21, the user's decision after spike V19): the default `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured prompt overhead (§6.9.1). Revision 3.5 (2026-10-29, the user's decisions U1–U4 and the M3 plan's deviations): the generator output schema of §11.5 is candidate C of spike V4b (generic fact items plus generic criterion items; the §11.5 schema of revision 3.4 is rejected by the API as too large), with §11.4, §11.6, §10.6, §10.11 and §11.9 adjusted to it; §11.3's language anchor follows §11.4 (B2 or higher is `met`); §6.8's Arbeitnow page yield is V8's 17.5 h, so the coverage-risk warning fires for intervals above 35 h (a 7-day interval raises it); `display.timezone` is a `schedule` field (§13.1); and the M3 plan's recorded deviations (its Deviations 1–41) on §3.3.3, §6.9.3, §7.11–7.13, §7.16, §7.18, §9.2, §9.3, §9.6, §9.7, §10.6, §10.10, §10.11, §11.6, §11.8, §11.13, §13.1, §14.2, §17.2, §17.6, §18.6, §20.1, §21.4 and §22, with the M3 execution rulings T3-b (§11.4, §11.6), T4-a (§7.3), T5-e (§11.6), T9-f (§11.7.2), T11-f and T11-g (§10.4), T12-b (§9.6.2), T15-a and T15-d (§8.7), T16-a, T16-d, T16-f, T16-g and T17-a (§10.10, §17.4, §17.6), T18-a (§17.5), T19-c (§7.4), T20-a (§13.2), T20-d (§10.3, §11.13), T22-c and T22-d′ (§8.6.1, §8.6.2), T22-e (§9.7) and M2-C1 (§12.3), and the overhead of V19's M3 re-count, 1,878 tokens (§6.9.1). Audit trail: `docs/council/` |
-| Known open points (revision 3.5) | Recorded, not decided: (1) §10.10 has a purge cancel the affected `in_batch` targets individually, while §20.2 step 1 requests the submission's cancel first; M5 decides (`targets.delete_target_set` records it). (2) §12.3's header-name rule takes a name only from a line that is nothing but a name, so mixed header lines (`Max Mustermann \| Senior Backend Engineer`, `Max Mustermann, M.Sc.`, `Lebenslauf Max Mustermann`, `Max Mustermann · max@… · +49 …`) and glued URLs (`LinkedInhttps://…`, an e-mail glued to a URL) leave contact data in the text; the user's review of the stripped text is the guarantee (a decision for the user). (3) §13.4: the scope apply's final staleness check recomputes in Python under `active_config FOR UPDATE` (about 0.7–1 s per 10,000 published results). (4) §18.3 C28: the old attempt's gateway path releases the entry `not_billed(never_dispatched)`, not the new owner; the end state is the same. (5) §8.6: the merge, unmerge and conflict routes (M4) must retry 40P01, and every `user_job_actions` write sets `updated_at`. (6) §6.9.4/§21.4 size the first reservation with the v1 schema's 8.0 KB bound (36,800 tokens at the overhead floor; 37,678 at the measured overhead); candidate C's 1,713 B schema would give about 31,400 tokens; the constant moves only on Task 26's measurement. |
+| Status | **Approved** — revision 3.6. Revision 3.3 was approved by the user on 2026-10-16, after council approval by Codex GPT-6 Astra and Claude Fable 5.1 in six rounds of 4-eyes review, with the chair's decisions on three items (§2.4). Revision 3.4 (2026-10-21, the user's decision after spike V19): the default `scoring.batch_max_items` is 500 instead of 1,000, so the $2.00 overrun buffer covers the measured prompt overhead (§6.9.1). Revision 3.5 (2026-10-29, the user's decisions U1–U4 and the M3 plan's deviations): the generator output schema of §11.5 is candidate C of spike V4b (generic fact items plus generic criterion items; the §11.5 schema of revision 3.4 is rejected by the API as too large), with §11.4, §11.6, §10.6, §10.11 and §11.9 adjusted to it; §11.3's language anchor follows §11.4 (B2 or higher is `met`); §6.8's Arbeitnow page yield is V8's 17.5 h, so the coverage-risk warning fires for intervals above 35 h (a 7-day interval raises it); `display.timezone` is a `schedule` field (§13.1); and the M3 plan's recorded deviations (its Deviations 1–41) on §3.3.3, §6.9.3, §7.11–7.13, §7.16, §7.18, §9.2, §9.3, §9.6, §9.7, §10.6, §10.10, §10.11, §11.6, §11.8, §11.13, §13.1, §14.2, §17.2, §17.6, §18.6, §20.1, §21.4 and §22, with the M3 execution rulings T3-b (§11.4, §11.6), T4-a (§7.3), T5-e (§11.6), T9-f (§11.7.2), T11-f and T11-g (§10.4), T12-b (§9.6.2), T15-a and T15-d (§8.7), T16-a, T16-d, T16-f, T16-g and T17-a (§10.10, §17.4, §17.6), T18-a (§17.5), T19-c (§7.4), T20-a (§13.2), T20-d (§10.3, §11.13), T22-c and T22-d′ (§8.6.1, §8.6.2), T22-e (§9.7) and M2-C1 (§12.3), and the overhead of V19's M3 re-count, 1,878 tokens (§6.9.1). Revision 3.6 (2026-11-04, the user's decisions U1–U3 of 2026-11-02 and the M4 plan's deviations): a submitted batch whose retrieve keeps failing can be released (§7.16.6, §10.10, §14.2, §17.6); the ranking generation bumps on scoring-state bucket changes only (§7.1); the Jobs list's sections, filters, group cards, counts and cursor are settled (§14.3, §15.3, §15.5); the header status, query, watchlist, activation-preview, eval-run and facet routes and the route extensions (§14.2); `totp_required` (§14.4, §15.2, §16.3); background polls keep no session alive (§16.4); presets A/B/C (§10.3, §13.1); needs attention and the replay operation (§7.3, §14.2, §15.7); the SPA's serving, stack and E2E tooling (§4.1, §4.2, §15, §18.4, §18.7, §18.8); and the M4 plan's recorded deviations that change spec text, and the M4 tasks' recorded rulings (T-numbers in `.superpowers` ledgers are not cited). Audit trail: `docs/council/` |
+| Known open points (revision 3.6) | Recorded, not decided: (1) §10.10 has a purge cancel the affected `in_batch` targets individually, while §20.2 step 1 requests the submission's cancel first; M5 decides (`targets.delete_target_set` records it). (2) §12.3's header-name rule takes a name only from a line that is nothing but a name, so mixed header lines (`Max Mustermann \| Senior Backend Engineer`, `Max Mustermann, M.Sc.`, `Lebenslauf Max Mustermann`, `Max Mustermann · max@… · +49 …`) and glued URLs (`LinkedInhttps://…`, an e-mail glued to a URL) leave contact data in the text; the user's review of the stripped text is the guarantee (a decision for the user). (3) §13.4: the scope apply's final staleness check recomputes in Python under `active_config FOR UPDATE` (about 0.7–1 s per 10,000 published results). (4) §18.3 C28: the old attempt's gateway path releases the entry `not_billed(never_dispatched)`, not the new owner; the end state is the same. (6) §6.9.4/§21.4 size the first reservation with the v1 schema's 8.0 KB bound (36,800 tokens at the overhead floor; 37,678 at the measured overhead); candidate C's 1,713 B schema would give about 31,400 tokens; the constant moves only on Task 26's measurement. (7) §12.3: marking an extra span for removal in the text review uses the native text selection, which keyboard users reach with caret browsing; a keyboard-only marking path is open. |
 | Date | 2026-10-16 |
 | Source of decisions | Architecture council (Claude Opus 5.5, Claude Fable 5.1, Codex GPT-6 Astra), consensus v3 (v3.1 fixes), the user's decisions recorded during design review, the user's cost decision of revision 2 (§2.1 U14), and the chair's decisions of revision 3 (§2.4) |
 | Scope | One deployment for one user, German job market |
@@ -391,6 +391,7 @@ Versions are pinned exactly in `uv.lock` and `package-lock.json`. Container imag
 
 - Versions without a mark come from the council's research snapshot (`research/tech`).
 - Versions marked † are not in the research. They were read from PyPI, npm or Docker Hub on 2026-10-16, and the first `uv lock` / `npm install` MUST re-confirm them; a different resolution is recorded in the lock PR.
+- The frontend versions that revision 3.6 adds (marked †) are the M4 plan's pins, as `frontend/package.json` holds them.
 - `anthropic` 1.x depends on the separate distribution `httpx2` (import name `httpx2`; per the bundled Claude API SDK notes). The source adapters use `httpx` 0.28.1. These are two different packages and coexist in one lockfile; objects from one are never passed to the other (the gateway uses `anthropic.Timeout`, §10.1 G3).
 
 | Area | Component | Version |
@@ -441,13 +442,28 @@ Versions are pinned exactly in `uv.lock` and `package-lock.json`. Container imag
 | | TypeScript | † 5.9.3; TS 7.0.2 adopted only after spike V16 |
 | | openapi-typescript | † 7.13.0 |
 | | vitest | † 5.0.5 |
+| | i18next | † 26.5.2 |
+| | react-i18next | † 17.1.0 |
+| | @radix-ui/react-checkbox | † 1.4.1 |
+| | @radix-ui/react-dismissable-layer | † 1.2.1 |
+| | @radix-ui/react-focus-scope | † 1.3.1 |
+| | @radix-ui/react-popover | † 1.3.1 |
+| | @radix-ui/react-portal | † 1.2.0 |
+| | @radix-ui/react-slider | † 1.6.1 |
+| | @radix-ui/react-tabs | † 1.2.1 |
 | Testing | pytest | † 9.1.1 |
 | | pytest-asyncio | † 1.4.0 |
 | | hypothesis | † 6.170.0 |
 | | respx | † 0.23.1 |
 | | ruff | † 0.17.1 |
 | | mypy | † 2.4.0 (`--strict`) |
-| | @playwright/cli | † 0.1.22 (Microsoft playwright-cli), playwright † 1.64.1 |
+| | @playwright/test | † 1.56.1 (the E2E suite, §18.7) |
+| | @playwright/cli | † 0.1.22 (Microsoft playwright-cli: the visual checks) |
+| | @axe-core/playwright | † 4.14.0 |
+| | @testing-library/dom | † 10.4.2 |
+| | @testing-library/react | † 16.3.3 |
+| | @testing-library/user-event | † 14.6.8 |
+| | jsdom | † 29.1.1 |
 
 ### 4.2 Repository layout
 
@@ -458,10 +474,10 @@ job-hunter/
 │   ├── config.py                 # env loading + startup assertions (§16.8)
 │   ├── cli.py                    # `jobhunter` CLI: user, totp, migrate, worker, manifests, restore, startup-check, fixtures, schema-dry-run
 │   ├── api/                      # FastAPI app
-│   │   ├── app.py, deps.py, errors.py (RFC 9457), pagination.py (signed keyset cursors)
+│   │   ├── app.py, deps.py, errors.py (RFC 9457), pagination.py (signed keyset cursors), retry.py (40P01)
 │   │   ├── security.py (sessions, CSRF, headers, throttling), static.py (SPA)
 │   │   └── routes/ auth.py jobs.py groups.py targets.py labelling.py profile.py settings.py
-│   │               watchlist.py runs.py system.py alerts.py privacy.py health.py
+│   │               watchlist.py runs.py cycles.py eval_runs.py system.py alerts.py privacy.py health.py docs.py
 │   ├── worker/ main.py lock.py epoch.py watchdog.py heartbeat.py tasks.py operations.py tick.py
 │   │           reconcilers.py shutdown.py
 │   ├── graphs/
@@ -479,32 +495,42 @@ job-hunter/
 │   │        schemas/{generator.py, critic.py, profile.py, queries.py}   # Pydantic + JSON-schema export
 │   ├── sources/ base.py http.py ratelimit.py breaker.py jsearch.py serpapi.py adzuna.py arbeitnow.py
 │   │            ats/{greenhouse,lever,ashby,personio,recruitee,smartrecruiters}.py watchlist_patterns.py
-│   │            parsing/{dates.py, salary.py, locations.py, extensions.py, employment.py}
+│   │            watchlist_listing.py replay.py parsing/{dates.py, salary.py, locations.py, extensions.py, employment.py}
 │   ├── quota/ windows.py ledger.py pacing.py planner.py fallback.py dryrun.py
 │   ├── normalize/ titles.py companies.py urls.py keys.py html.py language.py quality.py fields.py
 │   ├── dedup/ identity.py merge.py groups.py shingles.py representative.py
 │   ├── availability/ rules.py snapshots.py
+│   ├── jobs/ query.py _sql.py listing.py cards.py links.py facets.py detail.py history.py groups.py
+│   │         actions.py labelling.py   # the Jobs list, the drawer, the user's actions (§14.3, §15.3–15.6)
+│   ├── queries/ authoring.py proposals.py listing.py
+│   ├── settings/ model.py validate.py derive.py effects.py dryrun.py llm_projection.py save.py activate.py
+│   │             active.py scope_apply.py presets.py
 │   ├── scoring/ rubric/v1.yaml filters.py admission.py aggregate.py det_criteria.py knockouts.py
 │   │            validator.py injection.py triggers.py evaluation_policy.py versioning.py calibration.py
+│   │            eval_runs.py
 │   ├── profile/ upload.py parse_client.py contacts.py schema.py validate.py activation.py
 │   ├── geo/ gazetteer.py data/{de_places.tsv, non_de_places.tsv}   # GeoNames CC-BY 4.0, attributed
-│   ├── db/ base.py session.py locks.py transitions.py models/*.py views.sql
+│   ├── db/ base.py session.py locks.py transitions.py snapshot.py models/*.py views.sql
 │   │       migrations/ (alembic env + versions)
 │   ├── observability/ logging.py redact.py metrics.py alerts.py ntfy.py deadman.py langsmith.py health.py
+│   │                  status.py attention.py lists.py   # the header status, needs attention, the lists
 │   ├── api_idempotency.py        # Idempotency-Key store (§14.1)
 │   └── privacy/ retention.py deletion_graph.py purge.py fences.py export.py manifests.py replay.py
 │                restore_verify.py identities.py   # §19.5 replay, verification, identity advancement
 ├── embedder/ Dockerfile app.py model.lock
 ├── docparse/ Dockerfile worker.py        # network_mode: none; reads/writes the parse_jobs volume
-├── frontend/ package.json vite.config.ts tsconfig.json
-│   └── src/ main.tsx router.tsx api/{client.ts, schema.d.ts (generated)} i18n/{en,de}.json
-│       pages/{LoginPage,JobsPage,ProfileSettingsPage}.tsx
-│       components/{HeaderStrip,FilterPanel,JobCard,ScoreBadge,DetailDrawer,DuplicateGroupCard,
-│                   CriteriaTable,EvidenceHighlighter,LabelBar,CvReview,SettingsForm,DryRunPanel,...}.tsx
+├── frontend/ package.json vite.config.ts tsconfig.json scripts/check-dist-csp.mjs
+│   ├── src/ main.tsx router.tsx api/{client.ts, schema.d.ts (generated)} i18n/{en,de,codes}.json
+│   │   app/ (shell, session) pages/{LoginPage,JobsPage,ProfileSettingsPage}.tsx styles/{tokens,global}.css
+│   │   components/ (Drawer, ConfirmDialog, ProblemBox, OutboundLink, Toaster, ...)
+│   │   jobs/ (FilterPanel, JobCard, ScoreBadge, GroupCard, DetailDrawer, CriteriaTable, EvidenceHighlighter,
+│   │         LabelMode, ...) settings/ (the sections, DryRunPanel, cv/) system/ (HeaderStrip, Banners,
+│   │         NeedsAttention, ...) profile/
+│   └── e2e/ playwright.config.ts specs/ support/ fixtures/ visual/   # §18.7
 ├── deploy/ compose.yaml Caddyfile secrets.example (names only) postgres/{postgresql.conf, init/}
 │           firewall/docker-user.nft backup/{Dockerfile (FROM the app image),crontab,backup_set.sh,
 │           manifest_shipper.sh,restore.sh,restore-test.sh}
-├── tests/ unit/ property/ integration/ crash/ contract/{fixtures (scrubbed)}/ payload/ eval/ e2e/
+├── tests/ unit/ property/ integration/ crash/ contract/{fixtures (scrubbed)}/ payload/ eval/
 ├── docs/ PRIVACY.md RUNBOOK.md superpowers/specs/
 └── .github/workflows/ ci.yml eval-manual.yml schema-dry-run-manual.yml
 ```
@@ -1134,7 +1160,7 @@ def dry_run(proposed: Settings, active: Settings, now) -> DryRunResult:
 
 With the 17.5 h page yield (V8) and the unchanged page cap, `arbeitnow_coverage_risk` fires for intervals above 35 h: none at 24 h or 35 h, a warning at 36, 48, 72, 120 and 168 h. A 7-day collection interval therefore raises it (10.6 expected pages against a cap of 7).
 
-`llm_projection` reports the bucket rate, the bucket capacity, `ĉ`, the projected critic rate of the proposed evaluation policy and `targets_per_month = (scoring share − cache overhead) / ĉ` (§21.5). `arrival_per_month` is the trailing 7-day rate of new targets × 30, or 3,000 when there is no history.
+`llm_projection` reports the bucket rate, the bucket capacity, `ĉ`, the projected critic rate of the proposed evaluation policy and `targets_per_month = (scoring share − cache overhead) / ĉ` (§21.5). The cache-write share is added to a central `ĉ` only, `scoring share / (ĉ + cache writes per cycle / min_cycle_targets)` (§21.3); a history `ĉ` is the mean of measured attempt costs, which already include their cache writes, and divides the scoring share as it is. `arrival_per_month` is the trailing 7-day rate of new targets × 30, or 3,000 when there is no history. Only the active tuple's targets without a `bulk_operation_id` count (an activation's re-score is no arrival), and the 3,000 apply while the tuple has no target older than 7 days or its latest activation is younger than 7 days.
 
 ### 6.9 LLM spend: monthly budget lock, USD bucket, bulk budgets
 
@@ -1252,7 +1278,7 @@ CREATE TABLE ranking_state (                       -- §14.3 pagination generati
 );
 ```
 
-**Ranking generation.** Every transaction that can change the order or the membership of the Jobs list runs `UPDATE ranking_state SET generation = generation + 1, updated_at = now() WHERE id = 1` as its **last statement before commit** (the row lock is held for microseconds and is last in the lock order). These transactions are: a publish (online or batch), a `det_results` current-instance change, a scope flip, a tuple activation, **any** target state change (published or not, since the scoring-state filter and the unscored section depend on it), a similarity update of a pending target, the insertion of a job, a change of any job field that a filter or sort reads, a duplicate-group change (join, leave, re-election, split, dissolve), a merge or unmerge, a job availability change, and any user action (`saved_at`, `applied_at`, `hidden_at`, note, and an explicit Mark seen or Mark unseen). Setting `seen_at` implicitly by opening a job does **not** bump the generation: it would raise the "Ranking changed" banner after every view. A list filtered to unseen jobs may therefore keep showing a just-opened job until the next refresh; the UI marks it seen locally. The generation is a committed, monotonic counter; it is never derived from row values. The list API reads the generation and the page rows **in one `REPEATABLE READ` snapshot** (§14.3), so a page can never be labelled with a generation newer than the data it shows.
+**Ranking generation.** Every transaction that can change the order or the membership of the Jobs list runs `UPDATE ranking_state SET generation = generation + 1, updated_at = now() WHERE id = 1` as its **last statement before commit** (the row lock is held for microseconds and is last in the lock order). These transactions are: a publish (online or batch), a `det_results` current-instance change, a scope flip, a tuple activation, a target state change that moves the target across a §15.3 scoring-state bucket (unscored: none, `pending`, `budget_deferred`, `in_progress`, `in_batch`; grouped: `deferred_duplicate`; scored: published; filtered; failed: `refused` and `failed_*`; expired; hidden: `cancelled`), a similarity update of a pending target, the insertion of a job, a change of any job field that a filter or sort reads, a duplicate-group change (join, leave, re-election, split, dissolve), a merge or unmerge, a job availability change, and any user action (`saved_at`, `applied_at`, `hidden_at`, note, and an explicit Mark seen or Mark unseen). `pending ↔ in_progress` and the other moves within the unscored bucket do not bump. Setting `seen_at` implicitly by opening a job does **not** bump the generation: it would raise the "Ranking changed" banner after every view. A list filtered to unseen jobs may therefore keep showing a just-opened job until the next refresh; the UI marks it seen locally. The generation is a committed, monotonic counter; it is never derived from row values. The list API reads the generation and the page rows **in one `REPEATABLE READ` snapshot** (§14.3), so a page can never be labelled with a generation newer than the data it shows.
 
 ### 7.2 Identity, sessions, throttling
 
@@ -1424,7 +1450,7 @@ CREATE TABLE operations (                            -- durable intents (§3.3.2
   id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   kind            text NOT NULL CHECK (kind IN ('extract_profile_text','extract_profile','embed_profile',
                     'propose_queries','apply_scope','create_targets_for_tuple','batch_submit','export',
-                    'purge','eval_run','watchlist_validate')),
+                    'purge','eval_run','watchlist_validate','replay_raw_items')),
   payload         jsonb NOT NULL,                    -- ids only, never content
   dedup_key       text NOT NULL,                     -- e.g. 'apply_scope:<scope_version_id>'
   status          text NOT NULL CHECK (status IN ('pending','running','succeeded','failed','cancelled')),
@@ -2121,7 +2147,7 @@ CREATE TABLE duplicate_groups (
   status                text NOT NULL CHECK (status IN ('active','dissolved')),
   unscorable_reason     text CHECK (unscorable_reason IN ('all_failed','all_filtered','no_active_member')),
   elected_at            timestamptz NOT NULL DEFAULT now(),
-  election_reason       text NOT NULL,      -- initial | rep_inactive | rep_ineligible | fuller_member_joined |
+  election_reason       text NOT NULL,      -- initial | rep_inactive | fuller_member_joined |
                                             -- split | member_left | reconciler_repair | eligible_again
   created_at            timestamptz NOT NULL DEFAULT now(),
   updated_at            timestamptz NOT NULL DEFAULT now(),
@@ -3016,6 +3042,7 @@ submit_ambiguous | released ──candidate ended + custom_id set equals ours─
 submit_ambiguous ──any reconciliation without a match, complete or not──► submit_ambiguous
                     (alert at 25 h; never by timeout and never from an empty listing — chair decision C3)
 submit_ambiguous ──explicit user release──► released     (in_batch targets → pending; spend stays ambiguous)
+submitted ──explicit user release while batch.retrieve_failing is open and now > expires_at + 1 h──► released     (in_batch targets → pending; spend stays ambiguous; provider_batch_id kept)
 released ──29 days after submit_started_at without a match──► released (reconciliation stops; terminal; items stay ambiguous)
 submit_started | submit_ambiguous ──delete-everything (§20.4)──► released     (spend → ambiguous; rows then deleted)
 submitted | ended ──delete-everything──► (same state; cancel_requested_at set, spend → ambiguous; rows then deleted)
@@ -3895,7 +3922,7 @@ The configuration has two immutable, separately hashed parts:
 - **Allowed efforts**: `low | medium | high | xhigh | max`, constrained by each model's capabilities as listed in `llm/pricing.py`, where `claude-haiku-5-5` supports `low…max`.
 - The score nodes' first stage of 6,000 output tokens is about 1.5× the high-case output including thinking (§21.1) under the slim limits of U14; it keeps worst-case reservations and batch holds small. A `max_tokens` stop moves to the 12,000-token enlarged stage.
 - The generator's effort stays `medium` by default. `low` can be selected once the golden-set gate shows parity (§11.13), or with a warning while the gate is uncalibrated, and the UI says so. Switching the generator to `low` is refused while the golden-set gate is `failed`; while it is `uncalibrated` the switch is allowed with a warning; an already-active `low` under a failed gate is kept with the warning `eval_failed`.
-- The UI offers the presets **A** (all Opus medium), **B** (default) and **C** (Haiku generator and reviser, Sonnet critic), plus per-node overrides.
+- The UI offers the presets **A** (all Opus medium), **B** (default) and **C** (Haiku generator and reviser, Sonnet critic), plus per-node overrides. Presets: A = generator, reviser and critic `claude-opus-5-5`/`medium`; B = the default; C = generator and reviser `claude-haiku-5-5`/`medium`, critic `claude-sonnet-5-5`/`medium`; all with `extract_profile` and `propose_queries` on `claude-opus-5-5`/`medium` and critic light effort `low`. The stored `preset` is the label of the grid (`custom` when none matches), so a label-only change is no change.
 
 ### 10.4 Retries, deadlines, errors
 
@@ -4035,7 +4062,7 @@ The raw `anthropic` SDK is used (`AsyncAnthropic(base_url=…, api_key=…, max_
 | 4b. Definitive 4xx | `submit_rejected`. A definitive 4xx is a non-retryable status (400/401/403/404/413/422); 401/403 also raise `llm.auth_failed`. 409, 429 and a connect failure before any byte was sent are retried inside the create call (gateway backoff, `Retry-After`, within the 10-minute deadline, at least `RETRY_MIN_REMAINING_S` left) and end here (`connect_failed_before_send` / `batch_submit_rejected`) when the tries run out. The items' spend → `not_billed` (`batch_submit_rejected`), targets → `pending`, the attempts end `submit_rejected`, and the follow-up hold is released. |
 | 4c. 408, timeout, connection loss after the send started, 5xx or crash after step 2 | `submit_ambiguous`. The targets stay `in_batch(submission_id)` and the spend stays reserved and counted. **The submission is never resubmitted while ambiguous.** A `preparing` or `submit_started` submission whose `batch_submit` execution was lost (its operation not running, running under a claim other than the stored `operation_claim_id`, or belonging to an older worker epoch) is recovered at takeover, by the re-run handler and by the `batch_submissions` tick reconciler, each in a fenced transaction that takes the configuration before the operation row: `preparing → abandoned`, `submit_started → submit_ambiguous`; a `submit_started` row is never resent. |
 | 4d. Crash before step 2 | At restart, a `preparing` submission is set to `abandoned`. The items' spend → `not_billed` (`never_dispatched`), the targets → `pending`, and the follow-up hold is released. |
-| 5. Poll | `batch_poll` (a periodic aux task, every 5 min). It calls `retrieve`; once `processing_status='ended'`, it sets `state='ended'` and streams `results()`. A `retrieve` still failing past `expires_at + 1 h` raises the critical alert `batch.retrieve_failing`. A result stream unreadable for 12 consecutive passes, or not read whole by `submit_started_at + 29 days`, is given up (critical `batch.results_unreadable`); the remaining items take the missing-item path. |
+| 5. Poll | `batch_poll` (a periodic aux task, every 5 min). It calls `retrieve`; once `processing_status='ended'`, it sets `state='ended'` and streams `results()`. A `retrieve` still failing past `expires_at + 1 h` raises the critical alert `batch.retrieve_failing`, which the move to `ended` or a release resolves. A `submitted` submission whose `retrieve` still fails past `expires_at + 1 h` (with `batch.retrieve_failing` open) can be released the same way; the poll keeps retrieving its batch by `provider_batch_id` for 29 days after `submit_started_at`, and a batch found `ended` moves it `released → ended` with every item `ignored_fenced`. A result stream unreadable for 12 consecutive passes, or not read whole by `submit_started_at + 29 days`, is given up (critical `batch.results_unreadable`); the remaining items take the missing-item path. |
 | 6. Per item | Match on `custom_id`; processing is idempotent on `batch_items.processed_at`. Every target mutation is fenced by `state='in_batch' AND batch_submission_id=:s AND attempt_no=:a`; a fenced item (the target was released or cancelled meanwhile) only settles spend and records `decision='ignored_fenced'`. The decision table below applies. One item whose decision raises is skipped for the pass, and after 12 consecutive failed passes is given up as missing (critical `batch.item_unprocessable`). |
 | 7. Reconciled | `missing` is decided only after the result stream was read to its end and validated (`results_complete_at`): every item without a result is then `missing`, and a missing item is processed as an item result of type `missing` through the same path as every other result. Once every item is processed: `state='reconciled'`. Results stay downloadable for 29 days, and processing MUST finish within that window. |
 
@@ -4077,6 +4104,8 @@ The periodic aux task `batch_reconcile_ambiguous` runs every 15 min for every `s
 
    The submission moves to `released`, which no longer blocks new submissions. Reconciliation continues for 29 days (the result retention window). If a matching batch is later found, the submission moves to `ended` and its items settle from the provider's per-item outcome: `ambiguous → billed` from downloaded usage, or `ambiguous → not_billed(batch_item_errored | batch_item_canceled | batch_item_expired)` from the item's own result (Codex N9). The publish CAS rejects every late result, because the released targets are no longer `in_batch` for this submission. If no batch is ever found, the items stay `ambiguous` and counted.
 
+   A `submitted` submission whose `retrieve` still fails past `expires_at + 1 h` (with `batch.retrieve_failing` open) can be released the same way; the poll keeps retrieving its batch by `provider_batch_id` for 29 days after `submit_started_at`, and a batch found `ended` moves it `released → ended` with every item `ignored_fenced`.
+
 **Released-submission lifecycle** (Codex R3-2). A released submission is reconciled **outside the `batch_one_in_flight` singleton**: the index ignores rows with `released_at` set (§7.12), so a current submission B in `submitted` never blocks it and it never blocks B. Its path is `released → ended → reconciled` when its batch is found within 29 days (steps 5–7 run for it exactly as for any ended submission: the poll, per-item processing with every item `ignored_fenced` for the targets, and spend settlement per §7.16.7), or `released` for good when the 29-day window passes without a match, after which `batch_reconcile_ambiguous` stops listing for it and its items stay `ambiguous` and counted. It never moves a target and never starts a follow-on submission.
 
 While any submission is `submit_ambiguous`, no new batch is submitted; after an explicit release, new submissions may proceed (their `custom_id`s carry new attempt numbers, so they can never be confused with the released batch). Bulk re-scores continue through online admission meanwhile.
@@ -4115,7 +4144,7 @@ Hard filters are evaluated per `(job, scope_version)` into `hard_filter_results`
 | `excluded_industry` | **Structured** industry ∈ `industries_exclude`. |
 | `too_old` | `posted_at_effective < now − max_ad_age_days`. This filter is evaluated at admission as expiry (§9.6.3), not stored. |
 
-A job that fails is shown under the "Filtered" state with its reasons. Its unpublished target is `filtered_out`, and "Score anyway" is available. Published results of a job that is now filtered stay visible when the "include filtered" filter is on.
+A job that fails is shown under the "Filtered" state with its reasons. Its unpublished target is `filtered_out`, and "Score anyway" is available. Published results of a job that is now filtered stay visible when §15.3's "filtered" scoring-state option is selected.
 
 ### 11.2 Rubric v1
 
@@ -4390,7 +4419,7 @@ V4 checks. **Repairable** (the value is computable, so it is corrected at valida
 - `languages.basis = unconstrained` while `required_languages` is non-empty;
 - `not_a_job_ad = true` while any criterion level is non-null.
 
-**Repairs at publication.** Every limited field has exactly one repair, so a limit issue that survives the revisions can never turn publication into a failure. Repairs are recorded in `llm_results.truncated_fields` and shown with a "shortened" marker; nothing is truncated silently. The rule is generic: **every length-limited string is cut at its limit with an explicit `[…]` marker; every count-limited list keeps its first N items; every out-of-range number becomes `null`; every invalid quote is dropped as evidence.**
+**Repairs at publication.** Every limited field has exactly one repair, so a limit issue that survives the revisions can never turn publication into a failure. Repairs are recorded in `llm_results.truncated_fields` and shown with a "shortened" marker; nothing is truncated silently. The rule is generic: **every length-limited string is cut at its limit with an explicit `[…]` marker; every count-limited list keeps its first N items; every out-of-range number becomes `null`; every invalid quote is dropped as evidence.** A known edge: the drawer tells the two markers apart by the final draft's stored correction paths, and the list paths a contested null-out moves are not stored, so after a null-out a "shortened" marker can show where "corrected" was due.
 
 | Non-compliant field | Repair |
 |---|---|
@@ -4690,7 +4719,7 @@ Semantic limits:
 | Name | The header name: the first non-empty line(s) that look like a person's name (2–4 capitalised tokens, no digits, no role keywords). Each header line is read whole (no fixed-length window), and a run of more than 120 blanks splits a line into cells read as lines. Every later case-insensitive occurrence of those tokens as a full name is replaced too. | `[NAME]` |
 
 **Nothing leaves the machine before the user has reviewed the text.** After stripping, the draft is in **`text_review`**:
-- The review UI shows the stripped text with the replacements highlighted, plus the counts. The user can mark extra spans for removal and restore false positives.
+- The review UI shows the stripped text with the replacements highlighted, plus the counts. The user can mark extra spans for removal and restore false positives. Marking uses the native text selection (the selected text, then [Mark as contact]); restoring is a button.
 - **Approve** (`POST /api/profile/drafts/{id}/text-review`) stores the result as `reviewed_text` with its sha256 and starts the `extract_profile` operation. The LLM receives exactly this text, and the call records `transmitted_text_sha256`, which must match (§9.5). Raw text never reaches the LLM or the embedder.
 - **Editing the text later** (from `ready`) returns the draft to `text_review`: the extracted `draft_json` is discarded, and approving the new text runs the extraction again, with a cost notice (about $0.10–0.15). A profile is therefore always derived from the text the user last approved.
 - **Grounding**: every `evidence` string in the extracted profile must be a substring of the transmitted text (after `fold`). An ungrounded evidence string is a validation issue, and the field is shown as "not found in your CV text" for the user to fix or delete.
@@ -4855,7 +4884,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `evaluation.t8_sample_pct` | int, 0–100 | `5` | evaluation_policy |
 | | `evaluation.critic_light_triggers` | subset of `{T2, T3, T8}` | `{T2, T8}` | evaluation_policy |
 | Collection | `sources.enabled` | `{jsearch, serpapi, adzuna, arbeitnow, ats}` bools | all `true` | collection |
-| | `queries[]` | `{query_id, enabled}`, 0–40 entries; the texts live in `queries` | proposal accepted by the user | collection |
+| | `queries[]` | `{query_id, enabled}`, 0–40 entries; the texts live in `queries`. The document names live queries only: the dry-run refuses a retired query id as it refuses a missing one, with the same code (`invalid`). | proposal accepted by the user | collection |
 | | `watchlist[]` | `{watchlist_company_id, enabled}`, ≤ 100 entries | `[]` | collection |
 | | `collection.stale_ttl_days` | int, 7–90, or `null` = the same as `scope.max_ad_age_days`. The dry-run warns when it is below `max_ad_age_days` (§8.11). | `null` (follows `max_ad_age_days`, i.e. 30) | collection |
 | Quota | `quota.jsearch_monthly_limit` | int, 1–100,000 | `200` | collection |
@@ -4864,7 +4893,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `quota.serpapi_hourly_cap` | int, 1–49 | `45` | collection |
 | | `quota.adzuna_cap_minute` / `_day` / `_week` / `_month` | ints ≤ 25 / 250 / 1,000 / 2,500 | `20 / 225 / 900 / 2,250` | collection |
 | | `quota.paid_max_requests_per_run` | `auto` or int, 1–100. `auto` = `max(10, ceil(2 × fair_share))` (§6.4). | `auto` | collection |
-| Scoring & models | `scoring.model_policy` | `{preset: A \| B \| C \| custom, nodes: {generate, revise, critic, extract_profile, propose_queries}: {model, effort}, critic_light_effort}`. Model and efforts must be supported (§10.3). Generator effort `low` requires a passing eval (§11.13). | preset **B** (§10.3) | llm_tuple |
+| Scoring & models | `scoring.model_policy` | `{preset: A \| B \| C \| custom, nodes: {generate, revise, critic, extract_profile, propose_queries}: {model, effort}, critic_light_effort}`. Model and efforts must be supported (§10.3). Generator effort `low` requires a passing eval (§11.13). The stored `preset` is the label of the grid (`custom` when none matches; the presets: §10.3), so a label-only change is no change. | preset **B** (§10.3) | llm_tuple |
 | | `scoring.execution` | per node `{max_tokens, max_tokens_retry, deadline_s}`. `max_tokens` 1,024–32,000, with retry ≥ first and ≤ 64,000. `deadline_s` 120–1,800. | §10.3 table | execution |
 | Budget | `llm.cap_usd` | decimal, 1.00–10,000.00 | `100.00` | budget |
 | | `llm.nonscoring_reserve_pct` | int, 0–20 | `5` | budget |
@@ -4873,7 +4902,7 @@ Settings are a single validated Pydantic document (`settings_versions.payload`).
 | | `scoring.max_targets_per_cycle` | int, 1–500 | `60` | budget |
 | | `scoring.min_cycle_targets` | int, 1–100 | `10` | budget |
 | | `scoring.batch_bulk_rescore` | bool | `true` | budget |
-| | `scoring.batch_min_targets` | int, 200–100,000 | `200` | budget |
+| | `scoring.batch_min_targets` | int, 20–100,000 | `200` | budget |
 | | `scoring.batch_max_items` | int, 200–10,000 | `500` | budget |
 | | `scoring.bulk_rescore_max_budget_share` | decimal, 0.1–1.0 | `0.4` | budget |
 | Retention | `retention.score_history_months` | int, 1–36 | `12` | none |
@@ -4985,20 +5014,21 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | POST | `/api/auth/login` | Log in | `{username, password, totp?}` → 204 + Set-Cookie. 401 generic, 429 throttled (with `retry_after_s`). Origin check only; no session yet. |
 | POST | `/api/auth/logout` | Log out | → 204 |
 | GET | `/api/auth/session` | Session info | → `{username, totp_enabled, idle_expires_at, absolute_expires_at}` |
-| GET | `/api/jobs` | List / search | Query: filters (§15.3), `sort`, `cursor`, `limit` (≤ 100, default 50) → `{items: JobCard[], next_cursor, ranking_generation, ranking_changed, counts: {total_estimate, unscored}}` |
-| GET | `/api/jobs/{job_id}` | Detail | → `JobDetail`: canonical fields + provenance, sanitised description, postings, links, current score (criteria, evidence with spans, det criteria, knockouts, caps, interval, coverage, confidence, status, critic outcome, versions), contested data, group, user actions, history |
+| GET | `/api/jobs` | List / search | Query: filters (§15.3), `sort`, `cursor`, `limit` (≤ 100, default 50) → `{items: JobCard[], next_cursor, ranking_generation, ranking_changed, counts: {total_estimate, unscored, capped} \| null}` (the counts of §15.3) |
+| GET | `/api/jobs/facets` | Company and Source options | the list's filters, `company_q?`, `limit` (≤ 100, default 50) → `{companies: [{company_key, display_name, count}], sources: [{source_id, count}]}`: the listed cards, each facet counted under every filter but its own |
+| GET | `/api/jobs/{job_id}` | Detail | → `JobDetail`: canonical fields + provenance, sanitised description, postings, links, current score (criteria, evidence with spans, det criteria, knockouts, caps, interval, coverage, confidence, status, critic outcome, versions), contested data, group, user actions, history. 404 with `merged_into_job_id` for a merged job |
 | GET | `/api/jobs/{job_id}/history` | Score history | → results for previous tuples and scopes (keyset paged) |
-| PUT | `/api/jobs/{job_id}/actions` | User actions | `{seen?, saved?, applied?, hidden?: bool, note?: str, apply_to_group?: bool, seen_on_open?: bool}` → `UserActions`. Sets or clears each timestamp independently. `seen_on_open=true` (sent by the drawer when it opens) sets `seen_at` without bumping the ranking generation (§7.1). |
+| PUT | `/api/jobs/{job_id}/actions` | User actions | `{seen?, saved?, applied?, hidden?: bool, note?: str, apply_to_group?: bool, seen_on_open?: bool}` → `ActionsOut{job, members}`. Sets or clears each timestamp independently: `true` keeps an existing timestamp, `false` clears, `note: ""` clears; `apply_to_group` sets saved, applied and hidden on every member of the job's group; a merged job is 404 with `merged_into_job_id`. `seen_on_open=true` (sent by the drawer when it opens) sets `seen_at` without bumping the ranking generation (§7.1). |
 | POST | `/api/jobs/{job_id}/score-now` | Score now | `{force?: bool}` → 202 `{target_id, state}`. 409 `budget_exhausted`, 409 `filtered_requires_force`. |
 | POST | `/api/jobs/{job_id}/feedback` | Label or "wrong score" | `{kind: label \| wrong_score, label: good \| ok \| poor, comment?}` → 201. Creates `score_feedback` (with the score snapshot) and, when a profile is active, upserts the `golden_cases` row for (revision, profile) with the active scope. |
-| GET | `/api/golden-cases` | Golden set | keyset paged → `[{id, job_id, label, comment, profile_version, scope_version, source, active}]` |
+| GET | `/api/golden-cases` | Golden set | keyset paged → `[{id, job_id, title, company, label, comment, profile_version, scope_version, source, active}]` |
 | PATCH | `/api/golden-cases/{id}` | Activate, deactivate or mark a canary | `{active?, is_canary?}` → 200 |
 | DELETE | `/api/golden-cases/{id}` | Delete a golden case | → 204. Writes a `golden_case_delete` manifest (the manifest from M5); the job's inputs lose their retention exemption (§20.1). |
-| DELETE | `/api/feedback/{id}` | Delete a label or feedback | → 204 |
-| POST | `/api/jobs/{job_id}/unmerge` | Reverse a merge | `{merge_event_id}` → 202 |
-| POST | `/api/duplicate-groups/{group_id}/split` | Split a member out | `{job_id}` → 200 `Group` |
+| DELETE | `/api/feedback/{id}` | Delete a label or feedback | → 204; the golden case it created stays |
+| POST | `/api/jobs/{job_id}/unmerge` | Reverse a merge | `{merge_event_id}` → 202 `{unmerge_event_id}`; 404 unless the event merged into `{job_id}` |
+| POST | `/api/duplicate-groups/{group_id}/split` | Split a member out | `{job_id}` → 200 `Group`: `{id, status, representative_job_id, unscorable_reason, election_reason, members}`, the drawer's group view, each member with its title, company, sources, locations, completeness, availability, target state, `score_individually` and `is_representative` |
 | POST | `/api/duplicate-groups/{group_id}/score-individually` | Score a member on its own (§8.7) | `{job_id}` → 200 `Group`; the member's target leaves deferral with `override = 'individual'` |
-| POST | `/api/duplicate-groups/{group_id}/confirm` | Confirm the group as one job (merge) | → 202 |
+| POST | `/api/duplicate-groups/{group_id}/confirm` | Confirm the group as one job (merge) | → 202 `{job_id}`, the representative the members were merged into |
 | POST | `/api/targets/{target_id}/retry` | Retry a refused or failed target | → 202 |
 | GET | `/api/labelling/queue` | Next labelling items | `?limit=10` → stratified by score band (≥ 75, 60–75, 40–60, < 40), unlabelled first, score hidden |
 | POST | `/api/profile/cv` | Upload a CV | multipart `file`, `native_pdf_opt_in?` → 202 `{draft_id}` |
@@ -5008,50 +5038,55 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 | PUT | `/api/profile/drafts/{id}/text` | Edit the reviewed text | `{span_edits[]}` → `{stripped_text_preview}`. Allowed in `text_review`; in `ready` it discards the extracted draft and returns to `text_review` (§12.3). |
 | POST | `/api/profile/drafts/{id}/text-review` | Approve the text and extract (LLM) | → 202 `{status: 'extracting_profile'}`. Counts against the non-scoring reserve. |
 | POST | `/api/profile/drafts/{id}/retry` | Repair a failed draft | `{mode: llm \| native_pdf}` → 202. `native_pdf` requires the disclosure acknowledgement `{ack_native_pdf: true}`. |
-| GET | `/api/profile/drafts/{id}/rescore-estimate` | Re-score preview | → `{targets, est_usd_online, est_usd_batch, month_spend, cap}` |
+| GET | `/api/profile/drafts/{id}/rescore-estimate` | Re-score preview | → `{targets, est_usd_online, est_usd_batch, month_spend, cap, bulk_budget_usd, bulk_share, batch_targets, online_targets, online_per_day, next_version_no}`: the confirm modal's figures (§15.7) |
 | POST | `/api/profile/drafts/{id}/confirm` | Confirm and activate | `{expected_rescore_ack}` → 201 `{profile_version_id, targets_to_create, est_usd, bulk_budget_usd}`; a repeat returns the original body |
 | POST | `/api/profile/drafts/{id}/discard` | Discard | → 204 |
-| GET | `/api/profile` | Active profile and history | → `{active: ProfileVersion \| null, versions: [...]}` |
+| GET | `/api/profile` | Active profile and history | → `{active: ProfileVersion \| null, versions: [...], open_draft: {id, status} \| null, latest_proposal: {id, status, failure_code} \| null, estimates: {extract_profile_usd, propose_queries_usd}}`: the newest open draft, the newest query proposal, and one call of each profile node under the active model policy |
 | POST | `/api/profile/query-proposals` | Propose queries (LLM) | → 202 `{proposal_id}` (counts against the nonscoring reserve) |
-| GET | `/api/profile/query-proposals/{id}` | Proposal status | → `{status, items}` |
-| GET | `/api/settings` | Active settings | → `{version, payload, pending_scope: {version_id, progress} \| null}` |
+| GET | `/api/profile/query-proposals/{id}` | Proposal status | → `{status, items, failure_code}` (`failure_code`: a failed proposal's code, else `null`) |
+| GET | `/api/settings` | Active settings | → `{version, payload, pending_scope: {version_id, progress} \| null, scope_applied}`. `progress` is the live apply's `{done, total, det_done, det_total}`, both phases (the jobs, then the published results), or `null` without a live apply. `scope_applied` compares the content hash of the scope that the active settings and the active profile derive with the active scope; it does not read `settings_versions.scope_version_id`, which a profile confirm can leave stale, and it is false while a scope is pending or after a failed apply |
 | POST | `/api/settings/dry-run` | Validate and preview | `{payload}` → `{errors, warnings, projections, effects}` |
 | POST | `/api/settings` | Save a new version | `{payload, base_version_id, acknowledged_warnings[]}` → 201 `{version}`. 409 stale base, 422 validation. |
 | GET | `/api/settings/versions` | Version list | keyset paged |
 | GET | `/api/settings/versions/{id}` | A version and its diff vs the previous one | → `{payload, diff}` |
 | GET | `/api/settings/{rubric,prompt-schema}-versions` | Shipped rubric and prompt/schema versions | → the versions with their ids, so the version to activate is discoverable |
+| GET | `/api/settings/{rubric,prompt-schema}-versions/{id}/activation-preview` | What an activation would check and re-score | → `{version_id, active, gate_state, latest_golden_run, schema_verified, unverified_models, targets, est_usd_online, est_usd_batch, bulk_budget_usd}`, the activation's own checks; nothing is written |
 | POST | `/api/settings/rubric-versions/{id}/activate` | Activate a shipped rubric version | `{expected_rescore_ack, eval_override_ack?}` → 201 `{version}` (an `llm_tuple` change, §13.3); 409 `eval_gate_failed` without the override |
 | POST | `/api/settings/prompt-schema-versions/{id}/activate` | Activate a shipped prompt/schema version | as above; also requires a passing schema dry-run (§10.11) |
 | POST | `/api/settings/scope/retry-apply` | Retry a failed scope application | → 202 `{operation_id}`: a new `apply_scope` operation for the active settings version's scope (§13.4 step 5); 409 if one is live |
 | GET | `/api/geo/places` | Gazetteer search for scope locations | `?q=<name or postal code>&limit=10` → `[{gazetteer_id, label, postal_codes, lat, lon, population}]`. Served from the bundled gazetteer; no network. |
+| GET | `/api/queries` | Query list | → the live queries by id, `[{id, text, lang, origin, exploration, proposal_id, created_at, enabled, cells, last_covered_at, open_gaps, yield_ema, too_broad, refresh_cadence_days}]`: `enabled` is the query's flag in the active settings; the aggregates are over its planned cells (the active scope's locations × the enabled search sources), whether it is enabled or not |
 | POST | `/api/queries` | Add a query | `{text, lang}` → 201 |
 | PATCH | `/api/queries/{id}` | Edit a query (retire + create) | `{text?, lang?}` → 200 new query |
-| GET | `/api/queries/stats` | Per-cell coverage stats | → cells with last covered, gaps, yield, cadence, `too_broad` |
+| GET | `/api/queries/stats` | Per-cell coverage stats | → cells with last covered, gaps, yield, cadence, `too_broad`: the existing planned cells of the live queries. The header's `coverage_gaps_open` counts every open gap, also of cells no longer planned or without a query, so it can exceed the sum over the queries |
+| GET | `/api/watchlist` | Watchlist | → every company by display name, `[{id, display_name, ats_type, board_slug, lever_region, validation_status, validated_at, enabled, instance: {health, last_error_code, last_success_at, last_complete_snapshot_at} \| null, postings: {active, stale, unknown, closed}}]` |
 | POST | `/api/watchlist/parse-url` | Pattern-parse a careers URL | `{url}` → `{ats, slug, region} \| {unsupported: reason}`. Makes no network request. |
 | POST | `/api/watchlist` | Add a company | `{display_name, ats_type, board_slug, lever_region?}` → 201. Validation is a worker task. |
 | DELETE | `/api/watchlist/{id}` | Remove a company | → 204. The settings version updates. |
 | POST | `/api/runs` | Run now | `{include_paid: bool}` → 202 `{run, created}` |
-| GET | `/api/runs` | Run history | keyset paged |
-| GET | `/api/runs/{id}` | Run report | → `{run, report}` |
+| GET | `/api/runs` | Run history | keyset paged; each run with its `status_reason` |
+| GET | `/api/runs/{id}` | Run report | → `{run, report, partial_causes}` |
 | GET | `/api/score-cycles` | Score cycles | keyset paged |
+| GET | `/api/eval-runs` | Eval runs (golden set, schema dry-runs) | `?kind=golden\|schema_dry_run` keyset paged → `{items, next_cursor, active_gate: {state, cases}}`. The runs start from the CLI only |
 | GET | `/api/system/health` | Detailed health | → §17.5 |
+| GET | `/api/system/status` | Header strip and banners (§15.1) | → `{last_run, active_run_id, next_slots, quota, llm, coverage_gaps_open, pending_targets, alerts, rescore, paid_search, run_now, scope, banners}` in one read snapshot, with every banner's condition computed here; no readiness probe. `run_now` is `{jsearch_units, serpapi_fallback_units}`, an estimate at the even pace: 0 for a disabled provider, and 0 for SerpApi without a validated window; JSearch without a stored window shows the units of the window its first run would bootstrap |
 | GET | `/api/system/quota` | Quota windows and ledger summary | → per provider `{window, used, reserved, ambiguous, adjustments, tokens, state}` |
 | GET | `/api/system/spend` | LLM spend | → `{month, counted, billed, ambiguous, reserved, cap, headroom, bucket: {usd, capacity, rate_per_h}, c_hat, critic_rate_7d, projected_critic_rate, bulk_operation, quarantined_batch_usd, by_model_effort_role}` |
-| GET | `/api/system/needs-attention` | Items needing the user | → rejected raw items, identity conflicts, failed/refused targets, quarantined batches, failed purges, broken sources |
+| GET | `/api/system/needs-attention` | Items needing the user | → each section's full count and its first 50 items: rejected raw items (per response, with `replayable`), identity conflicts, failed/refused targets, quarantined batches, lost batches (`batch.retrieve_failing`, with `releasable`), mass disappearances, unscorable groups, broken sources; the acknowledgeable pause of the score lane and a failed scope apply. Failed purges join with M5's purges |
 | POST | `/api/system/purges/{operation_id}/retry` | Retry a failed purge | → 202. A new attempt of the same `purge` operation and manifest; its purge fence stays active throughout (§20.2) |
-| POST | `/api/system/raw-items/replay` | Replay rejected items | `{raw_response_id \| raw_item_ids[]}` → 202 |
-| POST | `/api/identity-conflicts/{id}/resolve` | Resolve a conflict | `{decision: separate \| merge}` → 202 |
+| POST | `/api/system/raw-items/replay` | Replay rejected items | `{raw_response_id \| raw_item_ids[]}` → 202 `{operation_id, items}`, a `replay_raw_items` operation (§7.3) |
+| POST | `/api/identity-conflicts/{id}/resolve` | Resolve a conflict | `{decision: separate \| merge}` → 202 `{conflict_id, status}` |
 | POST | `/api/ats-snapshots/{id}/acknowledge` | Confirm a mass disappearance | → 200; the absent postings close (§8.11) |
-| POST | `/api/batches/{id}/release` | Release and re-score quarantined targets | `{confirm: true}` → 202. The submission becomes `released`; its reserved amount stays counted as `ambiguous` unless the batch is found later (§10.10). The response states that amount. |
+| POST | `/api/batches/{id}/release` | Release and re-score quarantined targets | `{confirm: true}` → 202. The submission (`submit_ambiguous`, or `submitted` under `batch.retrieve_failing` past `expires_at + 1 h`) becomes `released`; its reserved amount stays counted as `ambiguous` unless the batch is found later (§10.10). The response states that amount. |
 | POST | `/api/system/score-cycle` | Start a cycle manually | → 202 `{queued, reason}`: the API requests a cycle; the worker creates it |
-| GET | `/api/alerts` | Alerts | `?status=open\|acknowledged\|resolved` keyset paged |
+| GET | `/api/alerts` | Alerts | `?status=open\|acknowledged\|resolved` keyset paged: `resolved` once resolved, else `acknowledged` once acknowledged, else `open` |
 | POST | `/api/alerts/{id}/ack` | Acknowledge | → 200 |
 | POST | `/api/privacy/export` | Start an export | → 202 `{export_id}` |
 | GET | `/api/privacy/exports/{id}` | Export status / download | → status, or a `application/zip` stream when ready |
 | POST | `/api/privacy/delete-everything` | Delete all data | `{confirm: "DELETE EVERYTHING", password}` → 202 `{manifest_id}` |
 | GET | `/api/privacy/manifests/{id}` | Deletion status | → `{status: executing \| completed \| shipped, completed_at, shipped_at}`. The UI reports a deletion as done only at `shipped` (§19.5). |
 | POST | `/api/privacy/purge-source` | Purge a source's data | `{source: "adzuna", confirm: "PURGE ADZUNA", password}` → 202 `{manifest_id}` |
-| GET | `/api/openapi.json` | OpenAPI 3.1 | authenticated |
+| GET | `/api/openapi.json` | OpenAPI 3.1 | authenticated; not listed in its own document (§14.5) |
 | GET | `/healthz` | Liveness | unauthenticated → 200 `{status: "ok"}` |
 | GET | `/readyz` | Readiness | unauthenticated → 200 or 503 `{failing: [component codes]}`, with no details beyond codes |
 
@@ -5060,11 +5095,12 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 - `cursor` is `base64url(JSON) + "." + base64url(HMAC-SHA256(key=HKDF(session_secret, "cursor"), JSON))`. The JSON holds:
 
   ```json
-  {"v": 2, "sort": "score_mid", "dir": "desc", "section": "scored",
-   "last_key": [71.50, null], "job_id": 4711, "filters_hash": "…", "gen": 1834}
+  {"v": 2, "sort": "jobs.score_mid", "dir": "desc", "section": "scored",
+   "last_key": ["71.50"], "job_id": 4711, "gen": 1834,
+   "posted_after": "2026-10-05T09:12:00.000000+00:00", "filters_hash": "…"}
   ```
 
-  `section` is `scored` or `unscored` for the score sorts and `all` for the date sorts. `last_key` holds the sort value of the last row (or `null`) and, in the unscored section, its similarity.
+  `section` is `scored` or `unscored` for the score sorts and `all` for the date sorts. The cursor's `sort` is namespaced (`"jobs.score_mid"`, and `"<list>.<key>"` for the other lists). `last_key` holds the sort value of the last row: a score as a fixed-point string (`"71.50"`), a similarity as a number or `null`, a time as ISO-8601 (`null` for an unknown posting date). The cursor carries `posted_after`, the absolute cutoff the first page resolved, and `filters_hash` covers it and the normalised filters (defaults applied, sets sorted and de-duplicated).
 - The server rejects a cursor whose signature is invalid, or whose `filters_hash` differs from the request's filters: 400 `invalid_cursor`.
 - **Ordering and section predicates**:
 
@@ -5075,9 +5111,10 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
   | `posted` | one section: `posted_at_effective DESC NULLS LAST, job_id DESC` (unknown dates use `first_seen_at` for the filter only) | — |
   | `first_seen` | one section: `first_seen_at DESC, job_id DESC` | — |
 
-  Rows of the scored section come first. The next page continues in the cursor's section with the keyset predicate `(sort_value, job_id) < (:last_value, :job_id)`, using `IS NULL` branches for `NULLS LAST`; when the scored section is exhausted, the unscored section starts from its beginning. The score is the `display_scores` value (§7.18), so a deferred member sorts with its representative's score.
+  Rows of the scored section come first. The next page continues in the cursor's section with the keyset predicate `(sort_value, job_id) < (:last_value, :job_id)`, using `IS NULL` branches for `NULLS LAST`; when the scored section is exhausted, the unscored section starts from its beginning. The unscored section is the ordered union of the unscored targets with a similarity (the active tuple's targets that are not published, `deferred_duplicate` or `cancelled`), then the cards without one (no active-tuple target or a NULL similarity) by `job_id DESC`; when "not a job ad" is selected, the published not-a-job-ad rows join it by their similarity (those without one in the NULL branch). Under NULLS LAST, a page that continues from a non-NULL position reads the NULL branch from its beginning; only a position on a NULL row bounds the NULL branch by `job_id`. The score is the `display_scores` value (§7.18); a deferred member is never a row: it is listed inside its representative's group card, which sorts by the representative's score and dates.
 - **One snapshot per page.** The handler runs in a read-only `REPEATABLE READ` transaction that reads `ranking_state.generation` and the page rows from the same snapshot, so the generation returned with a page always describes exactly the data on it (Codex #46).
 - **Live semantics, disclosed**: pages are taken against live data. `gen` in the cursor is `ranking_state.generation` (§7.1) when the first page was served. When the current generation is larger, the response sets `ranking_changed: true`, and the UI shows the "Ranking changed — refresh" banner. Items may move across page boundaries in that case. This is disclosed, never silent. The generation is a committed counter bumped by every order- or membership-changing transaction, never derived from row values, so reverting a scope or tuple still increases it.
+- **Performance target**: p95 < 300 ms per list page and < 200 ms per detail at 50,000 jobs on the §19.7 host.
 
 ### 14.4 Error format (RFC 9457)
 
@@ -5096,11 +5133,11 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 
 - The content type is `application/problem+json`.
 - Stack traces, SQL and secrets are never included. Validation errors use 422 with `errors[]`.
-- Stable `code` values include: `unauthenticated`, `csrf_failed`, `throttled`, `invalid_cursor`, `stale_base_version`, `validation_failed`, `budget_exhausted`, `filtered_requires_force`, `run_active`, `not_found`, `conflict_state`, `upload_rejected`, `idempotency_key_required`, `idempotency_key_reused`, `idempotency_in_progress`, `eval_gate_failed`, `internal`.
+- Stable `code` values include: `unauthenticated`, `totp_required`, `csrf_failed`, `throttled`, `invalid_cursor`, `stale_base_version`, `validation_failed`, `budget_exhausted`, `filtered_requires_force`, `run_active`, `not_found`, `conflict_state`, `upload_rejected`, `idempotency_key_required`, `idempotency_key_reused`, `idempotency_in_progress`, `eval_gate_failed`, `internal`.
 
 ### 14.5 OpenAPI generation
 
-- FastAPI generates OpenAPI 3.1 from the Pydantic request and response models.
+- FastAPI generates OpenAPI 3.1 from the Pydantic request and response models. `GET /api/openapi.json` serves that document to a logged-in session and is not listed in it.
 - CI exports `openapi.json` and runs `openapi-typescript` 7.13.0 to produce `frontend/src/api/schema.d.ts`. Any diff from the committed file fails CI.
 - The frontend calls go through a typed wrapper in `api/client.ts`, which adds `X-JH-Request: 1` and handles problem details.
 
@@ -5108,7 +5145,7 @@ The Settings page calls the dry-run (§6.8) on every change, debounced by 500 ms
 
 ## 15. User interface
 
-The UI is a React 19 SPA served same-origin. There are two authenticated pages, **Jobs** and **Profile & Settings**, plus **Login**. It uses TanStack Router for routes and URL-synced filter state, and TanStack Query for data. Polling intervals: run status every 10 s while a run is active, scope-apply progress every 3 s, and the header strip every 60 s.
+The UI is a React 19 SPA served same-origin. The api serves the built SPA (`api/static.py`): hashed assets immutable, `index.html` uncached, and any non-`/api` GET that accepts `text/html` falls back to `index.html`. There are two authenticated pages, **Jobs** and **Profile & Settings**, plus **Login**. It uses TanStack Router for routes and URL-synced filter state, and TanStack Query for data. Polling intervals: run status every 10 s while a run is active, scope-apply progress every 3 s, and the header strip every 60 s.
 
 ### 15.1 Header strip and banners (both pages)
 
@@ -5126,17 +5163,21 @@ The UI is a React 19 SPA served same-origin. There are two authenticated pages, 
 | Banner | Condition | Colour |
 |---|---|---|
 | Stale data | The last successful run is older than 2 × the interval | critical |
-| Applying settings… n/N | A pending scope exists | info |
-| LLM cap reached — scoring paused | A scoring reservation was denied by the cap this month (§6.9.4) | critical |
-| Scoring paused — reservation bound violated | `llm.reservation_bound_violated` is open (§10.7) | critical |
+| Applying settings… n/N | A pending scope exists. n/N counts both apply phases (the jobs, then the published results); the banner shows no count until the apply reports its first, and "Applying the settings failed" once the apply failed for good | info |
+| LLM cap reached — scoring paused | The score lane is paused as `cap_reached` (§6.9.4) | critical |
+| Scoring paused — reservation bound violated | Paused as `reservation_bound_violated` (lifted by the acknowledgement, §10.7) | critical |
+| Scoring paused — <reason> | Paused as `auth_failed`, `schema_unverified` or `global_fence` | critical; warn for `global_fence` |
+| Search scope not applied — [Retry apply] | No scope is pending, and the scope that the active settings and the active profile derive is not the applied active scope (`scope_applied`, §14.2) | warn |
 | Deletion not yet confirmed offsite | A deletion manifest is `completed` but not `shipped` (§19.5) | warn |
-| Paid search paused until <date> | JSearch exhausted and SerpApi unavailable or exhausted | warn |
-| Re-scoring after profile change: k of N | Unscored targets of a new tuple remain | info |
-| Unresolved critical alerts | Any open critical alert | critical |
+| Paid search paused until <date> | JSearch exhausted, and SerpApi disabled, without a validated window, unhealthy or exhausted; the date is JSearch's reset, or SerpApi's when SerpApi is exhausted and resets first | warn |
+| Re-scoring after profile change: k of N | k of the active bulk operation's N targets have left the unscored bucket | info |
+| Unresolved critical alerts | Any unresolved, unacknowledged critical alert | critical |
+
+*pace ok*: the month's counted scoring spend is at most the scoring share times the elapsed fraction of the month. The strip and the banners come from `GET /api/system/status`, which computes every condition.
 
 ### 15.2 Login page
 
-- A centred card with Username, Password, a TOTP code field (shown only when TOTP is enabled; the server answers `totp_required` without revealing anything else), and a **Sign in** button.
+- A centred card with Username, Password, a TOTP code field (shown only when TOTP is enabled; when TOTP is enabled and the request has no code, the server answers 401 `totp_required` before any password check, records no attempt and reveals nothing else), and a **Sign in** button.
 - Errors are generic ("Invalid credentials"). A throttled login shows "Too many attempts — try again in N min". There is no "forgot password" link; a note reads: *"Reset via the server CLI."*
 - After login, the user is redirected to the originally requested URL.
 
@@ -5170,13 +5211,13 @@ The UI is a React 19 SPA served same-origin. There are two authenticated pages, 
 
 | Filter | Options |
 |---|---|
-| Posted within | 24 h, 3 d, 7 d, 14 d, ★30 d (equals the default `max_ad_age_days`), any, custom. Uses `posted_at_effective`, with `first_seen_at` when unknown. |
-| Score range | 0–100, on the selected score variant |
+| Posted within | 24 h, 3 d, 7 d, 14 d, ★30 d (equals the default `max_ad_age_days`), any, custom. Uses `posted_at_effective`, with `first_seen_at` when unknown. The window resolves to an absolute cutoff on the first page; custom = `{posted_from, posted_to}` dates in `display.timezone`. |
+| Score range | 0–100, on the selected score variant. Any of score range, minimum coverage and confidence set restricts the list to scored rows; the variant follows the score sort (`score_mid` under the date sorts). |
 | Minimum coverage | 0–100% |
 | Confidence | any, ≥ medium, high |
-| Location + radius | Gazetteer autocomplete. Remote jobs are included when "include remote" is ticked (★). |
-| Work mode | remote, hybrid, on-site, unknown |
-| Title/keyword | German or English FTS (`websearch_to_tsquery` against both configs) **OR** trigram `title_norm % q` |
+| Location + radius | Gazetteer autocomplete. A job matches when any resolved candidate of any of its locations lies within the radius; unresolved and country-wide locations never match. "Include remote" (★) adds jobs whose `location_kind` is `remote` or whose known work mode allows remote (`work_mode_source <> 'none'`); an unknown work mode is never remote. The filter carries `gazetteer_id, lat, lon, radius_km`. |
+| Work mode | ★ all four: remote, hybrid, on-site, unknown |
+| Title/keyword | German or English FTS (`websearch_to_tsquery` against both configs) **OR** trigram word similarity `fold(q) <% title_norm`, as a union of two indexed subqueries |
 | Company | Multi-select on company key |
 | Source | Multi-select |
 | Ad language | de, en, other, unknown |
@@ -5185,7 +5226,11 @@ The UI is a React 19 SPA served same-origin. There are two authenticated pages, 
 | Availability | ★active + unknown; not re-confirmed (`stale`); closed |
 | Contested | any (★), only, exclude |
 | Partial description | any (★), only, exclude |
-| Scoring state | ★all; scored; unscored/pending; filtered; failed/refused; expired; not a job ad (★ excluded) |
+| Scoring state | ★all; scored; unscored/pending; filtered; failed/refused; expired; not a job ad (★ excluded). scored = a score that passes the hard filters; filtered = `filtered_out` or a score whose job now fails a hard filter; unscored/pending = no target, `pending`, `budget_deferred`, `in_progress`, `in_batch`; failed/refused; expired; not a job ad. A published card whose job has no current `det_results` row under the active scope is in none of them: it is absent from the list until the `det_completeness` reconciler writes the row (at most its 10-minute period, §17.4), a write that bumps the ranking generation. |
+
+Non-score filters (posted, keyword, location, work mode, company, source, ad language, employment, seniority, availability, partial) match a group card when the representative or a deferred member matches; user status, contested, scoring state and the score filters read the representative.
+
+**Counts**: `total_estimate` and `unscored` count cards, exactly, on the first page only (`counts` is `null` later), capped at 10,000 (`capped`) and shown as "10,000+".
 
 **Sorts**: Score (neutral midpoint, ★ default), Score (conservative lower bound), Posted date, First seen.
 
@@ -5195,7 +5240,7 @@ The UI is a React 19 SPA served same-origin. There are two authenticated pages, 
 - posted date: relative, `≈` when precision ≤ day, and "(ingest date)" for Adzuna;
 - first seen, and last seen when not today;
 - source chips; NEW (unseen); saved/applied markers;
-- badges: **contested**, **partial description**, **Adzuna** (the attribution badge links to `outbound_url_private`), availability (**not re-confirmed** for `stale`, or **closed**), knockout badges (red for binding hard, amber for unconfirmed, unverified or soft), **shortened** when a field was cut at its limit (§11.6), "previous: 72 (profile v3)" during re-scoring, "scored via <member>" for deferred group members, and "possible duplicate of <job>" for a member with its own score;
+- badges: **contested**, **partial description**, **Adzuna** (the attribution badge links to `outbound_url_private`), availability (**not re-confirmed** for `stale`, or **closed**), knockout badges (red for binding hard, amber for unconfirmed, unverified or soft), **shortened** when a field was cut at its limit (§11.6), **possibly not a job ad**, **injection suspected**, "previous: 72 (profile v3)" during re-scoring, "scored via <member>" for deferred group members, and "possible duplicate of <job>" for a member with its own score;
 - quick actions: save, applied, hide, open the outbound link.
 
 **Unscored and pending cards** show a state chip with text:
@@ -5203,6 +5248,8 @@ The UI is a React 19 SPA served same-origin. There are two authenticated pages, 
 | State | Chip |
 |---|---|
 | `pending` | "Pending — queued" |
+| `in_progress` | "Scoring in progress" |
+| no target | "Not queued yet" |
 | `budget_deferred` | "Budget deferred — resumes when budget frees up" |
 | `filtered_out` | "Filtered: excluded keyword 'Praktikum'", with **Score anyway** |
 | `failed_*` | "Failed: <reason>", with **Retry** |
@@ -5221,7 +5268,7 @@ The drawer slides in from the right at 50% width (full screen on small viewports
 ┌ Senior Backend Engineer — Acme GmbH ─────────────────────────────────────────── [×] ┐
 │ Berlin · hybrid (structured: Lever) · Full-time · €70k–85k / year (stated)           │
 │ Posted 14 Oct (day precision) · first seen 15 Oct · last seen today · active         │
-│ [Seen ✓] [Save ☆] [Applied ☐] [Hide ☐]   [Open ad ↗] [Apply link ↗]   Adzuna badge   │
+│ [Seen ✓] [Save ☆] [Applied ☐] [Hide ☐]   [Open ad ↗]   Adzuna badge                  │
 ├ Score ───────────────────────────────────────────────────────────────────────────────┤
 │ 82  ▕███████▌░░▏ L 74 · U 90 · coverage 85% · confidence high · accepted (critic ✓)  │
 │ Profile v4 · rubric v1 · prompt 3f2a… · Sonnet 5.5/medium → Opus 5.5/medium critic   │
@@ -5237,7 +5284,9 @@ The drawer slides in from the right at 50% width (full screen on small viewports
 │ Employment/salary   5   4    det         full_time ∈ scope; no salary minimum set     │
 │ Knockouts: none · Caps: none · Industry: neutral                                     │
 ├ Tabs: [Description] [Contested] [Provenance] [Duplicates] [History] [Feedback] ──────┤
-│ Description: sanitised HTML, evidence quotes highlighted; partial marker for snippets│
+│ Description: the revision's text with paragraph breaks and the evidence quotes       │
+│   highlighted (spans are code-point offsets into it); a deferred member shows its    │
+│   representative's text, labelled; partial marker for snippets                       │
 │ Contested: critic rounds, issues per criterion, rejected drafts (level diff), nulled │
 │ Provenance: postings (source, native id, first/last seen, availability, link), field │
 │   provenance table, merge events [Unmerge]                                           │
@@ -5247,13 +5296,15 @@ The drawer slides in from the right at 50% width (full screen on small viewports
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+The drawer's link buttons are **[Open ad ↗]** (the postings' primary link by §8.8 precedence) and the Adzuna badge; each posting's own link is in Provenance.
+
 Opening the drawer sets `seen_at` (`seen_on_open`, which does not raise the "Ranking changed" banner, §7.1). The **Seen** toggle can clear or set it explicitly.
 
 ### 15.5 Duplicate-group card
 
 - It renders the representative's card with a header: "Possible duplicates (n) · scored via <member source/title> · applies to n members". Deferred members are listed inside it.
 - A member that has **its own published score** (it was split, scored individually, or moved out by conflicting facts) is shown as **its own card** in the list, ranked by its own score, with a "possible duplicate of <representative>" badge (§7.18).
-- A group with no eligible member shows "Not scorable: all members failed / filtered / inactive" (`unscorable_reason`) with a Retry action per member; nothing is retried automatically.
+- A group without a representative has no group card: each member's card carries the group's `unscorable_reason` ("Not scorable: all members failed / filtered / inactive") and its own Retry; nothing is retried automatically.
 - Expanding it lists the members (source, title, location, completeness, availability, own state). Each member has these actions:
   - **Split**: that member becomes a separate job and is scored individually.
   - **Score individually**: sets the member's `score_individually` flag and `override = 'individual'` (§8.7); the member then waits in normal admission, and its own card offers Score now.
@@ -5263,13 +5314,13 @@ Opening the drawer sets `seen_at` (`seen_on_open`, which does not raise the "Ran
 ### 15.6 Labelling UI (week-1 calibration)
 
 - **Label mode**, toggled in the filter panel, switches the list to labelling. Each card shows the ad (title, company, location, description excerpt) with the **score hidden by default** to avoid anchoring, plus three large buttons: **Good / OK / Poor**, keyboard `1/2/3`. There is an optional comment field. After a label is saved, a "Reveal score" link appears.
-- The queue comes from `GET /api/labelling/queue`, stratified across score bands. A progress bar shows "23 / 50 labelled", with the target set to 50.
+- The queue comes from `GET /api/labelling/queue`, stratified across score bands: bands `[75, 100]`, `[60, 75)`, `[40, 60)`, `[0, 40)` taken round-robin, unlabelled first (no golden case for the current revision and the active profile), then by job id descending; only jobs with their own published, non-NULL score in the list's `scored` bucket; the response holds no score. A progress bar shows "23 / 50 labelled", with the target set to 50: the progress counts the active `week1` golden cases of the active profile against 50.
 - Labels write `score_feedback(kind='label')`, with a snapshot of the score shown, and upsert `golden_cases(source='week1')` bound to the active profile and scope (§11.13).
 - The same three buttons appear in the drawer's Feedback tab for later "wrong score" feedback.
 
 ### 15.7 Profile & Settings page
 
-The page has a sticky section navigation: **CV & profile · Search scope · Queries & sources · Watchlist · Schedule · Scoring & models · Budget & quota · System · Privacy & data**. Each settings section ends with the **dry-run panel** and **Save**.
+The page has a sticky section navigation: **CV & profile · Search scope · Queries & sources · Watchlist · Schedule · Scoring & models · Budget & quota · System · Privacy & data**. Each settings section ends with the **dry-run panel** and **Save**. The page holds one settings document: every section's Save sends the whole document with its base version; a 409 `stale_base_version` offers reload-and-reapply of the edited fields.
 
 **CV & profile flow**:
 
@@ -5292,23 +5343,25 @@ Status: Uploading → Extracting text → Removing contact details → Review te
 Text review (before anything is sent): the stripped text with highlights, [mark span] [restore],
 "Automatic removal is best effort; please check." [Approve text & extract profile (~$0.14)]
 Confirm modal: "Creates profile v5 and re-scores 1,180 retained ads. Batch allocation $22.44 (40% of
-the remaining scoring budget): about 211 ads in one batch, incl. their expected critic follow-ups;
-the other ~969 are scored online at the monthly pace (about 53 per day). This month $38.20 / $100.
+the remaining scoring budget): about 209 ads in one batch, incl. their expected critic follow-ups;
+the other ~971 are scored online at the monthly pace (about 53 per day). This month $38.20 / $100.
 [Cancel] [Confirm & re-score]"
 ```
+
+The cost labels (the extraction's ~$0.14 here, **Propose queries** ~$0.10 below) are computed from the active models' prices.
 
 **The other sections**:
 
 | Section | Content |
 |---|---|
 | Search scope | Location list (gazetteer autocomplete plus a radius slider), remote toggle, work modes, employment types, seniority range (profile-relative or explicit), industries include/exclude, accepted ad languages, language policy table, max ad age, excluded companies/keywords, minimum salary, knockout severities. Scope changes show "No LLM cost — n scores will be recomputed". |
-| Queries & sources | A table of queries (text, language, origin, enabled, exploration flag, last covered, open gaps, yield, refresh cadence, a "too broad" hint). Actions: add, edit, disable, **Propose queries** (~$0.10). Plus source toggles and quota limits. |
+| Queries & sources | A table of queries (text, language, origin, enabled, exploration flag, last covered, open gaps, yield, refresh cadence, a "too broad" hint). Actions: add, edit, disable, **Propose queries** (~$0.10). Plus source toggles, quota limits and the stale period (`collection.stale_ttl_days`). |
 | Watchlist | Add a company by careers URL (pattern parse with an immediate result) or by ATS + slug. A list with validation status, last complete snapshot, health and posting counts. |
 | Schedule | Enabled, interval, anchor time (local), "include paid sources in scheduled runs", next slots preview. |
 | Scoring & models | Preset selector (A/B/C/custom) with a per-node model/effort grid (the critic with its light effort) and a separate execution grid (max_tokens, deadlines); **critic routing** (the evaluation policy: relevance threshold, T2 band and straddle coverage, T3 threshold, sample %, light-effort triggers) with the projected and the measured 7-day critic rate; monthly cost projection; eval status ("last eval: passed, ρ = 0.71"); available rubric/prompt versions with **Activate** (gated). |
 | Budget & quota | LLM cap, nonscoring reserve, bucket floor, max and minimum targets per cycle, batch options; live state: counted spend and headroom, the USD bucket (balance, capacity, rate), `ĉ`, the active bulk operation's budget and spend, any amount held by a quarantined batch; plus live windows (JSearch/SerpApi/Adzuna usage, reset dates, ambiguous counts, adjustments). |
-| System | Runs (list plus report viewer), score cycles, **Needs attention** (rejected raw items [Replay], identity conflicts [Resolve], failed/refused targets [Retry], quarantined batches [Release & re-score], mass disappearances [Confirm closure], unscorable groups, broken sources), alerts [Ack], the golden set (list, delete), and a health panel (§17.5). |
-| Privacy & data | Export, Adzuna purge, delete everything (typed confirmation plus password), each deletion's status (executing → completed → **confirmed offsite**), the retention table, the backup lag note, and a link to PRIVACY.md. |
+| System | Display (time zone, UI language) and notifications, runs (list plus report viewer), score cycles, **Needs attention** (rejected raw items [Replay], identity conflicts [Resolve], failed/refused targets [Retry], quarantined batches and batches that cannot be retrieved [Release & re-score], mass disappearances [Confirm closure], unscorable groups, broken sources, paused scoring [Acknowledge], a failed scope apply [Retry apply]), alerts [Ack], the golden set (list, delete), and a health panel (§17.5). |
+| Privacy & data | Export, Adzuna purge, delete everything (typed confirmation plus password), each deletion's status (executing → completed → **confirmed offsite**), the retention table (with `retention.score_history_months`, edited in its row), the backup lag note, and a link to PRIVACY.md. |
 
 **The dry-run panel** lists errors (red, block Save) and warnings (amber, each with an "I understand" checkbox). The projections are shown as compact rows. The effect classes appear as chips, e.g. "Recompute scores (no LLM)" or "LLM re-score ≈ $41".
 
@@ -5336,7 +5389,7 @@ the other ~969 are scored online at the monthly pace (about 53 per day). This mo
   - `aria-live="polite"` announces run and apply progress;
   - `prefers-reduced-motion` is respected;
   - ad descriptions carry `lang="de"` or `lang="en"` from the detected language.
-- **i18n**: the UI strings are English (default) and German (`i18n/en.json`, `i18n/de.json`). Ad content is shown as published. Summaries are shown in the UI language (`summary_en`/`summary_de`).
+- **i18n**: the UI strings are English (default) and German (`i18n/en.json`, `i18n/de.json`). Ad content is shown as published. Summaries are shown in the UI language (`summary_en`/`summary_de`). Server messages are shown through their stable codes; the server's English text is a fallback only. Provenance rules, field names, deterministic input keys, structured-field names, fact ids and `election_reason` values are shown verbatim in `<code>`, because no single catalogue exists for them.
 
 ---
 
@@ -5372,12 +5425,13 @@ the other ~969 are scored online at the monthly pace (about 53 per day). This mo
 - **The CLI is the escape hatch**: `jobhunter sessions unlock`.
 - Every attempt is recorded with an HMAC of the username, never the raw value.
 - Responses take constant time: a dummy Argon2 verify runs on unknown usernames. Error messages are generic.
+- When TOTP is enabled and the request has no code, the server answers 401 `totp_required` before any password check, records no attempt and reveals nothing else.
 
 ### 16.4 Sessions
 
 - **Token**: a 256-bit random token in cookie `__Host-jh_session` with `Secure; HttpOnly; SameSite=Strict; Path=/`.
 - **Storage**: the DB stores only `HMAC-SHA256(token, HKDF(session_secret, "session"))`.
-- **Lifetime**: 12 h idle (sliding, updated at most once a minute) and 30 d absolute.
+- **Lifetime**: 12 h idle (sliding, updated at most once a minute) and 30 d absolute. A request sent with `X-JH-Background: 1` (the UI's polls) does not slide the idle expiry.
 - **Lifecycle**: a new token is issued on login (rotation), and logout deletes the row.
 - `jobhunter sessions revoke-all` and a password change revoke every session.
 
@@ -5409,7 +5463,7 @@ Cross-Origin-Resource-Policy: same-origin
 ### 16.7 Input and output handling
 
 - **Uploads**: §12.1. Files are parsed in a sandboxed subprocess (§12.2).
-- **Ad HTML**: sanitised with nh3 at ingestion (§8.9). The UI renders only the sanitised HTML.
+- **Ad HTML**: sanitised with nh3 at ingestion (§8.9). The UI renders ad text as text (§15.4), never HTML.
 - **XML** (Personio) is parsed with `defusedxml`, which blocks entity expansion and DTDs.
 - **SQL**: SQLAlchemy with bound parameters only. Raw SQL in views and migrations is static.
 - **No arbitrary URL fetching**: adapters use fixed base URLs, the watchlist uses pattern parsing (§5.4), and redirects are disabled. This leaves no SSRF surface.
@@ -5625,7 +5679,7 @@ The UI renders the report under System → Runs. It contains no ad text.
 | `batch.submit_ambiguous_unresolved` | critical | 25 h without a matching batch; the text states the reserved amount and offers the release | found or released |
 | `batch.results_unreadable` | critical | A result stream unreadable for 12 consecutive passes, or not read whole by `submit_started_at + 29 days`; the remaining items take the missing-item path (§10.10) | manual |
 | `batch.item_unprocessable` | critical | One item's decision failed in 12 consecutive passes; it is given up as missing (§10.10) | manual |
-| `batch.retrieve_failing` | critical | `retrieve` still failing past `expires_at + 1 h` (§10.10) | the submission moves to `ended` |
+| `batch.retrieve_failing` | critical | `retrieve` still failing past `expires_at + 1 h` (§10.10) | the submission moves to `ended`, or the user releases it |
 | `scope.apply_failed` | critical | An `apply_scope` operation failed permanently; the old scope stays active (§13.4) | a later successful apply |
 | `batch.custom_id_anomaly` | critical | Partial `custom_id` intersection | manual |
 | `batch.items_missing` | critical | A result is missing for an item | manual |
@@ -5831,6 +5885,7 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
   - ATS snapshot completeness;
   - a gateway 404 settles `not_billed`.
 - Adapters are exercised with `respx` mocks. The paid adapters have no live calls in CI.
+- Fake mode (`JOBHUNTER_FAKE_SOURCES`) serves the fixtures with their posting dates and `Date` headers moved by whole days to the clock, so the ages the recording saw stay as they were; the contract tests read them as recorded.
 
 ### 18.5 Payload tests and schema dry-run
 
@@ -5851,9 +5906,9 @@ Crashes are injected by fault hooks (`JOBHUNTER_FAULT=<point>`, test env only) t
   - an ad with mandatory clearance;
   - an "or equivalent experience" degree clause.
 
-### 18.7 E2E (Microsoft playwright-cli)
+### 18.7 E2E (Playwright)
 
-E2E runs `@playwright/cli` against `docker compose -f deploy/compose.yaml -f deploy/compose.test.yaml up`, with `JOBHUNTER_ENV=test`, `JOBHUNTER_FAKE_SOURCES=1` (fixture adapters) and `JOBHUNTER_FAKE_LLM=1` (a deterministic stub gateway that still goes through the spend ledger).
+E2E runs the Playwright suite of `frontend/e2e/` (`@playwright/test`, §4.1) against the E2E stack, the dev stack with its overlays (`deploy/compose.dev.yaml`, `compose.fixtures.yaml`, `compose.fakellm.yaml`, `compose.e2e.yaml`), with `JOBHUNTER_FAKE_SOURCES=1` (fixture adapters) and `JOBHUNTER_FAKE_LLM=1` (a deterministic stub gateway that still goes through the spend ledger). E2E uses a deterministic test embedder (`EMBEDDER_FAKE=1`, refused outside dev and test). `@playwright/cli` takes the visual checks of the UI.
 
 | # | Scenario | Page |
 |---|---|---|
@@ -5869,7 +5924,7 @@ E2E runs `@playwright/cli` against `docker compose -f deploy/compose.yaml -f dep
 | E10 | Duplicate-group card: "scored via" label; Split → the member becomes pending with Score now | Jobs |
 | E11 | Score now on a pending card; with the cap set to the current spend → the button is disabled and the API returns 409 | Jobs |
 | E12 | Labelling mode: score hidden, keys 1/2/3 label, progress increments, reveal score | Jobs |
-| E13 | Settings: radius change → dry-run shows "no LLM cost, n recompute" → Save → "Applying settings…" banner → intervals stay populated throughout | Profile & Settings |
+| E13 | Settings: radius change → Search scope shows "No LLM cost — n scores will be recomputed" (the dry-run's `det_recompute`) → Save → "Applying settings…" banner (n/N once the apply reports a count) → intervals stay populated throughout | Profile & Settings |
 | E14 | Settings: interval 1 h with 40 queries → warnings require ticks before Save is enabled | Profile & Settings |
 | E15 | Model preset change B → C → re-score cost confirmation | Profile & Settings |
 | E16 | Watchlist: paste a Lever EU URL → detected (lever, eu, slug); an unsupported URL → message | Profile & Settings |
@@ -5889,7 +5944,7 @@ E2E runs `@playwright/cli` against `docker compose -f deploy/compose.yaml -f dep
 | `payload` | LLM payload contract tests (offline) |
 | `frontend` | vitest, build, OpenAPI drift check |
 | `images` | build the api/worker, embedder and backup images (no push on PRs); embedder model checksum check |
-| `e2e` | compose test stack + playwright-cli E1–E20, plus the network tests N1 (no egress from `api` and `docparse`) and N2 (real client IP through Caddy, spoofed `X-Forwarded-For` ignored) |
+| `e2e` | runs on pull requests to `main` and on demand: the E2E stack (§18.7) + the Playwright suite E1–E20, plus the network tests N1 (no egress from `api` and `docparse`) and N2 (real client IP through Caddy, spoofed `X-Forwarded-For` ignored) |
 | `audit` | pip-audit, npm audit |
 | Manual workflows | `eval-manual.yml`, `schema-dry-run-manual.yml`, `smoke-free-sources.yml` (weekly live smoke of free sources only, never paid) |
 
@@ -6617,7 +6672,7 @@ Other configurations under the same routing and limits (central):
 
 ### 21.3 Monthly estimate under the $100 cap
 
-The admissible budget is the cap minus the overrun buffer, $100 − $2 = $98 (§6.9.1); the non-scoring reserve is 5% of it ($4.90), and the **scoring share is $93.10**. Cache writes come out of the scoring share. Capacity is `93.10 / (per-target cost + 0.04923 / 10)`.
+The admissible budget is the cap minus the overrun buffer, $100 − $2 = $98 (§6.9.1); the non-scoring reserve is 5% of it ($4.90), and the **scoring share is $93.10**. Cache writes come out of the scoring share. Capacity is `93.10 / (per-target cost + 0.04923 / 10)`. The cache-write share is added to a central `ĉ` only: a history `ĉ` (§6.9.2) is the mean of measured attempt costs, which already include their cache writes (§6.8).
 
 | Config B | Per target | Cycles per month | Cache writes | Targets scored per month under the cap | Cost of 3,000 targets/month (uncapped: 300 cycles) |
 |---|---|---|---|---|---|
