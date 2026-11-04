@@ -7,6 +7,7 @@ import { fakeApi, jobDetail, json, problem, requestsTo } from "../test/api";
 import { NOW, renderInProviders } from "../test/app";
 import { useJobDetail } from "./detailApi";
 import { FeedbackTab } from "./FeedbackTab";
+import { useLabellingQueue } from "./labelApi";
 
 type JobFeedbackOut = components["schemas"]["JobFeedbackOut"];
 
@@ -182,6 +183,36 @@ describe("FeedbackTab", () => {
       expect(document.activeElement).toBe(within(form()).getByRole("radio", { name: en["feedback_label.good"] }));
     });
     expect(within(form()).getByRole<HTMLInputElement>("radio", { name: en["feedback_label.poor"] }).checked).toBe(false);
+  });
+
+  it("a sent label and a Delete read Label mode's queue again (a golden case changed)", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.routes.set("GET /api/labelling/queue", () => json({ items: [], progress: { labelled: 0, target: 50 } }));
+    api.routes.set("POST /api/jobs/5/feedback", () => json({ feedback_id: 80, golden_case_id: 3 }, 201));
+    api.routes.set("DELETE /api/feedback/77", () => new Response(null, { status: 204 }));
+    /** The tab beside a read of the queue, as Label mode keeps it (here: shown, so an invalidation reads it). */
+    function WithQueue() {
+      useLabellingQueue(false);
+      return <FeedbackTab jobId={5} feedback={FEEDBACK} />;
+    }
+    renderInProviders(<WithQueue />);
+    const reads = () => requestsTo(api, "GET /api/labelling/queue").length;
+    await waitFor(() => {
+      expect(reads()).toBe(1);
+    });
+    const user = userEvent.setup();
+    await user.click(within(form()).getByRole("radio", { name: en["feedback_label.ok"] }));
+    await user.click(within(form()).getByRole("button", { name: en["feedback.submit"] }));
+    await waitFor(() => {
+      expect(reads()).toBe(2); // after the wrong-score POST
+    });
+    const list = screen.getByRole("list", { name: en["feedback.list"] });
+    await user.click(within(within(list).getAllByRole("listitem")[1]).getByRole("button", { name: en["feedback.delete"] }));
+    await waitFor(() => {
+      expect(reads()).toBe(3); // after the Delete
+    });
+    expect(requestsTo(api, "POST /api/jobs/5/feedback")).toHaveLength(1);
+    expect(requestsTo(api, "DELETE /api/feedback/77")).toHaveLength(1);
   });
 
   it("without feedback says so", () => {

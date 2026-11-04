@@ -19,11 +19,12 @@
 //   no-profile notice, beside the filter panel and its Label mode toggle. The list is still read under the
 //   search (its query is kept), but its keyboard has no cards meanwhile, so `j`/`k` are Label mode's; leaving
 //   (the toggle again, or Back) shows the list as it was. When the switch takes focus with it, the heading has it.
-// - The detail drawer (Task 24, resolution e) is open while the search has `job`. Closing it goes Back when this
-//   page pushed that entry (so Esc and Back agree), else (a pasted URL) replaces the URL without `job`; showing
-//   another job in it (a survivor, a representative) replaces `job`. The drawer gives focus back to what held it
-//   before (the card it was opened from); when that is nothing (a pasted URL), focus goes to the job's card if
-//   the list shows it, else to the heading.
+//   No drawer shows in Label mode, since it would show the score; the toggle drops `job` on the way in.
+// - The detail drawer (Task 24, resolution e) is open while the search has `job`, outside Label mode. Closing it
+//   goes Back when this page pushed that entry (so Esc and Back agree), else (a pasted URL) replaces the URL
+//   without `job`; showing another job in it (a survivor, a representative) replaces `job`. The drawer gives
+//   focus back to what held it before (the card it was opened from); when that is nothing (a pasted URL), focus
+//   goes to the job's card if the list shows it, else to the heading.
 import { Link, useRouter } from "@tanstack/react-router";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
@@ -116,7 +117,7 @@ export function JobsPage() {
   useLayoutEffect(() => {
     shownIds.current = ids;
   }, [ids]);
-  const openJob = search.job;
+  const openJob = labelMode ? undefined : search.job; // no drawer over Label mode: it would show the score
   const drawerJob = useRef<number | undefined>(undefined);
   useEffect(() => {
     const closed = drawerJob.current;

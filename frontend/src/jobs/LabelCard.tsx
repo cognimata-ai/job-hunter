@@ -22,9 +22,9 @@ import { Skeleton } from "../components/Skeleton";
 import { useServerText } from "../i18n/index";
 import type { Span } from "./codepoints";
 import { CommentField, commentTooLong } from "./CommentField";
-import { useJobDetail } from "./detailApi";
+import { type FeedbackIn, useJobDetail } from "./detailApi";
 import { EvidenceHighlighter } from "./EvidenceHighlighter";
-import { type Label, type LabelIn, type LabelItemOut, useRecordLabel } from "./labelApi";
+import { type Label, type LabelItemOut, useRecordLabel } from "./labelApi";
 import styles from "./LabelCard.module.css";
 import { ScoreBadge } from "./ScoreBadge";
 import { focusDropped, ignoredKey } from "./useListKeyboard";
@@ -33,8 +33,9 @@ import { focusDropped, ignoredKey } from "./useListKeyboard";
 const LABELS: readonly Label[] = ["good", "ok", "poor"];
 const KEYS: ReadonlyMap<string, Label> = new Map(LABELS.map((label, i) => [String(i + 1), label]));
 const NO_SPANS: readonly Span[] = [];
-/** The length of an excerpt the server cut, in code points (`jobs/labelling.py`'s `EXCERPT_CHARS`). */
-const EXCERPT_CHARS = 600;
+/** The length of an excerpt the server cut, in code points: `jobs/labelling.py`'s `EXCERPT_CHARS`, which
+ * `tests/unit/test_label_excerpt_chars.py` holds this to. */
+export const EXCERPT_CHARS = 600;
 
 /** The excerpt as shown: one the server cut ends in an ellipsis. */
 function excerptText(excerpt: string): string {
@@ -77,7 +78,7 @@ export function LabelCard({ item, focused, label, onLabelled }: LabelCardProps) 
   const scoreId = useId();
   const article = useRef<HTMLElement>(null);
   const changeButton = useRef<HTMLButtonElement>(null);
-  const record = useRecordLabel(item.job_id);
+  const { mutation: record, save: saveLabel } = useRecordLabel(item.job_id);
   const [comment, setComment] = useState("");
   const [changing, setChanging] = useState(false);
   const [revealed, setRevealed] = useState(false);
@@ -96,22 +97,17 @@ export function LabelCard({ item, focused, label, onLabelled }: LabelCardProps) 
     }
   }, [changing, label]);
 
-  const post = (body: LabelIn) => {
-    record.mutate(body, {
-      onSuccess: () => {
-        const card = article.current;
-        const moveFocus = focusDropped() || (card !== null && card.contains(document.activeElement));
-        setChanging(false);
-        onLabelled(item.job_id, body.label, moveFocus);
-      },
-    });
+  // once the label is saved: the card shows it, and focus may move on
+  const onSaved = (_out: unknown, body: FeedbackIn) => {
+    const card = article.current;
+    const moveFocus = focusDropped() || (card !== null && card.contains(document.activeElement));
+    setChanging(false);
+    onLabelled(item.job_id, body.label, moveFocus);
   };
   const save = (value: Label) => {
-    if (blocked) {
-      return;
+    if (!blocked) {
+      saveLabel(value, comment, { onSuccess: onSaved });
     }
-    const text = comment.trim();
-    post(text === "" ? { label: value } : { label: value, comment: text });
   };
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const value = KEYS.get(event.key);
@@ -149,7 +145,7 @@ export function LabelCard({ item, focused, label, onLabelled }: LabelCardProps) 
             (isProblem(record.error, "conflict_state") ? (
               <p role="alert" className={styles.error}>{t("feedback.no_score")}</p>
             ) : (
-              <ProblemBox error={record.error} onRetry={() => { post(record.variables); }} />
+              <ProblemBox error={record.error} onRetry={() => { record.mutate(record.variables, { onSuccess: onSaved }); }} />
             ))}
           {changing && (
             <button type="button" className={styles.button}

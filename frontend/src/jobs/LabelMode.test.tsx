@@ -21,8 +21,17 @@ import { NOW, renderApp, settled } from "../test/app";
 type LabelItemOut = components["schemas"]["LabelItemOut"];
 type LabellingQueueOut = components["schemas"]["LabellingQueueOut"];
 
+// The batch's shuffle, deterministic here: the server's order unless a test sets another (`labelApi.test.ts`
+// tests the random one).
+const order = vi.hoisted(() => ({ of: <T,>(items: readonly T[]): T[] => [...items] }));
+vi.mock("./labelApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./labelApi")>()),
+  shuffle: <T,>(items: readonly T[]): T[] => order.of(items),
+}));
+
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"], now: NOW });
+  order.of = (items) => [...items];
 });
 
 afterEach(async () => {
@@ -334,6 +343,88 @@ describe("LabelMode", () => {
     expect(allLabelPosts(api)).toHaveLength(1);
   });
 
+  it("the shown order is the batch's shuffle, not the server's, and a read never reorders it", async () => {
+    const api = fakeApi({ signedIn: true });
+    const queue = queueRoute(api, queueOut([1, 2, 3]));
+    labelRoutes(api, [3]);
+    const shuffled: number[][] = [];
+    order.of = <T,>(items: readonly T[]): T[] => {
+      shuffled.push(items.map((one) => (one as LabelItemOut).job_id));
+      return [...items].reverse();
+    };
+    renderApp("/?label=1");
+    await screen.findByRole("article", { name: "Job 1" });
+    expect(cards()).toEqual(["Job 3", "Job 2", "Job 1"]); // the shuffle's order, not the server's 1, 2, 3
+    expect(shuffled).toEqual([[1, 2, 3]]); // once, when the batch was taken
+    queue.answer = queueOut([4, 5, 3], 24);
+    await userEvent.setup().click(button(card(3), en["feedback_label.good"]));
+    await waitFor(() => {
+      expect(progress().textContent).toBe("24 / 50 labelled");
+    });
+    expect(cards()).toEqual(["Job 3", "Job 2", "Job 1"]);
+    expect(shuffled).toHaveLength(1); // the read after the label moved only the progress
+    // Next batch shuffles the answer it takes; the job labelled in this session goes last
+    await userEvent.setup().click(screen.getByRole("button", { name: en["label_mode.next_batch"] }));
+    expect(shuffled).toEqual([[1, 2, 3], [4, 5, 3]]);
+    expect(cards()).toEqual(["Job 5", "Job 4", "Job 3"]);
+  });
+
+  it("an empty batch takes the next answer with ads: Check again", async () => {
+    const api = fakeApi({ signedIn: true });
+    const queue = queueRoute(api, queueOut([], 0));
+    renderApp("/?label=1");
+    const again = await screen.findByRole("button", { name: en["label_mode.check_again"] });
+    expect(screen.getByText(en["label_mode.empty"])).toBeTruthy();
+    queue.answer = queueOut([4, 5], 0);
+    queue.hold = true;
+    await userEvent.setup().click(again);
+    expect(again.textContent).toBe(en["label_mode.checking"]);
+    expect(again.getAttribute("aria-disabled")).toBe("true");
+    await act(async () => {
+      queue.release();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole("article", { name: "Job 4" })).toBeTruthy();
+    expect(cards()).toEqual(["Job 4", "Job 5"]);
+    expect(document.activeElement).toBe(card(4)); // Check again went with the empty state
+    const reads = requestsTo(api, "GET /api/labelling/queue");
+    expect(reads).toHaveLength(2);
+    expect(reads[1].headers.has("X-JH-Background")).toBe(false); // the user's own read, not a poll
+  });
+
+  it("an empty batch takes the next answer with ads: the 60 s background read", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"], now: NOW });
+    const api = fakeApi({ signedIn: true });
+    const queue = queueRoute(api, queueOut([], 0));
+    renderApp("/?label=1");
+    expect(await screen.findByText(en["label_mode.empty"])).toBeTruthy();
+    await settled();
+    const before = requestsTo(api, "GET /api/labelling/queue").length;
+    act(() => {
+      vi.advanceTimersByTime(59_000);
+    });
+    expect(requestsTo(api, "GET /api/labelling/queue")).toHaveLength(before); // not before the minute
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    await waitFor(() => {
+      expect(requestsTo(api, "GET /api/labelling/queue")).toHaveLength(before + 1);
+    });
+    expect(requestsTo(api, "GET /api/labelling/queue").at(-1)?.headers.get("X-JH-Background")).toBe("1");
+    queue.answer = queueOut([6], 0);
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(await screen.findByRole("article", { name: "Job 6" })).toBeTruthy();
+    // a batch with ads is not polled
+    const reads = requestsTo(api, "GET /api/labelling/queue").length;
+    act(() => {
+      vi.advanceTimersByTime(180_000);
+    });
+    await settled();
+    expect(requestsTo(api, "GET /api/labelling/queue")).toHaveLength(reads);
+  });
+
   it("the progress follows the refetched answer", async () => {
     const api = fakeApi({ signedIn: true });
     const queue = queueRoute(api, queueOut([1, 2, 3], 23));
@@ -408,13 +499,27 @@ describe("LabelMode", () => {
     await user.keyboard("1");
     await within(card(3)).findByText(labelledText(en["feedback_label.good"]));
     expect(document.activeElement).toBe(card(1)); // after the last card, round to the first one left
-    // the batch's last label: focus waits on Next batch while the queue is read again, then the new batch
-    // replaces this one and its first card has focus
+    // the batch's last label: the cards stay, "Batch done" says so, and Next batch has focus
+    api.routes.set("GET /api/jobs/1", () => json(jobDetail()));
+    const status = screen.getByText((_, element) => element?.getAttribute("role") === "status" && element.tagName === "P");
+    expect(status.textContent).toBe(""); // rendered before it speaks
     queue.answer = queueOut([6, 7], 26);
-    queue.hold = true;
+    queue.hold = true; // the read that follows the last label is still running
     await user.keyboard("3");
     await within(card(1)).findByText(labelledText(en["feedback_label.poor"]));
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: en["label_mode.next_batch"] }));
+    const next = screen.getByRole("button", { name: en["label_mode.next_batch"] });
+    expect(document.activeElement).toBe(next);
+    expect(status.textContent).toBe(en["label_mode.batch_done"]);
+    expect(cards()).toEqual(["Job 1", "Job 2", "Job 3"]);
+    // the last card's Reveal score and Change label still work
+    await user.click(button(card(1), en["label_mode.reveal"]));
+    expect(await within(card(1)).findByRole("img", { name: "Score 82, range 74 to 90" })).toBeTruthy();
+    await user.click(button(card(1), en["label_mode.change"]));
+    expect(button(card(1), en["feedback_label.poor"]).getAttribute("aria-pressed")).toBe("true");
+    await user.click(button(card(1), en["action.cancel"]));
+    // Next batch, pressed while that read runs, takes its answer once it is in
+    await user.click(next);
+    expect(next.getAttribute("aria-busy")).toBe("true");
     expect(cards()).toEqual(["Job 1", "Job 2", "Job 3"]);
     await act(async () => {
       queue.release();
@@ -425,6 +530,28 @@ describe("LabelMode", () => {
     });
     expect(document.activeElement).toBe(card(6));
     expect(progress().textContent).toBe("26 / 50 labelled");
+    expect(screen.getByRole("button", { name: en["label_mode.next_batch"] }).getAttribute("aria-busy")).toBe("false");
+    expect(status.textContent).toBe(""); // a new batch, not done
+    expect(requestsTo(api, "GET /api/labelling/queue")).toHaveLength(4); // the first and one after each label
+  });
+
+  it("nothing replaces a done batch but Next batch", async () => {
+    const api = fakeApi({ signedIn: true });
+    const queue = queueRoute(api, queueOut([1]));
+    labelRoutes(api, [1]);
+    renderApp("/?label=1");
+    await screen.findByRole("article", { name: "Job 1" });
+    queue.answer = queueOut([8, 9], 24);
+    await userEvent.setup().click(button(card(1), en["feedback_label.good"]));
+    await waitFor(() => {
+      expect(progress().textContent).toBe("24 / 50 labelled");
+    });
+    await settled();
+    expect(cards()).toEqual(["Job 1"]);
+    expect(screen.getByText(en["label_mode.batch_done"])).toBeTruthy();
+    await userEvent.setup().click(screen.getByRole("button", { name: en["label_mode.next_batch"] }));
+    expect(cards()).toEqual(["Job 8", "Job 9"]); // no read is running: the latest answer, at once
+    expect(document.activeElement).toBe(card(8));
   });
 
   it("Change label re-posts the card's label, and Cancel keeps it", async () => {
@@ -514,6 +641,7 @@ describe("LabelMode", () => {
     await screen.findByRole("article", { name: "Job 1" });
     expect(progress().textContent).toBe("52 / 50 labelled — target reached");
     expect(progress().getAttribute("aria-valuenow")).toBe("50");
+    expect(progress().getAttribute("aria-valuetext")).toBe("52 / 50 labelled — target reached"); // the real count
     expect(progress().querySelector("rect[data-part=fill]")?.getAttribute("width")).toBe("100");
     cleanup();
     // the numbers are the UI language's
@@ -573,6 +701,30 @@ describe("LabelMode", () => {
     await settled();
     expect(screen.queryByText(en["label_mode.empty"])).toBeNull();
     expect(screen.queryByRole("article")).toBeNull();
+  });
+
+  it("no drawer shows over Label mode, and entering it drops the drawer's job", async () => {
+    const api = fakeApi({ signedIn: true });
+    api.jobs = jobsPage([jobCard({ job_id: 5, title: "Job 5" })]);
+    queueRoute(api, queueOut([1]));
+    api.routes.set("GET /api/jobs/5", () => json(jobDetail()));
+    // a pasted URL with both: Label mode, no drawer, the detail not read
+    renderApp("/?label=1&job=5");
+    await screen.findByRole("article", { name: "Job 1" });
+    await settled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(requestsTo(api, "GET /api/jobs/5")).toHaveLength(0);
+    cleanup();
+    // the drawer open, then Label mode entered: the drawer's job goes with it
+    const app = renderApp("/?job=5");
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    const panel = screen.getByRole("complementary", { name: en["filters.title"], hidden: true });
+    fireEvent.click(within(panel).getByRole("button", { name: en["filters.label_mode"], hidden: true }));
+    await waitFor(() => {
+      expect(app.router.state.location.searchStr).toBe("?label=1");
+    });
+    expect(await screen.findByRole("article", { name: "Job 1" })).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("label=1 shows Label mode in the list's place, and leaving it shows the list as it was", async () => {

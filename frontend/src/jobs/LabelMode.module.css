@@ -25,9 +25,23 @@
   gap: var(--space-3);
 }
 
+/* Next batch, and "Batch done" before it. The status line is always rendered (a live region has to be in the
+ * accessibility tree before it speaks) and takes no room while it is empty. */
 .next {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: center;
+  row-gap: var(--space-2);
+}
+
+.done {
+  color: var(--color-success);
+  font-weight: var(--font-weight-bold);
+}
+
+.done:not(:empty) {
+  margin-right: var(--space-4);
 }
 
 .button {
@@ -42,4 +56,9 @@
 
 .button:hover {
   background: var(--color-surface-sunken);
+}
+
+.button[aria-disabled="true"],
+.button[aria-busy="true"] {
+  cursor: progress;
 }

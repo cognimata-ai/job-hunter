@@ -7,8 +7,10 @@
 // - `seen_on_open` changes no ranking (§7.1 L1255), so it reads nothing again: it sets `user` in the detail's
 //   cache and in that job's card of every loaded list (`["jobs", "list", …]`), whose NEW marker goes (Ruling
 //   T24-b). A failure costs a NEW marker until the next read of the list: it raises no toast.
-// - A feedback label and its deletion invalidate the detail; Unmerge invalidates `JOBS_KEY` and the header's
-//   status (its needs-attention counts can change). None of these routes takes an `Idempotency-Key` (§14.1).
+// - A feedback label and its deletion invalidate the detail and Label mode's queue (`LABELLING_QUEUE_KEY`: a label
+//   makes or updates the job's golden case, which the queue reads; Ruling T26-d); Unmerge invalidates `JOBS_KEY`
+//   and the header's status (its needs-attention counts can change). None of these routes takes an
+//   `Idempotency-Key` (§14.1).
 import {
   type InfiniteData,
   useInfiniteQuery,
@@ -46,6 +48,10 @@ export function detailKey(jobId: number): readonly [string, "detail", number] {
 export function historyKey(jobId: number): readonly [string, "history", number] {
   return [...JOBS_KEY, "history", jobId];
 }
+
+/** Label mode's queue (`jobs/labelApi.ts`), outside `JOBS_KEY`: a card's write does not read it again, a label
+ * does. */
+export const LABELLING_QUEUE_KEY = ["labelling", "queue"] as const;
 
 /** The prefix of every loaded list's key (`useJobsList`'s `listKey`). */
 export const LISTS_KEY = [...JOBS_KEY, "list"] as const;
@@ -159,7 +165,8 @@ export function useJobHistory(jobId: number, first: HistoryPageOut): JobHistory 
   };
 }
 
-/** A label of the job's score (`POST /api/jobs/{job_id}/feedback`, 201): it reads the detail again. */
+/** A label of the job's score (`POST /api/jobs/{job_id}/feedback`, 201), a "wrong score" or a Label mode label:
+ * it reads the detail and the labelling queue again. */
 export function useRecordFeedback(jobId: number): UseMutationResult<FeedbackOut, ProblemError, FeedbackIn> {
   const queryClient = useQueryClient();
   return useMutation<FeedbackOut, ProblemError, FeedbackIn>({
@@ -171,15 +178,16 @@ export function useRecordFeedback(jobId: number): UseMutationResult<FeedbackOut,
       }
     },
     retry: false,
-    meta: { ownToast: true }, // its failure is shown in the form
+    meta: { ownToast: true }, // its failure is shown where it was given
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: detailKey(jobId) });
+      void queryClient.invalidateQueries({ queryKey: LABELLING_QUEUE_KEY });
     },
   });
 }
 
 /** Deletes a label of the job (`DELETE /api/feedback/{feedback_id}`, 204; the golden case stays): it reads the
- * detail again. */
+ * detail and the labelling queue again. */
 export function useDeleteFeedback(jobId: number): UseMutationResult<null, ProblemError, number> {
   const queryClient = useQueryClient();
   return useMutation<null, ProblemError, number>({
@@ -195,6 +203,7 @@ export function useDeleteFeedback(jobId: number): UseMutationResult<null, Proble
     meta: { ownToast: true }, // its failure is shown under the list
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: detailKey(jobId) });
+      void queryClient.invalidateQueries({ queryKey: LABELLING_QUEUE_KEY });
     },
   });
 }

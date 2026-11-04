@@ -459,9 +459,13 @@ export function FilterPanel() {
             onClick={() => { write(resetSearch); }}>
             {t("filters.reset")}
           </button>
-          {/* Label mode (`label=1`): the labelling queue takes the list's place (`LabelMode`, Task 26). */}
+          {/* Label mode (`label=1`): the labelling queue takes the list's place (`LabelMode`, Task 26), and the
+              drawer closes on the way in (it would show the score). */}
           <button type="button" className={styles.button} aria-pressed={search.label === 1}
-            onClick={() => { write((current) => ({ ...current, label: current.label === 1 ? undefined : 1 })); }}>
+            onClick={() => {
+              write((current) =>
+                current.label === 1 ? { ...current, label: undefined } : { ...current, label: 1, job: undefined });
+            }}>
             {t("filters.label_mode")}
           </button>
         </div>
